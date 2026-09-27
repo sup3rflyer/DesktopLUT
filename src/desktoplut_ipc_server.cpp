@@ -21,6 +21,7 @@
 
 #include "types.h"
 #include "globals.h"
+#include "calib_snapshot.h"
 #include "gui_mhc.h"
 #include "gui_shared.h"
 #include "mhc.h"
@@ -338,10 +339,10 @@ struct CalibState {
     std::wstring dummyIcc;
     std::wstring reason;
     bool correctionsReset = false;
-    bool hasSnapshot = false;
-    int snapMonitor = -1;
-    bool snapWasHdr = false;
-    MonitorSettings snapshot;
+    // Pre-session settings per DISPLAY (identity-keyed, with the set of modes entered). The
+    // first capture of a display wins for the whole session; only calibration.exit drops them.
+    // See calib_snapshot.h (fable audit Phase 9 T2 + the 2026-09-27 stale-snapshot bug).
+    CalibSnapshotStore snapshots;
 };
 std::mutex g_calibMutex;
 CalibState g_calib;
@@ -740,19 +741,63 @@ void HandleStateGet(JsonValue& result) {
     result.set("overlay", overlay);
 }
 
+JsonValue CalibModesJson(bool sdr, bool hdr) {
+    JsonValue modes = JArr();
+    if (sdr) modes.arr.push_back(JStr("SDR"));
+    if (hdr) modes.arr.push_back(JStr("HDR"));
+    return modes;
+}
+
+// The display a capture belongs to, for a client to recognise (friendly name + EDID id), and the
+// index it had when it was captured.
+void CalibDisplayJson(JsonValue& out, const CalibCaptureKey& key) {
+    out.set("display", JStr(WideToUtf8(key.identity.friendlyName)));
+    out.set("edid_id", JStr(WideToUtf8(key.identity.edidId)));
+    out.set("captured_monitor", JNum(key.indexAtCapture));
+}
+
 void HandleCalibStatus(JsonValue& result) {
-    std::lock_guard<std::mutex> lk(g_calibMutex);
-    result.set("active", JBool(g_calib.active));
-    if (g_calib.active) {
-        JsonValue st = JObj();
-        st.set("monitor", JNum(g_calib.monitor));
-        st.set("mode", JStr(WideToUtf8(g_calib.mode)));
-        st.set("dummy_icc_path", JStr(WideToUtf8(g_calib.dummyIcc)));
-        st.set("corrections_reset", JBool(g_calib.correctionsReset));
-        result.set("state", st);
-    } else {
-        result.set("state", JsonValue());
+    std::vector<CalibCaptureInfo> caps;
+    {
+        std::lock_guard<std::mutex> lk(g_calibMutex);
+        result.set("active", JBool(g_calib.active));
+        if (g_calib.active) {
+            JsonValue st = JObj();
+            st.set("monitor", JNum(g_calib.monitor));
+            st.set("mode", JStr(WideToUtf8(g_calib.mode)));
+            st.set("dummy_icc_path", JStr(WideToUtf8(g_calib.dummyIcc)));
+            st.set("corrections_reset", JBool(g_calib.correctionsReset));
+            result.set("state", st);
+        } else {
+            result.set("state", JsonValue());
+        }
+        caps = g_calib.snapshots.Infos();
     }
+    // What exit(restore_snapshot=true) would put back: every display the session captured, the
+    // modes it entered there, and how old the capture is. Present even while inactive (a thrown
+    // enter keeps its capture). Resolved against the live enumeration only AFTER the calib lock is
+    // released: the GUI-thread enter nests settings -> calib, so this pipe-thread reader must
+    // never nest calib -> settings (sequential locks, as HandleStateGet does).
+    std::vector<CalibLiveMonitor> live;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        live = CalibLiveMonitorsFrom(g_gui.monitorSettings);
+    }
+    std::vector<CalibCaptureKey> keys;
+    for (const CalibCaptureInfo& c : caps) keys.push_back(c.key);
+    const std::vector<CalibResolution> where = ResolveCalibCaptures(keys, live);
+    const uint64_t now = GetTickCount64();
+    JsonValue captures = JArr();
+    for (size_t i = 0; i < caps.size(); ++i) {
+        JsonValue e = JObj();
+        e.set("monitor", where[i].liveIndex >= 0 ? JNum(where[i].liveIndex) : JsonValue());
+        e.set("resolved_by", JStr(where[i].how));
+        CalibDisplayJson(e, caps[i].key);
+        e.set("modes", CalibModesJson(caps[i].sdrEntered, caps[i].hdrEntered));
+        e.set("age_s", JNum(now >= caps[i].capturedAtMs ? (double)(now - caps[i].capturedAtMs) / 1000.0 : 0.0));
+        captures.arr.push_back(std::move(e));
+    }
+    result.set("captures", captures);
 }
 
 void HandleQueryProfiles(const JsonValue& p, JsonValue& result) {
@@ -974,15 +1019,19 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
 
     std::wstring removeName;       // the active real MHC profile this enter takes out of scanout
     float identityPeak = 0.0f;
+    bool snapshotRetained = false; // true = this session already held a capture of this display
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
         {
             std::lock_guard<std::mutex> ck(g_calibMutex);
-            g_calib.snapshot = ms;  // snapshot BEFORE clearing
-            g_calib.hasSnapshot = true;
-            g_calib.snapMonitor = mon;
-            g_calib.snapWasHdr = isHDR;
+            // Capture BEFORE clearing, unless this session already captured this display. A
+            // session still holding a capture here is one whose display is ALREADY cleared (a run
+            // that died without calibration.exit, or an enter that threw part-way): capturing again
+            // would overwrite the user's setup with the neutral slate and restore_snapshot would
+            // hand back the slate. The store is deliberately NOT cleared on a "fresh" enter (only
+            // exit clears it), so a thrown enter cannot lose a valid capture (calib_snapshot.h).
+            snapshotRetained = g_calib.snapshots.Enter(g_gui.monitorSettings, mon, isHDR, GetTickCount64());
         }
         MHCSettings& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
         if (mhc.enabled && !mhc.profileName.empty()) {
@@ -1061,6 +1110,10 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("dummy_icc_path", JStr(WideToUtf8(dummy)));
     result.set("corrections_reset", JBool(true));
     result.set("identity_profile", JStr(WideToUtf8(identityName)));
+    // Honest re-enter tell for DLC: true = this call KEPT the session's original capture of this
+    // display instead of capturing the cleared state. A build predating the snapshot store omits
+    // the field entirely, which is how DLC tells the two apart (additive: no contract bump).
+    result.set("snapshot_retained", JBool(snapshotRetained));
 }
 
 void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1071,36 +1124,66 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
     const JsonValue* rv = p.find("restore_snapshot");
     if (rv && rv->type == JsonValue::Bool) restore = rv->b;
     bool restored = false;
+    JsonValue restoredMonitors = JArr();
+    JsonValue unrestored = JArr();
     if (restore) {
+        // Lock order unchanged: calib -> settings here, settings -> calib in DoEnterNeutral, both
+        // on the GUI thread, so the two can never interleave.
         std::lock_guard<std::mutex> ck(g_calibMutex);
-        if (g_calib.hasSnapshot && g_calib.snapMonitor >= 0) {
-            // The calibration's live MHC profile for the captured mode (e.g. DLC's identity or an
-            // interim build) — the snapshot restore below drops it from settings.
-            std::wstring liveName;
-            float livePeak = 0.0f;
-            {
-                std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                if (g_calib.snapMonitor < (int)g_gui.monitorSettings.size()) {
-                    MonitorSettings& live = g_gui.monitorSettings[g_calib.snapMonitor];
-                    const MHCSettings& lm = g_calib.snapWasHdr ? live.hdrMHC : live.sdrMHC;
-                    if (lm.enabled && !lm.profileName.empty()) {
-                        liveName = lm.profileName;
-                        livePeak = MhcIdentityPeakNits(live, g_calib.snapWasHdr);
-                    }
-                    live = g_calib.snapshot;
+        // One MHC action per ENTERED mode of every restored display (see PlanCalibModeRestore).
+        struct ModeOp { int monitor; bool isHdr; CalibMhcRestore action; std::wstring liveName; float livePeak; };
+        std::vector<ModeOp> ops;
+        std::vector<int> touched;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+            // Resolve every capture to its display's CURRENT index (the enumeration may have
+            // shifted since the enter) and plan against the live settings as they are now,
+            // before anything is copied back.
+            const CalibRestorePlan plan = PlanCalibRestore(g_calib.snapshots, g_gui.monitorSettings);
+            for (const CalibRestoreStep& step : plan.steps) {
+                const CalibCapture& cap = g_calib.snapshots.captures[step.capture];
+                MonitorSettings& live = g_gui.monitorSettings[(size_t)step.liveIndex];
+                for (const CalibModeRestore& mr : step.modes) {
+                    // The identity profile's peak comes from the settings the session left live,
+                    // read before the copy below drops them (as DoEnterNeutral computes it).
+                    const float livePeak = mr.action == CalibMhcRestore::IdentitySwap
+                        ? MhcIdentityPeakNits(live, mr.isHdr) : 0.0f;
+                    ops.push_back(ModeOp{ step.liveIndex, mr.isHdr, mr.action, mr.liveProfileName, livePeak });
                 }
+                // The captured settings go back; the live identity / slot / legacyIndex stay.
+                RestoreCapturedSettings(live, cap.settings);
+                touched.push_back(step.liveIndex);
+                JsonValue e = JObj();
+                e.set("monitor", JNum(step.liveIndex));
+                e.set("resolved_by", JStr(step.how));
+                CalibDisplayJson(e, cap.key);
+                e.set("modes", CalibModesJson(cap.sdrEntered, cap.hdrEntered));
+                restoredMonitors.arr.push_back(std::move(e));
             }
+            for (const CalibUnrestored& u : plan.unrestored) {
+                const CalibCapture& cap = g_calib.snapshots.captures[u.capture];
+                JsonValue e = JObj();
+                e.set("reason", JStr(u.reason));
+                CalibDisplayJson(e, cap.key);
+                e.set("modes", CalibModesJson(cap.sdrEntered, cap.hdrEntered));
+                unrestored.arr.push_back(std::move(e));
+            }
+        }
+        if (!touched.empty()) {
             SaveSettings();
-            // Reinstall the original MHC for the captured mode if it was active.
-            MHCSettings& m = g_calib.snapWasHdr ? g_calib.snapshot.hdrMHC : g_calib.snapshot.sdrMHC;
-            if (m.enabled) GenerateAndInstallMhcProfile(g_calib.snapMonitor, g_calib.snapWasHdr);
-            // No original MHC to reinstall, but the calibration left one associated: swap it for the
-            // identity profile rather than leaving it applied (it is no longer referenced by
-            // settings, so the stale-association sweep would drop it → nothing associated, while
-            // Windows keeps applying its transform — HW-proven 2026-09-03 / 2026-09-23).
-            else if (!liveName.empty())
-                ReplaceMhcProfileWithIdentity(g_calib.snapMonitor, g_calib.snapWasHdr, livePeak, liveName);
-            UpdateMhcFlagsLive(g_calib.snapMonitor);
+            for (const ModeOp& op : ops) {
+                // Reinstall the original MHC of every mode the session entered. Where there was
+                // none but the calibration left one associated (DLC's identity or an interim
+                // build), swap it for the identity profile rather than leaving it applied: it is no
+                // longer referenced by settings, so the stale-association sweep would drop it →
+                // nothing associated, while Windows keeps applying its transform (HW-proven
+                // 2026-09-03 / 2026-09-23).
+                if (op.action == CalibMhcRestore::Reinstall)
+                    GenerateAndInstallMhcProfile(op.monitor, op.isHdr);
+                else if (op.action == CalibMhcRestore::IdentitySwap)
+                    ReplaceMhcProfileWithIdentity(op.monitor, op.isHdr, op.livePeak, op.liveName);
+            }
+            for (int mon : touched) UpdateMhcFlagsLive(mon);
             ReapplyProcessing();
             restored = true;
         }
@@ -1109,9 +1192,19 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
         std::lock_guard<std::mutex> ck(g_calibMutex);
         g_calib.active = false;
         g_calib.correctionsReset = false;
+        // The session is over either way. On the apply path (restore_snapshot=false) the
+        // calibrated state is what the user now has, so the pre-session captures must not survive
+        // into a later exit(restore) — the 2026-09-27 bug: `hasSnapshot` was never cleared, so a
+        // `3dlut-only --abort` (a flow that never enters) restored a PREVIOUS run's pre-run
+        // snapshot over the user's current setup.
+        g_calib.snapshots.Clear();
     }
     result.set("active", JBool(false));
     result.set("restored", JBool(restored));
+    // Which displays went back (at their CURRENT index), and any the session captured but could
+    // not put back (disconnected, or EDID twins it cannot tell apart). Always present.
+    result.set("restored_monitors", restoredMonitors);
+    result.set("unrestored", unrestored);
 }
 
 // layers.set — toggle the viewing layers of one monitor:mode over the pipe, exactly as the
