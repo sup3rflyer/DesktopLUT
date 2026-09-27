@@ -79,6 +79,7 @@ from .adjudication import (
     SEAM_BACKUP,
     SEAM_BRIGHTNESS,
     SEAM_CHARACTERIZE,
+    SEAM_CORRECTION,
     SEAM_FOUNDATION,
     SEAM_HARDWARE_READY,
     SEAM_MEASURE,
@@ -2473,6 +2474,21 @@ class Calibration:
                 options=("proceed", "abort"), recommendation="proceed",
                 digest={**backup, "compromised": True})),
                 stage="preflight", message="aborted — pre-run settings backup could not be captured")
+        # Which correction the meter is wired to is a judgment whenever it isn't this mode's own
+        # recorded slot: a raw fallback, a borrowed profile-YAML file, or a legacy guess used to
+        # surface only as a log line — the 2026-09-26 store upgrade left the PA32UCXR with no HDR
+        # slot, and the next HDR run would have metered RAW with nothing pausing it.
+        corr_question = self._correction_resolution_question(outcome.digest)
+        if corr_question:
+            question, recommendation, reason = corr_question
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="preflight:correction", seam=SEAM_CORRECTION, stage="preflight",
+                question=question, options=("abort", "proceed"), recommendation=recommendation,
+                digest={"reason": reason,
+                        "resolution": outcome.digest.get("correction_resolution"),
+                        "correction": outcome.digest.get("correction"),
+                        "compromised": recommendation == "abort"})),
+                stage="preflight", message="aborted on the colorimeter correction for this mode")
         staleness = outcome.digest.get("correction", {})
         # The build-correction flow IS the refresh, so don't ask about staleness there.
         if staleness.get("stale") and self.calib.get("flow") != "build-correction":
@@ -2490,6 +2506,50 @@ class Calibration:
                                        "(it mints a fresh CCMX via ccxxmake at the box and records it as the "
                                        "active correction), then re-run this calibration."}))
         return outcome
+
+    def _correction_resolution_question(self, digest: Mapping[str, Any]
+                                        ) -> Optional[tuple[str, str, str]]:
+        """``(question, recommendation, reason)`` when the preflight's correction resolution needs
+        a judge, else ``None``. Only this mode's own recorded store slot (or a profile-YAML file
+        with no competing slot) is mechanical; everything else is evidence for the LLM:
+
+        * ``missing_file`` — the resolved file is gone from where the meter looks → RAW reads (abort);
+        * ``raw_other_mode`` — no correction for this mode while another mode has one → RAW (abort);
+        * ``raw_none`` — no correction anywhere for this display → RAW (proceed; build one first?);
+        * ``profile_other_mode`` — the profile YAML file stands in while another mode has a slot;
+        * ``legacy_inferred`` — this mode's slot was only inferred from a legacy schema-1 file.
+
+        build-correction is exempt: it is the flow that mints the correction."""
+        if self.calib.get("flow") == "build-correction":
+            return None
+        res = digest.get("correction_resolution") or {}
+        tell = digest.get("correction") or {}
+        mode, name = res.get("mode") or self.mode, self.display.name
+        others = ", ".join(res.get("other_modes") or ())
+        file = res.get("file")
+        build = f"`--flow build-correction --mode {mode}`"
+        if file and tell.get("present") is False:
+            return (f"{tell.get('message') or f'correction {file} is missing on disk'} Abort and restore "
+                    f"or rebuild it, or proceed on RAW meter readings?", "abort", "missing_file")
+        if res.get("source") == "none":
+            if others:
+                return (f"no {mode} colorimeter correction is recorded for {name} (the store holds "
+                        f"{others} only, which a {mode} run never borrows) and the profile YAML "
+                        f"names none — this run would meter RAW. Abort and record/build the {mode} "
+                        f"correction ({build}), or proceed raw?", "abort", "raw_other_mode")
+            return (f"no colorimeter correction exists for {name} — this run meters RAW (a mini-LED/"
+                    f"QD/OLED panel's primaries read wrong without one). Proceed raw, or abort and "
+                    f"build one first ({build})?", "proceed", "raw_none")
+        if res.get("source") == "profile" and others:
+            return (f"no {mode} correction is recorded for {name}; the profile YAML's "
+                    f"{Path(str(file)).name} stands in (the store's {others} correction is not used). "
+                    f"Proceed only if that file is a {mode} correction for this panel.",
+                    "proceed", "profile_other_mode")
+        if res.get("source") == "store" and str(res.get("mode_source") or "").startswith("legacy"):
+            return (f"{res.get('warning') or f'the {mode} correction was assigned by legacy inference'} "
+                    f"Proceed if {Path(str(file)).name} is the {mode} correction, or abort and "
+                    f"record it ({build}).", "proceed", "legacy_inferred")
+        return None
 
     def _reject_mode_target_mismatch(self, stage: str, target: str, spec: cp.TargetSpec) -> None:
         """P12 guard (fable Phase 7a): the run MODE and the resolved target's transfer must

@@ -44,6 +44,7 @@ SEAM_HARDWARE_READY = "hardware_readiness"  # one live gate before the first met
 SEAM_MONITOR_MAP = "monitor_map"   # profile monitor↔Argyll↔panel map disagrees with live enumeration
 SEAM_BACKUP = "backup_capture"     # the pre-run durable settings backup could not be captured
 SEAM_PIPE = "pipe_down"            # the DesktopLUT calibration pipe is unreachable at preflight
+SEAM_CORRECTION = "correction_resolution"  # the meter's correction for THIS mode is missing / borrowed / a guess
 # NOTE: there is deliberately NO check-in seam. A §12 check-in is a NON-BLOCKING evidence packet
 # for the LLM (see Calibration._maybe_timed_checkin), never an adjudicated yes/no — it must never
 # gate the spine.

@@ -2321,6 +2321,87 @@ def test_legacy_hdr_record_is_not_used_by_an_sdr_run(tmp_path: Path):
     assert "P_HDR-ColorChecker.ccmx" in header["ccmx_warning"]
 
 
+def _without_profile_correction(calib, file=None):
+    from dataclasses import replace as _replace
+    p = calib.profile
+    calib.profile = _replace(p, meter=_replace(p.meter, correction=_replace(p.meter.correction, file=file)))
+    return calib
+
+
+def test_raw_fallback_while_other_mode_has_a_correction_is_a_seam(tmp_path: Path):
+    # The 2026-09-26 regression: the store kept only the PA32UCXR SDR slot, the profile YAML
+    # names no file, so an HDR run would have metered RAW with only a log line. It must pause.
+    from dlc.correction_store import CorrectionRecord
+    calib = _without_profile_correction(_make(tmp_path, "raw_other", mode="HDR",
+                                              adjudicator=MappingAdjudicator({})))
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="SDR", correction_file="panel-ColorChecker.ccmx"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    req = exc.value.request
+    assert req.key == "preflight:correction" and req.recommendation == "abort"
+    assert req.digest["reason"] == "raw_other_mode" and req.digest["compromised"] is True
+    assert "RAW" in req.question and "SDR" in req.question
+
+
+def test_raw_fallback_with_other_mode_aborts_under_auto(tmp_path: Path):
+    from dlc.correction_store import CorrectionRecord
+    calib = _without_profile_correction(_make(tmp_path, "raw_other_auto", mode="HDR"))
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="SDR", correction_file="panel-ColorChecker.ccmx"))
+    result = calib.run("mhc-only")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "preflight"
+
+
+def test_no_correction_anywhere_is_a_proceed_seam(tmp_path: Path):
+    calib = _without_profile_correction(_make(tmp_path, "raw_none", adjudicator=MappingAdjudicator({})))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    req = exc.value.request
+    assert req.key == "preflight:correction" and req.recommendation == "proceed"
+    assert req.digest["reason"] == "raw_none"
+
+
+def test_missing_correction_file_is_a_seam(tmp_path: Path):
+    calib = _without_profile_correction(_make(tmp_path, "missing_file", adjudicator=MappingAdjudicator({})),
+                                        file=str(tmp_path / "gone.ccmx"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    req = exc.value.request
+    assert req.key == "preflight:correction" and req.recommendation == "abort"
+    assert req.digest["reason"] == "missing_file" and "MISSING" in req.question
+
+
+def test_profile_fallback_and_legacy_slot_are_proceed_seams(tmp_path: Path):
+    from dlc.correction_store import CorrectionRecord
+    calib = _make(tmp_path, "profile_other", adjudicator=MappingAdjudicator({}))
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="HDR", correction_file="panel_HDR-ColorChecker.ccmx"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    assert exc.value.request.digest["reason"] == "profile_other_mode"
+    assert exc.value.request.recommendation == "proceed"
+
+    legacy = _make(tmp_path, "legacy_seam", adjudicator=MappingAdjudicator({}))
+    _write_legacy_store(legacy, {"Synthetic mini-LED": {"display": "Synthetic mini-LED",
+                                                        "correction_file": "untagged.ccmx"}})
+    with pytest.raises(AdjudicationRequired) as exc:
+        legacy.stage_preflight()
+    assert exc.value.request.digest["reason"] == "legacy_inferred"
+    assert exc.value.request.recommendation == "proceed"
+
+
+def test_own_recorded_slot_needs_no_correction_seam(tmp_path: Path):
+    from dlc.correction_store import CorrectionRecord
+    calib = _make(tmp_path, "own_slot", mode="HDR", adjudicator=MappingAdjudicator({}))
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="SDR", correction_file="panel-ColorChecker.ccmx"))
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="HDR", correction_file="panel_HDR-ColorChecker.ccmx"))
+    calib.stage_preflight()     # no pause: this mode's own recorded slot is mechanical
+    assert "preflight:correction" not in calib.calib["decisions"]
+
+
 def test_whitepoint_does_not_snapshot_the_yaml_correction(tmp_path: Path):
     # The whitepoint record must not mint a store "correction" from the profile-YAML fallback
     # (that would pin the YAML file into the slot as if it were built for this mode).
