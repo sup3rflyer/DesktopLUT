@@ -173,8 +173,17 @@ after the ICC for an LLM patch-strategy decision (value unproven — see `patch_
 **Early seams you'll hit before any metering** (mhc-only HDR; each = exit 10 → decide → resume):
 `preflight:monitor-map` (only if the display map disagrees) → `preflight:spd` (only if the meter
 correction is stale) → `resolve-target:plan` (plan veto — confirm flow + target + patch count) →
-`hardware-readiness` (one live gate before the first read) → `brightness:adjust` (human turns the OSD).
-Then the long **raw measure** stage begins. Later seams: `measure` (loop didn't settle),
+`hardware-readiness` (one live gate before the first read) → `brightness:adjust` (human turns the OSD) → `brightness:white-reach` (SDR with a DIP, only when the forecast — DIP primaries + the white just
+read, the refine's own reach model + margin — puts the EXACT target white below the SDR white band:
+ask the user to raise the OSD to ~`recommended_native_white_nits`, then `raised` = white is re-read
+and forecast again (drop that `--decide` once consumed); `continue` = keep this backlight, the
+refine's white-band seam still judges the real white; `abort`. A `raised` that changes nothing re-asks
+with `continue` + `raise_had_no_effect`; a `raised` arriving after raw was measured becomes
+`brightness:white-reach-late` (`keep_backlight` / `abort` + re-run). Never auto-answer).
+Then the long **raw measure** stage begins. Later seams: `build-install-mhc:white-reach` (SDR, only
+when the raw-measured primaries put the exact white below the band and the brightness forecast
+missed it — raising the OSD now means re-measuring raw: `abort` + re-run raised, or
+`keep_below_band`), `measure` (loop didn't settle),
 `foundation_collapse` (MHC install crushed bright-neutral luminance — a real stopper), `verify:accept`
 (final score vs targets). Read each `digest`/`options`/`recommendation`; decide or escalate.
 
@@ -248,6 +257,17 @@ message** — re-query `state()` + primaries and manually restore from the durab
   too late, and a dark 5-hour run can be hours of wasted measurement.
 - [ ] **~71% of run time is sub-1-nit dark reads** (~7 s each) — a long run goes dark for you unless
   you actively consume check-ins.
+- [ ] **Drift reference: state vs drift** (2026-09-27). A drift-checkpoint trip that lands back in a
+  state the reference already SETTLED in this stage (a frozen anchor, within the settle tolerance) is
+  panel STATE, not drift — no re-measure / re-warm / tightening (re-reading lands in whichever state
+  the panel is in). Check-ins then carry `since_last.state_recurrences` + a `reference_states` block
+  (anchors, levels, flips, `max_recurrent_delta`, `impact_vs_mean` = the worst state vs the mean in
+  the run metric, `settled_span`, `perceptible`). Judge it: a steady toggle with a sub-JND impact is
+  the panel (BenQ PD2700U: two states ~0.2 ΔE2000 from their mean); a growing `settled_span` or
+  `drift_anchors` is drift. A perceptible (≥ 1 JND) spread pauses at the measure escalation seam.
+  Genuine drift (a trip into territory never settled in) behaves exactly as before. The escalation
+  recommendation on a drift-alarm-only stage now weighs the stage's start/end bookends (main-pass
+  reads, `witness_source`): moved ≤ ¼ JND → `accept` with the basis spelled out, else `retry`.
 
 ## 7. THE DASHBOARD (one instance, reuse it)
 

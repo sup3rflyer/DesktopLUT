@@ -817,3 +817,208 @@ def test_kept_cube_with_an_unknown_refined_white_raises_its_own_seam(tmp_path):
     seams = [r for r in adj.requests if r.key.startswith("reapply-3dlut:")]
     assert [r.key for r in seams] == ["reapply-3dlut:white-unknown"]
     assert seams[0].options == ("keep_cube", "abort")
+
+
+# ---------------------------------------------------------------------------
+# the early white-reach forecast + seam (T4, 2026-09-27)
+# ---------------------------------------------------------------------------
+
+from dlc.dip import DisplayInstrumentProfile, NoiseBand  # noqa: E402
+from dlc.measure_loop import Reading  # noqa: E402
+
+# The BenQ PD2700U DIP (2026-09-26 characterize) and the PA32UCXR SDR DIP.
+_BENQ_DIP = DisplayInstrumentProfile(
+    display="BenQ PD2700U", native_white_xy=[0.31342, 0.33788], native_white_nits=114.36,
+    native_primaries={"R": [0.6525, 0.3309], "G": [0.3073, 0.6489], "B": [0.1502, 0.0569]},
+    noise_model=[NoiseBand(nits=114.36, sigma_de=0.0635, sigma_rel=0.000191, reads=20)],
+    updated="2026-09-26")
+_PA_DIP = DisplayInstrumentProfile(
+    display="PA32UCXR", native_white_xy=[0.314129, 0.326926], native_white_nits=121.72,
+    native_primaries={"R": [0.696042, 0.303958], "G": [0.181786, 0.750021], "B": [0.151213, 0.064799]},
+    updated="2026-06-18")
+
+
+class _WhiteMeter:
+    """The brightness read: a fixed native white (the OSD sets ``nits``; ``raise_to`` is what the
+    human turns it to after the first read)."""
+
+    def __init__(self, nits: float, xy, raise_to: float | None = None) -> None:
+        self.nits, self.xy, self.raise_to, self.reads = nits, xy, raise_to, 0
+
+    def __call__(self, patch):
+        self.reads += 1
+        if self.reads > 1 and self.raise_to:
+            self.nits = self.raise_to
+        x, y = self.xy
+        Y = self.nits
+        return Reading(xyz=(x / y * Y, Y, (1 - x - y) / y * Y), yxy=(Y, x, y), ok=True)
+
+
+def _brightness_calib(tmp_path, name, *, dip, meter, adjudicator=None, mode="SDR", monkeypatch=None):
+    calib = _make(tmp_path, name, adjudicator=adjudicator, mode=mode, panel=meter,
+                  bit_depth=(8 if mode == "SDR" else 10))
+    calib.stage_resolve_target()
+    monkeypatch.setattr(calib, "_dip", lambda: dip)
+    return calib
+
+
+def test_brightness_forecasts_the_benq_white_below_band_and_pauses(tmp_path, monkeypatch):
+    calib = _brightness_calib(tmp_path, "reach_benq", dip=_BENQ_DIP,
+                              meter=_WhiteMeter(114.3, (0.31342, 0.33788)),
+                              adjudicator=SupervisedAdjudicator(), monkeypatch=monkeypatch)
+    assert calib._spec().luminance_nits == pytest.approx(120.0)      # band = [110, 120]
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_brightness()
+    req = exc.value.request
+    assert req.key == "brightness:white-reach"            # never auto-accepted under --supervised
+    assert req.recommendation == "raised" and set(req.options) == {"raised", "continue", "abort"}
+    wr = req.digest["white_reach"]
+    assert wr["status"] == "below_band" and wr["limiting_channel"] == "b"
+    assert wr["reach_nits"] == pytest.approx(108.0, abs=0.5)        # the run measured 108.1
+    assert wr["band"] == [110.0, 120.0]
+    assert 116.0 < wr["needed_native_white_nits"] < 119.0
+    assert wr["recommended_native_white_nits"] > wr["needed_native_white_nits"]      # one margin of slack
+    # Re-forecast at the recommended white: the exact white then lands IN the band.
+    again = calib._sdr_white_reach_forecast(
+        {"rx": 0.6525, "ry": 0.3309, "gx": 0.3073, "gy": 0.6489, "bx": 0.1502, "by": 0.0569},
+        (0.31342, 0.33788), wr["recommended_native_white_nits"])
+    assert again["status"] == "in_band" and again["delivered_white_nits"] >= 110.0
+    assert wr["dip"]["updated"] == "2026-09-26" and wr["white_xy_source"] == "meter"
+
+
+def test_brightness_forecast_in_band_raises_no_seam(tmp_path, monkeypatch):
+    calib = _brightness_calib(tmp_path, "reach_pa", dip=_PA_DIP,
+                              meter=_WhiteMeter(121.72, (0.314129, 0.326926)),
+                              adjudicator=SupervisedAdjudicator(), monkeypatch=monkeypatch)
+    out = calib.stage_brightness()
+    wr = out.digest["white_reach"]
+    assert wr["status"] == "in_band" and wr["limiting_channel"] == "g"
+    assert "brightness:white-reach" not in calib.calib.get("decisions", {})
+
+
+def test_raised_rereads_white_and_forecasts_again(tmp_path, monkeypatch):
+    meter = _WhiteMeter(114.3, (0.31342, 0.33788), raise_to=119.0)
+    seed = {"brightness:white-reach": Decision("raised", note="human raised the OSD")}
+    calib = _brightness_calib(tmp_path, "reach_raised", dip=_BENQ_DIP, meter=meter,
+                              adjudicator=SupervisedAdjudicator(seed), monkeypatch=monkeypatch)
+    out = calib.stage_brightness()
+    assert meter.reads == 2                                    # exactly one re-read after the raise
+    assert out.digest["white_nits"] == pytest.approx(119.0)
+    assert out.digest["white_reach"]["status"] == "in_band"
+    # The consumed 'raised' is forgotten: a still-short forecast would pause afresh, never loop.
+    assert "brightness:white-reach" not in calib.adjudicator.decisions
+    assert calib.calib["stages"]["brightness"]["digest"]["white_nits"] == pytest.approx(119.0)
+
+
+def test_white_reach_forecast_skips_without_dip_and_for_hdr(tmp_path, monkeypatch):
+    calib = _brightness_calib(tmp_path, "reach_nodip", dip=None,
+                              meter=_WhiteMeter(114.3, (0.31342, 0.33788)),
+                              adjudicator=SupervisedAdjudicator(), monkeypatch=monkeypatch)
+    out = calib.stage_brightness()
+    assert out.digest["white_reach"]["skipped"] is True
+    assert "no DIP" in out.digest["white_reach"]["reason"]
+
+    hdr = _brightness_calib(tmp_path, "reach_hdr", dip=_BENQ_DIP, mode="HDR",
+                            meter=_WhiteMeter(900.0, (0.3127, 0.329)),
+                            adjudicator=SupervisedAdjudicator(), monkeypatch=monkeypatch)
+    out = hdr.stage_brightness()
+    assert out.digest["white_reach"]["skipped"] is True and "HDR" in out.digest["white_reach"]["reason"]
+
+
+def test_post_raw_reach_is_evidence_and_seams_only_when_the_forecast_missed(tmp_path, monkeypatch):
+    # No DIP → the brightness stage could not forecast; the raw-measured primaries then put the exact
+    # white below the (test) band → the MHC build pauses (keep / abort — raising now means re-raw).
+    calib = _make(tmp_path, "reach_post_raw", adjudicator=SupervisedAdjudicator())
+    monkeypatch.setattr(calib, "_sdr_white_band", lambda: ((125.0, 130.0), "test"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("mhc-only")
+    req = exc.value.request
+    assert req.key == "build-install-mhc:white-reach"
+    assert req.recommendation == "keep_below_band" and "RE-MEASURING raw" in req.question
+    wr = calib.calib["stages"]["build-install-mhc"]["digest"]["white_reach_after_raw"]
+    assert wr["status"] == "below_band" and wr["basis"] == "raw_primaries+raw_white"
+    assert wr["brightness_forecast"]["skipped"] is True
+
+    # In band: the same evidence rides the digest, no seam.
+    calib2 = _make(tmp_path, "reach_post_raw_ok", adjudicator=SupervisedAdjudicator())
+    assert calib2.run("mhc-only").status == "completed"
+    wr2 = calib2.calib["stages"]["build-install-mhc"]["digest"]["white_reach_after_raw"]
+    assert wr2["status"] == "in_band"
+    assert "build-install-mhc:white-reach" not in calib2.calib.get("decisions", {})
+
+
+def test_a_raise_that_changes_nothing_cannot_loop(tmp_path, monkeypatch):
+    # Review finding 2: under the sim/CI AutoAdjudicator the 'raised' recommendation IS the looping
+    # action. A raise that leaves the white unchanged re-asks with 'continue' + a compromised flag.
+    calib = _brightness_calib(tmp_path, "reach_noeffect", dip=_BENQ_DIP,
+                              meter=_WhiteMeter(114.3, (0.31342, 0.33788)),
+                              adjudicator=AutoAdjudicator(), monkeypatch=monkeypatch)
+    out = calib.stage_brightness()                        # raised once, white unchanged → continue
+    assert out.digest["white_reach"]["status"] == "below_band"
+    assert len(calib.calib["brightness_raises"]) == 1
+    sup = _brightness_calib(tmp_path, "reach_noeffect_sup", dip=_BENQ_DIP,
+                            meter=_WhiteMeter(114.3, (0.31342, 0.33788)),
+                            adjudicator=SupervisedAdjudicator({"brightness:white-reach": Decision("raised")}),
+                            monkeypatch=monkeypatch)
+    with pytest.raises(AdjudicationRequired) as exc:
+        sup.stage_brightness()
+    req = exc.value.request
+    assert req.key == "brightness:white-reach" and req.recommendation == "continue"
+    assert req.digest["raise_had_no_effect"] is True and req.digest["compromised"] is True
+
+
+def test_a_still_short_raise_pauses_again_with_its_history(tmp_path, monkeypatch):
+    meter = _WhiteMeter(112.0, (0.31342, 0.33788), raise_to=114.3)      # raised, but not enough
+    calib = _brightness_calib(tmp_path, "reach_short", dip=_BENQ_DIP, meter=meter,
+                              adjudicator=SupervisedAdjudicator({"brightness:white-reach": Decision("raised")}),
+                              monkeypatch=monkeypatch)
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_brightness()
+    req = exc.value.request
+    assert req.key == "brightness:white-reach" and req.recommendation == "raised"
+    assert meter.reads == 2 and req.digest["white_nits"] == pytest.approx(114.3)
+    assert [h["white_nits"] for h in req.digest["brightness_raises"]] == [pytest.approx(112.0)]
+
+
+def test_a_late_raise_is_not_honoured_after_raw(tmp_path, monkeypatch):
+    # Review finding 1: '--decide brightness:white-reach=raised' on a resume AFTER raw/MHC were
+    # measured must not re-read white under a memoised raw — it becomes a keep/abort question.
+    meter = _WhiteMeter(114.3, (0.31342, 0.33788), raise_to=119.0)
+    calib = _brightness_calib(tmp_path, "reach_late", dip=_BENQ_DIP, meter=meter,
+                              adjudicator=SupervisedAdjudicator({"brightness:white-reach": Decision("continue")}),
+                              monkeypatch=monkeypatch)
+    calib.stage_brightness()
+    calib.calib["stages"]["measure:raw"] = {"status": "done", "digest": {}}
+    calib.decision_overrides["brightness:white-reach"] = Decision("raised", note="late --decide")
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_brightness()                           # memoised stage, override re-decides
+    req = exc.value.request
+    assert req.key == "brightness:white-reach-late"
+    assert set(req.options) == {"keep_backlight", "abort"} and req.digest["downstream"] == ["measure:raw"]
+    assert meter.reads == 1                                # white was NOT re-read
+    assert calib.calib["stages"]["brightness"]["digest"]["white_nits"] == pytest.approx(114.3)
+
+
+def test_post_raw_seam_fires_when_an_in_band_forecast_missed(tmp_path, monkeypatch):
+    calib = _make(tmp_path, "reach_missed", adjudicator=SupervisedAdjudicator())
+    monkeypatch.setattr(calib, "_dip", lambda: _PA_DIP)
+    bands = iter([((110.0, 120.0), "test")])
+    monkeypatch.setattr(calib, "_sdr_white_band", lambda: next(bands, ((125.0, 130.0), "test")))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("mhc-only")
+    req = exc.value.request
+    assert calib.calib["stages"]["brightness"]["digest"]["white_reach"]["status"] == "in_band"
+    assert req.key == "build-install-mhc:white-reach"
+    assert req.digest["white_reach_after_raw"]["brightness_forecast"]["status"] == "in_band"
+
+
+def test_post_raw_seam_is_suppressed_when_already_asked_at_brightness(tmp_path, monkeypatch):
+    calib = _make(tmp_path, "reach_asked",
+                  adjudicator=SupervisedAdjudicator({"brightness:white-reach": Decision("continue")}))
+    monkeypatch.setattr(calib, "_dip", lambda: _PA_DIP)
+    monkeypatch.setattr(calib, "_sdr_white_band", lambda: ((125.0, 130.0), "test"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.run("mhc-only")
+    # the next pause is the refine's own white-band seam — not a second "raise the OSD?" at the build
+    assert exc.value.request.key == "refine-mhc-grayscale:white-band"
+    assert calib.calib["stages"]["build-install-mhc"]["digest"]["white_reach_after_raw"]["status"] == "below_band"

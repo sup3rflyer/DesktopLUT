@@ -3099,6 +3099,10 @@ class Calibration:
             digest = {"white_nits": round(nits, 2), "target_nits": target,
                       "in_range": in_range, "read_attempts": attempts, "panel_dark": panel_dark,
                       "hdr_fixed_peak": self._spec().is_hdr, "compromised": gross_miss or panel_dark}
+            if not panel_dark:
+                white_xy = ((reading.yxy[1], reading.yxy[2])
+                            if reading.yxy is not None and len(reading.yxy) >= 3 else None)
+                digest["white_reach"] = self._early_white_reach(nits, white_xy)
             return StageOutcome("brightness", "done", digest=digest,
                                 data={"white_nits": nits, "in_range": in_range, "panel_dark": panel_dark})
 
@@ -3109,7 +3113,18 @@ class Calibration:
                 "brightness", panel_dark=True, white_nits=outcome.digest.get("white_nits"),
                 message=(f"white reads {outcome.digest.get('white_nits')} nits — panel appears "
                          "dark/asleep (off / wrong input / patch window not showing)"))
-        if panel_dark or not outcome.data.get("in_range"):
+        wr = (outcome.digest or {}).get("white_reach") or {}
+        asked_raise = self._last_brightness_raise()
+        adjust_needed = not outcome.data.get("in_range")
+        if adjust_needed and not panel_dark:
+            if wr.get("status") == "below_band":
+                adjust_needed = False       # the white-reach seam asks for the OSD, with the exact target
+            elif asked_raise and asked_raise.get("recommended_native_white_nits"):
+                want = float(asked_raise["recommended_native_white_nits"])
+                nits_now = float(outcome.data.get("white_nits") or 0.0)
+                # the white now sits at the raise this stage itself asked for: not a new question
+                adjust_needed = abs(nits_now - want) > max(3.0, 0.05 * want)
+        if panel_dark or adjust_needed:
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="brightness:adjust", seam=SEAM_BRIGHTNESS, stage="brightness",
                 question=((f"white reads {outcome.digest['white_nits']} nits — the panel appears "
@@ -3124,7 +3139,233 @@ class Calibration:
                 stage="brightness",
                 message=("aborted — panel dark at brightness" if panel_dark
                          else "aborted on out-of-range white luminance"))
+        if not panel_dark:
+            raised = self._white_reach_seam(outcome)
+            if raised is not None:
+                return raised
         return outcome
+
+    # -- early white-reach (SDR) -----------------------------------------------------------------
+    def _sdr_white_reach_forecast(self, primaries: dict[str, float], native_white_xy: tuple[float, float],
+                                  white_nits: float) -> dict[str, Any]:
+        """The white the SDR refine will deliver, forecast from native primaries + a native white:
+        the exact-target-white reach (:func:`mhc_cube.sdr_white_reach`, the refine's own model), less
+        the refine's physical margin, placed in the white band (:func:`choose_sdr_white_nits`). The
+        reach scales with the backlight (the model is linear in the white luminance), so the native
+        white needed for the band's lower edge is ``white * lo / usable``."""
+        from .mhc_cube import choose_sdr_white_nits, sdr_white_reach
+
+        spec = self._spec()
+        gamma = float(spec.gamma)
+        band, band_source = self._sdr_white_band()
+        m = self._sdr_white_margin(float(white_nits))
+        margin_rel = m["rel"]
+        reach = sdr_white_reach(primaries, native_white_xy, float(white_nits), (1.0, 1.0, 1.0),
+                                gamma=gamma, target_white_xy=self._white_xy())
+        choice = choose_sdr_white_nits(reach.get("reach_nits"), band, float(white_nits), margin_rel=margin_rel)
+        usable = choice.get("usable_nits")
+        # The reach is linear in the backlight: white * lo / usable lands the margined exact white ON
+        # the band edge; one more margin of slack keeps a panel that settles a little lower in band.
+        needed = (float(white_nits) * float(band[0]) / float(usable)
+                  if usable and choice["status"] == "below_band" else None)
+        recommended = needed * (1.0 + margin_rel) if needed else None
+        return {"status": choice["status"], "white_nits": round(float(white_nits), 3),
+                "native_white_xy": [round(float(native_white_xy[0]), 5), round(float(native_white_xy[1]), 5)],
+                "reach_nits": reach.get("reach_nits"), "limiting_channel": reach.get("limiting_channel"),
+                "per_channel_nits": reach.get("per_channel_nits"), "usable_nits": usable,
+                "delivered_white_nits": choice.get("white_nits"),
+                "band": [float(band[0]), float(band[1])], "band_source": band_source,
+                "margin_rel": round(margin_rel, 6),
+                "margin": {k: (round(v, 6) if isinstance(v, float) else v) for k, v in m.items()},
+                "needed_native_white_nits": (round(needed, 1) if needed else None),
+                "recommended_native_white_nits": (round(recommended, 1) if recommended else None),
+                "raise_pct": (round(100.0 * (recommended / float(white_nits) - 1.0), 1) if recommended else None)}
+
+    def _sdr_white_margin(self, nits: float) -> dict[str, Any]:
+        """The SDR white's physical margin below the reach — ONE definition for the refine and the
+        brightness forecast: the white read's repeatability (DIP noise model) ⊕ the settled thermal
+        wander (the run's thermal-alignment evidence; none yet at brightness time — flagged) ⊕ one
+        output code at white (the panel's bit depth)."""
+        from .mhc_cube import sdr_white_margin_rel
+
+        gamma = float(self._spec().gamma)
+        out_bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
+        code_rel = gamma / float(2 ** out_bits - 1)
+        meter_rel = self._meter_lum_sigma_rel(float(nits))
+        thermal = self.calib.get("thermal_align")
+        drift_rel = refine_convergence.panel_floor_from_thermal(thermal).drift_rel
+        rel = sdr_white_margin_rel(meter_rel=meter_rel, drift_rel=drift_rel, code_rel=code_rel)
+        return {"rel": rel, "meter_rel": meter_rel, "drift_rel": drift_rel,
+                "drift_assumed_zero": not bool(thermal), "code_rel": code_rel, "output_bits": out_bits}
+
+    def _last_brightness_raise(self) -> Optional[dict[str, Any]]:
+        hist = self.calib.get("brightness_raises") or []
+        return hist[-1] if hist else None
+
+    def _early_white_reach(self, white_nits: float, white_xy: Optional[tuple[float, float]]) -> dict[str, Any]:
+        """The brightness stage's forecast of the SDR white: the DIP's native primaries + the white
+        just read (its chromaticity when the meter gave one, else the DIP's native white). Skipped for
+        HDR (the OSD cannot retarget a PQ peak) and without a DIP (nothing to forecast from — the
+        refine's white-band seam still judges the real white)."""
+        try:
+            spec = self._spec()
+            if spec.is_hdr:
+                return {"skipped": True, "reason": "HDR: the OSD cannot retarget a PQ peak"}
+            dip = self._dip()
+            prim = dip.native_primaries if dip is not None else None
+            if not prim or not all(k in prim for k in ("R", "G", "B")) or not white_nits or white_nits <= 0:
+                return {"skipped": True, "reason": "no DIP native primaries for this display+mode — the "
+                                                   "refine's white-band seam judges the measured white"}
+            nw = white_xy or (tuple(dip.native_white_xy) if dip.native_white_xy else None)
+            if not nw:
+                return {"skipped": True, "reason": "no native white chromaticity (meter or DIP)"}
+            primaries = {"rx": prim["R"][0], "ry": prim["R"][1], "gx": prim["G"][0], "gy": prim["G"][1],
+                         "bx": prim["B"][0], "by": prim["B"][1]}
+            out = self._sdr_white_reach_forecast(primaries, (float(nw[0]), float(nw[1])), float(white_nits))
+            today = datetime.now().date().isoformat()
+            out["basis"] = "dip_primaries+measured_white"
+            out["white_xy_source"] = "meter" if white_xy else "dip"
+            out["dip"] = {"updated": getattr(dip, "updated", None), "made": getattr(dip, "made", None),
+                          "native_white_nits": getattr(dip, "native_white_nits", None),
+                          "stale": bool(dip.is_stale(today))}
+            return out
+        except Exception as exc:  # noqa: BLE001 - a forecast must never break the brightness stage
+            return {"skipped": True, "reason": f"forecast failed: {type(exc).__name__}: {exc}"}
+
+    def _pop_decision(self, key: str) -> None:
+        """Forget a recorded decision everywhere it can replay from (run record, --decide overrides,
+        the adjudicator's seed) — so the NEXT time this seam is reached it pauses for a fresh one."""
+        self.calib.get("decisions", {}).pop(key, None)
+        self.decision_overrides.pop(key, None)
+        seed = getattr(self.adjudicator, "decisions", None)
+        if isinstance(seed, dict):
+            seed.pop(key, None)
+
+    def _white_reach_seam(self, outcome: StageOutcome) -> Optional[StageOutcome]:
+        """OPTIONAL early brightness seam (owner request 2026-09-27): when the forecast says the exact
+        target white will land BELOW the SDR white band, ask for more backlight BEFORE ~35 min of raw +
+        MHC are measured at this one (BenQ PD2700U: 114.3 native → exact D65 blue-limited at 108.1 →
+        107.2 delivered vs band [110, 120]; the refine's white-band seam only saw it 35 min in).
+        ``raised`` (the human raised the OSD) re-reads white and forecasts again; ``continue`` keeps
+        this backlight (the refine's white-band seam still judges the real white); ``abort``. The
+        recommendation ``raised`` is non-benign: ``--supervised`` always pauses here."""
+        wr = (outcome.digest or {}).get("white_reach") or {}
+        if wr.get("status") != "below_band":
+            return None
+        lo, hi = (wr.get("band") or [None, None])[:2]
+        prev = self._last_brightness_raise()
+        # A 'raised' that did not change the white (within the white's own margin) is not a raise:
+        # re-ask with 'continue' suggested + flagged, so no adjudicator can loop on it (the sim/CI
+        # AutoAdjudicator takes recommendations) and a supervised run pauses on the flag.
+        unchanged = bool(prev and prev.get("white_nits") and wr.get("white_nits")
+                         and abs(float(wr["white_nits"]) - float(prev["white_nits"]))
+                         <= max(float(wr.get("margin_rel") or 0.0), 1e-6) * float(prev["white_nits"]))
+        question = (
+            f"white reads {wr.get('white_nits')} nits; with this panel's primaries an EXACT target white "
+            f"is only reachable up to {wr.get('reach_nits')} nits ({wr.get('limiting_channel')} channel "
+            f"at full drive), so the refine would deliver ~{wr.get('delivered_white_nits')} nits — below "
+            f"the SDR white band [{lo}, {hi}]. Raising the OSD brightness to about "
+            f"{wr.get('recommended_native_white_nits')} nits native white (+{wr.get('raise_pct')} %) would "
+            "put the exact white in the band. 'raised' = the backlight was raised (white is re-read and "
+            "forecast again; drop a --decide for this seam once consumed); 'continue' = keep this "
+            "backlight (the refine's white-band seam still judges the real white); 'abort'.")
+        if unchanged:
+            question = (f"the white did NOT change after 'raised' ({prev.get('white_nits')} → "
+                        f"{wr.get('white_nits')} nits) — the OSD may already be at maximum. " + question)
+        key = "brightness:white-reach"
+        decision = self.adjudicate(AdjudicationRequest(
+            key=key, seam=SEAM_BRIGHTNESS, stage="brightness", question=question,
+            options=("raised", "continue", "abort"),
+            recommendation=("continue" if unchanged else "raised"),
+            digest={**outcome.digest, "white_reach": wr,
+                    "brightness_raises": self.calib.get("brightness_raises") or [],
+                    **({"compromised": True, "raise_had_no_effect": True} if unchanged else {})}))
+        self._abort_if(decision, stage="brightness",
+                       message="aborted at the white-reach seam (exact white below the SDR band)")
+        if decision.choice != "raised":
+            return None
+        downstream = [k for k in ("measure:raw", "build-install-mhc", "refine-mhc-grayscale",
+                                  "measure:post-mhc", "build-install-3dlut", "measure:verify")
+                      if k in (self.calib.get("stages") or {})]
+        if downstream:
+            # A 'raised' can only be honoured BEFORE anything is measured at this backlight (a
+            # --decide override re-deciding this seam later, or a stale flag re-passed on resume):
+            # re-reading white now would leave raw + the MHC built for the old backlight. Say so.
+            self._pop_decision(key)
+            self.runlog.anomaly("brightness", kind="late_white_reach_raise", downstream=downstream,
+                                message=("'raised' at brightness:white-reach after " + ", ".join(downstream)
+                                         + " were measured at the old backlight — not re-read"))
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="brightness:white-reach-late", seam=SEAM_BRIGHTNESS, stage="brightness",
+                question=("'raised' was decided for brightness:white-reach, but " + ", ".join(downstream)
+                          + " were already measured at the old backlight. Raising the OSD now needs a "
+                          "fresh run ('abort', then re-run with the backlight raised); 'keep_backlight' "
+                          "continues at the backlight everything was measured at."),
+                options=("keep_backlight", "abort"), recommendation="keep_backlight",
+                digest={"white_reach": wr, "downstream": downstream})),
+                stage="brightness", message="aborted — raise the backlight and re-run")
+            return None
+        # The human changed the backlight: this stage's white (and any decision taken on it) is stale.
+        # Keep the audit trail, forget both, and read again — a still-short forecast pauses afresh.
+        self.calib.setdefault("brightness_raises", []).append({
+            "white_nits": wr.get("white_nits"), "reach_nits": wr.get("reach_nits"),
+            "delivered_white_nits": wr.get("delivered_white_nits"),
+            "recommended_native_white_nits": wr.get("recommended_native_white_nits"),
+            "decided": getattr(decision, "note", None)})
+        self.calib["stages"].pop("brightness", None)
+        for k in ("brightness:adjust", key):
+            self._pop_decision(k)
+        self._save()
+        return self.stage_brightness()
+
+    def _post_raw_white_reach(self, params: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """The same forecast from the RAW-measured primaries + native white (what the refine will
+        actually use), set beside the brightness-stage forecast. Evidence for every SDR run."""
+        prim = params.get("primaries") or {}
+        mw = params.get("measured_white") or {}
+        peak = params.get("target_luminance")
+        if not (prim and mw.get("x") is not None and mw.get("y") is not None and peak):
+            return None
+        try:
+            out = self._sdr_white_reach_forecast(prim, (float(mw["x"]), float(mw["y"])), float(peak))
+        except Exception as exc:  # noqa: BLE001 - evidence must never break the build
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        early = (((self.calib.get("stages") or {}).get("brightness") or {}).get("digest") or {}).get("white_reach")
+        out["basis"] = "raw_primaries+raw_white"
+        if isinstance(early, dict):
+            out["brightness_forecast"] = {k: early.get(k) for k in ("status", "reach_nits", "delivered_white_nits",
+                                                                     "limiting_channel", "skipped", "reason")}
+            if early.get("reach_nits") and out.get("reach_nits"):
+                out["forecast_error_rel"] = round(float(early["reach_nits"]) / float(out["reach_nits"]) - 1.0, 5)
+        return out
+
+    def _post_raw_white_reach_seam(self, outcome: StageOutcome) -> None:
+        """A seam at the MHC build ONLY when the brightness forecast missed (it said in-band, or
+        could not forecast) and the raw-measured primaries put the exact white below the band.
+        Raising the backlight now means re-measuring raw, so the options are keep / abort."""
+        wr = (outcome.digest or {}).get("white_reach_after_raw") or {}
+        if wr.get("status") != "below_band":
+            return
+        early = wr.get("brightness_forecast") or {}
+        if early.get("status") == "below_band":
+            return      # already asked at the brightness seam (and answered there)
+        lo, hi = (wr.get("band") or [None, None])[:2]
+        had = ("could not forecast it (" + str(early.get("reason")) + ")" if early.get("skipped")
+               else f"forecast {early.get('delivered_white_nits')} nits ({early.get('status')})")
+        question = (
+            f"from the RAW-measured primaries an exact target white is only reachable up to "
+            f"{wr.get('reach_nits')} nits ({wr.get('limiting_channel')} limiting) — the refine will "
+            f"deliver ~{wr.get('delivered_white_nits')} nits, BELOW the SDR white band [{lo}, {hi}]; the "
+            f"brightness stage {had}. Raising the OSD now (to ~{wr.get('recommended_native_white_nits')} nits "
+            "native white) means RE-MEASURING raw: 'abort' and re-run with the backlight raised, or "
+            "'keep_below_band' to continue at this backlight (the refine's white-band seam still judges "
+            "the real white).")
+        self._abort_if(self.adjudicate(AdjudicationRequest(
+            key="build-install-mhc:white-reach", seam=SEAM_BRIGHTNESS, stage="build-install-mhc",
+            question=question, options=("keep_below_band", "abort"), recommendation="keep_below_band",
+            digest={"white_reach_after_raw": wr})),
+            stage="build-install-mhc",
+            message="aborted at the post-raw white-reach seam — re-run with the backlight raised")
 
     def _neutral_state_audit(self) -> dict[str, Any]:
         """The pipe + DesktopLUT.ini neutral-state audit for this monitor/mode (see
@@ -3831,11 +4072,17 @@ class Calibration:
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
+            if not spec.is_hdr:
+                reach = self._post_raw_white_reach(params)
+                if reach is not None:
+                    digest["white_reach_after_raw"] = reach
             return StageOutcome("build-install-mhc", "done", digest=digest,
                                 data={"profile_name": profile_name, "verified": verify_ok})
 
         outcome = self._stage("build-install-mhc", run)
         self._foundation_seam(outcome, stage="build-install-mhc")
+        if outcome.status == "done" and not self._spec().is_hdr:
+            self._post_raw_white_reach_seam(outcome)
         if outcome.status == "done" and self._spec().is_hdr:
             self._pin_hdr_peak_to_cap(outcome)
         return outcome
@@ -4550,8 +4797,7 @@ class Calibration:
 
             from .measure_loop import match_level_noise
             from .mhc_cube import (choose_sdr_white_nits, mhc2_matrix, read_1d_cube, refine_sdr_cube,
-                                   retarget_sdr_white, sdr_white_margin_rel, sdr_white_reach,
-                                   write_1d_cube)
+                                   retarget_sdr_white, sdr_white_reach, write_1d_cube)
 
             # Installed SDR MHC2 matrix: src = sRGB (the C++ SDR srcPrim), display = native primaries +
             # MEASURED native white (set_white sends native white) → M performs native→D65. rowsums
@@ -4619,13 +4865,11 @@ class Calibration:
             # judge. Exact target white below the band is not code's call: ``below_band`` -> the
             # white-band seam (never auto-accepted). ---
             band, band_source = self._sdr_white_band()
-            out_bits = int(getattr(getattr(self.display, "panel", None), "bit_depth", None) or 10)
-            code_rel = gamma / float(2 ** out_bits - 1)    # one output code's light step at white
-            meter_rel = self._meter_lum_sigma_rel(float(peak))
-            drift_rel = refine_convergence.panel_floor_from_thermal(
-                self.calib.get("thermal_align")).drift_rel
-            margin_rel = sdr_white_margin_rel(meter_rel=meter_rel, drift_rel=drift_rel,
-                                              code_rel=code_rel)
+            margin_terms = self._sdr_white_margin(float(peak))   # shared with the brightness forecast
+            code_rel = margin_terms["code_rel"]            # one output code's light step at white
+            meter_rel = margin_terms["meter_rel"]
+            drift_rel = margin_terms["drift_rel"]
+            margin_rel = margin_terms["rel"]
             model_reach = sdr_white_reach(primaries, (nwx, nwy), float(peak), rowsums,
                                           gamma=gamma, target_white_xy=(wx, wy))
             wb_choice = choose_sdr_white_nits(model_reach["reach_nits"], band, float(peak),
