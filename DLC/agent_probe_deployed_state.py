@@ -93,7 +93,7 @@ def main() -> int:
     port, info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
     disp_name = profile.display_for(MON).name
-    ccmx = active_correction(profile, store, disp_name)
+    ccmx = active_correction(profile, store, disp_name, MODE)
     log(f"[setup] spotread port={port} ok={info.get('ok')} display={disp_name!r} ccmx={ccmx}")
 
     params = json.loads(RUN_PARAMS.read_text(encoding="utf-8"))

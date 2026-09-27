@@ -47,7 +47,7 @@ def main() -> int:
     argyll = Argyll(Path(profile.paths["argyll"]) / "spotread.exe")
     port, info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
-    ccmx = active_correction(profile, store, profile.display_for(MON).name)
+    ccmx = active_correction(profile, store, profile.display_for(MON).name, MODE)
     ctrl = CalibrationController.connect()
     audit_state(ctrl, MON, MODE, log)
     entered = False

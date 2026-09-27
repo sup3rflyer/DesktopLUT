@@ -333,7 +333,7 @@ def meter(ts):
     argyll = Argyll(Path(profile.paths["argyll"]) / "spotread.exe")
     port, info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
-    ccmx = active_correction(profile, store, profile.display_for(MON).name)
+    ccmx = active_correction(profile, store, profile.display_for(MON).name, "HDR")
 
     class NoShow:                      # the video frame is already on screen; the meter fn only needs .show()
         def show(self, patch): time.sleep(0.3)

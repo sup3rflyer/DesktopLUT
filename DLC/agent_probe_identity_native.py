@@ -64,7 +64,7 @@ def main() -> int:
     port, info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
     disp = profile.display_for(MON)
-    ccmx = active_correction(profile, store, disp.name)
+    ccmx = active_correction(profile, store, disp.name, MODE)
     log(f"[setup] spotread port={port} ok={info.get('ok')} ccmx={ccmx}")
     # DIP native primaries (06-19 characterize) as the "native" colorant set
     dip = json.loads(Path("dip_store.json").read_text(encoding="utf-8"))["displays"][f"{disp.name}:HDR"]

@@ -100,7 +100,7 @@ def main():
     argyll = Argyll(Path(profile.paths["argyll"]) / "spotread.exe")
     port, info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
-    ccmx = active_correction(profile, store, profile.display_for(MON).name)
+    ccmx = active_correction(profile, store, profile.display_for(MON).name, "HDR")
     presenter = MpvPresenter(int(os.environ.get("FALD_MPV_SCREEN", "0")))
     meter = argyll.open_persistent(SpotreadRequest(port=port, ccmx_or_ccss=Path(ccmx) if ccmx else None))
     measure = make_persistent_spotread_meter(presenter=presenter, persistent=meter)

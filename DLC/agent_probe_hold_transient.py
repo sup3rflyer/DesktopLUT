@@ -46,7 +46,7 @@ from dlc.correction_store import CorrectionStore
 from dlc.measure_loop import MeasurePatch, SocketPresenter, make_persistent_spotread_meter
 from dlc.measure_rgbw import resolve_spotread_instrument_port
 
-MON, BIT = 0, 10
+MON, MODE, BIT = 0, "HDR", 10
 HOST, PORT = "127.0.0.1", 28930
 OUT = Path("runs/probes") / (datetime.now().strftime("%Y%m%d_%H%M%S") + "_hold_transient")
 REF = ("ref512", (512, 512, 512))
@@ -79,7 +79,7 @@ def main() -> int:
     port, info = resolve_spotread_instrument_port(argyll, profile.meter.argyll_port)
     store = CorrectionStore.load(correction_store_path(profile, Path.cwd()))
     disp_name = profile.display_for(MON).name
-    ccmx = active_correction(profile, store, disp_name)
+    ccmx = active_correction(profile, store, disp_name, MODE)
     log(f"[setup] spotread port={port} ok={info.get('ok')} display={disp_name!r} ccmx={ccmx}")
 
     # 1.0 s presenter settle on EVERY read (= the run's jump-settle dwell): without it the first read of a
