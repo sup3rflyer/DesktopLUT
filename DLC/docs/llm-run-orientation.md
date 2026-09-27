@@ -36,14 +36,14 @@ DLC is **not a scripted program** — it is scripts on a spine **the LLM adjudic
 
 ## 2. ORIENT (before you launch)
 
-- [ ] Read [HANDOFF §0](HANDOFF.md): the 2026-06-24 milestone (resume anchor) + the consolidated backlog.
+- [ ] Read [HANDOFF §0](HANDOFF.md): the newest "RESUME HERE" block (the resume anchor) and its
+  **owed-checks ledger** — what the next run must watch for / accept, per display.
 - [ ] Build state: **native-target MHC is validated, landed in C++, wired in DLC**. Color science
   audited clean — remaining work is architecture/efficiency/HW, **not math**.
-- [ ] **The staged native-target `mhc-only` HDR run is ready = Task E1.** That's the next HW run.
 
 ## 3. RUN COMMAND + flags + the seam rhythm
 
-Staged Task E1 (native-target `mhc-only` HDR validation):
+Example (native-target `mhc-only` HDR on the PA32UCXR, mon 0):
 ```bash
 PYTHONPATH=src python -m dlc.calibrate --flow mhc-only --mode HDR --monitor 0 --bit-depth 10 \
   --raw-steps 48 --icc-tube-levels 10 --icc-tube-offsets 0.06 0.15 \
@@ -103,10 +103,16 @@ and won't re-ask.
 ### Flag reference (everything you may need to wield)
 
 **Plan (must match on every resume):**
-- `--flow` · `--mode SDR|HDR` · `--monitor 0` (mon 1 is the user's working display — never touch it) ·
+- `--flow` · `--mode SDR|HDR` · `--monitor N` (mon 0 = PA32UCXR; mon 1 = the user's working display,
+  the BenQ PD2700U since 2026-09-23 — calibrate it only when the user asks; the profile's
+  `desktoplut_monitor` is the truth) ·
   `--bit-depth N` (**SDR resolves to 8 unless you pass it** — a 10-bit daemon + a default SDR run is a
   silent mismatch you'll only catch at the plan seam; always pass it explicitly + identically to the
-  daemon AND the run).
+  daemon AND the run). **The live link is checked at preflight** (2026-09-26): DLC reads the
+  monitor's actual link bpc + encoding (`query_monitors` `link_bpc`, or a local DisplayConfig probe on
+  older builds) and raises `preflight:link-depth` when `--bit-depth` exceeds the link, the profile's
+  `panel.bit_depth` is wider than the link, HDR runs < 10 bpc, or the link is YCbCr. The refine's output-quantization
+  floor follows the MEASURED link (`calib.output_depth`), not the profile.
 
 **Size the run FIRST:** `… --preview-patches` prints the per-stage patch counts (the run's
 time/size) and exits without measuring. Always preview before committing. Short-run starting points:
@@ -171,7 +177,13 @@ after the ICC for an LLM patch-strategy decision (value unproven — see `patch_
   monitor OSD** to bring white luminance into range (DesktopLUT can't drive the backlight).
 
 **Early seams you'll hit before any metering** (mhc-only HDR; each = exit 10 → decide → resume):
-`preflight:monitor-map` (only if the display map disagrees) → `preflight:spd` (only if the meter
+`preflight:monitor-map` (only if the display map disagrees) → `preflight:link-depth` (only if the
+live link bpc/encoding disagrees with `--bit-depth`/the profile: `abort` = relaunch run + daemon at the
+link depth / fix the link; `use-link` / `use-profile` = which depth the output floor uses) →
+`preflight:correction` (only if the meter's correction is NOT this mode's own recorded slot — a missing
+file or RAW-while-another-mode-has-one recommends `abort`: record/build this mode's CCMX first; a raw
+display with none, a profile-YAML stand-in or a legacy-inferred slot recommends `proceed` — confirm with
+the user that it IS this mode's correction; never wave a raw run through) → `preflight:spd` (only if the meter
 correction is stale) → `resolve-target:plan` (plan veto — confirm flow + target + patch count) →
 `hardware-readiness` (one live gate before the first read) → `brightness:adjust` (human turns the OSD) → `brightness:white-reach` (SDR with a DIP, only when the forecast — DIP primaries + the white just
 read, the refine's own reach model + margin — puts the EXACT target white below the SDR white band:
@@ -214,12 +226,11 @@ error in a real session):
 >   WB/Grayscale an "OVERLAY / DWM-hook shader layer" (e.g. `desktoplut_api_spec.py` `runtime.set_grayscale_tweak`,
 >   older NAMING/§5 wording) conflict with this bake-into-ICM model. Reconcile the naming before trusting either.
 >
-> 🚫 **3dlut-only PREFLIGHT GAP (owner, 2026-06-25): GUI corrections must be DISABLED before a `3dlut-only`
-> run — the cube must calibrate off the MHC FOUNDATION ONLY.** The user-facing GUI WB/Grayscale toggles are
-> **not part of the core calibration pipe**; if they're enabled, the active ICM is MHC+WB and the cube bakes in
-> / fights the WB (target is D65). **The `3dlut-only` preflight does NOT currently disable them** — today this
-> is a MANUAL step (turn WB/Grayscale off in the GUI, confirm the ICM reverts to pure MHC, then run). Building
-> the auto-disable into preflight is an open task (see HANDOFF backlog).
+> ✅ **3dlut-only GUI corrections (owner, 2026-06-25) — handled by the spine since `d8f8769`.** The cube must
+> calibrate off the MHC FOUNDATION ONLY; the user-facing GUI WB/Grayscale toggles are **not part of the core
+> calibration pipe** (enabled, the active ICM is MHC+WB and the cube would bake in / fight the WB). The viewing
+> layers are captured and switched OFF at hardware-readiness and restored at the end, and `neutral_audit`
+> refuses a run it cannot neutralise — check the `hardware-readiness` digest's `viewing_layers`.
 
 **Confirm the panel is TRULY native by checking PRIMARIES, not white.** A leftover MHC moves
 native→D65, so **white still reads ~D65** even while the panel is being corrected — `enter-neutral`
