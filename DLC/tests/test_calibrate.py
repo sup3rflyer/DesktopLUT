@@ -4336,6 +4336,67 @@ def test_grayscale_wb_bake_memoised_across_resume(tmp_path: Path):
     assert mhc.get("gs_committed") is True            # the bake is still the applied state
 
 
+def test_bookend_witness_uses_main_pass_reads_not_drain_remeasures(tmp_path: Path):
+    # BenQ 2026-09-27 review: appended re-measures overwrite .ti3 rows with drain-time reads, so a
+    # stage with many drift episodes ends up with BOTH bookends read at drain time — they agree and
+    # hide the movement. The witness must use each bookend patch's MAIN-pass read.
+    import json as _json
+    from dlc.measure_loop import AcceptedRead, MeasurePatch, write_ti3
+    from dlc.mhc import parse_ti3
+
+    calib, patches = _bookend_qc_fixture(tmp_path, "bookdrain", end_gain=1.25, repeats=1)
+    outcome = calib.stage_measure(role="verify", patches=patches,
+                                  ti3_name="v.ti3", ndjson_name="v.ndjson")
+    honest = outcome.digest["bookend_drift_qc"]
+    assert honest["witness_source"] == "main_pass" and honest["remeasured_bookend_patches"] == 0
+    assert honest["max_delta_de"] > honest["threshold"]
+
+    ti3 = Path(outcome.data["ti3"])
+    nd = Path(outcome.data["ndjson"])
+    samples = parse_ti3(ti3)
+    span = 7
+    n = len(samples)
+    # Contaminate: the start bookends were "re-measured at drain time" → their .ti3 rows now carry
+    # end-state reads, and the ndjson records the appended re-measure.
+    rows = []
+    for i, smp in enumerate(samples):
+        xyz = samples[n - span + i].xyz if i < span else smp.xyz
+        rows.append(AcceptedRead(patch=MeasurePatch(label=f"p{i:04d}", rgb=(0, 0, 0),
+                                                    signal=tuple(smp.rgb), seq=i), xyz=xyz))
+    write_ti3(ti3, rows)
+    with nd.open("a", encoding="utf-8") as fh:
+        for i in range(span):
+            fh.write(_json.dumps({"phase": "remeasure", "role": "measurement", "label": f"p{i:04d}",
+                                  "accepted": True, "xyz": list(samples[n - span + i].xyz)}) + "\n")
+
+    ti3_only = calib._bookend_drift_qc("verify", str(ti3), patches)
+    assert ti3_only["witness_source"] == "ti3" and ti3_only["max_delta_de"] == 0.0   # the blind spot
+    witness = calib._bookend_drift_qc("verify", str(ti3), patches, str(nd))
+    assert witness["witness_source"] == "main_pass"
+    assert witness["remeasured_bookend_patches"] == span
+    assert witness["max_delta_de"] == pytest.approx(honest["max_delta_de"])
+
+
+def test_bookend_witness_maps_planned_patches_not_ti3_rows(tmp_path: Path):
+    # Review round 2 finding 1: write_ti3 DROPS an unusable row, so the .ti3 row index is not the
+    # loop's p{planned index}. A stable panel with one dropped core row must not read as drift.
+    from dlc.measure_loop import AcceptedRead, MeasurePatch, write_ti3
+    from dlc.mhc import parse_ti3
+
+    calib, patches = _bookend_qc_fixture(tmp_path, "bookdrop", end_gain=1.0, repeats=1)
+    outcome = calib.stage_measure(role="verify", patches=patches,
+                                  ti3_name="v.ti3", ndjson_name="v.ndjson")
+    ti3 = Path(outcome.data["ti3"])
+    samples = parse_ti3(ti3)
+    mid = len(samples) // 2
+    rows = [AcceptedRead(patch=MeasurePatch(label=f"p{i:04d}", rgb=(0, 0, 0), signal=tuple(smp.rgb), seq=i),
+                         xyz=smp.xyz) for i, smp in enumerate(samples) if i != mid]
+    write_ti3(ti3, rows)                               # one core row dropped
+    qc = calib._bookend_drift_qc("verify", str(ti3), patches, outcome.data["ndjson"])
+    assert qc["available"] is True and qc["witness_source"] == "main_pass"
+    assert qc["max_delta_de"] == pytest.approx(0.0, abs=1e-6)
+
+
 # ---------------------------------------------------------------------------
 # measure escalation: repeatability-aware recommendation + present-stall seam
 # (2026-09-02 C6 run, items #2/#4)
@@ -4375,6 +4436,32 @@ def test_measure_escalation_recommendation_flips_on_repeatability():
 
     # Benign escalations (not-warm / unresolved only) keep the accept recommendation.
     assert rec({})[0] == "accept"
+
+
+def test_measure_escalation_recommendation_weighs_the_bookends():
+    # BenQ PD2700U 2026-09-27 verify: a state-toggling panel drove the dense-drift alarm (→ retry)
+    # while the stage's own start/end bookends moved ≤ 0.19 ΔE2000. The bookends are the direct
+    # evidence the data did not move; below the ¼-JND materiality the suggestion is accept.
+    from dlc.calibrate import _measure_escalation_recommendation as rec
+
+    sound = {"available": True, "max_delta_de": 0.189, "mean_delta_de": 0.053, "metric": "CIEDE2000",
+             "unique_signals": 28, "repeats_per_location": 3}
+    choice, basis = rec({"drift_density_exceeded": True, "bookend_drift_qc": sound})
+    assert choice == "accept" and "bookends" in basis and "0.189" in basis
+    assert rec({"remeasure_budget_exceeded": True, "bookend_drift_qc": sound})[0] == "accept"
+    # Bookends that moved materially, or no bookend evidence (raw / refine), stay retry.
+    moved = {**sound, "max_delta_de": 0.31}
+    assert rec({"drift_density_exceeded": True, "bookend_drift_qc": moved})[0] == "retry"
+    assert rec({"drift_density_exceeded": True})[0] == "retry"
+    assert rec({"drift_density_exceeded": True,
+                "bookend_drift_qc": {"available": False, "reason": "bookend_sequence_mismatch"}})[0] == "retry"
+    # A run-stopper or a compromised path alongside never argues accept from the bookends.
+    assert rec({"drift_density_exceeded": True, "present_stall": True, "bookend_drift_qc": sound})[0] == "retry"
+    assert rec({"drift_density_exceeded": True, "measurement_path_compromised": True,
+                "bookend_drift_qc": sound})[0] == "retry"
+    # A perceptible state toggle: retry cannot remove it — accept, with the OSD hint as the basis.
+    choice, basis = rec({"reference_states": {"perceptible": True}})
+    assert choice == "accept" and "OSD" in basis
 
 
 def test_present_stall_pauses_the_measure_seam_with_retry(tmp_path: Path):

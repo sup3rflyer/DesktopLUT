@@ -305,7 +305,8 @@ def latest_checkin_metrics(cal: Any) -> dict[str, Any]:
         out["bookend_drift"] = {
             k: cal._last_bookend_drift.get(k)
             for k in ("available", "role", "metric", "max_delta_de", "p95_delta_de",
-                      "mean_delta_de", "threshold", "unique_signals")
+                      "mean_delta_de", "threshold", "unique_signals", "witness_source",
+                      "remeasured_bookend_patches")
             if k in cal._last_bookend_drift
         }
     return out

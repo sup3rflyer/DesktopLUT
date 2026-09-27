@@ -1671,7 +1671,8 @@ class Calibration:
         return ctxkw
 
     def _bookend_drift_qc(self, role: str, ti3_path: Optional[str],
-                          patches: Sequence[tuple[int, int, int]]) -> Optional[dict[str, Any]]:
+                          patches: Sequence[tuple[int, int, int]],
+                          ndjson_path: Optional[str] = None) -> Optional[dict[str, Any]]:
         """Compare start-vs-end saturation-sweep bookends before RBF aggregation.
 
         The bookends serve two jobs: repeated reads become high-confidence RBF knots, but
@@ -1679,6 +1680,13 @@ class Calibration:
         ordered measured rows while that temporal information still exists, emits a digest
         packet/anomaly for the LLM, and only then downstream optimization may average the
         duplicates by signal.
+
+        The witness is the MAIN-PASS read of each bookend patch (from the stage ndjson) when one
+        exists: an appended re-measure overwrites the .ti3 row with a drain-time read, and the more
+        drift episodes a stage had, the more of BOTH bookends become drain-time reads that agree
+        with each other — hiding exactly the movement the witness exists to show (BenQ 2026-09-27
+        verify: 51/84 start and 24/84 end bookend patches re-measured; true max 0.219 vs 0.189 from
+        the .ti3). ``remeasured_bookend_patches`` counts them.
         """
         if role not in ("post-mhc", "verify") or not ti3_path:
             return None
@@ -1721,15 +1729,42 @@ class Calibration:
         if start_keys != end_keys:
             return unavailable("bookend_signal_mismatch")
 
+        # Main-pass reads per patch label. The measure loop labels PLANNED patch i as
+        # p{i:0{width}d} with width from the planned count — NOT the .ti3 row index (write_ti3 drops
+        # an unusable row, shifting every later row). The bookends are the first/last `span` PLANNED
+        # patches; each witness read must also carry the planned patch's code values, else the
+        # .ti3 row stands.
+        n_planned = len(patch_list)
+        width = max(4, len(str(max(0, n_planned - 1))))
+        main_reads, remeasured = _main_pass_reads(ndjson_path)
+        bookend_idx = list(range(span)) + list(range(n_planned - span, n_planned))
+        remeasured_count = sum(1 for i in bookend_idx if f"p{i:0{width}d}" in remeasured)
+        used_main = {"n": 0}
+
+        def witness_xyz(i: int, row) -> tuple[float, float, float]:
+            reads = main_reads.get(f"p{i:0{width}d}")
+            want = [int(c) for c in patch_list[i]]
+            reads = [xyz for xyz, rgb in (reads or []) if rgb is None or list(rgb) == want]
+            if not reads:
+                return row.xyz
+            used_main["n"] += 1
+            if len(reads) >= 3:      # robust: a glitch the loop rejected must not move the witness
+                arr = np.median(np.asarray(reads, dtype=float), axis=0)
+            else:
+                arr = np.asarray(reads, dtype=float).mean(axis=0)
+            return (float(arr[0]), float(arr[1]), float(arr[2]))
+
         groups: dict[tuple[float, float, float], dict[str, list[tuple[float, float, float]]]] = {}
         order: list[tuple[float, float, float]] = []
-        for s0, s1 in zip(start, end):
+        for j, (s0, s1) in enumerate(zip(start, end)):
             k = key(s0.rgb)
             if k not in groups:
                 groups[k] = {"start": [], "end": []}
                 order.append(k)
-            groups[k]["start"].append(s0.xyz)
-            groups[k]["end"].append(s1.xyz)
+            groups[k]["start"].append(witness_xyz(j, s0))
+            groups[k]["end"].append(witness_xyz(n_planned - span + j, s1))
+        witness_source = ("main_pass" if used_main["n"] == 2 * span
+                          else "mixed" if used_main["n"] else "ti3")
 
         def mean_xyz(vals: Sequence[tuple[float, float, float]]) -> tuple[float, float, float]:
             arr = np.asarray(vals, dtype=float)
@@ -1784,6 +1819,8 @@ class Calibration:
             "bookend_locations": 2,
             "repeats_per_location": int(self.patch_sizes.saturation_sweep_repeats),
             "bookend_patch_count": span,
+            "witness_source": witness_source,
+            "remeasured_bookend_patches": remeasured_count,
             "unique_signals": len(per_signal),
             "mean_delta_de": round(float(sum(deltas) / len(deltas)), 4) if deltas else 0.0,
             "p95_delta_de": round(float(percentile(deltas, 95.0)), 4) if deltas else 0.0,
@@ -1800,8 +1837,11 @@ class Calibration:
                     threshold=_BOOKEND_DRIFT_ANOMALY_DE,
                     max_delta_de=round(float(max_delta), 4),
                     worst=worst,
+                    witness_source=witness_source,
+                    remeasured_bookend_patches=remeasured_count,
                     message=("start/end saturation-sweep bookends drifted beyond the "
-                             f"{_BOOKEND_DRIFT_ANOMALY_DE:g} {metric_name} threshold"))
+                             f"{_BOOKEND_DRIFT_ANOMALY_DE:g} {metric_name} threshold "
+                             f"({witness_source} reads)"))
         return summary
 
     def _liveness_threshold(self, dip: Optional[Any]) -> float:
@@ -3288,7 +3328,7 @@ class Calibration:
 
         def run() -> StageOutcome:
             res = self._measure_set(patches, role=role, ti3_name=ti3_name, ndjson_name=ndjson_name)
-            bookend_drift = self._bookend_drift_qc(role, res.ti3_path, patches)
+            bookend_drift = self._bookend_drift_qc(role, res.ti3_path, patches, res.ndjson_path)
             digest = dict(res.digest)
             if bookend_drift is not None:
                 digest["bookend_drift_qc"] = bookend_drift
@@ -7101,6 +7141,37 @@ def _reassert_viewing_layers(controller: Any, calib_state: Optional[dict[str, An
                 "monitor": int(mon), "mode": str(md)}
 
 
+def _main_pass_reads(ndjson_path: Optional[str]) -> tuple[dict[str, list[tuple[Any, Any]]], set[str]]:
+    """``(label → [(xyz, rgb)] accepted MAIN-pass measurement reads, labels that were
+    appended-re-measured)`` from a measure stage's ndjson; empty when there is no readable ndjson
+    (the caller falls back to the .ti3)."""
+    reads: dict[str, list[tuple[Any, Any]]] = {}
+    remeasured: set[str] = set()
+    if not ndjson_path:
+        return reads, remeasured
+    try:
+        with open(ndjson_path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if rec.get("role") != "measurement":
+                    continue
+                label = rec.get("label")
+                if rec.get("phase") == "remeasure":
+                    if label:
+                        remeasured.add(label)
+                    continue
+                xyz = rec.get("xyz")
+                if rec.get("phase") == "main" and label and rec.get("accepted") and xyz:
+                    reads.setdefault(label, []).append(
+                        ((float(xyz[0]), float(xyz[1]), float(xyz[2])), rec.get("rgb")))
+    except OSError:
+        return {}, set()
+    return reads, remeasured
+
+
 def _measure_escalation_recommendation(digest: dict[str, Any]) -> tuple[str, Optional[str]]:
     """``(recommendation, basis)`` for the measure escalation seam — a SUGGESTION to the LLM
     judge, never an auto-action (Design Law: the seam decides; ``--auto`` is sim/CI only and
@@ -7114,17 +7185,49 @@ def _measure_escalation_recommendation(digest: dict[str, Any]) -> tuple[str, Opt
     physics), and the flagged reads are REPEATABLE (the digest's read-repeatability evidence:
     the same stimulus re-read to the same implausible value). That is stable-but-implausible =
     real panel/correction behaviour; a retry re-measures the same dim patch and re-fails
-    forever, so the recommendation flips to accept — with the basis spelled out for the judge."""
-    hard = bool(digest.get("meter_down")
-                or digest.get("panel_dark")
-                or digest.get("present_stall")
-                or digest.get("preheat_compromised")
-                or digest.get("remeasure_budget_exceeded")
-                or digest.get("drift_density_exceeded"))
+    forever, so the recommendation flips to accept — with the basis spelled out for the judge.
+
+    The drift budgets (dense drift / blown re-measure budget) are MECHANICS alarms: the stage's
+    own start/end saturation-sweep bookends are the direct evidence of whether the data moved.
+    When those are the ONLY compromise and the bookends moved less than the materiality
+    (¼ JND — below what a correction round would chase), the data is sound and a retry would
+    re-measure the same panel behaviour (BenQ PD2700U 2026-09-27: a state-toggling panel drove
+    24 episodes and a dense-drift ``retry`` while the bookends moved ≤ 0.19 ΔE2000) — accept,
+    basis spelled out. No bookend evidence (raw/refine stages) keeps the conservative retry."""
+    stopper = bool(digest.get("meter_down")
+                   or digest.get("panel_dark")
+                   or digest.get("present_stall")
+                   or digest.get("preheat_compromised"))
+    drift_alarm = bool(digest.get("remeasure_budget_exceeded")
+                       or digest.get("drift_density_exceeded"))
     path_compromised = bool(digest.get("measurement_path_compromised"))
-    if hard:
+    if stopper:
         return "retry", None
+    if drift_alarm:
+        if path_compromised:
+            return "retry", None
+        bookend = digest.get("bookend_drift_qc") or {}
+        moved = _as_float_local(bookend.get("max_delta_de")) if bookend.get("available") else None
+        if moved is None or moved > refine_convergence.MATERIAL_GAIN_JND:
+            return "retry", None
+        return "accept", (
+            f"the drift alarms fired, but this stage's own start/end bookends "
+            f"({bookend.get('unique_signals')} signals × {bookend.get('repeats_per_location')} reads, "
+            f"{bookend.get('witness_source', 'ti3')} reads) moved at most {moved:g} "
+            f"{bookend.get('metric', 'ΔE')} (mean {bookend.get('mean_delta_de')}) — below the "
+            f"{refine_convergence.MATERIAL_GAIN_JND:g} materiality: start and end agree, so a retry "
+            "would most likely re-measure the same panel behaviour (the bookends cannot see an "
+            "excursion that returned mid-stage — weigh the drift-reference evidence too)"
+        )
     if not path_compromised:
+        states = digest.get("reference_states") or {}
+        if states.get("perceptible"):
+            return "accept", (
+                "the drift reference kept returning to previously settled states whose spread is "
+                "perceptible — if that is a panel toggle a retry cannot remove it (check the panel "
+                "OSD for a dynamic-contrast / eco-dimming feature); if it is drift that returned, "
+                "judge from reference_states (levels, flips, settled_span) whether to re-measure"
+            )
         return "accept", None
     repeat = digest.get("read_anomaly_repeatability") or {}
     if repeat.get("classification") == "stable" and repeat.get("all_low_luminance") is True:

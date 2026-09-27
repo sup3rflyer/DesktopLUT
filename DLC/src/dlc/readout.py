@@ -234,7 +234,8 @@ def render_console_line(rec: dict[str, Any], state: ReadoutState) -> str:
         drift = rec.get("drift") or {}
         if not drift:
             return f"[drift] {'check':6s} {rgbs} {ys}  (read failed)"
-        verdict = "DRIFT -> re-measure queued" if drift.get("repeat") else "stable"
+        verdict = ("DRIFT -> re-measure queued" if drift.get("repeat")
+                   else "known panel state (no re-measure)" if drift.get("recurrent") else "stable")
         return (
             f"[drift] {'check':6s} {rgbs} d={drift.get('max_delta', 0.0):.4f} "
             f"cold={drift.get('coldest', '?')} -> {verdict}"
@@ -303,7 +304,8 @@ def render_html(records: list[dict[str, Any]], *, title: str = "DLC measurement 
         if role == "neutral_ref":
             drift = rec.get("drift") or {}
             cls = "drift" if drift.get("repeat") else "ok"
-            verdict = "DRIFT" if drift.get("repeat") else "stable"
+            verdict = ("DRIFT" if drift.get("repeat")
+                       else "known state" if drift.get("recurrent") else "stable")
             label = "drift check"
             extra = f"d={drift.get('max_delta', 0):.4f} cold={drift.get('coldest', '?')} {verdict}"
         else:

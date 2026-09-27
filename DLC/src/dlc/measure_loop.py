@@ -58,6 +58,7 @@ from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
 from .liveness import Liveness, MeterDown
 from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
+from .reference_states import ReferenceStates, reference_shift_impact
 
 __all__ = [
     "MeasurePatch",
@@ -177,6 +178,13 @@ class MeasureLoopConfig:
     adaptive_neutral_min: int = 4       # tightest interval after repeated drift exits the envelope
     drift_density_window: int = 5       # recent neutral checkpoints considered for dense-drift gating
     drift_density_limit: int = 4        # repeats in that window => LLM review (continued, not aborted)
+    # A checkpoint trip that lands back in a state this stage already SETTLED in (a frozen anchor,
+    # within settle_threshold) is panel STATE, not drift (dlc.reference_states): no re-measure /
+    # re-warm / tightening — re-measuring lands in whichever state the panel is in and cannot make the
+    # data consistent. It is reported (check-ins + digest, with its ΔE impact) for the LLM. Needs
+    # drift_threshold >= 2 * settle_threshold (the "same state" / "moved" gap that keeps meter noise
+    # out); otherwise — e.g. the no-DIP defaults — the loop keeps the plain per-trip behaviour.
+    recognize_recurrent_states: bool = True
 
     # Per-patch read policy (single-read default + DIP-driven escalation) -----
     read_tolerance_de: float = 0.2      # target standard error of the mean (CIEDE2000) per patch
@@ -690,6 +698,12 @@ class _Loop:
         self.drift_regime = "unknown"
         self.neutral_interval_current = max(0, config.neutral_interval)
         self.neutral_interval_adjustments = 0
+        self.state_recurrences = 0
+        self.reference_states: Optional[ReferenceStates] = (
+            ReferenceStates(near=config.settle_threshold, far=config.drift_threshold)
+            if (config.recognize_recurrent_states and config.settle_threshold > 0.0
+                and config.drift_threshold >= 2.0 * config.settle_threshold)
+            else None)
         self.remeasure_budget = config.remeasure_cap
         self.remeasure_budget_exceeded = False
         self.warm = False
@@ -705,6 +719,7 @@ class _Loop:
         self._checkin_reads_at_last = 0
         self._checkin_anomalies_at_last = 0
         self._checkin_drift_at_last = 0
+        self._checkin_recur_at_last = 0
         self._checkin_warm_at_last = False
         # Cross-patch read-integrity state (frozen-frame / mid-run-dark detection).
         self._integrity_recent: list[tuple[float, tuple[float, float, float]]] = []
@@ -970,6 +985,11 @@ class _Loop:
             "anomalies": len(new_anomalies),
             "drift_episodes": self.drift_episodes - self._checkin_drift_at_last,
         }
+        # Trips that returned to a known panel state (not drift — no re-measure was queued):
+        # only present when some happened, with the running state picture + its ΔE impact.
+        new_recur = self.state_recurrences - self._checkin_recur_at_last
+        if new_recur:
+            since_last["state_recurrences"] = new_recur
         if self.warm and not self._checkin_warm_at_last:
             since_last["became_warm"] = True   # the warm-up→warm transition happened this window
         # Meter-health evidence NEW in this window (failed reads, self-heal respawns) — only
@@ -1000,11 +1020,14 @@ class _Loop:
             white_nits=(round(self.white_xyz[1], 2) if self.white_xyz else None),
             reads_total=self.seq_counter,
             anomalies_total=len(self.read_anomalies),
-            drift_episodes_total=self.drift_episodes)
+            drift_episodes_total=self.drift_episodes,
+            **({"reference_states": self.reference_states_summary(compact=True)}
+               if self.state_recurrences else {}))
         # Advance the window high-water marks AFTER emitting, so the next check-in's delta is clean.
         self._checkin_reads_at_last = self.seq_counter
         self._checkin_anomalies_at_last = len(self.read_anomalies)
         self._checkin_drift_at_last = self.drift_episodes
+        self._checkin_recur_at_last = self.state_recurrences
         self._checkin_warm_at_last = self.warm
         self._checkin_meter_at_last = len(self.meter_events)
 
@@ -1492,6 +1515,7 @@ class _Loop:
         dark_reads = 0
         settled = False
         last_good: Optional[tuple[float, float, float]] = None
+        last_stimulus: Optional[tuple[int, int, int]] = None
         reads = 0
 
         # Reference reads run under the caller's fixed-display-state guard (identity
@@ -1536,6 +1560,7 @@ class _Loop:
                 dark_reads = 0
 
                 last_good = reading.xyz
+                last_stimulus = patch.rgb
                 # Auto-detect the cold channel from the first usable read, then
                 # re-bias subsequent warm-up patches toward it.
                 if self.cold_channel is None:
@@ -1562,6 +1587,10 @@ class _Loop:
             self._update_white(last_good)
         if settled and last_good is not None:
             self.reference_xyz = last_good
+            # A settle is the loop's proof of a stable state: it founds (or re-confirms) a frozen
+            # reference-state anchor. The approach trail is never catalogued (dlc.reference_states).
+            if self.reference_states is not None:
+                self.reference_states.settle(last_good, stimulus=last_stimulus)
         elif not existing_reference and last_good is not None:
             # Not settled, but adopt the best read so the main pass has a
             # reference at all (the digest flags warm=False for the LLM).
@@ -1957,9 +1986,54 @@ class _Loop:
         if pending:
             self._neutral_checkpoint(warmup_patch, pending, final=True, patch_index=len(self.patches))
 
+    def reference_states_summary(self, *, compact: bool = False) -> Optional[dict[str, Any]]:
+        """The recurrent-state evidence (dlc.reference_states.ReferenceStates.summary), or ``None``
+        when recognition is off. ``compact`` keeps a check-in packet small: counts + the impact."""
+        if self.reference_states is None:
+            return None
+        full = self.reference_states.summary(white=self._impact_white(), hdr=self.transfer.kind == "pq")
+        if not compact:
+            return full
+        vs_mean = full.get("impact_vs_mean") or {}
+        spread = full.get("spread") or {}
+        span = full.get("settled_span") or {}
+        return {"recurrences": full["recurrences"], "anchors": full["anchors"],
+                "levels": len(full["levels"]), "flips": full["flips"], "metric": full["metric"],
+                "max_recurrent_delta": full["max_recurrent_delta"], "threshold": full["far"],
+                "impact_vs_mean": vs_mean.get("impact"),
+                "impact_vs_mean_at_reference": vs_mean.get("at_reference"),
+                "spread": spread.get("impact"),
+                "settled_span": span.get("impact"),
+                "perceptible": full["perceptible"]}
+
+    def _impact_white(self) -> Optional[tuple[float, float, float]]:
+        """The Lab anchor for a reference-shift ΔE. The running ``white_xyz`` is the brightest read
+        SO FAR — early in a pass that can be the mid-grey reference itself, which would inflate every
+        CIEDE2000. SDR: until a read reaches half the expected white, use the expected white (the
+        measured white peak when known, else the transfer's top code) at the reference's chromaticity.
+        HDR (dE_ITP is absolute): the running white, when any."""
+        white = self.white_xyz
+        if self.transfer.kind == "pq":
+            return white
+        expected = self.white_peak_y or self.transfer.cv_to_nits(self.transfer.max_cv)
+        if white is not None and white[1] >= 0.5 * expected:
+            return white
+        ref = self.reference_xyz or white
+        if ref is None or ref[1] <= 0:
+            return white
+        scale = expected / ref[1]
+        return (ref[0] * scale, expected, ref[2] * scale)
+
+    def _drift_window(self) -> list[dict[str, Any]]:
+        """The recent checkpoints the density / regime judgment weighs. Recognised recurrences are
+        left out: they are panel STATE, and letting them occupy window slots would dilute genuine
+        repeats on a panel that both toggles and drifts (delaying the tighten / dense-drift latch)."""
+        window = max(1, self.cfg.drift_density_window)
+        return [s for s in self.drift_checkpoints if not s.get("recurrent")][-window:]
+
     def _recent_drift_summary(self) -> dict[str, Any]:
         window = max(1, self.cfg.drift_density_window)
-        recent = self.drift_checkpoints[-window:]
+        recent = self._drift_window()
         repeats = [s for s in recent if s.get("repeat")]
         max_delta = max((float(s.get("max_delta", 0.0)) for s in recent), default=0.0)
         return {
@@ -1975,12 +2049,16 @@ class _Loop:
 
     def _classify_drift_regime(self) -> str:
         window = max(1, self.cfg.drift_density_window)
-        recent = self.drift_checkpoints[-window:]
-        if not recent:
+        recent = self._drift_window()
+        latest = self.drift_checkpoints[-window:]
+        if not recent and not latest:
             return "unknown"
         repeats = [s for s in recent if s.get("repeat")]
         if not repeats:
-            return "bounded_fluctuation"
+            # Trips that returned to a settled state (not drift) are named, so the LLM reading the
+            # regime sees a toggling panel rather than a quiet one.
+            return ("recurrent_states" if any(s.get("recurrent") for s in latest)
+                    else "bounded_fluctuation")
         pairs = [(s.get("dominant_channel"), s.get("direction")) for s in repeats
                  if s.get("direction") != "flat"]
         if not pairs:
@@ -2025,7 +2103,12 @@ class _Loop:
         pending_count: int,
         final: bool,
         patch_index: Optional[int],
+        recurrence: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
+        """``recurrence`` (a tripped read that returned to a known state) turns the trip into
+        evidence: ``repeat`` is False (no episode, no density count, no tightening) and
+        ``recurrent`` carries the match."""
+        repeat = bool(ev.repeat) and recurrence is None
         reference = normalized_channels(self.reference_xyz) if self.reference_xyz is not None else None
         current = normalized_channels(current_xyz)
         signed = ({ch: current[ch] - reference[ch] for ch in CHANNELS}
@@ -2038,7 +2121,8 @@ class _Loop:
             "patch_index": patch_index,
             "pending_count": pending_count,
             "final": final,
-            "repeat": ev.repeat,
+            "repeat": repeat,
+            "recurrent": recurrence is not None,
             "max_delta": round(ev.max_channel_delta, 6),
             "threshold": round(self.cfg.drift_threshold, 6),
             "coldest": ev.coldest_channel,
@@ -2053,7 +2137,7 @@ class _Loop:
         sample["recent_repeats"] = summary["recent_repeats"]
         sample["repeat_density"] = summary["repeat_density"]
 
-        if ev.repeat:
+        if repeat:
             self._maybe_tighten_neutral_interval(summary)
             summary = self._recent_drift_summary()
             if int(summary["recent_repeats"]) >= max(1, self.cfg.drift_density_limit):
@@ -2134,12 +2218,29 @@ class _Loop:
             current_xyz=reading.xyz,
             delta_threshold=self.cfg.drift_threshold,
         )
+        # A trip back to a state the panel already occupied and LEFT this stage is panel state, not
+        # drift (dlc.reference_states): re-measuring the pending patches would land in whichever
+        # state the panel happens to be in, so it is evidence for the LLM, not an episode. The
+        # test runs BEFORE this read joins the catalogue (a read cannot match itself).
+        states = self.reference_states
+        recurrence = (states.recurrence(reading.xyz, stimulus=warmup_patch.rgb)
+                      if (states is not None and ev.repeat) else None)
+        impact = None
+        if ev.repeat:
+            impact = reference_shift_impact(self.reference_xyz, reading.xyz, white=self._impact_white(),
+                                            hdr=self.transfer.kind == "pq")
+        if states is not None:
+            if recurrence is not None:
+                states.note_recurrence(recurrence, trip_delta=ev.max_channel_delta,
+                                       reference=self.reference_xyz, stimulus=warmup_patch.rgb)
+            states.observe(reading.xyz, stimulus=warmup_patch.rgb)
         drift_sample = self._record_drift_checkpoint(
             ev=ev,
             current_xyz=reading.xyz,
             pending_count=len(pending),
             final=final,
             patch_index=patch_index,
+            recurrence=recurrence,
         )
         record = {
             "t": _now(),
@@ -2158,7 +2259,9 @@ class _Loop:
             "agreement_de": None,
             "drift": {
                 "max_delta": round(ev.max_channel_delta, 6),
-                "repeat": ev.repeat,
+                "repeat": drift_sample["repeat"],
+                "recurrent": drift_sample["recurrent"],
+                "impact": impact,
                 "coldest": ev.coldest_channel,
                 "channel_deltas": drift_sample["channel_deltas"],
                 "dominant": drift_sample["dominant_channel"],
@@ -2178,7 +2281,23 @@ class _Loop:
         # drift chart + the read count — without this it lived only in the ndjson, invisible.
         self._mirror_patch_read(record)
 
-        if ev.repeat:
+        if recurrence is not None:
+            # Panel STATE, not drift: the patches since the last checkpoint stand (each was read in
+            # one of the states the panel keeps returning to), the warm reference stays, nothing is
+            # re-warmed. Evidence only — the spread's impact rides the check-ins and the digest.
+            self.state_recurrences += 1
+            self._emit_event(
+                "INFO",
+                "reference_state_recurrence",
+                max_delta=round(ev.max_channel_delta, 6),
+                threshold=round(self.cfg.drift_threshold, 6),
+                impact=impact,
+                matched=recurrence,
+                recurrences=self.state_recurrences,
+                pending_kept=len(pending),
+            )
+            pending.clear()
+        elif ev.repeat:
             # Panel temperature moved: every patch since the last clean checkpoint
             # may have been taken cold. Queue them for an appended re-measure and
             # re-establish the warm reference.
@@ -2354,6 +2473,9 @@ class IncrementalMeasureSession:
             or self.loop.remeasure_budget_exceeded
             or self.loop.drift_density_exceeded
             or self.loop.drift_episodes > 0
+            # A caller-mutated session keeps its conservative rule: ANY return to another settled
+            # state means earlier editor measurements may describe a different display state.
+            or self.loop.state_recurrences > 0
         )
         return {
             "warm": self.loop.warm,
@@ -2387,6 +2509,8 @@ class IncrementalMeasureSession:
             "neutral_interval_initial": self.cfg.neutral_interval,
             "neutral_interval_final": self.loop.neutral_interval_current,
             "neutral_interval_adjustments": self.loop.neutral_interval_adjustments,
+            "state_recurrences": self.loop.state_recurrences,
+            "reference_states": self.loop.reference_states_summary(),
             "preheat": self.preheat_digest,
             "needs_adjudication": needs_adjudication,
         }
@@ -2590,6 +2714,11 @@ def run_measure_loop(
             "note": r.note,
         })
     drift_summary = loop._recent_drift_summary()
+    states_summary = loop.reference_states_summary()
+    # A recurrent-state spread a viewer could SEE (≥ 1 JND vs the mean state) is a judgement even
+    # though re-measuring cannot remove it: a panel feature (dynamic contrast, eco dimming, FRC) may
+    # be causing it, and every patch carries it.
+    states_perceptible = bool(states_summary and states_summary.get("perceptible"))
     # Escalation-recommendation evidence (item #4): are the envelope-anomalous reads REPEATABLE
     # (stable-but-implausible ⇒ real panel/correction behaviour) or divergent (transient fault)?
     anomaly_repeatability = _read_anomaly_repeatability(loop.read_anomalies, loop.accepted, cfg)
@@ -2603,6 +2732,7 @@ def run_measure_loop(
         or bool(unresolved_all)
         or loop.remeasure_budget_exceeded
         or loop.drift_density_exceeded
+        or states_perceptible
     )
     anomaly_reasons = [
         name for name, active in (
@@ -2615,6 +2745,7 @@ def run_measure_loop(
             ("unresolved", bool(unresolved_all)),
             ("remeasure_budget_exceeded", loop.remeasure_budget_exceeded),
             ("drift_density_exceeded", loop.drift_density_exceeded),
+            ("reference_states_perceptible", states_perceptible),
         )
         if active
     ]
@@ -2698,6 +2829,18 @@ def run_measure_loop(
                 f"regime {loop.drift_regime}, max delta {drift_summary['max_delta']}); "
                 f"neutral interval tightened to {loop.neutral_interval_current}"
             )
+        if states_perceptible:
+            vm = states_summary.get("impact_vs_mean") or {}
+            bits.append(
+                f"the drift reference kept returning to {len(states_summary['levels'])} previously "
+                f"SETTLED reference states ({states_summary['recurrences']} recurrences, "
+                f"{states_summary['flips']} flips) whose spread may be PERCEPTIBLE — worst state "
+                f"{vm.get('impact')} {states_summary['metric']} from the mean state (upper bound; "
+                f"measured {vm.get('at_reference')} at the reference); those returns were not "
+                "re-measured (a re-read lands in whichever state the panel is in) — judge whether "
+                "this is a panel toggle (a dynamic-contrast / eco-dimming / FRC feature may cause "
+                "it) or drift that should be re-measured"
+            )
         if unresolved_all:
             bits.append(
                 f"{len(unresolved_all)} patch(es) would not stabilise: "
@@ -2745,6 +2888,8 @@ def run_measure_loop(
         "neutral_interval_initial": cfg.neutral_interval,
         "neutral_interval_final": loop.neutral_interval_current,
         "neutral_interval_adjustments": loop.neutral_interval_adjustments,
+        "state_recurrences": loop.state_recurrences,
+        "reference_states": states_summary,
         "unresolved": unresolved_all,
         "unresolved_detail": unresolved_detail,
         "white_xyz": [round(c, 4) for c in loop.white_xyz] if loop.white_xyz else None,
