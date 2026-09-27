@@ -619,6 +619,31 @@ JsonValue BuildHookStateJson() {
 // ===========================================================================
 // Read-only handlers (served on the pipe thread)
 // ===========================================================================
+// The correction grayscale as DLC reads it back (fable audit Phase 9, T3), in the SAME
+// decomposition ApplyGrayscalePayload stores: `points` already carry the luminance (main-slider)
+// scale and `deviations` the per-channel BALANCE. So the block handed back VERBATIM to
+// mhc.set_correction_grayscale (no luminance / rgb keys) reproduces the curve exactly — never
+// re-derive it through a signal-domain bridge, which would treat those points as the x-grid.
+// `enabled` is reported for honesty (it is the same bool as layers[key].grayscale); a client
+// restores it with layers.set {grayscale}, since ApplyGrayscalePayload forces it true.
+JsonValue GrayscaleJson(const GrayscaleSettings& gs) {
+    JsonValue out = JObj();
+    out.set("enabled", JBool(gs.enabled));
+    out.set("point_count", JNum((double)gs.pointCount));
+    JsonValue pts = JArr();
+    for (float v : gs.points) pts.arr.push_back(JNum((double)v));
+    out.set("points", std::move(pts));
+    static const char* kChannels[3] = { "r", "g", "b" };
+    JsonValue devs = JObj();
+    for (int c = 0; c < 3; ++c) {
+        JsonValue chan = JArr();
+        for (float v : gs.rgbDeviations[c]) chan.arr.push_back(JNum((double)v));
+        devs.set(kChannels[c], std::move(chan));
+    }
+    out.set("deviations", std::move(devs));
+    return out;
+}
+
 void HandleStateGet(JsonValue& result) {
     result.set("contract_version", JNum((double)kCalibrationContractVersion));
     result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
@@ -661,6 +686,13 @@ void HandleStateGet(JsonValue& result) {
                     if (!m.sourceFilePath.empty())
                         e.set("source_file", JStr(WideToUtf8(m.sourceFilePath)));
                     e.set("active_perm", JNum(m.activePerm));
+                    // The user's CORRECTION grayscale, so DLC can snapshot it before a grayscale
+                    // touch-up and put THEIR curve back on revert (Design B) instead of clearing to
+                    // identity (fable audit Phase 9, T3 / F9-10). Always emitted with the entry. The
+                    // settings loader fills an identity curve (initLinear / initLinearPQ), so points
+                    // are empty only for a display whose settings were never loaded or edited; a
+                    // client that sees NO field is talking to a build that predates it.
+                    e.set("correction_grayscale", GrayscaleJson(m.correctionGrayscale));
                     mhc.set(key, e);
                 }
                 const std::wstring& path = isHDR ? s.hdrPath : s.sdrPath;

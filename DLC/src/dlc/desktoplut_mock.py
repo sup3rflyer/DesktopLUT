@@ -15,6 +15,96 @@ class _MockApiError(Exception):
     """Internal: a request the C++ server would reject (mirrored error text)."""
 
 
+_GS_CHANNELS = ("r", "g", "b")
+_MAX_GS_POINTS = 32   # C++ kMaxMhcGrayscalePoints
+
+
+def _identity_correction_grayscale(is_hdr: bool, point_count: int = 20) -> dict[str, Any]:
+    """C++ ``GrayscaleSettings::initLinear`` (SDR: slot i at signal (i/(N-1))**2) /
+    ``initLinearPQ`` (HDR: i/(N-1)) with unit deviations — what the settings loader fills in, so a
+    real build reports an identity curve (never empty points) for a display with no correction."""
+    n = max(2, int(point_count))
+    ts = [i / (n - 1) for i in range(n)]
+    return {"enabled": False, "point_count": n,
+            "points": [t if is_hdr else t * t for t in ts],
+            "deviations": {ch: [1.0] * n for ch in _GS_CHANNELS}}
+
+
+def _resample_uniform(src: list[float], count: int, fallback: float) -> list[float]:
+    """C++ ``ResampleUniform`` (same-size input passes through untouched)."""
+    if count <= 0:
+        return []
+    if not src:
+        return [fallback] * count
+    if len(src) == count:
+        return list(src)
+    if len(src) == 1 or count == 1:
+        return [src[0]] * count
+    out = []
+    src_max = len(src) - 1
+    for i in range(count):
+        pos = i / (count - 1) * src_max
+        i0 = int(pos)
+        i1 = min(i0 + 1, src_max)
+        t = pos - i0
+        out.append(src[i0] + (src[i1] - src[i0]) * t)
+    return out
+
+
+def _floats(v: Any) -> list[float]:
+    return [float(x) for x in v] if isinstance(v, list) else []
+
+
+def _apply_grayscale_payload(existing: dict[str, Any] | None, p: dict[str, Any]) -> dict[str, Any]:
+    """C++ ``ApplyGrayscalePayload``: what DesktopLUT STORES for a grayscale payload. With the
+    decomposed editor sliders the luminance scales the points curve (``points *= luminance``) and
+    the balance lands on the deviations; without them the payload is stored as sent (a same-size
+    resample is exact). ``enabled`` is forced true. ``luminance`` / ``rgb`` / ``editor_points`` are
+    MOCK-ONLY test probes the C++ does not keep — production DLC reads only the four wire keys."""
+    pc = int(p.get("point_count") or 0)
+    pts = _floats(p.get("points"))
+    dev = p.get("deviations") if isinstance(p.get("deviations"), dict) else {}
+    raw = {ch: _floats(dev.get(ch)) for ch in _GS_CHANNELS}
+    lum = _floats(p.get("luminance"))
+    rgb = p.get("rgb") if isinstance(p.get("rgb"), dict) else None
+    bal = {ch: _floats((rgb or {}).get(ch)) for ch in _GS_CHANNELS}
+    if pc <= 0:
+        pc = len(pts)
+    if pc <= 0:
+        pc = len((existing or {}).get("points") or [])
+    if pc <= 0:
+        pc = 20
+    if len(pts) != pc:
+        pts = [k / (pc - 1) if pc > 1 else 0.0 for k in range(pc)]
+    for ch in _GS_CHANNELS:
+        if len(raw[ch]) != pc:
+            raw[ch] = [1.0] * pc
+    have_lum = len(lum) == pc
+    have_rgb = all(len(bal[ch]) == pc for ch in _GS_CHANNELS)
+    if have_lum and not have_rgb:
+        # luminance without balance: recover it from the composed deviations (= luminance*rgb)
+        bal = {ch: [(raw[ch][k] / lum[k]) if abs(lum[k]) > 1e-6 else 1.0 for k in range(pc)]
+               for ch in _GS_CHANNELS}
+        have_rgb = True
+    dst = min(max(pc, 2), _MAX_GS_POINTS)
+    points = _resample_uniform(pts, dst, 0.0)
+    if have_lum:
+        lum_r = _resample_uniform(lum, dst, 1.0)
+        points = [a * b for a, b in zip(points, lum_r)]
+    out: dict[str, Any] = {
+        "enabled": True,
+        "point_count": dst,
+        "points": points,
+        "deviations": {ch: _resample_uniform(bal[ch] if have_rgb else raw[ch], dst, 1.0) for ch in _GS_CHANNELS},
+    }
+    if have_lum:
+        out["luminance"] = list(lum)
+        out["editor_points"] = list(points)   # what the editor's main slider shows = the stored points
+    if rgb is not None:
+        out["rgb"] = deepcopy(rgb)
+    return out
+
+
 def _fald_file_has_boost(path: Path) -> bool:
     """C++ FaldPanelFileHasBoost: an FLD4 header whose word 48 (boost step count) is 1..24."""
     import struct
@@ -261,6 +351,10 @@ class MockDesktopLutServer:
                 # it — MockDesktopLutState.overlay_tick; the sim is never in DWM-hook mode)
                 out["overlay"] = {"awake": self.state.overlay_tick(poll=True), "dwm_hook_mode": False}
                 out.pop("overlay_model", None)
+                # The C++ emits correction_grayscale on every mhc entry (fable Phase 9 T3), identity
+                # when the display has none (the loader's initLinear) — never absent, never empty.
+                for mhc_key, entry in (out.get("mhc") or {}).items():
+                    entry["correction_grayscale"] = self.correction_grayscale_view(mhc_key)
                 return self.ok(out)
             if method == "hook.set_routing":
                 return self.handle_hook_set_routing(params)
@@ -481,6 +575,21 @@ class MockDesktopLutServer:
     LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
     SHADER_LAYERS = ("tonemap", "fald")      # shader flags: no MHC re-bake
 
+    def correction_grayscale_view(self, key: str) -> dict[str, Any]:
+        """The ``correction_grayscale`` block C++ ``HandleStateGet`` emits on an mhc entry: the
+        stored ``ApplyGrayscalePayload`` decomposition (points already luminance-scaled, deviations
+        = the balance), or the identity curve the settings loader fills in. Handed back verbatim to
+        ``mhc.set_correction_grayscale`` it reproduces the curve exactly."""
+        cg = (self.state.mhc.get(key) or {}).get("correction_grayscale")
+        if not isinstance(cg, dict) or not cg.get("points"):
+            return _identity_correction_grayscale(key.endswith(":HDR"))
+        view = deepcopy(cg)
+        view["enabled"] = bool(cg.get("enabled", True))
+        view["point_count"] = int(cg.get("point_count") or len(cg["points"]))
+        devs = cg.get("deviations") or {}
+        view["deviations"] = {ch: list(devs.get(ch) or []) for ch in _GS_CHANNELS}
+        return view
+
     def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
         """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
         an APPLIED profile re-bakes it under a new name (permutation churn — the profile_name a
@@ -502,6 +611,18 @@ class MockDesktopLutServer:
                     cur[name] = val
                     if name not in self.SHADER_LAYERS:
                         mhc_changed = True
+        if "grayscale" in params and key in self.state.mhc:
+            # C++ DoLayersSet writes MHCSettings::correctionGrayscale.enabled — the bit state.get
+            # reports as correction_grayscale.enabled (and initLinear-fills an empty curve).
+            # KNOWN DIVERGENCE kept from Phase 9 T3: the reverse direction (ApplyGrayscalePayload
+            # forcing it true) is NOT mirrored onto this layer flag, because doing so trips DLC's
+            # hardware-readiness neutral audit on the grayscale-wb pause/resume path — whether that
+            # is a real hardware hazard is an owner question (phase-9.md §5b), not guessed here.
+            entry = self.state.mhc[key]
+            cg = entry.get("correction_grayscale")
+            if not isinstance(cg, dict) or not cg.get("points"):
+                cg = entry["correction_grayscale"] = _identity_correction_grayscale(is_hdr)
+            cg["enabled"] = bool(params["grayscale"])
         self.state.layers[key] = cur
         entry = self.state.mhc.get(key) or {}
         regenerated = False
@@ -707,11 +828,8 @@ class MockDesktopLutServer:
                 "peak_nits": params.get("peak_nits"),
             }
         elif method == "mhc.set_correction_grayscale":
-            state["correction_grayscale"] = {
-                "point_count": params.get("point_count"),
-                "points": deepcopy(params.get("points", [])),
-                "deviations": deepcopy(params.get("deviations", {})),
-            }
+            # C++ DoMhcSetGrayscale -> ApplyGrayscalePayload (enabled forced true)
+            state["correction_grayscale"] = _apply_grayscale_payload(state.get("correction_grayscale"), params)
         elif method == "mhc.grayscale_live_begin":
             # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
             # stacks on top of MHC+3D-LUT and is measurable. No bake yet. Mirrors the C++
@@ -735,26 +853,14 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(
                     ok=False, error="no active grayscale live preview (call mhc.grayscale_live_begin first)")
             gs = params.get("grayscale", {})
-            staged = {
-                "point_count": gs.get("point_count"),
-                "points": deepcopy(gs.get("points", [])),
-                "deviations": deepcopy(gs.get("deviations", {})),
-            }
-            # Decomposed editor sliders (C++ ApplyGrayscalePayload): luminance[] is the
-            # common/main slider, rgb{r,g,b} the balance strips; when present they are
-            # authoritative — luminance scales the points curve (what the editor's main
-            # slider shows) and rgb lands on the RGB balance values. Mirror the mapping so
-            # a --simulate run exercises the same editor-visible split as hardware.
-            lum = gs.get("luminance")
-            rgb = gs.get("rgb")
-            n = len(staged["points"])
-            if isinstance(lum, list) and len(lum) == n:
-                staged["luminance"] = deepcopy(lum)
-                staged["editor_points"] = [float(p) * float(v)
-                                           for p, v in zip(staged["points"], lum)]
-            if isinstance(rgb, dict):
-                staged["rgb"] = deepcopy(rgb)
-            state["correction_grayscale"] = staged
+            # C++ DoGrayscaleSetLive -> ApplyGrayscalePayload: the decomposed editor sliders
+            # (luminance[] = the common/main slider, rgb{r,g,b} = the balance strips) are
+            # authoritative when present — luminance scales the STORED points curve (what the
+            # editor's main slider shows) and rgb lands on the deviations. A synthetic panel reads
+            # the curve the way the shader does: channel output = points[i] * deviations[c][i] at
+            # slot input (i/(N-1))**2 (SDR) or i/(N-1) (HDR).
+            state["correction_grayscale"] = _apply_grayscale_payload(
+                state.get("correction_grayscale"), gs if isinstance(gs, dict) else {})
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.

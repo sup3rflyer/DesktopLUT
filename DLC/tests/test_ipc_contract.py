@@ -967,3 +967,113 @@ def test_install_mhc_flags_unconfirmed_apply(tmp_path, monkeypatch):
     codes = [a.code for a in result.anomalies]
     assert "apply_unconfirmed" in codes and "verify_failed" in codes
     assert result.advice["default_policy_verdict"] == "investigate"
+
+
+# --------------------------------------------------------------------------
+# state.get correction_grayscale: the Design-B revert snapshot (Phase 9 T3)
+# --------------------------------------------------------------------------
+def test_cpp_state_get_exposes_correction_grayscale_on_mhc_entries():
+    """The nested mhc-entry shape the top-level result-key check cannot see: HandleStateGet must
+    emit correction_grayscale on every mhc entry, or the grayscale-wb revert silently degrades to
+    clear-to-identity on hardware while passing in the simulator."""
+    text = _cpp_text()
+    start = text.find("void HandleStateGet(")
+    assert start != -1, "HandleStateGet not found in the C++ IPC server"
+    body = text[start:text.find("\nvoid ", start + 1)]
+    assert 'e.set("correction_grayscale"' in body
+    assert "GrayscaleJson(m.correctionGrayscale)" in body
+
+
+def _cg_probe(state_result, *, monitor=0, mode="SDR"):
+    """Drive Calibration._snapshot_correction_grayscale against a canned state.get result."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import Calibration
+
+    holder = SimpleNamespace(controller=SimpleNamespace(state=lambda: state_result),
+                             monitor=monitor, mode=mode, calib={})
+    snap = Calibration._snapshot_correction_grayscale(holder)
+    return snap, holder.calib.get("grayscale_wb_prior_source")
+
+
+def test_mock_reports_the_identity_curve_for_a_display_without_a_correction():
+    """Mirrors the C++ loader's initLinear / initLinearPQ fill: an applied MHC with no correction
+    reports an identity curve, switched off — never an empty or missing block."""
+    ctrl = CalibrationController.mock()
+    for mode in ("SDR", "HDR"):
+        ctrl.apply_mhc(0, mode)
+    mhc = ctrl.state()["mhc"]
+    sdr, hdr = mhc["0:SDR"]["correction_grayscale"], mhc["0:HDR"]["correction_grayscale"]
+    assert sdr["enabled"] is False and sdr["point_count"] == 20
+    assert sdr["points"] == pytest.approx([(i / 19) ** 2 for i in range(20)])
+    assert hdr["points"] == pytest.approx([i / 19 for i in range(20)])
+    assert all(v == 1.0 for col in sdr["deviations"].values() for v in col)
+
+
+def test_a_luminance_scaled_curve_round_trips_exactly_through_the_raw_setter():
+    """What state.get reports is what DesktopLUT stores — points already x luminance (the main
+    slider), deviations = the balance — so handing it back VERBATIM reproduces the curve exactly.
+    The bridged setter treats those points as DLC's signal x-grid and bends the curve; the
+    reviewer measured ~0.0065 abs at slot 1 for a 1.05 main slider."""
+    ctrl = CalibrationController.mock()
+    ctrl.apply_mhc(0, "HDR")
+    n = 6
+    grid = [i / (n - 1) for i in range(n)]
+    lum = [1.0, 1.05, 1.03, 1.0, 0.98, 1.0]
+    rgb = {"r": [1.0, 1.02, 1.0, 1.0, 1.0, 1.0], "g": [1.0] * n, "b": [1.0, 0.97, 1.0, 1.0, 1.0, 1.0]}
+    devs = {ch: [l * v for l, v in zip(lum, rgb[ch])] for ch in "rgb"}
+    for mode in ("SDR", "HDR"):
+        ctrl.apply_mhc(0, mode)
+        ctrl.grayscale_live_begin(0, mode)
+        ctrl.grayscale_set_live(0, mode, n, grid, devs, luminance=lum, rgb=rgb)
+        ctrl.grayscale_commit(0, mode)
+        before = ctrl.state()["mhc"][f"0:{mode}"]["correction_grayscale"]
+        ctrl.set_correction_grayscale_raw(0, mode, {"point_count": 2, "points": [0.0, 1.0],
+                                                    "deviations": {"r": [1, 1], "g": [1, 1], "b": [1, 1]}})
+        ctrl.set_correction_grayscale_raw(0, mode, before)
+        after = ctrl.state()["mhc"][f"0:{mode}"]["correction_grayscale"]
+        assert after["points"] == before["points"], mode
+        assert after["deviations"] == before["deviations"], mode
+        assert after["point_count"] == before["point_count"]
+    # the raw setter sends ONLY the stored decomposition — never luminance/rgb (a second scale)
+    wire = [r for r in ctrl.client.transport.requests if r.method == "mhc.set_correction_grayscale"][-1]
+    assert set(wire.params) == {"monitor", "mode", "point_count", "points", "deviations"}
+    # ...and the bridged path is NOT a round trip for a luminance-scaled SDR curve
+    sdr = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    ctrl.set_correction_grayscale(0, "SDR", sdr["point_count"], sdr["points"], sdr["deviations"])
+    bridged = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert max(abs(a - b) for a, b in zip(bridged["points"], sdr["points"])) > 1e-3
+
+
+def test_layers_set_grayscale_drives_the_reported_enabled_bit():
+    """C++ DoLayersSet writes correctionGrayscale.enabled — the bit state.get reports — and
+    ApplyGrayscalePayload forces it on; the revert relies on both."""
+    ctrl = CalibrationController.mock()
+    ctrl.apply_mhc(0, "SDR")
+    ctrl.set_correction_grayscale(0, "SDR", 3, [0.0, 0.5, 1.0], {"r": [1, 1.01, 1], "g": [1, 1, 1], "b": [1, 1, 1]})
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is True
+    ctrl.set_layers(0, "SDR", grayscale=False)
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is False
+    ctrl.set_layers(0, "SDR", grayscale=True)
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is True
+
+
+def test_snapshot_correction_grayscale_keeps_the_wire_block_and_says_why_when_none():
+    """The revert snapshot keeps exactly {enabled, point_count, points, deviations} (no mock test
+    probes, nothing that would be re-sent as luminance), and 'empty', 'this build cannot tell me'
+    and 'no entry' stay apart — only one of them is fixed by updating DesktopLUT."""
+    ctrl = CalibrationController.mock()
+    ctrl.apply_mhc(0, "SDR")
+    ctrl.grayscale_live_begin(0, "SDR")
+    ctrl.grayscale_set_live(0, "SDR", 3, [0.0, 0.5, 1.0], {"r": [1, 1.02, 1], "g": [1, 1, 1], "b": [1, 1, 1]},
+                            luminance=[1.0, 1.02, 1.0], rgb={"r": [1, 1, 1], "g": [1, 0.98, 1], "b": [1, 1, 1]})
+    snap, source = _cg_probe(ctrl.state())
+    assert source == "prior"
+    assert set(snap) == {"enabled", "point_count", "points", "deviations"}
+    assert snap["points"] == ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["points"]
+
+    empty = {"mhc": {"0:SDR": {"applied": True, "correction_grayscale": {
+        "enabled": False, "point_count": 20, "points": [], "deviations": {"r": [], "g": [], "b": []}}}}}
+    assert _cg_probe(empty) == (None, "none")
+    assert _cg_probe({"mhc": {"0:SDR": {"applied": True, "profile_name": "user.icm"}}}) == (None, "unsupported")
+    assert _cg_probe({"mhc": {}}) == (None, "unreadable")

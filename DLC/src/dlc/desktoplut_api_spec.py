@@ -65,10 +65,19 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "corrections_enabled": "boolean (the OVERLAY-draw flag, NOT 'a correction is live' — "
                                        "false in DWM-hook mode even with a cube loaded; see ../docs/NAMING.md S4)",
                 "calibration_mode": "object or null",
-                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string}. "
-                       "DLC ALSO wants correction_grayscale {point_count,points,deviations} exposed here "
-                       "(the Design-B grayscale-wb revert snapshot source) — a DesktopLUT-side ticket; "
-                       "until then the snapshot degrades to clear-to-identity on hardware (fable Phase 9)",
+                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string, "
+                       "correction_grayscale:{enabled:bool, point_count:int, points:[float], "
+                       "deviations:{r:[float],g:[float],b:[float]}}}. correction_grayscale is the Design-B "
+                       "grayscale-wb revert snapshot source, in the decomposition DesktopLUT STORES "
+                       "(ApplyGrayscalePayload): points already carry the luminance / main-slider scale, "
+                       "deviations the per-channel balance — so hand it back VERBATIM to "
+                       "mhc.set_correction_grayscale (point_count/points/deviations only, never through the "
+                       "SDR signal bridge, never with luminance/rgb) to reproduce the curve exactly. A display "
+                       "with no correction reports the loader's identity curve (initLinear), so points are "
+                       "empty only for settings never loaded or edited; the field ABSENT = a build predating it "
+                       "(a revert then degrades to clear-to-identity; fable Phase 9 T3). enabled is the same "
+                       "C++ bool as layers[key].grayscale: ApplyGrayscalePayload forces it true, restore it "
+                       "with layers.set",
                 "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
                 "layers": "object keyed by '<monitor>:<MODE>' for EVERY pair: the viewing layers a run "
                           "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"

@@ -219,6 +219,29 @@ class CalibrationController:
             },
         )
 
+    def set_correction_grayscale_raw(self, monitor: int, mode: str, block: dict[str, Any]) -> dict[str, Any]:
+        """Hand a ``state.get`` ``correction_grayscale`` block back to DesktopLUT VERBATIM — no
+        signal-domain bridge (fable Phase 9 T3 revert).
+
+        ``state.get`` reports the curve in the decomposition ``ApplyGrayscalePayload`` STORES:
+        ``points`` already carry the luminance (main-slider) scale, ``deviations`` the per-channel
+        balance. :meth:`set_correction_grayscale` would re-bridge them as if the points were DLC's
+        signal x-grid, which bends any curve with a luminance component (a 1.05 main slider came
+        back ~0.0065 off at slot 1). Only ``point_count`` / ``points`` / ``deviations`` go on the
+        wire — never ``luminance`` / ``rgb``, which would scale the stored points a second time.
+        ``ApplyGrayscalePayload`` forces ``enabled`` true; restore it with :meth:`set_layers`."""
+        points = [float(p) for p in (block.get("points") or [])]
+        return self.call(
+            "mhc.set_correction_grayscale",
+            {
+                "monitor": monitor,
+                "mode": normalize_mode(mode),
+                "point_count": int(block.get("point_count") or len(points)),
+                "points": points,
+                "deviations": _coerce_deviations(block.get("deviations") or {}),
+            },
+        )
+
     @staticmethod
     def _bridge_grayscale(mode, points, deviations, gamma):
         """Translate the DLC's signal-domain grayscale into DesktopLUT's MHC2

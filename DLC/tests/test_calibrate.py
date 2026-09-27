@@ -879,6 +879,25 @@ def _interp_editor_col(x: float, xs: list, ys: list) -> float:
     return float(ys[-1])
 
 
+def _editor_gains(cg: dict, level: float, *, hdr: bool = False) -> list[float]:
+    """Per-channel gain the correction grayscale applies at signal ``level``, decoded the way the
+    shader does from what DesktopLUT STORES (C++ ApplyGrayscalePayload, mirrored by the mock):
+    slot i sits at input (i/(N-1))**2 (SDR) or i/(N-1) (HDR) and outputs points[i]·deviations[c][i]
+    — the points carry the luminance (main slider), the deviations the per-channel balance."""
+    pts = cg.get("points") or []
+    dev = cg.get("deviations") or {}
+    n = len(pts)
+    if n < 2:
+        return [1.0, 1.0, 1.0]
+    xs = [(i / (n - 1)) if hdr else (i / (n - 1)) ** 2 for i in range(n)]
+    gains = []
+    for ch in "rgb":
+        col = list(dev.get(ch) or [1.0] * n)
+        g = [(pts[i] * col[i] / xs[i]) if xs[i] > 0 else col[i] for i in range(n)]
+        gains.append(_interp_editor_col(level, xs, g))
+    return gains
+
+
 def _editor_responsive_panel(ctrl, transfer, *, white_nits: float, tint=(1.0, 1.0, 1.0)):
     """A warm panel that renders THROUGH the mock's live correction-grayscale table —
     the closed loop the real preview shader provides: a set_live nudge changes the very
@@ -893,12 +912,10 @@ def _editor_responsive_panel(ctrl, transfer, *, white_nits: float, tint=(1.0, 1.
     def measure(patch):
         st = (ctrl.state().get("mhc") or {}).get("0:SDR") or {}
         cg = st.get("correction_grayscale") or {}
-        pts = cg.get("points") or []
-        dev = cg.get("deviations") or {}
         level = max(patch.signal)
         gains = [1.0, 1.0, 1.0]
-        if st.get("gs_preview_active") and pts:
-            gains = [_interp_editor_col(level, pts, dev.get(ch) or []) for ch in "rgb"]
+        if st.get("gs_preview_active") and cg.get("points"):
+            gains = _editor_gains(cg, level)
         sig = tuple(min(1.0, max(0.0, s * g * t)) for s, g, t in zip(patch.signal, gains, tint))
         return panel(_replace(patch, signal=sig))
 
@@ -948,15 +965,19 @@ def test_grayscale_wb_decomposed_sliders_and_unreachable_top_target(tmp_path: Pa
     for i in corrected:
         gmean = (payload["rgb"]["r"][i] * payload["rgb"]["g"][i] * payload["rgb"]["b"][i]) ** (1 / 3)
         assert gmean == pytest.approx(1.0, abs=0.02)                  # zero-mean balance
-    # The wire/mock carries the decomposition (SDR-bridged: resampled onto the exact
-    # t² slot grid, so equal to the payload within resampling tolerance) and maps
-    # luminance onto the editor points curve — the main slider — exactly.
+    # The wire carries the decomposition (SDR-bridged: resampled onto the exact t² slot grid,
+    # so equal to the payload within resampling tolerance), and DesktopLUT STORES it the way
+    # ApplyGrayscalePayload does: luminance scales the points curve (the editor's main slider)
+    # and the balance lands on the deviations — so state.get's points are t²·luminance.
     cg = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     assert cg["luminance"] == pytest.approx(payload["luminance"], abs=5e-3)
     for ch in ("r", "g", "b"):
         assert cg["rgb"][ch] == pytest.approx(payload["rgb"][ch], abs=5e-3)
-    assert cg["editor_points"] == pytest.approx(
-        [p * l for p, l in zip(cg["points"], cg["luminance"])])
+        assert cg["deviations"][ch] == pytest.approx(cg["rgb"][ch])
+    n = cg["point_count"]
+    assert cg["points"] == pytest.approx(
+        [(i / (n - 1)) ** 2 * lum for i, lum in enumerate(cg["luminance"])])
+    assert cg["editor_points"] == pytest.approx(cg["points"])
 
     # Defect 3: the touch-up's own edits never masqueraded as panel drift — the
     # reference reads ran through the identity table (the guard), so this closed-loop
@@ -4359,15 +4380,73 @@ def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path
 
 
 def test_grayscale_wb_revert_clears_when_no_prior_correction(tmp_path: Path):
-    # No pre-existing correction → revert clears the touch-up to identity (empty snapshot).
+    # No pre-existing correction: DesktopLUT still reports one — the identity curve its settings
+    # loader fills in (initLinear), switched OFF — and that is what the revert puts back.
     ctrl = _gswb_controller()
     calib = _make(tmp_path, "gswb_revert_clear", controller=ctrl,
                   decision_overrides={"verify:accept": Decision("revert")})
     result = calib.run("grayscale-wb")
     assert result.status == "reverted"
-    assert calib.calib["grayscale_wb_prior"] is None
-    devs = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["deviations"]
-    assert all(abs(v - 1.0) < 1e-9 for col in devs.values() for v in col)  # identity
+    prior = calib.calib["grayscale_wb_prior"]
+    assert calib.calib["grayscale_wb_prior_source"] == "prior"
+    assert prior["enabled"] is False and prior["point_count"] == 20
+    cg = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert all(abs(v - 1.0) < 1e-9 for col in cg["deviations"].values() for v in col)  # identity
+    assert cg["points"] == prior["points"]
+    assert cg["enabled"] is False            # the touch-up's enable did not stick
+
+
+def test_grayscale_wb_revert_restores_a_luminance_scaled_curve_exactly(tmp_path: Path):
+    """The prior curve carries a luminance (main-slider) component. state.get reports it the way
+    DesktopLUT stores it (points already ×luminance), so the revert must hand it back VERBATIM:
+    re-bridging it through set_correction_grayscale treated those points as the x-grid and came
+    back off (the reviewer's ~0.0065 at slot 1 with luminance 1.05)."""
+    ctrl = _gswb_controller()
+    n = 8
+    grid = [i / (n - 1) for i in range(n)]
+    lum = [1.0, 1.05, 1.04, 1.02, 1.01, 1.0, 0.99, 1.0]
+    rgb = {"r": [1.0, 1.02, 1.01, 1.0, 1.0, 1.0, 1.0, 1.0], "g": [1.0] * n,
+           "b": [1.0, 0.98, 0.99, 1.0, 1.0, 1.0, 1.0, 1.0]}
+    devs = {ch: [l * v for l, v in zip(lum, rgb[ch])] for ch in "rgb"}
+    ctrl.grayscale_live_begin(0, "SDR")
+    ctrl.grayscale_set_live(0, "SDR", n, grid, devs, luminance=lum, rgb=rgb)
+    ctrl.grayscale_commit(0, "SDR")
+    prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    identity = [(i / (n - 1)) ** 2 for i in range(n)]
+    assert max(abs(a - b) for a, b in zip(prior["points"], identity)) > 1e-3   # luminance in the points
+
+    calib = _make(tmp_path, "gswb_revert_lum", controller=ctrl,
+                  decision_overrides={"verify:accept": Decision("revert")})
+    assert calib.run("grayscale-wb").status == "reverted"
+    back = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert back["points"] == prior["points"]                     # exact, not approximately
+    assert back["deviations"] == prior["deviations"]
+    assert back["point_count"] == prior["point_count"] and back["enabled"] is True
+    # ...whereas the old bridged restore does NOT reproduce it:
+    ctrl.set_correction_grayscale(0, "SDR", prior["point_count"], prior["points"], prior["deviations"])
+    bridged = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert max(abs(a - b) for a, b in zip(bridged["points"], prior["points"])) > 1e-3
+
+
+def test_grayscale_wb_revert_keeps_a_disabled_prior_curve_disabled(tmp_path: Path):
+    """ApplyGrayscalePayload forces the curve ENABLED, so a revert that only re-sends the prior
+    curve would switch on a correction the user had switched off. The prior on/off state goes
+    back through layers.set."""
+    ctrl = _gswb_controller()
+    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
+                                  gamma=2.2)
+    ctrl.set_layers(0, "SDR", grayscale=False)            # the user keeps it, switched off
+    prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert prior["enabled"] is False and prior["deviations"]["r"] != [1.0] * 4
+
+    calib = _make(tmp_path, "gswb_revert_disabled", controller=ctrl,
+                  decision_overrides={"verify:accept": Decision("revert")})
+    assert calib.run("grayscale-wb").status == "reverted"
+    assert calib.calib["grayscale_wb_prior"]["enabled"] is False
+    back = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert back["enabled"] is False
+    assert back["points"] == prior["points"] and back["deviations"] == prior["deviations"]
 
 
 def test_grayscale_wb_bake_lost_after_restart_is_surfaced(tmp_path: Path):
@@ -4702,14 +4781,12 @@ def test_grayscale_wb_holds_points_that_regress(tmp_path: Path):
     def overreacting_measure(patch):
         st = (ctrl.state().get("mhc") or {}).get("0:SDR") or {}
         cg = st.get("correction_grayscale") or {}
-        pts = cg.get("points") or []
-        dev = cg.get("deviations") or {}
         level = max(patch.signal)
         gains = [1.0, 1.0, 1.0]
-        if st.get("gs_preview_active") and pts:
+        if st.get("gs_preview_active") and cg.get("points"):
             # over-response: the panel applies every editor deviation ~3x (gain**3),
             # so the damped tuner overshoots and oscillates instead of converging
-            gains = [_interp_editor_col(level, pts, dev.get(ch) or []) ** 3 for ch in "rgb"]
+            gains = [g ** 3 for g in _editor_gains(cg, level)]
         # a mild tint so the tuner has something real to chase into the overshoot
         tint = (1.0, 1.015, 0.99)
         sig = tuple(min(1.0, max(0.0, s * g * t)) for s, g, t in zip(patch.signal, gains, tint))
