@@ -64,6 +64,7 @@ from .engine.lut_rbf import (build_cube, cube_diagnostics, hold_lattice_level, i
 from .engine.cube_quality import cube_quality, ideal_cube
 from .engine.model import DisplayErrorModel, Target, TargetSpace, de_itp
 from .engine.physical import StructuredForwardModel, build_physical_cube
+from .refine_convergence import SIGNIFICANCE_K
 
 __all__ = [
     "ProbeFn",
@@ -158,6 +159,25 @@ class OptimizeConfig:
     n_inner_iterations: int = 3
     fade_width: float = 0.05
     near_black_nits: float = 0.1
+    # Exact-code probe reuse: the display is driven at integer CODE values (the probe rounds each driven
+    # signal to ``round(signal * probe_code_levels)``), so two probes on the same codes — or a probe on the
+    # codes of a training (post-MHC) patch, measured through the same MHC-only path — are the SAME
+    # stimulus. Such a probe is answered from the earlier read (a re-read of an identical stimulus adds
+    # no information, only meter time — 35 of 62 min of the BenQ PD2700U 2026-09-27 build) and is scored
+    # like any probe but NOT folded again (the model already holds that read). ``None`` ⇒ every probe is
+    # read (synthetic/continuous probes, back-compat). The orchestrator sets the transfer's max code.
+    probe_code_levels: Optional[int] = None
+    # Seed the cache from the training reads (the orchestrator turns this off when those reads were
+    # rewritten to another display state, e.g. thermally aligned to the stage's start/middle).
+    probe_reuse_seed: bool = True
+    # The cache is only valid while the display is still in the state it was read in (a resumed build
+    # can run hours after post-MHC; BenQ 2026-09-27 attempt B came back 3-5 % brighter). Each pass
+    # re-reads this many cached codes, spread over luminance (a SAMPLING budget, not a target), and
+    # drops the whole cache when their median shift exceeds ``probe_reuse_stale_de`` — one JND in
+    # dE_ITP (~1, BT.2124): below it a reused read is indistinguishable from a fresh one for the
+    # correction; above it the cache describes another display state.
+    probe_reuse_sentinels: int = 8
+    probe_reuse_stale_de: float = 1.0
     # Neutral-axis preservation: fade the cube's correction to identity as the input nears the grey
     # diagonal (R==G==B). The DWM 3D LUT feeds the MHC ICC, and the MHC owns the grey/white axis
     # (1+1+1), so the cube must own colour only in that stacked path; this stops it re-touching neutral (the white
@@ -244,6 +264,14 @@ class IterationResult:
     # CONVERGES in dE_ITP; this is "CIEDE2000" for an SDR run whose surfaced numbers were re-scored,
     # else "dE_ITP". Defaulted so any external constructor / older caller stays valid.
     metric: str = "dE_ITP"
+    # Probes answered from an earlier read of the identical code values (exact-code reuse) — scored,
+    # never re-read, never re-folded. ``probed_patches - reused_probes`` = meter reads this iteration.
+    reused_probes: int = 0
+    sentinels: int = 0                          # cached codes re-read to prove the cache current
+    sentinel_median_de: Optional[float] = None  # their median dE_ITP shift vs the cached reads
+    cache_invalidated: bool = False             # that shift exceeded probe_reuse_stale_de → cache dropped
+    uncached_outliers: int = 0                  # fresh reads kept OUT of the cache (model-gap outliers)
+    fresh_rows: Optional[list[int]] = None      # batch positions read fresh (event-log reconstruction)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -271,6 +299,13 @@ class IterationResult:
             "sample_fraction": round(self.probed_patches / self.probe_total, 4)
                                if self.probe_total else 0.0,
             "sampling_mode": self.sampling_mode,
+            "reused_probes": self.reused_probes,
+            "meter_reads": self.probed_patches - self.reused_probes,
+            "sentinels": self.sentinels,
+            "sentinel_median_de": (round(self.sentinel_median_de, 4)
+                                   if self.sentinel_median_de is not None else None),
+            "cache_invalidated": self.cache_invalidated,
+            "uncached_outliers": self.uncached_outliers,
         }
 
 
@@ -547,6 +582,44 @@ def optimize_cube(
         # subsequent probes update these hints with measured dE.
         score_hint = np.zeros(len(verify), dtype=float)
 
+    # Exact-code reuse cache (see OptimizeConfig.probe_code_levels): code triple → measured XYZ, seeded
+    # with the training reads that sit exactly on a code (the post-MHC patches are code values), then
+    # extended by every fresh probe read.
+    levels = int(cfg.probe_code_levels) if cfg.probe_code_levels else 0
+    code_cache: dict[tuple[int, int, int], np.ndarray] = {}
+
+    def _code_keys(rows: np.ndarray) -> list[tuple[int, int, int]]:
+        q = np.rint(np.clip(rows, 0.0, 1.0) * levels).astype(int)
+        return [(int(a), int(b), int(c)) for a, b, c in q]
+
+    if levels and cfg.probe_reuse_seed:
+        exact = np.all(np.abs(train_signals * levels - np.rint(train_signals * levels)) <= 1e-2, axis=1)
+        for key, xyz_row in zip(_code_keys(train_signals[exact]), train_xyz[exact]):
+            code_cache[key] = np.asarray(xyz_row, dtype=float)
+    reused_total = 0
+    cache_invalidations: list[dict[str, Any]] = []
+
+    def _read(rows: list[int], signals: np.ndarray) -> np.ndarray:
+        if not rows:
+            return np.zeros((0, 3), dtype=float)
+        return np.maximum(np.asarray(probe(signals[rows]), dtype=float).reshape(-1, 3), 0.0)
+
+    def _cacheable(rows: list[int], xyz_rows: np.ndarray, signals: np.ndarray) -> np.ndarray:
+        """Which fresh reads may answer later probes: not a gross outlier against the model the cube
+        was built from (robust 3σ on the batch's model gaps). A single occluded/glitched read
+        (BenQ attempt B 01:54: 60 dE_ITP off the model vs a 0.7 median) must stay re-readable, not
+        become the cached truth for every later pass. Too few reads to judge ⇒ nothing cached."""
+        if len(rows) < 5 or model is None or not hasattr(model, "forward"):
+            return np.zeros(len(rows), dtype=bool)
+        try:
+            pred = np.asarray(model.forward(signals[rows]), dtype=float).reshape(-1, 3)
+            gap = de_itp(space.xyz_to_ictcp(xyz_rows) - space.xyz_to_ictcp(pred))
+        except Exception:  # noqa: BLE001 - no judgement possible ⇒ cache nothing
+            return np.zeros(len(rows), dtype=bool)
+        med = float(np.median(gap))
+        mad = float(np.median(np.abs(gap - med)))
+        return gap <= med + SIGNIFICANCE_K * 1.4826 * max(mad, 1e-9)
+
     # Budget: seed from the measured residual unless pinned.
     budget = (cfg.max_correction if cfg.max_correction is not None
               else seed_correction_budget(space, train_signals, train_xyz,
@@ -656,7 +729,75 @@ def optimize_cube(
         full_probe = len(probe_idx) == len(verify)
 
         driven = sample_cube(cube, verify_probe)
-        measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
+        sentinel_rows: list[int] = []
+        sentinel_median: Optional[float] = None
+        invalidated = False
+        outliers = 0
+        if levels:
+            keys = _code_keys(driven)
+            fresh: dict[int, np.ndarray] = {}           # batch row -> its fresh read
+            hits = [i for i, key in enumerate(keys) if key in code_cache]
+            if hits:
+                # Is the cache still the display's current state? Re-read a luminance-spread sample
+                # of the cached (non-near-black) codes; a median shift beyond one JND drops the cache.
+                seen: set[tuple[int, int, int]] = set()
+                cand = []
+                for i in hits:
+                    if keys[i] not in seen and float(np.max(verify_probe[i])) > cfg.low_light_signal:
+                        seen.add(keys[i])
+                        cand.append(i)
+                cand.sort(key=lambda i: float(code_cache[keys[i]][1]))
+                k = max(0, int(cfg.probe_reuse_sentinels))
+                if len(cand) > k > 0:
+                    pick = np.unique(np.linspace(0, len(cand) - 1, k).round().astype(int))
+                    cand = [cand[j] for j in pick]
+                sentinel_rows = cand if k > 0 else []
+                if len(sentinel_rows) >= 3:
+                    sx = _read(sentinel_rows, driven)
+                    cached = np.array([code_cache[keys[i]] for i in sentinel_rows], dtype=float)
+                    shift = de_itp(space.xyz_to_ictcp(sx) - space.xyz_to_ictcp(cached))
+                    sentinel_median = float(np.median(shift))
+                    for i, xyz_row in zip(sentinel_rows, sx):
+                        fresh[i] = xyz_row
+                    if sentinel_median > cfg.probe_reuse_stale_de:
+                        invalidated = True
+                        code_cache.clear()
+                        cache_invalidations.append({
+                            "iteration": it, "sentinels": len(sentinel_rows),
+                            "median_de_itp": round(sentinel_median, 4),
+                            "max_de_itp": round(float(np.max(shift)), 4)})
+                else:
+                    # Too few cached codes to prove the cache current: read everything this pass.
+                    sentinel_rows = []
+                    code_cache.clear()
+            # Every distinct code triple not cached and not already read as a sentinel: read once
+            # (first occurrence, thermal order kept). Only fresh reads are new ground truth.
+            pending: set[tuple[int, int, int]] = {keys[i] for i in fresh}
+            main_rows: list[int] = []
+            for i, key in enumerate(keys):
+                if key not in code_cache and key not in pending:
+                    pending.add(key)
+                    main_rows.append(i)
+            for i, xyz_row in zip(main_rows, _read(main_rows, driven)):
+                fresh[i] = xyz_row
+            fresh_rows = sorted(fresh)
+            fresh_xyz = np.array([fresh[i] for i in fresh_rows], dtype=float).reshape(-1, 3)
+            ok = _cacheable(fresh_rows, fresh_xyz, driven)
+            outliers = int(len(fresh_rows) - int(ok.sum()))
+            by_key = {keys[i]: fresh[i] for i in fresh_rows}
+            for i, good in zip(fresh_rows, ok):
+                # A sentinel's cached (often multi-read) value stays unless the cache was just dropped.
+                if good and (invalidated or i not in sentinel_rows):
+                    code_cache[keys[i]] = fresh[i]
+            measured = np.array([fresh[i] if i in fresh else (code_cache.get(keys[i]) if keys[i] in code_cache
+                                                               else by_key[keys[i]])
+                                 for i in range(len(keys))], dtype=float).reshape(-1, 3)
+            fold_rows = np.asarray(fresh_rows, dtype=int)
+        else:
+            measured = np.maximum(np.asarray(probe(driven), dtype=float).reshape(-1, 3), 0.0)
+            fold_rows = np.arange(len(driven), dtype=int)
+        reused = int(len(driven) - len(fold_rows))
+        reused_total += reused
         # Optimization score (dE_ITP) — drives score_hint, _classify, convergence, budget, and the
         # returned-cube ranking. NEVER swapped for the report metric (philosophy: optimize in the
         # uniform/invertible ICtCp space; report per-mode).
@@ -705,6 +846,9 @@ def optimize_cube(
             worst_lattice_jump=diag.worst_lattice_jump,
             train_points=int(len(train_signals)), probed_patches=int(len(probe_idx)),
             probe_total=int(len(verify)), sampling_mode=sampling_mode,
+            reused_probes=reused, sentinels=len(sentinel_rows), sentinel_median_de=sentinel_median,
+            cache_invalidated=invalidated, uncached_outliers=outliers,
+            fresh_rows=[int(i) for i in fold_rows],
         )
         history.append(result)
         snapshots.append({"cube": cube, "driven": driven, "measured": measured, "de": de,
@@ -749,12 +893,13 @@ def optimize_cube(
         # Fold reality back: the driven points + their true response are new ground truth where
         # the cube actually operates. Only reached when escalating or genuinely improving — a
         # non-improving (likely noisy) iteration breaks above WITHOUT polluting the model.
-        train_signals = np.vstack([train_signals, driven])
-        train_xyz = np.vstack([train_xyz, measured])
-        train_confidence = np.concatenate([train_confidence, np.ones(len(driven), dtype=float)])
+        train_signals = np.vstack([train_signals, driven[fold_rows]])
+        train_xyz = np.vstack([train_xyz, measured[fold_rows]])
+        train_confidence = np.concatenate([train_confidence, np.ones(len(fold_rows), dtype=float)])
         train_signals, train_xyz, train_confidence = aggregate_training_samples(
             train_signals, train_xyz, train_confidence)
-        train_version += 1
+        if len(fold_rows):
+            train_version += 1   # an all-reused pass adds no ground truth: the model is unchanged
 
     # Pick the cube to return: prefer monotonic, then lowest worst-case dE — using
     # the cached measurements (no extra probing).
@@ -913,6 +1058,11 @@ def optimize_cube(
         "constrained_info": best.get("constrained_info"),
         "best_probed_patches": int(len(best_de)),
         "probe_total": int(len(verify)),
+        "probe_code_levels": levels or None,
+        "probe_reuse_seeded": bool(levels and cfg.probe_reuse_seed),
+        "probe_cache_invalidations": cache_invalidations,
+        "reused_probes": int(reused_total),
+        "meter_probe_reads": int(sum(h.probed_patches - h.reused_probes for h in history)),
         "needs_adjudication": needs_adjudication,
         "history": [h.as_dict() for h in history],
     }

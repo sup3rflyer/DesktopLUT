@@ -352,6 +352,150 @@ def test_build_cube_preserves_black_and_blends_near_black_to_identity():
     assert abs(node[0] - axis[1]) < 0.02 and abs(node[1]) < 0.02 and abs(node[2]) < 0.02
 
 
+class _CodeProbe:
+    """The live probe's contract: the driven signal is shown as integer CODES (``round(s * levels)``),
+    so the panel only ever sees code triples. Records every code triple actually read."""
+
+    def __init__(self, inner, levels: int = 255) -> None:
+        self.inner, self.levels = inner, levels
+        self.read: list[tuple[int, int, int]] = []
+
+    def __call__(self, signals):
+        codes = np.rint(np.clip(np.asarray(signals, dtype=float).reshape(-1, 3), 0, 1) * self.levels)
+        self.read.extend(tuple(int(c) for c in row) for row in codes)
+        return self.inner(codes / self.levels)
+
+
+def test_exact_code_reuse_never_rereads_an_identical_stimulus():
+    # BenQ PD2700U 2026-09-27: 35 of the build's 62 min re-read code triples already measured (in the
+    # post-MHC set — the same MHC-only path — or an earlier probe). An identical code triple is an
+    # identical stimulus: answer it from the earlier read, score it, never fold it twice. The only
+    # deliberate re-reads are the per-pass SENTINELS that prove the cache still current.
+    target = _sdr_target()
+    probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
+    signals = np.rint(_cube_signals(5) * 255) / 255
+    measured = probe.inner(signals)                 # the "post-MHC" training reads (not via .read)
+    cfg = OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4, neutral_band=0.0,
+                         probe_code_levels=255)
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=measured, config=cfg)
+
+    sentinels = sum(h.sentinels for h in result.history)
+    train_codes = {tuple(int(c) for c in row) for row in np.rint(signals * 255)}
+    assert len(probe.read) - len(set(probe.read)) <= sentinels        # re-reads are sentinels only
+    assert len([c for c in probe.read if c in train_codes]) <= sentinels
+    assert result.digest["reused_probes"] > 0
+    assert result.digest["meter_probe_reads"] == len(probe.read)
+    assert result.digest["probe_cache_invalidations"] == []            # same panel ⇒ cache current
+    for h in result.history:
+        assert h.as_dict()["meter_reads"] == h.probed_patches - h.reused_probes
+        assert h.sentinel_median_de is None or h.sentinel_median_de < 1e-9
+    assert result.converged is True and result.digest["best_max_de"] < cfg.threshold
+
+
+def test_exact_code_reuse_across_passes_and_within_a_batch():
+    # Review finding 4: exercise reuse ACROSS outer passes (focused → widened → full) and two verify
+    # points on one code triple.
+    target = _sdr_target()
+    probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
+    signals = np.rint(_cube_signals(7) * 255) / 255
+    verify = np.vstack([signals, signals[:20] + 0.2 / 255])       # sub-code twins of 20 patches
+    cfg = OptimizeConfig(grid_size=9, threshold=0.2, max_outer=3, adaptive_min_full=64,
+                         adaptive_initial_worst=24, adaptive_sentinels=24, adaptive_low_light_cap=24,
+                         probe_code_levels=255)
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=probe.inner(signals),
+                           verify_signals=verify, config=cfg)
+    hist = result.history
+    assert len(hist) >= 2 and sum(h.reused_probes for h in hist[1:]) > 0
+    sentinels = sum(h.sentinels for h in hist)
+    assert len(probe.read) - len(set(probe.read)) <= sentinels
+
+
+class _ShiftedProbe(_CodeProbe):
+    """The display after a resume: 5 % brighter than when the training (post-MHC) set was read."""
+
+    def __call__(self, signals):
+        return 1.05 * super().__call__(signals)
+
+
+def test_a_stale_cache_is_dropped_by_the_sentinels():
+    # Review finding 1: BenQ attempt B came back 3-5 % brighter after a resume; its cached post-MHC
+    # reads describe another display state. The sentinels see the shift and the cache is dropped.
+    target = _sdr_target()
+    probe = _ShiftedProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
+    signals = np.rint(_cube_signals(5) * 255) / 255
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=probe.inner(signals),
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=2, neutral_band=0.0,
+                                                 probe_code_levels=255))
+    first = result.history[0]
+    assert first.cache_invalidated is True and first.sentinel_median_de > 1.0
+    assert first.reused_probes == 0                                   # everything re-read fresh
+    assert result.digest["probe_cache_invalidations"][0]["iteration"] == 1
+
+
+class _GlitchProbe(_CodeProbe):
+    """One occluded read: the first time a given code triple is shown it reads a wrong colour."""
+
+    def __init__(self, inner, bad_code):
+        super().__init__(inner)
+        self.bad_code, self.glitched = bad_code, False
+
+    def __call__(self, signals):
+        out = super().__call__(signals)
+        codes = [tuple(int(c) for c in row) for row in
+                 np.rint(np.clip(np.asarray(signals, dtype=float).reshape(-1, 3), 0, 1) * self.levels)]
+        for i, c in enumerate(codes):
+            if c == self.bad_code and not self.glitched:
+                self.glitched = True
+                out[i] = out[i][[2, 0, 1]] * 3.0                        # a grossly wrong read
+        return out
+
+
+def test_a_glitched_probe_read_is_never_cached():
+    # Review finding 2: a single occluded read must stay re-readable, not become the cached truth.
+    target = _sdr_target()
+    inner = synthetic_probe(target, gains=(1.0, 1.012, 1.025))
+    signals = np.rint(_cube_signals(5) * 255) / 255
+    cfg = OptimizeConfig(grid_size=17, threshold=0.05, max_outer=3, neutral_band=0.0, probe_code_levels=255)
+    # find a code the first pass reads fresh
+    dry = _CodeProbe(inner)
+    optimize_cube(target=target, probe=dry, signals=signals, measured_xyz=inner(signals),
+                  config=OptimizeConfig(grid_size=17, threshold=0.05, max_outer=1, neutral_band=0.0,
+                                        probe_code_levels=255))
+    bad = next(c for c in dry.read if max(c) > 100)
+    probe = _GlitchProbe(inner, bad)
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=inner(signals),
+                           config=cfg)
+    assert probe.glitched and result.history[0].uncached_outliers >= 1
+
+
+def test_exact_code_reuse_folds_only_fresh_reads():
+    target = _sdr_target()
+    probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
+    signals = np.rint(_cube_signals(5) * 255) / 255
+    cfg = OptimizeConfig(grid_size=17, threshold=0.05, max_outer=3, neutral_band=0.0,
+                         probe_code_levels=255)
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=probe.inner(signals), config=cfg)
+    hist = result.history
+    assert len(hist) >= 2
+    # The training set grows by at most the FRESH reads of the previous pass (the aggregation may merge
+    # more) — reused answers are never folded back as new ground truth.
+    for prev, cur in zip(hist, hist[1:]):
+        assert cur.train_points - prev.train_points <= prev.probed_patches - prev.reused_probes
+
+
+def test_probe_reuse_is_off_by_default():
+    target = _sdr_target()
+    probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
+    signals = np.rint(_cube_signals(5) * 255) / 255
+    result = optimize_cube(target=target, probe=probe, signals=signals,
+                           measured_xyz=probe.inner(signals),
+                           config=OptimizeConfig(grid_size=17, threshold=2.0, max_outer=4, neutral_band=0.0))
+    assert result.digest["reused_probes"] == 0 and result.digest["probe_code_levels"] is None
+    assert all(h.reused_probes == 0 for h in result.history)
+
+
 def test_adaptive_sampling_starts_focused_then_forces_full_validation():
     target = _sdr_target()
     probe = synthetic_probe(target, gains=(1.0, 1.012, 1.025))

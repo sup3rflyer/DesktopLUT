@@ -1951,6 +1951,13 @@ class Calibration:
             data = result.as_dict()
             self._last_optimizer = dict(data)
             self.runlog.optimizer_iteration(**data)
+            fresh_rows = getattr(result, "fresh_rows", None)
+            if fresh_rows is not None and getattr(result, "reused_probes", 0):
+                # Stream tier: which batch rows were metered (the patch_read seq order) vs answered from
+                # the exact-code cache — what an offline replay needs to rebuild the pass.
+                self.runlog.emit("INFO", "build-install-3dlut", "probe_reuse", tier="stream",
+                                 iteration=data.get("iteration"), fresh_rows=fresh_rows,
+                                 probed=data.get("probed_patches"), reused=data.get("reused_probes"))
             # The optimizer is the long pole (it can run for hours). Emit a §12 evidence packet
             # between iterations so a multi-hour optimize never goes dark for the LLM.
             self._maybe_timed_checkin("build-install-3dlut")
@@ -5637,6 +5644,15 @@ class Calibration:
             measured = np.array([s.xyz for s in samples], dtype=float)
             cube_path = str(self.ctx.root / "generated" / f"final_{self.mode.lower()}.cube")
             cfg, premise = self._cube_oog_solve(self._cube_optimize_config(), target, signals, measured)
+            if self._probe is None and cfg.probe_code_levels is None:
+                # The live probe drives integer codes of this transfer (``_probe_fn``) through the same
+                # MHC-only path the post-MHC set was measured on: an identical code triple is an identical
+                # stimulus, answered from the earlier read (OptimizeConfig.probe_code_levels) — while the
+                # per-pass sentinels prove the display is still in that state. A post-MHC set thermally
+                # re-aligned to its start/middle no longer holds reads of the CURRENT state: no seeding.
+                align = ((self.calib.get("thermal_align") or {}).get("measure:post-mhc") or {}).get("choice")
+                cfg = replace(cfg, probe_code_levels=int(self._transfer().max_cv),
+                              probe_reuse_seed=align not in ("start", "mid"))
             # The level edge (D4) is decided + pinned here, after the solve mode (it needs the projection solve).
             reachable, level_edge = self._cube_level_edge(cfg, target, signals, measured)
             try:
