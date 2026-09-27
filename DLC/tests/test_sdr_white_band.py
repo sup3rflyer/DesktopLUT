@@ -589,3 +589,27 @@ def test_malformed_white_band_is_a_clean_cli_error(capsys):
         main(["--flow", "refine-mhc", "--white-band", "abc"])
     assert exc.value.code == 2
     assert "white_nits_band" in capsys.readouterr().err
+
+
+def test_cube_targets_the_refined_white_not_the_nominal(tmp_path):
+    """The 3D-LUT engine target must use the white luminance the SDR refine DELIVERED: targeting
+    the nominal (120) over an accepted below-band white (107.2) asks the cube for an unreachable
+    brighter tone curve — the top clips and the refined greys are lifted off the MHC (BenQ run
+    20260926_225451: 280 'floor' patches, neutral mean 0.36 -> 0.68)."""
+    calib = _make(tmp_path, "cube_white")
+    calib.stage_resolve_target()
+    nominal = calib._engine_target().peak_nits
+    assert nominal == pytest.approx(calib._spec().luminance_nits)   # no refine yet: nominal stands
+    calib._state.setdefault("mhc_params", {})["sdr_white"] = {"white_nits": 107.2343,
+                                                               "status": "below_band"}
+    assert calib._engine_target().peak_nits == pytest.approx(107.2343)
+    assert calib._sdr_refined_white_nits() == pytest.approx(107.2343)
+    calib._state["mhc_params"]["sdr_white"] = {"white_nits": None}
+    assert calib._engine_target().peak_nits == pytest.approx(nominal)
+
+
+def test_hdr_engine_target_ignores_an_sdr_white(tmp_path):
+    calib = _make(tmp_path, "cube_white_hdr", mode="HDR", bit_depth=10)
+    calib.stage_resolve_target()
+    calib._state.setdefault("mhc_params", {})["sdr_white"] = {"white_nits": 107.2}
+    assert calib._engine_target().peak_nits == pytest.approx(10000.0)

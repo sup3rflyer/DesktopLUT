@@ -1271,12 +1271,33 @@ class Calibration:
     def _engine_target(self):
         # The 3D-LUT correction targets the SAME resolved white the MHC stages do.
         target = self.profile.engine_target(self.target_name, white_xy=self._white_xy())
+        # ...and the SAME white luminance: an SDR grayscale refine that chose a white inside (or,
+        # adjudicated, below) the white band delivers THAT white, not the target's nominal nits.
+        # Targeting the nominal would ask the cube for an unreachable brighter tone curve — every
+        # signal above (white/nominal)^(1/γ) clipped at the top and the refined greys lifted off
+        # the MHC (BenQ run 20260926_225451: 107.2-nit white vs 120 nominal → 280 "floor" patches).
+        if getattr(target, "transfer", None) != "pq":
+            white_nits = self._sdr_refined_white_nits()
+            if white_nits is not None:
+                target = replace(target, peak_nits=white_nits)
         # The OOG policy is memoised in the run record the first time it is used (_oog_mapping):
         # a resume keeps building/scoring/projecting with the policy the run started with.
         cached = (getattr(self, "calib", None) or {}).get("oog_mapping")
         if cached and cached != getattr(target, "oog_mapping", cached):
             target = replace(target, oog_mapping=str(cached))
         return target
+
+    def _sdr_refined_white_nits(self) -> Optional[float]:
+        """The white luminance THIS run's SDR MHC refine delivered (``mhc_params['sdr_white']``,
+        written by the white-band refine), or ``None`` when no refine chose one (the target's
+        nominal nits then stand)."""
+        params = (getattr(self, "_state", None) or {}).get("mhc_params") or {}
+        white = (params.get("sdr_white") or {}).get("white_nits")
+        try:
+            white = float(white)
+        except (TypeError, ValueError):
+            return None
+        return white if white > 0 else None
 
     def _reachable_primaries(self) -> Optional[dict]:
         """The panel's MEASURED native primaries — THIS run's (from the raw stage's channel model,
@@ -5288,7 +5309,7 @@ class Calibration:
         if cfg.oog_solve != "projection" or reach is None:
             return cfg, None
         from .engine.cube_quality import premise_check
-        cap = float(self._hdr_target().peak_nits) if self.mode == "HDR" else float(self._spec().luminance_nits)
+        cap = float(self._hdr_target().peak_nits) if self.mode == "HDR" else float(target.peak_nits)
         premise = premise_check(signals, measured, target, reach, self._white_xy(), cap)
         if premise.get("passed") is True:
             return cfg, premise
