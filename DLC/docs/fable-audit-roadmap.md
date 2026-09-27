@@ -1145,6 +1145,18 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-8 | `windows.set_hdr` live flip on the box: toggle monitor 0 SDR→HDR→SDR over the pipe; confirm the OS flip, DesktopLUT's MHC reapply on WM_DISPLAYCHANGE, and `query_monitors` tracking `hdr_active`/`color_space`; then one `--mode HDR` run end-to-end without touching Windows Settings | Phase 9 |
 | — | *(phases append here)* | |
 
+**Dispositions 2026-09-27** (offline, from the recorded runs — full evidence + reproducing scripts in
+[`audits/fable/hw-queue-dispositions-2026-09-27.md`](audits/fable/hw-queue-dispositions-2026-09-27.md)):
+HW-2, HW-4 (property), HW-5, HW-6 **closed by analysis**; HW-1, HW-3, HW-7 (capture) **closed on evidence**;
+**HW-8 still owed on hardware** (~10 min flip protocol + one `mhc-only` HDR run on the PA32UCXR, in the report).
+Offline follow-ups it raised: HW-1 — PA SDR like-for-like 0.39 → 0.51 on 133 common signals, driven by dim
+saturated primaries (confounded by the CCMX change: the June runs read SDR through the HDR CCMX; matches the
+open "SDR cube over-desaturates primaries" note — an SDR cube-engine look, bears on P9); HW-4 — single-read strays
+still escalate the dark floor to 5 nit (worked around with `--dark-floor-max-nits 60`), and `noise_trust` treats a
+zero spread (two identical quantised reads) as proof of real drift; HW-5 — the P16 `cap_nits_nonadditive_est`
+field was retired by `0d37207` (keep the nominal cap; the refine lands exact D65 by giving up 0.5–0.8 %);
+HW-7 — the P3 HDR thresholds (3/6/10/4) were never re-derived from the post-P1 core numbers (owner/LLM decision).
+
 ## 8. v3 horizon — packaging & interface (parked)
 
 **Status: parked, deliberately.** v2 — this audit, and confidence in what's been
