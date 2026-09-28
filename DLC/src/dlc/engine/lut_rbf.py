@@ -30,7 +30,7 @@ import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import ConvexHull, QhullError
 
-from .model import DisplayErrorModel, de_itp
+from .model import DE_ITP_SCALE, DisplayErrorModel, de_itp
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +136,53 @@ def hold_lattice_level(top: Optional[float], grid_size: int) -> Optional[float]:
 
 
 OOG_SOLVES = ("direct", "projection")
+INNER_STEPS = ("fixed_point", "gain_aware")
+
+# ITP weights of the ICtCp components (BT.2124: T = Ct / 2), squared — the inner product the gain-aware step
+# measures the model's response in, so the gain is taken in the metric the loop converges in (dE_ITP).
+_ITP_W2 = np.array([1.0, 0.25, 1.0])
+# Ceiling on the gain the gain-aware step damps for: its step fraction α never drops below 1/4. Set above every
+# PHYSICAL gain measured along the cube's own corrections (PA32UCXR SDR HW: ≤ 2.6 on run 133655's worst patches,
+# 2.9–3.2 on June's small steps; the model's first-step chord gain p99 1.8–2.0 on the four SDR models, > 4 on
+# ≤ 4 of ~35 800 lattice nodes), so it does not bind on a real gain — closed-loop replays of run 133655 (oracle
+# and physics sim, 4 noise seeds each) give the same numbers (3 decimals, same reversal counts) with and without
+# it. It is a guard, not a tuning: a node whose model gain estimate is an outlier still closes ≥ 1/4 of its step
+# per iteration, and any true gain < 2 × 4 converges (|1 − g/4| < 1). results/_replays/2026-09-28_gain_step/
+# (v3_*.out).
+GAIN_AWARE_MAX_GAIN = 4.0
+
+
+def _chord_gain(d_ideal: np.ndarray, d_response: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The model's gain along a step: the response change projected on the ideal change, in the dE_ITP inner
+    product — ``g = <dF, dI> / <dI, dI>``. Returns ``(g, measurable)``; ``measurable`` is False where the step's
+    ideal change is float dust (a converged node — the step is nil either way, so its gain is meaningless)."""
+    den = np.sum(_ITP_W2 * d_ideal * d_ideal, axis=1)
+    num = np.sum(_ITP_W2 * d_response * d_ideal, axis=1)
+    # (720·|dI|)² < 1e-12 ⇔ the step moves the ideal by < 1e-6 dE_ITP: numerically nil, no physical claim.
+    measurable = den * DE_ITP_SCALE ** 2 > 1e-12
+    g = np.where(measurable, num / np.where(measurable, den, 1.0), 1.0)
+    return g, measurable
+
+
+def _secant_fraction(residual: np.ndarray, d_ideal: np.ndarray,
+                     d_response: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The fraction ``α`` of the fixed-point step the gain-aware update takes, and the nodes it damps.
+
+    To first order the model answers along the step as ``F(cur + α·step) ≈ F(cur) + α·dF``. For an untruncated
+    candidate (``dI = r``, the residual ``T − F(cur)``) the root is ``α = 1/g``. Where the budget clamp, a 0/1
+    rail or the hull fade cut the candidate short, the root of the residual projected on the step (Galerkin,
+    dE_ITP inner product) ``<r, dI> / <dF, dI>`` lies further out, and the node takes that instead — a node bound
+    by one reaches it rather than closing only ``1/g`` of the remaining gap per iteration. So
+    ``α = max(1/g, <r, dI>/<dF, dI>)``, clipped to ``[1/GAIN_AWARE_MAX_GAIN, 1]`` — never shorter than the plain
+    secant (continuous at g → 1, where it is the legacy step). Damping only: ``g ≤ 1`` (or an unmeasurable step)
+    and ``α = 1`` keep the full step."""
+    g, measurable = _chord_gain(d_ideal, d_response)
+    num = np.sum(_ITP_W2 * residual * d_ideal, axis=1)
+    den = np.sum(_ITP_W2 * d_response * d_ideal, axis=1)          # = g·<dI, dI> > 0 wherever g > 1
+    damp = measurable & (g > 1.0)
+    alpha = np.ones(len(g))
+    alpha[damp] = np.clip(np.maximum(1.0 / g[damp], num[damp] / den[damp]), 1.0 / GAIN_AWARE_MAX_GAIN, 1.0)
+    return alpha, damp & (alpha < 1.0)
 
 
 def _solve_at(model: DisplayErrorModel, solve: np.ndarray, signal_points: np.ndarray, *,
@@ -164,7 +211,8 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
                n_iterations: int = 3, convergence_tol: float = 1e-6,
                near_black_nits: float = 0.1, neutral_band: float = 0.05,
                hold_above: Optional[float] = None, best_iterate: bool = False,
-               best_iterate_margin: float = 2.0, oog_solve: str = "direct") -> np.ndarray:
+               best_iterate_margin: float = 2.0, oog_solve: str = "direct",
+               inner_step: str = "fixed_point") -> np.ndarray:
     """Build a ``(grid_size, grid_size, grid_size, 3)`` corrected LUT.
 
     Indexed ``lut[b, g, r]`` (B slowest, R fastest) — the order :func:`write_cube`
@@ -215,9 +263,42 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
       verified to decode colorimetrically (drives > 1 % outside native 56 % → 29 %).
       With a level-edge target space (``model.space.level_gamut``, design D4) the solve point is re-mapped after
       the top projection (the edge depends on luminance); nothing else changes.
+
+    ``inner_step`` — the per-node update of the inversion loop:
+
+    * ``"fixed_point"`` (default, bit-identical to every build before 2026-09-28): ``s ← ideal⁻¹(T − δ(s))``. It
+      never looks at the panel's response to a drive change — it assumes the panel answers like the ideal (gain
+      1). Linearised, the node error goes ``e ← (1 − g)·e`` per step, with ``g`` the panel's gain along the step
+      relative to the ideal: it converges only for ``0 < g < 2``. Behind the PA32UCXR's SDR MHC2 (Windows mixes
+      the channels in sRGB-piecewise linear light) small off-channel drive answers at g ≈ 2 (HW median 1.94, 2.6
+      worst): a period-2 cycle held only by the 0-clip, and an odd ``n_iterations`` ships the overshoot — the
+      MHC's dim over-saturation mirrored into desaturation, neighbouring nodes on opposite phases (run 133655:
+      red 0.25 2.37 → 2.98 ΔE2000, 1250 large reversals).
+    * ``"gain_aware"`` (2026-09-28): the same fixed-point step, then a secant along it — one extra model
+      evaluation measures the model's gain ``g`` along the full step (:func:`_chord_gain`, in the dE_ITP inner
+      product), and the node takes the fraction of the step that roots the model's linearised response along
+      it (:func:`_secant_fraction`: ``1/g`` for an untruncated candidate, up to the residual's own root where
+      the budget clamp, a rail or the fade cut the candidate short), re-measured every iteration (the response
+      is concave — a large first step sees the sRGB-toe gain, later short steps less). It only ever DAMPS:
+      ``g ≤ 1`` (including ``g ≤ 0``, a response against the step) keeps the legacy full step — where the
+      fixed point already converges monotonically it is untouched, and it never lengthens a step toward an
+      unreachable target (bright-blue nodes of run 133655 sit at g < 0.5, many already at the budget or a 0/1
+      rail: amplifying would double their steps into it). The step never drops below
+      1/:data:`GAIN_AWARE_MAX_GAIN` of the candidate (a guard above every physical gain measured; it binds in
+      no replay). The damped point is a convex combination of the current iterate and the fixed-point
+      candidate, so the budget clamp, the [0, 1] clip and the hull fade all still hold without re-applying
+      them. Out-of-gamut-target nodes (the reachable clamp moved their target — HDR only) keep the legacy
+      step: their step is a gamut-corner walk, not a descent (the rough blue-corner lattice, run 132412), and
+      the projection solve (:func:`_solve_at`) stays legacy too (both run ``n_iterations`` legacy steps — the
+      caller's count, which for a pinned gain_aware HDR build is the gain-aware count).
+      Where the model's gain is exactly 1 the result IS the legacy one; near 1 both converge to the same fixed
+      point and differ only on nodes the legacy step had not converged (an off-channel toe at 0 — output
+      within 0.02 dE_ITP, gain-aware never worse by the model).
     """
     if oog_solve not in OOG_SOLVES:
         raise ValueError(f"oog_solve must be one of {OOG_SOLVES}, got {oog_solve!r}")
+    if inner_step not in INNER_STEPS:
+        raise ValueError(f"inner_step must be one of {INNER_STEPS}, got {inner_step!r}")
     space = model.space
     signal_points = np.asarray(signal_points, dtype=float)
 
@@ -268,6 +349,14 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
         best_corrected = corrected.copy()
         de_last = de_itp(model.forward_ictcp(corrected, delta) - target_ictcp)
         best_de = de_last.copy()
+    gain_aware = inner_step == "gain_aware"
+    if gain_aware:
+        # The raw (unclamped) ideal is what the fixed point inverts (xyz_to_signal never clamps) and what the
+        # model's error field is trained against: the gain is measured on it. Nodes whose target the reachable
+        # clamp moved keep the legacy step (see the docstring).
+        raw_ideal = model._raw_space.ideal_ictcp
+        ideal_cur = raw_ideal(corrected)
+        damp_ok = ~np.any(np.abs(ideal_cur - target_ictcp) > 1e-9, axis=1)
     for _it in range(n_iterations):
         # display produces ideal(corrected)+delta(corrected); we want that to
         # equal ideal(input) → ideal(corrected) should be target - delta.
@@ -281,11 +370,28 @@ def build_cube(model: DisplayErrorModel, grid_size: int, signal_points: np.ndarr
         w = fade_weight[:, np.newaxis]
         corrected_new = (1 - w) * corrected_new + w * points
 
+        if gain_aware:
+            # Secant along the fixed-point step: the model's response at the candidate vs the ideal's, and
+            # the node goes the fraction α of the way that roots it (≈ 1/g; damping only, α ≥ 1/4).
+            delta_new = model.predict(corrected_new)
+            ideal_new = raw_ideal(corrected_new)
+            d_ideal = ideal_new - ideal_cur
+            alpha, damp = _secant_fraction(target_ictcp - (ideal_cur + delta), d_ideal,
+                                           d_ideal + (delta_new - delta))
+            damp &= damp_ok
+            if np.any(damp):
+                corrected_new[damp] = (corrected[damp]
+                                       + (corrected_new[damp] - corrected[damp]) * alpha[damp, np.newaxis])
+                delta_new[damp] = model.predict(corrected_new[damp])
+                ideal_new[damp] = raw_ideal(corrected_new[damp])
+
         inside = ~outside
         convergence = (np.max(np.abs(corrected_new[inside] - corrected[inside]))
                        if np.any(inside) else 0.0)
         corrected = corrected_new
-        if best_iterate or (_it + 1 < n_iterations and convergence >= convergence_tol):
+        if gain_aware:
+            delta, ideal_cur = delta_new, ideal_new
+        elif best_iterate or (_it + 1 < n_iterations and convergence >= convergence_tol):
             delta = model.predict(corrected)
         if best_iterate:
             de_last = de_itp(model.forward_ictcp(corrected, delta) - target_ictcp)
