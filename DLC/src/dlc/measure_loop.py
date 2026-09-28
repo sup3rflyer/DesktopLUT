@@ -1034,7 +1034,11 @@ class _Loop:
                 restarts_total=self.meter_restarts, read_ok=bool(reading.ok),
                 death_exit_code=raw.get("meter_death_exit_code"),
                 death_tail=raw.get("meter_death_tail"),
-                message=("spotread had died and was respawned by the meter's bounded self-heal"
+                restart_reason=raw.get("meter_restart_reason"),
+                message=(("a timed-out reading never arrived, so the out-of-sync spotread was stopped "
+                          "and respawned (no late reading can be attributed to a later patch)"
+                          if raw.get("meter_restart_reason") == "resync" else
+                          "spotread had died and was respawned by the meter's bounded self-heal")
                          + ("; the reading after the respawn is valid" if reading.ok else "")))
         if reading.xyz is not None:
             # The instrument produced data (even a warning-demoted read) → the meter is alive.
@@ -1061,7 +1065,9 @@ class _Loop:
         if not (terminal or streak_trip) or self.meter_down:
             return
         error = reading.error or "meter read failed (no error text)"
-        reason = ("meter self-heal exhausted (the dead spotread could not be respawned)"
+        reason = (("meter self-heal exhausted (the out-of-sync spotread could not be respawned)"
+                   if raw.get("meter_restart_reason") == "resync" else
+                   "meter self-heal exhausted (the dead spotread could not be respawned)")
                   if terminal else
                   f"{self._meter_fault_streak} consecutive meter-process faults")
         self.meter_down = True
@@ -3494,6 +3500,8 @@ def make_persistent_spotread_meter(
             _time.sleep(settle_seconds)
         restarts_before = getattr(persistent, "restarts", 0)
         failures_before = getattr(persistent, "restart_failures", 0)
+        deaths_before = getattr(persistent, "deaths", 0)
+        resyncs_before = getattr(persistent, "resync_restarts", 0)
         res = persistent.measure()
         raw: dict[str, Any] = {"persistent": True, "result": res.raw}
         # Meter-PROCESS health for the loop's read guard (distinct from a measurement-quality
@@ -3507,12 +3515,19 @@ def make_persistent_spotread_meter(
         # A self-heal respawn happened inside this read: surface it (with the dead process's
         # own output) so the loop can put it on the LLM's evidence stream.
         attempts = getattr(persistent, "restarts", 0) - restarts_before
+        resyncs = getattr(persistent, "resync_restarts", 0) - resyncs_before
+        if resyncs > 0:
+            # Not a death: a timed-out reading never arrived, so the out-of-sync process was stopped
+            # (and respawned within budget) — no late reading can land on a later patch.
+            raw["meter_restart_reason"] = "resync"
+            raw["meter_resync_restarts"] = resyncs
         if attempts > 0:
             failed = getattr(persistent, "restart_failures", 0) - failures_before
             raw["meter_restart_attempts"] = attempts
             raw["meter_restarts"] = max(0, attempts - failed)   # respawns that came up alive
-            raw["meter_death_tail"] = getattr(persistent, "last_death_tail", None)
-            raw["meter_death_exit_code"] = getattr(persistent, "last_death_exit_code", None)
+            if resyncs <= 0 or getattr(persistent, "deaths", 0) > deaths_before:
+                raw["meter_death_tail"] = getattr(persistent, "last_death_tail", None)
+                raw["meter_death_exit_code"] = getattr(persistent, "last_death_exit_code", None)
         return Reading(
             xyz=res.xyz,
             yxy=res.yxy,

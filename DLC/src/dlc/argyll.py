@@ -416,9 +416,19 @@ class PersistentSpotread:
     Self-correcting against the i1 DisplayPro's real behaviour:
     - **Drain-before-trigger:** :meth:`measure` discards any readings already queued
       (a stray instrument-switch press, a startup-calibration reading, a prior
-      desync) BEFORE sending its trigger, then consumes exactly one fresh reading —
-      so producer/consumer can never drift off-by-one (a reading is never returned
-      for the wrong patch).
+      desync) BEFORE sending its trigger, then consumes exactly one fresh reading.
+    - **Resync after a timeout:** a read that TIMES OUT leaves its trigger owed — spotread
+      is still measuring (it serves triggers strictly in order) and its result can land
+      AFTER the next call's drain, where it would be returned for the NEXT patch (an
+      off-by-one that persists across back-to-back re-reads, each result arriving just
+      after the following drain). So the next :meth:`measure` first waits (bounded by the
+      read timeout) for every owed result and discards it (``late_discarded``); if an owed
+      result never arrives it cannot be ruled out later, so the out-of-sync process is
+      stopped and respawned (``resync_restarts``, within the self-heal budget) — a fresh
+      process owes nothing; when the budget is spent the meter fails as down instead (every
+      later read fails fast, never re-waiting). spotread's ``Spot read failed …`` line is
+      the trigger's outcome too (a failed reading, returned at once — not a timeout).
+      Together a reading is never returned for the wrong patch.
     - **Validity gate:** a reading is ``ok`` only if XYZ parsed AND (when present) the
       XYZ and Yxy luminances agree (catches a corrupted/garbled line); a spotread
       warning demotes it. Low/zero luminance is NOT rejected — black patches are real.
@@ -466,6 +476,7 @@ class PersistentSpotread:
         restart_budget: int = 3,
         restart_window_s: float = 600.0,
         restart_backoff_s: float = 3.0,
+        resync_timeout: Optional[float] = None,
     ) -> None:
         self._factory = factory
         self._trigger = trigger
@@ -474,6 +485,10 @@ class PersistentSpotread:
         self._read_timeout = read_timeout
         self._poll_interval = poll_interval
         self._quiesce_seconds = quiesce_seconds
+        # How long the next measure() waits for a timed-out read's owed result before giving up on
+        # it and respawning (None ⇒ that call's read timeout: the meter cannot serve a new trigger
+        # before it finishes the owed one anyway, so a healthy-but-slow meter costs nothing extra).
+        self._resync_timeout = resync_timeout
         # Self-heal bounds: at most `restart_budget` respawns within any `restart_window_s`
         # sliding window (window <= 0: the budget never refills — a lifetime cap) AND at most
         # `restart_budget` within any single measure() call (so a slow respawn-and-die cycle
@@ -497,13 +512,17 @@ class PersistentSpotread:
         self._eof = False
         self._started = False
         self._recent_lines: deque[str] = deque(maxlen=self._RECENT_LINES)  # this process's output tail
+        self._owed = 0                 # triggers of THIS process that timed out; results still due
         self._gen = 0                  # process generation: a superseded reader thread goes inert
         self._close_gen = 0            # bumped by close(): an in-flight measure() must not respawn
         self._closed = False           # sticky after close(): no process is spawned until start()
         self._death_recorded_gen = -1  # a death is recorded once per process generation
-        # diagnostics (read after a run; surfaced in the digest later)
+        # diagnostics (read after a run; :meth:`summary` — the run's workflow.log meter line)
         self.stale_discarded = 0
         self.extra_readings = 0
+        self.timeouts = 0              # reads that timed out with the process alive (result owed)
+        self.late_discarded = 0        # owed results that arrived late and were discarded at resync
+        self.resync_restarts = 0       # owed results that never arrived → out-of-sync process stopped
         self.restarts = 0              # respawn attempts made by the self-heal
         self.restart_failures = 0      # respawn attempts that did not come up alive
         self.deaths = 0                # process deaths (or failed spawns) observed
@@ -558,9 +577,18 @@ class PersistentSpotread:
                 self._recent_lines.append(line.strip())
             self._classify_locked(line)
 
+    # spotread's own per-trigger failure line ("Spot read failed due to misread …", "… due to
+    # communication problem …"): the trigger was consumed and no "Result is" line will follow.
+    _READ_FAILED = "spot read failed"
+
     def _classify_locked(self, line: str) -> None:
         low = line.lower()
-        if "result is" in low and "xyz:" in low:
+        if self._READ_FAILED in low:
+            # The trigger's outcome: a failed reading (returned at once instead of waiting out the
+            # read timeout, and it settles an owed trigger at resync). A warning before it was its.
+            self._pending_warning = None
+            self._results.append(SpotreadResult(None, None, ok=False, error=line.strip(), raw=line.strip()))
+        elif "result is" in low and "xyz:" in low:
             xyz = parse_xyz(line)
             yxy = parse_yxy(line)
             ok, err = self._validate(xyz, yxy)
@@ -680,6 +708,7 @@ class PersistentSpotread:
                 self._saw_cal = False
                 self._eof = False
                 self._recent_lines.clear()
+                self._owed = 0             # a fresh process owes no reading
                 reader = threading.Thread(target=self._reader_loop, args=(proc, gen),
                                           name="spotread-reader", daemon=True)
                 # Started while publishing it under the lock, so a concurrent close() can never
@@ -937,6 +966,16 @@ class PersistentSpotread:
                 # The lifecycle has begun: recovery is now the BUDGETED self-heal's job, not an
                 # unbounded lazy re-spawn on every later call (close() resets this).
                 self._started = True
+        attempts = [0]   # respawns spent by THIS call (capped at restart_budget)
+        # A previous read timed out with its trigger still owed: take its late result out of the
+        # stream (or respawn) BEFORE triggering, so it can never be returned for this patch.
+        with self._lock:
+            owed = self._owed
+        if owed:
+            failed = self._resync(close_gen, attempts, self._resync_timeout
+                                  if self._resync_timeout is not None else (timeout or self._read_timeout))
+            if failed is not None:
+                return failed
         # Drain readings queued BEFORE this trigger — they predate this patch.
         with self._lock:
             stale = len(self._results)
@@ -948,7 +987,6 @@ class PersistentSpotread:
             self._pending_warning = None
         context = "idle"
         base = "spotread process is not running"
-        attempts = [0]   # respawns spent by THIS call (capped at restart_budget)
         # Bounded: every pass that does not return consumes ≥1 respawn attempt from the
         # sliding-window budget (or returns once the budget is spent / the meter was closed).
         while True:
@@ -963,11 +1001,70 @@ class PersistentSpotread:
             if res is not None:
                 return res
             if not self._process_down():
+                # Alive but silent: spotread may still be measuring THIS trigger — its result is
+                # owed, and the next call resyncs past it (never returns it for the next patch).
+                with self._lock:
+                    self._owed += 1
+                    self.timeouts += 1
                 return SpotreadResult(None, None, ok=False, error="timed out waiting for a reading",
                                       raw=self._tail()[:500])
             # Died while we waited for the reading → record + self-heal, then re-trigger.
             context = "mid-read"
             base = "spotread exited before a reading"
+
+    def _resync(self, close_gen: int, attempts: list[int], budget: float) -> Optional[SpotreadResult]:
+        """Consume the result(s) owed to timed-out triggers of this process (discarded: they belong
+        to earlier patches). Waits up to ``budget`` seconds. ``None`` = in sync (or the process is
+        down — :meth:`measure`'s down path self-heals it, and a new process owes nothing). If an owed
+        result never arrives it could still land at any later moment, so the process is respawned
+        (bounded self-heal); a failure result when that is impossible (budget spent / closed)."""
+        end = time.monotonic() + max(0.0, budget)
+        while True:
+            with self._lock:
+                if self._results and self._owed > 0:
+                    take = min(len(self._results), self._owed)
+                    del self._results[:take]
+                    self._owed -= take
+                    self.late_discarded += take
+                    # a warning printed before the late reading belonged to that reading
+                    self._pending_warning = None
+                if self._owed <= 0:
+                    return None
+            if self._closed_since(close_gen):
+                return self._down_result(close_gen, "spotread resync interrupted")
+            if self._dead():
+                return None
+            if time.monotonic() >= end:
+                break
+            time.sleep(self._poll_interval)
+        # The owed reading never came: it could still land at any later moment, so this process can
+        # never be trusted in sync again. Stop it (a deliberate teardown, not a spotread death — no
+        # death is recorded for it) so no later call re-waits on it, then respawn within the budget.
+        with self._lock:
+            proc = self._proc
+            self._death_recorded_gen = self._gen
+            self._owed = 0
+        if proc is not None:
+            self._stop_process(proc, polite=False)
+        self.resync_restarts += 1
+        if self._self_heal(close_gen, attempts):
+            return None
+        closed = self._closed_since(close_gen)
+        return SpotreadResult(
+            None, None, ok=False, fault="closed" if closed else "self_heal_exhausted",
+            error=(f"spotread out of sync: a timed-out reading never arrived within {budget:.0f}s; the "
+                   "out-of-sync process was stopped and "
+                   + ("the meter was closed by its owner" if closed else
+                      f"could not be respawned (self-heal budget {self._restart_budget} spent)")))
+
+    def summary(self) -> dict[str, int]:
+        """The meter's lifetime counters (for the run's workflow.log): process deaths / respawns,
+        reads that timed out, late results discarded at resync, resync respawns, and readings
+        discarded as stale before a trigger / as extra echoes alongside one."""
+        return {"deaths": self.deaths, "restarts": self.restarts,
+                "restart_failures": self.restart_failures, "timeouts": self.timeouts,
+                "late_discarded": self.late_discarded, "resync_restarts": self.resync_restarts,
+                "stale_discarded": self.stale_discarded, "extra_readings": self.extra_readings}
 
     def _wait_result(self, timeout: float) -> Optional[SpotreadResult]:
         end = time.monotonic() + timeout
