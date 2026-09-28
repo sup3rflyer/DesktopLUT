@@ -43,10 +43,13 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 from .colormath import invert3x3, matvec, rgb_to_xyz_matrix, xy_to_XYZ
 from .mhc import Ti3Sample
+
+if TYPE_CHECKING:  # dlc.meter_quantum imports METER_XYZ_RESOLUTION from here (no runtime cycle)
+    from .meter_quantum import CountQuantum
 
 # ST 2084 lives in dlc._pq (the one shared stdlib copy — the Phase 1 audit consolidated
 # the four verbatim ports of mhc.cpp PqEOTF/PqOETF). Re-exported here because the cube
@@ -130,20 +133,33 @@ def _xyz_from_nits_xy(nits: float, x: float, y: float) -> tuple[float, float, fl
 
 
 def floor_level_noise(noise: Optional[float], xyz: Sequence[float],
-                      resolution: float = METER_XYZ_RESOLUTION) -> Optional[float]:
-    """A level's measured chroma noise (SE of the mean ``xy``) floored at the meter's print
-    quantisation for THAT level (:func:`xy_quantization_sigma`) — so a zero spread (reads identical
-    after quantisation, or a σ rounded to 0 in the sidecar) is never read as "noise-free" proof.
+                      resolution: float = METER_XYZ_RESOLUTION, *,
+                      count_quantum: Optional["CountQuantum"] = None) -> Optional[float]:
+    """A level's measured chroma noise (SE of the mean ``xy``) floored at the meter's quantisation for
+    THAT level — so a zero spread (reads identical after quantisation, or a σ rounded to 0 in the
+    sidecar) is never read as "noise-free" proof. Two quantisations, the larger wins:
+
+    * **print** (:func:`xy_quantization_sigma`) — the 6-decimal XYZ format, every level;
+    * **count** (``count_quantum``, a :class:`dlc.meter_quantum.CountQuantum` learned from the run's
+      reads) — above ~15 nit an i1d3 frequency-counts every channel, so reads sit on an integer-count
+      lattice and cannot resolve below one count (10⁴–10⁵× the print step). Applied only where the
+      lattice :meth:`~dlc.meter_quantum.CountQuantum.applies` (at/above the dimmest read the run proved
+      counted); below it channels are period-measured and only the print floor holds. The noise
+      sidecar already applies it per level from each level's own reads
+      (:func:`dlc.measure_loop.read_noise_sidecar`), so consumers of sidecar noise inherit it without
+      passing a quantum here.
 
     ``None`` stays ``None``: <2 reads = NO repeatability evidence, whose meaning is the caller's
     (documented at each call site — it is not "zero noise"). ``+inf`` (an ``unstable`` level) stays
-    ``+inf``. Otherwise ``max(noise, quantisation)``."""
+    ``+inf``. Otherwise ``max(noise, print, count)``."""
     if noise is None:
         return None
     noise = float(noise)
     if math.isinf(noise):
         return noise
     q = xy_quantization_sigma(xyz, resolution)
+    if count_quantum is not None and count_quantum.applies(xyz):
+        q = max(q, count_quantum.xy_sigma(xyz))
     return max(noise, q) if not math.isnan(noise) else q
 
 

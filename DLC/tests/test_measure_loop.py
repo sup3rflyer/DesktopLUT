@@ -491,6 +491,203 @@ def test_noise_reads_is_per_round_not_lifetime_after_remeasure(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
+# i1d3 count quantum (dlc.meter_quantum): the sidecar's per-level count floor + the recorded SE floor
+# ---------------------------------------------------------------------------
+
+_Q_PROART = ((0.083688, 0.031480, -0.000197), (0.035229, 0.068796, 0.000812),
+             (0.037449, 0.000949, 0.176918))
+
+
+class _CountingPanel:
+    """A :data:`MeasureFn` modelling an i1d3 on a D65 SDR panel: at/above ``threshold`` nits every
+    channel is frequency-counted (the read is ``Q·n``, integer ``n``, printed at 6 decimals — the
+    ProArt HDR lattice), below it period-measured (continuous). ``jitter`` = per-channel count noise
+    (0 ⇒ repeated reads of a counted patch come back bit-identical, as the recorded runs do)."""
+
+    def __init__(self, *, white: float = 110.0, threshold: float = 15.0, jitter: float = 0.0,
+                 seed: int = 4) -> None:
+        import random
+
+        from dlc.meter_quantum import CountQuantum
+        from dlc.metrics import SRGB_TO_XYZ_D65
+        self.q = CountQuantum(steps=_Q_PROART, min_counted_nits=threshold)
+        self.m = SRGB_TO_XYZ_D65
+        self.white, self.threshold, self.jitter = white, threshold, jitter
+        self.rng = random.Random(seed)
+
+    def true_xyz(self, signal):
+        lin = [max(0.0, float(c)) ** 2.2 for c in signal]
+        return tuple(self.white * sum(self.m[i][j] * lin[j] for j in range(3)) for i in range(3))
+
+    def __call__(self, patch: MeasurePatch) -> Reading:
+        t = self.true_xyz(patch.signal)
+        if t[1] >= self.threshold:
+            n = self.q.counts(t)
+            k = [round(c + (self.rng.uniform(-self.jitter, self.jitter) if self.jitter else 0.0)) for c in n]
+            x = tuple(round(sum(_Q_PROART[j][i] * k[j] for j in range(3)), 6) for i in range(3))
+        else:
+            x = tuple(round(v * (1.0 + self.rng.gauss(0.0, 3e-4)), 6) for v in t)
+        return Reading(xyz=x, yxy=(x[1], 0.31, 0.33), ok=True)
+
+
+def _counting_run(tmp_path: Path, name: str, *, jitter: float = 0.0, extra=(), n_grey: int = 14):
+    t = _sdr()
+    panel = _CountingPanel(jitter=jitter)
+    ti3 = tmp_path / f"{name}.ti3"
+    res = run_measure_loop(
+        patches=_grey_ramp(t, n_grey) + list(extra), transfer=t, measure=panel,
+        config=MeasureLoopConfig(neutral_min_reads=3),
+        ti3_path=ti3, ndjson_path=tmp_path / f"{name}.ndjson")
+    return res, ti3, panel
+
+
+def _sibling_with_lattice(tmp_path: Path, name: str = "raw") -> None:
+    from dlc.meter_quantum import CountQuantum
+    from dlc.measure_loop import noise_sidecar_path
+    block = {"status": "learned", **CountQuantum(steps=_Q_PROART, min_counted_nits=15.0).as_dict()}
+    noise_sidecar_path(tmp_path / f"{name}.ti3").write_text(
+        json.dumps({"schema": 2, "count_quantum": block, "by_level": {}}), encoding="utf-8")
+
+
+def test_read_noise_sidecar_applies_the_count_floor_per_level_and_keeps_spread_raw(tmp_path: Path):
+    import math
+    from dlc.measure_loop import noise_sidecar_path, read_noise_sidecar, read_noise_sidecar_spread
+    ti3 = tmp_path / "raw.ti3"
+    noise_sidecar_path(ti3).write_text(json.dumps({"schema": 2, "count_quantum": {"status": "learned"},
+        "by_level": {
+            "0.600000": {"chroma_sigma": 0.0, "reads": 2, "unstable": False,          # identical, counted
+                         "count_quantised": True, "count_sigma_xy": 2.3e-4},
+            "0.700000": {"chroma_sigma": 1e-3, "reads": 4, "unstable": False,         # real spread above it
+                         "count_quantised": True, "count_sigma_xy": 1.9e-4},
+            "0.100000": {"chroma_sigma": 1e-5, "reads": 4, "unstable": False,         # period-measured
+                         "count_quantised": False},
+            "0.800000": {"chroma_sigma": 0.01, "reads": 5, "unstable": True,
+                         "count_quantised": True, "count_sigma_xy": 1.7e-4},
+            "0.900000": {"chroma_sigma": None, "reads": 1, "unstable": False,
+                         "count_quantised": True, "count_sigma_xy": 1.5e-4},
+        }}), encoding="utf-8")
+    se = dict(read_noise_sidecar(ti3))
+    assert se[0.6] == 2.3e-4                        # zero spread → the count floor (not "noise-free")
+    assert math.isclose(se[0.7], 1e-3 / 2.0)        # a measured SE above the floor is kept
+    assert math.isclose(se[0.1], 1e-5 / 2.0)        # period mode: no count term
+    assert se[0.8] == math.inf and se[0.9] is None  # unstable / no-evidence semantics unchanged
+    # the per-read σ feeding the monotone law stays RAW (no count floor propagates below ~15 nit)
+    assert dict(read_noise_sidecar_spread(ti3))[0.6] == (0.0, 2)
+
+
+def test_identical_counted_reads_get_a_count_floor_without_changing_any_read(tmp_path: Path):
+    # Bright counted greys read bit-identical (σ = 0). With an earlier session's lattice available the
+    # sidecar marks them count-quantised and floors their SE at one count; period-measured dim greys
+    # get no count term. The loop's decisions are untouched: same reads, same .ti3, as a run without
+    # the lattice (the floor lives on the consumer side only).
+    from dlc.measure_loop import noise_sidecar_path, read_noise_sidecar
+    base = tmp_path / "a"
+    with_lattice = tmp_path / "b"
+    base.mkdir()
+    with_lattice.mkdir()
+    _sibling_with_lattice(with_lattice)
+    res_a, ti3_a, panel = _counting_run(base, "refine_1")
+    res_b, ti3_b, _ = _counting_run(with_lattice, "refine_1")
+    assert res_a.total_reads == res_b.total_reads
+    assert ti3_a.read_text(encoding="utf-8") == ti3_b.read_text(encoding="utf-8")
+    assert res_b.digest["count_quantum"]["status"] == "adopted"
+    assert res_a.digest["count_quantum"]["status"] == "none"          # nothing to learn from: says why
+    side = json.loads(noise_sidecar_path(ti3_b).read_text(encoding="utf-8"))
+    assert side["schema"] == 2 and side["count_quantum"]["source"] == "sibling:raw.ti3"
+    se = dict(read_noise_sidecar(ti3_b))
+    se_plain = dict(read_noise_sidecar(ti3_a))
+    counted = dimmed = 0
+    for key, v in side["by_level"].items():
+        lvl = float(key)
+        nits = panel.true_xyz((lvl, lvl, lvl))[1]
+        if nits >= 20.0:
+            counted += 1
+            assert v["count_quantised"] and v["chroma_sigma"] == 0.0
+            assert v["count_sigma_xy"] > 5e-5 and se[lvl] == v["count_sigma_xy"]
+            assert v["se_de"] > 0.0                                   # recorded SE: the count floor
+            assert se_plain[lvl] == 0.0                               # without a lattice: "noise-free"
+        elif nits < 10.0:
+            dimmed += 1
+            assert not v["count_quantised"] and "count_sigma_xy" not in v
+            assert se[lvl] == se_plain[lvl]
+    assert counted >= 3 and dimmed >= 3
+
+
+def test_count_floor_stays_out_of_the_stop_rule_even_above_tolerance():
+    # Near the counting threshold on a dim SDR white one count is > read_tolerance_de (≈0.28 dE2000
+    # at 16 nit / 100 nit white). Identical counted reads still converge at the read floor (the stop
+    # rule compares the RAW SE, 0); the RECORDED SE then carries the count floor — above the tolerance.
+    from dlc.meter_quantum import CountQuantum
+    t = _sdr()
+    q = CountQuantum(steps=_Q_PROART, min_counted_nits=15.0)
+    cfg = MeasureLoopConfig(neutral_min_reads=3)
+
+    def lattice(nits):
+        d = (0.3127 / 0.3290 * nits, nits, (1.0 - 0.3127 - 0.3290) / 0.3290 * nits)
+        k = [round(c) for c in q.counts(d)]
+        return tuple(round(sum(_Q_PROART[j][i] * k[j] for j in range(3)), 6) for i in range(3))
+
+    levels = [16.0, 25.0, 40.0, 60.0, 90.0]
+    seq = [lattice(n) for n in levels for _ in range(3)]
+    loop = _solo_loop(_ScriptedPanel(seq), t, cfg)
+    loop.white_xyz = (0.3127 / 0.3290 * 100.0, 100.0, (1.0 - 0.3127 - 0.3290) / 0.3290 * 100.0)
+    recs = []
+    for i in range(len(levels)):
+        cv = (400 + 100 * i,) * 3
+        recs.append(loop.measure_patch(_patch(f"g{i}", cv, t, i), phase="main"))
+    assert all(r.reads_taken == 3 for r in recs)                     # converged at the floor, as before
+    assert all(r.se_de < 1e-9 for r in recs)                         # the raw SE the stop rule saw
+    assert loop._sample_se_de(list(recs[0].round_reads)) < 1e-9       # raw estimator unchanged
+    got, block = loop.finalize_count_quantum([("raw.ti3", q)])
+    assert got is not None and block["status"] == "adopted"
+    assert all(r.se_de > 0.0 for r in recs)                          # consumer-side: one count
+    assert recs[0].se_de > cfg.read_tolerance_de > recs[-1].se_de    # 16 nit: floor above tolerance
+
+
+def test_own_lattice_beats_an_identical_sibling_copy():
+    # Float noise in |det| must not decide own-vs-sibling for the SAME lattice: the session's own
+    # learn is reported "learned" (and so is offered to later sessions), not "adopted".
+    from dlc.measure_loop import select_count_quantum
+    from dlc.meter_quantum import CountQuantum, learn_count_quantum
+    panel = _CountingPanel(jitter=0.45, seed=9)
+    import random
+    rng = random.Random(9)
+    groups = []
+    for _ in range(60):
+        sig = (rng.uniform(0.45, 1.0), rng.uniform(0.45, 1.0), rng.uniform(0.45, 1.0))
+        p = MeasurePatch(label="x", rgb=(0, 0, 0), signal=sig)
+        groups.append([panel(p).xyz for _ in range(3)])
+    own, _ev = learn_count_quantum(groups)
+    assert own is not None
+    sib = CountQuantum(steps=tuple(tuple(c * (1 + 1e-7) for c in s) for s in own.steps), min_counted_nits=15.0)
+    q, block = select_count_quantum(groups, [("raw.ti3", sib), ("verify.ti3", sib)])
+    assert block["status"] == "learned" and q.source == "learned"
+
+
+def test_session_learns_its_own_lattice_and_backfill_reproduces_the_live_sidecar(tmp_path: Path):
+    # A session with count jitter learns its lattice from its own reads; re-deriving the sidecar from
+    # the recorded ndjson (backfill_count_floor, the replay path) reproduces the live annotations.
+    from dlc.measure_loop import backfill_count_floor, noise_sidecar_path
+    t = _sdr()
+    colours = [(c1, c2, c3) for c1 in (700, 900) for c2 in (650, 1000) for c3 in (600, 950)]
+    res, ti3, _ = _counting_run(tmp_path, "raw", jitter=0.45, extra=colours, n_grey=24)
+    assert res.digest["count_quantum"]["status"] == "learned", res.digest["count_quantum"]
+    live = json.loads(noise_sidecar_path(ti3).read_text(encoding="utf-8"))
+    assert any(v["count_quantised"] for v in live["by_level"].values())
+    # strip the count annotations (a schema-1 sidecar, as older runs recorded) and back-fill
+    stripped = {k: {kk: vv for kk, vv in v.items() if not kk.startswith("count_")}
+                for k, v in live["by_level"].items()}
+    noise_sidecar_path(ti3).write_text(json.dumps({"schema": 1, "by_level": stripped}), encoding="utf-8")
+    block = backfill_count_floor(ti3)
+    again = json.loads(noise_sidecar_path(ti3).read_text(encoding="utf-8"))
+    assert block["status"] == "learned" and block["steps"] == live["count_quantum"]["steps"]
+    for k, v in live["by_level"].items():
+        assert again["by_level"][k].get("count_quantised") == v.get("count_quantised"), k
+        assert again["by_level"][k].get("count_sigma_xy") == v.get("count_sigma_xy"), k
+    assert t.max_cv > 0
+
+
+# ---------------------------------------------------------------------------
 # cross-patch read-integrity guard (frozen presenter / mid-run dark panel)
 # ---------------------------------------------------------------------------
 
