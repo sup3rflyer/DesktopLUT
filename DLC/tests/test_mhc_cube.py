@@ -207,8 +207,10 @@ def test_adaptive_dark_floor_follows_dark_chroma_drift():
 def test_adaptive_dark_floor_hdr_anchors_on_diffuse_white_not_overdriven_peak():
     # HDR: the brightest patch (1000 nits) is overdriven/ABL-shifted; the diffuse-white band
     # (100-203) is stable at D65. A dark read that tracks D65 must NOT be flagged just because it
-    # differs from the shifted peak — only the genuinely-wandering dark read sets the floor.
-    reads = [(0.3, 0.34, 0.30),       # dark, genuinely wandering
+    # differs from the shifted peak — only the genuinely-wandering dark reads set the floor (two
+    # adjacent ones: a lone single-read stray no longer raises the floor on its own).
+    reads = [(0.2, 0.33, 0.31),       # dark, genuinely wandering
+             (0.3, 0.34, 0.30),       # dark, genuinely wandering
              (0.5, 0.3127, 0.329),    # dark, on diffuse white
              (2.0, 0.3127, 0.329),    # dark, on diffuse white
              (120.0, 0.3127, 0.329),  # diffuse-white band
@@ -243,9 +245,12 @@ def test_noise_trust_gates_on_snr():
     assert mc.noise_trust(0.05, 0.01) == 1.0           # error >> noise (5σ)
     mid = mc.noise_trust(0.02, 0.01)                    # 2σ -> partial
     assert 0.0 < mid < 1.0
-    # no measured noise (single read / perfect) -> trust fully
+    # no repeatability evidence (single read) -> the gate is not engaged (caller's floor governs)
     assert mc.noise_trust(0.02, None) == 1.0
-    assert mc.noise_trust(0.02, 0.0) == 1.0
+    # a zero spread is NOT proof of zero noise: callers floor it at the meter quantisation, and an
+    # unfloored 0 is a caller bug that must not silently score "proven real"
+    with pytest.raises(ValueError):
+        mc.noise_trust(0.02, 0.0)
     # more readings tighten σ (SE shrinks) -> the SAME error clears the gate
     assert mc.noise_trust(0.02, 0.02) < mc.noise_trust(0.02, 0.02 / (4 ** 0.5))
 
@@ -813,9 +818,10 @@ def test_adaptive_dark_floor_unstable_dark_read_still_raises_floor():
 
 
 def test_adaptive_dark_floor_sigma_less_strays_stay_conservative():
-    # Without σ (single-read run / no sidecar) a strayed dark read keeps the old conservative
-    # behaviour: noise and real drift are indistinguishable, so the floor rises (3-tuples and
-    # 4-tuples with noise=None behave identically).
+    # Without σ (single-read run / no sidecar) noise and real drift are indistinguishable, so strays
+    # that CORROBORATE each other (here two adjacent dark strays) keep the conservative behaviour and
+    # raise the floor (3-tuples and 4-tuples with noise=None behave identically). A lone σ-less stray
+    # does not — see test_adaptive_dark_floor_sigma_less_needs_corroboration.
     reads3 = [(0.3, 0.34, 0.30), (0.8, 0.33, 0.31), (2.0, 0.315, 0.328),
               (50.0, 0.3127, 0.3290), (300.0, 0.3127, 0.3290)]
     reads4 = [(n, x, y, None) for (n, x, y) in reads3]
@@ -823,6 +829,198 @@ def test_adaptive_dark_floor_sigma_less_strays_stay_conservative():
     f4, i4 = mc.adaptive_dark_floor(reads4, chroma_tolerance=0.008, bounds=(0.1, 5.0))
     assert f3 == f4 == 0.8
     assert i3["n_strayed"] == i4["n_strayed"] == 2
+
+
+# --- single-read strays + zero-spread "proof" (HW-4 caveats 2/3, 2026-09-27) ---
+
+def _xy_read(nits, x, y, se=None, read_sigma=None):
+    return (nits, x, y, se, read_sigma)
+
+
+def test_adaptive_dark_floor_single_read_stray_beyond_meter_noise_does_not_escalate():
+    # PA32UCXR 013909 shape: multi-read dark levels carry σ and REAL drift; the mid-tones are single
+    # reads, two of which stray (6 and 23.5 nits) by ~0.01 — 300x the chroma noise the dimmer
+    # multi-read levels measured. Meter noise cannot produce that, so they must NOT lift the floor to
+    # the 5-nit cap (which blended identity up to ~90 nits and threw away the σ-proven dark
+    # correction); they are surfaced as `unverified` evidence instead.
+    ref = (0.3104, 0.3262)
+    reads = [
+        _xy_read(0.0055, ref[0] - 0.050, ref[1] - 0.018, 7.2e-4, 1.0e-3),   # REAL (σ-proven)
+        _xy_read(0.073, ref[0] - 0.022, ref[1] - 0.002, 4.6e-5, 6.5e-5),    # REAL
+        _xy_read(0.97, ref[0] - 0.0084, ref[1] + 0.001, 6.4e-6, 9e-6),      # REAL
+        _xy_read(1.55, ref[0] - 0.005, ref[1] + 0.002, 1.2e-5, 1.7e-5),     # clean, measured
+        _xy_read(4.07, ref[0] - 0.0025, ref[1] + 0.001),                    # single read, clean
+        _xy_read(5.99, ref[0] - 0.0123, ref[1] + 0.001),                    # single-read STRAY
+        _xy_read(8.65, ref[0] - 0.0025, ref[1] + 0.001),                    # single read, clean
+        _xy_read(23.5, ref[0] - 0.0089, ref[1] + 0.0024),                   # single-read STRAY
+        _xy_read(31.6, ref[0] - 0.0058, ref[1] + 0.0023),
+        _xy_read(55.0, ref[0] - 0.002, ref[1]),
+        _xy_read(120.0, *ref), _xy_read(180.0, *ref),                       # diffuse-white band
+        _xy_read(400.0, *ref), _xy_read(900.0, *ref), _xy_read(1500.0, *ref),
+        _xy_read(1700.0, *ref), _xy_read(1750.0, *ref), _xy_read(1800.0, *ref),
+        _xy_read(1810.0, *ref), _xy_read(1820.0, *ref), _xy_read(1830.0, *ref),
+    ]
+    floor, info = mc.adaptive_dark_floor(reads, reference_band=mc.HDR_REFERENCE_WHITE_BAND)
+    assert floor == 0.1, info
+    assert info["n_strayed"] == 0 and info["n_real_drift"] == 3
+    assert info["n_unverified"] == 2 and {u["basis"] for u in info["unverified"]} == {"beyond_noise"}
+    for u in info["unverified"]:
+        assert u["noise_bound"] is not None and 3 * u["noise_bound"] < u["drift"]
+    # The same data WITHOUT any σ (a single-read run): no measured noise bounds the mid-tone strays
+    # and the unmeasured dark chain below them is itself strayed — noise and drift are
+    # indistinguishable, so the conservative floor stands (corroborated, not "by itself").
+    bare = [r[:3] for r in reads]
+    floor_bare, info_bare = mc.adaptive_dark_floor(bare, reference_band=mc.HDR_REFERENCE_WHITE_BAND)
+    assert floor_bare == 5.0 and info_bare["floor_set_by"]["basis"] == "corroborated", info_bare
+    assert info_bare["n_unverified"] == 0
+
+
+def test_adaptive_dark_floor_single_read_within_measured_noise_escalates():
+    # Corroborated by physics: the dimmer multi-read level measured a per-read chroma σ of 0.004, so a
+    # single read just above it that strays by 0.009 is within 3σ of what the meter can do there —
+    # noise-plausible → the floor rises over it (and says why).
+    reads = [
+        _xy_read(0.02, 0.3127, 0.3290, 0.0028, 0.004),       # noisy meter, measured, on white
+        _xy_read(0.03, 0.3127 + 0.009, 0.3290),              # single read, strays by 0.009
+        _xy_read(0.5, 0.3127, 0.3290, 1e-4, 1.4e-4),
+        _xy_read(20.0, 0.3127, 0.3290), _xy_read(150.0, 0.3127, 0.3290),
+        _xy_read(400.0, 0.3127, 0.3290),
+    ]
+    floor, info = mc.adaptive_dark_floor(reads, reference_band=None, bounds=(0.01, 5.0))
+    assert floor == pytest.approx(0.03) and info["n_strayed"] == 1, info
+    assert info["floor_set_by"] == {"nits": 0.03, "basis": "noise_plausible"}
+
+
+def test_adaptive_dark_floor_sigma_less_needs_corroboration():
+    # No repeatability evidence anywhere (single-read run): a lone stray does not lift the floor; an
+    # adjacent stray — the next level, or a second read of the same level — corroborates it.
+    base = [(20.0, 0.3127, 0.3290), (150.0, 0.3127, 0.3290), (400.0, 0.3127, 0.3290)]
+    lone = [(0.3, 0.3127, 0.3290), (0.8, 0.33, 0.31), (2.0, 0.3127, 0.3290)] + base
+    f1, i1 = mc.adaptive_dark_floor(lone, bounds=(0.1, 5.0))
+    assert f1 == 0.1 and i1["n_strayed"] == 0 and i1["unverified"][0]["basis"] == "uncorroborated"
+    pair = [(0.3, 0.34, 0.30), (0.8, 0.33, 0.31), (2.0, 0.3127, 0.3290)] + base
+    f2, i2 = mc.adaptive_dark_floor(pair, bounds=(0.1, 5.0))
+    assert f2 == 0.8 and i2["floor_set_by"]["basis"] == "corroborated"
+    second_read = [(0.3, 0.3127, 0.3290), (0.8, 0.33, 0.31), (0.8001, 0.331, 0.309),
+                   (2.0, 0.3127, 0.3290)] + base
+    f3, _i3 = mc.adaptive_dark_floor(second_read, bounds=(0.1, 5.0))
+    assert f3 == pytest.approx(0.8001)
+    # 2026-06-21 shape: a strayed (noise-limited) dark chain, one read just inside tolerance, then a
+    # stray above it. Single-read noise does not respect the tolerance line, and noise grows toward
+    # black — the unmeasured chain below corroborates it, so the conservative floor keeps it.
+    gapped = [(0.1, 0.34, 0.30), (0.2, 0.33, 0.31), (0.3, 0.3127 + 0.007, 0.3290),
+              (0.8, 0.33, 0.31), (2.0, 0.3127, 0.3290)] + base
+    f4, i4 = mc.adaptive_dark_floor(gapped, bounds=(0.01, 5.0))
+    assert f4 == 0.8 and i4["floor_set_by"]["basis"] == "corroborated" and i4["n_unverified"] == 0
+
+
+def test_adaptive_dark_floor_corroboration_is_order_independent_and_final():
+    # Tied luminances + mixed evidence: the result must not depend on input order, and a single read
+    # already judged BEYOND the measured noise must not corroborate anything (adversarial review).
+    import itertools
+    base = [(20.0, 0.3127, 0.3290), (150.0, 0.3127, 0.3290), (400.0, 0.3127, 0.3290)]
+    a = (0.3, 0.33, 0.31)                         # σ-less stray, nothing measured below it
+    b = (0.5, 0.33, 0.31)                         # σ-less stray, bounded by c → beyond noise
+    c = (0.5, 0.3127, 0.3290, 1e-5, 1.4e-5)       # measured, clean
+    floors = set()
+    for perm in itertools.permutations([a, b, c]):
+        f, info = mc.adaptive_dark_floor(list(perm) + base, bounds=(0.1, 5.0))
+        floors.add((f, info["n_strayed"], info["n_unverified"]))
+    assert floors == {(0.1, 0, 2)}, floors
+
+
+def test_monotone_noise_floor_never_more_repeatable_than_the_brighter_level():
+    # Reads that came back identical (σ=0) at 0.003 nit cannot claim more repeatability than the meter
+    # showed one level brighter; a level whose own σ is larger keeps it; None / +inf pass through.
+    levels = [(0.003, 0.0, 0.0, 2),                 # identical pair
+              (0.006, 0.005 / 2 ** 0.5, 0.005, 2),  # the brighter level's measured scatter
+              (0.02, 0.004 / 3 ** 0.5, 0.004, 3),
+              (0.05, None, None, 1),                # single read — no evidence
+              (0.08, math.inf, 0.02, 5)]            # unstable
+    out = mc.monotone_noise_floor(levels)
+    assert out[0] == (pytest.approx(0.005 / 2 ** 0.5), 0.005)
+    assert out[1] == (pytest.approx(0.005 / 2 ** 0.5), 0.005)   # own σ already ≥ brighter's 0.004
+    assert out[2] == (pytest.approx(0.004 / 3 ** 0.5), 0.004)   # nothing finite measured brighter
+    assert out[3] == (None, None) and out[4] == (math.inf, 0.02)
+    # End to end: a realistic just-over-tolerance drift on the identical pair. Unfloored it scored
+    # "proven real" (old: noise<=0 → trust 1); floored by the brighter level's noise it is only 2.4σ
+    # → noisy → it raises the floor.
+    reads = [(0.003, 0.3127 + 0.0085, 0.3290, out[0][0], out[0][1]),
+             (0.006, 0.3127, 0.3290, out[1][0], out[1][1]),
+             (0.02, 0.3127, 0.3290, out[2][0], out[2][1]),
+             (20.0, 0.3127, 0.3290), (150.0, 0.3127, 0.3290), (400.0, 0.3127, 0.3290)]
+    floor, info = mc.adaptive_dark_floor(reads, reference_band=None, bounds=(0.001, 5.0))
+    assert info["n_real_drift"] == 0 and floor == pytest.approx(0.003), info
+    assert info["floor_set_by"]["basis"] == "noisy"
+
+
+def test_xy_quantization_sigma_is_the_print_step_through_the_jacobian():
+    # C6 2026-09-02, 0.0021 nit: two reads came back identical to the last printed digit.
+    q = mc.xy_quantization_sigma((0.00208, 0.002094, 0.005365))
+    assert 2.5e-5 < q < 5e-5                                   # ≈3.6e-5 xy at 0.002 nit
+    # ~1/luminance: 1000x brighter at the same chromaticity → ~1000x smaller
+    q_bright = mc.xy_quantization_sigma((2.08, 2.094, 5.365))
+    assert q_bright == pytest.approx(q / 1000.0, rel=1e-9)
+    assert mc.xy_quantization_sigma((0.0, 0.0, 0.0)) == math.inf   # no chromaticity at all
+    # Monte-Carlo cross-check of the Jacobian propagation (independent uniform ±½-step rounding)
+    import random
+    rng = random.Random(7)
+    X, Y, Z = 0.00208, 0.002094, 0.005365
+    r = mc.METER_XYZ_RESOLUTION
+    d2 = []
+    for _ in range(20000):
+        a, b, c = (v + (rng.random() - 0.5) * r for v in (X, Y, Z))
+        s0, s1 = X + Y + Z, a + b + c
+        d2.append((a / s1 - X / s0) ** 2 + (b / s1 - Y / s0) ** 2)
+    assert math.sqrt(sum(d2) / len(d2)) == pytest.approx(q, rel=0.03)
+
+
+def test_floor_level_noise_keeps_none_and_inf_semantics():
+    xyz = (0.00208, 0.002094, 0.005365)
+    q = mc.xy_quantization_sigma(xyz)
+    assert mc.floor_level_noise(None, xyz) is None             # no evidence stays no evidence
+    assert mc.floor_level_noise(math.inf, xyz) == math.inf     # unstable stays unstable
+    assert mc.floor_level_noise(0.0, xyz) == q                 # zero spread → the quantisation
+    assert mc.floor_level_noise(1e-3, xyz) == 1e-3             # a real spread above it is kept
+
+
+def test_zero_spread_is_not_proof_of_real_drift():
+    # Two identical quantised reads (SE exactly 0). A chroma error far beyond the quantisation is
+    # still real; one BELOW it must no longer score "proven real" (the old noise<=0 → 1.0 path).
+    xyz = (0.00208, 0.002094, 0.005365)
+    se = mc.floor_level_noise(0.0, xyz)
+    assert mc.noise_trust(0.147, se) == 1.0                    # C6 215254's 0.147 drift: still real
+    assert mc.noise_trust(1e-5, se) == 0.0                     # sub-quantisation error: not proof
+    # dark_trust_weights floors it when told the level's luminance; unfloored 0 is a caller bug
+    w = dict(mc.dark_trust_weights([(0.02, 0.3127 + 1e-5, 0.3290, 0.0, 0.0021)], (0.3127, 0.3290)))
+    assert w[0.02] == 0.0
+    with pytest.raises(ValueError):
+        mc.dark_trust_weights([(0.02, 0.3127 + 1e-5, 0.3290, 0.0)], (0.3127, 0.3290))
+    # the floor classifies the zero-spread level against the quantisation, not as "infinitely sure"
+    reads = [(0.0021, 0.3127 + 0.02, 0.3290, 0.0), (0.5, 0.3127, 0.3290, 1e-4),
+             (20.0, 0.3127, 0.3290), (150.0, 0.3127, 0.3290), (400.0, 0.3127, 0.3290)]
+    floor, info = mc.adaptive_dark_floor(reads, bounds=(0.001, 5.0))
+    assert info["n_real_drift"] == 1 and floor == 0.001        # 0.02 ≫ 3×3.6e-5: genuinely real
+
+
+def test_refine_cubes_floor_a_zero_sigma_level_instead_of_trusting_it():
+    # refine_hdr_cube: one measured dark level whose chroma error (1e-5) is BELOW the print
+    # quantisation there (~3e-5) and whose reads were identical (σ=0). Old: noise<=0 → trust 1 →
+    # the full ratio step baked in. Now: floored → trust 0 → the curve is left as it was.
+    from dlc.colormath import xy_to_XYZ
+    N = 64
+    cur = {ch: [j / (N - 1) for j in range(N)] for ch in ("r", "g", "b")}
+    peak = [(412.4, 212.6, 19.3), (357.6, 715.2, 119.2), (180.5, 72.2, 950.5)]   # sRGB @1000 nits
+    tY = 0.003
+    sig = mc.pq_oetf(tY / 10000.0)
+    meas = xy_to_XYZ(0.3127 + 1e-5, 0.3290, 0.9 * tY)          # 10 % dim, chroma within quantisation
+    kw = dict(peak_cap_nits=1000.0, dark_floor_nits=0.0, top_hold=False)
+    zero = mc.refine_hdr_cube(cur, [(sig, meas, 0.0)], peak, (1.0, 1.0, 1.0), **kw)
+    none = mc.refine_hdr_cube(cur, [(sig, meas)], peak, (1.0, 1.0, 1.0), **kw)
+    moved_zero = max(abs(zero["g"][j] - cur["g"][j]) for j in range(N))
+    moved_none = max(abs(none["g"][j] - cur["g"][j]) for j in range(N))
+    assert moved_zero < 1e-5, moved_zero                       # PQ round-trip only (~1e-7)
+    assert moved_none > 1e-3, moved_none                       # None = gate not engaged → full step
 
 
 # --- gray-share monotone enforcement on NON-monotone measured shares ---------

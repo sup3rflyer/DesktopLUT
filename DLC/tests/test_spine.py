@@ -300,6 +300,25 @@ def test_refinement_noise_trust_holds_correction_within_noise():
     assert bn["noise_trust"] == 0.0
 
 
+def test_refinement_zero_noise_is_floored_not_trusted():
+    # A level whose reads were identical (σ=0) is floored at the meter's print quantisation for that
+    # level, not treated as noise-free: a chroma error far above it is still corrected, and the call
+    # no longer relies on the old `noise <= 0 → trust 1` shortcut (which now raises in noise_trust).
+    D65 = (0.3127, 0.3290)
+
+    def xyz_at(x, y, Y):
+        return (x / y * Y, Y, (1 - x - y) / y * Y)
+
+    off = (0.3200, 0.3340)
+    patches = [GrayPatch(level=0.5, xyz=xyz_at(*off, 30.0)),
+               GrayPatch(level=1.0, xyz=xyz_at(*off, 120.0))]
+    prim = MeasuredPrimaries(0.64, 0.33, 0.30, 0.60, 0.15, 0.06, D65[0], D65[1])
+    target = RefinementTarget(white_x=D65[0], white_y=D65[1], gamma=2.2, peak_luminance=120.0)
+    out = propose_correction_grayscale(measured=patches, target=target, primaries=prim,
+                                       current=Deviations.identity(2), noise={0.5: 0.0, 1.0: 0.0})
+    assert all(r["noise_trust"] == 1.0 for r in out["residuals"])   # 0.009 ≫ the ~1e-9 floor
+
+
 def test_sdr_dark_floor_adapts_below_the_fixed_half_nit():
     # SDR uses the adaptive dark floor too: a CLEAN dark region (every read on the target white)
     # drops the floor to the low bound, so a 0.3-nit patch is CORRECTED — the old fixed 0.5-nit
