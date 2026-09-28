@@ -249,9 +249,17 @@ c.disable_all()                             # drop the runtime OVERLAY layers (n
 dummy = str(default_dummy_icc("SDR").path)  # contained neutral ICC (HDR placeholder is Rec2020.icm)
 c.enter_neutral(0, "SDR", dummy)            # re-associate the dummy to truly clear the Windows MHC2
 ```
-⚠️ **Known bug:** after `--cancel`/`--abort` the spine prints "restored pre-run setup" but the run's
-MHC often **stays installed** (the in-memory snapshot is lost on process exit). **Don't trust the
-message** — re-query `state()` + primaries and manually restore from the durable `.ini` backup if needed.
+⚠️ **Restore honesty:** `--abort` and the rollback guard print DesktopLUT's OWN answer —
+`reverted` / `partially_reverted` / `nothing_restored` / `restored_other_session` (rollback:
+`rolled_back` / `rolled_back_partially` / `rollback_restored_nothing`) with `snapshot_restore.summary`;
+a revert at the apply gate that DesktopLUT could not honour ends `revert_unavailable`, not `reverted`.
+The rollback guard never asks DesktopLUT to restore an in-place run (`3dlut-only` / `grayscale-wb`
+never enter calibration mode, so any snapshot it held would be someone else's).
+`nothing_restored` = DesktopLUT held no capture for this run (it restarted mid-run — the capture is
+in memory — or the flow never entered calibration mode, e.g. `3dlut-only`, or the session already
+exited): restore from the durable `.ini` backup (the payload's `hint` names it, and the pre-run cube
+for an in-place run). Builds before the snapshot store (no `snapshot_retained` on enter) could print
+"restored" while the run's MHC stayed installed — on those, re-query `state()` + primaries.
 
 ## 6. WATCHING THE RUN (three-consumer model — never conflate)
 
@@ -302,7 +310,7 @@ message** — re-query `state()` + primaries and manually restore from the durab
   boundary. The actionable half of mid-run gating — stop a run going wrong without `--abort`.
 - **`--abort`** (no `--run` needed against a live pipe) rolls DesktopLUT back to the pre-run setup and
   exits — use to bail out of a paused/abandoned run.
-- After either, **re-verify state** (the §5 known bug): the MHC may still be installed.
+- After either, **read the status it printed** (§5 "Restore honesty"); on an older DesktopLUT build re-verify `state()`.
 - **Cleanup after a run:** uncheck the in-app "Calibration control" toggle (or delete the flag) +
   restart DesktopLUT to return to the normal no-pipe state.
 

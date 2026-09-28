@@ -208,8 +208,40 @@ default vs C++ GUI-marshal 60s verified correctly ordered (the server gives up f
 | T3 | Expose `correction_grayscale` (`point_count`/`points`/`deviations`) in `state.get` mhc entries | `HandleStateGet` | Makes DLC's Design-B grayscale-wb revert (restore the user's PRIOR correction) real on hardware; today it degrades to clear-to-identity (F9-10). Spec text already documents the requirement. |
 | T4 | Remove the unreachable `maintenance.verify_mhc` branch in `HandleCalibrationGuiCommand` | `desktoplut_ipc_server.cpp:1483` | Hygiene: Dispatch serves it on the pipe thread first; the GUI-thread branch is dead and misleads about threading. |
 
+### 5a. Status — T1–T4 landed on `cpp/calib-snapshot-rework` (2026-09-27, MSVC-built, not HW-verified)
+
+The first implementation (`claude/project-thread-djg427`, 2026-09-21, never built) was reviewed
+adversarially and NOT merged; the rework ports it onto main and corrects it:
+
+- **T1 / T4** as written (`kCalibrationContractVersion = 1`; the dead GUI branch removed).
+- **T2** grew into a per-display snapshot store (`src/calib_snapshot.h`, pure + doctested): keyed
+  by display identity (device path → EDID + settings slot → unique EDID → index only when captured
+  without an identity), the SET of entered modes tracked, first capture wins, never cleared on
+  enter (a thrown enter keeps its capture), ALWAYS cleared on exit — which also fixes the
+  2026-09-27 bug where the never-cleared `hasSnapshot` let a `3dlut-only --abort` restore a
+  previous run's pre-run setup. Main's ca43c39 identity-profile swap is kept on enter and folded
+  into the per-mode restore on exit. `calibration.enter` reports `snapshot_retained`,
+  `calibration.status` reports `captures`, `calibration.exit` reports `restored_monitors` /
+  `unrestored` (all additive; each restored display also reports per-mode `mhc` outcomes, so a
+  failed profile reinstall is not a "complete" restore). DLC reads `snapshot_retained` and
+  `restored` everywhere it enters or restores (enter-neutral, orchestrator digest + `_finish`
+  (`revert_unavailable` when nothing came back), `--abort`, rollback guard — which no longer asks
+  for a restore on an in-place run — and fald-profile, which skips the exit on a `--no-native`
+  pass but still exits after an enter that failed client-side). An internal adversarial review of
+  the rework (2026-09-28) found and fixed: `_finish` reporting "reverted" regardless, the
+  all-unresolved summary wording, fald trusting a local flag after a failed enter, the rollback
+  guard restoring for runs that never entered, the grayscale-wb prior being re-captured on a stage
+  re-run, `restored` ignoring MHC reinstall failures, the stale tell dropping capture age, and an
+  identity-less capture adopting an identified display after an index shift.
+  Not done: persisting the captures to disk.
+- **T3** emitted as designed; the DLC revert now sends the block back VERBATIM (the branch
+  re-bridged it, which bent luminance-scaled curves) and restores `enabled` through `layers.set`.
+  The `correctionGrayscale.enabled` ⇄ `layers.grayscale` mirror question (the mock mirrors only
+  the layers.set direction) is still open for the owner.
+
 ## 6. HW-validation queue additions
 
+- **HW-9 / HW-10 / HW-11:** the T1–T4 checks — see the roadmap's HW table.
 - **HW-8:** `windows.set_hdr` live flip on the box — toggle monitor 0 SDR→HDR→SDR over
   the pipe; confirm the OS flip, DesktopLUT's own MHC reapply on WM_DISPLAYCHANGE, and
   `windows.query_monitors` tracking `hdr_active`/`color_space`; then drive one
