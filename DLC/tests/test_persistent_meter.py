@@ -823,6 +823,45 @@ def test_one_measure_call_never_outlives_its_respawn_budget():
     drv.close()
 
 
+class _EofBeforeExitFake(FakeSpotread):
+    """Dead on arrival with the Windows exit ordering: the output stream hits EOF (the
+    pipe's write end is closed in the exiting process's handle rundown) BEFORE the process
+    becomes reapable — ``poll()`` stays ``None`` for ``lag`` seconds after that EOF."""
+
+    def __init__(self, *, lag: float, code: int) -> None:
+        super().__init__(prompt=_USB_OPEN_FAILURE)
+        self._lag = lag
+        self._code = code
+        self._eof_at: float | None = None
+        self._close()
+
+    def read_some(self) -> bytes:
+        chunk = super().read_some()
+        if not chunk and self._eof_at is None:
+            self._eof_at = time.monotonic()
+        return chunk
+
+    def poll(self):
+        if self._eof_at is None or time.monotonic() - self._eof_at < self._lag:
+            return None
+        return self._code
+
+
+def test_death_record_waits_for_the_exit_code_when_eof_precedes_the_exit():
+    # The real-subprocess flake below, made deterministic: the death was detected on EOF and
+    # poll() read straight after it, so the exit code was recorded as None ~15 % of the time
+    # under CPU load. The record must wait (bounded) for the exit to become observable.
+    factory = _SequencedFactory(lambda: _EofBeforeExitFake(lag=0.25, code=1), FakeSpotread)
+    drv = _healing(factory)
+    res = drv.measure()
+    assert res.ok and abs(res.xyz[0] - 96.0) < 1e-6
+    assert drv.deaths == 1 and drv.restarts == 1
+    assert drv.last_death_exit_code == 1
+    assert drv.death_log[-1]["exit_code"] == 1
+    assert "Communications failure" in (drv.last_death_tail or "")
+    drv.close()
+
+
 _DIES_AT_STARTUP = '''\
 import sys
 sys.stdout.write("Setting up the instrument\\n"); sys.stdout.flush()

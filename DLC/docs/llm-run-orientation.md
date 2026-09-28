@@ -58,6 +58,7 @@ PYTHONPATH=src python -m dlc.calibrate --flow mhc-only --mode HDR --monitor 0 --
 | `mhc-only` | raw → MHC (+ D65 refine) → verify → report (**ICC only, no 3D LUT** — the fast shakedown) | No (enters calibration mode) |
 | `3dlut-only` | verify MHC present → measure → 3D LUT → verify → report | **Yes** — needs an installed MHC; does NOT enter-neutral; never run it on a neutralized panel |
 | `grayscale-wb` | verify MHC present → disable current user Grayscale → patch-by-patch Corrections-tab Grayscale tune → grey-ramp verify | **Yes** — tunes the installed MHC-only or MHC+3D-LUT stack; writes the user-toggleable GUI Grayscale correction |
+| `verify-only` | [load a recorded run's verify set] → plan → hardware-readiness → [install a candidate cube] → measure verify → score + report | **Yes, read-only** — measures the INSTALLED stack (or a `--verify-cube` candidate over it); builds and commits nothing; see the recipe below |
 | `build-correction` | preflight → prep ccxxmake → operator runs it → ingest `.ccmx` (+white.sp) → store (no spotread metering) | n/a |
 | `characterize` | preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore | n/a |
 | `hdr` | **aborts** — there is no `hdr` flow; see the HDR note below | n/a |
@@ -65,6 +66,46 @@ PYTHONPATH=src python -m dlc.calibrate --flow mhc-only --mode HDR --monitor 0 --
 > ⚠️ **`--flow hdr` vs `--mode HDR`.** HDR is a `--mode`, **not** a flow. To calibrate HDR you run a
 > real flow in HDR mode: `--flow mhc-only --mode HDR` or `--flow full --mode HDR`. `--flow hdr` is a
 > deferred placeholder that aborts. Do **not** write `--flow hdr`.
+
+### `verify-only` — measure a stack without rebuilding it (acceptances, re-verifies, A/Bs)
+
+A ~15-20 min measurement of what is installed — no enter-neutral, no MHC / cube / registry write. The
+viewing layers are switched off for the run and restored at its end, like the other in-place flows.
+- **Installed stack as-is** (no extra flags): the standard verify preset; HDR scores against the
+  installed MHC's cap and its own measured gamut (stack registry, pipe-cross-checked).
+- **`--verify-patches-from RUN_DIR`** re-measures EXACTLY that run's verify list (its
+  `measurements/verify.ndjson`, cross-checked against `verify.ti3` and the recorded count) and scores it
+  under that run's basis (HDR peak, OOG policy, measured gamut). The verify digest + report carry
+  `vs_source`: now / source / delta per headline number, per `practical` bucket (core / limits / clamped /
+  tube), per luminance band (`<1` … `>203`), the per-patch movers, and `comparability` (any scoring-basis
+  difference — deltas across it measure the scorer, not the stack). Seam **`verify-source:mismatch`**:
+  mode / bit depth differ → `abort` only (the codes mean another signal); display / EDID / target /
+  colorimeter correction / installed cap differ → `abort` recommended, `proceed_anyway` is your call.
+- **`--verify-cube CUBE`** installs a candidate 3D LUT for the run (the prior runtime cube is captured
+  first). Seam **`verify:candidate`** at the end: `restore` (recommended — puts the prior cube back) or
+  `keep` (stays live, recorded in the stack registry like a `3dlut-only` apply; the MHC record is
+  untouched). Abort, cancel, an error and `--abort` of a paused run all restore the prior cube; a pause
+  keeps the candidate live (a resume re-installs it if DesktopLUT lost it).
+- **`--preheat auto|always|never`** (any flow): the thermal soak before each measure stage. `auto` =
+  today's behaviour; `never` only when the panel is provably at operating temperature (e.g. right after
+  another run) — an acceptance compared against a preheated run should keep `auto`.
+
+**D1 acceptance recipe (PA32UCXR HDR, mon 0)** — run 132412's exact 303-patch set through the
+engine-built projection cube, over the installed 132412 MHC:
+```bash
+PYTHONPATH=src python -m dlc.calibrate --flow verify-only --mode HDR --monitor 0 --bit-depth 10 \
+  --verify-patches-from runs/20260924_132412_307436_hdr_asus_proart_pa32ucxr \
+  --verify-cube results/Asus_ProArt_PA32UCXR_2026-09-24_HDR/2026-09-24_DLC_PA32UCXR_HDR_Rec2020_PQ_1729n_D1-projection_CANDIDATE.cube \
+  --dogegen-server localhost:28930 --keep-dogegen-server --checkin-interval 300
+```
+Seams: `resolve-target:plan` (303 patches; `hdr_target.provenance.peak.source` = `verify_patches_from`,
+1729.26 nits) → [`verify-source:mismatch` — e.g. the HDR correction differs from 132412's] →
+`hardware-readiness:confirm` (+ the hook-routing self-check) → `verify:candidate`. Judge on
+`request.digest.vs_source.buckets` against the owed criteria: core 1.04±0.1, limits 1.23±0.1, tube
+1.10±0.1, clamped ≤ 3.91. The panel has drifted since 09-24 — for a clean read of the CUBE's effect, run
+the same command WITHOUT `--verify-cube` first (the shipped cube, same set = the control) and compare
+both runs' `vs_source`. Keep repeating every flag on each resume (`--verify-cube` /
+`--verify-patches-from` are persisted; a different value on resume is refused).
 
 ### The seam rhythm = seam → decide → resume (a NEW process each time)
 
@@ -130,6 +171,12 @@ time/size) and exits without measuring. Always preview before committing. Short-
   survives between runs. A pause/resume never stops the daemon regardless.
 - Persistent meter is the **default** (~2× faster); `--legacy-meter` opts out. `--persistent-meter` is
   a no-op kept for back-compat. **Native targeting is the C++ default** — `DLC_SRC_NATIVE` is a no-op.
+
+**verify-only + thermal (plan flags — repeat them on every resume):** `--verify-cube CUBE` (candidate 3D
+LUT for the run; `verify:candidate` restore/keep) · `--verify-patches-from RUN_DIR` (re-measure that run's
+exact verify set; deltas vs its recorded verify) · `--preheat auto|always|never` (any flow; the thermal
+soak before each measure stage, `auto` = today's behaviour; persisted, and each measure digest records
+`preheat_policy`). `--preview-patches` with `--verify-patches-from` sizes the run from the source's set.
 
 **Adjudication mode:** default (no flag) = `MappingAdjudicator` (live, every seam → you).
 `--auto` = sim/CI rubber-stamp. `--supervised` = benign-auto-accept (avoid; Task #1). `--decide

@@ -132,6 +132,7 @@ from . import hook_routing
 from . import neutral_audit
 from . import stack_registry
 from . import thermal_align
+from . import verify_only
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
 from . import patch_evidence
@@ -359,6 +360,9 @@ class Calibration:
         white_band: Optional[tuple[float, float]] = None,
         source_run: Optional[Path] = None,
         link_probe: Optional[Callable[[], dict[str, Any]]] = None,
+        verify_cube: Optional[Path] = None,
+        verify_patches_from: Optional[Path] = None,
+        preheat: Optional[str] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -467,7 +471,12 @@ class Calibration:
         requested = (
             ("white_band_override",
              list(cp.parse_white_nits_band(white_band)) if white_band is not None else None),
-            ("source_run", str(Path(source_run).resolve()) if source_run is not None else None))
+            ("source_run", str(Path(source_run).resolve()) if source_run is not None else None),
+            # verify-only: the candidate 3D LUT to install for the run (--verify-cube) and the
+            # recorded run whose EXACT verify set is re-measured (--verify-patches-from).
+            ("verify_cube", str(Path(verify_cube).resolve()) if verify_cube is not None else None),
+            ("verify_patches_from",
+             str(Path(verify_patches_from).resolve()) if verify_patches_from is not None else None))
         for key, val in requested:
             if val is None:
                 continue
@@ -476,6 +485,23 @@ class Calibration:
                 self._arg_conflicts.append({"field": key, "requested": val, "persisted": stored})
             else:
                 self.calib[key] = val
+        # Thermal preheat policy (--preheat auto|always|never → MeasureLoopConfig.preheat). None =
+        # not asked: the loop config's own policy (auto) — today's behaviour. Persisted so a flagless
+        # resume keeps it; unlike the args above it only shapes measure stages NOT yet run (each
+        # measure digest records the policy it ran under), so an explicit new value on resume is
+        # honoured — visibly (preheat_changes), never silently.
+        self._preheat_change: Optional[dict[str, Any]] = None
+        if preheat is not None:
+            policy = str(preheat).strip().lower()
+            if policy not in verify_only.PREHEAT_POLICIES:
+                raise ValueError(f"preheat must be one of {verify_only.PREHEAT_POLICIES}, got {preheat!r}")
+            stored = self.calib.get("preheat")
+            if stored is not None and stored != policy:
+                self._preheat_change = {"from": stored, "to": policy,
+                                        "at": datetime.now().isoformat(timespec="seconds"),
+                                        "stages_done": sorted(self.calib.get("stages") or {})}
+                self.calib.setdefault("preheat_changes", []).append(self._preheat_change)
+            self.calib["preheat"] = policy
         self.target_name: Optional[str] = self.calib.get("target")
         # Reconcile mode + bit depth against the persisted run record: a resume's CLI args
         # default to SDR/8-bit and must NOT override the run's fixed spec (which both
@@ -636,6 +662,8 @@ class Calibration:
         "seed-from-run": ("Seed from source run", False),
         "install-mhc": ("Reinstall MHC", False),
         "reapply-3dlut": ("Re-apply 3D LUT", False),
+        "verify-source": ("Load verify set (source run)", False),
+        "install-candidate": ("Install candidate 3D LUT", False),
         "adaptive-planning": ("Adaptive planning", False),
         "measure:post-mhc": ("Measure · post-MHC", True),
         "build-install-3dlut": ("Build + install 3D LUT", True),
@@ -661,6 +689,12 @@ class Calibration:
         # required — main() always requires it live, so the live stepper is unchanged.
         if not self.require_hardware_readiness:
             keys = [k for k in keys if k != "hardware-readiness"]
+        # verify-only's optional stages exist only with their flags (--verify-patches-from /
+        # --verify-cube); without them the flow never announces them.
+        if not self.calib.get("verify_patches_from"):
+            keys = [k for k in keys if k != "verify-source"]
+        if not self.calib.get("verify_cube"):
+            keys = [k for k in keys if k != "install-candidate"]
         out: list[dict[str, Any]] = []
         for key in keys:
             label, long = self._STAGE_LABELS.get(key, (key, False))
@@ -1339,7 +1373,7 @@ class Calibration:
         if white is not None and white > 0:
             return white, "refined_this_run"
         calib = getattr(self, "calib", None) or {}
-        if calib.get("flow") == "3dlut-only" and self.mode != "HDR":
+        if calib.get("flow") in ("3dlut-only", "verify-only") and self.mode != "HDR":
             stack = (self._installed_stack_evidence() if capture else calib.get("installed_stack")) or {}
             white = _as_float_local(stack.get("sdr_white_nits"))
             if white is not None and white > 0:
@@ -1479,7 +1513,7 @@ class Calibration:
         self._save()
         return tgt
 
-    _FLOWS_KEEPING_MHC = ("3dlut-only", "grayscale-wb")
+    _FLOWS_KEEPING_MHC = ("3dlut-only", "grayscale-wb", "verify-only")
     _REPIN_MIN_SHORTFALL = 0.005    # cap must sit > 0.5 % under the resolved peak to re-pin
 
     def _installed_stack_evidence(self) -> Optional[dict[str, Any]]:
@@ -1621,6 +1655,21 @@ class Calibration:
             kw["dark_floor_max_nits"] = self.dark_floor_max_nits
         return MeasureLoopConfig(**kw)
 
+    def _preheat_policy(self) -> Optional[str]:
+        """The run's explicit thermal preheat policy (``--preheat``; persisted in the run record),
+        or ``None`` = not asked: the measure-loop config's own policy (``auto``) stands."""
+        policy = self.calib.get("preheat")
+        return str(policy) if policy else None
+
+    def _with_preheat(self, cfg: MeasureLoopConfig) -> MeasureLoopConfig:
+        """``cfg`` with the run's ``--preheat`` policy applied — the one place the lever reaches the
+        thermal controller's gate (``MeasureLoopConfig.preheat`` → ``_Loop._preheat_enabled``) for
+        every batch measure stage and the grayscale-wb session."""
+        policy = self._preheat_policy()
+        if policy is None or cfg.preheat == policy:
+            return cfg
+        return replace(cfg, preheat=policy)
+
     def _resolve_white_now(self) -> cp.WhitePointResolution:
         """Resolve the target white, preferring a white SPD captured by a probe-match
         build (item 9) recorded in the store over the profile's ``display.white_spd``."""
@@ -1648,7 +1697,7 @@ class Calibration:
                      ti3_name: str, ndjson_name: str) -> MeasureLoopResult:
         transfer = self._transfer()
         dip = self._dip()
-        cfg = self.loop_config or self._loop_config_for(dip)
+        cfg = self._with_preheat(self.loop_config or self._loop_config_for(dip))
         meas_dir = self.ctx.root / "measurements"
         # Pass the DIP through: the loop reads a single adaptive-integration read by default
         # and escalates to more averaged reads only where the DIP's measured noise model says
@@ -2752,6 +2801,14 @@ class Calibration:
                   "white_nits": target_nits, "patch_plan": self.calib["patch_plan"]}
         if not spec.is_hdr:
             digest["nominal_white_nits"] = spec.luminance_nits
+        if self._preheat_policy():
+            digest["preheat"] = self._preheat_policy()
+        if flow == "verify-only":
+            # What this measurement-only run will read THROUGH (nothing is built or committed).
+            digest["verify_only"] = {"verify_cube": self.calib.get("verify_cube"),
+                                     "verify_patches_from": self.calib.get("verify_patches_from"),
+                                     "installed_stack": self._installed_stack_evidence(),
+                                     "scoring_gamut": self._scoring_gamut_source()}
         plan_warnings: list[str] = []
         if sdr_white_evidence is not None:
             stack = self.calib.get("installed_stack") or {}
@@ -2777,7 +2834,14 @@ class Calibration:
                     "the measured EOTF undershoot implies an implausible boost — the gain was "
                     f"CLAMPED to {hdr.undershoot_gain:.3f}×; suspect characterization, consider "
                     "re-measuring before calibrating to it")
-            if (prov.get("peak") or {}).get("sustained_unknown"):
+            adopted_peak = (prov.get("peak") or {}).get("source") == "verify_patches_from"
+            if adopted_peak:
+                # verify-only --verify-patches-from: the peak is DELIBERATELY the one the source
+                # scored against (like-for-like); an installed cap that differs was the
+                # verify-source seam's business. Grounding warnings are for a build, not here.
+                digest["hdr_peak_note"] = (f"HDR peak {hdr.peak_nits:g} nits = the source run's scored "
+                                           "peak (adopted for a like-for-like verify)")
+            if (prov.get("peak") or {}).get("sustained_unknown") and not adopted_peak:
                 plan_warnings.append(
                     "the target peak rests on no warm/sustained capture "
                     f"({(prov.get('peak') or {}).get('source', 'unknown source')}) — a peak the "
@@ -2785,7 +2849,7 @@ class Calibration:
             if flow in self._FLOWS_KEEPING_MHC:
                 stack = self.calib.get("installed_stack") or {}
                 digest["installed_stack"] = stack
-                if not stack.get("pin_nits"):
+                if not stack.get("pin_nits") and not adopted_peak:
                     plan_warnings.append(
                         "the installed MHC's calibrated top is UNKNOWN ("
                         + str(stack.get("reason") or "no registry evidence")
@@ -2836,7 +2900,10 @@ class Calibration:
             store = self._correction_store()
             prior = store.get(self.display.name, self.mode)
             has_corr = bool(prior and prior.correction_file)
-            store.record(CorrectionRecord(
+            # verify-only is measurement-only: it resolves the white it scores against but never
+            # rewrites the cross-run store (not even its metadata).
+            record = store.record if self.calib.get("flow") != "verify-only" else (lambda _rec: None)
+            record(CorrectionRecord(
                 display=self.display.name, mode=self.mode,
                 correction_file=(prior.correction_file if has_corr else None),
                 correction_made=(prior.correction_made if has_corr else None),
@@ -3556,7 +3623,9 @@ class Calibration:
         audit["neutral_profile"] = self.calib.get("neutral_profile")
         return _jsonable(audit)
 
-    _CUBE_FLOWS = ("full", "3dlut-only", "refine-mhc")
+    # verify-only measures THROUGH the installed (or a candidate) cube: a crossed hook routing would
+    # score an uncorrected panel, so it gets the same optical self-check as the cube-building flows.
+    _CUBE_FLOWS = ("full", "3dlut-only", "refine-mhc", "verify-only")
 
     def _hook_routing_pending(self) -> dict[str, Any]:
         """Pre-read evidence for the readiness seam: what the hook reports now and whether the
@@ -3762,6 +3831,10 @@ class Calibration:
             res = self._measure_set(patches, role=role, ti3_name=ti3_name, ndjson_name=ndjson_name)
             bookend_drift = self._bookend_drift_qc(role, res.ti3_path, patches, res.ndjson_path)
             digest = dict(res.digest)
+            # The thermal preheat policy this measure ran under (--preheat, else the loop config's
+            # own) — evidence beside the controller's own `preheat` digest (null when it skipped).
+            digest["preheat_policy"] = self._with_preheat(
+                self.loop_config or self._loop_config_for(self._dip())).preheat
             if probe_path is not None:
                 digest["probe_path"] = probe_path
             if bookend_drift is not None:
@@ -5393,7 +5466,7 @@ class Calibration:
 
             has_3dlut = bool(self._active_runtime_cube())
             dip = self._dip()
-            loop_cfg = self.loop_config or self._loop_config_for(dip)
+            loop_cfg = self._with_preheat(self.loop_config or self._loop_config_for(dip))
             # Bright-point read averaging (2026-08-14 HDR run): high-luminance points on a
             # local-dimming panel oscillate read-to-read far beyond the DIP's luminance-σ
             # model (zone behaviour, not shot noise), and a single read per round had the
@@ -6486,12 +6559,20 @@ class Calibration:
                         samples, metrics, q, within, white_xy=(wx, wy), peak_nits=hdr.peak_nits, gamut=reachable))
                 except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
                     digest["level_edge_evidence_error"] = f"{type(exc).__name__}: {exc}"
+            if self.calib.get("flow") == "verify-only":
+                # What was measured (installed stack / candidate) and, with --verify-patches-from,
+                # the per-bucket deltas vs the source run's RECORDED verify — evidence, no pause.
+                digest.update(self._verify_only_evidence(digest, metrics))
             return StageOutcome("verify", "done", digest=digest,
                                 data={"within_quality": within, "metrics": {
                                     "avg_de2000": summary.avg_de2000, "p95_de2000": summary.p95_de2000,
                                     "max_de2000": summary.max_de2000, "white_de2000": summary.white_de2000}})
 
         outcome = self._stage("verify", run)
+        if self.calib.get("flow") == "verify-only":
+            # verify-only built nothing, so there is no apply/revert gate: the score is evidence
+            # (result + report), and a candidate cube's fate is its own seam (verify:candidate).
+            return outcome
         d = outcome.digest
         within = outcome.data.get("within_quality")
         severe = self._severe_verify_failure(outcome)
@@ -6625,6 +6706,11 @@ class Calibration:
             # record would be lost — even on a revert).
             stamp = "_".join(self.ctx.root.name.split("_")[:2])
             name += f"_refine-mhc_{stamp}"
+        elif self.calib.get("flow") == "verify-only":
+            # Keyed by THIS run's full id (date_time_micro): repeated verifies of one stack — same
+            # day, back to back — must never overwrite each other's report / measurements.
+            stamp = "_".join(self.ctx.root.name.split("_")[:3])
+            name += f"_verify-only_{stamp}"
         folder = out / name
         folder.mkdir(parents=True, exist_ok=True)
         return folder
@@ -6698,6 +6784,14 @@ class Calibration:
                              "measurements_ti3": str(ti3_out) if ti3_out else None},
             "display_analysis": analysis,   # the LLM fills this at report time
         }
+        if self.calib.get("flow") == "verify-only":
+            # A measurement of an installed / candidate stack — nothing built, nothing committed.
+            payload["verify_only"] = {
+                "measured_stack": (sd("verify").get("verify_only") or {}).get("measured_stack"),
+                "candidate": self.calib.get("verify_candidate"),
+                "verify_source": sd("verify-source") or None,
+                "preheat": self._preheat_policy() or "auto",
+            }
         report_json = results_dir / "report.json"
         report_html = results_dir / "report.html"
         report_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -6766,6 +6860,11 @@ class Calibration:
                                           "conflicts": self._arg_conflicts})
         self._publish_active_pointer()   # let the dashboard find this run (and the next)
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
+        if self._preheat_change:
+            self.runlog.note("run", f"--preheat changed on resume: {self._preheat_change['from']} -> "
+                                    f"{self._preheat_change['to']} (measure stages not yet run use the "
+                                    "new policy; each measure digest records its own)",
+                             preheat_change=self._preheat_change)
         if self._enable_watchdog:
             self.liveness.start()   # backstop thread (live runs only; tests don't spin threads)
         # Own our own keep-awake for the WHOLE run (not just the measure stages): the
@@ -6801,6 +6900,8 @@ class Calibration:
                 return self._flow_grayscale_wb()
             if flow == "refine-mhc":
                 return self._flow_refine_mhc()
+            if flow == "verify-only":
+                return self._flow_verify_only()
             if flow == "build-correction":
                 return self._flow_build_correction()
             if flow == "characterize":
@@ -6991,6 +7092,16 @@ class Calibration:
             # peak changes which patches are measured, so it must invalidate an approved plan.
             "patch_max_cv": self._patch_max_cv(),
         }
+        source = self._verify_source_record() if flow == "verify-only" else None
+        if source is not None:
+            # --verify-patches-from: the run measures the SOURCE's exact verify list, not this run's
+            # preset — the plan's size and identity are that list (a different source = a new plan).
+            n = len(source.get("patches") or ())
+            record["stages"] = {"verify": n}
+            record["total_patches"] = n
+            record["verify_source"] = {"run": source.get("run"),
+                                       "patches_fingerprint": source.get("patches_fingerprint"),
+                                       "patch_source": source.get("patch_source")}
         payload = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return {**record, "fingerprint": hashlib.sha256(payload).hexdigest()[:16]}
 
@@ -7654,6 +7765,499 @@ class Calibration:
             if decision.choice != "proceed_anyway":
                 raise CalibrationAborted(StageOutcome("require-stack", "aborted", digest=digest))
 
+    # ====================================================================
+    # verify-only — MEASURE an installed (or candidate) stack; build/commit nothing
+    # ====================================================================
+    def _flow_verify_only(self) -> CalibrationResult:
+        """Score the INSTALLED stack (or a candidate 3D LUT over it) against a verify set — no MHC,
+        cube or registry change of its own. The owed hardware acceptances (D1 projection cube,
+        re-verifying a stack after a change, owner A/Bs) only need a measurement, not a multi-hour
+        ``3dlut-only`` rebuild.
+
+        preflight → [verify-source] → resolve-target (plan seam) → whitepoint → require-stack →
+        hardware-readiness (the stack stays installed: no enter-neutral; viewing layers off for the
+        run, restored at its end) → [install-candidate] → measure:verify → verify (score + gate +
+        report) → finish. ``--verify-patches-from RUN`` re-measures that run's EXACT verify list and
+        scores it under its basis (per-bucket deltas vs its recorded verify); ``--verify-cube PATH``
+        installs a candidate cube for the run, and ``verify:candidate`` (restore / keep) decides its
+        fate. Any other end — abort, cancel, error — puts the prior cube back; a pause keeps the
+        measurement state (``--abort`` of a paused run restores it too)."""
+        try:
+            self.stage_preflight()
+            self.stage_verify_source()
+            self._adopt_installed_stack_basis()
+            self.stage_resolve_target()
+            self.stage_whitepoint()
+            self._require_stack(need_mhc=True, need_lut=False)
+            self.stage_hardware_readiness()
+            self.stage_install_candidate()
+            ver = self.stage_measure(role="verify", patches=self._verify_only_patches(),
+                                     ti3_name="verify.ti3", ndjson_name="verify.ndjson")
+            self.stage_verify(ver.data["ti3"])
+            return self._finish_verify_only()
+        except AdjudicationRequired:
+            raise   # a PAUSE: the candidate stays live for the resuming invocation
+        except BaseException:
+            self._restore_verify_candidate(
+                why="the run ended before verify:candidate was decided (abort / cancel / error)")
+            raise
+
+    def _adopt_installed_stack_basis(self) -> None:
+        """No ``--verify-patches-from`` (HDR): score against the INSTALLED MHC's own measured gamut —
+        the primaries its build recorded in the stack registry — so the gamut-aware verify clamps
+        exactly as that stack's build verify did, not against a separately characterized DIP. Only
+        when the registry record is trusted for this stack (the pipe's profile cross-checks); else
+        ``_reachable_primaries`` keeps its DIP fallback. The seeded ``mhc_params`` carry only the
+        primaries + ``seeded_from`` and are NEVER installed. Memoised (first write wins)."""
+        if (self.mode != "HDR" or self._state.get("mhc_params") or self.calib.get("verify_patches_from")
+                or self.calib.get("verify_basis_checked")):
+            return
+        # Decided ONCE per run (before the plan): a registry edited between resumes must not
+        # change the gamut the approved plan's verify caps were derived from.
+        self.calib["verify_basis_checked"] = True
+        self._save()
+        evidence = self._installed_stack_evidence() or {}
+        if not (evidence.get("pin_nits") or evidence.get("matches") is True):
+            return
+        try:
+            reg = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root))
+            rec = reg.get(self.display.name, self.mode)
+        except Exception:  # noqa: BLE001 - priors, never a gate
+            return
+        prim = dict(((rec.mhc if rec is not None else None) or {}).get("primaries") or {})
+        if not metrics_mod.reachable_primaries_from_mhc_params({"primaries": prim}):
+            return
+        self._state["mhc_params"] = {
+            "primaries": prim,
+            "seeded_from": {"registry": str(reg.path), "run_id": rec.run_id,
+                            "purpose": "verify-only scoring basis (the installed MHC's measured gamut) "
+                                       "— not installed"}}
+        self._save()
+
+    def _scoring_gamut_source(self) -> Optional[str]:
+        """Where the verify's reachable gamut (the OOG clamp) came from — evidence for the LLM."""
+        if self.mode != "HDR":
+            return None
+        seeded = (self._state.get("mhc_params") or {}).get("seeded_from") or {}
+        if seeded.get("run"):
+            return f"source run {Path(str(seeded['run'])).name} (its MHC build's measured primaries)"
+        if seeded.get("registry"):
+            return f"installed stack (registry record of run {seeded.get('run_id')})"
+        if self._reachable_primaries() is not None:
+            return "DIP native primaries (no trusted installed-stack record)"
+        return None
+
+    def _verify_source_record(self) -> Optional[dict[str, Any]]:
+        """The memoised ``verify-source`` data (the source's patch list, recorded verify, basis),
+        or ``None`` without ``--verify-patches-from`` / before the stage ran."""
+        rec = (self.calib.get("stages") or {}).get("verify-source") or {}
+        if rec.get("status") != "done":
+            return None
+        return rec.get("data") or None
+
+    def _verify_only_patches(self) -> list[tuple[int, int, int]]:
+        """The source run's exact verify list (``--verify-patches-from``), else the standard
+        gamut-aware verify preset (the same QC set every flow verifies with)."""
+        source = self._verify_source_record()
+        if source is not None:
+            return [tuple(int(c) for c in p) for p in source.get("patches") or ()]  # type: ignore[misc]
+        return self._verify_patches()
+
+    def _adopt_verify_scoring_basis(self, basis: Mapping[str, Any], src: str) -> dict[str, Any]:
+        """Score this run's verify exactly as the source run scored its own — the OOG policy +
+        level-edge memo, and for HDR the target peak and the reachable gamut its MHC build measured
+        (``mhc_params`` → ``_reachable_primaries``). Run-record memos only, first write wins (a
+        resume never re-adopts); ``mhc_params`` is tagged ``seeded_from`` and is NEVER installed."""
+        adopted: dict[str, Any] = {}
+        if self.mode == "HDR":
+            params = basis.get("mhc_params")
+            if isinstance(params, dict) and params and not self._state.get("mhc_params"):
+                seeded = json.loads(json.dumps(params))
+                seeded["seeded_from"] = {"run": src, "purpose": "verify-only scoring basis (reachable "
+                                                             "gamut + plausibility envelope) — not installed"}
+                self._state["mhc_params"] = seeded
+                adopted["mhc_params"] = "the source run's MHC build (measured primaries / channel peaks)"
+            ht = basis.get("hdr_target")
+            if isinstance(ht, dict) and ht.get("peak_nits") and not self.calib.get("hdr_target"):
+                ht = json.loads(json.dumps(ht))
+                prov = dict(ht.get("provenance") or {})
+                peak = dict(prov.get("peak") or {})
+                peak["source_run_peak_source"] = peak.get("source")
+                peak["source"] = "verify_patches_from"
+                peak["note"] = (f"the peak run {Path(src).name} scored its verify against — kept so this "
+                                "verify is scored like-for-like")
+                prov["peak"] = peak
+                ht["provenance"] = prov
+                self.calib["hdr_target"] = ht
+                adopted["hdr_target_peak_nits"] = ht.get("peak_nits")
+        if basis.get("oog_mapping") and not self.calib.get("oog_mapping"):
+            self.calib["oog_mapping"] = basis["oog_mapping"]
+            adopted["oog_mapping"] = basis["oog_mapping"]
+        if isinstance(basis.get("oog_level_edge"), dict) and not self.calib.get("oog_level_edge"):
+            self.calib["oog_level_edge"] = basis["oog_level_edge"]
+            adopted["oog_level_edge"] = bool(basis["oog_level_edge"].get("enabled"))
+        self._save()
+        # What is IN USE from this source — also when an earlier invocation adopted it (a stage
+        # re-run after an abort at the mismatch seam adopts nothing new: first write wins).
+        seeded = (self._state.get("mhc_params") or {}).get("seeded_from") or {}
+        if seeded.get("run") == src:
+            adopted.setdefault("mhc_params", "the source run's MHC build (measured primaries / channel peaks)")
+        ht = self.calib.get("hdr_target") or {}
+        if ((ht.get("provenance") or {}).get("peak") or {}).get("source") == "verify_patches_from":
+            adopted.setdefault("hdr_target_peak_nits", ht.get("peak_nits"))
+        if basis.get("oog_mapping") and self.calib.get("oog_mapping") == basis["oog_mapping"]:
+            adopted.setdefault("oog_mapping", basis["oog_mapping"])
+        if isinstance(basis.get("oog_level_edge"), dict) and self.calib.get("oog_level_edge") == basis["oog_level_edge"]:
+            adopted.setdefault("oog_level_edge", bool(basis["oog_level_edge"].get("enabled")))
+        return adopted
+
+    def stage_verify_source(self) -> Optional[StageOutcome]:
+        """``--verify-patches-from RUN``: load that run's EXACT verify patch list (its
+        ``measurements/verify.ndjson``, cross-checked against ``verify.ti3`` and the recorded
+        count) + its recorded verify digest, and adopt its scoring basis. Unreadable source = a
+        clean refusal; a source that differs from this run is the ``verify-source:mismatch`` seam
+        (mode / bit depth: the codes mean another signal — abort only; display / EDID / target /
+        correction / installed top: abort recommended, proceed_anyway the judge's call)."""
+        src = self.calib.get("verify_patches_from")
+        if not src:
+            return None
+        key = "verify-source"
+
+        def run() -> StageOutcome:
+            try:
+                source = verify_only.load_source_verify(Path(src))
+            except verify_only.SourceRunError as exc:
+                raise CalibrationAborted(StageOutcome(
+                    key, "aborted", digest={"message": f"--verify-patches-from: {exc}", **exc.detail}))
+            here = ((self.calib["stages"].get("preflight") or {}).get("digest") or {})
+            stack = self._installed_stack_evidence() or {}
+            mism = verify_only.source_mismatches(
+                source, mode=self.mode, bit_depth=self.bit_depth,
+                display=here.get("display") or self.display.name,
+                hardware_id=(here.get("monitor_map") or {}).get("hardware_id"),
+                target=self.display.target_name(self.mode),
+                correction_file=(here.get("correction") or {}).get("file"),
+                pin_nits=stack.get("pin_nits") if self.mode == "HDR" else None)
+            if not source.get("verify"):
+                mism["soft"].append("the source run's verify was never scored (no recorded numbers): "
+                                    "its patch list is reused but there is nothing to compare against")
+            basis = source.pop("scoring_basis") or {}
+            adopted = {} if mism["hard"] else self._adopt_verify_scoring_basis(basis, str(src))
+            src_verify = source.get("verify") or {}
+            digest = {"source_run": source["run"], "source_flow": source.get("flow"),
+                      "patch_count": source["patch_count"], "patch_source": source["patch_source"],
+                      "patch_cross_check": source.get("patch_cross_check"),
+                      "patches_fingerprint": source["patches_fingerprint"],
+                      "source_patch_max_cv": source.get("patch_max_cv"),
+                      "identity": {k: source.get(k) for k in ("display", "hardware_id", "mode", "monitor",
+                                                              "bit_depth", "target", "correction_file")},
+                      "source_verify": ({k: src_verify.get(k) for k in
+                                         ("metric", "avg_de2000", "max_de2000", "white_de2000",
+                                          "grayscale_avg_de2000", "within_quality", "gate")}
+                                        if src_verify else None),
+                      "source_verify_decision": source.get("verify_decision"),
+                      "installed_stack": stack or None,
+                      "adopted_basis": adopted, "mismatch": mism}
+            data = {"run": source["run"], "patches": source["patches"],
+                    "patches_fingerprint": source["patches_fingerprint"],
+                    "patch_source": source["patch_source"], "verify": source.get("verify"),
+                    "patch_metrics_path": source.get("patch_metrics_path"),
+                    "basis": {"peak_nits": (basis.get("hdr_target") or {}).get("peak_nits"),
+                              "oog_mapping": basis.get("oog_mapping"),
+                              "gamut_from_run": bool((basis.get("mhc_params") or {}).get("primaries"))}}
+            return StageOutcome(key, "done", digest=digest, data=data)
+
+        outcome = self._stage(key, run)
+        mism = (outcome.digest or {}).get("mismatch") or {}
+        if mism.get("hard") or mism.get("soft"):
+            hard = list(mism.get("hard") or [])
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key=f"{key}:mismatch", seam=SEAM_STACK, stage=key,
+                question=("verify-only --verify-patches-from: " + "; ".join(hard + list(mism.get("soft") or []))
+                          + (". The recorded codes cannot be re-measured like-for-like here — abort "
+                             "(start a run that matches the source)." if hard else
+                             ". Proceed anyway (the deltas vs the source are then across that "
+                             "difference), or abort?")),
+                options=("abort",) if hard else ("abort", "proceed_anyway"),
+                recommendation="abort", digest=dict(outcome.digest or {}))),
+                stage=key, message="verify-only: refused at the source-run mismatch seam")
+        return outcome
+
+    def stage_install_candidate(self) -> Optional[StageOutcome]:
+        """``--verify-cube PATH``: install a candidate 3D LUT on the calibrated slot for this run.
+        The prior runtime cube is captured (and persisted) BEFORE the install so every exit path can
+        put it back; ``verify:candidate`` at the end decides restore / keep. A prior whose FILE is
+        gone (DesktopLUT keeps a dead path after a run folder is cleaned) could never be re-applied —
+        the ``install-candidate:prior-missing`` seam decides that before anything is installed. A
+        memoised replay re-asserts the candidate if the slot lost it (DesktopLUT restarted during a
+        pause)."""
+        path = self.calib.get("verify_cube")
+        if not path:
+            return None
+        key = "install-candidate"
+
+        def run() -> StageOutcome:
+            facts = verify_only.candidate_cube_facts(Path(path))
+            if not facts.get("ok"):
+                raise CalibrationAborted(StageOutcome(
+                    key, "aborted",
+                    digest={"message": f"--verify-cube {path}: {facts.get('error')} — not installable "
+                                       "as a verify candidate", "candidate": facts}))
+            rec = self.calib.get("verify_candidate") or {}
+            if not rec.get("prior_captured"):
+                try:
+                    state = self.controller.state() or {}
+                except Exception as exc:  # noqa: BLE001 - no prior known = no safe restore: refuse
+                    raise CalibrationAborted(StageOutcome(
+                        key, "aborted",
+                        digest={"message": "cannot read the live runtime cube before installing the "
+                                           f"candidate ({type(exc).__name__}: {exc}) — refusing: the "
+                                           "prior cube could not be restored afterwards"}))
+                prior = ((state.get("runtime") or {}).get(f"{self.monitor}:{self.mode}") or {}).get("cube_path")
+                rec = {"cube": str(path), "monitor": self.monitor, "mode": self.mode,
+                       "prior_captured": True, "prior_cube": prior,
+                       "prior_exists": (Path(str(prior)).exists() if prior else None),
+                       "installed": False, "restored": False, "kept": False, "facts": facts}
+                self.calib["verify_candidate"] = rec
+                self._save()     # persisted BEFORE the mutation: an abort mid-install knows the prior
+            if rec.get("prior_cube") and rec.get("prior_exists") is False and not rec.get("restore_clears"):
+                self._abort_if(self.adjudicate(AdjudicationRequest(
+                    key=f"{key}:prior-missing", seam=SEAM_STACK, stage=key,
+                    question=(f"the runtime 3D LUT DesktopLUT holds for {self.monitor}:{self.mode} points at "
+                              f"a file that no longer exists ({rec.get('prior_cube')}) — it cannot be put "
+                              "back after the candidate. clear_on_restore = install the candidate and CLEAR "
+                              "the slot at restore / abort (DesktopLUT cannot load the missing file "
+                              "anyway); abort = stop now (nothing installed) and fix the installed cube."),
+                    options=("abort", "clear_on_restore"), recommendation="abort",
+                    digest={"prior_cube": rec.get("prior_cube"), "candidate": facts})),
+                    stage=key, message="verify-only: aborted — the prior runtime cube file is missing")
+                rec["restore_clears"] = True
+                self.calib["verify_candidate"] = rec
+                self._save()
+            self.controller.set_3dlut(self.monitor, self.mode, str(path))
+            rec.update(installed=True, restored=False,
+                       installed_at=datetime.now().isoformat(timespec="seconds"))
+            self.calib["verify_candidate"] = rec
+            self._save()
+            self._hook_routing_evidence_after_install(key)
+            prior = rec.get("prior_cube")
+            same = bool(prior) and os.path.normcase(os.path.abspath(str(prior))) == \
+                os.path.normcase(os.path.abspath(str(path)))
+            return StageOutcome(key, "done",
+                                digest={"candidate": facts, "prior_cube": prior,
+                                        "prior_exists": rec.get("prior_exists"),
+                                        "restore_clears": bool(rec.get("restore_clears")),
+                                        "candidate_is_prior": same},
+                                data={"cube_path": str(path), "prior_cube": prior})
+
+        outcome = self._stage(key, run)
+        if outcome.replayed:
+            self._ensure_candidate_live(key)
+        return outcome
+
+    def _redecide_resolved_candidate(self, cand: dict[str, Any]) -> dict[str, Any]:
+        """A resumed, already-resolved run given ``--decide verify:candidate=<the other choice>``
+        re-decides the terminal gate (as ``verify:accept`` apply↔revert does): keep → restore puts the
+        prior back; restore → keep re-installs the candidate. The seam then records the override."""
+        override = self.decision_overrides.get("verify:candidate")
+        if override is None or self.force or not cand.get("installed"):
+            return cand
+        if cand.get("kept") and override.choice == "restore":
+            cand["kept"] = False
+        elif cand.get("restored") and override.choice == "keep" and not cand.get("aborted"):
+            self.controller.set_3dlut(self.monitor, self.mode, str(cand.get("cube")))
+            cand.update(restored=False, reinstalled_at=datetime.now().isoformat(timespec="seconds"))
+            self._hook_routing_evidence_after_install("verify")
+        else:
+            return cand
+        self.calib["verify_candidate"] = cand
+        self._save()
+        self.runlog.note("verify", f"verify:candidate re-decided on resume -> {override.choice}",
+                         verify_candidate=cand)
+        return cand
+
+    def _ensure_candidate_live(self, key: str) -> None:
+        """Resume guard: the measurement must read THROUGH the candidate. Re-install it when the slot
+        no longer holds it (a DesktopLUT restart during a pause, or a resumed aborted run whose
+        teardown restored the prior) — never once verify:candidate has decided."""
+        rec = self.calib.get("verify_candidate") or {}
+        if not rec.get("cube") or rec.get("kept") or (self.calib.get("decisions") or {}).get("verify:candidate"):
+            return
+        if rec.get("aborted"):
+            # `--abort` ended this run for the operator: never re-install its candidate behind them.
+            raise CalibrationAborted(StageOutcome(
+                key, "aborted",
+                digest={"message": "this verify-only run was ended with --abort (the prior cube was put "
+                                   "back) — start a NEW verify-only run instead of resuming it",
+                        "verify_candidate": rec}))
+        try:
+            live = (((self.controller.state() or {}).get("runtime") or {}).get(
+                f"{self.monitor}:{self.mode}") or {}).get("cube_path")
+        except Exception:  # noqa: BLE001 - unknown live state: re-assert (idempotent install)
+            live = None
+        if live == rec["cube"] and rec.get("installed") and not rec.get("restored"):
+            return
+        self.controller.set_3dlut(self.monitor, self.mode, str(rec["cube"]))
+        rec.update(installed=True, restored=False,
+                   reinstalled_at=datetime.now().isoformat(timespec="seconds"))
+        self.calib["verify_candidate"] = rec
+        self._save()
+        self.runlog.anomaly(key, kind="verify_candidate",
+                            message=f"the candidate cube was not live on resume (slot held {live!r}) — "
+                                    "re-installed before measuring")
+        self._hook_routing_evidence_after_install(key)
+
+    def _restore_verify_candidate(self, *, why: str) -> Optional[dict[str, Any]]:
+        """Put the prior runtime cube back after a candidate install (no-op without one). Evidence on
+        the spine; a failed restore is an anomaly naming the cube to re-apply by hand."""
+        before = dict(self.calib.get("verify_candidate") or {})
+        rec = verify_only.restore_candidate(self.controller, self.calib, why=why, log=self.ctx.log)
+        if not rec or rec == before:
+            return rec
+        try:
+            self._save()
+        except Exception:  # noqa: BLE001 - teardown bookkeeping must not mask the original exit
+            pass
+        if rec.get("restored"):
+            self.runlog.note("verify", f"candidate cube restored: prior {rec.get('prior_cube') or 'none'} back "
+                                       f"on the slot ({why})", verify_candidate=rec)
+            self._hook_routing_evidence_after_install("verify", action="restore")
+        else:
+            self.runlog.anomaly("verify", kind="verify_candidate", verify_candidate=rec,
+                                message=f"candidate cube NOT restored ({rec.get('restore_error')}) — "
+                                        f"re-apply {rec.get('prior_cube') or 'no cube (clear the slot)'} "
+                                        "in DesktopLUT by hand")
+        return rec
+
+    def _keep_verify_candidate(self) -> dict[str, Any]:
+        """``verify:candidate=keep``: the candidate stays live and is recorded in the applied-stack
+        registry as this display+mode's cube — exactly what a ``3dlut-only`` apply records
+        (``record_cube``); the MHC record is untouched."""
+        rec = self.calib.get("verify_candidate") or {}
+        rec["kept"] = True
+        rec["kept_at"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            reg = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root))
+            try:
+                pipe = self.controller.state() or {}
+                pipe_profile = ((pipe.get("mhc") or {}).get(f"{self.monitor}:{self.mode}") or {}).get("profile_name")
+            except Exception:  # noqa: BLE001
+                pipe_profile = None
+            entry = reg.record_cube(display=self.display.name, mode=self.mode, monitor=self.monitor,
+                                    run_id=self.ctx.root.name, cube_path=rec.get("cube"),
+                                    profile_name=pipe_profile)
+            rec["registry"] = {"key": entry.key, "path": str(reg.path)}
+            self.ctx.log(f"applied-stack registry: {entry.key} cube <- verify-only candidate {rec.get('cube')}")
+        except Exception as exc:  # noqa: BLE001 - the cube stays live either way; say the record failed
+            rec["registry_error"] = f"{type(exc).__name__}: {exc}"
+            stack_run = (self.calib.get("installed_stack") or {}).get("run_id") or "<the installed MHC's run>"
+            self.runlog.anomaly("verify", kind="verify_candidate",
+                                message=f"candidate kept live but the stack registry was NOT updated "
+                                        f"({rec['registry_error']}) — backfill with `python -m "
+                                        f"dlc.stack_registry import-run --run runs/{stack_run} --cube "
+                                        f"{rec.get('cube')}`")
+        self.calib["verify_candidate"] = rec
+        self._save()
+        return rec
+
+    def _verify_only_evidence(self, digest: Mapping[str, Any], metrics: Sequence[Any]) -> dict[str, Any]:
+        """The verify-only additions to the verify digest: WHAT was measured (the live runtime cube /
+        MHC profile, the candidate, the registry's view of the installed stack) and, with
+        ``--verify-patches-from``, ``vs_source`` — per-bucket deltas + per-patch movers vs the source
+        run's RECORDED verify, with every scoring-basis difference listed."""
+        ck = f"{self.monitor}:{self.mode}"
+        try:
+            state = self.controller.state() or {}
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            state = {"error": f"{type(exc).__name__}: {exc}"}
+        cand = self.calib.get("verify_candidate") or {}
+        measured = {"runtime_cube": ((state.get("runtime") or {}).get(ck) or {}).get("cube_path"),
+                    "mhc_profile": ((state.get("mhc") or {}).get(ck) or {}).get("profile_name"),
+                    "candidate": cand.get("cube") if cand.get("installed") else None,
+                    "installed_stack": self.calib.get("installed_stack")}
+        out: dict[str, Any] = {"verify_only": {"measured_stack": measured,
+                                               "scoring_gamut": self._scoring_gamut_source(),
+                                               "preheat_policy": self._preheat_policy() or "auto"}}
+        source = self._verify_source_record()
+        if source is None:
+            return out
+        src_verify = source.get("verify")
+        if not src_verify:
+            out["vs_source"] = {"source_run": source.get("run"),
+                                "note": "the source run's verify was never scored — nothing to compare"}
+            return out
+        src_rows = None
+        try:
+            p = Path(source.get("patch_metrics_path") or "")
+            if p.is_file():
+                src_rows = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            src_rows = None
+        now_rows = [{"rgb": list(m.rgb), "de2000": m.de2000, "gamut_clamped": m.gamut_clamped}
+                    for m in metrics]
+        basis_now = {"peak_nits": self._hdr_target().peak_nits if self.mode == "HDR" else None,
+                     "oog_mapping": self._oog_mapping()}
+        vs = verify_only.compare_verify(digest, src_verify, now_patch_rows=now_rows,
+                                        source_patch_rows=src_rows if isinstance(src_rows, list) else None,
+                                        basis_now=basis_now, basis_source=source.get("basis"))
+        if self.mode == "HDR" and (source.get("basis") or {}).get("gamut_from_run") is False:
+            # The source run built no MHC: its verify clamped against ITS day's DIP, which cannot be
+            # reproduced — the core / limits / clamped split may be re-partitioned here.
+            comp = vs.setdefault("comparability", {"like_for_like": True, "differences": []})
+            comp["differences"].append("the source run clamped against its day's DIP (it built no MHC); "
+                                       "this verify clamps against " + str(self._scoring_gamut_source()))
+            comp["like_for_like"] = False
+        out["vs_source"] = {"source_run": source.get("run"), **vs}
+        return out
+
+    def _finish_verify_only(self) -> CalibrationResult:
+        """The no-commit finish: a candidate's fate is the ``verify:candidate`` seam (restore
+        recommended; keep = stays live + recorded in the stack registry), then the report. No
+        durable-cube re-point, no MHC/registry write of its own."""
+        status = "completed"
+        cand = self.calib.get("verify_candidate") or {}
+        cand = self._redecide_resolved_candidate(cand)
+        if (self.calib.get("verify_cube") and cand.get("installed") and not cand.get("restored")
+                and not cand.get("kept")):
+            verify = ((self.calib["stages"].get("verify") or {}).get("digest") or {})
+            scored = (verify.get("gate") or {}).get("scored") or {}
+            vs = verify.get("vs_source") or {}
+            reads = (f"core avg {scored.get('core_avg')}, tube {scored.get('tube_avg')}, white "
+                     f"{scored.get('white')} {verify.get('metric', 'ΔE')}" if scored else
+                     f"avg {verify.get('avg_de2000')} {verify.get('metric', 'ΔE')}")
+            if vs.get("buckets"):
+                reads += "; vs " + Path(str(vs.get("source_run"))).name + ": " + ", ".join(
+                    f"{b} {row['avg']['delta']:+.3f}" for b, row in vs["buckets"].items()
+                    if (row.get("avg") or {}).get("delta") is not None)
+            decision = self.adjudicate(AdjudicationRequest(
+                key="verify:candidate", seam=SEAM_VERIFY, stage="verify",
+                question=(f"The candidate 3D LUT {Path(str(cand.get('cube'))).name} reads {reads} "
+                          f"({'within' if verify.get('within_quality') else 'outside'} the quality "
+                          "targets). Restore the prior cube "
+                          f"({cand.get('prior_cube') or 'none — clear the slot'}), or keep the "
+                          "candidate installed (recorded in the stack registry)?"),
+                options=("restore", "keep"), recommendation="restore",
+                digest={"candidate": cand, "verify": verify, "vs_source": vs or None,
+                        "gate_failed": not bool(verify.get("within_quality")),
+                        "keep_records": "stack_registry cube entry for "
+                                        f"{self.display.name}:{self.mode} (the MHC record is untouched)"}))
+            if decision.choice == "keep":
+                self._keep_verify_candidate()
+            else:
+                rec = self._restore_verify_candidate(why="verify:candidate=restore")
+                if not (rec or {}).get("restored"):
+                    status = "revert_unavailable"
+        rep = self.stage_report()
+        self.runlog.run_done(status, results_dir=rep.data.get("results_dir"),
+                             report_path=rep.data.get("report_path"))
+        return CalibrationResult(
+            flow="verify-only", monitor=self.monitor, mode=self.mode, target=self.target_name,
+            status=status, stages=list(self.calib["stages"].keys()),
+            results_dir=rep.data.get("results_dir"), report_path=rep.data.get("report_path"),
+            digest={**rep.digest, "candidate": self.calib.get("verify_candidate")})
+
 
 # The ordered stage keys each flow walks/announces on the spine — the DECLARATIVE mirror of
 # the imperative ``_flow_*`` methods, consumed by ``Calibration._planned_stages`` (the
@@ -7683,6 +8287,9 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
                    "measure:verify", "verify"),
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
+    # verify-source / install-candidate only with --verify-patches-from / --verify-cube.
+    "verify-only": ("preflight", "verify-source", "resolve-target", "whitepoint", "hardware-readiness",
+                    "install-candidate", "measure:verify", "verify"),
 }
 
 # Flow registry (the named flows the front door maps an intent onto). HDR is a run
@@ -7696,6 +8303,9 @@ FLOWS: dict[str, str] = {
                    "grayscale (white band) → re-apply its 3D LUT → short verify → apply gate"),
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
+    "verify-only": ("MEASURE the installed stack (or a --verify-cube candidate over it) against the verify "
+                    "preset or a recorded run's exact set (--verify-patches-from, deltas vs its verify) → "
+                    "report; builds/commits nothing (candidate: verify:candidate restore/keep)"),
     "hdr": "(not a flow — signpost) HDR is a MODE: use --mode HDR with full / mhc-only / 3dlut-only",
 }
 
@@ -7768,6 +8378,11 @@ def _restore_hint(calib_state: Optional[dict[str, Any]]) -> str:
     bak = calib_state.get("backup") or {}
     ref = bak.get("ini_backup") or bak.get("path")
     hint = "restore from the pre-run settings backup" + (f" ({ref})" if ref else " in the run folder")
+    cand = calib_state.get("verify_candidate")
+    if isinstance(cand, dict) and cand.get("installed") and not cand.get("restored") and not cand.get("kept"):
+        hint += ("; the verify-only CANDIDATE cube is still installed — re-apply "
+                 + (f"the prior 3D LUT {cand.get('prior_cube')}" if cand.get("prior_cube") else "no cube (clear the slot)")
+                 + " in DesktopLUT" + (f" ({cand.get('restore_error')})" if cand.get("restore_error") else ""))
     base = calib_state.get("inplace_baseline")
     if isinstance(base, dict) and base.get("captured"):
         if calib_state.get("flow") == "grayscale-wb":
@@ -7781,33 +8396,68 @@ def _restore_hint(calib_state: Optional[dict[str, Any]]) -> str:
     return hint
 
 
-def _run_entered_calibration(calib_state: Optional[dict[str, Any]]) -> Optional[bool]:
-    """Did this run enter calibration mode (so DesktopLUT holds a capture of it)? ``None`` when the
-    run record cannot tell (no record — ``--abort`` against a live pipe)."""
-    if not isinstance(calib_state, dict) or not calib_state:
-        return None
-    stages = calib_state.get("stages") or {}
+def _run_entered_calibration(calib_state: Optional[dict[str, Any]], *,
+                             flow: Optional[str] = None) -> Optional[bool]:
+    """Did this run enter calibration mode (so DesktopLUT holds a capture of it)? False for a
+    verify-only run without an enter-neutral stage (it measures the installed stack in place and
+    records no in-place baseline; ``flow`` is the fallback when the record has none) or a recorded
+    in-place baseline; ``None`` when the run record cannot tell (no record — ``--abort`` against a
+    live pipe)."""
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    stages = rec.get("stages") or {}
     if "enter-neutral" in stages or "clear-native" in stages:
         return True
-    if calib_state.get("inplace_baseline") is not None:
+    if (rec.get("flow") or flow) == "verify-only":
+        return False
+    if not rec:
+        return None
+    if rec.get("inplace_baseline") is not None:
         return False
     return None
 
 
 def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
-                   mode: Optional[str], run_root: Any) -> tuple[int, dict[str, Any]]:
-    """``--abort``: restore the pre-run snapshot, re-assert the user's viewing layers, and report
-    what the SERVER says it restored. Returns ``(exit_code, payload)`` for the CLI to print."""
+                   mode: Optional[str], run_root: Any, flow: Optional[str] = None,
+                   log: Optional[Callable[[str], None]] = None) -> tuple[int, dict[str, Any]]:
+    """``--abort``: put a verify-only candidate cube back, restore the pre-run snapshot, re-assert
+    the user's viewing layers, and report what the SERVER says it restored. Returns
+    ``(exit_code, payload)`` for the CLI to print.
+
+    A verify-only run that never entered calibration mode never asks for a snapshot restore (main's
+    verify-only guard, folded in here): it has no snapshot of its own, and a build predating the
+    snapshot store would restore its stale LAST slot — a completed earlier calibration's pre-run
+    setup — over the current one."""
+    candidate = None
+    if isinstance(calib_state, dict):
+        candidate = verify_only.restore_candidate(controller, calib_state, why="--abort of a paused run",
+                                                  log=log, terminal=True)
+    entered = _run_entered_calibration(calib_state, flow=flow)
+    run_flow = (calib_state or {}).get("flow") or flow
+    if entered is False and run_flow == "verify-only":
+        bak = ((calib_state or {}).get("backup") or {})
+        layers = _reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
+        cand_back = (not isinstance(candidate, dict) or not candidate.get("installed")
+                     or candidate.get("restored") or candidate.get("kept"))
+        report = {"restored": False, "unrestored": [], "mhc_failed": [], "complete": False,
+                  "requested": False,
+                  "summary": "verify-only never entered calibration mode: no snapshot was requested"}
+        payload = {"status": "reverted" if cand_back else "revert_unavailable",
+                   "restored_snapshot": None, "snapshot_restore": report, "viewing_layers": layers,
+                   "verify_candidate": candidate, "backup": bak, "run": str(run_root)}
+        if not cand_back:
+            payload["hint"] = _restore_hint(calib_state)
+        return 0, payload
     try:
         out = controller.exit_calibration(restore_snapshot=True)
     except Exception as exc:  # noqa: BLE001
-        return 1, {"status": "abort_failed", "error": f"{type(exc).__name__}: {exc}", "run": str(run_root)}
+        return 1, {"status": "abort_failed", "error": f"{type(exc).__name__}: {exc}",
+                   "verify_candidate": candidate, "run": str(run_root)}
     report = snapshot_restore_report(out)
     bak = ((calib_state or {}).get("backup") or {})
     layers = _reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
     status = ("reverted" if report["complete"]
               else "partially_reverted" if report["restored"] else "nothing_restored")
-    if _run_entered_calibration(calib_state) is False and report["restored"]:
+    if entered is False and report["restored"]:
         # An in-place run never entered calibration mode, so whatever DesktopLUT just put back was
         # NOT captured by this run: an earlier, never-exited session's capture — or, on a build
         # predating the snapshot store (no restored_monitors), its stale last slot, i.e. a PREVIOUS
@@ -7822,7 +8472,7 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
             + ": verify the display against the pre-run settings backup")
     payload: dict[str, Any] = {"status": status, "restored_snapshot": report["restored"],
                                "snapshot_restore": report, "viewing_layers": layers,
-                               "backup": bak, "run": str(run_root)}
+                               "verify_candidate": candidate, "backup": bak, "run": str(run_root)}
     if not report["complete"]:
         payload["hint"] = _restore_hint(calib_state)
     return 0, payload
@@ -8226,8 +8876,33 @@ def _render_report_html(p: dict[str, Any]) -> str:
         + metric_row(f"White {de}", "white_de2000")
         + metric_row(f"Grayscale avg {de}", "grayscale_avg_de2000")
         + "</table>"
+        + _render_vs_source_html(v.get("vs_source"), de)
         + analysis_block
     )
+
+
+def _render_vs_source_html(vs: Optional[Mapping[str, Any]], de: str) -> str:
+    """verify-only ``--verify-patches-from``: the per-bucket deltas vs the source run's recorded
+    verify (now − source; negative = better)."""
+    if not vs:
+        return ""
+    rows: list[str] = []
+    for key, row in (vs.get("headline") or {}).items():
+        rows.append(f"<tr><td>{key.replace('_de2000', '')}</td><td>{row.get('source')}</td>"
+                    f"<td>{row.get('now')}</td><td>{row.get('delta')}</td></tr>")
+    for group in ("buckets", "bands"):
+        for name, stats in (vs.get(group) or {}).items():
+            avg = stats.get("avg") or {}
+            n = stats.get("n") or {}
+            rows.append(f"<tr><td>{name} avg (n {n.get('source')}→{n.get('now')})</td>"
+                        f"<td>{avg.get('source')}</td><td>{avg.get('now')}</td><td>{avg.get('delta')}</td></tr>")
+    comp = vs.get("comparability") or {}
+    note = ("like-for-like scoring basis" if comp.get("like_for_like")
+            else "scoring basis differs: " + "; ".join(comp.get("differences") or []))
+    return (f"<h2>vs source run <code>{vs.get('source_run')}</code> ({de}, now − source)</h2>"
+            f"<p class='{'ok' if comp.get('like_for_like') else 'warn'}'>{note}</p>"
+            "<table><tr><th>Bucket</th><th>Source</th><th>Now</th><th>Δ</th></tr>"
+            + "".join(rows) + "</table>")
 
 
 # ---------------------------------------------------------------------------
@@ -8256,6 +8931,9 @@ def run_calibration(
     mhc_top_hold: bool = True,
     white_band: Optional[tuple[float, float]] = None,
     source_run: Optional[Path] = None,
+    verify_cube: Optional[Path] = None,
+    verify_patches_from: Optional[Path] = None,
+    preheat: Optional[str] = None,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -8269,7 +8947,8 @@ def run_calibration(
         patch_sizes=patch_sizes, run_date=run_date, force=force,
         adaptive_planning=adaptive_planning,
         require_hardware_readiness=require_hardware_readiness,
-        mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run)
+        mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run,
+        verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat)
     return calib.run(flow)
 
 
@@ -8318,6 +8997,24 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="SDR white-luminance band in nits for the MHC grayscale refine (overrides "
                              "the target's white_nits_band; default 11/12..1 x the nominal white): the "
                              "refine dims white inside it just enough for an exact target white")
+    parser.add_argument("--verify-cube", type=Path, default=None, dest="verify_cube", metavar="CUBE",
+                        help="verify-only flow: temporarily install this candidate 3D LUT for the run (the "
+                             "prior runtime cube is captured and put back on restore / abort / cancel); "
+                             "the verify:candidate seam decides restore (recommended) or keep (stays live, "
+                             "recorded in the stack registry)")
+    parser.add_argument("--verify-patches-from", type=Path, default=None, dest="verify_patches_from",
+                        metavar="RUN_DIR",
+                        help="verify-only flow: re-measure EXACTLY this recorded run's verify patch list "
+                             "(read-only) and score it under that run's basis; the verify digest + report "
+                             "carry per-bucket deltas vs its recorded verify. A source whose mode / bit "
+                             "depth / display / target / correction differs is a seam")
+    parser.add_argument("--preheat", choices=("auto", "always", "never"), default=None, dest="preheat",
+                        help="thermal preheat policy for every measure stage (the closed-loop soak before "
+                             "the main pass). auto (default = today's behaviour): soak any characterized "
+                             "panel, self-deactivating when already warm; always: soak even without a DIP; "
+                             "never: skip it (a short verify on a panel already at operating temperature). "
+                             "Persisted in the run record (a flagless resume keeps it; each measure digest "
+                             "records the policy it ran under)")
     parser.add_argument("--profile", type=Path, default=None)
     parser.add_argument("--bit-depth", type=int, default=None, dest="bit_depth")
 
@@ -8632,9 +9329,24 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         out["patch_plan"] = (flow_patch_counts(args.flow, patch_sizes,
                                                profile.transfer_for(target, bit_depth=bd))
                              if target else {"note": f"no {mode} target for monitor {args.monitor}"})
+        if args.flow == "verify-only" and args.verify_patches_from is not None:
+            # The run re-measures the SOURCE's exact list — that is its size, not the preset's.
+            try:
+                src = verify_only.load_source_verify(Path(args.verify_patches_from))
+                out["patch_plan"] = {"stages": {"verify": src["patch_count"]},
+                                     "total_patches": src["patch_count"],
+                                     "verify_source": {k: src.get(k) for k in
+                                                       ("run", "mode", "bit_depth", "target", "display",
+                                                        "patch_source", "patches_fingerprint")}}
+            except verify_only.SourceRunError as exc:
+                out["patch_plan"] = {"error": f"--verify-patches-from: {exc}", **exc.detail}
         print(json.dumps(out, indent=2))
         return 0
 
+    if ((args.verify_cube is not None or args.verify_patches_from is not None) and args.flow != "verify-only"
+            and not (args.run and (args.run / "manifest.json").exists())):
+        print(json.dumps({"error": "--verify-cube / --verify-patches-from belong to --flow verify-only"}))
+        return 2
     ctx = open_run(args.run) if args.run and (args.run / "manifest.json").exists() \
         else create_run(normalize_mode(args.mode), display=profile.display_for(args.monitor).name,
                         run_dir=args.run)
@@ -8653,6 +9365,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # so main only needs the resolved values to build the live stack — discard the conflict list.
     eff_mode, _eff_bd, _ = resolve_run_spec(ctx, state, mode=args.mode, bit_depth=args.bit_depth)
     eff_flow, _ = resolve_run_flow(state, args.flow)
+    if (args.verify_cube is not None or args.verify_patches_from is not None) and eff_flow != "verify-only":
+        print(json.dumps({"error": (f"--verify-cube / --verify-patches-from belong to --flow verify-only "
+                                    f"(this run's flow is {eff_flow}) — nothing else would use them")}))
+        return 2
     recorded = (state.get("calib", {}) or {}).get("decisions", {})
     decisions = {k: Decision(v["choice"], v.get("note"), payload=v.get("payload"))
                  for k, v in recorded.items()}
@@ -8701,8 +9417,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # `restored_snapshot` is the SERVER's restored flag, not "the call returned": a flow that never
     # entered (3dlut-only) or a DesktopLUT restarted mid-run holds no capture, and the payload says so.
     if args.abort:
+        # verify-only's candidate cube is put back first, and a verify-only run that never entered
+        # calibration mode never asks DesktopLUT for a snapshot restore: on a build predating the
+        # snapshot store its stale LAST slot would roll a completed earlier calibration back.
         code, payload = _abort_restore(controller, state.get("calib"), monitor=args.monitor,
-                                       mode=args.mode, run_root=ctx.root)
+                                       mode=args.mode, run_root=ctx.root, flow=eff_flow, log=ctx.log)
+        if payload.get("verify_candidate") is not None:
+            _common.save_dlc_state(ctx, state)   # restore_candidate updated calib['verify_candidate']
         print(json.dumps(payload, indent=2, default=str))
         return code
 
@@ -8890,6 +9611,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             mhc_top_hold=(args.top_hold == "on"),
                             white_band=args.white_band,
                             source_run=args.source_run,
+                            verify_cube=args.verify_cube,
+                            verify_patches_from=args.verify_patches_from,
+                            preheat=args.preheat,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))

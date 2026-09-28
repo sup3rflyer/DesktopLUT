@@ -599,6 +599,9 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
     # refine rounds (the neutral ramp, repeated until the physics judge stops) are not counted —
     # as for the full/mhc-only refine; the fixed cost is the short verify.
     "refine-mhc": ("refine-verify",),
+    # measures the installed stack with the standard verify preset (--verify-patches-from swaps in a
+    # recorded run's exact list — the orchestrator/preview size that one from the source).
+    "verify-only": ("verify",),
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
                    "post-mhc": build_volumetric_set, "grayscale-wb": build_grayscale_wb_set,

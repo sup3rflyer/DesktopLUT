@@ -11,6 +11,23 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **`--flow verify-only`: measure a stack without rebuilding it** (2026-09-27). Several hardware
+  acceptances only need a measurement: the projection-cube (D1) acceptance on the PA32UCXR, re-checking a
+  stack after a change, owner A/Bs. Until now the only route was a multi-hour `3dlut-only` rebuild. The
+  new flow scores the installed stack against the verify preset and changes nothing: no enter-neutral,
+  no MHC, cube or registry write. The viewing layers are off for the run and restored at its end.
+  `--verify-patches-from RUN_DIR` re-measures exactly that run's verify patches, read from its
+  measurement log and cross-checked against its TI3 and recorded count. The run is then scored the way
+  that run was (HDR peak, out-of-gamut policy, measured gamut). The verify digest and the report carry
+  before/after/delta per headline number, per core / limits / clamped / tube bucket and per luminance
+  band, plus the patches that moved most. A source whose mode or bit depth differs is refused at a seam;
+  another display, target, meter correction or installed cap is a judged seam. `--verify-cube CUBE`
+  installs a candidate 3D LUT for the run. At the end the `verify:candidate` seam restores the prior cube
+  (recommended) or keeps the candidate and records it in the stack registry. Abort, cancel, an error and
+  `--abort` of a paused run all put the prior cube back. `--preheat auto|always|never` (all flows) sets
+  the thermal soak before each measure stage. It is kept across resumes and recorded in each measure
+  digest; `auto` is the old behaviour. The stepper, `--preview-patches` and the mock rehearsal
+  (`python -m dlc.stages.simulate --flow verify-only`) know the flow.
 - **FALD compensation on SDR desktops** (2026-09-14): the mini-LED compensation layer now also works in SDR
   when Windows "Automatically manage color for apps" is on, with its own panel file; the profiling flow can
   verify an SDR profile, and DesktopLUT now reports whether that Windows setting is on.
