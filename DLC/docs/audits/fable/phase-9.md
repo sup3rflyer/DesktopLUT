@@ -233,6 +233,14 @@ adversarially and NOT merged; the rework ports it onto main and corrects it:
   guard restoring for runs that never entered, the grayscale-wb prior being re-captured on a stage
   re-run, `restored` ignoring MHC reinstall failures, the stale tell dropping capture age, and an
   identity-less capture adopting an identified display after an index shift.
+  A second review (2026-09-28, after merging main's verify-only flow) led to: DLC requests a
+  snapshot restore only for a run that entered AND while DesktopLUT holds an open session / capture
+  (`_common.request_snapshot_restore`, pinned against BOTH servers in `tests/test_snapshot_server_
+  compat.py` via the mock's `LegacySnapshotMockServer`); verify-only's `--abort` restores its
+  candidate and never the snapshot; a revert over an old build's stale single slot is
+  `reverted_partially`, not complete; the grayscale-wb prior's `enabled` comes from the viewing-layer
+  capture; the raw grayscale setter sends `len(points)`; and a C++ exit that fails part-way keeps
+  its pre-copy MHC plan on the capture so a retry still swaps the identity profile in.
   Not done: persisting the captures to disk.
 - **T3** emitted as designed; the DLC revert now sends the block back VERBATIM (the branch
   re-bridged it, which bent luminance-scaled curves) and restores `enabled` through `layers.set`.
