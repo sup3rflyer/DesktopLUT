@@ -100,8 +100,9 @@ struct CalibResolution {
 //                                                      with it: MatchMonitorSettings keeps it)
 //   3. same EDID id, exactly one candidate, and a slot missing on one side (a slot MISMATCH means
 //      a different known display, e.g. an uncaptured EDID twin — never adopted)
-//   4. captured WITHOUT an identity: the display now at the captured index (monitor_identity's own
-//      "same index, previously unidentified" rule)
+//   4. captured WITHOUT an identity: the display now at the captured index — but only while that
+//      display is STILL unidentified. Once it is identified nothing proves it is the same panel (an
+//      index shift puts another display there), so the capture is reported, never guessed.
 inline std::vector<CalibResolution> ResolveCalibCaptures(const std::vector<CalibCaptureKey>& caps,
                                                          const std::vector<CalibLiveMonitor>& live) {
     std::vector<CalibResolution> out(caps.size());
@@ -147,8 +148,12 @@ inline std::vector<CalibResolution> ResolveCalibCaptures(const std::vector<Calib
     for (size_t c = 0; c < caps.size(); c++) {
         if (out[c].liveIndex >= 0 || !caps[c].identity.empty()) continue;
         const int idx = caps[c].indexAtCapture;
-        if (idx >= 0 && idx < (int)live.size() && !taken[(size_t)idx])
-            claim(c, (size_t)idx, "same index (captured without a display identity)");
+        if (idx < 0 || idx >= (int)live.size() || taken[(size_t)idx]) continue;
+        if (live[(size_t)idx].identity.empty())
+            claim(c, (size_t)idx, "same index, still unidentified");
+        else
+            out[c].how = "captured without a display identity; the display now at that index is "
+                         "identified, so it cannot be proven to be the same one";
     }
     for (size_t c = 0; c < caps.size(); c++) {
         if (out[c].liveIndex >= 0 || out[c].how[0] != '\0') continue;

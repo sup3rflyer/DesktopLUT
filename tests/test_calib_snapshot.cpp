@@ -260,6 +260,16 @@ TEST_CASE("CalibSnapshot: a display captured without an identity falls back to i
     const CalibRestorePlan gone = PlanCalibRestore(store, fewer);
     CHECK(gone.steps.empty());
     CHECK(gone.unrestored.size() == 1);
+    // ...as is an IDENTIFIED display now sitting at that index (an index shift): nothing proves it
+    // is the panel that was captured, so its settings are never overwritten with the capture.
+    std::vector<MonitorSettings> shifted = { live[0], CsUser(kA, 0, L"C:\\luts\\a.cube") };
+    const CalibRestorePlan other = PlanCalibRestore(store, shifted);
+    CHECK(other.steps.empty());
+    REQUIRE(other.unrestored.size() == 1);
+    CHECK(std::string(other.unrestored[0].reason).find("cannot be proven") != std::string::npos);
+    // ...and a re-enter there is a NEW capture, not a false "retained".
+    CHECK(store.Enter(shifted, 1, false, 2000) == false);
+    CHECK(store.captures.size() == 2);
 }
 
 TEST_CASE("CalibSnapshot: two displays in one session each keep their own original") {

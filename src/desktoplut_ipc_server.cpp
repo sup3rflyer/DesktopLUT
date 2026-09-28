@@ -1163,7 +1163,8 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
         // on the GUI thread, so the two can never interleave.
         std::lock_guard<std::mutex> ck(g_calibMutex);
         // One MHC action per ENTERED mode of every restored display (see PlanCalibModeRestore).
-        struct ModeOp { int monitor; bool isHdr; CalibMhcRestore action; std::wstring liveName; float livePeak; };
+        struct ModeOp { int monitor; bool isHdr; CalibMhcRestore action; std::wstring liveName; float livePeak;
+                        size_t entry; };   // entry = its display's index in restoredMonitors
         std::vector<ModeOp> ops;
         std::vector<int> touched;
         {
@@ -1180,7 +1181,8 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
                     // read before the copy below drops them (as DoEnterNeutral computes it).
                     const float livePeak = mr.action == CalibMhcRestore::IdentitySwap
                         ? MhcIdentityPeakNits(live, mr.isHdr) : 0.0f;
-                    ops.push_back(ModeOp{ step.liveIndex, mr.isHdr, mr.action, mr.liveProfileName, livePeak });
+                    ops.push_back(ModeOp{ step.liveIndex, mr.isHdr, mr.action, mr.liveProfileName, livePeak,
+                                          restoredMonitors.arr.size() });
                 }
                 // The captured settings go back; the live identity / slot / legacyIndex stay.
                 RestoreCapturedSettings(live, cap.settings);
@@ -1203,6 +1205,10 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
         }
         if (!touched.empty()) {
             SaveSettings();
+            // Per entered mode: which MHC action ran and whether it landed. `restored` means the
+            // SETTINGS went back; a failed reinstall / identity swap leaves the calibration's
+            // transform in scanout, so DLC must be able to see it (restored_monitors[].mhc).
+            std::vector<JsonValue> mhcResults(restoredMonitors.arr.size(), JArr());
             for (const ModeOp& op : ops) {
                 // Reinstall the original MHC of every mode the session entered. Where there was
                 // none but the calibration left one associated (DLC's identity or an interim
@@ -1210,11 +1216,23 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
                 // longer referenced by settings, so the stale-association sweep would drop it →
                 // nothing associated, while Windows keeps applying its transform (HW-proven
                 // 2026-09-03 / 2026-09-23).
-                if (op.action == CalibMhcRestore::Reinstall)
-                    GenerateAndInstallMhcProfile(op.monitor, op.isHdr);
-                else if (op.action == CalibMhcRestore::IdentitySwap)
-                    ReplaceMhcProfileWithIdentity(op.monitor, op.isHdr, op.livePeak, op.liveName);
+                bool ok = true;
+                const char* action = "none";
+                if (op.action == CalibMhcRestore::Reinstall) {
+                    action = "reinstall";
+                    ok = GenerateAndInstallMhcProfile(op.monitor, op.isHdr);
+                } else if (op.action == CalibMhcRestore::IdentitySwap) {
+                    action = "identity_swap";
+                    ok = !ReplaceMhcProfileWithIdentity(op.monitor, op.isHdr, op.livePeak, op.liveName).empty();
+                }
+                JsonValue r = JObj();
+                r.set("mode", JStr(op.isHdr ? "HDR" : "SDR"));
+                r.set("action", JStr(action));
+                r.set("ok", JBool(ok));
+                if (op.entry < mhcResults.size()) mhcResults[op.entry].arr.push_back(std::move(r));
             }
+            for (size_t k = 0; k < mhcResults.size(); ++k)
+                restoredMonitors.arr[k].set("mhc", std::move(mhcResults[k]));
             for (int mon : touched) UpdateMhcFlagsLive(mon);
             ReapplyProcessing();
             restored = true;
