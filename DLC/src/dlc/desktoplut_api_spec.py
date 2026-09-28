@@ -263,7 +263,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                  "identity_swap | none, ok:bool}]}: per entered mode, the captured MHC reinstalled, or "
                  "a live one swapped for the identity profile when the capture had none. ok:false = "
                  "the settings came back but that profile step failed (the old transform may still "
-                 "be in scanout) — not a complete restore."),
+                 "be in scanout) — not a complete restore. resumed:true = an earlier exit copied the "
+                 "settings back and failed part-way; this one ran the MHC steps it had left."),
              "unrestored": (
                  "array (additive): displays the session captured but could NOT put back — "
                  "{reason, display, edid_id, captured_monitor, modes}. Non-empty = restore those "

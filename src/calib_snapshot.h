@@ -25,6 +25,9 @@
 //     back (reinstalled, or swapped for the identity profile) on restore.
 //  5. Captures survive a failed/thrown enter (the next enter keeps them) and are dropped ONLY by
 //     calibration.exit — which always drops them, restore or not.
+//  6. A restore that fails part-way (an exception after the settings were copied back) keeps the
+//     per-mode MHC plan it made BEFORE the copy, so the retry still knows what the session left
+//     associated — re-planning from the already-restored settings would lose the identity swap.
 // Disk persistence of the captures (surviving a DesktopLUT restart mid-run) is NOT here; after a
 // restart the store is empty and exit reports restored=false — DLC's settings backup covers it.
 
@@ -46,12 +49,32 @@ struct CalibCaptureKey {
                                // display captured without an identity
 };
 
+enum class CalibMhcRestore {
+    None,          // nothing to do for this mode's MHC
+    Reinstall,     // the captured MHC was enabled: GenerateAndInstallMhcProfile
+    IdentitySwap,  // no captured MHC, but the session left one associated: ReplaceMhcProfileWithIdentity
+};
+
+struct CalibModeRestore {
+    bool isHdr = false;
+    CalibMhcRestore action = CalibMhcRestore::None;
+    std::wstring liveProfileName;  // IdentitySwap: the profile the session left associated
+    float livePeak = 0.0f;         // IdentitySwap: its identity-profile peak (the IO layer fills it in)
+    bool done = false;             // the step ran (a retry after a failure part-way skips it)
+};
+
 struct CalibCapture {
     CalibCaptureKey key;
     MonitorSettings settings;   // the display's settings BEFORE the session cleared anything
     bool sdrEntered = false;    // the modes this session entered on the display
     bool hdrEntered = false;
     uint64_t capturedAtMs = 0;  // the caller's clock (GetTickCount64 in the server)
+    // Set once an exit has copied `settings` back over the live display: the per-mode MHC plan it
+    // made BEFORE the copy (with what was left associated) lives on in pendingMhc, so a retry after
+    // an exception part-way re-runs the steps not yet done instead of re-planning from the
+    // already-restored settings (which no longer show the calibration's live profile).
+    bool settingsRestored = false;
+    std::vector<CalibModeRestore> pendingMhc;
 
     bool Entered(bool isHdr) const { return isHdr ? hdrEntered : sdrEntered; }
     void MarkEntered(bool isHdr) { (isHdr ? hdrEntered : sdrEntered) = true; }
@@ -167,18 +190,6 @@ inline std::vector<CalibResolution> ResolveCalibCaptures(const std::vector<Calib
 // ---------------------------------------------------------------------------------------------
 // Restore planning
 // ---------------------------------------------------------------------------------------------
-enum class CalibMhcRestore {
-    None,          // nothing to do for this mode's MHC
-    Reinstall,     // the captured MHC was enabled: GenerateAndInstallMhcProfile
-    IdentitySwap,  // no captured MHC, but the session left one associated: ReplaceMhcProfileWithIdentity
-};
-
-struct CalibModeRestore {
-    bool isHdr = false;
-    CalibMhcRestore action = CalibMhcRestore::None;
-    std::wstring liveProfileName;  // IdentitySwap: the profile the session left associated
-};
-
 // One entered mode's MHC: reinstall the captured profile if it was enabled; otherwise, if the
 // session left a profile live (DLC's identity or an interim build), swap it for the identity
 // profile rather than leaving it associated — after the settings restore nothing references it,
@@ -204,7 +215,8 @@ struct CalibRestoreStep {
     size_t capture = 0;   // index into CalibSnapshotStore::captures
     int liveIndex = -1;   // where it goes back
     const char* how = "";
-    std::vector<CalibModeRestore> modes;   // one per ENTERED mode, SDR first
+    std::vector<CalibModeRestore> modes;   // one per ENTERED mode, SDR first (resumed: the pending ones)
+    bool resumed = false; // an earlier exit already copied the settings back and failed part-way
 };
 
 struct CalibUnrestored {
@@ -261,6 +273,10 @@ struct CalibSnapshotStore {
         for (size_t c = 0; c < captures.size(); c++) {
             if (res[c].liveIndex == mon) {
                 captures[c].MarkEntered(isHdr);
+                // an exit that failed part-way copied the settings back; this enter clears the display
+                // again, so the next exit must copy them again and plan from what is live THEN
+                captures[c].settingsRestored = false;
+                captures[c].pendingMhc.clear();
                 return true;
             }
         }
@@ -291,6 +307,14 @@ inline CalibRestorePlan PlanCalibRestore(const CalibSnapshotStore& store, const 
         step.capture = c;
         step.liveIndex = res[c].liveIndex;
         step.how = res[c].how;
+        if (cap.settingsRestored) {
+            // a retry: the live settings ARE the capture now — keep the plan made before the copy
+            step.resumed = true;
+            for (const CalibModeRestore& mr : cap.pendingMhc)
+                if (!mr.done) step.modes.push_back(mr);
+            plan.steps.push_back(std::move(step));
+            continue;
+        }
         const MonitorSettings& liveNow = live[(size_t)step.liveIndex];
         for (int mode = 0; mode < 2; mode++) {
             const bool isHdr = (mode == 1);
@@ -299,4 +323,22 @@ inline CalibRestorePlan PlanCalibRestore(const CalibSnapshotStore& store, const 
         plan.steps.push_back(std::move(step));
     }
     return plan;
+}
+
+// Carry out a restore step's settings half: copy the capture back over `live` (never its identity
+// fields) and keep `modes` — the per-mode MHC plan made BEFORE the copy, peaks filled in — on the
+// capture until each step is marked done. A resumed step (the settings are back already) only
+// re-arms the pending MHC steps. Returns the MHC steps still to run, in order.
+inline std::vector<size_t> ApplyCalibRestoreStep(CalibCapture& cap, MonitorSettings& live,
+                                                 const CalibRestoreStep& step,
+                                                 const std::vector<CalibModeRestore>& modes) {
+    if (!step.resumed) {
+        cap.pendingMhc = modes;
+        RestoreCapturedSettings(live, cap.settings);
+        cap.settingsRestored = true;
+    }
+    std::vector<size_t> todo;
+    for (size_t k = 0; k < cap.pendingMhc.size(); k++)
+        if (!cap.pendingMhc[k].done) todo.push_back(k);
+    return todo;
 }

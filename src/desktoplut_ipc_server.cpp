@@ -1162,9 +1162,10 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
         // Lock order unchanged: calib -> settings here, settings -> calib in DoEnterNeutral, both
         // on the GUI thread, so the two can never interleave.
         std::lock_guard<std::mutex> ck(g_calibMutex);
-        // One MHC action per ENTERED mode of every restored display (see PlanCalibModeRestore).
-        struct ModeOp { int monitor; bool isHdr; CalibMhcRestore action; std::wstring liveName; float livePeak;
-                        size_t entry; };   // entry = its display's index in restoredMonitors
+        // One MHC action per ENTERED mode of every restored display (see PlanCalibModeRestore). An op
+        // points into its capture's pendingMhc, which survives an exception part-way (the store is
+        // only cleared below, after everything ran), so a retried exit resumes instead of re-planning.
+        struct ModeOp { size_t capture; size_t mode; int monitor; size_t entry; };
         std::vector<ModeOp> ops;
         std::vector<int> touched;
         {
@@ -1174,22 +1175,22 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
             // before anything is copied back.
             const CalibRestorePlan plan = PlanCalibRestore(g_calib.snapshots, g_gui.monitorSettings);
             for (const CalibRestoreStep& step : plan.steps) {
-                const CalibCapture& cap = g_calib.snapshots.captures[step.capture];
+                CalibCapture& cap = g_calib.snapshots.captures[step.capture];
                 MonitorSettings& live = g_gui.monitorSettings[(size_t)step.liveIndex];
-                for (const CalibModeRestore& mr : step.modes) {
-                    // The identity profile's peak comes from the settings the session left live,
-                    // read before the copy below drops them (as DoEnterNeutral computes it).
-                    const float livePeak = mr.action == CalibMhcRestore::IdentitySwap
-                        ? MhcIdentityPeakNits(live, mr.isHdr) : 0.0f;
-                    ops.push_back(ModeOp{ step.liveIndex, mr.isHdr, mr.action, mr.liveProfileName, livePeak,
-                                          restoredMonitors.arr.size() });
-                }
+                // The identity profile's peak comes from the settings the session left live, read
+                // before the copy drops them (as DoEnterNeutral computes it).
+                std::vector<CalibModeRestore> modes = step.modes;
+                if (!step.resumed)
+                    for (CalibModeRestore& mr : modes)
+                        if (mr.action == CalibMhcRestore::IdentitySwap) mr.livePeak = MhcIdentityPeakNits(live, mr.isHdr);
                 // The captured settings go back; the live identity / slot / legacyIndex stay.
-                RestoreCapturedSettings(live, cap.settings);
+                for (size_t k : ApplyCalibRestoreStep(cap, live, step, modes))
+                    ops.push_back(ModeOp{ step.capture, k, step.liveIndex, restoredMonitors.arr.size() });
                 touched.push_back(step.liveIndex);
                 JsonValue e = JObj();
                 e.set("monitor", JNum(step.liveIndex));
                 e.set("resolved_by", JStr(step.how));
+                if (step.resumed) e.set("resumed", JBool(true));
                 CalibDisplayJson(e, cap.key);
                 e.set("modes", CalibModesJson(cap.sdrEntered, cap.hdrEntered));
                 restoredMonitors.arr.push_back(std::move(e));
@@ -1210,6 +1211,7 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
             // transform in scanout, so DLC must be able to see it (restored_monitors[].mhc).
             std::vector<JsonValue> mhcResults(restoredMonitors.arr.size(), JArr());
             for (const ModeOp& op : ops) {
+                CalibModeRestore& mr = g_calib.snapshots.captures[op.capture].pendingMhc[op.mode];
                 // Reinstall the original MHC of every mode the session entered. Where there was
                 // none but the calibration left one associated (DLC's identity or an interim
                 // build), swap it for the identity profile rather than leaving it applied: it is no
@@ -1218,15 +1220,16 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
                 // 2026-09-03 / 2026-09-23).
                 bool ok = true;
                 const char* action = "none";
-                if (op.action == CalibMhcRestore::Reinstall) {
+                if (mr.action == CalibMhcRestore::Reinstall) {
                     action = "reinstall";
-                    ok = GenerateAndInstallMhcProfile(op.monitor, op.isHdr);
-                } else if (op.action == CalibMhcRestore::IdentitySwap) {
+                    ok = GenerateAndInstallMhcProfile(op.monitor, mr.isHdr);
+                } else if (mr.action == CalibMhcRestore::IdentitySwap) {
                     action = "identity_swap";
-                    ok = !ReplaceMhcProfileWithIdentity(op.monitor, op.isHdr, op.livePeak, op.liveName).empty();
+                    ok = !ReplaceMhcProfileWithIdentity(op.monitor, mr.isHdr, mr.livePeak, mr.liveProfileName).empty();
                 }
+                mr.done = true;   // ran (a returned failure is reported, not retried)
                 JsonValue r = JObj();
-                r.set("mode", JStr(op.isHdr ? "HDR" : "SDR"));
+                r.set("mode", JStr(mr.isHdr ? "HDR" : "SDR"));
                 r.set("action", JStr(action));
                 r.set("ok", JBool(ok));
                 if (op.entry < mhcResults.size()) mhcResults[op.entry].arr.push_back(std::move(r));

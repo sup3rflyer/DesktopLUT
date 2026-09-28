@@ -640,7 +640,11 @@ def test_cpp_snapshot_store_is_cleared_only_by_exit():
     assert "snapshots.Clear()" in exit_[exit_.find("g_calib.active = false;"):], (
         "calibration.exit must drop the captures on every exit, not only after a restore")
     assert "snapshots.Clear()" not in restore_branch
-    assert "RestoreCapturedSettings(" in exit_, "a restore must keep the live identity fields"
+    assert "ApplyCalibRestoreStep(" in exit_, "a restore must go through the identity-keeping copy"
+    header = (CPP_SERVER.parent / "calib_snapshot.h").read_text(encoding="utf-8", errors="replace")
+    apply_body = header[header.find("inline std::vector<size_t> ApplyCalibRestoreStep("):]
+    assert "RestoreCapturedSettings(live, cap.settings)" in apply_body[:apply_body.find("\n}")], (
+        "ApplyCalibRestoreStep must copy through RestoreCapturedSettings (keeps the live identity fields)")
 
 
 def test_enter_neutral_clears_only_the_calibrated_pair(tmp_path):

@@ -295,3 +295,71 @@ TEST_CASE("CalibSnapshot: an out-of-range monitor captures nothing") {
     CHECK(store.Enter(live, 1, false, 1000) == false);
     CHECK(store.Empty());
 }
+
+TEST_CASE("CalibSnapshot: the restore keeps the LIVE slot even when it differs from the capture's") {
+    // The capture's slot and the live slot normally agree; if they ever do not (the live entry was
+    // re-slotted), the restore must keep the live one — copying the capture's would re-key the
+    // display's persisted [Display<slot>] section.
+    std::vector<MonitorSettings> atCapture = { CsUser(kA, 3, L"C:\\luts\\a.cube") };
+    CalibSnapshotStore store;
+    store.Enter(atCapture, 0, false, 1000);
+    MonitorSettings reslotted = atCapture[0];
+    CsClear(reslotted, false);
+    reslotted.slot = 9;
+    reslotted.legacyIndex = 4;
+    std::vector<MonitorSettings> live = { reslotted };
+    const CalibRestorePlan plan = PlanCalibRestore(store, live);
+    REQUIRE(plan.steps.size() == 1);
+    RestoreCapturedSettings(live[0], store.captures[plan.steps[0].capture].settings);
+    CHECK(live[0].sdrPath == L"C:\\luts\\a.cube");
+    CHECK(live[0].slot == 9);
+    CHECK(live[0].legacyIndex == 4);
+}
+
+TEST_CASE("CalibSnapshot: a restore that failed part-way resumes with the plan made before the copy") {
+    // The user had no SDR MHC; the session left DLC's profile associated. An exception after the
+    // settings were copied back (before the identity swap ran) must not lose the swap on retry:
+    // re-planning from the restored settings would see "no MHC anywhere" and do nothing.
+    MonitorSettings user = CsUser(kA, 0, L"C:\\luts\\a.cube");
+    user.sdrMHC.enabled = false;
+    user.sdrMHC.profileName.clear();
+    std::vector<MonitorSettings> live = { user };
+    CalibSnapshotStore store;
+    store.Enter(live, 0, false, 1000);
+    CsClear(live[0], false);
+    live[0].sdrMHC.enabled = true;
+    live[0].sdrMHC.profileName = L"DLC_identity.icm";
+
+    const CalibRestorePlan first = PlanCalibRestore(store, live);
+    REQUIRE(first.steps.size() == 1);
+    REQUIRE(first.steps[0].modes.size() == 1);
+    CHECK(first.steps[0].modes[0].action == CalibMhcRestore::IdentitySwap);
+    std::vector<CalibModeRestore> modes = first.steps[0].modes;
+    modes[0].livePeak = 80.0f;
+    CalibCapture& cap = store.captures[first.steps[0].capture];
+    const std::vector<size_t> todo = ApplyCalibRestoreStep(cap, live[0], first.steps[0], modes);
+    CHECK(todo.size() == 1);
+    CHECK(live[0].sdrPath == L"C:\\luts\\a.cube");      // settings are back...
+    CHECK(live[0].sdrMHC.enabled == false);
+    // ...and the swap threw before it ran (nothing marked done). The retry:
+    const CalibRestorePlan retry = PlanCalibRestore(store, live);
+    REQUIRE(retry.steps.size() == 1);
+    CHECK(retry.steps[0].resumed);
+    REQUIRE(retry.steps[0].modes.size() == 1);
+    CHECK(retry.steps[0].modes[0].action == CalibMhcRestore::IdentitySwap);
+    CHECK(retry.steps[0].modes[0].liveProfileName == L"DLC_identity.icm");
+    CHECK(retry.steps[0].modes[0].livePeak == 80.0f);
+    // a re-plan from the restored settings would have lost it
+    CHECK(PlanCalibModeRestore(live[0], cap.settings, false).action == CalibMhcRestore::None);
+    // once the step ran, a further retry has nothing left to do
+    CHECK(ApplyCalibRestoreStep(cap, live[0], retry.steps[0], retry.steps[0].modes).size() == 1);
+    cap.pendingMhc[0].done = true;
+    CHECK(PlanCalibRestore(store, live).steps[0].modes.empty());
+    // a re-enter after that failed exit clears the display again: the next exit copies the capture
+    // back again and plans from what is live then
+    CHECK(store.Enter(live, 0, false, 3000) == true);
+    CsClear(live[0], false);
+    const CalibRestorePlan after = PlanCalibRestore(store, live);
+    CHECK_FALSE(after.steps[0].resumed);
+    CHECK_FALSE(store.captures[0].settingsRestored);
+}
