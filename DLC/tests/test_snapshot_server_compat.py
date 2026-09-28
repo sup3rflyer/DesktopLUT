@@ -239,3 +239,28 @@ def test_legacy_server_shape():
     assert "contract_version" not in state and "correction_grayscale" not in state["mhc"].get("0:SDR", {})
     ctrl.exit_calibration(restore_snapshot=False)
     assert ctrl.exit_calibration(restore_snapshot=True) == {"active": False, "restored": True}
+
+
+def test_restore_gate_accepts_a_capture_whose_index_moved():
+    """New server: the run entered monitor 0, then a display re-enumeration (a TV powering on) moved its
+    capture to index 1. The C++ restores by identity, so the gate must still ask — matching on the index
+    the capture was TAKEN on as well as the one it resolves to now."""
+    from types import SimpleNamespace
+    from dlc.stages import _common
+
+    calls = []
+    ctrl = SimpleNamespace(
+        calibration_status=lambda: {"active": True, "state": {"monitor": 1, "mode": "SDR"},
+                                    "captures": [{"monitor": 1, "captured_monitor": 0, "modes": ["SDR"]}]},
+        exit_calibration=lambda restore_snapshot=False: calls.append(restore_snapshot) or {"active": False,
+                                                                                        "restored": True})
+    rep = _common.request_snapshot_restore(ctrl, entered=True, monitor=0)
+    assert rep["requested"] is True and calls == [True]
+
+    calls.clear()
+    other = SimpleNamespace(
+        calibration_status=lambda: {"active": True, "state": {"monitor": 2, "mode": "SDR"},
+                                    "captures": [{"monitor": 2, "captured_monitor": 2, "modes": ["SDR"]}]},
+        exit_calibration=lambda restore_snapshot=False: calls.append(restore_snapshot) or {})
+    rep = _common.request_snapshot_restore(other, entered=True, monitor=0)
+    assert rep["requested"] is False and calls == []          # another run's session stays untouched

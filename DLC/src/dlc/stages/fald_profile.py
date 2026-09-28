@@ -832,7 +832,9 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
             # A client-side failure (e.g. the pipe timeout, where the spec says the enter may still be
             # APPLIED server-side) cannot prove the server did NOT enter: unknown → restore attempts it.
             st["fald"]["entered"] = None
-            _common.note_stale_calibration(result, stale, None, monitor=args.monitor, mode=mode)
+            # Persisted for phase_restore: on a pre-snapshot-store server a stale session on this monitor
+            # means its one restore slot holds the CLEARED state — a "restored" answer must not read as complete.
+            st["fald"]["stale_tell"] = _common.note_stale_calibration(result, stale, None, monitor=args.monitor, mode=mode)
             result.fail("enter_native_failed", f"{type(exc).__name__}: {exc}")
             return
         st["fald"]["entered"] = True
@@ -842,6 +844,7 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         # None = a server predating the snapshot store (it overwrites its restore slot on every enter)
         result.metrics["snapshot_retained"] = enter.get("snapshot_retained") if isinstance(enter, dict) else None
         tell = _common.note_stale_calibration(result, stale, enter, monitor=args.monitor, mode=mode)
+        st["fald"]["stale_tell"] = tell
         if tell is not None:
             result.metrics["stale_session_mismatch"] = tell["mismatch"]
         try:
@@ -1864,7 +1867,8 @@ def phase_restore(s: Session, result: StageResult) -> None:
         # Asked only while DesktopLUT holds an open session / capture (_common.request_snapshot_restore): a
         # restarted DesktopLUT or an already-exited session has nothing of this pass, and a build predating the
         # snapshot store would otherwise "restore" its stale slot from an EARLIER run.
-        report = _common.request_snapshot_restore(ctl, entered=entered, monitor=s.args.monitor)
+        report = _common.request_snapshot_restore(ctl, entered=entered, monitor=s.args.monitor,
+                                                  stale_tell=s.st["fald"].get("stale_tell"))
         if report.get("requested"):
             result.raw["calibration_exit"] = {k: report.get(k) for k in ("restored", "restored_monitors", "unrestored")}
         s.st["fald"]["entered"] = False

@@ -572,8 +572,11 @@ def request_snapshot_restore(controller: Any, *, entered: bool | None, monitor: 
             "back to its pre-run setup — restore it from the pre-run settings backup")
     captures = (status or {}).get("captures") if isinstance(status, dict) else None
     if entered is True and monitor is not None and isinstance(captures, list) and captures:
-        mons = {c.get("monitor") if c.get("monitor") is not None else c.get("captured_monitor")
-                for c in captures if isinstance(c, dict)}
+        # A capture belongs to this run if it was TAKEN on this run's monitor or now RESOLVES to it:
+        # after a display re-enumeration (a TV powering on) the capture's current index can move while
+        # the C++ still restores the right display by identity.
+        mons = {m for c in captures if isinstance(c, dict)
+                for m in (c.get("monitor"), c.get("captured_monitor"))}
         if int(monitor) not in {int(m) for m in mons if m is not None}:
             return not_requested(
                 f"DesktopLUT restored NOTHING for monitor {monitor}: the open calibration session holds no "

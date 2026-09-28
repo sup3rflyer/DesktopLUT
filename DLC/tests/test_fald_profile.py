@@ -399,3 +399,24 @@ def test_extended_verify_set_refs_resolve():
     for p in pats:
         if p.kind == "ratio":
             assert p.ref in names
+
+
+def test_stage_restore_passes_the_preflight_stale_tell(tmp_path, monkeypatch):
+    """On a server predating the snapshot store, an earlier session left open on this monitor means its one
+    restore slot holds the CLEARED state — so phase_restore must hand the preflight's stale-session tell to
+    the restore gate (it downgrades a "restored" answer to incomplete), not restore blind."""
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    assert _run(ctx, "preflight").status == "ran"
+    assert _run(ctx, "preflight").metrics["stale_calibration_mode"] is True      # re-entered over a stale session
+    tell = _common.load_dlc_state(ctx)["fald"]["stale_tell"]
+    assert isinstance(tell, dict) and tell.get("stale_pairs")
+    seen = {}
+    real = _common.request_snapshot_restore
+
+    def spy(controller, **kw):
+        seen.update(kw)
+        return real(controller, **kw)
+
+    monkeypatch.setattr(_common, "request_snapshot_restore", spy)
+    _run(ctx, "restore")
+    assert seen.get("stale_tell") == tell
