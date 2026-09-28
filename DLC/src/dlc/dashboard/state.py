@@ -248,6 +248,11 @@ _TERMINAL_BY_STATUS = {
     "completed": "completed",
     "reverted": "reverted",
     "aborted": "aborted",
+    # a revert DesktopLUT could not honour / only partly honoured / did not confirm: still terminal
+    # (the run is over), shown by its own name so a half-restored display is never read as "reverted"
+    "revert_unavailable": "revert_unavailable",
+    "reverted_partially": "reverted_partially",
+    "revert_unconfirmed": "revert_unconfirmed",
 }
 
 

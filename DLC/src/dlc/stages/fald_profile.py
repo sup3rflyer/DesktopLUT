@@ -1861,13 +1861,16 @@ def phase_restore(s: Session, result: StageResult) -> None:
                          "reasons": ["no calibration snapshot was taken by this run — nothing to restore over the pipe"]}
         return
     try:
-        r = ctl.exit_calibration(restore_snapshot=True)
-        result.raw["calibration_exit"] = r
+        # Asked only while DesktopLUT holds an open session / capture (_common.request_snapshot_restore): a
+        # restarted DesktopLUT or an already-exited session has nothing of this pass, and a build predating the
+        # snapshot store would otherwise "restore" its stale slot from an EARLIER run.
+        report = _common.request_snapshot_restore(ctl, entered=entered, monitor=s.args.monitor)
+        if report.get("requested"):
+            result.raw["calibration_exit"] = {k: report.get(k) for k in ("restored", "restored_monitors", "unrestored")}
         s.st["fald"]["entered"] = False
         # `restored` is the server SAYING it put the snapshot back. Believing the call returned is how a lost stack
         # reads as a clean finish — the user's whole FALD configuration (panel file, pedestal mode, temporal,
         # starfield, glow) comes back this way and no other, because the flow only ever switches the layer off.
-        report = _common.snapshot_restore_report(r)
         result.metrics["stack_restored"] = report["restored"] is True
         result.metrics["snapshot_restore"] = report
         if report["complete"]:

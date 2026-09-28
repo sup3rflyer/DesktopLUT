@@ -1081,6 +1081,65 @@ class MockDesktopLutServer:
         return self.ok({"monitor_mode": key, "runtime": deepcopy(self.state.runtime.get(key, {}))})
 
 
+class LegacySnapshotMockServer(MockDesktopLutServer):
+    """DesktopLUT as it was BEFORE the per-display snapshot store (the deployed builds up to the
+    2026-09-27 fix; C++ ca43c39): so DLC can be pinned against the server users actually run until
+    they update.
+
+    * ONE snapshot slot, overwritten on EVERY ``calibration.enter`` (a re-enter over a crashed run
+      captures the already-cleared display) and NEVER cleared — ``exit(restore_snapshot=True)``
+      restores it whenever one was ever taken, session or not (the ``3dlut-only --abort`` bug);
+    * the slot remembers ONE mode (the last entered);
+    * ``calibration.enter`` has no ``snapshot_retained``; ``calibration.status`` no ``captures``;
+      ``calibration.exit`` answers only ``{active, restored}``;
+    * ``state.get`` has no ``contract_version`` and no mhc ``correction_grayscale``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.legacy_slot: dict[str, Any] | None = None
+
+    def handle(self, command: DesktopLutCommand) -> DesktopLutResponse:
+        response = super().handle(command)
+        if command.method == "state.get" and response.ok and isinstance(response.result, dict):
+            response.result.pop("contract_version", None)
+            for entry in (response.result.get("mhc") or {}).values():
+                if isinstance(entry, dict):
+                    entry.pop("correction_grayscale", None)
+        return response
+
+    def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
+        if method == "calibration.status":
+            return self.ok({"active": self.state.calibration_mode is not None,
+                            "state": deepcopy(self.state.calibration_mode)})
+        if method == "calibration.enter":
+            key = self.key(params)
+            mon = int(params["monitor"])
+            mode = str(params["mode"]).upper()
+            self.legacy_slot = self._capture_monitor(mon, mode, "calib-snapshot")   # overwritten, always
+            self.legacy_slot["monitor"] = mon
+            self.state.corrections_enabled = False
+            self.state.mhc.pop(key, None)
+            self.state.runtime.pop(key, None)
+            self.state.layers[key] = {n: False for n in self.LAYER_NAMES}
+            self.state.calibration_mode = {
+                "active": True, "snapshot_id": "calib-snapshot", "monitor": params["monitor"], "mode": mode,
+                "dummy_icc_path": params["dummy_icc_path"], "reason": params.get("reason", ""),
+                "corrections_reset": True,
+            }
+            return self.ok({**deepcopy(self.state.calibration_mode), "identity_profile": ""})
+        if method == "calibration.exit":
+            self._cleanup_active_gs_live()
+            restored = False
+            if bool(params.get("restore_snapshot", False)) and self.legacy_slot is not None:
+                self._restore_monitor(self.legacy_slot)
+                self.state.corrections_enabled = bool(self.legacy_slot.get("corrections_enabled", True))
+                restored = True     # the slot is NOT cleared: the next exit(restore) restores it again
+            self.state.calibration_mode = None
+            return self.ok({"active": False, "restored": restored})
+        return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
+
+
 class MockDesktopLutTransport:
     def __init__(self, server: MockDesktopLutServer | None = None) -> None:
         self.server = server or MockDesktopLutServer()

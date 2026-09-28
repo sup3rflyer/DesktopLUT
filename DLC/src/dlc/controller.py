@@ -43,11 +43,14 @@ class CalibrationController:
         return cls(DesktopLutClient(transport=transport))
 
     @classmethod
-    def mock(cls) -> "CalibrationController":
-        """Controller bound to a fresh in-process simulator (tests / --simulate)."""
-        from .desktoplut_mock import MockDesktopLutTransport
+    def mock(cls, *, legacy_snapshot_server: bool = False) -> "CalibrationController":
+        """Controller bound to a fresh in-process simulator (tests / --simulate).
+        ``legacy_snapshot_server`` = a DesktopLUT predating the per-display snapshot store (one
+        never-cleared slot; see ``LegacySnapshotMockServer``)."""
+        from .desktoplut_mock import LegacySnapshotMockServer, MockDesktopLutTransport
 
-        return cls.with_transport(MockDesktopLutTransport())
+        server = LegacySnapshotMockServer() if legacy_snapshot_server else None
+        return cls.with_transport(MockDesktopLutTransport(server))
 
     # -- low-level ---------------------------------------------------------
     def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:

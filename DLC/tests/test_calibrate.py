@@ -1443,7 +1443,8 @@ def test_abort_after_an_applied_run_restores_nothing_and_says_so(tmp_path: Path)
     assert code == 0
     assert payload["status"] == "nothing_restored"
     assert payload["restored_snapshot"] is False
-    assert "restored NOTHING" in payload["snapshot_restore"]["summary"]
+    assert payload["snapshot_restore"]["requested"] is False          # never asked: the run never entered
+    assert "never entered calibration mode" in payload["snapshot_restore"]["summary"]
     assert applied in payload["hint"] and "desktoplut_backup.json" in payload["hint"]
     assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == applied   # the accepted calibration stays
 
@@ -1555,26 +1556,61 @@ def test_rollback_guard_does_not_ask_for_a_restore_an_in_place_run_never_took(tm
     state = {"flow": "grayscale-wb", "inplace_baseline": {"captured": True}}
     out = _rollback_restore(ctrl, state, monitor=0, mode="SDR", run_root=tmp_path, entered_calibration=False)
     assert out["status"] == "rollback_restored_nothing"
-    assert out["snapshot_restore"]["not_requested"] is True
+    assert out["snapshot_restore"]["requested"] is False
     assert ("exit", {"restore_snapshot": True}) not in calls
     assert calls == [("cancel", (0, "SDR"))]                  # the orphaned preview, and nothing else
     assert "correction grayscale" in out["hint"]
 
 
-def test_abort_of_an_in_place_run_flags_a_restore_that_cannot_be_its_own(tmp_path: Path):
-    """--abort still asks (it is also the operator's live-pipe bail-out), but a restore reported for
-    a run that never entered is NOT this run's pre-run setup and must not read as "reverted"."""
+def test_abort_of_an_in_place_run_never_asks_for_a_restore_even_with_a_session_open(tmp_path: Path):
+    """A run that never entered calibration mode has no capture of its own: --abort must not ask
+    DesktopLUT for a restore even when a session IS open (someone else's — an old server would
+    restore its stale slot, a previous run's pre-run setup). The open session is evidence."""
     from types import SimpleNamespace
 
     from dlc.calibrate import _abort_restore
 
-    old_server = SimpleNamespace(exit_calibration=lambda restore_snapshot=False: {"active": False, "restored": True},
-                                 set_layers=lambda *a, **k: {})
+    calls: list = []
+    old_server = SimpleNamespace(
+        exit_calibration=lambda restore_snapshot=False: calls.append(restore_snapshot) or {"restored": True},
+        calibration_status=lambda: {"active": True, "state": {"monitor": 1, "mode": "HDR"}},
+        set_layers=lambda *a, **k: {})
     state = {"flow": "3dlut-only", "stages": {"preflight": {}}, "inplace_baseline": {"captured": True, "cube_path": "C:/luts/a.cube"}}
     code, payload = _abort_restore(old_server, state, monitor=0, mode="SDR", run_root=tmp_path)
-    assert code == 0 and payload["status"] == "restored_other_session"
-    assert "previous run's pre-run setup" in payload["snapshot_restore"]["summary"]
+    assert code == 0 and payload["status"] == "nothing_restored" and calls == []
+    assert "unrelated calibration session is open" in payload["snapshot_restore"]["summary"]
     assert "C:/luts/a.cube" in payload["hint"]
+
+
+@pytest.mark.parametrize("reply, status", [
+    ({"active": False, "restored": True, "unrestored": [], "restored_monitors": [
+        {"monitor": 0, "modes": ["SDR"], "mhc": [{"mode": "SDR", "action": "reinstall", "ok": False}]}]},
+     "reverted_partially"),
+    ({"active": False, "restored": True, "restored_monitors": [{"monitor": 0, "modes": ["SDR"]}],
+      "unrestored": [{"reason": "display not connected", "display": "Panel B", "captured_monitor": 1,
+                      "modes": ["SDR"]}]}, "reverted_partially"),
+    ({"active": False}, "revert_unconfirmed"),
+])
+def test_finish_reports_a_partial_or_unconfirmed_revert_as_such(tmp_path: Path, monkeypatch, reply, status):
+    """N2: `_finish` said "reverted" for any restore the server half-honoured (an MHC reinstall that
+    failed, a display it could not find), and a reply that did not say must not read as nothing."""
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, f"partial_{status}_{len(str(reply))}", controller=ctrl,
+                  adjudicator=_AutoExceptVerify("revert"))
+    real_exit = ctrl.exit_calibration
+
+    def exit_(restore_snapshot=False):
+        real_exit(restore_snapshot=restore_snapshot)
+        return dict(reply)
+
+    monkeypatch.setattr(ctrl, "exit_calibration", exit_)
+    res = calib.run("mhc-only")
+    assert res.status == status
+    summary = res.digest["snapshot_restore"]["summary"]
+    if "mhc" in str(reply):
+        assert "FAILED" in summary
+    if status == "revert_unconfirmed":
+        assert "did not say" in summary
 
 
 def test_grayscale_wb_prior_is_captured_once_per_run(tmp_path: Path):
