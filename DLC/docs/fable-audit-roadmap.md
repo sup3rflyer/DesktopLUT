@@ -121,6 +121,10 @@ fixable, and leave a written trail. Nothing is one-shotted.
   Design-B grayscale-wb revert on hardware; honesty tell landed). P10 re-verified
   against the shipped C++; F4-12 closed (HDR live-edit honoured, mode-match gated).
   HW-8 queued (`windows.set_hdr` live flip).
+- **Updated:** 2026-09-27, Phase 9 C++ tickets **T1–T4 landed** on `cpp/calib-snapshot-rework`
+  (reworked from the unbuilt, adversarially rejected `claude/project-thread-djg427`; details in
+  `docs/audits/fable/phase-9.md` §5a). MSVC-built (doctest 363/363, app links); **hardware
+  behaviour unverified** — HW-9 / HW-10 / HW-11.
 - **How to run a phase:** start a session with
   *"Run Phase N of DLC/docs/fable-audit-roadmap.md"*. The phase spec below is the
   brief. When a phase completes, check it off in §9 and commit the phase report.
@@ -1142,6 +1146,9 @@ the user has a hardware checklist whose every item traces to a phase finding.
 | HW-5 | F4-3 (P16): compare `peak_chroma.cap_nits_nonadditive_est` against the HDR refine's actually-landed D65 peak — decides whether the Peak-Chroma cap should adopt the first-order non-additivity correction | Phase 4 |
 | HW-6 | F5-1 (gamut-aware delta fix): on the next HDR box run, compare 3D-LUT frontier-corner residuals + optimizer floor counts/classifications vs the recorded baseline — reachable-boundary corners should improve or hold, previously-reported near-boundary "floors" may partially resolve; in-gamut and SDR numbers unchanged | Phase 5 |
 | HW-7 | Practical split on hardware: record the HDR verify `practical` block (core/limits/clamped) next to the raw numbers — expect `core.avg` materially below the overall avg (the 3.26 baseline was gamut-floor-inflated) and `clamped.n` ≈ the panel's known unreachable Rec.2020 corners; then re-derive the P3 HDR thresholds from the post-P1 core numbers (folds into HW-1's capture) | Phase 6 |
+| HW-9 | Phase 9 T2 (per-display snapshot store): on the box, (a) kill a run mid-flight, re-enter, then `--abort` — the ORIGINAL MHC profile + white balance + 3D LUT + FALD settings come back and the Windows association is the user's profile; (b) a committing run keeps its calibrated state; (c) after an applied full run, `3dlut-only --abort` in the same DesktopLUT process answers `restored:false` and leaves the accepted calibration; (d) a monitor with NO original MHC still gets the identity-profile swap on exit(restore); (e) restart DesktopLUT mid-run and confirm `--abort` / the rollback guard say `nothing_restored` honestly | Phase 9 |
+| HW-10 | Phase 9 T3 (`correction_grayscale` in `state.get`): read back a user correction grayscale over the pipe (incl. a main-slider/luminance component and `enabled`), run a grayscale touch-up and `revert` — the curve comes back exactly and a curve that was switched off stays off | Phase 9 |
+| HW-11 | Phase 9 T1 + T4: `state.get` reports `contract_version: 1` with no preflight mismatch, and `maintenance.verify_mhc` still answers over the pipe | Phase 9 |
 | HW-8 | `windows.set_hdr` live flip on the box: toggle monitor 0 SDR→HDR→SDR over the pipe; confirm the OS flip, DesktopLUT's MHC reapply on WM_DISPLAYCHANGE, and `query_monitors` tracking `hdr_active`/`color_space`; then one `--mode HDR` run end-to-end without touching Windows Settings | Phase 9 |
 | — | *(phases append here)* | |
 

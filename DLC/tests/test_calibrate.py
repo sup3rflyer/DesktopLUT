@@ -879,6 +879,25 @@ def _interp_editor_col(x: float, xs: list, ys: list) -> float:
     return float(ys[-1])
 
 
+def _editor_gains(cg: dict, level: float, *, hdr: bool = False) -> list[float]:
+    """Per-channel gain the correction grayscale applies at signal ``level``, decoded the way the
+    shader does from what DesktopLUT STORES (C++ ApplyGrayscalePayload, mirrored by the mock):
+    slot i sits at input (i/(N-1))**2 (SDR) or i/(N-1) (HDR) and outputs points[i]·deviations[c][i]
+    — the points carry the luminance (main slider), the deviations the per-channel balance."""
+    pts = cg.get("points") or []
+    dev = cg.get("deviations") or {}
+    n = len(pts)
+    if n < 2:
+        return [1.0, 1.0, 1.0]
+    xs = [(i / (n - 1)) if hdr else (i / (n - 1)) ** 2 for i in range(n)]
+    gains = []
+    for ch in "rgb":
+        col = list(dev.get(ch) or [1.0] * n)
+        g = [(pts[i] * col[i] / xs[i]) if xs[i] > 0 else col[i] for i in range(n)]
+        gains.append(_interp_editor_col(level, xs, g))
+    return gains
+
+
 def _editor_responsive_panel(ctrl, transfer, *, white_nits: float, tint=(1.0, 1.0, 1.0)):
     """A warm panel that renders THROUGH the mock's live correction-grayscale table —
     the closed loop the real preview shader provides: a set_live nudge changes the very
@@ -893,12 +912,10 @@ def _editor_responsive_panel(ctrl, transfer, *, white_nits: float, tint=(1.0, 1.
     def measure(patch):
         st = (ctrl.state().get("mhc") or {}).get("0:SDR") or {}
         cg = st.get("correction_grayscale") or {}
-        pts = cg.get("points") or []
-        dev = cg.get("deviations") or {}
         level = max(patch.signal)
         gains = [1.0, 1.0, 1.0]
-        if st.get("gs_preview_active") and pts:
-            gains = [_interp_editor_col(level, pts, dev.get(ch) or []) for ch in "rgb"]
+        if st.get("gs_preview_active") and cg.get("points"):
+            gains = _editor_gains(cg, level)
         sig = tuple(min(1.0, max(0.0, s * g * t)) for s, g, t in zip(patch.signal, gains, tint))
         return panel(_replace(patch, signal=sig))
 
@@ -948,15 +965,19 @@ def test_grayscale_wb_decomposed_sliders_and_unreachable_top_target(tmp_path: Pa
     for i in corrected:
         gmean = (payload["rgb"]["r"][i] * payload["rgb"]["g"][i] * payload["rgb"]["b"][i]) ** (1 / 3)
         assert gmean == pytest.approx(1.0, abs=0.02)                  # zero-mean balance
-    # The wire/mock carries the decomposition (SDR-bridged: resampled onto the exact
-    # t² slot grid, so equal to the payload within resampling tolerance) and maps
-    # luminance onto the editor points curve — the main slider — exactly.
+    # The wire carries the decomposition (SDR-bridged: resampled onto the exact t² slot grid,
+    # so equal to the payload within resampling tolerance), and DesktopLUT STORES it the way
+    # ApplyGrayscalePayload does: luminance scales the points curve (the editor's main slider)
+    # and the balance lands on the deviations — so state.get's points are t²·luminance.
     cg = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     assert cg["luminance"] == pytest.approx(payload["luminance"], abs=5e-3)
     for ch in ("r", "g", "b"):
         assert cg["rgb"][ch] == pytest.approx(payload["rgb"][ch], abs=5e-3)
-    assert cg["editor_points"] == pytest.approx(
-        [p * l for p, l in zip(cg["points"], cg["luminance"])])
+        assert cg["deviations"][ch] == pytest.approx(cg["rgb"][ch])
+    n = cg["point_count"]
+    assert cg["points"] == pytest.approx(
+        [(i / (n - 1)) ** 2 * lum for i, lum in enumerate(cg["luminance"])])
+    assert cg["editor_points"] == pytest.approx(cg["points"])
 
     # Defect 3: the touch-up's own edits never masqueraded as panel drift — the
     # reference reads ran through the identity table (the guard), so this closed-loop
@@ -1362,6 +1383,305 @@ def test_revert_rolls_back_to_previous_setup(tmp_path: Path):
     # reverted: calibration mode exited AND the built MHC rolled back to the pre-run snapshot
     assert ctrl.calibration_status().get("active") is False
     assert not ctrl.state().get("mhc")
+    # ...and the record says so from the SERVER's restored flag, not from the call returning
+    rec = calib.calib["snapshot_restore"]
+    assert rec["restored"] is True and rec["complete"] is True
+
+
+# ---------------------------------------------------------------------------
+# Restores report what the SERVER says it restored (fable Phase 9 T2 + the 2026-09-27 bug):
+# `calibration.exit(restore_snapshot=True)` returning proves nothing — a DesktopLUT restarted
+# mid-run, or a flow that never entered calibration mode, restores NOTHING (restored:false).
+# ---------------------------------------------------------------------------
+
+def test_enter_neutral_digest_carries_the_stale_session_evidence(tmp_path: Path):
+    """The orchestrator's enter-neutral digest routes through the shared stale tell: it carries
+    `snapshot_retained` on every run, and — when an earlier session never exited — the tell with
+    any monitor/mode mismatch against THIS run (evidence for the LLM, no verdict)."""
+    clean = _make(tmp_path, "clean_digest")
+    clean.run("mhc-only")
+    digest = clean.calib["stages"]["enter-neutral"]["digest"]
+    assert digest["snapshot_retained"] is False and "stale_calibration" not in digest
+
+    ctrl = CalibrationController.mock()
+    ctrl.enter_neutral(1, "SDR", "C:/dlc/sRGB.icm")      # an earlier run on monitor 1 died without exiting
+    calib = _make(tmp_path, "stale_digest", controller=ctrl)
+    calib.run("mhc-only")
+    digest = calib.calib["stages"]["enter-neutral"]["digest"]
+    assert digest["snapshot_retained"] is False            # monitor 0 was not captured by the earlier session
+    assert digest["stale_calibration_mode"] is True
+    tell = digest["stale_calibration"]
+    assert tell["session_mismatch"] is True and tell["severity"] == "medium"
+    assert "monitor(s) [1]" in tell["mismatch"][0]
+    assert [(p["monitor"], p["mode"], p["resolvable"]) for p in tell["stale_pairs"]] == [(1, "SDR", True)]
+    assert tell["oldest_capture_age_s"] is not None
+
+
+def test_restore_user_setup_is_honest_when_the_server_restored_nothing(tmp_path: Path):
+    ctrl = CalibrationController.mock()       # a DesktopLUT with no capture: e.g. restarted mid-run
+    calib = _make(tmp_path, "restart", controller=ctrl)
+    assert calib._restore_user_setup(why="test") is False
+    rec = calib.calib["snapshot_restore"]
+    assert rec["restored"] is False and rec["complete"] is False and rec["why"] == "test"
+    assert "restored NOTHING" in rec["summary"]
+
+
+def test_abort_after_an_applied_run_restores_nothing_and_says_so(tmp_path: Path):
+    """`3dlut-only --abort` after an applied full run in the SAME DesktopLUT process: the abort
+    must not hand back the full run's PRE-RUN setup (the C++ `hasSnapshot` was never cleared),
+    and must not print "reverted" when nothing came back."""
+    from dlc.calibrate import _abort_restore
+
+    ctrl = CalibrationController.mock()
+    full = _make(tmp_path, "applied_full", controller=ctrl)
+    assert full.run("full").status == "completed"
+    applied = ctrl.state()["runtime"]["0:SDR"]["cube_path"]
+
+    lut_state = {"inplace_baseline": {"captured": True, "cube_path": applied},
+                 "backup": {"path": str(tmp_path / "lut" / "desktoplut_backup.json")}}
+    code, payload = _abort_restore(ctrl, lut_state, monitor=0, mode="SDR", run_root=tmp_path / "lut")
+    assert code == 0
+    assert payload["status"] == "nothing_restored"
+    assert payload["restored_snapshot"] is False
+    assert payload["snapshot_restore"]["requested"] is False          # never asked: the run never entered
+    assert "never entered calibration mode" in payload["snapshot_restore"]["summary"]
+    assert applied in payload["hint"] and "desktoplut_backup.json" in payload["hint"]
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == applied   # the accepted calibration stays
+
+
+def test_abort_restores_an_entered_run(tmp_path: Path):
+    from dlc.calibrate import _abort_restore
+
+    ctrl = CalibrationController.mock()
+    cube = tmp_path / "user.cube"
+    cube.write_text('TITLE "x"\n', encoding="utf-8")
+    ctrl.set_3dlut(0, "SDR", str(cube))
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    code, payload = _abort_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert code == 0 and payload["status"] == "reverted" and payload["restored_snapshot"] is True
+    assert "hint" not in payload
+    assert ctrl.state()["runtime"]["0:SDR"]["cube_path"] == str(cube)
+
+
+def test_rollback_guard_is_honest_without_a_session(tmp_path: Path):
+    """The CLI rollback guard used to print "rolled_back … restored pre-run setup" whenever the
+    exit call returned — including for an in-place run that never entered calibration mode."""
+    from dlc.calibrate import _rollback_restore
+
+    ctrl = CalibrationController.mock()
+    nothing = _rollback_restore(ctrl, {"inplace_baseline": {"captured": True, "cube_path": None}},
+                                monitor=0, mode="SDR", run_root=tmp_path)
+    assert nothing["status"] == "rollback_restored_nothing"
+    assert "restored pre-run setup" not in nothing["reason"]
+    assert "empty before the run" in nothing["hint"]
+
+    ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm")
+    done = _rollback_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert done["status"] == "rolled_back" and done["snapshot_restore"]["complete"] is True
+
+
+def test_abort_and_rollback_report_a_partial_restore(tmp_path: Path):
+    """A display the session captured but the server could not put back (disconnected / EDID
+    twins) is `unrestored`: the restore is reported as partial, with the backup to finish it."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import _abort_restore, _rollback_restore
+
+    reply = {"active": False, "restored": True, "restored_monitors": [{"monitor": 0, "modes": ["SDR"]}],
+             "unrestored": [{"reason": "display not connected", "display": "Panel B", "edid_id": "BBB",
+                             "captured_monitor": 1, "modes": ["HDR"]}]}
+    ctrl = SimpleNamespace(exit_calibration=lambda restore_snapshot=False: dict(reply),
+                           set_layers=lambda *a, **k: {})
+    code, payload = _abort_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert code == 0 and payload["status"] == "partially_reverted"
+    assert "Panel B" in payload["snapshot_restore"]["summary"] and "hint" in payload
+    rolled = _rollback_restore(ctrl, {}, monitor=0, mode="SDR", run_root=tmp_path)
+    assert rolled["status"] == "rolled_back_partially"
+
+
+def test_snapshot_restore_report_reads_old_and_unclear_replies():
+    from dlc.calibrate import snapshot_restore_report
+
+    old = snapshot_restore_report({"active": False, "restored": True})    # pre-store server shape
+    assert old["complete"] is True and old["unrestored"] == []
+    unclear = snapshot_restore_report({"active": False})
+    assert unclear["restored"] is None and unclear["complete"] is False
+    assert "did not say" in unclear["summary"]
+    assert snapshot_restore_report(None)["restored"] is None
+
+    # captures existed, none could be put back: not "held no capture"
+    none_back = snapshot_restore_report({"active": False, "restored": False, "restored_monitors": [],
+                                         "unrestored": [{"reason": "display not connected", "display": "Panel B",
+                                                         "captured_monitor": 1, "modes": ["SDR"]}]})
+    assert none_back["complete"] is False
+    assert "could put NONE" in none_back["summary"] and "held no calibration capture" not in none_back["summary"]
+    # settings back, but an MHC profile step failed: incomplete, and says which
+    mhc_fail = snapshot_restore_report({"active": False, "restored": True, "unrestored": [], "restored_monitors": [
+        {"monitor": 0, "modes": ["SDR", "HDR"], "mhc": [{"mode": "SDR", "action": "reinstall", "ok": True},
+                                                       {"mode": "HDR", "action": "identity_swap", "ok": False}]}]})
+    assert mhc_fail["complete"] is False and mhc_fail["mhc_failed"][0]["mode"] == "HDR"
+    assert "FAILED" in mhc_fail["summary"] and "identity_swap" in mhc_fail["summary"]
+
+
+def test_a_revert_the_server_could_not_honour_is_not_reported_as_reverted(tmp_path: Path, monkeypatch):
+    """_finish used to set status "reverted" whatever the restore returned — a DesktopLUT that
+    restarted mid-run (no capture) read as a clean revert."""
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "revert_nothing", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
+    real_exit = ctrl.exit_calibration
+
+    def exit_after_restart(restore_snapshot=False):
+        real_exit(restore_snapshot=False)            # the session is gone...
+        return {"active": False, "restored": False, "restored_monitors": [], "unrestored": []}
+
+    monkeypatch.setattr(ctrl, "exit_calibration", exit_after_restart)
+    res = calib.run("mhc-only")
+    assert res.status == "revert_unavailable"
+    assert res.digest["snapshot_restore"]["restored"] is False
+    assert "restored NOTHING" in res.digest["snapshot_restore"]["summary"]
+
+
+def test_rollback_guard_does_not_ask_for_a_restore_an_in_place_run_never_took(tmp_path: Path):
+    """An in-place run (3dlut-only / grayscale-wb) never entered calibration mode, so the automatic
+    rollback must not call exit(restore_snapshot=True): on a new server that restores an unrelated
+    earlier session's capture, on a build predating the snapshot store a PREVIOUS run's setup."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import _rollback_restore
+
+    calls: list = []
+    ctrl = SimpleNamespace(exit_calibration=lambda **k: calls.append(("exit", k)) or {"restored": True},
+                           grayscale_cancel=lambda *a: calls.append(("cancel", a)) or {},
+                           set_layers=lambda *a, **k: {})
+    state = {"flow": "grayscale-wb", "inplace_baseline": {"captured": True}}
+    out = _rollback_restore(ctrl, state, monitor=0, mode="SDR", run_root=tmp_path, entered_calibration=False)
+    assert out["status"] == "rollback_restored_nothing"
+    assert out["snapshot_restore"]["requested"] is False
+    assert ("exit", {"restore_snapshot": True}) not in calls
+    assert calls == [("cancel", (0, "SDR"))]                  # the orphaned preview, and nothing else
+    assert "correction grayscale" in out["hint"]
+
+
+def test_abort_of_an_in_place_run_never_asks_for_a_restore_even_with_a_session_open(tmp_path: Path):
+    """A run that never entered calibration mode has no capture of its own: --abort must not ask
+    DesktopLUT for a restore even when a session IS open (someone else's — an old server would
+    restore its stale slot, a previous run's pre-run setup). The open session is evidence."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import _abort_restore
+
+    calls: list = []
+    old_server = SimpleNamespace(
+        exit_calibration=lambda restore_snapshot=False: calls.append(restore_snapshot) or {"restored": True},
+        calibration_status=lambda: {"active": True, "state": {"monitor": 1, "mode": "HDR"}},
+        set_layers=lambda *a, **k: {})
+    state = {"flow": "3dlut-only", "stages": {"preflight": {}}, "inplace_baseline": {"captured": True, "cube_path": "C:/luts/a.cube"}}
+    code, payload = _abort_restore(old_server, state, monitor=0, mode="SDR", run_root=tmp_path)
+    assert code == 0 and payload["status"] == "nothing_restored" and calls == []
+    assert "unrelated calibration session is open" in payload["snapshot_restore"]["summary"]
+    assert "C:/luts/a.cube" in payload["hint"]
+
+
+def test_grayscale_wb_revert_keeps_the_users_curve_on_from_the_viewing_layer_capture(tmp_path: Path):
+    """S3: hardware-readiness switches the grayscale LAYER off before the prior snapshot, so the live
+    bit read False for a user whose curve was ON. The prior's `enabled` now comes from the viewing-
+    layer capture taken before anything was switched: the revert turns it back on itself (no longer
+    only because _restore_viewing_layers happens to run later), with no off/on churn."""
+    ctrl = _gswb_controller()
+    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4}, gamma=2.2)
+    ctrl.set_layers(0, "SDR", grayscale=True)
+    user = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    calls: list = []
+    real = ctrl.set_layers
+
+    def spy(mon, mode, **kw):
+        if "grayscale" in kw:
+            calls.append(kw["grayscale"])
+        return real(mon, mode, **kw)
+
+    ctrl.set_layers = spy
+    calib = _make(tmp_path, "gswb_on", controller=ctrl, decision_overrides={"verify:accept": Decision("revert")})
+    assert calib.run("grayscale-wb").status == "reverted"
+    assert calib.calib["grayscale_wb_prior"]["enabled"] is True
+    back = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert back["enabled"] is True and back["points"] == user["points"]
+    assert calls[0] is False and False not in calls[1:]        # off for the run, then only back ON
+
+    # ...and it ends ON even when the viewing layers were already marked restored (so the terminal
+    # _restore_viewing_layers does nothing): the revert alone must put the user's state back.
+    ctrl2 = _gswb_controller()
+    ctrl2.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                   {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4}, gamma=2.2)
+    ctrl2.set_layers(0, "SDR", grayscale=True)
+    calib2 = _make(tmp_path, "gswb_on_marked", controller=ctrl2,
+                   decision_overrides={"verify:accept": Decision("revert")})
+    real_restore = calib2._restore_viewing_layers
+    calib2._restore_viewing_layers = lambda: None               # "already restored"
+    assert calib2.run("grayscale-wb").status == "reverted"
+    calib2._restore_viewing_layers = real_restore
+    assert ctrl2.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is True
+
+
+def test_raw_grayscale_setter_sends_the_real_point_count():
+    """N1: C++ ApplyGrayscalePayload replaces `points` with a LINEAR ramp when their size differs
+    from point_count, so a stored pointCount that disagrees with the stored points must not ride
+    the wire — the revert would restore identity."""
+    ctrl = CalibrationController.mock()
+    ctrl.apply_mhc(0, "SDR")
+    block = {"point_count": 20, "points": [0.0, 0.3, 1.0],
+             "deviations": {"r": [1.0, 1.02, 1.0], "g": [1.0] * 3, "b": [1.0] * 3}}
+    ctrl.set_correction_grayscale_raw(0, "SDR", block)
+    wire = [r for r in ctrl.client.transport.requests if r.method == "mhc.set_correction_grayscale"][-1]
+    assert wire.params["point_count"] == 3
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["points"] == [0.0, 0.3, 1.0]
+
+
+@pytest.mark.parametrize("reply, status", [
+    ({"active": False, "restored": True, "unrestored": [], "restored_monitors": [
+        {"monitor": 0, "modes": ["SDR"], "mhc": [{"mode": "SDR", "action": "reinstall", "ok": False}]}]},
+     "reverted_partially"),
+    ({"active": False, "restored": True, "restored_monitors": [{"monitor": 0, "modes": ["SDR"]}],
+      "unrestored": [{"reason": "display not connected", "display": "Panel B", "captured_monitor": 1,
+                      "modes": ["SDR"]}]}, "reverted_partially"),
+    ({"active": False}, "revert_unconfirmed"),
+])
+def test_finish_reports_a_partial_or_unconfirmed_revert_as_such(tmp_path: Path, monkeypatch, reply, status):
+    """N2: `_finish` said "reverted" for any restore the server half-honoured (an MHC reinstall that
+    failed, a display it could not find), and a reply that did not say must not read as nothing."""
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, f"partial_{status}_{len(str(reply))}", controller=ctrl,
+                  adjudicator=_AutoExceptVerify("revert"))
+    real_exit = ctrl.exit_calibration
+
+    def exit_(restore_snapshot=False):
+        real_exit(restore_snapshot=restore_snapshot)
+        return dict(reply)
+
+    monkeypatch.setattr(ctrl, "exit_calibration", exit_)
+    res = calib.run("mhc-only")
+    assert res.status == status
+    summary = res.digest["snapshot_restore"]["summary"]
+    if "mhc" in str(reply):
+        assert "FAILED" in summary
+    if status == "revert_unconfirmed":
+        assert "did not say" in summary
+
+
+def test_grayscale_wb_prior_is_captured_once_per_run(tmp_path: Path):
+    """A stage re-run after DLC died mid-touch-up would read the half-finished live edit (the
+    live session writes straight into correctionGrayscale) and persist it as the 'prior' a revert
+    restores. The first snapshot of the run is kept."""
+    ctrl = _gswb_controller()
+    calib = _make(tmp_path, "gswb_prior_once", controller=ctrl)
+    calib.target_name = "srgb_g22"
+    calib.measure = _editor_responsive_panel(ctrl, calib._transfer(), white_nits=120.0)
+    first = {"enabled": False, "point_count": 2, "points": [0.0, 1.0],
+             "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}}
+    calib.calib["grayscale_wb_prior"] = dict(first)
+    calib.calib["grayscale_wb_prior_source"] = "prior"
+    assert calib.stage_grayscale_wb_touchup().status == "done"
+    assert calib.calib["grayscale_wb_prior"] == first
 
 
 # ---------------------------------------------------------------------------
@@ -1857,7 +2177,11 @@ def test_decide_override_supersedes_recorded_decision_on_resume(tmp_path: Path):
 
 def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
     # End-to-end: a full run records verify:accept=apply; resuming the SAME run with an
-    # explicit override flips the terminal gate to a real snapshot revert.
+    # explicit override flips the terminal gate to a revert. The first run already COMMITTED
+    # (exit without restore), and every exit drops DesktopLUT's pre-run capture — so the snapshot
+    # revert can no longer put anything back, and the run must SAY so (revert_unavailable), not
+    # report "reverted". (Pre-fix C++ never cleared its slot, which made this "work" by restoring
+    # whatever it last captured — the same stale slot that hit `3dlut-only --abort`.)
     ctrl = CalibrationController.mock()
     first = _make(tmp_path, "ovfull", controller=ctrl)
     assert first.run("full").status == "completed"
@@ -1866,8 +2190,9 @@ def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
     resumed = _make(tmp_path, "ovfull", controller=ctrl,
                     decision_overrides={"verify:accept": Decision("revert", note="cli")})
     result = resumed.run("full")
-    assert result.status == "reverted"
     assert resumed.calib["decisions"]["verify:accept"]["choice"] == "revert"
+    assert result.status == "revert_unavailable"
+    assert "restored NOTHING" in result.digest["snapshot_restore"]["summary"]
 
 
 # ---------------------------------------------------------------------------
@@ -4220,6 +4545,7 @@ def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path
     ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
                                   {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
                                   gamma=2.2)
+    ctrl.set_layers(0, "SDR", grayscale=True)   # on hardware the curve's enable IS this layer flag
     # The controller's SDR bridge resamples on the way in — the pre-existing correction, as
     # DesktopLUT actually STORES it, is what revert must bring back:
     prior_stored = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
@@ -4236,15 +4562,74 @@ def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path
 
 
 def test_grayscale_wb_revert_clears_when_no_prior_correction(tmp_path: Path):
-    # No pre-existing correction → revert clears the touch-up to identity (empty snapshot).
+    # No pre-existing correction: DesktopLUT still reports one — the identity curve its settings
+    # loader fills in (initLinear), switched OFF — and that is what the revert puts back.
     ctrl = _gswb_controller()
     calib = _make(tmp_path, "gswb_revert_clear", controller=ctrl,
                   decision_overrides={"verify:accept": Decision("revert")})
     result = calib.run("grayscale-wb")
     assert result.status == "reverted"
-    assert calib.calib["grayscale_wb_prior"] is None
-    devs = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["deviations"]
-    assert all(abs(v - 1.0) < 1e-9 for col in devs.values() for v in col)  # identity
+    prior = calib.calib["grayscale_wb_prior"]
+    assert calib.calib["grayscale_wb_prior_source"] == "prior"
+    assert prior["enabled"] is False and prior["point_count"] == 20
+    cg = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert all(abs(v - 1.0) < 1e-9 for col in cg["deviations"].values() for v in col)  # identity
+    assert cg["points"] == prior["points"]
+    assert cg["enabled"] is False            # the touch-up's enable did not stick
+
+
+def test_grayscale_wb_revert_restores_a_luminance_scaled_curve_exactly(tmp_path: Path):
+    """The prior curve carries a luminance (main-slider) component. state.get reports it the way
+    DesktopLUT stores it (points already ×luminance), so the revert must hand it back VERBATIM:
+    re-bridging it through set_correction_grayscale treated those points as the x-grid and came
+    back off (the reviewer's ~0.0065 at slot 1 with luminance 1.05)."""
+    ctrl = _gswb_controller()
+    n = 8
+    grid = [i / (n - 1) for i in range(n)]
+    lum = [1.0, 1.05, 1.04, 1.02, 1.01, 1.0, 0.99, 1.0]
+    rgb = {"r": [1.0, 1.02, 1.01, 1.0, 1.0, 1.0, 1.0, 1.0], "g": [1.0] * n,
+           "b": [1.0, 0.98, 0.99, 1.0, 1.0, 1.0, 1.0, 1.0]}
+    devs = {ch: [l * v for l, v in zip(lum, rgb[ch])] for ch in "rgb"}
+    ctrl.grayscale_live_begin(0, "SDR")
+    ctrl.grayscale_set_live(0, "SDR", n, grid, devs, luminance=lum, rgb=rgb)
+    ctrl.grayscale_commit(0, "SDR")
+    ctrl.set_layers(0, "SDR", grayscale=True)   # on hardware the curve's enable IS this layer flag
+    prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    identity = [(i / (n - 1)) ** 2 for i in range(n)]
+    assert max(abs(a - b) for a, b in zip(prior["points"], identity)) > 1e-3   # luminance in the points
+
+    calib = _make(tmp_path, "gswb_revert_lum", controller=ctrl,
+                  decision_overrides={"verify:accept": Decision("revert")})
+    assert calib.run("grayscale-wb").status == "reverted"
+    back = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert back["points"] == prior["points"]                     # exact, not approximately
+    assert back["deviations"] == prior["deviations"]
+    assert back["point_count"] == prior["point_count"] and back["enabled"] is True
+    # ...whereas the old bridged restore does NOT reproduce it:
+    ctrl.set_correction_grayscale(0, "SDR", prior["point_count"], prior["points"], prior["deviations"])
+    bridged = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert max(abs(a - b) for a, b in zip(bridged["points"], prior["points"])) > 1e-3
+
+
+def test_grayscale_wb_revert_keeps_a_disabled_prior_curve_disabled(tmp_path: Path):
+    """ApplyGrayscalePayload forces the curve ENABLED, so a revert that only re-sends the prior
+    curve would switch on a correction the user had switched off. The prior on/off state goes
+    back through layers.set."""
+    ctrl = _gswb_controller()
+    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
+                                  gamma=2.2)
+    ctrl.set_layers(0, "SDR", grayscale=False)            # the user keeps it, switched off
+    prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert prior["enabled"] is False and prior["deviations"]["r"] != [1.0] * 4
+
+    calib = _make(tmp_path, "gswb_revert_disabled", controller=ctrl,
+                  decision_overrides={"verify:accept": Decision("revert")})
+    assert calib.run("grayscale-wb").status == "reverted"
+    assert calib.calib["grayscale_wb_prior"]["enabled"] is False
+    back = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert back["enabled"] is False
+    assert back["points"] == prior["points"] and back["deviations"] == prior["deviations"]
 
 
 def test_grayscale_wb_bake_lost_after_restart_is_surfaced(tmp_path: Path):
@@ -4579,14 +4964,12 @@ def test_grayscale_wb_holds_points_that_regress(tmp_path: Path):
     def overreacting_measure(patch):
         st = (ctrl.state().get("mhc") or {}).get("0:SDR") or {}
         cg = st.get("correction_grayscale") or {}
-        pts = cg.get("points") or []
-        dev = cg.get("deviations") or {}
         level = max(patch.signal)
         gains = [1.0, 1.0, 1.0]
-        if st.get("gs_preview_active") and pts:
+        if st.get("gs_preview_active") and cg.get("points"):
             # over-response: the panel applies every editor deviation ~3x (gain**3),
             # so the damped tuner overshoots and oscillates instead of converging
-            gains = [_interp_editor_col(level, pts, dev.get(ch) or []) ** 3 for ch in "rgb"]
+            gains = [g ** 3 for g in _editor_gains(cg, level)]
         # a mild tint so the tuner has something real to chase into the overshoot
         tint = (1.0, 1.015, 0.99)
         sig = tuple(min(1.0, max(0.0, s * g * t)) for s, g, t in zip(patch.signal, gains, tint))

@@ -296,9 +296,30 @@ c.disable_all()                             # drop the runtime OVERLAY layers (n
 dummy = str(default_dummy_icc("SDR").path)  # contained neutral ICC (HDR placeholder is Rec2020.icm)
 c.enter_neutral(0, "SDR", dummy)            # re-associate the dummy to truly clear the Windows MHC2
 ```
-⚠️ **Known bug:** after `--cancel`/`--abort` the spine prints "restored pre-run setup" but the run's
-MHC often **stays installed** (the in-memory snapshot is lost on process exit). **Don't trust the
-message** — re-query `state()` + primaries and manually restore from the durable `.ini` backup if needed.
+⚠️ **Restore honesty:** `--abort`, the rollback guard and a `revert` print DesktopLUT's OWN answer
+(`snapshot_restore.summary`), never "the call returned":
+- `--abort`: `reverted` / `partially_reverted` / `nothing_restored` / `restore_unknown` (a reply that
+  did not say); verify-only is `reverted` once its candidate cube is back (`verify_candidate`).
+- rollback guard: `rolled_back` / `rolled_back_partially` / `rollback_restored_nothing` / `rollback_unconfirmed`.
+- `revert` at the apply gate: `reverted` / `reverted_partially` (a display unresolved, an MHC
+  reinstall FAILED, or an old build's stale slot) / `revert_unavailable` / `revert_unconfirmed`.
+- DLC asks DesktopLUT for a snapshot restore ONLY for a run that entered calibration mode AND while
+  DesktopLUT holds an open session or capture. `3dlut-only` / `grayscale-wb` / `verify-only` never
+  enter, so `--abort` / the rollback never restore anything for them over the pipe (any snapshot
+  DesktopLUT held would be someone else's — on an old build, a PREVIOUS run's pre-run setup).
+- `nothing_restored` = no capture of this run (DesktopLUT restarted mid-run — captures are in
+  memory — or the session was already exited/committed, or the flow never entered): restore from the
+  durable `.ini` backup (the payload's `hint` names it, and the pre-run cube for an in-place run).
+- On a DesktopLUT with the snapshot store, a `revert` decided AFTER the run already applied (e.g.
+  `--decide verify:accept=revert` on a completed run) ends `revert_unavailable`: the commit's exit
+  dropped the capture.
+- ⚠️ **Never run an enter/exit probe script while a DLC run is PAUSED.** The capture now belongs to the
+  open session: a probe's `calibration.exit(restore_snapshot=True)` restores the user's pre-run setup
+  MID-RUN (and drops the run's capture); a probe's `calibration.enter` on another monitor joins the
+  session. Finish or `--abort` the run first.
+- Builds before the snapshot store (no `snapshot_retained` on enter): a stale session on this monitor
+  at enter means the old single slot held the CLEARED state — the revert reports `reverted_partially`
+  and points at the `.ini` backup; on those builds re-query `state()` + primaries after any restore.
 
 ## 6. WATCHING THE RUN (three-consumer model — never conflate)
 
@@ -349,7 +370,7 @@ message** — re-query `state()` + primaries and manually restore from the durab
   boundary. The actionable half of mid-run gating — stop a run going wrong without `--abort`.
 - **`--abort`** (no `--run` needed against a live pipe) rolls DesktopLUT back to the pre-run setup and
   exits — use to bail out of a paused/abandoned run.
-- After either, **re-verify state** (the §5 known bug): the MHC may still be installed.
+- After either, **read the status it printed** (§5 "Restore honesty"); on an older DesktopLUT build re-verify `state()`.
 - **Cleanup after a run:** uncheck the in-app "Calibration control" toggle (or delete the flag) +
   restart DesktopLUT to return to the normal no-pipe state.
 

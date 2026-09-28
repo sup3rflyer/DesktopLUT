@@ -816,12 +816,35 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         result.anomaly("hook_active", "DesktopLUT is rendering through the DWM hook; the FALD layer (verify phase) runs "
                        "only in the overlay path — profiling reads are unaffected", "medium")
     # enter the native state: calibration.enter + identity MHC (the probe's FALD_NATIVE=1)
+    # `entered` = this run holds an open calibration session (entered, not yet exited): phase_restore gates its
+    # exit(restore_snapshot=True) on it, so a --no-native run (which never enters) is not reported as a lost stack.
+    st["fald"].setdefault("entered", False)
+    result.metrics["entered_calibration"] = bool(st["fald"]["entered"])
     if not args.no_native:
         dummy = default_dummy_icc(mode)
+        # A profiling pass is ~40 minutes of phases — the flow most likely to be interrupted — and its whole restore is
+        # the calibration snapshot (phase_restore): probe for an earlier session BEFORE entering, as enter-neutral does.
+        stale = _common.stale_calibration_session(controller)
+        result.metrics["stale_calibration_mode"] = stale is not None
         try:
             enter = controller.enter_neutral(args.monitor, mode, str(resolve_profile_path(dummy.path)), reason="DLC fald-profile")
-            result.action("entered calibration mode (layers cleared, dummy ICC associated)")
-            result.raw["calibration_enter"] = enter
+        except Exception as exc:  # noqa: BLE001
+            # A client-side failure (e.g. the pipe timeout, where the spec says the enter may still be
+            # APPLIED server-side) cannot prove the server did NOT enter: unknown → restore attempts it.
+            st["fald"]["entered"] = None
+            _common.note_stale_calibration(result, stale, None, monitor=args.monitor, mode=mode)
+            result.fail("enter_native_failed", f"{type(exc).__name__}: {exc}")
+            return
+        st["fald"]["entered"] = True
+        result.metrics["entered_calibration"] = True
+        result.action("entered calibration mode (layers cleared, dummy ICC associated)")
+        result.raw["calibration_enter"] = enter
+        # None = a server predating the snapshot store (it overwrites its restore slot on every enter)
+        result.metrics["snapshot_retained"] = enter.get("snapshot_retained") if isinstance(enter, dict) else None
+        tell = _common.note_stale_calibration(result, stale, enter, monitor=args.monitor, mode=mode)
+        if tell is not None:
+            result.metrics["stale_session_mismatch"] = tell["mismatch"]
+        try:
             native = None
             if mode == "HDR":
                 try:
@@ -1821,14 +1844,56 @@ def phase_restore(s: Session, result: StageResult) -> None:
         ctl.set_layers(s.args.monitor, mode, fald=False)
     except Exception:  # noqa: BLE001
         pass
+    # None = unknown (a run recorded before the flag existed, or an enter that failed client-side and
+    # may still have landed): attempt the restore as before.
+    entered = s.st["fald"].get("entered")
+    result.metrics["entered_calibration"] = entered
+    if entered is False:
+        # A --no-native run never entered calibration mode (or an earlier restore already exited it): there is no
+        # DesktopLUT capture to put back. Calling exit(restore_snapshot=True) anyway would read restored:false on a
+        # fixed server and raise a FALSE stack_not_restored alarm — and on a pre-fix server it could restore a stale
+        # snapshot from an EARLIER run over the user's current setup.
+        result.metrics["stack_restored"] = None
+        result.action("no calibration session to leave (this run never entered calibration mode, or already left it); "
+                      "the FALD layer was switched off")
+        s.st["fald"]["phases"]["restore"] = {"status": "done", "at": time.time()}
+        result.advice = {"default_policy_verdict": "done",
+                         "reasons": ["no calibration snapshot was taken by this run — nothing to restore over the pipe"]}
+        return
     try:
-        r = ctl.exit_calibration(restore_snapshot=True)
-        result.raw["calibration_exit"] = r
-        result.action("left calibration mode (user stack restored)")
+        # Asked only while DesktopLUT holds an open session / capture (_common.request_snapshot_restore): a
+        # restarted DesktopLUT or an already-exited session has nothing of this pass, and a build predating the
+        # snapshot store would otherwise "restore" its stale slot from an EARLIER run.
+        report = _common.request_snapshot_restore(ctl, entered=entered, monitor=s.args.monitor)
+        if report.get("requested"):
+            result.raw["calibration_exit"] = {k: report.get(k) for k in ("restored", "restored_monitors", "unrestored")}
+        s.st["fald"]["entered"] = False
+        # `restored` is the server SAYING it put the snapshot back. Believing the call returned is how a lost stack
+        # reads as a clean finish — the user's whole FALD configuration (panel file, pedestal mode, temporal,
+        # starfield, glow) comes back this way and no other, because the flow only ever switches the layer off.
+        result.metrics["stack_restored"] = report["restored"] is True
+        result.metrics["snapshot_restore"] = report
+        if report["complete"]:
+            result.action("left calibration mode (user stack restored)")
+        else:
+            result.action("left calibration mode")
+            result.anomaly(
+                "stack_not_restored",
+                report["summary"] + " — the MHC profile, white balance, 3D LUT and FALD configuration of what was not "
+                "restored are still in their cleared state",
+                "high",
+            )
     except Exception as exc:  # noqa: BLE001
+        result.metrics["stack_restored"] = False
         result.anomaly("restore_failed", f"calibration.exit failed: {exc}", "high")
     s.st["fald"]["phases"]["restore"] = {"status": "done", "at": time.time()}
-    result.advice = {"default_policy_verdict": "done", "reasons": ["stack restored"]}
+    restored_ok = result.metrics.get("stack_restored") is True
+    result.advice = {
+        "default_policy_verdict": "done",
+        "reasons": ["stack restored"] if restored_ok
+        else ["the stack was NOT (fully) restored — tell the user before calling this done"],
+    }
+    # the dispatcher's _judge_on_high turns a high anomaly above into judge_restore
 
 
 # ----------------------------------------------------------------------------- entry

@@ -138,6 +138,7 @@
     <ClInclude Include="src\displayconfig.h" />
     <ClInclude Include="src\mhc.h" />
     <ClInclude Include="src\desktoplut_ipc_server.h" />
+    <ClInclude Include="src\calib_snapshot.h" />
     <ClInclude Include="src\mhc_internal.h" />
     <ClInclude Include="src\whitelist.h" />
     <ClInclude Include="src\framepacer.h" />

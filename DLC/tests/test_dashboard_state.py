@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from datetime import datetime, timedelta
 
 from dlc.events import Ev, Event
@@ -428,6 +430,17 @@ def test_liveness_light_live_then_stalled_then_done():
     # A terminal run_done flips it to a neutral 'done' regardless of age.
     st.ingest(_ev(Ev.RUN_DONE, t=T0 + timedelta(seconds=601), stage="run", status="completed"))
     assert st.snapshot(T0 + timedelta(seconds=999))["liveness"]["light"] == "done"
+
+
+@pytest.mark.parametrize("status", ["revert_unavailable", "reverted_partially", "revert_unconfirmed"])
+def test_an_unhonoured_revert_is_terminal_under_its_own_name(status):
+    """A revert DesktopLUT could not (fully) honour ends the run: the light goes 'done', and the
+    status keeps its own name — a half-restored display must never read as 'reverted'."""
+    st = DashboardState()
+    st.ingest(_ev(Ev.RUN_HEADER, t=T0, stage="run", run_id="r"))
+    st.ingest(_ev(Ev.RUN_DONE, t=T0 + timedelta(seconds=1), stage="run", status=status))
+    snap = st.snapshot(T0 + timedelta(seconds=999))
+    assert snap["liveness"]["light"] == "done" and snap["run_status"] == status
 
 
 def test_stall_event_sets_status_and_flag():

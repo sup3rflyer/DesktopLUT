@@ -1018,16 +1018,33 @@ class Calibration:
     def _restore_user_setup(self, *, why: str) -> bool:
         """Roll DesktopLUT back to the user's pre-run setup: restore the snapshot taken
         at ``calibration.enter`` (which re-installs their original MHC) and leave
-        calibration mode. Best-effort; returns whether the restore call succeeded."""
+        calibration mode. Best-effort; returns whether the SERVER says it put the setup back
+        (its ``restored`` flag — a call that merely returned proves nothing: a DesktopLUT that
+        restarted mid-run holds no capture and restores nothing). The outcome is recorded in
+        ``calib['snapshot_restore']`` and logged in plain words either way."""
+        bak = (self.calib.get("backup") or {}).get("path")
         try:
-            self.controller.exit_calibration(restore_snapshot=True)
-            self.ctx.log(f"restored the user's previous DesktopLUT setup ({why})")
-            return True
+            # Asked only while DesktopLUT holds an open session / capture (a committed or restarted
+            # session has nothing of this run); a stale single slot (a build predating the snapshot
+            # store that found an earlier session open on this monitor) is never reported complete.
+            report = _common.request_snapshot_restore(
+                self.controller, entered=True, monitor=self.monitor,
+                stale_tell=_enter_stale_tell(self.calib))
         except Exception as exc:  # noqa: BLE001
-            bak = (self.calib.get("backup") or {}).get("path")
+            self.calib["snapshot_restore"] = {"why": why, "restored": False, "complete": False,
+                                              "error": f"{type(exc).__name__}: {exc}",
+                                              "summary": f"calibration.exit failed: {exc}"}
+            self._save()
             self.ctx.log(f"restore failed ({why}): {exc}"
                          + (f"; manual backup at {bak}" if bak else ""))
             return False
+        self.calib["snapshot_restore"] = {"why": why, **report}
+        self._save()
+        if report["complete"]:
+            self.ctx.log(f"restored the user's previous DesktopLUT setup ({why})")
+        else:
+            self.ctx.log(f"{report['summary']} ({why})" + (f"; manual backup at {bak}" if bak else ""))
+        return report["restored"] is True
 
     def _capture_inplace_baseline(self) -> dict[str, Any]:
         """The in-place flow (``3dlut-only``) tunes the *installed* stack directly — it never
@@ -3101,21 +3118,13 @@ class Calibration:
             # Capture the user's viewing layers BEFORE calibration.enter clears them (the C++
             # snapshot restores them only on revert; the apply path used to leave them off).
             self._enter_measurement_layers()
-            # Stale-calibration-mode tell (fable Phase 9): if a PREVIOUS run died without
-            # exiting calibration mode, the C++ DoEnterNeutral re-snapshots unconditionally —
-            # its single restore slot then holds the already-CLEARED state, so a later
-            # exit(restore_snapshot=True) cannot bring back the user's pre-run setup. Surface
-            # it so the digest reader knows the preflight settings backup is the authoritative
-            # restore for this run. Tell-only; entering is still correct.
-            stale_calibration = False
-            try:
-                stale_calibration = bool(self.controller.calibration_status().get("active"))
-            except Exception:  # noqa: BLE001 - status probe is advisory; enter itself will surface a dead pipe
-                pass
-            if stale_calibration:
-                self.ctx.log("DesktopLUT was already in calibration mode (a previous run did not "
-                             "exit) — the pipe's restore snapshot now captures that cleared state; "
-                             "treat the preflight settings backup as the authoritative restore")
+            # Stale-calibration tell (fable Phase 9): a PREVIOUS run died without exiting
+            # calibration mode, so its display is already cleared. Probed BEFORE the enter; what
+            # it costs is judged AFTER it — a server with the snapshot store keeps the original
+            # capture (snapshot_retained), an older one overwrote its single slot, and a stale
+            # session on another monitor/mode changes what a restore or a commit does. The shared
+            # _common helper owns the words (the stage tools and fald-profile use the same one).
+            stale = _common.stale_calibration_session(self.controller)
             # Capture the PRE-ENTER runtime layer map (every mode:monitor pair), persisted in
             # the run record. DesktopLUT builds before 2026-08-14 cleared BOTH modes' runtime
             # layers on this monitor at calibration.enter, and the apply path exits WITHOUT the
@@ -3131,18 +3140,35 @@ class Calibration:
                     self.calib["runtime_prior"] = {
                         "captured": False, "error": f"{type(exc).__name__}: {exc}"}
                 self._save()
-            res = self.controller.enter_neutral(self.monitor, self.mode, self.dummy_icc,
-                                                reason="DLC v2 calibration")
+            try:
+                res = self.controller.enter_neutral(self.monitor, self.mode, self.dummy_icc,
+                                                    reason="DLC v2 calibration")
+            except Exception:
+                failed_tell = _common.note_stale_calibration(None, stale, None,
+                                                             monitor=self.monitor, mode=self.mode)
+                if failed_tell is not None:
+                    self.ctx.log(f"stale calibration session: {failed_tell['detail']}")
+                raise
+            stale_tell = _common.note_stale_calibration(None, stale, res,
+                                                        monitor=self.monitor, mode=self.mode)
+            if stale_tell is not None:
+                self.ctx.log(f"stale calibration session ({stale_tell['severity']}): {stale_tell['detail']}")
             # calibration.enter cleared the layers + REMOVED the ICM — but Windows keeps the
             # LAST associated MHC2 transform, so the panel is still driven through whatever
             # was applied before (HW-proven 2026-09-03). Associate an IDENTITY profile
             # through the normal path so the raw stages measure the bare panel.
             neutral_profile = self._associate_identity_profile()
-            digest: dict[str, Any] = {"entered": True, "neutral_profile": neutral_profile}
-            if stale_calibration:
+            digest: dict[str, Any] = {
+                "entered": True, "neutral_profile": neutral_profile,
+                # True = the server kept an earlier capture of this display; None = a build that
+                # predates the snapshot store (its restore slot is overwritten on every enter).
+                "snapshot_retained": res.get("snapshot_retained") if isinstance(res, dict) else None,
+            }
+            if stale_tell is not None:
                 digest["stale_calibration_mode"] = True
-                digest["note"] = ("snapshot-restore now reflects a cleared state; "
-                                  "preflight backup is the authoritative rollback")
+                # severity + detail + the stale session's monitor/mode pairs and any mismatch
+                # with this run — evidence for the reader, no verdict.
+                digest["stale_calibration"] = stale_tell
             return StageOutcome("enter-neutral", "done",
                                 digest=digest, data={"raw": _jsonable(res)})
         outcome = self._stage("enter-neutral", run)
@@ -5402,17 +5428,32 @@ class Calibration:
             # (which is a no-op once commit has run) and durable across a DesktopLUT restart (the
             # snapshot lives in dlc_state.json, not DesktopLUT's in-memory GsLiveState). None ⇒ no
             # prior correction (revert clears to identity).
-            self.calib["grayscale_wb_prior"] = prior_snapshot = self._snapshot_correction_grayscale()
+            # Captured ONCE per run: a stage re-run after DLC died mid-touch-up would read the
+            # half-finished edit (the live session writes straight into correctionGrayscale; the
+            # true pre-begin curve then lives only in DesktopLUT's in-memory GsLiveState) and
+            # persist THAT as the "prior" a revert restores.
+            if "grayscale_wb_prior_source" in self.calib:
+                prior_snapshot = self.calib.get("grayscale_wb_prior")
+                self.ctx.log("keeping this run's first pre-touch-up correctionGrayscale snapshot "
+                             f"({self.calib.get('grayscale_wb_prior_source')}) — a re-run stage must not "
+                             "re-capture a half-finished edit as the prior")
+            else:
+                self.calib["grayscale_wb_prior"] = prior_snapshot = self._snapshot_correction_grayscale()
             self._save()
             if prior_snapshot is None:
-                # Honesty tell (fable Phase 9): None means EITHER no prior correction exists OR
-                # this DesktopLUT build doesn't expose correction_grayscale in state.get (the
-                # current C++ reports only applied/profile_name — exposing it is a ticketed
-                # DesktopLUT change). Either way a later `revert` clears the touch-up to
-                # identity rather than restoring a pre-existing correction — say so up front.
-                self.ctx.log("no prior correctionGrayscale captured over the pipe (none exists, or "
-                             "this DesktopLUT build does not expose it in state.get) — a revert of "
-                             "this touch-up will clear to identity, not restore a prior correction")
+                # Honesty tell (fable Phase 9): a revert will clear the touch-up to identity
+                # rather than restore a pre-existing correction — say so up front, and say WHY,
+                # because "you had none" and "this build can't tell me" are different problems
+                # (T3 made state.get expose the curve; older builds still don't).
+                why = {
+                    "none": "DesktopLUT reports an empty correction curve for this monitor/mode",
+                    "unsupported": "this DesktopLUT build does not expose correction_grayscale in "
+                                   "state.get — update DesktopLUT to make the revert restore your curve",
+                    "unreadable": "DesktopLUT reported no MHC entry for this monitor/mode, or the pipe "
+                                  "read failed",
+                }.get(self.calib.get("grayscale_wb_prior_source") or "", "reason unknown")
+                self.ctx.log(f"no prior correctionGrayscale captured over the pipe ({why}) — a revert "
+                             "of this touch-up will clear to identity, not restore a prior correction")
 
             # Engage the live grayscale editor (the "Edit Points" path): this strips any prior
             # correction-grayscale from the active MHC permutation and shows a live, measurable
@@ -5820,28 +5861,73 @@ class Calibration:
 
     def _snapshot_correction_grayscale(self) -> Optional[dict[str, Any]]:
         """The live correctionGrayscale for this monitor/mode from ``state.get`` (the user's
-        current correction), or ``None`` if absent/unreadable — the DLC-owned revert snapshot
-        for the grayscale touch-up (Design B). Best-effort: a down pipe just yields None (the
-        touch-up won't proceed far without the pipe anyway)."""
+        current correction), or ``None`` — the DLC-owned revert snapshot for the grayscale
+        touch-up (Design B). Best-effort: a down pipe just yields None (the touch-up won't
+        proceed far without the pipe anyway).
+
+        Keeps exactly the wire block ``{enabled, point_count, points, deviations}`` — the
+        decomposition DesktopLUT stores, handed back verbatim by the revert. Records WHY it is
+        None in ``calib['grayscale_wb_prior_source']`` (fable Phase 9 T3), because the reasons need
+        different words to the user:
+
+        * ``prior`` — the user's curve (identity included) was captured; a revert restores it.
+        * ``none`` — the field is there but its points are empty.
+        * ``unsupported`` — the mhc entry carries no ``correction_grayscale`` at all: a DesktopLUT
+          predating the field. A revert can only clear to identity.
+        * ``unreadable`` — no mhc entry for this pair, or the pipe failed.
+        """
         try:
             state = self.controller.state()
             key = f"{self.monitor}:{self.mode}"
-            cg = (((state.get("mhc") or {}).get(key) or {}).get("correction_grayscale"))
-            return dict(cg) if isinstance(cg, dict) and cg.get("points") else None
+            entry = (state.get("mhc") or {}).get(key)
+            if not isinstance(entry, dict):
+                self.calib["grayscale_wb_prior_source"] = "unreadable"
+                return None
+            cg = entry.get("correction_grayscale")
+            if not isinstance(cg, dict):
+                self.calib["grayscale_wb_prior_source"] = "unsupported"
+                return None
+            if not cg.get("points"):
+                self.calib["grayscale_wb_prior_source"] = "none"
+                return None
+            self.calib["grayscale_wb_prior_source"] = "prior"
+            devs = cg.get("deviations") or {}
+            # The run switched the grayscale LAYER off before this snapshot (hardware-readiness),
+            # so the live bit reads False for a user whose curve was ON; the user's own on/off is
+            # the viewing-layer capture taken before anything was switched.
+            enabled = cg.get("enabled")
+            vl = self.calib.get("viewing_layers")
+            if (isinstance(vl, dict) and vl.get("captured") and isinstance(vl.get("before"), dict)
+                    and "grayscale" in vl["before"] and vl.get("monitor") in (None, self.monitor)
+                    and str(vl.get("mode") or self.mode) == str(self.mode)):
+                enabled = bool(vl["before"]["grayscale"])
+            return {
+                "enabled": enabled,
+                "point_count": int(cg.get("point_count") or len(cg["points"])),
+                "points": [float(p) for p in cg["points"]],
+                "deviations": {ch: [float(v) for v in (devs.get(ch) or [])] for ch in ("r", "g", "b")},
+            }
         except Exception:  # noqa: BLE001 - advisory snapshot; revert falls back to clearing
+            self.calib["grayscale_wb_prior_source"] = "unreadable"
             return None
 
     def _restore_correction_grayscale(self) -> bool:
         """Re-apply the DLC-owned pre-begin correctionGrayscale snapshot and regenerate the ICM
         (Design B revert). Restores the user's prior correction if one was captured, else clears
         to identity — either way it does NOT rely on the C++ cancel-after-commit no-op. Returns
-        whether the restore call chain succeeded."""
+        whether the restore call chain succeeded.
+
+        The prior block goes back VERBATIM (``set_correction_grayscale_raw``): it is already in
+        DesktopLUT's stored decomposition, so the signal-domain bridge would bend a curve that
+        carries a luminance (main-slider) component. ``ApplyGrayscalePayload`` then forces the
+        curve ENABLED, so the prior on/off state is put back through ``layers.set`` — a curve the
+        user had switched off stays off."""
         prior = self.calib.get("grayscale_wb_prior")
         try:
             if prior and prior.get("points"):
-                self.controller.set_correction_grayscale(
-                    self.monitor, self.mode, prior["point_count"], prior["points"],
-                    prior["deviations"], gamma=float(self._spec().gamma))
+                self.controller.set_correction_grayscale_raw(self.monitor, self.mode, prior)
+                if prior.get("enabled") is not None:
+                    self.controller.set_layers(self.monitor, self.mode, grayscale=bool(prior["enabled"]))
             else:
                 n = 32
                 grid = [j / (n - 1) for j in range(n)]
@@ -7059,8 +7145,11 @@ class Calibration:
         choice = (self.calib.get("decisions") or {}).get("verify:accept", {}).get("choice")
         if self._entered_calibration():
             if choice == "revert":
+                # the SERVER's restored flag decides the terminal status: a revert DesktopLUT could
+                # not honour (no capture — e.g. it restarted mid-run) is revert_unavailable, the
+                # same honest terminal state the in-place flow uses, never "reverted"
                 self._restore_user_setup(why="operator chose revert at the apply gate")
-                status = "reverted"
+                status = _revert_status(self.calib.get("snapshot_restore") or {})
             else:
                 self._commit_calibration()
         elif self.calib.get("inplace_baseline") is not None:
@@ -7078,11 +7167,14 @@ class Calibration:
             self._record_applied_stack(rep.data.get("deliverable_cube"))
         self.runlog.run_done(status, results_dir=rep.data.get("results_dir"),
                              report_path=rep.data.get("report_path"))
+        digest = rep.digest
+        if choice == "revert" and self.calib.get("snapshot_restore") is not None and isinstance(digest, dict):
+            digest = {**digest, "snapshot_restore": self.calib["snapshot_restore"]}
         return CalibrationResult(
             flow=self.calib.get("flow"), monitor=self.monitor, mode=self.mode, target=self.target_name,
             status=status, stages=list(self.calib["stages"].keys()),
             results_dir=rep.data.get("results_dir"), report_path=rep.data.get("report_path"),
-            digest=rep.digest)
+            digest=digest)
 
     def _flow_full(self) -> CalibrationResult:
         self.stage_preflight()
@@ -7639,19 +7731,22 @@ class Calibration:
             self._restore_user_setup(why="characterization rejected at review — nothing applied")
             raise
         # Leave the display exactly as we found it (clear-native entered native via the pipe).
-        self._restore_user_setup(why="characterization complete — panel learned, nothing applied")
+        display_restored = self._restore_user_setup(
+            why="characterization complete — panel learned, nothing applied")
         dip = self._dip()
         # Terminal marker on the spine (this flow doesn't go through _finish) so the dashboard
         # flips to 'done' instead of hanging on "running" after a completed characterization.
+        # The characterization completed either way; whether the display came back is its own fact.
         self.runlog.run_done("completed", flow="characterize",
-                             dip_store=str(self._dip_store().path))
+                             dip_store=str(self._dip_store().path), display_restored=display_restored)
         return CalibrationResult(
             flow="characterize", monitor=self.monitor, mode=self.mode, target=self.target_name,
             status="completed", stages=list(self.calib["stages"].keys()),
             results_dir=None, report_path=None,
             digest={"characterize": outcome.digest,
                     "stored_display": dip.display if dip else None,
-                    "dip_store": str(self._dip_store().path)})
+                    "dip_store": str(self._dip_store().path),
+                    "snapshot_restore": self.calib.get("snapshot_restore")})
 
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
         """3dlut-only assumes an installed stack. If it's missing, escalate
@@ -8284,6 +8379,178 @@ def _as_float_local(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+# What calibration.exit(restore_snapshot=True) actually did — shared with the stage tools
+# (fald-profile reads it the same way).
+snapshot_restore_report = _common.snapshot_restore_report
+
+
+def _restore_hint(calib_state: Optional[dict[str, Any]]) -> str:
+    """Where the operator restores from when the pipe put nothing (or not everything) back."""
+    calib_state = calib_state or {}
+    bak = calib_state.get("backup") or {}
+    ref = bak.get("ini_backup") or bak.get("path")
+    hint = "restore from the pre-run settings backup" + (f" ({ref})" if ref else " in the run folder")
+    cand = calib_state.get("verify_candidate")
+    if isinstance(cand, dict) and cand.get("installed") and not cand.get("restored") and not cand.get("kept"):
+        hint += ("; the verify-only CANDIDATE cube is still installed — re-apply "
+                 + (f"the prior 3D LUT {cand.get('prior_cube')}" if cand.get("prior_cube") else "no cube (clear the slot)")
+                 + " in DesktopLUT" + (f" ({cand.get('restore_error')})" if cand.get("restore_error") else ""))
+    base = calib_state.get("inplace_baseline")
+    if isinstance(base, dict) and base.get("captured"):
+        if calib_state.get("flow") == "grayscale-wb":
+            hint += ("; this in-place flow never entered calibration mode — its display change is the "
+                     "MHC correction grayscale (the pre-touch-up curve is `grayscale_wb_prior` in the run's "
+                     "dlc_state.json)")
+        else:
+            prev = base.get("cube_path")
+            hint += ("; this in-place flow never entered calibration mode — its display change is the "
+                     "runtime 3D LUT, which was " + (f"{prev} before the run" if prev else "empty before the run"))
+    return hint
+
+
+# Flows that never enter calibration mode: they tune / measure the INSTALLED stack in place, so
+# DesktopLUT never takes a snapshot of them (their own undo is the in-place baseline / candidate).
+_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only")
+
+
+def _run_entered_calibration(calib_state: Optional[dict[str, Any]], *,
+                             flow: Optional[str] = None) -> Optional[bool]:
+    """Did this run enter calibration mode (so DesktopLUT may hold a capture of it)? True once an
+    entering stage ran; False for a flow that never enters (``_NON_ENTERING_FLOWS`` — ``flow`` is
+    the fallback when the record has none) or a recorded in-place baseline; ``None`` when the run
+    record cannot tell (no record — ``--abort`` against a live pipe — or an entering flow paused
+    before its enter stage completed)."""
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    stages = rec.get("stages") or {}
+    if "enter-neutral" in stages or "clear-native" in stages:
+        return True
+    if (rec.get("flow") or flow) in _NON_ENTERING_FLOWS:
+        return False
+    if rec.get("inplace_baseline") is not None:
+        return False
+    return None
+
+
+def _enter_stale_tell(calib_state: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The stale-session tell this run's enter-neutral recorded (None when there was none)."""
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    digest = (((rec.get("stages") or {}).get("enter-neutral") or {}).get("digest") or {})
+    tell = digest.get("stale_calibration")
+    return tell if isinstance(tell, dict) else None
+
+
+def _run_monitor(calib_state: Optional[dict[str, Any]], fallback: Optional[int]) -> Optional[int]:
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    for src in (rec.get("neutral_profile"), rec.get("viewing_layers")):
+        if isinstance(src, dict) and src.get("monitor") is not None:
+            return int(src["monitor"])
+    return fallback
+
+
+def _revert_status(report: Mapping[str, Any]) -> str:
+    """The terminal status of a snapshot revert, from what DesktopLUT SAID (never "the call
+    returned"): complete → reverted; something but not everything back (a display unresolved, an
+    MHC reinstall failed, a stale single slot) → reverted_partially; nothing → revert_unavailable;
+    a reply that did not say → revert_unconfirmed."""
+    if report.get("complete"):
+        return "reverted"
+    if report.get("restored") is True:
+        return "reverted_partially"
+    if report.get("restored") is False or report.get("error"):
+        return "revert_unavailable"
+    return "revert_unconfirmed"
+
+
+def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
+                   mode: Optional[str], run_root: Any, flow: Optional[str] = None,
+                   log: Optional[Callable[[str], None]] = None) -> tuple[int, dict[str, Any]]:
+    """``--abort``: undo what this run changed and report what was ACTUALLY put back. Returns
+    ``(exit_code, payload)`` for the CLI to print.
+
+    * a verify-only candidate cube is put back first (``verify_only.restore_candidate``);
+    * the pre-run snapshot is requested only through :func:`_common.request_snapshot_restore` —
+      never for a run that did not enter calibration mode, and never when DesktopLUT holds no open
+      session / capture (a restarted DesktopLUT, an exited session, a build predating the snapshot
+      store whose stale slot would roll an accepted calibration back);
+    * the user's viewing layers are re-asserted.
+    Status: ``reverted`` / ``partially_reverted`` / ``nothing_restored`` / ``restore_unknown`` (a
+    reply that did not say) — a verify-only run is ``reverted`` once its candidate is back."""
+    candidate = None
+    if isinstance(calib_state, dict):
+        candidate = verify_only.restore_candidate(controller, calib_state, why="--abort of a paused run",
+                                                  log=log, terminal=True)
+    entered = _run_entered_calibration(calib_state, flow=flow)
+    mon = _run_monitor(calib_state, monitor)
+    try:
+        report = _common.request_snapshot_restore(controller, entered=entered, monitor=mon,
+                                                  stale_tell=_enter_stale_tell(calib_state))
+    except Exception as exc:  # noqa: BLE001
+        return 1, {"status": "abort_failed", "error": f"{type(exc).__name__}: {exc}",
+                   "verify_candidate": candidate, "run": str(run_root)}
+    bak = ((calib_state or {}).get("backup") or {})
+    layers = _reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
+    run_flow = (calib_state or {}).get("flow") or flow
+    if entered is False and run_flow == "verify-only":
+        # verify-only's only display changes are the candidate cube and the viewing layers
+        cand_back = (not isinstance(candidate, dict) or not candidate.get("installed")
+                     or candidate.get("restored") or candidate.get("kept"))
+        status = "reverted" if cand_back else "revert_unavailable"
+    elif report.get("complete"):
+        status = "reverted"
+    elif report.get("restored") is True:
+        status = "partially_reverted"
+    elif report.get("restored") is False:
+        status = "nothing_restored"
+    else:
+        status = "restore_unknown"
+    payload: dict[str, Any] = {"status": status, "restored_snapshot": report.get("restored"),
+                               "snapshot_restore": report, "viewing_layers": layers,
+                               "verify_candidate": candidate, "backup": bak, "run": str(run_root)}
+    if status != "reverted":
+        payload["hint"] = _restore_hint(calib_state)
+    return 0, payload
+
+
+def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
+                      mode: Optional[str], run_root: Any,
+                      entered_calibration: Optional[bool] = None) -> dict[str, Any]:
+    """The CLI rollback guard's restore (a run that ended neither applied nor reverted): request the
+    pre-run snapshot through :func:`_common.request_snapshot_restore` (never for a run that did not
+    enter calibration mode, never when DesktopLUT holds no open session / capture), re-assert the
+    viewing layers when a restore ran, and report what DesktopLUT actually put back. Raises when
+    the exit call itself fails (the caller reports ``rollback_failed``).
+
+    A run that never entered (an in-place flow) gets its grayscale-wb live preview cancelled — the
+    one pipe-side undo that is safe without a session — and an honest "not rolled back"."""
+    if entered_calibration is False and (calib_state or {}).get("flow") == "grayscale-wb" \
+            and monitor is not None and mode:
+        try:
+            controller.grayscale_cancel(int(monitor), str(mode))   # no-op when no preview is live
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+    report = _common.request_snapshot_restore(controller, entered=entered_calibration,
+                                              monitor=_run_monitor(calib_state, monitor),
+                                              stale_tell=_enter_stale_tell(calib_state))
+    # The snapshot predates nothing the user cares about: it was taken after their viewing layers
+    # were switched off, so put them back (run() already did, and a restore undoes it).
+    layers = (_reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
+              if report.get("requested") else None)
+    if report.get("complete"):
+        status, reason = "rolled_back", "run did not complete; restored pre-run setup"
+    elif report.get("restored") is True:
+        status, reason = "rolled_back_partially", "run did not complete; " + report["summary"]
+    elif report.get("restored") is False:
+        status, reason = "rollback_restored_nothing", "run did not complete; " + report["summary"]
+    else:
+        status, reason = "rollback_unconfirmed", "run did not complete; " + report["summary"]
+    payload: dict[str, Any] = {"status": status, "reason": reason, "snapshot_restore": report,
+                               "viewing_layers": layers, "run": str(run_root)}
+    if not report.get("complete"):
+        payload["backup"] = ((calib_state or {}).get("backup") or {})
+        payload["hint"] = _restore_hint(calib_state)
+    return payload
 
 
 def _reassert_viewing_layers(controller: Any, calib_state: Optional[dict[str, Any]], *,
@@ -9176,35 +9443,19 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     controller = CalibrationController.connect()
 
     # Explicit cancel: restore the user's pre-run setup and exit (no measurement stack needed).
+    # `restored_snapshot` is the SERVER's restored flag, not "the call returned": a flow that never
+    # entered (3dlut-only) or a DesktopLUT restarted mid-run holds no capture, and the payload says so.
     if args.abort:
-        restored = False
-        # verify-only never enters calibration mode: a candidate cube it installed is put back
-        # first (independent of the snapshot restore below).
-        candidate = verify_only.restore_candidate(controller, state.get("calib"),
-                                                  why="--abort of a paused run", log=ctx.log,
-                                                  terminal=True)
-        if candidate is not None:
-            _common.save_dlc_state(ctx, state)
-        # ...and it has no snapshot of its own to restore: DesktopLUT keeps the LAST calibration
-        # snapshot for its whole process lifetime (DoExitCalibration restores it whenever one was
-        # ever taken), so restoring here would roll a completed earlier calibration back.
-        calib_rec = state.get("calib") or {}
-        if eff_flow == "verify-only" and "enter-neutral" not in (calib_rec.get("stages") or {}):
-            restored = None
-        else:
-            try:
-                controller.exit_calibration(restore_snapshot=True)
-                restored = True
-            except Exception as exc:  # noqa: BLE001
-                print(json.dumps({"status": "abort_failed", "error": f"{type(exc).__name__}: {exc}",
-                                  "run": str(ctx.root)}, indent=2))
-                return 1
-        bak = (state.get("calib", {}) or {}).get("backup", {})
-        layers = _reassert_viewing_layers(controller, state.get("calib"), monitor=args.monitor, mode=args.mode)
-        print(json.dumps({"status": "reverted", "restored_snapshot": restored,
-                          "viewing_layers": layers, "verify_candidate": candidate,
-                          "backup": bak, "run": str(ctx.root)}, indent=2))
-        return 0
+        # verify-only's candidate cube is put back first, and a flow that never entered calibration
+        # mode (verify-only / 3dlut-only / grayscale-wb) never asks DesktopLUT for a snapshot restore:
+        # any snapshot it holds would be someone else's — on a build predating the snapshot store its
+        # stale LAST slot, i.e. a completed earlier calibration's pre-run setup (see _abort_restore).
+        code, payload = _abort_restore(controller, state.get("calib"), monitor=args.monitor,
+                                       mode=args.mode, run_root=ctx.root, flow=eff_flow, log=ctx.log)
+        if payload.get("verify_candidate") is not None:
+            _common.save_dlc_state(ctx, state)   # restore_candidate updated calib['verify_candidate']
+        print(json.dumps(payload, indent=2, default=str))
+        return code
 
     # The live measurement stack (dogegen patch display + spotread meter) is only needed by
     # flows that MEASURE. build-correction mints a colorimeter correction via interactive
@@ -9450,7 +9701,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # half-applied profile, so roll DesktopLUT back to the user's pre-run snapshot.
         if not paused:
             handled = result is not None and getattr(result, "status", None) in (
-                "completed", "reverted", "revert_unavailable")
+                "completed", "reverted", "reverted_partially", "revert_unavailable", "revert_unconfirmed")
             # Nothing to roll back if the run never entered calibration mode / never mutated the
             # display — e.g. a clean early-fail at the pipe/plan/backup seam (finding F7a-A8).
             # Skipping avoids a spurious `rollback_failed` (exit_calibration over the very pipe
@@ -9464,25 +9715,29 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                 entered = True
             if not handled and entered:
                 try:
-                    controller.exit_calibration(restore_snapshot=True)
-                    # The snapshot predates nothing the user cares about: it was taken after their
-                    # viewing layers were switched off, so put them back (run() already did, and
-                    # this restore undid it).
-                    layers = _reassert_viewing_layers(controller, calib.calib if calib is not None else None,
-                                                      monitor=args.monitor, mode=args.mode)
-                    if layers is not None and calib is not None:
+                    # Reports what the SERVER says it restored — a run that never entered
+                    # calibration mode (3dlut-only) or a DesktopLUT restarted mid-run gets
+                    # restored:false, and that must not print as "restored pre-run setup".
+                    rollback = _rollback_restore(
+                        controller, calib.calib if calib is not None else None,
+                        monitor=args.monitor, mode=args.mode, run_root=ctx.root,
+                        entered_calibration=_run_entered_calibration(calib.calib if calib is not None else None,
+                                                                     flow=eff_flow))
+                    layers = rollback.get("viewing_layers")
+                    if calib is not None:
                         try:
+                            calib.calib["snapshot_restore"] = {"why": "rollback guard",
+                                                               **rollback["snapshot_restore"]}
                             vl = calib.calib.get("viewing_layers")
-                            if isinstance(vl, dict):
+                            if layers is not None and isinstance(vl, dict):
                                 vl["reasserted_after_rollback"] = layers
-                                calib._save()
-                            ctx.log("viewing layers after rollback: " + json.dumps(layers, default=str))
+                            calib._save()
+                            if layers is not None:
+                                ctx.log("viewing layers after rollback: " + json.dumps(layers, default=str))
+                            ctx.log("rollback: " + rollback["snapshot_restore"]["summary"])
                         except Exception:  # noqa: BLE001 - bookkeeping only
                             pass
-                    print(json.dumps({"status": "rolled_back",
-                                      "reason": "run did not complete; restored pre-run setup",
-                                      "viewing_layers": layers,
-                                      "run": str(ctx.root)}, indent=2))
+                    print(json.dumps(rollback, indent=2, default=str))
                 except Exception as exc:  # noqa: BLE001 - but a FAILED rollback must never be silent
                     # The one teardown failure that can cost the user their display setup: the
                     # run died half-applied AND the snapshot restore failed. Say so, and point

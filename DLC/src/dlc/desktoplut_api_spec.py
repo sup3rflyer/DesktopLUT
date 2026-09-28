@@ -65,10 +65,19 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "corrections_enabled": "boolean (the OVERLAY-draw flag, NOT 'a correction is live' — "
                                        "false in DWM-hook mode even with a cube loaded; see ../docs/NAMING.md S4)",
                 "calibration_mode": "object or null",
-                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string}. "
-                       "DLC ALSO wants correction_grayscale {point_count,points,deviations} exposed here "
-                       "(the Design-B grayscale-wb revert snapshot source) — a DesktopLUT-side ticket; "
-                       "until then the snapshot degrades to clear-to-identity on hardware (fable Phase 9)",
+                "mhc": "object keyed by '<monitor>:<MODE>'; each entry {applied:bool, profile_name:string, "
+                       "correction_grayscale:{enabled:bool, point_count:int, points:[float], "
+                       "deviations:{r:[float],g:[float],b:[float]}}}. correction_grayscale is the Design-B "
+                       "grayscale-wb revert snapshot source, in the decomposition DesktopLUT STORES "
+                       "(ApplyGrayscalePayload): points already carry the luminance / main-slider scale, "
+                       "deviations the per-channel balance — so hand it back VERBATIM to "
+                       "mhc.set_correction_grayscale (point_count/points/deviations only, never through the "
+                       "SDR signal bridge, never with luminance/rgb) to reproduce the curve exactly. A display "
+                       "with no correction reports the loader's identity curve (initLinear), so points are "
+                       "empty only for settings never loaded or edited; the field ABSENT = a build predating it "
+                       "(a revert then degrades to clear-to-identity; fable Phase 9 T3). enabled is the same "
+                       "C++ bool as layers[key].grayscale: ApplyGrayscalePayload forces it true, restore it "
+                       "with layers.set",
                 "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
                 "layers": "object keyed by '<monitor>:<MODE>' for EVERY pair: the viewing layers a run "
                           "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"
@@ -91,10 +100,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
                           "Absent on pre-2026-09-03 builds (then the ini is the only layer evidence).",
-                "contract_version": "integer (optional): the wire-contract version the server speaks. "
-                                    "Absent = pre-versioning build = 1. DLC checks this at preflight so a "
-                                    "mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
-                                    "mid-run. Server-side field is a DesktopLUT ticket (fable Phase 9).",
+                "contract_version": "integer: the wire-contract version the server speaks (1). "
+                                    "Absent = a build predating the field = 1. DLC checks this at preflight "
+                                    "so a mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
+                                    "mid-run. Mirrors kCalibrationContractVersion in the C++ and "
+                                    "CONTRACT_VERSION in desktoplut_client (fable Phase 9 T1).",
                 "hook": "object {active:bool (DWM hook DLL injected), needs_check:bool (an entry is "
                         "order/pinned/replaced-matched and unconfirmed, or provisional, or the routing "
                         "session is stale), "
@@ -193,8 +203,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "cube on the apply path (exit without restore); the orchestrator's commit re-applies "
             "dropped pairs as a guard for those builds. The dummy ICC path is RECORDED but not "
             "associated (deferred; neutrality comes from the cleared layers plus DLC's own "
-            "dispwin -c). NOT retry-safe: re-entering while a session is active re-snapshots the "
-            "already-cleared state (see transport.timeout_and_retries).",
+            "dispwin -c). Retry/crash-safe on a server that reports snapshot_retained: the "
+            "snapshot is a per-DISPLAY store (identity-keyed, with the set of modes entered) whose "
+            "FIRST capture of a display wins for the whole session — a re-enter (a crashed run, or "
+            "an enter that threw) keeps the ORIGINAL instead of capturing the already-cleared state, "
+            "and re-entering the display in the other mode adds that mode to the restore. Only "
+            "calibration.exit drops the captures. A build that omits snapshot_retained predates the "
+            "store and overwrites a single slot on every enter (see transport.timeout_and_retries).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
@@ -208,23 +223,52 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "mode": "string",
                 "dummy_icc_path": "string",
                 "corrections_reset": "boolean true",
+                "snapshot_retained": (
+                    "boolean: true when this call KEPT the session's earlier capture of this display "
+                    "(a re-enter after a crashed run or a thrown enter) instead of snapshotting the "
+                    "already-cleared state. Absent = a server predating the snapshot store, which "
+                    "overwrites — treat the preflight settings backup as the authoritative restore."
+                ),
             },
             mutates_state=True,
             gui_thread_required=True,
         ),
         ApiMethodSpec(
             "calibration.status",
-            "Return current calibration-mode bookkeeping.",
+            "Return current calibration-mode bookkeeping, plus what a restore would put back.",
             {},
-            {"active": "boolean", "state": "object or null"},
+            {"active": "boolean", "state": "object or null",
+             "captures": (
+                 "array (additive; absent on builds predating the snapshot store): one entry per "
+                 "display the session captured — {monitor: its CURRENT index or null when it cannot "
+                 "be resolved (disconnected / ambiguous EDID twins), resolved_by: the matching rule "
+                 "or the reason it is unresolved, display: friendly name, edid_id, captured_monitor: "
+                 "its index at capture, modes: ['SDR'|'HDR'] entered, age_s: seconds since capture}. "
+                 "Can be non-empty while active=false (an enter that threw keeps its capture).")},
             mutates_state=False,
             gui_thread_required=False,
         ),
         ApiMethodSpec(
             "calibration.exit",
-            "Exit calibration mode, optionally restoring the calibration snapshot.",
+            "Exit calibration mode, optionally restoring the calibration snapshot. The captures are "
+            "dropped on EVERY exit (restore or not), so an exit(restore_snapshot=true) with no "
+            "session behind it restores nothing and says restored:false — builds before the "
+            "snapshot store kept a stale slot and could restore a PREVIOUS run's pre-run setup.",
             {"restore_snapshot": ApiParamSpec("boolean", required=False, description="Restore the snapshot captured by calibration.enter.")},
-            {"active": "boolean false", "restored": "boolean"},
+            {"active": "boolean false",
+             "restored": "boolean: true when at least one captured display was put back",
+             "restored_monitors": (
+                 "array (additive): the displays put back — {monitor (current index), resolved_by, "
+                 "display, edid_id, captured_monitor, modes, mhc:[{mode, action: reinstall | "
+                 "identity_swap | none, ok:bool}]}: per entered mode, the captured MHC reinstalled, or "
+                 "a live one swapped for the identity profile when the capture had none. ok:false = "
+                 "the settings came back but that profile step failed (the old transform may still "
+                 "be in scanout) — not a complete restore. resumed:true = an earlier exit copied the "
+                 "settings back and failed part-way; this one ran the MHC steps it had left."),
+             "unrestored": (
+                 "array (additive): displays the session captured but could NOT put back — "
+                 "{reason, display, edid_id, captured_monitor, modes}. Non-empty = restore those "
+                 "from the preflight settings backup.")},
             mutates_state=True,
             gui_thread_required=True,
         ),
@@ -734,8 +778,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "request_envelope": {"method": "string", "params": "object"},
             "response_envelope": {"ok": "boolean", "result": "object when ok", "error": "string when not ok"},
             "versioning": (
-                "state.get result SHOULD carry contract_version (integer; absent = 1, i.e. a "
-                "pre-versioning build). The client checks it at preflight (desktoplut_client."
+                "state.get result carries contract_version (integer; absent = 1, i.e. a build "
+                "predating the field). The client checks it at preflight (desktoplut_client."
                 "contract_version_mismatch) so a mismatch reads 'update DLC/DesktopLUT' instead "
                 "of 'unknown method' mid-run. Additive fields never bump the version."
             ),
@@ -745,11 +789,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "GUI thread is wedged mid-mutation. The timed-out request may still be APPLIED "
                 "server-side, and a retry fails pipe-busy until the orphaned connection drains. "
                 "Retry-safety: every mhc.set_*/mhc.apply/runtime.* call is idempotent (same "
-                "params => same state); calibration.enter is NOT retry-safe — a re-enter "
-                "overwrites the single C++ restore snapshot with the already-cleared state "
-                "(DesktopLUT ticket, fable Phase 9), so DLC surfaces a stale active calibration "
-                "mode before entering and treats the preflight settings backup as the "
-                "authoritative restore; mhc.grayscale_commit retried after a real commit "
+                "params => same state); calibration.enter is retry-safe on a server that reports "
+                "snapshot_retained — a re-enter keeps the ORIGINAL pre-session capture per display "
+                "instead of overwriting it with the already-cleared state (fable Phase 9 T2). On a "
+                "server that omits the field the old single-slot overwrite still applies. Either "
+                "way DLC surfaces a stale active calibration mode before entering and keeps the "
+                "preflight settings backup as the durable fallback (the captures are in-memory: a "
+                "DesktopLUT restart mid-run loses them); mhc.grayscale_commit retried after a real commit "
                 "returns baked:false (detectable, surfaced as a seam)."
             ),
         },

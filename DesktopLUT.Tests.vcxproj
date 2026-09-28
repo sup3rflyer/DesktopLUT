@@ -121,6 +121,7 @@
     <ClCompile Include="tests\test_displayconfig.cpp" />
     <ClCompile Include="tests\test_monitor_identity.cpp" />
     <ClCompile Include="tests\test_settings.cpp" />
+    <ClCompile Include="tests\test_calib_snapshot.cpp" />
     <ClCompile Include="tests\test_fald.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
@@ -145,6 +146,7 @@
     <ClInclude Include="src\gui_mhc.h" />
     <ClInclude Include="src\gui_whitelist.h" />
     <ClInclude Include="src\displayconfig.h" />
+    <ClInclude Include="src\calib_snapshot.h" />
     <ClInclude Include="src\mhc.h" />
     <ClInclude Include="src\mhc_internal.h" />
     <ClInclude Include="src\whitelist.h" />

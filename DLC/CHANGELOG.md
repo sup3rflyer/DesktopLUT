@@ -370,6 +370,42 @@ request, adjudicates ambiguous results on digests, and writes the report.
   with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
 
 ### Fixed
+- **A crashed or repeated calibration run can still be undone** (2026-09-27; fable Phase 9 T2,
+  needs the matching DesktopLUT build). DesktopLUT kept one pre-run snapshot and overwrote it on
+  every `calibration.enter`: a run that died without exiting left the display cleared, and the
+  next run's enter snapshotted THAT, so undoing it handed back the neutral slate instead of the
+  user's MHC profile, white balance, grayscale, 3D LUT and FALD settings. The snapshot is now kept
+  per display (by display identity, so a Windows re-enumeration mid-run does not send it to the
+  wrong screen), the first capture wins for the whole session, re-entering the other mode adds
+  that mode to what is put back, and a display that cannot be found at restore is reported instead
+  of guessed. `calibration.enter` reports `snapshot_retained`, and enter-neutral (stage tool and
+  orchestrator digest) and the FALD profiling preflight now say what an earlier, never-exited
+  session means for this run — including when it was on another monitor or mode, or when the
+  enter itself failed.
+- **`--abort` no longer restores a previous run's setup, and nothing claims a restore that did
+  not happen** (2026-09-27, same DesktopLUT build). DesktopLUT never forgot its last snapshot, so
+  aborting a `3dlut-only` run (which never enters calibration mode) after an accepted full run in
+  the same session put back the full run's pre-run state over the calibration the user had just
+  accepted. Every exit now drops the snapshot. And DLC — on the new AND the old DesktopLUT — only
+  asks for a snapshot restore for a run that entered calibration mode while DesktopLUT still holds
+  an open session: `--abort` of a `3dlut-only` / `grayscale-wb` / `verify-only` run (which never
+  enter), an `--abort` with no run record, or one after DesktopLUT restarted no longer restores an
+  old build's stale snapshot over the accepted calibration (verify-only's `--abort` still puts its
+  candidate cube back). `--abort`, the rollback after a failed run, a revert and the FALD `restore`
+  phase read DesktopLUT's own `restored` answer and say `nothing_restored` / partially restored
+  (with the settings backup, and for an in-place run the pre-run 3D LUT, to restore from) instead
+  of "reverted"; a revert DesktopLUT could not honour ends `revert_unavailable`, a half-honoured one
+  (an MHC reinstall failed, a display it could not find, or an old build whose single slot held the
+  already-cleared state) `reverted_partially`. The FALD `restore` phase no longer raises a false
+  "stack not restored" alarm after a `--no-native` pass, which never entered.
+- **Reverting a grayscale touch-up restores the user's own curve exactly** (2026-09-27; fable
+  Phase 9 T3, needs the matching DesktopLUT build). DesktopLUT now reports the correction
+  grayscale in `state.get`; the revert sends it back unchanged instead of re-converting it (which
+  bent any curve with a main-slider/luminance component), and puts back whether it was switched
+  on — a curve the user had switched off stays off.
+- **The DLC ↔ DesktopLUT version check can fire** (2026-09-27; fable Phase 9 T1). DLC checked
+  `state.get`'s `contract_version` at preflight, but no DesktopLUT build sent it, so a mismatch
+  would still have surfaced as `unknown method` mid-run. DesktopLUT now reports version 1.
 - **The test suite no longer writes into the real `runs/`** (2026-09-24). Every suite run left a
   `runs/<ts>_sdr_x/` folder behind and repointed `runs/active.json` at a pytest tmp run, which
   pulled a live dashboard off an in-progress hardware run. The runs root is now resolved at call

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -12,6 +13,96 @@ from .desktoplut_client import CONTRACT_VERSION, DesktopLutCommand, DesktopLutRe
 
 class _MockApiError(Exception):
     """Internal: a request the C++ server would reject (mirrored error text)."""
+
+
+_GS_CHANNELS = ("r", "g", "b")
+_MAX_GS_POINTS = 32   # C++ kMaxMhcGrayscalePoints
+
+
+def _identity_correction_grayscale(is_hdr: bool, point_count: int = 20) -> dict[str, Any]:
+    """C++ ``GrayscaleSettings::initLinear`` (SDR: slot i at signal (i/(N-1))**2) /
+    ``initLinearPQ`` (HDR: i/(N-1)) with unit deviations — what the settings loader fills in, so a
+    real build reports an identity curve (never empty points) for a display with no correction."""
+    n = max(2, int(point_count))
+    ts = [i / (n - 1) for i in range(n)]
+    return {"enabled": False, "point_count": n,
+            "points": [t if is_hdr else t * t for t in ts],
+            "deviations": {ch: [1.0] * n for ch in _GS_CHANNELS}}
+
+
+def _resample_uniform(src: list[float], count: int, fallback: float) -> list[float]:
+    """C++ ``ResampleUniform`` (same-size input passes through untouched)."""
+    if count <= 0:
+        return []
+    if not src:
+        return [fallback] * count
+    if len(src) == count:
+        return list(src)
+    if len(src) == 1 or count == 1:
+        return [src[0]] * count
+    out = []
+    src_max = len(src) - 1
+    for i in range(count):
+        pos = i / (count - 1) * src_max
+        i0 = int(pos)
+        i1 = min(i0 + 1, src_max)
+        t = pos - i0
+        out.append(src[i0] + (src[i1] - src[i0]) * t)
+    return out
+
+
+def _floats(v: Any) -> list[float]:
+    return [float(x) for x in v] if isinstance(v, list) else []
+
+
+def _apply_grayscale_payload(existing: dict[str, Any] | None, p: dict[str, Any]) -> dict[str, Any]:
+    """C++ ``ApplyGrayscalePayload``: what DesktopLUT STORES for a grayscale payload. With the
+    decomposed editor sliders the luminance scales the points curve (``points *= luminance``) and
+    the balance lands on the deviations; without them the payload is stored as sent (a same-size
+    resample is exact). ``enabled`` is forced true. ``luminance`` / ``rgb`` / ``editor_points`` are
+    MOCK-ONLY test probes the C++ does not keep — production DLC reads only the four wire keys."""
+    pc = int(p.get("point_count") or 0)
+    pts = _floats(p.get("points"))
+    dev = p.get("deviations") if isinstance(p.get("deviations"), dict) else {}
+    raw = {ch: _floats(dev.get(ch)) for ch in _GS_CHANNELS}
+    lum = _floats(p.get("luminance"))
+    rgb = p.get("rgb") if isinstance(p.get("rgb"), dict) else None
+    bal = {ch: _floats((rgb or {}).get(ch)) for ch in _GS_CHANNELS}
+    if pc <= 0:
+        pc = len(pts)
+    if pc <= 0:
+        pc = len((existing or {}).get("points") or [])
+    if pc <= 0:
+        pc = 20
+    if len(pts) != pc:
+        pts = [k / (pc - 1) if pc > 1 else 0.0 for k in range(pc)]
+    for ch in _GS_CHANNELS:
+        if len(raw[ch]) != pc:
+            raw[ch] = [1.0] * pc
+    have_lum = len(lum) == pc
+    have_rgb = all(len(bal[ch]) == pc for ch in _GS_CHANNELS)
+    if have_lum and not have_rgb:
+        # luminance without balance: recover it from the composed deviations (= luminance*rgb)
+        bal = {ch: [(raw[ch][k] / lum[k]) if abs(lum[k]) > 1e-6 else 1.0 for k in range(pc)]
+               for ch in _GS_CHANNELS}
+        have_rgb = True
+    dst = min(max(pc, 2), _MAX_GS_POINTS)
+    points = _resample_uniform(pts, dst, 0.0)
+    if have_lum:
+        lum_r = _resample_uniform(lum, dst, 1.0)
+        points = [a * b for a, b in zip(points, lum_r)]
+    out: dict[str, Any] = {
+        "enabled": True,
+        "point_count": dst,
+        "points": points,
+        "deviations": {ch: _resample_uniform(bal[ch] if have_rgb else raw[ch], dst, 1.0) for ch in _GS_CHANNELS},
+    }
+    if have_lum:
+        out["luminance"] = list(lum)
+        out["editor_points"] = list(points)   # what the editor's main slider shows = the stored points
+    if rgb is not None:
+        out["rgb"] = deepcopy(rgb)
+    return out
 
 
 def _fald_file_has_boost(path: Path) -> bool:
@@ -135,6 +226,10 @@ class MockDesktopLutState:
     running: bool = True
     corrections_enabled: bool = True
     calibration_mode: dict[str, Any] | None = None
+    # The C++ calibration snapshot store (src/calib_snapshot.h), keyed by str(monitor) — the
+    # mock's monitors never re-enumerate, so the index IS the display identity here. Each entry
+    # is that monitor's pre-session pairs (mhc/runtime/layers/fald for both modes) plus the set of
+    # modes the session entered; only calibration.exit drops them.
     snapshots: dict[str, dict[str, Any]] = field(default_factory=dict)
     mhc: dict[str, Any] = field(default_factory=dict)
     runtime: dict[str, Any] = field(default_factory=dict)
@@ -256,6 +351,10 @@ class MockDesktopLutServer:
                 # it — MockDesktopLutState.overlay_tick; the sim is never in DWM-hook mode)
                 out["overlay"] = {"awake": self.state.overlay_tick(poll=True), "dwm_hook_mode": False}
                 out.pop("overlay_model", None)
+                # The C++ emits correction_grayscale on every mhc entry (fable Phase 9 T3), identity
+                # when the display has none (the loader's initLinear) — never absent, never empty.
+                for mhc_key, entry in (out.get("mhc") or {}).items():
+                    entry["correction_grayscale"] = self.correction_grayscale_view(mhc_key)
                 return self.ok(out)
             if method == "hook.set_routing":
                 return self.handle_hook_set_routing(params)
@@ -412,19 +511,53 @@ class MockDesktopLutServer:
             raise _MockApiError("monitor index out of range")
         return f"{mon}:{mode}"
 
-    def restore(self, snapshot_id: str) -> DesktopLutResponse:
-        if snapshot_id not in self.state.snapshots:
-            return DesktopLutResponse(ok=False, error=f"unknown snapshot: {snapshot_id}")
-        snapshot = deepcopy(self.state.snapshots[snapshot_id])
-        self.state.corrections_enabled = bool(snapshot.get("corrections_enabled", True))
-        self.state.calibration_mode = deepcopy(snapshot.get("calibration_mode"))
-        self.state.mhc = deepcopy(snapshot.get("mhc", {}))
-        self.state.runtime = deepcopy(snapshot.get("runtime", {}))
-        self.state.hdr = {int(k): bool(v) for k, v in deepcopy(snapshot.get("hdr", {})).items()}
-        self.state.layers = {k: {n: bool(v) for n, v in (d or {}).items() if n in self.LAYER_NAMES}
-                             for k, d in deepcopy(snapshot.get("layers", {})).items()}
-        self.state.fald = deepcopy(snapshot.get("fald", {}))
-        return self.ok({"snapshot_id": snapshot_id, "restored": True})
+    def _capture_monitor(self, mon: int, mode: str, session_id: str) -> dict[str, Any]:
+        """One C++ ``CalibCapture``: the monitor's settings (both modes — MonitorSettings is per
+        display) BEFORE the enter clears anything, plus the entered mode."""
+        pairs = {}
+        for md in ("SDR", "HDR"):
+            k = f"{mon}:{md}"
+            pairs[k] = {
+                "mhc": deepcopy(self.state.mhc.get(k)),
+                "runtime": deepcopy(self.state.runtime.get(k)),
+                "layers": deepcopy(self.state.layers.get(k)),
+                "fald": deepcopy(self.state.fald.get(k)),
+            }
+        return {
+            "session_id": session_id,
+            "modes": [mode],
+            "captured_at": time.time(),
+            "pairs": pairs,
+            # the overlay flag is global, not per display; the session's first capture carries it
+            "corrections_enabled": bool(self.state.corrections_enabled),
+            "display": f"Simulated Display {mon}",
+            "edid_id": f"SIM000{mon}",
+        }
+
+    def _restore_monitor(self, cap: dict[str, Any]) -> None:
+        """C++ RestoreCapturedSettings: the captured pairs go back (never the OS HDR state — that
+        is not part of MonitorSettings)."""
+        for k, pair in (cap.get("pairs") or {}).items():
+            for name, store in (("mhc", self.state.mhc), ("runtime", self.state.runtime),
+                                ("layers", self.state.layers), ("fald", self.state.fald)):
+                val = deepcopy(pair.get(name))
+                if val is None:
+                    store.pop(k, None)
+                elif name == "layers":
+                    store[k] = {n: bool(v) for n, v in val.items() if n in self.LAYER_NAMES}
+                else:
+                    store[k] = val
+
+    def _capture_view(self, mon_s: str, cap: dict[str, Any]) -> dict[str, Any]:
+        """A capture as calibration.status / calibration.exit report it."""
+        return {
+            "monitor": int(mon_s),
+            "resolved_by": "device path",
+            "display": cap.get("display", ""),
+            "edid_id": cap.get("edid_id", ""),
+            "captured_monitor": int(mon_s),
+            "modes": [m for m in ("SDR", "HDR") if m in (cap.get("modes") or [])],
+        }
 
     def _cleanup_active_gs_live(self) -> None:
         """Mirror the C++ ``CleanupActiveGsLive``: any monitor/mode with an active live-edit
@@ -441,6 +574,24 @@ class MockDesktopLutServer:
 
     LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
     SHADER_LAYERS = ("tonemap", "fald")      # shader flags: no MHC re-bake
+
+    def correction_grayscale_view(self, key: str) -> dict[str, Any]:
+        """The ``correction_grayscale`` block C++ ``HandleStateGet`` emits on an mhc entry: the
+        stored ``ApplyGrayscalePayload`` decomposition (points already luminance-scaled, deviations
+        = the balance), or the identity curve the settings loader fills in. Handed back verbatim to
+        ``mhc.set_correction_grayscale`` it reproduces the curve exactly."""
+        cg = (self.state.mhc.get(key) or {}).get("correction_grayscale")
+        if not isinstance(cg, dict) or not cg.get("points"):
+            ident = _identity_correction_grayscale(key.endswith(":HDR"))
+            # the same C++ bool the layers block reports as `grayscale`
+            ident["enabled"] = bool((self.state.layers.get(key) or {}).get("grayscale"))
+            return ident
+        view = deepcopy(cg)
+        view["enabled"] = bool(cg.get("enabled", True))
+        view["point_count"] = int(cg.get("point_count") or len(cg["points"]))
+        devs = cg.get("deviations") or {}
+        view["deviations"] = {ch: list(devs.get(ch) or []) for ch in _GS_CHANNELS}
+        return view
 
     def handle_layers_set(self, params: dict[str, Any]) -> DesktopLutResponse:
         """C++ DoLayersSet: set the given layer flags for monitor:mode; an MHC-layer change on
@@ -463,6 +614,18 @@ class MockDesktopLutServer:
                     cur[name] = val
                     if name not in self.SHADER_LAYERS:
                         mhc_changed = True
+        if "grayscale" in params and key in self.state.mhc:
+            # C++ DoLayersSet writes MHCSettings::correctionGrayscale.enabled — the bit state.get
+            # reports as correction_grayscale.enabled (and initLinear-fills an empty curve).
+            # KNOWN DIVERGENCE kept from Phase 9 T3: the reverse direction (ApplyGrayscalePayload
+            # forcing it true) is NOT mirrored onto this layer flag, because doing so trips DLC's
+            # hardware-readiness neutral audit on the grayscale-wb pause/resume path — whether that
+            # is a real hardware hazard is an owner question (phase-9.md §5a), not guessed here.
+            entry = self.state.mhc[key]
+            cg = entry.get("correction_grayscale")
+            if not isinstance(cg, dict) or not cg.get("points"):
+                cg = entry["correction_grayscale"] = _identity_correction_grayscale(is_hdr)
+            cg["enabled"] = bool(params["grayscale"])
         self.state.layers[key] = cur
         entry = self.state.mhc.get(key) or {}
         regenerated = False
@@ -547,18 +710,35 @@ class MockDesktopLutServer:
 
     def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
         if method == "calibration.status":
-            return self.ok({"active": self.state.calibration_mode is not None, "state": deepcopy(self.state.calibration_mode)})
+            now = time.time()
+            captures = []
+            for mon_s, cap in sorted(self.state.snapshots.items()):
+                view = self._capture_view(mon_s, cap)
+                view["age_s"] = max(0.0, now - float(cap.get("captured_at") or now))
+                captures.append(view)
+            return self.ok({"active": self.state.calibration_mode is not None,
+                            "state": deepcopy(self.state.calibration_mode),
+                            "captures": captures})
         if method == "calibration.enter":
             key = self.key(params)  # C++ ParseMonitorMode: validate monitor index + mode vocabulary
-            # NOTE (fable Phase 9): mirrors a real C++ hazard — DoEnterNeutral snapshots
-            # unconditionally, so a RE-enter while calibration is already active captures the
-            # already-cleared state; a later exit(restore_snapshot=True) then restores that
-            # cleared state, not the user's pre-run setup (single snapshot slot in C++; here the
-            # latest enter's snapshot wins the same way). The preflight settings backup is the
-            # authoritative restore. DesktopLUT-side fix ticketed (keep the ORIGINAL snapshot on
-            # re-enter); DLC surfaces stale calibration mode before entering.
-            snapshot_id = f"snapshot-{len(self.state.snapshots) + 1}"
-            self.state.snapshots[snapshot_id] = self.state.as_dict()
+            mon = int(params["monitor"])
+            mode = str(params["mode"]).upper()
+            # Mirrors the C++ snapshot store (src/calib_snapshot.h): the FIRST capture of a display
+            # wins for the whole session. A RE-enter while the store still holds this monitor — the
+            # crashed-run case, where it is already cleared — keeps the original and only adds the
+            # mode, so exit(restore_snapshot=True) still returns the user's pre-run setup. The store
+            # is NOT dropped on a "fresh" enter (a thrown enter keeps its capture); only exit drops it.
+            cap = self.state.snapshots.get(str(mon))
+            snapshot_retained = cap is not None
+            if cap is not None:
+                if mode not in cap["modes"]:
+                    cap["modes"].append(mode)
+                snapshot_id = str(cap.get("session_id"))
+            else:
+                others = list(self.state.snapshots.values())
+                snapshot_id = (str(others[0].get("session_id")) if others
+                               else f"snapshot-{self.state.command_count}")
+                self.state.snapshots[str(mon)] = self._capture_monitor(mon, mode, snapshot_id)
             self.state.corrections_enabled = False
             # C++ DoEnterNeutral clears ONLY the calibrated mode:monitor pair's layers.
             # Other pairs are preserved — the mock used to clear everything (and old C++
@@ -567,35 +747,64 @@ class MockDesktopLutServer:
             # the 2026-08-14 HDR run lost the user's SDR cube exactly this way.
             self.state.mhc.pop(key, None)
             self.state.runtime.pop(key, None)
-            # C++ clears WB/GS/DG + tonemap for the pair (the snapshot above keeps the user's)
+            # C++ clears WB/GS/DG + tonemap for the pair (the capture above keeps the user's)
             self.state.layers[key] = {n: False for n in self.LAYER_NAMES}
             self.state.calibration_mode = {
                 "active": True,
                 "snapshot_id": snapshot_id,
                 "monitor": params["monitor"],
-                "mode": str(params["mode"]).upper(),
+                "mode": mode,
                 "dummy_icc_path": params["dummy_icc_path"],
                 "reason": params.get("reason", ""),
                 "corrections_reset": True,
             }
-            return self.ok(deepcopy(self.state.calibration_mode))
+            # snapshot_retained / identity_profile are RESULT-only fields: the C++
+            # calibration_mode block in state.get / calibration.status does not carry them.
+            entered = deepcopy(self.state.calibration_mode)
+            entered["snapshot_retained"] = snapshot_retained
+            entered["identity_profile"] = ""
+            return self.ok(entered)
         if method == "calibration.exit":
             # C++ DoExitCalibration runs CleanupActiveGsLive() unconditionally first — an
             # orphaned live-edit preview (client died between begin and commit) is reverted to
             # its pre-begin correction so it can't leak past the run (fable Phase 7a fidelity).
             self._cleanup_active_gs_live()
-            current = deepcopy(self.state.calibration_mode)
             restore = bool(params.get("restore_snapshot", False))
-            if restore and current and current.get("snapshot_id") in self.state.snapshots:
-                snapshot_id = str(current["snapshot_id"])
-                restored = self.restore(snapshot_id)
-                if not restored.ok:
-                    return restored
-                self.state.calibration_mode = None
-                # C++ DoExitCalibration result shape: always {active, restored}.
-                return self.ok({"active": False, "restored": True, "snapshot_id": snapshot_id})
+            restored_monitors: list[dict[str, Any]] = []
+            session_id = None
+            if restore and self.state.snapshots:
+                first = True
+                for mon_s, cap in sorted(self.state.snapshots.items()):
+                    # C++ PlanCalibModeRestore per ENTERED mode, judged before the settings copy:
+                    # reinstall the captured MHC, else swap a live one for the identity profile.
+                    mhc_ops = []
+                    for md in ("SDR", "HDR"):
+                        if md not in (cap.get("modes") or []):
+                            continue
+                        k = f"{mon_s}:{md}"
+                        captured = ((cap.get("pairs") or {}).get(k) or {}).get("mhc") or {}
+                        live_now = self.state.mhc.get(k) or {}
+                        action = ("reinstall" if captured.get("applied")
+                                  else "identity_swap" if live_now.get("profile_name") else "none")
+                        mhc_ops.append({"mode": md, "action": action, "ok": True})
+                    self._restore_monitor(cap)
+                    if first:
+                        self.state.corrections_enabled = bool(cap.get("corrections_enabled", True))
+                        session_id = cap.get("session_id")
+                        first = False
+                    restored_monitors.append({**self._capture_view(mon_s, cap), "mhc": mhc_ops})
+            # The session is over either way — the captures go with it (the C++ always clears the
+            # store), so a later exit(restore) with no session behind it restores NOTHING rather
+            # than a previous run's pre-run state (the 2026-09-27 `3dlut-only --abort` bug).
+            self.state.snapshots = {}
             self.state.calibration_mode = None
-            return self.ok({"active": False, "restored": False})
+            # C++ DoExitCalibration result shape: {active, restored, restored_monitors, unrestored}.
+            # The mock's displays never disconnect, so nothing is ever unrestored here.
+            out: dict[str, Any] = {"active": False, "restored": bool(restored_monitors),
+                                   "restored_monitors": restored_monitors, "unrestored": []}
+            if session_id:
+                out["snapshot_id"] = session_id
+            return self.ok(out)
         return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
 
     def handle_mhc(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
@@ -634,11 +843,8 @@ class MockDesktopLutServer:
                 "peak_nits": params.get("peak_nits"),
             }
         elif method == "mhc.set_correction_grayscale":
-            state["correction_grayscale"] = {
-                "point_count": params.get("point_count"),
-                "points": deepcopy(params.get("points", [])),
-                "deviations": deepcopy(params.get("deviations", {})),
-            }
+            # C++ DoMhcSetGrayscale -> ApplyGrayscalePayload (enabled forced true)
+            state["correction_grayscale"] = _apply_grayscale_payload(state.get("correction_grayscale"), params)
         elif method == "mhc.grayscale_live_begin":
             # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
             # stacks on top of MHC+3D-LUT and is measurable. No bake yet. Mirrors the C++
@@ -662,26 +868,14 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(
                     ok=False, error="no active grayscale live preview (call mhc.grayscale_live_begin first)")
             gs = params.get("grayscale", {})
-            staged = {
-                "point_count": gs.get("point_count"),
-                "points": deepcopy(gs.get("points", [])),
-                "deviations": deepcopy(gs.get("deviations", {})),
-            }
-            # Decomposed editor sliders (C++ ApplyGrayscalePayload): luminance[] is the
-            # common/main slider, rgb{r,g,b} the balance strips; when present they are
-            # authoritative — luminance scales the points curve (what the editor's main
-            # slider shows) and rgb lands on the RGB balance values. Mirror the mapping so
-            # a --simulate run exercises the same editor-visible split as hardware.
-            lum = gs.get("luminance")
-            rgb = gs.get("rgb")
-            n = len(staged["points"])
-            if isinstance(lum, list) and len(lum) == n:
-                staged["luminance"] = deepcopy(lum)
-                staged["editor_points"] = [float(p) * float(v)
-                                           for p, v in zip(staged["points"], lum)]
-            if isinstance(rgb, dict):
-                staged["rgb"] = deepcopy(rgb)
-            state["correction_grayscale"] = staged
+            # C++ DoGrayscaleSetLive -> ApplyGrayscalePayload: the decomposed editor sliders
+            # (luminance[] = the common/main slider, rgb{r,g,b} = the balance strips) are
+            # authoritative when present — luminance scales the STORED points curve (what the
+            # editor's main slider shows) and rgb lands on the deviations. A synthetic panel reads
+            # the curve the way the shader does: channel output = points[i] * deviations[c][i] at
+            # slot input (i/(N-1))**2 (SDR) or i/(N-1) (HDR).
+            state["correction_grayscale"] = _apply_grayscale_payload(
+                state.get("correction_grayscale"), gs if isinstance(gs, dict) else {})
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.
@@ -885,6 +1079,65 @@ class MockDesktopLutServer:
         else:
             return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
         return self.ok({"monitor_mode": key, "runtime": deepcopy(self.state.runtime.get(key, {}))})
+
+
+class LegacySnapshotMockServer(MockDesktopLutServer):
+    """DesktopLUT as it was BEFORE the per-display snapshot store (the deployed builds up to the
+    2026-09-27 fix; C++ ca43c39): so DLC can be pinned against the server users actually run until
+    they update.
+
+    * ONE snapshot slot, overwritten on EVERY ``calibration.enter`` (a re-enter over a crashed run
+      captures the already-cleared display) and NEVER cleared — ``exit(restore_snapshot=True)``
+      restores it whenever one was ever taken, session or not (the ``3dlut-only --abort`` bug);
+    * the slot remembers ONE mode (the last entered);
+    * ``calibration.enter`` has no ``snapshot_retained``; ``calibration.status`` no ``captures``;
+      ``calibration.exit`` answers only ``{active, restored}``;
+    * ``state.get`` has no ``contract_version`` and no mhc ``correction_grayscale``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.legacy_slot: dict[str, Any] | None = None
+
+    def handle(self, command: DesktopLutCommand) -> DesktopLutResponse:
+        response = super().handle(command)
+        if command.method == "state.get" and response.ok and isinstance(response.result, dict):
+            response.result.pop("contract_version", None)
+            for entry in (response.result.get("mhc") or {}).values():
+                if isinstance(entry, dict):
+                    entry.pop("correction_grayscale", None)
+        return response
+
+    def handle_calibration(self, method: str, params: dict[str, Any]) -> DesktopLutResponse:
+        if method == "calibration.status":
+            return self.ok({"active": self.state.calibration_mode is not None,
+                            "state": deepcopy(self.state.calibration_mode)})
+        if method == "calibration.enter":
+            key = self.key(params)
+            mon = int(params["monitor"])
+            mode = str(params["mode"]).upper()
+            self.legacy_slot = self._capture_monitor(mon, mode, "calib-snapshot")   # overwritten, always
+            self.legacy_slot["monitor"] = mon
+            self.state.corrections_enabled = False
+            self.state.mhc.pop(key, None)
+            self.state.runtime.pop(key, None)
+            self.state.layers[key] = {n: False for n in self.LAYER_NAMES}
+            self.state.calibration_mode = {
+                "active": True, "snapshot_id": "calib-snapshot", "monitor": params["monitor"], "mode": mode,
+                "dummy_icc_path": params["dummy_icc_path"], "reason": params.get("reason", ""),
+                "corrections_reset": True,
+            }
+            return self.ok({**deepcopy(self.state.calibration_mode), "identity_profile": ""})
+        if method == "calibration.exit":
+            self._cleanup_active_gs_live()
+            restored = False
+            if bool(params.get("restore_snapshot", False)) and self.legacy_slot is not None:
+                self._restore_monitor(self.legacy_slot)
+                self.state.corrections_enabled = bool(self.legacy_slot.get("corrections_enabled", True))
+                restored = True     # the slot is NOT cleared: the next exit(restore) restores it again
+            self.state.calibration_mode = None
+            return self.ok({"active": False, "restored": restored})
+        return DesktopLutResponse(ok=False, error=f"unknown method: {method}")
 
 
 class MockDesktopLutTransport:
