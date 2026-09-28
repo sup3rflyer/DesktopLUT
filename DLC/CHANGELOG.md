@@ -406,6 +406,16 @@ request, adjudicates ambiguous results on digests, and writes the report.
 - **The DLC ↔ DesktopLUT version check can fire** (2026-09-27; fable Phase 9 T1). DLC checked
   `state.get`'s `contract_version` at preflight, but no DesktopLUT build sent it, so a mismatch
   would still have surfaced as `unknown method` mid-run. DesktopLUT now reports version 1.
+- **SDR 3D LUT no longer mirrors dim primaries from over- to under-saturated** (2026-09-28). The cube's
+  per-node inversion step assumed the panel answers a drive change like the ideal (gain 1). Behind Windows'
+  SDR MHC2 (channels mixed in sRGB-piecewise linear light) a small added off-channel answers at about twice
+  that, so the step overshot by the whole error and cycled with period 2; the odd iteration count shipped the
+  overshoot (PA32UCXR run 133655: red 0.25 went 2.37 → 2.98 ΔE2000, 1250 lattice reversals). The step now
+  measures the model's own gain along it and goes about 1/g of the way (damping only; `OptimizeConfig.inner_step`,
+  SDR default `gain_aware` with 4 iterations, HDR keeps the legacy `fixed_point` until it has its own CV).
+  Offline, run 133655 replayed closed-loop: dim saturated 0.61 → 0.14 ΔE2000, reversals 1190 → 1; held-out
+  CV over the six SDR datasets: all 0.547 → 0.489, dim saturated 0.545 → 0.295, neutral unchanged; BenQ
+  (near-diagonal MHC) unchanged. The digest reports `inner_step` / `inner_iterations`.
 - **The test suite no longer writes into the real `runs/`** (2026-09-24). Every suite run left a
   `runs/<ts>_sdr_x/` folder behind and repointed `runs/active.json` at a pytest tmp run, which
   pulled a live dashboard off an in-progress hardware run. The runs root is now resolved at call

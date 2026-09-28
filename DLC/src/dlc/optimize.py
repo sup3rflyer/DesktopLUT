@@ -77,6 +77,7 @@ __all__ = [
     "sample_cube",
     "seed_correction_budget",
     "optimize_cube",
+    "resolve_inner_step",
     "synthetic_probe",
 ]
 
@@ -157,6 +158,22 @@ class OptimizeConfig:
     smoothing: Optional[float] = None   # None ⇒ per-iteration k-fold CV
     confidence_weighted_rbf: bool = True  # duplicate/skeleton samples lower local RBF smoothing
     n_inner_iterations: int = 3
+    # Inner per-node step of the rbf engine's build_cube (``inner_step``, 2026-09-28, HANDOFF §0 A9):
+    # "fixed_point" = the legacy s ← ideal⁻¹(T − δ(s)), which assumes the panel answers a drive change at gain 1
+    # and cycles once the gain reaches 2; "gain_aware" = the same step damped by the model's own gain along it
+    # (a secant; damping only — g ≤ 1 keeps the full step). ``None`` ⇒ the MODE default: "gain_aware" on a
+    # power-law (SDR) target — behind the Windows SDR MHC2 (channels mixed in sRGB-piecewise light) off-channel
+    # corrections answer at g ≈ 2 (PA32UCXR run 133655: HW median 1.94; the shipped odd-n iterate mirrored the
+    # dim primaries' over-saturation into desaturation, 1250 large reversals) — and "fixed_point" on PQ (HDR
+    # 132412: g ≈ 0.84, converges) until HDR has its own CV. rbf engine only.
+    inner_step: Optional[Literal["fixed_point", "gain_aware"]] = None
+    # gain_aware's iteration count (fixed_point keeps n_inner_iterations). From the data, not a target: the
+    # smallest n after which one more iteration moves the model-predicted ΔE2000 of the run's own patches by no
+    # more than the meter's same-code re-read spread on that panel. n 4→5: max 0.013 / 0.019 / 0.012 on PA
+    # 133655 / PA June 214429 / BenQ 225451 vs re-read median 0.012 / 0.034 / 0.026 (p90 0.076 / 0.222 / 0.095)
+    # — one PA patch sits at the median, none beyond; n 3→4 still moved 19 / 6 / 0 patches past it (max 0.029 /
+    # 0.048 / 0.021). results/_replays/2026-09-28_gain_step/s1b_iteration_count_v3.out.
+    n_inner_iterations_gain_aware: int = 4
     fade_width: float = 0.05
     near_black_nits: float = 0.1
     # Exact-code probe reuse: the display is driven at integer CODE values (the probe rounds each driven
@@ -489,6 +506,15 @@ def _adaptive_probe_indices(verify: np.ndarray, scores: np.ndarray, *, iteration
     return selected, "focused" if iteration == 1 else "widened"
 
 
+def resolve_inner_step(cfg: "OptimizeConfig", target: Target) -> tuple[str, int]:
+    """``(inner_step, n_iterations)`` the rbf engine's build_cube runs with: the pinned
+    ``cfg.inner_step``, else the mode default (``"gain_aware"`` on a power-law/SDR target,
+    ``"fixed_point"`` on PQ/HDR) — see :attr:`OptimizeConfig.inner_step`."""
+    step = cfg.inner_step or ("fixed_point" if getattr(target, "transfer", None) == "pq" else "gain_aware")
+    n = cfg.n_inner_iterations_gain_aware if step == "gain_aware" else cfg.n_inner_iterations
+    return step, int(n)
+
+
 def optimize_cube(
     *,
     target: Target,
@@ -547,6 +573,7 @@ def optimize_cube(
     space = TargetSpace(target, reachable_primaries=reachable_primaries)
     projection = (cfg.oog_solve == "projection" and reachable_primaries is not None
                   and cfg.engine == "rbf")
+    inner_step, inner_iterations = resolve_inner_step(cfg, target)
 
     raw_train_count = int(np.asarray(signals).reshape(-1, 3).shape[0])
     train_signals = np.asarray(signals, dtype=float).reshape(-1, 3)
@@ -694,10 +721,10 @@ def optimize_cube(
         cube = build_cube(
             model, cfg.grid_size, signal_points=train_signals,
             fade_width=cfg.fade_width, max_correction=budget,
-            n_iterations=cfg.n_inner_iterations, near_black_nits=cfg.near_black_nits,
+            n_iterations=inner_iterations, near_black_nits=cfg.near_black_nits,
             neutral_band=cfg.neutral_band, hold_above=hold_top,
             best_iterate=cfg.best_iterate_oog, best_iterate_margin=cfg.best_iterate_margin,
-            oog_solve=cfg.oog_solve,
+            oog_solve=cfg.oog_solve, inner_step=inner_step,
         )
         return model, cube, None, None
 
@@ -1014,6 +1041,9 @@ def optimize_cube(
         "top_held_nodes": int(np.sum(~in_range)),
         "nodes_at_budget_cap": nodes_at_cap,
         "oog_solve": cfg.oog_solve if reachable_primaries is not None else None,
+        # The inversion's per-node step (OptimizeConfig.inner_step) — rbf engine only.
+        "inner_step": inner_step if cfg.engine == "rbf" else None,
+        "inner_iterations": inner_iterations if cfg.engine == "rbf" else None,
         "grid_size": cfg.grid_size,
         "threshold": cfg.threshold,
         "max_correction": round(best_budget, 4),
