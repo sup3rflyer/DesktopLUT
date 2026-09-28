@@ -980,3 +980,164 @@ def test_dead_meter_stops_the_preheat_soak_fast_with_the_error_surfaced(tmp_path
     assert not any(e.event == "meter_restarted" for e in events)   # no respawn ever came up
     assert failed[0].data["respawn_attempts"] == 3
     drv.close()
+
+
+# ---------------------------------------------------------------------------
+# Timeout resync: a late result must never be returned for the NEXT patch
+# ---------------------------------------------------------------------------
+
+class SerialFakeSpotread(FakeSpotread):
+    """Models real spotread's ordering: triggers are served ONE AT A TIME, in order — trigger k's
+    measurement takes ``durations.get(k, fast)`` seconds and only then is result k (X = 95 + k)
+    printed, and the next queued trigger starts. ``swallow`` = triggers consumed without ever
+    producing a result (a lost / misread trigger)."""
+
+    def __init__(self, *, durations: dict[int, float] | None = None, fast: float = 0.02,
+                 swallow: frozenset[int] = frozenset()) -> None:
+        super().__init__()
+        self._durations = dict(durations or {})
+        self._fast = fast
+        self._swallow = swallow
+        self._queue: list[int] = []
+        self._qcv = threading.Condition()
+        self._worker = threading.Thread(target=self._serve, daemon=True)
+        self._worker.start()
+
+    def _drain_lines(self) -> None:
+        while True:
+            with self._cv:
+                idx = self._in.find(b"\n")
+                if idx == -1:
+                    return
+                line = bytes(self._in[:idx])
+                del self._in[: idx + 1]
+            if line.strip().lower() == b"q":
+                self._emit(b"\nSpot read stopped\n")
+                self._close()
+                with self._qcv:
+                    self._qcv.notify_all()
+                return
+            self._count += 1
+            with self._qcv:
+                self._queue.append(self._count)
+                self._qcv.notify_all()
+
+    def _serve(self) -> None:
+        while True:
+            with self._qcv:
+                while not self._queue and not self._closed:
+                    self._qcv.wait(timeout=0.5)
+                if self._closed:
+                    return
+                k = self._queue.pop(0)
+            time.sleep(self._durations.get(k, self._fast))
+            if self._closed:
+                return
+            if k in self._swallow:
+                continue
+            self._emit((" Result is XYZ: %f %f %f, Yxy: %f 0.312700 0.329000\n"
+                        "and hit any key to take a reading: " % (95.0 + k, 100.0, 108.0, 100.0)).encode("ascii"))
+
+
+def test_late_result_after_a_timeout_is_never_returned_for_the_next_patch():
+    # Trigger 1's measurement outlasts the read timeout: its result lands AFTER measure() #2 has
+    # drained and triggered — without a resync #2 would return reading 1, #3 reading 2, ... (the
+    # off-by-one persists across back-to-back re-reads). With the resync every call gets its own.
+    fake = SerialFakeSpotread(durations={1: 0.6})
+    drv = _driver(fake, read_timeout=0.3)
+    drv.start()
+    first = drv.measure()
+    assert not first.ok and "timed out" in (first.error or "")
+    got = [drv.measure() for _ in range(3)]
+    assert all(r.ok for r in got)
+    assert [r.xyz[0] for r in got] == [97.0, 98.0, 99.0]      # readings 2, 3, 4 — never the late 1
+    assert drv.timeouts == 1 and drv.late_discarded == 1 and drv.resync_restarts == 0
+    s = drv.summary()
+    assert s["timeouts"] == 1 and s["late_discarded"] == 1 and s["stale_discarded"] == 0
+    drv.close()
+
+
+def test_owed_result_that_never_arrives_forces_a_fresh_process():
+    # The timed-out trigger was swallowed (no result will EVER come for it). Waiting cannot resync a
+    # stream that is off by one, so the driver respawns — a fresh process owes nothing — and the next
+    # patch is read by the new process.
+    factory = _SequencedFactory(lambda: SerialFakeSpotread(swallow=frozenset({1})), SerialFakeSpotread)
+    drv = _healing(factory, read_timeout=0.3, resync_timeout=0.3)
+    drv.start()
+    assert not drv.measure().ok                                 # trigger 1 swallowed → timeout
+    res = drv.measure()
+    assert res.ok and abs(res.xyz[0] - 96.0) < 1e-6            # the NEW process's first reading
+    assert drv.resync_restarts == 1 and drv.restarts == 1 and factory.calls == 2
+    again = drv.measure()
+    assert again.ok and abs(again.xyz[0] - 97.0) < 1e-6
+    drv.close()
+
+
+def test_unrecoverable_desync_fails_loudly_instead_of_misattributing():
+    # Owed result never arrives AND the self-heal budget is spent: fail (meter down), never guess.
+    fake = SerialFakeSpotread(swallow=frozenset({1}))
+    drv = _driver(fake, read_timeout=0.2, resync_timeout=0.2, restart_budget=0)
+    drv.start()
+    assert not drv.measure().ok
+    res = drv.measure()
+    assert not res.ok and res.fault == "self_heal_exhausted"
+    assert "out of sync" in (res.error or "")
+    drv.close()
+
+
+def test_spot_read_failed_line_is_the_triggers_outcome_not_a_timeout():
+    # spotread consumes the trigger and prints "Spot read failed …" with no Result line: that IS the
+    # trigger's outcome — returned at once (not after the read timeout) and nothing is left owed.
+    def responder(n):
+        if n == 1:
+            return b"\nSpot read failed due to misread (Instrument misread)\nand hit any key to take a reading: "
+        return _result_line(80.0 + n, 100.0, 108.0)
+    drv = _driver(FakeSpotread(responder=responder), read_timeout=5.0)
+    drv.start()
+    t0 = time.monotonic()
+    first = drv.measure()
+    assert not first.ok and "Spot read failed" in (first.error or "") and first.fault is None
+    assert time.monotonic() - t0 < 2.0
+    second = drv.measure()
+    assert second.ok and abs(second.xyz[0] - 82.0) < 1e-6
+    assert drv.timeouts == 0 and drv.resync_restarts == 0
+    drv.close()
+
+
+def test_exhausted_resync_leaves_later_reads_failing_fast():
+    fake = SerialFakeSpotread(swallow=frozenset({1}))
+    drv = _driver(fake, read_timeout=0.3, resync_timeout=0.3, restart_budget=0)
+    drv.start()
+    assert not drv.measure().ok                                   # timeout, result owed
+    assert drv.measure().fault == "self_heal_exhausted"           # out of sync: process stopped
+    t0 = time.monotonic()
+    later = drv.measure()
+    assert later.fault == "self_heal_exhausted" and time.monotonic() - t0 < 0.2   # no re-wait
+    assert drv.deaths == 0                                        # a deliberate stop is not a death
+    drv.close()
+
+
+def test_composer_reports_a_resync_respawn_without_a_stale_death_tail():
+    from dlc.engine.patches import Transfer, to_signal
+    from dlc.measure_loop import MeasurePatch, make_persistent_spotread_meter
+
+    class _Presenter:
+        def show(self, patch):
+            pass
+
+        def close(self):
+            pass
+
+    t = Transfer.power(gamma=2.2, peak_nits=120.0, bit_depth=10)
+    cv = (511, 511, 511)
+    patch = MeasurePatch(label="p0", rgb=cv, signal=to_signal([cv], t)[0])
+    # an earlier, unrelated death leaves a tail behind; then a swallowed trigger forces a resync respawn
+    factory = _SequencedFactory(_dead_on_arrival, lambda: SerialFakeSpotread(swallow=frozenset({1})),
+                                SerialFakeSpotread)
+    drv = _healing(factory, read_timeout=0.3, resync_timeout=0.3)
+    meter = make_persistent_spotread_meter(presenter=_Presenter(), persistent=drv)
+    assert not meter(patch).ok                                    # death healed, then trigger 1 swallowed
+    reading = meter(patch)
+    assert reading.ok and reading.raw["meter_restart_reason"] == "resync"
+    assert reading.raw["meter_restarts"] == 1 and "meter_death_tail" not in reading.raw
+    drv.close()

@@ -48,7 +48,7 @@ from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, ContextManager, Optional, Protocol, Sequence
+from typing import Any, Callable, ContextManager, Mapping, Optional, Protocol, Sequence
 
 from .checkin import (MILESTONE_DEDUPE_FRAC, MILESTONE_DEDUPE_INTERVAL_FRAC, MILESTONE_STEP,
                       CheckinWindow, window_evidence)
@@ -57,6 +57,7 @@ from .drift import CHANNELS, Channel, coldest_channel_from_xyz, evaluate_drift, 
 from .engine.patches import Patch, Transfer, to_signal
 from .events import EventWriter, RunLog
 from .liveness import Liveness, MeterDown
+from .meter_quantum import CountQuantum, learn_count_quantum, level_count_quantised, validate_count_quantum
 from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 from .reference_states import ReferenceStates, reference_shift_impact
 
@@ -355,6 +356,10 @@ class AcceptedRead:
     # describe the same set of reads, else an appended re-measure divides a single-round σ by an inflated
     # n, understating noise and OVER-trusting the dark correction the gate exists to suppress.
     noise_reads: Optional[int] = None
+    # The individual reads of THIS round (the same set ``chroma_sigma`` describes): the count-lattice
+    # test is per READ (a mean of counted reads is generally not on the lattice), so the sidecar needs
+    # them to decide whether this level was frequency-counted (dlc.meter_quantum).
+    round_reads: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass
@@ -442,7 +447,16 @@ def read_noise_sidecar(ti3_path: Path) -> list[tuple[float, Optional[float]]]:
     as reads accumulate, so more readings → tighter → more trust. An ``unstable`` level (the loop
     couldn't pin it after many reads = genuine fluctuation, not averageable) returns ``+inf`` ⇒ never
     trust it. ``<2`` reads ⇒ ``None`` (no spread; trust the adaptive integration). Empty list when no
-    sidecar / unreadable."""
+    sidecar / unreadable.
+
+    **Count floor.** A level whose reads were all frequency-counted (``count_quantised`` — every read
+    on the session's i1d3 count lattice, :mod:`dlc.meter_quantum`) is floored at its count-quantum
+    chromaticity σ (``count_sigma_xy``): its reads cannot resolve below one count, so bit-identical
+    reads there (σ = 0) are a resolution statement, not proof of zero noise. Like the print floor it
+    is NOT divided by √reads (the quantisation is common to every read). Every consumer of the
+    trust-noise (the build's dark floor + per-level trust, the closed-loop refine trust, the refine
+    convergence judge's meter floor) inherits it from here. Period-measured levels (below ~15 nit)
+    carry no count term."""
     p = noise_sidecar_path(ti3_path)
     if not p.exists():
         return []
@@ -464,6 +478,12 @@ def read_noise_sidecar(ti3_path: Path) -> list[tuple[float, Optional[float]]]:
             sg = v.get("chroma_sigma")
             n = v.get("reads") or 0          # reads behind THIS σ (per-round), not lifetime reads_taken
             noise = (sg / math.sqrt(n)) if (sg is not None and n >= 2) else None
+            cs = v.get("count_sigma_xy") if v.get("count_quantised") else None
+            if noise is not None and cs is not None:
+                try:
+                    noise = max(noise, float(cs))
+                except (TypeError, ValueError):
+                    pass
         out.append((lvl, noise))
     out.sort(key=lambda e: e[0])
     return out
@@ -475,7 +495,13 @@ def read_noise_sidecar_spread(ti3_path: Path) -> list[tuple[float, tuple[Optiona
     count behind it, for the dark floor's single-read noise bound and monotone noise floor
     (``build_mhc`` → ``mhc_cube.adaptive_dark_floor``). Recorded for ``unstable`` levels too (their
     measured scatter). σ ``None`` for <2 reads. Match with :func:`match_level_noise` (the value is
-    the ``(σ, reads)`` pair). Empty when absent."""
+    the ``(σ, reads)`` pair). Empty when absent.
+
+    Deliberately RAW — no count floor: this σ feeds :func:`mhc_cube.monotone_noise_floor`, which floors
+    each level at its nearest BRIGHTER neighbour's σ. A frequency-mode count quantum is a resolution
+    limit of the counted regime only; letting it propagate to the period-measured level just below
+    the ~15 nit boundary would claim noise that level never showed (the count floor reaches the
+    consumers through :func:`read_noise_sidecar`'s SE instead, per level)."""
     p = noise_sidecar_path(ti3_path)
     if not p.exists():
         return []
@@ -512,19 +538,121 @@ def match_level_noise(entries: Sequence[tuple[float, Optional[float]]], level: f
     return best
 
 
-def _write_noise_sidecar(ti3_path: Path, accepted: Sequence[AcceptedRead]) -> None:
+def load_sibling_count_quanta(ti3_path: Path) -> list[tuple[str, CountQuantum]]:
+    """Count lattices LEARNED by earlier sessions of this run (the other ``*.ti3.noise.json`` beside
+    ``ti3_path``), newest first — the fallback for a session too thin to learn its own (a refine round
+    of ~40 reads, a single-read verify). Only self-learned blocks are offered (never an adopted one:
+    no chains); each must still validate on the adopting session's own reads."""
+    out: list[tuple[float, str, CountQuantum]] = []
+    own = noise_sidecar_path(ti3_path).name
+    try:
+        siblings = list(Path(ti3_path).parent.glob("*.ti3.noise.json"))
+    except OSError:
+        return []
+    for sp in siblings:
+        if sp.name == own:
+            continue
+        try:
+            block = (json.loads(sp.read_text(encoding="utf-8")) or {}).get("count_quantum") or {}
+            mtime = sp.stat().st_mtime
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(block, dict) or block.get("status") != "learned":
+            continue
+        q = CountQuantum.from_dict(block, source=f"sibling:{sp.name[:-len('.noise.json')]}")
+        if q is not None:
+            out.append((mtime, sp.name, q))
+    out.sort(key=lambda t: -t[0])
+    return [(name, q) for _t, name, q in out]
+
+
+def _lattice_det(q: CountQuantum) -> float:
+    (a, b, c), (d, e, f), (g, h, i) = q.steps
+    return abs(a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g))
+
+
+def select_count_quantum(read_groups: Sequence[Sequence[Any]],
+                         siblings: Sequence[tuple[str, CountQuantum]] = ()
+                         ) -> tuple[Optional[CountQuantum], dict[str, Any]]:
+    """The session's count lattice: learned from its own reads
+    (:func:`dlc.meter_quantum.learn_count_quantum`) and/or an earlier session's, each VALIDATED on this
+    session's reads (integer counts beyond chance). Among the valid candidates the one putting the most
+    patches on its lattice wins (ties → the finer lattice: a thin session can learn a coarse SUB-lattice
+    of the true one, which its sibling beats). Returns ``(quantum or None, block)`` — ``block`` is the
+    sidecar's ``count_quantum`` evidence: ``status`` ``learned`` / ``adopted`` / ``none`` (+ ``reason``:
+    the count term is then SKIPPED for this session — the consumers keep the print floor), ``source``,
+    ``steps``, ``min_counted_nits`` (this session's dimmest proven-counted read) and the numbers behind
+    the choice."""
+    groups = [list(g) for g in read_groups]
+    learned, lev = learn_count_quantum(groups)
+    cands: list[tuple[tuple[int, float, int], CountQuantum, dict[str, Any]]] = []
+    if learned is not None:
+        cands.append(((int(lev.get("patches_on_lattice") or 0), -_lattice_det(learned), 1), learned, lev))
+    tried: list[dict[str, Any]] = []
+    for name, sq in siblings:
+        source = sq.source if sq.source.startswith("sibling:") else f"sibling:{name}"
+        ok, vev = validate_count_quantum(sq, groups, hypotheses=max(1, len(siblings)))
+        tried.append({"source": source, "valid": ok, "patches_on_lattice": vev.get("patches_on_lattice"),
+                      "log10_p_chance": vev.get("log10_p_chance")})
+        if ok and vev.get("min_counted_nits") is not None:
+            q = CountQuantum(steps=sq.steps, min_counted_nits=float(vev["min_counted_nits"]), source=source)
+            cands.append(((int(vev.get("patches_on_lattice") or 0), -_lattice_det(q), 0), q, vev))
+    block: dict[str, Any] = {"learn": lev}
+    if tried:
+        block["siblings"] = tried
+    if not cands:
+        reason = ("no count lattice in this session's reads (" + str(lev.get("reason")) + ")"
+                  + (" and no earlier session's lattice validates" if tried else "")
+                  + " - count term skipped; levels keep the print floor")
+        return None, {"status": "none", "reason": reason, **block}
+    # Most patches on the lattice; among those the finest lattice (|det| within 1 % = the same
+    # lattice up to fit noise, not a reason to prefer one copy); then this session's own over a sibling.
+    top = max(c[0][0] for c in cands)
+    tied = [c for c in cands if c[0][0] == top]
+    finest = min(-c[0][1] for c in tied)
+    tied = [c for c in tied if -c[0][1] <= finest * 1.01]
+    key, q, ev = max(tied, key=lambda c: c[0][2])
+    return q, {"status": "learned" if key[2] else "adopted", **q.as_dict(),
+               "patches_on_lattice": ev.get("patches_on_lattice"),
+               "log10_p_chance": ev.get("log10_p_chance"), **block}
+
+
+def _annotate_count_levels(by_level: dict[str, dict[str, Any]],
+                           level_reads: Mapping[str, Sequence[Sequence[float]]],
+                           quantum: Optional[CountQuantum]) -> None:
+    """Per neutral level: ``count_quantised`` (EVERY read of the round on the lattice — all channels
+    frequency-counted) and, if so, ``count_sigma_xy`` (the count-quantum xy σ at the round's mean)."""
+    for key, entry in by_level.items():
+        reads = [(float(r[0]), float(r[1]), float(r[2])) for r in (level_reads.get(key) or ())]
+        quantised = level_count_quantised(reads, quantum)
+        entry["count_quantised"] = bool(quantised)
+        if quantised and quantum is not None:
+            entry["count_sigma_xy"] = float(f"{quantum.xy_sigma(_mean_xyz(reads)):.4g}")
+        else:
+            entry.pop("count_sigma_xy", None)
+
+
+def _write_noise_sidecar(ti3_path: Path, accepted: Sequence[AcceptedRead], *,
+                         count_quantum: Optional[CountQuantum] = None,
+                         count_block: Optional[Mapping[str, Any]] = None) -> None:
     """Persist per-NEUTRAL-LEVEL measured repeatability (chroma σ + SE + reads) beside the ``.ti3``,
     keyed by gray level (signal). Consumed by ``build_mhc`` → ``mhc_cube.dark_trust_weights`` to
-    decide how much to smooth each dark level's correction to identity. No file when nothing has
-    ≥2 reads (single-read run ⇒ no spread ⇒ the trust gate simply isn't engaged)."""
+    decide how much to smooth each dark level's correction to identity. ``chroma_sigma`` stays the
+    RAW measured spread; the session's count lattice (``count_block``, :func:`select_count_quantum`)
+    adds, per level, whether its reads were count-quantised and that level's count-quantum σ — the
+    floor :func:`read_noise_sidecar` applies. No file when nothing has ≥2 reads AND no lattice was
+    learned (single-read run ⇒ no spread ⇒ the trust gate simply isn't engaged; a learned lattice is
+    still written so later sessions of the run can adopt it)."""
     by_level: dict[str, dict[str, Any]] = {}
+    level_reads: dict[str, Sequence[Sequence[float]]] = {}
     for r in accepted:
         if not r.usable or r.chroma_sigma is None:
             continue
         s = r.patch.signal
         if not (abs(s[0] - s[1]) < 1e-6 and abs(s[1] - s[2]) < 1e-6):
             continue                       # neutral gray levels only (the cube's neutral axis)
-        by_level[f"{s[0]:.6f}"] = {
+        key = f"{s[0]:.6f}"
+        by_level[key] = {
             "chroma_sigma": round(r.chroma_sigma, 6),
             "se_de": (round(r.se_de, 4) if r.se_de is not None else None),
             # The read count that PRODUCED chroma_sigma (this round), so the consumer's σ/√n is the SE
@@ -532,10 +660,82 @@ def _write_noise_sidecar(ti3_path: Path, accepted: Sequence[AcceptedRead]) -> No
             "reads": (r.noise_reads if r.noise_reads is not None else r.reads_taken),
             "unstable": bool(r.unstable),
         }
-    if not by_level:
+        level_reads[key] = r.round_reads
+    learned = bool(count_block) and (count_block or {}).get("status") == "learned"
+    if not by_level and not learned:
         return
-    noise_sidecar_path(ti3_path).write_text(
-        json.dumps({"schema": 1, "by_level": by_level}, indent=2), encoding="utf-8")
+    payload: dict[str, Any] = {"schema": 1, "by_level": by_level}
+    if count_block:
+        _annotate_count_levels(by_level, level_reads, count_quantum)
+        payload = {"schema": 2, "count_quantum": dict(count_block), "by_level": by_level}
+    noise_sidecar_path(ti3_path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def backfill_count_floor(ti3_path: Path, ndjson_path: Optional[Path] = None) -> dict[str, Any]:
+    """Re-derive a RECORDED session's count lattice + per-level count floor into its existing
+    ``<ti3>.noise.json`` from the session's per-read log (``ndjson_path``, default
+    ``<ti3 stem>.ndjson``) — the same :func:`select_count_quantum` / per-level test the live loop runs,
+    so an older run can be replayed under the count floor. Reads are grouped by presented stimulus
+    (rgb) as the loop's presentation funnel groups them (every read with an XYZ, drift-ref reads
+    included); each neutral level's reads are its LAST round (the reads the recorded ``chroma_sigma``
+    describes), taken from the last patch in patch order when two patches share a level. Earlier sessions' sidecars in the same directory are offered
+    as siblings (back-fill a run in chronological order). The recorded ``se_de`` is left as recorded.
+    Returns the ``count_quantum`` block."""
+    ti3_path = Path(ti3_path)
+    nd = Path(ndjson_path) if ndjson_path else ti3_path.with_suffix(".ndjson")
+    groups: dict[tuple, list[tuple[float, float, float]]] = {}
+    rounds: dict[str, list[tuple[float, float, float]]] = {}
+    pending: dict[str, list[tuple[float, float, float]]] = {}
+    last_round: dict[str, list[tuple[float, float, float]]] = {}
+    level_of: dict[str, str] = {}
+    for line in nd.read_text(encoding="utf-8").splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or "seq" not in rec:
+            continue
+        xyz = rec.get("xyz")
+        v = (float(xyz[0]), float(xyz[1]), float(xyz[2])) if xyz else None
+        if v is not None and rec.get("ok") is not False:
+            groups.setdefault(tuple(rec.get("rgb") or ()), []).append(v)   # the loop's _read funnel
+        sig = rec.get("signal") or ()
+        if (rec.get("accepted") and len(sig) == 3
+                and abs(sig[0] - sig[1]) < 1e-6 and abs(sig[1] - sig[2]) < 1e-6):
+            label = str(rec.get("label"))
+            level_of[label] = f"{float(sig[0]):.6f}"
+            if int(rec.get("read_index") or 0) == 0:
+                # a new round of this patch starts; the previous one stands if it had any read
+                # (measure_patch keeps the prior accepted value when a round yields nothing usable)
+                if pending.get(label):
+                    last_round[label] = pending[label]
+                pending[label] = []
+            if v is not None:                      # measure_patch keeps every read with an XYZ
+                pending.setdefault(label, []).append(v)
+    for label, reads in pending.items():
+        if reads:
+            last_round[label] = reads
+    # Two patches can share a neutral level (a bookend, a re-measured twin): the live sidecar keeps
+    # the one LAST in patch order (ordered_accepted sorts by the patch index behind the pNNNN label).
+    def _patch_order(label: str) -> tuple[int, str]:
+        digits = "".join(ch for ch in label if ch.isdigit())
+        return (int(digits) if digits else -1, label)
+
+    for label in sorted(last_round, key=_patch_order):
+        rounds[level_of[label]] = last_round[label]
+    p = noise_sidecar_path(ti3_path)
+    try:
+        data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    by_level = (data or {}).get("by_level") or {}
+    q, block = select_count_quantum(list(groups.values()), load_sibling_count_quanta(ti3_path))
+    if not by_level and block.get("status") != "learned":
+        return block
+    _annotate_count_levels(by_level, rounds, q)
+    p.write_text(json.dumps({"schema": 2, "count_quantum": block, "by_level": by_level}, indent=2),
+                 encoding="utf-8")
+    return block
 
 
 def write_ti3(
@@ -680,6 +880,11 @@ class _Loop:
         # absent, the loop falls back to the single-read default (trust the instrument's
         # adaptive integration) — variance-based SNR/abnormality needs a DIP to know σ.
         self.dip = dip
+        # The meter's COUNT lattice (i1d3 frequency mode, dlc.meter_quantum): every usable read by
+        # presented stimulus — learned from at the END of the session (finalize_count_quantum), never
+        # in the read path — and the lattice then adopted (floors the recorded per-patch SE + sidecar).
+        self._reads_by_rgb: dict[tuple[int, ...], list[tuple[float, float, float]]] = {}
+        self.count_quantum: Optional[CountQuantum] = None
         # §12 wall-clock backstop for the in-measure check-in (emit-only) — see _maybe_checkin.
         # The window is the orchestrator's (shared with its stage/optimizer/refine packets) so a
         # packet from either side resets the cadence for both; standalone use gets its own. A
@@ -829,7 +1034,11 @@ class _Loop:
                 restarts_total=self.meter_restarts, read_ok=bool(reading.ok),
                 death_exit_code=raw.get("meter_death_exit_code"),
                 death_tail=raw.get("meter_death_tail"),
-                message=("spotread had died and was respawned by the meter's bounded self-heal"
+                restart_reason=raw.get("meter_restart_reason"),
+                message=(("a timed-out reading never arrived, so the out-of-sync spotread was stopped "
+                          "and respawned (no late reading can be attributed to a later patch)"
+                          if raw.get("meter_restart_reason") == "resync" else
+                          "spotread had died and was respawned by the meter's bounded self-heal")
                          + ("; the reading after the respawn is valid" if reading.ok else "")))
         if reading.xyz is not None:
             # The instrument produced data (even a warning-demoted read) → the meter is alive.
@@ -856,7 +1065,9 @@ class _Loop:
         if not (terminal or streak_trip) or self.meter_down:
             return
         error = reading.error or "meter read failed (no error text)"
-        reason = ("meter self-heal exhausted (the dead spotread could not be respawned)"
+        reason = (("meter self-heal exhausted (the out-of-sync spotread could not be respawned)"
+                   if raw.get("meter_restart_reason") == "resync" else
+                   "meter self-heal exhausted (the dead spotread could not be respawned)")
                   if terminal else
                   f"{self._meter_fault_streak} consecutive meter-process faults")
         self.meter_down = True
@@ -1089,7 +1300,16 @@ class _Loop:
         ignored by synthetic measure fns) and read. Returns ``(reading, bump_s)``."""
         bump = self._jump_settle_bump(patch)
         presented = replace(patch, settle_bump_s=bump) if bump > 0.0 else patch
-        return self.measure(presented), bump
+        reading = self.measure(presented)
+        if reading.ok and reading.xyz is not None:
+            # Every read of the session by presented stimulus — measurement reads AND the drift-ref
+            # reads (which bypass _read) — for the count-lattice learner (finalize_count_quantum).
+            try:
+                self._reads_by_rgb.setdefault(tuple(patch.rgb), []).append(
+                    (float(reading.xyz[0]), float(reading.xyz[1]), float(reading.xyz[2])))
+            except (TypeError, ValueError, IndexError):
+                pass
+        return reading, bump
 
     def _read(
         self,
@@ -1207,6 +1427,46 @@ class _Loop:
         thr = max(self.cfg.outlier_floor_de, self.cfg.outlier_factor * (spread or 0.0))
         inliers = [r for r in reads if _agreement_de(r, med, white) <= thr] or list(reads)
         return (_mean_xyz(inliers), self._sample_se_de(inliers), len(inliers), n - len(inliers))
+
+    def _se_count_floor(self, reads: Sequence[tuple[float, float, float]],
+                        quantum: Optional[CountQuantum]) -> float:
+        """ΔE2000 SE floor of one count per channel at these reads' mean — ``√(Σ_j ΔE(q_j)²/12)``
+        (each channel's count error uniform over one count, independent; the same Lab anchor as
+        :meth:`_sample_se_de`). 0 unless EVERY read is on the lattice: a period-measured read is
+        near-continuous and carries no count floor."""
+        q = quantum
+        if q is None or len(reads) < 2 or not level_count_quantised(reads, q):
+            return 0.0
+        mean = _mean_xyz(reads)
+        white = self.white_xyz or mean
+        var = sum(_agreement_de(mean, (mean[0] + st[0], mean[1] + st[1], mean[2] + st[2]), white) ** 2
+                  for st in q.steps)
+        return math.sqrt(var / 12.0)
+
+    def finalize_count_quantum(self, siblings: Sequence[tuple[str, CountQuantum]] = ()
+                               ) -> tuple[Optional[CountQuantum], dict[str, Any]]:
+        """The session's count lattice from ALL its reads (:func:`select_count_quantum`, with earlier
+        sessions' lattices as validated fallbacks), adopted for the sidecar — and the CONSUMER-side SE
+        floor: every accepted record's ``se_de`` (the digest / sidecar / anomaly-verdict evidence) is
+        floored at one count (:meth:`_se_count_floor`) where its round's reads were all counted, so
+        bit-identical counted reads report the meter's resolution instead of 0.
+
+        The loop's own decisions never see the floor — the stop / dark early-stop rules compare the
+        RAW SE (:meth:`_sample_se_de`) to ``read_tolerance_de`` as before. That is by construction,
+        not by margin: one count can exceed 0.2 ΔE2000 near the ~15 nit counting threshold on a dim
+        SDR white (recorded max 0.16 at 32 nit / 120 nit white), and a floored SE above the tolerance
+        would keep a resolution-limited patch reading until it is flagged abnormal. Outlier rejection
+        runs on the spread (floored at ``outlier_floor_de``), never on this SE."""
+        try:
+            q, block = select_count_quantum(list(self._reads_by_rgb.values()), siblings)
+        except Exception as exc:  # noqa: BLE001 - the sidecar must still be written
+            return None, {"status": "none", "reason": f"lattice selection failed: {type(exc).__name__}: {exc}"}
+        self.count_quantum = q
+        if q is not None:
+            for rec in self.accepted.values():
+                if rec.se_de is not None and len(rec.round_reads) >= 2:
+                    rec.se_de = max(rec.se_de, self._se_count_floor(rec.round_reads, q))
+        return q, block
 
     # -- warm-up-settle ----------------------------------------------------
 
@@ -1949,7 +2209,7 @@ class _Loop:
                 reads_taken=read_index, immediate_remeasures=immediate,
                 unstable=unstable, usable=usable, note=note,
                 se_de=accepted_se, chroma_sigma=accepted_chroma_sigma,
-                noise_reads=read_index,
+                noise_reads=read_index, round_reads=tuple(reads),
             )
             self.accepted[patch.label] = record
         elif not round_usable and record.usable:
@@ -1975,6 +2235,7 @@ class _Loop:
             record.se_de = accepted_se
             record.chroma_sigma = accepted_chroma_sigma
             record.noise_reads = read_index
+            record.round_reads = tuple(reads)
         if round_usable:
             self._check_read_integrity(patch, accepted_xyz)
         return record
@@ -2707,12 +2968,16 @@ def run_measure_loop(
             raise   # not this loop's latch — never swallow someone else's abort
     preheat_compromised = bool(preheat_digest and preheat_digest.get("compromised"))
 
+    # The meter's count lattice: learned from this session's reads, else an EARLIER session of this
+    # run's (validated on these reads) — floors the recorded SE and the sidecar's per-level noise.
+    count_quantum, count_block = loop.finalize_count_quantum(
+        load_sibling_count_quanta(Path(ti3_path)) if ti3_path is not None else ())
     accepted = loop.ordered_accepted()
     written_ti3: Optional[str] = None
     if ti3_path is not None and accepted:
         write_ti3(ti3_path, accepted)
         written_ti3 = str(ti3_path)
-        _write_noise_sidecar(ti3_path, accepted)
+        _write_noise_sidecar(ti3_path, accepted, count_quantum=count_quantum, count_block=count_block)
 
     immediate = sum(r.immediate_remeasures for r in accepted)
     appended = sum(r.appended_remeasures for r in accepted)
@@ -2922,6 +3187,11 @@ def run_measure_loop(
         "unresolved_detail": unresolved_detail,
         "white_xyz": [round(c, 4) for c in loop.white_xyz] if loop.white_xyz else None,
         "white_nits": round(loop.white_xyz[1], 3) if loop.white_xyz else None,
+        # The meter's count lattice (i1d3 frequency mode): whether this session proved/adopted one
+        # (then counted levels carry a one-count noise floor) or not (count term skipped — why).
+        "count_quantum": {k: count_block.get(k) for k in
+                          ("status", "source", "min_counted_nits", "patches_on_lattice", "reason")
+                          if count_block.get(k) is not None},
         "preheat": preheat_digest,
         "needs_adjudication": needs_adjudication,
         "read_anomaly": needs_adjudication,
@@ -3230,6 +3500,8 @@ def make_persistent_spotread_meter(
             _time.sleep(settle_seconds)
         restarts_before = getattr(persistent, "restarts", 0)
         failures_before = getattr(persistent, "restart_failures", 0)
+        deaths_before = getattr(persistent, "deaths", 0)
+        resyncs_before = getattr(persistent, "resync_restarts", 0)
         res = persistent.measure()
         raw: dict[str, Any] = {"persistent": True, "result": res.raw}
         # Meter-PROCESS health for the loop's read guard (distinct from a measurement-quality
@@ -3243,12 +3515,19 @@ def make_persistent_spotread_meter(
         # A self-heal respawn happened inside this read: surface it (with the dead process's
         # own output) so the loop can put it on the LLM's evidence stream.
         attempts = getattr(persistent, "restarts", 0) - restarts_before
+        resyncs = getattr(persistent, "resync_restarts", 0) - resyncs_before
+        if resyncs > 0:
+            # Not a death: a timed-out reading never arrived, so the out-of-sync process was stopped
+            # (and respawned within budget) — no late reading can land on a later patch.
+            raw["meter_restart_reason"] = "resync"
+            raw["meter_resync_restarts"] = resyncs
         if attempts > 0:
             failed = getattr(persistent, "restart_failures", 0) - failures_before
             raw["meter_restart_attempts"] = attempts
             raw["meter_restarts"] = max(0, attempts - failed)   # respawns that came up alive
-            raw["meter_death_tail"] = getattr(persistent, "last_death_tail", None)
-            raw["meter_death_exit_code"] = getattr(persistent, "last_death_exit_code", None)
+            if resyncs <= 0 or getattr(persistent, "deaths", 0) > deaths_before:
+                raw["meter_death_tail"] = getattr(persistent, "last_death_tail", None)
+                raw["meter_death_exit_code"] = getattr(persistent, "last_death_exit_code", None)
         return Reading(
             xyz=res.xyz,
             yxy=res.yxy,

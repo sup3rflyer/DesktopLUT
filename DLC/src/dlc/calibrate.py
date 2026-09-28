@@ -9683,14 +9683,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             # to the run's workflow.log — the read paths outside the measure loop (characterize,
             # probes, brightness) have no event of their own for them, and before this the error
             # text of a dead meter was recorded nowhere (2026-09-23 incident).
+            # Also its stream-sync counters (timeouts, late results discarded at resync, resync
+            # respawns, stale / extra readings) — evidence the reads stayed matched to their patches.
             try:
-                if getattr(persistent_meter, "deaths", 0):
-                    ctx.log("persistent meter: " + json.dumps({
-                        "deaths": persistent_meter.deaths,
-                        "restarts": persistent_meter.restarts,
-                        "restart_failures": persistent_meter.restart_failures,
-                        "death_log": persistent_meter.death_log,
-                    }, default=str))
+                meter_summary = persistent_meter.summary()
+                if any(meter_summary.values()):
+                    ctx.log("persistent meter: " + json.dumps(
+                        {**meter_summary, "death_log": persistent_meter.death_log}, default=str))
             except Exception:  # noqa: BLE001 - diagnostics only, never break teardown
                 pass
         # Rollback guard: a clean run reaches a 'completed' (applied), 'reverted', or

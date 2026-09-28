@@ -984,6 +984,30 @@ def test_floor_level_noise_keeps_none_and_inf_semantics():
     assert mc.floor_level_noise(1e-3, xyz) == 1e-3             # a real spread above it is kept
 
 
+def test_floor_level_noise_count_term_bright_counted_levels_only():
+    # Above ~15 nit an i1d3 frequency-counts every channel: reads sit on an integer-count lattice
+    # (ProArt HDR steps from the 2026-09-28 investigation), so a zero spread there is floored at the
+    # count quantum (~2.3e-4 xy at 40 nit) — 10^4-10^5x the print step. Below the dimmest proven
+    # counted read (period mode) only the print floor applies.
+    from dlc.meter_quantum import CountQuantum
+    q = CountQuantum(steps=((0.083688, 0.031480, -0.000197), (0.035229, 0.068796, 0.000812),
+                            (0.037449, 0.000949, 0.176918)), min_counted_nits=15.0)
+
+    def d65(nits):
+        return (0.3127 / 0.3290 * nits, nits, (1.0 - 0.3127 - 0.3290) / 0.3290 * nits)
+
+    bright, dim = d65(40.0), d65(1.0)
+    assert mc.floor_level_noise(0.0, bright, count_quantum=q) >= 2e-4
+    assert mc.floor_level_noise(0.0, bright, count_quantum=q) == pytest.approx(q.xy_sigma(bright))
+    assert mc.floor_level_noise(0.0, dim, count_quantum=q) == mc.xy_quantization_sigma(dim)
+    # without a lattice nothing changes (the default path every existing caller takes)
+    assert mc.floor_level_noise(0.0, bright) == mc.xy_quantization_sigma(bright)
+    # a real measured spread above the count floor is kept; None / inf semantics unchanged
+    assert mc.floor_level_noise(1e-3, bright, count_quantum=q) == 1e-3
+    assert mc.floor_level_noise(None, bright, count_quantum=q) is None
+    assert mc.floor_level_noise(math.inf, bright, count_quantum=q) == math.inf
+
+
 def test_zero_spread_is_not_proof_of_real_drift():
     # Two identical quantised reads (SE exactly 0). A chroma error far beyond the quantisation is
     # still real; one BELOW it must no longer score "proven real" (the old noise<=0 → 1.0 path).
