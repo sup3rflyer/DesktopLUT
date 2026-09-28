@@ -219,10 +219,11 @@ def test_sdr_build_mhc_smooths_unstable_levels_via_noise_sidecar(tmp_path):
             assert abs(curves[ch][j] - sig) < 1.5e-2, (ch, sig, curves[ch][j])
 
 
-def _write_sdr_drifted_dark_ti3(path: Path, *, drift_dy: float = 0.021) -> Path:
-    """A synthetic SDR raw TI3 (γ2.2, ~D65 native, 100-nit peak) whose 0.1-signal gray
-    (~0.63 nits) carries a REAL chromaticity drift (+drift_dy in y) — the correctable disease.
-    All other grays track the native white exactly."""
+def _write_sdr_drifted_dark_ti3(path: Path, *, drift_dy: float = 0.021,
+                                drift_levels: tuple = (0.1,)) -> Path:
+    """A synthetic SDR raw TI3 (γ2.2, ~D65 native, 100-nit peak) whose ``drift_levels`` grays
+    (default the 0.1 signal, ~0.63 nits) carry a REAL chromaticity drift (+drift_dy in y) — the
+    correctable disease. All other grays track the native white exactly."""
     from dlc.colormath import rgb_to_xyz_matrix, xy_to_XYZ
 
     peak = 100.0
@@ -238,7 +239,7 @@ def _write_sdr_drifted_dark_ti3(path: Path, *, drift_dy: float = 0.021) -> Path:
     for s in (0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0):
         frac = s ** 2.2
         xyz = tuple(sum(P[r][c] * frac for c in range(3)) for r in range(3))
-        if s == 0.1:                                      # real, repeatable greenish dark drift
+        if s in drift_levels:                             # real, repeatable greenish dark drift
             xyz = xy_to_XYZ(0.3127, 0.3290 + drift_dy, xyz[1])
         emit_row((s, s, s), xyz)
     for c in range(3):                                    # per-channel ramps for the primaries
@@ -260,8 +261,10 @@ def _write_sdr_drifted_dark_ti3(path: Path, *, drift_dy: float = 0.021) -> Path:
 def test_sdr_build_mhc_stable_dark_drift_is_corrected_not_smoothed(tmp_path):
     # Phase 4 (σ-aware adaptive dark floor): a REAL, repeatable dark drift — strayed chromaticity
     # with a tiny measured σ in the noise sidecar — must NOT raise the adaptive floor and smooth
-    # its own correction to identity. Without the sidecar (single-read run) the same drift keeps
-    # the old conservative behaviour: the floor rises over it and the cube holds ~identity there.
+    # its own correction to identity. Without the sidecar (single-read run) a LONE drifted read has
+    # no repeatability evidence and no corroborating neighbour, so it must not raise the floor on its
+    # own either (HW 2026-09-03); it is surfaced as `unverified`. Two ADJACENT drifted reads without
+    # σ are corroborated: noise and drift are indistinguishable → the conservative floor holds them.
     import json
 
     from dlc.measure_loop import noise_sidecar_path
@@ -282,17 +285,49 @@ def test_sdr_build_mhc_stable_dark_drift_is_corrected_not_smoothed(tmp_path):
     j = round(0.1 * (n - 1))
     corrected_dev = abs(curves["g"][j] - 0.1)                  # green pulled to fix the green drift
 
-    # -- same panel, NO sidecar: noise and drift are indistinguishable -> conservative floor --
+    # -- same panel, NO sidecar, the drift on ONE level: a lone single read never lifts the floor --
     ctx2 = create_run("SDR", display="test", run_dir=tmp_path / "run_bare")
     ti32 = _write_sdr_drifted_dark_ti3(tmp_path / "raw_drift2.ti3")
     build_mhc.build(_ns(ctx2, mode="SDR", source_ti3=str(ti32)), ctx2)
     df2 = _common.load_dlc_state(ctx2)["mhc_params"]["dark_floor"]
-    assert df2["nits"] > 0.5, df2                              # floor rose over the ~0.63-nit read
-    curves2 = read_1d_cube(Path(_common.load_dlc_state(ctx2)["mhc_params"]["base_lut"]["cube_path"]))
-    held_dev = abs(curves2["g"][j] - 0.1)
+    assert df2["nits"] == 0.1 and df2["n_strayed"] == 0, df2
+    assert df2["n_unverified"] == 1 and df2["unverified"][0]["basis"] == "uncorroborated", df2
+
+    # -- NO sidecar, TWO adjacent drifted dark levels: corroborated → conservative floor --
+    ctx3 = create_run("SDR", display="test", run_dir=tmp_path / "run_bare_pair")
+    ti33 = _write_sdr_drifted_dark_ti3(tmp_path / "raw_drift3.ti3", drift_levels=(0.05, 0.1))
+    build_mhc.build(_ns(ctx3, mode="SDR", source_ti3=str(ti33)), ctx3)
+    df3 = _common.load_dlc_state(ctx3)["mhc_params"]["dark_floor"]
+    assert df3["nits"] > 0.5, df3                              # floor rose over the ~0.63-nit read
+    assert df3["floor_set_by"]["basis"] == "corroborated", df3
+    curves3 = read_1d_cube(Path(_common.load_dlc_state(ctx3)["mhc_params"]["base_lut"]["cube_path"]))
+    held_dev = abs(curves3["g"][j] - 0.1)
 
     assert corrected_dev > 0.0025, corrected_dev              # the stable drift IS corrected
-    assert held_dev < corrected_dev / 3, (held_dev, corrected_dev)   # σ-less stays held ~identity
+    assert held_dev < corrected_dev / 3, (held_dev, corrected_dev)   # corroborated σ-less held ~identity
+
+
+def test_sdr_build_mhc_single_read_stray_above_measured_levels_does_not_lift_floor(tmp_path):
+    # HW-4 caveat 2 end to end (PA32UCXR 013909 / LG C6 170323): the multi-read dark level carries its
+    # σ in the sidecar; a brighter SINGLE-read level strays far beyond the noise the multi-read level
+    # measured. It must not lift the floor (the old path pinned it to the 5-nit cap) — it is reported
+    # as `unverified` evidence in the build's dark_floor, with its noise bound.
+    import json
+
+    from dlc.measure_loop import noise_sidecar_path
+
+    ctx = create_run("SDR", display="test", run_dir=tmp_path / "run")
+    ti3 = _write_sdr_drifted_dark_ti3(tmp_path / "raw.ti3", drift_levels=(0.1, 0.25))
+    noise_sidecar_path(ti3).write_text(
+        json.dumps({"by_level": {f"{0.1:.6f}": {"chroma_sigma": 0.001, "reads": 4}}}),
+        encoding="utf-8")
+    result = build_mhc.build(_ns(ctx, mode="SDR", source_ti3=str(ti3)), ctx)
+    assert result.status == "ran"
+    df = _common.load_dlc_state(ctx)["mhc_params"]["dark_floor"]
+    assert df["nits"] == 0.1 and df["n_strayed"] == 0 and df["n_real_drift"] == 1, df
+    (u,) = df["unverified"]
+    assert u["basis"] == "beyond_noise" and 4.0 < u["nits"] < 5.5, u   # the 0.25-signal read (~4.7 nit)
+    assert 3 * u["noise_bound"] < u["drift"], u
 
 
 def test_hdr_build_mhc_reports_wrgb_gate_diagnostics(tmp_path):

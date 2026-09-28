@@ -64,6 +64,10 @@ __all__ = [
     "adaptive_dark_floor",
     "noise_trust",
     "dark_trust_weights",
+    "METER_XYZ_RESOLUTION",
+    "xy_quantization_sigma",
+    "floor_level_noise",
+    "monotone_noise_floor",
     "HDR_REFERENCE_WHITE_BAND",
     "mhc2_matrix",
     "neutral_hold_abscissae",
@@ -90,6 +94,92 @@ _D65 = (0.3127, 0.3290)
 # judge dark drift against on HDR, where the BRIGHTEST patch is the panel in overdrive/ABL/thermal
 # limit (a moving, untrustworthy reference), not a target.
 HDR_REFERENCE_WHITE_BAND = (100.0, 203.0)
+
+# The meter's printed XYZ resolution, in cd/m² per component. Argyll spotread prints every reading
+# with C's ``%f`` ("Result is XYZ: 167.862654 175.115989 187.817531" in the recorded runs' raw
+# lines), i.e. 6 decimals, and DLC keeps exactly that precision end to end (ndjson ``xyz``,
+# ``measure_loop.write_ti3`` ``%.6f``). It is a format fact, not a tuning knob: two reads of a very
+# dark patch can come back IDENTICAL at this resolution (LG C6 2026-09-02, 0.0021 nit: 0.002080
+# 0.002094 0.005365 twice), which says the spread is below the print step — not that it is zero.
+METER_XYZ_RESOLUTION = 1e-6
+
+
+def xy_quantization_sigma(xyz: Sequence[float], resolution: float = METER_XYZ_RESOLUTION) -> float:
+    """σ of a read's chromaticity (Euclidean ``xy``) from the meter's print quantisation alone.
+
+    Each of X, Y, Z is rounded independently to ``resolution`` — a uniform ±½-step error, σ =
+    step/√12 per component — propagated through the chromaticity Jacobian (``∂x/∂X = (Y+Z)/S²``,
+    ``∂x/∂Y = ∂x/∂Z = −X/S²``, and the analogue for ``y``; ``S = X+Y+Z``). It grows as ~1/luminance,
+    so it only matters in the deep dark (≈4e-5 xy at 0.002 nit, ≈1e-7 at 1 nit). Averaging IDENTICAL
+    quantised reads does not shrink it (the rounding is common to every read), so it floors the
+    standard error of the mean directly, not divided by √n. ``+inf`` when ``S <= 0`` (a zero read
+    carries no chromaticity at all)."""
+    X, Y, Z = (float(v) for v in xyz[:3])
+    S = X + Y + Z
+    if not (S > 0.0) or not math.isfinite(S):
+        return math.inf
+    q = float(resolution) / math.sqrt(12.0)
+    var = q * q * ((Y + Z) ** 2 + 2.0 * X * X + (X + Z) ** 2 + 2.0 * Y * Y) / S ** 4
+    return math.sqrt(var)
+
+
+def _xyz_from_nits_xy(nits: float, x: float, y: float) -> tuple[float, float, float]:
+    if not (y > 0.0):
+        return (0.0, 0.0, 0.0)          # → xy_quantization_sigma = inf (no chromaticity)
+    return (x / y * nits, nits, (1.0 - x - y) / y * nits)
+
+
+def floor_level_noise(noise: Optional[float], xyz: Sequence[float],
+                      resolution: float = METER_XYZ_RESOLUTION) -> Optional[float]:
+    """A level's measured chroma noise (SE of the mean ``xy``) floored at the meter's print
+    quantisation for THAT level (:func:`xy_quantization_sigma`) — so a zero spread (reads identical
+    after quantisation, or a σ rounded to 0 in the sidecar) is never read as "noise-free" proof.
+
+    ``None`` stays ``None``: <2 reads = NO repeatability evidence, whose meaning is the caller's
+    (documented at each call site — it is not "zero noise"). ``+inf`` (an ``unstable`` level) stays
+    ``+inf``. Otherwise ``max(noise, quantisation)``."""
+    if noise is None:
+        return None
+    noise = float(noise)
+    if math.isinf(noise):
+        return noise
+    q = xy_quantization_sigma(xyz, resolution)
+    return max(noise, q) if not math.isnan(noise) else q
+
+
+def monotone_noise_floor(levels: Sequence[Sequence[Optional[float]]]
+                         ) -> list[tuple[Optional[float], Optional[float]]]:
+    """Floor each multi-read level's noise by what the meter DEMONSTRABLY could not beat one level
+    brighter: chroma noise grows toward black, so a level's per-read σ is at least the per-read σ
+    measured at the nearest brighter level. A level whose own reads happened to agree — a lucky-low
+    two-read estimate, or reads that came back bit-identical (recorded runs: 0 of ~3200 repeat pairs
+    identical at 0.01-10 nit, yet ~57 % below 0.01 nit and ~15-25 % above 10 nit) — therefore cannot
+    claim more repeatability than its brighter neighbour showed. Every level gets the same floor; a
+    zero spread is not special-cased.
+
+    ``levels``: ``[(nits, se, per_read_sigma, n_reads), ...]`` in any order — ``se`` and ``σ`` as the
+    noise sidecar defines them (``se = σ/√n``; ``None`` = <2 reads = no evidence; ``se = +inf`` =
+    unstable). Returns ``[(se, per_read_sigma), ...]`` per input position: ``σ' = max(σ, σ_brighter)``
+    and ``se' = max(se, σ'/√n)`` for finite levels; ``None``/``+inf`` pass through; a level with no
+    brighter measured neighbour keeps its own values. The nearest brighter level's OWN (unfloored) σ
+    is used, so one high bright estimate cannot cascade down the whole ramp. Stdlib; the print-
+    quantisation floor is applied by the consumer (:func:`floor_level_noise` needs the XYZ)."""
+    measured = sorted((float(lv[0]), float(lv[2])) for lv in levels
+                      if lv[1] is not None and math.isfinite(float(lv[1]))
+                      and lv[2] is not None and math.isfinite(float(lv[2])) and float(lv[2]) > 0.0)
+    out: list[tuple[Optional[float], Optional[float]]] = []
+    for lv in levels:
+        nits, se, sigma, n = float(lv[0]), lv[1], lv[2], lv[3] if len(lv) > 3 else None
+        if se is None or not math.isfinite(float(se)) or sigma is None:
+            out.append((se, sigma))
+            continue
+        se, sigma = float(se), float(sigma)
+        above = [s for (ln, s) in measured if ln > nits]       # sorted by luminance → [0] = nearest
+        if above and above[0] > sigma:
+            sigma = above[0]
+            se = max(se, sigma / math.sqrt(max(2, int(n or 2))))
+        out.append((se, sigma))
+    return out
 
 
 def _median(vals: Sequence[float]) -> float:
@@ -121,11 +211,31 @@ def adaptive_dark_floor(neutral_reads: Sequence[Sequence[float]], *,
     which is exactly the disease this cube exists to correct (HW 2026-06-20: dy +0.099 at sig
     0.09). Chroma distance alone cannot tell them apart; measured repeatability can. When a read
     carries its measurement noise (4th element: the standard error of the mean chromaticity from
-    MULTIPLE reads, ``+inf`` for an ``unstable`` level), a strayed read whose drift CLEARLY exceeds
-    that noise (:func:`noise_trust` == 1) is a real signal and does NOT raise the floor — the
-    per-level ``dark_trust_weights`` machinery governs it instead. A σ-less (single-read) or
-    unstable/noisy strayed read keeps the conservative behaviour and raises the floor. Without any
-    σ data this function is unchanged.
+    MULTIPLE reads, ``+inf`` for an ``unstable`` level — floored at the meter's print quantisation,
+    :func:`floor_level_noise`, so identical quantised reads are not "zero noise"), a strayed read
+    whose drift CLEARLY exceeds that noise (:func:`noise_trust` == 1) is a real signal and does NOT
+    raise the floor — the per-level ``dark_trust_weights`` machinery governs it instead. An
+    unstable/noisy strayed read raises the floor.
+
+    **A single read (no σ) never raises the floor on its own** (HW 2026-09-03 PA32UCXR 013909 and
+    LG C6 170323: one-read strays at 6-24 nits, where the meter resolves xy to ~1e-5, lifted the floor
+    to the 5-nit cap and threw away the σ-proven dark correction below). The floor bounds the region
+    where the MEASUREMENT is untrustworthy — noise-limited, and meter chroma noise grows toward black,
+    so that region is contiguous from black up:
+
+      * **Physics first** — when dimmer levels carry measured per-read σ (5th element), a single
+        read's noise is bounded by them (:func:`_single_read_noise_bound`). A drift inside that bound
+        (< 3σ) is noise-plausible → raises the floor; a drift beyond it cannot be meter noise → it is
+        real level drift or a transient, neither of which a luminance floor fixes → it does NOT raise
+        the floor and is reported in ``unverified`` (``basis: beyond_noise``) for the LLM; the
+        closed-loop refine re-measures that level.
+      * **Corroboration otherwise** — with no measured per-read σ below it (a single-read run, or
+        below the dimmest multi-read level) noise and drift are indistinguishable, so a σ-less stray
+        raises the floor only when corroborated by another untrustworthy stray (noisy / unstable /
+        noise-plausible / itself unbounded) at the same or a DIMMER luminance (a second read, or the
+        noise-limited region it sits on) or at the next luminance up. A lone one — nothing
+        untrustworthy below or right above it — is reported in ``unverified``
+        (``basis: uncorroborated``) and does not move the floor.
 
     The reference depends on the mode:
       * ``reference_band=(lo,hi)`` (**HDR**): the median chromaticity of reads in the stable diffuse-
@@ -136,25 +246,40 @@ def adaptive_dark_floor(neutral_reads: Sequence[Sequence[float]], *,
       * ``None`` (**SDR**): the brightest read — on SDR the peak IS the calibration target white and
         is stable, so it's the right anchor.
 
-    ``neutral_reads``: ``[(nits, x, y), ...]`` or ``[(nits, x, y, noise), ...]`` (any order;
-    nits>0; ``noise`` optional per-read chroma SE as above, ``None`` = unknown). Returns
-    ``(floor_nits, info)`` clamped to ``bounds``; a clean dark region returns ``bounds[0]``;
-    too few reads → ``default_floor_nits``.
+    ``neutral_reads``: ``[(nits, x, y), ...]``, ``[(nits, x, y, noise), ...]`` or
+    ``[(nits, x, y, noise, read_sigma), ...]`` (any order; nits>0). ``noise`` = the level's chroma SE
+    as above; ``None`` = <2 reads, NO repeatability evidence (not "zero noise"). ``read_sigma``
+    (optional) = the level's per-read chroma σ — the evidence the single-read noise bound is built
+    from (``build_mhc`` supplies it Bessel-corrected, with :func:`monotone_noise_floor` applied);
+    without it there is no bound and the corroboration rule applies. Returns
+    ``(floor_nits, info)`` clamped to ``bounds``; a clean dark region returns ``bounds[0]``; too few
+    reads → ``default_floor_nits``. ``info`` is digest evidence: ``n_strayed`` (strays that raised the
+    floor), ``n_real_drift`` (σ-verified real drift), ``unverified`` (single-read strays that did not
+    raise it, with their noise bound + basis), ``floor_set_by`` and, on HDR, ``ref_band_n`` /
+    ``ref_band_spread`` (how well the diffuse-white reference itself is pinned).
     """
-    reads = [(float(r[0]), float(r[1]), float(r[2]),
-              (float(r[3]) if len(r) > 3 and r[3] is not None else None))
-             for r in neutral_reads
-             if r[0] is not None and r[0] > 0.0 and r[1] is not None and r[2] is not None]
+    reads = []
+    for r in neutral_reads:
+        if r[0] is None or not (r[0] > 0.0) or r[1] is None or r[2] is None:
+            continue
+        se = float(r[3]) if len(r) > 3 and r[3] is not None else None
+        rs = float(r[4]) if len(r) > 4 and r[4] is not None else None
+        reads.append((float(r[0]), float(r[1]), float(r[2]), se, rs))
     if len(reads) < 3:
         return default_floor_nits, {"reason": "too_few_reads", "n_reads": len(reads)}
     reads.sort(key=lambda r: r[0])
     nits = [r[0] for r in reads]
+    band_evidence: dict = {}
     if reference_band is not None:
         lo_b, hi_b = reference_band
         band = [r for r in reads if lo_b <= r[0] <= hi_b]
         if band:
             ref_x, ref_y = _median([r[1] for r in band]), _median([r[2] for r in band])
             ref_nits, ref_source = _median([r[0] for r in band]), "diffuse_white_band"
+            band_evidence = {
+                "ref_band_n": len(band),
+                "ref_band_spread": round(max(((r[1] - ref_x) ** 2 + (r[2] - ref_y) ** 2) ** 0.5
+                                             for r in band), 5)}
         else:
             below = [r for r in reads if r[0] <= hi_b]   # avoid the overdriven peak when out-of-band
             ref_nits, ref_x, ref_y = (below[-1] if below else reads[0])[:3]
@@ -165,30 +290,110 @@ def adaptive_dark_floor(neutral_reads: Sequence[Sequence[float]], *,
     # Floor candidates = the dark reads (below the reference); the bounds clamp keeps a mid-tone
     # chroma error from inflating the floor even if it slips through.
     cutoff = min(nits[len(nits) // 2], ref_nits)
-    strayed = []
-    real_drift = []
+
+    rows = []
     max_drift = 0.0
-    for n, x, y, sigma in reads:
+    for n, x, y, se, rs in reads:
+        xyz = _xyz_from_nits_xy(n, x, y)
         drift = ((x - ref_x) ** 2 + (y - ref_y) ** 2) ** 0.5
         max_drift = max(max_drift, drift)
-        if n <= cutoff and drift > chroma_tolerance:
-            # σ-aware: drift clearly above the measured repeatability = a real, CORRECTABLE
-            # signal — don't smooth it away. noise_trust(drift, +inf) == 0, so an `unstable`
-            # level stays strayed; σ=None (single read) stays conservative.
-            if sigma is not None and noise_trust(drift, sigma) >= 1.0:
-                real_drift.append(n)
+        rows.append({"nits": n, "xyz": xyz, "drift": drift,
+                     "se": floor_level_noise(se, xyz),
+                     "read_sigma": (floor_level_noise(rs, xyz)
+                                    if rs is not None and math.isfinite(rs) else None)})
+
+    # Pass 1 — levels with their own repeatability evidence decide themselves; σ-less strays are
+    # judged against the per-read σ measured at dimmer levels where there is any (physics).
+    kind: list[Optional[str]] = [None] * len(rows)
+    bound: list[Optional[float]] = [None] * len(rows)
+    for i, row in enumerate(rows):
+        if not (row["nits"] <= cutoff and row["drift"] > chroma_tolerance):
+            continue
+        se = row["se"]
+        if se is not None:
+            if noise_trust(row["drift"], se) >= 1.0:
+                kind[i] = "real"                  # drift clearly above its own measured noise
             else:
-                strayed.append(n)
+                kind[i] = "unstable" if math.isinf(se) else "noisy"
+            continue
+        bound[i] = _single_read_noise_bound(rows, i)
+        if bound[i] is None:
+            kind[i] = "unbounded"                 # no measured noise below it: pass 2 decides
+        elif noise_trust(row["drift"], bound[i]) < 1.0:
+            kind[i] = "noise_plausible"
+        else:
+            kind[i] = "beyond_noise"
+    # Pass 2 — an unbounded σ-less stray needs corroboration by ANOTHER untrustworthy stray at the
+    # same/a dimmer luminance or at the next luminance up. Classes are final (a beyond-noise single
+    # read never corroborates) and ties are by luminance, not list position → order-independent.
+    doubtful = ("noisy", "unstable", "noise_plausible", "unbounded")
+    pass1 = list(kind)                            # judge every unbounded stray on the SAME evidence
+    for i, row in enumerate(rows):
+        if pass1[i] != "unbounded":
+            continue
+        above = [r["nits"] for r in rows if r["nits"] > row["nits"]]
+        next_up = min(above) if above else None
+        kind[i] = "corroborated" if any(
+            j != i and pass1[j] in doubtful
+            and (rows[j]["nits"] <= row["nits"] or rows[j]["nits"] == next_up)
+            for j in range(len(rows))) else "uncorroborated"
+
+    untrusted: list[tuple[float, str]] = []
+    unverified: list[dict] = []
+    for i, row in enumerate(rows):
+        k = kind[i]
+        if k in ("noisy", "unstable", "noise_plausible", "corroborated"):
+            untrusted.append((row["nits"], k))
+        elif k in ("beyond_noise", "uncorroborated"):
+            unverified.append({"nits": round(row["nits"], 4), "drift": round(row["drift"], 5),
+                               "noise_bound": _sig(bound[i]), "basis": k})
+
     lo, hi = bounds
-    if not strayed:
+    floor_set_by = None
+    if not untrusted:
         floor, reason = lo, "clean_dark_region"
     else:
-        floor, reason = min(max(max(strayed), lo), hi), "chroma_drift"
+        top_nits, top_kind = max(untrusted, key=lambda t: t[0])
+        floor, reason = min(max(top_nits, lo), hi), "chroma_drift"
+        floor_set_by = {"nits": round(top_nits, 4), "basis": top_kind}
     return floor, {"reason": reason, "n_reads": len(reads),
                    "ref_xy": [round(ref_x, 5), round(ref_y, 5)], "ref_nits": round(ref_nits, 3),
-                   "ref_source": ref_source, "max_chroma_drift": round(max_drift, 5),
-                   "n_strayed": len(strayed), "n_real_drift": len(real_drift),
+                   "ref_source": ref_source, **band_evidence,
+                   "max_chroma_drift": round(max_drift, 5),
+                   "n_strayed": len(untrusted), "n_real_drift": sum(1 for k in kind if k == "real"),
+                   "n_unverified": len(unverified), "unverified": unverified,
+                   "floor_set_by": floor_set_by,
                    "chroma_tolerance": chroma_tolerance}
+
+
+def _sig(v: Optional[float], digits: int = 3) -> Optional[float]:
+    """Round to significant digits (noise bounds span 1e-7..1e-2) for digest evidence."""
+    if v is None or not math.isfinite(v) or v == 0.0:
+        return v
+    return float(f"{v:.{digits}g}")
+
+
+def _single_read_noise_bound(rows: Sequence[Mapping], i: int) -> Optional[float]:
+    """Bound on the per-read chroma σ of the single read ``rows[i]`` from the multi-read levels at
+    or below its luminance — ``None`` when there are none (no repeatability evidence to bound it by).
+
+    Model: colorimeter chroma noise ``σ²(Y) = a²/Y + b²/Y² + c²`` — photon shot noise, fixed
+    dark/read noise, and a luminance-independent part (source flicker / panel short-term wander).
+    For every dimmer measured level ``i`` the first two terms at ``Y`` are ≤ ``σ_i²·Y_i/Y``, and ``c``
+    ≤ the nearest dimmer level's σ, so the bound is ``√(max_i σ_i²·Y_i/Y + σ_nearest²)`` — the max over
+    every dimmer level keeps one lucky-low two-read σ from shrinking it — floored at this read's own
+    print quantisation. Honest limits: the σ_i are estimates (build_mhc Bessel-corrects the sidecar's
+    population σ and applies :func:`monotone_noise_floor`), and flicker under adaptive integration can
+    grow slightly with light; the bound is used at 3σ against a 0.008 tolerance while the recorded
+    i1d3 bounds above 2 nits are ~1e-5–1e-4, so neither moves a verdict by orders of magnitude."""
+    y = rows[i]["nits"]
+    dimmer = [(r["nits"], r["read_sigma"]) for j, r in enumerate(rows)
+              if j != i and r["read_sigma"] is not None and r["nits"] <= y]
+    if not dimmer:
+        return None
+    nearest = max(dimmer, key=lambda d: d[0])[1]
+    pooled = max(s * s * (ni / y) for ni, s in dimmer)
+    return max(math.sqrt(pooled + nearest * nearest), xy_quantization_sigma(rows[i]["xyz"]))
 
 
 def mhc2_matrix(native_primaries: Mapping[str, float], native_white_xy: tuple[float, float],
@@ -310,9 +515,19 @@ def noise_trust(error: float, noise: Optional[float], *,
     readings → tighter → the same real error clears the gate ("more readings → trust the reading
     more"). A level the measure loop flags **unstable** (can't be pinned after many reads = genuine
     display fluctuation, not averageable) is passed ``noise = +inf`` by the caller ⇒ ``w = 0`` (never
-    bake a correction to a chromaticity the panel won't hold). ``noise`` None/≤0 ⇒ trust fully (1.0)."""
-    if noise is None or noise <= 0.0:
+    bake a correction to a chromaticity the panel won't hold).
+
+    ``noise=None`` = <2 reads = NO repeatability evidence ⇒ 1.0: the gate is simply not engaged and
+    the caller's other dark logic governs (the adaptive floor / the refine's dark cut) — every call
+    site documents that. A spread of exactly 0 is NOT evidence of zero noise (two reads can agree to
+    the meter's last printed digit): callers floor the noise at the meter's print quantisation for
+    the level (:func:`floor_level_noise`), so ``noise <= 0`` (or NaN) here is a caller bug and raises
+    ``ValueError`` instead of silently scoring "proven real"."""
+    if noise is None:
         return 1.0
+    if not (noise > 0.0):
+        raise ValueError(f"noise_trust: noise must be > 0 (got {noise!r}); floor it at the meter's "
+                         "print quantisation with floor_level_noise(noise, xyz)")
     snr = error / noise
     if snr <= lo_snr:
         return 0.0
@@ -322,26 +537,33 @@ def noise_trust(error: float, noise: Optional[float], *,
     return t * t * (3.0 - 2.0 * t)
 
 
-def dark_trust_weights(levels: Sequence[tuple[float, float, float, Optional[float]]],
+def dark_trust_weights(levels: Sequence[Sequence[Optional[float]]],
                        reference_white_xy: tuple[float, float], *,
                        lo_snr: float = 1.0, hi_snr: float = 3.0) -> list[tuple[float, float]]:
     """Per-level trust weights from MEASURED repeatability — the core of the dark-level logic.
 
-    ``levels``: ``[(signal, x, y, noise), ...]`` per measured neutral level, where ``noise`` is the
-    measurement uncertainty of that level's chromaticity — the **standard error of the mean** in
+    ``levels``: ``[(signal, x, y, noise[, nits]), ...]`` per measured neutral level, where ``noise`` is
+    the measurement uncertainty of that level's chromaticity — the **standard error of the mean** in
     ``xy`` (per-read σ / √reads), or ``+inf`` for an ``unstable`` level (caller's choice; ⇒ trust 0),
-    or ``None`` for <2 reads. ``reference_white_xy`` is the chromaticity the per-level correction
-    drives toward (native white for ``build_hdr_cube``'s per-level share correction; D65 for the
-    closed-loop refine).
+    or ``None`` for <2 reads. The optional ``nits`` (the level's measured luminance) floors ``noise``
+    at the meter's print quantisation there (:func:`floor_level_noise`) — pass it whenever ``noise``
+    can be 0 (identical quantised reads); without it a 0 raises in :func:`noise_trust`.
+    ``reference_white_xy`` is the chromaticity the per-level correction drives toward (native white
+    for ``build_hdr_cube``'s per-level share correction; D65 for the closed-loop refine).
 
     For each level the chroma error to correct is ``|measured_xy - reference|`` and the trust is
     ``noise_trust(error, chroma_sigma)`` — so where the dark read's chromaticity is so noisy/unstable
     that the error can't be distinguished from the spread, the weight collapses toward 0 (smooth that
     level's correction to identity); where the read is stable, it stays ~1. Returns sorted
-    ``[(signal, w), ...]``; levels with no σ (single read) get ``w=1`` (trust the adaptive integration)."""
+    ``[(signal, w), ...]``. ``noise=None`` (single read, no repeatability evidence) ⇒ ``w=1``: this
+    per-level gate is not engaged and the luminance floor ramp (:func:`adaptive_dark_floor` →
+    ``dark_floor_nits``) governs that level instead."""
     rx, ry = reference_white_xy
     out: list[tuple[float, float]] = []
-    for sig, x, y, sigma in levels:
+    for lv in levels:
+        sig, x, y, sigma = lv[0], lv[1], lv[2], lv[3]
+        if sigma is not None and len(lv) > 4 and lv[4] is not None:
+            sigma = floor_level_noise(sigma, _xyz_from_nits_xy(float(lv[4]), x, y))
         err = ((x - rx) ** 2 + (y - ry) ** 2) ** 0.5
         out.append((float(sig), noise_trust(err, sigma, lo_snr=lo_snr, hi_snr=hi_snr)))
     out.sort(key=lambda p: p[0])
@@ -917,10 +1139,13 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
             continue
         # Measurement-trust: if MULTIPLE reads gave a chromaticity spread, scale this level's whole
         # correction toward identity when its chroma error is within the noise (don't bake a per-channel
-        # tint from noise/instability at a dark level). w=1 when no σ (trust the adaptive integration).
+        # tint from noise/instability at a dark level). No σ (single read) = no repeatability evidence
+        # → w=1: the dark_floor_nits cut above governs. A zero spread is floored at the meter's print
+        # quantisation for this level, never read as noise-free.
         total = sum(xyz) or 1.0
         mx, my = xyz[0] / total, xyz[1] / total
-        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5, chroma_sigma)
+        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5,
+                              floor_level_noise(chroma_sigma, xyz))
         ms = matvec(disp_inv, xyz)
         ts = matvec(disp_inv, xy_to_XYZ(wx, wy, tY))
         for c in range(3):
@@ -1032,7 +1257,10 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
             continue
         total = sum(xyz) or 1.0
         mx, my = xyz[0] / total, xyz[1] / total
-        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5, chroma_sigma)
+        # No σ = no repeatability evidence → w=1 (the dark_floor_nits cut governs); a zero spread is
+        # floored at the meter's print quantisation, never read as noise-free.
+        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5,
+                              floor_level_noise(chroma_sigma, xyz))
         ms = matvec(disp_inv, list(xyz))
         ts = matvec(disp_inv, xy_to_XYZ(wx, wy, tY))
         for c in range(3):
@@ -1290,7 +1518,9 @@ def refine_sdr_grayscale_legacy(current_deviations: Optional[Mapping[str, Sequen
             continue
         total = sum(xyz) or 1.0
         mx, my = xyz[0] / total, xyz[1] / total
-        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5, chroma_sigma)
+        # No σ → w=1 (the dark_floor_nits cut governs); a zero spread is floored at quantisation.
+        w_trust = noise_trust(((mx - wx) ** 2 + (my - wy) ** 2) ** 0.5,
+                              floor_level_noise(chroma_sigma, xyz))
         ms = matvec(disp_inv, list(xyz))
         ts = matvec(disp_inv, xy_to_XYZ(wx, wy, target_Y))
         for c in range(3):

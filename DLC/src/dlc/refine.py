@@ -125,7 +125,7 @@ def propose_correction_grayscale(
     # the old fixed DARK_LUMINANCE_FLOOR when the ramp is too sparse to derive one. Each read
     # carries its measured repeatability (``noise``) so a REAL, stable dark drift — the thing this
     # solver exists to correct — is not classified as noise and held to the current deviation.
-    from .mhc_cube import adaptive_dark_floor, noise_trust
+    from .mhc_cube import adaptive_dark_floor, floor_level_noise, noise_trust
     dark_floor, _dark_info = adaptive_dark_floor(
         [(p.xyz[1], *XYZ_to_xy(*p.xyz),
           (noise.get(p.level) if noise is not None else None)) for p in patches],
@@ -160,11 +160,13 @@ def propose_correction_grayscale(
         # how far the measured white sits from target vs. this level's chroma noise. trust->0 when
         # the error is within the measurement uncertainty (don't chase noise / a chromaticity the
         # panel won't hold) ⇒ hold near the current deviation; ->1 when it clearly exceeds it ⇒ full
-        # step. noise=None / level absent ⇒ trust 1.0 = the original full-step behaviour.
+        # step. noise=None / level absent = no repeatability evidence ⇒ trust 1.0 = the original
+        # full-step behaviour (the dark floor above still holds the too-dark levels). A zero spread
+        # (identical quantised reads) is floored at the meter's print quantisation for this level.
         mx, my = XYZ_to_xy(*M)
         chroma_err = ((mx - target.white_x) ** 2 + (my - target.white_y) ** 2) ** 0.5
         level_sigma = noise.get(patch.level) if noise is not None else None
-        trust = noise_trust(chroma_err, level_sigma)
+        trust = noise_trust(chroma_err, floor_level_noise(level_sigma, M))
 
         gains: list[float] = []
         out_cols = ("r", "g", "b")

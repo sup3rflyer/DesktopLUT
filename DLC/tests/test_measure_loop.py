@@ -419,6 +419,23 @@ def test_read_noise_sidecar_computes_se_and_flags_unstable(tmp_path: Path):
     assert entries[0.9] is None                        # <2 reads → no spread
 
 
+def test_read_noise_sidecar_spread_is_per_read_sigma_and_count(tmp_path: Path):
+    # The dark floor's single-read noise bound + monotone noise floor need the PER-READ sigma and the
+    # read count behind it (not the SE) - including an unstable level's measured scatter; <2 reads =
+    # no sigma.
+    from dlc.measure_loop import match_level_noise, noise_sidecar_path, read_noise_sidecar_spread
+    ti3 = tmp_path / "raw.ti3"
+    noise_sidecar_path(ti3).write_text(json.dumps({"schema": 1, "by_level": {
+        "0.100000": {"chroma_sigma": 0.004, "reads": 4, "unstable": False},
+        "0.050000": {"chroma_sigma": 0.02, "reads": 5, "unstable": True},
+        "0.900000": {"chroma_sigma": None, "reads": 1, "unstable": False},
+    }}), encoding="utf-8")
+    entries = read_noise_sidecar_spread(ti3)
+    assert dict(entries) == {0.05: (0.02, 5), 0.1: (0.004, 4), 0.9: (None, 1)}
+    assert match_level_noise(entries, 0.1 + 7e-8) == (0.004, 4)      # same nearest-level matching
+    assert read_noise_sidecar_spread(tmp_path / "absent.ti3") == []
+
+
 def test_match_level_noise_robust_to_ti3_roundtrip():
     from dlc.measure_loop import match_level_noise
     # the .ti3 ×100/÷100 percent roundtrip perturbs a level ~1e-7; nearest-match still finds it,

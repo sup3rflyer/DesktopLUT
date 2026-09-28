@@ -425,19 +425,49 @@ def level_edge_digest(block) -> dict | None:
             "summary": block.get("summary")}
 
 
-def _grey_reads_with_noise(source, grey_samples, xy_from_xyz):
-    """``[(nits, x, y, noise), ...]`` for :func:`mhc_cube.adaptive_dark_floor`: each gray read plus
-    its measured repeatability from the noise sidecar (SE of the mean chromaticity; ``+inf`` for an
-    unstable level; ``None`` when single-read / no sidecar — the floor then stays conservative).
-    Accepts ``Ti3Sample`` (``.rgb``) or ``refine.GrayPatch`` (``.level``) gray entries."""
-    from ..measure_loop import match_level_noise, read_noise_sidecar
+def _grey_noise(source, grey_samples):
+    """Per gray sample, from the noise sidecar beside ``source``: ``(se, bound_sigma)`` —
+
+    * ``se``: the SE of the mean chromaticity (``+inf`` = unstable), floored by the monotone meter-noise
+      law (:func:`mhc_cube.monotone_noise_floor`: never more repeatable than the nearest brighter
+      level measured), so reads that happened to agree — or came back bit-identical — are not proof;
+    * ``bound_sigma``: that level's per-read σ, Bessel-corrected (the sidecar's σ is the population
+      RMS, ÷n) — the evidence a brighter SINGLE read's noise bound is built from.
+
+    Both ``None`` for a single-read level / no sidecar (no repeatability evidence). Accepts
+    ``Ti3Sample`` (``.rgb``) or ``refine.GrayPatch`` (``.level``) gray entries."""
+    import math
+
+    from ..measure_loop import match_level_noise, read_noise_sidecar, read_noise_sidecar_spread
+    from ..mhc_cube import monotone_noise_floor
     entries = read_noise_sidecar(Path(source))
-    reads = []
+    if not entries:
+        return [(None, None)] * len(grey_samples)
+    spreads = read_noise_sidecar_spread(Path(source))
+    raw = []
     for s in grey_samples:
         level = s.rgb[0] if hasattr(s, "rgb") else s.level
-        noise = match_level_noise(entries, level) if entries else None
+        se = match_level_noise(entries, level)
+        sigma, n = match_level_noise(spreads, level) or (None, 0)
+        raw.append((s.xyz[1], se, sigma, n))
+    out = []
+    for (_nits, _se, _sigma, n), (se, sigma) in zip(raw, monotone_noise_floor(raw)):
+        bound_sigma = (sigma * math.sqrt(n / (n - 1))
+                       if sigma is not None and math.isfinite(sigma) and n >= 2 else None)
+        out.append((se, bound_sigma))
+    return out
+
+
+def _grey_reads_with_noise(source, grey_samples, xy_from_xyz):
+    """``[(nits, x, y, noise, read_sigma), ...]`` for :func:`mhc_cube.adaptive_dark_floor`: each gray
+    read plus its measured repeatability (:func:`_grey_noise`) — ``noise`` = the floored SE of the
+    mean chromaticity (``+inf`` for an unstable level), ``read_sigma`` = the per-read σ that bounds how
+    noisy a single read at a brighter level can be; both ``None`` when single-read / no sidecar (no
+    repeatability evidence — see the floor's single-read rules)."""
+    reads = []
+    for s, (noise, read_sigma) in zip(grey_samples, _grey_noise(source, grey_samples)):
         x, y = xy_from_xyz(s.xyz)
-        reads.append((s.xyz[1], x, y, noise))
+        reads.append((s.xyz[1], x, y, noise, read_sigma))
     return reads
 
 
@@ -447,15 +477,14 @@ def _dark_level_trust(source, grey_samples, reference_white_xy, dark_trust_weigh
     level was flagged unstable) → ``mhc_cube.dark_trust_weights``. Levels are matched to the parsed
     TI3 by NEAREST signal (robust to the ti3 percent roundtrip). Returns ``[(signal, w), ...]`` or
     ``None`` when there's no sidecar / no usable noise (single-read run)."""
-    from ..measure_loop import match_level_noise, read_noise_sidecar
-    entries = read_noise_sidecar(Path(source))
-    if not entries:
+    from ..measure_loop import read_noise_sidecar
+    if not read_noise_sidecar(Path(source)):
         return None
     levels = []
-    for s in grey_samples:
-        noise = match_level_noise(entries, s.rgb[0])
+    for s, (noise, _bound) in zip(grey_samples, _grey_noise(source, grey_samples)):
         x, y = xy_from_xyz(s.xyz)
-        levels.append((s.rgb[0], x, y, noise))
+        # measured luminance → the noise is also floored at the meter's print quantisation there
+        levels.append((s.rgb[0], x, y, noise, s.xyz[1]))
     weights = dark_trust_weights(levels, reference_white_xy)
     return weights or None
 

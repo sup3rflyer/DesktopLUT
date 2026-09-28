@@ -469,6 +469,34 @@ def read_noise_sidecar(ti3_path: Path) -> list[tuple[float, Optional[float]]]:
     return out
 
 
+def read_noise_sidecar_spread(ti3_path: Path) -> list[tuple[float, tuple[Optional[float], int]]]:
+    """``<ti3>.noise.json`` → ``[(gray level, (per-READ chroma σ, reads)), ...]`` sorted by level —
+    the raw ``chroma_sigma`` (population RMS over the inliers, NOT divided by √reads) and the read
+    count behind it, for the dark floor's single-read noise bound and monotone noise floor
+    (``build_mhc`` → ``mhc_cube.adaptive_dark_floor``). Recorded for ``unstable`` levels too (their
+    measured scatter). σ ``None`` for <2 reads. Match with :func:`match_level_noise` (the value is
+    the ``(σ, reads)`` pair). Empty when absent."""
+    p = noise_sidecar_path(ti3_path)
+    if not p.exists():
+        return []
+    try:
+        by = (json.loads(p.read_text(encoding="utf-8")) or {}).get("by_level") or {}
+    except (OSError, ValueError):
+        return []
+    out: list[tuple[float, tuple[Optional[float], int]]] = []
+    for k, v in by.items():
+        try:
+            lvl = float(k)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(v, dict):
+            continue
+        sg, n = v.get("chroma_sigma"), int(v.get("reads") or 0)
+        out.append((lvl, (float(sg) if (sg is not None and n >= 2) else None, n)))
+    out.sort(key=lambda e: e[0])
+    return out
+
+
 def match_level_noise(entries: Sequence[tuple[float, Optional[float]]], level: float,
                       *, tol: float = 1e-5) -> Optional[float]:
     """Nearest sidecar level's trust-noise to ``level`` within ``tol`` — robust to the ``.ti3``
