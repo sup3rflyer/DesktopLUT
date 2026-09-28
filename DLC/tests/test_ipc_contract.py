@@ -844,11 +844,16 @@ def test_stale_tell_wording_old_server_mismatch_and_failed_enter():
     old_other = _common.assess_stale_calibration(old_stale, {"active": True}, monitor=1, mode="SDR")
     assert old_other["session_mismatch"] is True
     assert "lost their pipe snapshot" in old_other["detail"]
+    # the slot now holds THIS monitor's genuine state — not "the cleared state"
+    assert "now holds the cleared state" not in old_other["detail"]
+    assert "THIS monitor's pre-enter state" in old_other["detail"]
 
     new_stale = {"active": True, "state": {"monitor": 0, "mode": "SDR"},
                  "captures": [{"monitor": 0, "captured_monitor": 0, "modes": ["SDR"], "age_s": 60.0}]}
     other_mode = _common.assess_stale_calibration(new_stale, {"snapshot_retained": True}, monitor=0, mode="HDR")
     assert other_mode["severity"] == "low" and other_mode["session_mismatch"] is True
+    # captures never expire: the kept capture's age is part of the evidence
+    assert other_mode["oldest_capture_age_s"] == 60.0 and "60 s old" in other_mode["detail"]
     assert other_mode["mismatch"] == ["the earlier session entered ['SDR'] on this monitor, this run is HDR"]
     assert "['HDR', 'SDR']" in other_mode["detail"]
 
@@ -866,6 +871,8 @@ def test_stale_tell_wording_old_server_mismatch_and_failed_enter():
     gone = {"active": True, "captures": [{"monitor": None, "captured_monitor": 1, "modes": ["HDR"]}]}
     unresolved = _common.assess_stale_calibration(gone, {"snapshot_retained": False}, monitor=0, mode="SDR")
     assert unresolved["severity"] == "medium" and "cannot be resolved" in unresolved["detail"]
+    # an unresolvable capture is not also claimed to be "put back too" by a restore
+    assert "puts them back too" not in unresolved["detail"] and unresolved["session_mismatch"] is False
 
     assert _common.assess_stale_calibration(None, {"snapshot_retained": False}, monitor=0, mode="SDR") is None
 

@@ -582,7 +582,10 @@ class MockDesktopLutServer:
         ``mhc.set_correction_grayscale`` it reproduces the curve exactly."""
         cg = (self.state.mhc.get(key) or {}).get("correction_grayscale")
         if not isinstance(cg, dict) or not cg.get("points"):
-            return _identity_correction_grayscale(key.endswith(":HDR"))
+            ident = _identity_correction_grayscale(key.endswith(":HDR"))
+            # the same C++ bool the layers block reports as `grayscale`
+            ident["enabled"] = bool((self.state.layers.get(key) or {}).get("grayscale"))
+            return ident
         view = deepcopy(cg)
         view["enabled"] = bool(cg.get("enabled", True))
         view["point_count"] = int(cg.get("point_count") or len(cg["points"]))
@@ -617,7 +620,7 @@ class MockDesktopLutServer:
             # KNOWN DIVERGENCE kept from Phase 9 T3: the reverse direction (ApplyGrayscalePayload
             # forcing it true) is NOT mirrored onto this layer flag, because doing so trips DLC's
             # hardware-readiness neutral audit on the grayscale-wb pause/resume path — whether that
-            # is a real hardware hazard is an owner question (phase-9.md §5b), not guessed here.
+            # is a real hardware hazard is an owner question (phase-9.md §5a), not guessed here.
             entry = self.state.mhc[key]
             cg = entry.get("correction_grayscale")
             if not isinstance(cg, dict) or not cg.get("points"):
@@ -772,12 +775,24 @@ class MockDesktopLutServer:
             if restore and self.state.snapshots:
                 first = True
                 for mon_s, cap in sorted(self.state.snapshots.items()):
+                    # C++ PlanCalibModeRestore per ENTERED mode, judged before the settings copy:
+                    # reinstall the captured MHC, else swap a live one for the identity profile.
+                    mhc_ops = []
+                    for md in ("SDR", "HDR"):
+                        if md not in (cap.get("modes") or []):
+                            continue
+                        k = f"{mon_s}:{md}"
+                        captured = ((cap.get("pairs") or {}).get(k) or {}).get("mhc") or {}
+                        live_now = self.state.mhc.get(k) or {}
+                        action = ("reinstall" if captured.get("applied")
+                                  else "identity_swap" if live_now.get("profile_name") else "none")
+                        mhc_ops.append({"mode": md, "action": action, "ok": True})
                     self._restore_monitor(cap)
                     if first:
                         self.state.corrections_enabled = bool(cap.get("corrections_enabled", True))
                         session_id = cap.get("session_id")
                         first = False
-                    restored_monitors.append(self._capture_view(mon_s, cap))
+                    restored_monitors.append({**self._capture_view(mon_s, cap), "mhc": mhc_ops})
             # The session is over either way — the captures go with it (the C++ always clears the
             # store), so a later exit(restore) with no session behind it restores NOTHING rather
             # than a previous run's pre-run state (the 2026-09-27 `3dlut-only --abort` bug).

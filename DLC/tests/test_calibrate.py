@@ -1413,7 +1413,8 @@ def test_enter_neutral_digest_carries_the_stale_session_evidence(tmp_path: Path)
     tell = digest["stale_calibration"]
     assert tell["session_mismatch"] is True and tell["severity"] == "medium"
     assert "monitor(s) [1]" in tell["mismatch"][0]
-    assert tell["stale_pairs"] == [{"monitor": 1, "mode": "SDR", "resolvable": True}]
+    assert [(p["monitor"], p["mode"], p["resolvable"]) for p in tell["stale_pairs"]] == [(1, "SDR", True)]
+    assert tell["oldest_capture_age_s"] is not None
 
 
 def test_restore_user_setup_is_honest_when_the_server_restored_nothing(tmp_path: Path):
@@ -1506,6 +1507,90 @@ def test_snapshot_restore_report_reads_old_and_unclear_replies():
     assert unclear["restored"] is None and unclear["complete"] is False
     assert "did not say" in unclear["summary"]
     assert snapshot_restore_report(None)["restored"] is None
+
+    # captures existed, none could be put back: not "held no capture"
+    none_back = snapshot_restore_report({"active": False, "restored": False, "restored_monitors": [],
+                                         "unrestored": [{"reason": "display not connected", "display": "Panel B",
+                                                         "captured_monitor": 1, "modes": ["SDR"]}]})
+    assert none_back["complete"] is False
+    assert "could put NONE" in none_back["summary"] and "held no calibration capture" not in none_back["summary"]
+    # settings back, but an MHC profile step failed: incomplete, and says which
+    mhc_fail = snapshot_restore_report({"active": False, "restored": True, "unrestored": [], "restored_monitors": [
+        {"monitor": 0, "modes": ["SDR", "HDR"], "mhc": [{"mode": "SDR", "action": "reinstall", "ok": True},
+                                                       {"mode": "HDR", "action": "identity_swap", "ok": False}]}]})
+    assert mhc_fail["complete"] is False and mhc_fail["mhc_failed"][0]["mode"] == "HDR"
+    assert "FAILED" in mhc_fail["summary"] and "identity_swap" in mhc_fail["summary"]
+
+
+def test_a_revert_the_server_could_not_honour_is_not_reported_as_reverted(tmp_path: Path, monkeypatch):
+    """_finish used to set status "reverted" whatever the restore returned — a DesktopLUT that
+    restarted mid-run (no capture) read as a clean revert."""
+    ctrl = CalibrationController.mock()
+    calib = _make(tmp_path, "revert_nothing", controller=ctrl, adjudicator=_AutoExceptVerify("revert"))
+    real_exit = ctrl.exit_calibration
+
+    def exit_after_restart(restore_snapshot=False):
+        real_exit(restore_snapshot=False)            # the session is gone...
+        return {"active": False, "restored": False, "restored_monitors": [], "unrestored": []}
+
+    monkeypatch.setattr(ctrl, "exit_calibration", exit_after_restart)
+    res = calib.run("mhc-only")
+    assert res.status == "revert_unavailable"
+    assert res.digest["snapshot_restore"]["restored"] is False
+    assert "restored NOTHING" in res.digest["snapshot_restore"]["summary"]
+
+
+def test_rollback_guard_does_not_ask_for_a_restore_an_in_place_run_never_took(tmp_path: Path):
+    """An in-place run (3dlut-only / grayscale-wb) never entered calibration mode, so the automatic
+    rollback must not call exit(restore_snapshot=True): on a new server that restores an unrelated
+    earlier session's capture, on a build predating the snapshot store a PREVIOUS run's setup."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import _rollback_restore
+
+    calls: list = []
+    ctrl = SimpleNamespace(exit_calibration=lambda **k: calls.append(("exit", k)) or {"restored": True},
+                           grayscale_cancel=lambda *a: calls.append(("cancel", a)) or {},
+                           set_layers=lambda *a, **k: {})
+    state = {"flow": "grayscale-wb", "inplace_baseline": {"captured": True}}
+    out = _rollback_restore(ctrl, state, monitor=0, mode="SDR", run_root=tmp_path, entered_calibration=False)
+    assert out["status"] == "rollback_restored_nothing"
+    assert out["snapshot_restore"]["not_requested"] is True
+    assert ("exit", {"restore_snapshot": True}) not in calls
+    assert calls == [("cancel", (0, "SDR"))]                  # the orphaned preview, and nothing else
+    assert "correction grayscale" in out["hint"]
+
+
+def test_abort_of_an_in_place_run_flags_a_restore_that_cannot_be_its_own(tmp_path: Path):
+    """--abort still asks (it is also the operator's live-pipe bail-out), but a restore reported for
+    a run that never entered is NOT this run's pre-run setup and must not read as "reverted"."""
+    from types import SimpleNamespace
+
+    from dlc.calibrate import _abort_restore
+
+    old_server = SimpleNamespace(exit_calibration=lambda restore_snapshot=False: {"active": False, "restored": True},
+                                 set_layers=lambda *a, **k: {})
+    state = {"flow": "3dlut-only", "stages": {"preflight": {}}, "inplace_baseline": {"captured": True, "cube_path": "C:/luts/a.cube"}}
+    code, payload = _abort_restore(old_server, state, monitor=0, mode="SDR", run_root=tmp_path)
+    assert code == 0 and payload["status"] == "restored_other_session"
+    assert "previous run's pre-run setup" in payload["snapshot_restore"]["summary"]
+    assert "C:/luts/a.cube" in payload["hint"]
+
+
+def test_grayscale_wb_prior_is_captured_once_per_run(tmp_path: Path):
+    """A stage re-run after DLC died mid-touch-up would read the half-finished live edit (the
+    live session writes straight into correctionGrayscale) and persist it as the 'prior' a revert
+    restores. The first snapshot of the run is kept."""
+    ctrl = _gswb_controller()
+    calib = _make(tmp_path, "gswb_prior_once", controller=ctrl)
+    calib.target_name = "srgb_g22"
+    calib.measure = _editor_responsive_panel(ctrl, calib._transfer(), white_nits=120.0)
+    first = {"enabled": False, "point_count": 2, "points": [0.0, 1.0],
+             "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}}
+    calib.calib["grayscale_wb_prior"] = dict(first)
+    calib.calib["grayscale_wb_prior_source"] = "prior"
+    assert calib.stage_grayscale_wb_touchup().status == "done"
+    assert calib.calib["grayscale_wb_prior"] == first
 
 
 # ---------------------------------------------------------------------------
@@ -2001,7 +2086,11 @@ def test_decide_override_supersedes_recorded_decision_on_resume(tmp_path: Path):
 
 def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
     # End-to-end: a full run records verify:accept=apply; resuming the SAME run with an
-    # explicit override flips the terminal gate to a real snapshot revert.
+    # explicit override flips the terminal gate to a revert. The first run already COMMITTED
+    # (exit without restore), and every exit drops DesktopLUT's pre-run capture — so the snapshot
+    # revert can no longer put anything back, and the run must SAY so (revert_unavailable), not
+    # report "reverted". (Pre-fix C++ never cleared its slot, which made this "work" by restoring
+    # whatever it last captured — the same stale slot that hit `3dlut-only --abort`.)
     ctrl = CalibrationController.mock()
     first = _make(tmp_path, "ovfull", controller=ctrl)
     assert first.run("full").status == "completed"
@@ -2010,8 +2099,9 @@ def test_decide_override_flips_full_flow_to_revert_on_resume(tmp_path: Path):
     resumed = _make(tmp_path, "ovfull", controller=ctrl,
                     decision_overrides={"verify:accept": Decision("revert", note="cli")})
     result = resumed.run("full")
-    assert result.status == "reverted"
     assert resumed.calib["decisions"]["verify:accept"]["choice"] == "revert"
+    assert result.status == "revert_unavailable"
+    assert "restored NOTHING" in result.digest["snapshot_restore"]["summary"]
 
 
 # ---------------------------------------------------------------------------

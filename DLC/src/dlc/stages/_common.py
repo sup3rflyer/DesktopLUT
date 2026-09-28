@@ -279,11 +279,12 @@ def stale_calibration_session(controller: CalibrationController) -> dict[str, An
     return None
 
 
-def _stale_pairs(stale: dict[str, Any]) -> list[tuple[Any, str, bool]]:
-    """(monitor, mode, resolvable) the stale session holds: from ``captures`` when the server
-    reports them (its restore target), else the single ``state`` block of an older server."""
+def _stale_pairs(stale: dict[str, Any]) -> list[dict[str, Any]]:
+    """``{monitor, mode, resolvable, age_s, resolved_by}`` per mode the stale session holds: from
+    ``captures`` when the server reports them (its restore target), else the single ``state``
+    block of an older server (no age, no resolution)."""
     captures = stale.get("captures")
-    pairs: list[tuple[Any, str, bool]] = []
+    pairs: list[dict[str, Any]] = []
     if isinstance(captures, list) and captures:
         for cap in captures:
             if not isinstance(cap, dict):
@@ -293,12 +294,26 @@ def _stale_pairs(stale: dict[str, Any]) -> list[tuple[Any, str, bool]]:
             if mon is None:
                 mon = cap.get("captured_monitor")
             for md in cap.get("modes") or []:
-                pairs.append((mon, str(md).upper(), resolvable))
+                pairs.append({"monitor": mon, "mode": str(md).upper(), "resolvable": resolvable,
+                              "age_s": cap.get("age_s"), "resolved_by": cap.get("resolved_by")})
         return pairs
     state = stale.get("state")
     if isinstance(state, dict) and state.get("monitor") is not None:
-        pairs.append((state.get("monitor"), str(state.get("mode") or "").upper(), True))
+        pairs.append({"monitor": state.get("monitor"), "mode": str(state.get("mode") or "").upper(),
+                      "resolvable": True, "age_s": None, "resolved_by": None})
     return pairs
+
+
+def _age_words(age_s: Any) -> str:
+    try:
+        age = float(age_s)
+    except (TypeError, ValueError):
+        return "of unknown age"
+    if age < 120:
+        return f"{age:.0f} s old"
+    if age < 7200:
+        return f"{age / 60:.0f} min old"
+    return f"{age / 3600:.1f} h old"
 
 
 def assess_stale_calibration(stale: dict[str, Any] | None, enter_result: Any, *,
@@ -317,10 +332,16 @@ def assess_stale_calibration(stale: dict[str, Any] | None, enter_result: Any, *,
         return None
     mode = str(mode).upper()
     pairs = _stale_pairs(stale)
-    other_monitors = sorted({m for m, _, _ in pairs if m is not None and int(m) != int(monitor)})
-    other_modes = sorted({md for m, md, _ in pairs
-                          if m is not None and int(m) == int(monitor) and md and md != mode})
-    unresolvable = sorted({m for m, _, ok in pairs if not ok and m is not None})
+    resolved = [p for p in pairs if p["resolvable"] and p["monitor"] is not None]
+    other_monitors = sorted({int(p["monitor"]) for p in resolved if int(p["monitor"]) != int(monitor)})
+    other_modes = sorted({p["mode"] for p in resolved
+                          if int(p["monitor"]) == int(monitor) and p["mode"] and p["mode"] != mode})
+    on_this_monitor = any(int(p["monitor"]) == int(monitor) for p in resolved)
+    unresolvable = sorted({int(p["monitor"]) for p in pairs if not p["resolvable"] and p["monitor"] is not None})
+    ages = [p["age_s"] for p in pairs if isinstance(p.get("age_s"), (int, float))]
+    oldest = max(ages) if ages else None
+    this_age = next((p["age_s"] for p in resolved if int(p["monitor"]) == int(monitor)
+                     and isinstance(p.get("age_s"), (int, float))), None)
     retained = enter_result.get("snapshot_retained") if isinstance(enter_result, dict) else None
     reports_store = isinstance(stale.get("captures"), list)
     mismatch: list[str] = []
@@ -345,22 +366,31 @@ def assess_stale_calibration(stale: dict[str, Any] | None, enter_result: Any, *,
         parts.append(
             "the server kept its ORIGINAL pre-session capture of this display, so "
             "exit(restore_snapshot=True) can still restore the user's setup")
+        if this_age is not None:
+            # captures never expire: anything the user set up after it was taken would be overwritten
+            parts.append(f"that capture is {_age_words(this_age)} — a restore puts back the display as it was "
+                         "then, overwriting anything changed on it since")
         if other_modes:
             parts.append(f"that capture now covers {sorted(set(other_modes) | {mode})}, and a restore "
                          "reinstalls each entered mode's MHC")
     elif retained is False:
         parts.append("the server captured this display afresh (the earlier session had not captured it)")
-        if not other_monitors:
+        if on_this_monitor:
             severity = "medium"
             parts.append(
                 "although the session was open on this monitor — the display may have been "
                 "re-identified; treat the pre-run settings backup as the authoritative restore")
     else:
         severity = "medium"
-        parts.append(
-            "and the server did not report keeping the original snapshot (a build predating the "
-            "snapshot store): the pipe's restore snapshot now holds the cleared state — treat the "
-            "pre-run settings backup as the authoritative restore")
+        if on_this_monitor or not pairs:
+            parts.append(
+                "and the server did not report keeping the original snapshot (a build predating the "
+                "snapshot store): the pipe's restore snapshot now holds the cleared state — treat the "
+                "pre-run settings backup as the authoritative restore")
+        else:
+            parts.append(
+                "and the server did not report keeping the original snapshot (a build predating the "
+                "snapshot store): its single restore slot now holds THIS monitor's pre-enter state")
     if other_monitors and isinstance(enter_result, dict):
         severity = "medium"
         if retained is None:
@@ -377,7 +407,8 @@ def assess_stale_calibration(stale: dict[str, Any] | None, enter_result: Any, *,
     detail = lead + "; " + "; ".join(parts)
     return {
         "active": bool(stale.get("active")),
-        "stale_pairs": [{"monitor": m, "mode": md, "resolvable": ok} for m, md, ok in pairs],
+        "stale_pairs": pairs,
+        "oldest_capture_age_s": oldest,
         "snapshot_retained": retained,
         "server_reports_captures": reports_store,
         "session_mismatch": bool(mismatch),
@@ -414,12 +445,28 @@ def snapshot_restore_report(out: Any) -> dict[str, Any]:
     raw = reply.get("restored")
     restored = raw if isinstance(raw, bool) else None
     unrestored = [u for u in (reply.get("unrestored") or []) if isinstance(u, dict)]
-    report: dict[str, Any] = {"restored": restored, "unrestored": unrestored,
-                              "complete": restored is True and not unrestored}
-    if isinstance(reply.get("restored_monitors"), list):
-        report["restored_monitors"] = reply["restored_monitors"]
+    monitors = reply.get("restored_monitors") if isinstance(reply.get("restored_monitors"), list) else None
+    # per-mode MHC outcome of each restored display: a settings restore whose profile reinstall /
+    # identity swap FAILED leaves the old transform in scanout, so it is not a complete restore
+    mhc_failed = [{"monitor": m.get("monitor"), "display": m.get("display"), **op}
+                  for m in (monitors or []) if isinstance(m, dict)
+                  for op in (m.get("mhc") or []) if isinstance(op, dict) and op.get("ok") is False]
+    report: dict[str, Any] = {"restored": restored, "unrestored": unrestored, "mhc_failed": mhc_failed,
+                              "complete": restored is True and not unrestored and not mhc_failed}
+    if monitors is not None:
+        report["restored_monitors"] = monitors
     if report["complete"]:
         report["summary"] = "DesktopLUT restored the pre-run setup"
+    elif restored is True and mhc_failed and not unrestored:
+        what = ", ".join(f"monitor {f.get('monitor')} {f.get('mode')} ({f.get('action')})" for f in mhc_failed)
+        report["summary"] = (f"DesktopLUT restored the settings, but putting the MHC profile back FAILED for "
+                             f"{what} — the display may still scan out the calibration's profile; re-apply "
+                             "it from the pre-run settings backup")
+    elif restored is not True and unrestored:
+        names = ", ".join(str(u.get("display") or f"monitor {u.get('captured_monitor')}") for u in unrestored)
+        report["summary"] = (f"DesktopLUT held this run's captures but could put NONE of them back ({names}: "
+                             f"{'; '.join(str(u.get('reason')) for u in unrestored)}) — restore them from the "
+                             "pre-run settings backup")
     elif restored is True:
         names = ", ".join(str(u.get("display") or f"monitor {u.get('captured_monitor')}") for u in unrestored)
         report["summary"] = (f"DesktopLUT restored only part of the pre-run setup: {len(unrestored)} captured "

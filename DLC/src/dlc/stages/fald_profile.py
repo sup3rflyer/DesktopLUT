@@ -829,6 +829,9 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         try:
             enter = controller.enter_neutral(args.monitor, mode, str(resolve_profile_path(dummy.path)), reason="DLC fald-profile")
         except Exception as exc:  # noqa: BLE001
+            # A client-side failure (e.g. the pipe timeout, where the spec says the enter may still be
+            # APPLIED server-side) cannot prove the server did NOT enter: unknown → restore attempts it.
+            st["fald"]["entered"] = None
             _common.note_stale_calibration(result, stale, None, monitor=args.monitor, mode=mode)
             result.fail("enter_native_failed", f"{type(exc).__name__}: {exc}")
             return
@@ -1841,7 +1844,8 @@ def phase_restore(s: Session, result: StageResult) -> None:
         ctl.set_layers(s.args.monitor, mode, fald=False)
     except Exception:  # noqa: BLE001
         pass
-    # None = a run recorded before the flag existed: attempt the restore as before.
+    # None = unknown (a run recorded before the flag existed, or an enter that failed client-side and
+    # may still have landed): attempt the restore as before.
     entered = s.st["fald"].get("entered")
     result.metrics["entered_calibration"] = entered
     if entered is False:

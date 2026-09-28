@@ -279,6 +279,27 @@ def test_stage_restore_without_a_session_raises_no_false_alarm(tmp_path):
     assert "calibration_exit" not in again.raw and not [a for a in again.anomalies if a.severity == "high"]
 
 
+def test_stage_restore_still_exits_after_an_enter_that_failed_client_side(tmp_path, monkeypatch):
+    """A client-side enter failure (the pipe timeout — the spec says the request may still be APPLIED server-side)
+    cannot prove DesktopLUT did not enter: the run records `entered` as unknown and restore still exits."""
+    from dlc.controller import CalibrationController
+
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    real_enter = CalibrationController.enter_neutral
+
+    def enter_then_time_out(self, *a, **k):
+        real_enter(self, *a, **k)                    # landed server-side...
+        raise TimeoutError("pipe timed out")         # ...but the client never heard back
+
+    monkeypatch.setattr(CalibrationController, "enter_neutral", enter_then_time_out)
+    pre = _run(ctx, "preflight")
+    assert pre.status == "failed" and pre.metrics["entered_calibration"] is False
+    assert _common.load_dlc_state(ctx)["fald"]["entered"] is None
+    monkeypatch.setattr(CalibrationController, "enter_neutral", real_enter)
+    res = _run(ctx, "restore")
+    assert "calibration_exit" in res.raw and res.metrics["stack_restored"] is True
+
+
 def test_stage_refuses_measuring_before_preflight(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
     res = _run(ctx, "rings")
