@@ -232,14 +232,18 @@ class CalibrationController:
         signal x-grid, which bends any curve with a luminance component (a 1.05 main slider came
         back ~0.0065 off at slot 1). Only ``point_count`` / ``points`` / ``deviations`` go on the
         wire — never ``luminance`` / ``rgb``, which would scale the stored points a second time.
-        ``ApplyGrayscalePayload`` forces ``enabled`` true; restore it with :meth:`set_layers`."""
+        ``ApplyGrayscalePayload`` forces ``enabled`` true; restore it with :meth:`set_layers`.
+
+        ``point_count`` is sent as ``len(points)``, never the block's own field: C++ replaces a
+        ``points`` array whose size differs from ``point_count`` with a LINEAR ramp, so a stored
+        pointCount that disagrees with the stored points would turn the revert into identity."""
         points = [float(p) for p in (block.get("points") or [])]
         return self.call(
             "mhc.set_correction_grayscale",
             {
                 "monitor": monitor,
                 "mode": normalize_mode(mode),
-                "point_count": int(block.get("point_count") or len(points)),
+                "point_count": len(points),
                 "points": points,
                 "deviations": _coerce_deviations(block.get("deviations") or {}),
             },

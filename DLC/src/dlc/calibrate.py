@@ -5892,8 +5892,17 @@ class Calibration:
                 return None
             self.calib["grayscale_wb_prior_source"] = "prior"
             devs = cg.get("deviations") or {}
+            # The run switched the grayscale LAYER off before this snapshot (hardware-readiness),
+            # so the live bit reads False for a user whose curve was ON; the user's own on/off is
+            # the viewing-layer capture taken before anything was switched.
+            enabled = cg.get("enabled")
+            vl = self.calib.get("viewing_layers")
+            if (isinstance(vl, dict) and vl.get("captured") and isinstance(vl.get("before"), dict)
+                    and "grayscale" in vl["before"] and vl.get("monitor") in (None, self.monitor)
+                    and str(vl.get("mode") or self.mode) == str(self.mode)):
+                enabled = bool(vl["before"]["grayscale"])
             return {
-                "enabled": cg.get("enabled"),
+                "enabled": enabled,
                 "point_count": int(cg.get("point_count") or len(cg["points"])),
                 "points": [float(p) for p in cg["points"]],
                 "deviations": {ch: [float(v) for v in (devs.get(ch) or [])] for ch in ("r", "g", "b")},

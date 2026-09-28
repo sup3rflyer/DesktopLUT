@@ -1582,6 +1582,61 @@ def test_abort_of_an_in_place_run_never_asks_for_a_restore_even_with_a_session_o
     assert "C:/luts/a.cube" in payload["hint"]
 
 
+def test_grayscale_wb_revert_keeps_the_users_curve_on_from_the_viewing_layer_capture(tmp_path: Path):
+    """S3: hardware-readiness switches the grayscale LAYER off before the prior snapshot, so the live
+    bit read False for a user whose curve was ON. The prior's `enabled` now comes from the viewing-
+    layer capture taken before anything was switched: the revert turns it back on itself (no longer
+    only because _restore_viewing_layers happens to run later), with no off/on churn."""
+    ctrl = _gswb_controller()
+    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4}, gamma=2.2)
+    ctrl.set_layers(0, "SDR", grayscale=True)
+    user = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    calls: list = []
+    real = ctrl.set_layers
+
+    def spy(mon, mode, **kw):
+        if "grayscale" in kw:
+            calls.append(kw["grayscale"])
+        return real(mon, mode, **kw)
+
+    ctrl.set_layers = spy
+    calib = _make(tmp_path, "gswb_on", controller=ctrl, decision_overrides={"verify:accept": Decision("revert")})
+    assert calib.run("grayscale-wb").status == "reverted"
+    assert calib.calib["grayscale_wb_prior"]["enabled"] is True
+    back = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    assert back["enabled"] is True and back["points"] == user["points"]
+    assert calls[0] is False and False not in calls[1:]        # off for the run, then only back ON
+
+    # ...and it ends ON even when the viewing layers were already marked restored (so the terminal
+    # _restore_viewing_layers does nothing): the revert alone must put the user's state back.
+    ctrl2 = _gswb_controller()
+    ctrl2.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
+                                   {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4}, gamma=2.2)
+    ctrl2.set_layers(0, "SDR", grayscale=True)
+    calib2 = _make(tmp_path, "gswb_on_marked", controller=ctrl2,
+                   decision_overrides={"verify:accept": Decision("revert")})
+    real_restore = calib2._restore_viewing_layers
+    calib2._restore_viewing_layers = lambda: None               # "already restored"
+    assert calib2.run("grayscale-wb").status == "reverted"
+    calib2._restore_viewing_layers = real_restore
+    assert ctrl2.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is True
+
+
+def test_raw_grayscale_setter_sends_the_real_point_count():
+    """N1: C++ ApplyGrayscalePayload replaces `points` with a LINEAR ramp when their size differs
+    from point_count, so a stored pointCount that disagrees with the stored points must not ride
+    the wire — the revert would restore identity."""
+    ctrl = CalibrationController.mock()
+    ctrl.apply_mhc(0, "SDR")
+    block = {"point_count": 20, "points": [0.0, 0.3, 1.0],
+             "deviations": {"r": [1.0, 1.02, 1.0], "g": [1.0] * 3, "b": [1.0] * 3}}
+    ctrl.set_correction_grayscale_raw(0, "SDR", block)
+    wire = [r for r in ctrl.client.transport.requests if r.method == "mhc.set_correction_grayscale"][-1]
+    assert wire.params["point_count"] == 3
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["points"] == [0.0, 0.3, 1.0]
+
+
 @pytest.mark.parametrize("reply, status", [
     ({"active": False, "restored": True, "unrestored": [], "restored_monitors": [
         {"monitor": 0, "modes": ["SDR"], "mhc": [{"mode": "SDR", "action": "reinstall", "ok": False}]}]},
@@ -4490,6 +4545,7 @@ def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path
     ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
                                   {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
                                   gamma=2.2)
+    ctrl.set_layers(0, "SDR", grayscale=True)   # on hardware the curve's enable IS this layer flag
     # The controller's SDR bridge resamples on the way in — the pre-existing correction, as
     # DesktopLUT actually STORES it, is what revert must bring back:
     prior_stored = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
@@ -4537,6 +4593,7 @@ def test_grayscale_wb_revert_restores_a_luminance_scaled_curve_exactly(tmp_path:
     ctrl.grayscale_live_begin(0, "SDR")
     ctrl.grayscale_set_live(0, "SDR", n, grid, devs, luminance=lum, rgb=rgb)
     ctrl.grayscale_commit(0, "SDR")
+    ctrl.set_layers(0, "SDR", grayscale=True)   # on hardware the curve's enable IS this layer flag
     prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     identity = [(i / (n - 1)) ** 2 for i in range(n)]
     assert max(abs(a - b) for a, b in zip(prior["points"], identity)) > 1e-3   # luminance in the points
