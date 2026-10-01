@@ -356,7 +356,9 @@ def fit_constant_pedestal(rgb, xyz, se=None) -> dict:
         weighting = "unweighted (no per-row SE)"
     out = {"P_xyz": P.tolist(), "P_se_Y": se_Y, "n_codes": len(per), "weighting": weighting, "per_code": per,
            "constancy": {"chi2": chi2, "dof": dof, "chi2_per_dof": (chi2 / dof if chi2 is not None and dof > 0 else None),
-                         "note": "≫ 1 = the P_m disagree beyond their noise — the pedestal is not constant (evidence)"}}
+                         "note": "≫ 1 (LD off) = the pedestal is NOT constant across codes — that IS the non-additivity "
+                                 "signal (or a content-dependent backlight with LD off): a decision input next to the "
+                                 "grey residual and the ratio trend, not a fit-quality footnote"}}
     blk_mask = rgb.max(1) <= 1e-9
     if blk_mask.any():
         bm = xyz[blk_mask].mean(0)
@@ -781,7 +783,9 @@ def do_analyze(args) -> int:
         st["checks"] = {"grey_de_max": gmax, "grey_de_max_le_threshold": (gmax is not None and gmax <= GREY_DE_ITP_MAX),
                         "trend_slope": tr.get("slope_de_per_log10_ratio"), "trend_se": tr.get("se"),
                         "trend_significantly_negative": (tr.get("slope_de_per_log10_ratio") is not None and
-                                                         tr["slope_de_per_log10_ratio"] < -2 * tr["se"])}
+                                                         tr["slope_de_per_log10_ratio"] < -2 * tr["se"]),
+                        # the third LD-off decision input: is the fitted constant pedestal actually constant?
+                        "pedestal_chi2_per_dof": ((st.get("fitted_constant_fit") or {}).get("constancy") or {}).get("chi2_per_dof")}
         out["states"][state] = st
     hc.atomic_write_text(sess / "analysis.json", json.dumps(out, indent=1, default=float))
     fs = frozen.get("source_stats") or {}
