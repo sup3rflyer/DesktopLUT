@@ -130,6 +130,12 @@ P2_HIGH_MIXES = ((437, 493, 493), (437, 437, 493), (525, 591, 591), (525, 525, 5
 P0_CODES = (749,)          # the BRIGHTER window: two zone columns out the glow is the 32 mm kernel tail (<= ~0.1 nit),
                            # so a luma-rule blue glow (~0.1x grey) must still clear the black floor; --p0-codes adds 553
 P0_MIN_READS = 5
+# Pedestal-identification set (P estimation ONLY — its own raw_pedestal.ti3, never in the frozen 132412 comparison):
+# grey + R/G/B singles at ~2 and ~5 nit as-if-white, where the constant pedestal P is a large fraction of every read
+# (blue alone at code 250 ≈ 0.5 nit on a ~1.9-nit flat-out LD-off pedestal) and so is well identified; the bright P2
+# codes' P_m are differences of four several-hundred-nit reads with noise as large as P itself.
+P2_PEDESTAL_CODES = (200, 250)
+PEDESTAL_MIN_READS = 5
 SDR_ANCHOR_HDR_CODE = 837
 SPEED_TAU_S = {"fast": 0.05, "medium": 0.4, "gradual": 1.5, "off": 0.0}   # --simulate only
 # the minimum span of a settled tail per Dynamic Dimming speed (--settle-min-span-s overrides): the speeds'
@@ -227,6 +233,12 @@ def plan_p2(args, g: hc.Geometry) -> list[hc.Patch]:
             v[k] = c
             singles.append((f"{ch}{c}", tuple(v)))
     pats = [pat("P2:black", (0, 0, 0), "black")]
+    for c in P2_PEDESTAL_CODES:
+        for n, v in ((f"grey{c}", (c, c, c)), (f"R{c}", (c, 0, 0)), (f"G{c}", (0, c, 0)), (f"B{c}", (0, 0, c))):
+            p0 = pat(f"P2:ped_{n}", v, "ped_grey" if n.startswith("grey") else "ped_single")
+            p0.cond, p0.min_reads = "pedestal", PEDESTAL_MIN_READS
+            p0.meta["pedestal_only"] = True
+            pats.append(p0)
     pats += [pat(f"P2:{n}:a", v, "single") for n, v in singles]
     body = [(f"P2:grey{c}", (c, c, c), "grey") for c in P2_GREYS] + \
            [(f"P2:mix{m[0]}_{m[1]}_{m[2]}", m, "mix") for m in mixes]
@@ -294,47 +306,77 @@ def run_pa_additivity(script: Path, run_dir: Path) -> tuple[dict, str]:
     return ns, buf.getvalue()
 
 
-def fit_constant_pedestal(rgb, xyz) -> dict:
+def fit_constant_pedestal(rgb, xyz, se=None) -> dict:
     """ONE constant pedestal P (XYZ, 3 parameters) from the greys, no black read involved. Under additivity with a
     constant pedestal, grey(m) = P + Σ own_k(m) and single_k(m) = P + own_k(m), so grey(m) − Σ_k single_k(m) = −2P at
-    EVERY code m: each grey code with all three singles at the same code gives P_m = −(grey − Σ singles)/2 and the
-    least-squares P is their mean. The spread of P_m across codes is the deviation from constancy (not circular);
-    the mixes are then scored OUT-OF-SAMPLE with this P. A 0,0,0 read in a different backlight state (the BenQ's
-    1.7× black-frame understatement, 2026-10-01) cannot fake non-additivity here."""
+    EVERY code m: each grey code with all three singles at the same code gives P_m = −(grey − Σ singles)/2. The
+    estimate is the INVERSE-VARIANCE weighted mean of the P_m — a P_m is a difference of four reads, so a bright code
+    (several hundred nits, ~1–3 nit per read) carries noise as large as P itself and must not dominate it; the dim
+    pedestal-identification set (``P2_PEDESTAL_CODES``) is where P is well identified. ``se``: per-row SE of Y (cd/m²)
+    from the patch's kept reads (floored at the meter prior); without it the plain mean is used. The weighted χ²/dof
+    of the P_m about P is the constancy evidence; the mixes are then scored OUT-OF-SAMPLE with this P. A 0,0,0 read in
+    a different backlight state (the BenQ's 1.7× black-frame understatement, 2026-10-01) cannot fake non-additivity."""
     import numpy as np
     rgb, xyz = np.asarray(rgb, float), np.asarray(xyz, float)
+    sev = None if se is None else np.asarray(se, float)
     nz = (rgb > 1e-9).sum(1)
 
-    def mean_at(mask):
-        return xyz[mask].mean(0) if mask.any() else None
+    def stat_at(mask):
+        if not mask.any():
+            return None
+        X = xyz[mask].mean(0)
+        if sev is None:
+            return X, None
+        # duplicates of one patch (singles are read twice) average: SE of the mean of k independent patch means
+        return X, float(np.sqrt(np.sum(sev[mask] ** 2)) / mask.sum())
     per = []
-    for c in np.unique(np.round(rgb[(np.ptp(rgb, 1) < 1e-9) & (rgb.max(1) > 0), 0], 6)):
-        g = mean_at((np.ptp(rgb, 1) < 1e-9) & np.isclose(rgb[:, 0], c))
-        singles = [mean_at((nz == 1) & np.isclose(rgb[:, k], c)) for k in range(3)]
+    is_grey = (np.ptp(rgb, 1) < 1e-9) & (rgb.max(1) > 0)
+    for c in np.unique(np.round(rgb[is_grey, 0], 6)):
+        g = stat_at(is_grey & np.isclose(rgb[:, 0], c))
+        singles = [stat_at((nz == 1) & np.isclose(rgb[:, k], c)) for k in range(3)]
         if g is None or any(x is None for x in singles):
             continue
-        per.append({"code_norm": float(c), "P": (-(g - sum(singles)) / 2.0).tolist()})
+        Pm = -(g[0] - sum(x[0] for x in singles)) / 2.0
+        se_m = (0.5 * float(np.sqrt(g[1] ** 2 + sum(x[1] ** 2 for x in singles)))) if sev is not None else None
+        per.append({"code_norm": float(c), "P": Pm.tolist(), "P_se_Y": se_m})
     if not per:
         raise ValueError("fitted_constant pedestal: no grey code has all three singles at the same code")
     Ps = np.array([q["P"] for q in per])
-    P = Ps.mean(0)
-    se = (Ps.std(0, ddof=1) / np.sqrt(len(Ps))).tolist() if len(Ps) > 1 else [float("nan")] * 3
-    out = {"P_xyz": P.tolist(), "P_se_xyz": se, "n_codes": len(per), "per_code": per}
-    blk = xyz[rgb.max(1) <= 1e-9]
-    if len(blk):
-        bm = blk.mean(0)
-        bse = (blk.std(0, ddof=1) / np.sqrt(len(blk))) if len(blk) > 1 else np.full(3, np.nan)
+    if sev is not None and all(q["P_se_Y"] and q["P_se_Y"] > 0 for q in per):
+        w = np.array([1.0 / q["P_se_Y"] ** 2 for q in per])
+        P = (w[:, None] * Ps).sum(0) / w.sum()
+        se_Y = float(np.sqrt(1.0 / w.sum()))
+        chi2 = float(np.sum(w * (Ps[:, 1] - P[1]) ** 2))
+        dof = len(per) - 1
+        weighting = "inverse-variance (per-code SE from the kept reads, floored at the meter prior)"
+    else:
+        P = Ps.mean(0)
+        se_Y = float(Ps[:, 1].std(ddof=1) / np.sqrt(len(Ps))) if len(Ps) > 1 else float("nan")
+        chi2, dof = None, len(per) - 1
+        weighting = "unweighted (no per-row SE)"
+    out = {"P_xyz": P.tolist(), "P_se_Y": se_Y, "n_codes": len(per), "weighting": weighting, "per_code": per,
+           "constancy": {"chi2": chi2, "dof": dof, "chi2_per_dof": (chi2 / dof if chi2 is not None and dof > 0 else None),
+                         "note": "≫ 1 = the P_m disagree beyond their noise — the pedestal is not constant (evidence)"}}
+    blk_mask = rgb.max(1) <= 1e-9
+    if blk_mask.any():
+        bm = xyz[blk_mask].mean(0)
+        if sev is not None:
+            bse = float(np.sqrt(np.sum(sev[blk_mask] ** 2)) / blk_mask.sum())
+        else:
+            bse = float(xyz[blk_mask, 1].std(ddof=1) / np.sqrt(blk_mask.sum())) if blk_mask.sum() > 1 else float("nan")
         dY = float(P[1] - bm[1])
-        sig = float(np.sqrt(np.nan_to_num(se[1]) ** 2 + np.nan_to_num(bse[1]) ** 2))
-        out["measured_black"] = {"Y": float(bm[1]), "Y_se": float(bse[1]), "n": int(len(blk)),
+        sig = float(np.sqrt(np.nan_to_num(se_Y) ** 2 + np.nan_to_num(bse) ** 2))
+        out["measured_black"] = {"Y": float(bm[1]), "Y_se": bse, "n": int(blk_mask.sum()),
                                  "fitted_over_measured_Y": (float(P[1] / bm[1]) if bm[1] > 0 else None),
+                                 "difference_Y": dY, "difference_sigma": (dY / sig if sig > 0 else None),
                                  "disagree_beyond_noise": bool(sig > 0 and abs(dY) > 3 * sig),
                                  "note": "a disagreement is EVIDENCE of a black-state effect (as on the BenQ), "
                                          "not of non-additivity — for the LLM to judge"}
     return out
 
 
-def additivity_rows(rgb, xyz, *, transfer: str, pedestal: str, bit_depth: int = 10, gamma: float = 2.2) -> list[dict]:
+def additivity_rows(rgb, xyz, *, transfer: str, pedestal: str, bit_depth: int = 10, gamma: float = 2.2,
+                    P=None) -> list[dict]:
     """pa_additivity.py's bookkeeping with a pluggable pedestal: ``ld_on_law`` = its hard-coded 132412
     level-edge law (identical numbers to the script for ``transfer='pq'``), ``measured_black`` = a
     constant pedestal = the mean of the set's own 0,0,0 reads, ``fitted_constant`` = ONE constant pedestal fitted
@@ -360,7 +402,7 @@ def additivity_rows(rgb, xyz, *, transfer: str, pedestal: str, bit_depth: int = 
         P = blk.mean(0)
         ped = lambda m: (np.asarray(m, dtype=float) > 0)[..., None] * P  # noqa: E731
     elif pedestal == "fitted_constant":
-        P = np.asarray(fit_constant_pedestal(rgb, xyz)["P_xyz"])
+        P = np.asarray(P if P is not None else fit_constant_pedestal(rgb, xyz)["P_xyz"])   # P from a wider set (+ SE)
         ped = lambda m: (np.asarray(m, dtype=float) > 0)[..., None] * P  # noqa: E731
     else:
         raise ValueError(pedestal)
@@ -613,6 +655,16 @@ def do_measure(args) -> int:
             if ph == "p2" and s.mode == "SDR":
                 extra["sdr_mapping"] = {"rule": "PQ linear light relative to HDR code 837 -> SDR full scale via the SDR power law",
                                         "gamma": args.sdr_gamma, "anchor_hdr_code": SDR_ANCHOR_HDR_CODE}
+            if ph == "p2":
+                ped = [r for r in res if r.patch.cond == "pedestal"]
+                res = [r for r in res if r.patch.cond != "pedestal"]
+                pdir = s.root / ph
+                hc.write_ti3(pdir / "measurements" / "raw_pedestal.ti3",
+                             [(r.patch.ti3_rgb or r.patch.field, r.xyz) for r in ped if r.xyz is not None], bit_depth=bd,
+                             title=f"probe_ld_additivity p2 pedestal set LD {state}",
+                             notes=["P estimation ONLY (fitted_constant) — not part of the 132412 comparison set"])
+                hc.atomic_write_text(pdir / "p2_pedestal.json", json.dumps(
+                    {"ld": state, "results": [r.as_dict(s.geometry) for r in ped]}, indent=1, default=float))
             hc.phase_outputs(s, ph, res, bit_depth=bd, title=f"probe_ld_additivity {ph} LD {state} ({args.dimming_speed})",
                              ti3_layout="flat" if ph == "p0" else "measurements", split_by_cond=False, extra=extra,
                              notes=(["RGB = the WINDOW code one zone beside the meter; XYZ = the glow read on black"]
@@ -647,6 +699,30 @@ def do_measure(args) -> int:
 
 
 # ----------------------------------------------------------------------------- analyze
+def p2_rows_with_se(d: Path, bit_depth: int) -> tuple[list, list, list]:
+    """``(rgb 0–1, xyz, se_Y)`` per P2 patch from ``p2.json`` (the comparison set) + ``p2_pedestal.json`` (the
+    P-estimation set). se_Y = max(the kept reads' SD, the meter prior σ) / √n — a 3–5-read SD alone is too
+    unstable to weight with. Empty lists when the phase JSON is missing (older sessions)."""
+    rgb, xyz, se = [], [], []
+    mx = float(hc.max_code(bit_depth))
+    for name in ("p2.json", "p2_pedestal.json"):
+        f = d / name
+        if not f.exists():
+            continue
+        for r in json.loads(f.read_text(encoding="utf-8")).get("results") or []:
+            if not r.get("xyz"):
+                continue
+            pt = r["patch"]
+            code = pt.get("ti3_rgb") or pt["field"]
+            y = float(r["xyz"][1])
+            n = max(int(r.get("n_kept") or 1), 1)
+            sd = max(float(r.get("sd_y") or 0.0), hc.noise_floor(y))
+            rgb.append([c / mx for c in code])
+            xyz.append([float(v) for v in r["xyz"]])
+            se.append(sd / math.sqrt(n))
+    return rgb, xyz, se
+
+
 def do_analyze(args) -> int:
     sess = session_dir(args)
     fpath = sess / "frozen_prediction.json"
@@ -684,10 +760,12 @@ def do_analyze(args) -> int:
         except ValueError as exc:
             st["measured_black_pedestal"] = {"error": str(exc)}
         try:
-            st["fitted_constant_fit"] = fit_constant_pedestal(rgb, xyz)
+            frgb, fxyz, fse = p2_rows_with_se(d, bd)       # comparison set + the pedestal-only set, per-patch SE
+            fit = fit_constant_pedestal(frgb, fxyz, fse) if frgb else fit_constant_pedestal(rgb, xyz)
+            st["fitted_constant_fit"] = fit
             st["fitted_constant_pedestal"] = residual_stats(additivity_rows(rgb, xyz, transfer=transfer,
                                                                             pedestal="fitted_constant", bit_depth=bd,
-                                                                            gamma=args.sdr_gamma))
+                                                                            gamma=args.sdr_gamma, P=fit["P_xyz"]))
         except ValueError as exc:
             st["fitted_constant_pedestal"] = {"error": str(exc)}
         # LD on: the frozen 132412 numbers are pa_additivity.py's, so judge like with like. LD off: the fitted
@@ -713,7 +791,10 @@ def do_analyze(args) -> int:
         mb = (st.get("fitted_constant_fit") or {}).get("measured_black") or {}
         if mb.get("disagree_beyond_noise"):
             print(f"  evidence: fitted constant pedestal / measured 0,0,0 = {mb.get('fitted_over_measured_Y'):.2f} "
-                  "(beyond noise) — a black-state effect, not non-additivity")
+                  f"({mb.get('difference_sigma'):.1f} σ) — a black-state effect, not non-additivity")
+        cst = ((st.get("fitted_constant_fit") or {}).get("constancy") or {})
+        if cst.get("chi2_per_dof") is not None:
+            print(f"  pedestal constancy: χ²/dof {cst['chi2_per_dof']:.2f} over {cst['dof']} dof (≫ 1 = not constant)")
     print(f"-> {sess / 'analysis.json'} (numbers only; the decision is the LLM's / owner's)")
     return 0
 

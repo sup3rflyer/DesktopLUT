@@ -298,7 +298,7 @@ def _synthetic_p2(tmp_path, *, pedestal_nits: float, ld_on: bool):
     a = _ld_args()
     g = ld.geometry(a, 3840, 2160)
     panel = hc.SimPanel("fald", "HDR", 10, g, ld_on=ld_on)
-    rows = [(p.field, panel.expected(p.shapes, (0.5, 0.5))) for p in ld.plan_p2(a, g)]
+    rows = [(p.field, panel.expected(p.shapes, (0.5, 0.5))) for p in ld.plan_p2(a, g) if p.cond != "pedestal"]
     d = tmp_path / ("on" if ld_on else "off")
     hc.write_ti3(d / "measurements" / "raw.ti3", rows, bit_depth=10, title="synthetic")
     return d, rows
@@ -479,7 +479,7 @@ def test_fitted_constant_pedestal_sees_through_an_understated_black():
     xyz = _additive_xyz(rgb, P, prim)
     xyz[rgb.max(1) <= 0] = P / 1.7                                 # the black frame reads LOW (another backlight state)
     fit = ld.fit_constant_pedestal(rgb, xyz)
-    assert np.allclose(fit["P_xyz"], P, rtol=1e-6) and fit["n_codes"] == len(ld.P2_GREYS)
+    assert np.allclose(fit["P_xyz"], P, rtol=1e-6) and fit["n_codes"] == len(ld.P2_GREYS) + len(ld.P2_PEDESTAL_CODES)
     assert fit["measured_black"]["fitted_over_measured_Y"] == pytest.approx(1.7, rel=1e-3)
     good = ld.residual_stats(ld.additivity_rows(rgb, xyz, transfer="pq", pedestal="fitted_constant"))
     bad = ld.residual_stats(ld.additivity_rows(rgb, xyz, transfer="pq", pedestal="measured_black"))
@@ -505,3 +505,39 @@ def test_fitted_constant_pedestal_still_sees_real_non_additivity():
     st = ld.residual_stats(ld.additivity_rows(rgb, xyz, transfer="pq", pedestal="fitted_constant"))
     assert st["grey_de_max"] < 0.05                                # greys are additive here ...
     assert max(b["de_median"] for b in st["bins"]) > 1.0           # ... the mixes are not, and it shows
+
+
+def test_pedestal_set_is_its_own_condition_and_dim():
+    a = _ld_args()
+    g = ld.geometry(a, 3840, 2160)
+    ped = [p for p in ld.plan_p2(a, g) if p.cond == "pedestal"]
+    assert len(ped) == 4 * len(ld.P2_PEDESTAL_CODES) and all(p.min_reads >= 5 and p.meta["pedestal_only"] for p in ped)
+    assert {p.group for p in ped} == {"ped_grey", "ped_single"}
+    assert max(max(p.field) for p in ped) < min(ld.P2_GREYS)        # below every comparison grey
+
+
+def test_fitted_constant_pedestal_is_inverse_variance_weighted():
+    """Bright codes' P_m are differences of four several-hundred-nit reads: with read noise ∝ Y they carry noise as
+    large as P. The weighted fit (per-row SE) must beat the plain mean and stay consistent with its own SE."""
+    pytest.importorskip("colour")
+    import numpy as np
+    a = _ld_args()
+    g = ld.geometry(a, 3840, 2160)
+    rgb = np.asarray([[c / 1023 for c in p.field] for p in ld.plan_p2(a, g)])
+    P = np.array([1.8, 1.9, 2.2])                                   # a flat-out LD-off backlight pedestal
+    prim = np.array([[400.0, 210.0, 15.0], [300.0, 640.0, 90.0], [170.0, 70.0, 900.0]])
+    clean = _additive_xyz(rgb, P, prim)
+    sd = np.maximum(0.003 * clean[:, 1], 5e-4)                      # 0.3 % per read, 5 reads per patch
+    se = sd / np.sqrt(5)
+    errs_w, errs_u = [], []
+    for seed in range(40):
+        noisy = clean + np.random.default_rng(seed).normal(size=clean.shape) * (se / clean[:, 1].clip(1e-9))[:, None] * clean
+        w = ld.fit_constant_pedestal(rgb, noisy, se)
+        u = ld.fit_constant_pedestal(rgb, noisy)
+        errs_w.append(w["P_xyz"][1] - P[1])
+        errs_u.append(u["P_xyz"][1] - P[1])
+    rms_w, rms_u = float(np.sqrt(np.mean(np.square(errs_w)))), float(np.sqrt(np.mean(np.square(errs_u))))
+    assert rms_w < 0.5 * rms_u                                      # the dim codes carry the estimate
+    assert rms_w < 3 * w["P_se_Y"]                                  # and its reported SE is honest
+    assert w["weighting"].startswith("inverse-variance") and w["constancy"]["chi2_per_dof"] is not None
+    assert all(q["P_se_Y"] > 0 for q in w["per_code"])
