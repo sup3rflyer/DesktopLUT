@@ -183,15 +183,31 @@ def plan_hwB(args, g: hc.Geometry) -> list[hc.Patch]:
     return pats
 
 
-def plan_hwC_block(args, colour: str, state: str) -> list[hc.Patch]:
+def plan_hwC_block(args, colour: str, state: str, g: Optional[hc.Geometry] = None) -> list[hc.Patch]:
+    """One colour block of HW-C. ``--hwc-surround lit`` (DEFAULT, 2026-10-01): every patch is a ``--hole-px``
+    window in the lit dim-grey surround. HW-A found a black-frame backlight dip (frames whose max is ≲ code 2 read
+    ×1/1.67): with the cube ON the crushed shell-1 nodes output ~1.3 codes, so a FULL-FIELD read would drop the
+    panel into the dipped state exactly on the reads that test the crush (identity keeps them in the content
+    state) and inflate the cube-vs-identity difference by the dip. With lit content on screen the backlight never
+    dips — the real-use condition. ``full`` keeps the old full-field reads."""
     bd = int(args.bit_depth)
     codes = [int(v) for v in str(args.hwc_codes).split(",") if v.strip()]
-    pats = [hc.Patch(f"C:{colour}:black", "hwC", hc.full((0, 0, 0)), (0, 0, 0), group=colour, cond=state,
-                     meta={"colour": colour, "code8": 0})]
+    lit = getattr(args, "hwc_surround", "lit") == "lit"
+    if lit and g is None:
+        raise ValueError("--hwc-surround lit needs the geometry")
+    sur = hc.grey(s8(args.surround_code, bd))
+    meta0 = {"colour": colour, "surround": "lit" if lit else "full"}
+    if lit:
+        meta0.update(check_hole(g, float(args.hole_px)))
+
+    def frame(code):
+        return hc.framed(g, sur, code, g.centred(float(args.hole_px), float(args.hole_px))) if lit else hc.full(code)
+    pats = [hc.Patch(f"C:{colour}:black", "hwC", frame((0, 0, 0)), (0, 0, 0), group=colour, cond=state,
+                     meta={**meta0, "code8": 0})]
     for c in codes:
         code = tuple(s8(c * m, bd) for m in HWC_COLOURS[colour])
-        pats.append(hc.Patch(f"C:{colour}{c}", "hwC", hc.full(code), code, group=colour, cond=state,
-                             meta={"colour": colour, "code8": c}))
+        pats.append(hc.Patch(f"C:{colour}{c}", "hwC", frame(code), code, group=colour, cond=state,
+                             meta={**meta0, "code8": c}))
     return pats
 
 
@@ -321,7 +337,7 @@ def do_hwC(s: hc.ProbeSession, g: hc.Geometry) -> None:
                 if s.cancel_requested():
                     break
                 set_cube(s, path)
-                s.run_patches("hwC", plan_hwC_block(s.args, colour, state), state=state, results=results)
+                s.run_patches("hwC", plan_hwC_block(s.args, colour, state, s.geometry), state=state, results=results)
             if s.evidence.get("cancelled"):
                 break
     finally:
@@ -366,6 +382,9 @@ def main(argv=None) -> int:
     p.add_argument("--hwb-codes", default=",".join(map(str, HWB_CODES)), dest="hwb_codes")
     p.add_argument("--hwb-surround", choices=("full", "lit"), default="full", dest="hwb_surround")
     p.add_argument("--hwc-codes", default=",".join(map(str, HWC_CODES)), dest="hwc_codes")
+    p.add_argument("--hwc-surround", choices=("lit", "full"), default="lit", dest="hwc_surround",
+                   help="HW-C patch presentation: lit (default) = --hole-px windows in the lit surround, so the "
+                        "black-frame backlight dip never confounds the crushed cube-on reads; full = full field")
     p.add_argument("--hwc-colours", default=",".join(HWC_COLOURS), dest="hwc_colours")
     p.add_argument("--no-analysis", action="store_true", dest="no_analysis", help="skip teardrop_fit.py after hwB")
     args = p.parse_args(argv)
@@ -382,7 +401,7 @@ def main(argv=None) -> int:
         panel = hc.SimPanel("lcd", args.mode, args.bit_depth, g, white_nits=107.0)
         tot = hc.print_plan("hwA", plan_hwA(args, g), panel, g)
         tot += hc.print_plan("hwB", plan_hwB(args, g), panel, g)
-        cblock = [q for c in str(args.hwc_colours).split(",") for q in plan_hwC_block(args, c, "cube")]
+        cblock = [q for c in str(args.hwc_colours).split(",") for q in plan_hwC_block(args, c, "cube", g)]
         tot += hc.print_plan("hwC (x2 states)", cblock, panel, g, states=2) + 4 * hc.est_patch_s(100.0)
         print(f"== total est {hc.fmt_min(tot)} (+ owner eye check)")
         return 0

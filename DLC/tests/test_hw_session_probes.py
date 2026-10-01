@@ -218,9 +218,16 @@ def test_hwB_has_what_teardrop_fit_needs():
 
 
 def test_hwC_block_scales_codes_and_includes_black():
-    pats = nb.plan_hwC_block(_nb_args(bit_depth=10), "C", "cube")
+    a = _nb_args(bit_depth=10)
+    g = nb.geometry(a, 3840, 2160)
+    pats = nb.plan_hwC_block(a, "C", "cube", g)
     assert pats[0].field == (0, 0, 0)
     assert pats[1].field == (0, nb.s8(4, 10), nb.s8(4, 10)) and nb.s8(255, 10) == 1023
+    # DEFAULT lit surround (2026-10-01): a black-frame backlight dip must never confound the crushed cube-on reads
+    assert all(len(p.shapes) == 2 and p.meta["surround"] == "lit" for p in pats)
+    assert all(p.shapes[0][0] == pats[0].shapes[0][0] != (0, 0, 0) for p in pats)   # the same lit grey surround
+    a.hwc_surround = "full"
+    assert all(len(p.shapes) == 1 for p in nb.plan_hwC_block(a, "C", "cube", g))
 
 
 # ----------------------------------------------------------------------------- LD additivity plans
