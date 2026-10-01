@@ -242,7 +242,10 @@ def test_p2_plan_has_every_single_twice_and_the_listed_mixes():
             v[k] = c
             assert singles.count(tuple(v)) == 2                       # ascending before, descending after the mixes
     mixes = [p.field for p in pats if p.group == "mix"]
-    assert sorted(mixes) == sorted(ld.P2_MIXES)
+    assert sorted(mixes) == sorted(list(ld.P2_MIXES) + list(ld.P2_HIGH_MIXES))   # high-ratio mixes are the default
+    a0 = _ld_args()
+    a0.p2_high_ratio = False                                          # --no-p2-high-ratio
+    assert sorted(p.field for p in ld.plan_p2(a0, g) if p.group == "mix") == sorted(ld.P2_MIXES)
     assert sorted(p.field[0] for p in pats if p.group == "grey") == sorted(ld.P2_GREYS)
     assert pats[0].field == pats[-1].field == (0, 0, 0)
     a2 = _ld_args()
@@ -272,7 +275,10 @@ def test_p0_window_is_lattice_aligned_beside_the_meter():
     pats = ld.plan_p0(a, g)
     assert all(p.field == (0, 0, 0) for p in pats)                    # the meter always sits on black
     win = [p for p in pats if p.group != "floor"]
-    assert len(win) == 2 * 6 and {p.ti3_rgb for p in win} >= {(553, 553, 553), (749, 0, 0), (0, 0, 553)}
+    assert len(win) == 2 * 3 and {p.ti3_rgb for p in win} == {(749, 749, 749), (749, 0, 0), (0, 0, 749)}   # 749 default
+    assert all(p.min_reads >= 5 for p in win)                         # the glow 2 columns out is ~<= 0.1 nit
+    a_both = _ld_args(p0_codes="553,749")
+    assert len([p for p in ld.plan_p0(a_both, g) if p.group != "floor"]) == 2 * 6
     a.p0_col_offset = 1
     with pytest.raises(hc.Refusal):
         ld.p0_window(a, g)                                            # 50 px from the meter
@@ -303,7 +309,7 @@ def test_measured_black_bookkeeping_is_exact_on_an_additive_panel(tmp_path):
     d, rows = _synthetic_p2(tmp_path, pedestal_nits=1.9, ld_on=False)
     rgb = [[c / 1023 for c in r[0]] for r in rows]
     out = ld.additivity_rows(rgb, [r[1] for r in rows], transfer="pq", pedestal="measured_black")
-    assert len(out) == len(ld.P2_MIXES) + len(ld.P2_GREYS)
+    assert len(out) == len(ld.P2_MIXES) + len(ld.P2_HIGH_MIXES) + len(ld.P2_GREYS)   # --p2-high-ratio is the default
     assert max(r["de"] for r in out) < 0.05 and all(abs(r["yr"] - 1) < 1e-3 for r in out)
     st = ld.residual_stats(out)
     assert st["n_grey"] == 5 and st["grey_de_max"] < 0.05
@@ -425,6 +431,7 @@ def test_ld_additivity_pilot_simulated(tmp_path, capsys):
     an = json.loads((sess / "analysis.json").read_text(encoding="utf-8"))
     assert set(an["states"]) == {"on", "off"} and an["decision"] is None
     assert an["states"]["off"]["measured_black_pedestal"]["grey_de_max"] < 0.5   # the synthetic LD-off panel is additive
+    assert an["states"]["off"]["primary_bookkeeping"] == "fitted_constant"         # LD off is judged by the fitted pedestal
 
 
 def test_full_stack_spots_simulated(capsys):
@@ -447,3 +454,54 @@ def test_hw10_round_trip_simulated(capsys):
     assert all(isinstance(c["revert_replies"]["mhc_apply"], dict) for c in body["cases"])   # the production revert
     assert all(c["revert_compare"]["equal"] and c["luminance_component"] > 0 for c in body["cases"])
     assert body["final"]["compare"]["equal"]
+
+
+# ----------------------------------------------------------------------------- fitted constant pedestal (LD-off judge)
+def _additive_xyz(rgb_norm, P, prim):
+    """A perfectly additive panel with a CONSTANT pedestal P: XYZ = P + Σ_k lin(c_k)·prim_k (black reads P)."""
+    import numpy as np
+    rgb = np.asarray(rgb_norm, float)
+    return np.asarray(P)[None, :] + (rgb ** 2.4) @ np.asarray(prim)
+
+
+def test_fitted_constant_pedestal_sees_through_an_understated_black():
+    """The BenQ trap (2026-10-01): the 0,0,0 read under-states the pedestal the colours sit on (1.7x). On a
+    perfectly ADDITIVE panel, measured_black bookkeeping then reports false non-additivity; the fitted constant
+    pedestal recovers P from the greys alone, scores the mixes out of sample at ~0, and reports the black
+    disagreement as evidence."""
+    pytest.importorskip("colour")
+    import numpy as np
+    a = _ld_args()
+    g = ld.geometry(a, 3840, 2160)
+    rgb = np.asarray([[c / 1023 for c in p.field] for p in ld.plan_p2(a, g)])
+    P = np.array([0.09, 0.092, 0.11])
+    prim = np.array([[400.0, 210.0, 15.0], [300.0, 640.0, 90.0], [170.0, 70.0, 900.0]])
+    xyz = _additive_xyz(rgb, P, prim)
+    xyz[rgb.max(1) <= 0] = P / 1.7                                 # the black frame reads LOW (another backlight state)
+    fit = ld.fit_constant_pedestal(rgb, xyz)
+    assert np.allclose(fit["P_xyz"], P, rtol=1e-6) and fit["n_codes"] == len(ld.P2_GREYS)
+    assert fit["measured_black"]["fitted_over_measured_Y"] == pytest.approx(1.7, rel=1e-3)
+    good = ld.residual_stats(ld.additivity_rows(rgb, xyz, transfer="pq", pedestal="fitted_constant"))
+    bad = ld.residual_stats(ld.additivity_rows(rgb, xyz, transfer="pq", pedestal="measured_black"))
+    assert good["grey_de_max"] < 0.05 and max(b["de_median"] for b in good["bins"]) < 0.05
+    assert bad["grey_de_max"] > 5 * good["grey_de_max"] + 0.05     # the false "non-additive" verdict it prevents
+
+
+def test_fitted_constant_pedestal_still_sees_real_non_additivity():
+    """Not a white-wash: a minor-channel deficit in the MIXES (intrinsic non-additivity) survives the fit."""
+    pytest.importorskip("colour")
+    import numpy as np
+    a = _ld_args()
+    g = ld.geometry(a, 3840, 2160)
+    rgb = np.asarray([[c / 1023 for c in p.field] for p in ld.plan_p2(a, g)])
+    P = np.array([0.05, 0.05, 0.06])
+    prim = np.array([[400.0, 210.0, 15.0], [300.0, 640.0, 90.0], [170.0, 70.0, 900.0]])
+    xyz = _additive_xyz(rgb, P, prim)
+    lin = rgb ** 2.4
+    mix = ((rgb > 0).sum(1) == 3) & (np.ptp(rgb, 1) > 1e-9)
+    minor = np.argmin(np.where(rgb > 0, lin, np.inf), axis=1)
+    for i in np.where(mix)[0]:                                     # the minor channel delivers only 60 % in a mix
+        xyz[i] -= 0.4 * lin[i, minor[i]] * prim[minor[i]]
+    st = ld.residual_stats(ld.additivity_rows(rgb, xyz, transfer="pq", pedestal="fitted_constant"))
+    assert st["grey_de_max"] < 0.05                                # greys are additive here ...
+    assert max(b["de_median"] for b in st["bins"]) > 1.0           # ... the mixes are not, and it shows

@@ -100,6 +100,7 @@ the OSD flips and the restore + re-warm — the charter's ~75 min holds.
 """
 from __future__ import annotations
 
+import argparse
 import contextlib
 import io
 import json
@@ -126,7 +127,9 @@ P2_MIXES = ((553, 553, 749), (553, 749, 749), (474, 474, 642), (474, 642, 642), 
 # exactly its five LOWEST-ratio pairs, 0.157-0.283 — two of pa_additivity.py's bins; a "trend" needs the other end)
 P2_HIGH_MIXES = ((437, 493, 493), (437, 437, 493), (525, 591, 591), (525, 525, 591), (612, 690, 690), (612, 612, 690),
                  (787, 837, 837), (787, 787, 837))
-P0_CODES = (553, 749)
+P0_CODES = (749,)          # the BRIGHTER window: two zone columns out the glow is the 32 mm kernel tail (<= ~0.1 nit),
+                           # so a luma-rule blue glow (~0.1x grey) must still clear the black floor; --p0-codes adds 553
+P0_MIN_READS = 5
 SDR_ANCHOR_HDR_CODE = 837
 SPEED_TAU_S = {"fast": 0.05, "medium": 0.4, "gradual": 1.5, "off": 0.0}   # --simulate only
 # the minimum span of a settled tail per Dynamic Dimming speed (--settle-min-span-s overrides): the speeds'
@@ -262,7 +265,8 @@ def plan_p0(args, g: hc.Geometry) -> list[hc.Patch]:
         pats.append(hc.Patch(f"P0:black_{tag}", "p0", hc.full((0, 0, 0)), (0, 0, 0), group="floor",
                              ti3_rgb=(0, 0, 0), meta={"floor": True, **info}))
 
-    order = [(c, col) for c in P0_CODES for col in ("grey", "R", "B")]
+    codes = tuple(int(c) for c in str(args.p0_codes).split(",") if c.strip()) if getattr(args, "p0_codes", None) else P0_CODES
+    order = [(c, col) for c in codes for col in ("grey", "R", "B")]
     floor("a")
     for npass in range(int(args.p0_passes)):
         seq = order if npass % 2 == 0 else list(reversed(order))
@@ -270,7 +274,8 @@ def plan_p0(args, g: hc.Geometry) -> list[hc.Patch]:
             c = map_code(c_hdr, mode, bd, gm)
             code = {"grey": (c, c, c), "R": (c, 0, 0), "B": (0, 0, c)}[col]
             pats.append(hc.Patch(f"P0:{col}{c_hdr}:pass{npass + 1}", "p0", hc.framed(g, (0, 0, 0), code, rect), (0, 0, 0),
-                                 group=col, ti3_rgb=code, meta={"hdr_code": c_hdr, "colour": col, "pass": npass + 1, **info}))
+                                 group=col, ti3_rgb=code, meta={"hdr_code": c_hdr, "colour": col, "pass": npass + 1, **info},
+                                 min_reads=P0_MIN_READS))
         floor("b" if npass + 1 < int(args.p0_passes) else "c")
     return pats
 
@@ -289,10 +294,51 @@ def run_pa_additivity(script: Path, run_dir: Path) -> tuple[dict, str]:
     return ns, buf.getvalue()
 
 
+def fit_constant_pedestal(rgb, xyz) -> dict:
+    """ONE constant pedestal P (XYZ, 3 parameters) from the greys, no black read involved. Under additivity with a
+    constant pedestal, grey(m) = P + Σ own_k(m) and single_k(m) = P + own_k(m), so grey(m) − Σ_k single_k(m) = −2P at
+    EVERY code m: each grey code with all three singles at the same code gives P_m = −(grey − Σ singles)/2 and the
+    least-squares P is their mean. The spread of P_m across codes is the deviation from constancy (not circular);
+    the mixes are then scored OUT-OF-SAMPLE with this P. A 0,0,0 read in a different backlight state (the BenQ's
+    1.7× black-frame understatement, 2026-10-01) cannot fake non-additivity here."""
+    import numpy as np
+    rgb, xyz = np.asarray(rgb, float), np.asarray(xyz, float)
+    nz = (rgb > 1e-9).sum(1)
+
+    def mean_at(mask):
+        return xyz[mask].mean(0) if mask.any() else None
+    per = []
+    for c in np.unique(np.round(rgb[(np.ptp(rgb, 1) < 1e-9) & (rgb.max(1) > 0), 0], 6)):
+        g = mean_at((np.ptp(rgb, 1) < 1e-9) & np.isclose(rgb[:, 0], c))
+        singles = [mean_at((nz == 1) & np.isclose(rgb[:, k], c)) for k in range(3)]
+        if g is None or any(x is None for x in singles):
+            continue
+        per.append({"code_norm": float(c), "P": (-(g - sum(singles)) / 2.0).tolist()})
+    if not per:
+        raise ValueError("fitted_constant pedestal: no grey code has all three singles at the same code")
+    Ps = np.array([q["P"] for q in per])
+    P = Ps.mean(0)
+    se = (Ps.std(0, ddof=1) / np.sqrt(len(Ps))).tolist() if len(Ps) > 1 else [float("nan")] * 3
+    out = {"P_xyz": P.tolist(), "P_se_xyz": se, "n_codes": len(per), "per_code": per}
+    blk = xyz[rgb.max(1) <= 1e-9]
+    if len(blk):
+        bm = blk.mean(0)
+        bse = (blk.std(0, ddof=1) / np.sqrt(len(blk))) if len(blk) > 1 else np.full(3, np.nan)
+        dY = float(P[1] - bm[1])
+        sig = float(np.sqrt(np.nan_to_num(se[1]) ** 2 + np.nan_to_num(bse[1]) ** 2))
+        out["measured_black"] = {"Y": float(bm[1]), "Y_se": float(bse[1]), "n": int(len(blk)),
+                                 "fitted_over_measured_Y": (float(P[1] / bm[1]) if bm[1] > 0 else None),
+                                 "disagree_beyond_noise": bool(sig > 0 and abs(dY) > 3 * sig),
+                                 "note": "a disagreement is EVIDENCE of a black-state effect (as on the BenQ), "
+                                         "not of non-additivity — for the LLM to judge"}
+    return out
+
+
 def additivity_rows(rgb, xyz, *, transfer: str, pedestal: str, bit_depth: int = 10, gamma: float = 2.2) -> list[dict]:
     """pa_additivity.py's bookkeeping with a pluggable pedestal: ``ld_on_law`` = its hard-coded 132412
     level-edge law (identical numbers to the script for ``transfer='pq'``), ``measured_black`` = a
-    constant pedestal = the mean of the set's own 0,0,0 reads (the LD-off / no-LD physics).
+    constant pedestal = the mean of the set's own 0,0,0 reads, ``fitted_constant`` = ONE constant pedestal fitted
+    from the greys (:func:`fit_constant_pedestal`) — the LD-off judge.
     pred(r,g,b) = Σ own_k(c_k) + ped(max c), own_k = single − ped(c_k). Rows like the script's ``res``."""
     import numpy as np
     import colour
@@ -312,6 +358,9 @@ def additivity_rows(rgb, xyz, *, transfer: str, pedestal: str, bit_depth: int = 
         if not len(blk):
             raise ValueError("measured_black pedestal: the set has no 0,0,0 read")
         P = blk.mean(0)
+        ped = lambda m: (np.asarray(m, dtype=float) > 0)[..., None] * P  # noqa: E731
+    elif pedestal == "fitted_constant":
+        P = np.asarray(fit_constant_pedestal(rgb, xyz)["P_xyz"])
         ped = lambda m: (np.asarray(m, dtype=float) > 0)[..., None] * P  # noqa: E731
     else:
         raise ValueError(pedestal)
@@ -634,8 +683,21 @@ def do_analyze(args) -> int:
                                                                             bit_depth=bd, gamma=args.sdr_gamma))
         except ValueError as exc:
             st["measured_black_pedestal"] = {"error": str(exc)}
-        primary = st.get("pa_additivity_verbatim") if state == "on" and "pa_additivity_verbatim" in st else st["measured_black_pedestal"]
-        st["primary_bookkeeping"] = "pa_additivity.py (LD-on law)" if primary is st.get("pa_additivity_verbatim") else "measured_black"
+        try:
+            st["fitted_constant_fit"] = fit_constant_pedestal(rgb, xyz)
+            st["fitted_constant_pedestal"] = residual_stats(additivity_rows(rgb, xyz, transfer=transfer,
+                                                                            pedestal="fitted_constant", bit_depth=bd,
+                                                                            gamma=args.sdr_gamma))
+        except ValueError as exc:
+            st["fitted_constant_pedestal"] = {"error": str(exc)}
+        # LD on: the frozen 132412 numbers are pa_additivity.py's, so judge like with like. LD off: the fitted
+        # constant pedestal — measured_black would turn a black-frame backlight state into false non-additivity.
+        if state == "on" and "pa_additivity_verbatim" in st:
+            primary, st["primary_bookkeeping"] = st["pa_additivity_verbatim"], "pa_additivity.py (LD-on law)"
+        elif "error" not in st["fitted_constant_pedestal"]:
+            primary, st["primary_bookkeeping"] = st["fitted_constant_pedestal"], "fitted_constant"
+        else:
+            primary, st["primary_bookkeeping"] = st["measured_black_pedestal"], "measured_black (fitted_constant failed)"
         gmax = primary.get("grey_de_max") if isinstance(primary, dict) else None
         tr = (primary or {}).get("trend") or {}
         st["checks"] = {"grey_de_max": gmax, "grey_de_max_le_threshold": (gmax is not None and gmax <= GREY_DE_ITP_MAX),
@@ -648,6 +710,10 @@ def do_analyze(args) -> int:
     print(f"frozen 132412 (LD on): greys median {fs.get('grey_de_median')} max {fs.get('grey_de_max')}; trend {fs.get('trend')}")
     for state, st in out["states"].items():
         print(f"LD {state}: [{st['primary_bookkeeping']}] checks {st['checks']}")
+        mb = (st.get("fitted_constant_fit") or {}).get("measured_black") or {}
+        if mb.get("disagree_beyond_noise"):
+            print(f"  evidence: fitted constant pedestal / measured 0,0,0 = {mb.get('fitted_over_measured_Y'):.2f} "
+                  "(beyond noise) — a black-state effect, not non-additivity")
     print(f"-> {sess / 'analysis.json'} (numbers only; the decision is the LLM's / owner's)")
     return 0
 
@@ -667,8 +733,11 @@ def build_parser():
                    help="p1/p2 patch: square of N %% of the short side on the meter (100 = full field, the DLC raw condition)")
     p.add_argument("--p2-rotations", action="store_true", dest="p2_rotations",
                    help="add the other two rotations of every mix (132412 has all three)")
-    p.add_argument("--p2-high-ratio", action="store_true", dest="p2_high_ratio",
-                   help="add 132412's minor/max 0.45-0.64 mixes (+ their singles) so the residual-vs-ratio trend has both ends")
+    p.add_argument("--p2-high-ratio", action=argparse.BooleanOptionalAction, default=True, dest="p2_high_ratio",
+                   help="132412's minor/max 0.45-0.64 mixes (+ their singles) so the residual-vs-ratio trend has both ends "
+                        "(DEFAULT ON — 'trend gone' cannot be judged from the 0.157-0.283 cluster alone); --no-p2-high-ratio drops them")
+    p.add_argument("--p0-codes", default=None, dest="p0_codes",
+                   help="p0 window HDR codes (default 749; e.g. 553,749)")
     p.add_argument("--p0-col-offset", type=int, default=2, dest="p0_col_offset")
     p.add_argument("--p0-window-zones", default="2x3", dest="p0_window_zones")
     p.add_argument("--p0-side", choices=("right", "left"), default="right", dest="p0_side")
