@@ -6,15 +6,18 @@ build's closed loop probes AT the post-MHC training signals and folds every prob
 its training, so a verify signal that coincides with a training signal — or whose cube DRIVE
 coincides with a training signal / probe drive — scores the correction where it was fitted
 (in-sample). That run: 141 unique verify signals, 77 within 1 code of a post-MHC training signal;
-held-out (> 4 codes) per-signal avg 0.313 vs coincident 0.271.
+held-out (> 4 codes) per-signal avg 0.320 vs coincident 0.296 at its measured white (0.313 vs 0.271
+when scored at the nominal 120 nits).
 
 Pure mechanics, evidence only — the code measures distances and splits stats; the LLM judges the
 verify seam:
 
 * :func:`load_training` / :func:`load_probe_drives` — a run's TRAINING set: every signal of its
-  non-verify measurement TI3s (``measurements/*.ti3`` except ``verify*``) plus every build-probe
-  DRIVE (``measurements/build_probes.ndjson``, appended per read by the live probe so a resumed
-  build keeps them; runs from before that file fall back to the ``events.jsonl`` probe rows).
+  non-verify measurement TI3s (``measurements/*.ti3`` except ``verify*``) plus the LIVE build's
+  probe DRIVES (``measurements/build_probes.ndjson``, appended per read and tagged with the build
+  attempt, so a superseded attempt's drives drop out; runs from before the tag fall back to every
+  recorded probe read incl. the ``events.jsonl`` rows — a conservative superset).
+  :func:`training_context` assembles it from a run record; :func:`training_key` fingerprints it.
 * :func:`classify_signals` — per verify signal, the Chebyshev distance in OUTPUT CODES at the run's
   bit depth of the signal (``d_in``) and of its cube drive ``sample_cube(cube, s)`` (``d_drive``,
   only when the verify measured through a cube) to the training set; ``held_out`` ⇔
@@ -22,7 +25,8 @@ verify seam:
   ⇔ held-out AND off the cube lattice (not every channel within 1 code of a lattice node).
 * :func:`held_out_summary` — per-signal stats per class over the gate's population.
 * :func:`draw_held_out_signals` — N fresh verify signals per run, seeded by the run id (a resume
-  re-draws the identical set), random hue with a saturation/value spread so dim and half-saturated
+  re-draws the identical set), hue-stratified over the six sextants, with a saturation/value spread
+  so dim and half-saturated
   colours are represented, rejection-filtered ≥ 8 codes from every training signal / probe drive
   (and, through a cube, in drive space too), off-lattice, never a duplicate. **SDR only for now** —
   HDR draws need the gamut-aware hue caps and a PQ value floor (follow-up).
@@ -38,7 +42,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 
-from .metrics import bucket_stats
+from .metrics import HELD_OUT_GATE_MIN_SIGNALS, bucket_stats
 from .mhc import parse_ti3
 
 __all__ = [
@@ -46,17 +50,20 @@ __all__ = [
     "GATE_MIN_SIGNALS", "DRAW_MIN_CODES", "DRAW_SATURATION", "PROBES_FILE",
     "run_seed", "to_codes", "min_chebyshev", "lattice_distance_codes", "load_training",
     "load_probe_drives", "append_probe_drives", "load_cube", "classify_signals",
-    "held_out_summary", "thresholds", "training_context", "held_out_view", "draw_held_out_signals",
+    "held_out_summary", "thresholds", "training_context", "training_key", "held_out_view",
+    "draw_held_out_signals",
 ]
 
 HELD_OUT_CODES = 4.0          # held-out ⇔ min(d_in, d_drive) > 4 output codes
 COINCIDENT_CODES = 1.0        # coincident ⇔ min(d_in, d_drive) <= 1 code (the same stimulus ± rounding)
 LATTICE_CODES = 1.0           # on-lattice ⇔ every channel within 1 code of a cube lattice coordinate
 DEFAULT_LATTICE_SIZE = 33     # the production cube grid (a run's own cube says otherwise)
-GATE_MIN_SIGNALS = 8          # below this many held-out signals the bucket is reported, never gated
+GATE_MIN_SIGNALS = HELD_OUT_GATE_MIN_SIGNALS   # below this the held-out bucket is reported, never gated
 DRAW_MIN_CODES = 8.0          # a fresh draw sits >= 8 codes from every training signal / probe drive
 DRAW_SATURATION = (0.15, 1.0)  # signal-space saturation spread of the draws ((max-min)/max)
 PROBES_FILE = "build_probes.ndjson"
+_SEXTANTS = 6                 # the draws are hue-stratified over the six HSV sextants
+_SEXTANT_NAMES = ("R-Y", "Y-G", "G-C", "C-B", "B-M", "M-R")
 _CLASSES = ("held_out", "strict_held_out", "near", "coincident")
 
 
@@ -132,24 +139,44 @@ def append_probe_drives(path: Path, codes: Iterable[Sequence[int]], **extra: Any
             fh.write(json.dumps({"rgb": [int(c) for c in code], **extra}, separators=(",", ":")) + "\n")
 
 
-def load_probe_drives(run_root: Path) -> tuple[np.ndarray, dict[str, Any]]:
-    """Every build-probe DRIVE of a run (unique integer codes, (N, 3)): the probe ledger
-    (``measurements/build_probes.ndjson``) ∪ the ``events.jsonl`` probe ``patch_read`` rows (the only
-    record for runs from before the ledger; for newer runs the same reads — the union is deduped).
-    Only successful reads: a failed probe aborts the build and is never folded."""
+def load_probe_drives(run_root: Path, *, attempt: Optional[int] = None) -> tuple[np.ndarray, dict[str, Any]]:
+    """The build-probe DRIVES of a run (unique integer codes, (N, 3)) — only successful reads (a
+    failed probe aborts the build and is never folded).
+
+    ``attempt`` (the live build's ``probe_attempt``, from its stage record): only the probe-ledger
+    rows tagged with it (``measurements/build_probes.ndjson``) — a re-run / resumed build starts its
+    training afresh from the post-MHC set, so a superseded attempt's drives are not in the live cube's
+    training (they stay in the ledger as evidence; ``superseded_rows`` counts them). Without a live
+    tag (a run from before the tagged ledger), or when the live attempt left no row: every recorded
+    probe read — the ledger ∪ the ``events.jsonl`` probe ``patch_read`` rows, deduped — a superset of
+    the live training, i.e. conservative for the held-out claim (``scope`` says which)."""
     root = Path(run_root)
-    codes: set[tuple[int, int, int]] = set()
-    info: dict[str, Any] = {"ledger_rows": 0, "event_rows": 0}
+    live: set[tuple[int, int, int]] = set()
+    every: set[tuple[int, int, int]] = set()
+    info: dict[str, Any] = {"attempt": attempt, "ledger_rows": 0, "superseded_rows": 0, "event_rows": 0}
     ledger = root / "measurements" / PROBES_FILE
     if ledger.is_file():
         for line in ledger.read_text(encoding="utf-8", errors="replace").splitlines():
             try:
-                rgb = json.loads(line).get("rgb")
+                row = json.loads(line)
+                rgb = row.get("rgb")
             except (ValueError, AttributeError):
                 continue
-            if isinstance(rgb, list) and len(rgb) == 3:
-                codes.add(tuple(int(c) for c in rgb))  # type: ignore[arg-type]
+            if not (isinstance(rgb, list) and len(rgb) == 3):
+                continue
+            code = tuple(int(c) for c in rgb)
+            every.add(code)  # type: ignore[arg-type]
+            if attempt is not None and row.get("attempt") == attempt:
+                live.add(code)  # type: ignore[arg-type]
                 info["ledger_rows"] += 1
+            elif attempt is not None:
+                info["superseded_rows"] += 1
+            else:
+                info["ledger_rows"] += 1
+    if attempt is not None and live:
+        info["scope"] = f"build attempt {attempt} (the live cube's training)"
+        info["unique"] = len(live)
+        return np.asarray(sorted(live), dtype=np.int64).reshape(-1, 3), info
     events = root / "events.jsonl"
     if events.is_file():
         with events.open(encoding="utf-8", errors="replace") as fh:
@@ -165,10 +192,32 @@ def load_probe_drives(run_root: Path) -> tuple[np.ndarray, dict[str, Any]]:
                     continue
                 rgb = data.get("rgb")
                 if isinstance(rgb, list) and len(rgb) == 3:
-                    codes.add(tuple(int(c) for c in rgb))  # type: ignore[arg-type]
+                    every.add(tuple(int(c) for c in rgb))  # type: ignore[arg-type]
                     info["event_rows"] += 1
-    info["unique"] = len(codes)
-    return np.asarray(sorted(codes), dtype=np.int64).reshape(-1, 3), info
+    info["scope"] = ("every recorded probe read (no live-attempt tag) — a conservative superset"
+                     if attempt is None else
+                     f"build attempt {attempt} left no ledger row — every recorded probe read "
+                     "(a conservative superset)")
+    info["unique"] = len(every)
+    return np.asarray(sorted(every), dtype=np.int64).reshape(-1, 3), info
+
+
+def training_key(training: Mapping[str, Any], *, max_cv: int) -> Optional[str]:
+    """A content fingerprint of a :func:`training_context` — the training codes, the probe drives and
+    the cube. The fresh draws are drawn AGAINST a training set: a different key means the memoised
+    draws were drawn against a superseded one (re-plan, forced / resumed re-build, re-measured
+    post-MHC). ``None`` for an unavailable context."""
+    if not training.get("available"):
+        return None
+    h = hashlib.sha256()
+    h.update(_unique_codes(to_codes(training["training_signals"], max_cv)).tobytes())
+    h.update(b"|")
+    h.update(_unique_codes(training["probe_drives"]).tobytes())
+    h.update(b"|")
+    cube = training.get("cube")
+    if cube is not None:
+        h.update(np.round(np.asarray(cube, dtype=float), 6).tobytes())
+    return h.hexdigest()[:16]
 
 
 def load_cube(path: Optional[Path]) -> Optional[np.ndarray]:
@@ -275,6 +324,25 @@ def held_out_summary(rows: Sequence[Mapping[str, Any]], *, population: Sequence[
     return out
 
 
+def _live_probe_attempt(root: Path, calib: Optional[Mapping[str, Any]]) -> Optional[int]:
+    """The live build's probe attempt from a run record (``calib``; read from ``root`` when None)."""
+    if calib is None:
+        try:
+            calib = json.loads((Path(root) / "dlc_state.json").read_text(encoding="utf-8")).get("calib") or {}
+        except (OSError, ValueError, AttributeError):
+            return None
+    built = ((calib.get("stages") or {}).get("build-install-3dlut") or {})
+    if built.get("status") != "done":
+        return None
+    value = (built.get("data") or {}).get("probe_attempt")
+    if value is None:
+        value = (built.get("digest") or {}).get("probe_attempt")
+    try:
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def training_context(run_root: Path, calib: Mapping[str, Any], *, max_cv: int) -> dict[str, Any]:
     """The TRAINING set a run's verify is classified against, from its record (``calib`` = the run's
     ``dlc_state.json['calib']``): every non-verify measurement TI3 + build-probe drive of the runs that
@@ -311,7 +379,7 @@ def training_context(run_root: Path, calib: Mapping[str, Any], *, max_cv: int) -
         tr = load_training(r)
         signals.append(tr["signals"])
         sources += [{"run": r.name, **s} for s in tr["sources"]]
-        drv, info = load_probe_drives(r)
+        drv, info = load_probe_drives(r, attempt=_live_probe_attempt(r, calib if r == root else None))
         probes.append(drv)
         probe_info[r.name] = info
     training = np.vstack(signals) if signals else np.zeros((0, 3))
@@ -341,22 +409,25 @@ def training_context(run_root: Path, calib: Mapping[str, Any], *, max_cv: int) -
 
 def held_out_view(patch_metrics: Sequence[Any], *, run_root: Path, calib: Mapping[str, Any],
                   bit_depth: int, is_hdr: bool,
-                  sample: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None
+                  sample: Optional[Callable[[np.ndarray, np.ndarray], np.ndarray]] = None,
+                  draws: Optional[Iterable[Sequence[int]]] = None
                   ) -> tuple[dict[str, Any], Optional[list[dict[str, Any]]]]:
     """A scored verify set's held-out view (V1) — the ONE function the live verify and the score
     CLI share: group the reads per unique signal (each signal's ΔE = the mean of its reads), classify
     every signal against :func:`training_context`, and summarise per class over the gate's population
     (the practical core). Returns ``(summary, rows)``; ``rows`` (per signal: code, drive, distances,
     class, ΔE, reads, zone, fresh-draw flag) is ``None`` when there is no training to classify
-    against (the summary then says why, plus the fresh draws' own stats when any were measured)."""
+    against (the summary then says why, plus the fresh draws' own stats when any were measured).
+    ``draws`` (codes) flags the fresh held-out draws; default the run's own memo."""
     from .metrics import group_per_signal, practical_zone
 
     max_cv = (1 << int(bit_depth)) - 1
     groups = group_per_signal(list(patch_metrics))
     training = training_context(run_root, calib, max_cv=max_cv)
     th = thresholds(bit_depth=bit_depth, lattice_size=int(training.get("lattice_size") or DEFAULT_LATTICE_SIZE))
-    draw_set = {tuple(int(c) for c in p)
-                for p in (calib.get("verify_held_out_draws") or {}).get("signals") or ()}
+    if draws is None:   # default: the run's own draw memo
+        draws = (calib.get("verify_held_out_draws") or {}).get("signals") or ()
+    draw_set = {tuple(int(c) for c in p) for p in draws}
     codes = to_codes([m.rgb for m, _ in groups], max_cv) if groups else np.zeros((0, 3), dtype=np.int64)
     zones = [practical_zone(m, is_hdr=is_hdr) for m, _ in groups]
     is_draw = [tuple(int(c) for c in code) in draw_set for code in codes]
@@ -385,7 +456,10 @@ def draw_held_out_signals(n: int, *, seed: int, max_cv: int, value_floor_cv: int
                           max_attempts: Optional[int] = None) -> dict[str, Any]:
     """Draw up to ``n`` fresh verify signals (integer codes), deterministic in ``seed`` + inputs.
 
-    Each candidate: hue uniform in [0, 1), saturation uniform in ``saturation`` (signal-space
+    Each candidate: hue uniform WITHIN a hue sextant (R-Y, Y-G, G-C, C-B, B-M, M-R) — the draws are
+    hue-STRATIFIED: each sextant gets an equal quota (24 → 4 each) and candidates cycle over the
+    sextants still short of theirs, so no hue family is left unsampled by chance — saturation
+    uniform in ``saturation`` (signal-space
     ``(max-min)/max``), value (= the on-channel code) uniform in ``[value_floor_cv, cap_cv]`` — the
     verify's colour floor (above the shadow band) up to its range cap — so dim and half-saturated
     colours are represented, not just the gamut shell. Rejected when: below the floor after rounding,
@@ -406,18 +480,27 @@ def draw_held_out_signals(n: int, *, seed: int, max_cv: int, value_floor_cv: int
     sampler = _sampler(sample) if cube is not None else None
     attempts = 0      # candidates GENERATED (the stream position; bounded by ``limit``)
     examined = 0      # candidates actually judged (the report)
+    quota = [int(n) // _SEXTANTS + (1 if k < int(n) % _SEXTANTS else 0) for k in range(_SEXTANTS)]
+    filled = [0] * _SEXTANTS
+    cursor = 0
 
     def reject(why: str) -> None:
         rejected[why] = rejected.get(why, 0) + 1
 
     while len(chosen) < n and attempts < limit:
         block = []
+        sextant_of = []
+        open_sextants = [k for k in range(_SEXTANTS) if filled[k] < quota[k]] or list(range(_SEXTANTS))
         for _ in range(min(64, limit - attempts)):
-            h, s_u, v_u = rng.random(), rng.random(), rng.random()
+            sextant = open_sextants[cursor % len(open_sextants)]
+            cursor += 1
+            h_u, s_u, v_u = rng.random(), rng.random(), rng.random()
+            h = (sextant + h_u) / _SEXTANTS
             sat = lo_s + (hi_s - lo_s) * s_u
             val = (floor + (cap - floor) * v_u) / float(max_cv)
             rgb = colorsys.hsv_to_rgb(h, sat, val)
             block.append(tuple(int(round(c * max_cv)) for c in rgb))
+            sextant_of.append(sextant)
         attempts += len(block)
         cand = np.asarray(block, dtype=np.int64).reshape(-1, 3)
         sig = cand / float(max_cv)
@@ -429,7 +512,9 @@ def draw_held_out_signals(n: int, *, seed: int, max_cv: int, value_floor_cv: int
             if len(chosen) >= n:
                 break
             examined += 1
-            if max(code) < floor or max(code) > cap:
+            if filled[sextant_of[i]] >= quota[sextant_of[i]]:
+                reject("hue_sextant_full")
+            elif max(code) < floor or max(code) > cap:
                 reject("value_range")
             elif code in seen:
                 reject("duplicate")
@@ -444,8 +529,10 @@ def draw_held_out_signals(n: int, *, seed: int, max_cv: int, value_floor_cv: int
             else:
                 chosen.append(code)
                 seen.add(code)
+                filled[sextant_of[i]] += 1
     return {"signals": [list(c) for c in chosen], "n_requested": int(n), "n_drawn": len(chosen),
             "seed": int(seed), "attempts": examined, "rejected": rejected,
             "min_codes": float(min_codes), "value_range_codes": [floor, cap],
             "saturation_range": [lo_s, hi_s], "lattice_size": int(lattice_size),
-            "drive_space_checked": cube is not None, "n_exclusion_codes": int(len(excl))}
+            "drive_space_checked": cube is not None, "n_exclusion_codes": int(len(excl)),
+            "per_hue_sextant": {name: filled[k] for k, name in enumerate(_SEXTANT_NAMES)}}

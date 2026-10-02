@@ -181,17 +181,32 @@ def test_draws_are_deterministic_per_run_id_and_differ_between_runs():
     assert a1["signals"] != b["signals"]
 
 
+def _crosstalk_cube(n: int = 17) -> np.ndarray:
+    """A real, NON-identity 3D LUT ([b, g, r] layout): channel crosstalk + a gain/offset, so a
+    signal's drive differs from the signal by tens of codes (what a calibration cube does)."""
+    ax = np.linspace(0.0, 1.0, n)
+    b, g, r = np.meshgrid(ax, ax, ax, indexing="ij")
+    rgb = np.stack([r, g, b], axis=-1)
+    mix = np.array([[0.90, 0.07, 0.03], [0.04, 0.92, 0.04], [0.02, 0.06, 0.92]])
+    return np.clip(rgb @ mix.T * 0.96 + 0.015, 0.0, 1.0)
+
+
 def test_draws_respect_every_exclusion_and_spread_value_and_saturation():
+    from dlc.optimize import sample_cube   # the production sampler the draw itself uses
+
     rng = np.random.default_rng(3)
     excl = rng.integers(0, 1024, size=(800, 3))
     existing = [tuple(int(c) for c in row) for row in rng.integers(256, 1024, size=(100, 3))]
-    identity = lambda cube, s: s   # noqa: E731 - the drive IS the signal
-    rec = _draw(7, exclude_codes=excl, existing=existing, cube=np.zeros((33, 33, 33, 3)), sample=identity)
+    cube = _crosstalk_cube()
+    rec = _draw(7, exclude_codes=excl, existing=existing, cube=cube)
     draws = np.asarray(rec["signals"])
     assert rec["n_drawn"] == 24 and rec["drive_space_checked"] is True
-    assert np.all(vh.min_chebyshev(draws, excl) >= vh.DRAW_MIN_CODES)
+    drives = vh.to_codes(sample_cube(cube, draws / 1023.0), 1023)
+    assert np.median(np.abs(drives - draws).max(axis=1)) > 8          # the cube really moves them
+    assert np.all(vh.min_chebyshev(draws, excl) >= vh.DRAW_MIN_CODES)   # signal space
+    assert np.all(vh.min_chebyshev(drives, excl) >= vh.DRAW_MIN_CODES)  # drive space, through the cube
     assert not set(map(tuple, draws.tolist())) & set(existing)
-    assert np.all(vh.lattice_distance_codes(draws / 1023.0, 33, 1023) > vh.LATTICE_CODES)
+    assert np.all(vh.lattice_distance_codes(draws / 1023.0, 17, 1023) > vh.LATTICE_CODES)
     assert np.all(draws.max(axis=1) >= 256) and np.all(draws.max(axis=1) <= 1023)
     for i in range(len(draws)):   # the draws keep their distance from each other too
         others = np.delete(draws, i, axis=0)
@@ -199,10 +214,23 @@ def test_draws_respect_every_exclusion_and_spread_value_and_saturation():
     sat = (draws.max(axis=1) - draws.min(axis=1)) / draws.max(axis=1)
     assert sat.min() < 0.5 < sat.max()                      # half-saturated AND saturated colours
     assert draws.max(axis=1).min() < 600                    # dim colours too, not just the shell
-    # every draw classifies held-out against that same training set (drive space included)
-    rows = vh.classify_signals(draws / 1023.0, max_cv=1023, probe_drives=excl,
-                               cube=np.zeros((33, 33, 33, 3)), sample=identity)
+    # every draw classifies held-out against that same training set through that same cube
+    rows = vh.classify_signals(draws / 1023.0, max_cv=1023, probe_drives=excl, cube=cube)
     assert all(r["class"] == "held_out" and r["strict_held_out"] for r in rows)
+    assert [r["drive"] for r in rows] == drives.tolist()
+
+
+def test_draws_are_hue_stratified():
+    import colorsys
+
+    for seed in (1, 2, 3, 4):
+        rec = _draw(seed)
+        assert rec["per_hue_sextant"] == {k: 4 for k in ("R-Y", "Y-G", "G-C", "C-B", "B-M", "M-R")}
+        hues = [colorsys.rgb_to_hsv(*(np.asarray(c) / 1023.0))[0] for c in rec["signals"]]
+        counts = np.bincount(np.minimum((np.asarray(hues) * 6).astype(int), 5), minlength=6)
+        assert counts.min() >= 3, counts   # rounding to codes may nudge a draw over a sextant edge
+    odd = vh.draw_held_out_signals(8, seed=5, max_cv=1023, value_floor_cv=256)
+    assert sorted(odd["per_hue_sextant"].values()) == [1, 1, 1, 1, 2, 2]
 
 
 def test_draws_in_drive_space_reject_signals_whose_cube_drive_lands_on_training():
@@ -359,14 +387,28 @@ def test_full_flow_verify_digest_carries_per_signal_held_out_draws_and_white(sdr
     # the per-signal rows are persisted for the judge (run-relative path)
     rows = json.loads((calib.ctx.root / v["held_out_rows"]).read_text(encoding="utf-8"))["rows"]
     assert len(rows) == v["n_signals"] and sum(r["draw"] for r in rows) == 24
-    # the build probe ledger exists and is what the classification read
-    assert (calib.ctx.root / "measurements" / vh.PROBES_FILE).is_file()
+    # the build probe ledger exists, every row tagged with the live build attempt the classification read
+    ledger = [json.loads(line) for line in (calib.ctx.root / "measurements" / vh.PROBES_FILE)
+              .read_text(encoding="utf-8").splitlines()]
+    attempt = calib.calib["stages"]["build-install-3dlut"]["data"]["probe_attempt"]
+    assert ledger and {row["attempt"] for row in ledger} == {attempt}
+    assert held["training"]["probe_drives"][calib.ctx.root.name]["scope"].startswith(f"build attempt {attempt}")
     # the seam leads with the per-signal numbers and quotes held-out next to them
     q = next(r.question for r in adj.requests if r.key == "verify:accept")
     assert q.index("per-signal over") < q.index("held-out avg") < q.index("read-weighted overall avg")
     plan = calib.calib["patch_plan"]
     assert plan["verify_held_out_draws"] == 24
     assert calib.calib["stages"]["measure:verify"]["digest"]["patch_count"] == plan["stages"]["verify"]
+    # the headline now includes the draws: the preset-only (run-to-run comparable) numbers ride beside
+    preset = v["preset_set"]
+    assert preset["available"] and preset["draw_reads_excluded"] == 24
+    assert preset["n_reads"] == v["patch_count"] - 24 and preset["n_signals"] == v["n_signals"] - 24
+    base = M.score_samples([s for s in __import__("dlc.mhc", fromlist=["parse_ti3"]).parse_ti3(
+        calib.ctx.root / "measurements" / "verify.ti3")
+        if tuple(int(round(c * 1023)) for c in s.rgb) not in {tuple(d) for d in draws["signals"]}],
+        gamma=2.2, white_xy=tuple(v["target_white_xy"]))[0]
+    assert preset["avg_de2000"] == round(sum(m.de2000 for m in base) / len(base), 3)
+    assert f"preset set without the 24 draw reads: read-weighted avg {preset['avg_de2000']}" in q
 
 
 def test_draws_are_memoised_and_never_drawn_for_an_already_measured_verify(sdr_full):
@@ -394,20 +436,222 @@ def test_score_cli_reproduces_the_live_held_out_view(sdr_full):
     assert res.metrics["practical"]["per_signal"] == v["practical"]["per_signal"]
 
 
-def test_default_draw_knob_keeps_an_approved_plan_fingerprint(tmp_path: Path):
-    import hashlib
+# Two REAL plan records approved by pre-V1 code (dlc_state.json['calib']['patch_plan'] of PA32UCXR
+# runs; the fingerprints were computed by that code). The fresh draws must not move them.
+_PA_SDR_PLAN_20261002_012945 = {
+    "flow": "3dlut-only", "fingerprint": "9313a6d1b7d46445",
+    "patch_sizes": {
+        "raw_ramp_steps": 32, "raw_saturations": [1.0], "raw_include_secondaries": False,
+        "raw_spacing": "uniform", "raw_color_min_nits": 1.0, "icc_tube_levels": 0,
+        "icc_tube_offsets": [0.06, 0.15], "volumetric_mode": "cube", "cube_size": 7, "tube_size": 33,
+        "tube_radius": 2, "grid_type": "cub", "spines": False, "gamut_lum_steps": 17, "gamut_hues": 12,
+        "gamut_lum_bias": 1.3, "verify_steps": 13, "verify_saturations": [1.0, 0.5],
+        "verify_color_min_signal": 0.25, "saturation_sweep_levels": [0.25, 0.5, 0.75, 1.0],
+        "saturation_sweep_repeats": 3, "neutral_steps": 17, "low_light_steps": 9,
+        "low_light_cube_size": 5, "low_light_signal": 0.2, "low_light_bias": 2.0, "order": "thermal"}}
+_PA_HDR_VERIFY_ONLY_PLAN_20261002_143710 = {
+    "flow": "verify-only", "fingerprint": "7ba114567aad1918", "patch_max_cv": 830, "n_patches": 303,
+    "verify_source": {"run": "H:\\Projects\\DesktopLUT\\DLC\\runs\\20260924_132412_307436_hdr_asus_proart_pa32ucxr",
+                      "patches_fingerprint": "e910d0936cb964d7", "patch_source": "ndjson"},
+    "patch_sizes": {
+        "raw_ramp_steps": 32, "raw_saturations": [1.0], "raw_include_secondaries": False,
+        "raw_spacing": "uniform", "raw_color_min_nits": 1.0, "icc_tube_levels": 0,
+        "icc_tube_offsets": [0.06, 0.15], "volumetric_mode": "tube", "cube_size": 9, "tube_size": 33,
+        "tube_radius": 2, "grid_type": "cub", "spines": False, "gamut_lum_steps": 17, "gamut_hues": 12,
+        "gamut_lum_bias": 1.3, "verify_steps": 13, "verify_saturations": [1.0, 0.5],
+        "verify_color_min_signal": 0.25, "saturation_sweep_levels": [0.25, 0.5, 0.75, 1.0],
+        "saturation_sweep_repeats": 3, "neutral_steps": 17, "low_light_steps": 9,
+        "low_light_cube_size": 5, "low_light_signal": 0.2, "low_light_bias": 2.0, "order": "thermal"}}
+
+
+def test_a_pre_v1_approved_sdr_plan_keeps_its_recorded_fingerprint(tmp_path: Path):
+    from test_calibrate import _make
+    recorded = _PA_SDR_PLAN_20261002_012945
+    calib = _make(tmp_path, "fp_pa", patch_sizes=PatchSizes.from_dict(recorded["patch_sizes"]), bit_depth=10)
+    calib.target_name = "srgb_g22"
+    rec = calib._patch_plan_record(recorded["flow"])
+    # the record COUNTS the draws (the run will measure them)...
+    assert rec["stages"] == {"post-mhc": 753, "verify": 309 + 24} and rec["verify_held_out_draws"] == 24
+    # ...but its identity is the one the pre-V1 code approved: the in-flight run resumes approved
+    assert rec["fingerprint"] == recorded["fingerprint"]
+    calib.patch_sizes = replace(calib.patch_sizes, verify_held_out_draws=12)   # a real plan change
+    rec2 = calib._patch_plan_record(recorded["flow"])
+    assert rec2["patch_sizes"]["verify_held_out_draws"] == 12
+    assert rec2["fingerprint"] != recorded["fingerprint"]
+
+
+def test_a_pre_v1_approved_hdr_verify_only_plan_keeps_its_recorded_fingerprint(tmp_path: Path):
+    from test_calibrate import _make
+    recorded = _PA_HDR_VERIFY_ONLY_PLAN_20261002_143710
+    calib = _make(tmp_path, "fp_hdr", mode="HDR", patch_sizes=PatchSizes.from_dict(recorded["patch_sizes"]),
+                  bit_depth=10)
+    calib.target_name = "rec2020_pq"
+    calib._patch_max_cv = lambda: recorded["patch_max_cv"]
+    calib.calib["flow"] = "verify-only"
+    calib.calib["stages"]["verify-source"] = {"status": "done", "data": {
+        **recorded["verify_source"], "patches": [[0, 0, 0]] * recorded["n_patches"]}}
+    rec = calib._patch_plan_record("verify-only")
+    assert rec["stages"] == {"verify": 303} and "verify_held_out_draws" not in rec
+    assert "verify_held_out_draws" not in rec["patch_sizes"]
+    assert rec["fingerprint"] == recorded["fingerprint"]
+
+
+def test_a_resume_with_the_memo_cleared_redraws_the_identical_set_and_a_changed_training_supersedes_it(sdr_full):
+    """The memo is not what makes a resume reproducible — the run-id seed + the training are: a fresh
+    process with the memo gone re-draws the identical list. When the training the draws were drawn
+    against changes (a re-built cube's probe attempt, a re-plan), the memo is superseded."""
+    import copy
 
     from test_calibrate import _make
-    calib = _make(tmp_path, "fp_draws")
+    calib, _adj = sdr_full
+    memo = copy.deepcopy(calib.calib["verify_held_out_draws"])
+    resumed = _make(calib.ctx.root.parent, calib.ctx.root.name)        # reopen the run (a new process)
+    measured = copy.deepcopy(resumed.calib["stages"]["measure:verify"])
+    try:
+        resumed.calib.pop("verify_held_out_draws")
+        resumed.calib["stages"]["measure:verify"] = {**measured, "status": "running"}   # not measured yet
+        redrawn = resumed._held_out_draw_record(resumed._verify_patches())
+        assert redrawn["signals"] == memo["signals"] and redrawn["training_key"] == memo["training_key"]
+        assert "superseded" not in redrawn
+        # the training changes (here: three of the draws become probe drives of a re-built cube)
+        changed = resumed._held_out_training()
+        changed["probe_drives"] = np.vstack([changed["probe_drives"], np.asarray(memo["signals"][:3])])
+        resumed._held_out_training = lambda: changed
+        again = resumed._held_out_draw_record(resumed._verify_patches())
+        assert again["training_key"] != memo["training_key"]
+        assert again["superseded"]["training_key"] == memo["training_key"]
+        assert not set(map(tuple, again["signals"])) & set(map(tuple, memo["signals"][:3]))
+        # a MEASURED verify keeps exactly what it measured, whatever the training does afterwards
+        resumed.calib["stages"]["measure:verify"] = measured
+        assert resumed._held_out_draw_record(resumed._verify_patches()) is resumed.calib["verify_held_out_draws"]
+    finally:
+        resumed.calib["verify_held_out_draws"] = memo
+        resumed.calib["stages"]["measure:verify"] = measured
+        resumed._save()
+
+
+def test_an_adaptive_replan_drops_the_draws_with_the_training_it_discards(tmp_path: Path):
+    from test_calibrate import _make
+    calib = _make(tmp_path, "replan_draws", adaptive_planning=True)
     calib.stage_resolve_target()
-    rec = calib._patch_plan_record("full")
-    assert rec["verify_held_out_draws"] == 24 and "verify_held_out_draws" not in rec["patch_sizes"]
-    # the identity a pre-V1 build hashed: the same record without the draws in its counts
-    legacy = {k: v for k, v in rec.items() if k not in ("fingerprint", "verify_held_out_draws")}
-    legacy["stages"] = {**legacy["stages"], "verify": legacy["stages"]["verify"] - 24}
-    legacy["total_patches"] -= 24
-    payload = json.dumps(legacy, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
-    assert rec["fingerprint"] == hashlib.sha256(payload).hexdigest()[:16]
-    calib.patch_sizes = replace(calib.patch_sizes, verify_held_out_draws=12)
-    rec2 = calib._patch_plan_record("full")
-    assert rec2["patch_sizes"]["verify_held_out_draws"] == 12 and rec2["fingerprint"] != rec["fingerprint"]
+    calib.calib["flow"] = "full"
+    calib.calib["verify_held_out_draws"] = {"signals": [[1, 2, 3]], "training_key": "old"}
+    calib.calib["adaptive_plan"] = {"fingerprint": "OLD-FINGERPRINT"}
+    calib.stage_adaptive_planning(raw_ti3=None)
+    assert "verify_held_out_draws" not in calib.calib
+
+
+def test_probe_ledger_reads_only_the_live_build_attempt(tmp_path: Path):
+    ledger = tmp_path / "measurements" / vh.PROBES_FILE
+    vh.append_probe_drives(ledger, [[1, 2, 3]], attempt=1)                 # a superseded build attempt
+    vh.append_probe_drives(ledger, [[4, 5, 6], [7, 8, 9]], attempt=2)      # the live one
+    ev = {"event": "patch_read", "data": {"role": "probe", "rgb": [10, 11, 12], "ok": True}}
+    (tmp_path / "events.jsonl").write_text(json.dumps(ev) + "\n", encoding="utf-8")
+    live, info = vh.load_probe_drives(tmp_path, attempt=2)
+    assert sorted(map(tuple, live.tolist())) == [(4, 5, 6), (7, 8, 9)]
+    assert info["superseded_rows"] == 1 and info["scope"].startswith("build attempt 2")
+    # no live tag (a pre-ledger run): every recorded read, events included — a conservative superset
+    every, info = vh.load_probe_drives(tmp_path)
+    assert len(every) == 4 and "superset" in info["scope"]
+    # a live tag with no row of its own also falls back to the superset, said so
+    _rows, info = vh.load_probe_drives(tmp_path, attempt=3)
+    assert "left no ledger row" in info["scope"]
+    calib = {"flow": "full", "stages": {"build-install-3dlut": {"status": "done", "data": {"probe_attempt": 2}}}}
+    ctx = vh.training_context(tmp_path, calib, max_cv=1023)
+    assert sorted(map(tuple, ctx["probe_drives"].tolist())) == [(4, 5, 6), (7, 8, 9)]
+    assert vh.training_key(ctx, max_cv=1023) == vh.training_key(vh.training_context(tmp_path, calib, max_cv=1023),
+                                                                max_cv=1023)
+    calib["stages"]["build-install-3dlut"]["data"]["probe_attempt"] = 1
+    assert vh.training_key(vh.training_context(tmp_path, calib, max_cv=1023), max_cv=1023) \
+        != vh.training_key(ctx, max_cv=1023)
+
+
+def test_policy_advice_judges_the_gates_own_buckets():
+    """stages._common.policy_advice claims the live gate's basis — it reads the same view
+    (metrics.practical_gate_view): per-signal core/tube and the held-out avg at n >= 8."""
+    from dlc.decisions import MetricThresholds
+    from dlc.stages._common import policy_advice
+
+    th = MetricThresholds(avg_de2000=0.4, p95_de2000=3.0, max_de2000=5.0, white_de2000=2.0)
+    summary = _summary()
+    for practical in (_practical(64, 0.32),          # per-signal core 0.30 passes; read-weighted 0.45 would not
+                      _practical(8, 0.6),            # held-out gated and over
+                      _practical(7, 9.9),            # held-out too small: reported, not gated
+                      {k: v for k, v in _practical(64, 0.32).items() if k != "per_signal"}):   # legacy shape
+        within, basis = Calibration._quality_gate(summary, practical, th)
+        advice = policy_advice({"avg_de2000": summary.avg_de2000, "p95_de2000": summary.p95_de2000,
+                                "max_de2000": summary.max_de2000, "white_de2000": summary.white_de2000,
+                                "practical": practical}, thresholds=th)
+        assert (advice["default_policy_verdict"] == "stop") is within, (practical, advice)
+        assert basis["scored"]["basis"].replace("_", "-") in advice["reasons"][0]
+    advice = policy_advice({"avg_de2000": 0.4, "p95_de2000": 1.0, "max_de2000": 1.5, "white_de2000": 0.5,
+                            "practical": _practical(8, 0.6)}, thresholds=th)
+    assert any("held_out_avg_de2000=0.600>0.400" in r for r in advice["reasons"])
+
+
+# ---------------------------------------------------------------------------
+# HDR: the gate is per-signal core/tube + held-out too; the build writes the ledger; no draws yet
+# ---------------------------------------------------------------------------
+
+def test_hdr_gate_judges_per_signal_core_not_oog_and_gates_held_out():
+    q = types.SimpleNamespace(avg_de2000=3.0, p95_de2000=6.0, max_de2000=10.0, white_de2000=4.0)
+    practical = {"gamut_aware": True,
+                 "core": {"avg": 3.4, "p95": 5.0, "max": 9.0, "n": 200},      # repeats of one bad patch
+                 "tube": {"avg": 1.4, "p95": 4.1, "max": 7.5, "n": 99},
+                 "limits": {"avg": 8.1, "p95": 30.0, "max": 30.2, "n": 103},
+                 "clamped": {"avg": 9.9, "p95": 62.8, "max": 62.9, "n": 114},
+                 "per_signal": {"n_signals": 150, "n_reads": 417,
+                                "core": {"avg": 1.1, "p95": 2.4, "max": 9.0, "n": 86},
+                                "tube": {"avg": 1.3, "p95": 4.0, "max": 7.5, "n": 40},
+                                "limits": {"avg": 8.0, "p95": 29.0, "max": 30.2, "n": 30},
+                                "clamped": {"avg": 9.0, "p95": 60.0, "max": 62.9, "n": 34}},
+                 "held_out": {"available": True, "held_out": {"avg": 3.3, "p95": 6.0, "max": 9.0, "n": 12}}}
+    within, basis = Calibration._quality_gate(_summary(white=1.0), practical, q)
+    assert basis["scored"]["basis"] == "per_signal" and basis["scored"]["core_avg"] == 1.1
+    assert basis["checks"]["core_avg"] is True                         # read-weighted 3.4 would fail
+    assert basis["checks"]["held_out_avg"] is False and within is False   # held-out over target gates it
+    practical["held_out"]["held_out"]["n"] = 7
+    within, basis = Calibration._quality_gate(_summary(white=1.0), practical, q)
+    assert within is True and basis["held_out_gate"]["gated"] is False
+
+
+@pytest.fixture(scope="module")
+def hdr_full(tmp_path_factory):
+    from test_calibrate import _RecordingAuto, _make, _perfect_hdr_panel
+    adj = _RecordingAuto()
+    calib = _make(tmp_path_factory.mktemp("holdout_hdr"), "holdout_hdr_full", mode="HDR",
+                  panel=_perfect_hdr_panel(), bit_depth=10, adjudicator=adj)
+    result = calib.run("full")
+    assert result.status == "completed", result.digest
+    return calib, adj
+
+
+def test_hdr_full_flow_gates_per_signal_and_held_out_writes_the_ledger_and_draws_nothing(hdr_full):
+    calib, adj = hdr_full
+    v = calib.calib["stages"]["verify"]["digest"]
+    assert v["metric"] == "dE_ITP"
+    gate = v["gate"]
+    per = v["practical"]["per_signal"]
+    assert gate["scored"]["basis"] == "per_signal" and gate["scored"]["core_avg"] == per["core"]["avg"]
+    held = v["held_out"]
+    assert held["available"] is True and held["training"]["drive_space"] is True
+    assert held["n_signals"] == per["core"]["n"]                       # the gate's population: core signals
+    # The synthetic Rec.2020 verify has only ~21 CORE signals, almost all on training: the held-out
+    # bucket is too small to gate here — reported with the reason (the n >= 8 HDR gating path is
+    # pinned by test_hdr_gate_judges_per_signal_core_not_oog_and_gates_held_out).
+    n_ho = held["held_out"]["n"]
+    assert gate["held_out_gate"]["gated"] is (n_ho >= 8) and ("held_out_avg" in gate["checks"]) is (n_ho >= 8)
+    if n_ho < 8:
+        assert gate["held_out_gate"]["reason"] == f"held-out n {n_ho} < 8"
+    # no fresh draws on HDR (follow-up): none drawn, none planned, nothing excluded from the preset
+    assert "held_out_draws" not in v and "verify_held_out_draws" not in calib.calib
+    assert "verify_held_out_draws" not in calib.calib["patch_plan"]
+    assert v["preset_set"]["draw_reads_excluded"] == 0 and v["preset_set"]["avg_de2000"] == v["avg_de2000"]
+    # the HDR build wrote the tagged probe ledger the classification read
+    rows = [json.loads(line) for line in (calib.ctx.root / "measurements" / vh.PROBES_FILE)
+            .read_text(encoding="utf-8").splitlines()]
+    attempt = calib.calib["stages"]["build-install-3dlut"]["data"]["probe_attempt"]
+    assert rows and {r["attempt"] for r in rows} == {attempt}
+    q = next(r.question for r in adj.requests if r.key == "verify:accept")
+    assert "per-signal over" in q and "held-out avg" in q
+    assert ("reported, not gated" in q) is (n_ho < 8)

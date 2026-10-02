@@ -717,14 +717,19 @@ def policy_advice(
     white = metrics.get("white_de2000")
 
     reasons: list[str] = []
-    # Same basis as the live verify gate (D3, 2026-08-14 — adversarial-review alignment):
-    # when the practical split is present with a non-empty core, advise on core avg/p95/max
-    # + tube avg + white, so the CLI's advisory verdict can never contradict the run gate
-    # by re-inflating the verdict with OOG/limits framework patches.
+    # Same basis as the live verify gate (D3, 2026-08-14 — adversarial-review alignment; V1/V2,
+    # 2026-10-02): when the practical split is present with a non-empty core, advise on core
+    # avg/p95/max + tube avg + white — PER UNIQUE SIGNAL when the split carries ``per_signal`` —
+    # plus the held-out per-signal avg when the held-out bucket is big enough to gate. The bucket
+    # selection is the live gate's own (metrics.practical_gate_view), so the CLI's advisory verdict
+    # can never contradict the run gate (no OOG/limits re-inflation, no repeat-weighted core).
+    from ..metrics import practical_gate_view  # local import: advisor only
+
     practical = metrics.get("practical") or {}
-    core = practical.get("core") or {}
-    tube = practical.get("tube") or {}
-    if core.get("n"):
+    read_core = practical.get("core") or {}
+    if read_core.get("n"):
+        view = practical_gate_view(practical)
+        core, tube, held_gate = view["core"], view["tube"], view["held_out_gate"]
         checks = {
             "core_avg_de2000": (core.get("avg"), th.avg_de2000),
             "core_p95_de2000": (core.get("p95"), th.p95_de2000),
@@ -732,7 +737,12 @@ def policy_advice(
             "tube_avg_de2000": (tube.get("avg") if tube.get("n") else None, th.avg_de2000),
             "white_de2000": (white, th.white_de2000),
         }
-        reasons.append("basis: practical core+tube+white (OOG/limits are framework, not verdict)")
+        if held_gate["gated"]:
+            checks["held_out_avg_de2000"] = (held_gate["held_out_avg"], th.avg_de2000)
+        reasons.append(f"basis: practical core+tube+white ({view['basis'].replace('_', '-')}"
+                       + ("; + held-out avg" if held_gate["gated"]
+                          else f"; held-out not gated: {held_gate['reason']}")
+                       + ") — OOG/limits are framework, not verdict")
         missing = [name for name, (value, _) in checks.items() if value is None]
         if missing:
             return {
@@ -744,7 +754,8 @@ def policy_advice(
                 for name, (value, limit) in checks.items() if value > limit]
         if not over:
             verdict = "stop"
-            reasons.append("core/tube/white dE within default thresholds")
+            reasons.append("core/tube/white" + ("/held-out" if held_gate["gated"] else "")
+                           + " dE within default thresholds")
         elif (previous_avg is not None and avg is not None
               and (previous_avg - avg) < th.min_improvement):
             # Diminishing-returns stop mirrors the legacy path (improvement tracked on the

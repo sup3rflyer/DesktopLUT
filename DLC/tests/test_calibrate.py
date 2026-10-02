@@ -4368,7 +4368,8 @@ def uncrashed_verify_digest(tmp_path_factory) -> object:
     """
     # One run NAME for the baseline and every crash case (each in its own tmp dir): the fresh
     # held-out verify draws are seeded by the run id, so equal ids are what makes the digests
-    # comparable — and the matrix then also proves a resume re-draws the identical set.
+    # comparable. (A crash at measure:verify fires AFTER the draw is memoised, so the resume
+    # replays the memo here; test_verify_holdout's re-draw test clears it and re-draws.)
     baseline = _make(tmp_path_factory.mktemp("crash_base"), _CRASH_RUN)
     assert baseline.run("full").status == "completed"
     return baseline.calib["stages"]["verify"]["digest"]

@@ -14,22 +14,36 @@ request, adjudicates ambiguous results on digests, and writes the report.
 - **Held-out verify, per-signal verify stats, and the scoring white stated** (2026-10-02). A review of
   the PA32UCXR SDR run found the verify headline partly in-sample: 309 reads but 141 unique signals, 77
   of them on a build training signal, and the 28 repeated sweep signals carried 63 % of the
-  read-weighted mean. The verify now (a) adds a `per_signal` view (each signal's ΔE is the mean of its
-  reads; repeats count once) and gates core/tube on it, with the read-weighted numbers kept unchanged
-  beside it; (b) classifies every verify signal against the run's training set (its non-verify TI3s plus
-  every build-probe drive, now logged to `measurements/build_probes.ndjson`, with the events log as the
-  fallback for older runs) in signal and drive space, and reports held-out (> 4 codes), off-lattice
-  held-out and coincident (≤ 1 code) buckets, with the per-signal rows in
-  `reports/verification_iter00_held_out.json`. A held-out bucket of 8 or more signals is also gated on
-  the average target; a smaller one is reported only, with the reason. (c) SDR verifies now carry 24
-  fresh held-out colours per run (`--verify-held-out-draws`, 0 = off). They are seeded by the run id, so a
-  resume measures the same set, sit ≥ 8 codes from every training signal and probe drive, are off the
-  cube lattice, and are counted in the patch plan without moving an approved plan's fingerprint. HDR
-  draws are a follow-up. (d) The digest states the white the SDR ΔE is relative to (the measured white,
-  how many white reads, its offset from the calibrated white). verify-only `--verify-patches-from`
-  compares per-signal and held-out buckets on one basis by re-scoring the source's verify.ti3 with the
-  current scorer. The `verify:accept` question leads with the per-signal numbers and quotes the
-  held-out average next to them. The score CLI reports the same held-out view.
+  read-weighted mean.
+  - **Per-signal view.** The verify adds `per_signal` stats: each signal's ΔE is the mean of its reads,
+    so repeats count once. The quality gate now scores core/tube on it. The stage-CLI advisory verdict
+    (`policy_advice`) reads the same buckets as the gate.
+  - **Held-out classification.** Every verify signal is classified against the run's training set, in
+    signal and drive space. The training set is the run's non-verify TI3s plus the live build's probe
+    drives. Those drives are now logged per build attempt to `measurements/build_probes.ndjson`; older
+    runs fall back to every recorded probe read, a conservative superset. The verify reports held-out
+    (> 4 codes), off-lattice held-out and coincident (≤ 1 code) buckets. The per-signal rows go to
+    `reports/verification_iter00_held_out.json`. A held-out bucket of 8 or more signals is also gated on
+    the average target; a smaller one is reported only, with the reason.
+  - **Fresh draws (SDR).** SDR verifies now carry 24 fresh held-out colours per run
+    (`--verify-held-out-draws`, 0 = off). The draws are seeded by the run id and hue-stratified. They sit
+    ≥ 8 codes from every training signal and probe drive (in drive space too), off the cube lattice. They
+    are memoised against the training they were drawn from and re-drawn when that changes (re-plan,
+    forced or resumed re-build, re-measured post-MHC). They are counted in the patch plan without moving
+    an approved plan's fingerprint.
+  - **Headline population changed.** On new SDR runs `avg_de2000` and the read-weighted buckets keep
+    their definition but now include the draws. Use the digest's `preset_set` block (the preset verify
+    set without the draws, read-weighted and per signal) to compare against other runs. The
+    `verify:accept` question quotes it.
+  - **HDR.** HDR verifies are gated on per-signal core/tube too, plus the held-out avg when ≥ 8 core
+    signals are held out (full / 3dlut-only). HDR builds write the probe ledger. HDR fresh draws are a
+    follow-up.
+  - **Scoring white stated.** The digest states the white the SDR ΔE is relative to: the measured white,
+    how many white reads, and its offset from the calibrated white.
+  - **verify-only.** `--verify-patches-from` compares per-signal and held-out buckets on one basis, by
+    re-scoring the source's verify.ti3 with the current scorer.
+  - **Seam and score CLI.** The `verify:accept` question leads with the per-signal numbers and quotes
+    the held-out average next to them. The score CLI reports the same held-out view.
 - **`--flow verify-only`: measure a stack without rebuilding it** (2026-09-27). Several hardware
   acceptances only need a measurement: the projection-cube (D1) acceptance on the PA32UCXR, re-checking a
   stack after a change, owner A/Bs. Until now the only route was a multi-hour `3dlut-only` rebuild. The

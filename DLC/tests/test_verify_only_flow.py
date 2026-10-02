@@ -565,8 +565,10 @@ def test_verify_patches_from_compares_per_signal_and_held_out_on_one_basis(tmp_p
     # this run built nothing: its own held-out view says so instead of calling everything held-out
     assert verify["held_out"]["available"] is False and "verify-only" in verify["held_out"]["reason"]
     assert verify["gate"]["held_out_gate"]["gated"] is False
-    # the source's exact list carries its fresh draws; no new draws on top
+    # the source's exact list carries its fresh draws; no new draws on top — but the preset-only numbers
+    # still recognise (and exclude) the source's draws
     assert "held_out_draws" not in verify and "verify_held_out_draws" not in calib.calib["patch_plan"]
+    assert verify["preset_set"]["draw_reads_excluded"] == 24
     vs = verify["vs_source"]
     per = vs["per_signal"]
     assert per["available"] is True and per["source_basis"].startswith("rescored")
@@ -579,6 +581,22 @@ def test_verify_patches_from_compares_per_signal_and_held_out_on_one_basis(tmp_p
     assert set(vs["scored_white_nits"]) == {"now", "source", "delta_pct"}
     html = (Path(result.results_dir) / "report.html").read_text(encoding="utf-8")
     assert "per-signal core avg" in html and "held-out partition held_out avg" in html
+
+
+def test_a_held_out_partition_failure_keeps_the_per_signal_deltas(tmp_path: Path, sdr_source: Path,
+                                                                  monkeypatch):
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("partition exploded")
+
+    monkeypatch.setattr(Calibration, "_vs_source_held_out", boom)
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    calib = _make(tmp_path, "vo_partition_fail", controller=ctrl, verify_patches_from=sdr_source)
+    assert calib.run("verify-only").status == "completed"
+    vs = calib.calib["stages"]["verify"]["digest"]["vs_source"]
+    assert vs["per_signal"]["available"] is True and vs["per_signal"]["core"]["avg"]["delta"] is not None
+    assert vs["held_out"] == {"available": False} and "partition exploded" in vs["held_out_error"]
+    assert "per_signal_error" not in vs and "rescore_error" not in vs
 
 
 def test_verify_patches_from_a_mode_mismatch_is_an_abort_only_seam(tmp_path: Path, sdr_source: Path):

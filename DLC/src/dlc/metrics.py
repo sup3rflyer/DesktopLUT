@@ -682,6 +682,44 @@ def group_per_signal(patch_metrics: list[PatchMetric]) -> list[tuple[PatchMetric
     return out
 
 
+# Below this many held-out signals the held-out bucket is reported, never gated (V1).
+HELD_OUT_GATE_MIN_SIGNALS = 8
+
+
+def practical_gate_view(practical: dict[str, Any] | None) -> dict[str, Any]:
+    """The buckets the verify quality gate scores — ONE selection shared by the live gate
+    (``Calibration._quality_gate``) and the stage-CLI advisory verdict
+    (``stages._common.policy_advice``), so the two can never judge different numbers.
+
+    * ``core`` / ``tube`` — PER UNIQUE SIGNAL when the practical split carries ``per_signal``
+      (V2: a signal read 7× counts once), else the read-weighted buckets; ``basis`` names which.
+    * ``held_out_gate`` — whether the held-out per-signal core avg (V1) is a gate input: only
+      with >= :data:`HELD_OUT_GATE_MIN_SIGNALS` held-out signals; otherwise reported with the
+      reason (unavailable classification, too few signals)."""
+    practical = practical or {}
+    read_core = practical.get("core") or {}
+    per = practical.get("per_signal") or {}
+    if (per.get("core") or {}).get("n"):
+        core, tube, basis = per["core"], per.get("tube") or {}, "per_signal"
+    else:
+        core, tube, basis = read_core, practical.get("tube") or {}, "read_weighted"
+    held = practical.get("held_out") or {}
+    ho = held.get("held_out") or {}
+    n_ho = int(ho.get("n") or 0)
+    min_n = HELD_OUT_GATE_MIN_SIGNALS
+    if held.get("available") and n_ho >= min_n and ho.get("avg") is not None:
+        held_gate: dict[str, Any] = {"gated": True, "held_out_avg": ho["avg"], "held_out_n": n_ho,
+                                     "min_n": min_n}
+    else:
+        reason = ((held.get("reason") or "no held-out classification") if not held.get("available")
+                  else f"held-out n {n_ho} < {min_n}")
+        held_gate = {"gated": False, "reason": reason, "held_out_avg": ho.get("avg"),
+                     "held_out_n": n_ho, "min_n": min_n}
+    return {"basis": basis, "core": core, "tube": tube, "read_core": read_core,
+            "n_signals": per.get("n_signals"), "n_reads": per.get("n_reads"),
+            "held_out_gate": held_gate}
+
+
 def per_signal_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool) -> dict[str, Any]:
     """The practical split over UNIQUE signals (V2): each signal's ΔE is the mean of its reads,
     then ``overall`` / ``core`` / ``limits`` / ``clamped`` / ``tube`` / ``bands`` are stats over
