@@ -72,7 +72,8 @@ def _hdr_panel() -> SyntheticPanel:
 
 def _make(tmp_path: Path, name: str, *, mode: str = "SDR", controller=None, adjudicator=None,
           panel=None, bit_depth=None, verify_cube=None, verify_patches_from=None, preheat=None,
-          loop_config=None, require_hardware_readiness=False, decision_overrides=None) -> Calibration:
+          loop_config=None, require_hardware_readiness=False, decision_overrides=None,
+          present_stall=None) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -83,7 +84,8 @@ def _make(tmp_path: Path, name: str, *, mode: str = "SDR", controller=None, adju
         adjudicator=adjudicator or AutoAdjudicator(), optimize_config=_OPT, patch_sizes=_SMALL,
         run_date=_DATE, bit_depth=bit_depth, loop_config=loop_config,
         require_hardware_readiness=require_hardware_readiness, decision_overrides=decision_overrides,
-        verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat)
+        verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat,
+        present_stall=present_stall)
 
 
 def _cube(path: Path, value: str = "0.5 0.5 0.5") -> Path:
@@ -737,6 +739,43 @@ def test_no_preheat_flag_keeps_todays_behaviour(tmp_path: Path, monkeypatch):
     assert calib.run("verify-only").status == "completed"
     assert seen == ["never"] and "preheat" not in calib.calib
     assert MeasureLoopConfig().preheat == "auto"             # the code default a CLI run gets
+
+
+def test_present_stall_off_reaches_the_loop_persists_and_is_recorded(tmp_path: Path, monkeypatch):
+    import dlc.calibrate as calibrate_mod
+
+    seen: list = []
+    real = calibrate_mod.run_measure_loop
+
+    def spy(**kw):
+        seen.append(kw["config"].stall_reads)
+        return real(**kw)
+    monkeypatch.setattr(calibrate_mod, "run_measure_loop", spy)
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl)
+    with pytest.raises(AdjudicationRequired):     # pauses at the readiness gate, before any measure
+        _make(tmp_path, "vo_stall_off", controller=ctrl, present_stall="off", require_hardware_readiness=True,
+              adjudicator=MappingAdjudicator({"resolve-target:plan": Decision("approve")})).run("verify-only")
+    state = json.loads((tmp_path / "vo_stall_off" / "dlc_state.json").read_text(encoding="utf-8"))
+    assert state["calib"]["present_stall"] == "off"
+    decided = MappingAdjudicator({"resolve-target:plan": Decision("approve"),
+                                  "hardware-readiness:confirm": Decision("ready")})
+    resumed = _make(tmp_path, "vo_stall_off", controller=ctrl, present_stall=None,  # a flagless resume
+                    require_hardware_readiness=True, adjudicator=decided)
+    assert resumed.run("verify-only").status == "completed"
+    assert seen == [0]                                       # the stuck-frame detector is disabled
+    assert resumed.calib["stages"]["measure:verify"]["digest"]["present_stall_detect"] == "off"
+    # default: the detector stays armed and the digest says nothing
+    seen.clear()
+    ctrl2 = CalibrationController.mock()
+    _seed_stack(ctrl2)
+    calib = _make(tmp_path, "vo_stall_default", controller=ctrl2)
+    assert calib.run("verify-only").status == "completed"
+    assert seen == [MeasureLoopConfig().stall_reads] and seen[0] > 0
+    assert "present_stall" not in calib.calib
+    assert "present_stall_detect" not in calib.calib["stages"]["measure:verify"]["digest"]
+    with pytest.raises(ValueError):
+        _make(tmp_path, "vo_stall_bad", controller=ctrl2, present_stall="maybe")
 
 
 def test_preheat_persists_across_resume_and_a_change_is_recorded(tmp_path: Path, monkeypatch):

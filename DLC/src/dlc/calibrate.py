@@ -366,6 +366,7 @@ class Calibration:
         verify_cube: Optional[Path] = None,
         verify_patches_from: Optional[Path] = None,
         preheat: Optional[str] = None,
+        present_stall: Optional[str] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -505,6 +506,21 @@ class Calibration:
                                         "stages_done": sorted(self.calib.get("stages") or {})}
                 self.calib.setdefault("preheat_changes", []).append(self._preheat_change)
             self.calib["preheat"] = policy
+        # The stuck-frame (present-stall) detector, per run (--present-stall). It assumes distinct
+        # commanded colours can only read identical XYZ on a frozen frame; a deliberate drive sweep
+        # whose minor channels the MHC clips to zero (2026-10-02 PA HDR minor-channel brackets) reads
+        # identical XYZ legitimately. "off" is an LLM decision for such a run: persisted (a flagless
+        # resume keeps it), every change recorded, every measure digest names it.
+        if present_stall is not None:
+            sw = str(present_stall).strip().lower()
+            if sw not in ("on", "off"):
+                raise ValueError(f"present_stall must be 'on' or 'off', got {present_stall!r}")
+            stored = self.calib.get("present_stall")
+            if stored is not None and stored != sw:
+                self.calib.setdefault("present_stall_changes", []).append(
+                    {"from": stored, "to": sw, "at": datetime.now().isoformat(timespec="seconds"),
+                     "stages_done": sorted(self.calib.get("stages") or {})})
+            self.calib["present_stall"] = sw
         self.target_name: Optional[str] = self.calib.get("target")
         # Reconcile mode + bit depth against the persisted run record: a resume's CLI args
         # default to SDR/8-bit and must NOT override the run's fixed spec (which both
@@ -1693,7 +1709,10 @@ class Calibration:
     def _with_preheat(self, cfg: MeasureLoopConfig) -> MeasureLoopConfig:
         """``cfg`` with the run's ``--preheat`` policy applied — the one place the lever reaches the
         thermal controller's gate (``MeasureLoopConfig.preheat`` → ``_Loop._preheat_enabled``) for
-        every batch measure stage and the grayscale-wb session."""
+        every batch measure stage and the grayscale-wb session. The run's ``--present-stall off``
+        rides the same path (``stall_reads`` 0 disables the stuck-frame detector)."""
+        if self.calib.get("present_stall") == "off" and cfg.stall_reads > 0:
+            cfg = replace(cfg, stall_reads=0)
         policy = self._preheat_policy()
         if policy is None or cfg.preheat == policy:
             return cfg
@@ -2856,6 +2875,8 @@ class Calibration:
             digest["nominal_white_nits"] = spec.luminance_nits
         if self._preheat_policy():
             digest["preheat"] = self._preheat_policy()
+        if self.calib.get("present_stall") == "off":
+            digest["present_stall"] = "off"
         if flow == "verify-only":
             # What this measurement-only run will read THROUGH (nothing is built or committed).
             digest["verify_only"] = {"verify_cube": self.calib.get("verify_cube"),
@@ -3886,8 +3907,10 @@ class Calibration:
             digest = dict(res.digest)
             # The thermal preheat policy this measure ran under (--preheat, else the loop config's
             # own) — evidence beside the controller's own `preheat` digest (null when it skipped).
-            digest["preheat_policy"] = self._with_preheat(
-                self.loop_config or self._loop_config_for(self._dip())).preheat
+            run_cfg = self._with_preheat(self.loop_config or self._loop_config_for(self._dip()))
+            digest["preheat_policy"] = run_cfg.preheat
+            if run_cfg.stall_reads <= 0:
+                digest["present_stall_detect"] = "off"   # --present-stall off: no stuck-frame guard
             if probe_path is not None:
                 digest["probe_path"] = probe_path
             if bookend_drift is not None:
@@ -9472,6 +9495,7 @@ def run_calibration(
     verify_cube: Optional[Path] = None,
     verify_patches_from: Optional[Path] = None,
     preheat: Optional[str] = None,
+    present_stall: Optional[str] = None,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -9486,7 +9510,8 @@ def run_calibration(
         adaptive_planning=adaptive_planning,
         require_hardware_readiness=require_hardware_readiness,
         mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run,
-        verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat)
+        verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat,
+        present_stall=present_stall)
     return calib.run(flow)
 
 
@@ -9553,6 +9578,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "never: skip it (a short verify on a panel already at operating temperature). "
                              "Persisted in the run record (a flagless resume keeps it; each measure digest "
                              "records the policy it ran under)")
+    parser.add_argument("--present-stall", choices=("on", "off"), default=None, dest="present_stall",
+                        help="the stuck-frame (present-stall) run-stopper for every measure stage (default on). "
+                             "off = an LLM decision for a drive sweep whose distinct commands legitimately read "
+                             "identical XYZ (e.g. minor channels the MHC clips to zero). Persisted in the run "
+                             "record; each measure digest names it")
     parser.add_argument("--profile", type=Path, default=None)
     parser.add_argument("--bit-depth", type=int, default=None, dest="bit_depth")
 
@@ -10157,6 +10187,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             verify_cube=args.verify_cube,
                             verify_patches_from=args.verify_patches_from,
                             preheat=args.preheat,
+                            present_stall=args.present_stall,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
