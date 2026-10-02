@@ -370,6 +370,20 @@ request, adjudicates ambiguous results on digests, and writes the report.
   with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
 
 ### Fixed
+- **The 3D-LUT build models the cube the way DesktopLUT applies it** (2026-10-02). The DWM hook samples the
+  cube with tetrahedral interpolation; DLC sampled it trilinearly to pick its probe drives, fold them back and
+  predict the result. Between lattice nodes the two differ, most visibly on the grey axis: tetrahedral keeps
+  identity grey nodes exactly identity, trilinear mixed the neighbouring colour corrections in. On the PA32UCXR
+  (SDR run 20261002) the build probed grey 852 at (855.7, 854.1, 854.2) and read ΔE 0.25, while the hook showed
+  (852, 852, 852) and verify read 0.68. `optimize.sample_cube` and `lut_rbf.predicted_accuracy` now use an exact
+  numpy port of the hook's sampler (`engine.cube_sampler.sample_tetrahedral`). Offline: held-out 5-fold CV over
+  the eight SDR datasets through the production outer loop is unchanged on every region (all differences
+  ≤ 0.002 ΔE2000); the BenQ and June closed-loop replays and the HDR 132412 verify zones are unchanged
+  (≤ 0.004 / 0.001). The predicted verify now tracks the measured one better: grey prediction error falls on
+  seven of the eight SDR runs that shipped a cube (0.10–0.60 → 0.06–0.20 ΔE2000), and June 214429 is
+  unchanged. Older CV tables scored greys through trilinear and so overstated the cube's neutral accuracy:
+  pooled held-out neutral is 1.215, not 1.124, under the sampler the panel actually uses. HDR 132412 note: the
+  out-of-gamut green-edge lattice reshuffles, from 51 to 60 large reversals, all at out-of-gamut target nodes.
 - **A crashed or repeated calibration run can still be undone** (2026-09-27; fable Phase 9 T2,
   needs the matching DesktopLUT build). DesktopLUT kept one pre-run snapshot and overwrote it on
   every `calibration.enter`: a run that died without exiting left the display cleared, and the

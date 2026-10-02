@@ -75,7 +75,7 @@ def ideal_cube(space: TargetSpace, grid_size: int, hold_above: Optional[float] =
 
 
 def _sample(cube: np.ndarray, signals: np.ndarray) -> np.ndarray:
-    from ..optimize import sample_cube   # the production tetrahedral sampler
+    from ..optimize import sample_cube   # the runtime's sampler (the DWM hook's tetrahedral interpolation)
     return np.clip(sample_cube(cube, signals), 0.0, 1.0)
 
 

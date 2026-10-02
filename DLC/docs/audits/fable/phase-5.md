@@ -105,7 +105,7 @@ against cross-phase rule 7.
 
 | Site | Size | Role / rationale |
 |---|---|---|
-| `OptimizeConfig.grid_size` = 33 | runtime RBF cube | The shipping 3D-LUT resolution: DesktopLUT samples it trilinearly; 33³ balances node density against the RBF predict cost per inner iteration (35,937 nodes × 3). |
+| `OptimizeConfig.grid_size` = 33 | runtime RBF cube | The shipping 3D-LUT resolution: DesktopLUT's DWM hook samples it tetrahedrally (DLC models it with the same sampler since 2026-10-02, `engine.cube_sampler`); 33³ balances node density against the RBF predict cost per inner iteration (35,937 nodes × 3). |
 | `lut3d.build_3dlut_plan` `-r33` | collink device-link | The Argyll stage-CLI alternate deliberately matches the runtime cube resolution. |
 | `execute_3dlut_build_plan(simulate=True)` → `min(plan, 17)` | rehearsal artifact | Simulated identity cube only — smaller for cheap no-hardware rehearsals; never installed on a real run. |
 | `simulation.write_identity_cube` default 17 | rehearsal artifact | Same rehearsal tier. |

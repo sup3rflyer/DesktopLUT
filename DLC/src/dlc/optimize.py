@@ -56,8 +56,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 
+from .engine.cube_sampler import sample_tetrahedral
 from .engine.lut_constrained import build_constrained_rbf_cube
 from .engine.lut_rbf import (build_cube, cube_diagnostics, hold_lattice_level, identity_cube,
                              predicted_accuracy, write_cube)
@@ -345,15 +345,17 @@ class OptimizeResult:
 
 
 def sample_cube(cube: np.ndarray, signals: np.ndarray) -> np.ndarray:
-    """Trilinearly sample the LUT (indexed ``[b, g, r]``) at input ``signals``
-    (N, 3) → the corrected output signals the panel would be driven to."""
-    grid_size = cube.shape[0]
-    axis = np.linspace(0.0, 1.0, grid_size)
-    interp = RegularGridInterpolator((axis, axis, axis), cube, method="linear",
-                                     bounds_error=False, fill_value=None)
-    signals = np.asarray(signals, dtype=float)
-    out = interp(signals[:, [2, 1, 0]])  # cube indexed [B, G, R]
-    return np.clip(out, 0.0, 1.0)
+    """Sample the LUT (indexed ``[b, g, r]``) at input ``signals`` (N, 3) exactly as the runtime
+    does → the output signals the panel is driven to, clipped to [0, 1].
+
+    DesktopLUT's DWM hook applies the cube with TETRAHEDRAL interpolation
+    (:func:`dlc.engine.cube_sampler.sample_tetrahedral`, an exact port of ``LutTransformTetrahedral``),
+    so this is what the build probes, folds back and predicts with: a point between nodes is probed
+    at the drive the hook will show there. (Trilinear sampling — used here until 2026-10-02 — mixes
+    all eight cell corners and leaked neighbouring colour corrections onto the grey axis: PA32UCXR SDR
+    run 20261002 grey 852 was probed at (855.7, 854.1, 854.2) / dE 0.25 while the hook showed the
+    identity drive and verified 0.68.)"""
+    return np.clip(sample_tetrahedral(cube, signals), 0.0, 1.0)
 
 
 def aggregate_training_samples(signals: np.ndarray, measured_xyz: np.ndarray,

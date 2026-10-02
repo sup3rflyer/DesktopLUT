@@ -27,9 +27,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
-from scipy.interpolate import RegularGridInterpolator
 from scipy.spatial import ConvexHull, QhullError
 
+from .cube_sampler import sample_tetrahedral
 from .model import DE_ITP_SCALE, DisplayErrorModel, de_itp
 
 
@@ -565,17 +565,14 @@ def predicted_accuracy(model: DisplayErrorModel, lut: np.ndarray,
                        max_data_signal: Optional[float] = None) -> dict[str, float]:
     """Predict post-LUT ``dE_ITP`` at the measurement points (in-data-range).
 
-    Trilinearly samples the LUT at each measurement stimulus, runs the result
-    back through the model's forward simulator, and compares to target. This is
-    the model-side estimate of how good the cube is before it touches hardware.
+    Samples the LUT at each measurement stimulus the way the runtime does (the DWM
+    hook's tetrahedral interpolation, :func:`dlc.engine.cube_sampler.sample_tetrahedral`),
+    runs the result back through the model's forward simulator, and compares to
+    target. This is the model-side estimate of how good the cube is before it
+    touches hardware.
     """
-    grid_size = lut.shape[0]
-    axis = np.linspace(0.0, 1.0, grid_size)
     signal_points = np.asarray(signal_points, dtype=float)
-
-    interp = RegularGridInterpolator((axis, axis, axis), lut, method="linear",
-                                     bounds_error=False, fill_value=None)
-    lut_out = interp(signal_points[:, [2, 1, 0]])  # lut indexed [B,G,R]
+    lut_out = sample_tetrahedral(lut, signal_points)  # lut indexed [B,G,R]
 
     produced_ictcp = model.space.xyz_to_ictcp(model.forward(lut_out))
     target_ictcp = model.space.ideal_ictcp(signal_points)
