@@ -1190,6 +1190,26 @@ class Calibration:
         (pre-2026-09-03 builds) yield ``supported: False`` — the ini audit stays the evidence."""
         rec = self.calib.get("viewing_layers")
         if isinstance(rec, dict) and rec.get("captured"):
+            if rec.get("restored") and rec.get("disabled"):
+                # A rollback / abort already PUT THE USER'S LAYERS BACK, and this run is measuring
+                # again (a resume after a cancel). Switch the recorded ones off again — never
+                # re-capture (the original `before` stays the user's state for the terminal restore)
+                # — or the resumed stages would measure THROUGH the viewing layers (2026-10-02: a
+                # resumed PA SDR 3dlut-only would have probed its cube through the FALD layer).
+                try:
+                    res = self.controller.set_layers(self.monitor, self.mode,
+                                                     **{n: False for n in rec["disabled"]})
+                    rec.update(restored=False, after=res.get("after"),
+                               profile_after=res.get("profile_name"),
+                               recleared_after_restore=sorted(rec["disabled"]))
+                    self.ctx.log(f"viewing layers OFF again after the rollback restore: "
+                                 f"{', '.join(rec['disabled'])}")
+                except Exception as exc:  # noqa: BLE001 - surfaced; the readiness audit still judges
+                    rec["error"] = f"layers.set (re-clear) failed: {type(exc).__name__}: {exc}"
+                    self.runlog.anomaly("hardware-readiness", kind="viewing_layers",
+                                        message=f"could not switch the viewing layers off again: {rec['error']}")
+                self.calib["viewing_layers"] = rec
+                self._save()
             return rec
         try:
             state = self.controller.state() or {}

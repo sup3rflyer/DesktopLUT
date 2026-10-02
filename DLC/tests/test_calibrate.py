@@ -5730,6 +5730,26 @@ def _layers(ctrl: CalibrationController, key: str) -> dict:
     return {n: v for n, v in entry.items() if n in CalibrationController.LAYER_NAMES}
 
 
+def test_resume_after_a_rollback_switches_the_restored_viewing_layers_off_again(tmp_path: Path):
+    """2026-10-02 (PA SDR 3dlut-only, cancelled mid cube-build for a Print-Screen overlay): the rollback
+    put the user's FALD layer back on, and the memoised capture would have let the resumed cube build
+    probe THROUGH it. A resume after a restore re-clears the recorded layers — without re-capturing, so
+    the user's original `before` still drives the terminal restore."""
+    ctrl = CalibrationController.mock()
+    _layers_on(ctrl, "0:SDR", white_balance=True)
+    calib = _make(tmp_path, "relayers", controller=ctrl)
+    rec = calib._enter_measurement_layers()
+    assert rec["disabled"] == ["white_balance"] and not _layers(ctrl, "0:SDR")["white_balance"]
+    calib._restore_viewing_layers()                                  # what a rollback / abort does
+    assert calib.calib["viewing_layers"]["restored"] is True and _layers(ctrl, "0:SDR")["white_balance"]
+    rec2 = calib._enter_measurement_layers()                         # the resumed run measures again
+    assert not _layers(ctrl, "0:SDR")["white_balance"]               # OFF again for the measurement
+    assert rec2["restored"] is False and rec2["recleared_after_restore"] == ["white_balance"]
+    assert rec2["before"]["white_balance"] is True                   # the user's state, not re-captured
+    calib._restore_viewing_layers()                                  # the terminal restore still works
+    assert _layers(ctrl, "0:SDR")["white_balance"]
+
+
 def test_3dlut_only_measures_with_the_viewing_layers_off_and_restores_them(tmp_path: Path):
     ctrl = CalibrationController.mock()
     prof = _seed_hdr_stack(ctrl)
