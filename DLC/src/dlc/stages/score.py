@@ -106,6 +106,19 @@ def build(args, ctx: RunContext) -> StageResult:
         thresholds = metric_thresholds_for_run(ctx, args.stage)
     gamut_aware = reachable is not None
     practical = practical_summary(patch_metrics, is_hdr=is_hdr, gamut_aware=gamut_aware)
+    if Path(source).name.lower().startswith("verify"):
+        # A verify set: the held-out view (V1) exactly as the live verify computes it — classified
+        # against this run's training (non-verify TI3s + build-probe drives, the verify's cube).
+        from ..verify_holdout import held_out_view
+
+        bit_depth = int(dl_state.get("bit_depth") or (10 if is_hdr else 8))
+        try:
+            practical["held_out"], _rows = held_out_view(
+                patch_metrics, run_root=ctx.root, calib=dl_state.get("calib") or {},
+                bit_depth=bit_depth, is_hdr=is_hdr)
+        except Exception as exc:  # noqa: BLE001 - evidence only, like the live verify
+            practical["held_out"] = {"available": False,
+                                     "reason": f"classification failed ({type(exc).__name__}: {exc})"}
     # One producer shape (P4): write_metrics owns the artifacts (metrics + per-patch rows —
     # the file the dashboard's /api/patch_metrics globs for) and the canonical
     # metrics_scored event, so a stage-CLI run fills the same dashboard ΔE panel a live

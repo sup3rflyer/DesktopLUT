@@ -4353,6 +4353,7 @@ def test_planned_stages_match_announced_phases_per_flow(tmp_path: Path):
     run_and_check("ps_gswb", "grayscale-wb", controller=full.controller)
 
 
+_CRASH_RUN = "crash_run"   # shared run id (see uncrashed_verify_digest)
 _CRASH_POINTS = ["preflight", "whitepoint", "enter-neutral", "brightness",
                  "measure:raw", "build-install-mhc", "refine-mhc-grayscale",
                  "measure:post-mhc", "build-install-3dlut", "measure:verify", "verify"]
@@ -4365,7 +4366,10 @@ def uncrashed_verify_digest(tmp_path_factory) -> object:
     Module-scoped only to stop the resume matrix paying for the same baseline eleven times;
     the value is read, never mutated, and the run dir behind it is never reopened.
     """
-    baseline = _make(tmp_path_factory.mktemp("crash_base"), "crash_baseline")
+    # One run NAME for the baseline and every crash case (each in its own tmp dir): the fresh
+    # held-out verify draws are seeded by the run id, so equal ids are what makes the digests
+    # comparable — and the matrix then also proves a resume re-draws the identical set.
+    baseline = _make(tmp_path_factory.mktemp("crash_base"), _CRASH_RUN)
     assert baseline.run("full").status == "completed"
     return baseline.calib["stages"]["verify"]["digest"]
 
@@ -4378,7 +4382,7 @@ def test_crash_resume_matrix_replays_to_identical_outcome(tmp_path: Path, key: s
     # (b) every stage recorded before the crash replays from the memo (never re-measured),
     # (c) the final verify digest is IDENTICAL to an uncrashed baseline run's.
     # One parameter per crash point: same matrix, one case per test so xdist spreads it.
-    name = f"crash_{key.replace(':', '_')}"
+    name = _CRASH_RUN
     calib = _make(tmp_path, name)
     orig = calib._stage
 

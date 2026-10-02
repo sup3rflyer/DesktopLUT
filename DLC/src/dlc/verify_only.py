@@ -276,6 +276,9 @@ def _bucket_delta(now: Mapping[str, Any], src: Mapping[str, Any]) -> dict[str, A
     return out
 
 
+bucket_delta = _bucket_delta   # {avg, p95, max: {now, source, delta}, n} of two practical buckets (public)
+
+
 def _patch_rows(rows: Iterable[Mapping[str, Any]]) -> dict[tuple, Mapping[str, Any]]:
     """Key per-patch rows by (rounded signal, occurrence) — robust to a source whose TI3
     dropped a hole (index alignment would then shift every later patch)."""

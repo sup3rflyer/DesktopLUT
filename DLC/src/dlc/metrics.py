@@ -577,6 +577,9 @@ def _bucket_stats(values: list[float]) -> dict[str, Any]:
             "max": round(max(values), 3), "n": len(values)}
 
 
+bucket_stats = _bucket_stats   # the {avg, p95, max, n} shape every practical bucket uses (public)
+
+
 def practical_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
                       gamut_aware: bool = False) -> dict[str, Any]:
     """The §0 practically-weighted view of a scored set — the content-priority split that
@@ -604,33 +607,89 @@ def practical_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
     Plus the two §0 honesty breakdowns that keep a flattering average from hiding a
     visible defect: ``tube`` (neutral + near-neutral ≤ 0.20 saturation — where a cast is
     most visible) and ``bands`` (the Phase 2 luminance bands — a low-light drift shows up
-    in ``<1``/``1-10`` no matter how good the overall average looks)."""
+    in ``<1``/``1-10`` no matter how good the overall average looks).
+
+    The buckets above are READ-weighted (every read counts) and stay exactly that — the
+    verify-only deltas and history compare recorded numbers. ``per_signal`` (V2, 2026-10-02)
+    is the same split over UNIQUE signals (:func:`per_signal_summary`): a signal read 7× (the
+    saturation-sweep bookends) counts once, so the repeated, in-training sweep cannot carry
+    the average (PA32UCXR 2026-10-02: 28 of 141 signals held 63 % of the read weight)."""
+    return {
+        "gamut_aware": bool(gamut_aware),
+        **_practical_buckets(patch_metrics, is_hdr=is_hdr),
+        "per_signal": per_signal_summary(patch_metrics, is_hdr=is_hdr),
+    }
+
+
+def practical_zone(m: PatchMetric, *, is_hdr: bool) -> str:
+    """The §0 zone of one scored patch — ``core`` / ``limits`` / ``clamped`` (see
+    :func:`practical_summary`). The ONE classifier the read-weighted and per-signal views share."""
+    x, y, z = m.target_xyz
+    total = x + y + z
+    target_xy = (x / total, y / total) if total > 1e-9 else None
+    if m.gamut_clamped:
+        return "clamped"
+    if not is_hdr or is_core_target(target_xy, y):
+        return "core"
+    return "limits"
+
+
+def _practical_buckets(patch_metrics: list[PatchMetric], *, is_hdr: bool) -> dict[str, Any]:
     zones: dict[str, list[float]] = {"core": [], "limits": [], "clamped": []}
     tube: list[float] = []
     bands: dict[str, list[float]] = {label: [] for label in PRACTICAL_BAND_LABELS}
     for m in patch_metrics:
-        x, y, z = m.target_xyz
-        total = x + y + z
-        target_xy = (x / total, y / total) if total > 1e-9 else None
-        target_y = y
-        if m.gamut_clamped:
-            zones["clamped"].append(m.de2000)
-        elif not is_hdr or is_core_target(target_xy, target_y):
-            zones["core"].append(m.de2000)
-        else:
-            zones["limits"].append(m.de2000)
+        zones[practical_zone(m, is_hdr=is_hdr)].append(m.de2000)
         if m.grayscale or _signal_saturation(m.rgb) <= TUBE_SATURATION_MAX:
             tube.append(m.de2000)
-        band_idx = sum(1 for edge in PRACTICAL_BAND_EDGES_NITS if target_y > edge)
+        band_idx = sum(1 for edge in PRACTICAL_BAND_EDGES_NITS if m.target_xyz[1] > edge)
         bands[PRACTICAL_BAND_LABELS[band_idx]].append(m.de2000)
     return {
-        "gamut_aware": bool(gamut_aware),
         "core": _bucket_stats(zones["core"]),
         "limits": _bucket_stats(zones["limits"]),
         "clamped": _bucket_stats(zones["clamped"]),
         "tube": _bucket_stats(tube),
         "bands": {label: _bucket_stats(vals) for label, vals in bands.items()},
     }
+
+
+# Signals are code values / max_cv: at <= 12 bits adjacent codes sit >= 2.4e-4 apart, so 4
+# decimals separate every code while merging the float noise of one code's repeated reads.
+SIGNAL_KEY_DECIMALS = 4
+
+
+def signal_key(rgb: tuple[float, float, float] | list[float]) -> tuple[float, float, float]:
+    """The grouping key of a signal (rounded to :data:`SIGNAL_KEY_DECIMALS`)."""
+    return tuple(round(float(c), SIGNAL_KEY_DECIMALS) for c in rgb[:3])  # type: ignore[return-value]
+
+
+def group_per_signal(patch_metrics: list[PatchMetric]) -> list[tuple[PatchMetric, int]]:
+    """One representative :class:`PatchMetric` per UNIQUE signal, in first-read order, with its
+    read count. The representative's ``de2000`` is the MEAN of that signal's reads' ΔE (and
+    ``measured_xyz`` the mean read); target / grayscale / gamut_clamped come from the signal
+    (identical across its reads — they depend on the signal only)."""
+    groups: dict[tuple[float, float, float], list[PatchMetric]] = {}
+    for m in patch_metrics:
+        groups.setdefault(signal_key(m.rgb), []).append(m)
+    out: list[tuple[PatchMetric, int]] = []
+    for reads in groups.values():
+        n = len(reads)
+        first = reads[0]
+        mean_xyz = tuple(sum(r.measured_xyz[i] for r in reads) / n for i in range(3))
+        out.append((PatchMetric(first.rgb, mean_xyz, first.target_xyz,   # type: ignore[arg-type]
+                                sum(r.de2000 for r in reads) / n, first.grayscale,
+                                gamut_clamped=first.gamut_clamped), n))
+    return out
+
+
+def per_signal_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool) -> dict[str, Any]:
+    """The practical split over UNIQUE signals (V2): each signal's ΔE is the mean of its reads,
+    then ``overall`` / ``core`` / ``limits`` / ``clamped`` / ``tube`` / ``bands`` are stats over
+    signals — repeats count once. ``n_signals`` / ``n_reads`` say how much the two views differ."""
+    reps = [m for m, _n in group_per_signal(patch_metrics)]
+    return {"n_signals": len(reps), "n_reads": len(patch_metrics),
+            "overall": _bucket_stats([m.de2000 for m in reps]),
+            **_practical_buckets(reps, is_hdr=is_hdr)}
 
 
 def metrics_scored_payload(summary: MetricsSummary, *, label: str,

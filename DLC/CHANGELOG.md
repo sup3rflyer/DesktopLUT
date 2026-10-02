@@ -11,6 +11,25 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Held-out verify, per-signal verify stats, and the scoring white stated** (2026-10-02). A review of
+  the PA32UCXR SDR run found the verify headline partly in-sample: 309 reads but 141 unique signals, 77
+  of them on a build training signal, and the 28 repeated sweep signals carried 63 % of the
+  read-weighted mean. The verify now (a) adds a `per_signal` view (each signal's ΔE is the mean of its
+  reads; repeats count once) and gates core/tube on it, with the read-weighted numbers kept unchanged
+  beside it; (b) classifies every verify signal against the run's training set (its non-verify TI3s plus
+  every build-probe drive, now logged to `measurements/build_probes.ndjson`, with the events log as the
+  fallback for older runs) in signal and drive space, and reports held-out (> 4 codes), off-lattice
+  held-out and coincident (≤ 1 code) buckets, with the per-signal rows in
+  `reports/verification_iter00_held_out.json`. A held-out bucket of 8 or more signals is also gated on
+  the average target; a smaller one is reported only, with the reason. (c) SDR verifies now carry 24
+  fresh held-out colours per run (`--verify-held-out-draws`, 0 = off). They are seeded by the run id, so a
+  resume measures the same set, sit ≥ 8 codes from every training signal and probe drive, are off the
+  cube lattice, and are counted in the patch plan without moving an approved plan's fingerprint. HDR
+  draws are a follow-up. (d) The digest states the white the SDR ΔE is relative to (the measured white,
+  how many white reads, its offset from the calibrated white). verify-only `--verify-patches-from`
+  compares per-signal and held-out buckets on one basis by re-scoring the source's verify.ti3 with the
+  current scorer. The `verify:accept` question leads with the per-signal numbers and quotes the
+  held-out average next to them. The score CLI reports the same held-out view.
 - **`--flow verify-only`: measure a stack without rebuilding it** (2026-09-27). Several hardware
   acceptances only need a measurement: the projection-cube (D1) acceptance on the PA32UCXR, re-checking a
   stack after a change, owner A/Bs. Until now the only route was a multi-hour `3dlut-only` rebuild. The

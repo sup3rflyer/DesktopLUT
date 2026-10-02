@@ -132,6 +132,7 @@ from . import hook_routing
 from . import neutral_audit
 from . import stack_registry
 from . import thermal_align
+from . import verify_holdout
 from . import verify_only
 from .optimize import (DegenerateMeasurements, OptimizeConfig, ProbeFn, SDR_CORRECTION_CAP,
                        optimize_cube)
@@ -148,6 +149,8 @@ from .patch_sets import (
     build_verify_set,
     build_volumetric_set,
     flow_patch_counts,
+    held_out_draws_apply,
+    insert_held_out_draws,
     outside_in_indices,
 )
 from .paths import atomic_write_text, runs_dir
@@ -573,6 +576,7 @@ class Calibration:
         self._last_optimizer: dict[str, Any] = {}
         self._last_refine: dict[str, Any] = {}
         self._last_bookend_drift: dict[str, Any] = {}
+        self._last_verify_reachable: Any = None   # the gamut the live verify scored against (re-scores reuse it)
 
     # -- persistence ------------------------------------------------------
     def _save(self) -> None:
@@ -1955,9 +1959,26 @@ class Calibration:
     def _probe_fn(self) -> ProbeFn:
         """The re-measure probe for the correction machine. Injected in tests;
         otherwise present each driven signal (code values, no LUT) and read it via
-        the measure seam — the fidelity-ladder tier-2 path."""
+        the measure seam — the fidelity-ladder tier-2 path.
+
+        Every probed DRIVE is appended to the run's probe ledger (``measurements/build_probes.ndjson``,
+        per read so a resumed build keeps them): the probe reads are folded into the cube's training,
+        so the verify's held-out classification (V1, :mod:`dlc.verify_holdout`) must know them."""
+        ledger = self.ctx.root / "measurements" / verify_holdout.PROBES_FILE
         if self._probe is not None:
-            return self._probe
+            injected = self._probe
+            levels = self._transfer().max_cv
+
+            def recorded(signals: np.ndarray) -> np.ndarray:
+                out = injected(signals)
+                try:
+                    verify_holdout.append_probe_drives(
+                        ledger, verify_holdout.to_codes(signals, levels).tolist())
+                except OSError:   # evidence only — a ledger write never breaks the build
+                    pass
+                return out
+
+            return recorded
         transfer = self._transfer()
         max_cv = transfer.max_cv
         batch = {"n": 0}   # outer-iteration counter so the build's progress bar pulses per pass
@@ -2005,6 +2026,10 @@ class Calibration:
                                 "probe_failure": True,
                                 "failed_signal": [round(float(c), 4) for c in s]}))
                 out[i] = reading.xyz
+                try:   # the held-out ledger (V1): this drive's read may be folded into training
+                    verify_holdout.append_probe_drives(ledger, [rgb], **{"pass": batch["n"]})
+                except OSError:   # evidence only — a ledger write never breaks the build
+                    pass
                 # Drive the dashboard's progress bar DURING the build — it would otherwise sit
                 # frozen at the post-MHC count for the whole (longest) stage. Progress-driven,
                 # restarting each outer pass so the bar visibly pulses = clearly alive.
@@ -6411,6 +6436,10 @@ class Calibration:
                 digest["target_white_nits"] = round(float(target.peak_nits), 4)
                 digest["target_white_source"] = white_source if white_nits is not None else "nominal"
                 digest["nominal_white_nits"] = self._spec().luminance_nits
+                # V3: the build's surfaced CIEDE2000 (*_report) is scored against this ABSOLUTE target
+                # white; the verify scores relative to its MEASURED white (sdr_white.scored_white_nits).
+                digest["report_scored_white"] = ("the cube's target white (target_white_nits, absolute) — "
+                                                 "the verify scores relative to its measured white")
             if premise is not None:
                 digest["oog_premise"] = premise
             if level_edge is not None:
@@ -6496,37 +6525,28 @@ class Calibration:
                     "verify", "aborted",
                     digest={"message": "verify TI3 has no usable measurements to score "
                                        "(all reads failed?) — aborting before the quality gate."}))
-            # Score against the SAME resolved white the pipeline targeted (MHC matrix + grayscale
-            # refine, 3D-LUT target) — not textbook D65 — so a non-zero white strength is the goal
-            # here, not scored as white error. SDR scores CIEDE2000 against γ-power/sRGB; HDR
-            # scores dE_ITP against PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's
-            # Lab is meaningless at HDR absolute luminance), with looser, LLM-negotiated targets.
             wx, wy = self._white_xy()
-            # The target the cube was BUILT for: the run's level edge when its memo enables it (D4), else the
-            # full-drive triangle (_reachable_gamut); every bucket below is deterministic under it.
-            reachable = self._reachable_gamut(stage="verify") if spec.is_hdr else None
-            if spec.is_hdr:
-                hdr = self._hdr_target()
-                metrics, lum = score_samples_hdr(samples, white_xy=(wx, wy), peak_nits=hdr.peak_nits,
-                                                  oog_mapping=self._oog_mapping(),
-                                                  reachable_primaries=reachable)
-                metric_name = "dE_ITP"
-                # Advisory HDR defaults (dE_ITP), overlaid by the profile's optional
-                # ``quality: {hdr: {...}}`` block — the same policy source the stage-CLI
-                # scorer reads — then negotiated by the assistant at the verify seam after
-                # the first refinement round (design §7).
-                q = hdr_metric_thresholds(self.profile.quality_policy)
-            else:
-                metrics, lum = score_samples(samples, gamma=spec.gamma, white_xy=(wx, wy))
-                metric_name = "CIEDE2000"
-                q = self.profile.quality
+            scored_set = self._score_verify_samples(samples)
+            metrics, lum = scored_set["metrics"], scored_set["lum"]
+            metric_name, q, reachable = scored_set["metric"], scored_set["q"], scored_set["reachable"]
+            self._last_verify_reachable = reachable
+            hdr = self._hdr_target() if spec.is_hdr else None
             summary = summarize_metrics(phase="verification", iteration=0, source=Path(verify_ti3),
                                         patch_metrics=metrics, target_luminance=lum, metric=metric_name)
             # The §0 practically-weighted view (metrics.practical_summary): core (Rec.709 ≤
             # ref-white, reachable) is the practical verdict; `clamped` isolates residuals at
             # the panel's gamut floor so they are read as reachability, never calibration error.
+            # Its ``per_signal`` block (V2) is the same split over UNIQUE signals — the gate's basis.
             practical = practical_summary(metrics, is_hdr=spec.is_hdr,
                                           gamut_aware=reachable is not None)
+            # HELD-OUT view (V1): how much of the verify sits where the calibration was trained
+            # (training TI3 signals ∪ build-probe drives, signal + drive space) vs provably not.
+            held_rows: Optional[str] = None
+            try:
+                practical["held_out"], held_rows = self._held_out_evidence(metrics, is_hdr=spec.is_hdr)
+            except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
+                practical["held_out"] = {"available": False,
+                                         "reason": f"classification failed ({type(exc).__name__}: {exc})"}
             # QUALITY GATE (owner directive D3, 2026-08-14): OOG patches are a FRAMEWORK, not
             # the meat — the deterministic gate scores the practical core/tube/white buckets,
             # never the OOG-inflated overall. On the first full HDR run the overall avg (6.77)
@@ -6574,6 +6594,29 @@ class Calibration:
                       "practical": practical,
                       "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2),
                                  "gamut_clamped": m.gamut_clamped} for m in worst]}
+            # V2: the per-UNIQUE-signal view (each signal's ΔE = the mean of its reads) beside the
+            # read-weighted headline (``avg_de2000`` stays read-weighted for continuity).
+            per = (practical.get("per_signal") or {})
+            overall = per.get("overall") or {}
+            digest.update({"per_signal_avg": overall.get("avg"), "per_signal_p95": overall.get("p95"),
+                           "per_signal_max": overall.get("max"), "n_signals": per.get("n_signals"),
+                           "n_reads": per.get("n_reads")})
+            # V1: the held-out split (+ the fresh draws this run measured, seed and list).
+            digest["held_out"] = practical.get("held_out")
+            if held_rows:
+                digest["held_out_rows"] = held_rows   # per-signal rows (class, distances, ΔE)
+            draws = self.calib.get("verify_held_out_draws")
+            if isinstance(draws, dict):
+                measured = {tuple(int(c) for c in row) for row in verify_holdout.to_codes(
+                    [s.rgb for s in samples], self._transfer().max_cv)}
+                listed = [[int(c) for c in p] for p in draws.get("signals") or ()]
+                digest["held_out_draws"] = {
+                    **{k: draws.get(k) for k in ("seed", "run_id", "n_requested", "n_drawn", "min_codes",
+                                                 "value_range_codes", "saturation_range", "lattice_size",
+                                                 "drive_space_checked", "attempts", "rejected")},
+                    "n_measured": sum(1 for p in listed if tuple(p) in measured),
+                    "signals": listed,
+                    "note": "SDR only — HDR fresh draws are a follow-up (gamut-aware hue caps + PQ floor)"}
             if not spec.is_hdr:
                 # The white luminance the stack was calibrated to (the refine's / the installed
                 # MHC's), the cube's build white, and the nominal — so the verify seam can tell a
@@ -6581,7 +6624,9 @@ class Calibration:
                 white_nits, white_source = self._sdr_calibrated_white()
                 digest["sdr_white"] = {"calibrated_white_nits": white_nits, "source": white_source,
                                        "cube_target_white_nits": self._cube_target_white_nits(),
-                                       "nominal_white_nits": spec.luminance_nits}
+                                       "nominal_white_nits": spec.luminance_nits,
+                                       # V3: the white the ΔE above is RELATIVE to, stated.
+                                       **self._scored_white_evidence(samples, lum, white_nits)}
                 kept = ((self.calib["stages"].get("reapply-3dlut") or {}).get("digest") or {}).get("cube_white")
                 if kept:
                     digest["cube_white"] = kept
@@ -6616,10 +6661,14 @@ class Calibration:
         scored = (d.get("gate") or {}).get("scored") or {}
         if scored:
             tube_txt = scored.get('tube_avg') if scored.get('tube_avg') is not None else "— (none measured)"
+            basis_txt = (f"per-signal over {scored.get('n_signals')} signals / {scored.get('n_reads')} reads"
+                         if scored.get("basis") == "per_signal" else "read-weighted")
             reads = (f"core avg {scored.get('core_avg')} (p95 {scored.get('core_p95')}, "
-                     f"max {scored.get('core_max')}), tube {tube_txt}, "
-                     f"white {scored.get('white')} {d.get('metric', 'ΔE')} "
-                     f"(overall avg {d.get('avg_de2000')} incl. gamut-limit/OOG framework)")
+                     f"max {scored.get('core_max')}; {basis_txt}), "
+                     f"{self._held_out_question_text(d)}, tube {tube_txt}, "
+                     f"white {_round3(scored.get('white'))} {d.get('metric', 'ΔE')} "
+                     f"(read-weighted overall avg {d.get('avg_de2000')} incl. repeats + "
+                     "gamut-limit/OOG framework)")
         else:
             reads = (f"avg {d.get('metric', 'ΔE')} {d.get('avg_de2000')} "
                      f"(white {d.get('white_de2000')}, max {d.get('max_de2000')})")
@@ -6640,6 +6689,82 @@ class Calibration:
                     "before_scores": self.calib.get("stage_scores") or None}))
         return outcome
 
+    def _score_verify_samples(self, samples: Sequence[Any], *, reachable: Any = None,
+                              reuse_reachable: bool = False) -> dict[str, Any]:
+        """Score verify samples exactly as ``stage_verify`` does — the ONE verify scorer (also used
+        to re-score a source run's verify.ti3 like-for-like in verify-only, V3).
+
+        Score against the SAME resolved white the pipeline targeted (MHC matrix + grayscale refine,
+        3D-LUT target) — not textbook D65 — so a non-zero white strength is the goal here, not scored
+        as white error. SDR scores CIEDE2000 against γ-power/sRGB RELATIVE TO THE MEASURED WHITE
+        (``luminance=None`` → :func:`metrics.infer_target_luminance`: the brightest full-white read —
+        the ColourSpace/CalMAN convention; the digest states it, V3); HDR scores dE_ITP against
+        PQ/Rec.2020 (the metric the cube converges in — CIEDE2000's Lab is meaningless at HDR absolute
+        luminance; PQ is absolute, no white normalisation), with looser, LLM-negotiated targets."""
+        spec = self._spec()
+        wx, wy = self._white_xy()
+        # The target the cube was BUILT for: the run's level edge when its memo enables it (D4), else the
+        # full-drive triangle (_reachable_gamut); every bucket below is deterministic under it.
+        # ``reuse_reachable`` (a re-score inside the same verify) passes the gamut the live verify
+        # resolved, so its level-edge seam is never asked twice.
+        if not reuse_reachable:
+            reachable = self._reachable_gamut(stage="verify") if spec.is_hdr else None
+        if spec.is_hdr:
+            hdr = self._hdr_target()
+            metrics, lum = score_samples_hdr(list(samples), white_xy=(wx, wy), peak_nits=hdr.peak_nits,
+                                             oog_mapping=self._oog_mapping(),
+                                             reachable_primaries=reachable)
+            # Advisory HDR defaults (dE_ITP), overlaid by the profile's optional
+            # ``quality: {hdr: {...}}`` block — the same policy source the stage-CLI
+            # scorer reads — then negotiated by the assistant at the verify seam after
+            # the first refinement round (design §7).
+            return {"metrics": metrics, "lum": lum, "metric": "dE_ITP", "reachable": reachable,
+                    "q": hdr_metric_thresholds(self.profile.quality_policy)}
+        metrics, lum = score_samples(list(samples), gamma=spec.gamma, white_xy=(wx, wy))
+        return {"metrics": metrics, "lum": lum, "metric": "CIEDE2000", "reachable": None,
+                "q": self.profile.quality}
+
+    @staticmethod
+    def _scored_white_evidence(samples: Sequence[Any], scored_nits: float,
+                               calibrated_nits: Optional[float]) -> dict[str, Any]:
+        """V3 — the SDR scoring white, stated: the luminance every CIEDE2000 above is relative to
+        (the MEASURED white — :func:`metrics.infer_target_luminance`, the industry convention), where
+        it came from (how many full-white reads; their mean beside the max the rule takes), and how
+        far it sits from the white the stack was calibrated to."""
+        whites = [float(s.xyz[1]) for s in samples
+                  if min(s.rgb) >= 0.99 and math.isfinite(float(s.xyz[1])) and float(s.xyz[1]) > 0.0]
+        source = {"kind": "measured",
+                  "rule": ("max Y of the full-white reads (metrics.infer_target_luminance)" if whites
+                           else "no full-white read: the brightest grey / patch (infer_target_luminance "
+                                "fallback)"),
+                  "n_white_reads": len(whites),
+                  "mean_white_nits": round(sum(whites) / len(whites), 4) if whites else None}
+        cal = _as_float_local(calibrated_nits)
+        return {"scored_white_nits": round(float(scored_nits), 4), "scored_white_source": source,
+                "white_luminance_vs_calibrated_pct": (round(100.0 * (float(scored_nits) / cal - 1.0), 3)
+                                                      if cal else None)}
+
+    @staticmethod
+    def _held_out_question_text(digest: Mapping[str, Any]) -> str:
+        """The held-out clause of the verify:accept question (V1): the held-out per-signal avg next
+        to the full per-signal avg, and whether it was gated."""
+        held = digest.get("held_out") or {}
+        gate = (digest.get("gate") or {}).get("held_out_gate") or {}
+        if not held.get("available"):
+            return f"held-out — n/a ({held.get('reason') or 'not classified'})"
+        ho = held.get("held_out") or {}
+        strict = held.get("strict_held_out") or {}
+        coin = held.get("coincident") or {}
+        th = held.get("thresholds") or {}
+        txt = (f"held-out avg {ho.get('avg')} over {ho.get('n', 0)} signals > "
+               f"{th.get('held_out_gt_codes', verify_holdout.HELD_OUT_CODES):g} codes from training "
+               f"(strict off-lattice {strict.get('avg')}, n {strict.get('n', 0)}; coincident "
+               f"{coin.get('avg')}, n {coin.get('n', 0)})")
+        fresh = held.get("fresh_draws") or {}
+        if fresh.get("n"):
+            txt += f" incl. {fresh.get('n')} fresh draws avg {fresh.get('avg')}"
+        return txt + ("" if gate.get("gated") else f" [reported, not gated: {gate.get('reason')}]")
+
     @staticmethod
     def _quality_gate(summary, practical: dict, q) -> tuple[bool, dict]:
         """The deterministic verify quality gate (D3, 2026-08-14): score the practical
@@ -6650,11 +6775,18 @@ class Calibration:
         * ``core``  — avg/p95/max vs the mode's acceptance targets (the practical verdict).
         * ``tube``  — avg vs the avg target (a neutral cast must not hide behind core colour).
         * ``white`` — the summary white vs the white target (unchanged).
+        * core/tube are scored PER UNIQUE SIGNAL (V2, ``practical["per_signal"]``) — a signal read
+          7× counts once — falling back to the read-weighted buckets when absent;
+          ``scored["basis"]`` records which.
+        * ``held_out_avg`` (V1) — the held-out per-signal core avg vs the avg target, only when the
+          held-out bucket holds >= ``verify_holdout.GATE_MIN_SIGNALS`` signals; below that it is
+          reported, never gated (``held_out_gate`` says why).
         * Fallback: an empty core bucket (degenerate/truncated set) uses the legacy overall
           summary gate — a gate must never pass vacuously.
         """
-        core = (practical or {}).get("core") or {}
-        tube = (practical or {}).get("tube") or {}
+        practical = practical or {}
+        core = practical.get("core") or {}
+        tube = practical.get("tube") or {}
         if not core.get("n"):
             within = (summary.avg_de2000 <= q.avg_de2000 and summary.p95_de2000 <= q.p95_de2000
                       and summary.max_de2000 <= q.max_de2000
@@ -6664,6 +6796,12 @@ class Calibration:
                                        "p95": summary.p95_de2000 <= q.p95_de2000,
                                        "max": summary.max_de2000 <= q.max_de2000,
                                        "white": summary.white_de2000 <= q.white_de2000}}
+        read_core = core
+        per = practical.get("per_signal") or {}
+        per_signal = bool((per.get("core") or {}).get("n"))
+        if per_signal:
+            core = per["core"]
+            tube = per.get("tube") or {}
         checks = {
             "core_avg": core["avg"] <= q.avg_de2000,
             "core_p95": core["p95"] <= q.p95_de2000,
@@ -6674,11 +6812,30 @@ class Calibration:
             "tube_avg": bool(tube.get("n")) and tube["avg"] <= q.avg_de2000,
             "white": summary.white_de2000 <= q.white_de2000,
         }
-        basis = {"basis": "practical core+tube+white (D3)", "checks": checks,
-                 "scored": {"core_avg": core["avg"], "core_p95": core["p95"],
-                            "core_max": core["max"], "core_n": core["n"],
-                            "tube_avg": tube.get("avg"), "tube_n": tube.get("n"),
-                            "white": summary.white_de2000}}
+        scored: dict[str, Any] = {"basis": "per_signal" if per_signal else "read_weighted",
+                                  "core_avg": core["avg"], "core_p95": core["p95"],
+                                  "core_max": core["max"], "core_n": core["n"],
+                                  "tube_avg": tube.get("avg"), "tube_n": tube.get("n"),
+                                  "white": summary.white_de2000}
+        if per_signal:
+            scored.update(n_signals=per.get("n_signals"), n_reads=per.get("n_reads"),
+                          read_weighted_core_avg=read_core.get("avg"))
+        # V1 held-out check: gated only on a bucket big enough to mean something.
+        held = practical.get("held_out") or {}
+        ho = held.get("held_out") or {}
+        n_ho = int(ho.get("n") or 0)
+        min_n = verify_holdout.GATE_MIN_SIGNALS
+        if held.get("available") and n_ho >= min_n and ho.get("avg") is not None:
+            checks["held_out_avg"] = ho["avg"] <= q.avg_de2000
+            scored.update(held_out_avg=ho["avg"], held_out_n=n_ho)
+            held_gate = {"gated": True, "held_out_avg": ho["avg"], "held_out_n": n_ho, "min_n": min_n}
+        else:
+            reason = (held.get("reason") or "no held-out classification") if not held.get("available") \
+                else f"held-out n {n_ho} < {min_n}"
+            held_gate = {"gated": False, "reason": reason, "held_out_avg": ho.get("avg"),
+                         "held_out_n": n_ho, "min_n": min_n}
+        label = "practical core+tube+white (D3)" + (" + held-out avg (V1)" if held_gate["gated"] else "")
+        basis = {"basis": label, "checks": checks, "scored": scored, "held_out_gate": held_gate}
         return all(checks.values()), basis
 
     def _severe_verify_failure(self, outcome: StageOutcome) -> bool:
@@ -6710,6 +6867,9 @@ class Calibration:
         reach: dict = {}
         if str((d.get("gate") or {}).get("basis", "")).startswith("practical"):
             practical = d.get("practical") or {}
+            # The gate's own statistic: per unique signal when it scored that (V2).
+            if ((d.get("gate") or {}).get("scored") or {}).get("basis") == "per_signal":
+                practical = practical.get("per_signal") or practical
             buckets = [b for b in (practical.get("core"), practical.get("limits"))
                        if b and b.get("n")]
             if buckets:
@@ -7103,6 +7263,81 @@ class Calibration:
         return build_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
                                 max_cv=self._patch_max_cv(), hue_sat_caps=caps)
 
+    def _verify_measure_patches(self) -> list[tuple[int, int, int]]:
+        """The verify set a flow MEASURES: the standard QC set (:meth:`_verify_patches`) plus this
+        run's fresh held-out draws (V1, SDR) spread through its core. The draws need the training
+        set, which exists by the time ``measure:verify`` runs."""
+        base = self._verify_patches()
+        rec = self._held_out_draw_record(base)
+        draws = [tuple(int(c) for c in p) for p in (rec or {}).get("signals") or ()]
+        if not draws:
+            return base
+        return insert_held_out_draws(base, draws, self.patch_sizes, self._transfer(),  # type: ignore[arg-type]
+                                     max_cv=self._patch_max_cv())
+
+    def _held_out_draw_record(self, base: Sequence[tuple[int, int, int]]) -> Optional[dict[str, Any]]:
+        """This run's fresh held-out verify draws (V1): ``patch_sizes.verify_held_out_draws`` colours
+        drawn with a seed derived from the run id, >= 8 codes from every training signal / probe
+        drive (in drive space too through this run's cube), off-lattice, no duplicate of ``base``.
+        Memoised in the run record on first draw (first write wins) — a resume, a remeasure or a
+        crash replay measures the identical list. Never drawn retroactively for a verify that was
+        already measured without them. ``None`` when off (knob 0 / HDR — follow-up)."""
+        n = held_out_draws_apply(self.patch_sizes, self._transfer())
+        memo = self.calib.get("verify_held_out_draws")
+        if isinstance(memo, dict) and isinstance(memo.get("signals"), list):
+            return memo
+        if n <= 0 or ((self.calib.get("stages") or {}).get("measure:verify") or {}).get("status") == "done":
+            return None
+        transfer = self._transfer()
+        max_cv = transfer.max_cv
+        training = self._held_out_training()
+        excl = [verify_holdout.to_codes(training["training_signals"], max_cv),
+                training["probe_drives"]] if training.get("available") else []
+        rec = verify_holdout.draw_held_out_signals(
+            n, seed=verify_holdout.run_seed(self.ctx.root.name), max_cv=max_cv,
+            value_floor_cv=int(round(self.patch_sizes.verify_color_min_signal * max_cv)),
+            cap_cv=self._patch_max_cv() or max_cv,
+            exclude_codes=np.vstack(excl) if excl else None, existing=base,
+            cube=training.get("cube"), lattice_size=int(training.get("lattice_size")
+                                                         or verify_holdout.DEFAULT_LATTICE_SIZE))
+        rec["run_id"] = self.ctx.root.name
+        rec["exclusion"] = (training.get("provenance") if training.get("available")
+                            else {"none": training.get("reason")})
+        self.calib["verify_held_out_draws"] = rec
+        self._save()
+        if self.runlog is not None:
+            self.runlog.emit("INFO", "measure:verify", "held_out_draws", tier="digest",
+                             **{k: rec.get(k) for k in ("seed", "n_requested", "n_drawn", "attempts",
+                                                        "rejected", "min_codes", "drive_space_checked")})
+        return rec
+
+    def _held_out_training(self) -> dict[str, Any]:
+        """The TRAINING set the verify is classified against (V1) — :func:`verify_holdout.training_context`
+        over this run's record (this run's TI3s + probe drives, the source run of a kept cube)."""
+        return verify_holdout.training_context(self.ctx.root, self.calib,
+                                               max_cv=self._transfer().max_cv)
+
+    def _held_out_evidence(self, metrics: Sequence[Any], *, is_hdr: bool) -> tuple[dict[str, Any],
+                                                                                   Optional[str]]:
+        """The verify's held-out view (V1, :func:`verify_holdout.held_out_view` — the same pure
+        function the score CLI uses): per-signal ΔE stats per class over the gate's population, the
+        fresh draws' own stats; the per-signal rows are persisted to
+        ``reports/verification_iter00_held_out.json`` (run-relative path returned) for the judge to
+        dig into. Evidence only."""
+        summary, rows = verify_holdout.held_out_view(
+            list(metrics), run_root=self.ctx.root, calib=self.calib,
+            bit_depth=self._transfer().bit_depth, is_hdr=is_hdr)
+        if rows is None:
+            return summary, None
+        try:
+            path = self.ctx.root / "reports" / "verification_iter00_held_out.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"summary": summary, "rows": rows}, indent=1, allow_nan=False),
+                            encoding="utf-8")
+            return summary, str(path.relative_to(self.ctx.root)).replace("\\", "/")
+        except (OSError, ValueError) as exc:   # evidence only — never break the verify
+            return summary, f"(not written: {type(exc).__name__}: {exc})"
+
     def flow_patch_counts(self, flow: str) -> dict[str, Any]:
         return flow_patch_counts(flow, self.patch_sizes, self._transfer(),
                                  max_cv=self._patch_max_cv(),
@@ -7136,13 +7371,23 @@ class Calibration:
             record["verify_source"] = {"run": source.get("run"),
                                        "patches_fingerprint": source.get("patches_fingerprint"),
                                        "patch_source": source.get("patch_source")}
-        payload = json.dumps(record, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+            record.pop("verify_held_out_draws", None)   # the source's exact list: no fresh draws
+        ident = dict(record)
+        draws = int(ident.pop("verify_held_out_draws", 0) or 0)
+        if draws and self.patch_sizes.verify_held_out_draws == PatchSizes().verify_held_out_draws:
+            # The fresh held-out draws (V1) arrived after plans were approved: at the default knob they
+            # are left out of the plan IDENTITY (the counts it hashes exclude them) so an in-flight
+            # run's approved fingerprint survives the upgrade — the record itself still counts them.
+            # A non-default knob is in patch_sizes and so changes the identity as any override does.
+            ident["stages"] = {**ident["stages"], "verify": ident["stages"]["verify"] - draws}
+            ident["total_patches"] = ident["total_patches"] - draws
+        payload = json.dumps(ident, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
         return {**record, "fingerprint": hashlib.sha256(payload).hexdigest()[:16]}
 
     # PatchSizes knobs added after plans were already approved: left out of the plan identity while
     # at their defaults, so an in-flight run's approved fingerprint survives the upgrade (a
     # non-default override still invalidates the plan, as any patch-size change does).
-    _FINGERPRINT_DEFAULT_EXEMPT = ("neutral_top_pins", "neutral_top_band")
+    _FINGERPRINT_DEFAULT_EXEMPT = ("neutral_top_pins", "neutral_top_band", "verify_held_out_draws")
 
     def _fingerprinted_patch_sizes(self) -> dict[str, Any]:
         sizes = asdict(self.patch_sizes)
@@ -7218,7 +7463,7 @@ class Calibration:
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
-        ver = self.stage_measure(role="verify", patches=self._verify_patches(),
+        ver = self.stage_measure(role="verify", patches=self._verify_measure_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -7246,7 +7491,7 @@ class Calibration:
             self.stage_refine_mhc_cube()
         else:
             self.stage_refine_mhc_grayscale()
-        ver = self.stage_measure(role="verify", patches=self._verify_patches(),
+        ver = self.stage_measure(role="verify", patches=self._verify_measure_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -7262,7 +7507,7 @@ class Calibration:
         post = self.stage_measure(role="post-mhc", patches=self._volumetric_patches(),
                                   ti3_name="post_mhc.ti3", ndjson_name="post_mhc.ndjson")
         self.stage_build_install_3dlut(post.data["ti3"])
-        ver = self.stage_measure(role="verify", patches=self._verify_patches(),
+        ver = self.stage_measure(role="verify", patches=self._verify_measure_patches(),
                                  ti3_name="verify.ti3", ndjson_name="verify.ndjson")
         self.stage_verify(ver.data["ti3"])
         return self._finish()
@@ -7896,7 +8141,7 @@ class Calibration:
         source = self._verify_source_record()
         if source is not None:
             return [tuple(int(c) for c in p) for p in source.get("patches") or ()]  # type: ignore[misc]
-        return self._verify_patches()
+        return self._verify_measure_patches()
 
     def _adopt_verify_scoring_basis(self, basis: Mapping[str, Any], src: str) -> dict[str, Any]:
         """Score this run's verify exactly as the source run scored its own — the OOG policy +
@@ -8244,6 +8489,89 @@ class Calibration:
                                        "this verify clamps against " + str(self._scoring_gamut_source()))
             comp["like_for_like"] = False
         out["vs_source"] = {"source_run": source.get("run"), **vs}
+        try:
+            out["vs_source"].update(self._vs_source_per_signal(digest, metrics, source))
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            out["vs_source"]["per_signal_error"] = f"{type(exc).__name__}: {exc}"
+        return out
+
+    def _vs_source_per_signal(self, digest: Mapping[str, Any], metrics: Sequence[Any],
+                              source: Mapping[str, Any]) -> dict[str, Any]:
+        """V2/V3 deltas vs the source run on ONE basis: per-unique-signal buckets and the held-out
+        classes. The source side is RE-SCORED from its verify.ti3 with this run's scorer (which
+        adopted the source's scoring basis — measured white, resolved white xy, OOG policy / peak)
+        rather than mixing a recorded number of another convention; the recorded ``per_signal`` is
+        the fallback only when the TI3 is gone. The held-out partition is the SOURCE run's
+        classification (its training TI3s + probe drives, its cube) applied to both sides — the same
+        signals, so the per-class deltas compare the stack, not the partition."""
+        spec = self._spec()
+        src_root = Path(str(source.get("run")))
+        src_metrics = None
+        src_lum = None
+        ti3 = src_root / "measurements" / "verify.ti3"
+        if ti3.is_file():
+            samples = parse_ti3(ti3)
+            if samples:
+                rescored = self._score_verify_samples(
+                    samples, reachable=self._last_verify_reachable, reuse_reachable=True)
+                src_metrics, src_lum = rescored["metrics"], rescored["lum"]
+        recorded = ((source.get("verify") or {}).get("practical") or {}).get("per_signal")
+        now_per = (digest.get("practical") or {}).get("per_signal") or {}
+        if src_metrics is not None:
+            src_per = metrics_mod.per_signal_summary(src_metrics, is_hdr=spec.is_hdr)
+            basis = "rescored from the source's verify.ti3 with this run's scorer"
+        elif recorded:
+            src_per, basis = recorded, "the source's recorded per_signal (its verify.ti3 is gone)"
+        else:
+            return {"per_signal": {"available": False,
+                                   "reason": "the source has neither a verify.ti3 nor a recorded per_signal"}}
+        out: dict[str, Any] = {"per_signal": {
+            "available": True, "source_basis": basis,
+            "n_signals": {"now": now_per.get("n_signals"), "source": src_per.get("n_signals")},
+            **{b: verify_only.bucket_delta(now_per.get(b) or {}, src_per.get(b) or {})
+               for b in ("overall", "core", "tube")}}}
+        now_white = (digest.get("sdr_white") or {}).get("scored_white_nits")
+        if not spec.is_hdr and now_white is not None and src_lum:
+            # Both sides score RELATIVE to their own measured white, which hides an absolute white
+            # luminance change between the two measurements — so state it beside the ΔE deltas.
+            out["scored_white_nits"] = {"now": now_white, "source": round(float(src_lum), 4),
+                                        "delta_pct": round(100.0 * (float(now_white) / float(src_lum) - 1.0), 3)}
+        if src_metrics is None:
+            out["held_out"] = {"available": False, "reason": "the source's verify.ti3 is gone"}
+            return out
+        # The source run's own training set + cube: its classification is the partition.
+        max_cv = self._transfer().max_cv
+        src_state = json.loads((src_root / "dlc_state.json").read_text(encoding="utf-8"))
+        training = verify_holdout.training_context(src_root, src_state.get("calib") or {}, max_cv=max_cv)
+        if not training.get("available"):
+            out["held_out"] = {"available": False, "reason": f"source run: {training.get('reason')}"}
+            return out
+        cube = training["cube"]
+        src_groups = metrics_mod.group_per_signal(list(src_metrics))
+        part_rows = verify_holdout.classify_signals(
+            [m.rgb for m, _ in src_groups], max_cv=max_cv, training=training["training_signals"],
+            probe_drives=training["probe_drives"], cube=cube, lattice_size=training["lattice_size"])
+        partition = {tuple(r["code"]): r for r in part_rows}
+
+        def side(groups: list) -> dict[str, Any]:
+            rows = []
+            for m, _n in groups:
+                key = tuple(int(c) for c in verify_holdout.to_codes([m.rgb], max_cv)[0])
+                part = partition.get(key)
+                if part is not None:
+                    rows.append({"class": part["class"], "strict_held_out": part["strict_held_out"],
+                                 "de": m.de2000, "zone": metrics_mod.practical_zone(m, is_hdr=spec.is_hdr)})
+            return verify_holdout.held_out_summary(rows)
+
+        now_s = side(metrics_mod.group_per_signal(list(metrics)))
+        src_s = side(src_groups)
+        held: dict[str, Any] = {
+            "available": True,
+            "partition": f"source run {src_root.name}'s training (TI3s + probe drives"
+                         + (", drive space through its cube)" if cube is not None else ", signal space)")}
+        for cls in ("held_out", "strict_held_out", "near", "coincident"):
+            held[cls] = verify_only.bucket_delta(now_s.get(cls) or {}, src_s.get(cls) or {})
+        out["held_out"] = held
         return out
 
     def _finish_verify_only(self) -> CalibrationResult:
@@ -8258,8 +8586,9 @@ class Calibration:
             verify = ((self.calib["stages"].get("verify") or {}).get("digest") or {})
             scored = (verify.get("gate") or {}).get("scored") or {}
             vs = verify.get("vs_source") or {}
-            reads = (f"core avg {scored.get('core_avg')}, tube {scored.get('tube_avg')}, white "
-                     f"{scored.get('white')} {verify.get('metric', 'ΔE')}" if scored else
+            reads = (f"core avg {scored.get('core_avg')} ({str(scored.get('basis') or 'read_weighted').replace('_', '-')}), "
+                     f"tube {scored.get('tube_avg')}, white "
+                     f"{_round3(scored.get('white'))} {verify.get('metric', 'ΔE')}" if scored else
                      f"avg {verify.get('avg_de2000')} {verify.get('metric', 'ΔE')}")
             if vs.get("buckets"):
                 reads += "; vs " + Path(str(vs.get("source_run"))).name + ": " + ", ".join(
@@ -8399,6 +8728,12 @@ def _as_float_local(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _round3(value: Any) -> Any:
+    """A number rounded to 3 decimals for a seam question (non-numbers pass through)."""
+    v = _as_float_local(value)
+    return value if v is None else round(v, 3)
 
 
 # What calibration.exit(restore_snapshot=True) actually did — shared with the stage tools
@@ -8924,10 +9259,41 @@ def _render_report_html(p: dict[str, Any]) -> str:
         + metric_row(f"Max {de}", "max_de2000")
         + metric_row(f"White {de}", "white_de2000")
         + metric_row(f"Grayscale avg {de}", "grayscale_avg_de2000")
+        + (f"<tr><td>Per-signal avg {de} ({v.get('n_signals')} signals / {v.get('n_reads')} reads)</td>"
+           f"<td>{v.get('per_signal_avg')}</td></tr>" if v.get("per_signal_avg") is not None else "")
+        + _render_held_out_rows(v.get("held_out"), de)
+        + _render_scored_white_row(v.get("sdr_white"))
         + "</table>"
         + _render_vs_source_html(v.get("vs_source"), de)
         + analysis_block
     )
+
+
+def _render_held_out_rows(held: Optional[Mapping[str, Any]], de: str) -> str:
+    """V1: the held-out / coincident per-signal avgs (or why there is no classification)."""
+    if not held:
+        return ""
+    if not held.get("available"):
+        return f"<tr><td>Held-out {de}</td><td class='muted'>n/a — {held.get('reason')}</td></tr>"
+    rows = []
+    for key, label in (("held_out", "Held-out"), ("strict_held_out", "Held-out, off-lattice"),
+                       ("coincident", "Coincident with training"), ("fresh_draws", "Fresh draws")):
+        stats = held.get(key) or {}
+        if stats.get("n"):
+            rows.append(f"<tr><td>{label} avg {de} (n {stats.get('n')})</td><td>{stats.get('avg')}</td></tr>")
+    return "".join(rows)
+
+
+def _render_scored_white_row(sdr_white: Optional[Mapping[str, Any]]) -> str:
+    """V3: the white the SDR ΔE is relative to."""
+    if not sdr_white or sdr_white.get("scored_white_nits") is None:
+        return ""
+    src = sdr_white.get("scored_white_source") or {}
+    pct = sdr_white.get("white_luminance_vs_calibrated_pct")
+    return (f"<tr><td>Scored relative to white (nits)</td><td>{sdr_white.get('scored_white_nits')} "
+            f"({src.get('kind')}, {src.get('n_white_reads')} white reads"
+            + (f"; {pct:+.2f}% vs calibrated {sdr_white.get('calibrated_white_nits')}" if pct is not None else "")
+            + ")</td></tr>")
 
 
 def _render_vs_source_html(vs: Optional[Mapping[str, Any]], de: str) -> str:
@@ -8944,6 +9310,17 @@ def _render_vs_source_html(vs: Optional[Mapping[str, Any]], de: str) -> str:
             avg = stats.get("avg") or {}
             n = stats.get("n") or {}
             rows.append(f"<tr><td>{name} avg (n {n.get('source')}→{n.get('now')})</td>"
+                        f"<td>{avg.get('source')}</td><td>{avg.get('now')}</td><td>{avg.get('delta')}</td></tr>")
+    for group, prefix in (("per_signal", "per-signal"), ("held_out", "held-out partition")):
+        block = vs.get(group) or {}
+        if not block.get("available"):
+            continue
+        for name, stats in block.items():
+            if not isinstance(stats, Mapping) or "avg" not in stats:
+                continue
+            avg = stats.get("avg") or {}
+            n = stats.get("n") or {}
+            rows.append(f"<tr><td>{prefix} {name} avg (n {n.get('source')}→{n.get('now')})</td>"
                         f"<td>{avg.get('source')}</td><td>{avg.get('now')}</td><td>{avg.get('delta')}</td></tr>")
     comp = vs.get("comparability") or {}
     note = ("like-for-like scoring basis" if comp.get("like_for_like")
@@ -9102,6 +9479,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                        help="verify sanity-ramp steps per channel (default 13 — lighter than the build).")
     patch.add_argument("--verify-saturations", type=float, nargs="+", default=None, dest="verify_saturations",
                        help="verify saturation shells (default 1.0 0.5 — saturated + practical mid-sat).")
+    patch.add_argument("--verify-held-out-draws", type=int, default=None, dest="verify_held_out_draws",
+                       help="fresh held-out verify colours drawn per run (seeded by the run id; >= 8 codes "
+                            "from every training signal / build-probe drive, off-lattice). SDR only; "
+                            "default 24, 0 = off.")
     patch.add_argument("--sat-sweep-levels", type=float, nargs="+", default=None,
                        dest="saturation_sweep_levels",
                        help="3D-LUT confidence skeleton levels as signal fractions (default 0.25 0.5 0.75 1.0).")

@@ -40,6 +40,8 @@ __all__ = [
     "build_verify_set",
     "build_refine_verify_set",
     "flow_patch_counts",
+    "held_out_draws_apply",
+    "insert_held_out_draws",
     "outside_in_indices",
 ]
 
@@ -103,6 +105,11 @@ class PatchSizes:
     # meaningless to meter + panel, so the grayscale toe (low_light_steps) carries the EOTF
     # there and colour ramps start above it. Just above low_light_signal so the two don't overlap.
     verify_color_min_signal: float = 0.25
+    # FRESH held-out verify signals (V1, 2026-10-02): this many extra colours drawn per run (seeded
+    # by the run id — a resume re-draws the identical set) at >= 8 codes from every training signal
+    # and build-probe drive, off the cube lattice — so the verify always carries signals the
+    # calibration provably never trained on (dlc.verify_holdout). SDR only for now; 0 ⇒ off.
+    verify_held_out_draws: int = 24
 
     # 3D-LUT confidence skeleton: measured at the start and end of the post-MHC build set,
     # and again in verify for drift QC. ``saturation_sweep_repeats`` is the number of
@@ -275,6 +282,38 @@ def _with_saturation_sweep_bookends(core: list[tuple[int, int, int]],
     if not sweep:
         return core
     return sweep + core + sweep
+
+
+def held_out_draws_apply(ps: PatchSizes, transfer: Transfer) -> int:
+    """How many fresh held-out draws a ``verify``-role set carries: the knob for an SDR (power-law)
+    transfer, 0 for PQ — HDR draws need gamut-aware hue caps + a PQ value floor (follow-up)."""
+    return max(0, int(ps.verify_held_out_draws)) if transfer.kind == "power" else 0
+
+
+def insert_held_out_draws(patches: list[tuple[int, int, int]], draws: list[tuple[int, int, int]],
+                          ps: PatchSizes, transfer: Transfer, *,
+                          max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """Spread the fresh held-out ``draws`` evenly through a verify set's CORE — between the
+    saturation-sweep bookends (the start/end drift QC reads them by position) — without reordering
+    the core's own thermal sequence: draw k lands after core position ``round((k+1)·len/(N+1))``."""
+    if not draws:
+        return list(patches)
+    span = len(_saturation_sweep_bookend(ps, transfer, max_cv=max_cv))
+    if span and len(patches) >= 2 * span:
+        head, core, tail = patches[:span], list(patches[span:len(patches) - span]), patches[len(patches) - span:]
+    else:
+        head, core, tail = [], list(patches), []
+    n = len(draws)
+    out: list[tuple[int, int, int]] = []
+    slots = [round((k + 1) * len(core) / (n + 1)) for k in range(n)]
+    k = 0
+    for i, p in enumerate(core):
+        while k < n and slots[k] <= i:
+            out.append(tuple(draws[k]))   # type: ignore[arg-type]
+            k += 1
+        out.append(p)
+    out.extend(tuple(d) for d in draws[k:])   # type: ignore[misc]
+    return list(head) + out + list(tail)
 
 
 def _volumetric_bulk(ps: PatchSizes, transfer: Transfer, *, warm_tau: Optional[int],
@@ -620,6 +659,7 @@ def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
     roles = _FLOW_PATCH_STAGES.get(flow, ())
     cache: dict[Any, int] = {}
     stages: dict[str, int] = {}
+    draws = 0
     for role in roles:
         fn = _PATCH_BUILDERS[role]
         extend = raw_extend_to_cv if role == "raw" else None
@@ -630,5 +670,13 @@ def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
                 kwargs["extend_to_cv"] = extend
             cache[key] = len(fn(ps, transfer, **kwargs))
         stages[role] = cache[key]
-    return {"stages": stages, "total_patches": sum(stages.values()),
-            "volumetric_mode": ps.volumetric_mode, "order": ps.order}
+        if role == "verify":
+            # The fresh held-out draws ride the verify set (an upper bound: the rejection draw can
+            # come up short on a pathological exclusion set — the verify digest records the count).
+            draws = held_out_draws_apply(ps, transfer)
+            stages[role] += draws
+    out: dict[str, Any] = {"stages": stages, "total_patches": sum(stages.values()),
+                           "volumetric_mode": ps.volumetric_mode, "order": ps.order}
+    if draws:
+        out["verify_held_out_draws"] = draws
+    return out

@@ -552,6 +552,35 @@ def test_verify_patches_from_remeasures_the_source_set_and_reports_deltas(tmp_pa
     assert "vs source run" in (Path(result.results_dir) / "report.html").read_text(encoding="utf-8")
 
 
+def test_verify_patches_from_compares_per_signal_and_held_out_on_one_basis(tmp_path: Path, sdr_source: Path):
+    """V2/V3: the per-signal + held-out deltas vs the source are computed on ONE basis — the
+    source's verify.ti3 re-scored with this run's scorer, partitioned by the SOURCE run's training
+    (its TI3s + probe drives + cube) on both sides — and the two measured whites are stated."""
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    calib = _make(tmp_path, "vo_from_ps", controller=ctrl, verify_patches_from=sdr_source)
+    result = calib.run("verify-only")
+    assert result.status == "completed", result.digest
+    verify = calib.calib["stages"]["verify"]["digest"]
+    # this run built nothing: its own held-out view says so instead of calling everything held-out
+    assert verify["held_out"]["available"] is False and "verify-only" in verify["held_out"]["reason"]
+    assert verify["gate"]["held_out_gate"]["gated"] is False
+    # the source's exact list carries its fresh draws; no new draws on top
+    assert "held_out_draws" not in verify and "verify_held_out_draws" not in calib.calib["patch_plan"]
+    vs = verify["vs_source"]
+    per = vs["per_signal"]
+    assert per["available"] is True and per["source_basis"].startswith("rescored")
+    assert per["n_signals"]["now"] == per["n_signals"]["source"]
+    assert abs(per["core"]["avg"]["delta"]) < 0.05                    # same perfect panel + stack
+    held = vs["held_out"]
+    assert held["available"] is True and "training" in held["partition"]
+    assert held["held_out"]["n"]["now"] == held["held_out"]["n"]["source"] > 0
+    assert abs(held["held_out"]["avg"]["delta"]) < 0.05
+    assert set(vs["scored_white_nits"]) == {"now", "source", "delta_pct"}
+    html = (Path(result.results_dir) / "report.html").read_text(encoding="utf-8")
+    assert "per-signal core avg" in html and "held-out partition held_out avg" in html
+
+
 def test_verify_patches_from_a_mode_mismatch_is_an_abort_only_seam(tmp_path: Path, sdr_source: Path):
     ctrl = CalibrationController.mock()
     _seed_stack(ctrl, mode="HDR")
