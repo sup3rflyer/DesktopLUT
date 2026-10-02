@@ -794,8 +794,11 @@ def do_analyze(args) -> int:
         print(f"LD {state}: [{st['primary_bookkeeping']}] checks {st['checks']}")
         mb = (st.get("fitted_constant_fit") or {}).get("measured_black") or {}
         if mb.get("disagree_beyond_noise"):
-            print(f"  evidence: fitted constant pedestal / measured 0,0,0 = {mb.get('fitted_over_measured_Y'):.2f} "
-                  f"({mb.get('difference_sigma'):.1f} σ) — a black-state effect, not non-additivity")
+            # a measured black of 0 (LD on: the zones switch off) leaves the ratio undefined (None)
+            ratio, sig = mb.get("fitted_over_measured_Y"), mb.get("difference_sigma")
+            print(f"  evidence: fitted constant pedestal / measured 0,0,0 = "
+                  f"{'n/a (measured black 0)' if ratio is None else f'{ratio:.2f}'} "
+                  f"({'n/a' if sig is None else f'{sig:.1f}'} σ) — a black-state effect, not non-additivity")
         cst = ((st.get("fitted_constant_fit") or {}).get("constancy") or {})
         if cst.get("chi2_per_dof") is not None:
             print(f"  pedestal constancy: χ²/dof {cst['chi2_per_dof']:.2f} over {cst['dof']} dof (≫ 1 = not constant)")
