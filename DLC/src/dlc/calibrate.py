@@ -367,6 +367,7 @@ class Calibration:
         verify_patches_from: Optional[Path] = None,
         preheat: Optional[str] = None,
         present_stall: Optional[str] = None,
+        refine_cube: Optional[str] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -480,7 +481,13 @@ class Calibration:
             # recorded run whose EXACT verify set is re-measured (--verify-patches-from).
             ("verify_cube", str(Path(verify_cube).resolve()) if verify_cube is not None else None),
             ("verify_patches_from",
-             str(Path(verify_patches_from).resolve()) if verify_patches_from is not None else None))
+             str(Path(verify_patches_from).resolve()) if verify_patches_from is not None else None),
+            # refine-mhc: which 3D LUT the re-refined MHC keeps — the source run's build (default) or
+            # the cube INSTALLED now (a later 3dlut-only run over the same MHC lineage).
+            ("refine_cube", str(refine_cube).strip().lower() if refine_cube is not None else None))
+        if self.calib.get("refine_cube") not in (None, "source", "installed") or \
+                (refine_cube is not None and str(refine_cube).strip().lower() not in ("source", "installed")):
+            raise ValueError(f"refine_cube must be 'source' or 'installed', got {refine_cube!r}")
         for key, val in requested:
             if val is None:
                 continue
@@ -7055,7 +7062,8 @@ class Calibration:
                         "physical_floor", "cube_path")} if sd("build-install-3dlut")
                       # refine-mhc KEEPS the source run's cube: carry that cube's build record.
                       else (dict(sd("seed-from-run").get("source_lut3d") or {},
-                                 kept_from_run=sd("seed-from-run").get("source_run"),
+                                 kept_from_run=((sd("seed-from-run").get("kept_installed_cube") or {})
+                                                .get("cube_run") or sd("seed-from-run").get("source_run")),
                                  kept_cube_path=sd("reapply-3dlut").get("cube_path"))
                             if sd("seed-from-run") else None)),
             "verification": sd("verify") or None,
@@ -7661,11 +7669,62 @@ class Calibration:
         return build_refine_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
                                        max_cv=self._patch_max_cv())
 
+    def _installed_lineage_cube(self, src_root: Path) -> dict[str, Any]:
+        """``--refine-cube installed``: the 3D LUT INSTALLED now for this display + mode (the stack
+        registry's record), kept across the re-refine instead of the source run's build — the routine
+        "the MHC drifted, re-centre it under the current cube" case (the cube came from a later
+        3dlut-only run). Only over the SAME MHC lineage: the registry's MHC must be the source run's
+        own or a refine-mhc seeded from it; anything else is a refusal (``problem``), never a guess.
+        ``build_digest`` is the cube's own build digest (its build white), read from its run."""
+        try:
+            reg = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root))
+            rec = reg.get(self.display.name, self.mode)
+        except Exception as exc:  # noqa: BLE001 - no registry = nothing provably installed
+            return {"path": None, "source": "installed", "problem": f"stack registry unreadable ({exc})"}
+        if rec is None or not (rec.cube or {}).get("cube_path"):
+            return {"path": None, "source": "installed",
+                    "problem": "the stack registry records no installed 3D LUT for this display + mode"}
+        cube = rec.cube or {}
+        mhc_run = str(rec.run_id or "")
+        lineage = mhc_run == src_root.name
+        if not lineage and mhc_run:
+            try:
+                mstate = json.loads((src_root.parent / mhc_run / "dlc_state.json").read_text(encoding="utf-8"))
+                mcal = mstate.get("calib") or {}
+                seeded = str(mcal.get("source_run") or "")
+                lineage = mcal.get("flow") == "refine-mhc" and Path(seeded).name == src_root.name
+            except (OSError, ValueError):
+                lineage = False
+        if not lineage:
+            return {"path": None, "source": "installed",
+                    "problem": (f"the installed MHC (run {mhc_run or '?'}) is not the source run's own or a "
+                                f"refine-mhc seeded from {src_root.name} — the installed cube was built over "
+                                "another MHC lineage")}
+        path = str(cube["cube_path"])
+        if not Path(path).exists():
+            return {"path": None, "source": "installed", "missing": path}
+        build: dict[str, Any] = {}
+        cube_run = cube.get("run_id")
+        if cube_run:
+            try:
+                cstate = json.loads((src_root.parent / str(cube_run) / "dlc_state.json").read_text(encoding="utf-8"))
+                build = (((cstate.get("calib") or {}).get("stages") or {}).get("build-install-3dlut")
+                         or {}).get("digest") or {}
+            except (OSError, ValueError):
+                build = {}
+        return {"path": path, "source": "installed", "cube_run": cube_run, "mhc_run": mhc_run,
+                "target_white_nits": _as_float_local(cube.get("target_white_nits")),
+                "build_digest": build}
+
     def _source_run_cube(self, src_root: Path, src_calib: Mapping[str, Any]) -> dict[str, Any]:
         """The 3D LUT the source run left applied: the applied-stack registry's DURABLE deliverable
         when the registry says that run applied it, else the run's own build artifact. ``path`` is
         None when the source run built no cube (an mhc-only run); ``missing`` names a cube the
-        source DID build that is gone from disk."""
+        source DID build that is gone from disk. ``--refine-cube installed`` keeps the cube installed
+        now instead (:meth:`_installed_lineage_cube`)."""
+        if self.calib.get("refine_cube") == "installed":
+            return self._installed_lineage_cube(src_root)
         run_id = src_root.name
         try:
             reg = stack_registry.StackRegistry.load(
@@ -7840,6 +7899,8 @@ class Calibration:
             cube = self._source_run_cube(src_root, src_calib)
             if cube.get("missing"):
                 problems.append(f"the source run's 3D LUT is gone from disk: {cube['missing']}")
+            if cube.get("problem"):
+                problems.append(f"--refine-cube installed: {cube['problem']}")
             if problems:
                 refuse("cannot seed refine-mhc from the source run: " + "; ".join(problems),
                        source_run=str(src_root), problems=problems)
@@ -7864,7 +7925,10 @@ class Calibration:
             src_refine = (stages.get("refine-mhc-grayscale") or {}).get("digest") or {}
             src_verify = (stages.get("verify") or {}).get("digest") or {}
             src_3d = (stages.get("build-install-3dlut") or {}).get("digest") or {}
-            cube_white = (self._source_cube_white(cube, src_3d, params, spec, src_refine)
+            # the kept cube's OWN build digest decides its build white (the installed cube's run,
+            # not the source's, under --refine-cube installed)
+            cube_3d = cube.get("build_digest") if cube.get("source") == "installed" else src_3d
+            cube_white = (self._source_cube_white(cube, cube_3d or {}, params, spec, src_refine)
                           if cube.get("path") else None)
             here_ccmx = (here.get("correction") or {}).get("file")
             there_ccmx = (there.get("correction") or {}).get("file")
@@ -7881,6 +7945,9 @@ class Calibration:
             digest = {"source_run": str(src_root), "source_flow": src_calib.get("flow"),
                       "base_cube": str(base_dst), "base_note": base_note,
                       "cube_path": cube.get("path"), "cube_source": cube.get("source"),
+                      **({"kept_installed_cube": {"cube_run": cube.get("cube_run"),
+                                                  "installed_mhc_run": cube.get("mhc_run")}}
+                         if cube.get("source") == "installed" else {}),
                       "native_peak_nits": params.get("target_luminance"),
                       "measured_white": nw,
                       "source_refine": {k: src_refine.get(k) for k in
@@ -9549,6 +9616,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--source-run", type=Path, default=None, dest="source_run",
                         help="refine-mhc flow: the COMPLETED run whose MHC is re-refined and whose "
                              "3D LUT is kept (read-only; the refine runs in a new run dir)")
+    parser.add_argument("--refine-cube", choices=("source", "installed"), default=None, dest="refine_cube",
+                        help="refine-mhc flow: the 3D LUT the re-refined MHC keeps — 'source' (default: the "
+                             "source run's build) or 'installed' (the cube installed now per the stack "
+                             "registry, e.g. from a later 3dlut-only run; refused unless the installed MHC "
+                             "is the source's own or a refine-mhc seeded from it)")
     def _white_band_arg(text: str) -> tuple[float, float]:
         try:
             return cp.parse_white_nits_band(text)
@@ -10188,6 +10260,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             verify_patches_from=args.verify_patches_from,
                             preheat=args.preheat,
                             present_stall=args.present_stall,
+                            refine_cube=args.refine_cube,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))

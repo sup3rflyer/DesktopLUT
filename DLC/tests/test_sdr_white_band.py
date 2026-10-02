@@ -303,7 +303,7 @@ def _perfect_panel(nits: float = 120.0) -> SyntheticPanel:
 
 def _make(tmp_path: Path, name: str, *, controller=None, adjudicator=None, white_band=None,
           source_run=None, require_hardware_readiness=False, mode="SDR", panel=None,
-          bit_depth=None) -> Calibration:
+          bit_depth=None, refine_cube=None) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -314,7 +314,7 @@ def _make(tmp_path: Path, name: str, *, controller=None, adjudicator=None, white
         measure=panel if panel is not None else _perfect_panel(),
         adjudicator=adjudicator or AutoAdjudicator(), optimize_config=_OPT, patch_sizes=_SMALL,
         run_date=_DATE, white_band=white_band, source_run=source_run, bit_depth=bit_depth,
-        require_hardware_readiness=require_hardware_readiness)
+        require_hardware_readiness=require_hardware_readiness, refine_cube=refine_cube)
 
 
 def test_sdr_refine_digest_carries_the_band_and_judges_white_at_its_luminance(tmp_path, monkeypatch):
@@ -473,6 +473,68 @@ def test_refine_mhc_flow_rerefines_and_keeps_the_source_cube(tmp_path, monkeypat
     assert report["lut3d"]["kept_from_run"] == str(src.ctx.root.resolve())
     assert report["lut3d"]["kept_cube_path"] == kept
     assert report["deliverables"]["cube"] and Path(report["deliverables"]["cube"]).exists()
+
+
+def _install_later_cube(src, tmp_path: Path, *, mhc_run: str) -> Path:
+    """Simulate a later 3dlut-only run over the source's MHC lineage: a different cube file, its own run
+    dir with a build digest (its build white), and the registry pointing at both."""
+    from dlc import stack_registry
+    cube_run = tmp_path / "later_3dlut"
+    (cube_run / "generated").mkdir(parents=True)
+    later = cube_run / "generated" / "final_sdr.cube"
+    src_cube = src.calib["stages"]["build-install-3dlut"]["digest"]["cube_path"]
+    later.write_text(Path(src_cube).read_text(encoding="utf-8") + "\n# later 3dlut-only build\n",
+                     encoding="utf-8")
+    (cube_run / "dlc_state.json").write_text(json.dumps({"calib": {"flow": "3dlut-only", "stages": {
+        "build-install-3dlut": {"status": "done", "digest": {"cube_path": str(later),
+                                                              "target_white_nits": 118.5}}}}}),
+        encoding="utf-8")
+    path = stack_registry.registry_path(src.profile, src.ctx.root)
+    reg = stack_registry.StackRegistry.load(path)
+    rec = reg.get(src.display.name, src.mode)
+    rec.run_id = mhc_run
+    rec.cube = {"cube_path": str(later), "run_id": cube_run.name, "applied_at": "2026-10-02T03:45:33",
+                "target_white_nits": 118.5}
+    reg.record(rec)
+    return later
+
+
+def test_refine_mhc_can_keep_the_installed_cube_of_the_same_lineage(tmp_path, monkeypatch):
+    src = _make(tmp_path, "src_full_i")
+    assert src.run("full").status == "completed"
+    later = _install_later_cube(src, tmp_path, mhc_run=src.ctx.root.name)
+    controller = src.controller
+    installs: list[str] = []
+    orig_set = controller.set_3dlut
+    monkeypatch.setattr(controller, "set_3dlut",
+                        lambda mon, mode, path: (installs.append(str(path)), orig_set(mon, mode, path))[1])
+    calib = _make(tmp_path, "refine_installed", controller=controller, source_run=src.ctx.root,
+                  refine_cube="installed")
+    result = calib.run("refine-mhc")
+    assert result.status == "completed", result.digest
+    seed = calib.calib["stages"]["seed-from-run"]
+    assert seed["digest"]["cube_source"] == "installed"
+    assert seed["digest"]["kept_installed_cube"] == {"cube_run": "later_3dlut",
+                                                     "installed_mhc_run": src.ctx.root.name}
+    assert seed["data"]["source_cube_white"]["nits"] == 118.5          # the KEPT cube's own build white
+    kept = calib.calib["stages"]["reapply-3dlut"]["data"]["cube_path"]
+    assert Path(kept) == later and installs and installs[0] == str(later)
+    report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+    assert report["lut3d"]["kept_from_run"] == "later_3dlut"
+    assert calib.calib["refine_cube"] == "installed"
+    with pytest.raises(ValueError):
+        _make(tmp_path, "refine_bad_opt", source_run=src.ctx.root, refine_cube="newest")
+
+
+def test_refine_mhc_installed_cube_refuses_another_mhc_lineage(tmp_path):
+    src = _make(tmp_path, "src_full_l")
+    assert src.run("full").status == "completed"
+    _install_later_cube(src, tmp_path, mhc_run="some_other_full_run")
+    calib = _make(tmp_path, "refine_lineage", controller=src.controller, source_run=src.ctx.root,
+                  refine_cube="installed")
+    res = calib.run("refine-mhc")
+    assert res.status == "aborted" and res.digest["aborted_at"] == "seed-from-run"
+    assert "another MHC lineage" in json.dumps(res.digest)
 
 
 def test_refine_mhc_refuses_without_a_matching_source(tmp_path):
