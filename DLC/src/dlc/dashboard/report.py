@@ -111,7 +111,8 @@ def render_report_html(snap: dict[str, Any], charts: dict[str, Any], exported_at
     if metric_name:
         de_label = "ΔE · ITP" if "itp" in str(metric_name).lower() else "ΔE2000"
     else:
-        is_hdr = bool(h.get("is_hdr")) or str(h.get("mode", "")).upper() == "HDR"
+        is_hdr = bool(h.get("is_hdr")) if h.get("is_hdr") is not None else \
+            str(h.get("content_mode") or h.get("mode", "")).upper() == "HDR"
         de_label = "ΔE · ITP" if is_hdr else "ΔE2000"
 
     return f"""<!DOCTYPE html>

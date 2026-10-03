@@ -259,7 +259,8 @@ function renderState(s) {
   $("f-run").textContent = h.run_id || s.run_id || "—";
   $("f-display").textContent = h.display || "—";
   $("f-monitor").textContent = (h.monitor !== undefined && h.monitor !== null) ? h.monitor : "—";
-  $("f-mode").textContent = h.mode || "—";
+  $("f-mode").textContent = (h.mode || "—") +
+    (h.content_mode && h.content_mode !== h.mode ? " · " + h.content_mode + " content" : "");
   $("f-flow").textContent = h.flow || "—";
   $("f-bits").textContent = h.bit_depth ? `${h.bit_depth}-bit` : "—";
   $("f-target").textContent = h.target || "—";

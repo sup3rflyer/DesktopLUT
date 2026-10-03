@@ -1210,3 +1210,12 @@ def test_channel_drift_rebaselines_per_stage_segment():
     assert cd[2]["r"] == 0.0 and cd[2]["g"] == 0.0 and cd[2]["b"] == 0.0  # re-baselined
     # within-segment drift stays small — the ~35% cross-stack Y change never charts as drift
     assert all(abs(cd[i][k]) < 5.0 for i in range(4) for k in ("r", "g", "b"))
+
+
+def test_is_hdr_header_follows_the_target_not_the_display_mode():
+    from dlc.dashboard.state import _is_hdr_header
+    # SDR content measured on a display in HDR (verify-only --content-mode SDR): CIEDE2000, not ITP
+    assert _is_hdr_header({"mode": "HDR", "content_mode": "SDR", "is_hdr": False}) is False
+    assert _is_hdr_header({"mode": "HDR", "content_mode": "SDR"}) is False       # before the target resolves
+    assert _is_hdr_header({"mode": "HDR"}) is True and _is_hdr_header({"mode": "SDR", "is_hdr": True}) is True
+    assert _is_hdr_header({"mode": "SDR", "transfer": "pq"}) is True

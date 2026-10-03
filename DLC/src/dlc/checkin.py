@@ -249,6 +249,7 @@ def run_overview(cal: Any, trigger: str) -> dict[str, Any]:
         "run": cal.ctx.root.name,
         "flow": cal.calib.get("flow"),
         "mode": cal.mode,
+        "content_mode": getattr(cal, "content_mode", cal.mode),
         "target": cal.target_name,
         "phase": cal.runlog.phase if cal.runlog else None,
         "stage": trigger,

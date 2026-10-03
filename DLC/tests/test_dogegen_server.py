@@ -221,3 +221,42 @@ def test_shapes_to_stdin_pattern_translates_full_field_and_ndc_rects():
     # top-left quadrant example from the dogegen README
     assert shapes_to_stdin_pattern([((255, 255, 255), (0.0, 0.0, 0.5, 0.5))]) == \
         "draw -1.000000 1.000000 0.000000 0.000000 255 255 255"
+
+
+def test_dispatch_mode_reports_what_the_codes_mean():
+    assert dispatch("mode", show=lambda *a: None, mode_info="mode SDR 8") == ("mode SDR 8", True)
+    assert dispatch("mode", show=lambda *a: None)[0].startswith("err")
+
+
+class _ReplyDaemon:
+    """One connection; answers every line with a fixed reply (``ok`` = a daemon without ``mode``)."""
+
+    def __init__(self, reply: bytes):
+        self.reply = reply
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(1)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        conn, _ = self._srv.accept()
+        with conn:
+            while conn.recv(4096):
+                conn.sendall(self.reply)
+
+    def stop(self):
+        self._srv.close()
+
+
+def test_socket_presenter_query_mode_parses_and_tolerates_old_daemons():
+    for reply, want in ((b"mode SDR 8\n", {"mode": "SDR", "bit_depth": 8}),
+                        (b"mode HDR 10\n", {"mode": "HDR", "bit_depth": 10}),
+                        (b"err bad command: 'mode'\n", None), (b"ok\n", None)):
+        daemon = _ReplyDaemon(reply)
+        try:
+            pres = SocketPresenter("127.0.0.1", daemon.port, settle_seconds=0.0)
+            assert pres.query_mode() == want
+            pres.close()
+        finally:
+            daemon.stop()

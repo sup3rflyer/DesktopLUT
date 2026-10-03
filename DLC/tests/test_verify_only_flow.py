@@ -73,7 +73,7 @@ def _hdr_panel() -> SyntheticPanel:
 def _make(tmp_path: Path, name: str, *, mode: str = "SDR", controller=None, adjudicator=None,
           panel=None, bit_depth=None, verify_cube=None, verify_patches_from=None, preheat=None,
           loop_config=None, require_hardware_readiness=False, decision_overrides=None,
-          present_stall=None) -> Calibration:
+          present_stall=None, **extra) -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
@@ -85,7 +85,7 @@ def _make(tmp_path: Path, name: str, *, mode: str = "SDR", controller=None, adju
         run_date=_DATE, bit_depth=bit_depth, loop_config=loop_config,
         require_hardware_readiness=require_hardware_readiness, decision_overrides=decision_overrides,
         verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat,
-        present_stall=present_stall)
+        present_stall=present_stall, **extra)
 
 
 def _cube(path: Path, value: str = "0.5 0.5 0.5") -> Path:
@@ -867,3 +867,149 @@ def test_simulate_rehearsal_runs_the_verify_only_flow(tmp_path: Path):
     assert legs["verify_installed"]["stack_unchanged"] is True
     assert legs["verify_patches_from"]["verify"]["vs_source"]["like_for_like"] is True
     assert legs["verify_candidate"]["decision"] == "restore" and legs["verify_candidate"]["prior_restored"]
+
+
+# ---------------------------------------------------------------------------
+# --content-mode SDR on an HDR display (the Rec.709 / gamma 2.2 "SDR in HDR" validation)
+# ---------------------------------------------------------------------------
+
+def _sdr_in_hdr_panel(white: float = 116.0) -> SyntheticPanel:
+    # what the meter sees of SDR content composited into HDR by an ideal stack: SDR codes, power 2.2
+    return SyntheticPanel(transfer=Transfer.power(gamma=2.2, peak_nits=white, bit_depth=8),
+                          start_temp=1.0, cold_blue_gain=1.0, white_nits=white)
+
+
+def _hdr_display_with_layers(tmp_path: Path) -> CalibrationController:
+    ctrl = CalibrationController.mock()
+    ctrl.set_hdr(0, True)
+    _seed_stack(ctrl, mode="HDR", cube=_cube(tmp_path / "hdr_installed.cube"))
+    ctrl.set_layers(0, "HDR", desktop_gamma=True, fald=True, tonemap=True)
+    return ctrl
+
+
+def _layers(ctrl: CalibrationController, key: str = "0:HDR") -> dict:
+    return {k: v for k, v in ((ctrl.state().get("layers") or {}).get(key) or {}).items()
+            if k in CalibrationController.LAYER_NAMES}
+
+
+def test_sdr_content_on_an_hdr_display_scores_sdr_through_the_hdr_stack(tmp_path: Path):
+    ctrl = _hdr_display_with_layers(tmp_path)
+    before = ctrl.state()
+    seen: list = []
+    panel = _sdr_in_hdr_panel()
+
+    def measure(patch):
+        seen.append(dict(_layers(ctrl)))
+        return panel(patch)
+    calib = _make(tmp_path, "vo_sdr_in_hdr", mode="HDR", controller=ctrl, panel=measure, bit_depth=8,
+                  content_mode="SDR", keep_layers=["desktop_gamma"],
+                  sdr_white_probe=lambda rect: {"nits": 116.0, "source": "test", "rect": rect})
+    result = calib.run("verify-only")
+    assert result.status == "completed", result.digest
+    # the CONTENT picks the target / scoring: the SDR target, CIEDE2000, 8-bit codes
+    assert calib.content_mode == "SDR" and calib.mode == "HDR"
+    assert not calib.profile.target(calib.target_name).is_hdr
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert verify["metric"] != "dE_ITP" and verify["within_quality"] is True
+    # the white SDR content is composited at = the Windows SDR white level (not the target's nominal)
+    assert verify["sdr_white"]["calibrated_white_nits"] == 116.0
+    assert verify["sdr_white"]["source"] == "windows_sdr_white_level"
+    assert abs(verify["sdr_white"]["white_luminance_vs_calibrated_pct"]) < 1.0
+    sih = verify["sdr_in_hdr"]
+    assert sih["desktop_gamma_on"] is True and sih["declared_sdr_white_nits"] == 116.0
+    fit = sih["grey_model_fit"]
+    assert fit["closest"] == "g22" and fit["models"]["g22"]["rms_ln"] < fit["models"]["dg80_forecast"]["rms_ln"]
+    assert calib.calib["stages"]["preflight"]["digest"]["sdr_white_level"]["nits"] == 116.0
+    # the DISPLAY keys the layers: Desktop Gamma kept ON through every read, FALD + tonemap off, all restored
+    assert seen and all(s["desktop_gamma"] and not s["fald"] and not s["tonemap"] for s in seen)
+    vl = calib.calib["viewing_layers"]
+    assert vl["mode"] == "HDR" and vl["disabled"] == ["fald", "tonemap"] and vl["kept"] == {"desktop_gamma": True}
+    now = _layers(ctrl)
+    assert now["fald"] and now["tonemap"] and now["desktop_gamma"]
+    # the HDR stack under test is untouched
+    after = ctrl.state()
+    assert after["mhc"]["0:HDR"] == before["mhc"]["0:HDR"]      # Desktop Gamma never toggled: same profile
+    assert after["runtime"]["0:HDR"] == before["runtime"]["0:HDR"]
+    header = next(e.data for e in read_events(calib.ctx.events_path) if e.event == Ev.RUN_HEADER)
+    assert header["mode"] == "HDR" and header["content_mode"] == "SDR"
+
+
+def test_sdr_in_hdr_without_a_white_reader_keeps_the_nominal_white(tmp_path: Path):
+    ctrl = _hdr_display_with_layers(tmp_path)
+    calib = _make(tmp_path, "vo_sdr_in_hdr_nominal", mode="HDR", controller=ctrl, panel=_sdr_in_hdr_panel(),
+                  bit_depth=8, content_mode="SDR", keep_layers=["desktop_gamma"])
+    assert calib.run("verify-only").status == "completed"
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert verify["sdr_white"]["source"] == "nominal"
+    assert "dg80_forecast" not in verify["sdr_in_hdr"]["grey_model_fit"]["models"]   # no declared white
+    assert calib.calib["sdr_white_level"]["nits"] is None
+
+
+def test_content_mode_and_keep_layers_are_verify_only(tmp_path: Path):
+    ctrl = _hdr_display_with_layers(tmp_path)
+    for name, flow, kw, needle in (
+            ("cm_full", "3dlut-only", {"content_mode": "SDR"}, "--content-mode"),
+            ("kl_full", "3dlut-only", {"keep_layers": ["desktop_gamma"]}, "--keep-layers")):
+        res = _make(tmp_path, name, mode="HDR", controller=ctrl, bit_depth=8, **kw).run(flow)
+        assert res.status == "aborted" and res.digest["aborted_at"] == "run-args" and needle in res.digest["message"]
+    sdr = CalibrationController.mock()
+    _seed_stack(sdr)
+    res = _make(tmp_path, "cm_hdr_on_sdr", controller=sdr, content_mode="HDR").run("verify-only")
+    assert res.status == "aborted" and "only SDR content on an HDR display" in res.digest["message"]
+    with pytest.raises(ValueError, match="unknown layer"):
+        _make(tmp_path, "kl_bad", mode="HDR", controller=ctrl, keep_layers=["desktop_gama"])
+
+
+def test_content_mode_persists_across_a_resume(tmp_path: Path):
+    ctrl = _hdr_display_with_layers(tmp_path)
+    first = _make(tmp_path, "vo_sih_resume", mode="HDR", controller=ctrl, panel=_sdr_in_hdr_panel(), bit_depth=8,
+                  content_mode="SDR", keep_layers=["desktop_gamma"], adjudicator=MappingAdjudicator({}))
+    with pytest.raises(AdjudicationRequired):
+        first.run("verify-only")
+    resumed = _make(tmp_path, "vo_sih_resume", mode="HDR", controller=ctrl, panel=_sdr_in_hdr_panel())
+    assert resumed.content_mode == "SDR" and resumed.calib["keep_layers"] == ["desktop_gamma"]
+    assert resumed.bit_depth == 8
+
+
+def test_source_mismatch_splits_content_from_display_mode():
+    src = {"mode": "SDR", "content_mode": "SDR", "bit_depth": 8}
+    m = verify_only.source_mismatches(src, mode="SDR", bit_depth=8, display=None, hardware_id=None, target=None,
+                                      correction_file=None, pin_nits=None, display_mode="HDR")
+    assert not m["hard"] and any("display mode SDR" in s for s in m["soft"])    # same codes, other path
+    m = verify_only.source_mismatches({"mode": "HDR", "content_mode": "SDR", "bit_depth": 8}, mode="HDR",
+                                      bit_depth=10, display=None, hardware_id=None, target=None,
+                                      correction_file=None, pin_nits=None)
+    assert any("content mode SDR" in h for h in m["hard"])
+
+
+def test_resolve_content_mode_is_one_rule_for_main_and_the_orchestrator():
+    from dlc.calibrate import resolve_content_mode
+    assert resolve_content_mode({}, None, "HDR") == ("HDR", None, None)                    # default = display
+    assert resolve_content_mode({}, "sdr", "HDR") == ("SDR", None, "SDR")                  # fresh request
+    assert resolve_content_mode({"content_mode": "SDR"}, None, "HDR") == ("SDR", None, "SDR")   # flagless resume
+    # a dead-pipe preflight leaves no memo: a new explicit request still wins (main() must agree)
+    assert resolve_content_mode({"content_mode": "SDR"}, "HDR", "HDR") == ("HDR", None, None)
+    # memoised stages: a different request is a conflict, the persisted value stays
+    eff, conflict, _ = resolve_content_mode({"content_mode": "SDR", "stages": {"x": {}}}, "HDR", "HDR")
+    assert eff == "SDR" and conflict["field"] == "content_mode"
+    # asking for the display's own mode on a memoised run without a record is the default, not a conflict
+    assert resolve_content_mode({"stages": {"x": {}}}, "HDR", "HDR") == ("HDR", None, None)
+    assert resolve_content_mode({"stages": {"x": {}}}, "SDR", "HDR")[1] is not None
+
+
+def test_a_kept_layer_the_user_toggles_mid_run_is_not_forced_back(tmp_path: Path):
+    ctrl = _hdr_display_with_layers(tmp_path)
+    panel = _sdr_in_hdr_panel()
+    toggled = []
+
+    def measure(patch):
+        if not toggled:                       # the user switches Desktop Gamma off during the run
+            ctrl.set_layers(0, "HDR", desktop_gamma=False)
+            toggled.append(True)
+        return panel(patch)
+    calib = _make(tmp_path, "vo_sih_toggle", mode="HDR", controller=ctrl, panel=measure, bit_depth=8,
+                  content_mode="SDR", keep_layers=["desktop_gamma"])
+    assert calib.run("verify-only").status == "completed"
+    now = _layers(ctrl)
+    assert now["desktop_gamma"] is False and now["fald"] and now["tonemap"]   # only the run's own changes undone
+

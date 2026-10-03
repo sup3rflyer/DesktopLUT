@@ -186,6 +186,9 @@ def load_source_verify(src_root: Path) -> dict[str, Any]:
         "run_id": src_root.name,
         "flow": calib.get("flow"),
         "mode": str(state.get("mode") or manifest.get("mode") or "").upper() or None,
+        # what the codes ARE (verify-only --content-mode; == mode for every other run)
+        "content_mode": str(calib.get("content_mode") or state.get("mode") or manifest.get("mode") or "").upper()
+        or None,
         "monitor": state.get("monitor"),
         "bit_depth": int(bit_depth) if bit_depth is not None else None,
         "target": calib.get("target"),
@@ -219,17 +222,26 @@ def _norm_file(value: Any) -> Optional[str]:
 
 def source_mismatches(source: Mapping[str, Any], *, mode: str, bit_depth: int, display: Optional[str],
                       hardware_id: Optional[str], target: Optional[str],
-                      correction_file: Optional[str], pin_nits: Optional[float]) -> dict[str, Any]:
+                      correction_file: Optional[str], pin_nits: Optional[float],
+                      display_mode: Optional[str] = None) -> dict[str, Any]:
     """What differs between the source run and this one.
 
-    ``hard`` — the recorded code values would mean a different SIGNAL here (mode / bit depth):
-    measuring them is not a like-for-like verify, whatever the judge prefers. ``soft`` — a
-    judgment for the LLM (another display / panel EDID / target / colorimeter correction / an
-    installed calibrated top that is not the one the source scored against)."""
+    ``mode`` is the CONTENT mode (what the codes are) and ``display_mode`` the display's (``None`` =
+    the same as ``mode``). ``hard`` — the recorded code values would mean a different SIGNAL here
+    (content mode / bit depth): measuring them is not a like-for-like verify, whatever the judge
+    prefers. ``soft`` — a judgment for the LLM (another display mode — the same SDR codes composited
+    into HDR, or the reverse / display / panel EDID / target / colorimeter correction / an installed
+    calibrated top that is not the one the source scored against)."""
     hard: list[str] = []
     soft: list[str] = []
-    if source.get("mode") and str(source["mode"]).upper() != str(mode).upper():
-        hard.append(f"source mode {source['mode']} != this run's {mode} (the codes are another transfer)")
+    src_content = source.get("content_mode") or source.get("mode")
+    if src_content and str(src_content).upper() != str(mode).upper():
+        hard.append(f"source content mode {src_content} != this run's {mode} (the codes are another transfer)")
+    disp = str(display_mode or mode).upper()
+    if source.get("mode") and str(source["mode"]).upper() != disp:
+        soft.append(f"source display mode {source['mode']} != this run's {disp} — the same codes reach the "
+                    "panel through another path (e.g. SDR codes composited into HDR at the SDR white level "
+                    "through the HDR stack): compare the numbers as a different stack, not a re-verify")
     if source.get("bit_depth") is not None and int(source["bit_depth"]) != int(bit_depth):
         hard.append(f"source bit depth {source['bit_depth']} != this run's {bit_depth} (the codes "
                     "are another quantization)")

@@ -66,7 +66,7 @@ def build(args, ctx: RunContext) -> StageResult:
     # Mode-gate the metric exactly like calibrate.py (dE_ITP HDR-only / CIEDE2000 SDR-only). The run's
     # FIXED mode comes from the manifest (run_mode), not the SDR-defaulting --mode flag, so a flagless
     # resume of an HDR run still scores in dE_ITP.
-    is_hdr = _common.run_mode(args, ctx) == "HDR"
+    is_hdr = _common.run_content_mode(args, ctx, dl_state) == "HDR"
     if is_hdr:
         # peak_nits is a reported number only (PQ is absolute) — the dE_ITP math needs just the white.
         peak = (args.luminance

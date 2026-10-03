@@ -16,7 +16,7 @@ import json
 import math
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 from ..controller import CalibrationController, normalize_mode
 from ..desktoplut_client import (
@@ -183,6 +183,13 @@ def run_mode(args: argparse.Namespace, ctx: RunContext) -> str:
     derive the SDR target/transfer — the run-spec drift class (see calibrate.resolve_run_spec)."""
     manifest_mode = getattr(getattr(ctx, "manifest", None), "mode", None)
     return normalize_mode(manifest_mode or args.mode)
+
+
+def run_content_mode(args: argparse.Namespace, ctx: RunContext, dl_state: Mapping[str, Any]) -> str:
+    """What the run's patches ARE (its target / scoring mode): the run record's ``calib.content_mode``
+    (verify-only ``--content-mode`` — SDR content measured on a display in HDR), else :func:`run_mode`."""
+    cm = (dl_state.get("calib") or {}).get("content_mode")
+    return normalize_mode(cm) if cm else run_mode(args, ctx)
 
 
 # --------------------------------------------------------------------------

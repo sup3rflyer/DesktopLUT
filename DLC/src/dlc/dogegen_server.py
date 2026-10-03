@@ -15,6 +15,8 @@ every invocation — no respawn, no flash, fullscreen preserved. The orchestrato
 Line protocol (ASCII, loopback only — this drives a local display, not a network):
   ``"<r> <g> <b>\\n"`` → show a full-field patch at those code values; reply ``"ok\\n"``
   ``"ping\\n"``        → reply ``"pong\\n"`` (liveness)
+  ``"mode\\n"``        → reply ``"mode <SDR|HDR> <bits>\\n"`` (what the codes mean — the orchestrator refuses
+                       a daemon whose mode / bit depth is not its run's)
   ``"quit\\n"``        → quit dogegen + stop the daemon; reply ``"bye\\n"``
 Code values are in the daemon's dogegen bit depth (``mode 8`` → 0..255, ``mode 10`` →
 0..1023), so it MUST be started at the same ``--bit-depth`` the calibration run uses.
@@ -73,16 +75,20 @@ def shapes_to_stdin_pattern(shapes) -> str:
 
 
 def dispatch(cmd: str, *, show: Callable[[int, int, int], None],
-             show_shapes: Optional[Callable[[list], None]] = None) -> Tuple[str, bool]:
+             show_shapes: Optional[Callable[[list], None]] = None,
+             mode_info: Optional[str] = None) -> Tuple[str, bool]:
     """Handle one protocol line. Returns ``(reply, keep_running)``; ``reply`` empty ⇒
     send nothing. ``show(r, g, b)`` paints a full-field patch; ``show_shapes(shapes)`` paints
     an ordered rectangle list (``shapes …`` lines — Resolve transport only; ``None`` ⇒ the
-    command is refused). Pure of any socket/dogegen detail so it is unit-testable."""
+    command is refused); ``mode_info`` is the ``mode`` reply (``"mode SDR 8"``). Pure of any
+    socket/dogegen detail so it is unit-testable."""
     cmd = cmd.strip()
     if not cmd:
         return ("", True)
     if cmd == "ping":
         return ("pong", True)
+    if cmd == "mode":
+        return (mode_info or "err mode unknown", True)
     if cmd == "quit":
         return ("bye", False)
     if cmd.split(None, 1)[0] == "shapes":
@@ -221,7 +227,8 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
                         line, buf = buf.split(b"\n", 1)
                         try:
                             reply, keep = dispatch(line.decode("ascii", "ignore"), show=show,
-                                                   show_shapes=show_shapes)
+                                                   show_shapes=show_shapes,
+                                                   mode_info=f"mode {str(mode).upper()} {int(bit_depth)}")
                         except OSError as exc:
                             # The dogegen child died (broken stdin pipe) — report it cleanly to the
                             # client instead of crashing the daemon, so the caller gets a clear error

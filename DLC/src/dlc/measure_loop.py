@@ -3350,6 +3350,16 @@ class SocketPresenter:
         if dwell:
             time.sleep(dwell)
 
+    def query_mode(self) -> Optional[dict[str, Any]]:
+        """The daemon's dogegen mode + bit depth (``{"mode": "SDR"|"HDR", "bit_depth": int}``), or
+        ``None`` from a daemon that predates the ``mode`` command / an unparsable reply."""
+        s = self._ensure()
+        s.sendall(b"mode\n")
+        parts = self._recv_line(s).split()
+        if len(parts) == 3 and parts[0] == "mode" and parts[1].upper() in ("SDR", "HDR") and parts[2].isdigit():
+            return {"mode": parts[1].upper(), "bit_depth": int(parts[2])}
+        return None
+
     def close(self) -> None:
         # Drop our connection ONLY — the daemon (and its fullscreen window) persists across
         # invocations on purpose (so a pause/resume keeps one fullscreen window). The run's

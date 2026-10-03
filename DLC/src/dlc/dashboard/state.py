@@ -226,8 +226,13 @@ _DE_DECIMALS = {"itp": 3, "de2000": 3}
 
 
 def _is_hdr_header(header: dict[str, Any]) -> bool:
-    return bool(header.get("is_hdr")) or str(header.get("mode", "")).upper() == "HDR" \
-        or str(header.get("transfer", "")).lower() == "pq"
+    # The TARGET decides (is_hdr, once resolved): SDR content measured on a display in HDR (verify-only
+    # --content-mode SDR) has mode HDR but an SDR target. Before the target resolves: the content mode,
+    # then the display mode / transfer.
+    if header.get("is_hdr") is not None:
+        return bool(header.get("is_hdr"))
+    mode = header.get("content_mode") or header.get("mode") or ""
+    return str(mode).upper() == "HDR" or str(header.get("transfer", "")).lower() == "pq"
 
 
 def _pq_eotf(signal: float, peak: Optional[float]) -> float:

@@ -107,6 +107,23 @@ the same command WITHOUT `--verify-cube` first (the shipped cube, same set = the
 both runs' `vs_source`. Keep repeating every flag on each resume (`--verify-cube` /
 `--verify-patches-from` are persisted; a different value on resume is refused).
 
+**SDR-in-HDR recipe (Rec.709 / γ2.2 SDR content on the HDR display, 2026-10-03)** — the SDR verify preset
+as 8-bit SDR codes (dogegen `mode 8`), composited by Windows at its SDR white level, through the installed
+HDR stack; Desktop Gamma kept ON (it is what turns Windows' sRGB into γ2.2), every other layer off for the
+run (FALD is a passthrough on full fields by design, tonemap is irrelevant ≤ the SDR white):
+```bash
+python -m dlc.dogegen_server --mode SDR --bit-depth 8 --monitor 0        # its own background job, timeout 7200000
+PYTHONPATH=src python -m dlc.calibrate --flow verify-only --mode HDR --content-mode SDR --monitor 0 --bit-depth 8 \
+  --keep-layers desktop_gamma --dogegen-server localhost:28930 --keep-dogegen-server --checkin-interval 300
+```
+`--mode` = the DISPLAY (stack / layers / correction slot / DIP keys), `--content-mode` = what the codes are
+(target, transfer, scoring: CIEDE2000 vs the SDR target at the measured white). The CLI refuses a daemon in
+another mode / depth (`mode` query). Read in the verify digest: `sdr_white` (calibrated white = Windows' SDR
+white level, source `windows_sdr_white_level`, vs the measured one) and `sdr_in_hdr.grey_model_fit` — which
+grey shape the stack renders (`g22` / `srgb` / `g24` / `dg80_forecast` = Desktop Gamma's 80-nit bake at the
+declared white). `--verify-patches-from <an SDR run>` reuses that run's exact set (display mode differs ⇒ the
+soft `verify-source:mismatch` seam: same codes, another path — compare as a different stack).
+
 ### The seam rhythm = seam → decide → resume (a NEW process each time)
 
 At every seam the spine **exits 10** and prints the request JSON. A real seam looks like:

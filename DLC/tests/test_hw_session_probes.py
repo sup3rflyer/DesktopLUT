@@ -22,7 +22,6 @@ import probe_hw10_grayscale_roundtrip as hw10  # noqa: E402
 import probe_hw_common as hc  # noqa: E402
 import probe_ld_additivity as ld  # noqa: E402
 import probe_near_black as nb  # noqa: E402
-import probe_sdr_in_hdr as sih  # noqa: E402
 
 PA_ADDITIVITY = ROOT / ld.ANALYSIS_SCRIPT
 
@@ -549,50 +548,3 @@ def test_fitted_constant_pedestal_is_inverse_variance_weighted():
     assert rms_w < 3 * w["P_se_Y"]                                  # and its reported SE is honest
     assert w["weighting"].startswith("inverse-variance") and w["constancy"]["chi2_per_dof"] is not None
     assert all(q["P_se_Y"] > 0 for q in w["per_code"])
-
-
-# ----------------------------------------------------------------------------- probe_sdr_in_hdr (Rec.709 in HDR)
-def test_sdr_in_hdr_desktop_gamma_forecast():
-    for c in (3, 24, 128, 216, 255):
-        assert sih.srgb_oetf(sih.srgb_eotf(c / 255)) == pytest.approx(c / 255, abs=1e-12)
-        # Desktop Gamma referenced to an 80-nit SDR white is exactly pure 2.2
-        assert sih.grey_forecast_rel(c, 80.0, True) == pytest.approx((c / 255) ** 2.2, rel=1e-9)
-        assert sih.grey_forecast_rel(c, 116.0, False) == pytest.approx(sih.srgb_eotf(c / 255), rel=1e-12)
-    # at a 116-nit white the 80-nit bake leaves part of the sRGB shadow lift: code 24 -> 0.7413 nit (2.2: 0.6405)
-    assert 116.0 * sih.grey_forecast_rel(24, 116.0, True) == pytest.approx(0.7413, abs=2e-4)
-    assert sih.grey_forecast_rel(230, 116.0, True) == pytest.approx(sih.srgb_eotf(230 / 255))   # above 80 nit: untouched
-
-
-def test_sdr_in_hdr_exact_target_scores_zero():
-    rows = [{"name": f"grey:{c}", "group": "grey", "cond": "", "field": [c, c, c],
-             "xyz": sih.target_xyz((c, c, c), 116.0, "g22")} for c in sih.GREY_CODES]
-    rows += [{"name": n, "group": "checker", "cond": "", "field": list(code),
-              "xyz": sih.target_xyz(code, 116.0, "g22")} for n, code in sih.COLORCHECKER]
-    sc = sih.score_rows(rows, declared_white=116.0, desktop_gamma=True)
-    assert sc["white"]["Y"] == pytest.approx(116.0) and sc["white"]["duv_d65"] < 1e-4
-    assert sc["summary"]["all_non_black"]["g22"]["max"] < 1e-3
-    assert sc["summary"]["grey"]["srgb"]["max"] > 0.5                    # the sRGB column sees the shadow lift
-    assert sc["model_fit"]["g22"]["rms_ln"] < 1e-6 < sc["model_fit"]["dg80_forecast"]["rms_ln"]
-
-
-def test_sdr_in_hdr_white_level_matches_the_monitor_rect():
-    levels = [{"gdi": "A", "position": [0, 0], "size": [3840, 2160], "nits": 116.0},
-              {"gdi": "B", "position": [-3840, -212], "size": [3840, 2160], "nits": 80.0}]
-    assert sih.sdr_white_for_rect(levels, {"x": -3840, "y": -212, "width": 3840, "height": 2160})["gdi"] == "B"
-    assert sih.sdr_white_for_rect(levels, {"x": 5, "y": 0, "width": 3840, "height": 2160}) is None
-
-
-def test_sdr_in_hdr_simulated(capsys):
-    base = ["--simulate", "--phase", "grey,colour", "--grey-codes", "0,12,24,64,128,216,255", "--no-checker"]
-    assert sih.main(base) == 2                                           # needs the through-stack exception
-    capsys.readouterr()
-    assert sih.main(base + ["--through-stack"]) == 0
-    ev = _evidence(capsys.readouterr().out)
-    run = ev["_run"]
-    assert ev["stack_unchanged"]["unchanged"] and ev["stack_facts"]["desktop_gamma"] is True
-    assert ev["sdr_white"]["declared_nits"] == 116.0 and not ev["anomalies"]
-    sc = json.loads((run / "score.json").read_text(encoding="utf-8"))
-    assert sc["drift_bracket"] is not None and sc["white"]["reads"] == 3     # bracket start + ramp + bracket end
-    assert sc["model_fit"]["dg80_forecast"]["rms_ln"] < sc["model_fit"]["g22"]["rms_ln"]   # the sim bakes DG@80
-    assert sih.main(["--score-only", str(run)]) == 0
-    assert json.loads((run / "score.json").read_text(encoding="utf-8"))["summary"] == sc["summary"]

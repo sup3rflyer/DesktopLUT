@@ -77,7 +77,7 @@ def build(args, ctx: RunContext) -> StageResult:
         result.fail("invalid_target_white", str(exc))
         return result
 
-    is_hdr = _common.run_mode(args, ctx) == "HDR"
+    is_hdr = _common.run_content_mode(args, ctx, dl) == "HDR"
     peak_nits = float((dl.get("mhc_params") or {}).get("target_luminance") or 1000.0)
     metric_name = "dE_ITP" if is_hdr else "CIEDE2000"
     # Gamut-aware like the live verify + the score stage (P1): HDR targets clamp onto the

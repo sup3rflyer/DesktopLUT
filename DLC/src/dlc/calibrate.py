@@ -309,6 +309,26 @@ def resolve_run_spec(ctx: RunContext, state: Mapping[str, Any], *, mode: str,
     return eff_mode, eff_bd, conflicts
 
 
+def resolve_content_mode(calib: Mapping[str, Any], requested: Optional[str], display_mode: str
+                         ) -> tuple[str, Optional[dict[str, Any]], Optional[str]]:
+    """The run's CONTENT mode (verify-only ``--content-mode``) from the persisted ``calib['content_mode']``
+    and the request — ONE rule for the orchestrator and ``main()`` (which builds dogegen before it), so the
+    two can never present one signal and score another. Returns ``(effective, conflict | None,
+    value_to_persist)``. No request: the persisted value (else the display mode). A request on a run with
+    memoised stages that differs from what they ran with is a conflict (the persisted value stays and the
+    run refuses at resume-args); otherwise the request wins. Asking for the display's own mode is the
+    default — persisted as ``None``, never a conflict with an unset record."""
+    disp = normalize_mode(display_mode)
+    stored = calib.get("content_mode")
+    stored_eff = normalize_mode(stored) if stored else disp
+    if requested is None:
+        return stored_eff, None, stored
+    req = normalize_mode(requested)
+    if calib.get("stages") and req != stored_eff:
+        return stored_eff, {"field": "content_mode", "requested": req, "persisted": stored}, stored
+    return req, None, (None if req == disp else req)
+
+
 def resolve_run_flow(state: Mapping[str, Any], flow: str) -> tuple[str, Optional[dict[str, Any]]]:
     """Reconcile the requested flow against the persisted ``calib.flow`` (the flow chosen
     when the run started). On resume the CLI ``--flow`` defaults to ``full`` and must not
@@ -368,6 +388,9 @@ class Calibration:
         preheat: Optional[str] = None,
         present_stall: Optional[str] = None,
         refine_cube: Optional[str] = None,
+        content_mode: Optional[str] = None,
+        keep_layers: Optional[Sequence[str]] = None,
+        sdr_white_probe: Optional[Callable[[Optional[Mapping[str, Any]]], dict[str, Any]]] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -484,7 +507,15 @@ class Calibration:
              str(Path(verify_patches_from).resolve()) if verify_patches_from is not None else None),
             # refine-mhc: which 3D LUT the re-refined MHC keeps — the source run's build (default) or
             # the cube INSTALLED now (a later 3dlut-only run over the same MHC lineage).
-            ("refine_cube", str(refine_cube).strip().lower() if refine_cube is not None else None))
+            ("refine_cube", str(refine_cube).strip().lower() if refine_cube is not None else None),
+            # (--content-mode is resolved after the display mode, below: resolve_content_mode)
+            # verify-only: viewing layers left as the user has them for the run (--keep-layers).
+            ("keep_layers", sorted({str(n).strip().lower() for n in keep_layers}) if keep_layers is not None
+             else None))
+        if keep_layers is not None:
+            unknown = sorted({str(n).strip().lower() for n in keep_layers} - set(CalibrationController.LAYER_NAMES))
+            if unknown:
+                raise ValueError(f"keep_layers: unknown layer(s) {unknown}; known: {CalibrationController.LAYER_NAMES}")
         if self.calib.get("refine_cube") not in (None, "source", "installed") or \
                 (refine_cube is not None and str(refine_cube).strip().lower() not in ("source", "installed")):
             raise ValueError(f"refine_cube must be 'source' or 'installed', got {refine_cube!r}")
@@ -544,6 +575,20 @@ class Calibration:
         # passes it in; an in-process caller presents through its injected measure fn at the
         # panel's own depth. The persisted run spec makes the choice sticky either way.
         self.bit_depth = _eff_bd if _eff_bd is not None else self.display.panel.bit_depth
+        # The CONTENT mode (verify-only --content-mode): what the patches ARE — target, transfer, patch
+        # codes, dogegen mode, scoring. Defaults to the display mode (self.mode, which keys every pipe /
+        # stack / layer / correction / DIP lookup); persisted in calib so a flagless resume keeps it.
+        self.content_mode, cm_conflict, cm_persist = resolve_content_mode(self.calib, content_mode, self.mode)
+        if cm_conflict:
+            self._arg_conflicts.append(cm_conflict)
+        elif content_mode is not None:
+            if cm_persist is None:
+                self.calib.pop("content_mode", None)
+            else:
+                self.calib["content_mode"] = cm_persist
+        # Live DisplayConfig SDR-white-level reader (dlc.sdr_in_hdr.probe_sdr_white) for SDR content on an
+        # HDR display; the CLI wires it, None keeps sim/tests off the host's displays.
+        self.sdr_white_probe = sdr_white_probe
 
         # The unified event spine: every phase change, stage boundary, seam, and (via the
         # measure loop / optimizer) every patch read + heartbeat lands in events.jsonl, the
@@ -737,6 +782,7 @@ class Calibration:
             "display": self.display.name,
             "monitor": self.monitor,
             "mode": self.mode,
+            "content_mode": self.content_mode,
             "flow": self.calib.get("flow"),
             "bit_depth": self.bit_depth,
         }
@@ -1254,11 +1300,23 @@ class Calibration:
             self.calib["viewing_layers"] = rec
             self._save()
             return rec
-        to_clear = {name: False for name, on in before.items() if on}
+        # --keep-layers (verify-only): left exactly as the user has them — never switched off, never on.
+        keep = set(self.calib.get("keep_layers") or ())
+        to_clear = {name: False for name, on in before.items() if on and name not in keep}
         # monitor/mode ride the record so a teardown outside this object (the --abort path, the
         # CLI rollback guard) can re-assert the layers without trusting argparse defaults.
         rec = {"captured": True, "supported": True, "before": before, "disabled": sorted(to_clear),
                "restored": False, "monitor": self.monitor, "mode": self.mode}
+        if keep:
+            rec["kept"] = {n: bool(before.get(n)) for n in sorted(keep)}
+            off = [n for n in sorted(keep) if not before.get(n)]
+            if off:
+                # Asked to keep a layer the user has OFF: it stays off (the run measures the user's
+                # state) — a fact for the LLM, who may want it on for the question being asked.
+                rec["kept_but_off"] = off
+                self.runlog.note("hardware-readiness",
+                                 f"--keep-layers {', '.join(off)}: OFF in the user's stack — kept OFF",
+                                 kept_but_off=off)
         if to_clear:
             try:
                 res = self.controller.set_layers(self.monitor, self.mode, **to_clear)
@@ -1289,7 +1347,8 @@ class Calibration:
         rec = self.calib.get("viewing_layers")
         if not isinstance(rec, dict) or not rec.get("captured") or rec.get("restored"):
             return rec
-        want = {name: bool(on) for name, on in (rec.get("before") or {}).items() if on}
+        kept = set(rec.get("kept") or ())       # --keep-layers: never changed by the run — never re-set
+        want = {name: bool(on) for name, on in (rec.get("before") or {}).items() if on and name not in kept}
         if not want:
             rec["restored"] = True
             rec["restore_note"] = "nothing was on"
@@ -1425,12 +1484,21 @@ class Calibration:
         if white is not None and white > 0:
             return white, "refined_this_run"
         calib = getattr(self, "calib", None) or {}
-        if calib.get("flow") in ("3dlut-only", "verify-only") and self.mode != "HDR":
+        if self._sdr_in_hdr():
+            # SDR content on an HDR display: Windows composites it at the live SDR white level — the
+            # white the stack delivers to SDR content (preflight's DisplayConfig read; None = unknown).
+            white = _as_float_local((calib.get("sdr_white_level") or {}).get("nits"))
+            return (white, "windows_sdr_white_level") if white is not None and white > 0 else (None, "nominal")
+        if calib.get("flow") in ("3dlut-only", "verify-only") and self.content_mode != "HDR":
             stack = (self._installed_stack_evidence() if capture else calib.get("installed_stack")) or {}
             white = _as_float_local(stack.get("sdr_white_nits"))
             if white is not None and white > 0:
                 return white, "installed_stack"
         return None, "nominal"
+
+    def _sdr_in_hdr(self) -> bool:
+        """SDR content measured on a display in HDR (verify-only ``--content-mode SDR``)."""
+        return getattr(self, "content_mode", None) == "SDR" and self.mode == "HDR"
 
     def _cube_target_white_nits(self) -> Optional[float]:
         """The SDR white the 3D LUT this run leaves installed was BUILT for: this run's build
@@ -1454,7 +1522,7 @@ class Calibration:
 
         Production use is HDR/wide-gamut only. The SDR clamp experiment was CV-gated worse, so SDR
         returns ``None`` and stays on the plain sRGB scoring/build target."""
-        if self.mode != "HDR":
+        if self.content_mode != "HDR":
             return None
         # Prefer THIS run's freshly-measured native primaries (raw-stage channel model, persisted
         # to mhc_params at build) over the prior DIP — same session, current thermal state, and no
@@ -2361,7 +2429,7 @@ class Calibration:
     def _target_colorspace(self) -> Optional[str]:
         """The target colour space for this run, resilient to preflight running BEFORE
         resolve-target sets ``target_name`` (fall back to the display's per-mode target)."""
-        name = self.target_name or self.display.target_name(self.mode)
+        name = self.target_name or self.display.target_name(self.content_mode)
         if not name:
             return None
         try:
@@ -2431,7 +2499,7 @@ class Calibration:
         contrast = (white / black) if (black and black > 0) else None
         colorspace = self._target_colorspace()
         try:
-            spec = self.profile.target(self.target_name or self.display.target_name(self.mode))
+            spec = self.profile.target(self.target_name or self.display.target_name(self.content_mode))
             is_hdr = spec.is_hdr
             # HDR target = the resolved MAX-SUSTAINED peak (already clamped to the native ceiling),
             # NOT the profile's viewing peak_luminance_nits (owner 2026-06-24, Task C — that moved to
@@ -2440,7 +2508,7 @@ class Calibration:
             # the OSD-set white luminance.
             target_nits = self._hdr_target().peak_nits if is_hdr else spec.luminance_nits
         except (KeyError, AttributeError, ValueError):
-            target_nits, is_hdr = None, (self.mode == "HDR")
+            target_nits, is_hdr = None, (self.content_mode == "HDR")
         tell: dict[str, Any] = {"checked": True, "native_white_nits": round(white, 2),
                                 "native_black_nits": (round(black, 5) if black is not None else None),
                                 "contrast": (round(contrast) if contrast else None),
@@ -2522,6 +2590,7 @@ class Calibration:
             patch_window = self._patch_window_guard()
             if patch_window.get("warning"):
                 self.ctx.log(patch_window["warning"])
+            sdr_white_level = self._probe_sdr_white_level(patch_window) if self._sdr_in_hdr() else None
             if patch_window.get("mode_warning"):
                 self.ctx.log(patch_window["mode_warning"])
             # LIVE link format (bpc + encoding) vs --bit-depth and the profile's panel.bit_depth —
@@ -2613,6 +2682,9 @@ class Calibration:
                       "dip": dip_status,
                       "store_health": store_health,
                       "backup": backup}
+            if self._sdr_in_hdr():
+                digest["content_mode"] = self.content_mode
+                digest["sdr_white_level"] = sdr_white_level
             return StageOutcome("preflight", "done", digest=digest,
                                 data={"stale": staleness.stale, "mapping_ok": mapping_ok})
 
@@ -2798,26 +2870,28 @@ class Calibration:
         would otherwise run an incoherent hybrid (HDR refine + SDR gamut clamp, a stepper showing
         the other mode's stages) with nothing surfacing why. Reject it loudly at resolve time —
         the two predicates are then provably interchangeable for the rest of the run."""
-        if spec.is_hdr != (self.mode == "HDR"):
+        if spec.is_hdr != (self.content_mode == "HDR"):
+            cm = self.content_mode
             raise CalibrationAborted(StageOutcome(
                 stage, "aborted",
                 digest={"message": (
                     f"target {target!r} is a {'PQ/HDR' if spec.is_hdr else 'power-law/SDR'} target "
-                    f"but the run mode is {self.mode} — the profile maps display {self.monitor}'s "
-                    f"{self.mode} slot ({'hdr_target' if self.mode == 'HDR' else 'sdr_target'}) to a "
+                    f"but the run's content mode is {cm} — the profile maps display {self.monitor}'s "
+                    f"{cm} slot ({'hdr_target' if cm == 'HDR' else 'sdr_target'}) to a "
                     f"mismatched target. Fix the profile before running."),
-                    "target": target, "target_is_hdr": spec.is_hdr, "run_mode": self.mode}))
+                    "target": target, "target_is_hdr": spec.is_hdr, "run_mode": self.mode,
+                    "content_mode": cm}))
 
     def stage_resolve_target(self) -> StageOutcome:
         # This stage owns its own adjudication (the plan seam) and so bypasses _stage —
         # announce it on the spine directly so the dashboard phase header still tracks it.
         self.runlog.set_phase("resolve-target")
         self.runlog.stage_start("resolve-target")
-        target = self.display.target_name(self.mode)
+        target = self.display.target_name(self.content_mode)
         if not target:
             raise CalibrationAborted(StageOutcome(
                 "resolve-target", "aborted",
-                digest={"message": f"display {self.monitor} has no {self.mode} target configured"}))
+                digest={"message": f"display {self.monitor} has no {self.content_mode} target configured"}))
         spec = self.profile.target(target)
         self._reject_mode_target_mismatch("resolve-target", target, spec)
         self.target_name = target
@@ -3865,6 +3939,7 @@ class Calibration:
                 ),
                 options=("ready", "abort"), recommendation="ready",
                 digest={"required": True, "monitor": self.monitor, "mode": self.mode,
+                        "content_mode": self.content_mode,
                         "bit_depth": self.bit_depth, "dogegen_required": True,
                         "neutral_audit": audit,
                         "hook_routing_pending": self._hook_routing_pending(),
@@ -6680,6 +6755,11 @@ class Calibration:
                 kept = ((self.calib["stages"].get("reapply-3dlut") or {}).get("digest") or {}).get("cube_white")
                 if kept:
                     digest["cube_white"] = kept
+                if self._sdr_in_hdr():
+                    try:
+                        digest["sdr_in_hdr"] = self._sdr_in_hdr_evidence(samples, lum)
+                    except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
+                        digest["sdr_in_hdr"] = {"error": f"{type(exc).__name__}: {exc}"}
             if spec.is_hdr and hasattr(reachable, "full_primaries"):
                 # Level edge primary (D4): the full-drive view, the reclassified patches, the edge's falsification
                 # on these reads, and whether the verdict depends on the edge — evidence only, no new pause.
@@ -7051,6 +7131,7 @@ class Calibration:
 
         payload = {
             "flow": self.calib.get("flow"), "monitor": self.monitor, "mode": self.mode,
+            "content_mode": self.content_mode,
             "display": self.display.name, "target": self.target_name, "date": self.run_date.isoformat(),
             "whitepoint": sd("whitepoint") or None,
             "mhc": sd("build-install-mhc") or sd("install-mhc") or None,
@@ -7148,6 +7229,14 @@ class Calibration:
                 status="aborted", stages=list(self.calib["stages"].keys()), results_dir=None,
                 report_path=None, digest={"aborted_at": "resume-args", "message": msg,
                                           "conflicts": self._arg_conflicts})
+        bad = self._content_mode_problem(flow)
+        if bad:
+            self.runlog.anomaly("run", kind="content_mode", message=bad)
+            self.runlog.run_done("aborted", aborted_at="run-args", message=bad)
+            return CalibrationResult(
+                flow=flow, monitor=self.monitor, mode=self.mode, target=self.target_name,
+                status="aborted", stages=list(self.calib["stages"].keys()), results_dir=None,
+                report_path=None, digest={"aborted_at": "run-args", "message": bad})
         self._publish_active_pointer()   # let the dashboard find this run (and the next)
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
         if self._preheat_change:
@@ -8262,7 +8351,7 @@ class Calibration:
         when the registry record is trusted for this stack (the pipe's profile cross-checks); else
         ``_reachable_primaries`` keeps its DIP fallback. The seeded ``mhc_params`` carry only the
         primaries + ``seeded_from`` and are NEVER installed. Memoised (first write wins)."""
-        if (self.mode != "HDR" or self._state.get("mhc_params") or self.calib.get("verify_patches_from")
+        if (self.content_mode != "HDR" or self._state.get("mhc_params") or self.calib.get("verify_patches_from")
                 or self.calib.get("verify_basis_checked")):
             return
         # Decided ONCE per run (before the plan): a registry edited between resumes must not
@@ -8290,7 +8379,7 @@ class Calibration:
 
     def _scoring_gamut_source(self) -> Optional[str]:
         """Where the verify's reachable gamut (the OOG clamp) came from — evidence for the LLM."""
-        if self.mode != "HDR":
+        if self.content_mode != "HDR":
             return None
         seeded = (self._state.get("mhc_params") or {}).get("seeded_from") or {}
         if seeded.get("run"):
@@ -8309,6 +8398,67 @@ class Calibration:
             return None
         return rec.get("data") or None
 
+    def _content_mode_problem(self, flow: str) -> Optional[str]:
+        """Mechanical coherence of ``--content-mode`` / ``--keep-layers`` (a refusal, not a judgment):
+        only verify-only measures content of another mode than the display's, only SDR-on-HDR exists
+        (Windows composites SDR into HDR; the reverse is not a thing), and only verify-only may keep a
+        viewing layer on (a calibration must measure the stack it builds without the user's tweaks)."""
+        if self.content_mode != self.mode:
+            if flow != "verify-only":
+                return (f"--content-mode {self.content_mode} on a {self.mode} display belongs to --flow "
+                        f"verify-only (this run is {flow})")
+            if not self._sdr_in_hdr():
+                return (f"--content-mode {self.content_mode} on a {self.mode} display: only SDR content on an "
+                        "HDR display exists (Windows composites SDR into HDR)")
+        if self.calib.get("keep_layers") and flow != "verify-only":
+            return ("--keep-layers belongs to --flow verify-only (a calibration measures without the "
+                    "viewing layers)")
+        return None
+
+    def _probe_sdr_white_level(self, patch_window: Mapping[str, Any]) -> dict[str, Any]:
+        """Preflight, SDR content on an HDR display: Windows' live SDR white level for the target monitor
+        (memoised in ``calib['sdr_white_level']``, first read wins) — the white SDR content is composited
+        at, the calibrated white this verify is judged against."""
+        rec = self.calib.get("sdr_white_level")
+        if isinstance(rec, dict) and rec.get("nits"):
+            return rec
+        if self.sdr_white_probe is None:
+            rec = {"nits": None, "source": None,
+                   "reason": "no SDR-white-level reader wired (sim / tests): the nominal white stands"}
+        else:
+            try:
+                rec = dict(self.sdr_white_probe(patch_window.get("target_rect")))
+            except Exception as exc:  # noqa: BLE001 - evidence; the nominal white stands
+                rec = {"nits": None, "source": None, "reason": f"{type(exc).__name__}: {exc}"}
+        self.calib["sdr_white_level"] = rec
+        self._save()
+        self.runlog.note("preflight", f"SDR content on an HDR display: Windows SDR white level "
+                                      f"{rec.get('nits')} nit" + (f" ({rec['reason']})" if rec.get("reason") else ""),
+                         sdr_white_level={k: rec.get(k) for k in ("nits", "source", "reason")})
+        return rec
+
+    def _sdr_in_hdr_evidence(self, samples: Sequence[Any], scored_white: float) -> dict[str, Any]:
+        """Verify evidence for SDR content on an HDR display (no verdict): the SDR white Windows declares
+        vs the measured one, Desktop Gamma's state for the run, and which tone model the verify greys
+        track (``sdr_in_hdr.grey_model_fit``: pure 2.2 / piecewise sRGB / 2.4 / Desktop Gamma's 80-nit
+        bake at the declared white)."""
+        from . import sdr_in_hdr
+        declared = _as_float_local((self.calib.get("sdr_white_level") or {}).get("nits"))
+        layers = self.calib.get("viewing_layers") or {}
+        before = layers.get("before") or {}
+        dg_on = bool(before.get("desktop_gamma")) and "desktop_gamma" not in (layers.get("disabled") or ())
+        greys = [(float(s.rgb[0]), float(s.xyz[1])) for s in samples
+                 if max(s.rgb) - min(s.rgb) < 1e-6 and math.isfinite(float(s.xyz[1]))]
+        fit = sdr_in_hdr.grey_model_fit(greys, white_y=float(scored_white),
+                                        declared_white=declared if dg_on else None)
+        return {"declared_sdr_white_nits": declared,
+                "declared_source": (self.calib.get("sdr_white_level") or {}).get("source"),
+                "measured_white_nits": round(float(scored_white), 4),
+                "measured_over_declared": (round(float(scored_white) / declared, 4) if declared else None),
+                "desktop_gamma_on": dg_on, "desktop_gamma_white_nits_assumed": sdr_in_hdr.DG_WHITE_NITS,
+                "viewing_layers_on": sorted(n for n, v in before.items() if v and n not in (layers.get("disabled") or ())),
+                "grey_model_fit": fit}
+
     def _verify_only_patches(self) -> list[tuple[int, int, int]]:
         """The source run's exact verify list (``--verify-patches-from``), else the standard
         gamut-aware verify preset (the same QC set every flow verifies with)."""
@@ -8323,7 +8473,7 @@ class Calibration:
         (``mhc_params`` → ``_reachable_primaries``). Run-record memos only, first write wins (a
         resume never re-adopts); ``mhc_params`` is tagged ``seeded_from`` and is NEVER installed."""
         adopted: dict[str, Any] = {}
-        if self.mode == "HDR":
+        if self.content_mode == "HDR":
             params = basis.get("mhc_params")
             if isinstance(params, dict) and params and not self._state.get("mhc_params"):
                 seeded = json.loads(json.dumps(params))
@@ -8386,12 +8536,13 @@ class Calibration:
             here = ((self.calib["stages"].get("preflight") or {}).get("digest") or {})
             stack = self._installed_stack_evidence() or {}
             mism = verify_only.source_mismatches(
-                source, mode=self.mode, bit_depth=self.bit_depth,
+                source, mode=self.content_mode, bit_depth=self.bit_depth,
                 display=here.get("display") or self.display.name,
                 hardware_id=(here.get("monitor_map") or {}).get("hardware_id"),
-                target=self.display.target_name(self.mode),
+                target=self.display.target_name(self.content_mode),
                 correction_file=(here.get("correction") or {}).get("file"),
-                pin_nits=stack.get("pin_nits") if self.mode == "HDR" else None)
+                pin_nits=stack.get("pin_nits") if self.content_mode == "HDR" else None,
+                display_mode=self.mode)
             if not source.get("verify"):
                 mism["soft"].append("the source run's verify was never scored (no recorded numbers): "
                                     "its patch list is reused but there is nothing to compare against")
@@ -8650,12 +8801,12 @@ class Calibration:
             src_rows = None
         now_rows = [{"rgb": list(m.rgb), "de2000": m.de2000, "gamut_clamped": m.gamut_clamped}
                     for m in metrics]
-        basis_now = {"peak_nits": self._hdr_target().peak_nits if self.mode == "HDR" else None,
+        basis_now = {"peak_nits": self._hdr_target().peak_nits if self.content_mode == "HDR" else None,
                      "oog_mapping": self._oog_mapping()}
         vs = verify_only.compare_verify(digest, src_verify, now_patch_rows=now_rows,
                                         source_patch_rows=src_rows if isinstance(src_rows, list) else None,
                                         basis_now=basis_now, basis_source=source.get("basis"))
-        if self.mode == "HDR" and (source.get("basis") or {}).get("gamut_from_run") is False:
+        if self.content_mode == "HDR" and (source.get("basis") or {}).get("gamut_from_run") is False:
             # The source run built no MHC: its verify clamped against ITS day's DIP, which cannot be
             # reproduced — the core / limits / clamped split may be re-partitioned here.
             comp = vs.setdefault("comparability", {"like_for_like": True, "differences": []})
@@ -9117,7 +9268,8 @@ def _reassert_viewing_layers(controller: Any, calib_state: Optional[dict[str, An
     rec = calib_state.get("viewing_layers")
     if not isinstance(rec, dict) or not rec.get("captured"):
         return None
-    want = {name: True for name, on in (rec.get("before") or {}).items() if on}
+    kept = set(rec.get("kept") or ())           # --keep-layers: never changed by the run — never re-set
+    want = {name: True for name, on in (rec.get("before") or {}).items() if on and name not in kept}
     if not want:
         return {"reasserted": [], "note": "nothing was on"}
     neutral = calib_state.get("neutral_profile") if isinstance(calib_state.get("neutral_profile"), dict) else {}
@@ -9563,6 +9715,8 @@ def run_calibration(
     verify_patches_from: Optional[Path] = None,
     preheat: Optional[str] = None,
     present_stall: Optional[str] = None,
+    content_mode: Optional[str] = None,
+    keep_layers: Optional[Sequence[str]] = None,
 ) -> CalibrationResult:
     """Build a :class:`Calibration` and run a flow. The default adjudicator is
     :class:`AutoAdjudicator` (autonomous). Pass a :class:`MappingAdjudicator` for the
@@ -9578,7 +9732,7 @@ def run_calibration(
         require_hardware_readiness=require_hardware_readiness,
         mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run,
         verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat,
-        present_stall=present_stall)
+        present_stall=present_stall, content_mode=content_mode, keep_layers=keep_layers)
     return calib.run(flow)
 
 
@@ -9655,6 +9809,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "off = an LLM decision for a drive sweep whose distinct commands legitimately read "
                              "identical XYZ (e.g. minor channels the MHC clips to zero). Persisted in the run "
                              "record; each measure digest names it")
+    parser.add_argument("--content-mode", type=str.upper, choices=("SDR", "HDR"), default=None, dest="content_mode",
+                        help="verify-only: the mode of the CONTENT when it differs from the display's --mode. "
+                             "--mode HDR --content-mode SDR measures SDR content (8-bit codes, dogegen mode 8, the "
+                             "SDR Rec.709 / gamma target) on a display in HDR — composited by Windows at its SDR "
+                             "white level, through the installed HDR stack. Persisted in the run record")
+    parser.add_argument("--keep-layers", default=None, dest="keep_layers", metavar="LIST",
+                        help="verify-only: comma list of viewing layers left exactly as the user has them for the "
+                             "run (e.g. desktop_gamma); every other layer is off for the run and restored after. "
+                             "Persisted in the run record")
     parser.add_argument("--profile", type=Path, default=None)
     parser.add_argument("--bit-depth", type=int, default=None, dest="bit_depth")
 
@@ -9965,11 +10128,13 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     if args.preview_patches:
         # Decide the time/size BEFORE committing: print the per-stage patch counts for the flow
         # and exit. Pure offline sizing — no run folder, controller, dogegen, or meter.
-        mode = normalize_mode(args.mode)
+        mode = normalize_mode(args.content_mode or args.mode)      # the CONTENT picks target + depth
         bd = args.bit_depth if args.bit_depth is not None else (10 if mode == "HDR" else 8)
         target = profile.display_for(args.monitor).target_name(mode)
-        out: dict[str, Any] = {"flow": args.flow, "monitor": args.monitor, "mode": mode,
+        out: dict[str, Any] = {"flow": args.flow, "monitor": args.monitor, "mode": normalize_mode(args.mode),
                                "patch_sizes": asdict(patch_sizes)}
+        if args.content_mode:
+            out["content_mode"] = mode
         out["patch_plan"] = (flow_patch_counts(args.flow, patch_sizes,
                                                profile.transfer_for(target, bit_depth=bd))
                              if target else {"note": f"no {mode} target for monitor {args.monitor}"})
@@ -10009,6 +10174,17 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # so main only needs the resolved values to build the live stack — discard the conflict list.
     eff_mode, _eff_bd, _ = resolve_run_spec(ctx, state, mode=args.mode, bit_depth=args.bit_depth)
     eff_flow, _ = resolve_run_flow(state, args.flow)
+    # The CONTENT mode drives dogegen's mode + the patch depth (the display mode keeps the meter's
+    # correction slot and the DIP); the persisted run record wins on a resume, as for mode.
+    eff_content, _, _ = resolve_content_mode(state.get("calib") or {}, args.content_mode, eff_mode)
+    if (args.content_mode or args.keep_layers) and eff_flow != "verify-only":
+        print(json.dumps({"error": f"--content-mode / --keep-layers belong to --flow verify-only (this run's flow "
+                                   f"is {eff_flow})"}))
+        return 2
+    if eff_content != eff_mode and not (eff_content == "SDR" and eff_mode == "HDR"):
+        print(json.dumps({"error": f"--content-mode {eff_content} on a {eff_mode} display: only SDR content on an "
+                                   "HDR display exists (Windows composites SDR into HDR)"}))
+        return 2
     if (args.verify_cube is not None or args.verify_patches_from is not None) and eff_flow != "verify-only":
         print(json.dumps({"error": (f"--verify-cube / --verify-patches-from belong to --flow verify-only "
                                     f"(this run's flow is {eff_flow}) — nothing else would use them")}))
@@ -10054,6 +10230,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     from .dogegen import DogegenPatchDisplay
     from .measure_rgbw import resolve_spotread_instrument_port
     from .link_format import probe_link_formats
+    from .sdr_in_hdr import probe_sdr_white as _sdr_white_probe
 
     controller = CalibrationController.connect()
 
@@ -10083,7 +10260,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # ("mode 10"), which needs the TPG window borderless-fullscreened to render accurately.
     # Resolved against the persisted run spec (see above); when nothing is persisted/explicit
     # (_eff_bd is None) keep main()'s long-standing live default: 10-bit HDR, 8-bit SDR.
-    bit_depth = _eff_bd if _eff_bd is not None else (10 if eff_mode == "HDR" else 8)
+    bit_depth = _eff_bd if _eff_bd is not None else (10 if eff_content == "HDR" else 8)
     presenter = None
     persistent_meter = None
     measure: Optional[MeasureFn] = None
@@ -10120,6 +10297,23 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             host, _, srv_port = args.dogegen_server.partition(":")
             presenter = SocketPresenter(host or "127.0.0.1", int(srv_port or 28930),
                                         settle_seconds=presenter_settle)
+            # The daemon's mode is set out of band: a daemon in another mode / depth would show these
+            # codes as another signal (an HDR daemon renders SDR 8-bit codes as PQ) — refuse, mechanically.
+            try:
+                daemon_mode = presenter.query_mode()
+            except Exception as exc:  # noqa: BLE001 - an unreachable daemon fails at the first patch anyway
+                daemon_mode = None
+                ctx.log(f"dogegen daemon mode query failed ({type(exc).__name__}: {exc})")
+            if daemon_mode is None:
+                ctx.log("dogegen daemon did not report its mode (an older daemon?) — make sure it runs "
+                        f"--mode {eff_content} --bit-depth {bit_depth}")
+            elif (daemon_mode["mode"], daemon_mode["bit_depth"]) != (eff_content, int(bit_depth)):
+                presenter.close()
+                print(json.dumps({"error": (
+                    f"the dogegen daemon runs {daemon_mode['mode']} {daemon_mode['bit_depth']}-bit but this run "
+                    f"presents {eff_content} {bit_depth}-bit codes — restart it: python -m dlc.dogegen_server "
+                    f"--mode {eff_content} --bit-depth {bit_depth} --monitor {args.monitor}")}))
+                return 2
         else:
             dogegen_path = profile.paths.get("dogegen")
             if not dogegen_path:
@@ -10134,7 +10328,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                     (controller.query_monitors() or {}).get("monitors"), args.monitor)
             except Exception:  # noqa: BLE001 - advisory placement; never block the run
                 place_rect = None
-            presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), eff_mode,
+            presenter = DogegenPresenter(DogegenPatchDisplay(Path(dogegen_path), eff_content,
                                                              bit_depth=bit_depth),
                                          settle_seconds=presenter_settle, place_rect=place_rect)
         # The active correction comes from the store first (a freshly probe-matched .ccmx)
@@ -10261,6 +10455,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             preheat=args.preheat,
                             present_stall=args.present_stall,
                             refine_cube=args.refine_cube,
+                            content_mode=args.content_mode,
+                            keep_layers=([n for n in str(args.keep_layers).split(",") if n.strip()]
+                                         if args.keep_layers else None),
+                            sdr_white_probe=_sdr_white_probe,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
