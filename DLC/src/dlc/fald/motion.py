@@ -67,6 +67,7 @@ class MovingShape:
     vy: float = 0.0
     blink: int = 0
     blink_phase: int = 0
+    angle: float = 0.0       # "bar": a ``w`` (thickness) × ``h`` (length) box rotated by ``angle`` degrees (simulator only so far)
 
     def visible(self, i: int) -> bool:
         return self.blink <= 0 or ((int(i) + self.blink_phase) // self.blink) % 2 == 0
@@ -76,8 +77,31 @@ class MovingShape:
 
     def bbox(self, t: float) -> tuple[float, float, float, float]:
         cx, cy = self.centre(t)
-        hw, hh = (self.w / 2.0, self.h / 2.0) if self.kind == "rect" else (self.r + 0.5, self.r + 0.5)
+        if self.kind == "rect":
+            hw, hh = self.w / 2.0, self.h / 2.0
+        elif self.kind == "bar":
+            c, sn = abs(math.cos(math.radians(self.angle))), abs(math.sin(math.radians(self.angle)))
+            hw = 0.5 * (self.h * c + self.w * sn) + 0.5
+            hh = 0.5 * (self.h * sn + self.w * c) + 0.5
+        else:
+            hw = hh = self.r + 0.5
         return cx - hw, cy - hh, cx + hw, cy + hh
+
+    def sdf(self, t: float, xx: np.ndarray, yy: np.ndarray) -> np.ndarray:
+        """Signed distance (px) from the shape's edge at points (xx, yy): < 0 inside. rect / bar = the exact box SDF (in the
+        bar's own frame), disc = |p − c| − r."""
+        cx, cy = self.centre(t)
+        dx, dy = xx - cx, yy - cy
+        if self.kind == "disc":
+            return np.hypot(dx, dy) - self.r
+        if self.kind == "bar":
+            a = math.radians(self.angle)
+            dx, dy = dx * math.cos(a) + dy * math.sin(a), -dx * math.sin(a) + dy * math.cos(a)
+            hw, hh = self.h / 2.0, self.w / 2.0            # along the length, across the thickness
+        else:
+            hw, hh = self.w / 2.0, self.h / 2.0
+        qx, qy = np.abs(dx) - hw, np.abs(dy) - hh
+        return np.hypot(np.maximum(qx, 0.0), np.maximum(qy, 0.0)) + np.minimum(np.maximum(qx, qy), 0.0)
 
 
 @dataclass(frozen=True)
@@ -195,11 +219,20 @@ def coverage_disc(s: MovingShape, t: float, x0: int, y0: int, nx: int, ny: int) 
     return np.clip(s.r - np.hypot(xx - cx, yy - cy) + 0.5, 0.0, 1.0)
 
 
+def coverage_bar(s: MovingShape, t: float, x0: int, y0: int, nx: int, ny: int) -> np.ndarray:
+    """(ny, nx) coverage of a rotated bar: clamp(0.5 − SDF at the pixel centre, 0, 1) (the disc's anti-aliasing rule)."""
+    yy = np.arange(y0, y0 + ny, dtype=np.float64)[:, None] + 0.5
+    xx = np.arange(x0, x0 + nx, dtype=np.float64)[None, :] + 0.5
+    return np.clip(0.5 - s.sdf(t, xx, yy), 0.0, 1.0)
+
+
 def coverage(s: MovingShape, t: float, x0: int, y0: int, nx: int, ny: int) -> np.ndarray:
     if s.kind == "rect":
         return coverage_rect(s, t, x0, y0, nx, ny)
     if s.kind == "disc":
         return coverage_disc(s, t, x0, y0, nx, ny)
+    if s.kind == "bar":
+        return coverage_bar(s, t, x0, y0, nx, ny)
     raise ValueError(f"unknown shape kind {s.kind!r}")
 
 
@@ -332,6 +365,8 @@ def object_mask(model: FaldModel, scene: Scene, i: int, inset_px: float = 6.0) -
             a, b, c, d = s.bbox(t)
             ins = min(inset_px, 0.25 * min(s.w, s.h))
             mi = (xx >= a + ins) & (xx <= c - ins) & (yy >= b + ins) & (yy <= d - ins)
+        elif s.kind == "bar":
+            mi = s.sdf(t, xx, yy) <= -min(inset_px, 0.25 * min(s.w, s.h))
         else:
             mi = np.hypot(xx - cx, yy - cy) <= s.r - min(inset_px, 0.25 * s.r)
         if not mi.any():
@@ -357,9 +392,12 @@ def static_mask(model: FaldModel, scene: Scene, margin_px: float = 10.0, near_zo
     for i in range(scene.frames):
         t = scene.motion_time(i)
         for s in scene.shapes:
-            a, b, c, d = s.bbox(t)
-            dx = np.maximum(np.maximum(a - xx, xx - c), 0.0); dy = np.maximum(np.maximum(b - yy, yy - d), 0.0)
-            dist = np.hypot(dx, dy)
+            if s.kind == "bar":                                   # the true diagonal, not its bounding box
+                dist = np.maximum(s.sdf(t, xx, yy), 0.0)
+            else:
+                a, b, c, d = s.bbox(t)
+                dx = np.maximum(np.maximum(a - xx, xx - c), 0.0); dy = np.maximum(np.maximum(b - yy, yy - d), 0.0)
+                dist = np.hypot(dx, dy)
             touched |= dist <= pad
             near |= dist <= reach
     for x0, y0, aw, ah, _ in scene.aid_rects(0):   # aids change on purpose: never score them as static background

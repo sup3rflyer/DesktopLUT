@@ -52,7 +52,7 @@ def scene_text(scene: Scene) -> str:
         elif s.kind == "disc":
             lines.append("disc " + " ".join(f(v) for v in (s.x, s.y, s.r, s.vx, s.vy, *s.nits)) + blink)
         else:
-            raise ValueError(f"unknown shape kind {s.kind!r}")
+            raise ValueError(f"shape kind {s.kind!r} is not supported by the TPG yet")
     if scene.sync:
         x0, y0, w, h, lo, hi = scene.sync
         lines.append("sync " + " ".join(f(v) for v in (x0, y0, w, h, lo, hi)))

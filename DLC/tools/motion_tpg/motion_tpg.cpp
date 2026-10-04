@@ -41,6 +41,7 @@
 #include <d3dcompiler.h>
 #include <avrt.h>
 #include <timeapi.h>
+#include <dwmapi.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -493,6 +494,13 @@ int main(int argc, char** argv) {
 
     // frame-statistics samples (PresentCount -> PresentRefreshCount), polled at every vblank and after every present;
     // written to <log>.stats.csv when the present rows are flushed
+    // DWM composition timing at every vblank wake (stage-3 counter bench: is DWM_TIMING_INFO.cRefresh the same numbering as
+    // DXGI PresentRefreshCount, and are qpcVBlank the real vblank instants?) -> <log>.dwm.csv
+    FILE* dwmf = nullptr;
+    if (fopen_s(&dwmf, (a.log + ".dwm.csv").c_str(), "w") != 0 || !dwmf) { reply("fatal cannot open the dwm log"); return 2; }
+    fprintf(dwmf, "qpc,vbn,ok,c_refresh,qpc_vblank,c_frame,qpc_compose,c_frames_displayed,qpc_refresh_period\n");
+    struct DwmRow { long long qpc, vbn; int ok; unsigned long long cRefresh, qpcVBlank, cFrame, qpcCompose, cDisplayed, period; };
+    std::vector<DwmRow> dwmRows; dwmRows.reserve(1 << 16);
     std::string statsPath = a.log + ".stats.csv";
     FILE* statf = nullptr;
     if (fopen_s(&statf, statsPath.c_str(), "w") != 0 || !statf) { reply("fatal cannot open the stats log"); return 2; }
@@ -527,6 +535,10 @@ int main(int argc, char** argv) {
             vbN += steps;
         }
         lastVbq = t.QuadPart;
+        DWM_TIMING_INFO ti{}; ti.cbSize = sizeof ti;
+        const int ok = SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) ? 1 : 0;
+        dwmRows.push_back({t.QuadPart, vbN, ok, ti.cRefresh, ti.qpcVBlank, ti.cFrame, ti.qpcCompose, ti.cFramesDisplayed,
+                           ti.qpcRefreshPeriod});
     };
     auto pollStats = [&]() {
         DXGI_FRAME_STATISTICS st{};
@@ -546,6 +558,11 @@ int main(int argc, char** argv) {
         for (const StatRow& r : stats) fprintf(statf, "%lld,%u,%u,%u,%lld\n", r.qpc, r.pc, r.pr, r.sr, r.sq);
         fflush(statf);
         stats.clear();
+        for (const DwmRow& r : dwmRows)
+            fprintf(dwmf, "%lld,%lld,%d,%llu,%llu,%llu,%llu,%llu,%llu\n", r.qpc, r.vbn, r.ok, r.cRefresh, r.qpcVBlank, r.cFrame,
+                    r.qpcCompose, r.cDisplayed, r.period);
+        fflush(dwmf);
+        dwmRows.clear();
     };
 
     bool running = true;
@@ -681,6 +698,7 @@ int main(int argc, char** argv) {
     flushRows(); flushStats();
     fclose(logf);
     fclose(statf);
+    fclose(dwmf);
     if (mm) AvRevertMmThreadCharacteristics(mm);
     timeEndPeriod(1);
     DestroyWindow(g_hwnd);
