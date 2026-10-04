@@ -83,9 +83,40 @@ class Adb:
                 return int(ln.split(":")[1])
         return None
 
+    def wlan_ip(self) -> str | None:
+        """The phone's Wi-Fi IPv4 address (needed by the Blackmagic REST server), or None."""
+        for ln in self.shell("ip -4 addr show wlan0", check=False).splitlines():
+            ln = ln.strip()
+            if ln.startswith("inet "):
+                return ln.split()[1].split("/")[0]
+        return None
+
+    def focus_window(self) -> str:
+        out = self.shell("dumpsys window | grep mCurrentFocus", check=False).strip()
+        return out.split("mCurrentFocus=")[-1] if out else ""
+
     # -- input ------------------------------------------------------------------------------------------
     def wake(self) -> None:
         self.shell("input keyevent KEYCODE_WAKEUP")
+
+    def unlock(self, tries: int = 3) -> bool:
+        """Wake the screen and dismiss a swipe-lock or Samsung's 'Accidental touch protection' (proximity sensor
+        covered - typical when the phone sits on a mount). Returns True when an app window has focus.
+        A secure lock (PIN) is not handled: that needs the owner."""
+        guards = ("UnintentionalLcdOn", "Keyguard", "NotificationShade", "StatusBar", "Bouncer")
+        for _ in range(tries):
+            self.wake()
+            time.sleep(0.6)
+            focus = self.focus_window()
+            if focus and not any(g in focus for g in guards):
+                return True
+            self.shell("wm dismiss-keyguard", check=False)
+            self.swipe(540, 1476, 540, 700, 450)   # protection screen: drag the ring up
+            time.sleep(0.8)
+            self.swipe(540, 1900, 540, 500, 350)   # plain swipe lock
+            time.sleep(0.8)
+        focus = self.focus_window()
+        return bool(focus) and not any(g in focus for g in guards)
 
     def key(self, name: str) -> None:
         self.shell(f"input keyevent {name}")

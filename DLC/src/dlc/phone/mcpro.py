@@ -46,6 +46,7 @@ class UiNode:
     bounds: tuple[int, int, int, int]
     clickable: bool = False
     selected: bool = False
+    desc: str = ""                       # content-description (Compose UIs label controls this way)
 
     @property
     def center(self) -> tuple[int, int]:
@@ -69,7 +70,8 @@ def parse_ui_dump(xml_text: str) -> list[UiNode]:
             continue
         out.append(UiNode(id=a.get("resource-id", "").replace(_P, ""), text=a.get("text", ""),
                           cls=a.get("class", "").rsplit(".", 1)[-1], bounds=tuple(nums),
-                          clickable=a.get("clickable") == "true", selected=a.get("selected") == "true"))
+                          clickable=a.get("clickable") == "true", selected=a.get("selected") == "true",
+                          desc=a.get("content-desc", "")))
     return out
 
 
@@ -204,6 +206,134 @@ class Mcpro:
                              "set it in the app (Video menu > Resolution and FPS > Apply); it persists per camera")
         return st
 
+    # -- menus / settings profile ------------------------------------------------------------------------
+    def _open_menu(self, btn: str) -> list[UiNode]:
+        nodes = self.dump()
+        for other in ("more_info", "video_info", "audio_info", "wbs"):
+            n = self._find(nodes, other)
+            if n and n.selected and other != btn:
+                self.adb.tap(*n.center)
+                time.sleep(0.8)
+                nodes = self.dump()
+        n = self._find(nodes, btn)
+        if n is None:
+            raise McproError(f"menu button {btn!r} not on screen")
+        if not n.selected:
+            self.adb.tap(*n.center)
+            time.sleep(1.0)
+            nodes = self.dump()
+        return nodes
+
+    def _scroll_to(self, node_id: str, max_pages: int = 14) -> UiNode:
+        """Scroll the open menu (rows only exist in the dump while on screen) until ``node_id`` is visible."""
+        for _ in range(3):                                       # fling to the top
+            self.adb.swipe(1650, 400, 1650, 880, 250)
+            time.sleep(0.4)
+        for _ in range(max_pages):
+            n = self._find(self.dump(), node_id)
+            if n and n.on_screen and 260 < n.center[1] < 930:
+                return n
+            self.adb.swipe(1650, 800, 1650, 420, 450)
+            time.sleep(0.7)
+        raise McproError(f"{node_id!r} not found while scrolling the menu")
+
+    def export_profile(self) -> dict:
+        """Settings -> Export (system save dialog) -> pull -> decoded profile. The phone-side copy is deleted."""
+        import tempfile
+        from pathlib import Path
+
+        from .profile import load_profile
+        self.ensure_running()
+        self._open_menu("more_info")
+        self.adb.tap(*self._scroll_to("export_settings").center)
+        time.sleep(2.5)
+        nodes = self.dump()
+        name = next((n.text for n in nodes if n.id == "android:id/title" and n.cls == "EditText"), None)
+        save = self._find(nodes, "android:id/button1")
+        if not name or save is None:
+            raise McproError("export dialog not found (system file picker changed?)")
+        self.adb.tap(*save.center)
+        time.sleep(2.0)
+        self.close_menus()
+        remote = "/sdcard/Download/" + name
+        tmp = Path(tempfile.mkdtemp()) / name
+        self.adb.pull(remote, tmp)
+        self.adb.rm(remote)
+        return load_profile(tmp)
+
+    def import_profile(self, profile: dict) -> None:
+        """Push a profile, import it through the app's Import dialog (the app restarts), relaunch."""
+        import tempfile
+        from pathlib import Path
+
+        from .profile import dump_profile
+        name = f"dlc_profile_{int(time.time())}.json"
+        local = dump_profile(profile, Path(tempfile.mkdtemp()) / name)
+        remote = "/sdcard/Download/" + name
+        self.adb.push(local, remote)
+        self.adb.media_scan(remote)
+        try:
+            self.ensure_running()
+            self._open_menu("more_info")
+            self.adb.tap(*self._scroll_to("import_settings").center)
+            time.sleep(2.5)
+            search = self._find(self.dump(), "com.google.android.documentsui:id/option_menu_search")
+            if search is None:
+                raise McproError("import file picker did not open")
+            self.adb.tap(*search.center)
+            time.sleep(1.2)
+            self.adb.text(name.rsplit(".", 1)[0])
+            time.sleep(0.5)
+            self.adb.key("KEYCODE_ENTER")
+            time.sleep(2.0)
+            hit = next((n for n in self.dump() if n.id == "android:id/title" and n.text == name), None)
+            if hit is None:
+                raise McproError(f"{name} not found in the file picker")
+            self.adb.tap(*hit.center)
+            time.sleep(5.0)
+        finally:
+            self.adb.rm(remote)
+        self.adb.force_stop(PKG)
+        time.sleep(1.0)
+        self.ensure_running()
+
+    def set_mode(self, *, fps: int | None = None, size: tuple[int, int] | None = None, codec: str | None = None,
+                 bits: int | None = None, camera: str | None = None) -> McState:
+        """Switch camera / codec / bit depth / frame rate / resolution in one step via the settings profile (the
+        import applies them and flips the session between normal and constrained-high-speed). Exposure is NOT carried
+        by the import - use ``set_iso`` / ``set_shutter`` after. Skips the round trip when already in that mode."""
+        from .profile import set_pref
+        cur = self.state()
+        prof = self.export_profile()
+        m = prof["m01"]
+        cam = str(camera if camera is not None else m.get("STRING_camera", "0"))
+        changed = False
+
+        def put(key: str, val) -> None:
+            nonlocal changed
+            if m.get(key) != val:
+                set_pref(prof, key, val)
+                changed = True
+        if camera is not None:
+            put("STRING_camera", cam)
+        if codec is not None:
+            put("STRING_codec", {"h264": "avc", "h265": "hevc"}.get(codec.lower(), codec.lower()))
+        if bits is not None:
+            put("INTEGER_bits", int(bits))
+        if fps is not None:
+            put(f"INTEGER_nifps_{cam}", int(fps))
+        if size is not None:
+            put(f"INTEGER_width_{cam}", int(size[0]))
+            put(f"INTEGER_height_{cam}", int(size[1]))
+        if not changed:
+            return cur
+        self.import_profile(prof)
+        st = self.state()
+        if (fps is not None and st.fps != int(fps)) or (size and (st.width, st.height) != tuple(size)):
+            raise McproError(f"mode did not take: app shows {st.fps} fps {st.width}x{st.height}, "
+                             f"wanted {fps} fps {size or ''} (camera {cam} may not offer it)")
+        return st
+
     # -- exposure ---------------------------------------------------------------------------------------
     def ensure_manual(self) -> None:
         nodes = self.close_menus()
@@ -279,49 +409,63 @@ class Mcpro:
         return self._step_to("exposure_info", "exposure", "exposure_down", seconds, parse_shutter, tol, label="shutter")
 
     # -- recording --------------------------------------------------------------------------------------
-    def _newest(self, before: dict) -> tuple[str, int] | None:
-        now = self.adb.stat_dir(MEDIA_DIR)
-        fresh = {n: v for n, v in now.items() if n not in before and not n.endswith((".json", ".jpg"))}
-        if not fresh:
-            return None
-        name = max(fresh, key=lambda n: fresh[n][1])
-        return name, fresh[name][0]
+    def is_recording(self) -> bool:
+        """The record button (view ``video``) is *selected* exactly while a clip is being recorded. This is the only
+        reliable signal: in constrained-high-speed the app buffers to temporary storage and writes the file at stop."""
+        n = self._find(self.dump(), "video")
+        return bool(n and n.selected)
+
+    def start_recording(self) -> dict:
+        """Volume-down, then wait until the record button shows recording. Returns a token for :meth:`stop_recording`.
+        The key is a blind toggle, so a stray recording already running is refused (never double-toggle)."""
+        self.ensure_running()
+        nodes = self.close_menus()
+        v = self._find(nodes, "video")
+        if v is not None and v.selected:
+            raise McproError("a recording is already running - stop it first (python -m dlc.phone rec stop)")
+        before = sorted(self.adb.stat_dir(MEDIA_DIR))
+        self.adb.key("KEYCODE_VOLUME_DOWN")
+        for _ in range(10):
+            time.sleep(0.6)
+            if self.is_recording():
+                return dict(before=before)
+        raise McproError("recording did not start (volume keys not set to 'Recording Control'? app not in front?)")
+
+    def stop_recording(self, token: dict | None = None) -> str:
+        """Volume-down again; wait for the button to release, then for the saved file to appear and stop growing
+        (high-speed clips are written at this point, which can take a while). Returns the clip's name."""
+        before = set((token or {}).get("before", []))
+        if not self.is_recording():
+            raise McproError("no recording is running (already stopped?)")
+        self.adb.key("KEYCODE_VOLUME_DOWN")
+        for _ in range(15):
+            time.sleep(0.6)
+            if not self.is_recording():
+                break
+        else:
+            raise McproError("record button still shows recording 9 s after stop - look at the phone")
+        name, prev, stable = None, -1, 0
+        for _ in range(120):                                  # up to ~60 s for the save
+            time.sleep(0.5)
+            now = self.adb.stat_dir(MEDIA_DIR)
+            fresh = {n: v for n, v in now.items() if n not in before and n.lower().endswith((".mov", ".mp4"))}
+            if fresh:
+                name = max(fresh, key=lambda n: fresh[n][1])
+                sz = fresh[name][0]
+                stable = stable + 1 if sz == prev else 0
+                prev = sz
+                if stable >= 4:
+                    return name
+        raise McproError("no saved clip appeared in " + MEDIA_DIR if name is None else f"{name} never stopped growing")
 
     def record(self, seconds: float, *, on_recording=None) -> tuple[str, float, float]:
-        """Start (volume-down), hold ``seconds``, stop. Returns ``(remote_name, t_start, t_stop)`` host epoch seconds
-        at the two key events. ``on_recording`` (callable) runs ~1 s into the clip (camera-service snapshot etc.)."""
-        self.ensure_running()
-        self.close_menus()
-        before = self.adb.stat_dir(MEDIA_DIR)
+        """Fixed-length convenience: ``(remote_name, t_start, t_stop)`` host epoch seconds at the two key events."""
         t0 = time.time()
-        self.adb.key("KEYCODE_VOLUME_DOWN")
-        found = None
-        for _ in range(16):
-            time.sleep(0.5)
-            found = self._newest(before)
-            if found:
-                break
-        if not found:
-            raise McproError("recording did not start (volume keys not set to 'Recording Control'? app not in front?)")
-        name = found[0]
-        first_size = found[1]
-        time.sleep(1.0)
-        if self.adb.stat_dir(MEDIA_DIR).get(name, (0, 0))[0] <= first_size:
-            self.adb.key("KEYCODE_VOLUME_DOWN")  # toggle desync: don't leave it in an unknown state
-            raise McproError("recording file is not growing - key toggle desync; stopped, retry")
+        token = self.start_recording()
         if on_recording:
             on_recording()
         remaining = seconds - (time.time() - t0)
         if remaining > 0:
             time.sleep(remaining)
         t1 = time.time()
-        self.adb.key("KEYCODE_VOLUME_DOWN")
-        stable, prev = 0, -1
-        for _ in range(60):
-            time.sleep(0.5)
-            sz = self.adb.stat_dir(MEDIA_DIR).get(name, (0, 0))[0]
-            stable = stable + 1 if sz == prev else 0
-            prev = sz
-            if stable >= 4:
-                return name, t0, t1
-        raise McproError(f"{name} still growing 30 s after stop - look at the phone")
+        return self.stop_recording(token), t0, t1
