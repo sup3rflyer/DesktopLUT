@@ -11,9 +11,12 @@
 //   2. Wiring: BuildMHC2Params carries hdrMHC.dgSdrWhiteNits; RebakeHdrMhcForSdrWhite records a new level and
 //      drops cached DG variants; the INI round trip (absent key = a pre-tracking profile = 80).
 //   3. The DisplayConfig level -> nits conversion.
-//   4. The REAL overlay HLSL (DLUT_DESKTOP_GAMMA_HLSL) on WARP: white = 1.0 is bit-identical to the pre-change
-//      shader text; white = 1.45 is the same LUT referenced to W, i.e. pure 2.2 relative to W; the production
-//      pixel shader splices it, compiles, and its cbuffer puts the new fields where render.cpp writes them.
+//   4. The overlay path: its table is octave-indexed (64 nodes per octave, 2^-20..1; the old table, uniform in
+//      linear light, left sRGB code 1 +307 % over 2.2), checked node by node and through a CPU emulation of the
+//      shader's lookup at every 8- and 10-bit code; the REAL HLSL (DLUT_DESKTOP_GAMMA_HLSL) on WARP decodes every
+//      8- and 10-bit code as pure 2.2 at SDR whites 80..480 nits, referenced to W (DG_W(w t) = w DG_80(t)), HDR
+//      highlights pass, black stays black, monotone; the production pixel shader splices it, compiles, and its
+//      cbuffer puts the new fields where render.cpp writes them.
 
 #define NOMINMAX
 #include <windows.h>
@@ -343,15 +346,155 @@ TEST_CASE("Desktop gamma: DisplayConfig SDRWhiteLevel -> nits (level / 1000 * 80
 }
 
 // =============================================================================================
-// 4. The overlay HLSL on WARP
+// 4. The overlay HLSL and its octave-indexed table
 // =============================================================================================
 
 namespace {
 
-// The shared function vs src/shader.h's desktop gamma before 2026-10-03 (verbatim), selected by DG_OLD.
+double SrgbOetfD(double L) { return L <= 0.0031308 ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055; }
+
+// What the table approximates: sRGB_OETF(L)^2.2, in double.
+double DgExact(double L) { return std::pow((std::max)(SrgbOetfD(L), 0.0), 2.2); }
+
+// gpu.cpp's desktop gamma table before 2026-10-03 (verbatim): 1024 texels uniform in linear light over [0, 1].
+std::vector<float> PreChangeDesktopGammaLut() {
+    std::vector<float> lut(1024);
+    for (int i = 0; i < 1024; i++) {
+        float L = static_cast<float>(i) / 1023.0f;
+        float srgb = (L <= 0.0031308f) ? 12.92f * L : 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
+        lut[i] = powf((std::max)(srgb, 0.0f), 2.2f);
+    }
+    return lut;
+}
+
+// The production table.
+std::vector<float> DesktopGammaLut() {
+    std::vector<float> lut(DLUT_DESKTOP_GAMMA_LUT_SIZE);
+    BuildDesktopGammaLut(lut.data());
+    return lut;
+}
+
+// A clamp-addressed linear filter with exact weights at texture coordinate u (texel centres at (i + 0.5) / N).
+double FilterLinear(const std::vector<float>& lut, double u) {
+    const int n = (int)lut.size();
+    double x = std::clamp(u * n - 0.5, 0.0, (double)(n - 1));
+    int i0 = (std::min)((int)std::floor(x), n - 2);
+    double w = x - i0;
+    return lut[i0] * (1.0 - w) + lut[i0 + 1] * w;
+}
+
+// DlutDesktopGamma's lookup for L in [0, 1] on the CPU: the HLSL's index arithmetic in float, then FilterLinear.
+double EmulatedDgLookup(const std::vector<float>& lut, float L) {
+    int32_t bits;
+    std::memcpy(&bits, &L, sizeof bits);
+    float d = (float)(bits - (int32_t)DLUT_DESKTOP_GAMMA_FLOOR_BITS);
+    float u = d * (1.0f / ((float)DLUT_DESKTOP_GAMMA_BITS_PER_TEXEL * (float)DLUT_DESKTOP_GAMMA_LUT_SIZE)) +
+              0.5f / (float)DLUT_DESKTOP_GAMMA_LUT_SIZE;
+    return FilterLinear(lut, u);
+}
+
+// The pre-change lookup: u = L * 1023/1024 + 0.5/1024.
+double PreChangeDgLookup(const std::vector<float>& lut, float L) {
+    return FilterLinear(lut, (double)(L * (1023.0f / 1024.0f) + 0.5f / 1024.0f));
+}
+
+// Worst |lookup(sRGB_EOTF(c / max)) / (c / max)^2.2 - 1| over codes lo..hi of a `max`-code signal; `at` = that code.
+template <typename Lookup>
+double WorstCodeError(int max, int lo, int hi, Lookup lookup, int* at = nullptr) {
+    double worst = 0.0;
+    for (int c = lo; c <= hi; c++) {
+        double e = std::fabs(lookup((float)SrgbEotfD((double)c / max)) / std::pow((double)c / max, 2.2) - 1.0);
+        if (e > worst) { worst = e; if (at) *at = c; }
+    }
+    return worst;
+}
+
+} // namespace
+
+TEST_CASE("Desktop gamma: the table is octave-indexed: 64 nodes per octave from 2^-20 to 1, sRGB_OETF^2.2 at each") {
+    // The nodes: powers of two at every octave start, uniform within each octave (all exact in float).
+    REQUIRE(DLUT_DESKTOP_GAMMA_LUT_SIZE == DLUT_DESKTOP_GAMMA_OCTAVES * DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE + 1);
+    int badNodes = 0;
+    for (int k = 0; k < DLUT_DESKTOP_GAMMA_OCTAVES; k++)
+        for (int j = 0; j < DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE; j++) {
+            float want = std::ldexp(1.0f + (float)j / DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE,
+                                    k - DLUT_DESKTOP_GAMMA_OCTAVES);
+            if (!SameBits(DesktopGammaLutNode(k * DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE + j), want)) badNodes++;
+        }
+    CHECK(badNodes == 0);
+    CHECK(SameBits(DesktopGammaLutNode(0), std::ldexp(1.0f, -20)));
+    CHECK(SameBits(DesktopGammaLutNode(DLUT_DESKTOP_GAMMA_LUT_SIZE - 1), 1.0f));
+
+    // The values: f at each node to float rounding; strictly increasing; exactly 1 at white.
+    auto lut = DesktopGammaLut();
+    double worst = 0.0;
+    bool increasing = true;
+    for (int i = 0; i < DLUT_DESKTOP_GAMMA_LUT_SIZE; i++) {
+        worst = (std::max)(worst, std::fabs(lut[i] / DgExact(DesktopGammaLutNode(i)) - 1.0));
+        if (i > 0 && !(lut[i] > lut[i - 1])) increasing = false;
+    }
+    INFO("worst relative node error: " << worst);
+    CHECK(worst < 1e-7);
+    CHECK(increasing);
+    CHECK(lut.back() == 1.0f);
+    CHECK(lut[0] < 2e-11f);   // what everything below 2^-20 of the SDR white clamps to
+
+    // The HLSL's literals are these constants (the static_assert in shader.h pins the constants to the literals).
+    const std::string hlsl = DLUT_DESKTOP_GAMMA_HLSL;
+    char floorHex[16];
+    snprintf(floorHex, sizeof floorHex, "0x%08X", DLUT_DESKTOP_GAMMA_FLOOR_BITS);
+    CHECK(hlsl.find(std::string("asint(sdrPart) - (int)") + floorHex) != std::string::npos);   // signed: see shader.h
+    CHECK(hlsl.find(std::to_string(DLUT_DESKTOP_GAMMA_BITS_PER_TEXEL) + ".0f * " +
+                    std::to_string(DLUT_DESKTOP_GAMMA_LUT_SIZE) + ".0f") != std::string::npos);
+    CHECK(hlsl.find("0.5f / " + std::to_string(DLUT_DESKTOP_GAMMA_LUT_SIZE) + ".0f") != std::string::npos);
+}
+
+TEST_CASE("Desktop gamma: the octave-indexed lookup (CPU emulation) is pure 2.2 at every 8- and 10-bit code") {
+    auto lut = DesktopGammaLut();
+    auto lookup = [&](float L) { return EmulatedDgLookup(lut, L); };
+    // Linear interpolation of a local power L^p over an interval of relative width r errs by at most about
+    // p(p - 1)/8 * r^2: p <= 2.2 and r <= 1/64 here, i.e. 8.1e-5 at every level.
+    int at8 = 0, at10 = 0;
+    double worst8 = WorstCodeError(255, 1, 254, lookup, &at8);
+    double worst10 = WorstCodeError(1023, 1, 1022, lookup, &at10);
+    INFO("worst relative deviation from code^2.2: 8-bit " << worst8 << " (code " << at8 << "), 10-bit " << worst10
+         << " (code " << at10 << ")");
+    CHECK(worst8 < 1e-4);
+    CHECK(worst10 < 1e-4);
+
+    // A dense sweep against the function itself, over the whole table range; monotone.
+    double worstDense = 0.0, prev = 0.0;
+    bool monotone = true;
+    for (int s = 0; s <= 200000; s++) {
+        float L = (float)std::exp2(-20.0 + 20.0 * s / 200000.0);
+        double v = lookup(L);
+        worstDense = (std::max)(worstDense, std::fabs(v / DgExact(L) - 1.0));
+        if (v < prev) monotone = false;
+        prev = v;
+    }
+    INFO("worst relative error over L in [2^-20, 1]: " << worstDense);
+    CHECK(worstDense < 1e-4);
+    CHECK(monotone);
+    CHECK(lookup(1.0f) == doctest::Approx(1.0).epsilon(1e-6));
+    CHECK(lookup(0.0f) == (double)lut[0]);          // black clamps to the first texel (the shader's sign() zeroes it)
+    CHECK(lookup(std::ldexp(1.0f, -24)) == (double)lut[0]);
+
+    // The defect this removes: the table uniform in linear light put codes 0..8 in its first interval.
+    auto preLut = PreChangeDesktopGammaLut();
+    auto pre = [&](float L) { return PreChangeDgLookup(preLut, L); };
+    const double want1 = std::pow(1.0 / 255.0, 2.2);
+    CHECK(pre((float)SrgbEotfD(1.0 / 255.0)) / want1 - 1.0 == doctest::Approx(3.07).epsilon(0.01));   // +307 %
+    CHECK(WorstCodeError(255, 32, 254, lookup) < WorstCodeError(255, 32, 254, pre));   // no worse where it was fine
+}
+
+namespace {
+
+// The shared function (t0 = the production table) vs src/shader.h's desktop gamma before 2026-10-03 (verbatim, its
+// own pre-change table on t1), selected by DG_OLD.
 const char* const kDgTestCS =
     "RWStructuredBuffer<float4> io : register(u0);\n"
     "Texture2D<float> desktopGammaLUT : register(t0);\n"
+    "Texture2D<float> preChangeLUT : register(t1);\n"
     "SamplerState linearSampler : register(s0);\n"
     "cbuffer P : register(b0) { float white; float whiteRcp; float2 pad; };\n"
     DLUT_DESKTOP_GAMMA_HLSL
@@ -365,9 +508,9 @@ float3 PreChangeDesktopGamma(float3 input) {
     float dgScale = 1023.0f / 1024.0f;
     float dgBias = 0.5f / 1024.0f;
     float3 corrected = float3(
-        desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.r * dgScale + dgBias, 0.5), 0),
-        desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.g * dgScale + dgBias, 0.5), 0),
-        desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.b * dgScale + dgBias, 0.5), 0));
+        preChangeLUT.SampleLevel(linearSampler, float2(sdrPart.r * dgScale + dgBias, 0.5), 0),
+        preChangeLUT.SampleLevel(linearSampler, float2(sdrPart.g * dgScale + dgBias, 0.5), 0),
+        preChangeLUT.SampleLevel(linearSampler, float2(sdrPart.b * dgScale + dgBias, 0.5), 0));
     return (corrected + hdrPart) * signInput;
 }
 
@@ -387,14 +530,14 @@ struct DgGpu {
     ID3D11DeviceContext* dc = nullptr;
     ID3D11ComputeShader* csNew = nullptr;
     ID3D11ComputeShader* csOld = nullptr;
-    ID3D11ShaderResourceView* lutSrv = nullptr;
+    ID3D11ShaderResourceView* luts[2] = {};   // t0 production, t1 pre-change
     ID3D11SamplerState* sampler = nullptr;
     ID3D11Buffer* cb = nullptr;
     std::string error;
     bool deviceUnavailable = false;
 
     ~DgGpu() {
-        for (IUnknown* p : std::initializer_list<IUnknown*>{ csNew, csOld, lutSrv, sampler, cb, dc, device })
+        for (IUnknown* p : std::initializer_list<IUnknown*>{ csNew, csOld, luts[0], luts[1], sampler, cb, dc, device })
             if (p) p->Release();
     }
 
@@ -416,6 +559,26 @@ struct DgGpu {
         return true;
     }
 
+    // A 1-row R32_FLOAT table as gpu.cpp creates it.
+    bool CreateTable(const std::vector<float>& lut, ID3D11ShaderResourceView** srv) {
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)lut.size();
+        td.Height = 1;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R32_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init = { lut.data(), (UINT)(lut.size() * sizeof(float)), 0 };
+        ID3D11Texture2D* tex = nullptr;
+        if (FAILED(device->CreateTexture2D(&td, &init, &tex))) { error = "CreateTexture2D failed"; return false; }
+        HRESULT hr = device->CreateShaderResourceView(tex, nullptr, srv);
+        tex->Release();
+        if (FAILED(hr)) { error = "CreateShaderResourceView failed"; return false; }
+        return true;
+    }
+
     bool Init() {
         D3D_FEATURE_LEVEL fl;
         HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
@@ -427,24 +590,9 @@ struct DgGpu {
         if (fl < D3D_FEATURE_LEVEL_11_0) { deviceUnavailable = true; error = "feature level < 11_0"; return false; }
         if (!Compile(false, &csNew) || !Compile(true, &csOld)) return false;
 
-        // The production table and sampler (gpu.cpp: 1024 x R32_FLOAT, MIN_MAG_MIP_LINEAR, clamp).
-        std::vector<float> lut(DLUT_DESKTOP_GAMMA_LUT_SIZE);
-        BuildDesktopGammaLut(lut.data(), DLUT_DESKTOP_GAMMA_LUT_SIZE);
-        D3D11_TEXTURE2D_DESC td = {};
-        td.Width = DLUT_DESKTOP_GAMMA_LUT_SIZE;
-        td.Height = 1;
-        td.MipLevels = 1;
-        td.ArraySize = 1;
-        td.Format = DXGI_FORMAT_R32_FLOAT;
-        td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_IMMUTABLE;
-        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA init = { lut.data(), (UINT)(lut.size() * sizeof(float)), 0 };
-        ID3D11Texture2D* tex = nullptr;
-        if (FAILED(device->CreateTexture2D(&td, &init, &tex))) { error = "CreateTexture2D failed"; return false; }
-        hr = device->CreateShaderResourceView(tex, nullptr, &lutSrv);
-        tex->Release();
-        if (FAILED(hr)) { error = "CreateShaderResourceView failed"; return false; }
+        // The production table and sampler (gpu.cpp: R32_FLOAT, MIN_MAG_MIP_LINEAR, clamp), and the pre-change table.
+        if (!CreateTable(DesktopGammaLut(), &luts[0]) || !CreateTable(PreChangeDesktopGammaLut(), &luts[1]))
+            return false;
         D3D11_SAMPLER_DESC sd = {};
         sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
         sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -497,7 +645,7 @@ struct DgGpu {
 
         dc->CSSetShader(old ? csOld : csNew, nullptr, 0);
         dc->CSSetConstantBuffers(0, 1, &cb);
-        dc->CSSetShaderResources(0, 1, &lutSrv);
+        dc->CSSetShaderResources(0, 2, luts);
         dc->CSSetSamplers(0, 1, &sampler);
         dc->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
         dc->Dispatch((UINT)(padded / 64), 1, 1);
@@ -527,75 +675,103 @@ struct DgGpu {
         FAIL(gpu.error);                                                           \
     }
 
+// Windows' HDR composite of codes lo..max-1 of a `max`-code SDR signal at SDR white W, through the shader: worst
+// |out / (w * code^2.2) - 1| over the three channels, which carry code c, the mirrored code lo + max - 1 - c and
+// -code c (per channel, sign preserved).
+double WorstShaderCodeError(DgGpu& gpu, bool old, float W, int max, int lo = 1) {
+    const double w = W / 80.0;
+    std::vector<float> rgb;
+    for (int c = lo; c < max; c++) {
+        const int m = lo + max - 1 - c;
+        float a = (float)(w * SrgbEotfD((double)c / max)), b = (float)(w * SrgbEotfD((double)m / max));
+        rgb.insert(rgb.end(), { a, b, -a });
+    }
+    auto out = gpu.Run(old, W, rgb);
+    double worst = 0.0;
+    for (int c = lo; c < max; c++) {
+        const float* o = &out[(c - lo) * 3];
+        const int m = lo + max - 1 - c;
+        double wa = w * std::pow((double)c / max, 2.2), wb = w * std::pow((double)m / max, 2.2);
+        worst = (std::max)({ worst, std::fabs(o[0] / wa - 1.0), std::fabs(o[1] / wb - 1.0), std::fabs(-o[2] / wa - 1.0) });
+    }
+    return worst;
+}
+
 } // namespace
 
-TEST_CASE("Desktop gamma: the shader table is the pre-change gpu.cpp table bit for bit") {
-    std::vector<float> lut(DLUT_DESKTOP_GAMMA_LUT_SIZE);
-    BuildDesktopGammaLut(lut.data(), DLUT_DESKTOP_GAMMA_LUT_SIZE);
-    for (int i = 0; i < DLUT_DESKTOP_GAMMA_LUT_SIZE; i++) {
-        float L = static_cast<float>(i) / static_cast<float>(DLUT_DESKTOP_GAMMA_LUT_SIZE - 1);
-        float srgb = (L <= 0.0031308f) ? 12.92f * L : 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
-        CHECK(SameBits(lut[i], powf((std::max)(srgb, 0.0f), 2.2f)));
-    }
-}
-
-TEST_CASE("Desktop gamma HLSL on WARP: an 80-nit SDR white is the pre-change shader bit for bit") {
+TEST_CASE("Desktop gamma HLSL on WARP: every 8- and 10-bit SDR code decodes as pure 2.2, at any SDR white") {
     DG_GPU_OR_SKIP(gpu);
-    // scRGB values across the whole range, per-channel distinct, both signs (wide gamut), HDR highlights.
-    std::vector<float> rgb;
-    for (int i = 0; i <= 4000; i++) {
-        float t = i / 4000.0f;
-        rgb.push_back(t * t);                          // dense near black
-        rgb.push_back(-t * 1.3f);                      // negative (out of sRGB gamut)
-        rgb.push_back(t * 12.5f);                      // up to 1000 nits
+    // Bound: the table's interpolation error (8.1e-5, the CPU test above) plus the filter's weight quantization:
+    // 8 fractional bits (the D3D minimum; WARP truncates), i.e. up to 1/256 of an interval whose value rises by at
+    // most p/64 = 2.2/64 of itself, 1.3e-4. WARP measures 8.7e-5 (8-bit) / 1.4e-4 (10-bit).
+    for (float W : { 80.0f, 116.0f, 203.0f, 480.0f }) {
+        CAPTURE(W);
+        double worst8 = WorstShaderCodeError(gpu, false, W, 255);
+        double worst10 = WorstShaderCodeError(gpu, false, W, 1023);
+        INFO("worst relative deviation from W * code^2.2: 8-bit " << worst8 << ", 10-bit " << worst10);
+        CHECK(worst8 < 2.2e-4);
+        CHECK(worst10 < 2.2e-4);
     }
-    for (float v : { 0.0f, -0.0f, 1.0f, -1.0f, 1.0000001f, 0.9999999f, 125.0f, 1e-8f })
-        rgb.insert(rgb.end(), { v, v, v });
-    auto now = gpu.Run(false, 80.0f, rgb);
-    auto before = gpu.Run(true, 80.0f, rgb);
-    REQUIRE(now.size() == before.size());
-    int mismatches = 0;
-    for (size_t i = 0; i < now.size(); i++)
-        if (!SameBits(now[i], before[i])) mismatches++;
-    CHECK(mismatches == 0);
+    // The defect this removes, on the pre-change shader text and table: code 1 at +307 %, 10-bit code 1 at about
+    // +2000 % (+2055 % with exact filter weights, +1967 % with WARP's truncated ones).
+    // Where the old table was already right (codes >= 32) the new one is no worse.
+    auto preCode1 = gpu.Run(true, 80.0f, { (float)SrgbEotfD(1.0 / 255.0), (float)SrgbEotfD(1.0 / 1023.0), 0.0f });
+    CHECK(preCode1[0] / std::pow(1.0 / 255.0, 2.2) - 1.0 == doctest::Approx(3.07).epsilon(0.02));
+    CHECK(preCode1[1] / std::pow(1.0 / 1023.0, 2.2) - 1.0 > 19.0);
+    CHECK(WorstShaderCodeError(gpu, false, 80.0f, 255, 32) < WorstShaderCodeError(gpu, true, 80.0f, 255, 32));
 }
 
-TEST_CASE("Desktop gamma HLSL on WARP: a 116-nit SDR white decodes Windows' sRGB composite as pure 2.2") {
+TEST_CASE("Desktop gamma HLSL on WARP: referenced to the SDR white; highlights pass; black stays black; monotone") {
     DG_GPU_OR_SKIP(gpu);
     const float W = 116.0f, w = W / 80.0f;
-    // (a) The same table referenced to W: DG_W(w * t) = w * DG_80(t), and above w the signal passes through.
+    // (a) The same table referenced to W: DG_W(w * t) = w * DG_80(t), up to one 8-bit filter-weight step of the
+    // widest interval (w t * (1/w) can land an ulp off t; the top octave's texels are 0.0076 apart, so 4.3e-5 at w).
     std::vector<float> rgb, scaled;
     for (int i = 0; i <= 2000; i++) {
         float t = i / 2000.0f;
         rgb.insert(rgb.end(), { t, t * 0.5f, t * t });
         scaled.insert(scaled.end(), { w * t, w * t * 0.5f, w * t * t });
     }
-    auto ref = gpu.Run(true, 80.0f, rgb);
+    auto ref = gpu.Run(false, 80.0f, rgb);
     auto at116 = gpu.Run(false, W, scaled);
     double worst = 0.0;
     for (size_t i = 0; i < ref.size(); i++) worst = (std::max)(worst, (double)std::fabs(at116[i] - w * ref[i]));
     INFO("worst |DG_116(w t) - w DG_80(t)| (scRGB): " << worst);
-    CHECK(worst < 2e-5);
-    auto above = gpu.Run(false, W, { w + 0.5f, w + 10.0f, -(w + 2.0f) });
+    auto lut = DesktopGammaLut();
+    double widest = 0.0;
+    for (size_t i = 1; i < lut.size(); i++) widest = (std::max)(widest, (double)(lut[i] - lut[i - 1]));
+    CHECK(worst < 1.1 * w * widest / 256.0);
+
+    // (b) Above W the signal passes through (sign preserved); continuous at W.
+    auto above = gpu.Run(false, W, { w + 0.5f, w + 10.0f, -(w + 2.0f), w, w * (1.0f + 1e-5f), -w });
     CHECK(above[0] == doctest::Approx(w + 0.5f).epsilon(1e-5));
     CHECK(above[1] == doctest::Approx(w + 10.0f).epsilon(1e-5));
     CHECK(above[2] == doctest::Approx(-(w + 2.0f)).epsilon(1e-5));
+    CHECK(above[3] == doctest::Approx(w).epsilon(1e-6));
+    CHECK(above[4] == doctest::Approx(w * (1.0f + 1e-5f)).epsilon(1e-6));
+    CHECK(above[5] == doctest::Approx(-w).epsilon(1e-6));
 
-    // (b) Windows' composite of 8-bit SDR codes at W, through the shader: W * code^2.2 (relative to W). Codes below
-    // 32 are left out: the linear-light table is coarse there, the same at any W (a property of the table).
-    std::vector<float> codes;
-    for (int c = 32; c <= 254; c++) {
-        float x = (float)(w * SrgbEotfD(c / 255.0));
-        codes.insert(codes.end(), { x, x, x });
+    // (c) Black (either sign of zero) is exactly zero; below the table's 2^-20 floor the output is ~1e-11 of white.
+    auto black = gpu.Run(false, W, { 0.0f, -0.0f, 1e-9f, -1e-9f, std::ldexp(w, -21), 0.0f });
+    CHECK(SameBits(black[0], 0.0f));
+    CHECK(black[1] == 0.0f);
+    CHECK(std::fabs(black[2]) < 1e-10f);
+    CHECK(std::fabs(black[3]) < 1e-10f);
+    CHECK(black[2] >= 0.0f);
+    CHECK(black[3] <= 0.0f);
+    CHECK(std::fabs(black[4]) < 1e-10f);
+
+    // (d) Monotone over the whole range, through every octave boundary and on across W.
+    std::vector<float> sweep;
+    for (int s = 0; s <= 60000; s++) {
+        float x = (float)(w * std::exp2(-22.0 + 23.0 * s / 60000.0));   // 2^-22 W .. 2 W
+        sweep.insert(sweep.end(), { x, x, x });
     }
-    auto out = gpu.Run(false, W, codes);
-    double worstRel = 0.0;
-    for (int c = 32; c <= 254; c++) {
-        double want = w * std::pow(c / 255.0, 2.2);
-        worstRel = (std::max)(worstRel, std::fabs(out[(c - 32) * 3] / want - 1.0));
-    }
-    INFO("worst relative deviation from W * code^2.2 over codes 32..254: " << worstRel);
-    CHECK(worstRel < 1e-3);
+    auto swept = gpu.Run(false, W, sweep);
+    int decreases = 0;
+    for (size_t i = 3; i < swept.size(); i += 3)
+        if (swept[i] < swept[i - 3]) decreases++;
+    CHECK(decreases == 0);
 }
 
 TEST_CASE("Desktop gamma: the overlay pixel shader splices the shared function, compiles, and lays out the cbuffer") {

@@ -168,7 +168,7 @@ The Calibration Loader is preferred over remove+re-add because it never disassoc
 HDR processing uses the Dolby ICtCp color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.
 
 **Pipeline (per-channel Rec.2020 grayscale + ICtCp tonemap):**
-1. **Desktop Gamma**: sRGB→2.2 correction via precomputed 1D LUT (t4), over the range up to the monitor's Windows SDR white level (SDR content brightness) and relative to it
+1. **Desktop Gamma**: sRGB→2.2 correction via precomputed 1D LUT (t4), over the range up to the monitor's Windows SDR white level (SDR content brightness) and relative to it. The LUT is octave-indexed (the float bit pattern as index: 64 texels per octave from 2^-20 to white), so it is accurate to ~1e-4 relative from sRGB code 1 up
 2. **BT.709 → Rec.2020**: Standards-derived RGB primary conversion per ITU-R BT.2087
 3. **Primaries Matrix**: Display calibration in linear Rec.2020 (includes Bradford chromatic adaptation)
 4. **Per-channel Grayscale**: PQ-domain R/G/B interpolation with linear gains (via t5/t6 LUT)

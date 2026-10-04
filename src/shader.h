@@ -6,45 +6,70 @@
 #include "../shared/peak_detect.h"     // g_peakReduceCSSource / g_peakSmoothCSSource
 #include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the hook)
 #include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF output dither, shared with the hook)
+#include <bit>
 #include <cmath>
+#include <cstdint>
 
 // Desktop gamma (HDR, overlay path; the MHC path bakes the same mapping: DesktopGammaPQ in mhc_icc.cpp).
 // In HDR, Windows composites SDR content as W * sRGB_EOTF(code), W = the display's SDR white level ("SDR
 // content brightness"). This re-decodes the range up to W with a pure 2.2 power: W * code^2.2. Per channel,
 // sign preserved (wide-gamut scRGB); the part above W (HDR highlights) passes through. `white` = W in scRGB
-// units (nits / 80) and `whiteRcp` = 1 / white, both from the CPU, so an 80-nit white is exactly 1.0 and the
-// result is the pre-2026-10-03 fixed-80-nit shader's bit for bit. `lut` = BuildDesktopGammaLut over [0, 1]
-// (texel centres at (i + 0.5) / N), sampled linearly: 3 texture fetches instead of 6 pow per pixel.
+// units (nits / 80) and `whiteRcp` = 1 / white, both from the CPU, so an 80-nit white is exactly 1.0.
+// `lut` = BuildDesktopGammaLut, sampled linearly: 3 texture fetches instead of 6 pow per pixel.
+//
+// The table is OCTAVE-INDEXED (2026-10-03). A float's bit pattern is a piecewise-linear log2 of its value, so
+// (asint(L) - asint(2^-20)) / 2^17 is a texel index with 64 texels per octave from 2^-20 to 1, and within each
+// octave the index is linear in L, so the hardware's linear filter interpolates in L between nodes. Every
+// interval spans at most 1/64 of its own L, which bounds the RELATIVE interpolation error at every level:
+// p(p - 1)/8 * (1/64)^2 = 8.1e-5 for the local power p <= 2.2. D3D's 8-bit filter weights add at most 1.3e-4
+// (WARP: worst 1.4e-4 over every 8- and 10-bit code). Both stay below the FP16 capture's own rounding (up to
+// 2.2 * 2^-11 = 1.1e-3 in the output). A table uniform in L (pre-2026-10-03: 1024 texels over [0, 1]) put
+// codes 0..8 of 255 in its first interval, i.e. sRGB code 1 came out +307 % over 2.2. The index costs an
+// integer subtract and an int->float convert per channel, with no transcendental. Below 2^-20 (including
+// black) the index goes negative and the clamp holds texel 0, f(2^-20) = 1.6e-11 of the SDR white; exact zero
+// stays zero through `signInput`. Constants: DLUT_DESKTOP_GAMMA_* below.
 #define DLUT_DESKTOP_GAMMA_HLSL R"DGH(
 float3 DlutDesktopGamma(float3 input, float white, float whiteRcp, Texture2D<float> lut, SamplerState linearClamp) {
     float3 absInput = abs(input);
     float3 signInput = sign(input);
     float3 sdrPart = min(absInput * whiteRcp, 1.0);
     float3 hdrPart = max(absInput - white, 0.0);
-    float dgScale = 1023.0f / 1024.0f;
-    float dgBias = 0.5f / 1024.0f;
+    // Octave index: (bits - bits(2^-20)) / 2^17 texels; texel centres at (i + 0.5) / 1281. The subtraction must
+    // stay SIGNED (a bare hex literal is uint in HLSL: below 2^-20 the difference would wrap to the top texel).
+    float3 dgUV = (float3)(asint(sdrPart) - (int)0x35800000) * (1.0f / (131072.0f * 1281.0f)) + 0.5f / 1281.0f;
     float3 corrected = float3(
-        lut.SampleLevel(linearClamp, float2(sdrPart.r * dgScale + dgBias, 0.5), 0),
-        lut.SampleLevel(linearClamp, float2(sdrPart.g * dgScale + dgBias, 0.5), 0),
-        lut.SampleLevel(linearClamp, float2(sdrPart.b * dgScale + dgBias, 0.5), 0));
+        lut.SampleLevel(linearClamp, float2(dgUV.r, 0.5), 0),
+        lut.SampleLevel(linearClamp, float2(dgUV.g, 0.5), 0),
+        lut.SampleLevel(linearClamp, float2(dgUV.b, 0.5), 0));
     return (corrected * white + hdrPart) * signInput;
 }
 )DGH"
 
-// The table DlutDesktopGamma samples: f(L) = sRGB_OETF(L)^2.2 at L = i / (size - 1). The HLSL's texel mapping
-// assumes size = DLUT_DESKTOP_GAMMA_LUT_SIZE.
-constexpr int DLUT_DESKTOP_GAMMA_LUT_SIZE = 1024;
-inline void BuildDesktopGammaLut(float* out, int size) {
-    for (int i = 0; i < size; i++) {
-        float L = static_cast<float>(i) / static_cast<float>(size - 1);
+// The table DlutDesktopGamma samples: f(L) = sRGB_OETF(L)^2.2 at the octave-indexed nodes
+// L_i = asfloat(DLUT_DESKTOP_GAMMA_FLOOR_BITS + i * DLUT_DESKTOP_GAMMA_BITS_PER_TEXEL), i.e. 2^-20 .. 1 with
+// 64 nodes per octave, uniform within each octave. The constants must match the literals in the HLSL above
+// (floor bits 0x35800000, 2^17 = 131072 bits per texel, 1281 texels).
+constexpr int DLUT_DESKTOP_GAMMA_OCTAVES = 20;
+constexpr int DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE = 64;
+constexpr int DLUT_DESKTOP_GAMMA_LUT_SIZE = DLUT_DESKTOP_GAMMA_OCTAVES * DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE + 1;
+constexpr uint32_t DLUT_DESKTOP_GAMMA_FLOOR_BITS = (127u - DLUT_DESKTOP_GAMMA_OCTAVES) << 23;      // 2^-20
+constexpr uint32_t DLUT_DESKTOP_GAMMA_BITS_PER_TEXEL = (1u << 23) / DLUT_DESKTOP_GAMMA_TEXELS_PER_OCTAVE;
+static_assert(DLUT_DESKTOP_GAMMA_LUT_SIZE == 1281 && DLUT_DESKTOP_GAMMA_FLOOR_BITS == 0x35800000u &&
+              DLUT_DESKTOP_GAMMA_BITS_PER_TEXEL == 131072u, "update the literals in DLUT_DESKTOP_GAMMA_HLSL");
+
+// Linear-light value at node i (exact: built from the bit pattern the shader's index is linear in).
+inline float DesktopGammaLutNode(int i) {
+    return std::bit_cast<float>(DLUT_DESKTOP_GAMMA_FLOOR_BITS + (uint32_t)i * DLUT_DESKTOP_GAMMA_BITS_PER_TEXEL);
+}
+
+// Fills DLUT_DESKTOP_GAMMA_LUT_SIZE entries (evaluated in double, rounded once to float).
+inline void BuildDesktopGammaLut(float* out) {
+    for (int i = 0; i < DLUT_DESKTOP_GAMMA_LUT_SIZE; i++) {
+        double L = DesktopGammaLutNode(i);
         // sRGB OETF: linear → encoded signal
-        float srgb;
-        if (L <= 0.0031308f)
-            srgb = 12.92f * L;
-        else
-            srgb = 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
+        double srgb = (L <= 0.0031308) ? 12.92 * L : 1.055 * std::pow(L, 1.0 / 2.4) - 0.055;
         // Decode with 2.2 power law
-        out[i] = powf(srgb > 0.0f ? srgb : 0.0f, 2.2f);
+        out[i] = static_cast<float>(std::pow(srgb > 0.0 ? srgb : 0.0, 2.2));
     }
 }
 
@@ -112,7 +137,7 @@ Texture2D<float4> captureTexture : register(t0);
 Texture3D<float4> lutTexture : register(t1);
 Texture2D<float> blueNoiseTexture : register(t2);
 Texture2D<float> peakTexture : register(t3);  // Dynamic peak detection result
-Texture2D<float> desktopGammaLUT : register(t4);  // Precomputed sRGB->2.2 correction (1024x1)
+Texture2D<float> desktopGammaLUT : register(t4);  // Precomputed sRGB->2.2 correction (1281x1, octave-indexed)
 Texture2D<float> pqOetfLUT : register(t5);        // PQ OETF: Linear->PQ, sqrt-domain (4096x1)
 Texture2D<float> pqEotfLUT : register(t6);        // PQ EOTF: PQ->Linear, uniform (4096x1)
 Texture2D<float> srgbOetfLUT : register(t7);      // sRGB OETF: Linear->sRGB (1024x1)

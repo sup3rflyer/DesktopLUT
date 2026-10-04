@@ -257,11 +257,12 @@ bool InitD3D() {
 
     // Create desktop gamma LUT (precomputed sRGB→2.2 correction)
     // f(L) = (sRGB_OETF(L))^2.2 for L in [0,1], L relative to the SDR white (shader.h DlutDesktopGamma)
-    // Replaces 6 pow() per pixel with 3 texture samples
+    // Octave-indexed (64 texels per octave, 2^-20..1): accurate down to code 1. Replaces 6 pow() per pixel
+    // with 3 texture samples
     {
         const int DG_LUT_SIZE = DLUT_DESKTOP_GAMMA_LUT_SIZE;
         float dgData[DG_LUT_SIZE];
-        BuildDesktopGammaLut(dgData, DG_LUT_SIZE);
+        BuildDesktopGammaLut(dgData);
 
         D3D11_TEXTURE2D_DESC dgDesc = {};
         dgDesc.Width = DG_LUT_SIZE;
@@ -291,7 +292,7 @@ bool InitD3D() {
             return false;
         }
 
-        std::cout << "Desktop gamma LUT: enabled (1024-entry sRGB->2.2)" << std::endl;
+        std::cout << "Desktop gamma LUT: enabled (" << DG_LUT_SIZE << "-entry sRGB->2.2, octave-indexed)" << std::endl;
     }
 
     // Create PQ transfer function LUTs (replaces all pow() in HDR pixel shader)
