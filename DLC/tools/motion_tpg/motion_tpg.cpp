@@ -24,7 +24,8 @@
 //
 // Protocol: stdin lines, replies on stdout (one line each, flushed):
 //   load <path>        -> "ok load <name> shapes=<n> frames=<n>"   | "err ..."
-//   play [cycles]      -> "ok play" now, "done play <cycles> presents=<a>..<b>" when the last present was SUBMITTED (then
+//   play [cycles] [lock] -> "ok play" now (lock: blinking shapes follow the TARGET REFRESH count, so a late frame
+//                         cannot shift a toggle's phase for the rest of the play), "done play <cycles> presents=<a>..<b>" when the last present was SUBMITTED (then
 //                         holds the last frame; the log says when each present reached the screen)
 //   park [nits]        -> "ok park <nits>"  (uniform grey; also the idle state at start)
 //   status             -> "ok status ..."
@@ -212,7 +213,9 @@ static bool parseScene(const std::string& path, Scene& sc, std::string& err) {
 }
 
 // Fill the constant buffer for content frame i (or park when sc == nullptr). presentIdx = the Gray code's value.
-static void fillCB(CB& cb, const Args& a, const Scene* sc, int i, unsigned long long presentIdx, double parkNits) {
+// lockRefresh >= 0: blinking shapes follow the REFRESH the frame is aimed at (play ... lock) instead of the content index
+static void fillCB(CB& cb, const Args& a, const Scene* sc, int i, unsigned long long presentIdx, double parkNits,
+                   long long lockRefresh = -1) {
     memset(&cb, 0, sizeof cb);
     double pxs = a.sceneW / a.w;
     cb.origin[0] = 0; cb.origin[1] = 0; cb.pxscale = (float)pxs; cb.outscale = 1.0f / 80.0f;
@@ -230,7 +233,11 @@ static void fillCB(CB& cb, const Args& a, const Scene* sc, int i, unsigned long 
         p[4] = (float)bb; p[5] = (float)r; p[6] = (float)g; p[7] = (float)b;
     };
     for (const Shape& s : sc->shapes) {
-        if (s.blink > 0 && ((i + s.blinkPhase) / s.blink) % 2 != 0) continue;   // hidden this content frame
+        if (s.blink > 0) {
+            const long long b2 = 2LL * s.blink;
+            const long long pos = lockRefresh >= 0 ? ((lockRefresh % b2) + s.blinkPhase) % b2 : (long long)(i + s.blinkPhase) % b2;
+            if (pos >= s.blink) continue;   // hidden this frame / refresh
+        }
         put(s.kind, s.cx + s.vx * t, s.cy + s.vy * t, s.a, s.b, s.r, s.g, s.bl);
     }
     if (sc->hasSync) {
@@ -271,7 +278,7 @@ static void fillCB(CB& cb, const Args& a, const Scene* sc, int i, unsigned long 
 }
 
 struct LogRow {
-    unsigned long long present; long long qpc; long long vbq; int play; int cycle; int content; int sub; int interval;
+    unsigned long long present; long long qpc; long long vbq; long long vbN; long long rTarget; int play; int cycle; int content; int sub; int interval;
     UINT lastPresentCount; UINT stPresentCount; UINT stPresentRefresh; UINT stSyncRefresh; long long stSyncQpc; int statsOk;
 };
 
@@ -463,7 +470,7 @@ int main(int argc, char** argv) {
 
     FILE* logf = nullptr;
     if (fopen_s(&logf, a.log.c_str(), "w") != 0 || !logf) { reply("fatal cannot open --log file"); return 2; }
-    fprintf(logf, "present,qpc,vblank_qpc,play,cycle,content,sub,interval,last_present_count,st_present_count,st_present_refresh,st_sync_refresh,st_sync_qpc,st_ok\n");
+    fprintf(logf, "present,qpc,vblank_qpc,vblank_n,r_target,play,cycle,content,sub,interval,last_present_count,st_present_count,st_present_refresh,st_sync_refresh,st_sync_qpc,st_ok\n");
     fprintf(logf, "# qpcfreq=%lld refresh=%.3f output_hdr=%d\n", qf.QuadPart, refreshHz, outHdr ? 1 : 0);
 
     Scene scene; bool haveScene = false;
@@ -478,7 +485,7 @@ int main(int argc, char** argv) {
 
     auto flushRows = [&]() {
         for (const LogRow& r : rows)
-            fprintf(logf, "%llu,%lld,%lld,%d,%d,%d,%d,%d,%u,%u,%u,%u,%lld,%d\n", r.present, r.qpc, r.vbq, r.play, r.cycle, r.content, r.sub,
+            fprintf(logf, "%llu,%lld,%lld,%lld,%lld,%d,%d,%d,%d,%d,%u,%u,%u,%u,%lld,%d\n", r.present, r.qpc, r.vbq, r.vbN, r.rTarget, r.play, r.cycle, r.content, r.sub,
                     r.interval, r.lastPresentCount, r.stPresentCount, r.stPresentRefresh, r.stSyncRefresh, r.stSyncQpc, r.statsOk);
         fflush(logf);
         rows.clear();
@@ -493,10 +500,45 @@ int main(int argc, char** argv) {
     UINT lastSeenCount = 0xFFFFFFFFu;
     struct StatRow { long long qpc; UINT pc, pr, sr; long long sq; };
     std::vector<StatRow> stats; stats.reserve(1 << 16);
+    // own vblank index (arbitrary origin): +1 per WaitForVBlank return, corrected by the QPC gap when a wake came late
+    // (period = median of single-step gaps); and its offset to DXGI PresentRefreshCount, learned from every present that
+    // reaches the screen: offset = PresentRefreshCount - vbN at its submit (median of the last 7: the DWM's latency shifts
+    // between regimes and the own count can slip by one on a late wake, so the offset must re-learn within a few frames). Target refresh of the
+    // frame being built = vbN + offset (play ... lock).
+    long long vbN = 0, lastVbq = 0;
+    double periodQpc = (double)qf.QuadPart / (refreshHz > 1.0 ? refreshHz : 60.0);
+    std::vector<double> stepHist;
+    struct Sub { UINT pc = 0; long long n = 0; };
+    std::vector<Sub> submitN(4096);
+    std::vector<long long> offHist;
+    long long offsetMed = 0; bool offsetValid = false;
+    auto onVblank = [&]() {
+        LARGE_INTEGER t; QueryPerformanceCounter(&t);
+        if (lastVbq) {
+            const double dt = (double)(t.QuadPart - lastVbq);
+            long long steps = std::max(1LL, std::llround(dt / periodQpc));
+            if (steps == 1) {
+                stepHist.push_back(dt);
+                if (stepHist.size() >= 31) {
+                    std::vector<double> c(stepHist); std::nth_element(c.begin(), c.begin() + c.size() / 2, c.end());
+                    periodQpc = c[c.size() / 2]; stepHist.erase(stepHist.begin(), stepHist.begin() + 16);
+                }
+            }
+            vbN += steps;
+        }
+        lastVbq = t.QuadPart;
+    };
     auto pollStats = [&]() {
         DXGI_FRAME_STATISTICS st{};
         if (FAILED(sc->GetFrameStatistics(&st)) || st.PresentCount == 0 || st.PresentCount == lastSeenCount) return;
         lastSeenCount = st.PresentCount;
+        const Sub& sb = submitN[st.PresentCount % submitN.size()];
+        if (sb.pc == st.PresentCount) {
+            offHist.push_back((long long)st.PresentRefreshCount - sb.n);
+            if (offHist.size() > 7) offHist.erase(offHist.begin());
+            std::vector<long long> c(offHist); std::nth_element(c.begin(), c.begin() + c.size() / 2, c.end());
+            offsetMed = c[c.size() / 2]; offsetValid = offHist.size() >= 5;
+        }
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
         stats.push_back({t.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount, st.SyncQPCTime.QuadPart});
     };
@@ -508,6 +550,7 @@ int main(int argc, char** argv) {
 
     bool running = true;
     int pendingVblanks = 1;
+    bool playLock = false;
     while (running) {
         MSG msg;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
@@ -533,6 +576,7 @@ int main(int argc, char** argv) {
                 } else reply("err load: " + err);
             } else if (k == "play") {
                 int n = 1; is >> n;
+                std::string opt; playLock = bool(is >> opt) && opt == "lock";
                 if (!haveScene) reply("err play: no scene");
                 else if (state == PLAY) reply("err play: already playing");
                 else { state = PLAY; ++playId; cycles = std::max(n, 1); cycle = 0; content = 0; sub = 0; firstPresent = presentIdx; reply("ok play"); }
@@ -554,6 +598,7 @@ int main(int argc, char** argv) {
         LARGE_INTEGER vbq{};
         for (int v = 0; v < std::max(pendingVblanks, 1); ++v) {
             output->WaitForVBlank();
+            onVblank();
             pollStats();   // every vblank: a frame held k refreshes still has its arrival sampled
         }
         QueryPerformanceCounter(&vbq);
@@ -577,7 +622,9 @@ int main(int argc, char** argv) {
         } else if (state == HOLD) {
             show = &scene; ci = scene.frames() - 1;   // a finished play holds its last frame until park / play
         }
-        fillCB(cb, a, show, ci, presentIdx + 1, parkNits);   // the Gray code carries this present's logged number
+        const long long rTarget = offsetValid ? vbN + offsetMed : -1;   // the DXGI refresh this frame is aimed at
+        fillCB(cb, a, show, ci, presentIdx + 1, parkNits,           // the Gray code carries this present's logged number
+               (state == PLAY && playLock) ? rTarget : -1);
         ctx->UpdateSubresource(cbuf.Get(), 0, nullptr, &cb, 0, 0);
 
         ComPtr<ID3D11Texture2D> bb; sc->GetBuffer(0, IID_PPV_ARGS(&bb));
@@ -602,6 +649,8 @@ int main(int argc, char** argv) {
         r.present = presentIdx; r.qpc = q.QuadPart; r.vbq = vbq.QuadPart; r.play = playing ? playId : 0; r.cycle = playing ? cycle : -1;
         r.content = playing ? content : -1; r.sub = playing ? sub : -1; r.interval = interval;
         sc->GetLastPresentCount(&r.lastPresentCount);
+        r.vbN = vbN; r.rTarget = rTarget;
+        submitN[r.lastPresentCount % submitN.size()] = {r.lastPresentCount, vbN};
         DXGI_FRAME_STATISTICS st{};
         if (SUCCEEDED(sc->GetFrameStatistics(&st))) {
             r.statsOk = 1; r.stPresentCount = st.PresentCount; r.stPresentRefresh = st.PresentRefreshCount;

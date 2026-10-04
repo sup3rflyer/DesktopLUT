@@ -165,11 +165,14 @@ class MotionTPG:
         path.write_text(scene_text(scene), encoding="ascii")
         return self.send(f"load {path}")
 
-    def play(self, cycles: int = 1, timeout: Optional[float] = None, refresh_hz: Optional[float] = None) -> tuple[int, int]:
+    def play(self, cycles: int = 1, timeout: Optional[float] = None, refresh_hz: Optional[float] = None,
+             lock: bool = False) -> tuple[int, int]:
         """Play the loaded scene ``cycles`` times and wait until its last present was SUBMITTED; returns the (first, last)
         present numbers of the play (the log's ``present`` column — when each reached the screen is in the log). The
-        finished play holds its last frame until :meth:`park`."""
-        self.send(f"play {int(cycles)}", expect=("ok play",))
+        finished play holds its last frame until :meth:`park`. ``lock``: blinking shapes follow the TARGET REFRESH count
+        (the TPG's own vblank index + its learned offset to DXGI's PresentRefreshCount) — a late frame then mis-shows for
+        one refresh instead of shifting a toggle's phase for the rest of the play."""
+        self.send(f"play {int(cycles)}" + (" lock" if lock else ""), expect=("ok play",))
         if timeout is None:
             hz = refresh_hz or float(self.ready.get("refresh", 60.0) or 60.0)
             timeout = 10.0 + 4.0 * cycles * 600 / max(hz, 1.0)
@@ -200,6 +203,8 @@ class Present:
     dxgi_count: int          # DXGI's PresentCount of this present (GetLastPresentCount right after it)
     refresh: Optional[int]   # the vblank index it reached the screen on (DXGI PresentRefreshCount), None = unknown
     inferred: bool = False   # refresh filled in by :func:`infer_refreshes` (unambiguous gap), not reported by DXGI
+    vblank_n: Optional[int] = None    # the TPG's own vblank index at submit (arbitrary origin)
+    r_target: Optional[int] = None    # the DXGI refresh the TPG aimed this frame at (-1 / None = offset not learned yet)
 
 
 def read_present_log(path: Path) -> tuple[list[Present], dict]:
@@ -224,9 +229,10 @@ def read_present_log(path: Path) -> tuple[list[Present], dict]:
         with open(stats, newline="", encoding="ascii") as fh:
             for r in csv.DictReader(fh):
                 seen.setdefault(int(r["st_present_count"]), int(r["st_present_refresh"]))
+    opt = lambda r, k: (int(r[k]) if r.get(k) not in (None, "") and int(r[k]) >= 0 else None)
     out = [Present(int(r["present"]), int(r["qpc"]), int(r.get("vblank_qpc") or 0), int(r["play"]), int(r["cycle"]),
                    int(r["content"]), int(r["sub"]), int(r["interval"]), int(r["last_present_count"]),
-                   seen.get(int(r["last_present_count"])))
+                   seen.get(int(r["last_present_count"])), False, opt(r, "vblank_n"), opt(r, "r_target"))
            for r in rows]
     return out, header
 
