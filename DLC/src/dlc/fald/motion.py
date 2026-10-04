@@ -412,12 +412,16 @@ def static_mask(model: FaldModel, scene: Scene, margin_px: float = 10.0, near_zo
 class PanelRun:
     """What one panel hypothesis showed over a scene, per REFRESH: ``ys`` (n, m) float32 luminance at the static pixels
     (``mask`` order), ``row`` (n, w) float32 luminance along the kymograph row, ``obj`` (n,) mean luminance over the
-    object's interior."""
+    object's interior, ``obj_spread`` (n,) the interior's spatial non-uniformity per refresh = (p95 − p5) / p50 of Y over
+    the interior (edges excluded by the object mask's inset) — a zone grid printed INSIDE a flat bright shape raises it;
+    ``snaps`` {refresh: (h, w) float32 Y} for the refreshes asked for."""
     truth: str
     parity: int
     ys: np.ndarray
     row: np.ndarray
     obj: np.ndarray
+    obj_spread: np.ndarray = None
+    snaps: dict = None
 
 
 @dataclass
@@ -433,7 +437,8 @@ class SceneRun:
 def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tuple[str, int]] = (("area", 0), ("area", 1)),
                    law: PanelTimeLaw = PanelTimeLaw(), rerender_on_repeat: bool = True, iters: int = 2,
                    kymo_row: Optional[int] = None, mask: Optional[np.ndarray] = None,
-                   control: Optional[Callable] = None, layer_stat: str = "area") -> SceneRun:
+                   control: Optional[Callable] = None, layer_stat: str = "area",
+                   snapshot_refreshes: Sequence[int] = ()) -> SceneRun:
     """Stream ``scene`` refresh by refresh through the layer (``state``: None = layer OFF; a
     :class:`dlc.fald.temporal.DriveState` — ``DriveState(MODE_OFF)`` = the static layer — or a
     :class:`dlc.fald.paneltime.PanelDriveState`) and through every panel hypothesis ``(truth statistic, tick parity)``.
@@ -462,6 +467,9 @@ def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tup
     ys = {k: np.empty((n, int(m.sum())), np.float32) for k in panels}
     rows = {k: np.empty((n, layer.w), np.float32) for k in panels}
     objs = {k: np.empty(n) for k in panels}
+    spreads = {k: np.full(n, np.nan) for k in panels}
+    snaps = {k: {} for k in panels}
+    want_snap = set(int(v) for v in snapshot_refreshes)
     cidx, target_static, k_out = [], None, 0
     for i, kk in enumerate(refr):
         img, pk_img = render_reduced(scene, i, p.scale, p.width, p.height)
@@ -493,9 +501,15 @@ def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tup
                 ys[key][k_out] = y[m]
                 rows[key][k_out] = y[kymo_row]
                 objs[key][k_out] = float(y[om].mean())
+                if om.sum() >= 4:
+                    q5, q50, q95 = np.percentile(y[om], (5, 50, 95))
+                    spreads[key][k_out] = float((q95 - q5) / max(q50, 1e-9))
+                if k_out in want_snap:
+                    snaps[key][k_out] = y.astype(np.float32)
             cidx.append(i)
             k_out += 1
-    runs = [PanelRun(t, par, ys[(t, par)], rows[(t, par)], objs[(t, par)]) for t, par in panels]
+    runs = [PanelRun(t, par, ys[(t, par)], rows[(t, par)], objs[(t, par)], spreads[(t, par)], snaps[(t, par)])
+            for t, par in panels]
     return SceneRun(scene, cidx, m, target_static, kymo_row, runs)
 
 
@@ -542,6 +556,10 @@ def score(run: PanelRun, sr: SceneRun, fuse: int = 3, floor_nits: float = 0.05) 
         "step_abs_max": float(np.abs(np.diff(y, axis=0))[n0 - 1:].max()), "excess_abs_max": float((win - tgt).max()),
         "err_mean": pc(err.mean()), "err_p95": pc(np.percentile(err, 95)),
         "obj_min": float(ob.min()), "obj_max": float(ob.max()),
+        "obj_spread_rest": (100.0 * float(run.obj_spread[n0 - 1])) if run.obj_spread is not None else float("nan"),
+        "obj_spread_max": (100.0 * float(np.nanmax(run.obj_spread[n0:]))) if run.obj_spread is not None else float("nan"),
+        "obj_spread_step": (100.0 * float(np.nanmax(np.abs(np.diff(run.obj_spread[n0 - 1:])))))
+                           if run.obj_spread is not None else float("nan"),
         "obj_pulse": pc(np.abs(np.diff(np.log(np.maximum(mov, 1e-9)))).max()) if mov.size > 1 else float("nan"),
         "static_px": int(sr.mask.sum()),
         "trace_step": [pc(v) for v in np.percentile(np.abs(np.diff(ly, axis=0)), 99, axis=1)],
