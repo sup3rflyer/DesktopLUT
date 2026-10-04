@@ -928,6 +928,7 @@ def test_sdr_content_on_an_hdr_display_scores_sdr_through_the_hdr_stack(tmp_path
     assert abs(verify["sdr_white"]["white_luminance_vs_calibrated_pct"]) < 1.0
     sih = verify["sdr_in_hdr"]
     assert sih["desktop_gamma_on"] is True and sih["declared_sdr_white_nits"] == 116.0
+    assert sih["stack_stability"]["changed"] == [] and sih["stack_stability"]["at_preflight"]["mhc_profile"]
     fit = sih["grey_model_fit"]
     assert fit["closest"] == "g22" and fit["models"]["g22"]["rms_ln"] < fit["models"]["dg80_forecast"]["rms_ln"]
     assert calib.calib["stages"]["preflight"]["digest"]["sdr_white_level"]["nits"] == 116.0
@@ -1023,4 +1024,9 @@ def test_a_kept_layer_the_user_toggles_mid_run_is_not_forced_back(tmp_path: Path
     assert calib.run("verify-only").status == "completed"
     now = _layers(ctrl)
     assert now["desktop_gamma"] is False and now["fald"] and now["tonemap"]   # only the run's own changes undone
+    # the mid-run Desktop Gamma swap re-baked the measured MHC: surfaced, never silent
+    stab = calib.calib["stages"]["verify"]["digest"]["sdr_in_hdr"]["stack_stability"]
+    assert "mhc_profile" in stab["changed"]
+    assert any(e.event == Ev.ANOMALY and e.data.get("kind") == "stack_changed_mid_run"
+               for e in read_events(calib.ctx.events_path))
 

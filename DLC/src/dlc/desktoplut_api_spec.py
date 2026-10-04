@@ -81,7 +81,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "runtime": "object keyed by '<monitor>:<MODE>'; each entry {cube_path:string}",
                 "layers": "object keyed by '<monitor>:<MODE>' for EVERY pair: the viewing layers a run "
                           "must measure WITHOUT — {white_balance, grayscale, desktop_gamma, tonemap, fald: bool"
-                          "; HDR adds tonemap_dynamic, tonemap_target_peak; every pair (HDR and SDR, the FALD "
+                          "; HDR adds tonemap_dynamic, tonemap_target_peak and desktop_gamma_sdr_white_nits (the "
+                          "SDR white level, nits, the HDR MHC's Desktop Gamma was last baked against — the RECORDED "
+                          "level, set even while Desktop Gamma is off; absent on builds before 2026-10-03, which "
+                          "assumed 80); every pair (HDR and SDR, the FALD "
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
                           "fald_ped_mode, fald_ped_colour_in_file, fald_boost_in_file (the panel file is FLD4 with a "
                           "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "

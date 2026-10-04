@@ -8430,12 +8430,31 @@ class Calibration:
                 rec = dict(self.sdr_white_probe(patch_window.get("target_rect")))
             except Exception as exc:  # noqa: BLE001 - evidence; the nominal white stands
                 rec = {"nits": None, "source": None, "reason": f"{type(exc).__name__}: {exc}"}
+        # What the measured stack is at the start (re-checked at verify): DesktopLUT re-bakes the HDR MHC by
+        # itself when the SDR white level changes or a Desktop Gamma whitelist / hotkey swap fires, and
+        # verify-only never enters calibration mode — a mid-run re-bake must not pass silently.
+        rec["stack_at_preflight"] = self._sdr_in_hdr_stack_facts()
         self.calib["sdr_white_level"] = rec
         self._save()
         self.runlog.note("preflight", f"SDR content on an HDR display: Windows SDR white level "
                                       f"{rec.get('nits')} nit" + (f" ({rec['reason']})" if rec.get("reason") else ""),
                          sdr_white_level={k: rec.get(k) for k in ("nits", "source", "reason")})
         return rec
+
+    def _sdr_in_hdr_stack_facts(self) -> dict[str, Any]:
+        """The HDR stack a SDR-in-HDR verify measures, from the pipe: the white Desktop Gamma is baked
+        against (``desktop_gamma_sdr_white_nits``; ``None`` before the 2026-10-03 build, which assumed 80),
+        the MHC profile and the runtime cube."""
+        try:
+            st = self.controller.state() or {}
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        key = f"{self.monitor}:{self.mode}"
+        lay = (st.get("layers") or {}).get(key) or {}
+        return {"dg_baked_white_nits": lay.get("desktop_gamma_sdr_white_nits"),
+                "desktop_gamma": lay.get("desktop_gamma"),
+                "mhc_profile": ((st.get("mhc") or {}).get(key) or {}).get("profile_name"),
+                "cube_path": ((st.get("runtime") or {}).get(key) or {}).get("cube_path")}
 
     def _sdr_in_hdr_evidence(self, samples: Sequence[Any], scored_white: float) -> dict[str, Any]:
         """Verify evidence for SDR content on an HDR display (no verdict): the SDR white Windows declares
@@ -8451,7 +8470,20 @@ class Calibration:
                  if max(s.rgb) - min(s.rgb) < 1e-6 and math.isfinite(float(s.xyz[1]))]
         fit = sdr_in_hdr.grey_model_fit(greys, white_y=float(scored_white),
                                         declared_white=declared if dg_on else None)
+        pre = (self.calib.get("sdr_white_level") or {}).get("stack_at_preflight") or {}
+        now = self._sdr_in_hdr_stack_facts()
+        changed = [k for k in ("dg_baked_white_nits", "mhc_profile", "cube_path")
+                   if "error" not in pre and "error" not in now and pre.get(k) != now.get(k)]
+        if changed:
+            self.runlog.anomaly(
+                "verify", kind="stack_changed_mid_run", changed=changed, at_preflight=pre, at_verify=now,
+                message=("the measured HDR stack changed during the run (" + ", ".join(changed) + ") — DesktopLUT "
+                         "re-baked or swapped the MHC (SDR white level change, Desktop Gamma whitelist / hotkey); "
+                         "the verify reads may mix two stacks"))
+        baked = _as_float_local(now.get("dg_baked_white_nits"))
         return {"declared_sdr_white_nits": declared,
+                "desktop_gamma_baked_white_nits": baked,
+                "stack_stability": {"at_preflight": pre, "at_verify": now, "changed": changed},
                 "declared_source": (self.calib.get("sdr_white_level") or {}).get("source"),
                 "measured_white_nits": round(float(scored_white), 4),
                 "measured_over_declared": (round(float(scored_white) / declared, 4) if declared else None),
