@@ -18,7 +18,8 @@ def _scene():
     return Scene("parity", (5.0, 4.0, 6.0),
                  (MovingShape("rect", 150.3, 120.7, (1000.0, 800.0, 600.0), w=40.6, h=70.2, vx=3.37, vy=-0.41),
                   MovingShape("disc", 300.4, 160.6, grey(200.0), r=33.3, vx=-2.13),
-                  MovingShape("rect", 230.0, 60.0, grey(1842.0), w=8.0, h=8.0, vx=1.5)),
+                  MovingShape("rect", 230.0, 60.0, grey(1842.0), w=8.0, h=8.0, vx=1.5),
+                  MovingShape("rect", 420.0, 60.0, grey(300.0), w=30.0, h=20.0, blink=3, blink_phase=1)),
                  pre=3, move=12, post=3, sync=(10.0, 100.0, 30.0, 30.0, 10.0, 30.0), code=(10.0, 240.0, 12.0, 10, 2.0, 12.0),
                  digits=(380.0, 230.0, 24.0, 4, 2.0, 12.0))
 
@@ -37,7 +38,7 @@ def _tpg_frames(tmp_path, scene, frames):
 
 def test_tpg_pixels_equal_the_simulator_render(tmp_path):
     sc = _scene()
-    frames = [0, sc.pre, sc.pre + 5, sc.pre + sc.move - 1, sc.frames - 1]
+    frames = [0, 1, 2, sc.pre, sc.pre + 5, sc.pre + sc.move - 1, sc.frames - 1]   # the blinker is off at 2..4, 8..10, …
     got = _tpg_frames(tmp_path, sc, frames)
     for i in frames:
         want = render_full_patch(sc, i, 0, 0, W, H)

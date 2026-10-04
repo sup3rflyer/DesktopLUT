@@ -63,6 +63,7 @@ struct Shape {             // scene units = full-resolution panel pixels relativ
     double cx = 0, cy = 0, a = 0, b = 0;    // rect: w, h | disc: r, 0
     double vx = 0, vy = 0;
     double r = 0, g = 0, bl = 0;            // linear nits per channel
+    int blink = 0, blinkPhase = 0;          // > 0: shown for `blink` content frames, hidden for `blink`, … (motion.MovingShape)
 };
 
 struct Scene {
@@ -187,6 +188,11 @@ static bool parseScene(const std::string& path, Scene& sc, std::string& err) {
             Shape sh; sh.kind = (k == "disc");
             if (sh.kind == 0) ok = bool(is >> sh.cx >> sh.cy >> sh.a >> sh.b >> sh.vx >> sh.vy >> sh.r >> sh.g >> sh.bl);
             else ok = bool(is >> sh.cx >> sh.cy >> sh.a >> sh.vx >> sh.vy >> sh.r >> sh.g >> sh.bl);
+            std::string opt;
+            if (ok && (is >> opt)) {
+                if (opt == "blink") { ok = bool(is >> sh.blink); if (!(is >> sh.blinkPhase)) sh.blinkPhase = 0; ok = ok && sh.blink >= 0 && sh.blinkPhase >= 0; }
+                else ok = false;
+            }
             s.shapes.push_back(sh);
         }
         else if (k == "sync") { s.hasSync = true; ok = bool(is >> s.sync[0] >> s.sync[1] >> s.sync[2] >> s.sync[3] >> s.syncLo >> s.syncHi); }
@@ -223,8 +229,10 @@ static void fillCB(CB& cb, const Args& a, const Scene* sc, int i, unsigned long 
         p[0] = (float)kind; p[1] = (float)cx; p[2] = (float)cy; p[3] = (float)aa;
         p[4] = (float)bb; p[5] = (float)r; p[6] = (float)g; p[7] = (float)b;
     };
-    for (const Shape& s : sc->shapes)
+    for (const Shape& s : sc->shapes) {
+        if (s.blink > 0 && ((i + s.blinkPhase) / s.blink) % 2 != 0) continue;   // hidden this content frame
         put(s.kind, s.cx + s.vx * t, s.cy + s.vy * t, s.a, s.b, s.r, s.g, s.bl);
+    }
     if (sc->hasSync) {
         int events = (i >= sc->pre ? 1 : 0) + (i >= sc->pre + sc->move ? 1 : 0);
         double v = (events % 2) ? sc->syncHi : sc->syncLo;

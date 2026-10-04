@@ -46,10 +46,11 @@ def scene_text(scene: Scene) -> str:
              f"pre {int(scene.pre)}", f"move {int(scene.move)}", f"post {int(scene.post)}",
              "cadence " + " ".join(str(int(c)) for c in scene.cadence)]
     for s in scene.shapes:
+        blink = f" blink {int(s.blink)} {int(s.blink_phase)}" if s.blink > 0 else ""
         if s.kind == "rect":
-            lines.append("rect " + " ".join(f(v) for v in (s.x, s.y, s.w, s.h, s.vx, s.vy, *s.nits)))
+            lines.append("rect " + " ".join(f(v) for v in (s.x, s.y, s.w, s.h, s.vx, s.vy, *s.nits)) + blink)
         elif s.kind == "disc":
-            lines.append("disc " + " ".join(f(v) for v in (s.x, s.y, s.r, s.vx, s.vy, *s.nits)))
+            lines.append("disc " + " ".join(f(v) for v in (s.x, s.y, s.r, s.vx, s.vy, *s.nits)) + blink)
         else:
             raise ValueError(f"unknown shape kind {s.kind!r}")
     if scene.sync:

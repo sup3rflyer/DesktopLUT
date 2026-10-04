@@ -53,7 +53,9 @@ PANEL_W, PANEL_H = 3840, 2160
 class MovingShape:
     """One shape in full-resolution panel pixels. ``kind`` "rect" (``w`` × ``h``) or "disc" (radius ``r``); centre
     (``x``, ``y``) at the first frame; moves (``vx``, ``vy``) px per CONTENT frame while the scene's motion runs;
-    ``nits`` = linear level per channel (R, G, B as-if-white nits; grey = three equal values)."""
+    ``nits`` = linear level per channel (R, G, B as-if-white nits; grey = three equal values). ``blink`` > 0: the shape
+    is shown for ``blink`` content frames, hidden for ``blink``, … — visible at content frame i when
+    ``((i + blink_phase) // blink) % 2 == 0`` (a toggle at refresh / (2·blink) with cadence 1: blink 2 = 15 Hz at 60 Hz)."""
     kind: str
     x: float
     y: float
@@ -63,6 +65,11 @@ class MovingShape:
     r: float = 0.0
     vx: float = 0.0
     vy: float = 0.0
+    blink: int = 0
+    blink_phase: int = 0
+
+    def visible(self, i: int) -> bool:
+        return self.blink <= 0 or ((int(i) + self.blink_phase) // self.blink) % 2 == 0
 
     def centre(self, t: float) -> tuple[float, float]:
         return self.x + self.vx * t, self.y + self.vy * t
@@ -204,6 +211,8 @@ def render_full_patch(scene: Scene, i: int, x0: int, y0: int, nx: int, ny: int) 
     out = np.empty((3, ny, nx), dtype=np.float64)
     out[:] = np.asarray(scene.bg, dtype=np.float64)[:, None, None]
     for s in scene.shapes:
+        if not s.visible(i):
+            continue
         cov = coverage(s, t, x0, y0, nx, ny)
         out = out * (1.0 - cov)[None] + np.asarray(s.nits, dtype=np.float64)[:, None, None] * cov[None]
     for ax, ay, aw, ah, v in scene.aid_rects(i):
@@ -246,7 +255,7 @@ def render_reduced(scene: Scene, i: int, scale: int, w: int = PANEL_W, h: int = 
         _render_window(scene, i, scale, img, peak, min(a[0] for a in aids), min(a[1] for a in aids),
                        max(a[0] + a[2] for a in aids), max(a[1] + a[3] for a in aids))
     t = scene.motion_time(i)
-    boxes = [s.bbox(t) for s in scene.shapes]
+    boxes = [s.bbox(t) for s in scene.shapes if s.visible(i)]
     if boxes:
         _render_window(scene, i, scale, img, peak, min(b[0] for b in boxes), min(b[1] for b in boxes),
                        max(b[2] for b in boxes), max(b[3] for b in boxes))
