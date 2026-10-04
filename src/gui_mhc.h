@@ -4,9 +4,13 @@
 #pragma once
 
 #include <windows.h>
+#include <chrono>
+#include <map>
 #include <string>
+#include <vector>
 
 struct MHCSettings;
+struct MHC2ProfileParams;
 
 // Outcome of the live-preview mode gate (see EvaluatePreviewModeGate).
 enum class PreviewModeGate {
@@ -46,11 +50,81 @@ void UpdateMhcFlagsLive(int monitorIndex);
 // Compute metadata strings for display in MHC section labels
 void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR);
 
+// MHC2ProfileParams for an MHCSettings (every correction it has on), shared by Generate / Regenerate and the
+// permutation variants. Exposed for testing.
+void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params);
+
 // Generate, write, and install MHC2 ICC profile from current MHCSettings
 bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR);
 
 // Auto-regenerate and reinstall MHC profile when MHC settings change
 void RegenerateMhcIfActive(int monitorIndex, bool isHDR);
+
+// Desktop Gamma follows the Windows SDR white level ("SDR content brightness"), per live monitor, while it
+// is in HDR: the overlay shader's reference (the monitor's render context) and the HDR MHC bake
+// (hdrMHC.dgSdrWhiteNits; the active profile is re-baked when its DG stamp differs). Outside HDR the last
+// HDR-mode level stays in force. Nothing changes while a calibration session or a live grayscale edit runs
+// (IsCalibrationOrLiveEditActive); an MHC re-bake also waits while an MHC edit dialog is open, after a failed
+// re-bake at the same level (SdrWhiteRebakeBackoff), and while the processing thread's startup MHC
+// maintenance holds g_mhcMaintenanceMutex (re-armed on SDR_WHITE_CHECK_TIMER_ID). What waits, and why, is
+// published for calibration.status (GetDesktopGammaSdrWhitePending). Persists the settings when they
+// changed. GUI thread.
+void RefreshDesktopGammaSdrWhite(const char* reason);
+
+// Record sdrWhiteNits as monitor's HDR desktop-gamma reference. Re-bakes the active HDR profile when its DG
+// was baked under another level (keeping its permutation) and forgets cached variants whose DG stamp
+// differs. Returns true when the settings changed (persist them); false: nothing stale, invalid level, or
+// no such monitor. *rebakeFailed reports a failed re-bake (the profile keeps its old stamp, so it stays
+// stale). Takes g_monitorSettingsMutex.
+bool RebakeHdrMhcForSdrWhite(int monitorIndex, float sdrWhiteNits, bool* rebakeFailed = nullptr);
+
+// Two SDR white readings are the same level (Windows reports 0.08-nit steps; the tolerance only absorbs
+// float rounding through the INI round trip). Exposed for testing.
+bool SameSdrWhiteNits(float a, float b);
+
+// Cached / active permutation `perm` is valid at sdrWhiteNits: it carries no DG, its bake carried none
+// (stamp 0), or its DG stamp is that level. Exposed for testing.
+bool MhcPermDgBakedAt(const MHCSettings& m, int perm, float sdrWhiteNits);
+
+// The HDR MHC lags the live level: the recorded level differs, or the active profile's DG was baked under
+// another one. Exposed for testing.
+bool HdrMhcSdrWhiteStale(const MHCSettings& mhc, float liveNits);
+
+// Retry backoff for failed re-bakes, per monitor and level: a failed install flickers (remove, install,
+// re-associate), so the same level is retried after 1, 2, 4 .. 32 minutes, a new level at once. Cleared by
+// display transitions (ResetDesktopGammaSdrWhiteBackoff). Exposed for testing.
+struct SdrWhiteRebakeBackoff {
+    using Clock = std::chrono::steady_clock;
+    static constexpr std::chrono::seconds kFirstDelay{ 60 };
+    static constexpr int kMaxDoublings = 5;
+    struct Entry { float level = 0.0f; int failures = 0; Clock::time_point retryAt{}; };
+    std::map<int, Entry> entries;
+    bool Allowed(int monitor, float level, Clock::time_point now) const;
+    void Failed(int monitor, float level, Clock::time_point now);
+    void Succeeded(int monitor);
+    void Clear();
+};
+void ResetDesktopGammaSdrWhiteBackoff();
+
+// One monitor's follow-up for a level change (pure, exposed for testing): only in HDR, nothing during a
+// session; the shader reference updates at once; the MHC re-bake runs unless a dialog or the backoff holds it.
+struct SdrWhiteFollowPlan {
+    bool updateShader = false;
+    bool rebakeMhc = false;              // still subject to the g_mhcMaintenanceMutex try-lock
+    const char* pendingReason = nullptr; // "calibration" | "mhc_dialog_open" | "retry_backoff", or null
+};
+SdrWhiteFollowPlan PlanSdrWhiteFollow(bool mhcStale, bool ctxStale, bool inHdr, bool sessionHold,
+                                      bool dialogOpen, bool backoffAllows);
+
+// A monitor in HDR whose level moved and whose follow-up waits, as of the last check (calibration.status).
+struct DesktopGammaSdrWhitePending {
+    int monitor = -1;
+    float liveNits = 0.0f;      // what Windows reports now
+    float recordedNits = 0.0f;  // hdrMHC.dgSdrWhiteNits
+    float bakedNits = 0.0f;     // the active HDR profile's DG stamp; 0 = nothing on screen carries DG
+    const char* reason = "";    // a SdrWhiteFollowPlan reason, or "mhc_maintenance"
+};
+std::vector<DesktopGammaSdrWhitePending> GetDesktopGammaSdrWhitePending();   // thread-safe
 
 // Update MHC info labels in the appropriate SDR or HDR groupbox
 void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR);

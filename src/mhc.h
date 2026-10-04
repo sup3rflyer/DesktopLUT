@@ -40,6 +40,9 @@ struct MHC2ProfileParams {
 
     // Desktop gamma: sRGB->2.2 baked into HDR 1D LUT
     bool desktopGammaEnabled = false;
+    // Desktop gamma's reference white: the display's Windows SDR white level (SDR content brightness, nits),
+    // which Windows scales SDR content's piecewise-sRGB EOTF to in HDR. 80 = the pre-2026-10-03 hard-wired bake.
+    float sdrWhiteNits = 80.0f;
 
     // Correction grayscale (fine-tuning on top of base grayscale from Edit dialog)
     GrayscaleData correctionGrayscale;
@@ -207,6 +210,12 @@ float SrgbOETF(float v);
 float PqEOTF(float pq);
 float PqOETF(float L);
 
+// Desktop gamma on one channel's HDR drive signal (PQ): Windows composites SDR content as
+// sdrWhiteNits * sRGB_EOTF(code); over (0, sdrWhiteNits] this re-decodes it as
+// sdrWhiteNits * code^2.2. Above the SDR white (HDR highlights) and at black the signal is returned
+// unchanged. Exposed for testing.
+float DesktopGammaPQ(float pq, float sdrWhiteNits);
+
 // Grayscale evaluation (exposed for testing)
 float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs);
 float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak);
@@ -272,7 +281,9 @@ bool TriggerCalibrationLoader();
 // Start a background thread that watches the Windows Color Management registry
 // keys via RegNotifyChangeKeyValue. On any write (calibration tools, GPU
 // panels, colorcpl, other LUT loaders) it posts WM_TIMER for a debounced kick
-// on the given hwnd. Idempotent — safe to call once at GUI startup.
+// on the given hwnd. Also watches GraphicsDrivers\MonitorDataStore (the SDR
+// white level) and arms SDR_WHITE_CHECK_TIMER_ID for it. Idempotent — safe to
+// call once at GUI startup.
 void StartIcmRegistryWatcher(HWND hwnd);
 
 // Stop the watcher and wait for its thread to exit. Call before DestroyWindow.

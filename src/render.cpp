@@ -344,8 +344,11 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     bool curGamma = g_desktopGammaMode.load();
     bool curTetrahedral = g_tetrahedralInterp.load();
     bool curHdrDither = g_hdrDither.load();
+    // The SDR white level is written from the GUI thread; comparing against the value last written keeps a
+    // change from being lost to a concurrent cbDirty clear (a static monitor would never re-dirty the buffer).
+    const float curSdrWhiteNits = ctx->sdrWhiteNits.load();
     if (curGamma != ctx->lastDesktopGamma || curTetrahedral != ctx->lastTetrahedralInterp
-        || curHdrDither != ctx->lastHdrDither) {
+        || curHdrDither != ctx->lastHdrDither || curSdrWhiteNits != ctx->lastSdrWhiteNits) {
         ctx->cbDirty = true;
     }
 
@@ -364,7 +367,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         float* cbData = (float*)mapped.pData;
         // Row 0: Core settings
         cbData[0] = ctx->isHDREnabled ? 1.0f : 0.0f;
-        cbData[1] = g_sdrWhiteNits;
+        cbData[1] = curSdrWhiteNits;   // Windows SDR white level (desktop gamma reference)
         cbData[2] = ctx->maxDisplayNits;
         cbData[3] = (float)(ctx->isHDREnabled ? ctx->lutSizeHDR : ctx->lutSizeSDR);
         // Row 1: Toggles
@@ -529,12 +532,20 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // corrPreviewMatRow2.w = correction-grayscale use24Gamma (full-preview applies it per-channel,
         // independent of the shared grayscale24 suppression which doesn't apply in this path).
         cbData[143] = (corrGsFullPreview && cc.grayscale.use24Gamma) ? 1.0f : 0.0f;
+        // Row 36: desktop gamma reference white in scRGB units + its reciprocal, computed here so an 80-nit
+        // white is exactly 1.0 (the scale the fixed-80-nit desktop gamma used).
+        const float sdrWhiteScRGB = curSdrWhiteNits / 80.0f;
+        cbData[144] = sdrWhiteScRGB;
+        cbData[145] = 1.0f / sdrWhiteScRGB;
+        cbData[146] = 0.0f;
+        cbData[147] = 0.0f;
         g_context->Unmap(g_constantBuffer, 0);
 
         // Only clear dirty flag and update cached atomics AFTER successful write.
         // If Map failed, cbDirty stays true so we retry next frame.
         ctx->cbDirty = false;
         ctx->lastDesktopGamma = curGamma;
+        ctx->lastSdrWhiteNits = curSdrWhiteNits;
         ctx->lastTetrahedralInterp = curTetrahedral;
         ctx->lastHdrDither = curHdrDither;
     }

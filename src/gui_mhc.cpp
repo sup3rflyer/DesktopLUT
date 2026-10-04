@@ -13,7 +13,10 @@
 #include "displayconfig.h"
 #include <commctrl.h>
 #include <commdlg.h>
+#include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <iostream>
 
 // ============================================================================
@@ -195,7 +198,7 @@ float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR) {
 }
 
 // Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate)
-static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
+void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
     params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
         ? g_gui.monitorNames[monitorIndex] : L"Monitor";
     params.isHDR = isHDR;
@@ -300,9 +303,10 @@ static void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex
         }
     }
 
-    // Desktop gamma (HDR only): sRGB→2.2 baked into 1D LUT
+    // Desktop gamma (HDR only): sRGB→2.2 baked into 1D LUT, referenced to the display's SDR white level
     if (isHDR && mhc.desktopGammaEnabled) {
         params.desktopGammaEnabled = true;
+        params.sdrWhiteNits = IsValidSdrWhiteNits(mhc.dgSdrWhiteNits) ? mhc.dgSdrWhiteNits : 80.0f;
     }
 
     // Correction grayscale (fine-tuning on top of base)
@@ -393,16 +397,28 @@ static void ClearPermCache(MHCSettings& mhc, int monitorIndex, bool isHDR, bool 
     }
 }
 
+// The SDR white level a bake's desktop gamma used: 0 when the bake carries no DG (W-independent).
+static float DgBakeStamp(const MHC2ProfileParams& params) {
+    return (params.isHDR && params.desktopGammaEnabled) ? params.sdrWhiteNits : 0.0f;
+}
+
+bool MhcPermDgBakedAt(const MHCSettings& m, int perm, float sdrWhiteNits) {
+    if (perm < 0 || perm >= MHCSettings::PERM_COUNT || !(perm & MHCSettings::PERM_DG)) return true;
+    const float baked = m.permDgWhiteNits[perm];
+    return baked == 0.0f || SameSdrWhiteNits(baked, sdrWhiteNits);
+}
+
 bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
     if (!IsMHC2ApiAvailable()) return false;
 
-    // Check cache — fast path under lock
+    // Check cache — fast path under lock. A DG variant baked under another SDR white level than the recorded
+    // one (it raced a level change, or predates it) is regenerated rather than swapped in.
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
         const auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                                  : g_gui.monitorSettings[monitorIndex].sdrMHC;
-        if (!mhc.permNames[perm].empty()) {
+        if (!mhc.permNames[perm].empty() && MhcPermDgBakedAt(mhc, perm, mhc.dgSdrWhiteNits)) {
             // Verify file still exists on disk
             if (GetFileAttributesW(mhc.permPaths[perm].c_str()) != INVALID_FILE_ATTRIBUTES)
                 return true;
@@ -461,13 +477,16 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
     GetSystemDirectory(sysDir, MAX_PATH);
     std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
 
-    // Store in cache
+    // Store in cache, stamped with the SDR white its DG was baked at (the snapshot's): if the recorded level
+    // moved meanwhile, the stamp keeps the entry recognisably stale instead of silently passing for current.
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
         auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                            : g_gui.monitorSettings[monitorIndex].sdrMHC;
         mhc.permNames[perm] = profileName;
         mhc.permPaths[perm] = profilePath;
+        mhc.permDgWhiteNits[perm] = DgBakeStamp(params);
     }
 
     std::cout << "MHC perm: generated P" << (int)perm << " for monitor " << monitorIndex
@@ -836,6 +855,86 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         mhc.activePerm = perm;
         mhc.permNames[perm] = profileName;
         mhc.permPaths[perm] = profilePath;
+        mhc.permDgWhiteNits[perm] = DgBakeStamp(params);
+    }
+    UpdateMhcFlagsLive(monitorIndex);
+    return true;
+}
+
+// Write + install a regenerated profile (params) in place of mhcCopy's installed one, then record it as
+// the active permutation `perm` and drop the cached variants (baked from the previous data). Shared by
+// RegenerateMhcIfActive and RebakeHdrMhcForSdrWhite. Returns false (old profile kept) on any failure.
+static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSettings& mhcCopy,
+                                       const MHC2ProfileParams& params, uint8_t perm) {
+    std::vector<uint8_t> profileData;
+    if (!GenerateMHC2Profile(params, profileData)) return false;
+
+    DisplayInfo displayInfo;
+    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return false;
+
+    // Unique filename to bypass caching
+    wchar_t monTag[8];
+    swprintf_s(monTag, L"Mon%d", monitorIndex);
+    std::wstring newProfileName = L"DesktopLUT_" + std::wstring(monTag)
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
+
+    wchar_t tempDir[MAX_PATH];
+    GetTempPathW(MAX_PATH, tempDir);
+    std::wstring tempPath = std::wstring(tempDir) + newProfileName;
+
+    // Save old profile info for rollback if new install fails. A named-but-DISABLED old profile
+    // (mhc.remove / calibration.enter swapped in the identity profile) is already out of scanout:
+    // quiet removal only, and no rollback re-association (see GenerateAndInstallMhcProfile).
+    std::wstring oldProfileName = mhcCopy.profileName;
+    const bool oldActive = mhcCopy.enabled;
+
+    if (!WriteMHC2Profile(profileData, tempPath)) return false;
+
+    // Remove old profile AFTER new one is written and ready to install
+    if (oldActive) RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    else RemoveMHC2ProfileQuiet(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+
+    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+        std::cerr << "RegenerateMhcIfActive: InstallMHC2Profile failed for monitor "
+                  << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
+        DeleteFileW(tempPath.c_str());
+        // Rollback: re-associate old profile if it was the active one and still exists
+        if (oldActive && !oldProfileName.empty()) {
+            ReassociateMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        }
+        return false;
+    }
+    DeleteFileW(tempPath.c_str());
+
+    // Real profile active again — drop any identity stand-in (see GenerateAndInstallMhcProfile).
+    DisengageIdentityForDisplay(monitorIndex, isHDR, displayInfo);
+
+    // Clean up old profile file only after new one is confirmed installed
+    if (!oldProfileName.empty()) {
+        wchar_t sysDir[MAX_PATH];
+        GetSystemDirectory(sysDir, MAX_PATH);
+        std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldProfileName;
+        DeleteFileW(oldPath.c_str());
+    }
+
+    // Update stored name — profile is now active, ensure enabled is true
+    wchar_t sysDir2[MAX_PATH];
+    GetSystemDirectory(sysDir2, MAX_PATH);
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                          : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        // Clear all cached permutation profiles (base data changed, variants are stale)
+        ClearPermCache(mhc, monitorIndex, isHDR, false);
+        mhc.enabled = true;
+        mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
+        mhc.profileName = newProfileName;
+        mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
+        mhc.activePerm = perm;
+        mhc.permNames[perm] = newProfileName;
+        mhc.permPaths[perm] = mhc.profilePath;
+        mhc.permDgWhiteNits[perm] = DgBakeStamp(params);
     }
     UpdateMhcFlagsLive(monitorIndex);
     return true;
@@ -861,79 +960,213 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     MHC2ProfileParams params;
     BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params);
 
-    std::vector<uint8_t> profileData;
-    if (!GenerateMHC2Profile(params, profileData)) return;
-
-    DisplayInfo displayInfo;
-    if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return;
-
-    // Unique filename to bypass caching
-    wchar_t monTag[8];
-    swprintf_s(monTag, L"Mon%d", monitorIndex);
-    std::wstring newProfileName = L"DesktopLUT_" + std::wstring(monTag)
-        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
-
-    wchar_t tempDir[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempDir);
-    std::wstring tempPath = std::wstring(tempDir) + newProfileName;
-
-    // Save old profile info for rollback if new install fails. A named-but-DISABLED old profile
-    // (mhc.remove / calibration.enter swapped in the identity profile) is already out of scanout:
-    // quiet removal only, and no rollback re-association (see GenerateAndInstallMhcProfile).
-    std::wstring oldProfileName = mhcCopy.profileName;
-    const bool oldActive = mhcCopy.enabled;
-
-    if (!WriteMHC2Profile(profileData, tempPath)) return;
-
-    // Remove old profile AFTER new one is written and ready to install
-    if (oldActive) RemoveMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-    else RemoveMHC2ProfileQuiet(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-
-    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
-        std::cerr << "RegenerateMhcIfActive: InstallMHC2Profile failed for monitor "
-                  << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
-        DeleteFileW(tempPath.c_str());
-        // Rollback: re-associate old profile if it was the active one and still exists
-        if (oldActive && !oldProfileName.empty()) {
-            ReassociateMHC2Profile(oldProfileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-        }
-        return;
-    }
-    DeleteFileW(tempPath.c_str());
-
-    // Real profile active again — drop any identity stand-in (see GenerateAndInstallMhcProfile).
-    DisengageIdentityForDisplay(monitorIndex, isHDR, displayInfo);
-
-    // Clean up old profile file only after new one is confirmed installed
-    if (!oldProfileName.empty()) {
-        wchar_t sysDir[MAX_PATH];
-        GetSystemDirectory(sysDir, MAX_PATH);
-        std::wstring oldPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + oldProfileName;
-        DeleteFileW(oldPath.c_str());
-    }
-
     // Recompute active permutation (corrections may have changed)
-    uint8_t perm = ComputeMhcPermutation(mhcCopy, isHDR);
+    ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, ComputeMhcPermutation(mhcCopy, isHDR));
+}
 
-    // Update stored name — profile is now active, ensure enabled is true
-    wchar_t sysDir2[MAX_PATH];
-    GetSystemDirectory(sysDir2, MAX_PATH);
+// ============================================================================
+// SECTION: Desktop Gamma reference white (Windows SDR white level)
+// ============================================================================
+
+bool SameSdrWhiteNits(float a, float b) {
+    return std::fabs(a - b) < 0.01f;
+}
+
+bool HdrMhcSdrWhiteStale(const MHCSettings& mhc, float liveNits) {
+    if (!SameSdrWhiteNits(mhc.dgSdrWhiteNits, liveNits)) return true;
+    return mhc.enabled && !mhc.profileName.empty() && !MhcPermDgBakedAt(mhc, mhc.activePerm, liveNits);
+}
+
+bool RebakeHdrMhcForSdrWhite(int monitorIndex, float sdrWhiteNits, bool* rebakeFailed) {
+    if (rebakeFailed) *rebakeFailed = false;
+    if (!IsValidSdrWhiteNits(sdrWhiteNits)) return false;
+    float oldNits = 0.0f;
+    bool rebake = false;
+    int dropped = 0;
+    MHCSettings mhcCopy;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
-        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
-                          : g_gui.monitorSettings[monitorIndex].sdrMHC;
-        // Clear all cached permutation profiles (base data changed, variants are stale)
-        ClearPermCache(mhc, monitorIndex, isHDR, false);
-        mhc.enabled = true;
-        mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
-        mhc.profileName = newProfileName;
-        mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
-        mhc.activePerm = perm;
-        mhc.permNames[perm] = newProfileName;
-        mhc.permPaths[perm] = mhc.profilePath;
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        auto& mhc = g_gui.monitorSettings[monitorIndex].hdrMHC;
+        // The ACTIVE permutation decides, not the settings: a whitelist / hotkey may have swapped DG out for
+        // now, and an edit session may have stripped another bit. Re-bake exactly what is on screen, when its
+        // DG was baked under another level.
+        rebake = mhc.enabled && !mhc.profileName.empty() && !MhcPermDgBakedAt(mhc, mhc.activePerm, sdrWhiteNits);
+        if (SameSdrWhiteNits(mhc.dgSdrWhiteNits, sdrWhiteNits) && !rebake) return false;
+        oldNits = mhc.dgSdrWhiteNits;
+        mhc.dgSdrWhiteNits = sdrWhiteNits;
+        // Cached variants whose DG was baked under another level are stale: forget them, so the next swap to
+        // one regenerates it. Their files stay for the startup orphan cleanup: deleting one could pull it from
+        // under a permutation swap on another thread that has already read its name.
+        for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+            if (k == (int)mhc.activePerm || mhc.permNames[k].empty() || MhcPermDgBakedAt(mhc, k, sdrWhiteNits))
+                continue;
+            mhc.permNames[k].clear();
+            mhc.permPaths[k].clear();
+            dropped++;
+        }
+        if (rebake) mhcCopy = mhc;
     }
-    UpdateMhcFlagsLive(monitorIndex);
+    std::cout << "[Desktop gamma] monitor " << monitorIndex << ": SDR white level " << oldNits << " -> "
+              << sdrWhiteNits << " nits" << (rebake ? ", re-baking the HDR MHC profile" : "");
+    if (dropped > 0) std::cout << ", " << dropped << " stale cached DG variant(s) dropped";
+    std::cout << std::endl;
+    if (rebake) {
+        MHC2ProfileParams params;
+        BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/true, monitorIndex, mhcCopy.activePerm, params);
+        if (!IsMHC2ApiAvailable() ||
+            !ReplaceInstalledMhcProfile(monitorIndex, true, mhcCopy, params, mhcCopy.activePerm)) {
+            // The installed profile keeps its old stamp, so it stays recognisably stale; the caller backs off.
+            if (rebakeFailed) *rebakeFailed = true;
+            std::cerr << "[Desktop gamma] monitor " << monitorIndex << ": re-bake failed" << std::endl;
+        }
+    }
+    return true;
+}
+
+bool SdrWhiteRebakeBackoff::Allowed(int monitor, float level, Clock::time_point now) const {
+    auto it = entries.find(monitor);
+    if (it == entries.end() || !SameSdrWhiteNits(it->second.level, level)) return true;
+    return now >= it->second.retryAt;
+}
+
+void SdrWhiteRebakeBackoff::Failed(int monitor, float level, Clock::time_point now) {
+    Entry& e = entries[monitor];
+    if (e.failures == 0 || !SameSdrWhiteNits(e.level, level)) { e.level = level; e.failures = 0; }
+    e.failures++;
+    e.retryAt = now + kFirstDelay * (1 << (std::min)(e.failures - 1, kMaxDoublings));
+}
+
+void SdrWhiteRebakeBackoff::Succeeded(int monitor) { entries.erase(monitor); }
+
+void SdrWhiteRebakeBackoff::Clear() { entries.clear(); }
+
+SdrWhiteFollowPlan PlanSdrWhiteFollow(bool mhcStale, bool ctxStale, bool inHdr, bool sessionHold,
+                                      bool dialogOpen, bool backoffAllows) {
+    SdrWhiteFollowPlan plan;
+    // Outside HDR the level is not desktop gamma's reference: the last HDR-mode value stays in force.
+    if ((!mhcStale && !ctxStale) || !inHdr) return plan;
+    // Never mid-session: a calibration or a live grayscale edit measures through the installed stack.
+    if (sessionHold) { plan.pendingReason = "calibration"; return plan; }
+    plan.updateShader = ctxStale;
+    if (!mhcStale) return plan;
+    if (dialogOpen) plan.pendingReason = "mhc_dialog_open";        // a dialog holds a reference into the settings
+    else if (!backoffAllows) plan.pendingReason = "retry_backoff"; // the last re-bake at this level failed
+    else plan.rebakeMhc = true;
+    return plan;
+}
+
+// GUI-thread state: the backoff and the last published pending set (read by calibration.status on the pipe
+// thread, hence its own mutex).
+static SdrWhiteRebakeBackoff s_sdrWhiteBackoff;
+static std::mutex s_sdrWhitePendingMutex;
+static std::vector<DesktopGammaSdrWhitePending> s_sdrWhitePending;
+
+std::vector<DesktopGammaSdrWhitePending> GetDesktopGammaSdrWhitePending() {
+    std::lock_guard<std::mutex> lk(s_sdrWhitePendingMutex);
+    return s_sdrWhitePending;
+}
+
+void ResetDesktopGammaSdrWhiteBackoff() {
+    s_sdrWhiteBackoff.Clear();
+}
+
+void RefreshDesktopGammaSdrWhite(const char* reason) {
+    const bool sessionHold = IsCalibrationOrLiveEditActive();
+    const auto now = SdrWhiteRebakeBackoff::Clock::now();
+    std::vector<DesktopGammaSdrWhitePending> pending;
+    bool settingsChanged = false;
+    bool maintenanceBusy = false;
+    for (int i = 0; i < (int)g_gui.monitors.size(); i++) {
+        HMONITOR hmon = g_gui.monitors[i];
+        DisplayInfo di;
+        float nits = 0.0f;
+        if (!hmon || !ResolveDisplayInfoForHMonitor(hmon, di) || !QuerySdrWhiteLevelNits(di, nits)) continue;
+
+        // Anything to follow? Checked first, so the steady state costs one DisplayConfig query per monitor.
+        bool mhcStale = false;
+        float recordedNits = 0.0f, bakedNits = 0.0f;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            if (i < (int)g_gui.monitorSettings.size()) {
+                const MHCSettings& m = g_gui.monitorSettings[i].hdrMHC;
+                mhcStale = HdrMhcSdrWhiteStale(m, nits);
+                recordedNits = m.dgSdrWhiteNits;
+                if (m.enabled && !m.profileName.empty() && (m.activePerm & MHCSettings::PERM_DG))
+                    bakedNits = m.permDgWhiteNits[m.activePerm];
+            }
+        }
+        bool ctxStale = false;
+        {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            for (const auto& ctx : g_monitors)
+                if (ctx.index == i && !SameSdrWhiteNits(ctx.sdrWhiteNits.load(), nits)) ctxStale = true;
+        }
+        if (!mhcStale && !ctxStale) { s_sdrWhiteBackoff.Succeeded(i); continue; }
+
+        const SdrWhiteFollowPlan plan = PlanSdrWhiteFollow(
+            mhcStale, ctxStale, IsDisplayInHdrMode(di, hmon), sessionHold,
+            g_mhcEditDialogOpen.load(), s_sdrWhiteBackoff.Allowed(i, nits, now));
+        const char* waiting = plan.pendingReason;
+
+        if (plan.updateShader) {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            for (auto& ctx : g_monitors) {
+                if (ctx.index != i) continue;
+                ctx.sdrWhiteNits.store(nits);       // the render thread re-dirties its constant buffer on the change
+                ctx.redrawRequested = true;          // a static desktop delivers no new frame to carry it
+            }
+        }
+        if (plan.rebakeMhc) {
+            // The processing thread's startup maintenance deletes profile files its settings snapshot doesn't
+            // name: never install a fresh profile under it. Retried shortly.
+            std::unique_lock<std::mutex> maintenance(g_mhcMaintenanceMutex, std::try_to_lock);
+            if (!maintenance.owns_lock()) {
+                maintenanceBusy = true;
+                waiting = "mhc_maintenance";
+            } else {
+                bool failed = false;
+                if (RebakeHdrMhcForSdrWhite(i, nits, &failed)) {
+                    settingsChanged = true;
+                    recordedNits = nits;
+                    if (i == g_gui.currentMonitor) UpdateMhcInfoDisplay(i, true);
+                }
+                if (failed) {
+                    s_sdrWhiteBackoff.Failed(i, nits, now);   // remove/re-associate flickers: never every tick
+                    waiting = "retry_backoff";
+                } else {
+                    s_sdrWhiteBackoff.Succeeded(i);
+                }
+            }
+        }
+        if (waiting) pending.push_back({ i, nits, recordedNits, bakedNits, waiting });
+    }
+
+    // Publish for calibration.status; log only when the waiting set changes (the checks repeat).
+    bool pendingChanged = false;
+    {
+        std::lock_guard<std::mutex> lk(s_sdrWhitePendingMutex);
+        pendingChanged = pending.size() != s_sdrWhitePending.size();
+        for (size_t k = 0; !pendingChanged && k < pending.size(); k++) {
+            const auto& a = pending[k];
+            const auto& b = s_sdrWhitePending[k];
+            pendingChanged = a.monitor != b.monitor || std::strcmp(a.reason, b.reason) != 0
+                          || !SameSdrWhiteNits(a.liveNits, b.liveNits);
+        }
+        s_sdrWhitePending = pending;
+    }
+    if (pendingChanged) {
+        for (const auto& w : pending)
+            std::cout << "[Desktop gamma] monitor " << w.monitor << ": SDR white " << w.liveNits
+                      << " nits waiting (" << w.reason << ", " << reason << ")" << std::endl;
+        if (pending.empty()) std::cout << "[Desktop gamma] nothing waiting (" << reason << ")" << std::endl;
+    }
+    if (settingsChanged) {
+        std::cout << "[Desktop gamma] SDR white level followed (" << reason << ")" << std::endl;
+        SaveSettings();
+    }
+    if (maintenanceBusy && g_gui.hwndMain)
+        SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
 }
 
 // ============================================================================

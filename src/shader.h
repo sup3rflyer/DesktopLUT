@@ -6,6 +6,47 @@
 #include "../shared/peak_detect.h"     // g_peakReduceCSSource / g_peakSmoothCSSource
 #include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the hook)
 #include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF output dither, shared with the hook)
+#include <cmath>
+
+// Desktop gamma (HDR, overlay path; the MHC path bakes the same mapping: DesktopGammaPQ in mhc_icc.cpp).
+// In HDR, Windows composites SDR content as W * sRGB_EOTF(code), W = the display's SDR white level ("SDR
+// content brightness"). This re-decodes the range up to W with a pure 2.2 power: W * code^2.2. Per channel,
+// sign preserved (wide-gamut scRGB); the part above W (HDR highlights) passes through. `white` = W in scRGB
+// units (nits / 80) and `whiteRcp` = 1 / white, both from the CPU, so an 80-nit white is exactly 1.0 and the
+// result is the pre-2026-10-03 fixed-80-nit shader's bit for bit. `lut` = BuildDesktopGammaLut over [0, 1]
+// (texel centres at (i + 0.5) / N), sampled linearly: 3 texture fetches instead of 6 pow per pixel.
+#define DLUT_DESKTOP_GAMMA_HLSL R"DGH(
+float3 DlutDesktopGamma(float3 input, float white, float whiteRcp, Texture2D<float> lut, SamplerState linearClamp) {
+    float3 absInput = abs(input);
+    float3 signInput = sign(input);
+    float3 sdrPart = min(absInput * whiteRcp, 1.0);
+    float3 hdrPart = max(absInput - white, 0.0);
+    float dgScale = 1023.0f / 1024.0f;
+    float dgBias = 0.5f / 1024.0f;
+    float3 corrected = float3(
+        lut.SampleLevel(linearClamp, float2(sdrPart.r * dgScale + dgBias, 0.5), 0),
+        lut.SampleLevel(linearClamp, float2(sdrPart.g * dgScale + dgBias, 0.5), 0),
+        lut.SampleLevel(linearClamp, float2(sdrPart.b * dgScale + dgBias, 0.5), 0));
+    return (corrected * white + hdrPart) * signInput;
+}
+)DGH"
+
+// The table DlutDesktopGamma samples: f(L) = sRGB_OETF(L)^2.2 at L = i / (size - 1). The HLSL's texel mapping
+// assumes size = DLUT_DESKTOP_GAMMA_LUT_SIZE.
+constexpr int DLUT_DESKTOP_GAMMA_LUT_SIZE = 1024;
+inline void BuildDesktopGammaLut(float* out, int size) {
+    for (int i = 0; i < size; i++) {
+        float L = static_cast<float>(i) / static_cast<float>(size - 1);
+        // sRGB OETF: linear → encoded signal
+        float srgb;
+        if (L <= 0.0031308f)
+            srgb = 12.92f * L;
+        else
+            srgb = 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
+        // Decode with 2.2 power law
+        out[i] = powf(srgb > 0.0f ? srgb : 0.0f, 2.2f);
+    }
+}
 
 // Vertex shader: fullscreen triangle (no vertex buffer)
 inline const char* g_vsSource = R"(
@@ -63,6 +104,8 @@ cbuffer LUTParams : register(b0) {
     float4 corrPreviewMatRow0;     // xyz = result row 0; w = corrGsFullPreview (0/1)
     float4 corrPreviewMatRow1;     // xyz = result row 1; w = base-LUT size (entries)
     float4 corrPreviewMatRow2;     // xyz = result row 2; w = reserved
+    float sdrWhiteScRGB;           // Desktop gamma reference white: Windows SDR white level / 80 (scRGB units)
+    float sdrWhiteScRGBRcp;        // 1 / sdrWhiteScRGB (CPU-computed: exactly 1.0 at 80 nits)
 };
 
 Texture2D<float4> captureTexture : register(t0);
@@ -542,6 +585,10 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 )"
 DLUT_HDR_DITHER_HLSL
 R"(
+// Desktop gamma (sRGB -> 2.2 for SDR content in HDR, referenced to the SDR white level): DLUT_DESKTOP_GAMMA_HLSL.
+)"
+DLUT_DESKTOP_GAMMA_HLSL
+R"(
 // Three decorrelated blue-noise samples per pixel from the static tile. R8_UNORM holds b/255; remapped to the
 // hook's texel-centre (b + 0.5) / 256 so both paths draw the same noise (u strictly inside (0, 1)).
 float3 HdrDitherNoise(float2 pos) {
@@ -618,22 +665,11 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // ═══════════════════════════════════════════════════════════════════════
 
         // Desktop gamma correction (sRGB EOTF -> 2.2 power law)
-        // Fixes Windows using sRGB EOTF - applies to ALL SDR-range content (sub 80 nits)
-        // Sign preserved for wide-gamut; HDR highlights (>80 nits) pass through unchanged
+        // Fixes Windows using sRGB EOTF - applies to ALL SDR-range content (up to the SDR white level)
+        // Sign preserved for wide-gamut; HDR highlights (above the SDR white) pass through unchanged
         // Uses precomputed 1D LUT (0 pow) instead of analytical sRGB OETF+pow (6 pow)
         if (desktopGamma > 0.5) {
-            float3 absInput = abs(input);
-            float3 signInput = sign(input);
-            float3 sdrPart = min(absInput, 1.0);
-            float3 hdrPart = max(absInput - 1.0, 0.0);
-            // UV mapping: texel centers at (i+0.5)/1024, map [0,1] linear → texel space
-            float dgScale = 1023.0f / 1024.0f;
-            float dgBias = 0.5f / 1024.0f;
-            float3 corrected = float3(
-                desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.r * dgScale + dgBias, 0.5), 0),
-                desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.g * dgScale + dgBias, 0.5), 0),
-                desktopGammaLUT.SampleLevel(linearSampler, float2(sdrPart.b * dgScale + dgBias, 0.5), 0));
-            input = (corrected + hdrPart) * signInput;
+            input = DlutDesktopGamma(input, sdrWhiteScRGB, sdrWhiteScRGBRcp, desktopGammaLUT, linearSampler);
         }
 
         // ═══════════════════════════════════════════════════════════════════════

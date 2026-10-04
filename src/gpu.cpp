@@ -215,7 +215,8 @@ bool InitD3D() {
 
     // Create constant buffer for shader parameters
     D3D11_BUFFER_DESC cbDesc = {};
-    cbDesc.ByteWidth = 576;  // 144 floats (36 float4s) - grayscaleR/G/B[8] + motion bar + full-preview matrix (132-143)
+    cbDesc.ByteWidth = 592;  // 148 floats (37 float4s) - grayscaleR/G/B[8] + motion bar + full-preview matrix (132-143)
+                             //   + desktop gamma SDR white (144-145)
     cbDesc.Usage = D3D11_USAGE_DYNAMIC;
     cbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     cbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -255,22 +256,12 @@ bool InitD3D() {
     std::cout << "Blue noise dithering: enabled (64x64 texture)" << std::endl;
 
     // Create desktop gamma LUT (precomputed sRGB→2.2 correction)
-    // f(L) = (sRGB_OETF(L))^2.2 for L in [0,1]
+    // f(L) = (sRGB_OETF(L))^2.2 for L in [0,1], L relative to the SDR white (shader.h DlutDesktopGamma)
     // Replaces 6 pow() per pixel with 3 texture samples
     {
-        const int DG_LUT_SIZE = 1024;
+        const int DG_LUT_SIZE = DLUT_DESKTOP_GAMMA_LUT_SIZE;
         float dgData[DG_LUT_SIZE];
-        for (int i = 0; i < DG_LUT_SIZE; i++) {
-            float L = static_cast<float>(i) / static_cast<float>(DG_LUT_SIZE - 1);
-            // sRGB OETF: linear → encoded signal
-            float srgb;
-            if (L <= 0.0031308f)
-                srgb = 12.92f * L;
-            else
-                srgb = 1.055f * powf(L, 1.0f / 2.4f) - 0.055f;
-            // Decode with 2.2 power law
-            dgData[i] = powf(std::max(srgb, 0.0f), 2.2f);
-        }
+        BuildDesktopGammaLut(dgData, DG_LUT_SIZE);
 
         D3D11_TEXTURE2D_DESC dgDesc = {};
         dgDesc.Width = DG_LUT_SIZE;

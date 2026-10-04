@@ -1222,6 +1222,11 @@ void CreateGUILayout(HWND hwnd) {
 
     // Launch the registry watcher that detects third-party writes to the ICM
     // keys (calibration tools, GPU control panels, colorcpl) and fires a kick
-    // on demand. Started here so it's tied to GUI window lifetime.
+    // on demand. Started here so it's tied to GUI window lifetime. It also
+    // watches the per-display SDR white level (SDR content brightness).
     StartIcmRegistryWatcher(hwnd);
+
+    // First desktop-gamma SDR white check once the message loop runs: an HDR profile saved under another
+    // SDR white level (or before the level was tracked: 80 nits) is re-baked to the live one.
+    SetTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
 }

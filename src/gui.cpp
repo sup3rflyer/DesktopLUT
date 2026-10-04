@@ -910,6 +910,9 @@ static bool AnyMhcProfileActive() {
 // burst restarts the schedule, which is the desired behavior — the most recent
 // transition is the one whose settling we need to outlast.
 static void StartMhcTransitionBurst(HWND hwnd, const char* reason) {
+    // A display transition is a fresh chance for a desktop-gamma re-bake that failed before (it backs off
+    // between steady-state checks; a transition flickers anyway).
+    ResetDesktopGammaSdrWhiteBackoff();
     if (!AnyMhcProfileActive()) return;
     std::cout << "[MHC] Transition burst started (" << reason << ")" << std::endl;
     g_mhcBurstStage = 0;
@@ -2882,6 +2885,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // the OS default for its monitor, put it back. Runs independently
             // of the processing thread so MHC-only users are also protected.
             VerifyAndRestoreMhcProfiles();
+            // Safety net for the SDR white level: the MonitorDataStore registry watch and the display /
+            // setting-change triggers are the prompt paths; this catches a level change none of them saw
+            // (cheap when nothing changed: a DisplayConfig query per monitor).
+            RefreshDesktopGammaSdrWhite("periodic");
+            return 0;
+        }
+        if (wParam == SDR_WHITE_CHECK_TIMER_ID) {
+            KillTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID);
+            RefreshDesktopGammaSdrWhite("SDR white / display change");
             return 0;
         }
         if (wParam == MHC_BLIND_KICK_TIMER_ID) {
@@ -2929,6 +2941,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // DesktopLUT_* entries Windows could re-broker to.
             VerifyAndRestoreMhcProfiles();
             SweepStaleMhcAssociations();
+            // An HDR switch makes the SDR white level desktop gamma's reference again: re-bake before the
+            // hardware kick below so the kick loads the re-baked profile.
+            RefreshDesktopGammaSdrWhite("transition burst");
             // Hardware layer: unconditional reload. Associations can read
             // correct while the hardware LUT still has the previous mode's
             // curves — undetectable by any query, so always kick.
@@ -2952,6 +2967,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // switching (e.g. video players matching content rate) hits this path
         // constantly, so always run the re-assertion burst.
         StartMhcTransitionBurst(hwnd, "display change");
+        // HDR on/off and hot-plug change which monitors' SDR white level is desktop gamma's reference.
+        SetTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
 
         // Monitor hotplug: re-enumerate and update if count or handles changed
         std::vector<HMONITOR> newMonitors;
@@ -3068,6 +3085,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::cout << "[GUI] ImmersiveColorSet changed, debouncing reinit..." << std::endl;
             SetTimer(hwnd, SETTINGS_CHANGE_TIMER_ID, 500, nullptr);
         }
+        // Any setting change may be the SDR content brightness: debounced re-read (a DisplayConfig query per
+        // monitor when nothing changed). The MonitorDataStore registry watch is the direct signal.
+        SetTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
         break;  // Let DefWindowProc also process
 
     case WM_DEVICECHANGE:
@@ -3153,6 +3173,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, MHC_BLIND_KICK_TIMER_ID);
         KillTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID);
         StopIcmRegistryWatcher();
+        KillTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID);
         // Unregister GUI-side display power notification
         if (g_guiDisplayPowerNotify) {
             UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);

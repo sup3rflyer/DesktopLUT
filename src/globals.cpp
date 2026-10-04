@@ -146,6 +146,7 @@ std::mutex g_vrrWhitelistMutex;                          // Protects g_vrrWhitel
 std::mutex g_gammaWhitelistMutex;  // Protects g_gammaWhitelist, g_gammaWhitelistMatch, g_gammaWhitelistOverrideProcess
 std::mutex g_colorCorrectionMutex;
 std::mutex g_monitorSettingsMutex; // Protects g_gui.monitorSettings (MHC profileName/enabled fields)
+std::mutex g_mhcMaintenanceMutex;  // Startup MHC maintenance vs automatic re-bakes (see globals.h)
 std::vector<PendingColorCorrection> g_pendingColorCorrections;
 std::atomic<bool> g_hasPendingColorCorrections{ false };
 
@@ -170,12 +171,6 @@ HANDLE g_singleInstanceMutex = nullptr;
 // ============================================================================
 
 std::atomic<bool> g_tearingSupported{ false };
-
-// ============================================================================
-// SDR White Point
-// ============================================================================
-
-float g_sdrWhiteNits = 80.0f;
 
 // ============================================================================
 // Watchdog Timer

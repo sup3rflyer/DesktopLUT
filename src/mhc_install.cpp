@@ -645,17 +645,29 @@ static void IcmWatcherThreadFunc() {
     // Paths watched, in priority order. If any open fails (Windows SKU
     // differences, missing subkey before first MHC profile ever installed),
     // we silently skip that key — partial coverage is still useful.
+    // Each target arms its own debounced GUI timer: the ICM keys a calibration
+    // kick, MonitorDataStore a re-read of the SDR white level (Windows persists
+    // the "SDR content brightness" slider there as SDRWhiteLevel, per display,
+    // next to HDREnabled) — desktop gamma's reference white.
     struct WatchTarget {
         HKEY root;
         const wchar_t* subkey;
+        UINT_PTR timerId;
+        UINT debounceMs;
     };
     const WatchTarget targets[] = {
         { HKEY_CURRENT_USER,
-          L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display" },
+          L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display",
+          MHC_REGISTRY_KICK_TIMER_ID, MHC_REGISTRY_KICK_DEBOUNCE_MS },
         { HKEY_LOCAL_MACHINE,
-          L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display" },
+          L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\ProfileAssociations\\Display",
+          MHC_REGISTRY_KICK_TIMER_ID, MHC_REGISTRY_KICK_DEBOUNCE_MS },
         { HKEY_CURRENT_USER,
-          L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\Display" },
+          L"Software\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\Display",
+          MHC_REGISTRY_KICK_TIMER_ID, MHC_REGISTRY_KICK_DEBOUNCE_MS },
+        { HKEY_LOCAL_MACHINE,
+          L"SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers\\MonitorDataStore",
+          SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS },
     };
     const int kNumTargets = sizeof(targets) / sizeof(targets[0]);
 
@@ -718,14 +730,13 @@ static void IcmWatcherThreadFunc() {
         if (wr >= WAIT_OBJECT_0 + 1 && wr < WAIT_OBJECT_0 + (DWORD)waitCount) {
             int idx = eventToTarget[wr - WAIT_OBJECT_0 - 1];
 
-            // Debounced kick request: SetTimer with the same ID on each
-            // registry write restarts the countdown, so a burst of writes
-            // collapses into a single kick when the dust settles. SetTimer
-            // is thread-safe across threads owning the same window handle.
+            // Debounced request: SetTimer with the same ID on each registry
+            // write restarts the countdown, so a burst of writes collapses
+            // into a single action when the dust settles. SetTimer is
+            // thread-safe across threads owning the same window handle.
             HWND hwnd = g_icmWatcherHwnd.load();
             if (hwnd) {
-                SetTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID,
-                         MHC_REGISTRY_KICK_DEBOUNCE_MS, nullptr);
+                SetTimer(hwnd, targets[idx].timerId, targets[idx].debounceMs, nullptr);
             }
 
             // Re-arm this key's notification (RegNotifyChangeKeyValue is one-shot)

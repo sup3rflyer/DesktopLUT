@@ -165,6 +165,10 @@ extern std::mutex g_vrrWhitelistMutex;                 // Protects g_vrrWhitelis
 extern std::mutex g_gammaWhitelistMutex;  // Protects g_gammaWhitelist, g_gammaWhitelistMatch, g_gammaWhitelistOverrideProcess
 extern std::mutex g_colorCorrectionMutex;
 extern std::mutex g_monitorSettingsMutex; // Protects g_gui.monitorSettings (MHC profileName/enabled fields)
+extern std::mutex g_mhcMaintenanceMutex;  // Serializes the processing thread's startup MHC maintenance (orphan-file
+                                          // cleanup / stale sweep / reapply, all keyed by a settings snapshot) with
+                                          // automatic GUI-thread re-bakes (desktop gamma SDR white). Taken before
+                                          // g_monitorSettingsMutex, never inside it.
 extern std::vector<PendingColorCorrection> g_pendingColorCorrections;
 extern std::atomic<bool> g_hasPendingColorCorrections;  // Fast check to avoid mutex lock
 
@@ -189,12 +193,6 @@ extern HANDLE g_singleInstanceMutex;
 // ============================================================================
 
 extern std::atomic<bool> g_tearingSupported;
-
-// ============================================================================
-// SDR White Point
-// ============================================================================
-
-extern float g_sdrWhiteNits;
 
 // ============================================================================
 // Watchdog Timer

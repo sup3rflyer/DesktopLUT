@@ -397,20 +397,27 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         return;
     }
 
-    // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles.
-    // Sweep stale association entries first — orphan cleanup deletes files but
-    // can't disassociate (no LUID for prior-session state), and Windows can
-    // re-broker defaults to dead entries during mode switches.
-    CleanupOrphanedMhcProfiles();
-    SweepStaleMhcAssociations();
-    ReapplyAllMhcProfiles();
+    {
+        // Held across the block: the cleanup keys "orphan" on a settings snapshot, so a GUI-thread re-bake
+        // (desktop gamma following the SDR white level) installing a new profile mid-scan would have its
+        // fresh file deleted as an orphan. The GUI side try-locks and retries.
+        std::lock_guard<std::mutex> maintenanceLock(g_mhcMaintenanceMutex);
 
-    // Auto-generate identity MHC profiles for monitors with DG enabled but no profile
-    if (g_userDesktopGammaMode.load()) {
-        for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
-            auto& mhc = g_gui.monitorSettings[i].hdrMHC;
-            if (mhc.desktopGammaEnabled && !mhc.enabled) {
-                GenerateAndInstallMhcProfile(i, true);
+        // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles.
+        // Sweep stale association entries first — orphan cleanup deletes files but
+        // can't disassociate (no LUID for prior-session state), and Windows can
+        // re-broker defaults to dead entries during mode switches.
+        CleanupOrphanedMhcProfiles();
+        SweepStaleMhcAssociations();
+        ReapplyAllMhcProfiles();
+
+        // Auto-generate identity MHC profiles for monitors with DG enabled but no profile
+        if (g_userDesktopGammaMode.load()) {
+            for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
+                auto& mhc = g_gui.monitorSettings[i].hdrMHC;
+                if (mhc.desktopGammaEnabled && !mhc.enabled) {
+                    GenerateAndInstallMhcProfile(i, true);
+                }
             }
         }
     }

@@ -126,6 +126,8 @@
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
     <ClCompile Include="tests\test_hdr_dither.cpp" />
+    <ClCompile Include="tests\test_desktop_gamma.cpp" />
+    <ClCompile Include="tests\test_desktop_gamma_refresh.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

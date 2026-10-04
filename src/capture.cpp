@@ -129,6 +129,17 @@ done:
     ctx->isHDRAtom.store(ctx->isHDREnabled, std::memory_order_relaxed);
     ctx->isFP16SDR = isFP16 && !ctx->isHDRCapable;
 
+    // Desktop gamma's reference white in the shader path: the SDR white level Windows composites SDR content
+    // to in HDR (also followed at runtime by RefreshDesktopGammaSdrWhite). Outside HDR the last value stays.
+    if (ctx->isHDREnabled) {
+        float sdrWhite = 0.0f;
+        if (QuerySdrWhiteNitsForHMonitor(ctx->monitor, sdrWhite)) {
+            ctx->sdrWhiteNits.store(sdrWhite);
+            ctx->cbDirty = true;
+            std::cout << "  SDR white level: " << sdrWhite << " nits" << std::endl;
+        }
+    }
+
     // Calculate frame time from refresh rate (with 5ms margin for timing tolerance)
     if (duplDesc.ModeDesc.RefreshRate.Numerator > 0) {
         double frameTimeExact = 1000.0 * duplDesc.ModeDesc.RefreshRate.Denominator / duplDesc.ModeDesc.RefreshRate.Numerator;

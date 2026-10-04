@@ -101,6 +101,8 @@ struct JsonValue {
 
 JsonValue JBool(bool v) { JsonValue j; j.type = JsonValue::Bool; j.b = v; return j; }
 JsonValue JNum(double v) { JsonValue j; j.type = JsonValue::Num; j.num = v; return j; }
+// Luminance for the wire: Windows' SDR white steps are 0.08 nit, so 2 decimals are exact (no float tail).
+static double RoundNits(float v) { return std::round((double)v * 100.0) / 100.0; }
 JsonValue JStr(const std::string& v) { JsonValue j; j.type = JsonValue::Str; j.str = v; return j; }
 JsonValue JObj() { JsonValue j; j.type = JsonValue::Obj; return j; }
 JsonValue JArr() { JsonValue j; j.type = JsonValue::Arr; return j; }
@@ -437,6 +439,8 @@ void FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
     if (st.startedForPreview) StopProcessing();
     if (st.startedOverlayForPreview) DwmHookReevaluateOverlay();
     SaveSettings();
+    // Desktop gamma waited for the live edit: catch up with the SDR white level (debounced re-check).
+    if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
 }
 
 // Abort any active grayscale live preview (e.g. the client died between begin and
@@ -711,6 +715,15 @@ void HandleStateGet(JsonValue& result) {
                 l.set("desktop_gamma", JBool(isHDR && m.desktopGammaEnabled));
                 l.set("tonemap", JBool(isHDR && s.hdrColorCorrection.tonemap.enabled));
                 if (isHDR) {
+                    // Desktop gamma's reference: the SDR white level (nits) recorded for this display — what
+                    // any DG bake uses (it follows the live level in HDR, outside calibration sessions) ...
+                    l.set("desktop_gamma_sdr_white_nits", JNum(RoundNits(m.dgSdrWhiteNits)));
+                    // ... and the level the INSTALLED profile's DG was baked with; null when the active HDR
+                    // profile carries no DG (DG off, swapped out, or no profile). Differs from the recorded
+                    // level only while a re-bake is pending (calibration.status desktop_gamma_sdr_white_pending).
+                    const float baked = (m.enabled && !m.profileName.empty() && (m.activePerm & MHCSettings::PERM_DG))
+                        ? m.permDgWhiteNits[m.activePerm] : 0.0f;
+                    l.set("desktop_gamma_baked_sdr_white_nits", baked > 0.0f ? JNum(RoundNits(baked)) : JsonValue());
                     l.set("tonemap_dynamic", JBool(s.hdrColorCorrection.tonemap.dynamicPeak));
                     l.set("tonemap_target_peak", JNum(s.hdrColorCorrection.tonemap.targetPeakNits));
                 }
@@ -830,6 +843,20 @@ void HandleCalibStatus(JsonValue& result) {
         captures.arr.push_back(std::move(e));
     }
     result.set("captures", captures);
+
+    // Desktop gamma follows the Windows SDR white level, but never mid-session: monitors (in HDR) whose level
+    // moved and whose follow-up is waiting, as of the last check. Applied once nothing holds it (reason).
+    JsonValue pending = JArr();
+    for (const DesktopGammaSdrWhitePending& w : GetDesktopGammaSdrWhitePending()) {
+        JsonValue e = JObj();
+        e.set("monitor", JNum(w.monitor));
+        e.set("live_nits", JNum(RoundNits(w.liveNits)));
+        e.set("recorded_nits", JNum(RoundNits(w.recordedNits)));
+        e.set("baked_nits", w.bakedNits > 0.0f ? JNum(RoundNits(w.bakedNits)) : JsonValue());
+        e.set("reason", JStr(w.reason));
+        pending.arr.push_back(std::move(e));
+    }
+    result.set("desktop_gamma_sdr_white_pending", pending);
 }
 
 void HandleQueryProfiles(const JsonValue& p, JsonValue& result) {
@@ -1252,6 +1279,8 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
         // snapshot over the user's current setup.
         g_calib.snapshots.Clear();
     }
+    // Desktop gamma waited for the session: catch up with the SDR white level now (debounced re-check).
+    if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
     result.set("active", JBool(false));
     result.set("restored", JBool(restored));
     // Which displays went back (at their CURRENT index), and any the session captured but could
@@ -2378,6 +2407,18 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
 // ===========================================================================
 // Public entry points
 // ===========================================================================
+bool IsCalibrationOrLiveEditActive() {
+    // Sequential, never nested: the GUI-thread enter nests settings -> calib.
+    {
+        std::lock_guard<std::mutex> lk(g_calibMutex);
+        if (g_calib.active) return true;
+    }
+    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+    for (const auto& kv : g_gsLive)
+        if (kv.second.active) return true;
+    return false;
+}
+
 void StartCalibrationIpcServer() {
     if (g_serverThread) return;
     if (!ServerEnabled()) return;  // SECURITY: opt-in only

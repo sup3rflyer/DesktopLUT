@@ -106,12 +106,14 @@ HDR_MHCSourceIs1DCube=true
 HDR_MHCGrayscaleEnabled=true
 HDR_MHCGrayscalePeak=10000.0
 HDR_MHCDesktopGamma=false      ; true = sRGB→2.2 baked into 1D LUT for SDR range; hotswaps via permutation cache
+HDR_MHCDgSdrWhiteNits=116.0000 ; Windows SDR white level (nits) desktop gamma is referenced to; follows the live level in HDR, outside calibration sessions (absent = 80)
 HDR_MHCWhiteBalanceEnabled=false
 HDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
 HDR_MHCCorrGSPeak=10000.0
 HDR_MHCActivePerm=2            ; Active permutation bitmask (WB=1, DG=2, GS=4)
 HDR_MHCPermPath0=              ; Cached profiles indexed by bitmask (0-7)
 HDR_MHCPermPath2=C:\...\DesktopLUT_Mon0_HDR_P2_xxx.icm  ; DG-only variant
+HDR_MHCPermDgWhite2=116.0000   ; SDR white each cached variant's DG was baked with (0 = no DG in it; absent = MHCDgSdrWhiteNits); a mismatch regenerates / re-bakes it
 ```
 
 ## DWM Hook Mode
@@ -166,7 +168,7 @@ The Calibration Loader is preferred over remove+re-add because it never disassoc
 HDR processing uses the Dolby ICtCp color space for perceptually accurate tonemapping and grayscale correction. LUTs expect PQ-encoded Rec.2020 input.
 
 **Pipeline (per-channel Rec.2020 grayscale + ICtCp tonemap):**
-1. **Desktop Gamma**: sRGB→2.2 correction via precomputed 1D LUT (t4)
+1. **Desktop Gamma**: sRGB→2.2 correction via precomputed 1D LUT (t4), over the range up to the monitor's Windows SDR white level (SDR content brightness) and relative to it
 2. **BT.709 → Rec.2020**: Standards-derived RGB primary conversion per ITU-R BT.2087
 3. **Primaries Matrix**: Display calibration in linear Rec.2020 (includes Bradford chromatic adaptation)
 4. **Per-channel Grayscale**: PQ-domain R/G/B interpolation with linear gains (via t5/t6 LUT)

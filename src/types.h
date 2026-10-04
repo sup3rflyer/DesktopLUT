@@ -281,6 +281,8 @@ const int MHC_BLIND_KICK_INTERVAL_MS = 300000;  // Every 5 min — catches silen
 const int MHC_REGISTRY_KICK_TIMER_ID = 108;     // Debounce for ICM registry-change-triggered kick
 const int MHC_REGISTRY_KICK_DEBOUNCE_MS = 500;  // Wait 500ms after registry write before kicking (writer may fire multiple times)
 const int MHC_BURST_TIMER_ID = 109;             // Staggered MHC re-assertion burst after display transition events
+const int SDR_WHITE_CHECK_TIMER_ID = 114;       // Debounced re-read of the Windows SDR white level (desktop gamma reference)
+const int SDR_WHITE_CHECK_DEBOUNCE_MS = 1000;   // After the last trigger — a slider drag writes many intermediate levels
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear
 const int HOTKEY_GAMMA = 2;      // Win+Shift+G for gamma toggle
 const int HOTKEY_ANALYSIS = 4;   // Win+Shift+X for analysis toggle
@@ -635,6 +637,9 @@ struct MonitorContext {
     bool isFP16SDR = false;  // ACM: FP16 capture but SDR color space (input is linear scRGB at 80 nits)
     bool wasHDREnabled = false;  // Track previous HDR state for mode change detection
     float maxDisplayNits = 1000.0f;
+    // Windows SDR white level (nits) while in HDR — desktop gamma's reference white in the shader path.
+    // Written by the processing thread (duplication init) and the GUI thread (RefreshDesktopGammaSdrWhite).
+    MovableAtomic<float> sdrWhiteNits{80.0f};
 
     // Rendering
     IDXGISwapChain4* swapchain = nullptr;
@@ -741,6 +746,7 @@ struct MonitorContext {
                                              //   (prim|gs|wb|tonemap|dg|24). Feeds g_shaderCorrectionsActive /
                                              //   IPC corrections_enabled. NOT the DWM-hook state. docs/NAMING.md §4.
     bool lastDesktopGamma = true;            // Cached atomic value
+    float lastSdrWhiteNits = -1.0f;          // sdrWhiteNits last written to the constant buffer (render thread)
     bool lastTetrahedralInterp = false;      // Cached atomic value
     bool lastHdrDither = true;               // Cached atomic value (g_hdrDither)
     bool grayscaleICtCp = false;             // true = shader uses ICtCp offsets for HDR grayscale
@@ -887,6 +893,11 @@ struct MHCSettings {
 
     // Desktop gamma (HDR only): sRGB->2.2 baked into 1D LUT
     bool desktopGammaEnabled = false;
+    // Desktop gamma's reference white (HDR only): the Windows SDR white level (nits) the installed profile
+    // and its cached permutations were baked with. Follows the live value read in HDR mode
+    // (RefreshDesktopGammaSdrWhite); persisted so a profile baked under another level is re-baked on load.
+    // 80 = the original fixed bake (and the value assumed for profiles saved before this was tracked).
+    float dgSdrWhiteNits = 80.0f;
 
     // Permutation profile cache — indexed by correction bitmask
     // Each bit controls whether that correction is baked into the ICC profile.
@@ -901,6 +912,10 @@ struct MHCSettings {
 
     std::wstring permNames[PERM_COUNT];  // Cached profile filenames (indexed by bitmask)
     std::wstring permPaths[PERM_COUNT];  // Cached profile full paths
+    // SDR white level (nits) each cached profile's desktop gamma was baked with; 0 = that bake carries no DG
+    // (W-independent). A DG permutation whose stamp differs from dgSdrWhiteNits is stale (MhcPermDgBakedAt):
+    // regenerated on demand, and re-baked when it is the active one. Persisted (HDR) with the cache.
+    float permDgWhiteNits[PERM_COUNT] = { 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f };
     uint8_t activePerm = 0;              // Currently active permutation bitmask
 
     // Display metadata for installed profile (computed at Apply time, persisted)

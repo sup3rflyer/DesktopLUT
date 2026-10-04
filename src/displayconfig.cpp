@@ -11,6 +11,7 @@
 #include <devguid.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -423,6 +424,48 @@ DisplayColorModeResult QueryDisplayColorMode(const DisplayInfo& display, bool dx
         legacyEnabled = legacyOk && (ci.value & 0x2) != 0;   // bit 1 = advancedColorEnabled
     }
     return ClassifyDisplayColorMode(dxgiHdrActive, dxgiFp16Sdr, info2Ok, info2.activeColorMode, legacyOk, legacyEnabled);
+}
+
+bool QuerySdrWhiteLevelNits(const DisplayInfo& display, float& outNits) {
+    // Per TARGET (adapterId + target id), like the other advanced-colour queries.
+    DISPLAYCONFIG_SDR_WHITE_LEVEL sw = {};
+    sw.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+    sw.header.size = sizeof(sw);
+    sw.header.adapterId = display.adapterId;
+    sw.header.id = display.targetId;
+    if (DisplayConfigGetDeviceInfo(&sw.header) != ERROR_SUCCESS) return false;
+    float nits = SdrWhiteLevelToNits(sw.SDRWhiteLevel);
+    if (!IsValidSdrWhiteNits(nits)) return false;
+    outNits = nits;
+    return true;
+}
+
+bool ResolveDisplayInfoForHMonitor(HMONITOR hMonitor, DisplayInfo& outInfo) {
+    if (GetDisplayInfoForHMonitor(hMonitor, outInfo)) return true;
+    // The GDI-name match needs the source-name query; mid-modeset it can transiently fail.
+    MONITORINFO mi = { sizeof(mi) };
+    if (!hMonitor || !GetMonitorInfo(hMonitor, &mi)) return false;
+    POINT pt = { mi.rcMonitor.left, mi.rcMonitor.top };
+    return GetDisplayInfoAtPoint(pt, outInfo);
+}
+
+bool QuerySdrWhiteNitsForHMonitor(HMONITOR hMonitor, float& outNits) {
+    DisplayInfo info;
+    return ResolveDisplayInfoForHMonitor(hMonitor, info) && QuerySdrWhiteLevelNits(info, outNits);
+}
+
+bool DisplayModeAllowsHdr(const DisplayColorModeResult& mode) {
+    const bool info2 = std::strcmp(mode.source, "displayconfig2") == 0;
+    const bool legacy = std::strcmp(mode.source, "displayconfig") == 0;
+    if ((info2 || legacy) && mode.mode == DisplayColorMode::SDR) return false;   // advanced colour off
+    if (info2 && mode.mode == DisplayColorMode::AcmSdr) return false;            // 24H2+: WCG / ACM, not HDR
+    return true;
+}
+
+bool IsDisplayInHdrMode(const DisplayInfo& display, HMONITOR hMonitor) {
+    if (!DisplayModeAllowsHdr(QueryDisplayColorMode(display, /*dxgiHdrActive=*/false))) return false;
+    DXGI_OUTPUT_DESC1 desc;
+    return QueryFreshOutputDesc(hMonitor, desc) && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
 }
 
 bool SetDisplayHdrState(const DisplayInfo& display, bool enable) {

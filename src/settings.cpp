@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "monitor_identity.h"
 #include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp, FaldGlowClamp
+#include "displayconfig.h"   // IsValidSdrWhiteNits
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -297,9 +298,10 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileFloat(section, (p + L"MHCWhiteBalanceWx").c_str(), mhc.whiteBalanceWx, iniPath);
     WritePrivateProfileFloat(section, (p + L"MHCWhiteBalanceWy").c_str(), mhc.whiteBalanceWy, iniPath);
 
-    // Desktop gamma (HDR only)
+    // Desktop gamma (HDR only) + the SDR white level the installed profile's DG was baked with
     if (isHDR) {
         WritePrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), mhc.desktopGammaEnabled, iniPath);
+        WritePrivateProfileFloat(section, (p + L"MHCDgSdrWhiteNits").c_str(), mhc.dgSdrWhiteNits, iniPath);
     }
 
     // Permutation profile cache
@@ -311,6 +313,10 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
         std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
         WritePrivateProfileStringW(section, key.c_str(), mhc.permPaths[k].c_str(), iniPath);
+        // HDR: the SDR white each cached variant's desktop gamma was baked with (0 = no DG in that bake)
+        if (isHDR)
+            WritePrivateProfileFloat(section, (p + L"MHCPermDgWhite" + std::to_wstring(k)).c_str(),
+                                     mhc.permDgWhiteNits[k], iniPath);
     }
 
     // Correction grayscale (fine-tuning on top of base)
@@ -488,9 +494,12 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     if (!std::isfinite(mhc.whiteBalanceWy) || mhc.whiteBalanceWy <= 0.0f || mhc.whiteBalanceWy >= 1.0f)
         mhc.whiteBalanceWy = 0.3290f;
 
-    // Desktop gamma (HDR only)
+    // Desktop gamma (HDR only). A missing reference white = a profile baked before it was tracked, i.e. at
+    // the original fixed 80 nits; RefreshDesktopGammaSdrWhite re-bakes it once the live level differs.
     if (isHDR) {
         mhc.desktopGammaEnabled = GetPrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), false, iniPath);
+        float dgWhite = GetPrivateProfileFloat(section, (p + L"MHCDgSdrWhiteNits").c_str(), 80.0f, iniPath);
+        mhc.dgSdrWhiteNits = IsValidSdrWhiteNits(dgWhite) ? dgWhite : 80.0f;
     }
 
     // Permutation profile cache
@@ -506,6 +515,20 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         size_t permSlash = permName.find_last_of(L"\\/");
         if (permSlash != std::wstring::npos) permName = permName.substr(permSlash + 1);
         mhc.permNames[k] = permName;
+        // HDR DG stamp. Absent = a cache saved before stamps existed: baked at the recorded level (loaded above;
+        // 80 for those INIs). 0 = no DG in that bake; anything else unusable marks the entry stale (-1).
+        mhc.permDgWhiteNits[k] = mhc.dgSdrWhiteNits;
+        if (isHDR) {
+            wchar_t stampBuf[32] = {};
+            GetPrivateProfileStringW(section, (p + L"MHCPermDgWhite" + std::to_wstring(k)).c_str(), L"",
+                                     stampBuf, 32, iniPath);
+            if (stampBuf[0] != L'\0') {
+                wchar_t* end = nullptr;
+                float stamp = (float)_wcstod_l(stampBuf, &end, GetCLocale());
+                bool parsed = end && end != stampBuf;
+                mhc.permDgWhiteNits[k] = (parsed && (stamp == 0.0f || IsValidSdrWhiteNits(stamp))) ? stamp : -1.0f;
+            }
+        }
     }
     // Backward compatibility: if no permutation data but old DG path exists, migrate
     if (mhc.permNames[mhc.activePerm].empty() && !mhc.profileName.empty()) {

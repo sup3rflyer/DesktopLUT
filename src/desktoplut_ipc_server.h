@@ -29,6 +29,12 @@ void StartCalibrationIpcServer();
 // Stop and join the control server. Safe to call even if it never started.
 void StopCalibrationIpcServer();
 
+// A calibration session (calibration.enter .. exit) or a live grayscale edit (mhc.grayscale_live_begin ..
+// commit/cancel) is running: automatic display-state changes (e.g. desktop gamma following the SDR white
+// level) must wait. Takes the calibration and settings locks one after the other; never call it while
+// holding the calibration lock.
+bool IsCalibrationOrLiveEditActive();
+
 // GUI-thread handler for a marshaled mutating command. Call from GUIWndProc:
 //     case WM_CALIB_CMD: return HandleCalibrationGuiCommand(wParam, lParam);
 LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM lParam);

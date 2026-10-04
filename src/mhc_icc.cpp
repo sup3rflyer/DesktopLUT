@@ -515,6 +515,20 @@ static bool ComputeMD5(const uint8_t* data, size_t size, uint8_t outHash[16]) {
 // SECTION: ICC Profile Generation
 // ============================================================================
 
+float DesktopGammaPQ(float pq, float sdrWhiteNits) {
+    // In HDR Windows composites SDR content as W * sRGB_EOTF(code), W = the display's SDR white level.
+    // Re-encode that with the sRGB OETF relative to W and decode it with a pure 2.2 power: W * code^2.2.
+    // Same operations in the same order as the original 80-nit bake, so W = 80 is bit-identical to it.
+    float linearNits = PqEOTF(pq) * 10000.0f;
+    if (linearNits <= sdrWhiteNits && linearNits > 0.0f) {
+        float sdrLinear = linearNits / sdrWhiteNits;
+        float srgbEncoded = SrgbOETF(sdrLinear);
+        float gamma22 = powf(srgbEncoded, 2.2f);
+        return PqOETF(gamma22 * sdrWhiteNits / 10000.0f);
+    }
+    return pq;
+}
+
 bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& outData) {
     outData.clear();
 
@@ -643,6 +657,10 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
 
     bool hasDG = params.isHDR && params.desktopGammaEnabled;
     bool hasCorrGS = params.correctionGrayscaleEnabled && params.correctionGrayscale.enabled;
+    // DG reference white = the display's SDR white level; a non-finite / non-positive value keeps the
+    // original 80-nit reference rather than baking garbage.
+    const float dgWhiteNits = (std::isfinite(params.sdrWhiteNits) && params.sdrWhiteNits > 0.0f)
+        ? params.sdrWhiteNits : 80.0f;
 
     if (hasDG || hasCorrGS) {
         float pqPeak = params.isHDR ? PqOETF(params.peakNits / 10000.0f) : 0.0f;
@@ -662,15 +680,9 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
                         v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
                     }
 
-                    // Desktop gamma last: sRGB→2.2 for SDR luminance range
+                    // Desktop gamma last: sRGB→2.2 over the SDR range (0, SDR white], per channel
                     if (hasDG) {
-                        float linearNits = PqEOTF(v) * 10000.0f;
-                        if (linearNits <= 80.0f && linearNits > 0.0f) {
-                            float sdrLinear = linearNits / 80.0f;
-                            float srgbEncoded = SrgbOETF(sdrLinear);
-                            float gamma22 = powf(srgbEncoded, 2.2f);
-                            v = PqOETF(gamma22 * 80.0f / 10000.0f);
-                        }
+                        v = DesktopGammaPQ(v, dgWhiteNits);
                     }
                 } else {
                     // SDR: LUT output is sRGB signal
@@ -695,7 +707,8 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
             }
         }
 
-        if (hasDG) std::cout << "MHC2: Desktop gamma (sRGB→2.2) composed into HDR LUT" << std::endl;
+        if (hasDG) std::cout << "MHC2: Desktop gamma (sRGB→2.2, SDR white " << dgWhiteNits
+                             << " nits) composed into HDR LUT" << std::endl;
         if (hasCorrGS) std::cout << "MHC2: Correction grayscale composed on top of base LUT" << std::endl;
     }
 

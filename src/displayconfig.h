@@ -79,6 +79,32 @@ DisplayLinkFormat QueryDisplayLinkFormat(const DisplayInfo& display);
 const char* DisplayColorEncodingName(unsigned int encoding);      // "RGB" | "YCBCR444" | ... | "UNKNOWN"
 const char* DisplayOutputTechnologyName(unsigned int technology); // "HDMI" | "DISPLAYPORT_EXTERNAL" | ... | "UNKNOWN"
 
+// Windows SDR white level of a display target ("SDR content brightness"): in HDR, Windows composites SDR content
+// with the piecewise-sRGB EOTF scaled to this luminance. DisplayConfigGetDeviceInfo(
+// DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL) reports it as a multiple of 80 nits in 1/1000 units.
+inline float SdrWhiteLevelToNits(unsigned long sdrWhiteLevel) {
+    return (float)((double)sdrWhiteLevel / 1000.0 * 80.0);
+}
+// A usable SDR white (finite, 1..10000 nits). Windows' slider spans 80..480; the wider range only rejects garbage.
+inline bool IsValidSdrWhiteNits(float nits) {
+    return nits >= 1.0f && nits <= 10000.0f;   // false for NaN
+}
+// The target's SDR white level in nits. False when the query fails or answers an unusable value.
+bool QuerySdrWhiteLevelNits(const DisplayInfo& display, float& outNits);
+// Same for the display an HMONITOR shows (ResolveDisplayInfoForHMonitor).
+bool QuerySdrWhiteNitsForHMonitor(HMONITOR hMonitor, float& outNits);
+// The DisplayInfo of the display an HMONITOR shows: exact GDI-name match, desktop-position fallback (the
+// name match needs the source-name query, which can transiently fail mid-modeset).
+bool ResolveDisplayInfoForHMonitor(HMONITOR hMonitor, DisplayInfo& outInfo);
+
+// Is the display compositing in HDR right now? The fresh DXGI colour space decides (the project's HDR test),
+// but only after the cheap DisplayConfig mode query allows it: a display it reports as SDR, or as WCG/ACM via
+// the 24H2+ query, is answered without creating a DXGI factory.
+bool IsDisplayInHdrMode(const DisplayInfo& display, HMONITOR hMonitor);
+// The pre-filter alone (pure, exposed for tests): false = DisplayConfig rules HDR out; true = HDR possible
+// (HDR, legacy "advanced colour on" = HDR or ACM, or no DisplayConfig answer at all).
+bool DisplayModeAllowsHdr(const DisplayColorModeResult& mode);
+
 // Toggle HDR on the monitor containing the focused window
 // Returns true if toggled, false if failed (e.g., monitor not HDR-capable)
 bool ToggleHdrOnFocusedMonitor();
