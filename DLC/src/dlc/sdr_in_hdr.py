@@ -4,13 +4,17 @@ When a display runs in HDR, Windows composites SDR content (the desktop, SDR app
 with the piecewise-sRGB EOTF scaled to the SDR content brightness slider — the per-display **SDR white
 level** (``DisplayConfigGetDeviceInfo(DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL)``; nits =
 ``SDRWhiteLevel / 1000 · 80``). DesktopLUT's **Desktop Gamma** then remaps sRGB → pure 2.2 inside the HDR
-MHC2 regamma — but over 0–80 nit only, normalised to 80 (``src/mhc_icc.cpp``: ``linearNits <= 80``; the
-overlay shader uses scRGB 1.0 = 80 nit too), i.e. it assumes an 80-nit SDR white. With a brighter SDR white
+MHC2 regamma. Builds before 2026-10-03 did it over 0–80 nit only, normalised to 80, i.e. they assumed an
+80-nit SDR white; later builds follow the live SDR white level (the pipe reports the baked one as
+``layers[key].desktop_gamma_sdr_white_nits``; HW A/B 2026-10-03: greys then track pure 2.2). For the legacy
+80-nit bake (``dg80_forecast``, kept as the reference model) with a brighter SDR white
 W the forecast grey for code s is ``80·oetf_sRGB(W·eotf_sRGB(s)/80)^2.2`` below 80 nit and ``W·eotf_sRGB(s)``
 above it — part of the sRGB shadow lift survives and the curve kinks where Windows' output crosses 80 nit.
 The forecast is a SHAPE guide, not an exact prediction: DesktopLUT applies Desktop Gamma per channel to the HDR
 MHC2's base-LUT output (drive nits after the matrix), so each channel's kink shifts with the white gains and the
-base LUT (exact only on the shader path, without an MHC grayscale LUT).
+base LUT (exact only on the shader path, without an MHC grayscale LUT). The same post-matrix placement crushes
+the minor channels of saturated colours (dim Rec.709 reds over-saturate) — the pre-gamut design note is
+``docs/pregamut-desktop-gamma-design-2026-10-04.md``.
 
 This module is pure + dependency-free except :func:`windows_sdr_white_levels` (Windows ``user32``, read-only).
 """
@@ -20,7 +24,7 @@ import math
 import statistics
 from typing import Any, Mapping, Optional, Sequence
 
-DG_WHITE_NITS = 80.0              # Desktop Gamma's built-in SDR white (DesktopLUT src/mhc_icc.cpp, src/shader.h)
+DG_WHITE_NITS = 80.0              # the SDR white Desktop Gamma hard-wired before the 2026-10-03 build (legacy reference)
 FIT_FLOOR_NITS = 0.02             # greys below this stay out of the model fit (i1D3 low-light scatter class)
 
 

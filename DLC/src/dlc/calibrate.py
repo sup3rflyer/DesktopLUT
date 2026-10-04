@@ -8487,7 +8487,11 @@ class Calibration:
                 "declared_source": (self.calib.get("sdr_white_level") or {}).get("source"),
                 "measured_white_nits": round(float(scored_white), 4),
                 "measured_over_declared": (round(float(scored_white) / declared, 4) if declared else None),
-                "desktop_gamma_on": dg_on, "desktop_gamma_white_nits_assumed": sdr_in_hdr.DG_WHITE_NITS,
+                # the white Desktop Gamma is referenced to: the baked one the pipe reports (2026-10-03 builds
+                # follow the Windows SDR white level), else the 80 nit every earlier build hard-wired
+                "desktop_gamma_on": dg_on,
+                "desktop_gamma_reference_white_nits": baked if baked is not None else sdr_in_hdr.DG_WHITE_NITS,
+                "desktop_gamma_reference_source": "baked (pipe)" if baked is not None else "legacy 80-nit build",
                 "viewing_layers_on": sorted(n for n, v in before.items() if v and n not in (layers.get("disabled") or ())),
                 "grey_model_fit": fit}
 
