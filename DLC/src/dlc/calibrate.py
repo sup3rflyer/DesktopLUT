@@ -8451,7 +8451,12 @@ class Calibration:
             return {"error": f"{type(exc).__name__}: {exc}"}
         key = f"{self.monitor}:{self.mode}"
         lay = (st.get("layers") or {}).get(key) or {}
-        return {"dg_baked_white_nits": lay.get("desktop_gamma_sdr_white_nits"),
+        # baked = the installed profile's Desktop Gamma stamp (None when it carries no DG; builds after the
+        # 2026-10-04 review); the recorded reference level is the fallback on the first SDR-white build
+        baked = lay.get("desktop_gamma_baked_sdr_white_nits") if "desktop_gamma_baked_sdr_white_nits" in lay \
+            else lay.get("desktop_gamma_sdr_white_nits")
+        return {"dg_baked_white_nits": baked,
+                "dg_recorded_white_nits": lay.get("desktop_gamma_sdr_white_nits"),
                 "desktop_gamma": lay.get("desktop_gamma"),
                 "mhc_profile": ((st.get("mhc") or {}).get(key) or {}).get("profile_name"),
                 "cube_path": ((st.get("runtime") or {}).get(key) or {}).get("cube_path")}
