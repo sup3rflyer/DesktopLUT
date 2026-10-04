@@ -774,23 +774,38 @@ struct Vblanks {
         FaldVBlankMap m; m.countAnchor = K + j; m.qpcAnchor = at(j) + 200; m.periodQpc = P; return m;
     }
 };
-// The publisher's inputs, simulated: the wakes of a vblank-wait thread (latency 30..330 us, a 3-ms spike every 37th),
-// DWM's counter (it increments 0.3 ms after each vblank), and the publisher's loop: a counter read in the middle of
-// every 8th refresh (the timer lands +-0.5 ms around it), then a publish.
+// The publisher's inputs, simulated: the wakes of a vblank-wait thread on the TARGET output (latency 30 us + uniform
+// 0..latSpread, a 3-ms spike every 37th), DWM's composition clock (by default the same display; set dwmP / dwmV0 to make
+// it another display's, as on the owner's rig), and the publisher's loop: a DWM diagnostic read + a publish every 8th
+// wake. The tracker's count starts at Reset's firstIndex on the first wake (vblank 0 of the sim).
 struct PublisherSim {
     Vblanks vb;
+    double dwmP, dwmV0;
+    double latSpread = 3000.0;
     Lcg rng{ 2024u };
     FaldVBlankTracker trk;
     unsigned int sincePublish = 0;
     bool valid = false;
-    FaldVBlankMap map;                                            // the last publish: anchored at wake mapWakeIndex
-    long long lastWakeIndex = -1, mapWakeIndex = -1;
-    explicit PublisherSim(double nominalPeriodQpc = 166666.5) { FaldVBlankTrackerReset(&trk, nominalPeriodQpc); }
-    unsigned long long countAt(long long t) const {
-        return (unsigned long long)(vb.K + (long long)std::floor(((double)t - vb.v0 - 3000.0) / vb.P));
-    }
+    FaldVBlankMap map;                                            // the last publish
+    long long lastWakeIndex = -1, mapWakeIndex = -1, publishes = 0, wrongMaps = 0;
+    explicit PublisherSim(double nominalPeriodQpc = 166666.5, unsigned long long firstIndex = 0)
+        : dwmP(vb.P), dwmV0(vb.v0) { FaldVBlankTrackerReset(&trk, nominalPeriodQpc, firstIndex); }
     long long wakeTime(long long i) {
-        return vb.at(i) + 300 + (long long)(1500.0 + rng.next(1500.0)) + ((i % 37) == 36 ? 30000 : 0);
+        return vb.at(i) + 300 + (long long)(0.5 * latSpread + rng.next(0.5 * latSpread)) + ((i % 37) == 36 ? 30000 : 0);
+    }
+    long long dwmVBlankBefore(long long t) const {
+        return (long long)std::floor(dwmV0 + std::floor(((double)t - dwmV0) / dwmP) * dwmP);
+    }
+    // every published map must name the right vblank: its anchor sits just after a true vblank j, and within one numbering
+    // epoch count - j is constant (the ORIGIN is arbitrary by design: it is fixed by the first publish of the epoch;
+    // `origin` = what it is expected to be, -1 = whatever the first publish says)
+    long long origin = 0, offset = 0;
+    unsigned long long offsetEpoch = ~0ull;
+    void check(const FaldVBlankMap& m) {
+        const long long j = (long long)std::floor(((double)m.qpcAnchor - vb.v0) / vb.P);
+        const double late = (double)m.qpcAnchor - (vb.v0 + (double)j * vb.P);
+        if (offsetEpoch != trk.epoch) { offsetEpoch = trk.epoch; offset = m.countAnchor - j; if (origin >= 0 && offset != origin) wrongMaps++; }
+        if (m.countAnchor - j != offset || late < 0.0 || late > 0.25 * vb.P) wrongMaps++;
     }
     void wake(long long i) {
         const long long t = wakeTime(i);
@@ -798,10 +813,9 @@ struct PublisherSim {
         lastWakeIndex = i;
         if (++sincePublish < 8u) return;
         sincePublish = 0;
-        const long long tm = t + (long long)(0.5 * vb.P + rng.next(5000.0));
-        FaldVBlankTrackerSample(&trk, tm - 100, tm + 100, countAt(tm), vb.P);
+        FaldVBlankTrackerDwmSample(&trk, t + 500, dwmVBlankBefore(t + 500), 777000ull + (unsigned long long)i, dwmP);
         valid = FaldVBlankTrackerMap(&trk, &map);
-        if (valid) mapWakeIndex = i;
+        if (valid) { mapWakeIndex = i; publishes++; check(map); }
     }
 };
 }  // namespace
@@ -1026,20 +1040,22 @@ TEST_CASE("FALD stage 3: a stale or missing map is the run-time grid bit for bit
     }
 }
 
-TEST_CASE("FALD stage 3: the vblank tracker - phase, period and count from jittery wakes; missed, spurious, restarts") {
-    // A: 20 s of wakes with latency jitter and spikes
+TEST_CASE("FALD stage 3: the vblank tracker - its own wake numbering IS the count; DWM's clock never enters") {
+    // A: 20 s of wakes with latency jitter and spikes, DWM clocked by this output: phase, fitted period, count
     PublisherSim s;
     for (long long i = 0; i < 1200; i++) s.wake(i);
     REQUIRE(s.valid);
     CHECK(s.mapWakeIndex == s.lastWakeIndex);
-    CHECK(s.map.countAnchor == s.vb.K + s.mapWakeIndex);           // the count of the publishing wake's vblank
+    CHECK(s.map.countAnchor == s.mapWakeIndex);                   // origin 0 at the first wake (vblank 0)
+    CHECK(s.wrongMaps == 0); CHECK(s.publishes > 100);
     const long long trueV = s.vb.at(s.mapWakeIndex);
     CHECK(s.map.qpcAnchor >= trueV); CHECK(s.map.qpcAnchor - trueV <= 1500);   // within 150 us, late (one-sided latency)
     CHECK(std::fabs(s.map.periodQpc - s.vb.P) < 2.0);              // the fit: within 0.2 us of the true period
     CHECK(s.trk.periodFit);
     CHECK(std::fabs(s.trk.medianPeriodQpc - s.vb.P) < 1000.0);     // (the median alone: only within ~100 us)
-    CHECK(s.trk.missed == 0ull); CHECK(s.trk.spurious == 0ull); CHECK(s.trk.conflicts == 0ull); CHECK(s.trk.restarts == 0ull);
-    CHECK(s.trk.anchorJumps == 0ull); CHECK_FALSE(s.trk.needConfirm);
+    CHECK(s.trk.missed == 0ull); CHECK(s.trk.spurious == 0ull); CHECK(s.trk.restarts == 0ull);
+    CHECK(s.trk.slipsRepaired == 0ull); CHECK(s.trk.phaseJumps == 0ull); CHECK(s.trk.epoch == 0ull);
+    CHECK(s.trk.dwmState == 1); CHECK(std::fabs(s.trk.dwmPpm) < 5.0);   // diagnostic: DWM's clock is this output's
     // the hook's index for runs anywhere in the next 0.4 s (but the first / last 0.2 ms of a refresh): the truth + L
     {
         Lcg r(5u);
@@ -1048,11 +1064,25 @@ TEST_CASE("FALD stage 3: the vblank tracker - phase, period and count from jitte
             for (int q = 0; q < 10; q++) {
                 const long long t = s.vb.at(i) + 2000 + (long long)((0.5 + 0.5 * r.next(1.0)) * (s.vb.P - 4000.0));
                 unsigned long long n = 0;
-                if (!FaldAbsRefreshIndex(s.map, t, 10000000, 16.66665f, 1, &n) || n != (unsigned long long)(s.vb.K + i + 1)) wrong++;
+                if (!FaldAbsRefreshIndex(s.map, t, 10000000, 16.66665f, 1, &n) || n != (unsigned long long)(i + 1)) wrong++;
             }
         CHECK(wrong == 0);
     }
-    // B: missed wakes (a late thread: one in 50, once four in a row) and a spurious second return inside one refresh
+    // B: the SAME wakes with DWM clocked by ANOTHER display — the owner's rig (BenQ 59.9406 Hz vs the ProArt's 60.0001:
+    // +~990 ppm), and one only 40 ppm off at a different phase: the published map is bit for bit the same; only the
+    // diagnostic changes
+    const double others[] = { 993.0, 40.0 };
+    for (double ppm : others) {
+        PublisherSim o;
+        o.dwmP = o.vb.P * (1.0 + ppm * 1.0e-6); o.dwmV0 = o.vb.v0 + 61234.5;
+        for (long long i = 0; i < 1200; i++) o.wake(i);
+        CAPTURE(ppm);
+        REQUIRE(o.valid);
+        CHECK(o.map.countAnchor == s.map.countAnchor); CHECK(o.map.qpcAnchor == s.map.qpcAnchor);
+        CHECK(o.map.periodQpc == s.map.periodQpc);
+        CHECK(o.trk.dwmState == 0); CHECK(std::fabs(o.trk.dwmPpm - ppm) < 10.0);   // (a diagnostic: +-10 ppm)
+    }
+    // C: missed wakes (a late thread: one in 50, once four in a row) and a spurious second return inside one refresh
     // (the run ends on a wake: a skipped LAST wake is not missed yet — nothing has come after it)
     {
         PublisherSim m2;
@@ -1063,98 +1093,144 @@ TEST_CASE("FALD stage 3: the vblank tracker - phase, period and count from jitte
             if (i == 400) CHECK(FaldVBlankTrackerWake(&m2.trk, m2.vb.at(i) + 4000) == 0u);
         }
         REQUIRE(m2.valid);
-        CHECK(m2.trk.missed == skipped);
-        CHECK(m2.trk.spurious == 1ull);
-        CHECK(m2.map.countAnchor == m2.vb.K + m2.mapWakeIndex);
-        CHECK(m2.trk.conflicts == 0ull);
+        CHECK(m2.trk.missed == skipped); CHECK(m2.trk.spurious == 1ull);
+        CHECK(m2.map.countAnchor == m2.mapWakeIndex); CHECK(m2.wrongMaps == 0);
     }
-    // C: the thread was gone for 5 s (more than FALD_VBLANK_MAX_GAP refreshes): the model starts over and the count comes
-    // back exact once two mid-frame reads agree
+    // D: a 5-s gap with a fitted period on a chain is counted through (no restart, the count exact); a 3-min gap
+    // restarts the model in a new epoch, the count continued from the elapsed time (monotonic), the map withheld until
+    // the period is fitted again
     {
         PublisherSim m3;
         for (long long i = 0; i < 600; i++) m3.wake(i);
         REQUIRE(m3.valid);
-        m3.wake(900);
-        CHECK(m3.trk.restarts == 1ull);
-        FaldVBlankMap tmp;
-        CHECK_FALSE(FaldVBlankTrackerMap(&m3.trk, &tmp));           // no phase, no offset yet
-        for (long long i = 901; i < 1500; i++) m3.wake(i);
+        for (long long i = 900; i < 1300; i++) m3.wake(i);
         REQUIRE(m3.valid);
-        CHECK(m3.map.countAnchor == m3.vb.K + m3.mapWakeIndex);
+        CHECK(m3.trk.restarts == 0ull); CHECK(m3.map.countAnchor == m3.mapWakeIndex); CHECK(m3.wrongMaps == 0);
+        const long long before = m3.map.countAnchor;
+        m3.wake(12000);
+        CHECK(m3.trk.restarts == 1ull); CHECK(m3.trk.epoch == 1ull);
+        CHECK(m3.trk.v == 12000ull);                              // the elapsed time, exact here (a sharp fitted period)
+        FaldVBlankMap tmp;
+        CHECK_FALSE(FaldVBlankTrackerMap(&m3.trk, &tmp));           // no phase, no fit yet
+        for (long long i = 12001; i < 12600; i++) m3.wake(i);
+        REQUIRE(m3.valid);
+        CHECK(m3.map.countAnchor > before); CHECK(m3.map.countAnchor == m3.mapWakeIndex); CHECK(m3.wrongMaps == 0);
+    }
+    // E: the origin is the publisher's: Reset's firstIndex (a re-binding continues the numbering)
+    {
+        PublisherSim m4(166666.5, 1000000ull);
+        m4.origin = 1000000;
+        for (long long i = 0; i < 600; i++) m4.wake(i);
+        REQUIRE(m4.valid);
+        CHECK(m4.map.countAnchor == 1000000 + m4.mapWakeIndex); CHECK(m4.wrongMaps == 0);
     }
 }
 
-TEST_CASE("FALD stage 3: the vblank tracker - the mid-frame +-1 guard, re-anchoring, slow reads, rate checks") {
-    PublisherSim s;
-    for (long long i = 0; i < 800; i++) s.wake(i);
-    REQUIRE(s.valid);
-    const long long iv = s.lastWakeIndex;                           // the refresh of the last wake
-    const long long v0 = s.vb.at(iv);
-    const long long P = (long long)s.vb.P;
-    const double dwmP = s.vb.P;
-    FaldVBlankMap m;
-    // reads near the counter's increment (just after the vblank / just before the next one) are ambiguous by +-1:
-    // ignored, whatever they say
-    CHECK(FaldVBlankTrackerSample(&s.trk, v0 + 4900, v0 + 5100, s.countAt(v0 + 5000) + 1, dwmP) == FALD_VSAMPLE_NEAR_EDGE);
-    CHECK(FaldVBlankTrackerSample(&s.trk, v0 + P - 10100, v0 + P - 9900, s.countAt(v0 + P - 10000) - 1, dwmP) == FALD_VSAMPLE_NEAR_EDGE);
-    REQUIRE(FaldVBlankTrackerMap(&s.trk, &m)); CHECK(m.countAnchor == s.vb.K + iv);
-    // a mid-frame read one off (a glitch): the map is WITHHELD, never changed by it ...
-    const long long mid = v0 + P / 2;
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_CONFLICT);
-    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
-    // ... until a read confirms the old offset
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid), dwmP) == FALD_VSAMPLE_ACCEPTED);
-    REQUIRE(FaldVBlankTrackerMap(&s.trk, &m)); CHECK(m.countAnchor == s.vb.K + iv);
-    // three consecutive reads agreeing on a new offset re-anchor it (the counter really moved)
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_CONFLICT);
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_CONFLICT);
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_REANCHORED);
-    REQUIRE(FaldVBlankTrackerMap(&s.trk, &m)); CHECK(m.countAnchor == s.vb.K + iv + 1);
-    CHECK(s.trk.reanchors == 1ull); CHECK(s.trk.conflicts == 4ull);
-    // a read whose moment is unknown to better than a tenth of a period
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 10000, mid + 10000, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_SLOW);
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid + 100, mid - 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_SLOW);
-    // DWM's composition clock at another rate (its clock display is a 120-Hz monitor): withheld; at this rate: published
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP / 2.0) == FALD_VSAMPLE_ACCEPTED);
-    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
-    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_ACCEPTED);
-    CHECK(FaldVBlankTrackerMap(&s.trk, &m));
-    // no read for longer than FALD_VBLANK_CONFIRM_MAX refreshes: withheld
-    for (long long i = iv + 1; i <= iv + 1 + (long long)FALD_VBLANK_CONFIRM_MAX + 5; i++) FaldVBlankTrackerWake(&s.trk, s.wakeTime(i));
-    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
-    // a nominal period of another mode (the display runs 60 Hz, the mode description says 47.952): never published
-    PublisherSim wrongMode(208542.0);
-    for (long long i = 0; i < 800; i++) wrongMode.wake(i);
-    CHECK_FALSE(wrongMode.valid);
-    // a numbering anomaly (a repaired missed wake) withholds the map until an ACCEPTED read confirms the offset — a
-    // rejected (near-edge) read in that cycle does not (review 2026-10-04: a slip must never be published unseen)
+TEST_CASE("FALD stage 3: the vblank tracker - the continuity chain: slips repaired, a moved phase withheld then re-based, heavy jitter") {
+    // A: a slip of the live numbering (white-box: every wake index one too high, as after a miscounted wake has propagated)
+    // is seen against the last published map and repaired before anything is published
     {
-        PublisherSim q;
-        for (long long i = 0; i < 800; i++) q.wake(i);
-        REQUIRE(q.valid);
-        FaldVBlankMap mm;
-        FaldVBlankTrackerWake(&q.trk, q.wakeTime(801));            // wake 800 missed
-        CHECK(q.trk.needConfirm);
-        CHECK_FALSE(FaldVBlankTrackerMap(&q.trk, &mm));
-        const long long vv = q.vb.at(801);
-        CHECK(FaldVBlankTrackerSample(&q.trk, vv + 4900, vv + 5100, q.countAt(vv + 5000), dwmP) == FALD_VSAMPLE_NEAR_EDGE);
-        CHECK_FALSE(FaldVBlankTrackerMap(&q.trk, &mm));
-        const long long mid2 = vv + P / 2;
-        CHECK(FaldVBlankTrackerSample(&q.trk, mid2 - 100, mid2 + 100, q.countAt(mid2), dwmP) == FALD_VSAMPLE_ACCEPTED);
-        REQUIRE(FaldVBlankTrackerMap(&q.trk, &mm)); CHECK(mm.countAnchor == q.vb.K + 801);
-        // the anchor-jump guard: the current vblank instant must sit where the last map's numbering puts it (a slip of the
-        // local index moves it by a whole period); white-box: as if the numbering had moved since that map
-        q.trk.refQpc -= (long long)(0.4 * q.vb.P);
-        CHECK_FALSE(FaldVBlankTrackerMap(&q.trk, &mm));
-        CHECK(q.trk.anchorJumps == 1ull); CHECK(q.trk.needConfirm);
-        CHECK(FaldVBlankTrackerSample(&q.trk, mid2 - 100, mid2 + 100, q.countAt(mid2), dwmP) == FALD_VSAMPLE_ACCEPTED);
-        REQUIRE(FaldVBlankTrackerMap(&q.trk, &mm)); CHECK(mm.countAnchor == q.vb.K + 801);
+        PublisherSim s;
+        for (long long i = 0; i < 800; i++) s.wake(i);
+        REQUIRE(s.valid);
+        s.trk.v += 1;                                             // (the history - the chain's phase points - keeps its own)
+        for (unsigned int k = 0; k < s.trk.wakeN; k++) s.trk.wakeV[k] += 1;
+        for (long long i = 800; i < 900; i++) s.wake(i);
+        REQUIRE(s.valid);
+        CHECK(s.trk.slipsRepaired == 1ull);
+        CHECK(s.map.countAnchor == s.mapWakeIndex); CHECK(s.wrongMaps == 0);
+        CHECK(s.trk.epoch == 0ull);                               // a repaired slip keeps the epoch
     }
-    // no phase yet: a read is not even interpreted
-    FaldVBlankTracker fresh;
-    FaldVBlankTrackerReset(&fresh, 166666.5);
-    CHECK(FaldVBlankTrackerSample(&fresh, 1000, 1200, 5, dwmP) == FALD_VSAMPLE_NO_PHASE);
-    CHECK_FALSE(FaldVBlankTrackerMap(&fresh, &m));
+    // B: the display is re-timed (every vblank from now on 0.4 period later): the phase leaves the chain — withheld, then
+    // re-based once stable (a new epoch, the period re-fitted), the count monotonic
+    {
+        PublisherSim s;
+        for (long long i = 0; i < 800; i++) s.wake(i);
+        REQUIRE(s.valid);
+        const long long before = s.map.countAnchor;
+        s.vb.v0 += 0.4 * s.vb.P;
+        long long firstWithheld = -1, republished = -1;
+        for (long long i = 800; i < 1400; i++) {
+            const long long pubs = s.publishes;
+            s.wake(i);
+            if (s.sincePublish == 0u && !s.valid && firstWithheld < 0) firstWithheld = i;
+            if (firstWithheld >= 0 && republished < 0 && s.publishes > pubs) republished = i;
+        }
+        CHECK(firstWithheld > 0); CHECK(firstWithheld < 860);       // withheld once the ring has turned over (~32 wakes)
+        CHECK(republished > firstWithheld + 8 * (long long)FALD_VBLANK_REBASE_AFTER);   // after the re-base + a new fit
+        CHECK(s.trk.phaseJumps == 1ull); CHECK(s.trk.rebases == 1ull); CHECK(s.trk.epoch == 1ull);
+        CHECK(s.trk.recentLate >= 1ull);                          // the recent-wake guard caught it first ...
+        CHECK(s.wrongMaps <= 2);                                  // ... so at most the publishes inside its 16 wakes were off
+        REQUIRE(s.valid);
+        CHECK(s.map.countAnchor > before);
+        // the new chain names the re-timed vblanks with the nearest whole count of the old numbering (0.4 -> +0)
+        const long long j = (long long)std::floor(((double)s.map.qpcAnchor - s.vb.v0) / s.vb.P);
+        CHECK(s.map.countAnchor == j);
+    }
+    // C: heavy wake jitter — latency spread over 0.6 of a period, plus 3-ms spikes (wakes up to ~0.8 period late): every
+    // map that IS published names the right vblank (count and anchor), over many seeds
+    {
+        long long wrong = 0, pubs = 0;
+        for (uint32_t seed = 1; seed <= 12; seed++) {
+            PublisherSim s;
+            s.rng = Lcg(seed);
+            s.latSpread = 0.6 * s.vb.P;
+            s.origin = -1;                                        // (a bootstrap miscount may set the origin)
+            for (long long i = 0; i < 3000; i++) s.wake(i);
+            wrong += s.wrongMaps; pubs += s.publishes;
+        }
+        CHECK(wrong == 0);
+        CHECK(pubs > 12 * 200);                                   // ... and maps are still published
+    }
+}
+
+TEST_CASE("FALD stage 3: the publisher's spin guard, output re-check and the ReleaseClock re-seed") {
+    const double P = 166666.5;
+    CHECK_FALSE(FaldVBlankWaitTooSoon(0, 5000, P));               // the first return
+    CHECK(FaldVBlankWaitTooSoon(1000000, 1000000 + 30000, P));     // 3 ms after the previous: it did not wait
+    CHECK_FALSE(FaldVBlankWaitTooSoon(1000000, 1000000 + 50000, P));
+    CHECK_FALSE(FaldVBlankWaitTooSoon(1000000, 1000000 + 166000, P));
+    CHECK_FALSE(FaldVBlankWaitTooSoon(1000000, 1000010, 0.0));      // no period: no guard
+    // a storm of immediate returns reaching the tracker anyway is never counted, and the count carries on afterwards
+    {
+        PublisherSim s;
+        for (long long i = 0; i < 600; i++) s.wake(i);
+        REQUIRE(s.valid);
+        const unsigned long long v = s.trk.v;
+        const long long t0 = s.vb.at(599) + (long long)(0.25 * s.vb.P);  // inside refresh 599, after its wake
+        unsigned int counted = 0;
+        for (int k = 0; k < 500; k++) counted += FaldVBlankTrackerWake(&s.trk, t0 + 10 * k);   // 10 us apart, 5 ms
+        CHECK(counted == 0u); CHECK(s.trk.v == v);
+        for (long long i = 600; i < 900; i++) s.wake(i);
+        REQUIRE(s.valid);
+        CHECK(s.map.countAnchor == s.mapWakeIndex); CHECK(s.wrongMaps == 0);
+    }
+    // the re-check: a stale factory, an unreadable / detached output, an output now at another position (a swap or
+    // layout change: the posTag would name the wrong display), a mode set -> re-bind
+    CHECK_FALSE(FaldVBlankNeedsRebind(true, true, true, 0, 0, 0, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankNeedsRebind(false, true, true, 0, 0, 0, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankNeedsRebind(true, false, true, 0, 0, 0, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankNeedsRebind(true, true, false, 0, 0, 0, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankNeedsRebind(true, true, true, 3840, 0, 0, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankNeedsRebind(true, true, true, 0, 2160, 0, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankNeedsRebind(true, true, true, 0, 0, 0, 0, 16.6667f, 20.8542f));
+    CHECK(FaldVBlankNeedsRebind(true, true, true, 0, 0, 0, 0, 16.6667f, 0.0f));
+    CHECK_FALSE(FaldVBlankNeedsRebind(true, true, true, -3840, 0, -3840, 0, 16.6667f, 16.6667f));
+    // ReleaseClock voids the clocks' state: the next run RE-SEEDS (never a k = 0 run binding maps no pass has written)
+    {
+        const long long freq = 10000000;
+        Vblanks vb;
+        FaldResources r;
+        const FaldVBlankMap m = vb.map(0);
+        CHECK(FaldPanelClockStep(&r, vb.at(0) + 20000, freq, 0.72f, -1, 16.66665f, &m));
+        CHECK_FALSE(FaldPanelClockStep(&r, vb.at(1) + 20000, freq, 0.72f, -1, 16.66665f, &m));
+        CHECK(r.stateValid); CHECK_FALSE(r.clkSeeded);
+        FaldTemporalClockReleased(&r);
+        CHECK_FALSE(r.stateValid); CHECK(r.clkIndex == 0ull); CHECK_FALSE(r.clkSeeded);
+        CHECK(FaldPanelClockStep(&r, vb.at(1) + 60000, freq, 0.72f, -1, 16.66665f, &m));   // same refresh: a seed, not k = 0
+        CHECK(r.clkSeeded); CHECK(r.clkIndex == (unsigned long long)(vb.K + 2));
+        CHECK_FALSE(FaldPanelClockPlan(r.clkSeeded, r.clkElapsed).bindMaps);
+    }
 }
 
 // FLD3: the 40 FLD2 words + 8 (word 40 transfer, 41 sdr_gamma, 42-47 reserved); tables follow at byte 192.

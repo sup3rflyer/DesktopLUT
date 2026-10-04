@@ -93,27 +93,37 @@ void FaldPanelClockFactors(unsigned long long nA, unsigned long long k, float cl
 unsigned int FaldPanelClockSettleFrames(float closure);
 
 // ---------------------------------------------------------------------------------------------------------------------
-// Stage 3: an ABSOLUTE refresh index for the panel clock (DLC docs/fald-stage3-absolute-refresh-spec.md; DLC twin
-// dlc/fald/paneltime.py abs_refresh_index / clock_source_step / VBlankTracker; tests/test_fald.cpp).
+// Stage 3: an ABSOLUTE refresh index for the panel clock (DLC docs/fald-stage3-absolute-refresh-spec.md; DLC twins
+// dlc/fald/paneltime.py abs_refresh_index / clock_source_step; tests/test_fald.cpp).
 // ---------------------------------------------------------------------------------------------------------------------
 // MEASURED 2026-10-04 (PA32UCXR, meter): the dimming engine ticks every 2nd refresh with its parity locked to the VBLANK
 // COUNT; the run-time grid above re-rolls against it every few seconds (DWM's composition timing shifts between latency
 // regimes, which moves Σk by one), so parity 0 / 1 could not hold. DesktopLUT.exe now publishes a "vblank map" of the
-// monitor (src/dwm_inject.cpp; the shared words: dwm_hook_config.h DwmHookVBlankMap): the vblank PHASE + period from a
-// vblank-wait thread on the output, the COUNT from DWM's per-vblank composition counter (DWM_TIMING_INFO::cRefresh, =
-// DXGI PresentRefreshCount minus a constant) sampled MID-FRAME. The hook numbers a composition run at QPC time t with
-// the count of the vblank its frame is scanned out on:
+// monitor (src/dwm_inject.cpp; the shared words: dwm_hook_config.h DwmHookVBlankMap). Phase, period AND COUNT all come
+// from a vblank-wait thread on the TARGET OUTPUT itself (FaldVBlankTracker below): the count is that thread's own wake
+// numbering. DWM's composition counter (DWM_TIMING_INFO::cRefresh / qpcVBlank) is NOT an input — on the owner's rig
+// (2026-10-04) DWM's clock follows the OTHER monitor (BenQ 59.9406 Hz vs the ProArt's 60.0001 Hz: ~1000 ppm, one count
+// per ~17 s), and two displays a few ppm apart could not be told apart by any rate check; it is logged as a diagnostic
+// only (the drift of DWM's clock against the target output). The hook numbers a composition run at QPC time t with the
+// count of the vblank its frame is scanned out on:
 //     n = countAnchor + floor((t - qpcAnchor) / period) + L
 // L = FALD_VBLANK_LATENCY_REFRESHES: a frame composed in refresh interval j shows from vblank j + 1 (DWM flips at the
-// vblank after its composition) — an ASSUMPTION the hardware bench confirms. Parity 0 / 1 then mean "the clock ticks on
-// even / odd n" across composition regimes and restarts; the panel's bit relative to n is calibrated by the meter probe.
-// A map that is missing, older than FALD_VBLANK_MAP_MAX_AGE_MS or of another refresh period (a mode change) is not
-// used: the run-time grid drives the clock exactly as before (it keeps locking in the background either way).
+// vblank after its composition) — an ASSUMPTION the hardware bench confirms. qpcAnchor sits at the wakes' latency floor
+// AFTER the true vblank (a low quantile of the wake times: tens of us), so a run inside that first sliver of a refresh is
+// numbered as the previous one (n - 1); DWM's own composition wakes on the same vblank with a latency of the same kind,
+// so its runs land after it — the bench's check of L covers this window too.
+// The count's ORIGIN is arbitrary: 0 when the publisher starts, monotonic over the publisher's life (re-binding the output,
+// a restart of the model or a re-based phase continue it from the elapsed time — each such event starts a new numbering
+// EPOCH, logged by the host). The panel's parity bit relative to n is therefore NOT known from n alone: it must be
+// calibrated per publisher start / display event / epoch (the meter probe, agent_motion_parity_layer_probe.py); parity
+// -1 (the mean of both clocks) stays the default, and 0 / 1 mean "the clock ticks on even / odd n" — stable within an
+// epoch across composition regimes. A map that is missing, older than FALD_VBLANK_MAP_MAX_AGE_MS or of another refresh
+// period (a mode change) is not used: the run-time grid drives the clock exactly as before (it keeps locking either way).
 constexpr int FALD_VBLANK_LATENCY_REFRESHES = 1;
 constexpr double FALD_VBLANK_MAP_MAX_AGE_MS = 500.0;
 constexpr double FALD_VBLANK_PERIOD_TOLERANCE = 0.01;   // map period vs the hook's nominal refresh period (relative)
 struct FaldVBlankMap {
-    long long countAnchor = 0;   // absolute vblank count (cRefresh numbering) of the vblank at qpcAnchor
+    long long countAnchor = 0;   // the publisher's vblank index of the vblank at qpcAnchor (origin arbitrary, see above)
     long long qpcAnchor = 0;     // QPC time of that vblank
     double periodQpc = 0.0;      // refresh period in QPC ticks (<= 0 or not finite: no map)
 };
@@ -128,7 +138,7 @@ bool FaldAbsRefreshIndex(const FaldVBlankMap& map, long long tQpc, long long qpc
 //   abs after abs:  d = absN - prevIndex. 0 <= d and |d - kGrid| <= 2 -> k = d, n = absN (ABS: the absolute index wins —
 //                   the grid re-rolls at a regime shift, the vblank count does not); d = -1 -> k = 0, n = prevIndex (HOLD:
 //                   a run just behind the previous one's boundary after a re-published phase; never backwards); else
-//                   REBASE: k = kGrid (continuity), n = absN (the numbering).
+//                   REBASE: k = kGrid (continuity), n = absN (the numbering: e.g. a new epoch).
 //   abs after grid: SWITCH_ABS: k = kGrid, n = absN (the elapsed refreshes are the grid's, the numbering the map's).
 //   no abs:         k = kGrid, n = prevIndex + kGrid (GRID — bit for bit the pre-stage-3 clock — or SWITCH_GRID after
 //                   an abs stretch: the numbering continues from the last absolute index).
@@ -147,49 +157,48 @@ const char* FaldClockSourceName(unsigned int source);   // "grid" / "abs" / "swi
 
 // The host side of the map (DesktopLUT.exe's publisher thread, src/dwm_inject.cpp) — pure bookkeeping on QPC times, no
 // Windows calls, so every rule is unit-tested:
-//  * Wake(qpc) at every return of the output's vblank wait = the PHASE. A wake is numbered by the phase model, steps =
-//    floor((t - vblank instant of the previous index) / period + 0.25) (the wake latency is one-sided and below 3/4 of a
-//    period): a missed wake (a late thread) is repaired, a second wake inside one refresh is ignored, more than
-//    FALD_VBLANK_MAX_GAP refreshes start the model over. The vblank instant of an index = a low quantile of the recent
-//    wakes projected onto it (the latency is one-sided). Period: the median of the recent single-step gaps (robust; the
-//    gap repair uses it), refined once published phase points span FALD_VBLANK_FIT_MIN refreshes by a least-squares fit
-//    over them (the median is only good to a few us per refresh; the fit to well below 0.1 us).
-//  * Sample(before, after, count, dwmPeriod): DWM's per-vblank counter read MID-FRAME (QPC before / after the call).
-//    Near its increment instant it is ambiguous by +-1, so a read outside FALD_VBLANK_SAMPLE_PHASE_LO..HI of its refresh
-//    (or one that took longer than a tenth of a period) is rejected. offset = count - (local index of that refresh);
-//    two agreeing reads establish it; a disagreeing read WITHHOLDS the map (a lone glitch never changes the published
-//    count) until a read confirms the old offset or FALD_VBLANK_REANCHOR_VOTES consecutive reads agree on a new one.
-//    A numbering anomaly — repaired missed wakes, a wake more than half a period late, or an ANCHOR JUMP (the current
-//    vblank instant more than a quarter period off where the last map published since a confirming read puts it) —
-//    also withholds the map until an accepted read confirms the offset (needConfirm): a slip of the local index is
-//    never published, even when the read of that cycle was rejected. While withheld (pending), the publisher keeps
-//    its LAST map in place — it was right when published and the hook ages it out after 0.5 s; it withdraws the map
-//    only for the hard reasons below.
-//  * Map(out): valid once the phase (FALD_VBLANK_MIN_WAKES), the FITTED period (~2 s after a start: the median alone is
-//    too coarse to extrapolate) and the offset are known, the offset was confirmed within
-//    FALD_VBLANK_CONFIRM_MAX refreshes, the period is within 0.5 % of the nominal one, and DWM's own refresh period
-//    (when it reported one) agrees within 0.5 % — DWM's counter follows its CLOCK display (by default the fastest one),
-//    not necessarily this monitor. Records a phase point for the period fit.
+//  * Wake(qpc) at every return of the TARGET output's vblank wait: phase, period and the count. A wake is numbered by the
+//    phase model, steps = floor((t - vblank instant of the previous index) / period + 0.25) (the wake latency is
+//    one-sided and below 3/4 of a period): a missed wake (a late thread) is repaired, a second wake inside one refresh is
+//    ignored, a gap longer than FALD_VBLANK_MAX_GAP refreshes (FALD_VBLANK_MAX_GAP_FIT once the period is fitted and a map
+//    was published) restarts the model, the numbering continued by the elapsed time in a new epoch. The vblank instant of
+//    an index = a low quantile of the recent wakes projected onto it (the latency is one-sided). Period: the median of the
+//    recent single-step gaps (robust; the gap repair uses it), refined once phase points span FALD_VBLANK_FIT_MIN
+//    refreshes by a least-squares fit over them (the median is only good to a few us per refresh; the fit to well below
+//    0.1 us). Only a fitted period within FALD_VBLANK_NOMINAL_TOLERANCE of the nominal one is published.
+//  * Map(out): the CONTINUITY CHAIN. Every published map must sit on the published numbering: the current vblank
+//    instant must land on the chain's reference — the least-squares line through its phase points (each one accepted
+//    onto the chain), or the last published anchor before there is a fit — within FALD_VBLANK_PHASE_TOLERANCE of a
+//    whole number m of periods. m != 0 = a slip of the local numbering (wakes miscounted since): repaired — the rings
+//    are renumbered from their times — and the map is published on the chain. A non-integer residual = the phase itself
+//    moved (a re-timed display, a burst of late wakes): the map is WITHHELD; only once the moved phase has been stable for
+//    FALD_VBLANK_REBASE_AFTER publish attempts is it adopted as a new chain (re-based to the nearest whole count, a new
+//    epoch; the phase points are dropped and the period re-fitted first). A slip is never published unseen. Before
+//    the ring has turned over, a RECENT-WAKE guard catches a moved phase early: if none of the last
+//    FALD_VBLANK_RECENT_WAKES wakes lies within FALD_VBLANK_RECENT_LATE periods of the model's vblank, the map is
+//    withheld (a display re-timed by more than that is published wrongly for at most ~FALD_VBLANK_RECENT_WAKES refreshes;
+//    a smaller re-timing until the wake ring turns over, ~0.5 s, and then only for runs in the last sliver of a refresh).
+//  * DwmSample(...): DWM's composition clock against the target output — DIAGNOSTICS ONLY, never an input: the phase of
+//    qpcVBlank on the target's vblank grid over time gives the relative period difference in ppm (the owner's BenQ-clocked
+//    DWM: about +990 ppm) and whether DWM's clock display is this output (|ppm| < FALD_VBLANK_SAME_CLOCK_PPM).
 constexpr unsigned int FALD_VBLANK_WAKE_RING = 32;       // wakes the vblank instant is estimated from
 constexpr unsigned int FALD_VBLANK_GAP_RING = 64;        // single-step gaps the median period is taken over
-constexpr unsigned int FALD_VBLANK_PHASE_RING = 64;      // published phase points the period is fitted on
+constexpr unsigned int FALD_VBLANK_PHASE_RING = 64;      // phase points the period is fitted on (one per publish attempt)
 constexpr unsigned int FALD_VBLANK_MIN_WAKES = 16;
 constexpr unsigned int FALD_VBLANK_MIN_GAPS = 8;
+constexpr unsigned int FALD_VBLANK_MODEL_MIN_WAKES = 4;   // wakes before the phase model numbers wakes (nominal period)
 constexpr unsigned int FALD_VBLANK_FIT_MIN = 120;        // refreshes the phase points must span before the fit is used
-constexpr unsigned int FALD_VBLANK_MAX_GAP = 240;        // more refreshes between two wakes: start over
-constexpr unsigned int FALD_VBLANK_CONFIRM_MAX = 600;    // the offset unconfirmed for longer: map withheld
-constexpr unsigned int FALD_VBLANK_REANCHOR_VOTES = 3;
-constexpr double FALD_VBLANK_SAMPLE_PHASE_LO = 0.25;     // accepted counter reads: this part of the refresh, away from
-constexpr double FALD_VBLANK_SAMPLE_PHASE_HI = 0.75;     // the counter's increment at the vblank
-constexpr double FALD_VBLANK_RATE_TOLERANCE = 0.005;     // period vs nominal / vs DWM's clock (relative)
-enum FaldVBlankSampleResult : int {
-    FALD_VSAMPLE_ACCEPTED = 0,     // agrees with the offset (or establishes / votes for it)
-    FALD_VSAMPLE_NO_PHASE = 1,     // no phase model yet
-    FALD_VSAMPLE_SLOW = 2,         // the read took longer than a tenth of a period
-    FALD_VSAMPLE_NEAR_EDGE = 3,    // read near the counter's increment: ambiguous by +-1, ignored
-    FALD_VSAMPLE_CONFLICT = 4,     // disagrees with the established offset: map withheld, not adopted
-    FALD_VSAMPLE_REANCHORED = 5,   // enough consecutive agreeing disagreements: the new offset is adopted
-};
+constexpr unsigned int FALD_VBLANK_MAX_GAP = 240;        // more refreshes between two wakes: start over ...
+constexpr unsigned int FALD_VBLANK_MAX_GAP_FIT = 7200;   // ... with a fitted period on a chain (fit error x gap << 1/4)
+constexpr double FALD_VBLANK_NOMINAL_TOLERANCE = 0.001;  // fitted period vs the nominal one (relative)
+constexpr double FALD_VBLANK_FIT_MEDIAN_TOLERANCE = 0.01;   // fit vs the median of the gaps (a sanity bound)
+constexpr double FALD_VBLANK_PHASE_TOLERANCE = 0.1;      // chain residual off a whole number of periods (periods)
+constexpr unsigned int FALD_VBLANK_RECENT_WAKES = 8;     // the recent-wake guard (one of them near the model's vblank)
+constexpr double FALD_VBLANK_RECENT_LATE = 0.15;         // ... within this many periods of it
+constexpr unsigned int FALD_VBLANK_REBASE_AFTER = 16;    // stable publish attempts before a moved phase is adopted
+constexpr unsigned int FALD_VBLANK_DWM_RING = 64;        // DWM-clock diagnostic samples
+constexpr unsigned int FALD_VBLANK_DWM_MIN_SPAN = 240;   // refreshes they must span before a drift is reported
+constexpr double FALD_VBLANK_SAME_CLOCK_PPM = 20.0;      // |drift| below this: DWM's clock display is the target output
 struct FaldVBlankTracker {
     double nominalPeriodQpc = 0.0;            // from the mode description (DisplayConfig); 0 = unknown (no map)
     double medianPeriodQpc = 0.0;             // median of the single-step gaps (0 until FALD_VBLANK_MIN_GAPS)
@@ -197,7 +206,7 @@ struct FaldVBlankTracker {
     bool periodFit = false;                   // periodQpc is the phase-point fit (required for a map)
     bool haveWake = false;
     long long lastWakeQpc = 0;
-    unsigned long long v = 0;                 // local vblank index of the last accepted wake (0 = the first one)
+    unsigned long long v = 0;                 // vblank index of the last accepted wake = THE COUNT (origin: Reset's)
     long long wakeQpc[FALD_VBLANK_WAKE_RING] = {};
     unsigned long long wakeV[FALD_VBLANK_WAKE_RING] = {};
     unsigned int wakeN = 0, wakeHead = 0;
@@ -206,30 +215,52 @@ struct FaldVBlankTracker {
     long long phaseQpc[FALD_VBLANK_PHASE_RING] = {};
     unsigned long long phaseV[FALD_VBLANK_PHASE_RING] = {};
     unsigned int phaseN = 0, phaseHead = 0;
-    bool offsetValid = false;                 // offset = DWM count - local index, established
-    bool withheld = false;                    // a disagreeing read is pending a decision (map invalid meanwhile)
-    bool needConfirm = false;                 // a numbering anomaly (missed / late wake, anchor jump) awaits a confirming read
-    bool haveRef = false;                     // the anchor-jump reference: the last map published since the last
-    long long refQpc = 0;                     // confirming read (its vblank instant and local index)
+    // the continuity chain: the last published map's anchor and index
+    bool haveRef = false;
+    long long refQpc = 0;
     unsigned long long refV = 0;
-    long long offset = 0;
-    long long pending = 0;                    // the candidate offset and its consecutive votes
-    unsigned int pendingVotes = 0;
-    unsigned long long confirmV = 0;          // local index of the last read that agreed with the offset
-    double dwmPeriodQpc = 0.0;                // DWM's composition clock period at the last read (0 = not reported)
+    long long lineBase = 0;                   // (the reference line's time origin: VBlankLineAt)
+    unsigned int held = 0;                    // consecutive publish attempts withheld by a moved phase
+    bool haveMoved = false;                   // the last withheld attempt (the moved phase's own stability)
+    long long movedQpc = 0;
+    unsigned long long movedV = 0;
+    unsigned int movedStable = 0;
+    unsigned long long epoch = 0;             // numbering epochs inside this tracker (restart / re-base)
+    // DWM's composition clock vs this output (diagnostics only)
+    bool dwmHave = false;
+    long long dwmT0 = 0;
+    double dwmLastFrac = 0.0, dwmUnwrapped = 0.0;
+    double dwmX[FALD_VBLANK_DWM_RING] = {}, dwmY[FALD_VBLANK_DWM_RING] = {};
+    unsigned int dwmN = 0, dwmHead = 0;
+    double dwmPpm = 0.0;                      // DWM's period minus this output's, relative, in ppm (when dwmState >= 0)
+    int dwmState = -1;                        // -1 unknown, 0 another display's clock, 1 this output's clock
+    unsigned long long dwmLastCount = 0;      // the last cRefresh / qpcRefreshPeriod seen (log)
+    double dwmLastPeriodQpc = 0.0;
     // statistics (host log; the bench reads them)
     unsigned long long wakes = 0, missed = 0, spurious = 0, lateWakes = 0, restarts = 0;
-    unsigned long long samples = 0, rejectedEdge = 0, rejectedSlow = 0, conflicts = 0, reanchors = 0, anchorJumps = 0;
+    unsigned long long published = 0, slipsRepaired = 0, phaseJumps = 0, rebases = 0, recentLate = 0, dwmSamples = 0;
 };
-void FaldVBlankTrackerReset(FaldVBlankTracker* t, double nominalPeriodQpc);
+// A fresh tracker whose first wake gets index firstIndex (the publisher continues its numbering across re-binds).
+void FaldVBlankTrackerReset(FaldVBlankTracker* t, double nominalPeriodQpc, unsigned long long firstIndex = 0);
 // Returns the refreshes since the previous accepted wake: 0 = ignored (the first wake / a restart also return 0 after
 // seeding the model), 1 = the next vblank, > 1 = missed wakes repaired.
 unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc);
-// The vblank instant of local index v from the phase model; false before FALD_VBLANK_MIN_GAPS wakes / without a period.
+// The vblank instant of index v from the phase model; false before FALD_VBLANK_MODEL_MIN_WAKES wakes / without a period.
 bool FaldVBlankTrackerVBlankQpc(const FaldVBlankTracker* t, unsigned long long v, long long* qpc);
-FaldVBlankSampleResult FaldVBlankTrackerSample(FaldVBlankTracker* t, long long qpcBefore, long long qpcAfter,
-                                               unsigned long long count, double dwmPeriodQpc);
+// One publish attempt (the chain above). True = *out is a map to publish; false = withhold / withdraw.
 bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out);
+// DWM's composition timing at nowQpc (qpcVBlank, cRefresh, qpcRefreshPeriod of DWM_TIMING_INFO): diagnostics only.
+void FaldVBlankTrackerDwmSample(FaldVBlankTracker* t, long long nowQpc, long long qpcVBlank, unsigned long long cRefresh,
+                                double qpcRefreshPeriod);
+// The publisher's spin guard: a vblank wait that returned less than a quarter period after the previous return did not
+// wait for a vblank (monitor asleep, output gone): it is not fed to the tracker, and the thread sleeps a period instead.
+bool FaldVBlankWaitTooSoon(long long prevReturnQpc, long long returnQpc, double periodQpc);
+// The publisher's periodic re-check of its output (every few seconds of TIME): re-bind (withdraw the map, find the
+// output at the monitor's position again, a new epoch) when the DXGI factory is stale, the output's description is
+// unreadable, it left the desktop or no longer starts at the monitor's position (a swap / layout change: the posTag
+// would name the wrong output), or the nominal refresh period changed (a mode set).
+bool FaldVBlankNeedsRebind(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left, int top,
+                           float nominalMs, float nominalNowMs);
 
 // The per-monitor temporal bookkeeping (no D3D). The overlay's FaldResources and the hook's FaldMonitor both DERIVE
 // from it, so every field is reached the same way (r->clkIndex) and the functions below take either.
@@ -345,3 +376,8 @@ bool FaldTemporalSettlePending(const FaldTemporalState* r);
 // a state kept across a layer-OFF period would blend the new content with the OLD content's drives when the layer comes
 // back on a static desktop, and nothing would settle it (design review 2026-09-17).
 void FaldTemporalIdle(FaldTemporalState* r);
+// The panel clock's textures were released (src/fald.cpp / dwm_hook ReleaseClock): the clocks' state is void, so the next
+// run RE-SEEDS (stateValid = false) — the seed rule "clkSeeded && k == 0" must never see a k = 0 run bind maps that no
+// pass has written since. (Modes 0-2 are unaffected: ReleaseClock only runs on a rebuild, while mode 3 is (re)starting,
+// or when leaving mode 3 — a mode change that resets the state anyway.)
+void FaldTemporalClockReleased(FaldTemporalState* r);

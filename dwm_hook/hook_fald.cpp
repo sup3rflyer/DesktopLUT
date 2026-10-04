@@ -455,7 +455,7 @@ static void ReleaseClock(FaldMonitor* m) {
     for (unsigned int i = 0; i < 2; i++) { SafeRelease(m->clkStateSRV[i]); SafeRelease(m->clkStateUAV[i]); SafeRelease(m->clkStateTex[i]); }
     SafeRelease(m->clkPrevSRV); SafeRelease(m->clkPrevUAV); SafeRelease(m->clkPrevTex);
     SafeRelease(m->clkEstSRV); SafeRelease(m->clkEstUAV); SafeRelease(m->clkEstTex);
-    m->clkElapsed = 0; m->clkIndex = 0; m->clkSeeded = false;   // as src/fald.cpp ReleaseClock
+    FaldTemporalClockReleased(m);            // as src/fald.cpp ReleaseClock: the clocks' state is void, the next run re-seeds
 }
 
 static void ReleaseTemporal(FaldMonitor* m) {

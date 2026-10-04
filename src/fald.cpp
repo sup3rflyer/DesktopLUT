@@ -264,7 +264,7 @@ static void ReleaseClock(FaldResources* r) {
     SafeRelease(r->clkPrevSRV); SafeRelease(r->clkPrevUAV); SafeRelease(r->clkPrevTex);
     SafeRelease(r->clkEstSRV); SafeRelease(r->clkEstUAV); SafeRelease(r->clkEstTex);
     r->clkRetryCounter = 0;                  // mode off / resources rebuilt: the next enable tries at once
-    r->clkElapsed = 0; r->clkIndex = 0; r->clkSeeded = false;
+    FaldTemporalClockReleased(r);            // the clocks' state is void: the next run re-seeds
 }
 
 static void ReleaseAll(FaldResources* r) {

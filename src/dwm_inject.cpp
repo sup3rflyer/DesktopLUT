@@ -23,6 +23,7 @@
 #include <cctype>
 
 static std::recursive_mutex g_dwmInjectMutex;
+static void StopAllVBlankPublishersLocked();   // FALD stage 3 vblank publishers (below CloseDwmHookSharedMemory's helpers)
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -750,6 +751,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 std::wstring UninjectDwmHook()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    // FALD stage 3: the vblank publishers stop FIRST, on every path out of here (the early returns below included): no
+    // publisher thread may outlive the hook it serves, nor touch this file's statics during process exit.
+    StopAllVBlankPublishersLocked();
     SystemImpersonationGuard impGuard;
 
     std::wcout << L"[DWM Hook] Uninjecting..." << std::endl;
@@ -1120,25 +1124,29 @@ static void StopFaldSettleKicker() {
 // ---------------------------------------------------------------------------
 // One thread per monitor that runs a FALD layer with LED-lag mode 3 in hook mode (UpdateDwmHookSharedConfig starts and
 // stops them). Each thread
-//  * waits for that monitor's vblanks (IDXGIOutput::WaitForVBlank on the output at the monitor's desktop position) and
-//    feeds the QPC time of every wake to a FaldVBlankTracker: the vblank PHASE + period, missed wakes repaired;
-//  * every FALD_VBLANK_SAMPLE_EVERY wakes sleeps to the MIDDLE of the refresh (high-resolution timer, half a period after
-//    the wake) and reads DWM's per-vblank counter there (DwmGetCompositionTimingInfo(NULL).cRefresh, bracketed by QPC):
-//    the COUNT. Near its increment the counter is ambiguous by +-1 — the tracker rejects reads outside the middle half
-//    of the refresh. qpcVBlank is NOT used: its pairing with cRefresh slips by a period (bench 2026-10-04);
-//  * publishes {countAnchor, qpcAnchor, periodQpc} into the monitor's tail slot (dwm_hook_config.h DwmHookVBlankMap, its
-//    own seqlock; the head `version` is not touched) — or withdraws it (period 0) while the tracker cannot vouch for it.
+//  * waits for THAT monitor's vblanks (IDXGIOutput::WaitForVBlank on the output at the monitor's desktop position) and
+//    feeds the QPC time of every wake to a FaldVBlankTracker: phase, period AND the count — the tracker's own wake
+//    numbering (origin 0 at the publisher's start, continued across re-binds: monotonic over the publisher's life);
+//  * every FALD_VBLANK_PUBLISH_EVERY wakes publishes {countAnchor, qpcAnchor, periodQpc} into the monitor's tail slot
+//    (dwm_hook_config.h DwmHookVBlankMap, its own seqlock; the head `version` is not touched) — or withdraws it (period
+//    0) whenever the tracker does not vouch for it (no fitted period, a moved phase, the output re-bound);
+//  * reads DWM's composition timing there as a DIAGNOSTIC only (never an input): DWM's clock follows its clock display,
+//    which on the owner's rig is the OTHER monitor (2026-10-04: ~1000 ppm off the ProArt) — the statistics line reports
+//    its drift against this output and whether it is this output's clock.
 // The hook treats a map older than FALD_VBLANK_MAP_MAX_AGE_MS (0.5 s) as stale; publishing every 8 refreshes (133 ms at
 // 60 Hz) leaves room for a few skipped publishes. A publish only TRY-locks g_dwmInjectMutex (an injection may hold it for
-// seconds; skipping one is harmless). Cost: one thread asleep in a kernel vblank wait, plus one timer wait and one DWM
-// timing query every 8 refreshes; no window, no present, nothing shown on any display.
-// The count is DWM's COMPOSITION clock (its clock display: by default the fastest monitor, tools/dwm_clock_probe.py), so
-// the tracker withholds the map when DWM's refresh period differs from this monitor's — two displays at the SAME rate
-// that are not the same display cannot be told apart here (the mid-frame reads then conflict when their phases cross).
-static const unsigned int FALD_VBLANK_SAMPLE_EVERY = 8;        // wakes between counter reads / publishes
-static const unsigned int FALD_VBLANK_RECHECK_WAKES = 240;     // wakes between mode / factory checks (~4 s at 60 Hz)
+// seconds; skipping one is harmless). Spin guard: a wait that returns less than a quarter period after the previous one
+// (monitor asleep, output gone) is not counted and the thread sleeps a period; a run of them withdraws the map and backs
+// off. Every FALD_VBLANK_RECHECK_MS of time the output is re-checked (factory current, still attached, still at the
+// monitor's position, same nominal period) and re-bound otherwise. Cost: one thread asleep in a kernel vblank wait plus
+// one DWM timing query every 8 refreshes; no window, no present, nothing shown on any display.
+// The count's origin is arbitrary (every publisher start / re-bind / tracker epoch is a new numbering epoch, logged): the
+// panel's parity bit relative to it is calibrated per epoch by the meter probe; parity -1 stays the default.
+static const unsigned int FALD_VBLANK_PUBLISH_EVERY = 8;       // wakes between publishes (and DWM diagnostic reads)
+static const ULONGLONG FALD_VBLANK_RECHECK_MS = 4000;          // output / mode re-check interval (time, not wakes)
+static const unsigned int FALD_VBLANK_SPIN_LIMIT = 30;         // early returns in a row: output asleep, back off
 static const ULONGLONG FALD_VBLANK_STATS_MS = 60000;           // statistics line in the console log
-static const unsigned int FALD_VBLANK_LOG_TRANSITIONS = 32;    // valid <-> withheld transitions logged one by one
+static const unsigned int FALD_VBLANK_LOG_TRANSITIONS = 32;    // published <-> withdrawn transitions logged one by one
 
 struct VBlankPublisher {
     int left = 0, top = 0;
@@ -1187,6 +1195,7 @@ static void WriteVBlankMapLocked(int left, int top, const FaldVBlankMap* m) {
 }
 
 static void DropVBlankRecordLocked(int left, int top) {
+    WriteVBlankMapLocked(left, top, nullptr);                 // withdraw in shared memory now (a no-op if never published)
     const uint32_t tag = DwmHookVBlankPosTag(left, top);
     for (size_t i = 0; i < g_vblankPublished.size(); i++)
         if (g_vblankPublished[i].posTag == tag) { g_vblankPublished.erase(g_vblankPublished.begin() + (ptrdiff_t)i); return; }
@@ -1219,26 +1228,23 @@ static IDXGIOutput* FindDxgiOutputAt(int left, int top, IDXGIFactory1** factoryO
     return found;
 }
 
-// Why the tracker withholds its map (console log only).
+// Why the tracker does not publish (console log only).
 static const wchar_t* VBlankWithheldReason(const FaldVBlankTracker& t) {
     if (t.wakeN < FALD_VBLANK_MIN_WAKES) return L"acquiring the vblank phase";
-    if (!t.periodFit) return L"refresh period not fitted yet (phase points span < 2 s, or the fit disagrees with the median)";
-    if (!t.offsetValid) return L"count offset not established yet (mid-frame reads)";
-    if (t.withheld) return L"a mid-frame count read disagreed with the offset (pending)";
-    if (t.needConfirm) return L"a missed / late wake or an anchor jump awaits a confirming count read (pending)";
-    if ((long long)(t.v - t.confirmV) > (long long)FALD_VBLANK_CONFIRM_MAX) return L"count offset not re-confirmed lately";
-    if (!(t.nominalPeriodQpc > 0.0) || std::fabs(t.periodQpc / t.nominalPeriodQpc - 1.0) > FALD_VBLANK_RATE_TOLERANCE)
-        return L"measured period off the nominal refresh";
-    if (t.dwmPeriodQpc > 0.0 && std::fabs(t.dwmPeriodQpc / t.periodQpc - 1.0) > FALD_VBLANK_RATE_TOLERANCE)
-        return L"DWM's composition clock runs at another rate (its clock display is another monitor)";
-    return L"?";
+    if (t.held > 0u) return L"the vblank phase moved off the published numbering (withheld until it is stable)";
+    if (!t.periodFit) return L"refresh period not fitted yet (phase points span < 2 s), or the fit is off the nominal refresh by > 0.1 %";
+    if (!(t.nominalPeriodQpc > 0.0) || std::fabs(t.periodQpc / t.nominalPeriodQpc - 1.0) > FALD_VBLANK_NOMINAL_TOLERANCE)
+        return L"fitted period off the nominal refresh by more than 0.1 %";
+    return L"all recent wakes late against the model (the vblanks moved?)";
+}
+
+static const wchar_t* VBlankDwmClockText(int state) {
+    return state < 0 ? L"unknown yet" : (state == 1 ? L"this output" : L"ANOTHER display (its count is not this output's)");
 }
 
 static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
     VBlankPublisher* pub = static_cast<VBlankPublisher*>(param);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // a prompt wake = a sharp phase (it sleeps otherwise)
-    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-    if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
     LARGE_INTEGER f;
     QueryPerformanceFrequency(&f);
     const double freq = (double)f.QuadPart;
@@ -1246,9 +1252,11 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
     IDXGIFactory1* factory = nullptr;
     IDXGIOutput* out = nullptr;
     float nominalMs = 0.0f;
-    unsigned int sinceCheck = 0, sincePublish = 0, failures = 0, transitions = 0;
-    bool published = false;                                   // the slot holds a valid map (else nothing / withdrawn)
-    ULONGLONG lastStatsMs = GetTickCount64();
+    unsigned int sincePublish = 0, failures = 0, spins = 0, transitions = 0;
+    unsigned long long binds = 0;              // output bindings so far (each one a numbering epoch)
+    bool published = false;                    // the slot holds a valid map (else nothing / withdrawn)
+    long long prevReturn = 0;                  // QPC of the previous vblank-wait return (the spin guard)
+    ULONGLONG lastStatsMs = GetTickCount64(), lastCheckMs = GetTickCount64();
     auto releaseOutput = [&]() {
         if (out) { out->Release(); out = nullptr; }
         if (factory) { factory->Release(); factory = nullptr; }
@@ -1260,96 +1268,120 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
         return true;
     };
     auto withdraw = [&]() { if (published && publish(nullptr)) published = false; };
+    auto pauseFor = [&](DWORD ms) { return WaitForSingleObject(pub->stopEvt, ms) == WAIT_OBJECT_0; };   // true = stop
     while (!pub->stop.load()) {
         if (!out) {
             out = FindDxgiOutputAt(pub->left, pub->top, &factory);
-            nominalMs = RefreshPeriodMsAt(pub->left, pub->top);
-            if (!out || !(nominalMs > 1.0f)) {
+            const float nm = RefreshPeriodMsAt(pub->left, pub->top);
+            if (!out || !(nm > 1.0f)) {
                 releaseOutput();
-                if (WaitForSingleObject(pub->stopEvt, 1000) == WAIT_OBJECT_0) break;
+                if (pauseFor(1000)) break;
                 continue;
             }
-            FaldVBlankTrackerReset(&trk, (double)nominalMs * freq / 1000.0);
-            sinceCheck = sincePublish = 0;
+            // a (re-)binding: the count continues from the elapsed time (monotonic), in a new epoch
+            unsigned long long first = 0;
+            if (trk.haveWake && trk.periodQpc > 0.0) {
+                LARGE_INTEGER now;
+                QueryPerformanceCounter(&now);
+                const double el = (double)(now.QuadPart - trk.lastWakeQpc) / trk.periodQpc;
+                first = trk.v + (el >= 1.0 ? (unsigned long long)std::llround(el) : 1ull);
+            }
+            nominalMs = nm;
+            FaldVBlankTrackerReset(&trk, (double)nominalMs * freq / 1000.0, first);
+            sincePublish = 0; prevReturn = 0; spins = 0;
+            lastCheckMs = GetTickCount64();
+            binds++;
             std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): watching the output's vblanks, nominal "
-                       << nominalMs << L" ms" << std::endl;
+                       << nominalMs << L" ms, numbering epoch " << binds << L" from count " << first
+                       << L" (the panel's parity bit must be calibrated for this epoch)" << std::endl;
         }
         const HRESULT hr = out->WaitForVBlank();
-        LARGE_INTEGER wake;
-        QueryPerformanceCounter(&wake);
+        LARGE_INTEGER ret;
+        QueryPerformanceCounter(&ret);
         if (pub->stop.load()) break;
         if (FAILED(hr)) {                                     // output off / gone: withdraw, re-find it after a few
             withdraw();
             if (++failures >= 3u) { failures = 0; releaseOutput(); }
-            if (WaitForSingleObject(pub->stopEvt, 250) == WAIT_OBJECT_0) break;
+            if (pauseFor(250)) break;
             continue;
         }
         failures = 0;
-        FaldVBlankTrackerWake(&trk, wake.QuadPart);
-        if (++sinceCheck >= FALD_VBLANK_RECHECK_WAKES) {      // a mode change (new period) / a topology change
-            sinceCheck = 0;
+        // spin guard: a return that did not wait for a vblank is not counted; this HIGHEST-priority thread sleeps instead
+        const double P = trk.periodQpc > 0.0 ? trk.periodQpc : (double)nominalMs * freq / 1000.0;
+        const bool tooSoon = FaldVBlankWaitTooSoon(prevReturn, ret.QuadPart, P);
+        prevReturn = ret.QuadPart;
+        if (tooSoon) {
+            if (++spins >= FALD_VBLANK_SPIN_LIMIT) {          // the output does not wait at all: asleep / gone
+                withdraw();
+                releaseOutput();
+                spins = 0;
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top
+                           << L"): vblank wait returns immediately (output asleep?) - map withdrawn, re-binding" << std::endl;
+                if (pauseFor(1000)) break;
+            } else if (pauseFor((DWORD)std::ceil(P * 1000.0 / freq))) {
+                break;
+            }
+            continue;
+        }
+        spins = 0;
+        FaldVBlankTrackerWake(&trk, ret.QuadPart);
+        // the output re-check, by TIME: a stale factory, a detached / moved output (a swap or layout change), a mode set
+        const ULONGLONG tick = GetTickCount64();
+        if (tick - lastCheckMs >= FALD_VBLANK_RECHECK_MS) {
+            lastCheckMs = tick;
+            DXGI_OUTPUT_DESC d = {};
+            const bool descOk = SUCCEEDED(out->GetDesc(&d));
             const float nm = RefreshPeriodMsAt(pub->left, pub->top);
-            if (!factory->IsCurrent() || !(std::fabs(nm - nominalMs) <= 1.0e-4f * nominalMs)) {
-                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): display changed (nominal "
-                           << nominalMs << L" -> " << nm << L" ms) - starting over" << std::endl;
+            if (FaldVBlankNeedsRebind(factory->IsCurrent() != FALSE, descOk, descOk && d.AttachedToDesktop,
+                                      (int)d.DesktopCoordinates.left, (int)d.DesktopCoordinates.top, pub->left, pub->top,
+                                      nominalMs, nm)) {
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): output / mode changed (nominal "
+                           << nominalMs << L" -> " << nm << L" ms) - map withdrawn, re-binding" << std::endl;
                 withdraw();
                 releaseOutput();
                 continue;
             }
         }
-        if (++sincePublish < FALD_VBLANK_SAMPLE_EVERY) continue;
+        if (++sincePublish < FALD_VBLANK_PUBLISH_EVERY) continue;
         sincePublish = 0;
-        // to the middle of this refresh, then DWM's counter, bracketed by QPC
-        const double P = trk.periodQpc > 0.0 ? trk.periodQpc : (double)nominalMs * freq / 1000.0;
-        LARGE_INTEGER now;
-        QueryPerformanceCounter(&now);
-        const double waitQpc = 0.5 * P - (double)(now.QuadPart - wake.QuadPart);
-        if (waitQpc > 0.0 && timer) {
-            LARGE_INTEGER due;
-            due.QuadPart = -(LONGLONG)(waitQpc * 1.0e7 / freq);   // relative, 100-ns units
-            if (due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
-                HANDLE w[2] = { pub->stopEvt, timer };
-                if (WaitForMultipleObjects(2, w, FALSE, 100) == WAIT_OBJECT_0) break;
-            }
-        }
+        // DWM's composition clock against this output: diagnostics only (never an input)
         DWM_TIMING_INFO ti = {};
         ti.cbSize = sizeof(ti);
-        LARGE_INTEGER before, after;
-        QueryPerformanceCounter(&before);
-        const HRESULT th = DwmGetCompositionTimingInfo(nullptr, &ti);
-        QueryPerformanceCounter(&after);
-        if (SUCCEEDED(th))
-            FaldVBlankTrackerSample(&trk, before.QuadPart, after.QuadPart, (unsigned long long)ti.cRefresh, (double)ti.qpcRefreshPeriod);
+        if (SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti))) {
+            LARGE_INTEGER now;
+            QueryPerformanceCounter(&now);
+            FaldVBlankTrackerDwmSample(&trk, now.QuadPart, (long long)ti.qpcVBlank, (unsigned long long)ti.cRefresh,
+                                       (double)ti.qpcRefreshPeriod);
+        }
         FaldVBlankMap m;
         const bool valid = FaldVBlankTrackerMap(&trk, &m);
         const bool wasPublished = published;
         if (valid) { if (publish(&m)) published = true; }
-        else if (!(trk.withheld || trk.needConfirm)) withdraw();
-        // (pending — a contradicting read / a numbering anomaly awaiting a confirming read: the last map stays; it was
-        // right when published, and the hook stops using it 0.5 s after its anchor unless a confirmed one replaces it)
+        else withdraw();
         if (published != wasPublished && transitions < FALD_VBLANK_LOG_TRANSITIONS) {
             transitions++;
             if (published)
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map published - period "
-                           << m.periodQpc * 1000.0 / freq << L" ms, count " << m.countAnchor << std::endl;
+                           << m.periodQpc * 1000.0 / freq << L" ms, count " << m.countAnchor << L" (epoch " << binds << L"."
+                           << trk.epoch << L")" << std::endl;
             else
-                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map withheld - "
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map withdrawn - "
                            << VBlankWithheldReason(trk) << std::endl;
         }
-        const ULONGLONG tick = GetTickCount64();
         if (tick - lastStatsMs >= FALD_VBLANK_STATS_MS) {
             lastStatsMs = tick;
-            std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): " << (published ? L"published" : L"withheld")
-                       << L", period " << trk.periodQpc * 1000.0 / freq << L" ms (median " << trk.medianPeriodQpc * 1000.0 / freq
-                       << L"), DWM period " << trk.dwmPeriodQpc * 1000.0 / freq << L" ms | wakes " << trk.wakes << L" missed "
-                       << trk.missed << L" spurious " << trk.spurious << L" late " << trk.lateWakes << L" restarts " << trk.restarts
-                       << L" | reads " << trk.samples << L" near-edge " << trk.rejectedEdge << L" slow " << trk.rejectedSlow
-                       << L" conflicts " << trk.conflicts << L" re-anchors " << trk.reanchors << L" anchor jumps "
-                       << trk.anchorJumps << std::endl;
+            std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): " << (published ? L"published" : L"withdrawn")
+                       << L", count " << trk.v << L" epoch " << binds << L"." << trk.epoch << L", period "
+                       << trk.periodQpc * 1000.0 / freq << L" ms (" << (trk.nominalPeriodQpc > 0.0 ? (trk.periodQpc / trk.nominalPeriodQpc - 1.0) * 1.0e6 : 0.0)
+                       << L" ppm vs nominal) | wakes " << trk.wakes << L" missed " << trk.missed << L" spurious " << trk.spurious
+                       << L" late " << trk.lateWakes << L" restarts " << trk.restarts << L" | publishes " << trk.published
+                       << L" slips repaired " << trk.slipsRepaired << L" phase jumps " << trk.phaseJumps << L" re-bases "
+                       << trk.rebases << L" recent-late " << trk.recentLate << L" | DWM clock (diagnostic): " << VBlankDwmClockText(trk.dwmState) << L", drift "
+                       << trk.dwmPpm << L" ppm, cRefresh " << trk.dwmLastCount << L", DWM period "
+                       << trk.dwmLastPeriodQpc * 1000.0 / freq << L" ms" << std::endl;
         }
     }
     releaseOutput();
-    if (timer) CloseHandle(timer);
     return 0;
 }
 

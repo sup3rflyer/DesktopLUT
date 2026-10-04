@@ -176,7 +176,9 @@ static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FA
 struct DwmHookVBlankMap {
     uint32_t seq;                    // own seqlock: odd = write in progress, even = complete, 0 = never published
     uint32_t posTag;                 // DwmHookVBlankPosTag(left, top) of the monitor these vblanks are
-    int64_t  countAnchor;            // absolute vblank count (DWM_TIMING_INFO::cRefresh numbering) of the vblank at qpcAnchor
+    int64_t  countAnchor;            // the publisher's vblank index of the vblank at qpcAnchor: its own wake numbering of THIS
+                                     // monitor (origin arbitrary per publisher start / epoch; NOT DWM's cRefresh, whose
+                                     // clock may be another display's — shared/fald_temporal.h)
     int64_t  qpcAnchor;              // QPC time of that vblank
     double   periodQpc;              // refresh period in QPC ticks; <= 0 = withdrawn (no map)
 };

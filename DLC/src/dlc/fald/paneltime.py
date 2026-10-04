@@ -114,8 +114,10 @@ class RefreshGrid:
 def abs_refresh_index(count_anchor: int, qpc_anchor: int, period_qpc: float, t_qpc: int, qpc_freq: int,
                       nominal_ms: float = 0.0, latency: int = VBLANK_LATENCY) -> Optional[int]:
     """Stage 3: the ABSOLUTE index of the refresh a composition run at QPC time ``t_qpc`` is scanned out on, from the
-    host's vblank map ``(count_anchor, qpc_anchor, period_qpc)`` (count = DWM's per-vblank counter of the vblank at
-    ``qpc_anchor``): ``n = count_anchor + floor((t − qpc_anchor) / period) + latency``. ``None`` = no usable map: the period
+    host's vblank map ``(count_anchor, qpc_anchor, period_qpc)`` (count = the host publisher's own vblank-wait numbering
+    of THIS monitor at ``qpc_anchor``, origin arbitrary per publisher start / epoch — NOT DWM's cRefresh, whose clock can
+    be another display's; so the panel's parity bit relative to n is calibrated per epoch and parity −1 stays the
+    default): ``n = count_anchor + floor((t − qpc_anchor) / period) + latency``. ``None`` = no usable map: the period
     not finite / outside 1..1000 ms / off ``nominal_ms`` by more than ``VBLANK_PERIOD_TOLERANCE`` (``nominal_ms <= 0``
     skips that check), the run more than ``VBLANK_MAP_MAX_AGE_MS`` after the anchor or more than two periods before it,
     no QPC frequency, a garbage anchor, or n < 0 — the clock then runs on its :class:`RefreshGrid` as before.
