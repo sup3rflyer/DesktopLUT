@@ -70,6 +70,23 @@ def test_level_truth_drives_a_zone_on_one_pixel_column_area_truth_by_area():
     assert d_level > 2 * d_area
 
 
+def test_power_statistic_spans_the_two_brackets():
+    sc = Scene("t", grey(5.0), (_bar(x=481.0 - 20.0, w=40.0),))           # one full-res column inside zone column 6
+    img, pk = render_reduced(sc, 0, P.scale, P.width, P.height)
+    r = 270 // 45
+    d = {}
+    for st in ("area", "level", "power:1", "power:0", "power:0.45"):
+        m = MotionModel(P, st)
+        m.set_peak(pk)
+        d[st] = float(m.cell_drives(img)[r, 6])
+    tot = 5.0 * 45 * 80 + 995.0 * 45                                       # this zone's lit sum: a < 1, so g matters
+    assert tot / (P.stat_area0_px2 * 1000.0) < 1.0
+    assert d["power:1"] == pytest.approx(d["area"]) and d["power:0"] == pytest.approx(d["level"])
+    assert d["area"] < d["power:0.45"] < d["level"]
+    with pytest.raises(ValueError):
+        MotionModel(P, "power:1.5")
+
+
 def test_scene_round_trip_text_and_gray_code():
     sc = Scene("t", grey(5.0), (_bar(vx=4.0), MovingShape("disc", 700.0, 300.0, grey(200.0), r=30.0, vx=-2.0)),
                pre=3, move=10, post=2, cadence=(3, 2), sync=(50, 250, 60, 60, 10, 30), code=(40, 480, 20, 8, 2, 12))

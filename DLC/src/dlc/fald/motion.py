@@ -262,13 +262,20 @@ class MotionModel(FaldModel):
     (:func:`render_reduced`) or a corrected request's (:func:`dlc.fald.correct.correct_image` carries a ``peak``
     companion through the same per-pixel rule — the soft knee acts per full-resolution pixel, so the peak is NOT the
     raster pixel scaled by its mean correction). ``None`` = the raster itself (the plain model). ``stat`` = "area" (the
-    shipped ``min(peak, Σ/A0)``, the shader's) or "level" (the brightest lit pixel — the measured border law's upper
-    bracket); the area sum always comes from the raster (light is conserved)."""
+    shipped ``min(peak, Σ/A0)``, the shader's), "level" (the brightest lit pixel — the border law's upper bracket) or
+    "power:<g>" = ``peak · min(1, Σ / (A0 · peak))^g`` (g 1 = area, 0 = level; the 2026-10-04 border meter probe — a
+    1000-nit 40x270 bar stepped into a zone — fits g ≈ 0.45: the first pixel column already gives 2/3 of the zone's
+    effect, `results/fald_motion_2026-10-04/border_analysis.json`); the area sum always comes from the raster."""
 
     def __init__(self, p: FaldParams, stat: str = "area"):
         super().__init__(p)
-        if stat not in ("area", "level"):
-            raise ValueError(f"stat must be 'area' or 'level', got {stat!r}")
+        self.gamma: Optional[float] = None
+        if stat.startswith("power:"):
+            self.gamma = float(stat.split(":", 1)[1])
+            if not 0.0 <= self.gamma <= 1.0:
+                raise ValueError(f"power statistic exponent must be in [0, 1], got {self.gamma}")
+        elif stat not in ("area", "level"):
+            raise ValueError(f"stat must be 'area', 'level' or 'power:<g>', got {stat!r}")
         self.stat = stat
         self._peak: Optional[np.ndarray] = None
 
@@ -287,6 +294,8 @@ class MotionModel(FaldModel):
             return peak
         lit = s > p.drive_floor_nits
         tot = (s * lit).reshape(p.rows, self.ch, p.cols, self.cw).sum(axis=(1, 3)) * float(p.scale ** 2)
+        if self.gamma is not None:
+            return peak * np.minimum(1.0, tot / np.maximum(p.stat_area0_px2 * peak, 1e-9)) ** self.gamma
         return np.minimum(peak, tot / p.stat_area0_px2)
 
     def active_zones(self, img: np.ndarray) -> np.ndarray:
