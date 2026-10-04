@@ -1063,6 +1063,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\ntemp_alpha_rise " << r->tempAlphaRise << "\ntemp_alpha_fall " << r->tempAlphaFall << "\ndt_ms " << r->dtMs
          << "\nstate_valid " << (r->stateValid ? 1 : 0)
          << "\nclock_closure " << r->clkClosure << "\nclock_parity " << r->clkParity << " (-1 unknown: the mean of both clocks)"
+         << "\nclock_source " << FaldClockSourceName(r->clkSource) << " (the overlay gets no vblank map: always the run-time grid)"
          << "\nclock_seed " << (r->clkSeeded ? 1 : 0) << " (1 = this run (re-)seeded the clocks: the stateless layer, no clock files)"
          << "\nclock_time_ms " << clockText[0] << "\nclock_refresh_ms " << clockText[1]
          << " (time / grid: ms since the seeding run; grid = the centre of this run's refresh on the phase-locked grid AFTER the"

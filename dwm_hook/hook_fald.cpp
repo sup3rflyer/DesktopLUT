@@ -395,6 +395,10 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     // as the overlay's Build); the four panel-clock textures only while mode 3 is on (EnsureClock).
     FaldTemporalSettings tempSettings;                    // from the tuning tail (mode 0 until the host sends one)
     float refreshMs = 0.0f;                               // this monitor's nominal refresh period (mode 3's grid)
+    unsigned int clkLogEvents = 0;                        // stage 3: index-source events logged so far (capped)
+    long long clkLogLastQpc = 0;                          // ... and when the last one was (rate limit)
+    FaldVBlankMap vmap;                                   // stage 3: the last consistent vblank map read for this monitor
+    bool vmapValid = false;
     bool clockFailed = false;                             // latched until the next rebuild
     ID3D11Texture2D* driveFiltTex = nullptr;  ID3D11UnorderedAccessView* driveFiltUAV = nullptr;  ID3D11ShaderResourceView* driveFiltSRV = nullptr;
     ID3D11Texture2D* driveStateTex = nullptr; ID3D11UnorderedAccessView* driveStateUAV = nullptr; ID3D11ShaderResourceView* driveStateSRV = nullptr;
@@ -1385,6 +1389,29 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
                     m->clkSeeded ? 1 : 0, m->clkTimeMs, m->clkGridMs, m->clkResidual, m->clkGain, m->refreshMs,
                     m->clkIndex, m->clkElapsed, m->clkFactor[0], m->clkFactor[1], m->clkFactor[2], m->clkFactor[3],
                     m->clkW[0], m->clkW[1], m->clkClosure, m->clkParity);
+            // stage 3: which index drove the clock, the map the run was offered, and the run's QPC time, so the bench can
+            // recompute n = count_anchor + floor((run_qpc - qpc_anchor) / period_qpc) + latency against its own counts
+            fprintf(f, "clock_source %s (abs = the vblank map's absolute index; grid = the run-time grid, as before stage 3)\n"
+                       "clock_map_ok %d\n"
+                       "clock_abs_index %llu\n"
+                       "clock_grid_k %llu\n"
+                       "clock_latency %d\n"
+                       "clock_run_qpc %lld\n"
+                       "clock_qpc_freq %lld\n"
+                       "clock_map_count_anchor %lld\n"
+                       "clock_map_qpc_anchor %lld\n"
+                       "clock_map_period_qpc %.6f\n"
+                       "clock_map_age_ms %.4f\n"
+                       "clock_runs_abs %llu\n"
+                       "clock_runs_grid %llu\n"
+                       "clock_switches %llu\n"
+                       "clock_rebases %llu\n"
+                       "clock_holds %llu\n"
+                       "clock_k_diffs %llu\n",
+                    FaldClockSourceName(m->clkSource), m->clkMapOk ? 1 : 0, m->clkAbsIndex, m->clkGridK,
+                    FALD_VBLANK_LATENCY_REFRESHES, m->clkRunQpc, m->clkQpcFreq, m->clkMap.countAnchor, m->clkMap.qpcAnchor,
+                    m->clkMap.periodQpc, m->clkMapAgeMs, m->clkRunsAbs, m->clkRunsGrid, m->clkSwitches, m->clkRebases,
+                    m->clkHolds, m->clkKDiffs);
             fclose(f);
         }
     }
@@ -1528,9 +1555,39 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     bool clockOk = false;
     if (m->tempSettings.mode == FALD_TEMPORAL_PANEL) clockOk = EnsureClock(m);
     else if (m->clkStateTex[0] || m->clkStateTex[1] || m->clkPrevTex || m->clkEstTex) ReleaseClock(m);
+    // Stage 3: the host's vblank map (the absolute refresh numbering; memory reads only). Without a usable one the clock
+    // runs on its run-time grid exactly as before — FaldPanelClockStep decides and records which (clkSource, dump).
+    bool haveMap = false;
+    if (m->tempSettings.mode == FALD_TEMPORAL_PANEL) {
+        DwmHookVBlankMap w;
+        const int got = HookReadVBlankMap(m->left, m->top, &w);
+        if (got > 0) {
+            m->vmap.countAnchor = w.countAnchor; m->vmap.qpcAnchor = w.qpcAnchor; m->vmap.periodQpc = w.periodQpc;
+            m->vmapValid = true;
+        } else if (got == 0) {
+            m->vmapValid = false;             // none / withdrawn
+        }                                     // got < 0 (a writer mid-way): the last consistent map stands
+        haveMap = m->vmapValid;
+    } else {
+        m->vmapValid = false;
+    }
+    const FaldVBlankMap vmap = m->vmap;
     LARGE_INTEGER qpcNow;
     QueryPerformanceCounter(&qpcNow);
-    const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk, qpcNow.QuadPart, freq.QuadPart, m->refreshMs);
+    const unsigned int srcBefore = m->clkSource;
+    const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk, qpcNow.QuadPart, freq.QuadPart, m->refreshMs,
+                                                      haveMap ? &vmap : nullptr);
+    // a change of the clock's index source is logged — change-gated, at most one line a second and 64 in all (file I/O in
+    // the present path: a flapping map must not become a write per frame); the counters go into the periodic line below
+    if (trun.panel && (m->clkSource == FALD_CLOCK_SRC_SWITCH_ABS || m->clkSource == FALD_CLOCK_SRC_SWITCH_GRID ||
+                       m->clkSource == FALD_CLOCK_SRC_REBASE) && m->clkSource != srcBefore && m->clkLogEvents < 64u &&
+        (m->clkLogLastQpc == 0 || qpcNow.QuadPart - m->clkLogLastQpc >= freq.QuadPart)) {
+        m->clkLogEvents++;
+        m->clkLogLastQpc = qpcNow.QuadPart;
+        LogF("FALD: pos(%d,%d) panel clock index source %s (n %llu, grid k %llu, map %s age %.1f ms)%s", m->left, m->top,
+             FaldClockSourceName(m->clkSource), m->clkIndex, m->clkGridK, haveMap ? "present" : "absent",
+             m->clkMapAgeMs, m->clkLogEvents == 64u ? " - further source events only in the periodic line" : "");
+    }
     auto mapSrv = [m](FaldDriveMap k) {
         return k == FALD_MAP_FILTERED ? m->driveFiltSRV : (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : m->driveSRV);
     };
@@ -1652,6 +1709,11 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
                  m->starOn ? "on" : "off", m->glowOn ? "on" : "off");
         m->gpuSumUs = m->gpuStarSumUs = m->gpuMaxUs = 0.0;
         m->gpuSamples = 0;
+        if (trun.panel)   // stage 3: which index drives the panel clock (cumulative since the monitor's state was created)
+            LogF("FALD: pos(%d,%d) panel clock runs abs %llu / grid %llu, switches %llu, rebases %llu, holds %llu, abs k != grid k "
+                 "%llu, last source %s n %llu at qpc %lld (parity %d, map age %.1f ms)",
+                 m->left, m->top, m->clkRunsAbs, m->clkRunsGrid, m->clkSwitches, m->clkRebases, m->clkHolds, m->clkKDiffs,
+                 FaldClockSourceName(m->clkSource), m->clkIndex, m->clkRunQpc, m->clkParity, m->clkMapAgeMs);
     }
     return true;
 }

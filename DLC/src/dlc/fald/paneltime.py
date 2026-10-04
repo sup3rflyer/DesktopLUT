@@ -8,8 +8,8 @@ temporal corrections can be designed and scored offline against the law the came
   48 Hz: measured at both, results/phone_camera_2026-09-20/parity_lock/summary.json), not a fixed 30 Hz. Which
   refresh (``parity``) the software does not know TODAY: the parity is locked to the actually PRESENTED frame index
   (48/48 on every run, stable over 13 min) and re-rolls on display mode sets, so using it needs the presented
-  refresh index plus a one-bit calibration after every display event (stage 3, not built; default ``parity`` −1 =
-  the mean of both clocks);
+  refresh index plus a one-bit calibration after every display event (stage 3: the hook's absolute index,
+  :func:`abs_refresh_index` / :func:`clock_source_step`; default ``parity`` −1 = the mean of both clocks);
 * a tick uses content that is at least ``latency_frames`` old, so the first LED step shows 1 or 2 frames after the
   LCD data (camera at 60 Hz: 18–21 or 34–39 ms, the two parity classes);
 * at a tick every zone closes ``closure`` of the remaining gap to its target drive, the same up and down
@@ -54,6 +54,13 @@ SETTLE_RESIDUAL = 0.0005        # the settle hold ends when this share of a DRIV
 SETTLE_MAX = 120                # cap of the settle hold in refreshes (C++ FALD_CLOCK_SETTLE_MAX): a low closure must not
                                 # re-render a static desktop for seconds
 LOCK_GAIN = 0.08                # steady gain of the refresh grid's phase lock, per run (C++ FALD_CLOCK_LOCK_GAIN)
+# Stage 3 — the absolute refresh index (DLC docs/fald-stage3-absolute-refresh-spec.md; C++ shared/fald_temporal.h
+# FALD_VBLANK_*): the hook numbers a composition run with the vblank count of the refresh its frame is scanned out on.
+VBLANK_LATENCY = 1              # L: a frame composed in refresh interval j shows from vblank j + 1 (the bench confirms it)
+VBLANK_MAP_MAX_AGE_MS = 500.0   # an older map is stale: the run-time grid drives the clock instead
+VBLANK_PERIOD_TOLERANCE = 0.01  # map period vs the nominal refresh period (relative): another mode's map is not used
+# clock_source_step results (C++ FaldClockSource)
+SRC_GRID, SRC_ABS, SRC_SWITCH_ABS, SRC_HOLD, SRC_REBASE, SRC_SWITCH_GRID = range(6)
 
 
 @dataclass(frozen=True)
@@ -102,6 +109,57 @@ class RefreshGrid:
         self.residual, self.gain = r, a
         self.n += k
         return (self.n == 0), (0 if self.n == 0 else k)
+
+
+def abs_refresh_index(count_anchor: int, qpc_anchor: int, period_qpc: float, t_qpc: int, qpc_freq: int,
+                      nominal_ms: float = 0.0, latency: int = VBLANK_LATENCY) -> Optional[int]:
+    """Stage 3: the ABSOLUTE index of the refresh a composition run at QPC time ``t_qpc`` is scanned out on, from the
+    host's vblank map ``(count_anchor, qpc_anchor, period_qpc)`` (count = DWM's per-vblank counter of the vblank at
+    ``qpc_anchor``): ``n = count_anchor + floor((t − qpc_anchor) / period) + latency``. ``None`` = no usable map: the period
+    not finite / outside 1..1000 ms / off ``nominal_ms`` by more than ``VBLANK_PERIOD_TOLERANCE`` (``nominal_ms <= 0``
+    skips that check), the run more than ``VBLANK_MAP_MAX_AGE_MS`` after the anchor or more than two periods before it,
+    no QPC frequency, a garbage anchor, or n < 0 — the clock then runs on its :class:`RefreshGrid` as before.
+    Mirrors C++ ``FaldAbsRefreshIndex`` (tests/test_fald.cpp pins the same cases)."""
+    if qpc_freq <= 0:
+        return None
+    period = float(period_qpc)
+    if not (period > 0.0) or not math.isfinite(period):
+        return None
+    period_ms = period * 1000.0 / qpc_freq
+    if not (1.0 <= period_ms <= 1000.0):
+        return None
+    if qpc_anchor <= 0 or count_anchor < 0 or count_anchor > (1 << 62):
+        return None
+    d = int(t_qpc) - int(qpc_anchor)
+    age_ms = d * 1000.0 / qpc_freq
+    if nominal_ms > 0.0 and abs(period_ms / nominal_ms - 1.0) > VBLANK_PERIOD_TOLERANCE:
+        return None
+    if not (age_ms <= VBLANK_MAP_MAX_AGE_MS) or age_ms < -2.0 * period_ms:
+        return None
+    n = int(count_anchor) + int(math.floor(d / period)) + int(latency)
+    return n if n >= 0 else None
+
+
+def clock_source_step(prev_index: int, prev_abs: bool, k_grid: int, abs_n: Optional[int]) -> tuple[int, int, int]:
+    """Stage 3: which index drives the panel clock this run — ``(source, k, n)``. ``k_grid`` = the grid's k of this run,
+    ``abs_n`` = :func:`abs_refresh_index` (``None`` = no usable map), ``prev_index`` / ``prev_abs`` = the last run's index
+    and whether it was absolute. Absolute after absolute: d = abs_n − prev_index; 0 <= d and |d − k_grid| <= 2 → (ABS, d,
+    abs_n) — the vblank count wins where the grid re-rolls; d = −1 with k_grid <= 1 → (HOLD, 0, prev_index), never
+    backwards; else (REBASE, k_grid, abs_n). Absolute after grid: (SWITCH_ABS, k_grid, abs_n). No map: (GRID or
+    SWITCH_GRID, k_grid, prev_index + k_grid). k never exceeds n. Mirrors C++ ``FaldClockSourceStep``."""
+    if abs_n is None:
+        src, k, n = (SRC_SWITCH_GRID if prev_abs else SRC_GRID), k_grid, prev_index + k_grid
+    elif not prev_abs:
+        src, k, n = SRC_SWITCH_ABS, k_grid, abs_n
+    else:
+        d = abs_n - prev_index
+        if d >= 0 and abs(d - k_grid) <= 2:
+            src, k, n = SRC_ABS, d, abs_n
+        elif d == -1 and k_grid <= 1:
+            src, k, n = SRC_HOLD, 0, prev_index
+        else:
+            src, k, n = SRC_REBASE, k_grid, abs_n
+    return src, min(k, n), n
 
 
 def clock_ticks(n_a: int, k: int, parity: int, tick_frames: int = 2) -> tuple[int, int]:

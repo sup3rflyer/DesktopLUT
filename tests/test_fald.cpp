@@ -758,6 +758,405 @@ TEST_CASE("FALD panel clock: settle hold, setting clamps, INI parity text") {
     delete r;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Stage 3: the absolute refresh index (shared/fald_temporal.h above FALD_VBLANK_LATENCY_REFRESHES). DLC
+// tests/test_fald_paneltime.py pins the same FaldAbsRefreshIndex / FaldClockSourceStep cases on the Python twin
+// (dlc/fald/paneltime.py abs_refresh_index / clock_source_step).
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+// A display's vblanks in 100-ns QPC ticks (true period 30 ppm off the nominal 16.66665 ms), DWM's per-vblank count, and
+// the map the host publishes for it (anchored at vblank j, 20 us late: the wakes' latency).
+struct Vblanks {
+    double v0 = 7.0e9, P = 166666.5 * (1.0 + 30.0e-6);
+    long long K = 5243510;                                        // the count of vblank 0
+    long long at(long long i) const { return (long long)std::floor(v0 + (double)i * P); }
+    FaldVBlankMap map(long long j) const {
+        FaldVBlankMap m; m.countAnchor = K + j; m.qpcAnchor = at(j) + 200; m.periodQpc = P; return m;
+    }
+};
+// The publisher's inputs, simulated: the wakes of a vblank-wait thread (latency 30..330 us, a 3-ms spike every 37th),
+// DWM's counter (it increments 0.3 ms after each vblank), and the publisher's loop: a counter read in the middle of
+// every 8th refresh (the timer lands +-0.5 ms around it), then a publish.
+struct PublisherSim {
+    Vblanks vb;
+    Lcg rng{ 2024u };
+    FaldVBlankTracker trk;
+    unsigned int sincePublish = 0;
+    bool valid = false;
+    FaldVBlankMap map;                                            // the last publish: anchored at wake mapWakeIndex
+    long long lastWakeIndex = -1, mapWakeIndex = -1;
+    explicit PublisherSim(double nominalPeriodQpc = 166666.5) { FaldVBlankTrackerReset(&trk, nominalPeriodQpc); }
+    unsigned long long countAt(long long t) const {
+        return (unsigned long long)(vb.K + (long long)std::floor(((double)t - vb.v0 - 3000.0) / vb.P));
+    }
+    long long wakeTime(long long i) {
+        return vb.at(i) + 300 + (long long)(1500.0 + rng.next(1500.0)) + ((i % 37) == 36 ? 30000 : 0);
+    }
+    void wake(long long i) {
+        const long long t = wakeTime(i);
+        FaldVBlankTrackerWake(&trk, t);
+        lastWakeIndex = i;
+        if (++sincePublish < 8u) return;
+        sincePublish = 0;
+        const long long tm = t + (long long)(0.5 * vb.P + rng.next(5000.0));
+        FaldVBlankTrackerSample(&trk, tm - 100, tm + 100, countAt(tm), vb.P);
+        valid = FaldVBlankTrackerMap(&trk, &map);
+        if (valid) mapWakeIndex = i;
+    }
+};
+}  // namespace
+
+TEST_CASE("FALD stage 3: the absolute index from a vblank map - the formula, freshness, period checks, garbage") {
+    const long long freq = 10000000;                              // 100-ns QPC ticks
+    FaldVBlankMap m;
+    m.countAnchor = 5243510; m.qpcAnchor = 7000000000ll; m.periodQpc = 166666.5;   // 16.66665 ms
+    const float nominal = 16.66667f;
+    unsigned long long n = 0; double age = -1.0;
+    CHECK(FALD_VBLANK_LATENCY_REFRESHES == 1);
+    CHECK(FALD_VBLANK_MAP_MAX_AGE_MS == 500.0);
+    // composed 2 ms into the anchor's refresh: scanned out at the NEXT vblank (L = 1)
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, freq, nominal, 1, &n, &age));
+    CHECK(n == 5243511ull); CHECK(age == doctest::Approx(2.0));
+    // 10 refreshes and 15 ms later; L = 0 / 2 move it by one
+    const long long t10 = m.qpcAnchor + 1666665 + 150000;
+    CHECK(FaldAbsRefreshIndex(m, t10, freq, nominal, 1, &n)); CHECK(n == 5243521ull);
+    CHECK(FaldAbsRefreshIndex(m, t10, freq, nominal, 0, &n)); CHECK(n == 5243520ull);
+    CHECK(FaldAbsRefreshIndex(m, t10, freq, nominal, 2, &n)); CHECK(n == 5243522ull);
+    // the boundary: one tick before / exactly at the 10th vblank after the anchor
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor + 1666664, freq, nominal, 1, &n)); CHECK(n == 5243520ull);
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor + 1666665, freq, nominal, 1, &n)); CHECK(n == 5243521ull);
+    // a run read just BEFORE the anchor (the publish landed between the run's QPC read and the map read): its refresh
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor - 1000, freq, nominal, 1, &n)); CHECK(n == 5243510ull);
+    // freshness: up to FALD_VBLANK_MAP_MAX_AGE_MS after the anchor, at most two periods before it
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor + 4999999, freq, nominal, 1, &n));
+    n = 77; CHECK_FALSE(FaldAbsRefreshIndex(m, m.qpcAnchor + 5000001, freq, nominal, 1, &n, &age));
+    CHECK(n == 77ull); CHECK(age == doctest::Approx(500.0001));            // the age is reported even when stale
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor - 333000, freq, nominal, 1, &n)); CHECK(n == 5243509ull);
+    CHECK_FALSE(FaldAbsRefreshIndex(m, m.qpcAnchor - 334000, freq, nominal, 1, &n));
+    // the period: within 1 % of the nominal one (a map of the previous mode is not used); nominal 0 = unknown, no check
+    CHECK_FALSE(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, freq, 20.8542f, 1, &n));   // a 47.952 Hz mode
+    CHECK_FALSE(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, freq, 16.4f, 1, &n));      // 1.6 % off
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, freq, 16.6f, 1, &n));            // 0.4 % off
+    CHECK(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, freq, 0.0f, 1, &n));
+    // garbage words (shared memory): never a number
+    FaldVBlankMap g = m;
+    g.periodQpc = 0.0;         CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor, freq, 0.0f, 1, &n));
+    g.periodQpc = -5.0;        CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor, freq, 0.0f, 1, &n));
+    g.periodQpc = std::nan(""); CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor, freq, 0.0f, 1, &n));
+    g.periodQpc = HUGE_VAL;    CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor, freq, 0.0f, 1, &n));
+    g.periodQpc = 5000.0;      CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor, freq, 0.0f, 1, &n));   // 0.5 ms
+    g.periodQpc = 2.0e7;       CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor, freq, 0.0f, 1, &n));   // 2 s
+    g = m; g.qpcAnchor = 0;    CHECK_FALSE(FaldAbsRefreshIndex(g, 100, freq, 0.0f, 1, &n));
+    g = m; g.countAnchor = -1; CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor + 20000, freq, 0.0f, 1, &n));
+    g = m; g.countAnchor = (1ll << 62) + 1; CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor + 20000, freq, 0.0f, 1, &n));
+    CHECK_FALSE(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, 0, nominal, 1, &n));              // no QPC frequency
+    CHECK_FALSE(FaldAbsRefreshIndex(m, m.qpcAnchor + 20000, freq, nominal, 1, nullptr));
+    g = m; g.countAnchor = 0;
+    CHECK_FALSE(FaldAbsRefreshIndex(g, m.qpcAnchor - 300000, freq, nominal, 0, &n));         // n would be -2
+    CHECK(FaldAbsRefreshIndex(g, m.qpcAnchor + 20000, freq, nominal, 0, &n)); CHECK(n == 0ull);
+}
+
+TEST_CASE("FALD stage 3: which index drives the clock - the source step table") {
+    struct Row { unsigned long long prev; bool prevAbs; unsigned long long kGrid; bool absOk; unsigned long long absN;
+                 FaldClockSource src; unsigned long long k, n; };
+    const Row rows[] = {
+        { 100,  false, 1,   false, 0,    FALD_CLOCK_SRC_GRID,        1,   101 },   // no map: the grid as before
+        { 100,  false, 0,   false, 0,    FALD_CLOCK_SRC_GRID,        0,   100 },
+        { 100,  true,  1,   false, 0,    FALD_CLOCK_SRC_SWITCH_GRID, 1,   101 },   // map gone: the numbering continues
+        { 100,  false, 1,   true,  5000, FALD_CLOCK_SRC_SWITCH_ABS,  1,   5000 },  // map back: k from the grid, n from it
+        { 5000, true,  1,   true,  5001, FALD_CLOCK_SRC_ABS,         1,   5001 },
+        { 5000, true,  2,   true,  5001, FALD_CLOCK_SRC_ABS,         1,   5001 },  // the grid re-rolled: the count wins
+        { 5000, true,  0,   true,  5001, FALD_CLOCK_SRC_ABS,         1,   5001 },
+        { 5000, true,  1,   true,  5000, FALD_CLOCK_SRC_ABS,         0,   5000 },  // two runs inside one refresh: k = 0
+        { 5000, true,  3,   true,  5003, FALD_CLOCK_SRC_ABS,         3,   5003 },
+        { 5000, true,  299, true,  5301, FALD_CLOCK_SRC_ABS,         301, 5301 },  // a long pause, within 2 of the grid
+        { 5000, true,  1,   true,  4999, FALD_CLOCK_SRC_HOLD,        0,   5000 },  // one behind: held, never backwards
+        { 5000, true,  0,   true,  4999, FALD_CLOCK_SRC_HOLD,        0,   5000 },
+        { 5000, true,  3,   true,  4999, FALD_CLOCK_SRC_REBASE,      3,   4999 },  // inconsistent: k grid, n map
+        { 5000, true,  1,   true,  5004, FALD_CLOCK_SRC_REBASE,      1,   5004 },
+        { 5000, true,  1,   true,  4000, FALD_CLOCK_SRC_REBASE,      1,   4000 },
+        { 2,    false, 5,   true,  3,    FALD_CLOCK_SRC_SWITCH_ABS,  3,   3 },     // k never exceeds n
+    };
+    for (const Row& w : rows) {
+        unsigned long long k = 99, n = 99;
+        const FaldClockSource src = FaldClockSourceStep(w.prev, w.prevAbs, w.kGrid, w.absOk, w.absN, k, n);
+        CAPTURE(w.prev); CAPTURE(w.prevAbs); CAPTURE(w.kGrid); CAPTURE(w.absOk); CAPTURE(w.absN);
+        CHECK(src == w.src); CHECK(k == w.k); CHECK(n == w.n);
+    }
+    CHECK(std::string(FaldClockSourceName(FALD_CLOCK_SRC_GRID)) == "grid");
+    CHECK(std::string(FaldClockSourceName(FALD_CLOCK_SRC_ABS)) == "abs");
+    CHECK(std::string(FaldClockSourceName(FALD_CLOCK_SRC_SWITCH_GRID)) == "switch_grid");
+    CHECK(std::string(FaldClockSourceName(99)) == "?");
+}
+
+TEST_CASE("FALD stage 3: the panel clock on the absolute index - regime shifts do not re-roll it, k = 0, parity = even / odd counts") {
+    const long long freq = 10000000;
+    const float nominal = 16.66665f;
+    Vblanks vb;
+    Lcg rng(4242u);
+    // DWM composition runs, one per refresh, at an offset into the refresh that jumps between latency regimes (2 -> 14 -> 8
+    // -> 2 ms, 300 refreshes each, +-0.5 ms jitter); the map is re-published every 8 refreshes. Truth: the frame composed
+    // in refresh i is scanned out at vblank i + 1.
+    FaldResources withMap, gridOnly;
+    std::vector<long long> devGrid;
+    const double regimes[] = { 20000.0, 140000.0, 80000.0, 20000.0 };
+    long long i = 0;
+    int wrong = 0;
+    for (int reg = 0; reg < 4; reg++)
+        for (int j = 0; j < 300; j++, i++) {
+            const long long t = vb.at(i) + (long long)(regimes[reg] + rng.next(5000.0));
+            const FaldVBlankMap m = vb.map(i - (i % 8));
+            const bool s1 = FaldPanelClockStep(&withMap, t, freq, 0.72f, 0, nominal, &m);
+            const bool s2 = FaldPanelClockStep(&gridOnly, t, freq, 0.72f, 0, nominal, nullptr);
+            const unsigned long long truth = (unsigned long long)(vb.K + i + 1);
+            if (i == 0) { CHECK(s1); CHECK(s2); CHECK(withMap.clkIndex == truth); CHECK(gridOnly.clkIndex == 0ull); continue; }
+            if (s1 || withMap.clkIndex != truth || withMap.clkElapsed != 1ull || withMap.clkSource != FALD_CLOCK_SRC_ABS) wrong++;
+            const long long dev = (long long)gridOnly.clkIndex - i;   // the grid's numbering against the truth's
+            if (devGrid.empty() || devGrid.back() != dev) devGrid.push_back(dev);
+        }
+    CHECK(wrong == 0);
+    CHECK(devGrid.size() >= 2u);                                   // the grid alone re-rolled at a regime shift (the bug)
+    CHECK(withMap.clkRunsAbs == 1200ull); CHECK(withMap.clkSwitches == 0ull); CHECK(withMap.clkRebases == 0ull);
+    CHECK(withMap.clkKDiffs >= 1ull);                              // ... and the absolute index overruled it there
+    // k = 0: a second run inside the same refresh (a faster display elsewhere paces the loop) holds the index and the words
+    {
+        const FaldVBlankMap m = vb.map(i - (i % 8));
+        CHECK_FALSE(FaldPanelClockStep(&withMap, vb.at(i) + 30000, freq, 0.72f, 0, nominal, &m));
+        CHECK(withMap.clkElapsed == 1ull);
+        const unsigned long long nA = withMap.clkIndex;
+        const float held[4] = { withMap.clkFactor[0], withMap.clkFactor[1], withMap.clkFactor[2], withMap.clkFactor[3] };
+        CHECK_FALSE(FaldPanelClockStep(&withMap, vb.at(i) + 90000, freq, 0.72f, 0, nominal, &m));
+        CHECK(withMap.clkElapsed == 0ull); CHECK(withMap.clkIndex == nA); CHECK(withMap.clkSource == FALD_CLOCK_SRC_ABS);
+        for (int q = 0; q < 4; q++) CHECK(withMap.clkFactor[q] == held[q]);
+        i++;
+    }
+    // parity 0 / 1 = the clock ticking on EVEN / ODD absolute counts: with k = 1 exactly one clock ticks, and which one
+    // follows the count's parity, not the run times (alternating 2 / 14 ms offsets would make the grid's k = 2, 0, 2, 0)
+    for (int p = 0; p < 2; p++) {
+        FaldResources r;
+        int bad = 0;
+        for (int j = 0; j < 40; j++, i++) {
+            const long long t = vb.at(i) + 20000 + ((j % 2) ? 120000 : 0);
+            const FaldVBlankMap m = vb.map(i - (i % 8));
+            FaldPanelClockStep(&r, t, freq, 0.72f, p, nominal, &m);
+            if (j == 0) continue;
+            const bool even = (r.clkIndex % 2ull) == 0ull;
+            if (r.clkElapsed != 1ull || (r.clkFactor[0] > 0.0f) != even || (r.clkFactor[2] > 0.0f) == even) bad++;
+            if (r.clkW[p] != 1.0f || r.clkW[1 - p] != 0.0f) bad++;
+        }
+        CAPTURE(p);
+        CHECK(bad == 0);
+    }
+    // a seed inside the seeding refresh with the map: the later frame re-seeds, the index is the absolute one
+    {
+        FaldResources r;
+        const FaldVBlankMap m = vb.map(i - (i % 8));
+        CHECK(FaldPanelClockStep(&r, vb.at(i) + 20000, freq, 0.72f, -1, nominal, &m));
+        CHECK(r.clkIndex == (unsigned long long)(vb.K + i + 1)); CHECK(r.clkAbs); CHECK(r.clkSeeded);
+        CHECK(FaldPanelClockStep(&r, vb.at(i) + 60000, freq, 0.72f, -1, nominal, &m));     // same refresh: re-seeds
+        CHECK(r.clkIndex == (unsigned long long)(vb.K + i + 1));
+        CHECK_FALSE(FaldPanelClockStep(&r, vb.at(i + 1) + 20000, freq, 0.72f, -1, nominal, &m));
+        CHECK(r.clkElapsed == 1ull); CHECK(r.clkIndex == (unsigned long long)(vb.K + i + 2));
+    }
+    // an absolute seed, then the map is gone and more runs land inside the same refresh: every one of them re-seeds — no
+    // run binds clock maps that no pass has written (review 2026-10-04: the grid's literal n == 0 test missed this)
+    {
+        FaldResources r;
+        const FaldVBlankMap m = vb.map(i - (i % 8));
+        CHECK(FaldPanelClockStep(&r, vb.at(i) + 20000, freq, 0.72f, -1, nominal, &m));
+        CHECK(FaldPanelClockStep(&r, vb.at(i) + 50000, freq, 0.72f, -1, nominal, nullptr));
+        CHECK(r.clkSource == FALD_CLOCK_SRC_SWITCH_GRID); CHECK(r.clkSeeded);
+        CHECK(FaldPanelClockStep(&r, vb.at(i) + 80000, freq, 0.72f, -1, nominal, nullptr));
+        CHECK(r.clkSource == FALD_CLOCK_SRC_GRID); CHECK(r.clkSeeded);
+        CHECK_FALSE(FaldPanelClockPlan(r.clkSeeded, r.clkElapsed).bindMaps);
+        CHECK_FALSE(FaldPanelClockStep(&r, vb.at(i + 1) + 20000, freq, 0.72f, -1, nominal, nullptr));
+        CHECK(r.clkElapsed == 1ull); CHECK(r.clkIndex == (unsigned long long)(vb.K + i + 2));   // the numbering carried on
+    }
+}
+
+TEST_CASE("FALD stage 3: a stale or missing map is the run-time grid bit for bit; the numbering survives a stale stretch") {
+    const long long freq = 10000000;
+    const float nominal = 16.66665f;
+    Vblanks vb;
+    Lcg rng(99u);
+    // A: the same run times with no map and with a map that is always stale (anchored 10 s earlier): identical after
+    // every run — the fallback IS the pre-stage-3 clock
+    {
+        FaldResources a, b;
+        const FaldVBlankMap stale = vb.map(0);
+        int diff = 0;
+        for (long long i = 600; i < 2400; i++) {
+            const long long t = vb.at(i) + (long long)(30000.0 + rng.next(5000.0));
+            const bool sa = FaldPanelClockStep(&a, t, freq, 0.72f, 1, nominal, nullptr);
+            const bool sb = FaldPanelClockStep(&b, t, freq, 0.72f, 1, nominal, &stale);
+            if (sa != sb || a.clkIndex != b.clkIndex || a.clkElapsed != b.clkElapsed || a.clkSeeded != b.clkSeeded ||
+                a.clkGridMs != b.clkGridMs || a.clkResidual != b.clkResidual || a.clkW[0] != b.clkW[0] || a.clkW[1] != b.clkW[1])
+                diff++;
+            for (int q = 0; q < 4; q++) if (a.clkFactor[q] != b.clkFactor[q]) diff++;
+            if (b.clkSource != FALD_CLOCK_SRC_GRID || b.clkMapOk || b.clkAbs) diff++;
+        }
+        CHECK(diff == 0);
+        CHECK(a.clkIndex == 1799ull);                              // numbered from its seed, as before
+        CHECK(b.clkMapAgeMs > 500.0);
+        CHECK(b.clkRunsGrid == 1800ull); CHECK(b.clkRunsAbs == 0ull); CHECK(b.clkSwitches == 0ull);
+    }
+    // B: the publisher stops (its last map ages out after 0.5 s) and comes back: abs -> grid -> abs, one numbering
+    {
+        FaldResources r;
+        long long i = 0;
+        int wrong = 0;
+        auto runAt = [&](long long idx, const FaldVBlankMap* m) {
+            const long long t = vb.at(idx) + (long long)(20000.0 + rng.next(3000.0));
+            FaldPanelClockStep(&r, t, freq, 0.72f, 0, nominal, m);
+            if (idx > 0 && r.clkIndex != (unsigned long long)(vb.K + idx + 1)) wrong++;
+        };
+        for (; i < 200; i++) { const FaldVBlankMap m = vb.map(i - (i % 8)); runAt(i, &m); }
+        const FaldVBlankMap last = vb.map(200);
+        for (; i < 400; i++) runAt(i, &last);
+        CHECK(r.clkSource == FALD_CLOCK_SRC_GRID);                 // stale by now: the grid continues the numbering
+        CHECK(r.clkSwitches == 1ull);
+        for (; i < 500; i++) { const FaldVBlankMap m = vb.map(i - (i % 8)); runAt(i, &m); }
+        CHECK(r.clkSource == FALD_CLOCK_SRC_ABS);
+        CHECK(r.clkSwitches == 2ull); CHECK(r.clkRebases == 0ull);
+        CHECK(wrong == 0);
+        // a map of another refresh rate (the mode changed, the publisher has not caught up) is not used
+        FaldVBlankMap other = vb.map(i - (i % 8)); other.periodQpc = 208542.0;
+        runAt(i, &other); i++;
+        CHECK(r.clkSource == FALD_CLOCK_SRC_SWITCH_GRID); CHECK_FALSE(r.clkMapOk);
+    }
+}
+
+TEST_CASE("FALD stage 3: the vblank tracker - phase, period and count from jittery wakes; missed, spurious, restarts") {
+    // A: 20 s of wakes with latency jitter and spikes
+    PublisherSim s;
+    for (long long i = 0; i < 1200; i++) s.wake(i);
+    REQUIRE(s.valid);
+    CHECK(s.mapWakeIndex == s.lastWakeIndex);
+    CHECK(s.map.countAnchor == s.vb.K + s.mapWakeIndex);           // the count of the publishing wake's vblank
+    const long long trueV = s.vb.at(s.mapWakeIndex);
+    CHECK(s.map.qpcAnchor >= trueV); CHECK(s.map.qpcAnchor - trueV <= 1500);   // within 150 us, late (one-sided latency)
+    CHECK(std::fabs(s.map.periodQpc - s.vb.P) < 2.0);              // the fit: within 0.2 us of the true period
+    CHECK(s.trk.periodFit);
+    CHECK(std::fabs(s.trk.medianPeriodQpc - s.vb.P) < 1000.0);     // (the median alone: only within ~100 us)
+    CHECK(s.trk.missed == 0ull); CHECK(s.trk.spurious == 0ull); CHECK(s.trk.conflicts == 0ull); CHECK(s.trk.restarts == 0ull);
+    CHECK(s.trk.anchorJumps == 0ull); CHECK_FALSE(s.trk.needConfirm);
+    // the hook's index for runs anywhere in the next 0.4 s (but the first / last 0.2 ms of a refresh): the truth + L
+    {
+        Lcg r(5u);
+        int wrong = 0;
+        for (long long i = s.mapWakeIndex; i < s.mapWakeIndex + 24; i++)
+            for (int q = 0; q < 10; q++) {
+                const long long t = s.vb.at(i) + 2000 + (long long)((0.5 + 0.5 * r.next(1.0)) * (s.vb.P - 4000.0));
+                unsigned long long n = 0;
+                if (!FaldAbsRefreshIndex(s.map, t, 10000000, 16.66665f, 1, &n) || n != (unsigned long long)(s.vb.K + i + 1)) wrong++;
+            }
+        CHECK(wrong == 0);
+    }
+    // B: missed wakes (a late thread: one in 50, once four in a row) and a spurious second return inside one refresh
+    // (the run ends on a wake: a skipped LAST wake is not missed yet — nothing has come after it)
+    {
+        PublisherSim m2;
+        unsigned long long skipped = 0;
+        for (long long i = 0; i < 1490; i++) {
+            if ((i % 50) == 49 || (i >= 700 && i < 703)) { skipped++; continue; }
+            m2.wake(i);
+            if (i == 400) CHECK(FaldVBlankTrackerWake(&m2.trk, m2.vb.at(i) + 4000) == 0u);
+        }
+        REQUIRE(m2.valid);
+        CHECK(m2.trk.missed == skipped);
+        CHECK(m2.trk.spurious == 1ull);
+        CHECK(m2.map.countAnchor == m2.vb.K + m2.mapWakeIndex);
+        CHECK(m2.trk.conflicts == 0ull);
+    }
+    // C: the thread was gone for 5 s (more than FALD_VBLANK_MAX_GAP refreshes): the model starts over and the count comes
+    // back exact once two mid-frame reads agree
+    {
+        PublisherSim m3;
+        for (long long i = 0; i < 600; i++) m3.wake(i);
+        REQUIRE(m3.valid);
+        m3.wake(900);
+        CHECK(m3.trk.restarts == 1ull);
+        FaldVBlankMap tmp;
+        CHECK_FALSE(FaldVBlankTrackerMap(&m3.trk, &tmp));           // no phase, no offset yet
+        for (long long i = 901; i < 1500; i++) m3.wake(i);
+        REQUIRE(m3.valid);
+        CHECK(m3.map.countAnchor == m3.vb.K + m3.mapWakeIndex);
+    }
+}
+
+TEST_CASE("FALD stage 3: the vblank tracker - the mid-frame +-1 guard, re-anchoring, slow reads, rate checks") {
+    PublisherSim s;
+    for (long long i = 0; i < 800; i++) s.wake(i);
+    REQUIRE(s.valid);
+    const long long iv = s.lastWakeIndex;                           // the refresh of the last wake
+    const long long v0 = s.vb.at(iv);
+    const long long P = (long long)s.vb.P;
+    const double dwmP = s.vb.P;
+    FaldVBlankMap m;
+    // reads near the counter's increment (just after the vblank / just before the next one) are ambiguous by +-1:
+    // ignored, whatever they say
+    CHECK(FaldVBlankTrackerSample(&s.trk, v0 + 4900, v0 + 5100, s.countAt(v0 + 5000) + 1, dwmP) == FALD_VSAMPLE_NEAR_EDGE);
+    CHECK(FaldVBlankTrackerSample(&s.trk, v0 + P - 10100, v0 + P - 9900, s.countAt(v0 + P - 10000) - 1, dwmP) == FALD_VSAMPLE_NEAR_EDGE);
+    REQUIRE(FaldVBlankTrackerMap(&s.trk, &m)); CHECK(m.countAnchor == s.vb.K + iv);
+    // a mid-frame read one off (a glitch): the map is WITHHELD, never changed by it ...
+    const long long mid = v0 + P / 2;
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_CONFLICT);
+    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
+    // ... until a read confirms the old offset
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid), dwmP) == FALD_VSAMPLE_ACCEPTED);
+    REQUIRE(FaldVBlankTrackerMap(&s.trk, &m)); CHECK(m.countAnchor == s.vb.K + iv);
+    // three consecutive reads agreeing on a new offset re-anchor it (the counter really moved)
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_CONFLICT);
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_CONFLICT);
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_REANCHORED);
+    REQUIRE(FaldVBlankTrackerMap(&s.trk, &m)); CHECK(m.countAnchor == s.vb.K + iv + 1);
+    CHECK(s.trk.reanchors == 1ull); CHECK(s.trk.conflicts == 4ull);
+    // a read whose moment is unknown to better than a tenth of a period
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 10000, mid + 10000, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_SLOW);
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid + 100, mid - 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_SLOW);
+    // DWM's composition clock at another rate (its clock display is a 120-Hz monitor): withheld; at this rate: published
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP / 2.0) == FALD_VSAMPLE_ACCEPTED);
+    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
+    CHECK(FaldVBlankTrackerSample(&s.trk, mid - 100, mid + 100, s.countAt(mid) + 1, dwmP) == FALD_VSAMPLE_ACCEPTED);
+    CHECK(FaldVBlankTrackerMap(&s.trk, &m));
+    // no read for longer than FALD_VBLANK_CONFIRM_MAX refreshes: withheld
+    for (long long i = iv + 1; i <= iv + 1 + (long long)FALD_VBLANK_CONFIRM_MAX + 5; i++) FaldVBlankTrackerWake(&s.trk, s.wakeTime(i));
+    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
+    // a nominal period of another mode (the display runs 60 Hz, the mode description says 47.952): never published
+    PublisherSim wrongMode(208542.0);
+    for (long long i = 0; i < 800; i++) wrongMode.wake(i);
+    CHECK_FALSE(wrongMode.valid);
+    // a numbering anomaly (a repaired missed wake) withholds the map until an ACCEPTED read confirms the offset — a
+    // rejected (near-edge) read in that cycle does not (review 2026-10-04: a slip must never be published unseen)
+    {
+        PublisherSim q;
+        for (long long i = 0; i < 800; i++) q.wake(i);
+        REQUIRE(q.valid);
+        FaldVBlankMap mm;
+        FaldVBlankTrackerWake(&q.trk, q.wakeTime(801));            // wake 800 missed
+        CHECK(q.trk.needConfirm);
+        CHECK_FALSE(FaldVBlankTrackerMap(&q.trk, &mm));
+        const long long vv = q.vb.at(801);
+        CHECK(FaldVBlankTrackerSample(&q.trk, vv + 4900, vv + 5100, q.countAt(vv + 5000), dwmP) == FALD_VSAMPLE_NEAR_EDGE);
+        CHECK_FALSE(FaldVBlankTrackerMap(&q.trk, &mm));
+        const long long mid2 = vv + P / 2;
+        CHECK(FaldVBlankTrackerSample(&q.trk, mid2 - 100, mid2 + 100, q.countAt(mid2), dwmP) == FALD_VSAMPLE_ACCEPTED);
+        REQUIRE(FaldVBlankTrackerMap(&q.trk, &mm)); CHECK(mm.countAnchor == q.vb.K + 801);
+        // the anchor-jump guard: the current vblank instant must sit where the last map's numbering puts it (a slip of the
+        // local index moves it by a whole period); white-box: as if the numbering had moved since that map
+        q.trk.refQpc -= (long long)(0.4 * q.vb.P);
+        CHECK_FALSE(FaldVBlankTrackerMap(&q.trk, &mm));
+        CHECK(q.trk.anchorJumps == 1ull); CHECK(q.trk.needConfirm);
+        CHECK(FaldVBlankTrackerSample(&q.trk, mid2 - 100, mid2 + 100, q.countAt(mid2), dwmP) == FALD_VSAMPLE_ACCEPTED);
+        REQUIRE(FaldVBlankTrackerMap(&q.trk, &mm)); CHECK(mm.countAnchor == q.vb.K + 801);
+    }
+    // no phase yet: a read is not even interpreted
+    FaldVBlankTracker fresh;
+    FaldVBlankTrackerReset(&fresh, 166666.5);
+    CHECK(FaldVBlankTrackerSample(&fresh, 1000, 1200, 5, dwmP) == FALD_VSAMPLE_NO_PHASE);
+    CHECK_FALSE(FaldVBlankTrackerMap(&fresh, &m));
+}
+
 // FLD3: the 40 FLD2 words + 8 (word 40 transfer, 41 sdr_gamma, 42-47 reserved); tables follow at byte 192.
 // Words 32-35 all zero = no pedestal colour (an SDR fit without one still needs the transfer words).
 static Image Fld3Image(uint32_t transfer, float gamma) {

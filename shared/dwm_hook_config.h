@@ -161,6 +161,30 @@ static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FA
 #define DWM_HOOK_TAIL_MAGIC          0x444C4654u   // 'TFLD'
 #define DWM_HOOK_TAIL_LAYOUT_VERSION 1u
 
+// FALD stage 3 — the "vblank map" of one monitor: its absolute refresh numbering for the hook's panel clock
+// (shared/fald_temporal.h FaldAbsRefreshIndex: n = countAnchor + floor((t - qpcAnchor) / periodQpc) + L). Published by
+// DesktopLUT.exe's vblank publisher thread (src/dwm_inject.cpp) while a FALD layer with LED-lag mode 3 is on that
+// monitor. It takes the LAST 8 WORDS of DwmHookFaldTuning (they were _reserved): no offset, size or layout version
+// changes, an older DLL ignores them, and a host that predates them leaves seq = 0 = no map (the hook's grid clock).
+// It changes many times a second, so it does NOT go through the head's seqlock (`version`: every bump re-runs the
+// hook's whole config pass, including the monitor-set debounce); it has its own: the publisher bumps `seq` to odd,
+// writes the fields, bumps it to even. UpdateDwmHookSharedConfig rewrites the whole tail inside the head seqlock and
+// copies the publisher's last words into it (identical bytes), so a reader accepts a copy only when BOTH the head
+// `version` and `seq` are even and unchanged across it. The host serialises both writers (g_dwmInjectMutex).
+// posTag names the monitor the words belong to (its desktop left / top): a reader searches for its own tag instead of
+// trusting a monitors[] index that a topology change may have just moved.
+struct DwmHookVBlankMap {
+    uint32_t seq;                    // own seqlock: odd = write in progress, even = complete, 0 = never published
+    uint32_t posTag;                 // DwmHookVBlankPosTag(left, top) of the monitor these vblanks are
+    int64_t  countAnchor;            // absolute vblank count (DWM_TIMING_INFO::cRefresh numbering) of the vblank at qpcAnchor
+    int64_t  qpcAnchor;              // QPC time of that vblank
+    double   periodQpc;              // refresh period in QPC ticks; <= 0 = withdrawn (no map)
+};
+static_assert(sizeof(DwmHookVBlankMap) == 32, "DwmHookVBlankMap must be the 8 former reserved words");
+static inline uint32_t DwmHookVBlankPosTag(int32_t left, int32_t top) {
+    return (uint32_t)(uint16_t)left | ((uint32_t)(uint16_t)top << 16);   // desktop coordinates fit 16 bits each
+}
+
 struct DwmHookFaldTuning {           // per monitors[] index: the settings of the mode it is in NOW
     // starfield (CB words 52-65; same fields and clamps as src FaldStarfieldSettings)
     float    starEven, starLift, starTargetGain, starTargetSigma;
@@ -178,9 +202,10 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     float    tempClockClosure;
     int32_t  tempClockParity;        // -1 unknown, 0, 1
     float    refreshMs;              // exact nominal refresh period of this monitor (DisplayConfig vSyncFreq); 0 = unknown
-    uint32_t _reserved[8];           // room for later fields without a layout bump (24 used + 8 = 32 words)
+    DwmHookVBlankMap vblank;         // stage 3 (above): the former _reserved[8] — all 32 words of the struct are now used
 };
 static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
+static_assert(offsetof(DwmHookFaldTuning, vblank) == 96, "the vblank map sits where _reserved[8] was");
 
 struct DwmHookSharedConfigTail {
     uint32_t magic;                  // DWM_HOOK_TAIL_MAGIC
@@ -195,7 +220,9 @@ struct DwmHookSharedConfigEx {
     DwmHookSharedConfigTail tail;    // offset 464
 };
 static_assert(sizeof(DwmHookSharedConfigTail) == 16 + 128 * MAX_DWM_HOOK_MONITORS, "tail layout");
+static_assert(offsetof(DwmHookSharedConfigTail, fald) == 16, "tail layout");
 static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigTail), "head must stay at 464");
+static_assert(offsetof(DwmHookSharedConfigEx, tail) == 464, "the tail starts right after the frozen head");
 
 // ---------------------------------------------------------------------------
 // Identity beacon palette — shared by the host (paints) and the DLL (classifies)

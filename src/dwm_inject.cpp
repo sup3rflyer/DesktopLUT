@@ -1115,6 +1115,310 @@ static void StopFaldSettleKicker() {
     CloseHandle(g_faldPrimeEvent); g_faldPrimeEvent = nullptr;
 }
 
+// ---------------------------------------------------------------------------
+// FALD stage 3: the vblank map publisher (shared/fald_temporal.h above FALD_VBLANK_LATENCY_REFRESHES)
+// ---------------------------------------------------------------------------
+// One thread per monitor that runs a FALD layer with LED-lag mode 3 in hook mode (UpdateDwmHookSharedConfig starts and
+// stops them). Each thread
+//  * waits for that monitor's vblanks (IDXGIOutput::WaitForVBlank on the output at the monitor's desktop position) and
+//    feeds the QPC time of every wake to a FaldVBlankTracker: the vblank PHASE + period, missed wakes repaired;
+//  * every FALD_VBLANK_SAMPLE_EVERY wakes sleeps to the MIDDLE of the refresh (high-resolution timer, half a period after
+//    the wake) and reads DWM's per-vblank counter there (DwmGetCompositionTimingInfo(NULL).cRefresh, bracketed by QPC):
+//    the COUNT. Near its increment the counter is ambiguous by +-1 — the tracker rejects reads outside the middle half
+//    of the refresh. qpcVBlank is NOT used: its pairing with cRefresh slips by a period (bench 2026-10-04);
+//  * publishes {countAnchor, qpcAnchor, periodQpc} into the monitor's tail slot (dwm_hook_config.h DwmHookVBlankMap, its
+//    own seqlock; the head `version` is not touched) — or withdraws it (period 0) while the tracker cannot vouch for it.
+// The hook treats a map older than FALD_VBLANK_MAP_MAX_AGE_MS (0.5 s) as stale; publishing every 8 refreshes (133 ms at
+// 60 Hz) leaves room for a few skipped publishes. A publish only TRY-locks g_dwmInjectMutex (an injection may hold it for
+// seconds; skipping one is harmless). Cost: one thread asleep in a kernel vblank wait, plus one timer wait and one DWM
+// timing query every 8 refreshes; no window, no present, nothing shown on any display.
+// The count is DWM's COMPOSITION clock (its clock display: by default the fastest monitor, tools/dwm_clock_probe.py), so
+// the tracker withholds the map when DWM's refresh period differs from this monitor's — two displays at the SAME rate
+// that are not the same display cannot be told apart here (the mid-frame reads then conflict when their phases cross).
+static const unsigned int FALD_VBLANK_SAMPLE_EVERY = 8;        // wakes between counter reads / publishes
+static const unsigned int FALD_VBLANK_RECHECK_WAKES = 240;     // wakes between mode / factory checks (~4 s at 60 Hz)
+static const ULONGLONG FALD_VBLANK_STATS_MS = 60000;           // statistics line in the console log
+static const unsigned int FALD_VBLANK_LOG_TRANSITIONS = 32;    // valid <-> withheld transitions logged one by one
+
+struct VBlankPublisher {
+    int left = 0, top = 0;
+    HANDLE thread = nullptr;
+    HANDLE stopEvt = nullptr;
+    std::atomic<bool> stop{ false };
+};
+struct VBlankPublished { uint32_t posTag; DwmHookVBlankMap map; };   // the host's copy of what a shared slot holds
+static std::vector<VBlankPublisher*> g_vblankPubs;        // running (all three: under g_dwmInjectMutex)
+static std::vector<VBlankPublisher*> g_vblankRetired;     // told to stop, not seen exiting yet
+static std::vector<VBlankPublished> g_vblankPublished;
+
+// Write (or withdraw, m = null) the map of the monitor at (left, top): into the host copy and, when the monitor has a
+// slot in the current head, into shared memory under the map's own seqlock. Caller holds g_dwmInjectMutex — the only
+// other writer of those bytes, UpdateDwmHookSharedConfig, copies the host copy (identical bytes) under the same mutex.
+static void WriteVBlankMapLocked(int left, int top, const FaldVBlankMap* m) {
+    const uint32_t tag = DwmHookVBlankPosTag(left, top);
+    VBlankPublished* rec = nullptr;
+    for (VBlankPublished& p : g_vblankPublished) if (p.posTag == tag) { rec = &p; break; }
+    if (!rec) {
+        if (!m) return;                                       // nothing published: nothing to withdraw
+        g_vblankPublished.push_back(VBlankPublished{ tag, DwmHookVBlankMap{} });
+        rec = &g_vblankPublished.back();
+    }
+    DwmHookVBlankMap* slot = nullptr;
+    if (g_sharedMemPtr && g_sharedMemBytes >= sizeof(DwmHookSharedConfigEx)) {
+        DwmHookSharedConfigEx* ex = reinterpret_cast<DwmHookSharedConfigEx*>(g_sharedMemPtr);
+        const uint32_t nm = std::min(ex->head.numMonitors, static_cast<uint32_t>(MAX_DWM_HOOK_MONITORS));
+        for (uint32_t i = 0; i < nm; i++)
+            if (ex->head.monitors[i].left == left && ex->head.monitors[i].top == top) { slot = &ex->tail.fald[i].vblank; break; }
+    }
+    DwmHookVBlankMap& h = rec->map;
+    h.seq += 1u;                                              // odd = write in progress
+    if (slot) { *reinterpret_cast<volatile uint32_t*>(&slot->seq) = h.seq; std::atomic_thread_fence(std::memory_order_release); }
+    h.posTag = tag;
+    h.countAnchor = m ? m->countAnchor : 0;
+    h.qpcAnchor = m ? m->qpcAnchor : 0;
+    h.periodQpc = m ? m->periodQpc : 0.0;
+    if (slot) {
+        slot->posTag = h.posTag; slot->countAnchor = h.countAnchor; slot->qpcAnchor = h.qpcAnchor; slot->periodQpc = h.periodQpc;
+        std::atomic_thread_fence(std::memory_order_release);
+    }
+    h.seq += 1u;                                              // even = complete (0 is "never published": skip it)
+    if (h.seq == 0u) h.seq = 2u;
+    if (slot) *reinterpret_cast<volatile uint32_t*>(&slot->seq) = h.seq;
+}
+
+static void DropVBlankRecordLocked(int left, int top) {
+    const uint32_t tag = DwmHookVBlankPosTag(left, top);
+    for (size_t i = 0; i < g_vblankPublished.size(); i++)
+        if (g_vblankPublished[i].posTag == tag) { g_vblankPublished.erase(g_vblankPublished.begin() + (ptrdiff_t)i); return; }
+}
+
+// The DXGI output whose desktop rectangle starts at (left, top), with the factory it came from (IsCurrent() later tells
+// a topology change). Null = not found.
+static IDXGIOutput* FindDxgiOutputAt(int left, int top, IDXGIFactory1** factoryOut) {
+    *factoryOut = nullptr;
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) || !factory) return nullptr;
+    IDXGIOutput* found = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT ai = 0; !found && factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
+        IDXGIOutput* output = nullptr;
+        for (UINT oi = 0; !found && adapter->EnumOutputs(oi, &output) == S_OK; oi++) {
+            DXGI_OUTPUT_DESC d;
+            if (SUCCEEDED(output->GetDesc(&d)) && d.AttachedToDesktop &&
+                d.DesktopCoordinates.left == left && d.DesktopCoordinates.top == top)
+                found = output;                               // keeps the reference
+            else
+                output->Release();
+            output = nullptr;
+        }
+        adapter->Release();
+        adapter = nullptr;
+    }
+    if (found) *factoryOut = factory;
+    else factory->Release();
+    return found;
+}
+
+// Why the tracker withholds its map (console log only).
+static const wchar_t* VBlankWithheldReason(const FaldVBlankTracker& t) {
+    if (t.wakeN < FALD_VBLANK_MIN_WAKES) return L"acquiring the vblank phase";
+    if (!t.periodFit) return L"refresh period not fitted yet (phase points span < 2 s, or the fit disagrees with the median)";
+    if (!t.offsetValid) return L"count offset not established yet (mid-frame reads)";
+    if (t.withheld) return L"a mid-frame count read disagreed with the offset (pending)";
+    if (t.needConfirm) return L"a missed / late wake or an anchor jump awaits a confirming count read (pending)";
+    if ((long long)(t.v - t.confirmV) > (long long)FALD_VBLANK_CONFIRM_MAX) return L"count offset not re-confirmed lately";
+    if (!(t.nominalPeriodQpc > 0.0) || std::fabs(t.periodQpc / t.nominalPeriodQpc - 1.0) > FALD_VBLANK_RATE_TOLERANCE)
+        return L"measured period off the nominal refresh";
+    if (t.dwmPeriodQpc > 0.0 && std::fabs(t.dwmPeriodQpc / t.periodQpc - 1.0) > FALD_VBLANK_RATE_TOLERANCE)
+        return L"DWM's composition clock runs at another rate (its clock display is another monitor)";
+    return L"?";
+}
+
+static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
+    VBlankPublisher* pub = static_cast<VBlankPublisher*>(param);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);   // a prompt wake = a sharp phase (it sleeps otherwise)
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    const double freq = (double)f.QuadPart;
+    FaldVBlankTracker trk;
+    IDXGIFactory1* factory = nullptr;
+    IDXGIOutput* out = nullptr;
+    float nominalMs = 0.0f;
+    unsigned int sinceCheck = 0, sincePublish = 0, failures = 0, transitions = 0;
+    bool published = false;                                   // the slot holds a valid map (else nothing / withdrawn)
+    ULONGLONG lastStatsMs = GetTickCount64();
+    auto releaseOutput = [&]() {
+        if (out) { out->Release(); out = nullptr; }
+        if (factory) { factory->Release(); factory = nullptr; }
+    };
+    auto publish = [&](const FaldVBlankMap* m) -> bool {      // false = skipped (the mutex is busy / told to stop)
+        std::unique_lock<std::recursive_mutex> lock(g_dwmInjectMutex, std::try_to_lock);
+        if (!lock.owns_lock() || pub->stop.load()) return false;
+        WriteVBlankMapLocked(pub->left, pub->top, m);
+        return true;
+    };
+    auto withdraw = [&]() { if (published && publish(nullptr)) published = false; };
+    while (!pub->stop.load()) {
+        if (!out) {
+            out = FindDxgiOutputAt(pub->left, pub->top, &factory);
+            nominalMs = RefreshPeriodMsAt(pub->left, pub->top);
+            if (!out || !(nominalMs > 1.0f)) {
+                releaseOutput();
+                if (WaitForSingleObject(pub->stopEvt, 1000) == WAIT_OBJECT_0) break;
+                continue;
+            }
+            FaldVBlankTrackerReset(&trk, (double)nominalMs * freq / 1000.0);
+            sinceCheck = sincePublish = 0;
+            std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): watching the output's vblanks, nominal "
+                       << nominalMs << L" ms" << std::endl;
+        }
+        const HRESULT hr = out->WaitForVBlank();
+        LARGE_INTEGER wake;
+        QueryPerformanceCounter(&wake);
+        if (pub->stop.load()) break;
+        if (FAILED(hr)) {                                     // output off / gone: withdraw, re-find it after a few
+            withdraw();
+            if (++failures >= 3u) { failures = 0; releaseOutput(); }
+            if (WaitForSingleObject(pub->stopEvt, 250) == WAIT_OBJECT_0) break;
+            continue;
+        }
+        failures = 0;
+        FaldVBlankTrackerWake(&trk, wake.QuadPart);
+        if (++sinceCheck >= FALD_VBLANK_RECHECK_WAKES) {      // a mode change (new period) / a topology change
+            sinceCheck = 0;
+            const float nm = RefreshPeriodMsAt(pub->left, pub->top);
+            if (!factory->IsCurrent() || !(std::fabs(nm - nominalMs) <= 1.0e-4f * nominalMs)) {
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): display changed (nominal "
+                           << nominalMs << L" -> " << nm << L" ms) - starting over" << std::endl;
+                withdraw();
+                releaseOutput();
+                continue;
+            }
+        }
+        if (++sincePublish < FALD_VBLANK_SAMPLE_EVERY) continue;
+        sincePublish = 0;
+        // to the middle of this refresh, then DWM's counter, bracketed by QPC
+        const double P = trk.periodQpc > 0.0 ? trk.periodQpc : (double)nominalMs * freq / 1000.0;
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        const double waitQpc = 0.5 * P - (double)(now.QuadPart - wake.QuadPart);
+        if (waitQpc > 0.0 && timer) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)(waitQpc * 1.0e7 / freq);   // relative, 100-ns units
+            if (due.QuadPart < 0 && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+                HANDLE w[2] = { pub->stopEvt, timer };
+                if (WaitForMultipleObjects(2, w, FALSE, 100) == WAIT_OBJECT_0) break;
+            }
+        }
+        DWM_TIMING_INFO ti = {};
+        ti.cbSize = sizeof(ti);
+        LARGE_INTEGER before, after;
+        QueryPerformanceCounter(&before);
+        const HRESULT th = DwmGetCompositionTimingInfo(nullptr, &ti);
+        QueryPerformanceCounter(&after);
+        if (SUCCEEDED(th))
+            FaldVBlankTrackerSample(&trk, before.QuadPart, after.QuadPart, (unsigned long long)ti.cRefresh, (double)ti.qpcRefreshPeriod);
+        FaldVBlankMap m;
+        const bool valid = FaldVBlankTrackerMap(&trk, &m);
+        const bool wasPublished = published;
+        if (valid) { if (publish(&m)) published = true; }
+        else if (!(trk.withheld || trk.needConfirm)) withdraw();
+        // (pending — a contradicting read / a numbering anomaly awaiting a confirming read: the last map stays; it was
+        // right when published, and the hook stops using it 0.5 s after its anchor unless a confirmed one replaces it)
+        if (published != wasPublished && transitions < FALD_VBLANK_LOG_TRANSITIONS) {
+            transitions++;
+            if (published)
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map published - period "
+                           << m.periodQpc * 1000.0 / freq << L" ms, count " << m.countAnchor << std::endl;
+            else
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map withheld - "
+                           << VBlankWithheldReason(trk) << std::endl;
+        }
+        const ULONGLONG tick = GetTickCount64();
+        if (tick - lastStatsMs >= FALD_VBLANK_STATS_MS) {
+            lastStatsMs = tick;
+            std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): " << (published ? L"published" : L"withheld")
+                       << L", period " << trk.periodQpc * 1000.0 / freq << L" ms (median " << trk.medianPeriodQpc * 1000.0 / freq
+                       << L"), DWM period " << trk.dwmPeriodQpc * 1000.0 / freq << L" ms | wakes " << trk.wakes << L" missed "
+                       << trk.missed << L" spurious " << trk.spurious << L" late " << trk.lateWakes << L" restarts " << trk.restarts
+                       << L" | reads " << trk.samples << L" near-edge " << trk.rejectedEdge << L" slow " << trk.rejectedSlow
+                       << L" conflicts " << trk.conflicts << L" re-anchors " << trk.reanchors << L" anchor jumps "
+                       << trk.anchorJumps << std::endl;
+        }
+    }
+    releaseOutput();
+    if (timer) CloseHandle(timer);
+    return 0;
+}
+
+// Make exactly the `wanted` monitors have a running publisher. Caller holds g_dwmInjectMutex. Stopping never waits here
+// (a thread may sit in a vblank wait for a frame): it is told to stop, its record is dropped — the caller's shared write
+// then zeroes its slot, and a thread told to stop never writes again (it checks under the same mutex) — and its handles
+// are closed once a later sync / the shutdown sees it exited.
+static void SyncVBlankPublishersLocked(const std::vector<POINT>& wanted) {
+    for (size_t i = 0; i < g_vblankRetired.size();) {
+        VBlankPublisher* p = g_vblankRetired[i];
+        if (p->thread && WaitForSingleObject(p->thread, 0) != WAIT_OBJECT_0) { i++; continue; }
+        if (p->thread) CloseHandle(p->thread);
+        if (p->stopEvt) CloseHandle(p->stopEvt);
+        delete p;
+        g_vblankRetired.erase(g_vblankRetired.begin() + (ptrdiff_t)i);
+    }
+    for (size_t i = 0; i < g_vblankPubs.size();) {
+        VBlankPublisher* p = g_vblankPubs[i];
+        bool keep = false;
+        for (const POINT& w : wanted) if (w.x == p->left && w.y == p->top) { keep = true; break; }
+        if (keep) { i++; continue; }
+        p->stop.store(true);
+        SetEvent(p->stopEvt);
+        DropVBlankRecordLocked(p->left, p->top);
+        std::wcout << L"[FALD vblank] (" << p->left << L"," << p->top << L"): publisher stopped" << std::endl;
+        g_vblankRetired.push_back(p);
+        g_vblankPubs.erase(g_vblankPubs.begin() + (ptrdiff_t)i);
+    }
+    for (const POINT& w : wanted) {
+        bool have = false;
+        for (const VBlankPublisher* p : g_vblankPubs) if (p->left == w.x && p->top == w.y) { have = true; break; }
+        if (have) continue;
+        VBlankPublisher* p = new VBlankPublisher();
+        p->left = w.x; p->top = w.y;
+        p->stopEvt = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        p->thread = p->stopEvt ? CreateThread(nullptr, 0, VBlankPublisherThread, p, 0, nullptr) : nullptr;
+        if (!p->thread) {
+            std::wcerr << L"[FALD vblank] (" << w.x << L"," << w.y << L"): publisher thread could not be started ("
+                       << GetLastError() << L") - the panel clock stays on its run-time grid" << std::endl;
+            if (p->stopEvt) CloseHandle(p->stopEvt);
+            delete p;
+            continue;
+        }
+        g_vblankPubs.push_back(p);
+        std::wcout << L"[FALD vblank] (" << w.x << L"," << w.y << L"): publisher started (LED-lag mode 3)" << std::endl;
+    }
+}
+
+// Shutdown (CloseDwmHookSharedMemory): stop every publisher and wait for it briefly. Caller holds g_dwmInjectMutex — the
+// threads only ever TRY-lock it, so waiting here cannot deadlock. A thread that does not exit in time is left running
+// with its object (it exits on its own once its vblank wait returns; it never writes again: stop is set).
+static void StopAllVBlankPublishersLocked() {
+    SyncVBlankPublishersLocked(std::vector<POINT>());
+    for (size_t i = 0; i < g_vblankRetired.size();) {
+        VBlankPublisher* p = g_vblankRetired[i];
+        if (p->thread && WaitForSingleObject(p->thread, 1000) != WAIT_OBJECT_0) {
+            std::wcerr << L"[FALD vblank] (" << p->left << L"," << p->top << L"): publisher did not stop in 1 s - left running"
+                       << std::endl;
+            i++;
+            continue;
+        }
+        if (p->thread) CloseHandle(p->thread);
+        if (p->stopEvt) CloseHandle(p->stopEvt);
+        delete p;
+        g_vblankRetired.erase(g_vblankRetired.begin() + (ptrdiff_t)i);
+    }
+    g_vblankPublished.clear();
+}
+
 bool CreateDwmHookSharedMemory()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
@@ -1252,6 +1556,23 @@ void UpdateDwmHookSharedConfig()
         }
     }
 
+    // FALD stage 3: a vblank publisher for every monitor whose layer runs LED-lag mode 3 (only with a tail the DLL can
+    // read), then the publishers' last words into the tail — the memcpy below rewrites every slot, and must write the
+    // bytes a publisher last wrote (their own seqlock; a stopped publisher's record is gone: its slot becomes zeros).
+    {
+        std::vector<POINT> wanted;
+        if (g_sharedMemBytes >= sizeof(DwmHookSharedConfigEx))
+            for (uint32_t i = 0; i < cfg.numMonitors; i++)
+                if (DwmHookFaldEnabled(cfg.faldFlags[i]) && ex.tail.fald[i].tempMode == FALD_TEMPORAL_PANEL)
+                    wanted.push_back(POINT{ cfg.monitors[i].left, cfg.monitors[i].top });
+        SyncVBlankPublishersLocked(wanted);
+        for (uint32_t i = 0; i < cfg.numMonitors; i++) {
+            const uint32_t tag = DwmHookVBlankPosTag(cfg.monitors[i].left, cfg.monitors[i].top);
+            for (const VBlankPublished& p : g_vblankPublished)
+                if (p.posTag == tag) { ex.tail.fald[i].vblank = p.map; break; }
+        }
+    }
+
     // Seqlock write: odd version = write in progress, even = complete.
     // Reader rejects odd versions and mismatched pre/post-copy versions.
     g_sharedMemPtr->version = ++g_sharedMemVersion;  // odd = write in progress
@@ -1268,6 +1589,7 @@ void CloseDwmHookSharedMemory()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     StopFaldSettleKicker();   // (its thread never takes g_dwmInjectMutex)
+    StopAllVBlankPublishersLocked();   // (their threads only try-lock it; none writes once stopped)
     if (g_sharedMemPtr) {
         UnmapViewOfFile(g_sharedMemPtr);
         g_sharedMemPtr = nullptr;

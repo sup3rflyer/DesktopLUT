@@ -725,6 +725,53 @@ LocalFaldParams* FindFaldForMonitor(int left, int top) {
 	return NULL;
 }
 
+// FALD stage 3: the host's vblank map for this monitor, read LIVE from the mapping (not from the config snapshot: it
+// changes many times a second without a head version bump). Double seqlock — dwm_hook_config.h DwmHookVBlankMap: a copy
+// counts only when the head `version` and the map's `seq` are both even and unchanged across it. Searched by posTag in
+// every tail slot (a topology change may move the monitor's index). Memory reads only — no wait, no I/O; a writer is
+// mid-way for well under a microsecond, so a few pause-retries, then "busy".
+// Returns 1 = a map (in *out), 0 = none for this monitor (never published / withdrawn / no tail), -1 = busy (a writer was
+// mid-way on every attempt: the caller may keep its last consistent map — its age still bounds it).
+int HookReadVBlankMap(int left, int top, DwmHookVBlankMap* out) {
+	if (!out || !g_sharedConfig || !g_sharedHasTail) return 0;
+	const DwmHookSharedConfigEx* ex = reinterpret_cast<const DwmHookSharedConfigEx*>(g_sharedConfig);
+	const volatile uint32_t* headVersion = &ex->head.version;
+	const uint32_t tag = DwmHookVBlankPosTag(left, top);
+	for (int attempt = 0; attempt < 4; attempt++) {
+		if (attempt > 0) YieldProcessor();
+		const uint32_t h1 = *headVersion;
+		if (h1 & 1u) continue;
+		std::atomic_thread_fence(std::memory_order_acquire);
+		if (ex->tail.magic != DWM_HOOK_TAIL_MAGIC || ex->tail.layoutVersion != DWM_HOOK_TAIL_LAYOUT_VERSION ||
+		    ex->tail.tuningBytes != sizeof(DwmHookFaldTuning)) {
+			if (*headVersion != h1) continue;                 // the tail was being (re)written
+			return 0;                                         // a tail this DLL does not understand
+		}
+		bool torn = false;
+		for (int i = 0; i < MAX_DWM_HOOK_MONITORS; i++) {
+			const DwmHookVBlankMap* src = &ex->tail.fald[i].vblank;
+			const uint32_t s1 = *reinterpret_cast<const volatile uint32_t*>(&src->seq);
+			if (s1 == 0u) continue;                           // never published in this slot
+			if (s1 & 1u) { torn = true; continue; }           // mid-write (maybe another monitor's): keep looking
+			std::atomic_thread_fence(std::memory_order_acquire);
+			DwmHookVBlankMap copy;
+			memcpy(&copy, (const void*)src, sizeof(copy));
+			std::atomic_thread_fence(std::memory_order_acquire);
+			const uint32_t s2 = *reinterpret_cast<const volatile uint32_t*>(&src->seq);
+			const uint32_t h2 = *headVersion;
+			if (s1 != s2 || h1 != h2) { torn = true; continue; }
+			if (copy.posTag != tag) continue;
+			if (!(copy.periodQpc > 0.0)) return 0;              // withdrawn
+			*out = copy;
+			return 1;
+		}
+		// no map for this monitor in this pass: "none" only when nothing was mid-way and the head did not move under it
+		// (a record moving between slots / a re-created mapping reads as zeros meanwhile)
+		if (!torn && *headVersion == h1) return 0;
+	}
+	return -1;
+}
+
 
 typedef struct rectVec
 {

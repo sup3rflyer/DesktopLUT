@@ -197,8 +197,23 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK(offsetof(DwmHookFaldTuning, tempMode) == 68);
     CHECK(offsetof(DwmHookFaldTuning, tempClockParity) == 88);
     CHECK(offsetof(DwmHookFaldTuning, refreshMs) == 92);
-    CHECK(offsetof(DwmHookFaldTuning, _reserved) == 96);
+    // FALD stage 3: the vblank map took the former _reserved[8] (words 24-31): same offsets, same size, an older DLL
+    // ignores it, an older host leaves seq = 0 (no map)
+    CHECK(offsetof(DwmHookFaldTuning, vblank) == 96);
+    CHECK(offsetof(DwmHookVBlankMap, seq) == 0);
+    CHECK(offsetof(DwmHookVBlankMap, posTag) == 4);
+    CHECK(offsetof(DwmHookVBlankMap, countAnchor) == 8);
+    CHECK(offsetof(DwmHookVBlankMap, qpcAnchor) == 16);
+    CHECK(offsetof(DwmHookVBlankMap, periodQpc) == 24);
+    CHECK(sizeof(DwmHookVBlankMap) == 32);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1].vblank) - base) == 464 + 16 + 128 + 96);
     CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 128 * MAX_DWM_HOOK_MONITORS);
+    // the position tag: desktop left / top, 16 bits each (negative positions included), distinct per monitor
+    CHECK(DwmHookVBlankPosTag(0, 0) == 0u);
+    CHECK(DwmHookVBlankPosTag(-3840, 0) == 0x0000F100u);
+    CHECK(DwmHookVBlankPosTag(3840, 2160) == ((2160u << 16) | 3840u));
+    CHECK(DwmHookVBlankPosTag(-1, -1) == 0xFFFFFFFFu);
+    CHECK(DwmHookVBlankPosTag(0, 2160) != DwmHookVBlankPosTag(2160, 0));
 }
 
 TEST_CASE("DwmHookFaldPack: starfield and its glow-fill part") {

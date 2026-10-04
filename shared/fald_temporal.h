@@ -34,7 +34,7 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
 // (2026-09-19/20): the dimming engine is a sample-and-hold at HALF the refresh rate (30 Hz at 60 Hz, 24 Hz at 48 Hz:
 // measured at both — not a fixed 30 Hz). It ticks every 2nd panel refresh
 // (which one — the PARITY — software does not know TODAY: it is locked to the actually presented frame index and
-// re-rolls on display mode sets, so it needs the presented refresh index + a one-bit calibration; not built); at a tick every zone's LED drive closes `closure` of the remaining
+// re-rolls on display mode sets, so it needs the presented refresh index + a one-bit calibration: stage 3 below); at a tick every zone's LED drive closes `closure` of the remaining
 // gap to the drive demanded by the frame that was on the panel ONE refresh earlier (same up and down); the panel's own
 // LCD compensation uses the LED state of ONE refresh earlier. The first-order filter of modes 1 / 2 cannot express
 // this. Per zone and parity clock p the layer keeps the LED state S_p; with k = the panel refreshes elapsed since the
@@ -43,7 +43,8 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
 //   B_true of this frame from S_p + aTrue_p (d_prev - S_p)   (ticks up to this refresh; committed as the new S_p)
 //   B_est  of this frame from S_p + aEst_p  (d_prev - S_p)   (ticks up to the refresh before it)
 // parity -1 (unknown, the default) = the mean of the two clocks (the fields are linear in the drives), 0 / 1 = that
-// clock only (EXPERIMENTAL: the refresh index comes from run timing, not from DXGI frame statistics). The state of a
+// clock only (meaningful with stage 3's absolute index — below FaldPanelClockSettleFrames; on the run-time grid alone
+// the index re-rolls with DWM's composition timing, so there they stay EXPERIMENTAL). The state of a
 // frame depends on past frames only, so both inverse rounds read the same two maps. First frame after a reset: both
 // clocks = this frame's drives (the panel is taken as settled), the fields are the stateless layer's.
 // TIME: a refresh GRID LOCKED TO THE RUNS (first-order phase lock). The grid has the NOMINAL period (the mode
@@ -91,6 +92,145 @@ void FaldPanelClockFactors(unsigned long long nA, unsigned long long k, float cl
 // correction, and with 0.5 % the output still moved ~1.4 % per frame at the end of the hold after a 5 -> 1842-nit step.
 unsigned int FaldPanelClockSettleFrames(float closure);
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Stage 3: an ABSOLUTE refresh index for the panel clock (DLC docs/fald-stage3-absolute-refresh-spec.md; DLC twin
+// dlc/fald/paneltime.py abs_refresh_index / clock_source_step / VBlankTracker; tests/test_fald.cpp).
+// ---------------------------------------------------------------------------------------------------------------------
+// MEASURED 2026-10-04 (PA32UCXR, meter): the dimming engine ticks every 2nd refresh with its parity locked to the VBLANK
+// COUNT; the run-time grid above re-rolls against it every few seconds (DWM's composition timing shifts between latency
+// regimes, which moves Σk by one), so parity 0 / 1 could not hold. DesktopLUT.exe now publishes a "vblank map" of the
+// monitor (src/dwm_inject.cpp; the shared words: dwm_hook_config.h DwmHookVBlankMap): the vblank PHASE + period from a
+// vblank-wait thread on the output, the COUNT from DWM's per-vblank composition counter (DWM_TIMING_INFO::cRefresh, =
+// DXGI PresentRefreshCount minus a constant) sampled MID-FRAME. The hook numbers a composition run at QPC time t with
+// the count of the vblank its frame is scanned out on:
+//     n = countAnchor + floor((t - qpcAnchor) / period) + L
+// L = FALD_VBLANK_LATENCY_REFRESHES: a frame composed in refresh interval j shows from vblank j + 1 (DWM flips at the
+// vblank after its composition) — an ASSUMPTION the hardware bench confirms. Parity 0 / 1 then mean "the clock ticks on
+// even / odd n" across composition regimes and restarts; the panel's bit relative to n is calibrated by the meter probe.
+// A map that is missing, older than FALD_VBLANK_MAP_MAX_AGE_MS or of another refresh period (a mode change) is not
+// used: the run-time grid drives the clock exactly as before (it keeps locking in the background either way).
+constexpr int FALD_VBLANK_LATENCY_REFRESHES = 1;
+constexpr double FALD_VBLANK_MAP_MAX_AGE_MS = 500.0;
+constexpr double FALD_VBLANK_PERIOD_TOLERANCE = 0.01;   // map period vs the hook's nominal refresh period (relative)
+struct FaldVBlankMap {
+    long long countAnchor = 0;   // absolute vblank count (cRefresh numbering) of the vblank at qpcAnchor
+    long long qpcAnchor = 0;     // QPC time of that vblank
+    double periodQpc = 0.0;      // refresh period in QPC ticks (<= 0 or not finite: no map)
+};
+// n for a run at tQpc (formula above, `latency` = L). False (n untouched) = no usable map: the period not finite, outside
+// 1..1000 ms or off nominalRefreshMs by more than FALD_VBLANK_PERIOD_TOLERANCE (nominalRefreshMs <= 0 skips that check);
+// the run more than FALD_VBLANK_MAP_MAX_AGE_MS after the anchor or more than two periods before it; no QPC frequency;
+// n < 0. ageMs (optional) = (t - qpcAnchor) in ms, written whenever the period and frequency are usable.
+bool FaldAbsRefreshIndex(const FaldVBlankMap& map, long long tQpc, long long qpcFreq, float nominalRefreshMs, int latency,
+                         unsigned long long* n, double* ageMs = nullptr);
+// Which index drives the clock this run (pure). kGrid = the grid's k of this run, absN = the map's n (absOk = usable),
+// prevIndex / prevAbs = the last run's index and whether it was absolute.
+//   abs after abs:  d = absN - prevIndex. 0 <= d and |d - kGrid| <= 2 -> k = d, n = absN (ABS: the absolute index wins —
+//                   the grid re-rolls at a regime shift, the vblank count does not); d = -1 -> k = 0, n = prevIndex (HOLD:
+//                   a run just behind the previous one's boundary after a re-published phase; never backwards); else
+//                   REBASE: k = kGrid (continuity), n = absN (the numbering).
+//   abs after grid: SWITCH_ABS: k = kGrid, n = absN (the elapsed refreshes are the grid's, the numbering the map's).
+//   no abs:         k = kGrid, n = prevIndex + kGrid (GRID — bit for bit the pre-stage-3 clock — or SWITCH_GRID after
+//                   an abs stretch: the numbering continues from the last absolute index).
+// k never exceeds n (the tick count starts at n - k >= 0).
+enum FaldClockSource : unsigned int {
+    FALD_CLOCK_SRC_GRID = 0,
+    FALD_CLOCK_SRC_ABS = 1,
+    FALD_CLOCK_SRC_SWITCH_ABS = 2,
+    FALD_CLOCK_SRC_HOLD = 3,
+    FALD_CLOCK_SRC_REBASE = 4,
+    FALD_CLOCK_SRC_SWITCH_GRID = 5,
+};
+FaldClockSource FaldClockSourceStep(unsigned long long prevIndex, bool prevAbs, unsigned long long kGrid, bool absOk,
+                                    unsigned long long absN, unsigned long long& k, unsigned long long& n);
+const char* FaldClockSourceName(unsigned int source);   // "grid" / "abs" / "switch_abs" / "hold" / "rebase" / "switch_grid"
+
+// The host side of the map (DesktopLUT.exe's publisher thread, src/dwm_inject.cpp) — pure bookkeeping on QPC times, no
+// Windows calls, so every rule is unit-tested:
+//  * Wake(qpc) at every return of the output's vblank wait = the PHASE. A wake is numbered by the phase model, steps =
+//    floor((t - vblank instant of the previous index) / period + 0.25) (the wake latency is one-sided and below 3/4 of a
+//    period): a missed wake (a late thread) is repaired, a second wake inside one refresh is ignored, more than
+//    FALD_VBLANK_MAX_GAP refreshes start the model over. The vblank instant of an index = a low quantile of the recent
+//    wakes projected onto it (the latency is one-sided). Period: the median of the recent single-step gaps (robust; the
+//    gap repair uses it), refined once published phase points span FALD_VBLANK_FIT_MIN refreshes by a least-squares fit
+//    over them (the median is only good to a few us per refresh; the fit to well below 0.1 us).
+//  * Sample(before, after, count, dwmPeriod): DWM's per-vblank counter read MID-FRAME (QPC before / after the call).
+//    Near its increment instant it is ambiguous by +-1, so a read outside FALD_VBLANK_SAMPLE_PHASE_LO..HI of its refresh
+//    (or one that took longer than a tenth of a period) is rejected. offset = count - (local index of that refresh);
+//    two agreeing reads establish it; a disagreeing read WITHHOLDS the map (a lone glitch never changes the published
+//    count) until a read confirms the old offset or FALD_VBLANK_REANCHOR_VOTES consecutive reads agree on a new one.
+//    A numbering anomaly — repaired missed wakes, a wake more than half a period late, or an ANCHOR JUMP (the current
+//    vblank instant more than a quarter period off where the last map published since a confirming read puts it) —
+//    also withholds the map until an accepted read confirms the offset (needConfirm): a slip of the local index is
+//    never published, even when the read of that cycle was rejected. While withheld (pending), the publisher keeps
+//    its LAST map in place — it was right when published and the hook ages it out after 0.5 s; it withdraws the map
+//    only for the hard reasons below.
+//  * Map(out): valid once the phase (FALD_VBLANK_MIN_WAKES), the FITTED period (~2 s after a start: the median alone is
+//    too coarse to extrapolate) and the offset are known, the offset was confirmed within
+//    FALD_VBLANK_CONFIRM_MAX refreshes, the period is within 0.5 % of the nominal one, and DWM's own refresh period
+//    (when it reported one) agrees within 0.5 % — DWM's counter follows its CLOCK display (by default the fastest one),
+//    not necessarily this monitor. Records a phase point for the period fit.
+constexpr unsigned int FALD_VBLANK_WAKE_RING = 32;       // wakes the vblank instant is estimated from
+constexpr unsigned int FALD_VBLANK_GAP_RING = 64;        // single-step gaps the median period is taken over
+constexpr unsigned int FALD_VBLANK_PHASE_RING = 64;      // published phase points the period is fitted on
+constexpr unsigned int FALD_VBLANK_MIN_WAKES = 16;
+constexpr unsigned int FALD_VBLANK_MIN_GAPS = 8;
+constexpr unsigned int FALD_VBLANK_FIT_MIN = 120;        // refreshes the phase points must span before the fit is used
+constexpr unsigned int FALD_VBLANK_MAX_GAP = 240;        // more refreshes between two wakes: start over
+constexpr unsigned int FALD_VBLANK_CONFIRM_MAX = 600;    // the offset unconfirmed for longer: map withheld
+constexpr unsigned int FALD_VBLANK_REANCHOR_VOTES = 3;
+constexpr double FALD_VBLANK_SAMPLE_PHASE_LO = 0.25;     // accepted counter reads: this part of the refresh, away from
+constexpr double FALD_VBLANK_SAMPLE_PHASE_HI = 0.75;     // the counter's increment at the vblank
+constexpr double FALD_VBLANK_RATE_TOLERANCE = 0.005;     // period vs nominal / vs DWM's clock (relative)
+enum FaldVBlankSampleResult : int {
+    FALD_VSAMPLE_ACCEPTED = 0,     // agrees with the offset (or establishes / votes for it)
+    FALD_VSAMPLE_NO_PHASE = 1,     // no phase model yet
+    FALD_VSAMPLE_SLOW = 2,         // the read took longer than a tenth of a period
+    FALD_VSAMPLE_NEAR_EDGE = 3,    // read near the counter's increment: ambiguous by +-1, ignored
+    FALD_VSAMPLE_CONFLICT = 4,     // disagrees with the established offset: map withheld, not adopted
+    FALD_VSAMPLE_REANCHORED = 5,   // enough consecutive agreeing disagreements: the new offset is adopted
+};
+struct FaldVBlankTracker {
+    double nominalPeriodQpc = 0.0;            // from the mode description (DisplayConfig); 0 = unknown (no map)
+    double medianPeriodQpc = 0.0;             // median of the single-step gaps (0 until FALD_VBLANK_MIN_GAPS)
+    double periodQpc = 0.0;                   // the period in use: fit / median / nominal
+    bool periodFit = false;                   // periodQpc is the phase-point fit (required for a map)
+    bool haveWake = false;
+    long long lastWakeQpc = 0;
+    unsigned long long v = 0;                 // local vblank index of the last accepted wake (0 = the first one)
+    long long wakeQpc[FALD_VBLANK_WAKE_RING] = {};
+    unsigned long long wakeV[FALD_VBLANK_WAKE_RING] = {};
+    unsigned int wakeN = 0, wakeHead = 0;
+    double gap[FALD_VBLANK_GAP_RING] = {};
+    unsigned int gapN = 0, gapHead = 0;
+    long long phaseQpc[FALD_VBLANK_PHASE_RING] = {};
+    unsigned long long phaseV[FALD_VBLANK_PHASE_RING] = {};
+    unsigned int phaseN = 0, phaseHead = 0;
+    bool offsetValid = false;                 // offset = DWM count - local index, established
+    bool withheld = false;                    // a disagreeing read is pending a decision (map invalid meanwhile)
+    bool needConfirm = false;                 // a numbering anomaly (missed / late wake, anchor jump) awaits a confirming read
+    bool haveRef = false;                     // the anchor-jump reference: the last map published since the last
+    long long refQpc = 0;                     // confirming read (its vblank instant and local index)
+    unsigned long long refV = 0;
+    long long offset = 0;
+    long long pending = 0;                    // the candidate offset and its consecutive votes
+    unsigned int pendingVotes = 0;
+    unsigned long long confirmV = 0;          // local index of the last read that agreed with the offset
+    double dwmPeriodQpc = 0.0;                // DWM's composition clock period at the last read (0 = not reported)
+    // statistics (host log; the bench reads them)
+    unsigned long long wakes = 0, missed = 0, spurious = 0, lateWakes = 0, restarts = 0;
+    unsigned long long samples = 0, rejectedEdge = 0, rejectedSlow = 0, conflicts = 0, reanchors = 0, anchorJumps = 0;
+};
+void FaldVBlankTrackerReset(FaldVBlankTracker* t, double nominalPeriodQpc);
+// Returns the refreshes since the previous accepted wake: 0 = ignored (the first wake / a restart also return 0 after
+// seeding the model), 1 = the next vblank, > 1 = missed wakes repaired.
+unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc);
+// The vblank instant of local index v from the phase model; false before FALD_VBLANK_MIN_GAPS wakes / without a period.
+bool FaldVBlankTrackerVBlankQpc(const FaldVBlankTracker* t, unsigned long long v, long long* qpc);
+FaldVBlankSampleResult FaldVBlankTrackerSample(FaldVBlankTracker* t, long long qpcBefore, long long qpcAfter,
+                                               unsigned long long count, double dwmPeriodQpc);
+bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out);
+
 // The per-monitor temporal bookkeeping (no D3D). The overlay's FaldResources and the hook's FaldMonitor both DERIVE
 // from it, so every field is reached the same way (r->clkIndex) and the functions below take either.
 struct FaldTemporalState {
@@ -118,6 +258,19 @@ struct FaldTemporalState {
     bool clkSeeded = false;                  // the last run (re-)seeded the clocks: the stateless layer, no clock pass
     float clkFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // CB words 68-71 of the last run: aTrue_0, aEst_0, aTrue_1, aEst_1
     float clkW[2] = { 0.5f, 0.5f };                     // CB words 66-67: the clocks' weights
+    // stage 3 (the absolute refresh index; FaldPanelClockStep with a vblank map). clkAbs drives the next run's source
+    // step; the rest is dump / log only (the overlay never has a map: it stays on the grid).
+    bool clkAbs = false;                     // the last run's index came from the vblank map (else the grid's numbering)
+    unsigned int clkSource = FALD_CLOCK_SRC_GRID;   // FaldClockSource of the last run
+    bool clkMapOk = false;                   // the last run was offered a USABLE map
+    long long clkRunQpc = 0, clkQpcFreq = 0; // the last run's QPC time + frequency (n can be recomputed offline)
+    unsigned long long clkAbsIndex = 0;      // the map's n at the last run (when clkMapOk)
+    unsigned long long clkGridK = 0;         // the grid's k at the last run, whichever source drove the clock
+    FaldVBlankMap clkMap;                    // the map the last run was offered (zeros = none)
+    double clkMapAgeMs = 0.0;                // the last run's time after the map's anchor
+    // counters since the monitor's state was created (log / dump): runs per source, events, and the runs whose
+    // absolute k differed from the grid's (each one a re-roll the grid would have made)
+    unsigned long long clkRunsAbs = 0, clkRunsGrid = 0, clkSwitches = 0, clkRebases = 0, clkHolds = 0, clkKDiffs = 0;
 };
 
 // Per-run bookkeeping of the panel clock (the caller passes the run's QPC time): applies the reset rules and the time
@@ -126,7 +279,11 @@ struct FaldTemporalState {
 // both clocks' state. Otherwise clkElapsed = k (0 = hold the previous run's maps, >= 1 = run the clock pass). Time
 // running backwards by more than two periods, an unusable period or QPC frequency: re-seed. The stored times stay small
 // (the origin is rebased every hour of grid time); the index is 64-bit.
-bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFreq, float closure, int parity, float refreshMs);
+// vblankMap (stage 3, optional): when FaldAbsRefreshIndex accepts it, the clock is numbered with the ABSOLUTE index
+// (FaldClockSourceStep; a seed takes n as its index) and parity 0 / 1 mean even / odd vblank counts. Null / unusable:
+// bit for bit the grid clock above.
+bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFreq, float closure, int parity, float refreshMs,
+                        const FaldVBlankMap* vblankMap = nullptr);
 // What a run does with the step's result (pure, so the rules are testable without D3D): runPass = dispatch the
 // clock pass (k >= 1), bindMaps = both rounds' kernels read the clock's true / est maps (every non-seeding run, k = 0
 // INCLUDED: the previous run's maps), seedStates = copy this frame's round-1 drives into both clocks, commitPrev = this
@@ -171,9 +328,11 @@ struct FaldTemporalRun {
 // Start of a run: the dt estimate (EMA over 2..100 ms intervals; a longer gap = `resumed`), the mode (a change forgets
 // the state, the hold and the ring), the delay depth (a change restarts the ring), the blend factors (tempAlphaRise /
 // Fall), the panel clock's step, and which map each kernel reads. clockTexturesOk: the caller could create its clock
-// textures (mode 3 runs as off otherwise). refreshMs: the monitor's nominal refresh period (mode 3's grid).
+// textures (mode 3 runs as off otherwise). refreshMs: the monitor's nominal refresh period (mode 3's grid). vblankMap:
+// stage 3's absolute refresh index (the DWM hook passes the host's published map; null = the grid, as before).
 FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSettings& s, bool clockTexturesOk,
-                                     long long nowQpc, long long qpcFreq, float refreshMs);
+                                     long long nowQpc, long long qpcFreq, float refreshMs,
+                                     const FaldVBlankMap* vblankMap = nullptr);
 // End of a run, AFTER the caller has done the copies the plan implies, in this order: modes 1 / 2 — copy the filtered
 // map into the state texture, and (delay > 0) the round-1 instantaneous drive into ring slot r->delayHead; mode 3 —
 // clock.seedStates: the round-1 drive into both clock states, clock.commitPrev: the round-1 drive into clkPrev.

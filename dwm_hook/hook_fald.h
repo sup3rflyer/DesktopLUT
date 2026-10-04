@@ -96,6 +96,12 @@ ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
 // Throttled to once a second across all callers; false = not signalled this time, ask again later.
 bool HookRequestFullRecompose();
 
+// FALD stage 3: the host's vblank map for this monitor (the absolute refresh numbering of LED-lag mode 3), read live
+// from the shared mapping under its own seqlock (defined in dllmain.cpp; dwm_hook_config.h DwmHookVBlankMap).
+// 1 = a map, 0 = none (never published / withdrawn: the panel clock runs on its run-time grid, as before), -1 = busy (a
+// writer was mid-way: the caller keeps its last consistent map, which its age still bounds).
+int HookReadVBlankMap(int left, int top, DwmHookVBlankMap* out);
+
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
 // the next run. star / glow: the merged starfield feature and its glow-fill part (glow only with star,
 // and only on a PQ panel file — refused here otherwise). tuning = null: their defaults (older host).

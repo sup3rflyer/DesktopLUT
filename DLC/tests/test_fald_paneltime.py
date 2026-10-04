@@ -1,4 +1,6 @@
 """The measured panel time law (dlc.fald.paneltime): 30-Hz sample-and-hold LEDs, compensation one frame later."""
+import math
+
 import numpy as np
 import pytest
 
@@ -215,3 +217,71 @@ def test_drive_state_commit_takes_refreshes():
         a.commit(d, refreshes=k)
         for _ in range(k):
             b.commit(d)
+
+
+def test_abs_refresh_index_formula_freshness_and_guards():
+    """Stage 3: the hook's absolute index from the host's vblank map — tests/test_fald.cpp pins the same cases on C++
+    FaldAbsRefreshIndex."""
+    from dlc.fald.paneltime import VBLANK_LATENCY, VBLANK_MAP_MAX_AGE_MS, abs_refresh_index as idx
+    assert VBLANK_LATENCY == 1 and VBLANK_MAP_MAX_AGE_MS == 500.0
+    f, c, a, p, nom = 10_000_000, 5243510, 7_000_000_000, 166666.5, 16.66667     # 100-ns ticks, a 16.66665 ms map
+    assert idx(c, a, p, a + 20000, f, nom) == 5243511                  # 2 ms into the anchor's refresh: shows at the next
+    t10 = a + 1666665 + 150000
+    assert (idx(c, a, p, t10, f, nom), idx(c, a, p, t10, f, nom, 0), idx(c, a, p, t10, f, nom, 2)) == (5243521, 5243520, 5243522)
+    assert idx(c, a, p, a + 1666664, f, nom) == 5243520 and idx(c, a, p, a + 1666665, f, nom) == 5243521   # the boundary
+    assert idx(c, a, p, a - 1000, f, nom) == 5243510                   # read just before the anchor: its refresh
+    assert idx(c, a, p, a + 4999999, f, nom) is not None and idx(c, a, p, a + 5000001, f, nom) is None   # 0.5 s: stale
+    assert idx(c, a, p, a - 333000, f, nom) == 5243509 and idx(c, a, p, a - 334000, f, nom) is None    # > 2 periods early
+    assert idx(c, a, p, a + 20000, f, 20.8542) is None and idx(c, a, p, a + 20000, f, 16.4) is None    # another mode
+    assert idx(c, a, p, a + 20000, f, 16.6) == 5243511 and idx(c, a, p, a + 20000, f, 0.0) == 5243511
+    for bad in (0.0, -5.0, float("nan"), float("inf"), 5000.0, 2.0e7):
+        assert idx(c, a, bad, a, f) is None, bad
+    assert idx(c, 0, p, 100, f) is None and idx(-1, a, p, a + 20000, f) is None and idx((1 << 62) + 1, a, p, a + 20000, f) is None
+    assert idx(c, a, p, a + 20000, 0, nom) is None
+    assert idx(0, a, p, a - 300000, f, nom, 0) is None and idx(0, a, p, a + 20000, f, nom, 0) == 0
+
+
+def test_clock_source_step_table():
+    """Stage 3: which index drives the clock — the same table as tests/test_fald.cpp (C++ FaldClockSourceStep)."""
+    from dlc.fald.paneltime import (SRC_ABS, SRC_GRID, SRC_HOLD, SRC_REBASE, SRC_SWITCH_ABS, SRC_SWITCH_GRID,
+                                    clock_source_step)
+    rows = [
+        (100, False, 1, None, SRC_GRID, 1, 101), (100, False, 0, None, SRC_GRID, 0, 100),
+        (100, True, 1, None, SRC_SWITCH_GRID, 1, 101), (100, False, 1, 5000, SRC_SWITCH_ABS, 1, 5000),
+        (5000, True, 1, 5001, SRC_ABS, 1, 5001), (5000, True, 2, 5001, SRC_ABS, 1, 5001),
+        (5000, True, 0, 5001, SRC_ABS, 1, 5001), (5000, True, 1, 5000, SRC_ABS, 0, 5000),
+        (5000, True, 3, 5003, SRC_ABS, 3, 5003), (5000, True, 299, 5301, SRC_ABS, 301, 5301),
+        (5000, True, 1, 4999, SRC_HOLD, 0, 5000), (5000, True, 0, 4999, SRC_HOLD, 0, 5000),
+        (5000, True, 3, 4999, SRC_REBASE, 3, 4999), (5000, True, 1, 5004, SRC_REBASE, 1, 5004),
+        (5000, True, 1, 4000, SRC_REBASE, 1, 4000), (2, False, 5, 3, SRC_SWITCH_ABS, 3, 3),
+    ]
+    for prev, prev_abs, kg, absn, src, k, n in rows:
+        assert clock_source_step(prev, prev_abs, kg, absn) == (src, k, n), (prev, prev_abs, kg, absn)
+
+
+def test_absolute_index_survives_a_composition_regime_shift_where_the_grid_rerolls():
+    """Stage 3's point, offline: composition runs whose offset into the refresh jumps between DWM latency regimes
+    (2 -> 14 -> 8 -> 2 ms). The run-time grid re-rolls its index at the shift; the absolute index from the vblank map does
+    not, and with it parity 0 / 1 tick on even / odd vblank counts."""
+    from dlc.fald.paneltime import SRC_ABS, RefreshGrid, abs_refresh_index, clock_source_step
+    f, P = 10_000_000, 166666.5 * (1 + 30e-6)
+    v0, K = 7.0e9, 5243510
+    at = lambda i: int(math.floor(v0 + i * P))
+    rng = np.random.default_rng(4242)
+    grid = RefreshGrid(P / 1e4)
+    n = None
+    prev_abs = False
+    dev_grid = set()
+    for i in range(1200):
+        t = at(i) + int((20000, 140000, 80000, 20000)[i // 300] + rng.uniform(-5000, 5000))
+        j = i - i % 8                                                     # the last publish, every 8 refreshes
+        absn = abs_refresh_index(K + j, at(j) + 200, P, t, f, 16.66665)
+        seeded, kg = grid.step(t / 1e4)
+        dev_grid.add(grid.n - i)
+        if seeded:
+            n, prev_abs = absn, True
+            continue
+        src, k, n = clock_source_step(n, prev_abs, kg, absn)
+        prev_abs = absn is not None
+        assert (src, k, n) == (SRC_ABS, 1, K + i + 1), i
+    assert len(dev_grid) >= 2                                             # the grid alone re-rolled
