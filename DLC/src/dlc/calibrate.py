@@ -10156,6 +10156,25 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             and not (args.run and (args.run / "manifest.json").exists())):
         print(json.dumps({"error": "--verify-cube / --verify-patches-from belong to --flow verify-only"}))
         return 2
+    # --keep-layers names and a fresh run's --content-mode coherence are refused BEFORE a run folder,
+    # dogegen or the meter exist (a resume is re-checked against its persisted spec below).
+    if args.keep_layers:
+        unknown = sorted({n.strip().lower() for n in str(args.keep_layers).split(",") if n.strip()}
+                         - set(CalibrationController.LAYER_NAMES))
+        if unknown:
+            print(json.dumps({"error": f"--keep-layers: unknown layer(s) {unknown}; known: "
+                                       f"{list(CalibrationController.LAYER_NAMES)}"}))
+            return 2
+    if not (args.run and (args.run / "manifest.json").exists()):
+        if (args.content_mode or args.keep_layers) and args.flow != "verify-only":
+            print(json.dumps({"error": "--content-mode / --keep-layers belong to --flow verify-only"}))
+            return 2
+        if args.content_mode and normalize_mode(args.content_mode) != normalize_mode(args.mode) and not (
+                normalize_mode(args.content_mode) == "SDR" and normalize_mode(args.mode) == "HDR"):
+            print(json.dumps({"error": f"--content-mode {normalize_mode(args.content_mode)} on a "
+                                       f"{normalize_mode(args.mode)} display: only SDR content on an HDR display "
+                                       "exists (Windows composites SDR into HDR)"}))
+            return 2
     ctx = open_run(args.run) if args.run and (args.run / "manifest.json").exists() \
         else create_run(normalize_mode(args.mode), display=profile.display_for(args.monitor).name,
                         run_dir=args.run)

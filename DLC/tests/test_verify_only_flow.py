@@ -836,6 +836,17 @@ def test_cli_refuses_verify_flags_on_another_flow(tmp_path: Path, monkeypatch, c
     assert not run_dir.exists()
 
 
+def test_cli_refuses_bad_content_mode_and_keep_layers_before_a_run_exists(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setattr(cp, "load_profile", lambda *a, **k: cp.Profile.synthetic())
+    run_dir = tmp_path / "never_created"
+    for argv, needle in ((["--flow", "verify-only", "--mode", "HDR", "--keep-layers", "desktop_gama"], "unknown layer"),
+                         (["--flow", "3dlut-only", "--mode", "HDR", "--content-mode", "SDR"], "verify-only"),
+                         (["--flow", "verify-only", "--mode", "SDR", "--content-mode", "HDR"], "only SDR content")):
+        assert main(argv + ["--run", str(run_dir)]) == 2
+        assert needle in json.loads(capsys.readouterr().out)["error"]
+        assert not run_dir.exists()
+
+
 # ---------------------------------------------------------------------------
 # preview + simulate rehearsal
 # ---------------------------------------------------------------------------
