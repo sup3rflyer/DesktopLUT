@@ -141,7 +141,8 @@ def pedestal_adjust(delta: np.ndarray, img: np.ndarray, ped_mode: str) -> tuple[
 
 
 def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
-                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None, glow=None) -> dict:
+                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None, glow=None,
+                  peak: Optional[np.ndarray] = None) -> dict:
     """Return the corrected request image for ``img`` (3, h, w, as-if-white nits).
 
     ``glow``: optional :class:`dlc.fald.glowfill.GlowFillParams` — the glow fill (work guide S2): every round adds the
@@ -152,20 +153,36 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     cell drives before the kernels — the temporal drive state of :mod:`dlc.fald.temporal` (the shader's
     per-cell LED-law filter). ``None`` = the stateless layer (both fields from the frame's own drives).
 
+    ``peak``: optional (3, h, w) COMPANION for a full-resolution statistic (the offline motion simulator,
+    :mod:`dlc.fald.motion`): per raster pixel, the brightest full-resolution pixel it stands for. It goes through every
+    round with the SAME fields and the same per-pixel rule as ``img`` — its own level sets its pedestal, lum fade and soft
+    knee, as the shader does per full-resolution pixel — and before every round's statistic ``model.set_peak(peak
+    request so far)`` is called when the model has that method. Not combined with ``glow``. ``img``'s path is unchanged
+    bit for bit; the result gains ``req_peak``.
+
     Result dict: ``req`` (corrected image), ``gain`` (B_est/B_true of the last iteration),
     ``pedestal`` (per channel, nits, from the last iteration's drives), ``clipped`` (LCD would
     need > 100 %: original request kept), ``floored`` (target below the pedestal), ``drives`` (the last
     round's INSTANTANEOUS drives — what a temporal state commits after the frame)."""
+    if peak is not None and glow is not None:
+        raise ValueError("correct_image: a peak companion is not supported with the glow fill")
     p = model.p
     w = np.array(p.chan_weights)[:, None, None]
     lmax = p.white_nits * w
     tv = p.tmin_vec()[:, None, None]                          # per-channel closed-LCD transmittance
-    ped_ref = reference_pedestal_rgb(model, img)               # as-if-white, per channel
-    ped_ref_w = reference_pedestal(model, img)[None]           # the white pedestal (luminance) for the split
     tv_w = p.tmin * np.ones((3, 1, 1))
+    # per pixel, from the pixel's OWN level: the pedestal a uniform field of that level carries (as-if-white, per
+    # channel) and its white (luminance) part for the split
+    refs = [(img, reference_pedestal_rgb(model, img), reference_pedestal(model, img)[None])]
+    if peak is not None:
+        refs.append((peak, reference_pedestal_rgb(model, peak), reference_pedestal(model, peak)[None]))
+    set_peak = getattr(model, "set_peak", None) if peak is not None else None
     cur = img.copy()
+    cur_pk = None if peak is None else peak.copy()
     gain = np.ones_like(img[0])
     for _ in range(max(1, iters)):
+        if set_peak is not None:
+            set_peak(cur_pk)
         drives = model.cell_drives(cur)
         # black-frame LED boost (FaldParams.boost_lut): the panel counts the non-black zones of the frame it RECEIVES —
         # this round's request. The pedestal term can floor dim pixels and move the count (review 2026-09-18: <= 1 zone
@@ -174,12 +191,12 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         d_true, d_est = drive_filter(drives) if drive_filter is not None else (drives, drives)
         b_true, b_est = model.backlights(d_true, d_est, boost=boost)
         b_true = np.maximum(b_true, 0.0)
-        gain = np.clip(b_est / np.maximum(b_true, 1e-9), gain_clip[0], gain_clip[1])
+        gain_f = np.clip(b_est / np.maximum(b_true, 1e-9), gain_clip[0], gain_clip[1])
         # deep-dark fade: trust the model only where the panel's estimate is not ~zero (FaldParams.fade_*)
         t = np.clip((b_est - p.fade_lo) / max(p.fade_hi - p.fade_lo, 1e-9), 0.0, 1.0)
-        wfade = t * t * (3.0 - 2.0 * t)
-        wbest = wfade                                          # B_est fade alone (the colour part keeps it)
-        gain = 1.0 + (gain - 1.0) * wfade
+        wfade_f = t * t * (3.0 - 2.0 * t)
+        wbest = wfade_f                                        # B_est fade alone (the colour part keeps it)
+        gain_f = 1.0 + (gain_f - 1.0) * wfade_f
         # C15 (2026-09-22): the knee's ceiling reads B_est low-passed by the SAME filter as the gain (the shader blurs the
         # two together, gainTex .xy). The fitted estimate kernel peaks sharply at every LED sample point; a per-pixel
         # ceiling let the knee brighten a small bright shape only near the LEDs and printed the zone lattice (>= ~500
@@ -188,47 +205,54 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
         if p.gain_smooth_cells > 0:
             from scipy.ndimage import gaussian_filter
             sig = (p.gain_smooth_cells * model.ch, p.gain_smooth_cells * model.cw)
-            gain = gaussian_filter(gain, sigma=sig, mode="nearest")
+            gain_f = gaussian_filter(gain_f, sigma=sig, mode="nearest")
             b_est_ceil = gaussian_filter(b_est, sigma=sig, mode="nearest")
-        # pixel-luminance fade (2026-09-12, doc S33): the model has no baseline below ~1 nit (drive floor), and the
-        # dark-halo probe showed the correction wrong in sign on 0.5-nit grey next to a bright stroke (the owner's
-        # dark band around text). Weight 0 -> 1 over lum_fade_lo -> lum_fade_hi of the pixel's own max channel,
-        # applied per pixel AFTER the gain low-pass (the gain field stays smooth; the fade follows the content).
-        if p.lum_fade_hi > p.lum_fade_lo >= 0:
-            tl = np.clip((img.max(axis=0) - p.lum_fade_lo) / (p.lum_fade_hi - p.lum_fade_lo), 0.0, 1.0)
-            wlum = tl * tl * (3.0 - 2.0 * tl)
-            gain = 1.0 + (gain - 1.0) * wlum
-            wfade = wfade * wlum
         ped = lmax * b_true[None] * tv                         # per channel, nits, actual context
-        # Pedestal term. delta_c = ref − actual per channel (as-if-white); in "white" mode the three are
-        # identical. delta > 0 (uniform field leaks more than this context) is a plain lift and never clips;
-        # delta < 0 is limited by what the pixel can take, per FaldParams.ped_mode:
-        #   "white"   (2026-09-12, live A/B showed blue rims when a WHITE pedestal was clipped per channel):
-        #             one common factor on the whole vector, so what cannot be removed stays as desaturation
-        #             instead of a hue rotation;
-        #   "channel" (2026-09-13, coloured pedestal): each channel floors independently.
-        delta = ped_ref - ped / w                              # as-if-white, per channel
-        adj, floored_px = pedestal_adjust(delta, img, p.ped_mode)
-        if p.ped_mode == "channel" and (p.ped_chroma_gain != 1.0 or p.ped_chroma_lum_fade is not None):
-            # split: white part (the "white" rule on the white pedestal) faded as before; colour part
-            # (adj − adj_white, luminance-neutral) × ped_chroma_gain × its own pixel-luminance fade
-            adj_w, _ = pedestal_adjust(ped_ref_w - lmax * b_true[None] * tv_w / w, img, "white")
-            clo, chi = p.chroma_lum_fade()
-            if chi > clo >= 0:
-                tc = np.clip((img.max(axis=0) - clo) / (chi - clo), 0.0, 1.0)
-                wchroma = wbest * (tc * tc * (3.0 - 2.0 * tc))
+
+        def per_pixel(src, ped_ref, ped_ref_w):
+            """The per-pixel part of the round for a source image ``src`` on this round's fields."""
+            g, wfade = gain_f, wfade_f
+            # pixel-luminance fade (2026-09-12, doc S33): the model has no baseline below ~1 nit (drive floor), and the
+            # dark-halo probe showed the correction wrong in sign on 0.5-nit grey next to a bright stroke (the owner's
+            # dark band around text). Weight 0 -> 1 over lum_fade_lo -> lum_fade_hi of the pixel's own max channel,
+            # applied per pixel AFTER the gain low-pass (the gain field stays smooth; the fade follows the content).
+            if p.lum_fade_hi > p.lum_fade_lo >= 0:
+                tl = np.clip((src.max(axis=0) - p.lum_fade_lo) / (p.lum_fade_hi - p.lum_fade_lo), 0.0, 1.0)
+                wlum = tl * tl * (3.0 - 2.0 * tl)
+                g = 1.0 + (g - 1.0) * wlum
+                wfade = wfade * wlum
+            # Pedestal term. delta_c = ref − actual per channel (as-if-white); in "white" mode the three are
+            # identical. delta > 0 (uniform field leaks more than this context) is a plain lift and never clips;
+            # delta < 0 is limited by what the pixel can take, per FaldParams.ped_mode:
+            #   "white"   (2026-09-12, live A/B showed blue rims when a WHITE pedestal was clipped per channel):
+            #             one common factor on the whole vector, so what cannot be removed stays as desaturation
+            #             instead of a hue rotation;
+            #   "channel" (2026-09-13, coloured pedestal): each channel floors independently.
+            delta = ped_ref - ped / w                          # as-if-white, per channel
+            adj, floored_px = pedestal_adjust(delta, src, p.ped_mode)
+            if p.ped_mode == "channel" and (p.ped_chroma_gain != 1.0 or p.ped_chroma_lum_fade is not None):
+                # split: white part (the "white" rule on the white pedestal) faded as before; colour part
+                # (adj − adj_white, luminance-neutral) × ped_chroma_gain × its own pixel-luminance fade
+                adj_w, _ = pedestal_adjust(ped_ref_w - lmax * b_true[None] * tv_w / w, src, "white")
+                clo, chi = p.chroma_lum_fade()
+                if chi > clo >= 0:
+                    tc = np.clip((src.max(axis=0) - clo) / (chi - clo), 0.0, 1.0)
+                    wchroma = wbest * (tc * tc * (3.0 - 2.0 * tc))
+                else:
+                    wchroma = wbest
+                term = adj_w * wfade + (adj - adj_w) * p.ped_chroma_gain * wchroma[None]
             else:
-                wchroma = wbest
-            term = adj_w * wfade + (adj - adj_w) * p.ped_chroma_gain * wchroma[None]
-        else:
-            term = adj * wfade
-        u = img + term
-        floored = np.broadcast_to(floored_px[None], u.shape)
-        mu = u.max(axis=0)
-        ok = mu > 1e-9
-        g_eff = np.where(ok, ceiling_gain(np.where(ok, mu, 1.0), gain, b_est_ceil, p.white_nits), gain)
-        req = np.maximum(u * g_eff[None], 0.0)                  # ONE scale per pixel: hue cannot rotate
-        clipped = np.broadcast_to((g_eff < gain - 1e-12)[None], req.shape)   # brightening limited by the knee
+                term = adj * wfade
+            u = src + term
+            fl = np.broadcast_to(floored_px[None], u.shape)
+            mu = u.max(axis=0)
+            ok = mu > 1e-9
+            g_eff = np.where(ok, ceiling_gain(np.where(ok, mu, 1.0), g, b_est_ceil, p.white_nits), g)
+            rq = np.maximum(u * g_eff[None], 0.0)              # ONE scale per pixel: hue cannot rotate
+            cl = np.broadcast_to((g_eff < g - 1e-12)[None], rq.shape)   # brightening limited by the knee
+            return rq, g, cl, fl
+
+        req, gain, clipped, floored = per_pixel(*refs[0])
         if glow is not None:
             from . import glowfill
             zf = glowfill.zone_fields(model, d_true, boost, glow)
@@ -238,10 +262,14 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
             glow_out.update(zf, round_input=cur, req_nofill=req, band=glow_band)
             req = np.where(glow_out["add"] > 0.0, req + glow_out["add"], req)   # untouched pixels stay bit-identical
         cur = req
+        if cur_pk is not None:
+            cur_pk = per_pixel(*refs[1])[0]
     out = {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives,
            "boost": boost}
     if glow is not None:
         out["glow"] = glow_out
+    if cur_pk is not None:
+        out["req_peak"] = cur_pk
     return out
 
 
