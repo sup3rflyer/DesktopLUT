@@ -25,6 +25,8 @@ convolution and bilinearly upsampled (it is smooth at pixel scale).
 """
 from __future__ import annotations
 
+import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
@@ -360,6 +362,8 @@ class FaldModel:
         assert abs(self.cw - round(self.cw)) < 1e-9 and abs(self.ch - round(self.ch)) < 1e-9, \
             "choose a scale giving integer reduced-res cells"
         self.cw, self.ch = int(round(self.cw)), int(round(self.ch))
+        self._peak: Optional[np.ndarray] = None    # full-resolution COMPANIONS of the image about to be evaluated (set_peak)
+        self._logm: Optional[np.ndarray] = None
         self._kern_cache: dict = {}
         self._spec_cache: dict = {}
 
@@ -447,23 +451,50 @@ class FaldModel:
         tot = (blocks * lit).sum(axis=(2, 3)) * float(p.scale ** 2)
         return np.minimum(peak, tot / p.stat_area0_px2)
 
+    def set_peak(self, peak: Optional[np.ndarray], logm: Optional[np.ndarray] = None) -> None:
+        """FULL-RESOLUTION companions of the image about to be evaluated (call before :meth:`cell_drives` /
+        :meth:`led_boost`, then ``set_peak(None)``): ``peak`` (3, h, w) = per raster pixel the RGB of its brightest
+        full-resolution pixel; ``logm`` (h, w) = per raster pixel the mean over its full-resolution pixels of
+        ln max(s, stat_ctx_eps), s = the brightest channel capped at white (:func:`dlc.fald.motion.render_reduced`
+        ``log_eps=``). The raster alone under-drives sub-5-px content under the context statistic, where the peak is the
+        statistic (review of aa0e14b: a 1-px 1000-nit line on 20 nit -53 %) and over-states the geometric mean of sub-raster
+        texture (Jensen: 1-px dots on black +63 %). ``None`` = the raster itself."""
+        self._peak = None if peak is None else np.minimum(np.max(peak, axis=0), self.p.white_nits)
+        self._logm = None if logm is None else np.asarray(logm, dtype=float)
+
     def _peak_px(self, s: np.ndarray) -> np.ndarray:
-        """The per-raster-pixel PEAK the zone peak is read from (the raster itself here; :class:`dlc.fald.motion.
-        MotionModel` substitutes the full-resolution peak)."""
-        return s
+        """The per-raster-pixel PEAK the zone peak is read from: the full-resolution companion when set, else the raster."""
+        return s if self._peak is None else self._peak
+
+    def logm_follow(self, logm0: np.ndarray, img0: np.ndarray, cur: np.ndarray) -> np.ndarray:
+        """The log companion of ``cur`` = a per-pixel rescale of ``img0`` (the layer's request, a control's output):
+        every full-resolution pixel of a raster pixel scaled by the raster pixel's own factor shifts its ln by
+        ln(s_cur / s_img0); pixels at or below eps stay (the per-pixel rule leaves black black)."""
+        p = self.p
+        eps = p.stat_ctx_eps
+        s0 = np.minimum(np.max(img0, axis=0), p.white_nits)
+        s1 = np.minimum(np.max(cur, axis=0), p.white_nits)
+        shift = np.where(s0 > eps, np.log(np.maximum(s1, eps) / np.maximum(s0, eps)), 0.0)
+        return np.maximum(logm0 + shift, math.log(eps))
 
     def ctx_weight(self, s: np.ndarray) -> np.ndarray:
-        """The P10 context weight w = m / (m0 + m) per zone, m = the zone's geometric mean of max(s, eps) (0 on black,
-        -> 1 on a bright background)."""
+        """The P10 context weight w = m / (m0 + m) per zone, m = the zone's geometric mean of max(s, eps) over its
+        full-resolution pixels (the log companion when set, else the raster's own pixels) — 0 on black, -> 1 on a bright
+        background."""
         p = self.p
-        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw)
-        m = np.exp(np.log(np.maximum(blocks, p.stat_ctx_eps)).mean(axis=(1, 3)))
+        lg = self._logm if self._logm is not None else np.log(np.maximum(s, p.stat_ctx_eps))
+        m = np.exp(lg.reshape(p.rows, self.ch, p.cols, self.cw).mean(axis=(1, 3)))
         return m / (p.stat_ctx_m0 + m)
 
     def _ctx_drives(self, s: np.ndarray) -> np.ndarray:
         """stat_kind "ctxpow" (see ``FaldParams.stat_ctx_*``): the context-power statistic and its black-only floor,
         returned as DRIVES (the floor acts in drive space, as the shader applies it)."""
         p = self.p
+        if self._peak is None and not getattr(self, "_ctx_raster_warned", False):
+            self._ctx_raster_warned = True
+            warnings.warn("stat_kind 'ctxpow' evaluated on the raster without a full-resolution peak companion: content "
+                          "finer than the scale-5 raster is under-driven (set_peak / render_reduced companions)",
+                          RuntimeWarning, stacklevel=3)
         pk = self._peak_px(s)
         peak = (pk * (pk > p.drive_floor_nits)).reshape(p.rows, self.ch, p.cols, self.cw).max(axis=(1, 3))
         lit = s > p.drive_floor_nits

@@ -142,7 +142,7 @@ def pedestal_adjust(delta: np.ndarray, img: np.ndarray, ped_mode: str) -> tuple[
 
 def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
                   gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None, glow=None,
-                  peak: Optional[np.ndarray] = None) -> dict:
+                  peak: Optional[np.ndarray] = None, logm: Optional[np.ndarray] = None) -> dict:
     """Return the corrected request image for ``img`` (3, h, w, as-if-white nits).
 
     ``glow``: optional :class:`dlc.fald.glowfill.GlowFillParams` — the glow fill (work guide S2): every round adds the
@@ -158,14 +158,16 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     round with the SAME fields and the same per-pixel rule as ``img`` — its own level sets its pedestal, lum fade and soft
     knee, as the shader does per full-resolution pixel — and before every round's statistic ``model.set_peak(peak
     request so far)`` is called when the model has that method. Not combined with ``glow``. ``img``'s path is unchanged
-    bit for bit; the result gains ``req_peak``.
+    bit for bit; the result gains ``req_peak``. ``logm``: the content's full-resolution LOG companion (h, w) for the P10
+    context statistic (:func:`dlc.fald.motion.render_reduced` ``log_eps=``) — every round passes
+    ``model.logm_follow(logm, img, request so far)`` with the peak (each pixel's own scale shifts its ln).
 
     Result dict: ``req`` (corrected image), ``gain`` (B_est/B_true of the last iteration),
     ``pedestal`` (per channel, nits, from the last iteration's drives), ``clipped`` (LCD would
     need > 100 %: original request kept), ``floored`` (target below the pedestal), ``drives`` (the last
     round's INSTANTANEOUS drives — what a temporal state commits after the frame)."""
-    if peak is not None and glow is not None:
-        raise ValueError("correct_image: a peak companion is not supported with the glow fill")
+    if (peak is not None or logm is not None) and glow is not None:
+        raise ValueError("correct_image: a peak / log companion is not supported with the glow fill")
     p = model.p
     w = np.array(p.chan_weights)[:, None, None]
     lmax = p.white_nits * w
@@ -176,13 +178,16 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     refs = [(img, reference_pedestal_rgb(model, img), reference_pedestal(model, img)[None])]
     if peak is not None:
         refs.append((peak, reference_pedestal_rgb(model, peak), reference_pedestal(model, peak)[None]))
-    set_peak = getattr(model, "set_peak", None) if peak is not None else None
+    set_peak = getattr(model, "set_peak", None) if (peak is not None or logm is not None) else None
     cur = img.copy()
     cur_pk = None if peak is None else peak.copy()
     gain = np.ones_like(img[0])
     for _ in range(max(1, iters)):
         if set_peak is not None:
-            set_peak(cur_pk)
+            if logm is None:
+                set_peak(cur_pk)
+            else:
+                set_peak(cur_pk, model.logm_follow(logm, img, cur))
         drives = model.cell_drives(cur)
         # black-frame LED boost (FaldParams.boost_lut): the panel counts the non-black zones of the frame it RECEIVES —
         # this round's request. The pedestal term can floor dim pixels and move the count (review 2026-09-18: <= 1 zone

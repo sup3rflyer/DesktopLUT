@@ -64,7 +64,7 @@ FLD5 (magic 0x464C4435, written when the fit's statistic is the P10 CONTEXT stat
 word 48 may be 0 = no boost) with the zone-statistic words in the FLD3 block's reserved slots:
   word 42  statistic kind: 0 = area min(peak, Σ/A0) (every older file: the words were reserved, zero), 1 = ctxpow
   word 43  f: stat_ctx_m0 (nit, > 0)   word 44  f: stat_ctx_g_lit (0..1)   word 45  f: stat_ctx_floor (0..1)
-  word 46  f: stat_ctx_eps (nit, 0 < eps <= 10)   word 47  reserved (0)
+  word 46  f: stat_ctx_eps (nit, 1e-4 <= eps <= 10)   word 47  reserved (0; refused otherwise); word 42 must be 1
   (kind 1: m = exp(mean over the zone's pixels of ln max(s, eps)), w = m / (m0 + m), gamma = g_lit + (1 - g_lit)(1 - w),
    stat = peak · min(1, Σ_lit / (A0 · peak))^gamma, drive = max(drive_of(stat), floor · (1 - w) · drive_of(peak)))
 An exe from before the P10 shader refuses the FLD5 magic — deliberately: it would run the area statistic under a fit
@@ -122,9 +122,9 @@ def stat_ctx_words(p: FaldParams) -> bytes:
     """FLD5 words 42-47 for the P10 context statistic (kind 1 + m0, g_lit, floor, eps + one reserved zero). Raises
     ValueError for what the C++ loader would refuse — judged on the float32 values the file stores."""
     m0, g, fl, eps = (float(np.float32(x)) for x in (p.stat_ctx_m0, p.stat_ctx_g_lit, p.stat_ctx_floor, p.stat_ctx_eps))
-    if not (m0 > 0.0 and np.isfinite(m0)) or not (0.0 <= g <= 1.0) or not (0.0 <= fl <= 1.0) or not (0.0 < eps <= 10.0):
+    if not (m0 > 0.0 and np.isfinite(m0)) or not (0.0 <= g <= 1.0) or not (0.0 <= fl <= 1.0) or not (1e-4 <= eps <= 10.0):
         raise ValueError(f"context statistic (m0 {m0!r}, g_lit {g!r}, floor {fl!r}, eps {eps!r}) outside the loader's gate "
-                         "(m0 finite > 0, g_lit and floor in 0..1, eps in (0, 10])")
+                         "(m0 finite > 0, g_lit and floor in 0..1, eps in [1e-4, 10])")
     return struct.pack("<I4fI", STAT_KIND_CODES["ctxpow"], m0, g, fl, eps, 0)
 
 

@@ -114,17 +114,18 @@ def read_panel_file(path) -> dict:
                 raise ValueError("implausible sdr_gamma")
         elif o["transfer"] != 0:
             raise ValueError("unknown transfer")
-        o["reserved42_47"] = [int(x) for x in u[42:48]]
-    if u[0] == MAGIC5:                                 # words 42-46: the zone statistic (P10)
+        if u[0] != MAGIC5:
+            o["reserved42_47"] = [int(x) for x in u[42:48]]
+    if u[0] == MAGIC5:                                 # words 42-46: the zone statistic (P10); FLD5 exists only for it
         kind = int(u[42])
-        if kind > STAT_CTXPOW:
+        if kind != STAT_CTXPOW:
             raise ValueError("unknown zone statistic")
-        if kind == STAT_CTXPOW:
-            m0, g, flr, eps = (f32(fl[i]) for i in (43, 44, 45, 46))
-            if not (m0 > 0.0 and np.isfinite(m0)) or not (0.0 <= g <= 1.0) or not (0.0 <= flr <= 1.0) \
-                    or not (0.0 < eps <= 10.0):
-                raise ValueError("implausible context-statistic words")
-            o["statKind"], o["ctxM0"], o["ctxGLit"], o["ctxFloor"], o["ctxEps"] = kind, m0, g, flr, eps
+        m0, g, flr, eps = (f32(fl[i]) for i in (43, 44, 45, 46))
+        # eps >= 1e-4: a denormal would flush to zero on the GPU (ln 0) while the twin kept it; word 47 reserved zero
+        if not (m0 > 0.0 and np.isfinite(m0)) or not (0.0 <= g <= 1.0) or not (0.0 <= flr <= 1.0) \
+                or not (1e-4 <= eps <= 10.0) or int(u[47]) != 0:
+            raise ValueError("implausible context-statistic words")
+        o["statKind"], o["ctxM0"], o["ctxGLit"], o["ctxFloor"], o["ctxEps"] = kind, m0, g, flr, eps
     if u[0] in (MAGIC4, MAGIC5):                       # words 48-103: the black-frame LED boost block
         n = int(u[48])
         if n > BOOST_MAX_STEPS:

@@ -71,7 +71,7 @@ def test_ctx_floor_acts_on_black_only():
     assert d > no_floor                                                     # the floor lifts a tiny feature on black
 
 
-def test_motion_model_ctx_equals_the_model_without_a_full_res_peak():
+def test_motion_model_ctx_on_raster_exact_content_needs_no_companion():
     p = _small_params(stat_kind="ctxpow")
     img = _put(_put(_raster(FaldModel(p), 5.0), FaldModel(p), 400, 225, 40, 45, 1000.0), FaldModel(p), 80, 90, 10, 10, 600.0)
     mm = MotionModel(p, "ctx")
@@ -110,22 +110,27 @@ def test_fld5_round_trip_and_area_files_unchanged(tmp_path):
 
 @pytest.mark.parametrize("word,value,reason", [
     (42, 2, "unknown zone statistic"),
+    (42, 0, "unknown zone statistic"),                      # FLD5 exists only for the context statistic
     (43, 0.0, "implausible context-statistic words"),       # m0 must be > 0
+    (43, float("nan"), "implausible context-statistic words"),
     (44, 1.5, "implausible context-statistic words"),       # g_lit in 0..1
     (45, -0.1, "implausible context-statistic words"),      # floor in 0..1
-    (46, 0.0, "implausible context-statistic words"),       # eps in (0, 10]
+    (46, 0.0, "implausible context-statistic words"),       # eps in [1e-4, 10]
+    (46, 1.4e-45, "implausible context-statistic words"),   # a denormal flushes to 0 on the GPU (ln 0)
+    (47, 1, "implausible context-statistic words"),         # reserved
 ])
 def test_fld5_loader_refusals(tmp_path, word, value, reason):
     export_panel_params(FaldModel(_small_params(stat_kind="ctxpow")), tmp_path / "c.bin")
     b = bytearray((tmp_path / "c.bin").read_bytes())
-    struct.pack_into("<I" if word == 42 else "<f", b, word * 4, value)
+    struct.pack_into("<I" if word in (42, 47) else "<f", b, word * 4, value)
     (tmp_path / "bad.bin").write_bytes(bytes(b))
     with pytest.raises(ValueError, match=reason):
         read_panel_file(tmp_path / "bad.bin")
 
 
 def test_export_refuses_parameters_the_loader_would(tmp_path):
-    for bad in (dict(stat_ctx_m0=0.0), dict(stat_ctx_g_lit=1.2), dict(stat_ctx_floor=-0.01), dict(stat_ctx_eps=11.0)):
+    for bad in (dict(stat_ctx_m0=0.0), dict(stat_ctx_g_lit=1.2), dict(stat_ctx_floor=-0.01), dict(stat_ctx_eps=11.0),
+                dict(stat_ctx_eps=5e-5)):
         with pytest.raises(ValueError, match="context statistic"):
             export_panel_params(FaldModel(_small_params(stat_kind="ctxpow", **bad)), tmp_path / "x.bin")
 
@@ -151,3 +156,95 @@ def test_emulator_stat_pass_equals_the_model(tmp_path):
     ea = Emu(read_panel_file(tmp_path / "a.bin"), width=p.width, height=p.height)
     img = _put(_raster(m, 20.0), m, 400, 225, 20, 20, 1000.0)
     assert np.allclose(ea.stat_drive(_full(img))[0], FaldModel(pa).cell_drives(img), atol=2e-3)
+
+
+# ------------------------------------------------------------------------------------------------ review of aa0e14b
+def _scene(bg, shapes):
+    from dlc.fald.motion import MovingShape, Scene
+    return Scene("t", (bg,) * 3, tuple(MovingShape("rect", x + w / 2, y + h / 2, (lv,) * 3, w=w, h=h) for x, y, w, h, lv in shapes),
+                 pre=0, move=0, post=1)
+
+
+def test_emulator_floor_binds_on_a_dim_speck_on_black(tmp_path):
+    p = _small_params(stat_kind="ctxpow")
+    m = FaldModel(p)
+    export_panel_params(m, tmp_path / "c.bin")
+    emu = Emu(read_panel_file(tmp_path / "c.bin"), width=p.width, height=p.height)
+    img = _put(_raster(m), m, 400, 225, 5, 5, 300.0)                      # a 5x5 300-nit speck on black
+    s = np.minimum(img.max(axis=0), p.white_nits)
+    w = float(m.ctx_weight(s)[5, 5])
+    floor_d = p.stat_ctx_floor * (1.0 - w) * float(m.drive_of(np.array(300.0)))
+    no_floor = float(FaldModel(replace(p, stat_ctx_floor=0.0)).cell_drives(img)[5, 5])
+    assert floor_d > no_floor + 0.02                                       # the floor binds, by far more than the LUT gap
+    assert m.cell_drives(img)[5, 5] == pytest.approx(floor_d, rel=1e-9)
+    assert emu.stat_drive(_full(img))[0][5, 5] == pytest.approx(floor_d, abs=2e-3)
+
+
+def test_sub_raster_content_needs_the_companions(tmp_path):
+    from dlc.fald.motion import render_full_patch, render_reduced
+    p = _small_params(stat_kind="ctxpow")
+    export_panel_params(FaldModel(p), tmp_path / "c.bin")
+    emu = Emu(read_panel_file(tmp_path / "c.bin"), width=p.width, height=p.height)
+    # a 1-px 1000-nit line on 20 nit; 1-px 200-nit dots on black every 3 px (sub-raster texture: Jensen); a 3x3 speck on black
+    dots = [(560 + 3 * i, 270 + 3 * j, 1, 1, 200.0) for i in range(20) for j in range(10)]
+    # (scene, the raster alone is badly wrong): line -53 %, 3x3 speck -45 % without the companions; the dots stay within
+    # ~4 % (the black-only floor dominates them) — a companion-accuracy case only
+    for sc, raster_wrong in ((_scene(20.0, [(401, 230, 1, 30, 1000.0)]), True), (_scene(0.0, dots), False),
+                             (_scene(0.0, [(401, 231, 3, 3, 1000.0)]), True)):
+        full = render_full_patch(sc, 0, 0, 0, p.width, p.height)
+        de, _ = emu.stat_drive(full)
+        img, pk, lg = render_reduced(sc, 0, p.scale, p.width, p.height, log_eps=p.stat_ctx_eps, white=p.white_nits)
+        mm = MotionModel(p, "ctx")
+        mm.set_peak(pk, lg)
+        dm = mm.cell_drives(img)
+        mm.set_peak(None)
+        assert np.allclose(dm, de, atol=2e-3), np.max(np.abs(dm - de))
+        with pytest.warns(RuntimeWarning, match="peak companion"):
+            raw = FaldModel(p).cell_drives(img)                            # the raster alone: warned
+        if raster_wrong:
+            assert np.max(np.abs(raw - de)) > 0.3 * np.max(de)
+
+
+def test_correct_image_follows_the_log_companion():
+    from dlc.fald.correct import correct_image
+    from dlc.fald.motion import render_reduced
+    p = _small_params(stat_kind="ctxpow")
+    sc = _scene(0.0, [(560 + 3 * i, 270 + 3 * j, 1, 1, 200.0) for i in range(20) for j in range(10)])
+    img, pk, lg = render_reduced(sc, 0, p.scale, p.width, p.height, log_eps=p.stat_ctx_eps, white=p.white_nits)
+    m = MotionModel(p, "ctx")
+    a = correct_image(m, img, peak=pk, logm=lg)
+    m.set_peak(None)
+    b = correct_image(m, img, peak=pk)                                      # no log companion: the raster's own logs
+    m.set_peak(None)
+    assert not np.allclose(a["drives"], b["drives"], atol=1e-3)            # the companion is used ...
+    lg2 = m.logm_follow(lg, img, img)
+    assert np.array_equal(lg2, np.maximum(lg, np.log(p.stat_ctx_eps)))     # ... and is the content's own on round 1
+
+
+def test_starfield_reference_follows_a_ctx_fit(tmp_path):
+    from dlc.fald.starfield import StarfieldParams, zone_plan
+    p = _small_params(stat_kind="ctxpow")
+    m = FaldModel(p)
+    export_panel_params(m, tmp_path / "c.bin")
+    emu = Emu(read_panel_file(tmp_path / "c.bin"), width=p.width, height=p.height)
+    img = _put(_put(_raster(m, 3.0), m, 400, 225, 20, 20, 1000.0), m, 80, 90, 5, 5, 600.0)
+    sp = StarfieldParams()
+    ref, gpu = zone_plan(m, img, sp)["solid"], emu.star_stat(_full(img), sp)["solid"]
+    assert np.allclose(ref, gpu, atol=2e-3), np.max(np.abs(ref - gpu))
+    area_solid = zone_plan(FaldModel(replace(p, stat_kind="area")), img, sp)["solid"]
+    assert np.max(np.abs(area_solid - gpu)) > 0.05                          # the area law would not have matched
+
+
+def test_simulate_scene_layer_runs_the_fits_statistic():
+    from dlc.fald.motion import simulate_scene
+    from dlc.fald.temporal import DriveState
+    sc = _scene(5.0, [(400, 225, 5, 5, 1000.0)])                          # a speck: area and ctx disagree on its zone
+    for kind, explicit in (("ctxpow", "ctx"), ("area", "area")):
+        p = _small_params(stat_kind=kind)
+        a = simulate_scene(p, sc, state=DriveState(), panels=(("ctx", 0),))
+        b = simulate_scene(p, sc, state=DriveState(), panels=(("ctx", 0),), layer_stat=explicit)
+        assert np.array_equal(a.runs[0].ys, b.runs[0].ys)
+    p = _small_params(stat_kind="ctxpow")
+    c = simulate_scene(p, sc, state=DriveState(), panels=(("ctx", 0),), layer_stat="area")
+    d = simulate_scene(p, sc, state=DriveState(), panels=(("ctx", 0),))
+    assert not np.allclose(c.runs[0].ys, d.runs[0].ys, rtol=1e-4)          # the default is NOT the area layer for a ctx fit

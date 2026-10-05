@@ -270,7 +270,10 @@ def zone_plan(model: FaldModel, img: np.ndarray, sp: StarfieldParams) -> dict:
     sparse = np.where(has & speck, 1.0 - _smoothstep(sp.area_lo, sp.area_hi, a_eff), 0.0)
     if sp.peak_hi > 0.0:
         sparse = sparse * (1.0 - _smoothstep(sp.peak_hi, 2.0 * sp.peak_hi, peak))
-    drive = model.drive_of(np.minimum(peak, total / p.stat_area0_px2))
+    if p.stat_kind == "ctxpow":                         # the P10 context statistic: the layer's own drives (FLD5 S0 `solid`)
+        drive = model.cell_drives(img)
+    else:
+        drive = model.drive_of(np.minimum(peak, total / p.stat_area0_px2))
     solid = (1.0 - sparse) * drive * has
     spk = has & speck & (a_eff < sp.area_hi)
     near = near_tapered(solid, int(sp.reach))

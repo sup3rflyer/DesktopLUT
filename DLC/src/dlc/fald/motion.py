@@ -24,8 +24,10 @@ drives by up to 0.25).
 **Two panel-truth statistics bracket the unknown** (P10 refit owed; the measured regimes disagree with any single
 form): ``"area"`` = the shipped ``min(peak, Σ/A0)`` at full resolution (what the layer itself assumes: the panel then
 agrees with the layer's model and only the time law differs), ``"level"`` = the brightest lit pixel (one column →
-full drive at its level; the upper bracket of border snapping). The LAYER always runs ``"area"`` — the shader's
-statistic.
+full drive at its level; the upper bracket of border snapping). ``"ctx"`` = the P10 context statistic (FaldParams
+``stat_ctx_*``; area on black, ~level on a lit background), fed the full-resolution peak AND log-mean companions. The
+LAYER runs the fit's own statistic (``simulate_scene(layer_stat=None)``: "ctx" for a ``stat_kind`` "ctxpow" fit = the FLD5
+shader, else "area" = the shader today).
 
 Not modelled: LCD transition time (as :mod:`dlc.fald.paneltime`), starfield (S1) and glow fill (S2) (both live in the
 owner's HDR INI; they act on specks / near-black, which the default scenes avoid — a scene on black or with specks
@@ -255,7 +257,8 @@ def render_full_patch(scene: Scene, i: int, x0: int, y0: int, nx: int, ny: int) 
 
 
 def _render_window(scene: Scene, i: int, scale: int, img: np.ndarray, peak: np.ndarray,
-                   x0: float, y0: float, x1: float, y1: float) -> None:
+                   x0: float, y0: float, x1: float, y1: float, logm: Optional[np.ndarray] = None,
+                   log_eps: float = 0.05, white: float = 1842.0) -> None:
     """Render the full-resolution window covering [x0, x1) × [y0, y1) (snapped out to whole raster pixels, one pixel of
     margin) with :func:`render_full_patch` and write its block mean into ``img`` and its block PEAK (the RGB of the
     full-resolution pixel with the largest channel) into ``peak``. Exact wherever it is written: the patch carries the
@@ -271,28 +274,37 @@ def _render_window(scene: Scene, i: int, scale: int, img: np.ndarray, peak: np.n
     img[:, ry0:ry1, rx0:rx1] = blocks.mean(axis=3)
     k = blocks.max(axis=0).argmax(axis=2)                                   # brightest full-res pixel of each block
     peak[:, ry0:ry1, rx0:rx1] = np.take_along_axis(blocks, k[None, :, :, None], axis=3)[..., 0]
+    if logm is not None:                                                    # mean of ln max(s, eps), s capped at white
+        logm[ry0:ry1, rx0:rx1] = np.log(np.maximum(np.minimum(blocks.max(axis=0), white), log_eps)).mean(axis=2)
 
 
-def render_reduced(scene: Scene, i: int, scale: int, w: int = PANEL_W, h: int = PANEL_H) -> tuple[np.ndarray, np.ndarray]:
+def render_reduced(scene: Scene, i: int, scale: int, w: int = PANEL_W, h: int = PANEL_H,
+                   log_eps: Optional[float] = None, white: float = 1842.0):
     """Content frame ``i`` on the model raster: ``(img, peak)`` — img (3, h/scale, w/scale) = the exact block MEAN of the
     full-resolution render (light is conserved); peak (3, h/scale, w/scale) = per block, the RGB of its brightest
     full-resolution pixel (what a full-resolution statistic sees; ``peak.max(0)`` is the block max of the brightest
     channel). Only the shapes' bounding box and the aids' bounding box are rendered at full resolution (each window
-    exactly, shapes and aids included); elsewhere the frame is the background."""
+    exactly, shapes and aids included); elsewhere the frame is the background. ``log_eps`` given: ``(img, peak, logm)``
+    with logm (h/scale, w/scale) = per block the mean of ln max(s, log_eps), s = the brightest channel capped at
+    ``white`` — the P10 context statistic's geometric-mean companion (``FaldModel.set_peak(peak, logm)``)."""
     hr, wr = h // scale, w // scale
     bg = np.asarray(scene.bg, dtype=np.float64)
     img = np.empty((3, hr, wr)); img[:] = bg[:, None, None]
     peak = img.copy()
+    logm = None
+    if log_eps is not None:
+        logm = np.full((hr, wr), math.log(max(min(float(bg.max()), white), log_eps)))
+    kw = {} if logm is None else {"logm": logm, "log_eps": float(log_eps), "white": float(white)}
     aids = scene.aid_rects(i)
     if aids:
         _render_window(scene, i, scale, img, peak, min(a[0] for a in aids), min(a[1] for a in aids),
-                       max(a[0] + a[2] for a in aids), max(a[1] + a[3] for a in aids))
+                       max(a[0] + a[2] for a in aids), max(a[1] + a[3] for a in aids), **kw)
     t = scene.motion_time(i)
     boxes = [s.bbox(t) for s in scene.shapes if s.visible(i)]
     if boxes:
         _render_window(scene, i, scale, img, peak, min(b[0] for b in boxes), min(b[1] for b in boxes),
-                       max(b[2] for b in boxes), max(b[3] for b in boxes))
-    return img, peak
+                       max(b[2] for b in boxes), max(b[3] for b in boxes), **kw)
+    return (img, peak) if logm is None else (img, peak, logm)
 
 
 # ------------------------------------------------------------------------------------------------ the model
@@ -319,13 +331,6 @@ class MotionModel(FaldModel):
         elif stat not in ("area", "level", "ctx"):
             raise ValueError(f"stat must be 'area', 'level', 'ctx' or 'power:<g>', got {stat!r}")
         self.stat = stat
-        self._peak: Optional[np.ndarray] = None
-
-    def set_peak(self, peak: Optional[np.ndarray]) -> None:
-        self._peak = None if peak is None else np.minimum(np.max(peak, axis=0), self.p.white_nits)
-
-    def _peak_px(self, s: np.ndarray) -> np.ndarray:
-        return s if self._peak is None else self._peak
 
     def cell_drives(self, img: np.ndarray) -> np.ndarray:
         """``stat`` "ctx" = the P10 context statistic (``FaldParams.stat_ctx_*``, :meth:`FaldModel._ctx_drives`) with the
@@ -446,7 +451,7 @@ class SceneRun:
 def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tuple[str, int]] = (("area", 0), ("area", 1)),
                    law: PanelTimeLaw = PanelTimeLaw(), rerender_on_repeat: bool = True, iters: int = 2,
                    kymo_row: Optional[int] = None, mask: Optional[np.ndarray] = None,
-                   control: Optional[Callable] = None, layer_stat: str = "area",
+                   control: Optional[Callable] = None, layer_stat: Optional[str] = None,
                    snapshot_refreshes: Sequence[int] = ()) -> SceneRun:
     """Stream ``scene`` refresh by refresh through the layer (``state``: None = layer OFF; a
     :class:`dlc.fald.temporal.DriveState` — ``DriveState(MODE_OFF)`` = the static layer — or a
@@ -460,9 +465,14 @@ def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tup
     ``control``: an optional content-side controller ``control(layer_model, img, peak, req, req_peak) -> (req, req_peak)``
     applied to every refresh's request after the layer (candidate motion algorithms; ``peak`` / ``req_peak`` = the
     full-resolution peak companions of the content and of the request); it may keep its own state. ``layer_stat``: the
-    statistic the LAYER assumes ("area" = the shader today; "level" = a candidate that believes the border law)."""
+    statistic the LAYER assumes; None = the fit's own (``p.stat_kind`` "ctxpow" -> "ctx", the FLD5 shader; else "area",
+    the shader today); "level" = a candidate that believes the border law. A "ctx" layer or panel gets the
+    full-resolution log companion as well as the peak."""
     from .correct import correct_image
+    if layer_stat is None:
+        layer_stat = "ctx" if p.stat_kind == "ctxpow" else "area"
     layer = MotionModel(p, layer_stat)
+    want_log = layer_stat == "ctx" or any(t == "ctx" for t, _ in panels)
     pms = [(t, par, MotionModel(p, t), PanelClock(law, par)) for t, par in panels]
     w = np.array(p.chan_weights)[:, None, None]
     lmax = p.white_nits * w
@@ -481,7 +491,11 @@ def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tup
     want_snap = set(int(v) for v in snapshot_refreshes)
     cidx, target_static, k_out = [], None, 0
     for i, kk in enumerate(refr):
-        img, pk_img = render_reduced(scene, i, p.scale, p.width, p.height)
+        if want_log:
+            img, pk_img, lg_img = render_reduced(scene, i, p.scale, p.width, p.height, log_eps=p.stat_ctx_eps,
+                                                 white=p.white_nits)
+        else:
+            (img, pk_img), lg_img = render_reduced(scene, i, p.scale, p.width, p.height), None
         if target_static is None:
             tgt = (img * w).sum(axis=0) + reference_pedestal(layer, img)
             target_static = tgt[m].astype(np.float32)
@@ -489,7 +503,7 @@ def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tup
         req, req_pk = img, pk_img
         for r in range(kk):
             if state is not None and (r == 0 or rerender_on_repeat):
-                res = correct_image(layer, img, iters=iters, drive_filter=state.fields, peak=pk_img)
+                res = correct_image(layer, img, iters=iters, drive_filter=state.fields, peak=pk_img, logm=lg_img)
                 layer.set_peak(None)
                 req, req_pk = res["req"], res["req_peak"]
                 if isinstance(state, PanelDriveState):
@@ -497,8 +511,9 @@ def simulate_scene(p: FaldParams, scene: Scene, state=None, panels: Sequence[tup
                 else:
                     state.commit(res["drives"])
             sent, sent_pk = (req, req_pk) if control is None else control(layer, img, pk_img, req, req_pk)
+            lg_sent = None if lg_img is None else layer.logm_follow(lg_img, img, sent)
             for truth, par, pm, clock in pms:
-                pm.set_peak(sent_pk)
+                pm.set_peak(sent_pk, lg_sent)
                 d = pm.cell_drives(sent)
                 boost = pm.led_boost(sent)
                 pm.set_peak(None)
