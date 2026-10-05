@@ -928,6 +928,7 @@ static void StartMhcTransitionBurst(HWND hwnd, const char* reason) {
 // invalidates the DXGI cache so late-settling transition state is re-read,
 // preventing a stale pre-transition snapshot from being pumped to acceptance.
 static void StartDwmHookConfigResends(HWND hwnd) {
+    DwmInjectDisplayChanged();                       // FALD stage 3: the vblank publishers re-bind (a new numbering epoch)
     InvalidateDxgiMonitorCache();
     UpdateDwmHookSharedConfig();
     g_dwmHookConfigResends = 3;
@@ -1567,8 +1568,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         FaldSlot(false).clockParityEpoch = epoch;
                     }
                     ApplyFaldSharedSettingChange();
-                    if (parity >= 0)
-                        SetStatus(L"FALD panel clock: a known parity is experimental - the WRONG one is as bad as no time law; Unknown is the safe choice");
+                    if (parity >= 0 && epoch != FALD_PARITY_EPOCH_NONE) {
+                        wchar_t msg[256];
+                        swprintf_s(msg, L"FALD panel clock: parity %d applies to the CURRENT vblank numbering only (epoch %016llx) - "
+                                   L"it stops at the next restart / display event. Experimental: the WRONG one is worse than Unknown",
+                                   parity, epoch);
+                        SetStatus(msg);
+                    } else if (parity >= 0) {
+                        SetStatus(L"FALD panel clock: parity INACTIVE - no live vblank numbering (needs the DWM hook with the FALD "
+                                  L"layer on in LED-lag mode 3); Unknown is used");
+                    }
                 }
             }
             return 0;

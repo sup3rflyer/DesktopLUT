@@ -379,6 +379,11 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert vs.ok and vs.result["published"] is False and vs.result["parity_active"] is True and vs.result["epoch_id"] == "none"
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity_epoch": "12ab"}), raise_on_error=False)
     assert not bad.ok and bad.error.startswith("parity_epoch must be 16 hex digits")
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity_epoch": "f" * 16}), raise_on_error=False)
+    assert not bad.ok and "reserved" in bad.error                                  # no hex alias of 'any' / 'none'
+    # a parity re-sent without an epoch (a settings restore) drops the binding: never activated implicitly
+    pe = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1})
+    assert pe.ok and pe.result["parity_epoch"] == "none" and pe.result["parity_active"] is False
     client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 0, "closure": 0.72, "parity": -1})
     # ... and the C++ handler carries the same refusals word for word
     if CPP_SERVER.exists():

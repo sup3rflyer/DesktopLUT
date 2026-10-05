@@ -543,6 +543,17 @@ static void UpdateLocalTonemapFromShared() {
 	const bool tailValid = g_sharedHasTail && localEx.tail.magic == DWM_HOOK_TAIL_MAGIC &&
 	                       localEx.tail.layoutVersion == DWM_HOOK_TAIL_LAYOUT_VERSION &&
 	                       localEx.tail.tuningBytes == sizeof(DwmHookFaldTuning);
+	{   // a host of another tail layout (a mixed build pair): FALD tuning runs on defaults — say so once
+		static bool loggedReject = false;
+		if (g_sharedHasTail && !tailValid && localEx.tail.magic == DWM_HOOK_TAIL_MAGIC && !loggedReject) {
+			loggedReject = true;
+			char tmsg[160];
+			snprintf(tmsg, sizeof(tmsg), "FALD: tuning tail REJECTED (host layout %u / %u bytes, this DLL %u / %u) - "
+			         "FALD tuning at defaults, no vblank map", localEx.tail.layoutVersion, localEx.tail.tuningBytes,
+			         (unsigned)DWM_HOOK_TAIL_LAYOUT_VERSION, (unsigned)sizeof(DwmHookFaldTuning));
+			log_to_file(tmsg);
+		}
+	}
 
 	g_localConfigVersion = local.version;
 

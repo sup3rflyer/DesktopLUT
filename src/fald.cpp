@@ -1161,7 +1161,9 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     FaldTemporalSettings ts;
     ts.mode = fs.temporalMode; ts.tauRiseMs = fs.tauRiseMs; ts.tauFallMs = fs.tauFallMs; ts.delayFrames = fs.delayFrames;
     ts.clockClosure = fs.clockClosure; ts.clockParity = fs.clockParity;
-    ts.clockParityEpoch = FALD_PARITY_EPOCH_ANY;   // the overlay has no vblank map: its parity applies as set
+    // the overlay has no vblank map, so no epoch can ever match: its parity applies only when explicitly set to 'any'
+    // (its run-time grid re-rolls against the panel — measured 2026-10-04 — the case the fail-safe exists for)
+    ts.clockParityEpoch = (fs.clockParityEpoch == FALD_PARITY_EPOCH_ANY) ? FALD_PARITY_EPOCH_ANY : FALD_PARITY_EPOCH_NONE;
     // panel clock (mode 3, work guide C13): its textures exist only while the mode is on; a failed creation runs as off
     bool clockOk = false;
     if (ts.mode == FALD_TEMPORAL_PANEL) clockOk = EnsureClock(r);

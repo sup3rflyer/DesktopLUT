@@ -963,6 +963,8 @@ class MockDesktopLutServer:
             if isinstance(pe, str) and pe not in ("current", "any", "none") and not (
                     len(pe) == 16 and all(c in "0123456789abcdefABCDEF" for c in pe)):
                 return DesktopLutResponse(ok=False, error='parity_epoch must be 16 hex digits, "current", "any" or "none"')
+            if isinstance(pe, str) and pe.lower() in ("0" * 16, "f" * 16):
+                return DesktopLutResponse(ok=False, error='parity_epoch 0000000000000000 / ffffffffffffffff are reserved: say "none" or "any"')
             if num(tm) and tm not in (0, 1, 2, 3):
                 return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)")
             for name, v in (("tau_rise_ms", tr), ("tau_fall_ms", tf)):
@@ -986,9 +988,9 @@ class MockDesktopLutServer:
                 fs["closure"] = float(cl)
             if num(pa):
                 fs["parity"] = int(pa)
-            # the mock publishes no vblank map: 'current' binds to none (the parity stays inactive, as in the app
-            # before a publisher runs)
-            pe_text = pe if isinstance(pe, str) else ("current" if num(pa) else None)
+            # a parity without parity_epoch binds none (never activated implicitly); the mock publishes no vblank map,
+            # so 'current' binds none too (as in the app before a publisher runs)
+            pe_text = pe if isinstance(pe, str) else ("none" if num(pa) else None)
             if pe_text is not None:
                 fs["parity_epoch"] = "none" if pe_text == "current" else pe_text.lower()
             from dlc.fald.paneltime import MODE_PANEL, settle_refreshes

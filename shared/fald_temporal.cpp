@@ -452,6 +452,32 @@ FaldVBlankWaitVerdict FaldVBlankSpinGuardStep(FaldVBlankSpinGuard* g, long long 
     if (++g->spins >= FALD_VBLANK_SPIN_LIMIT) { g->spins = 0; g->asleep++; return FALD_VBLANK_WAIT_ASLEEP; }
     return FALD_VBLANK_WAIT_EARLY;
 }
+FaldVBlankEpochReason FaldVBlankEpochKeeperStep(FaldVBlankEpochKeeper* k, unsigned long long bind, unsigned long long trkEpoch,
+                                                FaldVBlankEpochEvent ev) {
+    if (ev == FALD_VBLANK_EV_FAILED) { k->suspect = FALD_VBLANK_EPOCH_FAILED; k->earlyRun = 0; return FALD_VBLANK_EPOCH_SAME; }
+    if (ev == FALD_VBLANK_EV_EARLY) {
+        if (++k->earlyRun >= FALD_VBLANK_EPOCH_EARLY_RUN && k->suspect == FALD_VBLANK_EPOCH_SAME) k->suspect = FALD_VBLANK_EPOCH_EARLY;
+        return FALD_VBLANK_EPOCH_SAME;
+    }
+    if (ev == FALD_VBLANK_EV_WAKE) k->earlyRun = 0;
+    FaldVBlankEpochReason why = FALD_VBLANK_EPOCH_SAME;
+    if (!k->haveId || bind != k->bind) why = FALD_VBLANK_EPOCH_BIND;
+    else if (trkEpoch != k->trkEpoch) why = FALD_VBLANK_EPOCH_TRACKER;
+    else if (k->suspect != FALD_VBLANK_EPOCH_SAME) why = (FaldVBlankEpochReason)k->suspect;
+    if (why != FALD_VBLANK_EPOCH_SAME) {
+        k->haveId = true; k->bind = bind; k->trkEpoch = trkEpoch; k->suspect = FALD_VBLANK_EPOCH_SAME;
+    }
+    return why;
+}
+const char* FaldVBlankEpochReasonText(unsigned int reason) {
+    switch (reason) {
+        case FALD_VBLANK_EPOCH_BIND: return "binding";
+        case FALD_VBLANK_EPOCH_TRACKER: return "tracker restart / re-base";
+        case FALD_VBLANK_EPOCH_FAILED: return "a failed vblank wait";
+        case FALD_VBLANK_EPOCH_EARLY: return "a run of early returns";
+        default: return "same";
+    }
+}
 bool FaldVBlankNeedsRebind(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left, int top,
                            float nominalMs, float nominalNowMs) {
     if (!factoryCurrent || !descOk || !attached) return true;

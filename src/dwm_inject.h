@@ -51,6 +51,9 @@ void InvalidateDxgiMonitorCache();
 // what a parity calibration binds to (shared/fald_temporal.h parity fail-safe). False = no publisher record. Never call
 // it with g_monitorSettingsMutex held (lock order: inject -> settings).
 bool DwmInjectVBlankMapAt(int left, int top, DwmHookVBlankMap* out);
+// A display / mode change happened (WM_DISPLAYCHANGE, HDR flip): every vblank publisher re-binds at its next wake (a new
+// numbering epoch — a calibrated parity stops applying at once).
+void DwmInjectDisplayChanged();
 
 // True when at least two monitors are indistinguishable to the hook (same size + bit depth):
 // the only rigs where the identity beacon has anything to tell apart.

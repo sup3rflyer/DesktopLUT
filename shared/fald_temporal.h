@@ -325,6 +325,38 @@ struct FaldVBlankSpinGuard {
 // periodQpc = the output's nominal refresh period (<= 0: the 1-ms rule alone).
 FaldVBlankWaitVerdict FaldVBlankSpinGuardStep(FaldVBlankSpinGuard* g, long long waitStartQpc, long long returnQpc,
                                               long long qpcFreq, double periodQpc = 0.0);
+// The publisher's numbering-epoch bookkeeping (pure; src/dwm_inject.cpp VBlankPublisherThread draws the random ids).
+// A NEW epoch id — so a calibrated parity stops applying at once (fald_temporal.h fail-safe) — on: the first id, a
+// (re-)binding, a tracker epoch change (restart / re-base), a FAILED vblank wait or a run of
+// FALD_VBLANK_EPOCH_EARLY_RUN early returns (the output went away or did not wait, however briefly: its timing may restart
+// anywhere, and a restarted timing that lands within the chain's tolerance would otherwise be absorbed silently — review
+// 2026-10-05). Feed every wait outcome (FAILED / EARLY) and every point where the numbering may have moved (WAKE after
+// the tracker's Wake, CHECK after its Map / a binding); a nonzero return = draw a new id NOW, before anything is
+// published, and says why.
+constexpr unsigned int FALD_VBLANK_EPOCH_EARLY_RUN = 2;
+enum FaldVBlankEpochEvent : unsigned int {
+    FALD_VBLANK_EV_WAKE = 0,       // a wait returned a vblank and the tracker took it
+    FALD_VBLANK_EV_EARLY = 1,      // a wait returned without waiting (spin guard EARLY)
+    FALD_VBLANK_EV_FAILED = 2,     // a wait failed (output off / gone)
+    FALD_VBLANK_EV_CHECK = 3,      // after a binding / a publish attempt (no wait outcome)
+};
+enum FaldVBlankEpochReason : unsigned int {
+    FALD_VBLANK_EPOCH_SAME = 0,
+    FALD_VBLANK_EPOCH_BIND = 1,    // the first id / a (re-)binding
+    FALD_VBLANK_EPOCH_TRACKER = 2, // the tracker restarted or re-based its numbering
+    FALD_VBLANK_EPOCH_FAILED = 3,  // a failed wait since the last id
+    FALD_VBLANK_EPOCH_EARLY = 4,   // an early-return run since the last id
+};
+struct FaldVBlankEpochKeeper {
+    bool haveId = false;
+    unsigned long long bind = 0, trkEpoch = 0;   // what the current id was drawn for
+    unsigned int earlyRun = 0;
+    unsigned int suspect = FALD_VBLANK_EPOCH_SAME;   // a failed wait / an early run since: the next check draws an id
+};
+FaldVBlankEpochReason FaldVBlankEpochKeeperStep(FaldVBlankEpochKeeper* k, unsigned long long bind, unsigned long long trkEpoch,
+                                                FaldVBlankEpochEvent ev);
+const char* FaldVBlankEpochReasonText(unsigned int reason);
+
 // The publisher's periodic re-check of its output (every few seconds of TIME): re-bind (withdraw the map, find the
 // output at the monitor's position again, a new epoch) when the DXGI factory is stale, the output's description is
 // unreadable, it left the desktop or no longer starts at the monitor's position (a swap / layout change: the posTag

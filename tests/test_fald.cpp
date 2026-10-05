@@ -997,6 +997,32 @@ TEST_CASE("FALD stage 3: the panel clock on the absolute index - regime shifts d
     }
 }
 
+TEST_CASE("FALD stage 3: the publisher's epoch keeper - a new id on every event that may move the numbering") {
+    FaldVBlankEpochKeeper k;
+    // the first check draws an id (a binding)
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 0, FALD_VBLANK_EV_CHECK) == FALD_VBLANK_EPOCH_BIND);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 0, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 0, FALD_VBLANK_EV_CHECK) == FALD_VBLANK_EPOCH_SAME);
+    // a tracker restart / re-base
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_TRACKER);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_CHECK) == FALD_VBLANK_EPOCH_SAME);
+    // a failed wait: nothing until the next wake / check, then a new id before any publish
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_FAILED) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_FAILED);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_SAME);
+    // ONE early return (a stall) keeps the epoch; a run of them does not
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_EARLY) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_EARLY) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_EARLY) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_EARLY);
+    // a re-binding wins over a pending suspicion (one new id, reason bind)
+    CHECK(FaldVBlankEpochKeeperStep(&k, 1, 1, FALD_VBLANK_EV_FAILED) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 2, 0, FALD_VBLANK_EV_CHECK) == FALD_VBLANK_EPOCH_BIND);
+    CHECK(FaldVBlankEpochKeeperStep(&k, 2, 0, FALD_VBLANK_EV_WAKE) == FALD_VBLANK_EPOCH_SAME);
+    CHECK(std::string(FaldVBlankEpochReasonText(FALD_VBLANK_EPOCH_FAILED)) == "a failed vblank wait");
+}
+
 TEST_CASE("FALD stage 3: the parity fail-safe - a parity applies only inside the numbering epoch it belongs to") {
     // the rule (fald_temporal.h above FALD_PARITY_EPOCH_NONE)
     const unsigned long long E = 0x1234abcd5678ef90ull, E2 = 0x0badc0ffee000001ull;

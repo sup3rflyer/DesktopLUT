@@ -477,10 +477,12 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "parity_epoch": ApiParamSpec(
                     "string", required=False,
                     description="stage 3 parity fail-safe: the vblank-numbering epoch the parity belongs to — 16 hex "
-                                "digits (the epoch a calibration measured in: runtime.fald_vblank_status), 'current' "
-                                "(the live map's epoch now; the default whenever parity is set without one), 'any' "
-                                "(apply whatever the numbering: manual A/B only) or 'none'. In hook mode a parity 0 / 1 "
-                                "applies only while the published map carries this epoch, else the clocks' mean"),
+                                "digits (the epoch a calibration measured in: runtime.fald_vblank_status; 0000... / ffff... "
+                                "are refused), 'current' (the live map's epoch now), 'any' (apply whatever the numbering: "
+                                "manual A/B only) or 'none'. A parity set WITHOUT parity_epoch binds 'none' (never "
+                                "activated implicitly). In hook mode a parity 0 / 1 applies only while the published map "
+                                "carries this epoch, else the clocks' mean; parity_active / live_epoch = the host's binding "
+                                "after the call"),
             },
             {"monitor_mode": "string", "temporal_mode": "number", "tau_rise_ms": "number", "tau_fall_ms": "number",
              "delay_frames": "number", "closure": "number", "parity": "number", "settle_frames_60hz": "number",

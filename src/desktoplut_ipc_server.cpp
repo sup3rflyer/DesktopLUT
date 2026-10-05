@@ -1730,10 +1730,12 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     const bool hasPe = pe && pe->type == JsonValue::Str;
     if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df) && !isNum(cl) && !isNum(pa) && !hasPe) { error = "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1), parity (-1|0|1) or parity_epoch"; return; }
     // parity_epoch (stage 3 fail-safe): the numbering epoch the parity belongs to — 16 hex digits (the epoch a calibration
-    // measured in; runtime.fald_vblank_status), "current" (the live map's epoch now; the default whenever parity is set
-    // without one), "any" (apply whatever the numbering: manual A/B, never for daily use) or "none"
+    // measured in; runtime.fald_vblank_status), "current" (the live map's epoch now), "any" (apply whatever the numbering:
+    // manual A/B, never for daily use) or "none". A parity set WITHOUT one binds NONE: a parity is never activated
+    // implicitly (review 2026-10-05: a settings restore carrying a stale parity would otherwise bind it to a live epoch in
+    // which it was never measured)
     if (pe && !hasPe) { error = "parity_epoch must be a string: 16 hex digits, \"current\", \"any\" or \"none\""; return; }
-    std::string peText = hasPe ? pe->str : (isNum(pa) ? std::string("current") : std::string());
+    std::string peText = hasPe ? pe->str : (isNum(pa) ? std::string("none") : std::string());
     unsigned long long peValue = FALD_PARITY_EPOCH_NONE;
     DwmHookVBlankMap live{};
     const bool liveOk = LiveVBlankMap(mon, live);                // (inject lock only: before the settings lock)
@@ -1746,6 +1748,9 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
                 error = "parity_epoch must be 16 hex digits, \"current\", \"any\" or \"none\""; return;
             }
             peValue = std::strtoull(peText.c_str(), nullptr, 16);
+            if (peValue == FALD_PARITY_EPOCH_NONE || peValue == FALD_PARITY_EPOCH_ANY) {   // no hex aliases of the keywords
+                error = "parity_epoch 0000000000000000 / ffffffffffffffff are reserved: say \"none\" or \"any\""; return;
+            }
         }
     }
     if (isNum(tm) && !(tm->num == 0 || tm->num == 1 || tm->num == 2 || tm->num == 3)) { error = "temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)"; return; }
@@ -1777,9 +1782,12 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("delay_frames", JNum((double)delay));
     result.set("closure", JNum((double)closure));
     result.set("parity", JNum((double)parity));
+    // the host's binding AFTER this call took effect (its mode change may stop / start the publisher): re-read the live map
+    DwmHookVBlankMap after{};
+    const bool afterOk = LiveVBlankMap(mon, after);
     result.set("parity_epoch", JStr(ParityEpochText(peValue)));
-    result.set("live_epoch", JStr(liveOk ? ParityEpochText(live.epochId) : std::string("none")));
-    result.set("parity_active", JBool(ParityActive(parity, peValue, liveOk, live.epochId)));
+    result.set("live_epoch", JStr(afterOk ? ParityEpochText(after.epochId) : std::string("none")));
+    result.set("parity_active", JBool(ParityActive(parity, peValue, afterOk, after.epochId)));
     // mode 3 settles in refreshes (independent of the rate); the first-order modes in frames at 60 Hz
     result.set("settle_frames_60hz", JNum((double)(mode == FALD_TEMPORAL_PANEL ? FaldPanelClockSettleFrames(closure)
                                                                                : FaldSettleFrames(rise, fall, 1000.0f / 60.0f, delay))));
