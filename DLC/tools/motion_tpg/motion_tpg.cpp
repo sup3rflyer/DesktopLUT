@@ -437,6 +437,7 @@ int main(int argc, char** argv) {
     if (FAILED(hr)) return fail("CreateSwapChainForHwnd", hr);
     factory->MakeWindowAssociation(g_hwnd, DXGI_MWA_NO_ALT_ENTER);
     ComPtr<IDXGISwapChain3> sc; sc1.As(&sc);
+    ComPtr<IDXGISwapChainMedia> media; sc1.As(&media);   // CompositionMode per frame (composed / overlay / independent flip)
     hr = sc->SetColorSpace1(a.hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
     if (FAILED(hr)) return fail("SetColorSpace1", hr);
     {   // at most one frame queued (the vblank wait paces; no waitable object whose count could drift on a timeout)
@@ -504,9 +505,11 @@ int main(int argc, char** argv) {
     std::string statsPath = a.log + ".stats.csv";
     FILE* statf = nullptr;
     if (fopen_s(&statf, statsPath.c_str(), "w") != 0 || !statf) { reply("fatal cannot open the stats log"); return 2; }
-    fprintf(statf, "qpc,st_present_count,st_present_refresh,st_sync_refresh,st_sync_qpc\n");
+    fprintf(statf, "qpc,st_present_count,st_present_refresh,st_sync_refresh,st_sync_qpc,st_comp_mode\n");
     UINT lastSeenCount = 0xFFFFFFFFu;
-    struct StatRow { long long qpc; UINT pc, pr, sr; long long sq; };
+    // st_comp_mode: DXGI_FRAME_PRESENTATION_MODE of the frame (0 composed by DWM, 1 overlay plane, 2 none / independent
+    // flip, 3 composition failure; -1 = not reported): whether DWM (and so a DWM hook) ever sees the frames
+    struct StatRow { long long qpc; UINT pc, pr, sr; long long sq; int mode; };
     std::vector<StatRow> stats; stats.reserve(1 << 16);
     // own vblank index (arbitrary origin): +1 per WaitForVBlank return, corrected by the QPC gap when a wake came late
     // (period = median of single-step gaps); and its offset to DXGI PresentRefreshCount, learned from every present that
@@ -542,7 +545,16 @@ int main(int argc, char** argv) {
     };
     auto pollStats = [&]() {
         DXGI_FRAME_STATISTICS st{};
-        if (FAILED(sc->GetFrameStatistics(&st)) || st.PresentCount == 0 || st.PresentCount == lastSeenCount) return;
+        int compMode = -1;
+        DXGI_FRAME_STATISTICS_MEDIA sm{};
+        if (media && SUCCEEDED(media->GetFrameStatisticsMedia(&sm))) {
+            st.PresentCount = sm.PresentCount; st.PresentRefreshCount = sm.PresentRefreshCount;
+            st.SyncRefreshCount = sm.SyncRefreshCount; st.SyncQPCTime = sm.SyncQPCTime; st.SyncGPUTime = sm.SyncGPUTime;
+            compMode = (int)sm.CompositionMode;
+        } else if (FAILED(sc->GetFrameStatistics(&st))) {
+            return;
+        }
+        if (st.PresentCount == 0 || st.PresentCount == lastSeenCount) return;
         lastSeenCount = st.PresentCount;
         const Sub& sb = submitN[st.PresentCount % submitN.size()];
         if (sb.pc == st.PresentCount) {
@@ -552,10 +564,10 @@ int main(int argc, char** argv) {
             offsetMed = c[c.size() / 2]; offsetValid = offHist.size() >= 5;
         }
         LARGE_INTEGER t; QueryPerformanceCounter(&t);
-        stats.push_back({t.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount, st.SyncQPCTime.QuadPart});
+        stats.push_back({t.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount, st.SyncQPCTime.QuadPart, compMode});
     };
     auto flushStats = [&]() {
-        for (const StatRow& r : stats) fprintf(statf, "%lld,%u,%u,%u,%lld\n", r.qpc, r.pc, r.pr, r.sr, r.sq);
+        for (const StatRow& r : stats) fprintf(statf, "%lld,%u,%u,%u,%lld,%d\n", r.qpc, r.pc, r.pr, r.sr, r.sq, r.mode);
         fflush(statf);
         stats.clear();
         for (const DwmRow& r : dwmRows)
