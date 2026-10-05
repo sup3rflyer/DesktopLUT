@@ -158,10 +158,22 @@ const char* FaldClockSourceName(unsigned int source);   // "grid" / "abs" / "swi
 // The host side of the map (DesktopLUT.exe's publisher thread, src/dwm_inject.cpp) — pure bookkeeping on QPC times, no
 // Windows calls, so every rule is unit-tested:
 //  * Wake(qpc) at every return of the TARGET output's vblank wait: phase, period and the count. A wake is numbered by the
-//    phase model, steps = floor((t - vblank instant of the previous index) / period + 0.25) (the wake latency is
-//    one-sided and below 3/4 of a period): a missed wake (a late thread) is repaired, a second wake inside one refresh is
-//    ignored, a gap longer than FALD_VBLANK_MAX_GAP refreshes (FALD_VBLANK_MAX_GAP_FIT once the period is fitted and a map
-//    was published) restarts the model, the numbering continued by the elapsed time in a new epoch. The vblank instant of
+//    phase model, steps = floor((t - vblank instant of the previous index) / period + e). The wake latency is one-sided,
+//    so the split between "late" and "early" belongs just below the FASTEST wakes: e = the model vblank's height above
+//    the latency floor — (k + 1) order-statistic spacings for the k-th smallest, the spacing measured ABOVE it (so an early
+//    stray cannot inflate it) — plus FALD_VBLANK_EARLY_MARGIN, clamped to [FALD_VBLANK_EARLY_TOLERANCE,
+//    FALD_VBLANK_EARLY_TOLERANCE_MAX]. (Too small an e drops the fastest genuine wakes as "spurious"; the ring then loses
+//    its fastest samples and the model vblank drifts LATE — a positive feedback.) Tight latency
+//    (the rig: max 0.011 period, 2026-10-04) gives 0.05 — a wake keeps its refresh up to 0.95 of a period late (review
+//    2026-10-04: a fixed + 0.25 numbered wakes 0.75 - 1.0 late as the NEXT vblank, projected up to 1/4 period early, and
+//    three of them in the ring became the anchor); latency spread over 0.6 period gives ~0.07 (a fixed 0.05 dropped the
+//    fastest genuine wakes as spurious there). A missed wake (a late thread) is
+//    repaired, a second wake inside one refresh is ignored. A GAP is counted through only as far as the period is known:
+//    s x u <= FALD_VBLANK_GAP_BUDGET, u = the chain line's period uncertainty once the period is fitted on a chain
+//    (lineBound below), else FALD_VBLANK_NOMINAL_TOLERANCE — FaldVBlankTrackerMaxGap; a longer gap restarts the model,
+//    the numbering continued by the elapsed time in a new epoch (review 2026-10-04: a +258 ppm fit bias from a 1.5-ms
+//    step of the wake-latency floor, accepted by the 1000-ppm check, counted a 60-s gap one short and the chain could not
+//    see it: its line extrapolated with the same slope). The vblank instant of
 //    an index = a low quantile of the recent wakes projected onto it (the latency is one-sided). Period: the median of the
 //    recent single-step gaps (robust; the gap repair uses it), refined once phase points span FALD_VBLANK_FIT_MIN
 //    refreshes by a least-squares fit over them (the median is only good to a few us per refresh; the fit to well below
@@ -188,8 +200,14 @@ constexpr unsigned int FALD_VBLANK_MIN_WAKES = 16;
 constexpr unsigned int FALD_VBLANK_MIN_GAPS = 8;
 constexpr unsigned int FALD_VBLANK_MODEL_MIN_WAKES = 4;   // wakes before the phase model numbers wakes (nominal period)
 constexpr unsigned int FALD_VBLANK_FIT_MIN = 120;        // refreshes the phase points must span before the fit is used
-constexpr unsigned int FALD_VBLANK_MAX_GAP = 240;        // more refreshes between two wakes: start over ...
-constexpr unsigned int FALD_VBLANK_MAX_GAP_FIT = 7200;   // ... with a fitted period on a chain (fit error x gap << 1/4)
+constexpr unsigned int FALD_VBLANK_MAX_GAP = 240;        // refreshes ever counted through without a fitted chain ...
+constexpr unsigned int FALD_VBLANK_MAX_GAP_FIT = 7200;   // ... and with one (both then capped by the gap budget)
+constexpr double FALD_VBLANK_EARLY_TOLERANCE = 0.05;     // the numbering's early tolerance e: at least this ...
+constexpr double FALD_VBLANK_EARLY_TOLERANCE_MAX = 0.25; // ... at most this (periods) ...
+constexpr double FALD_VBLANK_EARLY_MARGIN = 0.05;        // ... = (model vblank's height above the floor) + this
+constexpr double FALD_VBLANK_GAP_BUDGET = 0.05;          // phase error a counted-through gap may accumulate (periods)
+constexpr double FALD_VBLANK_LINE_BOUND_K = 4.0;         // line slope uncertainty = K max|residual| / span (worst case: 3)
+constexpr double FALD_VBLANK_DRIFT_FLOOR = 2.0e-5;       // ... at least this (unmodelled latency-floor drift: 20 ppm)
 constexpr double FALD_VBLANK_NOMINAL_TOLERANCE = 0.001;  // fitted period vs the nominal one (relative)
 constexpr double FALD_VBLANK_FIT_MEDIAN_TOLERANCE = 0.01;   // fit vs the median of the gaps (a sanity bound)
 constexpr double FALD_VBLANK_PHASE_TOLERANCE = 0.1;      // chain residual off a whole number of periods (periods)
@@ -204,6 +222,9 @@ struct FaldVBlankTracker {
     double medianPeriodQpc = 0.0;             // median of the single-step gaps (0 until FALD_VBLANK_MIN_GAPS)
     double periodQpc = 0.0;                   // the period in use: fit / median / nominal
     bool periodFit = false;                   // periodQpc is the phase-point fit (required for a map)
+    double fitPeriodQpc = 0.0;                // the last fit candidate, accepted or not (log)
+    double lineBound = 0.0;                   // the chain line's period uncertainty, periods per refresh (0 = no fit):
+                                              // max(K max|residual| / span, FALD_VBLANK_DRIFT_FLOOR) — the gap gate
     bool haveWake = false;
     long long lastWakeQpc = 0;
     unsigned long long v = 0;                 // vblank index of the last accepted wake = THE COUNT (origin: Reset's)
@@ -237,7 +258,7 @@ struct FaldVBlankTracker {
     unsigned long long dwmLastCount = 0;      // the last cRefresh / qpcRefreshPeriod seen (log)
     double dwmLastPeriodQpc = 0.0;
     // statistics (host log; the bench reads them)
-    unsigned long long wakes = 0, missed = 0, spurious = 0, lateWakes = 0, restarts = 0;
+    unsigned long long wakes = 0, missed = 0, spurious = 0, lateWakes = 0, restarts = 0;   // (restarts: gaps)
     unsigned long long published = 0, slipsRepaired = 0, phaseJumps = 0, rebases = 0, recentLate = 0, dwmSamples = 0;
 };
 // A fresh tracker whose first wake gets index firstIndex (the publisher continues its numbering across re-binds).
@@ -247,14 +268,37 @@ void FaldVBlankTrackerReset(FaldVBlankTracker* t, double nominalPeriodQpc, unsig
 unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc);
 // The vblank instant of index v from the phase model; false before FALD_VBLANK_MODEL_MIN_WAKES wakes / without a period.
 bool FaldVBlankTrackerVBlankQpc(const FaldVBlankTracker* t, unsigned long long v, long long* qpc);
+// The numbering's early tolerance now (periods; rules above). FALD_VBLANK_EARLY_TOLERANCE without a model.
+double FaldVBlankTrackerEarlyTolerance(const FaldVBlankTracker* t);
+// The longest gap (refreshes between two accepted wakes) counted through now: min(cap, FALD_VBLANK_GAP_BUDGET / u) with
+// u = lineBound and cap FALD_VBLANK_MAX_GAP_FIT once the period is fitted on a chain, else u =
+// FALD_VBLANK_NOMINAL_TOLERANCE and cap FALD_VBLANK_MAX_GAP. A longer gap restarts the model in a new epoch.
+unsigned int FaldVBlankTrackerMaxGap(const FaldVBlankTracker* t);
 // One publish attempt (the chain above). True = *out is a map to publish; false = withhold / withdraw.
 bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out);
 // DWM's composition timing at nowQpc (qpcVBlank, cRefresh, qpcRefreshPeriod of DWM_TIMING_INFO): diagnostics only.
 void FaldVBlankTrackerDwmSample(FaldVBlankTracker* t, long long nowQpc, long long qpcVBlank, unsigned long long cRefresh,
                                 double qpcRefreshPeriod);
-// The publisher's spin guard: a vblank wait that returned less than a quarter period after the previous return did not
-// wait for a vblank (monitor asleep, output gone): it is not fed to the tracker, and the thread sleeps a period instead.
-bool FaldVBlankWaitTooSoon(long long prevReturnQpc, long long returnQpc, double periodQpc);
+// The publisher's spin guard, judging every vblank wait by ITS OWN duration (call start -> return; as Chromium's
+// VSyncThreadWin): under FALD_VBLANK_MIN_WAIT_MS it did not wait for a vblank (monitor asleep, output gone) — not fed
+// to the tracker, the thread sleeps a period; FALD_VBLANK_SPIN_LIMIT of them in a row = ASLEEP (withdraw the map,
+// re-bind). A legitimately short wait (the loop came back less than 1 ms before a vblank: it stalled ~a period) is only
+// a missed wake, which the next wake's numbering repairs. (Review 2026-10-04: the previous rule compared consecutive
+// RETURNS; the guard's own one-period sleep reset it, so the escalation never fired and ~56 fake wakes a second reached
+// the tracker while a display slept.)
+constexpr double FALD_VBLANK_MIN_WAIT_MS = 1.0;
+constexpr unsigned int FALD_VBLANK_SPIN_LIMIT = 30;
+enum FaldVBlankWaitVerdict : unsigned int {
+    FALD_VBLANK_WAIT_WAKE = 0,     // a real wait: feed the return to the tracker
+    FALD_VBLANK_WAIT_EARLY = 1,    // returned without waiting: skip it, sleep a period
+    FALD_VBLANK_WAIT_ASLEEP = 2,   // FALD_VBLANK_SPIN_LIMIT early returns in a row: withdraw, re-bind, back off
+};
+struct FaldVBlankSpinGuard {
+    unsigned int spins = 0;                   // early returns in a row
+    unsigned long long early = 0, asleep = 0; // statistics
+};
+FaldVBlankWaitVerdict FaldVBlankSpinGuardStep(FaldVBlankSpinGuard* g, long long waitStartQpc, long long returnQpc,
+                                              long long qpcFreq);
 // The publisher's periodic re-check of its output (every few seconds of TIME): re-bind (withdraw the map, find the
 // output at the monitor's position again, a new epoch) when the DXGI factory is stale, the output's description is
 // unreadable, it left the desktop or no longer starts at the monitor's position (a swap / layout change: the posTag

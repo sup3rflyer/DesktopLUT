@@ -1135,16 +1135,17 @@ static void StopFaldSettleKicker() {
 //    its drift against this output and whether it is this output's clock.
 // The hook treats a map older than FALD_VBLANK_MAP_MAX_AGE_MS (0.5 s) as stale; publishing every 8 refreshes (133 ms at
 // 60 Hz) leaves room for a few skipped publishes. A publish only TRY-locks g_dwmInjectMutex (an injection may hold it for
-// seconds; skipping one is harmless). Spin guard: a wait that returns less than a quarter period after the previous one
-// (monitor asleep, output gone) is not counted and the thread sleeps a period; a run of them withdraws the map and backs
-// off. Every FALD_VBLANK_RECHECK_MS of time the output is re-checked (factory current, still attached, still at the
+// seconds; skipping one is harmless). Spin guard (FaldVBlankSpinGuardStep): a wait shorter than 1 ms by its own clock
+// (monitor asleep, output gone) is not counted and the thread sleeps a period; FALD_VBLANK_SPIN_LIMIT in a row withdraw
+// the map and re-bind. Every FALD_VBLANK_RECHECK_MS of time the output is re-checked (factory current, still attached, still at the
 // monitor's position, same nominal period) and re-bound otherwise. Cost: one thread asleep in a kernel vblank wait plus
 // one DWM timing query every 8 refreshes; no window, no present, nothing shown on any display.
-// The count's origin is arbitrary (every publisher start / re-bind / tracker epoch is a new numbering epoch, logged): the
-// panel's parity bit relative to it is calibrated per epoch by the meter probe; parity -1 stays the default.
+// The count's origin is arbitrary (every publisher start / re-bind / tracker epoch is a new numbering epoch, logged with
+// its QPC time so a bench can split the hook's dump by epoch): the panel's parity bit relative to it is calibrated per
+// epoch by the meter probe; parity -1 stays the default. A re-bind continues the count from the elapsed time at a moment
+// that is not a wake (monotonic only; its parity is a new epoch's anyway).
 static const unsigned int FALD_VBLANK_PUBLISH_EVERY = 8;       // wakes between publishes (and DWM diagnostic reads)
 static const ULONGLONG FALD_VBLANK_RECHECK_MS = 4000;          // output / mode re-check interval (time, not wakes)
-static const unsigned int FALD_VBLANK_SPIN_LIMIT = 30;         // early returns in a row: output asleep, back off
 static const ULONGLONG FALD_VBLANK_STATS_MS = 60000;           // statistics line in the console log
 static const unsigned int FALD_VBLANK_LOG_TRANSITIONS = 32;    // published <-> withdrawn transitions logged one by one
 
@@ -1232,7 +1233,7 @@ static IDXGIOutput* FindDxgiOutputAt(int left, int top, IDXGIFactory1** factoryO
 static const wchar_t* VBlankWithheldReason(const FaldVBlankTracker& t) {
     if (t.wakeN < FALD_VBLANK_MIN_WAKES) return L"acquiring the vblank phase";
     if (t.held > 0u) return L"the vblank phase moved off the published numbering (withheld until it is stable)";
-    if (!t.periodFit) return L"refresh period not fitted yet (phase points span < 2 s), or the fit is off the nominal refresh by > 0.1 %";
+    if (!t.periodFit) return L"refresh period not fitted yet (phase points span < 2 s), or the fit is off the nominal refresh by > 0.1 % (see the statistics line)";
     if (!(t.nominalPeriodQpc > 0.0) || std::fabs(t.periodQpc / t.nominalPeriodQpc - 1.0) > FALD_VBLANK_NOMINAL_TOLERANCE)
         return L"fitted period off the nominal refresh by more than 0.1 %";
     return L"all recent wakes late against the model (the vblanks moved?)";
@@ -1252,10 +1253,11 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
     IDXGIFactory1* factory = nullptr;
     IDXGIOutput* out = nullptr;
     float nominalMs = 0.0f;
-    unsigned int sincePublish = 0, failures = 0, spins = 0, transitions = 0;
+    unsigned int sincePublish = 0, failures = 0, transitions = 0, epochLines = 0;
     unsigned long long binds = 0;              // output bindings so far (each one a numbering epoch)
+    unsigned long long loggedEpoch = 0;        // the tracker epoch last logged (within the current binding)
     bool published = false;                    // the slot holds a valid map (else nothing / withdrawn)
-    long long prevReturn = 0;                  // QPC of the previous vblank-wait return (the spin guard)
+    FaldVBlankSpinGuard guard;                 // judges every wait by its own duration
     ULONGLONG lastStatsMs = GetTickCount64(), lastCheckMs = GetTickCount64();
     auto releaseOutput = [&]() {
         if (out) { out->Release(); out = nullptr; }
@@ -1288,13 +1290,17 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
             }
             nominalMs = nm;
             FaldVBlankTrackerReset(&trk, (double)nominalMs * freq / 1000.0, first);
-            sincePublish = 0; prevReturn = 0; spins = 0;
+            sincePublish = 0; guard.spins = 0; loggedEpoch = 0;
             lastCheckMs = GetTickCount64();
             binds++;
+            LARGE_INTEGER bq;
+            QueryPerformanceCounter(&bq);
             std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): watching the output's vblanks, nominal "
-                       << nominalMs << L" ms, numbering epoch " << binds << L" from count " << first
-                       << L" (the panel's parity bit must be calibrated for this epoch)" << std::endl;
+                       << nominalMs << L" ms, numbering epoch " << binds << L".0 from count " << first << L" at QPC "
+                       << bq.QuadPart << L" (the panel's parity bit must be calibrated for this epoch)" << std::endl;
         }
+        LARGE_INTEGER waitStart;
+        QueryPerformanceCounter(&waitStart);
         const HRESULT hr = out->WaitForVBlank();
         LARGE_INTEGER ret;
         QueryPerformanceCounter(&ret);
@@ -1306,25 +1312,33 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
             continue;
         }
         failures = 0;
-        // spin guard: a return that did not wait for a vblank is not counted; this HIGHEST-priority thread sleeps instead
-        const double P = trk.periodQpc > 0.0 ? trk.periodQpc : (double)nominalMs * freq / 1000.0;
-        const bool tooSoon = FaldVBlankWaitTooSoon(prevReturn, ret.QuadPart, P);
-        prevReturn = ret.QuadPart;
-        if (tooSoon) {
-            if (++spins >= FALD_VBLANK_SPIN_LIMIT) {          // the output does not wait at all: asleep / gone
-                withdraw();
-                releaseOutput();
-                spins = 0;
-                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top
-                           << L"): vblank wait returns immediately (output asleep?) - map withdrawn, re-binding" << std::endl;
-                if (pauseFor(1000)) break;
-            } else if (pauseFor((DWORD)std::ceil(P * 1000.0 / freq))) {
-                break;
-            }
+        // spin guard: a wait judged by its own duration; a return that did not wait for a vblank is not counted and this
+        // HIGHEST-priority thread sleeps a period instead
+        const FaldVBlankWaitVerdict verdict = FaldVBlankSpinGuardStep(&guard, waitStart.QuadPart, ret.QuadPart, f.QuadPart);
+        if (verdict == FALD_VBLANK_WAIT_ASLEEP) {             // the output does not wait at all: asleep / gone
+            withdraw();
+            releaseOutput();
+            std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top
+                       << L"): vblank wait returns immediately (output asleep?) - map withdrawn, re-binding" << std::endl;
+            if (pauseFor(1000)) break;
             continue;
         }
-        spins = 0;
+        if (verdict == FALD_VBLANK_WAIT_EARLY) {
+            const double P = trk.periodQpc > 0.0 ? trk.periodQpc : (double)nominalMs * freq / 1000.0;
+            if (pauseFor((DWORD)std::ceil(P * 1000.0 / freq))) break;
+            continue;
+        }
         FaldVBlankTrackerWake(&trk, ret.QuadPart);
+        if (trk.epoch != loggedEpoch) {                       // a gap restart or a re-base: a new numbering epoch
+            loggedEpoch = trk.epoch;
+            if (epochLines < FALD_VBLANK_LOG_TRANSITIONS) {
+                epochLines++;
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): numbering epoch " << binds << L"."
+                           << trk.epoch << L" from count " << trk.v << L" at QPC " << ret.QuadPart
+                           << L" (restarts " << trk.restarts << L", re-bases " << trk.rebases
+                           << L"; the parity bit must be calibrated again)" << std::endl;
+            }
+        }
         // the output re-check, by TIME: a stale factory, a detached / moved output (a swap or layout change), a mode set
         const ULONGLONG tick = GetTickCount64();
         if (tick - lastCheckMs >= FALD_VBLANK_RECHECK_MS) {
@@ -1355,6 +1369,15 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
         }
         FaldVBlankMap m;
         const bool valid = FaldVBlankTrackerMap(&trk, &m);
+        if (trk.epoch != loggedEpoch) {                       // a re-base inside the publish attempt
+            loggedEpoch = trk.epoch;
+            if (epochLines < FALD_VBLANK_LOG_TRANSITIONS) {
+                epochLines++;
+                std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): numbering epoch " << binds << L"."
+                           << trk.epoch << L" from count " << trk.v << L" at QPC " << ret.QuadPart
+                           << L" (re-base of a moved vblank phase; the parity bit must be calibrated again)" << std::endl;
+            }
+        }
         const bool wasPublished = published;
         if (valid) { if (publish(&m)) published = true; }
         else withdraw();
@@ -1372,9 +1395,13 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
             lastStatsMs = tick;
             std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): " << (published ? L"published" : L"withdrawn")
                        << L", count " << trk.v << L" epoch " << binds << L"." << trk.epoch << L", period "
-                       << trk.periodQpc * 1000.0 / freq << L" ms (" << (trk.nominalPeriodQpc > 0.0 ? (trk.periodQpc / trk.nominalPeriodQpc - 1.0) * 1.0e6 : 0.0)
-                       << L" ppm vs nominal) | wakes " << trk.wakes << L" missed " << trk.missed << L" spurious " << trk.spurious
-                       << L" late " << trk.lateWakes << L" restarts " << trk.restarts << L" | publishes " << trk.published
+                       << trk.periodQpc * 1000.0 / freq << L" ms (" << (trk.periodFit ? L"fitted" : L"NOT fitted") << L"; fit "
+                       << (trk.nominalPeriodQpc > 0.0 && trk.fitPeriodQpc > 0.0 ? (trk.fitPeriodQpc / trk.nominalPeriodQpc - 1.0) * 1.0e6 : 0.0)
+                       << L" ppm vs nominal " << trk.nominalPeriodQpc * 1000.0 / freq << L" ms, accepted within "
+                       << FALD_VBLANK_NOMINAL_TOLERANCE * 1.0e6 << L"; line +-" << trk.lineBound * 1.0e6 << L" ppm -> gaps up to "
+                       << FaldVBlankTrackerMaxGap(&trk) << L" refreshes counted through) | wakes " << trk.wakes << L" missed "
+                       << trk.missed << L" spurious " << trk.spurious << L" late " << trk.lateWakes << L" early returns " << guard.early
+                       << L" asleep " << guard.asleep << L" restarts " << trk.restarts << L" | publishes " << trk.published
                        << L" slips repaired " << trk.slipsRepaired << L" phase jumps " << trk.phaseJumps << L" re-bases "
                        << trk.rebases << L" recent-late " << trk.recentLate << L" | DWM clock (diagnostic): " << VBlankDwmClockText(trk.dwmState) << L", drift "
                        << trk.dwmPpm << L" ppm, cRefresh " << trk.dwmLastCount << L", DWM period "

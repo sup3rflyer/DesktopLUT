@@ -782,6 +782,9 @@ struct PublisherSim {
     Vblanks vb;
     double dwmP, dwmV0;
     double latSpread = 3000.0;
+    double floorStep = 0.0;                                       // added to every wake's latency from wake floorStepAt on
+    long long floorStepAt = -1;
+    double heavyFrac = 0.0;                                       // this fraction of wakes 0.75 - 0.95 of a period late
     Lcg rng{ 2024u };
     FaldVBlankTracker trk;
     unsigned int sincePublish = 0;
@@ -791,20 +794,26 @@ struct PublisherSim {
     explicit PublisherSim(double nominalPeriodQpc = 166666.5, unsigned long long firstIndex = 0)
         : dwmP(vb.P), dwmV0(vb.v0) { FaldVBlankTrackerReset(&trk, nominalPeriodQpc, firstIndex); }
     long long wakeTime(long long i) {
-        return vb.at(i) + 300 + (long long)(0.5 * latSpread + rng.next(0.5 * latSpread)) + ((i % 37) == 36 ? 30000 : 0);
+        if (heavyFrac > 0.0 && 0.5 + 0.5 * rng.next(1.0) < heavyFrac) return vb.at(i) + (long long)((0.85 + rng.next(0.1)) * vb.P);
+        const double step = (floorStepAt >= 0 && i >= floorStepAt) ? floorStep : 0.0;
+        return vb.at(i) + 300 + (long long)(step + 0.5 * latSpread + rng.next(0.5 * latSpread)) + ((i % 37) == 36 ? 30000 : 0);
     }
     long long dwmVBlankBefore(long long t) const {
         return (long long)std::floor(dwmV0 + std::floor(((double)t - dwmV0) / dwmP) * dwmP);
     }
     // every published map must name the right vblank: its anchor sits just after a true vblank j, and within one numbering
     // epoch count - j is constant (the ORIGIN is arbitrary by design: it is fixed by the first publish of the epoch;
-    // `origin` = what it is expected to be, -1 = whatever the first publish says)
+    // `origin` = what the FIRST epoch's is expected to be, -1 = whatever its first publish says; a later epoch continues
+    // the count by the elapsed time, which may land one off — its own origin)
     long long origin = 0, offset = 0;
     unsigned long long offsetEpoch = ~0ull;
     void check(const FaldVBlankMap& m) {
         const long long j = (long long)std::floor(((double)m.qpcAnchor - vb.v0) / vb.P);
         const double late = (double)m.qpcAnchor - (vb.v0 + (double)j * vb.P);
-        if (offsetEpoch != trk.epoch) { offsetEpoch = trk.epoch; offset = m.countAnchor - j; if (origin >= 0 && offset != origin) wrongMaps++; }
+        if (offsetEpoch != trk.epoch) {
+            offsetEpoch = trk.epoch; offset = m.countAnchor - j;
+            if (origin >= 0 && trk.epoch == 0ull && offset != origin) wrongMaps++;
+        }
         if (m.countAnchor - j != offset || late < 0.0 || late > 0.25 * vb.P) wrongMaps++;
     }
     void wake(long long i) {
@@ -1184,13 +1193,103 @@ TEST_CASE("FALD stage 3: the vblank tracker - the continuity chain: slips repair
     }
 }
 
+TEST_CASE("FALD stage 3: the vblank tracker - a gap is counted through only as far as the period is known (review 2026-10-04)") {
+    // before a fitted chain: the nominal period's tolerance (1e-3) over the budget (0.05 period) = 50 refreshes
+    {
+        FaldVBlankTracker t;
+        FaldVBlankTrackerReset(&t, 166666.5, 0);
+        CHECK(FaldVBlankTrackerMaxGap(&t) == 50u);
+    }
+    // A: a clean chain: the line is sharp, the drift floor (20 ppm) rules -> 2500 refreshes; a 30-s gap is counted through
+    // with the exact count, in the same epoch
+    {
+        PublisherSim s;
+        for (long long i = 0; i < 2400; i++) s.wake(i);
+        REQUIRE(s.valid);
+        CHECK(s.trk.lineBound < 1.5 * FALD_VBLANK_DRIFT_FLOOR);
+        CHECK(FaldVBlankTrackerMaxGap(&s.trk) <= 2500u); CHECK(FaldVBlankTrackerMaxGap(&s.trk) > 1801u);
+        for (long long i = 4200; i < 4600; i++) s.wake(i);       // 1801 refreshes after the last wake
+        REQUIRE(s.valid);
+        CHECK(s.trk.restarts == 0ull); CHECK(s.trk.epoch == 0ull);
+        CHECK(s.map.countAnchor == s.mapWakeIndex); CHECK(s.wrongMaps == 0);
+    }
+    // B: the review's failure: the wake-latency floor steps up by 1.5 ms (and 1.0 ms) 4 s before a 60-s (90-s) gap. The
+    // step sits inside the chain tolerance, tilts the fitted line by a few hundred ppm, and the old 1000-ppm acceptance
+    // counted the gap through one short — on the chain's own line, so nothing saw it. Now the line's residuals widen its
+    // bound, the gap exceeds the budget: a restart in a NEW epoch, and no published map is ever off within an epoch.
+    const double steps[] = { 15000.0, 10000.0 };
+    const long long gaps[] = { 3600, 5400 };
+    for (int c = 0; c < 2; c++)
+        for (uint32_t seed = 1; seed <= 8; seed++) {
+            PublisherSim s;
+            s.rng = Lcg(seed);
+            s.floorStep = steps[c]; s.floorStepAt = 2400;
+            for (long long i = 0; i < 2640; i++) s.wake(i);
+            REQUIRE(s.valid);
+            CAPTURE(c); CAPTURE(seed); CAPTURE(s.trk.lineBound);
+            CHECK(FaldVBlankTrackerMaxGap(&s.trk) < (unsigned int)gaps[c]);
+            for (long long i = 2640 + gaps[c]; i < 2640 + gaps[c] + 1200; i++) s.wake(i);
+            CHECK(s.trk.restarts == 1ull); CHECK(s.trk.epoch == 1ull);
+            CHECK(s.wrongMaps == 0);
+            REQUIRE(s.valid);
+            CHECK(s.map.countAnchor > (long long)(2640 + gaps[c]) - 2);   // monotonic, continued by the elapsed time
+        }
+}
+
+TEST_CASE("FALD stage 3: the vblank tracker - very late wakes never pull the anchor early (review 2026-10-04)") {
+    // 2 % / 10 % of the wakes 0.75 - 0.95 of a period late (a starved thread) on a tight latency floor: with a fixed
+    // floor(x + 0.25) such wakes were numbered as the NEXT vblank, projected up to 1/4 period early, and became the anchor
+    // (2 %: 137 of 8403 maps off; 10 %: most). The adaptive early tolerance is 0.05 here: every published map names the
+    // right vblank, at or after it. (A QUARTER of the wakes that late is ambiguous from wake times alone — "most wakes
+    // prompt, some 0.85 late" vs "the vblank at the late cluster, most wakes 0.15 late": the count stays right but the
+    // anchor may sit on the late cluster; an absolute phase source — the scanline — would settle it.)
+    const double fracs[] = { 0.02, 0.10 };
+    for (double f : fracs) {
+        long long wrong = 0, pubs = 0;
+        for (uint32_t seed = 1; seed <= 6; seed++) {
+            PublisherSim s;
+            s.rng = Lcg(seed);
+            s.heavyFrac = f;
+            s.origin = -1;
+            for (long long i = 0; i < 3000; i++) s.wake(i);
+            wrong += s.wrongMaps; pubs += s.publishes;
+        }
+        CAPTURE(f);
+        CHECK(wrong == 0);
+        CHECK(pubs > 6 * 150);
+    }
+}
+
 TEST_CASE("FALD stage 3: the publisher's spin guard, output re-check and the ReleaseClock re-seed") {
-    const double P = 166666.5;
-    CHECK_FALSE(FaldVBlankWaitTooSoon(0, 5000, P));               // the first return
-    CHECK(FaldVBlankWaitTooSoon(1000000, 1000000 + 30000, P));     // 3 ms after the previous: it did not wait
-    CHECK_FALSE(FaldVBlankWaitTooSoon(1000000, 1000000 + 50000, P));
-    CHECK_FALSE(FaldVBlankWaitTooSoon(1000000, 1000000 + 166000, P));
-    CHECK_FALSE(FaldVBlankWaitTooSoon(1000000, 1000010, 0.0));      // no period: no guard
+    // the guard judges every wait by ITS OWN duration (call -> return), 1 ms the line
+    {
+        const long long f = 10000000;
+        FaldVBlankSpinGuard g;
+        CHECK(FaldVBlankSpinGuardStep(&g, 1000000, 1000000 + 166000, f) == FALD_VBLANK_WAIT_WAKE);   // a 16.6-ms wait
+        CHECK(FaldVBlankSpinGuardStep(&g, 1000000, 1000000 + 10000, f) == FALD_VBLANK_WAIT_WAKE);    // 1.0 ms: waited
+        CHECK(FaldVBlankSpinGuardStep(&g, 1000000, 1000000 + 9999, f) == FALD_VBLANK_WAIT_EARLY);
+        CHECK(g.spins == 1u);
+        CHECK(FaldVBlankSpinGuardStep(&g, 2000000, 2000000 + 120000, f) == FALD_VBLANK_WAIT_WAKE);   // a real wait resets
+        CHECK(g.spins == 0u);
+        CHECK(FaldVBlankSpinGuardStep(&g, 3000000, 3000010, 0) == FALD_VBLANK_WAIT_WAKE);            // no clock: no guard
+    }
+    // the LOOP's pattern with a sleeping output (review 2026-10-04: the old rule compared consecutive returns, and the
+    // guard's own one-period sleep reset it — the escalation never fired, ~56 fake wakes a second reached the tracker):
+    // every wait returns within 50 us, the loop sleeps a period after each; the 30th in a row is ASLEEP, none is a wake
+    {
+        const long long f = 10000000;
+        FaldVBlankSpinGuard g;
+        long long now = 5000000, wakes = 0, asleepAt = -1;
+        for (int k = 0; k < 75; k++) {
+            const long long ret = now + 20 + (k * 7) % 30;
+            const FaldVBlankWaitVerdict v = FaldVBlankSpinGuardStep(&g, now, ret, f);
+            if (v == FALD_VBLANK_WAIT_WAKE) wakes++;
+            if (v == FALD_VBLANK_WAIT_ASLEEP && asleepAt < 0) asleepAt = k;
+            now = ret + (v == FALD_VBLANK_WAIT_ASLEEP ? 10000000 : 166667);   // the loop: a period's sleep / 1 s back-off
+        }
+        CHECK(wakes == 0); CHECK(asleepAt == (long long)FALD_VBLANK_SPIN_LIMIT - 1);
+        CHECK(g.asleep == 2ull); CHECK(g.early == 75ull);
+    }
     // a storm of immediate returns reaching the tracker anyway is never counted, and the count carries on afterwards
     {
         PublisherSim s;

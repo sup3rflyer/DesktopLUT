@@ -150,6 +150,7 @@ static void VBlankPushWake(FaldVBlankTracker* t, long long qpc) {
 // it would scramble the numbering; the nominal rational is within ~1e-3 of any real display.) Only a fitted period is
 // published (FaldVBlankTrackerMap): the nominal one's error, extrapolated by the hook, could cost a millisecond.
 static void VBlankUpdatePeriod(FaldVBlankTracker* t, double fitPeriodQpc) {
+    t->fitPeriodQpc = fitPeriodQpc > 0.0 ? fitPeriodQpc : 0.0;
     double p = t->nominalPeriodQpc;
     if (!(p > 0.0) && t->medianPeriodQpc > 0.0) p = t->medianPeriodQpc;
     if (!(fitPeriodQpc > 0.0)) t->periodFit = false;
@@ -161,42 +162,64 @@ static void VBlankUpdatePeriod(FaldVBlankTracker* t, double fitPeriodQpc) {
     if (t->periodFit) p = fitPeriodQpc;
     t->periodQpc = p;
 }
-static double VBlankFitPeriod(const FaldVBlankTracker* t) {
+// The least-squares line through the phase points (index -> QPC, relative to the first point's time q0 and to the lowest
+// index vMin): the period fit, the chain's reference line and its uncertainty all come from it. ok = >= 3 points over
+// more than one index.
+struct VBlankLine {
+    bool ok = false;
+    unsigned long long vMin = 0, vMax = 0;
+    long long q0 = 0;
+    double mx = 0.0, my = 0.0, slope = 0.0;
+};
+static VBlankLine VBlankLineFit(const FaldVBlankTracker* t) {
+    VBlankLine L;
     const unsigned int n = t->phaseN;
-    if (n < 3u) return 0.0;
-    unsigned long long vMin = t->phaseV[0], vMax = t->phaseV[0];
-    for (unsigned int i = 1; i < n; i++) { vMin = t->phaseV[i] < vMin ? t->phaseV[i] : vMin; vMax = t->phaseV[i] > vMax ? t->phaseV[i] : vMax; }
-    if (vMax - vMin < (unsigned long long)FALD_VBLANK_FIT_MIN) return 0.0;
-    const long long q0 = t->phaseQpc[0];
-    double mx = 0.0, my = 0.0;
-    for (unsigned int i = 0; i < n; i++) { mx += (double)(t->phaseV[i] - vMin); my += (double)(t->phaseQpc[i] - q0); }
-    mx /= (double)n; my /= (double)n;
+    if (n < 3u) return L;
+    L.vMin = t->phaseV[0]; L.vMax = t->phaseV[0];
+    for (unsigned int i = 1; i < n; i++) { L.vMin = t->phaseV[i] < L.vMin ? t->phaseV[i] : L.vMin; L.vMax = t->phaseV[i] > L.vMax ? t->phaseV[i] : L.vMax; }
+    L.q0 = t->phaseQpc[0];
+    for (unsigned int i = 0; i < n; i++) { L.mx += (double)(t->phaseV[i] - L.vMin); L.my += (double)(t->phaseQpc[i] - L.q0); }
+    L.mx /= (double)n; L.my /= (double)n;
     double sxy = 0.0, sxx = 0.0;
     for (unsigned int i = 0; i < n; i++) {
-        const double dx = (double)(t->phaseV[i] - vMin) - mx, dy = (double)(t->phaseQpc[i] - q0) - my;
+        const double dx = (double)(t->phaseV[i] - L.vMin) - L.mx, dy = (double)(t->phaseQpc[i] - L.q0) - L.my;
         sxy += dx * dy; sxx += dx * dx;
     }
-    return sxx > 0.0 ? sxy / sxx : 0.0;
+    if (!(sxx > 0.0)) return L;
+    L.slope = sxy / sxx; L.ok = true;
+    return L;
 }
-// The chain's reference line at index v: the least-squares line through the phase points (as VBlankFitPeriod), its
-// value relative to t->lineBase (set here: the first phase point's time) in QPC ticks. False without >= 3 points.
-static bool VBlankLineAt(FaldVBlankTracker* t, unsigned long long v, double* rel) {
-    const unsigned int n = t->phaseN;
-    if (n < 3u) return false;
-    unsigned long long vMin = t->phaseV[0];
-    for (unsigned int i = 1; i < n; i++) vMin = t->phaseV[i] < vMin ? t->phaseV[i] : vMin;
-    const long long q0 = t->phaseQpc[0];
-    double mx = 0.0, my = 0.0;
-    for (unsigned int i = 0; i < n; i++) { mx += (double)(t->phaseV[i] - vMin); my += (double)(t->phaseQpc[i] - q0); }
-    mx /= (double)n; my /= (double)n;
-    double sxy = 0.0, sxx = 0.0;
-    for (unsigned int i = 0; i < n; i++) {
-        const double dx = (double)(t->phaseV[i] - vMin) - mx, dy = (double)(t->phaseQpc[i] - q0) - my;
-        sxy += dx * dy; sxx += dx * dx;
+static double VBlankFitPeriod(const VBlankLine& L) {
+    return (L.ok && L.vMax - L.vMin >= (unsigned long long)FALD_VBLANK_FIT_MIN) ? L.slope : 0.0;
+}
+// How far the line may be trusted to extrapolate, in periods per refresh: a disturbance of the phase points bounded by A
+// (from the true line) tilts a least-squares line by at most 3 A / span (+-A split at the middle; a step of the
+// wake-latency floor is that case); A is estimated by the largest residual, with margin K = 4, and never below
+// FALD_VBLANK_DRIFT_FLOOR (a slow drift of the latency floor leaves no residual at all). 0 = no usable line.
+static double VBlankLineBound(const FaldVBlankTracker* t, const VBlankLine& L) {
+    if (!L.ok || !(t->periodQpc > 0.0) || L.vMax <= L.vMin) return 0.0;
+    double maxRes = 0.0;
+    for (unsigned int i = 0; i < t->phaseN; i++) {
+        const double x = (double)(t->phaseV[i] - L.vMin) - L.mx, y = (double)(t->phaseQpc[i] - L.q0) - L.my;
+        const double r = std::fabs(y - L.slope * x);
+        if (r > maxRes) maxRes = r;
     }
-    if (!(sxx > 0.0)) return false;
-    t->lineBase = q0;
-    *rel = my + sxy / sxx * ((double)(long long)(v - vMin) - mx);
+    const double u = FALD_VBLANK_LINE_BOUND_K * (maxRes / t->periodQpc) / (double)(L.vMax - L.vMin);
+    return u > FALD_VBLANK_DRIFT_FLOOR ? u : FALD_VBLANK_DRIFT_FLOOR;
+}
+// Re-fit the period on the phase points, and the line's uncertainty for the fitted period.
+static void VBlankRefit(FaldVBlankTracker* t) {
+    const VBlankLine L = VBlankLineFit(t);
+    VBlankUpdatePeriod(t, VBlankFitPeriod(L));
+    t->lineBound = t->periodFit ? VBlankLineBound(t, L) : 0.0;
+}
+// The chain's reference line at index v, its value relative to t->lineBase (set here: the first phase point's time) in
+// QPC ticks. False without a line.
+static bool VBlankLineAt(FaldVBlankTracker* t, unsigned long long v, double* rel) {
+    const VBlankLine L = VBlankLineFit(t);
+    if (!L.ok) return false;
+    t->lineBase = L.q0;
+    *rel = L.my + L.slope * ((double)(long long)(v - L.vMin) - L.mx);
     return true;
 }
 static void VBlankPushPhase(FaldVBlankTracker* t, long long a) {
@@ -205,14 +228,18 @@ static void VBlankPushPhase(FaldVBlankTracker* t, long long a) {
     t->phaseQpc[t->phaseHead] = a; t->phaseV[t->phaseHead] = t->v;
     t->phaseHead = (t->phaseHead + 1u) % FALD_VBLANK_PHASE_RING;
     if (t->phaseN < FALD_VBLANK_PHASE_RING) t->phaseN++;
-    VBlankUpdatePeriod(t, VBlankFitPeriod(t));
+    VBlankRefit(t);
 }
 // Give index newV to the vblank at time a and renumber every ring entry FROM ITS TIME (wakes: their refresh, the latency
-// one-sided below 3/4 of a period; phase points: the nearest index). The count then follows time again.
+// one-sided: the early tolerance as in Wake, taken before the renumbering; phase points: the nearest index). The count
+// then follows time again.
+static double VBlankEarlyNow(const FaldVBlankTracker* t);
+static bool VBlankModelAt(const FaldVBlankTracker* t, unsigned long long v, long long* qpc, double* early);
 static void VBlankRenumber(FaldVBlankTracker* t, unsigned long long newV, long long a) {
     const double P = t->periodQpc;
+    const double early = VBlankEarlyNow(t);
     for (unsigned int i = 0; i < t->wakeN; i++)
-        t->wakeV[i] = newV + (unsigned long long)(long long)std::floor((double)(t->wakeQpc[i] - a) / P + 0.25);
+        t->wakeV[i] = newV + (unsigned long long)(long long)std::floor((double)(t->wakeQpc[i] - a) / P + early);
     for (unsigned int i = 0; i < t->phaseN; i++)
         t->phaseV[i] = newV + (unsigned long long)(long long)std::llround((double)(t->phaseQpc[i] - a) / P);
     t->v = newV;
@@ -226,17 +253,19 @@ unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc) {
     }
     const double P = t->periodQpc;
     if (!(P > 0.0)) { t->lastWakeQpc = qpc; return 0; }        // no period at all: nothing can be numbered
-    // Number the wake against the model's vblank instant of the previous index (the latency is one-sided: floor(x + 1/4)
-    // takes a wake up to 3/4 of a period late); until the model exists, against the previous wake (symmetric: round).
+    // Number the wake against the model's vblank instant of the previous index (the latency is one-sided: floor(x + e),
+    // e the early tolerance — 0.05 under tight latency: a wake up to 0.95 of a period late keeps its refresh); until the
+    // model exists, against the previous wake (symmetric: round).
     long long ref = t->lastWakeQpc;
-    const bool model = FaldVBlankTrackerVBlankQpc(t, t->v, &ref);
+    double early = FALD_VBLANK_EARLY_TOLERANCE;
+    const bool model = VBlankModelAt(t, t->v, &ref, &early);
     const double x = (double)(qpc - ref) / P;
-    const double s = std::floor(x + (model ? 0.25 : 0.5));
+    const double s = std::floor(x + (model ? early : 0.5));
     if (s < 1.0) { t->spurious++; return 0; }                  // a second wake inside the same refresh
-    const unsigned int maxGap = (t->periodFit && t->haveRef) ? FALD_VBLANK_MAX_GAP_FIT : FALD_VBLANK_MAX_GAP;
-    if (s > (double)maxGap) {
-        // The thread was gone too long to count the refreshes reliably: start the model over, the count continued by the
-        // elapsed time (monotonic) in a new epoch — its parity relative to the panel is no longer guaranteed.
+    if (s > (double)FaldVBlankTrackerMaxGap(t)) {
+        // The thread was gone longer than the period is known for (the gap budget): start the model over, the count
+        // continued by the elapsed time (monotonic) in a new epoch; its parity relative to the panel is no longer
+        // guaranteed.
         const double el = (double)(qpc - t->lastWakeQpc) / P;
         const unsigned long long next = t->v + (el >= 1.0 ? (unsigned long long)std::llround(el) : 1ull);
         t->restarts++; t->epoch++;
@@ -260,7 +289,7 @@ unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc) {
                 g[j] = key;
             }
             t->medianPeriodQpc = (t->gapN % 2u) ? g[t->gapN / 2] : 0.5 * (g[t->gapN / 2 - 1] + g[t->gapN / 2]);
-            VBlankUpdatePeriod(t, VBlankFitPeriod(t));
+            VBlankRefit(t);
         }
     } else {
         t->missed += steps - 1u;
@@ -269,10 +298,19 @@ unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc) {
     VBlankPushWake(t, qpc);
     return steps;
 }
-bool FaldVBlankTrackerVBlankQpc(const FaldVBlankTracker* t, unsigned long long v, long long* qpc) {
-    if (!t->haveWake || t->wakeN < FALD_VBLANK_MODEL_MIN_WAKES || !(t->periodQpc > 0.0) || !qpc) return false;
-    // every recent wake projected onto index v (relative to the last wake: small numbers); a low quantile = the wakes
-    // with the least latency (index n / 16: the 3rd smallest of a full ring — a stray early value or two cannot pull it)
+unsigned int FaldVBlankTrackerMaxGap(const FaldVBlankTracker* t) {
+    const bool chain = t->periodFit && t->haveRef && t->lineBound > 0.0;
+    const double u = chain ? t->lineBound : FALD_VBLANK_NOMINAL_TOLERANCE;
+    const double cap = chain ? (double)FALD_VBLANK_MAX_GAP_FIT : (double)FALD_VBLANK_MAX_GAP;
+    const double g = std::floor(FALD_VBLANK_GAP_BUDGET / u);
+    return (unsigned int)(g < 1.0 ? 1.0 : (g < cap ? g : cap));
+}
+// The phase model at index v: every recent wake projected onto v (relative to the last wake: small numbers), sorted. The
+// vblank instant = a low quantile, the wakes with the least latency (index n / 16: the 3rd smallest of a full ring — a
+// stray early value or two cannot pull it); the numbering's early tolerance = its estimated height above the latency
+// floor (+ margin, clamped: fald_temporal.h above FALD_VBLANK_WAKE_RING).
+static bool VBlankModelAt(const FaldVBlankTracker* t, unsigned long long v, long long* qpc, double* early) {
+    if (!t->haveWake || t->wakeN < FALD_VBLANK_MODEL_MIN_WAKES || !(t->periodQpc > 0.0)) return false;
     double d[FALD_VBLANK_WAKE_RING];
     const unsigned int n = t->wakeN;
     for (unsigned int i = 0; i < n; i++)
@@ -282,8 +320,27 @@ bool FaldVBlankTrackerVBlankQpc(const FaldVBlankTracker* t, unsigned long long v
         while (j > 0 && d[j - 1] > key) { d[j] = d[j - 1]; j--; }
         d[j] = key;
     }
-    *qpc = t->lastWakeQpc + (long long)std::llround(d[n / 16u]);
+    if (qpc) *qpc = t->lastWakeQpc + (long long)std::llround(d[n / 16u]);
+    if (early) {
+        // the anchor (k = n/16) sits ~ (k + 1) order-statistic spacings above the latency floor; the spacing is taken
+        // ABOVE it (d[n/8] - d[n/16] over n/8 - n/16 steps), where an early stray (a very late wake numbered as the next
+        // vblank) cannot inflate it
+        const unsigned int k = n / 16u, k2 = n / 8u;
+        const double spacing = k2 > k ? (d[k2] - d[k]) / (double)(k2 - k) : 0.0;
+        double e = (double)(k + 1u) * spacing / t->periodQpc + FALD_VBLANK_EARLY_MARGIN;
+        e = e < FALD_VBLANK_EARLY_TOLERANCE ? FALD_VBLANK_EARLY_TOLERANCE : (e > FALD_VBLANK_EARLY_TOLERANCE_MAX ? FALD_VBLANK_EARLY_TOLERANCE_MAX : e);
+        *early = e;
+    }
     return true;
+}
+bool FaldVBlankTrackerVBlankQpc(const FaldVBlankTracker* t, unsigned long long v, long long* qpc) {
+    return qpc && VBlankModelAt(t, v, qpc, nullptr);
+}
+static double VBlankEarlyNow(const FaldVBlankTracker* t) { return FaldVBlankTrackerEarlyTolerance(t); }
+double FaldVBlankTrackerEarlyTolerance(const FaldVBlankTracker* t) {
+    double e = FALD_VBLANK_EARLY_TOLERANCE;
+    if (!VBlankModelAt(t, t->v, nullptr, &e)) return FALD_VBLANK_EARLY_TOLERANCE;
+    return e;
 }
 bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out) {
     long long a = 0;
@@ -312,7 +369,7 @@ bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out) {
                 t->rebases++; t->epoch++;
                 VBlankRenumber(t, t->v + (unsigned long long)(long long)m, a);
                 t->phaseN = 0; t->phaseHead = 0;
-                VBlankUpdatePeriod(t, 0.0);
+                VBlankUpdatePeriod(t, 0.0); t->lineBound = 0.0;
                 t->haveRef = false; t->held = 0; t->haveMoved = false; t->movedStable = 0;
                 VBlankClearDwm(t);
             }
@@ -379,9 +436,15 @@ void FaldVBlankTrackerDwmSample(FaldVBlankTracker* t, long long nowQpc, long lon
     const bool rateOff = qpcRefreshPeriod > 0.0 && std::fabs(qpcRefreshPeriod / P - 1.0) > 0.005;   // another rate class
     t->dwmState = (!rateOff && std::fabs(t->dwmPpm) < FALD_VBLANK_SAME_CLOCK_PPM) ? 1 : 0;
 }
-bool FaldVBlankWaitTooSoon(long long prevReturnQpc, long long returnQpc, double periodQpc) {
-    if (prevReturnQpc == 0 || !(periodQpc > 0.0)) return false;
-    return (double)(returnQpc - prevReturnQpc) < 0.25 * periodQpc;
+FaldVBlankWaitVerdict FaldVBlankSpinGuardStep(FaldVBlankSpinGuard* g, long long waitStartQpc, long long returnQpc,
+                                              long long qpcFreq) {
+    if (qpcFreq <= 0 || (double)(returnQpc - waitStartQpc) * 1000.0 / (double)qpcFreq >= FALD_VBLANK_MIN_WAIT_MS) {
+        g->spins = 0;                                            // it waited (no clock: nothing to judge by)
+        return FALD_VBLANK_WAIT_WAKE;
+    }
+    g->early++;
+    if (++g->spins >= FALD_VBLANK_SPIN_LIMIT) { g->spins = 0; g->asleep++; return FALD_VBLANK_WAIT_ASLEEP; }
+    return FALD_VBLANK_WAIT_EARLY;
 }
 bool FaldVBlankNeedsRebind(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left, int top,
                            float nominalMs, float nominalNowMs) {
