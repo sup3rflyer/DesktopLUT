@@ -478,12 +478,12 @@ const char* FaldVBlankEpochReasonText(unsigned int reason) {
         default: return "same";
     }
 }
-bool FaldVBlankNeedsRebind(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left, int top,
-                           float nominalMs, float nominalNowMs) {
-    if (!factoryCurrent || !descOk || !attached) return true;
-    if (outLeft != left || outTop != top) return true;           // another output sits there now: the posTag would lie
-    if (!(nominalNowMs > 1.0f)) return true;
-    return !(std::fabs(nominalNowMs - nominalMs) <= 1.0e-4f * nominalMs);
+FaldVBlankRecheckResult FaldVBlankRecheck(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left,
+                                          int top, float nominalMs, float nominalNowMs) {
+    if (!descOk || !attached) return FALD_VBLANK_RECHECK_REBIND;
+    if (outLeft != left || outTop != top) return FALD_VBLANK_RECHECK_REBIND;   // another output there: the posTag would lie
+    if (!(nominalNowMs > 1.0f) || !(std::fabs(nominalNowMs - nominalMs) <= 1.0e-4f * nominalMs)) return FALD_VBLANK_RECHECK_REBIND;
+    return factoryCurrent ? FALD_VBLANK_RECHECK_OK : FALD_VBLANK_RECHECK_REFRESH;
 }
 
 int FaldPanelClockEffectiveParity(int parity, unsigned long long parityEpoch, bool absOk, unsigned long long mapEpoch) {

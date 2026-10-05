@@ -357,12 +357,23 @@ FaldVBlankEpochReason FaldVBlankEpochKeeperStep(FaldVBlankEpochKeeper* k, unsign
                                                 FaldVBlankEpochEvent ev);
 const char* FaldVBlankEpochReasonText(unsigned int reason);
 
-// The publisher's periodic re-check of its output (every few seconds of TIME): re-bind (withdraw the map, find the
-// output at the monitor's position again, a new epoch) when the DXGI factory is stale, the output's description is
-// unreadable, it left the desktop or no longer starts at the monitor's position (a swap / layout change: the posTag
-// would name the wrong output), or the nominal refresh period changed (a mode set).
-bool FaldVBlankNeedsRebind(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left, int top,
-                           float nominalMs, float nominalNowMs);
+// The publisher's periodic re-check of its output (every few seconds of TIME):
+//  * REBIND (withdraw the map, find the output at the monitor's position again, a new epoch) when its description is
+//    unreadable, it left the desktop or no longer starts at the monitor's position (a swap / layout change: the posTag
+//    would name the wrong output), or the nominal refresh period changed (a mode set);
+//  * REFRESH when only the DXGI factory went stale: re-acquire the factory + output objects and KEEP the tracker and the
+//    epoch. Windows marks factories stale on display-stack changes that do not touch the timing — the owner's DesktopLUT
+//    re-applies its MHC2 profiles every 5 min (Calibration Loader) and every kick staled the factory while the vblank
+//    waits ran on untouched (2026-10-05 probe: 6061 waits, 0 failed / early / gapped) — re-binding there started a new
+//    numbering epoch every 5 min. A REAL mode set re-binds through the modeset signal (DwmInjectDisplayChanged on
+//    WM_DISPLAYCHANGE) and the checks above; a moved phase is the tracker's chain's to catch.
+enum FaldVBlankRecheckResult : unsigned int {
+    FALD_VBLANK_RECHECK_OK = 0,
+    FALD_VBLANK_RECHECK_REFRESH = 1,
+    FALD_VBLANK_RECHECK_REBIND = 2,
+};
+FaldVBlankRecheckResult FaldVBlankRecheck(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left,
+                                          int top, float nominalMs, float nominalNowMs);
 
 // The per-monitor temporal bookkeeping (no D3D). The overlay's FaldResources and the hook's FaldMonitor both DERIVE
 // from it, so every field is reached the same way (r->clkIndex) and the functions below take either.

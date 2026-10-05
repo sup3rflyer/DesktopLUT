@@ -1300,6 +1300,7 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
     unsigned long long logSuppressed = 0;      // ... beyond the cap (counted in the statistics line)
     unsigned int asleepStreak = 0;             // consecutive ASLEEP verdicts (re-bind back-off; one log line per streak)
     unsigned long long asleepRebinds = 0;
+    unsigned long long factoryRefreshes = 0;   // stale DXGI factories re-acquired without a re-bind (same epoch)
     unsigned long long binds = 0;              // output bindings so far (each one a numbering epoch)
     unsigned long long epochId = 0;            // the published id of the current numbering epoch (FaldVBlankEpochKeeper)
     FaldVBlankEpochKeeper keeper;              // when a new id is due (bind, tracker epoch, failed wait, early run)
@@ -1419,16 +1420,38 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
             const FaldVBlankEpochReason why = FaldVBlankEpochKeeperStep(&keeper, binds, trk.epoch, FALD_VBLANK_EV_WAKE);
             if (why != FALD_VBLANK_EPOCH_SAME) { epochId = NewVBlankEpochId(); logEpoch(why, ret.QuadPart); }
         }
-        // the output re-check, by TIME: a stale factory, a detached / moved output (a swap or layout change), a mode set
+        // the output re-check, by TIME: a detached / moved output (a swap or layout change) or a mode set re-binds (a new
+        // epoch); a factory that only went STALE (a display-stack change that left the timing alone, e.g. the 5-min MHC
+        // re-apply) re-acquires the DXGI objects and keeps the tracker and the epoch (fald_temporal.h FaldVBlankRecheck)
         const ULONGLONG tick = GetTickCount64();
         if (tick - lastCheckMs >= FALD_VBLANK_RECHECK_MS) {
             lastCheckMs = tick;
             DXGI_OUTPUT_DESC d = {};
             const bool descOk = SUCCEEDED(out->GetDesc(&d));
             const float nm = RefreshPeriodMsAt(pub->left, pub->top);
-            if (FaldVBlankNeedsRebind(factory->IsCurrent() != FALSE, descOk, descOk && d.AttachedToDesktop,
-                                      (int)d.DesktopCoordinates.left, (int)d.DesktopCoordinates.top, pub->left, pub->top,
-                                      nominalMs, nm)) {
+            FaldVBlankRecheckResult rc = FaldVBlankRecheck(factory->IsCurrent() != FALSE, descOk, descOk && d.AttachedToDesktop,
+                                                           (int)d.DesktopCoordinates.left, (int)d.DesktopCoordinates.top,
+                                                           pub->left, pub->top, nominalMs, nm);
+            if (rc == FALD_VBLANK_RECHECK_REFRESH) {
+                IDXGIFactory1* nf = nullptr;
+                IDXGIOutput* no = FindDxgiOutputAt(pub->left, pub->top, &nf);
+                DXGI_OUTPUT_DESC d2 = {};
+                const bool same = no && SUCCEEDED(no->GetDesc(&d2)) && d2.AttachedToDesktop &&
+                                  d2.DesktopCoordinates.left == pub->left && d2.DesktopCoordinates.top == pub->top &&
+                                  FaldVBlankRecheck(nf->IsCurrent() != FALSE, true, true, (int)d2.DesktopCoordinates.left,
+                                                    (int)d2.DesktopCoordinates.top, pub->left, pub->top, nominalMs,
+                                                    RefreshPeriodMsAt(pub->left, pub->top)) == FALD_VBLANK_RECHECK_OK;
+                if (same) {
+                    releaseOutput();
+                    out = no; factory = nf;
+                    factoryRefreshes++;
+                } else {
+                    if (no) no->Release();
+                    if (nf) nf->Release();
+                    rc = FALD_VBLANK_RECHECK_REBIND;
+                }
+            }
+            if (rc == FALD_VBLANK_RECHECK_REBIND) {
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): output / mode changed (nominal "
                            << nominalMs << L" -> " << nm << L" ms) - map withdrawn, re-binding" << std::endl;
                 withdraw();
@@ -1479,7 +1502,8 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
                        << FaldVBlankTrackerMaxGap(&trk) << L" refreshes counted through) | wakes " << trk.wakes << L" missed "
                        << trk.missed << L" spurious " << trk.spurious << L" late " << trk.lateWakes << L" early returns " << guard.early
                        << L" asleep " << guard.asleep << L" (re-binds " << asleepRebinds << L") restarts " << trk.restarts
-                       << L" gap-holds " << trk.gapHolds << L" | publishes " << trk.published
+                       << L" gap-holds " << trk.gapHolds << L" factory refreshes " << factoryRefreshes
+                       << L" | publishes " << trk.published
                        << L" slips repaired " << trk.slipsRepaired << L" phase jumps " << trk.phaseJumps << L" re-bases "
                        << trk.rebases << L" recent-late " << trk.recentLate << L" | DWM clock (diagnostic): " << VBlankDwmClockText(trk.dwmState) << L", drift "
                        << trk.dwmPpm << L" ppm, cRefresh " << trk.dwmLastCount << L", DWM period "

@@ -928,7 +928,6 @@ static void StartMhcTransitionBurst(HWND hwnd, const char* reason) {
 // invalidates the DXGI cache so late-settling transition state is re-read,
 // preventing a stale pre-transition snapshot from being pumped to acceptance.
 static void StartDwmHookConfigResends(HWND hwnd) {
-    DwmInjectDisplayChanged();                       // FALD stage 3: the vblank publishers re-bind (a new numbering epoch)
     InvalidateDxgiMonitorCache();
     UpdateDwmHookSharedConfig();
     g_dwmHookConfigResends = 3;
@@ -3068,6 +3067,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // FP16 pipeline selection on. Gating this on `changed` left the hook
         // running the stale mode's pipeline until it was manually re-toggled.
         // Runs after the `changed` block so a topology update lands first.
+        // FALD stage 3: a modeset (an HDR toggle included) re-binds the vblank publishers — a new numbering epoch at once
+        // (NOT on the ImmersiveColorSet broadcast: profile reloads send it too, every 5 min here)
+        DwmInjectDisplayChanged();
         if (g_dwmHookMode.load() && g_gui.isRunning) {
             StartDwmHookConfigResends(hwnd);
         }

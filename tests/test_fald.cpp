@@ -1427,15 +1427,18 @@ TEST_CASE("FALD stage 3: the publisher's spin guard, output re-check and the Rel
     }
     // the re-check: a stale factory, an unreadable / detached output, an output now at another position (a swap or
     // layout change: the posTag would name the wrong display), a mode set -> re-bind
-    CHECK_FALSE(FaldVBlankNeedsRebind(true, true, true, 0, 0, 0, 0, 16.6667f, 16.6667f));
-    CHECK(FaldVBlankNeedsRebind(false, true, true, 0, 0, 0, 0, 16.6667f, 16.6667f));
-    CHECK(FaldVBlankNeedsRebind(true, false, true, 0, 0, 0, 0, 16.6667f, 16.6667f));
-    CHECK(FaldVBlankNeedsRebind(true, true, false, 0, 0, 0, 0, 16.6667f, 16.6667f));
-    CHECK(FaldVBlankNeedsRebind(true, true, true, 3840, 0, 0, 0, 16.6667f, 16.6667f));
-    CHECK(FaldVBlankNeedsRebind(true, true, true, 0, 2160, 0, 0, 16.6667f, 16.6667f));
-    CHECK(FaldVBlankNeedsRebind(true, true, true, 0, 0, 0, 0, 16.6667f, 20.8542f));
-    CHECK(FaldVBlankNeedsRebind(true, true, true, 0, 0, 0, 0, 16.6667f, 0.0f));
-    CHECK_FALSE(FaldVBlankNeedsRebind(true, true, true, -3840, 0, -3840, 0, 16.6667f, 16.6667f));
+    CHECK(FaldVBlankRecheck(true, true, true, 0, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_OK);
+    // a stale factory alone (the 5-min MHC re-apply staled it; the vblanks ran on untouched): refresh, same epoch
+    CHECK(FaldVBlankRecheck(false, true, true, 0, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REFRESH);
+    CHECK(FaldVBlankRecheck(true, false, true, 0, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(false, false, true, 0, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(true, true, false, 0, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(true, true, true, 3840, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(true, true, true, 0, 2160, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(true, true, true, 0, 0, 0, 0, 16.6667f, 20.8542f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(false, true, true, 0, 0, 0, 0, 16.6667f, 20.8542f) == FALD_VBLANK_RECHECK_REBIND);   // stale + mode set
+    CHECK(FaldVBlankRecheck(true, true, true, 0, 0, 0, 0, 16.6667f, 0.0f) == FALD_VBLANK_RECHECK_REBIND);
+    CHECK(FaldVBlankRecheck(true, true, true, -3840, 0, -3840, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_OK);
     // ReleaseClock voids the clocks' state: the next run RE-SEEDS (never a k = 0 run binding maps no pass has written)
     {
         const long long freq = 10000000;
