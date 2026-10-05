@@ -54,21 +54,30 @@ def _monitor_point(monitor: int) -> tuple[int, int]:
     return int(x + min(100, w // 2)), int(y + min(100, h // 2))
 
 
-def _index_at(ctrl, point: tuple[int, int]) -> Optional[int]:
-    """DesktopLUT's monitor index of the monitor containing ``point`` NOW (a display in standby can leave the desktop and
-    shift the indices), or None when no monitor contains it."""
+def _monitor_at(ctrl, point: tuple[int, int]) -> Optional[dict]:
+    """The DesktopLUT monitor containing ``point`` NOW (a display in standby can leave the desktop: the indices shift and
+    ANOTHER display can take the position — 2026-10-05 the BenQ became the primary at (0, 0) while the ProArt slept)."""
     for m in (ctrl.query_monitors() or {}).get("monitors") or []:
         r = m.get("rect") or {}
         if r and r["x"] <= point[0] < r["x"] + r["width"] and r["y"] <= point[1] < r["y"] + r["height"]:
-            return int(m["index"])
+            return m
     return None
 
 
-def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.0, truth_ms: int = 1000) -> int:
+def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.0, truth_ms: int = 1000,
+           hardware_id: Optional[str] = None, point: Optional[tuple[int, int]] = None) -> int:
+    """``hardware_id`` (EDID, e.g. AUS322A) identifies the target; default = whatever sits at the monitor's point now.
+    ``point`` = a desktop point on the target (default: from the monitor index)."""
     out.mkdir(parents=True, exist_ok=True)
     if not TRUTH_EXE.exists():
         raise SystemExit(f"{TRUTH_EXE} not built (tools/vblank_truth/build.cmd)")
-    px, py = _monitor_point(monitor)
+    px, py = point if point else _monitor_point(monitor)
+    if hardware_id is None:
+        from dlc.controller import CalibrationController
+        m0 = _monitor_at(CalibrationController.connect(), (px, py))
+        hardware_id = (m0 or {}).get("hardware_id")
+    if not hardware_id:
+        raise SystemExit("no target hardware id (pass --hardware-id)")
     k = 0
     while (out / f"truth_{k}.csv").exists() or (k == 0 and (out / "truth.csv").exists()):
         k += 1                                      # a resumed soak: a new truth file (the analysis reads them all)
@@ -80,7 +89,8 @@ def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.
         helper.kill()
         raise SystemExit(f"vblank_truth did not start: {ready!r}")
     meta = {"monitor": monitor, "mode": mode, "hours": hours, "every_s": every_s, "truth_ms": truth_ms, "truth_ready": ready,
-            "started": time.strftime("%Y-%m-%d %H:%M:%S"), "qpc_start": qpc_now(), "point": [px, py], "truth": truth_path.name}
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"), "qpc_start": qpc_now(), "point": [px, py], "truth": truth_path.name,
+            "hardware_id": hardware_id}
     (out / f"meta_{k}.json" if k else out / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
     (out / "events.txt").touch()
     print(f"[soak] {ready}; recording to {out} for {hours} h — Ctrl+C stops", file=sys.stderr, flush=True)
@@ -96,12 +106,13 @@ def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.
                 try:
                     if ctrl is None:
                         ctrl = CalibrationController.connect()
-                    idx = _index_at(ctrl, (px, py))    # the target by POSITION (indices shift when a display sleeps)
-                    if idx is None:
+                    mon = _monitor_at(ctrl, (px, py))  # the target by position AND identity (EDID hardware id)
+                    if mon is None or mon.get("hardware_id") != hardware_id:
                         row["absent"] = True
+                        row["at_hw"] = (mon or {}).get("hardware_id")
                     else:
-                        row["index"] = idx
-                        row.update(ctrl.call("runtime.fald_vblank_status", {"monitor": idx, "mode": mode}))
+                        row["index"] = int(mon["index"])
+                        row.update(ctrl.call("runtime.fald_vblank_status", {"monitor": int(mon["index"]), "mode": mode}))
                     last_err = None
                 except Exception as exc:  # noqa: BLE001 — DesktopLUT restarts are part of the soak
                     ctrl = None
@@ -223,6 +234,19 @@ def truth_at(seg: list[TruthSample], qpc: int, period: float, max_extrap_s: floa
 def analyse(run: Path, max_extrap_s: float = 3.0) -> dict:
     truth, freq = load_truth(run)
     rows = [json.loads(ln) for ln in open(run / "status.jsonl", encoding="utf-8") if ln.strip()]
+    # while the target was absent another display can sit at its position — and the truth window on IT: drop those
+    # truth samples (absent stretches from the status rows, widened by the truth interval + margin)
+    pad = int(3.0 * freq)
+    spans, cur = [], None
+    for r in rows:
+        if r.get("absent"):
+            cur = [r["qpc"], r["qpc"]] if cur is None else [cur[0], r["qpc"]]
+        elif cur is not None:
+            spans.append(cur); cur = None
+    if cur is not None:
+        spans.append(cur)
+    if spans:
+        truth = [t for t in truth if not any(a - pad <= t.qpc <= b + pad for a, b in spans)]
     periods = [r["period_ms"] for r in rows if r.get("published") and r.get("period_ms", 0) > 0]
     if not truth or not periods:
         return {"error": "no truth samples or no published map", "truth": len(truth), "rows": len(rows)}
@@ -309,11 +333,15 @@ def main(argv=None) -> int:
     r = sub.add_parser("record"); r.add_argument("--out", required=True); r.add_argument("--monitor", type=int, default=0)
     r.add_argument("--mode", default="HDR"); r.add_argument("--hours", type=float, default=8.0)
     r.add_argument("--every-s", type=float, default=1.0)
+    r.add_argument("--hardware-id", default=None, help="EDID id of the target (default: the monitor at its point now)")
+    r.add_argument("--point", default=None, help="x,y desktop point on the target (default: from --monitor)")
     a = sub.add_parser("analyse"); a.add_argument("run")
     nt = sub.add_parser("note"); nt.add_argument("run"); nt.add_argument("text")
     args = ap.parse_args(argv)
     if args.cmd == "record":
-        return record(Path(args.out), args.monitor, args.mode, args.hours, args.every_s)
+        pt = tuple(int(v) for v in args.point.split(",")) if args.point else None
+        return record(Path(args.out), args.monitor, args.mode, args.hours, args.every_s, hardware_id=args.hardware_id,
+                      point=pt)
     if args.cmd == "note":
         with open(Path(args.run) / "events.txt", "a", encoding="utf-8") as fh:
             fh.write(f"{time.strftime('%H:%M:%S')} {args.text}\n")

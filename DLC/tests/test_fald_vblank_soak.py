@@ -104,3 +104,19 @@ def test_rows_on_another_output_and_resumed_truth_files(tmp_path):
     assert all(s.count < 9_000_000 for s in tr) and len(tr) == 50 + 45
     rep = analyse(run)
     assert rep["silent_slips"] == 0 and rep["absent"] == 1 and rep["truth_segments"] == 1
+
+
+def test_truth_samples_while_the_target_was_absent_are_dropped(tmp_path):
+    """The BenQ took the ProArt's position (0, 0) while the ProArt slept: on-position truth rows from that stretch are
+    another display's count — dropped by the absent stretch of the status rows."""
+    run = tmp_path / "r"
+    truth = [(_vblank(i), 186_000 + i) for i in range(0, 2000, 60)]
+    truth += [(_vblank(i), 7_000_000 + i) for i in range(2000, 3000, 60)]     # the BenQ's counter at (0, 0)
+    truth += [(_vblank(i), 186_000 + i) for i in range(3000, 5000, 60)]
+    status = [_status(i, "aaaa", 5) for i in range(10, 1900, 60)]
+    status += [{"qpc": _vblank(i), "wall": f"a{i}", "absent": True, "at_hw": "BNQ802E"} for i in range(1900, 3100, 60)]
+    status += [_status(i, "bbbb", 7) for i in range(3130, 4900, 60)]
+    _write(run, truth, status)
+    rep = analyse(run)
+    assert rep["silent_slips"] == 0 and rep["truth_segments"] == 1     # the BenQ stretch is gone: one consistent timeline
+    assert [e["epoch_id"] for e in rep["epochs"]] == ["aaaa", "bbbb"]
