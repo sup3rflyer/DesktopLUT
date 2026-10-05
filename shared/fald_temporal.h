@@ -167,7 +167,14 @@ const char* FaldClockSourceName(unsigned int source);   // "grid" / "abs" / "swi
 //    (the rig: max 0.011 period, 2026-10-04) gives 0.05 — a wake keeps its refresh up to 0.95 of a period late (review
 //    2026-10-04: a fixed + 0.25 numbered wakes 0.75 - 1.0 late as the NEXT vblank, projected up to 1/4 period early, and
 //    three of them in the ring became the anchor); latency spread over 0.6 period gives ~0.07 (a fixed 0.05 dropped the
-//    fastest genuine wakes as spurious there). A missed wake (a late thread) is
+//    fastest genuine wakes as spurious there). KNOWN LIMIT (review 2026-10-05): with a BIMODAL latency whose slow cluster
+//    is the majority (deep C-states: most wakes ~1-2 ms late, a few at the floor) the model sits in the slow cluster and
+//    the fast genuine wakes are dropped as spurious: the anchor runs 0.09-0.23 period LATE (runs in that first sliver of
+//    a refresh are numbered one low) but the count never slips. Letting the fast wakes in was tried and REFUTED in the
+//    review harness: a ring holding both clusters flips its low quantile between them, the chain stays withheld, and a
+//    wrong slip repair lands (184 silent slips at 240 Hz, 21 under wide bursts; the pre-v3 0.25 tolerance mixed them too:
+//    170). The robust fix is a wake-latency-free phase (D3DKMTGetScanLine at the wake) — a bench item. The rig measured
+//    unimodal (p99 95 us). A missed wake (a late thread) is
 //    repaired, a second wake inside one refresh is ignored. A GAP is counted through only as far as the period is known:
 //    s x u <= FALD_VBLANK_GAP_BUDGET, u = the chain line's period uncertainty once the period is fitted on a chain
 //    (lineBound below), else FALD_VBLANK_NOMINAL_TOLERANCE — FaldVBlankTrackerMaxGap; a longer gap restarts the model,
@@ -242,6 +249,8 @@ struct FaldVBlankTracker {
     unsigned long long refV = 0;
     long long lineBase = 0;                   // (the reference line's time origin: VBlankLineAt)
     unsigned int held = 0;                    // consecutive publish attempts withheld by a moved phase
+    unsigned int gapHold = 0;                 // fed wakes still owed after a counted-through gap before a publish: the
+                                              // recent-wake guard must see post-gap wakes only (review 2026-10-05)
     bool haveMoved = false;                   // the last withheld attempt (the moved phase's own stability)
     long long movedQpc = 0;
     unsigned long long movedV = 0;
@@ -260,6 +269,7 @@ struct FaldVBlankTracker {
     // statistics (host log; the bench reads them)
     unsigned long long wakes = 0, missed = 0, spurious = 0, lateWakes = 0, restarts = 0;   // (restarts: gaps)
     unsigned long long published = 0, slipsRepaired = 0, phaseJumps = 0, rebases = 0, recentLate = 0, dwmSamples = 0;
+    unsigned long long gapHolds = 0;
 };
 // A fresh tracker whose first wake gets index firstIndex (the publisher continues its numbering across re-binds).
 void FaldVBlankTrackerReset(FaldVBlankTracker* t, double nominalPeriodQpc, unsigned long long firstIndex = 0);
@@ -280,13 +290,15 @@ bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out);
 void FaldVBlankTrackerDwmSample(FaldVBlankTracker* t, long long nowQpc, long long qpcVBlank, unsigned long long cRefresh,
                                 double qpcRefreshPeriod);
 // The publisher's spin guard, judging every vblank wait by ITS OWN duration (call start -> return; as Chromium's
-// VSyncThreadWin): under FALD_VBLANK_MIN_WAIT_MS it did not wait for a vblank (monitor asleep, output gone) — not fed
+// VSyncThreadWin): under min(FALD_VBLANK_MIN_WAIT_MS, FALD_VBLANK_MIN_WAIT_PERIODS x the period) it did not wait for a
+// vblank (monitor asleep, output gone; the period term keeps 480 Hz+ displays — whose every wait is < 1 ms — out of it) — not fed
 // to the tracker, the thread sleeps a period; FALD_VBLANK_SPIN_LIMIT of them in a row = ASLEEP (withdraw the map,
 // re-bind). A legitimately short wait (the loop came back less than 1 ms before a vblank: it stalled ~a period) is only
 // a missed wake, which the next wake's numbering repairs. (Review 2026-10-04: the previous rule compared consecutive
 // RETURNS; the guard's own one-period sleep reset it, so the escalation never fired and ~56 fake wakes a second reached
 // the tracker while a display slept.)
 constexpr double FALD_VBLANK_MIN_WAIT_MS = 1.0;
+constexpr double FALD_VBLANK_MIN_WAIT_PERIODS = 0.25;
 constexpr unsigned int FALD_VBLANK_SPIN_LIMIT = 30;
 enum FaldVBlankWaitVerdict : unsigned int {
     FALD_VBLANK_WAIT_WAKE = 0,     // a real wait: feed the return to the tracker
@@ -297,8 +309,9 @@ struct FaldVBlankSpinGuard {
     unsigned int spins = 0;                   // early returns in a row
     unsigned long long early = 0, asleep = 0; // statistics
 };
+// periodQpc = the output's nominal refresh period (<= 0: the 1-ms rule alone).
 FaldVBlankWaitVerdict FaldVBlankSpinGuardStep(FaldVBlankSpinGuard* g, long long waitStartQpc, long long returnQpc,
-                                              long long qpcFreq);
+                                              long long qpcFreq, double periodQpc = 0.0);
 // The publisher's periodic re-check of its output (every few seconds of TIME): re-bind (withdraw the map, find the
 // output at the monitor's position again, a new epoch) when the DXGI factory is stale, the output's description is
 // unreadable, it left the desktop or no longer starts at the monitor's position (a swap / layout change: the posTag

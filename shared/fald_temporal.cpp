@@ -128,7 +128,7 @@ static void VBlankRestartModel(FaldVBlankTracker* t) {
     fresh.wakes = t->wakes; fresh.missed = t->missed; fresh.spurious = t->spurious; fresh.lateWakes = t->lateWakes;
     fresh.restarts = t->restarts; fresh.published = t->published; fresh.slipsRepaired = t->slipsRepaired;
     fresh.phaseJumps = t->phaseJumps; fresh.rebases = t->rebases; fresh.recentLate = t->recentLate;
-    fresh.dwmSamples = t->dwmSamples;
+    fresh.dwmSamples = t->dwmSamples; fresh.gapHolds = t->gapHolds;
     fresh.dwmLastCount = t->dwmLastCount; fresh.dwmLastPeriodQpc = t->dwmLastPeriodQpc;
     *t = fresh;
 }
@@ -261,7 +261,7 @@ unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc) {
     const bool model = VBlankModelAt(t, t->v, &ref, &early);
     const double x = (double)(qpc - ref) / P;
     const double s = std::floor(x + (model ? early : 0.5));
-    if (s < 1.0) { t->spurious++; return 0; }                  // a second wake inside the same refresh
+    if (s < 1.0) { t->spurious++; return 0; }                  // a second wake inside one refresh / an over-count's heal
     if (s > (double)FaldVBlankTrackerMaxGap(t)) {
         // The thread was gone longer than the period is known for (the gap budget): start the model over, the count
         // continued by the elapsed time (monotonic) in a new epoch; its parity relative to the panel is no longer
@@ -276,6 +276,9 @@ unsigned int FaldVBlankTrackerWake(FaldVBlankTracker* t, long long qpc) {
     }
     const unsigned int steps = (unsigned int)s;
     if (model && x - s > 0.5) t->lateWakes++;
+    // a counted-through gap: the next publishes wait until the recent-wake guard sees post-gap wakes only
+    if (steps > FALD_VBLANK_RECENT_WAKES) { t->gapHold = FALD_VBLANK_RECENT_WAKES + 1u; t->gapHolds++; }
+    if (t->gapHold > 0u) t->gapHold--;
     if (steps == 1u) {
         t->gap[t->gapHead] = (double)(qpc - t->lastWakeQpc);
         t->gapHead = (t->gapHead + 1) % FALD_VBLANK_GAP_RING;
@@ -343,6 +346,7 @@ double FaldVBlankTrackerEarlyTolerance(const FaldVBlankTracker* t) {
     return e;
 }
 bool FaldVBlankTrackerMap(FaldVBlankTracker* t, FaldVBlankMap* out) {
+    if (t->gapHold > 0u) return false;                          // just after a counted-through gap (rules: Wake)
     long long a = 0;
     if (t->wakeN < FALD_VBLANK_MIN_WAKES || !FaldVBlankTrackerVBlankQpc(t, t->v, &a)) return false;
     // the continuity chain: where does this vblank sit on the published numbering? The reference is the least-squares
@@ -437,8 +441,10 @@ void FaldVBlankTrackerDwmSample(FaldVBlankTracker* t, long long nowQpc, long lon
     t->dwmState = (!rateOff && std::fabs(t->dwmPpm) < FALD_VBLANK_SAME_CLOCK_PPM) ? 1 : 0;
 }
 FaldVBlankWaitVerdict FaldVBlankSpinGuardStep(FaldVBlankSpinGuard* g, long long waitStartQpc, long long returnQpc,
-                                              long long qpcFreq) {
-    if (qpcFreq <= 0 || (double)(returnQpc - waitStartQpc) * 1000.0 / (double)qpcFreq >= FALD_VBLANK_MIN_WAIT_MS) {
+                                              long long qpcFreq, double periodQpc) {
+    double minWait = FALD_VBLANK_MIN_WAIT_MS * (double)qpcFreq / 1000.0;
+    if (periodQpc > 0.0 && FALD_VBLANK_MIN_WAIT_PERIODS * periodQpc < minWait) minWait = FALD_VBLANK_MIN_WAIT_PERIODS * periodQpc;
+    if (qpcFreq <= 0 || (double)(returnQpc - waitStartQpc) >= minWait) {
         g->spins = 0;                                            // it waited (no clock: nothing to judge by)
         return FALD_VBLANK_WAIT_WAKE;
     }

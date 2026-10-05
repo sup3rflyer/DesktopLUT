@@ -1236,6 +1236,32 @@ TEST_CASE("FALD stage 3: the vblank tracker - a gap is counted through only as f
         }
 }
 
+TEST_CASE("FALD stage 3: the vblank tracker - no publish right after a counted-through gap (review 2026-10-05)") {
+    // The recent-wake guard looks at the last FALD_VBLANK_RECENT_WAKES wakes; right after a gap those are PRE-gap wakes,
+    // so a count-through error could be published once unseen. After a wake that stepped more than that many refreshes,
+    // publishing waits until as many post-gap wakes are in.
+    PublisherSim s;
+    for (long long i = 0; i < 1200; i++) s.wake(i);
+    REQUIRE(s.valid);
+    FaldVBlankMap m;
+    CHECK(FaldVBlankTrackerWake(&s.trk, s.wakeTime(1500)) == 301u);             // a 5-s gap, counted through
+    CHECK(s.trk.restarts == 0ull); CHECK(s.trk.gapHolds == 1ull);
+    CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));                               // held: no post-gap evidence yet
+    for (long long i = 1501; i < 1501 + (long long)FALD_VBLANK_RECENT_WAKES - 1; i++) {
+        FaldVBlankTrackerWake(&s.trk, s.wakeTime(i));
+        CHECK_FALSE(FaldVBlankTrackerMap(&s.trk, &m));
+    }
+    FaldVBlankTrackerWake(&s.trk, s.wakeTime(1501 + (long long)FALD_VBLANK_RECENT_WAKES - 1));
+    CHECK(s.trk.gapHold == 0u);
+    for (long long i = 1501 + (long long)FALD_VBLANK_RECENT_WAKES; i < 1700; i++) s.wake(i);
+    REQUIRE(s.valid);
+    CHECK(s.map.countAnchor == s.mapWakeIndex); CHECK(s.wrongMaps == 0);
+    // a short miss (a few refreshes) does not hold anything
+    const unsigned long long holds = s.trk.gapHolds;
+    FaldVBlankTrackerWake(&s.trk, s.wakeTime(1703));
+    CHECK(s.trk.gapHolds == holds); CHECK(s.trk.gapHold == 0u);
+}
+
 TEST_CASE("FALD stage 3: the vblank tracker - very late wakes never pull the anchor early (review 2026-10-04)") {
     // 2 % / 10 % of the wakes 0.75 - 0.95 of a period late (a starved thread) on a tight latency floor: with a fixed
     // floor(x + 0.25) such wakes were numbered as the NEXT vblank, projected up to 1/4 period early, and became the anchor
@@ -1272,6 +1298,11 @@ TEST_CASE("FALD stage 3: the publisher's spin guard, output re-check and the Rel
         CHECK(FaldVBlankSpinGuardStep(&g, 2000000, 2000000 + 120000, f) == FALD_VBLANK_WAIT_WAKE);   // a real wait resets
         CHECK(g.spins == 0u);
         CHECK(FaldVBlankSpinGuardStep(&g, 3000000, 3000010, 0) == FALD_VBLANK_WAIT_WAKE);            // no clock: no guard
+        // a 1000-Hz output: EVERY wait is under 1 ms — the line is min(1 ms, 1/4 period) when the period is known
+        // (review 2026-10-05: the 1-ms rule alone called a 1000-Hz output asleep 539 times in 10 minutes)
+        CHECK(FaldVBlankSpinGuardStep(&g, 4000000, 4000000 + 9000, f, 10000.0) == FALD_VBLANK_WAIT_WAKE);   // 0.9 ms
+        CHECK(FaldVBlankSpinGuardStep(&g, 4000000, 4000000 + 2400, f, 10000.0) == FALD_VBLANK_WAIT_EARLY);  // 0.24 P
+        CHECK(FaldVBlankSpinGuardStep(&g, 4000000, 4000000 + 9000, f, 166666.5) == FALD_VBLANK_WAIT_EARLY); // 60 Hz: 1 ms
     }
     // the LOOP's pattern with a sleeping output (review 2026-10-04: the old rule compared consecutive returns, and the
     // guard's own one-period sleep reset it — the escalation never fired, ~56 fake wakes a second reached the tracker):
