@@ -326,6 +326,10 @@ class Emu:
         self.sub = o["sub"]; self.cols = o["cols"]; self.rows = o["rows"]; self.cw = o["cellW"]; self.ch = o["cellH"]
         self.ox, self.oy = int(o.get("originX", 0)), int(o.get("originY", 0))
         self.floor = float(o["driveFloor"]); self.area0 = float(o["area0"])
+        # P10 zone statistic (FLD5 words 42-46): 0 = area, 1 = the context statistic
+        self.statKind = int(o.get("statKind", 0))
+        self.ctxM0, self.ctxGLit = f32(o.get("ctxM0", 1.9645)), f32(o.get("ctxGLit", 0.0556))
+        self.ctxFloor, self.ctxEps = f32(o.get("ctxFloor", 0.1539)), f32(o.get("ctxEps", 0.05))
         self.fadeLo, self.fadeHi = float(o["fadeLo"]), float(o["fadeHi"])
         self.lumLo, self.lumHi = float(o["lumFadeLo"]), float(o["lumFadeHi"])
         self.gmin, self.gmax = float(o["gainMin"]), float(o["gainMax"])
@@ -409,7 +413,7 @@ class Emu:
         sparse = np.where(has & speck, 1.0 - star_smooth(sp.area_lo, sp.area_hi, a_eff), 0.0)
         if sp.peak_hi > 0.0:
             sparse = sparse * (1.0 - star_smooth(sp.peak_hi, 2.0 * sp.peak_hi, peak))
-        drive = self.drive_of(np.minimum(peak, total / f32(self.area0)))
+        drive, _ = self.zone_drive(blocks, peak, total)
         solid = np.where(has, (1.0 - sparse) * drive, 0.0)
         ln_b = np.log(np.maximum(b, f32(1e-12))).astype(np.float32)
         # the zone-local position of the brightest pixel (float32 values as the GPU compares them; ties: nearest the
@@ -831,6 +835,25 @@ class Emu:
         d = o["curve"][i0] * (1 - fr) + o["curve"][i1] * fr
         return np.where(stat32 < f32(self.floor), 0.0, d).astype(np.float32)
 
+    # ---- the zone statistic -> drive (both the stat pass and the starfield's S0 `solid`)
+    def zone_drive(self, blocks, peak, total):
+        """Drive per zone from the zone's pixels ``blocks`` (rows, ch, cols, cw; brightest channel capped at white), its
+        lit peak and lit sum: kind 0 = drive_of(min(peak, total / A0)); kind 1 (P10, FLD5) = the context statistic
+        (geometric mean of max(s, eps) over ALL the zone's pixels -> w, gamma; black-only floor in drive space).
+        Returns (drive, stat)."""
+        if self.statKind != 1:
+            stat = np.minimum(peak, total / f32(self.area0)).astype(np.float32)
+            return self.drive_of(stat), stat
+        n = f32(blocks.shape[1] * blocks.shape[3])
+        lsum = np.log(np.maximum(blocks, self.ctxEps)).astype(np.float32).sum(axis=(1, 3), dtype=np.float32)
+        m = np.exp(lsum / n).astype(np.float32)
+        w = (m / (self.ctxM0 + m)).astype(np.float32)
+        gam = (self.ctxGLit + (f32(1.0) - self.ctxGLit) * (f32(1.0) - w)).astype(np.float32)
+        frac = np.minimum(f32(1.0), total / np.maximum(f32(self.area0) * peak, f32(1e-9))).astype(np.float32)
+        stat = np.where(peak > 0, peak * np.power(frac, gam), f32(0.0)).astype(np.float32)
+        fl = np.where(peak > 0, self.ctxFloor * (f32(1.0) - w) * self.drive_of(peak), f32(0.0)).astype(np.float32)
+        return np.maximum(self.drive_of(stat), fl).astype(np.float32), stat
+
     # ---- CS stat (lattice cells only; pixels outside the frame do not count)
     def stat_drive(self, img):
         s = np.minimum(img.max(axis=0), self.white)
@@ -839,8 +862,7 @@ class Emu:
         lit = blocks > self.floor
         m = np.where(lit, blocks, 0.0).max(axis=(1, 3))
         tot = np.where(lit, blocks, 0.0).astype(np.float32).sum(axis=(1, 3), dtype=np.float32)
-        stat = np.minimum(m, tot / f32(self.area0))
-        return self.drive_of(stat), stat
+        return self.zone_drive(blocks, m, tot)
 
     # ---- CS stat, the boost part (u1): per zone, LIT-or-DIM / LIT-or-MEAN on the pixel's brightest channel (NOT capped
     # at white). Rule 1 sums pow(mc, gamma) over the pixels with mc > 0 in the shader's order (zone_pow_sum).

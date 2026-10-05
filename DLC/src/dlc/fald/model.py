@@ -99,6 +99,18 @@ class FaldParams:
     #       statistic produces does not exist on the panel (results/phone_camera_2026-09-20/border/).
     # A0: 1150 px² = the shipped HDR fit (this default); 433 px² = the SDR refit (2026-09-15).
     stat_area0_px2: float = 1150.0
+    # P10 CONTEXT statistic (stat_kind "ctxpow", 2026-10-05; results/fald_p10_2026-10-05/RESULT.md — offline refit over 21
+    # datasets, LODO held-out 9.0 vs the area law's 24.8, and a frozen HW gate on unseen lit-field patterns PASSED: shape
+    # rms 0.42 vs 1.54 %). The panel follows the AREA law on black and ~the LEVEL law on a lit background, so the zone's
+    # background unlocks the brightest pixel:  m = geometric mean of the zone's pixels (each max(s, eps)),
+    # w = m / (m0 + m), gamma = g_lit + (1 - g_lit)(1 - w), stat = peak · min(1, Σ_lit / (A0 · peak))^gamma, and a
+    # black-only small-feature floor  drive = max(drive_of(stat), floor · (1 - w) · drive_of(peak)). On black it is NEAR
+    # the area law (m = eps -> gamma 0.98; the feature's own pixels raise the geometric mean a little: a 20x20 window
+    # -> gamma ~0.93). Defaults = the all-data fit; OFF unless stat_kind == "ctxpow" (the panel file then says FLD5).
+    stat_ctx_m0: float = 1.9645           # nit: the background level of half unlock
+    stat_ctx_g_lit: float = 0.0556        # gamma on a bright background (0 = level law)
+    stat_ctx_floor: float = 0.1539        # black-only floor, a fraction of drive_of(peak)
+    stat_ctx_eps: float = 0.05            # nit: the log floor of the geometric mean (below the 0.5-nit drive floor)
     # NATIVE drive curve (2026-09-11, doc §22/§23: leak beside a large window vs field level, normalised
     # to code 1023 = 1842 nits). The 2026-09-10 curve had the same shape but was normalised to 1000 nits
     # because the DesktopLUT stack showed code 1023 at ≈ 1000 nits.
@@ -413,6 +425,8 @@ class FaldModel:
         s = np.minimum(np.max(img, axis=0), p.white_nits)      # brightest channel, requested nits
         if p.stat_kind == "area":
             return self.drive_of(self._area_stat(s))
+        if p.stat_kind == "ctxpow":
+            return self._ctx_drives(s)
         if p.stat_kind == "area_win":
             return self.drive_of(np.minimum(self._winmax_stat(s), self._area_stat(s)))
         if p.stat_kind != "winmax":
@@ -432,6 +446,35 @@ class FaldModel:
         peak = (blocks * lit).max(axis=(2, 3))
         tot = (blocks * lit).sum(axis=(2, 3)) * float(p.scale ** 2)
         return np.minimum(peak, tot / p.stat_area0_px2)
+
+    def _peak_px(self, s: np.ndarray) -> np.ndarray:
+        """The per-raster-pixel PEAK the zone peak is read from (the raster itself here; :class:`dlc.fald.motion.
+        MotionModel` substitutes the full-resolution peak)."""
+        return s
+
+    def ctx_weight(self, s: np.ndarray) -> np.ndarray:
+        """The P10 context weight w = m / (m0 + m) per zone, m = the zone's geometric mean of max(s, eps) (0 on black,
+        -> 1 on a bright background)."""
+        p = self.p
+        blocks = s.reshape(p.rows, self.ch, p.cols, self.cw)
+        m = np.exp(np.log(np.maximum(blocks, p.stat_ctx_eps)).mean(axis=(1, 3)))
+        return m / (p.stat_ctx_m0 + m)
+
+    def _ctx_drives(self, s: np.ndarray) -> np.ndarray:
+        """stat_kind "ctxpow" (see ``FaldParams.stat_ctx_*``): the context-power statistic and its black-only floor,
+        returned as DRIVES (the floor acts in drive space, as the shader applies it)."""
+        p = self.p
+        pk = self._peak_px(s)
+        peak = (pk * (pk > p.drive_floor_nits)).reshape(p.rows, self.ch, p.cols, self.cw).max(axis=(1, 3))
+        lit = s > p.drive_floor_nits
+        tot = (s * lit).reshape(p.rows, self.ch, p.cols, self.cw).sum(axis=(1, 3)) * float(p.scale ** 2)
+        w = self.ctx_weight(s)
+        gam = p.stat_ctx_g_lit + (1.0 - p.stat_ctx_g_lit) * (1.0 - w)
+        frac = np.minimum(1.0, tot / np.maximum(p.stat_area0_px2 * peak, 1e-9))
+        stat = np.where(peak > 0, peak * frac ** gam, 0.0)
+        d = self.drive_of(stat)
+        fl = np.where(peak > 0, p.stat_ctx_floor * (1.0 - w) * self.drive_of(peak), 0.0)
+        return np.maximum(d, fl)
 
     def _winmax_stat(self, s: np.ndarray) -> np.ndarray:
         """Max over sliding windows (footprint ``blur_px``, fractional) inside each cell of the window

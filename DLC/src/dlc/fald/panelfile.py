@@ -8,7 +8,8 @@ from pathlib import Path
 
 import numpy as np
 
-MAGIC1, MAGIC2, MAGIC3, MAGIC4 = 0x464C4431, 0x464C4432, 0x464C4433, 0x464C4434
+MAGIC1, MAGIC2, MAGIC3, MAGIC4, MAGIC5 = 0x464C4431, 0x464C4432, 0x464C4433, 0x464C4434, 0x464C4435
+STAT_AREA, STAT_CTXPOW = 0, 1     # FLD5 word 42 (P10 context statistic; every older file: area)
 BOOST_MAX_STEPS = 24         # src/fald.h FALD_BOOST_MAX_STEPS
 BOOST_RULE_DIM, BOOST_RULE_MEAN = 0, 1   # FLD4 word 53 / CB word 72 (src/fald.h FALD_BOOST_RULE_*)
 f32 = np.float32
@@ -46,13 +47,15 @@ def read_panel_file(path) -> dict:
         raise ValueError("params file too short")
     u = np.frombuffer(buf[: (len(buf) // 4) * 4], dtype="<u4")
     fl = np.frombuffer(buf[: (len(buf) // 4) * 4], dtype="<f4")
-    if u[0] not in (MAGIC1, MAGIC2, MAGIC3, MAGIC4):
+    if u[0] not in (MAGIC1, MAGIC2, MAGIC3, MAGIC4, MAGIC5):
         raise ValueError("bad magic")
-    hb = {MAGIC1: 128, MAGIC2: 160, MAGIC3: 192, MAGIC4: 416}[int(u[0])]
+    hb = {MAGIC1: 128, MAGIC2: 160, MAGIC3: 192, MAGIC4: 416, MAGIC5: 416}[int(u[0])]
     if len(buf) < hb:
         raise ValueError("params file too short for its header")
-    long_header = u[0] in (MAGIC3, MAGIC4)             # pedestal block optional (zero = none) + transfer words
-    o: dict = {"magic": {MAGIC1: "FLD1", MAGIC2: "FLD2", MAGIC3: "FLD3", MAGIC4: "FLD4"}[int(u[0])]}
+    long_header = u[0] in (MAGIC3, MAGIC4, MAGIC5)     # pedestal block optional (zero = none) + transfer words
+    o: dict = {"magic": {MAGIC1: "FLD1", MAGIC2: "FLD2", MAGIC3: "FLD3", MAGIC4: "FLD4", MAGIC5: "FLD5"}[int(u[0])]}
+    o["statKind"] = STAT_AREA                          # the P10 context statistic: FLD5 words 42-46 (below)
+    o["ctxM0"], o["ctxGLit"], o["ctxFloor"], o["ctxEps"] = f32(1.9645), f32(0.0556), f32(0.1539), f32(0.05)
     for k, i in (("cols", 1), ("rows", 2), ("sub", 3), ("cellW", 4), ("cellH", 5), ("originX", 6), ("originY", 7),
                  ("reachTrueC", 8), ("reachTrueR", 9), ("reachEstC", 10), ("reachEstR", 11), ("curveN", 12)):
         o[k] = int(u[i])
@@ -112,7 +115,17 @@ def read_panel_file(path) -> dict:
         elif o["transfer"] != 0:
             raise ValueError("unknown transfer")
         o["reserved42_47"] = [int(x) for x in u[42:48]]
-    if u[0] == MAGIC4:                                 # words 48-103: the black-frame LED boost block
+    if u[0] == MAGIC5:                                 # words 42-46: the zone statistic (P10)
+        kind = int(u[42])
+        if kind > STAT_CTXPOW:
+            raise ValueError("unknown zone statistic")
+        if kind == STAT_CTXPOW:
+            m0, g, flr, eps = (f32(fl[i]) for i in (43, 44, 45, 46))
+            if not (m0 > 0.0 and np.isfinite(m0)) or not (0.0 <= g <= 1.0) or not (0.0 <= flr <= 1.0) \
+                    or not (0.0 < eps <= 10.0):
+                raise ValueError("implausible context-statistic words")
+            o["statKind"], o["ctxM0"], o["ctxGLit"], o["ctxFloor"], o["ctxEps"] = kind, m0, g, flr, eps
+    if u[0] in (MAGIC4, MAGIC5):                       # words 48-103: the black-frame LED boost block
         n = int(u[48])
         if n > BOOST_MAX_STEPS:
             raise ValueError("implausible boost step count")

@@ -59,6 +59,16 @@ fit, word 41 = sdr_gamma or 0), then 56 more (header = 104 words = 416 bytes):
 The shader multiplies B_true (never B_est) by the looked-up boost, the normalisation fields stay boost-free. A fit
 WITHOUT a boost LUT stays FLD1/FLD2/FLD3 byte for byte; an exe from before 2026-09-18 refuses the FLD4 magic —
 deliberately: it would run the kernels of a boost-aware fit without the boost term.
+FLD5 (magic 0x464C4435, written when the fit's statistic is the P10 CONTEXT statistic, ``FaldParams.stat_kind``
+"ctxpow" — work guide P10, results/fald_p10_2026-10-05/RESULT.md): the FLD4 layout (104 words; the boost block's count
+word 48 may be 0 = no boost) with the zone-statistic words in the FLD3 block's reserved slots:
+  word 42  statistic kind: 0 = area min(peak, Σ/A0) (every older file: the words were reserved, zero), 1 = ctxpow
+  word 43  f: stat_ctx_m0 (nit, > 0)   word 44  f: stat_ctx_g_lit (0..1)   word 45  f: stat_ctx_floor (0..1)
+  word 46  f: stat_ctx_eps (nit, 0 < eps <= 10)   word 47  reserved (0)
+  (kind 1: m = exp(mean over the zone's pixels of ln max(s, eps)), w = m / (m0 + m), gamma = g_lit + (1 - g_lit)(1 - w),
+   stat = peak · min(1, Σ_lit / (A0 · peak))^gamma, drive = max(drive_of(stat), floor · (1 - w) · drive_of(peak)))
+An exe from before the P10 shader refuses the FLD5 magic — deliberately: it would run the area statistic under a fit
+whose kernels and corrections assume the context statistic.
 The C++ reader is LoadFaldPanelParams (src/fald.cpp; tests/test_fald.cpp); words 26-30 are optional —
 zero means 'loader default' so older files stay loadable; an FLD1 file loads with m = (1, 1, 1).
 Keep the two in step when adding a word (the work guide forbids a header word without a C++ test).
@@ -81,6 +91,8 @@ MAGIC = 0x464C4431
 MAGIC2 = 0x464C4432          # 'FLD2': 40-word header (pedestal colour multipliers + validated mode)
 MAGIC3 = 0x464C4433          # 'FLD3': 48-word header (+ signal transfer words 40/41; every "gamma" fit)
 MAGIC4 = 0x464C4434          # 'FLD4': 104-word header (+ the black-frame LED boost block; every fit with a boost_lut)
+MAGIC5 = 0x464C4435          # 'FLD5': the FLD4 layout + the P10 context-statistic words 42-46 (stat_kind "ctxpow")
+STAT_KIND_CODES = {"area": 0, "ctxpow": 1}   # FLD5 word 42 (FaldParams.stat_kind)
 BOOST_RULE_CODES = {"dim": 0, "mean": 1}   # FLD4 word 53 (FaldParams.boost_rule); src/fald.h FALD_BOOST_RULE_*
 BOOST_MAX_STEPS = 24         # src/fald.h FALD_BOOST_MAX_STEPS
 TRANSFER_CODES = {"pq": 0, "gamma": 1}
@@ -104,6 +116,16 @@ def kernel_tables(model: FaldModel):
 def drive_curve_lut(model: FaldModel, n: int = CURVE_N) -> np.ndarray:
     ln = np.linspace(CURVE_LOG_MIN, CURVE_LOG_MAX, n)
     return model.drive_of(np.exp(ln)).astype(np.float32)
+
+
+def stat_ctx_words(p: FaldParams) -> bytes:
+    """FLD5 words 42-47 for the P10 context statistic (kind 1 + m0, g_lit, floor, eps + one reserved zero). Raises
+    ValueError for what the C++ loader would refuse — judged on the float32 values the file stores."""
+    m0, g, fl, eps = (float(np.float32(x)) for x in (p.stat_ctx_m0, p.stat_ctx_g_lit, p.stat_ctx_floor, p.stat_ctx_eps))
+    if not (m0 > 0.0 and np.isfinite(m0)) or not (0.0 <= g <= 1.0) or not (0.0 <= fl <= 1.0) or not (0.0 < eps <= 10.0):
+        raise ValueError(f"context statistic (m0 {m0!r}, g_lit {g!r}, floor {fl!r}, eps {eps!r}) outside the loader's gate "
+                         "(m0 finite > 0, g_lit and floor in 0..1, eps in (0, 10])")
+    return struct.pack("<I4fI", STAT_KIND_CODES["ctxpow"], m0, g, fl, eps, 0)
 
 
 def boost_block(p: FaldParams) -> bytes:
@@ -145,11 +167,13 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
         raise ValueError(f"transfer must be 'pq' or 'gamma', got {p.transfer!r}")
     v2 = p.tmin_rgb is not None
     v3 = p.transfer == "gamma"                       # an SDR/ACM fit always carries its transfer (FLD3)
-    v4 = len(p.boost_lut) > 0                        # a fit with a black-frame LED boost LUT: FLD4 (the long header + the block)
+    v5 = p.stat_kind == "ctxpow"                     # the P10 context statistic: FLD5 (the FLD4 layout + words 42-46)
+    v4 = len(p.boost_lut) > 0 or v5                  # a fit with a black-frame LED boost LUT: FLD4 (the long header + the block)
     if v3 and not (1.0 <= float(p.sdr_gamma) <= 4.0):
         raise ValueError(f"sdr_gamma {p.sdr_gamma!r} outside the loader's 1..4 gate")
-    boost = boost_block(p) if v4 else b""           # validated before anything is written
-    header = [MAGIC4 if v4 else (MAGIC3 if v3 else (MAGIC2 if v2 else MAGIC)), p.cols, p.rows, p.sub,
+    stat_words = stat_ctx_words(p) if v5 else struct.pack("<6I", *([0] * 6))   # validated before anything is written
+    boost = (boost_block(p) if p.boost_lut else struct.pack("<56I", *([0] * 56))) if v4 else b""
+    header = [MAGIC5 if v5 else (MAGIC4 if v4 else (MAGIC3 if v3 else (MAGIC2 if v2 else MAGIC))), p.cols, p.rows, p.sub,
               int(round(p.cell_w)), int(round(p.cell_h)), 0, 0, rt_c, rt_r, re_c, re_r, len(curve)]
     floats = [p.white_nits, p.tmin, p.stat_area0_px2, *p.chan_weights, gain_clip[0], gain_clip[1],
               p.drive_floor_nits, CURVE_LOG_MIN, CURVE_LOG_MAX, p.est_phase_px, p.est_phase_py]
@@ -167,21 +191,22 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
         assert len(buf) == 40 * 4
     if v3 or v4:
         buf += (struct.pack("<I", TRANSFER_CODES[p.transfer]) + struct.pack("<f", float(p.sdr_gamma) if v3 else 0.0)
-                + struct.pack("<6I", *([0] * 6)))
+                + stat_words)
         assert len(buf) == 48 * 4
     if v4:
         buf += boost
         assert len(buf) == 104 * 4
     buf += curve.tobytes() + np.ascontiguousarray(kt).tobytes() + np.ascontiguousarray(ke).tobytes()
     Path(path).write_bytes(buf)
-    fmt = "FLD4" if v4 else ("FLD3" if v3 else ("FLD2" if v2 else "FLD1"))
+    fmt = "FLD5" if v5 else ("FLD4" if v4 else ("FLD3" if v3 else ("FLD2" if v2 else "FLD1")))
     return {"path": str(path), "bytes": len(buf), "k_true_shape": kt.shape, "k_est_shape": ke.shape,
             "curve_n": len(curve), "header_ints": header, "header_floats": floats,
-            "format": fmt, "header_bytes": {"FLD1": 128, "FLD2": 160, "FLD3": 192, "FLD4": 416}[fmt],
+            "format": fmt, "header_bytes": {"FLD1": 128, "FLD2": 160, "FLD3": 192, "FLD4": 416, "FLD5": 416}[fmt],
             "transfer": p.transfer, "sdr_gamma": float(p.sdr_gamma) if v3 else None,
             # the black-frame LED boost (FaldParams.boost_lut) travels in the FLD4 block (work guide C12): a fit with a
             # LUT always exports it (or the export raises), so the shader runs the same boost-aware model as Python
-            "boost_lut_steps": len(p.boost_lut), "boost_in_file": v4, "boost_rule": p.boost_rule if v4 else None}
+            "boost_lut_steps": len(p.boost_lut), "boost_in_file": bool(p.boost_lut),
+            "boost_rule": p.boost_rule if p.boost_lut else None, "stat_kind": "ctxpow" if v5 else "area"}
 
 
 def main(argv=None):

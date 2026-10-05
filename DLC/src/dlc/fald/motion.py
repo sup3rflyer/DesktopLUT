@@ -316,8 +316,8 @@ class MotionModel(FaldModel):
             self.gamma = float(stat.split(":", 1)[1])
             if not 0.0 <= self.gamma <= 1.0:
                 raise ValueError(f"power statistic exponent must be in [0, 1], got {self.gamma}")
-        elif stat not in ("area", "level"):
-            raise ValueError(f"stat must be 'area', 'level' or 'power:<g>', got {stat!r}")
+        elif stat not in ("area", "level", "ctx"):
+            raise ValueError(f"stat must be 'area', 'level', 'ctx' or 'power:<g>', got {stat!r}")
         self.stat = stat
         self._peak: Optional[np.ndarray] = None
 
@@ -326,6 +326,15 @@ class MotionModel(FaldModel):
 
     def _peak_px(self, s: np.ndarray) -> np.ndarray:
         return s if self._peak is None else self._peak
+
+    def cell_drives(self, img: np.ndarray) -> np.ndarray:
+        """``stat`` "ctx" = the P10 context statistic (``FaldParams.stat_ctx_*``, :meth:`FaldModel._ctx_drives`) with the
+        full-resolution peak, whatever ``p.stat_kind`` says; every other ``stat`` goes through :meth:`_area_stat`."""
+        if self.stat == "ctx":
+            return self._ctx_drives(np.minimum(np.max(img, axis=0), self.p.white_nits))
+        if self.p.stat_kind == "ctxpow":                # a ctx fit evaluated under another panel statistic (brackets)
+            return self.drive_of(self._area_stat(np.minimum(np.max(img, axis=0), self.p.white_nits)))
+        return super().cell_drives(img)
 
     def _area_stat(self, s: np.ndarray) -> np.ndarray:
         p = self.p
