@@ -21,6 +21,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cctype>
+#include <random>
 
 static std::recursive_mutex g_dwmInjectMutex;
 static void StopAllVBlankPublishersLocked();   // FALD stage 3 vblank publishers (below CloseDwmHookSharedMemory's helpers)
@@ -1190,8 +1191,10 @@ static void WriteVBlankMapLocked(int left, int top, const FaldVBlankMap* m) {
     h.countAnchor = m ? m->countAnchor : 0;
     h.qpcAnchor = m ? m->qpcAnchor : 0;
     h.periodQpc = m ? m->periodQpc : 0.0;
+    h.epochId = m ? m->epochId : 0ull;
     if (slot) {
         slot->posTag = h.posTag; slot->countAnchor = h.countAnchor; slot->qpcAnchor = h.qpcAnchor; slot->periodQpc = h.periodQpc;
+        slot->epochId = h.epochId;
         std::atomic_thread_fence(std::memory_order_release);
     }
     h.seq += 1u;                                              // even = complete (0 is "never published": skip it)
@@ -1204,6 +1207,34 @@ static void DropVBlankRecordLocked(int left, int top) {
     const uint32_t tag = DwmHookVBlankPosTag(left, top);
     for (size_t i = 0; i < g_vblankPublished.size(); i++)
         if (g_vblankPublished[i].posTag == tag) { g_vblankPublished.erase(g_vblankPublished.begin() + (ptrdiff_t)i); return; }
+}
+
+// The vblank map currently published for the monitor at (left, top) (the host's copy; periodQpc <= 0 = withdrawn).
+// False = no publisher record for it. Takes g_dwmInjectMutex: call it WITHOUT g_monitorSettingsMutex held (the config
+// writer takes them in the order inject -> settings).
+bool DwmInjectVBlankMapAt(int left, int top, DwmHookVBlankMap* out) {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    const uint32_t tag = DwmHookVBlankPosTag(left, top);
+    for (const VBlankPublished& p : g_vblankPublished)
+        if (p.posTag == tag) { if (out) *out = p.map; return true; }
+    return false;
+}
+
+// A fresh numbering-epoch id: random 64-bit, never FALD_PARITY_EPOCH_NONE / _ANY (fald_temporal.h parity fail-safe).
+static unsigned long long NewVBlankEpochId() {
+    static std::atomic<unsigned long long> salt{ 0 };
+    std::random_device rd;
+    unsigned long long v = ((unsigned long long)rd() << 32) ^ (unsigned long long)rd();
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    v ^= ((unsigned long long)q.QuadPart + (++salt)) * 0x9E3779B97F4A7C15ull;
+    if (v == FALD_PARITY_EPOCH_NONE || v == FALD_PARITY_EPOCH_ANY) v = 1ull;
+    return v;
+}
+static std::wstring EpochHex(unsigned long long id) {
+    wchar_t b[24];
+    swprintf_s(b, L"%016llx", id);
+    return b;
 }
 
 // The DXGI output whose desktop rectangle starts at (left, top), with the factory it came from (IsCurrent() later tells
@@ -1265,6 +1296,7 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
     unsigned long long asleepRebinds = 0;
     unsigned long long binds = 0;              // output bindings so far (each one a numbering epoch)
     unsigned long long loggedEpoch = 0;        // the tracker epoch last logged (within the current binding)
+    unsigned long long epochId = 0;            // the published id of the current numbering epoch (bind x tracker epoch)
     bool published = false;                    // the slot holds a valid map (else nothing / withdrawn)
     FaldVBlankSpinGuard guard;                 // judges every wait by its own duration
     ULONGLONG lastStatsMs = GetTickCount64(), lastCheckMs = GetTickCount64();
@@ -1302,12 +1334,14 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
             sincePublish = 0; guard.spins = 0; loggedEpoch = 0;
             lastCheckMs = GetTickCount64();
             binds++;
+            epochId = NewVBlankEpochId();                     // a new numbering epoch: a calibrated parity no longer applies
             LARGE_INTEGER bq;
             QueryPerformanceCounter(&bq);
             if (asleepStreak == 0u)                               // (while asleep: counted, logged once on waking)
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): watching the output's vblanks, nominal "
-                           << nominalMs << L" ms, numbering epoch " << binds << L".0 from count " << first << L" at QPC "
-                           << bq.QuadPart << L" (the panel's parity bit must be calibrated for this epoch)" << std::endl;
+                           << nominalMs << L" ms, numbering epoch " << binds << L".0 (id " << EpochHex(epochId) << L") from count "
+                           << first << L" at QPC " << bq.QuadPart << L" (the panel's parity bit must be calibrated for this epoch)"
+                           << std::endl;
         }
         LARGE_INTEGER waitStart;
         QueryPerformanceCounter(&waitStart);
@@ -1353,11 +1387,12 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
         FaldVBlankTrackerWake(&trk, ret.QuadPart);
         if (trk.epoch != loggedEpoch) {                       // a gap restart or a re-base: a new numbering epoch
             loggedEpoch = trk.epoch;
+            epochId = NewVBlankEpochId();
             if (logLines >= FALD_VBLANK_LOG_LINES) logSuppressed++;
             else {
                 logLines++;
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): numbering epoch " << binds << L"."
-                           << trk.epoch << L" from count " << trk.v << L" at QPC " << ret.QuadPart
+                           << trk.epoch << L" (id " << EpochHex(epochId) << L") from count " << trk.v << L" at QPC " << ret.QuadPart
                            << L" (restarts " << trk.restarts << L", re-bases " << trk.rebases
                            << L"; the parity bit must be calibrated again)" << std::endl;
             }
@@ -1394,15 +1429,17 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
         const bool valid = FaldVBlankTrackerMap(&trk, &m);
         if (trk.epoch != loggedEpoch) {                       // a re-base inside the publish attempt
             loggedEpoch = trk.epoch;
+            epochId = NewVBlankEpochId();
             if (logLines >= FALD_VBLANK_LOG_LINES) logSuppressed++;
             else {
                 logLines++;
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): numbering epoch " << binds << L"."
-                           << trk.epoch << L" from count " << trk.v << L" at QPC " << ret.QuadPart
+                           << trk.epoch << L" (id " << EpochHex(epochId) << L") from count " << trk.v << L" at QPC " << ret.QuadPart
                            << L" (re-base of a moved vblank phase; the parity bit must be calibrated again)" << std::endl;
             }
         }
         const bool wasPublished = published;
+        m.epochId = epochId;
         if (valid) { if (publish(&m)) published = true; }
         else withdraw();
         if (published != wasPublished && logLines >= FALD_VBLANK_LOG_LINES) logSuppressed++;
@@ -1411,7 +1448,7 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
             if (published)
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map published - period "
                            << m.periodQpc * 1000.0 / freq << L" ms, count " << m.countAnchor << L" (epoch " << binds << L"."
-                           << trk.epoch << L")" << std::endl;
+                           << trk.epoch << L", id " << EpochHex(epochId) << L")" << std::endl;
             else
                 std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): map withdrawn - "
                            << VBlankWithheldReason(trk) << std::endl;
@@ -1419,7 +1456,7 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
         if (tick - lastStatsMs >= FALD_VBLANK_STATS_MS) {
             lastStatsMs = tick;
             std::wcout << L"[FALD vblank] (" << pub->left << L"," << pub->top << L"): " << (published ? L"published" : L"withdrawn")
-                       << L", count " << trk.v << L" epoch " << binds << L"." << trk.epoch << L", period "
+                       << L", count " << trk.v << L" epoch " << binds << L"." << trk.epoch << L" (id " << EpochHex(epochId) << L"), period "
                        << trk.periodQpc * 1000.0 / freq << L" ms (" << (trk.periodFit ? L"fitted" : L"NOT fitted") << L"; fit "
                        << (trk.nominalPeriodQpc > 0.0 && trk.fitPeriodQpc > 0.0 ? (trk.fitPeriodQpc / trk.nominalPeriodQpc - 1.0) * 1.0e6 : 0.0)
                        << L" ppm vs nominal " << trk.nominalPeriodQpc * 1000.0 / freq << L" ms, accepted within "
@@ -1634,6 +1671,7 @@ void UpdateDwmHookSharedConfig()
                         t.tempDelayFrames = fs.delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : fs.delayFrames;
                         t.tempClockClosure = FaldPanelClockClosure(fs.clockClosure);
                         t.tempClockParity = FaldPanelClockParity(fs.clockParity);
+                        t.parityEpochId = fs.clockParityEpoch;   // parity applies only inside this epoch (fail-safe)
                         t.refreshMs = mons[i].refreshMs;
                         break;
                     }

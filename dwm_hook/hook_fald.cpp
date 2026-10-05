@@ -929,6 +929,7 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
         ts.delayFrames = t.tempDelayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : t.tempDelayFrames;
         ts.clockClosure = FaldPanelClockClosure(t.tempClockClosure);
         ts.clockParity = FaldPanelClockParity(t.tempClockParity);
+        ts.clockParityEpoch = t.parityEpochId;   // the parity applies only inside its epoch (fail-safe)
         m->refreshMs = (t.refreshMs == t.refreshMs && t.refreshMs > 1.0f && t.refreshMs < 1000.0f) ? t.refreshMs : 0.0f;
     }
     if (!g_temporalCS && (ts.mode == FALD_TEMPORAL_BOTH || ts.mode == FALD_TEMPORAL_TRUE_ONLY)) ts.mode = FALD_TEMPORAL_OFF;
@@ -1391,6 +1392,9 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
                     m->clkW[0], m->clkW[1], m->clkClosure, m->clkParity);
             // stage 3: which index drove the clock, the map the run was offered, and the run's QPC time, so the bench can
             // recompute n = count_anchor + floor((run_qpc - qpc_anchor) / period_qpc) + latency against its own counts
+            fprintf(f, "clock_parity_effective %d (the setting applies only inside its numbering epoch)\n"
+                       "clock_parity_epoch %016llx\n"
+                       "clock_map_epoch %016llx\n", m->clkParityEff, m->tempSettings.clockParityEpoch, m->clkMap.epochId);
             fprintf(f, "clock_source %s (abs = the vblank map's absolute index; grid = the run-time grid, as before stage 3)\n"
                        "clock_map_ok %d\n"
                        "clock_abs_index %llu\n"
@@ -1563,6 +1567,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
         const int got = HookReadVBlankMap(m->left, m->top, &w);
         if (got > 0) {
             m->vmap.countAnchor = w.countAnchor; m->vmap.qpcAnchor = w.qpcAnchor; m->vmap.periodQpc = w.periodQpc;
+            m->vmap.epochId = w.epochId;
             m->vmapValid = true;
         } else if (got == 0) {
             m->vmapValid = false;             // none / withdrawn

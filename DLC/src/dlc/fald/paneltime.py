@@ -142,6 +142,23 @@ def abs_refresh_index(count_anchor: int, qpc_anchor: int, period_qpc: float, t_q
     return n if n >= 0 else None
 
 
+PARITY_EPOCH_NONE = 0                     # C++ FALD_PARITY_EPOCH_NONE: the parity was never bound to an epoch
+PARITY_EPOCH_ANY = (1 << 64) - 1          # C++ FALD_PARITY_EPOCH_ANY: apply whatever the numbering (overlay / manual A/B)
+
+
+def effective_parity(parity: int, parity_epoch: int, abs_ok: bool, map_epoch: int) -> int:
+    """The parity the panel clock applies this run (C++ shared/fald_temporal.cpp FaldPanelClockEffectiveParity; the
+    stage-3 fail-safe, 2026-10-05): a parity calibrated in one vblank-numbering epoch is meaningless in another, and a
+    wrong parity is worse than none — so 0 / 1 apply only when ``parity_epoch`` is ANY, or when the run's map is usable
+    and carries ``parity_epoch`` (never NONE); otherwise -1 (the mean of both clocks)."""
+    parity = parity if parity in (0, 1) else -1
+    if parity < 0:
+        return -1
+    if parity_epoch == PARITY_EPOCH_ANY:
+        return parity
+    return parity if (abs_ok and parity_epoch != PARITY_EPOCH_NONE and map_epoch == parity_epoch) else -1
+
+
 def clock_source_step(prev_index: int, prev_abs: bool, k_grid: int, abs_n: Optional[int]) -> tuple[int, int, int]:
     """Stage 3: which index drives the panel clock this run — ``(source, k, n)``. ``k_grid`` = the grid's k of this run,
     ``abs_n`` = :func:`abs_refresh_index` (``None`` = no usable map), ``prev_index`` / ``prev_abs`` = the last run's index

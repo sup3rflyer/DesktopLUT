@@ -119,6 +119,15 @@ unsigned int FaldPanelClockSettleFrames(float closure);
 // -1 (the mean of both clocks) stays the default, and 0 / 1 mean "the clock ticks on even / odd n" — stable within an
 // epoch across composition regimes. A map that is missing, older than FALD_VBLANK_MAP_MAX_AGE_MS or of another refresh
 // period (a mode change) is not used: the run-time grid drives the clock exactly as before (it keeps locking either way).
+// PARITY FAIL-SAFE (2026-10-05): the panel's parity bit relative to n is only known for the epoch it was calibrated in,
+// and a WRONG parity is worse than none (the 10-05 meter control: mismatched over-darkened 4.51 -> 3.42 nit where
+// unknown averages the clocks). So a parity setting carries the epoch it belongs to, and the clock applies it only while
+// the run's map is usable AND carries that epoch; otherwise the weights are the unknown parity's (1/2, 1/2) —
+// FaldPanelClockEffectiveParity. Switching between the two changes only the clock pass's weights (both clocks' states
+// are always kept), never re-seeds. FALD_PARITY_EPOCH_ANY applies the parity whatever the numbering (the overlay, which
+// has no map; tests; a deliberate manual A/B); FALD_PARITY_EPOCH_NONE never applies it with a stage-3 map.
+constexpr unsigned long long FALD_PARITY_EPOCH_NONE = 0ull;
+constexpr unsigned long long FALD_PARITY_EPOCH_ANY = ~0ull;
 constexpr int FALD_VBLANK_LATENCY_REFRESHES = 1;
 constexpr double FALD_VBLANK_MAP_MAX_AGE_MS = 500.0;
 constexpr double FALD_VBLANK_PERIOD_TOLERANCE = 0.01;   // map period vs the hook's nominal refresh period (relative)
@@ -126,7 +135,11 @@ struct FaldVBlankMap {
     long long countAnchor = 0;   // the publisher's vblank index of the vblank at qpcAnchor (origin arbitrary, see above)
     long long qpcAnchor = 0;     // QPC time of that vblank
     double periodQpc = 0.0;      // refresh period in QPC ticks (<= 0 or not finite: no map)
+    unsigned long long epochId = 0;   // the numbering epoch (random per epoch; 0 = none)
 };
+// The parity the clock applies this run (rules above FALD_PARITY_EPOCH_NONE): `parity` (-1 / 0 / 1) when parityEpoch is
+// FALD_PARITY_EPOCH_ANY, or when the run's map is usable (absOk) and carries parityEpoch (never NONE); else -1.
+int FaldPanelClockEffectiveParity(int parity, unsigned long long parityEpoch, bool absOk, unsigned long long mapEpoch);
 // n for a run at tQpc (formula above, `latency` = L). False (n untouched) = no usable map: the period not finite, outside
 // 1..1000 ms or off nominalRefreshMs by more than FALD_VBLANK_PERIOD_TOLERANCE (nominalRefreshMs <= 0 skips that check);
 // the run more than FALD_VBLANK_MAP_MAX_AGE_MS after the anchor or more than two periods before it; no QPC frequency;
@@ -334,6 +347,7 @@ struct FaldTemporalState {
     // panel clock (mode 3)
     float clkClosure = FALD_CLOCK_CLOSURE_DEFAULT;   // the clamped settings + the refresh period of the last run: a change
     int clkParity = -1;                              // of any of them resets the clocks
+    int clkParityEff = -1;                           // the parity the last run applied (fail-safe; dump)
     float clkRefreshMs = 0.0f;
     long long clkOriginQpc = 0;              // QPC origin of the two times below (the seeding run; rebased hourly)
     double clkTimeMs = 0.0;                  // the last run's time since the origin (dump: k can be replayed offline)
@@ -370,8 +384,11 @@ struct FaldTemporalState {
 // vblankMap (stage 3, optional): when FaldAbsRefreshIndex accepts it, the clock is numbered with the ABSOLUTE index
 // (FaldClockSourceStep; a seed takes n as its index) and parity 0 / 1 mean even / odd vblank counts. Null / unusable:
 // bit for bit the grid clock above.
+// parityEpoch: the epoch `parity` belongs to (fail-safe above; default ANY = the setting applies as such — direct
+// callers / tests; the run orchestration passes FaldTemporalSettings::clockParityEpoch, default NONE). Only the SETTING
+// parity's changes re-seed; the effective parity (clkParityEff) only sets the weights.
 bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFreq, float closure, int parity, float refreshMs,
-                        const FaldVBlankMap* vblankMap = nullptr);
+                        const FaldVBlankMap* vblankMap = nullptr, unsigned long long parityEpoch = FALD_PARITY_EPOCH_ANY);
 // What a run does with the step's result (pure, so the rules are testable without D3D): runPass = dispatch the
 // clock pass (k >= 1), bindMaps = both rounds' kernels read the clock's true / est maps (every non-seeding run, k = 0
 // INCLUDED: the previous run's maps), seedStates = copy this frame's round-1 drives into both clocks, commitPrev = this
@@ -393,6 +410,7 @@ struct FaldTemporalSettings {
     unsigned int delayFrames = 0;
     float clockClosure = FALD_CLOCK_CLOSURE_DEFAULT;
     int clockParity = -1;
+    unsigned long long clockParityEpoch = FALD_PARITY_EPOCH_NONE;   // the epoch clockParity belongs to (fail-safe)
 };
 // Which drive map a kernel / pass reads this run (the caller maps these onto its own textures).
 enum FaldDriveMap : unsigned int {

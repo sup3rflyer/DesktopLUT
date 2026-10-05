@@ -190,24 +190,27 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * 4);
     CHECK(offsetof(DwmHookSharedConfig, _reserved) == 464 - 4 * 4);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[0]) - base) == 464 + 16);
-    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1]) - base) == 464 + 16 + 128);
-    CHECK(sizeof(DwmHookFaldTuning) == 128);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1]) - base) == 464 + 16 + 160);
+    CHECK(sizeof(DwmHookFaldTuning) == 160);                 // tail layout 2 (stage 3 epoch ids)
+    CHECK(DWM_HOOK_TAIL_LAYOUT_VERSION == 2u);
     // LED-lag fields came out of _reserved: their offsets are wire contract too
     CHECK(offsetof(DwmHookFaldTuning, glowReach) == 64);
     CHECK(offsetof(DwmHookFaldTuning, tempMode) == 68);
     CHECK(offsetof(DwmHookFaldTuning, tempClockParity) == 88);
     CHECK(offsetof(DwmHookFaldTuning, refreshMs) == 92);
-    // FALD stage 3: the vblank map took the former _reserved[8] (words 24-31): same offsets, same size, an older DLL
-    // ignores it, an older host leaves seq = 0 (no map)
+    // FALD stage 3: the vblank map starts where layout 1's _reserved[8] was (words 24-31); layout 2 adds its epoch id and
+    // the parity's epoch (a DLL and a host of different layouts reject each other's tail)
     CHECK(offsetof(DwmHookFaldTuning, vblank) == 96);
     CHECK(offsetof(DwmHookVBlankMap, seq) == 0);
     CHECK(offsetof(DwmHookVBlankMap, posTag) == 4);
     CHECK(offsetof(DwmHookVBlankMap, countAnchor) == 8);
     CHECK(offsetof(DwmHookVBlankMap, qpcAnchor) == 16);
     CHECK(offsetof(DwmHookVBlankMap, periodQpc) == 24);
-    CHECK(sizeof(DwmHookVBlankMap) == 32);
-    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1].vblank) - base) == 464 + 16 + 128 + 96);
-    CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 128 * MAX_DWM_HOOK_MONITORS);
+    CHECK(offsetof(DwmHookVBlankMap, epochId) == 32);
+    CHECK(sizeof(DwmHookVBlankMap) == 48);
+    CHECK(offsetof(DwmHookFaldTuning, parityEpochId) == 144);
+    CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1].vblank) - base) == 464 + 16 + 160 + 96);
+    CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 160 * MAX_DWM_HOOK_MONITORS);
     // the position tag: desktop left / top, 16 bits each (negative positions included), distinct per monitor
     CHECK(DwmHookVBlankPosTag(0, 0) == 0u);
     CHECK(DwmHookVBlankPosTag(-3840, 0) == 0x0000F100u);

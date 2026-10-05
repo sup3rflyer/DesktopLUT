@@ -460,8 +460,14 @@ bool FaldVBlankNeedsRebind(bool factoryCurrent, bool descOk, bool attached, int 
     return !(std::fabs(nominalNowMs - nominalMs) <= 1.0e-4f * nominalMs);
 }
 
+int FaldPanelClockEffectiveParity(int parity, unsigned long long parityEpoch, bool absOk, unsigned long long mapEpoch) {
+    parity = FaldPanelClockParity(parity);
+    if (parity < 0) return -1;
+    if (parityEpoch == FALD_PARITY_EPOCH_ANY) return parity;
+    return (absOk && parityEpoch != FALD_PARITY_EPOCH_NONE && mapEpoch == parityEpoch) ? parity : -1;
+}
 bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFreq, float closure, int parity, float refreshMs,
-                        const FaldVBlankMap* vblankMap) {
+                        const FaldVBlankMap* vblankMap, unsigned long long parityEpoch) {
     closure = FaldPanelClockClosure(closure); parity = FaldPanelClockParity(parity);
     if (closure != r->clkClosure || parity != r->clkParity || refreshMs != r->clkRefreshMs) r->stateValid = false;
     r->clkClosure = closure; r->clkParity = parity; r->clkRefreshMs = refreshMs;
@@ -483,6 +489,9 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
     r->clkMap = vblankMap ? *vblankMap : FaldVBlankMap();
     r->clkMapAgeMs = vblankMap ? mapAge : 0.0;
     r->clkRunQpc = nowQpc; r->clkQpcFreq = qpcFreq;
+    // the parity this run applies (fail-safe: only inside the epoch it belongs to) — weights only, never a re-seed
+    const int eff = FaldPanelClockEffectiveParity(parity, parityEpoch, absOk, vblankMap ? vblankMap->epochId : 0ull);
+    r->clkParityEff = eff;
     double x = 0.0;
     if (r->stateValid) {
         r->clkTimeMs = (double)(nowQpc - r->clkOriginQpc) * 1000.0 / (double)qpcFreq;
@@ -496,7 +505,7 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
         r->clkAbs = absOk; r->clkSource = absOk ? FALD_CLOCK_SRC_ABS : FALD_CLOCK_SRC_GRID; r->clkGridK = 0;
         if (absOk) r->clkRunsAbs++; else r->clkRunsGrid++;
         r->stateValid = true;
-        FaldPanelClockFactors(0, 1, closure, parity, r->clkFactor, r->clkW);   // (weights for the dump; the pass does not run)
+        FaldPanelClockFactors(0, 1, closure, eff, r->clkFactor, r->clkW);      // (weights for the dump; the pass does not run)
         return true;
     }
     // the phase-locked grid (rules: fald_temporal.h above FALD_TEMPORAL_PANEL; DLC twin: dlc/fald/paneltime.py RefreshGrid)
@@ -532,7 +541,7 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
         r->clkIndex = n; r->clkElapsed = 0; r->clkSeeded = true;
         return true;
     }
-    if (k > 0ull) FaldPanelClockFactors(n - k, k, closure, parity, r->clkFactor, r->clkW);   // k = 0: the previous
+    if (k > 0ull) FaldPanelClockFactors(n - k, k, closure, eff, r->clkFactor, r->clkW);      // k = 0: the previous
     r->clkElapsed = k; r->clkIndex = n; r->clkSeeded = false;                                // run's words stand
     return false;
 }
@@ -597,7 +606,8 @@ FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSet
     else if (mode == FALD_TEMPORAL_TRUE_ONLY) { run.trueMap = FALD_MAP_FILTERED; }
     run.clock = FaldClockPlan{ false, false, false, false };
     if (run.panel) {
-        const bool seeded = FaldPanelClockStep(r, nowQpc, qpcFreq, s.clockClosure, s.clockParity, refreshMs, vblankMap);
+        const bool seeded = FaldPanelClockStep(r, nowQpc, qpcFreq, s.clockClosure, s.clockParity, refreshMs, vblankMap,
+                                               s.clockParityEpoch);
         run.clock = FaldPanelClockPlan(seeded, r->clkElapsed);
         if (run.clock.bindMaps) { run.trueMap = FALD_MAP_FILTERED; run.estMap = FALD_MAP_CLOCK_EST; }
     }

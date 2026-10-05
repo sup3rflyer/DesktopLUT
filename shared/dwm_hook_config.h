@@ -159,13 +159,15 @@ static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FA
 #define DWM_HOOK_FALD_KICK_ZONE_PX  16
 
 #define DWM_HOOK_TAIL_MAGIC          0x444C4654u   // 'TFLD'
-#define DWM_HOOK_TAIL_LAYOUT_VERSION 1u
+#define DWM_HOOK_TAIL_LAYOUT_VERSION 2u   // 2: stage 3's epoch ids (48-byte vblank map, parityEpochId)
 
 // FALD stage 3 — the "vblank map" of one monitor: its absolute refresh numbering for the hook's panel clock
 // (shared/fald_temporal.h FaldAbsRefreshIndex: n = countAnchor + floor((t - qpcAnchor) / periodQpc) + L). Published by
 // DesktopLUT.exe's vblank publisher thread (src/dwm_inject.cpp) while a FALD layer with LED-lag mode 3 is on that
-// monitor. It takes the LAST 8 WORDS of DwmHookFaldTuning (they were _reserved): no offset, size or layout version
-// changes, an older DLL ignores them, and a host that predates them leaves seq = 0 = no map (the hook's grid clock).
+// monitor. It started as the last 8 words of DwmHookFaldTuning (layout 1); layout 2 (2026-10-05) adds the numbering
+// EPOCH id, so a parity calibrated in one epoch is never applied in another (shared/fald_temporal.h
+// FaldPanelClockEffectiveParity) — a DLL and a host of different layouts reject each other's tail (FALD tuning at
+// defaults, no map: the grid clock).
 // It changes many times a second, so it does NOT go through the head's seqlock (`version`: every bump re-runs the
 // hook's whole config pass, including the monitor-set debounce); it has its own: the publisher bumps `seq` to odd,
 // writes the fields, bumps it to even. UpdateDwmHookSharedConfig rewrites the whole tail inside the head seqlock and
@@ -181,8 +183,11 @@ struct DwmHookVBlankMap {
                                      // clock may be another display's — shared/fald_temporal.h)
     int64_t  qpcAnchor;              // QPC time of that vblank
     double   periodQpc;              // refresh period in QPC ticks; <= 0 = withdrawn (no map)
+    uint64_t epochId;                // the numbering epoch these counts belong to: random per epoch (publisher start,
+                                     // re-bind, tracker restart / re-base), never 0 (none) or ~0 (any)
+    uint64_t _reserved;
 };
-static_assert(sizeof(DwmHookVBlankMap) == 32, "DwmHookVBlankMap must be the 8 former reserved words");
+static_assert(sizeof(DwmHookVBlankMap) == 48, "DwmHookVBlankMap: layout 2");
 static inline uint32_t DwmHookVBlankPosTag(int32_t left, int32_t top) {
     return (uint32_t)(uint16_t)left | ((uint32_t)(uint16_t)top << 16);   // desktop coordinates fit 16 bits each
 }
@@ -204,10 +209,14 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     float    tempClockClosure;
     int32_t  tempClockParity;        // -1 unknown, 0, 1
     float    refreshMs;              // exact nominal refresh period of this monitor (DisplayConfig vSyncFreq); 0 = unknown
-    DwmHookVBlankMap vblank;         // stage 3 (above): the former _reserved[8] — all 32 words of the struct are now used
+    DwmHookVBlankMap vblank;         // stage 3 (above): starts where layout 1's _reserved[8] was
+    uint64_t parityEpochId;          // the numbering epoch tempClockParity was set / calibrated in: parity 0 / 1 applies
+                                     // only while the map carries this epoch (0 = none: never; ~0 = any: always)
+    uint32_t _reserved2[2];
 };
-static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
-static_assert(offsetof(DwmHookFaldTuning, vblank) == 96, "the vblank map sits where _reserved[8] was");
+static_assert(sizeof(DwmHookFaldTuning) == 160, "DwmHookFaldTuning: layout 2 is 160 bytes");
+static_assert(offsetof(DwmHookFaldTuning, vblank) == 96, "the vblank map sits where layout 1's _reserved[8] was");
+static_assert(offsetof(DwmHookFaldTuning, parityEpochId) == 144, "layout 2");
 
 struct DwmHookSharedConfigTail {
     uint32_t magic;                  // DWM_HOOK_TAIL_MAGIC
@@ -221,7 +230,7 @@ struct DwmHookSharedConfigEx {
     DwmHookSharedConfig     head;    // offset 0: the frozen layout, seqlock `version` first
     DwmHookSharedConfigTail tail;    // offset 464
 };
-static_assert(sizeof(DwmHookSharedConfigTail) == 16 + 128 * MAX_DWM_HOOK_MONITORS, "tail layout");
+static_assert(sizeof(DwmHookSharedConfigTail) == 16 + 160 * MAX_DWM_HOOK_MONITORS, "tail layout");
 static_assert(offsetof(DwmHookSharedConfigTail, fald) == 16, "tail layout");
 static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigTail), "head must stay at 464");
 static_assert(offsetof(DwmHookSharedConfigEx, tail) == 464, "the tail starts right after the frozen head");

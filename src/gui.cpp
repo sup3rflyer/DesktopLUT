@@ -1548,10 +1548,23 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldParity, CB_GETCURSEL, 0, 0);
                     int parity = (sel >= 0 && sel <= 2) ? sel - 1 : -1;   // three entries: unknown, 0, 1
+                    // stage 3 fail-safe: the choice binds to the monitor's live numbering epoch and stops applying at the
+                    // next epoch change (restart, re-bind, display event) — read before the settings lock (lock order)
+                    unsigned long long epoch = FALD_PARITY_EPOCH_NONE;
+                    {
+                        MONITORINFO info = { sizeof(info) };
+                        DwmHookVBlankMap live{};
+                        if (g_gui.currentMonitor < (int)g_gui.monitors.size() &&
+                            GetMonitorInfo(g_gui.monitors[g_gui.currentMonitor], &info) &&
+                            DwmInjectVBlankMapAt(info.rcMonitor.left, info.rcMonitor.top, &live) && live.periodQpc > 0.0)
+                            epoch = live.epochId;
+                    }
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
                         FaldSlot(true).clockParity = parity;
                         FaldSlot(false).clockParity = parity;
+                        FaldSlot(true).clockParityEpoch = epoch;
+                        FaldSlot(false).clockParityEpoch = epoch;
                     }
                     ApplyFaldSharedSettingChange();
                     if (parity >= 0)

@@ -47,6 +47,11 @@ void CloseDwmHookSharedMemory();
 // Invalidate cached DXGI monitor info (call on WM_DISPLAYCHANGE).
 void InvalidateDxgiMonitorCache();
 
+// FALD stage 3: the vblank map currently published for the monitor at desktop (left, top) — its numbering epoch id is
+// what a parity calibration binds to (shared/fald_temporal.h parity fail-safe). False = no publisher record. Never call
+// it with g_monitorSettingsMutex held (lock order: inject -> settings).
+bool DwmInjectVBlankMapAt(int left, int top, DwmHookVBlankMap* out);
+
 // True when at least two monitors are indistinguishable to the hook (same size + bit depth):
 // the only rigs where the identity beacon has anything to tell apart.
 bool DwmHookHasTwinMonitors();

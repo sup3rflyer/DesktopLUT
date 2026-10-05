@@ -997,6 +997,70 @@ TEST_CASE("FALD stage 3: the panel clock on the absolute index - regime shifts d
     }
 }
 
+TEST_CASE("FALD stage 3: the parity fail-safe - a parity applies only inside the numbering epoch it belongs to") {
+    // the rule (fald_temporal.h above FALD_PARITY_EPOCH_NONE)
+    const unsigned long long E = 0x1234abcd5678ef90ull, E2 = 0x0badc0ffee000001ull;
+    CHECK(FaldPanelClockEffectiveParity(-1, FALD_PARITY_EPOCH_ANY, true, E) == -1);
+    CHECK(FaldPanelClockEffectiveParity(0, FALD_PARITY_EPOCH_ANY, false, 0) == 0);     // the overlay / manual A/B
+    CHECK(FaldPanelClockEffectiveParity(1, FALD_PARITY_EPOCH_ANY, false, 0) == 1);
+    CHECK(FaldPanelClockEffectiveParity(0, E, true, E) == 0);                          // calibrated, same epoch
+    CHECK(FaldPanelClockEffectiveParity(1, E, true, E) == 1);
+    CHECK(FaldPanelClockEffectiveParity(0, E, true, E2) == -1);                        // another epoch: unknown
+    CHECK(FaldPanelClockEffectiveParity(0, E, false, E) == -1);                        // map stale / missing
+    CHECK(FaldPanelClockEffectiveParity(0, FALD_PARITY_EPOCH_NONE, true, 0) == -1);    // never calibrated (a map of id 0)
+    CHECK(FaldPanelClockEffectiveParity(1, FALD_PARITY_EPOCH_NONE, true, E) == -1);
+    CHECK(FaldPanelClockEffectiveParity(7, FALD_PARITY_EPOCH_ANY, true, E) == -1);     // garbage parity
+    FaldTemporalSettings defaults;
+    CHECK(defaults.clockParityEpoch == FALD_PARITY_EPOCH_NONE);                        // the safe default
+
+    // the clock: weights follow the map's epoch run by run; the switches never re-seed (both clocks' states are kept)
+    const long long freq = 10000000;
+    const float nominal = 16.66665f;
+    Vblanks vb;
+    FaldResources r;
+    auto map = [&](long long i, unsigned long long epoch) { FaldVBlankMap m = vb.map(i - (i % 8)); m.epochId = epoch; return m; };
+    auto run = [&](long long i, const FaldVBlankMap* m, int parity, unsigned long long pe) {
+        return FaldPanelClockStep(&r, vb.at(i) + 20000, freq, 0.72f, parity, nominal, m, pe);
+    };
+    long long i = 0;
+    { const FaldVBlankMap m = map(i, E); CHECK(run(i, &m, 0, E)); i++; }                 // the seed
+    for (; i < 40; i++) { const FaldVBlankMap m = map(i, E); CHECK_FALSE(run(i, &m, 0, E)); }
+    CHECK(r.clkParityEff == 0); CHECK(r.clkW[0] == 1.0f); CHECK(r.clkW[1] == 0.0f);
+    const unsigned long long seededAt = r.clkRunsAbs;
+    // a new epoch arrives (a re-bind: the numbering continued from the elapsed time): unknown at once, no re-seed
+    for (; i < 60; i++) { const FaldVBlankMap m = map(i, E2); CHECK_FALSE(run(i, &m, 0, E)); }
+    CHECK(r.clkParityEff == -1); CHECK(r.clkW[0] == 0.5f); CHECK(r.clkW[1] == 0.5f);
+    CHECK_FALSE(r.clkSeeded); CHECK(r.clkIndex == (unsigned long long)(vb.K + 59 + 1));
+    // the parity re-calibrated in the new epoch: applies again, still no re-seed
+    for (; i < 80; i++) { const FaldVBlankMap m = map(i, E2); CHECK_FALSE(run(i, &m, 0, E2)); }
+    CHECK(r.clkParityEff == 0); CHECK(r.clkW[0] == 1.0f);
+    // the map goes stale (the publisher stopped): unknown — the grid's numbering is not the calibrated one
+    const FaldVBlankMap last = map(80, E2);
+    for (; i < 140; i++) CHECK_FALSE(run(i, &last, 0, E2));
+    CHECK_FALSE(r.clkMapOk); CHECK(r.clkParityEff == -1); CHECK(r.clkW[0] == 0.5f);
+    CHECK(r.clkRunsAbs >= seededAt);
+    // a parity SETTING change still re-seeds (as before stage 3) — with a map the seed takes the absolute index
+    { const FaldVBlankMap m = map(i, E2); CHECK(run(i, &m, 1, E2)); CHECK(r.clkIndex == (unsigned long long)(vb.K + i + 1)); i++; }
+    { const FaldVBlankMap m = map(i, E2); CHECK_FALSE(run(i, &m, 1, E2)); CHECK(r.clkParityEff == 1); CHECK(r.clkW[1] == 1.0f); }
+
+    // through the run orchestration: the settings' default epoch (NONE) never applies a parity next to a map
+    {
+        FaldResources q;
+        FaldTemporalSettings ts; ts.mode = FALD_TEMPORAL_PANEL; ts.clockParity = 0;   // clockParityEpoch = NONE
+        for (long long j = 0; j < 30; j++) {
+            const FaldVBlankMap m = map(j, E);
+            FaldTemporalBeginRun(&q, ts, true, vb.at(j) + 20000, freq, nominal, &m);
+        }
+        CHECK(q.clkParityEff == -1); CHECK(q.clkW[0] == 0.5f);
+        ts.clockParityEpoch = E;
+        for (long long j = 30; j < 60; j++) {
+            const FaldVBlankMap m = map(j, E);
+            FaldTemporalBeginRun(&q, ts, true, vb.at(j) + 20000, freq, nominal, &m);
+        }
+        CHECK(q.clkParityEff == 0); CHECK(q.clkW[0] == 1.0f);
+    }
+}
+
 TEST_CASE("FALD stage 3: a stale or missing map is the run-time grid bit for bit; the numbering survives a stale stretch") {
     const long long freq = 10000000;
     const float nominal = 16.66665f;

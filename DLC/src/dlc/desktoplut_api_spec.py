@@ -90,7 +90,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
                           "fald_ped_mode, fald_ped_colour_in_file, fald_boost_in_file (the panel file is FLD4 with a "
                           "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "
-                          "fald_tau_fall_ms, fald_delay_frames, fald_temporal_closure, fald_temporal_parity (runtime.fald_temporal; the last "
+                          "fald_tau_fall_ms, fald_delay_frames, fald_temporal_closure, fald_temporal_parity, fald_temporal_parity_epoch (runtime.fald_temporal; the last "
                           "two absent on builds before 2026-09-20), fald_starfield (bool) + fald_star_even, "
                           "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
@@ -474,10 +474,32 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "delay_frames": ApiParamSpec("number", required=False, description="0..3"),
                 "closure": ApiParamSpec("number", required=False, description="0.05..1 (temporal_mode 3)"),
                 "parity": ApiParamSpec("number", required=False, description="-1 | 0 | 1 (temporal_mode 3)"),
+                "parity_epoch": ApiParamSpec(
+                    "string", required=False,
+                    description="stage 3 parity fail-safe: the vblank-numbering epoch the parity belongs to — 16 hex "
+                                "digits (the epoch a calibration measured in: runtime.fald_vblank_status), 'current' "
+                                "(the live map's epoch now; the default whenever parity is set without one), 'any' "
+                                "(apply whatever the numbering: manual A/B only) or 'none'. In hook mode a parity 0 / 1 "
+                                "applies only while the published map carries this epoch, else the clocks' mean"),
             },
             {"monitor_mode": "string", "temporal_mode": "number", "tau_rise_ms": "number", "tau_fall_ms": "number",
-             "delay_frames": "number", "closure": "number", "parity": "number", "settle_frames_60hz": "number"},
+             "delay_frames": "number", "closure": "number", "parity": "number", "settle_frames_60hz": "number",
+             "parity_epoch": "string", "live_epoch": "string", "parity_active": "boolean"},
             mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.fald_vblank_status",
+            "FALD stage 3 (read-only): the vblank map DesktopLUT currently publishes for the monitor — its numbering "
+            "epoch id (random per publisher start / re-bind / tracker restart or re-base), count and anchor — and whether "
+            "the mode's parity setting applies right now (parity 0 / 1 whose parity_epoch equals the live epoch, or "
+            "'any'). A parity calibration reads epoch_id at its start and end (the same epoch throughout, else it is "
+            "void) and passes it as runtime.fald_temporal parity_epoch.",
+            {"monitor": _monitor_param(), "mode": _mode_param()},
+            {"monitor_mode": "string", "publisher": "boolean", "published": "boolean", "epoch_id": "string",
+             "count_anchor": "number", "qpc_anchor": "number", "period_ms": "number", "temporal_mode": "number",
+             "parity": "number", "parity_epoch": "string", "parity_active": "boolean"},
+            mutates_state=False,
             gui_thread_required=True,
         ),
         ApiMethodSpec(

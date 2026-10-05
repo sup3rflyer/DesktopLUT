@@ -584,6 +584,8 @@ struct FaldSettings {
     // dlc/fald/paneltime.py): the measured half-refresh-rate sample-and-hold law. Persisted; used by mode 3 only.
     float clockClosure = 0.72f;     // share of the remaining LED drive gap closed per tick, 0.05..1 (FALD_CLOCK_CLOSURE_*)
     int clockParity = -1;           // which refresh the engine ticks on: -1 = unknown (mean of both clocks), 0 / 1 = known
+    unsigned long long clockParityEpoch = 0;   // RUNTIME ONLY (never saved): the stage-3 numbering epoch clockParity
+                                               // belongs to — it applies only inside it (shared/fald_temporal.h fail-safe)
     // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
     // resource for resource and dispatch for dispatch.
     FaldStarfieldSettings star;

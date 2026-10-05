@@ -285,3 +285,19 @@ def test_absolute_index_survives_a_composition_regime_shift_where_the_grid_rerol
         prev_abs = absn is not None
         assert (src, k, n) == (SRC_ABS, 1, K + i + 1), i
     assert len(dev_grid) >= 2                                             # the grid alone re-rolled
+
+
+def test_effective_parity_fail_safe_matches_cpp():
+    """Pinned with tests/test_fald.cpp 'the parity fail-safe' (C++ FaldPanelClockEffectiveParity)."""
+    from dlc.fald.paneltime import PARITY_EPOCH_ANY, PARITY_EPOCH_NONE, effective_parity
+    E, E2 = 0x1234abcd5678ef90, 0x0badc0ffee000001
+    assert effective_parity(-1, PARITY_EPOCH_ANY, True, E) == -1
+    assert effective_parity(0, PARITY_EPOCH_ANY, False, 0) == 0
+    assert effective_parity(1, PARITY_EPOCH_ANY, False, 0) == 1
+    assert effective_parity(0, E, True, E) == 0
+    assert effective_parity(1, E, True, E) == 1
+    assert effective_parity(0, E, True, E2) == -1
+    assert effective_parity(0, E, False, E) == -1
+    assert effective_parity(0, PARITY_EPOCH_NONE, True, 0) == -1
+    assert effective_parity(1, PARITY_EPOCH_NONE, True, E) == -1
+    assert effective_parity(7, PARITY_EPOCH_ANY, True, E) == -1

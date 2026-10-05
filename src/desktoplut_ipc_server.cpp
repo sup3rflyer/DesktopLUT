@@ -373,6 +373,8 @@ std::string MonitorModeKey(int mon, bool isHDR) {
     return std::to_string(mon) + (isHDR ? ":HDR" : ":SDR");
 }
 
+static std::string ParityEpochText(unsigned long long id);   // FALD stage 3 parity fail-safe (below DoFaldTemporal)
+
 // ===========================================================================
 // Correction-grayscale live preview (mhc.grayscale_live_*)
 // ===========================================================================
@@ -739,6 +741,7 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_delay_frames", JNum((double)fs.delayFrames));
                 l.set("fald_temporal_closure", JNum((double)fs.clockClosure));   // temporal mode 3 "panel clock" (work guide C13)
                 l.set("fald_temporal_parity", JNum((double)fs.clockParity));
+                l.set("fald_temporal_parity_epoch", JStr(ParityEpochText(fs.clockParityEpoch)));
                 // starfield balancing (runtime.fald_starfield; work guide S1)
                 l.set("fald_starfield", JBool(fs.star.enabled));
                 l.set("fald_star_even", JNum((double)fs.star.even));
@@ -1682,6 +1685,37 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
 // the measured panel clock (work guide C13, DLC dlc/fald/paneltime.py) with closure (share of the LED gap closed per
 // tick) and parity (-1 unknown / 0 / 1). Persisted per mode like ped_mode (the GUI row sets both modes). Error texts are
 // mirrored by the DLC mock word for word.
+// FALD stage 3 parity fail-safe helpers (shared/fald_temporal.h above FALD_PARITY_EPOCH_NONE). An epoch id travels as
+// text: 16 hex digits, or "any" / "none" (a JSON number cannot carry 64 bits).
+static std::string ParityEpochText(unsigned long long id) {
+    if (id == FALD_PARITY_EPOCH_ANY) return "any";
+    if (id == FALD_PARITY_EPOCH_NONE) return "none";
+    char b[24];
+    snprintf(b, sizeof b, "%016llx", id);
+    return b;
+}
+static bool MonitorTopLeft(int mon, int& left, int& top) {
+    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+    if (mon < 0 || mon >= (int)g_gui.monitors.size()) return false;
+    MONITORINFO info = { sizeof(info) };
+    if (!GetMonitorInfo(g_gui.monitors[mon], &info)) return false;
+    left = info.rcMonitor.left; top = info.rcMonitor.top;
+    return true;
+}
+// The live vblank map of a monitor (published = a usable map right now). Takes the inject lock: never call it with
+// g_monitorSettingsMutex held.
+static bool LiveVBlankMap(int mon, DwmHookVBlankMap& m) {
+    int left = 0, top = 0;
+    m = DwmHookVBlankMap{};
+    if (!MonitorTopLeft(mon, left, top)) return false;
+    return DwmInjectVBlankMapAt(left, top, &m) && m.periodQpc > 0.0;
+}
+static bool ParityActive(int parity, unsigned long long parityEpoch, bool live, unsigned long long liveEpoch) {
+    if (FaldPanelClockParity(parity) < 0) return false;
+    if (parityEpoch == FALD_PARITY_EPOCH_ANY) return true;
+    return live && parityEpoch != FALD_PARITY_EPOCH_NONE && liveEpoch == parityEpoch;
+}
+
 void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -1691,8 +1725,29 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     const JsonValue* df = p.find("delay_frames");
     const JsonValue* cl = p.find("closure");
     const JsonValue* pa = p.find("parity");
+    const JsonValue* pe = p.find("parity_epoch");
     auto isNum = [](const JsonValue* v) { return v && v->type == JsonValue::Num; };
-    if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df) && !isNum(cl) && !isNum(pa)) { error = "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)"; return; }
+    const bool hasPe = pe && pe->type == JsonValue::Str;
+    if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df) && !isNum(cl) && !isNum(pa) && !hasPe) { error = "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1), parity (-1|0|1) or parity_epoch"; return; }
+    // parity_epoch (stage 3 fail-safe): the numbering epoch the parity belongs to — 16 hex digits (the epoch a calibration
+    // measured in; runtime.fald_vblank_status), "current" (the live map's epoch now; the default whenever parity is set
+    // without one), "any" (apply whatever the numbering: manual A/B, never for daily use) or "none"
+    if (pe && !hasPe) { error = "parity_epoch must be a string: 16 hex digits, \"current\", \"any\" or \"none\""; return; }
+    std::string peText = hasPe ? pe->str : (isNum(pa) ? std::string("current") : std::string());
+    unsigned long long peValue = FALD_PARITY_EPOCH_NONE;
+    DwmHookVBlankMap live{};
+    const bool liveOk = LiveVBlankMap(mon, live);                // (inject lock only: before the settings lock)
+    if (!peText.empty()) {
+        if (peText == "any") peValue = FALD_PARITY_EPOCH_ANY;
+        else if (peText == "none") peValue = FALD_PARITY_EPOCH_NONE;
+        else if (peText == "current") peValue = liveOk ? live.epochId : FALD_PARITY_EPOCH_NONE;
+        else {
+            if (peText.size() != 16 || peText.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) {
+                error = "parity_epoch must be 16 hex digits, \"current\", \"any\" or \"none\""; return;
+            }
+            peValue = std::strtoull(peText.c_str(), nullptr, 16);
+        }
+    }
     if (isNum(tm) && !(tm->num == 0 || tm->num == 1 || tm->num == 2 || tm->num == 3)) { error = "temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)"; return; }
     if (isNum(tr) && !(tr->num >= 0 && tr->num <= FALD_TAU_MAX_MS)) { error = "tau_rise_ms must be 0..5000 ms"; return; }
     if (isNum(tf) && !(tf->num >= 0 && tf->num <= FALD_TAU_MAX_MS)) { error = "tau_fall_ms must be 0..5000 ms"; return; }
@@ -1709,8 +1764,9 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
         if (isNum(df)) fs.delayFrames = (unsigned int)df->num;
         if (isNum(cl)) fs.clockClosure = (float)cl->num;
         if (isNum(pa)) fs.clockParity = (int)pa->num;
+        if (!peText.empty()) fs.clockParityEpoch = peValue;
         mode = fs.temporalMode; rise = fs.tauRiseMs; fall = fs.tauFallMs; delay = fs.delayFrames;
-        closure = fs.clockClosure; parity = fs.clockParity;
+        closure = fs.clockClosure; parity = fs.clockParity; peValue = fs.clockParityEpoch;
     }
     SaveSettings();
     FaldPropagate(mon, isHDR);
@@ -1721,6 +1777,9 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("delay_frames", JNum((double)delay));
     result.set("closure", JNum((double)closure));
     result.set("parity", JNum((double)parity));
+    result.set("parity_epoch", JStr(ParityEpochText(peValue)));
+    result.set("live_epoch", JStr(liveOk ? ParityEpochText(live.epochId) : std::string("none")));
+    result.set("parity_active", JBool(ParityActive(parity, peValue, liveOk, live.epochId)));
     // mode 3 settles in refreshes (independent of the rate); the first-order modes in frames at 60 Hz
     result.set("settle_frames_60hz", JNum((double)(mode == FALD_TEMPORAL_PANEL ? FaldPanelClockSettleFrames(closure)
                                                                                : FaldSettleFrames(rise, fall, 1000.0f / 60.0f, delay))));
@@ -1730,6 +1789,39 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
 // area_lo?, area_hi?, peak_hi?, reach?, nb_lo?, nb_hi?}: starfield balancing (EXPERIMENT, default off; work guide S1,
 // reference DLC dlc/fald/starfield.py). Partial updates; persisted per mode (the GUI row sets both modes). Every value
 // is validated BEFORE anything is stored; error texts are mirrored by the DLC mock word for word.
+
+// runtime.fald_vblank_status {monitor, mode}: the stage-3 vblank map currently published for the monitor (read-only) and
+// whether the mode's parity setting applies right now (its epoch = the live map's). A calibration reads the epoch here
+// at its start and end (the same epoch throughout, else it is void) and passes it to runtime.fald_temporal parity_epoch.
+void DoFaldVBlankStatus(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    DwmHookVBlankMap m{};
+    int left = 0, top = 0;
+    const bool pos = MonitorTopLeft(mon, left, top);
+    const bool rec = pos && DwmInjectVBlankMapAt(left, top, &m);
+    const bool live = rec && m.periodQpc > 0.0;
+    int parity = -1; unsigned long long pe = FALD_PARITY_EPOCH_NONE; unsigned int tmode = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        const FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        parity = fs.clockParity; pe = fs.clockParityEpoch; tmode = fs.temporalMode;
+    }
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("publisher", JBool(rec));
+    result.set("published", JBool(live));
+    result.set("epoch_id", JStr(live ? ParityEpochText(m.epochId) : std::string("none")));
+    result.set("count_anchor", JNum(live ? (double)m.countAnchor : 0.0));
+    result.set("qpc_anchor", JNum(live ? (double)m.qpcAnchor : 0.0));
+    result.set("period_ms", JNum(live && f.QuadPart > 0 ? m.periodQpc * 1000.0 / (double)f.QuadPart : 0.0));
+    result.set("temporal_mode", JNum((double)tmode));
+    result.set("parity", JNum((double)parity));
+    result.set("parity_epoch", JStr(ParityEpochText(pe)));
+    result.set("parity_active", JBool(ParityActive(parity, pe, live, m.epochId)));
+}
+
 void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -2463,6 +2555,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_debug") DoFaldDebug(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_dump") DoFaldDump(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_temporal") DoFaldTemporal(*r->params, *r->result, *r->error);
+        else if (m == "runtime.fald_vblank_status") DoFaldVBlankStatus(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_starfield") DoFaldStarfield(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_glowfill") DoFaldGlowFill(*r->params, *r->result, *r->error);
         else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);

@@ -201,7 +201,8 @@ def _fald_state_keys(entry: dict[str, Any] | None, is_hdr: bool = True) -> dict[
                            "fald_delay_frames": int(entry.get("delay_frames", 0)),
                            # temporal mode 3 "panel clock" (2026-09-20, work guide C13): closure per tick + tick parity
                            "fald_temporal_closure": float(entry.get("closure", 0.72)),
-                           "fald_temporal_parity": int(entry.get("parity", -1))}
+                           "fald_temporal_parity": int(entry.get("parity", -1)),
+                           "fald_temporal_parity_epoch": str(entry.get("parity_epoch", "none"))}
     # starfield balancing (2026-09-19, work guide S1; runtime.fald_starfield): the switch + every numeric field
     star = _fald_star(entry)
     out["fald_starfield"] = star["enabled"]
@@ -953,9 +954,15 @@ class MockDesktopLutServer:
             # C++ DoFaldTemporal (2026-09-17): the shader's per-cell drive state (LED-lag filter), persisted per mode
             tm = params.get("temporal_mode"); tr = params.get("tau_rise_ms"); tf = params.get("tau_fall_ms")
             df = params.get("delay_frames"); cl = params.get("closure"); pa = params.get("parity")
+            pe = params.get("parity_epoch")
             num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-            if not (num(tm) or num(tr) or num(tf) or num(df) or num(cl) or num(pa)):
-                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)")
+            if not (num(tm) or num(tr) or num(tf) or num(df) or num(cl) or num(pa) or isinstance(pe, str)):
+                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1), parity (-1|0|1) or parity_epoch")
+            if "parity_epoch" in params and not isinstance(pe, str):
+                return DesktopLutResponse(ok=False, error='parity_epoch must be a string: 16 hex digits, "current", "any" or "none"')
+            if isinstance(pe, str) and pe not in ("current", "any", "none") and not (
+                    len(pe) == 16 and all(c in "0123456789abcdefABCDEF" for c in pe)):
+                return DesktopLutResponse(ok=False, error='parity_epoch must be 16 hex digits, "current", "any" or "none"')
             if num(tm) and tm not in (0, 1, 2, 3):
                 return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)")
             for name, v in (("tau_rise_ms", tr), ("tau_fall_ms", tf)):
@@ -979,6 +986,11 @@ class MockDesktopLutServer:
                 fs["closure"] = float(cl)
             if num(pa):
                 fs["parity"] = int(pa)
+            # the mock publishes no vblank map: 'current' binds to none (the parity stays inactive, as in the app
+            # before a publisher runs)
+            pe_text = pe if isinstance(pe, str) else ("current" if num(pa) else None)
+            if pe_text is not None:
+                fs["parity_epoch"] = "none" if pe_text == "current" else pe_text.lower()
             from dlc.fald.paneltime import MODE_PANEL, settle_refreshes
             from dlc.fald.temporal import settle_frames
             rise = float(fs.get("tau_rise_ms", 0.0)); fall = float(fs.get("tau_fall_ms", 0.0)); delay = int(fs.get("delay_frames", 0))
@@ -986,7 +998,16 @@ class MockDesktopLutServer:
             settle = settle_refreshes(closure) if mode_now == MODE_PANEL else settle_frames(rise, fall, 1000.0 / 60.0, delay)
             return self.ok({"monitor_mode": key, "temporal_mode": mode_now, "tau_rise_ms": rise, "tau_fall_ms": fall,
                             "delay_frames": delay, "closure": closure, "parity": int(fs.get("parity", -1)),
-                            "settle_frames_60hz": settle})
+                            "settle_frames_60hz": settle, "parity_epoch": str(fs.get("parity_epoch", "none")),
+                            "live_epoch": "none",
+                            "parity_active": int(fs.get("parity", -1)) in (0, 1) and fs.get("parity_epoch") == "any"})
+        if method == "runtime.fald_vblank_status":
+            # C++ DoFaldVBlankStatus (stage 3): the mock runs no vblank publisher
+            par = int(fs.get("parity", -1)); pe_s = str(fs.get("parity_epoch", "none"))
+            return self.ok({"monitor_mode": key, "publisher": False, "published": False, "epoch_id": "none",
+                            "count_anchor": 0, "qpc_anchor": 0, "period_ms": 0.0,
+                            "temporal_mode": int(fs.get("temporal_mode", 0)), "parity": par, "parity_epoch": pe_s,
+                            "parity_active": par in (0, 1) and pe_s == "any"})
         if method == "runtime.fald_starfield":
             # C++ DoFaldStarfield (2026-09-19, work guide S1): starfield balancing, partial updates, persisted per mode.
             # Everything is validated before anything is stored; refusals word for word.

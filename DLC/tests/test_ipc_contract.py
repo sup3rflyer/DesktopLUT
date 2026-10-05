@@ -120,6 +120,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(_write_fald_panel(tmp_path / "sdr.bin", "gamma"))}),
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
         ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
+        ("runtime.fald_vblank_status", {"monitor": 0, "mode": "HDR"}),   # stage 3 (read-only; the mock publishes no map)
         ("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.8, "even_reach": 6}),
         ("runtime.fald_glowfill", {"monitor": 0, "mode": "HDR", "enabled": True, "reach": 3}),
         ("layers.set", {**mm, "fald": True}),
@@ -367,13 +368,24 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 2}), raise_on_error=False)
     assert not bad.ok and bad.error == "parity must be -1 (unknown), 0 or 1"
     assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_temporal_closure"] == 0.5                   # a refusal stores nothing
+    # stage 3 parity fail-safe (2026-10-05): a parity binds to a numbering epoch; without a live map ('current' = none)
+    # it stays inactive, 'any' applies it as such, garbage is refused
+    pe = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1})
+    assert pe.ok and pe.result["parity_epoch"] == "none" and pe.result["parity_active"] is False
+    pe = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1, "parity_epoch": "any"})
+    assert pe.ok and pe.result["parity_epoch"] == "any" and pe.result["parity_active"] is True
+    assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_temporal_parity_epoch"] == "any"
+    vs = client.call("runtime.fald_vblank_status", {"monitor": 0, "mode": "HDR"})
+    assert vs.ok and vs.result["published"] is False and vs.result["parity_active"] is True and vs.result["epoch_id"] == "none"
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity_epoch": "12ab"}), raise_on_error=False)
+    assert not bad.ok and bad.error.startswith("parity_epoch must be 16 hex digits")
     client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 0, "closure": 0.72, "parity": -1})
     # ... and the C++ handler carries the same refusals word for word
     if CPP_SERVER.exists():
         cpp = CPP_SERVER.read_text(encoding="utf-8", errors="replace")
         for text in ("temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)", "closure must be 0.05..1",
                      "parity must be -1 (unknown), 0 or 1",
-                     "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)"):
+                     "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1), parity (-1|0|1) or parity_epoch"):
             assert text in cpp, text
     # starfield balancing (2026-09-19, work guide S1): partial updates, persisted per mode, reported in layers[key]
     st0 = client.call("state.get", {}).result["layers"]["0:SDR"]
