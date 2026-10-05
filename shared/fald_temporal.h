@@ -374,6 +374,19 @@ enum FaldVBlankRecheckResult : unsigned int {
 };
 FaldVBlankRecheckResult FaldVBlankRecheck(bool factoryCurrent, bool descOk, bool attached, int outLeft, int outTop, int left,
                                           int top, float nominalMs, float nominalNowMs);
+// The identity a REFRESH must keep (else REBIND: a new epoch). Position + nominal period alone are not an identity on a rig
+// of twin-format panels — the BenQ took the ProArt's (0, 0) while it slept (2026-10-05) — and an HDR / bit-depth switch
+// keeps both while the panel may re-sync (review 2026-10-05): the GDI device name, the colour space and bits per colour
+// (IDXGIOutput6::GetDesc1; not luminance / primaries, which an MHC2 profile can feed) must match too.
+struct FaldVBlankOutputId {
+    wchar_t device[32] = {};      // DXGI_OUTPUT_DESC::DeviceName
+    int left = 0, top = 0;
+    float nominalMs = 0.0f;
+    bool haveDesc1 = false;       // IDXGIOutput6 available: the two below are meaningful
+    unsigned int colorSpace = 0;  // DXGI_COLOR_SPACE_TYPE
+    unsigned int bitsPerColor = 0;
+};
+bool FaldVBlankSameOutput(const FaldVBlankOutputId& bound, const FaldVBlankOutputId& now);
 
 // The per-monitor temporal bookkeeping (no D3D). The overlay's FaldResources and the hook's FaldMonitor both DERIVE
 // from it, so every field is reached the same way (r->clkIndex) and the functions below take either.

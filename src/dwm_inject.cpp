@@ -1220,7 +1220,8 @@ bool DwmInjectVBlankMapAt(int left, int top, DwmHookVBlankMap* out) {
     return false;
 }
 
-// A display / mode change (WM_DISPLAYCHANGE, an HDR flip: gui.cpp StartDwmHookConfigResends): every publisher re-binds at
+// A display / mode change (WM_DISPLAYCHANGE: gui.cpp's handler — NOT the ImmersiveColorSet broadcast, which profile reloads
+// send too; an HDR flip that sends no WM_DISPLAYCHANGE is caught at the next REFRESH by the colour space): every publisher re-binds at
 // its next wake — a new numbering epoch at once instead of at the next 4-s re-check (the panel may have re-synced its
 // timing; a calibrated parity must stop applying immediately).
 static std::atomic<unsigned long long> g_displayGeneration{ 0 };
@@ -1241,6 +1242,24 @@ static std::wstring EpochHex(unsigned long long id) {
     wchar_t b[24];
     swprintf_s(b, L"%016llx", id);
     return b;
+}
+
+// The identity of a bound output (FaldVBlankSameOutput): GDI name, position, the nominal period, colour space + bpc.
+static FaldVBlankOutputId VBlankOutputIdentity(IDXGIOutput* out, float nominalMs) {
+    FaldVBlankOutputId id;
+    id.nominalMs = nominalMs;
+    DXGI_OUTPUT_DESC d = {};
+    if (out && SUCCEEDED(out->GetDesc(&d))) {
+        wcsncpy_s(id.device, d.DeviceName, _TRUNCATE);
+        id.left = (int)d.DesktopCoordinates.left; id.top = (int)d.DesktopCoordinates.top;
+    }
+    IDXGIOutput6* o6 = nullptr;
+    if (out && SUCCEEDED(out->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&o6))) && o6) {
+        DXGI_OUTPUT_DESC1 d1 = {};
+        if (SUCCEEDED(o6->GetDesc1(&d1))) { id.haveDesc1 = true; id.colorSpace = (unsigned int)d1.ColorSpace; id.bitsPerColor = d1.BitsPerColor; }
+        o6->Release();
+    }
+    return id;
 }
 
 // The DXGI output whose desktop rectangle starts at (left, top), with the factory it came from (IsCurrent() later tells
@@ -1301,6 +1320,7 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
     unsigned int asleepStreak = 0;             // consecutive ASLEEP verdicts (re-bind back-off; one log line per streak)
     unsigned long long asleepRebinds = 0;
     unsigned long long factoryRefreshes = 0;   // stale DXGI factories re-acquired without a re-bind (same epoch)
+    FaldVBlankOutputId boundId;                // the bound output's identity (FaldVBlankSameOutput)
     unsigned long long binds = 0;              // output bindings so far (each one a numbering epoch)
     unsigned long long epochId = 0;            // the published id of the current numbering epoch (FaldVBlankEpochKeeper)
     FaldVBlankEpochKeeper keeper;              // when a new id is due (bind, tracker epoch, failed wait, early run)
@@ -1346,6 +1366,7 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
                 first = trk.v + (el >= 1.0 ? (unsigned long long)std::llround(el) : 1ull);
             }
             nominalMs = nm;
+            boundId = VBlankOutputIdentity(out, nominalMs);   // what a later REFRESH must still find
             FaldVBlankTrackerReset(&trk, (double)nominalMs * freq / 1000.0, first);
             sincePublish = 0; guard.spins = 0;
             lastCheckMs = GetTickCount64();
@@ -1436,8 +1457,9 @@ static DWORD WINAPI VBlankPublisherThread(LPVOID param) {
                 IDXGIFactory1* nf = nullptr;
                 IDXGIOutput* no = FindDxgiOutputAt(pub->left, pub->top, &nf);
                 DXGI_OUTPUT_DESC d2 = {};
+                // the SAME output (identity: name, position, period, colour space + bpc) on a current factory — else REBIND
                 const bool same = no && SUCCEEDED(no->GetDesc(&d2)) && d2.AttachedToDesktop &&
-                                  d2.DesktopCoordinates.left == pub->left && d2.DesktopCoordinates.top == pub->top &&
+                                  FaldVBlankSameOutput(boundId, VBlankOutputIdentity(no, RefreshPeriodMsAt(pub->left, pub->top))) &&
                                   FaldVBlankRecheck(nf->IsCurrent() != FALSE, true, true, (int)d2.DesktopCoordinates.left,
                                                     (int)d2.DesktopCoordinates.top, pub->left, pub->top, nominalMs,
                                                     RefreshPeriodMsAt(pub->left, pub->top)) == FALD_VBLANK_RECHECK_OK;

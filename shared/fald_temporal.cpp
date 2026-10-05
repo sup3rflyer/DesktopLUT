@@ -469,6 +469,14 @@ FaldVBlankEpochReason FaldVBlankEpochKeeperStep(FaldVBlankEpochKeeper* k, unsign
     }
     return why;
 }
+bool FaldVBlankSameOutput(const FaldVBlankOutputId& bound, const FaldVBlankOutputId& now) {
+    if (std::wcsncmp(bound.device, now.device, 32) != 0) return false;
+    if (bound.left != now.left || bound.top != now.top) return false;
+    if (!(now.nominalMs > 1.0f) || !(std::fabs(now.nominalMs - bound.nominalMs) <= 1.0e-4f * bound.nominalMs)) return false;
+    if (bound.haveDesc1 != now.haveDesc1) return false;
+    if (bound.haveDesc1 && (bound.colorSpace != now.colorSpace || bound.bitsPerColor != now.bitsPerColor)) return false;
+    return true;
+}
 const char* FaldVBlankEpochReasonText(unsigned int reason) {
     switch (reason) {
         case FALD_VBLANK_EPOCH_BIND: return "binding";

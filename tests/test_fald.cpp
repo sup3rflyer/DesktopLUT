@@ -1439,6 +1439,24 @@ TEST_CASE("FALD stage 3: the publisher's spin guard, output re-check and the Rel
     CHECK(FaldVBlankRecheck(false, true, true, 0, 0, 0, 0, 16.6667f, 20.8542f) == FALD_VBLANK_RECHECK_REBIND);   // stale + mode set
     CHECK(FaldVBlankRecheck(true, true, true, 0, 0, 0, 0, 16.6667f, 0.0f) == FALD_VBLANK_RECHECK_REBIND);
     CHECK(FaldVBlankRecheck(true, true, true, -3840, 0, -3840, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_OK);
+    CHECK(FaldVBlankRecheck(false, true, false, 0, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);   // stale + detached
+    CHECK(FaldVBlankRecheck(false, true, true, 3840, 0, 0, 0, 16.6667f, 16.6667f) == FALD_VBLANK_RECHECK_REBIND);  // stale + moved
+    // the identity a REFRESH must keep: the BenQ at the ProArt's (0, 0) with the same format / period is NOT the same output;
+    // an HDR flip (colour space) or a bit-depth switch is not either
+    {
+        FaldVBlankOutputId a;
+        wcscpy_s(a.device, L"\\\\.\\DISPLAY1"); a.left = 0; a.top = 0; a.nominalMs = 16.6667f;
+        a.haveDesc1 = true; a.colorSpace = 12u; a.bitsPerColor = 10u;   // DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, 10 bpc
+        FaldVBlankOutputId b = a;
+        CHECK(FaldVBlankSameOutput(a, b));
+        b = a; wcscpy_s(b.device, L"\\\\.\\DISPLAY2"); CHECK_FALSE(FaldVBlankSameOutput(a, b));   // another output there
+        b = a; b.colorSpace = 0u; CHECK_FALSE(FaldVBlankSameOutput(a, b));                           // HDR -> SDR
+        b = a; b.bitsPerColor = 8u; CHECK_FALSE(FaldVBlankSameOutput(a, b));
+        b = a; b.left = -3840; CHECK_FALSE(FaldVBlankSameOutput(a, b));
+        b = a; b.nominalMs = 20.8542f; CHECK_FALSE(FaldVBlankSameOutput(a, b));
+        b = a; b.haveDesc1 = false; CHECK_FALSE(FaldVBlankSameOutput(a, b));
+        b = a; b.nominalMs = 16.66669f; CHECK(FaldVBlankSameOutput(a, b));                          // within 1e-4
+    }
     // ReleaseClock voids the clocks' state: the next run RE-SEEDS (never a k = 0 run binding maps no pass has written)
     {
         const long long freq = 10000000;
