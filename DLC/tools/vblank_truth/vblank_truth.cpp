@@ -4,7 +4,11 @@
 // (IDXGIOutput::GetFrameStatistics returns DXGI_ERROR_INVALID_CALL windowed). So this tool shows a 1 x 1 BLACK, STATIC
 // window on the target output's bottom-right pixel (inside the DWM hook's corner kick zone: not counted as content),
 // presents it once per --interval-ms, and logs one (count, QPC) pair per present:
-//     <log>: qpc_now, present_count, present_refresh, sync_refresh, sync_qpc, hr
+//     <log>: qpc_now, present_count, present_refresh, sync_refresh, sync_qpc, hr, out_left, out_top
+// out_left / out_top = the output that present actually went to (IDXGISwapChain::GetContainingOutput): a display in
+// standby can leave the desktop, and then the window would land on ANOTHER display and log its count — the analysis keeps
+// only rows on the target. Every interval the window is re-pinned to the bottom-right pixel of the monitor that contains
+// --at (MonitorFromPoint); while no monitor contains it (the target is gone) nothing is presented ("absent" rows).
 // Nothing on screen ever changes (no toggling stimulus: an LCD must never see a polarity-locked toggle). DWM composes
 // once per interval. Stop: "quit" on stdin, stdin EOF, or the process killed.
 //
@@ -19,6 +23,7 @@
 #include <share.h>
 #include <string>
 #include <thread>
+#include <climits>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "user32.lib")
@@ -86,7 +91,7 @@ int main(int argc, char** argv) {
     if (!f) { puts("fatal cannot open --log"); return 2; }
     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
     fprintf(f, "# qpcfreq=%lld output_left=%ld output_top=%ld interval_ms=%d\n", qf.QuadPart, R.left, R.top, intervalMs);
-    fprintf(f, "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr\n");
+    fprintf(f, "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr,out_left,out_top\n");
     fflush(f);
     char name[64]{}; WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, name, sizeof name, nullptr, nullptr);
     printf("ready output=%s rect=%ld,%ld,%ld,%ld window=%ld,%ld\n", name, R.left, R.top, R.right, R.bottom, R.right - 1, R.bottom - 1);
@@ -107,6 +112,16 @@ int main(int argc, char** argv) {
         if (now < next) { Sleep((DWORD)(next - now < 20 ? next - now : 20)); continue; }
         next += (ULONGLONG)intervalMs;
         if (next < now) next = now + (ULONGLONG)intervalMs;   // (after a stall: no burst of catch-up presents)
+        // the target = the monitor containing --at NOW (it may have left the desktop in standby, or moved)
+        HMONITOR hm = MonitorFromPoint(POINT{ px, py }, MONITOR_DEFAULTTONULL);
+        MONITORINFO mi{ sizeof(mi) };
+        LARGE_INTEGER q0; QueryPerformanceCounter(&q0);
+        if (!hm || !GetMonitorInfoW(hm, &mi)) {
+            fprintf(f, "%lld,0,0,0,0,absent,0,0\n", q0.QuadPart);
+            fflush(f);
+            continue;
+        }
+        SetWindowPos(hwnd, HWND_TOPMOST, mi.rcMonitor.right - 1, mi.rcMonitor.bottom - 1, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
         ctx->ClearRenderTargetView(rtv.Get(), black);      // the same black pixel, every time
         HRESULT hr = sc->Present(1, 0);
@@ -120,8 +135,14 @@ int main(int argc, char** argv) {
             if (SUCCEEDED(sh) && st.PresentCount == last) break;
         }
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
-        fprintf(f, "%lld,%u,%u,%u,%lld,0x%08lx\n", q.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount,
-                st.SyncQPCTime.QuadPart, (unsigned long)(FAILED(hr) ? hr : sh));
+        long ol = LONG_MIN, ot = LONG_MIN;
+        ComPtr<IDXGIOutput> co;
+        if (SUCCEEDED(sc->GetContainingOutput(&co)) && co) {
+            DXGI_OUTPUT_DESC cd;
+            if (SUCCEEDED(co->GetDesc(&cd))) { ol = cd.DesktopCoordinates.left; ot = cd.DesktopCoordinates.top; }
+        }
+        fprintf(f, "%lld,%u,%u,%u,%lld,0x%08lx,%ld,%ld\n", q.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount,
+                st.SyncQPCTime.QuadPart, (unsigned long)(FAILED(hr) ? hr : sh), ol, ot);
         fflush(f);
     }
     fclose(f);

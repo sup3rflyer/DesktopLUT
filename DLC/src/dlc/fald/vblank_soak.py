@@ -54,20 +54,34 @@ def _monitor_point(monitor: int) -> tuple[int, int]:
     return int(x + min(100, w // 2)), int(y + min(100, h // 2))
 
 
+def _index_at(ctrl, point: tuple[int, int]) -> Optional[int]:
+    """DesktopLUT's monitor index of the monitor containing ``point`` NOW (a display in standby can leave the desktop and
+    shift the indices), or None when no monitor contains it."""
+    for m in (ctrl.query_monitors() or {}).get("monitors") or []:
+        r = m.get("rect") or {}
+        if r and r["x"] <= point[0] < r["x"] + r["width"] and r["y"] <= point[1] < r["y"] + r["height"]:
+            return int(m["index"])
+    return None
+
+
 def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.0, truth_ms: int = 1000) -> int:
     out.mkdir(parents=True, exist_ok=True)
     if not TRUTH_EXE.exists():
         raise SystemExit(f"{TRUTH_EXE} not built (tools/vblank_truth/build.cmd)")
     px, py = _monitor_point(monitor)
-    helper = subprocess.Popen([str(TRUTH_EXE), "--at", f"{px},{py}", "--log", str(out / "truth.csv"),
+    k = 0
+    while (out / f"truth_{k}.csv").exists() or (k == 0 and (out / "truth.csv").exists()):
+        k += 1                                      # a resumed soak: a new truth file (the analysis reads them all)
+    truth_path = out / ("truth.csv" if k == 0 else f"truth_{k}.csv")
+    helper = subprocess.Popen([str(TRUTH_EXE), "--at", f"{px},{py}", "--log", str(truth_path),
                                "--interval-ms", str(truth_ms)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     ready = helper.stdout.readline().strip() if helper.stdout else ""
     if not ready.startswith("ready"):
         helper.kill()
         raise SystemExit(f"vblank_truth did not start: {ready!r}")
     meta = {"monitor": monitor, "mode": mode, "hours": hours, "every_s": every_s, "truth_ms": truth_ms, "truth_ready": ready,
-            "started": time.strftime("%Y-%m-%d %H:%M:%S"), "qpc_start": qpc_now()}
-    (out / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
+            "started": time.strftime("%Y-%m-%d %H:%M:%S"), "qpc_start": qpc_now(), "point": [px, py], "truth": truth_path.name}
+    (out / f"meta_{k}.json" if k else out / "meta.json").write_text(json.dumps(meta, indent=1), encoding="utf-8")
     (out / "events.txt").touch()
     print(f"[soak] {ready}; recording to {out} for {hours} h — Ctrl+C stops", file=sys.stderr, flush=True)
     from dlc.controller import CalibrationController
@@ -82,7 +96,12 @@ def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.
                 try:
                     if ctrl is None:
                         ctrl = CalibrationController.connect()
-                    row.update(ctrl.call("runtime.fald_vblank_status", {"monitor": monitor, "mode": mode}))
+                    idx = _index_at(ctrl, (px, py))    # the target by POSITION (indices shift when a display sleeps)
+                    if idx is None:
+                        row["absent"] = True
+                    else:
+                        row["index"] = idx
+                        row.update(ctrl.call("runtime.fald_vblank_status", {"monitor": idx, "mode": mode}))
                     last_err = None
                 except Exception as exc:  # noqa: BLE001 — DesktopLUT restarts are part of the soak
                     ctrl = None
@@ -135,22 +154,29 @@ class Epoch:
 
 
 def load_truth(path: Path) -> tuple[list[TruthSample], int]:
-    """(samples sorted by vblank time, deduplicated) and the QPC frequency."""
+    """(samples sorted by vblank time, deduplicated) and the QPC frequency. ``path`` = one truth CSV, or a run directory
+    (every truth*.csv in it). Rows that went to another output than the target (out_left / out_top, newer helpers) or
+    report no present are dropped."""
     freq = 10_000_000
     rows = []
-    with open(path, encoding="ascii") as fh:
-        lines = []
-        for ln in fh:
-            if ln.startswith("#"):
-                for kv in ln[1:].split():
-                    if kv.startswith("qpcfreq="):
-                        freq = int(kv.split("=", 1)[1])
-            else:
-                lines.append(ln)
-    for r in csv.DictReader(lines):
-        if int(r["hr"], 16) != 0 or int(r["sync_qpc"]) <= 0:
-            continue
-        rows.append(TruthSample(int(r["sync_qpc"]), int(r["sync_refresh"])))
+    paths = sorted(Path(path).glob("truth*.csv")) if Path(path).is_dir() else [Path(path)]
+    for one in paths:
+        lines, target = [], None
+        with open(one, encoding="ascii") as fh:
+            for ln in fh:
+                if ln.startswith("#"):
+                    kvs = dict(kv.split("=", 1) for kv in ln[1:].split() if "=" in kv)
+                    freq = int(kvs.get("qpcfreq", freq))
+                    if "output_left" in kvs:
+                        target = (int(kvs["output_left"]), int(kvs["output_top"]))
+                else:
+                    lines.append(ln)
+        for r in csv.DictReader(lines):
+            if r["hr"] == "absent" or int(r["hr"], 16) != 0 or int(r["sync_qpc"]) <= 0:
+                continue
+            if target is not None and r.get("out_left") not in (None, "") and (int(r["out_left"]), int(r["out_top"])) != target:
+                continue
+            rows.append(TruthSample(int(r["sync_qpc"]), int(r["sync_refresh"])))
     rows.sort(key=lambda s: s.qpc)
     out: list[TruthSample] = []
     for s in rows:
@@ -195,7 +221,7 @@ def truth_at(seg: list[TruthSample], qpc: int, period: float, max_extrap_s: floa
 
 
 def analyse(run: Path, max_extrap_s: float = 3.0) -> dict:
-    truth, freq = load_truth(run / "truth.csv")
+    truth, freq = load_truth(run)
     rows = [json.loads(ln) for ln in open(run / "status.jsonl", encoding="utf-8") if ln.strip()]
     periods = [r["period_ms"] for r in rows if r.get("published") and r.get("period_ms", 0) > 0]
     if not truth or not periods:
@@ -208,10 +234,13 @@ def analyse(run: Path, max_extrap_s: float = 3.0) -> dict:
         seg_of.append((s[0].qpc, s[-1].qpc, i))
     epochs: dict[str, Epoch] = {}
     order: list[str] = []
-    unpublished = errors = no_truth = 0
+    unpublished = errors = no_truth = absent = 0
     for r in rows:
         if "error" in r:
             errors += 1
+            continue
+        if r.get("absent"):
+            absent += 1
             continue
         if not r.get("published"):
             unpublished += 1
@@ -243,7 +272,7 @@ def analyse(run: Path, max_extrap_s: float = 3.0) -> dict:
     events = [ln.rstrip("\n") for ln in open(run / "events.txt", encoding="utf-8")] if (run / "events.txt").exists() else []
     out = {
         "period_ms": period * 1000.0 / freq, "truth_samples": len(truth), "truth_segments": len(segs),
-        "status_rows": len(rows), "pipe_errors": errors, "unpublished": unpublished, "no_truth": no_truth,
+        "status_rows": len(rows), "pipe_errors": errors, "unpublished": unpublished, "no_truth": no_truth, "absent": absent,
         "epochs": [{"epoch_id": epochs[k].epoch_id, "truth_segment": k.split("|seg")[1], "first": epochs[k].first_wall,
                     "last": epochs[k].last_wall, "hours": (epochs[k].last_qpc - epochs[k].first_qpc) / freq / 3600.0,
                     "samples": epochs[k].samples, "offsets": {str(o): c for o, c in epochs[k].offsets.items()},
@@ -262,7 +291,7 @@ def _print_report(rep: dict) -> None:
         print(rep); return
     print(f"period {rep['period_ms']:.5f} ms | truth samples {rep['truth_samples']} in {rep['truth_segments']} segment(s) | "
           f"status rows {rep['status_rows']}: pipe errors {rep['pipe_errors']}, unpublished {rep['unpublished']}, "
-          f"no truth {rep['no_truth']}")
+          f"no truth {rep['no_truth']}, target absent {rep.get('absent', 0)}")
     print(f"{'epoch id':18s} {'seg':>3s} {'first':>8s} {'last':>8s} {'hours':>6s} {'samples':>7s}  offsets / phase / slips")
     for e in rep["epochs"]:
         print(f"{e['epoch_id']:18s} {e['truth_segment']:>3s} {e['first']:>8s} {e['last']:>8s} {e['hours']:6.2f} {e['samples']:7d}  "

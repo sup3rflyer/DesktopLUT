@@ -76,3 +76,31 @@ def test_pipe_errors_and_unpublished_rows_are_counted_not_judged(tmp_path):
     _write(tmp_path / "r", truth, status)
     rep = analyse(tmp_path / "r")
     assert rep["pipe_errors"] == 1 and rep["unpublished"] == 5 and rep["silent_slips"] == 0
+
+
+def test_rows_on_another_output_and_resumed_truth_files(tmp_path):
+    """A display in standby leaves the desktop: the helper's window can land on ANOTHER output — those rows (out_left /
+    out_top != the target's) are dropped; a resumed soak writes truth_1.csv next to truth.csv: both are read."""
+    run = tmp_path / "r"
+    run.mkdir()
+    head = f"# qpcfreq={FREQ} output_left=0 output_top=0 interval_ms=1000\n" \
+           "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr,out_left,out_top\n"
+    with open(run / "truth.csv", "w", encoding="ascii") as fh:
+        fh.write(head)
+        for i in range(0, 3000, 60):
+            fh.write(f"{_vblank(i) + 50000},1,0,{186_000 + i},{_vblank(i)},0x00000000,0,0\n")
+        fh.write(f"{_vblank(3001)},0,0,0,0,absent,0,0\n")
+        for i in range(3060, 3300, 60):        # the window fell onto the BenQ: another count, must be ignored
+            fh.write(f"{_vblank(i) + 50000},1,0,{9_000_000 + i},{_vblank(i)},0x00000000,-3840,-212\n")
+    with open(run / "truth_1.csv", "w", encoding="ascii") as fh:
+        fh.write(head)
+        for i in range(3300, 6000, 60):
+            fh.write(f"{_vblank(i) + 50000},1,0,{186_000 + i},{_vblank(i)},0x00000000,0,0\n")
+    with open(run / "status.jsonl", "w", encoding="utf-8") as fh:
+        for i in range(10, 5900, 60):
+            fh.write(json.dumps(_status(i, "aaaa", 5)) + "\n")
+        fh.write(json.dumps({"qpc": _vblank(5950), "wall": "z", "absent": True}) + "\n")
+    tr, _ = load_truth(run)
+    assert all(s.count < 9_000_000 for s in tr) and len(tr) == 50 + 45
+    rep = analyse(run)
+    assert rep["silent_slips"] == 0 and rep["absent"] == 1 and rep["truth_segments"] == 1
