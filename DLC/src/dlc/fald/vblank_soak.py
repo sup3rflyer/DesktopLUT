@@ -38,7 +38,7 @@ from typing import Optional
 
 DLC = Path(__file__).resolve().parents[3]
 TRUTH_EXE = DLC / "tools" / "vblank_truth" / "bin" / "vblank_truth.exe"
-PHASE_WARN = 0.25          # an anchor further than this (periods) from just-after-a-vblank is reported
+PHASE_LO, PHASE_HI = -0.05, 0.25   # a map anchor sits just AFTER its vblank (the wakes' latency floor): outside = "far"
 
 
 def qpc_now() -> int:
@@ -164,12 +164,23 @@ class Epoch:
     parity_active: int = 0
 
 
-def load_truth(path: Path) -> tuple[list[TruthSample], int]:
+def _run_hardware_id(run: Path) -> Optional[str]:
+    for m in sorted(Path(run).glob("meta*.json")):
+        hw = json.loads(m.read_text(encoding="utf-8")).get("hardware_id")
+        if hw:
+            return hw
+    return None
+
+
+def load_truth(path: Path, target_hw: Optional[str] = None) -> tuple[list[TruthSample], int]:
     """(samples sorted by vblank time, deduplicated) and the QPC frequency. ``path`` = one truth CSV, or a run directory
-    (every truth*.csv in it). Rows that went to another output than the target (out_left / out_top, newer helpers) or
-    report no present are dropped."""
+    (every truth*.csv in it; the target's EDID id from its meta*.json unless given). Rows that went to another output
+    than the target — by EDID id (out_hw, newer helpers: another display can take the target's POSITION while it sleeps)
+    or by position (out_left / out_top) — or report no present are dropped."""
     freq = 10_000_000
     rows = []
+    if target_hw is None and Path(path).is_dir():
+        target_hw = _run_hardware_id(Path(path))
     paths = sorted(Path(path).glob("truth*.csv")) if Path(path).is_dir() else [Path(path)]
     for one in paths:
         lines, target = [], None
@@ -186,6 +197,8 @@ def load_truth(path: Path) -> tuple[list[TruthSample], int]:
             if r["hr"] == "absent" or int(r["hr"], 16) != 0 or int(r["sync_qpc"]) <= 0:
                 continue
             if target is not None and r.get("out_left") not in (None, "") and (int(r["out_left"]), int(r["out_top"])) != target:
+                continue
+            if target_hw and r.get("out_hw") and r["out_hw"] != target_hw:
                 continue
             rows.append(TruthSample(int(r["sync_qpc"]), int(r["sync_refresh"])))
     rows.sort(key=lambda s: s.qpc)
@@ -215,8 +228,10 @@ def truth_segments(samples: list[TruthSample], period: float, tol: float = 0.25)
 
 
 def truth_at(seg: list[TruthSample], qpc: int, period: float, max_extrap_s: float, freq: int) -> Optional[tuple[int, float]]:
-    """(the true vblank count of the last vblank at or before ``qpc``, the phase of ``qpc`` after it in periods) from the
-    nearest sample of the segment, or None when the nearest is more than ``max_extrap_s`` away."""
+    """(the true vblank count of the vblank NEAREST to ``qpc``, the phase of ``qpc`` from it in periods, -0.5..0.5) from
+    the nearest sample of the segment, or None when the nearest is more than ``max_extrap_s`` away. Nearest, not "last at
+    or before": a map anchor sits ~0.002 period after its vblank, and a floor() boundary there turned a few ppm of
+    period error into a count one low (review 2026-10-05) — a false slip in the soak, a wrong parity in parity_bind."""
     import bisect
     qs = [s.qpc for s in seg]
     i = bisect.bisect_left(qs, qpc)
@@ -227,7 +242,7 @@ def truth_at(seg: list[TruthSample], qpc: int, period: float, max_extrap_s: floa
     if best is None or abs(best.qpc - qpc) > max_extrap_s * freq:
         return None
     x = (qpc - best.qpc) / period
-    k = int(x // 1)
+    k = int(round(x))
     return best.count + k, x - k
 
 
@@ -289,11 +304,35 @@ def analyse(run: Path, max_extrap_s: float = 3.0) -> dict:
         e.samples += 1
         e.last_wall, e.last_qpc = r["wall"], r["qpc"]
         e.phase_min = min(e.phase_min, phase); e.phase_max = max(e.phase_max, phase)
-        if PHASE_WARN < phase < 1.0 - 0.02:
+        if not (PHASE_LO <= phase <= PHASE_HI):
             e.phase_far += 1
         if r.get("parity_active"):
             e.parity_active += 1
     events = [ln.rstrip("\n") for ln in open(run / "events.txt", encoding="utf-8")] if (run / "events.txt").exists() else []
+    # each event's QPC: "qpc=N" when noted by `note` (newer), else the status row with the same wall time
+    wall_qpc = {}
+    for r in rows:
+        wall_qpc.setdefault(r.get("wall"), r.get("qpc"))
+    ev_q = []
+    for ev in events:
+        parts = ev.split()
+        q = next((int(t[4:]) for t in parts if t.startswith("qpc=")), None)
+        ev_q.append((q if q is not None else wall_qpc.get(parts[0] if parts else None), ev))
+    # ADJUDICATION (review 2026-10-05): an epoch that survives a reset of Windows' counter (it spans two truth segments)
+    # or a noted display event (inside its span) kept its id through something that may have re-synced the panel — the
+    # count may be right, the parity may not: not a PASS, a judgement for the LLM / owner
+    segs_of_epoch: dict = {}
+    for k in order:
+        segs_of_epoch.setdefault(epochs[k].epoch_id, set()).add(k.split("|seg")[1])
+    adjudicate = []
+    for eid, ss in segs_of_epoch.items():
+        if len(ss) > 1:
+            adjudicate.append(f"epoch {eid} spans {len(ss)} Windows-counter segments (a counter reset inside one epoch)")
+    for k in order:
+        e = epochs[k]
+        for q, ev in ev_q:
+            if q is not None and e.first_qpc < q < e.last_qpc:
+                adjudicate.append(f"epoch {e.epoch_id} kept its id through event '{ev}'")
     out = {
         "period_ms": period * 1000.0 / freq, "truth_samples": len(truth), "truth_segments": len(segs),
         "status_rows": len(rows), "pipe_errors": errors, "unpublished": unpublished, "no_truth": no_truth, "absent": absent,
@@ -306,7 +345,13 @@ def analyse(run: Path, max_extrap_s: float = 3.0) -> dict:
         "events": events,
     }
     out["silent_slips"] = sum(len(e["silent_slips"]) for e in out["epochs"])
-    out["verdict"] = ("PASS: no silent slip" if out["silent_slips"] == 0 else f"FAIL: {out['silent_slips']} silent slip(s)")
+    out["adjudicate"] = adjudicate
+    if out["silent_slips"]:
+        out["verdict"] = f"FAIL: {out['silent_slips']} silent slip(s)"
+    elif adjudicate:
+        out["verdict"] = f"ADJUDICATE: no silent slip, but {len(adjudicate)} epoch(s) survived a reset / event (see 'adjudicate')"
+    else:
+        out["verdict"] = "PASS: no silent slip"
     return out
 
 
@@ -324,6 +369,8 @@ def _print_report(rep: dict) -> None:
               + (f" | parity active {e['parity_active_samples']}" if e["parity_active_samples"] else ""))
     if rep["events"]:
         print("events:"); [print("  " + ev) for ev in rep["events"]]
+    for a in rep.get("adjudicate", []):
+        print("ADJUDICATE: " + a)
     print(rep["verdict"])
 
 
@@ -344,12 +391,12 @@ def main(argv=None) -> int:
                       point=pt)
     if args.cmd == "note":
         with open(Path(args.run) / "events.txt", "a", encoding="utf-8") as fh:
-            fh.write(f"{time.strftime('%H:%M:%S')} {args.text}\n")
+            fh.write(f"{time.strftime('%H:%M:%S')} qpc={qpc_now()} {args.text}\n")
         return 0
     rep = analyse(Path(args.run))
     (Path(args.run) / "analysis.json").write_text(json.dumps(rep, indent=1), encoding="utf-8")
     _print_report(rep)
-    return 0 if rep.get("silent_slips", 1) == 0 else 1
+    return 0 if rep.get("verdict", "").startswith("PASS") else 1
 
 
 if __name__ == "__main__":

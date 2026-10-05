@@ -66,6 +66,8 @@ def test_a_reset_of_windows_counter_splits_the_truth_not_our_count(tmp_path):
     rep = analyse(tmp_path / "r")
     assert rep["silent_slips"] == 0 and rep["truth_segments"] == 2
     assert len(rep["epochs"]) == 2                     # the same epoch id, two truth segments: reported separately
+    # ... and it is NOT a pass: the epoch survived a reset of Windows' counter (a modeset) — the parity may have moved
+    assert rep["verdict"].startswith("ADJUDICATE") and "spans 2" in rep["adjudicate"][0]
 
 
 def test_pipe_errors_and_unpublished_rows_are_counted_not_judged(tmp_path):
@@ -120,3 +122,39 @@ def test_truth_samples_while_the_target_was_absent_are_dropped(tmp_path):
     rep = analyse(run)
     assert rep["silent_slips"] == 0 and rep["truth_segments"] == 1     # the BenQ stretch is gone: one consistent timeline
     assert [e["epoch_id"] for e in rep["epochs"]] == ["aaaa", "bbbb"]
+
+
+def test_an_event_inside_an_epoch_needs_adjudication(tmp_path):
+    truth = [(_vblank(i), 186_000 + i) for i in range(0, 6000, 60)]
+    status = [_status(i, "aaaa", 5) for i in range(10, 5900, 60)]
+    _write(tmp_path / "r", truth, status)
+    (tmp_path / "r" / "events.txt").write_text(f"02:10:00 qpc={_vblank(3000)} HDR off/on\n", encoding="utf-8")
+    rep = analyse(tmp_path / "r")
+    assert rep["silent_slips"] == 0 and rep["verdict"].startswith("ADJUDICATE")
+    assert "HDR off/on" in rep["adjudicate"][0]
+
+
+def test_anchor_just_before_the_grid_point_is_not_a_slip(tmp_path):
+    # a few ppm of period error put the anchor a hair BEFORE the extrapolated vblank: nearest, not floor (review)
+    truth = [(_vblank(i), 186_000 + i) for i in range(0, 6000, 60)]
+    status = [_status(i, "aaaa", 5, lat=-150) if i % 120 == 10 else _status(i, "aaaa", 5) for i in range(10, 5900, 60)]
+    _write(tmp_path / "r", truth, status)
+    rep = analyse(tmp_path / "r")
+    assert rep["silent_slips"] == 0 and rep["verdict"].startswith("PASS")
+    assert rep["epochs"][0]["phase_min"] < 0.0
+
+
+def test_truth_rows_of_another_display_by_edid(tmp_path):
+    run = tmp_path / "r"
+    run.mkdir()
+    (run / "meta.json").write_text('{"hardware_id": "AUS322A"}', encoding="utf-8")
+    head = f"# qpcfreq={FREQ} output_left=0 output_top=0 interval_ms=1000\n" \
+           "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr,out_left,out_top,out_hw\n"
+    with open(run / "truth.csv", "w", encoding="ascii") as fh:
+        fh.write(head)
+        for i in range(0, 3000, 60):
+            fh.write(f"{_vblank(i) + 50000},1,0,{186_000 + i},{_vblank(i)},0x00000000,0,0,AUS322A\n")
+        for i in range(3000, 3600, 60):     # the BenQ at the SAME position (0, 0)
+            fh.write(f"{_vblank(i) + 50000},1,0,{9_000_000 + i},{_vblank(i)},0x00000000,0,0,BNQ802E\n")
+    tr, _ = load_truth(run)
+    assert len(tr) == 50 and all(s.count < 9_000_000 for s in tr)

@@ -4,10 +4,11 @@
 // (IDXGIOutput::GetFrameStatistics returns DXGI_ERROR_INVALID_CALL windowed). So this tool shows a 1 x 1 BLACK, STATIC
 // window on the target output's bottom-right pixel (inside the DWM hook's corner kick zone: not counted as content),
 // presents it once per --interval-ms, and logs one (count, QPC) pair per present:
-//     <log>: qpc_now, present_count, present_refresh, sync_refresh, sync_qpc, hr, out_left, out_top
+//     <log>: qpc_now, present_count, present_refresh, sync_refresh, sync_qpc, hr, out_left, out_top, out_hw
 // out_left / out_top = the output that present actually went to (IDXGISwapChain::GetContainingOutput): a display in
 // standby can leave the desktop, and then the window would land on ANOTHER display and log its count — the analysis keeps
-// only rows on the target. Every interval the window is re-pinned to the bottom-right pixel of the monitor that contains
+// only rows on the target; out_hw = that output's monitor EDID id (e.g. AUS322A, from its device interface path) — the
+// identity, since another display can take the target's POSITION while it sleeps. Every interval the window is re-pinned to the bottom-right pixel of the monitor that contains
 // --at (MonitorFromPoint); while no monitor contains it (the target is gone) nothing is presented ("absent" rows).
 // Nothing on screen ever changes (no toggling stimulus: an LCD must never see a polarity-locked toggle). DWM composes
 // once per interval. Stop: "quit" on stdin, stdin EOF, or the process killed.
@@ -91,7 +92,7 @@ int main(int argc, char** argv) {
     if (!f) { puts("fatal cannot open --log"); return 2; }
     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
     fprintf(f, "# qpcfreq=%lld output_left=%ld output_top=%ld interval_ms=%d\n", qf.QuadPart, R.left, R.top, intervalMs);
-    fprintf(f, "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr,out_left,out_top\n");
+    fprintf(f, "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr,out_left,out_top,out_hw\n");
     fflush(f);
     char name[64]{}; WideCharToMultiByte(CP_UTF8, 0, od.DeviceName, -1, name, sizeof name, nullptr, nullptr);
     printf("ready output=%s rect=%ld,%ld,%ld,%ld window=%ld,%ld\n", name, R.left, R.top, R.right, R.bottom, R.right - 1, R.bottom - 1);
@@ -117,7 +118,7 @@ int main(int argc, char** argv) {
         MONITORINFO mi{ sizeof(mi) };
         LARGE_INTEGER q0; QueryPerformanceCounter(&q0);
         if (!hm || !GetMonitorInfoW(hm, &mi)) {
-            fprintf(f, "%lld,0,0,0,0,absent,0,0\n", q0.QuadPart);
+            fprintf(f, "%lld,0,0,0,0,absent,0,0,\n", q0.QuadPart);
             fflush(f);
             continue;
         }
@@ -136,13 +137,27 @@ int main(int argc, char** argv) {
         }
         LARGE_INTEGER q; QueryPerformanceCounter(&q);
         long ol = LONG_MIN, ot = LONG_MIN;
+        char hw[16] = "";
         ComPtr<IDXGIOutput> co;
         if (SUCCEEDED(sc->GetContainingOutput(&co)) && co) {
             DXGI_OUTPUT_DESC cd;
-            if (SUCCEEDED(co->GetDesc(&cd))) { ol = cd.DesktopCoordinates.left; ot = cd.DesktopCoordinates.top; }
+            if (SUCCEEDED(co->GetDesc(&cd))) {
+                ol = cd.DesktopCoordinates.left; ot = cd.DesktopCoordinates.top;
+                // the monitor's device interface path: \\?\DISPLAY#AUS322A#... -> AUS322A
+                DISPLAY_DEVICEW dd{}; dd.cb = sizeof(dd);
+                if (EnumDisplayDevicesW(cd.DeviceName, 0, &dd, EDD_GET_DEVICE_INTERFACE_NAME)) {
+                    const wchar_t* a = wcsstr(dd.DeviceID, L"DISPLAY#");
+                    if (a) {
+                        a += 8;
+                        int k = 0;
+                        while (a[k] && a[k] != L'#' && k < 15) { hw[k] = (char)a[k]; k++; }
+                        hw[k] = 0;
+                    }
+                }
+            }
         }
-        fprintf(f, "%lld,%u,%u,%u,%lld,0x%08lx,%ld,%ld\n", q.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount,
-                st.SyncQPCTime.QuadPart, (unsigned long)(FAILED(hr) ? hr : sh), ol, ot);
+        fprintf(f, "%lld,%u,%u,%u,%lld,0x%08lx,%ld,%ld,%s\n", q.QuadPart, st.PresentCount, st.PresentRefreshCount, st.SyncRefreshCount,
+                st.SyncQPCTime.QuadPart, (unsigned long)(FAILED(hr) ? hr : sh), ol, ot, hw);
         fflush(f);
     }
     fclose(f);
