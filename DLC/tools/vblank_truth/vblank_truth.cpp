@@ -51,20 +51,24 @@ int main(int argc, char** argv) {
 
     // the output containing (px, py)
     ComPtr<IDXGIFactory1> factory;
-    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) { puts("fatal CreateDXGIFactory1"); return 2; }
     ComPtr<IDXGIAdapter1> adapter; ComPtr<IDXGIOutput> output; DXGI_OUTPUT_DESC od{};
-    for (UINT ai = 0; !output && factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
-        ComPtr<IDXGIOutput> o;
-        for (UINT oi = 0; adapter->EnumOutputs(oi, &o) == S_OK; oi++) {
-            DXGI_OUTPUT_DESC d; o->GetDesc(&d);
-            const RECT& r = d.DesktopCoordinates;
-            if (d.AttachedToDesktop && px >= r.left && px < r.right && py >= r.top && py < r.bottom) { output = o; od = d; break; }
-            o.Reset();
+    auto findOutput = [&]() -> bool {
+        factory.Reset(); adapter.Reset(); output.Reset();
+        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+        for (UINT ai = 0; !output && factory->EnumAdapters1(ai, &adapter) == S_OK; ai++) {
+            ComPtr<IDXGIOutput> o;
+            for (UINT oi = 0; adapter->EnumOutputs(oi, &o) == S_OK; oi++) {
+                DXGI_OUTPUT_DESC d; o->GetDesc(&d);
+                const RECT& r = d.DesktopCoordinates;
+                if (d.AttachedToDesktop && px >= r.left && px < r.right && py >= r.top && py < r.bottom) { output = o; od = d; break; }
+                o.Reset();
+            }
+            if (!output) adapter.Reset();
         }
-        if (!output) adapter.Reset();
-    }
-    if (!output) { puts("fatal no output at --at"); return 2; }
-    const RECT& R = od.DesktopCoordinates;
+        return output != nullptr;
+    };
+    if (!findOutput()) { puts("fatal no output at --at"); return 2; }
+    const RECT R = od.DesktopCoordinates;
 
     WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"DlcVBlankTruth";
     RegisterClassW(&wc);
@@ -73,20 +77,29 @@ int main(int argc, char** argv) {
     if (!hwnd) { puts("fatal CreateWindowEx"); return 2; }
     ShowWindow(hwnd, SW_SHOWNOACTIVATE);
 
+    // the D3D objects; REBUILT whenever the factory goes stale or the containing output cannot be read (2026-10-05: a
+    // helper started while another display held the target's position kept presenting after the target came back, but
+    // GetContainingOutput failed on its stale objects — every row unidentifiable)
     ComPtr<ID3D11Device> dev; ComPtr<ID3D11DeviceContext> ctx;
-    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
-        puts("fatal D3D11CreateDevice"); return 2;
-    }
-    ComPtr<IDXGIFactory2> f2; factory.As(&f2);
-    DXGI_SWAP_CHAIN_DESC1 sd{};
-    sd.Width = 1; sd.Height = 1; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    ComPtr<IDXGISwapChain1> sc;
-    if (FAILED(f2->CreateSwapChainForHwnd(dev.Get(), hwnd, &sd, nullptr, nullptr, &sc))) { puts("fatal CreateSwapChainForHwnd"); return 2; }
-    f2->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-    ComPtr<ID3D11Texture2D> bb; sc->GetBuffer(0, IID_PPV_ARGS(&bb));
-    ComPtr<ID3D11RenderTargetView> rtv; dev->CreateRenderTargetView(bb.Get(), nullptr, &rtv);
+    ComPtr<IDXGISwapChain1> sc; ComPtr<ID3D11Texture2D> bb; ComPtr<ID3D11RenderTargetView> rtv;
+    auto buildD3D = [&]() -> bool {
+        if (ctx) { ctx->ClearState(); ctx->Flush(); }
+        rtv.Reset(); bb.Reset(); sc.Reset(); ctx.Reset(); dev.Reset();     // one flip swapchain per window: the old one first
+        D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+        if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ctx)))
+            return false;
+        ComPtr<IDXGIFactory2> f2; factory.As(&f2);
+        DXGI_SWAP_CHAIN_DESC1 sd{};
+        sd.Width = 1; sd.Height = 1; sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.SampleDesc.Count = 1;
+        sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.BufferCount = 2; sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        if (FAILED(f2->CreateSwapChainForHwnd(dev.Get(), hwnd, &sd, nullptr, nullptr, &sc))) return false;
+        f2->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
+        sc->GetBuffer(0, IID_PPV_ARGS(&bb));
+        dev->CreateRenderTargetView(bb.Get(), nullptr, &rtv);
+        return true;
+    };
+    if (!buildD3D()) { puts("fatal D3D setup"); return 2; }
+    unsigned int noContaining = 0, rebuilds = 0;
 
     FILE* f = _fsopen(log.c_str(), "w", _SH_DENYNO);   // shared: an analysis may read it while the soak runs
     if (!f) { puts("fatal cannot open --log"); return 2; }
@@ -123,6 +136,15 @@ int main(int argc, char** argv) {
             continue;
         }
         SetWindowPos(hwnd, HWND_TOPMOST, mi.rcMonitor.right - 1, mi.rcMonitor.bottom - 1, 1, 1, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (!factory || !factory->IsCurrent() || noContaining >= 2) {   // stale objects: rebuild them on the current topology
+            noContaining = 0;
+            if (!findOutput() || !buildD3D()) {
+                fprintf(f, "%lld,0,0,0,0,rebuild_failed,0,0,\n", q0.QuadPart);
+                fflush(f);
+                continue;
+            }
+            rebuilds++;
+        }
         ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
         ctx->ClearRenderTargetView(rtv.Get(), black);      // the same black pixel, every time
         HRESULT hr = sc->Present(1, 0);
@@ -139,7 +161,9 @@ int main(int argc, char** argv) {
         long ol = LONG_MIN, ot = LONG_MIN;
         char hw[16] = "";
         ComPtr<IDXGIOutput> co;
-        if (SUCCEEDED(sc->GetContainingOutput(&co)) && co) {
+        if (FAILED(sc->GetContainingOutput(&co)) || !co) noContaining++;
+        else noContaining = 0;
+        if (co) {
             DXGI_OUTPUT_DESC cd;
             if (SUCCEEDED(co->GetDesc(&cd))) {
                 ol = cd.DesktopCoordinates.left; ot = cd.DesktopCoordinates.top;

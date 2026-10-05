@@ -64,6 +64,46 @@ def _monitor_at(ctrl, point: tuple[int, int]) -> Optional[dict]:
     return None
 
 
+def _tail_hw(path: Path, n: int = 20) -> list[str]:
+    """The out_hw of the last ``n`` present rows of a truth CSV ('' = unidentified)."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 4096))
+            lines = fh.read().decode("ascii", "replace").splitlines()[1:]
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-n:]:
+        parts = ln.split(",")
+        if len(parts) >= 9 and parts[5] not in ("absent", "rebuild_failed"):
+            out.append(parts[8].strip())
+    return out
+
+
+def _start_helper(out: Path, px: int, py: int, truth_ms: int):
+    k = 0
+    while (out / f"truth_{k}.csv").exists() or (k == 0 and (out / "truth.csv").exists()):
+        k += 1                                      # a resumed soak: a new truth file (the analysis reads them all)
+    truth_path = out / ("truth.csv" if k == 0 else f"truth_{k}.csv")
+    helper = subprocess.Popen([str(TRUTH_EXE), "--at", f"{px},{py}", "--log", str(truth_path),
+                               "--interval-ms", str(truth_ms)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    ready = helper.stdout.readline().strip() if helper.stdout else ""
+    if not ready.startswith("ready"):
+        helper.kill()
+        raise SystemExit(f"vblank_truth did not start: {ready!r}")
+    return helper, truth_path, k, ready
+
+
+def _stop_helper(helper) -> None:
+    try:
+        if helper.poll() is None and helper.stdin:
+            helper.stdin.write("quit\n"); helper.stdin.flush()
+        helper.wait(timeout=5)
+    except Exception:  # noqa: BLE001
+        helper.kill()
+
+
 def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.0, truth_ms: int = 1000,
            hardware_id: Optional[str] = None, point: Optional[tuple[int, int]] = None) -> int:
     """``hardware_id`` (EDID, e.g. AUS322A) identifies the target; default = whatever sits at the monitor's point now.
@@ -78,16 +118,7 @@ def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.
         hardware_id = (m0 or {}).get("hardware_id")
     if not hardware_id:
         raise SystemExit("no target hardware id (pass --hardware-id)")
-    k = 0
-    while (out / f"truth_{k}.csv").exists() or (k == 0 and (out / "truth.csv").exists()):
-        k += 1                                      # a resumed soak: a new truth file (the analysis reads them all)
-    truth_path = out / ("truth.csv" if k == 0 else f"truth_{k}.csv")
-    helper = subprocess.Popen([str(TRUTH_EXE), "--at", f"{px},{py}", "--log", str(truth_path),
-                               "--interval-ms", str(truth_ms)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-    ready = helper.stdout.readline().strip() if helper.stdout else ""
-    if not ready.startswith("ready"):
-        helper.kill()
-        raise SystemExit(f"vblank_truth did not start: {ready!r}")
+    helper, truth_path, k, ready = _start_helper(out, px, py, truth_ms)
     meta = {"monitor": monitor, "mode": mode, "hours": hours, "every_s": every_s, "truth_ms": truth_ms, "truth_ready": ready,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"), "qpc_start": qpc_now(), "point": [px, py], "truth": truth_path.name,
             "hardware_id": hardware_id}
@@ -128,16 +159,20 @@ def record(out: Path, monitor: int, mode: str, hours: float, every_s: float = 1.
                 if helper.poll() is not None:
                     print("[soak] vblank_truth exited — stopping", file=sys.stderr, flush=True)
                     break
+                # backstop (the helper heals itself first): the target is present but 20 s of truth rows are not on it
+                if n % 10 == 0 and not row.get("absent") and "error" not in row:
+                    hws = _tail_hw(truth_path)
+                    if len(hws) >= 20 and all(h != hardware_id for h in hws):
+                        print(f"[soak] {row['wall']} truth rows not on {hardware_id} ({hws[-1]!r}) — restarting the helper",
+                              file=sys.stderr, flush=True)
+                        _stop_helper(helper)
+                        fh.flush()
+                        helper, truth_path, k, ready = _start_helper(out, px, py, truth_ms)
                 time.sleep(max(0.0, every_s - (time.monotonic() - t0)))
     except KeyboardInterrupt:
         print("[soak] stopped by Ctrl+C", file=sys.stderr, flush=True)
     finally:
-        try:
-            if helper.poll() is None and helper.stdin:
-                helper.stdin.write("quit\n"); helper.stdin.flush()
-            helper.wait(timeout=5)
-        except Exception:  # noqa: BLE001
-            helper.kill()
+        _stop_helper(helper)
     return 0
 
 
@@ -194,7 +229,7 @@ def load_truth(path: Path, target_hw: Optional[str] = None) -> tuple[list[TruthS
                 else:
                     lines.append(ln)
         for r in csv.DictReader(lines):
-            if r["hr"] == "absent" or int(r["hr"], 16) != 0 or int(r["sync_qpc"]) <= 0:
+            if r["hr"] in ("absent", "rebuild_failed") or int(r["hr"], 16) != 0 or int(r["sync_qpc"]) <= 0:
                 continue
             if target is not None and r.get("out_left") not in (None, "") and (int(r["out_left"]), int(r["out_top"])) != target:
                 continue
