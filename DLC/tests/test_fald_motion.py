@@ -191,3 +191,21 @@ def test_present_schedule_infers_only_unambiguous_gaps_and_finds_slips():
     sched = presented_schedule(pres)
     assert [row[4] for row in sched["presents"]] == [1, 2, 1, 1, None]
     assert sched["slips"] == [(2, 1, 1, 2)]                                # present 2 (content 1) stayed two refreshes
+
+
+def test_tpg_refuses_dc_unbalanced_blinks(tmp_path):
+    """An odd blink (or an even one made odd by a pulldown cadence) drives an LCD's cells with net DC — image sticking
+    (PA32UCXR 2026-10-05). The TPG client refuses such a scene before anything reaches the screen."""
+    from dlc.fald.motion_tpg import MotionTPG, TPGError, dc_unbalanced_shapes
+    blk = lambda b, ph=0: MovingShape("rect", 200.0, 200.0, grey(1000.0), w=40.0, h=30.0, blink=b, blink_phase=ph)
+    static = MovingShape("rect", 100.0, 100.0, grey(300.0), w=10.0, h=10.0)
+    sc = lambda shapes, cad=(1,): Scene("dc", grey(5.0), shapes, pre=1, move=0, post=479, cadence=cad)
+    assert dc_unbalanced_shapes(sc((static, blk(1)))) == [1]
+    assert dc_unbalanced_shapes(sc((blk(3, 1),))) == [0]
+    assert dc_unbalanced_shapes(sc((blk(2), blk(4, 1), static))) == []
+    assert dc_unbalanced_shapes(sc((blk(2),), cad=(2, 3))) == [0]          # 2 content frames = 5 refreshes ON
+    assert dc_unbalanced_shapes(sc((blk(2),), cad=(2,))) == []
+    tpg = MotionTPG(rect=(0, 0, 64, 64), log_path=tmp_path / "x.csv")     # never started: the guard comes first
+    with pytest.raises(TPGError, match="ODD|DC|STICKING"):
+        tpg.load(sc((blk(1),)))
+    tpg.close()

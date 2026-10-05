@@ -69,6 +69,40 @@ class TPGError(RuntimeError):
     pass
 
 
+DC_IMBALANCE_MAX = 0.01   # |ON refreshes on even - on odd| / ON refreshes, over one play
+
+
+def dc_unbalanced_shapes(scene: Scene) -> list[int]:
+    """Indices of the blinking shapes that would drive an LCD with a net DC component. LCD panels flip the cell voltage
+    polarity every refresh; a blinking shape whose ON refreshes fall on one polarity more often than the other puts DC
+    on those cells, and the DC migrates ions — IMAGE STICKING that shows as a faint square flickering at refresh / 2 on
+    bright content and survives a power cycle (PA32UCXR, 2026-10-05, after minutes of a 1000-nit 240x135 block toggled
+    every refresh). Refused: an ODD ``blink`` (refresh-locked plays count it in refreshes: blink 1 is always the same
+    polarity, blink 3 a third), and any blink whose ON refreshes over the scene's own cadence (e.g. a 2:3 pulldown makes
+    blink 2 five refreshes long) are off balance by more than DC_IMBALANCE_MAX (2 refreshes allowed for the play's
+    edges)."""
+    bad = []
+    reps = scene.refreshes()
+    for k, s in enumerate(scene.shapes):
+        b = int(getattr(s, "blink", 0))
+        if b <= 0:
+            continue
+        if b % 2 == 1:
+            bad.append(k)
+            continue
+        on = [0, 0]                                   # ON refreshes on even / odd refresh numbers of the play
+        r = 0
+        for i, n in enumerate(reps):
+            if s.visible(i):
+                for q in range(r, r + n):
+                    on[q % 2] += 1
+            r += n
+        total = on[0] + on[1]
+        if total and abs(on[0] - on[1]) > max(2, DC_IMBALANCE_MAX * total):
+            bad.append(k)
+    return bad
+
+
 class MotionTPG:
     """One TPG process. ``rect`` = (x, y, w, h) in physical desktop pixels (the target monitor's bounds for a real run;
     a smaller window shows the scene in miniature — ``scene_width`` scene px across it — for pacing self-tests).
@@ -161,6 +195,12 @@ class MotionTPG:
 
     # ------------------------------------------------------------------ commands
     def load(self, scene: Scene) -> str:
+        bad = dc_unbalanced_shapes(scene)
+        if bad:
+            raise TPGError(f"scene {scene.name!r}: blinking shape(s) {bad} with an ODD blink period — an LCD inverts the "
+                           "cell polarity every frame, so an odd-period toggle is bright on one polarity more than the "
+                           "other: a net DC drive that leaves IMAGE STICKING (2026-10-05: blink 1 at 1000 nit left a "
+                           "flickering square on the PA32UCXR that survived a power cycle). Use an EVEN blink period.")
         path = Path(self._tmp.name) / f"{scene.name}.scene"
         path.write_text(scene_text(scene), encoding="ascii")
         return self.send(f"load {path}")
