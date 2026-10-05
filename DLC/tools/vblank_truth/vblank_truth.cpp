@@ -16,6 +16,7 @@
 #include <wrl/client.h>
 #include <atomic>
 #include <cstdio>
+#include <share.h>
 #include <string>
 #include <thread>
 #pragma comment(lib, "d3d11.lib")
@@ -81,8 +82,8 @@ int main(int argc, char** argv) {
     ComPtr<ID3D11Texture2D> bb; sc->GetBuffer(0, IID_PPV_ARGS(&bb));
     ComPtr<ID3D11RenderTargetView> rtv; dev->CreateRenderTargetView(bb.Get(), nullptr, &rtv);
 
-    FILE* f = nullptr;
-    if (fopen_s(&f, log.c_str(), "w") != 0 || !f) { puts("fatal cannot open --log"); return 2; }
+    FILE* f = _fsopen(log.c_str(), "w", _SH_DENYNO);   // shared: an analysis may read it while the soak runs
+    if (!f) { puts("fatal cannot open --log"); return 2; }
     LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
     fprintf(f, "# qpcfreq=%lld output_left=%ld output_top=%ld interval_ms=%d\n", qf.QuadPart, R.left, R.top, intervalMs);
     fprintf(f, "qpc_now,present_count,present_refresh,sync_refresh,sync_qpc,hr\n");
