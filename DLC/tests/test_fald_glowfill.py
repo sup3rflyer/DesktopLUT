@@ -524,9 +524,15 @@ def test_a_long_chain_of_joins_converges_or_ends_in_the_worst_case_pass(mean_mod
     was 16, and zones joined in its last iteration lowered neighbours nobody re-checked: up to 6 fill-counted zones
     ended inside the margin at 1.19-1.25 T on the owner fit) or more than GUARD_ITER_MAX (73). The cap is 64; beyond it
     one worst-case pass bands every candidate that ALL its neighbours at k = 0 would pull below BAND_HI T. Either way no
-    fill-counted zone is left inside the margin, and the evidence says which way it went."""
-    m = mean_model
+    fill-counted zone is left inside the margin, and the evidence says which way it went.
+
+    The chain needs the 0.35-cell gain low-pass the scenario was built on: at the 0.7 default (2026-10-06) the stripes
+    join in 2 iterations — no long chain — so that case only checks the margin."""
     gp = GlowFillParams(cap_nits=cap)
+    g7 = fill_image(mean_model, stripes(mean_model, every=every), gp)["glow"]
+    b7, final7, _ = _final_stats(mean_model, g7, gp)
+    _assert_margin(mean_model, b7, final7)
+    m = FaldModel(replace(mean_model.p, gain_smooth_cells=0.35))
     g = fill_image(m, stripes(m, every=every), gp)["glow"]
     b, final, _ = _final_stats(m, g, gp)
     assert np.array_equal(b["k"], g["band"]["k"])

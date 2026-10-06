@@ -135,8 +135,9 @@ def test_correction_is_identity_on_a_uniform_field():
 
 def test_correction_removes_the_ring_in_the_model():
     from dlc.fald.correct import correct_image, reference_pedestal
-    # exact inverse with the gain low-pass off; with the default low-pass (sigma 0.35 cells, the anti-grid
-    # measure of 2026-09-12) a one-cell-gap ring is corrected to within 2 % in the model.
+    # exact inverse with the gain low-pass off; with the 0.35-cell low-pass (the anti-grid measure of 2026-09-12) a
+    # one-cell-gap ring is corrected to within 2 % in the model; with the 0.7-cell default (owner pan A/B 2026-10-06:
+    # less zone shimmer in motion) to within 6 % — the still-frame price of the wider blur.
     p = FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3, gain_smooth_cells=0.0)
     m = FaldModel(p)
     bg = ((307, 307, 307), FULL)
@@ -148,9 +149,13 @@ def test_correction_removes_the_ring_in_the_model():
     after = m.meter_img(correct_image(m, img)["req"], METER).sum() / target
     assert before < 0.9, "the test pattern must show a dark ring to begin with"
     assert abs(after - 1.0) < 0.005
-    m2 = FaldModel(FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3))
+    m2 = FaldModel(FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3,
+                              gain_smooth_cells=0.35))
     after2 = m2.meter_img(correct_image(m2, img)["req"], METER).sum() / target
     assert abs(after2 - 1.0) < 0.02
+    m3 = FaldModel(FaldParams(est_kind="exp", est_scale_mm=13.75, est_phase_px=-20.6, drive_dim=0.108, tmin=1.5e-3))
+    after3 = m3.meter_img(correct_image(m3, img)["req"], METER).sum() / target
+    assert abs(after2 - 1.0) < abs(after3 - 1.0) < 0.06
     # the highlight (saturated): its hue is preserved and the drive statistic it feeds is unchanged
     # (one scale per pixel; the old per-channel rule kept it "untouched" but rotated hue elsewhere — C10)
     res = correct_image(m, img)
