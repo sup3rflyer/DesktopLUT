@@ -94,6 +94,8 @@ std::atomic<bool> g_frameBufferEnabled{ true };  // Enable auto frame buffer (de
 std::atomic<bool> g_framePacerLogEnabled{ false }; // Log frame pacer stats to CSV (default: off)
 std::atomic<int> g_frameBufferIdleMs{ 3000 };  // Idle timeout before buffer engages (default: 3s)
 std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (default: off, experimental)
+std::atomic<bool> g_appShuttingDown{ false };
+std::atomic<bool> g_sessionEnding{ false };
 std::atomic<bool> g_calibrationControlEnabled{ false };  // DLC calibration IPC server arm (default: off — normal DesktopLUT exposes nothing)
 int g_dwmHookWatchdogRetries = 0;              // Consecutive re-injection failures (GUI thread only)
 int g_dwmHookReinjectCount = 0;                // Total re-injection cycles this run — flap detector (GUI thread only)

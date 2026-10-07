@@ -1281,3 +1281,18 @@ TEST_CASE("MonitorNeedsDwmHook: cube, FALD panel file or the HDR tonemapper, reg
         CHECK_FALSE(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
     }
 }
+
+// T2.16: the teardown pumps messages while it joins threads and ejects the hook; a timer, display
+// change or replayed intent arriving then must not start processing again.
+TEST_CASE("StartProcessing is a no-op once the app teardown began") {
+    REQUIRE_FALSE(g_gui.isRunning);
+    g_appShuttingDown.store(true);
+    StartProcessing();
+    const bool running = g_gui.isRunning;
+    const bool threadStarted = g_gui.processingThread.joinable();
+    const bool inTransition = IsProcessingTransitionActive();
+    g_appShuttingDown.store(false);
+    CHECK_FALSE(running);
+    CHECK_FALSE(threadStarted);
+    CHECK_FALSE(inTransition);
+}

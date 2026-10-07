@@ -1295,6 +1295,10 @@ static void StartProcessingImpl() {
 }
 
 void StartProcessing() {
+    if (g_appShuttingDown.load()) {   // a teardown pump (or a replayed intent) must not start anything
+        std::cout << "[Processing] Start ignored: shutting down" << std::endl;
+        return;
+    }
     if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(true); return; }
     {
         TransitionScope scope(ProcTransition::Starting);
@@ -1370,7 +1374,7 @@ static void StopProcessingImpl() {
     if (g_dwmHookMode.load() || IsDwmHookActive()) {
         std::cout << "[DWM Hook] Stopping — uninjecting from dwm.exe" << std::endl;
         FaldTrace("StopProcessing: UninjectDwmHook begin");
-        UninjectDwmHook();
+        UninjectDwmHook(/*keepOwnSession=*/g_sessionEnding.load());
         FaldTrace("StopProcessing: UninjectDwmHook end");
     }
 

@@ -1363,7 +1363,37 @@ static void TickTopologyPipeline(HWND hwnd) {
     }
 }
 
+// Messages that start, re-arm or restart work. During the teardown (which pumps while it joins threads
+// and ejects the hook) they are left to DefWindowProc — a timer, display change, resume or tray click
+// arriving then used to restart processing or re-arm timers under a window being destroyed.
+static bool IgnoredDuringShutdown(UINT msg) {
+    switch (msg) {
+    case WM_TIMER: case WM_DISPLAYCHANGE: case WM_WTSSESSION_CHANGE: case WM_SETTINGCHANGE:
+    case WM_DEVICECHANGE: case WM_POWERBROADCAST: case WM_COMMAND: case WM_TRAYICON: case WM_HOTKEY:
+    case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
+    case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD:
+        return true;
+    default:
+        return msg == WM_TASKBARCREATED;
+    }
+}
+
+// Every GUI timer (types.h). The shutdown filter above also kills any that still fires.
+static void KillAllGuiTimers(HWND hwnd) {
+    static const UINT_PTR kIds[] = {
+        OSD_TIMER_ID, HDR_REINIT_TIMER_ID, RESTART_TIMER_ID, SETTINGS_CHANGE_TIMER_ID, DEVICE_CHANGE_TIMER_ID,
+        DWM_HOOK_WATCHDOG_TIMER_ID, MHC_VERIFY_TIMER_ID, MHC_BLIND_KICK_TIMER_ID, MHC_REGISTRY_KICK_TIMER_ID,
+        MHC_BURST_TIMER_ID, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_BEACON_TIMER_ID, MONITOR_IDENTITY_TIMER_ID,
+        FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
+    };
+    for (UINT_PTR id : kIds) KillTimer(hwnd, id);
+}
+
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_appShuttingDown.load(std::memory_order_relaxed) && IgnoredDuringShutdown(msg)) {
+        if (msg == WM_TIMER) KillTimer(hwnd, wParam);
+        return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
     // Re-add tray icon when explorer restarts or finishes initializing
     if (msg == WM_TASKBARCREATED) {
         AddTrayIcon(hwnd);
@@ -3215,8 +3245,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_ENDSESSION:
         if (wParam) {
-            StopProcessing();
-            RemoveTrayIcon();
+            // The session ends once this returns: run the ordered teardown (WM_DESTROY) now, without
+            // the remote FreeLibrary into this session's dwm.exe (it ends with the session).
+            g_sessionEnding.store(true);
+            g_appShuttingDown.store(true);
             DestroyWindow(hwnd);
         }
         return 0;
@@ -3229,17 +3261,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DESTROY:
-        StopCalibrationIpcServer();
+        // Ordered teardown. From here on nothing may start or re-arm (see IgnoredDuringShutdown): the
+        // stops below pump messages while they join threads and eject the hook.
+        g_appShuttingDown.store(true);
+        KillAllGuiTimers(hwnd);
+        StopIcmRegistryWatcher();          // its thread arms MHC_REGISTRY_KICK_TIMER_ID
+        StopCalibrationIpcServer();        // no new pipe commands; a queued one runs nothing
+        AbortLiveEditsForShutdown();       // a live grayscale edit gives scanout back to the user's profile
         StopDwmHookBeacon(hwnd);
-        StopProcessing();
+        StopProcessing();                  // joins the processing thread (inside a running Start/Stop: replayed after it)
+        KillAllGuiTimers(hwnd);            // anything the teardown above armed
         RemoveTrayIcon();
         // Unregister session change notifications
         WTSUnRegisterSessionNotification(hwnd);
-        KillTimer(hwnd, MHC_VERIFY_TIMER_ID);
-        KillTimer(hwnd, MHC_BLIND_KICK_TIMER_ID);
-        KillTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID);
-        StopIcmRegistryWatcher();
-        KillTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID);
         // Unregister GUI-side display power notification
         if (g_guiDisplayPowerNotify) {
             UnregisterPowerSettingNotification(g_guiDisplayPowerNotify);

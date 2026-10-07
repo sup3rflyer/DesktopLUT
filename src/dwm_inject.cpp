@@ -767,7 +767,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     return {};
 }
 
-std::wstring UninjectDwmHook()
+std::wstring UninjectDwmHook(bool keepOwnSession)
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     SystemImpersonationGuard impGuard;
@@ -797,8 +797,17 @@ std::wstring UninjectDwmHook()
 
     bool anyFailed = false;
     std::wstring firstError;
+    DWORD ownSession = 0;
+    const bool haveOwnSession = keepOwnSession && ProcessIdToSessionId(GetCurrentProcessId(), &ownSession);
 
     for (DWORD pid : dwmPids) {
+        DWORD pidSession = 0;
+        if (haveOwnSession && ProcessIdToSessionId(pid, &pidSession) && pidSession == ownSession) {
+            // The remote FreeLibrary waits on the detach (seconds) — time the end-session budget does
+            // not have, for a process that ends with the session anyway.
+            std::wcout << L"[DWM Hook] Session ending: leaving PID " << pid << L" (ends with the session)" << std::endl;
+            continue;
+        }
         // Enumerate modules to find DwmHook.dll base address
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         if (snap == INVALID_HANDLE_VALUE) continue;

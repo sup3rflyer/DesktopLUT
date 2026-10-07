@@ -36,6 +36,13 @@ void StartCalibrationIpcServer();
 // on its own; a re-arm waits for it. Safe to call even if it never started.
 void StopCalibrationIpcServer();
 
+// App teardown: abort a grayscale live edit left engaged (its transient passthrough profile would
+// otherwise stay the display's scanout profile after DesktopLUT exits). GUI thread. A calibration
+// session itself is left as is — its settings were saved at enter, and whether an unfinished run
+// should restore the pre-run capture is not decidable here (a run that applied and died before exit
+// must keep its result); DLC's preflight backup remains the durable fallback.
+void AbortLiveEditsForShutdown();
+
 // A calibration session (calibration.enter .. exit) or a live grayscale edit (mhc.grayscale_live_begin ..
 // commit/cancel) is running: automatic display-state changes (e.g. desktop gamma following the SDR white
 // level) must wait. Takes the calibration and settings locks one after the other; never call it while

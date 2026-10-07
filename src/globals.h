@@ -104,6 +104,13 @@ extern std::atomic<bool> g_framePacerLogEnabled; // Log frame pacer stats to CSV
 extern std::atomic<int> g_frameBufferIdleMs;   // Idle timeout before buffer engages (ms, 0 = always active)
 extern std::atomic<bool> g_dwmHookMode;        // Use DWM hook injection instead of overlay for LUT
 extern std::atomic<bool> g_calibrationControlEnabled;  // Arm the opt-in DLC calibration IPC server (default off)
+// App teardown began (WM_DESTROY / WM_ENDSESSION). The teardown pumps messages while it joins threads and
+// ejects the hook: from here on timers, display/power/session events and StartProcessing are ignored, so
+// nothing restarts or re-arms mid-teardown. Set once, never cleared.
+extern std::atomic<bool> g_appShuttingDown;
+// WM_ENDSESSION(TRUE): this session's dwm.exe ends with the session, so the teardown leaves the hook in it
+// (no seconds-long remote FreeLibrary inside the end-session budget). Other sessions' copies are still ejected.
+extern std::atomic<bool> g_sessionEnding;
 extern int g_dwmHookWatchdogRetries;           // Consecutive re-injection failures (GUI thread only)
 extern int g_dwmHookReinjectCount;             // Total re-injection cycles this run — flap detector (GUI thread only)
 extern std::atomic<bool> g_hookBeaconActive;       // Identity-beacon session running (beacon windows shown)

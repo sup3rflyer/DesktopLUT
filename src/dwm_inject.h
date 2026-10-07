@@ -31,7 +31,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors);
 
 // Uninject DwmHook.dll from all dwm.exe processes via FreeLibrary.
 // Returns empty string on success, error message on failure.
-std::wstring UninjectDwmHook();
+// keepOwnSession: the session is ending (WM_ENDSESSION) — leave the hook in this session's dwm.exe,
+// which ends with it, and eject only other sessions' copies.
+std::wstring UninjectDwmHook(bool keepOwnSession = false);
 
 // --- Shared memory IPC (live parameter updates to hook without re-injection) ---
 

@@ -2239,6 +2239,10 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
 // ===========================================================================
 // Public entry points
 // ===========================================================================
+void AbortLiveEditsForShutdown() {
+    CleanupActiveGsLive();
+}
+
 bool IsCalibrationOrLiveEditActive() {
     // Sequential, never nested: the GUI-thread enter nests settings -> calib.
     {
