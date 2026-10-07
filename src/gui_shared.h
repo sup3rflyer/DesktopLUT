@@ -40,5 +40,12 @@ bool CommitNumericEdit(HWND edit, float lo, float hi, float& target, int decimal
 // Helper to set path text - shows just the filename for readability
 void SetPathText(HWND hwndEdit, const wchar_t* path);
 
+// Modal loop for the app's own dialog windows: dispatches until `dlg` is destroyed. Liveness is
+// checked BEFORE taking the next message, so a message queued behind the dialog's own close (a
+// one-shot such as WM_PROCESSING_EXITED) stays queued for the main loop instead of being pulled and
+// dropped; a WM_QUIT is re-posted for the main loop. `preDispatch` (optional) may consume a message
+// (return true) before Translate/Dispatch — e.g. dialog-level Enter / Escape handling.
+void RunModalLoop(HWND dlg, bool (*preDispatch)(MSG& msg, void* ctx) = nullptr, void* ctx = nullptr);
+
 // Draw a Windows 11-style rounded button
 void DrawRoundedButton(LPDRAWITEMSTRUCT pDIS);

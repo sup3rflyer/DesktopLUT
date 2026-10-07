@@ -153,6 +153,28 @@ TEST_CASE("Whitelist: .exe only not stripped (4 chars, needs >4)") {
     CHECK(out[0] == L".exe");
 }
 
+TEST_CASE("Whitelist: one exe per line (CR/LF from the multi-line editor) separates entries") {
+    std::vector<std::wstring> out;
+    ParseWhitelistString(L"mpv.exe\r\nmpvnet.exe\r\n\r\nWindows Terminal.exe\nvlc", out);
+    REQUIRE(out.size() == 4);
+    CHECK(out[0] == L"mpv");
+    CHECK(out[1] == L"mpvnet");
+    CHECK(out[2] == L"windows terminal");   // spaces inside a name are kept
+    CHECK(out[3] == L"vlc");
+}
+
+TEST_CASE("Whitelist: normalised to one INI-safe line, as typed") {
+    CHECK(NormalizeWhitelistRaw(L"mpv.exe\r\nMPVnet.exe ;  \r\n, Windows Terminal.exe\n") ==
+          L"mpv.exe, MPVnet.exe, Windows Terminal.exe");
+    CHECK(NormalizeWhitelistRaw(L"") == L"");
+    CHECK(NormalizeWhitelistRaw(L" \r\n ,; ") == L"");
+    std::vector<std::wstring> a, b;
+    const std::wstring raw = L"mpv.exe\r\nvlc";
+    ParseWhitelistString(raw, a);
+    ParseWhitelistString(NormalizeWhitelistRaw(raw), b);
+    CHECK(a == b);
+}
+
 TEST_CASE("Whitelist: a.exe stripped to 'a'") {
     std::vector<std::wstring> out;
     ParseWhitelistString(L"a.exe", out);

@@ -25,8 +25,9 @@ Settings saved to `DesktopLUT.ini` next to executable.
 [General]
 ; written by the app: 2 = identity-keyed [Display<slot>] sections
 IniVersion=2
-; 0 = trilinear (default), 1 = tetrahedral (higher quality)
-TetrahedralInterp=0
+; overlay 3D LUT interpolation: 1 = tetrahedral (default), 0 = trilinear. The DWM hook is always
+; tetrahedral, and in hook mode the overlay (preview / analysis) follows it whatever this says.
+TetrahedralInterp=1
 ; 1 = show console window in GUI mode (requires restart)
 ConsoleLog=0
 ; 1 = show frame timing stats in analysis overlay (developer debug)

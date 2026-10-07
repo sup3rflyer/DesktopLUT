@@ -839,14 +839,7 @@ void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHD
 
     // Modal message loop
     EnableWindow(hwndParent, FALSE);
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndEditor)) {
-        if (bRet == -1) break;
-        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
+    RunModalLoop(hwndEditor);
     EnableWindow(hwndParent, TRUE);
     SetForegroundWindow(hwndParent);
 

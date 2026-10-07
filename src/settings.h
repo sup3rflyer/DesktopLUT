@@ -93,6 +93,9 @@ TonemapCurve StringToTonemapCurve(const wchar_t* str);
 
 // Whitelist string parsing (exposed for testing)
 void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out);
+// The whitelist as one INI-safe line: entries split on , ; and line breaks, trimmed, empties
+// dropped, joined with ", " (case and .exe kept as typed).
+std::wstring NormalizeWhitelistRaw(const std::wstring& raw);
 
 // Parse g_gammaWhitelistRaw into g_gammaWhitelist vector
 void ParseGammaWhitelist();

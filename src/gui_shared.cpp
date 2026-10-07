@@ -210,6 +210,21 @@ bool CommitNumericEdit(HWND edit, float lo, float hi, float& target, int decimal
     return changed;
 }
 
+void RunModalLoop(HWND dlg, bool (*preDispatch)(MSG& msg, void* ctx), void* ctx) {
+    MSG msg;
+    while (IsWindow(dlg)) {
+        const BOOL r = GetMessage(&msg, nullptr, 0, 0);
+        if (r == -1) break;
+        if (r == 0) {                            // WM_QUIT: leave it for the main loop
+            PostQuitMessage((int)msg.wParam);
+            break;
+        }
+        if (preDispatch && preDispatch(msg, ctx)) continue;
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+}
+
 void SetPathText(HWND hwndEdit, const wchar_t* path) {
     if (!path || !*path) {
         SetWindowText(hwndEdit, L"");

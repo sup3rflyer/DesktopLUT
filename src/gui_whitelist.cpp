@@ -72,7 +72,7 @@ static LRESULT CALLBACK GammaWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, L
                 std::wstring buf(len + 1, L'\0');
                 int copied = GetWindowTextW(g_whitelistEdit, &buf[0], len + 1);
                 buf.resize(copied);
-                g_gammaWhitelistRaw = buf;
+                g_gammaWhitelistRaw = NormalizeWhitelistRaw(buf);   // one exe per line works too
                 ParseGammaWhitelist();
                 SaveSettings();
                 DestroyWindow(hwnd);
@@ -142,14 +142,7 @@ void ShowGammaWhitelistDialog(HWND hwndParent) {
 
     // Modal message loop
     EnableWindow(hwndParent, FALSE);
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndDialog)) {
-        if (bRet == -1) break;  // Error occurred
-        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
+    RunModalLoop(hwndDialog);
     EnableWindow(hwndParent, TRUE);
     SetForegroundWindow(hwndParent);
 }
@@ -219,7 +212,7 @@ static LRESULT CALLBACK VrrWhitelistProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
                 std::wstring buf(len + 1, L'\0');
                 int copied = GetWindowTextW(g_vrrWhitelistEdit, &buf[0], len + 1);
                 buf.resize(copied);
-                g_vrrWhitelistRaw = buf;
+                g_vrrWhitelistRaw = NormalizeWhitelistRaw(buf);   // one exe per line works too
                 ParseVrrWhitelist();
                 SaveSettings();
                 DestroyWindow(hwnd);
@@ -289,14 +282,7 @@ void ShowVrrWhitelistDialog(HWND hwndParent) {
 
     // Modal message loop
     EnableWindow(hwndParent, FALSE);
-    MSG msg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0 && IsWindow(hwndDialog)) {
-        if (bRet == -1) break;  // Error occurred
-        if (msg.message == WM_QUIT) { PostQuitMessage((int)msg.wParam); break; }
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
+    RunModalLoop(hwndDialog);
     EnableWindow(hwndParent, TRUE);
     SetForegroundWindow(hwndParent);
 }

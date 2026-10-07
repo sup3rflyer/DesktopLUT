@@ -343,7 +343,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // Cache values are updated only AFTER successful constant buffer write (below)
     // to ensure retries on Map failure
     bool curGamma = g_desktopGammaMode.load();
-    bool curTetrahedral = g_tetrahedralInterp.load();
+    // Hook mode: the overlay only previews what the DWM hook applies, and the hook is always
+    // tetrahedral — so the overlay is too, or a cube verified through it renders differently in production.
+    bool curTetrahedral = g_tetrahedralInterp.load() || g_dwmHookMode.load();
     bool curHdrDither = g_hdrDither.load();
     // The SDR white level is written from the GUI thread; comparing against the value last written keeps a
     // change from being lost to a concurrent cbDirty clear (a static monitor would never re-dirty the buffer).
@@ -376,7 +378,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         bool mhcPrim = ctx->isHDREnabled ? ctx->hdrMhcPrimariesActive.load() : ctx->sdrMhcPrimariesActive.load();
         bool mhcGs = ctx->isHDREnabled ? ctx->hdrMhcGrayscaleActive.load() : ctx->sdrMhcGrayscaleActive.load();
         cbData[4] = (ctx->isHDREnabled && g_desktopGammaMode.load() && !mhcGs) ? 1.0f : 0.0f;  // Desktop gamma (HDR-only, MHC bakes into 1D LUT)
-        cbData[5] = g_tetrahedralInterp.load() ? 1.0f : 0.0f; // Tetrahedral interpolation
+        cbData[5] = curTetrahedral ? 1.0f : 0.0f; // Tetrahedral interpolation (always in hook mode)
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
         auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;

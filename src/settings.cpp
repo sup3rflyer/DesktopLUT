@@ -617,6 +617,29 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     }
 }
 
+// Whitelist separators: comma, semicolon, and line breaks (the editor is multi-line, so one exe per
+// line is the natural way to type it). Not spaces: exe names can contain them.
+static bool IsWhitelistSeparator(wchar_t c) { return c == L',' || c == L';' || c == L'\r' || c == L'\n'; }
+
+std::wstring NormalizeWhitelistRaw(const std::wstring& raw) {
+    std::wstring out, item;
+    auto flush = [&]() {
+        size_t start = item.find_first_not_of(L" \t");
+        if (start != std::wstring::npos) {
+            size_t end = item.find_last_not_of(L" \t");
+            if (!out.empty()) out += L", ";
+            out += item.substr(start, end - start + 1);
+        }
+        item.clear();
+    };
+    for (wchar_t c : raw) {
+        if (IsWhitelistSeparator(c)) flush();
+        else item += c;
+    }
+    flush();
+    return out;
+}
+
 // Helper to parse comma-separated whitelist into vector of lowercase exe names
 void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& out) {
     out.clear();
@@ -624,7 +647,7 @@ void ParseWhitelistString(const std::wstring& raw, std::vector<std::wstring>& ou
 
     std::wstring item;
     for (wchar_t c : raw) {
-        if (c == L',' || c == L';') {
+        if (IsWhitelistSeparator(c)) {
             // Trim whitespace
             size_t start = item.find_first_not_of(L" \t");
             size_t end = item.find_last_not_of(L" \t");
@@ -903,9 +926,10 @@ void SaveSettings() {
     }
     WritePrivateProfileBool(L"General", L"DwmHookMode", g_dwmHookMode.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"CalibrationControl", g_calibrationControlEnabled.load(), iniPath.c_str());
-    WritePrivateProfileStringW(L"General", L"GammaWhitelist", g_gammaWhitelistRaw.c_str(), iniPath.c_str());
+    // One line in the INI: a raw line break in the value would end it there (the rest of the list lost).
+    WritePrivateProfileStringW(L"General", L"GammaWhitelist", NormalizeWhitelistRaw(g_gammaWhitelistRaw).c_str(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
-    WritePrivateProfileStringW(L"General", L"VRRWhitelist", g_vrrWhitelistRaw.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"General", L"VRRWhitelist", NormalizeWhitelistRaw(g_vrrWhitelistRaw).c_str(), iniPath.c_str());
 
     // Save hotkey settings
     WritePrivateProfileBool(L"General", L"HotkeyGammaEnabled", g_hotkeyGammaEnabled.load(), iniPath.c_str());
@@ -958,7 +982,7 @@ bool LoadSettings() {
 
     // Load general settings
     // DesktopGamma is now per-monitor (derived from MHCDesktopGamma after monitors load below)
-    g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", false, iniPath.c_str()));
+    g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", true, iniPath.c_str()));
     g_hdrDither.store(GetPrivateProfileBool(L"General", L"HdrDither", true, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));

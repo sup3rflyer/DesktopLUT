@@ -131,13 +131,19 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
 
 bool CreateLUTTexture(const std::vector<float>& data, int lutSize,
                       ID3D11Texture3D** outTexture, ID3D11ShaderResourceView** outSRV) {
-    // Convert FP32 data to FP16 for GPU efficiency
-    // Half-float is sufficient for LUT precision (10-bit mantissa = 1024 levels)
-    // Industry standard: DaVinci, ACES, Baselight all use FP16 for LUT interchange
+    // FP32, like the DWM hook's LUT texture: an FP16 texel carries only an 11-bit significand, up to
+    // a quarter of a 10-bit step of error in the HDR path, and the overlay is what previews and
+    // verifies a cube the hook then applies at full precision. 65^3 x 16 B = 4.4 MB. Falls back to
+    // FP16 only on a device that cannot sample a filtered FP32 3D texture.
+    UINT fp32Support = 0;
+    const bool useFp32 = SUCCEEDED(g_device->CheckFormatSupport(DXGI_FORMAT_R32G32B32A32_FLOAT, &fp32Support)) &&
+                         (fp32Support & D3D11_FORMAT_SUPPORT_TEXTURE3D) &&
+                         (fp32Support & D3D11_FORMAT_SUPPORT_SHADER_SAMPLE);
     std::vector<uint16_t> halfData;
-    halfData.reserve(data.size());
-    for (float f : data) {
-        halfData.push_back(DirectX::PackedVector::XMConvertFloatToHalf(f));
+    if (!useFp32) {
+        halfData.reserve(data.size());
+        for (float f : data) halfData.push_back(DirectX::PackedVector::XMConvertFloatToHalf(f));
+        std::cout << "3D LUT texture: FP32 sampling unsupported on this device, using FP16" << std::endl;
     }
 
     D3D11_TEXTURE3D_DESC texDesc = {};
@@ -145,14 +151,15 @@ bool CreateLUTTexture(const std::vector<float>& data, int lutSize,
     texDesc.Height = lutSize;
     texDesc.Depth = lutSize;
     texDesc.MipLevels = 1;
-    texDesc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;  // FP16: 50% memory vs FP32
+    texDesc.Format = useFp32 ? DXGI_FORMAT_R32G32B32A32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
     texDesc.Usage = D3D11_USAGE_IMMUTABLE;
     texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
     D3D11_SUBRESOURCE_DATA initData = {};
-    initData.pSysMem = halfData.data();
-    initData.SysMemPitch = lutSize * 4 * sizeof(uint16_t);       // 4 components × 2 bytes
-    initData.SysMemSlicePitch = lutSize * lutSize * 4 * sizeof(uint16_t);
+    const size_t texelBytes = useFp32 ? 4 * sizeof(float) : 4 * sizeof(uint16_t);   // RGBA
+    initData.pSysMem = useFp32 ? (const void*)data.data() : (const void*)halfData.data();
+    initData.SysMemPitch = (UINT)(lutSize * texelBytes);
+    initData.SysMemSlicePitch = (UINT)(lutSize * lutSize * texelBytes);
 
     HRESULT hr = g_device->CreateTexture3D(&texDesc, &initData, outTexture);
     if (FAILED(hr)) {

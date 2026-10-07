@@ -1021,29 +1021,25 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
     ShowWindow(dlg, SW_SHOW);
     UpdateWindow(dlg);
 
-    MSG winMsg;
-    BOOL bRet;
-    while ((bRet = GetMessage(&winMsg, nullptr, 0, 0)) != 0) {
-        if (bRet == -1) break;
-        if (!IsWindow(dlg)) break;
-        if (winMsg.message == WM_QUIT) { PostQuitMessage((int)winMsg.wParam); break; }
+    struct KeyCtx { MhcDialogData* data; HWND dlg; } keyCtx{ &data, dlg };
+    RunModalLoop(dlg, [](MSG& m, void* p) -> bool {
+        auto* k = static_cast<KeyCtx*>(p);
         // Enter: push live preview (confirm text box edits) or apply if not previewing
-        if (winMsg.message == WM_KEYDOWN && winMsg.wParam == VK_RETURN) {
-            if (data.livePreview) {
-                MhcPushLivePreview(&data);
+        if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN) {
+            if (k->data->livePreview) {
+                MhcPushLivePreview(k->data);
             } else {
-                SendMessage(dlg, WM_COMMAND, ID_MHC_OK, 0);
+                SendMessage(k->dlg, WM_COMMAND, ID_MHC_OK, 0);
             }
-            continue;
+            return true;
         }
         // Esc: cancel dialog
-        if (winMsg.message == WM_KEYDOWN && winMsg.wParam == VK_ESCAPE) {
-            SendMessage(dlg, WM_COMMAND, ID_MHC_CANCEL, 0);
-            continue;
+        if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
+            SendMessage(k->dlg, WM_COMMAND, ID_MHC_CANCEL, 0);
+            return true;
         }
-        TranslateMessage(&winMsg);
-        DispatchMessage(&winMsg);
-    }
+        return false;
+    }, &keyCtx);
 
     EnableWindow(hwndParent, TRUE);
     SetForegroundWindow(hwndParent);

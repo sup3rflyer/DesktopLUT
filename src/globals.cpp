@@ -70,7 +70,7 @@ std::mutex g_monitorsMutex; // Protects g_monitors STRUCTURE (push_back/clear). 
 // ============================================================================
 
 std::atomic<bool> g_desktopGammaMode{ false };   // Effective gamma state (may be overridden by whitelist)
-std::atomic<bool> g_tetrahedralInterp{ false };  // Default: trilinear (tetrahedral opt-in for quality)
+std::atomic<bool> g_tetrahedralInterp{ true };   // Default: tetrahedral (matches the DWM hook; trilinear opt-in)
 std::atomic<bool> g_hdrDither{ true };           // HDR output dither after the LUT (shared/hdr_dither.h); off = A/B
 std::atomic<bool> g_running{ true };            // Main loop control
 std::atomic<bool> g_forceReinit{ false };       // Force reinit on next frame
