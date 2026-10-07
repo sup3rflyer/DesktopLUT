@@ -8,6 +8,8 @@
 #include <iostream>
 #include <locale>
 #include <DirectXPackedVector.h>
+#include <charconv>
+#include <cmath>
 
 bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
     std::ifstream file(path);
@@ -32,17 +34,42 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
 
     if (isCube) {
         // Parse .cube format
+        bool firstLine = true;
         while (std::getline(file, line)) {
-            // Skip empty lines
-            if (line.empty()) continue;
+            // A UTF-8 BOM on the first line, and indentation, must not hide a keyword
+            if (firstLine && line.compare(0, 3, "\xEF\xBB\xBF") == 0) line.erase(0, 3);
+            firstLine = false;
+            const size_t start = line.find_first_not_of(" \t\r");
+            if (start == std::string::npos) continue;   // empty / whitespace-only
+            if (start > 0) line.erase(0, start);
 
             // Skip comments
             if (line[0] == '#') continue;
 
             // Parse header
             if (line.find("TITLE") == 0) continue;
-            if (line.find("DOMAIN_MIN") == 0) continue;
-            if (line.find("DOMAIN_MAX") == 0) continue;
+            if (line.find("DOMAIN_MIN") == 0 || line.find("DOMAIN_MAX") == 0) {
+                // Both renderers assume the 0..1 input domain: a file declaring another one would be
+                // applied to the wrong inputs. Accept the default (written explicitly by many tools).
+                const bool isMin = line.find("DOMAIN_MIN") == 0;
+                std::istringstream iss(line.substr(10));
+                iss.imbue(std::locale::classic());
+                float d[3];
+                if (!(iss >> d[0] >> d[1] >> d[2])) {
+                    std::cerr << "LUT error: malformed " << (isMin ? "DOMAIN_MIN" : "DOMAIN_MAX") << std::endl;
+                    return false;
+                }
+                const float want = isMin ? 0.0f : 1.0f;
+                for (float v : d) {
+                    if (std::fabs(v - want) > 1e-6f) {
+                        std::cerr << "LUT error: " << (isMin ? "DOMAIN_MIN" : "DOMAIN_MAX")
+                                  << " other than " << want << " is not supported (input domain must be 0..1)"
+                                  << std::endl;
+                        return false;
+                    }
+                }
+                continue;
+            }
 
             if (line.find("LUT_3D_SIZE") == 0) {
                 std::istringstream iss(line.substr(11));
@@ -127,6 +154,37 @@ bool LoadLUT(const std::wstring& path, std::vector<float>& data, int& lutSize) {
 
     std::cout << "Loaded " << lutSize << "^3 LUT with " << count << " entries" << std::endl;
     return true;
+}
+
+std::string CanonicalCubeText(const std::vector<float>& data, int lutSize) {
+    const size_t entries = (size_t)lutSize * lutSize * lutSize;
+    if (lutSize < 2 || lutSize > 128 || data.size() != entries * 4) return {};
+    std::string out = "# DesktopLUT canonical copy (host-parsed, staged for the DWM hook)\n";
+    out += "LUT_3D_SIZE " + std::to_string(lutSize) + "\n";
+    out.reserve(out.size() + entries * 3 * 16);
+    char buf[64];
+    for (size_t i = 0; i < entries; i++) {
+        for (int c = 0; c < 3; c++) {
+            const float v = data[i * 4 + c];
+            if (!std::isfinite(v)) return {};
+            // Shortest form that reads back as exactly this float; locale-independent (never a
+            // decimal comma). Always starts with a digit or '-' — what the DLL's line filter accepts.
+            const auto res = std::to_chars(buf, buf + sizeof(buf), v);
+            if (res.ec != std::errc()) return {};
+            out.append(buf, res.ptr);
+            out += (c < 2) ? ' ' : '\n';
+        }
+    }
+    return out;
+}
+
+bool WriteCanonicalCube(const std::wstring& path, const std::vector<float>& data, int lutSize) {
+    const std::string text = CanonicalCubeText(data, lutSize);
+    if (text.empty()) return false;
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(text.data(), (std::streamsize)text.size());
+    return (bool)f;
 }
 
 bool CreateLUTTexture(const std::vector<float>& data, int lutSize,

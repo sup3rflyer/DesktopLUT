@@ -6,6 +6,7 @@
 #include "globals.h"
 #include "gui.h"
 #include "fald.h"
+#include "lut.h"   // LoadLUT + WriteCanonicalCube: the staged cube is the host's parse
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -523,27 +524,34 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
         ClearDACL(faldDir);
     }
 
-    // --- Copy LUT files with position-based names ---
+    // --- Stage LUTs with position-based names ---
+    // Not the user's file: a canonical .cube written from the host's own parse (LoadLUT). The DLL's
+    // parser is stricter (header first, unindented lines, no BOM) and silently skipped files the host
+    // accepts, so an eeColor .txt or an indented .cube showed "Active" and applied nothing (T1.5). This
+    // is also the only place hook mode can reject a file: it fails the injection with the reason.
+    auto stageCube = [&](const std::wstring& src, const std::wstring& dest, const wchar_t* what) -> std::wstring {
+        std::wcout << L"[DWM Hook] Staging " << what << L" LUT: " << src << std::endl;
+        std::vector<float> data;
+        int size = 0;
+        if (!LoadLUT(src, data, size))
+            return std::wstring(L"The ") + what + L" LUT is not a readable 3D LUT (.cube or eeColor .txt):\n" + src;
+        if (!WriteCanonicalCube(dest, data, size))
+            return std::wstring(L"Could not stage the ") + what + L" LUT for the DWM hook: " + src;
+        ClearDACL(dest);
+        return {};
+    };
     for (const auto& mon : monitors) {
         std::wstring posPrefix = std::to_wstring(mon.left) + L"_" + std::to_wstring(mon.top);
 
-        if (!mon.sdrLutPath.empty()) {
-            std::wstring dest = lutsDir + posPrefix + L".cube";
-            std::wcout << L"[DWM Hook] Staging SDR LUT: pos(" << mon.left << L"," << mon.top << L") " << mon.sdrLutPath << std::endl;
-            if (!CopyFileW(mon.sdrLutPath.c_str(), dest.c_str(), FALSE)) {
-                std::wcerr << L"[DWM Hook] WARNING: Failed to copy SDR LUT: " << GetLastErrorString() << std::endl;
-            } else {
-                ClearDACL(dest);
-            }
-        }
-
-        if (!mon.hdrLutPath.empty()) {
-            std::wstring dest = lutsDir + posPrefix + L"_hdr.cube";
-            std::wcout << L"[DWM Hook] Staging HDR LUT: pos(" << mon.left << L"," << mon.top << L") " << mon.hdrLutPath << std::endl;
-            if (!CopyFileW(mon.hdrLutPath.c_str(), dest.c_str(), FALSE)) {
-                std::wcerr << L"[DWM Hook] WARNING: Failed to copy HDR LUT: " << GetLastErrorString() << std::endl;
-            } else {
-                ClearDACL(dest);
+        for (int hdr = 0; hdr < 2; hdr++) {
+            const std::wstring& src = hdr ? mon.hdrLutPath : mon.sdrLutPath;
+            if (src.empty()) continue;
+            std::wstring stageErr = stageCube(src, lutsDir + posPrefix + (hdr ? L"_hdr.cube" : L".cube"),
+                                              hdr ? L"HDR" : L"SDR");
+            if (!stageErr.empty()) {
+                std::wcerr << L"[DWM Hook] " << stageErr << std::endl;
+                DeleteDirectoryRecursive(lutsDir);
+                return stageErr;   // dllGuard removes the staged DLL
             }
         }
 
