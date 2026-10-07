@@ -167,6 +167,19 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
         mhc.metaWhiteBalance.clear();
     }
 
+    // SDR: the peak luminance the white-balance move costs (ComputeMHC2Matrix scales the profile so
+    // the white-balance target is reached at full drive instead of clipping).
+    if (!isHDR && mhc.whiteBalanceEnabled && !mhc.metaWhiteBalance.empty()) {
+        MHC2ProfileParams mp;
+        BuildMHC2MatrixParams(mhc, false, mp);
+        const float costPct = (1.0f - MhcSdrWhiteScale(mp)) * 100.0f;
+        if (costPct >= 0.05f) {
+            wchar_t costBuf[48];
+            _swprintf_s_l(costBuf, _countof(costBuf), L", peak -%.1f %%", GetCLocale(), costPct);
+            mhc.metaWhiteBalance += costBuf;
+        }
+    }
+
     // Append desktop gamma and correction grayscale to gamma label
     if (isHDR && mhc.desktopGammaEnabled) {
         gammaBase += L" + DG";
@@ -197,10 +210,9 @@ float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR) {
     return MHC2ProfileParams().peakNits;
 }
 
-// Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate)
-void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
-    params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
-        ? g_gui.monitorNames[monitorIndex] : L"Monitor";
+// The MATRIX inputs only (primaries + white-balance gains): no files read, cheap. Shared by
+// BuildMHC2Params and the metadata label's white-move cost.
+void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams& params) {
     params.isHDR = isHDR;
 
     if (mhc.primariesEnabled) {
@@ -214,6 +226,25 @@ void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
             params.displayPrimaries = { p.Rx, p.Ry, p.Gx, p.Gy, p.Bx, p.By, p.Wx, p.Wy };
         }
     }
+
+    // White balance gains (von Kries), solved in the basis the matrix scales: the generator's SOURCE
+    // primaries (MhcSourcePrimaries — sRGB for SDR, the panel's native primaries for HDR with
+    // primaries, BT.2020 otherwise). Needs params.isHDR / primaries set above.
+    if (mhc.whiteBalanceEnabled) {
+        float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
+        // Check if not D65 (within tolerance)
+        bool isD65 = (fabsf(wx - 0.3127f) < 0.001f && fabsf(wy - 0.3290f) < 0.001f);
+        if (!isD65 && wy > 0.001f) {
+            MhcWhiteBalanceGains(MhcSourcePrimaries(params), wx, wy, params.whiteBalanceGains);
+        }
+    }
+}
+
+// Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate)
+void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
+    params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
+        ? g_gui.monitorNames[monitorIndex] : L"Monitor";
+    BuildMHC2MatrixParams(mhc, isHDR, params);
 
     // Luminance metadata (lumi tag / MHC2 MaxCLL + HDR curve scaling) — one source of truth shared
     // with the identity profile (MhcProfileMetadataPeakNits mirrors the branches below exactly).
@@ -274,32 +305,6 @@ void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
             params.grayscale.use24Gamma = mhc.baseGrayscale.use24Gamma;
             params.grayscale.peakNits = mhc.baseGrayscale.peakNits;
             // params.peakNits = baseGrayscale.peakNits (set above via MhcProfileMetadataPeakNits)
-        }
-    }
-
-    // White balance gains (von Kries in wire RGB space)
-    if (mhc.whiteBalanceEnabled) {
-        float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
-        // Check if not D65 (within tolerance)
-        bool isD65 = (fabsf(wx - 0.3127f) < 0.001f && fabsf(wy - 0.3290f) < 0.001f);
-        if (!isD65 && wy > 0.001f) {
-            // Convert target white from CIE xy to XYZ (Y=1)
-            float tX = wx / wy;
-            float tY = 1.0f;
-            float tZ = (1.0f - wx - wy) / wy;
-            // XYZ→RGB matrix for wire space
-            static const float rec2020XYZtoRGB[9] = {
-                 1.7166512f, -0.3556708f, -0.2533663f,
-                -0.6666844f,  1.6164812f,  0.0157685f,
-                 0.0176399f, -0.0427706f,  0.9421031f };
-            static const float srgbXYZtoRGB[9] = {
-                 3.2404542f, -1.5371385f, -0.4985314f,
-                -0.9692660f,  1.8760108f,  0.0415560f,
-                 0.0556434f, -0.2040259f,  1.0572252f };
-            const float* m = isHDR ? rec2020XYZtoRGB : srgbXYZtoRGB;
-            params.whiteBalanceGains[0] = m[0]*tX + m[1]*tY + m[2]*tZ;
-            params.whiteBalanceGains[1] = m[3]*tX + m[4]*tY + m[5]*tZ;
-            params.whiteBalanceGains[2] = m[6]*tX + m[7]*tY + m[8]*tZ;
         }
     }
 

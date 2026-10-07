@@ -2067,11 +2067,13 @@ TEST_CASE("MHC2 matrix: white balance gains scale the as-applied white response"
     tMatMul3(Sinv, Memit, tmp);
     tMatMul3(tmp, S, applied);
 
+    // SDR keeps the white reachable: the gains come out divided by their max (1.1) — a pure
+    // luminance scale, same white chromaticity, no channel above 1 at full drive.
     float white[3] = { 1.0f, 1.0f, 1.0f };
     float outv[3]; MatVecMul3(applied, white, outv);
-    CHECK(outv[0] == doctest::Approx(1.1f).epsilon(2e-3));  // R gain
-    CHECK(outv[1] == doctest::Approx(1.0f).epsilon(2e-3));  // G gain
-    CHECK(outv[2] == doctest::Approx(0.9f).epsilon(2e-3));  // B gain
+    CHECK(outv[0] == doctest::Approx(1.0f).epsilon(2e-3));         // R gain 1.1 / 1.1
+    CHECK(outv[1] == doctest::Approx(1.0f / 1.1f).epsilon(2e-3));  // G gain
+    CHECK(outv[2] == doctest::Approx(0.9f / 1.1f).epsilon(2e-3));  // B gain
     // The emitted matrix itself is non-diagonal (carries the basis conjugation).
     CHECK(std::fabs(Memit[1]) + std::fabs(Memit[2]) > 1e-3f);
 }
@@ -2092,6 +2094,131 @@ TEST_CASE("MHC2 matrix: white balance + primaries combined") {
     CHECK(mhcBoth[3] == 0.0f);
     CHECK(mhcBoth[7] == 0.0f);
     CHECK(mhcBoth[11] == 0.0f);
+}
+
+namespace {
+void tXyOf(const float XYZ[3], float& x, float& y) {
+    const float s = XYZ[0] + XYZ[1] + XYZ[2];
+    x = XYZ[0] / s;
+    y = XYZ[1] / s;
+}
+// White (1,1,1) through the as-applied transform, then the display's own RGB->XYZ.
+void tAchievedWhite(const float asApplied9[9], const DisplayPrimariesData& display, float drive[3], float XYZ[3]) {
+    const float white[3] = { 1.0f, 1.0f, 1.0f };
+    MatVecMul3(asApplied9, white, drive);
+    float toXYZ[9];
+    REQUIRE(tBuildRGBtoXYZ(display, toXYZ));
+    MatVecMul3(toXYZ, drive, XYZ);
+}
+}  // namespace
+
+TEST_CASE("MHC2 matrix: SDR white-balance target reachable at full drive (audit T1.6)") {
+    // Every SDR white move puts full-drive white EXACTLY on the target chromaticity. The white-BALANCE
+    // part never pushes a channel above where the primaries-only transform has it: on a D65 display
+    // the max drive is exactly 1 (the MHC2 1D LUT is indexed on [0,1]; above 1 clipped from code
+    // ~237/255 for D50). A measured native white move keeps its own excess (DLC's refine owns it).
+    struct WbCase { const char* name; DisplayPrimariesData display; float wx, wy; };
+    const WbCase cases[] = {
+        { "sRGB display, no white move", kSRGB, 0.3127f, 0.3290f },
+        { "sRGB display -> D50", kSRGB, 0.3457f, 0.3585f },
+        { "sRGB display -> D55", kSRGB, 0.3324f, 0.3474f },
+        { "sRGB display -> D60 (ACES)", kSRGB, 0.32168f, 0.33767f },
+        { "sRGB display -> 9300 K", kSRGB, 0.2831f, 0.2971f },
+        { "native-white panel -> D65", kPaNative, 0.3127f, 0.3290f },
+        { "native-white panel -> D50", kPaNative, 0.3457f, 0.3585f },
+        { "P3 display -> D50", kP3D65, 0.3457f, 0.3585f },
+    };
+    for (const auto& c : cases) {
+        INFO(c.name);
+        MHC2ProfileParams p;
+        p.isHDR = false;
+        p.primariesEnabled = true;
+        p.displayPrimaries = c.display;
+        const bool hasWB = !(std::fabs(c.wx - 0.3127f) < 1e-4f && std::fabs(c.wy - 0.3290f) < 1e-4f);
+        if (hasWB) REQUIRE(MhcWhiteBalanceGains(MhcSourcePrimaries(p), c.wx, c.wy, p.whiteBalanceGains));
+
+        float mhc[12], asApplied9[9], scale = 0.0f;
+        ComputeMHC2Matrix(MhcSourcePrimaries(p), c.display, false, mhc, hasWB ? p.whiteBalanceGains : nullptr,
+                          asApplied9, &scale);
+        float drive[3], XYZ[3];
+        tAchievedWhite(asApplied9, c.display, drive, XYZ);
+        const float maxDrive = (std::max)({ drive[0], drive[1], drive[2] });
+        // The primaries-only (no white balance) drive of the same display: the allowed ceiling.
+        float baseMhc[12], base9[9], baseDrive[3], baseXYZ[3];
+        ComputeMHC2Matrix(MhcSourcePrimaries(p), c.display, false, baseMhc, nullptr, base9);
+        tAchievedWhite(base9, c.display, baseDrive, baseXYZ);
+        const float ceiling = (std::max)({ baseDrive[0], baseDrive[1], baseDrive[2], 1.0f });
+        CHECK(maxDrive <= ceiling * (1.0f + 1e-6f));
+        float x, y;
+        tXyOf(XYZ, x, y);
+        CHECK(std::fabs(x - c.wx) < 1e-5f);
+        CHECK(std::fabs(y - c.wy) < 1e-5f);
+        // The reported scale is the one applied, and the pure helper agrees with it.
+        CHECK(scale == doctest::Approx(MhcSdrWhiteScale(p)).epsilon(1e-6));
+        if (scale < 1.0f) CHECK(maxDrive == doctest::Approx(ceiling).epsilon(1e-5));   // white sits at the top
+        if (!hasWB) CHECK(scale == 1.0f);   // primaries-only: unchanged (DLC's matrix twin stays exact)
+    }
+    // On a D65 display a white-balance target never drives a channel above 1.
+    MHC2ProfileParams p;
+    p.isHDR = false;
+    REQUIRE(MhcWhiteBalanceGains(kSRGB, 0.3457f, 0.3585f, p.whiteBalanceGains));
+    float mhc[12], a9[9], drive[3], XYZ[3];
+    ComputeMHC2Matrix(kSRGB, kSRGB, false, mhc, p.whiteBalanceGains, a9);
+    tAchievedWhite(a9, kSRGB, drive, XYZ);
+    CHECK((std::max)({ drive[0], drive[1], drive[2] }) == doctest::Approx(1.0f).epsilon(1e-5));
+    CHECK(MhcSdrWhiteScale(p) == doctest::Approx(1.0f / 1.1765f).epsilon(2e-3));   // D50: R gain 1.1765
+}
+
+TEST_CASE("MHC2 matrix: HDR white move is not scaled (linear headroom)") {
+    float mhc[12], asApplied9[9], scale = 0.0f;
+    ComputeMHC2Matrix(kPaNativeD65, kPaNative, true, mhc, nullptr, asApplied9, &scale);
+    CHECK(scale == 1.0f);
+    CHECK(asApplied9[4] == doctest::Approx(1.0341f).epsilon(2e-3));   // G gain above 1 stays
+    MHC2ProfileParams p;
+    p.isHDR = true;
+    CHECK(MhcSdrWhiteScale(p) == 1.0f);
+}
+
+TEST_CASE("MHC2 matrix: HDR white balance is solved in the native source basis (audit T1.15 / F01.9)") {
+    // HDR with measured primaries builds the matrix from the panel's NATIVE primaries (D65 white). The
+    // white-balance gains must be solved in that basis; solving them in BT.2020 (the old hand-typed
+    // inverse) and scaling native columns with them missed the target white.
+    MHC2ProfileParams p;
+    p.isHDR = true;
+    p.primariesEnabled = true;
+    p.displayPrimaries = kPaNative;
+    const float wx = 0.3457f, wy = 0.3585f;   // D50 target
+    const DisplayPrimariesData src = MhcSourcePrimaries(p);
+    CHECK(src.Wx == 0.3127f);
+    CHECK(src.Rx == kPaNative.Rx);
+    float gains[3];
+    REQUIRE(MhcWhiteBalanceGains(src, wx, wy, gains));
+
+    float mhc[12], asApplied9[9];
+    ComputeMHC2Matrix(src, kPaNative, true, mhc, gains, asApplied9);
+    float drive[3], XYZ[3], x, y;
+    tAchievedWhite(asApplied9, kPaNative, drive, XYZ);
+    tXyOf(XYZ, x, y);
+    CHECK(std::fabs(x - wx) < 1e-5f);
+    CHECK(std::fabs(y - wy) < 1e-5f);
+
+    // The old BT.2020-basis gains on the same native source land measurably off target.
+    float oldGains[3];
+    REQUIRE(MhcWhiteBalanceGains(kBT2020, wx, wy, oldGains));
+    ComputeMHC2Matrix(src, kPaNative, true, mhc, oldGains, asApplied9);
+    tAchievedWhite(asApplied9, kPaNative, drive, XYZ);
+    tXyOf(XYZ, x, y);
+    CHECK(std::hypot(x - wx, y - wy) > 1e-3f);
+}
+
+TEST_CASE("MHC2 white balance gains: degenerate inputs leave unit gains") {
+    float g[3] = { 7, 7, 7 };
+    CHECK_FALSE(MhcWhiteBalanceGains(kSRGB, 0.3f, 0.0f, g));
+    CHECK(g[0] == 1.0f); CHECK(g[1] == 1.0f); CHECK(g[2] == 1.0f);
+    CHECK_FALSE(MhcWhiteBalanceGains(kSRGB, 0.6f, 0.5f, g));   // x + y >= 1
+    // D65 on an sRGB source is unit gains (to float precision)
+    REQUIRE(MhcWhiteBalanceGains(kSRGB, 0.3127f, 0.3290f, g));
+    for (float v : g) CHECK(v == doctest::Approx(1.0f).epsilon(1e-4));
 }
 
 // ============================================================================

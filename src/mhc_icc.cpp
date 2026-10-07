@@ -298,11 +298,74 @@ static const float g_bradfordD65toD50[9] = {
 // SECTION: MHC2 Matrix Computation
 // ============================================================================
 
+bool ComputeMhcForwardRGB(const DisplayPrimariesData& srcPrimaries,
+                          const DisplayPrimariesData& displayPrimaries,
+                          const float* whiteBalanceGains, float outResult9[9]) {
+    float srcToXYZ[9], displayToXYZ[9], displayFromXYZ[9];
+    if (!BuildRGBtoXYZ(srcPrimaries, srcToXYZ) || !BuildRGBtoXYZ(displayPrimaries, displayToXYZ)
+        || !MatInv3(displayToXYZ, displayFromXYZ)) {
+        return false;
+    }
+    // Apply white balance gains to srcToXYZ columns (von Kries in wire RGB space)
+    if (whiteBalanceGains) {
+        // Column 0 (R): rows 0,3,6 of row-major matrix
+        srcToXYZ[0] *= whiteBalanceGains[0]; srcToXYZ[3] *= whiteBalanceGains[0]; srcToXYZ[6] *= whiteBalanceGains[0];
+        // Column 1 (G): rows 1,4,7
+        srcToXYZ[1] *= whiteBalanceGains[1]; srcToXYZ[4] *= whiteBalanceGains[1]; srcToXYZ[7] *= whiteBalanceGains[1];
+        // Column 2 (B): rows 2,5,8
+        srcToXYZ[2] *= whiteBalanceGains[2]; srcToXYZ[5] *= whiteBalanceGains[2]; srcToXYZ[8] *= whiteBalanceGains[2];
+    }
+    // MHC2 = inv(displayRGBtoXYZ) * srcRGBtoXYZ_scaled  (RGB->RGB: source/wire -> display-native)
+    MatMul3(displayFromXYZ, srcToXYZ, outResult9);
+    return true;
+}
+
+DisplayPrimariesData MhcSourcePrimaries(const MHC2ProfileParams& params) {
+    if (!params.isHDR) return g_srgbPrimaries;
+    if (params.primariesEnabled) {
+        DisplayPrimariesData src = params.displayPrimaries;  // native R/G/B + measured native white
+        src.Wx = 0.3127f;                                    // ...but src TARGETS D65 (white move =
+        src.Wy = 0.3290f;                                    //    the src <-> display white delta)
+        return src;
+    }
+    return g_bt2020Primaries;  // no measured primaries -> display == src -> identity (old no-op)
+}
+
+bool MhcWhiteBalanceGains(const DisplayPrimariesData& src, float wx, float wy, float outGains[3]) {
+    outGains[0] = outGains[1] = outGains[2] = 1.0f;
+    if (!(wy > 1e-6f) || !(wx > 0.0f) || wx + wy >= 1.0f) return false;
+    float toXYZ[9], fromXYZ[9];
+    if (!BuildRGBtoXYZ(src, toXYZ) || !MatInv3(toXYZ, fromXYZ)) return false;
+    const float T[3] = { wx / wy, 1.0f, (1.0f - wx - wy) / wy };   // target white, Y = 1
+    for (int r = 0; r < 3; r++)
+        outGains[r] = fromXYZ[r * 3 + 0] * T[0] + fromXYZ[r * 3 + 1] * T[1] + fromXYZ[r * 3 + 2] * T[2];
+    return true;
+}
+
+float MhcSdrWhiteScale(const MHC2ProfileParams& params) {
+    if (params.isHDR) return 1.0f;
+    const bool hasWB = (params.whiteBalanceGains[0] != 1.0f || params.whiteBalanceGains[1] != 1.0f
+                        || params.whiteBalanceGains[2] != 1.0f);
+    if (!hasWB) return 1.0f;
+    const DisplayPrimariesData& displayPrim = params.primariesEnabled ? params.displayPrimaries : g_srgbPrimaries;
+    float base[9], full[9];
+    if (!ComputeMhcForwardRGB(g_srgbPrimaries, displayPrim, nullptr, base) ||
+        !ComputeMhcForwardRGB(g_srgbPrimaries, displayPrim, params.whiteBalanceGains, full))
+        return 1.0f;
+    auto maxRowSum = [](const float m[9]) {
+        return (std::max)({ m[0] + m[1] + m[2], m[3] + m[4] + m[5], m[6] + m[7] + m[8] });
+    };
+    const float baseMax = (std::max)(maxRowSum(base), 1.0f);
+    const float fullMax = maxRowSum(full);
+    return fullMax > baseMax ? baseMax / fullMax : 1.0f;
+}
+
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
                        bool isHDR, float outMHC[12],
                        const float* whiteBalanceGains,
-                       float* outAsAppliedRGB) {
+                       float* outAsAppliedRGB,
+                       float* outWhiteScale) {
     // The MHC2 driver pipeline:
     //   wire → DeGamma → RGBtoXYZ → [MHC2 matrix] → XYZtoRGB → ReGamma → LUT → display
     //
@@ -361,28 +424,46 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     //   srcToXYZ_scaled[col_i] = srcToXYZ[col_i] * gains[i]
     // This shifts the white point from D65 to the target in a single matrix pass.
 
-    float srcToXYZ[9], displayToXYZ[9], displayFromXYZ[9];
-    if (!BuildRGBtoXYZ(srcPrimaries, srcToXYZ) || !BuildRGBtoXYZ(displayPrimaries, displayToXYZ)
-        || !MatInv3(displayToXYZ, displayFromXYZ)) {
+    float result[9];
+    if (!ComputeMhcForwardRGB(srcPrimaries, displayPrimaries, whiteBalanceGains, result)) {
         std::cerr << "MHC2 matrix: degenerate primaries, using identity" << std::endl;
         memset(outMHC, 0, sizeof(float) * 12);
         outMHC[0] = outMHC[5] = outMHC[10] = 1.0f;  // 3x4 identity (row-major)
+        if (outAsAppliedRGB) { memset(outAsAppliedRGB, 0, sizeof(float) * 9); outAsAppliedRGB[0] = outAsAppliedRGB[4] = outAsAppliedRGB[8] = 1.0f; }
+        if (outWhiteScale) *outWhiteScale = 1.0f;
         return;
     }
 
-    // Apply white balance gains to srcToXYZ columns (von Kries in wire RGB space)
-    if (whiteBalanceGains) {
-        // Column 0 (R): rows 0,3,6 of row-major matrix
-        srcToXYZ[0] *= whiteBalanceGains[0]; srcToXYZ[3] *= whiteBalanceGains[0]; srcToXYZ[6] *= whiteBalanceGains[0];
-        // Column 1 (G): rows 1,4,7
-        srcToXYZ[1] *= whiteBalanceGains[1]; srcToXYZ[4] *= whiteBalanceGains[1]; srcToXYZ[7] *= whiteBalanceGains[1];
-        // Column 2 (B): rows 2,5,8
-        srcToXYZ[2] *= whiteBalanceGains[2]; srcToXYZ[5] *= whiteBalanceGains[2]; srcToXYZ[8] *= whiteBalanceGains[2];
+    // SDR: keep a white-balance target reachable at full drive (audit T1.6 / D5). A white move sends
+    // reference white (1,1,1) to display RGB r = result·1 whose luminance-weighted mean is 1, so
+    // max(r) >= 1 whenever white moves; the MHC2 1D LUT is indexed on [0,1], so channels above 1
+    // clip (from code ~237/255 for a D50 target) and full-drive white misses the target.
+    // Only the part the WHITE-BALANCE gains add is removed here: the transform is scaled by
+    // max(base·1) / max(result·1), base = the same transform without the gains. With an sRGB / D65
+    // display (base white = (1,1,1)) that is full normalisation (max drive exactly 1, white exactly on
+    // the target). A measured native white (the display primaries' own white move) is left as it was:
+    // DLC owns that excess — its closed-loop grayscale refine lands the achievable target-white peak
+    // from MEASURED channel peaks (non-additivity included) and its matrix twin
+    // (DLC/src/dlc/mhc_cube.py mhc2_matrix) models this transform unscaled. Cost 1 - scale is shown
+    // in the MHC label. HDR is left alone: linear signal relative to 10000 nits has headroom.
+    float whiteScale = 1.0f;
+    if (!isHDR && whiteBalanceGains) {
+        auto maxRowSum = [](const float m[9]) {
+            return (std::max)({ m[0] + m[1] + m[2], m[3] + m[4] + m[5], m[6] + m[7] + m[8] });
+        };
+        float base[9];
+        if (ComputeMhcForwardRGB(srcPrimaries, displayPrimaries, nullptr, base)) {
+            const float baseMax = (std::max)(maxRowSum(base), 1.0f);
+            const float fullMax = maxRowSum(result);
+            if (fullMax > baseMax) {
+                whiteScale = baseMax / fullMax;
+                for (float& v : result) v *= whiteScale;
+                std::cout << "MHC2: SDR white-balance move kept reachable: x" << whiteScale << " ("
+                          << (1.0f - whiteScale) * 100.0f << " % peak)" << std::endl;
+            }
+        }
     }
-
-    // MHC2 = inv(displayRGBtoXYZ) * srcRGBtoXYZ_scaled  (RGB->RGB: source/wire -> display-native)
-    float result[9];
-    MatMul3(displayFromXYZ, srcToXYZ, result);
+    if (outWhiteScale) *outWhiteScale = whiteScale;
 
     std::cout << "MHC2 matrix (RGB-to-RGB, source->display):" << std::endl;
     std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
@@ -562,19 +643,7 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     // incoming BT.2020-container linear RGB as native-gamut+D65 content. The old "wire cancels since
     // wire = src" identity no longer holds for HDR, and that is intentional (the 3D LUT, not the MHC,
     // owns BT.2020→native).
-    DisplayPrimariesData hdrNativeSrc{};
-    const DisplayPrimariesData* srcPrimPtr;
-    if (!params.isHDR) {
-        srcPrimPtr = &g_srgbPrimaries;
-    } else if (params.primariesEnabled) {
-        hdrNativeSrc = params.displayPrimaries;  // native R/G/B chromaticities + measured native white
-        hdrNativeSrc.Wx = 0.3127f;               // ...but src TARGETS D65 (white move = src↔display delta)
-        hdrNativeSrc.Wy = 0.3290f;
-        srcPrimPtr = &hdrNativeSrc;
-    } else {
-        srcPrimPtr = &g_bt2020Primaries;  // no measured primaries → display==src → identity (old no-op)
-    }
-    const DisplayPrimariesData& srcPrim = *srcPrimPtr;
+    const DisplayPrimariesData srcPrim = MhcSourcePrimaries(params);
     const DisplayPrimariesData& displayPrim = params.primariesEnabled
         ? params.displayPrimaries : srcPrim;
 

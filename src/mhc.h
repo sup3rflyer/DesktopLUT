@@ -137,11 +137,39 @@ struct MHCProfileState {
 //   NOT the emitted B*M*inv(B) tag), for SDR and HDR alike. This is what a shader must
 //   reproduce to predict the bake (used by the SDR live grayscale full-preview). WB gains
 //   are already baked in.
+// SDR only: when white-balance gains push a channel of reference white higher than the same transform
+// without them does, the transform is scaled back by max(base·1)/max(result·1) — a white-balance
+// target is then reached at full drive instead of clipping (on a D65 display: max drive exactly 1).
+// A measured native white move (primaries) is not scaled: DLC's grayscale refine owns that excess
+// and its twin (DLC mhc_cube.py mhc2_matrix) models it unscaled. outWhiteScale (optional) receives
+// the factor (1 = no cost). HDR is never scaled (linear headroom).
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
                        bool isHDR, float outMHC[12],
                        const float* whiteBalanceGains = nullptr,
-                       float* outAsAppliedRGB = nullptr);
+                       float* outAsAppliedRGB = nullptr,
+                       float* outWhiteScale = nullptr);
+
+// The unscaled, unconjugated RGB->RGB forward transform inv(displayRGBtoXYZ) * srcRGBtoXYZ * diag(gains)
+// (no logging). False for degenerate primaries.
+bool ComputeMhcForwardRGB(const DisplayPrimariesData& srcPrimaries,
+                          const DisplayPrimariesData& displayPrimaries,
+                          const float* whiteBalanceGains, float outResult9[9]);
+
+// The factor an SDR profile built from `params` is scaled by to keep its white-balance target reachable
+// (1 = none; 1 - value = the peak-luminance cost of the white-balance move). 1 for HDR. Pure.
+float MhcSdrWhiteScale(const MHC2ProfileParams& params);
+
+// The source primaries GenerateMHC2Profile builds the matrix from: SDR sRGB; HDR the display
+// primaries with a D65 white when primaries are enabled (native source, see GenerateMHC2Profile),
+// else BT.2020.
+DisplayPrimariesData MhcSourcePrimaries(const MHC2ProfileParams& params);
+
+// Von Kries gains that move reference white (1,1,1) of `src` to CIE xy (wx, wy) at Y = 1, solved in
+// src's OWN RGB basis — the basis ComputeMHC2Matrix scales (srcToXYZ * diag(gains) * 1 = target).
+// Solving them in a fixed sRGB / BT.2020 basis missed the HDR target by ~0.004 xy whenever the
+// source is the panel's native primaries. False (gains 1) for a degenerate basis or target.
+bool MhcWhiteBalanceGains(const DisplayPrimariesData& src, float wx, float wy, float outGains[3]);
 
 // Compute the SDR scanout transform a live grayscale FULL-PREVIEW shader must reproduce:
 //   outResult9   = net as-applied RGB->RGB matrix (row-major 3x3, WB baked in, pre-conjugation)
