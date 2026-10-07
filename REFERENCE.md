@@ -453,10 +453,11 @@ reader (`shared/fald_panel.h`) — there is no second implementation of the corr
 
 ## Analysis Overlay (Win+Shift+X)
 
-- Luminance: Peak, Min, Min>0, Average nits, APL, %HDR
+- Luminance: Peak Y (what the tonemapper compares), Min, Min>0, Average nits, APL, %HDR
+- Peak RGB: the max(R,G,B) peak — the CTA-861.3 basis; a saturated highlight reads higher than Peak Y (a 1000-nit red is Y 213)
 - Gamut: Rec.709, P3-D65 only, Rec.2020 only, out-of-gamut
 - HDR histogram: 5 buckets (0-203, 203-1k, 1k-2k, 2k-4k, 4000+ nits)
-- Session MaxCLL/MaxFALL tracking
+- Session MaxCLL/MaxFALL as CTA-861.3 defines them: the max over frames of the max(R,G,B) peak / of the frame-average max(R,G,B)
 - Frame timing (optional, `ShowFrameTiming=1` in INI): FPS, frame times, jitter, sync method, pacer metrics (composition offset EMA, spin-wait duration, pacer jitter)
 
 **Frame timing note**: These metrics measure Desktop Duplication frame delivery timing, not actual display presentation. Values fluctuate based on desktop activity and are useful for debugging the render loop, not for assessing VRR behavior or presentation quality.

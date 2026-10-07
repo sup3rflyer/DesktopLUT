@@ -11,6 +11,9 @@
 #include <atomic>
 #include <cmath>
 
+// Fits the widest readout line (" Peak Y:  <7>  TM: ~<5>") in the 16 px Consolas font.
+static constexpr int kAnalysisWindowWidth = 280;
+
 // Window class name for analysis overlay
 static const wchar_t* g_analysisClassName = L"DesktopLUT_Analysis";
 
@@ -168,7 +171,9 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 }
                 tmStr = tmss.str();
             }
-            ss << L" Peak: " << std::setw(7) << data.result.peakNits << L"  TM: " << tmStr << L"\n";
+            // Peak Y is what the tonemapper compares (luminance); Peak RGB is the CTA-861.3 basis (MaxCLL).
+            ss << L" Peak Y:  " << std::setw(7) << data.result.peakNits << L"  TM: " << tmStr << L"\n";
+            ss << L" Peak RGB: " << std::setw(7) << data.result.peakRgbNits << L"\n";
             // Show Min>0 (if all pixels were black, show 0)
             float minNonZero = (data.result.minNonZeroNits < 99999.0f) ? data.result.minNonZeroNits : 0.0f;
             ss << L" Avg:  " << std::setw(7) << data.result.avgNits << L"  Min>0:" << std::setprecision(3) << std::setw(6) << minNonZero << L"\n";
@@ -308,11 +313,11 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             SetProp(hwnd, L"AnalysisText", textCopy);
 
             // Window heights depend on frame timing visibility and pacer metrics
-            // HDR: 430 base, +160 with frame timing, +108 with pacer metrics (6 lines: PJit/Offs/Spin/Ovsh/Drop + BJit)
+            // HDR: 450 base, +160 with frame timing, +108 with pacer metrics (6 lines: PJit/Offs/Spin/Ovsh/Drop + BJit)
             // SDR: 260 base, +160 with frame timing, +108 with pacer metrics
             bool showTiming = g_showFrameTiming.load();
             bool showPacer = showTiming && data.frameTiming.pacerStrategy != FramePacerStrategy::DwmFlushOnly;
-            int height = data.isHDR ? 430 : 260;
+            int height = data.isHDR ? 450 : 260;
             if (showTiming) height += 160;
             if (showPacer) height += 108;
 
@@ -320,7 +325,7 @@ static LRESULT CALLBACK AnalysisWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             RECT curRc;
             GetWindowRect(hwnd, &curRc);
             if ((curRc.bottom - curRc.top) != height)
-                SetWindowPos(hwnd, nullptr, 0, 0, 260, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(hwnd, nullptr, 0, 0, kAnalysisWindowWidth, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             InvalidateRect(hwnd, nullptr, FALSE);
         }
         return 0;
@@ -354,8 +359,8 @@ bool CreateAnalysisOverlay(HINSTANCE hInstance) {
 
     // Create window (initially hidden)
     // Position: top-right with 40px margin
-    int width = 260;
-    int height = 430;  // Tall enough for all HDR stats
+    int width = kAnalysisWindowWidth;
+    int height = 450;  // Tall enough for all HDR stats
     int margin = 40;
     int screenW = GetSystemMetrics(SM_CXSCREEN);
     int x = screenW - width - margin;
@@ -463,9 +468,9 @@ bool CreateAnalysisResources(MonitorContext* ctx) {
         return false;  // Compute shader not available
     }
 
-    // Create structured buffer for analysis results (16 uint elements = 64 bytes)
+    // Create structured buffer for analysis results (layout: shader.h analysis_slot)
     D3D11_BUFFER_DESC bufDesc = {};
-    bufDesc.ByteWidth = 16 * sizeof(uint32_t);  // 16 uint elements
+    bufDesc.ByteWidth = kAnalysisOutputUints * sizeof(uint32_t);
     bufDesc.Usage = D3D11_USAGE_DEFAULT;
     bufDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
     bufDesc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
@@ -478,12 +483,12 @@ bool CreateAnalysisResources(MonitorContext* ctx) {
         return false;
     }
 
-    // Create UAV for 16 uint elements
+    // UAV over every output uint
     D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
     uavDesc.Format = DXGI_FORMAT_UNKNOWN;
     uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
     uavDesc.Buffer.FirstElement = 0;
-    uavDesc.Buffer.NumElements = 16;
+    uavDesc.Buffer.NumElements = kAnalysisOutputUints;
 
     hr = g_device->CreateUnorderedAccessView(ctx->analysisBuffer, &uavDesc, &ctx->analysisUAV);
     if (FAILED(hr)) {
@@ -496,7 +501,7 @@ bool CreateAnalysisResources(MonitorContext* ctx) {
 
     // Create double-buffered staging buffers for async readback
     D3D11_BUFFER_DESC stagingDesc = {};
-    stagingDesc.ByteWidth = 16 * sizeof(uint32_t);  // 16 uint elements
+    stagingDesc.ByteWidth = kAnalysisOutputUints * sizeof(uint32_t);
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
@@ -648,20 +653,25 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     result.histogram[3] = data[13];
     result.histogram[4] = data[14];
     result.minNonZeroNits = *(float*)&data[15];
+    result.peakRgbNits = *(float*)&data[analysis_slot::PeakRgb];
+    float sumRgbNits = *(float*)&data[analysis_slot::SumRgb];
 
     g_context->Unmap(ctx->analysisStagingBuffer[readIdx], 0);
 
     // Calculate derived values
     if (result.totalPixels > 0) {
         result.avgNits = sumNits / (float)result.totalPixels;
+        result.avgRgbNits = sumRgbNits / (float)result.totalPixels;
     }
 
-    // Update session maximums
-    if (result.peakNits > ctx->sessionMaxCLL) {
-        ctx->sessionMaxCLL = result.peakNits;
+    // Session maximums, as CTA-861.3 defines them: MaxCLL = max over frames of the max(R,G,B) peak,
+    // MaxFALL = max over frames of the frame-average max(R,G,B). (Were luminance Y: a saturated red or
+    // blue highlight read up to 4.7x / 14x low.)
+    if (result.peakRgbNits > ctx->sessionMaxCLL) {
+        ctx->sessionMaxCLL = result.peakRgbNits;
     }
-    if (result.avgNits > ctx->sessionMaxFALL) {
-        ctx->sessionMaxFALL = result.avgNits;
+    if (result.avgRgbNits > ctx->sessionMaxFALL) {
+        ctx->sessionMaxFALL = result.avgRgbNits;
     }
 
     // Store latest result

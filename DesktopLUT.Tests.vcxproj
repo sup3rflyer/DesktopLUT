@@ -131,6 +131,7 @@
     <ClCompile Include="tests\test_ipc_json.cpp" />
     <ClCompile Include="tests\test_ipc_grayscale.cpp" />
     <ClCompile Include="tests\test_ipc_pipe.cpp" />
+    <ClCompile Include="tests\test_analysis_cs.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

@@ -366,6 +366,8 @@ struct AnalysisResult {
     float minNits = 0.0f;
     float avgNits = 0.0f;
     float minNonZeroNits = 0.0f;   // Min excluding near-black (<0.1 nit)
+    float peakRgbNits = 0.0f;      // max(R,G,B) peak (CTA-861.3 MaxCLL basis); peakNits above is luminance Y
+    float avgRgbNits = 0.0f;       // frame average of max(R,G,B) (CTA-861.3 FALL basis)
     uint32_t totalPixels = 0;
     uint32_t pixelsRec709 = 0;
     uint32_t pixelsP3Only = 0;

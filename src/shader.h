@@ -899,8 +899,17 @@ R"(
 
 // Dynamic peak detection compute shaders: shared/peak_detect.h (one copy for overlay + DWM hook)
 
-// Compute shader for frame analysis
-// Samples a 64x64 grid across the frame to gather statistics
+// Compute shader for frame analysis: statistics over an 80x45 sample grid.
+// Output layout (uints) — the C++ side reads it by these slots; kAnalysisOutputUints sizes the buffers.
+inline constexpr unsigned kAnalysisOutputUints = 32;   // 18 used; room to grow without resizing
+namespace analysis_slot {
+enum : unsigned {
+    PeakY = 0, MinY = 1, SumY = 2, TotalPixels = 3, Rec709 = 4, P3Only = 5, Rec2020Only = 6, OutOfGamut = 7,
+    ClipBlack = 8, ClipWhite = 9, Hist0 = 10, /* .. Hist4 = 14 */ MinNonZeroY = 15,
+    PeakRgb = 16,   // max over samples of max(R,G,B) nits — CTA-861.3 MaxCLL basis
+    SumRgb = 17,    // sum over samples of max(R,G,B) nits — /TotalPixels = the frame-average light level (FALL)
+};
+}
 inline const char* g_analysisCSSource = R"(
 Texture2D<float4> inputTexture : register(t0);
 RWStructuredBuffer<uint> output : register(u0);
@@ -912,7 +921,7 @@ cbuffer AnalysisParams : register(b0) {
     uint pad;
 };
 
-// Output buffer layout (16 uint values = 64 bytes):
+// Output buffer layout (uints; the rest of the 32 stay 0):
 // [0] peakNits (as float bits, luminance-based)
 // [1] minNits (as float bits, luminance-based)
 // [2] sumNits (as float bits, divided by totalPixels later)
@@ -925,11 +934,16 @@ cbuffer AnalysisParams : register(b0) {
 // [9] pixelsClipWhite
 // [10-14] histogram (0-203, 203-1k, 1k-2k, 2k-4k, 4k+)
 // [15] minNonZeroNits (as float bits, min excluding <0.1 nit)
+// [16] peakRgbNits (float bits): max over samples of max(R,G,B)*80 — CTA-861.3 defines MaxCLL / MaxFALL on
+//      max(R,G,B), not on Y: a saturated 1000-nit red is Y 213 (Y stays the tonemapper's quantity)
+// [17] sumRgbNits (float bits): sum of max(R,G,B)*80, divided by totalPixels on the CPU
 
 groupshared float sharedPeak[256];
 groupshared float sharedMin[256];
 groupshared float sharedMinNonZero[256];
 groupshared float sharedSum[256];
+groupshared float sharedPeakRgb[256];
+groupshared float sharedSumRgb[256];
 groupshared uint sharedRec709[256];
 groupshared uint sharedP3Only[256];
 groupshared uint sharedRec2020Only[256];
@@ -970,6 +984,8 @@ void main(uint3 GTid : SV_GroupThreadID) {
     float localMin = 100000.0f;
     float localMinNonZero = 100000.0f;  // Min excluding near-black pixels
     float localSum = 0.0f;
+    float localPeakRgb = 0.0f;
+    float localSumRgb = 0.0f;
     uint localRec709 = 0, localP3Only = 0, localRec2020Only = 0, localOutOfGamut = 0;
     uint localClipBlack = 0, localClipWhite = 0;
     uint localHist0 = 0, localHist1 = 0, localHist2 = 0, localHist3 = 0, localHist4 = 0;
@@ -1002,7 +1018,12 @@ void main(uint3 GTid : SV_GroupThreadID) {
             if (nitsY > 0.1f) {                    // Min>0 excludes near-black (<0.1 nit)
                 localMinNonZero = min(localMinNonZero, nitsY);
             }
-            localSum += nitsY;                      // FALL/APL uses luminance average
+            localSum += nitsY;                      // Avg / APL use the luminance average
+            // MaxCLL / MaxFALL basis (CTA-861.3): max(R,G,B) in linear light. Negative (out-of-709)
+            // components contribute nothing.
+            float nitsRgb = max(max(max(rgb.r, rgb.g), rgb.b), 0.0f) * 80.0f;
+            localPeakRgb = max(localPeakRgb, nitsRgb);
+            localSumRgb += nitsRgb;
 
             // Gamut classification
             // SDR mode: everything is Rec.709 by definition (8-bit sRGB capture)
@@ -1058,6 +1079,8 @@ void main(uint3 GTid : SV_GroupThreadID) {
     sharedMin[GTid.x] = localMin;
     sharedMinNonZero[GTid.x] = localMinNonZero;
     sharedSum[GTid.x] = localSum;
+    sharedPeakRgb[GTid.x] = localPeakRgb;
+    sharedSumRgb[GTid.x] = localSumRgb;
     sharedRec709[GTid.x] = localRec709;
     sharedP3Only[GTid.x] = localP3Only;
     sharedRec2020Only[GTid.x] = localRec2020Only;
@@ -1078,6 +1101,8 @@ void main(uint3 GTid : SV_GroupThreadID) {
             sharedMin[GTid.x] = min(sharedMin[GTid.x], sharedMin[GTid.x + stride]);
             sharedMinNonZero[GTid.x] = min(sharedMinNonZero[GTid.x], sharedMinNonZero[GTid.x + stride]);
             sharedSum[GTid.x] += sharedSum[GTid.x + stride];
+            sharedPeakRgb[GTid.x] = max(sharedPeakRgb[GTid.x], sharedPeakRgb[GTid.x + stride]);
+            sharedSumRgb[GTid.x] += sharedSumRgb[GTid.x + stride];
             sharedRec709[GTid.x] += sharedRec709[GTid.x + stride];
             sharedP3Only[GTid.x] += sharedP3Only[GTid.x + stride];
             sharedRec2020Only[GTid.x] += sharedRec2020Only[GTid.x + stride];
@@ -1111,6 +1136,8 @@ void main(uint3 GTid : SV_GroupThreadID) {
         output[13] = sharedHist3[0];
         output[14] = sharedHist4[0];
         output[15] = asuint(sharedMinNonZero[0]);  // Min excluding near-black
+        output[16] = asuint(sharedPeakRgb[0]);
+        output[17] = asuint(sharedSumRgb[0]);      // Will divide by totalPixels in CPU code
     }
 }
 )";
