@@ -31,6 +31,7 @@
 #include "displayconfig.h"
 #include "ipc_json.h"
 #include "ipc_grayscale.h"
+#include "ipc_client_check.h"
 #include "settings.h"
 #include "processing.h"
 #include "gui.h"
@@ -144,6 +145,9 @@ struct CalibGuiCall {
 // Set by StopCalibrationIpcServer: ends every pipe wait and every pending GUI-call wait.
 // Manual reset; process lifetime (never closed — the server thread may outlive a Stop).
 HANDLE g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+// The connection whose request the server thread is dispatching (null elsewhere, e.g. in tests that
+// call Dispatch directly): mutating verbs log the client's PID and image path (T2.2).
+thread_local HANDLE t_clientPipe = nullptr;
 std::mutex g_guiCallsMutex;
 std::map<uint64_t, std::shared_ptr<CalibGuiCall>> g_guiCalls;   // under g_guiCallsMutex
 uint64_t g_nextGuiCallId = 1;                                    // under g_guiCallsMutex
@@ -1958,6 +1962,9 @@ std::string Dispatch(const std::string& request) {
         } else if (method == "maintenance.verify_mhc") {
             DoVerifyMhc(params, result, error);  // read-only, safe off the GUI thread
         } else if (IsMutatingMethod(method)) {
+            if (t_clientPipe)
+                std::cerr << "[Calibration IPC] " << method << " from "
+                          << ipc_client::PipeClientDescription(t_clientPipe) << std::endl;
             if (!g_gui.hwndMain) {
                 error = "GUI window not available";
             } else {
@@ -2110,14 +2117,15 @@ bool WriteAllOverlapped(HANDLE pipe, OverlappedEvent& io, const std::string& dat
     return true;
 }
 
-void HandleConnection(HANDLE pipe, OverlappedEvent& io) {
+// Returns false when the server thread must stop serving (it could not drop a client's identity).
+bool HandleConnection(HANDLE pipe, OverlappedEvent& io, const ipc_client::TokenIdentity& server) {
     std::string request;
     char buf[4096];
     bool gotLine = false;
     const DWORD readDeadline = GetTickCount() + kRequestReadDeadlineMs;
     while (request.size() < kMaxRequestBytes) {
         const DWORD now = GetTickCount();
-        if ((LONG)(readDeadline - now) <= 0) return;   // stalled client: drop it
+        if ((LONG)(readDeadline - now) <= 0) return true;   // stalled client: drop it
         OVERLAPPED& ov = io.Reset();
         DWORD n = 0;
         const BOOL ok = ReadFile(pipe, buf, sizeof(buf), nullptr, &ov);
@@ -2126,11 +2134,30 @@ void HandleConnection(HANDLE pipe, OverlappedEvent& io) {
         size_t nl = request.find('\n');
         if (nl != std::string::npos) { request.resize(nl); gotLine = true; break; }
     }
+    if (!gotLine && request.empty()) return true;   // closed / failed before sending anything
+
+    // Per-connection client check (T2.2). After the read: the client's context is captured by then.
+    bool revertFailed = false;
+    const ipc_client::TokenIdentity client = ipc_client::ReadPipeClientIdentity(pipe, revertFailed);
+    if (revertFailed) {
+        std::cerr << "[Calibration IPC] could not revert from a client's identity; server stopped" << std::endl;
+        return false;
+    }
+    const ipc_client::Verdict verdict = ipc_client::Judge(client, server);
+
     std::string response;
-    if (request.size() >= kMaxRequestBytes) response = ErrResponse("request too large") + "\n";
-    else if (!gotLine && request.empty()) return;   // closed / failed before sending anything
-    else response = Dispatch(request) + "\n";
-    if (!WriteAllOverlapped(pipe, io, response, GetTickCount() + kReplyWriteDeadlineMs)) return;
+    if (verdict != ipc_client::Verdict::Allowed) {
+        std::cerr << "[Calibration IPC] rejected a client (" << ipc_client::PipeClientDescription(pipe)
+                  << "): " << ipc_client::VerdictText(verdict) << std::endl;
+        response = ErrResponse(std::string("client not permitted: ") + ipc_client::VerdictText(verdict)) + "\n";
+    } else if (request.size() >= kMaxRequestBytes) {
+        response = ErrResponse("request too large") + "\n";
+    } else {
+        t_clientPipe = pipe;   // Dispatch logs who sent each mutating verb
+        response = Dispatch(request) + "\n";
+        t_clientPipe = nullptr;
+    }
+    if (!WriteAllOverlapped(pipe, io, response, GetTickCount() + kReplyWriteDeadlineMs)) return true;
     // Instead of FlushFileBuffers (which blocks until the client has read everything — forever for a
     // client that never reads): wait, bounded, for the client to close its end after reading the reply,
     // so the disconnect does not discard data it is still reading.
@@ -2138,6 +2165,7 @@ void HandleConnection(HANDLE pipe, OverlappedEvent& io) {
     DWORD n = 0;
     const BOOL ok = ReadFile(pipe, buf, sizeof(buf), nullptr, &ov);
     FinishOverlapped(pipe, ov, ok, kClientCloseWaitMs, n);
+    return true;
 }
 
 DWORD WINAPI ServerThreadProc(LPVOID) {
@@ -2150,10 +2178,18 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
         return 0;
     }
     SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+    // Fail closed: without our own identity no client can be judged.
+    const ipc_client::TokenIdentity serverIdentity = ipc_client::ReadProcessTokenIdentity();
+    if (!serverIdentity.valid) {
+        std::cerr << "[Calibration IPC] could not read the process token; server not started" << std::endl;
+        LocalFree(sd);
+        return 0;
+    }
     OverlappedEvent io;
     if (!io.ov.hEvent) { LocalFree(sd); return 0; }
     DWORD lastCreateError = 0;
-    while (WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
+    bool keepServing = true;
+    while (keepServing && WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
         // FILE_FLAG_FIRST_PIPE_INSTANCE: never serve under a name another process created first.
         HANDLE pipe = CreateNamedPipeW(
             kPipeName,
@@ -2189,7 +2225,8 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
                 connected = (FinishOverlapped(pipe, ov, FALSE, INFINITE, n) == IoResult::Done);
             }
         }
-        if (connected && WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) HandleConnection(pipe, io);
+        if (connected && WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0)
+            keepServing = HandleConnection(pipe, io, serverIdentity);
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }

@@ -6,6 +6,7 @@
 #include "doctest.h"
 #include "desktoplut_ipc_server.h"
 #include "globals.h"
+#include "ipc_client_check.h"
 
 #include <windows.h>
 #include <atomic>
@@ -206,5 +207,150 @@ TEST_CASE("Calibration pipe: mutating requests run on the GUI thread; a disarm a
         CHECK_FALSE(Contains(reply, "unknown method"));   // the command did not run
         PumpFor(50);   // the stale WM_CALIB_CMD is delivered now...
         CHECK(g_testCalibMessages.load() == 1);   // ...and finds its call gone
+    }
+}
+
+// ---- Per-connection client check (T2.2) -------------------------------------------------------
+namespace {
+
+HANDLE OwnPrimaryToken(DWORD access) {
+    HANDLE token = nullptr, dup = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY, &token)) return nullptr;
+    DuplicateTokenEx(token, access, nullptr, SecurityImpersonation, TokenPrimary, &dup);
+    CloseHandle(token);
+    return dup;
+}
+
+HANDLE LowIntegrityToken() {
+    HANDLE dup = OwnPrimaryToken(TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_DUPLICATE | TOKEN_IMPERSONATE |
+                                 TOKEN_ASSIGN_PRIMARY);
+    if (!dup) return nullptr;
+    BYTE lowSid[SECURITY_MAX_SID_SIZE];
+    DWORD size = sizeof(lowSid);
+    TOKEN_MANDATORY_LABEL label{};
+    if (!CreateWellKnownSid(WinLowLabelSid, nullptr, lowSid, &size)) { CloseHandle(dup); return nullptr; }
+    label.Label.Sid = lowSid;
+    label.Label.Attributes = SE_GROUP_INTEGRITY;
+    if (!SetTokenInformation(dup, TokenIntegrityLevel, &label, sizeof(label) + GetLengthSid(lowSid))) {
+        CloseHandle(dup);
+        return nullptr;
+    }
+    return dup;
+}
+
+// The process token restricted to its own user SID: the pipe DACL still grants it, so the connection
+// opens and only the per-connection check can refuse it.
+HANDLE RestrictedToken() {
+    HANDLE token = nullptr, restricted = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY, &token))
+        return nullptr;
+    const ipc_client::TokenIdentity self = ipc_client::ReadTokenIdentity(token);
+    std::vector<BYTE> sid = self.userSid;
+    SID_AND_ATTRIBUTES restrict{};
+    restrict.Sid = sid.data();
+    CreateRestrictedToken(token, 0, 0, nullptr, 0, nullptr, 1, &restrict, &restricted);
+    CloseHandle(token);
+    return restricted;
+}
+
+// Talks to the pipe while impersonating `primary` for the whole exchange — the server sees the
+// context the client WROTE with (dynamic tracking), not only the one it opened with — and returns the reply.
+std::string RoundTripAs(HANDLE primary, const std::string& request, bool* opened) {
+    *opened = false;
+    HANDLE imp = nullptr;
+    if (!DuplicateTokenEx(primary, TOKEN_IMPERSONATE | TOKEN_QUERY, nullptr, SecurityImpersonation,
+                          TokenImpersonation, &imp))
+        return "<no impersonation token>";
+    std::string reply;
+    std::thread client([&] {
+        if (!SetThreadToken(nullptr, imp)) { reply = "<SetThreadToken failed>"; return; }
+        HANDLE h = ConnectClient();
+        if (h == INVALID_HANDLE_VALUE) { RevertToSelf(); reply = "<open refused>"; return; }
+        *opened = true;
+        if (WriteLine(h, request)) reply = ReadLine(h);
+        CloseHandle(h);
+        RevertToSelf();
+    });
+    client.join();
+    CloseHandle(imp);
+    return reply;
+}
+
+}  // namespace
+
+TEST_CASE("Calibration pipe client check: judging real tokens") {
+    using namespace ipc_client;
+    const TokenIdentity self = ReadProcessTokenIdentity();
+    REQUIRE(self.valid);
+    CHECK(self.integrityRid >= SECURITY_MANDATORY_MEDIUM_RID);
+    CHECK_FALSE(self.appContainer);
+    CHECK(Judge(self, self) == Verdict::Allowed);
+
+    SUBCASE("a Low-integrity duplicate of our own token is refused") {
+        HANDLE low = LowIntegrityToken();
+        REQUIRE(low != nullptr);
+        const TokenIdentity id = ReadTokenIdentity(low);
+        CloseHandle(low);
+        REQUIRE(id.valid);
+        CHECK(id.userSid == self.userSid);
+        CHECK(id.integrityRid == SECURITY_MANDATORY_LOW_RID);
+        CHECK(Judge(id, self) == Verdict::BelowMediumIntegrity);
+    }
+    SUBCASE("a restricted token is refused") {
+        HANDLE restricted = RestrictedToken();
+        REQUIRE(restricted != nullptr);
+        const TokenIdentity id = ReadTokenIdentity(restricted);
+        CloseHandle(restricted);
+        REQUIRE(id.valid);
+        CHECK(id.restricted);
+        CHECK(Judge(id, self) == Verdict::Restricted);
+    }
+    SUBCASE("another user is refused, SYSTEM is allowed, an unreadable identity is refused") {
+        TokenIdentity other = self;
+        BYTE sid[SECURITY_MAX_SID_SIZE];
+        DWORD size = sizeof(sid);
+        REQUIRE(CreateWellKnownSid(WinLocalServiceSid, nullptr, sid, &size));
+        other.userSid.assign(sid, sid + size);
+        CHECK(Judge(other, self) == Verdict::OtherUser);
+
+        size = sizeof(sid);
+        REQUIRE(CreateWellKnownSid(WinLocalSystemSid, nullptr, sid, &size));
+        other.userSid.assign(sid, sid + size);
+        CHECK(Judge(other, self) == Verdict::Allowed);
+
+        CHECK(Judge(TokenIdentity{}, self) == Verdict::Unidentified);
+        CHECK(Judge(self, TokenIdentity{}) == Verdict::Unidentified);   // no server identity: fail closed
+        TokenIdentity container = self;
+        container.appContainer = true;
+        CHECK(Judge(container, self) == Verdict::AppContainer);
+    }
+}
+
+TEST_CASE("Calibration pipe client check: enforced on the real pipe") {
+    ArmedServer server(false);
+    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
+
+    SUBCASE("a restricted-token client reaches the pipe and is refused per connection") {
+        HANDLE restricted = RestrictedToken();
+        REQUIRE(restricted != nullptr);
+        bool opened = false;
+        const std::string reply = RoundTripAs(restricted, R"({"method":"no.such.method"})", &opened);
+        CloseHandle(restricted);
+        CHECK(opened);
+        CHECK(Contains(reply, "client not permitted: client token is restricted"));
+        CHECK_FALSE(Contains(reply, "unknown method"));   // never dispatched
+    }
+    SUBCASE("a Low-integrity client is refused (by the pipe's label or the check)") {
+        HANDLE low = LowIntegrityToken();
+        REQUIRE(low != nullptr);
+        bool opened = false;
+        const std::string reply = RoundTripAs(low, R"({"method":"no.such.method"})", &opened);
+        CloseHandle(low);
+        if (opened) CHECK(Contains(reply, "client not permitted"));
+        else        CHECK(reply == "<open refused>");
+        CHECK_FALSE(Contains(reply, "unknown method"));
+    }
+    SUBCASE("our own token is served") {
+        CHECK(Contains(RoundTrip(R"({"method":"no.such.method"})"), "unknown method"));
     }
 }

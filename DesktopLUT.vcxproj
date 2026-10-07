@@ -118,6 +118,7 @@
     <ClInclude Include="src\types.h" />
     <ClInclude Include="src\globals.h" />
     <ClInclude Include="src\ipc_json.h" />
+    <ClInclude Include="src\ipc_client_check.h" />
     <ClInclude Include="src\shader.h" />
     <ClInclude Include="shared\fald_panel.h" />
     <ClInclude Include="shared\fald_temporal.h" />

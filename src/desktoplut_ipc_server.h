@@ -7,6 +7,10 @@
 //   * LOCAL-USER-ONLY: the pipe is created with a protected DACL granting access
 //     to the current user + SYSTEM only (DesktopLUT may run elevated for DWM-hook
 //     mode, so the pipe must not become a privilege bridge).
+//   * PER-CONNECTION CHECK: each client's own pipe token must be the same user (or
+//     SYSTEM), at least Medium integrity, not an AppContainer, not restricted — DLC
+//     runs non-elevated, so High cannot be demanded (ipc_client_check.h). Every
+//     mutating verb logs the client's PID and image path.
 //   * REMOTE-REJECTED: PIPE_REJECT_REMOTE_CLIENTS — never reachable over a network.
 //   * BOUNDED + FAIL-SAFE: capped request size, one request per connection, and
 //     every handler is wrapped so bad input or a fault can never crash the host.
