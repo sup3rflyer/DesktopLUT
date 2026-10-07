@@ -21,6 +21,14 @@ void StartProcessing();
 // own while not running.
 void StopProcessing();
 
+// One display needs the processing pipeline (a LUT, a shader correction, tonemap, FALD in overlay mode,
+// or desktop gamma) — StartProcessing's per-monitor filter.
+bool MonitorNeedsProcessing(const MonitorSettings& ms);
+// Any LIVE display needs the processing pipeline.
+bool AnyMonitorNeedsProcessing();
+// Any LIVE display has any correction at all, MHC profiles included (the startup auto-start test).
+bool AnyMonitorHasCorrections();
+
 // True while StartProcessing/StopProcessing is executing (their joins pump messages): handlers
 // that would start, join or replace the processing thread must leave it to the transition.
 bool IsProcessingTransitionActive();

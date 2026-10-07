@@ -1151,6 +1151,11 @@ static int g_monitorIdentityRetries = 0;
 
 int g_monitorSettingsPins = 0;   // see MonitorSettingsPin (gui.h)
 
+// The user pressed Stop (button / tray) and has not pressed Start/Apply since: display changes and
+// wakes must not start processing behind their back. Programmatic Stop/Start pairs (LUT browse,
+// pipe verbs, preview spin-ups) do not touch it. GUI thread only.
+static bool g_userStopped = false;
+
 void SelectMonitor(int index) {
     const int count = (int)(std::min)(g_gui.monitors.size(), g_gui.monitorSettings.size());
     if (count <= 0) { g_gui.currentMonitor = 0; return; }
@@ -1450,6 +1455,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         case ID_APPLY:
+            g_userStopped = false;
             g_tetrahedralInterp = (SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             SaveSettings();
             if (g_gui.isRunning) {
@@ -1458,6 +1464,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StartProcessing();
             return 0;
         case ID_STOP:
+            g_userStopped = true;
             StopProcessing();
             return 0;
         case ID_TETRAHEDRAL_CHECK:
@@ -2521,9 +2528,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetForegroundWindow(hwnd);
             return 0;
         case ID_TRAY_APPLY:
+            g_userStopped = false;
             StartProcessing();
             return 0;
         case ID_TRAY_STOP:
+            g_userStopped = true;
             StopProcessing();
             return 0;
         case ID_TRAY_STARTUP:
@@ -3034,9 +3043,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_forceReinit.store(true);
                 g_forceMhcReapply.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-            } else if (!g_gui.activeSettings.empty()) {
-                // Processing exited (e.g., monitors were off during init) — restart now
-                std::cout << "[GUI] Display change with active settings, restarting processing..." << std::endl;
+            } else if (!g_userStopped && (!g_gui.activeSettings.empty() || AnyMonitorNeedsProcessing())) {
+                // Processing exited (e.g., monitors were off during init), or never started because the
+                // display it corrects was not connected yet (the owner's LG, powered on after logon):
+                // start now — unless the user pressed Stop.
+                std::cout << "[GUI] Display change with a display to correct, starting processing..." << std::endl;
                 StartProcessing();
             } else {
                 // MHC-only configuration (no processing thread): verify profiles
@@ -3135,7 +3146,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g_forceReinit.store(true);
                         g_forceMhcReapply.store(true);
                         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-                    } else if (!g_gui.activeSettings.empty()) {
+                    } else if (!g_userStopped && !g_gui.activeSettings.empty()) {
                         // Processing thread exited during display-off (e.g., watchdog timeout).
                         // Restart it automatically since the user had it running before.
                         std::cout << "[GUI] Processing was interrupted during display-off, restarting..." << std::endl;
@@ -3265,25 +3276,10 @@ int RunGUI() {
     // Create OSD window on GUI thread — available in all modes (hook-only, analysis-only, full overlay)
     CreateOSDWindow(GetModuleHandle(nullptr));
 
-    // Check if any visual correction is enabled (LUT, MHC, Primaries, Grayscale, 2.4 Gamma, Desktop Gamma, DWM hook)
-    bool hasAnyCorrection = g_userDesktopGammaMode.load();  // Desktop gamma is a global setting
-    for (const auto& settings : g_gui.monitorSettings) {
-        if (!settings.sdrPath.empty() ||
-            !settings.hdrPath.empty() ||
-            settings.sdrMHC.enabled ||
-            settings.hdrMHC.enabled ||
-            settings.sdrColorCorrection.primariesEnabled ||
-            settings.sdrColorCorrection.grayscale.enabled ||
-            settings.sdrColorCorrection.grayscale.use24Gamma ||
-            settings.hdrColorCorrection.primariesEnabled ||
-            settings.hdrColorCorrection.grayscale.enabled ||
-            settings.hdrColorCorrection.tonemap.enabled ||
-            settings.hdrColorCorrection.fald.enabled ||
-            settings.sdrColorCorrection.fald.enabled) {
-            hasAnyCorrection = true;
-            break;
-        }
-    }
+    // Check if any visual correction is enabled (LUT, MHC, Primaries, Grayscale, 2.4 Gamma, Desktop Gamma,
+    // tonemap, FALD) on a display that is connected now. A display that arrives later (the owner's LG,
+    // powered on after boot) starts processing from WM_DISPLAYCHANGE — see g_userStopped.
+    bool hasAnyCorrection = AnyMonitorHasCorrections();
 
     // Auto-start processing if any correction is enabled
     if (hasAnyCorrection) {

@@ -989,6 +989,36 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
     PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, needsFullOverlay ? 1 : 0, 0);
 }
 
+bool MonitorNeedsProcessing(const MonitorSettings& ms) {
+    bool hasLUT = !ms.sdrPath.empty() || !ms.hdrPath.empty();
+    bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
+                                 ms.sdrColorCorrection.grayscale.enabled ||
+                                 ms.sdrColorCorrection.grayscale.use24Gamma ||
+                                 (ms.sdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
+    bool hasHdrColorCorrection = ms.hdrColorCorrection.primariesEnabled ||
+                                 ms.hdrColorCorrection.grayscale.enabled ||
+                                 ms.hdrColorCorrection.tonemap.enabled ||
+                                 (ms.hdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
+    bool hasDesktopGamma = g_userDesktopGammaMode.load();
+    return hasLUT || hasSdrColorCorrection || hasHdrColorCorrection || hasDesktopGamma;
+}
+
+bool AnyMonitorNeedsProcessing() {
+    for (const auto& ms : g_gui.monitorSettings)
+        if (MonitorNeedsProcessing(ms)) return true;
+    return false;
+}
+
+bool AnyMonitorHasCorrections() {
+    if (g_userDesktopGammaMode.load()) return true;   // desktop gamma is a global setting
+    for (const auto& ms : g_gui.monitorSettings) {
+        if (MonitorNeedsProcessing(ms) || ms.sdrMHC.enabled || ms.hdrMHC.enabled ||
+            ms.hdrColorCorrection.fald.enabled || ms.sdrColorCorrection.fald.enabled)
+            return true;
+    }
+    return false;
+}
+
 static void StopProcessingImpl();
 
 static void StartProcessingImpl() {
@@ -1019,18 +1049,7 @@ static void StartProcessingImpl() {
     std::vector<MonitorLUTConfig> configs;
     for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
         const auto& ms = g_gui.monitorSettings[i];
-        bool hasLUT = !ms.sdrPath.empty() || !ms.hdrPath.empty();
-        bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
-                                     ms.sdrColorCorrection.grayscale.enabled ||
-                                     ms.sdrColorCorrection.grayscale.use24Gamma ||
-                                     (ms.sdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
-        bool hasHdrColorCorrection = ms.hdrColorCorrection.primariesEnabled ||
-                                     ms.hdrColorCorrection.grayscale.enabled ||
-                                     ms.hdrColorCorrection.tonemap.enabled ||
-                                     (ms.hdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
-        bool hasDesktopGamma = g_userDesktopGammaMode.load();
-
-        if (hasLUT || hasSdrColorCorrection || hasHdrColorCorrection || hasDesktopGamma) {
+        if (MonitorNeedsProcessing(ms)) {
             MonitorLUTConfig config;
             config.monitorIndex = (int)i;
             config.sdrLutPath = ms.sdrPath;
@@ -1042,7 +1061,28 @@ static void StartProcessingImpl() {
     }
 
     if (configs.empty()) {
-        SetStatus(L"Configure at least one monitor with LUT or color correction");
+        // Nothing for a processing thread or the hook. An MHC-only setup (the VRR-safe one) is not
+        // an error: its profiles live at scanout. Give it the startup hygiene the processing thread
+        // would have run (orphaned profile files, stale associations, re-assert the active ones) —
+        // MHC-only configurations used to skip it entirely and read "configure at least one monitor".
+        bool anyMhc = false;
+        for (const auto& ms : g_gui.monitorSettings) {
+            if ((ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) ||
+                (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty())) { anyMhc = true; break; }
+        }
+        if (anyMhc) {
+            {
+                // Same guard as the processing thread's startup pass (a re-bake installing a profile
+                // mid-scan must not have its fresh file deleted as an orphan).
+                std::lock_guard<std::mutex> maintenanceLock(g_mhcMaintenanceMutex);
+                CleanupOrphanedMhcProfiles();
+                SweepStaleMhcAssociations();
+                ReapplyAllMhcProfiles();
+            }
+            SetStatus(L"Active (MHC profiles only - nothing else to run)");
+        } else {
+            SetStatus(L"Configure at least one monitor with LUT or color correction");
+        }
         return;
     }
 
@@ -1096,6 +1136,9 @@ static void StartProcessingImpl() {
             std::wstring err = InjectDwmHook(dwmMonitors);
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
+                // Not running: activeSettings must not claim otherwise (it reads as "the user had it
+                // running" to the auto-restart paths and to SettingsChanged).
+                g_gui.activeSettings.clear();
                 // Status bar can only show a single short line — surface the full,
                 // actionable detail (e.g. the DwmHook.dll-missing guidance) in a dialog.
                 // Unowned, on its own thread: a pipe-driven start (layers.set / runtime.*)

@@ -2,6 +2,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
+#include "processing.h"
 #include "fald.h"    // FALD_TAU_MAX_MS
 #include <cstdio>
 #include <cmath>
@@ -1173,3 +1174,31 @@ TEST_CASE("SaveSettings: live displays are stamped LastSeen today, parked ones k
     g_gui.parkedSettings.clear();
 }
 
+
+TEST_CASE("Processing predicates: MHC-only needs no processing but counts as a correction") {
+    g_gui.monitorSettings.clear();
+    const bool dg = g_userDesktopGammaMode.load();
+    g_userDesktopGammaMode = false;
+
+    MonitorSettings mhcOnly;
+    mhcOnly.sdrMHC.enabled = true;
+    g_gui.monitorSettings = { mhcOnly };
+    CHECK_FALSE(MonitorNeedsProcessing(mhcOnly));
+    CHECK_FALSE(AnyMonitorNeedsProcessing());
+    CHECK(AnyMonitorHasCorrections());          // auto-start runs the MHC startup hygiene
+
+    MonitorSettings lut;
+    lut.hdrPath = L"C:\\luts\\x.cube";
+    g_gui.monitorSettings = { mhcOnly, lut };
+    CHECK(AnyMonitorNeedsProcessing());
+
+    MonitorSettings none;
+    g_gui.monitorSettings = { none };
+    CHECK_FALSE(AnyMonitorHasCorrections());
+    g_userDesktopGammaMode = true;              // desktop gamma is global
+    CHECK(AnyMonitorHasCorrections());
+    CHECK(AnyMonitorNeedsProcessing());
+
+    g_userDesktopGammaMode = dg;
+    g_gui.monitorSettings.clear();
+}
