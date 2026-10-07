@@ -68,7 +68,32 @@
 //
 // The HLSL uses no identifiers from either host shader except its own parameters (the hook's
 // cbuffer has pqSourcePeak / pqTargetPeak and globals c1..c3 — do not use those names here).
+//
+// BT.2446A ("BT.2446A" in the GUI; the name is kept, owner decision 2026-09-13) also lives here, so the
+// overlay and the hook run one copy. It is NOT BT.2446-1 Method A: it borrows Method A's log/piecewise
+// shape for a SHOULDER only — identity below a knee at 0.8 x target (linear, source-normalised; 0 for SDR
+// targets <= 203 nits), the overshoot above it mapped with a fixed rho_SDR = 33 and rho_HDR from the
+// compression ratio (overshoot range / headroom), then scaled into the headroom. Inputs are linear and
+// normalised by the source peak (Y = 1 is the source peak). Content above the source peak (Y > 1: a
+// static Source set too low, the dynamic detector's rise lag) is clamped: it used to extrapolate the
+// curve past the target (4000-nit pixel, detected 1200, target 1000 -> 1329 nits), so the output now
+// never exceeds the target.
+//
+// Dynamic-peak floor (C++, both hosts): in dynamic mode the source peak fed to the curves is the
+// detected frame peak, floored. SoftClip / Reinhard / HardClip floor at the target (detected <= target
+// -> identity + clip). BT.2390 and BT.2446A need a source strictly above the target — BT.2390's knee
+// KS = 1.5 maxLum - 0.5 reaches 1 at source == target and its Hermite segment divides by (1 - KS) — so
+// they floor at target x 1.1 (owner decision 2026-09-13; replaced a 1.0x..1.5x ramp over 400..4000-nit
+// targets whose constants had no stated basis and which darkened 1600-nit content on a 1600-nit target
+// to 1564 by running it as source 1867).
 #pragma once
+
+constexpr float kDlutDynamicFloorRatioWithKnee = 1.1f;
+
+// Dynamic-mode source-peak floor in nits for a tonemap curve (raisedFloor: BT.2390 or BT.2446A).
+inline float DlutDynamicPeakFloorNits(float targetNits, bool raisedFloor) {
+    return raisedFloor ? targetNits * kDlutDynamicFloorRatioWithKnee : targetNits;
+}
 
 #define DLUT_TONEMAP_CURVES_HLSL R"TMC(
 // ---- Peak-preserving SoftClip / Reinhard (one copy: shared/tonemap_curves.h, derivation there) ----
@@ -116,5 +141,28 @@ float TonemapReinhard_PQ(float I, float pqSrcPeak, float pqTgtPeak, float target
 	if (S <= H || H <= 0.0) return min(I, pqTgtPeak);
 	float x = I - pqKnee;
 	return min(pqKnee + x / (1.0 + x * (pqSrcPeak - pqTgtPeak) / (S * H)), pqTgtPeak);
+}
+
+// BT.2446A-style log shoulder - LINEAR, normalised by the source peak (Y = 1 is the source peak;
+// targetPeak = target / source). Identity below the knee, never above targetPeak (derivation above).
+float TonemapBT2446A(float Y, float targetPeak, float targetNits) {
+	float knee = (targetNits <= 203.0) ? 0.0 : targetPeak * 0.8;
+	if (Y <= knee) return Y;
+	float overshoot = Y - knee;
+	float maxOvershoot = 1.0 - knee;
+	float headroom = targetPeak - knee;
+	float normalizedOvershoot = saturate(overshoot / maxOvershoot);   // above the source peak: clamp
+	float Yg = pow(normalizedOvershoot, 1.0 / 2.4);
+	float compressionRatio = maxOvershoot / headroom;
+	float pHDR = 1.0 + 32.0 * pow(compressionRatio, 1.0 / 2.4);
+	float pSDR = 1.0 + 32.0;
+	float Yp = log(1.0 + (pHDR - 1.0) * Yg) / log(pHDR);
+	float Yc;
+	if (Yp <= 0.7399)      Yc = Yp * 1.0770;
+	else if (Yp < 0.9909)  Yc = Yp * (-1.1510 * Yp + 2.7811) - 0.6302;
+	else                   Yc = Yp * 0.5000 + 0.5000;
+	float Ysdr = (pow(pSDR, Yc) - 1.0) / (pSDR - 1.0);
+	float compressed = pow(max(Ysdr, 0.0), 2.4);
+	return min(knee + compressed * headroom, targetPeak);
 }
 )TMC"

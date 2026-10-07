@@ -21,6 +21,7 @@ struct MonitorMatchResult {
     std::vector<MonitorSettings> parked;  // every other known display — becomes g_gui.parkedSettings
     std::vector<std::wstring> log;        // one human-readable line per live display (+ drops)
     bool allIdentified = true;            // false when any live display had to be matched positionally
+    std::vector<bool> fresh;              // per live display: a NEW identified display on default settings
 };
 
 // EDID ids are "<hardware id>" or "<hardware id>-<serial>" (QueryDisplayIdentity).

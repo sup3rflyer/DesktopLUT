@@ -5,6 +5,9 @@
 #include "globals.h"
 #include "settings.h"
 #include <algorithm>
+#include <cmath>
+#include <string>
+#include <unordered_map>
 
 // Custom colors for Windows 11-like scheme
 HBRUSH g_tabBgBrush = nullptr;
@@ -47,9 +50,21 @@ void UpdateSliderFromEdit(int index) {
 // Numeric edit box subclass - filters input to only allow valid decimal numbers
 // maxDecimals is stored in dwRefData (set when subclassing)
 // Also handles Enter key to commit and unfocus
+// Text each numeric edit had when it gained the focus, for Escape (GUI thread only).
+static std::unordered_map<HWND, std::wstring> s_textAtFocus;
+
 LRESULT CALLBACK NumericEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
                                           UINT_PTR uIdSubclass, DWORD_PTR dwRefData) {
     int maxDecimals = (int)dwRefData;
+
+    if (msg == WM_SETFOCUS) {
+        wchar_t text[64] = {};
+        GetWindowText(hwnd, text, 64);
+        s_textAtFocus[hwnd] = text;
+    } else if (msg == WM_NCDESTROY) {
+        s_textAtFocus.erase(hwnd);
+        RemoveWindowSubclass(hwnd, NumericEditSubclassProc, uIdSubclass);
+    }
 
     // Handle Enter key - commit value and move focus to parent
     if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
@@ -60,8 +75,11 @@ LRESULT CALLBACK NumericEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
         return 0;  // Don't pass Enter to edit control (would beep)
     }
 
-    // Handle Escape key - restore original value and unfocus
+    // Handle Escape key - restore the value the field had when it got the focus, then unfocus
+    // (the EN_KILLFOCUS commit then sees the unchanged value and does nothing).
     if (msg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+        auto it = s_textAtFocus.find(hwnd);
+        if (it != s_textAtFocus.end()) SetWindowText(hwnd, it->second.c_str());
         HWND parent = GetParent(hwnd);
         if (parent) {
             SetFocus(parent);
@@ -161,6 +179,35 @@ LRESULT CALLBACK NumericEditSubclassProc(HWND hwnd, UINT msg, WPARAM wParam, LPA
 
 void SetNumericEdit(HWND hwnd, int maxDecimals) {
     SetWindowSubclass(hwnd, NumericEditSubclassProc, 0, (DWORD_PTR)maxDecimals);
+}
+
+bool ParseWholeNumber(const wchar_t* text, float& out) {
+    if (!text) return false;
+    while (*text == L' ' || *text == L'\t') text++;
+    if (!*text) return false;
+    wchar_t* end = nullptr;
+    double v = _wcstod_l(text, &end, GetCLocale());
+    if (end == text) return false;
+    while (*end == L' ' || *end == L'\t') end++;
+    if (*end != L'\0' || !std::isfinite(v) || std::fabs(v) > 3.0e38) return false;
+    out = (float)v;
+    return true;
+}
+
+bool CommitNumericEdit(HWND edit, float lo, float hi, float& target, int decimals) {
+    wchar_t buf[64] = {};
+    GetWindowText(edit, buf, 64);
+    float v = target;
+    const bool parsed = ParseWholeNumber(buf, v);
+    if (parsed) v = (std::min)(hi, (std::max)(lo, v));
+    // A re-commit of the shown (rounded) value is not a change: keep the stored precision.
+    const float shownStep = 0.5f * std::pow(10.0f, (float)-decimals);
+    const bool changed = parsed && std::fabs(v - target) >= shownStep;
+    if (changed) target = v;
+    wchar_t out[64];
+    _swprintf_s_l(out, _countof(out), L"%.*f", GetCLocale(), decimals, target);
+    if (wcscmp(out, buf) != 0) SetWindowText(edit, out);   // show what is stored (restore / clamp)
+    return changed;
 }
 
 void SetPathText(HWND hwndEdit, const wchar_t* path) {

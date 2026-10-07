@@ -16,6 +16,7 @@
 #include "fald.h"
 #include "../shared/hdr_dither.h"  // DlutHdrDitherLsb
 #include "../shared/peak_detect.h"
+#include "../shared/tonemap_curves.h"   // DlutDynamicPeakFloorNits
 #include <dwmapi.h>
 #include <avrt.h>
 #include <iostream>
@@ -412,16 +413,11 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Row 6: Tonemapping parameters
         // Slot [24]: PQ-encoded source peak (avoids per-pixel pow() in pixel shader)
         if (cc.tonemap.dynamicPeak) {
-            // Dynamic: floor ensures detected peak can't drop below a minimum
-            // BT.2390/BT.2446A: raised floor guarantees compression headroom on high-nit displays
-            //   ratio scales from 1.0× at 400 nits to 1.5× at 4000 nits (smooth highlight rolloff)
-            // Other curves: floor at target peak (passthrough when detected ≤ target)
-            float floorNits = cc.tonemap.targetPeakNits;
-            if (cc.tonemap.curve == TonemapCurve::BT2390 || cc.tonemap.curve == TonemapCurve::BT2446A) {
-                float t = (std::clamp)(((std::max)(cc.tonemap.targetPeakNits, 400.0f) - 400.0f) / 3600.0f, 0.0f, 1.0f);
-                float ratio = 1.0f + t * 0.5f;
-                floorNits = cc.tonemap.targetPeakNits * ratio;
-            }
+            // Dynamic: the detected peak, floored (shared/tonemap_curves.h DlutDynamicPeakFloorNits:
+            // target x 1.1 for BT.2390/BT.2446A, which need a source above the target; the target
+            // for the others — passthrough when detected <= target)
+            const bool raisedFloor = cc.tonemap.curve == TonemapCurve::BT2390 || cc.tonemap.curve == TonemapCurve::BT2446A;
+            float floorNits = DlutDynamicPeakFloorNits(cc.tonemap.targetPeakNits, raisedFloor);
             cbData[24] = LinearToPQScalar(floorNits / 10000.0f);
         } else {
             // Static: PQ of user-specified source peak (fallback 1000 nits)

@@ -1804,11 +1804,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
-                    wchar_t buf[16];
-                    GetWindowText(g_gui.hwndTonemapTarget, buf, 16);
-                    tm.targetPeakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                    if (tm.targetPeakNits < 10.0f) tm.targetPeakNits = 10.0f;
-                    if (tm.targetPeakNits > 10000.0f) tm.targetPeakNits = 10000.0f;
+                    // An emptied field used to parse as 0 -> a 10-nit target, applied at once.
+                    if (!CommitNumericEdit(g_gui.hwndTonemapTarget, 10.0f, 10000.0f, tm.targetPeakNits, 0)) return 0;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
                         if (g_dwmHookMode.load())
@@ -1837,11 +1834,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
-                    wchar_t buf[16];
-                    GetWindowText(g_gui.hwndTonemapSource, buf, 16);
-                    tm.sourcePeakNits = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                    if (tm.sourcePeakNits < 10.0f) tm.sourcePeakNits = 10.0f;
-                    if (tm.sourcePeakNits > 10000.0f) tm.sourcePeakNits = 10000.0f;
+                    if (!CommitNumericEdit(g_gui.hwndTonemapSource, 10.0f, 10000.0f, tm.sourcePeakNits, 0)) return 0;
                     if (g_gui.isRunning) {
                         UpdateColorCorrectionLive(g_gui.currentMonitor, true);
                         if (g_dwmHookMode.load())
@@ -1870,20 +1863,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (sel > 0)
                         SetWindowText(g_gui.hwndMaxTmlEdit, values[sel]);
                     if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                        float nits = nitsValues[sel];
+                        float& stored = g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits;
+                        bool changed = false;
                         if (sel == 0) {
-                            // "Custom" — sync stored value from current edit box text.
-                            // Clamp to the same [100, 10000] range as the Apply handler so an
-                            // empty/partial box can't store 0 nits (which ApplyMaxTmlSettings
-                            // would then push to the display on the next Start).
-                            wchar_t buf[16];
-                            GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
-                            nits = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                            if (!std::isfinite(nits) || nits < 100.0f) nits = 100.0f;
-                            if (nits > 10000.0f) nits = 10000.0f;
+                            // "Custom" — sync stored value from current edit box text, clamped to the
+                            // same [100, 10000] range as the Apply handler. An empty/partial box keeps
+                            // the stored value (ApplyMaxTmlSettings pushes it to the display on the
+                            // next Start, so a guessed 100 nits would really be applied).
+                            changed = CommitNumericEdit(g_gui.hwndMaxTmlEdit, 100.0f, 10000.0f, stored, 0);
+                        } else if (stored != nitsValues[sel]) {
+                            stored = nitsValues[sel];
+                            changed = true;
                         }
-                        g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nits;
-                        SaveSettings();
+                        if (changed) SaveSettings();
                     }
                 }
             }
@@ -1893,9 +1885,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 wchar_t buf[16];
                 GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
-                float nits = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                float nits = 0.0f;
+                if (!ParseWholeNumber(buf, nits)) {
+                    // Never push a guessed peak to the display: an empty box used to apply 100 nits.
+                    SetStatus(L"MaxTML: enter a peak in nits (100-10000)");
+                    return 0;
+                }
                 if (nits < 100.0f) nits = 100.0f;
                 if (nits > 10000.0f) nits = 10000.0f;
+                {
+                    wchar_t shown[16];
+                    _swprintf_s_l(shown, _countof(shown), L"%.0f", GetCLocale(), nits);
+                    SetWindowText(g_gui.hwndMaxTmlEdit, shown);
+                }
 
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nits;
@@ -2158,11 +2160,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                   : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 HWND hwndWx = isHDR ? g_gui.hwndHdrMhcWbWx : g_gui.hwndMhcWbWx;
                 HWND hwndWy = isHDR ? g_gui.hwndHdrMhcWbWy : g_gui.hwndMhcWbWy;
-                wchar_t buf[32];
-                GetWindowText(hwndWx, buf, 32);
-                mhc.whiteBalanceWx = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                GetWindowText(hwndWy, buf, 32);
-                mhc.whiteBalanceWy = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                // A white point, not any chromaticity: the bounds hold every Planckian / daylight
+                // white with room (CCT -> infinity is x 0.240, 2000 K is x 0.527 y 0.413). An empty
+                // or absurd entry used to be installed at scanout at once (0.9/0.05 -> gains 56, -16, 2).
+                bool changed = CommitNumericEdit(hwndWx, 0.20f, 0.60f, mhc.whiteBalanceWx, 4);
+                changed = CommitNumericEdit(hwndWy, 0.20f, 0.50f, mhc.whiteBalanceWy, 4) || changed;
+                if (!changed) return 0;
                 RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
                 SaveSettings();
             }
@@ -2395,11 +2398,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
                 auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC;
-                wchar_t buf[32];
-                GetWindowText(g_gui.hwndHdrMhcGsPeak, buf, 32);
-                float peak = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                if (peak >= 10.0f && peak <= 10000.0f) {
-                    mhc.correctionGrayscale.peakNits = peak;
+                if (CommitNumericEdit(g_gui.hwndHdrMhcGsPeak, 10.0f, 10000.0f, mhc.correctionGrayscale.peakNits, 0)) {
                     RegenerateMhcIfActive(g_gui.currentMonitor, true);
                     SaveSettings();
                 }

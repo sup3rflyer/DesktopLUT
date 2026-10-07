@@ -1289,16 +1289,11 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		cb.tonemapTargetNits = tmEnabled ? tp->targetPeakNits : 1000.0f;
 		cb.pqTargetPeak = tmEnabled ? tp->pqTargetPeak : 0.0f;
 		cb.tonemapDynamic = (tmEnabled && tp->dynamicPeak) ? 1 : 0;
-		// Dynamic mode: floor = target peak (or raised floor for BT.2390/BT.2446A)
-		// Static mode: PQ of user-specified source peak
+		// Dynamic mode: floor = target peak (target x 1.1 for BT.2390/BT.2446A — one helper shared with the
+		// overlay: shared/tonemap_curves.h DlutDynamicPeakFloorNits). Static mode: PQ of the user's source peak.
 		if (tmEnabled && tp->dynamicPeak) {
-			float floorNits = tp->targetPeakNits;
-			if (tp->curve == DWMHOOK_TONEMAP_BT2390 || tp->curve == DWMHOOK_TONEMAP_BT2446A) {
-				float tgtClamped = tp->targetPeakNits > 400.0f ? tp->targetPeakNits : 400.0f;
-				float t = (tgtClamped - 400.0f) / 3600.0f;
-				if (t > 1.0f) t = 1.0f;
-				floorNits = tp->targetPeakNits * (1.0f + t * 0.5f);
-			}
+			const bool raisedFloor = tp->curve == DWMHOOK_TONEMAP_BT2390 || tp->curve == DWMHOOK_TONEMAP_BT2446A;
+			float floorNits = DlutDynamicPeakFloorNits(tp->targetPeakNits, raisedFloor);
 			cb.pqSourcePeak = LinearToPQ(floorNits / 10000.0f);
 		} else {
 			cb.pqSourcePeak = tmEnabled ? tp->pqSourcePeak : 0.0f;

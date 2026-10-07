@@ -642,18 +642,19 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 50, tonemapY, 45, h, panel2, (HMENU)ID_CORR_TONEMAP_TARGET, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndTonemapTarget);
 
-    ctrl = CreateWindow(L"STATIC", L"Source:", WS_CHILD, innerX + 100, tonemapY + 2, 40, h, panel2, nullptr, nullptr, nullptr);
+    // The content's peak (MaxCLL) when not detected dynamically — what the curve maps onto Target.
+    ctrl = CreateWindow(L"STATIC", L"Content:", WS_CHILD, innerX + 100, tonemapY + 2, 48, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndTonemapSource = CreateWindow(L"EDIT", L"10000", WS_CHILD | WS_BORDER | ES_NUMBER,
-        innerX + 140, tonemapY, 50, h, panel2, (HMENU)ID_CORR_TONEMAP_SOURCE, nullptr, nullptr);
+    g_gui.hwndTonemapSource = CreateWindow(L"EDIT", L"1000", WS_CHILD | WS_BORDER | ES_NUMBER,
+        innerX + 148, tonemapY, 50, h, panel2, (HMENU)ID_CORR_TONEMAP_SOURCE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndTonemapSource);
 
-    ctrl = CreateWindow(L"STATIC", L"nits", WS_CHILD, innerX + 192, tonemapY + 2, 25, h, panel2, nullptr, nullptr, nullptr);
+    ctrl = CreateWindow(L"STATIC", L"nits", WS_CHILD, innerX + 200, tonemapY + 2, 25, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
     g_gui.hwndTonemapDynamic = CreateWindow(L"BUTTON", L"Dynamic",
         WS_CHILD | BS_AUTOCHECKBOX,
-        innerX + 220, tonemapY, 70, h, panel2, (HMENU)ID_CORR_TONEMAP_DYNAMIC, nullptr, nullptr);
+        innerX + 228, tonemapY, 70, h, panel2, (HMENU)ID_CORR_TONEMAP_DYNAMIC, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndTonemapDynamic);
 
     // MaxTML group (Windows HDR peak luminance override, HDR only)

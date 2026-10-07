@@ -146,32 +146,11 @@ float TonemapBT2390_PQ(float I, float pqSrcPeak, float pqTgtPeak) {
 	return clamp(E_mapped * iw, 0.0, ow);
 }
 
-// SoftClip + Reinhard (peak-preserving): one copy shared with the overlay, shared/tonemap_curves.h
+// SoftClip + Reinhard (peak-preserving) + BT.2446A: one copy shared with the overlay, shared/tonemap_curves.h
 )" DLUT_TONEMAP_CURVES_HLSL R"(
 
 float TonemapHardClip_PQ(float I, float pqTgtPeak) {
 	return min(I, pqTgtPeak);
-}
-
-float TonemapBT2446A(float Y, float targetPeak, float targetNits) {
-	float knee = (targetNits <= 203.0) ? 0.0 : targetPeak * 0.8;
-	if (Y <= knee) return Y;
-	float overshoot = Y - knee;
-	float maxOvershoot = 1.0 - knee;
-	float headroom = targetPeak - knee;
-	float normalizedOvershoot = overshoot / maxOvershoot;
-	float Yg = pow(normalizedOvershoot, 1.0 / 2.4);
-	float compressionRatio = maxOvershoot / headroom;
-	float pHDR = 1.0 + 32.0 * pow(compressionRatio, 1.0 / 2.4);
-	float pSDR = 1.0 + 32.0;
-	float Yp = log(1.0 + (pHDR - 1.0) * Yg) / log(pHDR);
-	float Yc;
-	if (Yp <= 0.7399)      Yc = Yp * 1.0770;
-	else if (Yp < 0.9909)  Yc = Yp * (-1.1510 * Yp + 2.7811) - 0.6302;
-	else                    Yc = Yp * 0.5000 + 0.5000;
-	float Ysdr = (pow(pSDR, Yc) - 1.0) / (pSDR - 1.0);
-	float compressed = pow(max(Ysdr, 0.0), 2.4);
-	return knee + compressed * headroom;
 }
 
 float3 ApplyTonemappingICtCp(float3 ictcp) {

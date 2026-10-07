@@ -167,9 +167,9 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         wchar_t curveBuf[32] = {};
         GetPrivateProfileStringW(section, (p + L"TonemapCurve").c_str(), L"BT2390", curveBuf, 32, iniPath);
         cc.tonemap.curve = StringToTonemapCurve(curveBuf);
-        float srcPeak = GetPrivateProfileFloat(section, (p + L"TonemapSourcePeak").c_str(), 10000.0f, iniPath);
+        float srcPeak = GetPrivateProfileFloat(section, (p + L"TonemapSourcePeak").c_str(), 1000.0f, iniPath);
         float tgtPeak = GetPrivateProfileFloat(section, (p + L"TonemapTargetPeak").c_str(), 1000.0f, iniPath);
-        cc.tonemap.sourcePeakNits = (srcPeak >= 10.0f && srcPeak <= 10000.0f) ? srcPeak : 10000.0f;
+        cc.tonemap.sourcePeakNits = (srcPeak >= 10.0f && srcPeak <= 10000.0f) ? srcPeak : 1000.0f;
         cc.tonemap.targetPeakNits = (tgtPeak >= 10.0f && tgtPeak <= 10000.0f) ? tgtPeak : 1000.0f;
         cc.tonemap.dynamicPeak = GetPrivateProfileBool(section, (p + L"TonemapDynamic").c_str(), false, iniPath);
     }

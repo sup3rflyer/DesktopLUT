@@ -6,6 +6,7 @@
 #include "globals.h"
 #include "settings.h"
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include <iostream>
 #include <mutex>
@@ -162,6 +163,7 @@ MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
         }
 
         MonitorSettings out;
+        const bool freshDefault = (pick < 0) && d.identified;
         if (pick >= 0) {
             pool[pick].taken = true;
             out = pool[pick].ms;
@@ -197,6 +199,7 @@ MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
         if (out.slot >= 0) line += L" [Display" + std::to_wstring(out.slot) + L"]";
         result.log.push_back(line);
         result.live.push_back(std::move(out));
+        result.fresh.push_back(freshDefault);
     }
 
     for (auto& e : pool) {
@@ -262,5 +265,25 @@ MonitorResolveOutcome ResolveMonitorSettings(const std::vector<HMONITOR>& monito
     }
     for (const auto& line : r.log) std::wcout << L"[Monitor identity] " << line << std::endl;
     outcome.allIdentified = r.allIdentified;
+
+    // A display seen for the first time starts its HDR tonemap target at the peak the panel reports
+    // (DXGI MaxLuminance) instead of a fixed 1000 nits that fits neither a 600- nor a 1800-nit panel.
+    // HDR-class panels only; the DXGI query runs outside the lock.
+    for (size_t i = 0; i < r.fresh.size() && i < live.size(); i++) {
+        if (!r.fresh[i]) continue;
+        DXGI_OUTPUT_DESC1 desc = {};
+        if (!QueryFreshOutputDesc(live[i].hmon, desc)) continue;
+        const float maxNits = desc.MaxLuminance;
+        if (!(maxNits >= 400.0f && maxNits <= 10000.0f)) continue;
+        const float seeded = std::round(maxNits / 10.0f) * 10.0f;
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (i >= g_gui.monitorSettings.size()) break;
+        auto& ms = g_gui.monitorSettings[i];
+        if (ms.identity.devicePath != live[i].identity.devicePath) continue;   // re-attached meanwhile
+        if (ms.hdrColorCorrection.tonemap.targetPeakNits != TonemapSettings{}.targetPeakNits) continue;
+        ms.hdrColorCorrection.tonemap.targetPeakNits = seeded;
+        std::wcout << L"[Monitor identity] Monitor " << i << L": new display, HDR tonemap target "
+                   << seeded << L" nits (panel-reported peak)" << std::endl;
+    }
     return outcome;
 }

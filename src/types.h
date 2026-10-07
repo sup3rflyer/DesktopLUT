@@ -585,7 +585,9 @@ struct TonemapData {
     bool enabled = false;
     bool dynamicPeak = false;         // Detect source peak per-frame (GPU-based)
     TonemapCurve curve = TonemapCurve::BT2390;
-    float sourcePeakNits = 10000.0f;  // Tonemapper INPUT peak: content source (ignored when dynamicPeak=true)
+    float sourcePeakNits = 1000.0f;   // Tonemapper INPUT peak: content MaxCLL (ignored when dynamicPeak=true).
+                                      // 1000, not 10000: real HDR content is mastered at 1000-4000, and a 10000
+                                      // source compressed every display (1000-nit content on a 1000-nit panel -29 %)
     float targetPeakNits = 1000.0f;   // Tonemapper OUTPUT peak: actual display capability. See docs/NAMING.md §1.
 };
 
@@ -822,7 +824,7 @@ struct TonemapSettings {
     bool enabled = false;
     bool dynamicPeak = false;
     TonemapCurve curve = TonemapCurve::BT2390;
-    float sourcePeakNits = 10000.0f;  // Content source peak (ignored when dynamicPeak=true)
+    float sourcePeakNits = 1000.0f;   // Content peak / MaxCLL (ignored when dynamicPeak=true); see TonemapData
     float targetPeakNits = 1000.0f;
 };
 

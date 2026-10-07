@@ -92,6 +92,28 @@ template <typename R> R Reinhard(R I, R pqSrcPeak, R pqTgtPeak, R targetNits) {
     return (std::min)(pqKnee + x / (R(1) + x * (pqSrcPeak - pqTgtPeak) / (S * H)), pqTgtPeak);
 }
 
+// BT.2446A-style shoulder: LINEAR, normalised by the source peak (Y = 1 is the source peak)
+template <typename R> R BT2446A(R Y, R targetPeak, R targetNits) {
+    R knee = (targetNits <= R(203)) ? R(0) : targetPeak * R(0.8);
+    if (Y <= knee) return Y;
+    R overshoot = Y - knee;
+    R maxOvershoot = R(1) - knee;
+    R headroom = targetPeak - knee;
+    R normalizedOvershoot = std::clamp(overshoot / maxOvershoot, R(0), R(1));
+    R Yg = std::pow(normalizedOvershoot, R(1) / R(2.4));
+    R compressionRatio = maxOvershoot / headroom;
+    R pHDR = R(1) + R(32) * std::pow(compressionRatio, R(1) / R(2.4));
+    R pSDR = R(1) + R(32);
+    R Yp = std::log(R(1) + (pHDR - R(1)) * Yg) / std::log(pHDR);
+    R Yc;
+    if (Yp <= R(0.7399))     Yc = Yp * R(1.0770);
+    else if (Yp < R(0.9909)) Yc = Yp * (R(-1.1510) * Yp + R(2.7811)) - R(0.6302);
+    else                     Yc = Yp * R(0.5000) + R(0.5000);
+    R Ysdr = (std::pow(pSDR, Yc) - R(1)) / (pSDR - R(1));
+    R compressed = std::pow((std::max)(Ysdr, R(0)), R(2.4));
+    return (std::min)(knee + compressed * headroom, targetPeak);
+}
+
 } // namespace TonemapCpu
 
 using Curve = std::function<double(double, double, double, double)>;
@@ -183,12 +205,25 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// BT.2446A on WARP: (Y, targetPeak, targetNits, -) in, (curve, 0, 0, 0) out
+const char* const kBt2446aTestCS =
+    "RWStructuredBuffer<float4> io : register(u0);\n"
+    DLUT_TONEMAP_CURVES_HLSL
+    R"(
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    float4 v = io[id.x];
+    io[id.x] = float4(TonemapBT2446A(v.x, v.y, v.z), 0.0, 0.0, 0.0);
+}
+)";
+
 struct CurvesGpu {
     ID3D11Device* device = nullptr;
     ID3D11DeviceContext* dc = nullptr;
     ID3D11ComputeShader* cs = nullptr;
     std::string error;
     bool deviceUnavailable = false;
+    const char* source = kCurvesTestCS;
 
     ~CurvesGpu() {
         if (cs) cs->Release();
@@ -209,7 +244,7 @@ struct CurvesGpu {
         ID3DBlob* blob = nullptr;
         ID3DBlob* err = nullptr;
         // Same compile flags as the production shaders (gpu.cpp / hook_render.cpp: 0)
-        hr = D3DCompile(kCurvesTestCS, strlen(kCurvesTestCS), "TonemapCurvesCS", nullptr, nullptr, "main", "cs_5_0",
+        hr = D3DCompile(source, strlen(source), "TonemapCurvesCS", nullptr, nullptr, "main", "cs_5_0",
                         0, 0, &blob, &err);
         if (FAILED(hr)) {
             error = std::string("compile failed: ") + (err ? (const char*)err->GetBufferPointer() : "?");
@@ -516,6 +551,74 @@ TEST_CASE("Tonemap curves: the shared HLSL on WARP matches the CPU port") {
 }
 
 // =============================================================================================
+// BT.2446A-style shoulder (linear, source-normalised)
+// =============================================================================================
+
+TEST_CASE("Tonemap curves: BT.2446A never exceeds the target, even above the source peak") {
+    // (target nits, source nits). Y runs to 4x the source peak: a static Source set too low, or the
+    // dynamic detector lagging a cut — the case that used to extrapolate past the target.
+    for (double tgt : { 100.0, 203.0, 400.0, 1000.0, 1700.0, 1800.0 }) {
+        for (double f : { 1.05, 1.2, 2.0, 4.0, 10000.0 / tgt }) {
+            const double src = tgt * f;
+            if (src > 10000.0 || src <= tgt) continue;
+            const double tp = tgt / src;                               // target, normalised
+            const double knee = tgt <= 203.0 ? 0.0 : 0.8 * tp;
+            INFO("target " << tgt << "  source " << src);
+            double prev = -1.0;
+            bool monotone = true, belowTarget = true, identityBelowKnee = true;
+            for (int i = 0; i <= 4000; i++) {
+                const double Y = 4.0 * i / 4000.0;
+                const double v = TonemapCpu::BT2446A<double>(Y, tp, tgt);
+                if (v > tp * (1.0 + 1e-12)) belowTarget = false;
+                if (v < prev - 1e-12) monotone = false;
+                if (Y <= knee && v != Y) identityBelowKnee = false;
+                prev = v;
+            }
+            CHECK(belowTarget);
+            CHECK(monotone);
+            CHECK(identityBelowKnee);
+            // the source peak lands on the target
+            CHECK(std::fabs(TonemapCpu::BT2446A<double>(1.0, tp, tgt) - tp) < 1e-9 * tp);
+        }
+    }
+    // The audit's case: a 4000-nit pixel with a detected peak of 1200 and a 1000-nit target used to
+    // come out at ~1329 nits; it now clips at the target.
+    const double src = 1200.0, tgt = 1000.0;
+    CHECK(TonemapCpu::BT2446A<double>(4000.0 / src, tgt / src, tgt) * src == doctest::Approx(1000.0).epsilon(1e-9));
+}
+
+TEST_CASE("Tonemap curves: the shared BT.2446A HLSL on WARP matches the CPU port") {
+    CurvesGpu gpu;
+    gpu.source = kBt2446aTestCS;
+    if (!gpu.Init()) {
+        if (gpu.deviceUnavailable) { MESSAGE("skipping GPU BT.2446A test: " << gpu.error); return; }
+        FAIL("BT.2446A GPU harness init failed: " << gpu.error);
+    }
+    std::vector<float> packed;
+    struct C { float tp, nits; };
+    std::vector<C> cases;
+    for (float tgt : { 100.0f, 400.0f, 1000.0f, 1800.0f })
+        for (float src : { 1200.0f, 2000.0f, 4000.0f, 10000.0f })
+            if (src > tgt) cases.push_back({ tgt / src, tgt });
+    const int kSweep = 256;
+    for (const C& c : cases)
+        for (int i = 0; i <= kSweep; i++) packed.insert(packed.end(), { 3.0f * i / kSweep, c.tp, c.nits, 0.0f });
+    auto out = gpu.Run(packed);
+    REQUIRE(out.size() == packed.size() / 4);
+    double worst = 0.0;
+    bool belowTarget = true;
+    for (size_t k = 0; k < out.size(); k++) {
+        const float Y = packed[k * 4], tp = packed[k * 4 + 1], nits = packed[k * 4 + 2];
+        const double cpu = TonemapCpu::BT2446A<double>(Y, tp, nits);
+        worst = (std::max)(worst, std::fabs(out[k].first - cpu) / (std::max)(tp, 1e-6f));
+        if (out[k].first > tp * (1.0f + 1e-6f)) belowTarget = false;
+    }
+    INFO("worst |GPU - CPU| relative to the target: " << worst);
+    CHECK(worst < 2e-5);
+    CHECK(belowTarget);
+}
+
+// =============================================================================================
 // Both production pixel shaders carry the shared text and compile
 // =============================================================================================
 
@@ -533,6 +636,9 @@ TEST_CASE("Tonemap curves: both production pixel shaders splice the shared text 
         first = src->find("float TonemapReinhard_PQ(");
         CHECK(first != std::string::npos);
         CHECK(src->find("float TonemapReinhard_PQ(", first + 1) == std::string::npos);
+        first = src->find("float TonemapBT2446A(");
+        CHECK(first != std::string::npos);
+        CHECK(src->find("float TonemapBT2446A(", first + 1) == std::string::npos);
     }
 
     // Compiled exactly as production does: gpu.cpp (strlen, "main") and hook_render.cpp (sizeof, "PS")
@@ -551,4 +657,15 @@ TEST_CASE("Tonemap curves: both production pixel shaders splice the shared text 
     INFO("hook compiler output: " << hookMsgs);
     CHECK(overlayOk);
     CHECK(hookOk);
+}
+
+TEST_CASE("Tonemap curves: dynamic-peak floor is the target, x 1.1 for the curves with a knee singularity") {
+    CHECK(DlutDynamicPeakFloorNits(1000.0f, false) == 1000.0f);
+    CHECK(DlutDynamicPeakFloorNits(1000.0f, true) == doctest::Approx(1100.0f).epsilon(1e-6));
+    CHECK(DlutDynamicPeakFloorNits(1600.0f, true) == doctest::Approx(1760.0f).epsilon(1e-6));
+    // BT.2390's knee KS = 1.5 maxLum - 0.5 must stay below 1 at the floor (its Hermite divides by 1 - KS)
+    for (float tgt : { 100.0f, 400.0f, 1000.0f, 1800.0f, 4000.0f, 9000.0f }) {
+        const double maxLum = PQ(tgt) / PQ(DlutDynamicPeakFloorNits(tgt, true));
+        CHECK(1.5 * maxLum - 0.5 < 1.0 - 1e-3);
+    }
 }

@@ -384,3 +384,13 @@ TEST_CASE("Identity: LiveSettingsAttachmentChanged") {
     e[1].identity.devicePath = L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4355#{guid}";   // connector move
     CHECK(LiveSettingsAttachmentChanged(a, e));
 }
+
+TEST_CASE("Identity: only a new identified display on default settings is flagged fresh") {
+    std::vector<MonitorSettings> parked = { Known(kAsus, 0, L"asus.cube"), Legacy(2, L"old.cube") };
+    auto r = MatchMonitorSettings({ Live(kAsus), Live(kLg), Unidentified(), Live(kBenq) }, {}, parked);
+    REQUIRE(r.fresh.size() == 4);
+    CHECK_FALSE(r.fresh[0]);   // known display
+    CHECK(r.fresh[1]);         // new display
+    CHECK_FALSE(r.fresh[2]);   // unidentified: adopted the legacy entry at its index, never seeded
+    CHECK(r.fresh[3]);
+}

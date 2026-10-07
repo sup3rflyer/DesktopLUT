@@ -471,52 +471,8 @@ float TonemapHardClip_PQ(float I, float pqTargetPeak) {
     return min(I, pqTargetPeak);
 }
 
-// ITU-R BT.2446 Method A - logarithmic compression with piecewise curve
-// Full range for SDR targets, shoulder-only for HDR
-float TonemapBT2446A(float Y, float targetPeak, float targetNits) {
-    // Full range for SDR targets (no knee), shoulder-only for HDR
-    float knee = (targetNits <= 203.0f) ? 0.0f : targetPeak * 0.8f;
-    if (Y <= knee) return Y;
-
-    // For content above knee, apply BT.2446A-style compression
-    // Remap input so knee=0, and compress the overshoot
-    float overshoot = Y - knee;
-    float maxOvershoot = 1.0f - knee;  // Maximum possible overshoot (up to 10000 nits)
-    float headroom = targetPeak - knee;  // Available headroom to target
-
-    // Normalize overshoot to 0-1 range
-    float normalizedOvershoot = overshoot / maxOvershoot;
-
-    // Apply BT.2446A-style compression to the overshoot
-    // Gamma expansion
-    float Yg = pow(normalizedOvershoot, 1.0f / 2.4f);
-
-    // Perceptual parameters based on compression ratio
-    float compressionRatio = maxOvershoot / headroom;
-    float pHDR = 1.0f + 32.0f * pow(compressionRatio, 1.0f / 2.4f);
-    float pSDR = 1.0f + 32.0f;  // Reference (1:1 mapping)
-
-    // Logarithmic compression
-    float Yp = log(1.0f + (pHDR - 1.0f) * Yg) / log(pHDR);
-
-    // Piecewise curve (three regions)
-    float Yc;
-    if (Yp <= 0.7399f)
-        Yc = Yp * 1.0770f;
-    else if (Yp < 0.9909f)
-        Yc = Yp * (-1.1510f * Yp + 2.7811f) - 0.6302f;
-    else
-        Yc = Yp * 0.5000f + 0.5000f;
-
-    // Inverse log
-    float Ysdr = (pow(pSDR, Yc) - 1.0f) / (pSDR - 1.0f);
-
-    // Gamma compression
-    float compressed = pow(max(Ysdr, 0.0f), 2.4f);
-
-    // Scale compressed overshoot to headroom and add to knee
-    return knee + compressed * headroom;
-}
+// BT.2446A-style log shoulder: TonemapBT2446A comes from DLUT_TONEMAP_CURVES_HLSL above
+// (shared/tonemap_curves.h, one copy with the hook; clamped to the target above the source peak).
 
 // ICTCP Tonemapping: operates on I (intensity) channel only
 // CT and CP (chroma) are preserved, ensuring hue/saturation stability
