@@ -437,22 +437,6 @@ void VerifyAndRestoreMhcProfiles() {
             // it only differs from `expected` while the settings say this mode's real profile is
             // active, and the locked re-validation rejects a Remove/disable that raced us.)
 
-            // Before trying to re-associate, confirm the profile file actually
-            // exists in the system color directory. If not, Windows' own cleanup
-            // (or a user uninstall / disk cleanup) removed the .icm file, and
-            // any re-associate will fail silently. Log and skip — the GUI
-            // Enable-toggle path (RegenerateMhcIfActive) is the correct remedy.
-            wchar_t sysDir[MAX_PATH];
-            GetSystemDirectory(sysDir, MAX_PATH);
-            std::wstring profilePath = std::wstring(sysDir)
-                + L"\\spool\\drivers\\color\\" + expected;
-            if (GetFileAttributesW(profilePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                std::wcerr << L"MHC verify: profile file missing: " << profilePath
-                           << L" — skipping restore (re-enable in GUI to regenerate)"
-                           << std::endl;
-                return;
-            }
-
             // Re-validate under lock: a permutation swap on another thread (hotkey /
             // whitelist DG toggle) may have changed the active profile since we
             // snapshotted. If 'expected' is no longer the active name, it is stale —
@@ -465,6 +449,34 @@ void VerifyAndRestoreMhcProfiles() {
                 const MHCSettings& mNow = isHDR ? g_gui.monitorSettings[i].hdrMHC
                                                 : g_gui.monitorSettings[i].sdrMHC;
                 if (!mNow.enabled || mNow.profileName != expected) return;
+            }
+
+            // Before trying to re-associate, confirm the profile file actually
+            // exists in the system color directory. If not, Windows' own cleanup
+            // (or a user uninstall / disk cleanup) removed the .icm file, and any
+            // re-associate fails silently. Ask the GUI thread to regenerate it (a new
+            // tick-stamped profile from the settings); it does so once per profile name
+            // when no editor / calibration holds the settings, so a regeneration that
+            // cannot succeed does not loop (T1.16; this used to log every 15 s forever
+            // while the label stayed green).
+            wchar_t sysDir[MAX_PATH];
+            GetSystemDirectory(sysDir, MAX_PATH);
+            std::wstring profilePath = std::wstring(sysDir)
+                + L"\\spool\\drivers\\color\\" + expected;
+            if (GetFileAttributesW(profilePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                static std::mutex s_logMutex;
+                static std::set<std::wstring> s_logged;
+                bool first;
+                {
+                    std::lock_guard<std::mutex> rl(s_logMutex);
+                    first = s_logged.insert(expected).second;
+                }
+                if (first)
+                    std::wcerr << L"MHC verify: profile file missing: " << profilePath
+                               << L" — asking for a regeneration" << std::endl;
+                if (g_gui.hwndMain)
+                    PostMessage(g_gui.hwndMain, WM_MHC_REGENERATE_MISSING, (WPARAM)i, isHDR ? 1 : 0);
+                return;
             }
 
             // Windows forgot our profile. Force re-broker: remove association,

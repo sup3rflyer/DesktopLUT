@@ -227,8 +227,11 @@ void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams
     }
 }
 
-// Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate)
-void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
+// Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate). False when the
+// imported source file (1D cube / SDR ICC TRC) is set but cannot be read: the params then lack the
+// correction, and a profile generated from them would silently install an identity curve (T1.16) —
+// every caller keeps the installed profile instead.
+bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params) {
     params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
         ? g_gui.monitorNames[monitorIndex] : L"Monitor";
     BuildMHC2MatrixParams(mhc, isHDR, params);
@@ -242,7 +245,11 @@ void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
         if (mhc.sourceIs1DCube) {
             // 1D cube: per-channel correction curves used directly as MHC2 LUT
             std::vector<float> corrR, corrG, corrB;
-            if (Load1DCubeLUT(mhc.sourceFilePath, corrR, corrG, corrB)) {
+            if (!Load1DCubeLUT(mhc.sourceFilePath, corrR, corrG, corrB)) {
+                std::wcerr << L"[MHC] the imported 1D cube cannot be read: " << mhc.sourceFilePath << std::endl;
+                return false;
+            }
+            {
                 params.hasPrecomputedCorrection = true;
                 params.corrR = std::move(corrR);
                 params.corrG = std::move(corrG);
@@ -256,7 +263,12 @@ void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
             // HDR ICC TRC disabled: DisplayCal's sparse measurements + curve fitting produce
             // shadow corrections 10-20x too aggressive vs ColourSpace ground truth
             ICCProfileData icc;
-            if (ReadICCProfile(mhc.sourceFilePath, icc) && icc.hasTRC) {
+            if (!ReadICCProfile(mhc.sourceFilePath, icc) || !icc.hasTRC) {
+                std::wcerr << L"[MHC] the imported ICC profile cannot be read (or lost its TRC): "
+                           << mhc.sourceFilePath << std::endl;
+                return false;
+            }
+            {
                 params.hasPerChannelTRC = true;
                 params.trcR = icc.trcR;
                 params.trcG = icc.trcG;
@@ -320,6 +332,7 @@ void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
         params.correctionGrayscale.use24Gamma = mhc.correctionGrayscale.use24Gamma;
         params.correctionGrayscale.peakNits = mhc.correctionGrayscale.peakNits;
     }
+    return true;
 }
 
 // ============================================================================
@@ -328,9 +341,9 @@ void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
 
 // Build MHC2ProfileParams for a specific permutation bitmask.
 // Starts from the full MHCSettings, then disables corrections not in the bitmask.
-static void BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex,
+static bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex,
                                     uint8_t perm, MHC2ProfileParams& params) {
-    BuildMHC2Params(mhc, isHDR, monitorIndex, params);
+    if (!BuildMHC2Params(mhc, isHDR, monitorIndex, params)) return false;
 
     // Disable white balance if PERM_WB bit is not set
     if (!(perm & MHCSettings::PERM_WB)) {
@@ -349,6 +362,7 @@ static void BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monit
         params.correctionGrayscaleEnabled = false;
         params.correctionGrayscale.enabled = false;
     }
+    return true;
 }
 
 uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR) {
@@ -431,7 +445,7 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
 
     // Build params for the specific permutation
     MHC2ProfileParams params;
-    BuildMHC2ParamsForPerm(mhcCopy, isHDR, monitorIndex, perm, params);
+    if (!BuildMHC2ParamsForPerm(mhcCopy, isHDR, monitorIndex, perm, params)) return false;   // keep the current one
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
@@ -549,7 +563,7 @@ bool ComputeSdrPreviewScanout(int monitorIndex, uint8_t strippedPerm,
         mhcCopy = g_gui.monitorSettings[monitorIndex].sdrMHC;
     }
     MHC2ProfileParams params;
-    BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/false, monitorIndex, strippedPerm, params);
+    if (!BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/false, monitorIndex, strippedPerm, params)) return false;
     return ComputeSdrScanoutForShader(params, outResult9, outBaseLutR, outBaseLutG, outBaseLutB);
 }
 
@@ -765,7 +779,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     }
 
     MHC2ProfileParams params;
-    BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params);
+    if (!BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params)) return false;   // nothing installed
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
@@ -950,7 +964,11 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     if (mhcCopy.profileName.empty()) return;
 
     MHC2ProfileParams params;
-    BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params);
+    if (!BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params)) {
+        std::cerr << "[MHC] monitor " << monitorIndex << (isHDR ? " HDR" : " SDR")
+                  << ": source file unreadable, keeping the installed profile" << std::endl;
+        return;
+    }
 
     // Recompute active permutation (corrections may have changed)
     ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, ComputeMhcPermutation(mhcCopy, isHDR));
@@ -1052,8 +1070,8 @@ bool RebakeHdrMhcForSdrWhite(int monitorIndex, float sdrWhiteNits, bool* rebakeF
     std::cout << std::endl;
     if (rebake) {
         MHC2ProfileParams params;
-        BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/true, monitorIndex, mhcCopy.activePerm, params);
-        if (!IsMHC2ApiAvailable() ||
+        if (!BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/true, monitorIndex, mhcCopy.activePerm, params) ||
+            !IsMHC2ApiAvailable() ||
             !ReplaceInstalledMhcProfile(monitorIndex, true, mhcCopy, params, mhcCopy.activePerm)) {
             // The installed profile keeps its old stamp, so it stays recognisably stale; the caller backs off.
             if (rebakeFailed) *rebakeFailed = true;

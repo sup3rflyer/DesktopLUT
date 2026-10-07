@@ -28,6 +28,7 @@
 #include <dbt.h>
 #include <taskschd.h>
 #include <climits>
+#include <set>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "Wtsapi32.lib")
@@ -1410,7 +1411,7 @@ static bool IgnoredDuringShutdown(UINT msg) {
     case WM_TIMER: case WM_DISPLAYCHANGE: case WM_WTSSESSION_CHANGE: case WM_SETTINGCHANGE:
     case WM_DEVICECHANGE: case WM_POWERBROADCAST: case WM_COMMAND: case WM_TRAYICON: case WM_HOTKEY:
     case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
-    case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD:
+    case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD: case WM_MHC_REGENERATE_MISSING:
         return true;
     default:
         return msg == WM_TASKBARCREATED;
@@ -2765,6 +2766,34 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (monIdx == g_gui.currentMonitor) {
             UpdateMhcInfoDisplay(monIdx, isHDR);
         }
+        return 0;
+    }
+
+    case WM_MHC_REGENERATE_MISSING: {
+        // The verify found the ACTIVE profile's .icm gone (Windows / disk cleanup). Regenerate it from the
+        // settings under a new name — once per profile name (a regeneration that cannot succeed must not
+        // loop), and not while an editor / calibration / transition holds the settings (the next verify
+        // tick asks again).
+        static std::set<std::wstring> attempted;
+        const int monIdx = (int)wParam;
+        const bool isHDR = (lParam != 0);
+        if (IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
+            IsCalibrationOrLiveEditActive())
+            return 0;
+        std::wstring name;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            if (monIdx < 0 || monIdx >= (int)g_gui.monitorSettings.size()) return 0;
+            const MHCSettings& m = isHDR ? g_gui.monitorSettings[monIdx].hdrMHC : g_gui.monitorSettings[monIdx].sdrMHC;
+            if (!m.enabled || m.profileName.empty()) return 0;
+            name = m.profileName;
+        }
+        if (!attempted.insert(name).second) return 0;
+        std::wcout << L"[MHC] monitor " << monIdx << (isHDR ? L" HDR" : L" SDR")
+                   << L": regenerating the missing profile " << name << std::endl;
+        RegenerateMhcIfActive(monIdx, isHDR);
+        SaveSettings();   // the new tick-stamped name
+        if (monIdx == g_gui.currentMonitor) UpdateMhcInfoDisplay(monIdx, isHDR);
         return 0;
     }
 

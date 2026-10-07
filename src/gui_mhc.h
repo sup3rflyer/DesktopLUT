@@ -52,7 +52,8 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR);
 
 // MHC2ProfileParams for an MHCSettings (every correction it has on), shared by Generate / Regenerate and the
 // permutation variants. Exposed for testing.
-void BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params);
+// False = the imported source file is set but unreadable (callers keep the installed profile).
+bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params);
 // Only the matrix inputs of BuildMHC2Params (primaries + white-balance gains): no files read.
 void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams& params);
 

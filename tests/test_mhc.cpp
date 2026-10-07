@@ -2515,3 +2515,28 @@ TEST_CASE("Identity MHC profile: metadata peak mirrors the normal profile's (Mhc
     f.sourceFilePath = L"C:/nonexistent/base.cube";
     CHECK(MhcProfileMetadataPeakNits(f, true) == 777.0f);
 }
+
+// T1.16: an imported source file (1D cube / SDR ICC) that can no longer be read used to bake an identity
+// curve silently; BuildMHC2Params now reports it so every generator keeps the installed profile.
+TEST_CASE("BuildMHC2Params: an unreadable imported source file is reported, not baked as identity") {
+    MHCSettings m;
+    m.enabled = true;
+    MHC2ProfileParams p;
+    CHECK(BuildMHC2Params(m, /*isHDR=*/false, 0, p));   // no source file: fine
+
+    m.sourceFilePath = L"Z:/definitely/not/here/source.icc";
+    m.sourceIs1DCube = false;
+    MHC2ProfileParams icc;
+    CHECK_FALSE(BuildMHC2Params(m, /*isHDR=*/false, 0, icc));
+
+    m.sourceFilePath = L"Z:/definitely/not/here/curves.cube";
+    m.sourceIs1DCube = true;
+    MHC2ProfileParams cube;
+    CHECK_FALSE(BuildMHC2Params(m, /*isHDR=*/true, 0, cube));
+
+    // HDR + ICC: the TRC is deliberately not used (only primaries/luminance, stored at import), so the
+    // file is not read and its absence is no failure.
+    m.sourceIs1DCube = false;
+    MHC2ProfileParams hdrIcc;
+    CHECK(BuildMHC2Params(m, /*isHDR=*/true, 0, hdrIcc));
+}
