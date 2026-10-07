@@ -3,7 +3,13 @@
 // (dwm_hook/hook_shader.h) both splice DLUT_TONEMAP_CURVES_HLSL into their source, so the two paths
 // cannot drift apart. tests/test_tonemap_curves.cpp runs this text on WARP against a CPU port.
 //
-// Domain: PQ (I of ICtCp, 0..1). Knee k = 0.8 * pqTgt (0 for SDR targets <= 203 nits: full range).
+// Domain: PQ (I of ICtCp, 0..1). Knee k = BT.2390's KS = 1.5 pqTgt - 0.5 pqSrc, floored at 0 (0 for SDR
+// targets <= 203 nits: full range). In BT.2390's source-normalised terms KS = 1.5 maxLum - 0.5: the shoulder
+// always spans 3x its output (S = 3H), so the knee rises toward the target when little compression is
+// needed and drops when much is. It was 0.8 * pqTgt (401 nits at an 1800 target) until 2026-10-07: that
+// compressed content the panel can show (1000 nits read 823..863 on an 1800 target), while a fixed knee at
+// PQ(0.8 * target) (1440 nits) would squeeze up to 8.6:1 above it for a 10000-nit source (owner, 2026-10-07:
+// "if it's correct" -> the standard's rule).
 //   x = I - k       overshoot above the knee
 //   H = pqTgt - k   headroom (knee -> target peak)
 //   S = pqSrc - k   source range (knee -> source / detected frame peak)
@@ -14,7 +20,8 @@
 //   f(0) = 0 and f'(0) = 1   C1 join with the identity below the knee (no slope kink)
 //   f(S) = H                 the source peak lands exactly on the target (peak preserving)
 //   f' > 0, f'' < 0, f <= min(x, H)
-//   f -> x as S -> H         continuous into the identity + clip branch at headroom 0
+//   pqSrc -> pqTgt           k -> pqTgt and the shoulder [k, pqSrc] shrinks to nothing: continuous into
+//                            the identity + clip branch at headroom 0 (r = H/S stays 1/3 meanwhile)
 // Content above the source peak (x > S) clips at the target, as BT.2390 does. Causes: a static source
 // peak set too low; the dynamic detector's rise lag / stride-4 misses; and saturated highlights — the
 // detector measures PQ of BT.709 LUMINANCE (shared/peak_detect.h) while the curve maps the ICtCp I
@@ -28,8 +35,9 @@
 // asymptotically (target 1700: a 4000-nit peak showed at 1250, 10000 at 1436). ef0f703 (2026-03-18)
 // replaced H by S in the rate: a slope kink at the knee (H/S, 0.64 at 1700/4000) and harder
 // compression the brighter the frame (the peak always landed at 63 % / 50 % of the headroom, ~985
-// nits at target 1700). These keep the original's knee join and add the peak constraint; both are
-// >= the original curve everywhere and tend to it as S -> infinity.
+// nits at target 1700). These keep the original's knee join and add the peak constraint (with the
+// original's knee they were >= the original curve everywhere and tended to it as S -> infinity); since
+// 2026-10-07 the knee is BT.2390's (above).
 //
 // Reinhard: extended Reinhard in the overshoot
 //   f(x) = x / (1 + c x),  c = 1/H - 1/S = (S - H) / (S H)
@@ -100,7 +108,7 @@ inline float DlutDynamicPeakFloorNits(float targetNits, bool raisedFloor) {
 
 #define DLUT_TONEMAP_CURVES_HLSL R"TMC(
 // ---- Peak-preserving SoftClip / Reinhard (one copy: shared/tonemap_curves.h, derivation there) ----
-// Knee 0.8*pqTgt (0 for SDR targets <= 203 nits). On [knee, src peak]: slope 1 at the knee, the source
+// Knee: BT.2390's KS (TonemapShoulderKnee_PQ). On [knee, src peak]: slope 1 at the knee, the source
 // peak maps exactly to the target, monotone, concave, never above the target. Above the source peak:
 // clip at the target. Source peak <= target: identity + clip.
 
@@ -122,9 +130,15 @@ float TonemapSoftClipRate(float r, float d) {
 	return u;
 }
 
+// Shoulder knee (PQ): BT.2390's KS = 1.5 maxLum - 0.5 in source-normalised PQ = 1.5 pqTgt - 0.5 pqSrc
+// absolute, floored at 0; 0 for SDR targets <= 203 nits (full range).
+float TonemapShoulderKnee_PQ(float pqSrcPeak, float pqTgtPeak, float targetNits) {
+	return (targetNits <= 203.0) ? 0.0 : max(1.5 * pqTgtPeak - 0.5 * pqSrcPeak, 0.0);
+}
+
 // SoftClip - PQ native: normalised exponential shoulder k + H (1 - exp(-a x)) / (1 - exp(-a S))
 float TonemapSoftClip_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
-	float pqKnee = (targetNits <= 203.0) ? 0.0 : pqTgtPeak * 0.8;
+	float pqKnee = TonemapShoulderKnee_PQ(pqSrcPeak, pqTgtPeak, targetNits);
 	if (I <= pqKnee) return I;
 	float H = pqTgtPeak - pqKnee;
 	float S = pqSrcPeak - pqKnee;
@@ -137,7 +151,7 @@ float TonemapSoftClip_PQ(float I, float pqSrcPeak, float pqTgtPeak, float target
 
 // Reinhard - PQ native: extended Reinhard shoulder k + x / (1 + x (S - H) / (S H))
 float TonemapReinhard_PQ(float I, float pqSrcPeak, float pqTgtPeak, float targetNits) {
-	float pqKnee = (targetNits <= 203.0) ? 0.0 : pqTgtPeak * 0.8;
+	float pqKnee = TonemapShoulderKnee_PQ(pqSrcPeak, pqTgtPeak, targetNits);
 	if (I <= pqKnee) return I;
 	float H = pqTgtPeak - pqKnee;
 	float S = pqSrcPeak - pqKnee;

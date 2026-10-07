@@ -70,8 +70,12 @@ template <typename R> R SoftClipRate(R r, R d) {
     return u;
 }
 
+template <typename R> R ShoulderKnee(R pqSrcPeak, R pqTgtPeak, R targetNits) {
+    return (targetNits <= R(203)) ? R(0) : (std::max)(R(1.5) * pqTgtPeak - R(0.5) * pqSrcPeak, R(0));
+}
+
 template <typename R> R SoftClip(R I, R pqSrcPeak, R pqTgtPeak, R targetNits) {
-    R pqKnee = (targetNits <= R(203)) ? R(0) : pqTgtPeak * R(0.8);
+    R pqKnee = ShoulderKnee(pqSrcPeak, pqTgtPeak, targetNits);
     if (I <= pqKnee) return I;
     R H = pqTgtPeak - pqKnee;
     R S = pqSrcPeak - pqKnee;
@@ -83,7 +87,7 @@ template <typename R> R SoftClip(R I, R pqSrcPeak, R pqTgtPeak, R targetNits) {
 }
 
 template <typename R> R Reinhard(R I, R pqSrcPeak, R pqTgtPeak, R targetNits) {
-    R pqKnee = (targetNits <= R(203)) ? R(0) : pqTgtPeak * R(0.8);
+    R pqKnee = ShoulderKnee(pqSrcPeak, pqTgtPeak, targetNits);
     if (I <= pqKnee) return I;
     R H = pqTgtPeak - pqKnee;
     R S = pqSrcPeak - pqKnee;
@@ -121,7 +125,10 @@ using Curve = std::function<double(double, double, double, double)>;
 double NewSoftClip(double I, double s, double t, double n) { return TonemapCpu::SoftClip<double>(I, s, t, n); }
 double NewReinhard(double I, double s, double t, double n) { return TonemapCpu::Reinhard<double>(I, s, t, n); }
 
-// Historical curves, for the ordering checks and the table only (never shipped again)
+// The shipped knee (BT.2390's KS), in double
+double NewKneeOf(double src, double tgt, double nits) { return TonemapCpu::ShoulderKnee<double>(src, tgt, nits); }
+
+// Historical curves, for the record only (never shipped again): knee 0.8 * pqTgt
 double KneeOf(double tgt, double nits) { return nits <= 203.0 ? 0.0 : 0.8 * tgt; }
 double PreMarchSoftClip(double I, double, double tgt, double n) {   // to 2026-03: rate 1/H, asymptote H
     double k = KneeOf(tgt, n); if (I <= k) return I;
@@ -183,7 +190,7 @@ std::vector<Case> CaseGrid() {
 
 // Right derivative at the knee by Richardson-extrapolated forward differences
 double KneeSlope(const Curve& f, double src, double tgt, double nits) {
-    double k = KneeOf(tgt, nits);
+    double k = NewKneeOf(src, tgt, nits);
     double h = 1e-5 * (src - k);
     double s1 = (f(k + h, src, tgt, nits) - k) / h;
     double s2 = (f(k + 0.5 * h, src, tgt, nits) - k) / (0.5 * h);
@@ -358,15 +365,17 @@ TEST_CASE("Tonemap curves: slope 1 at the knee, source peak -> target, monotone,
     const std::pair<std::string, Curve> curves[] = { { "SoftClip", NewSoftClip }, { "Reinhard", NewReinhard } };
     for (const auto& [name, f] : curves) {
         for (const Case& c : CaseGrid()) {
-            double tgt = PQ(c.tgtNits), src = PQ(c.srcNits), k = KneeOf(tgt, c.tgtNits);
+            double tgt = PQ(c.tgtNits), src = PQ(c.srcNits), k = NewKneeOf(src, tgt, c.tgtNits);
             INFO(name << "  target " << c.tgtNits << "  source peak " << c.srcNits);
 
             // identity below the knee
             for (double I : { 0.25 * k, 0.5 * k, k })
                 CHECK(f(I, src, tgt, c.tgtNits) == I);
 
-            // C1 at the knee (below it the slope is 1)
-            CHECK(std::fabs(KneeSlope(f, src, tgt, c.tgtNits) - 1.0) < 1e-6);
+            // C1 at the knee (below it the slope is 1). BT.2390's knee makes the shoulder 1.5 (src - tgt)
+            // wide: for a source within ~0.1 % of the target that is ~1e-5 PQ and the finite-difference
+            // probe (1e-5 of it) is lost in double rounding — f'(0) = 1 holds by construction (header).
+            if (src - k > 1e-3) CHECK(std::fabs(KneeSlope(f, src, tgt, c.tgtNits) - 1.0) < 1e-6);
 
             // the source peak lands on the target; above it, clip
             CHECK(std::fabs(f(src, src, tgt, c.tgtNits) - tgt) < 1e-12);
@@ -420,44 +429,39 @@ TEST_CASE("Tonemap curves: continuous into identity + clip as the source peak fa
     }
 }
 
-TEST_CASE("Tonemap curves: never darker than the pre-2026-03 curve, which is never darker than ef0f703") {
-    const struct { std::string name; Curve now, preMarch, ef0f703; } families[] = {
-        { "SoftClip", NewSoftClip, PreMarchSoftClip, Ef0f703SoftClip },
-        { "Reinhard", NewReinhard, PreMarchReinhard, Ef0f703Reinhard },
-    };
-    for (const auto& fam : families) {
-        for (const Case& c : CaseGrid()) {
-            double tgt = PQ(c.tgtNits), src = PQ(c.srcNits), k = KneeOf(tgt, c.tgtNits);
-            INFO(fam.name << "  target " << c.tgtNits << "  source peak " << c.srcNits);
-            bool ordered = true;
-            for (int i = 0; i <= 1000; i++) {
-                double I = k + (src - k) * i / 1000.0;
-                double a = fam.now(I, src, tgt, c.tgtNits);
-                double b = fam.preMarch(I, src, tgt, c.tgtNits);
-                double e = fam.ef0f703(I, src, tgt, c.tgtNits);
-                if (a < b - 1e-12 || b < e - 1e-12) ordered = false;
-            }
-            CHECK(ordered);
-        }
+TEST_CASE("Tonemap curves: the knee is BT.2390's KS - the shoulder spans 3x its output") {
+    // KS = 1.5 maxLum - 0.5 in BT.2390's source-normalised PQ = 1.5 pqTgt - 0.5 pqSrc absolute. Owner's
+    // 1800-nit target: the knee rises toward the target when little compression is needed.
+    const double tgt1800 = PQ(1800.0);
+    CHECK(Nits(NewKneeOf(PQ(2000.0), tgt1800, 1800.0)) == doctest::Approx(1707.7).epsilon(1e-3));
+    CHECK(Nits(NewKneeOf(PQ(4000.0), tgt1800, 1800.0)) == doctest::Approx(1210.1).epsilon(1e-3));
+    CHECK(Nits(NewKneeOf(PQ(10000.0), tgt1800, 1800.0)) == doctest::Approx(773.9).epsilon(1e-3));
+    for (const Case& c : CaseGrid()) {
+        double tgt = PQ(c.tgtNits), src = PQ(c.srcNits), k = NewKneeOf(src, tgt, c.tgtNits);
+        INFO("target " << c.tgtNits << "  source peak " << c.srcNits);
+        CHECK(k >= 0.0);
+        CHECK(k < tgt);
+        if (c.tgtNits > 203.0 && k > 0.0) CHECK((src - k) == doctest::Approx(3.0 * (tgt - k)).epsilon(1e-9));
+        if (c.tgtNits <= 203.0) CHECK(k == 0.0);
     }
 }
 
 TEST_CASE("Tonemap curves: target 1700 dynamic, displayed nits pinned against an independent reference") {
     // Dynamic mode: source peak = max(detected frame peak, target) (SoftClip/Reinhard floor = target),
     // through ApplyTonemappingICtCp's wrapper (no crossfade for these two curves).
-    // Reference values: exact SoftClip root by bracketing (Python/scipy brentq), double PQ, 2026-09-24.
+    // Reference values: exact SoftClip root by bracketing (Python, double PQ), BT.2390 knee, 2026-10-07.
     const double tgtNits = 1700.0, tgt = PQ(tgtNits);
     const double content[] = { 400.0, 700.0, 1000.0, 1500.0, 1700.0, -1.0 /* = frame peak */ };
     struct Row { double peak; double softClip[6]; double reinhard[6]; };
     const Row rows[] = {
-        { 1800.0,  { 399.981, 693.886, 978.143, 1434.653, 1612.190, 1700.0 },
-                   { 399.980, 693.840, 978.042, 1434.562, 1612.152, 1700.0 } },
-        { 2000.0,  { 399.949, 684.440, 945.427, 1341.162, 1488.537, 1700.0 },
-                   { 399.948, 684.112, 944.703, 1340.341, 1487.932, 1700.0 } },
-        { 4000.0,  { 399.834, 652.707, 844.455, 1083.528, 1160.513, 1700.0 },
-                   { 399.808, 648.143, 834.221, 1067.553, 1143.569, 1700.0 } },
-        { 10000.0, { 399.779, 639.088, 805.088, 994.974, 1052.381, 1700.0 },
-                   { 399.717, 628.661, 781.734, 956.502, 1009.985, 1700.0 } },
+        { 1800.0,  { 400.0, 700.0, 1000.0, 1500.0, 1682.994, 1700.0 },
+                   { 400.0, 700.0, 1000.0, 1500.0, 1680.680, 1700.0 } },
+        { 2000.0,  { 400.0, 700.0, 1000.0, 1500.0, 1652.109, 1700.0 },
+                   { 400.0, 700.0, 1000.0, 1500.0, 1645.664, 1700.0 } },
+        { 4000.0,  { 400.0, 700.0, 1000.0, 1383.452, 1463.541, 1700.0 },
+                   { 400.0, 700.0, 1000.0, 1362.507, 1433.866, 1700.0 } },
+        { 10000.0, { 400.0, 700.0, 945.643, 1187.039, 1250.782, 1700.0 },
+                   { 400.0, 700.0, 931.666, 1143.389, 1199.365, 1700.0 } },
     };
     for (const Row& row : rows) {
         double src = (std::max)(PQ(row.peak), tgt);
@@ -499,7 +503,7 @@ TEST_CASE("Tonemap curves: the shared HLSL on WARP matches the CPU port") {
     std::vector<float> packed;
     for (const Case& c : cases) {
         float tgt = (float)PQ(c.tgtNits), src = (float)PQ(c.srcNits);
-        float k = c.tgtNits <= 203.0 ? 0.0f : tgt * 0.8f;
+        float k = c.tgtNits <= 203.0 ? 0.0f : (std::max)(1.5f * tgt - 0.5f * src, 0.0f);   // as the HLSL, in float
         float h = 1e-2f * (src - k);
         auto push = [&](float I) { packed.insert(packed.end(), { I, src, tgt, (float)c.tgtNits }); };
         for (int i = 0; i <= kSweep; i++) push(1.05f * src * i / kSweep);
@@ -537,10 +541,13 @@ TEST_CASE("Tonemap curves: the shared HLSL on WARP matches the CPU port") {
         CHECK(std::fabs(res[kSweep + 1].first - tgt) < 1e-5);
         CHECK(std::fabs(res[kSweep + 1].second - tgt) < 1e-5);
 
-        // knee slope 1, Richardson on the two probes (the HLSL's knee: pqTgtPeak * 0.8 in float)
-        double k = c.tgtNits <= 203.0 ? 0.0 : (double)(tgt * 0.8f);
+        // knee slope 1, Richardson on the two probes (the HLSL's knee, BT.2390's KS, in float)
+        double k = c.tgtNits <= 203.0 ? 0.0 : (double)(std::max)(1.5f * tgt - 0.5f * src, 0.0f);
         double h = (double)in[(kSweep + 2) * 4] - k, h2 = (double)in[(kSweep + 3) * 4] - k;
-        for (int which = 0; which < 2; which++) {
+        // Measurable in float only on a shoulder wide enough that the probes (1 % of it) sit well above
+        // the float spacing near I ~ 0.7 (6e-8): BT.2390's shoulder is 1.5 (src - tgt) wide, so a source
+        // within ~1.5 % of the target is too narrow to probe (the double test covers the slope there).
+        for (int which = 0; which < 2 && (src - k) > 0.02; which++) {
             double v1 = which ? res[kSweep + 2].second : res[kSweep + 2].first;
             double v2 = which ? res[kSweep + 3].second : res[kSweep + 3].first;
             double slope = 2.0 * (v2 - k) / h2 - (v1 - k) / h;
