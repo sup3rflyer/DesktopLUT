@@ -1171,7 +1171,12 @@ static void StartProcessingImpl() {
         std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with hook work (cube / FALD / tonemap)"
                    << std::endl;
 
-        if (!dwmMonitors.empty()) {
+        if (!dwmMonitors.empty() && DwmHookResidentWith(dwmMonitors)) {
+            // Nothing ejected the hook since it was injected with exactly this set (e.g. the auto-restart
+            // after the overlay thread died): keep it — just bring its shared config up to date.
+            std::wcout << L"[DWM Hook] Hook already resident with this staging set — not re-injecting" << std::endl;
+            UpdateDwmHookSharedConfig();
+        } else if (!dwmMonitors.empty()) {
             std::wstring err = InjectDwmHook(dwmMonitors);
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;

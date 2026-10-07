@@ -64,6 +64,31 @@ PreviewModeGate EvaluatePreviewModeGate(bool requestedHDR, bool ctxHDR,
                                     : PreviewModeGate::Mismatch;
 }
 
+// Pump messages until monitor `monIdx` has an overlay context in mode `isHDR` (a live preview can run),
+// the processing thread is gone, or `timeoutMs` passes. A freshly started overlay builds its contexts
+// asynchronously (device, duplication, swapchain per monitor) — slow on low-end GPUs.
+static bool WaitForPreviewContext(int monIdx, bool isHDR, DWORD timeoutMs) {
+    const ULONGLONG until = GetTickCount64() + timeoutMs;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_monitorsMutex);
+            for (const auto& ctx : g_monitors)
+                if (ctx.index == monIdx) {
+                    if (ctx.isHDREnabled == isHDR) return true;
+                    break;
+                }
+        }
+        if (!g_gui.processingThread.joinable() || GetTickCount64() >= until) return false;
+        MSG pumpMsg;
+        while (PeekMessage(&pumpMsg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&pumpMsg);
+            DispatchMessage(&pumpMsg);
+        }
+        Sleep(10);
+    }
+}
+constexpr DWORD kPreviewContextWaitMs = 3000;
+
 // Start overlay/processing for MHC live preview if not already running.
 // Sets livePreview=true if monitor mode matches isHDR, and sets the
 // startedForPreview / startedOverlayForPreview flags accordingly.
@@ -125,25 +150,8 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
                 // the capture path to converge on the actual mode.
                 g_forceReinit.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-                // Forced reinit sleeps 500ms before re-deriving the mode; wait up
-                // to ~3s with message pumping (mirrors the Case-2 wait below).
-                for (int waitI = 0; waitI < 300 && !livePreview; waitI++) {
-                    MSG pumpMsg;
-                    while (PeekMessage(&pumpMsg, nullptr, 0, 0, PM_REMOVE)) {
-                        TranslateMessage(&pumpMsg);
-                        DispatchMessage(&pumpMsg);
-                    }
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorsMutex);
-                        for (const auto& ctx : g_monitors) {
-                            if (ctx.index == monIdx) {
-                                livePreview = (ctx.isHDREnabled == isHDR);
-                                break;
-                            }
-                        }
-                    }
-                    if (!livePreview) Sleep(10);
-                }
+                // Forced reinit sleeps 500ms before re-deriving the mode.
+                livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
                 break;
             }
         }
@@ -155,24 +163,7 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
         DwmHookReevaluateOverlay();
         if (g_gui.processingThread.joinable()) {
             startedOverlayForPreview = true;
-            // Wait for monitor contexts with message pumping (up to 500ms)
-            for (int waitI = 0; waitI < 50 && !livePreview; waitI++) {
-                MSG pumpMsg;
-                while (PeekMessage(&pumpMsg, nullptr, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&pumpMsg);
-                    DispatchMessage(&pumpMsg);
-                }
-                {
-                    std::lock_guard<std::mutex> lk(g_monitorsMutex);
-                    for (const auto& ctx : g_monitors) {
-                        if (ctx.index == monIdx) {
-                            livePreview = (ctx.isHDREnabled == isHDR);
-                            break;
-                        }
-                    }
-                }
-                if (!livePreview) Sleep(10);
-            }
+            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
             if (!livePreview) {
                 g_mhcEditDialogOpen.store(false);
                 DwmHookReevaluateOverlay();
@@ -193,15 +184,10 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
         cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
         if (g_gui.isRunning) {
             startedForPreview = true;
-            {
-                std::lock_guard<std::mutex> lk(g_monitorsMutex);
-                for (const auto& ctx : g_monitors) {
-                    if (ctx.index == monIdx) {
-                        livePreview = (ctx.isHDREnabled == isHDR);
-                        break;
-                    }
-                }
-            }
+            // The thread just started: its contexts do not exist yet. Checking once, right away, failed
+            // every time — the preview then stopped what it had started (a full hook inject + eject in
+            // hook mode) and the editor opened without a preview (T2.10).
+            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
             if (!livePreview) {
                 StopProcessing();
                 startedForPreview = false;

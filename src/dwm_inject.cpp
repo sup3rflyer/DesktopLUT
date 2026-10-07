@@ -24,6 +24,11 @@
 
 static std::recursive_mutex g_dwmInjectMutex;
 
+// The staging set of the last successful InjectDwmHook (DwmHookResidentWith). Under g_dwmInjectMutex.
+// Invalidated by every inject attempt (until it succeeds) and every uninject.
+static std::vector<DwmHookMonitorLUT> g_injectedSet;
+static bool g_injectedSetValid = false;
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -365,6 +370,12 @@ static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh =
 
 static const wchar_t* const kDllName   = L"DwmHook.dll";
 
+bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    return g_injectedSetValid && g_injectedSet == monitors && IsDwmHookActive();
+}
+
 bool IsDwmHookActive()
 {
     // Lightweight check: the injected DLL creates this named event on attach.
@@ -380,6 +391,7 @@ bool IsDwmHookActive()
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    g_injectedSetValid = false;   // whatever happens below, the old set no longer describes the hook
     SystemImpersonationGuard impGuard;
 
     // --- Elevate to SYSTEM ---
@@ -761,6 +773,8 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     // Injection succeeded — keep the staged DLL (dwm.exe has it loaded)
     dllGuard.disarm();
     std::wcout << L"[DWM Hook] Injection successful" << std::endl;
+    g_injectedSet = monitors;
+    g_injectedSetValid = true;
     // Twin panels: name them positively (identity beacon on the GUI thread) instead of
     // trusting the DLL's first-present order / persisted pins.
     if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_DWMHOOK_INJECTED, 0, 0);
@@ -770,6 +784,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 std::wstring UninjectDwmHook(bool keepOwnSession)
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    g_injectedSetValid = false;
     SystemImpersonationGuard impGuard;
 
     std::wcout << L"[DWM Hook] Uninjecting..." << std::endl;

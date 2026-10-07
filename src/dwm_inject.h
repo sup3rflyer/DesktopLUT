@@ -17,7 +17,19 @@ struct DwmHookMonitorLUT {
     // config instead (DwmHookSharedConfig::faldFlags). Empty = no FALD file for that mode.
     std::wstring sdrFaldPath;
     std::wstring hdrFaldPath;
+
+    bool operator==(const DwmHookMonitorLUT& o) const {
+        return left == o.left && top == o.top && sdrLutPath == o.sdrLutPath && hdrLutPath == o.hdrLutPath &&
+               sdrFaldPath == o.sdrFaldPath && hdrFaldPath == o.hdrFaldPath;
+    }
 };
+
+// The hook is resident AND was injected by this process with exactly this staging set (positions +
+// cube / FALD paths). A start that finds this — e.g. the auto-restart after the overlay thread died in
+// hook mode, where nothing ejected the hook — need not eject and re-inject a healthy hook: each cycle
+// stalls dwm.exe on the detach, re-patches, and re-rolls twin routing (T2.10). Files are read at attach
+// only, so a changed file at the same path still needs a Stop (eject) + Start.
+bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors);
 
 // Check if the DWM hook is active via named event (lightweight, no elevation needed).
 // The injected DLL creates Global\DesktopLUT_DwmHook_Active on attach.
