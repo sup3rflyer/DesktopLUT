@@ -1160,8 +1160,16 @@ bool CreateDwmHookSharedMemory()
         return false;
     }
 
-    memset(g_sharedMemPtr, 0, g_sharedMemBytes);
+    // No memset: a new mapping is zero-filled by the OS, and a PRE-EXISTING one is being read by a
+    // resident DLL — zeroing it outside the seqlock (version back to 0, an "even = complete" value)
+    // let that DLL accept a half-zeroed config. Continue the existing version sequence instead,
+    // rounded up to even (an odd value is a write a previous host never finished), and publish the
+    // first config through the normal odd/even write, which covers every byte after the version.
     g_sharedMemVersion = 0;
+    if (preexisting) {
+        const uint32_t existing = reinterpret_cast<volatile const DwmHookSharedConfig*>(g_sharedMemPtr)->version;
+        g_sharedMemVersion = (existing + 1u) & ~1u;
+    }
     UpdateDwmHookSharedConfig();
     StartFaldSettleKicker();
 
