@@ -246,6 +246,8 @@ float DesktopGammaPQ(float pq, float sdrWhiteNits);
 
 // Grayscale evaluation (exposed for testing)
 float EvalGrayscaleSDR(float Y_linear, const GrayscaleData& gs);
+// HDR grayscale above its peak: hold the top point's linear gain (T1.7; shader.h does the same)
+float HdrGrayscaleAbovePeak(float pqValue, float topPoint, float pqPeak);
 float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak);
 float EvalGrayscaleSDR_Channel(float Y_linear, const GrayscaleData& gs, int channel);
 float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqPeak, int channel);

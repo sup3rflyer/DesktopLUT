@@ -379,7 +379,7 @@ Input → Grayscale → Primaries → 3D LUT → Output
 - **HDR**: Per-channel Rec.2020 corrections in PQ domain
   - Per-channel R/G/B interpolation with linear gains (applied before ICtCp)
   - Peak setting must match ColourSpace target peak for slider alignment
-  - Content above peak passes through with last point's correction factor
+  - Content above peak keeps the top point's correction as a constant linear gain (no clip; same rule in the MHC bake and the overlay shader, 2026-10-07)
 - **Linear interpolation** (both SDR and HDR):
   - Piecewise linear between control points
   - Avoids undulations that smoothstep can cause in gradients

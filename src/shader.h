@@ -701,7 +701,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
                 int i1 = min(i0 + 1, (int)max(2.0f, grayscalePoints) - 1);
                 float t = idx - floor(idx);
 
-                // CB stores ICtCp deltas in R/G/B arrays: R=deltaI, G=deltaCt, B=deltaCp
+                // CB stores ICtCp deltas in R/G/B arrays: R=deltaI, G=deltaCt, B=deltaCp. Above the peak
+                // idx saturates: the top point's offset is held (the same above-peak rule as the gain path
+                // below, in this path's perceptual terms) — no clip.
                 float dI  = lerp(grayscaleR[i0/4][i0%4], grayscaleR[i1/4][i1%4], t);
                 float dCt = lerp(grayscaleG[i0/4][i0%4], grayscaleG[i1/4][i1%4], t);
                 float dCp = lerp(grayscaleB[i0/4][i0%4], grayscaleB[i1/4][i1%4], t);
@@ -736,9 +738,15 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 
             if (lumaNorm > 1e-10f) {
                 float3 corrPQ = float3(nR, nG, nB) * pqGrayscalePeak;
-                float gR = PQ_to_Linear_scalar(corrPQ.x) / lumaNorm;
-                float gG = PQ_to_Linear_scalar(corrPQ.y) / lumaNorm;
-                float gB = PQ_to_Linear_scalar(corrPQ.z) / lumaNorm;
+                // Above the peak the TOP point's linear gain is held (owner decision 2026-10-07, T1.7; the MHC
+                // bake does the same, mhc.cpp): brighter content keeps the correction made at the peak and is
+                // not clipped — compression is the tonemapper's job. idx has saturated to the top point there,
+                // so dividing by the peak's linear level (not the pixel's) gives exactly that gain; continuous
+                // at the peak, identity for an identity curve. (It used to divide by the pixel: a hard clip.)
+                float refLin = min(lumaNorm, max(grayscalePeakNits, 1.0f) * (1.0f / 10000.0f));
+                float gR = PQ_to_Linear_scalar(corrPQ.x) / refLin;
+                float gG = PQ_to_Linear_scalar(corrPQ.y) / refLin;
+                float gB = PQ_to_Linear_scalar(corrPQ.z) / refLin;
                 rec2020 *= float3(gR, gG, gB);
             }
             rec2020_out = rec2020 * (80.0f / 10000.0f);

@@ -54,6 +54,18 @@ static int EffectiveGrayscalePointCount(const GrayscaleData& gs) {
     return std::clamp(gs.pointCount, 2, 32);
 }
 
+// HDR grayscale above its peak (owner decision 2026-10-07, T1.7): hold the TOP point's linear gain,
+// g = PQ^-1(top * pqPeak) / PQ^-1(pqPeak), out = PQ(PQ^-1(pq) * g). Brighter content keeps the correction made
+// at the peak — not clipped (the overlay's gain path used to clip there) and not scaled in PQ (top * pq here
+// used to darken ever more nits the brighter the input: 0.97 took 10000 to ~7700). Continuous at the peak,
+// identity for an identity curve; the overlay's gain path (shader.h) applies the same rule.
+float HdrGrayscaleAbovePeak(float pqValue, float topPoint, float pqPeak) {
+    const float linPeak = PqEOTF(pqPeak);
+    if (linPeak <= 0.0f) return pqValue;
+    const float g = PqEOTF((std::max)(topPoint, 0.0f) * pqPeak) / linPeak;
+    return PqOETF((std::min)(PqEOTF(pqValue) * g, 1.0f));
+}
+
 // Evaluate SDR grayscale correction (matches the shader's ApplyGrayscaleCorrection).
 // Domain-agnostic sqrt-index/sqrt-interp: the caller now passes the SIGNAL (the bake
 // corrects in signal domain, so slider i sits at signal t² = code cap·t²). The param
@@ -96,10 +108,7 @@ float EvalGrayscaleHDR(float pqValue, const GrayscaleData& gs, float pqPeak) {
         float corrected = v0 + (v1 - v0) * t;
         return corrected * pqPeak;
     } else {
-        // Above peak: apply last point's correction factor
-        int lastIdx = pc - 1;
-        float lastVal = gs.points[lastIdx];
-        return lastVal * pqValue;
+        return HdrGrayscaleAbovePeak(pqValue, gs.points[pc - 1], pqPeak);
     }
 }
 
@@ -141,9 +150,7 @@ float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqP
         float corrected = v0 + (v1 - v0) * t;
         return corrected * pqPeak;
     } else {
-        int lastIdx = pc - 1;
-        float lastVal = pts[lastIdx];
-        return lastVal * pqValue;
+        return HdrGrayscaleAbovePeak(pqValue, pts[pc - 1], pqPeak);
     }
 }
 

@@ -561,6 +561,41 @@ TEST_CASE("Grayscale HDR: above peak extrapolation") {
     CHECK(result > 0.0f);
 }
 
+// T1.7 (owner decision 2026-10-07): above the peak the top point's LINEAR gain is held — no clip, no PQ-domain
+// scaling (top * pq used to take 10000 nits to ~7700 for a 0.97 top point), continuous at the peak.
+TEST_CASE("Grayscale HDR: above the peak the top point's linear gain is held") {
+    const float pqPeak = PqOETF(1000.0f / 10000.0f);
+    GrayscaleData gs = {};
+    gs.enabled = true;
+    gs.pointCount = 20;
+    gs.initLinearPQ();   // identity: point i = i / (N - 1)
+    for (int i = 0; i < 20; i++) { gs.pointsR[i] = gs.points[i]; gs.pointsG[i] = gs.points[i]; gs.pointsB[i] = gs.points[i]; }
+
+    SUBCASE("an identity curve stays identity above the peak") {
+        for (float nits : { 1200.0f, 2000.0f, 4000.0f, 10000.0f }) {
+            const float pq = PqOETF(nits / 10000.0f);
+            CHECK(EvalGrayscaleHDR(pq, gs, pqPeak) == doctest::Approx(pq).epsilon(1e-5));
+            CHECK(EvalGrayscaleHDR_Channel(pq, gs, pqPeak, 1) == doctest::Approx(pq).epsilon(1e-5));
+        }
+    }
+    SUBCASE("a top point of 0.97: every brighter pixel keeps the peak's gain") {
+        gs.points[19] = 0.97f;
+        gs.pointsR[19] = 0.97f;
+        const float g = PqEOTF(0.97f * pqPeak) / PqEOTF(pqPeak);   // the peak's linear gain (< 1)
+        REQUIRE(g < 1.0f);
+        for (float nits : { 1500.0f, 4000.0f, 10000.0f }) {
+            const float out = PqEOTF(EvalGrayscaleHDR(PqOETF(nits / 10000.0f), gs, pqPeak)) * 10000.0f;
+            INFO(nits << " nits -> " << out);
+            CHECK(out == doctest::Approx(nits * g).epsilon(2e-3));
+            CHECK(out > 1000.0f);   // not clipped at the peak
+        }
+        // continuous at the peak: just below and just above agree
+        const float below = EvalGrayscaleHDR_Channel(pqPeak * (1.0f - 1e-5f), gs, pqPeak, 0);
+        const float above = EvalGrayscaleHDR_Channel(pqPeak * (1.0f + 1e-5f), gs, pqPeak, 0);
+        CHECK(above == doctest::Approx(below).epsilon(1e-4));
+    }
+}
+
 // ============================================================================
 // TRC Inversion
 // ============================================================================
