@@ -187,6 +187,7 @@ AtomicTimePoint g_lastSuccessfulFrame;
 // ============================================================================
 
 std::atomic<bool> g_displayOff{ false };  // Display is off - skip recovery attempts, wait for wake signal
+std::atomic<bool> g_compClockOccluded{ false };  // Frame pacer only: compositor clock OCCLUDED
 
 // ============================================================================
 // MHC Edit Dialog State

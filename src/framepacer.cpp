@@ -391,6 +391,14 @@ static void QueryDCompFrameStats(FramePacer* fp) {
 // FramePacerSyncToVBlank — Phase 1: block until VBlank/compositor sync
 // ============================================================================
 
+// The compositor clock answered without OCCLUDED, or this strategy cannot observe occlusion at all: the
+// secure desktop is gone (recovery re-creates the duplication it cost). A wake event can end a wait
+// that is still occluded; the next wait then sets the flag again.
+static void ClearCompClockOccluded() {
+    if (g_compClockOccluded.exchange(false, std::memory_order_relaxed))
+        std::cout << "CompClock no longer occluded: resuming" << std::endl;
+}
+
 bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
     LARGE_INTEGER now;
 
@@ -407,14 +415,13 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
                                                      handleCount ? handles : nullptr,
                                                      INFINITE);
         if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-            if (!g_displayOff.load(std::memory_order_relaxed)) {
-                std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
-                g_displayOff.store(true, std::memory_order_relaxed);
-            }
+            if (!g_compClockOccluded.exchange(true, std::memory_order_relaxed))
+                std::cout << "CompClock OCCLUDED: pausing until the clock is no longer occluded" << std::endl;
             Sleep(100);
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return false;
         }
+        ClearCompClockOccluded();
         // Wake event fired (auto-sleep/reinit) or VBlank — proceed with current QPC.
         // Note: if wake event fired, vblankWakeQpc will be slightly off-VBlank, but
         // re-waiting for the next VBlank halves frame rate (was causing 30fps at 60Hz).
@@ -435,6 +442,7 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
     // ── Strategy B: DwmFlush sync ──
     case FramePacerStrategy::DwmFlushPredictive: {
         if (FAILED(DwmFlush())) { Sleep(1); }
+        ClearCompClockOccluded();   // no clock here: a fallback from A must not leave it set
 
         if (g_displayOff.load(std::memory_order_relaxed)) {
             Sleep(100);
@@ -459,16 +467,16 @@ bool FramePacerSyncToVBlank(FramePacer* fp, HANDLE wakeEvent) {
                                                          handleCount ? handles : nullptr,
                                                          INFINITE);
             if (result == STATUS_GRAPHICS_PRESENT_OCCLUDED) {
-                if (!g_displayOff.load(std::memory_order_relaxed)) {
-                    std::cout << "CompClock OCCLUDED: setting display-off flag" << std::endl;
-                    g_displayOff.store(true, std::memory_order_relaxed);
-                }
+                if (!g_compClockOccluded.exchange(true, std::memory_order_relaxed))
+                    std::cout << "CompClock OCCLUDED: pausing until the clock is no longer occluded" << std::endl;
                 Sleep(100);
                 g_lastSuccessfulFrame = std::chrono::steady_clock::now();
                 return false;
             }
+            ClearCompClockOccluded();
         } else {
             if (FAILED(DwmFlush())) { Sleep(1); }
+            ClearCompClockOccluded();
         }
 
         if (g_displayOff.load(std::memory_order_relaxed)) {

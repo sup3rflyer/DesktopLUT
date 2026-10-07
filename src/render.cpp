@@ -47,7 +47,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // FALD temporal state describes a panel that showed OUR frames, so it is void (fald.h FaldLayerIdle). Without
         // this a recovery that rebuilds nothing would resume from the pre-loss state.
         FaldLayerIdle(ctx);
-        if (g_displayOff.load()) {
+        if (DisplayOffOrOccluded()) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             return;
         }
@@ -194,7 +194,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         }
         ctx->lastCaptureTexture = nullptr;  // Invalidate SRV cache
 
-        if (g_displayOff.load()) {
+        if (DisplayOffOrOccluded()) {
             g_lastSuccessfulFrame = std::chrono::steady_clock::now();
             ctx->consecutiveFailures = 0;
             return;
@@ -836,7 +836,7 @@ void RenderAll(FramePacer* fp) {
     // Watchdog: if no successful frame for N seconds, attempt recovery before exit.
     // Skip watchdog during display sleep — the display-off flag is set by the GUI
     // thread (always responsive) so this is reliable even when CompClock blocks.
-    if (g_displayOff.load(std::memory_order_relaxed)) {
+    if (DisplayOffOrOccluded()) {
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
     } else {
         auto timeSinceLastFrame = std::chrono::steady_clock::now() - g_lastSuccessfulFrame.load();

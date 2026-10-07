@@ -212,6 +212,16 @@ extern AtomicTimePoint g_lastSuccessfulFrame;
 // ============================================================================
 
 extern std::atomic<bool> g_displayOff;  // Display is off - skip recovery attempts, wait for wake signal
+// The compositor clock reports OCCLUDED (secure desktop: UAC / Ctrl+Alt+Del). Written ONLY by the frame
+// pacer, which clears it on the first clock wait that is not occluded. Kept apart from g_displayOff, whose
+// setters are power/session events with their own clearing events: the pacer used to set g_displayOff, and
+// nothing ever cleared that, so the overlay stayed paused until the next power/session event (T2.19).
+extern std::atomic<bool> g_compClockOccluded;
+// Rendering is pointless right now (display off/asleep/locked, or the compositor clock is occluded):
+// recovery attempts and the render-loop watchdog stand down.
+inline bool DisplayOffOrOccluded() {
+    return g_displayOff.load(std::memory_order_relaxed) || g_compClockOccluded.load(std::memory_order_relaxed);
+}
 
 // ============================================================================
 // MHC Edit Dialog State

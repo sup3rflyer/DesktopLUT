@@ -1,5 +1,7 @@
 #include "doctest.h"
 #include "framepacer.h"
+#include "globals.h"   // g_displayOff, g_compClockOccluded
+#include "render.h"    // g_pfnWaitForCompositorClock
 #include <cmath>
 
 // QPC helpers (matching framepacer.cpp's internal helpers)
@@ -476,4 +478,50 @@ TEST_CASE("Acquisition: lastPresentTime takes priority over preAcquireQpc") {
 
     // EMA should be near 4ms (not 8ms), confirming lastPresentTime was used
     CHECK(fp.compositionOffsetMs == doctest::Approx(4.0f).epsilon(0.3));
+}
+
+// ============================================================================
+// Compositor clock OCCLUDED (T2.19)
+// ============================================================================
+// The secure desktop (UAC / Ctrl+Alt+Del) makes the clock wait return OCCLUDED. The pacer used to set
+// g_displayOff for it, which only power/session events ever cleared: the overlay stayed paused after the
+// prompt closed. It now has its own flag, cleared by the first clock wait that is not occluded.
+static DWORD g_stubClockResult = WAIT_OBJECT_0;
+static DWORD WINAPI StubCompositorClock(UINT, const HANDLE*, DWORD) { return g_stubClockResult; }
+
+TEST_CASE("Compositor clock OCCLUDED pauses only until the clock answers again") {
+    const auto savedClock = g_pfnWaitForCompositorClock;
+    const bool savedOff = g_displayOff.load();
+    g_pfnWaitForCompositorClock = StubCompositorClock;
+    g_displayOff.store(false);
+    g_compClockOccluded.store(false);
+    FramePacer fp = MakePacer(60.0, FramePacerStrategy::DwmFlushOnly);
+
+    g_stubClockResult = 0xC01E05A1;   // STATUS_GRAPHICS_PRESENT_OCCLUDED
+    CHECK_FALSE(FramePacerSyncToVBlank(&fp, nullptr));
+    CHECK(g_compClockOccluded.load());
+    CHECK_FALSE(g_displayOff.load());   // the power/session flag is not the pacer's
+    CHECK(DisplayOffOrOccluded());
+
+    g_stubClockResult = WAIT_OBJECT_0;   // a clock tick (no handles passed)
+    CHECK(FramePacerSyncToVBlank(&fp, nullptr));
+    CHECK_FALSE(g_compClockOccluded.load());
+    CHECK_FALSE(DisplayOffOrOccluded());
+
+    SUBCASE("a display-off set by a power/session event is left to its own clearing event") {
+        g_displayOff.store(true);
+        CHECK_FALSE(FramePacerSyncToVBlank(&fp, nullptr));
+        CHECK(g_displayOff.load());
+        CHECK_FALSE(g_compClockOccluded.load());
+    }
+    SUBCASE("a strategy that cannot observe occlusion clears a flag left by another") {
+        g_compClockOccluded.store(true);
+        g_pfnWaitForCompositorClock = nullptr;   // DwmFlushOnly without the clock: DwmFlush path
+        FramePacerSyncToVBlank(&fp, nullptr);
+        CHECK_FALSE(g_compClockOccluded.load());
+    }
+
+    g_pfnWaitForCompositorClock = savedClock;
+    g_displayOff.store(savedOff);
+    g_compClockOccluded.store(false);
 }
