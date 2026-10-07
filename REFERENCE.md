@@ -462,7 +462,7 @@ reader (`shared/fald_panel.h`) — there is no second implementation of the corr
 
 **Frame timing note**: These metrics measure Desktop Duplication frame delivery timing, not actual display presentation. Values fluctuate based on desktop activity and are useful for debugging the render loop, not for assessing VRR behavior or presentation quality.
 
-Implementation: the analysis statistics sample 3600 pixels (80x45 grid), async readback with 2-frame delay. (The tonemapper's dynamic peak detector is dense — see HDR Color Pipeline; the overlay's *Peak* statistic here is still the sparse grid and can read lower than the detector on small highlights.)
+Implementation: the analysis statistics sample 3600 pixels (80x45 grid) of every acquired desktop frame; the readout is read back every 500 ms (time-driven, non-blocking), so a static screen such as a test patch is measured too. (The tonemapper's dynamic peak detector is dense — see HDR Color Pipeline; the overlay's *Peak* statistic here is still the sparse grid and can read lower than the detector on small highlights.)
 
 ## Performance
 

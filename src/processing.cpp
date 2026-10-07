@@ -1001,6 +1001,8 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
 
             mon.duplication->ReleaseFrame();
         } else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            // Static screen: the readout still updates (the last frame was measured when it arrived)
+            UpdateAnalysisDisplay(&mon);
             continue;
         } else if (hr == DXGI_ERROR_ACCESS_LOST) {
             std::cout << "[Analysis-only] ACCESS_LOST, re-initializing DD" << std::endl;
@@ -1035,12 +1037,7 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
     mon.lastCaptureTexture = nullptr;
     if (mon.analysisUAV) { mon.analysisUAV->Release(); mon.analysisUAV = nullptr; }
     if (mon.analysisBuffer) { mon.analysisBuffer->Release(); mon.analysisBuffer = nullptr; }
-    for (int i = 0; i < 2; i++) {
-        if (mon.analysisStagingBuffer[i]) {
-            mon.analysisStagingBuffer[i]->Release();
-            mon.analysisStagingBuffer[i] = nullptr;
-        }
-    }
+    if (mon.analysisStagingBuffer) { mon.analysisStagingBuffer->Release(); mon.analysisStagingBuffer = nullptr; }
     {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
         g_monitors.clear();

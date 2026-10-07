@@ -602,14 +602,9 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     // Analysis resources
     if (ctx->analysisUAV) { ctx->analysisUAV->Release(); ctx->analysisUAV = nullptr; }
     if (ctx->analysisBuffer) { ctx->analysisBuffer->Release(); ctx->analysisBuffer = nullptr; }
-    for (int i = 0; i < 2; i++) {
-        if (ctx->analysisStagingBuffer[i]) {
-            ctx->analysisStagingBuffer[i]->Release();
-            ctx->analysisStagingBuffer[i] = nullptr;
-        }
-    }
-    ctx->analysisStagingIndex = 0;
+    if (ctx->analysisStagingBuffer) { ctx->analysisStagingBuffer->Release(); ctx->analysisStagingBuffer = nullptr; }
     ctx->analysisFrameCounter = 0;
+    ctx->analysisReadbackPending = false;
     if (ctx->rtv) { ctx->rtv->Release(); ctx->rtv = nullptr; }
     if (ctx->swapchain) { ctx->swapchain->Release(); ctx->swapchain = nullptr; }
     // Keep hwnd - we'll reuse it

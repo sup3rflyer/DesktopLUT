@@ -676,9 +676,10 @@ struct MonitorContext {
     // Analysis resources (frame statistics overlay)
     ID3D11Buffer* analysisBuffer = nullptr;           // Structured buffer for results
     ID3D11UnorderedAccessView* analysisUAV = nullptr; // UAV for compute shader write
-    ID3D11Buffer* analysisStagingBuffer[2] = {nullptr, nullptr};  // Double-buffered for async readback
-    int analysisStagingIndex = 0;                     // Which staging buffer to use
-    int analysisFrameCounter = 0;                     // For dispatch/readback timing
+    ID3D11Buffer* analysisStagingBuffer = nullptr;    // Async readback (copy queued, mapped DO_NOT_WAIT later)
+    int analysisFrameCounter = 0;                     // Frames measured since the resources were created (0 = no result)
+    bool analysisReadbackPending = false;             // A copy to staging is queued, not yet mapped
+    std::chrono::steady_clock::time_point analysisLastReadbackQueued{};  // Readback cadence (time-driven)
     float sessionMaxCLL = 0.0f;                       // Session peak tracking
     float sessionMaxFALL = 0.0f;                      // Session average tracking
     AnalysisResult analysisResult = {};               // Latest analysis result for display

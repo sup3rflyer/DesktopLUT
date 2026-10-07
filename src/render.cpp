@@ -170,6 +170,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Truly no new content this cycle (content static or frame rate < display rate).
         if (fp && ctx->index == 0) FramePacerNotifyTimeout(fp);
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+        // A static screen still gets its readout (the last frame was measured when it arrived)
+        if (ctx->index == 0 && g_analysisEnabled.load()) UpdateAnalysisDisplay(ctx);
         // Still need to handle initial visibility even without new frames
         if (ctx->dcompCommitted && ctx->hwnd && !IsWindowVisible(ctx->hwnd)
             && !g_vrrWhitelistActive.load() && !g_overlayAutoSleep.load()) {
@@ -230,6 +232,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         desktopResource->Release();
         ctx->duplication->ReleaseFrame();
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
+        if (ctx->index == 0 && g_analysisEnabled.load()) UpdateAnalysisDisplay(ctx);   // as on WAIT_TIMEOUT
         return;
     }
 
@@ -720,7 +723,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         if (useFrameBuffer) {
             g_context->OMSetRenderTargets(1, &ctx->rtv, nullptr);
         }
-        DispatchAnalysisCompute(ctx);
+        // Measure only a frame this call acquired: a re-processed / settle frame reads the released
+        // duplication texture, which is not a valid source.
+        if (!reprocess && !settleOnly) DispatchAnalysisCompute(ctx);
         UpdateAnalysisDisplay(ctx);
     }
 

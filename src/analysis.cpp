@@ -20,9 +20,10 @@ static const wchar_t* g_analysisClassName = L"DesktopLUT_Analysis";
 // Cached font for analysis overlay (avoids CreateFont/DeleteObject per paint)
 static HFONT g_analysisFont = nullptr;
 
-// Timing constants
-static const int ANALYSIS_DISPATCH_INTERVAL = 30;  // Dispatch every 30 frames (~0.5 sec at 60Hz)
-static const int ANALYSIS_READBACK_DELAY = 2;      // Read back 2 frames after dispatch
+// Readback cadence. Time-driven and content-independent (T4.20): the old cadence counted desktop-change
+// frames (dispatch on the 30th, read back 2 later), so a static screen — exactly what a test-pattern
+// generator puts up — was never measured, and its rate depended on the refresh / content rate.
+static const auto ANALYSIS_READBACK_INTERVAL = std::chrono::milliseconds(500);
 
 // AnalysisDisplayData declared in analysis.h (shared with gui.cpp for hook polling)
 // Definitions (non-static for cross-TU access):
@@ -499,34 +500,34 @@ bool CreateAnalysisResources(MonitorContext* ctx) {
         return false;
     }
 
-    // Create double-buffered staging buffers for async readback
+    // Staging buffer for the async readback (UpdateAnalysisDisplay: copy queued, mapped DO_NOT_WAIT later)
     D3D11_BUFFER_DESC stagingDesc = {};
     stagingDesc.ByteWidth = kAnalysisOutputUints * sizeof(uint32_t);
     stagingDesc.Usage = D3D11_USAGE_STAGING;
     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    for (int i = 0; i < 2; i++) {
-        hr = g_device->CreateBuffer(&stagingDesc, nullptr, &ctx->analysisStagingBuffer[i]);
-        if (FAILED(hr)) {
-            std::cerr << "Monitor " << ctx->index << " failed to create analysis staging buffer " << i << std::endl;
-            // Clean up
-            if (ctx->analysisUAV) { ctx->analysisUAV->Release(); ctx->analysisUAV = nullptr; }
-            if (ctx->analysisBuffer) { ctx->analysisBuffer->Release(); ctx->analysisBuffer = nullptr; }
-            for (int j = 0; j < i; j++) {
-                if (ctx->analysisStagingBuffer[j]) {
-                    ctx->analysisStagingBuffer[j]->Release();
-                    ctx->analysisStagingBuffer[j] = nullptr;
-                }
-            }
-            return false;
-        }
+    hr = g_device->CreateBuffer(&stagingDesc, nullptr, &ctx->analysisStagingBuffer);
+    if (FAILED(hr)) {
+        std::cerr << "Monitor " << ctx->index << " failed to create analysis staging buffer" << std::endl;
+        if (ctx->analysisUAV) { ctx->analysisUAV->Release(); ctx->analysisUAV = nullptr; }
+        if (ctx->analysisBuffer) { ctx->analysisBuffer->Release(); ctx->analysisBuffer = nullptr; }
+        ctx->analysisStagingBuffer = nullptr;
+        return false;
     }
 
+    // Fresh resources: no result yet, nothing queued; the first readback goes as soon as a frame is measured.
+    ctx->analysisFrameCounter = 0;
+    ctx->analysisReadbackPending = false;
+    ctx->analysisLastReadbackQueued = {};
     std::cout << "Monitor " << ctx->index << " analysis resources created" << std::endl;
     return true;
 }
 
 
+// Runs on EVERY acquired desktop frame, while the frame is held (the duplication texture is not a valid
+// source once released). One 256-thread group over 3600 samples — negligible next to the overlay's own
+// passes — so the result buffer always holds the statistics of the latest desktop frame, including the
+// last one before the screen went static. Callers skip re-processed / settle frames (released texture).
 void DispatchAnalysisCompute(MonitorContext* ctx) {
     if (!g_analysisCS || !g_analysisCB || !ctx->captureSRV) return;
 
@@ -537,46 +538,35 @@ void DispatchAnalysisCompute(MonitorContext* ctx) {
         }
     }
 
-    // Only dispatch every N frames
-    ctx->analysisFrameCounter++;
-    int frameInCycle = ctx->analysisFrameCounter % ANALYSIS_DISPATCH_INTERVAL;
-
-    if (frameInCycle == 0) {
-        // Update constant buffer with frame dimensions and HDR state
-        D3D11_MAPPED_SUBRESOURCE mapped;
-        if (SUCCEEDED(g_context->Map(g_analysisCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
-            uint32_t* udata = (uint32_t*)mapped.pData;
-            udata[0] = (uint32_t)ctx->width;
-            udata[1] = (uint32_t)ctx->height;
-            udata[2] = ctx->isHDREnabled ? 1 : 0;
-            udata[3] = 0;  // pad
-            g_context->Unmap(g_analysisCB, 0);
-        }
-
-        // Clear the analysis buffer (reset counters)
-        UINT clearVal[4] = { 0, 0, 0, 0 };
-        g_context->ClearUnorderedAccessViewUint(ctx->analysisUAV, clearVal);
-
-        // Dispatch compute shader
-        g_context->CSSetShader(g_analysisCS, nullptr, 0);
-        g_context->CSSetConstantBuffers(0, 1, &g_analysisCB);
-        g_context->CSSetShaderResources(0, 1, &ctx->captureSRV);
-        g_context->CSSetUnorderedAccessViews(0, 1, &ctx->analysisUAV, nullptr);
-        g_context->Dispatch(1, 1, 1);
-
-        // Unbind resources
-        ID3D11UnorderedAccessView* nullUAV = nullptr;
-        g_context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
-        ID3D11ShaderResourceView* nullSRV = nullptr;
-        g_context->CSSetShaderResources(0, 1, &nullSRV);
-
-        // Copy to staging buffer (this frame's results go to current staging index)
-        int stagingIdx = ctx->analysisStagingIndex;
-        g_context->CopyResource(ctx->analysisStagingBuffer[stagingIdx], ctx->analysisBuffer);
-
-        // Flip staging index for next time
-        ctx->analysisStagingIndex = 1 - stagingIdx;
+    // Update constant buffer with frame dimensions and HDR state
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    if (SUCCEEDED(g_context->Map(g_analysisCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        uint32_t* udata = (uint32_t*)mapped.pData;
+        udata[0] = (uint32_t)ctx->width;
+        udata[1] = (uint32_t)ctx->height;
+        udata[2] = ctx->isHDREnabled ? 1 : 0;
+        udata[3] = 0;  // pad
+        g_context->Unmap(g_analysisCB, 0);
     }
+
+    // Clear the analysis buffer (unused tail slots stay 0)
+    UINT clearVal[4] = { 0, 0, 0, 0 };
+    g_context->ClearUnorderedAccessViewUint(ctx->analysisUAV, clearVal);
+
+    // Dispatch compute shader
+    g_context->CSSetShader(g_analysisCS, nullptr, 0);
+    g_context->CSSetConstantBuffers(0, 1, &g_analysisCB);
+    g_context->CSSetShaderResources(0, 1, &ctx->captureSRV);
+    g_context->CSSetUnorderedAccessViews(0, 1, &ctx->analysisUAV, nullptr);
+    g_context->Dispatch(1, 1, 1);
+
+    // Unbind resources
+    ID3D11UnorderedAccessView* nullUAV = nullptr;
+    g_context->CSSetUnorderedAccessViews(0, 1, &nullUAV, nullptr);
+    ID3D11ShaderResourceView* nullSRV = nullptr;
+    g_context->CSSetShaderResources(0, 1, &nullSRV);
+
+    ctx->analysisFrameCounter++;   // a result now exists
 }
 
 static void ComputeFrameTimingStats(MonitorContext* ctx) {
@@ -615,22 +605,30 @@ static void ComputeFrameTimingStats(MonitorContext* ctx) {
     ctx->frameTimingStats.fps = (avgMs > 0.0f) ? (1000.0f / avgMs) : 0.0f;
 }
 
+// Call on EVERY loop iteration — a new frame or not (WAIT_TIMEOUT, cursor-only frames): every
+// ANALYSIS_READBACK_INTERVAL it queues a copy of the latest result to staging, and it maps that copy
+// with DO_NOT_WAIT on a later call once the GPU has finished it. Never stalls the render loop.
 void UpdateAnalysisDisplay(MonitorContext* ctx) {
     if (!g_analysisHwnd) return;  // Caller already gates on g_analysisEnabled
-    if (!ctx->analysisStagingBuffer[0] || !ctx->analysisStagingBuffer[1]) return;
+    if (!ctx->analysisBuffer || !ctx->analysisStagingBuffer) return;
+    if (ctx->analysisFrameCounter == 0) return;   // nothing measured yet
 
-    // Skip readback until first dispatch has completed its GPU readback delay
-    if (ctx->analysisFrameCounter < ANALYSIS_DISPATCH_INTERVAL + ANALYSIS_READBACK_DELAY) return;
-
-    // Only read back 2 frames after dispatch to avoid GPU sync stall
-    int frameInCycle = ctx->analysisFrameCounter % ANALYSIS_DISPATCH_INTERVAL;
-    if (frameInCycle != ANALYSIS_READBACK_DELAY) return;
-
-    // Read the most recently written staging buffer (the one dispatch copied to last cycle)
-    int readIdx = 1 - ctx->analysisStagingIndex;
+    ID3D11Buffer* staging = ctx->analysisStagingBuffer;
+    if (!ctx->analysisReadbackPending) {
+        const auto now = std::chrono::steady_clock::now();
+        if (ctx->analysisLastReadbackQueued != std::chrono::steady_clock::time_point{} &&
+            now - ctx->analysisLastReadbackQueued < ANALYSIS_READBACK_INTERVAL)
+            return;
+        g_context->CopyResource(staging, ctx->analysisBuffer);
+        ctx->analysisReadbackPending = true;
+        ctx->analysisLastReadbackQueued = now;
+        return;   // the copy is not done yet: map it on a later call
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = g_context->Map(ctx->analysisStagingBuffer[readIdx], 0, D3D11_MAP_READ, 0, &mapped);
+    HRESULT hr = g_context->Map(staging, 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) return;   // try again next iteration
+    ctx->analysisReadbackPending = false;
     if (FAILED(hr)) return;
 
     // Read uint array and convert to AnalysisResult
@@ -656,7 +654,7 @@ void UpdateAnalysisDisplay(MonitorContext* ctx) {
     result.peakRgbNits = *(float*)&data[analysis_slot::PeakRgb];
     float sumRgbNits = *(float*)&data[analysis_slot::SumRgb];
 
-    g_context->Unmap(ctx->analysisStagingBuffer[readIdx], 0);
+    g_context->Unmap(staging, 0);
 
     // Calculate derived values
     if (result.totalPixels > 0) {
