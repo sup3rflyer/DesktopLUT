@@ -406,10 +406,12 @@ static void ShowFaldTemporalRow(bool panelClock) {
 
 // Update color correction controls to reflect current monitor's settings
 // Populates both SDR and HDR sections simultaneously
-void UpdateColorCorrectionControls() {
+void UpdateColorCorrectionControls(bool forceEdits) {
     if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) {
         return;
     }
+    // A focused edit keeps the value being typed — except when the selected display changed.
+    auto typing = [forceEdits](HWND h) { return !forceEdits && GetFocus() == h; };
 
     // Suppress repaints during bulk control update to prevent cascade (~24 controls → 1 repaint)
     HWND scrollPanel = g_gui.hwndScrollPanel[2];  // Corrections tab
@@ -450,17 +452,17 @@ void UpdateColorCorrectionControls() {
     SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= FALD_TEMPORAL_PANEL ? shown.temporalMode : 0), 0);
     ShowFaldTemporalRow(shown.temporalMode == FALD_TEMPORAL_PANEL);
     wchar_t tauBuf[32];
-    if (GetFocus() != g_gui.hwndFaldTauRise) {  // don't fight a value being typed
+    if (!typing(g_gui.hwndFaldTauRise)) {  // don't fight a value being typed
         _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauRiseMs);
         SetWindowText(g_gui.hwndFaldTauRise, tauBuf);
     }
-    if (GetFocus() != g_gui.hwndFaldTauFall) {
+    if (!typing(g_gui.hwndFaldTauFall)) {
         _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauFallMs);
         SetWindowText(g_gui.hwndFaldTauFall, tauBuf);
     }
-    if (GetFocus() != g_gui.hwndFaldDelay)
+    if (!typing(g_gui.hwndFaldDelay))
         SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(shown.delayFrames).c_str());
-    if (GetFocus() != g_gui.hwndFaldClosure) {
+    if (!typing(g_gui.hwndFaldClosure)) {
         _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), shown.clockClosure);
         SetWindowText(g_gui.hwndFaldClosure, tauBuf);
     }
@@ -471,16 +473,16 @@ void UpdateColorCorrectionControls() {
         const struct { HWND edit; float v; } starEdits[] = { { g_gui.hwndFaldStarEven, shown.star.even },
             { g_gui.hwndFaldStarStrength, shown.star.strength }, { g_gui.hwndFaldStarSigma, shown.star.targetSigma } };
         for (const auto& e : starEdits) {
-            if (GetFocus() == e.edit) continue;   // don't fight a value being typed
+            if (typing(e.edit)) continue;   // don't fight a value being typed
             _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), e.v);
             SetWindowText(e.edit, tauBuf);
         }
     }
-    if (GetFocus() != g_gui.hwndFaldStarKeep) {
+    if (!typing(g_gui.hwndFaldStarKeep)) {
         _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.star.keepNits);
         SetWindowText(g_gui.hwndFaldStarKeep, tauBuf);
     }
-    if (GetFocus() != g_gui.hwndFaldStarReach)
+    if (!typing(g_gui.hwndFaldStarReach))
         SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(shown.star.evenReach).c_str());
     // The whole layer runs in both paths (overlay: src/fald.cpp; DWM hook: dwm_hook/hook_fald.cpp), so every FALD
     // control is live in either mode.
@@ -1145,14 +1147,93 @@ static UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 //   - a display's identity query can fail transiently mid-modeset; that display keeps
 //     the entry at its index and the query is retried a few times.
 
-static const UINT MONITOR_IDENTITY_RETRY_MS = 3000;
-static const int  MONITOR_IDENTITY_MAX_RETRIES = 5;
 static int g_monitorIdentityRetries = 0;
 
+int g_monitorSettingsPins = 0;   // see MonitorSettingsPin (gui.h)
+
+void SelectMonitor(int index) {
+    const int count = (int)(std::min)(g_gui.monitors.size(), g_gui.monitorSettings.size());
+    if (count <= 0) { g_gui.currentMonitor = 0; return; }
+    if (index < 0) index = 0;
+    if (index >= count) index = count - 1;
+    g_gui.currentMonitor = index;
+    SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, index, 0);
+    SetPathText(g_gui.hwndSdrPath, g_gui.monitorSettings[index].sdrPath.c_str());
+    SetPathText(g_gui.hwndHdrPath, g_gui.monitorSettings[index].hdrPath.c_str());
+    UpdateColorCorrectionControls(true);
+    if (g_gui.currentTab == 3) RefreshHookRoutingLabel();
+}
+
+void SetLiveMonitors(const std::vector<HMONITOR>& monitors) {
+    // Names are built outside the lock (DisplayConfig queries).
+    std::vector<std::wstring> names;
+    names.reserve(monitors.size());
+    for (size_t i = 0; i < monitors.size(); i++) {
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(monitors[i], &mi);
+        int monW = mi.rcMonitor.right - mi.rcMonitor.left;
+        int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+        // Friendly display name (e.g. "PA32UCXR"), matched by the HMONITOR's GDI source name.
+        DisplayInfo dispInfo;
+        std::wstring friendlyName;
+        if ((GetDisplayInfoForHMonitor(monitors[i], dispInfo) || GetDisplayInfoForMonitor((int)i, dispInfo)) &&
+            !dispInfo.name.empty()) {
+            friendlyName = dispInfo.name;
+        }
+        wchar_t name[128];
+        if (!friendlyName.empty()) {
+            swprintf_s(name, L"Monitor %d - %s: %dx%d%s", (int)i, friendlyName.c_str(),
+                monW, monH, isPrimary ? L" [Primary]" : L"");
+        } else {
+            swprintf_s(name, L"Monitor %d: %dx%d%s", (int)i,
+                monW, monH, isPrimary ? L" [Primary]" : L"");
+        }
+        names.push_back(name);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        g_gui.monitors = monitors;
+        g_gui.monitorNames = names;
+    }
+    SendMessage(g_gui.hwndMonitorList, WM_SETREDRAW, FALSE, 0);
+    SendMessage(g_gui.hwndMonitorList, LB_RESETCONTENT, 0, 0);
+    for (const auto& n : names) SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)n.c_str());
+    SendMessage(g_gui.hwndMonitorList, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(g_gui.hwndMonitorList, nullptr, TRUE);
+}
+
+// True when some identifiable live display is not the display whose settings sit at its
+// index — a panel swapped on a connector, or a display identified only now. Windows can keep
+// the HMONITOR set unchanged across such a change, so the handle comparison alone misses it.
+static bool LiveIdentitiesDiffer(const std::vector<HMONITOR>& monitors) {
+    std::vector<LiveDisplay> live = QueryLiveDisplays(monitors);
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    if (live.size() != g_gui.monitorSettings.size()) return true;
+    for (size_t i = 0; i < live.size(); i++) {
+        if (!live[i].identified) continue;   // cannot tell; the retry path handles it
+        const DisplayIdentity& have = g_gui.monitorSettings[i].identity;
+        if (have.empty()) return true;
+        if (_wcsicmp(have.devicePath.c_str(), live[i].identity.devicePath.c_str()) != 0) return true;
+        if (!EdidIdsCompatible(have.edidId, live[i].identity.edidId)) return true;
+    }
+    return false;
+}
+
+static bool AnyLiveMonitorUnidentified() {
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    for (const auto& ms : g_gui.monitorSettings) {
+        if (ms.identity.empty()) return true;
+    }
+    return false;
+}
+
+static void OnMonitorSettingsTopologyChanged();
+
 static void ReattachMonitorSettings(HWND hwnd, const char* why) {
-    if (g_mhcEditDialogOpen.load()) {
+    if (g_mhcEditDialogOpen.load() || g_monitorSettingsPins > 0) {
         // Keep index alignment with placeholders (never identified, so never persisted)
-        // and come back once the dialog has closed.
+        // and come back once the dialog has closed. Never shrinks while pinned.
         {
             std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
             if (g_gui.monitors.size() > g_gui.monitorSettings.size()) {
@@ -1164,8 +1245,15 @@ static void ReattachMonitorSettings(HWND hwnd, const char* why) {
         return;
     }
 
+    // The selection follows the DISPLAY, not the index: remember which display is selected.
+    int selectedSlot = -1;
+    if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+        selectedSlot = g_gui.monitorSettings[g_gui.currentMonitor].slot;
+    }
+
     std::cout << "[Monitor identity] re-attaching settings (" << why << ")" << std::endl;
-    bool allIdentified = ResolveMonitorSettings(g_gui.monitors);
+    MonitorResolveOutcome outcome = ResolveMonitorSettings(g_gui.monitors);
+    bool allIdentified = outcome.allIdentified;
 
     // A display that arrives with desktop gamma enabled turns the mode on, exactly as
     // it would have at startup. Never turns it off: that is the hotkey's decision.
@@ -1181,12 +1269,17 @@ static void ReattachMonitorSettings(HWND hwnd, const char* why) {
         if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(true);
     }
 
-    // The entry under the current selection may now belong to another panel.
-    if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-        SetPathText(g_gui.hwndSdrPath, g_gui.monitorSettings[g_gui.currentMonitor].sdrPath.c_str());
-        SetPathText(g_gui.hwndHdrPath, g_gui.monitorSettings[g_gui.currentMonitor].hdrPath.c_str());
-        UpdateColorCorrectionControls();
+    // Every per-monitor control is refreshed, whether or not the selected entry moved: the
+    // entry under any index may now belong to another panel, and a departed selection falls
+    // back to the nearest index (never leaves the old display's values on screen, where the
+    // next click would write them into whatever display now sits at that index).
+    int newSel = g_gui.currentMonitor;
+    if (selectedSlot >= 0) {
+        for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+            if (g_gui.monitorSettings[i].slot == selectedSlot) { newSel = (int)i; break; }
+        }
     }
+    SelectMonitor(newSel);
 
     // A legacy [Monitor<N>] section adopted just now (a display first seen by this
     // build) is persisted as its identity section immediately, not on the next edit.
@@ -1201,19 +1294,33 @@ static void ReattachMonitorSettings(HWND hwnd, const char* why) {
         if (migrated) SaveSettings();
     }
 
+    if (outcome.liveChanged) OnMonitorSettingsTopologyChanged();
+
     if (!allIdentified && g_monitorIdentityRetries < MONITOR_IDENTITY_MAX_RETRIES) {
         g_monitorIdentityRetries++;
         std::cout << "[Monitor identity] a display could not be identified yet, retry "
                   << g_monitorIdentityRetries << "/" << MONITOR_IDENTITY_MAX_RETRIES << std::endl;
+        SetStatus(L"A display could not be identified yet; retrying (its settings are not saved until then)");
         SetTimer(hwnd, MONITOR_IDENTITY_TIMER_ID, MONITOR_IDENTITY_RETRY_MS, nullptr);
     } else {
         if (!allIdentified) {
-            std::cout << "[Monitor identity] giving up on identifying a display; its settings "
-                         "stay attached by index and are not persisted" << std::endl;
+            std::cout << "[Monitor identity] giving up on identifying a display for now; its settings "
+                         "stay attached by index and are not persisted (re-checked on the MHC verify tick)"
+                      << std::endl;
+            SetStatus(L"A display could not be identified: its settings are not being saved");
         }
         g_monitorIdentityRetries = 0;
         KillTimer(hwnd, MONITOR_IDENTITY_TIMER_ID);
     }
+}
+
+// The live vector now attaches a different display at some index (arrival, departure, swap,
+// late identification). Everything that took a per-index view of the settings is stale.
+static void OnMonitorSettingsTopologyChanged() {
+    std::cout << "[Monitor identity] live settings attachment changed" << std::endl;
+    // Start/Apply reflect whether the running pipeline still matches the settings (a newly
+    // attached display with a LUT needs one; SettingsChanged compares by display slot).
+    UpdateGUIState();
 }
 
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -1278,15 +1385,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         switch (LOWORD(wParam)) {
         case ID_MONITOR_LIST:
             if (HIWORD(wParam) == LBN_SELCHANGE) {
-                // Load new monitor's settings
                 int sel = (int)SendMessage(g_gui.hwndMonitorList, LB_GETCURSEL, 0, 0);
-                if (sel >= 0 && sel < (int)g_gui.monitorSettings.size()) {
-                    g_gui.currentMonitor = sel;
-                    SetPathText(g_gui.hwndSdrPath, g_gui.monitorSettings[sel].sdrPath.c_str());
-                    SetPathText(g_gui.hwndHdrPath, g_gui.monitorSettings[sel].hdrPath.c_str());
-                    // Load color correction controls for this monitor
-                    UpdateColorCorrectionControls();
-                }
+                if (sel >= 0 && sel < (int)g_gui.monitorSettings.size()) SelectMonitor(sel);
             }
             return 0;
         case ID_SDR_BROWSE: {
@@ -1822,6 +1922,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_TAB_EDIT:
         case ID_MHC_HDR_EDIT:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                // References into monitorSettings are held across the preview spin-up's and
+                // the dialog's message pumps: pin the vector for the whole handler.
+                MonitorSettingsPin pin;
                 int monIdx = g_gui.currentMonitor;
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_EDIT);
                 auto& mhc = isHDR ? g_gui.monitorSettings[monIdx].hdrMHC
@@ -2120,6 +2223,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_SDR_GS_EDIT:
         case ID_MHC_HDR_GS_EDIT:
             if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+                MonitorSettingsPin pin;   // mhc / gs references held across the editor's pumps
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_GS_EDIT);
                 int monIdx = g_gui.currentMonitor;
                 auto& mhc = isHDR ? g_gui.monitorSettings[monIdx].hdrMHC
@@ -2795,6 +2899,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // the OS default for its monitor, put it back. Runs independently
             // of the processing thread so MHC-only users are also protected.
             VerifyAndRestoreMhcProfiles();
+            // A display given up on by the identity retry runs on index-attached settings that are
+            // never saved: re-attach as soon as it can be identified (only queried while one exists).
+            if (g_monitorSettingsPins == 0 && !g_mhcEditDialogOpen.load() &&
+                AnyLiveMonitorUnidentified() && LiveIdentitiesDiffer(g_gui.monitors)) {
+                ReattachMonitorSettings(hwnd, "display now identifiable");
+            }
             // Safety net for the SDR white level: the MonitorDataStore registry watch and the display /
             // setting-change triggers are the prompt paths; this catches a level change none of them saw
             // (cheap when nothing changed: a DisplayConfig query per monitor).
@@ -2889,49 +2999,25 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (newMonitors[i] != g_gui.monitors[i]) { changed = true; break; }
             }
         }
-        if (changed) {
+        // Same handles, different panel (a swap on a connector) or a display that can only now
+        // be identified: settings must re-attach even though the topology looks unchanged.
+        const bool identitiesDiffer = !changed && LiveIdentitiesDiffer(newMonitors);
+        if (changed || identitiesDiffer) {
             std::cout << "Display change: monitor count " << g_gui.monitors.size()
-                      << " -> " << newMonitors.size() << std::endl;
-            g_gui.monitors = newMonitors;
+                      << " -> " << newMonitors.size()
+                      << (identitiesDiffer ? " (same handles, display identity changed)" : "") << std::endl;
+            // List + g_gui.monitors first (under the settings mutex), so the re-attach's
+            // SelectMonitor highlights a row of the new list.
+            SetLiveMonitors(newMonitors);
 
             // Re-attach settings to the new enumeration by display identity: a panel
             // keeps its settings wherever it is enumerated, a departed panel is parked
             // (never dropped), a new panel starts from defaults. Render/whitelist
             // threads bounds-check via monitor index and reinit right after this.
             g_monitorIdentityRetries = 0;
-            ReattachMonitorSettings(hwnd, "display change");
-
-            // Update monitor names and combo box
-            g_gui.monitorNames.clear();
-            SendMessage(g_gui.hwndMonitorList, LB_RESETCONTENT, 0, 0);
-            for (size_t i = 0; i < newMonitors.size(); i++) {
-                MONITORINFO mi = { sizeof(mi) };
-                GetMonitorInfo(newMonitors[i], &mi);
-                int monW = mi.rcMonitor.right - mi.rcMonitor.left;
-                int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
-                bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
-                DisplayInfo dispInfo;
-                std::wstring friendlyName;
-                if (GetDisplayInfoForMonitor((int)i, dispInfo) && !dispInfo.name.empty()) {
-                    friendlyName = dispInfo.name;
-                }
-                wchar_t name[128];
-                if (!friendlyName.empty()) {
-                    swprintf_s(name, L"Monitor %d - %s: %dx%d%s", (int)i, friendlyName.c_str(),
-                        monW, monH, isPrimary ? L" [Primary]" : L"");
-                } else {
-                    swprintf_s(name, L"Monitor %d: %dx%d%s", (int)i,
-                        monW, monH, isPrimary ? L" [Primary]" : L"");
-                }
-                g_gui.monitorNames.push_back(name);
-                SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)name);
-            }
-
-            // Clamp current monitor selection
-            if (g_gui.currentMonitor >= (int)newMonitors.size()) {
-                g_gui.currentMonitor = (int)newMonitors.size() - 1;
-            }
-            if (g_gui.currentMonitor < 0) g_gui.currentMonitor = 0;
+            ReattachMonitorSettings(hwnd, identitiesDiffer ? "display identity change" : "display change");
+            // Deferred (editor open): keep the highlighted row on the display being edited;
+            // the deferred re-attach selects properly once the dialog closes.
             SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, g_gui.currentMonitor, 0);
 
             // Force reinit if processing is running, or restart if it exited

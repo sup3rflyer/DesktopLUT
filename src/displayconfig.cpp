@@ -957,16 +957,13 @@ bool GetDisplayInfoForHMonitor(HMONITOR hMonitor, DisplayInfo& outInfo) {
 bool QueryDisplayIdentity(HMONITOR hMonitor, DisplayIdentity& outIdentity) {
     outIdentity = DisplayIdentity{};
 
+    // Exact GDI-source-name match only. During a modeset the source-name query can fail
+    // transiently; the caller then treats the display as unidentified and retries
+    // (MONITOR_IDENTITY_TIMER_ID, armed at startup too) — a position guess here could
+    // hit the wrong path when two paths share an origin (the clone step of a topology
+    // change) and stamp the wrong identity onto a display's settings.
     DisplayInfo info;
-    if (!GetDisplayInfoForHMonitor(hMonitor, info)) {
-        // The GDI-name match is exact but needs the source-name query to succeed for
-        // this path; during a modeset it can transiently fail. Position matching is
-        // the same correlation GetDisplayInfoForMonitor relies on for ICC association.
-        MONITORINFO mi = { sizeof(mi) };
-        if (!GetMonitorInfo(hMonitor, &mi)) return false;
-        POINT pt = { mi.rcMonitor.left, mi.rcMonitor.top };
-        if (!GetDisplayInfoAtPoint(pt, info) || info.devicePath.empty()) return false;
-    }
+    if (!GetDisplayInfoForHMonitor(hMonitor, info)) return false;
 
     outIdentity.devicePath = info.devicePath;
     outIdentity.friendlyName = info.name;

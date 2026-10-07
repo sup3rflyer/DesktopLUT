@@ -2042,6 +2042,9 @@ void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& er
         }
     }
 
+    // `mon` indexes monitorSettings after EnsureProcessingForPreview's message pumps: a display
+    // change pumped meanwhile must not re-attach the vector underneath (deferred instead).
+    MonitorSettingsPin pin;
     bool livePreview = false, startedForPreview = false, startedOverlayForPreview = false;
     EnsureProcessingForPreview(mon, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
     if (!livePreview) {

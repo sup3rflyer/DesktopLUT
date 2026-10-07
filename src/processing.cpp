@@ -412,12 +412,23 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         ReapplyAllMhcProfiles();
 
         // Auto-generate identity MHC profiles for monitors with DG enabled but no profile
+        // (This is the processing thread: the candidates are read under the settings mutex, and
+        // each is re-checked just before its install in case the GUI re-attached the vector.)
         if (g_userDesktopGammaMode.load()) {
-            for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
-                auto& mhc = g_gui.monitorSettings[i].hdrMHC;
-                if (mhc.desktopGammaEnabled && !mhc.enabled) {
-                    GenerateAndInstallMhcProfile(i, true);
+            std::vector<std::pair<int, int>> needIdentity;   // (index, slot)
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
+                    const auto& mhc = g_gui.monitorSettings[i].hdrMHC;
+                    if (mhc.desktopGammaEnabled && !mhc.enabled) needIdentity.push_back({ i, g_gui.monitorSettings[i].slot });
                 }
+            }
+            for (const auto& [i, slot] : needIdentity) {
+                {
+                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                    if (i >= (int)g_gui.monitorSettings.size() || g_gui.monitorSettings[i].slot != slot) continue;
+                }
+                GenerateAndInstallMhcProfile(i, true);
             }
         }
     }
@@ -1381,12 +1392,24 @@ bool SettingsChanged() {
     // Only check settings that require a full restart (LUT paths).
     // Color corrections (primaries, grayscale, tonemapping, white point) are
     // live-updated via the pending queue and don't need a restart.
-    if (g_gui.monitorSettings.size() != g_gui.activeSettings.size()) {
-        return true;
-    }
+    // Compared per DISPLAY (settings slot), not per index or by count: a display arriving or
+    // leaving is not by itself a change, but a newly attached display with a configured LUT is
+    // (the running pipeline was built without it).
     for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        if (g_gui.monitorSettings[i].sdrPath != g_gui.activeSettings[i].sdrPath ||
-            g_gui.monitorSettings[i].hdrPath != g_gui.activeSettings[i].hdrPath) {
+        const MonitorSettings& ms = g_gui.monitorSettings[i];
+        const MonitorSettings* active = nullptr;
+        if (ms.slot >= 0) {
+            for (const auto& a : g_gui.activeSettings) {
+                if (a.slot == ms.slot) { active = &a; break; }
+            }
+        } else if (i < g_gui.activeSettings.size() && g_gui.activeSettings[i].slot < 0) {
+            active = &g_gui.activeSettings[i];   // unidentified both times: same index
+        }
+        if (!active) {
+            if (!ms.sdrPath.empty() || !ms.hdrPath.empty()) return true;
+            continue;
+        }
+        if (ms.sdrPath != active->sdrPath || ms.hdrPath != active->hdrPath) {
             return true;
         }
     }

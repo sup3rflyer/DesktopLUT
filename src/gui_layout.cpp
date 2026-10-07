@@ -11,6 +11,7 @@
 #include "color.h"
 #include "osd.h"
 #include "displayconfig.h"
+#include <iostream>
 #include "mhc.h"
 #include "dwm_inject.h"
 #include "analysis.h"
@@ -1072,43 +1073,24 @@ void CreateGUILayout(HWND hwnd) {
     // Populate monitor list
     std::vector<HMONITOR> monitors;
     EnumDisplayMonitors(nullptr, nullptr, GUIMonitorEnumProc, reinterpret_cast<LPARAM>(&monitors));
-    g_gui.monitors = monitors;
 
-    // Reserve stable storage up front. The WM_DISPLAYCHANGE handler only ever GROWS
-    // monitorSettings (never shrinks), so reserving well beyond any real display count
-    // guarantees those later resize() calls never reallocate — which lets the MHC and
-    // grayscale editor dialogs safely hold an MHCSettings& across their modal message
-    // loop (a hot-plug pumped mid-dialog would otherwise dangle the reference).
+    // Reserve stable storage up front. The settings re-attach (ResolveMonitorSettings)
+    // rebuilds monitorSettings element-wise inside this capacity and never runs while a
+    // handler holds a reference into it (MonitorSettingsPin / g_mhcEditDialogOpen defer it),
+    // so the vector's buffer never moves under the MHC and grayscale editor dialogs.
     g_gui.monitorSettings.reserve(64);
 
-    for (size_t i = 0; i < monitors.size(); i++) {
-        MONITORINFO mi = { sizeof(mi) };
-        GetMonitorInfo(monitors[i], &mi);
-        int monW = mi.rcMonitor.right - mi.rcMonitor.left;
-        int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
-        bool isPrimary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
-        // Query friendly display name (e.g. "PA32UCXR") from Windows display config
-        DisplayInfo dispInfo;
-        std::wstring friendlyName;
-        if (GetDisplayInfoForMonitor((int)i, dispInfo) && !dispInfo.name.empty()) {
-            friendlyName = dispInfo.name;
-        }
-        wchar_t name[128];
-        if (!friendlyName.empty()) {
-            swprintf_s(name, L"Monitor %d - %s: %dx%d%s", (int)i, friendlyName.c_str(),
-                monW, monH, isPrimary ? L" [Primary]" : L"");
-        } else {
-            swprintf_s(name, L"Monitor %d: %dx%d%s", (int)i,
-                monW, monH, isPrimary ? L" [Primary]" : L"");
-        }
-        SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)name);
-        g_gui.monitorNames.push_back(name);
-    }
+    SetLiveMonitors(monitors);
 
     // Load saved settings from INI. Per-monitor settings are keyed by display identity:
     // LoadSettings reads every saved display and attaches each live monitor's entry
     // (g_gui.monitorSettings, one per g_gui.monitors) by device path / EDID.
-    LoadSettings();
+    // A display whose identity query fails at logon (mid-modeset) would otherwise run the
+    // whole session on default settings: retry until it can be identified.
+    if (!LoadSettings()) {
+        std::cout << "[Monitor identity] a display could not be identified at startup; retrying" << std::endl;
+        SetTimer(hwnd, MONITOR_IDENTITY_TIMER_ID, MONITOR_IDENTITY_RETRY_MS, nullptr);
+    }
 
     // First run on an INI written in the old index-keyed format: persist the migration
     // right away so the identity sections exist on disk before anything else happens.
@@ -1144,15 +1126,7 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndSettingsCalibration, BM_SETCHECK,
         g_calibrationControlEnabled.load() ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    if (!monitors.empty()) {
-        SendMessage(g_gui.hwndMonitorList, LB_SETCURSEL, 0, 0);
-        g_gui.currentMonitor = 0;
-        // Update UI with monitor 0's settings
-        SetPathText(g_gui.hwndSdrPath, g_gui.monitorSettings[0].sdrPath.c_str());
-        SetPathText(g_gui.hwndHdrPath, g_gui.monitorSettings[0].hdrPath.c_str());
-        // Load color correction controls for initial monitor
-        UpdateColorCorrectionControls();
-    }
+    if (!monitors.empty()) SelectMonitor(0);
 
     // Add tray icon
     AddTrayIcon(hwnd);

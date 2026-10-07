@@ -41,7 +41,14 @@ float GetPrivateProfileFloat(const wchar_t* section, const wchar_t* key, float d
     wchar_t buf[32] = {};
     GetPrivateProfileStringW(section, key, L"", buf, 32, file);
     if (buf[0] == L'\0') return def;
-    return (float)_wcstod_l(buf, nullptr, GetCLocale());
+    // The whole value must be a finite number: a hand-edited "abc" used to parse as 0 (then
+    // clamped to a nonsense-but-in-range value and applied, e.g. a 10-nit MaxTML override).
+    wchar_t* end = nullptr;
+    double v = _wcstod_l(buf, &end, GetCLocale());
+    if (end == buf) return def;
+    while (*end == L' ' || *end == L'\t') end++;
+    if (*end != L'\0' || !std::isfinite(v) || std::fabs(v) > 3.0e38) return def;
+    return (float)v;
 }
 
 void WritePrivateProfileBool(const wchar_t* section, const wchar_t* key, bool value, const wchar_t* file) {
@@ -704,16 +711,32 @@ static std::vector<std::wstring> ListIniSections(const wchar_t* iniPath) {
     return names;
 }
 
+std::wstring TodayIsoDate() {
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    wchar_t buf[16];
+    swprintf_s(buf, L"%04u-%02u-%02u", (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay);
+    return buf;
+}
+
 std::vector<int> EnumerateSavedSectionIndices(const wchar_t* prefix, const wchar_t* iniPath) {
     std::vector<int> out;
     const std::wstring pre(prefix);
     for (const std::wstring& name : ListIniSections(iniPath)) {
-        // Exact form "<prefix><digits>" — no sign, no whitespace, no other suffix.
-        if (name.size() <= pre.size() || name.compare(0, pre.size(), pre) != 0) continue;
+        // Form "<prefix><digits>" — no sign, no whitespace, no other suffix. The prefix compare
+        // is case-insensitive like the profile API itself: "[display3]" receives every write
+        // addressed to "Display3", so it must also be loaded as slot 3.
+        if (name.size() <= pre.size() || _wcsnicmp(name.c_str(), pre.c_str(), pre.size()) != 0) continue;
         std::wstring digits = name.substr(pre.size());
         bool allDigits = true;
         for (wchar_t c : digits) if (c < L'0' || c > L'9') { allDigits = false; break; }
         if (!allDigits || digits.size() > 6) continue;
+        if (digits.size() > 1 && digits[0] == L'0') {
+            // "Display007" is not the section the canonical name "Display7" addresses, so it
+            // could be listed but never read back; leave the hand-edited section alone.
+            std::wcout << L"Settings: ignoring non-canonical INI section [" << name << L"]" << std::endl;
+            continue;
+        }
         int idx = (int)wcstoul(digits.c_str(), nullptr, 10);
         if (idx >= (int)kMaxSavedMonitorSections) {
             std::wcout << L"Settings: ignoring out-of-range INI section [" << name << L"]" << std::endl;
@@ -771,16 +794,21 @@ void SaveMonitorSettings(const wchar_t* section, const MonitorSettings& ms, cons
     SaveMHCSettings(section, L"HDR_", ms.hdrMHC, iniPath);
 }
 
-static void LoadIdentityKeys(const wchar_t* section, DisplayIdentity& id, const wchar_t* iniPath) {
-    id.devicePath   = ReadLongINIString(section, L"DevicePath", iniPath);
-    id.edidId       = ReadLongINIString(section, L"EdidId", iniPath);
-    id.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
+static void LoadIdentityKeys(const wchar_t* section, MonitorSettings& ms, const wchar_t* iniPath) {
+    ms.identity.devicePath   = ReadLongINIString(section, L"DevicePath", iniPath);
+    ms.identity.edidId       = ReadLongINIString(section, L"EdidId", iniPath);
+    ms.identity.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
+    ms.firstSeen             = ReadLongINIString(section, L"FirstSeen", iniPath);
+    ms.lastSeen              = ReadLongINIString(section, L"LastSeen", iniPath);
 }
 
-static void SaveIdentityKeys(const wchar_t* section, const DisplayIdentity& id, const wchar_t* iniPath) {
-    WritePrivateProfileStringW(section, L"DevicePath", id.devicePath.c_str(), iniPath);
-    WritePrivateProfileStringW(section, L"EdidId", id.edidId.c_str(), iniPath);
-    WritePrivateProfileStringW(section, L"DisplayName", id.friendlyName.c_str(), iniPath);
+static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
+    if (!ms.firstSeen.empty()) WritePrivateProfileStringW(section, L"FirstSeen", ms.firstSeen.c_str(), iniPath);
+    if (!ms.lastSeen.empty())  WritePrivateProfileStringW(section, L"LastSeen", ms.lastSeen.c_str(), iniPath);
+    WritePrivateProfileStringW(section, L"DisplayName", ms.identity.friendlyName.c_str(), iniPath);
+    WritePrivateProfileStringW(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
+    // Written last of all the section's keys: a section with a DevicePath is a complete one.
+    WritePrivateProfileStringW(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
 }
 
 void LoadMonitorSettingsPool(std::vector<MonitorSettings>& pool, const wchar_t* iniPath) {
@@ -791,58 +819,66 @@ void LoadMonitorSettingsPool(std::vector<MonitorSettings>& pool, const wchar_t* 
         MonitorSettings ms;
         std::wstring section = SectionName(kDisplaySectionPrefix, slot);
         LoadMonitorSettings(section.c_str(), ms, iniPath);
-        LoadIdentityKeys(section.c_str(), ms.identity, iniPath);
+        LoadIdentityKeys(section.c_str(), ms, iniPath);
         ms.slot = slot;
         if (ms.identity.empty()) {
-            // Hand-edited or truncated: nothing can ever match it, but never discard
-            // a user's settings silently — it is kept parked and re-saved as is.
-            std::wcout << L"Settings: [" << section << L"] has no display identity" << std::endl;
+            // Hand-edited, or a save cut short before its identity keys (written last): nothing
+            // can ever match it, but it is the user's data — it stays parked with its slot
+            // reserved, and the section on disk is left as is.
+            std::wcout << L"Settings: [" << section << L"] has no display identity (kept, unmatched)" << std::endl;
         }
         pool.push_back(std::move(ms));
     }
 
     // Pre-identity sections: adopted by enumeration index the first time a display
-    // shows up at that index, then retired by SaveSettings. Sections whose display is
-    // not connected right now stay untouched until it is.
+    // shows up at that index, then marked Migrated=Display<slot> by SaveSettings (kept on
+    // disk as the user's copy, never adopted again). Sections whose display is not
+    // connected right now stay untouched until it is.
     for (int n : EnumerateSavedSectionIndices(kLegacySectionPrefix, iniPath)) {
-        MonitorSettings ms;
         std::wstring section = SectionName(kLegacySectionPrefix, n);
+        if (!ReadLongINIString(section.c_str(), L"Migrated", iniPath).empty()) continue;
+        MonitorSettings ms;
         LoadMonitorSettings(section.c_str(), ms, iniPath);
         ms.legacyIndex = n;
         pool.push_back(std::move(ms));
     }
 }
 
-// Write every known display (live + parked). Returns the number of sections written.
-static int SaveMonitorSettingsPool(std::vector<MonitorSettings>& live,
-                                   std::vector<MonitorSettings>& parked,
-                                   const wchar_t* iniPath) {
-    int written = 0;
-    auto saveOne = [&](MonitorSettings& ms) {
+// Write every known display (live + parked). Payload first, identity keys last (the commit
+// marker), then — for an entry just adopted from a legacy [Monitor<N>] section — the
+// Migrated= mark on that section. Returns the slots whose legacy claim was retired, so the
+// caller can clear legacyIndex on the in-memory entries.
+static std::vector<int> SaveMonitorSettingsPool(const std::vector<MonitorSettings>& live,
+                                                const std::vector<MonitorSettings>& parked,
+                                                const wchar_t* iniPath) {
+    std::vector<int> migratedSlots;
+    auto saveOne = [&](const MonitorSettings& ms) {
         if (ms.identity.empty() || ms.slot < 0) {
             // Unclaimed legacy entry: its [Monitor<N>] section is still on disk, untouched.
+            // Identity-less [Display<slot>] from disk: left exactly as it is.
             // Anonymous live entry (identity query never succeeded): nothing to key it by.
-            if (ms.legacyIndex < 0) {
+            if (ms.legacyIndex < 0 && ms.slot < 0) {
                 std::wcout << L"Settings: skipping an unidentified display's settings (not persisted)"
                            << std::endl;
             }
             return;
         }
         std::wstring section = SectionName(kDisplaySectionPrefix, ms.slot);
-        SaveIdentityKeys(section.c_str(), ms.identity, iniPath);
         SaveMonitorSettings(section.c_str(), ms, iniPath);
-        written++;
+        SaveIdentityKeys(section.c_str(), ms, iniPath);
         if (ms.legacyIndex >= 0) {
-            // Migrated: retire the pre-identity section so it can never be adopted twice.
+            // Migrated: mark (never delete) the pre-identity section so it is not adopted
+            // twice, and the user's original copy survives a mis-adoption (another panel on
+            // the old display's connector).
             std::wstring legacy = SectionName(kLegacySectionPrefix, ms.legacyIndex);
-            WritePrivateProfileStringW(legacy.c_str(), nullptr, nullptr, iniPath);
+            WritePrivateProfileStringW(legacy.c_str(), L"Migrated", section.c_str(), iniPath);
             std::wcout << L"Settings: migrated [" << legacy << L"] -> [" << section << L"]" << std::endl;
-            ms.legacyIndex = -1;
+            migratedSlots.push_back(ms.slot);
         }
     };
-    for (auto& ms : live) saveOne(ms);
-    for (auto& ms : parked) saveOne(ms);
-    return written;
+    for (const auto& ms : live) saveOne(ms);
+    for (const auto& ms : parked) saveOne(ms);
+    return migratedSlots;
 }
 
 void SaveSettings() {
@@ -885,12 +921,39 @@ void SaveSettings() {
     // Save startup settings
     WritePrivateProfileBool(L"General", L"StartMinimized", g_startMinimized.load(), iniPath.c_str());
 
+    WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
+
     // Save per-display settings: live displays and parked (currently disconnected) ones,
-    // each under its identity-keyed [Display<slot>] section.
-    SaveMonitorSettingsPool(g_gui.monitorSettings, g_gui.parkedSettings, iniPath.c_str());
+    // each under its identity-keyed [Display<slot>] section. Written from a snapshot taken
+    // under g_monitorSettingsMutex: other threads assign profileName/activePerm (heap
+    // strings) under it, and the INI writes are far too slow to hold the lock across.
+    std::vector<MonitorSettings> live, parked;
+    {
+        const std::wstring today = TodayIsoDate();
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        for (auto& ms : g_gui.monitorSettings) {
+            if (!ms.identity.empty()) ms.lastSeen = today;   // connected right now
+        }
+        live = g_gui.monitorSettings;
+        parked = g_gui.parkedSettings;
+    }
+    std::vector<int> migratedSlots = SaveMonitorSettingsPool(live, parked, iniPath.c_str());
+    if (!migratedSlots.empty()) {
+        // The legacy claim is retired on disk: clear it on the entries that made it (by slot,
+        // since the vectors may have been re-attached meanwhile).
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        for (auto* vec : { &g_gui.monitorSettings, &g_gui.parkedSettings }) {
+            for (auto& ms : *vec) {
+                if (ms.legacyIndex >= 0 &&
+                    std::find(migratedSlots.begin(), migratedSlots.end(), ms.slot) != migratedSlots.end()) {
+                    ms.legacyIndex = -1;
+                }
+            }
+        }
+    }
 }
 
-void LoadSettings() {
+bool LoadSettings() {
     std::wstring iniPath = GetIniPath();
 
     // Load general settings
@@ -941,17 +1004,22 @@ void LoadSettings() {
     LoadMonitorSettingsPool(pool, iniPath.c_str());
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        g_gui.monitorSettings.clear();
         g_gui.parkedSettings = std::move(pool);
     }
-    ResolveMonitorSettings(g_gui.monitors);
+    const bool allIdentified = ResolveMonitorSettings(g_gui.monitors).allIdentified;
 
     // Derive desktop gamma global from the live monitors' MHC settings.
     // DG is user intent — if desktopGammaEnabled is set, flag it active.
     // Processing init will auto-generate an identity MHC profile if needed.
     bool anyDG = false;
-    for (const auto& ms : g_gui.monitorSettings)
-        if (ms.hdrMHC.desktopGammaEnabled) { anyDG = true; break; }
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        for (const auto& ms : g_gui.monitorSettings)
+            if (ms.hdrMHC.desktopGammaEnabled) { anyDG = true; break; }
+    }
     g_userDesktopGammaMode.store(anyDG);
     g_desktopGammaMode.store(anyDG);
+    return allIdentified;
 }
 

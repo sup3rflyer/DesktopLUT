@@ -244,9 +244,143 @@ TEST_CASE("Identity: twin panels prefer the entry that sat at the same index") {
     CHECK(r.live[1].sdrPath == L"b.cube");
 }
 
-TEST_CASE("Identity: new slots continue past the highest parked slot") {
-    std::vector<MonitorSettings> parked = { Known(kLg, 5, L"lg.cube") };
+TEST_CASE("Identity: a new display takes the lowest free slot; held slots are never reused") {
+    std::vector<MonitorSettings> parked = { Known(kLg, 0, L"lg.cube"), Known(kBenq, 2, L"benq.cube") };
     auto r = MatchMonitorSettings({ Live(kAsus) }, {}, parked);
     REQUIRE(r.live.size() == 1);
-    CHECK(r.live[0].slot == 6);
+    CHECK(r.live[0].slot == 1);   // the gap — 0 and 2 belong to parked displays
+    REQUIRE(r.parked.size() == 2);
+    CHECK(r.parked[0].slot == 0);
+    CHECK(r.parked[1].slot == 2);
+}
+
+TEST_CASE("Identity: duplicate slots are repaired, the later entry moves to a free slot") {
+    std::vector<MonitorSettings> prev = { Known(kAsus, 3, L"asus.cube") };
+    std::vector<MonitorSettings> parked = { Known(kLg, 3, L"lg.cube") };
+    auto r = MatchMonitorSettings({ Live(kAsus) }, prev, parked);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].slot == 3);
+    REQUIRE(r.parked.size() == 1);
+    CHECK(r.parked[0].sdrPath == L"lg.cube");
+    CHECK(r.parked[0].slot == 0);
+    CHECK(r.parked[0].slot != r.live[0].slot);
+}
+
+TEST_CASE("Identity: an identity-less [Display] entry parks and keeps its slot reserved") {
+    MonitorSettings orphan;          // hand-edited / cut-short section: slot from disk, no identity
+    orphan.slot = 0;
+    orphan.sdrPath = L"orphan.cube";
+    auto r = MatchMonitorSettings({ Live(kAsus) }, {}, { orphan });
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath.empty());     // nothing matched it
+    CHECK(r.live[0].slot == 1);           // and its slot was not handed out
+    REQUIRE(r.parked.size() == 1);
+    CHECK(r.parked[0].sdrPath == L"orphan.cube");
+    CHECK(r.parked[0].slot == 0);
+}
+
+TEST_CASE("Identity: same connector, same model, different unit (serial) gets fresh defaults") {
+    // The device path's instance segment is connector-scoped: a replacement panel of the same
+    // model on the same connector has the same path. Its serial differs, so it must not inherit
+    // the old unit's per-unit calibration.
+    DisplayIdentity replacement = kAsus;
+    replacement.edidId = L"AUS322A-S4LMSB009999";
+    std::vector<MonitorSettings> prev = { Known(kAsus, 0, L"asus.cube") };
+    auto r = MatchMonitorSettings({ Live(replacement) }, prev, {});
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath.empty());
+    CHECK(r.live[0].identity.edidId == L"AUS322A-S4LMSB009999");
+    CHECK(r.live[0].slot == 1);
+    REQUIRE(r.parked.size() == 1);
+    CHECK(r.parked[0].sdrPath == L"asus.cube");
+    CHECK(r.parked[0].identity.edidId == L"AUS322A-S4LMSB007317");
+}
+
+TEST_CASE("Identity: a serial-less read of the same panel matches and never downgrades the stored id") {
+    DisplayIdentity noSerial = kAsus;
+    noSerial.edidId = L"AUS322A";     // EDID/SetupAPI read failed transiently
+    std::vector<MonitorSettings> parked = { Known(kAsus, 0, L"asus.cube") };
+    auto r = MatchMonitorSettings({ Live(noSerial) }, {}, parked);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath == L"asus.cube");
+    CHECK(r.live[0].identity.edidId == L"AUS322A-S4LMSB007317");   // kept, not downgraded
+    CHECK(r.parked.empty());
+}
+
+TEST_CASE("Identity: a stored serial-less id is upgraded when the serial reads") {
+    DisplayIdentity storedBare = kAsus;
+    storedBare.edidId = L"AUS322A";
+    std::vector<MonitorSettings> parked = { Known(storedBare, 0, L"asus.cube") };
+    auto r = MatchMonitorSettings({ Live(kAsus) }, {}, parked);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath == L"asus.cube");
+    CHECK(r.live[0].identity.edidId == L"AUS322A-S4LMSB007317");
+}
+
+TEST_CASE("Identity: moved connector + serial-less read still finds the panel by EDID hardware id") {
+    DisplayIdentity movedBare = kLg;
+    movedBare.devicePath = L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4355#{guid}";
+    movedBare.edidId = L"GSM84CD";
+    std::vector<MonitorSettings> parked = { Known(kLg, 1, L"lg.cube") };
+    auto r = MatchMonitorSettings({ Live(movedBare) }, {}, parked);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath == L"lg.cube");
+    CHECK(r.live[0].identity.devicePath == movedBare.devicePath);
+    CHECK(r.live[0].identity.edidId == L"GSM84CD-16843009");
+}
+
+TEST_CASE("Identity: an exact EDID match wins over a serial-less compatible one") {
+    DisplayIdentity twinBare = Id(L"\\\\?\\DISPLAY#DELA1EE#5&1&0&UID1#{g}", L"DELA1EE", L"U2723QE");
+    DisplayIdentity twinSn   = Id(L"\\\\?\\DISPLAY#DELA1EE#5&1&0&UID2#{g}", L"DELA1EE-SN2", L"U2723QE");
+    std::vector<MonitorSettings> parked = { Known(twinBare, 0, L"bare.cube"), Known(twinSn, 1, L"sn2.cube") };
+    DisplayIdentity moved = twinSn;
+    moved.devicePath = L"\\\\?\\DISPLAY#DELA1EE#5&1&0&UID9#{g}";
+    auto r = MatchMonitorSettings({ Live(moved) }, {}, parked);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath == L"sn2.cube");
+}
+
+TEST_CASE("Identity: EdidIdsCompatible") {
+    CHECK(EdidIdsCompatible(L"", L"AUS322A-X"));
+    CHECK(EdidIdsCompatible(L"AUS322A-X", L""));
+    CHECK(EdidIdsCompatible(L"AUS322A-X", L"aus322a-x"));
+    CHECK(EdidIdsCompatible(L"AUS322A", L"AUS322A-X"));
+    CHECK(EdidIdsCompatible(L"AUS322A-X", L"AUS322A"));
+    CHECK(EdidIdsCompatible(L"AUS322A", L"AUS322A"));
+    CHECK_FALSE(EdidIdsCompatible(L"AUS322A-X", L"AUS322A-Y"));
+    CHECK_FALSE(EdidIdsCompatible(L"AUS322A", L"GSM84CD"));
+    CHECK_FALSE(EdidIdsCompatible(L"AUS322A", L"GSM84CD-1"));
+    CHECK(EdidHardwarePart(L"GSM84CD-16843009") == L"GSM84CD");
+    CHECK(EdidHardwarePart(L"GSM84CD") == L"GSM84CD");
+}
+
+TEST_CASE("Identity: FirstSeen is stamped once, LastSeen on every attach; nothing without a date") {
+    MonitorSettings seen = Known(kAsus, 0, L"asus.cube");
+    seen.firstSeen = L"2026-09-14";
+    seen.lastSeen = L"2026-09-20";
+    auto r = MatchMonitorSettings({ Live(kAsus), Live(kLg) }, {}, { seen }, L"2026-10-07");
+    REQUIRE(r.live.size() == 2);
+    CHECK(r.live[0].firstSeen == L"2026-09-14");
+    CHECK(r.live[0].lastSeen == L"2026-10-07");
+    CHECK(r.live[1].firstSeen == L"2026-10-07");   // new display
+    CHECK(r.live[1].lastSeen == L"2026-10-07");
+
+    auto r2 = MatchMonitorSettings({ Live(kAsus) }, {}, { seen });
+    CHECK(r2.live[0].lastSeen == L"2026-09-20");    // pure call without a date: untouched
+}
+
+TEST_CASE("Identity: LiveSettingsAttachmentChanged") {
+    std::vector<MonitorSettings> a = { Known(kAsus, 0, L"asus.cube"), Known(kLg, 1, L"lg.cube") };
+    CHECK_FALSE(LiveSettingsAttachmentChanged(a, a));
+    auto b = a;
+    b[1].sdrPath = L"other.cube";                    // a settings edit is not an attachment change
+    CHECK_FALSE(LiveSettingsAttachmentChanged(a, b));
+    auto c = a;
+    std::swap(c[0], c[1]);                           // order flip
+    CHECK(LiveSettingsAttachmentChanged(a, c));
+    std::vector<MonitorSettings> d = { a[0] };       // departure
+    CHECK(LiveSettingsAttachmentChanged(a, d));
+    auto e = a;
+    e[1].identity.devicePath = L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4355#{guid}";   // connector move
+    CHECK(LiveSettingsAttachmentChanged(a, e));
 }

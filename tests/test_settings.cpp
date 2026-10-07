@@ -5,6 +5,7 @@
 #include "fald.h"    // FALD_TAU_MAX_MS
 #include <cstdio>
 #include <cmath>
+#include <cwctype>
 #include <string>
 
 // Helper to create a temp INI file and clean up
@@ -542,6 +543,32 @@ TEST_CASE("Float: default returned for missing key") {
     CHECK(result == doctest::Approx(42.0f).epsilon(0.001));
 }
 
+TEST_CASE("Float: a value that is not entirely a finite number returns the default") {
+    // A hand-edited "abc" used to parse as 0 and then be clamped into range and applied
+    // (MaxTmlPeak=abc -> a 10-nit display peak override).
+    TempIni ini;
+    const wchar_t* bad[] = { L"abc", L"12abc", L"inf", L"-inf", L"nan", L"1e400", L"--5", L"." };
+    for (const wchar_t* v : bad) {
+        WritePrivateProfileStringW(L"F", L"k", v, ini.c_str());
+        CHECK(GetPrivateProfileFloat(L"F", L"k", 42.0f, ini.c_str()) == 42.0f);
+    }
+    WritePrivateProfileStringW(L"F", L"k", L"1000\t ", ini.c_str());   // trailing whitespace is fine
+    CHECK(GetPrivateProfileFloat(L"F", L"k", 42.0f, ini.c_str()) == 1000.0f);
+    WritePrivateProfileStringW(L"F", L"k", L"-0.25", ini.c_str());
+    CHECK(GetPrivateProfileFloat(L"F", L"k", 42.0f, ini.c_str()) == -0.25f);
+    WritePrivateProfileStringW(L"F", L"k", L"1e3", ini.c_str());
+    CHECK(GetPrivateProfileFloat(L"F", L"k", 42.0f, ini.c_str()) == 1000.0f);
+}
+
+TEST_CASE("Monitor settings: a non-numeric MaxTmlPeak loads the default, not 10 nits") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display0", L"MaxTmlEnabled", L"true", ini.c_str());
+    WritePrivateProfileStringW(L"Display0", L"MaxTmlPeak", L"abc", ini.c_str());
+    MonitorSettings ms;
+    LoadMonitorSettings(L"Display0", ms, ini.c_str());
+    CHECK(ms.maxTml.peakNits == 1000.0f);
+}
+
 // ============================================================================
 // Tonemap Case-Insensitive Parsing
 // ============================================================================
@@ -723,11 +750,28 @@ TEST_CASE("Sections: only exact <prefix><digits> names count") {
     WritePrivateProfileStringW(L"Monitor 7", L"LUT_SDR", L"", ini.c_str());
     WritePrivateProfileStringW(L"Monitor-1", L"LUT_SDR", L"", ini.c_str());
     WritePrivateProfileStringW(L"Monitor2b", L"LUT_SDR", L"", ini.c_str());
-    WritePrivateProfileStringW(L"monitor5", L"LUT_SDR", L"", ini.c_str());  // case-sensitive
+    WritePrivateProfileStringW(L"Monitor006", L"LUT_SDR", L"", ini.c_str());  // not the canonical "Monitor6"
     WritePrivateProfileStringW(L"Display1", L"LUT_SDR", L"", ini.c_str());  // other prefix
     auto legacy = EnumerateSavedSectionIndices(kLegacySectionPrefix, ini.c_str());
     REQUIRE(legacy.size() == 1);
     CHECK(legacy[0] == 0);
+}
+
+TEST_CASE("Sections: the prefix is matched case-insensitively, like the profile API") {
+    // "[display3]" receives every write addressed to "Display3" (the API is case-insensitive),
+    // so it must also be listed — and read back — as slot 3.
+    TempIni ini;
+    WritePrivateProfileStringW(L"display3", L"LUT_SDR", L"C:\\luts\\lower.cube", ini.c_str());
+    WritePrivateProfileStringW(L"monitor5", L"LUT_SDR", L"", ini.c_str());
+    auto display = EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini.c_str());
+    REQUIRE(display.size() == 1);
+    CHECK(display[0] == 3);
+    auto legacy = EnumerateSavedSectionIndices(kLegacySectionPrefix, ini.c_str());
+    REQUIRE(legacy.size() == 1);
+    CHECK(legacy[0] == 5);
+    MonitorSettings ms;
+    LoadMonitorSettings(L"Display3", ms, ini.c_str());
+    CHECK(ms.sdrPath == L"C:\\luts\\lower.cube");
 }
 
 TEST_CASE("Sections: out-of-range index is ignored, not clamped") {
@@ -919,9 +963,20 @@ TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sectio
     auto display = EnumerateSavedSectionIndices(kDisplaySectionPrefix, ini);
     REQUIRE(display.size() == 1);
     CHECK(display[0] == 0);
+    // [Monitor0] is kept on disk (the user's original copy) but marked; [Monitor1] still waits.
     auto legacy = EnumerateSavedSectionIndices(kLegacySectionPrefix, ini);
-    REQUIRE(legacy.size() == 1);
-    CHECK(legacy[0] == 1);   // [Monitor0] retired, [Monitor1] still waiting for the LG
+    REQUIRE(legacy.size() == 2);
+    {
+        wchar_t mark[64] = {};
+        GetPrivateProfileStringW(L"Monitor0", L"Migrated", L"", mark, 64, ini);
+        CHECK(std::wstring(mark) == L"Display0");
+        GetPrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"", mark, 64, ini);
+        CHECK(std::wstring(mark) == L"C:\\luts\\asus.cube");
+        GetPrivateProfileStringW(L"Monitor1", L"Migrated", L"", mark, 64, ini);
+        CHECK(std::wstring(mark).empty());
+        GetPrivateProfileStringW(L"General", L"IniVersion", L"", mark, 64, ini);
+        CHECK(std::wstring(mark) == L"2");
+    }
     CHECK(g_gui.monitorSettings[0].legacyIndex == -1);
 
     wchar_t buf[512] = {};
@@ -932,7 +987,8 @@ TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sectio
     GetPrivateProfileStringW(L"Display0", L"LUT_SDR", L"", buf, 512, ini);
     CHECK(std::wstring(buf) == L"C:\\luts\\asus.cube");
 
-    // Reload from disk: the identity section and the unclaimed legacy one both come back.
+    // Reload from disk: the identity section and the unclaimed legacy one both come back; the
+    // marked [Monitor0] is skipped (never adopted twice).
     g_gui.monitors.clear();
     g_gui.monitorSettings.clear();
     g_gui.parkedSettings.clear();
@@ -978,6 +1034,99 @@ TEST_CASE("SaveSettings: parked displays are written, anonymous entries are not"
     wchar_t buf[64] = {};
     GetPrivateProfileStringW(L"Display4", L"HDR_MHCWhiteBalanceEnabled", L"", buf, 64, ini);
     CHECK(std::wstring(buf) == L"true");
+
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+}
+
+TEST_CASE("Pool: a legacy section marked Migrated is never loaded (adopted twice)") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\old.cube", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor0", L"Migrated", L"Display2", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor1", L"LUT_SDR", L"C:\\luts\\lg.cube", ini.c_str());
+    std::vector<MonitorSettings> pool;
+    LoadMonitorSettingsPool(pool, ini.c_str());
+    REQUIRE(pool.size() == 1);
+    CHECK(pool[0].legacyIndex == 1);
+    CHECK(pool[0].sdrPath == L"C:\\luts\\lg.cube");
+}
+
+TEST_CASE("Pool: a [Display] section cut short before its identity keys does not shadow the legacy one") {
+    // The identity keys are the commit marker (written last). A save that died after the payload
+    // leaves an identity-less [Display0]: it must not match anything, must keep its slot number,
+    // and the untouched legacy section must still be adopted.
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display0", L"LUT_SDR", L"C:\\luts\\asus.cube", ini.c_str());
+    WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\asus.cube", ini.c_str());
+    std::vector<MonitorSettings> pool;
+    LoadMonitorSettingsPool(pool, ini.c_str());
+    REQUIRE(pool.size() == 2);
+
+    LiveDisplay asus;
+    asus.hmon = (HMONITOR)1;
+    asus.identity.devicePath = L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{guid}";
+    asus.identity.edidId = L"AUS322A-S4LMSB007317";
+    asus.identified = true;
+    MonitorMatchResult r = MatchMonitorSettings({ asus }, {}, pool);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].legacyIndex == 0);            // adopted the legacy section
+    CHECK(r.live[0].sdrPath == L"C:\\luts\\asus.cube");
+    CHECK(r.live[0].slot == 1);                   // slot 0 still belongs to the orphan section
+    REQUIRE(r.parked.size() == 1);
+    CHECK(r.parked[0].slot == 0);
+    CHECK(r.parked[0].identity.empty());
+}
+
+TEST_CASE("Pool: FirstSeen / LastSeen load with the identity keys") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display5", L"DevicePath", L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}", ini.c_str());
+    WritePrivateProfileStringW(L"Display5", L"EdidId", L"GSM84CD-16843009", ini.c_str());
+    WritePrivateProfileStringW(L"Display5", L"FirstSeen", L"2026-09-14", ini.c_str());
+    WritePrivateProfileStringW(L"Display5", L"LastSeen", L"2026-10-01", ini.c_str());
+    std::vector<MonitorSettings> pool;
+    LoadMonitorSettingsPool(pool, ini.c_str());
+    REQUIRE(pool.size() == 1);
+    CHECK(pool[0].firstSeen == L"2026-09-14");
+    CHECK(pool[0].lastSeen == L"2026-10-01");
+}
+
+TEST_CASE("TodayIsoDate: YYYY-MM-DD") {
+    std::wstring d = TodayIsoDate();
+    REQUIRE(d.size() == 10);
+    CHECK(d[4] == L'-');
+    CHECK(d[7] == L'-');
+    for (int i : { 0, 1, 2, 3, 5, 6, 8, 9 }) CHECK(iswdigit(d[i]));
+}
+
+TEST_CASE("SaveSettings: live displays are stamped LastSeen today, parked ones keep their date") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+
+    MonitorSettings live;
+    live.identity = AsusId();
+    live.slot = 0;
+    live.firstSeen = L"2026-09-14";
+    live.lastSeen = L"2026-09-20";
+    MonitorSettings parked;
+    parked.identity.devicePath = L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}";
+    parked.identity.edidId = L"GSM84CD-16843009";
+    parked.slot = 1;
+    parked.lastSeen = L"2026-09-30";
+
+    g_gui.monitors.clear();
+    g_gui.monitorSettings = { live };
+    g_gui.parkedSettings = { parked };
+    SaveSettings();
+
+    wchar_t buf[64] = {};
+    GetPrivateProfileStringW(L"Display0", L"LastSeen", L"", buf, 64, ini);
+    CHECK(std::wstring(buf) == TodayIsoDate());
+    GetPrivateProfileStringW(L"Display0", L"FirstSeen", L"", buf, 64, ini);
+    CHECK(std::wstring(buf) == L"2026-09-14");
+    GetPrivateProfileStringW(L"Display1", L"LastSeen", L"", buf, 64, ini);
+    CHECK(std::wstring(buf) == L"2026-09-30");
+    CHECK(g_gui.monitorSettings[0].lastSeen == TodayIsoDate());
 
     g_gui.monitorSettings.clear();
     g_gui.parkedSettings.clear();

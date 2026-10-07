@@ -17,19 +17,30 @@ Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurabl
 
 Settings saved to `DesktopLUT.ini` next to executable.
 
+**Comments must be on their own line.** The Windows INI API keeps everything after `=` as the value, so `EdidId=AUS322A-S4LMSB007317 ; comment` stores the comment too — that identity then never matches and the display is treated as new. The example below keeps every comment on its own line for that reason.
+
 **Note**: Primaries, grayscale, white balance, and desktop gamma are per-monitor in the MHC sections. The Corrections section only persists tonemapping. `DesktopGamma` is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
 
 ```ini
 [General]
-TetrahedralInterp=0    ; 0 = trilinear (default), 1 = tetrahedral (higher quality)
-ConsoleLog=0           ; 1 = show console window in GUI mode (requires restart)
-ShowFrameTiming=0      ; 1 = show frame timing stats in analysis overlay (developer debug)
-DwmHookMode=1          ; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis)
-GammaWhitelist=mpv.exe,mpvnet.exe  ; Auto-disable desktop gamma when these apps run
+; written by the app: 2 = identity-keyed [Display<slot>] sections
+IniVersion=2
+; 0 = trilinear (default), 1 = tetrahedral (higher quality)
+TetrahedralInterp=0
+; 1 = show console window in GUI mode (requires restart)
+ConsoleLog=0
+; 1 = show frame timing stats in analysis overlay (developer debug)
+ShowFrameTiming=0
+; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis)
+DwmHookMode=1
+; Auto-disable desktop gamma when these apps run
+GammaWhitelist=mpv.exe,mpvnet.exe
 
 ; Passthrough Mode (hide overlay when specific apps are running)
-VRRWhitelistEnabled=0           ; 1 = enable passthrough mode
-VRRWhitelist=game1.exe          ; Comma-separated exe names
+; 1 = enable passthrough mode
+VRRWhitelistEnabled=0
+; Comma-separated exe names
+VRRWhitelist=game1.exe
 
 ; Hotkey settings
 HotkeyGammaEnabled=1
@@ -40,33 +51,52 @@ HotkeyAnalysisEnabled=1
 HotkeyAnalysisKey=X
 
 ; Frame pacer settings
-FramePacerEnabled=1    ; 1 = predictive frame pacer (default)
-FramePacerSpinWait=1   ; 1 = QPC spin-wait for sub-ms precision
-FrameBuffer=1          ; 1 = auto frame buffer (decouples capture from present)
-FrameBufferIdleMs=3000 ; Idle timeout before buffer engages (ms), 0 = always active
-FramePacerLog=0        ; 1 = write per-frame CSV (framepacer.csv) for diagnostics
+; 1 = predictive frame pacer (default)
+FramePacerEnabled=1
+; 1 = QPC spin-wait for sub-ms precision
+FramePacerSpinWait=1
+; 1 = auto frame buffer (decouples capture from present)
+FrameBuffer=1
+; Idle timeout before buffer engages (ms), 0 = always active
+FrameBufferIdleMs=3000
+; 1 = write per-frame CSV (framepacer.csv) for diagnostics
+FramePacerLog=0
 
-StartMinimized=0       ; 1 = start minimized to system tray
+; 1 = start minimized to system tray
+StartMinimized=0
 
 ; One section per physical display ever seen, keyed by identity — NOT by the order
 ; Windows enumerates displays. Settings follow the panel if it is enumerated at
 ; another index, a panel that is disconnected keeps its section, and a different
 ; panel on the same connector starts from defaults. The slot number is just storage.
-; Pre-1.x [Monitor0], [Monitor1] ... sections are migrated on first load: adopted by
-; index the first time a display appears at that index, then deleted on the next save.
+; Older [Monitor0], [Monitor1] ... sections (index-keyed, before identity keying) are
+; migrated on first load: adopted by index the first time a display appears at that
+; index, copied into a [Display<slot>] section on the next save, and marked
+; "Migrated=Display<slot>" — kept as the original copy, never adopted again.
+; The identity keys (DevicePath / EdidId / DisplayName / FirstSeen / LastSeen) are
+; written last; a section without them is kept but never matched.
 [Display0]
 DevicePath=\\?\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}
-EdidId=AUS322A-S4LMSB007317  ; EDID manufacturer+product code, "-" serial (matches the same panel on another connector)
-DisplayName=PA32UCXR          ; informational only
-LUT_SDR=C:\path\to\sdr.cube   ; 3D LUT for SDR (applied by DWM hook in DwmHookMode)
-LUT_HDR=C:\path\to\hdr.cube   ; 3D LUT for HDR
+; EDID manufacturer+product code, "-" serial (matches the same panel on another connector)
+EdidId=AUS322A-S4LMSB007317
+; informational only
+DisplayName=PA32UCXR
+; dates the display was first / last connected (informational)
+FirstSeen=2026-09-14
+LastSeen=2026-10-07
+; 3D LUT for SDR (applied by DWM hook in DwmHookMode)
+LUT_SDR=C:\path\to\sdr.cube
+; 3D LUT for HDR
+LUT_HDR=C:\path\to\hdr.cube
 
 ; HDR tonemapping (applied by DWM hook when DwmHookMode=1, overlay shader as fallback)
 HDR_TonemapEnabled=0
-HDR_TonemapCurve=SoftClip     ; BT2390, SoftClip, Reinhard, BT2446A, HardClip
+; BT2390, SoftClip, Reinhard, BT2446A, HardClip
+HDR_TonemapCurve=SoftClip
 HDR_TonemapSourcePeak=10000.0
 HDR_TonemapTargetPeak=1000.0
-HDR_TonemapDynamic=0          ; 1 = detect peak per-frame
+; 1 = detect peak per-frame
+HDR_TonemapDynamic=0
 
 MaxTmlEnabled=0
 MaxTmlPeak=1000.0
@@ -75,26 +105,34 @@ MaxTmlPeak=1000.0
 SDR_MHCEnabled=true
 SDR_MHCProfilePath=C:\Windows\system32\spool\drivers\color\DesktopLUT_Mon0_SDR_xxx.icm
 SDR_MHCPrimariesEnabled=true
-SDR_MHCPrimariesPreset=4       ; 0=sRGB, 1=P3-D65, 2=AdobeRGB, 3=Rec.2020, 4=Custom
+; 0=sRGB, 1=P3-D65, 2=AdobeRGB, 3=Rec.2020, 4=Custom
+SDR_MHCPrimariesPreset=4
 SDR_MHCPrimariesRed=0.68, 0.32
 SDR_MHCPrimariesGreen=0.30, 0.60
 SDR_MHCPrimariesBlue=0.15, 0.06
 SDR_MHCPrimariesWhite=0.3127, 0.3290
-SDR_MHCSourceFile=C:\path\to\1D.cube  ; 1D cube or ICC — locks grayscale section
+; 1D cube or ICC — locks grayscale section
+SDR_MHCSourceFile=C:\path\to\1D.cube
 SDR_MHCSourceIs1DCube=true
 SDR_MHCGrayscaleEnabled=true
-SDR_MHCGrayscalePoints=20      ; 10, 20, or 32
+; 10, 20, or 32
+SDR_MHCGrayscalePoints=20
 SDR_MHCGrayscaleData=0.000; 0.003; ...
-SDR_MHCGrayscale24=false       ; true = apply 2.4 gamma (BT.1886) in LUT
+; true = apply 2.4 gamma (BT.1886) in LUT
+SDR_MHCGrayscale24=false
 SDR_MHCWhiteBalanceEnabled=false
 SDR_MHCWhiteBalanceWx=0.3127
 SDR_MHCWhiteBalanceWy=0.3290
-SDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
+; Fine-tuning grayscale on top of base
+SDR_MHCCorrGSEnabled=false
 SDR_MHCCorrGSPoints=20
 SDR_MHCCorrGSData=...
-SDR_MHCActivePerm=0            ; Active permutation bitmask (WB=1, DG=2, GS=4)
-SDR_MHCPermPath0=              ; Cached profile paths indexed by permutation bitmask
-SDR_MHCPermPath1=              ; ...through MHCPermPath7
+; Active permutation bitmask (WB=1, DG=2, GS=4)
+SDR_MHCActivePerm=0
+; Cached profile paths indexed by permutation bitmask
+SDR_MHCPermPath0=
+; ...through MHCPermPath7
+SDR_MHCPermPath1=
 
 ; --- MHC ICC Profile (HDR) ---
 HDR_MHCEnabled=true
@@ -105,15 +143,22 @@ HDR_MHCSourceFile=C:\path\to\hdr.cube
 HDR_MHCSourceIs1DCube=true
 HDR_MHCGrayscaleEnabled=true
 HDR_MHCGrayscalePeak=10000.0
-HDR_MHCDesktopGamma=false      ; true = sRGB→2.2 baked into 1D LUT for SDR range; hotswaps via permutation cache
-HDR_MHCDgSdrWhiteNits=116.0000 ; Windows SDR white level (nits) desktop gamma is referenced to; follows the live level in HDR, outside calibration sessions (absent = 80)
+; true = sRGB→2.2 baked into 1D LUT for SDR range; hotswaps via permutation cache
+HDR_MHCDesktopGamma=false
+; Windows SDR white level (nits) desktop gamma is referenced to; follows the live level in HDR, outside calibration sessions (absent = 80)
+HDR_MHCDgSdrWhiteNits=116.0000
 HDR_MHCWhiteBalanceEnabled=false
-HDR_MHCCorrGSEnabled=false     ; Fine-tuning grayscale on top of base
+; Fine-tuning grayscale on top of base
+HDR_MHCCorrGSEnabled=false
 HDR_MHCCorrGSPeak=10000.0
-HDR_MHCActivePerm=2            ; Active permutation bitmask (WB=1, DG=2, GS=4)
-HDR_MHCPermPath0=              ; Cached profiles indexed by bitmask (0-7)
-HDR_MHCPermPath2=C:\...\DesktopLUT_Mon0_HDR_P2_xxx.icm  ; DG-only variant
-HDR_MHCPermDgWhite2=116.0000   ; SDR white each cached variant's DG was baked with (0 = no DG in it; absent = MHCDgSdrWhiteNits); a mismatch regenerates / re-bakes it
+; Active permutation bitmask (WB=1, DG=2, GS=4)
+HDR_MHCActivePerm=2
+; Cached profiles indexed by bitmask (0-7)
+HDR_MHCPermPath0=
+; DG-only variant
+HDR_MHCPermPath2=C:\...\DesktopLUT_Mon0_HDR_P2_xxx.icm
+; SDR white each cached variant's DG was baked with (0 = no DG in it; absent = MHCDgSdrWhiteNits); a mismatch regenerates / re-bakes it
+HDR_MHCPermDgWhite2=116.0000
 ```
 
 ## DWM Hook Mode
