@@ -260,9 +260,6 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.star.evenReach = 5; original.fald.star.capNits = 400.0f; original.fald.star.strength = 0.5f;
         original.fald.star.areaLo = 30.0f; original.fald.star.areaHi = 200.0f; original.fald.star.peakHi = 900.0f;
         original.fald.star.reach = 3; original.fald.star.nbLo = 0.1f; original.fald.star.nbHi = 0.4f;
-        original.fald.glow.enabled = true;   // glow fill (2026-09-20, work guide S2): persisted
-        original.fald.glow.strength = 0.6f; original.fald.glow.reach = 3; original.fald.glow.capNits = 0.045f;
-        const bool hdrSlot = std::wstring(prefix) == L"HDR_";    // HDR only: the SDR slot's switch never loads as on
         SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
 
         ColorCorrectionSettings loaded;
@@ -292,10 +289,6 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.star.reach == 3u);
         CHECK(loaded.fald.star.nbLo == doctest::Approx(0.1f).epsilon(1e-4));
         CHECK(loaded.fald.star.nbHi == doctest::Approx(0.4f).epsilon(1e-4));
-        CHECK(loaded.fald.glow.enabled == hdrSlot);
-        CHECK(loaded.fald.glow.strength == doctest::Approx(0.6f).epsilon(1e-4));
-        CHECK(loaded.fald.glow.reach == 3u);
-        CHECK(loaded.fald.glow.capNits == doctest::Approx(0.045f).epsilon(1e-4));
     }
     // a fresh INI (no keys) = the filter OFF; out-of-range values are clamped, an unknown mode is OFF
     {
@@ -378,30 +371,16 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(starClamped.fald.star.reach == 0u);
         CHECK(starClamped.fald.star.areaLo == 300.0f);
         CHECK(starClamped.fald.star.areaHi == 300.0f);
-        // glow fill: a fresh INI = OFF with the reference defaults; out-of-range values are clamped
-        CHECK_FALSE(fresh.fald.glow.enabled);
-        CHECK(fresh.fald.glow.strength == 1.0f);
-        CHECK(fresh.fald.glow.reach == 2u);
-        CHECK(fresh.fald.glow.capNits == doctest::Approx(0.05f));
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldGlowFill", L"1", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldGlowStrength", L"2.5", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldGlowReach", L"-3", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldGlowCapNits", L"9", ini.c_str());
-        ColorCorrectionSettings glowClamped;
-        LoadColorCorrectionSettings(L"TestMon", L"SDR_", glowClamped, ini.c_str());
-        CHECK_FALSE(glowClamped.fald.glow.enabled);                     // HDR only: an SDR_FaldGlowFill=1 in the INI stays off
-        WritePrivateProfileStringW(L"TestMon", L"HDR_FaldGlowFill", L"1", ini.c_str());
-        ColorCorrectionSettings glowHdr;
-        LoadColorCorrectionSettings(L"TestMon", L"HDR_", glowHdr, ini.c_str());
-        CHECK(glowHdr.fald.glow.enabled);
-        CHECK(glowClamped.fald.glow.strength == 1.0f);
-        CHECK(glowClamped.fald.glow.reach == FALD_GLOW_REACH_MIN);
-        CHECK(glowClamped.fald.glow.capNits == FALD_GLOW_CAP_MAX);
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldGlowReach", L"40", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldGlowCapNits", L"0.0001", ini.c_str());
-        LoadColorCorrectionSettings(L"TestMon", L"SDR_", glowClamped, ini.c_str());
-        CHECK(glowClamped.fald.glow.reach == FALD_GLOW_REACH_MAX);
-        CHECK(glowClamped.fald.glow.capNits == FALD_GLOW_CAP_MIN);
+        // the glow fill's keys (work guide S2, removed 2026-10-07): an old INI's keys are ignored and a save deletes them
+        for (const wchar_t* k : { L"HDR_FaldGlowFill", L"HDR_FaldGlowStrength", L"HDR_FaldGlowReach", L"HDR_FaldGlowCapNits" })
+            WritePrivateProfileStringW(L"TestMon", k, L"1", ini.c_str());
+        ColorCorrectionSettings oldIni;
+        LoadColorCorrectionSettings(L"TestMon", L"HDR_", oldIni, ini.c_str());
+        SaveColorCorrectionSettings(L"TestMon", L"HDR_", oldIni, ini.c_str());
+        for (const wchar_t* k : { L"HDR_FaldGlowFill", L"HDR_FaldGlowStrength", L"HDR_FaldGlowReach", L"HDR_FaldGlowCapNits" }) {
+            wchar_t left[8] = {};
+            CHECK(GetPrivateProfileStringW(L"TestMon", k, L"", left, 8, ini.c_str()) == 0u);
+        }
     }
     // the two modes are independent keys: an SDR save never touches the HDR slot
     TempIni ini;

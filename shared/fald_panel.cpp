@@ -221,12 +221,6 @@ bool FaldLatticeFits(const FaldPanelParams& p, int width, int height) {
     return right <= (unsigned long long)width && bottom <= (unsigned long long)height;
 }
 
-float FaldGlowReqCeil(const FaldPanelParams& p) {
-    float c = FALD_GLOW_REQ_FLOOR_FRAC * p.driveFloor;
-    if (p.hasBoost) { const float lit = FALD_GLOW_REQ_LIT_FRAC * p.boostLitNits; if (lit < c) c = lit; }
-    return c;
-}
-
 bool FaldPanelFileStamp(const std::wstring& path, unsigned long long& size, unsigned long long& mtime) {
     WIN32_FILE_ATTRIBUTE_DATA fad;
     if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad)) return false;

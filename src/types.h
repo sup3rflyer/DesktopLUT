@@ -147,10 +147,6 @@ struct MovableAtomic {
 #define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
 #define ID_CORR_FALD_STAR_STRENGTH 545
 #define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach   (lift is INI / pipe only)
-#define ID_CORR_FALD_GLOW_ENABLE 549   // Glow fill row (work guide S2), applies to both modes
-#define ID_CORR_FALD_GLOW_STRENGTH 550
-#define ID_CORR_FALD_GLOW_REACH  554
-#define ID_CORR_FALD_GLOW_CAP    555
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -550,23 +546,12 @@ struct FaldStarfieldSettings {
     float nbHi = 0.30f;           // ... none at / above this
 };
 
-// Glow fill (EXPERIMENT, default off; work guide ticket S2; reference DLC dlc/fald/glowfill.py GlowFillParams — the
-// defaults here are pinned equal by DLC tests/test_fald_transfer.py). A calculated black lift that evens the LED glow
-// on dark content: only holes / valleys of the glow that are enclosed by glow are filled. A user setting, not a panel
-// property. Clamped by FaldGlowClamp (fald.h). HDR only (fald.h FaldGlowSupported): the SDR slot's switch stays off.
-struct FaldGlowSettings {
-    bool enabled = false;
-    float strength = 1.0f;        // 0..1: share of the glow deficit that is filled
-    unsigned int reach = 2;       // 1..4 zones (each side): holes / valleys up to 2 * reach zones wide are filled
-    float capNits = 0.05f;        // 0.005..0.5: the fill never exceeds this (as-if-white nits)
-};
-
 struct FaldSettings {
     bool enabled = false;
     std::wstring paramsPath;
     unsigned int debugMode = 0;   // 0 = correct, 1 = gain map (white 0, red +, blue -), 2 = show B_true, 3 = show B_est, 4 = identity passthrough,
                                   // 5/6 pedestal views, 7 temporal settling, 8 black-frame boost zone map, 9 starfield balancing
-                                  // zone map, 10 glow fill (the added request x 1000) (fald_shader.h; not persisted)
+                                  // zone map (fald_shader.h; not persisted)
     unsigned int pedMode = 0;     // pedestal colour (persisted, GUI "Per-channel pedestal"): 0 = white pedestal, hue-preserving
                                   // subtraction (pre-2026-09-13 behaviour); 1 = the panel file's per-channel pedestal colour
                                   // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.
@@ -587,9 +572,6 @@ struct FaldSettings {
     // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
     // resource for resource and dispatch for dispatch.
     FaldStarfieldSettings star;
-    // Glow fill (persisted, GUI "Glow fill" row / runtime.fald_glowfill). Off = the layer without it, resource for
-    // resource and dispatch for dispatch.
-    FaldGlowSettings glow;
 };
 
 // Tonemapping settings (HDR only)
@@ -1046,10 +1028,6 @@ struct GUIState {
     HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
     HWND hwndFaldStarStrength = nullptr;
     HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
-    HWND hwndFaldGlowEnable = nullptr;  // Glow fill row: enable | strength | reach | cap nits
-    HWND hwndFaldGlowStrength = nullptr;
-    HWND hwndFaldGlowReach = nullptr;
-    HWND hwndFaldGlowCap = nullptr;
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

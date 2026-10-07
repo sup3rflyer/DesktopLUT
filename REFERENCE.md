@@ -379,7 +379,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
 ### In the DWM hook (phase one)
 
 The hook runs the layer's **stateless core** — statistic → black-frame boost → convolution → gain, twice, then
-the pixel pass. Starfield balancing, glow fill, the temporal modes and the settle hold stay on the overlay path
+the pixel pass. Starfield balancing, the temporal modes and the settle hold stay on the overlay path
 for now; each of those is documented as bit-identical when off, so the hook's output must equal the overlay's
 exactly for the same input frame. Both paths run the same HLSL (`shared/fald_shader.h`) and the same panel-file
 reader (`shared/fald_panel.h`) — there is no second implementation of the correction.

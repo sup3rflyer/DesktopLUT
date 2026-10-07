@@ -13,8 +13,8 @@
 #include <vector>
 
 // Constant-buffer size shared by the host's FillCB (src/fald.cpp), the hook's FillCB
-// (dwm_hook/hook_fald.cpp) and cbuffer FaldCB (shared/fald_shader.h): 84 words.
-constexpr unsigned int FALD_CB_BYTES = 336;
+// (dwm_hook/hook_fald.cpp) and cbuffer FaldCB (shared/fald_shader.h): 76 words.
+constexpr unsigned int FALD_CB_BYTES = 304;
 
 // Panel-file signal transfer (FLD3 header word 40; see FaldPanelParams::transfer).
 constexpr uint32_t FALD_TRANSFER_PQ = 0;      // HDR: PQ codes (FLD1/FLD2 files are implicitly PQ)
@@ -30,15 +30,6 @@ constexpr unsigned int FALD_BOOST_MAX_STEPS = 24;
 // + camera observations; LIT-or-DIM miscounts 4 of them).
 constexpr uint32_t FALD_BOOST_RULE_DIM = 0;
 constexpr uint32_t FALD_BOOST_RULE_MEAN = 1;
-
-// The glow fill's request ceiling, from what was MEASURED (work guide, probe pixrule): a 2-px column
-// at 0.298 nit does NOT make a zone LIT, 0.4 nit does (the rule's 0.35 is the midpoint), and whether
-// a ~0.3-nit AREA lights LEDs was never measured (risk R4; the 0.5-nit drive floor is a fit value).
-// So the ceiling keeps a factor ~1.5 below the one measured "not LIT" level and 2.5 below the drive
-// floor. The fill itself is host-only (the hook's phase-one core never runs it), but the ceiling is a
-// CB word both paths write, so it lives with the file it is derived from.
-constexpr float FALD_GLOW_REQ_FLOOR_FRAC = 0.4f;      // a filled pixel's request stays below this x the drive floor ...
-constexpr float FALD_GLOW_REQ_LIT_FRAC = 0.55f;       // ... and below this x the boost count's LIT level (files with a LUT)
 
 // Parsed panel parameter file.
 struct FaldPanelParams {
@@ -112,8 +103,5 @@ bool FaldBoostZoneActive(const FaldPanelParams& p, const float* maxChannelNits, 
 bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr);
 // The panel lattice (origin + cols*cellW x rows*cellH) must lie inside the monitor's frame.
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height);
-// The level (as-if-white nits, brightest channel) a glow-filled pixel's request never exceeds: CB word 79 (DLC
-// glowfill.req_ceiling). Written by both paths' FillCB; only the host's fill passes read it.
-float FaldGlowReqCeil(const FaldPanelParams& p);
 // Size + last-write stamp of the params file (false when it cannot be read). Both paths rebuild on a change.
 bool FaldPanelFileStamp(const std::wstring& path, unsigned long long& size, unsigned long long& mtime);

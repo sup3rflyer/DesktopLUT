@@ -280,58 +280,13 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
     }
 }
 
-TEST_CASE("FALD constant buffer is 84 words") {
-    // FillCB writes words up to index 79 (temporal drive state 44-47; boost activation rule 48-51; starfield balancing
-    // 52-65; panel clock 66-71; the boost's zone rule 72-74 (C12b); glow fill 75 = on, 76-79 = strength / cap / reach /
-    // request ceiling, 80 = the count-threshold band, 81-83 padding (S2); word 31 = transfer, 34 = boost step count, 35 =
-    // starfield on, 43 = sdrGamma); the HLSL cbuffer FaldCB declares 21 float4 rows.
-    CHECK(FALD_CB_BYTES == 336u);
+TEST_CASE("FALD constant buffer is 76 words") {
+    // FillCB writes words up to index 75 (temporal drive state 44-47; boost activation rule 48-51; starfield balancing
+    // 52-65; panel clock 66-71; the boost's zone rule 72-74 (C12b); 75 unused — the glow fill's switch until its removal
+    // 2026-10-07; word 31 = transfer, 34 = boost step count, 35 = starfield on, 43 = sdrGamma); the HLSL cbuffer FaldCB
+    // declares 19 float4 rows.
+    CHECK(FALD_CB_BYTES == 304u);
     CHECK(FALD_CB_BYTES % 16 == 0);
-}
-
-TEST_CASE("FALD glow fill: defaults follow the DLC reference, the clamp keeps every range, the request ceiling") {
-    // dlc/fald/glowfill.py GlowFillParams (DLC tests/test_fald_transfer.py pins the same numbers against types.h / fald.h)
-    FaldGlowSettings d;
-    CHECK_FALSE(d.enabled);                                     // experimental: default OFF
-    CHECK(d.strength == 1.0f); CHECK(d.reach == 2u); CHECK(d.capNits == 0.05f);
-    FaldGlowSettings same = d;
-    FaldGlowClamp(same);                                        // the defaults are inside every range
-    CHECK(same.strength == d.strength); CHECK(same.reach == d.reach); CHECK(same.capNits == d.capNits);
-    CHECK(FALD_GLOW_REACH_MIN == 1u); CHECK(FALD_GLOW_REACH_MAX == 4u);
-    CHECK(FALD_GLOW_CAP_MIN == 0.005f); CHECK(FALD_GLOW_CAP_MAX == 0.5f);
-
-    FaldGlowSettings s;
-    s.enabled = true; s.strength = 3.0f; s.reach = 40; s.capNits = 7.0f;
-    FaldGlowClamp(s);
-    CHECK(s.enabled);                                           // the clamp never touches the switch
-    CHECK(s.strength == 1.0f); CHECK(s.reach == FALD_GLOW_REACH_MAX); CHECK(s.capNits == FALD_GLOW_CAP_MAX);
-    s.strength = -2.0f; s.reach = 0; s.capNits = 0.0f;
-    FaldGlowClamp(s);
-    CHECK(s.strength == 0.0f); CHECK(s.reach == FALD_GLOW_REACH_MIN); CHECK(s.capNits == FALD_GLOW_CAP_MIN);
-    s.strength = std::nanf(""); s.capNits = std::nanf("");
-    FaldGlowClamp(s);
-    CHECK(s.strength == 1.0f); CHECK(s.capNits == 0.05f);       // NaN -> the default
-
-    // the fill never lights a LED (drive floor) and never makes a zone LIT for the boost count (files with a LUT only)
-    // — from MEASURED levels (probe pixrule: a 2-px column at 0.298 nit is NOT LIT, 0.4 is; a 0.3-nit area lighting LEDs
-    // is unmeasured): at most 0.2 nit on the PA32UCXR, a factor ~1.5 below the measured "not LIT" point
-    FaldPanelParams p;
-    p.driveFloor = 0.5f; p.boostLitNits = 0.35f; p.hasBoost = false;
-    CHECK(FaldGlowReqCeil(p) == doctest::Approx(0.20f));
-    p.hasBoost = true;
-    CHECK(FaldGlowReqCeil(p) == doctest::Approx(0.1925f));
-    CHECK(FaldGlowReqCeil(p) <= 0.2f); CHECK(FaldGlowReqCeil(p) * 1.5f < 0.298f);
-    CHECK(FaldGlowReqCeil(p) < p.boostLitNits); CHECK(FaldGlowReqCeil(p) < p.driveFloor);
-    p.boostLitNits = 2.0f;                                      // a LIT level above the drive floor: the floor binds
-    CHECK(FaldGlowReqCeil(p) == doctest::Approx(0.20f));
-    // HDR only; the count-threshold band needs a boost LUT AND the mean zone rule
-    FaldPanelParams q;
-    q.transfer = FALD_TRANSFER_PQ; CHECK(FaldGlowSupported(q));
-    q.transfer = FALD_TRANSFER_GAMMA; CHECK_FALSE(FaldGlowSupported(q));
-    CHECK(std::string(FALD_GLOW_SDR_NOTE).find("HDR only") != std::string::npos);
-    q.hasBoost = false; q.boostRule = FALD_BOOST_RULE_MEAN; CHECK_FALSE(FaldGlowBandActive(q));
-    q.hasBoost = true; q.boostRule = FALD_BOOST_RULE_DIM; CHECK_FALSE(FaldGlowBandActive(q));
-    q.boostRule = FALD_BOOST_RULE_MEAN; CHECK(FaldGlowBandActive(q));
 }
 
 TEST_CASE("FALD starfield balancing: defaults follow the DLC reference and the clamp keeps every range") {
@@ -1315,10 +1270,8 @@ TEST_CASE("FALD loader: an exported panel file named by FALD_TEST_PANEL_FILE loa
 // against the dumped run times (the phase-locked grid's DLC twin) — the runs are paced by this machine's clock, not by a
 // display. Without the variable the case checks nothing. A `frame.rgba16f` next to
 // panel.bin (frame-sized RGBA half) replaces both frames (C12b: the boost's zone rule on a device).
-// FALD_TEST_WARP_GLOW = 1 turns the glow fill on (work guide S2; FALD_TEST_WARP_GLOW_REACH, default 2, and
-// FALD_TEST_WARP_GLOW_CAP_MNIT, default 100 = 0.10 nit) AND starfield balancing at the FaldStarfieldSettings defaults:
-// glow fill is part of the starfield feature and runs only while starfield runs. The dump reports the starfield settings
-// and zone fields; DLC tests/test_fald_glowfill_warp.py replays both (tests/test_fald_c16_warp.py: the band's G4 / G5 dumps).
+// FALD_TEST_WARP_STAR = 1 turns starfield balancing on at the FaldStarfieldSettings defaults. The dump reports the
+// starfield settings and zone fields (DLC tests/test_fald_zone_slices_warp.py runs it on a sliced lattice).
 TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_TEST_WARP_DIR)") {
     char* envDir = nullptr; size_t len = 0;
     if (_dupenv_s(&envDir, &len, "FALD_TEST_WARP_DIR") != 0 || !envDir) return;
@@ -1332,7 +1285,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     const int mode = envInt("FALD_TEST_WARP_MODE", 3), parity = envInt("FALD_TEST_WARP_PARITY", -1);
     const int tauMs = envInt("FALD_TEST_WARP_TAU_MS", 50), delay = envInt("FALD_TEST_WARP_DELAY", 0);
     const float periodMs = (float)envInt("FALD_TEST_WARP_PERIOD_US", 16667) / 1000.0f;
-    const bool glow = envInt("FALD_TEST_WARP_GLOW", 0) != 0;
+    const bool star = envInt("FALD_TEST_WARP_STAR", 0) != 0;
 
     ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
@@ -1352,10 +1305,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
     fs.temporalMode = (unsigned int)mode; fs.clockParity = parity;
     fs.tauRiseMs = (float)tauMs; fs.tauFallMs = 0.5f * (float)tauMs; fs.delayFrames = (unsigned int)delay;
-    fs.star.enabled = glow;                                        // at its defaults: glow fill runs only under starfield
-    fs.glow.enabled = glow;
-    fs.glow.reach = (unsigned int)envInt("FALD_TEST_WARP_GLOW_REACH", 2);
-    fs.glow.capNits = (float)envInt("FALD_TEST_WARP_GLOW_CAP_MNIT", 100) / 1000.0f;
+    fs.star.enabled = star;                                        // at its defaults
     REQUIRE(FaldEnsureResources(&ctx, fs));
 
     // fullscreen triangle + an FP16 target standing in for the swapchain
@@ -1429,16 +1379,8 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         ic->Flush();
         CHECK_FALSE(ctx.faldDumpRequested.load());
         CHECK(ctx.fald->temporalMode == (unsigned int)mode);
-        CHECK(ctx.fald->starOn == glow);                           // starfield runs with the glow fill (one feature)
-        CHECK((ctx.fald->starPlanTex != nullptr) == glow);
-        CHECK(ctx.fald->glowOn == glow);                           // the glow textures exist exactly while the option is on
-        CHECK((ctx.fald->glowVTex != nullptr) == glow); CHECK((ctx.fald->glowEnvTex != nullptr) == glow);
-        CHECK(ctx.fald->glowBand == (glow && FaldGlowBandActive(pp)));   // the band: mean-rule files with a boost LUT only
-        CHECK((ctx.fald->glowBandTex != nullptr) == ctx.fald->glowBand);  // C16: G4's record / bound and G5's scratch exist
-        CHECK((ctx.fald->glowATex != nullptr) == ctx.fald->glowBand);     // exactly while the band runs
-        CHECK((ctx.fald->glowKTmpTex != nullptr) == ctx.fald->glowBand);
-        CHECK((ctx.fald->glowGuardTex != nullptr) == ctx.fald->glowBand);
-        CHECK((ctx.fald->glowBandPartBuf != nullptr) == (ctx.fald->glowBand && ctx.fald->zoneSlices > 1));
+        CHECK(ctx.fald->starOn == star);                           // the star textures exist exactly while the option is on
+        CHECK((ctx.fald->starPlanTex != nullptr) == star);
         if (mode == (int)FALD_TEMPORAL_PANEL) {
             CHECK(ctx.fald->stateValid);
             if (run == 0) CHECK(ctx.fald->clkSeeded);             // run 0 seeds the clocks ...
@@ -1462,24 +1404,11 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     } else {
         CHECK(ctx.fald->clkStateTex[0] == nullptr);                // modes 0-2 never create them
     }
-    if (glow) {                                                    // leaving the option releases its textures
-        fs.glow.enabled = false;
+    if (star) {                                                    // leaving the option releases its textures
+        fs.star.enabled = false;
         ctx.faldDumpRequested.store(false);
         FaldRunPasses(&ctx, rtv, true);
-        CHECK_FALSE(ctx.fald->glowOn);
-        CHECK(ctx.fald->glowVTex == nullptr); CHECK(ctx.fald->glowDilTex == nullptr);
-        CHECK(ctx.fald->glowCTex == nullptr); CHECK(ctx.fald->glowEnvTex == nullptr); CHECK(ctx.fald->glowKTex == nullptr);
-        CHECK(ctx.fald->glowBandTex == nullptr); CHECK(ctx.fald->glowATex == nullptr); CHECK(ctx.fald->glowKTmpTex == nullptr);
-        CHECK(ctx.fald->glowGuardTex == nullptr);
-        CHECK(ctx.fald->glowBandPartBuf == nullptr);
-        CHECK_FALSE(ctx.fald->glowBand);
-        CHECK(ctx.fald->starOn);                                   // ... and only its own: starfield keeps running
-        // one feature: starfield off stops the fill too, with the glow switch still on (it stays stored)
-        fs.glow.enabled = true; fs.star.enabled = false;
-        FaldRunPasses(&ctx, rtv, true);
         CHECK_FALSE(ctx.fald->starOn); CHECK(ctx.fald->starPlanTex == nullptr);
-        CHECK_FALSE(ctx.fald->glowOn); CHECK(ctx.fald->glowVTex == nullptr); CHECK(ctx.fald->glowEnvTex == nullptr);
-        CHECK_FALSE(ctx.fald->glowBand);
     }
     rtv->Release(); target->Release(); vs->Release();
     FaldReleaseResources(&ctx);

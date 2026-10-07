@@ -1220,24 +1220,18 @@ void UpdateDwmHookSharedConfig()
                         // A configured-but-pathless layer is off (the DLL has no file to read either).
                         const auto& fs = mc.isHdr ? g_gui.monitorSettings[mi].hdrColorCorrection.fald
                                                   : g_gui.monitorSettings[mi].sdrColorCorrection.fald;
-                        // Starfield + its glow-fill part are one feature: glow rides only with starfield
-                        // (DwmHookFaldPack drops it otherwise); the hook also refuses glow on a non-PQ file.
                         cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty(),
                                                            static_cast<uint32_t>(fs.debugMode),
                                                            static_cast<int>(fs.pedMode),
-                                                           fs.star.enabled ? 1 : 0,
-                                                           fs.glow.enabled ? 1 : 0);
+                                                           fs.star.enabled ? 1 : 0);
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
-                        FaldGlowSettings gl = fs.glow;
-                        FaldGlowClamp(gl);
                         DwmHookFaldTuning& t = ex.tail.fald[i];
                         t.starEven = st.even; t.starLift = st.lift; t.starTargetGain = st.targetGain;
                         t.starTargetSigma = st.targetSigma; t.starKeepNits = st.keepNits; t.starCapNits = st.capNits;
                         t.starStrength = st.strength; t.starAreaLo = st.areaLo; t.starAreaHi = st.areaHi;
                         t.starPeakHi = st.peakHi; t.starNbLo = st.nbLo; t.starNbHi = st.nbHi;
                         t.starReach = st.reach; t.starEvenReach = st.evenReach;
-                        t.glowStrength = gl.strength; t.glowCapNits = gl.capNits; t.glowReach = gl.reach;
                         // LED lag (temporal drive state): clamped here, re-bounded by the DLL
                         t.tempMode = fs.temporalMode <= FALD_TEMPORAL_PANEL ? fs.temporalMode : FALD_TEMPORAL_OFF;
                         t.tempTauRiseMs = fs.tauRiseMs; t.tempTauFallMs = fs.tauFallMs;

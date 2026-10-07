@@ -701,7 +701,7 @@ void CreateGUILayout(HWND hwnd) {
     // HDR fit is a PQ file, an SDR fit a gamma file). Debug views show the layer's own fields on the panel.
     innerY += 53;
     ctrl = CreateWindow(L"BUTTON", L"FALD Compensation (Experimental)", WS_CHILD | BS_GROUPBOX,
-        innerX, innerY, groupW, 207, panel2, nullptr, nullptr, nullptr);
+        innerX, innerY, groupW, 180, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
     // Row 1: HDR
@@ -751,7 +751,6 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Temporal settling (red rising)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Boost zone map (non-black zones)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Starfield zones (blue pulled, red lifted)");
-    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Glow fill (added light x1000)");
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
 
     // Per-channel pedestal (2026-09-13, DLC work guide H2): the panel file (FLD2) carries the measured colour of the
@@ -860,38 +859,7 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 250, faldS2Y, 30, h, panel2, (HMENU)ID_CORR_FALD_STAR_REACH, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldStarReach);
 
-    // Row 7: glow fill (EXPERIMENT, 2026-09-20, DLC work guide ticket S2; rules = the module docstring of
-    // dlc/fald/glowfill.py): a CALCULATED black lift that evens the LED glow on dark content. Only holes / valleys of the
-    // glow that are enclosed by glow are filled (no skirt around a bright window, no filled letterbox bars), and only
-    // where the panel's own backlight estimate is trusted. strength = the share of the glow deficit that is filled;
-    // reach = zones (each side): holes up to 2 x reach zones wide count; cap nits = the fill's ceiling. It adds light to
-    // black on purpose, and filled zones count for the panel's black-frame LED boost. HDR only (fald.h FaldGlowSupported:
-    // the levels behind its request ceiling are HDR measurements): the checkbox is the HDR slot's switch, the numbers
-    // go to both slots.
-    int faldGY = innerY + 180;
-    // Part of the Starfield feature: the row is live only while Starfield is on (gui.cpp), and the fill never
-    // runs without starfield balancing (src/fald.cpp, dwm_hook/hook_fald.cpp).
-    g_gui.hwndFaldGlowEnable = CreateWindow(L"BUTTON", L"+ glow",
-        WS_CHILD | BS_AUTOCHECKBOX,
-        innerX + 10, faldGY, 72, h, panel2, (HMENU)ID_CORR_FALD_GLOW_ENABLE, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowEnable);
-    ctrl = CreateWindow(L"STATIC", L"strength", WS_CHILD, innerX + 88, faldGY + 2, 48, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldGlowStrength = CreateWindow(L"EDIT", L"1.00", WS_CHILD | WS_BORDER | ES_RIGHT,
-        innerX + 138, faldGY, 38, h, panel2, (HMENU)ID_CORR_FALD_GLOW_STRENGTH, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowStrength);
-    ctrl = CreateWindow(L"STATIC", L"reach", WS_CHILD, innerX + 186, faldGY + 2, 32, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldGlowReach = CreateWindow(L"EDIT", L"2", WS_CHILD | WS_BORDER | ES_RIGHT,
-        innerX + 220, faldGY, 30, h, panel2, (HMENU)ID_CORR_FALD_GLOW_REACH, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowReach);
-    ctrl = CreateWindow(L"STATIC", L"cap nits", WS_CHILD, innerX + 260, faldGY + 2, 46, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldGlowCap = CreateWindow(L"EDIT", L"0.050", WS_CHILD | WS_BORDER | ES_RIGHT,
-        innerX + 308, faldGY, 46, h, panel2, (HMENU)ID_CORR_FALD_GLOW_CAP, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldGlowCap);
-
-    g_gui.contentHeight[2] = innerY + 207 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows + Glow fill)
+    g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);
@@ -906,9 +874,6 @@ void CreateGUILayout(HWND hwnd) {
     SetNumericEdit(g_gui.hwndFaldStarStrength, 2);
     SetNumericEdit(g_gui.hwndFaldStarReach, 0);
     SetNumericEdit(g_gui.hwndFaldStarSigma, 2);
-    SetNumericEdit(g_gui.hwndFaldGlowStrength, 2);
-    SetNumericEdit(g_gui.hwndFaldGlowReach, 0);
-    SetNumericEdit(g_gui.hwndFaldGlowCap, 3);
 
     // === TAB 3: Settings (initially hidden) ===
     innerY = 8;  // Reset for scroll panel

@@ -1,7 +1,7 @@
 // FALD (mini-LED local dimming) context-dependence correction — the OVERLAY path's layer (HDR, and SDR under
 // Windows ACM where the overlay frame is FP16 scRGB too). This file never runs in DWM hook mode; there the
 // hook runs the layer's stateless core itself (dwm_hook/hook_fald.h), out of the same HLSL and the same
-// panel-file reader. Everything below that hook_fald.h does not have — starfield, glow fill, the temporal
+// panel-file reader. Everything below that hook_fald.h does not have — starfield, the temporal
 // modes, the settle hold, the dump — is what keeps this the experiment bench of the two.
 // Design + measurements: DLC/docs/fald-shader-design.md, DLC/docs/fald-spatial-probe-2026-09-10.md.
 // The per-panel parameter file (*.bin) is produced by `python -m dlc.fald.export <fit.json> <out.bin>`
@@ -19,13 +19,12 @@
 
 // The panel parameter file and the pure functions over it live in shared/ so the DWM hook parses
 // the same bytes with the same code (FaldPanelParams, LoadFaldPanelParams, the boost helpers,
-// FALD_CB_BYTES, the transfer / boost-rule constants, FaldGlowReqCeil).
+// FALD_CB_BYTES, the transfer / boost-rule constants).
 #include "../shared/fald_panel.h"
 
 struct MonitorContext;
 struct FaldSettings;
 struct FaldStarfieldSettings;
-struct FaldGlowSettings;
 struct FaldResources;
 
 // Starfield balancing (EXPERIMENT, default off; work guide ticket S1). The complete rules: the header above
@@ -41,31 +40,6 @@ constexpr unsigned int FALD_STAR_EVEN_REACH_MAX = 12;
 constexpr unsigned int FALD_STAR_REACH_MAX = 4;
 // Clamp every field to its documented range (NaN -> the default; area / neighbour pairs kept ordered lo <= hi).
 void FaldStarfieldClamp(FaldStarfieldSettings& s);
-
-// Glow fill (EXPERIMENT, default off; work guide ticket S2). The complete rules: the header above g_faldGlowZoneSource
-// in fald_shader.h = the module docstring of DLC dlc/fald/glowfill.py (the reference). In short: a CALCULATED black lift
-// that evens the LED glow on dark content — per zone the white pedestal Vz = white * tmin * B_true (the correction's own
-// field: boost, starfield, temporal state included), its grey CLOSING over a (2 reach + 1)^2 box (only holes / valleys
-// enclosed by glow are filled: no skirt around a window, no filled letterbox bars), a blur under the closing, the zone
-// deficit; per pixel the interpolated deficit (x strength, <= capNits) minus what the pixel's own content already shows,
-// x the correction's deep-dark trust in B_est, requested in the pedestal's colour and never above glowReqCeil (no LED is
-// lit, no zone becomes LIT for the boost count). Each inverse round adds the fill of ITS fields, so round 1's statistic /
-// boost count see the frame the panel receives. Off = no resources, no dispatches, the shaders' results bit-identical.
-constexpr unsigned int FALD_GLOW_REACH_MIN = 1;
-constexpr unsigned int FALD_GLOW_REACH_MAX = 4;       // also sizes the dilation texture (cols + 2 MAX) x (rows + 2 MAX)
-constexpr float FALD_GLOW_CAP_MIN = 0.005f;           // as-if-white nits
-constexpr float FALD_GLOW_CAP_MAX = 0.5f;
-// The request ceiling (FALD_GLOW_REQ_* and FaldGlowReqCeil) is derived from the panel file, so it lives with it in
-// shared/fald_panel.h — both render paths write it into CB word 79.
-// Clamp every field to its documented range (NaN -> the default).
-void FaldGlowClamp(FaldGlowSettings& s);
-// HDR only: every level behind the ceiling and the band (drive floor, LIT level, count threshold) is an HDR measurement,
-// so the fill never runs on a gamma-transfer (SDR / ACM) panel file; the settings / pipe / GUI keep the SDR switch off.
-bool FaldGlowSupported(const FaldPanelParams& p);
-extern const char* const FALD_GLOW_NEEDS_STAR_NOTE;    // glow fill is part of starfield: stored switch, runs only with it
-extern const char* const FALD_GLOW_SDR_NOTE;          // the one text the pipe / state.get / GUI use to say why
-// The count-threshold band applies: the file has a boost LUT AND the mean zone rule (CB word 80; DLC glowfill.band_active).
-bool FaldGlowBandActive(const FaldPanelParams& p);
 
 // Temporal drive state ("LED lag"): constants, the time law, the panel clock, the settle hold and the per-run
 // orchestration live in shared/fald_temporal.h — ONE implementation for this path and the DWM hook. FaldResources
@@ -133,7 +107,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
     // zone sweeps (work guide C14; fald_shader.h above ZoneSlices): slices per zone, and for a lattice of more than one
-    // the slice partials the statistic / S0 / G4 passes write and their combine variants fold (u2); null for one slice
+    // the slice partials the statistic / S0 passes write and their combine variants fold (u2); null for one slice
     unsigned int zoneSlices = 1;
     ID3D11Buffer* zonePartBuf = nullptr; ID3D11UnorderedAccessView* zonePartUAV = nullptr;
     // starfield balancing: five zone textures (created on the first frame the option is on, released when it goes off;
@@ -158,32 +132,6 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
         float nbLo = 0.15f, nbHi = 0.30f; uint32_t reach = 2, evenReach = 8;
         float targetSigma = 0.0f, keepNits = 100.0f;
     } star;
-    // glow fill (work guide S2): four zone textures, created on the first frame the option is on and released when it
-    // goes off. glowV = Vz (cols x rows R32F, pass G0), glowDil = the box maximum on the lattice extended by
-    // FALD_GLOW_REACH_MAX on every side (R32F, G1), glowC = the closing (R32F, G2), glowEnv = (Ez, Dz, Cz, Vz) (RGBA32F,
-    // G3) — the statistic round 1 and the pixel pass sample glowEnv.y (t23). Rewritten after EACH round's conv pass.
-    ID3D11Texture2D* glowVTex = nullptr;   ID3D11UnorderedAccessView* glowVUAV = nullptr;   ID3D11ShaderResourceView* glowVSRV = nullptr;
-    ID3D11Texture2D* glowDilTex = nullptr; ID3D11UnorderedAccessView* glowDilUAV = nullptr; ID3D11ShaderResourceView* glowDilSRV = nullptr;
-    ID3D11Texture2D* glowCTex = nullptr;   ID3D11UnorderedAccessView* glowCUAV = nullptr;   ID3D11ShaderResourceView* glowCSRV = nullptr;
-    ID3D11Texture2D* glowEnvTex = nullptr; ID3D11UnorderedAccessView* glowEnvUAV = nullptr; ID3D11ShaderResourceView* glowEnvSRV = nullptr;
-    // the count-threshold band's zone scale k (cols x rows R32F; pass G5 after each round's G4, read by GlowAdd; t24)
-    ID3D11Texture2D* glowKTex = nullptr;   ID3D11UnorderedAccessView* glowKUAV = nullptr;   ID3D11ShaderResourceView* glowKSRV = nullptr;
-    // C16, only while the band applies (FaldGlowBandActive): G4's per-zone record (Pc, Pf, LIT flag, k0) (cols x rows
-    // RGBA32F, t25) and neighbour bound A_0..A_7 ((2 cols) x rows RGBA32F, t26), G5's Jacobi scratch k (R32F), and G4's
-    // slice partials of A (GlowBandPart records at u3; zones of more than one slice only)
-    ID3D11Texture2D* glowBandTex = nullptr; ID3D11UnorderedAccessView* glowBandUAV = nullptr; ID3D11ShaderResourceView* glowBandSRV = nullptr;
-    ID3D11Texture2D* glowATex = nullptr;    ID3D11UnorderedAccessView* glowAUAV = nullptr;    ID3D11ShaderResourceView* glowASRV = nullptr;
-    ID3D11Texture2D* glowKTmpTex = nullptr; ID3D11UnorderedAccessView* glowKTmpUAV = nullptr; ID3D11ShaderResourceView* glowKTmpSRV = nullptr;
-    ID3D11Buffer* glowBandPartBuf = nullptr; ID3D11UnorderedAccessView* glowBandPartUAV = nullptr;
-    // G5's report (4 x 1 R32F, u2): iterations evaluated, converged (1 / 0), the worst-case pass ran (1 / 0), its zones
-    ID3D11Texture2D* glowGuardTex = nullptr; ID3D11UnorderedAccessView* glowGuardUAV = nullptr; ID3D11ShaderResourceView* glowGuardSRV = nullptr;
-    bool glowBand = false;                   // the band runs this frame (glowOn AND FaldGlowBandActive): CB word 80
-    bool glowOn = false;                     // the fill runs this frame (setting on AND the textures exist): CB word 75
-    bool glowFailLogged = false;
-    unsigned int glowRetryCounter = 0;       // frames since the glow textures failed to create (retry every ~300, like Build)
-    struct GlowCB {                          // the clamped settings of the last FaldRunPasses (CB words 76-78, dump)
-        float strength = 1.0f, capNits = 0.05f; uint32_t reach = 2;
-    } glow;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
     uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)

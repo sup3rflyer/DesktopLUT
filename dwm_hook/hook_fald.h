@@ -2,9 +2,8 @@
 // The FALD (mini-LED local dimming) context-dependence correction, running inside dwm.exe.
 //
 // The STATELESS layer — stat -> boost -> conv -> gain, twice (two inverse rounds), then the pixel
-// pass — plus the stateless starfield feature: starfield balancing (S0-S2, before round 0) and its
-// glow-fill part (G0-G4, after each round's gain; HDR/PQ only, never without starfield). Both are
-// pure functions of the current frame. And LED lag — the temporal drive state (pass 1b modes 1/2 with its delay ring,
+// pass — plus the stateless starfield feature: starfield balancing (S0-S2, before round 0), a
+// pure function of the current frame. And LED lag — the temporal drive state (pass 1b modes 1/2 with its delay ring,
 // pass 1c the panel clock, the settle hold) — whose bookkeeping is shared/fald_temporal.cpp, the SAME code the overlay
 // runs. Its one hook-specific part: DWM presents nothing on a static desktop, so while the state settles the DLL
 // signals DWM_HOOK_FALD_SETTLE_EVENT and the host keeps DWM composing (src/dwm_inject.cpp FaldSettleKickThread).
@@ -36,10 +35,10 @@ struct ID3D11RenderTargetView;
 struct ID3D11Texture2D;
 
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
-// (t0..t26, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
+// (t0..t19, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
-#define HOOK_FALD_SRV_SLOTS 27
-#define HOOK_FALD_UAV_SLOTS 4   // u0..u3: the panel-clock pass (LED lag mode 3) and the glow band G4 bind four
+#define HOOK_FALD_SRV_SLOTS 20
+#define HOOK_FALD_UAV_SLOTS 4   // u0..u3: the panel-clock pass (LED lag mode 3) binds four
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed
 // out by FaldAcquire and released wholesale by FaldReleaseAll (UninitializeStuff).
@@ -97,9 +96,8 @@ ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
 bool HookRequestFullRecompose();
 
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
-// the next run. star / glow: the merged starfield feature and its glow-fill part (glow only with star,
-// and only on a PQ panel file — refused here otherwise). tuning = null: their defaults (older host).
-void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star, bool glow,
+// the next run. star: starfield balancing. tuning = null: its defaults (older host).
+void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
                          const DwmHookFaldTuning* tuning);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,

@@ -4,7 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
-#include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp, FaldGlowClamp
+#include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
 #include "displayconfig.h"   // IsValidSdrWhiteNits
 #include <algorithm>
 #include <cwchar>
@@ -144,12 +144,9 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileStringW(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
-    // glow fill (experimental, default off; work guide S2)
-    const FaldGlowSettings& gl = cc.fald.glow;
-    WritePrivateProfileBool(section, (p + L"FaldGlowFill").c_str(), gl.enabled, iniPath);
-    WritePrivateProfileFloat(section, (p + L"FaldGlowStrength").c_str(), gl.strength, iniPath);
-    WritePrivateProfileStringW(section, (p + L"FaldGlowReach").c_str(), std::to_wstring(gl.reach).c_str(), iniPath);
-    WritePrivateProfileFloat(section, (p + L"FaldGlowCapNits").c_str(), gl.capNits, iniPath);
+    // the glow fill's keys (work guide S2, removed 2026-10-07): deleted, so a saved file carries no dead switch
+    for (const wchar_t* k : { L"FaldGlowFill", L"FaldGlowStrength", L"FaldGlowReach", L"FaldGlowCapNits" })
+        WritePrivateProfileStringW(section, (p + k).c_str(), nullptr, iniPath);
 }
 
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
@@ -216,18 +213,6 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         st.nbHi = GetPrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
         FaldStarfieldClamp(st);
         cc.fald.star = st;
-    }
-    {
-        // glow fill: absent keys = the defaults (off); every value is clamped to its range (FaldGlowClamp)
-        FaldGlowSettings gl;        // defaults = DLC GlowFillParams
-        gl.enabled = GetPrivateProfileBool(section, (p + L"FaldGlowFill").c_str(), false, iniPath);
-        if (p == L"SDR_") gl.enabled = false;   // HDR only (fald.h FaldGlowSupported): the numbers persist, the SDR switch does not
-        gl.strength = GetPrivateProfileFloat(section, (p + L"FaldGlowStrength").c_str(), gl.strength, iniPath);
-        int gr = (int)GetPrivateProfileIntW(section, (p + L"FaldGlowReach").c_str(), (int)gl.reach, iniPath);
-        gl.reach = gr < 0 ? 0u : (unsigned int)gr;
-        gl.capNits = GetPrivateProfileFloat(section, (p + L"FaldGlowCapNits").c_str(), gl.capNits, iniPath);
-        FaldGlowClamp(gl);
-        cc.fald.glow = gl;
     }
 }
 

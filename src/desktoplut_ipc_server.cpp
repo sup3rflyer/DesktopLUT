@@ -755,15 +755,6 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_star_reach", JNum((double)fs.star.reach));
                 l.set("fald_star_nb_lo", JNum((double)fs.star.nbLo));
                 l.set("fald_star_nb_hi", JNum((double)fs.star.nbHi));
-                // glow fill (runtime.fald_glowfill; work guide S2)
-                l.set("fald_glowfill", JBool(fs.glow.enabled));
-                l.set("fald_glow_strength", JNum((double)fs.glow.strength));
-                l.set("fald_glow_reach", JNum((double)fs.glow.reach));
-                l.set("fald_glow_cap_nits", JNum((double)fs.glow.capNits));
-                // glow fill is part of the starfield feature: the stored switch runs only while starfield is on (HDR only)
-                l.set("fald_glow_active", JBool(fs.glow.enabled && fs.star.enabled && isHDR));
-                if (!isHDR) l.set("fald_glow_note", JStr(FALD_GLOW_SDR_NOTE));   // why the SDR pair's switch cannot be set
-                else if (fs.glow.enabled && !fs.star.enabled) l.set("fald_glow_note", JStr(FALD_GLOW_NEEDS_STAR_NOTE));
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)
                 uint32_t transfer = 0;
@@ -1601,7 +1592,7 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // <-> SDR: refused otherwise — the render side would refuse it too). Re-setting the SAME path bumps
 // reloadSeq so a file re-exported in place rebuilds. runtime.fald_debug {monitor, mode,
 // debug_mode 0..6}: 0 correct, 1 gain map (white 0, red brighten, blue darken, +-25 %), 2 B_true, 3 B_est, 4 identity passthrough, 5 pedestal term
-// x100, 6 per-channel-vs-white influence x100, 7 temporal settling, 8 the black-frame boost's non-black zone map (FLD4 files), 9 the starfield balancing zone map, 10 the glow fill's added request x1000 (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
+// x100, 6 per-channel-vs-white influence x100, 7 temporal settling, 8 the black-frame boost's non-black zone map (FLD4 files), 9 the starfield balancing zone map (not persisted); optional ped_mode 0|1 (persisted; the GUI "Per-channel pedestal" toggle: 1 = subtract the
 // FLD2 file's pedestal colour per channel, 0 = white pedestal as before). runtime.fald_dump {monitor, mode, dir}: next frame writes drive/B_true/B_est/
 // frame (input) + fald_out (output) dumps to dir (reference comparison against the Python model).
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
@@ -1655,12 +1646,12 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* v = p.find("debug_mode");
     const JsonValue* pm = p.find("ped_mode");
-    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..10) or ped_mode (0|1)"; return; }
+    if ((!v || v->type != JsonValue::Num) && (!pm || pm->type != JsonValue::Num)) { error = "missing parameter: debug_mode (0..9) or ped_mode (0|1)"; return; }
     unsigned int mode = 0, ped = 0;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 10 ? 10 : v->num));
+        if (v && v->type == JsonValue::Num) fs.debugMode = (unsigned int)(v->num < 0 ? 0 : (v->num > 9 ? 9 : v->num));
         if (pm && pm->type == JsonValue::Num) fs.pedMode = (pm->num >= 0.5) ? 1u : 0u;
         mode = fs.debugMode; ped = fs.pedMode;
     }
@@ -1806,54 +1797,6 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("reach", JNum((double)out.reach));
     result.set("nb_lo", JNum((double)out.nbLo));
     result.set("nb_hi", JNum((double)out.nbHi));
-}
-
-// runtime.fald_glowfill {monitor, mode, enabled?, strength?, reach?, cap_nits?}: the glow fill (EXPERIMENT, default off;
-// work guide S2, reference DLC dlc/fald/glowfill.py). Partial updates; persisted per mode (the GUI row sets both modes).
-// Every value is validated BEFORE anything is stored; error texts are mirrored by the DLC mock word for word.
-void DoFaldGlowFill(const JsonValue& p, JsonValue& result, std::string& error) {
-    int mon; bool isHDR;
-    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    const JsonValue* en = p.find("enabled");
-    if (en && en->type != JsonValue::Bool) { error = "enabled must be a boolean"; return; }
-    const JsonValue* vs = p.find("strength");
-    const JsonValue* vr = p.find("reach");
-    const JsonValue* vc = p.find("cap_nits");
-    if (vs && vs->type != JsonValue::Num) vs = nullptr;
-    if (vr && vr->type != JsonValue::Num) vr = nullptr;
-    if (vc && vc->type != JsonValue::Num) vc = nullptr;
-    if (vs && !(vs->num >= 0.0 && vs->num <= 1.0)) { error = "strength must be 0..1"; return; }
-    if (vr && (!(vr->num >= (double)FALD_GLOW_REACH_MIN && vr->num <= (double)FALD_GLOW_REACH_MAX) || vr->num != (double)(long long)vr->num)) {
-        error = "reach must be an integer 1..4"; return;
-    }
-    if (vc && !(vc->num >= (double)FALD_GLOW_CAP_MIN && vc->num <= (double)FALD_GLOW_CAP_MAX)) { error = "cap_nits must be 0.005..0.5"; return; }
-    if (!en && !vs && !vr && !vc) { error = "missing parameter: enabled, strength, reach or cap_nits"; return; }
-    if (en && en->b && !isHDR) { error = FALD_GLOW_SDR_NOTE; return; }   // HDR only (fald.h FaldGlowSupported)
-    FaldGlowSettings out;
-    bool starOn = false;
-    {
-        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        FaldGlowSettings gl = fs.glow;
-        if (en) gl.enabled = en->b;
-        if (vs) gl.strength = (float)vs->num;
-        if (vr) gl.reach = (unsigned int)vr->num;
-        if (vc) gl.capNits = (float)vc->num;
-        FaldGlowClamp(gl);
-        fs.glow = gl;
-        out = gl;
-        starOn = fs.star.enabled;
-    }
-    SaveSettings();
-    FaldPropagate(mon, isHDR);
-    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
-    result.set("enabled", JBool(out.enabled));
-    result.set("strength", JNum((double)out.strength));
-    result.set("reach", JNum((double)out.reach));
-    result.set("cap_nits", JNum((double)out.capNits));
-    // Part of the starfield feature: the switch is stored either way, but the fill runs only while starfield runs.
-    result.set("active", JBool(out.enabled && starOn && isHDR));
-    if (out.enabled && !starOn) result.set("note", JStr(FALD_GLOW_NEEDS_STAR_NOTE));
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -2464,7 +2407,6 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_dump") DoFaldDump(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_temporal") DoFaldTemporal(*r->params, *r->result, *r->error);
         else if (m == "runtime.fald_starfield") DoFaldStarfield(*r->params, *r->result, *r->error);
-        else if (m == "runtime.fald_glowfill") DoFaldGlowFill(*r->params, *r->result, *r->error);
         else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);

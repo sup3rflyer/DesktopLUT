@@ -126,7 +126,7 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top);
 struct LocalFaldParams {
 	int left, top;
 	unsigned int flags;
-	bool hasTuning;             // tuning came from the host's tail; false = run starfield / glow on defaults
+	bool hasTuning;             // tuning came from the host's tail; false = run starfield on defaults
 	DwmHookFaldTuning tuning;
 };
 extern LocalFaldParams g_localFald[MAX_DWM_HOOK_MONITORS];

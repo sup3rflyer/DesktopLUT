@@ -101,7 +101,7 @@ static_assert(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * sizeof(ui
 #define DWM_HOOK_FALD_SUBDIR_A  "fald"
 #define DWM_HOOK_FALD_SUBDIR_W  L"fald"
 
-// faldFlags[i] layout. debugMode is the same 0..10 scale as the overlay path (shared/fald_shader.h):
+// faldFlags[i] layout. debugMode is the same 0..9 scale as the overlay path (shared/fald_shader.h):
 // 0 = normal output, 4 = identity passthrough (the H4 bit-for-bit check), others are debug views.
 #define DWM_HOOK_FALD_ENABLED_BIT   0x00000001u
 #define DWM_HOOK_FALD_DEBUG_SHIFT   1
@@ -109,32 +109,28 @@ static_assert(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * sizeof(ui
 #define DWM_HOOK_FALD_PEDMODE_BIT   0x00000020u   // bit 5 (per-channel pedestal)
 #define DWM_HOOK_FALD_DEBUG_MAX     15u
 
-// Starfield (work guide S1) and its glow-fill part (S2): ONE feature. Glow fill never runs without
-// starfield — the host packs the glow bit only when both are on — and only on PQ (HDR) panel files.
+// Starfield (work guide S1). Bit 7 was the glow fill's (S2, removed 2026-10-07): never set, ignored.
 #define DWM_HOOK_FALD_STAR_BIT      0x00000040u   // bit 6: starfield balancing
-#define DWM_HOOK_FALD_GLOW_BIT      0x00000080u   // bit 7: its glow-fill part
 
-static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int glow = 0) {
+static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0) {
     if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
     return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
          | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
          | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u)
-         | (star ? DWM_HOOK_FALD_STAR_BIT : 0u)
-         | ((star && glow) ? DWM_HOOK_FALD_GLOW_BIT : 0u);
+         | (star ? DWM_HOOK_FALD_STAR_BIT : 0u);
 }
 static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
 static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
 static inline int      DwmHookFaldPedMode(uint32_t w)  { return (w & DWM_HOOK_FALD_PEDMODE_BIT) != 0; }
 static inline int      DwmHookFaldStar(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) != 0; }
-static inline int      DwmHookFaldGlow(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) && (w & DWM_HOOK_FALD_GLOW_BIT); }
 
 // ---------------------------------------------------------------------------
-// Tuning tail — the starfield / glow-fill parameters (floats), appended AFTER DwmHookSharedConfig
+// Tuning tail — the starfield parameters (floats), appended AFTER DwmHookSharedConfig
 // ---------------------------------------------------------------------------
 // The head struct above is frozen at 464 bytes (an older DwmHook.dll still resident in dwm.exe maps
 // exactly that much). The host creates the mapping sizeof(DwmHookSharedConfigEx) long; an old DLL
 // maps the first 464 bytes and never sees the tail, a new DLL paired with an old host (464-byte
-// mapping) fails to map the full size, falls back to the head and runs starfield / glow on their
+// mapping) fails to map the full size, falls back to the head and runs starfield on its
 // defaults. The tail is written inside the SAME seqlock as the head (the head's `version`), so a
 // reader copies head + tail in one consistent snapshot. `magic` + `layoutVersion` + `tuningBytes`
 // let a reader reject a tail it does not understand instead of misreading it.
@@ -167,9 +163,9 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     float    starKeepNits, starCapNits, starStrength, starAreaLo;
     float    starAreaHi, starPeakHi, starNbLo, starNbHi;
     uint32_t starReach, starEvenReach;
-    // glow fill (CB words 76-78; same fields and clamps as src FaldGlowSettings)
-    float    glowStrength, glowCapNits;
-    uint32_t glowReach;
+    // three words that held the glow fill's settings (S2, removed 2026-10-07): written 0, never read. Kept so the
+    // fields below stay where an already-resident DLL (layoutVersion 1) reads them.
+    uint32_t _retiredGlow[3];
     // LED lag = the temporal drive state (shared/fald_temporal.h FaldTemporalSettings) + the monitor's refresh period
     // (mode 3's grid). Taken from _reserved: a tail from a host that predates them reads 0 = LED lag off.
     uint32_t tempMode;               // 0 off, 1 both fields, 2 B_true only, 3 panel clock

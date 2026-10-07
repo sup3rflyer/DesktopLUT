@@ -1141,7 +1141,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				g_sharedMemHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, DWM_HOOK_CONFIG_NAME);
 				if (g_sharedMemHandle) {
 					// Head + FALD tuning tail; an older host's mapping is the 464-byte head only, and
-					// then starfield / glow fill run on their defaults.
+					// then starfield runs on its defaults.
 					g_sharedConfig = (const DwmHookSharedConfig*)MapViewOfFile(
 						g_sharedMemHandle, FILE_MAP_READ, 0, 0, sizeof(DwmHookSharedConfigEx));
 					g_sharedHasTail = (g_sharedConfig != NULL);

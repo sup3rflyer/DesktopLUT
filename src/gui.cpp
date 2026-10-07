@@ -377,7 +377,7 @@ static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
     SaveSettings();
     UpdateGUIState();
     if (enabledNow && g_dwmHookMode.load())
-        SetStatus(L"FALD in DWM hook mode: correction, Starfield (glow fill included) and LED lag");
+        SetStatus(L"FALD in DWM hook mode: correction, Starfield and LED lag");
 }
 
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
@@ -445,7 +445,7 @@ void UpdateColorCorrectionControls() {
         sdrCC.fald.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowText(g_gui.hwndFaldSdrPath, sdrCC.fald.paramsPath.c_str());
     const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
-    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 10 ? shown.debugMode : 0), 0);
+    SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 9 ? shown.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= FALD_TEMPORAL_PANEL ? shown.temporalMode : 0), 0);
     ShowFaldTemporalRow(shown.temporalMode == FALD_TEMPORAL_PANEL);
@@ -482,20 +482,8 @@ void UpdateColorCorrectionControls() {
     }
     if (GetFocus() != g_gui.hwndFaldStarReach)
         SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(shown.star.evenReach).c_str());
-    // glow fill row (work guide S2)
-    SendMessage(g_gui.hwndFaldGlowEnable, BM_SETCHECK, hdrCC.fald.glow.enabled ? BST_CHECKED : BST_UNCHECKED, 0);   // HDR only
-    if (GetFocus() != g_gui.hwndFaldGlowStrength) {  // don't fight a value being typed
-        _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), shown.glow.strength);
-        SetWindowText(g_gui.hwndFaldGlowStrength, tauBuf);
-    }
-    if (GetFocus() != g_gui.hwndFaldGlowCap) {
-        _swprintf_s_l(tauBuf, 32, L"%.3f", GetCLocale(), shown.glow.capNits);
-        SetWindowText(g_gui.hwndFaldGlowCap, tauBuf);
-    }
-    if (GetFocus() != g_gui.hwndFaldGlowReach)
-        SetWindowText(g_gui.hwndFaldGlowReach, std::to_wstring(shown.glow.reach).c_str());
     // The whole layer runs in both paths (overlay: src/fald.cpp; DWM hook: dwm_hook/hook_fald.cpp), so every FALD
-    // control is live in either mode; only the glow-fill row depends on another switch (below).
+    // control is live in either mode.
     EnableWindow(g_gui.hwndFaldEnable, TRUE);
     EnableWindow(g_gui.hwndFaldSdrEnable, TRUE);
     EnableWindow(g_gui.hwndFaldDebug, TRUE);
@@ -508,20 +496,13 @@ void UpdateColorCorrectionControls() {
     EnableWindow(g_gui.hwndFaldDelay, TRUE);
     EnableWindow(g_gui.hwndFaldClosure, TRUE);
     EnableWindow(g_gui.hwndFaldParity, TRUE);
-    // Starfield (with its glow-fill part) runs in both paths. Glow fill is part of the starfield feature:
-    // its row is live only while Starfield is on (it never runs without it).
+    // Starfield runs in both paths.
     EnableWindow(g_gui.hwndFaldStarEnable, TRUE);
     EnableWindow(g_gui.hwndFaldStarEven, TRUE);
     EnableWindow(g_gui.hwndFaldStarKeep, TRUE);
     EnableWindow(g_gui.hwndFaldStarStrength, TRUE);
     EnableWindow(g_gui.hwndFaldStarReach, TRUE);
     EnableWindow(g_gui.hwndFaldStarSigma, TRUE);
-    // The glow checkbox is the HDR slot's switch (glow fill is HDR only), so the row follows HDR's Starfield — not the
-    // slot the monitor happens to show (the Starfield row sets both modes, but the pipe / INI can make them differ).
-    EnableWindow(g_gui.hwndFaldGlowEnable, hdrCC.fald.star.enabled);
-    EnableWindow(g_gui.hwndFaldGlowStrength, hdrCC.fald.star.enabled);
-    EnableWindow(g_gui.hwndFaldGlowReach, hdrCC.fald.star.enabled);
-    EnableWindow(g_gui.hwndFaldGlowCap, hdrCC.fald.star.enabled);
 
     // MaxTML
     SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
@@ -1443,7 +1424,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == CBN_SELCHANGE) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= 10) ? (unsigned int)sel : 0u;   // one entry per debug view 0..10
+                    unsigned int mode = (sel >= 0 && sel <= 9) ? (unsigned int)sel : 0u;   // one entry per debug view 0..9
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads these
                         FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
@@ -1591,9 +1572,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         FaldSlot(false).star.enabled = on;
                     }
                     ApplyFaldSharedSettingChange();
-                    UpdateColorCorrectionControls();   // the glow-fill row follows the Starfield switch
                     if (on)
-                        SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose; glow fill (HDR) rides along when ticked");
+                        SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose");
                 }
             }
             return 0;
@@ -1655,76 +1635,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         }
                     }
                     SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(v).c_str());
-                    if (changed) ApplyFaldSharedSettingChange();
-                }
-            }
-            return 0;
-        // Glow fill row (EXPERIMENT, work guide S2): enable + strength / reach / cap nits, both modes at once like View.
-        // Persisted. Same edit rule as the Starfield row: losing the focus is not an edit.
-        case ID_CORR_FALD_GLOW_ENABLE:
-            if (HIWORD(wParam) == BN_CLICKED) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    bool on = (SendMessage(g_gui.hwndFaldGlowEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        FaldSlot(true).glow.enabled = on;       // HDR only (fald.h FaldGlowSupported): the SDR slot's switch
-                        FaldSlot(false).glow.enabled = false;   // stays off — the ceiling's levels are HDR measurements
-                    }
-                    ApplyFaldSharedSettingChange();
-                    if (on)
-                        SetStatus(CurrentMonitorIsHDR()
-                            ? L"FALD glow fill on (part of Starfield, unmeasured on HW): adds light to black between glowing areas on purpose"
-                            : L"FALD glow fill is HDR only (its request ceiling is measured in HDR): on for this monitor's HDR mode, not in SDR");
-                }
-            }
-            return 0;
-        case ID_CORR_FALD_GLOW_STRENGTH:
-        case ID_CORR_FALD_GLOW_CAP:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    const bool isCap = (LOWORD(wParam) == ID_CORR_FALD_GLOW_CAP);         // cap_nits 0.005..0.5, shown %.3f
-                    HWND edit = isCap ? g_gui.hwndFaldGlowCap : g_gui.hwndFaldGlowStrength;
-                    const float vMin = isCap ? FALD_GLOW_CAP_MIN : 0.0f, vMax = isCap ? FALD_GLOW_CAP_MAX : 1.0f;
-                    const float tol = (isCap ? 0.0005f : 0.005f) + 1e-6f;                 // the display rounding
-                    wchar_t buf[32];
-                    GetWindowText(edit, buf, 32);
-                    float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                    if (!(v >= vMin)) v = vMin;
-                    if (v > vMax) v = vMax;
-                    auto field = [isCap](FaldGlowSettings& gl) -> float& { return isCap ? gl.capNits : gl.strength; };
-                    bool changed = false;
-                    float stored = 0.0f;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        stored = field(FaldSlot(CurrentMonitorIsHDR()).glow);
-                        if (fabsf(v - stored) > tol) {
-                            for (bool isHDR : { true, false }) field(FaldSlot(isHDR).glow) = v;   // a real edit: the row sets both modes
-                            changed = true;
-                        }
-                    }
-                    wchar_t shownBuf[32];
-                    _swprintf_s_l(shownBuf, 32, isCap ? L"%.3f" : L"%.2f", GetCLocale(), changed ? v : stored);
-                    SetWindowText(edit, shownBuf);
-                    if (changed) ApplyFaldSharedSettingChange();
-                }
-            }
-            return 0;
-        case ID_CORR_FALD_GLOW_REACH:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    wchar_t buf[32];
-                    GetWindowText(g_gui.hwndFaldGlowReach, buf, 32);
-                    int n = _wtoi(buf);
-                    unsigned int v = n < (int)FALD_GLOW_REACH_MIN ? FALD_GLOW_REACH_MIN : (n > (int)FALD_GLOW_REACH_MAX ? FALD_GLOW_REACH_MAX : (unsigned int)n);
-                    bool changed = false;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        if (FaldSlot(CurrentMonitorIsHDR()).glow.reach != v) {
-                            for (bool isHDR : { true, false }) FaldSlot(isHDR).glow.reach = v;
-                            changed = true;
-                        }
-                    }
-                    SetWindowText(g_gui.hwndFaldGlowReach, std::to_wstring(v).c_str());
                     if (changed) ApplyFaldSharedSettingChange();
                 }
             }
