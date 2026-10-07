@@ -671,19 +671,39 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
 
         DWORD waitResult = WaitForSingleObject(hThread, 4000);
 
-        // Get exit code before closing handle (fallback verification)
-        DWORD exitCode = 0;
-        GetExitCodeThread(hThread, &exitCode);
-        CloseHandle(hThread);
-
         if (waitResult == WAIT_TIMEOUT) {
-            std::wcerr << L"Warning: Remote thread timed out for PID " << pid << L", skipping VirtualFreeEx" << std::endl;
-            // Don't free remoteMem — thread may still be using it
-            CloseHandle(hProcess);
+            // The remote LoadLibraryW is still running (DllMain does real work), so remoteMem may still
+            // be in use: hand the handles to a reaper that frees the page once that thread is done,
+            // instead of leaking a committed page in dwm.exe on every timed-out injection.
+            std::wcerr << L"Warning: Remote thread timed out for PID " << pid
+                       << L", freeing its path buffer once it finishes" << std::endl;
+            struct RemoteReap { HANDLE process; HANDLE thread; LPVOID mem; };
+            auto* reap = new RemoteReap{ hProcess, hThread, remoteMem };
+            HANDLE reaper = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD {
+                auto* r = static_cast<RemoteReap*>(p);
+                if (WaitForSingleObject(r->thread, 120000) == WAIT_OBJECT_0)
+                    VirtualFreeEx(r->process, r->mem, 0, MEM_RELEASE);
+                CloseHandle(r->thread);
+                CloseHandle(r->process);
+                delete r;
+                return 0;
+            }, reap, 0, nullptr);
+            if (reaper) {
+                CloseHandle(reaper);
+            } else {
+                CloseHandle(hThread);   // cannot reap: leave the page (still in use), as before
+                CloseHandle(hProcess);
+                delete reap;
+            }
             anyFailed = true;
             if (firstError.empty()) firstError = L"Remote LoadLibraryW thread timed out in dwm.exe PID " + std::to_wstring(pid);
             continue;
         }
+
+        // Get exit code before closing handle (fallback verification)
+        DWORD exitCode = 0;
+        GetExitCodeThread(hThread, &exitCode);
+        CloseHandle(hThread);
 
         // Verify DLL loaded: try module enumeration first, fall back to exit code
         // Module enumeration can fail under SYSTEM impersonation (CreateToolhelp32Snapshot
