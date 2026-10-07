@@ -125,14 +125,25 @@ CalibState g_calib;
 // the pipe thread waits at most kGuiTimeoutMs, but a handler already running on the GUI
 // thread keeps running after that and must write into memory it co-owns — never into the
 // pipe thread's (by then unwound) stack. WM_CALIB_CMD carries only the id, so a stale or
-// forged message finds nothing to run.
+// forged message finds nothing to run. The message is POSTED and the pipe thread waits on
+// {doneEvent, g_stopEvent}: a disarm (StopCalibrationIpcServer, on the GUI thread) then ends the
+// wait at once and un-registers the call, so the queued message runs nothing — a SendMessage
+// could not be abandoned that way and would execute the command after the human disarmed.
 struct CalibGuiCall {
     std::string method;
     JsonValue params;
     JsonValue result = JObj();
     std::string error;
     std::atomic<bool> done{false};   // release-stored by the GUI thread after result/error
+    HANDLE doneEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);   // set after `done`
+    CalibGuiCall() = default;
+    CalibGuiCall(const CalibGuiCall&) = delete;
+    CalibGuiCall& operator=(const CalibGuiCall&) = delete;
+    ~CalibGuiCall() { if (doneEvent) CloseHandle(doneEvent); }
 };
+// Set by StopCalibrationIpcServer: ends every pipe wait and every pending GUI-call wait.
+// Manual reset; process lifetime (never closed — the server thread may outlive a Stop).
+HANDLE g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 std::mutex g_guiCallsMutex;
 std::map<uint64_t, std::shared_ptr<CalibGuiCall>> g_guiCalls;   // under g_guiCallsMutex
 uint64_t g_nextGuiCallId = 1;                                    // under g_guiCallsMutex
@@ -1959,22 +1970,31 @@ std::string Dispatch(const std::string& request) {
                     id = g_nextGuiCallId++;
                     g_guiCalls[id] = call;
                 }
-                DWORD_PTR res = 0;
-                LRESULT ok = SendMessageTimeoutW(g_gui.hwndMain, WM_CALIB_CMD, (WPARAM)id, 0,
-                                                 SMTO_NORMAL, kGuiTimeoutMs, &res);
+                DWORD w = WAIT_FAILED;
+                const bool posted = call->doneEvent &&
+                                    PostMessageW(g_gui.hwndMain, WM_CALIB_CMD, (WPARAM)id, 0);
+                if (posted) {
+                    HANDLE waits[2] = { call->doneEvent, g_stopEvent };
+                    w = WaitForMultipleObjects(g_stopEvent ? 2 : 1, waits, FALSE, kGuiTimeoutMs);
+                }
                 {
+                    // From here on a still-queued WM_CALIB_CMD finds nothing and runs nothing.
                     std::lock_guard<std::mutex> lk(g_guiCallsMutex);
                     g_guiCalls.erase(id);
                 }
                 if (call->done.load(std::memory_order_acquire)) {
                     result = std::move(call->result);
                     error = call->error;
-                } else if (!ok) {
-                    // Still running on the GUI thread (it keeps its own reference) or never
-                    // delivered: the outcome is unknown, so say so rather than report success.
-                    error = "GUI thread did not respond in time (the command may still complete; re-read state)";
+                } else if (!posted) {
+                    error = "GUI thread did not accept the command";
+                } else if (w == WAIT_OBJECT_0 + 1) {
+                    // Disarmed. Not started = never runs; already running (nested in a pumping
+                    // GUI handler) = finishes into the call it co-owns. Unknown either way.
+                    error = "calibration control was disarmed (the command may not have run; re-read state)";
                 } else {
-                    error = "GUI thread did not run the command";
+                    // Still running on the GUI thread (it keeps its own reference) or never
+                    // reached: the outcome is unknown, so say so rather than report success.
+                    error = "GUI thread did not respond in time (the command may still complete; re-read state)";
                 }
             }
         } else {
@@ -1992,7 +2012,6 @@ std::string Dispatch(const std::string& request) {
 // ===========================================================================
 // Pipe server
 // ===========================================================================
-std::atomic<bool> g_stop{false};
 HANDLE g_serverThread = nullptr;
 
 bool ServerEnabled() {
@@ -2039,25 +2058,86 @@ PSECURITY_DESCRIPTOR BuildLocalUserSd() {
     return sd;
 }
 
-void HandleConnection(HANDLE pipe) {
+// ---- Overlapped pipe I/O with deadlines -------------------------------------
+// The pipe is a single instance, so a client that connects and then stalls (never sends its line,
+// never reads the reply — e.g. a DLC call that timed out and orphaned its connection) used to wedge
+// the server for good: blocking ReadFile/WriteFile, FlushFileBuffers waiting for a reader, and a Stop
+// whose self-connect failed with ERROR_PIPE_BUSY. Every wait below is bounded and also ends on the
+// stop event.
+constexpr DWORD kRequestReadDeadlineMs = 15000;   // the client writes its line right after connecting
+constexpr DWORD kReplyWriteDeadlineMs  = 15000;
+constexpr DWORD kClientCloseWaitMs     = 5000;    // the client closes after reading its reply line
+
+enum class IoResult { Done, Failed, TimedOut, Stopped };
+
+// Waits for an overlapped operation that was just started (`started` = its return value).
+IoResult FinishOverlapped(HANDLE pipe, OVERLAPPED& ov, BOOL started, DWORD timeoutMs, DWORD& bytes) {
+    bytes = 0;
+    if (!started) {
+        const DWORD e = GetLastError();
+        if (e != ERROR_IO_PENDING) return IoResult::Failed;
+    }
+    HANDLE waits[2] = { ov.hEvent, g_stopEvent };
+    const DWORD w = WaitForMultipleObjects(2, waits, FALSE, timeoutMs);
+    if (w != WAIT_OBJECT_0) {
+        CancelIoEx(pipe, &ov);
+        GetOverlappedResult(pipe, &ov, &bytes, TRUE);   // the cancelled op must finish before `ov` dies
+        return (w == WAIT_OBJECT_0 + 1) ? IoResult::Stopped : IoResult::TimedOut;
+    }
+    return GetOverlappedResult(pipe, &ov, &bytes, FALSE) ? IoResult::Done : IoResult::Failed;
+}
+
+struct OverlappedEvent {
+    OVERLAPPED ov{};
+    OverlappedEvent() { ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr); }
+    ~OverlappedEvent() { if (ov.hEvent) CloseHandle(ov.hEvent); }
+    OVERLAPPED& Reset() { HANDLE e = ov.hEvent; ov = OVERLAPPED{}; ov.hEvent = e; ResetEvent(e); return ov; }
+    OverlappedEvent(const OverlappedEvent&) = delete;
+    OverlappedEvent& operator=(const OverlappedEvent&) = delete;
+};
+
+bool WriteAllOverlapped(HANDLE pipe, OverlappedEvent& io, const std::string& data, DWORD deadlineTick) {
+    size_t off = 0;
+    while (off < data.size()) {
+        const DWORD now = GetTickCount();
+        if ((LONG)(deadlineTick - now) <= 0) return false;
+        OVERLAPPED& ov = io.Reset();
+        DWORD n = 0;
+        const BOOL ok = WriteFile(pipe, data.data() + off, (DWORD)(data.size() - off), nullptr, &ov);
+        if (FinishOverlapped(pipe, ov, ok, deadlineTick - now, n) != IoResult::Done || n == 0) return false;
+        off += n;
+    }
+    return true;
+}
+
+void HandleConnection(HANDLE pipe, OverlappedEvent& io) {
     std::string request;
     char buf[4096];
-    DWORD read = 0;
+    bool gotLine = false;
+    const DWORD readDeadline = GetTickCount() + kRequestReadDeadlineMs;
     while (request.size() < kMaxRequestBytes) {
-        if (!ReadFile(pipe, buf, sizeof(buf), &read, nullptr) || read == 0) break;
-        request.append(buf, read);
+        const DWORD now = GetTickCount();
+        if ((LONG)(readDeadline - now) <= 0) return;   // stalled client: drop it
+        OVERLAPPED& ov = io.Reset();
+        DWORD n = 0;
+        const BOOL ok = ReadFile(pipe, buf, sizeof(buf), nullptr, &ov);
+        if (FinishOverlapped(pipe, ov, ok, readDeadline - now, n) != IoResult::Done || n == 0) break;
+        request.append(buf, n);
         size_t nl = request.find('\n');
-        if (nl != std::string::npos) { request.resize(nl); break; }
+        if (nl != std::string::npos) { request.resize(nl); gotLine = true; break; }
     }
-    if (request.size() >= kMaxRequestBytes) {
-        std::string resp = ErrResponse("request too large") + "\n";
-        DWORD written = 0;
-        WriteFile(pipe, resp.data(), (DWORD)resp.size(), &written, nullptr);
-        return;
-    }
-    std::string response = Dispatch(request) + "\n";
-    DWORD written = 0;
-    WriteFile(pipe, response.data(), (DWORD)response.size(), &written, nullptr);
+    std::string response;
+    if (request.size() >= kMaxRequestBytes) response = ErrResponse("request too large") + "\n";
+    else if (!gotLine && request.empty()) return;   // closed / failed before sending anything
+    else response = Dispatch(request) + "\n";
+    if (!WriteAllOverlapped(pipe, io, response, GetTickCount() + kReplyWriteDeadlineMs)) return;
+    // Instead of FlushFileBuffers (which blocks until the client has read everything — forever for a
+    // client that never reads): wait, bounded, for the client to close its end after reading the reply,
+    // so the disconnect does not discard data it is still reading.
+    OVERLAPPED& ov = io.Reset();
+    DWORD n = 0;
+    const BOOL ok = ReadFile(pipe, buf, sizeof(buf), nullptr, &ov);
+    FinishOverlapped(pipe, ov, ok, kClientCloseWaitMs, n);
 }
 
 DWORD WINAPI ServerThreadProc(LPVOID) {
@@ -2070,29 +2150,50 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
         return 0;
     }
     SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
-    while (!g_stop.load()) {
+    OverlappedEvent io;
+    if (!io.ov.hEvent) { LocalFree(sd); return 0; }
+    DWORD lastCreateError = 0;
+    while (WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
+        // FILE_FLAG_FIRST_PIPE_INSTANCE: never serve under a name another process created first.
         HANDLE pipe = CreateNamedPipeW(
             kPipeName,
-            PIPE_ACCESS_DUPLEX,
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,                       // single instance — one client at a time
             64 * 1024, 64 * 1024,
             0,
             &sa);
-        if (pipe == INVALID_HANDLE_VALUE) { Sleep(500); continue; }
-
-        BOOL connected = ConnectNamedPipe(pipe, nullptr)
-                             ? TRUE
-                             : (GetLastError() == ERROR_PIPE_CONNECTED);
-        if (g_stop.load()) { CloseHandle(pipe); break; }
-        if (connected) {
-            HandleConnection(pipe);
-            FlushFileBuffers(pipe);
+        if (pipe == INVALID_HANDLE_VALUE) {
+            const DWORD e = GetLastError();
+            if (e != lastCreateError) {   // once per distinct failure, not every 500 ms
+                std::cerr << "[Calibration IPC] CreateNamedPipe failed (error " << e
+                          << (e == ERROR_ACCESS_DENIED ? ", name already in use" : "") << "); retrying"
+                          << std::endl;
+                lastCreateError = e;
+            }
+            if (WaitForSingleObject(g_stopEvent, 500) == WAIT_OBJECT_0) break;
+            continue;
         }
+        lastCreateError = 0;
+
+        OVERLAPPED& ov = io.Reset();
+        bool connected = false;
+        if (ConnectNamedPipe(pipe, &ov)) {
+            connected = true;
+        } else {
+            const DWORD e = GetLastError();
+            if (e == ERROR_PIPE_CONNECTED) {
+                connected = true;
+            } else if (e == ERROR_IO_PENDING) {
+                DWORD n = 0;
+                connected = (FinishOverlapped(pipe, ov, FALSE, INFINITE, n) == IoResult::Done);
+            }
+        }
+        if (connected && WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) HandleConnection(pipe, io);
         DisconnectNamedPipe(pipe);
         CloseHandle(pipe);
     }
-    if (sd) LocalFree(sd);
+    LocalFree(sd);
     return 0;
 }
 
@@ -2114,21 +2215,37 @@ bool IsCalibrationOrLiveEditActive() {
 }
 
 void StartCalibrationIpcServer() {
-    if (g_serverThread) return;
+    if (g_serverThread) {
+        if (!g_stopEvent || WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0)
+            return;   // the live server — already armed
+        // A stopped server still finishing a slow request (its stop event is set, so it is on its way
+        // out): start the new one only once it is gone — two would race for the single pipe instance.
+        if (WaitForSingleObject(g_serverThread, 10000) != WAIT_OBJECT_0) {
+            std::cerr << "[Calibration IPC] previous server still finishing a request; not re-armed "
+                         "(toggle Calibration control again)" << std::endl;
+            return;
+        }
+        CloseHandle(g_serverThread);
+        g_serverThread = nullptr;
+    }
     if (!ServerEnabled()) return;  // SECURITY: opt-in only
-    g_stop.store(false);
+    if (!g_stopEvent) return;
+    ResetEvent(g_stopEvent);
     g_serverThread = CreateThread(nullptr, 0, ServerThreadProc, nullptr, 0, nullptr);
 }
 
 void StopCalibrationIpcServer() {
     if (!g_serverThread) return;
-    g_stop.store(true);
-    // Unblock a pending ConnectNamedPipe by connecting to ourselves.
-    HANDLE h = CreateFileW(kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
-    WaitForSingleObject(g_serverThread, 5000);
-    CloseHandle(g_serverThread);
-    g_serverThread = nullptr;
+    // Ends every pipe wait (cancelling a stalled client's I/O) and every pending GUI-call wait, so the
+    // server never needs this (GUI) thread to exit: a plain wait, deliberately NOT pumping — Stop runs
+    // from WM_DESTROY, where dispatching queued messages would run handlers mid-teardown.
+    if (g_stopEvent) SetEvent(g_stopEvent);
+    if (WaitForSingleObject(g_serverThread, 5000) == WAIT_OBJECT_0) {
+        CloseHandle(g_serverThread);
+        g_serverThread = nullptr;
+    }
+    // else: still inside a slow read-only handler (e.g. a DisplayConfig flip); it exits on its own
+    // (the stop event stays set), and a re-arm waits for it (StartCalibrationIpcServer).
 }
 
 LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
@@ -2176,5 +2293,6 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         error = "unhandled exception";
     }
     call->done.store(true, std::memory_order_release);
+    if (call->doneEvent) SetEvent(call->doneEvent);
     return 0;
 }

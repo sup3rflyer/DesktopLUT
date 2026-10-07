@@ -26,7 +26,10 @@
 // runs normally. Call after the GUI window exists and the message loop is ready.
 void StartCalibrationIpcServer();
 
-// Stop and join the control server. Safe to call even if it never started.
+// Stop the control server: ends every pipe wait (a stalled client cannot hold it) and abandons a
+// request still queued for the GUI thread (it then runs nothing), then waits up to 5 s without
+// pumping — safe from WM_DESTROY. A server still inside a slow read-only handler after that exits
+// on its own; a re-arm waits for it. Safe to call even if it never started.
 void StopCalibrationIpcServer();
 
 // A calibration session (calibration.enter .. exit) or a live grayscale edit (mhc.grayscale_live_begin ..

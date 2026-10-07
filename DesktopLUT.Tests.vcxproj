@@ -130,6 +130,7 @@
     <ClCompile Include="tests\test_desktop_gamma_refresh.cpp" />
     <ClCompile Include="tests\test_ipc_json.cpp" />
     <ClCompile Include="tests\test_ipc_grayscale.cpp" />
+    <ClCompile Include="tests\test_ipc_pipe.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>
