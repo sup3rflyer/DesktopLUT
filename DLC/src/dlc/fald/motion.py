@@ -29,9 +29,8 @@ full drive at its level; the upper bracket of border snapping). ``"ctx"`` = the 
 LAYER runs the fit's own statistic (``simulate_scene(layer_stat=None)``: "ctx" for a ``stat_kind`` "ctxpow" fit = the FLD5
 shader, else "area" = the shader today).
 
-Not modelled: LCD transition time (as :mod:`dlc.fald.paneltime`), starfield (S1) and glow fill (S2) (both live in the
-owner's HDR INI; they act on specks / near-black, which the default scenes avoid — a scene on black or with specks
-must say so); the boost table's LIT rule reads the full-resolution peak (:meth:`MotionModel.active_zones`).
+Not modelled: LCD transition time (as :mod:`dlc.fald.paneltime`), starfield balancing (S1: live in the owner's HDR INI;
+it acts on specks, which the default scenes avoid — a scene with specks must say so); the boost table's LIT rule reads the full-resolution peak (:meth:`MotionModel.active_zones`).
 The camera aids' counters show the TPG's PRESENT number; here they show content index + 1 — the aid pixels differ in a
 real play (they are excluded from every score).
 """

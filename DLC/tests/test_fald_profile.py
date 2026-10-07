@@ -234,7 +234,7 @@ def test_stage_preflight_tells_when_a_previous_run_left_calibration_mode_on(tmp_
 def test_stage_restore_does_not_claim_a_stack_it_did_not_restore(tmp_path):
     """phase_restore reported "user stack restored" because calibration.exit RETURNED, never from its `restored`
     flag — so a pass whose DesktopLUT had nothing to put back read as a clean finish. The user's whole FALD
-    configuration (panel file, pedestal mode, temporal, starfield, glow) comes back through that snapshot and no
+    configuration (panel file, pedestal mode, temporal, starfield) comes back through that snapshot and no
     other way, because the flow only ever switches the layer off."""
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
     assert _run(ctx, "preflight").status == "ran"

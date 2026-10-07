@@ -87,14 +87,11 @@ def test_python_reference_constants_match_the_hlsl_source():
     # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43); the temporal drive state fills 44-47,
     # the black-frame LED boost word 34 (step count) and 48-51 (zone activation rule), starfield balancing word 35 (on)
     # and 52-65 (its parameters), the panel clock (temporal mode 3, work guide C13) 66-71, the boost's zone rule (C12b)
-    # 72-74, the glow fill (work guide S2) 75 (on), 76-79 and 80 (the count-threshold band) + three pads — FALD_CB_BYTES 336 = 84 words
+    # 72-74 + one unused pad (75, written 0) — FALD_CB_BYTES 304 = 76 words
     cb = re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", src, re.S).group(1)
     fields = re.findall(r"(?:uint|float) (\w+);", cb)
-    assert len(fields) == 84 and fields[31] == "transfer" and fields[43] == "sdrGamma"
-    assert fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "glowOn"]
-    assert fields[76:80] == ["glowStrength", "glowCapNits", "glowReach", "glowReqCeil"]
-    assert fields[80:84] == ["glowBand", "_padG1", "_padG2", "_padG3"]
-    assert re.search(r"float glowStrength; float glowCapNits; (\w+) glowReach; (\w+) glowReqCeil;", cb).groups() == ("uint", "float")
+    assert len(fields) == 76 and fields[31] == "transfer" and fields[43] == "sdrGamma"
+    assert fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "_pad75"]
     assert fields[64:68] == ["starTargetSigma", "starKeepNits", "clkW0", "clkW1"]
     assert fields[68:72] == ["clkTrue0", "clkEst0", "clkTrue1", "clkEst1"]
     assert fields[44:48] == ["tempAlphaRise", "tempAlphaFall", "tempMode", "tempInit"]
@@ -111,10 +108,8 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "f[64] = sc.targetSigma; f[65] = sc.keepNits;" in cpp
     assert "f[66] = r->clkW[0]; f[67] = r->clkW[1];" in cpp
     assert "f[68] = r->clkFactor[0]; f[69] = r->clkFactor[1]; f[70] = r->clkFactor[2]; f[71] = r->clkFactor[3];" in cpp
-    assert "u[75] = r->glowOn ? 1u : 0u;" in cpp
-    assert "f[76] = r->glow.strength; f[77] = r->glow.capNits; u[78] = r->glow.reach; f[79] = FaldGlowReqCeil(p);" in cpp
-    assert "u[80] = r->glowBand ? 1u : 0u;" in cpp
-    # ... and the DWM hook's (dwm_hook/hook_fald.cpp; its starfield / glow settings come from the tuning tail `t`)
+    assert "u[75] = 0u;" in cpp
+    # ... and the DWM hook's (dwm_hook/hook_fald.cpp; its starfield settings come from the tuning tail `t`)
     hook = _HOOK.read_text(encoding="utf-8")
     assert "u[35] = m->starOn ? 1u : 0u;" in hook
     assert "f[52] = t.starEven; f[53] = t.starLift; f[54] = t.starTargetGain; f[55] = t.starCapNits;" in hook
@@ -123,9 +118,7 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "f[64] = t.starTargetSigma; f[65] = t.starKeepNits;" in hook
     assert "f[66] = m->clkW[0]; f[67] = m->clkW[1];" in hook
     assert "f[68] = m->clkFactor[0]; f[69] = m->clkFactor[1]; f[70] = m->clkFactor[2]; f[71] = m->clkFactor[3];" in hook
-    assert "u[75] = m->glowOn ? 1u : 0u;" in hook
-    assert "f[76] = t.glowStrength; f[77] = t.glowCapNits; u[78] = t.glowReach; f[79] = FaldGlowReqCeil(p);" in hook
-    assert "u[80] = m->glowBand ? 1u : 0u;" in hook
+    assert "u[75] = 0u;" in hook
     decl = re.search(r"float starNbLo; float starNbHi; (\w+) starReach; (\w+) starEvenReach;", cb)
     assert decl.groups() == ("uint", "uint")
 
@@ -247,8 +240,8 @@ def test_knee_ceiling_reads_the_low_passed_estimate_in_the_hlsl_and_both_hosts()
     assert "RWTexture2D<float2> gainOut" in gain_pass and "gainOut[uint2(fx, fy)] = float2(RawGain(bT, bE), bE);" in gain_pass
     blur_pass = src[src.index("g_faldBlurSource"):src.index("g_faldFullscreenVsSource")]
     assert "RWTexture2D<float2> blurOut" in blur_pass and "float2 acc" in blur_pass
-    # every Correct call site samples the two-channel texture
-    assert src.count("float2 g = gainTex.SampleLevel(") == 2 and src.count("float2 gain = gainTex.SampleLevel(") == 1
+    # every Correct call site samples the two-channel texture (the round-1 statistic and the pixel pass)
+    assert src.count("float2 g = gainTex.SampleLevel(") == 1 and src.count("float2 gain = gainTex.SampleLevel(") == 1
     assert "float g = gainTex" not in src and "float gain = gainTex" not in src
     root = _SHADER.parents[1]
     for host in (root / "src" / "fald.cpp", root / "dwm_hook" / "hook_fald.cpp"):
@@ -312,13 +305,9 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
              "boostDimFrac": 51, "starEven": 52, "starCapNits": 55, "starStrength": 56, "starPeakHi": 59, "starNbLo": 60,
              "starReach": 62, "starEvenReach": 63, "starTargetSigma": 64, "starKeepNits": 65, "clkW0": 66, "clkW1": 67,
              "clkTrue0": 68, "clkEst0": 69, "clkTrue1": 70, "clkEst1": 71, "boostRule": 72, "boostMeanGamma": 73,
-             "boostMeanThresh": 74, "glowOn": 75, "glowStrength": 76, "glowCapNits": 77, "glowReach": 78, "glowReqCeil": 79,
-             "glowBand": 80}
+             "boostMeanThresh": 74, "_pad75": 75}
     for shader, target in (("g_faldPixelSource", "ps_5_0"), ("g_faldStatSource", "cs_5_0"), ("g_faldStarStatSource", "cs_5_0"),
                            ("g_faldStarPlanSource", "cs_5_0"), ("g_faldConvSource", "cs_5_0"), ("g_faldPanelClockSource", "cs_5_0"),
-                           ("g_faldGlowZoneSource", "cs_5_0"), ("g_faldGlowDilateSource", "cs_5_0"),
-                           ("g_faldGlowErodeSource", "cs_5_0"), ("g_faldGlowEnvSource", "cs_5_0"), ("g_faldGlowBandSource", "cs_5_0"),
-                           ("g_faldGlowGuardSource", "cs_5_0"),                                  # C16: the neighbour guard G5
                            ("g_faldGainSource", "cs_5_0"), ("g_faldBlurSource", "cs_5_0")):   # the two-channel gain (C15)
         asm = _d3d_disassemble(part("g_faldCommonSource") + part(shader), target)
         block = re.search(r"cbuffer FaldCB\s*//\s*\{(.*?)//\s*\}", asm, re.S).group(1)

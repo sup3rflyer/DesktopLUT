@@ -304,7 +304,7 @@ def test_hlsl_boost_passes_mirror_the_reference():
     loader = (_SHARED / "fald_panel.cpp").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     hook = _HOOK.read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 336" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 84 words since S2 (glow fill)
+    assert "FALD_CB_BYTES = 304" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 76 words since the glow fill (S2) was removed, 2026-10-07
     assert "FALD_MAGIC4 = 0x464C4434u;" in loader and "if (magic == FALD_MAGIC4) return 104 * 4;" in loader   # FLD4 = 416 B
     assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in loader     # panelfile.boost_zone_threshold's twin
     for cpp, v in ((c, "r"), (hook, "m")):                              # both paths read the file with the shared loader

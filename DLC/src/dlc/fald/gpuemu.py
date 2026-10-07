@@ -27,31 +27,19 @@ flags, Correct, the output. ``star=None`` runs none of it (the previous emulator
 the model's scale-5 raster, the emulator on full-resolution pixels: they agree on raster-aligned content (>= 5-px
 features), where the centre pixel of every 5 x 5 block has exactly the raster pixel's bilinear coordinates.
 
-Glow fill (work guide S2; the rules = the module docstring of :mod:`dlc.fald.glowfill`, the reference):
-``run(..., glow=GlowFillParams)`` runs the four glow passes after EACH round's conv pass (:meth:`Emu.glow_zones` = G0
-``g_faldGlowZoneSource`` zone pedestal, G1 ``g_faldGlowDilateSource`` box maximum on the lattice extended by ``reach``,
-G2 ``g_faldGlowErodeSource`` box minimum = the closing, G3 ``g_faldGlowEnvSource`` blur + min + deficit; float32, the
-shaders' loop order), then — files with a boost LUT and the mean zone rule only — the count-threshold band
-(:meth:`Emu.glow_band` = G4 ``g_faldGlowBandSource``: a full-resolution sweep like the statistic pass -> the zone's k0 and
-the neighbour bound A_d; + G5 ``g_faldGlowGuardSource``, the neighbour guard -> the final k, which GlowAdd reads through the
-feather of C16, :meth:`Emu.band_scale_px`; formed in EACH round from that round's request) and adds ``GlowAdd`` (:meth:`Emu.glow_add`) to that round's
-corrected request — round 0's feeds the round-1 statistic / boost flags, round 1's is the output. ``glow=None`` runs none
-of it (the previous emulator, bit for bit). HDR (PQ files) only, like the C++.
-EXACTNESS of the fill against a real device (WARP, 2026-09-20): the zone fields agree to <= 1e-5 relative (float32 sum
-order). With the default float64 sampler weights the filled pixels agree to <= 0.0006 nit but only 20-45 % are bit-equal
-(up to ~2 % apart where the deficit is small at the foot of a ramp): the hardware's bilinear sampler weighs with 8-bit
-sub-texel fractions — a 48-texel field stretched over 3840 px shows it. ``Emu(..., subtexel_bits=8)`` forms the sampler
-fractions (zone AND fine-grid textures AND the drive-curve LUT) the same way: 99.4 % of the filled pixels and 99.9 % of the
-whole frame bit-equal, <= 0.00008 nit. The default stays float64 (the comparisons against the reference need the exact
+EXACTNESS against a real device (WARP, 2026-09-20): a D3D11 device's bilinear sampler weighs with 8-bit sub-texel
+fractions — a 48-texel field stretched over 3840 px shows it (with float64 weights a sampled zone field small at the foot
+of a ramp sat up to ~2 % apart). ``Emu(..., subtexel_bits=8)`` forms the sampler fractions (zone AND fine-grid textures
+AND the drive-curve LUT) the same way. The default stays float64 (the comparisons against the reference need the exact
 coordinates); it is not an order-of-operations difference.
 HOW the device forms the 8-bit fraction differs (probe 2026-09-23, :func:`sampler_truncates`): a hardware GPU (RTX 5090)
 rounds it to nearest on every axis (``sampler="hw"``, the default); the WARP software device TRUNCATES it on x when the
 texture's width is a power of two and on y when both its dimensions are. A replay of WARP dumps passes ``sampler="warp"``.
 Found on a few-zone lattice (work guide C14): 8 x 6 zones at 960 x 540 = zone textures 8 wide, the fine grid 64 wide, the
-curve LUT 1024 — with the rounding model the output sat up to 106 FP16 steps off at the top zone row (a glow deficit
-stepping 0 -> 0.18 nit between a lit corner zone and its neighbour, sampled at a fraction of 0.054: half a 1/256 step is
-3.6 % of the interpolated fill), with WARP's rule every pixel is within one step, the drives equal, the band scales to a few
-float32 ulps (also 7 x 5, 16 x 8 and 4 x 4 lattices, lattice origins != 0, glow off, temporal mode 3).
+curve LUT 1024 — with the rounding model the output sat up to 106 FP16 steps off at the top zone row (a zone field
+stepping steeply between a lit corner zone and its neighbour, sampled at a fraction of 0.054: half a 1/256 step is 3.6 % of
+the interpolated value), with WARP's rule every pixel is within one step and the drives equal (also 7 x 5, 16 x 8 and
+4 x 4 lattices, lattice origins != 0, temporal mode 3).
 The 12 x 12 WARP lattices of the earlier gates (12 / 96 texels) round on WARP too — only their curve LUT truncates."""
 from __future__ import annotations
 
@@ -60,8 +48,6 @@ from typing import Optional
 import numpy as np
 from scipy.signal import convolve2d
 
-from .glowfill import (BAND_HI, BAND_LO, DEFICIT_REL_HI, DEFICIT_REL_LO, FEATHER, GLOW_SIGMA_BASE, GLOW_SIGMA_PER_REACH, GUARD_ITER_MAX,
-                       NEIGHBOURS, REQ_FLOOR_FRAC, REQ_LIT_FRAC, WANT_EPS, GlowFillParams, clamp_params as clamp_glow)
 from .panelfile import boost_of_count
 from .starfield import StarfieldParams
 from .temporal import MODE_BOTH, MODE_OFF, MODE_TRUE_ONLY, alpha_from_tau
@@ -552,248 +538,6 @@ class Emu:
         scale = np.where(acts, out_m / safe, 1.0)
         return np.where(acts[None], img * scale[None], img), scale
 
-    # ---- glow fill (work guide S2): passes G0-G3 + GlowAdd
-    def glow_zones(self, bT, gp: GlowFillParams):
-        """G0-G3 on this round's fine B_true texture (boost included), float32 in the shaders' loop order: ``vz`` (zone
-        mean of white * tmin * max(bT / flatT, 0) over the zone's sub x sub fine texels), ``dil`` (box maximum on the
-        lattice extended by ``reach`` on every side, the field continued by its border values), ``cz`` (box minimum of
-        ``dil`` = the grey closing), ``ez`` = min(Gaussian blur of cz, cz), ``dz`` = (ez - vz) x smoothstep(DEFICIT_REL_LO, DEFICIT_REL_HI, (ez - vz) / vz)."""
-        S, r = self.sub, int(gp.reach)
-        n = (bT.astype(np.float32) / np.maximum(self.flatT, f32(1e-6))).astype(np.float32)
-        n = np.maximum(n, f32(0.0)).reshape(self.rows, S, self.cols, S)
-        acc = np.zeros((self.rows, self.cols), dtype=np.float32)
-        for oy in range(S):                                   # the shader's order: oy outer, ox inner
-            for ox in range(S):
-                acc = (acc + n[:, oy, :, ox]).astype(np.float32)
-        vz = (acc * (f32(self.white) * f32(self.tmin) / f32(S * S))).astype(np.float32)
-        ext = np.pad(vz, 2 * r, mode="edge")                  # V(clamp(z)): the field continued by its border values
-        rows_e, cols_e = self.rows + 2 * r, self.cols + 2 * r
-        dil = None
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                v = ext[r + dy: r + dy + rows_e, r + dx: r + dx + cols_e]
-                dil = v.copy() if dil is None else np.maximum(dil, v)
-        cz = None
-        for dy in range(-r, r + 1):
-            for dx in range(-r, r + 1):
-                v = dil[r + dy: r + dy + self.rows, r + dx: r + dx + self.cols]
-                cz = v.copy() if cz is None else np.minimum(cz, v)
-        sigma = f32(GLOW_SIGMA_BASE) + f32(GLOW_SIGMA_PER_REACH) * f32(r)
-        R = int(np.ceil(3.0 * float(sigma)))
-        pad = np.pad(cz, R, mode="edge")
-        acc = np.zeros_like(cz); wsum = f32(0.0)
-        for dy in range(-R, R + 1):
-            for dx in range(-R, R + 1):
-                w = np.exp(f32(-0.5) * f32(dx * dx + dy * dy) / (sigma * sigma), dtype=np.float32)
-                acc = (acc + w * pad[R + dy: R + dy + self.rows, R + dx: R + dx + self.cols]).astype(np.float32)
-                wsum = f32(wsum + w)
-        ez = np.minimum((acc / wsum).astype(np.float32), cz)
-        d = np.maximum(ez - vz, f32(0.0)).astype(np.float32)
-        dz = (d * smoothstep(f32(DEFICIT_REL_LO), f32(DEFICIT_REL_HI), d / np.maximum(vz, f32(1e-12)))).astype(np.float32)
-        return {"vz": vz, "dil": dil, "cz": cz, "ez": ez, "dz": dz}
-
-    def glow_band_active(self):
-        """C++ FaldGlowBandActive: the count-threshold band applies (a boost LUT AND the mean zone rule)."""
-        return bool(self.boostN) and self.boostRule == 1
-
-    def glow_band(self, req, sT, sE, dz, gp: GlowFillParams):
-        """G4 g_faldGlowBandSource + G5 g_faldGlowGuardSource (glowfill.band_scale, item 7). G4: per zone, over every pixel
-        in the zone sweeps' thread / reduction order, float32 — the sum of (brightest channel)^gamma of the round's request
-        WITHOUT (pc) and WITH the fill of the unscaled deficit (pf), the LIT count of the content, k0 = ((BAND_LO T - pc) /
-        (pf - pc))^(1 / gamma) for a zone not counted by its content whose pf lies in [BAND_LO T, BAND_HI T] (else 1), and
-        (C16) the neighbour bound A_d = the zone mean of w_d q (:meth:`bound_q32`; 0 toward a neighbour outside the
-        lattice). G5: the neighbour guard (:meth:`guard32`) -> the final k GlowAdd reads.
-        ``gp.band_feather`` False: the band before C16 (k = k0; no A, no guard)."""
-        filled, _ = self.glow_add(req, sT, sE, dz, gp)                # k = 1: the unscaled rule
-        n = f32(self.cw * self.ch)
-        rc = self._zone_px(req.max(axis=0).astype(np.float32))       # (rows, cols, cellW * cellH): the sweep's k order
-        rf = self._zone_px(filled.max(axis=0).astype(np.float32))
-        pwc, pwf = self._pow32(rc), self._pow32(rf)
-        pc = (self.zone_sweep_sum(pwc) / n).astype(np.float32)
-        pf = (self.zone_sweep_sum(pwf) / n).astype(np.float32)
-        lit = (rc > self.litNits).sum(axis=-1).astype(np.float32) / n > self.litFrac
-        t = self.meanThresh
-        band0 = (~lit) & (pc < t) & (pf >= f32(BAND_LO) * t) & (pf <= f32(BAND_HI) * t)
-        share = np.clip((f32(BAND_LO) * t - pc) / np.maximum(pf - pc, f32(1e-30)), f32(0.0), f32(1.0)).astype(np.float32)
-        pos = share > 0
-        kk = np.where(pos, np.exp(np.log(np.where(pos, share, f32(1.0)), dtype=np.float32) / self.meanGamma, dtype=np.float32), f32(0.0))
-        k0 = np.where(band0, kk, f32(1.0)).astype(np.float32)
-        none = np.zeros_like(band0)
-        out = {"k": k0, "k0": k0, "pc": pc, "pf": pf, "lit": lit, "band": band0, "band0": band0, "guard_added": none,
-               "iterations": 0, "converged": True, "worst_case": False, "worst_case_added": none, "A": None}
-        if not gp.band_feather:
-            return out
-        q = self.bound_q32(req, sT, sE, dz, gp, rc, pwc, pwf)
-        u, v = self.zone_local32()
-        a = np.zeros((len(NEIGHBOURS), self.rows, self.cols), dtype=np.float32)
-        zy, zx = np.mgrid[0: self.rows, 0: self.cols]
-        for d, (i, j) in enumerate(NEIGHBOURS):
-            w = self._zone_px(self._feather32(i, j, u, v))
-            ad = (self.zone_sweep_sum((w * q).astype(np.float32)) / n).astype(np.float32)
-            exists = (zx + i >= 0) & (zx + i < self.cols) & (zy + j >= 0) & (zy + j < self.rows)
-            a[d] = np.where(exists, ad, f32(0.0))
-        # G5: the zones counted only by the fill (not LIT, pc < T, pf > BAND_HI T, not band0)
-        cand = (~lit) & (pc < t) & (pf > f32(BAND_HI) * t) & ~band0
-        gd = self.guard32(k0, cand, kk, pf, a, (f32(BAND_HI) * t).astype(np.float32))
-        band = band0 | (gd["k"] < f32(1.0))
-        out.update(k=gd["k"], band=band, guard_added=band & ~band0, iterations=gd["iterations"], converged=gd["converged"],
-                   worst_case=gd["worst_case"], worst_case_added=gd["worst_case_added"], A=a)
-        return out
-
-    def ped_m32(self):
-        """HLSL GlowAddK's m = float3(tminR, tminG, tminB) / max(tmin, 1e-30), float32 (the CB carries tmin x pedRGB)."""
-        ped = self.o.get("pedRGB")
-        pr = np.ones(3) if ped is None else np.asarray(ped, dtype=np.float64)
-        t32 = f32(self.tmin)
-        return ((t32 * pr.astype(np.float32)).astype(np.float32) / np.maximum(t32, f32(1e-30))).astype(np.float32)
-
-    def bound_q32(self, req, sT, sE, dz, gp, rc, pwc, pwf):
-        """G4's per-pixel slope of the neighbour bound (glowfill.bound_slope), float32, in the zone-pixel layout: q = the
-        largest chord slope (F(1) - F(sigma)) / (1 - sigma) over the kinks — sigma = s0 = saturate(shown / want) (want /
-        shown as GlowAddK forms them, unscaled want) and the fill levels where the brightest channel changes (pairs of
-        different pedestal multipliers; none with a white pedestal: q = (pf_px - pc_px) / (1 - s0) there)."""
-        want = self._zone_px(self.glow_want(dz, gp).astype(np.float32))
-        bT = self._zone_px(np.maximum(sT, 0.0).astype(np.float32))
-        bE = self._zone_px(sE.astype(np.float32))
-        shown = (rc * bT / np.maximum(bE, f32(1e-9))).astype(np.float32)
-        s0 = np.clip(shown / np.where(want > 0.0, want, f32(1.0)), f32(0.0), f32(1.0)).astype(np.float32)
-        live = (want > 0.0) & (s0 < f32(1.0))
-        rest = np.where(live, f32(1.0) - s0, f32(1.0)).astype(np.float32)
-        q = np.where(live, (pwf - pwc) / rest, f32(0.0)).astype(np.float32)
-        m = self.ped_m32()
-        pairs = [(i, j) for i, j in ((0, 1), (0, 2), (1, 2)) if f32(m[j] - m[i]) != 0.0]
-        if not pairs:
-            return q
-        # the fill's request luminance at sigma = 1: uncapped (a_u) and after the request ceiling (a1), as GlowAddK
-        trust = smoothstep(f32(self.fadeLo), f32(self.fadeHi), bE).astype(np.float32)
-        a_u = (np.maximum(want - shown, f32(0.0)) * trust * np.minimum(bE / np.maximum(bT, f32(1e-9)), f32(self.gmax))).astype(np.float32)
-        room = np.maximum(f32(self.glow_ceiling()) - rc, f32(0.0)).astype(np.float32)
-        a1 = (a_u * np.minimum(f32(1.0), room / np.maximum(a_u * m.max(), f32(1e-30)))).astype(np.float32)
-        c3 = [self._zone_px(req[c].astype(np.float32)) for c in range(3)]
-        for i, j in pairs:
-            ak = ((c3[i] - c3[j]) / f32(m[j] - m[i])).astype(np.float32)
-            ok = live & (ak > 0.0) & (ak < a1)
-            if not ok.any():
-                continue
-            hk = np.maximum(np.maximum(c3[0] + ak * m[0], c3[1] + ak * m[1]), c3[2] + ak * m[2]).astype(np.float32)
-            chord = ((pwf - self._pow32(hk)) / (rest * (f32(1.0) - ak / np.where(ok, a_u, f32(1.0))))).astype(np.float32)
-            q = np.where(ok, np.maximum(q, chord), q).astype(np.float32)
-        return q
-
-    @staticmethod
-    def guard32(k0, cand, k_join, pf, a, hi):
-        """G5 g_faldGlowGuardSource, float32: Jacobi iterations — every zone reads the PREVIOUS iteration's k; a candidate
-        still at k 1 joins (k_join) when pf - loss < hi, loss = the sum over its existing neighbours d (NEIGHBOURS order) of
-        (1 - k_{z+d}) A_d. Until no zone joins, at most GUARD_ITER_MAX iterations; if the last one still added zones, the
-        worst-case pass (every neighbour at k = 0) follows. Returns k, iterations, converged, worst_case, worst_case_added."""
-        k = k0.astype(np.float32).copy()
-        iterations, converged = 0, False
-        for it in range(GUARD_ITER_MAX):
-            iterations = it + 1
-            new = cand & (k >= f32(1.0)) & ((pf - Emu._loss32(k, a)).astype(np.float32) < hi)
-            if not new.any():
-                converged = True
-                break
-            k = np.where(new, k_join, k).astype(np.float32)
-        worst = np.zeros_like(cand)
-        if not converged:
-            worst = cand & (k >= f32(1.0)) & ((pf - Emu._loss32(np.zeros_like(k), a)).astype(np.float32) < hi)
-            k = np.where(worst, k_join, k).astype(np.float32)
-        return {"k": k, "iterations": iterations, "converged": converged, "worst_case": not converged, "worst_case_added": worst}
-
-    @staticmethod
-    def _loss32(k, a):
-        rows, cols = k.shape
-        loss = np.zeros((rows, cols), dtype=np.float32)
-        for d, (i, j) in enumerate(NEIGHBOURS):
-            ys, xs = slice(max(0, -j), rows - max(0, j)), slice(max(0, -i), cols - max(0, i))
-            kn = k[max(0, j): rows + min(0, j), max(0, i): cols + min(0, i)]
-            loss[ys, xs] = (loss[ys, xs] + ((f32(1.0) - kn) * a[d][ys, xs]).astype(np.float32)).astype(np.float32)
-        return loss
-
-    def _zone_px(self, a):
-        """(H, W) -> (rows, cols, cellW * cellH): each zone's pixels, row-major inside the zone (the sweeps' index k)."""
-        s = a[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw]
-        return s.reshape(self.rows, self.ch, self.cols, self.cw).transpose(0, 2, 1, 3).reshape(self.rows, self.cols, self.ch * self.cw)
-
-    def zone_local32(self):
-        """HLSL GlowZoneLocal for every frame column / row (float32; meaningful on the lattice): u = (px + 0.5 - originX) /
-        cellW - zx, v likewise, zx / zy the pixel's zone."""
-        xs, ys = np.arange(self.W), np.arange(self.H)
-        zx = np.clip((xs - self.ox) // self.cw, 0, self.cols - 1)
-        zy = np.clip((ys - self.oy) // self.ch, 0, self.rows - 1)
-        u = ((xs.astype(np.float32) + f32(0.5) - f32(self.ox)) / f32(self.cw) - zx.astype(np.float32)).astype(np.float32)
-        v = ((ys.astype(np.float32) + f32(0.5) - f32(self.oy)) / f32(self.ch) - zy.astype(np.float32)).astype(np.float32)
-        return u, v
-
-    @staticmethod
-    def _feather32(i, j, u, v):
-        """HLSL GlowFeatherW (glowfill.feather_weight) for columns u (W,) and rows v (H,): (H, W) float32; i / j may be
-        per-column / per-row arrays."""
-        i, j = np.asarray(i), np.asarray(j)
-        dx = np.maximum(f32(0.0), np.maximum(i.astype(np.float32) - u, u - (i + 1).astype(np.float32))).astype(np.float32)
-        dy = np.maximum(f32(0.0), np.maximum(j.astype(np.float32) - v, v - (j + 1).astype(np.float32))).astype(np.float32)
-        dist = np.sqrt(dy[:, None] * dy[:, None] + dx[None, :] * dx[None, :], dtype=np.float32)
-        t = np.clip(dist / f32(FEATHER), f32(0.0), f32(1.0)).astype(np.float32)
-        return (f32(1.0) - t * t * (f32(3.0) - f32(2.0) * t)).astype(np.float32)
-
-    def band_scale_px(self, k):
-        """HLSL GlowBandScale for every frame pixel (1 outside the lattice), float32: s = min(k_z, min over the existing
-        neighbours n with w_n > 0 of 1 - (1 - k_n) w_n). FEATHER < 0.5: only the three neighbours on the pixel's side of
-        its zone (the horizontal one on u's side, the vertical one on v's side, their diagonal) can reach it."""
-        assert FEATHER < 0.5
-        k = np.asarray(k, dtype=np.float32)
-        xs, ys = np.arange(self.W), np.arange(self.H)
-        zx = np.clip((xs - self.ox) // self.cw, 0, self.cols - 1)
-        zy = np.clip((ys - self.oy) // self.ch, 0, self.rows - 1)
-        u, v = self.zone_local32()
-        sx = np.where(u < f32(0.5), -1, 1)                               # the pixel's side of its zone
-        sy = np.where(v < f32(0.5), -1, 1)
-        s = k[np.ix_(zy, zx)].copy()
-        for ox, oy in ((sx, np.zeros_like(sy)), (np.zeros_like(sx), sy), (sx, sy)):
-            w = self._feather32(ox, oy, u, v)
-            nx, ny = zx + ox, zy + oy
-            ok = ((ny >= 0) & (ny < self.rows))[:, None] & ((nx >= 0) & (nx < self.cols))[None, :] & (w > 0.0)
-            kn = k[np.ix_(np.clip(ny, 0, self.rows - 1), np.clip(nx, 0, self.cols - 1))]
-            s = np.where(ok, np.minimum(s, (f32(1.0) - (f32(1.0) - kn) * w).astype(np.float32)), s)
-        return np.where(self.in_lattice, s, f32(1.0)).astype(np.float32)
-
-    def glow_ceiling(self):
-        """HLSL GlowReqCeil: a filled pixel's brightest channel stays at / below this (glowfill.req_ceiling)."""
-        c = REQ_FLOOR_FRAC * self.floor
-        return min(c, REQ_LIT_FRAC * float(self.litNits)) if self.boostN else c
-
-    def glow_want(self, dz, gp: GlowFillParams):
-        """HLSL GlowWant for every frame pixel: the unscaled want (item 4)."""
-        return np.minimum(np.maximum(float(gp.strength) * self.sample_zone(dz) - WANT_EPS, 0.0), float(gp.cap_nits))
-
-    def glow_add(self, req, sT, sE, dz, gp: GlowFillParams, k=None):
-        """HLSL GlowAdd for every lattice pixel: (request + fill (3, H, W), the fill's request luminance (H, W)). ``req``
-        = the round's corrected request, ``sT`` / ``sE`` = the pixel fields Correct used, ``k`` = the band's zone scale
-        (None = 1), reaching the pixels through the feather (:meth:`band_scale_px`; ``gp.band_feather`` False: the
-        pixel's OWN zone's k, the rule before C16). Untouched pixels are returned as they came (the HLSL returns ``req``
-        itself there)."""
-        want = self.glow_want(dz, gp)
-        if k is not None:
-            if gp.band_feather:
-                kpx = self.band_scale_px(k).astype(np.float64)
-            else:
-                kpx = np.ones((self.H, self.W))
-                kpx[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw] = \
-                    np.repeat(np.repeat(k.astype(np.float64), self.ch, axis=0), self.cw, axis=1)
-            want = want * kpx
-        bT = np.maximum(sT, 0.0)
-        r = req.max(axis=0)
-        shown = r * bT / np.maximum(sE, 1e-9)
-        fill = np.maximum(want - shown, 0.0) * smoothstep(self.fadeLo, self.fadeHi, sE)
-        ped = self.o.get("pedRGB")
-        m = np.ones(3) if ped is None else np.asarray(ped, dtype=np.float64)
-        add = fill * np.minimum(sE / np.maximum(bT, 1e-9), self.gmax)
-        room = np.maximum(self.glow_ceiling() - r, 0.0)
-        add = add * np.minimum(1.0, room / np.maximum(add * m.max(), 1e-30))
-        acts = (want > 0.0) & (add > 0.0) & self.in_lattice
-        return np.where(acts[None], req + add[None] * m[:, None, None], req), np.where(acts, add, 0.0)
-
     # ---- PanelNits / PanelNitsToScRGB
     def panel_nits(self, scrgb):          # (H, W, 3) -> (3, H, W)
         if self.transfer == 1:
@@ -1005,18 +749,14 @@ class Emu:
         g = self.sample(gainB.astype(np.float64))
         return sT, sE, g
 
-    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1,
-            glow: Optional[GlowFillParams] = None):
+    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1):
         """One frame of FaldRunPasses. ``temporal``: a GpuDriveState carried across calls (pass 1b after each stat
         round; the state commits after round 1 — the CopyResource in the C++), or a GpuPanelDriveState (mode 3: pass 1c
         once before round 0 with ``refreshes`` = the panel refreshes elapsed since the previous frame was first shown;
         both rounds read the same maps; the commit stores round 1's instantaneous drives as the next frame's target).
         ``star``: starfield balancing settings
         (None = the option off: no star pass runs and nothing below changes) — the zone fields come from the SOURCE
-        frame and every later step works on Balance(source). ``glow``: glow fill settings (None = the option off: no
-        glow pass runs and nothing below changes)."""
-        gp = clamp_glow(glow) if glow is not None else None
-        assert gp is None or self.transfer != 1, "glow fill is HDR (PQ panel files) only"
+        frame and every later step works on Balance(source)."""
         img = self.panel_nits(frame_scrgb)
         star_out = None
         if star is not None:
@@ -1036,12 +776,6 @@ class Emu:
         sT, sE, g = self.sampled(bT0, bE0, gB0)
         gc = self.sample(self.ceil_est(bE0).astype(np.float64)) if self.c15 else None
         cor0, _ = self.correct(img, sT, sE, g, gc)
-        glow0 = None
-        if gp is not None:                                            # round 0's fill: the round-1 statistic sees it
-            glow0 = self.glow_zones(bT0, gp)
-            glow0["band"] = self.glow_band(cor0, sT, sE, glow0["dz"], gp) if (gp.band and self.glow_band_active()) else None
-            glow_k = glow0["band"]["k"] if glow0["band"] is not None else None
-            cor0, _ = self.glow_add(cor0, sT, sE, glow0["dz"], gp, glow_k)
         d1, st1 = self.stat_drive(cor0)
         boost1, zones1, active1 = self.frame_boost(cor0)              # round 1: the corrected frame the panel receives
         dT1, dE1 = temporal.pair(d1) if temporal is not None else (d1, d1)
@@ -1051,16 +785,6 @@ class Emu:
         cB1 = self.ceil_est(bE1)
         gc = self.sample(cB1.astype(np.float64)) if self.c15 else None
         req, wfade = self.correct(img, sT, sE, g, gc)
-        glow_out = None
-        if gp is not None:                                            # round 1's fill: part of the output
-            glow_out = self.glow_zones(bT1, gp)
-            glow_out["band"] = self.glow_band(req, sT, sE, glow_out["dz"], gp) if (gp.band and self.glow_band_active()) else None
-            glow_k = glow_out["band"]["k"] if glow_out["band"] is not None else None   # round 1's OWN scale (None: no band rule)
-            glow_out["k"] = glow_k
-            glow_out["r0"] = glow0
-            glow_out["req_nofill"] = req
-            req, glow_out["add"] = self.glow_add(req, sT, sE, glow_out["dz"], gp, glow_k)
-            glow_out["params"] = gp
         if temporal is not None:
             temporal.commit(d1)
         if fp16_out:
@@ -1081,7 +805,4 @@ class Emu:
                 "zones0": zones0, "zones1": zones1, "active0": active0, "active1": active1,
                 # starfield balancing: None when off; else the source image ("img" above is then the BALANCED one), the
                 # star statistic / plan zone fields (fald_star_stat / _bg / _w / _plan / _plan2.f32) and the per-pixel scale
-                "star": star_out,
-                # glow fill: None when off; else round 1's zone fields (fald_glow_vz / _env / _k.f32: vz, [ez, dz, cz, vz],
-                # k), the request luminance added per pixel ("add") and round 0's zone fields ("r0")
-                "glow": glow_out}
+                "star": star_out}

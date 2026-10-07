@@ -251,12 +251,6 @@ class OverlayTracker:
         self.starfield_saved: Optional[dict[str, Any]] = None
         self.starfield_note: Optional[str] = None
         self._force_starfield_off()
-        # the glow fill (runtime.fald_glowfill, 2026-09-20, work guide S2) is a persisted setting too, and it ADDS light
-        # to black between glowing areas on purpose (and can move the panel's black-frame boost through the zone count):
-        # a dark read through it would measure the fill, not the panel. Forced off here, restored by `restore()`.
-        self.glowfill_saved: Optional[dict[str, Any]] = None
-        self.glowfill_note: Optional[str] = None
-        self._force_glowfill_off()
 
     def _force_temporal_off(self) -> None:
         ctl = self.s.controller
@@ -307,37 +301,8 @@ class OverlayTracker:
                                        "reads go through the balancing")
                 self.starfield_saved = None
 
-    def _force_glowfill_off(self) -> None:
-        ctl = self.s.controller
-        try:
-            layers = (ctl.call("state.get", {}).get("layers") or {}).get(f"{self.monitor}:{self.mode}") or {}
-        except Exception as exc:  # noqa: BLE001
-            self.glowfill_note = f"state.get failed ({exc}): glow fill unknown"
-            return
-        if "fald_glowfill" not in layers:
-            self.glowfill_note = "build without runtime.fald_glowfill (pre-S2): no glow fill"
-            return
-        saved = {"enabled": bool(layers.get("fald_glowfill", False))}
-        # the SETTINGS only: fald_glow_active / fald_glow_note are derived reports (2026-09-21), not something to restore
-        saved.update({k[len("fald_glow_"):]: layers[k] for k in sorted(layers)
-                      if k.startswith("fald_glow_") and k not in ("fald_glow_active", "fald_glow_note")})
-        self.glowfill_saved = saved
-        if saved["enabled"]:
-            try:
-                ctl.call("runtime.fald_glowfill", {"monitor": self.monitor, "mode": self.mode, "enabled": False})
-                self.glowfill_note = f"glow fill was ON ({saved}) — forced OFF for the reads, restored after"
-            except Exception as exc:  # noqa: BLE001
-                self.glowfill_note = (f"glow fill is ON ({saved}) and runtime.fald_glowfill refused ({exc}): "
-                                      "reads go through the fill")
-                self.glowfill_saved = None
-
     def restore(self) -> None:
-        """Put the owner's temporal drive state, starfield balancing and glow fill back (no-op when off or unknown)."""
-        if self.glowfill_saved and self.glowfill_saved.get("enabled"):
-            try:
-                self.s.controller.call("runtime.fald_glowfill", {"monitor": self.monitor, "mode": self.mode, "enabled": True})
-            except Exception as exc:  # noqa: BLE001
-                self.reasons.append(f"glow fill NOT restored ({exc}): re-enable it by hand")
+        """Put the owner's temporal drive state and starfield balancing back (no-op when off or unknown)."""
         if self.starfield_saved and self.starfield_saved.get("enabled"):
             try:
                 self.s.controller.call("runtime.fald_starfield", {"monitor": self.monitor, "mode": self.mode, "enabled": True})
@@ -395,9 +360,7 @@ class OverlayTracker:
                 "temporal_forced_off": bool(self.temporal_saved and self.temporal_saved.get("temporal_mode", 0) != 0),
                 "temporal_saved": self.temporal_saved, "temporal_note": self.temporal_note,
                 "starfield_forced_off": bool(self.starfield_saved and self.starfield_saved.get("enabled")),
-                "starfield_saved": self.starfield_saved, "starfield_note": self.starfield_note,
-                "glowfill_forced_off": bool(self.glowfill_saved and self.glowfill_saved.get("enabled")),
-                "glowfill_saved": self.glowfill_saved, "glowfill_note": self.glowfill_note}
+                "starfield_saved": self.starfield_saved, "starfield_note": self.starfield_note}
 
     def report(self, result: StageResult, phase: str) -> None:
         off = self.waits.get("off") or {}
@@ -423,11 +386,6 @@ class OverlayTracker:
                 result.anomaly("starfield_state", f"{phase}: {self.starfield_note}; {'; '.join(r for r in self.reasons if 'starfield' in r)}", "high")
             else:
                 result.note(f"{phase}: {self.starfield_note}")
-        if self.glowfill_note:
-            if "refused" in self.glowfill_note or "glow fill NOT restored" in " ".join(self.reasons):
-                result.anomaly("glowfill_state", f"{phase}: {self.glowfill_note}; {'; '.join(r for r in self.reasons if 'glow fill' in r)}", "high")
-            else:
-                result.note(f"{phase}: {self.glowfill_note}")
         result.metrics["overlay_wait"] = self.summary()
         result.metrics["off_overlay"] = self.off_overlay()
 
@@ -1874,7 +1832,7 @@ def phase_restore(s: Session, result: StageResult) -> None:
         s.st["fald"]["entered"] = False
         # `restored` is the server SAYING it put the snapshot back. Believing the call returned is how a lost stack
         # reads as a clean finish — the user's whole FALD configuration (panel file, pedestal mode, temporal,
-        # starfield, glow) comes back this way and no other, because the flow only ever switches the layer off.
+        # starfield) comes back this way and no other, because the flow only ever switches the layer off.
         result.metrics["stack_restored"] = report["restored"] is True
         result.metrics["snapshot_restore"] = report
         if report["complete"]:

@@ -92,7 +92,6 @@ _HEAVY_SECONDS = {
     "test_engine_v2.py::test_physical_cube_reduces_model_error_and_pins_neutral": 31,
     "test_optimize.py::test_physical_engine_is_opt_in_and_reports_info": 30,
     "test_fald_profile.py::test_stage_chain_sdr_to_export_and_verify": 29,
-    "test_fald_glowfill.py::test_the_fill_fades_out_continuously_as_the_content_gets_brighter": 22,
     "test_engine_v2.py::test_build_cube_reduces_error_and_is_mostly_monotonic": 13,
     "test_fald_starfield.py::test_protection_is_mirror_symmetric_and_a_mid_drive_object_protects_partially": 12,
     "test_engine_v2.py::test_sdr_wide_gamut_maps_inward_and_is_consistent": 10,

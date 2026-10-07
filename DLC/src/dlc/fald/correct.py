@@ -141,13 +141,9 @@ def pedestal_adjust(delta: np.ndarray, img: np.ndarray, ped_mode: str) -> tuple[
 
 
 def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
-                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None, glow=None,
+                  gain_clip: tuple[float, float] = (0.25, 4.0), drive_filter=None,
                   peak: Optional[np.ndarray] = None, logm: Optional[np.ndarray] = None) -> dict:
     """Return the corrected request image for ``img`` (3, h, w, as-if-white nits).
-
-    ``glow``: optional :class:`dlc.fald.glowfill.GlowFillParams` — the glow fill (work guide S2): every round adds the
-    fill of ITS fields to the request (so round 1's drives / boost count see the frame the panel receives, fill
-    included); ``None`` = the layer without it, bit for bit. Evidence of the last round under ``"glow"``.
 
     ``drive_filter``: optional ``drives -> (drives_true, drives_est)`` applied to every round's instantaneous
     cell drives before the kernels — the temporal drive state of :mod:`dlc.fald.temporal` (the shader's
@@ -157,8 +153,8 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     :mod:`dlc.fald.motion`): per raster pixel, the brightest full-resolution pixel it stands for. It goes through every
     round with the SAME fields and the same per-pixel rule as ``img`` — its own level sets its pedestal, lum fade and soft
     knee, as the shader does per full-resolution pixel — and before every round's statistic ``model.set_peak(peak
-    request so far)`` is called when the model has that method. Not combined with ``glow``. ``img``'s path is unchanged
-    bit for bit; the result gains ``req_peak``. ``logm``: the content's full-resolution LOG companion (h, w) for the P10
+    request so far)`` is called when the model has that method. ``img``'s path is unchanged bit for bit; the result
+    gains ``req_peak``. ``logm``: the content's full-resolution LOG companion (h, w) for the P10
     context statistic (:func:`dlc.fald.motion.render_reduced` ``log_eps=``) — every round passes
     ``model.logm_follow(logm, img, request so far)`` with the peak (each pixel's own scale shifts its ln).
 
@@ -166,8 +162,6 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
     ``pedestal`` (per channel, nits, from the last iteration's drives), ``clipped`` (LCD would
     need > 100 %: original request kept), ``floored`` (target below the pedestal), ``drives`` (the last
     round's INSTANTANEOUS drives — what a temporal state commits after the frame)."""
-    if (peak is not None or logm is not None) and glow is not None:
-        raise ValueError("correct_image: a peak / log companion is not supported with the glow fill")
     p = model.p
     w = np.array(p.chan_weights)[:, None, None]
     lmax = p.white_nits * w
@@ -258,21 +252,11 @@ def correct_image(model: FaldModel, img: np.ndarray, iters: int = 2,
             return rq, g, cl, fl
 
         req, gain, clipped, floored = per_pixel(*refs[0])
-        if glow is not None:
-            from . import glowfill
-            zf = glowfill.zone_fields(model, d_true, boost, glow)
-            # keep the fill off the firmware's count threshold: the zone scale k, from THIS round's request and fields
-            glow_band = glowfill.band_scale(model, req, b_true, b_est, zf["dz"], zf["ez"], glow, gain_max=gain_clip[1])
-            glow_out = glowfill.round_fill(model, req, b_true, b_est, zf["dz"], zf["ez"], glow, gain_max=gain_clip[1], k=glow_band["k"])
-            glow_out.update(zf, round_input=cur, req_nofill=req, band=glow_band)
-            req = np.where(glow_out["add"] > 0.0, req + glow_out["add"], req)   # untouched pixels stay bit-identical
         cur = req
         if cur_pk is not None:
             cur_pk = per_pixel(*refs[1])[0]
     out = {"req": cur, "gain": gain, "pedestal": ped, "clipped": clipped, "floored": floored, "drives": drives,
            "boost": boost}
-    if glow is not None:
-        out["glow"] = glow_out
     if cur_pk is not None:
         out["req_peak"] = cur_pk
     return out

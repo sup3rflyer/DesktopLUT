@@ -164,30 +164,7 @@ def _fald_star(entry: dict[str, Any] | None) -> dict[str, Any]:
     return {k: (bool(v) if k == "enabled" else int(v) if k in ("even_reach", "reach") else float(v)) for k, v in st.items()}
 
 
-# runtime.fald_glowfill (C++ DoFaldGlowFill, work guide S2): pipe key -> (lo, hi, integer, refusal text), the C++ texts
-# word for word; the defaults are dlc.fald.glowfill.GlowFillParams'.
-_FALD_GLOW_KEYS: dict[str, tuple[float, float, bool, str]] = {
-    "strength": (0.0, 1.0, False, "strength must be 0..1"),
-    "reach": (1.0, 4.0, True, "reach must be an integer 1..4"),
-    "cap_nits": (0.005, 0.5, False, "cap_nits must be 0.005..0.5"),
-}
-_FALD_GLOW_DEFAULTS: dict[str, Any] = {"enabled": False, "strength": 1.0, "reach": 2, "cap_nits": 0.05}
-# HDR only (C++ FALD_GLOW_SDR_NOTE, word for word): the pipe refuses `enabled: true` for an SDR pair and state.get says why
-_FALD_GLOW_SDR_NOTE = ("glow fill is HDR only: the levels behind its request ceiling (drive floor, LIT level, count threshold) "
-                       "are HDR measurements")
-# Part of the starfield feature (C++ FALD_GLOW_NEEDS_STAR_NOTE, word for word): the switch is stored, the fill runs only
-# while starfield balancing is on — state.get's fald_glow_active / runtime.fald_glowfill's `active` say whether it runs
-_FALD_GLOW_NEEDS_STAR_NOTE = ("glow fill is part of the starfield feature: the switch is stored, but the fill runs only while "
-                              "starfield balancing is on")
-
-
-def _fald_glow(entry: dict[str, Any] | None) -> dict[str, Any]:
-    """The pair's glow-fill settings (defaults where never set), an int for the reach."""
-    gl = {**_FALD_GLOW_DEFAULTS, **((entry or {}).get("glow") or {})}
-    return {k: (bool(v) if k == "enabled" else int(v) if k == "reach" else float(v)) for k, v in gl.items()}
-
-
-def _fald_state_keys(entry: dict[str, Any] | None, is_hdr: bool = True) -> dict[str, Any]:
+def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     """The fald_* keys C++ HandleStateGet puts into layers[key] for every pair."""
     entry = entry or {}
     path = str(entry.get("params_path") or "")
@@ -206,15 +183,6 @@ def _fald_state_keys(entry: dict[str, Any] | None, is_hdr: bool = True) -> dict[
     star = _fald_star(entry)
     out["fald_starfield"] = star["enabled"]
     out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
-    # glow fill (2026-09-20, work guide S2; runtime.fald_glowfill)
-    glow = _fald_glow(entry)
-    out["fald_glowfill"] = glow["enabled"]
-    out.update({f"fald_glow_{k}": v for k, v in glow.items() if k != "enabled"})
-    out["fald_glow_active"] = bool(glow["enabled"] and star["enabled"] and is_hdr)
-    if not is_hdr:
-        out["fald_glow_note"] = _FALD_GLOW_SDR_NOTE
-    elif glow["enabled"] and not star["enabled"]:
-        out["fald_glow_note"] = _FALD_GLOW_NEEDS_STAR_NOTE
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -317,7 +285,7 @@ class MockDesktopLutState:
             "hdr": deepcopy(self.hdr),
             # C++ reports every monitor:mode pair (absent = a fresh install, all OFF), fald settings included
             "layers": {k: {"tonemap": False, "fald": False, "desktop_gamma": False, "white_balance": False,
-                           "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k), k.endswith(":HDR"))}
+                           "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "fald": deepcopy(self.fald),
             "overlay_model": {"keep_awake": self.overlay_keep_awake, "sleep_lag_polls": self.overlay_sleep_lag_polls,
@@ -942,9 +910,9 @@ class MockDesktopLutServer:
         if method == "runtime.fald_debug":
             mode = params.get("debug_mode"); ped = params.get("ped_mode")
             if not isinstance(mode, (int, float)) and not isinstance(ped, (int, float)):
-                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..10) or ped_mode (0|1)")
+                return DesktopLutResponse(ok=False, error="missing parameter: debug_mode (0..9) or ped_mode (0|1)")
             if isinstance(mode, (int, float)):
-                fs["debug_mode"] = int(min(10, max(0, mode)))
+                fs["debug_mode"] = int(min(9, max(0, mode)))
             if isinstance(ped, (int, float)):
                 fs["ped_mode"] = 1 if ped >= 0.5 else 0      # persisted in the real app (the GUI checkbox)
             return self.ok({"monitor_mode": key, "debug_mode": fs.get("debug_mode", 0), "ped_mode": fs.get("ped_mode", 0),
@@ -1014,35 +982,6 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(ok=False, error="nb_hi must be >= nb_lo")
             fs["star"] = st
             return self.ok({"monitor_mode": key, **_fald_star(fs)})
-        if method == "runtime.fald_glowfill":
-            # C++ DoFaldGlowFill (2026-09-20, work guide S2): the glow fill, partial updates, persisted per mode.
-            # Everything is validated before anything is stored; refusals word for word.
-            num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-            en = params.get("enabled")
-            if "enabled" in params and not isinstance(en, bool):
-                return DesktopLutResponse(ok=False, error="enabled must be a boolean")
-            given = {}
-            for name, (lo, hi, integer, text) in _FALD_GLOW_KEYS.items():
-                v = params.get(name)
-                if not num(v):
-                    continue
-                if not (lo <= v <= hi) or (integer and v != int(v)):
-                    return DesktopLutResponse(ok=False, error=text)
-                given[name] = int(v) if integer else float(v)
-            if "enabled" not in params and not given:
-                return DesktopLutResponse(ok=False, error="missing parameter: enabled, strength, reach or cap_nits")
-            if en is True and not is_hdr:
-                return DesktopLutResponse(ok=False, error=_FALD_GLOW_SDR_NOTE)
-            gl = {**_fald_glow(fs), **given}
-            if "enabled" in params:
-                gl["enabled"] = en
-            fs["glow"] = gl
-            out = {"monitor_mode": key, **_fald_glow(fs)}
-            star_on = _fald_star(fs)["enabled"]
-            out["active"] = bool(out["enabled"] and star_on and is_hdr)
-            if out["enabled"] and not star_on:
-                out["note"] = _FALD_GLOW_NEEDS_STAR_NOTE
-            return self.ok(out)
         if method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

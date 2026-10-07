@@ -620,6 +620,12 @@ request, adjudicates ambiguous results on digests, and writes the report.
   at 0.48 / grayscale 0.19** on the same probe-matched i1.
 
 ### Removed
+- **FALD glow fill** (work guide S2, with its C16 count-threshold band, feather and neighbour guard; 2026-10-07).
+  The fill drew LED dots, grids and rows on screen, and its measured benefit was ~1 % on full frames. Gone with
+  it: `dlc/fald/glowfill.py`, the `glow` options of `correct_image` and the GPU-order twin (`gpuemu.Emu.run`), the
+  pipe method `runtime.fald_glowfill`, the `fald_glowfill` / `fald_glow_*` keys of `state.get`, the dump's glow
+  files and lines, and debug view 10 (`runtime.fald_debug` `debug_mode` is 0..9). `fald_profile` no longer forces
+  the fill off and restores it.
 - The Codex-scaffolded "mission control" autopilot (agent / supervise / dashboard /
   demo / handoff / final-audit and related modules) in favour of the scripted core.
 

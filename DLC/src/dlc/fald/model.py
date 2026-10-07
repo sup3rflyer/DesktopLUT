@@ -702,8 +702,7 @@ class FaldModel:
 
     def true_fine(self, drives: np.ndarray, boost: float = 1.0) -> np.ndarray:
         """B_true on the fine grid (rows·sub, cols·sub), LED boost and flat-lattice normalisation included, floored at 0 —
-        what the shader's gain pass forms per fine texel (``bTrueTex / flatTrueTex``). The glow fill's zone field
-        (:mod:`dlc.fald.glowfill`) is its per-zone mean."""
+        what the shader's gain pass forms per fine texel (``bTrueTex / flatTrueTex``)."""
         p = self.p
         fine = self.backlight_fine(drives, "mix", p.tail_mm, p.core_mm, p.tail_frac, pnorm=p.kernel_pnorm) * float(boost)
         if p.flat_norm:

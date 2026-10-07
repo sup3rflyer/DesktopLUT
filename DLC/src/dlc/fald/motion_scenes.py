@@ -45,7 +45,7 @@ def standard_scenes(aids: bool = False) -> list[Scene]:
     add("bar_24p", grey(5), (MovingShape("rect", 1790.3, Y_MID, grey(1000), w=40, h=270, vx=10),), 24,
         pre=8, post=10, cadence=(3, 2), note="the 40x270 bar as 24p content (10 px per content frame = 240 px/s, 3:2 cadence)")
     add("barblack_v4", grey(0), (MovingShape("rect", 1790.3, Y_MID, grey(1000), w=40, h=270, vx=4),), 60,
-        note="40x270 bar on BLACK (boost + deep-dark fade; glow fill NOT modelled)")
+        note="40x270 bar on BLACK (boost + deep-dark fade)")
     return out
 
 
