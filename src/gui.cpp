@@ -2570,6 +2570,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_ANALYSIS_ONLY_EXITED: {
         // Analysis-only thread exited.
+        // A Start/Stop in progress (this message was pumped by its join) owns the thread.
+        if (IsProcessingTransitionActive()) return 0;
         // Guard: StopAnalysisOnlyMode may have already handled cleanup during its message pump.
         if (!g_analysisOnlyMode.load() && !g_gui.processingThread.joinable())
             return 0;  // Already handled by StopAnalysisOnlyMode or StopProcessing
@@ -2589,6 +2591,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_PROCESSING_EXITED:  // Processing thread exited
+        // Pumped by a Start/Stop's own join: that transition owns the thread. Handling it here used
+        // to clear isRunning mid-Stop and re-arm RESTART_TIMER_ID (activeSettings is only cleared at
+        // the end of the Stop), restarting processing seconds after the user pressed Stop.
+        if (IsProcessingTransitionActive()) return 0;
         // Stale-message guard: the thread that posted this may already have been joined and REPLACED
         // by a new one (quick StopProcessing/StartProcessing, e.g. the DLC neutral entry). If the
         // current processing thread is still alive, this message is not about it — ignore it, or we
@@ -2600,6 +2606,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::cout << "[GUI] stale WM_PROCESSING_EXITED ignored (current processing thread is alive)" << std::endl;
             return 0;
         }
+        // The thread has exited (checked above): join it, so joinable() stops claiming an overlay
+        // thread exists — DwmHookReevaluateOverlay and the preview paths decide on joinable(), and
+        // an unjoined exited thread disabled analysis and live preview for the rest of the session.
+        if (g_gui.processingThread.joinable()) g_gui.processingThread.join();
         // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
         // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
         if (g_dwmHookMode.load() && g_running.load()) {

@@ -683,7 +683,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // SDR grayscale full-preview base LUTs (t11-t13). Re-upload once per begin (atomic dirty
     // handshake; begin is the only writer and is serialized per editor session). Harmless when
     // the full-preview flag is off — the shader ignores t11-t13.
-    if (ctx->previewBaseLutDirty.load()) {
+    // Consumed with an exchange: a begin that republishes while this upload runs sets the flag
+    // again and is picked up next frame (a load-then-clear would drop it).
+    if (ctx->previewBaseLutDirty.exchange(false, std::memory_order_acq_rel)) {
         int n = ctx->previewBaseLutSize;
         ID3D11Texture2D* baseTex[3] = { g_baseLutPreviewTexR, g_baseLutPreviewTexG, g_baseLutPreviewTexB };
         for (int ch = 0; ch < 3; ch++) {
@@ -695,7 +697,6 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
                 }
             }
         }
-        ctx->previewBaseLutDirty = false;
     }
     g_context->PSSetShaderResources(11, 1, &g_baseLutPreviewSRV_R);  // SDR full-preview base LUT (R)
     g_context->PSSetShaderResources(12, 1, &g_baseLutPreviewSRV_G);  // (G)

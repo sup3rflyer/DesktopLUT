@@ -12,7 +12,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -27,6 +29,7 @@
 #include "mhc.h"
 #include "fald.h"
 #include "displayconfig.h"
+#include "ipc_json.h"
 #include "settings.h"
 #include "processing.h"
 #include "gui.h"
@@ -67,244 +70,12 @@ std::wstring Utf8ToWide(const std::string& s) {
 }
 
 // ===========================================================================
-// Minimal, self-contained JSON (no external dependency)
+// JSON (src/ipc_json.h: bounded depth / value count, strict numbers)
 // ===========================================================================
-struct JsonValue {
-    enum Type { Null, Bool, Num, Str, Arr, Obj } type = Null;
-    bool b = false;
-    double num = 0.0;
-    std::string str;
-    std::vector<JsonValue> arr;
-    std::vector<std::pair<std::string, JsonValue>> members;
+using namespace ipc_json;
 
-    const JsonValue* find(const std::string& key) const {
-        if (type != Obj) return nullptr;
-        for (const auto& kv : members)
-            if (kv.first == key) return &kv.second;
-        return nullptr;
-    }
-    bool has(const std::string& key) const { return find(key) != nullptr; }
-    std::string getStr(const std::string& key, const std::string& def = "") const {
-        const JsonValue* v = find(key);
-        return (v && v->type == Str) ? v->str : def;
-    }
-    double getNum(const std::string& key, double def = 0.0) const {
-        const JsonValue* v = find(key);
-        return (v && v->type == Num) ? v->num : def;
-    }
-    int getInt(const std::string& key, int def = 0) const {
-        const JsonValue* v = find(key);
-        return (v && v->type == Num) ? (int)std::llround(v->num) : def;
-    }
-    void set(const std::string& key, JsonValue v) { members.emplace_back(key, std::move(v)); }
-};
-
-JsonValue JBool(bool v) { JsonValue j; j.type = JsonValue::Bool; j.b = v; return j; }
-JsonValue JNum(double v) { JsonValue j; j.type = JsonValue::Num; j.num = v; return j; }
 // Luminance for the wire: Windows' SDR white steps are 0.08 nit, so 2 decimals are exact (no float tail).
 static double RoundNits(float v) { return std::round((double)v * 100.0) / 100.0; }
-JsonValue JStr(const std::string& v) { JsonValue j; j.type = JsonValue::Str; j.str = v; return j; }
-JsonValue JObj() { JsonValue j; j.type = JsonValue::Obj; return j; }
-JsonValue JArr() { JsonValue j; j.type = JsonValue::Arr; return j; }
-
-void AppendUtf8(std::string& out, unsigned cp) {
-    if (cp <= 0x7F) {
-        out += (char)cp;
-    } else if (cp <= 0x7FF) {
-        out += (char)(0xC0 | (cp >> 6));
-        out += (char)(0x80 | (cp & 0x3F));
-    } else if (cp <= 0xFFFF) {
-        out += (char)(0xE0 | (cp >> 12));
-        out += (char)(0x80 | ((cp >> 6) & 0x3F));
-        out += (char)(0x80 | (cp & 0x3F));
-    } else {
-        out += (char)(0xF0 | (cp >> 18));
-        out += (char)(0x80 | ((cp >> 12) & 0x3F));
-        out += (char)(0x80 | ((cp >> 6) & 0x3F));
-        out += (char)(0x80 | (cp & 0x3F));
-    }
-}
-
-struct JsonParser {
-    const std::string& s;
-    size_t i = 0;
-    explicit JsonParser(const std::string& str) : s(str) {}
-
-    [[noreturn]] void err(const char* m) { throw std::runtime_error(m); }
-    void ws() {
-        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) i++;
-    }
-    JsonValue parse() { ws(); JsonValue v = value(); return v; }
-
-    JsonValue value() {
-        ws();
-        if (i >= s.size()) err("unexpected end of input");
-        char c = s[i];
-        if (c == '{') return object();
-        if (c == '[') return array();
-        if (c == '"') return JStr(string());
-        if (c == 't') { literal("true"); return JBool(true); }
-        if (c == 'f') { literal("false"); return JBool(false); }
-        if (c == 'n') { literal("null"); return JsonValue(); }
-        return number();
-    }
-    void literal(const char* lit) {
-        for (const char* p = lit; *p; ++p) {
-            if (i >= s.size() || s[i] != *p) err("invalid literal");
-            i++;
-        }
-    }
-    unsigned hex4() {
-        if (i + 4 > s.size()) err("bad \\u escape");
-        unsigned v = 0;
-        for (int k = 0; k < 4; ++k) {
-            char c = s[i++];
-            v <<= 4;
-            if (c >= '0' && c <= '9') v |= (c - '0');
-            else if (c >= 'a' && c <= 'f') v |= (c - 'a' + 10);
-            else if (c >= 'A' && c <= 'F') v |= (c - 'A' + 10);
-            else err("bad hex digit");
-        }
-        return v;
-    }
-    std::string string() {
-        if (s[i] != '"') err("expected string");
-        i++;
-        std::string out;
-        while (i < s.size()) {
-            char c = s[i++];
-            if (c == '"') return out;
-            if (c == '\\') {
-                if (i >= s.size()) err("bad escape");
-                char e = s[i++];
-                switch (e) {
-                    case '"': out += '"'; break;
-                    case '\\': out += '\\'; break;
-                    case '/': out += '/'; break;
-                    case 'n': out += '\n'; break;
-                    case 't': out += '\t'; break;
-                    case 'r': out += '\r'; break;
-                    case 'b': out += '\b'; break;
-                    case 'f': out += '\f'; break;
-                    case 'u': {
-                        unsigned cp = hex4();
-                        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.size() && s[i] == '\\' && s[i + 1] == 'u') {
-                            i += 2;
-                            unsigned lo = hex4();
-                            if (lo >= 0xDC00 && lo <= 0xDFFF)
-                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-                        }
-                        AppendUtf8(out, cp);
-                        break;
-                    }
-                    default: err("bad escape");
-                }
-            } else {
-                out += c;
-            }
-        }
-        err("unterminated string");
-    }
-    JsonValue number() {
-        size_t start = i;
-        if (i < s.size() && s[i] == '-') i++;
-        while (i < s.size() &&
-               ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-'))
-            i++;
-        if (i == start) err("invalid number");
-        return JNum(std::strtod(s.substr(start, i - start).c_str(), nullptr));
-    }
-    JsonValue array() {
-        JsonValue v = JArr();
-        i++;  // [
-        ws();
-        if (i < s.size() && s[i] == ']') { i++; return v; }
-        while (true) {
-            v.arr.push_back(value());
-            ws();
-            if (i >= s.size()) err("unterminated array");
-            if (s[i] == ',') { i++; continue; }
-            if (s[i] == ']') { i++; break; }
-            err("expected , or ]");
-        }
-        return v;
-    }
-    JsonValue object() {
-        JsonValue v = JObj();
-        i++;  // {
-        ws();
-        if (i < s.size() && s[i] == '}') { i++; return v; }
-        while (true) {
-            ws();
-            std::string key = string();
-            ws();
-            if (i >= s.size() || s[i] != ':') err("expected :");
-            i++;
-            v.members.emplace_back(key, value());
-            ws();
-            if (i >= s.size()) err("unterminated object");
-            if (s[i] == ',') { i++; continue; }
-            if (s[i] == '}') { i++; break; }
-            err("expected , or }");
-        }
-        return v;
-    }
-};
-
-void SerializeStr(const std::string& s, std::string& out) {
-    out += '"';
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"': out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            case '\b': out += "\\b"; break;
-            case '\f': out += "\\f"; break;
-            default:
-                if (c < 0x20) {
-                    char buf[8];
-                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    out += buf;
-                } else {
-                    out += (char)c;
-                }
-        }
-    }
-    out += '"';
-}
-
-void Serialize(const JsonValue& v, std::string& out) {
-    switch (v.type) {
-        case JsonValue::Null: out += "null"; break;
-        case JsonValue::Bool: out += v.b ? "true" : "false"; break;
-        case JsonValue::Num: {
-            char buf[40];
-            std::snprintf(buf, sizeof(buf), "%.10g", v.num);
-            out += buf;
-            break;
-        }
-        case JsonValue::Str: SerializeStr(v.str, out); break;
-        case JsonValue::Arr: {
-            out += '[';
-            for (size_t k = 0; k < v.arr.size(); ++k) { if (k) out += ','; Serialize(v.arr[k], out); }
-            out += ']';
-            break;
-        }
-        case JsonValue::Obj: {
-            out += '{';
-            for (size_t k = 0; k < v.members.size(); ++k) {
-                if (k) out += ',';
-                SerializeStr(v.members[k].first, out);
-                out += ':';
-                Serialize(v.members[k].second, out);
-            }
-            out += '}';
-            break;
-        }
-    }
-}
 
 std::string OkResponse(const JsonValue& result) {
     JsonValue env = JObj();
@@ -349,13 +120,21 @@ struct CalibState {
 std::mutex g_calibMutex;
 CalibState g_calib;
 
-// Marshaling envelope: pipe thread -> GUI thread.
-struct CalibGuiRequest {
-    const std::string* method;
-    const JsonValue* params;
-    JsonValue* result;
-    std::string* error;
+// Marshaling envelope: pipe thread -> GUI thread. Heap-owned and shared, looked up by id:
+// the pipe thread waits at most kGuiTimeoutMs, but a handler already running on the GUI
+// thread keeps running after that and must write into memory it co-owns — never into the
+// pipe thread's (by then unwound) stack. WM_CALIB_CMD carries only the id, so a stale or
+// forged message finds nothing to run.
+struct CalibGuiCall {
+    std::string method;
+    JsonValue params;
+    JsonValue result = JObj();
+    std::string error;
+    std::atomic<bool> done{false};   // release-stored by the GUI thread after result/error
 };
+std::mutex g_guiCallsMutex;
+std::map<uint64_t, std::shared_ptr<CalibGuiCall>> g_guiCalls;   // under g_guiCallsMutex
+uint64_t g_nextGuiCallId = 1;                                    // under g_guiCallsMutex
 
 // ---- shared helpers --------------------------------------------------------
 bool ParseMonitorMode(const JsonValue& p, int& mon, bool& isHDR, std::string& error) {
@@ -2235,11 +2014,32 @@ std::string Dispatch(const std::string& request) {
             if (!g_gui.hwndMain) {
                 error = "GUI window not available";
             } else {
-                CalibGuiRequest req{&method, &params, &result, &error};
+                auto call = std::make_shared<CalibGuiCall>();
+                call->method = method;
+                call->params = params;
+                uint64_t id;
+                {
+                    std::lock_guard<std::mutex> lk(g_guiCallsMutex);
+                    id = g_nextGuiCallId++;
+                    g_guiCalls[id] = call;
+                }
                 DWORD_PTR res = 0;
-                LRESULT ok = SendMessageTimeoutW(g_gui.hwndMain, WM_CALIB_CMD, (WPARAM)&req, 0,
+                LRESULT ok = SendMessageTimeoutW(g_gui.hwndMain, WM_CALIB_CMD, (WPARAM)id, 0,
                                                  SMTO_NORMAL, kGuiTimeoutMs, &res);
-                if (!ok && error.empty()) error = "GUI thread did not respond";
+                {
+                    std::lock_guard<std::mutex> lk(g_guiCallsMutex);
+                    g_guiCalls.erase(id);
+                }
+                if (call->done.load(std::memory_order_acquire)) {
+                    result = std::move(call->result);
+                    error = call->error;
+                } else if (!ok) {
+                    // Still running on the GUI thread (it keeps its own reference) or never
+                    // delivered: the outcome is unknown, so say so rather than report success.
+                    error = "GUI thread did not respond in time (the command may still complete; re-read state)";
+                } else {
+                    error = "GUI thread did not run the command";
+                }
             }
         } else {
             error = "unknown method: " + method;
@@ -2264,9 +2064,14 @@ bool ServerEnabled() {
     // action. Persisted, so a checkbox left on re-arms at next launch.
     if (g_calibrationControlEnabled.load()) return true;
     // Headless/dev/CI enable: env var or a flag file next to the exe.
+    // DESKTOPLUT_CALIBRATION=1 (or true/yes/on) arms; anything else — including a value too
+    // long for the buffer, which GetEnvironmentVariableW reports by NOT writing it — does not.
     wchar_t env[8] = {0};
     DWORD n = GetEnvironmentVariableW(L"DESKTOPLUT_CALIBRATION", env, 8);
-    if (n > 0 && env[0] != L'0') return true;
+    if (n > 0 && n < 8) {
+        if (wcscmp(env, L"1") == 0 || _wcsicmp(env, L"true") == 0 ||
+            _wcsicmp(env, L"yes") == 0 || _wcsicmp(env, L"on") == 0) return true;
+    }
     wchar_t path[MAX_PATH];
     if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
     std::wstring p(path);
@@ -2321,6 +2126,13 @@ void HandleConnection(HANDLE pipe) {
 
 DWORD WINAPI ServerThreadProc(LPVOID) {
     PSECURITY_DESCRIPTOR sd = BuildLocalUserSd();
+    if (!sd) {
+        // Fail closed: without the user+SYSTEM DACL the pipe would get the default named-pipe
+        // descriptor (read access for Everyone/anonymous) on an elevated host.
+        std::cerr << "[Calibration IPC] could not build the pipe's security descriptor; server not started"
+                  << std::endl;
+        return 0;
+    }
     SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
     while (!g_stop.load()) {
         HANDLE pipe = CreateNamedPipeW(
@@ -2330,7 +2142,7 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
             1,                       // single instance — one client at a time
             64 * 1024, 64 * 1024,
             0,
-            sd ? &sa : nullptr);
+            &sa);
         if (pipe == INVALID_HANDLE_VALUE) { Sleep(500); continue; }
 
         BOOL connected = ConnectNamedPipe(pipe, nullptr)
@@ -2384,40 +2196,49 @@ void StopCalibrationIpcServer() {
 }
 
 LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
-    CalibGuiRequest* r = reinterpret_cast<CalibGuiRequest*>(wParam);
-    if (!r || !r->method || !r->params || !r->result || !r->error) return 0;
-    try {
-        const std::string& m = *r->method;
-        if (m == "calibration.enter") DoEnterNeutral(*r->params, *r->result, *r->error);
-        else if (m == "calibration.exit") DoExitCalibration(*r->params, *r->result, *r->error);
-        else if (m == "corrections.disable_all") DoDisableAll(*r->params, *r->result, *r->error);
-        else if (m == "layers.set") DoLayersSet(*r->params, *r->result, *r->error);
-        else if (m == "mhc.set_primaries") DoMhcSetPrimaries(*r->params, *r->result, *r->error);
-        else if (m == "mhc.set_white") DoMhcSetWhite(*r->params, *r->result, *r->error);
-        else if (m == "mhc.set_base_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, false);
-        else if (m == "mhc.set_base_lut") DoMhcSetBaseLut(*r->params, *r->result, *r->error);
-        else if (m == "mhc.set_correction_grayscale") DoMhcSetGrayscale(*r->params, *r->result, *r->error, true);
-        else if (m == "mhc.grayscale_live_begin") DoGrayscaleLiveBegin(*r->params, *r->result, *r->error);
-        else if (m == "mhc.grayscale_set_live") DoGrayscaleSetLive(*r->params, *r->result, *r->error);
-        else if (m == "mhc.grayscale_commit") DoGrayscaleCommit(*r->params, *r->result, *r->error);
-        else if (m == "mhc.grayscale_cancel") DoGrayscaleCancel(*r->params, *r->result, *r->error);
-        else if (m == "mhc.apply") DoMhcApply(*r->params, *r->result, *r->error);
-        else if (m == "mhc.remove") DoMhcRemove(*r->params, *r->result, *r->error);
-        else if (m == "runtime.set_3dlut") DoSet3dlut(*r->params, *r->result, *r->error);
-        else if (m == "runtime.clear_3dlut") DoClear3dlut(*r->params, *r->result, *r->error);
-        else if (m == "runtime.set_fald_params") DoSetFaldParams(*r->params, *r->result, *r->error);
-        else if (m == "runtime.fald_debug") DoFaldDebug(*r->params, *r->result, *r->error);
-        else if (m == "runtime.fald_dump") DoFaldDump(*r->params, *r->result, *r->error);
-        else if (m == "runtime.fald_temporal") DoFaldTemporal(*r->params, *r->result, *r->error);
-        else if (m == "runtime.fald_starfield") DoFaldStarfield(*r->params, *r->result, *r->error);
-        else if (m == "hook.set_routing") DoHookSetRouting(*r->params, *r->result, *r->error);
-        else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(*r->params, *r->result, *r->error);
-        else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(*r->params, *r->result, *r->error);
-        else *r->error = "unknown method: " + m;
-    } catch (const std::exception& e) {
-        *r->error = std::string("exception: ") + e.what();
-    } catch (...) {
-        *r->error = "unhandled exception";
+    std::shared_ptr<CalibGuiCall> call;
+    {
+        std::lock_guard<std::mutex> lk(g_guiCallsMutex);
+        auto it = g_guiCalls.find((uint64_t)wParam);
+        if (it == g_guiCalls.end()) return 0;   // stale (caller gave up) or not ours
+        call = it->second;
     }
+    const JsonValue& params = call->params;
+    JsonValue& result = call->result;
+    std::string& error = call->error;
+    try {
+        const std::string& m = call->method;
+        if (m == "calibration.enter") DoEnterNeutral(params, result, error);
+        else if (m == "calibration.exit") DoExitCalibration(params, result, error);
+        else if (m == "corrections.disable_all") DoDisableAll(params, result, error);
+        else if (m == "layers.set") DoLayersSet(params, result, error);
+        else if (m == "mhc.set_primaries") DoMhcSetPrimaries(params, result, error);
+        else if (m == "mhc.set_white") DoMhcSetWhite(params, result, error);
+        else if (m == "mhc.set_base_grayscale") DoMhcSetGrayscale(params, result, error, false);
+        else if (m == "mhc.set_base_lut") DoMhcSetBaseLut(params, result, error);
+        else if (m == "mhc.set_correction_grayscale") DoMhcSetGrayscale(params, result, error, true);
+        else if (m == "mhc.grayscale_live_begin") DoGrayscaleLiveBegin(params, result, error);
+        else if (m == "mhc.grayscale_set_live") DoGrayscaleSetLive(params, result, error);
+        else if (m == "mhc.grayscale_commit") DoGrayscaleCommit(params, result, error);
+        else if (m == "mhc.grayscale_cancel") DoGrayscaleCancel(params, result, error);
+        else if (m == "mhc.apply") DoMhcApply(params, result, error);
+        else if (m == "mhc.remove") DoMhcRemove(params, result, error);
+        else if (m == "runtime.set_3dlut") DoSet3dlut(params, result, error);
+        else if (m == "runtime.clear_3dlut") DoClear3dlut(params, result, error);
+        else if (m == "runtime.set_fald_params") DoSetFaldParams(params, result, error);
+        else if (m == "runtime.fald_debug") DoFaldDebug(params, result, error);
+        else if (m == "runtime.fald_dump") DoFaldDump(params, result, error);
+        else if (m == "runtime.fald_temporal") DoFaldTemporal(params, result, error);
+        else if (m == "runtime.fald_starfield") DoFaldStarfield(params, result, error);
+        else if (m == "hook.set_routing") DoHookSetRouting(params, result, error);
+        else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(params, result, error);
+        else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(params, result, error);
+        else error = "unknown method: " + m;
+    } catch (const std::exception& e) {
+        error = std::string("exception: ") + e.what();
+    } catch (...) {
+        error = "unhandled exception";
+    }
+    call->done.store(true, std::memory_order_release);
     return 0;
 }

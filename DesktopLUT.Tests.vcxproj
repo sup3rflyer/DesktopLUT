@@ -128,6 +128,7 @@
     <ClCompile Include="tests\test_hdr_dither.cpp" />
     <ClCompile Include="tests\test_desktop_gamma.cpp" />
     <ClCompile Include="tests\test_desktop_gamma_refresh.cpp" />
+    <ClCompile Include="tests\test_ipc_json.cpp" />
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

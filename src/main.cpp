@@ -4,6 +4,7 @@
 #include "types.h"
 #include "globals.h"
 #include "gui.h"
+#include "crash_handler.h"
 #include <objbase.h>
 
 // ============================================================================
@@ -12,6 +13,9 @@
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     (void)hInstance; (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
+
+    // Minidump on any crash / std::terminate (crashdumps\ next to the exe).
+    InstallCrashHandler();
 
     // Initialize COM for DirectComposition and shell APIs
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

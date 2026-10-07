@@ -457,11 +457,14 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     SetStatus(L"Active");
 
-    // Create auto-sleep wake event (auto-reset: resets after WaitForSingleObject returns)
-    g_overlayWakeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    // Auto-sleep wake + TOPMOST events: created once for the process (globals.cpp) and never
+    // closed — the GUI, whitelist and pipe threads SetEvent them at any time, and closing one
+    // between their null-check and SetEvent signalled a recycled handle. Drop a stale signal
+    // left by the previous run.
+    if (g_overlayWakeEvent) ResetEvent(g_overlayWakeEvent);
+    if (g_topmostEvent) ResetEvent(g_topmostEvent);
 
     // Start TOPMOST reassert helper thread (offloads SetWindowPos from MMCSS render thread)
-    g_topmostEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
     HANDLE topmostThread = CreateThread(nullptr, 0, TopmostHelperThread, nullptr, 0, nullptr);
 
     // Initialize watchdog timestamp
@@ -481,11 +484,22 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
         }
     }
 
-    // Stop TOPMOST helper thread
+    // Stop TOPMOST helper thread. Wait while PUMPING: the helper may be inside
+    // EndDeferWindowPos on this thread's overlay windows, which sends them messages and blocks
+    // until this thread dispatches them — a plain blocking wait here deadlocked Stop with a
+    // frozen full-screen TOPMOST overlay.
     if (g_topmostEvent) SetEvent(g_topmostEvent);
-    // TOPMOST thread checks g_running every 500ms and exits promptly — INFINITE wait is safe
-    if (topmostThread) { WaitForSingleObject(topmostThread, INFINITE); CloseHandle(topmostThread); }
-    if (g_topmostEvent) { CloseHandle(g_topmostEvent); g_topmostEvent = nullptr; }
+    if (topmostThread) {
+        for (;;) {
+            DWORD w = MsgWaitForMultipleObjects(1, &topmostThread, FALSE, INFINITE, QS_ALLINPUT);
+            if (w != WAIT_OBJECT_0 + 1) break;   // helper exited (or the wait failed)
+            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+        }
+        CloseHandle(topmostThread);
+    }
 
     // Clean up frame pacer (MMCSS, timers, timeEndPeriod)
     CleanupFramePacer(&framePacer);
@@ -508,12 +522,6 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     // StopProcessing handles final destruction.
     if (!g_dwmHookMode.load() || !g_analysisEnabled.load()) {
         DestroyAnalysisOverlay();
-    }
-
-    // Clean up auto-sleep wake event
-    if (g_overlayWakeEvent) {
-        CloseHandle(g_overlayWakeEvent);
-        g_overlayWakeEvent = nullptr;
     }
 
     // Cleanup monitor contexts. The cleanup loop releases D3D + destroys windows
@@ -650,6 +658,68 @@ static unsigned RetireStaleAnalysisThread() {
     return gen;
 }
 
+// ============================================================================
+// Lifecycle re-entrancy guard
+// ============================================================================
+// Stopping waits for the processing thread with a message pump (so the window stays
+// responsive), and a pumped message can be another lifecycle request: a button, the tray, a
+// calibration-pipe command (ReapplyProcessing = Stop + Start), WM_SHADER_STATE_CHANGED ->
+// DwmHookReevaluateOverlay, WM_PROCESSING_EXITED. Nested, they joined the thread underneath
+// the outer wait, which then waited on a closed handle and finally detach()ed a non-joinable
+// std::thread — an uncaught std::system_error that aborts the process — or started a new
+// thread the outer Stop then forgot about; a pumped WM_PROCESSING_EXITED could also re-arm the
+// auto-restart timer and undo the user's Stop. While a transition runs, nested requests are
+// deferred (Start during Stop) or absorbed (Stop during Stop), and replayed when it ends.
+enum class ProcTransition { Idle, Starting, Stopping };
+static ProcTransition g_procTransition = ProcTransition::Idle;   // GUI thread only
+static bool g_deferredStart = false;   // Start requested while a Stop was in progress
+static bool g_deferredStop  = false;   // Stop requested while a Start was in progress
+
+namespace {
+struct TransitionScope {
+    explicit TransitionScope(ProcTransition t) { g_procTransition = t; }
+    ~TransitionScope() { g_procTransition = ProcTransition::Idle; }
+    TransitionScope(const TransitionScope&) = delete;
+    TransitionScope& operator=(const TransitionScope&) = delete;
+};
+}  // namespace
+
+bool IsProcessingTransitionActive() { return g_procTransition != ProcTransition::Idle; }
+
+// Wait for the CURRENT processing thread to exit, pumping GUI messages meanwhile. Re-checks
+// before every wait that the thread is still the one it started waiting for (the pump is the
+// only place it could have been joined or replaced), so it never waits on a closed handle and
+// never joins/detaches someone else's thread. On timeout the thread is detached (last resort)
+// and false is returned.
+static bool JoinProcessingThreadPumping(DWORD timeoutMs) {
+    if (!g_gui.processingThread.joinable()) return true;
+    const std::thread::id waitingFor = g_gui.processingThread.get_id();
+    auto stillOurs = [&] {
+        return g_gui.processingThread.joinable() && g_gui.processingThread.get_id() == waitingFor;
+    };
+    const DWORD start = GetTickCount();
+    for (;;) {
+        if (!stillOurs()) return true;   // joined (or detached) meanwhile by its own exit path
+        const DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= timeoutMs) {
+            g_gui.processingThread.detach();
+            return false;
+        }
+        const DWORD waitMs = (std::min)((DWORD)100, timeoutMs - elapsed);
+        const DWORD r = WaitForSingleObject((HANDLE)g_gui.processingThread.native_handle(), waitMs);
+        if (r == WAIT_OBJECT_0) {
+            g_gui.processingThread.join();
+            return true;
+        }
+        if (r == WAIT_FAILED) Sleep(waitMs);   // never spin
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+}
+
 // Start the lightweight analysis-only thread (DWM hook mode).
 // Keeps hotkeys on g_gui.hwndMain (no overlay window to register them on).
 static void StartAnalysisOnlyMode() {
@@ -667,30 +737,10 @@ static void StartAnalysisOnlyMode() {
 // Stop the analysis-only thread and wait for it to exit.
 static void StopAnalysisOnlyMode() {
     g_running.store(false);
-    if (g_gui.processingThread.joinable()) {
-        auto handle = g_gui.processingThread.native_handle();
-        DWORD startTime = GetTickCount();
-        DWORD timeout = 2000;
-        while (true) {
-            DWORD elapsed = GetTickCount() - startTime;
-            if (elapsed >= timeout) {
-                g_gui.processingThread.detach();
-                // Invalidate the zombie's generation so it exits even if
-                // g_running is re-armed by a subsequent start before it notices
-                g_analysisThreadGen.fetch_add(1);
-                break;
-            }
-            DWORD waitTime = (100 < timeout - elapsed) ? 100 : (timeout - elapsed);
-            if (WaitForSingleObject(handle, waitTime) == WAIT_OBJECT_0) {
-                g_gui.processingThread.join();
-                break;
-            }
-            MSG msg;
-            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-        }
+    if (!JoinProcessingThreadPumping(2000)) {
+        // Detached: invalidate the zombie's generation so it exits even if
+        // g_running is re-armed by a subsequent start before it notices
+        g_analysisThreadGen.fetch_add(1);
     }
     g_analysisOnlyMode.store(false);
     std::cout << "[DWM Hook] Analysis-only mode stopped" << std::endl;
@@ -939,7 +989,9 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
     PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, needsFullOverlay ? 1 : 0, 0);
 }
 
-void StartProcessing() {
+static void StopProcessingImpl();
+
+static void StartProcessingImpl() {
     if (g_gui.isRunning) return;
 
     // Ensure any previous thread is joined before creating a new one
@@ -956,7 +1008,7 @@ void StartProcessing() {
             FaldTrace("StartProcessing: leftover thread is ALIVE -> StopProcessing first");
             std::cerr << "StartProcessing: a processing thread is still alive while isRunning is false — stopping it first" << std::endl;
             g_gui.isRunning = true;          // let StopProcessing do its bounded stop/join
-            StopProcessing();
+            StopProcessingImpl();            // inside this Start's transition: not the guarded entry
         } else {
             FaldTrace("StartProcessing: joining an exited leftover thread");
             g_gui.processingThread.join();
@@ -1160,13 +1212,53 @@ void StartProcessing() {
     SetStatus(L"Active");
 }
 
+void StartProcessing() {
+    if (g_procTransition == ProcTransition::Stopping) {
+        // Pumped from inside a Stop (e.g. a pipe Stop+Start, a button): run it after the Stop.
+        g_deferredStart = true;
+        std::cout << "[Lifecycle] Start requested while stopping — deferred until the stop completes" << std::endl;
+        return;
+    }
+    if (g_procTransition == ProcTransition::Starting) return;
+    {
+        TransitionScope scope(ProcTransition::Starting);
+        StartProcessingImpl();
+    }
+    if (g_deferredStop) {
+        g_deferredStop = false;
+        StopProcessing();
+    }
+}
+
 void StopProcessing() {
+    if (g_procTransition == ProcTransition::Stopping) return;   // the outer Stop completes it
+    if (g_procTransition == ProcTransition::Starting) {
+        g_deferredStop = true;
+        std::cout << "[Lifecycle] Stop requested while starting — deferred until the start completes" << std::endl;
+        return;
+    }
+    {
+        TransitionScope scope(ProcTransition::Stopping);
+        StopProcessingImpl();
+    }
+    if (g_deferredStart) {
+        g_deferredStart = false;
+        StartProcessing();
+    }
+}
+
+static void StopProcessingImpl() {
     FaldTrace("StopProcessing: enter");
     // Cancel any pending auto-restart (user explicitly wants stopped)
     g_gui.restartRetryCount = 0;
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
 
-    if (!g_gui.isRunning) return;
+    if (!g_gui.isRunning) {
+        // Not running, but a thread that exited on its own may still be unjoined: join it now
+        // (bounded) so it never reaches ~GUIState joinable, which calls std::terminate.
+        JoinProcessingThreadPumping(2000);
+        return;
+    }
 
     SetStatus(L"Stopping...");
     g_running = false;
@@ -1191,26 +1283,10 @@ void StopProcessing() {
     if (g_analysisOnlyMode.load()) {
         g_analysisEnabled.store(false);  // Break analysis-only loop
         // Thread will exit and post WM_ANALYSIS_ONLY_EXITED, but we handle cleanup here
-        if (g_gui.processingThread.joinable()) {
-            auto handle = g_gui.processingThread.native_handle();
-            DWORD startTime = GetTickCount();
-            while (GetTickCount() - startTime < 2000) {
-                if (WaitForSingleObject(handle, 100) == WAIT_OBJECT_0) {
-                    g_gui.processingThread.join();
-                    break;
-                }
-                MSG msg;
-                while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                    TranslateMessage(&msg);
-                    DispatchMessage(&msg);
-                }
-            }
-            if (g_gui.processingThread.joinable()) {
-                g_gui.processingThread.detach();
-                // Invalidate the zombie's generation so it exits even if
-                // g_running is re-armed by a subsequent start before it notices
-                g_analysisThreadGen.fetch_add(1);
-            }
+        if (!JoinProcessingThreadPumping(2000)) {
+            // Detached: invalidate the zombie's generation so it exits even if
+            // g_running is re-armed by a subsequent start before it notices
+            g_analysisThreadGen.fetch_add(1);
         }
         g_analysisOnlyMode.store(false);
         DestroyAnalysisOverlay();
@@ -1237,39 +1313,11 @@ void StopProcessing() {
     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
     FaldTrace("StopProcessing: joining render thread");
 
-    if (g_gui.processingThread.joinable()) {
-        // Wait for thread with timeout to prevent GUI freeze
-        // Process GUI messages while waiting so window stays responsive
-        auto handle = g_gui.processingThread.native_handle();
-        DWORD startTime = GetTickCount();
-        DWORD timeout = 6000;  // 6 second timeout (accounts for Sleep(500) in forced reinit + frame sync)
-
-        while (true) {
-            DWORD elapsed = GetTickCount() - startTime;
-            if (elapsed >= timeout) {
-                // Timeout - detach thread (last resort, should not normally happen)
-                std::cerr << "Processing thread shutdown timed out after " << timeout << "ms, detaching" << std::endl;
-                g_gui.processingThread.detach();
-                SetStatus(L"Inactive");
-                break;
-            }
-
-            DWORD waitTime = (100 < timeout - elapsed) ? 100 : (timeout - elapsed);  // Wait in 100ms chunks
-            DWORD result = WaitForSingleObject(handle, waitTime);
-
-            if (result == WAIT_OBJECT_0) {
-                g_gui.processingThread.join();
-                SetStatus(L"Inactive");
-                break;
-            }
-
-            // Pump GUI messages to keep window responsive
-            MSG msg;
-            while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
-                TranslateMessage(&msg);
-                DispatchMessage(&msg);
-            }
-        }
+    // Wait for the thread with a timeout (6 s: accounts for Sleep(500) in forced reinit + frame
+    // sync), pumping GUI messages so the window stays responsive.
+    if (!JoinProcessingThreadPumping(6000)) {
+        // Timeout - detached (last resort, should not normally happen)
+        std::cerr << "Processing thread shutdown timed out after 6000ms, detaching" << std::endl;
     }
 
     FaldTrace("StopProcessing: joined/detached");
@@ -1285,7 +1333,26 @@ void StopProcessing() {
     UpdateGUIState();
 }
 
+static void DwmHookReevaluateOverlayOnce();
+
 void DwmHookReevaluateOverlay() {
+    // Pumped from inside a Start/Stop: the transition owns the thread (a Stop has already
+    // cleared g_running; starting an overlay here would leave a thread it then forgets).
+    if (g_procTransition != ProcTransition::Idle) return;
+    // Not re-entrant either: StopAnalysisOnlyMode below pumps messages, and a nested
+    // re-evaluation could start a thread underneath it. Fold it into one more pass instead.
+    static bool inReevaluate = false;
+    static bool againRequested = false;
+    if (inReevaluate) { againRequested = true; return; }
+    inReevaluate = true;
+    do {
+        againRequested = false;
+        DwmHookReevaluateOverlayOnce();
+    } while (againRequested && g_procTransition == ProcTransition::Idle);
+    inReevaluate = false;
+}
+
+static void DwmHookReevaluateOverlayOnce() {
     if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
 
     bool needAnalysis = g_analysisEnabled.load();

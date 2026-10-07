@@ -12,11 +12,18 @@ BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam);
 // Processing thread function
 void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs);
 
-// Start processing (GUI mode)
+// Start processing (GUI mode). Requested from inside a running Stop (a pumped message), it is
+// deferred until that Stop completes.
 void StartProcessing();
 
-// Stop processing (GUI mode)
+// Stop processing (GUI mode). Re-entrant calls from inside a running Stop are absorbed; from
+// inside a running Start, deferred until it completes. Also joins a thread that exited on its
+// own while not running.
 void StopProcessing();
+
+// True while StartProcessing/StopProcessing is executing (their joins pump messages): handlers
+// that would start, join or replace the processing thread must leave it to the transition.
+bool IsProcessingTransitionActive();
 
 // In DWM hook mode, check if overlay is needed and auto-start/stop it
 void DwmHookReevaluateOverlay();

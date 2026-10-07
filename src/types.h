@@ -33,8 +33,11 @@ struct AtomicTimePoint {
     operator std::chrono::steady_clock::time_point() const { return load(); }
 };
 
-// Atomic wrapper that allows copy/move (for use in vector-stored structs)
-// Uses relaxed ordering for copies since these are cross-thread flags, not synchronization primitives
+// Atomic wrapper that allows copy/move (for use in vector-stored structs).
+// Copies are relaxed (copying a whole context is not a publish). The implicit read/write
+// (`flag = true`, `if (flag)`) is acquire/release: these flags PUBLISH plain data written just
+// before them (e.g. previewResult / previewBaseLut before previewBaseLutDirty), and a relaxed
+// store let the compiler sink those writes past the flag. Free on x86 (plain mov).
 template<typename T>
 struct MovableAtomic {
     std::atomic<T> v;
@@ -47,8 +50,8 @@ struct MovableAtomic {
     T load(std::memory_order mo = std::memory_order_seq_cst) const { return v.load(mo); }
     void store(T val, std::memory_order mo = std::memory_order_seq_cst) { v.store(val, mo); }
     T exchange(T val, std::memory_order mo = std::memory_order_seq_cst) { return v.exchange(val, mo); }
-    operator T() const { return v.load(std::memory_order_relaxed); }
-    MovableAtomic& operator=(T val) { v.store(val, std::memory_order_relaxed); return *this; }
+    operator T() const { return v.load(std::memory_order_acquire); }
+    MovableAtomic& operator=(T val) { v.store(val, std::memory_order_release); return *this; }
 };
 
 // ============================================================================

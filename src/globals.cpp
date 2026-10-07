@@ -84,8 +84,10 @@ std::atomic<bool> g_showMotionBar{ false };    // Show motion bar for judder det
 std::atomic<bool> g_overlayAutoSleep{ false };  // true = overlay has nothing to do, windows hidden
 std::atomic<bool> g_shaderCorrectionsActive{ false };  // true = shader applying corrections (not just LUT)
 std::atomic<bool> g_nonAnalysisCorrectionsActive{ false };  // Cached for analysis-only thread (avoids iterating monitorSettings)
-HANDLE g_overlayWakeEvent = nullptr;           // Auto-reset event for auto-sleep wake
-HANDLE g_topmostEvent = nullptr;              // Signaled when TOPMOST reassert needed
+// Process-lifetime auto-reset events, never closed: set from several threads at any time (a
+// per-run create/close let a SetEvent race the CloseHandle and signal a recycled handle).
+HANDLE g_overlayWakeEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);   // auto-sleep wake
+HANDLE g_topmostEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);       // TOPMOST reassert needed
 std::atomic<bool> g_framePacerEnabled{ true };  // Enable predictive frame pacer (default: true)
 std::atomic<bool> g_framePacerSpinWait{ true }; // Enable spin-wait phase (default: true)
 std::atomic<bool> g_frameBufferEnabled{ true };  // Enable auto frame buffer (default: on)

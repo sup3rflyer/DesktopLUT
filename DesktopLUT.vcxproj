@@ -81,6 +81,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\crash_handler.cpp" />
     <ClCompile Include="src\globals.cpp" />
     <ClCompile Include="src\lut.cpp" />
     <ClCompile Include="src\color.cpp" />
@@ -116,6 +117,7 @@
   <ItemGroup>
     <ClInclude Include="src\types.h" />
     <ClInclude Include="src\globals.h" />
+    <ClInclude Include="src\ipc_json.h" />
     <ClInclude Include="src\shader.h" />
     <ClInclude Include="shared\fald_panel.h" />
     <ClInclude Include="shared\fald_temporal.h" />
