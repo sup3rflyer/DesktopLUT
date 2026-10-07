@@ -10,7 +10,7 @@
 BOOL CALLBACK MonitorEnumProc(HMONITOR hMonitor, HDC, LPRECT, LPARAM lParam);
 
 // Processing thread function
-void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs);
+void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned renderGen);
 
 // Start processing (GUI mode). Requested from inside a running Stop (a pumped message), it is
 // deferred until that Stop completes.
@@ -20,6 +20,11 @@ void StartProcessing();
 // inside a running Start, deferred until it completes. Also joins a thread that exited on its
 // own while not running.
 void StopProcessing();
+
+// The auto-restart after the overlay thread died (RESTART_TIMER_ID): like StartProcessing, but a DWM hook
+// still resident with exactly the staging set it would inject is kept (DwmHookResidentWith) instead of
+// being ejected and re-injected on every retry. Every other start re-injects.
+void StartProcessingAfterOverlayLoss();
 
 // One display needs the processing pipeline (a LUT, a shader correction, tonemap, FALD in overlay mode,
 // or desktop gamma) — StartProcessing's per-monitor filter.
@@ -34,8 +39,9 @@ bool AnyMonitorHasCorrections();
 bool AbandonedProcessingThreadAlive();
 // A StartProcessing was deferred for that reason and the thread has now exited: true once (consumes it).
 bool TakeDeferredStartReady();
-// Forget a deferred start (the user stopped meanwhile).
-void CancelDeferredStart();
+// Hook mode: the overlay thread hung (GUI-side render-health check). Join and restart only that thread;
+// the hook keeps running. If the join times out the overlay restarts once the thread has exited.
+void RestartHungOverlayThread();
 
 // One display needs the DWM hook resident (hook mode): a .cube, a FALD panel file, or the HDR
 // tonemapper. NOT gated on the display's current HDR mode — the user flips HDR while running and the

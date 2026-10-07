@@ -2134,7 +2134,10 @@ bool HandleConnection(HANDLE pipe, OverlappedEvent& io, const ipc_client::TokenI
         size_t nl = request.find('\n');
         if (nl != std::string::npos) { request.resize(nl); gotLine = true; break; }
     }
-    if (!gotLine && request.empty()) return true;   // closed / failed before sending anything
+    // A request is a complete line. Anything else — the client closed, stalled past the deadline, or the
+    // server was disarmed mid-read — is dropped, never dispatched as a partial command (an oversized
+    // request still gets its error reply below).
+    if (!gotLine && request.size() < kMaxRequestBytes) return true;
 
     // Per-connection client check (T2.2). After the read: the client's context is captured by then.
     bool revertFailed = false;

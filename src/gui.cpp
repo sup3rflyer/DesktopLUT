@@ -64,13 +64,16 @@ PreviewModeGate EvaluatePreviewModeGate(bool requestedHDR, bool ctxHDR,
                                     : PreviewModeGate::Mismatch;
 }
 
-// Pump messages until monitor `monIdx` has an overlay context in mode `isHDR` (a live preview can run),
-// the processing thread is gone, or `timeoutMs` passes. A freshly started overlay builds its contexts
-// asynchronously (device, duplication, swapchain per monitor) — slow on low-end GPUs.
-static bool WaitForPreviewContext(int monIdx, bool isHDR, DWORD timeoutMs) {
+// Pump messages until monitor `monIdx` has an overlay context in mode `isHDR` AND the render loop has
+// iterated since `beatBefore` (a live preview can run), the processing thread is gone, or `timeoutMs`
+// passes. A freshly started overlay builds its contexts asynchronously (device, duplication, swapchain per
+// monitor — slow on low-end GPUs) and only then runs its MHC startup hygiene (orphan cleanup, stale sweep,
+// reapply): a preview engaged before that ends would have its passthrough profile deleted / its
+// permutation re-asserted over by it. The first loop iteration comes after the hygiene.
+static bool WaitForPreviewContext(int monIdx, bool isHDR, DWORD timeoutMs, uint64_t beatBefore) {
     const ULONGLONG until = GetTickCount64() + timeoutMs;
     for (;;) {
-        {
+        if (g_renderLoopHeartbeat.load(std::memory_order_relaxed) != beatBefore) {
             std::lock_guard<std::mutex> lk(g_monitorsMutex);
             for (const auto& ctx : g_monitors)
                 if (ctx.index == monIdx) {
@@ -148,10 +151,11 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
                 // (render.cpp auto-sleep skips straight back to the wake wait).
                 // Kick the same full reinit resume-from-sleep uses and wait for
                 // the capture path to converge on the actual mode.
+                const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
                 g_forceReinit.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 // Forced reinit sleeps 500ms before re-deriving the mode.
-                livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
+                livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs, beat);
                 break;
             }
         }
@@ -160,10 +164,11 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
     // Case 2: DWM hook running without full overlay (or with analysis-only) — start overlay for preview
     if (g_gui.isRunning && (!g_gui.processingThread.joinable() || g_analysisOnlyMode.load()) && g_dwmHookMode.load()) {
         g_mhcEditDialogOpen.store(true);
+        const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
         DwmHookReevaluateOverlay();
         if (g_gui.processingThread.joinable()) {
             startedOverlayForPreview = true;
-            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
+            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs, beat);
             if (!livePreview) {
                 g_mhcEditDialogOpen.store(false);
                 DwmHookReevaluateOverlay();
@@ -180,6 +185,7 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
                          : g_gui.monitorSettings[monIdx].sdrColorCorrection;
         bool origPrimEnabled = cc.primariesEnabled;
         cc.primariesEnabled = true;  // Ensure this monitor is included in processing
+        const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
         StartProcessing();
         cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
         if (g_gui.isRunning) {
@@ -187,7 +193,7 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
             // The thread just started: its contexts do not exist yet. Checking once, right away, failed
             // every time — the preview then stopped what it had started (a full hook inject + eject in
             // hook mode) and the editor opened without a preview (T2.10).
-            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
+            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs, beat);
             if (!livePreview) {
                 StopProcessing();
                 startedForPreview = false;
@@ -1352,38 +1358,48 @@ static void TickTopologyPipeline(HWND hwnd) {
 // T2.20: the render thread's own watchdog (RenderAll) cannot see that thread hang — stuck in a clock
 // wait that never returns, in Present / Map, in a recovery. This GUI-side tick watches its heartbeat:
 // after RENDER_HANG_TIMEOUT_MS without a loop iteration (display on, compositor clock not occluded) it
-// stops and restarts processing. A Stop that cannot join the thread abandons it; the restart is then
-// deferred until that thread has exited (a successor must not share the globals it still uses) and
-// started from here once it has.
+// restarts it: in hook mode only the overlay thread (the hook keeps running), in overlay mode the whole
+// pipeline. A thread that cannot be joined is abandoned; no successor overlay thread starts while it
+// lives (it would share the globals it still uses) — a start or overlay re-evaluation deferred for that
+// reason is carried out from here once it has exited. Any Stop cancels such a deferral.
 static void TickRenderHealth() {
+    static std::thread::id watchedThread;
     static uint64_t lastBeat = 0;
     static ULONGLONG lastProgress = 0;
     const ULONGLONG now = GetTickCount64();
-    const bool busy = IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
-                      IsCalibrationOrLiveEditActive();
 
-    if (g_userStopped) CancelDeferredStart();
-    if (!busy && !g_gui.isRunning && TakeDeferredStartReady()) {
-        std::cout << "[Render health] the stuck processing thread has exited: starting processing" << std::endl;
-        StartProcessing();
+    if (!IsProcessingTransitionActive() && TakeDeferredStartReady()) {
+        std::cout << "[Render health] the stuck processing thread has exited" << std::endl;
+        if (g_gui.isRunning) DwmHookReevaluateOverlay();   // hook mode ran hook-only meanwhile
+        else StartProcessing();
         return;
     }
 
     const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
     const bool watching = g_gui.isRunning && g_running.load() && g_gui.processingThread.joinable() &&
                           !g_analysisOnlyMode.load() && !DisplayOffOrOccluded();
-    if (!watching || beat != lastBeat) {
+    const std::thread::id current = watching ? g_gui.processingThread.get_id() : std::thread::id{};
+    // New baseline whenever the watched thread changes (first sighting after a start included: the
+    // timer is armed at window creation, and "no progress since 0" read as the whole uptime).
+    if (!watching || current != watchedThread || beat != lastBeat) {
+        watchedThread = current;
         lastBeat = beat;
         lastProgress = now;
         return;
     }
+    const bool busy = IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
+                      IsCalibrationOrLiveEditActive();
     if (now - lastProgress < (ULONGLONG)RENDER_HANG_TIMEOUT_MS || busy) return;   // busy: escalate once it ends
     lastProgress = now;   // one escalation per hang period
     std::cerr << "[Render health] the overlay render loop made no progress for " << RENDER_HANG_TIMEOUT_MS / 1000
-              << " s: restarting processing" << std::endl;
+              << " s: restarting it" << std::endl;
     SetStatus(L"Overlay stopped responding: restarting...");
-    StopProcessing();
-    StartProcessing();   // defers by itself while the old thread is still stuck
+    if (g_dwmHookMode.load()) {
+        RestartHungOverlayThread();
+    } else {
+        StopProcessing();
+        StartProcessing();   // defers by itself while the old thread is still stuck
+    }
 }
 
 // Messages that start, re-arm or restart work. During the teardown (which pumps while it joins threads
@@ -2635,7 +2651,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ApplyCalibrationControl(!g_calibrationControlEnabled.load());
             return 0;
         case ID_TRAY_EXIT:
-            StopProcessing();
+            // WM_DESTROY runs the ordered teardown (pipe, live edits, processing, timers). A Stop here
+            // ran before it — pumping, with the pipe armed and nothing yet marked as shutting down.
             DestroyWindow(hwnd);
             return 0;
         }
@@ -2829,7 +2846,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == RESTART_TIMER_ID) {
             KillTimer(hwnd, RESTART_TIMER_ID);
             if (!g_gui.isRunning && !g_gui.activeSettings.empty()) {
-                StartProcessing();
+                StartProcessingAfterOverlayLoss();
                 if (g_gui.isRunning) {
                     // Success — reset backoff
                     g_gui.restartRetryCount = 0;
@@ -3273,9 +3290,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_ENDSESSION:
         if (wParam) {
-            // The session ends once this returns: run the ordered teardown (WM_DESTROY) now, without
-            // the remote FreeLibrary into this session's dwm.exe (it ends with the session).
-            g_sessionEnding.store(true);
+            // The app ends once this returns: run the ordered teardown (WM_DESTROY) now. When the SESSION
+            // ends too, skip the remote FreeLibrary into this session's dwm.exe (it ends with the
+            // session). ENDSESSION_CLOSEAPP = the Restart Manager closing just this app (an installer):
+            // the session and its dwm.exe continue, so the hook is ejected as on any exit.
+            if (!(lParam & ENDSESSION_CLOSEAPP)) g_sessionEnding.store(true);
             g_appShuttingDown.store(true);
             DestroyWindow(hwnd);
         }

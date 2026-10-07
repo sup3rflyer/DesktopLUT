@@ -151,6 +151,10 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
 // TOPMOST reassert helper thread — runs at low priority to avoid impacting
 // the MMCSS render loop. Periodically calls SetWindowPos(HWND_TOPMOST) for
 // all overlay windows, either on-demand (event signaled) or every 30 seconds.
+// Bumped whenever a Stop abandons a processing thread it could not join (RememberAbandonedThread). Each
+// render thread gets the value current at its creation and leaves its loop once it differs.
+static std::atomic<unsigned> g_renderLoopGen{0};
+
 static DWORD WINAPI TopmostHelperThread(LPVOID) {
     while (true) {
         DWORD result = WaitForSingleObject(g_topmostEvent, 500);
@@ -204,7 +208,7 @@ static DWORD WINAPI TopmostHelperThread(LPVOID) {
     return 0;
 }
 
-void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
+void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned renderGen) {
     FaldTrace("ProcessingThread: begin");
     // Initialize COM for this thread (separate apartment from GUI thread)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
@@ -472,7 +476,9 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     // Main loop
     MSG msg = {};
-    while (g_running) {
+    // renderGen: a Stop that gave up joining this thread (abandoned it) bumped g_renderLoopGen — if it ever
+    // unblocks it must leave its loop even when g_running is true again (the hook still runs in hook mode).
+    while (g_running && g_renderLoopGen.load(std::memory_order_relaxed) == renderGen) {
         g_renderLoopHeartbeat.fetch_add(1, std::memory_order_relaxed);   // liveness for the GUI-side hang check
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
@@ -548,7 +554,8 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
 
     CoUninitialize();
 
-    SetStatus(L"Inactive");
+    // An abandoned thread that finally exits must not relabel a pipeline that kept running without it
+    if (g_renderLoopGen.load(std::memory_order_relaxed) == renderGen) SetStatus(L"Inactive");
     PostMessage(g_gui.hwndMain, WM_PROCESSING_EXITED, 0, 0);  // Signal GUI to update
 }
 
@@ -721,8 +728,10 @@ static void ReplayPendingIntent() {
 // successor owns. GUI thread only.
 static std::vector<HANDLE> g_abandonedThreads;
 static bool g_startDeferredByAbandoned = false;   // a StartProcessing was refused for that reason
+static bool s_restartKeepsResidentHook = false;   // StartProcessingAfterOverlayLoss in progress
 
 static void RememberAbandonedThread(HANDLE native) {
+    g_renderLoopGen.fetch_add(1, std::memory_order_relaxed);   // an abandoned render loop exits if it unblocks
     HANDLE dup = nullptr;
     if (DuplicateHandle(GetCurrentProcess(), native, GetCurrentProcess(), &dup, SYNCHRONIZE, FALSE, 0))
         g_abandonedThreads.push_back(dup);
@@ -743,7 +752,6 @@ bool TakeDeferredStartReady() {
     return true;
 }
 
-void CancelDeferredStart() { g_startDeferredByAbandoned = false; }
 
 // Wait for the CURRENT processing thread to exit, pumping GUI messages meanwhile. Re-checks
 // before every wait that the thread is still the one it started waiting for (the pump is the
@@ -1106,16 +1114,19 @@ static void StartProcessingImpl() {
         }
     }
     // A thread a Stop gave up on is still alive (also covers the leftover just stopped above, if its
-    // join timed out): starting a successor now would share the globals it still uses. Deferred — the
-    // GUI's render-health tick starts it once that thread has exited (TakeDeferredStartReady).
-    if (AbandonedProcessingThreadAlive()) {
+    // join timed out): a successor overlay thread would share the globals it still uses (g_monitors, the
+    // shared D3D device). Overlay mode has nothing else to start: the whole start is deferred. Hook mode
+    // injects as usual and only its overlay thread waits. The GUI's render-health tick picks either up
+    // once that thread has exited (TakeDeferredStartReady).
+    g_startDeferredByAbandoned = false;
+    const bool overlayBlocked = AbandonedProcessingThreadAlive();
+    if (overlayBlocked && !g_dwmHookMode.load()) {
         std::cerr << "StartProcessing: a previous processing thread is still stuck — start deferred until it exits"
                   << std::endl;
         g_startDeferredByAbandoned = true;
         SetStatus(L"Waiting for the stuck overlay thread to exit...");
         return;
     }
-    g_startDeferredByAbandoned = false;
 
     // Build config from all monitors with SDR LUT or color correction configured
     std::vector<MonitorLUTConfig> configs;
@@ -1215,9 +1226,11 @@ static void StartProcessingImpl() {
         std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with hook work (cube / FALD / tonemap)"
                    << std::endl;
 
-        if (!dwmMonitors.empty() && DwmHookResidentWith(dwmMonitors)) {
-            // Nothing ejected the hook since it was injected with exactly this set (e.g. the auto-restart
-            // after the overlay thread died): keep it — just bring its shared config up to date.
+        if (!dwmMonitors.empty() && s_restartKeepsResidentHook && DwmHookResidentWith(dwmMonitors)) {
+            // The auto-restart after the overlay thread died: nothing ejected the hook since it was
+            // injected with exactly this set — keep it, just bring its shared config up to date. Only
+            // here: any other start (Apply, a pipe verb) may come with a re-exported file at the same
+            // path or a rewritten routing file, which the DLL reads only at attach.
             std::wcout << L"[DWM Hook] Hook already resident with this staging set — not re-injecting" << std::endl;
             UpdateDwmHookSharedConfig();
         } else if (!dwmMonitors.empty()) {
@@ -1248,7 +1261,14 @@ static void StartProcessingImpl() {
         bool needFullOverlay = HasNonAnalysisShaderCorrections();
         // HasNonAnalysisShaderCorrections already cached the result in g_nonAnalysisCorrectionsActive
 
-        if (needOverlay && needFullOverlay) {
+        if (overlayBlocked && needOverlay) {
+            // A stuck overlay thread is still alive: run hook-only for now; the render-health tick
+            // re-evaluates the overlay once it has exited.
+            std::cerr << "[DWM Hook] Overlay waits for a stuck processing thread to exit (hook runs meanwhile)"
+                      << std::endl;
+            g_startDeferredByAbandoned = true;
+        }
+        if (needOverlay && needFullOverlay && !overlayBlocked) {
             // Full overlay needed for shader corrections (not just analysis)
             // Clear LUT paths so shader only applies corrections
             std::cout << "[DWM Hook] Shader overlay ACTIVE (corrections-only passthrough, DWM hook handles LUT)" << std::endl;
@@ -1261,8 +1281,8 @@ static void StartProcessingImpl() {
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
             RetireStaleAnalysisThread();  // full overlay owns g_monitors too
-            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
-        } else if (needOverlay && !needFullOverlay) {
+            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs, g_renderLoopGen.load());
+        } else if (needOverlay && !needFullOverlay && !overlayBlocked) {
             // Only analysis active — use lightweight analysis-only mode (no overlay windows)
             std::cout << "[DWM Hook] Analysis-only mode (no overlay, DD capture + compute only)" << std::endl;
             g_gui.isRunning = true;
@@ -1335,7 +1355,7 @@ static void StartProcessingImpl() {
     g_gui.restartRetryCount = 0;  // Reset backoff on successful start
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
     RetireStaleAnalysisThread();  // full overlay owns g_monitors too
-    g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
+    g_gui.processingThread = std::thread(ProcessingThreadFunc, configs, g_renderLoopGen.load());
 
     // Directly set button states - don't call UpdateGUIState which may re-enable via SettingsChanged
     EnableWindow(g_gui.hwndApply, FALSE);
@@ -1356,6 +1376,18 @@ void StartProcessing() {
     ReplayPendingIntent();
 }
 
+void StartProcessingAfterOverlayLoss() {
+    if (g_appShuttingDown.load()) return;
+    if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(true); return; }   // replays as a plain start
+    {
+        TransitionScope scope(ProcTransition::Starting);
+        s_restartKeepsResidentHook = true;
+        StartProcessingImpl();
+        s_restartKeepsResidentHook = false;
+    }
+    ReplayPendingIntent();
+}
+
 void StopProcessing() {
     if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(false); return; }
     {
@@ -1370,11 +1402,19 @@ static void StopProcessingImpl() {
     // Cancel any pending auto-restart (user explicitly wants stopped)
     g_gui.restartRetryCount = 0;
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
+    g_startDeferredByAbandoned = false;   // and a start deferred behind a stuck thread: stopped means stopped
 
     if (!g_gui.isRunning) {
         // Not running, but a thread that exited on its own may still be unjoined: join it now
         // (bounded) so it never reaches ~GUIState joinable, which calls std::terminate.
         JoinProcessingThreadPumping(2000);
+        // ...and the hook may still be resident: the overlay thread died in hook mode (WM_PROCESSING_EXITED
+        // clears isRunning but leaves the hook for the auto-restart) or a previous session left it. A Stop
+        // means nothing stays on screen — e.g. corrections.disable_all used to leave the cube applied.
+        if (IsDwmHookActive()) {
+            std::cout << "[DWM Hook] Stop while not running: ejecting the resident hook" << std::endl;
+            UninjectDwmHook(/*keepOwnSession=*/g_sessionEnding.load());
+        }
         return;
     }
 
@@ -1473,6 +1513,30 @@ void DwmHookReevaluateOverlay() {
     ReplayPendingIntent();
 }
 
+void RestartHungOverlayThread() {
+    // Hook mode: the hook is healthy and keeps applying the LUT / tonemap — only the overlay thread is
+    // stuck. A full Stop would eject the hook before the join, and a join that times out would then
+    // defer the re-inject behind the stuck thread: the LUT gone for good.
+    if (g_procTransition != ProcTransition::Idle || !g_gui.isRunning || !g_dwmHookMode.load()) return;
+    if (!g_gui.processingThread.joinable() || g_analysisOnlyMode.load()) return;
+    {
+        TransitionScope scope(ProcTransition::Reevaluating);   // its WM_PROCESSING_EXITED is ours
+        g_running = false;
+        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+        const bool joined = JoinProcessingThreadPumping(6000);
+        g_running = true;   // hook mode: the hook is still running (an abandoned loop exits via its generation)
+        if (joined) {
+            DwmHookReevaluateOverlayOnce();   // a fresh overlay thread if one is still needed
+        } else {
+            std::cerr << "[Render health] the overlay thread did not exit; the hook keeps running and the "
+                         "overlay restarts once that thread has exited" << std::endl;
+            g_startDeferredByAbandoned = true;
+        }
+        SetStatus(L"Active (DWM Hook)");
+    }
+    ReplayPendingIntent();
+}
+
 static void DwmHookReevaluateOverlayOnce() {
     if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
 
@@ -1517,7 +1581,7 @@ static void DwmHookReevaluateOverlayOnce() {
             }
             g_running = true;
             RetireStaleAnalysisThread();  // full overlay owns g_monitors too
-            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs);
+            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs, g_renderLoopGen.load());
         }
     } else if (needAnalysis) {
         // Analysis only (no other corrections need the overlay shader)
