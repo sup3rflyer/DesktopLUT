@@ -217,6 +217,9 @@ extern std::atomic<bool> g_displayOff;  // Display is off - skip recovery attemp
 // setters are power/session events with their own clearing events: the pacer used to set g_displayOff, and
 // nothing ever cleared that, so the overlay stayed paused until the next power/session event (T2.19).
 extern std::atomic<bool> g_compClockOccluded;
+// Incremented once per overlay render-loop iteration (ProcessingThreadFunc). The GUI thread's render-health
+// tick (gui.cpp) watches it: the in-thread watchdog cannot see its own thread hang (T2.20).
+extern std::atomic<uint64_t> g_renderLoopHeartbeat;
 // Rendering is pointless right now (display off/asleep/locked, or the compositor clock is occluded):
 // recovery attempts and the render-loop watchdog stand down.
 inline bool DisplayOffOrOccluded() {

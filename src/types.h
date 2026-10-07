@@ -276,6 +276,10 @@ const int TOPOLOGY_PIPELINE_TIMER_ID = 115;     // After the live settings attac
 const int TOPOLOGY_PIPELINE_SETTLE_MS = 5000;   //   pipeline once the display transition has settled
 const int MHC_MATRIX_REBAKE_TIMER_ID = 116;     // Re-bake profiles baked by older matrix maths (startup / re-attach)
 const int MHC_MATRIX_REBAKE_DELAY_MS = 4000;
+const int RENDER_HEALTH_TIMER_ID = 117;          // GUI-side hang check of the overlay render loop (T2.20)
+const int RENDER_HEALTH_INTERVAL_MS = 2000;
+const int RENDER_HANG_TIMEOUT_MS = 30000;       // no render-loop iteration this long (display on) = hung;
+                                                //   6x the in-thread watchdog, so a slow recovery is not one
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses

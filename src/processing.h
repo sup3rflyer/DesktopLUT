@@ -29,6 +29,14 @@ bool AnyMonitorNeedsProcessing();
 // Any LIVE display has any correction at all, MHC profiles included (the startup auto-start test).
 bool AnyMonitorHasCorrections();
 
+// A processing thread a Stop gave up joining is still running. While it is, StartProcessing defers
+// (no successor may share the globals it still uses) and the overlay / analysis-only starts skip.
+bool AbandonedProcessingThreadAlive();
+// A StartProcessing was deferred for that reason and the thread has now exited: true once (consumes it).
+bool TakeDeferredStartReady();
+// Forget a deferred start (the user stopped meanwhile).
+void CancelDeferredStart();
+
 // One display needs the DWM hook resident (hook mode): a .cube, a FALD panel file, or the HDR
 // tonemapper. NOT gated on the display's current HDR mode — the user flips HDR while running and the
 // hook must already be there (it installs its hooks at attach from this configuration); the DLL gates

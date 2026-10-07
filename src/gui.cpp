@@ -1349,6 +1349,43 @@ static void TickTopologyPipeline(HWND hwnd) {
     }
 }
 
+// T2.20: the render thread's own watchdog (RenderAll) cannot see that thread hang — stuck in a clock
+// wait that never returns, in Present / Map, in a recovery. This GUI-side tick watches its heartbeat:
+// after RENDER_HANG_TIMEOUT_MS without a loop iteration (display on, compositor clock not occluded) it
+// stops and restarts processing. A Stop that cannot join the thread abandons it; the restart is then
+// deferred until that thread has exited (a successor must not share the globals it still uses) and
+// started from here once it has.
+static void TickRenderHealth() {
+    static uint64_t lastBeat = 0;
+    static ULONGLONG lastProgress = 0;
+    const ULONGLONG now = GetTickCount64();
+    const bool busy = IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
+                      IsCalibrationOrLiveEditActive();
+
+    if (g_userStopped) CancelDeferredStart();
+    if (!busy && !g_gui.isRunning && TakeDeferredStartReady()) {
+        std::cout << "[Render health] the stuck processing thread has exited: starting processing" << std::endl;
+        StartProcessing();
+        return;
+    }
+
+    const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
+    const bool watching = g_gui.isRunning && g_running.load() && g_gui.processingThread.joinable() &&
+                          !g_analysisOnlyMode.load() && !DisplayOffOrOccluded();
+    if (!watching || beat != lastBeat) {
+        lastBeat = beat;
+        lastProgress = now;
+        return;
+    }
+    if (now - lastProgress < (ULONGLONG)RENDER_HANG_TIMEOUT_MS || busy) return;   // busy: escalate once it ends
+    lastProgress = now;   // one escalation per hang period
+    std::cerr << "[Render health] the overlay render loop made no progress for " << RENDER_HANG_TIMEOUT_MS / 1000
+              << " s: restarting processing" << std::endl;
+    SetStatus(L"Overlay stopped responding: restarting...");
+    StopProcessing();
+    StartProcessing();   // defers by itself while the old thread is still stuck
+}
+
 // Messages that start, re-arm or restart work. During the teardown (which pumps while it joins threads
 // and ejects the hook) they are left to DefWindowProc — a timer, display change, resume or tray click
 // arriving then used to restart processing or re-arm timers under a window being destroyed.
@@ -1371,6 +1408,7 @@ static void KillAllGuiTimers(HWND hwnd) {
         DWM_HOOK_WATCHDOG_TIMER_ID, MHC_VERIFY_TIMER_ID, MHC_BLIND_KICK_TIMER_ID, MHC_REGISTRY_KICK_TIMER_ID,
         MHC_BURST_TIMER_ID, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_BEACON_TIMER_ID, MONITOR_IDENTITY_TIMER_ID,
         FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
+        RENDER_HEALTH_TIMER_ID,
     };
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
@@ -2946,6 +2984,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == TOPOLOGY_PIPELINE_TIMER_ID) {
             TickTopologyPipeline(hwnd);
+            return 0;
+        }
+        if (wParam == RENDER_HEALTH_TIMER_ID) {
+            TickRenderHealth();
             return 0;
         }
         if (wParam == MHC_MATRIX_REBAKE_TIMER_ID) {

@@ -473,6 +473,7 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs) {
     // Main loop
     MSG msg = {};
     while (g_running) {
+        g_renderLoopHeartbeat.fetch_add(1, std::memory_order_relaxed);   // liveness for the GUI-side hang check
         while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessage(&msg);
@@ -714,6 +715,36 @@ static void ReplayPendingIntent() {
     }
 }
 
+// Processing threads a Stop gave up joining (detached after its timeout) that may still be running.
+// While one lives no new processing thread may start: if it ever unblocks it finishes its loop and runs
+// its cleanup (g_monitors, the shared D3D device, hotkeys, the analysis overlay) against the state its
+// successor owns. GUI thread only.
+static std::vector<HANDLE> g_abandonedThreads;
+static bool g_startDeferredByAbandoned = false;   // a StartProcessing was refused for that reason
+
+static void RememberAbandonedThread(HANDLE native) {
+    HANDLE dup = nullptr;
+    if (DuplicateHandle(GetCurrentProcess(), native, GetCurrentProcess(), &dup, SYNCHRONIZE, FALSE, 0))
+        g_abandonedThreads.push_back(dup);
+}
+
+bool AbandonedProcessingThreadAlive() {
+    for (size_t i = 0; i < g_abandonedThreads.size();) {
+        if (WaitForSingleObject(g_abandonedThreads[i], 0) == WAIT_TIMEOUT) return true;
+        CloseHandle(g_abandonedThreads[i]);
+        g_abandonedThreads.erase(g_abandonedThreads.begin() + (ptrdiff_t)i);
+    }
+    return false;
+}
+
+bool TakeDeferredStartReady() {
+    if (!g_startDeferredByAbandoned || AbandonedProcessingThreadAlive()) return false;
+    g_startDeferredByAbandoned = false;
+    return true;
+}
+
+void CancelDeferredStart() { g_startDeferredByAbandoned = false; }
+
 // Wait for the CURRENT processing thread to exit, pumping GUI messages meanwhile. Re-checks
 // before every wait that the thread is still the one it started waiting for (the pump is the
 // only place it could have been joined or replaced), so it never waits on a closed handle and
@@ -730,6 +761,7 @@ static bool JoinProcessingThreadPumping(DWORD timeoutMs) {
         if (!stillOurs()) return true;   // joined (or detached) meanwhile by its own exit path
         const DWORD elapsed = GetTickCount() - start;
         if (elapsed >= timeoutMs) {
+            RememberAbandonedThread((HANDLE)g_gui.processingThread.native_handle());
             g_gui.processingThread.detach();
             return false;
         }
@@ -753,6 +785,10 @@ static bool JoinProcessingThreadPumping(DWORD timeoutMs) {
 static void StartAnalysisOnlyMode() {
     if (g_gui.processingThread.joinable()) {
         g_gui.processingThread.join();
+    }
+    if (AbandonedProcessingThreadAlive()) {   // see g_abandonedThreads
+        std::cerr << "[DWM Hook] Analysis-only start skipped: a previous processing thread is still stuck" << std::endl;
+        return;
     }
     unsigned gen = RetireStaleAnalysisThread();
     CreateAnalysisOverlay(GetModuleHandle(nullptr));
@@ -1072,6 +1108,17 @@ static void StartProcessingImpl() {
             g_gui.processingThread.join();
         }
     }
+    // A thread a Stop gave up on is still alive (also covers the leftover just stopped above, if its
+    // join timed out): starting a successor now would share the globals it still uses. Deferred — the
+    // GUI's render-health tick starts it once that thread has exited (TakeDeferredStartReady).
+    if (AbandonedProcessingThreadAlive()) {
+        std::cerr << "StartProcessing: a previous processing thread is still stuck — start deferred until it exits"
+                  << std::endl;
+        g_startDeferredByAbandoned = true;
+        SetStatus(L"Waiting for the stuck overlay thread to exit...");
+        return;
+    }
+    g_startDeferredByAbandoned = false;
 
     // Build config from all monitors with SDR LUT or color correction configured
     std::vector<MonitorLUTConfig> configs;
@@ -1448,9 +1495,10 @@ static void DwmHookReevaluateOverlayOnce() {
             StopAnalysisOnlyMode();
             if (wasAnalysisOn) g_analysisEnabled.store(true);  // Restore — still wanted
         }
-        if (!g_gui.processingThread.joinable()) {
-            // Join any previously-exited thread
-            // (StopAnalysisOnlyMode already joins, but handle other cases)
+        if (!g_gui.processingThread.joinable() && AbandonedProcessingThreadAlive()) {
+            // See g_abandonedThreads: no overlay thread while a previous one is still stuck.
+            std::cerr << "[DWM Hook] Overlay start skipped: a previous processing thread is still stuck" << std::endl;
+            return;
         }
         if (!g_gui.processingThread.joinable()) {
             // Unregister hook-only hotkeys — overlay thread will register its own

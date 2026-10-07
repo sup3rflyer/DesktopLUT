@@ -1156,6 +1156,9 @@ void CreateGUILayout(HWND hwnd) {
     // covered. Timer fires every MHC_VERIFY_INTERVAL_MS.
     SetTimer(hwnd, MHC_VERIFY_TIMER_ID, MHC_VERIFY_INTERVAL_MS, nullptr);
 
+    // Overlay render-loop hang check (T2.20); a no-op while no overlay thread runs.
+    SetTimer(hwnd, RENDER_HEALTH_TIMER_ID, RENDER_HEALTH_INTERVAL_MS, nullptr);
+
     // Periodic hardware-LUT reload: catches silent drops that verify can't see
     // (the profile stays associated but the compositor/driver stopped honoring
     // the MHC2 tag). Uses Windows' own Calibration Loader scheduled task, so
