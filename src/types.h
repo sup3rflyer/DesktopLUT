@@ -272,6 +272,10 @@ const int DWM_HOOK_BEACON_TIMER_ID = 111;       // Identity-beacon session: repa
 const int MONITOR_IDENTITY_TIMER_ID = 112;      // Deferred/retried settings re-attach after a display change
 const int MONITOR_IDENTITY_RETRY_MS = 3000;     // (also armed at startup when a display is not identifiable yet)
 const int MONITOR_IDENTITY_MAX_RETRIES = 5;
+const int TOPOLOGY_PIPELINE_TIMER_ID = 115;     // After the live settings attachment changed: start / restart the
+const int TOPOLOGY_PIPELINE_SETTLE_MS = 5000;   //   pipeline once the display transition has settled
+const int MHC_MATRIX_REBAKE_TIMER_ID = 116;     // Re-bake profiles baked by older matrix maths (startup / re-attach)
+const int MHC_MATRIX_REBAKE_DELAY_MS = 4000;
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
@@ -906,6 +910,9 @@ struct MHCSettings {
     // regenerated on demand, and re-baked when it is the active one. Persisted (HDR) with the cache.
     float permDgWhiteNits[PERM_COUNT] = { 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f };
     uint8_t activePerm = 0;              // Currently active permutation bitmask
+    // Runtime: the active profile was baked by a build whose white-balance matrix maths is older than
+    // this one (INI MHCMatrixRev < kMhcMatrixRev) — re-baked once at startup (RebakePendingMhcProfiles).
+    bool matrixRebakePending = false;
 
     // Display metadata for installed profile (computed at Apply time, persisted)
     std::wstring metaPrimaries;  // "sRGB", "Rec.709", "Custom", "P3-D65", etc.
@@ -949,6 +956,11 @@ struct MonitorSettings {
 
 // [Display<slot>] slots are allocated below this cap (lowest free slot first).
 constexpr int kMaxDisplaySlots = 256;
+
+// Revision of the MHC matrix maths cached / installed profiles were baked with (INI MHCMatrixRev).
+// 2 = SDR white-balance target kept reachable at full drive + HDR white-balance gains in the native
+// basis (2026-10-07). Bump when a change alters the bake of existing settings.
+constexpr int kMhcMatrixRev = 2;
 
 // GUI state
 struct GUIState {

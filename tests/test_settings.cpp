@@ -1202,3 +1202,49 @@ TEST_CASE("Processing predicates: MHC-only needs no processing but counts as a c
     g_userDesktopGammaMode = dg;
     g_gui.monitorSettings.clear();
 }
+
+TEST_CASE("MHC settings: profiles baked by older white-balance maths are forgotten / re-baked once") {
+    auto writeSection = [](const wchar_t* ini, const wchar_t* wx, const wchar_t* rev) {
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCEnabled", L"true", ini);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCProfilePath", L"C:\\color\\DesktopLUT_Mon0_SDR_P1_1.icm", ini);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCWhiteBalanceEnabled", L"true", ini);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCWhiteBalanceWx", wx, ini);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCWhiteBalanceWy", L"0.3585", ini);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCActivePerm", L"1", ini);   // PERM_WB
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCPermPath1", L"C:\\color\\DesktopLUT_Mon0_SDR_P1_1.icm", ini);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCPermPath5", L"C:\\color\\DesktopLUT_Mon0_SDR_P5_1.icm", ini);
+        if (rev) WritePrivateProfileStringW(L"Display0", L"SDR_MHCMatrixRev", rev, ini);
+    };
+    {   // older build (no stamp), D50 white balance: cached variants forgotten, active one re-baked
+        TempIni ini;
+        writeSection(ini.c_str(), L"0.3457", nullptr);
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+        CHECK(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[1].empty());    // the active profile stays associated until re-baked
+        CHECK(mhc.permNames[5].empty());          // other variants re-baked on demand
+        // A save before the re-bake keeps the old revision on disk
+        SaveMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+        CHECK(GetPrivateProfileIntW(L"Display0", L"SDR_MHCMatrixRev", 0, ini.c_str()) == kMhcMatrixRev - 1);
+        mhc.matrixRebakePending = false;
+        SaveMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+        CHECK(GetPrivateProfileIntW(L"Display0", L"SDR_MHCMatrixRev", 0, ini.c_str()) == kMhcMatrixRev);
+    }
+    {   // current stamp: nothing to do
+        TempIni ini;
+        writeSection(ini.c_str(), L"0.3457", L"2");
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+        CHECK_FALSE(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[5].empty());
+    }
+    {   // white balance at D65 moves nothing: old profiles are still exact
+        TempIni ini;
+        writeSection(ini.c_str(), L"0.3127", nullptr);
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCWhiteBalanceWy", L"0.3290", ini.c_str());
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+        CHECK_FALSE(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[5].empty());
+    }
+}

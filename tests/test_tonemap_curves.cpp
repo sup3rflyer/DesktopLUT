@@ -663,8 +663,12 @@ TEST_CASE("Tonemap curves: dynamic-peak floor is the target, x 1.1 for the curve
     CHECK(DlutDynamicPeakFloorNits(1000.0f, false) == 1000.0f);
     CHECK(DlutDynamicPeakFloorNits(1000.0f, true) == doctest::Approx(1100.0f).epsilon(1e-6));
     CHECK(DlutDynamicPeakFloorNits(1600.0f, true) == doctest::Approx(1760.0f).epsilon(1e-6));
+    // SDR targets: the shaders use the floor as the source peak (no detection) — must stay = target
+    CHECK(DlutDynamicPeakFloorNits(203.0f, true) == 203.0f);
+    CHECK(DlutDynamicPeakFloorNits(100.0f, true) == 100.0f);
+    CHECK(DlutDynamicPeakFloorNits(204.0f, true) == doctest::Approx(204.0f * 1.1f).epsilon(1e-6));
     // BT.2390's knee KS = 1.5 maxLum - 0.5 must stay below 1 at the floor (its Hermite divides by 1 - KS)
-    for (float tgt : { 100.0f, 400.0f, 1000.0f, 1800.0f, 4000.0f, 9000.0f }) {
+    for (float tgt : { 204.0f, 400.0f, 1000.0f, 1800.0f, 4000.0f, 9000.0f }) {   // HDR targets (raised floor)
         const double maxLum = PQ(tgt) / PQ(DlutDynamicPeakFloorNits(tgt, true));
         CHECK(1.5 * maxLum - 0.5 < 1.0 - 1e-3);
     }

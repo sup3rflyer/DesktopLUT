@@ -302,6 +302,10 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
         wchar_t permBuf[8];
         swprintf_s(permBuf, L"%d", (int)mhc.activePerm);
         WritePrivateProfileStringW(section, (p + L"MHCActivePerm").c_str(), permBuf, iniPath);
+        // The matrix maths revision the cached profiles were baked with; a re-bake still owed keeps the
+        // old revision on disk so it is not lost to a save before it happens.
+        swprintf_s(permBuf, L"%d", mhc.matrixRebakePending ? kMhcMatrixRev - 1 : kMhcMatrixRev);
+        WritePrivateProfileStringW(section, (p + L"MHCMatrixRev").c_str(), permBuf, iniPath);
     }
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
         std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
@@ -536,6 +540,25 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
             if (dgSlash != std::wstring::npos) dgName = dgName.substr(dgSlash + 1);
             mhc.permNames[dgPerm] = dgName;
             mhc.permPaths[dgPerm] = dgPathStr;
+        }
+    }
+
+    // Profiles baked before the white-balance matrix fixes (kMhcMatrixRev 2: SDR white-balance target kept
+    // reachable, HDR gains solved in the native basis) differ only when white balance moves white. Forget
+    // the cached variants (by name; the files go to the startup orphan cleanup) so each is re-baked on
+    // demand, and re-bake the active one once — a swap between an old and a new variant would otherwise
+    // change SDR brightness / the HDR white.
+    {
+        const int rev = GetPrivateProfileIntW(section, (p + L"MHCMatrixRev").c_str(), 1, iniPath);
+        const bool wbMovesWhite = mhc.whiteBalanceEnabled &&
+            !(fabsf(mhc.whiteBalanceWx - 0.3127f) < 0.001f && fabsf(mhc.whiteBalanceWy - 0.3290f) < 0.001f);
+        if (rev < kMhcMatrixRev && wbMovesWhite) {
+            for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+                if (k == mhc.activePerm) continue;
+                mhc.permNames[k].clear();
+                mhc.permPaths[k].clear();
+            }
+            mhc.matrixRebakePending = (mhc.activePerm & MHCSettings::PERM_WB) && !mhc.profileName.empty();
         }
     }
 

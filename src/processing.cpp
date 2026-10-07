@@ -668,12 +668,16 @@ static unsigned RetireStaleAnalysisThread() {
 // the outer wait, which then waited on a closed handle and finally detach()ed a non-joinable
 // std::thread — an uncaught std::system_error that aborts the process — or started a new
 // thread the outer Stop then forgot about; a pumped WM_PROCESSING_EXITED could also re-arm the
-// auto-restart timer and undo the user's Stop. While a transition runs, nested requests are
-// deferred (Start during Stop) or absorbed (Stop during Stop), and replayed when it ends.
-enum class ProcTransition { Idle, Starting, Stopping };
+// auto-restart timer and undo the user's Stop. DwmHookReevaluateOverlay pumps too (stopping the
+// analysis-only thread) and starts threads, so it is a transition as well.
+// While any transition runs, a nested Start/Stop only records the INTENT it expresses — the last
+// one wins, and a Start after a Stop is a restart — and the intent is carried out once the outer
+// transition has finished. (A Stop+Start pumped inside a Start, e.g. Apply, used to net to Stop;
+// a Stop pumped inside a re-evaluation was not deferred at all and left a live, orphaned thread.)
+enum class ProcTransition { Idle, Starting, Stopping, Reevaluating };
+enum class ProcIntent { None, Start, Stop, Restart };
 static ProcTransition g_procTransition = ProcTransition::Idle;   // GUI thread only
-static bool g_deferredStart = false;   // Start requested while a Stop was in progress
-static bool g_deferredStop  = false;   // Stop requested while a Start was in progress
+static ProcIntent g_pendingIntent = ProcIntent::None;            // GUI thread only
 
 namespace {
 struct TransitionScope {
@@ -685,6 +689,30 @@ struct TransitionScope {
 }  // namespace
 
 bool IsProcessingTransitionActive() { return g_procTransition != ProcTransition::Idle; }
+
+// A Start/Stop asked for while a transition runs: remember what the caller wants to end up with.
+static void RecordNestedIntent(bool start) {
+    if (start) {
+        g_pendingIntent = (g_pendingIntent == ProcIntent::Stop || g_pendingIntent == ProcIntent::Restart)
+            ? ProcIntent::Restart : ProcIntent::Start;
+    } else {
+        g_pendingIntent = ProcIntent::Stop;
+    }
+    std::cout << "[Lifecycle] " << (start ? "Start" : "Stop")
+              << " requested during a transition — carried out when it completes" << std::endl;
+}
+
+// Called by each transition when it has finished (g_procTransition is Idle again).
+static void ReplayPendingIntent() {
+    const ProcIntent intent = g_pendingIntent;
+    g_pendingIntent = ProcIntent::None;
+    switch (intent) {
+    case ProcIntent::Start:   StartProcessing(); break;
+    case ProcIntent::Stop:    StopProcessing(); break;
+    case ProcIntent::Restart: StopProcessing(); StartProcessing(); break;
+    case ProcIntent::None:    break;
+    }
+}
 
 // Wait for the CURRENT processing thread to exit, pumping GUI messages meanwhile. Re-checks
 // before every wait that the thread is still the one it started waiting for (the pump is the
@@ -1071,13 +1099,20 @@ static void StartProcessingImpl() {
                 (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty())) { anyMhc = true; break; }
         }
         if (anyMhc) {
-            {
+            // Once per process (the startup pass): ReapplyAllMhcProfiles is a remove + re-add per
+            // profile, and pipe verbs restart processing many times per calibration run — later
+            // MHC-only starts only verify the associations (no flicker).
+            static bool s_mhcOnlyHygieneDone = false;
+            if (!s_mhcOnlyHygieneDone) {
+                s_mhcOnlyHygieneDone = true;
                 // Same guard as the processing thread's startup pass (a re-bake installing a profile
                 // mid-scan must not have its fresh file deleted as an orphan).
                 std::lock_guard<std::mutex> maintenanceLock(g_mhcMaintenanceMutex);
                 CleanupOrphanedMhcProfiles();
                 SweepStaleMhcAssociations();
                 ReapplyAllMhcProfiles();
+            } else {
+                VerifyAndRestoreMhcProfiles();
             }
             SetStatus(L"Active (MHC profiles only - nothing else to run)");
         } else {
@@ -1256,38 +1291,21 @@ static void StartProcessingImpl() {
 }
 
 void StartProcessing() {
-    if (g_procTransition == ProcTransition::Stopping) {
-        // Pumped from inside a Stop (e.g. a pipe Stop+Start, a button): run it after the Stop.
-        g_deferredStart = true;
-        std::cout << "[Lifecycle] Start requested while stopping — deferred until the stop completes" << std::endl;
-        return;
-    }
-    if (g_procTransition == ProcTransition::Starting) return;
+    if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(true); return; }
     {
         TransitionScope scope(ProcTransition::Starting);
         StartProcessingImpl();
     }
-    if (g_deferredStop) {
-        g_deferredStop = false;
-        StopProcessing();
-    }
+    ReplayPendingIntent();
 }
 
 void StopProcessing() {
-    if (g_procTransition == ProcTransition::Stopping) return;   // the outer Stop completes it
-    if (g_procTransition == ProcTransition::Starting) {
-        g_deferredStop = true;
-        std::cout << "[Lifecycle] Stop requested while starting — deferred until the start completes" << std::endl;
-        return;
-    }
+    if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(false); return; }
     {
         TransitionScope scope(ProcTransition::Stopping);
         StopProcessingImpl();
     }
-    if (g_deferredStart) {
-        g_deferredStart = false;
-        StartProcessing();
-    }
+    ReplayPendingIntent();
 }
 
 static void StopProcessingImpl() {
@@ -1379,20 +1397,23 @@ static void StopProcessingImpl() {
 static void DwmHookReevaluateOverlayOnce();
 
 void DwmHookReevaluateOverlay() {
+    // Not re-entrant: StopAnalysisOnlyMode below pumps messages, and a nested re-evaluation could
+    // start a thread underneath it. Fold it into one more pass instead.
+    static bool againRequested = false;
+    if (g_procTransition == ProcTransition::Reevaluating) { againRequested = true; return; }
     // Pumped from inside a Start/Stop: the transition owns the thread (a Stop has already
     // cleared g_running; starting an overlay here would leave a thread it then forgets).
     if (g_procTransition != ProcTransition::Idle) return;
-    // Not re-entrant either: StopAnalysisOnlyMode below pumps messages, and a nested
-    // re-evaluation could start a thread underneath it. Fold it into one more pass instead.
-    static bool inReevaluate = false;
-    static bool againRequested = false;
-    if (inReevaluate) { againRequested = true; return; }
-    inReevaluate = true;
-    do {
-        againRequested = false;
-        DwmHookReevaluateOverlayOnce();
-    } while (againRequested && g_procTransition == ProcTransition::Idle);
-    inReevaluate = false;
+    {
+        // A transition itself: a Start/Stop pumped inside it (Stop button, pipe Stop+Start) is
+        // recorded and carried out after this pass, never run underneath it.
+        TransitionScope scope(ProcTransition::Reevaluating);
+        do {
+            againRequested = false;
+            DwmHookReevaluateOverlayOnce();
+        } while (againRequested && g_pendingIntent == ProcIntent::None);
+    }
+    ReplayPendingIntent();
 }
 
 static void DwmHookReevaluateOverlayOnce() {

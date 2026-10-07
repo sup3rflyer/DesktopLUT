@@ -91,8 +91,11 @@
 constexpr float kDlutDynamicFloorRatioWithKnee = 1.1f;
 
 // Dynamic-mode source-peak floor in nits for a tonemap curve (raisedFloor: BT.2390 or BT.2446A).
+// Targets <= 203 nits (SDR targets) keep floor = target: both shaders skip detection there and use the
+// floor AS the source peak, so a raised floor would run the curve over all content (a permanent
+// shadow / mid-tone lift) where the floor = target gives identity + clip.
 inline float DlutDynamicPeakFloorNits(float targetNits, bool raisedFloor) {
-    return raisedFloor ? targetNits * kDlutDynamicFloorRatioWithKnee : targetNits;
+    return (raisedFloor && targetNits > 203.0f) ? targetNits * kDlutDynamicFloorRatioWithKnee : targetNits;
 }
 
 #define DLUT_TONEMAP_CURVES_HLSL R"TMC(

@@ -241,10 +241,13 @@ def build(args, ctx: RunContext) -> StageResult:
                            "high")
     elif len(gray_patches) < 2:
         result.anomaly("too_few_gray", "fewer than 2 neutral patches; base grayscale set to identity", "high")
-        n = max(1, len(gray_patches))
+        # A real identity curve: DesktopLUT accepts 10/20/32-point grayscale only (a 1-point curve is
+        # refused, and used to be stored as a flat line), so send its 32-point identity on DLC's own
+        # signal grid (the controller bridges it to DesktopLUT's).
+        n = 32
         base = {
             "point_count": n,
-            "points": [round(p.level, 6) for p in gray_patches] or [1.0],
+            "points": [round(i / (n - 1), 6) for i in range(n)],
             "deviations": Deviations.identity(n).as_dict(),
         }
     else:

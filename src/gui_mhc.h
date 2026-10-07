@@ -62,6 +62,11 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR);
 // Auto-regenerate and reinstall MHC profile when MHC settings change
 void RegenerateMhcIfActive(int monitorIndex, bool isHDR);
 
+// Profiles loaded with matrixRebakePending (baked by older white-balance matrix maths): any on a live
+// display? / re-bake them now. GUI thread. False when the MHC maintenance lock was busy (retry later).
+bool AnyMhcMatrixRebakePending();
+bool RebakePendingMhcProfiles();
+
 // Desktop Gamma follows the Windows SDR white level ("SDR content brightness"), per live monitor, while it
 // is in HDR: the overlay shader's reference (the monitor's render context) and the HDR MHC bake
 // (hdrMHC.dgSdrWhiteNits; the active profile is re-baked when its DG stamp differs). Outside HDR the last

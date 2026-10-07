@@ -1300,6 +1300,8 @@ static void ReattachMonitorSettings(HWND hwnd, const char* why) {
     }
 
     if (outcome.liveChanged) OnMonitorSettingsTopologyChanged();
+    // A parked display that comes back may carry a profile baked by older matrix maths.
+    if (AnyMhcMatrixRebakePending()) SetTimer(hwnd, MHC_MATRIX_REBAKE_TIMER_ID, MHC_MATRIX_REBAKE_DELAY_MS, nullptr);
 
     if (!allIdentified && g_monitorIdentityRetries < MONITOR_IDENTITY_MAX_RETRIES) {
         g_monitorIdentityRetries++;
@@ -1326,6 +1328,39 @@ static void OnMonitorSettingsTopologyChanged() {
     // Start/Apply reflect whether the running pipeline still matches the settings (a newly
     // attached display with a LUT needs one; SettingsChanged compares by display slot).
     UpdateGUIState();
+    // The pipeline (overlay contexts, the hook's staged LUT list) was built for the old attachment:
+    // once the transition settles, start it or rebuild it (TOPOLOGY_PIPELINE_TIMER_ID).
+    if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, TOPOLOGY_PIPELINE_TIMER_ID, TOPOLOGY_PIPELINE_SETTLE_MS, nullptr);
+}
+
+// TOPOLOGY_PIPELINE_TIMER_ID: the live attachment changed (a display arrived, was swapped, or was
+// identified late — including by the identity retry, which no WM_DISPLAYCHANGE follows).
+//   not running -> start, when a live display needs processing and the user has not pressed Stop
+//                  (the display a correction is for was absent or unidentified until now);
+//   running     -> restart, when a display now attached has a LUT the running pipeline was built
+//                  without (SettingsChanged, per display slot): overlay contexts are built once per
+//                  thread and the hook stages LUTs only at injection, so nothing else picks it up.
+// Waits while an editor holds the settings or a calibration / live edit runs (a restart would pull
+// the pipeline out from under it), re-checking until that ends.
+static void TickTopologyPipeline(HWND hwnd) {
+    KillTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID);
+    if (IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
+        IsCalibrationOrLiveEditActive()) {
+        SetTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID, TOPOLOGY_PIPELINE_SETTLE_MS, nullptr);
+        return;
+    }
+    if (!g_gui.isRunning) {
+        if (!g_userStopped && AnyMonitorNeedsProcessing()) {
+            std::cout << "[Monitor identity] a display to correct is attached now: starting processing" << std::endl;
+            StartProcessing();
+        }
+    } else if (SettingsChanged()) {
+        std::cout << "[Monitor identity] a newly attached display has a LUT the running pipeline lacks: restarting"
+                  << std::endl;
+        SetStatus(L"Display attached: restarting to apply its LUT");
+        StopProcessing();
+        StartProcessing();
+    }
 }
 
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2152,6 +2187,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 HWND hwndEn = isHDR ? g_gui.hwndHdrMhcWbEnable : g_gui.hwndMhcWbEnable;
                 mhc.whiteBalanceEnabled = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);   // white-balance peak cost (SDR)
                 SaveSettings();
             }
             return 0;
@@ -2174,6 +2210,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 changed = CommitNumericEdit(hwndWy, 0.20f, 0.50f, mhc.whiteBalanceWy, 4) || changed;
                 if (!changed) return 0;
                 RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);   // white-balance peak cost (SDR)
                 SaveSettings();
             }
             return 0;
@@ -2888,6 +2925,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == MONITOR_IDENTITY_TIMER_ID) {
             KillTimer(hwnd, MONITOR_IDENTITY_TIMER_ID);
             ReattachMonitorSettings(hwnd, "deferred/retry");
+            return 0;
+        }
+        if (wParam == TOPOLOGY_PIPELINE_TIMER_ID) {
+            TickTopologyPipeline(hwnd);
+            return 0;
+        }
+        if (wParam == MHC_MATRIX_REBAKE_TIMER_ID) {
+            KillTimer(hwnd, MHC_MATRIX_REBAKE_TIMER_ID);
+            // Not under an editor (it holds the MHC settings) nor a calibration run (it owns the profiles).
+            if (g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() || IsCalibrationOrLiveEditActive() ||
+                !RebakePendingMhcProfiles())
+                SetTimer(hwnd, MHC_MATRIX_REBAKE_TIMER_ID, MHC_MATRIX_REBAKE_DELAY_MS, nullptr);
             return 0;
         }
         if (wParam == FALD_RECOMPOSE_TIMER_ID) {

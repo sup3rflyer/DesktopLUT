@@ -167,19 +167,6 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
         mhc.metaWhiteBalance.clear();
     }
 
-    // SDR: the peak luminance the white-balance move costs (ComputeMHC2Matrix scales the profile so
-    // the white-balance target is reached at full drive instead of clipping).
-    if (!isHDR && mhc.whiteBalanceEnabled && !mhc.metaWhiteBalance.empty()) {
-        MHC2ProfileParams mp;
-        BuildMHC2MatrixParams(mhc, false, mp);
-        const float costPct = (1.0f - MhcSdrWhiteScale(mp)) * 100.0f;
-        if (costPct >= 0.05f) {
-            wchar_t costBuf[48];
-            _swprintf_s_l(costBuf, _countof(costBuf), L", peak -%.1f %%", GetCLocale(), costPct);
-            mhc.metaWhiteBalance += costBuf;
-        }
-    }
-
     // Append desktop gamma and correction grayscale to gamma label
     if (isHDR && mhc.desktopGammaEnabled) {
         gammaBase += L" + DG";
@@ -967,6 +954,53 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
 
     // Recompute active permutation (corrections may have changed)
     ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, ComputeMhcPermutation(mhcCopy, isHDR));
+
+    // Whatever this was asked for, the installed profile now carries the current matrix maths.
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < (int)g_gui.monitorSettings.size()) {
+            auto& m = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC : g_gui.monitorSettings[monitorIndex].sdrMHC;
+            m.matrixRebakePending = false;
+        }
+    }
+}
+
+bool AnyMhcMatrixRebakePending() {
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    for (const auto& ms : g_gui.monitorSettings)
+        if (ms.sdrMHC.matrixRebakePending || ms.hdrMHC.matrixRebakePending) return true;
+    return false;
+}
+
+bool RebakePendingMhcProfiles() {
+    bool any = false;
+    for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++) {
+        for (bool isHDR : { false, true }) {
+            bool pending;
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                const auto& m = isHDR ? g_gui.monitorSettings[i].hdrMHC : g_gui.monitorSettings[i].sdrMHC;
+                pending = m.matrixRebakePending;
+            }
+            if (!pending) continue;
+            // Same guard as the desktop-gamma re-bake: never install a fresh profile under the processing
+            // thread's startup maintenance (it deletes files its settings snapshot does not name).
+            std::unique_lock<std::mutex> maintenance(g_mhcMaintenanceMutex, std::try_to_lock);
+            if (!maintenance.owns_lock()) return false;
+            std::wcout << L"[MHC] Monitor " << i << (isHDR ? L" HDR" : L" SDR")
+                       << L": re-baking the profile with the current white-balance matrix maths" << std::endl;
+            RegenerateMhcIfActive(i, isHDR);
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                auto& m = isHDR ? g_gui.monitorSettings[i].hdrMHC : g_gui.monitorSettings[i].sdrMHC;
+                m.matrixRebakePending = false;   // also when there was nothing to regenerate
+            }
+            if (i == g_gui.currentMonitor) UpdateMhcInfoDisplay(i, isHDR);
+            any = true;
+        }
+    }
+    if (any) SaveSettings();
+    return true;
 }
 
 // ============================================================================
@@ -1232,10 +1266,22 @@ void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR) {
     } else {
         if (metaLabels[1]) { SetWindowText(metaLabels[1], L""); ShowWindow(metaLabels[1], SW_HIDE); }
     }
+    // Third label: HDR shows the profile's peak; SDR (no peak metadata) shows what a white-balance target
+    // costs in peak luminance (the profile is scaled so the target white is reached at full drive).
+    float wbCostPct = 0.0f;
+    if (installed && !isHDR && mhc.whiteBalanceEnabled) {
+        MHC2ProfileParams mp;
+        BuildMHC2MatrixParams(mhc, false, mp);
+        wbCostPct = (1.0f - MhcSdrWhiteScale(mp)) * 100.0f;
+    }
     if (installed && isHDR && mhc.metaPeakNits > 0.0f) {
         wchar_t peakBuf[64];
         _swprintf_s_l(peakBuf, _countof(peakBuf), L"Peak: %.0f nits", GetCLocale(), mhc.metaPeakNits);
         if (metaLabels[2]) { SetWindowText(metaLabels[2], peakBuf); ShowWindow(metaLabels[2], SW_SHOW); }
+    } else if (wbCostPct >= 0.05f) {
+        wchar_t costBuf[64];
+        _swprintf_s_l(costBuf, _countof(costBuf), L"White balance: peak -%.1f %%", GetCLocale(), wbCostPct);
+        if (metaLabels[2]) { SetWindowText(metaLabels[2], costBuf); ShowWindow(metaLabels[2], SW_SHOW); }
     } else {
         if (metaLabels[2]) { SetWindowText(metaLabels[2], L""); ShowWindow(metaLabels[2], SW_HIDE); }
     }
