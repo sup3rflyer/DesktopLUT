@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -16,7 +18,6 @@ class _MockApiError(Exception):
 
 
 _GS_CHANNELS = ("r", "g", "b")
-_MAX_GS_POINTS = 32   # C++ kMaxMhcGrayscalePoints
 
 
 def _identity_correction_grayscale(is_hdr: bool, point_count: int = 20) -> dict[str, Any]:
@@ -30,73 +31,101 @@ def _identity_correction_grayscale(is_hdr: bool, point_count: int = 20) -> dict[
             "deviations": {ch: [1.0] * n for ch in _GS_CHANNELS}}
 
 
-def _resample_uniform(src: list[float], count: int, fallback: float) -> list[float]:
-    """C++ ``ResampleUniform`` (same-size input passes through untouched)."""
-    if count <= 0:
-        return []
-    if not src:
-        return [fallback] * count
-    if len(src) == count:
-        return list(src)
-    if len(src) == 1 or count == 1:
-        return [src[0]] * count
-    out = []
-    src_max = len(src) - 1
-    for i in range(count):
-        pos = i / (count - 1) * src_max
-        i0 = int(pos)
-        i1 = min(i0 + 1, src_max)
-        t = pos - i0
-        out.append(src[i0] + (src[i1] - src[i0]) * t)
-    return out
-
-
 def _floats(v: Any) -> list[float]:
     return [float(x) for x in v] if isinstance(v, list) else []
 
 
-def _apply_grayscale_payload(existing: dict[str, Any] | None, p: dict[str, Any]) -> dict[str, Any]:
-    """C++ ``ApplyGrayscalePayload``: what DesktopLUT STORES for a grayscale payload. With the
-    decomposed editor sliders the luminance scales the points curve (``points *= luminance``) and
-    the balance lands on the deviations; without them the payload is stored as sent (a same-size
-    resample is exact). ``enabled`` is forced true. ``luminance`` / ``rgb`` / ``editor_points`` are
-    MOCK-ONLY test probes the C++ does not keep — production DLC reads only the four wire keys."""
-    pc = int(p.get("point_count") or 0)
-    pts = _floats(p.get("points"))
-    dev = p.get("deviations") if isinstance(p.get("deviations"), dict) else {}
-    raw = {ch: _floats(dev.get(ch)) for ch in _GS_CHANNELS}
-    lum = _floats(p.get("luminance"))
-    rgb = p.get("rgb") if isinstance(p.get("rgb"), dict) else None
-    bal = {ch: _floats((rgb or {}).get(ch)) for ch in _GS_CHANNELS}
-    if pc <= 0:
-        pc = len(pts)
-    if pc <= 0:
-        pc = len((existing or {}).get("points") or [])
-    if pc <= 0:
-        pc = 20
-    if len(pts) != pc:
-        pts = [k / (pc - 1) if pc > 1 else 0.0 for k in range(pc)]
-    for ch in _GS_CHANNELS:
-        if len(raw[ch]) != pc:
-            raw[ch] = [1.0] * pc
-    have_lum = len(lum) == pc
-    have_rgb = all(len(bal[ch]) == pc for ch in _GS_CHANNELS)
-    if have_lum and not have_rgb:
-        # luminance without balance: recover it from the composed deviations (= luminance*rgb)
-        bal = {ch: [(raw[ch][k] / lum[k]) if abs(lum[k]) > 1e-6 else 1.0 for k in range(pc)]
-               for ch in _GS_CHANNELS}
-        have_rgb = True
-    dst = min(max(pc, 2), _MAX_GS_POINTS)
-    points = _resample_uniform(pts, dst, 0.0)
+_GS_POINT_COUNTS = (10, 20, 32)   # C++ IsValidGrayscalePointCount (src/grayscale_validate.h)
+_GS_EPS = 1e-4                    # C++ ipc_grayscale.h: float noise below 0 is clamped
+_GS_MAX_LEVEL = 2.0               # C++ kMaxGrayscalePointLevel (above 1 saturates in the bake)
+
+
+class GrayscalePayloadError(ValueError):
+    """A grayscale payload the C++ refuses (ipc_grayscale::GrayscaleFromPayload); message mirrored."""
+
+
+def _exact_array(v: Any, n: int, lo: float, hi: float, name: str) -> list[float] | None:
+    """C++ ``ReadExactArray``: absent/null -> None; else exactly ``n`` finite numbers in [lo, hi]."""
+    if v is None:
+        return None
+    if not isinstance(v, list):
+        raise GrayscalePayloadError(f"{name} must be an array")
+    if len(v) != n:
+        raise GrayscalePayloadError(
+            f"{name} must have exactly point_count ({n}) values, got {len(v)}")
+    out = []
+    for e in v:
+        if (isinstance(e, bool) or not isinstance(e, (int, float)) or not math.isfinite(e)
+                or e < lo or e > hi):
+            raise GrayscalePayloadError(f"{name} values must be finite numbers in [{lo}, {hi}]")
+        out.append(float(e))
+    return out
+
+
+def _apply_grayscale_payload(existing: dict[str, Any] | None, p: dict[str, Any],
+                             is_hdr: bool = False) -> dict[str, Any]:
+    """C++ ``ApplyGrayscalePayload`` -> ``ipc_grayscale::GrayscaleFromPayload``: what DesktopLUT
+    STORES for a grayscale payload, or :class:`GrayscalePayloadError` (the C++ refuses it and leaves
+    the slot untouched). point_count must be 10/20/32 (absent: len(points), else the slot's current
+    count); every array exactly point_count long; points in [0, 2] (absent: the mode's identity
+    curve, never a uniform ramp); gains in [0, 8]; luminance scales the points (product <= 2);
+    luminance without rgb recovers the balance from deviations only when deviations were sent.
+    ``enabled`` is forced true. ``luminance`` / ``rgb`` / ``editor_points`` are MOCK-ONLY test
+    probes the C++ does not keep — production DLC reads only the four wire keys."""
+    pcv = p.get("point_count")
+    pts_raw = p.get("points")
+    if pcv is not None:
+        if (isinstance(pcv, bool) or not isinstance(pcv, (int, float)) or not math.isfinite(pcv)
+                or pcv != math.floor(pcv)):
+            raise GrayscalePayloadError("point_count must be an integer")
+        pc = int(pcv)
+    elif isinstance(pts_raw, list):
+        pc = len(pts_raw)
+    else:
+        pc = int((existing or {}).get("point_count") or 20)
+    if pc not in _GS_POINT_COUNTS:
+        raise GrayscalePayloadError("point_count must be 10, 20 or 32")
+    dev = p.get("deviations")
+    rgb = p.get("rgb")
+    if dev is not None and not isinstance(dev, dict):
+        raise GrayscalePayloadError("deviations must be an object")
+    if rgb is not None and not isinstance(rgb, dict):
+        raise GrayscalePayloadError("rgb must be an object")
+    pts = _exact_array(pts_raw, pc, -_GS_EPS, _GS_MAX_LEVEL, "points")
+    lum = _exact_array(p.get("luminance"), pc, 0.0, 8.0, "luminance")
+    raw = {ch: _exact_array((dev or {}).get(ch), pc, 0.0, 8.0, f"deviations.{ch}") for ch in _GS_CHANNELS}
+    bal = {ch: _exact_array((rgb or {}).get(ch), pc, 0.0, 8.0, f"rgb.{ch}") for ch in _GS_CHANNELS}
+    have_dev = [raw[ch] is not None for ch in _GS_CHANNELS]
+    have_bal = [bal[ch] is not None for ch in _GS_CHANNELS]
+    if any(have_dev) and not all(have_dev):
+        raise GrayscalePayloadError("deviations needs r, g and b")
+    if any(have_bal) and not all(have_bal):
+        raise GrayscalePayloadError("rgb needs r, g and b")
+    have_dev, have_rgb, have_lum = all(have_dev), all(have_bal), lum is not None
+
+    points = (list(pts) if pts is not None
+              else _identity_correction_grayscale(is_hdr, pc)["points"])
     if have_lum:
-        lum_r = _resample_uniform(lum, dst, 1.0)
-        points = [a * b for a, b in zip(points, lum_r)]
-    out: dict[str, Any] = {
-        "enabled": True,
-        "point_count": dst,
-        "points": points,
-        "deviations": {ch: _resample_uniform(bal[ch] if have_rgb else raw[ch], dst, 1.0) for ch in _GS_CHANNELS},
-    }
+        points = [a * b for a, b in zip(points, lum)]
+    for k, v in enumerate(points):
+        if v > _GS_MAX_LEVEL:
+            raise GrayscalePayloadError(f"points x luminance must stay within [0, 2] (point {k})")
+    points = [max(0.0, v) for v in points]
+
+    if have_rgb:
+        gains = {ch: list(bal[ch]) for ch in _GS_CHANNELS}
+    elif have_lum and have_dev:
+        gains = {ch: [(raw[ch][k] / lum[k]) if abs(lum[k]) > 1e-6 else 1.0 for k in range(pc)]
+                 for ch in _GS_CHANNELS}
+    elif have_dev and not have_lum:
+        gains = {ch: list(raw[ch]) for ch in _GS_CHANNELS}
+    else:
+        gains = {ch: [1.0] * pc for ch in _GS_CHANNELS}
+    for ch in _GS_CHANNELS:
+        if any((not math.isfinite(v)) or v < 0.0 or v > 8.0 for v in gains[ch]):
+            raise GrayscalePayloadError("recovered per-channel balance out of range (deviations / luminance)")
+
+    out: dict[str, Any] = {"enabled": True, "point_count": pc, "points": points, "deviations": gains}
     if have_lum:
         out["luminance"] = list(lum)
         out["editor_points"] = list(points)   # what the editor's main slider shows = the stored points
@@ -783,6 +812,11 @@ class MockDesktopLutServer:
         elif method == "mhc.set_white":
             state["white"] = {"x": params["x"], "y": params["y"]}
         elif method == "mhc.set_base_grayscale":
+            # C++ validates the payload exactly like the correction slot (ipc_grayscale.h).
+            try:
+                _apply_grayscale_payload(state.get("base_grayscale"), params, is_hdr=key.endswith(":HDR"))
+            except GrayscalePayloadError as e:
+                return DesktopLutResponse(ok=False, error=str(e))
             state["base_grayscale"] = {
                 "point_count": params.get("point_count"),
                 "points": deepcopy(params.get("points", [])),
@@ -812,7 +846,11 @@ class MockDesktopLutServer:
             }
         elif method == "mhc.set_correction_grayscale":
             # C++ DoMhcSetGrayscale -> ApplyGrayscalePayload (enabled forced true)
-            state["correction_grayscale"] = _apply_grayscale_payload(state.get("correction_grayscale"), params)
+            try:
+                state["correction_grayscale"] = _apply_grayscale_payload(
+                    state.get("correction_grayscale"), params, is_hdr=key.endswith(":HDR"))
+            except GrayscalePayloadError as e:
+                return DesktopLutResponse(ok=False, error=str(e))
         elif method == "mhc.grayscale_live_begin":
             # Engage the live-edit preview (the editor's "Edit Points"): the correction GS now
             # stacks on top of MHC+3D-LUT and is measurable. No bake yet. Mirrors the C++
@@ -842,8 +880,12 @@ class MockDesktopLutServer:
             # editor's main slider shows) and rgb lands on the deviations. A synthetic panel reads
             # the curve the way the shader does: channel output = points[i] * deviations[c][i] at
             # slot input (i/(N-1))**2 (SDR) or i/(N-1) (HDR).
-            state["correction_grayscale"] = _apply_grayscale_payload(
-                state.get("correction_grayscale"), gs if isinstance(gs, dict) else {})
+            try:
+                state["correction_grayscale"] = _apply_grayscale_payload(
+                    state.get("correction_grayscale"), gs if isinstance(gs, dict) else {},
+                    is_hdr=key.endswith(":HDR"))
+            except GrayscalePayloadError as e:
+                return DesktopLutResponse(ok=False, error=str(e))
             state["gs_preview_active"] = True
         elif method == "mhc.grayscale_commit":
             # The editor's "OK": bake correctionGrayscale into the ICM, leave it toggled on.
@@ -1012,7 +1054,13 @@ class MockDesktopLutServer:
         elif method == "runtime.clear_3dlut":
             state.pop("cube_path", None)
         elif method == "runtime.set_grayscale_tweak":
-            state["grayscale_tweak"] = deepcopy(params.get("grayscale_tweak", {}))
+            tweak = params.get("grayscale_tweak", {})
+            try:   # C++ validates it like every grayscale payload (ipc_grayscale.h)
+                _apply_grayscale_payload(None, tweak if isinstance(tweak, dict) else {},
+                                         is_hdr=key.endswith(":HDR"))
+            except GrayscalePayloadError as e:
+                return DesktopLutResponse(ok=False, error=str(e))
+            state["grayscale_tweak"] = deepcopy(tweak)
         elif method == "runtime.disable_grayscale_tweak":
             state.pop("grayscale_tweak", None)
         else:

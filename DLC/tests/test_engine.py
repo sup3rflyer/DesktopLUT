@@ -1101,8 +1101,8 @@ class DesktopLutApiTests(unittest.TestCase):
         client.send(client.disable_all())
         client.send(client.set_mhc_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33}))
         client.send(client.set_mhc_white(0, "SDR", 0.3127, 0.329))
-        client.send(client.set_mhc_base_grayscale(
-            0, "SDR", 2, [0.0, 1.0], {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}))
+        client.send(client.set_mhc_base_grayscale(   # 10 points: DesktopLUT accepts 10/20/32 only
+            0, "SDR", 10, [(i / 9) ** 2 for i in range(10)], {ch: [1.0] * 10 for ch in "rgb"}))
         client.send(client.apply_mhc(0, "SDR"))
         state = client.send(client.state_get()).result or {}
         self.assertFalse(state["corrections_enabled"])

@@ -6,6 +6,7 @@
 #include "monitor_identity.h"
 #include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
 #include "displayconfig.h"   // IsValidSdrWhiteNits
+#include "grayscale_validate.h"
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -358,6 +359,53 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     }
 }
 
+// A ';'-separated float list; an entry that is not entirely a number becomes NaN, so the shared
+// validity rules (grayscale_validate.h) reject the whole list instead of reading it as 0.
+static std::vector<float> ReadFloatListKey(const wchar_t* section, const std::wstring& key, const wchar_t* iniPath) {
+    std::vector<float> out;
+    wchar_t buf[1024] = {};
+    GetPrivateProfileStringW(section, key.c_str(), L"", buf, 1024, iniPath);
+    if (buf[0] == L'\0') return out;
+    wchar_t* ctx = nullptr;
+    for (wchar_t* token = wcstok_s(buf, L";", &ctx); token; token = wcstok_s(nullptr, L";", &ctx)) {
+        while (*token == L' ' || *token == L'\t') token++;
+        wchar_t* end = nullptr;
+        double v = _wcstod_l(token, &end, GetCLocale());
+        while (end && (*end == L' ' || *end == L'\t')) end++;
+        out.push_back((end == token || !end || *end != L'\0') ? std::nanf("") : (float)v);
+    }
+    return out;
+}
+
+// One grayscale slot: count (10/20/32, else 20), points, three per-channel gain lists. Whatever
+// fails the shared rules is reset — the points to the slot's identity curve, a channel's gains to
+// 1 — with a log line, and never reaches the MHC LUT bake. Base and correction slots alike.
+static void LoadGrayscaleBlock(const wchar_t* section, const std::wstring& countKey, const std::wstring& dataKey,
+                               const std::wstring (&devKeys)[3], GrayscaleSettings& gs, bool isHDR,
+                               const wchar_t* iniPath) {
+    const int n = GetPrivateProfileIntW(section, countKey.c_str(), 20, iniPath);
+    gs.pointCount = IsValidGrayscalePointCount(n) ? n : 20;
+    gs.points = ReadFloatListKey(section, dataKey, iniPath);
+    if (!GrayscalePointsValid(gs.points, gs.pointCount)) {
+        if (!gs.points.empty()) {
+            std::wcerr << L"Warning: " << section << L"/" << dataKey
+                       << L" invalid (count/NaN/range), reinitializing to the identity curve" << std::endl;
+        }
+        InitIdentityGrayscale(gs, isHDR);
+    }
+    for (int ch = 0; ch < 3; ch++) {
+        std::vector<float> gains = ReadFloatListKey(section, devKeys[ch], iniPath);
+        if (!GrayscaleGainsValid(gains, gs.pointCount)) {
+            if (!gains.empty()) {
+                std::wcerr << L"Warning: " << section << L"/" << devKeys[ch]
+                           << L" invalid (count/NaN/range), reset to 1" << std::endl;
+            }
+            gains.assign(gs.pointCount, 1.0f);
+        }
+        gs.rgbDeviations[ch] = std::move(gains);
+    }
+}
+
 void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
                       MHCSettings& mhc, const wchar_t* iniPath) {
     std::wstring p(prefix);
@@ -403,69 +451,10 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     // MHC's own grayscale
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
     mhc.baseGrayscale.enabled = GetPrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), false, iniPath);
-    int points = GetPrivateProfileIntW(section, (p + L"MHCGrayscalePoints").c_str(), 20, iniPath);
-    mhc.baseGrayscale.pointCount = (points == 10 || points == 20 || points == 32) ? points : 20;
-
-    wchar_t grayscaleData[1024] = {};
-    GetPrivateProfileStringW(section, (p + L"MHCGrayscaleData").c_str(), L"", grayscaleData, 1024, iniPath);
-    mhc.baseGrayscale.points.clear();
-    if (grayscaleData[0] != L'\0') {
-        wchar_t* ctx = nullptr;
-        wchar_t* token = wcstok_s(grayscaleData, L";", &ctx);
-        while (token) {
-            while (*token == L' ' || *token == L'\t') token++;
-            mhc.baseGrayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
-            token = wcstok_s(nullptr, L";", &ctx);
-        }
-    }
-    // Reinitialize on a count mismatch OR any corrupt value (NaN/Inf/out-of-[0,1]) — a
-    // hand-edited or truncated INI must not feed garbage into MHC LUT generation.
-    bool gsNeedsReinit = mhc.baseGrayscale.points.empty() ||
-                         (int)mhc.baseGrayscale.points.size() != mhc.baseGrayscale.pointCount;
-    if (!gsNeedsReinit) {
-        for (float v : mhc.baseGrayscale.points) {
-            if (!std::isfinite(v) || v < 0.0f || v > 1.0f) { gsNeedsReinit = true; break; }
-        }
-    }
-    if (gsNeedsReinit) {
-        if (!mhc.baseGrayscale.points.empty()) {
-            std::wcerr << L"Warning: " << section << L"/" << p
-                       << L"MHCGrayscaleData invalid (count/NaN/range), reinitializing to linear"
-                       << std::endl;
-        }
-        mhc.baseGrayscale.points.resize(mhc.baseGrayscale.pointCount);
-        if (isHDR) mhc.baseGrayscale.initLinearPQ();
-        else mhc.baseGrayscale.initLinear();
-    }
-
-    // Load per-channel RGB deviations for MHC grayscale
     {
-        const wchar_t* devSuffix[] = { L"MHCGrayscaleDevR", L"MHCGrayscaleDevG", L"MHCGrayscaleDevB" };
-        for (int ch = 0; ch < 3; ch++) {
-            wchar_t devBuf[1024] = {};
-            GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf, 1024, iniPath);
-            mhc.baseGrayscale.rgbDeviations[ch].clear();
-            if (devBuf[0] != L'\0') {
-                wchar_t* ctx2 = nullptr;
-                wchar_t* token = wcstok_s(devBuf, L";", &ctx2);
-                while (token) {
-                    while (*token == L' ' || *token == L'\t') token++;
-                    mhc.baseGrayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
-                    token = wcstok_s(nullptr, L";", &ctx2);
-                }
-            }
-            bool devValid = !mhc.baseGrayscale.rgbDeviations[ch].empty() &&
-                            (int)mhc.baseGrayscale.rgbDeviations[ch].size() == mhc.baseGrayscale.pointCount;
-            if (devValid) {
-                for (float v : mhc.baseGrayscale.rgbDeviations[ch]) {
-                    // Per-channel gains; reject NaN/Inf and absurd magnitudes.
-                    if (!std::isfinite(v) || v < 0.0f || v > 8.0f) { devValid = false; break; }
-                }
-            }
-            if (!devValid) {
-                mhc.baseGrayscale.rgbDeviations[ch].assign(mhc.baseGrayscale.pointCount, 1.0f);
-            }
-        }
+        const std::wstring devKeys[3] = { p + L"MHCGrayscaleDevR", p + L"MHCGrayscaleDevG", p + L"MHCGrayscaleDevB" };
+        LoadGrayscaleBlock(section, p + L"MHCGrayscalePoints", p + L"MHCGrayscaleData", devKeys,
+                           mhc.baseGrayscale, isHDR, iniPath);
     }
 
     if (isHDR) {
@@ -552,49 +541,12 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
 
     // Correction grayscale (fine-tuning on top of base)
     mhc.correctionGrayscale.enabled = GetPrivateProfileBool(section, (p + L"MHCCorrGSEnabled").c_str(), false, iniPath);
-    int corrPts = GetPrivateProfileIntW(section, (p + L"MHCCorrGSPoints").c_str(), 20, iniPath);
-    mhc.correctionGrayscale.pointCount = (corrPts == 10 || corrPts == 20 || corrPts == 32) ? corrPts : 20;
-
     {
-        wchar_t corrGsData[1024] = {};
-        GetPrivateProfileStringW(section, (p + L"MHCCorrGSData").c_str(), L"", corrGsData, 1024, iniPath);
-        mhc.correctionGrayscale.points.clear();
-        if (corrGsData[0] != L'\0') {
-            wchar_t* ctx3 = nullptr;
-            wchar_t* token = wcstok_s(corrGsData, L";", &ctx3);
-            while (token) {
-                while (*token == L' ' || *token == L'\t') token++;
-                mhc.correctionGrayscale.points.push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
-                token = wcstok_s(nullptr, L";", &ctx3);
-            }
-        }
-        if (mhc.correctionGrayscale.points.empty() || (int)mhc.correctionGrayscale.points.size() != mhc.correctionGrayscale.pointCount) {
-            mhc.correctionGrayscale.points.resize(mhc.correctionGrayscale.pointCount);
-            if (isHDR) mhc.correctionGrayscale.initLinearPQ();
-            else mhc.correctionGrayscale.initLinear();
-        }
-    }
-
-    {
-        const wchar_t* devSuffix[] = { L"MHCCorrGSDevR", L"MHCCorrGSDevG", L"MHCCorrGSDevB" };
-        for (int ch = 0; ch < 3; ch++) {
-            wchar_t devBuf2[1024] = {};
-            GetPrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), L"", devBuf2, 1024, iniPath);
-            mhc.correctionGrayscale.rgbDeviations[ch].clear();
-            if (devBuf2[0] != L'\0') {
-                wchar_t* ctx4 = nullptr;
-                wchar_t* token = wcstok_s(devBuf2, L";", &ctx4);
-                while (token) {
-                    while (*token == L' ' || *token == L'\t') token++;
-                    mhc.correctionGrayscale.rgbDeviations[ch].push_back((float)_wcstod_l(token, nullptr, GetCLocale()));
-                    token = wcstok_s(nullptr, L";", &ctx4);
-                }
-            }
-            if (mhc.correctionGrayscale.rgbDeviations[ch].empty() ||
-                (int)mhc.correctionGrayscale.rgbDeviations[ch].size() != mhc.correctionGrayscale.pointCount) {
-                mhc.correctionGrayscale.rgbDeviations[ch].assign(mhc.correctionGrayscale.pointCount, 1.0f);
-            }
-        }
+        // Same rules as the base slot (it used to check only the counts: a NaN or 1e9 point went
+        // straight into the LUT bake).
+        const std::wstring devKeys[3] = { p + L"MHCCorrGSDevR", p + L"MHCCorrGSDevG", p + L"MHCCorrGSDevB" };
+        LoadGrayscaleBlock(section, p + L"MHCCorrGSPoints", p + L"MHCCorrGSData", devKeys,
+                           mhc.correctionGrayscale, isHDR, iniPath);
     }
 
     if (isHDR) {

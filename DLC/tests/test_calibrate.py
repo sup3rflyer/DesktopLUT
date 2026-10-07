@@ -1588,8 +1588,7 @@ def test_grayscale_wb_revert_keeps_the_users_curve_on_from_the_viewing_layer_cap
     layer capture taken before anything was switched: the revert turns it back on itself (no longer
     only because _restore_viewing_layers happens to run later), with no off/on churn."""
     ctrl = _gswb_controller()
-    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
-                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4}, gamma=2.2)
+    ctrl.set_correction_grayscale(0, "SDR", *_user_curve10(), gamma=2.2)
     ctrl.set_layers(0, "SDR", grayscale=True)
     user = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     calls: list = []
@@ -1611,8 +1610,7 @@ def test_grayscale_wb_revert_keeps_the_users_curve_on_from_the_viewing_layer_cap
     # ...and it ends ON even when the viewing layers were already marked restored (so the terminal
     # _restore_viewing_layers does nothing): the revert alone must put the user's state back.
     ctrl2 = _gswb_controller()
-    ctrl2.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
-                                   {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4}, gamma=2.2)
+    ctrl2.set_correction_grayscale(0, "SDR", *_user_curve10(), gamma=2.2)
     ctrl2.set_layers(0, "SDR", grayscale=True)
     calib2 = _make(tmp_path, "gswb_on_marked", controller=ctrl2,
                    decision_overrides={"verify:accept": Decision("revert")})
@@ -1624,17 +1622,18 @@ def test_grayscale_wb_revert_keeps_the_users_curve_on_from_the_viewing_layer_cap
 
 
 def test_raw_grayscale_setter_sends_the_real_point_count():
-    """N1: C++ ApplyGrayscalePayload replaces `points` with a LINEAR ramp when their size differs
-    from point_count, so a stored pointCount that disagrees with the stored points must not ride
-    the wire — the revert would restore identity."""
+    """N1: C++ ApplyGrayscalePayload refuses `points` whose size differs from point_count (it used
+    to replace them with a LINEAR ramp), so a stored pointCount that disagrees with the stored
+    points must not ride the wire — the revert would fail (it used to restore identity)."""
     ctrl = CalibrationController.mock()
     ctrl.apply_mhc(0, "SDR")
-    block = {"point_count": 20, "points": [0.0, 0.3, 1.0],
-             "deviations": {"r": [1.0, 1.02, 1.0], "g": [1.0] * 3, "b": [1.0] * 3}}
+    pts = [(i / 9) ** 2 for i in range(10)]
+    block = {"point_count": 20, "points": pts,   # stored count disagrees with the stored points
+             "deviations": {"r": [1.02 if i == 4 else 1.0 for i in range(10)], "g": [1.0] * 10, "b": [1.0] * 10}}
     ctrl.set_correction_grayscale_raw(0, "SDR", block)
     wire = [r for r in ctrl.client.transport.requests if r.method == "mhc.set_correction_grayscale"][-1]
-    assert wire.params["point_count"] == 3
-    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["points"] == [0.0, 0.3, 1.0]
+    assert wire.params["point_count"] == 10
+    assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["points"] == pts
 
 
 @pytest.mark.parametrize("reply, status", [
@@ -4511,6 +4510,16 @@ def test_dlc_state_carries_a_schema_version(tmp_path: Path):
 # a no-op) · dead-pipe early fail at preflight (build-correction exempt)
 # ---------------------------------------------------------------------------
 
+def _user_curve10(r_lo: float = 1.01, r_hi: float = 0.99):
+    """A 10-point user correction curve (DesktopLUT accepts 10/20/32 points only) with a small red
+    wobble at two slots — the shape the old 4-point fixtures carried."""
+    n = 10
+    points = [i / (n - 1) for i in range(n)]
+    r = [1.0] * n
+    r[3], r[6] = r_lo, r_hi
+    return n, points, {"r": r, "g": [1.0] * n, "b": [1.0] * n}
+
+
 def _gswb_controller():
     ctrl = CalibrationController.mock()
     ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60,
@@ -4547,9 +4556,7 @@ def test_grayscale_wb_revert_restores_the_pre_existing_correction(tmp_path: Path
     # (set_correction_grayscale + apply_mhc), restoring the USER'S prior correctionGrayscale —
     # NOT relying on the C++ grayscale_cancel (a no-op once the stage committed).
     ctrl = _gswb_controller()
-    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
-                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
-                                  gamma=2.2)
+    ctrl.set_correction_grayscale(0, "SDR", *_user_curve10(), gamma=2.2)
     ctrl.set_layers(0, "SDR", grayscale=True)   # on hardware the curve's enable IS this layer flag
     # The controller's SDR bridge resamples on the way in — the pre-existing correction, as
     # DesktopLUT actually STORES it, is what revert must bring back:
@@ -4589,11 +4596,11 @@ def test_grayscale_wb_revert_restores_a_luminance_scaled_curve_exactly(tmp_path:
     re-bridging it through set_correction_grayscale treated those points as the x-grid and came
     back off (the reviewer's ~0.0065 at slot 1 with luminance 1.05)."""
     ctrl = _gswb_controller()
-    n = 8
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
     grid = [i / (n - 1) for i in range(n)]
-    lum = [1.0, 1.05, 1.04, 1.02, 1.01, 1.0, 0.99, 1.0]
-    rgb = {"r": [1.0, 1.02, 1.01, 1.0, 1.0, 1.0, 1.0, 1.0], "g": [1.0] * n,
-           "b": [1.0, 0.98, 0.99, 1.0, 1.0, 1.0, 1.0, 1.0]}
+    lum = [1.0, 1.05, 1.04, 1.02, 1.01, 1.0, 0.99, 1.0, 1.0, 1.0]
+    rgb = {"r": [1.0, 1.02, 1.01] + [1.0] * (n - 3), "g": [1.0] * n,
+           "b": [1.0, 0.98, 0.99] + [1.0] * (n - 3)}
     devs = {ch: [l * v for l, v in zip(lum, rgb[ch])] for ch in "rgb"}
     ctrl.grayscale_live_begin(0, "SDR")
     ctrl.grayscale_set_live(0, "SDR", n, grid, devs, luminance=lum, rgb=rgb)
@@ -4621,9 +4628,7 @@ def test_grayscale_wb_revert_keeps_a_disabled_prior_curve_disabled(tmp_path: Pat
     curve would switch on a correction the user had switched off. The prior on/off state goes
     back through layers.set."""
     ctrl = _gswb_controller()
-    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
-                                  {"r": [1.0, 1.01, 0.99, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
-                                  gamma=2.2)
+    ctrl.set_correction_grayscale(0, "SDR", *_user_curve10(), gamma=2.2)
     ctrl.set_layers(0, "SDR", grayscale=False)            # the user keeps it, switched off
     prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     assert prior["enabled"] is False and prior["deviations"]["r"] != [1.0] * 4
@@ -4662,13 +4667,11 @@ def test_calibration_exit_cleans_up_an_orphaned_gs_preview(tmp_path: Path):
     # calibration.exit — an orphaned live preview (client died between begin and commit) is
     # reverted to its pre-begin correction so it can't leak past the run.
     ctrl = _gswb_controller()
-    ctrl.set_correction_grayscale(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
-                                  {"r": [1.0, 1.02, 0.98, 1.0], "g": [1.0] * 4, "b": [1.0] * 4},
-                                  gamma=2.2)
+    ctrl.set_correction_grayscale(0, "SDR", *_user_curve10(1.02, 0.98), gamma=2.2)
     prior = ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]
     ctrl.grayscale_live_begin(0, "SDR")
-    ctrl.grayscale_set_live(0, "SDR", 4, [0.0, 0.33, 0.66, 1.0],
-                            {"r": [1.0, 1.5, 0.5, 1.0], "g": [1.0] * 4, "b": [1.0] * 4})  # mid-edit
+    n, pts, devs = _user_curve10(1.5, 0.5)
+    ctrl.grayscale_set_live(0, "SDR", n, pts, devs)  # mid-edit
     assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"] != prior
     ctrl.exit_calibration(restore_snapshot=False)   # crash-cleanup path
     st = ctrl.state()["mhc"]["0:SDR"]

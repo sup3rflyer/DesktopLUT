@@ -709,7 +709,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
     # the sequence verbatim requires real cube files for the path-validated
     # methods (set_base_lut / set_3dlut check existence server-side AND in the mock).
     _m, _mode = 0, "SDR"
-    _grayscale = {"point_count": 2, "points": [0.0, 1.0], "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}}
+    # 10 points: the C++ accepts 10/20/32 only (src/grayscale_validate.h); SDR identity on
+    # DesktopLUT's (i/9)^2 grid (this goes to the wire unbridged).
+    _grayscale = {"point_count": 10, "points": [(i / 9) ** 2 for i in range(10)],
+                  "deviations": {ch: [1.0] * 10 for ch in ("r", "g", "b")}}
     sequence_steps = [
         ("initial_state", "state.get", {}),
         (

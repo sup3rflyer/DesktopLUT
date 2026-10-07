@@ -1061,6 +1061,25 @@ TEST_CASE("SaveSettings: parked displays are written, anonymous entries are not"
     g_gui.parkedSettings.clear();
 }
 
+TEST_CASE("MHC settings: a corrupt correction-grayscale slot is reset like the base slot (T5.5)") {
+    TempIni ini;
+    WritePrivateProfileStringW(L"Display0", L"SDR_MHCCorrGSPoints", L"10", ini.c_str());
+    WritePrivateProfileStringW(L"Display0", L"SDR_MHCCorrGSData",
+                               L"0;0.1;nan;0.3;0.4;0.5;0.6;0.7;0.8;1", ini.c_str());
+    WritePrivateProfileStringW(L"Display0", L"SDR_MHCCorrGSDevR", L"1;1;1;1;1;1;1;1;1;1e9", ini.c_str());
+    WritePrivateProfileStringW(L"Display0", L"SDR_MHCCorrGSDevG", L"1;1;1;abc;1;1;1;1;1;1", ini.c_str());
+    WritePrivateProfileStringW(L"Display0", L"SDR_MHCCorrGSDevB", L"1;1;1;1;1;1;1;1;1;0.95", ini.c_str());
+    MHCSettings mhc;
+    LoadMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+    const auto& gs = mhc.correctionGrayscale;
+    REQUIRE(gs.pointCount == 10);
+    REQUIRE(gs.points.size() == 10);
+    CHECK(gs.points[3] == doctest::Approx((3.0f / 9.0f) * (3.0f / 9.0f)));   // SDR identity (t^2), not NaN
+    CHECK(gs.rgbDeviations[0][9] == 1.0f);                                    // 1e9 gain rejected
+    CHECK(gs.rgbDeviations[1][3] == 1.0f);                                    // "abc" not read as 0
+    CHECK(gs.rgbDeviations[2][9] == doctest::Approx(0.95f));                  // valid channel kept
+}
+
 TEST_CASE("Pool: a legacy section marked Migrated is never loaded (adopted twice)") {
     TempIni ini;
     WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\old.cube", ini.c_str());

@@ -82,8 +82,9 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
     client = DesktopLutClient(transport=MockDesktopLutTransport())
     cube_1d = _write_1d_cube(tmp_path / "base.cube")
     cube_3d = _write_3d_cube(tmp_path / "final.cube")
-    gs = {"point_count": 2, "points": [0.0, 1.0],
-          "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}}
+    # 10 points (the C++ accepts 10/20/32 only), SDR identity on DesktopLUT's (i/9)^2 grid
+    gs = {"point_count": 10, "points": [(i / 9) ** 2 for i in range(10)],
+          "deviations": {ch: [1.0] * 10 for ch in ("r", "g", "b")}}
     mm = {"monitor": 0, "mode": "SDR"}
 
     calls: list[tuple[str, dict]] = [
@@ -663,11 +664,13 @@ def test_grayscale_set_live_carries_decomposed_sliders_on_the_wire():
     transport = ctrl.client.transport
     ctrl.grayscale_live_begin(0, "HDR")
 
-    points = [0.0, 0.5, 1.0]
-    luminance = [1.0, 1.05, 1.0]
-    rgb = {"r": [1.0, 1.02, 1.0], "g": [1.0, 0.99, 1.0], "b": [1.0, 1.0, 1.0]}
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
+    points = [i / (n - 1) for i in range(n)]
+    luminance = [1.05 if i == 4 else 1.0 for i in range(n)]
+    rgb = {"r": [1.02 if i == 4 else 1.0 for i in range(n)],
+           "g": [0.99 if i == 4 else 1.0 for i in range(n)], "b": [1.0] * n}
     deviations = {ch: [l * v for l, v in zip(luminance, rgb[ch])] for ch in ("r", "g", "b")}
-    ctrl.grayscale_set_live(0, "HDR", 3, points, deviations,
+    ctrl.grayscale_set_live(0, "HDR", n, points, deviations,
                             luminance=luminance, rgb=rgb)
 
     wire = [r for r in transport.requests if r.method == "mhc.grayscale_set_live"][-1]
@@ -677,7 +680,7 @@ def test_grayscale_set_live_carries_decomposed_sliders_on_the_wire():
     assert gs["rgb"] == rgb
     # ...and the composed back-compat deviations satisfy the wire invariant exactly.
     for ch in ("r", "g", "b"):
-        for i in range(3):
+        for i in range(n):
             assert gs["deviations"][ch][i] == pytest.approx(luminance[i] * rgb[ch][i])
     # Mock fidelity (mirrors C++ ApplyGrayscalePayload): the decomposition is stored and
     # luminance scales the points curve — what the editor's main slider displays.
@@ -687,7 +690,7 @@ def test_grayscale_set_live_carries_decomposed_sliders_on_the_wire():
     assert cg["editor_points"] == pytest.approx([p * l for p, l in zip(gs["points"], luminance)])
 
     # Legacy composed-only call still works (no decomposition on the wire).
-    ctrl.grayscale_set_live(0, "HDR", 3, points, deviations)
+    ctrl.grayscale_set_live(0, "HDR", n, points, deviations)
     wire = [r for r in transport.requests if r.method == "mhc.grayscale_set_live"][-1]
     assert "luminance" not in wire.params["grayscale"]
     assert "rgb" not in wire.params["grayscale"]
@@ -700,11 +703,13 @@ def test_grayscale_set_live_decomposed_sdr_bridge_keeps_invariant():
     holds exactly per slot even after the bridge."""
     ctrl = CalibrationController.mock()
     ctrl.grayscale_live_begin(0, "SDR")
-    points = [0.0, 0.25, 1.0]
-    luminance = [1.0, 1.08, 1.02]
-    rgb = {"r": [1.0, 1.03, 1.0], "g": [1.0, 1.0, 0.98], "b": [1.0, 0.97, 1.0]}
+    m = 10   # DesktopLUT accepts 10/20/32-point curves only
+    points = [(i / (m - 1)) ** 0.5 for i in range(m)]   # DLC's own signal grid, not DesktopLUT's
+    luminance = [1.0 + 0.01 * (i % 3) for i in range(m)]
+    rgb = {"r": [1.0 + 0.01 * (i % 2) for i in range(m)], "g": [1.0 - 0.01 * (i % 3 == 2) for i in range(m)],
+           "b": [1.0 - 0.01 * (i % 2) for i in range(m)]}
     deviations = {ch: [l * v for l, v in zip(luminance, rgb[ch])] for ch in ("r", "g", "b")}
-    ctrl.grayscale_set_live(0, "SDR", 3, points, deviations,
+    ctrl.grayscale_set_live(0, "SDR", m, points, deviations,
                             luminance=luminance, rgb=rgb)
     wire = [r for r in ctrl.client.transport.requests
             if r.method == "mhc.grayscale_set_live"][-1]
@@ -720,13 +725,20 @@ def test_grayscale_set_live_decomposed_sdr_bridge_keeps_invariant():
 
 
 def test_cpp_grayscale_payload_reads_decomposed_sliders():
-    """Static C++ pin: ApplyGrayscalePayload must parse the optional luminance[] +
-    rgb{r,g,b} decomposition (shared by mhc.grayscale_set_live and
-    runtime.set_grayscale_tweak) — removing it silently regresses the editor split
-    back to common-mode R/G/B under a zero main slider."""
+    """Static C++ pin: the grayscale payload parser (ApplyGrayscalePayload ->
+    ipc_grayscale::GrayscaleFromPayload in src/ipc_grayscale.h, shared by the set_*_grayscale verbs,
+    mhc.grayscale_set_live and runtime.set_grayscale_tweak) must parse the optional luminance[] +
+    rgb{r,g,b} decomposition — removing it silently regresses the editor split back to common-mode
+    R/G/B under a zero main slider."""
     text = _cpp_text()
-    m = re.search(r'void\s+ApplyGrayscalePayload\([^)]*\)\s*\{(.*?)\n\}', text, re.DOTALL)
-    assert m, "ApplyGrayscalePayload not found in the C++ IPC server"
+    assert "ipc_grayscale::GrayscaleFromPayload" in text, \
+        "ApplyGrayscalePayload no longer goes through ipc_grayscale::GrayscaleFromPayload"
+    header = CPP_SERVER.parent / "ipc_grayscale.h"
+    if not header.exists():
+        pytest.skip(f"C++ grayscale payload header not found at {header}")
+    htext = header.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r'inline\s+bool\s+GrayscaleFromPayload\([^)]*\)\s*\{(.*?)\n\}', htext, re.DOTALL)
+    assert m, "GrayscaleFromPayload not found in src/ipc_grayscale.h"
     body = m.group(1)
     assert 'find("luminance")' in body, "C++ no longer reads the luminance[] decomposition"
     assert 'find("rgb")' in body, "C++ no longer reads the rgb{} decomposition"
@@ -875,8 +887,8 @@ def _seed_mhc_params(ctx) -> None:
         "monitor": 0,
         "primaries": {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06},
         "white": {"x": 0.3127, "y": 0.3290},
-        "base_grayscale": {"point_count": 2, "points": [0.0, 1.0],
-                           "deviations": {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 1.0]}},
+        "base_grayscale": {"point_count": 10, "points": [(i / 9) ** 2 for i in range(10)],
+                           "deviations": {ch: [1.0] * 10 for ch in ("r", "g", "b")}},
         "target_gamma": 2.2,
     }
     _common.save_dlc_state(ctx, state)
@@ -987,10 +999,10 @@ def test_a_luminance_scaled_curve_round_trips_exactly_through_the_raw_setter():
     reviewer measured ~0.0065 abs at slot 1 for a 1.05 main slider."""
     ctrl = CalibrationController.mock()
     ctrl.apply_mhc(0, "HDR")
-    n = 6
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
     grid = [i / (n - 1) for i in range(n)]
-    lum = [1.0, 1.05, 1.03, 1.0, 0.98, 1.0]
-    rgb = {"r": [1.0, 1.02, 1.0, 1.0, 1.0, 1.0], "g": [1.0] * n, "b": [1.0, 0.97, 1.0, 1.0, 1.0, 1.0]}
+    lum = [1.0, 1.05, 1.03, 1.0, 0.98, 1.0, 1.0, 1.0, 1.0, 1.0]
+    rgb = {"r": [1.0, 1.02] + [1.0] * (n - 2), "g": [1.0] * n, "b": [1.0, 0.97] + [1.0] * (n - 2)}
     devs = {ch: [l * v for l, v in zip(lum, rgb[ch])] for ch in "rgb"}
     for mode in ("SDR", "HDR"):
         ctrl.apply_mhc(0, mode)
@@ -998,8 +1010,8 @@ def test_a_luminance_scaled_curve_round_trips_exactly_through_the_raw_setter():
         ctrl.grayscale_set_live(0, mode, n, grid, devs, luminance=lum, rgb=rgb)
         ctrl.grayscale_commit(0, mode)
         before = ctrl.state()["mhc"][f"0:{mode}"]["correction_grayscale"]
-        ctrl.set_correction_grayscale_raw(0, mode, {"point_count": 2, "points": [0.0, 1.0],
-                                                    "deviations": {"r": [1, 1], "g": [1, 1], "b": [1, 1]}})
+        ctrl.set_correction_grayscale_raw(0, mode, {"point_count": 10, "points": [i / 9 for i in range(10)],
+                                                    "deviations": {ch: [1] * 10 for ch in "rgb"}})
         ctrl.set_correction_grayscale_raw(0, mode, before)
         after = ctrl.state()["mhc"][f"0:{mode}"]["correction_grayscale"]
         assert after["points"] == before["points"], mode
@@ -1020,7 +1032,9 @@ def test_layers_set_grayscale_drives_the_reported_enabled_bit():
     ApplyGrayscalePayload forces it on; the revert relies on both."""
     ctrl = CalibrationController.mock()
     ctrl.apply_mhc(0, "SDR")
-    ctrl.set_correction_grayscale(0, "SDR", 3, [0.0, 0.5, 1.0], {"r": [1, 1.01, 1], "g": [1, 1, 1], "b": [1, 1, 1]})
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
+    ctrl.set_correction_grayscale(0, "SDR", n, [i / (n - 1) for i in range(n)],
+                                  {"r": [1.01 if i == 4 else 1 for i in range(n)], "g": [1] * n, "b": [1] * n})
     assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is True
     ctrl.set_layers(0, "SDR", grayscale=False)
     assert ctrl.state()["mhc"]["0:SDR"]["correction_grayscale"]["enabled"] is False
@@ -1035,8 +1049,12 @@ def test_snapshot_correction_grayscale_keeps_the_wire_block_and_says_why_when_no
     ctrl = CalibrationController.mock()
     ctrl.apply_mhc(0, "SDR")
     ctrl.grayscale_live_begin(0, "SDR")
-    ctrl.grayscale_set_live(0, "SDR", 3, [0.0, 0.5, 1.0], {"r": [1, 1.02, 1], "g": [1, 1, 1], "b": [1, 1, 1]},
-                            luminance=[1.0, 1.02, 1.0], rgb={"r": [1, 1, 1], "g": [1, 0.98, 1], "b": [1, 1, 1]})
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
+    bump = [1.02 if i == 4 else 1.0 for i in range(n)]
+    ctrl.grayscale_set_live(0, "SDR", n, [i / (n - 1) for i in range(n)],
+                            {"r": bump, "g": [1] * n, "b": [1] * n},
+                            luminance=bump,
+                            rgb={"r": [1] * n, "g": [0.98 if i == 4 else 1 for i in range(n)], "b": [1] * n})
     snap, source = _cg_probe(ctrl.state())
     assert source == "prior"
     assert set(snap) == {"enabled", "point_count", "points", "deviations"}

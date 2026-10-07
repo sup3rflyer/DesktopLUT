@@ -30,6 +30,7 @@
 #include "fald.h"
 #include "displayconfig.h"
 #include "ipc_json.h"
+#include "ipc_grayscale.h"
 #include "settings.h"
 #include "processing.h"
 #include "gui.h"
@@ -261,78 +262,11 @@ void ReapplyProcessing() {
     FaldTrace("ReapplyProcessing: end");
 }
 
-constexpr int kMaxMhcGrayscalePoints = 32;
-
-std::vector<float> ResampleUniform(const std::vector<float>& src, int count, float fallback) {
-    std::vector<float> out((std::max)(count, 0), fallback);
-    if (count <= 0 || src.empty()) return out;
-    if ((int)src.size() == count) return src;
-    if (src.size() == 1 || count == 1) {
-        std::fill(out.begin(), out.end(), src.front());
-        return out;
-    }
-    float denom = (float)(count - 1);
-    float srcMax = (float)(src.size() - 1);
-    for (int i = 0; i < count; ++i) {
-        float pos = ((float)i / denom) * srcMax;
-        int i0 = (int)floorf(pos);
-        int i1 = (std::min)(i0 + 1, (int)src.size() - 1);
-        float t = pos - floorf(pos);
-        out[i] = src[i0] + (src[i1] - src[i0]) * t;
-    }
-    return out;
-}
-
-void ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p) {
-    int pc = p.getInt("point_count", 0);
-    std::vector<float> pts = ReadFloatArray(p.find("points"));
-    const JsonValue* dev = p.find("deviations");
-    std::vector<float> r = ReadFloatArray(dev ? dev->find("r") : nullptr);
-    std::vector<float> g = ReadFloatArray(dev ? dev->find("g") : nullptr);
-    std::vector<float> b = ReadFloatArray(dev ? dev->find("b") : nullptr);
-    // Decomposed editor sliders (optional): luminance[] is the common (main) slider
-    // per point, rgb{r,g,b} the per-channel balance strips; deviations stays the
-    // composed back-compat form (luminance*rgb). When present, the decomposition is
-    // authoritative: luminance scales the points curve — exactly what the editor's
-    // main slider edits — and rgb lands on rgbDeviations, so opening the editor shows
-    // the solver's split instead of a zero main slider with common-mode R/G/B.
-    std::vector<float> lum = ReadFloatArray(p.find("luminance"));
-    const JsonValue* rgb = p.find("rgb");
-    std::vector<float> balR = ReadFloatArray(rgb ? rgb->find("r") : nullptr);
-    std::vector<float> balG = ReadFloatArray(rgb ? rgb->find("g") : nullptr);
-    std::vector<float> balB = ReadFloatArray(rgb ? rgb->find("b") : nullptr);
-    if (pc <= 0) pc = (int)pts.size();
-    if (pc <= 0) pc = (int)gs.points.size();
-    if (pc <= 0) pc = 20;
-    if ((int)pts.size() != pc) {
-        pts.assign(pc, 0.0f);
-        for (int k = 0; k < pc; ++k) pts[k] = (pc > 1) ? (float)k / (pc - 1) : 0.0f;
-    }
-    auto fix = [pc](std::vector<float>& v) { if ((int)v.size() != pc) v.assign(pc, 1.0f); };
-    fix(r); fix(g); fix(b);
-    bool haveLum = (int)lum.size() == pc;
-    bool haveRgb = (int)balR.size() == pc && (int)balG.size() == pc && (int)balB.size() == pc;
-    if (haveLum && !haveRgb) {
-        // Luminance without balance: recover the balance from the composed deviations
-        // (deviations = luminance*rgb) so the split still lands on the right controls.
-        balR.assign(pc, 1.0f); balG.assign(pc, 1.0f); balB.assign(pc, 1.0f);
-        for (int k = 0; k < pc; ++k) {
-            float l = lum[k];
-            if (fabsf(l) > 1e-6f) { balR[k] = r[k] / l; balG[k] = g[k] / l; balB[k] = b[k] / l; }
-        }
-        haveRgb = true;
-    }
-    int dstPc = std::clamp(pc, 2, kMaxMhcGrayscalePoints);
-    gs.pointCount = dstPc;
-    gs.points = ResampleUniform(pts, dstPc, 0.0f);
-    if (haveLum) {
-        std::vector<float> lumR = ResampleUniform(lum, dstPc, 1.0f);
-        for (int k = 0; k < dstPc; ++k) gs.points[k] *= lumR[k];
-    }
-    gs.rgbDeviations[0] = ResampleUniform(haveRgb ? balR : r, dstPc, 1.0f);
-    gs.rgbDeviations[1] = ResampleUniform(haveRgb ? balG : g, dstPc, 1.0f);
-    gs.rgbDeviations[2] = ResampleUniform(haveRgb ? balB : b, dstPc, 1.0f);
-    gs.enabled = true;
+// Validates a grayscale payload and, only if it is entirely valid, stores it into `gs` (point count,
+// points, per-channel gains, enabled = true). Rules: src/ipc_grayscale.h. False + error otherwise,
+// with `gs` untouched — a malformed payload used to bake a square-root curve and report ok:true.
+bool ApplyGrayscalePayload(GrayscaleSettings& gs, const JsonValue& p, bool isHDR, std::string& error) {
+    return ipc_grayscale::GrayscaleFromPayload(p, isHDR, gs.pointCount, gs, error);
 }
 
 // ===========================================================================
@@ -1243,7 +1177,9 @@ void DoMhcSetGrayscale(const JsonValue& p, JsonValue& result, std::string& error
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        ApplyGrayscalePayload(correction ? m.correctionGrayscale : m.baseGrayscale, p);
+        GrayscaleSettings& slot = correction ? m.correctionGrayscale : m.baseGrayscale;
+        if (!ApplyGrayscalePayload(slot, p, isHDR, error)) return;
+        result.set("point_count", JNum(slot.pointCount));   // what was stored
     }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("mhc", JObj());
@@ -1251,8 +1187,8 @@ void DoMhcSetGrayscale(const JsonValue& p, JsonValue& result, std::string& error
 
 // Import a full-resolution 1D .cube as the MHC base grayscale/EOTF correction — the
 // path ColourSpace/DisplayCal use via the GUI file-import, now reachable over the pipe
-// so DLC can carry a dense per-channel TRC instead of the coarse 32-point editable table
-// (kMaxMhcGrayscalePoints), which is far too sparse for a PQ EOTF. Sets sourceFilePath/
+// so DLC can carry a dense per-channel TRC instead of the coarse 10/20/32-point editable table
+// (src/grayscale_validate.h), which is far too sparse for a PQ EOTF. Sets sourceFilePath/
 // sourceIs1DCube so mhc.apply's BuildMHC2Params loads the cube (Load1DCubeLUT ->
 // params.corrR/G/B) and bakes the 4096-entry (HDR) / 1024-entry (SDR) MHC2 LUT directly.
 // The matrix is untouched: the cube carries ONLY per-channel tone; set_primaries/set_white
@@ -1775,7 +1711,7 @@ void DoSetGrayscaleTweak(const JsonValue& p, JsonValue& result, std::string& err
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         ColorCorrectionSettings& cc = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection
                                             : g_gui.monitorSettings[mon].sdrColorCorrection;
-        ApplyGrayscalePayload(cc.grayscale, *tweak);  // sets enabled = true
+        if (!ApplyGrayscalePayload(cc.grayscale, *tweak, isHDR, error)) return;  // sets enabled = true
     }
     SaveSettings();
     ReapplyProcessing();
@@ -1911,7 +1847,7 @@ void DoGrayscaleSetLive(const JsonValue& p, JsonValue& result, std::string& erro
             return;
         }
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        ApplyGrayscalePayload(m.correctionGrayscale, *gs);  // sets enabled = true
+        if (!ApplyGrayscalePayload(m.correctionGrayscale, *gs, isHDR, error)) return;  // sets enabled = true
         tempCC.grayscale = m.correctionGrayscale;           // snapshot for the overlay push
     }
     ColorCorrectionData data = ConvertColorCorrection(tempCC, isHDR);

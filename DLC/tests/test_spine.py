@@ -158,8 +158,11 @@ def test_controller_full_contract_roundtrip(tmp_path):
 
     ctrl.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06})
     ctrl.set_white(0, "SDR", 0.3127, 0.3290)
-    ctrl.set_base_grayscale(0, "SDR", 3, [0.0, 0.5, 1.0], {"r": [1, 1, 1], "g": [1, 1, 1], "b": [1, 1, 1]})
-    ctrl.set_correction_grayscale(0, "SDR", 3, [0.0, 0.5, 1.0], {"r": [1.0, 1.01, 1.0], "g": [1, 1, 1], "b": [1, 0.99, 1]})
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
+    grid = [i / (n - 1) for i in range(n)]
+    ctrl.set_base_grayscale(0, "SDR", n, grid, {ch: [1] * n for ch in "rgb"})
+    ctrl.set_correction_grayscale(0, "SDR", n, grid, {"r": [1.01 if i == 4 else 1.0 for i in range(n)],
+                                                      "g": [1] * n, "b": [0.99 if i == 4 else 1 for i in range(n)]})
     applied = ctrl.apply_mhc(0, "SDR")
     assert applied["mhc"]["applied"] is True
     assert "correction_grayscale" in applied["mhc"]
@@ -349,17 +352,19 @@ def test_grayscale_tweak_proxy_roundtrip():
     ctrl = CalibrationController.mock()
     ctrl.enter_neutral(0, "SDR", "C:/dlc/sRGB.icm", reason="item6 test")
 
-    points = [0.0, 0.5, 1.0]
-    deviations = {"r": [1.0, 1.01, 1.0], "g": [1.0, 1.0, 1.0], "b": [1.0, 0.99, 0.98]}
-    res = ctrl.set_grayscale_tweak(0, "SDR", 3, points, deviations)
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
+    points = [i / (n - 1) for i in range(n)]
+    b = [1.0, 0.99, 0.98] + [1.0] * (n - 3)
+    deviations = {"r": [1.0, 1.01] + [1.0] * (n - 2), "g": [1.0] * n, "b": b}
+    res = ctrl.set_grayscale_tweak(0, "SDR", n, points, deviations)
     assert res["monitor_mode"] == "0:SDR"
 
     runtime = ctrl.state()["runtime"]["0:SDR"]
     tweak = runtime["grayscale_tweak"]
-    assert tweak["point_count"] == 3
+    assert tweak["point_count"] == n
     assert tweak["points"] == points
     # Deviations are float-coerced through the controller.
-    assert tweak["deviations"]["b"] == pytest.approx([1.0, 0.99, 0.98])
+    assert tweak["deviations"]["b"] == pytest.approx(b)
 
     ctrl.disable_grayscale_tweak(0, "SDR")
     assert "grayscale_tweak" not in ctrl.state()["runtime"].get("0:SDR", {})
@@ -373,11 +378,13 @@ def test_grayscale_tweak_independent_of_3dlut(tmp_path):
     cube = tmp_path / "final.cube"
     cube.write_text('TITLE "x"\n', encoding="utf-8")
     ctrl.set_3dlut(0, "SDR", str(cube))
-    ctrl.set_grayscale_tweak(0, "SDR", 2, [0.0, 1.0], {"r": [1.0, 1.0], "g": [1.0, 1.0], "b": [1.0, 0.99]})
+    n = 10   # DesktopLUT accepts 10/20/32-point curves only
+    ctrl.set_grayscale_tweak(0, "SDR", n, [i / (n - 1) for i in range(n)],
+                             {"r": [1.0] * n, "g": [1.0] * n, "b": [1.0] * (n - 1) + [0.99]})
 
     runtime = ctrl.state()["runtime"]["0:SDR"]
     assert runtime["cube_path"].endswith("final.cube")
-    assert runtime["grayscale_tweak"]["point_count"] == 2
+    assert runtime["grayscale_tweak"]["point_count"] == n
 
 
 def test_query_monitors_deterministic_mapping():
