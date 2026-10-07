@@ -918,8 +918,11 @@ CWindowContext_IsCandidateDirectFlipCompatbile_t* CWindowContext_IsCandidateDire
 // Check if any active processing (LUT or tonemap) requires DWM composition
 static bool HasActiveHookProcessing() {
 	if (numLuts > 0) return true;
+	// The tonemapper only runs on a display in HDR (RenderLUT: colorMode 1). The host sends the
+	// CONFIGURED flag so the hooks are installed at attach even while in SDR; a configured tonemapper
+	// on an SDR display must not keep every window from direct flip. Same debounced state as RenderLUT.
 	for (int i = 0; i < g_numLocalTonemap; i++) {
-		if (g_localTonemap[i].enabled) return true;
+		if (g_localTonemap[i].enabled && IsMonitorHdr(g_localTonemap[i].left, g_localTonemap[i].top)) return true;
 	}
 	// FALD needs the composed frame too: a monitor with the layer on must not direct-flip past the hook
 	for (int i = 0; i < g_numLocalFald; i++) {

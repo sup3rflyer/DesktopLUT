@@ -1248,3 +1248,36 @@ TEST_CASE("MHC settings: profiles baked by older white-balance maths are forgott
         CHECK_FALSE(mhc.permNames[5].empty());
     }
 }
+
+// T1.4: a display with only the HDR tonemapper (no .cube) needs the DWM hook — it used to be left out
+// of the injection list, so hook mode showed "Active (DWM Hook)" and tonemapped nothing.
+TEST_CASE("MonitorNeedsDwmHook: cube, FALD panel file or the HDR tonemapper, regardless of the live mode") {
+    MonitorSettings ms;
+    CHECK_FALSE(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+
+    SUBCASE("HDR tonemapper alone") {
+        ms.hdrColorCorrection.tonemap.enabled = true;
+        CHECK(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+    }
+    SUBCASE("an SDR-side tonemap flag is not hook work (the tonemapper is HDR-only)") {
+        ms.sdrColorCorrection.tonemap.enabled = true;
+        CHECK_FALSE(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+    }
+    SUBCASE("a cube on either side") {
+        ms.sdrPath = L"sdr.cube";
+        CHECK(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+        ms.sdrPath.clear();
+        ms.hdrPath = L"hdr.cube";
+        CHECK(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+    }
+    SUBCASE("a FALD panel file, switched on or not") {
+        ms.hdrColorCorrection.fald.paramsPath = L"panel.fld";
+        ms.hdrColorCorrection.fald.enabled = false;
+        CHECK(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+    }
+    SUBCASE("overlay-only corrections are not hook work") {
+        ms.sdrColorCorrection.primariesEnabled = true;
+        ms.hdrColorCorrection.grayscale.enabled = true;
+        CHECK_FALSE(MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection));
+    }
+}

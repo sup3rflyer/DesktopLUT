@@ -29,6 +29,18 @@ bool AnyMonitorNeedsProcessing();
 // Any LIVE display has any correction at all, MHC profiles included (the startup auto-start test).
 bool AnyMonitorHasCorrections();
 
+// One display needs the DWM hook resident (hook mode): a .cube, a FALD panel file, or the HDR
+// tonemapper. NOT gated on the display's current HDR mode — the user flips HDR while running and the
+// hook must already be there (it installs its hooks at attach from this configuration); the DLL gates
+// the tonemapper on the live, debounced mode itself. Shared by StartProcessing and the watchdog's
+// re-injection so the two cannot disagree. `CC` = ColorCorrectionData or ColorCorrectionSettings.
+template <class CC>
+bool MonitorNeedsDwmHook(const std::wstring& sdrLut, const std::wstring& hdrLut, const CC& sdr, const CC& hdr) {
+    return !sdrLut.empty() || !hdrLut.empty() ||
+           !sdr.fald.paramsPath.empty() || !hdr.fald.paramsPath.empty() ||
+           hdr.tonemap.enabled;
+}
+
 // True while StartProcessing/StopProcessing is executing (their joins pump messages): handlers
 // that would start, join or replace the processing thread must leave it to the transition.
 bool IsProcessingTransitionActive();
