@@ -26,8 +26,42 @@ inline const char* GetLogFilePath()
 	return path;
 }
 
+// Backstop against a log call that ends up in a per-present path (every open/append/close is synchronous
+// I/O inside dwm.exe). Token bucket: a burst of kLogBurstLines (attach / injection diagnostics are kept
+// whole), refilled at kLogLinesPerSecond; lines beyond that are counted and reported as one line when
+// logging resumes.
+constexpr double kLogBurstLines = 500.0;
+constexpr double kLogLinesPerSecond = 20.0;
+
+inline bool log_rate_allow(unsigned& suppressedOut)
+{
+	static SRWLOCK lock = SRWLOCK_INIT;
+	static double tokens = kLogBurstLines;
+	static unsigned long long lastTick = 0;
+	static unsigned suppressed = 0;
+	AcquireSRWLockExclusive(&lock);
+	const unsigned long long now = GetTickCount64();
+	if (lastTick != 0) {
+		tokens += (double)(now - lastTick) * (kLogLinesPerSecond / 1000.0);
+		if (tokens > kLogBurstLines) tokens = kLogBurstLines;
+	}
+	lastTick = now;
+	bool allow = tokens >= 1.0;
+	if (allow) {
+		tokens -= 1.0;
+		suppressedOut = suppressed;
+		suppressed = 0;
+	} else {
+		suppressed++;
+	}
+	ReleaseSRWLockExclusive(&lock);
+	return allow;
+}
+
 inline void log_to_file(const char* log_buf)
 {
+	unsigned suppressedLines = 0;
+	if (!log_rate_allow(suppressedLines)) return;
 	FILE* pFile = fopen(GetLogFilePath(), "a");
 	if (pFile == NULL)
 	{
@@ -44,6 +78,7 @@ inline void log_to_file(const char* log_buf)
 		}
 	}
 	fseek(pFile, 0, SEEK_END);
+	if (suppressedLines) fprintf(pFile, "(log rate limit: %u lines suppressed)\n", suppressedLines);
 	fprintf(pFile, "%s\n", log_buf);
 	fclose(pFile);
 }

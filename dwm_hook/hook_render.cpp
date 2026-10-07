@@ -293,6 +293,8 @@ static int FindCacheIndex(void* context) {
 	return -1;
 }
 
+static void EvictContext(int cacheIndex);
+
 void CacheContextPositionEx(void* context, int left, int top, int method) {
 	int i = FindCacheIndex(context);
 	if (i >= 0) {
@@ -301,6 +303,22 @@ void CacheContextPositionEx(void* context, int left, int top, int method) {
 		if (method != CTXPOS_UNKNOWN) g_contextPosCache[i].method = method;
 		g_contextPosCache[i].placedTick = GetTickCount64();
 		return;
+	}
+	if (g_numContextPosCache >= 16) {
+		// Full: evict the entry that presented least recently. DWM creates a fresh overlay context on
+		// every modeset / fullscreen switch and never says when one dies, so a long session fills the
+		// table with dead contexts; a context that could not be cached was re-matched, logged and the
+		// routing file rewritten on EVERY present (file I/O in dwm.exe's present path). Sixteen live
+		// contexts do not occur, so the victim is a dead one; were it live, its next present simply
+		// re-matches it like any new context.
+		int victim = 0;
+		for (int k = 1; k < g_numContextPosCache; k++)
+			if (g_contextPosCache[k].lastPresentSerial < g_contextPosCache[victim].lastPresentSerial) victim = k;
+		char msg[128];
+		snprintf(msg, sizeof(msg), "context cache full: evicting ctx %p (silent since present %llu)",
+			g_contextPosCache[victim].context, g_contextPosCache[victim].lastPresentSerial);
+		log_to_file(msg);
+		EvictContext(victim);
 	}
 	if (g_numContextPosCache < 16) {
 		ContextPositionCache e = {};
@@ -1048,10 +1066,13 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		}
 	}
 
-	// Log per-context info for diagnostics (track up to 8 unique contexts)
+	// Log per-context info for diagnostics, once per context. A ring of the most recent contexts: the old
+	// fixed 8-entry table never recorded a 9th, so from then on every new context logged on EVERY present
+	// (synchronous file I/O in dwm.exe's present path — DWM makes a new context on each modeset).
 	{
-		static void* loggedContexts[8] = {};
+		static void* loggedContexts[32] = {};
 		static int numLoggedContexts = 0;
+		static int nextLoggedSlot = 0;
 		bool alreadyLogged = false;
 		for (int lc = 0; lc < numLoggedContexts; lc++) {
 			if (loggedContexts[lc] == cOverlayContext) { alreadyLogged = true; break; }
@@ -1064,7 +1085,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				cOverlayContext, dbgLeft, dbgTop, (int)newBackBufferDesc.Format,
 				newBackBufferDesc.Width, newBackBufferDesc.Height, colorMode);
 			log_to_file(msg);
-			if (numLoggedContexts < 8) loggedContexts[numLoggedContexts++] = cOverlayContext;
+			loggedContexts[nextLoggedSlot] = cOverlayContext;
+			nextLoggedSlot = (nextLoggedSlot + 1) % 32;
+			if (numLoggedContexts < 32) numLoggedContexts++;
 		}
 	}
 
