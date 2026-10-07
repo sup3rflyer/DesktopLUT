@@ -189,6 +189,8 @@ AtomicTimePoint g_lastSuccessfulFrame;
 std::atomic<bool> g_displayOff{ false };  // Display is off - skip recovery attempts, wait for wake signal
 std::atomic<bool> g_compClockOccluded{ false };  // Frame pacer only: compositor clock OCCLUDED
 std::atomic<uint64_t> g_renderLoopHeartbeat{ 0 };  // Render-loop iterations (GUI-side hang check)
+std::atomic<bool> g_analysisMeasureReset{ false };
+std::atomic<bool> g_renderLoopStarted{ false };   // Current render thread is past init (preview barrier)
 
 // ============================================================================
 // MHC Edit Dialog State

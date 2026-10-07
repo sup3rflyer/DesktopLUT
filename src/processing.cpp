@@ -155,10 +155,15 @@ ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, b
 // render thread gets the value current at its creation and leaves its loop once it differs.
 static std::atomic<unsigned> g_renderLoopGen{0};
 
-static DWORD WINAPI TopmostHelperThread(LPVOID) {
+static std::thread LaunchRenderThread(std::vector<MonitorLUTConfig> configs);
+
+static DWORD WINAPI TopmostHelperThread(LPVOID param) {
+    // The generation of the render thread that owns this helper: an abandoned render thread's helper must
+    // also stop when g_running is true again (hook-only mode runs on), or that thread never finishes exiting.
+    const unsigned renderGen = (unsigned)(uintptr_t)param;
     while (true) {
         DWORD result = WaitForSingleObject(g_topmostEvent, 500);
-        if (!g_running) break;
+        if (!g_running || g_renderLoopGen.load(std::memory_order_relaxed) != renderGen) break;
 
         static auto lastReassert = std::chrono::steady_clock::now();
         auto now = std::chrono::steady_clock::now();
@@ -469,13 +474,17 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
     if (g_topmostEvent) ResetEvent(g_topmostEvent);
 
     // Start TOPMOST reassert helper thread (offloads SetWindowPos from MMCSS render thread)
-    HANDLE topmostThread = CreateThread(nullptr, 0, TopmostHelperThread, nullptr, 0, nullptr);
+    HANDLE topmostThread = CreateThread(nullptr, 0, TopmostHelperThread, (LPVOID)(uintptr_t)renderGen, 0, nullptr);
 
     // Initialize watchdog timestamp
     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
 
     // Main loop
     MSG msg = {};
+    // Init is done — contexts, and the MHC startup hygiene above: a live preview may engage from now on
+    // (EnsureProcessingForPreview waits for this; the hygiene would undo a passthrough engaged earlier).
+    if (g_renderLoopGen.load(std::memory_order_relaxed) == renderGen) g_renderLoopStarted.store(true);
+
     // renderGen: a Stop that gave up joining this thread (abandoned it) bumped g_renderLoopGen — if it ever
     // unblocks it must leave its loop even when g_running is true again (the hook still runs in hook mode).
     while (g_running && g_renderLoopGen.load(std::memory_order_relaxed) == renderGen) {
@@ -511,8 +520,13 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
     // Clean up frame pacer (MMCSS, timers, timeEndPeriod)
     CleanupFramePacer(&framePacer);
 
+    // Abandoned (a Stop gave up joining this thread; the pipeline went on without it — hook-only meanwhile):
+    // release only what this thread owns (its contexts, windows, hotkeys, the D3D objects no successor uses
+    // while it lives), never what the running pipeline started (gamma whitelist thread, analysis overlay).
+    auto abandoned = [&] { return g_renderLoopGen.load(std::memory_order_relaxed) != renderGen; };
+
     // Stop gamma whitelist polling thread
-    StopGammaWhitelistThread();
+    if (!abandoned()) StopGammaWhitelistThread();
 
     // Unregister hotkeys before cleanup
     if (g_mainHwnd) {
@@ -527,7 +541,7 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
     // Cleanup analysis overlay — skip in DWM hook mode if analysis is still enabled,
     // so the window survives the transition to analysis-only mode or hook-only hotkey mode.
     // StopProcessing handles final destruction.
-    if (!g_dwmHookMode.load() || !g_analysisEnabled.load()) {
+    if (!abandoned() && (!g_dwmHookMode.load() || !g_analysisEnabled.load())) {
         DestroyAnalysisOverlay();
     }
 
@@ -555,8 +569,15 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
     CoUninitialize();
 
     // An abandoned thread that finally exits must not relabel a pipeline that kept running without it
-    if (g_renderLoopGen.load(std::memory_order_relaxed) == renderGen) SetStatus(L"Inactive");
+    if (!abandoned()) SetStatus(L"Inactive");
     PostMessage(g_gui.hwndMain, WM_PROCESSING_EXITED, 0, 0);  // Signal GUI to update
+}
+
+// Every overlay render thread starts here: clears g_renderLoopStarted first (the new thread sets it once
+// its init + MHC hygiene are done) and hands the thread its generation.
+static std::thread LaunchRenderThread(std::vector<MonitorLUTConfig> configs) {
+    g_renderLoopStarted.store(false);
+    return std::thread(ProcessingThreadFunc, std::move(configs), g_renderLoopGen.load());
 }
 
 // Check if any shader corrections are active.
@@ -796,6 +817,7 @@ static void StartAnalysisOnlyMode() {
     }
     if (AbandonedProcessingThreadAlive()) {   // see g_abandonedThreads
         std::cerr << "[DWM Hook] Analysis-only start skipped: a previous processing thread is still stuck" << std::endl;
+        g_startDeferredByAbandoned = true;   // re-evaluated once it exits (TickRenderHealth)
         return;
     }
     unsigned gen = RetireStaleAnalysisThread();
@@ -970,6 +992,8 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
                 if (mon.captureFormat != DXGI_FORMAT_UNKNOWN &&
                     texDesc.Format != mon.captureFormat) {
                     std::cout << "[Analysis-only] Capture format changed, re-init DD" << std::endl;
+                    mon.analysisFrameCounter = 0;          // the held measurement is of the old format
+                    mon.analysisReadbackPending = false;
                     frameTexture->Release();
                     mon.duplication->ReleaseFrame();
                     mon.duplication->Release();
@@ -1226,6 +1250,7 @@ static void StartProcessingImpl() {
         std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with hook work (cube / FALD / tonemap)"
                    << std::endl;
 
+        std::wstring stagingWarning;   // LUT files the injection had to skip (unreadable)
         if (!dwmMonitors.empty() && s_restartKeepsResidentHook && DwmHookResidentWith(dwmMonitors)) {
             // The auto-restart after the overlay thread died: nothing ejected the hook since it was
             // injected with exactly this set — keep it, just bring its shared config up to date. Only
@@ -1234,7 +1259,16 @@ static void StartProcessingImpl() {
             std::wcout << L"[DWM Hook] Hook already resident with this staging set — not re-injecting" << std::endl;
             UpdateDwmHookSharedConfig();
         } else if (!dwmMonitors.empty()) {
-            std::wstring err = InjectDwmHook(dwmMonitors);
+            std::wstring err = InjectDwmHook(dwmMonitors, &stagingWarning);
+            if (err.empty() && !stagingWarning.empty()) {
+                // Injected, but a LUT file could not be read: that display runs without its cube.
+                // Same non-blocking dialog as an injection error (a pipe-driven start must not block).
+                SetStatus(L"Active (DWM Hook) - a LUT file could not be read");
+                std::thread([msg = stagingWarning]() {
+                    MessageBoxW(nullptr, (msg + L"\n\nThat display runs without its 3D LUT.").c_str(),
+                                L"DesktopLUT — DWM Hook", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+                }).detach();
+            }
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
                 // Not running: activeSettings must not claim otherwise (it reads as "the user had it
@@ -1281,7 +1315,7 @@ static void StartProcessingImpl() {
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
             RetireStaleAnalysisThread();  // full overlay owns g_monitors too
-            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs, g_renderLoopGen.load());
+            g_gui.processingThread = LaunchRenderThread(configs);
         } else if (needOverlay && !needFullOverlay && !overlayBlocked) {
             // Only analysis active — use lightweight analysis-only mode (no overlay windows)
             std::cout << "[DWM Hook] Analysis-only mode (no overlay, DD capture + compute only)" << std::endl;
@@ -1339,7 +1373,7 @@ static void StartProcessingImpl() {
 
         EnableWindow(g_gui.hwndApply, FALSE);
         EnableWindow(g_gui.hwndStop, TRUE);
-        SetStatus(L"Active (DWM Hook)");
+        SetStatus(stagingWarning.empty() ? L"Active (DWM Hook)" : L"Active (DWM Hook) - a LUT file could not be read");
 
         // Start DWM hook watchdog timer (detects DWM restart / hook loss)
         g_dwmHookWatchdogRetries = 0;
@@ -1355,7 +1389,7 @@ static void StartProcessingImpl() {
     g_gui.restartRetryCount = 0;  // Reset backoff on successful start
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
     RetireStaleAnalysisThread();  // full overlay owns g_monitors too
-    g_gui.processingThread = std::thread(ProcessingThreadFunc, configs, g_renderLoopGen.load());
+    g_gui.processingThread = LaunchRenderThread(configs);
 
     // Directly set button states - don't call UpdateGUIState which may re-enable via SettingsChanged
     EnableWindow(g_gui.hwndApply, FALSE);
@@ -1559,6 +1593,7 @@ static void DwmHookReevaluateOverlayOnce() {
         if (!g_gui.processingThread.joinable() && AbandonedProcessingThreadAlive()) {
             // See g_abandonedThreads: no overlay thread while a previous one is still stuck.
             std::cerr << "[DWM Hook] Overlay start skipped: a previous processing thread is still stuck" << std::endl;
+            g_startDeferredByAbandoned = true;   // re-evaluated once it exits (TickRenderHealth)
             return;
         }
         if (!g_gui.processingThread.joinable()) {
@@ -1581,7 +1616,7 @@ static void DwmHookReevaluateOverlayOnce() {
             }
             g_running = true;
             RetireStaleAnalysisThread();  // full overlay owns g_monitors too
-            g_gui.processingThread = std::thread(ProcessingThreadFunc, configs, g_renderLoopGen.load());
+            g_gui.processingThread = LaunchRenderThread(configs);
         }
     } else if (needAnalysis) {
         // Analysis only (no other corrections need the overlay shader)

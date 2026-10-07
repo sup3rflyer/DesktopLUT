@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "shader.h"
 #include "render.h"
+#include "gui.h"      // RequestDesktopRecompose
 #include <iostream>
 #include <iomanip>
 #include <sstream>
@@ -420,6 +421,10 @@ void ShowAnalysisOverlay() {
             }
         }
         g_resetPacerStats.store(true);
+        // The measurement still held is from before the readout was off (the screen may have changed since,
+        // even its HDR mode): drop it, and recompose the desktop so a static screen yields a fresh frame.
+        g_analysisMeasureReset.store(true);
+        RequestDesktopRecompose();
 
         // Set initial placeholder text
         const wchar_t* initialText = L" ANALYSIS\n--------------------\n Collecting data...";
@@ -528,7 +533,16 @@ bool CreateAnalysisResources(MonitorContext* ctx) {
 // source once released). One 256-thread group over 3600 samples — negligible next to the overlay's own
 // passes — so the result buffer always holds the statistics of the latest desktop frame, including the
 // last one before the screen went static. Callers skip re-processed / settle frames (released texture).
+// The readout was (re)enabled: forget the measurement held from before (analysis thread only).
+static void ConsumeAnalysisMeasureReset(MonitorContext* ctx) {
+    if (!g_analysisMeasureReset.exchange(false)) return;
+    ctx->analysisFrameCounter = 0;
+    ctx->analysisReadbackPending = false;
+    ctx->analysisLastReadbackQueued = {};
+}
+
 void DispatchAnalysisCompute(MonitorContext* ctx) {
+    ConsumeAnalysisMeasureReset(ctx);
     if (!g_analysisCS || !g_analysisCB || !ctx->captureSRV) return;
 
     // Create resources on first use
@@ -609,6 +623,7 @@ static void ComputeFrameTimingStats(MonitorContext* ctx) {
 // ANALYSIS_READBACK_INTERVAL it queues a copy of the latest result to staging, and it maps that copy
 // with DO_NOT_WAIT on a later call once the GPU has finished it. Never stalls the render loop.
 void UpdateAnalysisDisplay(MonitorContext* ctx) {
+    ConsumeAnalysisMeasureReset(ctx);
     if (!g_analysisHwnd) return;  // Caller already gates on g_analysisEnabled
     if (!ctx->analysisBuffer || !ctx->analysisStagingBuffer) return;
     if (ctx->analysisFrameCounter == 0) return;   // nothing measured yet

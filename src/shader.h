@@ -906,8 +906,8 @@ namespace analysis_slot {
 enum : unsigned {
     PeakY = 0, MinY = 1, SumY = 2, TotalPixels = 3, Rec709 = 4, P3Only = 5, Rec2020Only = 6, OutOfGamut = 7,
     ClipBlack = 8, ClipWhite = 9, Hist0 = 10, /* .. Hist4 = 14 */ MinNonZeroY = 15,
-    PeakRgb = 16,   // max over samples of max(R,G,B) nits — CTA-861.3 MaxCLL basis
-    SumRgb = 17,    // sum over samples of max(R,G,B) nits — /TotalPixels = the frame-average light level (FALL)
+    PeakRgb = 16,   // max over samples of max(R,G,B) nits, BT.2020 components — CTA-861.3 MaxCLL basis
+    SumRgb = 17,    // sum over samples of that max — /TotalPixels = the frame-average light level (FALL)
 };
 }
 inline const char* g_analysisCSSource = R"(
@@ -934,9 +934,10 @@ cbuffer AnalysisParams : register(b0) {
 // [9] pixelsClipWhite
 // [10-14] histogram (0-203, 203-1k, 1k-2k, 2k-4k, 4k+)
 // [15] minNonZeroNits (as float bits, min excluding <0.1 nit)
-// [16] peakRgbNits (float bits): max over samples of max(R,G,B)*80 — CTA-861.3 defines MaxCLL / MaxFALL on
-//      max(R,G,B), not on Y: a saturated 1000-nit red is Y 213 (Y stays the tonemapper's quantity)
-// [17] sumRgbNits (float bits): sum of max(R,G,B)*80, divided by totalPixels on the CPU
+// [16] peakRgbNits (float bits): max over samples of max(R,G,B)*80 with R,G,B the BT.2020 components — how
+//      HDR10 metadata (CTA-861.3, H.265 D.3.35) defines MaxCLL / MaxFALL: on max(R,G,B) of the BT.2020
+//      container signal, not on Y. A 1000-nit BT.709 red is 627 there (Y 213; Y stays the tonemapper's quantity)
+// [17] sumRgbNits (float bits): sum of that max, divided by totalPixels on the CPU
 
 groupshared float sharedPeak[256];
 groupshared float sharedMin[256];
@@ -1019,9 +1020,11 @@ void main(uint3 GTid : SV_GroupThreadID) {
                 localMinNonZero = min(localMinNonZero, nitsY);
             }
             localSum += nitsY;                      // Avg / APL use the luminance average
-            // MaxCLL / MaxFALL basis (CTA-861.3): max(R,G,B) in linear light. Negative (out-of-709)
-            // components contribute nothing.
-            float nitsRgb = max(max(max(rgb.r, rgb.g), rgb.b), 0.0f) * 80.0f;
+            // MaxCLL / MaxFALL basis (CTA-861.3 / HDR10): max(R,G,B) in linear light of the BT.2020
+            // container signal — scRGB is BT.709-based, so convert first. Negative components (outside
+            // BT.2020) contribute nothing.
+            float3 c2020 = mul(BT709_to_2020, rgb);
+            float nitsRgb = max(max(max(c2020.r, c2020.g), c2020.b), 0.0f) * 80.0f;
             localPeakRgb = max(localPeakRgb, nitsRgb);
             localSumRgb += nitsRgb;
 

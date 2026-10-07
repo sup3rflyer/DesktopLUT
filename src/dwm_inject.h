@@ -39,7 +39,8 @@ bool IsDwmHookActive();
 // Stages LUT files to %SYSTEMROOT%\Temp\DesktopLUT_luts\, copies DLL,
 // elevates to SYSTEM via lsass token, and injects via CreateRemoteThread.
 // Returns empty string on success, error message on failure.
-std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors);
+// stagingWarning: LUT files that could not be read are skipped (the rest is injected) and listed here.
+std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::wstring* stagingWarning = nullptr);
 
 // Uninject DwmHook.dll from all dwm.exe processes via FreeLibrary.
 // Returns empty string on success, error message on failure.

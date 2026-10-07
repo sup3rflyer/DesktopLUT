@@ -948,30 +948,30 @@ static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSe
 
 // Auto-regenerate and reinstall MHC profile when MHC settings change
 // Only acts if MHC is enabled and a profile is already installed for the given mode
-void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
-    if (!IsMHC2ApiAvailable()) return;
-
+MhcRegenResult RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     // Snapshot under lock (see GenerateAndInstallMhcProfile — reachable off the GUI thread).
     MHCSettings mhcCopy;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return MhcRegenResult::NoProfile;
         mhcCopy = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                         : g_gui.monitorSettings[monitorIndex].sdrMHC;
     }
     // Only require a profile name — editing inline corrections re-enables MHC automatically.
     // An existing profileName means Apply was run at some point and a profile file exists.
-    if (mhcCopy.profileName.empty()) return;
+    if (mhcCopy.profileName.empty()) return MhcRegenResult::NoProfile;
+    if (!IsMHC2ApiAvailable()) return MhcRegenResult::Failed;
 
     MHC2ProfileParams params;
     if (!BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params)) {
         std::cerr << "[MHC] monitor " << monitorIndex << (isHDR ? " HDR" : " SDR")
                   << ": source file unreadable, keeping the installed profile" << std::endl;
-        return;
+        return MhcRegenResult::Failed;   // matrixRebakePending stays set: retried once the file is back
     }
 
     // Recompute active permutation (corrections may have changed)
-    ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, ComputeMhcPermutation(mhcCopy, isHDR));
+    if (!ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, ComputeMhcPermutation(mhcCopy, isHDR)))
+        return MhcRegenResult::Failed;
 
     // Whatever this was asked for, the installed profile now carries the current matrix maths.
     {
@@ -981,6 +981,39 @@ void RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
             m.matrixRebakePending = false;
         }
     }
+    return MhcRegenResult::Installed;
+}
+
+MhcRegenResult RegenerateMissingMhcProfile(int monitorIndex, bool isHDR, const std::wstring& missingName,
+                                           bool& busy) {
+    busy = false;
+    // The processing thread's startup maintenance deletes profile files its settings snapshot does not
+    // name — never install a fresh one under it (same guard as the matrix / desktop-gamma re-bakes).
+    std::unique_lock<std::mutex> maintenance(g_mhcMaintenanceMutex, std::try_to_lock);
+    if (!maintenance.owns_lock()) { busy = true; return MhcRegenResult::Failed; }
+
+    MHCSettings mhcCopy;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return MhcRegenResult::NoProfile;
+        mhcCopy = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC : g_gui.monitorSettings[monitorIndex].sdrMHC;
+    }
+    // Only the profile that was reported missing, and only while it still is: a swap or a re-bake since
+    // the report already put a profile in place.
+    if (!mhcCopy.enabled || mhcCopy.profileName.empty() || mhcCopy.profileName != missingName)
+        return MhcRegenResult::NoProfile;
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectory(sysDir, MAX_PATH);
+    const std::wstring path = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + missingName;
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES) return MhcRegenResult::NoProfile;
+    if (!IsMHC2ApiAvailable()) return MhcRegenResult::Failed;
+
+    // As it was: the ACTIVE permutation (a whitelist DG-off or a hotkey-stripped variant stays that variant).
+    MHC2ProfileParams params;
+    if (!BuildMHC2ParamsForPerm(mhcCopy, isHDR, monitorIndex, mhcCopy.activePerm, params))
+        return MhcRegenResult::Failed;
+    return ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, mhcCopy.activePerm)
+               ? MhcRegenResult::Installed : MhcRegenResult::Failed;
 }
 
 bool AnyMhcMatrixRebakePending() {
@@ -1007,12 +1040,11 @@ bool RebakePendingMhcProfiles() {
             if (!maintenance.owns_lock()) return false;
             std::wcout << L"[MHC] Monitor " << i << (isHDR ? L" HDR" : L" SDR")
                        << L": re-baking the profile with the current white-balance matrix maths" << std::endl;
-            RegenerateMhcIfActive(i, isHDR);
-            {
+            if (RegenerateMhcIfActive(i, isHDR) != MhcRegenResult::Failed) {
                 std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
                 auto& m = isHDR ? g_gui.monitorSettings[i].hdrMHC : g_gui.monitorSettings[i].sdrMHC;
                 m.matrixRebakePending = false;   // also when there was nothing to regenerate
-            }
+            }   // a failed re-bake stays pending (saved as the old revision): retried on a later start
             if (i == g_gui.currentMonitor) UpdateMhcInfoDisplay(i, isHDR);
             any = true;
         }

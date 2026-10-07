@@ -61,10 +61,18 @@ void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams
 bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR);
 
 // Auto-regenerate and reinstall MHC profile when MHC settings change
-void RegenerateMhcIfActive(int monitorIndex, bool isHDR);
+// NoProfile = nothing installed for this mode (nothing to do); Failed = the profile could not be rebuilt
+// (source file unreadable, MHC2 API missing, install failed) — the previous profile stays active.
+enum class MhcRegenResult { NoProfile, Installed, Failed };
+MhcRegenResult RegenerateMhcIfActive(int monitorIndex, bool isHDR);
 
 // Profiles loaded with matrixRebakePending (baked by older white-balance matrix maths): any on a live
 // display? / re-bake them now. GUI thread. False when the MHC maintenance lock was busy (retry later).
+// The 15 s verify found the ACTIVE profile's .icm gone (T1.16): rebuild that profile — its active
+// permutation — under a new name. Only while `missingName` is still the active profile and still missing
+// (else NoProfile). busy = the processing thread's MHC maintenance holds the lock: ask again later. GUI thread.
+MhcRegenResult RegenerateMissingMhcProfile(int monitorIndex, bool isHDR, const std::wstring& missingName,
+                                           bool& busy);
 bool AnyMhcMatrixRebakePending();
 bool RebakePendingMhcProfiles();
 

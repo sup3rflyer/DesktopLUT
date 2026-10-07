@@ -199,7 +199,8 @@ std::map<std::pair<int, bool>, GsLiveState> g_gsLive;  // keyed by (monitor, isH
 // PERM_GS on commit and drops it on cancel without an explicit perm swap, exactly
 // as the GUI editor's close path relies on. Must be called WITHOUT
 // g_monitorSettingsMutex held (RegenerateMhcIfActive locks it internally).
-void FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
+// Returns false when the profile could not be rebuilt (the edit is in the settings, not on screen).
+bool FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
     g_mhcEditDialogOpen.store(false);  // re-arm MHC profile monitoring (suppressed during preview)
     {
         std::lock_guard<std::mutex> lk(g_monitorsMutex);
@@ -221,7 +222,7 @@ void FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
     }
     // Bake the (restored or final) correctionGrayscale into the ICC and restore the
     // full permutation. No-op if MHC isn't active (no profileName).
-    RegenerateMhcIfActive(mon, isHDR);
+    const bool rebuilt = RegenerateMhcIfActive(mon, isHDR) != MhcRegenResult::Failed;
     UpdateMhcFlagsLive(mon);
     // realization-A: now the real profile is re-associated, drop the transient passthrough
     // (remove association + delete the .icm). Done AFTER the real reassoc to avoid a no-profile flash.
@@ -236,6 +237,7 @@ void FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
     SaveSettings();
     // Desktop gamma waited for the live edit: catch up with the SDR white level (debounced re-check).
     if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
+    return rebuilt;
 }
 
 // Abort any active grayscale live preview (e.g. the client died between begin and
@@ -1077,8 +1079,11 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     bool regenerated = false;
     if (mhcChanged && profileNamed) {
         // Without g_monitorSettingsMutex held (RegenerateMhcIfActive snapshots under it).
-        RegenerateMhcIfActive(mon, isHDR);
-        regenerated = true;
+        const MhcRegenResult regen = RegenerateMhcIfActive(mon, isHDR);
+        regenerated = (regen == MhcRegenResult::Installed);
+        if (regen == MhcRegenResult::Failed)
+            error = "the MHC profile could not be rebuilt (imported source file unreadable or install failed); "
+                    "the previous profile stays on screen although the settings changed";
     }
     if (dgChanged) {
         bool dgActive = dg && mhcEnabled;
@@ -1893,9 +1898,12 @@ void DoGrayscaleCommit(const JsonValue& p, JsonValue& result, std::string& error
         auto it = g_gsLive.find({mon, isHDR});
         if (it != g_gsLive.end()) { st = it->second; g_gsLive.erase(it); found = true; }
     }
-    if (found) FinishGsLive(mon, isHDR, st, /*bake=*/true);
+    // baked = the edit is in the INSTALLED profile: false without a live session, and false when the
+    // profile could not be rebuilt (e.g. its imported source file is unreadable) — DLC must not measure
+    // a correction that is only in the settings.
+    const bool baked = found && FinishGsLive(mon, isHDR, st, /*bake=*/true);
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
-    result.set("baked", JBool(found));
+    result.set("baked", JBool(baked));
 }
 
 // mhc.grayscale_cancel {monitor, mode}: abort without baking — restore the pre-begin

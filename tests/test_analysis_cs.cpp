@@ -1,6 +1,7 @@
 // Analysis overlay compute shader (src/shader.h g_analysisCSSource) on WARP: the output slot layout the
 // C++ readback relies on (analysis_slot), and T4.21 — MaxCLL / MaxFALL are defined on max(R,G,B)
-// (CTA-861.3), not on luminance Y: a saturated 1000-nit red has Y 213.
+// (CTA-861.3) of the BT.2020 container signal, not on luminance Y: a saturated 1000-nit BT.709 red has
+// Y 213 and a BT.2020 max(R,G,B) of 627.
 
 #include "doctest.h"
 #include "shader.h"
@@ -133,7 +134,7 @@ float F(const std::vector<uint32_t>& out, unsigned slot) {
 
 }  // namespace
 
-TEST_CASE("Analysis CS: MaxCLL basis is max(R,G,B), Peak Y stays luminance (CTA-861.3)") {
+TEST_CASE("Analysis CS: MaxCLL basis is max(R,G,B) of the BT.2020 signal, Peak Y stays luminance") {
     // A 1000-nit pure red (scRGB 12.5) and a 200-nit pure blue (2.5); everything else black.
     const AnalysisRun run = RunAnalysis({ { 10, 10, 12.5f, 0.0f, 0.0f }, { 50, 30, 0.0f, 0.0f, 2.5f } }, true);
     if (run.deviceUnavailable) { MESSAGE("skipped: " << run.error); return; }
@@ -144,9 +145,11 @@ TEST_CASE("Analysis CS: MaxCLL basis is max(R,G,B), Peak Y stays luminance (CTA-
     // Peak Y: the red's luminance, 12.5 * 0.2126 * 80 — what the tonemapper compares
     CHECK(F(run.out, analysis_slot::PeakY) == doctest::Approx(212.6).epsilon(0.002));
     // Peak RGB: the red channel itself, 1000 nits (FP16 holds 12.5 exactly)
-    CHECK(F(run.out, analysis_slot::PeakRgb) == doctest::Approx(1000.0).epsilon(0.001));
+    // Peak RGB: the red in BT.2020 terms, 0.6274 * 12.5 * 80 (HDR10 metadata would carry 627, not 1000)
+    CHECK(F(run.out, analysis_slot::PeakRgb) == doctest::Approx(627.4).epsilon(0.001));
     // Sum of max(R,G,B): 1000 + 200 (FALL = that / total samples on the CPU)
-    CHECK(F(run.out, analysis_slot::SumRgb) == doctest::Approx(1200.0).epsilon(0.001));
+    // Sum: 627.4 + the blue's BT.2020 max (0.8956 * 2.5 * 80 = 179.12)
+    CHECK(F(run.out, analysis_slot::SumRgb) == doctest::Approx(806.52).epsilon(0.001));
     // Luminance sum for comparison: 212.6 + 2.5 * 0.0722 * 80
     CHECK(F(run.out, analysis_slot::SumY) == doctest::Approx(212.6 + 14.44).epsilon(0.002));
     // The unused tail of the buffer stays cleared
@@ -154,12 +157,13 @@ TEST_CASE("Analysis CS: MaxCLL basis is max(R,G,B), Peak Y stays luminance (CTA-
 }
 
 TEST_CASE("Analysis CS: negative (out-of-709) components do not lower or raise the max(R,G,B) basis") {
-    // A wide-gamut green: negative red and blue in scRGB. max(R,G,B) = the green channel.
+    // A wide-gamut green: negative red and blue in scRGB, inside BT.2020: max = its BT.2020 green,
+    // 0.0691 * -0.25 + 0.9195 * 5 + 0.0114 * -0.1 = 4.5791 -> 366.3 nits.
     const AnalysisRun run = RunAnalysis({ { 0, 0, -0.25f, 5.0f, -0.1f } }, true);
     if (run.deviceUnavailable) { MESSAGE("skipped: " << run.error); return; }
     REQUIRE_MESSAGE(run.error.empty(), run.error);
-    CHECK(F(run.out, analysis_slot::PeakRgb) == doctest::Approx(400.0).epsilon(0.001));
-    CHECK(F(run.out, analysis_slot::SumRgb) == doctest::Approx(400.0).epsilon(0.001));
+    CHECK(F(run.out, analysis_slot::PeakRgb) == doctest::Approx(366.33).epsilon(0.001));
+    CHECK(F(run.out, analysis_slot::SumRgb) == doctest::Approx(366.33).epsilon(0.001));
     CHECK(run.out[analysis_slot::Rec709] + run.out[analysis_slot::P3Only] + run.out[analysis_slot::Rec2020Only] +
               run.out[analysis_slot::OutOfGamut] == 80u * 45u);
 }

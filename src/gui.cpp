@@ -65,16 +65,17 @@ PreviewModeGate EvaluatePreviewModeGate(bool requestedHDR, bool ctxHDR,
                                     : PreviewModeGate::Mismatch;
 }
 
-// Pump messages until monitor `monIdx` has an overlay context in mode `isHDR` AND the render loop has
-// iterated since `beatBefore` (a live preview can run), the processing thread is gone, or `timeoutMs`
+// Pump messages until monitor `monIdx` has an overlay context in mode `isHDR` AND the current render
+// thread has entered its loop (a live preview can run), the processing thread is gone, or `timeoutMs`
 // passes. A freshly started overlay builds its contexts asynchronously (device, duplication, swapchain per
 // monitor — slow on low-end GPUs) and only then runs its MHC startup hygiene (orphan cleanup, stale sweep,
 // reapply): a preview engaged before that ends would have its passthrough profile deleted / its
-// permutation re-asserted over by it. The first loop iteration comes after the hygiene.
-static bool WaitForPreviewContext(int monIdx, bool isHDR, DWORD timeoutMs, uint64_t beatBefore) {
+// permutation re-asserted over by it. g_renderLoopStarted is set after the hygiene — this covers a thread
+// started just before the call too (e.g. calibration.enter's restart right before grayscale_live_begin).
+static bool WaitForPreviewContext(int monIdx, bool isHDR, DWORD timeoutMs) {
     const ULONGLONG until = GetTickCount64() + timeoutMs;
     for (;;) {
-        if (g_renderLoopHeartbeat.load(std::memory_order_relaxed) != beatBefore) {
+        if (g_renderLoopStarted.load()) {
             std::lock_guard<std::mutex> lk(g_monitorsMutex);
             for (const auto& ctx : g_monitors)
                 if (ctx.index == monIdx) {
@@ -141,7 +142,9 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
         if (ctxFound) {
             switch (EvaluatePreviewModeGate(isHDR, ctxHDR, freshOk, freshHDR)) {
             case PreviewModeGate::Ready:
-                livePreview = true;
+                // The context exists, but a thread started a moment ago may still be in its MHC startup
+                // hygiene: wait for its loop (immediate for a thread that is long running).
+                livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
                 break;
             case PreviewModeGate::Mismatch:
                 break;
@@ -152,11 +155,10 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
                 // (render.cpp auto-sleep skips straight back to the wake wait).
                 // Kick the same full reinit resume-from-sleep uses and wait for
                 // the capture path to converge on the actual mode.
-                const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
                 g_forceReinit.store(true);
                 if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
                 // Forced reinit sleeps 500ms before re-deriving the mode.
-                livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs, beat);
+                livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
                 break;
             }
         }
@@ -165,11 +167,10 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
     // Case 2: DWM hook running without full overlay (or with analysis-only) — start overlay for preview
     if (g_gui.isRunning && (!g_gui.processingThread.joinable() || g_analysisOnlyMode.load()) && g_dwmHookMode.load()) {
         g_mhcEditDialogOpen.store(true);
-        const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
         DwmHookReevaluateOverlay();
         if (g_gui.processingThread.joinable()) {
             startedOverlayForPreview = true;
-            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs, beat);
+            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
             if (!livePreview) {
                 g_mhcEditDialogOpen.store(false);
                 DwmHookReevaluateOverlay();
@@ -186,7 +187,6 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
                          : g_gui.monitorSettings[monIdx].sdrColorCorrection;
         bool origPrimEnabled = cc.primariesEnabled;
         cc.primariesEnabled = true;  // Ensure this monitor is included in processing
-        const uint64_t beat = g_renderLoopHeartbeat.load(std::memory_order_relaxed);
         StartProcessing();
         cc.primariesEnabled = origPrimEnabled;  // Restore (processing thread has its own copy)
         if (g_gui.isRunning) {
@@ -194,7 +194,7 @@ void EnsureProcessingForPreview(int monIdx, bool isHDR,
             // The thread just started: its contexts do not exist yet. Checking once, right away, failed
             // every time — the preview then stopped what it had started (a full hook inject + eject in
             // hook mode) and the editor opened without a preview (T2.10).
-            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs, beat);
+            livePreview = WaitForPreviewContext(monIdx, isHDR, kPreviewContextWaitMs);
             if (!livePreview) {
                 StopProcessing();
                 startedForPreview = false;
@@ -313,17 +313,24 @@ static void ApplyFaldSharedSettingChange() {
 static HWND g_faldRecomposeWnd = nullptr;
 static int g_faldRecomposeStage = 0;   // 0 = idle/armed, 1 = window shown
 
-void RequestFaldFullRecompose() {
-    if (!g_dwmHookMode.load() || !g_gui.hwndMain) return;
+// Any mode: one full-screen composition, so Desktop Duplication delivers a fresh frame of a static desktop
+// (the analysis readout on enable) and the hook re-renders it (a setting it renders changed).
+void RequestDesktopRecompose() {
+    if (!g_gui.hwndMain) return;
     // SetTimer needs the window's own thread: from anywhere else (the pipe, the hook's prime requests) post it there.
     if (GetWindowThreadProcessId(g_gui.hwndMain, nullptr) != GetCurrentThreadId()) {
-        PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 0, 0);
+        PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 1, 0);
         return;
     }
     g_faldRecomposeStage = 0;
     // Short delay: the hook reads the new flags at the top of the next present; give the shared
     // config (and a re-injection's attach) a moment to land before the composition that primes.
     SetTimer(g_gui.hwndMain, FALD_RECOMPOSE_TIMER_ID, 150, nullptr);
+}
+
+void RequestFaldFullRecompose() {
+    if (!g_dwmHookMode.load()) return;
+    RequestDesktopRecompose();
 }
 
 static void FaldRecomposeTick(HWND hwnd) {
@@ -1356,6 +1363,13 @@ static void TickTopologyPipeline(HWND hwnd) {
     }
 }
 
+// GUI-triggered re-bake (WB / grayscale / layer toggles): a profile that could not be rebuilt leaves the
+// previous one on screen while the settings changed — say so instead of looking applied.
+static void RegenerateMhcFromGui(int monitorIndex, bool isHDR) {
+    if (RegenerateMhcIfActive(monitorIndex, isHDR) == MhcRegenResult::Failed)
+        SetStatus(L"MHC profile not updated (source file unreadable?) - the previous profile stays active");
+}
+
 // T2.20: the render thread's own watchdog (RenderAll) cannot see that thread hang — stuck in a clock
 // wait that never returns, in Present / Map, in a recovery. This GUI-side tick watches its heartbeat:
 // after RENDER_HANG_TIMEOUT_MS without a loop iteration (display on, compositor clock not occluded) it
@@ -2257,7 +2271,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                   : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 HWND hwndEn = isHDR ? g_gui.hwndHdrMhcWbEnable : g_gui.hwndMhcWbEnable;
                 mhc.whiteBalanceEnabled = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
                 UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);   // white-balance peak cost (SDR)
                 SaveSettings();
             }
@@ -2280,7 +2294,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool changed = CommitNumericEdit(hwndWx, 0.20f, 0.60f, mhc.whiteBalanceWx, 4);
                 changed = CommitNumericEdit(hwndWy, 0.20f, 0.50f, mhc.whiteBalanceWy, 4) || changed;
                 if (!changed) return 0;
-                RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
                 UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);   // white-balance peak cost (SDR)
                 SaveSettings();
             }
@@ -2305,7 +2319,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         else mhc.correctionGrayscale.initLinear();
                     }
                 }
-                RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
                 SaveSettings();
             }
             return 0;
@@ -2332,7 +2346,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (isHDR) mhc.correctionGrayscale.initLinearPQ();
                         else mhc.correctionGrayscale.initLinear();
                     }
-                    RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                    RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
                     SaveSettings();
                 }
             }
@@ -2436,7 +2450,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     }
                 }
                 // Regenerate ICC profile with updated correction GS (clears stale perm cache)
-                RegenerateMhcIfActive(monIdx, isHDR);
+                RegenerateMhcFromGui(monIdx, isHDR);
                 // realization A: real profile re-associated; drop the transient passthrough (after).
                 if (!sdrPassthroughName.empty()) DisengageSdrPassthroughScanout(monIdx, sdrPassthroughName);
                 if (livePreview) {
@@ -2468,7 +2482,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                   : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 if (isHDR) mhc.correctionGrayscale.initLinearPQ();
                 else mhc.correctionGrayscale.initLinear();
-                RegenerateMhcIfActive(g_gui.currentMonitor, isHDR);
+                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
                 SaveSettings();
             }
             return 0;
@@ -2478,7 +2492,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
                 auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 mhc.correctionGrayscale.use24Gamma = (SendMessage(g_gui.hwndMhcGs24, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                RegenerateMhcIfActive(g_gui.currentMonitor, false);
+                RegenerateMhcFromGui(g_gui.currentMonitor, false);
                 SaveSettings();
             }
             return 0;
@@ -2514,7 +2528,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
                 auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC;
                 if (CommitNumericEdit(g_gui.hwndHdrMhcGsPeak, 10.0f, 10000.0f, mhc.correctionGrayscale.peakNits, 0)) {
-                    RegenerateMhcIfActive(g_gui.currentMonitor, true);
+                    RegenerateMhcFromGui(g_gui.currentMonitor, true);
                     SaveSettings();
                 }
             }
@@ -2670,8 +2684,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
-    case WM_FALD_RECOMPOSE:    // the hook's FALD layer waits for a primed clean copy (or the pipe changed the layer)
-        RequestFaldFullRecompose();
+    case WM_FALD_RECOMPOSE:    // the hook's FALD layer waits for a primed clean copy (or the pipe changed the layer);
+                               // wParam 1 = any mode (RequestDesktopRecompose from another thread)
+        if (wParam == 1) RequestDesktopRecompose();
+        else RequestFaldFullRecompose();
         return 0;
 
     case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively
@@ -2730,7 +2746,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
         // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
         if (g_dwmHookMode.load() && g_running.load()) {
-            if (!g_hookOnlyHotkeys && g_gui.hwndMain) {
+            // No overlay thread now: the hotkeys belong on the GUI window. Registered even when
+            // g_hookOnlyHotkeys is already set — a hook-only start made while an abandoned overlay thread
+            // still held them set the flag but could not register (an already-registered id just fails).
+            if (g_gui.hwndMain) {
                 if (g_hotkeyGammaEnabled.load())
                     RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
                 if (g_hotkeyAnalysisEnabled.load())
@@ -2788,12 +2807,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!m.enabled || m.profileName.empty()) return 0;
             name = m.profileName;
         }
-        if (!attempted.insert(name).second) return 0;
-        std::wcout << L"[MHC] monitor " << monIdx << (isHDR ? L" HDR" : L" SDR")
-                   << L": regenerating the missing profile " << name << std::endl;
-        RegenerateMhcIfActive(monIdx, isHDR);
-        SaveSettings();   // the new tick-stamped name
-        if (monIdx == g_gui.currentMonitor) UpdateMhcInfoDisplay(monIdx, isHDR);
+        if (attempted.count(name)) return 0;
+        bool busy = false;
+        const MhcRegenResult regen = RegenerateMissingMhcProfile(monIdx, isHDR, name, busy);
+        if (busy) return 0;   // the processing thread's MHC maintenance runs: the next verify tick asks again
+        attempted.insert(name);
+        if (regen == MhcRegenResult::Installed) {
+            std::wcout << L"[MHC] monitor " << monIdx << (isHDR ? L" HDR" : L" SDR")
+                       << L": regenerated the missing profile " << name << std::endl;
+            SaveSettings();   // the new tick-stamped name
+            if (monIdx == g_gui.currentMonitor) UpdateMhcInfoDisplay(monIdx, isHDR);
+        } else if (regen == MhcRegenResult::Failed) {
+            SetStatus(L"An MHC profile file went missing and could not be rebuilt");
+        }
         return 0;
     }
 

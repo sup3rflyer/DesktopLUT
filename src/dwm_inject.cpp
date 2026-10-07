@@ -389,7 +389,7 @@ bool IsDwmHookActive()
     return false;
 }
 
-std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
+std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::wstring* stagingWarning)
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     g_injectedSetValid = false;   // whatever happens below, the old set no longer describes the hook
@@ -528,7 +528,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
     // Not the user's file: a canonical .cube written from the host's own parse (LoadLUT). The DLL's
     // parser is stricter (header first, unindented lines, no BOM) and silently skipped files the host
     // accepts, so an eeColor .txt or an indented .cube showed "Active" and applied nothing (T1.5). This
-    // is also the only place hook mode can reject a file: it fails the injection with the reason.
+    // is also the only place hook mode can reject a file: it is skipped and reported (stagingWarning).
     auto stageCube = [&](const std::wstring& src, const std::wstring& dest, const wchar_t* what) -> std::wstring {
         std::wcout << L"[DWM Hook] Staging " << what << L" LUT: " << src << std::endl;
         std::vector<float> data;
@@ -549,9 +549,13 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors)
             std::wstring stageErr = stageCube(src, lutsDir + posPrefix + (hdr ? L"_hdr.cube" : L".cube"),
                                               hdr ? L"HDR" : L"SDR");
             if (!stageErr.empty()) {
-                std::wcerr << L"[DWM Hook] " << stageErr << std::endl;
-                DeleteDirectoryRecursive(lutsDir);
-                return stageErr;   // dllGuard removes the staged DLL
+                // Skip just this LUT: the other displays keep their cubes, the tonemapper and FALD
+                // (failing the whole injection took every display's hook work down with one bad file).
+                std::wcerr << L"[DWM Hook] " << stageErr << L" (skipped)" << std::endl;
+                if (stagingWarning) {
+                    if (!stagingWarning->empty()) *stagingWarning += L"\n\n";
+                    *stagingWarning += stageErr;
+                }
             }
         }
 
@@ -1316,6 +1320,26 @@ void UpdateDwmHookSharedConfig()
            g_sharedMemBytes - sizeof(uint32_t));   // head + tail (when mapped) inside one seqlock write
     std::atomic_thread_fence(std::memory_order_release);
     g_sharedMemPtr->version = ++g_sharedMemVersion;  // even = write complete
+
+    // What the hook renders changed (tonemap on/off, curve, peaks, dither, FALD switches/tuning, an HDR flip):
+    // make DWM re-compose the whole screen now. On a static desktop DWM composes nothing, so a change only
+    // showed at the next desktop change and an A/B toggle looked dead. Identical re-sends (the post-modeset
+    // resends, the settle kicker's refreshes) change nothing and request nothing; beacon / host fields are not
+    // rendering. The first push after an injection is covered by WM_DWMHOOK_INJECTED.
+    {
+        DwmHookSharedConfigEx render = ex;   // zero-initialised: padding is deterministic
+        render.head.hostPid = 0;
+        render.head.lutReloadFlag = 0;
+        render.head.beaconActive = 0;
+        render.head.beaconGeneration = 0;
+        for (uint32_t i = 0; i < MAX_DWM_HOOK_MONITORS; i++) render.head.monitors[i].beaconColorId = 0;
+        uint64_t h = 1469598103934665603ull;   // FNV-1a
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(&render);
+        for (size_t i = 0; i < sizeof(render); i++) { h ^= p[i]; h *= 1099511628211ull; }
+        static uint64_t s_lastRenderHash = 0;
+        if (s_lastRenderHash != 0 && h != s_lastRenderHash) RequestFaldFullRecompose();
+        s_lastRenderHash = h;
+    }
 }
 
 void CloseDwmHookSharedMemory()

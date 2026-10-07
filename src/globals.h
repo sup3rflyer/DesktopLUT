@@ -186,6 +186,9 @@ extern std::atomic<bool> g_hasPendingColorCorrections;  // Fast check to avoid m
 extern std::atomic<HWND> g_mainHwnd;     // First monitor's overlay window (for hotkey registration)
 extern HWND g_osdHwnd;      // On-screen display window
 extern HWND g_analysisHwnd; // Analysis overlay window
+// Set when the analysis readout is (re)enabled: the analysis thread drops the measurement it still holds
+// (taken before it was off, maybe in the other HDR mode) and waits for a fresh frame.
+extern std::atomic<bool> g_analysisMeasureReset;
 extern std::atomic<bool> g_analysisEnabled;       // Analysis overlay visibility
 extern std::atomic<bool> g_resetPacerStats;       // Signal render thread to reset pacer diagnostics
 
@@ -220,6 +223,9 @@ extern std::atomic<bool> g_compClockOccluded;
 // Incremented once per overlay render-loop iteration (ProcessingThreadFunc). The GUI thread's render-health
 // tick (gui.cpp) watches it: the in-thread watchdog cannot see its own thread hang (T2.20).
 extern std::atomic<uint64_t> g_renderLoopHeartbeat;
+// The current overlay render thread finished its init (contexts + MHC startup hygiene) and entered its loop.
+// Cleared when a render thread is launched (LaunchRenderThread). A live preview engages only after it.
+extern std::atomic<bool> g_renderLoopStarted;
 // Rendering is pointless right now (display off/asleep/locked, or the compositor clock is occluded):
 // recovery attempts and the render-loop watchdog stand down.
 inline bool DisplayOffOrOccluded() {
