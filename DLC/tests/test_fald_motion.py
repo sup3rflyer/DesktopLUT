@@ -9,7 +9,9 @@ import pytest
 from dlc.fald.model import FaldModel, FaldParams
 from dlc.fald.motion import (MotionModel, MovingShape, Scene, coverage_disc, coverage_rect, grey, render_full_patch,
                              render_reduced, score, simulate_scene, static_mask)
-from dlc.fald.motion_tpg import Present, infer_refreshes, presented_schedule, scene_text
+from dlc.fald.motion_image import ImagePanScene, dc_image_imbalance, from_array
+from dlc.fald.motion_tpg import (MotionTPG, Present, TPGError, check_dc_balance, infer_refreshes, presented_schedule,
+                                 scene_text)
 from dlc.fald.paneltime import PanelDriveState, PanelTimeLaw
 from dlc.fald.temporal import MODE_OFF, DriveState
 
@@ -209,3 +211,33 @@ def test_tpg_refuses_dc_unbalanced_blinks(tmp_path):
     with pytest.raises(TPGError, match="ODD|DC|STICKING"):
         tpg.load(sc((blk(1),)))
     tpg.close()
+
+
+# ---------------------------------------------------------------------------------------------- IMAGE pans: LCD balance
+def _stripes(period_px, v, hold):
+    x = np.arange(400)
+    img = np.repeat(((x // max(period_px // 2, 1)) % 2 * 300.0 + 2.0)[None, :], 60, axis=0).astype(np.float32)
+    return from_array(img, f"stripes{period_px}", n_move=80, velocity=(v, 0), at=(1000, 1000), hold=hold, aids=False,
+                      bg=(2.0, 2.0, 2.0))
+
+
+def test_image_pans_polarity_locked_toggle_is_refused(tmp_path):
+    """A 2-px stripe panned 1 px per refresh toggles every pixel at refresh / 2: refused (no override); the same pan
+    held 2 refreshes per frame (2:2), or a 4-px stripe at 1 px per refresh, is balanced."""
+    bad = _stripes(2, 1, 1)
+    r = dc_image_imbalance(bad)
+    assert r["excess"] > 2.0 and r["bias"] > 0.4
+    tpg = MotionTPG(rect=(0, 0, 64, 64), log_path=tmp_path / "x.csv")     # never started: the guard comes first
+    try:
+        with pytest.raises(TPGError, match="polarity"):
+            tpg.load(bad)
+    finally:
+        tpg.close()
+    check_dc_balance(_stripes(2, 1, 2))
+    assert dc_image_imbalance(_stripes(2, 1, 2))["checked"] == "even holds"
+    assert dc_image_imbalance(_stripes(4, 1, 1))["excess"] < 0.2
+    sc = _stripes(2, 1, 2)                                           # an odd blink on top of an image: still refused
+    blink = Scene(sc.base.name, sc.base.bg, (MovingShape("rect", 50.0, 50.0, grey(300.0), w=20, h=20, blink=1),),
+                  pre=sc.base.pre, move=sc.base.move, post=sc.base.post, cadence=sc.base.cadence)
+    with pytest.raises(TPGError, match="ODD blink"):
+        check_dc_balance(ImagePanScene(blink, sc.layers, sc.disp, grid=sc.grid))

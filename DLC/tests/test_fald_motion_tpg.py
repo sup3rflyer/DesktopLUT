@@ -7,7 +7,9 @@ import numpy as np
 import pytest
 
 from dlc.fald.motion import MovingShape, Scene, grey, render_full_patch
-from dlc.fald.motion_tpg import EXE_DEFAULT, scene_text
+from dlc.fald.motion_image import (PAN_DIR_DEFAULT, ImageLayer, ImagePanScene, from_array, from_pan_scene,
+                                   load_pan_scene, render_image_patch)
+from dlc.fald.motion_tpg import EXE_DEFAULT, render_offscreen, scene_text
 
 W, H = 480, 270
 
@@ -54,3 +56,118 @@ def test_tpg_counter_changes_with_the_present_number(tmp_path):
     x0, y0, h, n, _, _ = sc.digits
     plate = d[int(y0 - h / 8) - 1:int(y0 + h + h / 8) + 2, int(x0 - h / 8) - 1:]
     assert plate.max() > 5.0                                                # 8 -> 9: segments change
+
+
+# ---------------------------------------------------------------------------------------------- IMAGE scenes (2026-10-08)
+# The TPG's image layers against INDEPENDENT renders written here the way results/fald_slowpan_2026-10-06/pan_scenes.py
+# renders (2x canvas shifted by whole half pixels, stat * (1 - a) + mov per half-pixel cell, 2x2 mean; the 4K frame
+# shifted by whole pixels with its first column repeated). D3D converts the float32 result to FP16 toward zero: < 2^-10.
+FP16_REL = 1e-3
+
+
+def _check(got, want, tag):
+    err = np.abs(got - want) / np.maximum(want, 0.05)
+    assert err.max() < FP16_REL, (tag, float(err.max()), np.unravel_index(err.argmax(), err.shape))
+    # and exactly the FP16 conversion of the same value: within one FP16 step of round-to-nearest
+    a = (got / 80.0).astype(np.float16).view(np.int16).astype(np.int32)
+    b = (want / 80.0).astype(np.float16).view(np.int16).astype(np.int32)
+    assert np.abs(a - b).max() <= 1, (tag, int(np.abs(a - b).max()))
+
+
+def _canvas_scene():
+    """Grid 2 (half-pixel canvas): a per-row frame (clamp), a static viewport layer, a premultiplied grey + alpha
+    moving layer clipped to the viewport, half-pixel displacements both ways; camera aids on top."""
+    rng = np.random.default_rng(7)
+    view = (60, 40, 260, 150)                                         # screen px
+    rows = np.linspace(2.0, 400.0, H).astype(np.float32)
+    stat = rng.uniform(1.0, 300.0, size=(2 * (view[3] - view[1]), 2 * (view[2] - view[0]))).astype(np.float32)
+    al = np.clip(rng.uniform(-0.5, 1.5, size=(300, 600)), 0.0, 1.0).astype(np.float32)
+    mov = (rng.uniform(0.0, 1000.0, size=al.shape) * al).astype(np.float32)
+    origin = (40, 20)                                                 # screen px of the canvas at zero shift
+    v2 = tuple(2 * v for v in view)
+    layers = (ImageLayer(np.repeat(rows, 2)[:, None], 0, 0, False, "clamp"),
+              ImageLayer(stat, v2[0], v2[1], False, "border", v2),
+              ImageLayer(np.stack([mov, al], axis=2), 2 * origin[0], 2 * origin[1], True, "border", v2))
+    disp = ((0, 0), (0, 0), (1, 0), (2, 1), (3, -1), (7, 3), (-5, 5), (-5, 5))
+    base = Scene("canvas", (5.0, 5.0, 5.0), (), pre=2, move=5, post=1, sync=(10.0, 10.0, 20.0, 20.0, 10.0, 30.0),
+                 code=(10.0, 230.0, 8.0, 6, 2.0, 12.0), digits=(300.0, 240.0, 12.0, 3, 2.0, 12.0))
+    sc = ImagePanScene(base, layers, disp, grid=2)
+    return sc, dict(view=view, rows=rows, stat=stat, mov=mov, al=al, origin=origin)
+
+
+def _canvas_ref(sc, d, i):
+    """pan_scenes.PanScene.window_full's rule, written out: the frame rows outside the viewport, inside it
+    stat * (1 - a) + mov of the canvas shifted by whole half pixels, then the 2x2 mean; the aids on top."""
+    X0, Y0, X1, Y1 = d["view"]
+    hx, hy = sc.disp[i]
+    ox, oy = 2 * (X0 - d["origin"][0]) - hx, 2 * (Y0 - d["origin"][1]) - hy
+    H2, W2 = 2 * (Y1 - Y0), 2 * (X1 - X0)
+    m = d["mov"][oy:oy + H2, ox:ox + W2].astype(np.float64)
+    a = d["al"][oy:oy + H2, ox:ox + W2].astype(np.float64)
+    win = (d["stat"].astype(np.float64) * (1.0 - a) + m).reshape(H2 // 2, 2, W2 // 2, 2).mean(axis=(1, 3))
+    full = np.repeat(d["rows"].astype(np.float64)[:, None], W, axis=1)
+    full[Y0:Y1, X0:X1] = win
+    return render_full_patch(sc.base, i, 0, 0, W, H, base=np.broadcast_to(full, (3, H, W)).copy())
+
+
+def test_tpg_image_canvas_equals_the_pan_render():
+    sc, d = _canvas_scene()
+    frames = list(range(sc.frames))
+    got = render_offscreen(sc, frames, (W, H))
+    for i in frames:
+        want = _canvas_ref(sc, d, i)
+        np.testing.assert_allclose(render_image_patch(sc, i, 0, 0, W, H), want, rtol=1e-12, atol=1e-9)
+        _check(got[i], want, ("canvas", i, sc.disp[i]))
+
+
+def test_tpg_image_rgb_clamp_pan_with_crop():
+    rng = np.random.default_rng(11)
+    im = rng.uniform(0.0, 2000.0, size=(H, W, 3)).astype(np.float16)
+    sc = from_array(im, "rgbpan", n_move=6, steps=[(10, 0), (10, 0), (15, 0)], pre=2, hold=2, address="clamp",
+                    lead_in=1, lead_out=1, aids=False)
+    assert sc.cadence == (2,) and sc.frames == 1 + 2 + 6 + 1
+    assert [d[0] for d in sc.disp] == [0, 0, 0, 0, 10, 20, 35, 45, 55, 55]
+    x0, y0, w, h = 20, 50, 160, 90
+    got = render_offscreen(sc, range(sc.frames), (w, h), origin=(x0, y0))
+    f = im.astype(np.float64)
+    for k in range(sc.frames):
+        dx = sc.disp[k][0]
+        cols = np.maximum(np.arange(x0, x0 + w) - dx, 0)              # ImageScene: shift right, first column repeated
+        _check(got[k], f[y0:y0 + h][:, cols].transpose(2, 0, 1), ("rgb", k, dx))
+
+
+_HAVE_STUDY = (PAN_DIR_DEFAULT / "pan_sim.py").exists() and \
+    (PAN_DIR_DEFAULT.parent / "fald_slowpan_example_2026-10-06" / "frame_nits_rgb_f16.npy").exists()
+
+
+@pytest.mark.skipif(not _HAVE_STUDY, reason="slow-pan study (local results/) not present")
+def test_tpg_image_equals_the_slowpan_simulator():
+    """The study's own scenes through the TPG (WARP) vs the study's own renders: the anime 2:2 pan (whole-pixel steps
+    10/10/15, clamp strip) and the desktop / city viewport pans (2x canvas; desktop_h_v0.5 at half-pixel offsets)."""
+    lead = 3
+    an = load_pan_scene("anime_pan_2to2_r5")
+    sc = from_pan_scene(an, lead_in=lead, lead_out=2, aids=False)
+    assert sc.cadence == (2,) and sc.frames == lead + 72 + 2
+    im = np.load(an.path).astype(np.float64)
+    for c, (x0, y0, w, h) in ((0, (1440, 855, 640, 360)), (5, (1440, 855, 640, 360)), (71, (0, 950, 960, 270))):
+        k = c + lead
+        dx = an.dx_c(c)
+        assert sc.disp[k] == (dx, 0)
+        got = render_offscreen(sc, [k], (w, h), origin=(x0, y0))[k]
+        cols = np.maximum(np.arange(x0, x0 + w) - dx, 0)
+        _check(got, im[y0:y0 + h][:, cols].transpose(2, 0, 1), ("anime", c, dx))
+
+    for name, refreshes in (("desktop_h_v0.5", (5, 61)), ("desktop_h_v1", (40,)), ("city_h_v1", (57,))):
+        ps = load_pan_scene(name)
+        sc = from_pan_scene(ps, lead_in=lead, aids=False)
+        X0, Y0, X1, Y1 = ps.meta()["view"]
+        x0, y0, w, h = 1200, 700, 1000, 560                           # straddles the viewport's top-left corner
+        for i in refreshes:
+            k = i + lead
+            assert sc.disp[k] == tuple(ps.disp_half(i))
+            if name == "desktop_h_v0.5":
+                assert ps.disp_half(i)[0] % 2 == 1                    # a half-pixel offset
+            got = render_offscreen(sc, [k], (w, h), origin=(x0, y0))[k]
+            full = np.repeat(np.asarray(ps.frame_rows, np.float64)[y0:y0 + h, None], w, axis=1)
+            full[Y0 - y0:, X0 - x0:] = ps.window_full(i)[:h - (Y0 - y0), :w - (X0 - x0)]
+            _check(got, np.broadcast_to(full, (3, h, w)), (name, i, ps.disp_half(i)))

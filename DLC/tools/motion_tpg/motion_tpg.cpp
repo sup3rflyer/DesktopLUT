@@ -21,9 +21,17 @@
 //     reached the screen on) so the analysis knows the PRESENTED refresh index of every content frame (slips included);
 //   * optional camera aids in the scene: a SYNC patch that toggles lo/hi when the motion starts and ends, and a
 //     Gray-coded present counter (one cell changes per new frame) for frame identity in the video.
+//   * IMAGE scenes (2026-10-08, src/dlc/fald/motion_image.py): up to 4 linear-nits image LAYERS (raw little-endian
+//     float16 / float32 files, 1 / 2 / 3 / 4 channels = grey / grey+alpha / RGB / RGBA, premultiplied) on a GRID of S cells per screen pixel
+//     (S = 2 = the slow-pan study's half-pixel canvas). Moving layers are translated by an integer number of CELLS per
+//     content frame ("disp" list, one (dx, dy) per content frame). A screen pixel is the exact box average of its S x S
+//     cells, each cell composited bottom to top (c = c * (1 - a) + rgb) — read with Load(), no sampler, so the pixels
+//     equal results/fald_slowpan_2026-10-06/pan_scenes.py (2x canvas shift + 2x2 mean) and its full-frame ImageScene
+//     (integer shift, first column repeated = "clamp" addressing) exactly. Shapes / aids are drawn on top as before.
 //
 // Protocol: stdin lines, replies on stdout (one line each, flushed):
-//   load <path>        -> "ok load <name> shapes=<n> frames=<n>"   | "err ..."
+//   load <path>        -> "ok load <name> shapes=<n> frames=<n>[ layers=<n> grid=<S>]"   | "err ..."
+//                         (an IMAGE scene's layer files are read and uploaded here: load while parked, not mid-play)
 //   play [cycles] [lock] -> "ok play" now (lock: blinking shapes follow the TARGET REFRESH count, so a late frame
 //                         cannot shift a toggle's phase for the rest of the play), "done play <cycles> presents=<a>..<b>" when the last present was SUBMITTED (then
 //                         holds the last frame; the log says when each present reached the screen)
@@ -59,6 +67,9 @@
 using Microsoft::WRL::ComPtr;
 
 static const int MAX_SHAPES = 128;  // scene shapes + sync patch + code cells + readable counter
+static const int MAX_LAYERS = 4;    // image layers of an IMAGE scene
+static const int MAX_GRID = 8;      // cells per screen pixel
+static const int MAX_TEX = 16384;   // D3D11 texture dimension limit
 
 struct Shape {             // scene units = full-resolution panel pixels relative to the monitor's top-left
     int kind = 0;          // 0 rect, 1 disc
@@ -66,6 +77,15 @@ struct Shape {             // scene units = full-resolution panel pixels relativ
     double vx = 0, vy = 0;
     double r = 0, g = 0, bl = 0;            // linear nits per channel
     int blink = 0, blinkPhase = 0;          // > 0: shown for `blink` content frames, hidden for `blink`, … (motion.MovingShape)
+};
+
+struct Layer {              // one image layer of an IMAGE scene (grid cells; see the header)
+    int w = 0, h = 0, ch = 0; bool f16 = false;
+    int x = 0, y = 0;           // screen cell of texel (0, 0) at zero displacement
+    bool moving = false, clamp = false;
+    int clip[4] = {0, 0, 0, 0}; // screen-fixed cell rect [x0, x1) x [y0, y1); outside = transparent
+    std::vector<uint16_t> h16;  // expanded RGBA texels until the upload
+    std::vector<float> f32;
 };
 
 struct Scene {
@@ -77,6 +97,9 @@ struct Scene {
     bool hasSync = false; double sync[4] = {0, 0, 0, 0}; double syncLo = 0, syncHi = 0;
     bool hasCode = false; double codeX = 0, codeY = 0, codeCell = 0; int codeBits = 0; double codeLo = 0, codeHi = 0;
     bool hasDigits = false; double digX = 0, digY = 0, digH = 0; int digN = 0; double digLo = 0, digHi = 0;
+    int grid = 1;
+    std::vector<Layer> layers;
+    std::vector<int> dispX, dispY;   // per content frame, cells
     int frames() const { return pre + move + post; }
     double motionTime(int i) const { return (double)std::clamp(i - pre, 0, move); }
 };
@@ -85,15 +108,26 @@ struct alignas(16) CB {
     float bg[4];
     float origin[2]; float pxscale; float outscale;
     unsigned nshapes; unsigned sdr; float sdrWhite; float sdrInvGamma;
+    int nlayers; int grid; int disp[2];
+    int lsize[MAX_LAYERS][4];   // (w, h, moving, clamp)
+    int lorg[MAX_LAYERS][4];    // (x, y, -, -) cells
+    int lclip[MAX_LAYERS][4];   // (x0, y0, x1, y1) cells
     float shp[MAX_SHAPES][8];   // (kind, cx, cy, a) (b, R, G, B)
 };
 
 static const char* kHLSL = R"(
 #define MAX_SHAPES 128
+#define MAX_LAYERS 4
+#define MAX_CELLS 64
+Texture2D<float4> lay[MAX_LAYERS] : register(t0);
 cbuffer CB : register(b0) {
     float4 bg;
     float2 origin; float pxscale; float outscale;
     uint nshapes; uint sdr; float sdrWhite; float sdrInvGamma;
+    int nlayers; int grid; int2 disp;
+    int4 lsize[MAX_LAYERS];
+    int4 lorg[MAX_LAYERS];
+    int4 lclip[MAX_LAYERS];
     float4 shp[MAX_SHAPES * 2];
 };
 float4 VS(uint id : SV_VertexID) : SV_Position {
@@ -101,10 +135,44 @@ float4 VS(uint id : SV_VertexID) : SV_Position {
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float cov1(float lo, float hi, float p0, float p1) { return saturate((min(p1, hi) - max(p0, lo)) / (p1 - p0)); }
+// one grid cell: the surround, then every layer bottom to top (premultiplied over)
+float3 cellValue(int2 cell, float3 c) {
+    [unroll] for (int L = 0; L < MAX_LAYERS; ++L) {
+        if (L < nlayers) {
+            int4 cl = lclip[L];
+            if (all(cell >= cl.xy) && all(cell < cl.zw)) {
+                int4 sz = lsize[L];
+                int2 q = cell - lorg[L].xy - (sz.z != 0 ? disp : int2(0, 0));
+                bool inside = all(q >= 0) && all(q < sz.xy);
+                if (sz.w != 0) { q = clamp(q, int2(0, 0), sz.xy - 1); inside = true; }
+                if (inside) { float4 v = lay[L].Load(int3(q, 0)); c = c * (1.0 - v.a) + v.rgb; }
+            }
+        }
+    }
+    return c;
+}
+// the pixel [p0, p1) (scene px) = the exact area average of the composited cells it overlaps
+float3 imageValue(float2 p0, float2 p1, float3 c0) {
+    float S = (float)grid;
+    float2 g0 = p0 * S, g1 = p1 * S;
+    int2 j0 = (int2)floor(g0);
+    int2 j1 = min((int2)ceil(g1), j0 + MAX_CELLS);
+    float3 acc = 0; float wsum = 0;
+    [loop] for (int y = j0.y; y < j1.y; ++y) {
+        float wy = min((float)(y + 1), g1.y) - max((float)y, g0.y);
+        [loop] for (int x = j0.x; x < j1.x; ++x) {
+            float w = wy * (min((float)(x + 1), g1.x) - max((float)x, g0.x));
+            acc += w * cellValue(int2(x, y), c0);
+            wsum += w;
+        }
+    }
+    return acc / max(wsum, 1e-20);
+}
 float4 PS(float4 pos : SV_Position) : SV_Target {
     float2 p0 = origin + floor(pos.xy) * pxscale;          // this pixel = [p0, p0 + pxscale) in scene px
     float2 p1 = p0 + pxscale;
     float3 c = bg.rgb;
+    if (nlayers > 0) c = imageValue(p0, p1, c);
     [loop] for (uint i = 0; i < nshapes; ++i) {
         float4 s0 = shp[2 * i], s1 = shp[2 * i + 1];
         float cov;
@@ -134,6 +202,7 @@ struct Args {
     bool repeatPresents = false;
     double phaseMs = 5.0;     // present this long after the vblank: far from the DWM's latch (late latching ~3 ms before vblank)
     double sceneW = 3840.0;   // scene width the window shows (window smaller than this = a miniature test view)
+    double originX = 0, originY = 0;   // scene px at the window's top-left (--origin; offscreen crops)
     std::string log;
 };
 
@@ -200,8 +269,67 @@ static bool parseScene(const std::string& path, Scene& sc, std::string& err) {
         else if (k == "sync") { s.hasSync = true; ok = bool(is >> s.sync[0] >> s.sync[1] >> s.sync[2] >> s.sync[3] >> s.syncLo >> s.syncHi); }
         else if (k == "code") { s.hasCode = true; ok = bool(is >> s.codeX >> s.codeY >> s.codeCell >> s.codeBits >> s.codeLo >> s.codeHi); }
         else if (k == "digits") { s.hasDigits = true; ok = bool(is >> s.digX >> s.digY >> s.digH >> s.digN >> s.digLo >> s.digHi); }
+        else if (k == "grid") { ok = bool(is >> s.grid); }
+        else if (k == "disp") {   // (dx, dy) cell pairs, appended in content-frame order
+            int dx, dy; int n = 0;
+            while (is >> dx) { if (!(is >> dy)) { ok = false; break; } s.dispX.push_back(dx); s.dispY.push_back(dy); ++n; }
+            ok = ok && n > 0;
+        }
+        else if (k == "layer") {  // layer <w> <h> <ch> <f16|f32> <x> <y> <moving 0|1> <clamp|border> <cx0> <cy0> <cx1> <cy1> <path>
+            Layer L; std::string dt, addr; int mv = 0;
+            ok = bool(is >> L.w >> L.h >> L.ch >> dt >> L.x >> L.y >> mv >> addr >> L.clip[0] >> L.clip[1] >> L.clip[2] >> L.clip[3]);
+            std::string lpath; std::getline(is, lpath);
+            lpath.erase(0, std::min(lpath.find_first_not_of(" \t"), lpath.size()));
+            while (!lpath.empty() && (lpath.back() == ' ' || lpath.back() == '\t')) lpath.pop_back();
+            ok = ok && (dt == "f16" || dt == "f32") && (addr == "clamp" || addr == "border") && !lpath.empty()
+                    && L.w >= 1 && L.h >= 1 && L.w <= MAX_TEX && L.h <= MAX_TEX && (L.ch >= 1 && L.ch <= 4);
+            if (ok) {
+                L.f16 = dt == "f16"; L.moving = mv != 0; L.clamp = addr == "clamp";
+                const size_t n = (size_t)L.w * L.h, bytes = L.f16 ? 2 : 4;
+                std::ifstream bf(lpath, std::ios::binary | std::ios::ate);
+                if (!bf) { err = "line " + std::to_string(ln) + ": cannot open layer file " + lpath; return false; }
+                const size_t have = (size_t)bf.tellg();
+                if (have != n * L.ch * bytes) {
+                    err = "line " + std::to_string(ln) + ": layer file " + lpath + " has " + std::to_string(have) + " bytes, want "
+                          + std::to_string(n * L.ch * bytes);
+                    return false;
+                }
+                bf.seekg(0);
+                std::vector<char> raw(have);
+                if (!bf.read(raw.data(), (std::streamsize)have)) { err = "line " + std::to_string(ln) + ": read " + lpath; return false; }
+                // expand to RGBA (grey -> R=G=B, grey+alpha, RGB -> alpha 1, RGBA premultiplied)
+                if (L.f16) {
+                    const uint16_t* src = (const uint16_t*)raw.data(); L.h16.resize(n * 4);
+                    for (size_t p = 0; p < n; ++p) {
+                        uint16_t* d = &L.h16[4 * p];
+                        if (L.ch == 1) { d[0] = d[1] = d[2] = src[p]; d[3] = 0x3C00; }
+                        else if (L.ch == 2) { d[0] = d[1] = d[2] = src[2 * p]; d[3] = src[2 * p + 1]; }
+                        else if (L.ch == 3) { d[0] = src[3 * p]; d[1] = src[3 * p + 1]; d[2] = src[3 * p + 2]; d[3] = 0x3C00; }
+                        else memcpy(d, &src[4 * p], 8);
+                    }
+                } else {
+                    const float* src = (const float*)raw.data(); L.f32.resize(n * 4);
+                    for (size_t p = 0; p < n; ++p) {
+                        float* d = &L.f32[4 * p];
+                        if (L.ch == 1) { d[0] = d[1] = d[2] = src[p]; d[3] = 1.0f; }
+                        else if (L.ch == 2) { d[0] = d[1] = d[2] = src[2 * p]; d[3] = src[2 * p + 1]; }
+                        else if (L.ch == 3) { d[0] = src[3 * p]; d[1] = src[3 * p + 1]; d[2] = src[3 * p + 2]; d[3] = 1.0f; }
+                        else memcpy(d, &src[4 * p], 16);
+                    }
+                }
+                s.layers.push_back(std::move(L));
+            }
+        }
         else { err = "line " + std::to_string(ln) + ": unknown key " + k; return false; }
         if (!ok) { err = "line " + std::to_string(ln) + ": bad values for " + k; return false; }
+    }
+    if (!s.layers.empty() || !s.dispX.empty()) {
+        if (s.layers.empty() || (int)s.layers.size() > MAX_LAYERS) { err = "image scene: 1.." + std::to_string(MAX_LAYERS) + " layers"; return false; }
+        if (s.grid < 1 || s.grid > MAX_GRID) { err = "grid 1.." + std::to_string(MAX_GRID); return false; }
+        if ((int)s.dispX.size() != s.frames()) {
+            err = "image scene: disp has " + std::to_string(s.dispX.size()) + " frames, pre+move+post = " + std::to_string(s.frames());
+            return false;
+        }
     }
     for (int c : s.cadence) if (c < 1 || c > 4) { err = "cadence entries must be 1..4 (DXGI sync interval)"; return false; }
     if (s.pre < 0 || s.move < 0 || s.post < 0 || s.frames() < 1) { err = "pre/move/post"; return false; }
@@ -213,19 +341,60 @@ static bool parseScene(const std::string& path, Scene& sc, std::string& err) {
     return true;
 }
 
+// Upload an IMAGE scene's layers (immutable textures, read with Load()); frees the CPU copies. On failure `out` is empty.
+static bool uploadLayers(ID3D11Device* dev, Scene& s, std::vector<ComPtr<ID3D11ShaderResourceView>>& out, std::string& err) {
+    out.clear();
+    for (Layer& L : s.layers) {
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = L.w; td.Height = L.h; td.MipLevels = 1; td.ArraySize = 1; td.SampleDesc.Count = 1;
+        td.Format = L.f16 ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R32G32B32A32_FLOAT;
+        td.Usage = D3D11_USAGE_IMMUTABLE; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA sd{};
+        sd.pSysMem = L.f16 ? (const void*)L.h16.data() : (const void*)L.f32.data();
+        sd.SysMemPitch = (UINT)L.w * (L.f16 ? 8u : 16u);
+        ComPtr<ID3D11Texture2D> t;
+        HRESULT hr = dev->CreateTexture2D(&td, &sd, &t);
+        ComPtr<ID3D11ShaderResourceView> v;
+        if (SUCCEEDED(hr)) hr = dev->CreateShaderResourceView(t.Get(), nullptr, &v);
+        if (FAILED(hr)) {
+            char b[96]; snprintf(b, sizeof b, "layer texture %dx%d hr=0x%08lx", L.w, L.h, (unsigned long)hr);
+            err = b; out.clear(); return false;
+        }
+        out.push_back(v);
+        std::vector<uint16_t>().swap(L.h16); std::vector<float>().swap(L.f32);
+    }
+    return true;
+}
+
+static void bindLayers(ID3D11DeviceContext* ctx, const std::vector<ComPtr<ID3D11ShaderResourceView>>& srvs) {
+    ID3D11ShaderResourceView* v[MAX_LAYERS] = {};
+    for (size_t k = 0; k < srvs.size() && k < (size_t)MAX_LAYERS; ++k) v[k] = srvs[k].Get();
+    ctx->PSSetShaderResources(0, MAX_LAYERS, v);
+}
+
 // Fill the constant buffer for content frame i (or park when sc == nullptr). presentIdx = the Gray code's value.
 // lockRefresh >= 0: blinking shapes follow the REFRESH the frame is aimed at (play ... lock) instead of the content index
 static void fillCB(CB& cb, const Args& a, const Scene* sc, int i, unsigned long long presentIdx, double parkNits,
                    long long lockRefresh = -1) {
     memset(&cb, 0, sizeof cb);
     double pxs = a.sceneW / a.w;
-    cb.origin[0] = 0; cb.origin[1] = 0; cb.pxscale = (float)pxs; cb.outscale = 1.0f / 80.0f;
+    cb.origin[0] = (float)a.originX; cb.origin[1] = (float)a.originY; cb.pxscale = (float)pxs; cb.outscale = 1.0f / 80.0f;
     cb.sdr = a.hdr ? 0u : 1u; cb.sdrWhite = (float)a.sdrWhite; cb.sdrInvGamma = (float)(1.0 / a.sdrGamma);
     if (!sc) {
         for (int c = 0; c < 3; ++c) cb.bg[c] = (float)parkNits;
         return;
     }
     for (int c = 0; c < 3; ++c) cb.bg[c] = (float)sc->bg[c];
+    if (!sc->layers.empty()) {   // IMAGE scene: this content frame's displacement + the layer descriptors
+        const int k = std::clamp(i, 0, (int)sc->dispX.size() - 1);
+        cb.nlayers = (int)sc->layers.size(); cb.grid = sc->grid; cb.disp[0] = sc->dispX[k]; cb.disp[1] = sc->dispY[k];
+        for (int L = 0; L < cb.nlayers; ++L) {
+            const Layer& ly = sc->layers[L];
+            cb.lsize[L][0] = ly.w; cb.lsize[L][1] = ly.h; cb.lsize[L][2] = ly.moving ? 1 : 0; cb.lsize[L][3] = ly.clamp ? 1 : 0;
+            cb.lorg[L][0] = ly.x; cb.lorg[L][1] = ly.y;
+            for (int q = 0; q < 4; ++q) cb.lclip[L][q] = ly.clip[q];
+        }
+    }
     double t = sc->motionTime(i);
     unsigned n = 0;
     auto put = [&](int kind, double cx, double cy, double aa, double bb, double r, double g, double b) {
@@ -302,6 +471,7 @@ static HRESULT compileShaders(ID3D11Device* dev, ComPtr<ID3D11VertexShader>& vs,
 // shader / constant-buffer path and write them out, so a test can compare the TPG's pixels with the simulator's coverage
 // (tests/test_fald_motion_tpg.py). --warp uses the WARP software rasteriser (deterministic, no GPU needed).
 // Commands: load <path> | dump <content_index> <present_number> <out.f16 path>  (RGBA float16 rows, top to bottom) | quit
+// --origin x,y = the scene px at the texture's top-left (a crop of a full-screen scene; also honoured on screen).
 static int offscreenMain(const Args& a, bool warp) {
     ComPtr<ID3D11Device> dev; ComPtr<ID3D11DeviceContext> ctx;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
@@ -323,6 +493,7 @@ static int offscreenMain(const Args& a, bool warp) {
     ComPtr<ID3D11Buffer> cbuf; if (FAILED(hr = dev->CreateBuffer(&bd, nullptr, &cbuf))) return fail("CreateBuffer", hr);
     reply(std::string("ready offscreen ") + (warp ? "warp" : "hardware"));
     Scene scene; bool have = false;
+    std::vector<ComPtr<ID3D11ShaderResourceView>> layerSrv;
     std::string line;
     char buf[4096];
     while (fgets(buf, sizeof buf, stdin)) {
@@ -332,7 +503,10 @@ static int offscreenMain(const Args& a, bool warp) {
         if (k == "quit") { reply("ok quit"); break; }
         if (k == "load") {
             std::string path; std::getline(is, path); path.erase(0, path.find_first_not_of(' '));
-            Scene s; if (parseScene(path, s, err)) { scene = std::move(s); have = true; reply("ok load " + scene.name); } else reply("err load: " + err);
+            Scene s; std::vector<ComPtr<ID3D11ShaderResourceView>> srv;
+            if (parseScene(path, s, err) && uploadLayers(dev.Get(), s, srv, err)) {
+                scene = std::move(s); layerSrv = std::move(srv); have = true; reply("ok load " + scene.name);
+            } else reply("err load: " + err);
         } else if (k == "dump") {
             int i = 0; unsigned long long pn = 0; std::string out;
             if (!(is >> i >> pn) || !have) { reply("err dump: dump <content_index> <present> <path> after load"); continue; }
@@ -344,6 +518,7 @@ static int offscreenMain(const Args& a, bool warp) {
             ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             ctx->VSSetShader(vs.Get(), nullptr, 0); ctx->PSSetShader(ps.Get(), nullptr, 0);
             ctx->PSSetConstantBuffers(0, 1, cbuf.GetAddressOf());
+            bindLayers(ctx.Get(), layerSrv);
             ctx->Draw(3, 0);
             ctx->CopyResource(staging.Get(), rt.Get());
             D3D11_MAPPED_SUBRESOURCE m{};
@@ -374,6 +549,7 @@ int main(int argc, char** argv) {
         else if (s == "--repeat-presents") a.repeatPresents = true;
         else if (s == "--phase-ms") a.phaseMs = atof(next().c_str());
         else if (s == "--scene-width") a.sceneW = atof(next().c_str());
+        else if (s == "--origin") { std::string v = next(); if (sscanf_s(v.c_str(), "%lf,%lf", &a.originX, &a.originY) != 2) { reply("fatal --origin x,y"); return 2; } }
         else if (s == "--log") a.log = next();
         else if (s == "--offscreen") offscreen = true;
         else if (s == "--warp") warp = true;
@@ -476,6 +652,7 @@ int main(int argc, char** argv) {
     fprintf(logf, "# qpcfreq=%lld refresh=%.3f output_hdr=%d\n", qf.QuadPart, refreshHz, outHdr ? 1 : 0);
 
     Scene scene; bool haveScene = false;
+    std::vector<ComPtr<ID3D11ShaderResourceView>> layerSrv;   // the loaded IMAGE scene's layers
     double parkNits = a.park;
     // PARK = uniform grey (start, after load, after park); PLAY = the scene runs; HOLD = a finished play keeps its last frame
     enum { PARK, PLAY, HOLD } state = PARK;
@@ -597,11 +774,13 @@ int main(int argc, char** argv) {
             if (k == "load") {
                 std::string path; std::getline(is, path);
                 path.erase(0, path.find_first_not_of(' '));
-                std::string err; Scene s;
+                std::string err; Scene s; std::vector<ComPtr<ID3D11ShaderResourceView>> srv;
                 if (state == PLAY) reply("err load: playing");
-                else if (parseScene(path, s, err)) {
-                    scene = std::move(s); haveScene = true; state = PARK;
-                    reply("ok load " + scene.name + " shapes=" + std::to_string(scene.shapes.size()) + " frames=" + std::to_string(scene.frames()));
+                else if (parseScene(path, s, err) && uploadLayers(dev.Get(), s, srv, err)) {
+                    scene = std::move(s); layerSrv = std::move(srv); haveScene = true; state = PARK;
+                    std::string r = "ok load " + scene.name + " shapes=" + std::to_string(scene.shapes.size()) + " frames=" + std::to_string(scene.frames());
+                    if (!scene.layers.empty()) r += " layers=" + std::to_string(scene.layers.size()) + " grid=" + std::to_string(scene.grid);
+                    reply(r);
                 } else reply("err load: " + err);
             } else if (k == "play") {
                 int n = 1; is >> n;
@@ -665,6 +844,7 @@ int main(int argc, char** argv) {
         ctx->VSSetShader(vs.Get(), nullptr, 0);
         ctx->PSSetShader(ps.Get(), nullptr, 0);
         ctx->PSSetConstantBuffers(0, 1, cbuf.GetAddressOf());
+        bindLayers(ctx.Get(), layerSrv);
         ctx->Draw(3, 0);
 
         LARGE_INTEGER q; QueryPerformanceCounter(&q);

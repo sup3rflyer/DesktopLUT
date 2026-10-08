@@ -237,13 +237,15 @@ def coverage(s: MovingShape, t: float, x0: int, y0: int, nx: int, ny: int) -> np
     raise ValueError(f"unknown shape kind {s.kind!r}")
 
 
-def render_full_patch(scene: Scene, i: int, x0: int, y0: int, nx: int, ny: int) -> np.ndarray:
+def render_full_patch(scene: Scene, i: int, x0: int, y0: int, nx: int, ny: int,
+                      base: Optional[np.ndarray] = None) -> np.ndarray:
     """(3, ny, nx) linear nits of content frame ``i`` over a full-resolution window: the background, then every shape
     painted in order with its coverage (``out = out·(1 − cov) + nits·cov``), then the camera aids — the TPG's order and
-    formulas exactly (``tests/test_fald_motion_tpg.py`` compares the two pixel for pixel)."""
+    formulas exactly (``tests/test_fald_motion_tpg.py`` compares the two pixel for pixel). ``base`` (3, ny, nx): start
+    from this frame instead of the flat background (an IMAGE scene's layers, :mod:`dlc.fald.motion_image`)."""
     t = scene.motion_time(i)
     out = np.empty((3, ny, nx), dtype=np.float64)
-    out[:] = np.asarray(scene.bg, dtype=np.float64)[:, None, None]
+    out[:] = np.asarray(scene.bg, dtype=np.float64)[:, None, None] if base is None else base
     for s in scene.shapes:
         if not s.visible(i):
             continue

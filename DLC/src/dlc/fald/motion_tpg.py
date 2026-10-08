@@ -7,6 +7,10 @@ with DXGI's frame statistics: :func:`presented_schedule` turns that log into the
 reached the screen on — slips included, and the refresh index whose parity the panel's dimming tick is locked to
 (stage 3 needs it; ``fald-model-current.md`` §6.1 item 5).
 
+IMAGE scenes (:class:`dlc.fald.motion_image.ImagePanScene`, 2026-10-08): a real linear-nits image panned by whole grid
+cells per content frame (the slow-pan study's stimuli) — same pacing, aids and present log; :func:`render_offscreen`
+renders any scene's frames on WARP without a window (parity tests, pre-flight checks).
+
 Display hygiene (FALD probe rules): the TPG parks on a dim uniform grey (``park_nits``, default 2) whenever it is not
 playing; start and end parked. It covers its rect TOP-MOST — on the PA32UCXR (monitor 0, the owner's MAIN display) that
 is the owner's working screen: a hardware session is the owner's call, not a background step.
@@ -30,6 +34,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence
+
+import numpy as np
 
 from .motion import Scene
 
@@ -101,6 +107,64 @@ def dc_unbalanced_shapes(scene: Scene) -> list[int]:
         if total and abs(on[0] - on[1]) > max(2, DC_IMBALANCE_MAX * total):
             bad.append(k)
     return bad
+
+
+def check_dc_balance(scene) -> None:
+    """Raise :class:`TPGError` for a stimulus that would drive an LCD with a net DC component: an odd / off-balance
+    blink (:func:`dc_unbalanced_shapes`), or — for an IMAGE scene — a pixel locked to one cell polarity over a play
+    (:func:`dlc.fald.motion_image.dc_image_imbalance`; e.g. a 2-px stripe panned 1 px per refresh under hold 1). No
+    override: fix the stimulus (even holds / blinks, another speed)."""
+    from .motion_image import ImagePanScene, dc_image_imbalance
+    base = scene.base if isinstance(scene, ImagePanScene) else scene
+    bad = dc_unbalanced_shapes(base)
+    if bad:
+        raise TPGError(f"scene {scene.name!r}: blinking shape(s) {bad} with an ODD blink period — an LCD inverts the "
+                       "cell polarity every frame, so an odd-period toggle is bright on one polarity more than the "
+                       "other: a net DC drive that leaves IMAGE STICKING (2026-10-05: blink 1 at 1000 nit left a "
+                       "flickering square on the PA32UCXR that survived a power cycle). Use an EVEN blink period.")
+    if isinstance(scene, ImagePanScene):
+        r = dc_image_imbalance(scene)
+        if r["excess"] > 1.0:
+            raise TPGError(f"image scene {scene.name!r}: pixel {r['worst']} carries {100 * r['bias']:.0f} % of its peak "
+                           f"on one cell polarity over a play ({r['excess']:.1f}x the allowance: content toggling at "
+                           "refresh / 2 under an odd hold) — a net DC drive that leaves IMAGE STICKING. Use an even "
+                           "hold or another pan speed.")
+
+
+def render_offscreen(scene, frames: Sequence[int], size: Sequence[int], origin: Sequence[float] = (0.0, 0.0),
+                     scene_width: Optional[float] = None, warp: bool = True, exe: Optional[Path] = None,
+                     presents: Optional[Sequence[int]] = None, timeout: float = 600.0) -> dict:
+    """Render content frames of ``scene`` (a :class:`Scene` or an ``ImagePanScene``) WITHOUT a window or swapchain:
+    the TPG's ``--offscreen`` mode (``warp``: the WARP software rasteriser — deterministic, no GPU, no monitor) over a
+    ``size`` = (w, h) window whose top-left is scene px ``origin`` (``scene_width`` scene px across it; default w =
+    full resolution). Returns {frame: (3, h, w) linear nits} (the HDR path: scRGB FP16 × 80). ``presents``: the
+    counter value per frame (default frame + 1, as the simulator's aids)."""
+    from .motion_image import ImagePanScene, write_tpg_files
+    exe = Path(exe) if exe else EXE_DEFAULT
+    if not exe.exists():
+        raise TPGError(f"{exe} not built (run tools/motion_tpg/build.cmd)")
+    w, h = (int(v) for v in size)
+    frames = [int(i) for i in frames]
+    presents = [i + 1 for i in frames] if presents is None else [int(p) for p in presents]
+    with tempfile.TemporaryDirectory(prefix="motion_tpg_off_") as td:
+        td = Path(td)
+        if isinstance(scene, ImagePanScene):
+            sc_file = write_tpg_files(scene, td)
+        else:
+            sc_file = td / "s.scene"
+            sc_file.write_text(scene_text(scene), encoding="ascii")
+        cmds = [f"load {sc_file}"] + [f"dump {i} {p} {td / f'f{n}.f16'}" for n, (i, p) in enumerate(zip(frames, presents))]
+        args = [str(exe), "--rect", f"0,0,{w},{h}", "--scene-width", f"{float(scene_width or w):.6f}",
+                "--origin", f"{float(origin[0]):.6f},{float(origin[1]):.6f}", "--offscreen"]
+        args += ["--warp"] if warp else []
+        r = subprocess.run(args, input="\n".join(cmds + ["quit"]) + "\n", capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0 or "ok load" not in r.stdout or r.stdout.count("ok dump") != len(frames):
+            raise TPGError(f"offscreen render failed: {r.stdout.strip()} {r.stderr.strip()}")
+        out = {}
+        for n, i in enumerate(frames):
+            raw = np.fromfile(td / f"f{n}.f16", dtype=np.float16).reshape(h, w, 4)[..., :3]
+            out[i] = raw.astype(np.float64).transpose(2, 0, 1) * 80.0
+    return out
 
 
 class MotionTPG:
@@ -194,13 +258,15 @@ class MotionTPG:
         self.close()
 
     # ------------------------------------------------------------------ commands
-    def load(self, scene: Scene) -> str:
-        bad = dc_unbalanced_shapes(scene)
-        if bad:
-            raise TPGError(f"scene {scene.name!r}: blinking shape(s) {bad} with an ODD blink period — an LCD inverts the "
-                           "cell polarity every frame, so an odd-period toggle is bright on one polarity more than the "
-                           "other: a net DC drive that leaves IMAGE STICKING (2026-10-05: blink 1 at 1000 nit left a "
-                           "flickering square on the PA32UCXR that survived a power cycle). Use an EVEN blink period.")
+    def load(self, scene) -> str:
+        """Load a :class:`dlc.fald.motion.Scene` or a :class:`dlc.fald.motion_image.ImagePanScene` (its layer files are
+        written to the client's temp dir and uploaded by the TPG — load while parked). Refuses LCD DC-unbalanced
+        stimuli (:func:`check_dc_balance`)."""
+        check_dc_balance(scene)
+        from .motion_image import ImagePanScene, write_tpg_files
+        if isinstance(scene, ImagePanScene):
+            path = write_tpg_files(scene, Path(self._tmp.name) / "image")
+            return self.send(f"load {path}", timeout=120.0)
         path = Path(self._tmp.name) / f"{scene.name}.scene"
         path.write_text(scene_text(scene), encoding="ascii")
         return self.send(f"load {path}")
