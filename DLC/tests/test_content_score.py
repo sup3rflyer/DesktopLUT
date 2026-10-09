@@ -219,7 +219,9 @@ def test_recorded_d1_run_reproduces_the_study_score():
     assert res["signals_with_no_content_within_reach"] == ref["patches_with_no_content_within_reach"]
     # the near-black reads that carry the number are visible as weak evidence
     assert res["evidence"]["at_floor"]["score_share_pct"] > 40.0
-    assert got["headline"]["score"] == 1.68
+    # the headline is the black-aware score by default (dlc.black_aware: the raw stage's native floor); the raw
+    # study number rides beside it
+    assert got["headline"]["black_aware"] is True and got["headline"]["score_raw"] == 1.68
 
 
 def test_noise_aware_variant_flags_noise_limited_signals_and_corrects_in_quadrature():
