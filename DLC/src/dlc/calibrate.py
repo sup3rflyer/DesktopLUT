@@ -388,6 +388,7 @@ class Calibration:
         verify_patches_file: Optional[Path] = None,
         verify_patches_order: Optional[str] = None,
         content_distribution: Optional[Sequence[str]] = None,
+        score_black_floor_nits: Optional[float] = None,
         preheat: Optional[str] = None,
         present_stall: Optional[str] = None,
         refine_cube: Optional[str] = None,
@@ -520,6 +521,9 @@ class Calibration:
             # computed against (--content-distribution PATH[#VARIANT]; else the profile's key). Evidence only.
             ("content_distribution",
              [_content_spec_resolved(c) for c in content_distribution] if content_distribution else None),
+            # HDR verify: the display floor (nit) of the content-weighted score's BLACK-AWARE variant
+            # (--score-black-floor-nits; else the DIP's native black). Evidence only (dlc.black_aware).
+            ("score_black_floor_nits", _black_floor_arg(score_black_floor_nits)),
             # refine-mhc: which 3D LUT the re-refined MHC keeps — the source run's build (default) or
             # the cube INSTALLED now (a later 3dlut-only run over the same MHC lineage).
             ("refine_cube", str(refine_cube).strip().lower() if refine_cube is not None else None),
@@ -9052,6 +9056,29 @@ class Calibration:
                       noise_floor_source="DIP noise_floor_nits (single reads below are noise-dominated)")
         return metrics_mod.ReadEvidence(**kw)
 
+    def _score_black_floor(self) -> Any:
+        """The display floor of the content-weighted score's BLACK-AWARE variant (:mod:`dlc.black_aware`, HDR,
+        evidence only). The order:
+
+        1. ``--score-black-floor-nits`` (memoised);
+        2. else the DIP's ``native_black_nits`` (characterize's full-field black read);
+        3. else unavailable.
+
+        NOT the DIP ``noise_floor_nits`` (the meter's trust floor), and never the verify's own reads (circular).
+        The BT.2390 source white is the run's resolved target peak."""
+        from . import black_aware
+
+        dip = self._dip()
+        recorded = getattr(dip, "native_black_nits", None) if dip is not None else None
+        made = getattr(dip, "made", None) if dip is not None else None
+        when = f", made {made}" if made else ""
+        return black_aware.resolve_black_floor(
+            explicit=self.calib.get("score_black_floor_nits"),
+            explicit_source="explicit option (--score-black-floor-nits)",
+            recorded=recorded,
+            recorded_source=f"DIP native_black_nits (characterize's full-field black read{when})",
+            peak_nits=self._hdr_target().peak_nits)
+
     def _content_practical_kwargs(self, verify_ti3: str, metrics: Sequence[Any]) -> tuple[dict[str, Any], list]:
         """The ``practical_summary`` content kwargs for this verify (empty without weights / a
         distribution) + distribution load errors. Never raises (evidence only)."""
@@ -9065,6 +9092,14 @@ class Calibration:
             wx, wy = self._white_xy()
             kw = {"content_weights": weights, "content": contents or None, "white_xy": (wx, wy),
                   "read_evidence": self._verify_read_evidence(verify_ti3, metrics)}
+            if self._spec().is_hdr:
+                try:
+                    kw["black_floor"] = self._score_black_floor()
+                except Exception as exc:  # noqa: BLE001 - the black-aware variant must never cost the block
+                    from .black_aware import BlackFloor
+
+                    kw["black_floor"] = BlackFloor(None, f"unavailable: floor resolution failed "
+                                                         f"({type(exc).__name__}: {exc})")
         except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
             errors = list(errors) + [{"error": f"content inputs failed ({type(exc).__name__}: {exc})"}]
         return kw, errors
@@ -10061,6 +10096,19 @@ def _content_spec_resolved(spec: Any) -> str:
     return str(Path(path).resolve()) + (f"#{variant}" if variant else "")
 
 
+def _black_floor_arg(value: Optional[float]) -> Optional[float]:
+    """``--score-black-floor-nits`` validated: a finite, non-negative luminance (nit), or ``None``."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        f = float("nan")
+    if not math.isfinite(f) or f < 0.0:
+        raise ValueError(f"score_black_floor_nits must be a finite, non-negative luminance (nit), got {value!r}")
+    return f
+
+
 def _content_lead_text(digest: Mapping[str, Any]) -> str:
     """The seam question's lead: the content-weighted score + its coverage gap, labelled (evidence the
     LLM weighs — never a gate). Empty without one."""
@@ -10070,11 +10118,17 @@ def _content_lead_text(digest: Mapping[str, Any]) -> str:
     gap = lead.get("coverage_gap_pct")
     weak = lead.get("weak_evidence_score_share_pct")
     bc = lead.get("score_bias_corrected")
+    raw = lead.get("score_raw") if lead.get("black_aware") else None
     return (f"{lead.get('label')} {lead['score']}"
+            + (f" [raw {raw}]" if raw is not None else "")
             + (f" [noise bias-corrected variant {bc}]" if bc is not None and bc != lead["score"] else "")
             + (f" (coverage gap {gap} % of content with no patch within R)" if gap is not None else "")
             + (f", {weak} % of it resting on weak reads (single / at the meter floor / low-SNR)"
                if weak is not None else "") + "; ")
+
+
+def _html_text(v: Any) -> str:
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> str:
@@ -10082,6 +10136,7 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
     (labelled with the class and R), the practical zones underneath. Evidence — no gate reads it."""
     practical = practical or {}
     cw = practical.get("content_weighted") or {}
+    black = cw.get("black_aware") or {}
     rows: list[str] = []
     for name, res in (cw.get("classes") or {}).items():
         if res.get("score") is None:
@@ -10097,6 +10152,14 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
                     + (f" · {weak} % of the score on weak reads" if weak is not None else "")
                     + (f" · noise bias-corrected variant {bc} ({nl} % of content noise-limited)"
                        if bc is not None else "") + "</td></tr>")
+        ba = res.get("black_aware") or {}
+        if ba.get("score") is not None:
+            toe = (ba.get("vs_toe_point") or {}).get("score")
+            rows.append(f"<tr><td><b>Content-weighted {de} — {name}, BLACK-AWARE</b> (display floor "
+                        f"{black.get('floor_nits')} nit from {_html_text(black.get('floor_source'))})</td>"
+                        f"<td><b>{ba.get('score')}</b> (raw {res.get('score')}) · nearest-patch fallback "
+                        f"{ba.get('score_with_nearest_fallback')}"
+                        + (f" · literal BT.2390-point variant {toe}" if toe is not None else "") + "</td></tr>")
     pw = cw.get("patch_weights") or {}
     if pw.get("score") is not None:
         weak = (pw.get("score_share") or {}).get("weak")
@@ -10107,7 +10170,18 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
                     + (f" · {round(100 * weak, 1)} % of the score on weak reads" if weak is not None else "")
                     + (f" · noise bias-corrected variant {pw.get('score_bias_corrected')}"
                        if pw.get("score_bias_corrected") is not None else "")
+                    + (f" · BLACK-AWARE {pw.get('score_black_aware')}"
+                       if pw.get("score_black_aware") is not None else "")
                     + "</td></tr>")
+    fl = black.get("floor_limited") or {}
+    if (fl.get("raw") or {}).get("n"):
+        raw_b, ba_b = fl["raw"], fl.get("black_aware") or {}
+        rows.append(f"<tr><td>Floor-limited signals ({_html_text(black.get('floor_limited_rule'))})</td><td>raw avg "
+                    f"{raw_b.get('avg')} · max {raw_b.get('max')} → black-aware avg {ba_b.get('avg')} · max "
+                    f"{ba_b.get('max')} (n {raw_b.get('n')}; evidence only — the zones below are unchanged)</td></tr>")
+    elif black and not black.get("applied"):
+        rows.append(f"<tr><td>Black-aware score</td><td class='muted'>not applied: "
+                    f"{_html_text(black.get('reason'))}</td></tr>")
     per = practical.get("per_signal") or {}
     zones = per if (per.get("core") or {}).get("n") else practical
     for zone, label in (("core", "core (Rec.709 ≤ ref-white)"), ("limits", "limits"),
@@ -10272,6 +10346,7 @@ def run_calibration(
     verify_patches_file: Optional[Path] = None,
     verify_patches_order: Optional[str] = None,
     content_distribution: Optional[Sequence[str]] = None,
+    score_black_floor_nits: Optional[float] = None,
     preheat: Optional[str] = None,
     present_stall: Optional[str] = None,
     content_mode: Optional[str] = None,
@@ -10292,8 +10367,8 @@ def run_calibration(
         mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run,
         verify_cube=verify_cube, verify_patches_from=verify_patches_from,
         verify_patches_file=verify_patches_file, verify_patches_order=verify_patches_order,
-        content_distribution=content_distribution, preheat=preheat,
-        present_stall=present_stall, content_mode=content_mode, keep_layers=keep_layers)
+        content_distribution=content_distribution, score_black_floor_nits=score_black_floor_nits,
+        preheat=preheat, present_stall=present_stall, content_mode=content_mode, keep_layers=keep_layers)
     return calib.run(flow)
 
 
@@ -10379,6 +10454,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "score is computed against (kernel score + coverage gap at R=20 dE_ITP, per class; "
                              "repeatable). Default: the profile's content_distribution key for the content mode. "
                              "Evidence only — it leads the practical block; no gate reads it")
+    parser.add_argument("--score-black-floor-nits", type=float, default=None, dest="score_black_floor_nits",
+                        metavar="NITS",
+                        help="HDR verify: the display black (nit) of the content-weighted score's BLACK-AWARE "
+                             "variant. Near-black targets are scored against the BT.2390 EETF black lift to this "
+                             "floor, as a panel limit like out-of-gamut colours; the raw score stays recorded. "
+                             "Default: the DIP's characterized native black. That is a FULL-FIELD black read, "
+                             "which understates the in-content floor on local-dimming panels (PA32UCXR: 0). "
+                             "Evidence only: no calibration target, cube or gate changes")
     parser.add_argument("--preheat", choices=("auto", "always", "never"), default=None, dest="preheat",
                         help="thermal preheat policy for every measure stage (the closed-loop soak before "
                              "the main pass). auto (default = today's behaviour): soak any characterized "
@@ -11090,6 +11173,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             verify_patches_file=args.verify_patches_file,
                             verify_patches_order=args.verify_patches_order,
                             content_distribution=args.content_distribution,
+                            score_black_floor_nits=args.score_black_floor_nits,
                             preheat=args.preheat,
                             present_stall=args.present_stall,
                             refine_cube=args.refine_cube,

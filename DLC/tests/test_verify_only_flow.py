@@ -1233,6 +1233,33 @@ def test_content_distribution_scores_any_verify_from_the_profile(tmp_path: Path)
     assert cw["headline"]["class"] == "profile_class" and "patch_weights" not in cw
 
 
+def test_an_hdr_verify_carries_the_black_aware_score_at_a_stated_floor(tmp_path: Path):
+    """``--score-black-floor-nits`` on an HDR verify. The content-weighted block also scores near black against
+    the floor as a panel limit (dlc.black_aware): its headline is black-aware, the raw score is kept, and
+    the gate's view is untouched."""
+    from dlc.metrics import practical_gate_view
+    from dlc.stages.simulate import write_synthetic_content_json
+
+    content = write_synthetic_content_json(tmp_path / "content.json", name="black_class")
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, mode="HDR", cube=_cube(tmp_path / "hdr_installed.cube"))
+    calib = _make(tmp_path, "vo_hdr_black", mode="HDR", controller=ctrl, bit_depth=10,
+                  content_distribution=[str(content)], score_black_floor_nits=0.005)
+    assert calib.run("verify-only").status == "completed"
+    assert calib.calib["score_black_floor_nits"] == 0.005
+    verify = calib.calib["stages"]["verify"]["digest"]
+    cw = verify["practical"]["content_weighted"]
+    block = cw["black_aware"]
+    assert block["applied"] and block["floor_nits"] == 0.005
+    assert block["floor_source"] == "explicit option (--score-black-floor-nits)"
+    assert block["source_white_nits"] == calib.calib["hdr_target"]["peak_nits"]
+    res = cw["classes"]["black_class"]
+    head = verify["content_weighted"]                                    # the digest LEADS with it
+    assert head["black_aware"] is True and head["score"] == res["black_aware"]["score"]
+    assert head["score_raw"] == res["score"]
+    assert "core" in practical_gate_view(verify["practical"]) and "black_aware" not in verify["practical"]["core"]
+
+
 def test_a_missing_content_distribution_is_reported_not_fatal(tmp_path: Path):
     ctrl = CalibrationController.mock()
     _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
