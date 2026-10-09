@@ -522,7 +522,8 @@ class Calibration:
             ("content_distribution",
              [_content_spec_resolved(c) for c in content_distribution] if content_distribution else None),
             # HDR verify: the display floor (nit) of the content-weighted score's BLACK-AWARE variant
-            # (--score-black-floor-nits; else the DIP's native black). Evidence only (dlc.black_aware).
+            # (--score-black-floor-nits; else a raw stage's native near-black floor, else the DIP's native
+            # black). Evidence only (dlc.black_aware).
             ("score_black_floor_nits", _black_floor_arg(score_black_floor_nits)),
             # refine-mhc: which 3D LUT the re-refined MHC keeps — the source run's build (default) or
             # the cube INSTALLED now (a later 3dlut-only run over the same MHC lineage).
@@ -9061,23 +9062,84 @@ class Calibration:
         evidence only). The order:
 
         1. ``--score-black-floor-nits`` (memoised);
-        2. else the DIP's ``native_black_nits`` (characterize's full-field black read);
-        3. else unavailable.
+        2. else the NATIVE near-black floor fitted from a raw stage (:func:`dlc.black_aware.fit_native_floor`):
+           this run's own ``measure:raw`` when it measured one, then the installed stack's training run's
+           (:meth:`_raw_floor_fits`);
+        3. else the DIP's ``native_black_nits`` (characterize's full-field black read);
+        4. else unavailable.
 
         NOT the DIP ``noise_floor_nits`` (the meter's trust floor), and never the verify's own reads (circular).
         The BT.2390 source white is the run's resolved target peak."""
         from . import black_aware
 
+        explicit = self.calib.get("score_black_floor_nits")
         dip = self._dip()
         recorded = getattr(dip, "native_black_nits", None) if dip is not None else None
         made = getattr(dip, "made", None) if dip is not None else None
         when = f", made {made}" if made else ""
         return black_aware.resolve_black_floor(
-            explicit=self.calib.get("score_black_floor_nits"),
+            explicit=explicit,
             explicit_source="explicit option (--score-black-floor-nits)",
+            raw=self._raw_floor_fits() if explicit is None else (),
             recorded=recorded,
             recorded_source=f"DIP native_black_nits (characterize's full-field black read{when})",
             peak_nits=self._hdr_target().peak_nits)
+
+    def _raw_floor_fits(self) -> list[Any]:
+        """The raw-stage native floor candidates, in order (:mod:`dlc.black_aware`, evidence only):
+
+        1. this run's own ``measure:raw`` stage, when it measured one (``full`` / ``mhc-only``);
+        2. the installed stack's TRAINING run: the ``--verify-patches-from`` source, else the stack registry's
+           record of the applying run (:meth:`_verify_file_training_run`);
+        3. the registry's applying run (the run that built the installed MHC and measured its raw ramp) when
+           it differs from 2, e.g. a ``3dlut-only`` training run, which measures no raw.
+
+        The list stops at the first usable fit. A raw stage measures the NATIVE panel (identity MHC, no cube)
+        separately from the verify, so its near-black greys are a non-circular floor source. Never raises:
+        each refusal says why."""
+        from . import black_aware
+
+        fits: list[Any] = []
+        own = (self.calib.get("stages") or {}).get("measure:raw") or {}
+        if own:
+            ti3 = (own.get("data") or {}).get("ti3")
+            if own.get("status") == "done" and ti3 and Path(str(ti3)).is_file():
+                fits.append(black_aware.raw_floor_from_ti3(Path(str(ti3)), run_name=self.ctx.root.name,
+                                                           role="this run's raw stage"))
+            else:
+                fits.append(black_aware.RawFloorFit(None, f"raw run {self.ctx.root.name} (this run's raw stage)",
+                                                    f"this run's raw stage is not usable (status "
+                                                    f"{own.get('status')!r}, ti3 {ti3!r})"))
+            if fits[-1].available:
+                return fits
+        try:
+            root, why = self._verify_file_training_run()
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            root, why = None, f"training run lookup failed ({type(exc).__name__})"
+        candidates: list[tuple[Path, str]] = [(root, "the installed stack's training run")] if root else []
+        try:
+            rec = stack_registry.StackRegistry.load(
+                stack_registry.registry_path(self.profile, self.ctx.root)).get(self.display.name, self.mode)
+        except Exception:  # noqa: BLE001 - evidence only
+            rec = None
+        if rec is not None and rec.run_id:
+            for cand in (self.ctx.root.parent / rec.run_id, runs_dir() / rec.run_id):
+                if (cand / "dlc_state.json").is_file():
+                    candidates.append((cand, "the installed MHC's applying run"))
+                    break
+        if not candidates:
+            fits.append(black_aware.RawFloorFit(None, "the installed stack's training run",
+                                                f"the installed stack's training run: {why or 'unknown'}"))
+        seen = {self.ctx.root.resolve()}
+        for cand, role in candidates:
+            key = Path(cand).resolve()
+            if key in seen:
+                continue
+            seen.add(key)
+            fits.append(black_aware.raw_floor_from_run(cand, role=role, mode=self.mode))
+            if fits[-1].available:
+                break
+        return fits
 
     def _content_practical_kwargs(self, verify_ti3: str, metrics: Sequence[Any]) -> tuple[dict[str, Any], list]:
         """The ``practical_summary`` content kwargs for this verify (empty without weights / a
@@ -10459,8 +10521,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         help="HDR verify: the display black (nit) of the content-weighted score's BLACK-AWARE "
                              "variant. Near-black targets are scored against the BT.2390 EETF black lift to this "
                              "floor, as a panel limit like out-of-gamut colours; the raw score stays recorded. "
-                             "Default: the DIP's characterized native black. That is a FULL-FIELD black read, "
-                             "which understates the in-content floor on local-dimming panels (PA32UCXR: 0). "
+                             "Default: the native near-black floor fitted from a RAW stage (this run's, else the "
+                             "installed stack's training run's: the median offset of its lit near-black greys "
+                             "over the PQ target), else the DIP's characterized native black (a FULL-FIELD black "
+                             "read, which understates the in-content floor on local-dimming panels: PA32UCXR 0). "
                              "Evidence only: no calibration target, cube or gate changes")
     parser.add_argument("--preheat", choices=("auto", "always", "never"), default=None, dest="preheat",
                         help="thermal preheat policy for every measure stage (the closed-loop soak before "
