@@ -725,16 +725,17 @@ def _evidence_header(evidence: ReadEvidence, trust: Sequence[Mapping[str, Any]])
 def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequence[Mapping[str, Any]],
                         cw: ContentWeights, *, reach: float,
                         e_corr: Optional[Sequence[float]] = None,
-                        e_black: Optional[Sequence[float]] = None) -> dict[str, Any]:
+                        e: Optional[Sequence[float]] = None) -> dict[str, Any]:
     """Σ w·E / Σ w over the measured unique signals that carry a content weight (E = the per-signal mean).
 
+    * ``e`` replaces the per-signal E (default: the raw ``de2000``). The black-aware basis passes its own E,
+      and its own ``trust`` rows (the noise-limited flag on that E), so every share describes that score.
     * ``e_corr`` adds the labelled noise bias-corrected variant Σ w·E_corr / Σ w.
-    * ``e_black`` adds the black-aware score Σ w·E_black / Σ w (:mod:`dlc.black_aware`). The trust rows
-      then carry ``floor_limited``, which gets its own weight and score share."""
+    * ``floor_limited`` (the black-aware class) gets its own weight and score share when the trust rows carry it."""
     total_w = float(sum(max(0.0, float(v)) for v in cw.weights.values()))
-    flags = ("out_of_gamut",) + _TRUST_FLAGS + _NOISE_FLAGS + (("floor_limited",) if e_black is not None else ())
+    flags = (("out_of_gamut",) + _TRUST_FLAGS + _NOISE_FLAGS
+             + (("floor_limited",) if any("floor_limited" in t for t in trust) else ()))
     num_c = 0.0
-    num_b = 0.0
     w_share = dict.fromkeys(flags, 0.0)
     s_share = dict.fromkeys(flags, 0.0)
     num = den = 0.0
@@ -746,24 +747,22 @@ def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequen
         w = max(0.0, float(cw.weights.get(key, 0.0)))
         if w <= 0:
             continue
+        ei = float(e[i]) if e is not None else m.de2000
         n += 1
-        num += w * m.de2000
+        num += w * ei
         den += w
         if e_corr is not None:
             num_c += w * e_corr[i]
-        if e_black is not None:
-            num_b += w * e_black[i]
         on = {"out_of_gamut": bool(m.gamut_clamped), "floor_limited": bool(t.get("floor_limited")),
               **{k: bool(t[k]) for k in _TRUST_FLAGS + _NOISE_FLAGS}}
         for k in flags:
             if on[k]:
                 w_share[k] += w
-                s_share[k] += w * m.de2000
+                s_share[k] += w * ei
     unmeasured = sum(max(0.0, float(v)) for k, v in cw.weights.items() if k not in seen)
     return {
         "label": cw.label, "source": cw.source, "score": round(num / den, 3) if den > 0 else None, "n": n,
         "score_bias_corrected": (round(num_c / den, 3) if (den > 0 and e_corr is not None) else None),
-        **({"score_black_aware": round(num_b / den, 3) if den > 0 else None} if e_black is not None else {}),
         "weight_measured": round(den, 6), "weight_total": round(total_w, 6),
         "weight_unmeasured_share": round(unmeasured / total_w, 4) if total_w > 0 else None,
         "coverage_gap_pct_as_drawn": (cw.coverage_gap_pct or {}).get(f"reach_{reach:g}"),
@@ -774,24 +773,31 @@ def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequen
 
 _BIAS_LABEL = ("noise bias-corrected (quadrature subtraction of each signal's read-noise SE, floored at 0) "
                "— a VARIANT beside the raw score, not the score")
-_TOE_POINT_LABEL = ("literal: floor-limited signals scored against the BT.2390 target point itself; shown beside "
-                    "the black-aware score, not the score (see dlc.black_aware)")
+_TOE_POINT_LABEL = ("literal BT.2390 toe point: floor-limited signals scored against the BT.2390 EETF black-lift "
+                    "target itself (others raw); a VARIANT beside the black-aware score, not the score")
+_BT2390_BAND_LABEL = ("superseded BT.2390-toe band: floor-limited signals scored against the luminance band "
+                      "[PQ target, BT.2390 toe target] at the target chromaticity (others raw); a VARIANT, not the "
+                      "score")
 _BLACK_GATE_NOTE = ("evidence only. No gate reads it, and the practical zones (core / limits / clamped) and the verify "
                     "gate keep their basis: a floor-limited core patch stays in core")
+_BLACK_BASIS_NOTE = ("the weak-evidence share, the noise bias-corrected variant and the noise-limited share beside a "
+                     "black-aware score are computed on the black-aware basis (its per-signal E)")
+# Continuity evidence: the largest per-signal |E_black_aware - E_raw| above these PQ target luminances (nit).
+_CONTINUITY_LEVELS = (1.0, 10.0)
 
 
 def _black_aware_signals(patch_metrics: Sequence[PatchMetric], groups: Sequence[tuple[PatchMetric, int]],
                          floor: Any, *, is_hdr: bool, white_xy: Optional[tuple[float, float]],
-                         ) -> tuple[Optional[dict[str, Any]], Optional[list[float]], Optional[list[float]],
-                                    Optional[list[bool]]]:
-    """The ``black_aware`` block of the content-weighted summary (:mod:`dlc.black_aware`) and, when the lift
-    applies, the per-signal black-aware E, the literal toe-point E and the ``floor_limited`` flag, in
-    :func:`group_per_signal` order. All three are per-signal MEANS over the signal's reads, like the raw E.
+                         ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """The ``black_aware`` block of the content-weighted summary (:mod:`dlc.black_aware`) and, when the
+    pedestal applies, the per-signal lists in :func:`group_per_signal` order: ``e_black`` (the score), ``e_toe``
+    / ``e_band`` (the BT.2390 variants, ``None`` without a target peak) and ``limited`` (the descriptive
+    floor-limited class). Every E is a per-signal MEAN over the signal's reads, like the raw E.
 
-    ``(None, None, None, None)`` without a floor. When the floor is unavailable, the floor is 0 or the verify
-    is SDR, the block says why and the per-signal lists are ``None``."""
+    ``(None, None)`` without a floor. When the floor is unavailable, the floor is 0 or the verify is SDR, the
+    block says why and the per-signal lists are ``None``."""
     if floor is None:
-        return None, None, None, None
+        return None, None
     import numpy as np                                   # lazy: the spine imports this module dependency-free
 
     from . import black_aware as ba
@@ -800,86 +806,126 @@ def _black_aware_signals(patch_metrics: Sequence[PatchMetric], groups: Sequence[
     if not is_hdr:
         return ({**head, "available": False, "applied": False,
                  "reason": "SDR verify: SDR scores CIEDE2000 against a zero-black power law relative to the measured "
-                           "white; the BT.2390 black lift is an HDR (PQ) construct"}, None, None, None)
+                           "white; the black-aware pedestal is an HDR (absolute-luminance) construct"}, None)
     if not floor.available:
-        return {**head, "available": False, "applied": False, "reason": floor.source}, None, None, None
+        return {**head, "available": False, "applied": False, "reason": floor.source}, None
     if float(floor.nits) <= 0.0:
         return ({**head, "available": True, "applied": False,
-                 "reason": "the floor is 0 nit, so the BT.2390 lift is the identity: black-aware = raw (the "
-                           "headline stays raw)"}, None, None, None)
+                 "reason": "the floor is 0 nit, so the pedestal is empty: black-aware = raw (the headline stays raw)"},
+                None)
     per = ba.black_aware_patch_scores(patch_metrics, floor, white_xy=white_xy)
+    has_var = per["e_toe_point"] is not None
     by_key: dict[tuple, list[int]] = {}
     for i, m in enumerate(patch_metrics):
         by_key.setdefault(signal_key(m.rgb), []).append(i)
+
+    def mean(arr: Any, idx: list[int]) -> float:
+        return float(np.mean(arr[idx]))
+
     e_black: list[float] = []
     e_toe: list[float] = []
+    e_band: list[float] = []
     limited: list[bool] = []
     rows: list[dict[str, Any]] = []
-    raw_l: list[float] = []
+    changes: list[tuple[float, float, bool, dict[str, Any]]] = []
     for m, n in groups:
         idx = by_key[signal_key(m.rgb)]
-        eb = float(np.mean(per["e_black_aware"][idx]))
-        et = float(np.mean(per["e_toe_point"][idx]))
+        eb = mean(per["e_black_aware"], idx)
         fl = bool(per["floor_limited"][idx[0]])          # depends on the signal's target only
+        ty = float(per["target_y"][idx[0]])
         e_black.append(eb)
-        e_toe.append(et)
         limited.append(fl)
+        if has_var:
+            e_toe.append(mean(per["e_toe_point"], idx))
+            e_band.append(mean(per["e_bt2390_band"], idx))
+        row = {"rgb": [round(float(c), 4) for c in m.rgb], "rows": n, "target_Y": round(ty, 6),
+               "measured_Y": round(mean(per["measured_y"], idx), 6),
+               "pedestal_used_nits": round(mean(per["pedestal_y"], idx), 6),
+               "E_raw": round(m.de2000, 4), "E_black_aware": round(eb, 4)}
+        if has_var:
+            row.update({"bt2390_Y": round(float(per["toe_y"][idx[0]]), 6), "E_vs_bt2390_band": round(e_band[-1], 4),
+                        "E_vs_toe_point": round(e_toe[-1], 4)})
         if fl:
-            raw_l.append(m.de2000)
-            rows.append({"rgb": [round(float(c), 4) for c in m.rgb], "rows": n,
-                         "target_Y": round(float(per["target_y"][idx[0]]), 6),
-                         "bt2390_Y": round(float(per["toe_y"][idx[0]]), 6),
-                         "measured_Y": round(float(np.mean(per["measured_y"][idx])), 6),
-                         "scored_Y": round(float(np.mean(per["band_y"][idx])), 6),
-                         "E_raw": round(m.de2000, 4), "E_black_aware": round(eb, 4), "E_vs_toe_point": round(et, 4)})
-    thr = ba.FLOOR_LIMITED_FACTOR * float(floor.nits)
+            rows.append(row)
+        changes.append((ty, abs(m.de2000 - eb), bool(m.grayscale), row))
+    f = float(floor.nits)
+    thr = ba.FLOOR_LIMITED_FACTOR * f
+
+    def largest(level: float, *, greys: bool = False) -> dict[str, Any]:
+        sel = [c for c in changes if c[0] >= level and (c[2] or not greys)]
+        if not sel:
+            return {"n": 0, "max_abs_change_dEITP": None}
+        top = max(sel, key=lambda c: c[1])
+        return {"n": len(sel), "max_abs_change_dEITP": round(top[1], 4),
+                "at": {k: top[3][k] for k in ("rgb", "target_Y", "E_raw", "E_black_aware")}}
+
+    raw_all = [m.de2000 for m, _n in groups]
     block = {**head, "available": True, "applied": True,
-             "floor_limited_rule": f"PQ target Y < {ba.FLOOR_LIMITED_FACTOR:g} x the floor (< {thr:g} nit)",
-             "scoring_rule": ba.SCORING_TEXT,
+             "scoring_rule": ba.SCORING_TEXT, "basis_note": _BLACK_BASIS_NOTE,
+             "floor_limited_rule": (f"descriptive class: PQ target Y < {ba.FLOOR_LIMITED_FACTOR:g} x the floor "
+                                    f"(< {thr:g} nit; the pedestal >= 10 % of the target). The black-aware score "
+                                    f"applies to EVERY signal; the BT.2390 variants only to this class"),
+             "n_signals": len(groups),
              "n_floor_limited_signals": sum(limited),
              "n_floor_limited_reads": int(np.sum(per["floor_limited"])),
+             "all_signals": {"raw": _bucket_stats(raw_all), "black_aware": _bucket_stats(e_black)},
              # The floor-limited class next to core / limits / clamped: the RAW number stays visible beside the
              # black-aware one (per unique signal).
-             "floor_limited": {"raw": _bucket_stats(raw_l),
-                               "black_aware": _bucket_stats([e for e, f in zip(e_black, limited) if f]),
-                               "vs_toe_point": _bucket_stats([e for e, f in zip(e_toe, limited) if f])},
+             "floor_limited": {"raw": _bucket_stats([e for e, fl in zip(raw_all, limited) if fl]),
+                               "black_aware": _bucket_stats([e for e, fl in zip(e_black, limited) if fl]),
+                               **({"vs_bt2390_band": _bucket_stats([e for e, fl in zip(e_band, limited) if fl]),
+                                   "vs_toe_point": _bucket_stats([e for e, fl in zip(e_toe, limited) if fl])}
+                                  if has_var else {})},
+             # No cutoff, so the score is continuous: the largest per-signal change above 10 F / 1 nit / 10 nit.
+             # A saturated colour keeps a near-black channel well above 1 nit, so the white pedestal still moves
+             # its chroma there (e.g. a 1.7-nit Rec.2020 green); greys converge first.
+             "continuity": {"above_floor_limited": largest(thr),
+                            **{f"target_ge_{lv:g}_nit": largest(lv) for lv in _CONTINUITY_LEVELS},
+                            **{f"greys_target_ge_{lv:g}_nit": largest(lv, greys=True) for lv in _CONTINUITY_LEVELS}},
+             "raw_recompute_max_abs_dEITP": round(per["d0_vs_raw_max"], 6),
              "per_signal": sorted(rows, key=lambda r: r["target_Y"])}
-    return block, e_black, e_toe, limited
+    if not has_var:
+        block["variants_unavailable"] = "no target peak: the BT.2390 variants need the source white"
+    return block, {"e_black": e_black, "e_toe": e_toe if has_var else None, "e_band": e_band if has_var else None,
+                   "limited": limited}
 
 
 def _black_aware_class(cs: Any, dist: Any, loc: Any, info: Sequence[Mapping[str, Any]],
-                       ses: Sequence[Optional[float]], e_black: Sequence[float], e_toe: Sequence[float],
-                       e_corr_b: Sequence[float], floor_lim: Sequence[bool], *, err: Sequence[float],
-                       reach: float) -> dict[str, Any]:
+                       ses: Sequence[Optional[float]], per: Mapping[str, Any],
+                       e_corr_b: Sequence[float], *, err: Sequence[float], reach: float) -> dict[str, Any]:
     """One class's BLACK-AWARE kernel result: the same kernel over the black-aware per-signal E. Its evidence
-    shares, breakdowns and top contributors describe that score. The literal toe-point score and the noise
-    bias-corrected variant ride as labelled variants. Signals are tagged ``zone: floor_limited`` and keep
-    their raw ``dE_raw``. A failure is recorded here and never touches the raw class result."""
+    shares (noise-limited recomputed on that E), breakdowns and top contributors describe that score. The noise
+    bias-corrected variant (on the same basis) and the BT.2390 variants ride as labelled variants. Signals are
+    tagged ``zone: floor_limited`` when floor-limited and keep their raw ``dE_raw``. A failure is recorded here
+    and never touches the raw class result."""
     try:
+        e_black = per["e_black"]
         rows = [{**row, "zone": "floor_limited" if fl else row.get("zone"), "dE_raw": round(float(e), 2),
                  "noise_limited": se is not None and eb <= NOISE_LIMITED_SE * se}
-                for row, fl, e, eb, se in zip(info, floor_lim, err, e_black, ses)]
-        res = cs.kernel_score(dist, loc, e_black, reach=reach, sig_info=rows,
-                              alt_err={"bias_corrected": e_corr_b, "vs_toe_point": e_toe})
+                for row, fl, e, eb, se in zip(info, per["limited"], err, e_black, ses)]
+        alt = {"bias_corrected": e_corr_b}
+        if per.get("e_band") is not None:
+            alt.update({"vs_bt2390_band": per["e_band"], "vs_toe_point": per["e_toe"]})
+        res = cs.kernel_score(dist, loc, e_black, reach=reach, sig_info=rows, alt_err=alt)
     except Exception as exc:  # noqa: BLE001 - evidence only
         return {"score": None, "error": f"{type(exc).__name__}: {exc}"}
     var = res.pop("variants", None) or {}
     for k in ("class", "reach_dEITP", "sigma_dEITP", "n_signals", "content_bins"):
         res.pop(k, None)                                   # already on the raw class result
-    out = {"label": "black-aware: floor-limited signals scored against the BT.2390 black-lift panel limit",
-           **res}
-    if var.get("bias_corrected") is not None:
-        out["bias_corrected"] = {**var["bias_corrected"], "label": _BIAS_LABEL}
-    if var.get("vs_toe_point") is not None:
-        out["vs_toe_point"] = {**var["vs_toe_point"], "label": _TOE_POINT_LABEL}
+    out = {"label": "black-aware: every signal scored against the nearest point of [target, target + floor "
+                    "x pedestal colour] (an additive raised black as a panel limit)", **res}
+    for key, label in (("bias_corrected", f"{_BIAS_LABEL} (black-aware basis)"),
+                       ("vs_bt2390_band", _BT2390_BAND_LABEL), ("vs_toe_point", _TOE_POINT_LABEL)):
+        if var.get(key) is not None:
+            out[key] = {**var[key], "label": label}
     return out
 
 
 def _headline_black_aware(head: dict[str, Any], black_block: Optional[Mapping[str, Any]], *,
                           raw_score: Any, applied: bool, metric: str, what: str) -> None:
-    """Mark the headline black-aware (in place) when the lift applied: the label names the floor and its source,
-    and ``score_raw`` keeps the raw number. Otherwise, when a floor was considered, it records why the headline
-    stayed raw."""
+    """Mark the headline black-aware (in place) when the pedestal applied: the label names the floor and its
+    source, ``score_raw`` keeps the raw number, and the basis says the variants beside it share the black-aware
+    basis. Otherwise, when a floor was considered, it records why the headline stayed raw."""
     if black_block is None:
         return
     if applied and black_block.get("applied"):
@@ -887,9 +933,12 @@ def _headline_black_aware(head: dict[str, Any], black_block: Optional[Mapping[st
         head.update({
             "label": (f"content-weighted {metric}, BLACK-AWARE ({what}; display floor {floor:g} nit from "
                       f"{black_block.get('floor_source')})"),
-            "basis": f"{head.get('basis')}; floor-limited signals scored against the BT.2390 black-lift panel limit",
+            "basis": (f"{head.get('basis')}; every signal scored against the nearest point of [target, target + "
+                      f"floor x pedestal colour] (additive raised black as a panel limit). {_BLACK_BASIS_NOTE}"),
             "black_aware": True, "score_raw": raw_score, "black_floor_nits": floor,
             "black_floor_source": black_block.get("floor_source"),
+            "black_pedestal_xy": black_block.get("pedestal_xy"),
+            "black_pedestal_source": black_block.get("pedestal_source"),
             "n_floor_limited_signals": black_block.get("n_floor_limited_signals")})
     else:
         head.update({"black_aware": False,
@@ -914,12 +963,13 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
       ``coverage_gap_pct``, the nearest-signal fallback, zone / band breakdowns, the evidence shares and
       the top contributors (:func:`dlc.content_score.kernel_score`).
     * ``headline`` — the first class's kernel score (else the patch-weight score) + its gap, labelled.
-    * ``black_aware`` — with ``black_floor`` (:class:`dlc.black_aware.BlackFloor`, HDR): near-black
-      signals are also scored against the display's floor as a panel limit (the BT.2390 black lift).
-      Every class and the patch weights then carry the black-aware score beside the raw one, which stays
-      recorded. The HEADLINE becomes the black-aware score, labelled with the floor and its source, when
-      the lift applies (a positive floor). When the floor is unavailable or 0, the block says why and the
-      headline stays raw.
+    * ``black_aware`` — with ``black_floor`` (:class:`dlc.black_aware.BlackFloor`, HDR): every signal is
+      also scored against the display's raised black as a panel limit (the nearest point of [target, target +
+      floor x pedestal colour]). Every class and the patch weights then carry the black-aware score beside
+      the raw one, which stays recorded; the variants and evidence shares beside a black-aware score are on
+      the black-aware basis. The HEADLINE becomes the black-aware score, labelled with the floor and its
+      source, when the pedestal applies (a positive floor). When the floor is unavailable or 0, the block
+      says why and the headline stays raw.
 
     Heavy imports (numpy / scipy / the engine) happen only with ``content`` / ``black_floor``."""
     contents = [] if content is None else (list(content) if isinstance(content, (list, tuple)) else [content])
@@ -952,22 +1002,27 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
         t["noise_limited"] = se is not None and m.de2000 <= NOISE_LIMITED_SE * se
         t["noise_unknown"] = se is None
         e_corr.append(math.sqrt(max(m.de2000 ** 2 - se ** 2, 0.0)) if se is not None else m.de2000)
-    # BLACK-AWARE (owner 2026-10-09, dlc.black_aware): the display's floor is a PANEL LIMIT, like an out-of-gamut
-    # colour. Floor-limited signals are also scored against the BT.2390 black lift. The raw score stays recorded
-    # beside it, and no gate reads either.
-    black_block = e_black = e_toe = floor_lim = None
+    # BLACK-AWARE (owner 2026-10-09, dlc.black_aware): the display's raised black is a PANEL LIMIT, like an
+    # out-of-gamut colour. Every signal is also scored against the nearest point of [target, target + pedestal].
+    # The raw score stays recorded beside it, and no gate reads either.
+    black_block = per_black = None
     try:
-        black_block, e_black, e_toe, floor_lim = _black_aware_signals(patch_metrics, groups, black_floor,
-                                                                      is_hdr=is_hdr, white_xy=white_xy)
+        black_block, per_black = _black_aware_signals(patch_metrics, groups, black_floor,
+                                                      is_hdr=is_hdr, white_xy=white_xy)
     except Exception as exc:  # noqa: BLE001 - evidence only
         failed("black_aware", exc)
         black_block = {**(black_floor.as_dict() if hasattr(black_floor, "as_dict") else {}), "available": False,
                        "applied": False, "reason": f"black-aware scoring failed ({type(exc).__name__}: {exc})"}
+    e_black: Optional[list[float]] = per_black["e_black"] if per_black is not None else None
     e_corr_b: Optional[list[float]] = None
-    if e_black is not None and floor_lim is not None:
-        for t, fl in zip(trust, floor_lim):
+    trust_b: Optional[list[dict[str, Any]]] = None
+    if per_black is not None:
+        for t, fl in zip(trust, per_black["limited"]):
             t["floor_limited"] = fl
         e_corr_b = [math.sqrt(max(eb ** 2 - se ** 2, 0.0)) if se is not None else eb for eb, se in zip(e_black, ses)]
+        # the black-aware basis' own trust rows: noise-limited judged on the black-aware E
+        trust_b = [{**t, "noise_limited": se is not None and eb <= NOISE_LIMITED_SE * se}
+                   for t, eb, se in zip(trust, e_black, ses)]
     block: dict[str, Any] = {"headline": None, "metric": metric,
                              "evidence_only": "no gate reads this block — the LLM judges it at the verify seam"}
     if contents:
@@ -993,9 +1048,9 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
                 if bc is not None:
                     res["bias_corrected"] = {**bc, "label": _BIAS_LABEL}
                 res["provenance"] = dist.provenance()
-                if e_black is not None:
-                    res["black_aware"] = _black_aware_class(cs, dist, loc, info, ses, e_black, e_toe, e_corr_b,
-                                                            floor_lim, err=err, reach=content_reach)
+                if per_black is not None:
+                    res["black_aware"] = _black_aware_class(cs, dist, loc, info, ses, per_black, e_corr_b,
+                                                            err=err, reach=content_reach)
             except Exception as exc:  # noqa: BLE001 - evidence must never break the verify
                 res = {"class": getattr(dist, "label", "?"), "score": None,
                        "error": f"{type(exc).__name__}: {exc}"}
@@ -1019,29 +1074,36 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
                                   metric=metric, what=f"{first['class']}, R {content_reach:g} dE_ITP")
     if content_weights is not None:
         try:
-            pw = _patch_weight_block(groups, trust, content_weights, reach=content_reach, e_corr=e_corr,
-                                     e_black=e_black)
+            pw = _patch_weight_block(groups, trust, content_weights, reach=content_reach, e_corr=e_corr)
+            if per_black is not None:
+                # the black-aware score on ITS OWN basis: E, the bias-corrected E and the trust rows all black-aware
+                pwb = _patch_weight_block(groups, trust_b, content_weights, reach=content_reach, e_corr=e_corr_b,
+                                          e=e_black)
+                pw["black_aware"] = {
+                    "label": ("black-aware: Σ w·E_black / Σ w; its bias-corrected variant and its weight / score "
+                              "shares are on the black-aware basis"),
+                    **{k: pwb[k] for k in ("score", "score_bias_corrected", "weight_share", "score_share")}}
         except Exception as exc:  # noqa: BLE001 - evidence only
             failed("patch_weights", exc)
             pw = None
         if pw is not None:
             block["patch_weights"] = pw
             if block["headline"] is None and pw["score"] is not None:
-                weak = pw["score_share"].get("weak")
-                black = pw.get("score_black_aware")
+                pb = pw.get("black_aware") or {}
+                src = pb if pb.get("score") is not None else pw     # every number below on ONE basis
+                weak = src["score_share"].get("weak")
                 block["headline"] = {
                     "label": f"content-weighted {metric} (patch weights: {pw['label']})",
                     "basis": "per-patch content weights (Σ w·E / Σ w)", "class": pw["label"],
-                    "reach_dEITP": content_reach, "score": black if black is not None else pw["score"],
+                    "reach_dEITP": content_reach, "score": src["score"],
                     "coverage_gap_pct": pw.get("coverage_gap_pct_as_drawn"),
-                    # the weak / noise shares and the bias-corrected variant describe the RAW per-signal E
                     "weak_evidence_score_share_pct": round(100.0 * weak, 1) if weak is not None else None,
-                    "score_bias_corrected": pw.get("score_bias_corrected"),
-                    "noise_limited_weight_share_pct": (round(100.0 * pw["weight_share"]["noise_limited"], 1)
-                                                       if pw["weight_share"].get("noise_limited") is not None
+                    "score_bias_corrected": src.get("score_bias_corrected"),
+                    "noise_limited_weight_share_pct": (round(100.0 * src["weight_share"]["noise_limited"], 1)
+                                                       if src["weight_share"].get("noise_limited") is not None
                                                        else None)}
                 _headline_black_aware(block["headline"], black_block, raw_score=pw["score"],
-                                      applied=black is not None, metric=metric,
+                                      applied=src is pb, metric=metric,
                                       what=f"patch weights: {pw['label']}")
     block["evidence"] = _evidence_header(evidence, trust)
     floor_txt = f"at/below the meter floor ({float(evidence.noise_floor_nits):g} nit)"
@@ -1125,10 +1187,10 @@ def practical_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
     and reach R) -- evidence only: no gate reads it, the LLM does.
 
     BLACK-AWARE (2026-10-09, ``black_floor``, HDR; :mod:`dlc.black_aware`). With a display floor, the
-    content-weighted block also scores near-black signals against the floor as a panel limit. Its headline
-    becomes that score (the raw one stays recorded), and its ``black_aware`` block carries the
-    ``floor_limited`` class with raw and black-aware stats. That class lives ONLY in the content-weighted
-    evidence. The zones below (and so :func:`practical_gate_view` / the verify gate) keep their basis: a
+    content-weighted block also scores every signal against the display's raised black (an additive pedestal)
+    as a panel limit. Its headline becomes that score (the raw one stays recorded), and its ``black_aware``
+    block carries the descriptive ``floor_limited`` class with raw, black-aware and variant stats. That class
+    lives ONLY in the content-weighted evidence. The zones below (and so :func:`practical_gate_view` / the verify gate) keep their basis: a
     floor-limited core patch stays in ``core``, scored raw."""
     lead = _content_weighted_or_error(patch_metrics, is_hdr=is_hdr, content_weights=content_weights,
                                       read_evidence=read_evidence, content=content,

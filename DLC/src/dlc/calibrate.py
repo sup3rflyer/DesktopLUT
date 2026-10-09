@@ -9059,17 +9059,20 @@ class Calibration:
 
     def _score_black_floor(self) -> Any:
         """The display floor of the content-weighted score's BLACK-AWARE variant (:mod:`dlc.black_aware`, HDR,
-        evidence only). The order:
+        evidence only): the additive pedestal the score allows as a panel limit. The order:
 
         1. ``--score-black-floor-nits`` (memoised);
-        2. else the NATIVE near-black floor fitted from a raw stage (:func:`dlc.black_aware.fit_native_floor`):
-           this run's own ``measure:raw`` when it measured one, then the installed stack's training run's
+        2. else the NATIVE near-black floor fitted from a raw stage (:func:`dlc.black_aware.fit_native_floor`,
+           the intercept over the lowest lit greys; the meter floor = the DIP's ``noise_floor_nits``): this run's
+           own ``measure:raw`` when it measured one, then an identity-matched recorded run's
            (:meth:`_raw_floor_fits`);
         3. else the DIP's ``native_black_nits`` (characterize's full-field black read);
         4. else unavailable.
 
-        NOT the DIP ``noise_floor_nits`` (the meter's trust floor), and never the verify's own reads (circular).
-        The BT.2390 source white is the run's resolved target peak."""
+        The pedestal colour: the used raw stage's native white, else this run's own raw white, else the DIP's
+        ``native_white_xy``, else D65 (stated as assumed). NOT the DIP ``noise_floor_nits`` as a floor (the
+        meter's trust floor), and never the verify's own reads (circular). The BT.2390 variants' source white is
+        the run's resolved target peak."""
         from . import black_aware
 
         explicit = self.calib.get("score_black_floor_nits")
@@ -9077,66 +9080,103 @@ class Calibration:
         recorded = getattr(dip, "native_black_nits", None) if dip is not None else None
         made = getattr(dip, "made", None) if dip is not None else None
         when = f", made {made}" if made else ""
+        own = (self.calib.get("stages") or {}).get("measure:raw") or {}
+        pedestal = [(black_aware.xy_from_xyz((own.get("data") or {}).get("white_xyz")),
+                     "this run's native white (measure:raw white_xyz)"),
+                    (getattr(dip, "native_white_xy", None) if dip is not None else None,
+                     f"DIP native_white_xy{when}")]
         return black_aware.resolve_black_floor(
             explicit=explicit,
             explicit_source="explicit option (--score-black-floor-nits)",
-            raw=self._raw_floor_fits() if explicit is None else (),
+            raw=self._raw_floor_fits(dip) if explicit is None else (),
             recorded=recorded,
             recorded_source=f"DIP native_black_nits (characterize's full-field black read{when})",
-            peak_nits=self._hdr_target().peak_nits)
+            peak_nits=self._hdr_target().peak_nits, pedestal=pedestal)
 
-    def _raw_floor_fits(self) -> list[Any]:
+    def _floor_identity(self) -> dict[str, Any]:
+        """This run's identity for matching a recorded raw floor (:func:`dlc.black_aware.run_identity`): the
+        preflight's display / EDID hardware id / correction, the display name and mode as configured."""
+        from . import black_aware
+
+        ident = black_aware.run_identity(self._state, self.ctx.root)
+        ident["display"] = ident.get("display") or self.display.name
+        ident["mode"] = str(self.mode).upper()
+        return ident
+
+    def _raw_floor_fits(self, dip: Any = None) -> list[Any]:
         """The raw-stage native floor candidates, in order (:mod:`dlc.black_aware`, evidence only):
 
         1. this run's own ``measure:raw`` stage, when it measured one (``full`` / ``mhc-only``);
-        2. the installed stack's TRAINING run: the ``--verify-patches-from`` source, else the stack registry's
-           record of the applying run (:meth:`_verify_file_training_run`);
-        3. the registry's applying run (the run that built the installed MHC and measured its raw ramp) when
-           it differs from 2, e.g. a ``3dlut-only`` training run, which measures no raw.
+        2. a flow that KEEPS the installed MHC (``3dlut-only`` / ``verify-only`` / ...): the installed stack's
+           TRAINING run (the ``--verify-patches-from`` source, else the stack registry's record,
+           :meth:`_verify_file_training_run`), then the registry's applying run (the run that built the
+           installed MHC and measured its raw ramp) when it differs, e.g. under a ``3dlut-only`` training run;
+        3. a flow that BUILT ITS OWN MHC (``full`` / ``mhc-only``): its own raw is this stack's. If it is refused,
+           the registry still names the PREVIOUSLY applied stack (the registry records this run only at apply),
+           so that run is tried under exactly that label, never as "the installed MHC's applying run".
 
-        The list stops at the first usable fit. A raw stage measures the NATIVE panel (identity MHC, no cube)
-        separately from the verify, so its near-black greys are a non-circular floor source. Never raises:
-        each refusal says why."""
+        Every recorded run must match this run's display / EDID hardware id / mode / correction
+        (:meth:`_floor_identity`); a mismatch is a listed refusal. The list stops at the first usable fit. A raw
+        stage measures the NATIVE panel (identity MHC, no cube) separately from the verify, so its near-black
+        greys are a non-circular floor source. The meter floor (which greys count as lit) is the DIP's
+        ``noise_floor_nits``. Never raises: each refusal says why."""
         from . import black_aware
 
+        meter = getattr(dip, "noise_floor_nits", None) if dip is not None else None
+        made = getattr(dip, "made", None) if dip is not None else None
+        kw = {"meter_floor_nits": meter,
+              "meter_floor_source": f"DIP noise_floor_nits{f' (made {made})' if made else ''}"}
         fits: list[Any] = []
         own = (self.calib.get("stages") or {}).get("measure:raw") or {}
         if own:
-            ti3 = (own.get("data") or {}).get("ti3")
+            data = own.get("data") or {}
+            ti3 = data.get("ti3")
             if own.get("status") == "done" and ti3 and Path(str(ti3)).is_file():
                 fits.append(black_aware.raw_floor_from_ti3(Path(str(ti3)), run_name=self.ctx.root.name,
-                                                           role="this run's raw stage"))
+                                                           role="this run's raw stage",
+                                                           white_xyz=data.get("white_xyz"), **kw))
             else:
                 fits.append(black_aware.RawFloorFit(None, f"raw run {self.ctx.root.name} (this run's raw stage)",
                                                     f"this run's raw stage is not usable (status "
                                                     f"{own.get('status')!r}, ti3 {ti3!r})"))
             if fits[-1].available:
                 return fits
-        try:
-            root, why = self._verify_file_training_run()
-        except Exception as exc:  # noqa: BLE001 - evidence only
-            root, why = None, f"training run lookup failed ({type(exc).__name__})"
-        candidates: list[tuple[Path, str]] = [(root, "the installed stack's training run")] if root else []
+        flow = self.calib.get("flow")
+        keeps_mhc = flow in self._FLOWS_KEEPING_MHC
+        candidates: list[tuple[Path, str]] = []
+        why: Optional[str] = None
+        if keeps_mhc:
+            try:
+                root, why = self._verify_file_training_run()
+            except Exception as exc:  # noqa: BLE001 - evidence only
+                root, why = None, f"training run lookup failed ({type(exc).__name__})"
+            if root:
+                candidates.append((root, "the installed stack's training run"))
         try:
             rec = stack_registry.StackRegistry.load(
                 stack_registry.registry_path(self.profile, self.ctx.root)).get(self.display.name, self.mode)
         except Exception:  # noqa: BLE001 - evidence only
             rec = None
         if rec is not None and rec.run_id:
+            role = ("the installed MHC's applying run" if keeps_mhc
+                    else f"a previously applied stack's run, NOT this run's stack (this {flow} run built its own MHC)")
             for cand in (self.ctx.root.parent / rec.run_id, runs_dir() / rec.run_id):
                 if (cand / "dlc_state.json").is_file():
-                    candidates.append((cand, "the installed MHC's applying run"))
+                    candidates.append((cand, role))
                     break
+        elif not keeps_mhc:
+            why = "no stack-registry record of a previously applied stack"
         if not candidates:
-            fits.append(black_aware.RawFloorFit(None, "the installed stack's training run",
-                                                f"the installed stack's training run: {why or 'unknown'}"))
+            label = "the installed stack's training run" if keeps_mhc else "a previously applied stack's run"
+            fits.append(black_aware.RawFloorFit(None, label, f"{label}: {why or 'not on disk here'}"))
+        expect = self._floor_identity()
         seen = {self.ctx.root.resolve()}
         for cand, role in candidates:
             key = Path(cand).resolve()
             if key in seen:
                 continue
             seen.add(key)
-            fits.append(black_aware.raw_floor_from_run(cand, role=role, mode=self.mode))
+            fits.append(black_aware.raw_floor_from_run(cand, role=role, mode=self.mode, expect=expect, **kw))
             if fits[-1].available:
                 break
         return fits
@@ -10180,12 +10220,15 @@ def _content_lead_text(digest: Mapping[str, Any]) -> str:
     gap = lead.get("coverage_gap_pct")
     weak = lead.get("weak_evidence_score_share_pct")
     bc = lead.get("score_bias_corrected")
-    raw = lead.get("score_raw") if lead.get("black_aware") else None
+    black = bool(lead.get("black_aware"))
+    raw = lead.get("score_raw") if black else None
+    # beside a black-aware score every variant / share is on the black-aware basis: say so (one basis per line)
+    basis = " (black-aware basis)" if black else ""
     return (f"{lead.get('label')} {lead['score']}"
             + (f" [raw {raw}]" if raw is not None else "")
-            + (f" [noise bias-corrected variant {bc}]" if bc is not None and bc != lead["score"] else "")
+            + (f" [noise bias-corrected variant{basis} {bc}]" if bc is not None and bc != lead["score"] else "")
             + (f" (coverage gap {gap} % of content with no patch within R)" if gap is not None else "")
-            + (f", {weak} % of it resting on weak reads (single / at the meter floor / low-SNR)"
+            + (f", {weak} % of it{basis} resting on weak reads (single / at the meter floor / low-SNR)"
                if weak is not None else "") + "; ")
 
 
@@ -10217,10 +10260,15 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
         ba = res.get("black_aware") or {}
         if ba.get("score") is not None:
             toe = (ba.get("vs_toe_point") or {}).get("score")
+            band = (ba.get("vs_bt2390_band") or {}).get("score")
+            bcb = (ba.get("bias_corrected") or {}).get("score")
             rows.append(f"<tr><td><b>Content-weighted {de} — {name}, BLACK-AWARE</b> (display floor "
-                        f"{black.get('floor_nits')} nit from {_html_text(black.get('floor_source'))})</td>"
+                        f"{black.get('floor_nits')} nit from {_html_text(black.get('floor_source'))}; pedestal "
+                        f"colour {black.get('pedestal_xy')} from {_html_text(black.get('pedestal_source'))})</td>"
                         f"<td><b>{ba.get('score')}</b> (raw {res.get('score')}) · nearest-patch fallback "
                         f"{ba.get('score_with_nearest_fallback')}"
+                        + (f" · noise bias-corrected variant (black-aware basis) {bcb}" if bcb is not None else "")
+                        + (f" · superseded BT.2390-band variant {band}" if band is not None else "")
                         + (f" · literal BT.2390-point variant {toe}" if toe is not None else "") + "</td></tr>")
     pw = cw.get("patch_weights") or {}
     if pw.get("score") is not None:
@@ -10232,15 +10280,29 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
                     + (f" · {round(100 * weak, 1)} % of the score on weak reads" if weak is not None else "")
                     + (f" · noise bias-corrected variant {pw.get('score_bias_corrected')}"
                        if pw.get("score_bias_corrected") is not None else "")
-                    + (f" · BLACK-AWARE {pw.get('score_black_aware')}"
-                       if pw.get("score_black_aware") is not None else "")
                     + "</td></tr>")
+        pb = pw.get("black_aware") or {}
+        if pb.get("score") is not None:
+            weak_b = (pb.get("score_share") or {}).get("weak")
+            rows.append(f"<tr><td><b>Content-weighted {de} — patch weights ({pw.get('label')}), BLACK-AWARE</b>"
+                        f"</td><td><b>{pb.get('score')}</b> (raw {pw.get('score')})"
+                        + (f" · {round(100 * weak_b, 1)} % of it on weak reads (black-aware basis)"
+                           if weak_b is not None else "")
+                        + (f" · noise bias-corrected variant (black-aware basis) {pb.get('score_bias_corrected')}"
+                           if pb.get("score_bias_corrected") is not None else "") + "</td></tr>")
     fl = black.get("floor_limited") or {}
     if (fl.get("raw") or {}).get("n"):
-        raw_b, ba_b = fl["raw"], fl.get("black_aware") or {}
+        raw_b, ba_b, band_b = fl["raw"], fl.get("black_aware") or {}, fl.get("vs_bt2390_band") or {}
         rows.append(f"<tr><td>Floor-limited signals ({_html_text(black.get('floor_limited_rule'))})</td><td>raw avg "
                     f"{raw_b.get('avg')} · max {raw_b.get('max')} → black-aware avg {ba_b.get('avg')} · max "
-                    f"{ba_b.get('max')} (n {raw_b.get('n')}; evidence only — the zones below are unchanged)</td></tr>")
+                    f"{ba_b.get('max')}"
+                    + (f" (superseded BT.2390-band variant avg {band_b.get('avg')})" if band_b.get("n") else "")
+                    + f" (n {raw_b.get('n')}; evidence only — the zones below are unchanged)</td></tr>")
+    cont = (black.get("continuity") or {}).get("target_ge_1_nit") or {}
+    if cont.get("max_abs_change_dEITP") is not None:
+        rows.append(f"<tr><td>Black-aware continuity</td><td>largest per-signal change at PQ target ≥ 1 nit: "
+                    f"{cont.get('max_abs_change_dEITP')} {de} (n {cont.get('n')}; no cutoff, the pedestal "
+                    f"vanishes at bright levels)</td></tr>")
     elif black and not black.get("applied"):
         rows.append(f"<tr><td>Black-aware score</td><td class='muted'>not applied: "
                     f"{_html_text(black.get('reason'))}</td></tr>")
@@ -10518,14 +10580,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "Evidence only — it leads the practical block; no gate reads it")
     parser.add_argument("--score-black-floor-nits", type=float, default=None, dest="score_black_floor_nits",
                         metavar="NITS",
-                        help="HDR verify: the display black (nit) of the content-weighted score's BLACK-AWARE "
-                             "variant. Near-black targets are scored against the BT.2390 EETF black lift to this "
-                             "floor, as a panel limit like out-of-gamut colours; the raw score stays recorded. "
-                             "Default: the native near-black floor fitted from a RAW stage (this run's, else the "
-                             "installed stack's training run's: the median offset of its lit near-black greys "
-                             "over the PQ target), else the DIP's characterized native black (a FULL-FIELD black "
-                             "read, which understates the in-content floor on local-dimming panels: PA32UCXR 0). "
-                             "Evidence only: no calibration target, cube or gate changes")
+                        help="HDR verify: the display floor (nit) of the content-weighted score's BLACK-AWARE "
+                             "variant: an additive raised black allowed as a panel limit, like out-of-gamut "
+                             "colours (every patch scored against the nearest point of [target, target + floor x "
+                             "the native white's colour]); the raw score stays recorded. Default: the native "
+                             "near-black floor fitted from a RAW stage (this run's, else an identity-matched "
+                             "recorded run's: the intercept of measured = F + g x target over its lowest lit "
+                             "greys), else the DIP's characterized native black (a FULL-FIELD black read, which "
+                             "understates the in-content floor on local-dimming panels: PA32UCXR 0). Evidence "
+                             "only: no calibration target, cube or gate changes")
     parser.add_argument("--preheat", choices=("auto", "always", "never"), default=None, dest="preheat",
                         help="thermal preheat policy for every measure stage (the closed-loop soak before "
                              "the main pass). auto (default = today's behaviour): soak any characterized "

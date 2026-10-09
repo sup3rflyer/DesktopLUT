@@ -55,7 +55,7 @@ __all__ = [
     "ContentDistribution", "parse_content_spec", "load_content_distribution", "export_content_json",
     "xyz_to_itp", "nominal_signal_xyz", "kernel_score", "FinalRoundReads", "final_round_reads",
     "read_counts_from_ndjson", "reads_from_ndjson", "sidecar_se_de", "read_noise_se", "print_quantum_se",
-    "low_snr_signal_keys", "recorded_display_black", "recorded_raw_floor_fits", "rescore_run",
+    "low_snr_signal_keys", "recorded_display_black", "recorded_raw_floor_fits", "recorded_dip", "rescore_run",
 ]
 
 DEFAULT_REACH = 20.0          # dE_ITP; ~ one 33-node PQ cube cell along I (study §5.1)
@@ -689,31 +689,48 @@ def recorded_display_black(state: Mapping[str, Any]) -> Optional[float]:
     return None
 
 
-def recorded_raw_floor_fits(run_root: Path, state: Mapping[str, Any]) -> list[Any]:
+# Flows that build their OWN MHC (from their own raw stage): a stack record they carry, or the registry, names a
+# PREVIOUSLY applied stack, never this run's (mirrors Calibration._FLOWS_KEEPING_MHC).
+_FLOWS_BUILDING_MHC = ("full", "mhc-only", "refine-mhc")
+
+
+def recorded_raw_floor_fits(run_root: Path, state: Mapping[str, Any], *, meter_floor_nits: Any = None,
+                            meter_floor_source: Optional[str] = None) -> list[Any]:
     """The raw-stage native floor candidates of a RECORDED run (:mod:`dlc.black_aware`), in order, stopping at
     the first usable fit:
 
     1. the run's own raw stage, when it measured one;
-    2. the installed stack's training run: the run's ``verify_patches_from`` source, then the run's
-       ``installed_stack`` record (the applying run). Each is looked up beside the run folder first (a moved
-       ``runs/`` tree), then at the recorded path."""
-    from .black_aware import RawFloorFit, raw_floor_from_run
+    2. the run's ``verify_patches_from`` source (the installed stack's training run), then the run's
+       ``installed_stack`` record (the installed MHC's applying run). Each is looked up beside the run folder
+       first (a moved ``runs/`` tree), then at the recorded path. A run that built its OWN MHC (``full`` /
+       ``mhc-only``) carries no record of its own stack, so any record there is labelled as a PREVIOUSLY
+       applied stack's run, not this run's stack.
+
+    Every recorded run must match the scored run's display / EDID hardware id / mode / correction
+    (:func:`dlc.black_aware.identity_check`); a mismatch is a listed refusal. ``meter_floor_nits`` is the DIP's
+    ``noise_floor_nits`` (which raw greys count as lit)."""
+    from .black_aware import RawFloorFit, raw_floor_from_run, run_identity
 
     root = Path(run_root)
     mode = str(state.get("mode") or "HDR")
     calib = state.get("calib") or {}
+    expect = run_identity(state, root)
+    kw = {"meter_floor_nits": meter_floor_nits, "meter_floor_source": meter_floor_source}
     fits: list[Any] = []
     if ((calib.get("stages") or {}).get("measure:raw") or {}):
-        fits.append(raw_floor_from_run(root, role="this run's raw stage", mode=mode))
+        fits.append(raw_floor_from_run(root, role="this run's raw stage", mode=mode, **kw))
         if fits[-1].available:
             return fits
+    own_mhc = calib.get("flow") in _FLOWS_BUILDING_MHC
     named: list[tuple[str, str]] = []
     src = calib.get("verify_patches_from")
     if src:
         named.append((str(src), "the installed stack's training run"))
     stack_run = (calib.get("installed_stack") or {}).get("run_id")
     if stack_run:
-        named.append((str(stack_run), "the installed MHC's applying run"))
+        named.append((str(stack_run), ("a previously applied stack's run, NOT this run's stack (this "
+                                       f"{calib.get('flow')} run built its own MHC)") if own_mhc
+                      else "the installed MHC's applying run"))
     seen = {root.resolve()}
     for ref, role in named:
         name = Path(ref).name
@@ -724,14 +741,43 @@ def recorded_raw_floor_fits(run_root: Path, state: Mapping[str, Any]) -> list[An
         if cand.resolve() in seen:
             continue
         seen.add(cand.resolve())
-        fits.append(raw_floor_from_run(cand, role=role, mode=mode))
+        fits.append(raw_floor_from_run(cand, role=role, mode=mode, expect=expect, **kw))
         if fits[-1].available:
             break
     return fits
 
 
+def recorded_dip(run_root: Path, state: Mapping[str, Any], *, dip_store: Optional[Path] = None
+                 ) -> tuple[Any, Optional[str]]:
+    """``(dip, source)``: the scored display's DIP for an offline rescore, from ``dip_store`` when given, else the
+    ``dip_store.json`` where the orchestrator keeps it (beside the profile, by convention the folder above
+    ``runs/``; else beside the run folders). Looked up ``display:mode`` first, then the bare display.
+    ``(None, why)`` when there is none. Never raises."""
+    from .black_aware import run_identity
+    from .dip import DipStore
+
+    root = Path(run_root)
+    ident = run_identity(state, root)
+    if not ident.get("display"):
+        return None, "the run records no display name"
+    paths = [Path(dip_store)] if dip_store is not None else [root.parent.parent / "dip_store.json",
+                                                             root.parent / "dip_store.json"]
+    for p in paths:
+        if not p.is_file():
+            continue
+        try:
+            store = DipStore.load(p)
+            rec = (store.get(f"{ident['display']}:{ident['mode']}") if ident.get("mode") else None) or store.get(
+                ident["display"])
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            return None, f"{p} unreadable ({type(exc).__name__})"
+        if rec is not None:
+            return rec, f"{p} ({ident['display']}:{ident.get('mode')}, made {getattr(rec, 'made', None)})"
+    return None, f"no DIP for {ident['display']!r} in {', '.join(str(p) for p in paths)}"
+
+
 def rescore_run(run_root: Path, specs: Sequence[str], *, reach: float = DEFAULT_REACH,
-                black_floor_nits: Optional[float] = None) -> dict[str, Any]:
+                black_floor_nits: Optional[float] = None, dip_store: Optional[Path] = None) -> dict[str, Any]:
     """The content-weighted block of a RECORDED run's verify (``reports/verification_iter00_*``) —
     the same :func:`dlc.metrics.practical_summary` the live verify computes, from the persisted patch
     rows + the run's resolved white + its verify NDJSON / noise sidecar. Read-only.
@@ -739,7 +785,10 @@ def rescore_run(run_root: Path, specs: Sequence[str], *, reach: float = DEFAULT_
     HDR: the black-aware score (:mod:`dlc.black_aware`) floors at ``black_floor_nits`` when given, else at
     the native near-black floor fitted from a raw stage (:func:`recorded_raw_floor_fits`: the run's own, else
     the installed stack's training run's), else at the display black the run recorded
-    (:func:`recorded_display_black`). Its source white is the run's target peak (``calib.hdr_target.peak_nits``)."""
+    (:func:`recorded_display_black`). The display's DIP (:func:`recorded_dip`; ``dip_store`` overrides where it
+    is looked up) supplies the raw fit's meter floor (``noise_floor_nits``) and the pedestal colour's fallback
+    (``native_white_xy``). The BT.2390 variants' source white is the run's target peak
+    (``calib.hdr_target.peak_nits``)."""
     from .metrics import PatchMetric, ReadEvidence, practical_summary
 
     root = Path(run_root)
@@ -767,15 +816,24 @@ def rescore_run(run_root: Path, specs: Sequence[str], *, reach: float = DEFAULT_
     contents = [load_content_distribution(s, content_mode=content_mode) for s in specs]
     floor = None
     if is_hdr:
-        from .black_aware import resolve_black_floor
+        from .black_aware import resolve_black_floor, xy_from_xyz
 
+        dip, dip_src = recorded_dip(root, state, dip_store=dip_store)
+        meter = getattr(dip, "noise_floor_nits", None) if dip is not None else None
+        own_raw = ((calib.get("stages") or {}).get("measure:raw") or {})
+        pedestal = [(xy_from_xyz((own_raw.get("data") or {}).get("white_xyz")),
+                     "this run's native white (measure:raw white_xyz)"),
+                    (getattr(dip, "native_white_xy", None) if dip is not None else None,
+                     f"DIP native_white_xy ({dip_src})")]
         floor = resolve_black_floor(
             explicit=black_floor_nits, explicit_source="explicit option (--black-floor-nits)",
-            raw=recorded_raw_floor_fits(root, state) if black_floor_nits is None else (),
+            raw=(recorded_raw_floor_fits(root, state, meter_floor_nits=meter,
+                                         meter_floor_source=f"DIP noise_floor_nits ({dip_src})")
+                 if black_floor_nits is None else ()),
             recorded=recorded_display_black(state),
             recorded_source=("the run record's preflight panel_limits (DIP native_black_nits: characterize's "
                              "full-field black read)"),
-            peak_nits=(calib.get("hdr_target") or {}).get("peak_nits"))
+            peak_nits=(calib.get("hdr_target") or {}).get("peak_nits"), pedestal=pedestal)
     practical = practical_summary(metrics, is_hdr=is_hdr, gamut_aware=bool(summ.get("practical", {}).get("gamut_aware")),
                                   read_evidence=evidence, content=contents, content_reach=reach,
                                   white_xy=tuple(white), black_floor=floor)
@@ -794,10 +852,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     rs.add_argument("--content", action="append", required=True, metavar="PATH[#VARIANT]")
     rs.add_argument("--reach", type=float, default=DEFAULT_REACH)
     rs.add_argument("--black-floor-nits", type=float, default=None, dest="black_floor_nits",
-                    help="HDR: the display black (nit) for the black-aware score (BT.2390 black lift; evidence "
-                         "only). Default: the native near-black floor fitted from a raw stage (the run's own, "
-                         "else the installed stack's training run's), else the display black the run recorded "
-                         "(DIP native_black_nits)")
+                    help="HDR: the display floor (nit) for the black-aware score (an additive raised black, "
+                         "scored as a panel limit; evidence only). Default: the native near-black floor fitted "
+                         "from a raw stage (the run's own, else an identity-matched recorded run's), else the "
+                         "display black the run recorded (DIP native_black_nits)")
+    rs.add_argument("--dip-store", type=Path, default=None, dest="dip_store",
+                    help="the dip_store.json holding the display's DIP (meter floor + native white). Default: "
+                         "the folder above runs/, else beside the run folders")
     ex = sub.add_parser("export", help="write an npz content histogram as the compact JSON export")
     ex.add_argument("content", metavar="PATH[#VARIANT]")
     ex.add_argument("out", type=Path)
@@ -805,7 +866,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     if args.cmd == "rescore":
         print(json.dumps(rescore_run(args.run, args.content, reach=args.reach,
-                                     black_floor_nits=args.black_floor_nits), indent=1, default=str))
+                                     black_floor_nits=args.black_floor_nits, dip_store=args.dip_store),
+                         indent=1, default=str))
     else:
         print(json.dumps(export_content_json(load_content_distribution(args.content), args.out,
                                              min_mass_fraction=args.min_mass_fraction)))
