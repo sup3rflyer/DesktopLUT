@@ -14,8 +14,11 @@ separately on a tinted synthetic panel in ``tests/test_spine.py``.
 (and is the recorded source run), then verify-only measures it three ways — the
 installed stack as-is, the source's exact verify set (``--verify-patches-from``,
 deltas vs its recorded verify), and a candidate cube over it (``--verify-cube``,
-restored at ``verify:candidate``). The in-process rubber-stamp adjudicator stands in
-for the LLM — sim only, never a hardware run.
+restored at ``verify:candidate``) — plus a fourth leg, a verify list from a FILE
+(``--verify-patches-file``, content-weighted) scored against a content distribution
+(``--content-distribution``): synthetic fixtures by default (:func:`write_synthetic_patches_file`,
+:func:`write_synthetic_content_json`), or the caller's own files. The in-process rubber-stamp
+adjudicator stands in for the LLM — sim only, never a hardware run.
 """
 
 from __future__ import annotations
@@ -132,11 +135,70 @@ def run_simulation(run_dir: Path | None = None, *, max_refine: int = 3, verbose:
     }
 
 
+def write_synthetic_patches_file(path: Path, *, mode: str = "SDR", bit_depth: int = 10) -> Path:
+    """A tiny content-sampled verify set (``--verify-patches-file`` format) for rehearsals / tests:
+    a weighted grey ramp + a few low-saturation colours, codes kept low enough for any synthetic HDR
+    cap, with two zero-weight anchors. Synthetic — never the owner's data."""
+    import json
+
+    max_cv = (1 << int(bit_depth)) - 1
+    top = 0.55 if str(mode).upper() == "HDR" else 0.95
+    greys = [round(max_cv * top * f) for f in (0.08, 0.15, 0.25, 0.4, 0.6, 0.8, 1.0)]
+    codes = [[0, 0, 0]] + [[g, g, g] for g in greys]
+    for f, tint in ((0.5, (1.0, 0.85, 0.8)), (0.7, (0.8, 0.9, 1.0)), (0.35, (0.9, 1.0, 0.85))):
+        codes.append([round(max_cv * top * f * t) for t in tint])
+    codes.append([round(max_cv * top), round(max_cv * top), round(max_cv * top)])
+    raw = [0.0] + [0.22, 0.2, 0.15, 0.12, 0.08, 0.05, 0.03] + [0.06, 0.05, 0.04] + [0.0]
+    total = sum(raw)
+    doc = {"_doc": "synthetic content-sampled verify set (dlc.stages.simulate rehearsal fixture)",
+           "content_mode": str(mode).upper(), "bit_depth": int(bit_depth), "content_class": "synthetic",
+           "n": len(codes), "codes": codes,
+           "meta": [{"stratum": "synthetic", "content_weight": round(w / total, 6)} for w in raw],
+           "coverage_gap_pct_of_content": {"reach_20": {"proposed": 5.0}}}
+    path = Path(path)
+    path.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    return path
+
+
+def write_synthetic_content_json(path: Path, *, name: str = "synthetic_live") -> Path:
+    """A tiny content distribution in the compact JSON export format (:mod:`dlc.content_score`):
+    low-chroma mass along I (dark-heavy, like the owner's survey) plus a saturated cluster no verify
+    patch reaches (a coverage gap). Synthetic — never the owner's data."""
+    import json
+
+    itp, w, zone, band, tube = [], [], [], [], []
+    for i in range(2, 70):
+        lev = i / 100.0
+        for t in (-0.006, 0.0, 0.006):
+            for p in (-0.006, 0.0, 0.006):
+                itp.append([lev, t, p])
+                w.append(1.0 / (1.0 + 20.0 * lev))
+                zone.append(0)
+                band.append(0 if lev < 0.15 else 1 if lev < 0.3 else 2 if lev < 0.5 else 3)
+                tube.append(1)
+    for k in range(9):
+        itp.append([0.45 + 0.01 * k, 0.2, -0.1])
+        w.append(0.4)
+        zone.append(1)
+        band.append(2)
+        tube.append(0)
+    doc = {"format": "dlc-content-distribution/1", "class": name, "variant": "json",
+           "doc": "synthetic content distribution (rehearsal / test fixture)", "itp": itp, "w": w,
+           "zone": zone, "band": band, "tube": tube}
+    path = Path(path)
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
 def run_verify_only_rehearsal(root: Path | None = None, *, mode: str = "SDR",
-                              verbose: bool = False) -> dict[str, Any]:
+                              verbose: bool = False, patches_file: Path | None = None,
+                              content: list[str] | None = None) -> dict[str, Any]:
     """Rehearse ``--flow verify-only`` end to end on the mock (orchestrator-level, not the v1
     stage chain). Returns a summary; ``reached_report`` is True iff every leg completed, the
-    installed stack was left exactly as found, and the candidate leg restored the prior cube."""
+    installed stack was left exactly as found, and the candidate leg restored the prior cube.
+    The ``verify_patches_file`` leg measures ``patches_file`` (default: a synthetic fixture) and
+    scores it against ``content`` (default: a synthetic distribution); it must reach the report
+    with the content-weighted block leading the practical summary."""
     import shutil
     from datetime import datetime
 
@@ -230,6 +292,29 @@ def run_verify_only_rehearsal(root: Path | None = None, *, mode: str = "SDR",
                      "decision": ((calib.calib.get("decisions") or {}).get("verify:candidate") or {}).get("choice"),
                      "results_dir": res.results_dir, "verify": verify_view(calib)})
         ok = ok and res.status == "completed" and restored and bool(rec.get("restored"))
+
+        # A verify list from a FILE (content-weighted) scored against a content distribution.
+        pf = Path(patches_file) if patches_file is not None else write_synthetic_patches_file(
+            root / "synthetic_patches.json", mode=mode, bit_depth=10)
+        specs = list(content) if content else [str(write_synthetic_content_json(root / "synthetic_content.json"))]
+        res, calib = leg("verify_patches_file", "verify-only", verify_patches_file=pf, content_distribution=specs)
+        unchanged = live() == before
+        d = ((calib.calib.get("stages") or {}).get("verify") or {}).get("digest") or {}
+        cw = (d.get("practical") or {}).get("content_weighted") or {}
+        listed = (((calib.calib.get("stages") or {}).get("verify-patches-file") or {}).get("digest") or {})
+        legs.append({"leg": "verify_patches_file", "status": res.status, "stack_unchanged": unchanged,
+                     "results_dir": res.results_dir, "file": str(pf),
+                     "patches": {k: listed.get(k) for k in ("n", "patches_fingerprint", "held_out_check")},
+                     "content_weighted": {"headline": cw.get("headline"),
+                                          "patch_weights": {k: (cw.get("patch_weights") or {}).get(k)
+                                                            for k in ("score", "n", "coverage_gap_pct_as_drawn")},
+                                          "classes": {k: {kk: v.get(kk) for kk in ("score", "coverage_gap_pct",
+                                                                                   "score_with_nearest_fallback")}
+                                                      for k, v in (cw.get("classes") or {}).items()}},
+                     "digest_leads_with_content_weighted": next(iter(d), None) == "content_weighted",
+                     "verify": verify_view(calib)})
+        ok = (ok and res.status == "completed" and unchanged and d.get("patch_count") == listed.get("n")
+              and bool(cw.get("headline")))
     return {"root": str(root), "mode": mode, "flow": "verify-only", "reached_report": ok, "legs": legs}
 
 
@@ -243,11 +328,20 @@ def main(argv: list[str] | None = None) -> int:
                              "exact set / with a candidate cube (restored). --run is the rehearsal root.")
     parser.add_argument("--mode", choices=("SDR", "HDR"), default="SDR",
                         help="the run mode for --flow rehearsals (default SDR)")
+    parser.add_argument("--verify-patches-file", type=Path, default=None, dest="verify_patches_file",
+                        help="--flow verify-only: the verify list the file leg measures (default: a synthetic "
+                             "content-sampled fixture; must be 10-bit codes of the rehearsal's mode)")
+    parser.add_argument("--content-distribution", action="append", default=None, dest="content_distribution",
+                        metavar="PATH[#VARIANT]",
+                        help="--flow verify-only: content distribution(s) for the file leg's content-weighted "
+                             "score (default: a synthetic one)")
     args = parser.parse_args(argv)
     if args.flow == "verify-only":
         import json
 
-        vsummary = run_verify_only_rehearsal(args.run, mode=args.mode, verbose=True)
+        vsummary = run_verify_only_rehearsal(args.run, mode=args.mode, verbose=True,
+                                             patches_file=args.verify_patches_file,
+                                             content=args.content_distribution)
         print(json.dumps(vsummary, indent=2, default=str))
         verdict = "Ding" if vsummary["reached_report"] else "NOT clean"
         print(f"\n{verdict} — verify-only rehearsal: {vsummary['root']}")

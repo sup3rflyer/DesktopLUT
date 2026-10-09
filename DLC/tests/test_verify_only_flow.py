@@ -878,6 +878,12 @@ def test_simulate_rehearsal_runs_the_verify_only_flow(tmp_path: Path):
     assert legs["verify_installed"]["stack_unchanged"] is True
     assert legs["verify_patches_from"]["verify"]["vs_source"]["like_for_like"] is True
     assert legs["verify_candidate"]["decision"] == "restore" and legs["verify_candidate"]["prior_restored"]
+    # --verify-patches-file (synthetic content-sampled set) scored against a synthetic distribution
+    vf = legs["verify_patches_file"]
+    assert vf["status"] == "completed" and vf["stack_unchanged"] is True
+    assert vf["digest_leads_with_content_weighted"] is True
+    assert vf["content_weighted"]["headline"]["score"] is not None
+    assert vf["content_weighted"]["patch_weights"]["n"] == 10
 
 
 # ---------------------------------------------------------------------------
@@ -1030,3 +1036,248 @@ def test_a_kept_layer_the_user_toggles_mid_run_is_not_forced_back(tmp_path: Path
     assert any(e.event == Ev.ANOMALY and e.data.get("kind") == "stack_changed_mid_run"
                for e in read_events(calib.ctx.events_path))
 
+
+
+# ---------------------------------------------------------------------------
+# --verify-patches-file (a verify list from a file — e.g. a content-sampled set) + the
+# content-weighted practical lead (evidence only, never a gate)
+# ---------------------------------------------------------------------------
+
+def _patches_file(path: Path, codes, *, mode: str = "SDR", bit_depth: int = 10, weights=None) -> Path:
+    doc = {"content_mode": mode, "bit_depth": bit_depth, "codes": [list(c) for c in codes],
+           "content_class": "unit"}
+    if weights is not None:
+        doc["meta"] = [{"content_weight": w} for w in weights]
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    return path
+
+
+def _synthetic_file(tmp_path: Path, mode: str = "SDR") -> Path:
+    from dlc.stages.simulate import write_synthetic_patches_file
+
+    return write_synthetic_patches_file(tmp_path / f"patches_{mode.lower()}.json", mode=mode, bit_depth=10)
+
+
+def test_verify_patches_file_measures_the_file_and_leads_with_content_weighted(tmp_path: Path):
+    from dlc.stages.simulate import write_synthetic_content_json
+
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    pf = _synthetic_file(tmp_path)
+    doc = json.loads(pf.read_text(encoding="utf-8"))
+    content = write_synthetic_content_json(tmp_path / "content.json")
+    calib = _make(tmp_path, "vo_file", controller=ctrl, bit_depth=10, verify_patches_file=pf,
+                  content_distribution=[str(content)], require_hardware_readiness=True)
+    result = calib.run("verify-only")
+    assert result.status == "completed", result.digest
+    assert result.stages[:3] == ["preflight", "verify-patches-file", "whitepoint"]
+
+    measured = verify_only._patches_from_ndjson(calib.ctx.root / "measurements" / "verify.ndjson")
+    assert [list(p) for p in measured] == doc["codes"]                    # EXACTLY the file's list
+    fp = verify_only.patches_fingerprint(doc["codes"])
+    assert calib.calib["patch_plan"]["verify_patches_file"]["patches_fingerprint"] == fp
+    assert calib.calib["patch_plan"]["total_patches"] == len(doc["codes"])
+    assert calib.calib["stages"]["verify-patches-file"]["data"]["patches_fingerprint"] == fp
+    # no training run known (no registry record): the held-out check says so, nothing is dropped
+    held = calib.calib["stages"]["verify-patches-file"]["digest"]["held_out_check"]
+    assert held["available"] is False and "registry" in held["reason"]
+
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert next(iter(verify)) == "content_weighted"                       # practical numbers LEAD
+    assert verify["patch_count"] == len(doc["codes"])
+    cw = verify["practical"]["content_weighted"]
+    assert next(iter(verify["practical"])) == "content_weighted"
+    # weight carry-through: Σ w·E / Σ w over the per-signal means of the scored rows
+    rows = json.loads((calib.ctx.root / "reports" / "verification_iter00_patch_metrics.json").read_text("utf-8"))
+    from dlc.metrics import signal_key
+    per: dict = {}
+    for r in rows:
+        per.setdefault(signal_key(r["rgb"]), []).append(r["de2000"])
+    wts: dict = {}
+    for code, m in zip(doc["codes"], doc["meta"]):
+        k = signal_key([c / 1023 for c in code])
+        wts[k] = wts.get(k, 0.0) + m["content_weight"]
+    num = sum(w * (sum(per[k]) / len(per[k])) for k, w in wts.items() if w > 0)
+    den = sum(w for w in wts.values() if w > 0)
+    pw = cw["patch_weights"]
+    assert pw["score"] == round(num / den, 3) and pw["n"] == sum(1 for w in wts.values() if w > 0)
+    assert pw["coverage_gap_pct_as_drawn"] == 5.0 and pw["weight_unmeasured_share"] == 0.0
+    # the kernel score against the given distribution heads the block (class + R labelled)
+    assert cw["headline"]["class"] == "synthetic_live" and cw["headline"]["reach_dEITP"] == 20.0
+    assert cw["classes"]["synthetic_live"]["coverage_gap_pct"] > 0
+    assert cw["evidence"]["reads_basis"].startswith("meter reads")
+    # the gate is untouched: it scored the practical core / tube as before
+    assert verify["gate"]["basis"].startswith("practical")
+    # metrics artifact + report + dashboard event carry it first
+    mfile = json.loads((calib.ctx.root / "reports" / "verification_iter00_metrics.json").read_text("utf-8"))
+    assert next(iter(mfile["practical"])) == "content_weighted"
+    html = (Path(result.results_dir) / "report.html").read_text(encoding="utf-8")
+    assert html.index("Content-weighted") < html.index("<h2>Verification")
+    scored = [e for e in read_events(calib.ctx.events_path) if e.event == "metrics_scored"]
+    assert scored and "content_weighted" in scored[-1].data["practical"]
+    assert verify["verify_only"]["verify_patches_file"]["patches_fingerprint"] == fp
+
+
+@pytest.mark.parametrize("case", ["mode", "depth", "range", "malformed", "weights"])
+def test_verify_patches_file_hard_refusals(tmp_path: Path, case: str):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    f = tmp_path / "bad.json"
+    if case == "mode":
+        _patches_file(f, [[100, 100, 100]], mode="HDR")
+    elif case == "depth":
+        _patches_file(f, [[100, 100, 100]], bit_depth=8)
+    elif case == "range":
+        _patches_file(f, [[100, 100, 100], [1024, 0, 0]])
+    elif case == "malformed":
+        f.write_text(json.dumps({"content_mode": "SDR", "bit_depth": 10, "codes": [[1, 2]]}), encoding="utf-8")
+    else:
+        _patches_file(f, [[100, 100, 100], [200, 200, 200]], weights=[0.5])
+    calib = _make(tmp_path, f"vo_bad_{case}", controller=ctrl, bit_depth=10, verify_patches_file=f)
+    result = calib.run("verify-only")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "verify-patches-file"
+    assert "measure:verify" not in calib.calib["stages"]                  # nothing measured
+    msg = json.dumps(result.digest)
+    assert {"mode": "content mode", "depth": "bit depth", "range": "outside 0..1023",
+            "malformed": "three integers", "weights": "content weights"}[case] in msg
+
+
+def test_verify_patches_file_above_the_hdr_cap_is_refused_before_the_plan_seam(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, mode="HDR", cube=_cube(tmp_path / "hdr_installed.cube"))
+    reg = stack_registry.StackRegistry.load(tmp_path / stack_registry.REGISTRY_FILE)
+    reg.record(stack_registry.StackRecord(
+        display="Synthetic mini-LED", mode="HDR", monitor=0, run_id="stack_run", applied_at="2026-09-24",
+        profile_name="DesktopLUT-sim-0-HDR.icm", mhc={"primaries": dict(_PRIMARIES)},
+        hdr_peak={"cube_peak_nits": 1500.0}))
+    f = _patches_file(tmp_path / "hdr.json", [[300, 300, 300], [1000, 1000, 1000]], mode="HDR")
+    judge = _AutoExcept()
+    calib = _make(tmp_path, "vo_hdr_cap", mode="HDR", controller=ctrl, bit_depth=10, verify_patches_file=f,
+                  adjudicator=judge)
+    result = calib.run("verify-only")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "verify-patches-file"
+    assert "patch cap" in json.dumps(result.digest)
+    assert not any(r.key == "resolve-target:plan" for r in judge.requests)   # never asked to approve it
+    assert "measure:verify" not in calib.calib["stages"]
+
+
+def test_verify_patches_file_resume_measures_the_memoised_list(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    f = _patches_file(tmp_path / "set.json", [[100, 100, 100], [400, 380, 360], [800, 800, 800]],
+                      weights=[0.5, 0.3, 0.2])
+    original = json.loads(f.read_text(encoding="utf-8"))["codes"]
+    with pytest.raises(AdjudicationRequired):
+        _make(tmp_path, "vo_file_resume", controller=ctrl, bit_depth=10, verify_patches_file=f,
+              adjudicator=MappingAdjudicator({})).run("verify-only")
+    # the file changes on disk during the pause: the resume still measures the memoised list
+    _patches_file(f, [[1, 2, 3]], weights=[1.0])
+    resumed = _make(tmp_path, "vo_file_resume", controller=ctrl, bit_depth=10, verify_patches_file=f,
+                    adjudicator=MappingAdjudicator({"resolve-target:plan": Decision("approve")}))
+    result = resumed.run("verify-only")
+    assert result.status == "completed", result.digest
+    measured = verify_only._patches_from_ndjson(resumed.ctx.root / "measurements" / "verify.ndjson")
+    assert [list(p) for p in measured] == original
+    assert resumed.calib["patch_plan"]["verify_patches_file"]["patches_fingerprint"] == \
+        verify_only.patches_fingerprint(original)
+    assert any(e.event == "verify_patches_file_changed" for e in read_events(resumed.ctx.events_path))
+    # a resume asking for ANOTHER file is a recorded conflict, never a silent re-target
+    other = _patches_file(tmp_path / "other.json", [[5, 5, 5]])
+    clash = _make(tmp_path, "vo_file_resume", controller=ctrl, bit_depth=10, verify_patches_file=other)
+    assert any(c["field"] == "verify_patches_file" for c in clash._arg_conflicts)
+
+
+def test_verify_patches_file_with_patches_from_only_like_for_like(tmp_path: Path, sdr_source: Path):
+    src_list = verify_only._patches_from_ndjson(sdr_source / "measurements" / "verify.ndjson")
+    same = _patches_file(tmp_path / "same.json", src_list)
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    calib = _make(tmp_path, "vo_file_same", controller=ctrl, bit_depth=10, verify_patches_from=sdr_source,
+                  verify_patches_file=same)
+    result = calib.run("verify-only")
+    assert result.status == "completed", result.digest
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert verify["vs_source"]["comparability"]["like_for_like"] is True
+    # the held-out distance rule is applied against the source's training and REPORTED, not dropped
+    held = calib.calib["stages"]["verify-patches-file"]["digest"]["held_out_check"]
+    assert held["available"] is True and held["training_run"] == sdr_source.name
+    assert held["n_checked"] == len(src_list) and held["n_fail"] >= 1
+    assert verify["patch_count"] == len(src_list)
+
+    other = _patches_file(tmp_path / "other.json", src_list[:-1])
+    ctrl2 = CalibrationController.mock()
+    _seed_stack(ctrl2, cube=_cube(tmp_path / "prior2.cube"))
+    refused = _make(tmp_path, "vo_file_other", controller=ctrl2, bit_depth=10, verify_patches_from=sdr_source,
+                    verify_patches_file=other).run("verify-only")
+    assert refused.status == "aborted" and refused.digest["aborted_at"] == "verify-patches-file"
+    assert "exact list" in json.dumps(refused.digest)
+
+
+def test_content_distribution_scores_any_verify_from_the_profile(tmp_path: Path):
+    """No file, no flag: the profile's content_distribution key still yields the kernel block."""
+    from dataclasses import replace
+
+    from dlc.stages.simulate import write_synthetic_content_json
+
+    content = write_synthetic_content_json(tmp_path / "content.json", name="profile_class")
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    run_dir = tmp_path / "vo_profile_content"
+    profile = replace(cp.Profile.synthetic(output_dir=str(tmp_path / "results")),
+                      content_distribution={"SDR": (str(content),)})
+    calib = Calibration(ctx=create_run("SDR", display="synthetic", run_dir=run_dir), profile=profile, monitor=0,
+                        mode="SDR", controller=ctrl, measure=_sdr_panel(), adjudicator=AutoAdjudicator(),
+                        optimize_config=_OPT, patch_sizes=_SMALL, run_date=_DATE, bit_depth=10)
+    assert calib.run("verify-only").status == "completed"
+    cw = calib.calib["stages"]["verify"]["digest"]["practical"]["content_weighted"]
+    assert cw["headline"]["class"] == "profile_class" and "patch_weights" not in cw
+
+
+def test_a_missing_content_distribution_is_reported_not_fatal(tmp_path: Path):
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    calib = _make(tmp_path, "vo_no_content", controller=ctrl, bit_depth=10,
+                  content_distribution=[str(tmp_path / "nope.npz")])
+    assert calib.run("verify-only").status == "completed"
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert "content_weighted" not in verify["practical"]
+    assert "not found" in json.dumps(verify["content_distribution_errors"])
+
+
+def test_cli_refuses_a_patches_file_before_a_run_exists(tmp_path: Path, monkeypatch, capsys):
+    monkeypatch.setattr(cp, "load_profile", lambda *a, **k: cp.Profile.synthetic())
+    run_dir = tmp_path / "never_created"
+    sdr10 = _patches_file(tmp_path / "sdr10.json", [[100, 100, 100]])
+    hdr10 = _patches_file(tmp_path / "hdr10.json", [[100, 100, 100]], mode="HDR")
+    sdr8 = _patches_file(tmp_path / "sdr8.json", [[300, 0, 0]], bit_depth=8)
+    (tmp_path / "junk.json").write_text("{", encoding="utf-8")
+    for argv, needle in (
+            (["--flow", "3dlut-only", "--verify-patches-file", str(sdr10)], "verify-only"),
+            (["--flow", "verify-only", "--bit-depth", "10", "--verify-patches-file", str(hdr10)], "content mode"),
+            (["--flow", "verify-only", "--verify-patches-file", str(sdr10)], "bit depth"),        # SDR default 8
+            (["--flow", "verify-only", "--bit-depth", "8", "--verify-patches-file", str(sdr8)], "outside 0..255"),
+            (["--flow", "verify-only", "--verify-patches-file", str(tmp_path / "junk.json")], "cannot read")):
+        assert main(argv + ["--run", str(run_dir)]) == 2, argv
+        assert needle in json.loads(capsys.readouterr().out)["error"], argv
+        assert not run_dir.exists()
+    assert main(["--flow", "verify-only", "--preview-patches", "--bit-depth", "10",
+                 "--verify-patches-file", str(sdr10)]) == 0
+    plan = json.loads(capsys.readouterr().out)["patch_plan"]
+    assert plan["total_patches"] == 1 and "refused" not in plan
+    assert plan["verify_patches_file"]["patches_fingerprint"] == verify_only.patches_fingerprint([[100, 100, 100]])
+
+
+def test_load_patches_file_reads_the_study_format(tmp_path: Path):
+    f = tmp_path / "patchset.json"
+    f.write_text(json.dumps({"content_mode": "hdr", "bit_depth": 10, "codes": [[0, 0, 0], [47, 47, 47]],
+                             "meta": [{"stratum": "anchor", "content_weight": 0.0},
+                                      {"stratum": "s1", "content_weight": 1.0}],
+                             "coverage_gap_pct_of_content": {"reach_20": {"proposed": 6.99, "current_verify": 42.6}}}),
+                 encoding="utf-8")
+    doc = verify_only.load_patches_file(f)
+    assert doc["content_mode"] == "HDR" and doc["weights"] == [0.0, 1.0] and doc["content_class"] == "patchset"
+    assert doc["coverage_gap_pct"] == {"reach_20": 6.99}
+    assert verify_only.patches_file_problems(doc, content_mode="HDR", bit_depth=10, patch_max_cv=40) == [
+        "1 code(s) above this run's HDR patch cap 40 (the target peak; first: index 1 = [47, 47, 47]) — the panel "
+        "would read a clipped highlight"]
+    assert verify_only.patches_file_problems(doc, content_mode="HDR", bit_depth=10, patch_max_cv=830) == []

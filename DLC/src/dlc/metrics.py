@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Optional, Sequence
 
 from .colormath import rgb_to_xyz_matrix
 from .events import EventWriter
@@ -580,8 +580,183 @@ def _bucket_stats(values: list[float]) -> dict[str, Any]:
 bucket_stats = _bucket_stats   # the {avg, p95, max, n} shape every practical bucket uses (public)
 
 
+# ---------------------------------------------------------------------------
+# Content-weighted practical score (owner directive 2026-10-09: "practical numbers must lead").
+# EVIDENCE ONLY — no gate reads any of it; the LLM judges it at the verify seam.
+# ---------------------------------------------------------------------------
+# The reach of the content kernel score (dE_ITP): ~ one 33-node PQ cube cell along I (study §5.1).
+DEFAULT_CONTENT_REACH = 20.0
+# Below this measured luminance a single colorimeter read is floor / noise-limited when the display
+# has no characterized DIP noise floor (i1D3-class; the study's 0.05 nit).
+METER_FLOOR_NITS_FALLBACK = 0.05
+
+
+@dataclass(frozen=True)
+class ReadEvidence:
+    """How much each verify signal's ΔE can be trusted (the content-weighted block reports the share
+    of content / score resting on weak evidence). ``reads`` = meter reads behind each signal (keyed by
+    :func:`signal_key`; ``None`` → the scored rows per signal); ``low_snr`` = signals the measure loop's
+    dark-level noise machinery flags (error within repeatability noise, or an unstable level);
+    ``noise_floor_nits`` = below this MEASURED luminance a read is at the meter floor."""
+    reads: Optional[Mapping[tuple, int]] = None
+    low_snr: frozenset = frozenset()
+    noise_floor_nits: float = METER_FLOOR_NITS_FALLBACK
+    noise_floor_source: str = (f"fallback {METER_FLOOR_NITS_FALLBACK:g} nit (i1D3-class single-read floor; "
+                               "no DIP noise floor)")
+
+
+@dataclass(frozen=True)
+class ContentWeights:
+    """Per-signal content weights carried by a content-sampled verify set (``--verify-patches-file``):
+    ``weights`` keyed by :func:`signal_key`; Σ w·E / Σ w over the measured signals is the
+    content-weighted score of the content the set was drawn from. ``coverage_gap_pct`` = the file's own
+    stated gap per reach (``{"reach_20": 6.99, ...}`` — content with no patch nearby, as drawn)."""
+    weights: Mapping[tuple, float]
+    label: str
+    source: Optional[str] = None
+    coverage_gap_pct: Mapping[str, float] = field(default_factory=dict)
+
+
+_TRUST_FLAGS = ("single_read", "at_floor", "low_snr", "single_read_at_floor", "weak")
+
+
+def _signal_trust(rep: PatchMetric, n_rows: int, evidence: ReadEvidence) -> dict[str, Any]:
+    key = signal_key(rep.rgb)
+    reads = int((evidence.reads or {}).get(key, n_rows)) if evidence.reads else int(n_rows)
+    y = rep.measured_xyz[1]
+    y = float(y) if isinstance(y, (int, float)) and math.isfinite(y) else float(rep.target_xyz[1])
+    single = reads <= 1
+    floor = y < float(evidence.noise_floor_nits)
+    low_snr = key in evidence.low_snr
+    return {"reads": reads, "single_read": single, "at_floor": floor, "low_snr": low_snr,
+            "single_read_at_floor": single and floor, "weak": single or floor or low_snr}
+
+
+def _evidence_header(evidence: ReadEvidence, trust: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "noise_floor_nits": evidence.noise_floor_nits, "noise_floor_source": evidence.noise_floor_source,
+        "reads_basis": ("meter reads per signal (measure NDJSON)" if evidence.reads else
+                        "scored rows per signal (no NDJSON read counts)"),
+        "weak_definition": "single read OR measured Y below the noise floor OR flagged low-SNR",
+        "n_signals": len(trust)}
+    for k in _TRUST_FLAGS:
+        out[f"n_{k}"] = sum(1 for t in trust if t[k])
+    return out
+
+
+def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequence[Mapping[str, Any]],
+                        cw: ContentWeights, *, reach: float) -> dict[str, Any]:
+    """Σ w·E / Σ w over the measured unique signals carrying a content weight (E = per-signal mean)."""
+    total_w = float(sum(max(0.0, float(v)) for v in cw.weights.values()))
+    flags = ("out_of_gamut",) + _TRUST_FLAGS
+    w_share = dict.fromkeys(flags, 0.0)
+    s_share = dict.fromkeys(flags, 0.0)
+    num = den = 0.0
+    n = 0
+    seen: set[tuple] = set()
+    for (m, _n), t in zip(groups, trust):
+        key = signal_key(m.rgb)
+        seen.add(key)
+        w = max(0.0, float(cw.weights.get(key, 0.0)))
+        if w <= 0:
+            continue
+        n += 1
+        num += w * m.de2000
+        den += w
+        on = {"out_of_gamut": bool(m.gamut_clamped), **{k: bool(t[k]) for k in _TRUST_FLAGS}}
+        for k in flags:
+            if on[k]:
+                w_share[k] += w
+                s_share[k] += w * m.de2000
+    unmeasured = sum(max(0.0, float(v)) for k, v in cw.weights.items() if k not in seen)
+    return {
+        "label": cw.label, "source": cw.source, "score": round(num / den, 3) if den > 0 else None, "n": n,
+        "weight_measured": round(den, 6), "weight_total": round(total_w, 6),
+        "weight_unmeasured_share": round(unmeasured / total_w, 4) if total_w > 0 else None,
+        "coverage_gap_pct_as_drawn": (cw.coverage_gap_pct or {}).get(f"reach_{reach:g}"),
+        "weight_share": {k: (round(v / den, 4) if den > 0 else None) for k, v in w_share.items()},
+        "score_share": {k: (round(v / num, 4) if num > 1e-9 * max(den, 1e-300) else None)
+                        for k, v in s_share.items()}}
+
+
+def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
+                             content_weights: Optional[ContentWeights] = None,
+                             read_evidence: Optional[ReadEvidence] = None,
+                             content: Any = None, content_reach: float = DEFAULT_CONTENT_REACH,
+                             white_xy: Optional[tuple[float, float]] = None) -> Optional[dict[str, Any]]:
+    """The ``content_weighted`` block of :func:`practical_summary` — ``None`` without weights or a
+    content distribution. EVIDENCE ONLY: no gate reads it (the verify gate keeps scoring the practical
+    core / tube / white); it LEADS the practical block so the number a human / the LLM reads first is
+    the one content sees.
+
+    * ``patch_weights`` — the verify set's own per-signal ``content_weight`` (``--verify-patches-file``):
+      Σ w·E / Σ w over measured signals, with ``n``, the out-of-gamut weight share and the weight / score
+      share resting on weak evidence (single read, below the meter floor, low-SNR).
+    * ``classes`` — per content class (:class:`dlc.content_score.ContentDistribution`): the kernel score,
+      ``coverage_gap_pct``, the nearest-signal fallback, zone / band breakdowns, the evidence shares and
+      the top contributors (:func:`dlc.content_score.kernel_score`).
+    * ``headline`` — the first class's kernel score (else the patch-weight score) + its gap, labelled.
+
+    Heavy imports (numpy / scipy / the engine) happen only with ``content``."""
+    contents = [] if content is None else (list(content) if isinstance(content, (list, tuple)) else [content])
+    if content_weights is None and not contents:
+        return None
+    evidence = read_evidence or ReadEvidence()
+    groups = group_per_signal(patch_metrics)
+    trust = [_signal_trust(m, n, evidence) for m, n in groups]
+    metric = "dE_ITP" if is_hdr else "CIEDE2000"
+    block: dict[str, Any] = {"headline": None, "metric": metric,
+                             "evidence_only": "no gate reads this block — the LLM judges it at the verify seam"}
+    if contents:
+        from . import content_score as cs
+
+        reps = [m for m, _ in groups]
+        nominal = cs.nominal_signal_xyz([m.rgb for m in reps], is_hdr=is_hdr, white_xy=white_xy,
+                                        target_xyz=[m.target_xyz for m in reps])
+        loc = cs.xyz_to_itp(nominal)
+        err = [m.de2000 for m in reps]
+        info = [{"rgb": [round(float(c), 4) for c in m.rgb], "nominal_Y": round(float(nominal[i][1]), 4),
+                 "zone": practical_zone(m, is_hdr=is_hdr), **t} for i, (m, t) in enumerate(zip(reps, trust))]
+        classes: dict[str, Any] = {}
+        for dist in contents:
+            try:
+                res = cs.kernel_score(dist, loc, err, reach=content_reach, sig_info=info)
+                res["provenance"] = dist.provenance()
+            except Exception as exc:  # noqa: BLE001 - evidence must never break the verify
+                res = {"class": getattr(dist, "label", "?"), "score": None,
+                       "error": f"{type(exc).__name__}: {exc}"}
+            classes[str(res.get("class"))] = res
+        block["classes"] = classes
+        first = next(iter(classes.values()))
+        if first.get("score") is not None:
+            block["headline"] = {
+                "label": f"content-weighted {metric} ({first['class']}, R {content_reach:g} dE_ITP)",
+                "basis": "content kernel (study §5.1)", "class": first["class"], "reach_dEITP": content_reach,
+                "score": first["score"], "coverage_gap_pct": first.get("coverage_gap_pct"),
+                "score_with_nearest_fallback": first.get("score_with_nearest_fallback"),
+                "weak_evidence_score_share_pct": ((first.get("evidence") or {}).get("weak") or {}).get(
+                    "score_share_pct")}
+    if content_weights is not None:
+        pw = _patch_weight_block(groups, trust, content_weights, reach=content_reach)
+        block["patch_weights"] = pw
+        if block["headline"] is None and pw["score"] is not None:
+            weak = pw["score_share"].get("weak")
+            block["headline"] = {
+                "label": f"content-weighted {metric} (patch weights: {pw['label']})",
+                "basis": "per-patch content weights (Σ w·E / Σ w)", "class": pw["label"],
+                "reach_dEITP": content_reach, "score": pw["score"],
+                "coverage_gap_pct": pw.get("coverage_gap_pct_as_drawn"),
+                "weak_evidence_score_share_pct": round(100.0 * weak, 1) if weak is not None else None}
+    block["evidence"] = _evidence_header(evidence, trust)
+    return block
+
+
 def practical_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
-                      gamut_aware: bool = False) -> dict[str, Any]:
+                      gamut_aware: bool = False,
+                      content_weights: Optional[ContentWeights] = None,
+                      read_evidence: Optional[ReadEvidence] = None,
+                      content: Any = None, content_reach: float = DEFAULT_CONTENT_REACH,
+                      white_xy: Optional[tuple[float, float]] = None) -> dict[str, Any]:
     """The §0 practically-weighted view of a scored set — the content-priority split that
     rides ALONGSIDE the raw avg/p95/max in every summary, so the number a human/LLM sees
     reads the run the way content does: neutral axis and the Rec.709-volume core first,
@@ -613,8 +788,20 @@ def practical_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
     verify-only deltas and history compare recorded numbers. ``per_signal`` (V2, 2026-10-02)
     is the same split over UNIQUE signals (:func:`per_signal_summary`): a signal read 7× (the
     saturation-sweep bookends) counts once, so the repeated, in-training sweep cannot carry
-    the average (PA32UCXR 2026-10-02: 28 of 141 signals held 63 % of the read weight)."""
+    the average (PA32UCXR 2026-10-02: 28 of 141 signals held 63 % of the read weight).
+
+    CONTENT-WEIGHTED LEAD (2026-10-09, :func:`content_weighted_summary`). The "patch geography already
+    spends its budget where content lives" premise above did not survive the owner's library survey
+    (``results/practical_score_2026-10-09``): the < 1 nit core is under-sampled ~8x and the low-chroma
+    shell ~13x, limits over-sampled ~7x, clamped ~50x. So the zones stay a BREAKDOWN, and when the
+    verify set carries per-patch ``content_weights`` or a content distribution is given (``content``),
+    the block opens with ``content_weighted`` (score + ``coverage_gap_pct``, labelled with the class
+    and reach R) -- evidence only: no gate reads it, the LLM does."""
+    lead = content_weighted_summary(patch_metrics, is_hdr=is_hdr, content_weights=content_weights,
+                                    read_evidence=read_evidence, content=content,
+                                    content_reach=content_reach, white_xy=white_xy)
     return {
+        **({"content_weighted": lead} if lead is not None else {}),
         "gamut_aware": bool(gamut_aware),
         **_practical_buckets(patch_metrics, is_hdr=is_hdr),
         "per_signal": per_signal_summary(patch_metrics, is_hdr=is_hdr),

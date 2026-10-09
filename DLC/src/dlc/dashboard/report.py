@@ -38,6 +38,17 @@ def _de_table(de: dict[str, Any]) -> str:
     # residuals so the headline is never frontier-dominated.
     practical = de.get("practical") or {}
     extra = ""
+    # Content-weighted FIRST (owner 2026-10-09: practical numbers lead) — the error content sees +
+    # the share of content no patch reaches; evidence, no gate reads it. Zones underneath.
+    lead = (practical.get("content_weighted") or {}).get("headline") or {}
+    if lead.get("score") is not None:
+        gap = lead.get("coverage_gap_pct")
+        weak = lead.get("weak_evidence_score_share_pct")
+        extra += (f"<p><b>{html.escape(str(lead.get('label') or 'content-weighted'))}: "
+                  f"{_num(lead.get('score'))}</b>"
+                  + (f" · coverage gap {_num(gap, 1)} %" if gap is not None else "")
+                  + (f" · {_num(weak, 1)} % of it on weak reads" if weak is not None else "")
+                  + "</p>")
     core = practical.get("core") or {}
     clamped = practical.get("clamped") or {}
     if core.get("n"):

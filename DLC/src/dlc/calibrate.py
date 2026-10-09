@@ -385,6 +385,8 @@ class Calibration:
         link_probe: Optional[Callable[[], dict[str, Any]]] = None,
         verify_cube: Optional[Path] = None,
         verify_patches_from: Optional[Path] = None,
+        verify_patches_file: Optional[Path] = None,
+        content_distribution: Optional[Sequence[str]] = None,
         preheat: Optional[str] = None,
         present_stall: Optional[str] = None,
         refine_cube: Optional[str] = None,
@@ -505,6 +507,15 @@ class Calibration:
             ("verify_cube", str(Path(verify_cube).resolve()) if verify_cube is not None else None),
             ("verify_patches_from",
              str(Path(verify_patches_from).resolve()) if verify_patches_from is not None else None),
+            # verify-only: a verify list from a FILE (--verify-patches-file — e.g. a content-sampled set
+            # with per-patch content weights). Its codes + fingerprint are memoised by the
+            # verify-patches-file stage, so a resume measures the identical list.
+            ("verify_patches_file",
+             str(Path(verify_patches_file).resolve()) if verify_patches_file is not None else None),
+            # Any flow: the content distribution(s) the verify's content-weighted practical score is
+            # computed against (--content-distribution PATH[#VARIANT]; else the profile's key). Evidence only.
+            ("content_distribution",
+             [_content_spec_resolved(c) for c in content_distribution] if content_distribution else None),
             # refine-mhc: which 3D LUT the re-refined MHC keeps — the source run's build (default) or
             # the cube INSTALLED now (a later 3dlut-only run over the same MHC lineage).
             ("refine_cube", str(refine_cube).strip().lower() if refine_cube is not None else None),
@@ -735,6 +746,7 @@ class Calibration:
         "install-mhc": ("Reinstall MHC", False),
         "reapply-3dlut": ("Re-apply 3D LUT", False),
         "verify-source": ("Load verify set (source run)", False),
+        "verify-patches-file": ("Load verify set (file)", False),
         "install-candidate": ("Install candidate 3D LUT", False),
         "adaptive-planning": ("Adaptive planning", False),
         "measure:post-mhc": ("Measure · post-MHC", True),
@@ -765,6 +777,8 @@ class Calibration:
         # --verify-cube); without them the flow never announces them.
         if not self.calib.get("verify_patches_from"):
             keys = [k for k in keys if k != "verify-source"]
+        if not self.calib.get("verify_patches_file"):
+            keys = [k for k in keys if k != "verify-patches-file"]
         if not self.calib.get("verify_cube"):
             keys = [k for k in keys if k != "install-candidate"]
         out: list[dict[str, Any]] = []
@@ -2903,6 +2917,10 @@ class Calibration:
         # patch sets are capped to it (docs/hdr-target-design.md). SDR is unaffected.
         hdr = self._hdr_target() if spec.is_hdr else None
         flow = self.calib.get("flow")
+        if flow == "verify-only":
+            # --verify-patches-file: the HDR patch cap is known only now (the target peak) — refuse a
+            # file that drives above it BEFORE the plan seam asks anyone to approve measuring it.
+            self._refuse_verify_file_above_cap()
         # Surface the run's SIZE up front (patch counts per measured stage), so the operator/LLM
         # approves the plan knowing the time cost — and can abort + re-run with different patch
         # flags if it's too long/short. This is the "no reservations about deciding time" lever.
@@ -2965,6 +2983,19 @@ class Calibration:
                                      "installed_stack": self._installed_stack_evidence(),
                                      "scoring_gamut": self._scoring_gamut_source()}
         plan_warnings: list[str] = []
+        listed_digest = (((self.calib.get("stages") or {}).get("verify-patches-file") or {}).get("digest") or {}
+                         if flow == "verify-only" else {})
+        if listed_digest:
+            digest["verify_only"]["verify_patches_file"] = {
+                k: listed_digest.get(k) for k in ("file", "n", "patches_fingerprint", "content_class",
+                                                  "weighted", "held_out_check")}
+            held = listed_digest.get("held_out_check") or {}
+            if held.get("n_fail"):
+                plan_warnings.append(
+                    f"{held['n_fail']} of the file's {listed_digest.get('n')} patches sit < "
+                    f"{held.get('min_codes')} codes from the installed stack's training signals / probe "
+                    f"drives ({held.get('training_run')}) — they are measured and scored (reported, not "
+                    "dropped), but their ΔE is partly in-sample")
         if sdr_white_evidence is not None:
             stack = self.calib.get("installed_stack") or {}
             digest["installed_stack"] = stack
@@ -6656,8 +6687,13 @@ class Calibration:
             # ref-white, reachable) is the practical verdict; `clamped` isolates residuals at
             # the panel's gamut floor so they are read as reachability, never calibration error.
             # Its ``per_signal`` block (V2) is the same split over UNIQUE signals — the gate's basis.
+            # With per-patch content weights (--verify-patches-file) or a content distribution
+            # (--content-distribution / the profile), it OPENS with ``content_weighted`` — the
+            # practical number content sees (score + coverage gap). EVIDENCE ONLY: the gate below
+            # never reads it; the LLM weighs it at this seam.
+            content_kw, content_errors = self._content_practical_kwargs(verify_ti3, metrics)
             practical = practical_summary(metrics, is_hdr=spec.is_hdr,
-                                          gamut_aware=reachable is not None)
+                                          gamut_aware=reachable is not None, **content_kw)
             # HELD-OUT view (V1): how much of the verify sits where the calibration was trained
             # (training TI3 signals ∪ build-probe drives, signal + drive space) vs provably not.
             held_rows: Optional[str] = None
@@ -6713,6 +6749,12 @@ class Calibration:
                       "practical": practical,
                       "worst": [{"rgb": [round(c, 3) for c in m.rgb], "de2000": round(m.de2000, 2),
                                  "gamut_clamped": m.gamut_clamped} for m in worst]}
+            lead = (practical.get("content_weighted") or {}).get("headline")
+            if lead:
+                # Practical numbers LEAD the verify digest (owner 2026-10-09) — evidence, not a gate.
+                digest = {"content_weighted": lead, **digest}
+            if content_errors:
+                digest["content_distribution_errors"] = content_errors
             # V2: the per-UNIQUE-signal view (each signal's ΔE = the mean of its reads) beside the
             # read-weighted headline (``avg_de2000`` stays read-weighted for continuity).
             per = (practical.get("per_signal") or {})
@@ -6804,7 +6846,7 @@ class Calibration:
                      f"(white {d.get('white_de2000')}, max {d.get('max_de2000')})")
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
-            question=(f"The new calibration reads {reads} — "
+            question=(f"The new calibration reads {_content_lead_text(d)}{reads} — "
                       f"{'within' if within else 'outside'} the quality targets. "
                       "Apply this calibration, or revert to the previous display setup?"),
             options=("apply", "revert"),
@@ -7576,6 +7618,15 @@ class Calibration:
                                        "patches_fingerprint": source.get("patches_fingerprint"),
                                        "patch_source": source.get("patch_source")}
             record.pop("verify_held_out_draws", None)   # the source's exact list: no fresh draws
+        listed = self._verify_patches_file_record() if flow == "verify-only" else None
+        if listed is not None:
+            # --verify-patches-file: the file's list IS the plan (a different file = a new plan).
+            n = len(listed.get("codes") or ())
+            record["stages"] = {"verify": n}
+            record["total_patches"] = n
+            record["verify_patches_file"] = {"path": listed.get("path"),
+                                             "patches_fingerprint": listed.get("patches_fingerprint")}
+            record.pop("verify_held_out_draws", None)   # the file's exact list: no fresh draws
         ident = dict(record)
         draws = int(ident.pop("verify_held_out_draws", 0) or 0)
         if draws and self.patch_sizes.verify_held_out_draws == PatchSizes().verify_held_out_draws:
@@ -8327,6 +8378,7 @@ class Calibration:
         try:
             self.stage_preflight()
             self.stage_verify_source()
+            self.stage_verify_patches_file()
             self._adopt_installed_stack_basis()
             self.stage_resolve_target()
             self.stage_whitepoint()
@@ -8501,8 +8553,12 @@ class Calibration:
                 "grey_model_fit": fit}
 
     def _verify_only_patches(self) -> list[tuple[int, int, int]]:
-        """The source run's exact verify list (``--verify-patches-from``), else the standard
-        gamut-aware verify preset (the same QC set every flow verifies with)."""
+        """The file's list (``--verify-patches-file``, memoised by its stage), else the source run's
+        exact verify list (``--verify-patches-from``), else the standard gamut-aware verify preset
+        (the same QC set every flow verifies with)."""
+        listed = self._verify_patches_file_record()
+        if listed is not None:
+            return [tuple(int(c) for c in p) for p in listed.get("codes") or ()]  # type: ignore[misc]
         source = self._verify_source_record()
         if source is not None:
             return [tuple(int(c) for c in p) for p in source.get("patches") or ()]  # type: ignore[misc]
@@ -8628,6 +8684,239 @@ class Calibration:
                 recommendation="abort", digest=dict(outcome.digest or {}))),
                 stage=key, message="verify-only: refused at the source-run mismatch seam")
         return outcome
+
+    # -- --verify-patches-file (a verify list from a file, e.g. a content-sampled set) ---------------
+    def stage_verify_patches_file(self) -> Optional[StageOutcome]:
+        """``--verify-patches-file PATH``: load a verify list from a file (e.g. the content-sampled sets
+        of ``results/practical_score_2026-10-09``, with a per-patch ``content_weight``) and memoise its
+        codes + :func:`verify_only.patches_fingerprint` in the run record, so a resume measures the
+        IDENTICAL list whatever happens to the file on disk.
+
+        HARD refusals (mechanical — the codes would mean another signal): unreadable / malformed file,
+        content mode or bit depth != the run's, a code outside ``0..max_cv``; (HDR) a code above the
+        target-peak cap is refused at resolve-target, before the plan seam (the cap is known there).
+        With ``--verify-patches-from`` as well, the source must have measured this exact list (same
+        fingerprint) — only then are its deltas like-for-like. The held-out distance rule the fresh draws
+        obey (>= 8 codes from every training signal / probe drive, in drive space through the cube) is
+        applied to the file's patches against the installed stack's training run and REPORTED — a
+        failing patch is measured and scored, never silently dropped. Scoring is unchanged (the run's own
+        reachable gamut / OOG basis for HDR, CIEDE2000 for SDR)."""
+        path = self.calib.get("verify_patches_file")
+        if not path:
+            return None
+        key = "verify-patches-file"
+
+        def refuse(message: str, **detail: Any) -> CalibrationAborted:
+            return CalibrationAborted(StageOutcome(key, "aborted", digest={
+                "message": f"--verify-patches-file: {message}", "file": path, **detail}))
+
+        def run() -> StageOutcome:
+            try:
+                doc = verify_only.load_patches_file(Path(path))
+            except verify_only.PatchesFileError as exc:
+                raise refuse(str(exc), **exc.detail)
+            hard = verify_only.patches_file_problems(doc, content_mode=self.content_mode,
+                                                     bit_depth=self.bit_depth)
+            if hard:
+                raise refuse("; ".join(hard), refused=hard)
+            source = self._verify_source_record()
+            if source is not None and source.get("patches_fingerprint") != doc["patches_fingerprint"]:
+                raise refuse(
+                    "with --verify-patches-from the source run must have measured this exact list (fingerprint "
+                    f"{source.get('patches_fingerprint')} != the file's {doc['patches_fingerprint']}) — the deltas "
+                    "vs its verify would compare different patch sets; drop one of the two flags",
+                    source_run=source.get("run"))
+            max_cv = (1 << int(self.bit_depth)) - 1
+            weights = doc.get("weights")
+            weighted = None
+            if weights is not None:
+                per_key: dict[str, float] = {}
+                for code, w in zip(doc["codes"], weights):
+                    k = json.dumps(list(metrics_mod.signal_key([c / max_cv for c in code])))
+                    per_key[k] = per_key.get(k, 0.0) + float(w)
+                weighted = {"weight_sum": round(float(sum(weights)), 6),
+                            "n_weighted": sum(1 for w in weights if w > 0),
+                            "n_zero_weight": sum(1 for w in weights if w <= 0)}
+            try:
+                held = self._verify_file_held_out_check(doc["codes"], weights)
+            except Exception as exc:  # noqa: BLE001 - evidence must never break the load
+                held = {"available": False, "reason": f"check failed ({type(exc).__name__}: {exc})"}
+            digest = {"file": doc["path"], "n": doc["n"], "patches_fingerprint": doc["patches_fingerprint"],
+                      "content_mode": doc["content_mode"], "bit_depth": doc["bit_depth"],
+                      "content_class": doc["content_class"], "weighted": weighted,
+                      "coverage_gap_pct_as_drawn": doc.get("coverage_gap_pct") or None,
+                      "held_out_check": held}
+            data = {"path": doc["path"], "codes": doc["codes"], "patches_fingerprint": doc["patches_fingerprint"],
+                    "content_class": doc["content_class"], "coverage_gap_pct": doc.get("coverage_gap_pct") or {},
+                    "weights": per_key if weights is not None else None}
+            return StageOutcome(key, "done", digest=digest, data=data)
+
+        outcome = self._stage(key, run)
+        if getattr(outcome, "replayed", False):
+            # A resume measures the MEMOISED list; say so when the file on disk no longer matches it.
+            try:
+                now = verify_only.load_patches_file(Path(path))["patches_fingerprint"]
+            except verify_only.PatchesFileError:
+                now = None
+            memo = (outcome.data or {}).get("patches_fingerprint")
+            if now != memo:
+                self.runlog.emit("WARN", key, "verify_patches_file_changed", tier="digest",
+                                 memoised_fingerprint=memo, file_fingerprint_now=now,
+                                 note="the file changed (or vanished) since this run loaded it — the memoised "
+                                      "list is measured, unchanged")
+        return outcome
+
+    def _verify_patches_file_record(self) -> Optional[dict[str, Any]]:
+        """The memoised ``verify-patches-file`` data (codes, fingerprint, weights), or ``None``."""
+        if not self.calib.get("verify_patches_file"):
+            return None
+        rec = (self.calib.get("stages") or {}).get("verify-patches-file") or {}
+        if rec.get("status") != "done":
+            return None
+        return rec.get("data") or None
+
+    def _refuse_verify_file_above_cap(self) -> None:
+        """HDR ``--verify-patches-file``: refuse codes above the run's patch cap (the target peak) — a
+        clipped highlight is not a verify read. Called once the target peak is resolved."""
+        listed = self._verify_patches_file_record()
+        cap = self._patch_max_cv()
+        if listed is None or cap is None:
+            return
+        hard = verify_only.patches_file_problems(
+            {"content_mode": self.content_mode, "bit_depth": self.bit_depth, "codes": listed.get("codes")},
+            content_mode=self.content_mode, bit_depth=self.bit_depth, patch_max_cv=cap)
+        if hard:
+            raise CalibrationAborted(StageOutcome("verify-patches-file", "aborted", digest={
+                "message": "--verify-patches-file: " + "; ".join(hard), "refused": hard,
+                "patch_max_cv": cap, "file": listed.get("path")}))
+
+    def _verify_file_training_run(self) -> tuple[Optional[Path], Optional[str]]:
+        """The run that TRAINED what this verify-only measures: the ``--verify-patches-from`` source,
+        else the installed stack's registry record (its run folder beside this one / under runs/)."""
+        source = self._verify_source_record()
+        if source is not None and source.get("run"):
+            return Path(str(source["run"])), None
+        try:
+            reg = stack_registry.StackRegistry.load(stack_registry.registry_path(self.profile, self.ctx.root))
+            rec = reg.get(self.display.name, self.mode)
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            return None, f"stack registry unreadable ({type(exc).__name__})"
+        if rec is None or not rec.run_id:
+            return None, "no stack-registry record of the installed stack (its training run is unknown)"
+        for root in (self.ctx.root.parent / rec.run_id, runs_dir() / rec.run_id):
+            if (root / "dlc_state.json").is_file():
+                return root, None
+        return None, f"the installed stack's build run {rec.run_id} is not on disk here"
+
+    def _verify_file_held_out_check(self, codes: Sequence[Sequence[int]],
+                                    weights: Optional[Sequence[float]]) -> dict[str, Any]:
+        """The fresh draws' held-out distance rule (:data:`verify_holdout.DRAW_MIN_CODES` codes from every
+        training signal / probe drive, signal space and — through the trained cube — drive space)
+        applied to the file's patches. Evidence: the failing patches are LISTED, never dropped."""
+        root, why = self._verify_file_training_run()
+        if root is None:
+            return {"available": False, "reason": why}
+        max_cv = (1 << int(self.bit_depth)) - 1
+        try:
+            calib = (json.loads((root / "dlc_state.json").read_text(encoding="utf-8")) or {}).get("calib") or {}
+        except (OSError, ValueError) as exc:
+            return {"available": False, "reason": f"training run {root.name} unreadable ({type(exc).__name__})"}
+        training = verify_holdout.training_context(root, calib, max_cv=max_cv)
+        if not training.get("available"):
+            return {"available": False, "reason": f"training run {root.name}: {training.get('reason')}"}
+        rows = verify_holdout.classify_signals(
+            [[c / max_cv for c in p] for p in codes], max_cv=max_cv, training=training["training_signals"],
+            probe_drives=training["probe_drives"], cube=training["cube"], lattice_size=training["lattice_size"])
+        min_codes = verify_holdout.DRAW_MIN_CODES
+        fails = []
+        for i, r in enumerate(rows):
+            ds = [d for d in (r.get("d_in"), r.get("d_drive")) if d is not None]
+            if ds and min(ds) < min_codes:
+                fails.append({"index": i, "code": r["code"], "d_in": r.get("d_in"), "d_drive": r.get("d_drive"),
+                              "content_weight": (round(float(weights[i]), 6) if weights is not None else None)})
+        total_w = float(sum(weights)) if weights is not None else 0.0
+        return {"available": True, "training_run": root.name, "min_codes": min_codes,
+                "rule": (f">= {min_codes:g} codes from every training signal / probe drive (signal space"
+                         + (", + drive space through the trained cube)" if training["cube"] is not None else ")")),
+                "n_checked": len(rows), "n_fail": len(fails),
+                "fail_weight_share": (round(sum(f["content_weight"] or 0.0 for f in fails) / total_w, 4)
+                                      if weights is not None and total_w > 0 else None),
+                "failing": fails[:40], "failing_truncated": len(fails) > 40,
+                "note": "reported, NOT dropped — these patches are measured and scored; their ΔE is partly in-sample"}
+
+    # -- content-weighted practical score inputs (evidence only) ----------------------------------
+    def _content_distribution_specs(self) -> list[str]:
+        """``--content-distribution`` (memoised), else the profile's ``content_distribution`` for the
+        content mode."""
+        specs = self.calib.get("content_distribution")
+        if specs:
+            return [str(s) for s in specs]
+        try:
+            return list(self.profile.content_distribution_for(self.content_mode))
+        except AttributeError:
+            return []
+
+    def _content_distributions(self) -> tuple[list[Any], list[dict[str, Any]]]:
+        """The loaded content distributions (cached per process) + per-spec load errors."""
+        from . import content_score
+
+        cache = getattr(self, "_content_cache", None)
+        if cache is None:
+            cache = self._content_cache = {}
+        out, errors = [], []
+        for spec in self._content_distribution_specs():
+            if spec not in cache:
+                try:
+                    cache[spec] = content_score.load_content_distribution(spec, content_mode=self.content_mode)
+                except Exception as exc:  # noqa: BLE001 - evidence only
+                    cache[spec] = {"spec": spec, "error": f"{type(exc).__name__}: {exc}"}
+            (errors if isinstance(cache[spec], dict) else out).append(cache[spec])
+        return out, errors
+
+    def _verify_content_weights(self) -> Optional[metrics_mod.ContentWeights]:
+        listed = self._verify_patches_file_record() if self.calib.get("flow") == "verify-only" else None
+        if listed is None or not listed.get("weights"):
+            return None
+        weights = {tuple(json.loads(k)): float(v) for k, v in listed["weights"].items()}
+        return metrics_mod.ContentWeights(weights=weights, label=str(listed.get("content_class") or "file"),
+                                          source=listed.get("path"),
+                                          coverage_gap_pct=dict(listed.get("coverage_gap_pct") or {}))
+
+    def _verify_read_evidence(self, verify_ti3: str, metrics: Sequence[Any]) -> metrics_mod.ReadEvidence:
+        """How much each verify signal's ΔE can be trusted: meter reads per signal (the measure NDJSON),
+        the dark-level noise trust flags (the noise sidecar) and the meter floor (the DIP's
+        ``noise_floor_nits``, else the documented fallback)."""
+        from . import content_score
+
+        ti3 = Path(verify_ti3)
+        reads = content_score.read_counts_from_ndjson(ti3.with_suffix(".ndjson"), self._transfer().max_cv)
+        reps = [m for m, _n in metrics_mod.group_per_signal(list(metrics))]
+        low = content_score.low_snr_signal_keys(ti3, reps)
+        dip = self._dip()
+        floor = getattr(dip, "noise_floor_nits", None) if dip is not None else None
+        if floor:
+            return metrics_mod.ReadEvidence(reads=reads or None, low_snr=frozenset(low),
+                                            noise_floor_nits=float(floor),
+                                            noise_floor_source="DIP noise_floor_nits (single reads below are "
+                                                               "noise-dominated)")
+        return metrics_mod.ReadEvidence(reads=reads or None, low_snr=frozenset(low))
+
+    def _content_practical_kwargs(self, verify_ti3: str, metrics: Sequence[Any]) -> tuple[dict[str, Any], list]:
+        """The ``practical_summary`` content kwargs for this verify (empty without weights / a
+        distribution) + distribution load errors. Never raises (evidence only)."""
+        kw: dict[str, Any] = {}
+        errors: list = []
+        try:
+            weights = self._verify_content_weights()
+            contents, errors = self._content_distributions()
+            if weights is None and not contents:
+                return {}, errors
+            wx, wy = self._white_xy()
+            kw = {"content_weights": weights, "content": contents or None, "white_xy": (wx, wy),
+                  "read_evidence": self._verify_read_evidence(verify_ti3, metrics)}
+        except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
+            errors = list(errors) + [{"error": f"content inputs failed ({type(exc).__name__}: {exc})"}]
+        return kw, errors
 
     def stage_install_candidate(self) -> Optional[StageOutcome]:
         """``--verify-cube PATH``: install a candidate 3D LUT on the calibrated slot for this run.
@@ -8825,6 +9114,9 @@ class Calibration:
         out: dict[str, Any] = {"verify_only": {"measured_stack": measured,
                                                "scoring_gamut": self._scoring_gamut_source(),
                                                "preheat_policy": self._preheat_policy() or "auto"}}
+        listed = (((self.calib.get("stages") or {}).get("verify-patches-file") or {}).get("digest") or {})
+        if self.calib.get("verify_patches_file") and listed:
+            out["verify_only"]["verify_patches_file"] = listed
         source = self._verify_source_record()
         if source is None:
             return out
@@ -8981,7 +9273,8 @@ class Calibration:
                     if (row.get("avg") or {}).get("delta") is not None)
             decision = self.adjudicate(AdjudicationRequest(
                 key="verify:candidate", seam=SEAM_VERIFY, stage="verify",
-                question=(f"The candidate 3D LUT {Path(str(cand.get('cube'))).name} reads {reads} "
+                question=(f"The candidate 3D LUT {Path(str(cand.get('cube'))).name} reads "
+                          f"{_content_lead_text(verify)}{reads} "
                           f"({'within' if verify.get('within_quality') else 'outside'} the quality "
                           "targets). Restore the prior cube "
                           f"({cand.get('prior_cube') or 'none — clear the slot'}), or keep the "
@@ -9036,8 +9329,8 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
     # verify-source / install-candidate only with --verify-patches-from / --verify-cube.
-    "verify-only": ("preflight", "verify-source", "resolve-target", "whitepoint", "hardware-readiness",
-                    "install-candidate", "measure:verify", "verify"),
+    "verify-only": ("preflight", "verify-source", "verify-patches-file", "resolve-target", "whitepoint",
+                    "hardware-readiness", "install-candidate", "measure:verify", "verify"),
 }
 
 # Flow registry (the named flows the front door maps an intent onto). HDR is a run
@@ -9609,6 +9902,68 @@ def active_correction(profile: cp.Profile, store: CorrectionStore, display_name:
     return resolve_correction(profile, store, display_name, mode).file
 
 
+def _content_spec_resolved(spec: Any) -> str:
+    """``PATH[#VARIANT]`` with PATH made absolute (the run record must not depend on the cwd)."""
+    from .content_score import parse_content_spec
+
+    path, variant = parse_content_spec(str(spec))
+    return str(Path(path).resolve()) + (f"#{variant}" if variant else "")
+
+
+def _content_lead_text(digest: Mapping[str, Any]) -> str:
+    """The seam question's lead: the content-weighted score + its coverage gap, labelled (evidence the
+    LLM weighs — never a gate). Empty without one."""
+    lead = (digest or {}).get("content_weighted") or {}
+    if lead.get("score") is None:
+        return ""
+    gap = lead.get("coverage_gap_pct")
+    weak = lead.get("weak_evidence_score_share_pct")
+    return (f"{lead.get('label')} {lead['score']}"
+            + (f" (coverage gap {gap} % of content with no patch within R)" if gap is not None else "")
+            + (f", {weak} % of it resting on weak reads (single / at the meter floor / low-SNR)"
+               if weak is not None else "") + "; ")
+
+
+def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> str:
+    """The practical block of the deliverable report: the content-weighted score + coverage gap FIRST
+    (labelled with the class and R), the practical zones underneath. Evidence — no gate reads it."""
+    practical = practical or {}
+    cw = practical.get("content_weighted") or {}
+    rows: list[str] = []
+    for name, res in (cw.get("classes") or {}).items():
+        if res.get("score") is None:
+            rows.append(f"<tr><td>Content-weighted {de} — {name}</td><td class='muted'>"
+                        f"{res.get('error') or 'no covered content'}</td></tr>")
+            continue
+        weak = ((res.get("evidence") or {}).get("weak") or {}).get("score_share_pct")
+        rows.append(f"<tr><td><b>Content-weighted {de} — {name}, R {res.get('reach_dEITP'):g}</b></td>"
+                    f"<td><b>{res.get('score')}</b> · coverage gap {res.get('coverage_gap_pct')} % · "
+                    f"nearest-patch fallback {res.get('score_with_nearest_fallback')}"
+                    + (f" · {weak} % of the score on weak reads" if weak is not None else "") + "</td></tr>")
+    pw = cw.get("patch_weights") or {}
+    if pw.get("score") is not None:
+        weak = (pw.get("score_share") or {}).get("weak")
+        rows.append(f"<tr><td><b>Content-weighted {de} — patch weights ({pw.get('label')})</b></td>"
+                    f"<td><b>{pw.get('score')}</b> over {pw.get('n')} weighted signals"
+                    + (f" · gap as drawn {pw.get('coverage_gap_pct_as_drawn')} %"
+                       if pw.get("coverage_gap_pct_as_drawn") is not None else "")
+                    + (f" · {round(100 * weak, 1)} % of the score on weak reads" if weak is not None else "")
+                    + "</td></tr>")
+    per = practical.get("per_signal") or {}
+    zones = per if (per.get("core") or {}).get("n") else practical
+    for zone, label in (("core", "core (Rec.709 ≤ ref-white)"), ("limits", "limits"),
+                        ("clamped", "clamped (gamut floor)"), ("tube", "near-neutral tube")):
+        b = zones.get(zone) or {}
+        if b.get("n"):
+            rows.append(f"<tr><td>Practical {label}</td><td>avg {b.get('avg')} · p95 {b.get('p95')} · "
+                        f"max {b.get('max')} (n {b.get('n')})</td></tr>")
+    if not rows:
+        return ""
+    return (f"<h2>Practical ({de})</h2><table><tr><th>View</th><th>Value</th></tr>" + "".join(rows)
+            + "</table>" + ("<p class='muted'>Content-weighted = the error content sees (evidence; no gate "
+                            "reads it).</p>" if cw else ""))
+
+
 def _render_report_html(p: dict[str, Any]) -> str:
     v = p.get("verification") or {}
     lut = p.get("lut3d") or {}
@@ -9639,7 +9994,8 @@ def _render_report_html(p: dict[str, Any]) -> str:
         f"<p>Target <code>{p.get('target')}</code> · {p.get('date')} · "
         f"3D LUT {'converged' if lut.get('converged') else 'best-effort'} "
         f"(max {lut_de} {lut.get('best_max_de_report', lut.get('best_max_de', '—'))})</p>"
-        f"<h2>Verification ({metric})</h2><table><tr><th>Metric</th><th>After</th></tr>"
+        + _render_practical_html(v.get("practical"), de)
+        + f"<h2>Verification ({metric})</h2><table><tr><th>Metric</th><th>After</th></tr>"
         + metric_row(f"Average {de}", "avg_de2000")
         + metric_row(f"P95 {de}", "p95_de2000")
         + metric_row(f"Max {de}", "max_de2000")
@@ -9754,6 +10110,8 @@ def run_calibration(
     source_run: Optional[Path] = None,
     verify_cube: Optional[Path] = None,
     verify_patches_from: Optional[Path] = None,
+    verify_patches_file: Optional[Path] = None,
+    content_distribution: Optional[Sequence[str]] = None,
     preheat: Optional[str] = None,
     present_stall: Optional[str] = None,
     content_mode: Optional[str] = None,
@@ -9772,7 +10130,8 @@ def run_calibration(
         adaptive_planning=adaptive_planning,
         require_hardware_readiness=require_hardware_readiness,
         mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run,
-        verify_cube=verify_cube, verify_patches_from=verify_patches_from, preheat=preheat,
+        verify_cube=verify_cube, verify_patches_from=verify_patches_from,
+        verify_patches_file=verify_patches_file, content_distribution=content_distribution, preheat=preheat,
         present_stall=present_stall, content_mode=content_mode, keep_layers=keep_layers)
     return calib.run(flow)
 
@@ -9838,6 +10197,22 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "(read-only) and score it under that run's basis; the verify digest + report "
                              "carry per-bucket deltas vs its recorded verify. A source whose mode / bit "
                              "depth / display / target / correction differs is a seam")
+    parser.add_argument("--verify-patches-file", type=Path, default=None, dest="verify_patches_file",
+                        metavar="JSON",
+                        help="verify-only flow: measure THIS verify list (a JSON file: 'codes' at 'bit_depth', "
+                             "'content_mode', optional per-patch 'content_weight' / meta[i].content_weight — e.g. a "
+                             "content-sampled set). Refused when its content mode / bit depth differ from the run's, "
+                             "a code exceeds max_cv or (HDR) the target-peak patch cap. Codes + fingerprint are "
+                             "memoised (a resume measures the identical list); per-patch weights yield the "
+                             "content-weighted score (evidence, no gate). With --verify-patches-from only when "
+                             "the source measured this exact list")
+    parser.add_argument("--content-distribution", action="append", default=None, dest="content_distribution",
+                        metavar="PATH[#VARIANT]",
+                        help="any flow: a content distribution (the library survey's content_hist_<class>.npz or "
+                             "its JSON export; USER DATA, local path) the verify's content-weighted practical "
+                             "score is computed against (kernel score + coverage gap at R=20 dE_ITP, per class; "
+                             "repeatable). Default: the profile's content_distribution key for the content mode. "
+                             "Evidence only — it leads the practical block; no gate reads it")
     parser.add_argument("--preheat", choices=("auto", "always", "never"), default=None, dest="preheat",
                         help="thermal preheat policy for every measure stage (the closed-loop soak before "
                              "the main pass). auto (default = today's behaviour): soak any characterized "
@@ -10190,13 +10565,42 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                                         "patch_source", "patches_fingerprint")}}
             except verify_only.SourceRunError as exc:
                 out["patch_plan"] = {"error": f"--verify-patches-from: {exc}", **exc.detail}
+        if args.flow == "verify-only" and args.verify_patches_file is not None:
+            # The run measures the FILE's list — that is its size.
+            try:
+                doc = verify_only.load_patches_file(Path(args.verify_patches_file))
+                problems = verify_only.patches_file_problems(doc, content_mode=mode, bit_depth=bd)
+                out["patch_plan"] = {"stages": {"verify": doc["n"]}, "total_patches": doc["n"],
+                                     "verify_patches_file": {k: doc.get(k) for k in
+                                                             ("path", "content_mode", "bit_depth", "content_class",
+                                                              "patches_fingerprint")},
+                                     **({"refused": problems} if problems else {})}
+            except verify_only.PatchesFileError as exc:
+                out["patch_plan"] = {"error": f"--verify-patches-file: {exc}", **exc.detail}
         print(json.dumps(out, indent=2))
         return 0
 
-    if ((args.verify_cube is not None or args.verify_patches_from is not None) and args.flow != "verify-only"
+    verify_flags = (args.verify_cube is not None or args.verify_patches_from is not None
+                    or args.verify_patches_file is not None)
+    if (verify_flags and args.flow != "verify-only"
             and not (args.run and (args.run / "manifest.json").exists())):
-        print(json.dumps({"error": "--verify-cube / --verify-patches-from belong to --flow verify-only"}))
+        print(json.dumps({"error": "--verify-cube / --verify-patches-from / --verify-patches-file belong to "
+                                   "--flow verify-only"}))
         return 2
+    if args.verify_patches_file is not None and not (args.run and (args.run / "manifest.json").exists()):
+        # A fresh run: refuse a file it could never measure like-for-like BEFORE a run folder, dogegen or
+        # the meter exist (the orchestrator re-checks; the HDR peak cap is checked at resolve-target).
+        content = normalize_mode(args.content_mode or args.mode)
+        bd = args.bit_depth if args.bit_depth is not None else (10 if content == "HDR" else 8)
+        try:
+            doc = verify_only.load_patches_file(Path(args.verify_patches_file))
+        except verify_only.PatchesFileError as exc:
+            print(json.dumps({"error": f"--verify-patches-file: {exc}", **exc.detail}))
+            return 2
+        problems = verify_only.patches_file_problems(doc, content_mode=content, bit_depth=bd)
+        if problems:
+            print(json.dumps({"error": "--verify-patches-file: " + "; ".join(problems), "refused": problems}))
+            return 2
     # --keep-layers names and a fresh run's --content-mode coherence are refused BEFORE a run folder,
     # dogegen or the meter exist (a resume is re-checked against its persisted spec below).
     if args.keep_layers:
@@ -10245,9 +10649,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         print(json.dumps({"error": f"--content-mode {eff_content} on a {eff_mode} display: only SDR content on an "
                                    "HDR display exists (Windows composites SDR into HDR)"}))
         return 2
-    if (args.verify_cube is not None or args.verify_patches_from is not None) and eff_flow != "verify-only":
-        print(json.dumps({"error": (f"--verify-cube / --verify-patches-from belong to --flow verify-only "
-                                    f"(this run's flow is {eff_flow}) — nothing else would use them")}))
+    if verify_flags and eff_flow != "verify-only":
+        print(json.dumps({"error": (f"--verify-cube / --verify-patches-from / --verify-patches-file belong to "
+                                    f"--flow verify-only (this run's flow is {eff_flow}) — nothing else would "
+                                    "use them")}))
         return 2
     recorded = (state.get("calib", {}) or {}).get("decisions", {})
     decisions = {k: Decision(v["choice"], v.get("note"), payload=v.get("payload"))
@@ -10512,6 +10917,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             source_run=args.source_run,
                             verify_cube=args.verify_cube,
                             verify_patches_from=args.verify_patches_from,
+                            verify_patches_file=args.verify_patches_file,
+                            content_distribution=args.content_distribution,
                             preheat=args.preheat,
                             present_stall=args.present_stall,
                             refine_cube=args.refine_cube,
