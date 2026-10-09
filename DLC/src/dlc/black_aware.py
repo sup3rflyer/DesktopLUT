@@ -14,15 +14,20 @@ THE MODEL: an additive pedestal, in XYZ. At best the panel shows ``target_xyz + 
   native white, else the DIP's ``native_white_xy``, else D65, which the block then states as ASSUMED).
 
 THE SCORE (:func:`black_aware_patch_scores`). EVERY HDR verify patch is scored (dE_ITP, the engine's own ICtCp)
-against the NEAREST point of the segment ``[target_xyz, target_xyz + F * w]``:
+against the NEAREST point of its REACHABLE SET:
 
-* the panel limit ALLOWS the pedestal but does not demand it. A patch anywhere between its target and
-  target + pedestal costs nothing. True black (target 0) reading 0 costs nothing, and reading the pedestal costs
-  nothing either;
+* the segment ``[target_xyz, target_xyz + F * w]`` for every patch. The panel limit ALLOWS the pedestal but does
+  not demand it: a patch anywhere between its target and target + pedestal costs nothing. True black (target 0)
+  reading 0 costs nothing, and reading the pedestal costs nothing either;
+* plus TRUE BLACK (XYZ 0) for a target BELOW THE FLOOR (:data:`BLACK_REACHABLE_RULE`: PQ target Y < ``F``). The
+  panel's near-black output is {0 (LEDs off)} U [~F, ...): under the pedestal model its lowest lit level is
+  ``F + g * 0+ = F``, so it cannot show a level strictly between 0 and ``F``, and reaching true black there costs
+  nothing (score = min(dE to the segment, dE to black)). At or above ``F`` the target itself is reachable, so the
+  segment alone stands and a read of 0 there remains a crush;
 * a lift in any other colour, or beyond the pedestal, is charged. The segment only adds ``F`` nit of
   pedestal-coloured light: a lifted saturated blue, or a near-black grey lifted to several times the floor,
   keeps (most of) its error;
-* a crush below the target keeps its raw error;
+* a crush below a target the panel COULD show (PQ target Y >= ``F``) keeps its raw error;
 * NO CUTOFF. Bright patches are scored by the same rule. There ``F * w`` is negligible next to the target, so
   the score is continuous and converges to the raw one. Greys converge first. A saturated colour keeps a
   near-black channel well above 1 nit, and the white pedestal is still a few percent of that channel, so its
@@ -32,7 +37,13 @@ against the NEAREST point of the segment ``[target_xyz, target_xyz + F * w]``:
 
 The nearest point is found numerically along the segment: a :data:`SEGMENT_GRID`-point grid on
 ``t in [0, 1]``, then a golden-section refinement in the cells around the grid minimum. Where no point of the
-segment beats the target itself, the raw error stands bit for bit.
+reachable set beats the target itself, the raw error stands bit for bit.
+
+BELOW THE METER FLOOR (:data:`BELOW_METER_FLOOR_RULE`, evidence). A signal whose PQ target Y AND measured Y are
+both below the METER FLOOR is flagged ``below_meter_floor`` and reported (count, content-weight share): its
+score rests on reads the meter cannot resolve. It is still scored by the rule above, never dropped. The meter
+floor is the read evidence's own (:func:`dlc.metrics.resolve_meter_floor`: the DIP's ``noise_floor_nits`` when
+> 0, else the documented fallback); the raw floor fit flags its greys against the same value.
 
 VARIANTS, recorded beside the score and never instead of it. Both apply only to the FLOOR-LIMITED signals
 (below), and every other signal keeps its raw error in them:
@@ -83,9 +94,12 @@ offset would take the bottom greys' offset, but a native tone (gain) error grows
 offset over a wide window therefore picks up the tone error of the 0.03-0.26-nit greys, and the intercept
 separates the two. The window is the first of :data:`RAW_FIT_WINDOWS_NITS` holding at least
 :data:`RAW_FIT_MIN_GREYS` greys: 0.05 nit, widened only when there are too few lit greys there. A grey counts
-when it is lit: its mean measured Y is above the METER FLOOR, the DIP's ``noise_floor_nits`` (else
-:data:`RAW_FIT_METER_FLOOR_FALLBACK_NITS`, stated). The black at code 0 and the greys a local-dimming panel
-shows with its LEDs off read 0 and stay out. They need no floor: the score never charges a reached black.
+when it is LIT. The meter floor is the read evidence's (:func:`dlc.metrics.resolve_meter_floor`). A MEASURED
+meter floor (the DIP's ``noise_floor_nits`` > 0) is evidence that a single read below it is noise, so a grey
+must read above it. The documented FALLBACK is not a measurement of this meter, so it FLAGS
+(``below_meter_floor`` per grey, ``n_below_meter_floor``) and does not drop: a grey then counts when it reads
+above 0. The black at code 0 and the greys a local-dimming panel shows with its LEDs off read 0 and stay out
+(``n_unlit``). They need no floor: a target below the floor reaching black is in the score's reachable set.
 The fit is REFUSED when there are too few greys, when ``F <= 0`` (no lift), when ``g <= 0``, or when the
 intercept's standard error is not below ``F`` (unresolved). It reports ``F``, ``g``, ``n``, the residuals and
 the window.
@@ -118,8 +132,8 @@ from . import _pq
 __all__ = ["FLOOR_LIMITED_FACTOR", "SEGMENT_GRID", "BlackFloor", "resolve_black_floor", "bt2390_black_lift",
            "black_aware_patch_scores", "MODEL_TEXT", "SCORING_TEXT", "BT2390_BAND_TEXT", "RawFloorFit",
            "fit_native_floor", "raw_floor_from_ti3", "raw_floor_from_run", "run_identity", "identity_check",
-           "xy_from_xyz", "RAW_FIT_WINDOWS_NITS", "RAW_FIT_METER_FLOOR_FALLBACK_NITS", "RAW_FIT_MIN_GREYS",
-           "RAW_FIT_RULE", "D65_XY", "PEDESTAL_ASSUMED"]
+           "xy_from_xyz", "RAW_FIT_WINDOWS_NITS", "RAW_FIT_MIN_GREYS", "RAW_FIT_RULE", "D65_XY",
+           "PEDESTAL_ASSUMED", "BLACK_REACHABLE_RULE", "BELOW_METER_FLOOR_RULE"]
 
 # The descriptive floor-limited class (and the scope of the BT.2390 variants): PQ target Y below this multiple
 # of the floor, i.e. the pedestal is >= 10 % of the target. NOT a scoring cutoff.
@@ -134,21 +148,31 @@ PEDESTAL_ASSUMED = "D65 (ASSUMED: no native white available for the pedestal col
 
 # The raw-stage native floor fit (see the module doc).
 RAW_FIT_WINDOWS_NITS = (0.05, 0.1, 0.2, 0.3)   # the first holding >= RAW_FIT_MIN_GREYS lit greys is used
-RAW_FIT_METER_FLOOR_FALLBACK_NITS = 0.001       # only without a DIP noise_floor_nits
 RAW_FIT_MIN_GREYS = 3
 RAW_FIT_RULE = (f"F = the intercept of measured Y = F + g x PQ target Y (least squares) over the raw ramp's lit native "
-                f"greys (R = G = B, the mean of each signal's reads, mean measured Y above the meter floor: the DIP "
-                f"noise_floor_nits, else {RAW_FIT_METER_FLOOR_FALLBACK_NITS:g} nit) with 0 < PQ target <= W, W the "
-                f"first of {', '.join(f'{w:g}' for w in RAW_FIT_WINDOWS_NITS)} nit holding >= {RAW_FIT_MIN_GREYS} "
-                f"greys; refused with fewer greys in the widest window, F <= 0 (no lift), g <= 0, or a standard "
-                f"error of F >= F (unresolved)")
+                f"greys (R = G = B, the mean of each signal's reads) with 0 < PQ target <= W, W the first of "
+                f"{', '.join(f'{w:g}' for w in RAW_FIT_WINDOWS_NITS)} nit holding >= {RAW_FIT_MIN_GREYS} greys. Lit = "
+                f"mean measured Y above the meter floor when the DIP measured it (noise_floor_nits > 0), else above 0 "
+                f"(the fallback meter floor is not a measurement: greys below it are flagged, not dropped). Refused "
+                f"with fewer greys in the widest window, F <= 0 (no lift), g <= 0, or a standard error of F >= F "
+                f"(unresolved)")
+BLACK_REACHABLE_RULE = ("true black (XYZ 0) is in the reachable set when the PQ target Y < F: the panel's near-black "
+                        "output is {0 (LEDs off)} U [F, ...) under the pedestal model (lowest lit level F + g x 0+ = "
+                        "F), so it cannot show a level strictly between 0 and F. Score = min(dE to the segment, dE to "
+                        "black) there; at or above F the segment alone (a read of 0 is a crush)")
+BELOW_METER_FLOOR_RULE = ("flagged (evidence, still scored) when the signal's PQ target Y AND its measured Y (mean of "
+                          "its reads) are both below the meter floor (the read evidence's: the DIP noise_floor_nits "
+                          "when > 0, else the documented fallback)")
 
 MODEL_TEXT = ("additive pedestal in XYZ: the panel at best shows target + F x w, F = the display floor (nit), w = the "
               "pedestal colour as a unit-Y XYZ at the panel's native white chromaticity")
-SCORING_TEXT = ("EVERY HDR patch is scored (dE_ITP) against the NEAREST point of the segment [target XYZ, target XYZ + "
-                "F x w]. The limit allows the pedestal but does not demand it: true black reading 0 costs nothing, a "
-                "lift beyond F or in another colour (e.g. a lifted saturated blue) is charged, a crush keeps its raw "
-                "error. No cutoff: at bright levels F is negligible and the score converges to the raw one. Variants "
+SCORING_TEXT = ("EVERY HDR patch is scored (dE_ITP) against the NEAREST point of its reachable set: the segment "
+                "[target XYZ, target XYZ + F x w], plus true black (XYZ 0) when the PQ target Y < F (the panel shows "
+                "0 or >= F there, nothing between). The limit allows the pedestal but does not demand it: true black "
+                "reading 0 costs nothing, a target below the floor reaching black costs nothing, a lift beyond F or "
+                "in another colour (e.g. a lifted saturated blue) is charged, a crush below a target at or above F "
+                "keeps its raw error. No cutoff: at bright levels F is negligible and the score converges to the raw "
+                "one. Variants "
                 "beside it, floor-limited signals only: 'vs_bt2390_band' (the superseded luminance band to the "
                 "BT.2390 toe) and 'vs_toe_point' (the literal BT.2390 toe point)")
 BT2390_BAND_TEXT = ("superseded rule: floor-limited signals scored against the luminance band [PQ target, BT.2390 "
@@ -247,22 +271,26 @@ def _finite_nonneg(v: Any) -> Optional[float]:
     return f if math.isfinite(f) and f >= 0.0 else None
 
 
-def fit_native_floor(samples: Iterable[Any], *, meter_floor_nits: Any = None,
-                     meter_floor_source: Optional[str] = None,
+def _meter_floor(meter_floor: Any) -> Any:
+    """A :class:`dlc.metrics.MeterFloor` as given, else a DIP ``noise_floor_nits`` value (or ``None``) resolved
+    by :func:`dlc.metrics.resolve_meter_floor`, the read evidence's own rule."""
+    from .metrics import MeterFloor, resolve_meter_floor
+
+    return meter_floor if isinstance(meter_floor, MeterFloor) else resolve_meter_floor(meter_floor)
+
+
+def fit_native_floor(samples: Iterable[Any], *, meter_floor: Any = None,
                      ) -> tuple[Optional[float], Optional[str], dict[str, Any]]:
     """The additive native near-black floor from a raw ramp: ``(floor_nits, refusal, stats)``.
 
     ``samples`` carry ``rgb`` (the HDR signal, 0..1) and ``xyz`` (absolute, nit) like :class:`dlc.mhc.Ti3Sample`.
-    ``meter_floor_nits`` is the DIP's ``noise_floor_nits`` (a grey must read above it to count as lit), else
-    :data:`RAW_FIT_METER_FLOOR_FALLBACK_NITS`. The rule is :data:`RAW_FIT_RULE` (see the module doc).
-    ``floor_nits`` is ``None`` when the fit is refused, and ``refusal`` then states which part of the rule
-    failed."""
-    meter = _finite_nonneg(meter_floor_nits)
-    if meter is None:
-        meter, meter_src = RAW_FIT_METER_FLOOR_FALLBACK_NITS, (
-            f"fallback {RAW_FIT_METER_FLOOR_FALLBACK_NITS:g} nit (no DIP noise_floor_nits)")
-    else:
-        meter_src = meter_floor_source or "DIP noise_floor_nits"
+    ``meter_floor`` is the read evidence's :class:`dlc.metrics.MeterFloor` (or a DIP ``noise_floor_nits`` value,
+    resolved the same way). A MEASURED meter floor excludes the greys at or below it; the fallback only flags
+    them. The rule is :data:`RAW_FIT_RULE` (see the module doc). ``floor_nits`` is ``None`` when the fit is
+    refused, and ``refusal`` then states which part of the rule failed."""
+    mf = _meter_floor(meter_floor)
+    meter = float(mf.nits)
+    lit_above = meter if mf.measured else 0.0
     by_sig: dict[int, list[float]] = {}
     sig_of: dict[int, float] = {}
     for s in samples:
@@ -276,32 +304,37 @@ def fit_native_floor(samples: Iterable[Any], *, meter_floor_nits: Any = None,
         by_sig.setdefault(key, []).append(y)
         sig_of[key] = r
     lit: list[dict[str, Any]] = []
-    below = 0
+    unlit = 0
     for key in sorted(by_sig):
         sig = sig_of[key]
         target = _pq.eotf_norm(sig) * _pq.CONTAINER_NITS
         if not (0.0 < target <= RAW_FIT_WINDOWS_NITS[-1]):
             continue
         meas = float(np.mean(by_sig[key]))
-        if meas <= meter:
-            below += 1
+        if meas <= lit_above:
+            unlit += 1
             continue
         lit.append({"signal_pct": round(100.0 * sig, 4), "target_nits": round(target, 6),
                     "measured_nits": round(meas, 6), "offset_nits": round(meas - target, 6),
-                    "reads": len(by_sig[key]), "_t": target, "_m": meas})
+                    "reads": len(by_sig[key]), "below_meter_floor": meas < meter, "_t": target, "_m": meas})
     window = next((w for w in RAW_FIT_WINDOWS_NITS
                    if sum(1 for r in lit if r["_t"] <= w) >= RAW_FIT_MIN_GREYS), None)
+    lit_rule = (f"mean measured Y > the measured meter floor {meter:g} nit" if mf.measured else
+                f"mean measured Y > 0 (the {meter:g}-nit fallback meter floor is not a measurement: greys below "
+                f"it are flagged below_meter_floor, not dropped)")
     stats: dict[str, Any] = {"rule": RAW_FIT_RULE, "model": "measured Y = F + g x target Y",
-                             "meter_floor_nits": meter, "meter_floor_source": meter_src,
-                             "n_greys_total": len(by_sig), "n_below_meter_floor": below,
+                             "meter_floor_nits": meter, "meter_floor_source": mf.source,
+                             "meter_floor_measured": bool(mf.measured), "lit_rule": lit_rule,
+                             "n_greys_total": len(by_sig), "n_unlit": unlit,
                              "window_nits": window,
                              "window_widened": window is not None and window != RAW_FIT_WINDOWS_NITS[0]}
     rows = [r for r in lit if window is not None and r["_t"] <= window]
     stats["n"] = len(rows)
+    stats["n_below_meter_floor"] = sum(1 for r in rows if r["below_meter_floor"])
     if window is None:
         stats["greys"] = [{k: v for k, v in r.items() if not k.startswith("_")} for r in lit]
         return None, (f"{len(lit)} lit native grey(s) up to {RAW_FIT_WINDOWS_NITS[-1]:g} nit (need >= "
-                      f"{RAW_FIT_MIN_GREYS}; {below} at or below the {meter:g}-nit meter floor)"), stats
+                      f"{RAW_FIT_MIN_GREYS}; {unlit} unlit: {lit_rule})"), stats
     t = np.array([r["_t"] for r in rows], dtype=float)
     m = np.array([r["_m"] for r in rows], dtype=float)
     n = len(rows)
@@ -343,8 +376,8 @@ def _fit_label(run_name: str, role: str) -> str:
     return f"raw run {_run_short(run_name)} ({role}; native near-black grey intercept)"
 
 
-def raw_floor_from_ti3(ti3_path: Path, *, run_name: str, role: str, meter_floor_nits: Any = None,
-                       meter_floor_source: Optional[str] = None, white_xyz: Any = None) -> RawFloorFit:
+def raw_floor_from_ti3(ti3_path: Path, *, run_name: str, role: str, meter_floor: Any = None,
+                       white_xyz: Any = None) -> RawFloorFit:
     """:func:`fit_native_floor` over a raw stage's ``.ti3``. ``role`` says which run this is to the verify
     being scored (e.g. ``this run's raw stage``). ``white_xyz`` is that raw stage's measured native white (the
     pedestal colour). Never raises: an unreadable file is a refusal."""
@@ -358,8 +391,7 @@ def raw_floor_from_ti3(ti3_path: Path, *, run_name: str, role: str, meter_floor_
     except Exception as exc:  # noqa: BLE001 - a refusal, never a crash
         return RawFloorFit(None, label, f"raw run {run_name}: {Path(ti3_path).name} unreadable "
                                         f"({type(exc).__name__}: {exc})")
-    nits, why, stats = fit_native_floor(samples, meter_floor_nits=meter_floor_nits,
-                                        meter_floor_source=meter_floor_source)
+    nits, why, stats = fit_native_floor(samples, meter_floor=meter_floor)
     stats = {"run": run_name, "role": role, "ti3": str(ti3_path), **stats}
     if nits is None:
         return RawFloorFit(None, label, f"raw run {run_name} ({role}): {why}", stats)
@@ -411,8 +443,7 @@ def identity_check(expect: Mapping[str, Any], got: Mapping[str, Any]) -> tuple[l
 
 
 def raw_floor_from_run(run_dir: Path, *, role: str, mode: str = "HDR",
-                       expect: Optional[Mapping[str, Any]] = None, meter_floor_nits: Any = None,
-                       meter_floor_source: Optional[str] = None) -> RawFloorFit:
+                       expect: Optional[Mapping[str, Any]] = None, meter_floor: Any = None) -> RawFloorFit:
     """The native floor of a recorded run's RAW stage.
 
     The run's ``dlc_state.json`` must be a ``mode`` run with a done ``measure:raw`` stage, its ``raw.ti3`` must
@@ -446,8 +477,8 @@ def raw_floor_from_run(run_dir: Path, *, role: str, mode: str = "HDR",
     name = Path(str(recorded)).name if recorded else "raw.ti3"
     for cand in (root / "measurements" / name, Path(str(recorded)) if recorded else None):
         if cand is not None and cand.is_file():
-            fit = raw_floor_from_ti3(cand, run_name=root.name, role=role, meter_floor_nits=meter_floor_nits,
-                                     meter_floor_source=meter_floor_source, white_xyz=white)
+            fit = raw_floor_from_ti3(cand, run_name=root.name, role=role, meter_floor=meter_floor,
+                                     white_xyz=white)
             if expect is not None:
                 fit.stats["identity_unverified"] = unverified
             return fit
@@ -582,9 +613,12 @@ def black_aware_patch_scores(patch_metrics: Sequence[Any], floor: BlackFloor, *,
                              white_xy: Optional[Sequence[float]] = None) -> dict[str, Any]:
     """Per scored patch (HDR, dE_ITP), with ``floor`` available and positive:
 
-    * ``e_black_aware``: dE_ITP against the nearest point of ``[target, target + F * w]`` (the module doc), the
-      raw ``de2000`` bit for bit wherever the segment does not beat the target itself;
-    * ``pedestal_y``: the pedestal luminance of that nearest point (``t* x F``);
+    * ``e_black_aware``: dE_ITP against the nearest point of the reachable set (the module doc): the segment
+      ``[target, target + F * w]``, plus true black (XYZ 0) where ``black_reachable``; the raw ``de2000`` bit
+      for bit wherever neither beats the target itself;
+    * ``black_reachable``: PQ target Y < F (:data:`BLACK_REACHABLE_RULE`); ``scored_vs_black``: true black is
+      the nearest reachable point (strictly nearer than the segment);
+    * ``pedestal_y``: the pedestal luminance of that nearest point (``t* x F``; 0 where scored against black);
     * ``floor_limited``: the descriptive class, PQ target Y below :data:`FLOOR_LIMITED_FACTOR` x the floor;
     * ``e_bt2390_band`` / ``e_toe_point``: the variants (floor-limited patches only, raw elsewhere), ``None``
       without a target peak; ``toe_y`` / ``band2390_y`` their luminances;
@@ -610,11 +644,17 @@ def black_aware_patch_scores(patch_metrics: Sequence[Any], floor: BlackFloor, *,
     m_ict = TargetSpace.xyz_to_ictcp(meas)
     t_star, d_min, d0 = _nearest_on_segment(m_ict, tgt, ped)
     gain = d_min < d0 - 1e-9                  # the segment beats the target itself (beyond rounding)
-    e_ba = np.where(gain, np.minimum(d_min, raw), raw)
+    e_seg = np.where(gain, np.minimum(d_min, raw), raw)
     ty = np.maximum(tgt[:, 1], 0.0)
+    # True black joins the reachable set below the floor: the panel shows 0 (LEDs off) or >= F, nothing between.
+    reach_black = ty < f
+    d_black = de_itp(m_ict - TargetSpace.xyz_to_ictcp(np.zeros((n, 3)))) if n else np.zeros(0)
+    to_black = reach_black & (d_black < e_seg - 1e-9)
+    e_ba = np.where(to_black, d_black, e_seg)
     limited = ty < FLOOR_LIMITED_FACTOR * f
     out: dict[str, Any] = {"floor_limited": limited, "target_y": ty, "measured_y": meas[:, 1],
-                           "pedestal_y": np.where(gain, t_star, 0.0) * f, "e_black_aware": e_ba,
+                           "black_reachable": reach_black, "scored_vs_black": to_black,
+                           "pedestal_y": np.where(gain & ~to_black, t_star, 0.0) * f, "e_black_aware": e_ba,
                            "d0_vs_raw_max": float(np.max(np.abs(d0 - raw))) if n else 0.0,
                            "e_toe_point": None, "e_bt2390_band": None, "toe_y": None, "band2390_y": None}
     if floor.peak_nits:

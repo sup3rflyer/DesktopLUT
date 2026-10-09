@@ -9050,12 +9050,19 @@ class Calibration:
                               "read_xyz": dict(final.reads) or None, "loop_se_de": loop_se or None,
                               "loop_round_se": (dict(final.loop_se) or None) if not is_hdr else None,
                               "reads_basis": final.describe()}
-        dip = self._dip()
-        floor = getattr(dip, "noise_floor_nits", None) if dip is not None else None
-        if floor:
-            kw.update(noise_floor_nits=float(floor),
-                      noise_floor_source="DIP noise_floor_nits (single reads below are noise-dominated)")
+        meter = self._meter_floor(self._dip())
+        kw.update(noise_floor_nits=meter.nits, noise_floor_source=meter.source)
         return metrics_mod.ReadEvidence(**kw)
+
+    @staticmethod
+    def _meter_floor(dip: Any) -> metrics_mod.MeterFloor:
+        """THE meter floor (:func:`dlc.metrics.resolve_meter_floor`): the DIP's ``noise_floor_nits`` when > 0,
+        else the documented fallback. One value for the read evidence AND the black-aware score (its
+        ``below_meter_floor`` flag and the raw floor fit's grey flags)."""
+        made = getattr(dip, "made", None) if dip is not None else None
+        return metrics_mod.resolve_meter_floor(
+            getattr(dip, "noise_floor_nits", None) if dip is not None else None,
+            where=f"DIP noise_floor_nits{f' (made {made})' if made else ''}")
 
     def _score_black_floor(self) -> Any:
         """The display floor of the content-weighted score's BLACK-AWARE variant (:mod:`dlc.black_aware`, HDR,
@@ -9063,8 +9070,8 @@ class Calibration:
 
         1. ``--score-black-floor-nits`` (memoised);
         2. else the NATIVE near-black floor fitted from a raw stage (:func:`dlc.black_aware.fit_native_floor`,
-           the intercept over the lowest lit greys; the meter floor = the DIP's ``noise_floor_nits``): this run's
-           own ``measure:raw`` when it measured one, then an identity-matched recorded run's
+           the intercept over the lowest lit greys; the meter floor = the read evidence's, :meth:`_meter_floor`):
+           this run's own ``measure:raw`` when it measured one, then an identity-matched recorded run's
            (:meth:`_raw_floor_fits`);
         3. else the DIP's ``native_black_nits`` (characterize's full-field black read);
         4. else unavailable.
@@ -9118,14 +9125,11 @@ class Calibration:
         Every recorded run must match this run's display / EDID hardware id / mode / correction
         (:meth:`_floor_identity`); a mismatch is a listed refusal. The list stops at the first usable fit. A raw
         stage measures the NATIVE panel (identity MHC, no cube) separately from the verify, so its near-black
-        greys are a non-circular floor source. The meter floor (which greys count as lit) is the DIP's
-        ``noise_floor_nits``. Never raises: each refusal says why."""
+        greys are a non-circular floor source. The meter floor is :meth:`_meter_floor`, the read evidence's own.
+        Never raises: each refusal says why."""
         from . import black_aware
 
-        meter = getattr(dip, "noise_floor_nits", None) if dip is not None else None
-        made = getattr(dip, "made", None) if dip is not None else None
-        kw = {"meter_floor_nits": meter,
-              "meter_floor_source": f"DIP noise_floor_nits{f' (made {made})' if made else ''}"}
+        kw = {"meter_floor": self._meter_floor(dip)}
         fits: list[Any] = []
         own = (self.calib.get("stages") or {}).get("measure:raw") or {}
         if own:
@@ -10298,6 +10302,15 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
                     f"{ba_b.get('max')}"
                     + (f" (superseded BT.2390-band variant avg {band_b.get('avg')})" if band_b.get("n") else "")
                     + f" (n {raw_b.get('n')}; evidence only — the zones below are unchanged)</td></tr>")
+    bmf = black.get("below_meter_floor") or {}
+    if black.get("applied") and bmf:
+        shares = "; ".join(f"{_html_text(k)} {v.get('content_share_pct')} % of content"
+                           for k, v in (bmf.get("content_share_by_class") or {}).items())
+        rows.append(f"<tr><td>Near-black evidence</td><td>{black.get('n_signals_scored_vs_black')} signal(s) "
+                    f"scored against true black (target below the floor) · {bmf.get('n_signals')} below the "
+                    f"{bmf.get('meter_floor_nits'):g}-nit meter floor, target and read"
+                    + (f" ({shares})" if shares else "")
+                    + f" — still scored ({_html_text(bmf.get('meter_floor_source'))})</td></tr>")
     cont = (black.get("continuity") or {}).get("target_ge_1_nit") or {}
     if cont.get("max_abs_change_dEITP") is not None:
         rows.append(f"<tr><td>Black-aware continuity</td><td>largest per-signal change at PQ target ≥ 1 nit: "

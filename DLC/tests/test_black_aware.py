@@ -26,7 +26,10 @@ Each review finding of 2026-10-09 has a test that failed on the superseded rule:
 _its_basis`` + ``test_the_dashboard_labels_the_black_aware_headline``, #5
 ``test_native_floor_fit_separates_the_floor_from_native_tone_error``, #6
 ``test_a_recorded_raw_floor_must_match_the_scored_runs_identity`` +
-``test_a_full_run_never_borrows_the_previous_stack_under_the_installed_label``.
+``test_a_full_run_never_borrows_the_previous_stack_under_the_installed_label``. The second round (2026-10-09):
+true black reachable below the floor (``test_true_black_is_reachable_below_the_floor_and_a_crush_above_it_is_
+charged``) and one meter floor, the read evidence's (``test_the_meter_floor_is_the_read_evidences_and_a_non_
+positive_dip_value_is_not_a_floor`` + ``test_signals_below_the_meter_floor_are_flagged_reported_and_still_scored``).
 """
 from __future__ import annotations
 
@@ -44,8 +47,8 @@ pytest.importorskip("colour")
 from dlc import _pq
 from dlc import black_aware as ba
 from dlc import content_score as cs
-from dlc.metrics import (ContentWeights, practical_gate_view, practical_summary, score_samples_hdr,
-                         signal_key)
+from dlc.metrics import (METER_FLOOR_NITS_FALLBACK, ContentWeights, MeterFloor, ReadEvidence, practical_gate_view,
+                         practical_summary, resolve_meter_floor, score_samples_hdr, signal_key)
 from dlc.mhc import Ti3Sample
 
 _DLC = Path(__file__).resolve().parents[1]
@@ -257,16 +260,17 @@ def test_native_floor_fit_is_the_intercept_over_the_lowest_lit_greys():
     noise = [0.0, 0.0, 0.0002, -0.0001, 0.0001, -0.0001, 0.0001, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     rows = _ramp(0.004, noise=noise)
     rows.append(rows[2])                                               # a repeat read of code 10: averaged
-    nits, why, st = ba.fit_native_floor(_samples(rows), meter_floor_nits=0.0, meter_floor_source="DIP (test)")
+    nits, why, st = ba.fit_native_floor(_samples(rows), meter_floor=MeterFloor(0.0001, "DIP (test)", True))
     assert why is None and nits == pytest.approx(0.004, abs=3e-4)
     used = [r["signal_pct"] for r in st["greys"]]
     # 0 < PQ target <= 0.05 nit and a lit read: code 0 and the LEDs-off code 3 are out, codes 53+ too
     assert used == [round(100 * c / 1023, 4) for c in _IN_005]
     assert (st["n"], st["window_nits"], st["window_widened"]) == (5, 0.05, False)
-    assert st["greys"][0]["reads"] == 2 and st["n_below_meter_floor"] == 1
+    assert st["greys"][0]["reads"] == 2 and st["n_unlit"] == 1 and st["n_below_meter_floor"] == 0
     assert st["F_nits"] == pytest.approx(nits, abs=1e-6) and st["g"] == pytest.approx(1.0, abs=0.02)
     assert st["se_F_nits"] < st["F_nits"] and st["residual_rms_nits"] < 3e-4 and st["rule"] == ba.RAW_FIT_RULE
-    assert (st["meter_floor_nits"], st["meter_floor_source"]) == (0.0, "DIP (test)")
+    assert (st["meter_floor_nits"], st["meter_floor_source"], st["meter_floor_measured"]) == (0.0001, "DIP (test)",
+                                                                                               True)
     assert all("fitted_nits" in r and "residual_nits" in r for r in st["greys"])
 
 
@@ -274,28 +278,46 @@ def test_native_floor_fit_separates_the_floor_from_native_tone_error():
     """Review #5: the bottom greys sit ~F over the target while the 0.03-0.26-nit greys carry a native TONE error;
     the old median offset over a 0.3-nit window read that tone error as floor."""
     # a gain error everywhere: the intercept is still the additive floor, the gain goes to g
-    nits, why, st = ba.fit_native_floor(_samples(_ramp(0.003, gain=1.10)), meter_floor_nits=0.0)
+    nits, why, st = ba.fit_native_floor(_samples(_ramp(0.003, gain=1.10)), meter_floor=0.0)
     assert why is None and nits == pytest.approx(0.003, abs=1e-6) and st["g"] == pytest.approx(1.10, abs=1e-4)
     assert st["residual_max_abs_nits"] < 1e-5
     # a tone error only above the window (the D1 shape): the bottom-grey floor, not the median of the offsets
     rows = _ramp(0.003, tone_above=0.04)
-    nits, why, st = ba.fit_native_floor(_samples(rows), meter_floor_nits=0.0)
+    nits, why, st = ba.fit_native_floor(_samples(rows), meter_floor=0.0)
     assert why is None and nits == pytest.approx(0.003, abs=1e-6) and st["window_nits"] == 0.05
     offs = [y - _pq_nits(rgb[0]) for rgb, (_x, y, _z) in rows[:len(_CODES)]
             if 0 < _pq_nits(rgb[0]) <= 0.3 and y > 0]
     assert float(np.median(offs)) > 0.0035                             # what the old median rule would have said
 
 
-def test_native_floor_fit_meter_floor_and_window_rules():
-    # the meter floor is the DIP's noise_floor_nits: a lit 0.0008-nit grey counts at a 0-nit floor, not at the
-    # fallback 0.001 (recorded as such)
+def test_the_meter_floor_is_the_read_evidences_and_a_non_positive_dip_value_is_not_a_floor():
+    """Fix 2 (2026-10-09): the raw fit took the DIP's noise_floor_nits 0 as a 0-nit meter floor, while the read
+    evidence (the practical score) took the same 0 as NOT MEASURED and used its 0.05-nit fallback. One resolver
+    now: the DIP's value when > 0, else the documented fallback, stated as such."""
+    for v in (None, 0.0, -0.01, float("nan"), "x"):
+        mf = resolve_meter_floor(v)
+        assert (mf.nits, mf.measured) == (METER_FLOOR_NITS_FALLBACK, False) and mf.source.startswith("fallback")
+    assert "0.0 is not a measured floor" in resolve_meter_floor(0.0).source
+    assert ReadEvidence().noise_floor_source == resolve_meter_floor(None).source       # the default IS the rule
+    mf = resolve_meter_floor(0.002, where="DIP noise_floor_nits (test)")
+    assert (mf.nits, mf.measured) == (0.002, True) and mf.source.startswith("DIP noise_floor_nits (test)")
+    # the fit: a DIP 0 is the fallback. It is no measurement of this meter, so it FLAGS the greys below it and
+    # drops none (lit = a read above 0)
     rows = _ramp(0.0005, off_codes=())
-    _, _, at0 = ba.fit_native_floor(_samples(rows), meter_floor_nits=0.0)
-    _, _, fb = ba.fit_native_floor(_samples(rows))
-    assert at0["n"] == fb["n"] + 1 and at0["n_below_meter_floor"] == 0
-    assert fb["meter_floor_nits"] == ba.RAW_FIT_METER_FLOOR_FALLBACK_NITS and "fallback" in fb["meter_floor_source"]
+    _, _, at0 = ba.fit_native_floor(_samples(rows), meter_floor=0.0)
+    assert (at0["meter_floor_nits"], at0["meter_floor_measured"]) == (METER_FLOOR_NITS_FALLBACK, False)
+    assert "0.0 is not a measured floor" in at0["meter_floor_source"] and at0["n_unlit"] == 0
+    assert at0["n_below_meter_floor"] == at0["n"] == sum(g["below_meter_floor"] for g in at0["greys"]) > 0
+    _, _, none = ba.fit_native_floor(_samples(rows))
+    assert none["n"] == at0["n"] and none["meter_floor_nits"] == METER_FLOOR_NITS_FALLBACK
+    # a MEASURED meter floor excludes: the lit 0.0008-nit grey (code 3) is out at a measured 0.001
+    _, _, meas = ba.fit_native_floor(_samples(rows), meter_floor=0.001)
+    assert meas["meter_floor_measured"] and meas["n_unlit"] == 1 and meas["n"] == at0["n"] - 1
+    # a resolved MeterFloor passes through unchanged (one value everywhere)
+    _, _, same = ba.fit_native_floor(_samples(rows), meter_floor=mf)
+    assert (same["meter_floor_nits"], same["meter_floor_source"]) == (mf.nits, mf.source)
     # too few lit greys in 0.05 nit: widened to the next window, and the stats say so
-    nits, why, st = ba.fit_native_floor(_samples(_ramp(0.004, off_codes=(3, 10, 18, 23))), meter_floor_nits=0.0)
+    nits, why, st = ba.fit_native_floor(_samples(_ramp(0.004, off_codes=(3, 10, 18, 23))), meter_floor=0.0)
     assert why is None and st["window_nits"] == 0.1 and st["window_widened"] and st["n"] == 3
     assert nits == pytest.approx(0.004, abs=1e-6)
 
@@ -303,20 +325,20 @@ def test_native_floor_fit_meter_floor_and_window_rules():
 def test_native_floor_fit_refusals():
     # fewer than 3 lit greys even in the widest window
     nits, why, st = ba.fit_native_floor(
-        _samples(_ramp(0.004, off_codes=(3, 10, 18, 23, 36, 42, 53, 65, 71))), meter_floor_nits=0.0)
+        _samples(_ramp(0.004, off_codes=(3, 10, 18, 23, 36, 42, 53, 65, 71))), meter_floor=0.0)
     assert nits is None and "2 lit native grey" in why and st["n"] == 0 and st["window_nits"] is None
     # no lift: the native greys sit on or below the PQ target
-    nits, why, _ = ba.fit_native_floor(_samples(_ramp(-0.002)), meter_floor_nits=0.0)
+    nits, why, _ = ba.fit_native_floor(_samples(_ramp(-0.002)), meter_floor=0.0)
     assert nits is None and why.startswith("incoherent") and "not a lift" in why
     # unresolved: the intercept's standard error is not below it
     scatter = [0.0, 0.0, 0.004, -0.003, 0.005, -0.004, 0.003, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    nits, why, st = ba.fit_native_floor(_samples(_ramp(0.001, noise=scatter)), meter_floor_nits=0.0)
+    nits, why, st = ba.fit_native_floor(_samples(_ramp(0.001, noise=scatter)), meter_floor=0.0)
     assert nits is None and "standard error" in why and st["se_F_nits"] >= st["F_nits"] > 0
 
 
 def test_raw_floor_from_a_run_and_its_refusals(tmp_path: Path):
     good = ba.raw_floor_from_run(_raw_run(tmp_path, "20260923_120740_186046_hdr_x", _ramp(0.005),
-                                          white_xyz=[95.0, 100.0, 105.0]), role="r", meter_floor_nits=0.0)
+                                          white_xyz=[95.0, 100.0, 105.0]), role="r", meter_floor=0.0)
     assert good.available and good.nits == pytest.approx(0.005, abs=1e-5)
     assert good.source.startswith("raw run 20260923_120740 (r;")
     assert good.stats["run"] == "20260923_120740_186046_hdr_x" and good.stats["n"] == 5
@@ -409,7 +431,13 @@ def test_the_orchestrator_prefers_raw_stages_in_order(tmp_path: Path):
     got = own._score_black_floor()
     assert got.nits == pytest.approx(0.006, abs=1e-5) and "this run's raw stage" in got.source
     assert got.fit["n"] == 5 and got.as_dict()["floor_fit"]["run"] == own.ctx.root.name
-    assert got.fit["meter_floor_nits"] == 0.0 and "DIP noise_floor_nits" in got.fit["meter_floor_source"]
+    # the DIP's noise_floor_nits 0 is NOT a floor: the read evidence's fallback, the same value on both
+    assert got.fit["meter_floor_nits"] == METER_FLOOR_NITS_FALLBACK and not got.fit["meter_floor_measured"]
+    assert "DIP noise_floor_nits (made 2026-06-19) 0.0 is not a measured floor" in got.fit["meter_floor_source"]
+    own._transfer, own._spec = (lambda: SimpleNamespace(max_cv=1023)), (lambda: SimpleNamespace(is_hdr=True))
+    ev = own._verify_read_evidence(str(own.ctx.root / "measurements" / "verify.ti3"), [])
+    assert (ev.noise_floor_nits, ev.noise_floor_source) == (got.fit["meter_floor_nits"],
+                                                            got.fit["meter_floor_source"])
     assert got.pedestal[0] == pytest.approx((0.95 / 3, 1 / 3)) and "native white" in got.pedestal[1]
     # the explicit option still wins
     own.calib["score_black_floor_nits"] = 0.004
@@ -604,6 +632,85 @@ def test_the_score_is_continuous_across_the_old_cutoff():
     assert e[0] > 5.0 and e[1] > 5.0 and abs(e[0] - e[1]) < 0.2
 
 
+def test_true_black_is_reachable_below_the_floor_and_a_crush_above_it_is_charged():
+    """Fix 1 (2026-10-09): the panel's near-black output is {0 (LEDs off)} U [F, ...), so a target below the floor
+    cannot be shown lit at its level and reaching true black costs nothing. The segment alone charged it as a
+    crush (D1: the LEDs-off grey, target 0.00026 nit, read 0: 2.11 dE_ITP). At or above F the target is reachable,
+    so a read of 0 there stays a crush."""
+    from dlc.engine.model import TargetSpace, de_itp
+
+    blue = (0.0, 0.0, 0.02)
+    rows = [("below_reads_black", _grey(0.002), (0.0, 0.0, 0.0)),              # target < F: reached black
+            ("below_reads_between", _grey(0.004), _xyz(_D65, 0.001)),          # target < F: min(segment, black)
+            ("below_on_pedestal", _grey(0.003), tuple(_ideal(_grey(0.003)) + np.array(_xyz(_D65, _FLOOR)))),
+            ("above_reads_black", _grey(0.008), (0.0, 0.0, 0.0)),              # target >= F: a crush
+            ("blue_below_reads_black", blue, (0.0, 0.0, 0.0)),                 # any colour below the floor
+            ("black", (0.0, 0.0, 0.0), (0.0, 0.0, 0.0))]
+    named, metrics = _metrics(rows)
+    per = ba.black_aware_patch_scores(metrics, _floor(), white_xy=_D65)
+    ty = dict(zip(named, per["target_y"]))
+    assert ty["blue_below_reads_black"] < _FLOOR <= ty["above_reads_black"]
+    reach = dict(zip(named, per["black_reachable"]))
+    assert reach == {"below_reads_black": True, "below_reads_between": True, "below_on_pedestal": True,
+                     "above_reads_black": False, "blue_below_reads_black": True, "black": True}
+    e = dict(zip(named, per["e_black_aware"]))
+    vb = dict(zip(named, per["scored_vs_black"]))
+    raw = {k: m.de2000 for k, m in named.items()}
+    # reaching black below the floor costs nothing (the segment alone kept the raw crush error)
+    assert raw["below_reads_black"] > 1.0 and e["below_reads_black"] == 0.0 and vb["below_reads_black"]
+    assert raw["blue_below_reads_black"] > 1.0 and e["blue_below_reads_black"] == 0.0
+    # at or above the floor the target is reachable: a read of 0 stays a crush, raw bit for bit
+    assert e["above_reads_black"] == raw["above_reads_black"] > 1.0 and not vb["above_reads_black"]
+    # between black and the target: the nearer of the segment and black, black computed independently
+    meas = np.array(named["below_reads_between"].measured_xyz)[None, :]
+    d_black = float(de_itp(TargetSpace.xyz_to_ictcp(meas) - TargetSpace.xyz_to_ictcp(np.zeros((1, 3))))[0])
+    assert e["below_reads_between"] == pytest.approx(min(d_black, raw["below_reads_between"]), abs=1e-9)
+    # the pedestal itself is still the nearest point there (not black), and true black on a black target is 0
+    assert e["below_on_pedestal"] < 1e-3 and not vb["below_on_pedestal"] and e["black"] == 0.0 and not vb["black"]
+    ped = dict(zip(named, per["pedestal_y"]))
+    assert ped["below_reads_black"] == 0.0 and ped["below_on_pedestal"] == pytest.approx(_FLOOR, rel=0.05)
+    assert np.all(per["e_black_aware"] <= np.array([m.de2000 for m in metrics]) + 1e-12)
+    # the block counts them
+    out = practical_summary(metrics, is_hdr=True, content=[_content()], white_xy=_D65, black_floor=_floor())
+    block = out["content_weighted"]["black_aware"]
+    assert block["n_black_reachable_signals"] == 5 and block["n_signals_scored_vs_black"] == sum(vb.values())
+    assert "{0 (LEDs off)} U [F" in block["black_reachable_rule"] and "true black" in block["scoring_rule"]
+    rows_vb = {tuple(r["rgb"]) for r in block["per_signal"] if r["scored_vs_black"]}
+    assert tuple(round(c, 4) for c in named["below_reads_black"].rgb) in rows_vb
+
+
+def test_signals_below_the_meter_floor_are_flagged_reported_and_still_scored():
+    """Fix 2 (2026-10-09): a signal whose target AND read are below the meter floor (the read evidence's) is
+    flagged below_meter_floor and reported (count + content-weight share), never dropped from the score."""
+    named, metrics = _set()
+    weights = ContentWeights({signal_key(m.rgb): 1.0 for m in metrics}, label="file")
+    ev = ReadEvidence(noise_floor_nits=0.01, noise_floor_source="DIP noise_floor_nits (test)")
+    out = practical_summary(metrics, is_hdr=True, content=[_content()], content_weights=weights, white_xy=_D65,
+                            black_floor=_floor(), read_evidence=ev)
+    cw = out["content_weighted"]
+    bmf = cw["black_aware"]["below_meter_floor"]
+    # black (0 / 0) and floor_raised (0.002 / ~0.007): below 0.01; lifted_to_toe reads above it, crushed's
+    # target is above it
+    flagged = {tuple(r["rgb"]) for r in cw["black_aware"]["per_signal"] if r["below_meter_floor"]}
+    assert flagged == {tuple(round(c, 4) for c in named[k].rgb) for k in ("black", "floor_raised")}
+    assert (bmf["meter_floor_nits"], bmf["meter_floor_source"]) == (0.01, "DIP noise_floor_nits (test)")
+    assert (bmf["n_signals"], bmf["n_reads"]) == (2, 2) and "same_as_floor_fit" not in bmf     # explicit floor
+    share = cw["classes"]["fixture"]["black_aware"]["evidence"]["below_meter_floor"]
+    assert bmf["content_share_by_class"]["fixture"] == {"content_share_pct": share["content_share_pct"],
+                                                        "black_aware_score_share_pct": share["score_share_pct"]}
+    assert share["n_signals"] == 2 and share["content_share_pct"] > 0
+    assert bmf["patch_weights"]["weight_share_pct"] == round(100 * 2 / 6, 2)
+    # still scored: the flagged signals are in the score, with their black-aware E
+    per = ba.black_aware_patch_scores(metrics, _floor(), white_xy=_D65)          # one read per signal here
+    assert cw["patch_weights"]["black_aware"]["score"] == round(float(np.mean(per["e_black_aware"])), 3)
+    assert all("E_black_aware" in r for r in cw["black_aware"]["per_signal"] if r["below_meter_floor"])
+    # the report states it
+    from dlc.calibrate import _render_practical_html
+
+    html = _render_practical_html(out, "dE_ITP")
+    assert "Near-black evidence" in html and "2 below the 0.01-nit meter floor" in html
+
+
 def test_content_weighted_block_carries_both_numbers_and_the_gate_basis_is_unchanged():
     named, metrics = _set()
     weights = ContentWeights({signal_key(m.rgb): 1.0 for m in metrics}, label="file")
@@ -734,12 +841,17 @@ def test_recorded_d1_run_black_aware_floor_sources():
     * By default the floor is the native near-black floor of the installed stack's training run's raw stage (D1
       is a verify-only run; its stack is run 20260924_132412, a full run, same display / EDID / correction): the
       intercept over its 5 lit greys <= 0.05 nit (0.98 % .. 4.11 %), F 0.00235 nit, g 1.120 (the old median rule
-      read 0.00532: the 0.03-0.26-nit greys' tone error). The meter floor is the DIP's noise_floor_nits (0) and
-      the pedestal colour the raw run's native white. The headline is black-aware 1.427 against raw 1.68; the
-      superseded BT.2390-band variant 1.459, the literal toe point 2.322.
+      read 0.00532: the 0.03-0.26-nit greys' tone error). The pedestal colour is the raw run's native white.
+    * The meter floor is the read evidence's: the DIP's noise_floor_nits is 0 (NOT measured), so the 0.05-nit
+      fallback, the same value in the read evidence, the raw fit (its 5 greys flagged below it, none dropped) and
+      the block. 5 verify signals sit below it, target and read (17.6 % of the content), still scored.
+    * True black is reachable below the floor (3 signals with a PQ target < F): the LEDs-off grey (signal 0.29 %,
+      target 0.00026 nit, read 0) costs 0 instead of 2.11, the only signal that changes. The headline is
+      black-aware 1.335 against raw 1.68 (1.427 before black was reachable); the superseded BT.2390-band variant
+      1.459, the literal toe point 2.322.
     * Continuity: greys >= 1 nit move < 0.0002 dE_ITP. A saturated colour keeps a near-black channel, so the white
       pedestal still moves its chroma above 1 nit (a 1.7-nit Rec.2020 green: 0.167), < 0.03 above 10 nit.
-    * A stated floor moves the score (the superseded band barely depended on it): 0.006 nit -> 1.287.
+    * A stated floor moves the score (the superseded band barely depended on it): 0.006 nit -> 1.196.
     * Without any raw source (the explicit option aside), the DIP's full-field black (0.0 on this local-dimming
       panel) lifts nothing, so the headline stays raw."""
     hist = _STUDY / "content_hist_hdr_live.npz"
@@ -748,15 +860,29 @@ def test_recorded_d1_run_black_aware_floor_sources():
         pytest.skip("local study data / recorded run absent (set DLC_PRACTICAL_STUDY / DLC_PRACTICAL_STUDY_RUNS)")
     default = cs.rescore_run(run, [str(hist)], reach=20.0)["content_weighted"]
     head, block = default["headline"], default["black_aware"]
-    assert head["black_aware"] is True and head["score_raw"] == 1.68 and head["score"] == 1.427
+    assert head["black_aware"] is True and head["score_raw"] == 1.68 and head["score"] == 1.335
     assert block["floor_nits"] == 0.00235 and block["floor_source"].startswith(
         "raw run 20260924_132412 (the installed stack's training run;")
     assert "display floor 0.00235 nit from raw run 20260924_132412" in head["label"]
     fit = block["floor_fit"]
     assert fit["run"] == "20260924_132412_307436_hdr_asus_proart_pa32ucxr" and fit["n"] == 5
-    assert (fit["F_nits"], fit["g"], fit["window_nits"], fit["meter_floor_nits"]) == (0.00235, 1.12044, 0.05, 0.0)
+    assert (fit["F_nits"], fit["g"], fit["window_nits"]) == (0.00235, 1.12044, 0.05)
     assert fit["signal_range_pct"] == [0.9775, 4.1056] and fit["se_F_nits"] < fit["F_nits"]
     assert fit["identity_unverified"] == [] and "dip_store.json" in fit["meter_floor_source"]
+    # one meter floor: the read evidence's fallback (the DIP's 0 is not a measurement), in all three places
+    assert (fit["meter_floor_nits"], fit["meter_floor_measured"], fit["n_below_meter_floor"]) == (0.05, False, 5)
+    assert "0.0 is not a measured floor" in fit["meter_floor_source"]
+    assert (default["evidence"]["noise_floor_nits"], default["evidence"]["noise_floor_source"]) == (
+        fit["meter_floor_nits"], fit["meter_floor_source"])
+    bmf = block["below_meter_floor"]
+    assert (bmf["meter_floor_nits"], bmf["meter_floor_source"]) == (fit["meter_floor_nits"], fit["meter_floor_source"])
+    assert bmf["same_as_floor_fit"] is True and (bmf["n_signals"], bmf["n_reads"]) == (5, 5)
+    assert bmf["content_share_by_class"]["hdr_live"]["content_share_pct"] == 17.6
+    # true black reachable below the floor: only the LEDs-off grey changes
+    assert (block["n_black_reachable_signals"], block["n_signals_scored_vs_black"]) == (3, 1)
+    off = [r for r in block["per_signal"] if r["scored_vs_black"]]
+    assert len(off) == 1 and off[0]["rgb"] == [0.0029] * 3 and off[0]["measured_Y"] == 0.0
+    assert off[0]["E_raw"] == pytest.approx(2.1109, abs=1e-4) and off[0]["E_black_aware"] == 0.0
     assert block["pedestal_source"].startswith("raw run 20260924_132412's native white")
     cls = default["classes"]["hdr_live"]["black_aware"]
     assert cls["vs_bt2390_band"]["score"] == 1.459 and cls["vs_toe_point"]["score"] == 2.322
@@ -765,7 +891,7 @@ def test_recorded_d1_run_black_aware_floor_sources():
     assert cont["target_ge_1_nit"]["max_abs_change_dEITP"] == pytest.approx(0.167, abs=0.002)
     assert cont["target_ge_10_nit"]["max_abs_change_dEITP"] < 0.03
     stated = cs.rescore_run(run, [str(hist)], reach=20.0, black_floor_nits=0.006)["content_weighted"]
-    assert stated["headline"]["score"] == 1.287 and stated["headline"]["black_floor_source"] == (
+    assert stated["headline"]["score"] == 1.196 and stated["headline"]["black_floor_source"] == (
         "explicit option (--black-floor-nits)")
     import unittest.mock as um
 
