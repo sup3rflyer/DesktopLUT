@@ -386,6 +386,7 @@ class Calibration:
         verify_cube: Optional[Path] = None,
         verify_patches_from: Optional[Path] = None,
         verify_patches_file: Optional[Path] = None,
+        verify_patches_order: Optional[str] = None,
         content_distribution: Optional[Sequence[str]] = None,
         preheat: Optional[str] = None,
         present_stall: Optional[str] = None,
@@ -512,6 +513,9 @@ class Calibration:
             # verify-patches-file stage, so a resume measures the identical list.
             ("verify_patches_file",
              str(Path(verify_patches_file).resolve()) if verify_patches_file is not None else None),
+            # ... measured in the FILE's order unless a sort is asked for (--verify-patches-order).
+            ("verify_patches_order",
+             str(verify_patches_order).strip().lower() if verify_patches_order is not None else None),
             # Any flow: the content distribution(s) the verify's content-weighted practical score is
             # computed against (--content-distribution PATH[#VARIANT]; else the profile's key). Evidence only.
             ("content_distribution",
@@ -523,6 +527,10 @@ class Calibration:
             # verify-only: viewing layers left as the user has them for the run (--keep-layers).
             ("keep_layers", sorted({str(n).strip().lower() for n in keep_layers}) if keep_layers is not None
              else None))
+        if verify_patches_order is not None and \
+                str(verify_patches_order).strip().lower() not in verify_only.PATCH_FILE_ORDERS:
+            raise ValueError(f"verify_patches_order must be one of {verify_only.PATCH_FILE_ORDERS}, "
+                             f"got {verify_patches_order!r}")
         if keep_layers is not None:
             unknown = sorted({str(n).strip().lower() for n in keep_layers} - set(CalibrationController.LAYER_NAMES))
             if unknown:
@@ -1845,8 +1853,18 @@ class Calibration:
             ti3_path=meas_dir / ti3_name, ndjson_path=meas_dir / ndjson_name,
             runlog=self.runlog, liveness=self.liveness, dip=dip,
             checkin_interval_s=self._checkin_interval_s, checkin_window=self._checkin_window,
+            patch_min_reads=self._file_min_reads(patches) if role == "verify" else None,
             **self._plausibility_context(role, dip),
         )
+
+    def _file_min_reads(self, patches: Sequence[tuple[int, int, int]]) -> Optional[list[int]]:
+        """A verify-only ``--verify-patches-file``'s per-patch read requests aligned to ``patches`` (by
+        code — any subset / re-measure keeps its request), else ``None`` (the loop's own policy)."""
+        listed = self._verify_patches_file_record() if self.calib.get("flow") == "verify-only" else None
+        if listed is None or not listed.get("min_reads"):
+            return None
+        req = {tuple(int(c) for c in p): int(r or 0) for p, r in zip(listed.get("codes") or (), listed["min_reads"])}
+        return [req.get(tuple(int(c) for c in p), 0) for p in patches]
 
     def _plausibility_context(self, role: str, dip) -> dict[str, Any]:
         """Gamut/correction context for the measure loop's luminance-plausibility envelope
@@ -2987,8 +3005,8 @@ class Calibration:
                          if flow == "verify-only" else {})
         if listed_digest:
             digest["verify_only"]["verify_patches_file"] = {
-                k: listed_digest.get(k) for k in ("file", "n", "patches_fingerprint", "content_class",
-                                                  "weighted", "held_out_check")}
+                k: listed_digest.get(k) for k in ("file", "n", "patches_fingerprint", "measurement_order",
+                                                  "min_reads", "content_class", "weighted", "held_out_check")}
             held = listed_digest.get("held_out_check") or {}
             if held.get("n_fail"):
                 plan_warnings.append(
@@ -7624,8 +7642,11 @@ class Calibration:
             n = len(listed.get("codes") or ())
             record["stages"] = {"verify": n}
             record["total_patches"] = n
+            reads = [int(r or 0) for r in listed.get("min_reads") or ()]
             record["verify_patches_file"] = {"path": listed.get("path"),
-                                             "patches_fingerprint": listed.get("patches_fingerprint")}
+                                             "patches_fingerprint": listed.get("patches_fingerprint"),
+                                             "order": listed.get("order") or "file",
+                                             "min_reads_total": sum(max(1, r) for r in reads) if reads else None}
             record.pop("verify_held_out_draws", None)   # the file's exact list: no fresh draws
         ident = dict(record)
         draws = int(ident.pop("verify_held_out_draws", 0) or 0)
@@ -8719,14 +8740,27 @@ class Calibration:
                                                      bit_depth=self.bit_depth)
             if hard:
                 raise refuse("; ".join(hard), refused=hard)
-            source = self._verify_source_record()
-            if source is not None and source.get("patches_fingerprint") != doc["patches_fingerprint"]:
-                raise refuse(
-                    "with --verify-patches-from the source run must have measured this exact list (fingerprint "
-                    f"{source.get('patches_fingerprint')} != the file's {doc['patches_fingerprint']}) — the deltas "
-                    "vs its verify would compare different patch sets; drop one of the two flags",
-                    source_run=source.get("run"))
             max_cv = (1 << int(self.bit_depth)) - 1
+            # ORDER: the file's list order IS the measurement order (a designed sequence must not be
+            # silently re-shuffled); only an explicit --verify-patches-order re-sorts it.
+            order = str(self.calib.get("verify_patches_order") or "file")
+            file_codes = [list(p) for p in doc["codes"]]
+            if order == "file":
+                measure_codes = file_codes
+            else:
+                from .engine.patches import sort_patches
+
+                # (before resolve-target: the transfer of the display's configured target for the content)
+                transfer = self.profile.transfer_for(self.display.target_name(self.content_mode),
+                                                     bit_depth=self.bit_depth)
+                measure_codes = [list(p) for p in sort_patches([tuple(p) for p in file_codes], order,
+                                                                transfer, warm_tau=self._warm_tau())]
+            # READS: the per-patch minimum accepted reads (a duplicate code takes its largest request).
+            req: dict[tuple, int] = {}
+            for code, r in zip(file_codes, doc.get("reads") or ()):
+                if r:
+                    req[tuple(code)] = max(req.get(tuple(code), 0), int(r))
+            min_reads = [req.get(tuple(p), 0) for p in measure_codes] if req else None
             weights = doc.get("weights")
             weighted = None
             if weights is not None:
@@ -8737,16 +8771,34 @@ class Calibration:
                 weighted = {"weight_sum": round(float(sum(weights)), 6),
                             "n_weighted": sum(1 for w in weights if w > 0),
                             "n_zero_weight": sum(1 for w in weights if w <= 0)}
+            source = self._verify_source_record()
+            if source is not None and source.get("patches_fingerprint") != verify_only.patches_fingerprint(
+                    measure_codes):
+                raise refuse(
+                    "with --verify-patches-from the source run must have measured this exact list in this order "
+                    f"(fingerprint {source.get('patches_fingerprint')} != the {order}-ordered file's "
+                    f"{verify_only.patches_fingerprint(measure_codes)}) — the deltas vs its verify would compare "
+                    "different patch sets; drop one of the two flags", source_run=source.get("run"))
             try:
                 held = self._verify_file_held_out_check(doc["codes"], weights)
             except Exception as exc:  # noqa: BLE001 - evidence must never break the load
                 held = {"available": False, "reason": f"check failed ({type(exc).__name__}: {exc})"}
-            digest = {"file": doc["path"], "n": doc["n"], "patches_fingerprint": doc["patches_fingerprint"],
+            measured_fp = verify_only.patches_fingerprint(measure_codes)
+            reads_rec = ({"n_patches": sum(1 for r in min_reads if r), "max": max(min_reads),
+                          "total_min_reads": int(sum(max(1, r) for r in min_reads)),
+                          "applied": "per-patch read floor in the measure loop (never shortened by the dark "
+                                     "early stop; the DIP may still escalate above it)"}
+                         if min_reads else None)
+            digest = {"file": doc["path"], "n": doc["n"], "patches_fingerprint": measured_fp,
+                      "file_fingerprint": doc["patches_fingerprint"],
+                      "measurement_order": ("file (as listed)" if order == "file"
+                                            else f"{order} (re-sorted on request: --verify-patches-order)"),
                       "content_mode": doc["content_mode"], "bit_depth": doc["bit_depth"],
-                      "content_class": doc["content_class"], "weighted": weighted,
+                      "content_class": doc["content_class"], "weighted": weighted, "min_reads": reads_rec,
                       "coverage_gap_pct_as_drawn": doc.get("coverage_gap_pct") or None,
                       "held_out_check": held}
-            data = {"path": doc["path"], "codes": doc["codes"], "patches_fingerprint": doc["patches_fingerprint"],
+            data = {"path": doc["path"], "codes": measure_codes, "patches_fingerprint": measured_fp,
+                    "file_fingerprint": doc["patches_fingerprint"], "order": order, "min_reads": min_reads,
                     "content_class": doc["content_class"], "coverage_gap_pct": doc.get("coverage_gap_pct") or {},
                     "weights": per_key if weights is not None else None}
             return StageOutcome(key, "done", digest=digest, data=data)
@@ -8758,7 +8810,7 @@ class Calibration:
                 now = verify_only.load_patches_file(Path(path))["patches_fingerprint"]
             except verify_only.PatchesFileError:
                 now = None
-            memo = (outcome.data or {}).get("patches_fingerprint")
+            memo = (outcome.data or {}).get("file_fingerprint") or (outcome.data or {}).get("patches_fingerprint")
             if now != memo:
                 self.runlog.emit("WARN", key, "verify_patches_file_changed", tier="digest",
                                  memoised_fingerprint=memo, file_fingerprint_now=now,
@@ -8889,17 +8941,22 @@ class Calibration:
         from . import content_score
 
         ti3 = Path(verify_ti3)
-        reads = content_score.read_counts_from_ndjson(ti3.with_suffix(".ndjson"), self._transfer().max_cv)
+        ndjson = ti3.with_suffix(".ndjson")
+        max_cv = self._transfer().max_cv
+        reads = content_score.read_counts_from_ndjson(ndjson, max_cv)
+        per_read = content_score.reads_from_ndjson(ndjson, max_cv)
         reps = [m for m, _n in metrics_mod.group_per_signal(list(metrics))]
         low = content_score.low_snr_signal_keys(ti3, reps)
+        # the loop's own ΔE2000 SE of the mean — same metric family only for an SDR (CIEDE2000) verify
+        loop_se = content_score.sidecar_se_de(ti3, reps) if not self._spec().is_hdr else {}
+        kw: dict[str, Any] = {"reads": reads or None, "low_snr": frozenset(low), "read_xyz": per_read or None,
+                              "loop_se_de": loop_se or None}
         dip = self._dip()
         floor = getattr(dip, "noise_floor_nits", None) if dip is not None else None
         if floor:
-            return metrics_mod.ReadEvidence(reads=reads or None, low_snr=frozenset(low),
-                                            noise_floor_nits=float(floor),
-                                            noise_floor_source="DIP noise_floor_nits (single reads below are "
-                                                               "noise-dominated)")
-        return metrics_mod.ReadEvidence(reads=reads or None, low_snr=frozenset(low))
+            kw.update(noise_floor_nits=float(floor),
+                      noise_floor_source="DIP noise_floor_nits (single reads below are noise-dominated)")
+        return metrics_mod.ReadEvidence(**kw)
 
     def _content_practical_kwargs(self, verify_ti3: str, metrics: Sequence[Any]) -> tuple[dict[str, Any], list]:
         """The ``practical_summary`` content kwargs for this verify (empty without weights / a
@@ -9918,7 +9975,9 @@ def _content_lead_text(digest: Mapping[str, Any]) -> str:
         return ""
     gap = lead.get("coverage_gap_pct")
     weak = lead.get("weak_evidence_score_share_pct")
+    bc = lead.get("score_bias_corrected")
     return (f"{lead.get('label')} {lead['score']}"
+            + (f" [noise bias-corrected variant {bc}]" if bc is not None and bc != lead["score"] else "")
             + (f" (coverage gap {gap} % of content with no patch within R)" if gap is not None else "")
             + (f", {weak} % of it resting on weak reads (single / at the meter floor / low-SNR)"
                if weak is not None else "") + "; ")
@@ -9936,10 +9995,14 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
                         f"{res.get('error') or 'no covered content'}</td></tr>")
             continue
         weak = ((res.get("evidence") or {}).get("weak") or {}).get("score_share_pct")
+        nl = ((res.get("evidence") or {}).get("noise_limited") or {}).get("content_share_pct")
+        bc = (res.get("bias_corrected") or {}).get("score")
         rows.append(f"<tr><td><b>Content-weighted {de} — {name}, R {res.get('reach_dEITP'):g}</b></td>"
                     f"<td><b>{res.get('score')}</b> · coverage gap {res.get('coverage_gap_pct')} % · "
                     f"nearest-patch fallback {res.get('score_with_nearest_fallback')}"
-                    + (f" · {weak} % of the score on weak reads" if weak is not None else "") + "</td></tr>")
+                    + (f" · {weak} % of the score on weak reads" if weak is not None else "")
+                    + (f" · noise bias-corrected variant {bc} ({nl} % of content noise-limited)"
+                       if bc is not None else "") + "</td></tr>")
     pw = cw.get("patch_weights") or {}
     if pw.get("score") is not None:
         weak = (pw.get("score_share") or {}).get("weak")
@@ -9948,6 +10011,8 @@ def _render_practical_html(practical: Optional[Mapping[str, Any]], de: str) -> s
                     + (f" · gap as drawn {pw.get('coverage_gap_pct_as_drawn')} %"
                        if pw.get("coverage_gap_pct_as_drawn") is not None else "")
                     + (f" · {round(100 * weak, 1)} % of the score on weak reads" if weak is not None else "")
+                    + (f" · noise bias-corrected variant {pw.get('score_bias_corrected')}"
+                       if pw.get("score_bias_corrected") is not None else "")
                     + "</td></tr>")
     per = practical.get("per_signal") or {}
     zones = per if (per.get("core") or {}).get("n") else practical
@@ -10111,6 +10176,7 @@ def run_calibration(
     verify_cube: Optional[Path] = None,
     verify_patches_from: Optional[Path] = None,
     verify_patches_file: Optional[Path] = None,
+    verify_patches_order: Optional[str] = None,
     content_distribution: Optional[Sequence[str]] = None,
     preheat: Optional[str] = None,
     present_stall: Optional[str] = None,
@@ -10131,7 +10197,8 @@ def run_calibration(
         require_hardware_readiness=require_hardware_readiness,
         mhc_top_hold=mhc_top_hold, white_band=white_band, source_run=source_run,
         verify_cube=verify_cube, verify_patches_from=verify_patches_from,
-        verify_patches_file=verify_patches_file, content_distribution=content_distribution, preheat=preheat,
+        verify_patches_file=verify_patches_file, verify_patches_order=verify_patches_order,
+        content_distribution=content_distribution, preheat=preheat,
         present_stall=present_stall, content_mode=content_mode, keep_layers=keep_layers)
     return calib.run(flow)
 
@@ -10206,6 +10273,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "memoised (a resume measures the identical list); per-patch weights yield the "
                              "content-weighted score (evidence, no gate). With --verify-patches-from only when "
                              "the source measured this exact list")
+    parser.add_argument("--verify-patches-order", choices=verify_only.PATCH_FILE_ORDERS, default=None,
+                        dest="verify_patches_order",
+                        help="with --verify-patches-file: the measurement order. file (default) = exactly as "
+                             "listed (a designed sequence is never re-shuffled); thermal / luminance / random = "
+                             "re-sort with dlc.engine.patches.sort_patches. Recorded in the digest")
     parser.add_argument("--content-distribution", action="append", default=None, dest="content_distribution",
                         metavar="PATH[#VARIANT]",
                         help="any flow: a content distribution (the library survey's content_hist_<class>.npz or "
@@ -10582,6 +10654,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
 
     verify_flags = (args.verify_cube is not None or args.verify_patches_from is not None
                     or args.verify_patches_file is not None)
+    if args.verify_patches_order is not None and args.verify_patches_file is None \
+            and not (args.run and (args.run / "manifest.json").exists()):
+        print(json.dumps({"error": "--verify-patches-order belongs to --verify-patches-file"}))
+        return 2
     if (verify_flags and args.flow != "verify-only"
             and not (args.run and (args.run / "manifest.json").exists())):
         print(json.dumps({"error": "--verify-cube / --verify-patches-from / --verify-patches-file belong to "
@@ -10918,6 +10994,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             verify_cube=args.verify_cube,
                             verify_patches_from=args.verify_patches_from,
                             verify_patches_file=args.verify_patches_file,
+                            verify_patches_order=args.verify_patches_order,
                             content_distribution=args.content_distribution,
                             preheat=args.preheat,
                             present_stall=args.present_stall,

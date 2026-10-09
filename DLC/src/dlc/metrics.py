@@ -597,12 +597,17 @@ class ReadEvidence:
     of content / score resting on weak evidence). ``reads`` = meter reads behind each signal (keyed by
     :func:`signal_key`; ``None`` → the scored rows per signal); ``low_snr`` = signals the measure loop's
     dark-level noise machinery flags (error within repeatability noise, or an unstable level);
-    ``noise_floor_nits`` = below this MEASURED luminance a read is at the meter floor."""
+    ``noise_floor_nits`` = below this MEASURED luminance a read is at the meter floor. ``read_xyz`` =
+    the accepted meter reads (absolute XYZ) behind each signal — their spread is the signal's read noise;
+    ``loop_se_de`` = the measure loop's own SE of the accepted mean (noise sidecar ``se_de``, ΔE2000) per
+    grey signal — used only for SDR runs (the same metric family) and only where the reads are absent."""
     reads: Optional[Mapping[tuple, int]] = None
     low_snr: frozenset = frozenset()
     noise_floor_nits: float = METER_FLOOR_NITS_FALLBACK
     noise_floor_source: str = (f"fallback {METER_FLOOR_NITS_FALLBACK:g} nit (i1D3-class single-read floor; "
                                "no DIP noise floor)")
+    read_xyz: Optional[Mapping[tuple, Sequence[Any]]] = None
+    loop_se_de: Optional[Mapping[tuple, float]] = None
 
 
 @dataclass(frozen=True)
@@ -618,6 +623,7 @@ class ContentWeights:
 
 
 _TRUST_FLAGS = ("single_read", "at_floor", "low_snr", "single_read_at_floor", "weak")
+_NOISE_FLAGS = ("noise_limited", "noise_unknown")
 
 
 def _signal_trust(rep: PatchMetric, n_rows: int, evidence: ReadEvidence) -> dict[str, Any]:
@@ -630,6 +636,40 @@ def _signal_trust(rep: PatchMetric, n_rows: int, evidence: ReadEvidence) -> dict
     low_snr = key in evidence.low_snr
     return {"reads": reads, "single_read": single, "at_floor": floor, "low_snr": low_snr,
             "single_read_at_floor": single and floor, "weak": single or floor or low_snr}
+
+
+# A signal whose scored E is within this many of its own read-noise SEs is "noise-limited": the
+# number is mostly meter noise (E[dE] ~ sqrt(true^2 + noise^2) — dE is a magnitude, so noise BIASES it up).
+NOISE_LIMITED_SE = 1.0
+
+
+def _signal_noise(groups: Sequence[tuple[PatchMetric, int]], evidence: ReadEvidence, *, is_hdr: bool,
+                  white_xy: Optional[tuple[float, float]]) -> list[Optional[dict[str, Any]]]:
+    """Per signal: the read-noise SE of its scored E in the run's metric, where DLC has it — the spread
+    of its repeated accepted reads (:func:`dlc.content_score.read_noise_se`), else (SDR only) the noise
+    sidecar's ``se_de``; ``None`` = no noise evidence (a single read, nothing recorded)."""
+    out: list[Optional[dict[str, Any]]] = [None] * len(groups)
+    if not (evidence.read_xyz or evidence.loop_se_de):
+        return out
+    white = None
+    if not is_hdr and groups:
+        wy = max(float(m.target_xyz[1]) for m, _ in groups)
+        wx, wyy = white_xy if white_xy is not None else (0.3127, 0.3290)
+        white = white_xyz(wy, wx, wyy)
+    for i, (m, rows) in enumerate(groups):
+        key = signal_key(m.rgb)
+        reads = (evidence.read_xyz or {}).get(key)
+        if reads:
+            from .content_score import read_noise_se
+
+            res = read_noise_se(reads, rows=rows, is_hdr=is_hdr, white_xyz=white)
+            if res is not None:
+                out[i] = {**res, "basis": "spread of the signal's accepted reads"}
+                continue
+        se = (evidence.loop_se_de or {}).get(key)
+        if se is not None and not is_hdr:
+            out[i] = {"se": float(se), "basis": "measure-loop noise sidecar se_de (ΔE2000 SE of the mean)"}
+    return out
 
 
 def _evidence_header(evidence: ReadEvidence, trust: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
@@ -645,16 +685,19 @@ def _evidence_header(evidence: ReadEvidence, trust: Sequence[Mapping[str, Any]])
 
 
 def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequence[Mapping[str, Any]],
-                        cw: ContentWeights, *, reach: float) -> dict[str, Any]:
-    """Σ w·E / Σ w over the measured unique signals carrying a content weight (E = per-signal mean)."""
+                        cw: ContentWeights, *, reach: float,
+                        e_corr: Optional[Sequence[float]] = None) -> dict[str, Any]:
+    """Σ w·E / Σ w over the measured unique signals carrying a content weight (E = per-signal mean);
+    ``e_corr`` adds the labelled noise bias-corrected variant Σ w·E_corr / Σ w."""
     total_w = float(sum(max(0.0, float(v)) for v in cw.weights.values()))
-    flags = ("out_of_gamut",) + _TRUST_FLAGS
+    flags = ("out_of_gamut",) + _TRUST_FLAGS + _NOISE_FLAGS
+    num_c = 0.0
     w_share = dict.fromkeys(flags, 0.0)
     s_share = dict.fromkeys(flags, 0.0)
     num = den = 0.0
     n = 0
     seen: set[tuple] = set()
-    for (m, _n), t in zip(groups, trust):
+    for i, ((m, _n), t) in enumerate(zip(groups, trust)):
         key = signal_key(m.rgb)
         seen.add(key)
         w = max(0.0, float(cw.weights.get(key, 0.0)))
@@ -663,7 +706,9 @@ def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequen
         n += 1
         num += w * m.de2000
         den += w
-        on = {"out_of_gamut": bool(m.gamut_clamped), **{k: bool(t[k]) for k in _TRUST_FLAGS}}
+        if e_corr is not None:
+            num_c += w * e_corr[i]
+        on = {"out_of_gamut": bool(m.gamut_clamped), **{k: bool(t[k]) for k in _TRUST_FLAGS + _NOISE_FLAGS}}
         for k in flags:
             if on[k]:
                 w_share[k] += w
@@ -671,12 +716,17 @@ def _patch_weight_block(groups: Sequence[tuple[PatchMetric, int]], trust: Sequen
     unmeasured = sum(max(0.0, float(v)) for k, v in cw.weights.items() if k not in seen)
     return {
         "label": cw.label, "source": cw.source, "score": round(num / den, 3) if den > 0 else None, "n": n,
+        "score_bias_corrected": (round(num_c / den, 3) if (den > 0 and e_corr is not None) else None),
         "weight_measured": round(den, 6), "weight_total": round(total_w, 6),
         "weight_unmeasured_share": round(unmeasured / total_w, 4) if total_w > 0 else None,
         "coverage_gap_pct_as_drawn": (cw.coverage_gap_pct or {}).get(f"reach_{reach:g}"),
         "weight_share": {k: (round(v / den, 4) if den > 0 else None) for k, v in w_share.items()},
         "score_share": {k: (round(v / num, 4) if num > 1e-9 * max(den, 1e-300) else None)
                         for k, v in s_share.items()}}
+
+
+_BIAS_LABEL = ("noise bias-corrected (quadrature subtraction of each signal's read-noise SE, floored at 0) "
+               "— a VARIANT beside the raw score, not the score")
 
 
 def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
@@ -705,6 +755,18 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
     groups = group_per_signal(patch_metrics)
     trust = [_signal_trust(m, n, evidence) for m, n in groups]
     metric = "dE_ITP" if is_hdr else "CIEDE2000"
+    # NOISE-AWARE (2026-10-09): dE is a magnitude, so read noise biases it UP near the meter floor
+    # (E[dE] ~ sqrt(true^2 + noise^2)). Per signal: the noise SE where DLC has it, a noise-limited flag
+    # (E within NOISE_LIMITED_SE of it) and the quadrature bias-corrected E (floored at 0) — a LABELLED
+    # variant reported beside the raw score, never instead of it.
+    noise = _signal_noise(groups, evidence, is_hdr=is_hdr, white_xy=white_xy)
+    e_corr: list[float] = []
+    for (m, _n), t, nz in zip(groups, trust, noise):
+        se = nz["se"] if nz else None
+        t["noise_se"] = round(se, 4) if se is not None else None
+        t["noise_limited"] = se is not None and m.de2000 <= NOISE_LIMITED_SE * se
+        t["noise_unknown"] = se is None
+        e_corr.append(math.sqrt(max(m.de2000 ** 2 - se ** 2, 0.0)) if se is not None else m.de2000)
     block: dict[str, Any] = {"headline": None, "metric": metric,
                              "evidence_only": "no gate reads this block — the LLM judges it at the verify seam"}
     if contents:
@@ -720,7 +782,11 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
         classes: dict[str, Any] = {}
         for dist in contents:
             try:
-                res = cs.kernel_score(dist, loc, err, reach=content_reach, sig_info=info)
+                res = cs.kernel_score(dist, loc, err, reach=content_reach, sig_info=info,
+                                      alt_err={"bias_corrected": e_corr})
+                bc = (res.pop("variants", None) or {}).get("bias_corrected")
+                if bc is not None:
+                    res["bias_corrected"] = {**bc, "label": _BIAS_LABEL}
                 res["provenance"] = dist.provenance()
             except Exception as exc:  # noqa: BLE001 - evidence must never break the verify
                 res = {"class": getattr(dist, "label", "?"), "score": None,
@@ -735,9 +801,12 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
                 "score": first["score"], "coverage_gap_pct": first.get("coverage_gap_pct"),
                 "score_with_nearest_fallback": first.get("score_with_nearest_fallback"),
                 "weak_evidence_score_share_pct": ((first.get("evidence") or {}).get("weak") or {}).get(
-                    "score_share_pct")}
+                    "score_share_pct"),
+                "score_bias_corrected": (first.get("bias_corrected") or {}).get("score"),
+                "noise_limited_content_share_pct": ((first.get("evidence") or {}).get("noise_limited") or {}).get(
+                    "content_share_pct")}
     if content_weights is not None:
-        pw = _patch_weight_block(groups, trust, content_weights, reach=content_reach)
+        pw = _patch_weight_block(groups, trust, content_weights, reach=content_reach, e_corr=e_corr)
         block["patch_weights"] = pw
         if block["headline"] is None and pw["score"] is not None:
             weak = pw["score_share"].get("weak")
@@ -746,8 +815,21 @@ def content_weighted_summary(patch_metrics: list[PatchMetric], *, is_hdr: bool,
                 "basis": "per-patch content weights (Σ w·E / Σ w)", "class": pw["label"],
                 "reach_dEITP": content_reach, "score": pw["score"],
                 "coverage_gap_pct": pw.get("coverage_gap_pct_as_drawn"),
-                "weak_evidence_score_share_pct": round(100.0 * weak, 1) if weak is not None else None}
+                "weak_evidence_score_share_pct": round(100.0 * weak, 1) if weak is not None else None,
+                "score_bias_corrected": pw.get("score_bias_corrected"),
+                "noise_limited_weight_share_pct": (round(100.0 * pw["weight_share"]["noise_limited"], 1)
+                                                   if pw["weight_share"].get("noise_limited") is not None else None)}
     block["evidence"] = _evidence_header(evidence, trust)
+    block["noise"] = {
+        "label": _BIAS_LABEL,
+        "noise_limited_rule": f"E <= {NOISE_LIMITED_SE:g}x its own read-noise SE",
+        "correction": "E_corr = sqrt(max(E^2 - SE^2, 0)) per signal; signals without a noise estimate keep E",
+        "n_with_estimate": sum(1 for nz in noise if nz),
+        "n_noise_limited": sum(1 for t in trust if t["noise_limited"]),
+        "per_signal": [{"rgb": [round(float(c), 4) for c in m.rgb], "E": round(m.de2000, 4),
+                        "noise_se": round(nz["se"], 4), "E_bias_corrected": round(ec, 4),
+                        "noise_limited": t["noise_limited"], "reads": t["reads"], "basis": nz["basis"]}
+                       for (m, _n), t, nz, ec in zip(groups, trust, noise, e_corr) if nz]}
     return block
 
 

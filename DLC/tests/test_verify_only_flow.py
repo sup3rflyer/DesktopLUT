@@ -1256,7 +1256,8 @@ def test_cli_refuses_a_patches_file_before_a_run_exists(tmp_path: Path, monkeypa
             (["--flow", "verify-only", "--bit-depth", "10", "--verify-patches-file", str(hdr10)], "content mode"),
             (["--flow", "verify-only", "--verify-patches-file", str(sdr10)], "bit depth"),        # SDR default 8
             (["--flow", "verify-only", "--bit-depth", "8", "--verify-patches-file", str(sdr8)], "outside 0..255"),
-            (["--flow", "verify-only", "--verify-patches-file", str(tmp_path / "junk.json")], "cannot read")):
+            (["--flow", "verify-only", "--verify-patches-file", str(tmp_path / "junk.json")], "cannot read"),
+            (["--flow", "verify-only", "--verify-patches-order", "thermal"], "--verify-patches-file")):
         assert main(argv + ["--run", str(run_dir)]) == 2, argv
         assert needle in json.loads(capsys.readouterr().out)["error"], argv
         assert not run_dir.exists()
@@ -1281,3 +1282,60 @@ def test_load_patches_file_reads_the_study_format(tmp_path: Path):
         "1 code(s) above this run's HDR patch cap 40 (the target peak; first: index 1 = [47, 47, 47]) — the panel "
         "would read a clipped highlight"]
     assert verify_only.patches_file_problems(doc, content_mode="HDR", bit_depth=10, patch_max_cv=830) == []
+
+
+def test_verify_patches_file_order_and_per_patch_reads(tmp_path: Path):
+    # ORDER: the file's order IS the measurement order (recorded); only an explicit sort re-orders it.
+    # READS: a per-patch minimum accepted read count reaches the measure loop as a read floor.
+    codes = [[900, 900, 900], [60, 60, 60], [500, 300, 250], [200, 200, 200]]
+    f = _patches_file(tmp_path / "ordered.json", codes, weights=[0.1, 0.5, 0.2, 0.2])
+    doc = json.loads(f.read_text(encoding="utf-8"))
+    doc["reads"] = [None, 4, None, 2]
+    f.write_text(json.dumps(doc), encoding="utf-8")
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    calib = _make(tmp_path, "vo_order_file", controller=ctrl, bit_depth=10, verify_patches_file=f)
+    assert calib.run("verify-only").status == "completed"
+    root = calib.ctx.root
+    assert [list(p) for p in verify_only._patches_from_ndjson(root / "measurements" / "verify.ndjson")] == codes
+    listed = calib.calib["stages"]["verify-patches-file"]["digest"]
+    assert listed["measurement_order"].startswith("file")
+    assert listed["min_reads"]["n_patches"] == 2 and listed["min_reads"]["max"] == 4
+    from dlc.content_score import read_counts_from_ndjson
+    from dlc.metrics import signal_key
+    counts = read_counts_from_ndjson(root / "measurements" / "verify.ndjson", 1023)
+    assert counts[signal_key([60 / 1023] * 3)] >= 4 and counts[signal_key([200 / 1023] * 3)] >= 2
+    assert calib.calib["patch_plan"]["verify_patches_file"]["order"] == "file"
+    assert calib.calib["patch_plan"]["verify_patches_file"]["min_reads_total"] == 1 + 4 + 1 + 2
+
+    ctrl2 = CalibrationController.mock()
+    _seed_stack(ctrl2, cube=_cube(tmp_path / "prior2.cube"))
+    sorted_run = _make(tmp_path, "vo_order_lum", controller=ctrl2, bit_depth=10, verify_patches_file=f,
+                       verify_patches_order="luminance")
+    assert sorted_run.run("verify-only").status == "completed"
+    measured = [list(p) for p in verify_only._patches_from_ndjson(
+        sorted_run.ctx.root / "measurements" / "verify.ndjson")]
+    assert measured != codes and sorted(measured) == sorted(codes) and measured[0] == [60, 60, 60]
+    rec = sorted_run.calib["stages"]["verify-patches-file"]
+    assert rec["digest"]["measurement_order"].startswith("luminance")
+    assert rec["data"]["file_fingerprint"] == verify_only.patches_fingerprint(codes)
+    assert rec["data"]["patches_fingerprint"] == verify_only.patches_fingerprint(measured)
+    # the read requests follow their patches through the sort
+    counts2 = read_counts_from_ndjson(sorted_run.ctx.root / "measurements" / "verify.ndjson", 1023)
+    assert counts2[signal_key([60 / 1023] * 3)] >= 4
+    with pytest.raises(ValueError):
+        _make(tmp_path, "vo_order_bad", controller=ctrl2, bit_depth=10, verify_patches_file=f,
+              verify_patches_order="sideways")
+
+
+def test_verify_patches_file_rejects_bad_reads(tmp_path: Path):
+    f = _patches_file(tmp_path / "reads.json", [[100, 100, 100], [200, 200, 200]])
+    doc = json.loads(f.read_text(encoding="utf-8"))
+    for bad in ([1], [0, 2], [2, 99], [2, "3"]):
+        doc["reads"] = bad
+        f.write_text(json.dumps(doc), encoding="utf-8")
+        with pytest.raises(verify_only.PatchesFileError, match="reads"):
+            verify_only.load_patches_file(f)
+    doc["reads"] = [None, 3]
+    f.write_text(json.dumps(doc), encoding="utf-8")
+    assert verify_only.load_patches_file(f)["reads"] == [None, 3]

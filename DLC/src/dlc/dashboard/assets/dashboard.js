@@ -405,6 +405,8 @@ function renderState(s) {
     $("de-cw-lab").textContent = `content-weighted · ${cw["class"] || ""} · R ${cw.reach_dEITP}`;
     $("de-cw-lab").title = cw.label || "";
     setDe("de-cw-score", cw.score);
+    $("de-cw-score").title = cw.score_bias_corrected != null
+      ? `noise bias-corrected variant (quadrature, floored at 0): ${num(cw.score_bias_corrected, 2)}` : "";
     $("de-cw-gap").textContent = cw.coverage_gap_pct != null ? `${num(cw.coverage_gap_pct, 1)} %` : "—";
   }
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);

@@ -53,8 +53,8 @@ import numpy as np
 __all__ = [
     "DEFAULT_REACH", "ITP_SCALE", "CONTENT_JSON_FORMAT", "ZONE_LABELS", "BAND_LABELS",
     "ContentDistribution", "parse_content_spec", "load_content_distribution", "export_content_json",
-    "xyz_to_itp", "nominal_signal_xyz", "kernel_score", "read_counts_from_ndjson",
-    "low_snr_signal_keys", "rescore_run",
+    "xyz_to_itp", "nominal_signal_xyz", "kernel_score", "read_counts_from_ndjson", "reads_from_ndjson",
+    "sidecar_se_de", "read_noise_se", "low_snr_signal_keys", "rescore_run",
 ]
 
 DEFAULT_REACH = 20.0          # dE_ITP; ~ one 33-node PQ cube cell along I (study §5.1)
@@ -290,13 +290,17 @@ def _r(v: Optional[float], nd: int = 3) -> Optional[float]:
 def kernel_score(content: ContentDistribution, sig_itp: Any, sig_err: Any, *,
                  reach: float = DEFAULT_REACH, sigma: Optional[float] = None,
                  sig_info: Optional[Sequence[Mapping[str, Any]]] = None,
-                 top: int = _TOP_CONTRIBUTORS) -> dict[str, Any]:
+                 top: int = _TOP_CONTRIBUTORS,
+                 alt_err: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
     """The study's §5.1 score of one content class against a verify set's unique signals.
 
     ``sig_itp`` (M, 3) nominal ITP locations, ``sig_err`` (M,) per-signal mean ΔE (the run's metric).
     ``sig_info`` (optional, per signal) rides into the top-contributor rows and the evidence shares:
     ``rgb``, ``nominal_Y``, ``reads``, ``zone`` and the trust flags ``single_read`` / ``at_floor`` /
-    ``low_snr`` / ``weak``. Evidence only — no threshold, no verdict."""
+    ``low_snr`` / ``weak`` / ``noise_limited`` / ``noise_unknown``. ``alt_err`` ({name: (M,)}) scores
+    labelled VARIANTS of the per-signal error over the same kernel (e.g. the noise bias-corrected E) —
+    returned under ``variants``, beside the raw score, never instead of it. Evidence only — no threshold,
+    no verdict."""
     from scipy.spatial import cKDTree
 
     reach = float(reach)
@@ -309,6 +313,8 @@ def kernel_score(content: ContentDistribution, sig_itp: Any, sig_err: Any, *,
     ct = cKDTree(pts)
     num = np.zeros(len(w))
     den = np.zeros(len(w))
+    alts = {str(n): np.asarray(v, float).reshape(-1) for n, v in (alt_err or {}).items()}
+    alt_num = {n: np.zeros(len(w)) for n in alts}
     hits = ct.query_ball_point(loc, reach) if len(loc) else []
     for j, ids in enumerate(hits):
         ids = np.asarray(ids, dtype=np.int64)
@@ -318,6 +324,8 @@ def kernel_score(content: ContentDistribution, sig_itp: Any, sig_err: Any, *,
         k = np.exp(-0.5 * (d / sigma) ** 2)
         np.add.at(num, ids, k * err[j])
         np.add.at(den, ids, k)
+        for n, v in alts.items():
+            np.add.at(alt_num[n], ids, k * v[j])
     cov = den > 0
     est = np.where(cov, num / np.where(cov, den, 1.0), np.nan)
     out: dict[str, Any] = {"class": content.label, "reach_dEITP": reach, "sigma_dEITP": sigma,
@@ -335,6 +343,13 @@ def kernel_score(content: ContentDistribution, sig_itp: Any, sig_err: Any, *,
         "p95_covered": _r(_wpct(est[cov], w[cov], 95)) if cov_mass > 0 else None,
         "median_distance_to_nearest_signal": round(_wpct(dn, w, 50), 2),
         "p90_distance_to_nearest_signal": round(_wpct(dn, w, 90), 2)})
+    if alts:
+        out["variants"] = {}
+        for n, v in alts.items():
+            a_est = np.where(cov, alt_num[n] / np.where(cov, den, 1.0), np.nan)
+            out["variants"][n] = {
+                "score": _r(float(np.sum(w[cov] * a_est[cov]) / cov_mass)) if cov_mass > 0 else None,
+                "score_with_nearest_fallback": _r(float(np.sum(w * np.where(cov, a_est, v[jn])) / total))}
     contrib_total = float(np.sum(w[cov] * est[cov]))
     if contrib_total <= 1e-9 * max(cov_mass, 1e-300):
         contrib_total = 0.0      # an error-free set: score shares would be float noise — report none
@@ -375,13 +390,15 @@ def kernel_score(content: ContentDistribution, sig_itp: Any, sig_err: Any, *,
                     "score_share_pct": round(100.0 * float(csum[mask].sum()) / contrib_total, 1),
                     "n_signals": int(mask.sum())}
         out["evidence"] = {f: evidence_share(f) for f in ("weak", "single_read", "at_floor", "low_snr",
-                                                          "single_read_at_floor")}
+                                                          "single_read_at_floor", "noise_limited",
+                                                          "noise_unknown")}
     order = np.argsort(-csum)[:max(0, int(top))]
     rows = []
     for j in order:
         if csum[j] <= 0:
             continue
-        row = {k: info[j][k] for k in ("rgb", "code", "nominal_Y", "reads", "zone", "weak") if k in info[j]}
+        row = {k: info[j][k] for k in ("rgb", "code", "nominal_Y", "reads", "zone", "weak", "noise_se",
+                                       "noise_limited") if k in info[j]}
         row.update({"dE": _r(float(err[j]), 2), "content_share_pct": round(100.0 * share[j] / total, 2),
                     "score_contribution_pct": round(100.0 * csum[j] / contrib_total, 1)})
         rows.append(row)
@@ -396,9 +413,16 @@ def read_counts_from_ndjson(path: Path, max_cv: int) -> dict[tuple, int]:
     """Meter reads behind each signal of a measure stage, from its NDJSON (one row per read): every
     accepted ``measurement`` row counts, keyed by :func:`dlc.metrics.signal_key` of its code / max_cv.
     Repeats of one signal at several patch indices add up. Empty when absent / unreadable."""
+    return {k: len(v) for k, v in reads_from_ndjson(path, max_cv, keep_unreadable=True).items()}
+
+
+def reads_from_ndjson(path: Path, max_cv: int, *, keep_unreadable: bool = False) -> dict[tuple, list]:
+    """The accepted meter reads (absolute XYZ) behind each signal of a measure stage, from its NDJSON —
+    keyed like :func:`read_counts_from_ndjson`; the spread of a signal's repeated reads is its read
+    noise. A read without a finite XYZ is kept as ``None`` only with ``keep_unreadable`` (counting)."""
     from .metrics import signal_key
 
-    counts: dict[tuple, int] = {}
+    counts: dict[tuple, list] = {}
     try:
         with Path(path).open(encoding="utf-8") as fh:
             for line in fh:
@@ -415,10 +439,71 @@ def read_counts_from_ndjson(path: Path, max_cv: int) -> dict[tuple, int]:
                 if not isinstance(rgb, list) or len(rgb) != 3:
                     continue
                 key = signal_key([float(c) / max_cv for c in rgb])
-                counts[key] = counts.get(key, 0) + 1
+                xyz = row.get("xyz")
+                ok = (isinstance(xyz, list) and len(xyz) == 3
+                      and all(isinstance(c, (int, float)) and math.isfinite(c) for c in xyz))
+                if ok or keep_unreadable:
+                    counts.setdefault(key, []).append(tuple(float(c) for c in xyz) if ok else None)
     except OSError:
         return {}
     return counts
+
+
+def sidecar_se_de(ti3_path: Path, reps: Iterable[Any]) -> dict[tuple, float]:
+    """The measure loop's own SE of the accepted mean (``se_de`` — ΔE2000 relative to its white) per
+    grey signal, from ``<ti3>.noise.json`` (multi-read neutral levels only). Empty when absent."""
+    from .measure_loop import noise_sidecar_path
+    from .metrics import signal_key
+
+    try:
+        by = (json.loads(noise_sidecar_path(Path(ti3_path)).read_text(encoding="utf-8")) or {}).get("by_level") or {}
+    except (OSError, ValueError):
+        return {}
+    levels = []
+    for k, v in by.items():
+        try:
+            if isinstance(v, dict) and v.get("se_de") is not None and not v.get("unstable"):
+                levels.append((float(k), float(v["se_de"])))
+        except (TypeError, ValueError):
+            continue
+    out: dict[tuple, float] = {}
+    for m in reps:
+        if not m.grayscale:
+            continue
+        hit = [se for lvl, se in levels if abs(lvl - float(m.rgb[0])) <= 1e-5]
+        if hit:
+            out[signal_key(m.rgb)] = hit[0]
+    return out
+
+
+def read_noise_se(reads: Sequence[Sequence[float]], *, rows: int, is_hdr: bool,
+                  white_xyz: Optional[Sequence[float]] = None) -> Optional[dict[str, Any]]:
+    """The read-noise SE of a signal's scored E, in the run's metric, from the spread of its repeated
+    reads: σ_read = √(Σ d_i² / (n−1)) with d_i the metric distance (dE_ITP for HDR, CIEDE2000 relative
+    to ``white_xyz`` for SDR) of read i from the signal's mean read; each scored row averages
+    ``n / rows`` reads, so SE = σ_read / √(n / rows), floored at the meter's 6-decimal XYZ print
+    quantisation. ``None`` below two reads (no spread → no evidence)."""
+    pts = [r for r in reads if r is not None]
+    n = len(pts)
+    if n < 2:
+        return None
+    arr = np.asarray(pts, float)
+    mean = arr.mean(axis=0)
+    if is_hdr:
+        itp = xyz_to_itp(np.vstack([arr, mean[None, :], (mean + 1e-6)[None, :]])) * ITP_SCALE
+        d = np.linalg.norm(itp[:n] - itp[n], axis=1)
+        q = float(np.linalg.norm(itp[n + 1] - itp[n]))
+    else:
+        from .metrics import delta_e2000, xyz_to_lab
+
+        wt = tuple(float(c) for c in (white_xyz if white_xyz is not None else (95.047, 100.0, 108.883)))
+        lab_m = xyz_to_lab(tuple(float(c) for c in mean), wt)
+        d = np.array([delta_e2000(xyz_to_lab(tuple(float(c) for c in r), wt), lab_m) for r in arr])
+        q = float(delta_e2000(xyz_to_lab(tuple(float(c) + 1e-6 for c in mean), wt), lab_m))
+    per_row = max(1.0, n / max(1, int(rows)))
+    sigma = float(math.sqrt(float(np.sum(d ** 2)) / (n - 1)))
+    se = max(sigma, q / math.sqrt(12.0)) / math.sqrt(per_row)
+    return {"se": se, "sigma_read": sigma, "n_reads": n, "reads_per_row": round(per_row, 3)}
 
 
 def low_snr_signal_keys(ti3_path: Path, reps: Iterable[Any]) -> set[tuple]:
@@ -488,9 +573,12 @@ def rescore_run(run_root: Path, specs: Sequence[str], *, reach: float = DEFAULT_
     from .metrics import group_per_signal
 
     reps = [m for m, _ in group_per_signal(metrics)]
+    per_read = reads_from_ndjson(root / "measurements" / "verify.ndjson", (1 << bit_depth) - 1)
     evidence = ReadEvidence(reads=read_counts_from_ndjson(root / "measurements" / "verify.ndjson",
                                                           (1 << bit_depth) - 1) or None,
-                            low_snr=frozenset(low_snr_signal_keys(ti3, reps)) if ti3.exists() else frozenset())
+                            low_snr=frozenset(low_snr_signal_keys(ti3, reps)) if ti3.exists() else frozenset(),
+                            read_xyz=per_read or None,
+                            loop_se_de=(sidecar_se_de(ti3, reps) or None) if (ti3.exists() and not is_hdr) else None)
     content_mode = "HDR" if is_hdr else "SDR"
     contents = [load_content_distribution(s, content_mode=content_mode) for s in specs]
     practical = practical_summary(metrics, is_hdr=is_hdr, gamut_aware=bool(summ.get("practical", {}).get("gamut_aware")),

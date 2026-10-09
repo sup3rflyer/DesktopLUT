@@ -48,6 +48,8 @@ def _de_table(de: dict[str, Any]) -> str:
                   f"{_num(lead.get('score'))}</b>"
                   + (f" · coverage gap {_num(gap, 1)} %" if gap is not None else "")
                   + (f" · {_num(weak, 1)} % of it on weak reads" if weak is not None else "")
+                  + (f" · noise bias-corrected variant {_num(lead.get('score_bias_corrected'))}"
+                     if lead.get("score_bias_corrected") is not None else "")
                   + "</p>")
     core = practical.get("core") or {}
     clamped = practical.get("clamped") or {}

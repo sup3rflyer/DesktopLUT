@@ -227,6 +227,14 @@ class PatchesFileError(SourceRunError):
     """The verify patches file cannot supply a patch list (unreadable / malformed)."""
 
 
+# A per-patch read request above this is a malformed file, not a plan (the loop flags a patch as
+# abnormal past ~2x its target; 32 reads of a dark patch is already many minutes).
+MAX_FILE_READS = 32
+# --verify-patches-order: the file's own order (default — the measurement order IS the file's) or an
+# explicit re-sort by dlc.engine.patches.sort_patches.
+PATCH_FILE_ORDERS = ("file", "thermal", "luminance", "random")
+
+
 def load_patches_file(path: Path) -> dict[str, Any]:
     """A verify patch list from a file (``--verify-patches-file``), e.g. the content-sampled sets of
     ``results/practical_score_2026-10-09`` (``patchset_hdr.json``). Format (JSON object):
@@ -235,6 +243,10 @@ def load_patches_file(path: Path) -> dict[str, Any]:
     * ``content_mode`` (``HDR`` / ``SDR``: what the codes ARE) and ``bit_depth`` — both required;
     * optional per-patch content weight: ``content_weight`` (a list parallel to ``codes``) or
       ``meta[i].content_weight`` — Σ w·dE is the content-weighted score of the content it was drawn from;
+    * optional per-patch ``reads`` — the MINIMUM accepted reads for that patch (an integer
+      1..:data:`MAX_FILE_READS`, or ``null`` = the loop's own policy): a list parallel to ``codes`` or
+      ``meta[i].reads``; passed to the measure loop as a per-patch read floor;
+    * the list ORDER is the measurement order (unless the run asks for a sort);
     * optional ``content_class`` (label; default the file stem), ``coverage_gap_pct_of_content``
       (``{"reach_20": {"proposed": 6.99, ...}}`` — the draw's own gap) and ``nominal_xyz`` / ``rgb``
       (carried, not used: scoring re-derives targets from the codes).
@@ -280,13 +292,25 @@ def load_patches_file(path: Path) -> dict[str, Any]:
         if len(weights) != len(codes) or any(not (w >= 0.0) or w == float("inf") for w in weights):
             raise PatchesFileError(f"{path.name}: content weights must be {len(codes)} finite values >= 0",
                                    file=str(path), n_weights=len(weights))
+    reads: Optional[list[Optional[int]]] = None
+    raw_reads = doc.get("reads") if isinstance(doc.get("reads"), list) else (
+        [(m or {}).get("reads") if isinstance(m, dict) else None for m in doc["meta"]]
+        if isinstance(doc.get("meta"), list) and any(isinstance(m, dict) and "reads" in m for m in doc["meta"])
+        else None)
+    if raw_reads is not None:
+        if len(raw_reads) != len(codes) or not all(
+                r is None or (isinstance(r, int) and not isinstance(r, bool) and 1 <= r <= MAX_FILE_READS)
+                for r in raw_reads):
+            raise PatchesFileError(f"{path.name}: 'reads' must be {len(codes)} entries, each null or an integer "
+                                   f"1..{MAX_FILE_READS}", file=str(path))
+        reads = [None if r is None else int(r) for r in raw_reads]
     gap: dict[str, float] = {}
     for reach, row in (doc.get("coverage_gap_pct_of_content") or {}).items():
         val = row.get("proposed") if isinstance(row, dict) else row
         if isinstance(val, (int, float)) and not isinstance(val, bool):
             gap[str(reach)] = float(val)
     return {"path": str(path.resolve()), "file": path.name, "content_mode": mode, "bit_depth": int(bd),
-            "codes": codes, "n": len(codes), "weights": weights,
+            "codes": codes, "n": len(codes), "weights": weights, "reads": reads,
             "content_class": str(doc.get("content_class") or path.stem),
             "coverage_gap_pct": gap, "patches_fingerprint": patches_fingerprint(codes)}
 

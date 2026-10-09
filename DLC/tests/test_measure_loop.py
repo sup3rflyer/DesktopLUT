@@ -2165,3 +2165,41 @@ def test_legacy_one_shot_meter_tags_a_no_reading_exit_as_a_meter_fault(tmp_path:
     reading = meter(_patch("p0", (512, 512, 512), t, 0))
     assert reading.ok is False and reading.raw["meter_fault"] == "exited"
     assert "Instrument access failed" in (reading.error or "")
+
+
+def test_per_patch_min_reads_raise_the_floor_and_are_never_shortened():
+    # A verify patches file's per-patch ``reads``: a floor above the loop's own policy, and the dark
+    # early stop (two agreeing reads) never cuts it short.
+    t = _sdr()
+    clean = _ScriptedPanel([(0.75, 0.80, 0.88)])
+    cfg = MeasureLoopConfig(dark_min_reads=3, dark_floor_max_nits=120.0)      # default dark_agree_reads=2
+    loop = _solo_loop(clean, t, cfg)
+    asked = MeasurePatch(label="p0", rgb=(102, 102, 102), signal=to_signal([(102, 102, 102)], t)[0], seq=0,
+                         min_reads=5)
+    assert loop._read_floor_for(asked) == 5 and not loop._dark_floor_binds(asked)
+    assert loop.measure_patch(asked, phase="main").reads_taken == 5
+    colour = MeasurePatch(label="p1", rgb=(600, 300, 200), signal=to_signal([(600, 300, 200)], t)[0], seq=1,
+                          min_reads=3)
+    assert loop._read_floor_for(colour) == 3          # not near-neutral: the request alone sets the floor
+
+
+def test_run_measure_loop_threads_patch_min_reads(tmp_path: Path):
+    t = _sdr()
+    patches = [(300, 300, 300), (700, 400, 300)]
+    ndjson = tmp_path / "v.ndjson"
+    res = run_measure_loop(patches=patches, transfer=t, measure=_ScriptedPanel([(20.0, 21.0, 23.0)]),
+                           config=MeasureLoopConfig(), ndjson_path=ndjson, patch_min_reads=[4, 0])
+    assert res is not None
+    rows = [json.loads(line) for line in ndjson.read_text(encoding="utf-8").splitlines() if line.strip()]
+    counts: dict = {}
+    for r in rows:
+        if r.get("role") == "measurement":
+            counts[tuple(r["rgb"])] = counts.get(tuple(r["rgb"]), 0) + 1
+    assert counts[(300, 300, 300)] >= 4 and counts[(700, 400, 300)] >= 1
+    try:
+        run_measure_loop(patches=patches, transfer=t, measure=_ScriptedPanel([(20.0, 21.0, 23.0)]),
+                         config=MeasureLoopConfig(), patch_min_reads=[1])
+    except ValueError as exc:
+        assert "patch_min_reads" in str(exc)
+    else:
+        raise AssertionError("a misaligned patch_min_reads must be refused")

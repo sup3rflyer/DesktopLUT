@@ -220,3 +220,55 @@ def test_recorded_d1_run_reproduces_the_study_score():
     # the near-black reads that carry the number are visible as weak evidence
     assert res["evidence"]["at_floor"]["score_share_pct"] > 40.0
     assert got["headline"]["score"] == 1.68
+
+
+def test_noise_aware_variant_flags_noise_limited_signals_and_corrects_in_quadrature():
+    a, b, c = (0.05, 0.05, 0.05), (0.5, 0.5, 0.5), (0.6, 0.3, 0.3)
+    y = 0.02
+    # a: 4 near-black reads scattered far more than its scored E → noise-limited; b: tight repeats → not;
+    # c: a single read → no noise evidence ("noise unknown")
+    reads_a = [(y * 0.95, y, y * 1.09), (y * 1.4, y * 0.8, y * 0.7), (y * 0.6, y * 1.3, y * 1.6), (y, y, y)]
+    reads_b = [(47.5, 50.0, 54.5), (47.51, 50.01, 54.49)]
+    metrics = [PatchMetric(a, tuple(sum(r[i] for r in reads_a) / 4 for i in range(3)), (y * 0.95, y, y * 1.09),
+                           0.5, True),
+               PatchMetric(b, (47.5, 50.0, 54.5), (47.5, 50.0, 54.5), 0.8, True),
+               PatchMetric(c, (30.0, 20.0, 15.0), (30.0, 20.0, 15.0), 1.2, False)]
+    ev = ReadEvidence(reads={signal_key(a): 4, signal_key(b): 2, signal_key(c): 1},
+                      read_xyz={signal_key(a): reads_a, signal_key(b): reads_b, signal_key(c): [(30.0, 20.0, 15.0)]})
+    cw = ContentWeights({signal_key(a): 0.5, signal_key(b): 0.3, signal_key(c): 0.2}, label="file")
+    out = practical_summary(metrics, is_hdr=True, content_weights=cw, read_evidence=ev)["content_weighted"]
+    noise = out["noise"]
+    rows = {tuple(r["rgb"]): r for r in noise["per_signal"]}
+    ra, rb = rows[tuple(round(v, 4) for v in a)], rows[tuple(round(v, 4) for v in b)]
+    assert ra["noise_limited"] is True and ra["E_bias_corrected"] == 0.0 and ra["noise_se"] > ra["E"]
+    assert rb["noise_limited"] is False and 0.79 < rb["E_bias_corrected"] <= 0.8
+    assert noise["n_with_estimate"] == 2 and noise["n_noise_limited"] == 1
+    pw = out["patch_weights"]
+    assert pw["score"] == round((0.5 * 0.5 + 0.3 * 0.8 + 0.2 * 1.2) / 1.0, 3)
+    assert pw["score_bias_corrected"] < pw["score"]                # the labelled variant sits BESIDE the raw score
+    assert pw["weight_share"]["noise_limited"] == 0.5 and pw["weight_share"]["noise_unknown"] == 0.2
+    assert out["headline"]["score"] == pw["score"] and out["headline"]["score_bias_corrected"] == pw["score_bias_corrected"]
+    assert "VARIANT" in noise["label"]
+    json.dumps(out, allow_nan=False)
+
+
+def test_kernel_variants_share_the_kernel():
+    rng = np.random.default_rng(5)
+    content = _content(rng)
+    loc = np.column_stack([np.linspace(0.06, 0.58, 10), np.zeros(10), np.zeros(10)])
+    err = np.linspace(0.5, 3.0, 10)
+    res = cs.kernel_score(content, loc, err, reach=20.0, alt_err={"half": err / 2.0, "same": err})
+    assert res["variants"]["same"]["score"] == res["score"]
+    assert abs(res["variants"]["half"]["score"] - res["score"] / 2.0) < 2e-3
+
+
+def test_read_noise_se_in_both_metrics():
+    reads = [(47.5, 50.0, 54.5), (47.6, 50.1, 54.4), (47.4, 49.9, 54.6)]
+    hdr = cs.read_noise_se(reads, rows=1, is_hdr=True)
+    sdr = cs.read_noise_se(reads, rows=1, is_hdr=False, white_xyz=(95.047, 100.0, 108.883))
+    assert hdr["n_reads"] == 3 and hdr["se"] > 0 and sdr["se"] > 0
+    # two rows of the same signal: each row averages fewer reads → a larger per-row SE
+    assert cs.read_noise_se(reads, rows=3, is_hdr=True)["se"] > hdr["se"]
+    assert cs.read_noise_se(reads[:1], rows=1, is_hdr=True) is None
+    # identical reads: floored at the meter's print quantisation, never a proof of zero noise
+    assert cs.read_noise_se([reads[0], reads[0]], rows=1, is_hdr=True)["se"] > 0

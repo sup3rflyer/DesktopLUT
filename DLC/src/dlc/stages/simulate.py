@@ -138,7 +138,8 @@ def run_simulation(run_dir: Path | None = None, *, max_refine: int = 3, verbose:
 def write_synthetic_patches_file(path: Path, *, mode: str = "SDR", bit_depth: int = 10) -> Path:
     """A tiny content-sampled verify set (``--verify-patches-file`` format) for rehearsals / tests:
     a weighted grey ramp + a few low-saturation colours, codes kept low enough for any synthetic HDR
-    cap, with two zero-weight anchors. Synthetic — never the owner's data."""
+    cap, with two zero-weight anchors; the darkest weighted grey requests 3 reads. Synthetic — never the
+    owner's data."""
     import json
 
     max_cv = (1 << int(bit_depth)) - 1
@@ -153,7 +154,9 @@ def write_synthetic_patches_file(path: Path, *, mode: str = "SDR", bit_depth: in
     doc = {"_doc": "synthetic content-sampled verify set (dlc.stages.simulate rehearsal fixture)",
            "content_mode": str(mode).upper(), "bit_depth": int(bit_depth), "content_class": "synthetic",
            "n": len(codes), "codes": codes,
-           "meta": [{"stratum": "synthetic", "content_weight": round(w / total, 6)} for w in raw],
+           # the darkest weighted grey asks for 3 accepted reads (a per-patch read floor), the rest the default
+           "meta": [{"stratum": "synthetic", "content_weight": round(w / total, 6), "reads": 3 if i == 1 else None}
+                    for i, w in enumerate(raw)],
            "coverage_gap_pct_of_content": {"reach_20": {"proposed": 5.0}}}
     path = Path(path)
     path.write_text(json.dumps(doc, indent=1), encoding="utf-8")

@@ -96,7 +96,10 @@ class MeasurePatch:
     ``settle_bump_s`` is EXTRA presenter dwell for this one presentation, on top of
     the presenter's own settle — set by the loop's luminance-jump settle bump when
     the presented luminance drops sharply (FALD zone decay/glow after a bright
-    patch); presenters honor it, synthetic measure fns are free to ignore it."""
+    patch); presenters honor it, synthetic measure fns are free to ignore it.
+    ``min_reads`` is a per-patch MINIMUM accepted (inlier) read count requested by the caller (a
+    verify patches file's ``reads``); 0 = none. It raises the patch's read floor and is never
+    shortened by the dark-floor early stop."""
 
     label: str
     rgb: tuple[int, int, int]
@@ -105,6 +108,7 @@ class MeasurePatch:
     bit_depth: int = 10
     seq: int = -1
     settle_bump_s: float = 0.0
+    min_reads: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -840,7 +844,10 @@ class _Loop:
         white_peak_y: Optional[float] = None,
         correction_max_nits: Optional[float] = None,
         correction_channel_scale: Optional[tuple[float, float, float]] = None,
+        patch_min_reads: Optional[Sequence[int]] = None,
     ) -> None:
+        if patch_min_reads is not None and len(patch_min_reads) != len(patches):
+            raise ValueError(f"patch_min_reads has {len(patch_min_reads)} entries for {len(patches)} patches")
         self.transfer = transfer
         self.cfg = config
         self.ndjson = ndjson
@@ -913,6 +920,7 @@ class _Loop:
                 role="measurement",
                 bit_depth=transfer.bit_depth,
                 seq=idx,
+                min_reads=max(0, int(patch_min_reads[idx] or 0)) if patch_min_reads is not None else 0,
             )
             for idx, (rgb, sig) in enumerate(zip(patches, signals))
         ]
@@ -2073,7 +2081,8 @@ class _Loop:
             # Dark near-neutral floor (estimate the CHROMA spread that drives dark-level trust).
             if self.cfg.dark_min_reads > floor and nits <= self.cfg.dark_floor_max_nits:
                 floor = self.cfg.dark_min_reads
-        return floor
+        # The caller's per-patch request (a verify patches file's ``reads``) is a floor too.
+        return max(floor, int(patch.min_reads or 0))
 
     def _dark_floor_binds(self, patch: MeasurePatch) -> bool:
         """True when the DARK read floor is what raised this patch's read count above the global
@@ -2086,7 +2095,8 @@ class _Loop:
             return False
         bright_floor = (self.cfg.neutral_min_reads
                         if nits >= self.cfg.neutral_floor_min_nits else self.cfg.min_reads)
-        return self.cfg.dark_min_reads > bright_floor
+        # A per-patch request is never shortened: the dark floor binds only above it.
+        return self.cfg.dark_min_reads > max(bright_floor, int(patch.min_reads or 0))
 
     def _abnormal_reads(self, target_n: Optional[int]) -> int:
         """The read count past which a patch is *abnormal* and must be FLAGGED (not
@@ -2899,6 +2909,7 @@ def run_measure_loop(
     white_peak_y: Optional[float] = None,
     correction_max_nits: Optional[float] = None,
     correction_channel_scale: Optional[tuple[float, float, float]] = None,
+    patch_min_reads: Optional[Sequence[int]] = None,
 ) -> MeasureLoopResult:
     """Run the adaptive measurement loop over ``patches`` (code-value triples,
     already thermally ordered by the caller via :mod:`dlc.engine.patches`).
@@ -2940,6 +2951,7 @@ def run_measure_loop(
         white_peak_y=white_peak_y,
         correction_max_nits=correction_max_nits,
         correction_channel_scale=correction_channel_scale,
+        patch_min_reads=patch_min_reads,
     )
 
     preheat_digest: Optional[dict[str, Any]] = None
