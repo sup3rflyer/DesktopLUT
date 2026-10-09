@@ -16,8 +16,9 @@ import pytest
 from dlc.engine.patches import Transfer
 from dlc.measure_loop import MeasureLoopConfig, MeasurePatch, SyntheticPanel, run_measure_loop
 from dlc.thermal import ThermalConfig, ThermalController
-from dlc.viewing_thermal import (LoadLaw, ThermalStateModel, ViewingGate, ViewingPrecondition, _min_xyz,
-                                 patch_load, predict_hold, read_seconds, set_band, stand_in_nits, start_state)
+from dlc.viewing_thermal import (PRECONDITION_CAP_MIN, RECORDED_VERIFY_LOAD, VIEWING_LOAD_MAX_NITS, LoadLaw,
+                                 ThermalStateModel, ViewingGate, ViewingPrecondition, _min_xyz, patch_load,
+                                 predict_hold, read_seconds, set_band, stand_in_nits, start_state)
 
 PQ = Transfer.pq(10)
 LAW = LoadLaw()
@@ -95,11 +96,20 @@ def test_stand_in_block_load_hits_the_target():
 
 def test_start_state_resolution_order():
     desk = LAW.load(40.0)
-    assert start_state(history=[], own_band_load=0.15, law=LAW)[0] == 0.15                 # conservative: hot
-    assert start_state(history=[], own_band_load=0.03, law=LAW)[0] == pytest.approx(desk)  # desktop floor
+    assert start_state(history=[], own_band_load=0.15, law=LAW)[0] == 0.15                 # a hotter set: its band
+    # unknown start → ASSUME HOT: the recorded verify band, never a desktop / a content file's own (cool) band
+    # (review 2026-10-09: the old max(own band, desktop) = 0.068 let the model claim "in band" on a hot panel)
+    t_unknown, src_unknown = start_state(history=[], own_band_load=0.03, law=LAW)
+    assert t_unknown == RECORDED_VERIFY_LOAD > desk and src_unknown.startswith("assumed HOT")
     hist = [{"stage": "measure:post-mhc", "load": 0.12, "ended_epoch": 1000.0}]
     t0, src = start_state(history=hist, own_band_load=0.03, law=LAW, now_epoch=1000.0 + 1500.0)
     assert t0 == pytest.approx(desk + (0.12 - desk) * math.exp(-1.0)) and "run history" in src
+    # ...but a history that does NOT cover stages since (refine rounds / cube-build probe reads) is not trusted:
+    cool = [{"stage": "measure:post-mhc", "load": 0.03, "ended_epoch": 1000.0}]
+    t1, src1 = start_state(history=cool, own_band_load=0.03, law=LAW, now_epoch=1000.0,
+                           unmodelled=["build-3dlut"])
+    assert t1 == RECORDED_VERIFY_LOAD and "build-3dlut" in src1 and src1.startswith("assumed HOT")
+    assert start_state(history=cool, own_band_load=0.03, law=LAW, now_epoch=1000.0)[0] == pytest.approx(0.03)
     assert start_state(history=hist, own_band_load=0.03, law=LAW, start_nits=13.5)[0] == pytest.approx(LAW.load(13.5))
 
 
@@ -170,17 +180,61 @@ def test_viewing_precondition_reaches_and_the_balanced_set_holds_the_band():
     assert ts["final"]["modelled_load"] == pytest.approx(panel.temp, abs=2e-3)
 
 
-def test_default_state_soak_parks_at_the_sets_own_band_unchanged():
-    # verify (default): no viewing config — the own-band soak, no thermal_state digest, identical reads.
+def test_default_path_matches_the_recorded_main_fingerprint(tmp_path: Path):
+    """verify (default, no flag) == main before this branch: the SAME reads in the same order and the same
+    digests (except the new ``thermal_state`` key) in a forced own-band soak and the verify-only flow. The
+    golden was recorded by running ``tests/_thermal_default_fingerprint.py`` against main fe890a9's source."""
+    from _thermal_default_fingerprint import fingerprint
+
+    golden = json.loads((Path(__file__).parent / "data" / "thermal_default_path_main.json").read_text("utf-8"))
+    golden.pop("_recorded_from")
+    got = json.loads(json.dumps(fingerprint(tmp_path), sort_keys=True))   # same JSON normalisation as the golden
+    for scenario in ("measure_loop", "verify_only"):
+        g, h = golden[scenario], got[scenario]
+        assert h["reads"] == g["reads"], f"{scenario}: the default path commands different reads than main"
+        assert h == g, f"{scenario}: the default path's digests differ from main"
+    assert "thermal_state" not in got["verify_only"]["calib_keys"]       # no run-record key without the flag
+
+
+def test_band_exit_during_the_measured_pass_is_flagged_never_silently_viewing():
+    """A pass that LEAVES the band (a bright set pulling the panel out) is an evidence flag for the LLM, and
+    the stage says the viewing state was requested but not held (review 2026-10-09: end load 0.053 > 0.048
+    raised no flag and the digest still said "viewing")."""
+    target = 0.0322
+    bright = [_grey(n) for n in (300.0, 600.0, 1000.0, 90.0)] * 60          # ~240 bright reads
+    panel = TimedThermalPanel(start_load=target, cold_blue_gain=1.0)
+    res = run_measure_loop(patches=bright, transfer=PQ, measure=panel,
+                           config=MeasureLoopConfig(viewing=_spec(target, target)))
+    assert res.needs_adjudication and "viewing_band_left" in res.digest["anomaly_reasons"]
+    ts = res.digest["thermal_state"]
+    assert ts["precondition"]["reached"] is True                           # it STARTED in the viewing state...
+    assert ts["achieved"]["in_band_at_start"] is True
+    assert ts["achieved"]["in_band_throughout"] is False and ts["achieved"]["in_band_at_end"] is False
+    assert ts["measure"]["modelled_end"] > target + 0.5 * target           # ...and left it (model)
+    assert ts["state"] == "outside-viewing-band" and ts["requested"] == "viewing" and "model" in ts["basis"]
+    assert "LEFT the band" in (res.question or "") and "remeasure" in res.question
+
+
+def test_soak_progress_ticks_carry_the_modelled_state(tmp_path: Path):
+    """The precondition's per-block model state reaches the spine's progress ticks (dashboard evidence);
+    a default-state soak's ticks are unchanged."""
+    import dlc.measure_loop as ml
+    from dlc.events import RunLog, read_events
+
     patches = _balanced_set()
-    runs = []
-    for cfg in (MeasureLoopConfig(preheat="always"), MeasureLoopConfig(preheat="always", viewing=None)):
-        panel = SyntheticPanel(transfer=PQ, load_thermal=True, start_temp=0.1)
-        res = run_measure_loop(patches=patches, transfer=PQ, measure=panel, config=cfg)
-        runs.append((res, panel.reads))
-    (a, na), (b, nb) = runs
-    assert na == nb and a.digest["preheat"] == b.digest["preheat"]
-    assert "thermal_state" not in a.digest and "thermal_state" not in (a.digest["preheat"] or {})
+    target = set_band(patches, PQ, LAW)["load"]
+    ticks = {}
+    for name, cfg in (("viewing", MeasureLoopConfig(viewing=_spec(target, 0.07))),
+                      ("default", MeasureLoopConfig(preheat="always"))):
+        epath = tmp_path / f"{name}.jsonl"
+        panel = TimedThermalPanel(start_load=0.07, cold_blue_gain=1.0)
+        loop = ml._Loop(patches=patches, transfer=PQ, measure=panel, config=cfg, ndjson=ml._NdjsonWriter(None),
+                        events=None, runlog=RunLog(epath, phase="measure:verify"))
+        loop.preheat()
+        ticks[name] = [e.data for e in read_events(epath) if e.event == "progress" and "block" in (e.data or {})]
+    assert ticks["viewing"] and all("model_load" in t and "model_in_band" in t for t in ticks["viewing"])
+    assert ticks["viewing"][0]["model_in_band"] is False and ticks["viewing"][-1]["model_in_band"] is True
+    assert ticks["default"] and not any("model_load" in t for t in ticks["default"])
 
 
 def test_measure_now_tracks_the_state_and_flags_it():
@@ -224,6 +278,28 @@ def _hdr_file(tmp_path: Path) -> Path:
     return write_synthetic_patches_file(tmp_path / "patches_hdr.json", mode="HDR", bit_depth=10)
 
 
+class _Scripted:
+    """Answers each seam key from a script (the i-th ask gets the i-th answer, the last repeats), every other
+    seam by its recommendation; records every request so a test can ASSERT a seam fired and what it carried."""
+
+    def __init__(self, **script: list[str]) -> None:
+        self.script = script
+        self.requests: list = []
+
+    def adjudicate(self, request):
+        from dlc.adjudication import Decision
+
+        self.requests.append(request)
+        answers = self.script.get(request.key)
+        if answers:
+            n = sum(1 for r in self.requests if r.key == request.key) - 1
+            return Decision(answers[min(n, len(answers) - 1)], note="scripted")
+        return Decision(request.recommendation, note="auto")
+
+    def asked(self, key: str) -> list:
+        return [r for r in self.requests if r.key == key]
+
+
 def test_viewing_option_validation(tmp_path: Path):
     pf = _hdr_file(tmp_path)
     with pytest.raises(ValueError, match="thermal_state"):
@@ -244,7 +320,8 @@ def test_default_run_records_verify_state_and_plan_order_unchanged(tmp_path: Pat
         assert calib.run("verify-only").status == "completed"
         runs[name] = calib
     a, b = runs["vo_default"], runs["vo_explicit"]
-    assert "thermal_state" not in a.calib and b.calib["thermal_state"] == "verify"
+    # an explicit `verify` IS the default: persisted as unset, exactly like omitting the flag
+    assert "thermal_state" not in a.calib and "thermal_state" not in b.calib
     assert a.calib["patch_plan"] == b.calib["patch_plan"]
     order = [verify_only._patches_from_ndjson(c.ctx.root / "measurements" / "verify.ndjson") for c in (a, b)]
     assert order[0] == order[1] and [list(p) for p in order[0]] == json.loads(pf.read_text("utf-8"))["codes"]
@@ -261,19 +338,22 @@ def test_viewing_verify_seam_precondition_and_recorded_state(tmp_path: Path):
     pf = _hdr_file(tmp_path)
     codes = json.loads(pf.read_text("utf-8"))["codes"]
     panel = TimedThermalPanel(start_load=LAW.load(40.0), cold_blue_gain=1.0)   # an ordinary desktop
-    calib = _vo(tmp_path, "vo_viewing", panel=panel, verify_patches_file=pf, thermal_state="viewing")
+    adj = _Scripted()
+    calib = _vo(tmp_path, "vo_viewing", panel=panel, verify_patches_file=pf, thermal_state="viewing", adjudicator=adj)
     result = calib.run("verify-only")
     assert result.status == "completed", result.digest
     assert calib.calib["thermal_state"] == "viewing"
-    # the seam: target band, start assumption, predicted cost; the recommendation is one of the options
+    # the seam FIRES (asserted, not `if`): target band, start assumption, predicted cost, cap; recommendation
+    # is one of the options; nothing auto-accepted it
     dec = calib.calib["decisions"]["measure:verify:thermal-state"]
     assert dec["choice"] == "precondition"
-    from dlc.events import read_events
-    reqs = [e.data for e in read_events(calib.ctx.events_path)
-            if (e.data or {}).get("key") == "measure:verify:thermal-state" and (e.data or {}).get("options")]
-    if reqs:
-        req = reqs[-1]
-        assert req["recommendation"] in req["options"] and "precondition" in req["question"]
+    reqs = adj.asked("measure:verify:thermal-state")
+    assert len(reqs) == 1
+    req = reqs[0]
+    assert req.options == ("precondition", "measure-now", "abort") and req.recommendation in req.options
+    assert "precondition" in req.question and "capped" in req.question and "--viewing-start-nits" in req.question
+    assert req.digest["start"]["kind"] == "assumed-hot" and req.digest["start"]["load"] == RECORDED_VERIFY_LOAD
+    assert req.digest["precondition_budget"]["capped"] is False and "model" in req.digest["basis"]
     # recorded state: the measure stage + the verify digest say which state the numbers represent
     ts = calib.calib["stages"]["measure:verify"]["digest"]["thermal_state"]
     assert ts["state"] == "viewing" and ts["decision"] == "precondition"
@@ -283,10 +363,194 @@ def test_viewing_verify_seam_precondition_and_recorded_state(tmp_path: Path):
     assert lo <= ts["measure"]["modelled_range"][0] and ts["measure"]["modelled_range"][1] <= hi
     vd = calib.calib["stages"]["verify"]["digest"]["thermal_state"]
     assert vd["state"] == "viewing" and vd["precondition_reached"] is True and vd["decision"] == "precondition"
-    # the file order is kept; the history records what the panel was left at
+    assert vd["requested"] == "viewing" and vd["evidence_flags"] == [] and vd["needs_adjudication"] is False
+    assert vd["achieved"]["in_band_at_start"] and vd["achieved"]["in_band_throughout"] and vd["achieved"]["in_band_at_end"]
+    assert "model" in vd["basis"] and vd["start"]["source"].startswith("assumed HOT")
+    # the file order is kept; the history records what the panel was left at (+ the stages memoised by then)
     measured = verify_only._patches_from_ndjson(calib.ctx.root / "measurements" / "verify.ndjson")
     assert [list(p) for p in measured] == codes
     assert calib.calib["thermal_history"][-1]["stage"] == "measure:verify"
+    assert "measure:verify" in calib.calib["thermal_history"][-1]["stages_done"]
+
+
+def _first_main_read_state(panel: TimedThermalPanel) -> float:
+    """The TRUE (rig) thermal state when the main pass's first measurement read completes."""
+    return next(tr[1] for tr in panel.trace if tr[2] == "measurement")
+
+
+def test_unknown_start_assumes_hot_so_a_hot_panel_is_really_in_band(tmp_path: Path):
+    """Finding 1: with no history / no given start the precondition used max(own band, desktop) = 0.068 for a
+    content file, so on a panel straight off a DLC verify (the recorded 0.096 band) the model claimed
+    "reached" while the TRUE state at the main pass was ~0.058, outside the 0.016-0.048 band. Assuming hot
+    (the recorded verify band) makes the soak long enough for the hot case."""
+    pf = _hdr_file(tmp_path)
+    panel = TimedThermalPanel(start_load=RECORDED_VERIFY_LOAD, cold_blue_gain=1.0)
+    calib = _vo(tmp_path, "vo_hot", panel=panel, verify_patches_file=pf, thermal_state="viewing", adjudicator=_Scripted())
+    assert calib.run("verify-only").status == "completed"
+    ts = calib.calib["stages"]["measure:verify"]["digest"]["thermal_state"]
+    lo, hi = ts["target"]["band"]
+    assert lo <= _first_main_read_state(panel) <= hi        # the rig's TRUE state, not just the model's claim
+    assert ts["start"]["kind"] == "assumed-hot" and ts["precondition"]["reached"] is True
+
+
+def test_history_start_is_untrusted_after_unmodelled_stages(tmp_path: Path):
+    """Finding 1 (history): the full flow's last history entry is post-MHC, but the cube build's probe reads
+    (and, in mhc-only, the MHC refine rounds) drove the display after it, uncounted. Any stage memoised after
+    the entry makes the history-based start untrusted → assumed hot, naming the stages."""
+    calib = _vo(tmp_path, "vo_hist", verify_patches_file=_hdr_file(tmp_path), thermal_state="viewing")
+    calib.calib["stages"] = {"measure:raw": {}, "measure:post-mhc": {}}
+    calib._note_thermal_history("measure:post-mhc", 0.03, basis="test")
+    assert calib._unmodelled_since_history("measure:verify") == []
+    calib.calib["stages"]["build-install-3dlut"] = {}
+    assert calib._unmodelled_since_history("measure:verify") == ["build-install-3dlut"]
+    from dlc.calibrate import CalibrationAborted
+
+    plan_patches = [_grey(n) for n in (1.0, 9.0, 30.0)]
+    adj = _Scripted(**{"measure:verify:thermal-state": ["abort"]})
+    calib.adjudicator, calib.target_name = adj, "rec2020_pq"
+    with pytest.raises(CalibrationAborted):
+        calib._thermal_state_plan("measure:verify", "verify", plan_patches)
+    start = adj.asked("measure:verify:thermal-state")[0].digest["start"]
+    assert start["kind"] == "assumed-hot" and start["load"] == RECORDED_VERIFY_LOAD
+    assert start["unmodelled_stages"] == ["build-install-3dlut"] and "build-install-3dlut" in start["source"]
+
+
+def test_start_is_correctable_on_resume_at_the_thermal_state_seam(tmp_path: Path):
+    """Finding 1 (seam): a resume answering the thermal-state seam may correct the start with
+    --viewing-start-nits (refused before: earlier stages were memoised → resume-args). The change is recorded
+    and a memoised thermal-state decision is DROPPED (its numbers changed) so the seam re-asks. Once
+    measure:verify is memoised the knobs lock (resume-args)."""
+    from dlc.adjudication import AdjudicationRequired, Decision, MappingAdjudicator
+
+    pf = _hdr_file(tmp_path)
+    key = "measure:verify:thermal-state"
+    plan = {"resolve-target:plan": Decision("approve")}
+
+    def run(decisions, **kw):
+        panel = TimedThermalPanel(start_load=LAW.load(40.0), cold_blue_gain=1.0)
+        calib = _vo(tmp_path, "vo_resume", panel=panel, verify_patches_file=pf, thermal_state="viewing",
+                    adjudicator=MappingAdjudicator(decisions), **kw)
+        return calib, calib.run("verify-only")
+
+    with pytest.raises(AdjudicationRequired) as first:
+        run(dict(plan))
+    assert first.value.request.key == key
+    first_start = first.value.request.digest["start"]
+    # a recorded decision from the first ask (e.g. the process died after deciding) — main() seeds the
+    # adjudicator from the run record, as here:
+    state_path = tmp_path / "vo_resume" / "dlc_state.json"
+    state = json.loads(state_path.read_text("utf-8"))
+    state["calib"]["decisions"][key] = {"choice": "precondition", "note": "first ask"}
+    state_path.write_text(json.dumps(state), "utf-8")
+    with pytest.raises(AdjudicationRequired) as again:       # knob changed → the stale decision is dropped
+        run({**plan, key: Decision("precondition", "first ask")}, viewing_start_nits=40.0)
+    assert again.value.request.key == key
+    assert first_start["kind"] == "assumed-hot" and first_start["load"] == RECORDED_VERIFY_LOAD
+    assert again.value.request.digest["start"] == {
+        "load": round(LAW.load(40.0), 5), "nits_equiv": 40.0, "source": "given: 40 nit-equivalent", "kind": "given"}
+    calib, result = run({**plan, key: Decision("precondition", "start corrected")}, viewing_start_nits=40.0)
+    assert result.status == "completed", result.digest
+    assert calib.calib["viewing_start_nits"] == 40.0
+    changes = calib.calib["thermal_state_changes"]
+    assert changes[0]["field"] == "viewing_start_nits" and changes[0]["from"] is None and changes[0]["to"] == 40.0
+    ts = calib.calib["stages"]["measure:verify"]["digest"]["thermal_state"]
+    assert ts["start"]["kind"] == "given" and ts["decision"] == "precondition"
+    # measure:verify memoised: a different start is now refused, the same one is not a conflict
+    _, locked = run({**plan, key: Decision("precondition")}, viewing_start_nits=20.0)
+    assert locked.status == "aborted" and locked.digest["aborted_at"] == "resume-args"
+    assert locked.digest["conflicts"] == [{"field": "viewing_start_nits", "requested": 20.0, "persisted": 40.0}]
+    _, same = run({**plan, key: Decision("precondition")}, viewing_start_nits=40.0)
+    assert same.status == "completed"
+
+
+def test_measure_now_verify_is_never_labelled_viewing(tmp_path: Path):
+    """Finding 2: a skipped precondition (measure-now) used to leave the verify digest saying `state: viewing`.
+    Now: requested vs achieved, an evidence flag, the model basis and the start source."""
+    pf = _hdr_file(tmp_path)
+    panel = TimedThermalPanel(start_load=RECORDED_VERIFY_LOAD, cold_blue_gain=1.0)
+    adj = _Scripted(**{"measure:verify:thermal-state": ["measure-now"], "measure:verify:escalation": ["accept"]})
+    calib = _vo(tmp_path, "vo_now", panel=panel, verify_patches_file=pf, thermal_state="viewing", adjudicator=adj)
+    assert calib.run("verify-only").status == "completed"
+    esc = adj.asked("measure:verify:escalation")
+    assert len(esc) == 1 and {"viewing_precondition_unmet", "viewing_band_left"} <= set(esc[0].digest["anomaly_reasons"])
+    ts = calib.calib["stages"]["measure:verify"]["digest"]["thermal_state"]
+    assert ts["state"] == "outside-viewing-band" and ts["requested"] == "viewing"
+    vd = calib.calib["stages"]["verify"]["digest"]["thermal_state"]
+    assert vd["state"] == "outside-viewing-band" and vd["requested"] == "viewing"
+    assert vd["precondition_skipped"] == "measure-now" and vd["precondition_reached"] is None
+    assert {"viewing_precondition_skipped", "viewing_band_left"} <= set(vd["evidence_flags"])
+    assert vd["needs_adjudication"] is True and vd["achieved"]["in_band_at_start"] is False
+    assert "model" in vd["basis"] and vd["start"]["source"] and vd["escalation_decision"]["choice"] == "accept"
+
+
+def test_unmet_precondition_offers_remeasure_and_the_thermal_state_seam_reasks(tmp_path: Path):
+    """Finding 3: the unmet question said "accept as such, or retry" but the seam offered accept/suppress/abort
+    and the memoised thermal-state choice would have replayed. Now `remeasure` is offered; choosing it drops
+    the memoised thermal-state decision, so the seam re-asks with the start from THIS run's history."""
+    pf = _hdr_file(tmp_path)
+    panel = TimedThermalPanel(start_load=RECORDED_VERIFY_LOAD, cold_blue_gain=1.0)
+    adj = _Scripted(**{"measure:verify:thermal-state": ["measure-now", "precondition"],
+                       "measure:verify:escalation": ["remeasure"]})
+    calib = _vo(tmp_path, "vo_re", panel=panel, verify_patches_file=pf, thermal_state="viewing", adjudicator=adj)
+    result = calib.run("verify-only")
+    esc = adj.asked("measure:verify:escalation")
+    assert esc and "remeasure" in esc[0].options and "remeasure" in esc[0].question
+    assert result.status == "completed", result.digest
+    assert len(esc) == 1
+    asks = adj.asked("measure:verify:thermal-state")
+    assert len(asks) == 2                                          # re-asked, not replayed
+    assert asks[0].digest["start"]["kind"] == "assumed-hot"
+    assert asks[1].digest["start"]["kind"] == "run-history"        # nothing unmodelled since the first pass
+    assert calib.calib["decisions"]["measure:verify:thermal-state"]["choice"] == "precondition"
+    vd = calib.calib["stages"]["verify"]["digest"]["thermal_state"]
+    assert vd["state"] == "viewing" and vd["evidence_flags"] == [] and vd["precondition_reached"] is True
+    lo, hi = vd["target"]["band"]
+    assert lo <= panel.temp <= hi + 0.005
+
+
+def test_explicit_verify_on_resume_is_not_a_conflict(tmp_path: Path):
+    """Finding 4: a run started WITHOUT the flag aborted at resume-args when resumed with an explicit
+    `--thermal-state verify`. Explicit verify == absent; a real change after the verify is measured is refused."""
+    pf = _hdr_file(tmp_path)
+    assert _vo(tmp_path, "vo_r", verify_patches_file=pf).run("verify-only").status == "completed"
+    calib = _vo(tmp_path, "vo_r", verify_patches_file=pf, thermal_state="verify")
+    result = calib.run("verify-only")
+    assert result.status == "completed", result.digest
+    assert "thermal_state" not in calib.calib and "thermal_state_changes" not in calib.calib
+    viewing = _vo(tmp_path, "vo_r", verify_patches_file=pf, thermal_state="viewing").run("verify-only")
+    assert viewing.status == "aborted" and viewing.digest["aborted_at"] == "resume-args"
+    assert viewing.digest["conflicts"] == [{"field": "thermal_state", "requested": "viewing", "persisted": "verify"}]
+
+
+@pytest.mark.parametrize("bad", [0.0, -1.0, 1000.0, float("nan"), VIEWING_LOAD_MAX_NITS + 0.5])
+def test_viewing_load_target_is_bounded(tmp_path: Path, bad: float):
+    """Finding 6: a 0 target can never converge; 1000 (a typo) would soak a ~full-field bright static for up to
+    the cap. Refused: (0, the recorded verify band's nit-equivalent]."""
+    with pytest.raises(ValueError, match="viewing_load_nits"):
+        _vo(tmp_path, "vo_bad", verify_patches_file=_hdr_file(tmp_path), thermal_state="viewing",
+            viewing_load_nits=bad)
+
+
+def test_precondition_is_capped_and_the_seam_says_so_then_abort_measures_nothing(tmp_path: Path):
+    """Finding 6 (cap) + the seam's abort: a start the model needs > the cap for is capped at
+    PRECONDITION_CAP_MIN (4 tau), stated in the question; abort stops the run before any measurement read."""
+    pf = _hdr_file(tmp_path)
+    panel = TimedThermalPanel(start_load=RECORDED_VERIFY_LOAD, cold_blue_gain=1.0)
+    adj = _Scripted(**{"measure:verify:thermal-state": ["abort"]})
+    assert 65.0 <= VIEWING_LOAD_MAX_NITS < 66.0
+    calib = _vo(tmp_path, "vo_cap", panel=panel, verify_patches_file=pf, thermal_state="viewing",
+                viewing_load_nits=VIEWING_LOAD_MAX_NITS / 10.0, viewing_start_nits=1850.0, adjudicator=adj)
+    result = calib.run("verify-only")
+    assert result.status == "aborted"
+    (req,) = adj.asked("measure:verify:thermal-state")
+    budget = req.digest["precondition_budget"]
+    assert budget == {"deadline_min": PRECONDITION_CAP_MIN, "cap_min": PRECONDITION_CAP_MIN, "capped": True}
+    assert req.digest["predicted"]["precondition_minutes"] * 1.5 + 5 > PRECONDITION_CAP_MIN
+    assert f"capped at {PRECONDITION_CAP_MIN:g}" in req.question.replace(".0 min", " min")
+    assert calib.calib["stages"]["measure:verify"]["status"] == "aborted"
+    assert "verify" not in calib.calib["stages"]
+    assert calib.calib["decisions"]["measure:verify:thermal-state"]["choice"] == "abort"
+    assert not any(tr[2] == "measurement" for tr in panel.trace) and not panel.trace
 
 
 def test_measure_checkin_carries_the_modelled_thermal_state(tmp_path: Path):

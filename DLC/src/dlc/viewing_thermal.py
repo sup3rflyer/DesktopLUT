@@ -36,8 +36,10 @@ from typing import Any, Callable, Optional, Sequence
 
 __all__ = [
     "THERMAL_STATES", "DEFAULT_THERMAL_STATE", "VIEWING_NITS_EQUIV", "DESKTOP_NITS_EQUIV",
+    "RECORDED_VERIFY_LOAD", "VIEWING_LOAD_MAX_NITS", "PRECONDITION_CAP_MIN", "MODEL_BASIS",
     "LoadLaw", "ViewingPrecondition", "ThermalStateModel", "ViewingGate",
     "read_seconds", "patch_load", "set_band", "predict_hold", "stand_in_nits", "start_state",
+    "band_achieved",
 ]
 
 THERMAL_STATES = ("verify", "viewing")
@@ -51,6 +53,22 @@ DEFAULT_THERMAL_STATE = "verify"          # today's behaviour: soak at the set's
 VIEWING_NITS_EQUIV = {"HDR": 13.5, "SDR": 10.1}
 # The "ordinary desktop" state the study anchored the white shift to (HANDOFF: x 0.313 on the desktop).
 DESKTOP_NITS_EQUIV = 40.0
+# The HOT case: the RECORDED PA32UCXR HDR verify band (verify 20261002_145601, backward dwell attribution —
+# DLC stamps a read when it completes; design note §0: 0.096 load ≈ 65 nit-eq). A precondition whose start
+# is not KNOWN (no --viewing-start-nits, no run history that covers everything the display showed since)
+# assumes the panel is this hot — the panel after a DLC verify, the A-B-A's A phase. Overestimating the
+# start only lengthens the soak; underestimating it lets the model claim "in band" on a hotter panel.
+RECORDED_VERIFY_LOAD = 0.096
+RECORDED_VERIFY_SOURCE = ("the recorded PA32UCXR HDR verify band (0.096 load, backward dwell; "
+                          "docs/viewing-thermal-state.md §0)")
+# The precondition soak is CAPPED at 4 τ (100 min at the 25-min fit): from the clipped maximum load (1.0)
+# the model needs 4.2 τ to reach the HDR band edge, so no realistic start needs more; a precondition the
+# model cannot finish inside the cap is a start/model question for the LLM, not more soak. The cap bounds
+# the deadline (model time-to-band × 1.5 + 5 min); past it the controller's normal flag path applies.
+PRECONDITION_CAP_MIN = 100.0
+# What every viewing-state claim rests on — stated beside each one (never a measurement).
+MODEL_BASIS = ("model: first-order PA32UCXR load-thermal fit fed with the reads actually shown — right on "
+               "SDR-in-HDR, ~1.7x high on HDR, absolute loads/times good to ~±2x; NOT a measurement")
 # Band half-width as a fraction of the target load. On the PA model 0.5 × 0.032 load ≈ 0.35 dE_ITP of
 # content-weighted white offset (study: ~22 dE_ITP per load unit, model) — about twice the median verify
 # bookend drift, i.e. the residual a 2τ settle from a recorded-verify state leaves.
@@ -113,6 +131,12 @@ class LoadLaw:
     def as_dict(self) -> dict[str, Any]:
         return {"tau_min": round(self.tau_s / 60.0, 2), "exponent": self.exponent,
                 "ref_nits": self.ref_nits, "source": self.source}
+
+
+# The ceiling for a viewing target (``--viewing-load-nits``): the recorded verify band's nit-equivalent
+# (~65). A "viewing" target at or above the meter's own verify load is not a viewing state, and a typo
+# (1000 → a ~1300-nit full-field static soak for up to the cap, against FALD probe hygiene) must be refused.
+VIEWING_LOAD_MAX_NITS = round(LoadLaw().nits_equiv(RECORDED_VERIFY_LOAD), 1)
 
 
 def _channel_nits(rgb: Sequence[float], transfer: Any) -> tuple[float, float, float]:
@@ -190,27 +214,65 @@ def stand_in_nits(target_load: float, *, ref_rgb: Sequence[float], transfer: Any
 
 
 def start_state(*, history: Sequence[dict[str, Any]], own_band_load: float, law: LoadLaw,
-                now_epoch: Optional[float] = None, start_nits: Optional[float] = None) -> tuple[float, str]:
+                now_epoch: Optional[float] = None, start_nits: Optional[float] = None,
+                unmodelled: Sequence[str] = ()) -> tuple[float, str]:
     """The modelled thermal state the precondition starts from, and where the assumption comes from:
 
     1. ``start_nits`` given (the operator/LLM knows what the panel showed) → its load;
-    2. this run's recorded load history (the last measure stage's band, relaxed toward the desktop
-       state over the wall time since it ended);
-    3. none known → CONSERVATIVE: the hotter of this set's own band (what today's preheat would hold —
-       the meter's test load) and an ordinary desktop. Overestimating only lengthens the soak."""
+    2. this run's recorded load history — the last measure stage's end state, relaxed toward the
+       desktop state over the wall time since it ended — ONLY when nothing unmodelled drove the display
+       since: ``unmodelled`` names the stages memoised after that entry (MHC refine rounds, the cube
+       build's probe reads, ...). Their reads are NOT counted, so a history with any such stage after it
+       is not trusted and falls through to (3), the source saying why;
+    3. otherwise ASSUME HOT: the hottest of the recorded verify band (:data:`RECORDED_VERIFY_LOAD`), this
+       set's own band, an ordinary desktop and the (relaxed) history. Overestimating only lengthens the
+       soak; the default content-file band (~0.03) is far cooler than the panel after any DLC stage."""
     desk = law.load(DESKTOP_NITS_EQUIV)
     if start_nits is not None:
         return law.load(float(start_nits)), f"given: {float(start_nits):g} nit-equivalent"
     last = history[-1] if history else None
+    relaxed: Optional[float] = None
+    hist_txt = ""
     if last and last.get("load") is not None and last.get("ended_epoch") is not None:
         now = time.time() if now_epoch is None else now_epoch
         gap = max(0.0, now - float(last["ended_epoch"]))
-        temp = desk + (float(last["load"]) - desk) * math.exp(-gap / law.tau_s)
-        return temp, (f"run history: {last.get('stage')} band {float(last['load']):.4f} ended "
-                      f"{gap / 60.0:.1f} min ago, relaxed toward a desktop state")
-    if own_band_load >= desk:
-        return own_band_load, "assumed (no load history): this set's own band — the meter's test load"
-    return desk, "assumed (no load history): an ordinary desktop state"
+        relaxed = desk + (float(last["load"]) - desk) * math.exp(-gap / law.tau_s)
+        hist_txt = (f"run history: {last.get('stage')} left the panel at {float(last['load']):.4f} "
+                    f"{gap / 60.0:.1f} min ago, relaxed toward a desktop state")
+        if not unmodelled:
+            return relaxed, hist_txt
+    candidates = [(RECORDED_VERIFY_LOAD, RECORDED_VERIFY_SOURCE),
+                  (float(own_band_load), "this set's own band"),
+                  (desk, f"an ordinary desktop ({DESKTOP_NITS_EQUIV:g} nit-eq)")]
+    if relaxed is not None:
+        candidates.append((relaxed, hist_txt))
+    load, what = max(candidates, key=lambda c: c[0])
+    if relaxed is None:
+        why = "no load history in this run"
+    else:
+        why = (f"the run history ends at {last.get('stage')} and does NOT cover {len(unmodelled)} later "
+               f"stage(s) that drove the display unmodelled ({', '.join(unmodelled)}: refine rounds and "
+               "cube-build probe reads are not counted)")
+    return load, f"assumed HOT ({why}): the hottest known case — {what}"
+
+
+def band_achieved(summary: Optional[dict[str, Any]], target: float, halfwidth: float) -> Optional[dict[str, Any]]:
+    """Was the MODELLED state inside the band at the start of, throughout and at the end of a segment
+    (a :meth:`ThermalStateModel.segment_summary`)? ``None`` when the segment saw no reads. A model
+    statement (:data:`MODEL_BASIS`), never a measurement."""
+    if not summary or not summary.get("reads"):
+        return None
+    lo, hi = target - halfwidth, target + halfwidth
+    start = summary.get("modelled_start")
+    end = summary.get("modelled_end")
+    rng = summary.get("modelled_range") or [None, None]
+
+    def inside(v: Optional[float]) -> Optional[bool]:
+        return None if v is None else bool(lo - 1e-9 <= float(v) <= hi + 1e-9)
+
+    throughout = (None if None in rng else bool(lo - 1e-9 <= float(rng[0]) and float(rng[1]) <= hi + 1e-9))
+    return {"in_band_at_start": inside(start), "in_band_throughout": throughout, "in_band_at_end": inside(end),
+            "band": [round(lo, 5), round(hi, 5)], "basis": MODEL_BASIS}
 
 
 @dataclass(frozen=True)

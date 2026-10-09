@@ -60,7 +60,8 @@ from .liveness import Liveness, MeterDown
 from .meter_quantum import CountQuantum, learn_count_quantum, level_count_quantised, validate_count_quantum
 from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 from .reference_states import ReferenceStates, reference_shift_impact
-from .viewing_thermal import ViewingGate, ViewingPrecondition, read_seconds, stand_in_nits
+from .viewing_thermal import (MODEL_BASIS, ViewingGate, ViewingPrecondition, band_achieved, read_seconds,
+                              stand_in_nits)
 
 __all__ = [
     "MeasurePatch",
@@ -2100,7 +2101,10 @@ class _Loop:
         if self.runlog is not None:
             self.runlog.progress(self._live_phase, **{k: rec.get(k) for k in
                 ("block", "k", "net", "gross", "state", "ref_nits", "active_channel",
-                 "op_streak", "protection_limited")})
+                 "op_streak", "protection_limited")},
+                # A viewing-state precondition's per-block MODELLED state vs the band (the controller
+                # adds these only when it carries a state gate — a default-state tick is unchanged).
+                **{k: rec[k] for k in ("model_load", "model_in_band") if k in rec})
         # The soak's ThermalController reads the meter directly (bypassing _read), and its
         # per-block mirror above is STREAM tier — dropped from the LLM digest. Without this
         # backstop a long preheat is the one spell that can go digest-dark past the §12
@@ -3212,10 +3216,20 @@ def run_measure_loop(
     # (budget/deadline passed, or the LLM chose measure-now): the stage's numbers describe a state
     # between the start and the viewing band — evidence the LLM must judge, never a silent accept.
     viewing_unmet = bool(loop.viewing_gate is not None and not (loop.viewing_gate.precondition_result or {}).get("reached"))
+    # ...and whether the MEASURED PASS stayed in the band (model): a pass that left it (a bright set's own
+    # load pulling the panel out, a precondition that ended on the edge) does not represent the viewing
+    # state either — a band exit is evidence for the LLM, never a silently "viewing" label.
+    viewing_achieved: Optional[dict[str, Any]] = None
+    if loop.viewing_gate is not None:
+        _vg = loop.viewing_gate
+        viewing_achieved = band_achieved(_vg.model.segment_summary("measure"), _vg.spec.target_load,
+                                         _vg.spec.halfwidth)
+    viewing_band_left = bool(viewing_achieved is not None and viewing_achieved.get("in_band_throughout") is False)
     needs_adjudication = (
         loop.meter_down
         or loop.panel_dark
         or viewing_unmet
+        or viewing_band_left
         or preheat_compromised
         or loop.measurement_path_compromised
         or (not loop.warm)
@@ -3231,6 +3245,7 @@ def run_measure_loop(
             ("present_stall", loop.present_stall),
             ("preheat_compromised", preheat_compromised),
             ("viewing_precondition_unmet", viewing_unmet),
+            ("viewing_band_left", viewing_band_left),
             ("measurement_path_compromised", loop.measurement_path_compromised),
             ("not_warm", not loop.warm),
             ("unresolved", bool(unresolved_all)),
@@ -3270,13 +3285,28 @@ def run_measure_loop(
                 f"(floor {cfg.dark_floor_nits}); no patches were measured (wake the panel / "
                 "check the input + that the patch window is showing, then retry)"
             )
-        if viewing_unmet:
+        if viewing_unmet or viewing_band_left:
             pre = (loop.viewing_gate.precondition_result if loop.viewing_gate else None) or {}
+            ach = viewing_achieved or {}
+            what = []
+            if viewing_unmet:
+                what.append("the precondition did not reach it ("
+                            + (f"skipped: {pre.get('skipped')}" if pre.get("skipped") else
+                               f"modelled load {pre.get('modelled_load')} still outside the band "
+                               f"{pre.get('band')} after {pre.get('elapsed_min')} min")
+                            + ")")
+            if viewing_band_left:
+                seg = (loop.viewing_gate.model.segment_summary("measure") if loop.viewing_gate else None) or {}
+                what.append(f"the measured pass LEFT the band {ach.get('band')} (modelled range "
+                            f"{seg.get('modelled_range')}, end {seg.get('modelled_end')}; in band at start "
+                            f"{ach.get('in_band_at_start')}, at end {ach.get('in_band_at_end')})")
             bits.append(
-                "the VIEWING thermal state was requested but the precondition did not reach it "
-                f"({pre.get('skipped') or 'modelled state outside the band'}: modelled load "
-                f"{pre.get('modelled_load')} vs band {pre.get('band')}, model prediction) — these numbers "
-                "describe a state between the start and the viewing band; accept as such, or retry"
+                "the VIEWING thermal state was requested but " + " and ".join(what)
+                + " — MODEL statements (first-order PA fit, ~1.7x high on HDR), so these numbers describe "
+                "a state outside the viewing band. accept = keep them, recorded as outside the viewing "
+                "band; remeasure = re-run the viewing precondition and this pass (the thermal-state seam "
+                "re-asks first, its start state now from this run's history — correct it there with "
+                "--viewing-start-nits); abort = stop the run"
             )
         if preheat_compromised:
             bits.append(
@@ -3399,7 +3429,13 @@ def run_measure_loop(
                           ("status", "source", "min_counted_nits", "patches_on_lattice", "reason")
                           if count_block.get(k) is not None},
         "preheat": preheat_digest,
-        **({"thermal_state": {"state": "viewing", "spec": cfg.viewing.as_dict() if cfg.viewing else None,
+        # requested vs ACHIEVED: the label is "viewing" only when the precondition reached the band AND the
+        # measured pass stayed in it (model); anything else says so — never a silently "viewing" stage.
+        **({"thermal_state": {"state": ("viewing" if (not viewing_unmet and not viewing_band_left
+                                                      and viewing_achieved is not None) else "outside-viewing-band"),
+                              "requested": "viewing", "achieved": viewing_achieved,
+                              "basis": MODEL_BASIS,
+                              "spec": cfg.viewing.as_dict() if cfg.viewing else None,
                               "precondition": loop.viewing_gate.precondition_result,
                               "measure": loop.viewing_gate.model.segment_summary("measure"),
                               "final": loop.viewing_gate.state()}}

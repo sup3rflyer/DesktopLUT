@@ -1,0 +1,1629 @@
+{
+"_recorded_from": "main fe890a9 (before the viewing-thermal branch) via tests/_thermal_default_fingerprint.py",
+"measure_loop": {
+"digest": {
+"anomaly_reasons": [],
+"appended_remeasures": 0,
+"cold_channel": "B",
+"count_quantum": {
+"reason": "no count lattice in this session's reads (no_lattice) - count term skipped; levels keep the print floor",
+"status": "none"
+},
+"dark_reference_nits": null,
+"drift_checkpoints": 5,
+"drift_density_exceeded": false,
+"drift_episodes": 0,
+"drift_recent_repeats": 0,
+"drift_regime": "bounded_fluctuation",
+"drift_repeat_density": 0.0,
+"immediate_remeasures": 0,
+"jump_settles": 3,
+"measurement_path_compromised": false,
+"meter_down": false,
+"meter_down_detail": null,
+"meter_events": [],
+"meter_read_failures": 0,
+"meter_restarts": 0,
+"needs_adjudication": false,
+"neutral_interval_adjustments": 0,
+"neutral_interval_final": 8,
+"neutral_interval_initial": 8,
+"panel_dark": false,
+"patch_count": 36,
+"preheat": {
+"active_channel": "B",
+"baseline_distance": null,
+"blocks": 4,
+"compromised": false,
+"content_reads": 48,
+"converged": true,
+"drift_threshold": 0.003,
+"final_k": 1.0,
+"protection_limited": false,
+"reason": "converged:convergent",
+"regime": "convergent",
+"shadow_would_fast_path": false,
+"warm_balance": {
+"B": 0.898742,
+"G": 0.994759,
+"R": 1.0
+}
+},
+"preheat_compromised": false,
+"present_stall": false,
+"read_anomalies": [],
+"read_anomaly": false,
+"read_anomaly_repeatability": null,
+"reference_states": null,
+"reference_xyz": [
+89.8903,
+93.3251,
+112.1648
+],
+"remeasure_budget_exceeded": false,
+"remeasure_budget_remaining": 256,
+"remeasure_cap": 256,
+"state_recurrences": 0,
+"total_reads": 45,
+"unresolved": [],
+"unresolved_detail": [],
+"warm": true,
+"warmup_reads": 4,
+"white_nits": 298.086,
+"white_xyz": [
+280.5527,
+298.0859,
+300.1495
+]
+},
+"needs_adjudication": false,
+"question": null,
+"reads": [
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+402,
+402,
+402
+]
+],
+[
+"warmup",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+530,
+530,
+530
+]
+],
+[
+"warmup",
+[
+153,
+153,
+153
+]
+],
+[
+"warmup",
+[
+298,
+298,
+298
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"neutral_ref",
+[
+512,
+512,
+512
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+636,
+636,
+636
+]
+],
+[
+"measurement",
+[
+530,
+530,
+530
+]
+],
+[
+"measurement",
+[
+402,
+402,
+402
+]
+],
+[
+"measurement",
+[
+298,
+298,
+298
+]
+],
+[
+"measurement",
+[
+218,
+218,
+218
+]
+],
+[
+"measurement",
+[
+153,
+153,
+153
+]
+],
+[
+"measurement",
+[
+153,
+153,
+153
+]
+],
+[
+"measurement",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+298,
+298,
+298
+]
+],
+[
+"measurement",
+[
+402,
+402,
+402
+]
+],
+[
+"measurement",
+[
+530,
+530,
+530
+]
+],
+[
+"measurement",
+[
+636,
+636,
+636
+]
+],
+[
+"measurement",
+[
+636,
+636,
+636
+]
+],
+[
+"measurement",
+[
+530,
+530,
+530
+]
+],
+[
+"measurement",
+[
+402,
+402,
+402
+]
+],
+[
+"measurement",
+[
+298,
+298,
+298
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+218,
+218,
+218
+]
+],
+[
+"measurement",
+[
+153,
+153,
+153
+]
+],
+[
+"measurement",
+[
+153,
+153,
+153
+]
+],
+[
+"measurement",
+[
+218,
+218,
+218
+]
+],
+[
+"measurement",
+[
+298,
+298,
+298
+]
+],
+[
+"measurement",
+[
+402,
+402,
+402
+]
+],
+[
+"measurement",
+[
+530,
+530,
+530
+]
+],
+[
+"measurement",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+636,
+636,
+636
+]
+],
+[
+"measurement",
+[
+530,
+530,
+530
+]
+],
+[
+"measurement",
+[
+402,
+402,
+402
+]
+],
+[
+"measurement",
+[
+298,
+298,
+298
+]
+],
+[
+"measurement",
+[
+218,
+218,
+218
+]
+],
+[
+"measurement",
+[
+153,
+153,
+153
+]
+],
+[
+"measurement",
+[
+153,
+153,
+153
+]
+],
+[
+"measurement",
+[
+218,
+218,
+218
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+298,
+298,
+298
+]
+],
+[
+"measurement",
+[
+402,
+402,
+402
+]
+],
+[
+"measurement",
+[
+530,
+530,
+530
+]
+],
+[
+"measurement",
+[
+636,
+636,
+636
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+]
+]
+},
+"verify_only": {
+"calib_keys": [
+"backup",
+"decisions",
+"flow",
+"hdr_target",
+"installed_stack",
+"oog_mapping",
+"output_depth",
+"patch_plan",
+"stages",
+"target",
+"verify_basis_checked",
+"verify_patches_file",
+"viewing_layers",
+"white"
+],
+"decisions": {
+"resolve-target:plan": "approve"
+},
+"measure:verify": {
+"anomaly_reasons": [],
+"appended_remeasures": 0,
+"bookend_drift_qc": {
+"available": false,
+"bookend_patch_count": 84,
+"measured_patch_count": 12,
+"reason": "patch_sequence_too_short",
+"role": "verify"
+},
+"cold_channel": "B",
+"count_quantum": {
+"reason": "no count lattice in this session's reads (too_few_differences) - count term skipped; levels keep the print floor",
+"status": "none"
+},
+"dark_reference_nits": null,
+"drift_checkpoints": 2,
+"drift_density_exceeded": false,
+"drift_episodes": 0,
+"drift_recent_repeats": 0,
+"drift_regime": "bounded_fluctuation",
+"drift_repeat_density": 0.0,
+"immediate_remeasures": 2,
+"jump_settles": 3,
+"measurement_path_compromised": false,
+"meter_down": false,
+"meter_down_detail": null,
+"meter_events": [],
+"meter_read_failures": 0,
+"meter_restarts": 0,
+"needs_adjudication": false,
+"neutral_interval_adjustments": 0,
+"neutral_interval_final": 8,
+"neutral_interval_initial": 8,
+"panel_dark": false,
+"patch_count": 12,
+"preheat": null,
+"preheat_compromised": false,
+"preheat_policy": "auto",
+"present_stall": false,
+"read_anomalies": [],
+"read_anomaly": false,
+"read_anomaly_repeatability": null,
+"reference_states": null,
+"reference_xyz": [
+91.4674,
+93.8789,
+122.0731
+],
+"remeasure_budget_exceeded": false,
+"remeasure_budget_remaining": 256,
+"remeasure_cap": 256,
+"state_recurrences": 0,
+"total_reads": 20,
+"unresolved": [],
+"unresolved_detail": [],
+"warm": true,
+"warmup_reads": 4,
+"white_nits": 151.523,
+"white_xyz": [
+144.0163,
+151.5233,
+165.0177
+]
+},
+"reads": [
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+0,
+0,
+0
+]
+],
+[
+"measurement",
+[
+45,
+45,
+45
+]
+],
+[
+"measurement",
+[
+45,
+45,
+45
+]
+],
+[
+"measurement",
+[
+45,
+45,
+45
+]
+],
+[
+"measurement",
+[
+84,
+84,
+84
+]
+],
+[
+"measurement",
+[
+141,
+141,
+141
+]
+],
+[
+"measurement",
+[
+225,
+225,
+225
+]
+],
+[
+"measurement",
+[
+338,
+338,
+338
+]
+],
+[
+"measurement",
+[
+450,
+450,
+450
+]
+],
+[
+"measurement",
+[
+563,
+563,
+563
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+],
+[
+"measurement",
+[
+281,
+239,
+225
+]
+],
+[
+"measurement",
+[
+315,
+354,
+394
+]
+],
+[
+"measurement",
+[
+177,
+197,
+167
+]
+],
+[
+"measurement",
+[
+563,
+563,
+563
+]
+],
+[
+"warmup",
+[
+512,
+512,
+532
+]
+]
+],
+"stages": [
+"measure:verify",
+"preflight",
+"verify",
+"verify-patches-file",
+"whitepoint"
+],
+"status": "completed",
+"verify": {
+"avg_de2000": 0.0,
+"content_weighted": {
+"basis": "per-patch content weights (\u03a3 w\u00b7E / \u03a3 w)",
+"class": "synthetic",
+"coverage_gap_pct": 5.0,
+"label": "content-weighted dE_ITP (patch weights: synthetic)",
+"noise_limited_weight_share_pct": 0.0,
+"reach_dEITP": 20.0,
+"score": 0.0,
+"score_bias_corrected": 0.0,
+"weak_evidence_score_share_pct": 99.8
+},
+"gamut_aware": false,
+"gate": {
+"basis": "practical core+tube+white (D3)",
+"checks": {
+"core_avg": true,
+"core_max": true,
+"core_p95": true,
+"tube_avg": true,
+"white": true
+},
+"held_out_gate": {
+"gated": false,
+"held_out_avg": null,
+"held_out_n": 0,
+"min_n": 8,
+"reason": "verify-only builds nothing: this run has no training set (the installed stack was trained in another run) \u2014 no held-out classification"
+},
+"scored": {
+"basis": "per_signal",
+"core_avg": 0.0,
+"core_max": 0.0,
+"core_n": 11,
+"core_p95": 0.0,
+"n_reads": 12,
+"n_signals": 11,
+"read_weighted_core_avg": 0.0,
+"tube_avg": 0.0,
+"tube_n": 10,
+"white": 7e-06
+}
+},
+"grayscale_avg_de2000": 0.0,
+"held_out": {
+"available": false,
+"n_signals": 11,
+"reason": "verify-only builds nothing: this run has no training set (the installed stack was trained in another run) \u2014 no held-out classification",
+"thresholds": {
+"bit_depth": 10,
+"coincident_le_codes": 1.0,
+"distance": "chebyshev, output codes",
+"gate_min_signals": 8,
+"held_out_gt_codes": 4.0,
+"lattice_size": 33,
+"max_cv": 1023,
+"on_lattice_le_codes": 1.0
+}
+},
+"max_de2000": 0.0,
+"metric": "dE_ITP",
+"n_reads": 12,
+"n_signals": 11,
+"optimize_metric": "dE_ITP",
+"p95_de2000": 0.0,
+"patch_count": 12,
+"per_signal_avg": 0.0,
+"per_signal_max": 0.0,
+"per_signal_p95": 0.0,
+"practical": {
+"bands": {
+"1-10": {
+"avg": 0.0,
+"max": 0.0,
+"n": 3,
+"p95": 0.0
+},
+"10-100": {
+"avg": 0.0,
+"max": 0.0,
+"n": 3,
+"p95": 0.0
+},
+"100-203": {
+"avg": 0.0,
+"max": 0.0,
+"n": 2,
+"p95": 0.0
+},
+"<1": {
+"avg": 0.0,
+"max": 0.0,
+"n": 4,
+"p95": 0.0
+},
+">203": {
+"avg": null,
+"max": null,
+"n": 0,
+"p95": null
+}
+},
+"clamped": {
+"avg": null,
+"max": null,
+"n": 0,
+"p95": null
+},
+"content_weighted": {
+"evidence": {
+"n_at_floor": 2,
+"n_low_snr": 1,
+"n_signals": 11,
+"n_single_read": 9,
+"n_single_read_at_floor": 1,
+"n_weak": 10,
+"noise_floor_nits": 0.05,
+"noise_floor_source": "fallback 0.05 nit (i1D3-class single-read floor; no DIP noise floor)",
+"reads_basis": "meter reads behind each signal's scored value: each patch's FINAL adopted round, only the reads the measure loop kept (its round records in the measure NDJSON)",
+"weak_definition": "single read OR measured Y below the noise floor OR flagged low-SNR"
+},
+"evidence_only": "no gate reads this block \u2014 the LLM judges it at the verify seam",
+"headline": {
+"basis": "per-patch content weights (\u03a3 w\u00b7E / \u03a3 w)",
+"class": "synthetic",
+"coverage_gap_pct": 5.0,
+"label": "content-weighted dE_ITP (patch weights: synthetic)",
+"noise_limited_weight_share_pct": 0.0,
+"reach_dEITP": 20.0,
+"score": 0.0,
+"score_bias_corrected": 0.0,
+"weak_evidence_score_share_pct": 99.8
+},
+"metric": "dE_ITP",
+"noise": {
+"correction": "E_corr = sqrt(max(E^2 - SE^2, 0)) per signal; signals without a noise estimate keep E",
+"label": "noise bias-corrected (quadrature subtraction of each signal's read-noise SE, floored at 0) \u2014 a VARIANT beside the raw score, not the score",
+"n_noise_limited": 0,
+"n_unknown_at_floor": 2,
+"n_with_estimate": 1,
+"noise_limited_rule": "E <= 1x its own read-noise SE",
+"per_signal": [
+{
+"E": 0.0,
+"E_bias_corrected": 0.0,
+"basis": "spread of the final round's loop-kept reads",
+"noise_limited": false,
+"noise_se": 0.0,
+"reads": 2,
+"rgb": [
+0.5503,
+0.5503,
+0.5503
+]
+}
+],
+"reads_basis": "meter reads behind each signal's scored value: each patch's FINAL adopted round, only the reads the measure loop kept (its round records in the measure NDJSON)",
+"unknown_rule": "no estimate (noise_unknown, E kept) for a single read and for a signal measured at/below the meter floor (0.05 nit): a read spread there is not a noise estimate"
+},
+"patch_weights": {
+"coverage_gap_pct_as_drawn": 5.0,
+"label": "synthetic",
+"n": 10,
+"score": 0.0,
+"score_bias_corrected": 0.0,
+"score_share": {
+"at_floor": 0.6393,
+"low_snr": 0.6393,
+"noise_limited": 0.0,
+"noise_unknown": 0.9976,
+"out_of_gamut": 0.0,
+"single_read": 0.3582,
+"single_read_at_floor": 0.0,
+"weak": 0.9976
+},
+"weight_measured": 1.0,
+"weight_share": {
+"at_floor": 0.22,
+"low_snr": 0.22,
+"noise_limited": 0.0,
+"noise_unknown": 0.97,
+"out_of_gamut": 0.0,
+"single_read": 0.75,
+"single_read_at_floor": 0.0,
+"weak": 0.97
+},
+"weight_total": 1.0,
+"weight_unmeasured_share": 0.0
+}
+},
+"core": {
+"avg": 0.0,
+"max": 0.0,
+"n": 12,
+"p95": 0.0
+},
+"gamut_aware": false,
+"held_out": {
+"available": false,
+"n_signals": 11,
+"reason": "verify-only builds nothing: this run has no training set (the installed stack was trained in another run) \u2014 no held-out classification",
+"thresholds": {
+"bit_depth": 10,
+"coincident_le_codes": 1.0,
+"distance": "chebyshev, output codes",
+"gate_min_signals": 8,
+"held_out_gt_codes": 4.0,
+"lattice_size": 33,
+"max_cv": 1023,
+"on_lattice_le_codes": 1.0
+}
+},
+"limits": {
+"avg": null,
+"max": null,
+"n": 0,
+"p95": null
+},
+"per_signal": {
+"bands": {
+"1-10": {
+"avg": 0.0,
+"max": 0.0,
+"n": 3,
+"p95": 0.0
+},
+"10-100": {
+"avg": 0.0,
+"max": 0.0,
+"n": 3,
+"p95": 0.0
+},
+"100-203": {
+"avg": 0.0,
+"max": 0.0,
+"n": 1,
+"p95": 0.0
+},
+"<1": {
+"avg": 0.0,
+"max": 0.0,
+"n": 4,
+"p95": 0.0
+},
+">203": {
+"avg": null,
+"max": null,
+"n": 0,
+"p95": null
+}
+},
+"clamped": {
+"avg": null,
+"max": null,
+"n": 0,
+"p95": null
+},
+"core": {
+"avg": 0.0,
+"max": 0.0,
+"n": 11,
+"p95": 0.0
+},
+"limits": {
+"avg": null,
+"max": null,
+"n": 0,
+"p95": null
+},
+"n_reads": 12,
+"n_signals": 11,
+"overall": {
+"avg": 0.0,
+"max": 0.0,
+"n": 11,
+"p95": 0.0
+},
+"tube": {
+"avg": 0.0,
+"max": 0.0,
+"n": 10,
+"p95": 0.0
+}
+},
+"tube": {
+"avg": 0.0,
+"max": 0.0,
+"n": 11,
+"p95": 0.0
+}
+},
+"preset_set": {
+"available": true,
+"avg_de2000": 0.0,
+"core": {
+"per_signal": {
+"avg": 0.0,
+"max": 0.0,
+"n": 11,
+"p95": 0.0
+},
+"read_weighted": {
+"avg": 0.0,
+"max": 0.0,
+"n": 12,
+"p95": 0.0
+}
+},
+"draw_reads_excluded": 0,
+"max_de2000": 0.0,
+"n_reads": 12,
+"n_signals": 11,
+"note": "the preset verify set without the per-run fresh draws \u2014 the run-to-run comparable population",
+"p95_de2000": 0.0,
+"per_signal_avg": 0.0,
+"per_signal_max": 0.0,
+"per_signal_p95": 0.0,
+"tube": {
+"per_signal": {
+"avg": 0.0,
+"max": 0.0,
+"n": 10,
+"p95": 0.0
+},
+"read_weighted": {
+"avg": 0.0,
+"max": 0.0,
+"n": 11,
+"p95": 0.0
+}
+},
+"white_de2000": 0.0
+},
+"quality_targets": {
+"avg_de2000": 3.0,
+"max_de2000": 10.0,
+"p95_de2000": 6.0,
+"white_de2000": 4.0
+},
+"target_white_xy": [
+0.3127,
+0.329
+],
+"verify_only": {
+"measured_stack": {
+"candidate": null,
+"installed_stack": {
+"matches": null,
+"pin_nits": null,
+"pipe_profile": "DesktopLUT-sim-0-HDR.icm",
+"pipe_source_file": null,
+"reason": "no applied-stack record for this display/mode (MHC applied before the registry existed, or by another tool) \u2014 its cap is unknown",
+"recorded": false,
+"recorded_profile": null,
+"sdr_white_nits": null,
+"sdr_white_reason": "no applied-stack record for this display/mode \u2014 the installed MHC's refined SDR white is unknown"
+},
+"mhc_profile": "DesktopLUT-sim-0-HDR.icm",
+"runtime_cube": "<root>\\fp.cube"
+},
+"preheat_policy": "auto",
+"scoring_gamut": null,
+"verify_patches_file": {
+"bit_depth": 10,
+"content_class": "synthetic",
+"content_mode": "HDR",
+"coverage_gap_pct_as_drawn": {
+"reach_20": 5.0
+},
+"file": "<root>\\patches_hdr.json",
+"file_fingerprint": "6464ede38668f658",
+"held_out_check": {
+"available": false,
+"reason": "no stack-registry record of the installed stack (its training run is unknown)"
+},
+"measurement_order": "file (as listed)",
+"min_reads": {
+"max": 3,
+"n_patches": 1,
+"total_min_reads": 14
+},
+"n": 12,
+"patches_fingerprint": "6464ede38668f658",
+"read_rule": {
+"dark_min_reads": 1,
+"n_file_reads": 1,
+"n_loop_policy": 11,
+"rule": "a file `reads` value is the patch's read count: a minimum binding in every stop path (dark early stop, convergence, drift re-measure) that REPLACES dark_min_reads for the patch; the global / bright-neutral floors and the DIP's SNR escalation still apply, and a rejected glitch is re-read",
+"summary": "file `reads` sets the read count of 1 of 12 patches (replaces dark_min_reads 1 for them); the other 11 keep the loop policy (dark_min_reads 1 on dark near-neutrals)"
+},
+"weighted": {
+"n_weighted": 10,
+"n_zero_weight": 2,
+"weight_sum": 1.0
+}
+}
+},
+"white_de2000": 0.0,
+"white_provenance": "numeric",
+"within_quality": true,
+"worst": [
+{
+"de2000": 0.0,
+"gamut_clamped": false,
+"rgb": [
+0.044,
+0.044,
+0.044
+]
+},
+{
+"de2000": 0.0,
+"gamut_clamped": false,
+"rgb": [
+0.082,
+0.082,
+0.082
+]
+},
+{
+"de2000": 0.0,
+"gamut_clamped": false,
+"rgb": [
+0.138,
+0.138,
+0.138
+]
+},
+{
+"de2000": 0.0,
+"gamut_clamped": false,
+"rgb": [
+0.275,
+0.234,
+0.22
+]
+},
+{
+"de2000": 0.0,
+"gamut_clamped": false,
+"rgb": [
+0.173,
+0.193,
+0.163
+]
+}
+]
+}
+}
+}
