@@ -187,7 +187,16 @@ def test_viewing_refine_seam_precondition_hold_and_stage_states(tmp_path: Path):
     assert rows["measure:raw"]["policy"] == "own" and rows["measure:raw"]["applied"] is False
     assert rows[STAGE]["policy"] == "viewing-refine" and rows[STAGE]["state"] == "viewing"
     assert rows["measure:verify"]["policy"].startswith("practical")
-    assert vd["mhc_white"] == {"stage": STAGE, "state": "viewing", "evidence_flags": []}
+    mw = vd["mhc_white"]
+    assert {k: mw[k] for k in ("stage", "state", "evidence_flags")} == {"stage": STAGE, "state": "viewing",
+                                                                          "evidence_flags": []}
+    assert mw["line"] == ts["mhc_white"] and mw["offset_from_target"]["near_target"] is True
+    # the refine's reads were taken AT the target (model), not at the band's edge — and it says so
+    off = ts["offset_from_target"]
+    assert abs(off["mean_offset_load"]) <= off["tolerance_load"] == ts["target"]["tolerance"]["load"]
+    assert ts["mhc_white"].startswith("refined in the viewing band at its target")
+    (acc,) = adj.asked("verify:accept")
+    assert f"MHC white: {ts['mhc_white']}" in acc.question
     # the refine's history entry is trusted by the verify (nothing unmodelled after it)
     assert calib.calib["thermal_history"][-2]["stage"] == STAGE
     assert vd["start"]["kind"] == "run-history"
@@ -330,3 +339,240 @@ def test_sdr_refine_runs_in_the_viewing_state_too(tmp_path: Path):
     assert ts["policy"] == "viewing-refine" and ts["rounds"] and ts["decision"] == "precondition"
     rows = {r["stage"]: r for r in calib.calib["stages"]["verify"]["digest"]["thermal_state"]["stages"]}
     assert rows[stage]["policy"] == "viewing-refine" and rows["measure:raw"]["applied"] is False
+
+
+# --- review findings 2026-10-09 (each test failed before its fix) ----------------------------------------
+class _PauseAt(_Scripted):
+    """_Scripted that PAUSES (AdjudicationRequired) at one seam key — a live run stopping there."""
+
+    def __init__(self, key: str, **script: list[str]) -> None:
+        super().__init__(**script)
+        self.key = key
+
+    def adjudicate(self, request):
+        from dlc.adjudication import AdjudicationRequired
+
+        if request.key == self.key:
+            raise AdjudicationRequired(request)
+        return super().adjudicate(request)
+
+
+def test_refine_remeasure_spends_the_given_start(tmp_path: Path):
+    """Finding 1: the miss question promises the re-run starts from the run history, but the re-asked seam reused
+    the SAME --viewing-start-nits (kind given, 40 nit) — a cool given start lets the re-run assume in-band on a
+    panel the first pass just heated. A remeasure now spends it."""
+    adj = _Scripted(**{f"{STAGE}:thermal-miss": ["remeasure", "accept"]})
+    calib, _ = _hdr(tmp_path, "vr_spent", adjudicator=adj, thermal_state="viewing", viewing_load_nits=3.0,
+                    viewing_hold_budget_min=0.0, viewing_start_nits=40.0)
+    assert calib.run("mhc-only").status == "completed"
+    asks = adj.asked(f"{STAGE}:thermal-state")
+    assert len(asks) == 2 and asks[0].digest["start"]["kind"] == "given"
+    second = asks[1].digest["start"]
+    assert second["kind"] == "run-history" and "SPENT" in second["source"]
+    assert calib.calib["viewing_start_spent"]["by"] == STAGE
+
+
+def test_verify_escalation_remeasure_spends_the_given_start(tmp_path: Path):
+    """Finding 1, the verify's escalation remeasure (its viewing miss): the re-asked thermal-state seam must not
+    re-read the given start either."""
+    from test_viewing_thermal import _hdr_file, _vo
+    from dlc.viewing_thermal import RECORDED_VERIFY_LOAD
+
+    pf = _hdr_file(tmp_path)
+    panel = TimedThermalPanel(start_load=RECORDED_VERIFY_LOAD, cold_blue_gain=1.0)
+    adj = _Scripted(**{"measure:verify:thermal-state": ["measure-now", "precondition"],
+                       "measure:verify:escalation": ["remeasure"]})
+    calib = _vo(tmp_path, "vo_spent", panel=panel, verify_patches_file=pf, thermal_state="viewing",
+                adjudicator=adj, viewing_start_nits=40.0)
+    assert calib.run("verify-only").status == "completed"
+    asks = adj.asked("measure:verify:thermal-state")
+    assert len(asks) == 2 and asks[0].digest["start"]["kind"] == "given"
+    assert asks[1].digest["start"]["kind"] == "run-history"
+    assert calib.calib["viewing_start_spent"]["by"] == "measure:verify"
+    # a NEW value re-arms it (while the knobs may still change: before the verify is memoised)
+    from dlc.calibrate import resolve_thermal_knobs
+    rec = {"stages": {"measure:raw": {}}, "viewing_start_nits": 40.0, "viewing_start_used_by": "measure:verify",
+           "viewing_start_spent": dict(calib.calib["viewing_start_spent"])}
+    resolve_thermal_knobs(rec, thermal_state=None, viewing_load_nits=None, viewing_start_nits=25.0)
+    assert "viewing_start_spent" not in rec and "viewing_start_used_by" not in rec
+    assert rec["viewing_start_nits"] == 25.0
+
+
+def test_hold_reads_a_pass_at_the_target_not_at_the_band_edge():
+    """Finding 2: the soak converges at the band's 0.9 x half-width edge and the old hold only kept the state in
+    band (release 0.75), so a cool refine-like set was read at the edge (~+0.4 x the target). Now the hold settles
+    to the target before the first read and keeps it there (true rig state, same law + clock as the model)."""
+    from dlc.viewing_thermal import CONVERGE_MARGIN
+
+    tolerance = 0.2                                         # x half-width: viewing_thermal.HOLD_AIM_FRAC
+
+    target = LAW.load(13.5)
+    half = 0.5 * target
+    patches = [(PQ.nits_to_cv(n),) * 3 for n in (0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 30.0) * 4]   # cool grey ramp
+    assert set_band(patches, PQ, LAW)["load"] < target
+    edge = target + CONVERGE_MARGIN * half                  # where the soak hands over (from a hot start)
+    panel = TimedThermalPanel(start_load=edge)
+    spec = ViewingPrecondition(target_load=target, halfwidth=half, start_load=edge, start_source="test",
+                               target_source="test", deadline_s=600.0, law=LAW, hold=True, hold_budget_s=3600.0)
+    res = run_measure_loop(patches=patches, transfer=PQ, measure=panel, config=MeasureLoopConfig(viewing=spec))
+    at_reads = [tr[1] for tr in panel.trace if tr[2] == "measurement"]
+    mean_off = sum(at_reads) / len(at_reads) - target
+    assert abs(mean_off) <= tolerance * half                 # the rig's state at the reads: AT the target
+    ts = res.digest["thermal_state"]
+    assert ts["hold"]["settle"]["needed"] is True and ts["hold"]["settle"]["reached"] is True
+    at = ts["measure"]["at_reads"]                          # the model's account agrees with the rig
+    assert at["mean_offset_load"] == pytest.approx(mean_off, abs=2e-4) and at["reads"] == len(at_reads)
+
+
+def test_refine_in_band_but_off_target_is_labelled_honestly(tmp_path: Path):
+    """Finding 2: with no dwell budget the refine reads where the soak left it (the band's edge): in band, but
+    OFF the target — never "refined in the viewing band" without qualification; the miss seam asks."""
+    adj = _Scripted(**{f"{STAGE}:thermal-miss": ["accept"]})
+    calib, _ = _hdr(tmp_path, "vr_off", adjudicator=adj, thermal_state="viewing", viewing_hold_budget_min=0.0)
+    assert calib.run("mhc-only").status == "completed"
+    ts = calib.calib["stages"][STAGE]["digest"]["thermal_state"]
+    assert ts["state"] == "viewing-band-off-target" and ts["evidence_flags"] == ["viewing_off_target"]
+    assert ts["achieved"]["all_rounds_in_band"] is True and ts["achieved"]["all_rounds_on_target"] is False
+    off = ts["offset_from_target"]
+    assert off["near_target"] is False and off["mean_offset_load"] > off["tolerance_load"]
+    assert "OFF its target" in ts["mhc_white"]
+    (miss,) = adj.asked(f"{STAGE}:thermal-miss")
+    assert "OFF its target" in miss.question
+    assert "OFF its target" in adj.asked("verify:accept")[0].question
+
+
+def test_thermal_state_locks_once_the_refine_is_memoised(tmp_path: Path):
+    """Finding 3: a resume could switch --thermal-state viewing -> verify after the viewing refine (the knob only
+    locked at measure:verify); the verify then claimed nothing about the MHC white. Now refused, with the reason."""
+    from dlc.adjudication import AdjudicationRequired
+
+    c1, _ = _hdr(tmp_path, "vr_lock", adjudicator=_PauseAt("measure:verify:thermal-state"), thermal_state="viewing")
+    with pytest.raises(AdjudicationRequired):
+        c1.run("mhc-only")
+    assert c1.calib["stages"][STAGE]["status"] == "done" and "measure:verify" not in c1.calib["stages"]
+    c2, _ = _hdr(tmp_path, "vr_lock", adjudicator=_Scripted(), thermal_state="verify")
+    result = c2.run("mhc-only")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "resume-args"
+    assert "locked once the MHC refine is memoised" in result.digest["message"]
+    assert c2.calib["thermal_state"] == "viewing" and "measure:verify" not in c2.calib["stages"]
+
+
+def test_verify_always_carries_the_mhc_white_line(tmp_path: Path):
+    """Finding 3: whenever a refine recorded a thermal state, the verify digest / verify:accept / the report carry
+    the MHC white's state — even for a verify measured in the 'verify' state (a pre-lock run record)."""
+    from dlc.adjudication import AdjudicationRequired
+
+    c1, _ = _hdr(tmp_path, "vr_line", adjudicator=_PauseAt("measure:verify:thermal-state"), thermal_state="viewing")
+    with pytest.raises(AdjudicationRequired):
+        c1.run("mhc-only")
+    c1.calib.pop("thermal_state")                 # a run record from before the lock: the verify runs "verify"
+    c1._save()
+    adj = _Scripted()
+    c2, _ = _hdr(tmp_path, "vr_line", adjudicator=adj)
+    assert c2.run("mhc-only").status == "completed"
+    vd = c2.calib["stages"]["verify"]["digest"]["thermal_state"]
+    assert vd["state"] == "verify" and vd["mhc_white"]["stage"] == STAGE and vd["mhc_white"]["state"] == "viewing"
+    assert vd["needs_adjudication"] is True and "refined in the 'viewing' state" in vd["note"]
+    q = adj.asked("verify:accept")[0].question
+    assert "MHC white: refined in the viewing band" in q and "Note: the verify was measured" in q
+    report = json.loads(next((tmp_path / "vr_line_results").rglob("report.json")).read_text("utf-8"))
+    rows = {r["stage"]: r for r in report["thermal_state"]["stages"]}
+    assert rows["measure:verify"]["policy"] == "own band (thermal-state verify)"
+    assert "practical" not in report["thermal_state"]["owner_policy"]
+
+
+def test_knob_change_clears_an_aborted_refines_decision(tmp_path: Path):
+    """Finding 4: abort at the refine seam, resume with a new start -> the recorded 'abort' replayed (the knob rule
+    only cleared refines NOT in stages). Now any not-done refine's thermal decisions are dropped."""
+    c1, _ = _hdr(tmp_path, "vr_ab", adjudicator=_Scripted(**{f"{STAGE}:thermal-state": ["abort"]}),
+                 thermal_state="viewing")
+    assert c1.run("mhc-only").status == "aborted"
+    assert c1.calib["stages"][STAGE]["status"] == "aborted"
+    adj = _Scripted()
+    c2, _ = _hdr(tmp_path, "vr_ab", adjudicator=adj, thermal_state="viewing", viewing_start_nits=30.0)
+    assert f"{STAGE}:thermal-state" not in c2.calib["decisions"]
+    assert c2.run("mhc-only").status == "completed"
+    (req,) = adj.asked(f"{STAGE}:thermal-state")
+    assert req.digest["start"]["kind"] == "given"
+
+
+def test_dwell_budget_counts_real_read_time_and_is_never_overrun():
+    """Finding 5: the budget check assumed each dwell read takes the MODEL's read time; a real read 3x longer ran
+    the budget over. Now the next read must fit a conservative bound (max(model x margin, longest real read))."""
+    from dlc.viewing_thermal import ViewingGate, ViewingHold
+
+    class _P:
+        def __init__(self, rgb):
+            self.rgb = tuple(rgb)
+
+    target = LAW.load(3.0)
+    now = [0.0]
+    gate = ViewingGate(_spec(target, hold=True), PQ, clock=lambda: now[0])
+    hold = ViewingHold(gate, (PQ.nits_to_cv(1.0),) * 3)
+    hold.budget_s = 10.0 * hold.read_s
+    hot = _P((PQ.nits_to_cv(60.0),) * 3)
+    gate.begin("measure")
+    gate.observe(hot)
+    hold.begin_block()
+    for _ in range(45):
+        now[0] += 1.0
+        gate.observe(hot)
+
+    def slow_read():                               # a REAL dwell read: 3x the model's read time
+        now[0] += 3.0 * hold.read_s
+        gate.observe(_P(hold.dwell_rgb))
+
+    rec = hold.dwell(slow_read, "time")
+    assert rec is not None and rec["reads"] >= 2 and rec["stopped"] == "budget"
+    assert hold.used_s <= hold.budget_s + 1e-9
+    assert "budget_overrun_s" not in hold.summary()
+
+
+def test_round_record_keeps_read_capped(tmp_path: Path):
+    """Finding 5: the hold's read_capped flag was dropped from the refine's round record."""
+    from types import SimpleNamespace
+
+    calib, _ = _hdr(tmp_path, "vr_cap", thermal_state="viewing")
+    target = LAW.load(13.5)
+    st = {"target": target, "half": 0.5 * target, "used_s": 0.0, "rounds": [], "carried": None, "t_end": None,
+          "left_load": None, "clock": lambda: 0.0, "law": LAW}
+    res = SimpleNamespace(digest={"thermal_state": {
+        "precondition": {"reached": True}, "achieved": {"in_band_throughout": True},
+        "final": {"modelled_load": target}, "measure": {"observed_load": target},
+        "hold": {"blocks": 2, "dwells": 1, "dwell_reads": 9, "dwell_min": 0.5, "dwell_s": 31.0,
+                 "budget_min": 5.0, "budget_exhausted": False, "exhausted_at_block": None, "early_blocks": 0,
+                 "read_capped": True}}})
+    calib._refine_round_record(st, 1, _spec(target, hold=True), res)
+    assert st["rounds"][0]["hold"]["read_capped"] is True
+    assert st["used_s"] == pytest.approx(31.0)
+
+
+def test_two_round_refine_carries_state_budget_and_history(tmp_path: Path):
+    """Test gap: >= 2 refine rounds — round 2 starts from round 1's modelled end state (not the seam's start), its
+    hold gets the budget round 1 left, both rounds read at the target, and the history the verify starts from is
+    the refine's last round."""
+    panel = TimedThermalPanel(start_load=0.096, cold_blue_gain=1.0, eotf_undershoot=-0.05)
+    adj = _Scripted()
+    calib, _ = _hdr(tmp_path, "vr_two", adjudicator=adj, thermal_state="viewing", panel=panel)
+    assert calib.run("mhc-only").status == "completed"
+    ts = calib.calib["stages"][STAGE]["digest"]["thermal_state"]
+    rounds = ts["rounds"]
+    assert len(rounds) >= 2 and len(adj.asked(f"{STAGE}:thermal-state")) == 1     # one seam, every round held
+    r1, r2 = rounds[0], rounds[1]
+    assert r1["start"]["load"] == ts["start"]["load"]
+    assert r2["start"]["source"].startswith("carried from refine round 1")
+    assert r2["start"]["load"] == pytest.approx(r1["measure"]["modelled_end"], abs=2e-5)  # sim: no wall-time gap
+    assert r1["hold"]["settle"]["needed"] is True                  # round 1 settles from the soak's edge
+    assert r2["hold"]["settle"].get("dwell_s", 0.0) < r1["hold"]["settle"]["dwell_s"] / 10
+    budget_s = ts["hold_budget"]["budget_min"] * 60.0
+    assert r2["hold"]["budget_min"] == pytest.approx((budget_s - r1["hold"]["dwell_s"]) / 60.0, abs=0.011)
+    assert ts["hold_total"]["dwell_min"] == pytest.approx(sum(r["hold"]["dwell_s"] for r in rounds) / 60.0,
+                                                          abs=0.011)
+    assert all(r["offset_from_target"]["near_target"] for r in rounds) and ts["state"] == "viewing"
+    assert ts["offset_from_target"]["reads"] == sum(r["offset_from_target"]["reads"] for r in rounds)
+    hist = [h for h in calib.calib["thermal_history"] if h["stage"] == STAGE]
+    last = rounds[-1]
+    assert hist and hist[-1]["load"] == pytest.approx(
+        max(last["measure"]["observed_load"], last["measure"]["modelled_end"]), abs=1e-5)
+    assert calib.calib["stages"]["verify"]["digest"]["thermal_state"]["start"]["kind"] == "run-history"
+    assert calib._last_refine["thermal_state"]["round"] == len(rounds)

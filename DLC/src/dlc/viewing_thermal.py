@@ -46,7 +46,7 @@ __all__ = [
     "LoadLaw", "ViewingPrecondition", "ThermalStateModel", "ViewingGate",
     "read_seconds", "patch_load", "set_band", "predict_hold", "stand_in_nits", "start_state",
     "band_achieved", "HOLD_BLOCK_S", "HOLD_DWELL_NITS", "HOLD_TRIGGER_FRAC", "HOLD_RELEASE_FRAC",
-    "REFINE_POLICY", "REFINE_EXPECTED_ROUNDS", "HOLD_BUDGET_MAX_MIN", "dwell_seconds", "ViewingHold",
+    "HOLD_AIM_FRAC", "HOLD_READ_MARGIN", "WHITE_SHIFT_DE_ITP_PER_LOAD", "REFINE_POLICY", "REFINE_EXPECTED_ROUNDS", "HOLD_BUDGET_MAX_MIN", "dwell_seconds", "ViewingHold",
     "predict_refine_hold",
 ]
 
@@ -95,11 +95,30 @@ CONVERGE_MARGIN = 0.9
 # hygiene: one steady ≤ 1-nit neutral — no full-signal static, no per-refresh toggle (OLED: near-black).
 HOLD_BLOCK_S = 45.0
 HOLD_DWELL_NITS = 1.0
-# A block ends EARLY when the modelled state rises past this fraction of the half-width above the target
-# (mechanical — the model, not a judgment); such a dwell then also runs until the state is back under
-# HOLD_RELEASE_FRAC of the half-width (hysteresis, so the next block cannot step straight out of the band).
-HOLD_TRIGGER_FRAC = CONVERGE_MARGIN
-HOLD_RELEASE_FRAC = 0.75
+# The hold AIMS AT THE TARGET, not just inside the band (review 2026-10-09: a hold that triggered at 0.9 and
+# released at 0.75 x half-width, after a soak that converges at the CONVERGE_MARGIN edge, let the refine read at
+# the band's top edge — sim rounds at 0.043-0.046 vs a 0.0319 target, ~0.3 dE_ITP of white offset by the note's
+# scale — while labelled "viewing"). HOLD_AIM_FRAC is the refine's TARGET TOLERANCE: its reads' mean modelled
+# offset must sit within this fraction of the half-width (0.2 x 0.5 = 10 % of the target load; PA HDR 0.0032
+# load ~ 0.07 dE_ITP of white offset at WHITE_SHIFT_DE_ITP_PER_LOAD, ~0.4x the median verify bookend drift the
+# band was sized against) — finer than that the first-order model (+-~2x absolute) cannot resolve, coarser and the
+# thermal offset is no longer small next to the read drift. Mechanics (model, never a judgment):
+# * SETTLE: after the soak (converged at the band's CONVERGE_MARGIN edge) and the warm-up, the dim dwell field is
+#   shown until the modelled state is back AT the target (HOLD_RELEASE_FRAC) before the first read — the refine's
+#   tighter converge criterion. The dim field (~0.005 load) cools a hot panel far faster than the target-load
+#   stand-in could close the last 0.9 half-width (asymptotic), so this is the cheap way to the target.
+# * a block ends EARLY when the modelled state rises past HOLD_TRIGGER_FRAC of the half-width above the target
+#   while the block is hot; such a dwell runs until the state is back at the target (HOLD_RELEASE_FRAC).
+HOLD_AIM_FRAC = 0.2
+HOLD_TRIGGER_FRAC = HOLD_AIM_FRAC
+HOLD_RELEASE_FRAC = 0.0
+# The study's content-weighted white shift per unit of load (PA HDR, model; see BAND_HALFWIDTH_FRAC) — only to
+# state a modelled offset in dE_ITP beside the load, never a measurement.
+WHITE_SHIFT_DE_ITP_PER_LOAD = 22.0
+# The dwell budget is counted in REAL (thermal-clock) elapsed time, and a dwell read is only started when a
+# CONSERVATIVE bound on its duration still fits: max(model read time x HOLD_READ_MARGIN, the longest dwell read
+# actually taken in this hold). A read that still outruns its bound is recorded (budget_overrun_s), never hidden.
+HOLD_READ_MARGIN = 1.5
 # The MHC refine's digest/policy label, and the round count the seam's predicted dwell TOTAL assumes (the
 # refine stops on the panel's physical floor, so the true count is unknown up front — stated as such).
 REFINE_POLICY = "viewing-refine"
@@ -339,7 +358,9 @@ class ViewingPrecondition:
                "deadline_min": round(self.deadline_s / 60.0, 1), "soak": self.soak, "model": law.as_dict()}
         if self.hold:
             out["hold"] = {"block_s": self.hold_block_s, "budget_min": round(self.hold_budget_s / 60.0, 2),
-                           "dwell_nits": self.dwell_nits}
+                           "dwell_nits": self.dwell_nits, "aim": "target",
+                           "tolerance_load": round(HOLD_AIM_FRAC * self.halfwidth, 5),
+                           "trigger_frac": HOLD_TRIGGER_FRAC, "release_frac": HOLD_RELEASE_FRAC}
         return out
 
 
@@ -401,6 +422,9 @@ class ViewingGate:
         self.model = ThermalStateModel(spec.law, spec.start_load)
         self._t_start: Optional[float] = None
         self.precondition_result: Optional[dict[str, Any]] = None
+        # The modelled state AT the stage's own reads (role "measurement" — not the soak, warm-up, checkpoints
+        # or dwells), per segment: where the numbers were actually taken relative to the target.
+        self._at_reads: dict[str, dict[str, float]] = {}
 
     # -- feeding ----------------------------------------------------------------
     def observe(self, patch: Any) -> None:
@@ -408,6 +432,28 @@ class ViewingGate:
         if rgb is None:
             return
         self.model.observe(patch_load(rgb, self.transfer, self.spec.law), self.clock())
+        seg = self.model._seg
+        if seg is not None and getattr(patch, "role", None) == "measurement":
+            acc = self._at_reads.setdefault(seg, {"n": 0, "temp": 0.0, "off": 0.0, "abs": 0.0, "max_abs": 0.0})
+            off = self.offset()
+            acc["n"] += 1
+            acc["temp"] += self.model.temp
+            acc["off"] += off
+            acc["abs"] += abs(off)
+            acc["max_abs"] = max(acc["max_abs"], abs(off))
+
+    def at_reads(self, segment: str) -> Optional[dict[str, Any]]:
+        """The modelled state at the segment's measurement reads vs the target (model): mean state, mean
+        signed / absolute offset, the worst read. ``None`` when the segment took no measurement read."""
+        acc = self._at_reads.get(segment)
+        if not acc or not acc["n"]:
+            return None
+        n = acc["n"]
+        mean = acc["temp"] / n
+        return {"reads": int(n), "mean_load": round(mean, 5),
+                "mean_nits_equiv": round(self.spec.law.nits_equiv(mean), 2),
+                "mean_offset_load": round(acc["off"] / n, 5), "mean_abs_offset_load": round(acc["abs"] / n, 5),
+                "max_abs_offset_load": round(acc["max_abs"], 5)}
 
     def begin(self, segment: str) -> None:
         if self._t_start is None:
@@ -444,7 +490,15 @@ class ViewingGate:
             "elapsed_min": round(self.elapsed_s() / 60.0, 2),
         }
         for name in self.model.segments:
-            out[name] = self.model.segment_summary(name)
+            out[name] = self.segment_summary(name)
+        return out
+
+    def segment_summary(self, name: str) -> Optional[dict[str, Any]]:
+        """The model's segment summary + the state at the segment's measurement reads (:meth:`at_reads`)."""
+        out = self.model.segment_summary(name)
+        at = self.at_reads(name)
+        if out is not None and at is not None:
+            out["at_reads"] = at
         return out
 
     def checkin(self) -> dict[str, Any]:
@@ -482,15 +536,19 @@ class _Shown:
 
 
 class ViewingHold:
-    """Policy ``hold`` for one measured pass (design note §4.1): the pass's reads form ~``hold_block_s``
-    blocks; a block ends on time, or EARLY when the modelled state rises past :data:`HOLD_TRIGGER_FRAC` of
-    the half-width above the target while the block is hot (mechanical — the model, not a judgment). After a
-    block the dwell field is shown for :func:`dwell_seconds` (block + dwell = the target load); an early
-    (model-triggered) dwell also runs until the state is back under :data:`HOLD_RELEASE_FRAC`. Every dwell
-    is capped by the remaining budget (never exceeded: a read that would cross it is not taken); once spent,
-    the pass rides unheld and :meth:`summary` says from which block. The caller supplies the dwell read
-    (present + read + discard); the gate is fed by that read like any other, so the model, the observed
-    load and the band verdict include the dwell."""
+    """Policy ``hold`` for one measured pass (design note §4.1), AIMED AT THE TARGET: before the pass's first
+    read the dwell field is shown until the modelled state is back at the target (:meth:`settle` — the
+    refine's tighter converge criterion after a soak that stops at the band's edge); then the pass's reads
+    form ~``hold_block_s`` blocks; a block ends on time, or EARLY when the modelled state rises past
+    :data:`HOLD_TRIGGER_FRAC` of the half-width above the target while the block is hot (mechanical — the
+    model, not a judgment). After a block the dwell field is shown for :func:`dwell_seconds` (block + dwell =
+    the target load); an early (model-triggered) dwell also runs until the state is back at the target
+    (:data:`HOLD_RELEASE_FRAC`). The budget is counted in the thermal clock's REAL elapsed time and a dwell
+    read is only started when a conservative bound on its duration still fits (:meth:`read_bound_s`); a read
+    that outruns its bound anyway is recorded (``budget_overrun_s``). Once spent, the pass rides unheld and
+    :meth:`summary` says from which block. The caller supplies the dwell read (present + read + discard); the
+    gate is fed by that read like any other, so the model, the observed load and the band verdict include
+    the dwell."""
 
     LOG_MAX = 40
 
@@ -502,9 +560,12 @@ class ViewingHold:
         self.read_s = read_seconds(_min_xyz(self.dwell_rgb, gate.transfer))   # model s per dwell read
         self.budget_s = max(0.0, float(spec.hold_budget_s))
         self.used_s = 0.0
+        self.max_read_s = 0.0               # the longest dwell read actually taken (thermal clock)
+        self.overrun_s = 0.0
         self.blocks = self.dwells = self.dwell_reads = self.early = 0
         self.exhausted_at_block: Optional[int] = None
         self.read_capped = False
+        self.settle_rec: Optional[dict[str, Any]] = None
         self.log: list[dict[str, Any]] = []
         self._mark = (0.0, 0.0)
 
@@ -526,9 +587,14 @@ class ViewingHold:
             return 0.0, 0.0
         return secs, (seg["load_s"] - self._mark[1]) / secs
 
+    def read_bound_s(self) -> float:
+        """A conservative bound on the NEXT dwell read's duration: the model's read time x
+        :data:`HOLD_READ_MARGIN`, or the longest dwell read this hold actually took, whichever is longer."""
+        return max(self.read_s * HOLD_READ_MARGIN, self.max_read_s)
+
     @property
     def exhausted(self) -> bool:
-        return self.used_s + self.read_s > self.budget_s
+        return self.used_s + self.read_bound_s() > self.budget_s
 
     def due(self) -> Optional[str]:
         """``"model"`` / ``"time"`` when the current block ends now, else ``None`` (always ``None`` once
@@ -547,6 +613,62 @@ class ViewingHold:
             return "time"
         return None
 
+    def _run(self, read: Callable[[], Any], satisfied: Callable[[float], bool], need_s: float,
+             at_block: int) -> tuple[float, int, Optional[str]]:
+        """Show (read + discard) the dwell field until ``satisfied(elapsed)``, the budget (real elapsed + the
+        next read's conservative bound) or the read cap stops it. Returns ``(elapsed_s, reads, stopped)``."""
+        clock = self.gate.clock
+        t0 = clock()
+        # A clock that does not advance with the reads (a mock without a sim clock) must not spin forever.
+        # (No dwell needs longer than its formula time + 4 τ: the model release from the hottest state.)
+        horizon = min(max(self.budget_s - self.used_s, 0.0), need_s + 4.0 * self.gate.spec.law.tau_s)
+        cap = int(math.ceil(horizon / max(self.read_s, 0.5))) * 2 + 1
+        reads = 0
+        stopped: Optional[str] = None
+        while True:
+            elapsed = max(0.0, clock() - t0)
+            if satisfied(elapsed):
+                break
+            if self.used_s + elapsed + self.read_bound_s() > self.budget_s:
+                stopped = "budget"
+                break
+            if reads >= cap:
+                stopped = "read-cap"
+                self.read_capped = True
+                break
+            t_read = clock()
+            read()
+            reads += 1
+            self.max_read_s = max(self.max_read_s, max(0.0, clock() - t_read))
+        elapsed = max(0.0, clock() - t0)
+        self.used_s += elapsed
+        self.overrun_s = max(self.overrun_s, self.used_s - self.budget_s)
+        self.dwells += int(reads > 0)
+        self.dwell_reads += reads
+        if stopped == "budget" and self.exhausted_at_block is None:
+            self.exhausted_at_block = at_block
+        return elapsed, reads, stopped
+
+    def settle(self, read: Callable[[], Any]) -> dict[str, Any]:
+        """Before the pass's first read (after the soak + warm-up): show the dwell field until the modelled
+        state is back AT the target (:data:`HOLD_RELEASE_FRAC`), within the budget — so the stage's reads
+        start at the target, not at the band edge the soak converged on. A state already at/below the target
+        needs none (the hold never heats: no bright filler). Opens the first block. Returns the record."""
+        spec = self.gate.spec
+        lim = HOLD_RELEASE_FRAC * spec.halfwidth
+        before = self.gate.model.temp
+        if self.gate.offset() <= lim:
+            rec: dict[str, Any] = {"needed": False, "modelled_before": round(before, 5)}
+        else:
+            elapsed, reads, stopped = self._run(read, lambda _e: self.gate.offset() <= lim, 0.0,
+                                                at_block=self.blocks + 1)
+            rec = {"needed": True, "reached": self.gate.offset() <= lim, "dwell_s": round(elapsed, 1),
+                   "reads": reads, "modelled_before": round(before, 5),
+                   "modelled_after": round(self.gate.model.temp, 5), **({"stopped": stopped} if stopped else {})}
+        self.settle_rec = rec
+        self.begin_block()
+        return rec
+
     def dwell(self, read: Callable[[], Any], reason: str) -> Optional[dict[str, Any]]:
         """End the current block (``reason`` from :meth:`due`) and run its dwell; ``read`` shows + reads
         (discards) the dwell field once. Returns the dwell record, or ``None`` when none was needed."""
@@ -563,34 +685,8 @@ class ViewingHold:
         if satisfied(0.0):
             self.begin_block()
             return None
-        clock = self.gate.clock
-        t0 = clock()
         before = self.gate.model.temp
-        # A clock that does not advance with the reads (a mock without a sim clock) must not spin forever.
-        # (No dwell needs longer than its formula time + 4 τ: the model release from the hottest state.)
-        horizon = min(max(self.budget_s - self.used_s, 0.0), need + 4.0 * spec.law.tau_s)
-        cap = int(math.ceil(horizon / max(self.read_s, 0.5))) * 2 + 1
-        reads = 0
-        stopped: Optional[str] = None
-        while True:
-            elapsed = max(0.0, clock() - t0)
-            if satisfied(elapsed):
-                break
-            if self.used_s + elapsed + self.read_s > self.budget_s:
-                stopped = "budget"
-                break
-            if reads >= cap:
-                stopped = "read-cap"
-                self.read_capped = True
-                break
-            read()
-            reads += 1
-        elapsed = max(0.0, clock() - t0)
-        self.used_s += elapsed
-        self.dwells += int(reads > 0)
-        self.dwell_reads += reads
-        if stopped == "budget" and self.exhausted_at_block is None:
-            self.exhausted_at_block = self.blocks
+        elapsed, reads, stopped = self._run(read, satisfied, need, at_block=self.blocks)
         rec = {"block": self.blocks, "reason": reason, "block_s": round(secs, 1), "block_load": round(load, 5),
                "need_s": round(need, 1), "dwell_s": round(elapsed, 1), "reads": reads,
                "modelled_before": round(before, 5), "modelled_after": round(self.gate.model.temp, 5),
@@ -603,15 +699,25 @@ class ViewingHold:
     def summary(self, *, compact: bool = False) -> dict[str, Any]:
         out: dict[str, Any] = {
             "policy": "hold", "blocks": self.blocks, "dwells": self.dwells, "dwell_reads": self.dwell_reads,
-            "dwell_min": round(self.used_s / 60.0, 2), "budget_min": round(self.budget_s / 60.0, 2),
+            "dwell_min": round(self.used_s / 60.0, 2), "dwell_s": round(self.used_s, 1),
+            "budget_min": round(self.budget_s / 60.0, 2),
             "budget_exhausted": self.exhausted_at_block is not None,
             "exhausted_at_block": self.exhausted_at_block, "early_blocks": self.early,
         }
+        if self.settle_rec is not None:
+            out["settle"] = dict(self.settle_rec)
         if self.read_capped:
             out["read_capped"] = True
+        if self.overrun_s > 0.05:
+            out["budget_overrun_s"] = round(self.overrun_s, 1)
         if not compact:
             out.update({"dwell_rgb": list(self.dwell_rgb), "dwell_load": round(self.dwell_load, 5),
                         "block_s": self.gate.spec.hold_block_s, "dwell_log": list(self.log),
+                        "aim": {"tolerance_load": round(HOLD_AIM_FRAC * self.gate.spec.halfwidth, 5),
+                                "trigger_frac": HOLD_TRIGGER_FRAC, "release_frac": HOLD_RELEASE_FRAC},
+                        "read_bound": {"model_read_s": round(self.read_s, 2), "margin": HOLD_READ_MARGIN,
+                                       "max_dwell_read_s": round(self.max_read_s, 2),
+                                       "basis": "budget counted in real (thermal-clock) elapsed time"},
                         "basis": MODEL_BASIS})
         return out
 
@@ -620,8 +726,10 @@ def predict_refine_hold(patches: Sequence[Sequence[float]], transfer: Any, law: 
                         halfwidth: float, start_load: float, budget_s: float = math.inf,
                         block_s: float = HOLD_BLOCK_S, dwell_nits: float = HOLD_DWELL_NITS) -> dict[str, Any]:
     """Model one HELD pass over ``patches`` in their order (the read-time model as the clock) by driving the
-    SAME :class:`ViewingHold` policy the measure loop runs: the dwell it needs, the state it ends in and the
-    time fraction in band. Excludes warm-up / checkpoints / re-reads (model prediction)."""
+    SAME :class:`ViewingHold` policy the measure loop runs — the settle to the target, then the blocks + dwells:
+    the dwell it needs (``settle_min`` of it before the first read), the state it ends in, the mean modelled
+    offset from the target at the set's reads and the time fraction in band. Excludes warm-up / checkpoints /
+    re-reads (model prediction)."""
     now = [0.0]
     spec = ViewingPrecondition(target_load=target_load, halfwidth=halfwidth, start_load=start_load,
                                start_source="prediction", target_source="prediction", deadline_s=0.0,
@@ -631,28 +739,31 @@ def predict_refine_hold(patches: Sequence[Sequence[float]], transfer: Any, law: 
     gate.model.observe(start_load, 0.0)            # anchor the model's clock (no relax on the first sample)
     gate.begin("measure")
     hold = ViewingHold(gate, _grey_rgb(dwell_nits, transfer))
-    hold.begin_block()
-    acc = {"in": 0.0, "all": 0.0, "worst": abs(start_load - target_load)}
+    acc = {"in": 0.0, "all": 0.0, "worst": abs(start_load - target_load), "off": 0.0, "n": 0}
 
-    def show(rgb: Sequence[int]) -> None:
+    def show(rgb: Sequence[int], measured: bool = False) -> None:
         dt = read_seconds(_min_xyz(rgb, transfer))
         now[0] += dt
         gate.observe(_Shown(rgb))
-        off = abs(gate.offset())
+        off = gate.offset()
         acc["all"] += dt
-        acc["worst"] = max(acc["worst"], off)
-        if off <= halfwidth:
+        acc["worst"] = max(acc["worst"], abs(off))
+        if abs(off) <= halfwidth:
             acc["in"] += dt
+        if measured:
+            acc["off"] += off
+            acc["n"] += 1
 
+    settle = hold.settle(lambda: show(hold.dwell_rgb))
     for p in patches:
-        show(p)
+        show(p, measured=True)
         reason = hold.due()
         if reason:
             hold.dwell(lambda: show(hold.dwell_rgb), reason)
     s = hold.summary(compact=True)
-    return {"dwell_min": s["dwell_min"], "dwells": s["dwells"], "blocks": s["blocks"],
-            "budget_exhausted": s["budget_exhausted"],
+    return {"dwell_min": s["dwell_min"], "settle_min": round(float(settle.get("dwell_s") or 0.0) / 60.0, 2),
+            "dwells": s["dwells"], "blocks": s["blocks"], "budget_exhausted": s["budget_exhausted"],
             "reads_min": round((acc["all"] - hold.used_s) / 60.0, 2), "total_min": round(acc["all"] / 60.0, 2),
             "end_load": round(gate.model.temp, 5), "max_offset_load": round(acc["worst"], 5),
+            "mean_offset_at_reads": round(acc["off"] / acc["n"], 5) if acc["n"] else None,
             "in_band_fraction": round(acc["in"] / acc["all"], 3) if acc["all"] else None}
-

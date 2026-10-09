@@ -352,9 +352,15 @@ def resolve_thermal_knobs(calib: dict[str, Any], *, thermal_state: Optional[str]
     * the knobs shape only the VERIFY measure, so they may change until :data:`THERMAL_STATE_STAGE` is
       memoised (the LLM corrects an assumed start at the thermal-state seam); every change on a run
       that already has stages or a stored value is returned in ``changes`` (recorded, never silent);
-    * once the verify is measured, a different value is a conflict (the run refuses at resume-args)."""
+    * once the verify is measured, a different value is a conflict (the run refuses at resume-args);
+    * ``--thermal-state`` itself also locks once an MHC refine (:data:`REFINE_THERMAL_STAGES`) is memoised
+      done — its white/greys were refined in that state (a conflict with a ``reason``)."""
     stages = calib.get("stages") or {}
     locked = THERMAL_STATE_STAGE in stages
+    # The STATE itself also locks once an MHC refine is memoised (done): its white/greys were refined in the
+    # state it recorded, so switching viewing <-> verify after it would make the verify describe another state
+    # than the profile's white (a viewing refine verified "verify", or the reverse) — refused, never silent.
+    refined = [k for k in REFINE_THERMAL_STAGES if (stages.get(k) or {}).get("status") == "done"]
     requested: list[tuple[str, Any]] = []
     if thermal_state is not None:
         st = str(thermal_state).strip().lower()
@@ -378,6 +384,13 @@ def resolve_thermal_knobs(calib: dict[str, Any], *, thermal_state: Optional[str]
         if locked:
             conflicts.append({"field": field, "requested": shown(field, want), "persisted": shown(field, stored)})
             continue
+        if field == "thermal_state" and refined:
+            conflicts.append({"field": field, "requested": shown(field, want), "persisted": shown(field, stored),
+                              "reason": (f"--thermal-state is locked once the MHC refine is memoised "
+                                         f"({', '.join(refined)} refined the MHC white/greys in the "
+                                         f"{shown(field, stored)!r} state; the verify must describe the same "
+                                         "request)")})
+            continue
         if stored is not None or stages:
             changes.append({"field": field, "from": shown(field, stored), "to": shown(field, want),
                             "at": datetime.now().isoformat(timespec="seconds"), "stages_done": sorted(stages)})
@@ -387,6 +400,7 @@ def resolve_thermal_knobs(calib: dict[str, Any], *, thermal_state: Optional[str]
             calib[field] = want
         if field == "viewing_start_nits":
             calib.pop("viewing_start_used_by", None)   # a NEW start answers the next viewing seam
+            calib.pop("viewing_start_spent", None)
     return conflicts, changes
 
 
@@ -652,11 +666,14 @@ class Calibration:
         if knob_changes:
             self.calib.setdefault("thermal_state_changes", []).extend(knob_changes)
             self._forget_decision(THERMAL_STATE_DECISION_KEY, overrides=False)
-            # ...and the MHC refine's thermal-state seam, while that refine is still to run (its numbers
-            # — start, target, dwell budget — just changed; a memoised refine keeps its record).
+            # ...and the MHC refine's thermal-state (+ miss) seam decisions, while that refine is not done —
+            # still to run OR aborted (an aborted refine re-runs on resume; its recorded "abort" must not
+            # replay over the numbers — start, target, dwell budget — that just changed). A done refine keeps
+            # its record.
             for stage in REFINE_THERMAL_STAGES:
-                if stage not in (self.calib.get("stages") or {}):
+                if ((self.calib.get("stages") or {}).get(stage) or {}).get("status") != "done":
                     self._forget_decision(f"{stage}:thermal-state", overrides=False)
+                    self._forget_decision(f"{stage}:thermal-miss", overrides=False)
         # Thermal preheat policy (--preheat auto|always|never → MeasureLoopConfig.preheat). None =
         # not asked: the loop config's own policy (auto) — today's behaviour. Persisted so a flagless
         # resume keeps it; unlike the args above it only shapes measure stages NOT yet run (each
@@ -2033,6 +2050,11 @@ class Calibration:
         given = self.calib.get("viewing_start_nits")
         if given is None:
             return None, None
+        spent = self.calib.get("viewing_start_spent") or {}
+        if spent:
+            return None, (f"--viewing-start-nits {float(given):g} answered the {spent.get('by')} seam and was SPENT "
+                          f"by its {spent.get('reason')} (the panel has run since: it no longer describes the "
+                          "panel); not reused — a new value re-arms it")
         used_by = self.calib.get("viewing_start_used_by")
         if used_by and used_by != key:
             return None, (f"--viewing-start-nits {float(given):g} answered the {used_by} seam (it describes the "
@@ -2044,6 +2066,17 @@ class Calibration:
         if start_kind == "given" and self.calib.get("viewing_start_used_by") != key:
             self.calib["viewing_start_used_by"] = key
             self._save()
+
+    def _spend_given_start_on_remeasure(self, key: str, reason: str) -> None:
+        """A REMEASURE of the stage whose seam ``key`` took ``--viewing-start-nits`` spends that start for good:
+        it described the panel before the FIRST pass, and the panel has run since (the soak, the reads), so
+        the re-asked seam must start from this run's history — or assume hot — as the remeasure question says,
+        never re-read the same (possibly cool) given start and over-claim "in band" on a hotter panel. A new
+        value re-arms it (:func:`resolve_thermal_knobs`). No-op when the start was not this seam's."""
+        if self.calib.get("viewing_start_nits") is None or self.calib.get("viewing_start_used_by") != key:
+            return
+        self.calib["viewing_start_spent"] = {"by": key, "reason": reason,
+                                             "at": datetime.now().isoformat(timespec="seconds")}
 
     def _viewing_start(self, key: str, own_band_load: float, law: viewing_thermal.LoadLaw
                        ) -> tuple[float, str, str, list[str]]:
@@ -2112,6 +2145,23 @@ class Calibration:
         held — never a silently "viewing" verify."""
         rec = (((self.calib.get("stages") or {}).get(THERMAL_STATE_STAGE) or {}).get("digest") or {}).get(
             "thermal_state")
+        out = self._verify_thermal_state_core(rec)
+        # Whatever the verify itself ran in: when an MHC refine recorded a thermal state, the profile's white
+        # was refined in THAT state — its line rides the verify digest (-> verify:accept, the report) always.
+        summary = self._thermal_stage_summary() or {}
+        mhc_white = summary.get("mhc_white")
+        if mhc_white is not None and "mhc_white" not in out:
+            out["mhc_white"] = mhc_white
+            out["stages"] = summary.get("stages")
+            if out.get("requested") != "viewing":
+                out["note"] = (f"the verify was measured in the {out.get('state')!r} state; the MHC white was "
+                               f"refined in the {mhc_white.get('state')!r} state ({mhc_white.get('stage')})")
+            if mhc_white.get("evidence_flags") or out.get("requested") != "viewing":
+                out["needs_adjudication"] = True
+        return out
+
+    def _verify_thermal_state_core(self, rec: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """:meth:`_verify_thermal_state` from the verify measure stage's own record."""
         if not rec:
             return {"state": self._thermal_state()}
         out = {k: rec.get(k) for k in ("state", "requested", "decision") if rec.get(k) is not None}
@@ -4534,7 +4584,9 @@ class Calibration:
                     seed.pop(f"{key}:escalation", None)
                 # A viewing-state stage: the re-measure re-runs the PRECONDITION too, so its thermal-state
                 # seam must re-ask (new start from the run history, new predicted time) — never replay the
-                # memoised choice over numbers the LLM has not seen. No-op for any other stage.
+                # memoised choice over numbers the LLM has not seen — and a --viewing-start-nits that seam took
+                # is spent (the panel has run since). No-op for any other stage.
+                self._spend_given_start_on_remeasure(key, "escalation remeasure")
                 self._forget_decision(f"{key}:thermal-state", overrides=True)
                 self._save()
                 return self.stage_measure(role=role, patches=patches,
@@ -5413,13 +5465,14 @@ class Calibration:
         budget_src = ("--viewing-hold-budget-min" if given_budget is not None
                       else "default: the predicted dwell total x 1.5 + 5 min")
         lo, hi = round(target - half, 5), round(target + half, 5)
+        tol = self._refine_target_tolerance(target, half)
         digest: dict[str, Any] = {
             "state": "viewing", "requested": "viewing", "policy": viewing_thermal.REFINE_POLICY,
             "owner_decision": ("2026-10-09: the thermal offset goes into the PROFILE through the MHC refine "
                                "(the sole neutral-axis owner), measured in the viewing state; raw + the cube "
                                "build stay at their own (loaded) band; DesktopLUT's White Balance is not used"),
             "target": {"load": round(target, 5), "nits_equiv": round(target_nits, 2), "band": [lo, hi],
-                       "source": target_src},
+                       "source": target_src, "tolerance": tol},
             "start": {"load": round(start, 5), "nits_equiv": round(law.nits_equiv(start), 2), "source": start_src,
                       "kind": start_kind, **({"unmodelled_stages": unmodelled} if unmodelled else {})},
             "predicted": {"precondition_minutes": (round(minutes, 1) if minutes is not None else None),
@@ -5428,7 +5481,9 @@ class Calibration:
                           "hold_round_1": first, "hold_round_n": steady,
                           "hold_dwell_total_min": dwell_total, "rounds_assumed": n_rounds,
                           "note": ("each round also re-runs the viewing-load soak (the per-round preheat, "
-                                   "converging in its minimum blocks from a held state)")},
+                                   "converging in its minimum blocks from a held state); the soak converges at "
+                                   "the band's edge, then the dwell field SETTLES the state to the target before "
+                                   "the first read (hold_round_1.settle_min) and the hold keeps it there")},
             "precondition_budget": {"deadline_min": round(deadline_s / 60.0, 1), "cap_min": cap_min,
                                     "capped": capped},
             "hold_budget": {"budget_min": budget_min, "source": budget_src, "default_min": default_budget,
@@ -5451,8 +5506,13 @@ class Calibration:
             f"(~{round(minutes, 1) if minutes is not None else '?'} min predicted; capped at "
             f"{round(deadline_s / 60.0, 1)} min"
             f"{' — the 4-tau cap binds, expect it flagged unmet' if capped else ''}), "
-            f"then HOLD it through every round: dim-neutral ({viewing_thermal.HOLD_DWELL_NITS:g} nit) dwells between "
-            f"~{viewing_thermal.HOLD_BLOCK_S:g} s read blocks so block + dwell sit at the viewing load. This refine "
+            f"then SETTLE it to the target (the soak converges at the band's edge; the "
+            f"{viewing_thermal.HOLD_DWELL_NITS:g}-nit dwell field cools it to the target before the first read, "
+            f"~{first.get('settle_min')} min in round 1, model) and HOLD it there through every round: dim-neutral "
+            f"dwells between ~{viewing_thermal.HOLD_BLOCK_S:g} s read blocks so block + dwell sit at the viewing "
+            f"load, and a block that heats the state past +{tol['load']} load is cut and cooled back to the "
+            f"target. The refine counts as AT the target when its reads' mean modelled offset is within "
+            f"+-{tol['load']} load ({tol['why_short']}). This refine "
             f"set's own band is {band['load']} (~{band['nits_equiv']} nit-eq, ~{band['minutes']} min of reads per "
             f"round): predicted dwell {first['dwell_min']} min in round 1, {steady['dwell_min']} min per later "
             f"round, ~{dwell_total} min for a {n_rounds}-round refine (model). Dwell budget {budget_min:g} min "
@@ -5520,7 +5580,21 @@ class Calibration:
         pre = ts.get("precondition") or {}
         hold = ts.get("hold") or {}
         flags = self._viewing_flags(ts)
-        st["used_s"] += 60.0 * float(hold.get("dwell_min") or 0.0)
+        # Where the round's READS were taken relative to the target (model): in band is not enough — a refine
+        # read at the band's edge carries that edge's thermal offset into the MHC white.
+        tol = self._refine_target_tolerance(st["target"], st["half"])
+        at = (ts.get("measure") or {}).get("at_reads")
+        offset = None
+        if at:
+            offset = {**at, "tolerance_load": tol["load"],
+                      "near_target": abs(float(at["mean_offset_load"])) <= tol["load"] + 1e-9,
+                      "model_white_shift_de_itp": round(
+                          viewing_thermal.WHITE_SHIFT_DE_ITP_PER_LOAD * float(at["mean_offset_load"]), 3)}
+            if not offset["near_target"]:
+                flags.append("viewing_off_target")
+        # the budget is counted in the hold's real elapsed seconds (not the rounded minutes)
+        st["used_s"] += float(hold["dwell_s"]) if hold.get("dwell_s") is not None else \
+            60.0 * float(hold.get("dwell_min") or 0.0)
         final = ts.get("final") or {}
         st["carried"] = final.get("modelled_load")
         st["t_end"] = st["clock"]()
@@ -5532,9 +5606,10 @@ class Calibration:
             "start": {"load": round(spec.start_load, 5), "source": spec.start_source},
             "precondition": {k: pre.get(k) for k in ("reached", "skipped", "converged", "elapsed_min",
                                                      "modelled_load") if k in pre},
-            "achieved": ts.get("achieved"), "measure": ts.get("measure"),
-            "hold": ({k: hold.get(k) for k in ("blocks", "dwells", "dwell_reads", "dwell_min", "budget_min",
-                                               "budget_exhausted", "exhausted_at_block", "early_blocks")
+            "achieved": ts.get("achieved"), "measure": ts.get("measure"), "offset_from_target": offset,
+            "hold": ({k: hold.get(k) for k in ("blocks", "dwells", "dwell_reads", "dwell_min", "dwell_s",
+                                               "budget_min", "budget_exhausted", "exhausted_at_block",
+                                               "early_blocks", "settle", "read_capped", "budget_overrun_s")
                       if k in hold} if hold else {"policy": "none (measure-now: no hold)"})})
 
     def _refine_round_thermal(self, stage: str) -> Optional[dict[str, Any]]:
@@ -5546,9 +5621,48 @@ class Calibration:
         return {"policy": viewing_thermal.REFINE_POLICY, "round": r["round"], "state": r["state"],
                 "evidence_flags": r["evidence_flags"],
                 "modelled_range": (r.get("measure") or {}).get("modelled_range"),
+                "offset_from_target": r.get("offset_from_target"),
                 "band": st["digest"]["target"]["band"], "hold": r.get("hold"),
                 "dwell_used_min": round(st["used_s"] / 60.0, 2),
                 "dwell_budget_min": round(st["budget_s"] / 60.0, 2)}
+
+    @staticmethod
+    def _refine_target_tolerance(target: float, half: float) -> dict[str, Any]:
+        """The refine's TARGET tolerance (:data:`viewing_thermal.HOLD_AIM_FRAC` of the half-width): the band
+        says the state was viewing-like; this says the refine's reads were taken AT the viewing target."""
+        tol = viewing_thermal.HOLD_AIM_FRAC * half
+        de = viewing_thermal.WHITE_SHIFT_DE_ITP_PER_LOAD * tol
+        return {"load": round(tol, 5), "frac_of_halfwidth": viewing_thermal.HOLD_AIM_FRAC,
+                "frac_of_target": round(tol / target, 3) if target > 0 else None,
+                "model_white_shift_de_itp": round(de, 3),
+                "why_short": f"~{de:.2f} dE_ITP of white shift at the study's scale, model",
+                "why": (f"{viewing_thermal.HOLD_AIM_FRAC:g} x the half-width = {tol / target:.0%} of the target "
+                        f"load, ~{de:.2f} dE_ITP of content-weighted white shift at the study's PA HDR scale "
+                        f"(~{viewing_thermal.WHITE_SHIFT_DE_ITP_PER_LOAD:g} dE_ITP per load unit, model): under half "
+                        "the median verify bookend drift the band was sized against — finer than this the "
+                        "first-order model (+-~2x absolute) cannot resolve; coarser and the refine's thermal "
+                        "offset is no longer small next to the read drift"),
+                "basis": viewing_thermal.MODEL_BASIS}
+
+    def _refine_offset_summary(self, st: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """The refine's reads vs the target over every round (read-weighted mean modelled offset; model)."""
+        rows = [r["offset_from_target"] for r in st["rounds"] if r.get("offset_from_target")]
+        n = sum(int(o["reads"]) for o in rows)
+        if not n:
+            return None
+        mean = sum(float(o["mean_offset_load"]) * int(o["reads"]) for o in rows) / n
+        mean_abs = sum(float(o["mean_abs_offset_load"]) * int(o["reads"]) for o in rows) / n
+        tol = self._refine_target_tolerance(st["target"], st["half"])
+        law = st["law"]
+        return {"reads": n, "mean_offset_load": round(mean, 5), "mean_abs_offset_load": round(mean_abs, 5),
+                "max_abs_offset_load": max(float(o["max_abs_offset_load"]) for o in rows),
+                "mean_nits_equiv": round(law.nits_equiv(st["target"] + mean), 2),
+                "target_nits_equiv": round(law.nits_equiv(st["target"]), 2),
+                "model_white_shift_de_itp": round(viewing_thermal.WHITE_SHIFT_DE_ITP_PER_LOAD * mean, 3),
+                "tolerance_load": tol["load"], "tolerance_why": tol["why"],
+                "near_target": abs(mean) <= tol["load"] + 1e-9,
+                "per_round": [round(float(o["mean_offset_load"]), 5) for o in rows],
+                "basis": viewing_thermal.MODEL_BASIS}
 
     def _refine_thermal_finish(self, stage: str) -> Optional[dict[str, Any]]:
         """The MHC refine stage's ``thermal_state`` (viewing runs; ``None`` otherwise / nothing measured):
@@ -5561,20 +5675,41 @@ class Calibration:
         if self._thermal_state() != "viewing" or not st or not st["rounds"]:
             return None
         flags = sorted({f for r in st["rounds"] for f in r["evidence_flags"]})
-        rounds_ok = sum(1 for r in st["rounds"] if not r["evidence_flags"])
+        band_flags = [f for f in flags if f != "viewing_off_target"]
+        rounds_in_band = sum(1 for r in st["rounds"] if not [f for f in r["evidence_flags"]
+                                                             if f != "viewing_off_target"])
+        rounds_on_target = sum(1 for r in st["rounds"] if not r["evidence_flags"])
         exhausted = next((r["round"] for r in st["rounds"] if (r.get("hold") or {}).get("budget_exhausted")), None)
+        overrun = round(sum(float((r.get("hold") or {}).get("budget_overrun_s") or 0.0) for r in st["rounds"]), 1)
+        offset = self._refine_offset_summary(st)
+        off_txt = ("no measurement read to place against the target" if offset is None else
+                   f"mean modelled offset from the target {offset['mean_offset_load']:+.4f} load "
+                   f"(~{offset['model_white_shift_de_itp']:+.2f} dE_ITP of white shift at the study's scale), "
+                   f"tolerance +-{offset['tolerance_load']}")
+        if band_flags:
+            state = "outside-viewing-band"
+            white = (f"refined OUTSIDE the viewing band ({', '.join(flags)}; {off_txt}; model) — the MHC's "
+                     "white/greys describe another thermal state than viewing")
+        elif flags:
+            state = "viewing-band-off-target"
+            white = (f"refined in the viewing band but OFF its target (viewing_off_target; {off_txt}; model) — the "
+                     "MHC's white/greys carry that offset's thermal shift")
+        else:
+            state = "viewing"
+            white = f"refined in the viewing band at its target ({off_txt}; model)"
         rec = {
             **st["digest"],
-            "state": "outside-viewing-band" if flags else "viewing",
-            "achieved": {"rounds": len(st["rounds"]), "rounds_in_band": rounds_ok, "all_rounds_in_band": not flags,
-                         "basis": viewing_thermal.MODEL_BASIS},
+            "state": state,
+            "achieved": {"rounds": len(st["rounds"]), "rounds_in_band": rounds_in_band,
+                         "rounds_on_target": rounds_on_target, "all_rounds_in_band": not band_flags,
+                         "all_rounds_on_target": not flags, "basis": viewing_thermal.MODEL_BASIS},
+            "offset_from_target": offset,
             "hold_total": {"dwell_min": round(st["used_s"] / 60.0, 2),
                            "budget_min": round(st["budget_s"] / 60.0, 2),
-                           "budget_exhausted_in_round": exhausted},
+                           "budget_exhausted_in_round": exhausted,
+                           **({"budget_overrun_s": overrun} if overrun > 0 else {})},
             "rounds": st["rounds"], "evidence_flags": flags, "needs_adjudication": bool(flags),
-            "mhc_white": ("refined in the viewing band (model)" if not flags else
-                          f"refined OUTSIDE the viewing band ({', '.join(flags)}; model) — the MHC's white/greys "
-                          "describe another thermal state than viewing"),
+            "mhc_white": white,
         }
         self._note_thermal_history(stage, st["left_load"],
                                    basis="max(observed load, modelled end state) of the last refine round")
@@ -5592,12 +5727,17 @@ class Calibration:
             return False
         key = f"{stage}:thermal-miss"
         ach, held = ts.get("achieved") or {}, ts.get("hold_total") or {}
+        off = ts.get("offset_from_target") or {}
+        where = ("ran outside it" if ts.get("state") == "outside-viewing-band" else
+                 "stayed in its band but read OFF its target")
         question = (
-            f"the MHC closed-loop refine ({stage}) asked for the VIEWING thermal state but ran outside it "
-            f"({', '.join(flags)}; {ach.get('rounds_in_band')}/{ach.get('rounds')} rounds in band; dwell "
+            f"the MHC closed-loop refine ({stage}) asked for the VIEWING thermal state but {where} "
+            f"({', '.join(flags)}; {ach.get('rounds_in_band')}/{ach.get('rounds')} rounds in band, "
+            f"{ach.get('rounds_on_target')}/{ach.get('rounds')} at the target; mean modelled offset from the target "
+            f"{off.get('mean_offset_load')} load vs tolerance +-{off.get('tolerance_load')}; dwell "
             f"{held.get('dwell_min')} of {held.get('budget_min')} min budget; model). The installed MHC's white/greys "
-            "were refined in another state than viewing. accept = keep this MHC, flagged as refined outside the "
-            "viewing band (carried to verify:accept and the report); remeasure = re-run the refine from the "
+            "were refined in another state than the viewing target. accept = keep this MHC, flagged (carried to "
+            "verify:accept and the report); remeasure = re-run the refine from the "
             "build's base cube — its thermal-state seam re-asks (start from this run's history; answer it with "
             "--viewing-start-nits / --viewing-hold-budget-min on that resume to change them); abort = stop the run.")
         decision = self._abort_if(self.adjudicate(AdjudicationRequest(
@@ -5610,7 +5750,9 @@ class Calibration:
         if decision.choice != "remeasure":
             return False
         # One remeasure buys exactly one re-run: drop the stage memo + both decisions (record, seed, override)
-        # so the re-run re-asks its thermal-state seam over fresh numbers and a second miss pauses again.
+        # so the re-run re-asks its thermal-state seam over fresh numbers and a second miss pauses again —
+        # with the start from this run's history: a --viewing-start-nits this seam took is spent for good.
+        self._spend_given_start_on_remeasure(stage, "thermal-miss remeasure")
         self.calib["stages"].pop(stage, None)
         self._forget_decision(key, overrides=True)
         self._forget_decision(f"{stage}:thermal-state", overrides=True)
@@ -5637,15 +5779,31 @@ class Calibration:
                          "evidence_flags": flags or []})
         if not rows:
             return None
+        verify_ts = ((stages.get(THERMAL_STATE_STAGE) or {}).get("digest") or {}).get("thermal_state")
+        verify_viewing = any(r["stage"] == THERMAL_STATE_STAGE for r in rows)
+        if THERMAL_STATE_STAGE in stages and not verify_viewing:
+            # the verify did NOT request viewing although an earlier stage did: say so (never "practical")
+            rows.append({"stage": THERMAL_STATE_STAGE, "requested": (verify_ts or {}).get("requested") or "verify",
+                         "policy": "own band (thermal-state verify)",
+                         "state": (verify_ts or {}).get("state") or "verify", "applied": True,
+                         "decision": (verify_ts or {}).get("decision"), "evidence_flags": []})
         refine = next((r for r in rows if r["stage"] in REFINE_THERMAL_STAGES), None)
+        refine_ts = (((stages.get(refine["stage"]) or {}).get("digest") or {}).get("thermal_state") or {}
+                     if refine else {})
+        verify_txt = ("the verify practical (viewing precondition)" if verify_viewing else
+                      "the verify at its own band (thermal-state verify)" if THERMAL_STATE_STAGE in stages else
+                      "the verify not measured yet")
         return {"requested": "viewing",
                 "owner_policy": ("2026-10-09: raw + the cube build in the loaded own-band state (viewing not "
                                  "applied); the MHC closed-loop refine in the viewing state (viewing-refine: "
-                                 "precondition + hold); the verify practical (viewing precondition)"),
+                                 f"precondition + settle + hold at the target); {verify_txt}"),
                 "stages": rows,
                 "mhc_white": (None if refine is None else
                               {"stage": refine["stage"], "state": refine["state"],
-                               "evidence_flags": refine["evidence_flags"]}),
+                               "evidence_flags": refine["evidence_flags"],
+                               **({"line": refine_ts["mhc_white"]} if refine_ts.get("mhc_white") else {}),
+                               **({"offset_from_target": refine_ts["offset_from_target"]}
+                                  if refine_ts.get("offset_from_target") else {})}),
                 "basis": viewing_thermal.MODEL_BASIS}
 
     def stage_refine_mhc_cube(self, *, materiality: float = refine_convergence.MATERIAL_GAIN_JND,
@@ -7553,10 +7711,16 @@ class Calibration:
                        "model) — these numbers describe a hotter/other state than real viewing."
                        if ts.get("evidence_flags") else "")
         mw = ts.get("mhc_white") or {}
-        if mw.get("evidence_flags"):
+        if mw.get("line"):
+            thermal_txt += f" MHC white: {mw['line']} ({mw.get('stage')})."
+        elif mw.get("evidence_flags"):
             thermal_txt += (f" MHC white: refined OUTSIDE the viewing band ({', '.join(mw['evidence_flags'])}; "
                             f"{mw.get('stage')}, model) — the profile's white/greys describe another thermal state "
                             "than viewing.")
+        elif mw:
+            thermal_txt += f" MHC white ({mw.get('stage')}): refined in the {mw.get('state')!r} state (model)."
+        if ts.get("note"):
+            thermal_txt += f" Note: {ts['note']}."
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
             question=(f"The new calibration reads {_content_lead_text(d)}{reads} — "
@@ -7979,7 +8143,8 @@ class Calibration:
                 + " but this run's memoised stages were made with " + ", ".join(
                 f"{c['field']}={c['persisted']}" for c in self._arg_conflicts)
                 + " — refusing to diverge from them: resume without the flag (or with the recorded "
-                "value), or start a NEW run for the new value.")
+                "value), or start a NEW run for the new value."
+                + "".join(f" ({c['reason']})" for c in self._arg_conflicts if c.get("reason")))
             self.runlog.anomaly("run", run_arg_conflict=True, conflicts=self._arg_conflicts,
                                 message=msg)
             self.runlog.run_done("aborted", aborted_at="resume-args", message=msg)
@@ -11082,7 +11247,8 @@ def _render_thermal_html(ts: Optional[Mapping[str, Any]]) -> str:
     mw = ts.get("mhc_white") or {}
     white = ("" if not mw else
              f"<p class='{'warn' if mw.get('evidence_flags') else 'ok'}'>MHC white refined in: {mw.get('state')}"
-             + (f" ({', '.join(mw['evidence_flags'])})" if mw.get("evidence_flags") else "") + " (model)</p>")
+             + (f" ({', '.join(mw['evidence_flags'])})" if mw.get("evidence_flags") else "") + " (model)</p>"
+             + (f"<p class='muted'>{mw['line']}</p>" if mw.get("line") else ""))
     return ("<h2>Thermal state (viewing requested)</h2>"
             f"<p class='muted'>{ts.get('owner_policy')}</p>"
             "<table><tr><th>Stage</th><th>Policy</th><th>State</th></tr>" + rows + "</table>" + white)
@@ -11328,10 +11494,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "(owner decision 2026-10-09): the MHC closed-loop refine and the verify each get a "
                              "seam offering a viewing-load precondition (dim neutral stand-in until the MODELLED "
                              "panel state is inside the content band, ~50 min from a hot panel); the refine's "
-                             "reads are HELD there by dim-neutral dwells between ~45 s blocks (budget: "
-                             "--viewing-hold-budget-min); the verify keeps a patch file's balanced order with no "
-                             "bright filler; raw + the cube build stay at their own (loaded) band. Recorded in "
-                             "the run record, every digest and the report")
+                             "reads are SETTLED to the target and HELD there by dim-neutral dwells between ~45 s "
+                             "blocks (budget: --viewing-hold-budget-min); the verify keeps a patch file's balanced "
+                             "order with no bright filler; raw + the cube build stay at their own (loaded) band. "
+                             "Recorded in the run record, every digest and the report. Locked once the MHC refine "
+                             "is memoised (its white was refined in that state)")
     parser.add_argument("--viewing-load-nits", type=float, default=None, dest="viewing_load_nits",
                         help="with --thermal-state viewing: the viewing target as a nit-equivalent load "
                              "(default: the content survey's 13.5 HDR / 10.1 SDR; must be > 0 and at most the "
@@ -11343,14 +11510,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                              "display since, else ASSUMED HOT = the recorded verify band ~65 nit-eq). Give it on "
                              "the resume that answers the thermal-state seam to correct the assumption "
                              "(changeable until measure:verify is measured). It answers ONE seam — the next "
-                             "viewing seam to ask (the MHC refine's, then the verify's): a later seam starts "
-                             "from the run history; a new value re-arms it")
+                             "viewing seam to ask (the MHC refine's, then the verify's): a later seam, or that "
+                             "seam's re-ask after a remeasure, starts from the run history; a new value re-arms it")
     parser.add_argument("--viewing-hold-budget-min", type=float, default=None, dest="viewing_hold_budget_min",
                         help="with --thermal-state viewing: the total dim-neutral DWELL (minutes) the MHC "
                              "refine's hold may add across all its rounds (default: shown at the refine's "
                              "thermal-state seam = the model's predicted dwell for a typical refine x 1.5 + 5). "
-                             "Past it the refine rides unheld and is flagged if it leaves the band. Changeable on "
-                             "the resume that answers that seam")
+                             "Past it the refine rides unheld and is flagged if it leaves the band or reads off "
+                             "its target (counted in real elapsed time; a dwell read starts only if a "
+                             "conservative bound on it still fits). Changeable on the resume that answers that seam")
     parser.add_argument("--present-stall", choices=("on", "off"), default=None, dest="present_stall",
                         help="the stuck-frame (present-stall) run-stopper for every measure stage (default on). "
                              "off = an LLM decision for a drive sweep whose distinct commands legitimately read "

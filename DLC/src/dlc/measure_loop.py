@@ -2846,6 +2846,29 @@ class _Loop:
             self._viewing_hold_tick()
         return unresolved
 
+    def _viewing_settle(self) -> None:
+        """Policy ``hold`` (cfg.viewing.hold): before the pass's first read, show the dim-neutral dwell field
+        (read and DISCARDED) until the modelled state is back AT the viewing target — the soak converges on the
+        band's edge, and a hold that only keeps the state in band would read the stage there (bounded by the
+        stage's dwell budget; :meth:`ViewingHold.settle`). No-op otherwise."""
+        hold = self.viewing_hold
+        if hold is None or self._dwell_patch is None:
+            return
+        patch = self._dwell_patch
+        phase = self._live_phase
+
+        def read() -> None:
+            self.measure(patch)                    # instrumented: liveness + meter health + the model
+            self._maybe_checkin_backstop()         # a long settle must not go digest-dark
+
+        self._live_phase = "viewing_dwell"
+        try:
+            rec = hold.settle(read)
+        finally:
+            self._live_phase = phase
+        if rec.get("needed") and self.runlog is not None:
+            self.runlog.progress("viewing_settle", **rec)
+
     def _viewing_hold_tick(self) -> None:
         """Policy ``hold`` (cfg.viewing.hold): end the current read block when it is due (time, or the
         modelled state rising out — mechanical) and show the dim-neutral dwell field, read and DISCARDED,
@@ -3191,6 +3214,7 @@ def run_measure_loop(
             # spin this guard exists to prevent). Surface it for adjudication instead.
             pass
         else:
+            loop._viewing_settle()                  # policy hold: start the reads AT the viewing target
             loop.main_pass()
             # A present-stall halts the pass mid-way; the appended queue was built against a live
             # panel and re-measuring it through a frozen frame just multiplies garbage — skip it
@@ -3479,7 +3503,7 @@ def run_measure_loop(
                               "basis": MODEL_BASIS,
                               "spec": cfg.viewing.as_dict() if cfg.viewing else None,
                               "precondition": loop.viewing_gate.precondition_result,
-                              "measure": loop.viewing_gate.model.segment_summary("measure"),
+                              "measure": loop.viewing_gate.segment_summary("measure"),
                               "final": loop.viewing_gate.state(),
                               **({"hold": loop.viewing_hold.summary()} if loop.viewing_hold is not None else {})}}
            if loop.viewing_gate is not None else {}),
