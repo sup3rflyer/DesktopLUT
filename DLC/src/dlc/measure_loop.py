@@ -60,6 +60,7 @@ from .liveness import Liveness, MeterDown
 from .meter_quantum import CountQuantum, learn_count_quantum, level_count_quantised, validate_count_quantum
 from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 from .reference_states import ReferenceStates, reference_shift_impact
+from .viewing_thermal import ViewingGate, ViewingPrecondition, read_seconds, stand_in_nits
 
 __all__ = [
     "MeasurePatch",
@@ -177,6 +178,12 @@ class MeasureLoopConfig:
     rewarm_max_blocks: int = 6          # bounded reactive re-soak on a drift episode (the rare fallback,
     #                                     fired only when the interleaved drift checkpoint trips — not an
     #                                     unconditional every-patch interleave)
+    # Thermal STATE (``--thermal-state viewing``; dlc.viewing_thermal). None = the soak parks the panel at
+    # this set's own band (today's behaviour, bit-for-bit). Set: the preheat becomes a VIEWING-LOAD
+    # precondition (a dim neutral stand-in at the viewing block load, no k>1 overshoot, converged only
+    # once the MODELLED state is inside the viewing band), a drift re-warm re-holds the viewing load
+    # instead of injecting bright filler, and every read feeds the modelled state the digest reports.
+    viewing: Optional[ViewingPrecondition] = None
 
     # Interleaved drift reference (appended re-measure) ----------------------
     neutral_interval: int = 8           # measurement patches between neutral re-reads (DIP may override)
@@ -913,6 +920,13 @@ class _Loop:
         # bypass this loop (the build probe) instrument themselves with the same Liveness.
         self.liveness = liveness
         self._live_phase = "measure"
+        # Viewing-state witness (cfg.viewing): fed by EVERY read through the instrumented measure fn.
+        # Its clock is the panel's simulated clock when the measure fn carries one (``sim_clock`` —
+        # the synthetic thermal rig), else wall time. None on the default path.
+        self._thermal_clock: Callable[[], float] = getattr(measure, "sim_clock", None) or time.monotonic
+        self.viewing_gate: Optional[ViewingGate] = (
+            ViewingGate(config.viewing, transfer, self._thermal_clock) if config.viewing is not None else None)
+        self.viewing_stand_in: Optional[dict[str, Any]] = None
         self.measure = self._instrument(measure)
         # The measured panel+meter model that drives the per-patch read budget. When
         # absent, the loop falls back to the single-read default (trust the instrument's
@@ -1042,6 +1056,8 @@ class _Loop:
                 live.activity(self._live_phase)
                 live.check(self._live_phase)
             reading = inner(patch)
+            if self.viewing_gate is not None:
+                self.viewing_gate.observe(patch)
             if live is not None and reading.ok:
                 live.progress(self._live_phase)
             self._meter_health(patch, reading)
@@ -1301,7 +1317,8 @@ class _Loop:
             anomalies_total=len(self.read_anomalies),
             drift_episodes_total=self.drift_episodes,
             **({"reference_states": self.reference_states_summary(compact=True)}
-               if self.state_recurrences else {}))
+               if self.state_recurrences else {}),
+            **({"thermal_state": self.viewing_gate.checkin()} if self.viewing_gate is not None else {}))
         # Advance the window high-water marks AFTER emitting, so the next check-in's delta is clean.
         self._checkin_reads_at_last = self.seq_counter
         self._checkin_anomalies_at_last = len(self.read_anomalies)
@@ -1970,6 +1987,10 @@ class _Loop:
             return False
         if mode == "always":
             return True
+        if self.cfg.viewing is not None:
+            # The viewing-state precondition IS the point of the stage (the LLM chose it at the
+            # thermal-state seam); it needs no DIP priors (the controller self-calibrates its noise).
+            return True
         dip = self.dip
         # Characterized (a measured regime exists, and it wasn't a known-bad 'compromised' run) ⇒
         # run the self-limiting controller, decided live. 'compromised' means the characterize
@@ -1999,6 +2020,8 @@ class _Loop:
             return None
         max_cv = self.transfer.max_cv
         ref_nits = self.transfer.cv_to_nits(round(self.cfg.warmup_signal * max_cv))
+        if self.cfg.viewing is not None:
+            return self._run_viewing_soak(phase=phase, max_blocks=max_blocks, ref_nits=ref_nits)
         # Prefer the DIP's measured channel-balance noise (≈ drift_threshold / 3) so the soak's
         # convergence gate is keyed to this panel+meter; else let the controller self-calibrate.
         balance_noise: Optional[float] = None
@@ -2018,6 +2041,50 @@ class _Loop:
             ref_nits=ref_nits, balance_noise=balance_noise, warm_baseline=warm_baseline,
             config=ThermalConfig(**tcfg_kw),
             emit=self._soak_block_emit, event=self._emit_event,
+        )
+        res = ctrl.run()
+        if res.active_channel and self.cold_channel is None:
+            self.cold_channel = res.active_channel
+        return res
+
+    def _run_viewing_soak(self, *, phase: str, max_blocks: Optional[int], ref_nits: float):
+        """The VIEWING-LOAD soak (``cfg.viewing``): the same closed-loop controller, but its content is a
+        dim neutral stand-in whose block load (stand-in reads + the controller's neutral reference reads,
+        time-weighted by the read-time model) equals the viewing target, at k = 1 — no overshoot soak, no
+        bright filler. The preheat additionally gates convergence on the MODELLED state being inside the
+        viewing band (:class:`~dlc.viewing_thermal.ViewingGate`; its deadline = the model's time-to-band
+        x 1.5 + slack); a drift re-warm only re-holds the viewing load (bounded, no gate)."""
+        from .thermal import ThermalController, ThermalConfig  # lazy: keep the module import light
+
+        viewing = self.cfg.viewing
+        assert viewing is not None
+        base = ThermalConfig()
+        ref_cv = self.transfer.nits_to_cv(ref_nits)
+        g_nits, block_load = stand_in_nits(viewing.target_load, ref_rgb=(ref_cv, ref_cv, ref_cv),
+                                           transfer=self.transfer, law=viewing.law,
+                                           n_load=base.load_reads_per_block, n_ref=base.ref_reads)
+        g_cv = self.transfer.nits_to_cv(g_nits) if g_nits > 0 else 0
+        self.viewing_stand_in = {"nits": round(g_nits, 3), "cv": g_cv, "predicted_block_load": block_load}
+        tcfg_kw: dict[str, Any] = {"k_start": 1.0}
+        gate = None
+        if phase == "preheat":
+            gate = self.viewing_gate
+            # The hard backstop in blocks, sized from the deadline and a model block duration (the
+            # controller's settled-panel budget extends to the gate's deadline; past both it FLAGS).
+            block_s = (base.load_reads_per_block * read_seconds(0.95 * g_nits)     # min(X,Y,Z) of a D65
+                       + base.ref_reads * read_seconds(0.95 * ref_nits))          # grey ~ 0.95 Y
+            need = math.ceil(1.5 * viewing.deadline_s / max(block_s, 1.0)) + base.window_blocks
+            tcfg_kw["max_blocks"] = max(base.max_blocks, need)
+        elif max_blocks is not None:
+            tcfg_kw["max_blocks"] = max_blocks
+        balance_noise: Optional[float] = None
+        if self.dip is not None and self.dip.recommended_drift_threshold:
+            balance_noise = self.dip.recommended_drift_threshold / 3.0
+        ctrl = ThermalController(
+            measure=self.measure, transfer=self.transfer, content=[(g_cv, g_cv, g_cv)],
+            ref_nits=ref_nits, balance_noise=balance_noise, config=ThermalConfig(**tcfg_kw),
+            clock=self._thermal_clock, emit=self._soak_block_emit, event=self._emit_event,
+            state_gate=gate,
         )
         res = ctrl.run()
         if res.active_channel and self.cold_channel is None:
@@ -2047,6 +2114,16 @@ class _Loop:
         ``None`` when skipped/empty."""
         if not self._preheat_enabled():
             return None
+        gate = self.viewing_gate
+        if gate is not None:
+            gate.begin("precondition")
+            if not (self.cfg.viewing and self.cfg.viewing.soak):
+                # measure-now (the LLM's choice at the thermal-state seam): no precondition at all —
+                # the gate still tracks the state the stage is measured in.
+                gate.precondition_result = {"skipped": "measure-now", **gate.state()}
+                self._emit_event("WARN", "viewing_precondition", **gate.precondition_result)
+                return {"thermal_state": gate.precondition_result, "converged": False,
+                        "reason": "viewing:measure-now", "compromised": False}
         res = self._run_soak(phase="preheat")
         if res is None:
             return None
@@ -2068,6 +2145,11 @@ class _Loop:
                                    if res.warm_balance else None),
                   "drift_threshold": (round(float(res.drift_threshold), 6)
                                       if res.drift_threshold is not None else None)}
+        if gate is not None:
+            gate.precondition_result = {"reached": gate.in_band(), "converged": res.converged,
+                                        "stand_in": self.viewing_stand_in, **gate.state()}
+            digest["thermal_state"] = gate.precondition_result
+            digest["flags"] = list(res.flags)
         self.ndjson.emit({"t": _now(), "phase": "preheat", "role": "preheat_complete", **digest})
         self._emit_event("INFO" if (res.converged and not res.compromised and not res.protection_limited)
                          else "WARN", "preheat_complete", **digest)
@@ -3054,6 +3136,8 @@ def run_measure_loop(
     unresolved: list[str] = []
     try:
         preheat_digest = loop.preheat()
+        if loop.viewing_gate is not None:
+            loop.viewing_gate.begin("measure")      # the state the stage's reads are taken in
         loop.warm_up()
         if loop.panel_dark:
             # The panel is emitting ~no light (asleep/off/wrong input). Skip the main pass entirely —
@@ -3124,9 +3208,14 @@ def run_measure_loop(
     # (stable-but-implausible ⇒ real panel/correction behaviour) or divergent (transient fault)?
     anomaly_repeatability = _read_anomaly_repeatability(loop.read_anomalies, loop.accepted, cfg)
 
+    # Viewing state requested but the precondition did not bring the MODELLED state into the band
+    # (budget/deadline passed, or the LLM chose measure-now): the stage's numbers describe a state
+    # between the start and the viewing band — evidence the LLM must judge, never a silent accept.
+    viewing_unmet = bool(loop.viewing_gate is not None and not (loop.viewing_gate.precondition_result or {}).get("reached"))
     needs_adjudication = (
         loop.meter_down
         or loop.panel_dark
+        or viewing_unmet
         or preheat_compromised
         or loop.measurement_path_compromised
         or (not loop.warm)
@@ -3141,6 +3230,7 @@ def run_measure_loop(
             ("panel_dark", loop.panel_dark),
             ("present_stall", loop.present_stall),
             ("preheat_compromised", preheat_compromised),
+            ("viewing_precondition_unmet", viewing_unmet),
             ("measurement_path_compromised", loop.measurement_path_compromised),
             ("not_warm", not loop.warm),
             ("unresolved", bool(unresolved_all)),
@@ -3179,6 +3269,14 @@ def run_measure_loop(
                 f"panel appears DARK/asleep — the mid-grey reference read {ref:.2f} cd/m² "
                 f"(floor {cfg.dark_floor_nits}); no patches were measured (wake the panel / "
                 "check the input + that the patch window is showing, then retry)"
+            )
+        if viewing_unmet:
+            pre = (loop.viewing_gate.precondition_result if loop.viewing_gate else None) or {}
+            bits.append(
+                "the VIEWING thermal state was requested but the precondition did not reach it "
+                f"({pre.get('skipped') or 'modelled state outside the band'}: modelled load "
+                f"{pre.get('modelled_load')} vs band {pre.get('band')}, model prediction) — these numbers "
+                "describe a state between the start and the viewing band; accept as such, or retry"
             )
         if preheat_compromised:
             bits.append(
@@ -3301,6 +3399,11 @@ def run_measure_loop(
                           ("status", "source", "min_counted_nits", "patches_on_lattice", "reason")
                           if count_block.get(k) is not None},
         "preheat": preheat_digest,
+        **({"thermal_state": {"state": "viewing", "spec": cfg.viewing.as_dict() if cfg.viewing else None,
+                              "precondition": loop.viewing_gate.precondition_result,
+                              "measure": loop.viewing_gate.model.segment_summary("measure"),
+                              "final": loop.viewing_gate.state()}}
+           if loop.viewing_gate is not None else {}),
         "needs_adjudication": needs_adjudication,
         "read_anomaly": needs_adjudication,
         "anomaly_reasons": anomaly_reasons,

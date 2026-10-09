@@ -46,6 +46,7 @@ SEAM_BACKUP = "backup_capture"     # the pre-run durable settings backup could n
 SEAM_PIPE = "pipe_down"            # the DesktopLUT calibration pipe is unreachable at preflight
 SEAM_CORRECTION = "correction_resolution"  # the meter's correction for THIS mode is missing / borrowed / a guess
 SEAM_LINK_DEPTH = "link_depth"     # live display-link bpc/encoding disagrees with --bit-depth / the profile
+SEAM_THERMAL_STATE = "thermal_state"  # --thermal-state viewing: precondition the verify to the viewing band?
 # NOTE: there is deliberately NO check-in seam. A §12 check-in is a NON-BLOCKING evidence packet
 # for the LLM (see Calibration._maybe_timed_checkin), never an adjudicated yes/no — it must never
 # gate the spine.
