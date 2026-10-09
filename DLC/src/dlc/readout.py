@@ -154,6 +154,9 @@ class ReadoutState:
         # reads — don't count them toward total_reads or treat them as measurements.
         if rec.get("role") in ("preheat_complete", "rewarm"):
             return
+        # The per-round decision row (which reads the loop kept) is a control row too — no seq.
+        if rec.get("role") == "measurement_round":
+            return
 
         self.total_reads += 1
         self.phase = rec.get("phase", self.phase)
@@ -224,6 +227,10 @@ def render_console_line(rec: dict[str, Any], state: ReadoutState) -> str:
                 f"reads={rec.get('content_reads', '?')} k={rec.get('final_k', '?')} -> parked")
     if role == "rewarm":
         return f"[soak ] {'rewarm':6s} reads={rec.get('content_reads', '?')} -> re-warmed"
+    if role == "measurement_round":
+        kept, total = len(rec.get("inlier_seqs") or ()), len(rec.get("read_seqs") or ())
+        verdict = "accepted" if rec.get("adopted") else "NOT adopted (prior value kept)"
+        return f"[round] {rec.get('label', ''):6s} {rgbs} kept {kept}/{total} reads -> {verdict}"
 
     if role == "warmup":
         settle = rec.get("settle") or {}

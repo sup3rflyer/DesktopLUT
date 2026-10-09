@@ -13,8 +13,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from dlc.engine.patches import Transfer, to_signal
 from dlc.measure_loop import (
+    MEASUREMENT_ROUND_ROLE,
     AcceptedRead,
     IncrementalMeasureSession,
     MeasureLoopConfig,
@@ -1240,9 +1243,12 @@ def test_ndjson_stream_is_one_line_per_read_with_pinned_schema(tmp_path: Path):
     )
     lines = [json.loads(ln) for ln in ndj.read_text(encoding="utf-8").splitlines() if ln.strip()]
     # The stream is read records (one line per probe read) interleaved with control markers
-    # (warm-up completion verdicts — NOT reads, no seq). Separate them.
-    reads = [ln for ln in lines if ln.get("role") != "warmup_complete"]
+    # (warm-up completion verdicts, per-round measurement decisions — NOT reads, no seq). Separate them.
+    control = ("warmup_complete", MEASUREMENT_ROUND_ROLE)
+    reads = [ln for ln in lines if ln.get("role") not in control]
     markers = [ln for ln in lines if ln.get("role") == "warmup_complete"]
+    rounds = [ln for ln in lines if ln.get("role") == MEASUREMENT_ROUND_ROLE]
+    assert all("seq" not in ln for ln in lines if ln.get("role") in control)
     assert len(reads) == res.total_reads
     # seq is a dense 0..N-1 index over READS (every probe read accounted for, none dropped).
     assert [ln["seq"] for ln in reads] == list(range(len(reads)))
@@ -1260,6 +1266,14 @@ def test_ndjson_stream_is_one_line_per_read_with_pinned_schema(tmp_path: Path):
     # the warm-up completion marker streams the honest settle verdict (for the readout)
     assert markers and all(set(m) >= {"role", "settled", "phase"} for m in markers)
     assert markers[-1]["settled"] == res.warm
+    # one round decision per measured patch round; its kept / rejected reads are that label's reads
+    by_seq = {ln["seq"]: ln for ln in reads}
+    measured = {ln["label"] for ln in reads if ln["role"] == "measurement"}
+    assert {r["label"] for r in rounds} == measured
+    for r in rounds:
+        assert set(r["inlier_seqs"]) | set(r["rejected_seqs"]) == set(r["read_seqs"])
+        assert all(by_seq[s]["label"] == r["label"] and by_seq[s]["role"] == "measurement" for s in r["read_seqs"])
+        assert r["n_inliers"] == len(r["inlier_seqs"]) and r["adopted"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -2165,3 +2179,123 @@ def test_legacy_one_shot_meter_tags_a_no_reading_exit_as_a_meter_fault(tmp_path:
     reading = meter(_patch("p0", (512, 512, 512), t, 0))
     assert reading.ok is False and reading.raw["meter_fault"] == "exited"
     assert "Instrument access failed" in (reading.error or "")
+
+
+def test_per_patch_min_reads_raise_the_floor_and_are_never_shortened():
+    # A verify patches file's per-patch ``reads``: a floor above the loop's own policy, and the dark
+    # early stop (two agreeing reads) never cuts it short.
+    t = _sdr()
+    clean = _ScriptedPanel([(0.75, 0.80, 0.88)])
+    cfg = MeasureLoopConfig(dark_min_reads=3, dark_floor_max_nits=120.0)      # default dark_agree_reads=2
+    loop = _solo_loop(clean, t, cfg)
+    asked = MeasurePatch(label="p0", rgb=(102, 102, 102), signal=to_signal([(102, 102, 102)], t)[0], seq=0,
+                         min_reads=5)
+    assert loop._read_floor_for(asked) == 5 and not loop._dark_floor_binds(asked)
+    assert loop.measure_patch(asked, phase="main").reads_taken == 5
+    colour = MeasurePatch(label="p1", rgb=(600, 300, 200), signal=to_signal([(600, 300, 200)], t)[0], seq=1,
+                          min_reads=3)
+    assert loop._read_floor_for(colour) == 3          # not near-neutral: the request alone sets the floor
+
+
+def test_run_measure_loop_threads_patch_min_reads(tmp_path: Path):
+    t = _sdr()
+    patches = [(300, 300, 300), (700, 400, 300)]
+    ndjson = tmp_path / "v.ndjson"
+    res = run_measure_loop(patches=patches, transfer=t, measure=_ScriptedPanel([(20.0, 21.0, 23.0)]),
+                           config=MeasureLoopConfig(), ndjson_path=ndjson, patch_min_reads=[4, 0])
+    assert res is not None
+    rows = [json.loads(line) for line in ndjson.read_text(encoding="utf-8").splitlines() if line.strip()]
+    counts: dict = {}
+    for r in rows:
+        if r.get("role") == "measurement":
+            counts[tuple(r["rgb"])] = counts.get(tuple(r["rgb"]), 0) + 1
+    assert counts[(300, 300, 300)] >= 4 and counts[(700, 400, 300)] >= 1
+    try:
+        run_measure_loop(patches=patches, transfer=t, measure=_ScriptedPanel([(20.0, 21.0, 23.0)]),
+                         config=MeasureLoopConfig(), patch_min_reads=[1])
+    except ValueError as exc:
+        assert "patch_min_reads" in str(exc)
+    else:
+        raise AssertionError("a misaligned patch_min_reads must be refused")
+
+
+def _round_rows(path: Path) -> list[dict]:
+    return [r for r in (json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip())
+            if r.get("role") == MEASUREMENT_ROUND_ROLE]
+
+
+@pytest.mark.parametrize("dark_min,agree,asked,expected,stop", [
+    # a caller-set count BELOW the dark floor: it REPLACES the floor, and the two-read dark early stop
+    # can no longer cut it to 2 (was: 2 reads for a file asking 3 under --dark-min-reads 5)
+    (5, 2, 3, 3, "converged"),
+    # ABOVE the dark floor: the request is the count
+    (3, 2, 5, 5, "converged"),
+    # the dark minimum no longer forces more than the request (early stop off: was 5 reads)
+    (5, 0, 2, 2, "converged"),
+    # no request: the dark policy is unchanged (two agreeing reads / the full dark floor)
+    (5, 2, 0, 2, "dark_agree"),
+    (5, 0, 0, 5, "converged"),
+])
+def test_per_patch_reads_replace_the_dark_floor_and_bind_every_stop(tmp_path: Path, dark_min, agree, asked,
+                                                                    expected, stop):
+    t = _sdr()
+    ndj = tmp_path / "m.ndjson"
+    cfg = MeasureLoopConfig(dark_min_reads=dark_min, dark_floor_max_nits=120.0, dark_agree_reads=agree)
+    loop = _Loop(patches=[], transfer=t, measure=_ScriptedPanel([(0.75, 0.80, 0.88)]), config=cfg,
+                 ndjson=_NdjsonWriter(ndj), events=None, dip=None)
+    patch = MeasurePatch(label="p0", rgb=(102, 102, 102), signal=to_signal([(102, 102, 102)], t)[0], seq=0,
+                         min_reads=asked)
+    rec = loop.measure_patch(patch, phase="main")
+    assert rec.reads_taken == expected
+    (row,) = _round_rows(ndj)
+    assert row["n_inliers"] == expected and row["stop"] == stop and row["min_reads"] == asked
+    # a re-measure (the drift re-read path) honours the same count
+    again = loop.measure_patch(patch, phase="remeasure", disposition="appended")
+    assert _round_rows(ndj)[-1]["n_inliers"] == expected and again.reads_taken == 2 * expected
+
+
+def test_round_record_names_the_reads_the_loop_kept_and_the_glitch_it_rejected(tmp_path: Path):
+    # A +30 % luminance glitch among five clean reads: the accepted mean drops it, and the round record
+    # says so (per-read rows keep accepted:true — written before the round's decision exists).
+    t = _sdr()
+    ndj = tmp_path / "m.ndjson"
+    clean = (19.0, 20.0, 21.8)
+    seq = [clean, clean, (19.0 * 1.3, 26.0, 21.8 * 1.3), clean, clean, clean]
+    loop = _Loop(patches=[], transfer=t, measure=_ScriptedPanel(seq), config=MeasureLoopConfig(),
+                 ndjson=_NdjsonWriter(ndj), events=None, dip=None)
+    patch = MeasurePatch(label="p0", rgb=(500, 500, 500), signal=to_signal([(500, 500, 500)], t)[0], seq=0,
+                         min_reads=5)
+    rec = loop.measure_patch(patch, phase="main")
+    rows = [json.loads(ln) for ln in ndj.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    reads = [r for r in rows if r.get("role") == "measurement"]
+    (rnd,) = _round_rows(ndj)
+    glitch = reads[2]["seq"]
+    assert all(r["accepted"] is True for r in reads)                     # per-read meaning unchanged
+    assert rnd["rejected_seqs"] == [glitch] and glitch not in rnd["inlier_seqs"]
+    assert rnd["n_inliers"] == len(reads) - 1 >= 5 and rnd["adopted"] is True
+    assert abs(rec.xyz[1] - 20.0) < 1e-9                                  # the mean the record describes
+    assert rnd["se_de"] is not None and rnd["se_de"] < 0.05
+
+
+def test_a_re_measure_round_with_nothing_usable_is_not_adopted(tmp_path: Path):
+    t = _sdr()
+    ndj = tmp_path / "m.ndjson"
+
+    class _DiesAfterFirst:
+        n = 0
+
+        def __call__(self, patch):
+            self.n += 1
+            if self.n == 1:
+                return Reading(xyz=(19.0, 20.0, 21.8), yxy=(20.0, 0.31, 0.33), ok=True)
+            return Reading(xyz=None, yxy=None, ok=False, error="meter died")
+
+    loop = _Loop(patches=[], transfer=t, measure=_DiesAfterFirst(), config=MeasureLoopConfig(),
+                 ndjson=_NdjsonWriter(ndj), events=None, dip=None)
+    patch = MeasurePatch(label="p0", rgb=(500, 500, 500), signal=to_signal([(500, 500, 500)], t)[0], seq=0)
+    loop.measure_patch(patch, phase="main")
+    rec = loop.measure_patch(patch, phase="remeasure", disposition="appended")
+    first, second = _round_rows(ndj)
+    assert first["adopted"] is True and second["adopted"] is False and second["usable"] is False
+    assert second["inlier_seqs"] == [] and second["unreadable_seqs"]
+    assert rec.usable and rec.xyz == (19.0, 20.0, 21.8)                   # the prior round stands

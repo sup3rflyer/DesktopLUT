@@ -20,6 +20,9 @@ dependency-free mechanics they share with the CLI (``--preview-patches`` / ``--a
   luminance bands) and per-patch movers vs the source's recorded verify.
 * :func:`restore_candidate` — put the prior runtime cube back after a candidate install; shared
   by the flow's own abort path and the CLI ``--abort`` of a paused run.
+* :func:`load_patches_file` / :func:`patches_file_problems` — a verify list from a FILE
+  (``--verify-patches-file``: e.g. a content-sampled set with per-patch ``content_weight``) and its
+  hard refusals (content mode / bit depth / code range / the HDR patch cap).
 """
 from __future__ import annotations
 
@@ -38,6 +41,9 @@ __all__ = [
     "compare_verify",
     "restore_candidate",
     "candidate_cube_facts",
+    "PatchesFileError",
+    "load_patches_file",
+    "patches_file_problems",
 ]
 
 # The thermal preheat policy vocabulary (MeasureLoopConfig.preheat) the --preheat lever exposes.
@@ -212,6 +218,129 @@ def load_source_verify(src_root: Path) -> dict[str, Any]:
             "white_xy": white.get("xy"),
         },
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# --verify-patches-file: a content-sampled verify set from a file (2026-10-09)
+# ---------------------------------------------------------------------------------------------
+class PatchesFileError(SourceRunError):
+    """The verify patches file cannot supply a patch list (unreadable / malformed)."""
+
+
+# A per-patch read request above this is a malformed file, not a plan (the loop flags a patch as
+# abnormal past ~2x its target; 32 reads of a dark patch is already many minutes).
+MAX_FILE_READS = 32
+# --verify-patches-order: the file's own order (default — the measurement order IS the file's) or an
+# explicit re-sort by dlc.engine.patches.sort_patches.
+PATCH_FILE_ORDERS = ("file", "thermal", "luminance", "random")
+
+
+def load_patches_file(path: Path) -> dict[str, Any]:
+    """A verify patch list from a file (``--verify-patches-file``), e.g. the content-sampled sets of
+    ``results/practical_score_2026-10-09`` (``patchset_hdr.json``). Format (JSON object):
+
+    * ``codes`` — ``[[r, g, b], ...]`` integer code values at ``bit_depth`` (what verify measures);
+    * ``content_mode`` (``HDR`` / ``SDR``: what the codes ARE) and ``bit_depth`` — both required;
+    * optional per-patch content weight: ``content_weight`` (a list parallel to ``codes``) or
+      ``meta[i].content_weight`` — Σ w·dE is the content-weighted score of the content it was drawn from;
+    * optional per-patch ``reads`` — the MINIMUM accepted reads for that patch (an integer
+      1..:data:`MAX_FILE_READS`, or ``null`` = the loop's own policy): a list parallel to ``codes`` or
+      ``meta[i].reads``; passed to the measure loop as a per-patch read floor;
+    * the list ORDER is the measurement order (unless the run asks for a sort);
+    * optional ``content_class`` (label; default the file stem), ``coverage_gap_pct_of_content``
+      (``{"reach_20": {"proposed": 6.99, ...}}`` — the draw's own gap) and ``nominal_xyz`` / ``rgb``
+      (carried, not used: scoring re-derives targets from the codes).
+
+    Returns the normalised document (``codes`` as int lists, ``weights`` as floats or ``None``,
+    ``patches_fingerprint`` = :func:`patches_fingerprint` of the codes). Raises
+    :class:`PatchesFileError`. Pure (reads the one file)."""
+    path = Path(path)
+    try:
+        doc = _read_json(path)
+    except (OSError, ValueError) as exc:
+        raise PatchesFileError(f"cannot read {path} ({type(exc).__name__}: {exc})", file=str(path)) from exc
+    if not isinstance(doc, dict):
+        raise PatchesFileError(f"{path.name}: not a JSON object", file=str(path))
+    raw = doc.get("codes")
+    if not isinstance(raw, list) or not raw:
+        raise PatchesFileError(f"{path.name}: no 'codes' list", file=str(path))
+    codes: list[list[int]] = []
+    for i, row in enumerate(raw):
+        if (not isinstance(row, list) or len(row) != 3
+                or not all(isinstance(c, int) and not isinstance(c, bool) for c in row)):
+            raise PatchesFileError(f"{path.name}: codes[{i}] is not three integers ({row!r})", file=str(path),
+                                   index=i)
+        codes.append([int(c) for c in row])
+    mode = str(doc.get("content_mode") or "").strip().upper()
+    if mode not in ("HDR", "SDR"):
+        raise PatchesFileError(f"{path.name}: 'content_mode' must be HDR or SDR (got {doc.get('content_mode')!r})",
+                               file=str(path))
+    bd = doc.get("bit_depth")
+    if not isinstance(bd, int) or isinstance(bd, bool) or not 1 <= bd <= 16:
+        raise PatchesFileError(f"{path.name}: 'bit_depth' must be an integer 1..16 (got {bd!r})", file=str(path))
+    weights: Optional[list[float]] = None
+    if isinstance(doc.get("content_weight"), list):
+        weights = doc["content_weight"]
+    elif isinstance(doc.get("meta"), list) and any(isinstance(m, dict) and "content_weight" in m
+                                                    for m in doc["meta"]):
+        weights = [(m or {}).get("content_weight", 0.0) if isinstance(m, dict) else 0.0 for m in doc["meta"]]
+    if weights is not None:
+        try:
+            weights = [float(w) for w in weights]
+        except (TypeError, ValueError) as exc:
+            raise PatchesFileError(f"{path.name}: content weights are not numbers", file=str(path)) from exc
+        if len(weights) != len(codes) or any(not (w >= 0.0) or w == float("inf") for w in weights):
+            raise PatchesFileError(f"{path.name}: content weights must be {len(codes)} finite values >= 0",
+                                   file=str(path), n_weights=len(weights))
+    reads: Optional[list[Optional[int]]] = None
+    raw_reads = doc.get("reads") if isinstance(doc.get("reads"), list) else (
+        [(m or {}).get("reads") if isinstance(m, dict) else None for m in doc["meta"]]
+        if isinstance(doc.get("meta"), list) and any(isinstance(m, dict) and "reads" in m for m in doc["meta"])
+        else None)
+    if raw_reads is not None:
+        if len(raw_reads) != len(codes) or not all(
+                r is None or (isinstance(r, int) and not isinstance(r, bool) and 1 <= r <= MAX_FILE_READS)
+                for r in raw_reads):
+            raise PatchesFileError(f"{path.name}: 'reads' must be {len(codes)} entries, each null or an integer "
+                                   f"1..{MAX_FILE_READS}", file=str(path))
+        reads = [None if r is None else int(r) for r in raw_reads]
+    gap: dict[str, float] = {}
+    for reach, row in (doc.get("coverage_gap_pct_of_content") or {}).items():
+        val = row.get("proposed") if isinstance(row, dict) else row
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            gap[str(reach)] = float(val)
+    return {"path": str(path.resolve()), "file": path.name, "content_mode": mode, "bit_depth": int(bd),
+            "codes": codes, "n": len(codes), "weights": weights, "reads": reads,
+            "content_class": str(doc.get("content_class") or path.stem),
+            "coverage_gap_pct": gap, "patches_fingerprint": patches_fingerprint(codes)}
+
+
+def patches_file_problems(doc: Mapping[str, Any], *, content_mode: str, bit_depth: int,
+                          patch_max_cv: Optional[int] = None) -> list[str]:
+    """The HARD refusals of a patches file for this run (mechanical — the codes would mean another
+    signal or drive outside the measured range): content mode / bit depth differ; a code outside
+    ``0..max_cv``; (HDR) a code above the run's ``patch_max_cv`` (the target-peak cap every verify
+    patch stays under). Empty = measurable."""
+    out: list[str] = []
+    if str(doc.get("content_mode") or "").upper() != str(content_mode).upper():
+        out.append(f"the file's content mode {doc.get('content_mode')} != this run's {str(content_mode).upper()} "
+                   "(the codes are another transfer)")
+    if int(doc.get("bit_depth") or 0) != int(bit_depth):
+        out.append(f"the file's bit depth {doc.get('bit_depth')} != this run's {bit_depth} (the codes are another "
+                   "quantization)")
+        return out   # the range checks below would only restate the depth mismatch
+    max_cv = (1 << int(bit_depth)) - 1
+    codes = [list(p) for p in doc.get("codes") or ()]
+    bad = [i for i, p in enumerate(codes) if min(p) < 0 or max(p) > max_cv]
+    if bad:
+        out.append(f"{len(bad)} code(s) outside 0..{max_cv} at {bit_depth} bits (first: index {bad[0]} = "
+                   f"{codes[bad[0]]})")
+    if patch_max_cv is not None:
+        over = [i for i, p in enumerate(codes) if max(p) > int(patch_max_cv)]
+        if over:
+            out.append(f"{len(over)} code(s) above this run's HDR patch cap {int(patch_max_cv)} (the target peak; "
+                       f"first: index {over[0]} = {codes[over[0]]}) — the panel would read a clipped highlight")
+    return out
 
 
 def _norm_file(value: Any) -> Optional[str]:

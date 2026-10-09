@@ -393,6 +393,16 @@ class Profile:
     # profile module stays free of the orchestrator import. The CLI's patch flags override it.
     patches: dict[str, Any] = field(default_factory=dict)
     source_path: Optional[str] = None
+    # The owner's content distributions for the content-weighted practical score (USER DATA — the
+    # library survey's ``content_hist_<class>.npz`` or its JSON export; never committed). Keyed by
+    # content mode (``HDR`` / ``SDR``; ``*`` = every mode), values ``PATH[#VARIANT]`` (relative paths
+    # resolve against the profile file). Evidence only: no gate reads the score.
+    content_distribution: dict[str, tuple[str, ...]] = field(default_factory=dict)
+
+    def content_distribution_for(self, content_mode: str) -> tuple[str, ...]:
+        """The configured content distributions for ``content_mode`` (its own entry, else ``*``)."""
+        mode = str(content_mode or "").upper()
+        return tuple(self.content_distribution.get(mode) or self.content_distribution.get("*") or ())
 
     # -- lookups ----------------------------------------------------------
     def display_for(self, monitor: int) -> DisplayConfig:
@@ -839,4 +849,29 @@ def load_profile(path: Optional[Path | str] = None) -> Profile:
     return Profile(meter=meter, displays=displays, targets=targets, quality=quality,
                    quality_policy=dict(q) if isinstance(q, dict) else {},
                    paths=dict(raw.get("paths", {}) or {}),
-                   patches=dict(raw.get("patches", {}) or {}), source_path=str(p))
+                   patches=dict(raw.get("patches", {}) or {}), source_path=str(p),
+                   content_distribution=_content_distribution(raw.get("content_distribution"), p))
+
+
+def _content_distribution(raw: Any, profile_path: Path) -> dict[str, tuple[str, ...]]:
+    """``content_distribution:`` → ``{MODE: (PATH[#VARIANT], ...)}``. A string / list applies to every
+    mode (``*``); a mapping is keyed by content mode. Relative paths resolve against the profile file."""
+    if not raw:
+        return {}
+
+    def specs(v: Any) -> tuple[str, ...]:
+        items = [v] if isinstance(v, str) else list(v or ())
+        out = []
+        for item in items:
+            text = str(item).strip()
+            if not text:
+                continue
+            path, sep, variant = text.rpartition("#") if "#" in text else (text, "", "")
+            q = Path(path)
+            if not q.is_absolute():
+                q = (Path(profile_path).resolve().parent / q)
+            out.append(str(q) + (sep + variant if sep else ""))
+        return tuple(out)
+    if isinstance(raw, dict):
+        return {str(k).strip().upper(): specs(v) for k, v in raw.items() if specs(v)}
+    return {"*": specs(raw)}
