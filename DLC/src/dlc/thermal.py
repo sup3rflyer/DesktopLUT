@@ -223,8 +223,15 @@ class ThermalController:
                  clock: Optional[Clock] = None,
                  warm_baseline: Optional[dict[Channel, float]] = None,
                  emit: Optional[Callable[[dict[str, Any]], None]] = None,
-                 event: Optional[Callable[..., None]] = None) -> None:
+                 event: Optional[Callable[..., None]] = None,
+                 state_gate: Optional[Any] = None) -> None:
         self.measure = measure
+        # VIEWING-STATE precondition (``--thermal-state viewing``; dlc.viewing_thermal.ViewingGate), else
+        # None = today's behaviour, bit-for-bit. QUERY-ONLY here: the caller's measure path feeds the
+        # gate every read. Convergence then ALSO needs the modelled state inside the viewing band (the
+        # slope-vs-noise gate cannot see a τ≈25 min drift — the model is the time floor), and the
+        # settled-panel budget extends to the gate's deadline (past it: the normal flag path).
+        self.state_gate = state_gate
         self.transfer = transfer
         self.cfg = config or ThermalConfig()
         self.ref_nits = ref_nits
@@ -476,18 +483,25 @@ class ThermalController:
                 y_flat = (oy_z <= cfg.slope_z) or protection_limited      # ABL ⇒ balance-only gate
                 bounded = envelope_op <= cfg.fluct_gross_mult * threshold # not a large oscillation
                 converged_now = bal_flat and y_flat and bounded
+            gate_held = False
+            if converged_now and self.state_gate is not None and not self.state_gate.ready():
+                converged_now = False                                # flat in noise, but the MODELLED
+                gate_held = True                                     # state is still outside the band
             if converged_now:
                 in_band += 1
                 state = f"in-band x{in_band}"
             elif load_operating:
                 in_band = 0
+                if gate_held:
+                    state = "held:model-out-of-band"
             if in_band >= cfg.converge_blocks:
                 converged = True
                 regime = "convergent"                                # the gate already required not-wandering
                 state = f"CONVERGED:{regime}"
             self._block_record(block, load_k, net_active, gross_active, ratio, threshold, active, state,
                                op_streak=op_streak, did_soak=did_soak,
-                               baseline_distance=baseline_distance, protection_limited=protection_limited)
+                               baseline_distance=baseline_distance, protection_limited=protection_limited,
+                               model=(self.state_gate.state() if self.state_gate is not None else None))
             # Progress-driven digest check-in: emit each milestone category ONCE (first soak, first
             # landing/in-band, convergence, protection) so the LLM sees the soak's story without the
             # per-block firehose (which goes to the dashboard via ``emit``). Not wall-clock paced.
@@ -496,7 +510,7 @@ class ThermalController:
                 emitted_cats.add("protection")
                 self._state_event("WARN", "protection_limited", block=block, k=round(load_k, 3),
                                   ref_nits=self._last_ref_nits, active_channel=active)
-            if cat in ("soak", "in-band", "CONVERGED") and cat not in emitted_cats:
+            if cat in ("soak", "in-band", "held", "CONVERGED") and cat not in emitted_cats:
                 emitted_cats.add(cat)
                 self._state_event("INFO", "thermal_state", block=block, state=state, k=round(load_k, 3),
                                   net=round(net_active, 5), threshold=round(threshold, 6),
@@ -505,7 +519,7 @@ class ThermalController:
                 break
             # BUDGET (flag-don't-cap): out of budget without convergence — break and let the post-loop
             # hand the LLM a directional-vs-non-directional evidence packet. Never a silent cap/glide.
-            if block >= soft_budget:
+            if block >= soft_budget and (self.state_gate is None or not self.state_gate.within_deadline()):
                 budget_exhausted = True
                 break
 
@@ -570,6 +584,12 @@ class ThermalController:
                     f"{round(envelope, 5)}) — thermally DYNAMIC: proceeding warm is safe, but it never "
                     "reaches a steady temperature, so maintain a consistent load (golden-ratio order) + "
                     "aggressive drift checks rather than warming to a target")
+        if self.state_gate is not None and not compromised and not self.state_gate.in_band():
+            st = self.state_gate.state()
+            flags.append(
+                f"viewing precondition NOT reached: the modelled thermal state {st['modelled_load']} is outside "
+                f"the viewing band {st['band']} after {st['elapsed_min']} min (model prediction, PA fit) — "
+                "measuring now records a state between the start and the viewing band")
         # A first-order estimate of the panel's thermal time constant in content-read (≈ measurement-
         # patch) units: warm-in took ~(block − converge_blocks) blocks before it confirmed in-band,
         # and a first-order system settles in ~3τ, so τ ≈ warm-in reads / 3. Only meaningful when a
@@ -608,6 +628,8 @@ class ThermalController:
             "slope_z_cutoff": cfg.slope_z, "luminance_sigma": round(sigma_y, 5),
             "budget_blocks": soft_budget, "budget_exhausted": budget_exhausted,
         }
+        if self.state_gate is not None:
+            digest["state_gate"] = self.state_gate.state()
         if self.event is not None:
             self.event("INFO" if (converged and not compromised and not protection_limited) else "WARN",
                        "thermal_regime", **digest)
@@ -633,7 +655,8 @@ class ThermalController:
                       active: Optional[Channel], state: str, *,
                       op_streak: int = 0, did_soak: bool = False,
                       baseline_distance: Optional[float] = None,
-                      protection_limited: bool = False) -> None:
+                      protection_limited: bool = False,
+                      model: Optional[dict[str, Any]] = None) -> None:
         rec = {"phase": "thermal", "block": block, "k": round(k, 3),
                "ref_nits": (round(self._last_ref_nits, 3) if self._last_ref_nits else None),
                "net": round(net, 5), "gross": round(gross, 5),
@@ -642,5 +665,8 @@ class ThermalController:
                "did_soak": did_soak, "protection_limited": protection_limited}
         if baseline_distance is not None:
             rec["baseline_distance"] = round(baseline_distance, 6)
+        if model is not None:
+            rec["model_load"] = model.get("modelled_load")
+            rec["model_in_band"] = model.get("in_band")
         if self.emit is not None:
             self.emit(rec)
