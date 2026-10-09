@@ -44,13 +44,18 @@ class McproBackend(CameraBackend):
             raise BackendError(str(e)) from e
 
     def state(self) -> dict:
+        """Curated fields + the HAL's full live request (``hal.request``, every key incl. vendor tags). mcpro has no
+        settings API, so there is no ``app`` block (its mode lives in the settings profile)."""
         st = self.cam.state()
         return dict(backend=self.name, fps=float(st.fps), size=[st.width, st.height], mbps=st.mbps, iso=st.iso,
                     shutter_s=st.camera.exposure_s() if st.camera.open else st.shutter_s, manual=st.manual,
                     recording=False, hal=dict(open=st.camera.open, client=st.camera.client, opmode=st.camera.opmode,
                                               iso=st.camera.iso(), exposure_s=st.camera.exposure_s(),
                                               fps=st.camera.target_fps(), ae_off=st.camera.manual_exposure(),
-                                              streams=st.camera.streams, high_speed=st.camera.high_speed))
+                                              streams=st.camera.streams, high_speed=st.camera.high_speed,
+                                              request=dict(st.camera.request),
+                                              physical_requests={k: dict(v) for k, v in
+                                                                 st.camera.physical_requests.items()}))
 
     def apply(self, s: Settings) -> dict:
         g = s.given()

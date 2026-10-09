@@ -164,3 +164,10 @@ def test_backend_flags_hal_disagreement_and_unsupported(monkeypatch):
         b.apply(Settings(iso=800))
     with pytest.raises(Unsupported, match="focus"):
         b.apply(Settings(focus=0.3))
+
+
+def test_backend_state_carries_the_full_hal_request(monkeypatch):
+    b, _ = _backend(monkeypatch)
+    st = b.state()
+    assert st["hal"]["request"]["control.aeTargetFpsRange"] == "120 120" and st["hal"]["request"]["control.aeMode"] == "OFF"
+    assert st["hal"]["physical_requests"] == {} and "app" not in st                 # mcpro has no settings API
