@@ -60,8 +60,8 @@ from .liveness import Liveness, MeterDown
 from .meter_quantum import CountQuantum, learn_count_quantum, level_count_quantised, validate_count_quantum
 from .metrics import SRGB_TO_XYZ_D65, delta_e2000, xyz_to_lab
 from .reference_states import ReferenceStates, reference_shift_impact
-from .viewing_thermal import (MODEL_BASIS, ViewingGate, ViewingPrecondition, band_achieved, read_seconds,
-                              stand_in_nits)
+from .viewing_thermal import (MODEL_BASIS, ViewingGate, ViewingHold, ViewingPrecondition, band_achieved,
+                              read_seconds, stand_in_nits)
 
 __all__ = [
     "MeasurePatch",
@@ -928,6 +928,16 @@ class _Loop:
         self.viewing_gate: Optional[ViewingGate] = (
             ViewingGate(config.viewing, transfer, self._thermal_clock) if config.viewing is not None else None)
         self.viewing_stand_in: Optional[dict[str, Any]] = None
+        # Policy ``hold`` (the MHC refine in the viewing state, cfg.viewing.hold): dim-neutral dwells between
+        # ~45 s read blocks keep the pass at the viewing load (dlc.viewing_thermal.ViewingHold). None otherwise.
+        self.viewing_hold: Optional[ViewingHold] = None
+        self._dwell_patch: Optional[MeasurePatch] = None
+        if self.viewing_gate is not None and config.viewing is not None and config.viewing.hold:
+            cv = int(transfer.nits_to_cv(config.viewing.dwell_nits)) if config.viewing.dwell_nits > 0 else 0
+            self._dwell_patch = MeasurePatch(label="viewing_dwell", rgb=(cv, cv, cv),
+                                             signal=to_signal([(cv, cv, cv)], transfer)[0],
+                                             role="warmup", bit_depth=transfer.bit_depth)
+            self.viewing_hold = ViewingHold(self.viewing_gate, self._dwell_patch.rgb)
         self.measure = self._instrument(measure)
         # The measured panel+meter model that drives the per-patch read budget. When
         # absent, the loop falls back to the single-read default (trust the instrument's
@@ -1319,7 +1329,10 @@ class _Loop:
             drift_episodes_total=self.drift_episodes,
             **({"reference_states": self.reference_states_summary(compact=True)}
                if self.state_recurrences else {}),
-            **({"thermal_state": self.viewing_gate.checkin()} if self.viewing_gate is not None else {}))
+            **({"thermal_state": {**self.viewing_gate.checkin(),
+                                  **({"hold": self.viewing_hold.summary(compact=True)}
+                                     if self.viewing_hold is not None else {})}}
+               if self.viewing_gate is not None else {}))
         # Advance the window high-water marks AFTER emitting, so the next check-in's delta is clean.
         self._checkin_reads_at_last = self.seq_counter
         self._checkin_anomalies_at_last = len(self.read_anomalies)
@@ -2451,6 +2464,7 @@ class _Loop:
                                      label=patch.label)
                     return
                 next_checkpoint = index + self.neutral_interval_current if self.neutral_interval_current > 0 else None
+            self._viewing_hold_tick()
 
         # Final checkpoint for the tail of the pass.
         if pending:
@@ -2829,7 +2843,56 @@ class _Loop:
             rec.taken_cold = False  # redone while warm
             if rec.unstable:
                 unresolved.append(patch.label)
+            self._viewing_hold_tick()
         return unresolved
+
+    def _viewing_settle(self) -> None:
+        """Policy ``hold`` (cfg.viewing.hold): before the pass's first read, show the dim-neutral dwell field
+        (read and DISCARDED) until the modelled state is back AT the viewing target — the soak converges on the
+        band's edge, and a hold that only keeps the state in band would read the stage there (bounded by the
+        stage's dwell budget; :meth:`ViewingHold.settle`). No-op otherwise."""
+        hold = self.viewing_hold
+        if hold is None or self._dwell_patch is None:
+            return
+        patch = self._dwell_patch
+        phase = self._live_phase
+
+        def read() -> None:
+            self.measure(patch)                    # instrumented: liveness + meter health + the model
+            self._maybe_checkin_backstop()         # a long settle must not go digest-dark
+
+        self._live_phase = "viewing_dwell"
+        try:
+            rec = hold.settle(read)
+        finally:
+            self._live_phase = phase
+        if rec.get("needed") and self.runlog is not None:
+            self.runlog.progress("viewing_settle", **rec)
+
+    def _viewing_hold_tick(self) -> None:
+        """Policy ``hold`` (cfg.viewing.hold): end the current read block when it is due (time, or the
+        modelled state rising out — mechanical) and show the dim-neutral dwell field, read and DISCARDED,
+        until block + dwell sit at the viewing load (bounded by the stage's dwell budget). No-op otherwise."""
+        hold = self.viewing_hold
+        if hold is None or self._dwell_patch is None:
+            return
+        reason = hold.due()
+        if reason is None:
+            return
+        patch = self._dwell_patch
+        phase = self._live_phase
+
+        def read() -> None:
+            self.measure(patch)                    # instrumented: liveness + meter health + the model
+            self._maybe_checkin_backstop()         # a long dwell must not go digest-dark
+
+        self._live_phase = "viewing_dwell"
+        try:
+            rec = hold.dwell(read, reason)
+        finally:
+            self._live_phase = phase
+        if rec is not None and self.runlog is not None:
+            self.runlog.progress("viewing_dwell", **rec)
 
     # -- assembly ----------------------------------------------------------
 
@@ -3142,6 +3205,8 @@ def run_measure_loop(
         preheat_digest = loop.preheat()
         if loop.viewing_gate is not None:
             loop.viewing_gate.begin("measure")      # the state the stage's reads are taken in
+            if loop.viewing_hold is not None:
+                loop.viewing_hold.begin_block()     # policy hold: the first block opens with the pass
         loop.warm_up()
         if loop.panel_dark:
             # The panel is emitting ~no light (asleep/off/wrong input). Skip the main pass entirely —
@@ -3149,6 +3214,7 @@ def run_measure_loop(
             # spin this guard exists to prevent). Surface it for adjudication instead.
             pass
         else:
+            loop._viewing_settle()                  # policy hold: start the reads AT the viewing target
             loop.main_pass()
             # A present-stall halts the pass mid-way; the appended queue was built against a live
             # panel and re-measuring it through a frozen frame just multiplies garbage — skip it
@@ -3437,8 +3503,9 @@ def run_measure_loop(
                               "basis": MODEL_BASIS,
                               "spec": cfg.viewing.as_dict() if cfg.viewing else None,
                               "precondition": loop.viewing_gate.precondition_result,
-                              "measure": loop.viewing_gate.model.segment_summary("measure"),
-                              "final": loop.viewing_gate.state()}}
+                              "measure": loop.viewing_gate.segment_summary("measure"),
+                              "final": loop.viewing_gate.state(),
+                              **({"hold": loop.viewing_hold.summary()} if loop.viewing_hold is not None else {})}}
            if loop.viewing_gate is not None else {}),
         "needs_adjudication": needs_adjudication,
         "read_anomaly": needs_adjudication,
