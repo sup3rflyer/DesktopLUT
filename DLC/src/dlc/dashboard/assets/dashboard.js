@@ -402,12 +402,28 @@ function renderState(s) {
   const cw = (((de.practical || {}).content_weighted) || {}).headline || null;
   $("de-cw").hidden = !(cw && cw.score != null);
   if (cw && cw.score != null) {
-    $("de-cw-lab").textContent = `content-weighted · ${cw["class"] || ""} · R ${cw.reach_dEITP}`;
+    // Black-aware headline (an additive raised black scored as a panel limit): label it as such, name the floor
+    // + its source, and keep the RAW number beside it. Its variants are on the black-aware basis.
+    const black = cw.black_aware === true;
+    const basis = black ? " (black-aware basis)" : "";
+    $("de-cw-lab").textContent =
+      `content-weighted${black ? " · BLACK-AWARE" : ""} · ${cw["class"] || ""} · R ${cw.reach_dEITP}`;
     $("de-cw-lab").title = cw.label || "";
     setDe("de-cw-score", cw.score);
     $("de-cw-score").title = cw.score_bias_corrected != null
-      ? `noise bias-corrected variant (quadrature, floored at 0): ${num(cw.score_bias_corrected, 2)}` : "";
+      ? `noise bias-corrected variant${basis} (quadrature, floored at 0): ${num(cw.score_bias_corrected, 2)}` : "";
     $("de-cw-gap").textContent = cw.coverage_gap_pct != null ? `${num(cw.coverage_gap_pct, 1)} %` : "—";
+    $("de-cw-raw-row").hidden = !black;
+    $("de-cw-floor-row").hidden = !black;
+    if (black) {
+      setDe("de-cw-raw", cw.score_raw);
+      $("de-cw-raw").title = "the raw content-weighted score (no black allowance), recorded beside the black-aware one";
+      const src = String(cw.black_floor_source || "unknown source");
+      const short = src.split(" (")[0];
+      $("de-cw-floor").textContent = `${cw.black_floor_nits} nit · ${short}`;
+      $("de-cw-floor").title = `display floor ${cw.black_floor_nits} nit from ${src}` +
+        (cw.black_pedestal_source ? `; pedestal colour ${cw.black_pedestal_xy} from ${cw.black_pedestal_source}` : "");
+    }
   }
   setDe("de-avg", de.avg); setDe("de-p95", de.p95); setDe("de-p99", de.p99); setDe("de-max", de.max);
   setDe("de-white", de.white);

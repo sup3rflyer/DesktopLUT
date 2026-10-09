@@ -46,6 +46,7 @@ def _de_table(de: dict[str, Any]) -> str:
         weak = lead.get("weak_evidence_score_share_pct")
         extra += (f"<p><b>{html.escape(str(lead.get('label') or 'content-weighted'))}: "
                   f"{_num(lead.get('score'))}</b>"
+                  + (f" (raw {_num(lead.get('score_raw'))})" if lead.get("black_aware") else "")
                   + (f" · coverage gap {_num(gap, 1)} %" if gap is not None else "")
                   + (f" · {_num(weak, 1)} % of it on weak reads" if weak is not None else "")
                   + (f" · noise bias-corrected variant {_num(lead.get('score_bias_corrected'))}"

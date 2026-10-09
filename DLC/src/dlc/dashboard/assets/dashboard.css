@@ -152,6 +152,7 @@ body {
 .de-split .kv { flex: 1; flex-direction: column; align-items: flex-start; }
 .de-cw { border-top: none; margin-bottom: 4px; }
 .de-cw[hidden] { display: none; }
+.de-cw .kv[hidden] { display: none; }
 .de-scored-cap { color: var(--ink-faint); font-size: 9px; text-transform: uppercase;
   letter-spacing: 1px; margin-bottom: 3px; }
 /* divided-delta row: lightness / chroma / hue split of the live patch's ΔE */
