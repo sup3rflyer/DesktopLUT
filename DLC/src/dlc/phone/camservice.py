@@ -4,8 +4,21 @@ The camera service keeps the last CaptureRequest of the live session, so this is
 time / ISO / frame duration / processing modes - independent of what an app's UI claims. It also tells a normal
 session from a CONSTRAINED_HIGH_SPEED one and which physical camera each stream reads.
 
-Quirks handled: CRLF; a trailing ``Dumpsys from previous open session`` block (the *previous* session - ignored);
-the request block is only present while a device is open.
+The request is kept WHOLE: every entry of the live "Logical request settings" block - ``android.*`` and vendor tags
+(``com.samsung.*``, ``samsung.android.*``, ...) alike, multi-value arrays and entries whose values wrap over several
+lines - lands in :attr:`CameraSession.request`, so a manifest carries the full processing state (tonemap, colour
+correction, noise reduction, edge, vendor knobs) and a later "the camera's response changed" can be traced to a key.
+``REQUEST_KEYS`` is only the curated list the convenience accessors / docs care about; parsing is generic.
+
+Key naming: ``android.`` is stripped (``sensor.sensitivity``, as before); vendor tags keep their full dotted name; a
+name the service could not resolve (``unknownSection.unknownTag``) or a repeated name gets ``@<hex tag id>`` appended so
+no entry is lost. Values are the bracketed text, whitespace-normalised, lines of a multi-line entry joined by a space
+(``"120 120"``, ``"OFF"``, ``"(1 / 1) (0 / 1) ..."``).
+
+Quirks handled: CRLF; ``Dumpsys from previous open session`` blocks (a *previous* session of that device - dropped,
+up to the next ``== ... ==`` section); the metadata preamble lines; the request block exists only while a device is open.
+Per-physical-camera requests (``Physical request settings for camera id N``) are parsed the same way into
+:attr:`CameraSession.physical_requests`.
 """
 
 from __future__ import annotations
@@ -23,6 +36,12 @@ REQUEST_KEYS = (
     "colorCorrection.mode", "colorCorrection.gains", "blackLevel.lock", "distortionCorrection.mode",
 )
 
+# "  android.control.aeMode (10003): byte[1]" / "  com.samsung.android.control.foo (80010002): int32[4]"
+_ENTRY = re.compile(r"^\s*(\S+) \(([0-9a-fA-F]+)\): (\w+)\[(\d+)\]\s*$")
+_VALUES = re.compile(r"^\s*\[(.*)\]\s*$")
+_PREAMBLE = re.compile(r"^\s*(Dumping camera metadata array|Version: )")
+_PREVIOUS = "Dumpsys from previous open session"
+
 
 @dataclass
 class CameraSession:
@@ -30,7 +49,8 @@ class CameraSession:
     client: str = ""
     opmode: str = ""
     streams: list[dict] = field(default_factory=list)  # {w, h, format, dataspace, physical}
-    request: dict[str, str] = field(default_factory=dict)
+    request: dict[str, str] = field(default_factory=dict)              # every key of the live logical request
+    physical_requests: dict[str, dict[str, str]] = field(default_factory=dict)   # camera id -> its request
 
     @property
     def high_speed(self) -> bool:
@@ -57,11 +77,62 @@ class CameraSession:
     def manual_exposure(self) -> bool:
         return self.request.get("control.aeMode") == "OFF"
 
+    def curated(self) -> dict[str, str]:
+        """Just the :data:`REQUEST_KEYS` that are present (the short view; :attr:`request` has everything)."""
+        return {k: self.request[k] for k in REQUEST_KEYS if k in self.request}
+
+
+def drop_previous_sessions(text: str) -> str:
+    """Remove every ``Dumpsys from previous open session`` block (up to the next ``== ... ==`` section header)."""
+    out: list[str] = []
+    skipping = False
+    for line in text.split("\n"):
+        if _PREVIOUS in line:
+            skipping = True
+            continue
+        if skipping and line.startswith("== "):
+            skipping = False
+        if not skipping:
+            out.append(line)
+    return "\n".join(out)
+
+
+def parse_metadata_block(lines: list[str], start: int) -> dict[str, str]:
+    """Parse one ``CameraMetadata::dump`` block whose entries start after ``lines[start]`` (the block's title line).
+
+    Generic: every ``<name> (<hex tag>): <type>[<count>]`` entry followed by one or more ``[ ... ]`` value lines. Stops
+    at the first line that is neither (the next section), after skipping the metadata preamble."""
+    out: dict[str, str] = {}
+    key: str | None = None
+    vals: list[str] = []
+
+    def flush():
+        if key is not None:
+            out[key] = " ".join(" ".join(vals).split())
+
+    for line in lines[start + 1:]:
+        em = _ENTRY.match(line)
+        if em:
+            flush()
+            name, tag = em.group(1), em.group(2).lower()
+            key = name[len("android."):] if name.startswith("android.") else name
+            if key.startswith("unknownSection.") or key in out:
+                key = f"{key}@{tag}"
+            vals = []
+            continue
+        vm = _VALUES.match(line)
+        if vm and key is not None:
+            vals.append(vm.group(1))
+            continue
+        if key is None and (not line.strip() or _PREAMBLE.match(line)):
+            continue
+        break
+    flush()
+    return out
+
 
 def parse_camera_dump(text: str) -> CameraSession:
-    text = text.replace("\r", "")
-    cut = text.find("Dumpsys from previous open session")
-    live = text[:cut] if cut >= 0 else text
+    live = drop_previous_sessions(text.replace("\r", ""))
     sess = CameraSession()
     m = re.search(r"Device \d+ is open\. Client instance dump:", live)
     sess.open = m is not None
@@ -76,10 +147,18 @@ def parse_camera_dump(text: str) -> CameraSession:
         pm = re.search(r"Physical camera id: (\S+)", chunk)  # absent on high-speed / single-sensor streams
         sess.streams.append(dict(w=int(sm[1]), h=int(sm[2]), format=sm[3], dataspace=sm[4],
                                  physical=pm.group(1) if pm else ""))
-    start = live.find("Logical request settings")
-    block = live[start:start + 60000] if start >= 0 else ""
-    for key in REQUEST_KEYS:
-        km = re.search(r"android\." + re.escape(key) + r" \([0-9a-f]+\): \S+\n\s+\[([^\]]*)\]", block)
-        if km:
-            sess.request[key] = km.group(1).strip()
+    lines = live.split("\n")
+    seen_logical = False
+    for i, line in enumerate(lines):
+        if "Logical request settings" in line:
+            if seen_logical:
+                break                                   # a second open device: the first one's request is kept
+            seen_logical = True
+            sess.request = parse_metadata_block(lines, i)
+        elif seen_logical and line.startswith("== "):
+            break                                       # next device / service section
+        elif seen_logical:
+            pm = re.search(r"Physical request settings for camera id (\S+?):?\s*$", line)
+            if pm and pm.group(1) not in sess.physical_requests:
+                sess.physical_requests[pm.group(1)] = parse_metadata_block(lines, i)
     return sess

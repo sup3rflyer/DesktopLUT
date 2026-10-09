@@ -18,8 +18,17 @@ import pytest
 from dlc.phone import PhoneRig, Settings
 from dlc.phone import __main__ as cli
 from dlc.phone.backend import CameraBackend
-from dlc.phone.blackmagic import BlackmagicBackend, RestApi, _timecode_seconds
+from dlc.phone.blackmagic import APP_SETTINGS, BlackmagicBackend, RestApi, _timecode_seconds
+from dlc.phone.session import SESSION_LOG, SESSION_SUMMARY
 from dlc.phone.settings import BackendError, Unachievable, parse_shutter, parse_size
+
+
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch):
+    """No real waiting in these tests; the list records every requested sleep (settle / step timing is asserted)."""
+    log: list[float] = []
+    monkeypatch.setattr("time.sleep", lambda s: log.append(s))
+    return log
 
 # --- Settings ----------------------------------------------------------------------------------------------
 
@@ -59,6 +68,7 @@ SUPPORTED = [
      "minOffSpeedFrameRate": 15.0, "recordResolution": {"width": 7680, "height": 4320},
      "sensorResolution": {"width": 7680, "height": 4320}},
 ]
+ISOS = [25, 32, 40, 50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200]
 CAMERAS = [
     {"id": "1", "facing": "front", "focalLength": 26, "zoomFactor": "1x", "isActive": False, "isAvailable": True, "index": 1},
     {"id": "2", "facing": "back", "focalLength": 14, "zoomFactor": ".6x", "isActive": False, "isAvailable": True, "index": 3},
@@ -81,17 +91,25 @@ class FakeApp:
         self.recording = False
         self.tc = "00:00:02:30"
         self.hal_iso_bias = 1.0                       # HAL lands a little off the request, like the real sensor
+        self.hal_iso_stuck: int | None = None         # the app's stalled-ISO bug: the HAL sits here whatever is PUT
+        self.tonemap, self.live_hdr = "FAST", 2       # processing state only visible in the full HAL request
+        self.clips: list[str] = []                    # files the app has written (stop -> new clip)
         self.puts: list[tuple[str, dict]] = []
 
     def hal_text(self) -> str:
         exp_ns = int(1e9 / max(self.shutter, 1))
+        iso = self.hal_iso_stuck if self.hal_iso_stuck is not None else int(self.iso * self.hal_iso_bias)
         return (f"  Device 0 is open. Client instance dump:\n    Client package: com.blackmagicdesign.android.blackmagiccam\n"
                 f"    Operation mode: NORMAL (0)\n      Dims: 1920 x 1080, format 0x22, dataspace 0x8c20000\n"
                 f"      Physical camera id: 5\n    Logical request settings:\n"
+                f"      Dumping camera metadata array: 7 / 142 entries, 0 / 100 bytes of extra data.\n"
                 f"        android.control.aeMode (10003): byte[1]\n          [{'OFF' if self.ae == 'Off' else 'ON'} ]\n"
                 f"        android.control.aeTargetFpsRange (10005): int32[2]\n          [{self.fmt['frameRate']} {self.fmt['frameRate']} ]\n"
                 f"        android.sensor.exposureTime (e0000): int64[1]\n          [{exp_ns} ]\n"
-                f"        android.sensor.sensitivity (e0002): int32[1]\n          [{int(self.iso * self.hal_iso_bias)} ]\n")
+                f"        android.sensor.sensitivity (e0002): int32[1]\n          [{iso} ]\n"
+                f"        android.tonemap.mode (1a0003): byte[1]\n          [{self.tonemap} ]\n"
+                f"        android.colorCorrection.gains (40002): float[4]\n          [1.875 1.0 1.0 2.133 ]\n"
+                f"        samsung.android.control.liveHdrState (80020003): int32[1]\n          [{self.live_hdr} ]\n")
 
 
 def _make_handler(app: FakeApp):
@@ -114,7 +132,7 @@ def _make_handler(app: FakeApp):
                 "/system/format": a.fmt,
                 "/system/supportedFormats": {"supportedFormats": SUPPORTED},
                 "/video/iso": {"iso": a.iso},
-                "/video/supportedISOs": {"supportedISOs": [25, 100, 200, 400, 800, 1600, 3200]},
+                "/video/supportedISOs": {"supportedISOs": ISOS},
                 "/video/shutter": {"shutterSpeed": a.shutter, "shutterAngle": None, "measurement": "ShutterSpeed"},
                 "/video/supportedShutters": {"shutterSpeeds": [24, 30, 60, 120, 125, 250, 1000]},
                 "/video/autoExposure": {"mode": a.ae, "type": None},
@@ -157,6 +175,8 @@ def _make_handler(app: FakeApp):
                 for c in a.cams:
                     c["isActive"] = c["id"] == body["id"]
             elif p == "/transports/0/record":
+                if a.recording and not body["recording"]:
+                    a.clips.append(f"A001_C{len(a.clips) + 1:03d}.mp4")
                 a.recording = bool(body["recording"])
             else:
                 return self._send(400)
@@ -184,6 +204,7 @@ class FakeAdb:
         self.files: dict[str, tuple[int, int]] = {}
         self.removed: list[str] = []
         self.pulls: list[str] = []
+        self.dumpsys = 0                                    # HAL read-backs (each ~3 s on the real phone)
 
     def ensure_device(self): return "FAKE"
     def unlock(self, tries=3): return True
@@ -198,11 +219,22 @@ class FakeAdb:
 
     def shell(self, cmd, timeout=60.0, check=True):
         if "dumpsys media.camera" in cmd and self.app:
+            self.dumpsys += 1
             return self.app.hal_text()
+        if cmd.startswith("uiautomator dump"):
+            return "UI hierchary dumped to: /sdcard/bm_ui.xml"
         return ""
 
+    def run(self, *args, **kw):                             # exec-out cat of the uiautomator dump
+        return ('<?xml version="1.0"?><hierarchy><node text="" content-desc="camera" '
+                'bounds="[0,0][100,100]" /></hierarchy>')
+
     def stat_dir(self, d):
-        return dict(self.files)
+        out = dict(self.files)
+        if self.app and self.clip_src:
+            size = Path(self.clip_src).stat().st_size
+            out.update({n: (size, i) for i, n in enumerate(self.app.clips) if n not in self.removed})
+        return out
 
     def pull(self, remote, local):
         self.pulls.append(remote)
@@ -211,7 +243,7 @@ class FakeAdb:
         return Path(local)
 
     def rm(self, remote):
-        self.removed.append(remote)
+        self.removed.append(remote.rsplit("/", 1)[-1])
 
 
 def _bm(app: FakeApp, adb: FakeAdb | None = None) -> BlackmagicBackend:
@@ -359,7 +391,7 @@ def test_recording_marks_manifest_and_cleanup(tmp_path, clip60):
     assert [m["label"] for m in man["marks"]] == ["patch=64", "patch=128"] and man["marks"][1]["clip_s"] == 3.0
     assert man["expect"] == {"fps": 60.0} and man["problems"] == [] and man["backend"]["name"] == "blackmagic"
     assert man["phone_minus_host_s"] == 0.012 and man["clip"]["frames"] == 60
-    assert adb.removed == ["/sdcard/x/clip.mp4"]                    # phone copy removed after a verified pull
+    assert adb.removed == ["clip.mp4"]                              # phone copy removed after a verified pull
 
 
 @needs_ffmpeg
@@ -390,3 +422,147 @@ def test_recording_resume_across_processes(tmp_path, clip60):
     cap = rig2.end(rec2)
     assert cap.ok and [m.label for m in cap.marks] == ["a"] and bm2.calls[-1] == "stop"
     assert rec2.expect == {"fps": 60.0}
+
+
+# --- exposure quirks (HW 2026-10-08): ISO floor, unchanged shutter, ISO walk, tracked fast path ------------
+
+
+def _iso_puts(app: FakeApp) -> list[int]:
+    return [b["iso"] for p, b in app.puts if p == "/video/iso"]
+
+
+def _shutter_puts(app: FakeApp) -> list[int]:
+    return [b["shutterSpeed"] for p, b in app.puts if p == "/video/shutter"]
+
+
+def test_expose_tracks_in_process_and_never_resends_an_unchanged_shutter(fake_app):
+    adb = FakeAdb(fake_app)
+    b = _bm(fake_app, adb)
+    r = b.expose(iso=400, shutter_s=1 / 60)                       # app starts at ISO 3200, 1/7199
+    assert r["iso"] == 400 and r["shutter_s"] == pytest.approx(1 / 60) and r["verified"] is False
+    assert _shutter_puts(fake_app) == [60] and adb.dumpsys == 1   # seeded ONCE from the HAL
+    fake_app.puts.clear()
+    b.expose(iso=800, shutter_s=1 / 60)                           # same shutter: must NOT be re-sent
+    b.expose(iso=800, shutter_s=1 / 60)                           # nothing changed: nothing sent at all
+    b.expose(shutter_s=1 / 60)
+    assert _shutter_puts(fake_app) == [] and _iso_puts(fake_app) == [500, 640, 800]
+    assert adb.dumpsys == 1                                       # the fast path never paid the ~3 s HAL read
+    v = b.expose(iso=800, verify=True)                            # verification only on request
+    assert v["verified"] is True and v["hal"]["iso"] == 800 and adb.dumpsys == 2
+
+
+def test_apply_does_not_resend_a_shutter_the_hal_already_has(fake_app):
+    fake_app.shutter, fake_app.iso = 120, 400                     # HAL already at 1/120 s, ISO 400
+    _bm(fake_app).apply(Settings(iso=800, shutter_s=1 / 120))
+    assert _shutter_puts(fake_app) == [] and _iso_puts(fake_app) == [500, 640, 800]
+
+
+def test_iso_walk_steps_and_settle_are_configurable(fake_app, sleeps):
+    b = BlackmagicBackend(FakeAdb(fake_app), base_url=fake_app.url, iso_settle_s=3.5, iso_step_s=0.25)
+    b.expose(iso=400)                                             # 3200 -> 400: nine 1/3-stop steps
+    assert _iso_puts(fake_app) == [2500, 2000, 1600, 1250, 1000, 800, 640, 500, 400]
+    assert sleeps.count(0.25) == 8 and sleeps[-1] == 3.5          # step gaps, then ONE settle after the last step
+    sleeps.clear()
+    b.expose(iso=500, settle_s=2.0)                               # one step; per-call settle override
+    assert _iso_puts(fake_app)[-1] == 500 and sleeps == [2.0]
+    assert BlackmagicBackend(FakeAdb(fake_app)).iso_settle_s >= 2.0          # default settle (a 1 s read was -7 %)
+
+
+@pytest.mark.parametrize("iso", [25, 32, 10])
+def test_iso_below_40_is_refused_with_a_clear_error(fake_app, iso):
+    b = _bm(fake_app)
+    with pytest.raises(Unachievable, match=r"below the camera HAL minimum ISO 40.*options: \[40, 50"):
+        b.expose(iso=iso)
+    with pytest.raises(Unachievable, match="below the camera HAL minimum ISO 40"):
+        b.apply(Settings(iso=iso))
+    assert _iso_puts(fake_app) == [] and _shutter_puts(fake_app) == []      # refused before anything was sent
+
+
+def test_stalled_iso_is_resent_once_then_reported(fake_app):
+    fake_app.iso, fake_app.hal_iso_stuck = 400, 379                 # the app's stall: HAL creeps below the request
+    with pytest.raises(Unachievable, match="ISO 379 != 400"):
+        _bm(fake_app).apply(Settings(iso=400))
+    assert _iso_puts(fake_app) == [400]                           # nearest entry IS the target -> one re-send
+
+
+def test_exposure_check_at_clip_stop_compares_tracker_with_hal(fake_app):
+    b = _bm(fake_app)
+    b.expose(iso=400, shutter_s=1 / 60)
+    assert b.exposure_check(b.state()) == []
+    fake_app.iso = 3200                                           # something moved the camera behind our back
+    probs = b.exposure_check(b.state())
+    assert len(probs) == 1 and "ISO 3200 != 400" in probs[0]
+    assert b.state()["exposure_tracked"]["iso"] == 3200           # re-seeded from the HAL (the truth)
+
+
+def test_state_carries_full_request_and_app_settings(fake_app):
+    st = _bm(fake_app).state()
+    req = st["hal"]["request"]
+    assert req["tonemap.mode"] == "FAST" and req["samsung.android.control.liveHdrState"] == "2"
+    assert req["colorCorrection.gains"] == "1.875 1.0 1.0 2.133" and req["sensor.sensitivity"] == "3200"
+    assert set(st["app"]) == set(APP_SETTINGS) and st["app"]["/video/whiteBalance"]["whiteBalance"] == 6500
+
+
+# --- manifest evidence trail (real Blackmagic backend against the fake app + device) ----------------------
+
+
+@needs_ffmpeg
+def test_manifest_carries_full_request_and_flags_changes_vs_previous_clip(tmp_path, clip60, fake_app):
+    adb = FakeAdb(fake_app, clip_src=clip60)
+    rig = PhoneRig(tmp_path / "out", adb=adb, backends=[BlackmagicBackend(adb, base_url=fake_app.url)])
+    with rig.recording("c1", iso=400, shutter_s=1 / 60) as rec:
+        rig.expose(iso=800)                                       # exposure segment: requested, never "evidence"
+        rec.mark("e800")
+    c1 = rec.capture
+    man = json.loads(c1.manifest.read_text())
+    for when in ("state_at_start", "state_at_stop"):
+        req = man[when]["hal"]["request"]
+        assert req["tonemap.mode"] == "FAST" and req["samsung.android.control.liveHdrState"] == "2", when
+        assert set(man[when]["app"]) == set(APP_SETTINGS), when
+    assert man["state_at_start"]["hal"]["request"]["sensor.sensitivity"] == "400"
+    assert man["state_at_stop"]["hal"]["request"]["sensor.sensitivity"] == "800"
+    assert c1.ok and man["changed_vs_prev"] == {} and man["changed_during"] == {} and man["warnings"] == []
+
+    fake_app.live_hdr, fake_app.tonemap = 0, "HIGH_QUALITY"        # the camera changes between clips (cf. 10-08 18:00)
+    cap = rig.capture("c2", 0, iso=400)
+    man2 = json.loads(cap.manifest.read_text())
+    assert man2["changed_vs_prev"] == {"hal.request.samsung.android.control.liveHdrState": ["2", "0"],
+                                       "hal.request.tonemap.mode": ["FAST", "HIGH_QUALITY"]}
+    assert man2["changed_vs_prev_label"] == "c1"
+    assert cap.ok and cap.problems == [] and len(cap.warnings) == 1         # evidence, NOT a gate
+    assert "differ from the previous clip 'c1'" in cap.warnings[0]
+    assert "tonemap.mode: FAST -> HIGH_QUALITY" in cap.warnings[0]
+
+    with rig.recording("c3") as rec3:
+        fake_app.wb = 5000                                        # changed DURING the clip
+    man3 = json.loads(rec3.capture.manifest.read_text())
+    assert man3["changed_vs_prev"] == {}
+    assert man3["changed_during"] == {"app./video/whiteBalance.whiteBalance": [6500, 5000]}
+
+    summ = json.loads((tmp_path / "out" / SESSION_SUMMARY).read_text())
+    assert summ["clips"] == 3 and summ["ok"] == 3 and len(summ["warnings"]) == 2
+    assert summ["warnings"][0].startswith("c2: ") and summ["warnings"][1].startswith("c3: ")
+    assert summ["clip_list"][1]["changed_vs_prev"] == ["hal.request.samsung.android.control.liveHdrState",
+                                                       "hal.request.tonemap.mode"]
+    assert len((tmp_path / "out" / SESSION_LOG).read_text().splitlines()) == 3
+
+
+@needs_ffmpeg
+def test_clip_stop_flags_a_hal_that_left_the_tracked_exposure(tmp_path, clip60, fake_app):
+    adb = FakeAdb(fake_app, clip_src=clip60)
+    rig = PhoneRig(tmp_path / "out", adb=adb, backends=[BlackmagicBackend(adb, base_url=fake_app.url)])
+    with rig.recording("drift", iso=400, shutter_s=1 / 60) as rec:
+        rig.expose(iso=800)
+        fake_app.hal_iso_stuck = 640                              # the HAL never got there
+    assert not rec.capture.ok and any("clip stop disagrees" in p and "ISO 640 != 800" in p
+                                      for p in rec.capture.problems)
+
+
+def test_cli_summary_reads_the_out_dir_only(tmp_path, capsys):
+    out = tmp_path / "o"
+    out.mkdir()
+    (out / SESSION_LOG).write_text(json.dumps(dict(label="a", ok=True, problems=[], warnings=["w1"],
+                                                   changed_vs_prev={"k": [1, 2]}, changed_during={})) + "\n")
+    assert cli.main(["summary", "--out", str(out)]) == 0
+    s = json.loads(capsys.readouterr().out)
+    assert s["clips"] == 1 and s["warnings"] == ["a: w1"] and s["clip_list"][0]["changed_vs_prev"] == ["k"]

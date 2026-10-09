@@ -12,6 +12,14 @@ mcpro24fps. Every clip gets ``<label>.json`` beside it: what was requested, what
 file's real format (ffprobe), the marks, host/phone clock offset and any problems - so a clip is never separated from
 the conditions it was shot under and a silently wrong mode is flagged rather than trusted. Problems are *reported*
 (``Capture.problems``) for the LLM to judge; nothing is auto-accepted.
+
+Evidence trail (added after the 2026-10-08 session, whose camera response changed mid-session with no recorded cause):
+the manifest holds the backend state at clip start AND stop (``state_at_start`` / ``state_at_stop``: the HAL's full
+live request incl. vendor tags, the app's settings), ``changed_vs_prev`` (non-exposure keys that differ from the
+previous clip in this ``out_dir``) and ``changed_during`` (start vs stop of this clip). Changes are *warnings*
+(``Capture.warnings``, and the session summary ``phone_session_summary.json`` / :meth:`PhoneRig.summary`) - evidence for
+the overseeing LLM, not a gate: ``Capture.ok`` does not depend on them. Both snapshots are taken with the camera at
+rest (start: after apply, before recording; stop: after the file is closed) so they compare like for like.
 """
 
 from __future__ import annotations
@@ -24,12 +32,15 @@ from pathlib import Path
 from typing import Iterator
 
 from . import clip as clipmod
+from . import evidence as evmod
 from .adb import Adb
 from .backend import CameraBackend
-from .settings import BackendError, Settings
+from .settings import BackendError, Settings, parse_shutter
 
 MIN_FREE_GB = 3.0
 _PREFERENCE = ("blackmagic", "mcpro")
+SESSION_LOG = "phone_session.jsonl"              # one line per finished clip in out_dir (evidence for the next diff)
+SESSION_SUMMARY = "phone_session_summary.json"   # rewritten after every clip
 
 
 @dataclass
@@ -49,6 +60,10 @@ class Capture:
     problems: list[str] = field(default_factory=list)
     marks: list[Mark] = field(default_factory=list)
     state: dict = field(default_factory=dict)
+    state_at_stop: dict = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)              # evidence for the LLM; does not affect ``ok``
+    changed_vs_prev: dict = field(default_factory=dict)            # {key: [previous clip, this clip's start]}
+    changed_during: dict = field(default_factory=dict)             # {key: [this clip's start, its stop]}
 
     @property
     def ok(self) -> bool:
@@ -91,6 +106,35 @@ class Recording:
                     pre=self.pre, offset=self.offset, unc=self.unc, delete_remote=self.delete_remote,
                     settings=self.settings, marks=[dict(label=m.label, t_host=m.t_host, clip_s=m.clip_s, data=m.data)
                                                    for m in self.marks])
+
+
+def _log_entries(out_dir: str | Path) -> list[dict]:
+    log = Path(out_dir) / SESSION_LOG
+    if not log.exists():
+        return []
+    out = []
+    for line in log.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def session_summary(out_dir: str | Path) -> dict:
+    """Summary of every clip finished in ``out_dir`` (across processes): counts, problems and WARNINGS (camera settings
+    that changed between / during clips) - evidence for the LLM to judge, no verdict. Also written to
+    ``phone_session_summary.json`` after every clip."""
+    entries = _log_entries(out_dir)
+    return dict(
+        out_dir=str(out_dir), clips=len(entries), ok=sum(1 for e in entries if e.get("ok")),
+        problems=[f"{e['label']}: {p}" for e in entries for p in e.get("problems", [])],
+        warnings=[f"{e['label']}: {w}" for e in entries for w in e.get("warnings", [])],
+        clip_list=[dict(label=e["label"], captured_at=e.get("captured_at"), ok=e.get("ok"),
+                        changed_vs_prev=sorted(e.get("changed_vs_prev") or {}),
+                        changed_during=sorted(e.get("changed_during") or {})) for e in entries],
+    )
 
 
 class PhoneRig:
@@ -150,6 +194,16 @@ class PhoneRig:
         self.active = b
         return b.apply(s)
 
+    def expose(self, iso: int | None = None, shutter_s: float | str | None = None, *, verify: bool = False) -> dict:
+        """Change ISO / exposure time on the active backend - the fast path for exposure segments inside a clip
+        (Blackmagic: tracked in-process, HAL checked on ``verify=True`` and at clip stop). Mark the segment yourself
+        (``rec.mark(...)``) once this returns (it has settled)."""
+        if self.active is None:
+            raise BackendError("no active camera backend - call set() / begin() first")
+        if isinstance(shutter_s, str):
+            shutter_s = parse_shutter(shutter_s)
+        return self.active.expose(iso=iso, shutter_s=shutter_s, verify=verify)
+
     def _preflight(self, b: CameraBackend, min_free_gb: float) -> dict:
         free = self.adb.free_gb()
         if free < min_free_gb:
@@ -186,9 +240,31 @@ class PhoneRig:
         """Stop, pull, verify, write the manifest. Never raises for a bad *clip* (see ``Capture.problems``)."""
         t_stop = time.time()
         name = rec.backend.stop(rec.token)
+        at_stop = self._state_at_stop(rec.backend)       # right after the file is closed, before the (slow) pull
         rec.capture = self._finish(rec.label, rec.backend, name, rec, rec.expect, rec.pre, rec.offset, rec.unc,
-                                   t_stop, rec.delete_remote, err)
+                                   t_stop, rec.delete_remote, err, at_stop)
         return rec.capture
+
+    @staticmethod
+    def _state_at_stop(b: CameraBackend) -> tuple[dict, list[str], list[str]]:
+        """``(state, problems, warnings)`` after the clip is closed. Never raises: the clip still has to be pulled."""
+        try:
+            st = b.state()
+        except Exception as e:  # noqa: BLE001 - evidence gathering must not lose the clip
+            why = f"{type(e).__name__}: {e}"
+            return {"error": why}, [], [f"state at clip stop unavailable: {why}"]
+        try:
+            return st, list(b.exposure_check(st)), []
+        except Exception as e:  # noqa: BLE001
+            return st, [], [f"exposure check at clip stop failed: {type(e).__name__}: {e}"]
+
+    # -- session log / summary --------------------------------------------------------------------------
+    def _log_entries(self) -> list[dict]:
+        return _log_entries(self.out_dir)
+
+    def summary(self) -> dict:
+        """Session summary for ``out_dir`` (see :func:`session_summary`)."""
+        return session_summary(self.out_dir)
 
     def resume(self, data: dict) -> Recording:
         """Rebuild a :class:`Recording` started by another process (CLI ``rec start`` ... ``rec stop``)."""
@@ -225,7 +301,8 @@ class PhoneRig:
         return rec.capture
 
     def _finish(self, label: str, b: CameraBackend, name: str, rec: Recording, expect: dict, pre: dict, offset: float,
-                unc: float, t_stop: float, delete_remote: bool, err: BaseException | None) -> Capture:
+                unc: float, t_stop: float, delete_remote: bool, err: BaseException | None,
+                at_stop: tuple[dict, list[str], list[str]] | None = None) -> Capture:
         self.out_dir.mkdir(parents=True, exist_ok=True)
         local = self.out_dir / f"{label}{Path(name).suffix}"
         remote = f"{b.media_dir}/{name}"
@@ -238,7 +315,23 @@ class PhoneRig:
         problems += clipmod.check(info, **expect)
         if err is not None:
             problems.append(f"interrupted: {type(err).__name__}: {err}")
+        stop_state, stop_problems, warnings = at_stop if at_stop is not None else self._state_at_stop(b)
+        problems += stop_problems
+        warnings = list(warnings)
+        ev_start = evmod.flatten(rec.state)
+        ev_stop = evmod.flatten(stop_state) if "error" not in stop_state else {}
+        prev = next(iter(reversed(self._log_entries())), None)
+        changed_vs_prev = evmod.diff(prev.get("evidence"), ev_start) if prev and prev.get("evidence") else {}
+        changed_during = evmod.diff(ev_start, ev_stop) if ev_stop else {}
+        if changed_vs_prev:
+            warnings.append(f"{len(changed_vs_prev)} camera setting(s) differ from the previous clip "
+                            f"{prev['label']!r} ({prev.get('captured_at')}), requested exposure excluded: "
+                            + evmod.describe(changed_vs_prev))
+        if changed_during:
+            warnings.append(f"{len(changed_during)} camera setting(s) changed during the clip (start -> stop), "
+                            "requested exposure excluded: " + evmod.describe(changed_during))
         manifest = self.out_dir / f"{label}.json"
+        captured_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         manifest.write_text(json.dumps(dict(
             label=label, backend=b.describe(), remote=remote, local=str(local),
             host_t_start=rec.t_start, host_t_recording=rec.t_ack, host_t_stop=t_stop,
@@ -251,9 +344,19 @@ class PhoneRig:
                       dt_ms=[info.dt_ms_min, info.dt_ms_median, info.dt_ms_max], gaps=info.gaps,
                       first_gap_ms=info.first_gap_ms, color_transfer=info.color_transfer, app_tags=info.app_tags),
             expect={k: (list(v) if isinstance(v, tuple) else v) for k, v in expect.items()}, problems=problems,
-            captured_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-        ), indent=1), encoding="utf-8")
+            warnings=warnings, state_at_stop=stop_state, changed_vs_prev=changed_vs_prev,
+            changed_vs_prev_label=prev["label"] if prev else None, changed_during=changed_during,
+            captured_at=captured_at,
+        ), indent=1, default=str), encoding="utf-8")
+        with (self.out_dir / SESSION_LOG).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(dict(label=label, captured_at=captured_at, manifest=manifest.name, ok=not problems,
+                                     problems=problems, warnings=warnings, changed_vs_prev=changed_vs_prev,
+                                     changed_during=changed_during, evidence=ev_stop or ev_start),
+                                default=str) + "\n")
+        (self.out_dir / SESSION_SUMMARY).write_text(json.dumps(self.summary(), indent=1, default=str),
+                                                    encoding="utf-8")
         if delete_remote and not any(p.startswith("pulled") for p in problems):
             self.adb.rm(remote)
         return Capture(label=label, local=local, manifest=manifest, info=info, problems=problems, marks=rec.marks,
-                       state=rec.state)
+                       state=rec.state, state_at_stop=stop_state, warnings=warnings, changed_vs_prev=changed_vs_prev,
+                       changed_during=changed_during)

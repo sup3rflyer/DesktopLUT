@@ -14,6 +14,16 @@ Limits to know:
   *preset* (``/presets``) or in Settings; the recorded clip is probed so a wrong mode is flagged, never assumed.
 * ``shutterSpeed`` is an integer denominator and is read back rounded (1/120 s reads "119"); the HAL value is the truth.
 * setting focus manually switches AF off by itself; the value then reads back exactly.
+
+Exposure quirks (HW, 2026-10-08) - encoded in :meth:`BlackmagicBackend.apply` / :meth:`BlackmagicBackend.expose`:
+* the HAL minimum is **ISO 40**: the app lists 25 / 32 but the sensor never goes below 40 -> refused (:data:`MIN_ISO`).
+* re-sending an UNCHANGED shutter makes the app's ISO stall / creep (HAL ISO 387 -> 379, never reaching the request)
+  -> the shutter is PUT only when it actually changes.
+* large ISO jumps are walked through the app's own ISO list (1/3-stop steps), then settled (>= 2 s by default: a read
+  ~1 s after a 4-stop jump was 7 % low) - :func:`iso_walk`.
+* the HAL read-back (``dumpsys media.camera``) costs ~3 s, so :meth:`BlackmagicBackend.expose` tracks the current
+  ISO / shutter in-process (seeded once from the HAL) and checks the HAL only on request (``verify=True``) and at clip
+  stop (:meth:`BlackmagicBackend.exposure_check`, via the manifest's ``state_at_stop``).
 """
 
 from __future__ import annotations
@@ -34,6 +44,13 @@ PKG = "com.blackmagicdesign.android.blackmagiccam"
 MEDIA_DIR = "/sdcard/DCIM/Blackmagic Camera"
 PORT = 4444
 ISO_TOL = 0.03          # relative; the HAL reports e.g. 396/398 for a requested 400
+EXPOSURE_TOL = 0.01     # relative; HAL exposure time vs the request (the HAL is exact: 1/120 -> 8333333 ns)
+SHUTTER_SAME = 0.005    # relative; a shutter this close to the current one is "unchanged" -> never re-sent
+MIN_ISO = 40            # HAL minimum; the app's list also offers 25 / 32 (the sensor sits at 40 for those)
+# Every REST-readable app *setting* the backend already GETs (one list; recorded whole in state()["app"] so each clip
+# manifest carries the app's settings at clip start and stop, and a clip-to-clip change shows up as evidence).
+APP_SETTINGS = ("/access/status", "/system/format", "/video/iso", "/video/shutter", "/video/whiteBalance",
+                "/video/autoExposure", "/lens/focus", "/lens/focus/autoFocus", "/lens/cameras/active")
 _CODECS = {"h264": "H264", "avc": "H264", "hevc": "H265", "h265": "H265"}
 _CONTAINERS = {"H264": "video/avc", "H265": "video/hevc"}
 
@@ -71,6 +88,34 @@ class RestApi:
             raise BackendError(f"PUT {path} {json.dumps(body)} -> HTTP {code} (rejected)")
 
 
+def iso_walk(current: float | None, target: int, options: list[int], tol: float = ISO_TOL) -> list[int]:
+    """The ISO PUT sequence from ``current`` to ``target`` through the app's list (1/3-stop steps), ``[]`` if already
+    there. ``current`` may be a HAL value between list entries (396 for 400): it is snapped to the nearest entry; if
+    that entry *is* the target but the HAL is off it by more than ``tol`` (a stalled ISO), the target is re-sent once.
+    ``current=None`` (unknown) -> a single PUT of the target."""
+    if current is None:
+        return [int(target)]
+    if abs(current - target) <= tol * target:
+        return []
+    opts = sorted(options)
+    c = min(opts, key=lambda v: abs(v - current))
+    if c < target:
+        return [v for v in opts if c < v <= target]
+    if c > target:
+        return [v for v in opts if target <= v < c][::-1]
+    return [int(target)]
+
+
+def _exposure_mismatch(want: dict, got: dict) -> list[str]:
+    bad = []
+    if want.get("iso") and got.get("iso") is not None and abs(got["iso"] - want["iso"]) / want["iso"] > ISO_TOL:
+        bad.append(f"ISO {got['iso']} != {want['iso']}")
+    if (want.get("exposure_s") and got.get("exposure_s") is not None
+            and abs(got["exposure_s"] - want["exposure_s"]) / want["exposure_s"] > EXPOSURE_TOL):
+        bad.append(f"exposure {got['exposure_s']:.6f} s != {want['exposure_s']:.6f} s")
+    return bad
+
+
 def _timecode_seconds(tc: str, fps: float) -> float | None:
     parts = tc.replace(";", ":").split(":")
     if len(parts) != 4 or not all(p.isdigit() for p in parts):
@@ -85,12 +130,19 @@ class BlackmagicBackend(CameraBackend):
     media_dir = MEDIA_DIR
     supports_clip_time = True
 
-    def __init__(self, adb: Adb | None = None, base_url: str | None = None):
+    def __init__(self, adb: Adb | None = None, base_url: str | None = None, *, iso_settle_s: float = 2.0,
+                 iso_step_s: float = 0.35, shutter_settle_s: float = 0.8):
         self.adb = adb or Adb()
         self._base_url = base_url
         self._api: RestApi | None = None
         self._fps_at_start = 60.0
         self._before: dict = {}
+        self.iso_settle_s = iso_settle_s          # after the last ISO step (the image level settles, not just the HAL)
+        self.iso_step_s = iso_step_s              # between the 1/3-stop steps of an ISO walk
+        self.shutter_settle_s = shutter_settle_s  # after a shutter PUT
+        # What the app's exposure is believed to be: {"iso", "exposure_s", "source": "hal" | "set"}; None = unknown
+        # (re-seeded from the HAL). Invalidated by lens / format / auto-exposure changes (the camera session restarts).
+        self._exp: dict | None = None
 
     # -- connection -------------------------------------------------------------------------------------
     @property
@@ -182,28 +234,35 @@ class BlackmagicBackend(CameraBackend):
         return parse_camera_dump(self.adb.shell("dumpsys media.camera", timeout=30))
 
     # -- state ------------------------------------------------------------------------------------------
+    def app_settings(self) -> dict:
+        """Every app setting in :data:`APP_SETTINGS`, as the REST API returns it (``{path: body}``)."""
+        return {p: self.api.get(p) for p in APP_SETTINGS}
+
     def state(self) -> dict:
+        """Curated fields + the app's full settings (``app``) + the HAL's full live request (``hal.request``: every key
+        incl. vendor tags; ``hal.physical_requests`` per physical camera) + the in-process exposure tracker."""
         a = self.api
-        fmt = a.get("/system/format")
-        shut = a.get("/video/shutter")
-        wb = a.get("/video/whiteBalance")
-        focus = a.get("/lens/focus")
-        af = a.get("/lens/focus/autoFocus")
-        lens = a.get("/lens/cameras/active")
+        app = self.app_settings()
+        fmt, shut, wb = app["/system/format"], app["/video/shutter"], app["/video/whiteBalance"]
+        focus, af, lens = app["/lens/focus"], app["/lens/focus/autoFocus"], app["/lens/cameras/active"]
         rec = a.get("/transports/0/record")
         hal = self.hal()
         st = dict(
             backend=self.name,
             fps=float(fmt["frameRate"]), size=[fmt["recordResolution"]["width"], fmt["recordResolution"]["height"]],
             codec=fmt["codec"].lower().replace("h265", "hevc"),
-            iso=a.get("/video/iso")["iso"], shutter_s=(hal.exposure_s() if hal.open else
-                                                       (1.0 / shut["shutterSpeed"] if shut.get("shutterSpeed") else None)),
+            iso=app["/video/iso"]["iso"], shutter_s=(hal.exposure_s() if hal.open else
+                                                     (1.0 / shut["shutterSpeed"] if shut.get("shutterSpeed") else None)),
             wb_k=wb["whiteBalance"], tint=wb["tint"], focus=focus["normalised"], af=bool(af.get("enabled")),
             lens=dict(id=lens["id"], focal_mm=lens["focalLength"], zoom=lens["zoomFactor"]),
-            ae=a.get("/video/autoExposure")["mode"], recording=bool(rec["recording"]),
+            ae=app["/video/autoExposure"]["mode"], recording=bool(rec["recording"]),
             free_gb=round(a.get("/media/workingset")["workingset"][0]["remainingSpace"] / 2**30, 2),
             hal=dict(open=hal.open, client=hal.client, opmode=hal.opmode, iso=hal.iso(), exposure_s=hal.exposure_s(),
-                     fps=hal.target_fps(), ae_off=hal.manual_exposure(), streams=hal.streams),
+                     fps=hal.target_fps(), ae_off=hal.manual_exposure(), streams=hal.streams,
+                     request=dict(hal.request),
+                     physical_requests={k: dict(v) for k, v in hal.physical_requests.items()}),
+            app=app,
+            exposure_tracked=dict(self._exp) if self._exp else None,
         )
         return st
 
@@ -215,21 +274,15 @@ class BlackmagicBackend(CameraBackend):
             self._set_lens(s.lens)
         if any(k in g for k in ("fps", "size", "codec")):
             self._set_format(s)
-        if ("iso" in g or "shutter_s" in g) and a.get("/video/autoExposure")["mode"] != "Off":
-            # only when it is on: re-sending Off while already off makes the app re-run AE (HAL aeMode back ON)
-            a.put("/video/autoExposure", {"mode": "Off"})
-        if s.iso is not None:
-            opts = a.get("/video/supportedISOs")["supportedISOs"]
-            if s.iso not in opts:
-                raise Unachievable(f"ISO {s.iso} not supported; options: {opts}")
-            a.put("/video/iso", {"iso": int(s.iso)})
-        if s.shutter_s is not None:
-            opts = a.get("/video/supportedShutters")["shutterSpeeds"]
-            n = round(1.0 / s.shutter_s)
-            if n not in opts or abs(1.0 / n - s.shutter_s) / s.shutter_s > 0.005:
-                raise Unachievable(f"shutter {s.shutter_s:.6g} s (1/{1.0 / s.shutter_s:.1f}) not supported; "
-                                   f"options 1/N with N in {opts}")
-            a.put("/video/shutter", {"shutterSpeed": n})
+        exposure = "iso" in g or "shutter_s" in g
+        if exposure:
+            iso = self._check_iso(s.iso) if s.iso is not None else None          # validate before exposure PUTs
+            n = self._shutter_n(s.shutter_s) if s.shutter_s is not None else None
+            self._ae_off()
+            # The slow verified path re-reads the HAL rather than trusting the tracker: a stale belief must never skip
+            # a needed PUT. A HAL that is not up yet (session restarting) -> unknown -> plain PUTs, judged below.
+            self._exp = self._read_hal_exposure(tries=3)
+            self._move_exposure(iso, n)
         if s.wb_k is not None:
             a.put("/video/whiteBalance", {"whiteBalance": int(s.wb_k)})
         if s.tint is not None:
@@ -244,11 +297,134 @@ class BlackmagicBackend(CameraBackend):
             st = self.state()
             try:
                 self._verify(s, st)
-                return st
             except Unachievable as e:
                 last = e
+                continue
+            if exposure and self._exp is not None:            # what was not requested comes from the verified HAL
+                for k in ("iso", "exposure_s"):
+                    if self._exp.get(k) is None:
+                        self._exp[k] = st["hal"].get(k)
+            return st
         assert last is not None
+        if exposure:
+            self._exp = None                          # what the app holds is unknown now -> re-seed from the HAL
         raise last
+
+    # -- exposure (tracked fast path) -------------------------------------------------------------------
+    def _check_iso(self, iso: int) -> int:
+        opts = sorted(self.api.get("/video/supportedISOs")["supportedISOs"])
+        usable = [v for v in opts if v >= MIN_ISO]
+        if iso < MIN_ISO:
+            raise Unachievable(f"ISO {iso} is below the camera HAL minimum ISO {MIN_ISO} (the app lists "
+                               f"{[v for v in opts if v < MIN_ISO]} but the sensor never goes below {MIN_ISO}, so the "
+                               f"clip would silently be at ISO {MIN_ISO}); options: {usable}")
+        if iso not in opts:
+            raise Unachievable(f"ISO {iso} not supported; options: {usable}")
+        return int(iso)
+
+    def _shutter_n(self, shutter_s: float) -> int:
+        opts = self.api.get("/video/supportedShutters")["shutterSpeeds"]
+        n = round(1.0 / shutter_s)
+        if n not in opts or abs(1.0 / n - shutter_s) / shutter_s > 0.005:
+            raise Unachievable(f"shutter {shutter_s:.6g} s (1/{1.0 / shutter_s:.1f}) not supported; "
+                               f"options 1/N with N in {opts}")
+        return n
+
+    def _ae_off(self) -> None:
+        """Switch auto-exposure off - only when it is on: re-sending Off while already off makes the app re-run AE
+        (HAL aeMode back ON). Switching it invalidates the exposure tracker."""
+        if self.api.get("/video/autoExposure")["mode"] != "Off":
+            self.api.put("/video/autoExposure", {"mode": "Off"})
+            self._exp = None
+            time.sleep(self.shutter_settle_s)
+
+    def _read_hal_exposure(self, tries: int = 1) -> dict | None:
+        """``{"iso", "exposure_s", "source": "hal"}`` from the live HAL request (~3 s), or None if it has none."""
+        for i in range(tries):
+            h = self.hal()
+            if h.open and h.iso() is not None and h.exposure_s() is not None:
+                return dict(iso=h.iso(), exposure_s=h.exposure_s(), source="hal")
+            if i + 1 < tries:
+                time.sleep(1.0)
+        return None
+
+    def _move_exposure(self, iso: int | None, n: int | None, settle_s: float | None = None) -> list[str]:
+        """PUT shutter (only if it changes) then walk the ISO (1/3-stop steps), settle; updates the tracker.
+        Inputs are pre-validated (:meth:`_check_iso`, :meth:`_shutter_n`). Returns what was sent."""
+        cur = self._exp or dict(iso=None, exposure_s=None, source="unknown")
+        sent: list[str] = []
+        if n is not None:
+            if cur["exposure_s"] is None or abs(cur["exposure_s"] * n - 1.0) > SHUTTER_SAME:
+                self.api.put("/video/shutter", {"shutterSpeed": n})
+                sent.append(f"shutter 1/{n}")
+                time.sleep(self.shutter_settle_s)
+            cur = dict(cur, exposure_s=1.0 / n, source="set")
+        if iso is not None:
+            steps = iso_walk(cur["iso"], iso, [v for v in self.api.get("/video/supportedISOs")["supportedISOs"]
+                                               if v >= MIN_ISO])
+            for i, v in enumerate(steps):
+                if i:
+                    time.sleep(self.iso_step_s)
+                self.api.put("/video/iso", {"iso": v})
+                sent.append(f"iso {v}")
+            if steps:
+                time.sleep(self.iso_settle_s if settle_s is None else settle_s)
+            cur = dict(cur, iso=iso, source="set")
+        self._exp = cur
+        return sent
+
+    def expose(self, iso: int | None = None, shutter_s: float | None = None, *, verify: bool = False,
+               settle_s: float | None = None) -> dict:
+        """Fast exposure change - built for exposure segments INSIDE one clip (no 3 s HAL read per change).
+
+        The current ISO / shutter are tracked in-process, seeded once from the HAL (and re-seeded whenever the
+        tracker is invalidated). The shutter is PUT only when it changes (an unchanged re-send stalls the app's ISO);
+        the ISO is walked through the app's 1/3-stop list and settled (``settle_s``, default ``iso_settle_s``);
+        ISO < 40 / unlisted values / non-1/N shutters raise :class:`Unachievable` before anything is sent.
+        ``verify=True`` reads the HAL afterwards (~3 s) and raises :class:`Unachievable` if it disagrees; otherwise the
+        HAL is checked at clip stop (:meth:`exposure_check`). Returns ``{iso, shutter_s, sent, verified[, hal]}``."""
+        iso_v = self._check_iso(iso) if iso is not None else None
+        n = self._shutter_n(shutter_s) if shutter_s is not None else None
+        self._ae_off()
+        if self._exp is None:
+            self._exp = self._read_hal_exposure(tries=3)
+            if self._exp is None:
+                raise BackendError("camera HAL has no live request (is the Blackmagic Camera tab showing?) - cannot "
+                                   "seed the current exposure")
+        sent = self._move_exposure(iso_v, n, settle_s)
+        out = dict(iso=self._exp["iso"], shutter_s=self._exp["exposure_s"], sent=sent, verified=False)
+        if verify:
+            out.update(self.verify_exposure())
+        return out
+
+    def verify_exposure(self) -> dict:
+        """Read the HAL (~3 s) and check it against the tracked exposure. The tracker is re-seeded from the HAL (the
+        truth) either way; a disagreement raises :class:`Unachievable`."""
+        want = dict(self._exp) if self._exp else None
+        got = self._read_hal_exposure(tries=1)
+        self._exp = got
+        if got is None:
+            raise Unachievable("camera HAL has no live request - exposure cannot be verified")
+        bad = _exposure_mismatch(want, got) if want else []
+        if bad:
+            raise Unachievable("camera HAL disagrees with the exposure set: " + "; ".join(bad))
+        return dict(verified=True, hal=dict(iso=got["iso"], exposure_s=got["exposure_s"]))
+
+    def exposure_check(self, state: dict) -> list[str]:
+        """Clip-stop check: the tracked exposure vs the HAL in ``state`` (a :meth:`state` taken at stop). Re-seeds the
+        tracker from that HAL reading. Returns problems (evidence), never raises."""
+        want = self._exp
+        if not want:
+            return []
+        hal = (state or {}).get("hal") or {}
+        if not hal.get("open") or hal.get("iso") is None or hal.get("exposure_s") is None:
+            self._exp = None
+            return ["exposure not verifiable at clip stop: the camera HAL had no live request"]
+        got = dict(iso=hal["iso"], exposure_s=hal["exposure_s"], source="hal")
+        self._exp = got
+        bad = _exposure_mismatch(want, got)
+        return [f"camera HAL at clip stop disagrees with the exposure set ({want.get('source')}): " + "; ".join(bad)] \
+            if bad else []
 
     def _set_lens(self, want: str) -> None:
         cams = self.api.get("/lens/cameras")["cameras"]
@@ -262,6 +438,7 @@ class BlackmagicBackend(CameraBackend):
             raise Unachievable(f"lens {want!r} not available; cameras: "
                                f"{[(c['id'], c['facing'], c['zoomFactor']) for c in cams]}")
         if not pick["isActive"]:
+            self._exp = None                                  # new camera session: exposure unknown until re-read
             self.api.put("/lens/cameras/active", {"id": pick["id"]})
             for _ in range(20):
                 time.sleep(0.5)
@@ -289,6 +466,7 @@ class BlackmagicBackend(CameraBackend):
         body.update(codec=codec, frameRate=fps_txt, recordResolution=entry["recordResolution"],
                     sensorResolution=entry["sensorResolution"], offSpeedEnabled=False)
         if (cur["codec"], cur["frameRate"], cur["recordResolution"]) != (codec, fps_txt, entry["recordResolution"]):
+            self._exp = None                                  # new camera session: exposure unknown until re-read
             self.api.put("/system/format", body)
             time.sleep(2.5)                                   # session restarts
 
@@ -306,7 +484,7 @@ class BlackmagicBackend(CameraBackend):
             got = hal["iso"] if hal["open"] and hal["iso"] else st["iso"]
             if abs(got - s.iso) / s.iso > ISO_TOL:      # HAL sensitivity is quantised by the gain steps (400 -> 396/398)
                 bad.append(f"ISO {got} != {s.iso}")
-        if s.shutter_s is not None and st["shutter_s"] and abs(st["shutter_s"] - s.shutter_s) / s.shutter_s > 0.01:
+        if s.shutter_s is not None and st["shutter_s"] and abs(st["shutter_s"] - s.shutter_s) / s.shutter_s > EXPOSURE_TOL:
             bad.append(f"exposure {st['shutter_s']:.6f} s != {s.shutter_s:.6f} s")
         if (s.iso is not None or s.shutter_s is not None) and hal["open"] and not hal["ae_off"]:
             bad.append("camera HAL still has auto-exposure on")

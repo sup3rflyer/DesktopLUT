@@ -28,7 +28,9 @@ class CameraBackend(ABC):
 
     @abstractmethod
     def state(self) -> dict:
-        """Backend-neutral snapshot: fps, size, codec, iso, shutter_s, wb_k, focus, lens, recording, ... (best effort)."""
+        """Backend-neutral snapshot: fps, size, codec, iso, shutter_s, wb_k, focus, lens, recording, ... (best effort),
+        plus ``hal`` (camera-service read-back incl. ``request``: EVERY key of the live request, vendor tags too) and,
+        where the app has a settings API, ``app`` (its settings verbatim). Manifests keep it at clip start and stop."""
 
     @abstractmethod
     def apply(self, s: Settings) -> dict:
@@ -46,6 +48,20 @@ class CameraBackend(ABC):
     def clip_time(self, token: dict | None = None) -> float | None:
         """Seconds into the running clip, or None if this backend cannot say."""
         return None
+
+    def expose(self, iso: int | None = None, shutter_s: float | None = None, *, verify: bool = False) -> dict:
+        """Change ISO / exposure time (e.g. exposure segments inside one clip). Backends with a fast tracked path
+        (:class:`~dlc.phone.blackmagic.BlackmagicBackend`) override this; the default is the verified :meth:`apply`.
+        Returns ``{iso, shutter_s, verified, ...}``."""
+        st = self.apply(Settings(iso=iso, shutter_s=shutter_s))
+        hal = st.get("hal") or {}
+        return dict(iso=hal.get("iso", st.get("iso")), shutter_s=hal.get("exposure_s", st.get("shutter_s")),
+                    verified=True)
+
+    def exposure_check(self, state: dict) -> list[str]:
+        """Problems when the exposure this backend believes it set disagrees with the HAL in ``state`` (taken at clip
+        stop). Default: nothing tracked, nothing to check."""
+        return []
 
     def describe(self) -> dict:
         return dict(name=self.name, max_fps=self.max_fps, media_dir=self.media_dir,

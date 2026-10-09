@@ -9,7 +9,9 @@ Layers (each importable and testable alone):
 * :mod:`.blackmagic` - Blackmagic Camera REST backend (<= 60 fps; deterministic, preferred).
 * :mod:`.mcpro` / :mod:`.mcpro_backend` - mcpro24fps UI driver / backend (120-240 fps constrained high speed).
 * :mod:`.clip`       - ffprobe the recorded file and check it against what the run asked for.
-* :mod:`.session`    - :class:`PhoneRig`: ``set()`` / ``recording()`` / ``capture()`` -> verified clip + manifest.
+* :mod:`.session`    - :class:`PhoneRig`: ``set()`` / ``expose()`` / ``recording()`` / ``capture()`` -> verified clip +
+  manifest (full camera state at clip start and stop) + session summary.
+* :mod:`.evidence`   - flatten / diff camera states: what changed between or during clips (warnings, never a gate).
 * :mod:`.analysis`   - clip -> numbers: frames on container pts, ROI series, mean frames, fiducial homography,
   sync edges, tone curves (needs numpy; imported lazily so the control surface stays dependency-free).
 
@@ -21,7 +23,7 @@ based ``agent_phone*.py`` tools at the repo root are superseded by this for new 
 from .adb import Adb, AdbError
 from .clip import ClipInfo, check, probe
 from .mcpro import Mcpro, McproError, McState
-from .session import Capture, Mark, PhoneRig, Recording
+from .session import Capture, Mark, PhoneRig, Recording, session_summary
 from .settings import BackendError, Settings, Unachievable, Unsupported
 
 # dlc.phone.analysis needs numpy (+ scipy for geometry): exported lazily so `import dlc.phone` stays dependency-free.
@@ -39,4 +41,5 @@ def __getattr__(name):
 
 
 __all__ = ["Adb", "AdbError", "BackendError", "Capture", "ClipInfo", "Mark", "Mcpro", "McproError", "McState",
-           "PhoneRig", "Recording", "Settings", "Unachievable", "Unsupported", "check", "probe", *_ANALYSIS]
+           "PhoneRig", "Recording", "Settings", "Unachievable", "Unsupported", "check", "probe", "session_summary",
+           *_ANALYSIS]

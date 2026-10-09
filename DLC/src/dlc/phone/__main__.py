@@ -7,6 +7,8 @@
     rec mark  NAME [key=value ...]           ... timestamp an event against it (host time + clip timecode) ...
     rec stop                                 ... stop, pull, verify, write <label>.json
     rec status                               is a recording active?
+    summary                                  the out dir's session summary: clips, problems, WARNINGS (camera settings
+                                             that changed between / during clips - evidence to judge, not a gate)
 
 settings: --fps N  --size WxH  --codec h264|hevc  --iso N  --shutter 1/120  --wb K  --tint N  --focus 0..1
           --lens main|uw|tele|<id>  --backend blackmagic|mcpro      (fps <= 60 -> Blackmagic REST, above -> mcpro)
@@ -20,7 +22,7 @@ import json
 import sys
 from pathlib import Path
 
-from .session import PhoneRig
+from .session import PhoneRig, session_summary
 from .settings import BackendError, parse_shutter, parse_size
 
 DEFAULT_OUT = "results/_phone_captures"
@@ -58,7 +60,8 @@ def _out(obj) -> None:
 
 
 def _capture_json(cap) -> dict:
-    return dict(ok=cap.ok, problems=cap.problems, clip=str(cap.local), manifest=str(cap.manifest),
+    return dict(ok=cap.ok, problems=cap.problems, warnings=cap.warnings, changed_vs_prev=sorted(cap.changed_vs_prev),
+                changed_during=sorted(cap.changed_during), clip=str(cap.local), manifest=str(cap.manifest),
                 summary=cap.info.summary(), marks=[dict(label=m.label, clip_s=m.clip_s, t_host=m.t_host)
                                                    for m in cap.marks])
 
@@ -84,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     mk.add_argument("--out", default=DEFAULT_OUT)
     for n in ("stop", "status"):
         rs.add_parser(n).add_argument("--out", default=DEFAULT_OUT)
+    sub.add_parser("summary").add_argument("--out", default=DEFAULT_OUT)
     a = ap.parse_args(argv)
 
     try:
@@ -92,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if a.cmd == "set":
             _out(_rig(a).set(**_settings(a)))
+            return 0
+        if a.cmd == "summary":
+            _out(session_summary(a.out))                         # reads the out dir only - no device needed
             return 0
         if a.cmd == "capture":
             cap = _rig(a).capture(a.label, a.seconds, **_settings(a))
