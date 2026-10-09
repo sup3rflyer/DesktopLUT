@@ -224,8 +224,8 @@ def test_recorded_d1_run_reproduces_the_study_score():
 
 def test_noise_aware_variant_flags_noise_limited_signals_and_corrects_in_quadrature():
     a, b, c = (0.05, 0.05, 0.05), (0.5, 0.5, 0.5), (0.6, 0.3, 0.3)
-    y = 0.02
-    # a: 4 near-black reads scattered far more than its scored E → noise-limited; b: tight repeats → not;
+    y = 0.2      # above the meter floor (0.05 nit fallback): at/below it a spread is no noise estimate
+    # a: 4 dark reads scattered far more than its scored E → noise-limited; b: tight repeats → not;
     # c: a single read → no noise evidence ("noise unknown")
     reads_a = [(y * 0.95, y, y * 1.09), (y * 1.4, y * 0.8, y * 0.7), (y * 0.6, y * 1.3, y * 1.6), (y, y, y)]
     reads_b = [(47.5, 50.0, 54.5), (47.51, 50.01, 54.49)]
@@ -272,3 +272,129 @@ def test_read_noise_se_in_both_metrics():
     assert cs.read_noise_se(reads[:1], rows=1, is_hdr=True) is None
     # identical reads: floored at the meter's print quantisation, never a proof of zero noise
     assert cs.read_noise_se([reads[0], reads[0]], rows=1, is_hdr=True)["se"] > 0
+
+
+# ---------------------------------------------------------------------------------------------
+# read evidence = the reads the SCORED value rests on (final adopted round, loop-kept reads only)
+# ---------------------------------------------------------------------------------------------
+def _loop_stream(path: Path, rounds):
+    """Drive the REAL measure loop: ``rounds`` = [(rgb8, phase, [xyz, ...], min_reads), ...] — each a
+    measure_patch round of label p<rgb> reading the listed XYZ in turn. Returns the NDJSON path."""
+    from dlc.engine.patches import Transfer, to_signal
+    from dlc.measure_loop import MeasureLoopConfig, MeasurePatch, Reading, _Loop, _NdjsonWriter
+
+    t = Transfer.power(2.2, 120.0, bit_depth=8)
+    queue: list = []
+
+    def measure(_patch):
+        xyz = queue.pop(0)
+        return Reading(xyz=xyz, yxy=(xyz[1], 0.31, 0.33), ok=True)
+
+    loop = _Loop(patches=[], transfer=t, measure=measure, config=MeasureLoopConfig(dark_min_reads=1),
+                 ndjson=_NdjsonWriter(path), events=None, dip=None)
+    for rgb, phase, reads, min_reads in rounds:
+        queue[:] = list(reads)
+        patch = MeasurePatch(label="p" + "_".join(map(str, rgb)), rgb=rgb, signal=to_signal([rgb], t)[0],
+                             bit_depth=8, seq=0, min_reads=min_reads)
+        loop.measure_patch(patch, phase=phase, disposition=("appended" if phase == "remeasure" else None))
+        assert not queue, "the loop took fewer reads than scripted"
+    return path
+
+
+def _strip_round_records(src: Path, dst: Path) -> Path:
+    rows = [ln for ln in src.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and json.loads(ln).get("role") != "measurement_round"]
+    dst.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    return dst
+
+
+def test_a_re_measured_signal_rests_on_its_final_round_only(tmp_path: Path):
+    # BenQ 2026-09-26 [42,42,85]: the scored value is the single warm re-measure read; pooling the cold
+    # main read made it "two-read" with an SE that was really drift → flagged noise-limited, E_corr → 0.
+    rgb = (42, 42, 85)
+    cold, warm = (2.00, 2.10, 4.00), (2.08, 2.20, 4.25)
+    nd = _loop_stream(tmp_path / "v.ndjson", [(rgb, "main", [cold], 0), (rgb, "remeasure", [warm], 0)])
+    key = signal_key([c / 255 for c in rgb])
+    for path, basis in ((nd, "loop"), (_strip_round_records(nd, tmp_path / "old.ndjson"), "reconstructed")):
+        final = cs.final_round_reads(path, 255)
+        assert final.basis == basis and final.reads[key] == [warm] and final.counts[key] == 1
+        assert cs.read_counts_from_ndjson(path, 255)[key] == 1 and cs.reads_from_ndjson(path, 255)[key] == [warm]
+    final = cs.final_round_reads(nd, 255)
+    m = PatchMetric(tuple(c / 255 for c in rgb), warm, tuple(c * 1.001 for c in warm), 0.031, False)
+    ev = ReadEvidence(reads=final.counts, read_xyz=final.reads, loop_round_se=final.loop_se,
+                      reads_basis=final.describe())
+    out = practical_summary([m], is_hdr=False, content_weights=ContentWeights({key: 1.0}, label="f"),
+                            read_evidence=ev)["content_weighted"]
+    assert out["noise"]["n_noise_limited"] == 0 and out["noise"]["per_signal"] == []
+    assert out["patch_weights"]["score_bias_corrected"] == out["patch_weights"]["score"] == 0.031
+    assert out["patch_weights"]["weight_share"]["noise_unknown"] == 1.0
+    assert out["evidence"]["n_single_read"] == 1 and out["evidence"]["reads_basis"].startswith("meter reads")
+
+
+def test_a_glitch_the_loop_rejected_is_not_read_noise(tmp_path: Path):
+    # The loop drops a +30 % glitch (its own SE ~0.01 dE2000); the noise evidence must not resurrect it.
+    rgb = (128, 128, 128)
+    clean = (19.0, 20.0, 21.8)
+    jit = [clean, (19.01, 20.01, 21.81), (19.0 * 1.3, 26.0, 21.8 * 1.3), (18.99, 19.99, 21.79), clean, clean]
+    nd = _loop_stream(tmp_path / "v.ndjson", [(rgb, "main", jit, 5)])
+    key = signal_key([c / 255 for c in rgb])
+    rnd = [json.loads(ln) for ln in nd.read_text(encoding="utf-8").splitlines() if "measurement_round" in ln][0]
+    assert len(rnd["rejected_seqs"]) == 1 and rnd["se_de"] < 0.05
+    mean = tuple(sum(r[i] for r in jit if r[1] < 25) / 5 for i in range(3))
+    m = PatchMetric(tuple(c / 255 for c in rgb), mean, mean, 0.4, True)
+    for path in (nd, _strip_round_records(nd, tmp_path / "old.ndjson")):        # loop records + the fallback
+        final = cs.final_round_reads(path, 255)
+        assert final.counts[key] == 5 and all(r[1] < 25 for r in final.reads[key])
+        for is_hdr in (False, True):
+            ev = ReadEvidence(reads=final.counts, read_xyz=final.reads, loop_round_se=final.loop_se)
+            out = practical_summary([m], is_hdr=is_hdr, content_weights=ContentWeights({key: 1.0}, label="f"),
+                                    read_evidence=ev)["content_weighted"]
+            (row,) = out["noise"]["per_signal"]
+            assert row["noise_se"] < 0.05 and row["noise_limited"] is False, (path.name, is_hdr, row)
+    # SDR prefers the loop's own SE (its round record) over re-deriving it
+    final = cs.final_round_reads(nd, 255)
+    out = practical_summary([m], is_hdr=False, content_weights=ContentWeights({key: 1.0}, label="f"),
+                            read_evidence=ReadEvidence(reads=final.counts, read_xyz=final.reads,
+                                                       loop_round_se=final.loop_se))["content_weighted"]
+    assert out["noise"]["per_signal"][0]["basis"].startswith("measure-loop round SE")
+
+
+def test_reads_at_the_meter_floor_are_noise_unknown_not_low_noise():
+    # D1 [3,3,3]: two agreeing early-stop reads of 0,0,0 gave SE 0.0175 → "0 % noise-limited". At or below
+    # the meter floor a read spread is no noise estimate: noise_unknown, E kept.
+    dark, mid = (0.003, 0.003, 0.003), (0.5, 0.5, 0.5)
+    d_xyz, m_xyz = (0.0, 0.0, 0.0), (47.5, 50.0, 54.5)
+    metrics = [PatchMetric(dark, d_xyz, (0.0019, 0.002, 0.0022), 0.9, True),
+               PatchMetric(mid, m_xyz, m_xyz, 0.8, True)]
+    ev = ReadEvidence(reads={signal_key(dark): 2, signal_key(mid): 2},
+                      read_xyz={signal_key(dark): [d_xyz, d_xyz], signal_key(mid): [m_xyz, (47.51, 50.01, 54.49)]})
+    out = practical_summary(metrics, is_hdr=True, content_weights=ContentWeights(
+        {signal_key(dark): 0.5, signal_key(mid): 0.5}, label="f"), read_evidence=ev)["content_weighted"]
+    noise = out["noise"]
+    assert [r["rgb"] for r in noise["per_signal"]] == [[0.5, 0.5, 0.5]]
+    assert noise["n_unknown_at_floor"] == 1 and "meter floor" in noise["unknown_rule"]
+    assert out["patch_weights"]["weight_share"]["noise_unknown"] == 0.5
+
+
+def test_evidence_failures_are_recorded_never_raised(monkeypatch):
+    rng = np.random.default_rng(3)
+    a, b = (0.2, 0.2, 0.2), (0.6, 0.3, 0.3)
+    metrics = [PatchMetric(a, (20.0, 21.0, 23.0), (20.0, 21.0, 23.0), 0.5, True),
+               PatchMetric(b, (30.0, 20.0, 15.0), (30.0, 20.0, 15.0), 1.2, False)]
+    cw = ContentWeights({signal_key(a): 0.5, signal_key(b): 0.5}, label="f")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic failure")
+
+    monkeypatch.setattr(cs, "nominal_signal_xyz", boom)
+    import dlc.metrics as metrics_mod
+
+    monkeypatch.setattr(metrics_mod, "_signal_noise", boom)
+    out = practical_summary(metrics, is_hdr=True, content_weights=cw, content=[_content(rng)])
+    block = out["content_weighted"]
+    assert {e["part"] for e in block["errors"]} == {"noise", "nominal_location"}
+    assert block["patch_weights"]["score"] == round((0.5 * 0.5 + 0.5 * 1.2), 3)       # the rest still reports
+    assert "core" in out and json.dumps(out, allow_nan=False)
+    monkeypatch.setattr(metrics_mod, "content_weighted_summary", boom)
+    out = practical_summary(metrics, is_hdr=True, content_weights=cw)
+    assert "synthetic failure" in out["content_weighted"]["error"] and "core" in out

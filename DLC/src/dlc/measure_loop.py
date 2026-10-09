@@ -97,9 +97,10 @@ class MeasurePatch:
     the presenter's own settle — set by the loop's luminance-jump settle bump when
     the presented luminance drops sharply (FALD zone decay/glow after a bright
     patch); presenters honor it, synthetic measure fns are free to ignore it.
-    ``min_reads`` is a per-patch MINIMUM accepted (inlier) read count requested by the caller (a
-    verify patches file's ``reads``); 0 = none. It raises the patch's read floor and is never
-    shortened by the dark-floor early stop."""
+    ``min_reads`` is a per-patch accepted (inlier) read count set by the caller (a verify patches
+    file's ``reads``); 0 = none (the loop's own policy). It REPLACES the dark near-neutral floor
+    (``dark_min_reads``) for this patch and binds as a minimum in every stop path; the global /
+    bright-neutral floors and the DIP's SNR escalation still apply."""
 
     label: str
     rgb: tuple[int, int, int]
@@ -438,6 +439,36 @@ def _median_xyz(vals: Sequence[tuple[float, float, float]]) -> tuple[float, floa
         m = len(xs) // 2
         return xs[m] if len(xs) % 2 else 0.5 * (xs[m - 1] + xs[m])
     return (med([v[0] for v in vals]), med([v[1] for v in vals]), med([v[2] for v in vals]))
+
+
+def robust_inlier_mask(reads: Sequence[tuple[float, float, float]], white: Optional[tuple[float, float, float]],
+                       *, sigma: Optional[float] = None, outlier_factor: float = 3.0,
+                       outlier_floor_de: float = 0.5) -> list[bool]:
+    """The measure loop's glitch-rejection rule (one definition, used by the loop and by offline
+    replays of an older stream): with ≥3 reads, a read whose ΔE2000 from the patch *median* exceeds
+    ``outlier_factor × σ`` (σ = the DIP's per-read σ, else the sample's median absolute deviation) —
+    floored at ``outlier_floor_de`` — is a glitch (``False``). Below 3 reads every read counts; if the
+    rule would reject every read, every read counts. ``white`` is the Lab anchor (``None`` → the median)."""
+    n = len(reads)
+    if n < 3:
+        return [True] * n
+    med = _median_xyz(reads)
+    anchor = white or med
+    devs = [_agreement_de(r, med, anchor) for r in reads]
+    spread = sigma
+    if spread is None:
+        spread = sorted(devs)[n // 2]   # median absolute deviation, in ΔE
+    thr = max(outlier_floor_de, outlier_factor * (spread or 0.0))
+    mask = [d <= thr for d in devs]
+    return mask if any(mask) else [True] * n
+
+
+# The per-round control row ``measure_patch`` appends to ``measurements.ndjson`` after each round of
+# one patch (no ``seq`` — not a read): which reads the loop KEPT (``inlier_seqs``), which it rejected
+# as glitches, whether the round's value became the patch's accepted value (``adopted``), and the
+# loop's own SE of that mean. Per-read rows keep ``accepted: true`` = "a measurement read" (written
+# before the round's decision exists); this row is the decision.
+MEASUREMENT_ROUND_ROLE = "measurement_round"
 
 
 def noise_sidecar_path(ti3_path: Path) -> Path:
@@ -932,6 +963,7 @@ class _Loop:
         self.accepted: dict[str, AcceptedRead] = {}
         self.appended_queue: list[MeasurePatch] = []
         self.seq_counter = 0            # running probe-read index (every read)
+        self._last_read_seq: Optional[int] = None   # seq of the latest _read (measure_patch's round record)
         self.drift_episodes = 0
         self.drift_checkpoints: list[dict[str, Any]] = []
         self.drift_density_exceeded = False
@@ -1335,6 +1367,7 @@ class _Loop:
         reading, jump_settle_s = self._present_and_measure(patch)
         seq = self.seq_counter
         self.seq_counter += 1
+        self._last_read_seq = seq
         record: dict[str, Any] = {
             "t": _now(),
             "seq": seq,
@@ -1426,15 +1459,15 @@ class _Loop:
             return None
         if n < 3:
             return (_mean_xyz(reads), self._sample_se_de(reads), n, 0)
-        med = _median_xyz(reads)
-        white = self.white_xyz or med
-        spread = sigma
-        if spread is None:
-            devs = sorted(_agreement_de(r, med, white) for r in reads)
-            spread = devs[len(devs) // 2]   # median absolute deviation, in ΔE
-        thr = max(self.cfg.outlier_floor_de, self.cfg.outlier_factor * (spread or 0.0))
-        inliers = [r for r in reads if _agreement_de(r, med, white) <= thr] or list(reads)
+        inliers = [r for r, keep in zip(reads, self._inlier_mask(reads, sigma=sigma)) if keep]
         return (_mean_xyz(inliers), self._sample_se_de(inliers), len(inliers), n - len(inliers))
+
+    def _inlier_mask(self, reads: Sequence[tuple[float, float, float]],
+                     *, sigma: Optional[float] = None) -> list[bool]:
+        """Which of ``reads`` the accepted mean keeps (:func:`robust_inlier_mask` with this loop's
+        config and current white anchor) — the same decision :meth:`_robust_stats` averages over."""
+        return robust_inlier_mask(reads, self.white_xyz, sigma=sigma, outlier_factor=self.cfg.outlier_factor,
+                                  outlier_floor_de=self.cfg.outlier_floor_de)
 
     def _se_count_floor(self, reads: Sequence[tuple[float, float, float]],
                         quantum: Optional[CountQuantum]) -> float:
@@ -2071,32 +2104,39 @@ class _Loop:
         ``neutral_min_reads`` on a near-neutral patch (gated to ``neutral_floor_min_nits`` and
         brighter) so the chroma-critical region is averaged where it pays off — fast, larger-σ
         reads — without multiplying the slow dim patches. The DIP still escalates above this where
-        measured σ demands it."""
+        measured σ demands it.
+
+        A caller's per-patch read count (``patch.min_reads`` > 0 — a verify patches file's ``reads``)
+        REPLACES the dark near-neutral floor for that patch (sequence study 2026-10-09: per-read noise
+        is ~flat down to 0.005 nit, so extra dark reads buy ~nothing): it binds as a minimum in every
+        stop path, and ``dark_min_reads`` no longer adds reads to it. Patches without a request keep
+        the dark floor unchanged."""
         floor = self.cfg.min_reads
+        requested = int(patch.min_reads or 0)
         if self._is_near_neutral(patch):
             nits = self._expected_patch_nits(patch)
             # Bright near-neutral floor (largest luminance σ, fast reads).
             if self.cfg.neutral_min_reads > floor and nits >= self.cfg.neutral_floor_min_nits:
                 floor = self.cfg.neutral_min_reads
-            # Dark near-neutral floor (estimate the CHROMA spread that drives dark-level trust).
-            if self.cfg.dark_min_reads > floor and nits <= self.cfg.dark_floor_max_nits:
+            # Dark near-neutral floor (estimate the CHROMA spread that drives dark-level trust) —
+            # only where the caller did not set this patch's read count.
+            if not requested and self.cfg.dark_min_reads > floor and nits <= self.cfg.dark_floor_max_nits:
                 floor = self.cfg.dark_min_reads
-        # The caller's per-patch request (a verify patches file's ``reads``) is a floor too.
-        return max(floor, int(patch.min_reads or 0))
+        return max(floor, requested)
 
     def _dark_floor_binds(self, patch: MeasurePatch) -> bool:
         """True when the DARK read floor is what raised this patch's read count above the global
         minimum — the only floor ``dark_agree_reads`` may satisfy early (the bright near-neutral
-        floor averages for SNR and is never shortened)."""
-        if not self._is_near_neutral(patch):
+        floor averages for SNR and is never shortened). Never for a patch with a caller-set read
+        count: that count replaces the dark floor (:meth:`_read_floor_for`)."""
+        if int(patch.min_reads or 0) > 0 or not self._is_near_neutral(patch):
             return False
         nits = self._expected_patch_nits(patch)
         if not (self.cfg.dark_min_reads > self.cfg.min_reads and nits <= self.cfg.dark_floor_max_nits):
             return False
         bright_floor = (self.cfg.neutral_min_reads
                         if nits >= self.cfg.neutral_floor_min_nits else self.cfg.min_reads)
-        # A per-patch request is never shortened: the dark floor binds only above it.
-        return self.cfg.dark_min_reads > max(bright_floor, int(patch.min_reads or 0))
+        return self.cfg.dark_min_reads > bright_floor
 
     def _abnormal_reads(self, target_n: Optional[int]) -> int:
         """The read count past which a patch is *abnormal* and must be FLAGGED (not
@@ -2114,7 +2154,13 @@ class _Loop:
         ``read_tolerance_de`` — an abnormal patch the LLM must adjudicate."""
         cfg = self.cfg
         reads: list[tuple[float, float, float]] = []
+        read_seqs: list[Optional[int]] = []     # the NDJSON seq of each entry of ``reads`` (round record)
+        unreadable_seqs: list[Optional[int]] = []
         yxys: list[tuple[float, float, float]] = []
+        # The caller's per-patch minimum (a verify patches file's ``reads``) binds EVERY stop path below
+        # except the abnormal FLAG (which only fires past 2x the target, itself >= this minimum).
+        min_inliers = max(0, int(patch.min_reads or 0))
+        stop = "abnormal"
         target_n: Optional[int] = None          # DIP-predicted reads for SNR (set on first valid read)
         dip_n: Optional[int] = None             # the DIP's own SNR read target (None ⇒ no DIP)
         dark_bound = False                      # the DARK floor set target_n (⇒ dark_agree_reads may satisfy it early)
@@ -2133,7 +2179,10 @@ class _Loop:
                 disposition=("immediate" if read_index else disposition),
             )
             read_index += 1
+            if r.xyz is None:
+                unreadable_seqs.append(self._last_read_seq)
             if r.xyz is not None:
+                read_seqs.append(self._last_read_seq)
                 anomaly = self._read_plausibility_anomaly(
                     patch, r.xyz, phase=phase, read_index=read_index - 1
                 )
@@ -2166,12 +2215,15 @@ class _Loop:
             # Dark-floor early stop: the floor's job is a chroma-spread ESTIMATE, which two agreeing
             # reads already provide (conservatively). Requires a clean cluster (no outliers), the
             # DIP's own SNR target met, and agreement within tolerance — a disagreeing pair keeps
-            # reading to the floor and beyond exactly as before. Never shortens the BRIGHT floor.
+            # reading to the floor and beyond exactly as before. Never shortens the BRIGHT floor, nor
+            # the caller's per-patch minimum (``min_inliers``, whatever the dark floor's size).
             if (dark_bound and cfg.dark_agree_reads > 0
                     and n_inliers >= cfg.dark_agree_reads
                     and n_inliers >= (dip_n or 0)
+                    and n_inliers >= min_inliers
                     and outliers == 0
                     and se is not None and se <= cfg.read_tolerance_de):
+                stop = "dark_agree"
                 break
 
             # Converge only on a CLEAN cluster: enough inlier reads at the SNR target,
@@ -2179,9 +2231,10 @@ class _Loop:
             # one-off transient is tolerated (resolved by the surviving inliers), but a
             # patch that is *mostly* outliers — bimodal / ping-ponging / genuinely
             # unstable — must FLAG, not be silently resolved by majority vote.
-            if (target_n is not None and n_inliers >= target_n
+            if (target_n is not None and n_inliers >= max(target_n, min_inliers)
                     and (se is None or se <= cfg.read_tolerance_de)
                     and outliers <= max(1, read_index // 4)):
+                stop = "converged"
                 break
 
             # Abnormal: too many reads for this luminance band ⇒ FLAG, do not cap silently.
@@ -2198,6 +2251,9 @@ class _Loop:
         # Accept the outlier-rejected MEAN (averaging the inliers IS the SNR win; a gross
         # glitch is dropped, not diluted in); a sentinel hole if nothing usable came back.
         st = self._robust_stats(reads, sigma=sigma)
+        # The loop's own keep/reject decision for this round's reads (the SAME rule and white anchor
+        # _robust_stats just averaged over) — written to the round record below.
+        keep_mask = self._inlier_mask(reads, sigma=sigma) if reads else []
         if st:
             accepted_xyz = st[0]
             accepted_yxy = _mean_xyz(yxys) if yxys else None
@@ -2213,6 +2269,7 @@ class _Loop:
         immediate = max(0, read_index - 1)
         round_usable = usable                       # whether THIS round produced a usable value
         record = self.accepted.get(patch.label)
+        adopted = record is None or round_usable or not record.usable
         if record is None:
             record = AcceptedRead(
                 patch=patch, xyz=accepted_xyz, yxy=accepted_yxy,
@@ -2246,9 +2303,37 @@ class _Loop:
             record.chroma_sigma = accepted_chroma_sigma
             record.noise_reads = read_index
             record.round_reads = tuple(reads)
+        self._emit_round_record(patch, phase=phase, read_seqs=read_seqs, keep_mask=keep_mask,
+                                unreadable_seqs=unreadable_seqs, se=accepted_se, adopted=adopted,
+                                usable=round_usable, unstable=unstable, stop=stop, target_n=target_n)
         if round_usable:
             self._check_read_integrity(patch, accepted_xyz)
         return record
+
+    def _emit_round_record(self, patch: MeasurePatch, *, phase: str, read_seqs: Sequence[Optional[int]],
+                           keep_mask: Sequence[bool], unreadable_seqs: Sequence[Optional[int]],
+                           se: Optional[float], adopted: bool, usable: bool, unstable: bool, stop: str,
+                           target_n: Optional[int]) -> None:
+        """Append the round's DECISION to ``measurements.ndjson`` (:data:`MEASUREMENT_ROUND_ROLE`): the
+        seqs of the reads the accepted mean kept / rejected as glitches / that returned no XYZ, whether
+        this round's value is now the patch's accepted value (``adopted`` — a later adopted round of the
+        same label supersedes it; a re-measure that yields nothing usable is NOT adopted and the prior
+        round stands), the loop's own raw SE of the kept mean (ΔE2000 against ``se_white_y``, the loop's
+        running white at the time — not count-floored; the noise sidecar holds the floored final value)
+        and why the round stopped. A control row: no ``seq``, not mirrored as a read."""
+        kept = [s for s, k in zip(read_seqs, keep_mask) if k]
+        rejected = [s for s, k in zip(read_seqs, keep_mask) if not k]
+        white = self.white_xyz
+        self.ndjson.emit({
+            "t": _now(), "phase": phase, "role": MEASUREMENT_ROUND_ROLE, "label": patch.label,
+            "rgb": list(patch.rgb), "signal": [round(s, 6) for s in patch.signal],
+            "read_seqs": list(read_seqs), "inlier_seqs": kept, "rejected_seqs": rejected,
+            "unreadable_seqs": list(unreadable_seqs), "n_inliers": len(kept),
+            "se_de": (round(float(se), 6) if se is not None else None),
+            "se_white_y": (round(float(white[1]), 6) if white else None),
+            "adopted": bool(adopted), "usable": bool(usable), "unstable": bool(unstable), "stop": stop,
+            "target_reads": target_n, "min_reads": int(patch.min_reads or 0),
+        })
 
     # -- main pass ---------------------------------------------------------
 
@@ -2889,6 +2974,17 @@ def _read_anomaly_repeatability(
         "stable_spread_threshold": cfg.anomaly_stable_spread,
         "groups": out_groups[:8],
     }
+
+
+def planned_read_floors(patches: Sequence[tuple[int, int, int]], transfer: Transfer, config: MeasureLoopConfig,
+                        *, patch_min_reads: Optional[Sequence[int]] = None) -> list[int]:
+    """The read FLOOR the loop will apply to each of ``patches`` before its first read (the same
+    :meth:`_Loop._read_floor_for` the measurement uses: global / bright-neutral / dark floors, a
+    caller-set per-patch count replacing the dark one). A plan-time lower bound: the DIP's SNR
+    escalation, glitch re-reads and drift re-measures only add to it. Reads nothing."""
+    loop = _Loop(patches=list(patches), transfer=transfer, measure=lambda _p: Reading(xyz=None, ok=False),
+                 config=config, ndjson=_NdjsonWriter(None), events=None, patch_min_reads=patch_min_reads)
+    return [loop._read_floor_for(p) for p in loop.patches]
 
 
 def run_measure_loop(

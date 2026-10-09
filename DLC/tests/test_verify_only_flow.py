@@ -1339,3 +1339,85 @@ def test_verify_patches_file_rejects_bad_reads(tmp_path: Path):
     doc["reads"] = [None, 3]
     f.write_text(json.dumps(doc), encoding="utf-8")
     assert verify_only.load_patches_file(f)["reads"] == [None, 3]
+
+
+def _round_records(ndjson: Path) -> dict:
+    """label -> the last ADOPTED measurement_round record of a measure NDJSON."""
+    out: dict = {}
+    for ln in ndjson.read_text(encoding="utf-8").splitlines():
+        if ln.strip():
+            r = json.loads(ln)
+            if r.get("role") == "measurement_round" and r.get("adopted"):
+                out[r["label"]] = r
+    return out
+
+
+def test_file_reads_replace_dark_min_reads_and_the_plan_seam_states_the_real_plan(tmp_path: Path):
+    # A file patch's ``reads`` IS its read count: it replaces dark_min_reads (5 here, early stop off) in
+    # both directions; a patch without ``reads`` keeps the dark floor. The plan seam names the file order,
+    # the planned read total + its sub-1-nit share and the rule that set the counts — not "thermal order".
+    from dlc.measure_loop import MeasureLoopConfig
+
+    codes = [[900, 900, 900], [40, 40, 40], [500, 300, 250], [60, 60, 60]]
+    f = _patches_file(tmp_path / "reads.json", codes, weights=[0.1, 0.5, 0.2, 0.2])
+    doc = json.loads(f.read_text(encoding="utf-8"))
+    doc["reads"] = [None, 2, None, None]
+    f.write_text(json.dumps(doc), encoding="utf-8")
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    judge = _AutoExcept()
+    cfg = MeasureLoopConfig(dark_min_reads=5, dark_agree_reads=0, dark_floor_max_nits=5.0)
+    calib = _make(tmp_path, "vo_reads_rule", controller=ctrl, bit_depth=10, verify_patches_file=f,
+                  loop_config=cfg, adjudicator=judge)
+    assert calib.run("verify-only").status == "completed"
+    rounds = _round_records(calib.ctx.root / "measurements" / "verify.ndjson")
+    by_rgb = {tuple(r["rgb"]): r for r in rounds.values()}
+    assert by_rgb[(40, 40, 40)]["n_inliers"] == 2 and by_rgb[(40, 40, 40)]["min_reads"] == 2   # not 5
+    assert by_rgb[(60, 60, 60)]["n_inliers"] >= 5                                            # dark floor kept
+    listed = calib.calib["stages"]["verify-patches-file"]["digest"]
+    rule = listed["read_rule"]
+    assert rule["n_file_reads"] == 1 and rule["n_loop_policy"] == 3 and rule["dark_min_reads"] == 5
+    assert "replaces dark_min_reads 5" in rule["summary"]
+    (plan,) = [r for r in judge.requests if r.key == "resolve-target:plan"]
+    q = plan.question
+    assert "thermal order" not in q and "measured in the file's listed order" in q
+    planned = plan.digest["verify_only"]["verify_patches_file"]["planned_reads"]
+    assert planned["available"] and planned["total_reads_min"] >= 1 + 2 + 1 + 5
+    assert f">= {planned['total_reads_min']} meter reads planned" in q
+    assert planned["n_below_1_nit"] >= 2 and "below 1 nit" in q
+    assert f"read counts: {rule['summary']}" in q
+    assert plan.digest["verify_only"]["verify_patches_file"]["read_rule"] == rule
+
+
+def test_held_out_check_is_unavailable_for_sdr_content_on_an_hdr_display(tmp_path: Path):
+    # The installed HDR stack trained on PQ signals; 8-bit SDR gamma codes share no code space with them.
+    ctrl = _hdr_display_with_layers(tmp_path)
+    f = _patches_file(tmp_path / "sdr8.json", [[128, 128, 128], [200, 60, 40]], bit_depth=8)
+    judge = _AutoExcept()
+    calib = _make(tmp_path, "vo_sih_file", mode="HDR", controller=ctrl, panel=_sdr_in_hdr_panel(), bit_depth=8,
+                  content_mode="SDR", keep_layers=["desktop_gamma"], verify_patches_file=f, adjudicator=judge)
+    assert calib.run("verify-only").status == "completed"
+    held = calib.calib["stages"]["verify-patches-file"]["digest"]["held_out_check"]
+    assert held["available"] is False and "content mode SDR ≠ display mode HDR" in held["reason"]
+    (plan,) = [r for r in judge.requests if r.key == "resolve-target:plan"]
+    assert "held-out check unavailable (content mode SDR ≠ display mode HDR)" in plan.question
+    assert plan.digest["verify_only"]["verify_patches_file"]["held_out_check"] == held
+    assert not any("in-sample" in w for w in plan.digest.get("sdr_white_warnings") or ())
+
+
+def test_a_failing_content_evidence_block_never_fails_the_verify(tmp_path: Path, monkeypatch):
+    import dlc.metrics as metrics_mod
+
+    def boom(*_a, **_k):
+        raise RuntimeError("synthetic evidence failure")
+
+    monkeypatch.setattr(metrics_mod, "content_weighted_summary", boom)
+    ctrl = CalibrationController.mock()
+    _seed_stack(ctrl, cube=_cube(tmp_path / "prior.cube"))
+    f = _patches_file(tmp_path / "w.json", [[100, 100, 100], [400, 380, 360]], weights=[0.5, 0.5])
+    calib = _make(tmp_path, "vo_evidence_boom", controller=ctrl, bit_depth=10, verify_patches_file=f)
+    result = calib.run("verify-only")
+    assert result.status == "completed", result.digest
+    verify = calib.calib["stages"]["verify"]["digest"]
+    assert "synthetic evidence failure" in verify["practical"]["content_weighted"]["error"]
+    assert verify["gate"]["basis"].startswith("practical")

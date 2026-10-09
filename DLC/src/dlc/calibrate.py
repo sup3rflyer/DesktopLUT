@@ -3003,11 +3003,16 @@ class Calibration:
         plan_warnings: list[str] = []
         listed_digest = (((self.calib.get("stages") or {}).get("verify-patches-file") or {}).get("digest") or {}
                          if flow == "verify-only" else {})
+        file_plan: Optional[str] = None
         if listed_digest:
             digest["verify_only"]["verify_patches_file"] = {
                 k: listed_digest.get(k) for k in ("file", "n", "patches_fingerprint", "measurement_order",
-                                                  "min_reads", "content_class", "weighted", "held_out_check")}
+                                                  "min_reads", "read_rule", "content_class", "weighted",
+                                                  "held_out_check")}
             held = listed_digest.get("held_out_check") or {}
+            planned = self._file_planned_reads()
+            digest["verify_only"]["verify_patches_file"]["planned_reads"] = planned
+            file_plan = self._file_plan_text(listed_digest, planned, held)
             if held.get("n_fail"):
                 plan_warnings.append(
                     f"{held['n_fail']} of the file's {listed_digest.get('n')} patches sit < "
@@ -3069,8 +3074,9 @@ class Calibration:
             question=(f"Plan: {flow} calibration of monitor {self.monitor} "
                       f"({self.display.name}) to target '{target}' "
                       f"({transfer_label}, {spec.white.intent}, {nits_label}) — "
-                      f"{patch_plan['total_patches']} patches "
-                      f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). "
+                      + (f"{patch_plan['total_patches']} patches "
+                         f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). "
+                         if file_plan is None else file_plan)
                       + ("".join(f"⚠ {w}. " for w in plan_warnings))
                       + "Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
@@ -8785,9 +8791,7 @@ class Calibration:
                 held = {"available": False, "reason": f"check failed ({type(exc).__name__}: {exc})"}
             measured_fp = verify_only.patches_fingerprint(measure_codes)
             reads_rec = ({"n_patches": sum(1 for r in min_reads if r), "max": max(min_reads),
-                          "total_min_reads": int(sum(max(1, r) for r in min_reads)),
-                          "applied": "per-patch read floor in the measure loop (never shortened by the dark "
-                                     "early stop; the DIP may still escalate above it)"}
+                          "total_min_reads": int(sum(max(1, r) for r in min_reads))}
                          if min_reads else None)
             digest = {"file": doc["path"], "n": doc["n"], "patches_fingerprint": measured_fp,
                       "file_fingerprint": doc["patches_fingerprint"],
@@ -8795,6 +8799,7 @@ class Calibration:
                                             else f"{order} (re-sorted on request: --verify-patches-order)"),
                       "content_mode": doc["content_mode"], "bit_depth": doc["bit_depth"],
                       "content_class": doc["content_class"], "weighted": weighted, "min_reads": reads_rec,
+                      "read_rule": self._file_read_rule(min_reads, len(measure_codes)),
                       "coverage_gap_pct_as_drawn": doc.get("coverage_gap_pct") or None,
                       "held_out_check": held}
             data = {"path": doc["path"], "codes": measure_codes, "patches_fingerprint": measured_fp,
@@ -8817,6 +8822,82 @@ class Calibration:
                                  note="the file changed (or vanished) since this run loaded it — the memoised "
                                       "list is measured, unchanged")
         return outcome
+
+    def _file_planned_reads(self) -> dict[str, Any]:
+        """The verify patches file's planned meter reads: Σ of the loop's per-patch read floor
+        (:func:`dlc.measure_loop.planned_read_floors` — the file's ``reads`` where given, else the loop's
+        own floors) — a LOWER bound (the DIP's SNR escalation, glitch re-reads and drift re-measures add
+        to it) — and how many patches / reads sit below 1 nit nominal (Rec.709 luminance weights over
+        the content transfer's per-channel nits for SDR, Rec.2020 for PQ — the slow reads). No per-level
+        read-time model exists in DLC, so no duration is estimated. Evidence only; never raises."""
+        from .measure_loop import planned_read_floors
+
+        listed = self._verify_patches_file_record() or {}
+        codes = [tuple(int(c) for c in p) for p in listed.get("codes") or ()]
+        try:
+            transfer = self._transfer()
+            cfg = self.loop_config or self._loop_config_for(self._dip())
+            floors = planned_read_floors(codes, transfer, cfg, patch_min_reads=self._file_min_reads(codes))
+            k = (0.2627, 0.6780, 0.0593) if transfer.kind == "pq" else (0.2126, 0.7152, 0.0722)
+            dark = [i for i, p in enumerate(codes) if sum(w * transfer.cv_to_nits(c) for w, c in zip(k, p)) < 1.0]
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            return {"available": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return {"available": True, "total_reads_min": int(sum(floors)), "n_patches": len(codes),
+                "n_below_1_nit": len(dark), "reads_below_1_nit_min": int(sum(floors[i] for i in dark)),
+                "max_reads_per_patch": max(floors) if floors else 0,
+                "basis": ("lower bound = Σ per-patch read floors (file `reads` where given, else the loop's own "
+                          "floors); the DIP's SNR escalation, glitch re-reads and drift re-measures add to it. "
+                          "Below 1 nit = nominal Y (Rec.709 weights, Rec.2020 for PQ). No duration: DLC has no "
+                          "per-level read-time model")}
+
+    def _file_plan_text(self, listed_digest: Mapping[str, Any], planned: Mapping[str, Any],
+                        held: Mapping[str, Any]) -> str:
+        """The plan-seam question's description of a ``--verify-patches-file`` plan: the ACTUAL order,
+        the planned read total (and its sub-1-nit share), which rule set the read counts, and the
+        held-out check's status when it could not run."""
+        order = str(listed_digest.get("measurement_order") or "file (as listed)")
+        order_txt = ("measured in the file's listed order" if order.startswith("file")
+                     else f"measured in {order}")
+        parts = [f"{listed_digest.get('n')} patches from --verify-patches-file, {order_txt}"]
+        if planned.get("available"):
+            parts.append(f">= {planned['total_reads_min']} meter reads planned ({planned['n_below_1_nit']} "
+                         f"patches / >= {planned['reads_below_1_nit_min']} reads below 1 nit)")
+        else:
+            parts.append(f"planned read total unavailable ({planned.get('reason')})")
+        rule = (listed_digest.get("read_rule") or {}).get("summary")
+        if rule:
+            parts.append(f"read counts: {rule}")
+        if held and not held.get("available"):
+            why = str(held.get("reason") or "no reason recorded")
+            parts.append("held-out check " + (why if why.startswith("unavailable") else f"unavailable: {why}"))
+        return "; ".join(parts) + ". "
+
+    def _file_read_rule(self, min_reads: Optional[Sequence[int]], n: int) -> dict[str, Any]:
+        """Which rule sets each file patch's read count: a patch whose file entry gives ``reads`` is
+        read exactly that many times as a minimum (binding in every stop path) — it REPLACES
+        ``dark_min_reads`` for that patch (sequence study 2026-10-09: per-read noise is ~flat down to
+        0.005 nit, so extra dark reads buy ~nothing); a patch without ``reads`` keeps the loop's own
+        policy (``dark_min_reads`` on dark near-neutrals). The global / bright-neutral floors and the
+        DIP's SNR escalation still apply to both; a glitch the loop rejects is re-read."""
+        try:   # the config the verify measure will actually run with
+            dark = int((self.loop_config or self._loop_config_for(self._dip())).dark_min_reads)
+        except Exception:  # noqa: BLE001 - evidence only
+            dark = int(self.dark_min_reads if self.dark_min_reads is not None else MeasureLoopConfig().dark_min_reads)
+        with_reads = sum(1 for r in (min_reads or ()) if r)
+        if with_reads == n and n:
+            summary = f"file `reads` sets the read count of all {n} patches (replaces dark_min_reads {dark})"
+        elif with_reads:
+            summary = (f"file `reads` sets the read count of {with_reads} of {n} patches (replaces "
+                       f"dark_min_reads {dark} for them); the other {n - with_reads} keep the loop policy "
+                       f"(dark_min_reads {dark} on dark near-neutrals)")
+        else:
+            summary = f"loop policy for all {n} patches (no file `reads`; dark_min_reads {dark} on dark near-neutrals)"
+        return {"summary": summary, "n_file_reads": with_reads, "n_loop_policy": n - with_reads,
+                "dark_min_reads": dark,
+                "rule": ("a file `reads` value is the patch's read count: a minimum binding in every stop path "
+                         "(dark early stop, convergence, drift re-measure) that REPLACES dark_min_reads for the "
+                         "patch; the global / bright-neutral floors and the DIP's SNR escalation still apply, "
+                         "and a rejected glitch is re-read")}
 
     def _verify_patches_file_record(self) -> Optional[dict[str, Any]]:
         """The memoised ``verify-patches-file`` data (codes, fingerprint, weights), or ``None``."""
@@ -8864,7 +8945,16 @@ class Calibration:
                                     weights: Optional[Sequence[float]]) -> dict[str, Any]:
         """The fresh draws' held-out distance rule (:data:`verify_holdout.DRAW_MIN_CODES` codes from every
         training signal / probe drive, signal space and — through the trained cube — drive space)
-        applied to the file's patches. Evidence: the failing patches are LISTED, never dropped."""
+        applied to the file's patches. Evidence: the failing patches are LISTED, never dropped.
+
+        UNAVAILABLE when the content mode differs from the display mode (SDR content on an HDR display):
+        the installed stack's training signals are the DISPLAY mode's (PQ codes), so distances to the
+        file's content-mode codes (8-bit SDR gamma) would be in a different code space."""
+        if self.content_mode != self.mode:
+            return {"available": False, "reason": (f"unavailable (content mode {self.content_mode} ≠ display "
+                                                   f"mode {self.mode}): the installed stack was trained on "
+                                                   f"{self.mode} signals, the file lists {self.content_mode} "
+                                                   "codes — no common code space to measure distance in")}
         root, why = self._verify_file_training_run()
         if root is None:
             return {"available": False, "reason": why}
@@ -8935,22 +9025,26 @@ class Calibration:
                                           coverage_gap_pct=dict(listed.get("coverage_gap_pct") or {}))
 
     def _verify_read_evidence(self, verify_ti3: str, metrics: Sequence[Any]) -> metrics_mod.ReadEvidence:
-        """How much each verify signal's ΔE can be trusted: meter reads per signal (the measure NDJSON),
-        the dark-level noise trust flags (the noise sidecar) and the meter floor (the DIP's
+        """How much each verify signal's ΔE can be trusted: the meter reads its scored value rests on
+        (the measure NDJSON — each patch's FINAL adopted round, only the reads the loop kept:
+        :func:`dlc.content_score.final_round_reads`), the loop's own SE (its round records + the noise
+        sidecar), the dark-level noise trust flags (the noise sidecar) and the meter floor (the DIP's
         ``noise_floor_nits``, else the documented fallback)."""
         from . import content_score
 
         ti3 = Path(verify_ti3)
         ndjson = ti3.with_suffix(".ndjson")
         max_cv = self._transfer().max_cv
-        reads = content_score.read_counts_from_ndjson(ndjson, max_cv)
-        per_read = content_score.reads_from_ndjson(ndjson, max_cv)
+        final = content_score.final_round_reads(ndjson, max_cv)
         reps = [m for m, _n in metrics_mod.group_per_signal(list(metrics))]
         low = content_score.low_snr_signal_keys(ti3, reps)
         # the loop's own ΔE2000 SE of the mean — same metric family only for an SDR (CIEDE2000) verify
-        loop_se = content_score.sidecar_se_de(ti3, reps) if not self._spec().is_hdr else {}
-        kw: dict[str, Any] = {"reads": reads or None, "low_snr": frozenset(low), "read_xyz": per_read or None,
-                              "loop_se_de": loop_se or None}
+        is_hdr = self._spec().is_hdr
+        loop_se = content_score.sidecar_se_de(ti3, reps) if not is_hdr else {}
+        kw: dict[str, Any] = {"reads": final.counts or None, "low_snr": frozenset(low),
+                              "read_xyz": dict(final.reads) or None, "loop_se_de": loop_se or None,
+                              "loop_round_se": (dict(final.loop_se) or None) if not is_hdr else None,
+                              "reads_basis": final.describe()}
         dip = self._dip()
         floor = getattr(dip, "noise_floor_nits", None) if dip is not None else None
         if floor:

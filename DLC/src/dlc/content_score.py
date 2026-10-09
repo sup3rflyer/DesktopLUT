@@ -53,8 +53,9 @@ import numpy as np
 __all__ = [
     "DEFAULT_REACH", "ITP_SCALE", "CONTENT_JSON_FORMAT", "ZONE_LABELS", "BAND_LABELS",
     "ContentDistribution", "parse_content_spec", "load_content_distribution", "export_content_json",
-    "xyz_to_itp", "nominal_signal_xyz", "kernel_score", "read_counts_from_ndjson", "reads_from_ndjson",
-    "sidecar_se_de", "read_noise_se", "low_snr_signal_keys", "rescore_run",
+    "xyz_to_itp", "nominal_signal_xyz", "kernel_score", "FinalRoundReads", "final_round_reads",
+    "read_counts_from_ndjson", "reads_from_ndjson", "sidecar_se_de", "read_noise_se", "print_quantum_se",
+    "low_snr_signal_keys", "rescore_run",
 ]
 
 DEFAULT_REACH = 20.0          # dE_ITP; ~ one 33-node PQ cube cell along I (study §5.1)
@@ -409,20 +410,69 @@ def kernel_score(content: ContentDistribution, sig_itp: Any, sig_err: Any, *,
 # ---------------------------------------------------------------------------------------------
 # read evidence (how much each signal's E can be trusted)
 # ---------------------------------------------------------------------------------------------
-def read_counts_from_ndjson(path: Path, max_cv: int) -> dict[tuple, int]:
-    """Meter reads behind each signal of a measure stage, from its NDJSON (one row per read): every
-    accepted ``measurement`` row counts, keyed by :func:`dlc.metrics.signal_key` of its code / max_cv.
-    Repeats of one signal at several patch indices add up. Empty when absent / unreadable."""
-    return {k: len(v) for k, v in reads_from_ndjson(path, max_cv, keep_unreadable=True).items()}
+@dataclass(frozen=True)
+class FinalRoundReads:
+    """The meter reads behind each signal's SCORED value, from a measure stage's NDJSON — per patch
+    label only its FINAL adopted round, and in that round only the reads the measure loop KEPT (its
+    outlier-rejected inliers). Keyed by :func:`dlc.metrics.signal_key`; a signal measured at several
+    patch indices pools those labels' final rounds (``rows`` labels).
+
+    ``basis`` = ``"loop"`` when the NDJSON carries the loop's own per-round decision rows
+    (:data:`dlc.measure_loop.MEASUREMENT_ROUND_ROLE`), ``"reconstructed"`` for an older stream (see
+    :func:`final_round_reads`), ``None`` when no read was found. ``loop_se`` = the loop's own raw SE of each row's kept mean (ΔE2000 against its
+    running white; ``None`` where the round kept < 2 reads) — decision rows only."""
+    reads: Mapping[tuple, list] = field(default_factory=dict)
+    rows: Mapping[tuple, int] = field(default_factory=dict)
+    loop_se: Mapping[tuple, list] = field(default_factory=dict)
+    basis: Optional[str] = None
+
+    @property
+    def counts(self) -> dict[tuple, int]:
+        return {k: len(v) for k, v in self.reads.items()}
+
+    def describe(self) -> str:
+        if self.basis == "loop":
+            return ("meter reads behind each signal's scored value: each patch's FINAL adopted round, only the "
+                    "reads the measure loop kept (its round records in the measure NDJSON)")
+        if self.basis == "reconstructed":
+            return ("meter reads behind each signal's scored value: each patch's FINAL round with any XYZ, inliers "
+                    "re-derived with the loop's glitch rule (MAD spread, no DIP sigma; white anchor = the "
+                    "brightest read) - RECONSTRUCTED: this NDJSON predates the loop's round records")
+        return "scored rows per signal (no NDJSON reads found)"
 
 
-def reads_from_ndjson(path: Path, max_cv: int, *, keep_unreadable: bool = False) -> dict[tuple, list]:
-    """The accepted meter reads (absolute XYZ) behind each signal of a measure stage, from its NDJSON —
-    keyed like :func:`read_counts_from_ndjson`; the spread of a signal's repeated reads is its read
-    noise. A read without a finite XYZ is kept as ``None`` only with ``keep_unreadable`` (counting)."""
+def _finite_xyz(xyz: Any) -> Optional[tuple[float, float, float]]:
+    if (isinstance(xyz, list) and len(xyz) == 3
+            and all(isinstance(c, (int, float)) and math.isfinite(c) for c in xyz)):
+        return (float(xyz[0]), float(xyz[1]), float(xyz[2]))
+    return None
+
+
+def final_round_reads(path: Path, max_cv: int) -> FinalRoundReads:
+    """The reads behind each signal's scored value (:class:`FinalRoundReads`) — what the read counts,
+    the single-read flags and the read-noise spread must rest on. A re-measured patch's earlier (cold)
+    round and every glitch the loop rejected are excluded: pooling them made a re-measured signal look
+    two-read and its drift look like read noise (BenQ 2026-09-26: [42,42,85] SE 0.076 = cold main read
+    vs warm re-measure; a rejected +30 % glitch read as SE 2.37).
+
+    With the loop's round records (``role: measurement_round``): per label, the LAST record with
+    ``adopted: true``; its ``inlier_seqs`` name the reads. FALLBACK for an older stream (no round
+    records): per label, the last round (a round starts at ``read_index`` 0) that has any read with an
+    XYZ — a re-measure that produced nothing usable leaves the prior round standing, as the loop does —
+    with the loop's glitch rule (:func:`dlc.measure_loop.robust_inlier_mask`, default outlier factor /
+    floor) re-applied with the MAD spread (the DIP σ is not recorded) and the brightest read in the
+    stream as the Lab anchor. A stream WITH round records uses only them: a label without one never
+    finished a round (an abort mid-patch), so it was never scored. Empty when the file is absent /
+    unreadable."""
+    from .measure_loop import MEASUREMENT_ROUND_ROLE, MeasureLoopConfig, robust_inlier_mask
     from .metrics import signal_key
 
-    counts: dict[tuple, list] = {}
+    by_seq: dict[int, tuple[float, float, float]] = {}
+    label_rgb: dict[str, list] = {}
+    pending: dict[str, list] = {}
+    last_round: dict[str, list] = {}
+    decided: dict[str, dict] = {}
+    brightest: Optional[tuple[float, float, float]] = None
     try:
         with Path(path).open(encoding="utf-8") as fh:
             for line in fh:
@@ -433,20 +483,78 @@ def reads_from_ndjson(path: Path, max_cv: int, *, keep_unreadable: bool = False)
                     row = json.loads(line)
                 except ValueError:
                     continue
-                if row.get("role") != "measurement" or row.get("ok") is False or row.get("accepted") is False:
+                if not isinstance(row, dict):
                     continue
+                role = row.get("role")
+                label = str(row.get("label") or "")
                 rgb = row.get("rgb")
-                if not isinstance(rgb, list) or len(rgb) != 3:
+                if not label or not isinstance(rgb, list) or len(rgb) != 3:
                     continue
-                key = signal_key([float(c) / max_cv for c in rgb])
-                xyz = row.get("xyz")
-                ok = (isinstance(xyz, list) and len(xyz) == 3
-                      and all(isinstance(c, (int, float)) and math.isfinite(c) for c in xyz))
-                if ok or keep_unreadable:
-                    counts.setdefault(key, []).append(tuple(float(c) for c in xyz) if ok else None)
+                if role == MEASUREMENT_ROUND_ROLE:
+                    if row.get("adopted"):
+                        decided[label] = row
+                        label_rgb[label] = rgb
+                    continue
+                if role != "measurement" or row.get("ok") is False or row.get("accepted") is False:
+                    continue
+                label_rgb.setdefault(label, rgb)
+                if int(row.get("read_index") or 0) == 0:
+                    if pending.get(label):
+                        last_round[label] = pending[label]
+                    pending[label] = []
+                xyz = _finite_xyz(row.get("xyz"))
+                if xyz is None:
+                    continue
+                if isinstance(row.get("seq"), int):
+                    by_seq[int(row["seq"])] = xyz
+                pending.setdefault(label, []).append(xyz)
+                if brightest is None or xyz[1] > brightest[1]:
+                    brightest = xyz
     except OSError:
-        return {}
-    return counts
+        return FinalRoundReads()
+    for label, reads in pending.items():
+        if reads:
+            last_round[label] = reads
+    cfg = MeasureLoopConfig()
+    reads_by: dict[tuple, list] = {}
+    rows_by: dict[tuple, int] = {}
+    se_by: dict[tuple, list] = {}
+    use_loop = bool(decided)
+    for label in sorted(decided if use_loop else last_round):
+        key = signal_key([float(c) / max_cv for c in label_rgb[label]])
+        if use_loop:
+            rec = decided[label]
+            kept = [by_seq[s] for s in (rec.get("inlier_seqs") or ()) if isinstance(s, int) and s in by_seq]
+            se = rec.get("se_de")
+            se_by.setdefault(key, []).append(float(se) if isinstance(se, (int, float)) and math.isfinite(se)
+                                             else None)
+        else:
+            raw = last_round[label]
+            mask = robust_inlier_mask(raw, brightest, outlier_factor=cfg.outlier_factor,
+                                      outlier_floor_de=cfg.outlier_floor_de)
+            kept = [r for r, k in zip(raw, mask) if k]
+        if not kept:
+            continue
+        reads_by.setdefault(key, []).extend(kept)
+        rows_by[key] = rows_by.get(key, 0) + 1
+    basis = ("loop" if use_loop else "reconstructed") if reads_by else None
+    return FinalRoundReads(reads=reads_by, rows=rows_by, loop_se=se_by, basis=basis)
+
+
+def read_counts_from_ndjson(path: Path, max_cv: int) -> dict[tuple, int]:
+    """Meter reads behind each signal's SCORED value (:func:`final_round_reads`: each patch's final
+    adopted round, only the reads the loop kept), keyed by :func:`dlc.metrics.signal_key` of its code /
+    max_cv. Repeats of one signal at several patch indices add up. Empty when absent / unreadable."""
+    return final_round_reads(path, max_cv).counts
+
+
+def reads_from_ndjson(path: Path, max_cv: int, *, keep_unreadable: bool = False) -> dict[tuple, list]:
+    """The meter reads (absolute XYZ) behind each signal's scored value — :func:`final_round_reads`
+    (final adopted round, loop-kept reads only). Their spread is the signal's read noise. A read with
+    no finite XYZ is never part of a round's mean, so ``keep_unreadable`` (kept for API compatibility)
+    changes nothing."""
+    del keep_unreadable
+    return dict(final_round_reads(path, max_cv).reads)
 
 
 def sidecar_se_de(ti3_path: Path, reps: Iterable[Any]) -> dict[tuple, float]:
@@ -476,33 +584,49 @@ def sidecar_se_de(ti3_path: Path, reps: Iterable[Any]) -> dict[tuple, float]:
     return out
 
 
+def _metric_distances(arr: np.ndarray, ref: np.ndarray, *, is_hdr: bool,
+                      white_xyz: Optional[Sequence[float]]) -> np.ndarray:
+    """The run's metric distance of each row of ``arr`` from ``ref`` (dE_ITP for HDR; CIEDE2000
+    relative to ``white_xyz`` — default D65 at Y 100 — for SDR)."""
+    arr = np.atleast_2d(np.asarray(arr, float))
+    if is_hdr:
+        itp = xyz_to_itp(np.vstack([arr, np.asarray(ref, float)[None, :]])) * ITP_SCALE
+        return np.linalg.norm(itp[:-1] - itp[-1], axis=1)
+    from .metrics import delta_e2000, xyz_to_lab
+
+    wt = tuple(float(c) for c in (white_xyz if white_xyz is not None else (95.047, 100.0, 108.883)))
+    lab_m = xyz_to_lab(tuple(float(c) for c in ref), wt)
+    return np.array([delta_e2000(xyz_to_lab(tuple(float(c) for c in r), wt), lab_m) for r in arr])
+
+
+def print_quantum_se(mean_xyz: Sequence[float], *, is_hdr: bool,
+                     white_xyz: Optional[Sequence[float]] = None) -> float:
+    """The SE floor of the meter's 6-decimal XYZ print quantisation at ``mean_xyz``, in the run's metric
+    (q / √12 for a uniform 1e-6 step): identical reads are never a proof of zero noise."""
+    mean = np.asarray(mean_xyz, float)
+    q = float(_metric_distances((mean + 1e-6)[None, :], mean, is_hdr=is_hdr, white_xyz=white_xyz)[0])
+    return q / math.sqrt(12.0)
+
+
 def read_noise_se(reads: Sequence[Sequence[float]], *, rows: int, is_hdr: bool,
                   white_xyz: Optional[Sequence[float]] = None) -> Optional[dict[str, Any]]:
     """The read-noise SE of a signal's scored E, in the run's metric, from the spread of its repeated
     reads: σ_read = √(Σ d_i² / (n−1)) with d_i the metric distance (dE_ITP for HDR, CIEDE2000 relative
     to ``white_xyz`` for SDR) of read i from the signal's mean read; each scored row averages
-    ``n / rows`` reads, so SE = σ_read / √(n / rows), floored at the meter's 6-decimal XYZ print
-    quantisation. ``None`` below two reads (no spread → no evidence)."""
+    ``n / rows`` reads, so SE = σ_read / √(n / rows) — the PER-ROW SE (a row's dE is biased by its own
+    noise; averaging rows does not remove that bias) — floored at the meter's print quantisation
+    (:func:`print_quantum_se`). ``None`` below two reads (no spread → no evidence). Pass the reads the
+    scored value rests on (:func:`final_round_reads`), never every read of the stream."""
     pts = [r for r in reads if r is not None]
     n = len(pts)
     if n < 2:
         return None
     arr = np.asarray(pts, float)
     mean = arr.mean(axis=0)
-    if is_hdr:
-        itp = xyz_to_itp(np.vstack([arr, mean[None, :], (mean + 1e-6)[None, :]])) * ITP_SCALE
-        d = np.linalg.norm(itp[:n] - itp[n], axis=1)
-        q = float(np.linalg.norm(itp[n + 1] - itp[n]))
-    else:
-        from .metrics import delta_e2000, xyz_to_lab
-
-        wt = tuple(float(c) for c in (white_xyz if white_xyz is not None else (95.047, 100.0, 108.883)))
-        lab_m = xyz_to_lab(tuple(float(c) for c in mean), wt)
-        d = np.array([delta_e2000(xyz_to_lab(tuple(float(c) for c in r), wt), lab_m) for r in arr])
-        q = float(delta_e2000(xyz_to_lab(tuple(float(c) + 1e-6 for c in mean), wt), lab_m))
+    d = _metric_distances(arr, mean, is_hdr=is_hdr, white_xyz=white_xyz)
     per_row = max(1.0, n / max(1, int(rows)))
     sigma = float(math.sqrt(float(np.sum(d ** 2)) / (n - 1)))
-    se = max(sigma, q / math.sqrt(12.0)) / math.sqrt(per_row)
+    se = max(sigma, print_quantum_se(mean, is_hdr=is_hdr, white_xyz=white_xyz)) / math.sqrt(per_row)
     return {"se": se, "sigma_read": sigma, "n_reads": n, "reads_per_row": round(per_row, 3)}
 
 
@@ -573,12 +697,12 @@ def rescore_run(run_root: Path, specs: Sequence[str], *, reach: float = DEFAULT_
     from .metrics import group_per_signal
 
     reps = [m for m, _ in group_per_signal(metrics)]
-    per_read = reads_from_ndjson(root / "measurements" / "verify.ndjson", (1 << bit_depth) - 1)
-    evidence = ReadEvidence(reads=read_counts_from_ndjson(root / "measurements" / "verify.ndjson",
-                                                          (1 << bit_depth) - 1) or None,
+    final = final_round_reads(root / "measurements" / "verify.ndjson", (1 << bit_depth) - 1)
+    evidence = ReadEvidence(reads=final.counts or None,
                             low_snr=frozenset(low_snr_signal_keys(ti3, reps)) if ti3.exists() else frozenset(),
-                            read_xyz=per_read or None,
-                            loop_se_de=(sidecar_se_de(ti3, reps) or None) if (ti3.exists() and not is_hdr) else None)
+                            read_xyz=dict(final.reads) or None,
+                            loop_se_de=(sidecar_se_de(ti3, reps) or None) if (ti3.exists() and not is_hdr) else None,
+                            loop_round_se=dict(final.loop_se) or None, reads_basis=final.describe())
     content_mode = "HDR" if is_hdr else "SDR"
     contents = [load_content_distribution(s, content_mode=content_mode) for s in specs]
     practical = practical_summary(metrics, is_hdr=is_hdr, gamut_aware=bool(summ.get("practical", {}).get("gamut_aware")),
