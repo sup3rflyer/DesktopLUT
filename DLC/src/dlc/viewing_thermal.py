@@ -16,6 +16,12 @@ equivalent). ``--thermal-state viewing`` measures a verify in the viewing state 
 * the modelled state rides every read, the check-ins and the digests, so a verify says which thermal
   state its numbers represent.
 
+Owner decision 2026-10-09 (policy ``viewing-refine``): the thermal offset goes into the PROFILE through the MHC
+(the sole neutral-axis owner). Raw + the cube build stay at their own (loaded) band; the MHC closed-loop refine
+runs in the viewing state — the same precondition per round, plus policy ``hold`` for its reads
+(:class:`ViewingHold`: dim-neutral dwells between ~45 s read blocks so block + dwell sit at the viewing load,
+capped by an LLM-chosen dwell budget; :func:`predict_refine_hold` models it with the same policy code).
+
 The model is first-order and TIME-based: ``dT/dt = (load − T)/τ`` with ``load = (max-channel nits /
 ref)^exponent``. Its constants are the 2026-10-09 PA32UCXR study fit (``results/practical_sequence_
 2026-10-09`` §1.3: τ 27 ± 1 min, exponent 0.7, ref 1850 nit; right on SDR-in-HDR, ~1.7× high on HDR,
@@ -39,7 +45,9 @@ __all__ = [
     "RECORDED_VERIFY_LOAD", "VIEWING_LOAD_MAX_NITS", "PRECONDITION_CAP_MIN", "MODEL_BASIS",
     "LoadLaw", "ViewingPrecondition", "ThermalStateModel", "ViewingGate",
     "read_seconds", "patch_load", "set_band", "predict_hold", "stand_in_nits", "start_state",
-    "band_achieved",
+    "band_achieved", "HOLD_BLOCK_S", "HOLD_DWELL_NITS", "HOLD_TRIGGER_FRAC", "HOLD_RELEASE_FRAC",
+    "REFINE_POLICY", "REFINE_EXPECTED_ROUNDS", "HOLD_BUDGET_MAX_MIN", "dwell_seconds", "ViewingHold",
+    "predict_refine_hold",
 ]
 
 THERMAL_STATES = ("verify", "viewing")
@@ -77,6 +85,28 @@ BAND_HALFWIDTH_FRAC = 0.5
 # panel landing exactly on the band edge would step straight out on the warm-up reference / the set's
 # first bright block. Reporting (in band / not) uses the full half-width.
 CONVERGE_MARGIN = 0.9
+
+# --- policy ``hold`` (design note §4.1; owner decision 2026-10-09: the MHC closed-loop refine runs in the
+# viewing state). The stage's reads are split into ~45 s blocks (≪ τ, so the state ripple per block is
+# < 0.002 load); after a block whose load exceeds the target a DIM NEUTRAL dwell field is shown (read and
+# discarded — the presenter/meter pair has no present-only seam, and a read keeps the frame, the liveness
+# clock and the model fed) for block_s × (block_load − target) / (target − dwell_load): block + dwell then
+# average to the target load (the spec's block_s × (block_load/target − 1) for a black dwell). FALD/LCD
+# hygiene: one steady ≤ 1-nit neutral — no full-signal static, no per-refresh toggle (OLED: near-black).
+HOLD_BLOCK_S = 45.0
+HOLD_DWELL_NITS = 1.0
+# A block ends EARLY when the modelled state rises past this fraction of the half-width above the target
+# (mechanical — the model, not a judgment); such a dwell then also runs until the state is back under
+# HOLD_RELEASE_FRAC of the half-width (hysteresis, so the next block cannot step straight out of the band).
+HOLD_TRIGGER_FRAC = CONVERGE_MARGIN
+HOLD_RELEASE_FRAC = 0.75
+# The MHC refine's digest/policy label, and the round count the seam's predicted dwell TOTAL assumes (the
+# refine stops on the panel's physical floor, so the true count is unknown up front — stated as such).
+REFINE_POLICY = "viewing-refine"
+REFINE_EXPECTED_ROUNDS = 4
+# The ceiling for an LLM-chosen dwell budget (--viewing-hold-budget-min): 4 h of dwell is far past any
+# refine (PA HDR: ~0); a larger value is a typo, refused rather than a silent multi-hour hold.
+HOLD_BUDGET_MAX_MIN = 240.0
 
 # Rec.709 / Rec.2020 (D65) linear RGB → XYZ — the nominal XYZ of a commanded patch for the read-time model.
 _M709 = ((0.4124564, 0.3575761, 0.1804375), (0.2126729, 0.7151522, 0.0721750), (0.0193339, 0.1191920, 0.9503041))
@@ -289,16 +319,28 @@ class ViewingPrecondition:
     #                                      the controller's normal budget/flag path applies (flag-don't-cap)
     soak: bool = True                    # False = the LLM chose measure-now: track the state, no precondition
     law: LoadLaw = field(default_factory=LoadLaw)
+    # policy ``hold`` (the MHC refine only): interleave dim-neutral dwells between ~45 s read blocks so each
+    # block + dwell sits at the target load (:class:`ViewingHold`). ``hold_budget_s`` caps this pass's total
+    # dwell (the LLM-chosen stage budget less what earlier rounds used); past it the pass rides unheld and the
+    # digest says so. Off (the verify / build stages) = the fields are inert and absent from ``as_dict``.
+    hold: bool = False
+    hold_budget_s: float = 0.0
+    hold_block_s: float = HOLD_BLOCK_S
+    dwell_nits: float = HOLD_DWELL_NITS
 
     def as_dict(self) -> dict[str, Any]:
         law = self.law
-        return {"target_load": round(self.target_load, 5),
-                "target_nits_equiv": round(law.nits_equiv(self.target_load), 2),
-                "band": [round(self.target_load - self.halfwidth, 5), round(self.target_load + self.halfwidth, 5)],
-                "start_load": round(self.start_load, 5),
-                "start_nits_equiv": round(law.nits_equiv(self.start_load), 2),
-                "start_source": self.start_source, "target_source": self.target_source,
-                "deadline_min": round(self.deadline_s / 60.0, 1), "soak": self.soak, "model": law.as_dict()}
+        out = {"target_load": round(self.target_load, 5),
+               "target_nits_equiv": round(law.nits_equiv(self.target_load), 2),
+               "band": [round(self.target_load - self.halfwidth, 5), round(self.target_load + self.halfwidth, 5)],
+               "start_load": round(self.start_load, 5),
+               "start_nits_equiv": round(law.nits_equiv(self.start_load), 2),
+               "start_source": self.start_source, "target_source": self.target_source,
+               "deadline_min": round(self.deadline_s / 60.0, 1), "soak": self.soak, "model": law.as_dict()}
+        if self.hold:
+            out["hold"] = {"block_s": self.hold_block_s, "budget_min": round(self.hold_budget_s / 60.0, 2),
+                           "dwell_nits": self.dwell_nits}
+        return out
 
 
 class ThermalStateModel:
@@ -413,4 +455,204 @@ class ViewingGate:
         return {"modelled_load": st["modelled_load"], "band": st["band"], "in_band": st["in_band"],
                 "phase": self.model._seg, "observed_load": (cur or {}).get("observed_load"),
                 "basis": "model (first-order, PA32UCXR fit) fed with the reads actually shown"}
+
+
+# --- policy ``hold`` ----------------------------------------------------------------------------------
+def dwell_seconds(block_load: float, block_s: float, target: float, dwell_load: float) -> float:
+    """Seconds of dwell field (at ``dwell_load``) after a ``block_s``-second block at ``block_load`` so the
+    block + dwell average to ``target`` — the spec's ``block_s × (block_load / target − 1)`` for a black
+    dwell, generalised to a dim one. 0 for a block at/below the target (nothing to hold off)."""
+    if block_s <= 0.0 or block_load <= target or dwell_load >= target:
+        return 0.0
+    return block_s * (block_load - target) / (target - dwell_load)
+
+
+def _grey_rgb(nits: float, transfer: Any) -> tuple[int, int, int]:
+    cv = int(transfer.nits_to_cv(float(nits))) if nits > 0 else 0
+    return (cv, cv, cv)
+
+
+class _Shown:
+    """A duck-typed patch (``.rgb``) for :meth:`ViewingGate.observe`."""
+
+    __slots__ = ("rgb",)
+
+    def __init__(self, rgb: Sequence[int]) -> None:
+        self.rgb = tuple(rgb)
+
+
+class ViewingHold:
+    """Policy ``hold`` for one measured pass (design note §4.1): the pass's reads form ~``hold_block_s``
+    blocks; a block ends on time, or EARLY when the modelled state rises past :data:`HOLD_TRIGGER_FRAC` of
+    the half-width above the target while the block is hot (mechanical — the model, not a judgment). After a
+    block the dwell field is shown for :func:`dwell_seconds` (block + dwell = the target load); an early
+    (model-triggered) dwell also runs until the state is back under :data:`HOLD_RELEASE_FRAC`. Every dwell
+    is capped by the remaining budget (never exceeded: a read that would cross it is not taken); once spent,
+    the pass rides unheld and :meth:`summary` says from which block. The caller supplies the dwell read
+    (present + read + discard); the gate is fed by that read like any other, so the model, the observed
+    load and the band verdict include the dwell."""
+
+    LOG_MAX = 40
+
+    def __init__(self, gate: ViewingGate, dwell_rgb: Sequence[int]) -> None:
+        spec = gate.spec
+        self.gate = gate
+        self.dwell_rgb = tuple(int(c) for c in dwell_rgb)
+        self.dwell_load = patch_load(self.dwell_rgb, gate.transfer, spec.law)
+        self.read_s = read_seconds(_min_xyz(self.dwell_rgb, gate.transfer))   # model s per dwell read
+        self.budget_s = max(0.0, float(spec.hold_budget_s))
+        self.used_s = 0.0
+        self.blocks = self.dwells = self.dwell_reads = self.early = 0
+        self.exhausted_at_block: Optional[int] = None
+        self.read_capped = False
+        self.log: list[dict[str, Any]] = []
+        self._mark = (0.0, 0.0)
+
+    def _seg(self) -> Optional[dict[str, float]]:
+        m = self.gate.model
+        return m.segments.get(m._seg) if m._seg else None
+
+    def begin_block(self) -> None:
+        seg = self._seg()
+        self._mark = (seg["seconds"], seg["load_s"]) if seg else (0.0, 0.0)
+
+    def block(self) -> tuple[float, float]:
+        """``(seconds, time-weighted load)`` of the current block so far (the gate's observed reads)."""
+        seg = self._seg()
+        if seg is None:
+            return 0.0, 0.0
+        secs = seg["seconds"] - self._mark[0]
+        if secs <= 0.0:
+            return 0.0, 0.0
+        return secs, (seg["load_s"] - self._mark[1]) / secs
+
+    @property
+    def exhausted(self) -> bool:
+        return self.used_s + self.read_s > self.budget_s
+
+    def due(self) -> Optional[str]:
+        """``"model"`` / ``"time"`` when the current block ends now, else ``None`` (always ``None`` once
+        the budget is spent — the rest of the pass rides unheld, recorded)."""
+        if self.exhausted:
+            if self.exhausted_at_block is None:
+                self.exhausted_at_block = self.blocks + 1
+            return None
+        secs, load = self.block()
+        if secs <= 0.0:
+            return None
+        spec = self.gate.spec
+        if self.gate.offset() > HOLD_TRIGGER_FRAC * spec.halfwidth and load > spec.target_load:
+            return "model"
+        if secs >= spec.hold_block_s:
+            return "time"
+        return None
+
+    def dwell(self, read: Callable[[], Any], reason: str) -> Optional[dict[str, Any]]:
+        """End the current block (``reason`` from :meth:`due`) and run its dwell; ``read`` shows + reads
+        (discards) the dwell field once. Returns the dwell record, or ``None`` when none was needed."""
+        spec = self.gate.spec
+        secs, load = self.block()
+        self.blocks += 1
+        self.early += int(reason == "model")
+        need = dwell_seconds(load, secs, spec.target_load, self.dwell_load)
+        release = reason == "model"
+
+        def satisfied(elapsed: float) -> bool:
+            return elapsed >= need and (not release or self.gate.offset() <= HOLD_RELEASE_FRAC * spec.halfwidth)
+
+        if satisfied(0.0):
+            self.begin_block()
+            return None
+        clock = self.gate.clock
+        t0 = clock()
+        before = self.gate.model.temp
+        # A clock that does not advance with the reads (a mock without a sim clock) must not spin forever.
+        # (No dwell needs longer than its formula time + 4 τ: the model release from the hottest state.)
+        horizon = min(max(self.budget_s - self.used_s, 0.0), need + 4.0 * spec.law.tau_s)
+        cap = int(math.ceil(horizon / max(self.read_s, 0.5))) * 2 + 1
+        reads = 0
+        stopped: Optional[str] = None
+        while True:
+            elapsed = max(0.0, clock() - t0)
+            if satisfied(elapsed):
+                break
+            if self.used_s + elapsed + self.read_s > self.budget_s:
+                stopped = "budget"
+                break
+            if reads >= cap:
+                stopped = "read-cap"
+                self.read_capped = True
+                break
+            read()
+            reads += 1
+        elapsed = max(0.0, clock() - t0)
+        self.used_s += elapsed
+        self.dwells += int(reads > 0)
+        self.dwell_reads += reads
+        if stopped == "budget" and self.exhausted_at_block is None:
+            self.exhausted_at_block = self.blocks
+        rec = {"block": self.blocks, "reason": reason, "block_s": round(secs, 1), "block_load": round(load, 5),
+               "need_s": round(need, 1), "dwell_s": round(elapsed, 1), "reads": reads,
+               "modelled_before": round(before, 5), "modelled_after": round(self.gate.model.temp, 5),
+               **({"stopped": stopped} if stopped else {})}
+        if len(self.log) < self.LOG_MAX:
+            self.log.append(rec)
+        self.begin_block()
+        return rec
+
+    def summary(self, *, compact: bool = False) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "policy": "hold", "blocks": self.blocks, "dwells": self.dwells, "dwell_reads": self.dwell_reads,
+            "dwell_min": round(self.used_s / 60.0, 2), "budget_min": round(self.budget_s / 60.0, 2),
+            "budget_exhausted": self.exhausted_at_block is not None,
+            "exhausted_at_block": self.exhausted_at_block, "early_blocks": self.early,
+        }
+        if self.read_capped:
+            out["read_capped"] = True
+        if not compact:
+            out.update({"dwell_rgb": list(self.dwell_rgb), "dwell_load": round(self.dwell_load, 5),
+                        "block_s": self.gate.spec.hold_block_s, "dwell_log": list(self.log),
+                        "basis": MODEL_BASIS})
+        return out
+
+
+def predict_refine_hold(patches: Sequence[Sequence[float]], transfer: Any, law: LoadLaw, *, target_load: float,
+                        halfwidth: float, start_load: float, budget_s: float = math.inf,
+                        block_s: float = HOLD_BLOCK_S, dwell_nits: float = HOLD_DWELL_NITS) -> dict[str, Any]:
+    """Model one HELD pass over ``patches`` in their order (the read-time model as the clock) by driving the
+    SAME :class:`ViewingHold` policy the measure loop runs: the dwell it needs, the state it ends in and the
+    time fraction in band. Excludes warm-up / checkpoints / re-reads (model prediction)."""
+    now = [0.0]
+    spec = ViewingPrecondition(target_load=target_load, halfwidth=halfwidth, start_load=start_load,
+                               start_source="prediction", target_source="prediction", deadline_s=0.0,
+                               law=law, hold=True, hold_budget_s=budget_s, hold_block_s=block_s,
+                               dwell_nits=dwell_nits)
+    gate = ViewingGate(spec, transfer, clock=lambda: now[0])
+    gate.model.observe(start_load, 0.0)            # anchor the model's clock (no relax on the first sample)
+    gate.begin("measure")
+    hold = ViewingHold(gate, _grey_rgb(dwell_nits, transfer))
+    hold.begin_block()
+    acc = {"in": 0.0, "all": 0.0, "worst": abs(start_load - target_load)}
+
+    def show(rgb: Sequence[int]) -> None:
+        dt = read_seconds(_min_xyz(rgb, transfer))
+        now[0] += dt
+        gate.observe(_Shown(rgb))
+        off = abs(gate.offset())
+        acc["all"] += dt
+        acc["worst"] = max(acc["worst"], off)
+        if off <= halfwidth:
+            acc["in"] += dt
+
+    for p in patches:
+        show(p)
+        reason = hold.due()
+        if reason:
+            hold.dwell(lambda: show(hold.dwell_rgb), reason)
+    s = hold.summary(compact=True)
+    return {"dwell_min": s["dwell_min"], "dwells": s["dwells"], "blocks": s["blocks"],
+            "budget_exhausted": s["budget_exhausted"],
+            "reads_min": round((acc["all"] - hold.used_s) / 60.0, 2), "total_min": round(acc["all"] / 60.0, 2),
+            "end_load": round(gate.model.temp, 5), "max_offset_load": round(acc["worst"], 5),
+            "in_band_fraction": round(acc["in"] / acc["all"], 3) if acc["all"] else None}
 
