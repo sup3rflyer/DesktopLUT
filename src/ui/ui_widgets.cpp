@@ -1,5 +1,6 @@
 #include "ui_widgets.h"
 
+#include "imgui_internal.h"   // GetActiveID (draft handling in NumberInput)
 #include <windows.h>
 #include <cfloat>
 #include <cmath>
@@ -73,6 +74,50 @@ bool Toggle(const char* id, const char* label, bool selected, ImVec2 sizeDip, bo
     const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, label);
     dl->AddText(f, fs, ImVec2(p.x + (size.x - ts.x) * 0.5f, p.y + (size.y - ts.y) * 0.5f), text, label);
     return clicked;
+}
+
+bool OnOff(const char* id, bool value, bool* out, const char* onLabel, const char* offLabel) {
+    ImGui::PushID(id);
+    bool picked = false;
+    if (Toggle("##on", onLabel, value, ImVec2(52, 24)) && !value) { *out = true; picked = true; }
+    ImGui::SameLine(0, 0);
+    if (Toggle("##off", offLabel, !value, ImVec2(52, 24)) && value) { *out = false; picked = true; }
+    ImGui::PopID();
+    return picked;
+}
+
+int Segmented(const char* id, const char* const* labels, int count, int current, float segWidthDip) {
+    ImGui::PushID(id);
+    int picked = -1;
+    for (int i = 0; i < count; i++) {
+        if (i > 0) ImGui::SameLine(0, 0);
+        ImGui::PushID(i);
+        if (Toggle("##seg", labels[i], i == current, ImVec2(segWidthDip, 24)) && i != current) picked = i;
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+    return picked;
+}
+
+bool NumberInput(const char* id, float* v, const char* fmt, float widthDip) {
+    // The draft lives across frames while the field is active: ImGui writes the parsed text into it as
+    // the user types, and the value is handed back only when the field is left.
+    static ImGuiStorage drafts;
+    const ImGuiID key = ImGui::GetID(id);
+    float* draft = drafts.GetFloatRef(key, *v);
+    if (ImGui::GetActiveID() != key) *draft = *v;
+    ImGui::PushFont(GetFont(Font::Mono), kSizeMono);
+    ImGui::SetNextItemWidth(Px(widthDip));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(Px(6), Px(4)));
+    ImGui::InputFloat(id, draft, 0.0f, 0.0f, fmt);
+    ImGui::PopStyleVar();
+    const bool commit = ImGui::IsItemDeactivatedAfterEdit();
+    ImGui::PopFont();
+    if (commit && *draft != *v) {
+        *v = *draft;
+        return true;
+    }
+    return false;
 }
 
 void StatusLight(Light l, float diameterDip) {

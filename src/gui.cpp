@@ -249,7 +249,7 @@ void SetStatus(const wchar_t* text) {
     }
 }
 
-static bool BrowseForFaldPanelFile(HWND hwndParent, wchar_t* path, size_t pathSize) {
+bool BrowseForFaldPanelFile(HWND hwndParent, wchar_t* path, size_t pathSize) {
     OPENFILENAME ofn = {};
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = hwndParent;
@@ -1142,6 +1142,14 @@ void GuiNotifySettingsChanged(int mon) {
     }
     UpdateGUIState();
     ui::Invalidate();
+}
+
+void RunClassicCommand(int mon, int commandId) {
+    if (mon < 0 || mon >= (int)g_gui.monitorSettings.size() || !g_gui.hwndMain) return;
+    // The classic handlers act on the selected display: select it first, then run the command exactly as
+    // a click would (synchronously: the classic editors run their own modal loops in here).
+    SelectMonitor(mon);
+    SendMessage(g_gui.hwndMain, WM_COMMAND, MAKEWPARAM(commandId, BN_CLICKED), 0);
 }
 
 void SelectMonitor(int index) {

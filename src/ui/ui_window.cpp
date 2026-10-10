@@ -14,6 +14,7 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <atomic>
+#include <vector>
 
 #pragma comment(lib, "uxtheme.lib")
 
@@ -44,6 +45,8 @@ float g_dpiScale = 1.0f;
 Presenter g_present;
 Snapshot g_snap;
 ViewState g_view;
+std::vector<std::function<void()>> g_commands;   // posted by widgets; run after Present (DrainCommands)
+bool g_busy = false;                             // a command is running (it may pump: frames still draw)
 
 float WindowDpiScale(HWND h) {
     UINT dpi = h ? GetDpiForWindow(h) : 0;
@@ -86,6 +89,26 @@ void UpdateAnimTimer() {
     if (!want && g_animTimer) { KillTimer(g_hwnd, kAnimTimer); g_animTimer = false; }
 }
 
+// Runs the posted commands, outside any frame. A command may pump (stop/start, profile generation,
+// file dialogs, the classic editors): the frames it lets through draw the interface disabled, and
+// nothing they post runs until this loop takes it.
+void DrainCommands() {
+    if (g_busy || g_commands.empty()) return;
+    g_busy = true;
+    Invalidate();
+    while (!g_commands.empty()) {
+        std::function<void()> cmd = std::move(g_commands.front());
+        g_commands.erase(g_commands.begin());
+        try {
+            cmd();
+        } catch (...) {
+            notify::Post(notify::Sev::Error, -1, L"ui", L"An interface action failed");
+        }
+    }
+    g_busy = false;
+    Invalidate();
+}
+
 void RenderFrame() {
     if (!g_hwnd || g_inFrame || !IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return;
     if (!EnsureImGui()) return;
@@ -95,7 +118,7 @@ void RenderFrame() {
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        DrawRoot(g_snap, g_view);
+        DrawRoot(g_snap, g_view, g_busy);
         ImGui::Render();
         const ImVec4 bg = ImGui::ColorConvertU32ToFloat4(pal::Ground);
         const float clear[4] = { bg.x, bg.y, bg.z, 1.0f };
@@ -115,6 +138,7 @@ void RenderFrame() {
         return;
     }
     g_inFrame = false;
+    DrainCommands();
 }
 
 // Input reaches ImGui first; a few extra frames let hover/press states and layout settle. The frame
@@ -245,6 +269,15 @@ bool CreateUiWindow() {
 
 }  // namespace
 
+void Post(std::function<void()> command) {
+    g_commands.push_back(std::move(command));
+    Invalidate();   // a frame (or the running drain loop) picks it up
+}
+
+bool Busy() { return g_busy; }
+
+HWND Window() { return g_hwnd; }
+
 void Show() {
     if (!g_hwnd && !CreateUiWindow()) {
         notify::Post(notify::Sev::Error, -1, L"ui", L"New interface could not be created");
@@ -271,6 +304,7 @@ void Hide() {
 bool IsVisible() { return g_hwnd && IsWindowVisible(g_hwnd); }
 
 void Shutdown() {
+    g_commands.clear();   // nothing posted runs during the teardown
     notify::SetListener(nullptr);
     if (g_hwnd) DestroyWindow(g_hwnd);
 }

@@ -1,10 +1,15 @@
 #include "ui_views.h"
 
 #include "ui_widgets.h"
+#include "ui_window.h"
+#include "actions/actions.h"
 #include "actions/notify.h"
+#include "globals.h"
+#include "gui.h"
 #include <cctype>
 #include <cfloat>
 #include <cstdio>
+#include <mutex>
 
 namespace ui {
 
@@ -15,6 +20,7 @@ constexpr float kFooterH = 30.0f;
 constexpr float kSidebarW = 220.0f;
 constexpr float kMeasuredW = 300.0f;
 constexpr float kRowLabelW = 150.0f;
+constexpr float kRowH = 28.0f;
 
 std::wstring KeyOf(const DisplayRow& r) {
     if (!r.settings.identity.devicePath.empty()) return r.settings.identity.devicePath;
@@ -28,7 +34,7 @@ std::string FileName(const std::wstring& path) {
     return Utf8(s == std::wstring::npos ? path : path.substr(s + 1));
 }
 
-const char* OnOff(bool on) { return on ? "ON" : "OFF"; }
+const char* OnOffText(bool on) { return on ? "ON" : "OFF"; }
 
 std::string Fmt(const char* fmt, double v) {
     char b[64];
@@ -36,24 +42,74 @@ std::string Fmt(const char* fmt, double v) {
     return b;
 }
 
-const char* CurveName(TonemapCurve c) {
-    switch (c) {
-    case TonemapCurve::BT2390:   return "BT.2390";
-    case TonemapCurve::SoftClip: return "Soft Clip";
-    case TonemapCurve::Reinhard: return "Reinhard";
-    case TonemapCurve::BT2446A:  return "BT.2446A";
-    case TonemapCurve::HardClip: return "Hard Clip";
-    }
-    return "?";
+// ---------------------------------------------------------------------------------------------
+// Commands aimed at a display. The live index can change between this frame and the command running
+// (a display was plugged or unplugged), so the command re-finds its display by identity.
+
+int ResolveLive(const DisplayIdentity& id, int hint) {
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    const auto& list = g_gui.monitorSettings;
+    auto same = [&](const MonitorSettings& ms) {
+        if (!id.devicePath.empty() && _wcsicmp(ms.identity.devicePath.c_str(), id.devicePath.c_str()) == 0) return true;
+        return !id.edidId.empty() && _wcsicmp(ms.identity.edidId.c_str(), id.edidId.c_str()) == 0;
+    };
+    if (hint >= 0 && hint < (int)list.size() && (id.empty() || same(list[hint]))) return hint;
+    if (id.empty()) return -1;
+    for (int i = 0; i < (int)list.size(); i++) if (same(list[i])) return i;
+    return -1;
 }
 
-// "LABEL      value" row of an inspector; the value in mono, the full text in a tooltip if given.
-void Row(const char* label, const std::string& value, const std::wstring& tooltip = {}) {
-    const float x0 = ImGui::GetCursorPosX();
-    Label(label);
-    ImGui::SameLine(x0 + Px(kRowLabelW));
-    Mono(value.c_str());
-    if (!tooltip.empty() && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", Utf8(tooltip).c_str());
+void PostTo(const DisplayRow& r, std::function<void(int)> fn) {
+    const DisplayIdentity id = r.settings.identity;
+    const int hint = r.liveIndex;
+    Post([id, hint, fn]() {
+        const int mon = ResolveLive(id, hint);
+        if (mon < 0) {
+            notify::Post(notify::Sev::Warning, -1, L"ui", L"That display is no longer connected");
+            return;
+        }
+        fn(mon);
+    });
+}
+
+void Ask(ViewState& vs, std::string title, std::string detail, std::string action, std::function<void()> onConfirm) {
+    vs.confirm = { std::move(title), std::move(detail), std::move(action), std::move(onConfirm) };
+    vs.confirmOpenRequested = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Inspector rows: a caps label column, then values and widgets vertically centred on the row.
+
+struct RowCtx { float x0, y0, h, x; };
+
+RowCtx BeginRow(const char* label, float hDip = kRowH) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = Px(hDip);
+    const ImVec2 ts = MeasureText(Font::Label, kSizeLabel, label);
+    ImGui::GetWindowDrawList()->AddText(GetFont(Font::Label), kSizeLabel * Dpi(),
+                                        ImVec2(p.x, p.y + (h - ts.y) * 0.5f), pal::InkDim, label);
+    return { p.x, p.y, h, p.x + Px(kRowLabelW) };
+}
+
+void RowText(RowCtx& r, const std::string& text, ImU32 col = pal::Ink, Font f = Font::Mono, float sizeDip = kSizeMono,
+             const std::wstring& tooltip = {}) {
+    const ImVec2 ts = MeasureText(f, sizeDip, text.c_str());
+    const ImVec2 at(r.x, r.y0 + (r.h - ts.y) * 0.5f);
+    ImGui::GetWindowDrawList()->AddText(GetFont(f), sizeDip * Dpi(), at, col, text.c_str());
+    if (!tooltip.empty() && ImGui::IsMouseHoveringRect(at, ImVec2(at.x + ts.x, at.y + ts.y)))
+        ImGui::SetTooltip("%s", Utf8(tooltip).c_str());
+    r.x += ts.x + Px(12);
+}
+
+void RowPlace(RowCtx& r, float widgetHDip = 24.0f) {
+    ImGui::SetCursorScreenPos(ImVec2(r.x, r.y0 + (r.h - Px(widgetHDip)) * 0.5f));
+}
+
+void RowNext(RowCtx& r) { r.x = ImGui::GetItemRectMax().x + Px(8); }
+
+void EndRow(const RowCtx& r) {
+    ImGui::SetCursorScreenPos(ImVec2(r.x0, r.y0 + r.h + Px(4)));
+    ImGui::Dummy(ImVec2(0, 0));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -71,7 +127,7 @@ void DrawHeader(ViewState& vs) {
 
     const float bw = 84.0f, gap = 8.0f;
     const float right = p.x + ImGui::GetContentRegionAvail().x - Px(16);
-    float x = right - Px(bw * 2 + gap);
+    const float x = right - Px(bw * 2 + gap);
     const float y = p.y + (h - Px(28)) * 0.5f;
     ImGui::SetCursorScreenPos(ImVec2(x, y));
     if (Toggle("##pg_pipe", "PIPELINE", vs.page == Page::Pipeline, ImVec2(bw, 28))) vs.page = Page::Pipeline;
@@ -82,7 +138,7 @@ void DrawHeader(ViewState& vs) {
     Hairline();
 }
 
-void DrawFooter(const Snapshot& snap) {
+void DrawFooter(const Snapshot& snap, bool busy) {
     Hairline();
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + Px(16));
     ImGui::SetCursorPosY(ImGui::GetCursorPosY() + Px(4));
@@ -95,10 +151,9 @@ void DrawFooter(const Snapshot& snap) {
         ImGui::SameLine(0, Px(6));
         Label("OVERLAY");
     }
-    if (!snap.lastStatus.empty()) {
-        ImGui::SameLine(0, Px(20));
-        Text(Font::Mono, 12.0f, pal::InkFaint, Utf8(snap.lastStatus).c_str());
-    }
+    ImGui::SameLine(0, Px(20));
+    if (busy) Label("APPLYING", pal::Ink);
+    else if (!snap.lastStatus.empty()) Text(Font::Mono, 12.0f, pal::InkFaint, Utf8(snap.lastStatus).c_str());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -248,7 +303,7 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Inspectors (read-only for now)
+// Inspectors
 
 void InspectorHeader(const char* title, Light l) {
     StatusLight(l, 8.0f);
@@ -259,78 +314,298 @@ void InspectorHeader(const char* title, Light l) {
     ImGui::Dummy(ImVec2(0, Px(6)));
 }
 
-void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage* st, bool hdr) {
-    const MonitorSettings& ms = r.settings;
-    const ColorCorrectionSettings& cc = hdr ? ms.hdrColorCorrection : ms.sdrColorCorrection;
-    const MHCSettings& mhc = hdr ? ms.hdrMHC : ms.sdrMHC;
-    if (!st) { Label("SELECT A STAGE", pal::InkFaint); return; }
+void InspectLut(const Snapshot& snap, const DisplayRow& r, const Stage& st, bool hdr) {
+    const std::wstring& path = hdr ? r.settings.hdrPath : r.settings.sdrPath;
+    InspectorHeader("3D LUT", st.light);
+    RowCtx row = BeginRow("CUBE");
+    RowText(row, FileName(path), pal::Ink, Font::Mono, kSizeMono, path);
+    RowPlace(row);
+    if (Button("##lut_browse", "BROWSE\xE2\x80\xA6", 84))
+        PostTo(r, [hdr](int mon) {
+            wchar_t file[MAX_PATH] = {};
+            if (BrowseForLUT(Window(), file, MAX_PATH)) act::SetLutPath(mon, hdr, file);
+        });
+    RowNext(row);
+    RowPlace(row);
+    if (!path.empty() && Button("##lut_clear", "CLEAR", 64))
+        PostTo(r, [hdr](int mon) { act::SetLutPath(mon, hdr, L""); });
+    EndRow(row);
 
-    switch (st->id) {
-    case StageId::Lut3D: {
-        const std::wstring& path = hdr ? ms.hdrPath : ms.sdrPath;
-        InspectorHeader("3D LUT", st->light);
-        Row("CUBE", FileName(path), path);
-        Row("ENGINE", snap.hookMode ? "DWM hook" : "overlay");
-        break;
+    row = BeginRow("ENGINE");
+    RowText(row, snap.hookMode ? "DWM hook" : "overlay");
+    EndRow(row);
+
+    if (hdr) {
+        row = BeginRow("HDR DITHER");
+        RowPlace(row);
+        bool v = false;
+        if (OnOff("##dither", g_hdrDither.load(), &v)) Post([v]() { act::SetHdrDither(v); });
+        EndRow(row);
     }
-    case StageId::ToneMap:
-        InspectorHeader("TONE MAP", st->light);
-        Row("STATE", OnOff(cc.tonemap.enabled));
-        Row("CURVE", CurveName(cc.tonemap.curve));
-        Row("DISPLAY PEAK", Fmt("%.0f nits", cc.tonemap.targetPeakNits));
-        Row("CONTENT PEAK", cc.tonemap.dynamicPeak ? std::string("dynamic") : Fmt("%.0f nits", cc.tonemap.sourcePeakNits));
-        Row("WINDOWS PEAK", ms.maxTml.enabled ? Fmt("%.0f nits", ms.maxTml.peakNits) : std::string("as reported"));
-        break;
-    case StageId::Fald:
-        InspectorHeader("FALD", st->light);
-        Row("STATE", st->light == Light::NotApplicable ? "n/a in SDR" : OnOff(cc.fald.enabled));
-        Row("PANEL FILE", FileName(cc.fald.paramsPath), cc.fald.paramsPath);
-        Row("VIEW", Fmt("%.0f", (double)cc.fald.debugMode));
-        Row("LED LAG", Fmt("mode %.0f", (double)cc.fald.temporalMode));
-        break;
-    case StageId::ShaderTweak:
-        InspectorHeader("SHADER TWEAK", st->light);
-        Row("PRIMARIES", OnOff(cc.primariesEnabled));
-        Row("GRAYSCALE", OnOff(cc.grayscale.enabled));
-        Row("GAMMA 2.4", OnOff(cc.grayscale.use24Gamma));
-        break;
-    case StageId::Primaries: {
-        InspectorHeader("PRIMARIES & WHITE", st->light);
-        Row("PROFILE", mhc.enabled ? FileName(mhc.profilePath.empty() ? mhc.profileName : mhc.profilePath) : std::string("OFF"),
-            mhc.profilePath);
-        Row("SOURCE", FileName(mhc.sourceFilePath), mhc.sourceFilePath);
-        const DisplayPrimaries& p = mhc.customPrimaries;
-        const bool preset = mhc.primariesPreset >= 0 && mhc.primariesPreset < g_numPresetPrimaries &&
-                            g_presetPrimaries[mhc.primariesPreset].name &&
-                            std::wstring(g_presetPrimaries[mhc.primariesPreset].name) != L"Custom";
-        Row("PRIMARIES", !mhc.primariesEnabled ? std::string("OFF")
-                         : preset ? Utf8(g_presetPrimaries[mhc.primariesPreset].name) : std::string("custom"));
-        char buf[96];
-        snprintf(buf, sizeof(buf), "%.4f %.4f", p.Rx, p.Ry); Row("R xy", buf);
-        snprintf(buf, sizeof(buf), "%.4f %.4f", p.Gx, p.Gy); Row("G xy", buf);
-        snprintf(buf, sizeof(buf), "%.4f %.4f", p.Bx, p.By); Row("B xy", buf);
-        snprintf(buf, sizeof(buf), "%.4f %.4f", p.Wx, p.Wy); Row("W xy", buf);
-        snprintf(buf, sizeof(buf), "%s  %.4f %.4f", OnOff(mhc.whiteBalanceEnabled), mhc.whiteBalanceWx, mhc.whiteBalanceWy);
-        Row("WHITE BALANCE", buf);
-        break;
+}
+
+void InspectToneMap(const DisplayRow& r, const Stage& st) {
+    const TonemapSettings& tm = r.settings.hdrColorCorrection.tonemap;
+    InspectorHeader("TONE MAP", st.light);
+    auto post = [&r](TonemapSettings t) { PostTo(r, [t](int mon) { act::SetTonemap(mon, t); }); };
+
+    RowCtx row = BeginRow("STATE");
+    RowPlace(row);
+    bool on = false;
+    if (OnOff("##tm_on", tm.enabled, &on)) { TonemapSettings t = tm; t.enabled = on; post(t); }
+    EndRow(row);
+
+    row = BeginRow("CURVE");
+    RowPlace(row);
+    static const char* kCurves[] = { "BT.2390", "BT.2446A", "REINHARD", "SOFT CLIP", "HARD CLIP" };
+    int pick = Segmented("##tm_curve", kCurves, 5, TonemapCurveToDropdownIndex(tm.curve), 88);
+    if (pick >= 0) { TonemapSettings t = tm; t.curve = DropdownIndexToTonemapCurve(pick); post(t); }
+    EndRow(row);
+
+    row = BeginRow("DISPLAY PEAK");
+    RowPlace(row);
+    float target = tm.targetPeakNits;
+    if (NumberInput("##tm_target", &target, "%.0f", 80)) { TonemapSettings t = tm; t.targetPeakNits = target; post(t); }
+    RowNext(row);
+    RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
+    EndRow(row);
+
+    row = BeginRow("CONTENT PEAK");
+    RowPlace(row);
+    bool dyn = false;
+    if (OnOff("##tm_dyn", tm.dynamicPeak, &dyn, "DYNAMIC", "FIXED")) { TonemapSettings t = tm; t.dynamicPeak = dyn; post(t); }
+    RowNext(row);
+    if (!tm.dynamicPeak) {
+        RowPlace(row);
+        float source = tm.sourcePeakNits;
+        if (NumberInput("##tm_source", &source, "%.0f", 80)) { TonemapSettings t = tm; t.sourcePeakNits = source; post(t); }
+        RowNext(row);
+        RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
     }
-    case StageId::Grayscale: {
-        InspectorHeader("GRAYSCALE & GAMMA", st->light);
-        std::string base = mhc.sourceIs1DCube ? "1D cube" : (mhc.hasPerChannelTRC ? "ICC curves"
-                         : (mhc.baseGrayscale.enabled ? Fmt("%.0f points", mhc.baseGrayscale.pointCount) : std::string("standard")));
-        Row("BASE", base);
-        Row("FINE-TUNE", mhc.correctionGrayscale.enabled ? Fmt("%.0f points", mhc.correctionGrayscale.pointCount) : std::string("OFF"));
-        if (hdr) {
-            Row("DESKTOP GAMMA", mhc.desktopGammaEnabled ? Fmt("2.2 @ %.0f nits", mhc.dgSdrWhiteNits) : std::string("OFF"));
-            Row("PEAK", mhc.metaPeakNits > 0 ? Fmt("%.0f nits", mhc.metaPeakNits) : std::string("\xE2\x80\x94"));
-        } else {
-            Row("GAMMA 2.4", OnOff(mhc.correctionGrayscale.use24Gamma));
+    EndRow(row);
+
+    row = BeginRow("WINDOWS PEAK");
+    RowPlace(row);
+    bool en = false;
+    if (OnOff("##mtml_on", r.settings.maxTml.enabled, &en))
+        PostTo(r, [en](int mon) { act::SetMaxTmlEnabled(mon, en); });
+    RowNext(row);
+    RowPlace(row);
+    float peak = r.settings.maxTml.peakNits;
+    if (NumberInput("##mtml_peak", &peak, "%.0f", 80))
+        PostTo(r, [peak](int mon) { act::SetMaxTmlPeak(mon, peak); });
+    RowNext(row);
+    RowPlace(row);
+    if (Button("##mtml_apply", "APPLY NOW", 92)) {
+        const float nits = r.settings.maxTml.peakNits;
+        PostTo(r, [nits](int mon) { act::ApplyMaxTmlNow(mon, nits); });
+    }
+    EndRow(row);
+}
+
+void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
+    const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
+    InspectorHeader("FALD", st.light);
+
+    RowCtx row = BeginRow("STATE");
+    RowPlace(row);
+    if (st.light == Light::NotApplicable) {
+        RowText(row, "n/a in SDR", pal::InkFaint);
+    } else {
+        bool on = false;
+        if (OnOff("##fald_on", f.enabled, &on)) PostTo(r, [hdr, on](int mon) { act::SetFaldEnabled(mon, hdr, on); });
+    }
+    EndRow(row);
+
+    row = BeginRow("PANEL FILE");
+    RowText(row, FileName(f.paramsPath), pal::Ink, Font::Mono, kSizeMono, f.paramsPath);
+    RowPlace(row);
+    if (Button("##fald_browse", "BROWSE\xE2\x80\xA6", 84))
+        PostTo(r, [hdr](int mon) {
+            wchar_t file[1024] = {};
+            if (BrowseForFaldPanelFile(Window(), file, 1024)) act::SetFaldPanelFile(mon, hdr, file, true);
+        });
+    RowNext(row);
+    RowPlace(row);
+    if (Button("##fald_reload", "RELOAD", 72)) {
+        const std::wstring path = f.paramsPath;
+        PostTo(r, [hdr, path](int mon) { act::SetFaldPanelFile(mon, hdr, path, true); });
+    }
+    EndRow(row);
+
+    row = BeginRow("PEDESTAL");
+    RowPlace(row);
+    bool ped = false;
+    if (OnOff("##fald_ped", f.pedMode != 0, &ped, "COLOUR", "WHITE"))
+        PostTo(r, [ped](int mon) {
+            act::EditFaldShared(mon, [ped](FaldSettings& s) { unsigned v = ped ? 1u : 0u; bool c = s.pedMode != v; s.pedMode = v; return c; });
+        });
+    EndRow(row);
+
+    row = BeginRow("LED LAG");
+    RowPlace(row);
+    static const char* kLag[] = { "OFF", "LEDS + EST", "LEDS ONLY", "PANEL CLOCK" };
+    int lag = Segmented("##fald_lag", kLag, 4, (int)(f.temporalMode <= 3 ? f.temporalMode : 0), 100);
+    if (lag >= 0)
+        PostTo(r, [lag](int mon) {
+            act::EditFaldShared(mon, [lag](FaldSettings& s) { bool c = s.temporalMode != (unsigned)lag; s.temporalMode = (unsigned)lag; return c; });
+        });
+    EndRow(row);
+}
+
+void InspectShaderTweak(const DisplayRow& r, const Stage& st, bool hdr) {
+    const ColorCorrectionSettings& cc = hdr ? r.settings.hdrColorCorrection : r.settings.sdrColorCorrection;
+    InspectorHeader("SHADER TWEAK", st.light);
+    RowCtx row = BeginRow("PRIMARIES"); RowText(row, OnOffText(cc.primariesEnabled)); EndRow(row);
+    row = BeginRow("GRAYSCALE"); RowText(row, OnOffText(cc.grayscale.enabled)); EndRow(row);
+    row = BeginRow("GAMMA 2.4"); RowText(row, OnOffText(cc.grayscale.use24Gamma)); EndRow(row);
+}
+
+void InspectPrimaries(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
+    const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
+    InspectorHeader("PRIMARIES & WHITE", st.light);
+    const bool installed = !mhc.profileName.empty();
+
+    RowCtx row = BeginRow("PROFILE");
+    RowText(row, installed ? FileName(mhc.profilePath.empty() ? mhc.profileName : mhc.profilePath) : std::string("not installed"),
+            installed ? pal::Ink : pal::InkFaint, Font::Mono, kSizeMono, mhc.profilePath);
+    RowPlace(row);
+    if (Button("##mhc_install", installed ? "REINSTALL" : "INSTALL", 92))
+        PostTo(r, [hdr](int mon) { act::MhcInstall(mon, hdr); });
+    RowNext(row);
+    if (installed) {
+        RowPlace(row);
+        if (Button("##mhc_remove", "REMOVE", 72)) {
+            const DisplayRow target = r;
+            Ask(vs, "REMOVE PROFILE?", "Deletes the calibration profile and its cached variants.", "REMOVE",
+                [target, hdr]() {
+                    const int mon = ResolveLive(target.settings.identity, target.liveIndex);
+                    if (mon >= 0) act::MhcRemove(mon, hdr);
+                });
         }
-        Row("PROFILE", Fmt("variant %.0f", (double)mhc.activePerm));
-        break;
+        RowNext(row);
     }
-    default:
-        break;
+    RowPlace(row);
+    if (Button("##mhc_edit", "EDIT\xE2\x80\xA6", 64))
+        PostTo(r, [hdr](int mon) { RunClassicCommand(mon, hdr ? ID_MHC_HDR_EDIT : ID_MHC_TAB_EDIT); });
+    EndRow(row);
+
+    row = BeginRow("SOURCE");
+    RowText(row, FileName(mhc.sourceFilePath), pal::Ink, Font::Mono, kSizeMono, mhc.sourceFilePath);
+    EndRow(row);
+
+    const DisplayPrimaries& p = mhc.customPrimaries;
+    const bool preset = mhc.primariesPreset >= 0 && mhc.primariesPreset < g_numPresetPrimaries &&
+                        g_presetPrimaries[mhc.primariesPreset].name &&
+                        std::wstring(g_presetPrimaries[mhc.primariesPreset].name) != L"Custom";
+    row = BeginRow("PRIMARIES");
+    RowText(row, !mhc.primariesEnabled ? std::string("OFF")
+                 : preset ? Utf8(g_presetPrimaries[mhc.primariesPreset].name) : std::string("custom"));
+    EndRow(row);
+    char buf[96];
+    snprintf(buf, sizeof(buf), "R %.4f %.4f   G %.4f %.4f   B %.4f %.4f", p.Rx, p.Ry, p.Gx, p.Gy, p.Bx, p.By);
+    row = BeginRow("");
+    RowText(row, buf, pal::InkDim);
+    EndRow(row);
+
+    row = BeginRow("WHITE BALANCE");
+    RowPlace(row);
+    bool wb = false;
+    if (OnOff("##wb_on", mhc.whiteBalanceEnabled, &wb))
+        PostTo(r, [hdr, wb](int mon) { act::MhcSetWhiteBalanceEnabled(mon, hdr, wb); });
+    RowNext(row);
+    RowPlace(row);
+    float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
+    const bool ex = NumberInput("##wb_x", &wx, "%.4f", 80);
+    RowNext(row);
+    RowPlace(row);
+    const bool ey = NumberInput("##wb_y", &wy, "%.4f", 80);
+    if (ex || ey) PostTo(r, [hdr, wx, wy](int mon) { act::MhcSetWhiteBalanceXY(mon, hdr, wx, wy); });
+    EndRow(row);
+}
+
+void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
+    const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
+    const GrayscaleSettings& gs = mhc.correctionGrayscale;
+    InspectorHeader("GRAYSCALE & GAMMA", st.light);
+
+    RowCtx row = BeginRow("BASE");
+    RowText(row, mhc.sourceIs1DCube ? "1D cube" : (mhc.hasPerChannelTRC ? "ICC curves"
+                 : (mhc.baseGrayscale.enabled ? Fmt("%.0f points", mhc.baseGrayscale.pointCount) : std::string("standard"))));
+    RowPlace(row);
+    if (Button("##base_edit", "EDIT\xE2\x80\xA6", 64))
+        PostTo(r, [hdr](int mon) { RunClassicCommand(mon, hdr ? ID_MHC_HDR_EDIT : ID_MHC_TAB_EDIT); });
+    EndRow(row);
+
+    row = BeginRow("FINE-TUNE");
+    RowPlace(row);
+    bool on = false;
+    if (OnOff("##gs_on", gs.enabled, &on)) PostTo(r, [hdr, on](int mon) { act::MhcSetCorrectionGsEnabled(mon, hdr, on); });
+    RowNext(row);
+    RowPlace(row);
+    if (Button("##gs_edit", "EDIT CURVE\xE2\x80\xA6", 104))
+        PostTo(r, [hdr](int mon) { RunClassicCommand(mon, hdr ? ID_MHC_HDR_GS_EDIT : ID_MHC_SDR_GS_EDIT); });
+    RowNext(row);
+    RowPlace(row);
+    if (Button("##gs_reset", "RESET", 64)) {
+        const DisplayRow target = r;
+        Ask(vs, "RESET FINE-TUNE?", "Returns every point to neutral.", "RESET", [target, hdr]() {
+            const int mon = ResolveLive(target.settings.identity, target.liveIndex);
+            if (mon >= 0) act::MhcResetCorrectionGs(mon, hdr);
+        });
+    }
+    EndRow(row);
+
+    row = BeginRow("POINTS");
+    RowPlace(row);
+    static const char* kPoints[] = { "10", "20", "32" };
+    const int cur = gs.pointCount == 10 ? 0 : (gs.pointCount == 32 ? 2 : 1);
+    int pick = Segmented("##gs_points", kPoints, 3, cur, 48);
+    if (pick >= 0) {
+        const int count = pick == 0 ? 10 : (pick == 2 ? 32 : 20);
+        const DisplayRow target = r;
+        Ask(vs, "CHANGE POINT COUNT?", "Resets the fine-tune curve to neutral.", "CHANGE", [target, hdr, count]() {
+            const int mon = ResolveLive(target.settings.identity, target.liveIndex);
+            if (mon >= 0) act::MhcSetCorrectionGsPoints(mon, hdr, count);
+        });
+    }
+    EndRow(row);
+
+    if (hdr) {
+        row = BeginRow("CURVE PEAK");
+        RowPlace(row);
+        float peak = gs.peakNits;
+        if (NumberInput("##gs_peak", &peak, "%.0f", 80)) PostTo(r, [peak](int mon) { act::MhcSetCorrectionGsPeak(mon, peak); });
+        RowNext(row);
+        RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
+        EndRow(row);
+
+        row = BeginRow("DESKTOP GAMMA");
+        RowPlace(row);
+        bool dg = false;
+        if (OnOff("##dg_on", mhc.desktopGammaEnabled, &dg)) PostTo(r, [dg](int mon) { act::MhcSetDesktopGamma(mon, dg); });
+        RowNext(row);
+        if (mhc.desktopGammaEnabled) RowText(row, Fmt("2.2 @ %.0f nits", mhc.dgSdrWhiteNits), pal::InkDim);
+        EndRow(row);
+    } else {
+        row = BeginRow("GAMMA 2.4");
+        RowPlace(row);
+        bool g24 = false;
+        if (OnOff("##g24_on", gs.use24Gamma, &g24)) PostTo(r, [g24](int mon) { act::MhcSet24Gamma(mon, g24); });
+        EndRow(row);
+    }
+}
+
+void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage* st, bool hdr, ViewState& vs) {
+    if (!st) { Label("SELECT A STAGE", pal::InkFaint); return; }
+    switch (st->id) {
+    case StageId::Lut3D:       InspectLut(snap, r, *st, hdr); break;
+    case StageId::ToneMap:     InspectToneMap(r, *st); break;
+    case StageId::Fald:        InspectFald(r, *st, hdr); break;
+    case StageId::ShaderTweak: InspectShaderTweak(r, *st, hdr); break;
+    case StageId::Primaries:   InspectPrimaries(r, *st, hdr, vs); break;
+    case StageId::Grayscale:   InspectGrayscale(r, *st, hdr, vs); break;
+    default: break;
     }
 }
 
@@ -404,7 +679,9 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 
     const float colH = ImGui::GetContentRegionAvail().y;
     ImGui::BeginChild("##inspector", ImVec2(-Px(kMeasuredW + 24), colH), ImGuiChildFlags_None);
-    DrawInspector(snap, *sel, st, showHdr);
+    ImGui::BeginDisabled(sel->liveIndex < 0);   // a remembered display that is not connected: view only
+    DrawInspector(snap, *sel, st, showHdr, vs);
+    ImGui::EndDisabled();
     ImGui::EndChild();
     ImGui::SameLine(0, Px(24));
     ImGui::BeginChild("##measured", ImVec2(0, colH), ImGuiChildFlags_None);
@@ -447,9 +724,39 @@ void DrawEventsPage() {
     ImGui::EndChild();
 }
 
+void DrawConfirm(ViewState& vs) {
+    if (vs.confirmOpenRequested) {
+        ImGui::OpenPopup("##confirm");
+        vs.confirmOpenRequested = false;
+    }
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.4f),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(20), Px(16)));
+    if (ImGui::BeginPopupModal("##confirm", nullptr,
+                               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+        Text(Font::Label, 13.0f, pal::Ink, vs.confirm.title.c_str());
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        ImGui::TextUnformatted(vs.confirm.detail.c_str());
+        ImGui::Dummy(ImVec2(0, Px(10)));
+        if (Toggle("##confirm_yes", vs.confirm.action.c_str(), true, ImVec2(96, 28))) {
+            if (vs.confirm.onConfirm) Post(vs.confirm.onConfirm);
+            vs.confirm = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine(0, Px(8));
+        if (Toggle("##confirm_no", "CANCEL", false, ImVec2(96, 28)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            vs.confirm = {};
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopStyleVar();
+}
+
 }  // namespace
 
-void DrawRoot(const Snapshot& snap, ViewState& vs) {
+void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
@@ -462,10 +769,13 @@ void DrawRoot(const Snapshot& snap, ViewState& vs) {
 
     DrawHeader(vs);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
+    ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
     if (vs.page == Page::Events) DrawEventsPage();
     else DrawPipelinePage(snap, vs);
+    ImGui::EndDisabled();
     ImGui::PopStyleVar();
-    DrawFooter(snap);
+    DrawFooter(snap, busy);
+    DrawConfirm(vs);
     ImGui::End();
 }
 

@@ -4,7 +4,19 @@
 // when something changes (input, invalidation, resize) and costs nothing while hidden; after 30 s
 // hidden its device, ImGui context and fonts are released.
 
+#include <functional>
+
+struct HWND__;
+typedef HWND__* HWND;
+
 namespace ui {
+
+// Widgets never call actions directly: many actions stop/start processing or regenerate profiles, and
+// those pump messages, which would re-enter the ImGui frame. A widget posts a command; commands run
+// after the frame has been presented, one at a time, while the interface draws itself disabled.
+void Post(std::function<void()> command);
+bool Busy();                    // a posted command is running (the interface is drawn disabled)
+HWND Window();                  // owner for file dialogs and message boxes
 
 void Show();                    // GUI thread. Creates the window on first use.
 void Hide();                    // GUI thread.
