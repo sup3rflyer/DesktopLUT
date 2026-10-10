@@ -860,6 +860,7 @@ TEST_CASE("Pool: loads identity-keyed displays and unclaimed legacy sections") {
     WritePrivateProfileStringW(L"Display3", L"DevicePath", L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}", ini.c_str());
     WritePrivateProfileStringW(L"Display3", L"EdidId", L"GSM84CD-16843009", ini.c_str());
     WritePrivateProfileStringW(L"Display3", L"DisplayName", L"LG TV SSCR2", ini.c_str());
+    WritePrivateProfileStringW(L"Display3", L"Label", L"Living room TV", ini.c_str());
     WritePrivateProfileStringW(L"Display3", L"LUT_SDR", L"C:\\luts\\lg.cube", ini.c_str());
     WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\mon0.cube", ini.c_str());
     WritePrivateProfileStringW(L"Monitor1", L"LUT_SDR", L"C:\\luts\\mon1.cube", ini.c_str());
@@ -873,9 +874,11 @@ TEST_CASE("Pool: loads identity-keyed displays and unclaimed legacy sections") {
     CHECK(pool[0].identity.devicePath == L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}");
     CHECK(pool[0].identity.edidId == L"GSM84CD-16843009");
     CHECK(pool[0].identity.friendlyName == L"LG TV SSCR2");
+    CHECK(pool[0].label == L"Living room TV");   // the user's name rides with the display
     CHECK(pool[0].sdrPath == L"C:\\luts\\lg.cube");
 
     CHECK(pool[1].slot == -1);
+    CHECK(pool[1].label.empty());
     CHECK(pool[1].legacyIndex == 0);
     CHECK(pool[1].identity.empty());
     CHECK(pool[1].sdrPath == L"C:\\luts\\mon0.cube");

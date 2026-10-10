@@ -2,9 +2,9 @@
 // "Instrument" theme for the ImGui interface.
 //
 // The chrome is achromatic: neutral greys, hairline rules, square-ish frames. Colour is reserved
-// for data (channel curves, swatches, gamut), for alarms (amber) and for the full-colour cube
-// logo, which doubles as a quick wide-gamut tell. Keep new UI inside this palette; a hue in the
-// chrome would bias the eye that is judging the colour on screen.
+// for data (channel curves, swatches, gamut), for health states (green healthy / amber fault, always
+// with a shape and a label) and for the full-colour cube logo, which doubles as a quick wide-gamut
+// tell. Keep new UI inside this palette; a hue in the chrome would bias the eye judging the screen.
 
 #include "imgui.h"
 
@@ -20,7 +20,8 @@ namespace pal {
     constexpr ImU32 Ink         = IM_COL32(0xe6, 0xe6, 0xe6, 0xff);  // primary text; inverted selection fill
     constexpr ImU32 InkDim      = IM_COL32(0x9b, 0x9b, 0x9b, 0xff);  // secondary text, neutral data marks
     constexpr ImU32 InkFaint    = IM_COL32(0x80, 0x80, 0x80, 0xff);  // tertiary text (>= 4.5:1 on Ground)
-    constexpr ImU32 Alarm       = IM_COL32(0xe3, 0xa5, 0x4a, 0xff);  // the only non-data hue
+    constexpr ImU32 Alarm       = IM_COL32(0xe3, 0xa5, 0x4a, 0xff);  // fault (always a triangle + label)
+    constexpr ImU32 Good        = IM_COL32(0x2f, 0xa3, 0x6b, 0xff);  // healthy (a filled dot + label); CVD-checked vs Alarm
     // Channel identity in data plots (validated for CVD separation on Ground with direct labels).
     constexpr ImU32 ChanR       = IM_COL32(0xd4, 0x50, 0x4c, 0xff);
     constexpr ImU32 ChanG       = IM_COL32(0x86, 0xcc, 0x8a, 0xff);

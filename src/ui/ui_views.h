@@ -27,6 +27,9 @@ struct ViewState {
     bool showOtherMode = false;    // show the pipeline of the mode the display is NOT in
     Confirm confirm;               // pending confirmation (onConfirm empty = none)
     bool confirmOpenRequested = false;
+    std::wstring renamingKey;      // the sidebar row being renamed (double-click); empty = none
+    char renameBuf[128] = {};      // its edit buffer (UTF-8)
+    bool renameFocus = false;      // give the field keyboard focus on its first frame
 };
 
 void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy);

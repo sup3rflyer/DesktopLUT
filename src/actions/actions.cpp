@@ -506,6 +506,38 @@ Result MhcSetDesktopGamma(int mon, bool on) {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// Display name
+
+Result SetDisplayLabel(int slot, int liveIndex, const std::wstring& label) {
+    // Trim, and keep it a name (one line, bounded).
+    size_t a = label.find_first_not_of(L" \t\r\n");
+    size_t b = label.find_last_not_of(L" \t\r\n");
+    std::wstring clean = (a == std::wstring::npos) ? std::wstring() : label.substr(a, b - a + 1);
+    for (wchar_t& c : clean) if (c < 32) c = L' ';
+    if (clean.size() > 64) clean.resize(64);
+
+    bool found = false, changed = false;
+    int liveFound = -1;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        auto apply = [&](MonitorSettings& ms) { found = true; changed = ms.label != clean; ms.label = clean; };
+        if (slot >= 0) {
+            for (size_t i = 0; i < g_gui.monitorSettings.size() && !found; i++)
+                if (g_gui.monitorSettings[i].slot == slot) { apply(g_gui.monitorSettings[i]); liveFound = (int)i; }
+            for (MonitorSettings& ms : g_gui.parkedSettings)
+                if (!found && ms.slot == slot) apply(ms);
+        } else if (liveIndex >= 0 && liveIndex < (int)g_gui.monitorSettings.size()) {
+            apply(g_gui.monitorSettings[liveIndex]);
+            liveFound = liveIndex;
+        }
+    }
+    if (!found) return Done(false);
+    if (changed) SaveSettings();
+    GuiNotifySettingsChanged(liveFound);
+    return Done(changed);
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Settings
 
 void SetHotkeyEnabled(int hotkeyId, bool on) {

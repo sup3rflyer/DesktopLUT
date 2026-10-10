@@ -61,6 +61,11 @@ Result MhcSet24Gamma(int mon, bool on);                               // SDR fin
 Result MhcSetCorrectionGsPeak(int mon, float nits);                   // HDR fine-tune, 10..10000
 Result MhcSetDesktopGamma(int mon, bool on);                          // HDR
 
+// ---- Display name ----------------------------------------------------------------------------------
+// The user's name for a display, live or remembered. Found by storage slot (live or parked); a live
+// display not yet given a slot is found by its live index. Empty = back to the automatic name.
+Result SetDisplayLabel(int slot, int liveIndex, const std::wstring& label);
+
 // ---- Settings ------------------------------------------------------------------------------------
 void SetHotkeyEnabled(int hotkeyId, bool on);      // HOTKEY_GAMMA / HOTKEY_HDR_TOGGLE / HOTKEY_ANALYSIS
 void SetStartMinimized(bool on);

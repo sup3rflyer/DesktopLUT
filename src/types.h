@@ -962,6 +962,7 @@ struct MonitorSettings {
                             // is stamped on it
     std::wstring firstSeen; // ISO date (YYYY-MM-DD) the display was first attached; informational
     std::wstring lastSeen;  // ISO date it was last attached / saved while connected; informational
+    std::wstring label;     // the user's name for the display (INI Label); empty = automatic. Never used for matching
 };
 
 // [Display<slot>] slots are allocated below this cap (lowest free slot first).

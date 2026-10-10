@@ -80,14 +80,14 @@ void TakeSnapshot(Snapshot& out) {
         for (const MonitorSettings& ms : g_gui.parkedSettings) {
             DisplayRow r;
             r.settings = ms;
-            r.name = DisplayLabel(ms.identity, std::wstring());
+            r.name = !ms.label.empty() ? ms.label : DisplayLabel(ms.identity, std::wstring());
             out.parked.push_back(std::move(r));
         }
     }
     for (DisplayRow& r : out.live) {
         const ModeEntry* m = FindMode(r.hmon);
         r.mode = m ? m->mode : Mode::Unknown;
-        r.name = DisplayLabel(r.settings.identity, m ? m->name : std::wstring());
+        r.name = !r.settings.label.empty() ? r.settings.label : DisplayLabel(r.settings.identity, m ? m->name : std::wstring());
         MONITORINFO mi = { sizeof(mi) };
         if (r.hmon && GetMonitorInfo(r.hmon, &mi)) {
             r.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;

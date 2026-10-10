@@ -799,12 +799,15 @@ static void LoadIdentityKeys(const wchar_t* section, MonitorSettings& ms, const 
     ms.identity.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
     ms.firstSeen             = ReadLongINIString(section, L"FirstSeen", iniPath);
     ms.lastSeen              = ReadLongINIString(section, L"LastSeen", iniPath);
+    ms.label                 = ReadLongINIString(section, L"Label", iniPath);
 }
 
 static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
     if (!ms.firstSeen.empty()) WritePrivateProfileStringW(section, L"FirstSeen", ms.firstSeen.c_str(), iniPath);
     if (!ms.lastSeen.empty())  WritePrivateProfileStringW(section, L"LastSeen", ms.lastSeen.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"DisplayName", ms.identity.friendlyName.c_str(), iniPath);
+    // The user's own name for the display; absent = the automatic one (the key is removed, not left empty).
+    WritePrivateProfileStringW(section, L"Label", ms.label.empty() ? nullptr : ms.label.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
     // Written last of all the section's keys: a section with a DevicePath is a complete one.
     WritePrivateProfileStringW(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
