@@ -11916,11 +11916,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                 "for sim/CI/reproducible runs, NOT an unattended hardware run "
                                 "(refused on live measuring flows)")
     adj_group.add_argument("--supervised", action="store_true",
-                           help="autonomous, but PAUSE for a live judge at safety-critical seams "
-                                "(foundation collapse / optimizer floor / failed verify) — the mode for "
-                                "an unattended HARDWARE run; a clean run never pauses. Benign defaults "
-                                "are taken as VISIBLE, vetoable judgment packets on the digest "
-                                "(seam status=auto_accepted, full request + veto lever), never silently.")
+                           help="NOT for hardware runs (the design law: every hardware run is LLM-adjudicated "
+                                "throughout — use the default --attended). Auto-accepts benign recommendations as "
+                                "VISIBLE, vetoable judgment packets on the digest (seam status=auto_accepted, full "
+                                "request + veto lever) and pauses only at safety-critical seams (foundation collapse "
+                                "/ optimizer floor / failed verify). Kept for supervised experiments.")
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
@@ -12176,8 +12176,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         print(json.dumps({"error": (
             "--auto (pure rubber-stamp, no LLM) must not drive a live measuring run — it would optimize "
             "for hours on an unadjudicated foundation. It is sim/CI only. Run live with --attended (the "
-            "default: every seam pauses for the LLM) or with --supervised, and use the in-process "
-            "simulator for sim/CI.")}))
+            "default: every seam pauses for the LLM), and use the in-process simulator for sim/CI.")}))
         return 2
     if args.auto:
         adjudicator: Adjudicator = AutoAdjudicator()
