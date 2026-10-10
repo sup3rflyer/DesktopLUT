@@ -3248,13 +3248,17 @@ class Calibration:
     def _correction_resolution_question(self, digest: Mapping[str, Any]
                                         ) -> Optional[tuple[str, str, str]]:
         """``(question, recommendation, reason)`` when the preflight's correction resolution needs
-        a judge, else ``None``. Only this mode's own recorded store slot (or a profile-YAML file
-        with no competing slot) is mechanical; everything else is evidence for the LLM:
+        a judge, else ``None``. Only this mode's own recorded store slot — or the profile-YAML file
+        on a rig where this is the only display on record (the per-meter file can only be meant for
+        it) — is mechanical; everything else is evidence for the LLM:
 
         * ``missing_file`` — the resolved file is gone from where the meter looks → RAW reads (abort);
         * ``raw_other_mode`` — no correction for this mode while another mode has one → RAW (abort);
         * ``raw_none`` — no correction anywhere for this display → RAW (proceed; build one first?);
         * ``profile_other_mode`` — the profile YAML file stands in while another mode has a slot;
+        * ``profile_cross_display`` — the per-meter profile YAML file stands in for a display with no
+          recorded correction while other displays are on record: it may be another panel's CCMX/CCSS
+          (abort when the store records that very file for another display, else proceed);
         * ``legacy_inferred`` — this mode's slot was only inferred from a legacy schema-1 file.
 
         build-correction is exempt: it is the flow that mints the correction."""
@@ -3283,6 +3287,21 @@ class Calibration:
                     f"{Path(str(file)).name} stands in (the store's {others} correction is not used). "
                     f"Proceed only if that file is a {mode} correction for this panel.",
                     "proceed", "profile_other_mode")
+        cross = res.get("cross_display") if res.get("source") == "profile" else None
+        if cross:
+            fname = Path(str(file)).name
+            on_record = sorted(set(cross.get("profile_displays") or ()) | set(cross.get("store_displays") or ()))
+            recorded_for = list(cross.get("recorded_for") or ())
+            return (f"no colorimeter correction is recorded for {name} (in any mode); the meter would use "
+                    f"the profile YAML's meter-level {fname} (meter.correction.file), which is NOT this "
+                    f"display's own recorded correction — the rig has other displays on record "
+                    f"({', '.join(on_record)})"
+                    + (f" and the correction store records {fname} as the correction of "
+                       f"{', '.join(recorded_for)}" if recorded_for else "")
+                    + f". A CCMX/CCSS describes one panel's spectra: another panel's skews every read of "
+                    f"this run. abort = stop now (nothing measured) and build this display's own "
+                    f"({build}); proceed = meter through {fname}, only if it was made for {name} in {mode}.",
+                    "abort" if recorded_for else "proceed", "profile_cross_display")
         if res.get("source") == "store" and str(res.get("mode_source") or "").startswith("legacy"):
             return (f"{res.get('warning') or f'the {mode} correction was assigned by legacy inference'} "
                     f"Proceed if {Path(str(file)).name} is the {mode} correction, or abort and "
@@ -11002,11 +11021,34 @@ class CorrectionResolution:
     mode_source: Optional[str] = None  # the store slot's provenance (legacy inference is flagged)
     other_modes: tuple[str, ...] = ()  # modes whose store slot holds a correction NOT used here
     warning: Optional[str] = None
+    # source "profile" only: why the meter-level YAML file may be ANOTHER display's correction (the
+    # profile drives other displays / the store holds other displays' corrections / the store records
+    # this very file for another display) — None when this display is the rig's only one
+    cross_display: Optional[dict[str, list[str]]] = None
 
     def as_dict(self) -> dict[str, Any]:
         return {"file": self.file, "source": self.source, "mode": self.mode,
                 "mode_source": self.mode_source, "other_modes": list(self.other_modes),
-                "warning": self.warning}
+                "warning": self.warning, "cross_display": self.cross_display}
+
+
+def _profile_file_cross_display(profile: cp.Profile, store: CorrectionStore, display_name: str,
+                                file: str) -> Optional[dict[str, list[str]]]:
+    """Mechanical evidence that ``profile.meter.correction.file`` — a per-METER setting, not a
+    per-display one — may belong to another panel: the profile's other displays, the displays the
+    correction store holds corrections for, and those whose slot records this very file (by name).
+    ``None`` when nothing else is on record (a single-display rig: the file can only be meant for it)."""
+    recs = store.records()
+    fname = Path(str(file)).name.lower()
+    profile_displays = sorted({d.name for d in profile.displays if d.name != display_name})
+    store_displays = sorted({d for (d, _m), r in recs.items() if d != display_name and r.correction_file})
+    recorded_for = sorted(f"{d} ({m})" for (d, m), r in recs.items()
+                          if d != display_name and r.correction_file
+                          and Path(str(r.correction_file)).name.lower() == fname)
+    if not (profile_displays or store_displays or recorded_for):
+        return None
+    return {"profile_displays": profile_displays, "store_displays": store_displays,
+            "recorded_for": recorded_for}
 
 
 def resolve_correction(profile: cp.Profile, store: CorrectionStore, display_name: str,
@@ -11016,7 +11058,9 @@ def resolve_correction(profile: cp.Profile, store: CorrectionStore, display_name
     ``profile.meter.correction.file`` — NEVER to the other mode's stored correction (a
     CCMX is built against one mode's spectra; the PA32UCXR SDR runs 2026-06-19..09-25
     measured through the HDR one, ~1.6 dE2000 on full red). The fallback, and a slot whose
-    mode was only inferred from a legacy schema-1 file, carry a ``warning`` for the evidence."""
+    mode was only inferred from a legacy schema-1 file, carry a ``warning`` for the evidence.
+    The YAML file is per-METER: on a rig with other displays on record a fallback carries
+    ``cross_display`` (it may be another panel's correction — the ``preflight:correction`` seam)."""
     mode = normalize_mode(mode)
     rec = store.get(display_name, mode)
     others = tuple(m for m, r in sorted(store.modes_for(display_name).items())
@@ -11030,13 +11074,22 @@ def resolve_correction(profile: cp.Profile, store: CorrectionStore, display_name
         return CorrectionResolution(rec.correction_file, "store", mode, rec.mode_source, others, warning)
     fallback = profile.meter.correction.file
     warning = None
+    cross = _profile_file_cross_display(profile, store, display_name, fallback) if fallback else None
     if others:
         other_files = ", ".join(f"{m}: {Path(store.get(display_name, m).correction_file).name}" for m in others)
         warning = (f"no {mode} colorimeter correction recorded for {display_name} — falling back to the "
                    f"profile YAML ({fallback or 'none → RAW meter readings'}); the store's other-mode "
                    f"correction ({other_files}) is deliberately NOT used for a {mode} run. Build one with "
                    f"`--flow build-correction --mode {mode}`.")
-    return CorrectionResolution(fallback, "profile" if fallback else "none", mode, None, others, warning)
+    elif cross:
+        warning = (f"no colorimeter correction recorded for {display_name} — falling back to the profile "
+                   f"YAML's meter-level {Path(str(fallback)).name}, which is not this display's own "
+                   f"recorded correction (other displays on record: "
+                   f"{', '.join(sorted(set(cross['profile_displays']) | set(cross['store_displays'])))}"
+                   + (f"; the store records it for {', '.join(cross['recorded_for'])}" if cross["recorded_for"] else "")
+                   + f"). Build this display's own with `--flow build-correction --mode {mode}`.")
+    return CorrectionResolution(fallback, "profile" if fallback else "none", mode, None, others, warning,
+                                cross)
 
 
 def active_correction(profile: cp.Profile, store: CorrectionStore, display_name: str,
