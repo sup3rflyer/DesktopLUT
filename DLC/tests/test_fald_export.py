@@ -42,3 +42,28 @@ def test_curve_lut_matches_drive_of():
         lut = float(np.interp(np.log(nits), ln, curve))
         ref = float(m.drive_of(np.array([nits]))[0])
         assert abs(lut - ref) < 2e-3, (nits, lut, ref)
+
+
+def test_lattice_fit_matches_the_export_arithmetic():
+    """The preflight's pitch check uses the export's own arithmetic (choose_scale canvas -> header cell px)."""
+    from dlc.fald.export import lattice_fit
+    pa = lattice_fit(3840, 2160, 48, 48)
+    assert pa["exact"] and pa["fits"] and pa["cell_px"] == [80, 45] and pa["uncovered_px"] == [0, 0]
+    qhd = lattice_fit(2560, 1440, 48, 24)                     # 53.3-px pitch -> 55-px cells: the loader refuses it
+    assert not qhd["fits"] and qhd["lattice_px"] == [2640, 1440]
+    uw = lattice_fit(3440, 1440, 48, 24)                      # 71.7-px pitch -> 70-px cells: fits, 80 px uncovered
+    assert uw["fits"] and not uw["exact"] and uw["lattice_px"] == [3360, 1440] and uw["uncovered_px"] == [80, 0]
+    assert uw["max_drift_px"] == [80.0, 0.0] and abs(uw["max_drift_cells"][0] - 80 / (3440 / 48)) < 1e-3
+    assert uw["max_drift_cells"][0] > 1.0                      # the far-edge zones land more than a cell off
+    odd = lattice_fit(2560, 1440, 40, 25)                     # an integer 64-px pitch still rescales (rows 57.6 px)
+    assert not odd["fits"] and odd["cell_px"] == [65, 60]
+
+
+def test_export_header_cells_are_the_lattice_fit_cells(tmp_path):
+    """The file's header words 4/5 are what lattice_fit predicted for the geometry the fit was built on."""
+    from dlc.fald import profile as P
+    from dlc.fald.export import export_panel_params, lattice_fit
+    from dlc.fald.model import FaldModel
+    g = P.PanelGeometry.from_diagonal(3440, 1440, 48, 24, 34.0, meter=(1720, 720), white_nits=1000.0)
+    info = export_panel_params(FaldModel(g.base_params()), tmp_path / "uw.bin")
+    assert info["header_ints"][4:6] == lattice_fit(3440, 1440, 48, 24)["cell_px"]

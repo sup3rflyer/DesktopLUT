@@ -157,6 +157,38 @@ def boost_block(p: FaldParams) -> bytes:
     return buf
 
 
+def header_cell_px(cell_w: float, cell_h: float) -> tuple[int, int]:
+    """The integer cell size (words 4/5) the panel file carries. The C++ loader places the lattice at the header origin
+    (0, 0 — words 6/7) with ``cols * cell_w`` x ``rows * cell_h`` px and REFUSES a file whose lattice does not fit the
+    monitor's frame (``FaldLatticeFits``, shared/fald_panel.cpp)."""
+    return int(round(cell_w)), int(round(cell_h))
+
+
+def lattice_fit(width: int, height: int, cols: int, rows: int) -> dict:
+    """What the exported panel file's lattice will be on a ``width`` x ``height`` frame with a ``cols`` x ``rows`` zone
+    grid — the SAME arithmetic the export runs (the model canvas of :func:`dlc.fald.profile.choose_scale`, then
+    :func:`header_cell_px`), so a profiling run can know before it measures anything whether its file will load.
+
+    ``fits`` = the C++ loader accepts the lattice (origin 0,0); ``exact`` = it covers the frame exactly (an integer
+    pitch the model renders exactly — the PA32UCXR's 3840x2160 / 48x48 → 80 x 45 px). A lattice that fits but is
+    smaller than the frame leaves ``uncovered_px`` at the right / bottom uncorrected, and every zone boundary k drifts
+    by ``k * (pitch - cell)``: ``max_drift_px`` (= the uncovered strip, at the lattice's far edge) is also given in
+    true zone pitches (``max_drift_cells``)."""
+    from .profile import choose_scale
+    _, canvas_w, canvas_h = choose_scale(int(width), int(height), int(cols), int(rows))
+    cell_w, cell_h = header_cell_px(canvas_w / cols, canvas_h / rows)
+    lat_w, lat_h = cols * cell_w, rows * cell_h
+    pitch = (width / cols, height / rows)
+    drift_px = (cols * abs(pitch[0] - cell_w), rows * abs(pitch[1] - cell_h))
+    return {"frame_px": [int(width), int(height)], "zones": [int(cols), int(rows)],
+            "pitch_px": [round(pitch[0], 4), round(pitch[1], 4)], "cell_px": [cell_w, cell_h],
+            "lattice_px": [lat_w, lat_h], "fits": lat_w <= width and lat_h <= height,
+            "exact": lat_w == width and lat_h == height,
+            "uncovered_px": [max(0, int(width) - lat_w), max(0, int(height) - lat_h)],
+            "max_drift_px": [round(drift_px[0], 2), round(drift_px[1], 2)],
+            "max_drift_cells": [round(drift_px[0] / pitch[0], 3), round(drift_px[1] / pitch[1], 3)]}
+
+
 def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> dict:
     p = model.p
     kt, ke = kernel_tables(model)
@@ -174,7 +206,7 @@ def export_panel_params(model: FaldModel, path: Path, gain_clip=(0.25, 4.0)) -> 
     stat_words = stat_ctx_words(p) if v5 else struct.pack("<6I", *([0] * 6))   # validated before anything is written
     boost = (boost_block(p) if p.boost_lut else struct.pack("<56I", *([0] * 56))) if v4 else b""
     header = [MAGIC5 if v5 else (MAGIC4 if v4 else (MAGIC3 if v3 else (MAGIC2 if v2 else MAGIC))), p.cols, p.rows, p.sub,
-              int(round(p.cell_w)), int(round(p.cell_h)), 0, 0, rt_c, rt_r, re_c, re_r, len(curve)]
+              *header_cell_px(p.cell_w, p.cell_h), 0, 0, rt_c, rt_r, re_c, re_r, len(curve)]
     floats = [p.white_nits, p.tmin, p.stat_area0_px2, *p.chan_weights, gain_clip[0], gain_clip[1],
               p.drive_floor_nits, CURVE_LOG_MIN, CURVE_LOG_MAX, p.est_phase_px, p.est_phase_py]
     buf = (struct.pack("<13I", *header) + struct.pack("<13f", *floats) + struct.pack("<2f", p.fade_lo, p.fade_hi)
