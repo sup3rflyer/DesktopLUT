@@ -306,6 +306,7 @@ class MockDesktopLutState:
     def as_dict(self) -> dict[str, Any]:
         return {
             "running": self.running,
+            "suspended": False,
             "corrections_enabled": self.corrections_enabled,
             "calibration_mode": deepcopy(self.calibration_mode),
             "snapshots": deepcopy(self.snapshots),

@@ -62,6 +62,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {},
             {
                 "running": "boolean",
+                "suspended": "boolean (user Suspend switch; a DLC apply clears it — see DesktopLUT event log)",
                 "corrections_enabled": "boolean (the OVERLAY-draw flag, NOT 'a correction is live' — "
                                        "false in DWM-hook mode even with a cube loaded; see ../docs/NAMING.md S4)",
                 "calibration_mode": "object or null",
