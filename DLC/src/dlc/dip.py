@@ -113,6 +113,10 @@ class DisplayInstrumentProfile:
     # -- metadata ---------------------------------------------------------
     instrument: Optional[str] = None             # meter id (e.g. "X-Rite i1 DisplayPro")
     correction_file: Optional[str] = None        # the .ccmx in force during characterization
+    patch_window_area_pct: Optional[float] = None  # the patch window (% of screen AREA, 100 = full
+    #   field) the presenter reported while characterizing — on an ABL panel the measured white /
+    #   settle / noise depend on it, so a later run at a different window is a judgment (the
+    #   preflight:patch-window seam). None = unknown / an older record (never a mismatch).
     made: Optional[str] = None                   # YYYY-MM-DD — the staleness clock
     max_age_days: Optional[int] = None
     updated: Optional[str] = None
@@ -163,6 +167,7 @@ class DisplayInstrumentProfile:
             recommended_drift_threshold=_opt_float(d.get("recommended_drift_threshold")),
             instrument=d.get("instrument"),
             correction_file=d.get("correction_file"),
+            patch_window_area_pct=_opt_float(d.get("patch_window_area_pct")),
             made=d.get("made"),
             max_age_days=(int(d["max_age_days"]) if d.get("max_age_days") is not None else None),
             updated=d.get("updated"),

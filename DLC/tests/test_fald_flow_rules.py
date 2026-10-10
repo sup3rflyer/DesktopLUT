@@ -711,8 +711,9 @@ def test_unstamped_file_without_legacy_meter_raises_meter_unstamped(tmp_path):
 
 def test_preflight_on_a_measured_run_needs_keep_geometry(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
-    first = _run(ctx, "preflight", zones="31x18")
-    assert first.status == "ran" and "cell_not_integer" in {a.code for a in first.anomalies}
+    # a rounded (but loadable) lattice the LLM let through at the cell-pitch seam — then fixed --zones
+    first = _run(ctx, "preflight", zones="30x18", decide=["fald_profile:cell_pitch=proceed"])
+    assert first.status == "ran" and first.metrics["lattice"]["uncovered_px"] == [10, 0]
     fixed = _run(ctx, "preflight", zones="32x18")                     # nothing measured yet: the corrected re-run is allowed
     assert fixed.status == "ran" and _common.load_dlc_state(ctx)["fald"]["geometry"]["cols"] == 32
     assert _run(ctx, "register").status == "ran"

@@ -391,6 +391,14 @@ def _parse_host_port(text: str) -> tuple[str, int]:
     return host, int(port)
 
 
+def park_probe_presenter(presenter: Any, level: str, bit_depth: int) -> dict[str, Any]:
+    """Park the probe's presenter on the idle patch for ``level`` (``black`` / ``mid`` / ``hold``)
+    via the presenter's real ``show`` API (the earlier inline park called a non-existent
+    ``present`` and its AttributeError was swallowed, so the panel was never parked). Never raises."""
+    from .measure_loop import park_presenter
+    return park_presenter(presenter, level, bit_depth)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m dlc.hook_routing",
@@ -449,12 +457,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             log("hook state AFTER: " + json.dumps(ctrl.hook_state(), indent=1))
         except Exception as exc:  # noqa: BLE001
             log(f"hook state AFTER unavailable: {exc}")
-        # OLED etiquette: never leave the panel on a bright patch.
-        try:
-            presenter.present(MeasurePatch(label="park", rgb=(0, 0, 0), signal=(0.0,) * 3,
-                                           role="warmup", bit_depth=args.bit_depth, seq=0))
-        except Exception:  # noqa: BLE001
-            pass
+        # OLED etiquette: never leave the panel on a bright patch — park per the display's
+        # idle policy (black on an emissive panel), then drop our socket (the daemon persists).
+        park = park_probe_presenter(presenter, profile.display_for(args.monitor).idle_park,
+                                    args.bit_depth)
+        log("idle park: " + json.dumps(park))
+        presenter.close()
         try:
             meter.close()
         except Exception:  # noqa: BLE001

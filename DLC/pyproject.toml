@@ -10,7 +10,8 @@ requires-python = ">=3.11"
 # The spine and contract stay dependency-free. The heavy scientific stack lives
 # behind the `engine` extra (pip install -e .[engine]) and is imported only by
 # dlc.engine.*; the persistent-meter ConPTY transport needs the `meter` extra
-# (pywinpty), lazily imported by dlc.argyll only when --persistent-meter is used.
+# (pywinpty), lazily imported by dlc.argyll for the persistent meter (the default;
+# --legacy-meter opts out).
 # See requirements.txt.
 dependencies = []
 

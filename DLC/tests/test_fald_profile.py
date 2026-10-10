@@ -420,3 +420,121 @@ def test_stage_restore_passes_the_preflight_stale_tell(tmp_path, monkeypatch):
     monkeypatch.setattr(_common, "request_snapshot_restore", spy)
     _run(ctx, "restore")
     assert seen.get("stale_tell") == tell
+
+
+
+# ----------------------------------------------------------------------------- preflight seams: panel class + cell pitch
+def test_panel_class_concern_matrix():
+    c = fald_profile.panel_class_concern
+    assert c("mini-LED IPS", 2304) is None              # the PA32UCXR
+    assert c("mini-LED IPS", None) is None              # the synthetic rehearsal display (tech names mini-LED)
+    assert c("VA", 384) is None and c("IPS FALD", None) is None and c("edge-lit local dimming", None) is None
+    assert c("QD-OLED", None) == "oled" and c("WOLED", None) == "oled" and c("OLED", 100) == "oled"
+    assert c("IPS", None) == "no_local_dimming" and c("IPS", 0) == "no_local_dimming"
+    assert c(None, None) == "no_local_dimming"
+
+
+def _profile_with_panel(monkeypatch, *, tech, zones, monitor=1):
+    """--profile under --simulate: the stage reads THIS profile's display (load_profile monkeypatched)."""
+    from dataclasses import replace as _replace
+    from dlc import calibration_profile as cp
+    base = cp.Profile.synthetic(monitor=monitor)
+    disp = _replace(base.displays[0], name="Test panel", panel=cp.PanelInfo(tech=tech, backlight_zones=zones))
+    prof = _replace(base, displays=(disp,))
+    monkeypatch.setattr(cp, "load_profile", lambda path=None: prof)
+    return "test_profile.yaml"
+
+
+def _nothing_entered(ctx):
+    st = _common.load_dlc_state(ctx)
+    return "geometry" not in st["fald"] and not st["fald"].get("entered")
+
+
+@pytest.mark.parametrize("tech,zones,concern", [("WOLED", None, "oled"), ("IPS", None, "no_local_dimming")])
+def test_preflight_panel_class_seam_before_anything_is_entered(tmp_path, monkeypatch, tech, zones, concern):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    prof = _profile_with_panel(monkeypatch, tech=tech, zones=zones)
+    res = _run(ctx, "preflight", profile=prof)
+    assert res.status == "blocked" and res.anomalies[0].code == "panel_class", res.as_dict()
+    seam = res.raw["seam"]
+    assert seam["key"] == fald_profile.SEAM_PANEL_CLASS and seam["options"] == ["abort", "proceed"]
+    assert seam["recommendation"] == "abort" and seam["digest"]["concern"] == concern
+    assert seam["digest"]["evidence"] == {"monitor": 1, "display": "Test panel", "tech": tech, "backlight_zones": zones}
+    assert repr(tech) in seam["question"] and res.advice["default_policy_verdict"] == "judge_panel_class"
+    assert _nothing_entered(ctx) and "calibration_enter" not in res.raw
+    # abort: still nothing entered
+    ab = _run(ctx, "preflight", profile=prof, decide=["fald_profile:panel_class=abort=owner says no"])
+    assert ab.status == "blocked" and ab.anomalies[0].code == "panel_class_aborted" and _nothing_entered(ctx)
+    # an off-vocabulary choice keeps the seam open
+    odd = _run(ctx, "preflight", profile=prof, decide=["fald_profile:panel_class=yes"])
+    assert odd.status == "blocked" and odd.anomalies[0].code == "panel_class"
+    # proceed: the flow runs, the decision is in the run record
+    go = _run(ctx, "preflight", profile=prof, decide=["fald_profile:panel_class=proceed=owner knows the panel"])
+    assert go.status == "ran", go.as_dict()
+    rec = _common.load_dlc_state(ctx)["fald"]["decisions"][fald_profile.SEAM_PANEL_CLASS]
+    assert rec["choice"] == "proceed" and rec["reason"] == "owner knows the panel" and rec["by"] == "--decide"
+    # a --keep-geometry re-entry on the same panel replays the recorded decision
+    again = _run(ctx, "preflight", profile=prof, keep_geometry=True)
+    assert again.status == "ran" and any("run record" in a for a in again.actions_taken)
+
+
+def test_preflight_panel_class_passes_a_zone_dimmed_panel_silently(tmp_path, monkeypatch):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    res = _run(ctx, "preflight", profile=_profile_with_panel(monkeypatch, tech="mini-LED IPS", zones=2304))
+    assert res.status == "ran" and "seam" not in res.raw and "seams" not in res.raw
+    assert not [a for a in res.anomalies if a.code.startswith("panel_class")]
+
+
+def test_preflight_simulate_without_profile_is_the_synthetic_mini_led(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    res = _run(ctx, "preflight")
+    assert res.status == "ran" and "seam" not in res.raw and "decisions" not in _common.load_dlc_state(ctx)["fald"]
+
+
+def test_preflight_unknown_display_is_a_panel_class_seam(tmp_path, monkeypatch):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    prof = _profile_with_panel(monkeypatch, tech="mini-LED IPS", zones=2304, monitor=7)    # nothing on monitor 1
+    res = _run(ctx, "preflight", profile=prof)
+    assert res.status == "blocked" and res.raw["seam"]["digest"]["concern"] == "unknown_panel"
+    assert _nothing_entered(ctx)
+
+
+def test_preflight_exact_pitch_is_silent_pa_frame(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    res = _run(ctx, "preflight", monitor=0, zones="48x48")              # simulated monitor 0 = 3840x2160 (PA32UCXR grid)
+    assert res.status == "ran", res.as_dict()
+    assert res.metrics["cell_px"] == [80.0, 45.0] and "lattice" not in res.metrics and "seam" not in res.raw
+    assert not {"cell_not_integer", "cell_pitch", "lattice_refused"} & {a.code for a in res.anomalies}
+
+
+def test_preflight_refuses_a_lattice_the_loader_would_refuse(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    res = _run(ctx, "preflight", zones="48x24")                          # 2560x1440: 55-px cells -> a 2640-px lattice
+    assert res.status == "blocked" and res.anomalies[0].code == "lattice_refused"
+    assert "2640x1440" in res.anomalies[0].detail and "48x24" in res.anomalies[0].detail
+    assert res.metrics["lattice"]["fits"] is False and _nothing_entered(ctx)
+    # mechanical: no seam a decision could answer
+    again = _run(ctx, "preflight", zones="48x24", decide=["fald_profile:cell_pitch=proceed"])
+    assert again.status == "blocked" and again.anomalies[0].code == "lattice_refused"
+
+
+def test_preflight_rounded_lattice_is_a_cell_pitch_seam(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    res = _run(ctx, "preflight", zones="36x18")                          # 2560/36 = 71.1 px -> 70-px cells, 2520 px
+    assert res.status == "blocked" and res.anomalies[0].code == "cell_pitch"
+    seam = res.raw["seam"]
+    lat = seam["digest"]["lattice"]
+    assert lat["lattice_px"] == [2520, 1440] and lat["uncovered_px"] == [40, 0]
+    assert lat["max_drift_cells"][0] == pytest.approx(40 / (2560 / 36), abs=1e-3)
+    assert seam["recommendation"] == "abort" and "40 px at the right" in seam["question"] and _nothing_entered(ctx)
+    small = _run(ctx, "preflight", zones="30x18")                        # 10 px uncovered, 0.12 cell drift
+    assert small.status == "blocked" and small.raw["seam"]["recommendation"] == "proceed"
+    go = _run(ctx, "preflight", zones="30x18", decide=["fald_profile:cell_pitch=proceed"])
+    assert go.status == "ran" and go.metrics["lattice"]["lattice_px"] == [2550, 1440]
+    assert _common.load_dlc_state(ctx)["fald"]["geometry"]["cols"] == 30
+
+
+def test_preflight_rejects_a_malformed_decide(tmp_path):
+    ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
+    res = _run(ctx, "preflight", decide=["fald_profile:cell_pitch"])
+    assert res.status == "blocked" and res.anomalies[0].code == "decide_arg"

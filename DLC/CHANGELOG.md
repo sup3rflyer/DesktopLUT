@@ -3,7 +3,7 @@
 DLC (DesktopLUT Calibrator) — an LLM-steered display-calibration harness for
 DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
 
-## Unreleased — v2 scripted-core redesign
+## Unreleased — ships with DesktopLUT v3.0.0 (v2 scripted-core redesign)
 
 Pivoted from an LLM-orchestrated autopilot to a **scripted core + thin LLM at the
 seams**: a deterministic state machine owns the mechanics (display mapping, patch
@@ -11,6 +11,50 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Public operating manual for the LLM, an agent skill, and an example profile** (2026-10-10). DLC is
+  operated by an LLM agent with the user in the loop, and until now its manual was local to one rig.
+  - `docs/operator-guide.md` is the generic manual: the operating law, panel safety per class (OLED /
+    LCD / mini-LED / edge-lit), one-time setup, onboarding a display, flows, every common seam and how
+    to judge it, the check-in loop, stopping and restore statuses, teardown, judging results, and FALD
+    panel profiling.
+  - `.claude/skills/calibrate-display/SKILL.md` is a committed entry point that Claude Code discovers
+    when launched in `DLC/`; it loads the guide.
+  - `calibration_profile.example.yaml` has one template each for a FALD mini-LED, an edge-lit LCD and
+    an OLED.
+  - README "Getting started"; `third_party/README.md` says where to get ArgyllCMS and dogegen.
+  - `--supervised` help no longer calls it the mode for unattended hardware runs (it isn't; use the
+    default `--attended`).
+- **FALD profile flow: panel-class and cell-pitch gates; a cross-display correction seam** (2026-10-10).
+  - Before anything is shown, `fald_profile --phase preflight` raises the seam `fald_profile:panel_class`
+    (abort / proceed; `--decide KEY=CHOICE`) for an OLED, or a panel with no local dimming, so no
+    static-pattern measuring starts on a panel the layer can't model.
+  - A zone grid whose exported lattice the DesktopLUT loader would refuse is now refused up front, not
+    after a ~40-min run. A lattice that fits but is rounded (cells not whole pixels) raises
+    `fald_profile:cell_pitch` with the uncovered pixels and the zone drift in cells.
+    `fald.export.lattice_fit` uses the exporter's own arithmetic.
+  - On a multi-display rig, metering a display through the meter-level profile correction file when the
+    store shows that file belongs to another display (or other displays have their own) raises
+    `preflight:correction` (reason `profile_cross_display`). A single-display rig is unchanged.
+- **OLED safety: idle park + the patch window is recorded and guarded** (2026-10-10).
+  - **Idle park.** While a run idles (a seam pause, a `control.json` pause, a daemon kept with
+    `--keep-dogegen-server`), the patch window is parked per the display's policy instead of leaving
+    the last (possibly peak-white) patch up: black on an emissive panel (`panel.tech` contains
+    "OLED"), the usual 50 % mid-grey otherwise. `quirks.idle_park: black | mid | hold` overrides. The
+    seam's exit JSON carries an `idle_park` record. The hook-routing probe's park (which called a
+    non-existent presenter method) now works.
+  - **Patch window.** The dogegen daemon answers a new `window` command (`window <patch_size>
+    <area_pct>`; `mode` is unchanged, an older daemon reads as "unknown"), and `--idle-level black`
+    boots it on black. The run records the window (`calib.patch_window_size`), `characterize` stamps
+    it on the DIP, and a profile may declare `patch_window_area_pct` per display (a number, or
+    `{SDR: n, HDR: n}`). The `preflight:patch-window` seam asks the LLM when the window differs from
+    the profile's or the DIP's, when an OLED with no declared window would be measured full field
+    (ABL), or when an OLED's window can't be read. Non-emissive panels with no declared window only
+    record it. Every resumed invocation re-checks the daemon's window against the recorded one: a change
+    (e.g. a daemon restarted at another `--patch-size`) is the seam
+    `preflight:patch-window-changed:<old>:<new>`.
+  - Review fixes: a spawned (non-daemon) window is not re-opened just to park it at a seam; a kept daemon
+    is parked after the meter teardown and the rollback guard; a failed pause park is a WARN note on the
+    spine again.
 - **Held-out verify, per-signal verify stats, and the scoring white stated** (2026-10-02). A review of
   the PA32UCXR SDR run found the verify headline partly in-sample: 309 reads but 141 unique signals, 77
   of them on a build training signal, and the 28 repeated sweep signals carried 63 % of the

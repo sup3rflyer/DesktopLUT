@@ -12,6 +12,15 @@ third_party/argyll/3.3.0/ref/   Argyll's reference ICCs — DLC reads sRGB.icm a
 third_party/dogegen/dogegen.exe
 ```
 
+Where to get them (each under its own licence — read it before use):
+
+- **ArgyllCMS 3.3.0** — https://www.argyllcms.com/ (Windows 64-bit build). Copy its `bin/` and
+  `ref/` folders to `third_party/argyll/3.3.0/`. Install the colorimeter driver it documents if
+  your meter needs one.
+- **dogegen** (patch generator) — https://github.com/ledoge/dogegen (releases). Put `dogegen.exe`
+  in `third_party/dogegen/`. DLC drives it through `python -m dlc.dogegen_server` (see
+  `docs/operator-guide.md`).
+
 The tool binaries are intentionally ignored by git. Place the ArgyllCMS and Dogegen
 builds at the layout above (copied by hand, or via the helpers in `dlc.vendor`:
 `plan_vendor_tools` / `copy_vendor_tools` / `write_vendor_manifest`).

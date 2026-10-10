@@ -1,5 +1,5 @@
 {
- "_recorded_from": "main fe890a9 (before the viewing-thermal branch) via tests/_thermal_default_fingerprint.py; re-recorded at the black-aware merge (46dfee5): the ONLY change vs the fe890a9 golden is 5 added verify-digest keys (content_weighted.black_aware / black_aware_reason, practical.content_weighted.black_aware, headline.black_aware / black_aware_reason); reads identical",
+ "_recorded_from": "main fe890a9 (before the viewing-thermal branch) via tests/_thermal_default_fingerprint.py; re-recorded at the black-aware merge (46dfee5): the ONLY change vs the fe890a9 golden is 5 added verify-digest keys (content_weighted.black_aware / black_aware_reason, practical.content_weighted.black_aware, headline.black_aware / black_aware_reason); reads identical; re-recorded at the OLED park/window safety fix: the ONLY change is the added calib key patch_window_size (calib_keys); reads + every existing value identical",
  "measure_loop": {
   "digest": {
    "anomaly_reasons": [],
@@ -931,6 +931,7 @@
    "oog_mapping",
    "output_depth",
    "patch_plan",
+   "patch_window_size",
    "stages",
    "target",
    "verify_basis_checked",

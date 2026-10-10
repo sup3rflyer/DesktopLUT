@@ -66,6 +66,21 @@ With DWM Hook Mode enabled (default), the 3D LUT is applied directly inside DWM 
 4. Optionally enable dynamic peak detection for automatic adjustment.
 5. Use the analysis overlay (**Win + Shift + X**) to inspect results in real time.
 
+### 5. Measure and calibrate with a colorimeter (DLC)
+Use the **DesktopLUT Calibrator** (in this repository's `DLC/` folder — not part of the release zip) to measure your display and install a matched MHC profile + 3D LUT for you (see below).
+
+## Calibrating with DLC (DesktopLUT Calibrator)
+
+[`DLC/`](DLC/) is a Python calibrator that measures your display with a colorimeter and installs the result into DesktopLUT — an **MHC ICC profile** (white point + grayscale, at the GPU) and a **3D LUT** (colour), for SDR and HDR. It is operated by an **LLM agent** (e.g. Claude Code launched in `DLC/`) with you in the loop: a scripted core does all the measuring and maths, the agent judges each decision point and keeps you informed, and there are no unattended hardware runs.
+
+You need: a colorimeter (i1Display Pro family; a spectrometer optionally, for meter corrections), Python 3.11+, ArgyllCMS 3.3.0 and dogegen (placed under `DLC/third_party/`), and DesktopLUT with its **calibration pipe armed** — **Settings** tab → *Experimental* → *Calibration control (DLC)* (or the tray menu), or an empty `DesktopLUT_Calibration.flag` next to the exe (off by default; disarm it when you're done).
+
+Start with **[DLC/README.md](DLC/README.md)** (setup + the example profile); the agent's operating manual is **[DLC/docs/operator-guide.md](DLC/docs/operator-guide.md)**.
+
+## FALD compensation (experimental, mini-LED only)
+
+The **III. Corrections** tab has an experimental **FALD** row for full-array local-dimming LCDs: a shader that models the panel's backlight zones and compensates local-dimming blooming / zone luminance errors. It is **off by default** and does nothing without a **panel file fitted to your exact monitor model** (DLC's FALD profiling flow produces one; none is shipped). It does not apply to OLED or to monitors without full-array local dimming. Leave it off while calibrating.
+
 ## System tray icon
 
 DesktopLUT shows a system tray icon that reflects the current state:
@@ -146,7 +161,7 @@ Hotkeys can be disabled or remapped in the **Settings** tab.
 3. Open `DesktopLUT.sln`.
 4. Build the Release x64 configuration.
 
-222 tests with 17,111 assertions cover color math, MHC ICC profiles, EDID parsing, frame pacing, LUT loading, and settings persistence.
+A doctest suite (`DesktopLUT.Tests.vcxproj`) covers color math, MHC ICC profiles, EDID parsing, frame pacing, LUT loading, tone mapping, the calibration IPC, and settings persistence.
 
 ## Technical details
 
