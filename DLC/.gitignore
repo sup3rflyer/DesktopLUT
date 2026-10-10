@@ -50,6 +50,8 @@ docs/agent-tooling.md
 docs/HANDOFF.md
 # The developer's rig-specific run orientation (local); the public, generic manual is docs/operator-guide.md.
 docs/llm-run-orientation.md
+# Release-notes drafts (published via `gh release`, carry review hash comments) — local until published.
+docs/release-notes-*.md
 docs/HANDOFF-archive-*.md
 docs/v2-design-notes.md
 docs/v1-rebuild-plan.md
