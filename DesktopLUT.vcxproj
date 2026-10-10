@@ -115,6 +115,12 @@
     <ClCompile Include="src\fald.cpp" />
     <ClCompile Include="src\ui\ui_theme.cpp" />
     <ClCompile Include="src\actions\notify.cpp" />
+    <ClCompile Include="src\ui\ui_model.cpp" />
+    <ClCompile Include="src\ui\ui_snapshot.cpp" />
+    <ClCompile Include="src\ui\ui_present.cpp" />
+    <ClCompile Include="src\ui\ui_widgets.cpp" />
+    <ClCompile Include="src\ui\ui_views.cpp" />
+    <ClCompile Include="src\ui\ui_window.cpp" />
   </ItemGroup>
   <!-- Dear ImGui v1.92.9b (third_party/imgui, MIT). Vendored as-is: no SDL checks, CRT deprecation silenced. -->
   <ItemGroup>

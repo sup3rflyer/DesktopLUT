@@ -90,6 +90,7 @@ struct MovableAtomic {
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
 #define ID_TRAY_CALIBRATION 2006
+#define ID_TRAY_NEW_UI      2007
 
 // Tab control
 #define ID_TAB_CONTROL      200

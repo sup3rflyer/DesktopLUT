@@ -7,6 +7,7 @@
 #include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
 #include "displayconfig.h"   // IsValidSdrWhiteNits
 #include "grayscale_validate.h"
+#include "ui/ui_window.h"
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -950,6 +951,7 @@ void SaveSettings() {
             }
         }
     }
+    ui::Invalidate();   // every settings change ends in a save: let the interface redraw (any thread)
 }
 
 bool LoadSettings() {

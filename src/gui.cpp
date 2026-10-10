@@ -18,6 +18,7 @@
 #include "desktoplut_ipc_server.h"
 #include "monitor_identity.h"
 #include "actions/notify.h"
+#include "ui/ui_window.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -843,6 +844,7 @@ void ShowTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
 
     HMENU hMenu = CreatePopupMenu();
+    AppendMenu(hMenu, MF_STRING, ID_TRAY_NEW_UI, L"New interface (preview)");
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, g_gui.isRunning ? MF_GRAYED : MF_STRING, ID_TRAY_APPLY, L"Start");
@@ -2661,6 +2663,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowVrrWhitelistDialog(hwnd);
             return 0;
 
+        case ID_TRAY_NEW_UI:
+            ui::Show();
+            return 0;
         case ID_TRAY_SHOW:
             ShowWindow(hwnd, SW_RESTORE);
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -2961,6 +2966,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // The immediate reapply above can race Windows' own transition
             // processing — follow up with the staggered burst either way.
             StartMhcTransitionBurst(hwnd, "ImmersiveColorSet");
+            ui::NotifyDisplayChanged();   // HDR/SDR/ACM badge and pipeline side
             // An HDR/SDR toggle flips monitor color spaces without changing the
             // monitor set — the DWM hook must get a fresh snapshot or it keeps
             // classifying the FP16 backbuffer under the previous mode.
@@ -3125,6 +3131,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // the OS default for its monitor, put it back. Runs independently
             // of the processing thread so MHC-only users are also protected.
             VerifyAndRestoreMhcProfiles();
+            ui::NotifyDisplayChanged();   // re-read display modes while the new interface is open
             // A display given up on by the identity retry runs on index-attached settings that are
             // never saved: re-attach as soon as it can be identified (only queried while one exists).
             if (g_monitorSettingsPins == 0 && !g_mhcEditDialogOpen.load() &&
@@ -3213,6 +3220,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // switching (e.g. video players matching content rate) hits this path
         // constantly, so always run the re-assertion burst.
         StartMhcTransitionBurst(hwnd, "display change");
+        ui::NotifyDisplayChanged();
         // HDR on/off and hot-plug change which monitors' SDR white level is desktop gamma's reference.
         SetTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
 
@@ -3394,6 +3402,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Ordered teardown. From here on nothing may start or re-arm (see IgnoredDuringShutdown): the
         // stops below pump messages while they join threads and eject the hook.
         g_appShuttingDown.store(true);
+        ui::Shutdown();                    // before anything pumps: no interface frame during the teardown
         KillAllGuiTimers(hwnd);
         StopIcmRegistryWatcher();          // its thread arms MHC_REGISTRY_KICK_TIMER_ID
         StopCalibrationIpcServer();        // no new pipe commands; a queued one runs nothing
