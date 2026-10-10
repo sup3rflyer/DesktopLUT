@@ -77,6 +77,9 @@ __all__ = [
     "Presenter",
     "DogegenPresenter",
     "SocketPresenter",
+    "parse_window_reply",
+    "idle_park_patch",
+    "park_presenter",
     "make_spotread_meter",
     "make_persistent_spotread_meter",
     "SyntheticPanel",
@@ -3596,6 +3599,13 @@ class DogegenPresenter:
                                                fullscreen=self.fullscreen)
         return self._proc
 
+    def query_window(self) -> Optional[dict[str, Any]]:
+        """This spawned window's patch window — the same shape as
+        :meth:`SocketPresenter.query_window` (the size is this presenter's own ``patch_size``)."""
+        from .dogegen_server import window_area_pct
+        return {"patch_size_pct": int(self.patch_size),
+                "area_pct": window_area_pct(self.patch_size, self.place_rect)}
+
     def show(self, patch: MeasurePatch) -> None:
         proc = self._ensure()
         r, g, b = patch.rgb
@@ -3617,6 +3627,53 @@ class DogegenPresenter:
                 pass
         finally:
             self._proc = None
+
+
+def parse_window_reply(reply: str) -> Optional[dict[str, Any]]:
+    """Parse a dogegen daemon ``window <patch_size_pct> <area_pct>`` reply; ``None`` for anything
+    else (an older daemon's ``err bad command`` reply, garbage, out-of-range numbers)."""
+    parts = str(reply or "").split()
+    if len(parts) != 3 or parts[0] != "window":
+        return None
+    try:
+        size, area = int(parts[1]), float(parts[2])
+    except ValueError:
+        return None
+    if size <= 0 or not 0.0 < area <= 100.0:
+        return None
+    return {"patch_size_pct": size, "area_pct": area}
+
+
+def idle_park_patch(level: str, bit_depth: int) -> Optional[MeasurePatch]:
+    """The patch to park the presenter on while the run idles (see
+    :attr:`dlc.calibration_profile.DisplayConfig.idle_park`): ``"black"`` → code 0 (no emission —
+    the OLED burn-in/retention-safe park); ``"mid"`` → the 50 % mid-grey neutral the pause handler
+    has always parked on (byte-identical to the historical ``pause-neutral`` patch); ``"hold"`` (or
+    anything else) → ``None`` = leave the last patch up."""
+    if level == "black":
+        return MeasurePatch(label="idle-park-black", rgb=(0, 0, 0), signal=(0.0, 0.0, 0.0),
+                            role="neutral_ref", bit_depth=bit_depth)
+    if level == "mid":
+        mid = int(round(0.5 * ((1 << bit_depth) - 1)))
+        return MeasurePatch(label="pause-neutral", rgb=(mid, mid, mid), signal=(0.5, 0.5, 0.5),
+                            role="neutral_ref", bit_depth=bit_depth)
+    return None
+
+
+def park_presenter(presenter: Any, level: str, bit_depth: int) -> dict[str, Any]:
+    """Show the idle-park patch for ``level`` on ``presenter`` (anything with ``show``). Never
+    raises: a park is housekeeping and must not mask the run's real exit — the returned record
+    (``{"level", "parked", "rgb"?, "error"?}``) says what happened, for the run log."""
+    rec: dict[str, Any] = {"level": level, "parked": False}
+    patch = idle_park_patch(level, bit_depth)
+    if presenter is None or patch is None:
+        return rec
+    try:
+        presenter.show(patch)
+        rec.update(parked=True, rgb=list(patch.rgb))
+    except Exception as exc:  # noqa: BLE001 - best-effort housekeeping
+        rec["error"] = f"{type(exc).__name__}: {exc}"
+    return rec
 
 
 class SocketPresenter:
@@ -3673,6 +3730,16 @@ class SocketPresenter:
         if len(parts) == 3 and parts[0] == "mode" and parts[1].upper() in ("SDR", "HDR") and parts[2].isdigit():
             return {"mode": parts[1].upper(), "bit_depth": int(parts[2])}
         return None
+
+    def query_window(self) -> Optional[dict[str, Any]]:
+        """The daemon's patch window (``{"patch_size_pct": int, "area_pct": float}`` — the linear %
+        of the monitor's short side it was started with, and the resulting % of the screen AREA;
+        100 / 100.0 = full field), or ``None`` from a daemon that predates the ``window`` command
+        (it answers ``err bad command …`` — one line, so the connection stays in sync) or an
+        unparsable reply."""
+        s = self._ensure()
+        s.sendall(b"window\n")
+        return parse_window_reply(self._recv_line(s))
 
     def close(self) -> None:
         # Drop our connection ONLY — the daemon (and its fullscreen window) persists across

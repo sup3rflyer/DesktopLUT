@@ -11,6 +11,21 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **OLED safety: idle park + the patch window is recorded and guarded** (2026-10-10).
+  - **Idle park.** While a run idles (a seam pause, a `control.json` pause, a daemon kept with
+    `--keep-dogegen-server`), the patch window is parked per the display's policy instead of leaving
+    the last (possibly peak-white) patch up: black on an emissive panel (`panel.tech` contains
+    "OLED"), the usual 50 % mid-grey otherwise. `quirks.idle_park: black | mid | hold` overrides. The
+    seam's exit JSON carries an `idle_park` record. The hook-routing probe's park (which called a
+    non-existent presenter method) now works.
+  - **Patch window.** The dogegen daemon answers a new `window` command (`window <patch_size>
+    <area_pct>`; `mode` is unchanged, an older daemon reads as "unknown"), and `--idle-level black`
+    boots it on black. The run records the window (`calib.patch_window_size`), `characterize` stamps
+    it on the DIP, and a profile may declare `patch_window_area_pct` per display (a number, or
+    `{SDR: n, HDR: n}`). The `preflight:patch-window` seam asks the LLM when the window differs from
+    the profile's or the DIP's, when an OLED with no declared window would be measured full field
+    (ABL), or when an OLED's window can't be read. Non-emissive panels with no declared window only
+    record it.
 - **Held-out verify, per-signal verify stats, and the scoring white stated** (2026-10-02). A review of
   the PA32UCXR SDR run found the verify headline partly in-sample: 309 reads but 141 unique signals, 77
   of them on a build training signal, and the 28 repeated sweep signals carried 63 % of the

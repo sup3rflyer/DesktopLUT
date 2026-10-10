@@ -17,6 +17,10 @@ Line protocol (ASCII, loopback only — this drives a local display, not a netwo
   ``"ping\\n"``        → reply ``"pong\\n"`` (liveness)
   ``"mode\\n"``        → reply ``"mode <SDR|HDR> <bits>\\n"`` (what the codes mean — the orchestrator refuses
                        a daemon whose mode / bit depth is not its run's)
+  ``"window\\n"``      → reply ``"window <patch_size_pct> <area_pct>\\n"`` (the patch window: the
+                       ``--patch-size`` linear % of the short side + the resulting % of the screen
+                       AREA, 100 = full field). An older daemon answers ``err bad command …``; the
+                       orchestrator then records the window as unknown.
   ``"quit\\n"``        → quit dogegen + stop the daemon; reply ``"bye\\n"``
 Code values are in the daemon's dogegen bit depth (``mode 8`` → 0..255, ``mode 10`` →
 0..1023), so it MUST be started at the same ``--bit-depth`` the calibration run uses.
@@ -74,14 +78,51 @@ def shapes_to_stdin_pattern(shapes) -> str:
     return "; ".join(parts)
 
 
+def window_area_pct(patch_size: int, monitor_rect: Optional[Rect] = None) -> float:
+    """The % of the screen AREA a ``--patch-size`` window covers. ``patch_size`` is a LINEAR % of
+    the monitor's short side (a centered square of ``min(w, h) * size / 100`` px — the daemon's /
+    patch_presenter's convention); 100 or more = full field = 100.0. Uses the monitor's rect when
+    known, else a 16:9 aspect fallback (the same fallback the Resolve geometry uses). E.g. 10 →
+    0.5625 % and 42 → ≈ 9.92 % (the TV-cal "10 % window") of a 16:9 screen."""
+    if patch_size >= 100:
+        return 100.0
+    if monitor_rect is not None and monitor_rect[2] > 0 and monitor_rect[3] > 0:
+        w, h = float(monitor_rect[2]), float(monitor_rect[3])
+    else:
+        w, h = 3840.0, 2160.0
+    side = min(w, h) * max(0, patch_size) / 100.0
+    return round(100.0 * side * side / (w * h), 4)
+
+
+def patch_size_for_area(area_pct: float, monitor_rect: Optional[Rect] = None) -> int:
+    """Inverse of :func:`window_area_pct`: the ``--patch-size`` (linear % of the short side) whose
+    centered square covers ``area_pct`` % of the screen (rounded; ≥ 100 area → 100). 10 → 42 on
+    a 16:9 screen."""
+    if area_pct >= 100:
+        return 100
+    if monitor_rect is not None and monitor_rect[2] > 0 and monitor_rect[3] > 0:
+        w, h = float(monitor_rect[2]), float(monitor_rect[3])
+    else:
+        w, h = 3840.0, 2160.0
+    side = (max(0.0, float(area_pct)) / 100.0 * w * h) ** 0.5
+    return max(1, min(100, int(round(100.0 * side / min(w, h)))))
+
+
+def window_reply(patch_size: int, monitor_rect: Optional[Rect] = None) -> str:
+    """The ``window`` command's reply line: ``window <patch_size_pct> <area_pct>``."""
+    return f"window {int(patch_size)} {window_area_pct(patch_size, monitor_rect):.4f}"
+
+
 def dispatch(cmd: str, *, show: Callable[[int, int, int], None],
              show_shapes: Optional[Callable[[list], None]] = None,
-             mode_info: Optional[str] = None) -> Tuple[str, bool]:
+             mode_info: Optional[str] = None,
+             window_info: Optional[str] = None) -> Tuple[str, bool]:
     """Handle one protocol line. Returns ``(reply, keep_running)``; ``reply`` empty ⇒
     send nothing. ``show(r, g, b)`` paints a full-field patch; ``show_shapes(shapes)`` paints
     an ordered rectangle list (``shapes …`` lines — Resolve transport only; ``None`` ⇒ the
-    command is refused); ``mode_info`` is the ``mode`` reply (``"mode SDR 8"``). Pure of any
-    socket/dogegen detail so it is unit-testable."""
+    command is refused); ``mode_info`` is the ``mode`` reply (``"mode SDR 8"``); ``window_info``
+    is the ``window`` reply (:func:`window_reply`). Pure of any socket/dogegen detail so it is
+    unit-testable."""
     cmd = cmd.strip()
     if not cmd:
         return ("", True)
@@ -89,6 +130,8 @@ def dispatch(cmd: str, *, show: Callable[[int, int, int], None],
         return ("pong", True)
     if cmd == "mode":
         return (mode_info or "err mode unknown", True)
+    if cmd == "window":
+        return (window_info or "err window unknown", True)
     if cmd == "quit":
         return ("bye", False)
     if cmd.split(None, 1)[0] == "shapes":
@@ -111,7 +154,7 @@ def dispatch(cmd: str, *, show: Callable[[int, int, int], None],
 def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
           patch_size: int = 100, monitor_rect: Optional[Rect] = None,
           auto_fullscreen: bool = True, resolve: bool = True,
-          resolve_port: int = 20002) -> None:
+          resolve_port: int = 20002, idle_level: str = "mid") -> None:
     """Start one dogegen window and serve patch commands until ``quit`` (blocking).
 
     The window is borderless-fullscreened automatically onto ``monitor_rect`` (the persistent
@@ -133,7 +176,13 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
     hours) does not freeze; HW-validated 28 min clean. The daemon exists for the fullscreen
     10-bit/HDR path, which is exactly where the freeze bites — hence Resolve as the default. The
     orchestrator-facing line protocol on ``host:port`` is identical either way; only how the daemon
-    talks to dogegen changes."""
+    talks to dogegen changes.
+
+    ``idle_level`` is the BOOT patch (what the window shows before the first run connects):
+    ``"mid"`` (default — today's 50 % mid-grey) or ``"black"`` (code 0 — the burn-in-safe idle for
+    an OLED). The ``window`` command reports ``patch_size`` + its screen-area % to the run."""
+    idle_level = "black" if str(idle_level).lower() == "black" else "mid"
+    window_info = window_reply(patch_size, monitor_rect)
     if resolve:
         # patch_size is a LINEAR percent of the monitor's short side (matches
         # patch_presenter's convention): the patch is a centered square of
@@ -157,8 +206,8 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
         proc = rdg.start()                 # we listen, launch dogegen, accept its connection
         print(f"[dogegen-server] dogegen up via Resolve ({rdg.startup_command}) pid {proc.pid}",
               flush=True)
-        mid = ((1 << bit_depth) - 1) // 2
-        rdg.show(mid, mid, mid)            # first pattern switches dogegen into the target depth/HDR
+        boot = 0 if idle_level == "black" else ((1 << bit_depth) - 1) // 2
+        rdg.show(boot, boot, boot)         # first pattern switches dogegen into the target depth/HDR
         time.sleep(1.0)                    # let the mode switch + swapchain settle before fullscreen
 
         def show(r: int, g: int, b: int) -> None:
@@ -181,6 +230,9 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
             # Resolve XML parser takes just the first <rectangle> after the background (HW-seen
             # 2026-09-10: a 3-shape frame rendered like its first two).
             disp.send(proc, shapes_to_stdin_pattern(shapes), settle_seconds=0.0)
+
+        if idle_level == "black":
+            show(0, 0, 0)                  # burn-in-safe boot patch (mid keeps dogegen's own start)
 
         def teardown() -> None:
             try:
@@ -228,7 +280,8 @@ def serve(*, dogegen_path: str, mode: str, bit_depth: int, host: str, port: int,
                         try:
                             reply, keep = dispatch(line.decode("ascii", "ignore"), show=show,
                                                    show_shapes=show_shapes,
-                                                   mode_info=f"mode {str(mode).upper()} {int(bit_depth)}")
+                                                   mode_info=f"mode {str(mode).upper()} {int(bit_depth)}",
+                                                   window_info=window_info)
                         except OSError as exc:
                             # The dogegen child died (broken stdin pipe) — report it cleanly to the
                             # client instead of crashing the daemon, so the caller gets a clear error
@@ -281,7 +334,14 @@ def main(argv=None) -> int:  # pragma: no cover - live wiring
     ap.add_argument("--bit-depth", type=int, default=8, dest="bit_depth")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=28930)
-    ap.add_argument("--patch-size", type=int, default=100, dest="patch_size")
+    ap.add_argument("--patch-size", type=int, default=100, dest="patch_size",
+                    help="Patch window as a LINEAR %% of the monitor's short side (default 100 = full "
+                         "field). 42 ≈ 10%% of a 16:9 screen's AREA — the window an OLED/ABL panel "
+                         "needs (a full-field patch is dimmed by its power limiter). Reported to the "
+                         "run via the 'window' command.")
+    ap.add_argument("--idle-level", choices=("mid", "black"), default="mid", dest="idle_level",
+                    help="Boot patch shown before the first run connects: mid (default, 50%% grey) "
+                         "or black (burn-in-safe idle for an OLED).")
     ap.add_argument("--monitor", type=int, default=None,
                     help="DLC target monitor index; auto-fullscreen lands the window on this "
                          "panel (rect resolved over the DesktopLUT pipe). Use for a non-primary target.")
@@ -304,7 +364,7 @@ def main(argv=None) -> int:  # pragma: no cover - live wiring
     serve(dogegen_path=a.dogegen, mode=a.mode, bit_depth=a.bit_depth,
           host=a.host, port=a.port, patch_size=a.patch_size,
           monitor_rect=rect, auto_fullscreen=a.auto_fullscreen,
-          resolve=a.resolve, resolve_port=a.resolve_port)
+          resolve=a.resolve, resolve_port=a.resolve_port, idle_level=a.idle_level)
     return 0
 
 

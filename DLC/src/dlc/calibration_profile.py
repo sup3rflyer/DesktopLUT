@@ -40,6 +40,7 @@ __all__ = [
     "PanelInfo",
     "ProbeMatchSpec",
     "DisplayConfig",
+    "IDLE_PARK_LEVELS",
     "WhiteSpec",
     "TargetSpec",
     "QualityTargets",
@@ -148,6 +149,10 @@ class PanelInfo:
     hdr_peak_nits: Optional[float] = None
 
 
+# Valid idle-park levels (see DisplayConfig.idle_park).
+IDLE_PARK_LEVELS: tuple[str, ...] = ("black", "mid", "hold")
+
+
 @dataclass(frozen=True)
 class DisplayConfig:
     """One physical display + its two identities (DesktopLUT monitor index ⇄ Argyll
@@ -165,6 +170,37 @@ class DisplayConfig:
     #                                    the SPD double-duty source (correction + white)
     probe_match: ProbeMatchSpec = field(default_factory=ProbeMatchSpec)
     quirks: dict[str, Any] = field(default_factory=dict)
+    # The patch window this display must be measured at, as a percent of the screen AREA per mode
+    # ({"SDR": n, "HDR": n}; 100 = full field). Empty = unspecified (no expectation). Parsed from the
+    # profile's per-display ``patch_window_area_pct`` (a number for both modes, or a per-mode map).
+    patch_window_area_pct: dict[str, float] = field(default_factory=dict)
+
+    @property
+    def is_emissive(self) -> bool:
+        """True for a self-emissive panel — ``panel.tech`` names OLED (WOLED, QD-OLED, …),
+        case-insensitive. Emissive panels burn in / retain a static patch and most run ABL (a
+        full-field patch is dimmed by the panel's power limiter), so idle parking and the patch
+        window are treated differently for them. An unknown tech is NOT emissive (today's default
+        path — mini-LED / white-LED LCDs — stays unchanged)."""
+        return "oled" in str(self.panel.tech or "").lower()
+
+    @property
+    def idle_park(self) -> str:
+        """What to show while the run idles (a seam pause, a cooperative pause, a kept daemon at
+        exit): ``"black"`` (code 0 — no emission, no burn-in risk), ``"mid"`` (the 50 % mid-grey
+        neutral the pause handler has always parked on LCDs) or ``"hold"`` (leave the last patch).
+        An explicit valid ``quirks['idle_park']`` wins; otherwise emissive panels park black (a
+        held bright patch is a burn-in/retention risk on OLED) and everything else parks mid-grey."""
+        v = str(self.quirks.get("idle_park") or "").strip().lower()
+        if v in IDLE_PARK_LEVELS:
+            return v
+        return "black" if self.is_emissive else "mid"
+
+    def expected_window(self, mode: str) -> Optional[float]:
+        """The profile's expected patch-window area (% of the screen) for ``mode``, or ``None``
+        when the profile does not specify one."""
+        v = self.patch_window_area_pct.get(str(mode).upper())
+        return float(v) if v is not None else None
 
     @property
     def temperamental_channel(self) -> Optional[str]:
@@ -802,7 +838,32 @@ def _display_config(raw: dict[str, Any]) -> DisplayConfig:
         white_spd=raw.get("white_spd"),
         probe_match=_probe_match_spec(raw.get("probe_match", {}) or {}),
         quirks=dict(raw.get("quirks", {}) or {}),
+        patch_window_area_pct=_patch_window_area(raw.get("patch_window_area_pct")),
     )
+
+
+def _patch_window_area(raw: Any) -> dict[str, float]:
+    """Parse a display's ``patch_window_area_pct``: absent/None → ``{}`` (unspecified); a number →
+    the same window for SDR and HDR; a ``{SDR: n, HDR: n}`` map → per mode (a missing mode stays
+    unspecified). Each value is a percent of the screen area in (0, 100]."""
+    if raw is None:
+        return {}
+    items = raw.items() if isinstance(raw, dict) else (("SDR", raw), ("HDR", raw))
+    out: dict[str, float] = {}
+    for mode, value in items:
+        m = str(mode).upper()
+        if m not in ("SDR", "HDR"):
+            raise ValueError(f"patch_window_area_pct: unknown mode {mode!r} (use SDR / HDR)")
+        if value is None:
+            continue
+        try:
+            v = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"patch_window_area_pct must be a number in (0, 100], got {value!r}") from exc
+        if not 0.0 < v <= 100.0:
+            raise ValueError(f"patch_window_area_pct must be in (0, 100], got {v}")
+        out[m] = v
+    return out
 
 
 def load_profile(path: Optional[Path | str] = None) -> Profile:
