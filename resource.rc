@@ -36,5 +36,6 @@ END
 IDI_APPICON ICON "DesktopLUT.ico"
 IDI_APPICON_ACTIVE ICON "DesktopLUT-active.ico"
 
-// The logo artwork (the interface header draws it; decoded with WIC at runtime)
-IDR_LOGO_PNG RCDATA "DesktopLUT-logo.png"
+// The logo artwork (the interface header draws it; decoded with WIC at runtime). Generated master:
+// tools/logo/render_logo.py -> assets/logo/.
+IDR_LOGO_PNG RCDATA "assets/logo/logo_256.png"
