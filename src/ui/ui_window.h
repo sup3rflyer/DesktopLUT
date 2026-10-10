@@ -19,7 +19,7 @@ bool Busy();                    // a posted command is running (the interface is
 HWND Window();                  // owner for file dialogs and message boxes
 void* LogoTexture();            // the logo artwork as an ImTextureID (ID3D11ShaderResourceView*); null = unavailable
 
-void Show();                    // GUI thread. Creates the window on first use.
+bool Show();                    // GUI thread. Creates the window on first use; false if it could not.
 void Hide();                    // GUI thread.
 bool IsVisible();               // GUI thread.
 void Shutdown();                // GUI thread: hub teardown, before anything pumps.

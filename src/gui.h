@@ -33,6 +33,12 @@ void SelectMonitor(int index);
 // that display, the Start/Stop state, and the ImGui interface. GUI thread.
 void GuiNotifySettingsChanged(int mon);
 
+// The interface the user chose ([UI] Interface): tray Show / left click, a second launch, startup. When the
+// new interface cannot start (no window, no Direct3D device) the classic window opens instead. GUI thread.
+void ShowActiveUi();
+// Switch interfaces and remember the choice (refused while an editor holds the settings). GUI thread.
+void SetInterfaceClassic(bool classic);
+
 // The user stopped the live layers (classic Stop / tray Stop); automatic restarts respect it. GUI thread.
 extern bool g_userStopped;
 
@@ -69,6 +75,12 @@ void FaldPanelFileChangedReinject();
 bool IsStartupEnabled();
 void SetStartupEnabled(bool enable);
 void UpdateStartupPath();
+// IsStartupEnabled as last read (-1 unknown, 0, 1): the new interface's frames read this, never the COM query.
+int StartupEnabledCached();
+void RefreshStartupEnabledCache();   // GUI thread, outside a frame (a command or a handler)
+
+// Arms / disarms the DLC calibration pipe and remembers the choice. GUI thread.
+void ApplyCalibrationControl(bool enable);
 
 // Tray icon functions
 void AddTrayIcon(HWND hwnd);

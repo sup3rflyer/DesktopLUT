@@ -937,6 +937,41 @@ TEST_CASE("LoadSettings/SaveSettings: [General] HdrDither defaults on and round-
     g_hdrDither = true;
 }
 
+TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, round-trip and clear") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    WritePrivateProfileStringW(L"General", L"StartMinimized", L"false", ini);   // an INI without [UI]
+    g_uiClassic = true;
+    g_dlcFolder = L"stale";
+    LoadSettings();
+    CHECK(g_uiClassic == false);                        // absent -> the new interface
+    CHECK(g_dlcFolder.empty());
+    g_uiClassic = true;
+    g_dlcFolder = L"D:\\Calibration\\DLC";
+    SaveSettings();
+    wchar_t buf[MAX_PATH] = {};
+    GetPrivateProfileStringW(L"UI", L"Interface", L"", buf, MAX_PATH, ini);
+    CHECK(std::wstring(buf) == L"classic");
+    g_uiClassic = false;
+    g_dlcFolder.clear();
+    LoadSettings();
+    CHECK(g_uiClassic == true);
+    CHECK(g_dlcFolder == L"D:\\Calibration\\DLC");
+    g_dlcFolder.clear();
+    SaveSettings();                                     // empty folder: the key goes
+    GetPrivateProfileStringW(L"UI", L"DlcFolder", L"<absent>", buf, MAX_PATH, ini);
+    CHECK(std::wstring(buf) == L"<absent>");
+    WritePrivateProfileStringW(L"UI", L"Interface", L"CLASSIC", ini);
+    g_uiClassic = false;
+    LoadSettings();
+    CHECK(g_uiClassic == true);                         // case-insensitive
+    g_uiClassic = false;
+}
+
 TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sections once matched") {
     AppIniGuard guard;
     if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }

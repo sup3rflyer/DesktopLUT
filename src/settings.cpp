@@ -924,6 +924,10 @@ void SaveSettings() {
     // Save startup settings
     WritePrivateProfileBool(L"General", L"StartMinimized", g_startMinimized.load(), iniPath.c_str());
 
+    // Interface
+    WritePrivateProfileStringW(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
+    WritePrivateProfileStringW(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
+
     WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
 
     // Save per-display settings: live displays and parked (currently disconnected) ones,
@@ -999,6 +1003,16 @@ bool LoadSettings() {
 
     // Load startup settings
     g_startMinimized.store(GetPrivateProfileBool(L"General", L"StartMinimized", false, iniPath.c_str()));
+
+    // Interface (absent = the new one)
+    {
+        wchar_t buf[MAX_PATH] = {};
+        GetPrivateProfileStringW(L"UI", L"Interface", L"new", buf, MAX_PATH, iniPath.c_str());
+        g_uiClassic = _wcsicmp(buf, L"classic") == 0;
+        buf[0] = 0;
+        GetPrivateProfileStringW(L"UI", L"DlcFolder", L"", buf, MAX_PATH, iniPath.c_str());
+        g_dlcFolder = buf;
+    }
 
     // Per-display settings: read every saved display into the parked pool, then attach
     // each live monitor's entry by identity. A display that is powered off right now

@@ -608,6 +608,15 @@ bool IsStartupEnabled() {
     return enabled == VARIANT_TRUE;
 }
 
+// Task Scheduler is out-of-process COM: slow, and an STA call can pump messages, so a frame of the new
+// interface must never make it. Frames read this cache; commands and handlers refresh it.
+static int s_startupEnabledCache = -1;   // -1 unknown, 0 / 1
+int StartupEnabledCached() { return s_startupEnabledCache; }
+void RefreshStartupEnabledCache() {
+    s_startupEnabledCache = IsStartupEnabled() ? 1 : 0;
+    ui::Invalidate();
+}
+
 void UpdateStartupPath() {
     bool hasOldReg = HasOldRegistryStartup();
 
@@ -799,13 +808,14 @@ void ShowTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
 
     HMENU hMenu = CreatePopupMenu();
-    AppendMenu(hMenu, MF_STRING, ID_TRAY_NEW_UI, L"New interface (preview)");
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
+    AppendMenu(hMenu, g_uiClassic ? (MF_STRING | MF_CHECKED) : MF_STRING, ID_TRAY_CLASSIC_UI, L"Classic interface");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, act::LiveLayersSuspended() ? (MF_STRING | MF_CHECKED) : MF_STRING, ID_TRAY_SUSPEND,
                L"Suspend live layers");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(hMenu, IsStartupEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
+    RefreshStartupEnabledCache();
+    AppendMenu(hMenu, StartupEnabledCached() == 1 ? (MF_STRING | MF_CHECKED) : MF_STRING,
                ID_TRAY_STARTUP, L"Run at startup");
     AppendMenu(hMenu, g_calibrationControlEnabled.load() ? (MF_STRING | MF_CHECKED) : MF_STRING,
                ID_TRAY_CALIBRATION, L"Calibration control");
@@ -1107,6 +1117,41 @@ static void SwapDwmHookRoutingForCurrentMonitor(HWND hwnd) {
 // ============================================================================
 
 static UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+// A second launch asks the running instance to show its interface (main.cpp).
+static UINT WM_SHOW_ACTIVE_UI = RegisterWindowMessageW(DESKTOPLUT_SHOW_UI_MESSAGE);
+
+// The classic window is the hub itself: restore it and bring it to the front.
+static void ShowClassicWindow() {
+    HWND hwnd = g_gui.hwndMain;
+    if (!hwnd) return;
+    ShowWindow(hwnd, SW_RESTORE);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetForegroundWindow(hwnd);
+}
+
+void ShowActiveUi() {
+    if (!g_uiClassic) {
+        if (ui::Show()) return;
+        notify::Post(notify::Sev::Warning, -1, L"ui", L"Classic interface opened: the new one could not start");
+    }
+    ShowClassicWindow();
+}
+
+void SetInterfaceClassic(bool classic) {
+    if (classic != g_uiClassic) {
+        // Either window may hold an editor bound to the settings vector (the MHC dialogs, a pinned edit).
+        if (g_mhcEditDialogOpen.load() || g_monitorSettingsPins > 0) {
+            notify::Post(notify::Sev::Warning, -1, L"ui", L"Close the open editor first");
+            return;
+        }
+        g_uiClassic = classic;
+        SaveSettings();
+        if (classic) ui::Hide();
+        else ShowWindow(g_gui.hwndMain, SW_HIDE);
+    }
+    ShowActiveUi();
+}
 
 // ============================================================================
 // SECTION: Identity-keyed settings re-attach on display changes
@@ -1447,6 +1492,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_appShuttingDown.load(std::memory_order_relaxed) && IgnoredDuringShutdown(msg)) {
         if (msg == WM_TIMER) KillTimer(hwnd, wParam);
         return DefWindowProc(hwnd, msg, wParam, lParam);
+    }
+    if (WM_SHOW_ACTIVE_UI && msg == WM_SHOW_ACTIVE_UI) {
+        ShowActiveUi();
+        return 0;
     }
     // Re-add tray icon when explorer restarts or finishes initializing
     if (msg == WM_TASKBARCREATED) {
@@ -2199,22 +2248,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowVrrWhitelistDialog(hwnd);
             return 0;
 
-        case ID_TRAY_NEW_UI:
-            ui::Show();
+        case ID_TRAY_CLASSIC_UI:
+            SetInterfaceClassic(!g_uiClassic);
             return 0;
         case ID_TRAY_SHOW:
-            ShowWindow(hwnd, SW_RESTORE);
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetForegroundWindow(hwnd);
+            ShowActiveUi();
             return 0;
         case ID_TRAY_SUSPEND:
             act::SetLiveLayersSuspended(!act::LiveLayersSuspended());
             return 0;
         case ID_TRAY_STARTUP:
-            SetStartupEnabled(!IsStartupEnabled());
+            act::SetRunAtStartup(!IsStartupEnabled());
             if (g_gui.hwndSettingsRunAtStartup)
-                SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, IsStartupEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+                SendMessage(g_gui.hwndSettingsRunAtStartup, BM_SETCHECK, StartupEnabledCached() == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
             return 0;
         case ID_TRAY_CALIBRATION:
             ApplyCalibrationControl(!g_calibrationControlEnabled.load());
@@ -2231,10 +2277,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (lParam == WM_RBUTTONUP) {
             ShowTrayMenu(hwnd);
         } else if (lParam == WM_LBUTTONUP) {
-            ShowWindow(hwnd, SW_RESTORE);
-            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            SetForegroundWindow(hwnd);
+            ShowActiveUi();
         }
         return 0;
 
@@ -3010,6 +3053,8 @@ int RunGUI() {
     if (!g_gui.hwndMain) {
         return 1;
     }
+    // A second launch runs unelevated or elevated alike: let its show request through either way.
+    if (WM_SHOW_ACTIVE_UI) ChangeWindowMessageFilterEx(g_gui.hwndMain, WM_SHOW_ACTIVE_UI, MSGFLT_ALLOW, nullptr);
 
     // Create OSD window on GUI thread — available in all modes (hook-only, analysis-only, full overlay)
     CreateOSDWindow(GetModuleHandle(nullptr));
@@ -3028,11 +3073,8 @@ int RunGUI() {
     }
 
     // Only start minimized if user explicitly enabled the setting
-    if (!g_startMinimized.load()) {
-        ShowWindow(g_gui.hwndMain, SW_SHOW);
-        UpdateWindow(g_gui.hwndMain);
-    }
-    // If starting minimized, window stays hidden (tray icon provides access)
+    if (!g_startMinimized.load()) ShowActiveUi();
+    // If starting minimized, every window stays hidden (tray icon provides access)
 
     // Start the opt-in calibration control server (no-op unless explicitly enabled
     // via the Settings checkbox/persisted setting, the flag file, or the env var).

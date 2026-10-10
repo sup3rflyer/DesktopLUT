@@ -8,7 +8,7 @@
 
 namespace ui {
 
-enum class Page { Pipeline, Events };
+enum class Page { Pipeline, Events, Settings };
 
 // A destructive or resetting edit waits for confirmation in a modal.
 struct Confirm {
@@ -30,6 +30,7 @@ struct ViewState {
     std::wstring renamingKey;      // the sidebar row being renamed (double-click); empty = none
     char renameBuf[128] = {};      // its edit buffer (UTF-8)
     bool renameFocus = false;      // give the field keyboard focus on its first frame
+    bool showNotices = false;      // Settings > About: third-party notices expanded
 };
 
 void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy);

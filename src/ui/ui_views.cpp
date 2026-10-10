@@ -5,6 +5,9 @@
 #include "actions/actions.h"
 #include "actions/notify.h"
 #include "actions/reconcile.h"
+#include "gui_whitelist.h"
+#include "ui_notices.h"
+#include "version.h"
 #include "globals.h"
 #include "gui.h"
 #include <cctype>
@@ -207,7 +210,7 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
 
     // Fixed slots, right-aligned: SUSPEND, a wider gap, then the page switch.
     const float bw = 92.0f, bh = 28.0f, gap = 8.0f, groupGap = 24.0f;
-    float x = p.x + w - Px(kGutter) - Px(bw * 3 + gap + groupGap);
+    float x = p.x + w - Px(kGutter) - Px(bw * 4 + gap * 2 + groupGap);
     ImGui::SetCursorScreenPos(ImVec2(x, cy - Px(bh) * 0.5f));
     ImGui::BeginDisabled(busy);
     if (Toggle("##suspend", "SUSPEND", snap.suspended, ImVec2(bw, bh))) {
@@ -222,6 +225,11 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
     if (Toggle("##pg_pipe", "PIPELINE", vs.page == Page::Pipeline, ImVec2(bw, bh))) vs.page = Page::Pipeline;
     ImGui::SameLine(0, Px(gap));
     if (Toggle("##pg_events", "EVENTS", vs.page == Page::Events, ImVec2(bw, bh))) vs.page = Page::Events;
+    ImGui::SameLine(0, Px(gap));
+    if (Toggle("##pg_settings", "SETTINGS", vs.page == Page::Settings, ImVec2(bw, bh))) {
+        if (vs.page != Page::Settings) Post([]() { RefreshStartupEnabledCache(); });   // COM: not in a frame
+        vs.page = Page::Settings;
+    }
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
     Hairline();
@@ -813,6 +821,188 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     ImGui::EndChild();
 }
 
+// ---------------------------------------------------------------------------------------------
+// Settings
+
+// The explanation of a row lives in a tooltip on its label (labels stay terse).
+void RowTip(const RowCtx& r, const char* tip) {
+    if (ImGui::IsMouseHoveringRect(ImVec2(r.x0, r.y0), ImVec2(r.x0 + Px(kRowLabelW) - Px(8), r.y0 + r.h)))
+        ImGui::SetTooltip("%s", tip);
+}
+
+void SettingsSpacer() { ImGui::Dummy(ImVec2(0, Px(18))); }
+
+void SettingsGeneral() {
+    SectionHeader("GENERAL", nullptr);
+    RowCtx row = BeginRow("INTERFACE");
+    RowTip(row, "Classic: the previous window. The tray switches too.");
+    RowPlace(row);
+    static const char* const kUi[] = { "NEW", "CLASSIC" };
+    const int pick = Segmented("##set_ui", kUi, 2, g_uiClassic ? 1 : 0, 80);
+    if (pick >= 0) {
+        const bool classic = pick == 1;
+        Post([classic]() { SetInterfaceClassic(classic); });
+    }
+    EndRow(row);
+
+    row = BeginRow("RUN AT STARTUP");
+    RowPlace(row);
+    const int startup = StartupEnabledCached();
+    bool v = false;
+    if (startup < 0) RowText(row, "\xE2\x80\xA6", pal::InkFaint);
+    else if (OnOff("##set_startup", startup == 1, &v)) Post([v]() { act::SetRunAtStartup(v); });
+    EndRow(row);
+
+    row = BeginRow("START MINIMIZED");
+    RowTip(row, "Start in the tray, no window.");
+    RowPlace(row);
+    if (OnOff("##set_min", g_startMinimized.load(), &v)) Post([v]() { act::SetStartMinimized(v); });
+    EndRow(row);
+}
+
+void SettingsEngine(const Snapshot& snap) {
+    SectionHeader("ENGINE", nullptr);
+    bool v = false;
+    RowCtx row = BeginRow("DWM HOOK");
+    RowTip(row, "3D LUT and tone mapping inside DWM: no overlay window.\nOff: the overlay applies them.");
+    RowPlace(row);
+    if (OnOff("##set_hook", snap.hookMode, &v)) Post([v]() { act::SetDwmHookMode(v); });
+    EndRow(row);
+
+    row = BeginRow("INTERPOLATION");
+    RowTip(row, "3D LUT interpolation of the overlay. The DWM hook always uses its own.");
+    RowPlace(row);
+    static const char* const kInterp[] = { "TRILINEAR", "TETRAHEDRAL" };
+    const int pick = Segmented("##set_interp", kInterp, 2, g_tetrahedralInterp.load() ? 1 : 0, 96);
+    if (pick >= 0) {
+        const bool tetra = pick == 1;
+        Post([tetra]() { act::SetTetrahedral(tetra); });
+    }
+    if (snap.hookMode) {
+        RowNext(row);
+        RowText(row, "OVERLAY ONLY", pal::InkFaint, Font::Label, kSizeLabel);
+    }
+    EndRow(row);
+
+    row = BeginRow("HDR DITHER");
+    RowTip(row, "Dither the HDR output (overlay and DWM hook).");
+    RowPlace(row);
+    if (OnOff("##set_dither", g_hdrDither.load(), &v)) Post([v]() { act::SetHdrDither(v); });
+    EndRow(row);
+
+    row = BeginRow("PASSTHROUGH");
+    RowTip(row, "Hide the overlay while a listed app runs (keeps G-Sync).");
+    if (RowButtons(row, "set_vrr", { "EDIT\xE2\x80\xA6" }) == 0) Post([]() { ShowVrrWhitelistDialog(Window()); });
+    RowPlace(row);
+    if (OnOff("##set_vrr_on", g_vrrWhitelistEnabled.load(), &v)) Post([v]() { act::SetVrrWhitelistEnabled(v); });
+    EndRow(row);
+
+    row = BeginRow("GAMMA EXCEPTIONS");
+    RowTip(row, "Desktop gamma turns off while a listed app runs.");
+    if (RowButtons(row, "set_gwl", { "EDIT\xE2\x80\xA6" }) == 0) Post([]() { ShowGammaWhitelistDialog(Window()); });
+    RowText(row, g_gammaWhitelistRaw.empty() ? std::string("\xE2\x80\x94") : Utf8(g_gammaWhitelistRaw),
+            g_gammaWhitelistRaw.empty() ? pal::InkFaint : pal::Ink);
+    EndRow(row);
+}
+
+void SettingsHotkeys() {
+    SectionHeader("HOTKEYS", nullptr);
+    struct Hotkey { const char* label; const char* id; int hotkey; const std::atomic<bool>* on; const std::atomic<char>* key; };
+    const Hotkey keys[] = {
+        { "DESKTOP GAMMA", "##hk_gamma", HOTKEY_GAMMA, &g_hotkeyGammaEnabled, &g_hotkeyGammaKey },
+        { "HDR", "##hk_hdr", HOTKEY_HDR_TOGGLE, &g_hotkeyHdrEnabled, &g_hotkeyHdrKey },
+        { "ANALYSIS", "##hk_analysis", HOTKEY_ANALYSIS, &g_hotkeyAnalysisEnabled, &g_hotkeyAnalysisKey },
+    };
+    for (const Hotkey& k : keys) {
+        RowCtx row = BeginRow(k.label);
+        RowPlace(row);
+        bool v = false;
+        if (OnOff(k.id, k.on->load(), &v)) {
+            const int id = k.hotkey;
+            Post([id, v]() { act::SetHotkeyEnabled(id, v); });
+        }
+        RowNext(row);
+        char combo[32];
+        snprintf(combo, sizeof(combo), "WIN+SHIFT+%c", k.key->load());
+        RowText(row, combo, k.on->load() ? pal::InkDim : pal::InkFaint);
+        EndRow(row);
+    }
+}
+
+void SettingsCalibration() {
+    SectionHeader("CALIBRATION", nullptr);
+    RowCtx row = BeginRow("DLC CONTROL");
+    RowTip(row, "Lets DLC drive DesktopLUT over a local pipe while it calibrates.");
+    RowPlace(row);
+    bool v = false;
+    if (OnOff("##set_calib", g_calibrationControlEnabled.load(), &v)) Post([v]() { ApplyCalibrationControl(v); });
+    EndRow(row);
+}
+
+void SettingsDiagnostics() {
+    SectionHeader("DIAGNOSTICS", nullptr);
+    RowCtx row = BeginRow("CONSOLE LOG");
+    RowTip(row, "A console window with the log.");
+    RowPlace(row);
+    bool v = false;
+    if (OnOff("##set_console", g_consoleEnabled.load(), &v)) Post([v]() { act::SetConsoleLog(v); });
+    EndRow(row);
+}
+
+void SettingsAbout(ViewState& vs) {
+    SectionHeader("ABOUT", nullptr);
+    RowCtx row = BeginRow("VERSION");
+    RowText(row, DESKTOPLUT_VERSION_STR);
+    EndRow(row);
+    row = BeginRow("LICENSE");
+    RowText(row, "GPL-3.0");
+    EndRow(row);
+    row = BeginRow("NOTICES");
+    if (RowButtons(row, "set_notices", { vs.showNotices ? "HIDE" : "SHOW" }) == 0) vs.showNotices = !vs.showNotices;
+    std::string names;
+    for (int i = 0; i < kNoticeCount; i++) names += (i ? ", " : "") + std::string(kNotices[i].name);
+    RowText(row, names, pal::InkDim, Font::Body, 13.0f);
+    EndRow(row);
+    if (!vs.showNotices) return;
+    for (int i = 0; i < kNoticeCount; i++) {
+        ImGui::Dummy(ImVec2(0, Px(10)));
+        const std::string title = std::string(kNotices[i].name) + "  \xC2\xB7  " + kNotices[i].license;
+        Text(Font::Label, kSizeLabel, pal::Ink, title.c_str());
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        Text(Font::Mono, 11.0f, pal::InkDim, kNotices[i].text);
+    }
+}
+
+void DrawSettingsPage(const Snapshot& snap, ViewState& vs) {
+    const float bodyH = FooterTop() - ImGui::GetCursorScreenPos().y;   // down to the pinned footer
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
+    ImGui::BeginChild("##settings", ImVec2(0, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PopStyleVar();
+    // Two equal columns with a double gutter between them.
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
+    if (ImGui::BeginTable("##settings_cols", 3, ImGuiTableFlags_None)) {
+        ImGui::TableSetupColumn("left", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("gap", ImGuiTableColumnFlags_WidthFixed, Px(kGutter * 2));
+        ImGui::TableSetupColumn("right", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        SettingsGeneral();
+        SettingsSpacer();
+        SettingsEngine(snap);
+        SettingsSpacer();
+        SettingsHotkeys();
+        ImGui::TableSetColumnIndex(2);
+        SettingsCalibration();
+        SettingsSpacer();
+        SettingsDiagnostics();
+        SettingsSpacer();
+        SettingsAbout(vs);
+        ImGui::EndTable();
+    }
+    ImGui::PopStyleVar();
+    ImGui::EndChild();
+}
+
 void DrawEventsPage() {
     const float bodyH = FooterTop() - ImGui::GetCursorScreenPos().y;   // down to the pinned footer
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
@@ -895,6 +1085,7 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
     if (vs.page == Page::Events) DrawEventsPage();
+    else if (vs.page == Page::Settings) DrawSettingsPage(snap, vs);
     else DrawPipelinePage(snap, vs);
     ImGui::EndDisabled();
     ImGui::PopStyleVar();

@@ -124,6 +124,7 @@
     <ClCompile Include="src\ui\ui_views.cpp" />
     <ClCompile Include="src\ui\ui_window.cpp" />
     <ClCompile Include="src\ui\ui_logo.cpp" />
+    <ClCompile Include="src\ui\ui_notices.cpp" />
   </ItemGroup>
   <!-- Dear ImGui v1.92.9b (third_party/imgui, MIT). Vendored as-is: no SDL checks, CRT deprecation silenced. -->
   <ItemGroup>

@@ -84,12 +84,14 @@ struct MovableAtomic {
 #define WM_FALD_RECOMPOSE        (WM_USER + 107)  // hook FALD needs one full-screen recomposition (any thread -> GUI thread)
 #define WM_MHC_REGENERATE_MISSING (WM_USER + 108) // the active MHC profile's .icm is gone: regenerate it (verify -> GUI thread)
 #define WM_STATUS_TEXT           (WM_USER + 109)  // SetStatus from a non-GUI thread: show the latest status text (any thread -> GUI thread)
+// Registered message a second launch posts to the running instance's hub window: show the active interface.
+#define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
 #define ID_TRAY_SUSPEND     2003   // "Suspend live layers" (replaces Start / Stop; 2002 retired)
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
 #define ID_TRAY_CALIBRATION 2006
-#define ID_TRAY_NEW_UI      2007
+#define ID_TRAY_CLASSIC_UI  2007
 
 // Tab control
 #define ID_TAB_CONTROL      200

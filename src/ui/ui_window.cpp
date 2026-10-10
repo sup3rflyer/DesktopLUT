@@ -284,21 +284,22 @@ void* LogoTexture() { return g_logo; }
 
 HWND Window() { return g_hwnd; }
 
-void Show() {
+bool Show() {
     if (!g_hwnd && !CreateUiWindow()) {
         notify::Post(notify::Sev::Error, -1, L"ui", L"New interface could not be created");
-        return;
+        return false;
     }
     KillTimer(g_hwnd, kReleaseTimer);
     RefreshModeCache();
     if (!EnsureImGui()) {
         notify::Post(notify::Sev::Error, -1, L"ui", L"New interface: no Direct3D device");
-        return;
+        return false;
     }
     if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
     else ShowWindow(g_hwnd, SW_SHOW);
     SetForegroundWindow(g_hwnd);
     Kick();
+    return true;
 }
 
 void Hide() {

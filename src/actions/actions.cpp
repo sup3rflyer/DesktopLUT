@@ -564,7 +564,10 @@ void SetStartMinimized(bool on) {
     SaveSettings();
 }
 
-void SetRunAtStartup(bool on) { SetStartupEnabled(on); }
+void SetRunAtStartup(bool on) {
+    SetStartupEnabled(on);
+    RefreshStartupEnabledCache();
+}
 
 void SetConsoleLog(bool on) {
     g_consoleEnabled.store(on);
