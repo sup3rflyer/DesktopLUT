@@ -119,7 +119,7 @@ void SetDwmHookMode(bool on) {
         StopProcessing();
         StartProcessing();
     } else {
-        ReconcileLiveLayers("engine");   // the overlay FALD layer needs processing, the hook's does not
+        ReconcileLiveLayers("engine");   // the FALD layer's need differs per engine (the hook's needs a panel file)
     }
     if (ValidMonitor(g_gui.currentMonitor)) Finish(g_gui.currentMonitor);
 }

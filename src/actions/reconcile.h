@@ -1,7 +1,7 @@
 #pragma once
 // Live layers follow the configuration (3.0.0: no Start / Stop). The processing thread and the DWM hook
-// run while some display needs them (a 3D LUT, tone mapping, the overlay FALD layer, the shader tweak,
-// desktop gamma) and stop when none does, unless the user suspended them. The MHC profiles are not live
+// run while some display needs them (a 3D LUT, tone mapping, the FALD layer, the shader tweak, desktop
+// gamma) and stop when none does, unless the user suspended them. The MHC profiles are not live
 // layers: they stay at scanout either way.
 
 namespace act {
