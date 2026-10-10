@@ -25,6 +25,7 @@ struct Snapshot {
     std::vector<DisplayRow> parked;
     bool running = false;
     bool suspended = false;   // the user's Suspend (act::LiveLayersSuspended)
+    bool calibrating = false; // a DLC calibration session or live edit is open (IsCalibrationOrLiveEditActive)
     bool hookMode = false;
     bool hookActive = false;
     std::wstring lastStatus;

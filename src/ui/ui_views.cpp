@@ -212,15 +212,16 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
     const float bw = 92.0f, bh = 28.0f, gap = 8.0f, groupGap = 24.0f;
     float x = p.x + w - Px(kGutter) - Px(bw * 4 + gap * 2 + groupGap);
     ImGui::SetCursorScreenPos(ImVec2(x, cy - Px(bh) * 0.5f));
-    ImGui::BeginDisabled(busy);
+    ImGui::BeginDisabled(busy || (snap.calibrating && !snap.suspended));
     if (Toggle("##suspend", "SUSPEND", snap.suspended, ImVec2(bw, bh))) {
         const bool want = !snap.suspended;
         Post([want]() { act::SetLiveLayersSuspended(want); });
     }
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip(snap.suspended ? "3D LUT, tone mapping and FALD off. MHC stays on."
-                                         : "Turn off 3D LUT, tone mapping and FALD. MHC stays on.");
+        ImGui::SetTooltip(snap.calibrating && !snap.suspended ? "Calibration in progress."
+                          : snap.suspended ? "3D LUT, tone mapping and FALD off. MHC stays on."
+                                           : "Turn off 3D LUT, tone mapping and FALD. MHC stays on.");
     ImGui::SameLine(0, Px(groupGap));
     if (Toggle("##pg_pipe", "PIPELINE", vs.page == Page::Pipeline, ImVec2(bw, bh))) vs.page = Page::Pipeline;
     ImGui::SameLine(0, Px(gap));

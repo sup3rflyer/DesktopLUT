@@ -69,6 +69,11 @@ ReconcileDecision ReconcileLiveLayers(const char* why) {
 
 void SetLiveLayersSuspended(bool suspended) {
     if (g_userStopped == suspended) return;
+    if (suspended && IsCalibrationOrLiveEditActive()) {
+        notify::Post(notify::Sev::Warning, -1, L"live", L"Calibration in progress: live layers stay on");
+        GuiNotifySettingsChanged(-1);   // the classic control shows the state it keeps
+        return;
+    }
     g_userStopped = suspended;
     notify::Post(notify::Sev::Info, -1, L"live", suspended ? L"Live layers suspended" : L"Live layers resumed");
     if (suspended) {
@@ -81,5 +86,12 @@ void SetLiveLayersSuspended(bool suspended) {
 }
 
 bool LiveLayersSuspended() { return g_userStopped; }
+
+void ResumeLiveLayersForPipe() {
+    if (!g_userStopped) return;
+    g_userStopped = false;
+    notify::Post(notify::Sev::Info, -1, L"live", L"Live layers resumed by DLC");
+    GuiNotifySettingsChanged(-1);
+}
 
 }  // namespace act

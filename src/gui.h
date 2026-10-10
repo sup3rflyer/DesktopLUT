@@ -40,7 +40,7 @@ void ShowActiveUi();
 void SetInterfaceClassic(bool classic);
 
 // The user stopped the live layers (classic Stop / tray Stop); automatic restarts respect it. GUI thread.
-extern bool g_userStopped;
+extern std::atomic<bool> g_userStopped;   // read by the pipe thread (state.get)
 
 // Run a classic control's command for display `mon` (selects it in the classic window first). The new
 // interface uses it to open the classic editors (MHC edit dialog, grayscale editor) until its own

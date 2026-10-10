@@ -28,8 +28,13 @@ ReconcileDecision DecideReconcile(const ReconcileInputs& in);
 ReconcileDecision ReconcileLiveLayers(const char* why);
 
 // GUI thread. Suspend stops the live layers and keeps them stopped (display changes and wakes do not
-// start them); resume reconciles.
+// start them); resume reconciles. Suspending is refused while a calibration session or live edit is
+// open (a DLC run owns the pipeline until calibration.exit).
 void SetLiveLayersSuspended(bool suspended);
 bool LiveLayersSuspended();
+
+// GUI thread. A calibration-pipe verb is about to start the live layers (DLC applies what it
+// configures): a Suspend gives way, announced in the event log, instead of being silently overridden.
+void ResumeLiveLayersForPipe();
 
 }  // namespace act

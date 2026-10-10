@@ -5,6 +5,7 @@
 #include "dwm_inject.h"
 #include "actions/notify.h"
 #include "actions/reconcile.h"
+#include "desktoplut_ipc_server.h"
 #include <dxgi1_6.h>
 #include <mutex>
 
@@ -99,6 +100,7 @@ void TakeSnapshot(Snapshot& out) {
 
     out.running = g_gui.isRunning.load();
     out.suspended = act::LiveLayersSuspended();
+    out.calibrating = IsCalibrationOrLiveEditActive();   // locks of its own: outside the settings lock above
     out.hookMode = g_dwmHookMode.load();
     out.hookActive = out.hookMode && IsDwmHookActive();
 

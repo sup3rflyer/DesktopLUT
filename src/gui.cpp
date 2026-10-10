@@ -1174,9 +1174,10 @@ int g_monitorSettingsPins = 0;   // see MonitorSettingsPin (gui.h)
 // The user suspended the live layers (act::SetLiveLayersSuspended: the new UI's SUSPEND, the tray's
 // "Suspend live layers", the classic Stop) and has not resumed since (classic Start/Apply resumes too):
 // display changes, wakes and the live-layer reconcile must not start processing behind their back.
-// Programmatic Stop/Start pairs (LUT browse, pipe verbs, preview spin-ups) do not touch it. Session
-// only. GUI thread only.
-bool g_userStopped = false;
+// Programmatic Stop/Start pairs (LUT browse, preview spin-ups) do not touch it; a pipe verb that starts
+// the live layers clears it, visibly (act::ResumeLiveLayersForPipe). Session only. Written on the GUI
+// thread; the pipe thread reads it for state.get.
+std::atomic<bool> g_userStopped{ false };
 
 void GuiNotifySettingsChanged(int mon) {
     // The classic controls show ONE display; refreshing them from another display's settings would put

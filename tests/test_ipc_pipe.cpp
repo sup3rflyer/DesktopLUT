@@ -6,6 +6,7 @@
 #include "doctest.h"
 #include "desktoplut_ipc_server.h"
 #include "globals.h"
+#include "gui.h"
 #include "ipc_client_check.h"
 
 #include <windows.h>
@@ -138,6 +139,20 @@ TEST_CASE("Calibration pipe: a request round-trips; Stop and re-arm work") {
     CHECK(MsToStop() < 1000);
     StartCalibrationIpcServer();
     CHECK(Contains(RoundTrip(R"({"method":"no.such.method"})"), "unknown method"));
+}
+
+TEST_CASE("Calibration pipe: state.get reports the user's Suspend beside running") {
+    ArmedServer server(false);
+    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
+    const bool old = g_userStopped.load();
+    g_userStopped = true;
+    std::string reply = RoundTrip(R"({"method":"state.get"})");
+    CHECK(Contains(reply, "\"suspended\":true"));
+    CHECK(Contains(reply, "\"running\":"));   // unchanged field, still there
+    g_userStopped = false;
+    reply = RoundTrip(R"({"method":"state.get"})");
+    CHECK(Contains(reply, "\"suspended\":false"));
+    g_userStopped = old;
 }
 
 TEST_CASE("Calibration pipe: a client that connects and sends nothing does not block Stop") {

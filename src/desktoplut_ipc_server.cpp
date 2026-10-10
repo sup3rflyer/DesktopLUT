@@ -35,6 +35,7 @@
 #include "settings.h"
 #include "processing.h"
 #include "gui.h"
+#include "actions/reconcile.h"
 #include "dwm_inject.h"
 
 #pragma comment(lib, "Advapi32.lib")
@@ -275,7 +276,11 @@ bool AnyCorrectionActive() {
 void ReapplyProcessing() {
     StopProcessing();
     FaldTrace("ReapplyProcessing: AnyCorrectionActive?");
-    if (AnyCorrectionActive()) { FaldTrace("ReapplyProcessing: StartProcessing"); StartProcessing(); }
+    if (AnyCorrectionActive()) {
+        act::ResumeLiveLayersForPipe();   // a user Suspend gives way to what DLC applies, visibly
+        FaldTrace("ReapplyProcessing: StartProcessing");
+        StartProcessing();
+    }
     FaldTrace("ReapplyProcessing: end");
 }
 
@@ -381,6 +386,9 @@ JsonValue GrayscaleJson(const GrayscaleSettings& gs) {
 void HandleStateGet(JsonValue& result) {
     result.set("contract_version", JNum((double)kCalibrationContractVersion));
     result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
+    // The user suspended the live layers (tray / interface). Additive: `running` keeps its meaning. A
+    // verb that starts the live layers clears it (act::ResumeLiveLayersForPipe).
+    result.set("suspended", JBool(g_userStopped.load()));
     // WIRE CONTRACT (consumed by DLC). Mirrors the OVERLAY-active flag, NOT the DWM-hook state:
     // reads false in hook mode even while a cube is live. Judge hook-mode liveness by cube_path
     // + hook health, not this field. See docs/NAMING.md §4.
@@ -1099,6 +1107,7 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
             else DwmHookReevaluateOverlay();
             FaldTrace("LayersSet: after reevaluate");
         } else if ((hasTm && tm) || (hasFd && fd)) {
+            act::ResumeLiveLayersForPipe();
             FaldTrace("LayersSet: StartProcessing");
             StartProcessing();
         }
