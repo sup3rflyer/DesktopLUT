@@ -24,6 +24,7 @@ struct Snapshot {
     std::vector<DisplayRow> live;
     std::vector<DisplayRow> parked;
     bool running = false;
+    bool suspended = false;   // the user's Suspend (act::LiveLayersSuspended)
     bool hookMode = false;
     bool hookActive = false;
     std::wstring lastStatus;

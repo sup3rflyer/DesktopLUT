@@ -1,4 +1,5 @@
 #include "actions/actions.h"
+#include "actions/reconcile.h"
 
 #include "gui.h"
 #include "gui_mhc.h"
@@ -46,7 +47,8 @@ void PushCorrection(int mon, bool hdr, bool reevaluateOverlay) {
 }
 
 // A FALD layer setting of one mode changed (GUI-thread port of the classic ApplyFaldSettingChange).
-void PushFald(int mon, bool hdr, bool enabledNow) {
+// Returns what the reconcile did (a Start / Restart already loaded the panel files).
+ReconcileDecision PushFald(int mon, bool hdr, bool enabledNow) {
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(mon, hdr);
         if (g_dwmHookMode.load()) {
@@ -55,12 +57,12 @@ void PushFald(int mon, bool hdr, bool enabledNow) {
         } else {
             DwmHookReevaluateOverlay();
         }
-    } else if (enabledNow) {
-        StartProcessing();
     }
     SaveSettings();
+    const ReconcileDecision d = ReconcileLiveLayers("FALD");
     if (enabledNow && g_dwmHookMode.load())
         notify::Post(notify::Sev::Info, mon, L"fald", L"FALD in DWM hook mode: correction, Starfield and LED lag");
+    return d;
 }
 
 void RegenerateMhc(int mon, bool hdr) {
@@ -91,6 +93,8 @@ Result SetLutPath(int mon, bool hdr, const std::wstring& path) {
     if (g_gui.isRunning) {
         StopProcessing();
         StartProcessing();
+    } else {
+        ReconcileLiveLayers("3D LUT");
     }
     Finish(mon);
     return Done();
@@ -114,6 +118,8 @@ void SetDwmHookMode(bool on) {
     if (g_gui.isRunning) {
         StopProcessing();
         StartProcessing();
+    } else {
+        ReconcileLiveLayers("engine");   // the overlay FALD layer needs processing, the hook's does not
     }
     if (ValidMonitor(g_gui.currentMonitor)) Finish(g_gui.currentMonitor);
 }
@@ -140,8 +146,9 @@ Result SetTonemap(int mon, const TonemapSettings& t) {
     // the analysis overlay's TM indicator follows. Only an enable change can change whether the
     // overlay is needed at all.
     if (g_gui.isRunning) PushCorrection(mon, true, enableChanged);
-    else if (enableChanged && v.enabled) StartProcessing();
     SaveSettings();
+    // An enable change can start or stop the live layers, or change the hook's display list.
+    if (enableChanged) ReconcileLiveLayers("tone map");
     Finish(mon);
     return Done();
 }
@@ -252,20 +259,21 @@ Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload
         enabledNow = fald.enabled;
     }
     if (!changed) return Done(false);
-    PushFald(mon, hdr, enabledNow);
-    FaldPanelFileChangedReinject();   // hook mode: the DLL reads panel files only at injection
+    const ReconcileDecision d = PushFald(mon, hdr, enabledNow);
+    // Hook mode: the DLL reads panel files only at injection (a new path already changed the display list
+    // and restarted it; a reload of the same path did not).
+    if (d != ReconcileDecision::Start && d != ReconcileDecision::Restart) FaldPanelFileChangedReinject();
     Finish(mon);
     return Done();
 }
 
 Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit) {
     if (!ValidMonitor(mon)) return Done(false);
-    bool changed = false, anyEnabled = false;
+    bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
         for (bool hdr : { true, false }) changed = edit(FaldOf(ms, hdr)) || changed;
-        anyEnabled = ms.hdrColorCorrection.fald.enabled || ms.sdrColorCorrection.fald.enabled;
     }
     if (!changed) return Done(false);
     if (g_gui.isRunning) {
@@ -277,10 +285,9 @@ Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit) {
         } else {
             DwmHookReevaluateOverlay();
         }
-    } else if (anyEnabled) {
-        StartProcessing();
     }
     SaveSettings();
+    ReconcileLiveLayers("FALD");
     Finish(mon);
     return Done();
 }
@@ -501,6 +508,7 @@ Result MhcSetDesktopGamma(int mon, bool on) {
         SwapMhcToPermutation(mon, true, perm);
     }
     SaveSettings();
+    ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (MonitorNeedsProcessing)
     Finish(mon);
     return Done();
 }
@@ -583,16 +591,15 @@ void SetVrrWhitelistEnabled(bool on) {
 // ---------------------------------------------------------------------------------------------------
 // Live layers
 
-void StartLiveLayers() {
-    g_userStopped = false;
+void ReloadLiveLayers() {
+    if (g_userStopped) {
+        g_userStopped = false;
+        notify::Post(notify::Sev::Info, -1, L"live", L"Live layers resumed");
+    }
     SaveSettings();
     if (g_gui.isRunning) StopProcessing();
-    StartProcessing();
-}
-
-void StopLiveLayers() {
-    g_userStopped = true;
-    StopProcessing();
+    StartProcessing();   // not running and nothing needed: still the MHC-only hygiene + status
+    GuiNotifySettingsChanged(-1);
 }
 
 }  // namespace act

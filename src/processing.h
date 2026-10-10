@@ -55,6 +55,13 @@ bool MonitorNeedsDwmHook(const std::wstring& sdrLut, const std::wstring& hdrLut,
            hdr.tonemap.enabled;
 }
 
+struct DwmHookMonitorLUT;
+// The staging set a hook-mode start injects for the current settings and display positions: the live
+// displays that need processing AND hook work. StartProcessing, the watchdog's re-injection and the
+// live-layer reconcile (DwmHookResidentWith: is the resident hook still the one this configuration
+// wants?) all use it, so they cannot disagree. GUI thread.
+std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet();
+
 // True while StartProcessing/StopProcessing is executing (their joins pump messages): handlers
 // that would start, join or replace the processing thread must leave it to the transition.
 bool IsProcessingTransitionActive();

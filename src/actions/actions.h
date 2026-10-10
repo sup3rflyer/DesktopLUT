@@ -73,8 +73,9 @@ void SetRunAtStartup(bool on);
 void SetConsoleLog(bool on);
 void SetVrrWhitelistEnabled(bool on);
 
-// ---- Live layers (the classic Start / Stop) ---------------------------------------------------------
-void StartLiveLayers();
-void StopLiveLayers();
+// ---- Live layers -----------------------------------------------------------------------------------
+// The classic Start / Apply: resume (act::SetLiveLayersSuspended) and restart, which re-reads the cube
+// files at their paths. Starting and stopping otherwise follow the configuration (actions/reconcile.h).
+void ReloadLiveLayers();
 
 }  // namespace act

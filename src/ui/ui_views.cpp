@@ -4,6 +4,7 @@
 #include "ui_window.h"
 #include "actions/actions.h"
 #include "actions/notify.h"
+#include "actions/reconcile.h"
 #include "globals.h"
 #include "gui.h"
 #include <cctype>
@@ -188,7 +189,7 @@ void SectionHeader(const char* title, const Light* light) {
 // ---------------------------------------------------------------------------------------------
 // Header / footer
 
-void DrawHeader(ViewState& vs) {
+void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::GetContentRegionAvail().x;
@@ -204,9 +205,20 @@ void DrawHeader(ViewState& vs) {
     TextAt(Font::Label, 14.0f, pal::Ink, textX, cy, "DESKTOPLUT");
     TextAt(Font::Label, kSizeLabel, pal::InkFaint, textX + MeasureText(Font::Label, 14.0f, "DESKTOPLUT").x + Px(14), cy, "PREVIEW");
 
-    const float bw = 92.0f, bh = 28.0f, gap = 8.0f;
-    float x = p.x + w - Px(kGutter) - Px(bw * 2 + gap);
+    // Fixed slots, right-aligned: SUSPEND, a wider gap, then the page switch.
+    const float bw = 92.0f, bh = 28.0f, gap = 8.0f, groupGap = 24.0f;
+    float x = p.x + w - Px(kGutter) - Px(bw * 3 + gap + groupGap);
     ImGui::SetCursorScreenPos(ImVec2(x, cy - Px(bh) * 0.5f));
+    ImGui::BeginDisabled(busy);
+    if (Toggle("##suspend", "SUSPEND", snap.suspended, ImVec2(bw, bh))) {
+        const bool want = !snap.suspended;
+        Post([want]() { act::SetLiveLayersSuspended(want); });
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip(snap.suspended ? "3D LUT, tone mapping and FALD off. MHC stays on."
+                                         : "Turn off 3D LUT, tone mapping and FALD. MHC stays on.");
+    ImGui::SameLine(0, Px(groupGap));
     if (Toggle("##pg_pipe", "PIPELINE", vs.page == Page::Pipeline, ImVec2(bw, bh))) vs.page = Page::Pipeline;
     ImGui::SameLine(0, Px(gap));
     if (Toggle("##pg_events", "EVENTS", vs.page == Page::Events, ImVec2(bw, bh))) vs.page = Page::Events;
@@ -879,7 +891,7 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     ImGui::Begin("##root", nullptr, flags);
     ImGui::PopStyleVar(2);
 
-    DrawHeader(vs);
+    DrawHeader(snap, vs, busy);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
     if (vs.page == Page::Events) DrawEventsPage();

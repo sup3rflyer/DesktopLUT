@@ -19,6 +19,7 @@
 #include "monitor_identity.h"
 #include "actions/actions.h"
 #include "actions/notify.h"
+#include "actions/reconcile.h"
 #include "ui/ui_window.h"
 #include "../resource.h"
 #include <commctrl.h>
@@ -801,8 +802,8 @@ void ShowTrayMenu(HWND hwnd) {
     AppendMenu(hMenu, MF_STRING, ID_TRAY_NEW_UI, L"New interface (preview)");
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenu(hMenu, g_gui.isRunning ? MF_GRAYED : MF_STRING, ID_TRAY_APPLY, L"Start");
-    AppendMenu(hMenu, g_gui.isRunning ? MF_STRING : MF_GRAYED, ID_TRAY_STOP, L"Stop");
+    AppendMenu(hMenu, act::LiveLayersSuspended() ? (MF_STRING | MF_CHECKED) : MF_STRING, ID_TRAY_SUSPEND,
+               L"Suspend live layers");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, IsStartupEnabled() ? (MF_STRING | MF_CHECKED) : MF_STRING,
                ID_TRAY_STARTUP, L"Run at startup");
@@ -1125,9 +1126,11 @@ static int g_monitorIdentityRetries = 0;
 
 int g_monitorSettingsPins = 0;   // see MonitorSettingsPin (gui.h)
 
-// The user pressed Stop (button / tray) and has not pressed Start/Apply since: display changes and
-// wakes must not start processing behind their back. Programmatic Stop/Start pairs (LUT browse,
-// pipe verbs, preview spin-ups) do not touch it. GUI thread only.
+// The user suspended the live layers (act::SetLiveLayersSuspended: the new UI's SUSPEND, the tray's
+// "Suspend live layers", the classic Stop) and has not resumed since (classic Start/Apply resumes too):
+// display changes, wakes and the live-layer reconcile must not start processing behind their back.
+// Programmatic Stop/Start pairs (LUT browse, pipe verbs, preview spin-ups) do not touch it. Session
+// only. GUI thread only.
 bool g_userStopped = false;
 
 void GuiNotifySettingsChanged(int mon) {
@@ -1435,7 +1438,7 @@ static void KillAllGuiTimers(HWND hwnd) {
         DWM_HOOK_WATCHDOG_TIMER_ID, MHC_VERIFY_TIMER_ID, MHC_BLIND_KICK_TIMER_ID, MHC_REGISTRY_KICK_TIMER_ID,
         MHC_BURST_TIMER_ID, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_BEACON_TIMER_ID, MONITOR_IDENTITY_TIMER_ID,
         FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
-        RENDER_HEALTH_TIMER_ID,
+        RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID,
     };
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
@@ -1523,10 +1526,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         case ID_APPLY:
             g_tetrahedralInterp = (SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            act::StartLiveLayers();
+            act::ReloadLiveLayers();
             return 0;
         case ID_STOP:
-            act::StopLiveLayers();
+            act::SetLiveLayersSuspended(true);
             return 0;
         case ID_TETRAHEDRAL_CHECK:
             act::SetTetrahedral(SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -2205,12 +2208,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
             SetForegroundWindow(hwnd);
             return 0;
-        case ID_TRAY_APPLY:
-            g_userStopped = false;
-            StartProcessing();
-            return 0;
-        case ID_TRAY_STOP:
-            act::StopLiveLayers();
+        case ID_TRAY_SUSPEND:
+            act::SetLiveLayersSuspended(!act::LiveLayersSuspended());
             return 0;
         case ID_TRAY_STARTUP:
             SetStartupEnabled(!IsStartupEnabled());
@@ -2483,6 +2482,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (wParam == RECONCILE_TIMER_ID) {
+            KillTimer(hwnd, RECONCILE_TIMER_ID);
+            act::ReconcileLiveLayers("retry");   // re-arms itself while still busy
+            return 0;
+        }
         if (wParam == SETTINGS_CHANGE_TIMER_ID) {
             KillTimer(hwnd, SETTINGS_CHANGE_TIMER_ID);
             std::cout << "[GUI] Settings change debounce fired, forcing reinit..." << std::endl;
@@ -2542,30 +2546,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 std::cout << "[DWM Hook Watchdog] Hook lost (DWM restart?), attempting re-injection..." << std::endl;
 
-                // Re-derive monitor LUT config from current settings + monitors
-                std::vector<DwmHookMonitorLUT> dwmMonitors;
-                for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-                    const auto& ms = g_gui.monitorSettings[i];
-                    // The same predicate as StartProcessing: a .cube, a FALD panel file (staged whether
-                    // or not the layer is on) or the HDR tonemapper is reason enough to inject.
-                    const std::wstring& sdrFald = ms.sdrColorCorrection.fald.paramsPath;
-                    const std::wstring& hdrFald = ms.hdrColorCorrection.fald.paramsPath;
-                    if (!MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection))
-                        continue;
-                    if (i >= g_gui.monitors.size()) continue;
-
-                    MONITORINFO mi = { sizeof(mi) };
-                    if (GetMonitorInfo(g_gui.monitors[i], &mi)) {
-                        DwmHookMonitorLUT lut;
-                        lut.left = mi.rcMonitor.left;
-                        lut.top = mi.rcMonitor.top;
-                        lut.sdrLutPath = ms.sdrPath;
-                        lut.hdrLutPath = ms.hdrPath;
-                        lut.sdrFaldPath = sdrFald;
-                        lut.hdrFaldPath = hdrFald;
-                        dwmMonitors.push_back(lut);
-                    }
-                }
+                // Re-derive the staging set from current settings + monitors (the same set StartProcessing
+                // injects: a .cube, a FALD panel file or the HDR tonemapper on a display that needs processing)
+                std::vector<DwmHookMonitorLUT> dwmMonitors = DesiredDwmHookStagingSet();
 
                 if (!dwmMonitors.empty()) {
                     std::wstring err = InjectDwmHook(dwmMonitors);
@@ -3036,9 +3019,12 @@ int RunGUI() {
     // powered on after boot) starts processing from WM_DISPLAYCHANGE — see g_userStopped.
     bool hasAnyCorrection = AnyMonitorHasCorrections();
 
-    // Auto-start processing if any correction is enabled
+    // Auto-start processing if any correction is enabled. MaxTML holds either way (StartProcessing applies
+    // it; a setup with nothing else configured still gets it).
     if (hasAnyCorrection) {
         StartProcessing();
+    } else {
+        ApplyMaxTmlSettings();
     }
 
     // Only start minimized if user explicitly enabled the setting

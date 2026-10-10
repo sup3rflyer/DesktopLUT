@@ -1102,6 +1102,31 @@ bool AnyMonitorNeedsProcessing() {
     return false;
 }
 
+std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet() {
+    std::vector<DwmHookMonitorLUT> set;
+    for (size_t i = 0; i < g_gui.monitorSettings.size() && i < g_gui.monitors.size(); i++) {
+        const MonitorSettings& ms = g_gui.monitorSettings[i];
+        // A monitor with only a FALD panel file, or only the HDR tonemapper, and no .cube still belongs
+        // in the list: the hook runs that work on it (empty cube paths stage nothing). The panel file is
+        // always staged when a path is set, enabled or not, so switching the layer on later rides the
+        // shared config instead of a re-inject.
+        if (!MonitorNeedsProcessing(ms) ||
+            !MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection))
+            continue;
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetMonitorInfo(g_gui.monitors[i], &mi)) continue;
+        DwmHookMonitorLUT lut;
+        lut.left = mi.rcMonitor.left;
+        lut.top = mi.rcMonitor.top;
+        lut.sdrLutPath = ms.sdrPath;
+        lut.hdrLutPath = ms.hdrPath;
+        lut.sdrFaldPath = ms.sdrColorCorrection.fald.paramsPath;
+        lut.hdrFaldPath = ms.hdrColorCorrection.fald.paramsPath;
+        set.push_back(lut);
+    }
+    return set;
+}
+
 bool AnyMonitorHasCorrections() {
     if (g_userDesktopGammaMode.load()) return true;   // desktop gamma is a global setting
     for (const auto& ms : g_gui.monitorSettings) {
@@ -1167,6 +1192,10 @@ static void StartProcessingImpl() {
         }
     }
 
+    // MaxTML (display peak override) is not a live layer: it holds whether or not anything else runs, so an
+    // MHC-only setup gets it too (C16).
+    ApplyMaxTmlSettings();
+
     if (configs.empty()) {
         // Nothing for a processing thread or the hook. An MHC-only setup (the VRR-safe one) is not
         // an error: its profiles live at scanout. Give it the startup hygiene the processing thread
@@ -1200,9 +1229,6 @@ static void StartProcessingImpl() {
         return;
     }
 
-    // Apply MaxTML settings for monitors that have it enabled
-    ApplyMaxTmlSettings();
-
     // Save current settings as active (for comparison to detect changes)
     g_gui.activeSettings = g_gui.monitorSettings;
 
@@ -1220,32 +1246,8 @@ static void StartProcessingImpl() {
         // DWM Hook Mode: inject DLL into dwm.exe for LUT application
         std::wcout << L"[DWM Hook] Starting in DWM Hook mode" << std::endl;
 
-        // Build monitor LUT list for injection
-        std::vector<DwmHookMonitorLUT> dwmMonitors;
-        for (const auto& cfg : configs) {
-            // A monitor with only a FALD panel file, or only the HDR tonemapper, and no .cube still
-            // belongs in the list: the hook runs that work on it (empty cube paths stage nothing). The
-            // panel file is always staged when a path is set, enabled or not, so switching the layer on
-            // later rides the shared config instead of a re-inject.
-            const std::wstring& sdrFald = cfg.sdrColorCorrection.fald.paramsPath;
-            const std::wstring& hdrFald = cfg.hdrColorCorrection.fald.paramsPath;
-            if (!MonitorNeedsDwmHook(cfg.sdrLutPath, cfg.hdrLutPath, cfg.sdrColorCorrection,
-                                     cfg.hdrColorCorrection))
-                continue;
-            if (cfg.monitorIndex < 0 || cfg.monitorIndex >= (int)g_gui.monitors.size()) continue;
-
-            MONITORINFO mi = { sizeof(mi) };
-            if (GetMonitorInfo(g_gui.monitors[cfg.monitorIndex], &mi)) {
-                DwmHookMonitorLUT lut;
-                lut.left = mi.rcMonitor.left;
-                lut.top = mi.rcMonitor.top;
-                lut.sdrLutPath = cfg.sdrLutPath;
-                lut.hdrLutPath = cfg.hdrLutPath;
-                lut.sdrFaldPath = sdrFald;
-                lut.hdrFaldPath = hdrFald;
-                dwmMonitors.push_back(lut);
-            }
-        }
+        // Build monitor LUT list for injection (the configs above, filtered to displays with hook work)
+        std::vector<DwmHookMonitorLUT> dwmMonitors = DesiredDwmHookStagingSet();
 
         std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with hook work (cube / FALD / tonemap)"
                    << std::endl;

@@ -85,8 +85,7 @@ struct MovableAtomic {
 #define WM_MHC_REGENERATE_MISSING (WM_USER + 108) // the active MHC profile's .icm is gone: regenerate it (verify -> GUI thread)
 #define WM_STATUS_TEXT           (WM_USER + 109)  // SetStatus from a non-GUI thread: show the latest status text (any thread -> GUI thread)
 #define ID_TRAY_SHOW        2001
-#define ID_TRAY_APPLY       2002
-#define ID_TRAY_STOP        2003
+#define ID_TRAY_SUSPEND     2003   // "Suspend live layers" (replaces Start / Stop; 2002 retired)
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
 #define ID_TRAY_CALIBRATION 2006
@@ -283,6 +282,8 @@ const int RENDER_HEALTH_TIMER_ID = 117;          // GUI-side hang check of the o
 const int RENDER_HEALTH_INTERVAL_MS = 2000;
 const int RENDER_HANG_TIMEOUT_MS = 30000;       // no render-loop iteration this long (display on) = hung;
                                                 //   6x the in-thread watchdog, so a slow recovery is not one
+const int RECONCILE_TIMER_ID = 118;             // Retry of a live-layer reconcile that had to wait (act::ReconcileLiveLayers)
+const int RECONCILE_RETRY_MS = 500;
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses

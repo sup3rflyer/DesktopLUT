@@ -4,6 +4,7 @@
 #include "displayconfig.h"
 #include "dwm_inject.h"
 #include "actions/notify.h"
+#include "actions/reconcile.h"
 #include <dxgi1_6.h>
 #include <mutex>
 
@@ -97,6 +98,7 @@ void TakeSnapshot(Snapshot& out) {
     }
 
     out.running = g_gui.isRunning.load();
+    out.suspended = act::LiveLayersSuspended();
     out.hookMode = g_dwmHookMode.load();
     out.hookActive = out.hookMode && IsDwmHookActive();
 
