@@ -93,6 +93,7 @@ from .adjudication import (
     SEAM_SPD,
     SEAM_STACK,
     SEAM_THERMAL_STATE,
+    SEAM_PATCH_WINDOW,
     SEAM_VERIFY,
     AdjudicationRequest,
     AdjudicationRequired,
@@ -414,6 +415,22 @@ def resolve_run_flow(state: Mapping[str, Any], flow: str) -> tuple[str, Optional
     return (persisted_flow or flow), None
 
 
+
+# Patch-window size guard (preflight:patch-window). Two windows are "the same" when their screen-area
+# percentages differ by at most max(ABS points, REL x the larger) — wide enough for a rounding /
+# aspect difference (42 on 16:9 = 9.92 % vs a profile's 10 %), far tighter than any real
+# full-field vs windowed mix-up.
+PATCH_WINDOW_TOLERANCE_ABS = 0.5
+PATCH_WINDOW_TOLERANCE_REL = 0.10
+# The TV-cal ABL-safe window an emissive panel is advised to run at when its profile names none.
+ABL_SAFE_WINDOW_AREA_PCT = 10.0
+
+
+def _same_window(a: Any, b: Any) -> bool:
+    a, b = float(a), float(b)
+    return abs(a - b) <= max(PATCH_WINDOW_TOLERANCE_ABS, PATCH_WINDOW_TOLERANCE_REL * max(a, b))
+
+
 class Calibration:
     """One calibration run: a flow over a monitor/mode, driving the injected
     controller + measure/probe seams + adjudicator, memoising every stage in the
@@ -474,6 +491,7 @@ class Calibration:
         content_mode: Optional[str] = None,
         keep_layers: Optional[Sequence[str]] = None,
         sdr_white_probe: Optional[Callable[[Optional[Mapping[str, Any]]], dict[str, Any]]] = None,
+        patch_window_size: Optional[Mapping[str, Any]] = None,
     ) -> None:
         self.ctx = ctx
         self.profile = profile
@@ -747,6 +765,11 @@ class Calibration:
         # Live DisplayConfig SDR-white-level reader (dlc.sdr_in_hdr.probe_sdr_white) for SDR content on an
         # HDR display; the CLI wires it, None keeps sim/tests off the host's displays.
         self.sdr_white_probe = sdr_white_probe
+        # The presenter's patch window as it reported it ({"patch_size_pct", "area_pct", "source"}) —
+        # the live CLI queries the dogegen daemon (`window`) / the spawned presenter; None = unknown
+        # (simulation, an older daemon, a presenter that can't report). Recorded + guarded at preflight.
+        self.patch_window_report: Optional[dict[str, Any]] = (
+            dict(patch_window_size) if patch_window_size else None)
 
         # The unified event spine: every phase change, stage boundary, seam, and (via the
         # measure loop / optimizer) every patch read + heartbeat lands in events.jsonl, the
@@ -2775,6 +2798,84 @@ class Calibration:
                 f"wrong panel and all readings are silently wrong.")
         return guard
 
+    def _abl_safe_window_advice(self) -> str:
+        """How to run an emissive (OLED/ABL) panel's patch window: the profile's
+        ``patch_window_area_pct`` for this mode when set, else the TV-cal ~10 % window."""
+        from .dogegen_server import patch_size_for_area
+        area = self.display.expected_window(self.mode)
+        src = "the profile's patch_window_area_pct" if area is not None else "an ABL-safe ~10 % window"
+        area = area if area is not None else ABL_SAFE_WINDOW_AREA_PCT
+        return (f"start the dogegen daemon with `--patch-size {patch_size_for_area(area)}` "
+                f"(≈ {area:g} % of a 16:9 screen's area — {src})"
+                + (" and `--idle-level black`" if self.display.is_emissive else ""))
+
+    def _patch_window_size_check(self) -> dict[str, Any]:
+        """Compare the presenter's patch window (``self.patch_window_report``) with what this display
+        expects. Mechanical facts only — any reason found is the ``preflight:patch-window`` seam
+        (the LLM judges), never an auto-fix:
+
+        * ``profile_mismatch`` — the profile's ``patch_window_area_pct`` for this mode differs;
+        * ``emissive_full_field`` — no profile window, an emissive (OLED) panel, and a FULL-FIELD
+          window (its ABL dims a full-field patch — every bright read would be wrong);
+        * ``dip_mismatch`` — this display:mode's DIP was characterized at a different window (its
+          settle / white / noise model may not transfer; ``characterize`` itself is exempt — it is
+          re-learning the DIP);
+        * ``unknown_on_emissive`` — the presenter can't report its window (older daemon / no
+          presenter) on an emissive panel: someone must confirm it by hand.
+
+        A non-emissive display with no profile window and no DIP stamp (the default LCD path) only
+        RECORDS the window — no seam."""
+        rep = self.patch_window_report or {}
+        area = rep.get("area_pct")
+        known = area is not None
+        emissive = self.display.is_emissive
+        expected = self.display.expected_window(self.mode)
+        dip = self._dip()
+        dip_area = getattr(dip, "patch_window_area_pct", None) if dip is not None else None
+        full_field = bool(known and float(area) >= 100.0 - PATCH_WINDOW_TOLERANCE_ABS)
+        out: dict[str, Any] = {
+            "known": known, "source": rep.get("source"),
+            "patch_size_pct": rep.get("patch_size_pct"), "area_pct": area,
+            "full_field": full_field if known else None,
+            "profile_area_pct": expected, "dip_area_pct": dip_area, "emissive": emissive,
+        }
+        if not known:
+            out["reason_unknown"] = rep.get("reason") or "the presenter did not report its window"
+        reasons: list[dict[str, str]] = []
+        if known:
+            here = (f"the presenter's patch window is {float(area):g} % of the screen area "
+                    f"(--patch-size {rep.get('patch_size_pct')})")
+            if expected is not None and not _same_window(area, expected):
+                reasons.append({"code": "profile_mismatch",
+                                "detail": f"{here}, but the profile expects {expected:g} % "
+                                          f"(patch_window_area_pct, {self.mode})"})
+            if expected is None and emissive and full_field:
+                reasons.append({"code": "emissive_full_field",
+                                "detail": f"{here} — FULL FIELD on an emissive "
+                                          f"({self.display.panel.tech}) panel, whose ABL dims a "
+                                          f"full-field patch (no patch_window_area_pct in the profile)"})
+            if (dip_area is not None and not _same_window(area, dip_area)
+                    and self.calib.get("flow") != "characterize"):
+                reasons.append({"code": "dip_mismatch",
+                                "detail": f"{here}, but this display's {self.mode} DIP was "
+                                          f"characterized at {float(dip_area):g} %"})
+        elif emissive:
+            reasons.append({"code": "unknown_on_emissive",
+                            "detail": f"the presenter cannot report its patch window "
+                                      f"({out['reason_unknown']}) and the panel is emissive "
+                                      f"({self.display.panel.tech}) — confirm the window by hand"})
+        out["reasons"] = reasons
+        out["seam"] = bool(reasons)
+        if reasons:
+            hard = any(r["code"] in ("profile_mismatch", "emissive_full_field") for r in reasons)
+            out["recommendation"] = "abort" if hard else "proceed"
+            out["question"] = (
+                "; ".join(r["detail"] for r in reasons)
+                + f". abort = stop now (nothing measured) and {self._abl_safe_window_advice()}"
+                  " (or set the display's patch_window_area_pct in the profile to the window you "
+                  "intend); proceed = measure at the current window (it is right for this panel).")
+        return out
+
     def _transport_tell(self, link_bpc: Optional[int] = None) -> dict[str, Any]:
         """Advisory (never a gate): a 3D-LUT flow measured below the panel's bit depth, or on a
         local-dimming panel without a fullscreen patch, risks contaminated VOLUMETRIC reads —
@@ -2785,8 +2886,12 @@ class Calibration:
         ``link_bpc`` (the MEASURED live link depth, when known) replaces the profile's
         ``panel.bit_depth`` — an 8 bpc link is not under-sampled by 8-bit patterns."""
         flow = self.calib.get("flow")
+        emissive = self.display.is_emissive
         if flow not in ("full", "3dlut-only") or self.mode != "SDR":
-            return {"checked": False, "reason": "not an SDR 3D-LUT flow"}
+            out: dict[str, Any] = {"checked": False, "reason": "not an SDR 3D-LUT flow"}
+            if emissive:
+                out.update(emissive=True, window_advice=self._abl_safe_window_advice())
+            return out
         panel = self.display.panel
         panel_bits = int(link_bpc) if link_bpc else (panel.bit_depth or 8)
         tech = (panel.tech or "").lower()
@@ -2795,6 +2900,18 @@ class Calibration:
                                  "panel_bit_depth": panel_bits,
                                  "panel_bit_depth_source": "link" if link_bpc else "profile",
                                  "local_dimming": local_dimming}
+        if emissive:
+            # An OLED/ABL panel must NOT be told to go full field: its power limiter dims a
+            # full-field patch. Point at the profile's / an ABL-safe window instead.
+            guard.update(emissive=True, window_advice=self._abl_safe_window_advice())
+            if self.bit_depth < 10 and panel_bits >= 10:
+                guard["warning"] = (
+                    f"3D-LUT flow measuring at {self.bit_depth}-bit on a {panel_bits}-bit emissive "
+                    f"panel in SDR: an ACM/FP16 SDR scanout is 10-bit-live (an 8-bit read "
+                    f"under-samples it). Run with `--bit-depth 10` over the persistent dogegen daemon "
+                    f"(`--dogegen-server HOST:PORT`), DesktopLUT hook ON — and do NOT measure full "
+                    f"field: {guard['window_advice']}.")
+            return guard
         if self.bit_depth < 10 and (panel_bits >= 10 or local_dimming):
             guard["warning"] = (
                 f"3D-LUT flow measuring at {self.bit_depth}-bit on a {panel_bits}-bit"
@@ -3020,6 +3137,14 @@ class Calibration:
             sdr_white_level = self._probe_sdr_white_level(patch_window) if self._sdr_in_hdr() else None
             if patch_window.get("mode_warning"):
                 self.ctx.log(patch_window["mode_warning"])
+            # Patch-window SIZE (the presenter's window vs the profile / DIP / an emissive panel's ABL):
+            # mechanical comparison here; any disagreement is the preflight:patch-window seam below.
+            window_size = self._patch_window_size_check()
+            self.calib["patch_window_size"] = {
+                k: window_size.get(k) for k in ("known", "patch_size_pct", "area_pct", "source",
+                                                "profile_area_pct", "dip_area_pct")}
+            if window_size.get("seam"):
+                self.ctx.log("patch window: " + "; ".join(r["detail"] for r in window_size["reasons"]))
             # LIVE link format (bpc + encoding) vs --bit-depth and the profile's panel.bit_depth —
             # measured, never assumed; a disagreement is the preflight:link-depth seam below.
             self.runlog.note("preflight", "reading the live display-link bit depth + encoding")
@@ -3102,6 +3227,7 @@ class Calibration:
                       "correction_from_store": corr_res.source == "store",
                       "correction_resolution": corr_res.as_dict(),
                       "patch_window": patch_window,
+                      "patch_window_size": window_size,
                       "link_depth": link_depth,
                       "transport": transport,
                       "gamut": gamut_tell,
@@ -3163,6 +3289,19 @@ class Calibration:
                          "disagrees with the live displays — abort and fix the profile, or proceed?"),
                 options=("abort", "proceed"), recommendation="abort", digest=monitor_map)),
                 stage="preflight", message="aborted on a monitor↔Argyll↔panel map mismatch")
+        # Patch-window size (OLED/ABL safety): the presenter's window disagrees with the profile's /
+        # the DIP's, or an emissive panel would be measured full-field (its power limiter dims it) or
+        # at a window nobody can confirm. Whether that window is right is a judgment — never auto.
+        window_size = outcome.digest.get("patch_window_size") or {}
+        if window_size.get("seam") and self.calib.get("flow") != "build-correction":
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="preflight:patch-window", seam=SEAM_PATCH_WINDOW, stage="preflight",
+                question=window_size.get("question") or "confirm the patch window — proceed or abort?",
+                options=("proceed", "abort"),
+                recommendation=window_size.get("recommendation", "abort"),
+                digest={**{k: v for k, v in window_size.items() if k != "question"},
+                        "compromised": True})),
+                stage="preflight", message="aborted on the patch-window size")
         # Live link depth vs --bit-depth / profile (2026-09-26: a BenQ profiled 10-bit ran an 8 bpc
         # HDMI link and nothing caught it). Which depth is right — relaunch at the link's depth, trust
         # the link for the output floor, or trust the profile — is a judgment, never an auto-fix.
@@ -3876,6 +4015,9 @@ class Calibration:
                           instrument=self.profile.meter.model,
                           correction_file=active_correction(self.profile, self._correction_store(),
                                                             self.display.name, self.mode),
+                          # the window this DIP was measured at (None = unknown) — a later run at
+                          # another window is the preflight:patch-window judgment
+                          patch_window_area_pct=(self.patch_window_report or {}).get("area_pct"),
                           made=self.run_date.isoformat(),
                           updated=self.run_date.isoformat())
             # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
@@ -12129,6 +12271,39 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             measure = make_spotread_meter(presenter=presenter, spotread=argyll, port=port,
                                           output_dir=ctx.root / "measurements" / "probe",
                                           ccmx_or_ccss=ccmx)
+    # The presenter's patch window (OLED/ABL safety): a mechanical fact the preflight records and
+    # guards (preflight:patch-window). An older daemon / unparsable reply → unknown, never a failure.
+    patch_window_report: Optional[dict[str, Any]] = None
+    if presenter is not None:
+        source = "daemon" if isinstance(presenter, SocketPresenter) else "spawned"
+        try:
+            win = presenter.query_window()
+        except Exception as exc:  # noqa: BLE001 - unknown window, judged at preflight
+            win = None
+            ctx.log(f"patch window query failed ({type(exc).__name__}: {exc})")
+        if win is not None:
+            patch_window_report = {**win, "source": source}
+        else:
+            patch_window_report = {"source": source,
+                                   "reason": "the dogegen daemon did not report its window (an older "
+                                             "daemon without the `window` command?)"}
+        ctx.log("patch window: " + json.dumps(patch_window_report))
+    # Idle park (OLED burn-in safety): what the presenter shows while the run idles — a seam pause,
+    # a control.json pause, a kept daemon at exit. Black on an emissive panel, the historical
+    # mid-grey neutral otherwise (DisplayConfig.idle_park; quirks.idle_park overrides).
+    park_level = profile.display_for(args.monitor).idle_park
+
+    def _park(why: str) -> Optional[dict[str, Any]]:
+        if presenter is None:
+            return None
+        from .measure_loop import park_presenter
+        rec = {**park_presenter(presenter, park_level, bit_depth), "why": why}
+        try:
+            ctx.log("idle park: " + json.dumps(rec))
+        except Exception:  # noqa: BLE001 - logging must never mask the real exit
+            pass
+        return rec
+
     # Characterize tuning: start from the defaults, override only the --char-* flags that were set.
     char_overrides = {
         "noise_levels": (tuple(args.char_noise_levels) if args.char_noise_levels else None),
@@ -12176,14 +12351,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                 pass
 
     def _pause_park(_ctrl: Mapping[str, Any]) -> None:
-        if presenter is None:
-            return
-        max_cv = (1 << bit_depth) - 1
-        mid = int(round(0.5 * max_cv))
-        patch = MeasurePatch(label="pause-neutral", rgb=(mid, mid, mid),
-                             signal=(0.5, 0.5, 0.5), role="neutral_ref",
-                             bit_depth=bit_depth)
-        presenter.show(patch)
+        # The display's idle-park policy: an LCD parks the same 50 % mid-grey neutral as always,
+        # an emissive panel parks black, quirks.idle_park=hold leaves the last patch up.
+        _park("pause")
 
     result = None
     paused = False
@@ -12235,6 +12405,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             keep_layers=([n for n in str(args.keep_layers).split(",") if n.strip()]
                                          if args.keep_layers else None),
                             sdr_white_probe=_sdr_white_probe,
+                            patch_window_size=patch_window_report,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
@@ -12242,8 +12413,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             result = calib.run(args.flow)
         except AdjudicationRequired as req:
             paused = True  # daemon must survive for the resuming invocation
-            print(json.dumps({"status": "adjudication_required", "request": req.request.as_dict(),
-                              "run": str(ctx.root)}, indent=2))
+            # The daemon's window outlives this process while the judge decides: never leave the
+            # last (possibly peak-white) patch up — park per the display's idle policy first.
+            park = _park("seam")
+            payload = {"status": "adjudication_required", "request": req.request.as_dict(),
+                       "run": str(ctx.root)}
+            if park is not None:
+                payload["idle_park"] = park
+            print(json.dumps(payload, indent=2))
             return 10
         print(json.dumps(result.as_dict(), indent=2))
         return 0 if result.status == "completed" else 1
@@ -12259,6 +12436,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         and hasattr(presenter, "shutdown_daemon")):
                     presenter.shutdown_daemon()
                 else:
+                    if terminal and hasattr(presenter, "shutdown_daemon"):
+                        _park("exit (daemon kept)")   # the kept window idles until the next run
                     presenter.close()
             except Exception:  # noqa: BLE001
                 pass
