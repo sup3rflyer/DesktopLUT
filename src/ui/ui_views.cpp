@@ -193,10 +193,14 @@ void DrawHeader(ViewState& vs) {
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::GetContentRegionAvail().x;
     const float h = Px(kHeaderH), cy = p.y + h * 0.5f;
-    const float logoHalf = Px(14);
-    const float logoHalfW = logoHalf * 0.8660254f;
-    DrawCubeLogo(dl, ImVec2(p.x + Px(kGutter) + logoHalfW, cy), logoHalf);
-    const float textX = p.x + Px(kGutter) + logoHalfW * 2 + Px(12);
+    // The logo artwork (mipmapped texture); the drawn cube only if the texture could not be made.
+    const float logo = Px(34);
+    const float lx = p.x + Px(kGutter);
+    if (void* tex = LogoTexture())
+        dl->AddImage(ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(lx, cy - logo * 0.5f), ImVec2(lx + logo, cy + logo * 0.5f));
+    else
+        DrawCubeLogo(dl, ImVec2(lx + logo * 0.5f, cy), logo * 0.5f);
+    const float textX = lx + logo + Px(12);
     TextAt(Font::Label, 14.0f, pal::Ink, textX, cy, "DESKTOPLUT");
     TextAt(Font::Label, kSizeLabel, pal::InkFaint, textX + MeasureText(Font::Label, 14.0f, "DESKTOPLUT").x + Px(14), cy, "PREVIEW");
 
@@ -211,11 +215,19 @@ void DrawHeader(ViewState& vs) {
     Hairline();
 }
 
+// The footer is pinned to the window's bottom edge (not placed after the body), so spacing above it can
+// never push it down or clip it.
+float FooterTop() {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    return vp->WorkPos.y + vp->WorkSize.y - Px(kFooterH);
+}
+
 void DrawFooter(const Snapshot& snap, bool busy) {
-    Hairline();
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float h = Px(kFooterH) - 1.0f, cy = p.y + h * 0.5f;
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 p(vp->WorkPos.x, FooterTop());
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddLine(p, ImVec2(p.x + vp->WorkSize.x, p.y), pal::Rule, 1.0f);
+    const float h = Px(kFooterH), cy = p.y + h * 0.5f;
     float x = p.x + Px(kGutter);
     // Engine health: green dot = running, amber triangle = should run but does not, ring = stopped.
     enum { Off, Good, Fault } state;
@@ -237,8 +249,6 @@ void DrawFooter(const Snapshot& snap, bool busy) {
     x += MeasureText(Font::Label, kSizeLabel, what).x + Px(24);
     if (busy) TextAt(Font::Label, kSizeLabel, pal::Ink, x, cy, "APPLYING");
     else if (!snap.lastStatus.empty()) TextAt(Font::Mono, 12.0f, pal::InkFaint, x, cy, Utf8(snap.lastStatus).c_str());
-    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
-    ImGui::Dummy(ImVec2(0, 0));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -722,7 +732,7 @@ void DrawMeasured() {
 
 void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     const DisplayRow* sel = FindSelected(snap, vs);
-    const float bodyH = ImGui::GetContentRegionAvail().y - Px(kFooterH);
+    const float bodyH = FooterTop() - ImGui::GetCursorScreenPos().y;   // down to the pinned footer
 
     ImGui::BeginChild("##sidebar", ImVec2(Px(kSidebarW), bodyH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     DrawSidebar(snap, vs, sel);
@@ -792,7 +802,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 }
 
 void DrawEventsPage() {
-    const float bodyH = ImGui::GetContentRegionAvail().y - Px(kFooterH);
+    const float bodyH = FooterTop() - ImGui::GetCursorScreenPos().y;   // down to the pinned footer
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
     ImGui::BeginChild("##events", ImVec2(0, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PopStyleVar();

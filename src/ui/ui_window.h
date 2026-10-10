@@ -17,6 +17,7 @@ namespace ui {
 void Post(std::function<void()> command);
 bool Busy();                    // a posted command is running (the interface is drawn disabled)
 HWND Window();                  // owner for file dialogs and message boxes
+void* LogoTexture();            // the logo artwork as an ImTextureID (ID3D11ShaderResourceView*); null = unavailable
 
 void Show();                    // GUI thread. Creates the window on first use.
 void Hide();                    // GUI thread.

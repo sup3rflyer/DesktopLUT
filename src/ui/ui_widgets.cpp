@@ -76,23 +76,44 @@ bool Toggle(const char* id, const char* label, bool selected, ImVec2 sizeDip, bo
     return clicked;
 }
 
+namespace {
+
+// Equal segment width (DIPs) for a row of toggle labels: the widest label plus padding, at least
+// `minDip`, and no wider than the space left on the line allows.
+float SegmentWidth(const char* const* labels, int count, float minDip) {
+    float widest = 0.0f;
+    for (int i = 0; i < count; i++) {
+        const float w = MeasureText(Font::Label, kSizeLabel, labels[i]).x / Dpi();
+        widest = w > widest ? w : widest;
+    }
+    float seg = widest + 22.0f;
+    seg = seg < minDip ? minDip : seg;
+    const float fit = ImGui::GetContentRegionAvail().x / Dpi() / (float)count;
+    return seg > fit && fit > 0.0f ? fit : seg;
+}
+
+}  // namespace
+
 bool OnOff(const char* id, bool value, bool* out, const char* onLabel, const char* offLabel) {
+    const char* labels[2] = { onLabel, offLabel };
+    const float w = SegmentWidth(labels, 2, 52.0f);
     ImGui::PushID(id);
     bool picked = false;
-    if (Toggle("##on", onLabel, value, ImVec2(52, 24)) && !value) { *out = true; picked = true; }
+    if (Toggle("##on", onLabel, value, ImVec2(w, 24)) && !value) { *out = true; picked = true; }
     ImGui::SameLine(0, 0);
-    if (Toggle("##off", offLabel, !value, ImVec2(52, 24)) && value) { *out = false; picked = true; }
+    if (Toggle("##off", offLabel, !value, ImVec2(w, 24)) && value) { *out = false; picked = true; }
     ImGui::PopID();
     return picked;
 }
 
-int Segmented(const char* id, const char* const* labels, int count, int current, float segWidthDip) {
+int Segmented(const char* id, const char* const* labels, int count, int current, float minSegWidthDip) {
+    const float w = SegmentWidth(labels, count, minSegWidthDip);
     ImGui::PushID(id);
     int picked = -1;
     for (int i = 0; i < count; i++) {
         if (i > 0) ImGui::SameLine(0, 0);
         ImGui::PushID(i);
-        if (Toggle("##seg", labels[i], i == current, ImVec2(segWidthDip, 24)) && i != current) picked = i;
+        if (Toggle("##seg", labels[i], i == current, ImVec2(w, 24)) && i != current) picked = i;
         ImGui::PopID();
     }
     ImGui::PopID();

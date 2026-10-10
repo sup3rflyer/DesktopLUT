@@ -33,8 +33,9 @@ inline bool Button(const char* id, const char* label, float widthDip, float heig
 // ON | OFF pair. Returns true when the user picked the other state (written to *out).
 bool OnOff(const char* id, bool value, bool* out, const char* onLabel = "ON", const char* offLabel = "OFF");
 
-// One-of-n row of toggles. Returns the newly picked index, or -1.
-int Segmented(const char* id, const char* const* labels, int count, int current, float segWidthDip);
+// One-of-n row of equal-width toggles, sized to the widest label (at least minSegWidthDip) and shrunk to
+// fit the space left on the line. Returns the newly picked index, or -1.
+int Segmented(const char* id, const char* const* labels, int count, int current, float minSegWidthDip);
 
 // Number field in mono. Edits a draft; returns true only when the field is left (Enter, Tab, click
 // elsewhere) with a changed value, written to *v. Never commits a half-typed value.

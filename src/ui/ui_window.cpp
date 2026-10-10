@@ -4,6 +4,7 @@
 #include "ui_snapshot.h"
 #include "ui_theme.h"
 #include "ui_views.h"
+#include "ui_logo.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
@@ -47,6 +48,7 @@ Snapshot g_snap;
 ViewState g_view;
 std::vector<std::function<void()>> g_commands;   // posted by widgets; run after Present (DrainCommands)
 bool g_busy = false;                             // a command is running (it may pump: frames still draw)
+ID3D11ShaderResourceView* g_logo = nullptr;      // the logo artwork, on the interface's device
 
 float WindowDpiScale(HWND h) {
     UINT dpi = h ? GetDpiForWindow(h) : 0;
@@ -55,6 +57,7 @@ float WindowDpiScale(HWND h) {
 
 void ReleaseImGui() {
     if (!g_imguiReady) return;
+    if (g_logo) { g_logo->Release(); g_logo = nullptr; }
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
@@ -79,6 +82,7 @@ bool EnsureImGui() {
         g_present.Destroy();
         return false;
     }
+    g_logo = CreateLogoTexture(g_present.Device(), g_present.Context());   // nullptr: the drawn cube stands in
     g_imguiReady = true;
     return true;
 }
@@ -275,6 +279,8 @@ void Post(std::function<void()> command) {
 }
 
 bool Busy() { return g_busy; }
+
+void* LogoTexture() { return g_logo; }
 
 HWND Window() { return g_hwnd; }
 
