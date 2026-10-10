@@ -3,7 +3,7 @@
 DLC (DesktopLUT Calibrator) — an LLM-steered display-calibration harness for
 DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
 
-## Unreleased — v2 scripted-core redesign
+## Unreleased — ships with DesktopLUT v3.0.0 (v2 scripted-core redesign)
 
 Pivoted from an LLM-orchestrated autopilot to a **scripted core + thin LLM at the
 seams**: a deterministic state machine owns the mechanics (display mapping, patch
@@ -11,6 +11,30 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Public operating manual for the LLM, an agent skill, and an example profile** (2026-10-10). DLC is
+  operated by an LLM agent with the user in the loop, and until now its manual was local to one rig.
+  - `docs/operator-guide.md` is the generic manual: the operating law, panel safety per class (OLED /
+    LCD / mini-LED / edge-lit), one-time setup, onboarding a display, flows, every common seam and how
+    to judge it, the check-in loop, stopping and restore statuses, teardown, judging results, and FALD
+    panel profiling.
+  - `.claude/skills/calibrate-display/SKILL.md` is a committed entry point that Claude Code discovers
+    when launched in `DLC/`; it loads the guide.
+  - `calibration_profile.example.yaml` has one template each for a FALD mini-LED, an edge-lit LCD and
+    an OLED.
+  - README "Getting started"; `third_party/README.md` says where to get ArgyllCMS and dogegen.
+  - `--supervised` help no longer calls it the mode for unattended hardware runs (it isn't; use the
+    default `--attended`).
+- **FALD profile flow: panel-class and cell-pitch gates; a cross-display correction seam** (2026-10-10).
+  - Before anything is shown, `fald_profile --phase preflight` raises the seam `fald_profile:panel_class`
+    (abort / proceed; `--decide KEY=CHOICE`) for an OLED, or a panel with no local dimming, so no
+    static-pattern measuring starts on a panel the layer can't model.
+  - A zone grid whose exported lattice the DesktopLUT loader would refuse is now refused up front, not
+    after a ~40-min run. A lattice that fits but is rounded (cells not whole pixels) raises
+    `fald_profile:cell_pitch` with the uncovered pixels and the zone drift in cells.
+    `fald.export.lattice_fit` uses the exporter's own arithmetic.
+  - On a multi-display rig, metering a display through the meter-level profile correction file when the
+    store shows that file belongs to another display (or other displays have their own) raises
+    `preflight:correction` (reason `profile_cross_display`). A single-display rig is unchanged.
 - **OLED safety: idle park + the patch window is recorded and guarded** (2026-10-10).
   - **Idle park.** While a run idles (a seam pause, a `control.json` pause, a daemon kept with
     `--keep-dogegen-server`), the patch window is parked per the display's policy instead of leaving

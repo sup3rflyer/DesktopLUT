@@ -1,0 +1,128 @@
+# DLC calibration profile — EXAMPLE. Copy to `calibration_profile.yaml` (git-ignored, local) and edit.
+#
+# The calibrator reads this at startup so it never has to guess your hardware, the display mapping or the
+# targets. It is YOUR data: keep it local, never commit or publish it. Everything DLC *learns* about a display
+# (noise, settle time, native primaries, thermal drift, …) is measured by `--flow characterize` and stored
+# separately — don't type measured numbers in here unless a field asks for them.
+#
+# One `displays:` entry per display. Three templates below — keep the one(s) matching your panels, delete the
+# rest, and give each a unique `desktoplut_monitor`. Operating manual: docs/operator-guide.md.
+
+meter:
+  model: i1Display Pro                # your colorimeter (informational)
+  argyll_port: 1                      # Argyll instrument port (spotread -?? lists them)
+  correction:
+    file: null                        # fallback .ccss/.ccmx for a display that has no correction of its own yet
+                                      #   (the run asks you to confirm it fits). Prefer --flow build-correction.
+    made: null                        # YYYY-MM-DD the correction was made (drives the staleness check)
+    max_age_days: 180
+    spectrometer_available: false     # true if you have a spectrometer for --flow build-correction
+
+displays:
+  # --- Template A: mini-LED with full-array local dimming (FALD) -----------------------------------------
+  - name: Example FALD Monitor        # the history key for this display — don't rename it later
+    desktoplut_monitor: 0             # DesktopLUT's monitor index (shown in its GUI / `windows.query_monitors`)
+    argyll_display: 1                 # Argyll's 1-based display number (dispwin -?? lists them)
+    panel:
+      tech: mini-LED IPS              # free text; include "OLED" for any OLED (enables OLED safety defaults)
+      backlight_zones: 1152           # local-dimming zone count (FALD only)
+      bit_depth: 10                   # the LINK depth DLC drives (DP: usually 10; HDMI 2.0 4K60: often 8)
+      resolution: 3840x2160
+      hdr_peak_nits: 1000             # rough spec-sheet peak; characterize measures the real one
+    sdr_target: srgb_g22_120
+    hdr_target: rec2020_pq
+    probe_match:                      # recipe for --flow build-correction (Argyll ccxxmake), needs a spectrometer
+      display_tech: s                 # ccxxmake -t (run `ccxxmake -??`): pick your backlight/emitter family
+      colorimeter_display_type: n     # i1D3 -y: n = non-refresh (LCD), r = refresh (OLED, CRT, PWM)
+      spectro_port: 2
+      kind: ccmx
+      patch_scale: 8                  # oversize patch so every dimming zone stays lit during the reference reads
+      settle_seconds: 2
+    quirks:
+      hardware_id: ABC1234            # EDID vendor+product (`edid_id` in query_monitors — operator guide §4).
+                                      #   REPLACE (or delete) these placeholder IDs, or preflight:monitor-map trips
+      short_name: FALD_Example        # short name for output files
+
+  # --- Template B: edge-lit / no local dimming LCD (typical office/creator monitor) -------------------------
+  - name: Example SDR Monitor
+    desktoplut_monitor: 1
+    argyll_display: 2
+    panel:
+      tech: White-LED IPS
+      bit_depth: 8
+      resolution: 2560x1440
+    sdr_target: srgb_g22_120
+    hdr_target: null                  # SDR-only display
+    probe_match:
+      display_tech: "8"               # ccxxmake -t 8: LCD White LED IPS (check `ccxxmake -??`)
+      colorimeter_display_type: n
+      spectro_port: 2
+      kind: ccmx
+      settle_seconds: 1
+    quirks:
+      hardware_id: DEF5678
+      short_name: SDR_Example
+
+  # --- Template C: OLED (WOLED / QD-OLED) -------------------------------------------------------------
+  - name: Example OLED TV
+    desktoplut_monitor: 2
+    argyll_display: 3
+    panel:
+      tech: WOLED                     # contains "OLED" → black idle park + window checks
+      bit_depth: 10
+      resolution: 3840x2160
+      hdr_peak_nits: 650
+    patch_window_area_pct: 10         # ABL: measure through a ~10 % AREA window. The daemon's --patch-size is a
+                                      #   LINEAR % of the short side: p = 100·sqrt(A/100 · long/short) →
+                                      #   16:9 = 42, 16:10 = 40, 21:9 = 49, 32:9 = 60. Start it with that and
+                                      #   --idle-level black. Preflight checks the daemon against this value.
+    sdr_target: srgb_g22_120
+    hdr_target: rec2020_pq_oled
+    probe_match:
+      display_tech: w                 # ccxxmake -t w: WOLED. Argyll 3.3.0 lists o (LED OLED), a (AMOLED), w (WOLED);
+                                      #   for QD-OLED pick the closest and confirm with a spectrometer read
+      colorimeter_display_type: r     # refresh mode for OLED
+      spectro_port: 2
+      kind: ccmx
+      settle_seconds: 1               # no patch_scale on OLED: a big bright patch trips ABL
+    quirks:
+      hardware_id: GHI9012
+      short_name: OLED_Example
+
+targets:
+  # sRGB / Rec.709 primaries, pure power-law 2.2 transfer (not the piecewise sRGB curve), D65, 120-nit white.
+  srgb_g22_120:
+    colorspace: Rec.709
+    transfer: { type: power, gamma: 2.2 }
+    white:
+      intent: D65
+      method: numeric                 # numeric D65 (0.3127, 0.3290)
+    white_luminance_nits: 120         # set the OSD to land near this; DLC asks at the brightness seams
+
+  # HDR: Rec.2020 container, PQ, D65. The peak is MEASURED (characterize); this value is only a fallback.
+  rec2020_pq:
+    colorspace: Rec.2020
+    transfer: { type: pq }
+    white: { intent: D65, method: numeric }
+    peak_luminance_nits: 1000
+
+  rec2020_pq_oled:
+    colorspace: Rec.2020
+    transfer: { type: pq }
+    white: { intent: D65, method: numeric }
+    peak_luminance_nits: 650          # OLED peak depends on the window size — measure it at your patch window
+
+quality:                              # advisory ΔE targets shown at the verify seam — you decide acceptance
+  avg_de2000: 1.5
+  p95_de2000: 3.0
+  max_de2000: 5.0
+  white_de2000: 2.0
+
+paths:
+  argyll: third_party/argyll/3.3.0/bin
+  dogegen: third_party/dogegen/dogegen.exe
+  output: results
+  # Your DesktopLUT.ini (it sits next to DesktopLUT.exe) — copied into every run folder as the complete pre-run
+  # settings backup (the rollback safety net). Use an ABSOLUTE path; a relative one resolves against the directory
+  # you run DLC from. If it can't be found the backup is skipped (only a log line), so check it once.
+  desktoplut_ini: C:/Tools/DesktopLUT/DesktopLUT.ini     # example — point at YOUR install

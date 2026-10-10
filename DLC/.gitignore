@@ -48,6 +48,8 @@ docs/agent-tooling.md
 # Internal R&D / handoff design docs (kept local until DLC is published-ready;
 # some carry display-specific measurements). The public face is README + CHANGELOG.
 docs/HANDOFF.md
+# The developer's rig-specific run orientation (local); the public, generic manual is docs/operator-guide.md.
+docs/llm-run-orientation.md
 docs/HANDOFF-archive-*.md
 docs/v2-design-notes.md
 docs/v1-rebuild-plan.md
@@ -63,7 +65,11 @@ docs/fald-*.html
 CLAUDE.md
 AGENTS.md
 CODEX_*.md
-.claude/
+# .claude/ is local (settings, worktrees) EXCEPT the public operator skill (skills/calibrate-display,
+# which loads docs/operator-guide.md). The parent repo ignores every .claude/ — re-include ours here.
+!/.claude/
+/.claude/*
+!/.claude/skills/
 
 
 # Python packaging/test artifacts (pip install -e ., pytest --cov)

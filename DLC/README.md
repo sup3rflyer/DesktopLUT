@@ -8,11 +8,14 @@ the raw measurement stream), and writes the closing panel analysis. DesktopLUT
 remains the runtime colour-management engine (MHC ICC at scanout + DWM-hook 3D LUT);
 DLC steers the calibration that fills it.
 
-> v1 scope: **MHC ICC + 3D LUT, SDR-first** — the MHC owns the neutral axis (matrix +
-> a closed-loop D65 grayscale refine), the 3D LUT owns colour (1+1+1).
-> HDR finalization is the end goal but deferred (the architecture is *aimed* at HDR —
-> PQ patch sets, ICtCp RBF, thermal handling — and proven on SDR first).
-> Design source of truth: **`docs/v2-design-notes.md`**.
+> Scope: **MHC ICC + 3D LUT, SDR and HDR** — the MHC owns the neutral axis (matrix +
+> a closed-loop D65 grayscale refine), the 3D LUT owns colour (1+1+1). SDR is ΔE2000-scored,
+> HDR (PQ, Rec.2020 container) ΔE_ITP-scored.
+>
+> **Operating it:** DLC is run by an LLM agent (e.g. Claude Code launched in `DLC/`) with you in
+> the loop — there is no unattended hardware run. The agent's manual is
+> **[`docs/operator-guide.md`](docs/operator-guide.md)**, loaded by the
+> `calibrate-display` skill in `.claude/skills/`. Start at [Getting started](#getting-started).
 
 ## How it works — scripted core + thin LLM
 
@@ -32,9 +35,10 @@ judgement. **Three consumers of a live measurement, never conflated:**
    pipeline **MHC ICC → 3D LUT** (the MHC owns the neutral axis — matrix + a
    closed-loop D65 grayscale refine — and the 3D LUT owns colour; 1+1+1). Every stage
    is memoised in the run-record, giving crash-recovery and live pause/resume.
-2. **Front-door skill** (repo-root `.claude/skills/calibrate-display/SKILL.md`) — the
-   assistant's thin operating manual: map intent → flow, adjudicate the seams the
-   core surfaces, write the report.
+2. **Operator guide + skill** (`docs/operator-guide.md`, loaded by
+   `.claude/skills/calibrate-display/SKILL.md`) — the assistant's operating manual: panel
+   safety, setup, map intent → flow, adjudicate the seams the core surfaces, consume the
+   check-ins, tear down, judge the result.
 3. **Controller** — `src/dlc/controller.py` talks NDJSON over the named pipe
    `\\.\pipe\DesktopLUT.Calibration` to DesktopLUT's C++ IPC server
    (`../src/desktoplut_ipc_server.{h,cpp}`), which actually installs results.
@@ -49,13 +53,19 @@ judgement. **Three consumers of a live measurement, never conflated:**
 | "calibrate my display" | `full` | neutral → raw → MHC build/install (+ D65 grayscale refine) → post-MHC → 3D-LUT build/check/install → verify → report |
 | "just the ICC, quick shakedown" | `mhc-only` | raw → MHC build/install (+ D65 refine) → verify → report (no 3D LUT) |
 | "give me a fresh 3D LUT" | `3dlut-only` | verify MHC present → measure → build/check/install cube → verify → report |
-| "calibrate for HDR" | `--mode HDR` | not a flow — run `full`/`mhc-only` with `--mode HDR` |
+| "re-tune the grayscale of a finished SDR run" | `refine-mhc` | seed that run's MHC (`--source-run`) → neutral → re-refine grayscale → re-apply its 3D LUT → verify |
+| "how accurate is it now?" | `verify-only` | measure the installed stack (or a `--verify-cube` candidate); builds/changes nothing |
+| "learn this display" (first time) | `characterize` | noise / settle / native white, black, primaries / thermal drift → the display's stored profile (DIP) |
+| "build a meter correction" | `build-correction` | prepare an Argyll `ccxxmake` run (needs a spectrometer) → ingest the `.ccmx` |
+| "calibrate for HDR" | `--mode HDR` | not a flow — run `full`/`mhc-only`/`3dlut-only`/`verify-only` with `--mode HDR` |
 
 `full` is "calibrate the monitor" (ICC + 3D LUT together); `mhc-only` is the fast
 shakedown that proves the foundation before a dense 3D-LUT run. The MHC ICC is the
 **sole neutral-axis owner** (a closed-loop D65 grayscale refine); the post-3D-LUT GS+WB
-tweak and its `gray-wb` flow were removed 2026-06-24 (they re-corrected the MHC-owned
-neutral a third time, breaking the 1+1+1 layering).
+tweak inside calibration was removed 2026-06-24 (it re-corrected the MHC-owned neutral a
+third time, breaking the 1+1+1 layering). The separate `grayscale-wb` flow is different: an
+opt-in, user-facing touch-up that tunes DesktopLUT's own Grayscale correction on top of an
+installed stack.
 
 ## The correction machine
 
@@ -69,11 +79,24 @@ and the machine distinguishes a real physical floor from a too-small budget, so 
 tuning limit is never reported as "the panel can't do better." Points that genuinely
 can't reach target are surfaced for adjudication, not silently accepted.
 
-## Quickstart
+## Getting started
+
+1. **DesktopLUT** (`DesktopLUT.exe` + `DwmHook.dll`) running, with the calibration pipe armed
+   (below).
+2. **Python 3.11+** and `pip install -e .[engine,meter,test]` from this directory.
+3. **ArgyllCMS 3.3.0** and **dogegen** placed under `third_party/` (see
+   [`third_party/README.md`](third_party/README.md)) and a **colorimeter** (i1Display Pro family;
+   a spectrometer is optional, for building meter corrections).
+4. Copy [`calibration_profile.example.yaml`](calibration_profile.example.yaml) to
+   `calibration_profile.yaml` (git-ignored — it's your hardware data) and describe your displays.
+5. Launch your agent in `DLC/` and ask it to calibrate; it follows
+   [`docs/operator-guide.md`](docs/operator-guide.md) (onboarding: meter correction →
+   `characterize` → `mhc-only` shakedown → `full`).
+
+## Quickstart (no hardware)
 
 ```bash
 # From the DLC directory; `python` (not python3) on Windows.
-cd DLC
 
 # Rehearse the whole loop on the in-process simulator (no hardware, no pipe):
 PYTHONPATH=src python -m dlc.stages.simulate --run runs/_rehearsal     # -> "Ding"
@@ -91,8 +114,9 @@ launched with the calibration pipe enabled (opt-in): an empty
 `DesktopLUT_Calibration.flag` next to the exe, `DESKTOPLUT_CALIBRATION=1`, or the
 in-app "Calibration control" toggle. A pause/resume seam exits 10 so the assistant can
 decide and resume (`--decide KEY=CHOICE[=REASON] --run <dir>`). This is a deliberate,
-user-involved step — see `docs/HANDOFF.md` for the live bring-up procedure; normally
-the assistant drives it through the `calibrate-display` skill.
+user-involved step — the live bring-up procedure is in
+[`docs/operator-guide.md`](docs/operator-guide.md); normally the assistant drives it through the
+`calibrate-display` skill.
 
 ### Autonomy modes (who answers a seam)
 
@@ -102,7 +126,7 @@ LAW there governs what may be decided without a judge):
 | Flag | Adjudicator | Behaviour | Use |
 |---|---|---|---|
 | `--attended` *(default)* | `MappingAdjudicator` | every seam without a recorded decision **pauses** (exit 10, request printed as JSON); resume with `--decide KEY=CHOICE[=REASON]` | **live hardware runs** — every judgment reaches the LLM/operator |
-| `--supervised` | `SupervisedAdjudicator` | benign recommendations auto-accept **as visible, vetoable judgment packets on the digest**; non-benign recommendations and severity-flagged digests pause | unattended hardware runs; a clean run never pauses |
+| `--supervised` | `SupervisedAdjudicator` | benign recommendations auto-accept **as visible, vetoable judgment packets on the digest**; non-benign recommendations and severity-flagged digests pause | **not for hardware runs** (benign auto-accepts skip the LLM's judgment) — kept for supervised experiments |
 | `--auto` | `AutoAdjudicator` | rubber-stamps every recommendation, no LLM | **sim/CI only** — refused on live measuring flows |
 
 Off-vocabulary decisions (`--decide verify:accept=aply`) are rejected loudly and the
@@ -129,13 +153,13 @@ pip install -e .[test]      # + pytest / pytest-xdist / pytest-cov (the suite's 
                             #   pass `-n auto`, so bare pytest without xdist won't run)
 ```
 
-System Python 3.11+ (3.13 on this box). Contained binaries for real runs go under
+System Python 3.11+. Contained binaries for real runs go under
 `third_party/argyll/3.3.0/bin/` and `third_party/dogegen/dogegen.exe`.
 
 ## Tests
 
 ```bash
-PYTHONPATH=src python -m pytest -q     # ~800 tests; green-or-skipped on any box
+python -m pytest -q     # ~2000 tests (xdist-parallel); green-or-skipped on any box
 ```
 
 The suite is deterministic on any machine: every environment-dependent test skips
@@ -158,8 +182,10 @@ DLC/
                       lut_rbf, lut_sdr, whitepoint
   src/dlc/stages/     stage tools + the end-to-end mock simulator
   src/dlc/dashboard/  mission-control live view + HTML report (stdlib-only)
-  tests/              the pytest suite (~800 tests)
-  docs/               v2-design-notes.md (SOT), HANDOFF.md (state), design notes
+  tests/              the pytest suite (~2000 tests)
+  docs/               operator-guide.md (the LLM's manual), NAMING.md (glossary)
+  .claude/skills/     calibrate-display — the agent entry point (loads the operator guide)
+  calibration_profile.example.yaml   template for your local calibration_profile.yaml
   runs/               per-run records (gitignored)
   results/            clean deliverable folders per run (gitignored)
   third_party/        contained tools: ArgyllCMS, dogegen (not committed)
@@ -167,7 +193,7 @@ DLC/
 
 ## More
 
-- **Design / source of truth:** `docs/v2-design-notes.md`
-- **Current state & live bring-up:** `docs/HANDOFF.md`
-- **Changelog:** `CHANGELOG.md`
-- **Operating manual:** repo-root `.claude/skills/calibrate-display/SKILL.md` (one level up from `DLC/`)
+- **Operating manual (for the LLM):** [`docs/operator-guide.md`](docs/operator-guide.md)
+- **Agent entry point:** [`.claude/skills/calibrate-display/SKILL.md`](.claude/skills/calibrate-display/SKILL.md)
+- **Identifier glossary:** [`docs/NAMING.md`](docs/NAMING.md)
+- **Changelog:** [`CHANGELOG.md`](CHANGELOG.md)
