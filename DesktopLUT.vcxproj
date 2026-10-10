@@ -115,6 +115,7 @@
     <ClCompile Include="src\fald.cpp" />
     <ClCompile Include="src\ui\ui_theme.cpp" />
     <ClCompile Include="src\actions\notify.cpp" />
+    <ClCompile Include="src\actions\actions.cpp" />
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_snapshot.cpp" />
     <ClCompile Include="src\ui\ui_present.cpp" />

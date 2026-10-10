@@ -27,6 +27,13 @@ void UpdateColorCorrectionControls(bool forceEdits = false);
 // (clamped to the live range). The one place the selected monitor changes.
 void SelectMonitor(int index);
 
+// Display `mon`'s settings changed (an action, the pipe): refresh the classic controls when they show
+// that display, the Start/Stop state, and the ImGui interface. GUI thread.
+void GuiNotifySettingsChanged(int mon);
+
+// The user stopped the live layers (classic Stop / tray Stop); automatic restarts respect it. GUI thread.
+extern bool g_userStopped;
+
 // GUI-thread pin on g_gui.monitorSettings: while held, a handler keeps a reference / index
 // into the vector across a message pump (editor dialogs, the preview spin-up that precedes
 // them, the pipe's grayscale live-begin), so a display change pumped meanwhile must not

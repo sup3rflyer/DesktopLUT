@@ -17,6 +17,7 @@
 #include "analysis.h"
 #include "desktoplut_ipc_server.h"
 #include "monitor_identity.h"
+#include "actions/actions.h"
 #include "actions/notify.h"
 #include "ui/ui_window.h"
 #include "../resource.h"
@@ -278,17 +279,6 @@ static bool CurrentMonitorIsHDR() {
     return true;
 }
 
-// A panel file's transfer (PQ = HDR fit, gamma = SDR fit) must match the row it is set on (the pipe and
-// the render side refuse a mismatch too). Returns true when the file is a readable panel file whose
-// transfer does NOT match; the status line carries the message and the caller refuses the file.
-static bool WarnFaldTransferMismatch(const std::wstring& path, bool isHDR) {
-    uint32_t transfer = 0;
-    if (path.empty() || !FaldPanelFileTransfer(path, transfer) || FaldTransferMatchesMode(transfer, isHDR)) return false;
-    SetStatus(isHDR ? L"FALD: this panel file is an SDR (gamma) fit - the HDR row needs a PQ fit profiled in HDR"
-                    : L"FALD: this panel file is an HDR (PQ) fit - the SDR (ACM) row needs a gamma fit profiled in SDR");
-    return true;
-}
-
 void RequestFaldFullRecompose();   // below: forces one full DWM composition for the hook's FALD layer
 
 // A FALD panel file was set / changed / re-set. The DWM hook reads panel files ONLY at injection (they are staged
@@ -299,24 +289,6 @@ void FaldPanelFileChangedReinject() {
     StopProcessing();
     StartProcessing();
     SetStatus(L"FALD panel file changed: DWM hook re-injected to load it");
-}
-
-// View / pedestal changed: they are mirrored in both modes' settings, so push both, persist once.
-static void ApplyFaldSharedSettingChange() {
-    const bool anyEnabled = FaldSlot(true).enabled || FaldSlot(false).enabled;
-    if (g_gui.isRunning) {
-        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-        UpdateColorCorrectionLive(g_gui.currentMonitor, false);
-        if (g_dwmHookMode.load()) {
-            UpdateDwmHookSharedConfig();
-            RequestFaldFullRecompose();
-        } else
-            DwmHookReevaluateOverlay();
-    } else if (anyEnabled) {
-        StartProcessing();
-    }
-    SaveSettings();
-    UpdateGUIState();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -379,24 +351,6 @@ static void FaldRecomposeTick(HWND hwnd) {
         g_faldRecomposeStage = 0;
         KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID);
     }
-}
-
-// FALD layer setting changed for the current monitor (one mode): push to the render thread and persist.
-static void ApplyFaldSettingChange(bool enabledNow, bool isHDR) {
-    if (g_gui.isRunning) {
-        UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
-        if (g_dwmHookMode.load()) {
-            UpdateDwmHookSharedConfig();
-            RequestFaldFullRecompose();
-        } else
-            DwmHookReevaluateOverlay();
-    } else if (enabledNow) {
-        StartProcessing();
-    }
-    SaveSettings();
-    UpdateGUIState();
-    if (enabledNow && g_dwmHookMode.load())
-        SetStatus(L"FALD in DWM hook mode: correction, Starfield and LED lag");
 }
 
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
@@ -1174,7 +1128,21 @@ int g_monitorSettingsPins = 0;   // see MonitorSettingsPin (gui.h)
 // The user pressed Stop (button / tray) and has not pressed Start/Apply since: display changes and
 // wakes must not start processing behind their back. Programmatic Stop/Start pairs (LUT browse,
 // pipe verbs, preview spin-ups) do not touch it. GUI thread only.
-static bool g_userStopped = false;
+bool g_userStopped = false;
+
+void GuiNotifySettingsChanged(int mon) {
+    // The classic controls show ONE display; refreshing them from another display's settings would put
+    // its values under the selected display's name (and the next click would write them there).
+    if (mon >= 0 && mon == g_gui.currentMonitor && mon < (int)g_gui.monitorSettings.size()) {
+        SetPathText(g_gui.hwndSdrPath, g_gui.monitorSettings[mon].sdrPath.c_str());
+        SetPathText(g_gui.hwndHdrPath, g_gui.monitorSettings[mon].hdrPath.c_str());
+        UpdateColorCorrectionControls();
+        UpdateMhcInfoDisplay(mon, false);
+        UpdateMhcInfoDisplay(mon, true);
+    }
+    UpdateGUIState();
+    ui::Invalidate();
+}
 
 void SelectMonitor(int index) {
     const int count = (int)(std::min)(g_gui.monitors.size(), g_gui.monitorSettings.size());
@@ -1534,109 +1502,37 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (sel >= 0 && sel < (int)g_gui.monitorSettings.size()) SelectMonitor(sel);
             }
             return 0;
-        case ID_SDR_BROWSE: {
+        case ID_SDR_BROWSE:
+        case ID_HDR_BROWSE: {
             wchar_t path[MAX_PATH] = {};
-            if (BrowseForLUT(hwnd, path, MAX_PATH)) {
-                SetPathText(g_gui.hwndSdrPath, path);
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    g_gui.monitorSettings[g_gui.currentMonitor].sdrPath = path;
-                }
-                SaveSettings();
-                if (g_gui.isRunning) {
-                    StopProcessing();
-                    StartProcessing();
-                } else {
-                    UpdateGUIState();
-                }
-            }
+            if (BrowseForLUT(hwnd, path, MAX_PATH))
+                act::SetLutPath(g_gui.currentMonitor, LOWORD(wParam) == ID_HDR_BROWSE, path);
             return 0;
         }
         case ID_SDR_CLEAR:
-            SetPathText(g_gui.hwndSdrPath, L"");
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].sdrPath.clear();
-            }
-            SaveSettings();
-            if (g_gui.isRunning) {
-                StopProcessing();
-                StartProcessing();
-            } else {
-                UpdateGUIState();
-            }
-            return 0;
-        case ID_HDR_BROWSE: {
-            wchar_t path[MAX_PATH] = {};
-            if (BrowseForLUT(hwnd, path, MAX_PATH)) {
-                SetPathText(g_gui.hwndHdrPath, path);
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    g_gui.monitorSettings[g_gui.currentMonitor].hdrPath = path;
-                }
-                SaveSettings();
-                if (g_gui.isRunning) {
-                    StopProcessing();
-                    StartProcessing();
-                } else {
-                    UpdateGUIState();
-                }
-            }
-            return 0;
-        }
         case ID_HDR_CLEAR:
-            SetPathText(g_gui.hwndHdrPath, L"");
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                g_gui.monitorSettings[g_gui.currentMonitor].hdrPath.clear();
-            }
-            SaveSettings();
-            if (g_gui.isRunning) {
-                StopProcessing();
-                StartProcessing();
-            } else {
-                UpdateGUIState();
-            }
+            act::SetLutPath(g_gui.currentMonitor, LOWORD(wParam) == ID_HDR_CLEAR, L"");
             return 0;
         case ID_APPLY:
-            g_userStopped = false;
             g_tetrahedralInterp = (SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            SaveSettings();
-            if (g_gui.isRunning) {
-                StopProcessing();
-            }
-            StartProcessing();
+            act::StartLiveLayers();
             return 0;
         case ID_STOP:
-            g_userStopped = true;
-            StopProcessing();
+            act::StopLiveLayers();
             return 0;
         case ID_TETRAHEDRAL_CHECK:
-            g_tetrahedralInterp = (SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            SaveSettings();
+            act::SetTetrahedral(SendMessage(g_gui.hwndTetrahedralCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
         case ID_HDR_DITHER_CHECK:
-            // Live: the overlay re-reads it at its next constant-buffer write; the hook via the shared config.
-            g_hdrDither = (SendMessage(g_gui.hwndHdrDitherCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            SaveSettings();
-            UpdateDwmHookSharedConfig();
+            act::SetHdrDither(SendMessage(g_gui.hwndHdrDitherCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         // Tonemapping controls (HDR only)
-        // In hook mode, tonemap is handled by DwmHook.dll via shared memory.
-        // We still call UpdateColorCorrectionLive() so the overlay's MonitorContext stays
-        // in sync for the analysis overlay's TM indicator (reads ctx->hdrColorCorrection.tonemap).
         case ID_CORR_TONEMAP_ENABLE:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndTonemapEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.enabled = enabled;
-                if (g_gui.isRunning) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                    if (g_dwmHookMode.load())
-                        UpdateDwmHookSharedConfig();
-                    else
-                        DwmHookReevaluateOverlay();
-                } else if (enabled) {
-                    StartProcessing();
-                }
-                SaveSettings();
-                UpdateGUIState();
+            if (act::ValidMonitor(g_gui.currentMonitor)) {
+                TonemapSettings t = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
+                t.enabled = (SendMessage(g_gui.hwndTonemapEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                act::SetTonemap(g_gui.currentMonitor, t);
             }
             return 0;
 
@@ -1644,184 +1540,118 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // tonemap, per mode.
         case ID_CORR_FALD_ENABLE:
         case ID_CORR_FALD_SDR_ENABLE:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+            if (act::ValidMonitor(g_gui.currentMonitor)) {
                 const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_ENABLE);
                 HWND box = isHDR ? g_gui.hwndFaldEnable : g_gui.hwndFaldSdrEnable;
-                bool enabled = (SendMessage(box, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                auto& fald = FaldSlot(isHDR);
-                if (enabled && fald.paramsPath.empty()) {
-                    SendMessage(box, BM_SETCHECK, BST_UNCHECKED, 0);
-                    SetStatus(isHDR ? L"FALD compensation (HDR) needs a panel parameter file (…)"
-                                    : L"FALD compensation (SDR) needs a panel parameter file profiled in SDR under ACM (…)");
-                    return 0;
-                }
-                if (enabled && WarnFaldTransferMismatch(fald.paramsPath, isHDR)) {   // a stored path of the wrong mode
-                    SendMessage(box, BM_SETCHECK, BST_UNCHECKED, 0);
-                    return 0;
-                }
-                {
-                    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads it
-                    fald.enabled = enabled;
-                }
-                ApplyFaldSettingChange(enabled, isHDR);
+                // A refusal (no panel file, wrong transfer) re-syncs the box from the settings.
+                act::SetFaldEnabled(g_gui.currentMonitor, isHDR, SendMessage(box, BM_GETCHECK, 0, 0) == BST_CHECKED);
             }
             return 0;
 
         case ID_CORR_FALD_DEBUG:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= 9) ? (unsigned int)sel : 0u;   // one entry per debug view 0..9
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // state.get reads these
-                        FaldSlot(true).debugMode = mode;    // the View applies to whichever mode the monitor is in
-                        FaldSlot(false).debugMode = mode;
-                    }
-                    ApplyFaldSharedSettingChange();
-                }
+            if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
+                int sel = (int)SendMessage(g_gui.hwndFaldDebug, CB_GETCURSEL, 0, 0);
+                unsigned int mode = (sel >= 0 && sel <= 9) ? (unsigned int)sel : 0u;   // one entry per debug view 0..9
+                // The View applies to whichever mode the monitor is in: both modes at once.
+                act::EditFaldShared(g_gui.currentMonitor, [mode](FaldSettings& f) {
+                    bool c = f.debugMode != mode; f.debugMode = mode; return c; });
             }
             return 0;
 
         case ID_CORR_FALD_PEDMODE:
-            if (HIWORD(wParam) == BN_CLICKED) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    bool on = (SendMessage(g_gui.hwndFaldPedMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        FaldSlot(true).pedMode = on ? 1u : 0u;
-                        FaldSlot(false).pedMode = on ? 1u : 0u;
-                    }
-                    ApplyFaldSharedSettingChange();
-                    const std::wstring& live = FaldSlot(CurrentMonitorIsHDR()).paramsPath;
-                    if (on && !FaldPanelFileHasPedColour(live))
-                        SetStatus(L"Per-channel pedestal: this panel file carries no leak colour - the toggle has no effect");
-                }
+            if (HIWORD(wParam) == BN_CLICKED && act::ValidMonitor(g_gui.currentMonitor)) {
+                bool on = (SendMessage(g_gui.hwndFaldPedMode, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                act::EditFaldShared(g_gui.currentMonitor, [on](FaldSettings& f) {
+                    unsigned int v = on ? 1u : 0u; bool c = f.pedMode != v; f.pedMode = v; return c; });
+                const std::wstring& live = FaldSlot(CurrentMonitorIsHDR()).paramsPath;
+                if (on && !FaldPanelFileHasPedColour(live))
+                    SetStatus(L"Per-channel pedestal: this panel file carries no leak colour - the toggle has no effect");
             }
             return 0;
 
         // Temporal drive state ("LED lag" row): mode combo + rise/fall ms, both modes at once like View. Persisted.
         case ID_CORR_FALD_TEMPORAL:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    int sel = (int)SendMessage(g_gui.hwndFaldTemporal, CB_GETCURSEL, 0, 0);
-                    unsigned int mode = (sel >= 0 && sel <= (int)FALD_TEMPORAL_PANEL) ? (unsigned int)sel : 0u;   // one entry per mode 0..3
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        FaldSlot(true).temporalMode = mode;
-                        FaldSlot(false).temporalMode = mode;
-                    }
-                    ShowFaldTemporalRow(mode == FALD_TEMPORAL_PANEL);
-                    ApplyFaldSharedSettingChange();
-                    if (mode == FALD_TEMPORAL_PANEL)
-                        SetStatus(L"FALD panel clock on (experimental): the measured 30-Hz LED law - judge flashes beside moving highlights by eye");
-                    else if (mode != 0)
-                        SetStatus(L"FALD LED-lag filter on: the panel's LED law is unmeasured - judge slow pans by eye, off if worse");
-                }
+            if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
+                int sel = (int)SendMessage(g_gui.hwndFaldTemporal, CB_GETCURSEL, 0, 0);
+                unsigned int mode = (sel >= 0 && sel <= (int)FALD_TEMPORAL_PANEL) ? (unsigned int)sel : 0u;   // one entry per mode 0..3
+                ShowFaldTemporalRow(mode == FALD_TEMPORAL_PANEL);
+                act::EditFaldShared(g_gui.currentMonitor, [mode](FaldSettings& f) {
+                    bool c = f.temporalMode != mode; f.temporalMode = mode; return c; });
+                if (mode == FALD_TEMPORAL_PANEL)
+                    SetStatus(L"FALD panel clock on (experimental): the measured 30-Hz LED law - judge flashes beside moving highlights by eye");
+                else if (mode != 0)
+                    SetStatus(L"FALD LED-lag filter on: the panel's LED law is unmeasured - judge slow pans by eye, off if worse");
             }
             return 0;
         case ID_CORR_FALD_TAU_RISE:
         case ID_CORR_FALD_TAU_FALL:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    const bool rise = (LOWORD(wParam) == ID_CORR_FALD_TAU_RISE);
-                    HWND edit = rise ? g_gui.hwndFaldTauRise : g_gui.hwndFaldTauFall;
-                    wchar_t buf[32];
-                    GetWindowText(edit, buf, 32);
-                    float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                    if (!(v >= 0.0f)) v = 0.0f;
-                    if (v > FALD_TAU_MAX_MS) v = FALD_TAU_MAX_MS;
-                    bool changed = false;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        for (bool isHDR : { true, false }) {
-                            float& t = rise ? FaldSlot(isHDR).tauRiseMs : FaldSlot(isHDR).tauFallMs;
-                            if (t != v) { t = v; changed = true; }
-                        }
-                    }
-                    wchar_t shown[32];
-                    _swprintf_s_l(shown, 32, L"%.1f", GetCLocale(), v);
-                    SetWindowText(edit, shown);
-                    if (changed) ApplyFaldSharedSettingChange();
-                }
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                const bool rise = (LOWORD(wParam) == ID_CORR_FALD_TAU_RISE);
+                HWND edit = rise ? g_gui.hwndFaldTauRise : g_gui.hwndFaldTauFall;
+                wchar_t buf[32];
+                GetWindowText(edit, buf, 32);
+                float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
+                if (!(v >= 0.0f)) v = 0.0f;
+                if (v > FALD_TAU_MAX_MS) v = FALD_TAU_MAX_MS;
+                wchar_t shown[32];
+                _swprintf_s_l(shown, 32, L"%.1f", GetCLocale(), v);
+                SetWindowText(edit, shown);
+                act::EditFaldShared(g_gui.currentMonitor, [rise, v](FaldSettings& f) {
+                    float& t = rise ? f.tauRiseMs : f.tauFallMs; bool c = t != v; t = v; return c; });
             }
             return 0;
         // "Panel clock" set of the LED-lag row: closure (0.05..1) + parity (combo index = parity + 1), both modes at once.
         case ID_CORR_FALD_CLOSURE:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    wchar_t buf[32];
-                    GetWindowText(g_gui.hwndFaldClosure, buf, 32);
-                    float v = FaldPanelClockClosure((float)_wcstod_l(buf, nullptr, GetCLocale()));
-                    // Losing the focus is not an edit (see the starfield edits below): write only when the typed value
-                    // differs from the shown mode's stored one by more than the display rounding.
-                    bool changed = false;
-                    float stored = 0.0f;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        stored = FaldSlot(CurrentMonitorIsHDR()).clockClosure;
-                        if (fabsf(v - stored) > 0.005f + 1e-6f) {
-                            for (bool isHDR : { true, false }) FaldSlot(isHDR).clockClosure = v;
-                            changed = true;
-                        }
-                    }
-                    wchar_t shownBuf[32];
-                    _swprintf_s_l(shownBuf, 32, L"%.2f", GetCLocale(), changed ? v : stored);
-                    SetWindowText(g_gui.hwndFaldClosure, shownBuf);
-                    if (changed) ApplyFaldSharedSettingChange();
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                wchar_t buf[32];
+                GetWindowText(g_gui.hwndFaldClosure, buf, 32);
+                float v = FaldPanelClockClosure((float)_wcstod_l(buf, nullptr, GetCLocale()));
+                // Losing the focus is not an edit (see the starfield edits below): write only when the typed value
+                // differs from the shown mode's stored one by more than the display rounding.
+                float stored = 0.0f;
+                {
+                    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                    stored = FaldSlot(CurrentMonitorIsHDR()).clockClosure;
                 }
+                const bool edit = fabsf(v - stored) > 0.005f + 1e-6f;
+                wchar_t shownBuf[32];
+                _swprintf_s_l(shownBuf, 32, L"%.2f", GetCLocale(), edit ? v : stored);
+                SetWindowText(g_gui.hwndFaldClosure, shownBuf);
+                if (edit)
+                    act::EditFaldShared(g_gui.currentMonitor, [v](FaldSettings& f) {
+                        bool c = f.clockClosure != v; f.clockClosure = v; return c; });
             }
             return 0;
         case ID_CORR_FALD_PARITY:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    int sel = (int)SendMessage(g_gui.hwndFaldParity, CB_GETCURSEL, 0, 0);
-                    int parity = (sel >= 0 && sel <= 2) ? sel - 1 : -1;   // three entries: unknown, 0, 1
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        FaldSlot(true).clockParity = parity;
-                        FaldSlot(false).clockParity = parity;
-                    }
-                    ApplyFaldSharedSettingChange();
-                    if (parity >= 0)
-                        SetStatus(L"FALD panel clock: a known parity is experimental - the WRONG one is as bad as no time law; Unknown is the safe choice");
-                }
+            if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
+                int sel = (int)SendMessage(g_gui.hwndFaldParity, CB_GETCURSEL, 0, 0);
+                int parity = (sel >= 0 && sel <= 2) ? sel - 1 : -1;   // three entries: unknown, 0, 1
+                act::EditFaldShared(g_gui.currentMonitor, [parity](FaldSettings& f) {
+                    bool c = f.clockParity != parity; f.clockParity = parity; return c; });
+                if (parity >= 0)
+                    SetStatus(L"FALD panel clock: a known parity is experimental - the WRONG one is as bad as no time law; Unknown is the safe choice");
             }
             return 0;
         case ID_CORR_FALD_DELAY:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    wchar_t buf[32];
-                    GetWindowText(g_gui.hwndFaldDelay, buf, 32);
-                    int n = _wtoi(buf);
-                    unsigned int v = n < 0 ? 0u : (n > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)n);
-                    bool changed = false;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        for (bool isHDR : { true, false }) {
-                            unsigned int& d = FaldSlot(isHDR).delayFrames;
-                            if (d != v) { d = v; changed = true; }
-                        }
-                    }
-                    SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(v).c_str());
-                    if (changed) ApplyFaldSharedSettingChange();
-                }
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                wchar_t buf[32];
+                GetWindowText(g_gui.hwndFaldDelay, buf, 32);
+                int n = _wtoi(buf);
+                unsigned int v = n < 0 ? 0u : (n > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)n);
+                SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(v).c_str());
+                act::EditFaldShared(g_gui.currentMonitor, [v](FaldSettings& f) {
+                    bool c = f.delayFrames != v; f.delayFrames = v; return c; });
             }
             return 0;
         // Starfield balancing rows (EXPERIMENT, work guide S1): enable + even / spread σ / keep nits / strength / mean reach, both modes at
         // once like View. Persisted. The other parameters are INI / pipe only.
         case ID_CORR_FALD_STAR_ENABLE:
-            if (HIWORD(wParam) == BN_CLICKED) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    bool on = (SendMessage(g_gui.hwndFaldStarEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        FaldSlot(true).star.enabled = on;
-                        FaldSlot(false).star.enabled = on;
-                    }
-                    ApplyFaldSharedSettingChange();
-                    if (on)
-                        SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose");
-                }
+            if (HIWORD(wParam) == BN_CLICKED && act::ValidMonitor(g_gui.currentMonitor)) {
+                bool on = (SendMessage(g_gui.hwndFaldStarEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                act::EditFaldShared(g_gui.currentMonitor, [on](FaldSettings& f) {
+                    bool c = f.star.enabled != on; f.star.enabled = on; return c; });
+                if (on)
+                    SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose");
             }
             return 0;
         case ID_CORR_FALD_STAR_EVEN:
@@ -1831,14 +1661,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (HIWORD(wParam) == EN_KILLFOCUS) {
                 if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
                     const int id = LOWORD(wParam);
-                    HWND edit = (id == ID_CORR_FALD_STAR_EVEN) ? g_gui.hwndFaldStarEven
-                              : (id == ID_CORR_FALD_STAR_KEEP) ? g_gui.hwndFaldStarKeep
-                              : (id == ID_CORR_FALD_STAR_SIGMA) ? g_gui.hwndFaldStarSigma : g_gui.hwndFaldStarStrength;
+                    HWND edit_ctl = (id == ID_CORR_FALD_STAR_EVEN) ? g_gui.hwndFaldStarEven
+                                  : (id == ID_CORR_FALD_STAR_KEEP) ? g_gui.hwndFaldStarKeep
+                                  : (id == ID_CORR_FALD_STAR_SIGMA) ? g_gui.hwndFaldStarSigma : g_gui.hwndFaldStarStrength;
                     const bool isKeep = (id == ID_CORR_FALD_STAR_KEEP);                  // keep_nits 0..10000, shown %.1f
                     const float vMax = isKeep ? 10000.0f : (id == ID_CORR_FALD_STAR_SIGMA) ? 4.0f : 1.0f;   // target_sigma 0..4, the others 0..1
                     const float tol = (isKeep ? 0.05f : 0.005f) + 1e-6f;                 // the display rounding
                     wchar_t buf[32];
-                    GetWindowText(edit, buf, 32);
+                    GetWindowText(edit_ctl, buf, 32);
                     float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
                     if (!(v >= 0.0f)) v = 0.0f;
                     if (v > vMax) v = vMax;
@@ -1849,180 +1679,110 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     // Losing the focus is not an edit: write only when the typed value differs from the stored one of the
                     // mode the row shows by more than the display rounding. Tabbing through must neither quantise a
                     // pipe-set 0.333 to 0.33 nor copy the shown mode's value into the other mode.
-                    bool changed = false;
                     float stored = 0.0f;
                     {
                         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
                         stored = field(FaldSlot(CurrentMonitorIsHDR()).star);
-                        if (fabsf(v - stored) > tol) {
-                            for (bool isHDR : { true, false }) field(FaldSlot(isHDR).star) = v;   // a real edit: the row sets both modes
-                            changed = true;
-                        }
                     }
+                    const bool edit = fabsf(v - stored) > tol;
                     wchar_t shownBuf[32];
-                    _swprintf_s_l(shownBuf, 32, isKeep ? L"%.1f" : L"%.2f", GetCLocale(), changed ? v : stored);
-                    SetWindowText(edit, shownBuf);
-                    if (changed) ApplyFaldSharedSettingChange();
+                    _swprintf_s_l(shownBuf, 32, isKeep ? L"%.1f" : L"%.2f", GetCLocale(), edit ? v : stored);
+                    SetWindowText(edit_ctl, shownBuf);
+                    if (edit)   // a real edit: the row sets both modes
+                        act::EditFaldShared(g_gui.currentMonitor, [&field, v](FaldSettings& f) {
+                            float& t = field(f.star); bool c = t != v; t = v; return c; });
                 }
             }
             return 0;
         case ID_CORR_FALD_STAR_REACH:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    wchar_t buf[32];
-                    GetWindowText(g_gui.hwndFaldStarReach, buf, 32);
-                    int n = _wtoi(buf);
-                    unsigned int v = n < 0 ? 0u : (n > (int)FALD_STAR_EVEN_REACH_MAX ? FALD_STAR_EVEN_REACH_MAX : (unsigned int)n);
-                    bool changed = false;                      // (same rule as the three fields above: focus loss is no edit)
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-                        if (FaldSlot(CurrentMonitorIsHDR()).star.evenReach != v) {
-                            for (bool isHDR : { true, false }) FaldSlot(isHDR).star.evenReach = v;
-                            changed = true;
-                        }
-                    }
-                    SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(v).c_str());
-                    if (changed) ApplyFaldSharedSettingChange();
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                wchar_t buf[32];
+                GetWindowText(g_gui.hwndFaldStarReach, buf, 32);
+                int n = _wtoi(buf);
+                unsigned int v = n < 0 ? 0u : (n > (int)FALD_STAR_EVEN_REACH_MAX ? FALD_STAR_EVEN_REACH_MAX : (unsigned int)n);
+                bool edit = false;                      // (same rule as the three fields above: focus loss is no edit)
+                {
+                    std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+                    edit = FaldSlot(CurrentMonitorIsHDR()).star.evenReach != v;
                 }
+                SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(v).c_str());
+                if (edit)
+                    act::EditFaldShared(g_gui.currentMonitor, [v](FaldSettings& f) {
+                        bool c = f.star.evenReach != v; f.star.evenReach = v; return c; });
             }
             return 0;
         case ID_CORR_FALD_BROWSE:
         case ID_CORR_FALD_SDR_BROWSE:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
+            if (act::ValidMonitor(g_gui.currentMonitor)) {
                 const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_BROWSE);
                 wchar_t path[1024] = {};
-                if (BrowseForFaldPanelFile(hwnd, path, 1024)) {
-                    if (WarnFaldTransferMismatch(path, isHDR)) return 0;   // refused: the row keeps its file
-                    bool enabledNow;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
-                        auto& fald = FaldSlot(isHDR);
-                        fald.paramsPath = path;
-                        fald.reloadSeq++;   // re-browsing the same (re-exported) file = reload, as runtime.set_fald_params
-                        enabledNow = fald.enabled;
-                    }
-                    SetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path);
-                    ApplyFaldSettingChange(enabledNow, isHDR);
-                    FaldPanelFileChangedReinject();   // hook mode: the DLL reads panel files only at injection
-                }
+                // Re-browsing the same (re-exported) file = reload, as runtime.set_fald_params. A wrong-transfer
+                // file is refused and the row keeps its file.
+                if (BrowseForFaldPanelFile(hwnd, path, 1024))
+                    act::SetFaldPanelFile(g_gui.currentMonitor, isHDR, path, true);
             }
             return 0;
 
         case ID_CORR_FALD_PATH:
         case ID_CORR_FALD_SDR_PATH:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_PATH);
-                    wchar_t path[1024] = {};
-                    GetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path, 1024);
-                    if (WarnFaldTransferMismatch(path, isHDR)) {   // refused: restore the row's file
-                        SetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, FaldSlot(isHDR).paramsPath.c_str());
-                        return 0;
-                    }
-                    bool changed = false, enabledNow = false;
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);   // the pipe thread reads this wstring
-                        auto& fald = FaldSlot(isHDR);
-                        if (fald.paramsPath != path) { fald.paramsPath = path; changed = true; }
-                        enabledNow = fald.enabled;
-                    }
-                    if (changed) { ApplyFaldSettingChange(enabledNow, isHDR); FaldPanelFileChangedReinject(); }
-                }
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                const bool isHDR = (LOWORD(wParam) == ID_CORR_FALD_PATH);
+                wchar_t path[1024] = {};
+                GetWindowText(isHDR ? g_gui.hwndFaldPath : g_gui.hwndFaldSdrPath, path, 1024);
+                act::SetFaldPanelFile(g_gui.currentMonitor, isHDR, path, false);
             }
             return 0;
 
         case ID_CORR_TONEMAP_CURVE:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    int sel = (int)SendMessage(g_gui.hwndTonemapCurve, CB_GETCURSEL, 0, 0);
-                    g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.curve =
-                        DropdownIndexToTonemapCurve(sel);
-                    if (g_gui.isRunning) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                        if (g_dwmHookMode.load())
-                            UpdateDwmHookSharedConfig();
-                    }
-                    SaveSettings();
-                }
+            if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
+                TonemapSettings t = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
+                t.curve = DropdownIndexToTonemapCurve((int)SendMessage(g_gui.hwndTonemapCurve, CB_GETCURSEL, 0, 0));
+                act::SetTonemap(g_gui.currentMonitor, t);
             }
             return 0;
 
         case ID_CORR_TONEMAP_TARGET:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
-                    // An emptied field used to parse as 0 -> a 10-nit target, applied at once.
-                    if (!CommitNumericEdit(g_gui.hwndTonemapTarget, 10.0f, 10000.0f, tm.targetPeakNits, 0)) return 0;
-                    if (g_gui.isRunning) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                        if (g_dwmHookMode.load())
-                            UpdateDwmHookSharedConfig();
-                    }
-                    SaveSettings();
-                }
+        case ID_CORR_TONEMAP_SOURCE:
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                const bool target = (LOWORD(wParam) == ID_CORR_TONEMAP_TARGET);
+                TonemapSettings t = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
+                // An emptied field used to parse as 0 -> a 10-nit target, applied at once: commit only a value.
+                float& v = target ? t.targetPeakNits : t.sourcePeakNits;
+                if (!CommitNumericEdit(target ? g_gui.hwndTonemapTarget : g_gui.hwndTonemapSource, 10.0f, 10000.0f, v, 0)) return 0;
+                act::SetTonemap(g_gui.currentMonitor, t);
             }
             return 0;
 
         case ID_CORR_TONEMAP_DYNAMIC:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndTonemapDynamic, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap.dynamicPeak = enabled;
-                EnableWindow(g_gui.hwndTonemapSource, !enabled);
-                if (g_gui.isRunning) {
-                    UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                    if (g_dwmHookMode.load())
-                        UpdateDwmHookSharedConfig();
-                }
-                SaveSettings();
-            }
-            return 0;
-
-        case ID_CORR_TONEMAP_SOURCE:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    auto& tm = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
-                    if (!CommitNumericEdit(g_gui.hwndTonemapSource, 10.0f, 10000.0f, tm.sourcePeakNits, 0)) return 0;
-                    if (g_gui.isRunning) {
-                        UpdateColorCorrectionLive(g_gui.currentMonitor, true);
-                        if (g_dwmHookMode.load())
-                            UpdateDwmHookSharedConfig();
-                    }
-                    SaveSettings();
-                }
+            if (act::ValidMonitor(g_gui.currentMonitor)) {
+                TonemapSettings t = g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection.tonemap;
+                t.dynamicPeak = (SendMessage(g_gui.hwndTonemapDynamic, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                EnableWindow(g_gui.hwndTonemapSource, !t.dynamicPeak);
+                act::SetTonemap(g_gui.currentMonitor, t);
             }
             return 0;
 
         // MaxTML controls (HDR only)
         case ID_CORR_MAXTML_ENABLE:
-            if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                bool enabled = (SendMessage(g_gui.hwndMaxTmlEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_gui.monitorSettings[g_gui.currentMonitor].maxTml.enabled = enabled;
-                SaveSettings();
-            }
+            act::SetMaxTmlEnabled(g_gui.currentMonitor, SendMessage(g_gui.hwndMaxTmlEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_CORR_MAXTML_COMBO:
-            if (HIWORD(wParam) == CBN_SELCHANGE) {
+            if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
                 int sel = (int)SendMessage(g_gui.hwndMaxTmlCombo, CB_GETCURSEL, 0, 0);
                 const wchar_t* values[] = { L"", L"400", L"600", L"1000", L"1400", L"4000", L"10000" };
                 const float nitsValues[] = { 0, 400, 600, 1000, 1400, 4000, 10000 };
                 if (sel >= 0 && sel < 7) {
-                    if (sel > 0)
+                    if (sel > 0) {
                         SetWindowText(g_gui.hwndMaxTmlEdit, values[sel]);
-                    if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                        float& stored = g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits;
-                        bool changed = false;
-                        if (sel == 0) {
-                            // "Custom" — sync stored value from current edit box text, clamped to the
-                            // same [100, 10000] range as the Apply handler. An empty/partial box keeps
-                            // the stored value (ApplyMaxTmlSettings pushes it to the display on the
-                            // next Start, so a guessed 100 nits would really be applied).
-                            changed = CommitNumericEdit(g_gui.hwndMaxTmlEdit, 100.0f, 10000.0f, stored, 0);
-                        } else if (stored != nitsValues[sel]) {
-                            stored = nitsValues[sel];
-                            changed = true;
-                        }
-                        if (changed) SaveSettings();
+                        act::SetMaxTmlPeak(g_gui.currentMonitor, nitsValues[sel]);
+                    } else {
+                        // "Custom": take the edit box's value, clamped to [100, 10000] like Apply. An empty or
+                        // partial box keeps the stored value (it is pushed to the display at the next start, so
+                        // a guessed 100 nits would really be applied).
+                        float v = g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits;
+                        if (CommitNumericEdit(g_gui.hwndMaxTmlEdit, 100.0f, 10000.0f, v, 0))
+                            act::SetMaxTmlPeak(g_gui.currentMonitor, v);
                     }
                 }
             }
@@ -2045,25 +1805,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     _swprintf_s_l(shown, _countof(shown), L"%.0f", GetCLocale(), nits);
                     SetWindowText(g_gui.hwndMaxTmlEdit, shown);
                 }
-
-                if (g_gui.currentMonitor >= 0 && g_gui.currentMonitor < (int)g_gui.monitorSettings.size()) {
-                    g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits = nits;
-                    SaveSettings();
-                }
-
-                DisplayInfo displayInfo;
-                if (GetDisplayInfoForMonitor(g_gui.currentMonitor, displayInfo)) {
-                    if (SetDisplayMaxTml(displayInfo, nits)) {
-                        wchar_t msg[256];
-                        const wchar_t* name = displayInfo.name.empty() ? L"selected monitor" : displayInfo.name.c_str();
-                        _swprintf_s_l(msg, _countof(msg), L"MaxTML set to %.0f nits for %s", GetCLocale(), nits, name);
-                        MessageBox(hwnd, msg, L"DesktopLUT", MB_OK | MB_ICONINFORMATION);
-                    } else {
-                        MessageBox(hwnd, L"Failed to set MaxTML. Make sure HDR is enabled.", L"Error", MB_OK | MB_ICONERROR);
-                    }
-                } else {
-                    MessageBox(hwnd, L"Could not find display information for this monitor.", L"Error", MB_OK | MB_ICONERROR);
-                }
+                act::Result r = act::ApplyMaxTmlNow(g_gui.currentMonitor, nits);
+                if (!r.text.empty())   // the classic window keeps its message boxes
+                    MessageBox(hwnd, r.text.c_str(), r.ok() ? L"DesktopLUT" : L"Error",
+                               MB_OK | (r.ok() ? MB_ICONINFORMATION : MB_ICONERROR));
             }
             return 0;
 
@@ -2180,104 +1925,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_HDR_APPLY:
             {
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_APPLY);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size())
-                    return 0;
-
-                if (!IsMHC2ApiAvailable()) {
-                    MessageBox(hwnd, L"MHC2 color management APIs not available.\nRequires Windows 10 21H2 or later.", L"Not Available", MB_OK | MB_ICONWARNING);
-                    return 0;
-                }
-
-                if (GenerateAndInstallMhcProfile(g_gui.currentMonitor, isHDR)) {
-                    auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                      : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
-                    ComputeMhcMetadata(mhc, isHDR);
-                    UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
-                    SaveSettings();
-                    MessageBox(hwnd, L"MHC2 profile installed successfully.\nProfile persists even when overlay is off.",
-                        L"DesktopLUT", MB_OK | MB_ICONINFORMATION);
-                } else {
-                    MessageBox(hwnd, L"Failed to install MHC2 profile.\nCheck that HDR is enabled and GPU supports MHC2.",
-                        L"Error", MB_OK | MB_ICONERROR);
-                }
+                act::Result r = act::MhcInstall(g_gui.currentMonitor, isHDR);
+                if (!r.text.empty())   // the classic window keeps its message boxes
+                    MessageBox(hwnd, r.text.c_str(), r.ok() ? L"DesktopLUT" : L"Error",
+                               MB_OK | (r.ok() ? MB_ICONINFORMATION : MB_ICONERROR));
             }
             return 0;
 
         case ID_MHC_TAB_REMOVE:
         case ID_MHC_HDR_REMOVE:
             {
-                bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_REMOVE);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size())
-                    return 0;
-
-                auto& settings = g_gui.monitorSettings[g_gui.currentMonitor];
-                auto& mhc = isHDR ? settings.hdrMHC : settings.sdrMHC;
-
-                if (mhc.profileName.empty()) {
-                    MessageBox(hwnd, L"No MHC2 profile is installed for this monitor.", L"Info", MB_OK | MB_ICONINFORMATION);
-                    return 0;
-                }
-
-                // Associate the identity MHC2 profile FIRST, then disassociate the real one:
-                // Windows keeps applying the last associated MHC2 transform after a removal
-                // (HW-proven 2026-09-03 / 2026-09-23), so "Remove" must hand the display a
-                // neutral profile, never "nothing associated". Only the identity association
-                // survives; the real profile's file is deleted below as before.
-                // Mark the mode disabled BEFORE the swap: the whitelist thread's CheckMhcProfiles
-                // would otherwise see enabled + a non-matching default (the identity) and
-                // re-assert the old profile mid-swap.
-                const float identityPeak = MhcIdentityPeakNits(settings, isHDR);
-                {
-                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-                    mhc.enabled = false;
-                }
-                ReplaceMhcProfileWithIdentity(g_gui.currentMonitor, isHDR, identityPeak, mhc.profileName);
-
-                // Delete the .icm file from system color directory
-                {
-                    wchar_t sysDir[MAX_PATH];
-                    GetSystemDirectory(sysDir, MAX_PATH);
-                    std::wstring icmPath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + mhc.profileName;
-                    if (DeleteFileW(icmPath.c_str())) {
-                        std::wcout << L"MHC: Deleted profile file " << mhc.profileName << std::endl;
-                    }
-                }
-
-                // Lock the MHC field writes against the whitelist reader (CheckMhcProfiles)
-                // and the generation snapshot (both read these wstrings under the mutex).
-                // DeleteFileW / GetSystemDirectory take no locks, so holding across them is
-                // safe; the *Display/*Live/SaveSettings calls below re-lock g_monitorSettingsMutex
-                // so they are deliberately left outside this scope (it is non-recursive).
-                {
-                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-
-                    // Delete all cached permutation profile files
-                    {
-                        wchar_t sysDirPerm[MAX_PATH];
-                        GetSystemDirectory(sysDirPerm, MAX_PATH);
-                        std::wstring colorDir = std::wstring(sysDirPerm) + L"\\spool\\drivers\\color\\";
-                        for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
-                            if (!mhc.permNames[k].empty()) {
-                                DeleteFileW((colorDir + mhc.permNames[k]).c_str());
-                                mhc.permNames[k].clear();
-                                mhc.permPaths[k].clear();
-                            }
-                        }
-                    }
-
-                    mhc.enabled = false;
-                    mhc.profilePath.clear();
-                    mhc.profileName.clear();
-                    mhc.activePerm = 0;
-                    mhc.hasPerChannelTRC = false;
-                    mhc.metaPrimaries.clear();
-                    mhc.metaGamma.clear();
-                    mhc.metaWhiteBalance.clear();
-                    mhc.metaPeakNits = 0.0f;
-                }
-                UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);
-                UpdateMhcFlagsLive(g_gui.currentMonitor);
-                SaveSettings();
+                act::Result r = act::MhcRemove(g_gui.currentMonitor, LOWORD(wParam) == ID_MHC_HDR_REMOVE);
+                if (!r.changed && !r.text.empty())
+                    MessageBox(hwnd, r.text.c_str(), L"Info", MB_OK | MB_ICONINFORMATION);
             }
             return 0;
 
@@ -2286,14 +1946,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_HDR_WB_ENABLE:
             {
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_WB_ENABLE);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 HWND hwndEn = isHDR ? g_gui.hwndHdrMhcWbEnable : g_gui.hwndMhcWbEnable;
-                mhc.whiteBalanceEnabled = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
-                UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);   // white-balance peak cost (SDR)
-                SaveSettings();
+                act::MhcSetWhiteBalanceEnabled(g_gui.currentMonitor, isHDR, SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
             }
             return 0;
 
@@ -2301,22 +1955,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_SDR_WB_WY:
         case ID_MHC_HDR_WB_WX:
         case ID_MHC_HDR_WB_WY:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_WB_WX || LOWORD(wParam) == ID_MHC_HDR_WB_WY);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
-                HWND hwndWx = isHDR ? g_gui.hwndHdrMhcWbWx : g_gui.hwndMhcWbWx;
-                HWND hwndWy = isHDR ? g_gui.hwndHdrMhcWbWy : g_gui.hwndMhcWbWy;
-                // A white point, not any chromaticity: the bounds hold every Planckian / daylight
-                // white with room (CCT -> infinity is x 0.240, 2000 K is x 0.527 y 0.413). An empty
-                // or absurd entry used to be installed at scanout at once (0.9/0.05 -> gains 56, -16, 2).
-                bool changed = CommitNumericEdit(hwndWx, 0.20f, 0.60f, mhc.whiteBalanceWx, 4);
-                changed = CommitNumericEdit(hwndWy, 0.20f, 0.50f, mhc.whiteBalanceWy, 4) || changed;
-                if (!changed) return 0;
-                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
-                UpdateMhcInfoDisplay(g_gui.currentMonitor, isHDR);   // white-balance peak cost (SDR)
-                SaveSettings();
+                const auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
+                                        : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
+                float wx = mhc.whiteBalanceWx, wy = mhc.whiteBalanceWy;
+                // A white point, not any chromaticity (bounds in act::MhcSetWhiteBalanceXY). An empty or absurd
+                // entry used to be installed at scanout at once (0.9/0.05 -> gains 56, -16, 2).
+                bool changed = CommitNumericEdit(isHDR ? g_gui.hwndHdrMhcWbWx : g_gui.hwndMhcWbWx, 0.20f, 0.60f, wx, 4);
+                changed = CommitNumericEdit(isHDR ? g_gui.hwndHdrMhcWbWy : g_gui.hwndMhcWbWy, 0.20f, 0.50f, wy, 4) || changed;
+                if (changed) act::MhcSetWhiteBalanceXY(g_gui.currentMonitor, isHDR, wx, wy);
             }
             return 0;
 
@@ -2324,23 +1972,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_MHC_HDR_GS_ENABLE:
             {
                 bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_GS_ENABLE);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 HWND hwndEn = isHDR ? g_gui.hwndHdrMhcGsEnable : g_gui.hwndMhcGsEnable;
-                bool gsChecked = (SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                // Lock: initLinear*/points are a std::vector read by the generation snapshot.
-                {
-                    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-                    mhc.correctionGrayscale.enabled = gsChecked;
-                    // Initialize points to identity on first enable if empty
-                    if (mhc.correctionGrayscale.enabled && mhc.correctionGrayscale.points.empty()) {
-                        if (isHDR) mhc.correctionGrayscale.initLinearPQ();
-                        else mhc.correctionGrayscale.initLinear();
-                    }
-                }
-                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
-                SaveSettings();
+                act::MhcSetCorrectionGsEnabled(g_gui.currentMonitor, isHDR, SendMessage(hwndEn, BM_GETCHECK, 0, 0) == BST_CHECKED);
             }
             return 0;
 
@@ -2353,22 +1986,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             {
                 int id = LOWORD(wParam);
                 bool isHDR = (id == ID_MHC_HDR_GS_10 || id == ID_MHC_HDR_GS_20 || id == ID_MHC_HDR_GS_32);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
                 int newCount = (id == ID_MHC_SDR_GS_10 || id == ID_MHC_HDR_GS_10) ? 10 :
                                (id == ID_MHC_SDR_GS_32 || id == ID_MHC_HDR_GS_32) ? 32 : 20;
-                if (newCount != mhc.correctionGrayscale.pointCount) {
-                    // Lock: pointCount + points (std::vector) are read by the generation snapshot.
-                    {
-                        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-                        mhc.correctionGrayscale.pointCount = newCount;
-                        if (isHDR) mhc.correctionGrayscale.initLinearPQ();
-                        else mhc.correctionGrayscale.initLinear();
-                    }
-                    RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
-                    SaveSettings();
-                }
+                act::MhcSetCorrectionGsPoints(g_gui.currentMonitor, isHDR, newCount);
             }
             return 0;
 
@@ -2495,147 +2115,53 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case ID_MHC_SDR_GS_RESET:
         case ID_MHC_HDR_GS_RESET:
-            {
-                bool isHDR = (LOWORD(wParam) == ID_MHC_HDR_GS_RESET);
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC
-                                  : g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
-                if (isHDR) mhc.correctionGrayscale.initLinearPQ();
-                else mhc.correctionGrayscale.initLinear();
-                RegenerateMhcFromGui(g_gui.currentMonitor, isHDR);
-                SaveSettings();
-            }
+            act::MhcResetCorrectionGs(g_gui.currentMonitor, LOWORD(wParam) == ID_MHC_HDR_GS_RESET);
             return 0;
 
         case ID_MHC_SDR_GS_24:
-            {
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].sdrMHC;
-                mhc.correctionGrayscale.use24Gamma = (SendMessage(g_gui.hwndMhcGs24, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                RegenerateMhcFromGui(g_gui.currentMonitor, false);
-                SaveSettings();
-            }
+            act::MhcSet24Gamma(g_gui.currentMonitor, SendMessage(g_gui.hwndMhcGs24, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_MHC_HDR_DG_ENABLE:
-            {
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC;
-                bool checked = (SendMessage(g_gui.hwndHdrMhcDgEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                mhc.desktopGammaEnabled = checked;
-                if (checked && !mhc.enabled) {
-                    // No MHC profile yet — auto-generate identity profile to carry DG
-                    GenerateAndInstallMhcProfile(g_gui.currentMonitor, true);
-                }
-                bool dgActive = checked && mhc.enabled;
-                g_userDesktopGammaMode.store(dgActive);
-                if (!g_gammaWhitelistActive.load()) {
-                    g_desktopGammaMode.store(dgActive);
-                }
-                // Swap to permutation with/without DG via on-demand cached profiles
-                if (!mhc.profileName.empty()) {
-                    uint8_t newPerm = mhc.activePerm;
-                    if (checked) newPerm |= MHCSettings::PERM_DG;
-                    else         newPerm &= ~MHCSettings::PERM_DG;
-                    SwapMhcToPermutation(g_gui.currentMonitor, true, newPerm);
-                }
-                SaveSettings();
-            }
+            act::MhcSetDesktopGamma(g_gui.currentMonitor, SendMessage(g_gui.hwndHdrMhcDgEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_MHC_HDR_GS_PEAK:
-            if (HIWORD(wParam) == EN_KILLFOCUS) {
-                if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) return 0;
-                auto& mhc = g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC;
-                if (CommitNumericEdit(g_gui.hwndHdrMhcGsPeak, 10.0f, 10000.0f, mhc.correctionGrayscale.peakNits, 0)) {
-                    RegenerateMhcFromGui(g_gui.currentMonitor, true);
-                    SaveSettings();
-                }
+            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
+                float v = g_gui.monitorSettings[g_gui.currentMonitor].hdrMHC.correctionGrayscale.peakNits;
+                if (CommitNumericEdit(g_gui.hwndHdrMhcGsPeak, 10.0f, 10000.0f, v, 0))
+                    act::MhcSetCorrectionGsPeak(g_gui.currentMonitor, v);
             }
             return 0;
 
-        // Settings tab controls - hotkeys register/unregister dynamically if running.
-        // Routing: g_hookOnlyHotkeys=true → GUI window (DWM hook mode, no overlay);
-        //          g_hookOnlyHotkeys=false → g_mainHwnd (render thread's overlay window).
+        // Settings tab controls - hotkeys register/unregister dynamically if running (act::SetHotkeyEnabled
+        // routes the registration to the window that owns them in the current mode).
         case ID_SETTINGS_HOTKEY_GAMMA_CHECK:
-            {
-                bool enable = (SendMessage(g_gui.hwndSettingsHotkeyGamma, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_hotkeyGammaEnabled.store(enable);
-                HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
-                if (target) PostMessage(target, WM_HOTKEY_REGISTER, HOTKEY_GAMMA, enable ? 1 : 0);
-                SaveSettings();
-            }
+            act::SetHotkeyEnabled(HOTKEY_GAMMA, SendMessage(g_gui.hwndSettingsHotkeyGamma, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_HOTKEY_HDR_CHECK:
-            {
-                bool enable = (SendMessage(g_gui.hwndSettingsHotkeyHdr, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_hotkeyHdrEnabled.store(enable);
-                HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
-                if (target) PostMessage(target, WM_HOTKEY_REGISTER, HOTKEY_HDR_TOGGLE, enable ? 1 : 0);
-                SaveSettings();
-            }
+            act::SetHotkeyEnabled(HOTKEY_HDR_TOGGLE, SendMessage(g_gui.hwndSettingsHotkeyHdr, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_HOTKEY_ANALYSIS_CHECK:
-            {
-                bool enable = (SendMessage(g_gui.hwndSettingsHotkeyAnalysis, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_hotkeyAnalysisEnabled.store(enable);
-                HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
-                if (target) PostMessage(target, WM_HOTKEY_REGISTER, HOTKEY_ANALYSIS, enable ? 1 : 0);
-                SaveSettings();
-            }
+            act::SetHotkeyEnabled(HOTKEY_ANALYSIS, SendMessage(g_gui.hwndSettingsHotkeyAnalysis, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_START_MINIMIZED:
-            g_startMinimized.store(SendMessage(g_gui.hwndSettingsStartMinimized, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            SaveSettings();
+            act::SetStartMinimized(SendMessage(g_gui.hwndSettingsStartMinimized, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_RUN_AT_STARTUP:
-            {
-                bool enable = (SendMessage(g_gui.hwndSettingsRunAtStartup, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                SetStartupEnabled(enable);
-            }
+            act::SetRunAtStartup(SendMessage(g_gui.hwndSettingsRunAtStartup, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_CONSOLE_LOG:
-            {
-                bool enable = (SendMessage(g_gui.hwndSettingsConsoleLog, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_consoleEnabled.store(enable);
-                if (enable) {
-                    if (GetConsoleWindow() == nullptr) {
-                        if (AllocConsole()) {
-                            FILE* fp;
-                            freopen_s(&fp, "CONOUT$", "w", stdout);
-                            freopen_s(&fp, "CONOUT$", "w", stderr);
-                            std::cout.clear();
-                            std::cerr.clear();
-                            std::cout << "Console enabled" << std::endl;
-                        }
-                    }
-                } else {
-                    HWND consoleWnd = GetConsoleWindow();
-                    if (consoleWnd != nullptr) {
-                        FreeConsole();
-                    }
-                }
-                SaveSettings();
-            }
+            act::SetConsoleLog(SendMessage(g_gui.hwndSettingsConsoleLog, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_DWM_HOOK:
-            {
-                bool enable = (SendMessage(g_gui.hwndSettingsDwmHook, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_dwmHookMode.store(enable);
-                SaveSettings();
-                UpdateColorCorrectionControls();   // FALD controls are overlay-only
-                // If processing is running, restart so the new mode takes effect immediately
-                if (g_gui.isRunning) {
-                    StopProcessing();
-                    StartProcessing();
-                }
-            }
+            act::SetDwmHookMode(SendMessage(g_gui.hwndSettingsDwmHook, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_CALIBRATION:
@@ -2655,8 +2181,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case ID_SETTINGS_VRR_WHITELIST_CHECK:
-            g_vrrWhitelistEnabled.store(SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            SaveSettings();
+            act::SetVrrWhitelistEnabled(SendMessage(g_gui.hwndSettingsVrrWhitelistCheck, BM_GETCHECK, 0, 0) == BST_CHECKED);
             return 0;
 
         case ID_SETTINGS_VRR_WHITELIST_BTN:
@@ -2677,8 +2202,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             StartProcessing();
             return 0;
         case ID_TRAY_STOP:
-            g_userStopped = true;
-            StopProcessing();
+            act::StopLiveLayers();
             return 0;
         case ID_TRAY_STARTUP:
             SetStartupEnabled(!IsStartupEnabled());
