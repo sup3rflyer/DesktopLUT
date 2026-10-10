@@ -8352,8 +8352,47 @@ class Calibration:
         self._restore_viewing_layers()       # completed / reverted / aborted (result returned)
         return result
 
+    def _patch_window_resume_check(self) -> None:
+        """A RESUMED run re-checks the presenter's patch window against the one its (memoised)
+        preflight recorded. The daemon can be restarted between invocations (its background timeout
+        makes that routine) at another ``--patch-size``, and the rest of the run would then read at
+        that window unnoticed — on an OLED, full-field ABL-dimmed reads. Mechanical no-op when nothing
+        was recorded, the window is unknown now, or it is unchanged; a change is a judgment, keyed by
+        the change itself so a later, different change asks again (never a replayed old answer)."""
+        if self.calib.get("flow") == "build-correction":
+            return
+        rec = self.calib.get("patch_window_size") or {}
+        if not rec.get("known") or rec.get("area_pct") is None:
+            return
+        rep = self.patch_window_report or {}
+        now = rep.get("area_pct")
+        if now is None or _same_window(now, rec["area_pct"]):
+            return
+        old, new = float(rec["area_pct"]), float(now)
+        key = f"preflight:patch-window-changed:{old:g}:{new:g}"
+        digest = {"recorded_area_pct": old, "recorded_patch_size_pct": rec.get("patch_size_pct"),
+                  "area_pct": new, "patch_size_pct": rep.get("patch_size_pct"), "source": rep.get("source"),
+                  "emissive": self.display.is_emissive, "profile_area_pct": rec.get("profile_area_pct"),
+                  "compromised": True}
+        self.ctx.log(f"patch window changed since preflight: {old:g} % -> {new:g} % of the screen area")
+        self._abort_if(self.adjudicate(AdjudicationRequest(
+            key=key, seam=SEAM_PATCH_WINDOW, stage="preflight",
+            question=(f"the presenter's patch window is now {new:g} % of the screen area "
+                      f"(--patch-size {rep.get('patch_size_pct')}), but this run's preflight recorded "
+                      f"{old:g} % (--patch-size {rec.get('patch_size_pct')}) — the dogegen daemon was "
+                      f"probably restarted with another --patch-size. abort = stop and restart the "
+                      f"daemon at the recorded window, then resume; proceed = keep measuring at the new "
+                      f"window (reads before and after it are then not like-for-like)."),
+            options=("proceed", "abort"), recommendation="abort", digest=digest)),
+            stage="preflight", message="aborted: the patch window changed since this run's preflight")
+        self.calib["patch_window_size"] = {**rec, "area_pct": new,
+                                           "patch_size_pct": rep.get("patch_size_pct"),
+                                           "changed_from_area_pct": old}
+        self._save()
+
     def _run_flow(self, flow: str) -> CalibrationResult:
         try:
+            self._patch_window_resume_check()
             if flow == "full":
                 return self._flow_full()
             if flow == "mhc-only":
@@ -12404,8 +12443,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
 
     def _pause_park(_ctrl: Mapping[str, Any]) -> None:
         # The display's idle-park policy: an LCD parks the same 50 % mid-grey neutral as always,
-        # an emissive panel parks black, quirks.idle_park=hold leaves the last patch up.
-        _park("pause")
+        # an emissive panel parks black, quirks.idle_park=hold leaves the last patch up. A failed park
+        # raises so the liveness supervisor puts a WARN note on the spine (the LLM's check-ins see it).
+        rec = _park("pause")
+        if rec and rec.get("error"):
+            raise RuntimeError(f"idle park ({rec.get('level')}) failed: {rec['error']}")
 
     result = None
     paused = False
@@ -12467,7 +12509,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             paused = True  # daemon must survive for the resuming invocation
             # The daemon's window outlives this process while the judge decides: never leave the
             # last (possibly peak-white) patch up — park per the display's idle policy first.
-            park = _park("seam")
+            # A spawned (non-daemon) dogegen window is closed at exit below — parking it would only
+            # open a fresh window to close it again; only the persistent daemon's window outlives us.
+            park = _park("seam") if hasattr(presenter, "shutdown_daemon") else None
             payload = {"status": "adjudication_required", "request": req.request.as_dict(),
                        "run": str(ctx.root)}
             if park is not None:
@@ -12488,9 +12532,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         and hasattr(presenter, "shutdown_daemon")):
                     presenter.shutdown_daemon()
                 else:
-                    if terminal and hasattr(presenter, "shutdown_daemon"):
-                        _park("exit (daemon kept)")   # the kept window idles until the next run
-                    presenter.close()
+                    presenter.close()   # a kept daemon is parked at the very end (below)
             except Exception:  # noqa: BLE001
                 pass
         # The interactive spotread is a child of THIS process — it can't outlive the CLI exit
@@ -12572,6 +12614,17 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         "hint": "restore manually: `dlc-calibrate --abort --run <dir>` once the "
                                 "pipe is back, or re-import the settings backup from the run dir",
                     }, indent=2))
+        # A kept daemon (terminal exit with --keep-dogegen-server) idles until the next run: park its
+        # window per the display's idle policy LAST — after the meter teardown and the rollback guard —
+        # so a slow/wedged daemon (up to the socket timeout) can never delay them, or skip them on a
+        # second Ctrl-C.
+        if (presenter is not None and not paused and args.keep_dogegen_server
+                and hasattr(presenter, "shutdown_daemon")):
+            try:
+                _park("exit (daemon kept)")
+                presenter.close()
+            except Exception:  # noqa: BLE001 - housekeeping only
+                pass
 
 
 if __name__ == "__main__":  # pragma: no cover

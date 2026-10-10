@@ -49,7 +49,12 @@ request, adjudicates ambiguous results on digests, and writes the report.
     `{SDR: n, HDR: n}`). The `preflight:patch-window` seam asks the LLM when the window differs from
     the profile's or the DIP's, when an OLED with no declared window would be measured full field
     (ABL), or when an OLED's window can't be read. Non-emissive panels with no declared window only
-    record it.
+    record it. Every resumed invocation re-checks the daemon's window against the recorded one: a change
+    (e.g. a daemon restarted at another `--patch-size`) is the seam
+    `preflight:patch-window-changed:<old>:<new>`.
+  - Review fixes: a spawned (non-daemon) window is not re-opened just to park it at a seam; a kept daemon
+    is parked after the meter teardown and the rollback guard; a failed pause park is a WARN note on the
+    spine again.
 - **Held-out verify, per-signal verify stats, and the scoring white stated** (2026-10-02). A review of
   the PA32UCXR SDR run found the verify headline partly in-sample: 309 reads but 141 unique signals, 77
   of them on a build training signal, and the 28 repeated sweep signals carried 63 % of the

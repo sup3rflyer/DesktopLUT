@@ -185,6 +185,7 @@ python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
 | `preflight:link-depth` | `--bit-depth` or the profile's depth differs from the live link | Usually relaunch run + daemon at the link depth. |
 | `preflight:correction` | The meter correction isn't this display + mode's own record (missing, stale, borrowed, raw) | Proceed only if the human confirms it fits this display. |
 | `preflight:patch-window` | The daemon's patch window differs from the profile / DIP, or an OLED is full-field | Fix the daemon window unless the human knowingly wants it. |
+| `preflight:patch-window-changed:<old>:<new>` | On a resume: the daemon's window differs from the one this run's preflight recorded (e.g. the daemon was restarted with another `--patch-size`) | `abort`, restart the daemon at the recorded window, resume. |
 | `preflight:spd` | The meter correction is older than its staleness limit (`proceed` / `refresh` / `abort`) | Refresh if a spectrometer is at hand; otherwise the human decides. |
 | `preflight:backup`, `preflight:pipe` | Settings backup / pipe health problems | Read the digest; don't proceed without a backup. |
 | `probe-match:build` | `build-correction`: the human runs the prepared `ccxxmake` command (`done` / `skip` / `abort`) | Answer `done` only after the `.ccmx` exists. |

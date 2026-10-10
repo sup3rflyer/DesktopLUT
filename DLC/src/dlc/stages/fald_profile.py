@@ -832,7 +832,9 @@ def _cell_pitch_gate(args, st: dict[str, Any], result: StageResult, width: int, 
         result.block("lattice_refused", f"{grid}: the panel file's lattice would be {cw}x{ch}-px cells = {lw}x{lh} px, "
                      f"larger than the {width}x{height} frame — DesktopLUT's loader REFUSES such a file (FaldLatticeFits), "
                      "so a ~40-min profiling run would end in a file that never loads. Check --zones against the panel's "
-                     "spec sheet and the monitor's resolution")
+                     "spec sheet and the monitor's resolution. If they are right, the cause is the exporter: it rounds the "
+                     "model canvas to whole-pixel cells (fald.profile.choose_scale), which cannot represent this grid on "
+                     "this resolution yet (fractional cell pitch is a known limitation)")
         return False
     (ux, uy), (dx, dy), (dcx, dcy) = lat["uncovered_px"], lat["max_drift_px"], lat["max_drift_cells"]
     question = (f"{grid}: the zone pitch is not one the model renders exactly — the panel file's lattice will be "

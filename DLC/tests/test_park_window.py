@@ -426,3 +426,83 @@ def test_kept_daemon_is_parked_at_a_terminal_exit_and_a_stopped_one_is_not(tmp_p
     rc, _o, stopped = _run_main(tmp_path / "b", monkeypatch, capsys, tech="WOLED", window=full,
                                 extra=abort)
     assert rc == 1 and stopped == [("shutdown",)]
+
+
+# ---------------------------------------------------------------------------
+# C. review fixes (2026-10-10): no park through a spawned window; a resume re-checks the window
+# ---------------------------------------------------------------------------
+
+class _FakeSpawnedPresenter:
+    """A spawned (non-daemon) dogegen window inside main(): it has no ``shutdown_daemon``."""
+
+    instances: list["_FakeSpawnedPresenter"] = []
+
+    def __init__(self, display, *, settle_seconds=0.5, place_rect=None):
+        self.events: list[tuple] = []
+        type(self).instances.append(self)
+
+    def query_window(self):
+        return {"patch_size_pct": 100, "area_pct": 100.0}
+
+    def show(self, patch):
+        self.events.append(("show", patch.label, patch.rgb))
+
+    def close(self):
+        self.events.append(("close",))
+
+
+def test_seam_exit_with_a_spawned_window_does_not_open_one_just_to_park_it(tmp_path, monkeypatch, capsys):
+    import dlc.link_format
+    import dlc.measure_loop
+    ctrl = CalibrationController.mock()
+    prof = _profile(tmp_path, "WOLED")
+    prof = dataclasses.replace(prof, paths={**prof.paths, "dogegen": str(tmp_path / "dogegen.exe")})
+    monkeypatch.setattr(cp, "load_profile", lambda *a, **k: prof)
+    monkeypatch.setattr(CalibrationController, "connect", classmethod(lambda cls, *a, **k: ctrl))
+    monkeypatch.setattr(dlc.measure_loop, "DogegenPresenter", _FakeSpawnedPresenter)   # main() imports it locally
+    monkeypatch.setattr(dlc.link_format, "probe_link_formats", lambda *a, **k: {})
+    monkeypatch.setattr(_FakeSpawnedPresenter, "instances", [])
+    rc = main(["--flow", "full", "--monitor", "0", "--mode", "SDR", "--legacy-meter",
+               "--run", str(tmp_path / "run")])
+    out = capsys.readouterr().out
+    assert rc == 10                                   # OLED full field → preflight:patch-window
+    events = _FakeSpawnedPresenter.instances[-1].events
+    assert not any(e[0] == "show" for e in events) and events[-1] == ("close",)
+    payload = json.loads(out[out.index('{\n  "status": "adjudication_required"'):])
+    assert "idle_park" not in payload
+
+
+def _recorded(tmp_path: Path, name: str, report: dict) -> None:
+    first = _calib(tmp_path, name, tech="WOLED", window=10, report=report)
+    first.stage_preflight()
+    first._save()
+
+
+def test_a_resume_rechecks_the_window_against_the_one_preflight_recorded(tmp_path: Path):
+    _recorded(tmp_path, "resume", TEN)
+    # The daemon was restarted at full field between invocations.
+    again = _calib(tmp_path, "resume", tech="WOLED", window=10, report=FULL)
+    with pytest.raises(AdjudicationRequired) as exc:
+        again._patch_window_resume_check()
+    req = exc.value.request
+    assert req.seam == SEAM_PATCH_WINDOW and req.key == "preflight:patch-window-changed:9.9225:100"
+    assert req.options == ("proceed", "abort") and req.recommendation == "abort"
+    assert req.digest["recorded_area_pct"] == 9.9225 and req.digest["area_pct"] == 100.0
+    # proceed → the record follows the new window; the same window on the next resume is a no-op
+    ok = _calib(tmp_path, "resume", tech="WOLED", window=10, report=FULL,
+                adjudicator=MappingAdjudicator({req.key: Decision("proceed")}))
+    ok._patch_window_resume_check()
+    assert ok.calib["patch_window_size"]["area_pct"] == 100.0
+    assert ok.calib["patch_window_size"]["changed_from_area_pct"] == 9.9225
+    later = _calib(tmp_path, "resume", tech="WOLED", window=10, report=FULL)
+    later._patch_window_resume_check()               # MappingAdjudicator({}) would raise on any seam
+
+
+@pytest.mark.parametrize("report", [TEN, UNKNOWN, None])
+def test_resume_check_is_mechanical_when_unchanged_or_unknown(tmp_path: Path, report):
+    _recorded(tmp_path, "same", TEN)
+    _calib(tmp_path, "same", tech="WOLED", window=10, report=report)._patch_window_resume_check()
+
+
+def test_resume_check_is_a_noop_before_preflight_recorded_anything(tmp_path: Path):
+    _calib(tmp_path, "fresh", tech="WOLED", window=10, report=FULL)._patch_window_resume_check()
