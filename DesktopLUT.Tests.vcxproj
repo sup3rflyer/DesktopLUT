@@ -114,6 +114,10 @@
     <ClCompile Include="src\actions\notify.cpp" />
     <ClCompile Include="src\actions\actions.cpp" />
     <ClCompile Include="src\actions\reconcile.cpp" />
+    <ClCompile Include="src\dlc\dlc_yaml.cpp" />
+    <ClCompile Include="src\dlc\dlc_data.cpp" />
+    <ClCompile Include="src\dlc\dlc_join.cpp" />
+    <ClCompile Include="src\dlc\dlc_scan.cpp" />
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_snapshot.cpp" />
     <ClCompile Include="src\ui\ui_present.cpp" />
@@ -157,6 +161,7 @@
     <ClCompile Include="tests\test_notify.cpp" />
     <ClCompile Include="tests\test_ui_model.cpp" />
     <ClCompile Include="tests\test_reconcile.cpp" />
+    <ClCompile Include="tests\test_dlc.cpp" />
     <ClCompile Include="dwm_hook\hook_lut.cpp">
       <!-- the DLL's own parser, compiled as the DLL builds it (test_lut_canonical.cpp round trip) -->
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>

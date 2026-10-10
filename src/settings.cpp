@@ -927,6 +927,7 @@ void SaveSettings() {
     // Interface
     WritePrivateProfileStringW(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
     WritePrivateProfileStringW(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
 
     WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
 
@@ -1012,6 +1013,8 @@ bool LoadSettings() {
         buf[0] = 0;
         GetPrivateProfileStringW(L"UI", L"DlcFolder", L"", buf, MAX_PATH, iniPath.c_str());
         g_dlcFolder = buf;
+        const int days = (int)GetPrivateProfileIntW(L"UI", L"RecalReminderDays", 90, iniPath.c_str());
+        g_recalReminderDays = days >= 0 && days <= 3650 ? days : 90;
     }
 
     // Per-display settings: read every saved display into the parked pool, then attach

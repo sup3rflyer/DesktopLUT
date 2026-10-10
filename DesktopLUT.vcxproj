@@ -117,6 +117,10 @@
     <ClCompile Include="src\actions\notify.cpp" />
     <ClCompile Include="src\actions\actions.cpp" />
     <ClCompile Include="src\actions\reconcile.cpp" />
+    <ClCompile Include="src\dlc\dlc_yaml.cpp" />
+    <ClCompile Include="src\dlc\dlc_data.cpp" />
+    <ClCompile Include="src\dlc\dlc_join.cpp" />
+    <ClCompile Include="src\dlc\dlc_scan.cpp" />
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_snapshot.cpp" />
     <ClCompile Include="src\ui\ui_present.cpp" />

@@ -5,6 +5,7 @@
 #include "actions/actions.h"
 #include "actions/notify.h"
 #include "actions/reconcile.h"
+#include "dlc/dlc_scan.h"
 #include "gui_whitelist.h"
 #include "ui_notices.h"
 #include "version.h"
@@ -12,6 +13,8 @@
 #include "gui.h"
 #include <cctype>
 #include <cfloat>
+#include <cmath>
+#include <shobjidl.h>
 #include <cstdio>
 #include <mutex>
 #include <vector>
@@ -371,6 +374,11 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
             char res[32];
             snprintf(res, sizeof(res), "%d\xC3\x97%d", r.widthPx, r.heightPx);
             TextAt(Font::Mono, kSizeMono, dim, x + Px(4), cy, res);
+        }
+        if (r.reminderDue) {   // right-aligned under the mode badge: nothing else moves
+            const char* due = "RECAL";
+            const float dueW = MeasureText(Font::Label, kSizeLabel, due).x;
+            TextAt(Font::Label, kSizeLabel, selected ? pal::Ground : pal::Alarm, p.x + w - pad - dueW, cy, due);
         }
     }
     ImGui::PopID();
@@ -743,12 +751,150 @@ void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage* st, b
     }
 }
 
-void DrawMeasured() {
-    SectionHeader("MEASURED", nullptr);
-    RowCtx row = BeginRow("", kRowH);
-    row.x = row.x0;
-    RowText(row, "no calibration data", pal::InkFaint);
-    EndRow(row);
+// ---------------------------------------------------------------------------------------------
+// Measured column: what DLC recorded and measured for the selected display and the mode shown.
+
+constexpr float kMeasuredLabelW = 84.0f;
+
+// A compact row of the measured column: label, value (ellipsized), optional tooltip on the row.
+void MeasuredRow(const char* label, const std::string& value, ImU32 col = pal::Ink, Font f = Font::Mono,
+                 const char* tip = nullptr) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x, h = Px(24), cy = p.y + h * 0.5f;
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, p.x, cy, label);
+    const float x = p.x + Px(kMeasuredLabelW);
+    const float size = f == Font::Mono ? kSizeMono : kSizeLabel;
+    const std::string shown = Ellipsize(f, size, value, p.x + w - x);
+    TextAt(f, size, col, x, cy, shown.c_str());
+    if (tip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + h))) ImGui::SetTooltip("%s", tip);
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+    ImGui::Dummy(ImVec2(0, 0));
+}
+
+std::string Num2(double v) { return std::isfinite(v) ? Fmt("%.2f", v) : std::string("\xE2\x80\x94"); }
+
+std::string DateAge(const std::string& date, int days) {
+    if (date.empty()) return "\xE2\x80\x94";
+    std::string s = date.substr(0, 10);
+    if (days >= 0) s += "  \xC2\xB7  " + std::to_string(days) + " D";
+    return s;
+}
+
+const char* LayerText(dlc::LayerState s) {
+    switch (s) {
+    case dlc::LayerState::Matches: return "AS APPLIED";
+    case dlc::LayerState::Differs: return "CHANGED";
+    case dlc::LayerState::Unrecorded: return "NOT FROM DLC";
+    default: return "OFF";
+    }
+}
+
+ImU32 LayerColour(dlc::LayerState s) {
+    if (s == dlc::LayerState::Matches) return pal::Ink;
+    if (s == dlc::LayerState::Differs) return pal::Alarm;
+    return pal::InkFaint;
+}
+
+// Distribution of the per-patch error: six bins, bars scaled to the fullest.
+void PatchHistogram(const std::vector<dlc::Patch>& patches) {
+    static const double kEdges[] = { 0.5, 1.0, 2.0, 3.0, 5.0 };
+    static const char* const kLabels[] = { "<.5", "<1", "<2", "<3", "<5", "5+" };
+    int bins[6] = {};
+    int n = 0;
+    for (const dlc::Patch& p : patches) {
+        if (!std::isfinite(p.de)) continue;
+        int b = 5;
+        for (int k = 0; k < 5; k++) if (p.de < kEdges[k]) { b = k; break; }
+        bins[b]++;
+        n++;
+    }
+    if (n == 0) return;
+    int top = 1;
+    for (int b : bins) top = b > top ? b : top;
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float w = ImGui::GetContentRegionAvail().x, barH = Px(56), labelH = Px(16);
+    const float gap = Px(4), bw = (w - gap * 5) / 6;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    for (int k = 0; k < 6; k++) {
+        const float x = p.x + k * (bw + gap);
+        const float h = barH * (float)bins[k] / (float)top;
+        dl->AddRectFilled(ImVec2(x, p.y + barH - (h > 0 ? (h < Px(1) ? Px(1) : h) : 0)), ImVec2(x + bw, p.y + barH),
+                          k >= 4 ? pal::Alarm : pal::InkDim);
+        const ImVec2 ts = MeasureText(Font::Mono, 11.0f, kLabels[k]);
+        dl->AddText(GetFont(Font::Mono), 11.0f * Dpi(), ImVec2(x + (bw - ts.x) * 0.5f, p.y + barH + Px(3)), pal::InkFaint, kLabels[k]);
+        if (ImGui::IsMouseHoveringRect(ImVec2(x, p.y), ImVec2(x + bw, p.y + barH + labelH)))
+            ImGui::SetTooltip("%d of %d patches", bins[k], n);
+    }
+    dl->AddLine(ImVec2(p.x, p.y + barH), ImVec2(p.x + w, p.y + barH), pal::Rule);
+    ImGui::Dummy(ImVec2(w, barH + labelH + Px(4)));
+}
+
+void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs) {
+    const dlc::Data& d = *snap.dlc;
+    const int mi = showHdr ? 1 : 0;
+    const dlc::ModeRecord& rec = r.dlcRecord[mi];
+    const int shown = rec.current >= 0 ? rec.current : rec.latest;
+    Light light = Light::Off;
+    if (rec.current >= 0) light = rec.reminderDue ? Light::Fault : Light::Configured;
+    else if (shown >= 0) light = Light::Fault;
+    SectionHeader("MEASURED", &light);
+
+    if (d.folder.empty()) {
+        MeasuredRow("DLC", "NO FOLDER", pal::InkFaint, Font::Label, "No DLC folder set or found. Settings > Calibration.");
+        ImGui::Dummy(ImVec2(0, Px(6)));
+        if (Button("##meas_settings", "SETTINGS", kButtonW)) vs.page = Page::Settings;
+        return;
+    }
+    if (r.dlcMatch.name.empty()) {
+        MeasuredRow("DLC", r.dlcMatch.ambiguous ? "AMBIGUOUS" : "NOT MATCHED", pal::InkFaint, Font::Label,
+                    r.dlcMatch.ambiguous ? "More than one DLC display fits this one."
+                                         : "No DLC display has this hardware id or runs what it runs.");
+        return;
+    }
+    const char* by = r.dlcMatch.by == dlc::MatchBy::HardwareId ? "Matched by hardware id."
+                     : r.dlcMatch.by == dlc::MatchBy::StackEvidence ? "Matched by the files DLC applied."
+                                                                    : "Matched by a verification's hardware id.";
+    MeasuredRow("DLC", r.dlcMatch.name, pal::InkDim, Font::Label, by);
+    if (rec.reminderDue) {
+        std::string why = rec.correctionStale ? "Meter correction older than the profile allows." : "";
+        if (g_recalReminderDays > 0 && rec.verifiedDaysAgo > g_recalReminderDays)
+            why = "Last verified " + std::to_string(rec.verifiedDaysAgo) + " days ago." + (why.empty() ? "" : "\n" + why);
+        MeasuredRow("DUE", "RECALIBRATE", pal::Alarm, Font::Label, why.c_str());
+    }
+    MeasuredRow("MHC", LayerText(rec.mhc), LayerColour(rec.mhc), Font::Label);
+    MeasuredRow("3D LUT", LayerText(rec.cube), LayerColour(rec.cube), Font::Label);
+    ImGui::Dummy(ImVec2(0, Px(8)));
+
+    if (shown < 0) {
+        MeasuredRow("VERIFIED", "NO REPORT", pal::InkFaint, Font::Label);
+    } else {
+        const dlc::Report& rep = d.reports[shown];
+        const bool current = rec.current >= 0;
+        const ImU32 val = current ? pal::Ink : pal::InkFaint;
+        const int age = dlc::DaysBetween(rep.date, d.today);
+        MeasuredRow(current ? "VERIFIED" : "LATEST", DateAge(rep.date, age), current ? pal::Ink : pal::Alarm, Font::Mono,
+                    current ? nullptr : "Not a verification of what runs now: the newest report for this display and mode.");
+        std::string flow = rep.flow;
+        if (!rep.contentMode.empty() && rep.contentMode != rep.mode) flow += "  \xC2\xB7  " + rep.contentMode + " content";
+        MeasuredRow("RUN", flow, pal::InkDim, Font::Mono);
+        const dlc::Verification& v = rep.verification;
+        MeasuredRow("METRIC", dlc::MetricLabel(v.metric), pal::InkDim, Font::Mono);
+        MeasuredRow("AVG", Num2(v.avg), val);
+        MeasuredRow("P95", Num2(v.p95), val);
+        MeasuredRow("MAX", Num2(v.max), val);
+        MeasuredRow("WHITE", Num2(v.white), val);
+        MeasuredRow("GRAY", Num2(v.grayAvg), val);
+        if (v.patchCount > 0) MeasuredRow("PATCHES", std::to_string(v.patchCount), pal::InkDim);
+        ImGui::Dummy(ImVec2(0, Px(8)));
+        if (!rep.runDir.empty()) {
+            const auto patches = dlc::Patches(rep.runDir);
+            if (!patches) MeasuredRow("", "LOADING", pal::InkFaint, Font::Label);
+            else if (!patches->empty()) PatchHistogram(*patches);
+        }
+    }
+    if (!rec.correctionMade.empty())
+        MeasuredRow("METER", DateAge(rec.correctionMade, rec.correctionDaysAgo), rec.correctionStale ? pal::Alarm : pal::InkDim,
+                    Font::Mono, rec.correctionStale ? "Meter correction older than the profile's max_age_days." : nullptr);
 }
 
 void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
@@ -817,7 +963,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     ImGui::EndChild();
     ImGui::SameLine(0, Px(kGutter));
     ImGui::BeginChild("##measured", ImVec2(0, colH), ImGuiChildFlags_None);
-    DrawMeasured();
+    DrawMeasured(snap, *sel, showHdr, vs);
     ImGui::EndChild();
     ImGui::EndChild();
 }
@@ -930,13 +1076,81 @@ void SettingsHotkeys() {
     }
 }
 
-void SettingsCalibration() {
+// Folder picker (Shell dialog). Runs inside a posted command: the dialog pumps messages.
+bool PickFolder(HWND owner, std::wstring& path) {
+    IFileOpenDialog* dlg = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return false;
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    if (!path.empty()) {
+        IShellItem* start = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&start)))) {
+            dlg->SetFolder(start);
+            start->Release();
+        }
+    }
+    bool ok = false;
+    if (SUCCEEDED(dlg->Show(owner))) {
+        IShellItem* item = nullptr;
+        if (SUCCEEDED(dlg->GetResult(&item))) {
+            PWSTR p = nullptr;
+            if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &p))) {
+                path = p;
+                CoTaskMemFree(p);
+                ok = true;
+            }
+            item->Release();
+        }
+    }
+    dlg->Release();
+    return ok;
+}
+
+void SettingsCalibration(const Snapshot& snap) {
     SectionHeader("CALIBRATION", nullptr);
     RowCtx row = BeginRow("DLC CONTROL");
     RowTip(row, "Lets DLC drive DesktopLUT over a local pipe while it calibrates.");
     RowPlace(row);
     bool v = false;
     if (OnOff("##set_calib", g_calibrationControlEnabled.load(), &v)) Post([v]() { ApplyCalibrationControl(v); });
+    EndRow(row);
+
+    row = BeginRow("DLC FOLDER");
+    RowTip(row, "Where DLC keeps its profile, runs and results.\nEmpty: found next to DesktopLUT when it is there.");
+    const int b = RowButtons(row, "set_dlc", { "BROWSE", "CLEAR" });
+    if (b == 0) {
+        Post([]() {
+            std::wstring path = DlcFolder();
+            if (!PickFolder(Window(), path)) return;
+            act::SetDlcFolder(path);
+            RequestDlcScan();
+        });
+    } else if (b == 1) {
+        Post([]() {
+            act::SetDlcFolder(L"");
+            RequestDlcScan();
+        });
+    }
+    const std::wstring& folder = snap.dlc->folder;
+    std::string shown = folder.empty() ? std::string("\xE2\x80\x94") : Utf8(folder);
+    if (g_dlcFolder.empty() && !folder.empty()) shown = "AUTO  " + shown;
+    RowText(row, shown, folder.empty() ? pal::InkFaint : pal::Ink, Font::Mono, kSizeMono, folder);
+    EndRow(row);
+
+    row = BeginRow("REMINDER");
+    RowTip(row, "Mark a display for recalibration when its last verification is older than this.\n"
+                "A stale meter correction marks it too.");
+    RowPlace(row);
+    static const char* const kDays[] = { "OFF", "30 D", "90 D", "180 D" };
+    static const int kDayValues[] = { 0, 30, 90, 180 };
+    int cur = -1;
+    for (int k = 0; k < 4; k++) if (g_recalReminderDays == kDayValues[k]) cur = k;
+    const int pick = Segmented("##set_remind", kDays, 4, cur, 56);
+    if (pick >= 0) {
+        const int days = kDayValues[pick];
+        Post([days]() { act::SetRecalReminderDays(days); });
+    }
     EndRow(row);
 }
 
@@ -993,7 +1207,7 @@ void DrawSettingsPage(const Snapshot& snap, ViewState& vs) {
         SettingsSpacer();
         SettingsHotkeys();
         ImGui::TableSetColumnIndex(2);
-        SettingsCalibration();
+        SettingsCalibration(snap);
         SettingsSpacer();
         SettingsDiagnostics();
         SettingsSpacer();

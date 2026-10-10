@@ -5,6 +5,7 @@
 #include "dwm_inject.h"
 #include "actions/notify.h"
 #include "actions/reconcile.h"
+#include "dlc/dlc_scan.h"
 #include "desktoplut_ipc_server.h"
 #include <dxgi1_6.h>
 #include <mutex>
@@ -97,6 +98,30 @@ void TakeSnapshot(Snapshot& out) {
             r.heightPx = mi.rcMonitor.bottom - mi.rcMonitor.top;
         }
     }
+
+    // DLC records for every display, live and remembered.
+    out.dlc = dlc::Current();
+    auto attach = [&](DisplayRow& r) {
+        const MonitorSettings& ms = r.settings;
+        dlc::LiveDisplay& live = r.dlcLive;
+        live = dlc::LiveDisplay();
+        live.hardwareId = dlc::HardwareIdOf(ms.identity.edidId, ms.identity.devicePath);
+        live.monitor = r.liveIndex;
+        const MHCSettings* mhc[2] = { &ms.sdrMHC, &ms.hdrMHC };
+        for (int k = 0; k < 2; k++)
+            if (mhc[k]->enabled && !mhc[k]->profileName.empty()) live.mhcSource[k] = mhc[k]->sourceFilePath;
+        live.lut[0] = ms.sdrPath;
+        live.lut[1] = ms.hdrPath;
+        r.dlcMatch = out.dlc->folder.empty() ? dlc::DisplayMatch() : dlc::MatchDisplay(*out.dlc, live);
+        r.reminderDue = false;
+        for (int k = 0; k < 2; k++) {
+            r.dlcRecord[k] = r.dlcMatch.name.empty() ? dlc::ModeRecord()
+                                                     : dlc::RecordFor(*out.dlc, r.dlcMatch.name, k, live, g_recalReminderDays);
+        }
+        if (!r.dlcMatch.name.empty()) r.reminderDue = r.dlcRecord[PipelineIsHdr(r.mode) ? 1 : 0].reminderDue;
+    };
+    for (DisplayRow& r : out.live) attach(r);
+    for (DisplayRow& r : out.parked) attach(r);
 
     out.running = g_gui.isRunning.load();
     out.suspended = act::LiveLayersSuspended();

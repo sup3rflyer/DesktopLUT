@@ -5,6 +5,7 @@
 // hidden its device, ImGui context and fonts are released.
 
 #include <functional>
+#include <string>
 
 struct HWND__;
 typedef HWND__* HWND;
@@ -25,5 +26,7 @@ bool IsVisible();               // GUI thread.
 void Shutdown();                // GUI thread: hub teardown, before anything pumps.
 void Invalidate();              // Any thread: request one redraw (coalesced).
 void NotifyDisplayChanged();    // GUI thread: displays or colour modes changed; refresh if visible.
+std::wstring DlcFolder();       // GUI thread: the DLC folder in use (configured, else detected); "" none
+void RequestDlcScan();          // GUI thread: re-read the DLC folder (off-thread; redraws when done)
 
 }  // namespace ui

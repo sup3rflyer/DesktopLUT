@@ -141,7 +141,8 @@ extern std::atomic<char> g_hotkeyHdrKey;          // Key for HDR toggle (default
 extern std::atomic<char> g_hotkeyAnalysisKey;     // Key for analysis toggle (default 'X')
 extern std::atomic<bool> g_startMinimized;        // Start minimized to tray
 extern bool g_uiClassic;                          // [UI] Interface=classic: the classic window instead of the new one (GUI thread)
-extern std::wstring g_dlcFolder;                  // [UI] DlcFolder: where DLC keeps its runs; empty = none (GUI thread)
+extern std::wstring g_dlcFolder;                  // [UI] DlcFolder: where DLC keeps its runs; empty = auto-detect (GUI thread)
+extern int g_recalReminderDays;                   // [UI] RecalReminderDays: remind when the verification is older; 0 = off (GUI thread)
 
 // ============================================================================
 // Gamma Whitelist (auto-disable gamma when whitelisted apps are running)

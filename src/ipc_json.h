@@ -7,6 +7,10 @@
 // a stack overflow is not a C++ exception, so it would take the whole 24/7 process down)
 // and in value count, and it rejects trailing characters, malformed numbers and numbers
 // outside the double range.
+//
+// JsonOptions::Files relaxes this for local files written by Python (DLC's stores and reports): its
+// json.dump writes the bare tokens NaN / Infinity / -Infinity, which read as null here, a UTF-8 BOM is
+// skipped, and the value cap is higher. The pipe keeps the strict defaults.
 
 #pragma once
 
@@ -22,6 +26,20 @@ namespace ipc_json {
 
 constexpr int    kMaxDepth  = 64;        // arrays/objects nested inside each other
 constexpr size_t kMaxValues = 200000;    // every value parsed (requests are capped at 256 KiB)
+
+struct JsonOptions {
+    bool allowNonFinite = false;   // NaN / Infinity / -Infinity (and numbers out of double range) -> null
+    bool skipBom = false;          // a leading UTF-8 byte order mark
+    size_t maxValues = kMaxValues;
+
+    static JsonOptions Files() {
+        JsonOptions o;
+        o.allowNonFinite = true;
+        o.skipBom = true;
+        o.maxValues = 20000000;
+        return o;
+    }
+};
 
 struct JsonValue {
     enum Type { Null, Bool, Num, Str, Arr, Obj } type = Null;
@@ -82,7 +100,8 @@ struct JsonParser {
     size_t i = 0;
     int depth = 0;
     size_t values = 0;
-    explicit JsonParser(const std::string& str) : s(str) {}
+    JsonOptions opt;
+    explicit JsonParser(const std::string& str, JsonOptions o = JsonOptions()) : s(str), opt(o) {}
 
     [[noreturn]] void err(const char* m) { throw std::runtime_error(m); }
     void ws() {
@@ -90,6 +109,9 @@ struct JsonParser {
     }
     // One complete value; anything but whitespace after it is an error.
     JsonValue parse() {
+        if (opt.skipBom && s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB &&
+            (unsigned char)s[2] == 0xBF)
+            i = 3;
         ws();
         JsonValue v = value();
         ws();
@@ -100,7 +122,7 @@ struct JsonParser {
     JsonValue value() {
         ws();
         if (i >= s.size()) err("unexpected end of input");
-        if (++values > kMaxValues) err("too many values");
+        if (++values > opt.maxValues) err("too many values");
         char c = s[i];
         if (c == '{') return object();
         if (c == '[') return array();
@@ -108,6 +130,8 @@ struct JsonParser {
         if (c == 't') { literal("true"); return JBool(true); }
         if (c == 'f') { literal("false"); return JBool(false); }
         if (c == 'n') { literal("null"); return JsonValue(); }
+        if (opt.allowNonFinite && c == 'N') { literal("NaN"); return JsonValue(); }
+        if (opt.allowNonFinite && c == 'I') { literal("Infinity"); return JsonValue(); }
         return number();
     }
     void literal(const char* lit) {
@@ -169,6 +193,11 @@ struct JsonParser {
     }
     JsonValue number() {
         size_t start = i;
+        if (opt.allowNonFinite && i + 1 < s.size() && s[i] == '-' && s[i + 1] == 'I') {
+            i++;
+            literal("Infinity");
+            return JsonValue();
+        }
         if (i < s.size() && s[i] == '-') i++;
         while (i < s.size() &&
                ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-'))
@@ -180,7 +209,10 @@ struct JsonParser {
         char* end = nullptr;
         double d = std::strtod(tok.c_str(), &end);
         if (end != tok.c_str() + tok.size()) err("invalid number");
-        if (!std::isfinite(d)) err("number out of range");
+        if (!std::isfinite(d)) {
+            if (opt.allowNonFinite) return JsonValue();
+            err("number out of range");
+        }
         return JNum(d);
     }
     JsonValue array() {

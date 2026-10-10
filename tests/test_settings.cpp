@@ -950,6 +950,15 @@ TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, roun
     LoadSettings();
     CHECK(g_uiClassic == false);                        // absent -> the new interface
     CHECK(g_dlcFolder.empty());
+    CHECK(g_recalReminderDays == 90);                   // absent -> 90 days
+    g_recalReminderDays = 0;                            // off survives a round trip
+    SaveSettings();
+    g_recalReminderDays = 7;
+    LoadSettings();
+    CHECK(g_recalReminderDays == 0);
+    WritePrivateProfileStringW(L"UI", L"RecalReminderDays", L"-5", ini);
+    LoadSettings();
+    CHECK(g_recalReminderDays == 90);                   // nonsense -> the default
     g_uiClassic = true;
     g_dlcFolder = L"D:\\Calibration\\DLC";
     SaveSettings();

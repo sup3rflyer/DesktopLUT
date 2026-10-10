@@ -586,6 +586,16 @@ void SetConsoleLog(bool on) {
     SaveSettings();
 }
 
+void SetDlcFolder(const std::wstring& folder) {
+    g_dlcFolder = folder;
+    SaveSettings();
+}
+
+void SetRecalReminderDays(int days) {
+    g_recalReminderDays = days < 0 ? 0 : (days > 3650 ? 3650 : days);
+    SaveSettings();
+}
+
 void SetVrrWhitelistEnabled(bool on) {
     g_vrrWhitelistEnabled.store(on);
     SaveSettings();

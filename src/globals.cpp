@@ -120,6 +120,7 @@ std::atomic<char> g_hotkeyAnalysisKey{ 'X' };      // Key for analysis toggle
 std::atomic<bool> g_startMinimized{ false };       // Start minimized to tray
 bool g_uiClassic = false;                          // [UI] Interface (GUI thread)
 std::wstring g_dlcFolder;                          // [UI] DlcFolder (GUI thread)
+int g_recalReminderDays = 90;                      // [UI] RecalReminderDays (GUI thread)
 
 // ============================================================================
 // Gamma Whitelist

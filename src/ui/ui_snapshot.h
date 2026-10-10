@@ -4,7 +4,9 @@
 // display change or the pipe may rebuild it between frames). GUI thread only.
 
 #include "ui_model.h"
+#include "dlc/dlc_join.h"
 #include <windows.h>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -18,6 +20,11 @@ struct DisplayRow {
     Mode mode = Mode::Unknown;   // from the mode cache
     bool primary = false;
     int widthPx = 0, heightPx = 0;
+    // DLC records (empty match when there is no DLC folder or nothing names this display).
+    dlc::LiveDisplay dlcLive;
+    dlc::DisplayMatch dlcMatch;
+    dlc::ModeRecord dlcRecord[2];   // 0 SDR, 1 HDR
+    bool reminderDue = false;       // for the mode the display is in
 };
 
 struct Snapshot {
@@ -26,6 +33,7 @@ struct Snapshot {
     bool running = false;
     bool suspended = false;   // the user's Suspend (act::LiveLayersSuspended)
     bool calibrating = false; // a DLC calibration session or live edit is open (IsCalibrationOrLiveEditActive)
+    std::shared_ptr<const dlc::Data> dlc;   // the latest DLC scan (never null)
     bool hookMode = false;
     bool hookActive = false;
     std::wstring lastStatus;

@@ -72,6 +72,8 @@ void SetStartMinimized(bool on);
 void SetRunAtStartup(bool on);
 void SetConsoleLog(bool on);
 void SetVrrWhitelistEnabled(bool on);
+void SetDlcFolder(const std::wstring& folder);   // empty = detect next to DesktopLUT
+void SetRecalReminderDays(int days);             // 0 = off
 
 // ---- Live layers -----------------------------------------------------------------------------------
 // The classic Start / Apply: resume (act::SetLiveLayersSuspended) and restart, which re-reads the cube

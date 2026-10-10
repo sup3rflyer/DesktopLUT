@@ -9,6 +9,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "actions/notify.h"
+#include "dlc/dlc_scan.h"
 #include "globals.h"
 #include "../resource.h"
 #include <windows.h>
@@ -30,7 +31,8 @@ constexpr UINT WM_UI_INVALIDATE = WM_APP + 1;
 constexpr UINT_PTR kSettleTimer = 1;    // a few frames after input so ImGui's layout settles
 constexpr UINT_PTR kAnimTimer = 2;      // while an item is active (caret blink, drags)
 constexpr UINT_PTR kReleaseTimer = 3;   // release the device after being hidden this long
-constexpr UINT kSettleMs = 16, kAnimMs = 33, kReleaseMs = 30000;
+constexpr UINT_PTR kDlcTimer = 4;       // re-read the DLC folder while visible
+constexpr UINT kSettleMs = 16, kAnimMs = 33, kReleaseMs = 30000, kDlcMs = 60000;
 constexpr int kSettleFrames = 3;
 constexpr float kDefaultW = 1180.0f, kDefaultH = 760.0f, kMinW = 820.0f, kMinH = 520.0f;
 
@@ -210,6 +212,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (wParam == kReleaseTimer) {
             KillTimer(hwnd, kReleaseTimer);
             if (!IsWindowVisible(hwnd)) ReleaseImGui();
+        } else if (wParam == kDlcTimer) {
+            if (IsWindowVisible(hwnd)) RequestDlcScan();
+            else KillTimer(hwnd, kDlcTimer);
         }
         return 0;
     case WM_CLOSE:
@@ -219,6 +224,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kSettleTimer);
         KillTimer(hwnd, kAnimTimer);
         KillTimer(hwnd, kReleaseTimer);
+        KillTimer(hwnd, kDlcTimer);
         g_animTimer = false;
         ReleaseImGui();
         g_hwndForPost.store(nullptr);
@@ -268,6 +274,7 @@ bool CreateUiWindow() {
                  w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     g_hwndForPost.store(g_hwnd);
     notify::SetListener(&Invalidate);
+    dlc::SetScanListener(&Invalidate);   // a scan or a patch load finished on the worker
     return true;
 }
 
@@ -298,6 +305,8 @@ bool Show() {
     if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);
     else ShowWindow(g_hwnd, SW_SHOW);
     SetForegroundWindow(g_hwnd);
+    RequestDlcScan();
+    SetTimer(g_hwnd, kDlcTimer, kDlcMs, nullptr);
     Kick();
     return true;
 }
@@ -305,6 +314,7 @@ bool Show() {
 void Hide() {
     if (!g_hwnd) return;
     ShowWindow(g_hwnd, SW_HIDE);
+    KillTimer(g_hwnd, kDlcTimer);
     SetTimer(g_hwnd, kReleaseTimer, kReleaseMs, nullptr);
 }
 
@@ -313,6 +323,7 @@ bool IsVisible() { return g_hwnd && IsWindowVisible(g_hwnd); }
 void Shutdown() {
     g_commands.clear();   // nothing posted runs during the teardown
     notify::SetListener(nullptr);
+    dlc::StopScanner();   // joins the worker (a scan in flight finishes first)
     if (g_hwnd) DestroyWindow(g_hwnd);
 }
 
@@ -323,6 +334,17 @@ void Invalidate() {
         if (!PostMessageW(h, WM_UI_INVALIDATE, 0, 0)) g_invalidatePending.store(false);
     }
 }
+
+std::wstring DlcFolder() {
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir(exe, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    dir = slash == std::wstring::npos ? std::wstring() : dir.substr(0, slash);
+    return dlc::ResolveFolder(g_dlcFolder, dir);
+}
+
+void RequestDlcScan() { dlc::RequestScan(DlcFolder()); }
 
 void NotifyDisplayChanged() {
     if (!IsVisible()) return;
