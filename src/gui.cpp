@@ -17,6 +17,7 @@
 #include "analysis.h"
 #include "desktoplut_ipc_server.h"
 #include "monitor_identity.h"
+#include "actions/notify.h"
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
@@ -223,9 +224,26 @@ void UpdateGUIState() {
         g_nonAnalysisCorrectionsActive.store(EvalNonAnalysisShaderCorrections(), std::memory_order_relaxed);
 }
 
+// Latest status text. SetStatus runs on the render and processing threads as well as the GUI thread;
+// a cross-thread SetWindowText is an implicit SendMessage into the GUI thread (a stall while it
+// pumps), so other threads leave the text here and post WM_STATUS_TEXT. The GUI thread writes it
+// too, so a post still queued from another thread can never put back an older text.
+static std::mutex g_statusTextMutex;
+static std::wstring g_statusText;
+
 void SetStatus(const wchar_t* text) {
-    if (g_gui.hwndStatus) {
-        SetWindowText(g_gui.hwndStatus, text);
+    if (!text) return;
+    notify::Post(notify::Sev::Info, -1, L"status", text);
+    {
+        std::lock_guard<std::mutex> lock(g_statusTextMutex);
+        g_statusText = text;
+    }
+    HWND status = g_gui.hwndStatus;
+    if (!status) return;
+    if (GetWindowThreadProcessId(status, nullptr) == GetCurrentThreadId()) {
+        SetWindowText(status, text);
+    } else if (g_gui.hwndMain) {
+        PostMessage(g_gui.hwndMain, WM_STATUS_TEXT, 0, 0);
     }
 }
 
@@ -2890,6 +2908,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowOSD(text);
             free(text);
         }
+        return 0;
+    }
+
+    case WM_STATUS_TEXT: {
+        std::wstring text;
+        {
+            std::lock_guard<std::mutex> lock(g_statusTextMutex);
+            text = g_statusText;
+        }
+        if (g_gui.hwndStatus) SetWindowText(g_gui.hwndStatus, text.c_str());
         return 0;
     }
 

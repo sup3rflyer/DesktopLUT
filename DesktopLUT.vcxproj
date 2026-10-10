@@ -114,6 +114,7 @@
     <ClCompile Include="shared\fald_temporal.cpp" />
     <ClCompile Include="src\fald.cpp" />
     <ClCompile Include="src\ui\ui_theme.cpp" />
+    <ClCompile Include="src\actions\notify.cpp" />
   </ItemGroup>
   <!-- Dear ImGui v1.92.9b (third_party/imgui, MIT). Vendored as-is: no SDL checks, CRT deprecation silenced. -->
   <ItemGroup>
