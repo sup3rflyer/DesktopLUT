@@ -113,28 +113,18 @@ void Hairline(ImU32 col) {
 }
 
 void DrawCubeLogo(ImDrawList* dl, ImVec2 c, float s) {
-    // Isometric RGB cube seen from the white corner: top face green/yellow/white/cyan, left face
-    // cyan/white/magenta/blue, right face white/yellow/red/magenta.
+    // Isometric cube with solid faces at the full primaries: green top, blue left, red right. Solid,
+    // never blended, so each face is the exact 8-bit primary: on a panel showing its native wide gamut
+    // (no colour management) they glow visibly more saturated than sRGB, which is the point.
     const float k = 0.8660254f * s, h = 0.5f * s;
     const ImVec2 T(c.x, c.y - s), UL(c.x - k, c.y - h), UR(c.x + k, c.y - h), C(c.x, c.y);
     const ImVec2 LL(c.x - k, c.y + h), LR(c.x + k, c.y + h), B(c.x, c.y + s);
-    const ImU32 W = IM_COL32(255, 255, 255, 255), Y = IM_COL32(255, 255, 0, 255), G = IM_COL32(0, 255, 0, 255);
-    const ImU32 Cy = IM_COL32(0, 255, 255, 255), M = IM_COL32(255, 0, 255, 255), Bl = IM_COL32(0, 0, 255, 255);
-    const ImU32 R = IM_COL32(255, 0, 0, 255);
-    const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
-    auto quad = [&](ImVec2 a, ImU32 ca, ImVec2 b, ImU32 cb, ImVec2 cc, ImU32 ccol, ImVec2 d, ImU32 cd) {
-        dl->PrimReserve(6, 4);
-        const ImDrawIdx base = (ImDrawIdx)dl->_VtxCurrentIdx;
-        dl->PrimWriteVtx(a, uv, ca);
-        dl->PrimWriteVtx(b, uv, cb);
-        dl->PrimWriteVtx(cc, uv, ccol);
-        dl->PrimWriteVtx(d, uv, cd);
-        dl->PrimWriteIdx(base); dl->PrimWriteIdx((ImDrawIdx)(base + 1)); dl->PrimWriteIdx((ImDrawIdx)(base + 2));
-        dl->PrimWriteIdx(base); dl->PrimWriteIdx((ImDrawIdx)(base + 2)); dl->PrimWriteIdx((ImDrawIdx)(base + 3));
-    };
-    quad(T, G, UR, Y, C, W, UL, Cy);
-    quad(UL, Cy, C, W, B, M, LL, Bl);
-    quad(C, W, UR, Y, LR, R, B, M);
+    const ImVec2 top[4] = { T, UR, C, UL };
+    const ImVec2 left[4] = { UL, C, B, LL };
+    const ImVec2 right[4] = { C, UR, LR, B };
+    dl->AddConvexPolyFilled(top, 4, IM_COL32(0, 255, 0, 255));
+    dl->AddConvexPolyFilled(left, 4, IM_COL32(0, 0, 255, 255));
+    dl->AddConvexPolyFilled(right, 4, IM_COL32(255, 0, 0, 255));
     const ImU32 edge = IM_COL32(0x0b, 0x0b, 0x0c, 0xff);
     const float t = s * 0.12f;
     const ImVec2 outline[6] = { T, UR, LR, B, LL, UL };

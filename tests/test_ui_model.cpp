@@ -104,6 +104,27 @@ TEST_CASE("ui_model: both MHC stages share one light, configured only with an in
     CHECK(Get(on, StageId::Grayscale).light == Light::Configured);
 }
 
+TEST_CASE("ui_model: display labels fall back to the EDID maker and product code") {
+    DisplayIdentity id;
+    id.devicePath = L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+    id.edidId = L"AUS322A-335544320";
+    CHECK(DisplayLabel(id, L"PA32UCXR") == L"PA32UCXR");        // the OS name wins when present
+    CHECK(DisplayLabel(id, L"") == L"ASUS 322A");               // EDIDs (and CRU overrides) often carry none
+    id.edidId.clear();
+    CHECK(DisplayLabel(id, L"") == L"ASUS 322A");               // device path when there is no EDID id
+    DisplayIdentity lg;
+    lg.edidId = L"GSM84CD-16843009";
+    CHECK(DisplayLabel(lg, L"") == L"LG 84CD");
+    DisplayIdentity unknownVendor;
+    unknownVendor.edidId = L"ZZZ1234";
+    CHECK(DisplayLabel(unknownVendor, L"") == L"ZZZ 1234");
+    CHECK(DisplayLabel(DisplayIdentity{}, L"") == L"Display");
+    DisplayIdentity named;
+    named.friendlyName = L"Kitchen TV";
+    named.edidId = L"SAM0F00";
+    CHECK(DisplayLabel(named, L"") == L"Kitchen TV");
+}
+
 TEST_CASE("ui_model: mode badges") {
     CHECK(std::string(ModeBadge(Mode::HDR)) == "HDR");
     CHECK(std::string(ModeBadge(Mode::SDR)) == "SDR");

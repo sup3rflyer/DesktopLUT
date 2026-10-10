@@ -80,15 +80,14 @@ void TakeSnapshot(Snapshot& out) {
         for (const MonitorSettings& ms : g_gui.parkedSettings) {
             DisplayRow r;
             r.settings = ms;
-            r.name = ms.identity.friendlyName;
+            r.name = DisplayLabel(ms.identity, std::wstring());
             out.parked.push_back(std::move(r));
         }
     }
     for (DisplayRow& r : out.live) {
         const ModeEntry* m = FindMode(r.hmon);
         r.mode = m ? m->mode : Mode::Unknown;
-        r.name = !r.settings.identity.friendlyName.empty() ? r.settings.identity.friendlyName
-                 : (m && !m->name.empty() ? m->name : std::wstring(L"Display"));
+        r.name = DisplayLabel(r.settings.identity, m ? m->name : std::wstring());
         MONITORINFO mi = { sizeof(mi) };
         if (r.hmon && GetMonitorInfo(r.hmon, &mi)) {
             r.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
@@ -96,7 +95,6 @@ void TakeSnapshot(Snapshot& out) {
             r.heightPx = mi.rcMonitor.bottom - mi.rcMonitor.top;
         }
     }
-    for (DisplayRow& r : out.parked) if (r.name.empty()) r.name = L"Display";
 
     out.running = g_gui.isRunning.load();
     out.hookMode = g_dwmHookMode.load();

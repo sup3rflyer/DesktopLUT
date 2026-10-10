@@ -43,4 +43,9 @@ Light MhcLight(const MHCSettings& mhc);
 // True when the overlay shader-tweak layer (pipe runtime.set_grayscale_tweak / INI) is active for a mode.
 bool ShaderTweakActive(const ColorCorrectionSettings& cc);
 
+// Name to show for a display. The OS friendly name (EDID name descriptor via DisplayConfig) when there
+// is one; many EDIDs (and CRU overrides) carry none, so otherwise the EDID maker + product code from the
+// hardware id ("ASUS 322A"); "Display" when even that is unknown.
+std::wstring DisplayLabel(const DisplayIdentity& id, const std::wstring& osName);
+
 }  // namespace ui

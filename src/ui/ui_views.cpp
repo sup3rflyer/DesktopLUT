@@ -223,9 +223,13 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
             const float tx = x + (w - ts.x) * 0.5f;
             dl->AddRectFilled(ImVec2(x, midY - ts.y * 0.5f - Px(2)), ImVec2(x + w, midY + ts.y * 0.5f + Px(2)), pal::Ground);
             if (s.id == StageId::Scanout) {
-                for (float yy = p0.y - Px(4); yy < p0.y + h + Px(4); yy += Px(6))
-                    dl->AddLine(ImVec2(x + w * 0.5f, yy), ImVec2(x + w * 0.5f, yy + Px(3)), pal::InkFaint);
-                dl->AddRectFilled(ImVec2(tx - Px(3), midY - ts.y * 0.5f), ImVec2(tx + ts.x + Px(3), midY + ts.y * 0.5f), pal::Ground);
+                // The cut: dashes above and below the label, never through it.
+                const float gapTop = midY - ts.y * 0.5f - Px(4), gapBottom = midY + ts.y * 0.5f + Px(4);
+                const float cx = x + w * 0.5f;
+                for (float yy = p0.y - Px(6); yy < gapTop; yy += Px(6))
+                    dl->AddLine(ImVec2(cx, yy), ImVec2(cx, yy + Px(3) < gapTop ? yy + Px(3) : gapTop), pal::InkFaint);
+                for (float yy = gapBottom; yy < p0.y + h + Px(6); yy += Px(6))
+                    dl->AddLine(ImVec2(cx, yy), ImVec2(cx, yy + Px(3)), pal::InkFaint);
             }
             dl->AddText(GetFont(Font::Label), kSizeLabel * Dpi(), ImVec2(tx, midY - ts.y * 0.5f), pal::InkFaint, t);
         } else {
@@ -255,7 +259,7 @@ void InspectorHeader(const char* title, Light l) {
     ImGui::Dummy(ImVec2(0, Px(6)));
 }
 
-void DrawInspector(const DisplayRow& r, const Stage* st, bool hdr) {
+void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage* st, bool hdr) {
     const MonitorSettings& ms = r.settings;
     const ColorCorrectionSettings& cc = hdr ? ms.hdrColorCorrection : ms.sdrColorCorrection;
     const MHCSettings& mhc = hdr ? ms.hdrMHC : ms.sdrMHC;
@@ -266,7 +270,7 @@ void DrawInspector(const DisplayRow& r, const Stage* st, bool hdr) {
         const std::wstring& path = hdr ? ms.hdrPath : ms.sdrPath;
         InspectorHeader("3D LUT", st->light);
         Row("CUBE", FileName(path), path);
-        Row("ENGINE", "DWM hook / overlay");
+        Row("ENGINE", snap.hookMode ? "DWM hook" : "overlay");
         break;
     }
     case StageId::ToneMap:
@@ -363,9 +367,19 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     const bool showHdr = vs.showOtherMode ? !liveHdr : liveHdr;
     const Mode shown = showHdr ? Mode::HDR : (sel->mode == Mode::AcmSdr ? Mode::AcmSdr : Mode::SDR);
 
-    // Title + mode switch
+    // Title + mode switch. The "other mode" note sits on this row, never on a line of its own: a
+    // conditional line would push the pixel path down when the user flips modes.
     Text(Font::BodyBold, 19.0f, pal::Ink, Utf8(sel->name).c_str());
-    ImGui::SameLine(0, Px(12));
+    ImGui::SameLine(0, Px(16));
+    if (vs.showOtherMode && sel->liveIndex >= 0) {
+        // Drawn, not laid out: it takes no space, so nothing on the row moves when it appears.
+        const char* note = liveHdr ? "DISPLAY IS IN HDR" : "DISPLAY IS IN SDR";
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float titleH = MeasureText(Font::BodyBold, 19.0f, "Ag").y;
+        const float noteH = MeasureText(Font::Label, kSizeLabel, note).y;
+        ImGui::GetWindowDrawList()->AddText(GetFont(Font::Label), kSizeLabel * Dpi(),
+                                            ImVec2(p.x, p.y + (titleH - noteH) * 0.5f), pal::Alarm, note);
+    }
     {
         const float bw = 64.0f;
         const float x = ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - Px(bw * 2 + 6);
@@ -376,9 +390,6 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         ImGui::SameLine(0, Px(6));
         if (Toggle("##m_sdr", !liveHdr && !parked ? "SDR \xE2\x80\xA2" : "SDR", !showHdr, ImVec2(bw, 26)))
             vs.showOtherMode = liveHdr;
-    }
-    if (vs.showOtherMode && sel->liveIndex >= 0) {
-        Label(liveHdr ? "SHOWING SDR \xC2\xB7 DISPLAY IS IN HDR" : "SHOWING HDR \xC2\xB7 DISPLAY IS IN SDR", pal::Alarm);
     }
     ImGui::Dummy(ImVec2(0, Px(14)));
 
@@ -393,7 +404,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 
     const float colH = ImGui::GetContentRegionAvail().y;
     ImGui::BeginChild("##inspector", ImVec2(-Px(kMeasuredW + 24), colH), ImGuiChildFlags_None);
-    DrawInspector(*sel, st, showHdr);
+    DrawInspector(snap, *sel, st, showHdr);
     ImGui::EndChild();
     ImGui::SameLine(0, Px(24));
     ImGui::BeginChild("##measured", ImVec2(0, colH), ImGuiChildFlags_None);

@@ -12,7 +12,10 @@
 #include "../resource.h"
 #include <windows.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
 #include <atomic>
+
+#pragma comment(lib, "uxtheme.lib")
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -220,6 +223,10 @@ bool CreateUiWindow() {
     DwmSetWindowAttribute(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
     COLORREF caption = RGB(0x0b, 0x0b, 0x0c);
     DwmSetWindowAttribute(g_hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+    // The header draws the logo and name; the caption's own icon and title would repeat them. The
+    // taskbar and Alt+Tab keep the class icon and window text.
+    WTA_OPTIONS nc = { WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON, WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON };
+    SetWindowThemeAttribute(g_hwnd, WTA_NONCLIENT, &nc, sizeof(nc));
 
     // Size in DIPs for the monitor it opens on, centred in its work area.
     const float s = WindowDpiScale(g_hwnd);
