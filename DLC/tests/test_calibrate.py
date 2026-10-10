@@ -2726,6 +2726,79 @@ def test_own_recorded_slot_needs_no_correction_seam(tmp_path: Path):
     assert "preflight:correction" not in calib.calib["decisions"]
 
 
+def _with_second_display(calib):
+    from dataclasses import replace as _replace
+    p = calib.profile
+    other = _replace(p.displays[0], name="Other panel", desktoplut_monitor=1, argyll_display=2, primary=False)
+    calib.profile = _replace(p, displays=(p.displays[0], other))
+    return calib
+
+
+def test_profile_fallback_on_a_single_display_rig_needs_no_correction_seam(tmp_path: Path):
+    # the per-meter YAML file can only be meant for the rig's one display: mechanical, as before
+    calib = _make(tmp_path, "single_rig", adjudicator=MappingAdjudicator({}))
+    calib.stage_preflight()
+    res = calib.calib["stages"]["preflight"]["digest"]["correction_resolution"]
+    assert res["source"] == "profile" and res["cross_display"] is None
+    assert "preflight:correction" not in calib.calib["decisions"]
+
+
+def test_profile_fallback_for_a_new_display_on_a_multi_display_rig_is_a_seam(tmp_path: Path):
+    # a display with no recorded correction must not be metered through the per-meter YAML file
+    # (possibly another panel's CCMX/CCSS) with no question
+    calib = _with_second_display(_make(tmp_path, "cross_rig", adjudicator=MappingAdjudicator({})))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    req = exc.value.request
+    assert req.key == "preflight:correction" and req.options == ("abort", "proceed")
+    assert req.digest["reason"] == "profile_cross_display" and req.recommendation == "proceed"
+    assert req.digest["resolution"]["cross_display"]["profile_displays"] == ["Other panel"]
+    assert "synthetic.ccmx" in req.question and "Other panel" in req.question
+    assert "NOT this display's own" in req.question
+    header = calib._header_data()
+    assert header["ccmx_source"] == "profile" and "not this display's own" in header["ccmx_warning"]
+
+
+def test_profile_fallback_recorded_for_another_display_recommends_abort(tmp_path: Path):
+    from dlc.correction_store import CorrectionRecord
+    calib = _make(tmp_path, "cross_store", adjudicator=MappingAdjudicator({}))
+    calib._correction_store().record(CorrectionRecord(
+        display="Other panel", mode="SDR", correction_file="results/synthetic.ccmx"))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    req = exc.value.request
+    assert req.digest["reason"] == "profile_cross_display" and req.recommendation == "abort"
+    assert req.digest["compromised"] is True
+    cross = req.digest["resolution"]["cross_display"]
+    assert cross["store_displays"] == ["Other panel"] and cross["recorded_for"] == ["Other panel (SDR)"]
+    # decided: the run proceeds past it, the decision on record
+    calib.adjudicator = MappingAdjudicator({"preflight:correction": Decision("proceed")})
+    calib.stage_preflight()
+
+
+def test_own_slot_on_a_multi_display_rig_needs_no_correction_seam(tmp_path: Path):
+    from dlc.correction_store import CorrectionRecord
+    calib = _with_second_display(_make(tmp_path, "own_multi", adjudicator=MappingAdjudicator({})))
+    calib._correction_store().record(CorrectionRecord(
+        display="Synthetic mini-LED", mode="SDR", correction_file="panel-ColorChecker.ccmx"))
+    calib._correction_store().record(CorrectionRecord(
+        display="Other panel", mode="SDR", correction_file="other-ColorChecker.ccmx"))
+    calib.stage_preflight()
+    res = calib.calib["stages"]["preflight"]["digest"]["correction_resolution"]
+    assert res["source"] == "store" and res["cross_display"] is None
+    assert "preflight:correction" not in calib.calib["decisions"]
+
+
+def test_no_correction_on_a_multi_display_rig_keeps_the_raw_seam(tmp_path: Path):
+    calib = _with_second_display(_without_profile_correction(
+        _make(tmp_path, "raw_multi", adjudicator=MappingAdjudicator({}))))
+    with pytest.raises(AdjudicationRequired) as exc:
+        calib.stage_preflight()
+    req = exc.value.request
+    assert req.digest["reason"] == "raw_none" and req.recommendation == "proceed"
+    assert req.digest["resolution"]["cross_display"] is None
+
+
 def test_whitepoint_does_not_snapshot_the_yaml_correction(tmp_path: Path):
     # The whitepoint record must not mint a store "correction" from the profile-YAML fallback
     # (that would pin the YAML file into the slot as if it were built for this mode).

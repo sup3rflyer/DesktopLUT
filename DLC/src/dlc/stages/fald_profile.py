@@ -7,8 +7,11 @@ Phases (each invocation runs ONE phase and emits ONE StageResult — every phase
 the overseeing LLM judges before invoking the next; long phases stream ``check_in`` evidence packets
 into the run's ``events.jsonl`` and honour ``control.json`` cancel):
 
-  preflight   pipe + monitor geometry + colour space (HDR or ACM SDR) + hook off; ENTER the native
-              state (calibration.enter + identity MHC) and refuse if any DesktopLUT layer is still on
+  preflight   panel class (seam fald_profile:panel_class: OLED / no local dimming on record) + the exported
+              lattice (refused when the loader would refuse it; seam fald_profile:cell_pitch when rounded),
+              both before anything is entered or shown; pipe + monitor geometry + colour space (HDR or
+              ACM SDR) + hook off; ENTER the native state (calibration.enter + identity MHC) and refuse if
+              any DesktopLUT layer is still on. Seams are answered with --decide KEY=abort|proceed[=REASON]
   register    transport check; meter self-registration (sensor px); meter floor
   grid        origin-phase check of the spec zone grid (evidence: step position vs the spec boundary)
   drive       white / primaries / flat sweep (SDR gamma) / drive curve / area / hole / peak windows
@@ -684,6 +687,166 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
     return by_state if len(states) > 1 else reads
 
 
+# ----------------------------------------------------------------------------- preflight seams (panel class, cell pitch)
+SEAM_PANEL_CLASS = "fald_profile:panel_class"
+SEAM_CELL_PITCH = "fald_profile:cell_pitch"
+SEAM_OPTIONS = ("abort", "proceed")
+# a panel.tech naming local dimming (with no backlight_zones on record) still counts as a zone-dimmed panel
+LOCAL_DIMMING_TECH_WORDS = ("mini", "fald", "local", "zone")
+# a cell-pitch seam recommends abort once the far-edge zone boundary lands this many true pitches off the panel's grid
+CELL_DRIFT_ABORT_CELLS = 0.5
+
+
+def panel_class_concern(tech: Optional[str], zones: Any) -> Optional[str]:
+    """Why the FALD profiling flow should NOT run on this panel unasked, from the profile's ``panel`` record (mechanical
+    string / number tests only — the decision is the LLM's): ``"oled"`` (``panel.tech`` names OLED: ~40 min of static
+    windows, a placement aid held for minutes and full-white peak windows — burn-in / retention risk, and no backlight
+    zones to model), ``"no_local_dimming"`` (no ``backlight_zones`` and a tech naming none of mini / FALD / local /
+    zone), or ``None`` (a zone-dimmed panel — the PA32UCXR's "mini-LED IPS" with 2304 zones)."""
+    t = str(tech or "").lower()
+    if "oled" in t:
+        return "oled"
+    if not zones and not any(w in t for w in LOCAL_DIMMING_TECH_WORDS):
+        return "no_local_dimming"
+    return None
+
+
+def _target_panel(args) -> dict[str, Any]:
+    """The run's display as the profile records it: ``{display, tech, backlight_zones, source[, error]}``. ``--simulate``
+    without ``--profile`` is the synthetic rehearsal display (:meth:`Profile.synthetic` — the mini-LED the synthetic
+    FALD panel models); a profile that cannot be read, or has no display on the monitor, leaves the class unknown."""
+    from .. import calibration_profile as cp
+    if args.simulate and not getattr(args, "profile", None):
+        profile, source = cp.Profile.synthetic(monitor=args.monitor), "synthetic (--simulate)"
+    else:
+        try:
+            profile, source = cp.load_profile(getattr(args, "profile", None)), "profile"
+        except Exception as exc:  # noqa: BLE001 - an unreadable profile is evidence for the seam, not a crash
+            return {"display": None, "tech": None, "backlight_zones": None, "source": "unavailable",
+                    "error": f"{type(exc).__name__}: {exc}"}
+    try:
+        disp = profile.display_for(args.monitor)
+    except KeyError as exc:
+        return {"display": None, "tech": None, "backlight_zones": None, "source": source,
+                "error": str(exc.args[0] if exc.args else exc)}
+    return {"display": disp.name, "tech": disp.panel.tech, "backlight_zones": disp.panel.backlight_zones, "source": source}
+
+
+def _decide_args(args) -> tuple[dict[str, tuple[str, Optional[str]]], list[str]]:
+    """``--decide KEY=CHOICE[=REASON]`` (repeatable, the calibrate CLI's vocabulary) → ``{key: (choice, reason)}`` + the
+    malformed specs."""
+    out: dict[str, tuple[str, Optional[str]]] = {}
+    bad: list[str] = []
+    for spec in getattr(args, "decide", None) or ():
+        key, sep, rest = str(spec).partition("=")
+        choice, _, reason = rest.partition("=")
+        if not sep or not key.strip() or not choice.strip():
+            bad.append(str(spec))
+            continue
+        out[key.strip()] = (choice.strip().lower(), reason.strip() or None)
+    return out, bad
+
+
+def _seam(args, st: dict[str, Any], result: StageResult, *, key: str, question: str, recommendation: str,
+          evidence: dict[str, Any], digest: dict[str, Any]) -> Optional[str]:
+    """One preflight seam (design law: a judgment, never a default). The decision comes from ``--decide KEY=CHOICE``
+    on the re-run, or replays from the run record when it was recorded for the SAME ``evidence`` (a ``--keep-geometry``
+    re-entry); either is recorded in ``st['fald']['decisions']``. Undecided → the phase is BLOCKED with the request
+    (question, options, recommendation, digest) in ``raw['seam']`` / ``advice`` and None is returned. ``abort`` blocks
+    too (nothing has been shown or changed yet); ``proceed`` returns "proceed"."""
+    code = key.split(":", 1)[-1]
+    evidence = json.loads(json.dumps(evidence, default=str))
+    request = {"key": key, "question": question, "options": list(SEAM_OPTIONS), "recommendation": recommendation,
+               "digest": {**digest, "evidence": evidence}}
+    decided, _ = _decide_args(args)
+    recorded = (st["fald"].get("decisions") or {}).get(key)
+    choice = reason = by = None
+    if key in decided:
+        choice, reason = decided[key]
+        by = "--decide"
+        if choice not in SEAM_OPTIONS:
+            result.note(f"--decide {key}={choice}: not one of {list(SEAM_OPTIONS)} — the seam stays open")
+            choice = None
+    elif recorded and recorded.get("evidence") == evidence and recorded.get("choice") in SEAM_OPTIONS:
+        choice, reason, by = recorded["choice"], recorded.get("reason"), "run record (same evidence)"
+    if choice is None:
+        result.raw["seam"] = request
+        result.block(code, question)
+        result.advice = {"default_policy_verdict": f"judge_{code}", "seam": key, "options": list(SEAM_OPTIONS),
+                         "recommendation": recommendation,
+                         "reasons": [f"decide, then re-run this preflight with --decide {key}=<{'|'.join(SEAM_OPTIONS)}>[=REASON]"]}
+        return None
+    st["fald"].setdefault("decisions", {})[key] = {"choice": choice, "reason": reason, "evidence": evidence,
+                                                   "by": by, "at": time.time()}
+    result.raw.setdefault("seams", {})[key] = {**request, "decision": choice, "reason": reason, "by": by}
+    why = f"{by}: {reason}" if reason else by
+    if choice == "abort":
+        result.block(f"{code}_aborted", f"aborted at {key} ({why}) — nothing was entered or shown")
+        return None
+    result.action(f"{key}: proceed ({why})")
+    return choice
+
+
+def _panel_class_gate(args, st: dict[str, Any], result: StageResult) -> bool:
+    """Seam ``fald_profile:panel_class`` BEFORE anything is entered or shown: an OLED, a panel without local dimming
+    on record, or an unknown panel. True = carry on (a zone-dimmed panel passes silently)."""
+    panel = _target_panel(args)
+    concern = panel_class_concern(panel["tech"], panel["backlight_zones"])
+    if concern is None:
+        return True
+    if panel.get("error"):
+        concern = "unknown_panel"
+    tech, zones = panel["tech"], panel["backlight_zones"]
+    name = panel["display"] or f"monitor {args.monitor}"
+    why = {"oled": ("an OLED: the flow holds ~40 min of static windows, a placement aid for minutes and full-white peak "
+                    "windows on screen — a burn-in / image-retention risk — and a self-emissive panel has no backlight "
+                    "zones for the model to describe"),
+           "no_local_dimming": ("a panel with no local dimming on record: the flow models a zone backlight, so on a "
+                                "panel without one its register / grid / drive phases (~40 min of static patterns) end "
+                                "in 'no transition' / 'no rings' anomalies"),
+           "unknown_panel": (f"a panel the profile does not describe ({panel.get('error')}): whether it is a zone-dimmed "
+                             "LCD, an OLED (burn-in risk) or a panel without local dimming cannot be told")}[concern]
+    fix = ("do not profile an OLED with this flow" if concern == "oled"
+           else "set panel.tech / panel.backlight_zones for this display in the profile")
+    question = (f"{name} (panel.tech {tech!r}, backlight_zones {zones!r}) is {why}. abort = stop now — nothing has been "
+                f"entered or shown ({fix}); proceed = run the FALD profiling flow on it anyway.")
+    return _seam(args, st, result, key=SEAM_PANEL_CLASS, question=question, recommendation="abort",
+                 evidence={"monitor": args.monitor, "display": panel["display"], "tech": tech, "backlight_zones": zones},
+                 digest={"concern": concern, "profile_source": panel["source"], "error": panel.get("error"),
+                         "local_dimming_words": list(LOCAL_DIMMING_TECH_WORDS)}) == "proceed"
+
+
+def _cell_pitch_gate(args, st: dict[str, Any], result: StageResult, width: int, height: int, cols: int, rows: int) -> bool:
+    """The exported lattice, decided BEFORE measuring with the export's own arithmetic (:func:`dlc.fald.export.lattice_fit`):
+    a lattice wider / taller than the frame is a hard refusal (mechanical — DesktopLUT's loader refuses the file,
+    ``FaldLatticeFits``); a rounded lattice that fits is seam ``fald_profile:cell_pitch`` (uncovered strip + zone drift);
+    an exact pitch passes silently. True = carry on."""
+    from ..fald.export import lattice_fit
+    lat = lattice_fit(width, height, cols, rows)
+    if lat["exact"]:
+        return True
+    result.metrics["lattice"] = lat
+    (pw, ph), (cw, ch), (lw, lh) = lat["pitch_px"], lat["cell_px"], lat["lattice_px"]
+    grid = f"{width}x{height} at {cols}x{rows} zones (pitch {pw:g} x {ph:g} px)"
+    if not lat["fits"]:
+        result.block("lattice_refused", f"{grid}: the panel file's lattice would be {cw}x{ch}-px cells = {lw}x{lh} px, "
+                     f"larger than the {width}x{height} frame — DesktopLUT's loader REFUSES such a file (FaldLatticeFits), "
+                     "so a ~40-min profiling run would end in a file that never loads. Check --zones against the panel's "
+                     "spec sheet and the monitor's resolution")
+        return False
+    (ux, uy), (dx, dy), (dcx, dcy) = lat["uncovered_px"], lat["max_drift_px"], lat["max_drift_cells"]
+    question = (f"{grid}: the zone pitch is not one the model renders exactly — the panel file's lattice will be "
+                f"{cw}x{ch}-px cells = {lw}x{lh} px, leaving {ux} px at the right and {uy} px at the bottom with no "
+                f"correction, and the zone boundaries drift from the panel's real grid by up to {dx:g} px "
+                f"({dcx:.2f} cells) horizontally and {dy:g} px ({dcy:.2f} cells) vertically (at the far edge). "
+                "abort = stop now (nothing entered or measured yet) and check --zones against the spec; proceed = "
+                "profile anyway with that coverage and drift.")
+    return _seam(args, st, result, key=SEAM_CELL_PITCH, question=question,
+                 recommendation="abort" if max(dcx, dcy) >= CELL_DRIFT_ABORT_CELLS else "proceed",
+                 evidence={"frame_px": lat["frame_px"], "zones": lat["zones"]},
+                 digest={"lattice": lat, "drift_abort_cells": CELL_DRIFT_ABORT_CELLS}) == "proceed"
+
+
 # ----------------------------------------------------------------------------- phases
 def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResult) -> None:
     from ..fald.profile import PanelGeometry
@@ -697,6 +860,13 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         result.block("geometry_exists", f"this run already measured with its recorded panel geometry (phases done: {measured}); "
                      "re-deriving it from the command line would drop what was measured (white, SDR gamma, sensor position) — "
                      "pass --keep-geometry to re-enter this run, or start a new run")
+        return
+    _, bad = _decide_args(args)
+    if bad:
+        result.block("decide_arg", f"--decide takes KEY=CHOICE[=REASON]; malformed: {bad}")
+        return
+    # panel class FIRST: nothing entered, nothing shown, before an OLED / a panel without local dimming runs a pattern
+    if not _panel_class_gate(args, st, result):
         return
     controller = _common.make_controller(args, ctx)
     alive, state, err = _common.ping_controller(controller)
@@ -754,6 +924,10 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
         g = PanelGeometry(width=width, height=height, cols=cols, rows=rows, px_mm=px_mm, meter=meter,
                           transfer="pq" if mode == "HDR" else "gamma", bit_depth=bit_depth,
                           white_nits=float(args.white_nits or (1000.0 if mode == "HDR" else 120.0)))
+    # the exported lattice, before anything is entered or measured (an inexact pitch used to be only a medium
+    # `cell_not_integer` anomaly — and the C++ loader refused an oversized lattice after the ~40-min run)
+    if not _cell_pitch_gate(args, st, result, g.width, g.height, g.cols, g.rows):
+        return
     st["fald"]["geometry"] = g.as_dict()
     st["fald"]["mode"] = mode
     st["fald"]["monitor"] = args.monitor
@@ -765,8 +939,6 @@ def phase_preflight(args, ctx: RunContext, st: dict[str, Any], result: StageResu
     if dropped:
         result.anomaly("patterns_off_panel", f"the meter spot loses patterns to the panel edge: {dropped} — move the meter "
                        "toward the centre (one cell inside, not on a cell corner)", "medium")
-    if abs(g.cell_w - round(g.cell_w)) > 1e-6 or abs(g.cell_h - round(g.cell_h)) > 1e-6:
-        result.anomaly("cell_not_integer", f"cell {g.cell_w:.3f}×{g.cell_h:.3f} px is not integer — check --zones against the spec", "medium")
     # hook / overlay path
     hook = (state or {}).get("hook") or {}
     result.preconditions["hook_active"] = bool(hook.get("active"))
@@ -1937,6 +2109,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--extended", action="store_true", help="verify: add 1-nit rings, thin bars and steep ramps to the set")
     parser.add_argument("--bin", default=None, help="verify: read through THIS panel file instead of the exported one (A/B)")
     parser.add_argument("--fit-json", default=None, dest="fit_json", help="verify with --bin: that file's fit result JSON (model columns)")
+    parser.add_argument("--decide", action="append", default=[], metavar="KEY=CHOICE[=REASON]",
+                        help=f"preflight: answer a seam (repeatable; {SEAM_PANEL_CLASS} / {SEAM_CELL_PITCH} = abort|proceed), "
+                             "e.g. --decide 'fald_profile:cell_pitch=proceed=owner accepts the uncovered strip'")
     args = parser.parse_args(argv)
     ctx = _common.resolve_run(args, create=(args.phase == "preflight"))
     args.run = ctx.root
