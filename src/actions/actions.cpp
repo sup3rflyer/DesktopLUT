@@ -90,12 +90,8 @@ Result SetLutPath(int mon, bool hdr, const std::wstring& path) {
     }
     SaveSettings();
     // The hook reads cube files only when it is injected; re-setting the same path is a reload.
-    if (g_gui.isRunning) {
-        StopProcessing();
-        StartProcessing();
-    } else {
-        ReconcileLiveLayers("3D LUT");
-    }
+    if (g_gui.isRunning) RestartLiveLayers();
+    else ReconcileLiveLayers("3D LUT");
     Finish(mon);
     return Done();
 }
@@ -103,6 +99,7 @@ Result SetLutPath(int mon, bool hdr, const std::wstring& path) {
 void SetTetrahedral(bool on) {
     g_tetrahedralInterp = on;
     SaveSettings();
+    SyncClassicGlobalControls();
 }
 
 void SetHdrDither(bool on) {
@@ -110,18 +107,16 @@ void SetHdrDither(bool on) {
     g_hdrDither = on;
     SaveSettings();
     UpdateDwmHookSharedConfig();
+    SyncClassicGlobalControls();
 }
 
 void SetDwmHookMode(bool on) {
     g_dwmHookMode.store(on);
     SaveSettings();
-    if (g_gui.isRunning) {
-        StopProcessing();
-        StartProcessing();
-    } else {
-        ReconcileLiveLayers("engine");   // the overlay FALD layer needs processing, the hook's does not
-    }
+    if (g_gui.isRunning) RestartLiveLayers();
+    else ReconcileLiveLayers("engine");   // the overlay FALD layer needs processing, the hook's does not
     if (ValidMonitor(g_gui.currentMonitor)) Finish(g_gui.currentMonitor);
+    SyncClassicGlobalControls();
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -557,16 +552,19 @@ void SetHotkeyEnabled(int hotkeyId, bool on) {
     HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
     if (target) PostMessage(target, WM_HOTKEY_REGISTER, hotkeyId, on ? 1 : 0);
     SaveSettings();
+    SyncClassicGlobalControls();
 }
 
 void SetStartMinimized(bool on) {
     g_startMinimized.store(on);
     SaveSettings();
+    SyncClassicGlobalControls();
 }
 
 void SetRunAtStartup(bool on) {
     SetStartupEnabled(on);
     RefreshStartupEnabledCache();
+    SyncClassicGlobalControls();
 }
 
 void SetConsoleLog(bool on) {
@@ -584,6 +582,7 @@ void SetConsoleLog(bool on) {
         FreeConsole();
     }
     SaveSettings();
+    SyncClassicGlobalControls();
 }
 
 void SetDlcFolder(const std::wstring& folder) {
@@ -599,6 +598,7 @@ void SetRecalReminderDays(int days) {
 void SetVrrWhitelistEnabled(bool on) {
     g_vrrWhitelistEnabled.store(on);
     SaveSettings();
+    SyncClassicGlobalControls();
 }
 
 // ---------------------------------------------------------------------------------------------------

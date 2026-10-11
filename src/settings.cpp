@@ -687,6 +687,60 @@ static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key
     }
 }
 
+std::wstring EncodeIniText(const std::wstring& text) {
+    bool plain = text.compare(0, 3, L"u8:") != 0 && (text.empty() || (text.front() != L' ' && text.back() != L' '));
+    for (wchar_t c : text) if (c < 0x20 || c > 0x7E) { plain = false; break; }
+    if (plain) return text;
+    std::string utf8;
+    if (!text.empty()) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+        utf8.resize((size_t)(n > 0 ? n : 0));
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), utf8.data(), n, nullptr, nullptr);
+    }
+    static const wchar_t* kHex = L"0123456789ABCDEF";
+    std::wstring out = L"u8:";
+    for (unsigned char b : utf8) {
+        if (b > 0x20 && b < 0x7F && b != '%') {
+            out += (wchar_t)b;
+        } else {
+            out += L'%';
+            out += kHex[b >> 4];
+            out += kHex[b & 15];
+        }
+    }
+    return out;
+}
+
+std::wstring DecodeIniText(const std::wstring& stored) {
+    if (stored.compare(0, 3, L"u8:") != 0) return stored;
+    auto hex = [](wchar_t c) -> int {
+        if (c >= L'0' && c <= L'9') return c - L'0';
+        if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+        if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+        return -1;
+    };
+    std::string utf8;
+    for (size_t i = 3; i < stored.size(); i++) {
+        if (stored[i] == L'%') {
+            if (i + 2 >= stored.size()) return stored;   // truncated escape
+            const int hi = hex(stored[i + 1]), lo = hex(stored[i + 2]);
+            if (hi < 0 || lo < 0) return stored;
+            utf8 += (char)(hi * 16 + lo);
+            i += 2;
+        } else if (stored[i] > 0x7E) {
+            return stored;   // not ours: leave it as written
+        } else {
+            utf8 += (char)stored[i];
+        }
+    }
+    if (utf8.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), (int)utf8.size(), nullptr, 0);
+    if (n <= 0) return stored;
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), (int)utf8.size(), w.data(), n);
+    return w;
+}
+
 // ============================================================================
 // SECTION: Per-monitor sections (identity-keyed [Display<slot>] + legacy [Monitor<N>])
 // ============================================================================
@@ -799,7 +853,7 @@ static void LoadIdentityKeys(const wchar_t* section, MonitorSettings& ms, const 
     ms.identity.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
     ms.firstSeen             = ReadLongINIString(section, L"FirstSeen", iniPath);
     ms.lastSeen              = ReadLongINIString(section, L"LastSeen", iniPath);
-    ms.label                 = ReadLongINIString(section, L"Label", iniPath);
+    ms.label                 = DecodeIniText(ReadLongINIString(section, L"Label", iniPath));
 }
 
 static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
@@ -807,7 +861,9 @@ static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, 
     if (!ms.lastSeen.empty())  WritePrivateProfileStringW(section, L"LastSeen", ms.lastSeen.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"DisplayName", ms.identity.friendlyName.c_str(), iniPath);
     // The user's own name for the display; absent = the automatic one (the key is removed, not left empty).
-    WritePrivateProfileStringW(section, L"Label", ms.label.empty() ? nullptr : ms.label.c_str(), iniPath);
+    // Free text: escaped to ASCII (the INI stays in the system code page; DLC reads it as UTF-8).
+    const std::wstring label = EncodeIniText(ms.label);
+    WritePrivateProfileStringW(section, L"Label", label.empty() ? nullptr : label.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
     // Written last of all the section's keys: a section with a DevicePath is a complete one.
     WritePrivateProfileStringW(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
@@ -1011,8 +1067,7 @@ bool LoadSettings() {
         GetPrivateProfileStringW(L"UI", L"Interface", L"new", buf, MAX_PATH, iniPath.c_str());
         g_uiClassic = _wcsicmp(buf, L"classic") == 0;
         buf[0] = 0;
-        GetPrivateProfileStringW(L"UI", L"DlcFolder", L"", buf, MAX_PATH, iniPath.c_str());
-        g_dlcFolder = buf;
+        g_dlcFolder = ReadLongINIString(L"UI", L"DlcFolder", iniPath.c_str());
         const int days = (int)GetPrivateProfileIntW(L"UI", L"RecalReminderDays", 90, iniPath.c_str());
         g_recalReminderDays = days >= 0 && days <= 3650 ? days : 90;
     }

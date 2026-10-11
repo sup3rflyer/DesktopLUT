@@ -33,6 +33,13 @@ bool MonitorNeedsProcessing(const MonitorSettings& ms);
 bool AnyMonitorNeedsProcessing();
 // Any LIVE display has any correction at all, MHC profiles included (the startup auto-start test).
 bool AnyMonitorHasCorrections();
+// Desktop gamma is configured on some live display (its persisted setting, not the hotkey's toggle).
+bool AnyDesktopGammaConfigured();
+// The last hook-mode start staged no display (nothing for the hook then), so no hook was injected.
+bool DwmHookStartStagedNothing();
+// Stop + Start that leaves the live layers stopped when the user suspended them meanwhile (the Stop's
+// join pumps messages: a Suspend can arrive inside it). GUI thread.
+void RestartLiveLayers();
 
 // A processing thread a Stop gave up joining is still running. While it is, StartProcessing defers
 // (no successor may share the globals it still uses) and the overlay / analysis-only starts skip.
@@ -57,9 +64,10 @@ bool MonitorNeedsDwmHook(const std::wstring& sdrLut, const std::wstring& hdrLut,
 
 struct DwmHookMonitorLUT;
 // The staging set a hook-mode start injects for the current settings and display positions: the live
-// displays that need processing AND hook work. StartProcessing, the watchdog's re-injection and the
-// live-layer reconcile (DwmHookResidentWith: is the resident hook still the one this configuration
-// wants?) all use it, so they cannot disagree. GUI thread.
+// displays with hook work (MonitorNeedsDwmHook; not gated on the global desktop-gamma flag, which would
+// add and remove displays on every toggle). StartProcessing, the watchdog's re-injection and the
+// live-layer reconcile (is the resident hook still the one this configuration wants?) all use it, so
+// they cannot disagree. GUI thread.
 std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet();
 
 // True while StartProcessing/StopProcessing is executing (their joins pump messages): handlers

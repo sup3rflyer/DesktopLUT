@@ -30,6 +30,8 @@ struct DwmHookMonitorLUT {
 // stalls dwm.exe on the detach, re-patches, and re-rolls twin routing (T2.10). Files are read at attach
 // only, so a changed file at the same path still needs a Stop (eject) + Start.
 bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors);
+// The staging set of the last successful injection (empty, `*valid` false, when none describes the hook).
+std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid);
 
 // Check if the DWM hook is active via named event (lightweight, no elevation needed).
 // The injected DLL creates Global\DesktopLUT_DwmHook_Active on attach.

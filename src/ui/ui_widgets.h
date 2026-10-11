@@ -39,7 +39,9 @@ int Segmented(const char* id, const char* const* labels, int count, int current,
 
 // Number field in mono. Edits a draft; returns true only when the field is left (Enter, Tab, click
 // elsewhere) with a changed value, written to *v. Never commits a half-typed value.
+// A difference under half a shown step (of `fmt`) is not an edit: tabbing through keeps the stored precision.
 bool NumberInput(const char* id, float* v, const char* fmt, float widthDip);
+int FormatDecimals(const char* fmt);   // "%.4f" -> 4, "%.0f" -> 0, "%f" -> 6
 
 // Light for a layer state: filled = configured/verified, ring = off, amber triangle = fault.
 void StatusLight(Light l, float diameterDip = 7.0f);

@@ -287,8 +287,7 @@ void RequestFaldFullRecompose();   // below: forces one full DWM composition for
 // .cube change uses. (The overlay path rebuilds from the path / reloadSeq by itself.) GUI thread.
 void FaldPanelFileChangedReinject() {
     if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
-    StopProcessing();
-    StartProcessing();
+    RestartLiveLayers();   // stays stopped if the user suspended meanwhile
     SetStatus(L"FALD panel file changed: DWM hook re-injected to load it");
 }
 
@@ -1106,8 +1105,7 @@ static void SwapDwmHookRoutingForCurrentMonitor(HWND hwnd) {
     if (!err.empty()) { SetStatus((L"LUT routing: " + err).c_str()); return; }
     r.confirmed = false;
     if (!WriteDwmHookRouting(r)) { SetStatus(L"LUT routing: failed to rewrite the routing file"); return; }
-    StopProcessing();
-    StartProcessing();
+    RestartLiveLayers();   // stays stopped if the user suspended meanwhile
     SetStatus(L"LUT routing swapped and re-injected");
     RefreshHookRoutingLabel();
 }
@@ -1120,10 +1118,26 @@ static UINT WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
 // A second launch asks the running instance to show its interface (main.cpp).
 static UINT WM_SHOW_ACTIVE_UI = RegisterWindowMessageW(DESKTOPLUT_SHOW_UI_MESSAGE);
 
+void SyncClassicGlobalControls() {
+    auto check = [](HWND h, bool on) { if (h) SendMessage(h, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0); };
+    check(g_gui.hwndTetrahedralCheck, g_tetrahedralInterp.load());
+    check(g_gui.hwndHdrDitherCheck, g_hdrDither.load());
+    check(g_gui.hwndSettingsDwmHook, g_dwmHookMode.load());
+    check(g_gui.hwndSettingsHotkeyGamma, g_hotkeyGammaEnabled.load());
+    check(g_gui.hwndSettingsHotkeyHdr, g_hotkeyHdrEnabled.load());
+    check(g_gui.hwndSettingsHotkeyAnalysis, g_hotkeyAnalysisEnabled.load());
+    check(g_gui.hwndSettingsStartMinimized, g_startMinimized.load());
+    check(g_gui.hwndSettingsConsoleLog, g_consoleEnabled.load());
+    check(g_gui.hwndSettingsVrrWhitelistCheck, g_vrrWhitelistEnabled.load());
+    check(g_gui.hwndSettingsCalibration, g_calibrationControlEnabled.load());
+    if (StartupEnabledCached() >= 0) check(g_gui.hwndSettingsRunAtStartup, StartupEnabledCached() == 1);
+}
+
 // The classic window is the hub itself: restore it and bring it to the front.
 static void ShowClassicWindow() {
     HWND hwnd = g_gui.hwndMain;
     if (!hwnd) return;
+    SyncClassicGlobalControls();   // the other interface may have changed them
     ShowWindow(hwnd, SW_RESTORE);
     SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
     SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
@@ -1403,8 +1417,7 @@ static void TickTopologyPipeline(HWND hwnd) {
         std::cout << "[Monitor identity] a newly attached display has a LUT the running pipeline lacks: restarting"
                   << std::endl;
         SetStatus(L"Display attached: restarting to apply its LUT");
-        StopProcessing();
-        StartProcessing();
+        RestartLiveLayers();   // stays stopped if the user suspended meanwhile
     }
 }
 
@@ -1495,7 +1508,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     if (WM_SHOW_ACTIVE_UI && msg == WM_SHOW_ACTIVE_UI) {
-        ShowActiveUi();
+        if (!g_appShuttingDown.load()) ShowActiveUi();   // a relaunch during exit: nothing comes back
         return 0;
     }
     // Re-add tray icon when explorer restarts or finishes initializing

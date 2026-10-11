@@ -937,6 +937,24 @@ TEST_CASE("LoadSettings/SaveSettings: [General] HdrDither defaults on and round-
     g_hdrDither = true;
 }
 
+TEST_CASE("INI free text: plain ASCII stays readable, anything else round-trips through an ASCII escape") {
+    CHECK(EncodeIniText(L"Desk left") == L"Desk left");
+    CHECK(EncodeIniText(L"") == L"");
+    const std::wstring nordic = L"\x00C1g\x00FAst's \x00DE\x00F3r";   // non-ASCII letters
+    const std::wstring enc = EncodeIniText(nordic);
+    CHECK(enc.compare(0, 3, L"u8:") == 0);
+    for (wchar_t c : enc) CHECK((c >= 0x20 && c <= 0x7E));
+    CHECK(DecodeIniText(enc) == nordic);
+    const std::wstring emoji = L"TV \xD83D\xDCFA";                       // a surrogate pair
+    CHECK(DecodeIniText(EncodeIniText(emoji)) == emoji);
+    CHECK(DecodeIniText(EncodeIniText(L" padded ")) == L" padded ");     // ends kept
+    CHECK(DecodeIniText(EncodeIniText(L"u8:literal")) == L"u8:literal"); // the prefix itself is escaped
+    CHECK(DecodeIniText(EncodeIniText(L"100%")) == L"100%");
+    CHECK(DecodeIniText(L"Plain name") == L"Plain name");               // written by an older build
+    CHECK(DecodeIniText(L"u8:bad%G1") == L"u8:bad%G1");                 // not ours: unchanged
+    CHECK(DecodeIniText(L"u8:cut%4") == L"u8:cut%4");
+}
+
 TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, round-trip and clear") {
     AppIniGuard guard;
     if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }

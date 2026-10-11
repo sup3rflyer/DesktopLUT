@@ -377,6 +377,13 @@ bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors)
     return g_injectedSetValid && g_injectedSet == monitors && IsDwmHookActive();
 }
 
+std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    if (valid) *valid = g_injectedSetValid;
+    return g_injectedSetValid ? g_injectedSet : std::vector<DwmHookMonitorLUT>();
+}
+
 bool IsDwmHookActive()
 {
     // Lightweight check: the injected DLL creates this named event on attach.

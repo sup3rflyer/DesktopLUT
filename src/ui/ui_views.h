@@ -33,8 +33,7 @@ struct LogView {
 // Interface-local state that survives frames and device teardown (not persisted yet).
 struct ViewState {
     Page page = Page::Pipeline;
-    std::wstring selectedKey;      // identity of the selected display (device path, else EDID id)
-    bool selectedParked = false;
+    std::wstring selectedKey;      // the selected sidebar row (RowIdOf: live/remembered + identity)
     StageId stage = StageId::Lut3D;
     bool showOtherMode = false;    // show the pipeline of the mode the display is NOT in
     Confirm confirm;               // pending confirmation (onConfirm empty = none)

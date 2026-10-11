@@ -4,6 +4,8 @@
 #include <windows.h>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 namespace ui {
 
@@ -120,6 +122,14 @@ int Segmented(const char* id, const char* const* labels, int count, int current,
     return picked;
 }
 
+// Decimals a printf format shows ("%.4f" -> 4, "%.0f" -> 0, "%f" -> 6).
+int FormatDecimals(const char* fmt) {
+    const char* p = fmt ? strchr(fmt, '%') : nullptr;
+    if (!p) return 6;
+    while (*p && *p != '.' && *p != 'f' && *p != 'g' && *p != 'e') p++;
+    return *p == '.' ? atoi(p + 1) : 6;
+}
+
 bool NumberInput(const char* id, float* v, const char* fmt, float widthDip) {
     // The draft lives across frames while the field is active: ImGui writes the parsed text into it as
     // the user types, and the value is handed back only when the field is left.
@@ -134,7 +144,11 @@ bool NumberInput(const char* id, float* v, const char* fmt, float widthDip) {
     ImGui::PopStyleVar();
     const bool commit = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::PopFont();
-    if (commit && *draft != *v) {
+    // Leaving the field re-applies the shown (rounded) text even when nothing was typed (ImGui 1.92.9:
+    // scalar edits apply on deactivation): a difference under half a shown step is that rounding, not an
+    // edit, and must not overwrite the stored precision (the classic CommitNumericEdit rule).
+    const float halfStep = 0.5f * std::pow(10.0f, (float)-FormatDecimals(fmt));
+    if (commit && std::fabs(*draft - *v) >= halfStep) {
         *v = *draft;
         return true;
     }

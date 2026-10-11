@@ -8,6 +8,7 @@
 #include "actions/reconcile.h"
 #include "dlc/dlc_scan.h"
 #include "gui_whitelist.h"
+#include "monitor_identity.h"
 #include "ui_notices.h"
 #include "version.h"
 #include "globals.h"
@@ -37,10 +38,17 @@ constexpr float kSectionH = 24.0f;
 constexpr float kButtonW = 92.0f;
 constexpr float kControlH = 24.0f;
 
+// The physical display (device path, else EDID id): follows it between live and remembered.
 std::wstring KeyOf(const DisplayRow& r) {
     if (!r.settings.identity.devicePath.empty()) return r.settings.identity.devicePath;
     if (!r.settings.identity.edidId.empty()) return r.settings.identity.edidId;
     return L"#" + std::to_wstring(r.liveIndex);
+}
+
+// One sidebar row: unique even when a live display and a remembered one share a connector (a same-model
+// replacement) or remembered entries have no identity.
+std::wstring RowIdOf(const DisplayRow& r) {
+    return (r.liveIndex >= 0 ? std::wstring(L"L|") : L"P" + std::to_wstring(r.settings.slot) + L"|") + KeyOf(r);
 }
 
 std::string FileName(const std::wstring& path) {
@@ -84,29 +92,54 @@ std::string Ellipsize(Font f, float sizeDip, const std::string& s, float maxW) {
 // Commands aimed at a display. The live index can change between this frame and the command running
 // (a display was plugged or unplugged), so the command re-finds its display by identity.
 
+// The same rules as the identity re-attach (monitor_identity.cpp): a device path names a connector, not a
+// unit, so it counts only with a compatible EDID id; an EDID id alone counts only when exactly one live
+// display has it (identical twins with serial-less EDIDs share one).
 int ResolveLive(const DisplayIdentity& id, int hint) {
     std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
     const auto& list = g_gui.monitorSettings;
-    auto same = [&](const MonitorSettings& ms) {
-        if (!id.devicePath.empty() && _wcsicmp(ms.identity.devicePath.c_str(), id.devicePath.c_str()) == 0) return true;
-        return !id.edidId.empty() && _wcsicmp(ms.identity.edidId.c_str(), id.edidId.c_str()) == 0;
+    if (id.empty()) return hint >= 0 && hint < (int)list.size() && list[hint].identity.empty() ? hint : -1;
+    auto byPath = [&](const MonitorSettings& ms) {
+        return !id.devicePath.empty() && _wcsicmp(ms.identity.devicePath.c_str(), id.devicePath.c_str()) == 0 &&
+               EdidIdsCompatible(ms.identity.edidId, id.edidId);
     };
-    if (hint >= 0 && hint < (int)list.size() && (id.empty() || same(list[hint]))) return hint;
-    if (id.empty()) return -1;
-    for (int i = 0; i < (int)list.size(); i++) if (same(list[i])) return i;
-    return -1;
+    if (hint >= 0 && hint < (int)list.size() && byPath(list[hint])) return hint;
+    for (int i = 0; i < (int)list.size(); i++) if (byPath(list[i])) return i;
+    if (id.edidId.empty()) return -1;
+    int found = -1;
+    for (int i = 0; i < (int)list.size(); i++) {
+        if (_wcsicmp(list[i].identity.edidId.c_str(), id.edidId.c_str()) != 0) continue;
+        if (found >= 0) return -1;   // ambiguous
+        found = i;
+    }
+    return found;
+}
+
+// Runs `fn` on the display's current live index, or says it is gone.
+void RunOnDisplay(const DisplayIdentity& id, int hint, const std::function<void(int)>& fn) {
+    const int mon = ResolveLive(id, hint);
+    if (mon < 0) {
+        notify::Post(notify::Sev::Warning, -1, L"ui", L"That display is no longer connected");
+        return;
+    }
+    fn(mon);
 }
 
 void PostTo(const DisplayRow& r, std::function<void(int)> fn) {
     const DisplayIdentity id = r.settings.identity;
     const int hint = r.liveIndex;
-    Post([id, hint, fn]() {
-        const int mon = ResolveLive(id, hint);
-        if (mon < 0) {
-            notify::Post(notify::Sev::Warning, -1, L"ui", L"That display is no longer connected");
-            return;
-        }
-        fn(mon);
+    Post([id, hint, fn]() { RunOnDisplay(id, hint, fn); });
+}
+
+// A file picked in a dialog, then applied: the dialog pumps messages (a display can come or go meanwhile),
+// so the display is found after it closes, not before.
+void PostPickThen(const DisplayRow& r, std::function<bool(std::wstring&)> pick, std::function<void(int, const std::wstring&)> apply) {
+    const DisplayIdentity id = r.settings.identity;
+    const int hint = r.liveIndex;
+    Post([id, hint, pick, apply]() {
+        std::wstring path;
+        if (!pick(path)) return;
+        RunOnDisplay(id, hint, [&](int mon) { apply(mon, path); });
     });
 }
 
@@ -287,19 +320,20 @@ void DrawFooter(const Snapshot& snap, bool busy) {
 // Sidebar
 
 const DisplayRow* FindSelected(const Snapshot& snap, ViewState& vs) {
-    for (const DisplayRow& r : snap.live)
-        if (!vs.selectedParked && KeyOf(r) == vs.selectedKey) return &r;
-    for (const DisplayRow& r : snap.parked)
-        if (vs.selectedParked && KeyOf(r) == vs.selectedKey) return &r;
-    // Default: the primary display, else the first one.
+    for (const DisplayRow& r : snap.live) if (RowIdOf(r) == vs.selectedKey) return &r;
+    for (const DisplayRow& r : snap.parked) if (RowIdOf(r) == vs.selectedKey) return &r;
+    // The selected display was connected or disconnected meanwhile: follow it by identity.
     const DisplayRow* pick = nullptr;
-    for (const DisplayRow& r : snap.live) if (r.primary) { pick = &r; break; }
+    if (vs.selectedKey.size() > 2) {
+        const std::wstring key = vs.selectedKey.substr(vs.selectedKey.find(L'|') + 1);
+        for (const DisplayRow& r : snap.live) if (!pick && KeyOf(r) == key) pick = &r;
+        for (const DisplayRow& r : snap.parked) if (!pick && KeyOf(r) == key) pick = &r;
+    }
+    // Default: the primary display, else the first one.
+    if (!pick) for (const DisplayRow& r : snap.live) if (r.primary) { pick = &r; break; }
     if (!pick && !snap.live.empty()) pick = &snap.live.front();
     if (!pick && !snap.parked.empty()) pick = &snap.parked.front();
-    if (pick) {
-        vs.selectedKey = KeyOf(*pick);
-        vs.selectedParked = pick->liveIndex < 0;
-    }
+    if (pick) vs.selectedKey = RowIdOf(*pick);
     return pick;
 }
 
@@ -316,7 +350,7 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
     const bool live = r.liveIndex >= 0;
     const float h = Px(live ? 60.0f : 44.0f);
     const ImVec2 p = ImGui::GetCursorScreenPos();
-    const std::wstring key = KeyOf(r);
+    const std::wstring key = RowIdOf(r);
     const bool renaming = vs.renamingKey == key;
     ImGui::PushID(Utf8(key).c_str());
     bool hovered = false;
@@ -325,7 +359,6 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
     } else {
         if (ImGui::InvisibleButton("##row", ImVec2(w, h))) {
             vs.selectedKey = key;
-            vs.selectedParked = !live;
             vs.showOtherMode = false;
         }
         hovered = ImGui::IsItemHovered();
@@ -476,10 +509,14 @@ void InspectLut(const Snapshot& snap, const DisplayRow& r, const Stage& st, bool
     if (!path.empty()) buttons.push_back("CLEAR");
     const int b = RowButtons(row, "lut", buttons);
     if (b == 0)
-        PostTo(r, [hdr](int mon) {
-            wchar_t file[MAX_PATH] = {};
-            if (BrowseForLUT(Window(), file, MAX_PATH)) act::SetLutPath(mon, hdr, file);
-        });
+        PostPickThen(r,
+                     [](std::wstring& out) {
+                         wchar_t file[MAX_PATH] = {};
+                         if (!BrowseForLUT(Window(), file, MAX_PATH)) return false;
+                         out = file;
+                         return true;
+                     },
+                     [hdr](int mon, const std::wstring& file) { act::SetLutPath(mon, hdr, file); });
     else if (b == 1)
         PostTo(r, [hdr](int mon) { act::SetLutPath(mon, hdr, L""); });
     RowText(row, FileName(path), path.empty() ? pal::InkFaint : pal::Ink, Font::Mono, kSizeMono, path);
@@ -575,10 +612,14 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     row = BeginRow("PANEL FILE");
     const int b = RowButtons(row, "fald", { "BROWSE\xE2\x80\xA6", "RELOAD" });
     if (b == 0)
-        PostTo(r, [hdr](int mon) {
-            wchar_t file[1024] = {};
-            if (BrowseForFaldPanelFile(Window(), file, 1024)) act::SetFaldPanelFile(mon, hdr, file, true);
-        });
+        PostPickThen(r,
+                     [](std::wstring& out) {
+                         wchar_t file[1024] = {};
+                         if (!BrowseForFaldPanelFile(Window(), file, 1024)) return false;
+                         out = file;
+                         return true;
+                     },
+                     [hdr](int mon, const std::wstring& file) { act::SetFaldPanelFile(mon, hdr, file, true); });
     else if (b == 1) {
         const std::wstring path = f.paramsPath;
         PostTo(r, [hdr, path](int mon) { act::SetFaldPanelFile(mon, hdr, path, true); });
@@ -633,8 +674,7 @@ void InspectPrimaries(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
         const DisplayRow target = r;
         Ask(vs, "REMOVE PROFILE?", "Deletes the calibration profile and its cached variants.", "REMOVE",
             [target, hdr]() {
-                const int mon = ResolveLive(target.settings.identity, target.liveIndex);
-                if (mon >= 0) act::MhcRemove(mon, hdr);
+                RunOnDisplay(target.settings.identity, target.liveIndex, [hdr](int mon) { act::MhcRemove(mon, hdr); });
             });
     }
     RowText(row, installed ? FileName(mhc.profilePath.empty() ? mhc.profileName : mhc.profilePath) : std::string("not installed"),
@@ -697,8 +737,7 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     } else if (b == 1) {
         const DisplayRow target = r;
         Ask(vs, "RESET FINE-TUNE?", "Returns every point to neutral.", "RESET", [target, hdr]() {
-            const int mon = ResolveLive(target.settings.identity, target.liveIndex);
-            if (mon >= 0) act::MhcResetCorrectionGs(mon, hdr);
+            RunOnDisplay(target.settings.identity, target.liveIndex, [hdr](int mon) { act::MhcResetCorrectionGs(mon, hdr); });
         });
     }
     RowPlace(row);
@@ -715,8 +754,8 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
         const int count = pick == 0 ? 10 : (pick == 2 ? 32 : 20);
         const DisplayRow target = r;
         Ask(vs, "CHANGE POINT COUNT?", "Resets the fine-tune curve to neutral.", "CHANGE", [target, hdr, count]() {
-            const int mon = ResolveLive(target.settings.identity, target.liveIndex);
-            if (mon >= 0) act::MhcSetCorrectionGsPoints(mon, hdr, count);
+            RunOnDisplay(target.settings.identity, target.liveIndex,
+                         [hdr, count](int mon) { act::MhcSetCorrectionGsPoints(mon, hdr, count); });
         });
     }
     EndRow(row);
@@ -980,7 +1019,13 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     const float colH = ImGui::GetContentRegionAvail().y;
     ImGui::BeginChild("##inspector", ImVec2(-Px(kMeasuredW + kGutter), colH), ImGuiChildFlags_None);
     ImGui::BeginDisabled(sel->liveIndex < 0);   // a remembered display that is not connected: view only
+    // Widget ids per display and mode: a field being typed in stays with its display and mode (it ends
+    // if either changes under it) instead of committing to whatever is shown next.
+    ImGui::PushID(Utf8(RowIdOf(*sel)).c_str());
+    ImGui::PushID(showHdr ? 1 : 0);
     DrawInspector(snap, *sel, st, showHdr, vs);
+    ImGui::PopID();
+    ImGui::PopID();
     ImGui::EndDisabled();
     ImGui::EndChild();
     ImGui::SameLine(0, Px(kGutter));

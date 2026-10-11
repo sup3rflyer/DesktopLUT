@@ -1,5 +1,6 @@
 #include "doctest.h"
 #include "ui/ui_model.h"
+#include "ui/ui_widgets.h"
 #include <algorithm>
 
 // ============================================================================
@@ -131,4 +132,12 @@ TEST_CASE("ui_model: mode badges") {
     CHECK(std::string(ModeBadge(Mode::AcmSdr)).find("ACM") != std::string::npos);
     CHECK(PipelineIsHdr(Mode::HDR));
     CHECK_FALSE(PipelineIsHdr(Mode::AcmSdr));
+}
+
+TEST_CASE("ui: number fields know the decimals they show (rounding-only commits are ignored)") {
+    CHECK(ui::FormatDecimals("%.0f") == 0);
+    CHECK(ui::FormatDecimals("%.4f") == 4);
+    CHECK(ui::FormatDecimals("%f") == 6);
+    CHECK(ui::FormatDecimals("x = %.2f nits") == 2);
+    CHECK(ui::FormatDecimals("plain") == 6);
 }

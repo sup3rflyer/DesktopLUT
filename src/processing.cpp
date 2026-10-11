@@ -1110,8 +1110,7 @@ std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet() {
         // in the list: the hook runs that work on it (empty cube paths stage nothing). The panel file is
         // always staged when a path is set, enabled or not, so switching the layer on later rides the
         // shared config instead of a re-inject.
-        if (!MonitorNeedsProcessing(ms) ||
-            !MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection))
+        if (!MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection))
             continue;
         MONITORINFO mi = { sizeof(mi) };
         if (!GetMonitorInfo(g_gui.monitors[i], &mi)) continue;
@@ -1125,6 +1124,20 @@ std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet() {
         set.push_back(lut);
     }
     return set;
+}
+
+bool AnyDesktopGammaConfigured() {
+    for (const auto& ms : g_gui.monitorSettings)
+        if (ms.hdrMHC.desktopGammaEnabled) return true;
+    return false;
+}
+
+static bool s_hookStartStagedNothing = false;
+bool DwmHookStartStagedNothing() { return s_hookStartStagedNothing; }
+
+void RestartLiveLayers() {
+    StopProcessing();
+    if (!g_userStopped.load() && !g_appShuttingDown.load()) StartProcessing();
 }
 
 bool AnyMonitorHasCorrections() {
@@ -1248,6 +1261,7 @@ static void StartProcessingImpl() {
 
         // Build monitor LUT list for injection (the configs above, filtered to displays with hook work)
         std::vector<DwmHookMonitorLUT> dwmMonitors = DesiredDwmHookStagingSet();
+        s_hookStartStagedNothing = dwmMonitors.empty();
 
         std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with hook work (cube / FALD / tonemap)"
                    << std::endl;

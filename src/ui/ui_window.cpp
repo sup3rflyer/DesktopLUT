@@ -8,6 +8,7 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
+#include "imgui_internal.h"   // ClearActiveID (commit an edit before hiding)
 #include "actions/logcap.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
@@ -33,6 +34,7 @@ constexpr UINT_PTR kSettleTimer = 1;    // a few frames after input so ImGui's l
 constexpr UINT_PTR kAnimTimer = 2;      // while an item is active (caret blink, drags)
 constexpr UINT_PTR kReleaseTimer = 3;   // release the device after being hidden this long
 constexpr UINT_PTR kDlcTimer = 4;       // re-read the DLC folder while visible
+constexpr UINT_PTR kDeviceRetryTimer = 5;   // rebuild the device after a loss, with backoff
 constexpr UINT kSettleMs = 16, kAnimMs = 33, kReleaseMs = 30000, kDlcMs = 60000;
 constexpr int kSettleFrames = 3;
 constexpr float kDefaultW = 1180.0f, kDefaultH = 760.0f, kMinW = 820.0f, kMinH = 520.0f;
@@ -52,6 +54,22 @@ ViewState g_view;
 std::vector<std::function<void()>> g_commands;   // posted by widgets; run after Present (DrainCommands)
 bool g_busy = false;                             // a command is running (it may pump: frames still draw)
 ID3D11ShaderResourceView* g_logo = nullptr;      // the logo artwork, on the interface's device
+bool g_shutDown = false;                         // ui::Shutdown ran: nothing is shown or posted again
+bool g_deactivateNextFrame = false;              // end the active edit in the next frame (it commits)
+bool g_minimized = false;
+int g_deviceFailures = 0;                        // consecutive device losses / creation failures
+
+void StopAnimTimer() {
+    if (g_hwnd) KillTimer(g_hwnd, kAnimTimer);
+    g_animTimer = false;
+}
+
+// After a device loss or a failed creation: try again later, longer each time (never per message).
+void ScheduleDeviceRetry() {
+    const int n = g_deviceFailures < 7 ? g_deviceFailures : 7;
+    g_deviceFailures++;
+    if (g_hwnd) SetTimer(g_hwnd, kDeviceRetryTimer, 500u << n, nullptr);   // 0.5 s .. 64 s
+}
 
 float WindowDpiScale(HWND h) {
     UINT dpi = h ? GetDpiForWindow(h) : 0;
@@ -59,6 +77,7 @@ float WindowDpiScale(HWND h) {
 }
 
 void ReleaseImGui() {
+    StopAnimTimer();
     if (!g_imguiReady) return;
     if (g_logo) { g_logo->Release(); g_logo = nullptr; }
     ImGui_ImplDX11_Shutdown();
@@ -91,7 +110,10 @@ bool EnsureImGui() {
 }
 
 void UpdateAnimTimer() {
-    const bool want = g_imguiReady && (ImGui::IsAnyItemActive() || ImGui::GetIO().WantTextInput);
+    // Caret blink and drags only while the window is in front: ImGui keeps a text field active when the
+    // app loses focus, and 30 frames a second for a background window is waste.
+    const bool want = g_imguiReady && GetForegroundWindow() == g_hwnd &&
+                      (ImGui::IsAnyItemActive() || ImGui::GetIO().WantTextInput);
     if (want && !g_animTimer) { SetTimer(g_hwnd, kAnimTimer, kAnimMs, nullptr); g_animTimer = true; }
     if (!want && g_animTimer) { KillTimer(g_hwnd, kAnimTimer); g_animTimer = false; }
 }
@@ -118,13 +140,20 @@ void DrainCommands() {
 
 void RenderFrame() {
     if (!g_hwnd || g_inFrame || !IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return;
-    if (!EnsureImGui()) return;
+    if (!EnsureImGui()) {
+        ScheduleDeviceRetry();
+        return;
+    }
     g_inFrame = true;
     try {
         TakeSnapshot(g_snap);
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        if (g_deactivateNextFrame) {   // before any item: the active one sees its deactivation this frame
+            ImGui::ClearActiveID();
+            g_deactivateNextFrame = false;
+        }
         DrawRoot(g_snap, g_view, g_busy);
         ImGui::Render();
         const ImVec4 bg = ImGui::ColorConvertU32ToFloat4(pal::Ground);
@@ -132,10 +161,13 @@ void RenderFrame() {
         g_present.BeginFrame(clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
         if (!g_present.Present()) {
-            // Device lost (driver reset, TDR): rebuild everything on the next frame.
+            // Device lost (driver reset, TDR): rebuild everything, after a pause that grows if it repeats.
             ReleaseImGui();
-            Invalidate();
+            ScheduleDeviceRetry();
+            g_inFrame = false;
+            return;
         }
+        g_deviceFailures = 0;
         UpdateAnimTimer();
     } catch (...) {
         g_inFrame = false;
@@ -184,11 +216,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_ERASEBKGND:
         return 1;
     case WM_SIZE:
-        if (wParam != SIZE_MINIMIZED && g_present.Valid()) {
-            g_present.Resize(LOWORD(lParam), HIWORD(lParam));
-            RenderFrame();
+        if (wParam == SIZE_MINIMIZED) {
+            // Minimized costs what hidden costs: no scans, no frames, the device released after a while.
+            if (!g_minimized) {
+                g_minimized = true;
+                StopAnimTimer();
+                KillTimer(hwnd, kDlcTimer);
+                SetTimer(hwnd, kReleaseTimer, kReleaseMs, nullptr);
+            }
+            return 0;
         }
+        if (g_minimized) {
+            g_minimized = false;
+            KillTimer(hwnd, kReleaseTimer);
+            RefreshModeCache();
+            RequestDlcScan();
+            SetTimer(hwnd, kDlcTimer, kDlcMs, nullptr);
+        }
+        if (g_present.Valid()) g_present.Resize(LOWORD(lParam), HIWORD(lParam));
+        RenderFrame();
         return 0;
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE) StopAnimTimer();
+        break;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mm = reinterpret_cast<MINMAXINFO*>(lParam);
         const float s = WindowDpiScale(hwnd);
@@ -212,10 +262,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RenderFrame();
         } else if (wParam == kReleaseTimer) {
             KillTimer(hwnd, kReleaseTimer);
-            if (!IsWindowVisible(hwnd)) ReleaseImGui();
+            if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) ReleaseImGui();
         } else if (wParam == kDlcTimer) {
-            if (IsWindowVisible(hwnd)) RequestDlcScan();
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) RequestDlcScan();
             else KillTimer(hwnd, kDlcTimer);
+        } else if (wParam == kDeviceRetryTimer) {
+            KillTimer(hwnd, kDeviceRetryTimer);
+            Invalidate();
         }
         return 0;
     case WM_CLOSE:
@@ -226,6 +279,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kAnimTimer);
         KillTimer(hwnd, kReleaseTimer);
         KillTimer(hwnd, kDlcTimer);
+        KillTimer(hwnd, kDeviceRetryTimer);
         g_animTimer = false;
         ReleaseImGui();
         g_hwndForPost.store(nullptr);
@@ -279,6 +333,8 @@ bool CreateUiWindow() {
     SetWindowPos(g_hwnd, nullptr, wa.left + ((wa.right - wa.left) - w) / 2, wa.top + ((wa.bottom - wa.top) - h) / 2,
                  w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     g_hwndForPost.store(g_hwnd);
+    g_invalidatePending.store(false);   // a wakeup posted to an earlier window died with it
+    g_minimized = false;
     notify::SetListener(&Invalidate);
     dlc::SetScanListener(&Invalidate);   // a scan or a patch load finished on the worker
     logcap::SetListener(&OnLogLine);
@@ -288,6 +344,7 @@ bool CreateUiWindow() {
 }  // namespace
 
 void Post(std::function<void()> command) {
+    if (g_shutDown) return;   // the app is exiting: nothing new runs
     g_commands.push_back(std::move(command));
     Invalidate();   // a frame (or the running drain loop) picks it up
 }
@@ -299,6 +356,7 @@ void* LogoTexture() { return g_logo; }
 HWND Window() { return g_hwnd; }
 
 bool Show() {
+    if (g_shutDown) return false;
     if (!g_hwnd && !CreateUiWindow()) {
         notify::Post(notify::Sev::Error, -1, L"ui", L"New interface could not be created");
         return false;
@@ -320,7 +378,15 @@ bool Show() {
 
 void Hide() {
     if (!g_hwnd) return;
+    // A field being typed in commits (one last frame ends the edit) instead of being dropped.
+    if (g_imguiReady && IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd) && ImGui::GetCurrentContext() &&
+        ImGui::IsAnyItemActive()) {
+        g_deactivateNextFrame = true;
+        RenderFrame();
+        g_deactivateNextFrame = false;
+    }
     ShowWindow(g_hwnd, SW_HIDE);
+    StopAnimTimer();
     KillTimer(g_hwnd, kDlcTimer);
     SetTimer(g_hwnd, kReleaseTimer, kReleaseMs, nullptr);
 }
@@ -328,6 +394,7 @@ void Hide() {
 bool IsVisible() { return g_hwnd && IsWindowVisible(g_hwnd); }
 
 void Shutdown() {
+    g_shutDown = true;    // Show / Post refuse from here on (a relaunch during exit must not revive it)
     g_commands.clear();   // nothing posted runs during the teardown
     notify::SetListener(nullptr);
     logcap::SetListener(nullptr);

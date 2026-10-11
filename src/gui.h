@@ -38,6 +38,8 @@ void GuiNotifySettingsChanged(int mon);
 void ShowActiveUi();
 // Switch interfaces and remember the choice (refused while an editor holds the settings). GUI thread.
 void SetInterfaceClassic(bool classic);
+// Re-reads the global settings into the classic window's checkboxes (another interface changed them). GUI thread.
+void SyncClassicGlobalControls();
 
 // The user stopped the live layers (classic Stop / tray Stop); automatic restarts respect it. GUI thread.
 extern std::atomic<bool> g_userStopped;   // read by the pipe thread (state.get)
