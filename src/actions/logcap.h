@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <streambuf>
 #include <string>
 #include <vector>
@@ -25,7 +26,9 @@ struct Line {
 constexpr size_t kCapacity = 4000;
 
 void Install();
-std::vector<Line> Snapshot(size_t max = kCapacity);   // oldest first
+// Oldest first. Lines are shared and immutable: a snapshot copies pointers, so the writers (render and
+// processing threads among them) never wait on a copy of thousands of strings.
+std::vector<std::shared_ptr<const Line>> Snapshot(size_t max = kCapacity);
 uint64_t LastSeq();
 void SetListener(void (*fn)());                        // called after each line (any thread; must not block)
 

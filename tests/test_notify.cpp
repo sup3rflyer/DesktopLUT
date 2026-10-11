@@ -96,10 +96,10 @@ TEST_CASE("logcap: lines from two threads never interleave; the ring is bounded"
     const auto lines = logcap::Snapshot();
     CHECK(lines.size() == 600);
     for (const auto& l : lines) {
-        const char c = l.text.front();
-        CHECK(l.text.find(c == 'a' ? 'b' : 'a') == std::string::npos);
+        const char c = l->text.front();
+        CHECK(l->text.find(c == 'a' ? 'b' : 'a') == std::string::npos);
     }
-    CHECK(lines.back().seq == logcap::LastSeq());
+    CHECK(lines.back()->seq == logcap::LastSeq());
     for (size_t i = 0; i < logcap::kCapacity + 10; i++) logcap::Append("x", false);
     CHECK(logcap::Snapshot().size() == logcap::kCapacity);
     logcap::ResetForTest();

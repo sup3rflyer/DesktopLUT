@@ -1368,7 +1368,8 @@ void RebuildLog(LogCache& c, const Snapshot& snap, const ViewState& vs) {
         c.rows.push_back(std::move(r));
     }
     if (vs.log.allOutput && vs.log.display < 0) {
-        for (const logcap::Line& l : logcap::Snapshot()) {
+        for (const auto& lp : logcap::Snapshot()) {
+            const logcap::Line& l = *lp;
             if (l.seq <= vs.log.clearedLineSeq) continue;
             if (vs.log.warningsOnly && !l.err) continue;
             LogRow r;

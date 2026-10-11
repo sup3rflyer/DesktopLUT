@@ -10,7 +10,7 @@ namespace logcap {
 namespace {
 
 std::mutex g_mutex;
-std::deque<Line> g_ring;
+std::deque<std::shared_ptr<const Line>> g_ring;
 uint64_t g_seq = 0;
 std::atomic<void (*)()> g_listener{ nullptr };
 
@@ -25,15 +25,19 @@ std::string Utf8(const std::wstring& w) {
 }  // namespace
 
 void Append(const std::string& utf8, bool err) {
+    auto l = std::make_shared<Line>();   // built outside the lock
+    GetLocalTime(&l->time);
+    l->err = err;
+    l->text = utf8;
+    std::shared_ptr<const Line> dropped;   // freed outside the lock
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        Line l;
-        l.seq = ++g_seq;
-        GetLocalTime(&l.time);
-        l.err = err;
-        l.text = utf8;
+        l->seq = ++g_seq;
         g_ring.push_back(std::move(l));
-        while (g_ring.size() > kCapacity) g_ring.pop_front();
+        if (g_ring.size() > kCapacity) {
+            dropped = std::move(g_ring.front());
+            g_ring.pop_front();
+        }
     }
     if (auto fn = g_listener.load()) fn();
 }
@@ -51,10 +55,10 @@ void Install() {
     std::wcerr.rdbuf(new TeeBuf<wchar_t>(std::wcerr.rdbuf(), true, wide));
 }
 
-std::vector<Line> Snapshot(size_t max) {
+std::vector<std::shared_ptr<const Line>> Snapshot(size_t max) {
     std::lock_guard<std::mutex> lock(g_mutex);
     const size_t n = g_ring.size() < max ? g_ring.size() : max;
-    return std::vector<Line>(g_ring.end() - (std::ptrdiff_t)n, g_ring.end());
+    return std::vector<std::shared_ptr<const Line>>(g_ring.end() - (std::ptrdiff_t)n, g_ring.end());
 }
 
 uint64_t LastSeq() {
