@@ -1,5 +1,7 @@
 #include "doctest.h"
+#include "actions/logcap.h"
 #include "actions/notify.h"
+#include <sstream>
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -59,4 +61,46 @@ TEST_CASE("notify: the listener runs once per post, from any thread") {
     CHECK(notify::LastSeq() == 200);
     auto ev = notify::Snapshot();
     for (size_t i = 1; i < ev.size(); i++) CHECK(ev[i].seq == ev[i - 1].seq + 1);
+}
+
+// ============================================================================
+// Diagnostic log capture (src/actions/logcap.*): what std::cout / cerr write, as lines, still forwarded.
+// ============================================================================
+
+TEST_CASE("logcap: a tee buffer forwards everything and hands over whole lines") {
+    std::ostringstream console;
+    std::vector<std::pair<std::string, bool>> lines;
+    logcap::TeeBuf<char> tee(console.rdbuf(), true, [&](const std::string& l, bool err) { lines.emplace_back(l, err); });
+    std::ostream out(&tee);
+    out << "[Tag] first " << 42 << '\n' << "second" << std::endl << "partial";
+    CHECK(console.str() == "[Tag] first 42\nsecond\npartial");   // the console sees it unchanged
+    REQUIRE(lines.size() == 2);                                    // "partial" waits for its line break
+    CHECK(lines[0].first == "[Tag] first 42");
+    CHECK(lines[0].second);
+    CHECK(lines[1].first == "second");
+    out << " done\r\n";
+    REQUIRE(lines.size() == 3);
+    CHECK(lines[2].first == "partial done");                       // CR stripped
+}
+
+TEST_CASE("logcap: lines from two threads never interleave; the ring is bounded") {
+    logcap::ResetForTest();
+    logcap::TeeBuf<char> tee(nullptr, false, [](const std::string& l, bool err) { logcap::Append(l, err); });
+    auto writer = [&](char c) {   // one ostream per thread over the shared buffer (as std::cout's threads share it)
+        std::ostream out(&tee);
+        for (int i = 0; i < 300; i++) out << std::string(5, c) << i << std::string(5, c) << '\n';
+    };
+    std::thread a(writer, 'a'), b(writer, 'b');
+    a.join();
+    b.join();
+    const auto lines = logcap::Snapshot();
+    CHECK(lines.size() == 600);
+    for (const auto& l : lines) {
+        const char c = l.text.front();
+        CHECK(l.text.find(c == 'a' ? 'b' : 'a') == std::string::npos);
+    }
+    CHECK(lines.back().seq == logcap::LastSeq());
+    for (size_t i = 0; i < logcap::kCapacity + 10; i++) logcap::Append("x", false);
+    CHECK(logcap::Snapshot().size() == logcap::kCapacity);
+    logcap::ResetForTest();
 }

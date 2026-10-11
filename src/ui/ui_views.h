@@ -3,6 +3,7 @@
 // (src/actions), never directly into the settings.
 
 #include "ui_snapshot.h"
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -18,6 +19,17 @@ struct Confirm {
     std::function<void()> onConfirm;   // posted when confirmed
 };
 
+// Events page: what is shown (interface-local, not persisted).
+struct LogView {
+    bool allOutput = false;        // interleave the diagnostic output (logcap) with the events
+    bool warningsOnly = false;
+    int display = -1;              // live index, -1 = all
+    char filter[128] = {};
+    uint64_t clearedEventSeq = 0;  // CLEAR hides everything up to these
+    uint64_t clearedLineSeq = 0;
+    uint64_t selectedKey = 0;      // selected row (0 = none)
+};
+
 // Interface-local state that survives frames and device teardown (not persisted yet).
 struct ViewState {
     Page page = Page::Pipeline;
@@ -31,6 +43,7 @@ struct ViewState {
     char renameBuf[128] = {};      // its edit buffer (UTF-8)
     bool renameFocus = false;      // give the field keyboard focus on its first frame
     bool showNotices = false;      // Settings > About: third-party notices expanded
+    LogView log;
 };
 
 void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy);

@@ -8,6 +8,7 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
+#include "actions/logcap.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
 #include "globals.h"
@@ -234,6 +235,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
+std::atomic<bool> g_logRedraws{ false };
+void OnLogLine() {   // any thread
+    if (g_logRedraws.load(std::memory_order_relaxed)) Invalidate();
+}
+
 bool CreateUiWindow() {
     HINSTANCE inst = GetModuleHandleW(nullptr);
     if (!g_classRegistered) {
@@ -275,6 +281,7 @@ bool CreateUiWindow() {
     g_hwndForPost.store(g_hwnd);
     notify::SetListener(&Invalidate);
     dlc::SetScanListener(&Invalidate);   // a scan or a patch load finished on the worker
+    logcap::SetListener(&OnLogLine);
     return true;
 }
 
@@ -323,6 +330,7 @@ bool IsVisible() { return g_hwnd && IsWindowVisible(g_hwnd); }
 void Shutdown() {
     g_commands.clear();   // nothing posted runs during the teardown
     notify::SetListener(nullptr);
+    logcap::SetListener(nullptr);
     dlc::StopScanner();   // joins the worker (a scan in flight finishes first)
     if (g_hwnd) DestroyWindow(g_hwnd);
 }
@@ -345,6 +353,8 @@ std::wstring DlcFolder() {
 }
 
 void RequestDlcScan() { dlc::RequestScan(DlcFolder()); }
+
+void SetLogRedraws(bool on) { g_logRedraws.store(on, std::memory_order_relaxed); }
 
 void NotifyDisplayChanged() {
     if (!IsVisible()) return;

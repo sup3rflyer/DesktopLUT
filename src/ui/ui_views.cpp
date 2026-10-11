@@ -4,6 +4,7 @@
 #include "ui_window.h"
 #include "actions/actions.h"
 #include "actions/notify.h"
+#include "actions/logcap.h"
 #include "actions/reconcile.h"
 #include "dlc/dlc_scan.h"
 #include "gui_whitelist.h"
@@ -11,6 +12,7 @@
 #include "version.h"
 #include "globals.h"
 #include "gui.h"
+#include <algorithm>
 #include <cctype>
 #include <cfloat>
 #include <cmath>
@@ -167,6 +169,12 @@ int RowButtons(RowCtx& r, const char* idPrefix, const std::vector<const char*>& 
         x += bw + gap;
     }
     return clicked;
+}
+
+// The explanation of a row lives in a tooltip on its label (labels stay terse).
+void RowTip(const RowCtx& r, const char* tip) {
+    if (ImGui::IsMouseHoveringRect(ImVec2(r.x0, r.y0), ImVec2(r.x0 + Px(kRowLabelW) - Px(8), r.y0 + r.h)))
+        ImGui::SetTooltip("%s", tip);
 }
 
 void EndRow(const RowCtx& r) {
@@ -723,6 +731,9 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
         EndRow(row);
 
         row = BeginRow("DESKTOP GAMMA");
+        RowTip(row, "SDR content in HDR as gamma 2.2 at the Windows SDR white level.\n"
+                    "The whitelist turns it off while a listed app runs.");
+        if (RowButtons(row, "dg_wl", { "WHITELIST" }) == 0) Post([]() { ShowGammaWhitelistDialog(Window()); });
         RowPlace(row);
         bool dg = false;
         if (OnOff("##dg_on", mhc.desktopGammaEnabled, &dg)) PostTo(r, [dg](int mon) { act::MhcSetDesktopGamma(mon, dg); });
@@ -936,12 +947,23 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         }
         const float bw = 64.0f;
         const bool parked = sel->liveIndex < 0;
+        // Which side's settings are shown; a green light marks the mode the display is in now.
         ImGui::SetCursorScreenPos(ImVec2(p.x + w - Px(bw * 2), cy - Px(13)));
-        if (Toggle("##m_hdr", liveHdr && !parked ? "HDR \xE2\x80\xA2" : "HDR", showHdr, ImVec2(bw, 26)))
-            vs.showOtherMode = !liveHdr;
+        auto modeButton = [&](const char* id, const char* label, bool isHdr) {
+            const bool live = !parked && liveHdr == isHdr;
+            const bool clicked = Toggle(id, label, showHdr == isHdr, ImVec2(bw, 26));
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            if (live) ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(a.x + Px(10), (a.y + b.y) * 0.5f), Px(3), pal::Good);
+            if (ImGui::IsItemHovered()) {
+                if (parked) ImGui::SetTooltip("%s settings. Display not connected.", label);
+                else if (live) ImGui::SetTooltip("%s settings. The display is in %s now.", label, label);
+                else ImGui::SetTooltip("%s settings. The display is in %s now.", label, isHdr ? "SDR" : "HDR");
+            }
+            return clicked;
+        };
+        if (modeButton("##m_hdr", "HDR", true)) vs.showOtherMode = !liveHdr;
         ImGui::SameLine(0, 0);
-        if (Toggle("##m_sdr", !liveHdr && !parked ? "SDR \xE2\x80\xA2" : "SDR", !showHdr, ImVec2(bw, 26)))
-            vs.showOtherMode = liveHdr;
+        if (modeButton("##m_sdr", "SDR", false)) vs.showOtherMode = liveHdr;
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
         ImGui::Dummy(ImVec2(0, Px(16)));
     }
@@ -970,12 +992,6 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 
 // ---------------------------------------------------------------------------------------------
 // Settings
-
-// The explanation of a row lives in a tooltip on its label (labels stay terse).
-void RowTip(const RowCtx& r, const char* tip) {
-    if (ImGui::IsMouseHoveringRect(ImVec2(r.x0, r.y0), ImVec2(r.x0 + Px(kRowLabelW) - Px(8), r.y0 + r.h)))
-        ImGui::SetTooltip("%s", tip);
-}
 
 void SettingsSpacer() { ImGui::Dummy(ImVec2(0, Px(18))); }
 
@@ -1017,17 +1033,16 @@ void SettingsEngine(const Snapshot& snap) {
     EndRow(row);
 
     row = BeginRow("INTERPOLATION");
-    RowTip(row, "3D LUT interpolation of the overlay. The DWM hook always uses its own.");
+    RowTip(row, snap.hookMode ? "The DWM hook always interpolates tetrahedrally.\nTrilinear is an overlay-mode option."
+                              : "3D LUT interpolation of the overlay.");
     RowPlace(row);
     static const char* const kInterp[] = { "TRILINEAR", "TETRAHEDRAL" };
-    const int pick = Segmented("##set_interp", kInterp, 2, g_tetrahedralInterp.load() ? 1 : 0, 96);
-    if (pick >= 0) {
+    ImGui::BeginDisabled(snap.hookMode);   // fixed in hook mode: show what the hook does
+    const int pick = Segmented("##set_interp", kInterp, 2, snap.hookMode || g_tetrahedralInterp.load() ? 1 : 0, 96);
+    ImGui::EndDisabled();
+    if (pick >= 0 && !snap.hookMode) {
         const bool tetra = pick == 1;
         Post([tetra]() { act::SetTetrahedral(tetra); });
-    }
-    if (snap.hookMode) {
-        RowNext(row);
-        RowText(row, "OVERLAY ONLY", pal::InkFaint, Font::Label, kSizeLabel);
     }
     EndRow(row);
 
@@ -1037,18 +1052,20 @@ void SettingsEngine(const Snapshot& snap) {
     if (OnOff("##set_dither", g_hdrDither.load(), &v)) Post([v]() { act::SetHdrDither(v); });
     EndRow(row);
 
+    auto listText = [](const std::wstring& raw) { return raw.empty() ? std::string("\xE2\x80\x94") : Utf8(raw); };
     row = BeginRow("PASSTHROUGH");
-    RowTip(row, "Hide the overlay while a listed app runs (keeps G-Sync).");
-    if (RowButtons(row, "set_vrr", { "EDIT\xE2\x80\xA6" }) == 0) Post([]() { ShowVrrWhitelistDialog(Window()); });
+    RowTip(row, "Hide the overlay while a whitelisted app runs (keeps G-Sync).");
+    if (RowButtons(row, "set_vrr", { "WHITELIST" }) == 0) Post([]() { ShowVrrWhitelistDialog(Window()); });
     RowPlace(row);
     if (OnOff("##set_vrr_on", g_vrrWhitelistEnabled.load(), &v)) Post([v]() { act::SetVrrWhitelistEnabled(v); });
+    RowNext(row);
+    RowText(row, listText(g_vrrWhitelistRaw), g_vrrWhitelistRaw.empty() ? pal::InkFaint : pal::InkDim);
     EndRow(row);
 
-    row = BeginRow("GAMMA EXCEPTIONS");
-    RowTip(row, "Desktop gamma turns off while a listed app runs.");
-    if (RowButtons(row, "set_gwl", { "EDIT\xE2\x80\xA6" }) == 0) Post([]() { ShowGammaWhitelistDialog(Window()); });
-    RowText(row, g_gammaWhitelistRaw.empty() ? std::string("\xE2\x80\x94") : Utf8(g_gammaWhitelistRaw),
-            g_gammaWhitelistRaw.empty() ? pal::InkFaint : pal::Ink);
+    row = BeginRow("DESKTOP GAMMA");
+    RowTip(row, "Desktop gamma turns off while a whitelisted app runs.");
+    if (RowButtons(row, "set_gwl", { "WHITELIST" }) == 0) Post([]() { ShowGammaWhitelistDialog(Window()); });
+    RowText(row, listText(g_gammaWhitelistRaw), g_gammaWhitelistRaw.empty() ? pal::InkFaint : pal::InkDim);
     EndRow(row);
 }
 
@@ -1218,38 +1235,261 @@ void DrawSettingsPage(const Snapshot& snap, ViewState& vs) {
     ImGui::EndChild();
 }
 
-void DrawEventsPage() {
+// ---------------------------------------------------------------------------------------------
+// Events: the notification log, optionally interleaved with the diagnostic output (logcap), as a log
+// viewer: oldest at the top, follows the newest while scrolled to the bottom.
+
+struct LogRow {
+    uint64_t key = 0;            // kind in the top bit, sequence below: stable across rebuilds
+    uint64_t ticks = 0;          // local time as FILETIME ticks (merge order)
+    char time[16] = {};
+    const char* level = "";
+    ImU32 levelCol = 0;
+    std::string source, display, message, detail;
+    std::string search;          // lower-case haystack for the text filter
+};
+
+struct LogCache {
+    uint64_t eventSeq = ~0ull, lineSeq = ~0ull;
+    std::string filterKey;
+    std::vector<LogRow> rows;
+    size_t lastCount = 0;
+};
+
+uint64_t Ticks(const SYSTEMTIME& st) {
+    FILETIME ft;
+    if (!SystemTimeToFileTime(&st, &ft)) return 0;
+    return ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+}
+
+std::string Lower(std::string s) {
+    for (char& c : s) c = (char)tolower((unsigned char)c);
+    return s;
+}
+
+// "[DWM Hook] Injected" -> source "DWM HOOK", message "Injected".
+void SplitTag(const std::string& line, std::string& source, std::string& message) {
+    size_t i = 0;
+    while (i < line.size() && line[i] == ' ') i++;
+    if (i < line.size() && line[i] == '[') {
+        const size_t close = line.find(']', i);
+        if (close != std::string::npos && close - i < 40) {
+            source = line.substr(i + 1, close - i - 1);
+            for (char& c : source) c = (char)toupper((unsigned char)c);
+            size_t m = close + 1;
+            while (m < line.size() && (line[m] == ' ' || line[m] == ':')) m++;
+            message = line.substr(m);
+            return;
+        }
+    }
+    message = line.substr(i);
+}
+
+std::string LogLineText(const LogRow& r) {
+    std::string s = std::string(r.time) + "  " + r.level + "  " + r.source;
+    if (!r.display.empty()) s += "  [" + r.display + "]";
+    s += "  " + r.message;
+    if (!r.detail.empty()) s += "  \xE2\x80\x94  " + r.detail;
+    return s;
+}
+
+void RebuildLog(LogCache& c, const Snapshot& snap, const ViewState& vs) {
+    c.rows.clear();
+    const std::vector<notify::Event> events = notify::Snapshot();
+    for (const notify::Event& e : events) {
+        if (e.seq <= vs.log.clearedEventSeq) continue;
+        const bool warn = e.sev == notify::Sev::Warning || e.sev == notify::Sev::Error;
+        if (vs.log.warningsOnly && !warn) continue;
+        if (vs.log.display >= 0 && e.monitor != vs.log.display) continue;
+        LogRow r;
+        r.key = e.seq;
+        r.ticks = Ticks(e.time);
+        snprintf(r.time, sizeof(r.time), "%02u:%02u:%02u.%03u", e.time.wHour, e.time.wMinute, e.time.wSecond, e.time.wMilliseconds);
+        switch (e.sev) {
+        case notify::Sev::Success: r.level = "OK"; r.levelCol = pal::Good; break;
+        case notify::Sev::Warning: r.level = "WARN"; r.levelCol = pal::Alarm; break;
+        case notify::Sev::Error: r.level = "ERROR"; r.levelCol = pal::Alarm; break;
+        default: r.level = "INFO"; r.levelCol = pal::InkDim; break;
+        }
+        r.source = Utf8(e.source);
+        for (char& ch : r.source) ch = (char)toupper((unsigned char)ch);
+        if (e.monitor >= 0) {
+            for (const DisplayRow& d : snap.live)
+                if (d.liveIndex == e.monitor) r.display = Utf8(d.name);
+            if (r.display.empty()) r.display = "MON " + std::to_string(e.monitor);
+        }
+        r.message = Utf8(e.title);
+        r.detail = Utf8(e.detail);
+        c.rows.push_back(std::move(r));
+    }
+    if (vs.log.allOutput && vs.log.display < 0) {
+        for (const logcap::Line& l : logcap::Snapshot()) {
+            if (l.seq <= vs.log.clearedLineSeq) continue;
+            if (vs.log.warningsOnly && !l.err) continue;
+            LogRow r;
+            r.key = (1ull << 63) | l.seq;
+            r.ticks = Ticks(l.time);
+            snprintf(r.time, sizeof(r.time), "%02u:%02u:%02u.%03u", l.time.wHour, l.time.wMinute, l.time.wSecond, l.time.wMilliseconds);
+            r.level = l.err ? "ERR" : "LOG";
+            r.levelCol = l.err ? pal::InkDim : pal::InkFaint;
+            SplitTag(l.text, r.source, r.message);
+            c.rows.push_back(std::move(r));
+        }
+        std::stable_sort(c.rows.begin(), c.rows.end(), [](const LogRow& a, const LogRow& b) { return a.ticks < b.ticks; });
+    }
+    const std::string needle = Lower(vs.log.filter);
+    if (!needle.empty()) {
+        std::vector<LogRow> kept;
+        for (LogRow& r : c.rows) {
+            r.search = Lower(r.source + " " + r.display + " " + r.message + " " + r.detail);
+            if (r.search.find(needle) != std::string::npos) kept.push_back(std::move(r));
+        }
+        c.rows.swap(kept);
+    }
+}
+
+void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
+    static LogCache cache;
     const float bodyH = FooterTop() - ImGui::GetCursorScreenPos().y;   // down to the pinned footer
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
-    ImGui::BeginChild("##events", ImVec2(0, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(14)));
+    ImGui::BeginChild("##events", ImVec2(0, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NoScrollbar);
     ImGui::PopStyleVar();
-    std::vector<notify::Event> ev = notify::Snapshot();
-    SectionHeader("EVENTS", nullptr);
-    if (ev.empty()) Label("NONE YET", pal::InkFaint);
-    if (ImGui::BeginTable("##ev", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("time", ImGuiTableColumnFlags_WidthFixed, Px(70));
-        ImGui::TableSetupColumn("sev", ImGuiTableColumnFlags_WidthFixed, Px(14));
-        ImGui::TableSetupColumn("src", ImGuiTableColumnFlags_WidthFixed, Px(70));
-        ImGui::TableSetupColumn("text", ImGuiTableColumnFlags_WidthStretch);
-        for (auto it = ev.rbegin(); it != ev.rend(); ++it) {
+
+    // Toolbar: what, how severe, which display, text filter; copy and clear at the right end.
+    LogView& lv = vs.log;
+    {
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const float w = ImGui::GetContentRegionAvail().x, h = Px(28), cy = p.y + h * 0.5f;
+        ImGui::SetCursorScreenPos(ImVec2(p.x, cy - Px(12)));
+        static const char* const kWhat[] = { "EVENTS", "ALL OUTPUT" };
+        const int what = Segmented("##log_what", kWhat, 2, lv.allOutput ? 1 : 0, 92);
+        if (what >= 0) lv.allOutput = what == 1;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("All output: the diagnostic log too (what the console shows).");
+        ImGui::SameLine(0, Px(16));
+        static const char* const kSev[] = { "ALL", "WARNINGS" };
+        const int sev = Segmented("##log_sev", kSev, 2, lv.warningsOnly ? 1 : 0, 72);
+        if (sev >= 0) lv.warningsOnly = sev == 1;
+        ImGui::SameLine(0, Px(16));
+        std::string current = "ALL DISPLAYS";
+        for (const DisplayRow& d : snap.live) if (d.liveIndex == lv.display) current = Utf8(d.name);
+        ImGui::SetNextItemWidth(Px(170));
+        if (ImGui::BeginCombo("##log_disp", current.c_str())) {
+            if (ImGui::Selectable("ALL DISPLAYS", lv.display < 0)) lv.display = -1;
+            for (const DisplayRow& d : snap.live)
+                if (ImGui::Selectable(Utf8(d.name).c_str(), lv.display == d.liveIndex)) lv.display = d.liveIndex;
+            ImGui::EndCombo();
+        }
+        ImGui::SameLine(0, Px(16));
+        ImGui::SetNextItemWidth(Px(200));
+        ImGui::InputTextWithHint("##log_filter", "FILTER", lv.filter, sizeof(lv.filter));
+
+        const float bw = 72.0f;
+        ImGui::SetCursorScreenPos(ImVec2(p.x + w - Px(bw * 2 + 8), cy - Px(12)));
+        if (Button("##log_copy", "COPY", bw)) {
+            std::string all;
+            for (const LogRow& r : cache.rows) all += LogLineText(r) + "\r\n";
+            ImGui::SetClipboardText(all.c_str());
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copy the rows shown.");
+        ImGui::SameLine(0, Px(8));
+        if (Button("##log_clear", "CLEAR", bw)) {
+            lv.clearedEventSeq = notify::LastSeq();
+            lv.clearedLineSeq = logcap::LastSeq();
+        }
+        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h + Px(10)));
+        ImGui::Dummy(ImVec2(0, 0));
+    }
+
+    const std::string filterKey = std::to_string(lv.allOutput) + std::to_string(lv.warningsOnly) + "|" +
+                                  std::to_string(lv.display) + "|" + lv.filter + "|" + std::to_string(lv.clearedEventSeq) +
+                                  "|" + std::to_string(lv.clearedLineSeq);
+    const uint64_t es = notify::LastSeq(), ls = lv.allOutput ? logcap::LastSeq() : 0;
+    if (es != cache.eventSeq || ls != cache.lineSeq || filterKey != cache.filterKey) {
+        RebuildLog(cache, snap, vs);
+        cache.eventSeq = es;
+        cache.lineSeq = ls;
+        cache.filterKey = filterKey;
+    }
+
+    const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
+                                  ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable;
+    ImGui::PushStyleColor(ImGuiCol_TableRowBg, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, IM_COL32(255, 255, 255, 6));
+    ImGui::PushStyleColor(ImGuiCol_TableBorderLight, pal::Rule);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(Px(8), Px(3)));
+    if (ImGui::BeginTable("##log", 5, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("TIME", ImGuiTableColumnFlags_WidthFixed, Px(96));
+        ImGui::TableSetupColumn("LEVEL", ImGuiTableColumnFlags_WidthFixed, Px(52));
+        ImGui::TableSetupColumn("SOURCE", ImGuiTableColumnFlags_WidthFixed, Px(110));
+        ImGui::TableSetupColumn("DISPLAY", ImGuiTableColumnFlags_WidthFixed, Px(120));
+        ImGui::TableSetupColumn("MESSAGE", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableNextRow(ImGuiTableRowFlags_Headers);
+        for (int col = 0; col < 5; col++) {
+            ImGui::TableSetColumnIndex(col);
+            Text(Font::Label, kSizeLabel, pal::InkFaint, ImGui::TableGetColumnName(col));
+        }
+        // Follow the newest while scrolled to the bottom (like a terminal); scrolling up stops it.
+        const bool atBottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - Px(2);
+        ImGui::PushFont(GetFont(Font::Mono), 12.0f);
+        ImGuiListClipper clip;
+        clip.Begin((int)cache.rows.size());
+        while (clip.Step()) {
+            for (int i = clip.DisplayStart; i < clip.DisplayEnd; i++) {
+                const LogRow& r = cache.rows[(size_t)i];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::PushID((void*)(uintptr_t)r.key);
+                const bool selected = lv.selectedKey == r.key;
+                if (ImGui::Selectable("##row", selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                    lv.selectedKey = selected ? 0 : r.key;
+                if (ImGui::BeginPopupContextItem("##rowmenu")) {
+                    if (ImGui::Selectable("COPY LINE")) ImGui::SetClipboardText(LogLineText(r).c_str());
+                    ImGui::EndPopup();
+                }
+                ImGui::SameLine(0, 0);
+                ImGui::PushStyleColor(ImGuiCol_Text, pal::InkFaint);
+                ImGui::TextUnformatted(r.time);
+                ImGui::PopStyleColor();
+                ImGui::TableSetColumnIndex(1);
+                ImGui::PushStyleColor(ImGuiCol_Text, r.levelCol);
+                ImGui::TextUnformatted(r.level);
+                ImGui::PopStyleColor();
+                ImGui::TableSetColumnIndex(2);
+                ImGui::PushStyleColor(ImGuiCol_Text, pal::InkDim);
+                ImGui::TextUnformatted(r.source.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(r.display.c_str());
+                ImGui::PopStyleColor();
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(r.message.c_str());
+                if (!r.detail.empty()) {
+                    ImGui::SameLine(0, Px(10));
+                    ImGui::PushStyleColor(ImGuiCol_Text, pal::InkFaint);
+                    ImGui::TextUnformatted(r.detail.c_str());
+                    ImGui::PopStyleColor();
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::PopFont();
+        if (cache.rows.empty()) {
             ImGui::TableNextRow();
-            ImGui::TableNextColumn();
-            char t[16];
-            snprintf(t, sizeof(t), "%02u:%02u:%02u", it->time.wHour, it->time.wMinute, it->time.wSecond);
-            Text(Font::Mono, 12.0f, pal::InkFaint, t);
-            ImGui::TableNextColumn();
-            StatusLight(it->sev == notify::Sev::Warning || it->sev == notify::Sev::Error ? Light::Fault : Light::Configured, 6.0f);
-            ImGui::TableNextColumn();
-            std::string src = Utf8(it->source);
-            for (char& c : src) c = (char)toupper((unsigned char)c);
-            Label(src.c_str(), pal::InkFaint);
-            ImGui::TableNextColumn();
-            std::string line = Utf8(it->title);
-            if (!it->detail.empty()) line += "  \xC2\xB7  " + Utf8(it->detail);
-            ImGui::TextUnformatted(line.c_str());
+            ImGui::TableSetColumnIndex(4);
+            Text(Font::Label, kSizeLabel, pal::InkFaint, "NOTHING TO SHOW");
+        }
+        if (atBottom && cache.rows.size() != cache.lastCount) ImGui::SetScrollHereY(1.0f);
+        cache.lastCount = cache.rows.size();
+        // Ctrl+C copies the selected row.
+        if (lv.selectedKey && ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            ImGui::IsKeyChordPressed(ImGuiMod_Ctrl | ImGuiKey_C)) {
+            for (const LogRow& r : cache.rows)
+                if (r.key == lv.selectedKey) ImGui::SetClipboardText(LogLineText(r).c_str());
         }
         ImGui::EndTable();
     }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(3);
     ImGui::EndChild();
 }
 
@@ -1299,7 +1539,8 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     DrawHeader(snap, vs, busy);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
-    if (vs.page == Page::Events) DrawEventsPage();
+    SetLogRedraws(vs.page == Page::Events && vs.log.allOutput);   // diagnostic lines redraw only here
+    if (vs.page == Page::Events) DrawEventsPage(snap, vs);
     else if (vs.page == Page::Settings) DrawSettingsPage(snap, vs);
     else DrawPipelinePage(snap, vs);
     ImGui::EndDisabled();

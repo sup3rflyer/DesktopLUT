@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "gui.h"
 #include "crash_handler.h"
+#include "actions/logcap.h"
 #include <objbase.h>
 
 // ============================================================================
@@ -41,6 +42,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
         return 0;
     }
 
+    logcap::Install();   // the diagnostic log for the Events page, before anything else writes
     int result = RunGUI();
     CloseHandle(g_singleInstanceMutex);
     return result;
