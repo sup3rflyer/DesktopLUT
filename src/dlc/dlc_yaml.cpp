@@ -221,13 +221,25 @@ struct Parser {
     std::vector<Line> lines;
     size_t pos = 0;
     int depth = 0;
+    static constexpr int kMaxDepth = 64;   // nesting of mappings and sequences (the stack is the scan worker's)
+
+    // Every mapping / sequence counts one level, undone on every return path.
+    struct Level {
+        int& d;
+        bool ok;
+        explicit Level(int& depthRef) : d(depthRef), ok(++depthRef <= kMaxDepth) {}
+        ~Level() { --d; }
+    };
+
+    // Too deep: the lines of this block are skipped (the rest of the file still parses).
+    void skipBlock(int indent) {
+        while (pos < lines.size() && lines[pos].indent >= indent) pos++;
+    }
 
     // The block whose lines are indented at least `minIndent`; its own indent is the first line's.
     YamlNode block(int minIndent) {
-        if (pos >= lines.size() || lines[pos].indent < minIndent || ++depth > 64) return YamlNode();
-        YamlNode n = IsSeqItem(lines[pos].text) ? sequence(lines[pos].indent) : mapping(lines[pos].indent);
-        depth--;
-        return n;
+        if (pos >= lines.size() || lines[pos].indent < minIndent) return YamlNode();
+        return IsSeqItem(lines[pos].text) ? sequence(lines[pos].indent) : mapping(lines[pos].indent);
     }
 
     // Raw text of a block scalar (| or >): the following lines indented deeper than `indent`.
@@ -256,6 +268,8 @@ struct Parser {
     }
 
     YamlNode mapping(int indent) {
+        Level level(depth);
+        if (!level.ok) { skipBlock(indent); return YamlNode(); }
         YamlNode n;
         n.kind = YamlNode::Map;
         while (pos < lines.size()) {
@@ -275,6 +289,8 @@ struct Parser {
     }
 
     YamlNode sequence(int indent) {
+        Level level(depth);
+        if (!level.ok) { skipBlock(indent); return YamlNode(); }
         YamlNode n;
         n.kind = YamlNode::Seq;
         while (pos < lines.size()) {
@@ -332,6 +348,7 @@ bool YamlNode::isNullish() const {
 }
 
 YamlNode ParseYaml(const std::string& text) {
+    if (text.size() > kMaxYamlBytes) return YamlNode();   // not a hand-written profile
     Parser p;
     p.lines = SplitLines(text);
     YamlNode root = p.block(0);

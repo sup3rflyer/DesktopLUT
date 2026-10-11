@@ -101,12 +101,24 @@ void TakeSnapshot(Snapshot& out) {
 
     // DLC records for every display, live and remembered.
     out.dlc = dlc::Current();
+    // Identical twins: how many displays (live or remembered) share each hardware id.
+    std::vector<std::string> ids;
+    for (const DisplayRow& r : out.live) ids.push_back(dlc::HardwareIdOf(r.settings.identity.edidId, r.settings.identity.devicePath));
+    for (const DisplayRow& r : out.parked) ids.push_back(dlc::HardwareIdOf(r.settings.identity.edidId, r.settings.identity.devicePath));
+    auto twins = [&](const DisplayRow& r) {
+        const std::string id = dlc::HardwareIdOf(r.settings.identity.edidId, r.settings.identity.devicePath);
+        if (id.empty()) return 1;
+        int n = 0;
+        for (const std::string& x : ids) if (_stricmp(x.c_str(), id.c_str()) == 0) n++;
+        return n > 0 ? n : 1;
+    };
     auto attach = [&](DisplayRow& r) {
         const MonitorSettings& ms = r.settings;
         dlc::LiveDisplay& live = r.dlcLive;
         live = dlc::LiveDisplay();
         live.hardwareId = dlc::HardwareIdOf(ms.identity.edidId, ms.identity.devicePath);
         live.monitor = r.liveIndex;
+        live.sameModelCount = twins(r);
         const MHCSettings* mhc[2] = { &ms.sdrMHC, &ms.hdrMHC };
         for (int k = 0; k < 2; k++)
             if (mhc[k]->enabled && !mhc[k]->profileName.empty()) live.mhcSource[k] = mhc[k]->sourceFilePath;

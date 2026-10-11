@@ -81,10 +81,31 @@ std::string WideToUtf8(const std::wstring& w) {
 }
 
 std::wstring NormPath(const std::wstring& p) {
-    std::wstring out;
-    out.reserve(p.size());
-    for (wchar_t c : p) out += c == L'/' ? L'\\' : (wchar_t)std::towlower(c);
-    while (out.size() > 3 && out.back() == L'\\') out.pop_back();
+    std::wstring s;
+    s.reserve(p.size());
+    for (wchar_t c : p) s += c == L'/' ? L'\\' : (wchar_t)std::towlower(c);
+    // Keep a UNC "\\" or a drive "x:" head; normalise the segments after it.
+    std::wstring head;
+    size_t i = 0;
+    bool rooted = false;
+    if (s.compare(0, 2, L"\\\\") == 0) { head = L"\\\\"; i = 2; }
+    else if (s.size() >= 2 && s[1] == L':') { head = s.substr(0, 2); i = 2; rooted = s.size() > 2 && s[2] == L'\\'; }
+    else rooted = !s.empty() && s[0] == L'\\';
+    std::vector<std::wstring> segs;
+    while (i <= s.size()) {
+        size_t j = s.find(L'\\', i);
+        if (j == std::wstring::npos) j = s.size();
+        const std::wstring seg = s.substr(i, j - i);
+        if (seg == L"..") { if (!segs.empty()) segs.pop_back(); }
+        else if (!seg.empty() && seg != L".") segs.push_back(seg);
+        i = j + 1;
+    }
+    std::wstring out = head;
+    if (rooted) out += L'\\';
+    for (size_t k = 0; k < segs.size(); k++) {
+        if (k > 0) out += L'\\';
+        out += segs[k];
+    }
     return out;
 }
 
@@ -93,13 +114,36 @@ bool SamePath(const std::wstring& a, const std::wstring& b) {
 }
 
 std::string RunIdFromPath(const std::wstring& p) {
-    const std::wstring n = NormPath(p);
-    const size_t at = n.find(L"\\runs\\");
-    if (at == std::wstring::npos) return {};
-    const size_t start = at + 6;
-    const size_t end = n.find(L'\\', start);
-    // The original casing: run ids are lower-case anyway, but take it from the input.
-    return WideToUtf8(p.substr(start, (end == std::wstring::npos ? p.size() : end) - start));
+    const std::wstring n = NormPath(p);   // run ids are lower-case: the normalised spelling is the id
+    std::wstring fallback, best;
+    size_t at = 0;
+    while ((at = n.find(L"\\runs\\", at)) != std::wstring::npos) {
+        const size_t start = at + 6;
+        const size_t end = n.find(L'\\', start);
+        const std::wstring seg = n.substr(start, (end == std::wstring::npos ? n.size() : end) - start);
+        if (!seg.empty()) {
+            fallback = seg;
+            if (IsRunFolderName(seg)) best = seg;
+        }
+        at = start;
+    }
+    return WideToUtf8(best.empty() ? fallback : best);
+}
+
+std::string InferModeFromFilename(const std::wstring& path) {
+    const size_t slash = path.find_last_of(L"\\/");
+    std::string base = WideToUtf8(slash == std::wstring::npos ? path : path.substr(slash + 1));
+    for (char& c : base) c = (char)toupper((unsigned char)c);
+    auto delim = [](char c) { return c == '_' || c == '-' || c == '.' || c == ' '; };
+    bool hdr = false, sdr = false;
+    for (size_t i = 0; i + 3 <= base.size(); i++) {
+        const std::string tok = base.substr(i, 3);
+        if (tok != "HDR" && tok != "SDR") continue;
+        if (i > 0 && !delim(base[i - 1])) continue;
+        if (i + 3 < base.size() && !delim(base[i + 3])) continue;
+        (tok == "HDR" ? hdr : sdr) = true;
+    }
+    return hdr == sdr ? std::string() : (hdr ? "HDR" : "SDR");
 }
 
 std::string NormMode(const std::string& m) {
@@ -158,6 +202,7 @@ Profile ParseProfile(const std::string& yamlText, const std::wstring& profileDir
     p.outputDir = IsAbsolute(out) ? out : profileDir + L"\\" + out;
     if (const YamlNode* meter = root.find("meter"); meter && meter->kind == YamlNode::Map) {
         if (const YamlNode* c = meter->find("correction"); c && c->kind == YamlNode::Map) {
+            p.correctionFile = c->str("file");
             p.correctionMade = c->str("made");
             p.correctionMaxAgeDays = c->integer("max_age_days", 180);
             if (p.correctionMaxAgeDays <= 0) p.correctionMaxAgeDays = 180;
@@ -209,20 +254,36 @@ std::vector<CorrectionRecord> ParseCorrectionStore(const std::string& json) {
         c.file = WStr(&r, "correction_file");
         out.push_back(std::move(c));
     };
+    static const char* const kRecordKeys[] = { "display", "correction_file", "correction_made", "spd_file", "white_xy",
+                                                "white_provenance", "observer", "anchor", "strength", "updated",
+                                                "mode", "mode_source" };
+    std::vector<CorrectionRecord> legacy;
     for (const auto& kv : displays->members) {
         const JsonValue& entry = kv.second;
         if (entry.type != JsonValue::Obj) continue;
-        if (entry.has("display") || entry.has("correction_file")) {
-            // Schema 1: one flat record per display. Its mode is the _HDR / _SDR token in the file name,
-            // else SDR (what DLC assumes).
-            const std::string file = Str(&entry, "correction_file");
-            std::string upper;
-            for (char ch : file) upper += (char)toupper((unsigned char)ch);
-            take(kv.first, entry, upper.find("_HDR") != std::string::npos ? "HDR" : "SDR");
+        bool flat = false;
+        for (const char* k : kRecordKeys) if (entry.has(k)) { flat = true; break; }
+        if (flat) {
+            // Schema 1 (DLC's _legacy_record): one slot. A recorded mode wins; else the correction file
+            // name's tag, else the SPD file's; untagged or contradictory -> SDR.
+            std::string mode = NormMode(Str(&entry, "mode"));
+            if (mode.empty()) {
+                const std::string file = Str(&entry, "correction_file");
+                mode = InferModeFromFilename(Utf8ToWide(!file.empty() ? file : Str(&entry, "spd_file")));
+            }
+            take(kv.first, entry, mode.empty() ? "SDR" : mode);
+            legacy.push_back(out.back());
+            out.pop_back();
             continue;
         }
         for (const auto& mk : entry.members)   // schema 2: one record per mode
             if (mk.second.type == JsonValue::Obj && !NormMode(mk.first).empty()) take(kv.first, mk.second, NormMode(mk.first));
+    }
+    // A schema-2 slot wins over a legacy one for the same display and mode; among legacy ones, the first.
+    for (const CorrectionRecord& l : legacy) {
+        bool taken = false;
+        for (const CorrectionRecord& r : out) if (r.display == l.display && r.mode == l.mode) taken = true;
+        if (!taken) out.push_back(l);
     }
     return out;
 }
@@ -265,6 +326,7 @@ bool ParseReport(const std::string& json, Report& out) {
     out.deliveredCube = WStr(Obj(&root, "deliverables"), "cube");
     if (const JsonValue* vo = Obj(&root, "verify_only")) {
         out.runtimeCube = WStr(Obj(vo, "measured_stack"), "runtime_cube");
+        out.verifiedMhcSource = WStr(Obj(Obj(vo, "measured_stack"), "installed_stack"), "pipe_source_file");
         out.hardwareId = Str(Obj(Obj(vo, "verify_source"), "identity"), "hardware_id");
     }
     return true;

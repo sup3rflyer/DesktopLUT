@@ -32,6 +32,7 @@ struct Data {
 struct LiveDisplay {
     std::string hardwareId;                 // EDID vendor + product ("ABC1234"); empty when unknown
     int monitor = -1;                       // live index (tie-break only)
+    int sameModelCount = 1;                 // live displays with this hardware id (identical twins > 1)
     std::wstring mhcSource[2];              // <MODE>_MHCSourceFile of an enabled MHC profile, else empty
     std::wstring lut[2];                    // LUT_SDR / LUT_HDR
 };

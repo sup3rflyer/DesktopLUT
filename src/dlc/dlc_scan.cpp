@@ -1,4 +1,5 @@
 #include "dlc/dlc_scan.h"
+#include "dlc/dlc_yaml.h"   // kMaxYamlBytes
 
 #include <windows.h>
 #include <algorithm>
@@ -11,7 +12,12 @@ namespace dlc {
 
 namespace {
 
-constexpr uint64_t kMaxFileBytes = 64ull << 20;     // a report or store larger than this is not DLC's
+// Size caps per kind of file (DLC's real ones: profile ~10 KB, stores and reports ~40 KB, patch metrics
+// ~120 KB): anything far larger is not DLC's, and parsing it would cost memory for nothing.
+constexpr uint64_t kProfileBytes = kMaxYamlBytes;
+constexpr uint64_t kStoreBytes = 4ull << 20;
+constexpr uint64_t kReportBytes = 4ull << 20;
+constexpr uint64_t kPatchBytes = 16ull << 20;
 constexpr uint64_t kEventsTailBytes = 256u << 10;   // run_done sits near the end of events.jsonl
 
 bool Stat(const std::wstring& path, ScanCache::Stamp& st, bool* isDir = nullptr) {
@@ -36,7 +42,7 @@ bool IsDir(const std::wstring& path) {
 }
 
 // Reads a whole file (or its last `tail` bytes) with every share mode: DLC may be writing or replacing it.
-bool ReadShared(const std::wstring& path, std::string& out, uint64_t tail = 0) {
+bool ReadShared(const std::wstring& path, std::string& out, uint64_t maxBytes, uint64_t tail = 0) {
     out.clear();
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -50,7 +56,7 @@ bool ReadShared(const std::wstring& path, std::string& out, uint64_t tail = 0) {
         ok = SetFilePointerEx(h, off, nullptr, FILE_BEGIN) != 0;
         want = tail;
     }
-    if (ok && want > kMaxFileBytes) ok = false;
+    if (ok && want > maxBytes) ok = false;
     if (ok && want) {
         out.resize((size_t)want);
         DWORD got = 0;
@@ -124,7 +130,9 @@ std::wstring PatchMetricsPath(const std::wstring& runDir) {
     return best.empty() ? std::wstring() : dir + L"\\" + best;
 }
 
-std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, const std::string& today) {
+std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, const std::string& today,
+                                 const std::atomic<bool>* cancel) {
+    auto stop = [cancel] { return cancel && cancel->load(std::memory_order_relaxed); };
     auto d = std::make_shared<Data>();
     d->today = today;
     if (folder.empty() || !IsDir(folder)) return d;
@@ -132,20 +140,21 @@ std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, c
     std::string text;
 
     const std::wstring profilePath = folder + L"\\calibration_profile.yaml";
-    if (ReadShared(profilePath, text)) {
+    if (ReadShared(profilePath, text, kProfileBytes)) {
         d->profileFound = true;
         d->profile = ParseProfile(text, folder);
     } else {
         d->profile.outputDir = folder + L"\\results";
     }
-    if (ReadShared(folder + L"\\stack_registry.json", text)) d->stacks = ParseStackRegistry(text);
-    if (ReadShared(folder + L"\\correction_store.json", text)) d->corrections = ParseCorrectionStore(text);
+    if (ReadShared(folder + L"\\stack_registry.json", text, kStoreBytes)) d->stacks = ParseStackRegistry(text);
+    if (ReadShared(folder + L"\\correction_store.json", text, kStoreBytes)) d->corrections = ParseCorrectionStore(text);
 
     // Runs: results folder -> run folder, from each run's run_done event (the reliable link).
     const std::wstring runsDir = folder + L"\\runs";
     std::vector<std::wstring> runNames;
     std::map<std::wstring, std::wstring> runOfResults;   // NormPath(results dir) -> run dir
     for (const std::wstring& n : ListDirs(runsDir)) {
+        if (stop()) return d;   // shutting down: the snapshot is discarded anyway
         if (!IsRunFolderName(n)) continue;
         runNames.push_back(n);
         const std::wstring events = runsDir + L"\\" + n + L"\\events.jsonl";
@@ -154,7 +163,7 @@ std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, c
         auto it = cache.runDone.find(events);
         if (it == cache.runDone.end() || !(it->second.first == st)) {
             std::vector<std::wstring> dirs;
-            if (ReadShared(events, text, kEventsTailBytes)) dirs = RunDoneResultsDirs(text);
+            if (ReadShared(events, text, kEventsTailBytes, kEventsTailBytes)) dirs = RunDoneResultsDirs(text);
             it = cache.runDone.insert_or_assign(events, std::make_pair(st, std::move(dirs))).first;
         }
         for (const std::wstring& r : it->second.second) runOfResults[NormPath(r)] = runsDir + L"\\" + n;
@@ -163,23 +172,27 @@ std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, c
     // Reports: <output>\<folder>\report.json (folders starting with '_' or '.' are DLC's scratch).
     const std::wstring out = d->profile.outputDir;
     for (const std::wstring& n : ListDirs(out)) {
+        if (stop()) return d;
         if (n.empty() || n[0] == L'_' || n[0] == L'.') continue;
         const std::wstring dir = out + L"\\" + n;
         const std::wstring path = dir + L"\\report.json";
         ScanCache::Stamp st;
         if (!Stat(path, st)) continue;
         auto it = cache.reports.find(path);
-        if (it == cache.reports.end() || !(it->second.first == st)) {
-            Report r;
-            bool ok = ReadShared(path, text) && ParseReport(text, r);
-            if (!ok) {   // caught mid-replace: once more
+        if (it == cache.reports.end() || !(it->second.stamp == st)) {
+            ScanCache::CachedReport c;
+            c.stamp = st;
+            c.ok = ReadShared(path, text, kReportBytes) && ParseReport(text, c.report);
+            if (!c.ok) {   // caught mid-write (DLC writes report.json in place): once more
                 Sleep(150);
-                ok = ReadShared(path, text) && ParseReport(text, r);
+                c.report = Report();
+                c.ok = ReadShared(path, text, kReportBytes) && ParseReport(text, c.report);
             }
-            if (!ok) continue;
-            it = cache.reports.insert_or_assign(path, std::make_pair(st, std::move(r))).first;
+            // A failure is remembered too: an unreadable file is not re-read until it changes.
+            it = cache.reports.insert_or_assign(path, std::move(c)).first;
         }
-        Report r = it->second.second;
+        if (!it->second.ok) continue;
+        Report r = it->second.report;
         r.path = path;
         r.folder = dir;
         r.mtime = st.mtime;
@@ -196,12 +209,20 @@ std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, c
     }
     // Newest first: by date, then by run id (it starts with the run's start time), then by file time
     // (a report can be rewritten after a later run's).
-    std::stable_sort(d->reports.begin(), d->reports.end(), [](const Report& a, const Report& b) {
-        if (a.date != b.date) return a.date > b.date;
-        const std::string ra = RunIdFromPath(a.runDir), rb = RunIdFromPath(b.runDir);
-        const bool sa = IsRunFolderName(Utf8ToWide(ra)), sb = IsRunFolderName(Utf8ToWide(rb));
-        if (sa && sb && ra != rb) return ra > rb;
-        return a.mtime > b.mtime;
+    // One lexicographic key (a strict weak order): date, then reports with a run id before those
+    // without, then the run id, then the file time; all newest first.
+    struct Key { std::string date; bool hasId; std::string id; uint64_t mtime; };
+    auto keyOf = [](const Report& r) {
+        const std::string id = RunIdFromPath(r.runDir);
+        const bool valid = IsRunFolderName(Utf8ToWide(id));
+        return Key{ r.date, valid, valid ? id : std::string(), r.mtime };
+    };
+    std::stable_sort(d->reports.begin(), d->reports.end(), [&](const Report& a, const Report& b) {
+        const Key ka = keyOf(a), kb = keyOf(b);
+        if (ka.date != kb.date) return ka.date > kb.date;
+        if (ka.hasId != kb.hasId) return ka.hasId;
+        if (ka.id != kb.id) return ka.id > kb.id;
+        return ka.mtime > kb.mtime;
     });
     return d;
 }
@@ -214,6 +235,7 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 std::thread g_thread;
 bool g_stop = false;
+std::atomic<bool> g_cancel{ false };   // StopScanner: an in-flight scan returns early
 bool g_scanWanted = false;
 std::wstring g_folder;
 std::deque<std::wstring> g_patchQueue;
@@ -249,7 +271,8 @@ void WorkerMain() {
             }
         }
         if (scan) {
-            std::shared_ptr<const Data> d = ScanFolder(folder, cache, Today());
+            std::shared_ptr<const Data> d = ScanFolder(folder, cache, Today(), &g_cancel);
+            if (g_cancel.load()) return;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_current = d;
@@ -259,7 +282,7 @@ void WorkerMain() {
             std::vector<Patch> patches;
             const std::wstring path = PatchMetricsPath(patchRun);
             std::string text;
-            if (!path.empty() && ReadShared(path, text)) patches = ParsePatchMetrics(text);
+            if (!path.empty() && ReadShared(path, text, kPatchBytes)) patches = ParsePatchMetrics(text);
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_patches[NormPath(patchRun)] = std::make_shared<const std::vector<Patch>>(std::move(patches));
@@ -297,6 +320,7 @@ void StopScanner() {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_stop = true;
         g_listener = nullptr;
+        g_cancel.store(true);
     }
     g_cv.notify_one();
     if (g_thread.joinable()) g_thread.join();

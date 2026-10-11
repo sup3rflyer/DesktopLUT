@@ -5,6 +5,7 @@
 
 #include "dlc/dlc_join.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -24,12 +25,15 @@ std::wstring PatchMetricsPath(const std::wstring& runDir);
 // Parsed files kept between scans, keyed by path; reused while size and write time are unchanged.
 struct ScanCache {
     struct Stamp { uint64_t size = 0, mtime = 0; bool operator==(const Stamp& o) const { return size == o.size && mtime == o.mtime; } };
-    std::map<std::wstring, std::pair<Stamp, Report>> reports;
+    struct CachedReport { Stamp stamp; bool ok = false; Report report; };   // ok false: unreadable at this stamp
+    std::map<std::wstring, CachedReport> reports;
     std::map<std::wstring, std::pair<Stamp, std::vector<std::wstring>>> runDone;   // events.jsonl -> results dirs
 };
 
-// One synchronous scan (the worker's body; tests call it on fixtures). `today` is YYYY-MM-DD.
-std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, const std::string& today);
+// One synchronous scan (the worker's body; tests call it on fixtures). `today` is YYYY-MM-DD. `cancel`
+// set: returns early with what it has (shutdown).
+std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, const std::string& today,
+                                 const std::atomic<bool>* cancel = nullptr);
 
 // ---- the worker ------------------------------------------------------------------------------------
 void SetScanListener(std::function<void()> onChange);   // called on the worker after each publish / load

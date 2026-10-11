@@ -36,7 +36,7 @@ struct JsonOptions {
         JsonOptions o;
         o.allowNonFinite = true;
         o.skipBom = true;
-        o.maxValues = 20000000;
+        o.maxValues = 1000000;   // DLC's largest real files hold a few thousand values
         return o;
     }
 };

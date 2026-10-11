@@ -414,11 +414,18 @@ TEST_CASE("dlc join: layers against the record, the report that verified what ru
     CHECK(rec.verifiedDaysAgo == 120);
     CHECK(rec.reminderDue);             // older than 90 days
     const ModeRecord off = RecordFor(d, "Panel B", 1, b, 0);     // verification reminder off
-    CHECK(off.correctionMade == "2026-01-10");                   // no store entry: the profile's date
-    CHECK(off.reminderDue);                                      // the meter correction is still stale
-    Data fresh = d;
-    fresh.profile.correctionMade.clear();
-    CHECK_FALSE(RecordFor(fresh, "Panel B", 1, b, 0).reminderDue);
+    CHECK(off.correctionMade.empty());                           // profile file: null -> no correction (DLC)
+    CHECK_FALSE(off.reminderDue);
+    Data withFile = d;
+    withFile.profile.correctionFile = "panel_b.ccmx";            // a profile correction file: its date counts
+    const ModeRecord prof = RecordFor(withFile, "Panel B", 1, b, 0);
+    CHECK(prof.correctionMade == "2026-01-10");
+    CHECK(prof.correctionStale);
+    CHECK(prof.reminderDue);
+    Data storeNoFile = d;                                        // a store record without a file: none
+    storeNoFile.corrections.push_back({ "Panel B", "HDR", "2026-05-01", L"" });
+    storeNoFile.profile.correctionFile = "panel_b.ccmx";
+    CHECK(RecordFor(storeNoFile, "Panel B", 1, b, 0).correctionMade.empty());
 
     LiveDisplay noRecord;
     noRecord.lut[1] = L"X:\\x.cube";
@@ -519,3 +526,161 @@ TEST_CASE("dlc scan: a real DLC folder (DLUT_REAL_DLC)" * doctest::skip(GetEnvir
                 << " cube " << (s.cubePath.empty() ? "-" : "yes"));
     CHECK(d->folder == folder);
 }
+
+// Developer check: the join for each [Display<n>] of a real DesktopLUT.ini (read-only), against the real DLC
+// folder. Set DLUT_REAL_DLC and DLUT_REAL_INI. Skipped otherwise.
+TEST_CASE("dlc join: a real INI against a real DLC folder (DLUT_REAL_INI)" *
+          doctest::skip(GetEnvironmentVariableW(L"DLUT_REAL_INI", nullptr, 0) == 0 ||
+                        GetEnvironmentVariableW(L"DLUT_REAL_DLC", nullptr, 0) == 0)) {
+    wchar_t folder[MAX_PATH] = {}, ini[MAX_PATH] = {};
+    GetEnvironmentVariableW(L"DLUT_REAL_DLC", folder, MAX_PATH);
+    GetEnvironmentVariableW(L"DLUT_REAL_INI", ini, MAX_PATH);
+    ScanCache cache;
+    auto d = ScanFolder(folder, cache, "2026-10-11");
+    auto get = [&](const std::wstring& sec, const wchar_t* key) {
+        wchar_t buf[2048] = {};
+        GetPrivateProfileStringW(sec.c_str(), key, L"", buf, 2048, ini);
+        return std::wstring(buf);
+    };
+    for (int n = 0; n < 10; n++) {
+        const std::wstring sec = L"Display" + std::to_wstring(n);
+        const std::wstring edid = get(sec, L"EdidId");
+        if (edid.empty()) continue;
+        LiveDisplay live;
+        live.hardwareId = HardwareIdOf(edid, get(sec, L"DevicePath"));
+        live.monitor = n;
+        live.lut[0] = get(sec, L"LUT_SDR");
+        live.lut[1] = get(sec, L"LUT_HDR");
+        if (get(sec, L"SDR_MHCEnabled") == L"true") live.mhcSource[0] = get(sec, L"SDR_MHCSourceFile");
+        if (get(sec, L"HDR_MHCEnabled") == L"true") live.mhcSource[1] = get(sec, L"HDR_MHCSourceFile");
+        const DisplayMatch m = MatchDisplay(*d, live);
+        MESSAGE(WideToUtf8(sec) << " " << live.hardwareId << " -> " << (m.name.empty() ? "(none)" : m.name) << " by " << (int)m.by
+                << (m.ambiguous ? " AMBIGUOUS" : ""));
+        if (m.name.empty()) continue;
+        for (int k = 0; k < 2; k++) {
+            const ModeRecord rec = RecordFor(*d, m.name, k, live, 90);
+            const Report* cur = rec.current >= 0 ? &d->reports[rec.current] : nullptr;
+            const Report* lat = rec.latest >= 0 ? &d->reports[rec.latest] : nullptr;
+            MESSAGE("  " << (k ? "HDR" : "SDR") << " mhc " << (int)rec.mhc << " cube " << (int)rec.cube << " current "
+                    << (cur ? WideToUtf8(cur->folder.substr(cur->folder.find_last_of(L'\\') + 1)) : std::string("-"))
+                    << (cur ? " avg " + std::to_string(cur->verification.avg) + " " + cur->verification.metric : std::string())
+                    << " | latest " << (lat ? WideToUtf8(lat->folder.substr(lat->folder.find_last_of(L'\\') + 1)) : std::string("-"))
+                    << " | meter " << rec.correctionMade << " due " << rec.reminderDue);
+        }
+    }
+}
+
+// ---- review fixes -----------------------------------------------------------------------------------
+
+TEST_CASE("dlc join: an SDR-content check on an HDR display is not the HDR verification") {
+    Data d = SampleData();
+    Report sdrInHdr;   // newest, verifies the same HDR cube, but measured SDR content
+    sdrInHdr.display = "Panel A"; sdrInHdr.mode = "HDR"; sdrInHdr.contentMode = "SDR"; sdrInHdr.date = "2026-05-30";
+    sdrInHdr.verification.present = true;
+    sdrInHdr.runtimeCube = L"X:\\a_hdr.cube";
+    Report hdr = sdrInHdr;
+    hdr.contentMode = "HDR"; hdr.date = "2026-05-20";
+    d.reports.insert(d.reports.begin(), { sdrInHdr, hdr });
+    LiveDisplay live;
+    live.lut[1] = L"X:\\a_hdr.cube";
+    const ModeRecord rec = RecordFor(d, "Panel A", 1, live, 90);
+    CHECK(rec.current == 1);   // the HDR check, not the newer SDR-content one
+    CHECK(rec.latest == 1);
+}
+
+TEST_CASE("dlc join: a cube counts as verified only over the MHC it was measured with") {
+    Data d = SampleData();
+    LiveDisplay a;
+    a.lut[0] = d.stacks[0].cubePath;
+    a.mhcSource[0] = d.stacks[0].baseLut;
+    CHECK(RecordFor(d, "Panel A", 0, a, 90).current == 0);
+    a.mhcSource[0] = L"X:\\dlc\\runs\\older\\generated\\mhc_base_sdr.cube";   // the MHC changed under the cube
+    ModeRecord rec = RecordFor(d, "Panel A", 0, a, 90);
+    CHECK(rec.mhc == LayerState::Differs);
+    CHECK(rec.current == -1);
+    // A verify-only report records the MHC it measured: that decides, not the registry.
+    d.reports[0].verifiedMhcSource = a.mhcSource[0];
+    rec = RecordFor(d, "Panel A", 0, a, 90);
+    CHECK(rec.current == 0);
+}
+
+TEST_CASE("dlc join: contradicting hardware ids veto file evidence; twins on the desk are not guessed") {
+    Data d = SampleData();
+    // Panel B's verify-only report says it is QQQ1111; a BBB2222 display running Panel B's MHC is not it.
+    Report idRep;
+    idRep.display = "Panel B"; idRep.mode = "HDR"; idRep.hardwareId = "QQQ1111";
+    d.reports.push_back(idRep);
+    LiveDisplay other;
+    other.hardwareId = "BBB2222";
+    other.mhcSource[1] = d.stacks[1].baseLut;
+    CHECK(MatchDisplay(d, other).name.empty());
+    other.hardwareId = "QQQ1111";
+    CHECK(MatchDisplay(d, other).name == "Panel B");
+
+    // One profile entry with ABC1234 (monitor 0), two such panels live: index decides, else files, else ambiguous.
+    LiveDisplay twin;
+    twin.hardwareId = "ABC1234";
+    twin.sameModelCount = 2;
+    twin.monitor = 0;
+    CHECK(MatchDisplay(d, twin).name == "Panel A");
+    twin.monitor = 1;
+    CHECK(MatchDisplay(d, twin).ambiguous);
+    twin.lut[0] = d.stacks[0].cubePath;            // ...unless it runs Panel A's files
+    CHECK(MatchDisplay(d, twin).name == "Panel A");
+}
+
+TEST_CASE("dlc: correction store schema 1 uses DLC's file-name tags, the SPD fallback, contradictions -> SDR") {
+    CHECK(InferModeFromFilename(L"X:\\third_party\\BenQ-HDR.ccmx") == "HDR");
+    CHECK(InferModeFromFilename(L"X:\\HDR\\plain.ccmx").empty());              // the folder does not count
+    CHECK(InferModeFromFilename(L"panel_HDR_SDR.ccmx").empty());               // contradictory
+    CHECK(InferModeFromFilename(L"panelhdr.ccmx").empty());                    // inside a word
+    CHECK(InferModeFromFilename(L"panel.sdr") == "SDR");
+    const auto v1 = ParseCorrectionStore(R"({"displays": {
+        "Panel S": {"spd_file": "spd_HDR.sp", "correction_made": "2026-01-01"},
+        "Panel M": {"mode": "hdr", "correction_file": "a_SDR.ccmx"},
+        "Panel X": {"correction_file": "x_HDR_SDR.ccmx"}}})");
+    REQUIRE(v1.size() == 3);
+    CHECK(v1[0].mode == "HDR");   // no correction file: the SPD file's tag
+    CHECK(v1[1].mode == "HDR");   // a recorded mode wins over the tag
+    CHECK(v1[2].mode == "SDR");   // contradictory tags -> SDR
+}
+
+TEST_CASE("dlc: path normalisation and run ids") {
+    CHECK(NormPath(L"X:\\dlc\\.\\results\\\\A\\") == L"x:\\dlc\\results\\a");
+    CHECK(NormPath(L"X:\\dlc\\runs\\..\\results") == L"x:\\dlc\\results");
+    CHECK(NormPath(L"\\\\server\\share\\dlc") == L"\\\\server\\share\\dlc");
+    CHECK(NormPath(L"X:\\") == L"x:\\");
+    CHECK(SamePath(L"X:/dlc/./results/A", L"x:\\DLC\\results\\a\\"));
+    CHECK(RunIdFromPath(L"D:\\runs\\work\\DLC\\runs\\20260101_000000_sdr_a\\generated\\f.cube") == "20260101_000000_sdr_a");
+}
+
+TEST_CASE("dlc yaml: alternating nested sequences and mappings are depth-bounded, the rest still parses") {
+    std::string deep;
+    for (int i = 0; i < 400; i++) deep += std::string((size_t)i * 2, ' ') + "- a:\n";
+    deep = "first: 1\nnest:\n" + deep + "last: 2\n";
+    YamlNode root;
+    CHECK_NOTHROW(root = ParseYaml(deep));
+    CHECK(root.str("first") == "1");
+    CHECK(root.str("last") == "2");
+    CHECK(ParseYaml(std::string(kMaxYamlBytes + 1, 'a')).kind == YamlNode::Null);
+}
+
+TEST_CASE("dlc scan: unreadable reports are remembered until they change; cancel returns early") {
+    TempDir t;
+    t.write(L"calibration_profile.yaml", "paths:\n  output: results\n");
+    t.mkdir(L"results\\Broken_2026-01-01_SDR");
+    t.write(L"results\\Broken_2026-01-01_SDR\\report.json", "{not json");
+    ScanCache cache;
+    auto d = ScanFolder(t.path, cache, "2026-01-02");
+    CHECK(d->reports.empty());
+    REQUIRE(cache.reports.size() == 1);
+    CHECK_FALSE(cache.reports.begin()->second.ok);
+    t.write(L"results\\Broken_2026-01-01_SDR\\report.json",
+            R"({"flow": "full", "mode": "SDR", "display": "Panel", "date": "2026-01-01", "verification": {}})");
+    d = ScanFolder(t.path, cache, "2026-01-02");
+    CHECK(d->reports.size() == 1);
+    std::atomic<bool> cancel{ true };
+    d = ScanFolder(t.path, cache, "2026-01-02", &cancel);
+    CHECK(d->reports.empty());
+}
+

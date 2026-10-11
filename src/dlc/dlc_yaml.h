@@ -28,7 +28,8 @@ struct YamlNode {
     bool isNullish() const;   // Null, or a scalar "null" / "~" / ""
 };
 
-// Parses UTF-8 text (a BOM is skipped).
+// Parses UTF-8 text (a BOM is skipped). Text larger than kMaxYamlBytes reads as empty (Null).
+constexpr size_t kMaxYamlBytes = 1u << 20;
 YamlNode ParseYaml(const std::string& text);
 
 }  // namespace dlc

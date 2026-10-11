@@ -19,13 +19,18 @@ constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
 std::wstring Utf8ToWide(const std::string& s);
 std::string WideToUtf8(const std::wstring& w);
 
-// Paths compare normalised: '/' -> '\', lower-case, no trailing separator (DLC writes str(Path)).
+// Paths compare normalised: '/' -> '\', lower-case, repeated separators and "." segments collapsed, ".."
+// resolved, no trailing separator (DLC writes str(Path), which drops "." itself).
 std::wstring NormPath(const std::wstring& p);
 bool SamePath(const std::wstring& a, const std::wstring& b);   // false when either is empty
-// "...\runs\<id>\..." -> "<id>" (empty when the path has no runs\<id> segment).
+// "...\runs\<id>\..." -> "<id>": the last runs\<segment> whose segment is a run folder name, else the last
+// runs\<segment> (a DLC folder may itself sit under another "runs" folder). Empty when there is none.
 std::string RunIdFromPath(const std::wstring& p);
 // "SDR" / "HDR" for any casing; "" otherwise.
 std::string NormMode(const std::string& m);
+// DLC's infer_mode_from_filename: the file NAME's delimited HDR / SDR tag (start/end or one of _ - . space
+// around it) when it carries exactly one kind; "" when untagged or contradictory.
+std::string InferModeFromFilename(const std::wstring& path);
 // Days from an ISO date ("YYYY-MM-DD", anything after it ignored) to `today` (same form); -1 if unreadable.
 int DaysBetween(const std::string& isoDate, const std::string& today);
 
@@ -40,6 +45,7 @@ struct Profile {
     bool readable = false;
     std::vector<ProfileDisplay> displays;
     std::wstring outputDir;            // paths.output resolved against the profile's folder ("results")
+    std::string correctionFile;        // meter.correction.file (empty: no correction)
     std::string correctionMade;        // meter.correction.made
     int correctionMaxAgeDays = 180;    // meter.correction.max_age_days
 };
@@ -83,6 +89,7 @@ struct Report {
     std::wstring cubePath;         // lut3d.cube_path  (runs\<id>\generated\final_<mode>.cube)
     std::wstring deliveredCube;    // deliverables.cube (the copy in the results folder)
     std::wstring runtimeCube;      // verify_only.measured_stack.runtime_cube (the cube that was verified)
+    std::wstring verifiedMhcSource;// verify_only.measured_stack.installed_stack.pipe_source_file (its MHC)
     std::string hardwareId;        // verify_only.verify_source.identity.hardware_id
     std::wstring runDir;           // resolved by the scanner (run_done event, cube path, folder stamp)
     uint64_t mtime = 0;            // file time, orders same-day reports
