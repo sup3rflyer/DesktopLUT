@@ -63,6 +63,9 @@ bool BeginGsEdit(int mon, bool hdr) {
             if (hdr) gs.initLinearPQ(); else gs.initLinear();
         }
         e.before = gs;
+        // Editing the curve switches it on: the bake leaves a switched-off curve out, so neither the preview nor DONE
+        // would show the edit. CANCEL restores `before`, switch included.
+        gs.enabled = true;
     }
 
     // The overlay (or, in hook mode, the hook) applies the profile while scanout runs an identity one.

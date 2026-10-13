@@ -281,7 +281,12 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             changed = true;
         }
         ImGui::SameLine(0, Px(8));
-        if (Button("##gs_cancel", "CANCEL", bw) || (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsAnyItemActive())) {
+        // Esc closes the measurement patch first (it never takes focus, so its Esc lands here); with no patch up it
+        // cancels the edit.
+        const bool escape = ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsAnyItemActive();
+        const bool escClosesPatch = escape && !ed.renderOnly && ed.patch != PatchSize::Off;
+        if (escClosesPatch) ed.patch = PatchSize::Off;
+        if (Button("##gs_cancel", "CANCEL", bw) || (escape && !escClosesPatch)) {
             GsEditorState* p = &ed;
             Post([p]() { HidePatch(); act::EndGsEdit(false); p->open = false; });
         }
@@ -462,7 +467,7 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             if (pp >= 0) ed.patch = (PatchSize)pp;
             if (ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) && ImGui::IsWindowHovered())
                 ImGui::SetTooltip("A patch at the selected point's level on the display being edited, for the meter.\n"
-                                  "It goes through the whole pipeline, the live edit included. 10 %%: a window on black.");
+                                  "It goes through the whole pipeline, the live edit included. 10 %%: a window on black. Esc closes it.");
         }
         // The four faders.
         const float colW = (ax1 - ax0) / 4.0f;

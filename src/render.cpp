@@ -916,10 +916,14 @@ void RenderAll(FramePacer* fp) {
         } else {
             Sleep(50);
         }
-        // Fall through if reinit, pending corrections, or analysis state change
-        // need processing — all can change whether the overlay needs to render.
+        // Fall through if reinit, pending corrections, analysis or a live edit preview (mhc_preview.h: a new stage
+        // generation) need processing — all can change whether the overlay needs to render.
+        static unsigned s_sleepPreviewGen = 0;
+        const unsigned previewGen = g_mhcPreviewStageGen.load(std::memory_order_acquire);
+        const bool previewMoved = previewGen != s_sleepPreviewGen;
+        s_sleepPreviewGen = previewGen;
         if (!g_forceReinit.load() && !g_hasPendingColorCorrections.load()
-            && !g_analysisEnabled.load()) {
+            && !g_analysisEnabled.load() && !previewMoved) {
             return;
         }
     }
