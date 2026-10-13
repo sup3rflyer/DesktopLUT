@@ -3,6 +3,7 @@
 #include "globals.h"
 #include "monitor_identity.h"
 #include "processing.h"
+#include "dwm_inject.h"   // DwmHookMonitorLUT
 #include "fald.h"    // FALD_TAU_MAX_MS
 #include <cstdio>
 #include <cmath>
@@ -1266,6 +1267,145 @@ TEST_CASE("Processing predicates: MHC-only needs no processing but counts as a c
 
     g_userDesktopGammaMode = dg;
     g_gui.monitorSettings.clear();
+}
+
+namespace {
+
+// Saves and restores the globals the processing predicates read.
+struct PredicateGlobalsGuard {
+    bool hook = g_dwmHookMode.load();
+    bool dg = g_userDesktopGammaMode.load();
+    bool analysis = g_analysisEnabled.load();
+    std::vector<HMONITOR> monitors = g_gui.monitors;
+    PredicateGlobalsGuard() {
+        g_userDesktopGammaMode = false;
+        g_analysisEnabled = false;
+        g_gui.monitorSettings.clear();
+    }
+    ~PredicateGlobalsGuard() {
+        g_dwmHookMode = hook;
+        g_userDesktopGammaMode = dg;
+        g_analysisEnabled = analysis;
+        g_gui.monitors = monitors;
+        g_gui.monitorSettings.clear();
+    }
+};
+
+const wchar_t* kHdrPanel = L"C:\\panels\\pa32ucxr_fald_panel.bin";
+const wchar_t* kSdrPanel = L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin";
+
+}  // namespace
+
+// A display whose only correction is the FALD layer never got the DWM hook: MonitorNeedsProcessing counted
+// FALD only in overlay mode (from when the layer was overlay-only), so StartProcessing, the hook watchdog and
+// the live-layer reconcile (all built on DesiredDwmHookStagingSet) filtered it out, although the DLL runs
+// exactly that setup. Hook mode: the layer on with that mode's panel file. Overlay: the switch alone, as
+// before. And in hook mode the overlay stays down for it: the hook runs the layer.
+TEST_CASE("Processing predicates: the FALD layer needs processing in both engines; hook mode needs its panel file") {
+    PredicateGlobalsGuard guard;
+    REQUIRE_FALSE(g_gui.processingThread.joinable());   // HasActiveShaderCorrections then checks the settings
+    REQUIRE_FALSE(g_mhcEditDialogOpen.load());
+
+    MonitorSettings fald;      // HDR row on, with its panel file; nothing else
+    fald.hdrColorCorrection.fald.enabled = true;
+    fald.hdrColorCorrection.fald.paramsPath = kHdrPanel;
+    MonitorSettings sdrFald;   // SDR (ACM) row alone
+    sdrFald.sdrColorCorrection.fald.enabled = true;
+    sdrFald.sdrColorCorrection.fald.paramsPath = kSdrPanel;
+    MonitorSettings noFile;    // on without a panel file (an old INI; the GUI refuses to switch it on so)
+    noFile.hdrColorCorrection.fald.enabled = true;
+    MonitorSettings off;       // panel file set, layer off
+    off.hdrColorCorrection.fald.paramsPath = kHdrPanel;
+    MonitorSettings crossed;   // HDR row on, only the SDR row has a file: the rows are per mode
+    crossed.hdrColorCorrection.fald.enabled = true;
+    crossed.sdrColorCorrection.fald.paramsPath = kSdrPanel;
+
+    SUBCASE("hook mode") {
+        g_dwmHookMode = true;
+        CHECK(MonitorNeedsProcessing(fald));
+        CHECK(MonitorNeedsProcessing(sdrFald));
+        CHECK_FALSE(MonitorNeedsProcessing(noFile));
+        CHECK_FALSE(MonitorNeedsProcessing(off));
+        CHECK_FALSE(MonitorNeedsProcessing(crossed));
+
+        g_gui.monitorSettings = { fald };
+        CHECK(AnyMonitorNeedsProcessing());     // startup, display change, topology tick and reconcile start it
+        CHECK(AnyMonitorHasCorrections());
+        CHECK_FALSE(HasActiveShaderCorrections());           // no overlay, no analysis-only thread
+        CHECK_FALSE(EvalNonAnalysisShaderCorrections());
+
+        g_gui.monitorSettings = { sdrFald };
+        CHECK_FALSE(HasActiveShaderCorrections());
+        CHECK_FALSE(EvalNonAnalysisShaderCorrections());
+
+        g_gui.monitorSettings = { off, noFile, crossed };
+        CHECK_FALSE(AnyMonitorNeedsProcessing());
+    }
+    SUBCASE("overlay mode: the switch alone, as before") {
+        g_dwmHookMode = false;
+        CHECK(MonitorNeedsProcessing(fald));
+        CHECK(MonitorNeedsProcessing(sdrFald));
+        CHECK(MonitorNeedsProcessing(noFile));
+        CHECK(MonitorNeedsProcessing(crossed));
+        CHECK_FALSE(MonitorNeedsProcessing(off));
+
+        g_gui.monitorSettings = { fald };
+        CHECK(HasActiveShaderCorrections());
+        CHECK(EvalNonAnalysisShaderCorrections());
+    }
+}
+
+// The staging set StartProcessing injects, the watchdog re-injects and the reconcile compares against the
+// resident hook. Only GetMonitorInfo on the primary display: nothing is injected.
+TEST_CASE("DesiredDwmHookStagingSet: a FALD-only display is staged with its panel files") {
+    PredicateGlobalsGuard guard;
+    HMONITOR primary = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!primary || !GetMonitorInfo(primary, &mi)) { MESSAGE("skipped: no display to stage"); return; }
+    g_gui.monitors = { primary };
+    g_dwmHookMode = true;
+
+    MonitorSettings ms;
+    ms.hdrColorCorrection.fald.enabled = true;
+    ms.hdrColorCorrection.fald.paramsPath = kHdrPanel;
+    ms.sdrColorCorrection.fald.paramsPath = kSdrPanel;   // SDR row off
+
+    g_gui.monitorSettings = { ms };
+    std::vector<DwmHookMonitorLUT> set = DesiredDwmHookStagingSet();
+    REQUIRE(set.size() == 1);
+    CHECK(set[0].left == mi.rcMonitor.left);
+    CHECK(set[0].top == mi.rcMonitor.top);
+    CHECK(set[0].sdrLutPath.empty());
+    CHECK(set[0].hdrLutPath.empty());
+    CHECK(set[0].hdrFaldPath == kHdrPanel);
+    CHECK(set[0].sdrFaldPath == kSdrPanel);   // staged too: switching that row on rides the shared config
+
+    // The set is the displays with hook work (MonitorNeedsDwmHook, a panel file is enough); whether the
+    // pipeline runs at all is MonitorNeedsProcessing's call. Once it runs for another display, a layer
+    // switched on later rides the shared config.
+    SUBCASE("layer off, nothing else: staged, but nothing needs the pipeline") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.enabled = false;
+        CHECK(DesiredDwmHookStagingSet().size() == 1);
+        CHECK_FALSE(AnyMonitorNeedsProcessing());
+    }
+    SUBCASE("on without its own panel file: staged for the other row's file, nothing needs the pipeline") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.paramsPath.clear();
+        CHECK(DesiredDwmHookStagingSet().size() == 1);
+        CHECK_FALSE(AnyMonitorNeedsProcessing());
+    }
+    SUBCASE("no panel file on either row: no hook work") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.paramsPath.clear();
+        g_gui.monitorSettings[0].sdrColorCorrection.fald.paramsPath.clear();
+        CHECK(DesiredDwmHookStagingSet().empty());
+    }
+    SUBCASE("layer off beside a cube: the panel files still ride along") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.enabled = false;
+        g_gui.monitorSettings[0].hdrPath = L"C:\\luts\\x.cube";
+        set = DesiredDwmHookStagingSet();
+        REQUIRE(set.size() == 1);
+        CHECK(set[0].hdrFaldPath == kHdrPanel);
+        CHECK(set[0].sdrFaldPath == kSdrPanel);
+    }
 }
 
 TEST_CASE("MHC settings: profiles baked by older white-balance maths are forgotten / re-baked once") {

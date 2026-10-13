@@ -26,8 +26,8 @@ void StopProcessing();
 // being ejected and re-injected on every retry. Every other start re-injects.
 void StartProcessingAfterOverlayLoss();
 
-// One display needs the processing pipeline (a LUT, a shader correction, tonemap, FALD in overlay mode,
-// or desktop gamma) — StartProcessing's per-monitor filter.
+// One display needs the processing pipeline (a LUT, a shader correction, tonemap, the FALD layer — in hook
+// mode only with that mode's panel file — or desktop gamma) — StartProcessing's per-monitor filter.
 bool MonitorNeedsProcessing(const MonitorSettings& ms);
 // Any LIVE display needs the processing pipeline.
 bool AnyMonitorNeedsProcessing();
@@ -87,6 +87,10 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode = fa
 // Evaluate whether non-analysis shader corrections need the full overlay.
 // Always iterates g_gui.monitorSettings — MUST only be called from the GUI thread.
 bool EvalNonAnalysisShaderCorrections();
+// Any overlay work at all (analysis included): the render thread's last verdict while it runs, else the
+// GUI-state check a start uses to pick the overlay / analysis-only thread. Hook-mode tonemap and FALD are
+// the hook's, not overlay work. Exposed for tests.
+bool HasActiveShaderCorrections();
 
 // Check if current settings differ from active (running) settings
 bool SettingsChanged();
