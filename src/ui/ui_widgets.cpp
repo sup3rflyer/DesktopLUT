@@ -781,6 +781,30 @@ void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 si
     ImGui::PopStyleVar();
 }
 
+float DrawKeyHints(ImDrawList* dl, float x, float cy, const KeyHint* hints, int count) {
+    const float capH = Snap(Px(16));
+    for (int i = 0; i < count; i++) {
+        const KeyHint& h = hints[i];
+        for (const char* k : h.keys) {
+            if (!k) continue;
+            const float tw = MeasureInk(Font::Mono, 10.0f, k).advance;
+            const float kw = Snap(std::max(tw + Px(8), capH));
+            const ImVec2 ka(Snap(x), cy - capH * 0.5f), kb(Snap(x) + kw, cy + capH * 0.5f);
+            if (Shape().bevel) {
+                dl->AddRectFilled(ka, kb, Col(pal::Control));
+                Bevel(dl, ka, kb, BevelKind::Raised);
+            } else {
+                dl->AddRect(ka, kb, Col(pal::RuleStrong), Shape().controlRounding > 0.0f ? Snap(Px(3)) : 0.0f);
+            }
+            DrawTextIn(dl, Font::Mono, 10.0f, ka, kb, pal::InkDim, k);
+            x += kw + Px(3);
+        }
+        x += Px(3);
+        x += DrawText(dl, Font::Label, 11.0f, x, cy, h.col, h.what) + Px(16);
+    }
+    return x;
+}
+
 void PanelNote(const char* text, ImU32 col, const char* tip) {
     if (g_panels.empty() || !text || !*text) return;
     g_panels.back().notes.push_back({ text, col, tip ? tip : "" });

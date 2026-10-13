@@ -122,6 +122,15 @@ struct PanelSwitch {
 };
 void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx, PanelSwitch* sw = nullptr);
 void EndPanel();
+// A key legend: each hint's keys as keycaps, then what they do (in `col`), left to right from x on the line at cy.
+// Keycaps keep a key from reading as part of its label ("Q A R" read as one word). Returns the end x.
+struct KeyHint {
+    const char* keys[4];   // up to four keys (the rest nullptr)
+    const char* what;
+    ImU32 col;
+};
+float DrawKeyHints(ImDrawList* dl, float x, float cy, const KeyHint* hints, int count);
+
 // A note on the current panel's title line, right-aligned (before a header switch), drawn by EndPanel left to right
 // in the order added. When they do not all fit beside the title, only the last one is drawn (add the most important
 // last). `tip` (optional) shows on hover.

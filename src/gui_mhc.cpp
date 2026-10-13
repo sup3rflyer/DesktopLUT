@@ -11,6 +11,8 @@
 #include "color.h"
 #include "mhc.h"
 #include "displayconfig.h"
+#include <mutex>
+#include <map>
 #include <commctrl.h>
 #include <commdlg.h>
 #include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
@@ -227,6 +229,92 @@ void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams
     }
 }
 
+// The imported source files, read once per version: a live edit recomputes the profile on every change, and
+// re-parsing a 4096-entry cube each time is waste. A version is the file's identity (volume + file index: a replaced
+// file is another file) + size + last write + change time (NTFS: any write or rename, whatever the last-write time
+// says). Only successful reads are kept: a transient failure (a sharing lock, an offline placeholder) is retried on
+// the next call. Any thread (BuildMHC2Params runs on the GUI, whitelist and processing threads).
+namespace {
+struct SourceFileStamp {
+    uint32_t volume = 0;
+    uint64_t index = 0;
+    uint64_t size = 0;
+    uint64_t written = 0;
+    int64_t changed = 0;
+    bool operator==(const SourceFileStamp& o) const {
+        return volume == o.volume && index == o.index && size == o.size && written == o.written && changed == o.changed;
+    }
+};
+bool StampOf(const std::wstring& path, SourceFileStamp& out) {
+    HANDLE h = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION fi;
+    const bool ok = GetFileInformationByHandle(h, &fi) != FALSE;
+    FILE_BASIC_INFO basic = {};
+    const bool haveBasic = GetFileInformationByHandleEx(h, FileBasicInfo, &basic, sizeof(basic)) != FALSE;
+    CloseHandle(h);
+    if (!ok) return false;
+    out.volume = fi.dwVolumeSerialNumber;
+    out.index = ((uint64_t)fi.nFileIndexHigh << 32) | fi.nFileIndexLow;
+    out.size = ((uint64_t)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
+    out.written = ((uint64_t)fi.ftLastWriteTime.dwHighDateTime << 32) | fi.ftLastWriteTime.dwLowDateTime;
+    out.changed = haveBasic ? basic.ChangeTime.QuadPart : 0;
+    return true;
+}
+struct CachedCube { SourceFileStamp stamp; std::vector<float> r, g, b; };
+struct CachedIcc { SourceFileStamp stamp; ICCProfileData icc; };
+std::mutex g_sourceCacheMutex;
+std::map<std::wstring, CachedCube> g_cubeCache;
+std::map<std::wstring, CachedIcc> g_iccCache;
+}  // namespace
+
+bool LoadSourceCube(const std::wstring& path, std::vector<float>& r, std::vector<float>& g, std::vector<float>& b) {
+    SourceFileStamp stamp;
+    if (!StampOf(path, stamp)) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_sourceCacheMutex);
+        auto it = g_cubeCache.find(path);
+        if (it != g_cubeCache.end() && it->second.stamp == stamp) {
+            r = it->second.r; g = it->second.g; b = it->second.b;
+            return true;
+        }
+    }
+    CachedCube c;
+    c.stamp = stamp;
+    std::lock_guard<std::mutex> lk(g_sourceCacheMutex);
+    if (!Load1DCubeLUT(path, c.r, c.g, c.b)) {
+        g_cubeCache.erase(path);
+        return false;
+    }
+    r = c.r; g = c.g; b = c.b;
+    g_cubeCache[path] = std::move(c);
+    return true;
+}
+
+bool LoadSourceIcc(const std::wstring& path, ICCProfileData& icc) {
+    SourceFileStamp stamp;
+    if (!StampOf(path, stamp)) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_sourceCacheMutex);
+        auto it = g_iccCache.find(path);
+        if (it != g_iccCache.end() && it->second.stamp == stamp) {
+            icc = it->second.icc;
+            return true;
+        }
+    }
+    CachedIcc c;
+    c.stamp = stamp;
+    std::lock_guard<std::mutex> lk(g_sourceCacheMutex);
+    if (!ReadICCProfile(path, c.icc)) {
+        g_iccCache.erase(path);
+        return false;
+    }
+    icc = c.icc;
+    g_iccCache[path] = std::move(c);
+    return true;
+}
+
 // Build MHC2ProfileParams from current MHCSettings (shared by Generate and Regenerate). False when the
 // imported source file (1D cube / SDR ICC TRC) is set but cannot be read: the params then lack the
 // correction, and a profile generated from them would silently install an identity curve (T1.16) —
@@ -245,7 +333,7 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
         if (mhc.sourceIs1DCube) {
             // 1D cube: per-channel correction curves used directly as MHC2 LUT
             std::vector<float> corrR, corrG, corrB;
-            if (!Load1DCubeLUT(mhc.sourceFilePath, corrR, corrG, corrB)) {
+            if (!LoadSourceCube(mhc.sourceFilePath, corrR, corrG, corrB)) {
                 std::wcerr << L"[MHC] the imported 1D cube cannot be read: " << mhc.sourceFilePath << std::endl;
                 return false;
             }
@@ -263,7 +351,7 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
             // HDR ICC TRC disabled: DisplayCal's sparse measurements + curve fitting produce
             // shadow corrections 10-20x too aggressive vs ColourSpace ground truth
             ICCProfileData icc;
-            if (!ReadICCProfile(mhc.sourceFilePath, icc) || !icc.hasTRC) {
+            if (!LoadSourceIcc(mhc.sourceFilePath, icc) || !icc.hasTRC) {
                 std::wcerr << L"[MHC] the imported ICC profile cannot be read (or lost its TRC): "
                            << mhc.sourceFilePath << std::endl;
                 return false;

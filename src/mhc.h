@@ -189,6 +189,17 @@ struct MhcScanout {
 // Matrix + base LUTs (base grayscale / ICC TRC / 1D cube; correction grayscale and desktop gamma not composed,
 // entries not quantized). Logs the LUT source like the bake always did.
 bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out);
+// The matrix alone (emit + applied; the LUTs of `out` are left as they are): the primaries, the white and the white
+// balance gains are its only inputs, so a live edit of them keeps the LUTs it already has.
+void ComputeMhcScanoutMatrix(const MHC2ProfileParams& params, MhcScanout& out);
+// While alive, the scanout computation on this thread logs nothing (the matrix, the LUT source): a live edit recomputes
+// the profile on every change, and the bake's lines would flood the log. Nests.
+struct MhcQuietLog {
+    MhcQuietLog();
+    ~MhcQuietLog();
+    MhcQuietLog(const MhcQuietLog&) = delete;
+    MhcQuietLog& operator=(const MhcQuietLog&) = delete;
+};
 // The base LUTs alone (the matrix fields of `out` are left as they are): a live edit of the base curve recomputes
 // these and keeps the matrix.
 bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out);

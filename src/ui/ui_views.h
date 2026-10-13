@@ -4,6 +4,7 @@
 
 #include "ui_snapshot.h"
 #include "ui_gsedit.h"
+#include "ui_mhcedit.h"
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -45,10 +46,14 @@ struct ViewState {
     bool showNotices = false;      // Settings > About: third-party notices expanded
     LogView log;
     GsEditorState gsEdit;          // the grayscale fine-tune editor (open while its live edit runs)
+    MhcEditorState mhcEdit;        // the MHC profile editor (open while its edit runs)
     int whitelist = 0;             // the whitelist editor: 0 closed, 1 desktop gamma, 2 passthrough (VRR)
     bool whitelistOpenRequested = false;
     char whitelistAdd[128] = {};   // the add field (UTF-8)
 };
+
+// An editor holds the page (its display, its mode, the pipeline) until DONE / CANCEL.
+inline bool EditorOpen(const ViewState& vs) { return vs.gsEdit.open || vs.mhcEdit.open; }
 
 // The sidebar row id of a display (live / remembered + its identity).
 std::wstring RowIdOf(const DisplayRow& r);

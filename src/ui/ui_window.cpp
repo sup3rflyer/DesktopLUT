@@ -389,6 +389,7 @@ bool Show() {
 void Hide() {
     if (!g_hwnd) return;
     CloseGsEditor(g_view, true);   // an open grayscale edit ends, keeping its edits (as the classic editor's X did)
+    CloseMhcEditor(g_view);        // an open profile edit is cancelled (as the classic editor's X did)
     // A field being typed in commits (one last frame ends the edit) instead of being dropped.
     if (g_imguiReady && IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd) && ImGui::GetCurrentContext() &&
         ImGui::IsAnyItemActive()) {
@@ -408,6 +409,7 @@ void Shutdown() {
     g_shutDown = true;    // Show / Post refuse from here on (a relaunch during exit must not revive it)
     g_commands.clear();   // nothing posted runs during the teardown
     g_view.gsEdit.open = false;   // its live edit ends in the hub teardown (AbortLiveEditsForShutdown), which may pump
+    g_view.mhcEdit.open = false;  // ...as does the profile edit
     HidePatch();
     notify::SetListener(nullptr);
     logcap::SetListener(nullptr);

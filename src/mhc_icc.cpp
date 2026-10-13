@@ -360,6 +360,14 @@ float MhcSdrWhiteScale(const MHC2ProfileParams& params) {
     return fullMax > baseMax ? baseMax / fullMax : 1.0f;
 }
 
+namespace {
+thread_local int t_mhcQuiet = 0;   // MhcQuietLog depth on this thread
+bool Loud() { return t_mhcQuiet == 0; }
+}  // namespace
+
+MhcQuietLog::MhcQuietLog() { ++t_mhcQuiet; }
+MhcQuietLog::~MhcQuietLog() { --t_mhcQuiet; }
+
 void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
                        const DisplayPrimariesData& displayPrimaries,
                        bool isHDR, float outMHC[12],
@@ -426,7 +434,7 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
 
     float result[9];
     if (!ComputeMhcForwardRGB(srcPrimaries, displayPrimaries, whiteBalanceGains, result)) {
-        std::cerr << "MHC2 matrix: degenerate primaries, using identity" << std::endl;
+        if (Loud()) std::cerr << "MHC2 matrix: degenerate primaries, using identity" << std::endl;
         memset(outMHC, 0, sizeof(float) * 12);
         outMHC[0] = outMHC[5] = outMHC[10] = 1.0f;  // 3x4 identity (row-major)
         if (outAsAppliedRGB) { memset(outAsAppliedRGB, 0, sizeof(float) * 9); outAsAppliedRGB[0] = outAsAppliedRGB[4] = outAsAppliedRGB[8] = 1.0f; }
@@ -458,17 +466,19 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
             if (fullMax > baseMax) {
                 whiteScale = baseMax / fullMax;
                 for (float& v : result) v *= whiteScale;
-                std::cout << "MHC2: SDR white-balance move kept reachable: x" << whiteScale << " ("
+                if (Loud()) std::cout << "MHC2: SDR white-balance move kept reachable: x" << whiteScale << " ("
                           << (1.0f - whiteScale) * 100.0f << " % peak)" << std::endl;
             }
         }
     }
     if (outWhiteScale) *outWhiteScale = whiteScale;
 
-    std::cout << "MHC2 matrix (RGB-to-RGB, source->display):" << std::endl;
-    std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
-    std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
-    std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
+    if (Loud()) {
+        std::cout << "MHC2 matrix (RGB-to-RGB, source->display):" << std::endl;
+        std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
+        std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
+        std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
+    }
 
     // Capture the NET as-applied RGB->RGB transform (WB baked in) BEFORE the basis conjugation
     // below overwrites `result` with the emitted tag. This pre-conjugation `result` is what the
@@ -491,11 +501,13 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
             MatMul3(basisToXYZ, result, tmp);   // B * result
             MatMul3(tmp, basisFromXYZ, emit);   // (B * result) * inv(B)
             memcpy(result, emit, sizeof(float) * 9);
-            std::cout << "MHC2 matrix (" << (isHDR ? "HDR BT.2020" : "SDR sRGB")
-                      << " XYZ-basis emit, B*M*inv(B)):" << std::endl;
-            std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
-            std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
-            std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
+            if (Loud()) {
+                std::cout << "MHC2 matrix (" << (isHDR ? "HDR BT.2020" : "SDR sRGB")
+                          << " XYZ-basis emit, B*M*inv(B)):" << std::endl;
+                std::cout << "  [" << result[0] << ", " << result[1] << ", " << result[2] << "]" << std::endl;
+                std::cout << "  [" << result[3] << ", " << result[4] << ", " << result[5] << "]" << std::endl;
+                std::cout << "  [" << result[6] << ", " << result[7] << ", " << result[8] << "]" << std::endl;
+            }
         }
     }
 
@@ -519,7 +531,11 @@ bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out) {
     // SDR: 1024 entries (sRGB signal, sufficient for 8-bit output)
     // HDR: 4096 entries (PQ signal needs more precision at low luminance due to steep slope)
     out.lutSize = params.isHDR ? 4096 : 1024;
+    ComputeMhcScanoutMatrix(params, out);
+    return ComputeMhcScanoutBaseLuts(params, out);
+}
 
+void ComputeMhcScanoutMatrix(const MHC2ProfileParams& params, MhcScanout& out) {
     // Matrix (source primaries: see GenerateMHC2Profile).
     const DisplayPrimariesData srcPrim = MhcSourcePrimaries(params);
     const DisplayPrimariesData& displayPrim = params.primariesEnabled ? params.displayPrimaries : srcPrim;
@@ -550,8 +566,6 @@ bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out) {
             for (int i = 0; i < 9; i++) out.applied[i] = (float)q[i];   // ComputeMHC2Matrix emitted unconjugated
         }
     }
-
-    return ComputeMhcScanoutBaseLuts(params, out);
 }
 
 bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out) {
@@ -577,7 +591,7 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
 
     if (params.hasPrecomputedCorrection && !params.corrR.empty() && !params.corrG.empty() && !params.corrB.empty()) {
         // Pre-computed correction curves from 1D .cube: use directly, just resample
-        std::cout << "MHC2: Using pre-computed 1D LUT correction (" << params.corrR.size() << " entries)" << std::endl;
+        if (Loud()) std::cout << "MHC2: Using pre-computed 1D LUT correction (" << params.corrR.size() << " entries)" << std::endl;
         resampleCurve(params.corrR, lutR, lutSize);
         resampleCurve(params.corrG, lutG, lutSize);
         resampleCurve(params.corrB, lutB, lutSize);
@@ -590,13 +604,13 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
             // ICC TRC from HDR-mode profiling (e.g. DisplayCal with PQ pattern generator like
             // Dogegen/Resolve): TRC maps PQ signal → measured linear light (normalized to peak).
             // Use per-channel PQ correction to fix the display's PQ tracking errors.
-            std::cout << "MHC2: Using per-channel TRC for HDR PQ correction (" << params.trcR.size() << " points, peak " << params.peakNits << " nits)" << std::endl;
+            if (Loud()) std::cout << "MHC2: Using per-channel TRC for HDR PQ correction (" << params.trcR.size() << " points, peak " << params.peakNits << " nits)" << std::endl;
             GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR, lutSize, params.peakNits);
             GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG, lutSize, params.peakNits);
             GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB, lutSize, params.peakNits);
         } else {
             float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
-            std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
+            if (Loud()) std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
             GenerateMHC2LUT_FromTRC_SDR(params.trcR, lutR, lutSize, targetGamma);
             GenerateMHC2LUT_FromTRC_SDR(params.trcG, lutG, lutSize, targetGamma);
             GenerateMHC2LUT_FromTRC_SDR(params.trcB, lutB, lutSize, targetGamma);

@@ -38,6 +38,7 @@
 #include "gui.h"
 #include "actions/reconcile.h"
 #include "actions/gs_live.h"
+#include "actions/mhc_edit.h"
 #include "dwm_inject.h"
 
 #pragma comment(lib, "Advapi32.lib")
@@ -1847,7 +1848,10 @@ void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& er
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     // Don't double-drive the preview if a human has an editor open.
-    if (g_mhcEditDialogOpen.load() || MhcPreviewActive()) { error = "grayscale editor already open in the GUI"; return; }
+    if (g_mhcEditDialogOpen.load() || MhcPreviewActive() || act::GsEditActive() || act::MhcEditActive()) {
+        error = "an MHC editor is already open in the GUI";
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         auto it = g_gsLive.find({mon, isHDR});
@@ -2292,10 +2296,13 @@ void AbortLiveEditsForShutdown() {
     CleanupActiveGsLive();
     // The interface's editor: its edits stay (as on closing the window), the real profile goes back on.
     if (act::GsEditActive()) act::EndGsEdit(true);
+    // The interface's profile editor: cancelled (as on closing the window), the profile that ran goes back on.
+    if (act::MhcEditActive()) act::EndMhcEdit(false);
 }
 
 bool IsCalibrationOrLiveEditActive() {
     if (act::GsEditActive()) return true;   // the interface's grayscale editor (GUI thread state)
+    if (act::MhcEditActive()) return true;  // the interface's profile editor (with or without a preview)
     if (MhcPreviewActive()) return true;    // any live edit preview (the classic editor's too)
     // Sequential, never nested: the GUI-thread enter nests settings -> calib.
     {
@@ -2342,6 +2349,16 @@ void StopCalibrationIpcServer() {
     // (the stop event stays set), and a re-arm waits for it (StartCalibrationIpcServer).
 }
 
+// An interface editor (the grayscale editor, the MHC profile editor) holds its display's profile until DONE / CANCEL:
+// the verbs that change MHC settings or scanout wait for it. The pipe's own live-edit session verbs and
+// calibration.exit (cleanup) are never held: neither can be in conflict (a session cannot begin while an editor is
+// open, nor an editor while a calibration runs).
+bool HeldByInterfaceEditor(const std::string& m) {
+    if (!act::GsEditActive() && !act::MhcEditActive()) return false;
+    if (m == "mhc.grayscale_set_live" || m == "mhc.grayscale_commit" || m == "mhc.grayscale_cancel") return false;
+    return m == "calibration.enter" || m == "corrections.disable_all" || m == "layers.set" || m.rfind("mhc.", 0) == 0;
+}
+
 LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
     std::shared_ptr<CalibGuiCall> call;
     {
@@ -2355,7 +2372,8 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
     std::string& error = call->error;
     try {
         const std::string& m = call->method;
-        if (m == "calibration.enter") DoEnterNeutral(params, result, error);
+        if (HeldByInterfaceEditor(m)) error = "an MHC editor is open in the DesktopLUT window: finish it (DONE or CANCEL) first";
+        else if (m == "calibration.enter") DoEnterNeutral(params, result, error);
         else if (m == "calibration.exit") DoExitCalibration(params, result, error);
         else if (m == "corrections.disable_all") DoDisableAll(params, result, error);
         else if (m == "layers.set") DoLayersSet(params, result, error);

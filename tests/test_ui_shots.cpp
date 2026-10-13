@@ -261,6 +261,9 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
         { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
         { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
+        { "mhcedit", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 6 },
+        { "mhceditsdr", ui::Page::Pipeline, ui::StageId::Primaries, 1, false, -1, -1, 1180, 760, 7 },
+        { "mhceditnarrow", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 920, 520, 6 },
     };
     const float scales[] = { 1.0f, 1.5f };
     int written = 0;
@@ -318,6 +321,37 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 if (shot.confirm) {
                     vs.confirm = { "REMOVE PROFILE?", "Deletes the calibration profile and its cached variants.", "REMOVE", nullptr };
                     vs.confirmOpenRequested = true;
+                }
+                if (shot.variant == 6 || shot.variant == 7) {
+                    // The profile editor, drawn without an edit: HDR with a 1D cube source (previewing, holds shown),
+                    // SDR with an ICC source that supplies R, G and B (no preview: the display shows the other mode).
+                    const bool hdr = shot.variant == 6;
+                    ui::MhcEditorState& ed = vs.mhcEdit;
+                    ed.open = true;
+                    ed.renderOnly = true;
+                    ed.hdr = hdr;
+                    ed.mon = shot.display;
+                    ed.work = hdr ? snap.live[0].settings.hdrMHC : snap.live[1].settings.sdrMHC;
+                    ed.work.primariesEnabled = true;
+                    ed.work.primariesPreset = g_numPresetPrimaries - 1;
+                    ed.work.customPrimaries = { 0.6923f, 0.3033f, 0.1783f, 0.7519f, 0.1513f, 0.0646f, 0.3155f, 0.3267f, L"Custom" };
+                    ed.work.sourceFilePath = hdr ? L"C:\\Calibration\\PA32UCXR_HDR_BMD_4096.cube"
+                                                 : L"C:\\Calibration\\BenQ_SDR_DisplayCAL_curves+matrix.icm";
+                    ed.work.sourceIs1DCube = hdr;
+                    ed.work.baseGrayscale.peakNits = 1612.0f;
+                    ed.describedPath = ed.work.sourceFilePath;
+                    ed.source.present = true;
+                    ed.source.readable = true;
+                    ed.source.cube = hdr;
+                    ed.source.entries = 4096;
+                    ed.source.primaries = !hdr;
+                    ed.source.curves = !hdr;
+                    ed.sourceGivesPrimaries = !hdr;
+                    ed.previewing = hdr;
+                    ed.why = "The display is in HDR";
+                    ed.selected = hdr ? 1 : 3;
+                    ed.renderHeld = hdr ? (kMhcHeldTonemap | kMhcHeldFald | kMhcHeldDesktopGamma) : 0u;
+                    ed.renderNightLight = hdr;
                 }
                 if (shot.variant == 5) {   // the desktop gamma whitelist editor
                     g_gammaWhitelistRaw = L"mpvnet.exe, mpv.exe, mpc-hc64.exe, mpc-be64.exe, madvr.exe";

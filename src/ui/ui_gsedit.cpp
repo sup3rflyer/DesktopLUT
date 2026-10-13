@@ -180,6 +180,34 @@ bool HandleKeys(GsEditorState& ed, int n) {
 
 }  // namespace
 
+void LiveEditNotes(unsigned held, bool nightLight) {
+    if (held) {
+        std::string list;
+        auto add = [&](const char* s) { if (!list.empty()) list += "  \xC2\xB7  "; list += s; };
+        if (held & kMhcHeldTonemap) add("TONE MAP");
+        if (held & kMhcHeldFald) add("FALD");
+        if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
+        if (held & kMhcHeldWhiteBalance) add("WHITE BALANCE");
+        const char* tip = "Off while you edit, so the meter reads the calibration alone.\nBack on with DONE or CANCEL.";
+        PanelNote("OFF", pal::InkFaint, tip);
+        PanelNote(list.c_str(), pal::InkDim, tip);
+    }
+    if (nightLight)
+        PanelNote("NIGHT LIGHT ON", pal::Alarm,
+                  "Windows Night Light tints every display: turn it off before measuring.\n"
+                  "Settings \xE2\x80\xBA System \xE2\x80\xBA Display");
+}
+
+bool NightLightOn() {
+    static int s_state = 0;
+    static ULONGLONG s_at = 0;
+    if (s_at == 0 || GetTickCount64() - s_at > 1000) {   // a registry read, at most once a second
+        s_state = WindowsNightLightState();
+        s_at = GetTickCount64();
+    }
+    return s_state == 1;
+}
+
 void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr, GsTarget target) {
     GsEditorState* ed = &vs.gsEdit;   // the view state outlives every posted command
     const std::wstring key = RowIdOf(r);
@@ -226,32 +254,8 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     snprintf(title, sizeof(title), "%s  \xC2\xB7  %s  \xC2\xB7  %d POINTS", ed.target == GsTarget::Base ? "BASE" : "FINE-TUNE",
              hdr ? "HDR" : "SDR", n);
     BeginPanel("##gsedit", title, nullptr, sizePx);
-    {
-        // On the title line: what the edit holds off for the meter, and a Night Light warning (Windows tints the
-        // screen outside DesktopLUT: the one thing the edit cannot hold) — the warning last, it stays when space is short.
-        const unsigned held = ed.renderOnly ? ed.renderHeld : act::GsEditHeld();
-        if (held) {
-            std::string list;
-            auto add = [&](const char* s) { if (!list.empty()) list += "  \xC2\xB7  "; list += s; };
-            if (held & kMhcHeldTonemap) add("TONE MAP");
-            if (held & kMhcHeldFald) add("FALD");
-            if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
-            if (held & kMhcHeldWhiteBalance) add("WHITE BALANCE");
-            const char* tip = "Off while you edit, so the meter reads the calibration alone.\nBack on with DONE or CANCEL.";
-            PanelNote("OFF", pal::InkFaint, tip);
-            PanelNote(list.c_str(), pal::InkDim, tip);
-        }
-        static int s_nightLight = 0;
-        static ULONGLONG s_nightLightAt = 0;
-        if (!ed.renderOnly && GetTickCount64() - s_nightLightAt > 1000) {   // a registry read, at most once a second
-            s_nightLight = WindowsNightLightState();
-            s_nightLightAt = GetTickCount64();
-        }
-        if (ed.renderOnly ? ed.renderNightLight : s_nightLight == 1)
-            PanelNote("NIGHT LIGHT ON", pal::Alarm,
-                      "Windows Night Light tints every display: turn it off before measuring.\n"
-                      "Settings \xE2\x80\xBA System \xE2\x80\xBA Display");
-    }
+    // On the title line: what the edit holds off for the meter, and the Night Light warning.
+    LiveEditNotes(ed.renderOnly ? ed.renderHeld : act::GsEditHeld(), ed.renderOnly ? ed.renderNightLight : NightLightOn());
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 origin(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
     const float width = ImGui::GetContentRegionAvail().x;
@@ -315,7 +319,9 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         ImGui::SameLine(0, Px(8));
         // Esc closes the measurement patch first (it never takes focus, so its Esc lands here); with no patch up it
         // cancels the edit.
-        const bool escape = ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsAnyItemActive();
+        // Not while a command runs (DONE / CANCEL pump): the widgets are disabled, and the keys must wait too.
+        const bool keysOk = ed.renderOnly || !Busy();
+        const bool escape = keysOk && ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsAnyItemActive();
         const bool escClosesPatch = escape && !ed.renderOnly && ed.patch != PatchSize::Off;
         if (escClosesPatch) ed.patch = PatchSize::Off;
         if (Button("##gs_cancel", "CANCEL", bw) || (escape && !escClosesPatch)) {
@@ -621,10 +627,8 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     }
 
     // ---- keys ----------------------------------------------------------------------------------------
-    changed |= HandleKeys(ed, n);
+    if (ed.renderOnly || !Busy()) changed |= HandleKeys(ed, n);
     {
-        // Keys as keycaps, so a key never reads as part of its label ("Q A R" read as one word before).
-        struct KeyHint { const char* keys[2]; const char* what; ImU32 col; };
         const KeyHint kHints[] = {
             { { "\xE2\x86\x90", "\xE2\x86\x92" }, "POINT", pal::InkFaint },
             { { "\xE2\x86\x91", "\xE2\x86\x93" }, "GRAY", pal::InkFaint },
@@ -635,27 +639,7 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             { { "CTRL", nullptr }, "\xC3\x97" "10", pal::InkFaint },
             { { "DEL", nullptr }, "NEUTRAL", pal::InkFaint },
         };
-        const float cy = Snap(origin.y + height - legendH * 0.5f);
-        const float capH = Snap(Px(16));
-        float x = origin.x;
-        for (const KeyHint& h : kHints) {
-            for (const char* k : h.keys) {
-                if (!k) continue;
-                const float tw = MeasureInk(Font::Mono, 10.0f, k).advance;
-                const float kw = Snap(std::max(tw + Px(8), capH));
-                const ImVec2 ka(Snap(x), cy - capH * 0.5f), kb(Snap(x) + kw, cy + capH * 0.5f);
-                if (Shape().bevel) {
-                    dl->AddRectFilled(ka, kb, Col(pal::Control));
-                    Bevel(dl, ka, kb, BevelKind::Raised);
-                } else {
-                    dl->AddRect(ka, kb, Col(pal::RuleStrong), Shape().controlRounding > 0.0f ? Snap(Px(3)) : 0.0f);
-                }
-                DrawTextIn(dl, Font::Mono, 10.0f, ka, kb, pal::InkDim, k);
-                x += kw + Px(3);
-            }
-            x += Px(3);
-            x += DrawText(dl, Font::Label, 11.0f, x, cy, h.col, h.what) + Px(16);
-        }
+        DrawKeyHints(dl, origin.x, Snap(origin.y + height - legendH * 0.5f), kHints, (int)(sizeof(kHints) / sizeof(kHints[0])));
     }
     // A new point count, once nothing in this frame indexes the old one: resampled (the shape stays).
     if (ed.pendingCount) {

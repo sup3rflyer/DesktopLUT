@@ -44,6 +44,12 @@ struct GsEditorState {
     bool renderNightLight = false;  // renderOnly: show the Night Light warning
 };
 
+// A live edit's title-line notes (PanelNote, inside the editor's panel): what it holds off (kMhcHeld*) and a Night
+// Light warning (Windows tints the screen outside DesktopLUT: the one thing an edit cannot hold), the warning last.
+void LiveEditNotes(unsigned held, bool nightLight);
+// Windows Night Light is on (read at most once a second; for the editors' warning).
+bool NightLightOn();
+
 // The BASE / FINE-TUNE rows' EDIT CURVE: begins the live edit of that curve (posted) and opens the editor.
 void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr, GsTarget target = GsTarget::FineTune);
 // The editor, filling `sizePx` at the cursor.

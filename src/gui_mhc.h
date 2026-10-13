@@ -192,6 +192,12 @@ void SwapDgForAllMonitors(bool dgEnabled);
 // The correction grayscale fields of a profile's params, exactly as BuildMHC2Params sets them (only when the
 // curve is enabled and has points; otherwise the params are left as they are).
 void SetMhcCorrectionParams(const GrayscaleSettings& correction, MHC2ProfileParams& params);
+// The imported source files (1D cube / ICC), read once per version of the file (its identity, size, last write and
+// change time) and shared by every BuildMHC2Params call. False: unreadable now (failures are not kept).
+struct ICCProfileData;
+bool LoadSourceCube(const std::wstring& path, std::vector<float>& r, std::vector<float>& g, std::vector<float>& b);
+bool LoadSourceIcc(const std::wstring& path, ICCProfileData& icc);
+
 // The base curve's fields, exactly as BuildMHC2Params sets them for a profile without an imported source file (an
 // enabled curve; an enabled but empty one is identity; a disabled one leaves the params as they are).
 void SetMhcBaseParams(const GrayscaleSettings& base, MHC2ProfileParams& params);

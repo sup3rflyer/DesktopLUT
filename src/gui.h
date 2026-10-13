@@ -44,11 +44,6 @@ void SyncClassicGlobalControls();
 // The user stopped the live layers (classic Stop / tray Stop); automatic restarts respect it. GUI thread.
 extern std::atomic<bool> g_userStopped;   // read by the pipe thread (state.get)
 
-// Run a classic control's command for display `mon` (selects it in the classic window first). The new
-// interface uses it to open the classic editors (MHC edit dialog, grayscale editor) until its own
-// editors replace them. GUI thread; may run a modal loop.
-void RunClassicCommand(int mon, int commandId);
-
 // GUI-thread pin on g_gui.monitorSettings: while held, a handler keeps a reference / index
 // into the vector across a message pump (editor dialogs, the preview spin-up that precedes
 // them, the pipe's grayscale live-begin), so a display change pumped meanwhile must not

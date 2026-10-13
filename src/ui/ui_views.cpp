@@ -819,7 +819,7 @@ void InspectPrimaries(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     if (b == 0) {
         PostTo(r, [hdr](int mon) { act::MhcInstall(mon, hdr); });
     } else if (b == editIndex) {
-        PostTo(r, [hdr](int mon) { RunClassicCommand(mon, hdr ? ID_MHC_HDR_EDIT : ID_MHC_TAB_EDIT); });
+        OpenMhcEditor(vs, r, hdr);
     } else if (b == 1 && installed) {
         const DisplayRow target = r;
         Ask(vs, "REMOVE PROFILE?", "Deletes the calibration profile and its cached variants.", "REMOVE",
@@ -1217,7 +1217,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         ImGui::SetCursorScreenPos(body);
         ImGui::BeginChild("##sidebar", ImVec2(sideW, bodyH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     }
-    ImGui::BeginDisabled(vs.gsEdit.open);   // the editor holds its display until DONE / CANCEL
+    ImGui::BeginDisabled(EditorOpen(vs));   // the editor holds its display until DONE / CANCEL
     DrawSidebar(snap, vs, sel);
     ImGui::EndDisabled();
     ImGui::EndChild();
@@ -1255,7 +1255,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         const ImU32 dots[2] = { !parked && liveHdr ? pal::Good : 0u, !parked && !liveHdr ? pal::Good : 0u };
         const float segW = 72.0f;
         ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Snap(Px(segW)) * 2), Snap(cy - Snap(Px(kControlH)) * 0.5f)));
-        ImGui::BeginDisabled(vs.gsEdit.open);
+        ImGui::BeginDisabled(EditorOpen(vs));
         const int pick = Segmented("##mode", kModes, 2, showHdr ? 0 : 1, segW, dots);
         ImGui::EndDisabled();
         if (pick == 0) vs.showOtherMode = !liveHdr;
@@ -1279,14 +1279,19 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     if (!st) {
         for (const Stage& s : path) if (s.selectable) { vs.stage = s.id; st = &s; break; }
     }
-    ImGui::BeginDisabled(vs.gsEdit.open);
+    ImGui::BeginDisabled(EditorOpen(vs));
     DrawPixelPath(path, vs);
     ImGui::EndDisabled();
     ImGui::Dummy(ImVec2(0, Px(20)));
 
-    // The grayscale editor, while open, takes the place of both panels.
+    // An editor, while open, takes the place of both panels.
     if (vs.gsEdit.open) {
         DrawGsEditor(snap, vs, ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y));
+        ImGui::EndChild();
+        return;
+    }
+    if (vs.mhcEdit.open) {
+        DrawMhcEditor(snap, vs, ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y));
         ImGui::EndChild();
         return;
     }
@@ -2086,9 +2091,9 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
 
     // The editor drives arrow keys itself: ImGui's keyboard navigation would move focus with them.
     ImGuiIO& io = ImGui::GetIO();
-    if (vs.gsEdit.open) io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    if (EditorOpen(vs)) io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
     else io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    DrawHeader(snap, vs, busy || vs.gsEdit.open);
+    DrawHeader(snap, vs, busy || EditorOpen(vs));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
     SetLogRedraws(vs.page == Page::Events && vs.log.allOutput);   // diagnostic lines redraw only here

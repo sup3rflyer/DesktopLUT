@@ -119,6 +119,7 @@
     <ClCompile Include="src\actions\actions.cpp" />
     <ClCompile Include="src\actions\reconcile.cpp" />
     <ClCompile Include="src\actions\gs_live.cpp" />
+    <ClCompile Include="src\actions\mhc_edit.cpp" />
     <ClCompile Include="src\actions\logcap.cpp" />
     <ClCompile Include="src\dlc\dlc_yaml.cpp" />
     <ClCompile Include="src\dlc\dlc_data.cpp" />
@@ -127,6 +128,7 @@
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_gscurve.cpp" />
     <ClCompile Include="src\ui\ui_gsedit.cpp" />
+    <ClCompile Include="src\ui\ui_mhcedit.cpp" />
     <ClCompile Include="src\ui\ui_patch.cpp" />
     <ClCompile Include="src\ui\ui_snapshot.cpp" />
     <ClCompile Include="src\ui\ui_present.cpp" />

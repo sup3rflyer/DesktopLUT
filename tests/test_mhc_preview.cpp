@@ -15,7 +15,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iostream>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -321,6 +323,114 @@ TEST_CASE("MHC preview: desktop gamma and the white balance tweak are held out; 
     MhcPreviewSession sdr;
     REQUIRE(PrepareMhcPreview(m, false, 0, sdr));
     CHECK_FALSE(sdr.params.desktopGammaEnabled);
+}
+
+TEST_CASE("MHC profile edit: the preview is the bake of the edited settings") {
+    for (bool hdr : { false, true }) {
+        CAPTURE(hdr);
+        MHCSettings m = FullSettings();
+        m.desktopGammaEnabled = false;   // nothing held: the preview is exactly what DONE installs
+        m.whiteBalanceEnabled = false;
+        std::vector<MHCSettings> edits;
+        { MHCSettings e = m; edits.push_back(e); }
+        { MHCSettings e = m; e.customPrimaries.Rx = 0.6800f; e.customPrimaries.Gy = 0.7000f; edits.push_back(e); }
+        { MHCSettings e = m; e.primariesPreset = 1; edits.push_back(e); }
+        { MHCSettings e = m; e.customPrimaries.Wx = 0.3200f; e.customPrimaries.Wy = 0.3350f; edits.push_back(e); }
+        { MHCSettings e = m; e.primariesEnabled = false; edits.push_back(e); }
+        { MHCSettings e = m; e.bypassPrimaries = true; edits.push_back(e); }
+        { MHCSettings e = m; e.baseGrayscale.peakNits = 1000.0f; edits.push_back(e); }
+        for (size_t i = 0; i < edits.size(); i++) {
+            CAPTURE(i);
+            const MHCSettings& e = edits[i];
+            MhcScanout preview;
+            REQUIRE(ComputeMhcPreviewProfile(e, hdr, 0, preview));
+            MHC2ProfileParams bp;
+            REQUIRE(BuildMHC2ParamsForPerm(e, hdr, 0, ComputeMhcPermutation(e, hdr), bp));
+            std::vector<uint8_t> file;
+            REQUIRE(GenerateMHC2Profile(bp, file));
+            CheckFileCarries(file, preview);
+        }
+    }
+}
+
+TEST_CASE("MHC profile edit: desktop gamma and the white balance tweak stay out of the preview") {
+    MHCSettings m = FullSettings();   // both on
+    for (bool hdr : { false, true }) {
+        CAPTURE(hdr);
+        MhcScanout preview;
+        REQUIRE(ComputeMhcPreviewProfile(m, hdr, 0, preview));
+        const uint8_t held = (uint8_t)(ComputeMhcPermutation(m, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB));
+        MHC2ProfileParams vp;
+        REQUIRE(BuildMHC2ParamsForPerm(m, hdr, 0, held, vp));
+        MhcScanout variant;
+        REQUIRE(ComputeMhcScanout(vp, variant));
+        CheckScanoutsIdentical(preview, variant);
+        // ...and the DONE bake has them again: another matrix (the tweak), HDR other LUTs too (desktop gamma).
+        MHC2ProfileParams fp;
+        REQUIRE(BuildMHC2ParamsForPerm(m, hdr, 0, ComputeMhcPermutation(m, hdr), fp));
+        MhcScanout full;
+        REQUIRE(ComputeMhcScanout(fp, full));
+        bool matrixDiffers = false;
+        for (int i = 0; i < 9; i++) matrixDiffers |= !SameBits(preview.applied[i], full.applied[i]);
+        CHECK(matrixDiffers);
+        if (hdr) {
+            int lutDiffers = 0;
+            for (int ch = 0; ch < 3; ch++)
+                for (int j = 0; j < full.lutSize; j++) lutDiffers += !SameBits(preview.lut[ch][j], full.lut[ch][j]);
+            CHECK(lutDiffers > 0);
+        }
+    }
+}
+
+TEST_CASE("MHC profile edit: a matrix-only update equals the complete recomputation") {
+    for (bool hdr : { false, true }) {
+        CAPTURE(hdr);
+        const MHCSettings m = FullSettings();
+        MhcScanout s;
+        REQUIRE(ComputeMhcPreviewProfile(m, hdr, 0, s));
+        // A drag's worth of matrix edits, each applied to the last state (as the editor does).
+        MHCSettings e = m;
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<float> jitter(-0.01f, 0.01f);
+        for (int step = 0; step < 24; step++) {
+            CAPTURE(step);
+            switch (step % 6) {
+            case 0: e.customPrimaries.Rx += jitter(rng); e.customPrimaries.Ry += jitter(rng); break;
+            case 1: e.customPrimaries.Gx += jitter(rng); e.customPrimaries.By += jitter(rng) * 0.2f; break;
+            case 2: e.customPrimaries.Wx += jitter(rng) * 0.3f; e.customPrimaries.Wy += jitter(rng) * 0.3f; break;
+            case 3: e.primariesPreset = (step / 6) % (g_numPresetPrimaries - 1); break;
+            case 4: e.primariesPreset = g_numPresetPrimaries - 1; e.primariesEnabled = !e.primariesEnabled; break;
+            case 5: e.bypassPrimaries = !e.bypassPrimaries; e.primariesEnabled = true; break;
+            }
+            ComputeMhcPreviewMatrix(e, hdr, s);
+            MhcScanout full;
+            REQUIRE(ComputeMhcPreviewProfile(e, hdr, 0, full));
+            CheckScanoutsIdentical(s, full);
+        }
+    }
+}
+
+TEST_CASE("MHC profile edit: the recomputation logs nothing; the bake still does") {
+    const MHCSettings m = FullSettings();
+    std::ostringstream quietOut, quietErr;
+    std::streambuf* oldOut = std::cout.rdbuf(quietOut.rdbuf());
+    std::streambuf* oldErr = std::cerr.rdbuf(quietErr.rdbuf());
+    MhcScanout s;
+    const bool ok = ComputeMhcPreviewProfile(m, true, 0, s);
+    ComputeMhcPreviewMatrix(m, true, s);
+    std::cout.rdbuf(oldOut);
+    std::cerr.rdbuf(oldErr);
+    REQUIRE(ok);
+    CHECK(quietOut.str().empty());
+    CHECK(quietErr.str().empty());
+
+    std::ostringstream loud;
+    oldOut = std::cout.rdbuf(loud.rdbuf());
+    MhcScanout b;
+    const bool okLoud = ComputeMhcScanout(FullParams(true), b);
+    std::cout.rdbuf(oldOut);
+    REQUIRE(okLoud);
+    CHECK(loud.str().find("MHC2 matrix") != std::string::npos);
 }
 
 TEST_CASE("MHC preview: with the grayscale stage switched off, neither the preview nor the bake has the curve") {

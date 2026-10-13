@@ -85,6 +85,8 @@ bool DisplayShowsMode(int mon, bool hdr) {
 
 }  // namespace
 
+bool MhcPreviewDisplayShowsMode(int mon, bool hdr) { return DisplayShowsMode(mon, hdr); }
+
 bool MhcPreviewUsesHook() {
     return g_dwmHookMode.load() && g_gui.isRunning && IsDwmHookActive();
 }
@@ -108,7 +110,8 @@ bool ReadyMhcPreviewDisplay(int mon, bool hdr, bool& startedForPreview, bool& st
     return live;
 }
 
-bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why) {
+bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why, bool requireProfile,
+                     const MHCSettings* work) {
     auto fail = [why](const wchar_t* text) {
         if (why) *why = text;
         return false;
@@ -129,11 +132,12 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
     }
     // The bake (RegenerateMhcIfActive) installs a profile only where one is named: without one there is nothing
     // the edit would change on screen, so nothing to preview either.
-    if (mhc.profileName.empty()) return fail(L"No MHC profile installed for this mode");
+    if (requireProfile && mhc.profileName.empty()) return fail(L"No MHC profile installed for this mode");
     if (!IsMHC2ApiAvailable()) return fail(L"MHC profiles need Windows 10 21H2 or later");
 
+    const MHCSettings& start = work ? *work : mhc;
     MhcPreviewSession n;
-    if (!PrepareMhcPreview(mhc, hdr, mon, n)) return fail(L"The profile's source file cannot be read");
+    if (!PrepareMhcPreview(start, hdr, mon, n)) return fail(L"The profile's source file cannot be read");
     n.held = held;
     n.onHook = MhcPreviewUsesHook();
     // What scanout runs now, to put back if the preview cannot start after the identity profile went on.
@@ -141,6 +145,7 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
     const bool haveDisplay = GetDisplayInfoForMonitor(mon, di);
     std::wstring restore = haveDisplay ? QueryDisplayDefaultProfile(di.adapterId, di.sourceId, hdr) : std::wstring();
     if (restore.empty() && mhc.enabled) restore = mhc.profileName;
+    n.restore = restore;
 
     n.passthrough = EngagePassthroughScanout(mon, hdr, mhc);
     if (n.passthrough.empty()) return fail(L"Scanout could not be switched for the preview");
@@ -155,7 +160,7 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
     g_previewOnHook = n.onHook;
     g_previewActive = true;
     s = std::move(n);
-    UpdateMhcPreview(s, mhc.correctionGrayscale);
+    UpdateMhcPreview(s, start.correctionGrayscale);
 
     // The hook must acknowledge: a DLL from before the preview (still resident in dwm.exe) never does, and the display
     // would then show no profile at all while the edit runs.
@@ -236,6 +241,53 @@ void UpdateMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& corre
     ComposeMhcPreview(s, correction, scan);
     if (s.onHook) g_hookGen = PublishDwmHookMhcPreview(s.mon, s.hdr, scan.applied, scan.lutSize, scan.lut);
     else PublishStage(s.mon, s.hdr, &scan);
+}
+
+namespace {
+// The variant a profile edit previews: the bake's, without desktop gamma and the white balance tweak (held).
+uint8_t ProfileEditPerm(const MHCSettings& work, bool hdr) {
+    return NormalizeMhcPerm(
+        (uint8_t)(ComputeMhcPermutation(work, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB)));
+}
+}  // namespace
+
+bool ComputeMhcPreviewProfile(const MHCSettings& work, bool hdr, int mon, MhcScanout& out) {
+    MhcQuietLog quiet;
+    MHC2ProfileParams p;
+    if (!BuildMHC2ParamsForPerm(work, hdr, mon, ProfileEditPerm(work, hdr), p)) return false;
+    return ComputeMhcScanout(p, out);
+}
+
+void ComputeMhcPreviewMatrix(const MHCSettings& work, bool hdr, MhcScanout& inout) {
+    // BuildMHC2ParamsForPerm's matrix fields for this variant: the primaries (identity under the stage switch) and no
+    // white balance gains (the tweak is held; the white the primaries carry is the calibration's).
+    MhcQuietLog quiet;
+    MHC2ProfileParams p;
+    BuildMHC2MatrixParams(work, hdr, p);
+    if (ProfileEditPerm(work, hdr) & MHCSettings::PERM_NOPRIM) p.primariesEnabled = false;
+    p.whiteBalanceGains[0] = p.whiteBalanceGains[1] = p.whiteBalanceGains[2] = 1.0f;
+    ComputeMhcScanoutMatrix(p, inout);
+}
+
+bool UpdateMhcPreviewProfile(MhcPreviewSession& s, const MHCSettings& work, bool matrixOnly) {
+    if (!s.active) return false;
+    if (matrixOnly && s.shownValid) {
+        ComputeMhcPreviewMatrix(work, s.hdr, s.shown);
+    } else {
+        MhcScanout scan;
+        if (!ComputeMhcPreviewProfile(work, s.hdr, s.mon, scan)) return false;
+        s.shown = std::move(scan);
+        s.shownValid = true;
+    }
+    if (s.onHook) g_hookGen = PublishDwmHookMhcPreview(s.mon, s.hdr, s.shown.applied, s.shown.lutSize, s.shown.lut);
+    else PublishStage(s.mon, s.hdr, &s.shown);
+    return true;
+}
+
+void RestoreMhcScanout(const MhcPreviewSession& s) {
+    if (!s.active || s.restore.empty()) return;
+    DisplayInfo di;
+    if (GetDisplayInfoForMonitor(s.mon, di)) ReassociateMHC2Profile(s.restore, di.adapterId, di.sourceId, s.hdr);
 }
 
 bool WaitMhcPreviewShown(const MhcPreviewSession& s, DWORD timeoutMs) {
