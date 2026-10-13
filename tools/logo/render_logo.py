@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 """DesktopLUT logo generator.
 
-Renders the DesktopLUT mark -- the RGB colour cube as a glass cube seen from its
-white corner, framed in black -- analytically: every pixel's colour is computed
-from the cube geometry (nothing is traced from the old bitmap). Output is
-supersampled and stored with straight (non-premultiplied) alpha.
+Renders the DesktopLUT mark -- a hazy cloud of mixed red, green and blue light
+inside a black-framed glass box (the RGB colour cube) -- from geometry alone
+(nothing is traced from the old bitmap): a flat additive RGB mix, wrapped onto
+a sphere, blurred into a cloud. Output is supersampled and stored with
+straight (non-premultiplied) alpha.
 
     python tools/logo/render_logo.py            # regenerate everything in assets/logo/
-    python tools/logo/render_logo.py --metrics  # also print per-face OKLab lightness
+    python tools/logo/render_logo.py --metrics  # also print the balance numbers
 
 Only Pillow and numpy are required. Output is deterministic.
 """
 from __future__ import annotations
 
 import argparse
+import base64
+import functools
 import io
 import math
 import os
@@ -27,54 +30,50 @@ from PIL import Image, ImageDraw, ImageFont
 # Parameters
 # =============================================================================
 # Geometry -------------------------------------------------------------------
-ELEVATION_DEG = 35.2643897   # view elevation of the cube. 35.264 deg = true isometric:
-                             # the neutral (black-white) axis points at the viewer, the
-                             # outline is a regular hexagon and black hides exactly
-                             # behind white. (The old PNG was ~26 deg.)
-ALT_ELEVATION_DEG = 26.4     # shown as an alternative in preview.png only (the old PNG's view)
+ELEVATION_DEG = 26.5         # view elevation of the cube: the old PNG's view (its upper
+                             # outline slopes at 0.446 = sin e). 35.264 would be true
+                             # isometric, which shows more of the top.
 FRAME_WIDTH = 0.046          # frame stroke width, fraction of the logo height
                              # (outer hexagon and the three front edges alike)
 
-# Glass ----------------------------------------------------------------------
-GLASS_ALPHA = 0.82           # face opacity at the outer corners (1.0 at the front vertex)
-GLASS_ALPHA_GAMMA = 1.7      # how quickly opacity falls from the front vertex outwards
-EDGE_CLEAR = 0.10            # extra transparency in a band hugging the outer frame
-EDGE_CLEAR_WIDTH = 1.4       # width of that band, in frame widths
-RIM_STRENGTH = 0.30          # thin light line where the faces meet the three front edges
-RIM_WIDTH = 0.18             # rim width, in frame widths
+# Cloud ----------------------------------------------------------------------
+# Built in three steps:
+#  1. A flat RGB mix: three hard-edged circles of light, green up, blue and red
+#     at -/+ MIX_ANGLE, added channel by channel. Each pair overlaps in a lens
+#     -- cyan, yellow, magenta -- pointing at the box's C, Y and M corners (an
+#     upside-down triquetra); all three overlap in a white middle. The
+#     secondaries touch each other only through that middle. The cloud is the
+#     circles' union, not a disc: three lobes that stop short of the box's
+#     corners and seams.
+#  2. That mix wrapped onto the front of a sphere inside the box and seen
+#     straight on, so the middle bulges toward the viewer and the rim
+#     compresses. SPHERE_BULGE blends the wrap with the flat mix (1 = a full
+#     equidistant wrap: a point at angle a from the sphere's front pole shows
+#     the mix at radius a / 90 deg), so it reads as a roundish cloud, not a ball.
+#  3. The result blurred (Gaussian, premultiplied) into haze. The blur does the
+#     mixing: every boundary becomes a plain additive blend, and the middle,
+#     where all six colours meet, a light grey-white. That haze is the only
+#     softness in the mark; the box corners outside it stay empty.
+#
+# Flat mix, in units of the sphere radius (the wrap covers radius 1). Each
+# circle's centre is MIX_OFFSET from the middle.
+MIX_ANGLE = 120.0
+MIX_OFFSET = {"G": 0.40, "B": 0.40, "R": 0.40}
+MIX_RADIUS = {"G": 0.57, "B": 0.57, "R": 0.57}
+# Sphere and haze, in units of R (cube centre to top vertex; the faces' inner
+# corners sit at 0.93-1.04 R, the middles of the outer edges at about 0.83 R).
+SPHERE_RADIUS = 0.86         # radius of the sphere the mix is wrapped on
+SPHERE_BULGE = 0.6           # 0 = flat, 1 = full sphere
+SPHERE_RAISE = 0.08          # cloud centre above the cube centre, so the white-grey
+                             # middle spills a little onto the green (top) face
+CLOUD_BLUR = 0.18            # Gaussian sigma of the haze
+CLOUD_DENSITY = 2.0          # haze opacity: alpha' = 1 - (1 - alpha)^density
+CLOUD_VALUE = 0.5            # 0 = blends are the plain average, 1 = lifted to full value
 
-# Highlight ------------------------------------------------------------------
-HIGHLIGHT_STRENGTH = 1.0     # white at the front vertex (0..1)
-HIGHLIGHT_RADIUS = 0.34      # radius where the highlight is 50 %, fraction of the edge length
-HIGHLIGHT_SOFTNESS = 1.7     # falloff exponent (2 = Gaussian; lower = longer, softer tail)
-INVERTED_HIGHLIGHT_SCALE = 0.75  # the inverted variant is a literal colour inversion, so the
-                                 # white highlight becomes a dark core; drawing it at 75 %
-                                 # radius keeps that core an accent (1.0 = strictly literal)
-
-# Back edges (the three hidden edges seen through the glass) -----------------
-BACK_EDGE_STRENGTH = 0.22    # darkening / opacity added along the hidden edges
-BACK_EDGE_WIDTH = 0.60       # line width, in frame widths (soft profile, seen through glass)
-
-# Colour balance -------------------------------------------------------------
-# Each face runs from its two secondaries (along the front edges) to its primary
-# (the far corner); the white comes only from the shared highlight above, so the
-# highlight is identical on every face. Knobs shape how the hue is distributed;
-# corners always stay the exact primaries/secondaries:
-#   radial:  how quickly the primary takes over going outwards (1 = plain cube)
-#   upper / lower: per secondary seam, >1 widens the secondary's wedge, <1
-#            widens the primary's. upper = the seam on the face's first front
-#            edge (cyan on top and left, yellow on right), lower = the second
-#            (yellow on top, magenta on both side faces)
-# OKLab lightness: G .866 < C .905 < Y .968 on top and B .452 is by far the
-# darkest, so the top face favours green (its darkest colour), the blue face
-# gives its cyan seam the most room, the red face keeps its yellow seam narrow.
-# Magenta is shaped identically on both side faces, so the bottom vertex stays
-# mirror-symmetric. See README for the measured numbers.
-FACE_SHAPING = {
-    "top": dict(radial=3.0, upper=0.5, lower=0.5),     # cyan seam / yellow seam
-    "left": dict(radial=1.3, upper=2.4, lower=1.1),    # cyan seam / magenta seam
-    "right": dict(radial=1.3, upper=0.8, lower=1.1),   # yellow seam / magenta seam
-}
+# Back edges (the three hidden edges of the box) -----------------------------
+# Crisp black lines behind the cloud: sharp wherever the cloud does not reach,
+# veiled only by the cloud's own haze in front of them.
+BACK_EDGE_WIDTH = 0.45       # line width, in frame widths
 
 # Rendering ------------------------------------------------------------------
 SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512, 1024]
@@ -82,22 +81,19 @@ ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
 
 # Per-size hinting. At every size frame widths are whole pixels and the vertical
 # strokes sit on pixel boundaries; at small sizes the detail that turns to mush
-# is dropped and the faces simplify toward their primaries.
+# is dropped.
 #   fw:    vertical stroke width in px (default: FRAME_WIDTH * size, rounded)
 #   diag:  slanted stroke width relative to fw (optical compensation: a 1 px
 #          slanted stroke anti-aliases to grey)
-#   back / rim / clear: multipliers for back edges, front rim, edge clearing
-#   hl:    highlight radius multiplier
-#   prim:  multiplier on the seam knobs (<1 = the primary owns more of each face)
-#   glass: face opacity at the outer corners (overrides GLASS_ALPHA)
+#   back:  back edges on (1) or off (0)
 SMALL = {
-    16: dict(fw=1, diag=1.50, back=0.0, rim=0.0, clear=0.0, hl=0.80, prim=0.50, glass=0.92),
-    20: dict(fw=1, diag=1.45, back=0.0, rim=0.0, clear=0.0, hl=0.82, prim=0.55, glass=0.92),
-    24: dict(fw=1, diag=1.40, back=0.0, rim=0.0, clear=0.0, hl=0.85, prim=0.60, glass=0.90),
-    32: dict(fw=2, diag=1.15, back=0.0, rim=0.0, clear=0.3, hl=0.90, prim=0.75, glass=0.88),
-    40: dict(fw=2, diag=1.05, back=0.4, rim=0.4, clear=0.5, hl=0.95, prim=0.85, glass=0.85),
-    48: dict(fw=2, diag=1.00, back=0.5, rim=0.5, clear=0.6, hl=1.00, prim=0.90),
-    64: dict(fw=3, diag=1.00, back=0.7, rim=0.7, clear=0.8, hl=1.00, prim=0.95),
+    16: dict(fw=1, diag=1.50, back=0),
+    20: dict(fw=1, diag=1.45, back=0),
+    24: dict(fw=1, diag=1.40, back=0),
+    32: dict(fw=2, diag=1.15, back=0),
+    40: dict(fw=2, diag=1.05),
+    48: dict(fw=2, diag=1.00),
+    64: dict(fw=3, diag=1.00),
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -108,9 +104,11 @@ ORIGINAL_INV_PNG = os.path.join(REPO, "DesktopLUT-logo-inv.png")
 ORIGINAL_ICO = os.path.join(REPO, "DesktopLUT.ico")
 
 # Cube corner colours (sRGB-encoded, the RGB cube itself)
-WHITE = np.array([1.0, 1.0, 1.0])
 RED, GREEN, BLUE = np.eye(3)
 CYAN, MAGENTA, YELLOW = 1 - RED, 1 - GREEN, 1 - BLUE
+COLOURS = {"R": RED, "G": GREEN, "B": BLUE, "C": CYAN, "M": MAGENTA, "Y": YELLOW}
+CHANNEL = {"R": 0, "G": 1, "B": 2}
+ORDER = ("G", "Y", "R", "M", "B", "C")
 
 
 # =============================================================================
@@ -190,22 +188,21 @@ class Geometry:
         self.G, self.Y, self.R, self.M, self.B, self.C = V
         self.W = self.C + self.Y - self.G                     # white corner (front)
         self.K = self.C + self.Y + self.M - 2 * self.W        # black corner (hidden)
-        self.unit = float(np.mean([np.hypot(*(p - self.W)) for p in (self.C, self.Y, self.M)]))
+        self.centre = (self.W + self.K) / 2                   # cube centre
+        self.radius = float(np.hypot(*(self.G - self.centre)))  # R: centre to top vertex
         self.faces = {
-            "top": self._face(self.C, self.G, self.Y, CYAN, GREEN, YELLOW),
-            "left": self._face(self.C, self.B, self.M, CYAN, BLUE, MAGENTA),
-            "right": self._face(self.Y, self.R, self.M, YELLOW, RED, MAGENTA),
+            "top": self._face(self.C, self.G, self.Y),
+            "left": self._face(self.C, self.B, self.M),
+            "right": self._face(self.Y, self.R, self.M),
         }
 
     def width(self, p0, p1):
         """Stroke width of the edge p0-p1 (vertical or slanted)."""
         return self.fw if abs(p1[0] - p0[0]) < 1e-9 else self.fd
 
-    def _face(self, A, P, Bc, colA, colP, colB):
-        """Face W-A-P-Bc (A, Bc secondaries along the front edges, P the primary).
-
-        The visible face is the rhombus inset by half a stroke from each cube edge.
-        """
+    def _face(self, A, P, Bc):
+        """Face W-A-P-Bc. The visible face is the rhombus inset by half a stroke
+        from each cube edge."""
         W = self.W
         mid = (W + P) / 2
         lWA = Line(W, A, mid).offset(self.width(W, A) / 2)
@@ -217,136 +214,220 @@ class Geometry:
         Pi = intersect(lAP, lPB)
         Bi = intersect(lPB, lBW)
         basis = np.array([Ai - Wi, Bi - Wi]).T
-        return dict(Wi=Wi, Ai=Ai, Pi=Pi, Bi=Bi, inv=np.linalg.inv(basis),
-                    front=(lWA, lBW), outer=(lAP, lPB), P=P,
-                    colA=colA, colP=colP, colB=colB)
+        return dict(Wi=Wi, Ai=Ai, Pi=Pi, Bi=Bi, inv=np.linalg.inv(basis))
+
+    def face_mask(self, f, x, y):
+        px, py = x - f["Wi"][0], y - f["Wi"][1]
+        a = f["inv"][0, 0] * px + f["inv"][0, 1] * py
+        b = f["inv"][1, 0] * px + f["inv"][1, 1] * py
+        return (a >= 0) & (a <= 1) & (b >= 0) & (b <= 1)
 
 
 # =============================================================================
-# Colour model
+# Colour science
 # =============================================================================
-def radial_shape(x, k):
-    """0->0, 1->1; k>1 rises faster (the primary takes over sooner)."""
-    return 1.0 - np.power(1.0 - np.clip(x, 0.0, 1.0), k)
+def srgb_to_linear(c):
+    c = np.asarray(c, float)
+    return np.where(c <= 0.04045, c / 12.92, np.power((c + 0.055) / 1.055, 2.4))
 
 
-def angular_shape(r, q):
-    """Weight of the primary for a ratio r in [0,1] (0 = secondary edge, 1 =
-    diagonal). Flat at r=1, so the two halves of a face meet smoothly on the
-    diagonal (no ridge at the primary)."""
-    return 1.0 - np.square(1.0 - np.power(np.clip(r, 0.0, 1.0), q))
+def linear_to_srgb(c):
+    c = np.clip(c, 0, 1)
+    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055)
 
 
-def primary_weight(a, b, shaping):
-    """Weight of the face's primary at face coordinates (a, b), and which half
-    (upper = toward secondary A) the point lies in."""
-    fa = radial_shape(a, shaping["radial"])
-    fb = radial_shape(b, shaping["radial"])
-    upper = fa >= fb
-    r = np.where(upper, fb / np.maximum(fa, 1e-12), fa / np.maximum(fb, 1e-12))
-    t = np.where(upper, angular_shape(r, shaping["upper"]), angular_shape(r, shaping["lower"]))
-    return t, upper
+_OKLAB_M1 = np.array([[0.4122214708, 0.5363325363, 0.0514459929],
+                      [0.2119034982, 0.6806995451, 0.1073969566],
+                      [0.0883024619, 0.2817188376, 0.6299787005]])
+_OKLAB_M2 = np.array([[0.2104542553, 0.7936177850, -0.0040720468],
+                      [1.9779984951, -2.4285922050, 0.4505937099],
+                      [0.0259040371, 0.7827717662, -0.8086757660]])
 
 
-def face_hue(a, b, face, shaping):
-    """Fully saturated face colour at face coordinates (a, b): the secondary along
-    each front edge, the primary on the diagonal and in the far corner. This is
-    the RGB cube's own hue layout (a fan about the white corner) with the
-    distribution reshaped; every colour lies on the face's cube plane."""
-    t, upper = primary_weight(a, b, shaping)
-    sec = np.where(upper[..., None], face["colA"], face["colB"])
-    return sec + (face["colP"] - sec) * t[..., None]
+def oklab(rgb):
+    """sRGB-encoded (..., 3) -> OKLab (..., 3)."""
+    lms = np.cbrt(srgb_to_linear(rgb) @ _OKLAB_M1.T)
+    return lms @ _OKLAB_M2.T
 
 
-def edge_hue(s, face, shaping):
-    """Colour along the back edges (A -> P -> Bc as s goes 0 -> 0.5 -> 1)."""
-    if s <= 0.5:
-        t = angular_shape(radial_shape(2 * s, shaping["radial"]), shaping["upper"])
-        return face["colA"] + (face["colP"] - face["colA"]) * t
-    t = angular_shape(radial_shape(2 * (1 - s), shaping["radial"]), shaping["lower"])
-    return face["colB"] + (face["colP"] - face["colB"]) * t
+def oklab_L(rgb):
+    return oklab(rgb)[..., 0]
 
 
-def highlight(d_unit, radius_scale=1.0):
-    r = HIGHLIGHT_RADIUS * radius_scale
-    return HIGHLIGHT_STRENGTH * np.exp2(-np.power(d_unit / r, HIGHLIGHT_SOFTNESS))
+_SRGB_TO_XYZ = np.array([[0.4124564, 0.3575761, 0.1804375],
+                         [0.2126729, 0.7151522, 0.0721750],
+                         [0.0193339, 0.1191920, 0.9503041]])
+
+
+def lightness_hk(rgb):
+    """CIELAB L** (Fairchild & Pirrotta 1991): L* plus the Helmholtz-Kohlrausch
+    term, the lightness a saturated colour appears to have. D65, sRGB."""
+    xyz = srgb_to_linear(rgb) @ _SRGB_TO_XYZ.T / (_SRGB_TO_XYZ @ np.ones(3))
+    f = np.where(xyz > 216 / 24389, np.cbrt(xyz), (24389 / 27 * xyz + 16) / 116)
+    L = 116 * f[..., 1] - 16
+    a, b = 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])
+    C, h = np.hypot(a, b), np.degrees(np.arctan2(b, a))
+    return L + (2.5 - 0.025 * L) * (0.116 * np.abs(np.sin(np.radians((h - 90) / 2))) + 0.085) * C
+
+
+def nearest_colour(rgb):
+    """Index into ORDER of the named colour each pixel's OKLab hue is closest to."""
+    lab = oklab(rgb)
+    h = np.degrees(np.arctan2(lab[..., 2], lab[..., 1]))
+    ref = [math.degrees(math.atan2(*oklab(COLOURS[c])[[2, 1]])) for c in ORDER]
+    d = np.stack([np.abs((h - r + 180.0) % 360.0 - 180.0) for r in ref], axis=-1)
+    return d.argmin(axis=-1)
+
+
+# =============================================================================
+# Cloud
+# =============================================================================
+def flat_mix(u, v):
+    """Step 1: the flat additive RGB mix at coordinates (u, v), v up, in units of
+    the sphere radius. Returns (rgb, inside the cloud = the circles' union)."""
+    rgb = np.zeros(u.shape + (3,))
+    for c, ch in CHANNEL.items():
+        ang = math.radians({"G": 0.0, "B": -MIX_ANGLE, "R": MIX_ANGLE}[c])
+        cu, cv = MIX_OFFSET[c] * math.sin(ang), MIX_OFFSET[c] * math.cos(ang)
+        rgb[..., ch] = (np.hypot(u - cu, v - cv) <= MIX_RADIUS[c]).astype(float)
+    return rgb, rgb.max(axis=-1) > 0
+
+
+@functools.lru_cache(maxsize=None)
+def _wrap_table(bulge):
+    """Screen radius rho for mix radius t (both in sphere radii): a blend of the
+    flat mix (rho = t) and the equidistant wrap (rho = sin(t * 90 deg))."""
+    t = np.linspace(0.0, 1.0, 4097)
+    rho = (1.0 - bulge) * t + bulge * np.sin(t * math.pi / 2)
+    return rho, t
+
+
+def sphere_layer(geo, ss):
+    """Step 2: the flat mix wrapped onto the sphere, premultiplied RGBA at the
+    canvas resolution (box-filtered from ss x ss samples per pixel)."""
+    n = geo.size
+    out = np.zeros((n, n, 4))
+    off = (np.arange(ss) + 0.5) / ss
+    cx, cy = geo.centre[0], geo.centre[1] - SPHERE_RAISE * geo.radius
+    rs = SPHERE_RADIUS * geo.radius
+    band = max(1, int(2 ** 21 // (n * ss * ss)))
+    xs = (np.arange(n)[:, None] + off[None, :]).reshape(-1)
+    for y0 in range(0, n, band):
+        y1 = min(n, y0 + band)
+        ys = (np.arange(y0, y1)[:, None] + off[None, :]).reshape(-1)
+        X, Y = np.meshgrid(xs, ys)
+        dx, dy = (X - cx) / rs, (Y - cy) / rs
+        rho = np.hypot(dx, dy)
+        on = rho < 1.0
+        rt, tt = _wrap_table(SPHERE_BULGE)
+        t = np.where(on, np.interp(rho, rt, tt), 0.0)
+        k = np.where(rho > 0, t / np.maximum(rho, 1e-12), 0.0)
+        rgb, inside = flat_mix(dx * k, -dy * k)
+        a = (on & inside).astype(float)
+        pm = np.concatenate([rgb * a[..., None], a[..., None]], axis=-1)
+        out[y0:y1] = pm.reshape(y1 - y0, ss, n, ss, 4).mean(axis=(1, 3))
+    return out
+
+
+def gaussian_blur(img, sigma):
+    """Gaussian blur of an (h, w, c) array via FFT, zero-padded."""
+    if sigma <= 0:
+        return img
+    pad = int(math.ceil(4 * sigma))
+    h, w = img.shape[:2]
+    H, W = h + 2 * pad, w + 2 * pad
+    big = np.zeros((H, W, img.shape[2]))
+    big[pad:pad + h, pad:pad + w] = img
+    fy = np.fft.fftfreq(H)[:, None]
+    fx = np.fft.rfftfreq(W)[None, :]
+    g = np.exp(-2.0 * (math.pi * sigma) ** 2 * (fy ** 2 + fx ** 2))
+    out = np.fft.irfft2(np.fft.rfft2(big, axes=(0, 1)) * g[..., None], s=(H, W), axes=(0, 1))
+    return out[pad:pad + h, pad:pad + w]
+
+
+def cloud(geo, ss):
+    """Steps 2 and 3: the hazy cloud as (straight colour, alpha) per pixel.
+
+    The blur averages the colours where regions meet, so the middle, where all
+    six meet, mixes to a light grey-white. CLOUD_VALUE lifts blends partway back
+    toward full value (0 = the plain average, 1 = strongest channel at 1) so
+    they do not turn muddy; CLOUD_DENSITY makes the haze less transparent."""
+    pm = gaussian_blur(sphere_layer(geo, ss), CLOUD_BLUR * geo.radius)
+    a = np.clip(pm[..., 3], 0.0, 1.0)
+    rgb = np.clip(pm[..., :3], 0.0, None) / np.maximum(a, 1e-12)[..., None]
+    rgb = np.clip(rgb, 0.0, 1.0)
+    m = rgb.max(axis=-1)
+    colour = np.where((m > 1e-9)[..., None], rgb / np.maximum(m, 1e-12)[..., None], 0.0)
+    value = m + CLOUD_VALUE * (1.0 - m)
+    colour = colour * value[..., None]
+    a = 1.0 - np.power(1.0 - a, CLOUD_DENSITY)
+    a = np.where(a < 1e-6, 0.0, a)
+    return colour, a
+
+
+def seg_dist(x, y, p0, p1):
+    d = p1 - p0
+    L2 = float(d @ d)
+    if L2 == 0:
+        return np.hypot(x - p0[0], y - p0[1])
+    t = np.clip(((x - p0[0]) * d[0] + (y - p0[1]) * d[1]) / L2, 0, 1)
+    return np.hypot(x - (p0[0] + t * d[0]), y - (p0[1] + t * d[1]))
 
 
 # =============================================================================
 # Rasteriser
 # =============================================================================
-def render(size, inverted=False, hinted=True, ss=None, return_coverage=False, elevation=None):
-    """Render the mark at size x size. Returns straight-alpha RGBA uint8 array
-    (and optionally per-face coverage maps)."""
+def render(size, inverted=False, hinted=True, ss=None, return_coverage=False, elevation=None,
+           frame=True):
+    """Render the mark at size x size. Returns a straight-alpha RGBA uint8 array
+    (and optionally per-face coverage maps). frame=False leaves out the frame
+    (the cloud layer of the SVG)."""
     spec = SMALL.get(size, {}) if hinted else {}
     fw = spec.get("fw")
     fd = None if fw is None else fw * spec.get("diag", 1.0)
     geo = Geometry(size, fw=fw, fd=fd, hinted=hinted, elevation=elevation)
-    back_k = BACK_EDGE_STRENGTH * spec.get("back", 1.0)
-    rim_k = RIM_STRENGTH * spec.get("rim", 1.0)
-    clear_k = EDGE_CLEAR * spec.get("clear", 1.0)
-    hl_scale = spec.get("hl", 1.0) * (INVERTED_HIGHLIGHT_SCALE if inverted else 1.0)
-    glass_min = spec.get("glass", GLASS_ALPHA)
-    prim = spec.get("prim", 1.0)
-    shaping = {k: dict(v, upper=v["upper"] * prim, lower=v["lower"] * prim) for k, v in FACE_SHAPING.items()}
+    back_on = spec.get("back", 1) > 0
     if ss is None:
         ss = 16 if size <= 64 else 8 if size <= 256 else 4
     frame_rgb = np.array([1.0, 1.0, 1.0]) if inverted else np.zeros(3)
+    cl_rgb, cl_a = cloud(geo, min(ss, 4))
 
     out = np.zeros((size, size, 4))
     cov = {k: np.zeros((size, size)) for k in geo.faces} if return_coverage else None
     off = (np.arange(ss) + 0.5) / ss
     band = max(1, int(2 ** 22 // (size * ss * ss)))      # output rows per band
     back_lines = [(geo.K, geo.G), (geo.K, geo.R), (geo.K, geo.B)]
-    back_sigma = max(0.5, BACK_EDGE_WIDTH * geo.fw * 0.5)
-    rim_w = max(0.35, RIM_WIDTH * geo.fw)
-    clear_w = EDGE_CLEAR_WIDTH * geo.fw
+    back_hw = max(0.5, BACK_EDGE_WIDTH * geo.fw) / 2
 
     for y0 in range(0, size, band):
         y1 = min(size, y0 + band)
         ys = (np.arange(y0, y1)[:, None] + off[None, :]).reshape(-1)
         xs = (np.arange(size)[:, None] + off[None, :]).reshape(-1)
         X, Y = np.meshgrid(xs, ys)
-        inside = np.ones_like(X, bool)
-        for l in geo.outer_lines:
-            inside &= l.dist(X, Y) < 0
+        PX = np.minimum(X.astype(int), size - 1)
+        PY = np.minimum(Y.astype(int), size - 1)
         rgb = np.zeros(X.shape + (3,))
-        alpha = inside.astype(float)
-        rgb[inside] = frame_rgb
-        dW = np.hypot(X - geo.W[0], Y - geo.W[1]) / geo.unit
-        H = highlight(dW, hl_scale)
-        glass = 1.0 - (1.0 - glass_min) * np.power(np.clip(dW, 0, 1), GLASS_ALPHA_GAMMA)
+        alpha = np.zeros(X.shape)
+        if frame:
+            inside = np.ones_like(X, bool)
+            for l in geo.outer_lines:
+                inside &= l.dist(X, Y) < 0
+            rgb[inside] = frame_rgb
+            alpha = inside.astype(float)
 
         for name, f in geo.faces.items():
-            px, py = X - f["Wi"][0], Y - f["Wi"][1]
-            a = f["inv"][0, 0] * px + f["inv"][0, 1] * py
-            b = f["inv"][1, 0] * px + f["inv"][1, 1] * py
-            m = (a >= 0) & (a <= 1) & (b >= 0) & (b <= 1)
+            m = geo.face_mask(f, X, Y)
             if not m.any():
                 continue
-            am, bm, xm, ym = a[m], b[m], X[m], Y[m]
-            c = face_hue(am, bm, f, shaping[name])
-            al = glass[m].copy()
-            # glass: a touch clearer right against the outer frame
-            if clear_k > 0:
-                eo = np.minimum(-f["outer"][0].dist(xm, ym), -f["outer"][1].dist(xm, ym))
-                al *= 1.0 - clear_k * np.exp(-np.square(eo / clear_w))
-            # hidden back edges, seen through the glass (darker, more opaque)
-            if back_k > 0:
-                ell = np.zeros_like(xm)
-                for p0, p1 in back_lines:
-                    ell = np.maximum(ell, np.exp(-0.5 * np.square(seg_dist(xm, ym, p0, p1) / back_sigma)))
-                ell *= back_k
-                c = c * (1.0 - ell[:, None])
-                al = al + (1.0 - al) * ell
-            # white highlight at the front vertex (front surface, covers the back edges)
-            h = H[m][:, None]
-            c = c + (1.0 - c) * h
-            # light rim along the front edges
-            if rim_k > 0:
-                ef = np.minimum(-f["front"][0].dist(xm, ym), -f["front"][1].dist(xm, ym))
-                rim = rim_k * np.exp(-np.square(ef / rim_w))
-                c = c + (1.0 - c) * rim[:, None]
+            xm, ym = X[m], Y[m]
+            col, ca = cl_rgb[PY[m], PX[m]], cl_a[PY[m], PX[m]]
+            # back to front: the box's back edges (crisp black), then the cloud
+            line = np.zeros_like(xm)
+            if back_on:
+                dist = np.min([seg_dist(xm, ym, p0, p1) for p0, p1 in back_lines], axis=0)
+                line = (dist < back_hw).astype(float)
+            al = ca + (1.0 - ca) * line
+            c = col * (ca / np.maximum(al, 1e-12))[:, None]
             if inverted:
                 c = 1.0 - c
             rgb[m] = c
@@ -369,37 +450,9 @@ def render(size, inverted=False, hinted=True, ss=None, return_coverage=False, el
     return (img, cov, geo) if return_coverage else img
 
 
-def seg_dist(x, y, p0, p1):
-    d = p1 - p0
-    L2 = float(d @ d)
-    if L2 == 0:
-        return np.hypot(x - p0[0], y - p0[1])
-    t = np.clip(((x - p0[0]) * d[0] + (y - p0[1]) * d[1]) / L2, 0, 1)
-    return np.hypot(x - (p0[0] + t * d[0]), y - (p0[1] + t * d[1]))
-
-
 # =============================================================================
-# OKLab metrics
+# Metrics
 # =============================================================================
-def srgb_to_linear(c):
-    c = np.asarray(c, float)
-    return np.where(c <= 0.04045, c / 12.92, np.power((c + 0.055) / 1.055, 2.4))
-
-
-def linear_to_srgb(c):
-    c = np.clip(c, 0, 1)
-    return np.where(c <= 0.0031308, c * 12.92, 1.055 * np.power(c, 1 / 2.4) - 0.055)
-
-
-def oklab_L(rgb):
-    lin = srgb_to_linear(rgb)
-    lms = lin @ np.array([[0.4122214708, 0.2119034982, 0.0883024619],
-                          [0.5363325363, 0.6806995451, 0.2817188376],
-                          [0.0514459929, 0.1073969566, 0.6299787005]])
-    lms = np.cbrt(lms)
-    return lms @ np.array([0.2104542553, 0.7936177850, -0.0040720468])
-
-
 def lightness_gray(img):
     """Grey with the same OKLab L as each pixel (alpha kept)."""
     L = oklab_L(img[..., :3] / 255.0)
@@ -444,6 +497,23 @@ def original_face_masks(img):
     return {"top": top, "left": left, "right": right}
 
 
+def colour_areas(img, masks):
+    """Share of each named colour on the faces: face pixels by the named colour
+    their OKLab hue is nearest, weighted by opacity x saturation (1 - min/max)."""
+    face = np.zeros(img.shape[:2], bool)
+    for v in masks.values():
+        face |= v
+    rgb = img[..., :3] / 255.0
+    near = nearest_colour(rgb)
+    sat = 1.0 - rgb.min(-1) / np.maximum(rgb.max(-1), 1e-6)
+    w = img[..., 3] / 255.0 * sat * face
+    return {c: float(w[near == i].sum() / w.sum()) for i, c in enumerate(ORDER)}
+
+
+def colour_weights():
+    return {c: float(lightness_hk(v)) for c, v in COLOURS.items()}
+
+
 # =============================================================================
 # ICO writer (BMP entries below 256 px, PNG-compressed 256 px entry)
 # =============================================================================
@@ -462,7 +532,6 @@ def write_ico(path, images):
         row_bytes = ((n + 31) // 32) * 4
         mask = bytearray()
         for row in im[::-1]:
-            bits = 0
             line = bytearray(row_bytes)
             for x in range(n):
                 if row[x, 3] == 0:
@@ -482,86 +551,27 @@ def write_ico(path, images):
 
 
 # =============================================================================
-# SVG (vector approximation of the master)
+# SVG: vector frame over the cloud layer
 # =============================================================================
-def write_svg(path, size=256):
+def write_svg(path, size=256, cloud_px=512):
+    """The frame is vector; the clouds (soft by nature, and mixed in a way SVG
+    compositing cannot express) are an embedded PNG at cloud_px."""
     geo = Geometry(size, hinted=False)
+    clouds = render(cloud_px, hinted=False, frame=False)
+    buf = io.BytesIO()
+    Image.fromarray(clouds, "RGBA").save(buf, "PNG", optimize=True)
+    data = base64.b64encode(buf.getvalue()).decode("ascii")
     f6 = lambda v: f"{v:.3f}".rstrip("0").rstrip(".")
     pt = lambda p: f"{f6(p[0])},{f6(p[1])}"
-    hexd = lambda c: "#%02x%02x%02x" % tuple(int(round(x * 255)) for x in c)
-    defs, faces, backs, seams = [], [], [], []
-    for name, f in geo.faces.items():
-        stops = []
-        for i in range(33):
-            s = i / 32
-            col = edge_hue(s, f, FACE_SHAPING[name])
-            stops.append(f'<stop offset="{f6(s)}" stop-color="{hexd(col)}"/>')
-        A, B = f["Ai"], f["Bi"]
-        defs.append(f'<linearGradient id="hue-{name}" gradientUnits="userSpaceOnUse" '
-                    f'x1="{f6(A[0])}" y1="{f6(A[1])}" x2="{f6(B[0])}" y2="{f6(B[1])}">'
-                    + "".join(stops) + "</linearGradient>")
-        poly = " ".join(pt(p) for p in (f["Wi"], f["Ai"], f["Pi"], f["Bi"]))
-        faces.append((name, poly))
-        # Secondary seams along the two front edges (the hue fan's wedges), as
-        # perpendicular fades sampled from the raster model at 65 % along the edge.
-        for side, E, col in (("a", f["Ai"], f["colA"]), ("b", f["Bi"], f["colB"])):
-            other = f["Bi"] if side == "a" else f["Ai"]
-            e = (E - f["Wi"]) / np.hypot(*(E - f["Wi"]))
-            nrm = np.array([-e[1], e[0]])
-            if nrm @ (other - f["Wi"]) < 0:
-                nrm = -nrm
-            Q = f["Wi"] + 0.65 * (E - f["Wi"])
-            # fade runs to the face diagonal, where the seam weight is exactly 0
-            dia = f["Pi"] - f["Wi"]
-            span = float(np.linalg.solve(np.array([nrm, -dia]).T, f["Wi"] - Q)[0])
-            sstops = []
-            for i in range(17):
-                d = span * i / 16
-                p = Q + d * nrm
-                ab = f["inv"] @ (p - f["Wi"])
-                t, _ = primary_weight(np.array(ab[0]), np.array(ab[1]), FACE_SHAPING[name])
-                w = float(1.0 - t)
-                sstops.append(f'<stop offset="{f6(i / 16)}" stop-color="{hexd(col)}" '
-                              f'stop-opacity="{f6(w)}"/>')
-            P2 = Q + span * nrm
-            sid = f"seam-{name}-{side}"
-            defs.append(f'<linearGradient id="{sid}" gradientUnits="userSpaceOnUse" '
-                        f'x1="{f6(Q[0])}" y1="{f6(Q[1])}" x2="{f6(P2[0])}" y2="{f6(P2[1])}">'
-                        + "".join(sstops) + "</linearGradient>")
-            seams.append((sid, poly))
-    # highlight + glass opacity as radial gradients about the white corner
-    hl, ga = [], []
-    for i in range(25):
-        d = i / 24 * 1.2
-        hl.append(f'<stop offset="{f6(i / 24)}" stop-color="#fff" stop-opacity="{f6(float(highlight(np.array(d))))}"/>')
-        g = 1.0 - (1.0 - GLASS_ALPHA) * min(1.0, d) ** GLASS_ALPHA_GAMMA
-        ga.append(f'<stop offset="{f6(i / 24)}" stop-color="#fff" stop-opacity="{f6(g)}"/>')
-    r = geo.unit * 1.2
-    W = geo.W
-    defs.append(f'<radialGradient id="hl" gradientUnits="userSpaceOnUse" cx="{f6(W[0])}" cy="{f6(W[1])}" r="{f6(r)}">' + "".join(hl) + "</radialGradient>")
-    defs.append(f'<radialGradient id="glassg" gradientUnits="userSpaceOnUse" cx="{f6(W[0])}" cy="{f6(W[1])}" r="{f6(r)}">' + "".join(ga) + "</radialGradient>")
-    defs.append(f'<mask id="glass" maskUnits="userSpaceOnUse" x="0" y="0" width="{size}" height="{size}">'
-                f'<rect width="{size}" height="{size}" fill="url(#glassg)"/></mask>')
-    clip = "".join(f'<polygon points="{p}"/>' for _, p in faces)
-    defs.append(f'<clipPath id="faces">{clip}</clipPath>')
-    sd = BACK_EDGE_WIDTH * geo.fw * 0.35
-    defs.append(f'<filter id="soft" x="-10%" y="-10%" width="120%" height="120%"><feGaussianBlur stdDeviation="{f6(sd)}"/></filter>')
-    for p1 in (geo.G, geo.R, geo.B):
-        backs.append(f'<line x1="{f6(geo.K[0])}" y1="{f6(geo.K[1])}" x2="{f6(p1[0])}" y2="{f6(p1[1])}"/>')
     frame = "M" + " L".join(pt(p) for p in geo.outer) + " Z"
-    for _, f in geo.faces.items():
+    for f in geo.faces.values():
         frame += " M" + " L".join(pt(p) for p in (f["Wi"], f["Ai"], f["Pi"], f["Bi"])) + " Z"
     body = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}" width="{size}" height="{size}">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        f'viewBox="0 0 {size} {size}" width="{size}" height="{size}">',
         "<title>DesktopLUT</title>",
-        "<defs>" + "".join(defs) + "</defs>",
-        '<g mask="url(#glass)">',
-        "".join(f'<polygon points="{p}" fill="url(#hue-{n})"/>' for n, p in faces),
-        "".join(f'<polygon points="{p}" fill="url(#{sid})"/>' for sid, p in seams),
-        f'<g clip-path="url(#faces)" filter="url(#soft)" stroke="#000" stroke-opacity="{f6(BACK_EDGE_STRENGTH)}" '
-        f'stroke-width="{f6(BACK_EDGE_WIDTH * geo.fw)}" stroke-linecap="round">' + "".join(backs) + "</g>",
-        f'<rect width="{size}" height="{size}" fill="url(#hl)" clip-path="url(#faces)"/>',
-        "</g>",
+        f'<image width="{size}" height="{size}" href="data:image/png;base64,{data}" '
+        f'xlink:href="data:image/png;base64,{data}"/>',
         f'<path d="{frame}" fill="#000" fill-rule="evenodd"/>',
         "</svg>",
     ]
@@ -593,7 +603,7 @@ def _paste(sheet, img, xy, ground, zoom=1):
     sheet.paste(bg.convert("RGB"), xy)
 
 
-def make_preview(path, master, master_inv, small, small_inv, stats_lines, alt=None):
+def make_preview(path, master, master_inv, small, small_inv, stats_lines):
     orig = orig_inv = None
     if os.path.exists(ORIGINAL_PNG):
         orig = np.array(Image.open(ORIGINAL_PNG).convert("RGBA"))
@@ -610,12 +620,11 @@ def make_preview(path, master, master_inv, small, small_inv, stats_lines, alt=No
     big = [("old", orig), ("new", master),
            ("old, OKLab L", None if orig is None else lightness_gray(orig)),
            ("new, OKLab L", lightness_gray(master)),
-           ("old inverted", orig_inv), ("new inverted", master_inv),
-           (alt[0] if alt else "", alt[1] if alt else None)]
+           ("old inverted", orig_inv), ("new inverted", master_inv)]
     big = [(t, im) for t, im in big if im is not None]
     gap, pad, lab = 16, 20, 20
     small_sizes = [16, 20, 24, 32, 40, 48, 64]
-    W = pad * 2 + len(big) * 256 + (len(big) - 1) * gap
+    W = max(pad * 2 + len(big) * 256 + (len(big) - 1) * gap, 1560)
     band_h = lab + lab + 256 + gap + lab + 128 + pad
     head_h = 34 + 19 * len(stats_lines) + 12
     H = head_h + len(GROUNDS) * band_h
@@ -672,45 +681,37 @@ def fmt_stats(label, st):
             f"   spread {max(vals) - min(vals):.3f}")
 
 
-def compute_stats(master_cov, master):
-    lines, raw = [], {}
-    new_masks = new_face_masks(master_cov)
-    raw["new"] = face_stats(master, new_masks)
-    raw["new_dark"] = face_stats(master, new_masks, GROUNDS[0][1])
+def fmt_colours(label, d, fmt="{:.3f}"):
+    return f"{label}: " + "   ".join(f"{c} {fmt.format(d[c])}" for c in ORDER)
+
+
+def compute_stats(master, cov):
+    w = colour_weights()
+    masks = new_face_masks(cov)
+    area = colour_areas(master, masks)
+    bal = {c: area[c] * w[c] for c in COLOURS}
+    mb = sum(bal.values()) / 6
+    lines = [
+        fmt_colours("Area share, new (nearest OKLab hue, opacity x saturation)", area),
+        fmt_colours("L** (lightness with Helmholtz-Kohlrausch, vs black)      ", w, "{:.1f}"),
+        fmt_colours("Area x L**, new, relative to the mean                    ", {c: bal[c] / mb for c in COLOURS}, "{:.2f}"),
+    ]
     if os.path.exists(ORIGINAL_PNG):
         orig = np.array(Image.open(ORIGINAL_PNG).convert("RGBA"))
         om = original_face_masks(orig)
-        raw["old"] = face_stats(orig, om)
-        raw["old_dark"] = face_stats(orig, om, GROUNDS[0][1])
-        lines.append(fmt_stats("Face mean OKLab L, old  (straight colour)", raw["old"]))
-    lines.append(fmt_stats("Face mean OKLab L, new  (straight colour)", raw["new"]))
-    if "old_dark" in raw:
-        lines.append(fmt_stats("Face mean OKLab L, old  (over #0b0b0c)   ", raw["old_dark"]))
-    lines.append(fmt_stats("Face mean OKLab L, new  (over #0b0b0c)   ", raw["new_dark"]))
-    return lines, raw
-
-
-def primary_share():
-    """Fraction of each face (master shaping) where the primary outweighs the
-    secondary -- the check that every face still reads as its primary."""
-    n = 256
-    a, b = np.meshgrid((np.arange(n) + 0.5) / n, (np.arange(n) + 0.5) / n)
-    return {k: float((primary_weight(a, b, v)[0] >= 0.5).mean()) for k, v in FACE_SHAPING.items()}
-
-
-def extra_metrics(cov, master_inv):
-    sh = primary_share()
-    lines = [f"Primary share, new: top {sh['top']:.2f}   left {sh['left']:.2f}   right {sh['right']:.2f}",
-             fmt_stats("Inverted, new (straight colour)", face_stats(master_inv, new_face_masks(cov)))]
-    if os.path.exists(ORIGINAL_INV_PNG):
-        oi = np.array(Image.open(ORIGINAL_INV_PNG).convert("RGBA"))
-        lines.append(fmt_stats("Inverted, old (straight colour)", face_stats(oi, original_face_masks(oi))))
+        oa = colour_areas(orig, om)
+        ob = {c: oa[c] * w[c] for c in COLOURS}
+        omb = sum(ob.values()) / 6
+        lines[1:1] = [fmt_colours("Area share, old                                          ", oa)]
+        lines.append(fmt_colours("Area x L**, old, relative to the mean                    ", {c: ob[c] / omb for c in COLOURS}, "{:.2f}"))
+        lines.append(fmt_stats("Face mean OKLab L, old  (over #0b0b0c)   ", face_stats(orig, om, GROUNDS[0][1])))
+    lines.append(fmt_stats("Face mean OKLab L, new  (over #0b0b0c)   ", face_stats(master, masks, GROUNDS[0][1])))
     return lines
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--metrics", action="store_true", help="print per-face OKLab lightness")
+    ap.add_argument("--metrics", action="store_true", help="print the balance numbers")
     ap.add_argument("--out", default=OUT_DIR, help="output directory (default assets/logo)")
     args = ap.parse_args(argv)
     os.makedirs(args.out, exist_ok=True)
@@ -726,10 +727,8 @@ def main(argv=None):
     write_svg(os.path.join(args.out, "logo.svg"))
 
     _, cov, _ = render(256, return_coverage=True)
-    stats_lines, raw = compute_stats(cov, imgs[256])
-    stats_lines += extra_metrics(cov, imgs_inv[256])
-    alt = (f"alt: old proportions ({ALT_ELEVATION_DEG:g} deg)", render(256, elevation=ALT_ELEVATION_DEG))
-    make_preview(os.path.join(args.out, "preview.png"), imgs[256], imgs_inv[256], imgs, imgs_inv, stats_lines, alt)
+    stats_lines = compute_stats(imgs[256], cov)
+    make_preview(os.path.join(args.out, "preview.png"), imgs[256], imgs_inv[256], imgs, imgs_inv, stats_lines)
     if args.metrics:
         print("\n".join(stats_lines))
     print(f"wrote {len(SIZES) * 2} PNGs, 2 ICOs, logo.svg, preview.png -> {args.out}")
