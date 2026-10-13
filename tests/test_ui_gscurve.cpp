@@ -200,3 +200,33 @@ TEST_CASE("gs editor: a new point count keeps the curve's shape (every channel, 
                 CHECK(std::fabs(GsPointPercent(id, i, hdr, ch)) < 1e-3f);
     }
 }
+
+TEST_CASE("gs editor: each point's patch, in every unit, is the stimulus the bake places it at") {
+    // HDR: PQ = t * the bake's PQ peak; nits = its EOTF; the 10-bit code is that PQ * 1023 (fractional).
+    const float pq = PqOETF(1729.2629f / 10000.0f);
+    const GsInput in = GsPointInput(26, 32, true, pq, 1023);
+    CHECK(in.signal == doctest::Approx(26.0f / 31.0f * pq));
+    CHECK(in.nits == doctest::Approx(PqEOTF(in.signal) * 10000.0f));
+    CHECK(in.pq10 == doctest::Approx(in.signal * 1023.0f));
+    CHECK(in.nits == doctest::Approx(GsPatchValue(26, 32, true, pq, 1023)));     // what the built-in patch shows
+    // At a 10000-nit peak, 32 points land on whole 10-bit codes (1023 = 31 x 33).
+    CHECK(GsPointInput(5, 32, true, 1.0f, 1023).pq10 == doctest::Approx(165.0f));
+    // SDR: on the code grid at the cap; the signal is code / cap (the built-in patch's value).
+    const GsInput s = GsPointInput(12, 32, false, 0.0f, 1023);
+    CHECK(s.code == (int)std::lround((12.0f / 31.0f) * (12.0f / 31.0f) * 1023.0f));
+    CHECK(s.signal == doctest::Approx((float)s.code / 1023.0f));
+    CHECK(s.signal == doctest::Approx(GsPatchValue(12, 32, false, 0.0f, 1023)));
+}
+
+TEST_CASE("gs editor: number formatting (significant digits, a signless zero that keeps its width)") {
+    CHECK(FormatSignificant(519.43f, 4) == "519.4");
+    CHECK(FormatSignificant(1729.26f, 4) == "1729");
+    CHECK(FormatSignificant(0.0073021f, 3) == "0.00730");
+    CHECK(FormatSignificant(2.8412f, 3) == "2.84");
+    CHECK(FormatSignificant(0.0f, 3) == "0");
+    CHECK(FormatSigned(0.62f, 2) == "+0.62");
+    CHECK(FormatSigned(-0.62f, 2) == "-0.62");
+    CHECK(FormatSigned(0.0f, 2) == " 0.00");
+    CHECK(FormatSigned(-0.004f, 2) == " 0.00");   // never "-0.00"
+    CHECK(FormatSigned(0.004f, 2).size() == FormatSigned(0.62f, 2).size());
+}

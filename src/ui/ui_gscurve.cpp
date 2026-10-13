@@ -232,6 +232,38 @@ float GsPatchValue(int i, int n, bool hdr, float pqPeak, int codeCap) {
     return (float)std::lround(t * t * (float)cap) / (float)cap;
 }
 
+GsInput GsPointInput(int i, int n, bool hdr, float pqPeak, int codeCap) {
+    GsInput in;
+    const float t = GsSlotT(i, n);
+    if (hdr) {
+        in.signal = Clamp(t * pqPeak, 0.0f, 1.0f);
+        in.nits = PqEOTF(in.signal) * 10000.0f;
+        in.pq10 = in.signal * 1023.0f;
+    } else {
+        const int cap = codeCap > 0 ? codeCap : 255;
+        in.code = (int)std::lround(t * t * (float)cap);
+        in.signal = (float)in.code / (float)cap;
+    }
+    return in;
+}
+
+std::string FormatSignificant(float v, int sig) {
+    char buf[32];
+    const float av = std::fabs(v);
+    if (av < 1e-9f) return "0";
+    int decimals = sig - 1 - (int)std::floor(std::log10(av));
+    decimals = decimals < 0 ? 0 : (decimals > 6 ? 6 : decimals);
+    snprintf(buf, sizeof(buf), "%.*f", decimals, v);
+    return buf;
+}
+
+std::string FormatSigned(float v, int decimals) {
+    char buf[32];
+    if (std::fabs(v) < 0.5f * std::pow(10.0f, (float)-decimals)) snprintf(buf, sizeof(buf), " %.*f", decimals, 0.0);
+    else snprintf(buf, sizeof(buf), "%+.*f", decimals, v);
+    return buf;
+}
+
 std::string GsPointLabel(int i, int n, bool hdr, float pqPeak, int codeCap) {
     const float t = GsSlotT(i, n);
     char buf[32];

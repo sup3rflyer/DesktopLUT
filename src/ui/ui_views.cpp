@@ -529,8 +529,6 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
         const float r = Snap(Px(Shape().panelRounding));
         dl->AddRectFilled(outer, ImVec2(outer.x + outerW, outer.y + h + 2 * pad), Col(pal::Raised), r);
         dl->AddRect(outer, ImVec2(outer.x + outerW, outer.y + h + 2 * pad), Col(pal::Rule), r);
-    } else {
-        dl->AddRectFilled(ImVec2(p0.x, Snap(midY)), ImVec2(p0.x + avail, Snap(midY) + 1), Col(pal::RuleStrong));
     }
 
     // The layout that fits, best first; the lights are the last thing to go:
@@ -576,6 +574,19 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
     const bool markerLabels = level <= 1;
     const bool chevrons = strip && level <= 1;
 
+    // The line: only in the gaps between the elements (and through unlabelled markers), never behind a node or a
+    // label, so a node greyed out (translucent) never shows it through.
+    if (!strip) {
+        float lx = p0.x;
+        for (size_t i = 0; i < n; i++) {
+            const bool through = !path[i].selectable && !markerLabels;
+            const float x0 = through ? lx : lx + widths[i];
+            const float x1 = i + 1 < n ? lx + widths[i] + gap : (through ? lx + widths[i] : x0);
+            if (x1 > x0) dl->AddRectFilled(ImVec2(Snap(x0), Snap(midY)), ImVec2(Snap(x1), Snap(midY) + 1), Col(pal::RuleStrong));
+            lx += widths[i] + gap;
+        }
+    }
+
     float x = p0.x;
     for (size_t i = 0; i < path.size(); i++) {
         const Stage& s = path[i];
@@ -596,8 +607,6 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
             }
             if (strip && s.id != StageId::Scanout)   // the ends as quiet chips
                 dl->AddRectFilled(ImVec2(Snap(x), p0.y), ImVec2(Snap(x + w), p0.y + h), Col(pal::Panel), Snap(Px(Shape().controlRounding)));
-            else if (!strip)
-                dl->AddRectFilled(ImVec2(Snap(x), Snap(midY - halfH)), ImVec2(Snap(x + w), Snap(midY + halfH)), Col(pal::Ground));
             if (s.id == StageId::Scanout) {
                 // The cut: dashes above and below the label, never through it.
                 const float gapTop = midY - halfH - Px(2), gapBottom = midY + halfH + Px(2);

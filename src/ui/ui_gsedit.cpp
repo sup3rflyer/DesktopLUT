@@ -186,10 +186,12 @@ void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr, GsTarget target)
     const int codeCap = r.mode == Mode::SDR ? 255 : 1023;
     PostToDisplay(r, [ed, hdr, key, codeCap, target](int mon) {
         if (!act::BeginGsEdit(mon, hdr, target == GsTarget::Base)) return;
-        const int step = ed->step;   // the key step and the patch are kept between edits
+        const int step = ed->step;   // the key step, the patch and the input unit are kept between edits
         const PatchSize patch = ed->patch;
+        const bool altUnit = ed->altUnit;
         *ed = GsEditorState{};
         ed->patch = patch;
+        ed->altUnit = altUnit;
         ed->open = true;
         ed->target = target;
         ed->mon = mon;
@@ -224,6 +226,32 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     snprintf(title, sizeof(title), "%s  \xC2\xB7  %s  \xC2\xB7  %d POINTS", ed.target == GsTarget::Base ? "BASE" : "FINE-TUNE",
              hdr ? "HDR" : "SDR", n);
     BeginPanel("##gsedit", title, nullptr, sizePx);
+    {
+        // On the title line: what the edit holds off for the meter, and a Night Light warning (Windows tints the
+        // screen outside DesktopLUT: the one thing the edit cannot hold) — the warning last, it stays when space is short.
+        const unsigned held = ed.renderOnly ? ed.renderHeld : act::GsEditHeld();
+        if (held) {
+            std::string list;
+            auto add = [&](const char* s) { if (!list.empty()) list += "  \xC2\xB7  "; list += s; };
+            if (held & kMhcHeldTonemap) add("TONE MAP");
+            if (held & kMhcHeldFald) add("FALD");
+            if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
+            if (held & kMhcHeldWhiteBalance) add("WHITE BALANCE");
+            const char* tip = "Off while you edit, so the meter reads the calibration alone.\nBack on with DONE or CANCEL.";
+            PanelNote("OFF", pal::InkFaint, tip);
+            PanelNote(list.c_str(), pal::InkDim, tip);
+        }
+        static int s_nightLight = 0;
+        static ULONGLONG s_nightLightAt = 0;
+        if (!ed.renderOnly && GetTickCount64() - s_nightLightAt > 1000) {   // a registry read, at most once a second
+            s_nightLight = WindowsNightLightState();
+            s_nightLightAt = GetTickCount64();
+        }
+        if (ed.renderOnly ? ed.renderNightLight : s_nightLight == 1)
+            PanelNote("NIGHT LIGHT ON", pal::Alarm,
+                      "Windows Night Light tints every display: turn it off before measuring.\n"
+                      "Settings \xE2\x80\xBA System \xE2\x80\xBA Display");
+    }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 origin(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
     const float width = ImGui::GetContentRegionAvail().x;
@@ -302,7 +330,7 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     }
 
     // ---- layout: the bank (left) and the channel strip (right); the input labels and the key legend under
-    const float legendH = Px(26), labelsH = Px(40);
+    const float legendH = Px(26), labelsH = Px(56);
     const float bodyTop = Snap(origin.y + Px(kControlH) + Px(12));
     const float bodyBottom = Snap(origin.y + height - legendH - labelsH);
     const float stripW = Snap(Px(kStripW));
@@ -395,10 +423,15 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         if (ImGui::IsItemActivated()) ed.selected = i;
         if (hovered && ImGui::GetIO().MouseWheel != 0.0f) ed.selected = i;
         changed |= FaderInput(ed, i, ed.channel, pb.y - pa.y, zoom, hovered);
-        if (hovered && !ImGui::IsItemActive())
-            ImGui::SetTooltip("%s %s  \xC2\xB7  %s %+.2f %%%s", hdr ? "Nits" : "Code", GsPointLabel(i, n, hdr, curve.pqPeak, ed.codeCap).c_str(),
-                              ed.channel == GsChannel::Gray ? "level" : "balance", Value(ed, i, ed.channel),
+        if (hovered && !ImGui::IsItemActive()) {
+            const GsInput in = GsPointInput(i, n, hdr, curve.pqPeak, ed.codeCap);
+            char patch[64];
+            if (hdr) snprintf(patch, sizeof(patch), "%s nits  \xC2\xB7  PQ %.1f", FormatSignificant(in.nits, 4).c_str(), in.pq10);
+            else snprintf(patch, sizeof(patch), "Code %d / %d", in.code, ed.codeCap);
+            ImGui::SetTooltip("%s  \xC2\xB7  %s %s %%%s", patch, ed.channel == GsChannel::Gray ? "level" : "balance",
+                              FormatSigned(Value(ed, i, ed.channel), 2).c_str(),
                               i == 0 && ed.channel == GsChannel::Gray ? "  (black: percent of full scale)" : "");
+        }
         const float y = Snap(Clamp(yOf(Value(ed, i, ed.channel)), pa.y, pb.y));
         if (Fixed(ed, i, ed.channel)) {
             dl->AddRectFilled(ImVec2(x - Px(4), y), ImVec2(x + Px(5), y + 1), Col(pal::InkFaint));
@@ -409,30 +442,67 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     }
     dl->PopClipRect();
 
-    // Inputs under the bank (thinned to fit), the moved values where they fit.
+    // The input every slider stands for — the patch to show it with — under the bank, in the chosen unit; staggered
+    // over two rows when one is too tight, thinned only when two are. The moved values where they fit.
     {
-        const float rowY = gb.y + Px(12);
-        // The selected point and the last one first; the others where they do not collide with a placed one.
-        std::vector<std::pair<float, float>> placed;
+        const float rowY = gb.y + Px(12), rowH = Px(14);
+        auto inputText = [&](int i) {
+            const GsInput in = GsPointInput(i, n, hdr, curve.pqPeak, ed.codeCap);
+            if (hdr) {
+                if (!ed.altUnit) return FormatSignificant(in.nits, 3);
+                char b[16];
+                const float r = std::round(in.pq10);
+                if (std::fabs(in.pq10 - r) < 0.05f) snprintf(b, sizeof(b), "%.0f", r);
+                else snprintf(b, sizeof(b), "%.1f", in.pq10);
+                return std::string(b);
+            }
+            if (!ed.altUnit) return std::to_string(in.code);
+            return FormatSignificant(in.signal * 100.0f, 3);
+        };
+        std::vector<std::string> texts(n);
+        std::vector<float> tws(n);
+        float widest = 0.0f;
+        for (int i = 0; i < n; i++) {
+            texts[i] = inputText(i);
+            tws[i] = MeasureInk(Font::Mono, 11.0f, texts[i].c_str()).advance;
+            widest = std::max(widest, tws[i]);
+        }
+        const float need = widest + Px(8);
+        const bool oneRow = need <= spacing;
+        const bool everyLabel = need <= 2.0f * spacing;
+        // Two rows: even points on the first, odd on the second. When even that is too tight, each row places the
+        // selected and the last point first and the others where they do not collide.
+        std::vector<std::pair<float, float>> placed[2];
         auto place = [&](int i, bool force) {
-            const std::string l = GsPointLabel(i, n, hdr, curve.pqPeak, ed.codeCap);
-            const float tw = MeasureInk(Font::Mono, 11.0f, l.c_str()).advance;
-            const float x0 = xOf(i) - tw * 0.5f, x1 = x0 + tw;
-            for (const auto& b : placed) if (!force && x1 + Px(6) > b.first && x0 - Px(6) < b.second) return;
-            placed.emplace_back(x0, x1);
-            DrawText(dl, Font::Mono, 11.0f, x0, rowY, i == ed.selected ? pal::Ink : pal::InkFaint, l.c_str());
+            const int row = oneRow ? 0 : (i & 1);
+            const float x0 = xOf(i) - tws[i] * 0.5f, x1 = x0 + tws[i];
+            if (!everyLabel)
+                for (const auto& pb : placed[row]) if (!force && x1 + Px(6) > pb.first && x0 - Px(6) < pb.second) return;
+            placed[row].emplace_back(x0, x1);
+            DrawText(dl, Font::Mono, 11.0f, x0, rowY + rowH * (float)row, i == ed.selected ? pal::Ink : pal::InkFaint,
+                     texts[i].c_str());
         };
         if (ed.selected >= 0) place(ed.selected, true);
         if (ed.selected != n - 1) place(n - 1, false);
         for (int i = 0; i < n - 1; i++) if (i != ed.selected) place(i, false);
-        DrawText(dl, Font::Label, 11.0f, ga.x + Px(6), rowY, pal::InkFaint, hdr ? "NITS" : "CODE");
+        // The unit, clickable: the other unit.
+        const char* unit = hdr ? (ed.altUnit ? "PQ" : "NITS") : (ed.altUnit ? "%" : "CODE");
+        const float uw = MeasureInk(Font::Label, 11.0f, unit).advance;
+        const ImVec2 ua(ga.x + Px(2), rowY - Px(8)), ub(ga.x + Px(10) + uw, rowY + Px(8));
+        ImGui::SetCursorScreenPos(ua);
+        ImGui::InvisibleButton("##gs_unit", ImVec2(ub.x - ua.x, ub.y - ua.y));
+        const bool unitHovered = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked()) ed.altUnit = !ed.altUnit;
+        DrawText(dl, Font::Label, 11.0f, ga.x + Px(6), rowY, unitHovered ? pal::InkDim : pal::InkFaint, unit);
+        if (unitHovered)
+            ImGui::SetTooltip(hdr ? "The patch for each point. Click: nits / 10-bit PQ code."
+                                  : "The patch for each point. Click: code / signal percent.");
         if (spacing >= Px(34)) {
-            const float valY = rowY + Px(16);
+            const float valY = rowY + rowH * 2.0f + Px(2);
             for (int i = 0; i < n; i++) {
-                char b[16];
-                snprintf(b, sizeof(b), "%+.2f", Value(ed, i, ed.channel));
-                const float tw = MeasureInk(Font::Mono, 11.0f, b).advance;
-                DrawText(dl, Font::Mono, 11.0f, xOf(i) - tw * 0.5f, valY, i == ed.selected ? pal::Ink : pal::InkDim, b);
+                const std::string b = FormatSigned(Value(ed, i, ed.channel), 2);
+                const float tw = MeasureInk(Font::Mono, 11.0f, b.c_str()).advance;
+                DrawText(dl, Font::Mono, 11.0f, xOf(i) - tw * 0.5f, valY, i == ed.selected ? pal::Ink : pal::InkDim, b.c_str());
             }
             DrawText(dl, Font::Label, 11.0f, ga.x + Px(6), valY, pal::InkFaint, "%");
         }
@@ -454,14 +524,30 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         if (ed.selected >= 0) snprintf(head, sizeof(head), "POINT %d / %d", ed.selected + 1, n);
         else snprintf(head, sizeof(head), "NO POINT");
         DrawTextIn(dl, Font::Label, 13.0f, ImVec2(ax0, row1cy - Px(10)), ImVec2(ax1, row1cy + Px(10)), pal::Ink, head);
-        // Row 2: the input, large.
+        // Row 2: the patch to show for it, large and exact; the other units under it (an external pattern generator
+        // takes one of them).
         const float row2cy = sa.y + pad + Px(kControlH) + Px(22);
         if (ed.selected >= 0) {
-            const std::string in = std::string(hdr ? "NITS " : "CODE ") + GsPointLabel(ed.selected, n, hdr, curve.pqPeak, ed.codeCap);
-            DrawTextIn(dl, Font::BodyBold, 20.0f, ImVec2(ax0, row2cy - Px(12)), ImVec2(ax1, row2cy + Px(12)), pal::Ink, in.c_str());
+            const GsInput in = GsPointInput(ed.selected, n, hdr, curve.pqPeak, ed.codeCap);
+            std::string big, sub;
+            char b[64];
+            if (hdr) {
+                big = "NITS " + FormatSignificant(in.nits, 4);
+                snprintf(b, sizeof(b), "PQ %.1f / 1023", in.pq10);
+                sub = b;
+            } else {
+                snprintf(b, sizeof(b), "CODE %d / %d", in.code, ed.codeCap);
+                big = b;
+                if (ed.codeCap == 1023) snprintf(b, sizeof(b), "8-BIT %.2f  \xC2\xB7  %s %%", in.signal * 255.0f,
+                                                 FormatSignificant(in.signal * 100.0f, 3).c_str());
+                else snprintf(b, sizeof(b), "%s %%", FormatSignificant(in.signal * 100.0f, 3).c_str());
+                sub = b;
+            }
+            DrawTextIn(dl, Font::BodyBold, 20.0f, ImVec2(ax0, row2cy - Px(12)), ImVec2(ax1, row2cy + Px(12)), pal::Ink, big.c_str());
+            DrawTextIn(dl, Font::Mono, 11.0f, ImVec2(ax0, row2cy + Px(12)), ImVec2(ax1, row2cy + Px(28)), pal::InkDim, sub.c_str());
         }
         // The measurement patch on the edited display, following the selection.
-        const float row3y = Snap(row2cy + Px(20));
+        const float row3y = Snap(row2cy + Px(36));
         {
             DrawText(dl, Font::Label, kSizeLabel, ax0, row3y + Px(kControlH) * 0.5f, pal::InkDim, "PATCH");
             const float segX = Snap(ax0 + Px(52));
@@ -537,54 +623,38 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     // ---- keys ----------------------------------------------------------------------------------------
     changed |= HandleKeys(ed, n);
     {
-        struct KeyHint { const char* keys; const char* what; };
-        static const KeyHint kHints[] = {
-            { "\xE2\x86\x90 \xE2\x86\x92", "POINT" }, { "\xE2\x86\x91 \xE2\x86\x93", "GRAY" }, { "Q A", "R" }, { "W S", "G" },
-            { "E D", "B" }, { "SHIFT", "\xC3\x97" "0.1" }, { "CTRL", "\xC3\x97" "10" }, { "DEL", "NEUTRAL" },
+        // Keys as keycaps, so a key never reads as part of its label ("Q A R" read as one word before).
+        struct KeyHint { const char* keys[2]; const char* what; ImU32 col; };
+        const KeyHint kHints[] = {
+            { { "\xE2\x86\x90", "\xE2\x86\x92" }, "POINT", pal::InkFaint },
+            { { "\xE2\x86\x91", "\xE2\x86\x93" }, "GRAY", pal::InkFaint },
+            { { "Q", "A" }, "R", ChannelColour(GsChannel::R) },
+            { { "W", "S" }, "G", ChannelColour(GsChannel::G) },
+            { { "E", "D" }, "B", ChannelColour(GsChannel::B) },
+            { { "SHIFT", nullptr }, "\xC3\x97" "0.1", pal::InkFaint },
+            { { "CTRL", nullptr }, "\xC3\x97" "10", pal::InkFaint },
+            { { "DEL", nullptr }, "NEUTRAL", pal::InkFaint },
         };
-        const float cy = origin.y + height - legendH * 0.5f;
+        const float cy = Snap(origin.y + height - legendH * 0.5f);
+        const float capH = Snap(Px(16));
         float x = origin.x;
         for (const KeyHint& h : kHints) {
-            x += DrawText(dl, Font::Mono, 11.0f, x, cy, pal::InkDim, h.keys) + Px(6);
-            x += DrawText(dl, Font::Label, 11.0f, x, cy, pal::InkFaint, h.what) + Px(18);
-        }
-        // Right-aligned, drawn without layout and only when it fits: a Night Light warning (Windows tints the screen
-        // outside DesktopLUT: the one thing the edit cannot hold), then what the edit holds off for the meter.
-        float right = origin.x + width;
-        static int s_nightLight = 0;
-        static ULONGLONG s_nightLightAt = 0;
-        if (!ed.renderOnly && GetTickCount64() - s_nightLightAt > 1000) {   // a registry read, at most once a second
-            s_nightLight = WindowsNightLightState();
-            s_nightLightAt = GetTickCount64();
-        }
-        if (ed.renderOnly ? ed.renderNightLight : s_nightLight == 1) {
-            const char* nl = "NIGHT LIGHT ON";
-            const float w = MeasureInk(Font::Label, 11.0f, nl).advance;
-            if (right - w > x + Px(10)) {
-                DrawText(dl, Font::Label, 11.0f, right - w, cy, pal::Alarm, nl);
-                if (ImGui::IsMouseHoveringRect(ImVec2(right - w, cy - Px(9)), ImVec2(right, cy + Px(9))))
-                    ImGui::SetTooltip("Windows Night Light tints every display: turn it off before measuring.\n"
-                                      "Settings \xE2\x80\xBA System \xE2\x80\xBA Display");
-                right -= w + Px(24);
+            for (const char* k : h.keys) {
+                if (!k) continue;
+                const float tw = MeasureInk(Font::Mono, 10.0f, k).advance;
+                const float kw = Snap(std::max(tw + Px(8), capH));
+                const ImVec2 ka(Snap(x), cy - capH * 0.5f), kb(Snap(x) + kw, cy + capH * 0.5f);
+                if (Shape().bevel) {
+                    dl->AddRectFilled(ka, kb, Col(pal::Control));
+                    Bevel(dl, ka, kb, BevelKind::Raised);
+                } else {
+                    dl->AddRect(ka, kb, Col(pal::RuleStrong), Shape().controlRounding > 0.0f ? Snap(Px(3)) : 0.0f);
+                }
+                DrawTextIn(dl, Font::Mono, 10.0f, ka, kb, pal::InkDim, k);
+                x += kw + Px(3);
             }
-        }
-        const unsigned held = ed.renderOnly ? ed.renderHeld : act::GsEditHeld();
-        if (held) {
-            std::string list;
-            auto add = [&](const char* s) { if (!list.empty()) list += "  \xC2\xB7  "; list += s; };
-            if (held & kMhcHeldTonemap) add("TONE MAP");
-            if (held & kMhcHeldFald) add("FALD");
-            if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
-            if (held & kMhcHeldWhiteBalance) add("WHITE BALANCE");
-            const float hw = MeasureInk(Font::Label, 11.0f, "OFF").advance + Px(8);
-            const float lw = MeasureInk(Font::Label, 11.0f, list.c_str()).advance;
-            const float x1 = right, x0 = x1 - lw - hw;
-            if (x0 > x + Px(10)) {
-                DrawText(dl, Font::Label, 11.0f, x0, cy, pal::InkFaint, "OFF");
-                DrawText(dl, Font::Label, 11.0f, x0 + hw, cy, pal::InkDim, list.c_str());
-                if (ImGui::IsMouseHoveringRect(ImVec2(x0, cy - Px(9)), ImVec2(x1, cy + Px(9))))
-                    ImGui::SetTooltip("Off while you edit, so the meter reads the curve alone.\nBack on with DONE or CANCEL.");
-            }
+            x += Px(3);
+            x += DrawText(dl, Font::Label, 11.0f, x, cy, h.col, h.what) + Px(16);
         }
     }
     // A new point count, once nothing in this frame indexes the old one: resampled (the shape stays).

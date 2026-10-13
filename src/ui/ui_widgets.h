@@ -122,6 +122,10 @@ struct PanelSwitch {
 };
 void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx, PanelSwitch* sw = nullptr);
 void EndPanel();
+// A note on the current panel's title line, right-aligned (before a header switch), drawn by EndPanel left to right
+// in the order added. When they do not all fit beside the title, only the last one is drawn (add the most important
+// last). `tip` (optional) shows on hover.
+void PanelNote(const char* text, ImU32 col, const char* tip = nullptr);
 
 // The RGB-cube logo, per-corner colours (the only saturated chrome: a quick wide-gamut tell).
 void DrawCubeLogo(ImDrawList* dl, ImVec2 center, float halfSize);

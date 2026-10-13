@@ -59,6 +59,20 @@ float GsPointLuminance(const GrayscaleSettings& gs, int i, bool hdr, float bakeP
 
 // The input a point stands for: SDR the code at `codeCap` (255 / 1023), HDR nits at the bake's peak.
 std::string GsPointLabel(int i, int n, bool hdr, float pqPeak, int codeCap);
+
+// The stimulus a point is measured with, in every unit an external pattern generator may want. HDR points sit at
+// t * the bake's PQ peak (generally between 10-bit codes); SDR points sit on the code grid at `codeCap`.
+struct GsInput {
+    float signal = 0.0f;   // HDR: PQ 0..1; SDR: code / cap
+    float nits = 0.0f;     // HDR: absolute nits
+    float pq10 = 0.0f;     // HDR: the 10-bit PQ code (fractional)
+    int code = 0;          // SDR: the code at codeCap
+};
+GsInput GsPointInput(int i, int n, bool hdr, float pqPeak, int codeCap);
+// `v` with `sig` significant digits, no exponent ("519.4", "0.0073", "1729").
+std::string FormatSignificant(float v, int sig);
+// A signed value with a space for zero's sign, so digits keep their place: "+0.62", "-0.62", " 0.00".
+std::string FormatSigned(float v, int decimals);
 // What a measurement patch shows for point i: HDR its nits; SDR its signal on the code grid (code / cap), the
 // same input the label names.
 float GsPatchValue(int i, int n, bool hdr, float pqPeak, int codeCap);

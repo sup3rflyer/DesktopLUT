@@ -620,7 +620,21 @@ bool NumberInput(const char* id, float* v, const char* fmt, float widthDip, floa
     float* draft = drafts.GetFloatRef(key, *v);
     if (ImGui::GetActiveID() != key) *draft = *v;
     const FieldText ft = BeginFieldText(key, widthDip, Font::Mono, fontSizeDip);
-    ImGui::InputFloat(id, draft, 0.0f, 0.0f, fmt);
+    // A signed format ("%+") shows zero without a sign: a space takes the sign's place, so in the mono font the
+    // digits stay where they were (and "-0.00" from a tiny negative value cannot appear).
+    const float showStep = 0.5f * std::pow(10.0f, (float)-FormatDecimals(fmt));
+    std::string zeroFmt;
+    const char* shownFmt = fmt;
+    if (ImGui::GetActiveID() != key && std::fabs(*draft) < showStep) {
+        zeroFmt = fmt;
+        const size_t at = zeroFmt.find("%+");
+        if (at != std::string::npos) {
+            zeroFmt.replace(at, 2, " %");
+            *draft = 0.0f;
+            shownFmt = zeroFmt.c_str();
+        }
+    }
+    ImGui::InputFloat(id, draft, 0.0f, 0.0f, shownFmt);
     const bool commit = ImGui::IsItemDeactivatedAfterEdit();
     EndFieldText(ft);
     // Leaving the field re-applies the shown (rounded) text even when nothing was typed (ImGui 1.92.9:
@@ -723,7 +737,13 @@ void EndDropdown() {
 
 namespace {
 
+struct PanelNoteItem {
+    std::string text;
+    ImU32 col = 0;
+    std::string tip;
+};
 struct PanelFrame {
+    std::vector<PanelNoteItem> notes;
     ImVec2 pos;
     float w = 0.0f;
     float titleH = 0.0f;
@@ -761,6 +781,11 @@ void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 si
     ImGui::PopStyleVar();
 }
 
+void PanelNote(const char* text, ImU32 col, const char* tip) {
+    if (g_panels.empty() || !text || !*text) return;
+    g_panels.back().notes.push_back({ text, col, tip ? tip : "" });
+}
+
 void EndPanel() {
     ImGui::EndChild();
     if (g_panels.empty()) return;
@@ -789,6 +814,37 @@ void EndPanel() {
         ImGui::PopID();
         ImGui::SetCursorScreenPos(after);
     };
+    // The notes, right-aligned on the title's line between the title and the switch (in a group box: in a gap of
+    // the top edge, like the title). All of them, or the last one alone, or none.
+    auto headerNotes = [&](float cy, float titleRight) {
+        if (f.notes.empty()) return;
+        const float gapW = Px(10);
+        float right = b.x - Px(Shape().groupBoxPanels ? 12.0f : 16.0f);
+        if (f.sw) right -= ToggleSwitchWidth() + Px(16);
+        std::vector<float> widths;
+        float total = 0.0f;
+        for (const auto& nt : f.notes) {
+            widths.push_back(MeasureInk(Font::Label, 11.0f, nt.text.c_str()).advance);
+            total += widths.back();
+        }
+        total += gapW * (float)(f.notes.size() - 1);
+        size_t first = 0;
+        if (right - total < titleRight + Px(24)) {
+            first = f.notes.size() - 1;
+            total = widths[first];
+            if (right - total < titleRight + Px(24)) return;
+        }
+        float x = Snap(right - total);
+        if (Shape().groupBoxPanels)
+            dl->AddRectFilled(ImVec2(x - Px(4), cy - Px(2)), ImVec2(right + Px(4), cy + Px(3)), Col(pal::Ground));
+        for (size_t i = first; i < f.notes.size(); i++) {
+            DrawText(dl, Font::Label, 11.0f, x, cy, f.notes[i].col, f.notes[i].text.c_str());
+            if (!f.notes[i].tip.empty() &&
+                ImGui::IsMouseHoveringRect(ImVec2(x, cy - Px(9)), ImVec2(x + widths[i], cy + Px(9))))
+                ImGui::SetTooltip("%s", f.notes[i].tip.c_str());
+            x += widths[i] + gapW;
+        }
+    };
     if (Shape().groupBoxPanels) {
         // An etched group box, titled in its top edge.
         const float lineY = Snap(a.y + Px(9));
@@ -800,6 +856,7 @@ void EndPanel() {
         dl->AddRectFilled(ImVec2(gapStart, lineY - 1), ImVec2(x + textW + Px(3), lineY + 2 * BevelPx() + 1), Col(pal::Ground));
         if (f.hasLight) DrawLight(dl, ImVec2(a.x + Snap(Px(10)) + d * 0.5f, lineY), f.light, d);
         DrawText(dl, Font::Label, 13.0f, x, lineY, pal::Ink, f.title.c_str());
+        headerNotes(lineY, x + textW);
         headerSwitch(lineY);
         return;
     }
@@ -812,8 +869,9 @@ void EndPanel() {
         DrawLight(dl, ImVec2(x + d * 0.5f, Snap(cy)), f.light, d);
         x += d + Snap(Px(9));
     }
-    DrawText(dl, Font::Label, 13.0f, x, cy, pal::Ink, f.title.c_str());
+    const float titleRight = x + DrawText(dl, Font::Label, 13.0f, x, cy, pal::Ink, f.title.c_str());
     dl->AddRectFilled(ImVec2(a.x + 1, a.y + f.titleH - 1), ImVec2(b.x - 1, a.y + f.titleH), Col(pal::PanelEdge));
+    headerNotes(Snap(cy), titleRight);
     headerSwitch(cy);
 }
 

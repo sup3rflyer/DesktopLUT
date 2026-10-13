@@ -38,6 +38,7 @@ struct GsEditorState {
     int selected = -1;          // the selected point
     float dragAccum = 0.0f;
     int pendingCount = 0;       // a point count picked this frame, applied once the frame is drawn (0 = none)
+    bool altUnit = false;       // the inputs under the bank in the other unit: HDR PQ codes (else nits), SDR % (else codes)
     bool renderOnly = false;    // drawn without a live edit (the screenshot test); never set by the interface
     unsigned renderHeld = 0;    // renderOnly: the held layers to show (kMhcHeld*)
     bool renderNightLight = false;  // renderOnly: show the Night Light warning
