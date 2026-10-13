@@ -3,9 +3,13 @@
 
 #include "mhc_preview.h"
 
+#include "displayconfig.h"   // QueryFreshOutputDesc
+#include "dwm_inject.h"
 #include "globals.h"
 #include "gui.h"
 #include "gui_mhc.h"
+#include "mhc.h"            // QueryDisplayDefaultProfile, ReassociateMHC2Profile
+#include "processing.h"
 #include <cstring>
 #include <iostream>
 
@@ -15,7 +19,12 @@ std::atomic<unsigned> g_mhcPreviewStageGen{ 0 };
 
 namespace {
 
-std::atomic<bool> g_previewActive{ false };   // one preview at a time (the overlay has one LUT texture for it)
+std::atomic<bool> g_previewActive{ false };   // one preview at a time (one LUT texture in the overlay, one block in the hook)
+std::atomic<bool> g_previewOnHook{ false };   // ...and the hook applies it (the overlay is not needed for it)
+std::atomic<int> g_previewMon{ -1 };          // the display it previews (-1 = none)
+uint32_t g_hookGen = 0;                       // the generation last handed to the hook (GUI thread)
+
+constexpr DWORD kHookAckWaitMs = 2000;        // the DLL acknowledges at its next present (DWM is made to present)
 
 MHCSettings& MhcOf(int mon, bool hdr) {
     MonitorSettings& ms = g_gui.monitorSettings[(size_t)mon];
@@ -43,7 +52,60 @@ void PublishStage(int mon, bool hdr, const MhcScanout* scan) {
     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
 }
 
+// Pumps the GUI thread's messages (the recomposition that makes DWM present runs on its timer) until `done` or the
+// deadline.
+template <typename Done> bool PumpUntil(Done done, DWORD timeoutMs) {
+    const ULONGLONG until = GetTickCount64() + timeoutMs;
+    for (;;) {
+        if (done()) return true;
+        if (GetTickCount64() >= until) return false;
+        MSG msg;
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 10, QS_ALLINPUT);
+    }
+}
+
+// The hook acknowledges the generation the config carries NOW (a re-injection re-publishes under a new one).
+bool HookShowsCurrentGen() {
+    const uint32_t gen = DwmHookMhcPreviewGen();
+    return gen != 0 && DwmHookMhcPreviewAck() == gen;
+}
+
+// The display shows `hdr` mode now (fresh DXGI: cached state may predate a toggle).
+bool DisplayShowsMode(int mon, bool hdr) {
+    if (mon < 0 || mon >= (int)g_gui.monitors.size() || !g_gui.monitors[mon]) return false;
+    DXGI_OUTPUT_DESC1 desc;
+    if (!QueryFreshOutputDesc(g_gui.monitors[mon], desc)) return false;
+    return (desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) == hdr;
+}
+
 }  // namespace
+
+bool MhcPreviewUsesHook() {
+    return g_dwmHookMode.load() && g_gui.isRunning && IsDwmHookActive();
+}
+
+bool MhcEditorNeedsOverlay() {
+    return g_mhcEditDialogOpen.load() && !g_previewOnHook.load();
+}
+
+bool ReadyMhcPreviewDisplay(int mon, bool hdr, bool& startedForPreview, bool& startedOverlayForPreview) {
+    startedForPreview = startedOverlayForPreview = false;
+    if (g_dwmHookMode.load() && !g_gui.isRunning) {
+        // Hook mode with the live layers suspended: start them for the edit (stopped again after it). The injection
+        // is synchronous; with no hook work for any display nothing is injected and the overlay path below applies.
+        StartProcessing();
+        startedForPreview = g_gui.isRunning;
+    }
+    if (MhcPreviewUsesHook()) return DisplayShowsMode(mon, hdr);
+    bool live = false, started = false;
+    EnsureProcessingForPreview(mon, hdr, live, started, startedOverlayForPreview);
+    startedForPreview = startedForPreview || started;
+    return live;
+}
 
 bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why) {
     auto fail = [why](const wchar_t* text) {
@@ -52,18 +114,31 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
     };
     if (s.active || g_previewActive) return fail(L"Another live edit is in progress");
     MHCSettings mhc;
+    bool fald = false;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         if (mon < 0 || mon >= (int)g_gui.monitorSettings.size()) return fail(L"No such display");
         mhc = MhcOf(mon, hdr);
+        const FaldSettings& f = hdr ? g_gui.monitorSettings[mon].hdrColorCorrection.fald
+                                    : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        fald = f.enabled && !f.paramsPath.empty();
     }
     // The bake (RegenerateMhcIfActive) installs a profile only where one is named: without one there is nothing
     // the edit would change on screen, so nothing to preview either.
     if (mhc.profileName.empty()) return fail(L"No MHC profile installed for this mode");
     if (!IsMHC2ApiAvailable()) return fail(L"MHC profiles need Windows 10 21H2 or later");
+    // The FALD pass runs after the pass that applies the preview (overlay and hook alike): the profile would land
+    // before FALD instead of after it, so the preview would not be the bake.
+    if (fald) return fail(L"FALD is on for this display");
 
     MhcPreviewSession n;
     if (!PrepareMhcPreview(mhc, hdr, mon, n)) return fail(L"The profile's source file cannot be read");
+    n.onHook = MhcPreviewUsesHook();
+    // What scanout runs now, to put back if the preview cannot start after the identity profile went on.
+    DisplayInfo di;
+    const bool haveDisplay = GetDisplayInfoForMonitor(mon, di);
+    std::wstring restore = haveDisplay ? QueryDisplayDefaultProfile(di.adapterId, di.sourceId, hdr) : std::wstring();
+    if (restore.empty() && mhc.enabled) restore = mhc.profileName;
 
     n.passthrough = EngagePassthroughScanout(mon, hdr, mhc);
     if (n.passthrough.empty()) return fail(L"Scanout could not be switched for the preview");
@@ -73,8 +148,27 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
     }
     n.active = true;
     g_previewActive = true;
+    g_previewOnHook = n.onHook;
+    g_previewMon = mon;
     s = std::move(n);
     UpdateMhcPreview(s, mhc.correctionGrayscale);
+
+    // The hook must acknowledge: a DLL from before the preview (still resident in dwm.exe) never does, and the display
+    // would then show no profile at all while the edit runs.
+    if (s.onHook) {
+        if (g_hookGen == 0 || !PumpUntil(HookShowsCurrentGen, kHookAckWaitMs)) {
+            std::wcerr << L"[MHC] live edit preview: the DWM hook did not acknowledge (generation "
+                       << DwmHookMhcPreviewGen() << L")" << std::endl;
+            // Undo in order: the hook stops, the profile that ran before goes back on, THEN the identity profile goes
+            // (Windows keeps applying the last associated MHC2 transform after a disassociation: dropping the identity
+            // first would leave the display with no correction).
+            StopMhcPreviewDraw(s);
+            if (haveDisplay && !restore.empty()) ReassociateMHC2Profile(restore, di.adapterId, di.sourceId, hdr);
+            EndMhcPreview(s);
+            return fail(L"The DWM hook did not apply the preview (an older hook: turn LIVE LAYERS off and on)");
+        }
+        std::wcout << L"[MHC] live edit preview: applied by the DWM hook" << std::endl;
+    }
     return true;
 }
 
@@ -104,22 +198,47 @@ void UpdateMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& corre
     if (!s.active) return;
     MhcScanout scan;
     ComposeMhcPreview(s, correction, scan);
-    PublishStage(s.mon, s.hdr, &scan);
+    if (s.onHook) g_hookGen = PublishDwmHookMhcPreview(s.mon, s.hdr, scan.applied, scan.lutSize, scan.lut);
+    else PublishStage(s.mon, s.hdr, &scan);
 }
 
-void StopMhcPreviewOverlay(const MhcPreviewSession& s) {
+bool WaitMhcPreviewShown(const MhcPreviewSession& s, DWORD timeoutMs) {
+    if (!s.active || !s.onHook) return true;   // the overlay draws the change on its next frame
+    // The hook applies a generation from its next present, and the recomposition this publish requested makes DWM
+    // present the whole screen (a static measurement patch included).
+    return PumpUntil([]() { return HookShowsCurrentGen() && !DesktopRecomposePending(); }, timeoutMs);
+}
+
+void StopMhcPreviewDraw(const MhcPreviewSession& s) {
     if (!s.active) return;
-    PublishStage(-1, false, nullptr);
+    if (s.onHook) {
+        // The hook redraws only what DWM re-composes: until the requested full recomposition has run, static parts of
+        // the screen keep preview pixels. Wait for it, so the caller's re-bake never puts the real profile under them
+        // (the profile applied twice). Scanout runs the identity profile meanwhile.
+        if (ClearDwmHookMhcPreview()) PumpUntil([]() { return !DesktopRecomposePending(); }, 1500);
+    } else {
+        PublishStage(-1, false, nullptr);
+    }
     std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
     if (s.mon >= 0 && s.mon < (int)g_gui.monitorSettings.size()) MhcOf(s.mon, s.hdr).previewScanoutName.clear();
 }
 
 void EndMhcPreview(MhcPreviewSession& s) {
     if (!s.active) return;
-    StopMhcPreviewOverlay(s);   // no-op when the caller already stopped it
+    StopMhcPreviewDraw(s);   // no-op work when the caller already stopped it
     DisengagePassthroughScanout(s.mon, s.hdr, s.passthrough);
     g_previewActive = false;
+    g_previewOnHook = false;
+    g_previewMon = -1;
+    g_hookGen = 0;
     s = MhcPreviewSession{};
 }
 
 bool MhcPreviewActive() { return g_previewActive; }
+
+bool MhcPreviewOnDisplay(int mon) { return g_previewActive && g_previewMon.load() == mon; }
+
+bool MhcPreviewApplied(const MhcPreviewSession& s) {
+    if (!s.active) return false;
+    return !s.onHook || (IsDwmHookActive() && DwmHookMhcPreviewGen() != 0);
+}

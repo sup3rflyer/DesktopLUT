@@ -304,6 +304,10 @@ void FaldPanelFileChangedReinject() {
 // ---------------------------------------------------------------------------------------------
 static HWND g_faldRecomposeWnd = nullptr;
 static int g_faldRecomposeStage = 0;   // 0 = idle/armed, 1 = window shown
+static bool g_desktopRecomposePending = false;   // requested and not finished (the window not yet hidden again)
+static bool g_desktopRecomposeRerun = false;     // requested again after the window went up: one more round
+
+bool DesktopRecomposePending() { return g_desktopRecomposePending; }
 
 // Any mode: one full-screen composition, so Desktop Duplication delivers a fresh frame of a static desktop
 // (the analysis readout on enable) and the hook re-renders it (a setting it renders changed).
@@ -314,7 +318,16 @@ void RequestDesktopRecompose() {
         PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 1, 0);
         return;
     }
+    // Already running: a request before the window goes up is covered by it; one after it went up gets one more
+    // round once it is down. (Re-arming the timer on every request starved a stream of them — a held key, a dragged
+    // live-edit fader — of any recomposition, and could hold the topmost window up for the whole stream.)
+    if (g_desktopRecomposePending) {
+        if (g_faldRecomposeStage == 1) g_desktopRecomposeRerun = true;
+        return;
+    }
     g_faldRecomposeStage = 0;
+    g_desktopRecomposePending = true;
+    g_desktopRecomposeRerun = false;
     // Short delay: the hook reads the new flags at the top of the next present; give the shared
     // config (and a re-injection's attach) a moment to land before the composition that primes.
     SetTimer(g_gui.hwndMain, FALD_RECOMPOSE_TIMER_ID, 150, nullptr);
@@ -340,7 +353,11 @@ static void FaldRecomposeTick(HWND hwnd) {
             if (g_faldRecomposeWnd)
                 SetLayeredWindowAttributes(g_faldRecomposeWnd, 0, 1, LWA_ALPHA);
         }
-        if (!g_faldRecomposeWnd) { KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID); return; }
+        if (!g_faldRecomposeWnd) {
+            KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID);
+            g_desktopRecomposePending = g_desktopRecomposeRerun = false;
+            return;
+        }
         SetWindowPos(g_faldRecomposeWnd, HWND_TOPMOST,
                      GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
                      GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
@@ -350,7 +367,13 @@ static void FaldRecomposeTick(HWND hwnd) {
     } else {
         ShowWindow(g_faldRecomposeWnd, SW_HIDE);
         g_faldRecomposeStage = 0;
-        KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID);
+        if (g_desktopRecomposeRerun) {
+            g_desktopRecomposeRerun = false;   // still pending: the next round shows the window again
+            SetTimer(hwnd, FALD_RECOMPOSE_TIMER_ID, 50, nullptr);
+        } else {
+            g_desktopRecomposePending = false;
+            KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID);
+        }
     }
 }
 
@@ -2081,12 +2104,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (isHDR) gs.initLinearPQ(); else gs.initLinear();
                 }
 
-                bool livePreview, startedForPreview, startedOverlayForPreview;
-                EnsureProcessingForPreview(monIdx, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
+                bool startedForPreview, startedOverlayForPreview;
+                const bool livePreview = ReadyMhcPreviewDisplay(monIdx, isHDR, startedForPreview, startedOverlayForPreview);
 
                 // The preview is exact to the bake (mhc_preview.h): scanout runs an identity profile while the
-                // overlay applies the profile the close re-bake installs, the edited curve composed in. Without it
-                // (the display is in the other mode, or the mode has no installed profile) the editor still edits.
+                // overlay or the hook applies the profile the close re-bake installs, the edited curve composed in.
+                // Without it (the display is in the other mode, no installed profile, FALD on) the editor still edits.
                 MhcPreviewSession preview;
                 const bool previewing = livePreview && !MhcPreviewActive() && BeginMhcPreview(monIdx, isHDR, preview);
                 g_mhcEditDialogOpen.store(true);
@@ -2097,7 +2120,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
                 // The overlay stops applying the profile, the re-bake associates the real one, then the identity
                 // profile goes (never a frame with nothing associated).
-                StopMhcPreviewOverlay(preview);
+                StopMhcPreviewDraw(preview);
                 g_mhcEditDialogOpen.store(false);
                 RegenerateMhcFromGui(monIdx, isHDR);
                 EndMhcPreview(preview);

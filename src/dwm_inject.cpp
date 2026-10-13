@@ -930,6 +930,19 @@ static HANDLE g_sharedMemHandle = nullptr;
 static DwmHookSharedConfig* g_sharedMemPtr = nullptr;
 static size_t g_sharedMemBytes = 0;   // the mapped view: sizeof(DwmHookSharedConfigEx), or the head only
 static uint32_t g_sharedMemVersion = 0;
+// Live edit preview block (DwmHookMhcPreview): its own mapping beside the config.
+static HANDLE g_mhcPreviewHandle = nullptr;
+static DwmHookMhcPreview* g_mhcPreviewPtr = nullptr;
+static uint32_t g_mhcPreviewVersion = 0;            // the block's seqlock
+static uint32_t g_mhcPreviewGenCounter = 0;         // last generation written
+static std::atomic<uint32_t> g_mhcPreviewPublished{ 0 };   // what the config carries (0 = no preview)
+// The block the host wants on screen, kept across a shared-memory re-creation (a re-injection mid-edit, the watchdog
+// after a DWM restart): without it the new mapping would carry no preview while scanout still runs the identity
+// profile, and the display would show no profile at all.
+static bool g_mhcPreviewWanted = false;
+static int g_mhcPreviewWantedMonitor = -1;
+static DwmHookMhcPreview g_mhcPreviewWantedBlock;   // magic/left/top/isHdr/lutSize/matrix/lut as last published
+static uint32_t WriteWantedMhcPreviewBlock();   // below (PublishDwmHookMhcPreview)
 
 static DwmHookTonemapCurve ConvertTonemapCurve(int curve) {
     switch (curve) {
@@ -1233,6 +1246,31 @@ bool CreateDwmHookSharedMemory()
         const uint32_t existing = reinterpret_cast<volatile const DwmHookSharedConfig*>(g_sharedMemPtr)->version;
         g_sharedMemVersion = (existing + 1u) & ~1u;
     }
+    // The live edit preview block. Not fatal: without it an edit in hook mode does not start (no acknowledgement).
+    if (!g_mhcPreviewPtr) {
+        g_mhcPreviewHandle = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0,
+                                                sizeof(DwmHookMhcPreview), DWM_HOOK_MHC_PREVIEW_NAME);
+        if (g_mhcPreviewHandle) {
+            const bool previewPreexisting = (GetLastError() == ERROR_ALREADY_EXISTS);
+            g_mhcPreviewPtr = static_cast<DwmHookMhcPreview*>(
+                MapViewOfFile(g_mhcPreviewHandle, FILE_MAP_WRITE, 0, 0, sizeof(DwmHookMhcPreview)));
+            if (!g_mhcPreviewPtr) {
+                CloseHandle(g_mhcPreviewHandle);
+                g_mhcPreviewHandle = nullptr;
+            } else if (previewPreexisting) {
+                // A resident DLL may still hold this block: continue its sequences, so neither an old version nor an
+                // old acknowledgement passes for a new one.
+                g_mhcPreviewVersion = (g_mhcPreviewPtr->version + 1u) & ~1u;
+                g_mhcPreviewGenCounter = (std::max)(g_mhcPreviewPtr->gen, (uint32_t)g_mhcPreviewPtr->ackGen);
+            }
+        }
+        if (!g_mhcPreviewPtr)
+            std::wcerr << L"[DWM Hook] Live edit preview block unavailable: " << GetLastError() << std::endl;
+    }
+    // A live edit still running (the hook was re-injected under it): put its block back before the first push.
+    if (g_mhcPreviewWanted && WriteWantedMhcPreviewBlock() != 0)
+        std::wcout << L"[DWM Hook] Live edit preview re-published to the new shared memory" << std::endl;
+
     UpdateDwmHookSharedConfig();
     StartFaldSettleKicker();
 
@@ -1257,6 +1295,7 @@ void UpdateDwmHookSharedConfig()
     cfg.beaconGeneration = g_hookBeaconGeneration.load();
     cfg.beaconSize = DWM_HOOK_BEACON_SIZE;
     cfg.hdrDitherOff = g_hdrDither.load() ? 0u : 1u;
+    cfg.mhcPreviewGen = g_mhcPreviewPtr ? g_mhcPreviewPublished.load() : 0u;
 
     // Use cached DXGI monitor info (refreshed on inject and WM_DISPLAYCHANGE)
     const auto& mons = EnumerateDxgiMonitors();
@@ -1365,6 +1404,88 @@ void CloseDwmHookSharedMemory()
         g_sharedMemHandle = nullptr;
     }
     g_sharedMemVersion = 0;
+    if (g_mhcPreviewPtr) { UnmapViewOfFile(g_mhcPreviewPtr); g_mhcPreviewPtr = nullptr; }
+    if (g_mhcPreviewHandle) { CloseHandle(g_mhcPreviewHandle); g_mhcPreviewHandle = nullptr; }
+    g_mhcPreviewVersion = 0;
+    g_mhcPreviewPublished = 0;
+}
+
+// Writes the wanted block into the mapping under its seqlock with a new generation (g_dwmInjectMutex held). The
+// monitor's desktop position is resolved now: a re-publish after a display change keys the block to where it is.
+static uint32_t WriteWantedMhcPreviewBlock() {
+    if (!g_mhcPreviewPtr || !g_mhcPreviewWanted) return 0;
+    DwmHookMhcPreview& w = g_mhcPreviewWantedBlock;
+    if (g_mhcPreviewWantedMonitor >= 0 && g_mhcPreviewWantedMonitor < (int)g_gui.monitors.size()) {
+        MONITORINFO info = { sizeof(info) };
+        if (GetMonitorInfo(g_gui.monitors[g_mhcPreviewWantedMonitor], &info)) {
+            w.left = info.rcMonitor.left;
+            w.top = info.rcMonitor.top;
+        }
+    }
+    uint32_t gen = ++g_mhcPreviewGenCounter;
+    if (gen == 0) gen = ++g_mhcPreviewGenCounter;   // 0 means "no preview"
+    DwmHookMhcPreview* b = g_mhcPreviewPtr;
+    b->version = ++g_mhcPreviewVersion;   // odd = write in progress
+    std::atomic_thread_fence(std::memory_order_release);
+    b->magic = DWM_HOOK_MHC_PREVIEW_MAGIC;
+    b->gen = gen;
+    b->left = w.left;
+    b->top = w.top;
+    b->isHdr = w.isHdr;
+    b->lutSize = w.lutSize;
+    memcpy(b->matrix, w.matrix, sizeof(b->matrix));
+    for (int ch = 0; ch < 3; ch++) memcpy(b->lut[ch], w.lut[ch], (size_t)w.lutSize * sizeof(float));
+    std::atomic_thread_fence(std::memory_order_release);
+    b->version = ++g_mhcPreviewVersion;   // even = complete
+    g_mhcPreviewPublished = gen;
+    return gen;
+}
+
+uint32_t PublishDwmHookMhcPreview(int monitorIndex, bool isHdr, const float applied[9], int lutSize,
+                                  const std::vector<float> lut[3])
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+        if (lutSize < 2 || lutSize > DWM_HOOK_MHC_PREVIEW_LUT_MAX) return 0;
+        for (int ch = 0; ch < 3; ch++)
+            if ((int)lut[ch].size() < lutSize) return 0;
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitors.size()) return 0;
+        // The wanted block is kept current even while the mapping is down (the hook stopped): a re-created mapping
+        // re-publishes the latest curve, never an older one.
+        DwmHookMhcPreview& w = g_mhcPreviewWantedBlock;
+        w.isHdr = isHdr ? 1u : 0u;
+        w.lutSize = (uint32_t)lutSize;
+        memcpy(w.matrix, applied, sizeof(w.matrix));
+        for (int ch = 0; ch < 3; ch++) memcpy(w.lut[ch], lut[ch].data(), (size_t)lutSize * sizeof(float));
+        g_mhcPreviewWanted = true;
+        g_mhcPreviewWantedMonitor = monitorIndex;
+        if (!g_mhcPreviewPtr || !g_sharedMemPtr) return 0;
+        if (WriteWantedMhcPreviewBlock() == 0) return 0;
+    }
+    // The config carries the generation; its render hash changes, so DWM re-composes the screen (a static desktop
+    // shows the change too).
+    UpdateDwmHookSharedConfig();
+    return g_mhcPreviewPublished.load();
+}
+
+bool ClearDwmHookMhcPreview()
+{
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+        g_mhcPreviewWanted = false;
+        g_mhcPreviewWantedMonitor = -1;
+    }
+    if (g_mhcPreviewPublished.exchange(0) == 0) return false;
+    UpdateDwmHookSharedConfig();
+    return true;
+}
+
+uint32_t DwmHookMhcPreviewGen() { return g_mhcPreviewPublished.load(); }
+
+uint32_t DwmHookMhcPreviewAck()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    return g_mhcPreviewPtr ? (uint32_t)g_mhcPreviewPtr->ackGen : 0u;
 }
 
 // ---------------------------------------------------------------------------

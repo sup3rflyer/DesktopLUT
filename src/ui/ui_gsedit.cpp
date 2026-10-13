@@ -525,7 +525,10 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             x += DrawText(dl, Font::Label, 11.0f, x, cy, pal::InkFaint, h.what) + Px(18);
         }
     }
-    if (changed) Preview(ed);
+    if (changed) {
+        Preview(ed);
+        InvalidatePatch();   // the measured patch shows the change at once (the rest when DWM re-composes)
+    }
     // The patch: the selected point's input on the edited display, while the display shows this mode.
     if (!ed.renderOnly) {
         HMONITOR hmon = nullptr;

@@ -1,4 +1,5 @@
 #include "actions/actions.h"
+#include "mhc_preview.h"   // MhcPreviewOnDisplay
 #include "actions/reconcile.h"
 
 #include "gui.h"
@@ -239,6 +240,10 @@ std::wstring FaldTransferMismatch(const std::wstring& path, bool hdr) {
 
 Result SetFaldEnabled(int mon, bool hdr, bool on) {
     if (!ValidMonitor(mon)) return Done(false);
+    if (MhcPreviewOnDisplay(mon)) {   // the FALD pass would land after the live edit's preview: not the bake
+        Finish(mon);
+        return Fail(notify::Sev::Warning, L"FALD waits for the live edit on this display");
+    }
     std::wstring path;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
@@ -270,6 +275,10 @@ Result SetFaldEnabled(int mon, bool hdr, bool on) {
 
 Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload) {
     if (!ValidMonitor(mon)) return Done(false);
+    if (MhcPreviewOnDisplay(mon)) {   // the FALD pass would land after the live edit's preview: not the bake
+        Finish(mon);
+        return Fail(notify::Sev::Warning, L"FALD waits for the live edit on this display");
+    }
     std::wstring mismatch = FaldTransferMismatch(path, hdr);
     if (!mismatch.empty()) {
         SetStatus(mismatch.c_str());
@@ -295,6 +304,10 @@ Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload
 
 Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit) {
     if (!ValidMonitor(mon)) return Done(false);
+    if (MhcPreviewOnDisplay(mon)) {   // the FALD pass would land after the live edit's preview: not the bake
+        Finish(mon);
+        return Fail(notify::Sev::Warning, L"FALD waits for the live edit on this display");
+    }
     bool changed = false;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);

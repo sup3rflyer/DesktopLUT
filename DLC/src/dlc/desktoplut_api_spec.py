@@ -597,8 +597,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "mhc.grayscale_set_live",
-            "Nudge the live-edit correction grayscale (per-patch, no ICC re-bake); the next frame "
-            "reflects it. Errors without an active grayscale_live_begin session.",
+            "Nudge the live-edit correction grayscale (per-patch, no ICC re-bake). Returns once the "
+            "change is on screen (in DWM-hook mode: the hook applied it and the screen was re-composed, "
+            "a static patch included). Errors without an active grayscale_live_begin session, or when "
+            "the change did not reach the screen.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

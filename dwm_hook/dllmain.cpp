@@ -558,6 +558,7 @@ static void UpdateLocalTonemapFromShared() {
 	}
 	g_beaconActive = local.beaconActive;
 	g_hdrDitherOff = local.hdrDitherOff ? 1u : 0u;
+	g_mhcPreviewWantGen = local.mhcPreviewGen;   // live edit preview: picked up by RenderLUT (MhcPreviewSync)
 	// The HDR output dither is sized for a 10-bit PQ link (shared/hdr_dither.h): note any HDR monitor below that.
 	for (uint32_t i = 0; i < numMons; i++) {
 		const DwmHookMonitorConfig& m = local.monitors[i];
@@ -1809,6 +1810,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		// Close shared memory
 		if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
 		if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }
+		ReleaseMhcPreviewMapping();
 
 		UninitializeStuff();
 		log_to_file("DLL_PROCESS_DETACH: cleanup complete");

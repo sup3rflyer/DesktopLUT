@@ -12,6 +12,7 @@
 #include <string>
 #include <sstream>
 #include <iomanip>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -48,6 +49,19 @@ ID3D11SamplerState* noiseSamplerState;
 ID3D11ShaderResourceView* noiseTextureView;
 
 ID3D11Buffer* constantBuffer;
+
+// Live edit preview (shared/dwm_hook_config.h DwmHookMhcPreview): the display's MHC profile, applied as the last step
+// of the pass while its scanout runs an identity profile. Synced from the host's block when the generation moves.
+unsigned int g_mhcPreviewWantGen = 0;
+static unsigned int s_mhcHaveGen = 0;               // generation on the texture (0 = none)
+static HANDLE s_mhcMap = NULL;
+static DwmHookMhcPreview* s_mhcView = NULL;
+static unsigned long long s_mhcNextOpenTick = 0;    // a missing mapping is retried rarely, never per present
+static DwmHookMhcPreview s_mhcCopy;                 // the seqlock copy (49 KB: static, never on the present stack)
+static ID3D11Texture2D* s_mhcTex = NULL;            // t6: the three LUTs, one row per channel
+static ID3D11ShaderResourceView* s_mhcSRV = NULL;
+static ID3D11Buffer* s_mhcCB = NULL;                // b1: the matrix rows; .w = on, LUT entries, 0
+static struct { bool on; int left, top; bool hdr; } s_mhc = {};
 
 // PQ transfer function LUTs (for ICtCp tonemapping)
 ID3D11Texture2D* pqOetfTexture = NULL;
@@ -680,6 +694,133 @@ static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
 
 void UninitializeStuff();  // Forward declaration for error cleanup
 
+void ReleaseMhcPreviewMapping() {
+	if (s_mhcView) { UnmapViewOfFile(s_mhcView); s_mhcView = NULL; }
+	if (s_mhcMap) { CloseHandle(s_mhcMap); s_mhcMap = NULL; }
+}
+
+static void ReleaseMhcPreview() {
+	RELEASE_IF_NOT_NULL(s_mhcSRV)
+	RELEASE_IF_NOT_NULL(s_mhcTex)
+	RELEASE_IF_NOT_NULL(s_mhcCB)
+	s_mhc.on = false;
+	s_mhcHaveGen = 0;   // re-synced from the block on the next present (a re-initialised device starts empty)
+}
+
+// Picks up a new preview generation: copies the host's block (seqlock) and uploads its LUTs and matrix. The
+// acknowledgement follows from RenderLUT once a present of the previewed monitor has drawn it.
+// Cheap when nothing moved (one compare). Runs on DWM's device context inside the present, like the rest of RenderLUT.
+// Never throws and never retries a failed generation (no per-present work or logging on a persistent failure): the
+// preview stays off and unacknowledged until the host publishes a new generation, and the host does not start (or
+// reports) an edit the hook does not acknowledge.
+static void MhcPreviewSync() {
+	const unsigned int want = g_mhcPreviewWantGen;
+	if (want == s_mhcHaveGen) return;
+	if (!device || !deviceContext) return;   // a failed InitializeStuff: nothing to upload to
+	if (want == 0) {
+		if (s_mhc.on) log_to_file("live edit preview: off");
+		s_mhc.on = false;
+		s_mhcHaveGen = 0;
+		return;
+	}
+	if (!s_mhcView) {
+		const unsigned long long now = GetTickCount64();
+		if (now < s_mhcNextOpenTick) return;
+		s_mhcNextOpenTick = now + 1000;
+		s_mhcMap = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, DWM_HOOK_MHC_PREVIEW_NAME);
+		if (!s_mhcMap) return;
+		s_mhcView = (DwmHookMhcPreview*)MapViewOfFile(s_mhcMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+		                                              sizeof(DwmHookMhcPreview));
+		if (!s_mhcView) { CloseHandle(s_mhcMap); s_mhcMap = NULL; return; }
+	}
+	const uint32_t v1 = s_mhcView->version;
+	if (v1 & 1) return;   // the host is writing: next present
+	std::atomic_thread_fence(std::memory_order_acquire);
+	memcpy(&s_mhcCopy, (const void*)s_mhcView, offsetof(DwmHookMhcPreview, ackGen));
+	std::atomic_thread_fence(std::memory_order_acquire);
+	if (s_mhcView->version != v1) return;
+	if (s_mhcCopy.magic != DWM_HOOK_MHC_PREVIEW_MAGIC || s_mhcCopy.gen != want) return;   // block not written yet
+
+	// From here this generation is settled either way: applied and acknowledged, or refused once.
+	s_mhcHaveGen = want;
+	auto refuse = [want](const char* why) {
+		s_mhc.on = false;
+		char msg[160];
+		snprintf(msg, sizeof(msg), "live edit preview: generation %u refused (%s)", want, why);
+		log_to_file(msg);
+	};
+	const int n = (int)s_mhcCopy.lutSize;
+	if (n < 2 || n > DWM_HOOK_MHC_PREVIEW_LUT_MAX) { refuse("LUT size"); return; }
+	for (int ch = 0; ch < 3; ch++)
+		for (int j = 0; j < n; j++)
+			if (!std::isfinite(s_mhcCopy.lut[ch][j])) { refuse("LUT value"); return; }
+	for (int i = 0; i < 9; i++)
+		if (!std::isfinite(s_mhcCopy.matrix[i])) { refuse("matrix value"); return; }
+
+	if (!s_mhcTex || !s_mhcSRV || !s_mhcCB) {
+		RELEASE_IF_NOT_NULL(s_mhcSRV)
+		RELEASE_IF_NOT_NULL(s_mhcTex)
+		RELEASE_IF_NOT_NULL(s_mhcCB)
+		D3D11_TEXTURE2D_DESC td = {};
+		td.Width = DWM_HOOK_MHC_PREVIEW_LUT_MAX;
+		td.Height = 3;
+		td.MipLevels = 1;
+		td.ArraySize = 1;
+		td.Format = DXGI_FORMAT_R32_FLOAT;
+		td.SampleDesc.Count = 1;
+		td.Usage = D3D11_USAGE_DYNAMIC;
+		td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		D3D11_BUFFER_DESC cbd = {};
+		cbd.ByteWidth = 48;   // 3 x float4 (MhcPreview in hook_shader.h)
+		cbd.Usage = D3D11_USAGE_DYNAMIC;
+		cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		if (FAILED(device->CreateTexture2D(&td, NULL, &s_mhcTex)) ||
+		    FAILED(device->CreateShaderResourceView((ID3D11Resource*)s_mhcTex, NULL, &s_mhcSRV)) ||
+		    FAILED(device->CreateBuffer(&cbd, NULL, &s_mhcCB))) {
+			RELEASE_IF_NOT_NULL(s_mhcSRV)
+			RELEASE_IF_NOT_NULL(s_mhcTex)
+			RELEASE_IF_NOT_NULL(s_mhcCB)
+			refuse("resource creation");
+			return;
+		}
+	}
+	D3D11_MAPPED_SUBRESOURCE m;
+	if (FAILED(deviceContext->Map((ID3D11Resource*)s_mhcTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+		refuse("texture map");
+		return;
+	}
+	for (int ch = 0; ch < 3; ch++)
+		memcpy((char*)m.pData + (size_t)ch * m.RowPitch, s_mhcCopy.lut[ch], (size_t)n * sizeof(float));
+	deviceContext->Unmap((ID3D11Resource*)s_mhcTex, 0);
+	struct { float rows[12]; } cb;
+	static_assert(sizeof(cb) == 48, "the preview constant buffer must match ByteWidth=48");
+	for (int row = 0; row < 3; row++) {
+		for (int col = 0; col < 3; col++) cb.rows[row * 4 + col] = s_mhcCopy.matrix[row * 3 + col];
+		cb.rows[row * 4 + 3] = 0.0f;
+	}
+	cb.rows[3] = 1.0f;          // on
+	cb.rows[7] = (float)n;      // LUT entries
+	if (FAILED(deviceContext->Map((ID3D11Resource*)s_mhcCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+		refuse("constant buffer map");
+		return;
+	}
+	memcpy(m.pData, &cb, sizeof(cb));
+	deviceContext->Unmap((ID3D11Resource*)s_mhcCB, 0);
+
+	if (!s_mhc.on || s_mhc.left != s_mhcCopy.left || s_mhc.top != s_mhcCopy.top) {
+		char msg[128];
+		snprintf(msg, sizeof(msg), "live edit preview: on for (%d,%d) %s, %d entries", s_mhcCopy.left, s_mhcCopy.top,
+		         s_mhcCopy.isHdr ? "HDR" : "SDR", n);
+		log_to_file(msg);
+	}
+	s_mhc.on = true;
+	s_mhc.left = s_mhcCopy.left;
+	s_mhc.top = s_mhcCopy.top;
+	s_mhc.hdr = s_mhcCopy.isHdr != 0;
+}
+
 void InitializeStuff(ID3D11Device* inputDevice)
 {
 	try
@@ -984,6 +1125,7 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(peakSmoothCS)
 	ReleasePeakSlots();
 	RELEASE_IF_NOT_NULL(peakCB)
+	ReleaseMhcPreview();
 	// FALD: the per-monitor resources first (they hold views onto DWM's device), then the shaders.
 	FaldReleaseAll();
 	FaldReleaseShaders();
@@ -1108,6 +1250,10 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	}
 	LocalTonemapParams* tp = FindTonemapForMonitor(monLeft, monTop);
 	bool tmEnabled = (colorMode == 1 && tp && tp->enabled);
+	// Live edit preview: this monitor, in the mode the preview is for (FP16 HDR = colorMode 1; legacy / ACM SDR).
+	if (index != -1) MhcPreviewSync();
+	const bool mhcOn = index != -1 && s_mhc.on && monLeft == s_mhc.left && monTop == s_mhc.top &&
+	                   (colorMode == 1) == s_mhc.hdr && s_mhcSRV && s_mhcCB;
 	// The 3D LUT stage is bypassed for this monitor: present as a monitor without a cube (tonemap and FALD
 	// still run). The host requests a full recompose with the change, so no corrected pixels linger.
 	if (lut && tp && tp->lutOff) lut = NULL;
@@ -1158,8 +1304,8 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	if (index != -1 && (!wantPeak || faldOn))
 		PeakSourceMarkStale(monLeft, monTop);
 
-	// Skip if no LUT AND no tonemap AND no FALD — nothing to render
-	if (index == -1 || (!lut && !tmEnabled && !faldOn))
+	// Skip if no LUT AND no tonemap AND no FALD AND no live edit preview — nothing to render
+	if (index == -1 || (!lut && !tmEnabled && !faldOn && !mhcOn))
 	{
 		return false;
 	}
@@ -1203,7 +1349,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 
 	backBufferDesc = newBackBufferDesc;
 
-	bool hasLutOrTonemap = (lut || tmEnabled);
+	// The pass runs for a LUT, tonemap or the live edit preview; FALD (which follows the pass) never meets the preview:
+	// the host does not start a preview on a display with FALD on (src/mhc_preview.cpp).
+	bool hasLutOrTonemap = (lut || tmEnabled || mhcOn);
 
 	if (hasLutOrTonemap || faldOn) {
 	  renderTargetView = NULL;
@@ -1277,6 +1425,14 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		if (pqEotfSRV) deviceContext->PSSetShaderResources(4, 1, &pqEotfSRV);
 		if (linearSamplerState) deviceContext->PSSetSamplers(2, 1, &linearSamplerState);
 
+		// Live edit preview (b1 + t6). Bound to NULL otherwise: the shader then reads 0 = off.
+		{
+			ID3D11Buffer* mcb = mhcOn ? s_mhcCB : NULL;
+			ID3D11ShaderResourceView* msrv = mhcOn ? s_mhcSRV : NULL;
+			deviceContext->PSSetConstantBuffers(1, 1, &mcb);
+			deviceContext->PSSetShaderResources(6, 1, &msrv);
+		}
+
 		// Peak detection compute pass (before pixel shader), on THIS monitor's peak state and THIS
 		// monitor's current frame (srcSRV, already fed with this present's rects). The shader only
 		// reads t5 when tonemapDynamic; left unbound (reads 0) it falls back to the floor.
@@ -1327,7 +1483,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		cb.hasLut = lut ? 1 : 0;
 		// HDR output dither (shared/hdr_dither.h): +-1 LSB of 10-bit PQ, TPDF, after the LUT. HDR only — the
 		// legacy SDR path keeps its OrderedDither, ACM has none yet.
-		cb.hdrDitherLsb = DlutHdrDitherLsb(colorMode == 1, lut != nullptr || tmEnabled, !g_hdrDitherOff);
+		cb.hdrDitherLsb = DlutHdrDitherLsb(colorMode == 1, lut != nullptr || tmEnabled || mhcOn, !g_hdrDitherOff);
 		cb.pad2 = 0.0f;
 
 		// Diagnostic: log tonemap CB state only when values change FOR THIS MONITOR.
@@ -1448,9 +1604,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		ID3D11SamplerState* nullSamplers[3] = {};
 		deviceContext->PSSetSamplers(0, 3, nullSamplers);
 		deviceContext->CSSetSamplers(0, 1, nullSamplers);
-		ID3D11Buffer* nullCB = NULL;
-		deviceContext->PSSetConstantBuffers(0, 1, &nullCB);
-		deviceContext->CSSetConstantBuffers(0, 1, &nullCB);
+		ID3D11Buffer* nullCBs[2] = { NULL, NULL };
+		deviceContext->PSSetConstantBuffers(0, 2, nullCBs);
+		deviceContext->CSSetConstantBuffers(0, 1, nullCBs);
 		deviceContext->CSSetShader(NULL, NULL, 0);
 		deviceContext->VSSetShader(NULL, NULL, 0);
 		deviceContext->PSSetShader(NULL, NULL, 0);
@@ -1477,14 +1633,18 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		ID3D11SamplerState* nullSamplers[3] = {};
 		deviceContext->PSSetSamplers(0, 3, nullSamplers);      // Clear s0-s2
 		deviceContext->CSSetSamplers(0, 1, nullSamplers);      // Clear CS s0
-		ID3D11Buffer* nullCB = NULL;
-		deviceContext->PSSetConstantBuffers(0, 1, &nullCB);    // Clear b0
-		deviceContext->CSSetConstantBuffers(0, 1, &nullCB);    // Clear CS b0
+		ID3D11Buffer* nullCBs[2] = { NULL, NULL };
+		deviceContext->PSSetConstantBuffers(0, 2, nullCBs);    // Clear b0-b1 (b1: the live edit preview)
+		deviceContext->CSSetConstantBuffers(0, 1, nullCBs);    // Clear CS b0
 		deviceContext->CSSetShader(NULL, NULL, 0);
 		deviceContext->VSSetShader(NULL, NULL, 0);
 		deviceContext->PSSetShader(NULL, NULL, 0);
 		deviceContext->OMSetRenderTargets(0, NULL, NULL);
 	}
+
+	// Live edit preview: acknowledged only once a present of the previewed monitor has drawn it (an upload alone proves
+	// nothing — no context may sit at that position, or the monitor's HDR flag may still be debouncing).
+	if (mhcOn && s_mhcView && s_mhcView->ackGen != s_mhcHaveGen) s_mhcView->ackGen = s_mhcHaveGen;
 
 	return hasLutOrTonemap || faldOn;  // Only report active when backbuffer was actually modified
 }

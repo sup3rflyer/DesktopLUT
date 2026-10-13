@@ -24,5 +24,8 @@ struct PatchLevel {
 void ShowPatch(HMONITOR monitor, PatchSize size, const PatchLevel& level);
 void HidePatch();
 bool PatchVisible();
+// The next ShowPatch presents a fresh frame even with nothing changed: the live preview changed, and DWM (and the hook
+// that applies the preview in hook mode) re-composes only what presents.
+void InvalidatePatch();
 
 }  // namespace ui

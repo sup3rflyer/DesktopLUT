@@ -2,6 +2,7 @@
 // Processing thread management
 
 #include "processing.h"
+#include "mhc_preview.h"   // MhcEditorNeedsOverlay
 #include "globals.h"
 #include "lut.h"
 #include "fald.h"
@@ -593,7 +594,7 @@ static bool HasActiveShaderCorrections() {
     if (g_gui.processingThread.joinable())
         return g_shaderCorrectionsActive.load(std::memory_order_relaxed);
     // MHC/grayscale editor live preview needs the overlay
-    if (g_mhcEditDialogOpen.load()) return true;
+    if (MhcEditorNeedsOverlay()) return true;
     // Static GUI check when render thread is not running.
     // MHC suppression mirrors UpdateMhcFlagsLive() and the render loop's mhcG evaluation.
     bool desktopGamma = g_userDesktopGammaMode.load();
@@ -629,7 +630,7 @@ static bool HasActiveShaderCorrections() {
 // Evaluate whether non-analysis shader corrections need the full overlay.
 // Always iterates g_gui.monitorSettings — MUST only be called from the GUI thread.
 bool EvalNonAnalysisShaderCorrections() {
-    if (g_mhcEditDialogOpen.load()) return true;
+    if (MhcEditorNeedsOverlay()) return true;
     bool desktopGamma = g_userDesktopGammaMode.load();
     for (const auto& ms : g_gui.monitorSettings) {
         bool sdrMhcP = ms.sdrMHC.enabled && ms.sdrMHC.primariesEnabled;
@@ -921,7 +922,7 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
     while (g_running.load() && g_analysisEnabled.load() &&
            g_analysisThreadGen.load() == generation) {
         // Check if we need to transition to full overlay (MHC editor or corrections)
-        if (g_mhcEditDialogOpen.load() || HasNonAnalysisShaderCorrections()) {
+        if (MhcEditorNeedsOverlay() || HasNonAnalysisShaderCorrections()) {
             std::cout << "[Analysis-only] Full overlay needed, transitioning" << std::endl;
             break;
         }
@@ -1051,7 +1052,7 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
     }
 
     // Determine exit reason for GUI handler
-    bool needsFullOverlay = g_mhcEditDialogOpen.load() || HasNonAnalysisShaderCorrections();
+    bool needsFullOverlay = MhcEditorNeedsOverlay() || HasNonAnalysisShaderCorrections();
 
     // If our generation went stale we are a detached zombie: a successor thread
     // may already own g_monitors and the shared D3D globals, and the `mon`

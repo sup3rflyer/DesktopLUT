@@ -222,7 +222,7 @@ bool FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
         }
     }
     MhcPreviewSession preview = st.preview;
-    StopMhcPreviewOverlay(preview);
+    StopMhcPreviewDraw(preview);
     g_mhcEditDialogOpen.store(false);  // re-arm MHC profile monitoring (suppressed during preview)
     // Bake the (restored or final) correctionGrayscale into the ICC (the full permutation).
     // No-op if MHC isn't active (no profileName).
@@ -1067,6 +1067,11 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     want("desktop_gamma", hasDg, dg);
     want("tonemap", hasTm, tm);
     want("fald", hasFd, fd);
+    if (hasFd && fd && MhcPreviewOnDisplay(mon)) {
+        // The FALD pass would land after the live edit's preview (mhc_preview.h): not the bake.
+        error = "fald cannot be switched on during a live grayscale edit on this display";
+        return;
+    }
     if (!isHDR && (hasDg || hasTm)) {
         // HDR-only layers; asking to change them in SDR is a client error, asking
         // for them OFF is a harmless no-op (a "disable everything" client). fald is per mode.
@@ -1824,10 +1829,10 @@ void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& er
     // `mon` indexes monitorSettings after EnsureProcessingForPreview's message pumps: a display
     // change pumped meanwhile must not re-attach the vector underneath (deferred instead).
     MonitorSettingsPin pin;
-    bool livePreview = false, startedForPreview = false, startedOverlayForPreview = false;
-    EnsureProcessingForPreview(mon, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
-    if (!livePreview) {
-        error = "overlay not available for live preview (monitor mode does not match run mode, or processing could not start)";
+    bool startedForPreview = false, startedOverlayForPreview = false;
+    if (!ReadyMhcPreviewDisplay(mon, isHDR, startedForPreview, startedOverlayForPreview)) {
+        StopGsLiveProcessing(startedForPreview, startedOverlayForPreview);
+        error = "live preview not available (monitor mode does not match, or the overlay could not start)";
         return;
     }
 
@@ -1858,12 +1863,14 @@ void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& er
 
 // mhc.grayscale_set_live {monitor, mode, grayscale:{point_count,points,deviations}}:
 // the per-patch nudge. Applies the payload to correctionGrayscale and recomposes the
-// preview, so the next frame shows the profile the commit would install with it.
+// preview; returns once the profile the commit would install with it is on screen.
 void DoGrayscaleSetLive(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* gs = p.find("grayscale");
     if (!gs || gs->type != JsonValue::Obj) { error = "missing parameter: grayscale"; return; }
+    MhcPreviewSession preview;
+    GrayscaleSettings curve;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         auto it = g_gsLive.find({mon, isHDR});
@@ -1873,8 +1880,15 @@ void DoGrayscaleSetLive(const JsonValue& p, JsonValue& result, std::string& erro
         }
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
         if (!ApplyGrayscalePayload(m.correctionGrayscale, *gs, isHDR, error)) return;  // sets enabled = true
-        // Lock order settings -> preview stage (UpdateMhcPreview takes only the stage mutex).
-        UpdateMhcPreview(it->second.preview, m.correctionGrayscale);
+        preview = it->second.preview;
+        curve = m.correctionGrayscale;
+    }
+    // Outside the lock: the hook's wait pumps messages. With the hook the change shows at its next present and after
+    // the recomposition it requested (a static patch included): the meter must not read before that.
+    UpdateMhcPreview(preview, curve);
+    if (!WaitMhcPreviewShown(preview, 1500)) {
+        error = "the live preview did not reach the screen (the DWM hook stopped presenting)";
+        return;
     }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
 }

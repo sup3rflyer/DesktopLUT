@@ -70,6 +70,8 @@ void SetLiveMonitors(const std::vector<HMONITOR>& monitors);
 void RequestFaldFullRecompose();
 // Any mode: force one full-screen DWM composition (a fresh Desktop Duplication frame of a static desktop).
 void RequestDesktopRecompose();
+// A RequestDesktopRecompose is still running (its full-screen composition has not finished). GUI thread.
+bool DesktopRecomposePending();
 // Hook FALD: a panel file was set or changed — re-inject so the DLL loads it (hook mode, running). GUI thread.
 void FaldPanelFileChangedReinject();
 

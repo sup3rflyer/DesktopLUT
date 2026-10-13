@@ -28,6 +28,7 @@ struct Patch {
     IDXGISwapChain1* swap = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     bool hdrChain = false;             // the swap chain's format (FP16 scRGB) matches level.hdr
+    bool invalid = false;              // present again on the next ShowPatch (InvalidatePatch)
     UINT width = 0, height = 0;
     bool classRegistered = false;
 };
@@ -183,7 +184,9 @@ void ShowPatch(HMONITOR monitor, PatchSize size, const PatchLevel& level) {
         SetWindowPos(g_patch.hwnd, HWND_TOP, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                      SWP_NOACTIVATE);
     }
-    const bool changed = moved || g_patch.size != size || g_patch.backdrop != backdrop || !(g_patch.level == level);
+    const bool changed = moved || g_patch.size != size || g_patch.backdrop != backdrop || !(g_patch.level == level) ||
+                         g_patch.invalid;
+    g_patch.invalid = false;
     g_patch.monitor = monitor;
     g_patch.size = size;
     g_patch.backdrop = backdrop;
@@ -209,5 +212,7 @@ void HidePatch() {
 }
 
 bool PatchVisible() { return g_patch.hwnd && IsWindowVisible(g_patch.hwnd); }
+
+void InvalidatePatch() { g_patch.invalid = true; }
 
 }  // namespace ui

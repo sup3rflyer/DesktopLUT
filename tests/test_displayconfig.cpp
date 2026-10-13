@@ -190,7 +190,9 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * 4);
     // the 3D LUT stage bypass mask came out of _reserved next (0 = every cube applied)
     CHECK(offsetof(DwmHookSharedConfig, lutOffMask) == 464 - 4 * 4);
-    CHECK(offsetof(DwmHookSharedConfig, _reserved) == 464 - 3 * 4);
+    // the live edit preview generation came out of _reserved next (0 = no preview)
+    CHECK(offsetof(DwmHookSharedConfig, mhcPreviewGen) == 464 - 3 * 4);
+    CHECK(offsetof(DwmHookSharedConfig, _reserved) == 464 - 2 * 4);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[0]) - base) == 464 + 16);
     CHECK((reinterpret_cast<uintptr_t>(&ex.tail.fald[1]) - base) == 464 + 16 + 128);
     CHECK(sizeof(DwmHookFaldTuning) == 128);

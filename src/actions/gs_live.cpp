@@ -65,9 +65,8 @@ bool BeginGsEdit(int mon, bool hdr) {
         e.before = gs;
     }
 
-    // The overlay must run for the display in this mode: it applies the profile while scanout runs an identity one.
-    bool livePreview = false;
-    EnsureProcessingForPreview(mon, hdr, livePreview, e.startedForPreview, e.startedOverlayForPreview);
+    // The overlay (or, in hook mode, the hook) applies the profile while scanout runs an identity one.
+    const bool livePreview = ReadyMhcPreviewDisplay(mon, hdr, e.startedForPreview, e.startedOverlayForPreview);
     std::wstring why = L"The display is not in this mode";
     if (!livePreview || !BeginMhcPreview(mon, hdr, e.preview, &why)) {
         StopPreviewProcessing(e);
@@ -100,7 +99,7 @@ void EndGsEdit(bool keep) {
     }
     // The overlay stops applying the profile, the bake puts the real one (with the kept or restored curve) on
     // scanout, and only then is the identity profile dropped: never a frame with nothing associated.
-    StopMhcPreviewOverlay(g_edit.preview);
+    StopMhcPreviewDraw(g_edit.preview);
     g_mhcEditDialogOpen.store(false);
     if (RegenerateMhcIfActive(mon, hdr) == MhcRegenResult::Failed)
         notify::Post(notify::Sev::Warning, mon, L"mhc", L"MHC profile not updated (source file unreadable?)");
@@ -117,6 +116,6 @@ void EndGsEdit(bool keep) {
 bool GsEditActive() { return g_edit.active; }
 int GsEditMonitor() { return g_edit.active ? g_edit.mon : -1; }
 bool GsEditHdr() { return g_edit.hdr; }
-bool GsEditPreviewing() { return g_edit.active && g_edit.preview.active; }
+bool GsEditPreviewing() { return g_edit.active && MhcPreviewApplied(g_edit.preview); }
 
 }  // namespace act

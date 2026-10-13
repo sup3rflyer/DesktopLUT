@@ -112,6 +112,10 @@ extern unsigned int g_beaconActive;      // host is showing the beacon windows
 extern unsigned int g_beaconGeneration;  // increments per beacon session
 extern unsigned int g_beaconSize;        // beacon square edge, device pixels
 extern unsigned int g_hdrDitherOff;      // 1 = host turned the HDR output dither off
+// Live edit preview (DwmHookMhcPreview): the generation the host published (0 = none). Written by dllmain.cpp from
+// every shared-config read, NOT debounced (the host drives it; the block itself carries its monitor and mode).
+extern unsigned int g_mhcPreviewWantGen;
+void ReleaseMhcPreviewMapping();         // the preview block's view + handle (DLL_PROCESS_DETACH, after the hooks are off)
 void ReleaseBeaconProbes();              // staging textures (UninitializeStuff)
 
 // Monitor state functions

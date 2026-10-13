@@ -1159,7 +1159,7 @@ void RenderAll(FramePacer* fp) {
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;
         bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only
         // An MHC editor's live preview: this display's exact preview, or a dialog that previews through the overlay
-        bool hasMhcPreview = (ctx.mhcPreviewOn && ctx.mhcPreviewHdr == ctx.isHDREnabled) || g_mhcEditDialogOpen.load();
+        bool hasMhcPreview = (ctx.mhcPreviewOn && ctx.mhcPreviewHdr == ctx.isHDREnabled) || MhcEditorNeedsOverlay();
         ctx.shaderCorrActive = hasPrim || hasGs || hasWB || hasTonemap || hasDG || has24
                                || hasFald || hasAnalysis || hasMhcPreview;
     }
