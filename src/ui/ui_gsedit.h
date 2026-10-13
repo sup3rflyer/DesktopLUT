@@ -9,6 +9,7 @@
 
 #include "imgui.h"
 #include "ui_gscurve.h"
+#include "ui_patch.h"
 #include "types.h"
 #include <string>
 
@@ -30,6 +31,7 @@ struct GsEditorState {
     GsChannel channel = GsChannel::Gray;
     int zoom = 0;               // index into the scale choices (+-5 / 10 / 25 / 50 %)
     int step = 1;               // index into the key steps (0.01 / 0.1 / 1 %)
+    PatchSize patch = PatchSize::Off;   // the measurement patch on the edited display (follows the selection)
     int selected = -1;          // the selected point
     float dragAccum = 0.0f;
     bool renderOnly = false;    // drawn without a live edit (the screenshot test); never set by the interface

@@ -55,5 +55,8 @@ float GsPointLuminance(const GrayscaleSettings& gs, int i, bool hdr, float bakeP
 
 // The input a point stands for: SDR the code at `codeCap` (255 / 1023), HDR nits at the bake's peak.
 std::string GsPointLabel(int i, int n, bool hdr, float pqPeak, int codeCap);
+// What a measurement patch shows for point i: HDR its nits; SDR its signal on the code grid (code / cap), the
+// same input the label names.
+float GsPatchValue(int i, int n, bool hdr, float pqPeak, int codeCap);
 
 }  // namespace ui

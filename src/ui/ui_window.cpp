@@ -408,6 +408,7 @@ void Shutdown() {
     g_shutDown = true;    // Show / Post refuse from here on (a relaunch during exit must not revive it)
     g_commands.clear();   // nothing posted runs during the teardown
     g_view.gsEdit.open = false;   // its live edit ends in the hub teardown (AbortLiveEditsForShutdown), which may pump
+    HidePatch();
     notify::SetListener(nullptr);
     logcap::SetListener(nullptr);
     dlc::StopScanner();   // joins the worker (a scan in flight finishes first)

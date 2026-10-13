@@ -154,3 +154,17 @@ TEST_CASE("gs editor: balance is centred on gray and keeps the point's light out
         CHECK_FALSE(SetGsBalancePercent(gs, 0, hdr, GsChannel::R, 1.0f, 1612.0f));
     }
 }
+
+TEST_CASE("gs editor: the patch shows the input the point's label names") {
+    // SDR: on the code grid (the label's code / cap), so the meter reads the very code being edited.
+    CHECK(GsPatchValue(1, 10, false, 0.0f, 255) == doctest::Approx(3.0f / 255.0f));
+    CHECK(GsPatchValue(9, 10, false, 0.0f, 255) == doctest::Approx(1.0f));
+    CHECK(GsPatchValue(1, 10, false, 0.0f, 1023) == doctest::Approx(13.0f / 1023.0f));
+    CHECK(GsPatchValue(0, 20, false, 0.0f, 1023) == 0.0f);
+    // HDR: nits at the bake's peak (the top point is the peak itself).
+    const float pq = PqOETF(1612.0f / 10000.0f);
+    CHECK(GsPatchValue(19, 20, true, pq, 1023) == doctest::Approx(1612.0f).epsilon(1e-3));
+    const float mid = GsPatchValue(10, 20, true, pq, 1023);
+    CHECK(mid == doctest::Approx(PqEOTF(GsSlotT(10, 20) * pq) * 10000.0f).epsilon(1e-5));
+    CHECK(std::to_string((int)std::lround(mid)) == GsPointLabel(10, 20, true, pq, 1023));
+}

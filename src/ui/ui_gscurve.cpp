@@ -200,6 +200,13 @@ bool SetGsBalancePercent(GrayscaleSettings& gs, int i, bool hdr, GsChannel ch, f
     return true;
 }
 
+float GsPatchValue(int i, int n, bool hdr, float pqPeak, int codeCap) {
+    const float t = GsSlotT(i, n);
+    if (hdr) return PqEOTF(Clamp(t * pqPeak, 0.0f, 1.0f)) * 10000.0f;
+    const int cap = codeCap > 0 ? codeCap : 255;
+    return (float)std::lround(t * t * (float)cap) / (float)cap;
+}
+
 std::string GsPointLabel(int i, int n, bool hdr, float pqPeak, int codeCap) {
     const float t = GsSlotT(i, n);
     char buf[32];

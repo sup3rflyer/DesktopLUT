@@ -126,6 +126,7 @@
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_gscurve.cpp" />
     <ClCompile Include="src\ui\ui_gsedit.cpp" />
+    <ClCompile Include="src\ui\ui_patch.cpp" />
     <ClCompile Include="src\ui\ui_snapshot.cpp" />
     <ClCompile Include="src\ui\ui_present.cpp" />
     <ClCompile Include="src\ui\ui_widgets.cpp" />

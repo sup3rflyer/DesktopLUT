@@ -184,8 +184,10 @@ void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr) {
     const int codeCap = r.mode == Mode::SDR ? 255 : 1023;
     PostToDisplay(r, [ed, hdr, key, codeCap](int mon) {
         if (!act::BeginGsEdit(mon, hdr)) return;
-        const int step = ed->step;   // the key step is kept between edits
+        const int step = ed->step;   // the key step and the patch are kept between edits
+        const PatchSize patch = ed->patch;
         *ed = GsEditorState{};
+        ed->patch = patch;
         ed->open = true;
         ed->mon = mon;
         ed->hdr = hdr;
@@ -205,14 +207,14 @@ void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr) {
 }
 
 void CloseGsEditor(ViewState& vs, bool keep) {
+    HidePatch();
     if (act::GsEditActive()) act::EndGsEdit(keep);
     vs.gsEdit.open = false;
 }
 
 void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
-    (void)snap;
     GsEditorState& ed = vs.gsEdit;
-    if (!ed.renderOnly && !act::GsEditActive()) { ed.open = false; return; }   // ended elsewhere (window hidden, exit)
+    if (!ed.renderOnly && !act::GsEditActive()) { ed.open = false; HidePatch(); return; }   // ended elsewhere
     const int n = ed.work.pointCount;
     const bool hdr = ed.hdr;
     if (ed.selected >= n) ed.selected = n - 1;
@@ -282,12 +284,12 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         ImGui::SameLine(0, Px(8));
         if (Button("##gs_cancel", "CANCEL", bw) || (ImGui::IsKeyPressed(ImGuiKey_Escape) && !ImGui::IsAnyItemActive())) {
             GsEditorState* p = &ed;
-            Post([p]() { act::EndGsEdit(false); p->open = false; });
+            Post([p]() { HidePatch(); act::EndGsEdit(false); p->open = false; });
         }
         ImGui::SameLine(0, Px(8));
         if (PushButton("##gs_done", "DONE", bw, kControlH, true)) {
             GsEditorState* p = &ed;
-            Post([p]() { act::EndGsEdit(true); p->open = false; });
+            Post([p]() { HidePatch(); act::EndGsEdit(true); p->open = false; });
         }
     }
 
@@ -450,9 +452,22 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             const std::string in = std::string(hdr ? "NITS " : "CODE ") + GsPointLabel(ed.selected, n, hdr, curve.pqPeak, ed.codeCap);
             DrawTextIn(dl, Font::BodyBold, 20.0f, ImVec2(ax0, row2cy - Px(12)), ImVec2(ax1, row2cy + Px(12)), pal::Ink, in.c_str());
         }
+        // The measurement patch on the edited display, following the selection.
+        const float row3y = Snap(row2cy + Px(20));
+        {
+            DrawText(dl, Font::Label, kSizeLabel, ax0, row3y + Px(kControlH) * 0.5f, pal::InkDim, "PATCH");
+            const float segX = Snap(ax0 + Px(52));
+            ImGui::SetCursorScreenPos(ImVec2(segX, row3y));
+            static const char* const kPatch[] = { "OFF", "10 %", "FULL" };
+            const int pp = Segmented("##gs_patch", kPatch, 3, (int)ed.patch, 40);
+            if (pp >= 0) ed.patch = (PatchSize)pp;
+            if (ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) && ImGui::IsWindowHovered())
+                ImGui::SetTooltip("A patch at the selected point's level on the display being edited, for the meter.\n"
+                                  "It goes through the whole pipeline, the live edit included. 10 %%: a window on black.");
+        }
         // The four faders.
         const float colW = (ax1 - ax0) / 4.0f;
-        const float labelY = row2cy + Px(26);
+        const float labelY = row3y + Px(kControlH) + Px(16);
         const float trackTop = labelY + Px(12), trackBottom = sb.y - pad - Px(kControlH) - Px(12);
         if (ed.selected >= 0 && trackBottom - trackTop > Px(40)) {
             auto ySt = [&](float pct) { return trackTop + (trackBottom - trackTop) * (0.5f - pct / (2.0f * zoom)); };
@@ -512,6 +527,19 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         }
     }
     if (changed) Preview(ed);
+    // The patch: the selected point's input on the edited display, while the display shows this mode.
+    if (!ed.renderOnly) {
+        HMONITOR hmon = nullptr;
+        for (const DisplayRow& r : snap.live) if (r.liveIndex == ed.mon) hmon = r.hmon;
+        if (ed.patch != PatchSize::Off && hmon && act::GsEditPreviewing()) {
+            PatchLevel level;
+            level.hdr = hdr;
+            level.value = GsPatchValue(ed.selected >= 0 ? ed.selected : 0, n, hdr, curve.pqPeak, ed.codeCap);
+            ShowPatch(hmon, ed.patch, level);
+        } else {
+            HidePatch();
+        }
+    }
     EndPanel();
 }
 
