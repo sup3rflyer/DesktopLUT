@@ -7,7 +7,7 @@ inside a black-framed glass box (the RGB colour cube) -- from geometry alone
 a sphere, blurred into a cloud. Output is supersampled and stored with
 straight (non-premultiplied) alpha.
 
-    python tools/logo/render_logo.py            # regenerate everything in assets/logo/
+    python tools/logo/render_logo.py            # regenerate assets/logo/ and the repo-root icons
     python tools/logo/render_logo.py --metrics  # also print the balance numbers
 
 Only Pillow and numpy are required. Output is deterministic.
@@ -80,7 +80,7 @@ BACK_EDGE_WIDTH = 0.82       # line width, in frame widths
 
 # Rendering ------------------------------------------------------------------
 SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512, 1024]
-ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 256]
+ICO_SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256]
 
 # Per-size hinting. At every size frame widths are whole pixels and the vertical
 # strokes sit on pixel boundaries; at small sizes the detail that turns to mush
@@ -102,9 +102,11 @@ SMALL = {
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
 OUT_DIR = os.path.join(REPO, "assets", "logo")
-ORIGINAL_PNG = os.path.join(REPO, "DesktopLUT-logo.png")
-ORIGINAL_INV_PNG = os.path.join(REPO, "DesktopLUT-logo-inv.png")
-ORIGINAL_ICO = os.path.join(REPO, "DesktopLUT.ico")
+ICO_DIR = REPO                                   # DesktopLUT.ico / DesktopLUT-active.ico (resource.rc)
+LEGACY_DIR = os.path.join(OUT_DIR, "legacy")     # the original artwork, for the preview comparison
+ORIGINAL_PNG = os.path.join(LEGACY_DIR, "DesktopLUT-logo.png")
+ORIGINAL_INV_PNG = os.path.join(LEGACY_DIR, "DesktopLUT-logo-inv.png")
+ORIGINAL_ICO = os.path.join(LEGACY_DIR, "DesktopLUT.ico")
 
 # Cube corner colours (sRGB-encoded, the RGB cube itself)
 RED, GREEN, BLUE = np.eye(3)
@@ -638,7 +640,7 @@ def make_preview(path, master, master_inv, small, small_inv, stats_lines):
     sheet = Image.new("RGB", (W, H), (30, 30, 32))
     dr = ImageDraw.Draw(sheet)
     fT, fS, fM = _font(19), _font(13), _font(14)
-    dr.text((pad, 8), "DesktopLUT mark: old (repo root DesktopLUT-logo*.png, DesktopLUT.ico) vs new (assets/logo)",
+    dr.text((pad, 8), "DesktopLUT mark: old (assets/logo/legacy) vs new (assets/logo, repo-root icons)",
             fill=(235, 235, 235), font=fT)
     for i, line in enumerate(stats_lines):
         dr.text((pad, 36 + 19 * i), line, fill=(205, 205, 205), font=fM)
@@ -729,8 +731,10 @@ def main(argv=None):
         imgs_inv[s] = render(s, inverted=True)
         Image.fromarray(imgs[s], "RGBA").save(os.path.join(args.out, f"logo_{s}.png"), optimize=True)
         Image.fromarray(imgs_inv[s], "RGBA").save(os.path.join(args.out, f"logo_inv_{s}.png"), optimize=True)
-    write_ico(os.path.join(args.out, "DesktopLUT_new.ico"), [imgs[s] for s in ICO_SIZES])
-    write_ico(os.path.join(args.out, "DesktopLUT-active_new.ico"), [imgs_inv[s] for s in ICO_SIZES])
+    # the app icons live at the repo root (resource.rc); a custom --out gets its own copies
+    ico_dir = ICO_DIR if os.path.abspath(args.out) == os.path.abspath(OUT_DIR) else args.out
+    write_ico(os.path.join(ico_dir, "DesktopLUT.ico"), [imgs[s] for s in ICO_SIZES])
+    write_ico(os.path.join(ico_dir, "DesktopLUT-active.ico"), [imgs_inv[s] for s in ICO_SIZES])
     write_svg(os.path.join(args.out, "logo.svg"))
 
     _, cov, _ = render(256, return_coverage=True)

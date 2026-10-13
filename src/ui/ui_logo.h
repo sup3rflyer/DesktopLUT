@@ -1,7 +1,7 @@
 #pragma once
-// The logo artwork (DesktopLUT-logo.png, embedded as RCDATA) as a mipmapped D3D11 texture, so the
-// interface draws the real logo, with its glass transparency, frame and CMY corners, cleanly at any
-// size. GUI thread; tied to the interface's device.
+// The logo artwork (assets/logo/logo_256.png, embedded as RCDATA) as a mipmapped D3D11 texture, so
+// the interface draws the real logo, with its hazy RGB cloud, frame and transparent corners, cleanly
+// at any size. GUI thread; tied to the interface's device.
 
 #include <d3d11.h>
 

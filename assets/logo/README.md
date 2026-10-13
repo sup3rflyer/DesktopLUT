@@ -9,7 +9,7 @@ A hazy cloud of mixed red, green and blue light inside a black-framed glass box:
   3. **Blurred into haze.** A Gaussian blur on premultiplied colour does the mixing. Every boundary becomes a plain additive blend, and the middle, where all six colours meet, becomes a light grey-white. Blends are lifted halfway back toward full value (`CLOUD_VALUE`), so they do not turn muddy, and the haze is made less transparent (`CLOUD_DENSITY`).
 - **Empty box.** The cloud stops short of the box's corners and seams, which stay transparent. Toward the green face's far corner the haze thins a little more (`TOP_THIN`), so the back edge to that corner shows through. The haze is the only softness in the mark: there is no glass rim, highlight or edge clearing.
 - **Back edges.** The three hidden edges from the black corner are crisp black lines behind the cloud. They are sharp where the cloud does not reach and fade only under the haze.
-- **Inverted variant** (`logo_inv_*`, `DesktopLUT-active_new.ico`): colour-inverted cloud, with a white frame and white back edges. It is used for the "active" tray icon.
+- **Inverted variant** (`logo_inv_*`, `DesktopLUT-active.ico`): colour-inverted cloud, with a white frame and white back edges. It is used for the "active" tray icon.
 
 ## Files
 
@@ -17,14 +17,15 @@ A hazy cloud of mixed red, green and blue light inside a black-framed glass box:
 |---|---|
 | `logo_{16,20,24,32,40,48,64,96,128,256,512,1024}.png` | master, RGBA with straight alpha |
 | `logo_inv_{…}.png` | inverted variant |
-| `DesktopLUT_new.ico`, `DesktopLUT-active_new.ico` | 16/20/24/32/40/48/64 as 32-bit BMP entries, 256 as PNG |
+| `../../DesktopLUT.ico`, `../../DesktopLUT-active.ico` | the app icons at the repo root (`resource.rc`): 16/20/24/32/40/48/64/96/128 as 32-bit BMP entries, 256 as PNG |
 | `logo.svg` | vector frame over the cloud as an embedded 512 px PNG. The cloud is soft by nature, and its additive mixing cannot be expressed with SVG compositing |
 | `preview.png` | old vs new over #0b0b0c, #808080 and #f2f2f2, OKLab-lightness greyscale, small sizes at 1x and 4x |
+| `legacy/` | the original artwork (PNG, inverted PNG, both ICOs), kept for the preview comparison |
 
 ## Regenerate
 
 ```
-python tools/logo/render_logo.py            # rewrites everything in assets/logo/
+python tools/logo/render_logo.py            # rewrites assets/logo/ and the repo-root icons
 python tools/logo/render_logo.py --metrics  # also prints the colour numbers
 ```
 

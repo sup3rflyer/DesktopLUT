@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="DesktopLUT-logo.png" alt="DesktopLUT" width="128">
+  <img src="assets/logo/logo_256.png" alt="DesktopLUT" width="128">
 </p>
 
 # DesktopLUT
