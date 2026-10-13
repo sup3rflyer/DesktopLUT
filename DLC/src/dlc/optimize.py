@@ -12,8 +12,9 @@ The differentiator. Two nested loops drive a display to its physical floor:
   and rebuild.** Alternate until no point can reach a lower dE.
 
 The fold-back is the magic: the points the cube actually drives the panel to
-(``cube(signal)``) are re-measured, and those ``(driven_signal, measured_xyz)``
-pairs are added to the model's training set — so the next model is accurate
+(``cube(signal)``) are re-measured, and those ``(presented_signal, measured_xyz)``
+pairs (the drive at the code the panel was shown, when the probe drives codes) are
+added to the model's training set — so the next model is accurate
 *exactly where the cube operates*, its inverse is more self-consistent, and the
 residual shrinks.
 
@@ -181,8 +182,12 @@ class OptimizeConfig:
     # codes of a training (post-MHC) patch, measured through the same MHC-only path — are the SAME
     # stimulus. Such a probe is answered from the earlier read (a re-read of an identical stimulus adds
     # no information, only meter time — 35 of 62 min of the BenQ PD2700U 2026-09-27 build) and is scored
-    # like any probe but NOT folded again (the model already holds that read). ``None`` ⇒ every probe is
-    # read (synthetic/continuous probes, back-compat). The orchestrator sets the transfer's max code.
+    # like any probe but NOT folded again (the model already holds that read). A fresh read is folded at
+    # the code triple the panel was actually shown (``code / probe_code_levels``), not at the unrounded
+    # drive: the drive is up to ½ code away from the stimulus (≈0.1-0.2 dE2000 on an 8-bit grey ramp), and
+    # attributing the read to it would teach the model a response at a signal the panel never saw.
+    # ``None`` ⇒ every probe is read and folded at its drive (synthetic/continuous probes, back-compat).
+    # The orchestrator sets the transfer's max code.
     probe_code_levels: Optional[int] = None
     # Seed the cache from the training reads (the orchestrator turns this off when those reads were
     # rewritten to another display state, e.g. thermally aligned to the stage's start/middle).
@@ -637,7 +642,12 @@ def optimize_cube(
         """Which fresh reads may answer later probes: not a gross outlier against the model the cube
         was built from (robust 3σ on the batch's model gaps). A single occluded/glitched read
         (BenQ attempt B 01:54: 60 dE_ITP off the model vs a 0.7 median) must stay re-readable, not
-        become the cached truth for every later pass. Too few reads to judge ⇒ nothing cached."""
+        become the cached truth for every later pass. Too few reads to judge ⇒ nothing cached.
+
+        The cut never falls below one JND (``probe_reuse_stale_de``): a read within a JND of the model
+        is not a gross glitch, whatever the batch's spread. Without that floor a well-attributed batch
+        on a quiet meter (gaps ~0.01 dE_ITP, MAD ~0.005) flagged ordinary sub-JND model-interpolation
+        error as outliers and re-read those codes on every later pass."""
         if len(rows) < 5 or model is None or not hasattr(model, "forward"):
             return np.zeros(len(rows), dtype=bool)
         try:
@@ -647,7 +657,7 @@ def optimize_cube(
             return np.zeros(len(rows), dtype=bool)
         med = float(np.median(gap))
         mad = float(np.median(np.abs(gap - med)))
-        return gap <= med + SIGNIFICANCE_K * 1.4826 * max(mad, 1e-9)
+        return gap <= max(med + SIGNIFICANCE_K * 1.4826 * max(mad, 1e-9), float(cfg.probe_reuse_stale_de))
 
     # Budget: seed from the measured residual unless pinned.
     budget = (cfg.max_correction if cfg.max_correction is not None
@@ -758,6 +768,11 @@ def optimize_cube(
         full_probe = len(probe_idx) == len(verify)
 
         driven = sample_cube(cube, verify_probe)
+        # The stimulus the panel is actually shown for each drive: its code triple when the probe drives
+        # integer codes (probe_code_levels), else the drive itself. Reads are attributed to THIS — the
+        # model learns the panel's response where it was measured; ``driven`` stays the cube's output
+        # (correction magnitude, rail classification, snapshots).
+        presented = (np.rint(np.clip(driven, 0.0, 1.0) * levels) / levels) if levels else driven
         sentinel_rows: list[int] = []
         sentinel_median: Optional[float] = None
         invalidated = False
@@ -811,7 +826,7 @@ def optimize_cube(
                 fresh[i] = xyz_row
             fresh_rows = sorted(fresh)
             fresh_xyz = np.array([fresh[i] for i in fresh_rows], dtype=float).reshape(-1, 3)
-            ok = _cacheable(fresh_rows, fresh_xyz, driven)
+            ok = _cacheable(fresh_rows, fresh_xyz, presented)
             outliers = int(len(fresh_rows) - int(ok.sum()))
             by_key = {keys[i]: fresh[i] for i in fresh_rows}
             for i, good in zip(fresh_rows, ok):
@@ -919,10 +934,10 @@ def optimize_cube(
             break
 
         best_seen_max = cur_max if best_seen_max is None else min(best_seen_max, cur_max)
-        # Fold reality back: the driven points + their true response are new ground truth where
+        # Fold reality back: the presented stimuli + their true response are new ground truth where
         # the cube actually operates. Only reached when escalating or genuinely improving — a
         # non-improving (likely noisy) iteration breaks above WITHOUT polluting the model.
-        train_signals = np.vstack([train_signals, driven[fold_rows]])
+        train_signals = np.vstack([train_signals, presented[fold_rows]])
         train_xyz = np.vstack([train_xyz, measured[fold_rows]])
         train_confidence = np.concatenate([train_confidence, np.ones(len(fold_rows), dtype=float)])
         train_signals, train_xyz, train_confidence = aggregate_training_samples(

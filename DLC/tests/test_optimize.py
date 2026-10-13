@@ -469,6 +469,23 @@ def test_a_glitched_probe_read_is_never_cached():
     assert probe.glitched and result.history[0].uncached_outliers >= 1
 
 
+def test_sub_jnd_model_gaps_are_never_outliers():
+    # The outlier screen guards the cache against GROSS glitches (60 dE_ITP vs a 0.7 median). On a quiet
+    # meter with correctly attributed reads the batch's gaps are ~0.01 dE_ITP, so a purely relative cut
+    # (median + 3 MAD) flagged ordinary sub-JND interpolation error and re-read those codes every pass.
+    target = _sdr_target()
+    probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
+    signals = np.rint(_cube_signals(7) * 255) / 255
+    verify = np.vstack([signals, signals[:20] + 0.2 / 255])
+    cfg = OptimizeConfig(grid_size=9, threshold=0.2, max_outer=3, adaptive_min_full=64,
+                         adaptive_initial_worst=24, adaptive_sentinels=24, adaptive_low_light_cap=24,
+                         probe_code_levels=255)
+    result = optimize_cube(target=target, probe=probe, signals=signals, measured_xyz=probe.inner(signals),
+                           verify_signals=verify, config=cfg)
+    assert len(result.history) >= 2
+    assert all(h.uncached_outliers == 0 for h in result.history)
+
+
 def test_exact_code_reuse_folds_only_fresh_reads():
     target = _sdr_target()
     probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)))
@@ -483,6 +500,49 @@ def test_exact_code_reuse_folds_only_fresh_reads():
     # more) — reused answers are never folded back as new ground truth.
     for prev, cur in zip(hist, hist[1:]):
         assert cur.train_points - prev.train_points <= prev.probed_patches - prev.reused_probes
+
+
+def _folded_signals(monkeypatch, cfg, *, levels: int = 255):
+    """Run a build against an integer-code probe; return every signal row handed to the training
+    aggregation (the initial post-MHC set + each fold-back) and the codes the probe actually showed."""
+    import dlc.optimize as opt
+    seen: list[np.ndarray] = []
+    real = opt.aggregate_training_samples
+
+    def spy(signals, measured_xyz, sample_confidence=None, **kw):
+        seen.append(np.array(signals, dtype=float).reshape(-1, 3))
+        return real(signals, measured_xyz, sample_confidence, **kw)
+
+    monkeypatch.setattr(opt, "aggregate_training_samples", spy)
+    target = _sdr_target()
+    probe = _CodeProbe(synthetic_probe(target, gains=(1.0, 1.012, 1.025)), levels=levels)
+    signals = np.rint(_cube_signals(5) * levels) / levels
+    result = opt.optimize_cube(target=target, probe=probe, signals=signals,
+                               measured_xyz=probe.inner(signals), config=cfg)
+    return result, seen, probe
+
+
+def test_fold_back_attributes_each_read_to_the_code_the_panel_was_shown(monkeypatch):
+    # The live probe shows round(drive * max_cv); the read belongs to THAT stimulus. Folding it at the
+    # unrounded drive put every fold-back point up to ½ code off (≈0.1-0.2 dE2000 on an 8-bit grey ramp).
+    cfg = OptimizeConfig(grid_size=17, threshold=0.05, max_outer=3, neutral_band=0.0, probe_code_levels=255)
+    result, seen, probe = _folded_signals(monkeypatch, cfg)
+    assert len(result.history) >= 2 and len(seen) >= 2          # at least one fold-back happened
+    for rows in seen:
+        assert np.allclose(rows * 255, np.rint(rows * 255), atol=1e-9)   # every training row is on a code
+    shown = {tuple(int(c) for c in row) for row in probe.read}
+    folded = {tuple(int(c) for c in row) for row in np.rint(np.vstack(seen[1:]) * 255)}
+    assert folded <= shown | {tuple(int(c) for c in row) for row in np.rint(seen[0] * 255)}
+
+
+def test_continuous_probe_still_folds_at_the_drive(monkeypatch):
+    # Back-compat: with no code depth known (synthetic/continuous probe) the drive IS the stimulus. Also
+    # proves the test above can fail: the cube's drives land between codes.
+    cfg = OptimizeConfig(grid_size=17, threshold=0.05, max_outer=3, neutral_band=0.0)
+    result, seen, _ = _folded_signals(monkeypatch, cfg)
+    assert len(seen) >= 2
+    later = np.vstack(seen[1:])
+    assert not np.allclose(later * 255, np.rint(later * 255), atol=1e-6)
 
 
 def test_probe_reuse_is_off_by_default():

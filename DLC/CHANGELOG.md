@@ -447,6 +447,15 @@ request, adjudicates ambiguous results on digests, and writes the report.
   with Phase 12). Suite identical before/after: 915 passed, 3 skipped.
 
 ### Fixed
+- **3D-LUT build probe reads are attributed to the code the panel was shown** (2026-10-13). The closed-loop
+  probe shows each cube drive rounded to an integer code at the run's bit depth, but the read was folded back
+  into the model at the unrounded drive, up to ½ code away. On a γ2.2 grey ramp that is ≈0.1–0.2 ΔE2000 at
+  8-bit (≈0.02–0.05 at 10-bit). Reads now fold at `code / max_cv`, and the probe cache's outlier screen
+  compares each read to the model at that code. Re-reads of a sentinel code now merge with the original read
+  instead of adding a near-duplicate model knot. The outlier screen also gets a one-JND floor
+  (`probe_reuse_stale_de`): with correctly attributed reads on a quiet meter, the purely relative cut
+  (median + 3 MAD on ~0.01 ΔE_ITP gaps) flagged sub-JND interpolation error as glitches and re-read those
+  codes on every pass. Tests only; no hardware run yet.
 - **The 3D-LUT build models the cube the way DesktopLUT applies it** (2026-10-02). The DWM hook samples the
   cube with tetrahedral interpolation; DLC sampled it trilinearly to pick its probe drives, fold them back and
   predict the result. Between lattice nodes the two differ, most visibly on the grey axis: tetrahedral keeps
