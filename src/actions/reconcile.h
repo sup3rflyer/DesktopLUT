@@ -4,6 +4,9 @@
 // gamma) and stop when none does, unless the user suspended them. The MHC profiles are not live
 // layers: they stay at scanout either way.
 
+#include "dwm_inject.h"
+#include <vector>
+
 namespace act {
 
 enum class ReconcileDecision { None, Start, Stop, Restart, Defer };
@@ -11,21 +14,80 @@ enum class ReconcileDecision { None, Start, Stop, Restart, Defer };
 struct ReconcileInputs {
     bool shuttingDown = false;
     bool suspended = false;        // the user's Suspend (g_userStopped)
-    bool busy = false;             // a start/stop transition, a pinned settings vector, an MHC edit dialog,
-                                   // a calibration session or live edit: nothing may start or stop now
+    bool busy = false;             // LiveLayersBusy(): nothing may start or stop now
     bool running = false;          // g_gui.isRunning
     bool needed = false;           // AnyMonitorNeedsProcessing()
-    bool hookStale = false;        // hook mode: the resident hook was injected with another staging set
-                                   // than the configuration wants (a display gained or lost hook work
-                                   // while running; the DLL reads its display list only at attach)
+    bool hookStale = false;        // HookStale(): the resident DWM hook must be re-injected
 };
 
 // Pure (tested): what reconciling should do in this state.
 ReconcileDecision DecideReconcile(const ReconcileInputs& in);
 
+// The DWM hook reads its staged files (DesiredDwmHookStagingSet: the cubes and FALD panel files) only at
+// injection and matches them to displays by desktop position. Everything else reaches a resident hook live
+// through the shared config, which lists every display by position: the tone mapper and the FALD switches.
+struct DisplayPosition { int left = 0, top = 0; };
+struct HookStaging {
+    std::vector<DwmHookMonitorLUT> desired;    // DesiredDwmHookStagingSet()
+    std::vector<DwmHookMonitorLUT> injected;   // DwmHookInjectedSet(): what the resident hook was injected with
+    bool injectedKnown = false;                // ...and whether that set describes the resident hook
+    bool hookActive = false;                   // IsDwmHookActive()
+    bool startStagedNothing = false;           // DwmHookStartStagedNothing(): the running start injected nothing
+    bool restartInjects = false;               // AnyMonitorNeedsProcessing(): a restart starts again and injects
+                                               // `desired` (otherwise it only ejects the hook and stays stopped)
+    std::vector<DisplayPosition> identified;   // live displays whose settings carry a display identity
+};
+
+// Pure (tested): hook mode, running — would a re-inject change what the hook applies to a live display?
+// Stale when:
+//   - a cube staged at a display's position is not the one that display wants (a BenQ with no cube swapped
+//     onto the TV's connector would show the TV's cube): even when the restart injects nothing again;
+//   - a restart injects, and a display stages a file the hook lacks at its position: a cube, or a panel file
+//     whatever its switch (so that switching the layer on rides the shared config) — it gained one, arrived
+//     late, or the attachment change moved it;
+//   - a restart injects, the running start injected nothing (no display had hook work then), and now some
+//     display has hook work: tone mapping too, it needs the hook resident.
+// Not stale:
+//   - tone mapping on a display the hook was not injected with: a resident hook tone maps every display;
+//   - a display that only lost live-switch work (tone mapping off, the FALD layer off);
+//   - a panel file under a display that does not want it: inert, the layer runs only where that display's
+//     own settings switch it on, with its own file (which then is a file the hook lacks);
+//   - a display that left (the owner's TV powering off): nothing sits under its files, and they are right
+//     again when it comes back at the same position;
+//   - an unidentified display over files staged for another: it may be the very display they are for (the
+//     identity query lags), so it waits for its identity, as the settings re-attach does;
+//   - a hook that is gone (DWM restarted, or the watchdog gave up re-injecting): the watchdog's business;
+//   - a resident hook whose staging set is unknown.
+bool DecideHookStale(const HookStaging& s);
+
+// GUI thread. DecideHookStale for the live state (false outside hook mode or when not running).
+bool HookStale();
+
+// GUI thread. A start/stop transition, a pinned settings vector, an MHC edit dialog, a calibration session
+// or live edit: nothing may start, stop or re-inject the live layers now.
+bool LiveLayersBusy();
+
 // GUI thread. Starts, stops or restarts the live layers to match the configuration; when it must wait
 // (busy), it retries on RECONCILE_TIMER_ID. `why` goes to the log. Returns what it did.
 ReconcileDecision ReconcileLiveLayers(const char* why);
+
+// TOPOLOGY_PIPELINE_TIMER_ID: the live settings attachment changed (a display arrived, left, was swapped, or
+// was identified late).
+struct TopologyInputs {
+    bool busy = false;             // LiveLayersBusy()
+    bool suspended = false;        // the user's Suspend (g_userStopped)
+    bool running = false;          // g_gui.isRunning
+    bool needed = false;           // AnyMonitorNeedsProcessing()
+    bool lutsChanged = false;      // SettingsChanged(): a live display's cube paths differ from the running ones
+    bool hookStale = false;        // HookStale()
+};
+
+// Pure (tested): what the topology tick does. Busy: wait (Defer = re-arm the tick). Not running: Start when
+// a live display needs processing and the user has not suspended. Running: Restart when the pipeline was
+// built without what the attached displays now need (lutsChanged, hookStale). Never Stop: a display that
+// left (the owner's TV powering off) does not stop what runs for it, so its return costs no re-inject; a
+// configuration change still stops what nothing needs (ReconcileLiveLayers).
+ReconcileDecision DecideTopologyTick(const TopologyInputs& in);
 
 // GUI thread. Suspend stops the live layers and keeps them stopped (display changes and wakes do not
 // start them); resume reconciles. Suspending is refused while a calibration session or live edit is

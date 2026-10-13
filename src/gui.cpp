@@ -1392,32 +1392,52 @@ static void OnMonitorSettingsTopologyChanged() {
     if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, TOPOLOGY_PIPELINE_TIMER_ID, TOPOLOGY_PIPELINE_SETTLE_MS, nullptr);
 }
 
-// TOPOLOGY_PIPELINE_TIMER_ID: the live attachment changed (a display arrived, was swapped, or was
+// TOPOLOGY_PIPELINE_TIMER_ID: the live attachment changed (a display arrived, left, was swapped, or was
 // identified late — including by the identity retry, which no WM_DISPLAYCHANGE follows).
 //   not running -> start, when a live display needs processing and the user has not pressed Stop
 //                  (the display a correction is for was absent or unidentified until now);
 //   running     -> restart, when a display now attached has a LUT the running pipeline was built
-//                  without (SettingsChanged, per display slot): overlay contexts are built once per
-//                  thread and the hook stages LUTs only at injection, so nothing else picks it up.
-// Waits while an editor holds the settings or a calibration / live edit runs (a restart would pull
-// the pipeline out from under it), re-checking until that ends.
+//                  without (SettingsChanged, per display slot: overlay contexts are built once per
+//                  thread), or, in hook mode, when the hook's staged files do not match the displays now
+//                  attached (act::HookStale: a late display's FALD panel file, a display the change moved,
+//                  a cube under a swapped-in display; or no hook resident yet for a late display's tone
+//                  mapper). The hook reads its files only at injection, so nothing else picks these up; the
+//                  tone mapper reaches a resident hook through the shared config by itself.
+// Never stops (act::DecideTopologyTick): the owner's TV powering off must not cost a re-inject when it
+// comes back. Waits while an editor holds the settings or a calibration / live edit runs (a restart
+// would pull the pipeline out from under it), re-checking until that ends. Not armed by a modeset that
+// only moves displays (a rearrangement, a resolution change beside them): no attachment change.
 static void TickTopologyPipeline(HWND hwnd) {
     KillTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID);
-    if (IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
-        IsCalibrationOrLiveEditActive()) {
+    act::TopologyInputs in;
+    in.busy = act::LiveLayersBusy();
+    in.suspended = g_userStopped.load();
+    in.running = g_gui.isRunning.load();
+    in.needed = !in.busy && !in.running && AnyMonitorNeedsProcessing();
+    in.lutsChanged = !in.busy && in.running && SettingsChanged();
+    in.hookStale = !in.busy && in.running && !in.lutsChanged && act::HookStale();
+    switch (act::DecideTopologyTick(in)) {
+    case act::ReconcileDecision::Defer:
         SetTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID, TOPOLOGY_PIPELINE_SETTLE_MS, nullptr);
-        return;
-    }
-    if (!g_gui.isRunning) {
-        if (!g_userStopped && AnyMonitorNeedsProcessing()) {
-            std::cout << "[Monitor identity] a display to correct is attached now: starting processing" << std::endl;
-            StartProcessing();
+        break;
+    case act::ReconcileDecision::Start:
+        std::cout << "[Monitor identity] a display to correct is attached now: starting processing" << std::endl;
+        StartProcessing();
+        break;
+    case act::ReconcileDecision::Restart:
+        if (in.lutsChanged) {
+            std::cout << "[Monitor identity] a newly attached display has a LUT the running pipeline lacks: restarting"
+                      << std::endl;
+            SetStatus(L"Display attached: restarting to apply its LUT");
+        } else {
+            std::cout << "[Monitor identity] the DWM hook's staged files do not match the displays: re-injecting"
+                      << std::endl;
+            SetStatus(L"Display change: re-injecting the DWM hook");
         }
-    } else if (SettingsChanged()) {
-        std::cout << "[Monitor identity] a newly attached display has a LUT the running pipeline lacks: restarting"
-                  << std::endl;
-        SetStatus(L"Display attached: restarting to apply its LUT");
         RestartLiveLayers();   // stays stopped if the user suspended meanwhile
+        break;
+    default:
+        break;
     }
 }
 
