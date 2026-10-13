@@ -81,6 +81,7 @@ struct ThemeDef {
     ImU32 menu, tip, tipEdge;
     ImU32 bevelHi, bevelLight, bevelShadow, bevelDark;
     ImU32 lightOn, switchOn, switchKnob;
+    ImU32 plotGrid, plotAxis;
     // ImGui-only
     ImU32 textDisabled, scrollBg, scrollGrab, scrollGrabHover, scrollGrabActive, rowAlt, textSelected, dim;
     ThemeShape shape;
@@ -102,9 +103,10 @@ const ThemeDef kDark = {
     /* menu    */ Hex(0x111113), Hex(0x111113), Hex(0x2e2e32),
     /* bevel   */ kNone, kNone, kNone, kNone,
     /* lights  */ Hex(0xe6e6e6), Hex(0x2fa36b), Hex(0xe6e6e6),
+    /* plots   */ Hex(0x1e1e1e), Hex(0x424242),
     /* imgui   */ Hex(0x808080), kNone, Hex(0x262628), Hex(0x343436), Hex(0x9b9b9b), Hex(0xffffff, 0x06),
                   Hex(0x333335), Hex(0x000000, 0x99),
-    { 2.0f, 0.0f, false, false, false, false, false, false, false },
+    { 2.0f, 0.0f, false, false, false, false, false, false, false, false },
     { RGB(0x00, 0x00, 0x00), RGB(0xe6, 0xe6, 0xe6), true },
 };
 
@@ -122,9 +124,10 @@ const ThemeDef kGray = {
     /* menu    */ Hex(0x1e1e21), Hex(0x222226), Hex(0x3a3a40),
     /* bevel   */ kNone, kNone, kNone, kNone,
     /* lights  */ Hex(0x7aa7d9), Hex(0x7aa7d9), Hex(0x161618),
+    /* plots   */ Hex(0x2c2c31), Hex(0x55555c),
     /* imgui   */ Hex(0x8b8b93), kNone, Hex(0x34343a), Hex(0x44444b), Hex(0xa6a6ad), Hex(0xffffff, 0x05),
                   Hex(0x3d4d60), Hex(0x000000, 0x99),
-    { 6.0f, 0.0f, false, false, false, false, false, true, true },
+    { 6.0f, 0.0f, false, false, false, false, false, true, true, false },
     { RGB(0x16, 0x16, 0x18), RGB(0xec, 0xec, 0xee), true },
 };
 
@@ -143,9 +146,10 @@ const ThemeDef kLight = {
     /* menu    */ Hex(0xffffff), Hex(0xffffe1), Hex(0x000000),
     /* bevel   */ Hex(0xffffff), Hex(0xdfdfdf), Hex(0x808080), Hex(0x000000),
     /* lights  */ Hex(0x000000), Hex(0x005c00), Hex(0xffffff),
+    /* plots   */ Hex(0xc8c8c8), Hex(0x808080),
     /* imgui   */ Hex(0x808080), Hex(0xdcdcdc), Hex(0xa8a8a8), Hex(0x909090), Hex(0x808080), Hex(0x000000, 0x0a),
                   Hex(0xa6caf0), Hex(0x000000, 0x40),
-    { 0.0f, 0.0f, true, true, true, true, true, false, false },
+    { 0.0f, 0.0f, true, true, true, true, true, false, false, true },
     { RGB(0x00, 0x00, 0x80), RGB(0xff, 0xff, 0xff), true },
 };
 
@@ -177,6 +181,7 @@ void CopyPalette(const ThemeDef& d) {
     pal::BevelHi = d.bevelHi; pal::BevelLight = d.bevelLight;
     pal::BevelShadow = d.bevelShadow; pal::BevelDark = d.bevelDark;
     pal::LightOn = d.lightOn; pal::SwitchOn = d.switchOn; pal::SwitchKnob = d.switchKnob;
+    pal::PlotGrid = d.plotGrid; pal::PlotAxis = d.plotAxis;
 }
 
 // The palette holds Dark before any theme is chosen, so nothing ever draws with zero colours.

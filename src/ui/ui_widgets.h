@@ -94,8 +94,11 @@ float ToggleSwitchWidth();              // pixels
 // Number field in mono. Edits a draft; returns true only when the field is left (Enter, Tab, click
 // elsewhere) with a changed value, written to *v. Never commits a half-typed value.
 // A difference under half a shown step (of `fmt`) is not an edit: tabbing through keeps the stored precision.
-bool NumberInput(const char* id, float* v, const char* fmt, float widthDip);
+bool NumberInput(const char* id, float* v, const char* fmt, float widthDip, float fontSizeDip = kSizeMono);
 int FormatDecimals(const char* fmt);   // "%.4f" -> 4, "%.0f" -> 0, "%f" -> 6
+
+// A field's box (sunken in Light): the background of plots and lists as well as of text fields.
+void DrawFieldBox(ImDrawList* dl, ImVec2 a, ImVec2 b, bool hovered = false, bool active = false);
 
 // A one-line text field (hint shown while empty). Returns true while it changed this frame.
 bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip);

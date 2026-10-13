@@ -3,6 +3,7 @@
 // (src/actions), never directly into the settings.
 
 #include "ui_snapshot.h"
+#include "ui_gsedit.h"
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -43,7 +44,13 @@ struct ViewState {
     bool renameFocus = false;      // give the field keyboard focus on its first frame
     bool showNotices = false;      // Settings > About: third-party notices expanded
     LogView log;
+    GsEditorState gsEdit;          // the grayscale fine-tune editor (open while its live edit runs)
 };
+
+// The sidebar row id of a display (live / remembered + its identity).
+std::wstring RowIdOf(const DisplayRow& r);
+// Posts `fn` for the display's live index as it is when the command runs (found again by identity).
+void PostToDisplay(const DisplayRow& r, std::function<void(int)> fn);
 
 void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy);
 

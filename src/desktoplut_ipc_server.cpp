@@ -36,6 +36,7 @@
 #include "processing.h"
 #include "gui.h"
 #include "actions/reconcile.h"
+#include "actions/gs_live.h"
 #include "dwm_inject.h"
 
 #pragma comment(lib, "Advapi32.lib")
@@ -2301,9 +2302,12 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
 // ===========================================================================
 void AbortLiveEditsForShutdown() {
     CleanupActiveGsLive();
+    // The interface's editor: its edits stay (as on closing the window), the real profile goes back on.
+    if (act::GsEditActive()) act::EndGsEdit(true);
 }
 
 bool IsCalibrationOrLiveEditActive() {
+    if (act::GsEditActive()) return true;   // the interface's grayscale editor (GUI thread state)
     // Sequential, never nested: the GUI-thread enter nests settings -> calib.
     {
         std::lock_guard<std::mutex> lk(g_calibMutex);

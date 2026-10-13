@@ -47,11 +47,15 @@ std::wstring KeyOf(const DisplayRow& r) {
     return L"#" + std::to_wstring(r.liveIndex);
 }
 
+}  // namespace
+
 // One sidebar row: unique even when a live display and a remembered one share a connector (a same-model
 // replacement) or remembered entries have no identity.
 std::wstring RowIdOf(const DisplayRow& r) {
     return (r.liveIndex >= 0 ? std::wstring(L"L|") : L"P" + std::to_wstring(r.settings.slot) + L"|") + KeyOf(r);
 }
+
+namespace {
 
 std::string FileName(const std::wstring& path) {
     if (path.empty()) return "\xE2\x80\x94";
@@ -132,6 +136,12 @@ void PostTo(const DisplayRow& r, std::function<void(int)> fn) {
     const int hint = r.liveIndex;
     Post([id, hint, fn]() { RunOnDisplay(id, hint, fn); });
 }
+
+}  // namespace
+
+void PostToDisplay(const DisplayRow& r, std::function<void(int)> fn) { PostTo(r, std::move(fn)); }
+
+namespace {
 
 // A file picked in a dialog, then applied: the dialog pumps messages (a display can come or go meanwhile),
 // so the display is found after it closes, not before.
@@ -414,10 +424,14 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
         }
     }
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    // On a list selection (navy in Light) every mark takes the selection's ink.
+    // On a list selection (navy in Light) every mark takes the selection's ink. While the page waits (an editor
+    // holds it) Light shows Windows 98's inactive selection, unfaded: a grey bar with white text.
     const bool onSel = selected && list;
-    const ImU32 ink = onSel ? pal::ListSelInk : (live ? pal::Ink : pal::InkFaint);
-    const ImU32 dim = onSel ? pal::ListSelInk : pal::InkDim;
+    const bool inactiveSel = onSel && (ImGui::GetItemFlags() & ImGuiItemFlags_Disabled) != 0;
+    if (inactiveSel) ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 1.0f);
+    const ImU32 selInk = inactiveSel ? pal::BevelHi : pal::ListSelInk;
+    const ImU32 ink = onSel ? selInk : (live ? pal::Ink : pal::InkFaint);
+    const ImU32 dim = onSel ? selInk : pal::InkDim;
     const bool cards = Shape().cardSidebar;   // cards (Gray)
     if (cards) {
         const float m = Snap(Px(10)), gy = Snap(Px(3)), rr = Snap(Px(Shape().panelRounding));
@@ -425,7 +439,7 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
         dl->AddRectFilled(ca, cb, Col(selected ? pal::ListSel : (hovered ? pal::Hover : pal::Panel)), rr);
         dl->AddRect(ca, cb, Col(selected ? pal::Accent : pal::PanelEdge), rr);
     } else if (selected) {
-        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), Col(pal::ListSel));
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), Col(inactiveSel ? pal::BevelShadow : pal::ListSel));
         if (!list) dl->AddRectFilled(p, ImVec2(p.x + Snap(Px(3)), p.y + h), Col(pal::Accent));
     } else if (hovered && !list) {
         dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), Col(pal::Hover));
@@ -466,7 +480,7 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
         const float d = Snap(Px(7));
         float x = Snap(p.x + pad);
         for (Light l : { cal, lut }) {
-            DrawLight(dl, ImVec2(x + d * 0.5f, Snap(cy)), l, d, onSel ? pal::ListSelInk : 0);
+            DrawLight(dl, ImVec2(x + d * 0.5f, Snap(cy)), l, d, onSel ? selInk : 0);
             x += Shape().bevel ? Snap(d * 1.45f + Px(6)) : d + Snap(Px(5));   // Windows 98 checks are wider than dots
         }
         if (r.widthPx > 0) {
@@ -477,9 +491,10 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
         if (r.reminderDue) {   // right-aligned under the mode badge: nothing else moves
             const char* due = "RECAL";
             const float dueW = MeasureInk(Font::Label, kSizeLabel, due).advance;
-            TextAt(Font::Label, kSizeLabel, onSel ? pal::ListSelInk : pal::Alarm, p.x + w - pad - dueW, cy, due);
+            TextAt(Font::Label, kSizeLabel, onSel ? selInk : pal::Alarm, p.x + w - pad - dueW, cy, due);
         }
     }
+    if (inactiveSel) ImGui::PopStyleVar();
     ImGui::PopID();
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
     ImGui::Dummy(ImVec2(0, 0));
@@ -834,9 +849,11 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     EndRow(row);
 
     row = BeginRow("FINE-TUNE");
+    ImGui::BeginDisabled(mhc.bypassGrayscale);
     const int b = RowButtons(row, "gs", { "EDIT CURVE\xE2\x80\xA6", "RESET" });
+    ImGui::EndDisabled();
     if (b == 0) {
-        PostTo(r, [hdr](int mon) { RunClassicCommand(mon, hdr ? ID_MHC_HDR_GS_EDIT : ID_MHC_SDR_GS_EDIT); });
+        OpenGsEditor(vs, r, hdr);
     } else if (b == 1) {
         const DisplayRow target = r;
         Ask(vs, "RESET FINE-TUNE?", "Returns every point to neutral.", "RESET", [target, hdr]() {
@@ -1167,7 +1184,9 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         ImGui::SetCursorScreenPos(body);
         ImGui::BeginChild("##sidebar", ImVec2(sideW, bodyH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
     }
+    ImGui::BeginDisabled(vs.gsEdit.open);   // the editor holds its display until DONE / CANCEL
     DrawSidebar(snap, vs, sel);
+    ImGui::EndDisabled();
     ImGui::EndChild();
     if (!Shape().sunkenSidebar)
         dl->AddRectFilled(ImVec2(body.x + sideW - 1, body.y), ImVec2(body.x + sideW, body.y + bodyH), Col(pal::Rule));
@@ -1203,7 +1222,9 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         const ImU32 dots[2] = { !parked && liveHdr ? pal::Good : 0u, !parked && !liveHdr ? pal::Good : 0u };
         const float segW = 72.0f;
         ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Snap(Px(segW)) * 2), Snap(cy - Snap(Px(kControlH)) * 0.5f)));
+        ImGui::BeginDisabled(vs.gsEdit.open);
         const int pick = Segmented("##mode", kModes, 2, showHdr ? 0 : 1, segW, dots);
+        ImGui::EndDisabled();
         if (pick == 0) vs.showOtherMode = !liveHdr;
         else if (pick == 1) vs.showOtherMode = liveHdr;
         const ImVec2 ga = ImGui::GetItemRectMin(), gb = ImGui::GetItemRectMax();
@@ -1223,8 +1244,17 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     if (!st) {
         for (const Stage& s : path) if (s.selectable) { vs.stage = s.id; st = &s; break; }
     }
+    ImGui::BeginDisabled(vs.gsEdit.open);
     DrawPixelPath(path, vs);
+    ImGui::EndDisabled();
     ImGui::Dummy(ImVec2(0, Px(20)));
+
+    // The grayscale editor, while open, takes the place of both panels.
+    if (vs.gsEdit.open) {
+        DrawGsEditor(snap, vs, ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetContentRegionAvail().y));
+        ImGui::EndChild();
+        return;
+    }
 
     // The selected node's panel, and the measured panel beside it; in a narrow window the measured panel
     // goes under it (both fit their content and the column scrolls).
@@ -1871,7 +1901,11 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     ImGui::Begin("##root", nullptr, flags);
     ImGui::PopStyleVar(2);
 
-    DrawHeader(snap, vs, busy);
+    // The editor drives arrow keys itself: ImGui's keyboard navigation would move focus with them.
+    ImGuiIO& io = ImGui::GetIO();
+    if (vs.gsEdit.open) io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
+    else io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    DrawHeader(snap, vs, busy || vs.gsEdit.open);
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
     SetLogRedraws(vs.page == Page::Events && vs.log.allOutput);   // diagnostic lines redraw only here

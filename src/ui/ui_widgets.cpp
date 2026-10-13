@@ -610,14 +610,16 @@ void EndFieldText(const FieldText& ft) {
 
 }  // namespace
 
-bool NumberInput(const char* id, float* v, const char* fmt, float widthDip) {
+void DrawFieldBox(ImDrawList* dl, ImVec2 a, ImVec2 b, bool hovered, bool active) { DrawField(dl, a, b, hovered, active); }
+
+bool NumberInput(const char* id, float* v, const char* fmt, float widthDip, float fontSizeDip) {
     // The draft lives across frames while the field is active: ImGui writes the parsed text into it as
     // the user types, and the value is handed back only when the field is left.
     static ImGuiStorage drafts;
     const ImGuiID key = ImGui::GetID(id);
     float* draft = drafts.GetFloatRef(key, *v);
     if (ImGui::GetActiveID() != key) *draft = *v;
-    const FieldText ft = BeginFieldText(key, widthDip, Font::Mono, kSizeMono);
+    const FieldText ft = BeginFieldText(key, widthDip, Font::Mono, fontSizeDip);
     ImGui::InputFloat(id, draft, 0.0f, 0.0f, fmt);
     const bool commit = ImGui::IsItemDeactivatedAfterEdit();
     EndFieldText(ft);

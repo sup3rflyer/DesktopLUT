@@ -3,10 +3,12 @@
 #include "ui/ui_theme.h"
 #include "ui/ui_widgets.h"
 #include "actions/notify.h"
+#include "ui/ui_gscurve.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
 #include <wincodec.h>
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -254,6 +256,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "bypassprim", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 1 },
         { "suspended", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 2 },
         { "fald", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1 },
+        { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
+        { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
     };
     const float scales[] = { 1.0f, 1.5f };
     int written = 0;
@@ -282,6 +286,29 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.page = shot.page;
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
+                if (shot.variant == 3 || shot.variant == 4) {
+                    // The grayscale editor, drawn without a live edit: HDR 20 points (gray), SDR 32 points (R).
+                    const bool hdr = shot.variant == 3;
+                    ui::GsEditorState& ed = vs.gsEdit;
+                    ed.open = true;
+                    ed.renderOnly = true;
+                    ed.hdr = hdr;
+                    ed.mon = shot.display;
+                    ed.codeCap = 1023;
+                    ed.bakePeakNits = ed.curvePeakNits = 1612.0f;
+                    ed.work.pointCount = hdr ? 20 : 32;
+                    ed.work.points.resize(ed.work.pointCount);
+                    if (hdr) ed.work.initLinearPQ(); else ed.work.initLinear();
+                    for (int i = 1; i < ed.work.pointCount; i++) {
+                        const float x = (float)i;
+                        ui::SetGsPointPercent(ed.work, i, hdr, ui::GsChannel::Gray, 1.8f * std::sin(0.45f * x) - 0.6f);
+                        ui::SetGsPointPercent(ed.work, i, hdr, ui::GsChannel::R, 1.8f * std::sin(0.45f * x) - 0.6f + 1.2f * std::cos(0.35f * x));
+                        ui::SetGsPointPercent(ed.work, i, hdr, ui::GsChannel::B, 1.8f * std::sin(0.45f * x) - 0.6f - 0.9f * std::sin(0.25f * x));
+                    }
+                    ed.channel = hdr ? ui::GsChannel::Gray : ui::GsChannel::R;
+                    ed.zoom = 0;
+                    ed.selected = hdr ? 7 : 12;
+                }
                 if (shot.confirm) {
                     vs.confirm = { "REMOVE PROFILE?", "Deletes the calibration profile and its cached variants.", "REMOVE", nullptr };
                     vs.confirmOpenRequested = true;

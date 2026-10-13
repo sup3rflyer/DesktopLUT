@@ -56,6 +56,8 @@ namespace pal {
     inline ImU32 BevelHi, BevelLight, BevelShadow, BevelDark;
     // A layer's "on" light; the live-layers switch when on, and its knob
     inline ImU32 LightOn, SwitchOn, SwitchKnob;
+    // Plots: the scale lines and the zero / selected line (quieter than structural rules on a white field)
+    inline ImU32 PlotGrid, PlotAxis;
 }
 
 // Shape rules of the current theme.
@@ -69,6 +71,7 @@ struct ThemeShape {
     bool sunkenSidebar;      // the display list in a sunken white list box (Light)
     bool cardSidebar;        // the display list as cards (Gray)
     bool pathStrip;          // the pixel path in a strip, chevrons between stages (Gray)
+    bool lightPlots;         // plots sit on a white field: curve tints darkened and weak ones boosted (Light)
 };
 
 ThemeId CurrentTheme();
