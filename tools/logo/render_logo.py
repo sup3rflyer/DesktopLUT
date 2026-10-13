@@ -69,6 +69,9 @@ SPHERE_RAISE = 0.08          # cloud centre above the cube centre, so the white-
 CLOUD_BLUR = 0.18            # Gaussian sigma of the haze
 CLOUD_DENSITY = 2.5          # haze opacity: alpha' = 1 - (1 - alpha)^density
 CLOUD_VALUE = 0.5            # 0 = blends are the plain average, 1 = lifted to full value
+TOP_THIN = 0.35              # the haze thins by this much at the green face's far corner,
+TOP_THIN_RADIUS = 0.45       # fading out over this distance (fraction of R), so the back
+                             # edge to that corner shows through
 
 # Back edges (the three hidden edges of the box) -----------------------------
 # Crisp black lines behind the cloud: sharp wherever the cloud does not reach,
@@ -361,6 +364,10 @@ def cloud(geo, ss):
     value = m + CLOUD_VALUE * (1.0 - m)
     colour = colour * value[..., None]
     a = 1.0 - np.power(1.0 - a, CLOUD_DENSITY)
+    if TOP_THIN > 0:
+        yy, xx = np.mgrid[0:geo.size, 0:geo.size] + 0.5
+        u = np.clip(1.0 - np.hypot(xx - geo.G[0], yy - geo.G[1]) / (TOP_THIN_RADIUS * geo.radius), 0.0, 1.0)
+        a = a * (1.0 - TOP_THIN * u * u * (3.0 - 2.0 * u))
     a = np.where(a < 1e-6, 0.0, a)
     return colour, a
 

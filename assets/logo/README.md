@@ -7,7 +7,7 @@ A hazy cloud of mixed red, green and blue light inside a black-framed glass box:
   1. **Flat RGB mix.** Three hard-edged circles of light are added channel by channel: green up, blue lower left, red lower right. Each pair overlaps in a lens pointing at the box's C, Y or M corner, giving cyan, yellow and magenta. The three lenses form an upside-down triquetra, and all three circles overlap in a white middle, so the secondaries touch each other only through that middle. The cloud is the circles' union, not a disc.
   2. **Wrapped onto a sphere.** The mix is wrapped onto the front of a sphere inside the box and seen straight on, so the middle bulges and the rim compresses. The wrap is partial (`SPHERE_BULGE` 0.6), so it reads as a roundish cloud, not a ball. The cloud sits slightly above the cube centre (`SPHERE_RAISE`), so its light middle spills a little onto the green face.
   3. **Blurred into haze.** A Gaussian blur on premultiplied colour does the mixing. Every boundary becomes a plain additive blend, and the middle, where all six colours meet, becomes a light grey-white. Blends are lifted halfway back toward full value (`CLOUD_VALUE`), so they do not turn muddy, and the haze is made less transparent (`CLOUD_DENSITY`).
-- **Empty box.** The cloud stops short of the box's corners and seams, which stay transparent. The haze is the only softness in the mark: there is no glass rim, highlight or edge clearing.
+- **Empty box.** The cloud stops short of the box's corners and seams, which stay transparent. Toward the green face's far corner the haze thins a little more (`TOP_THIN`), so the back edge to that corner shows through. The haze is the only softness in the mark: there is no glass rim, highlight or edge clearing.
 - **Back edges.** The three hidden edges from the black corner are crisp black lines behind the cloud. They are sharp where the cloud does not reach and fade only under the haze.
 - **Inverted variant** (`logo_inv_*`, `DesktopLUT-active_new.ico`): colour-inverted cloud, with a white frame and white back edges. It is used for the "active" tray icon.
 
@@ -44,6 +44,7 @@ The generator needs only Pillow and numpy, and its output is deterministic. Ever
 | `CLOUD_BLUR` | 0.18 | Gaussian sigma of the haze, fraction of R |
 | `CLOUD_DENSITY` | 2.5 | haze opacity: alpha' = 1 - (1 - alpha)^density |
 | `CLOUD_VALUE` | 0.5 | 0 = blends are the plain average, 1 = lifted to full value |
+| `TOP_THIN`, `TOP_THIN_RADIUS` | 0.35, 0.45 | haze thinning at the green face's far corner, and how far it reaches (fraction of R) |
 | `BACK_EDGE_WIDTH` | 0.82 | back-edge line width, in frame widths |
 | `SMALL` | per size | hinting for 16–64 px |
 
