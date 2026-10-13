@@ -280,31 +280,9 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
         }
         // Peak nits is display metadata, needed regardless of file type (set above via
         // MhcProfileMetadataPeakNits = baseGrayscale.peakNits on this branch).
-    } else if (mhc.baseGrayscale.enabled) {
-        // Safety: if points are empty (e.g., dialog set enabled=true without init), use identity
-        if (mhc.baseGrayscale.points.empty()) {
-            params.grayscaleEnabled = false;
-            params.grayscale.enabled = false;
-        } else {
-            params.grayscaleEnabled = true;
-            params.grayscale.enabled = true;
-            params.grayscale.pointCount = mhc.baseGrayscale.pointCount;
-            for (int i = 0; i < mhc.baseGrayscale.pointCount && i < 32; i++) {
-                params.grayscale.points[i] = (i < (int)mhc.baseGrayscale.points.size())
-                    ? mhc.baseGrayscale.points[i] : 0.0f;
-                // Compute per-channel values from base * deviation
-                float base = params.grayscale.points[i];
-                float devR = (i < (int)mhc.baseGrayscale.rgbDeviations[0].size()) ? mhc.baseGrayscale.rgbDeviations[0][i] : 1.0f;
-                float devG = (i < (int)mhc.baseGrayscale.rgbDeviations[1].size()) ? mhc.baseGrayscale.rgbDeviations[1][i] : 1.0f;
-                float devB = (i < (int)mhc.baseGrayscale.rgbDeviations[2].size()) ? mhc.baseGrayscale.rgbDeviations[2][i] : 1.0f;
-                params.grayscale.pointsR[i] = base * devR;
-                params.grayscale.pointsG[i] = base * devG;
-                params.grayscale.pointsB[i] = base * devB;
-            }
-            params.grayscale.use24Gamma = mhc.baseGrayscale.use24Gamma;
-            params.grayscale.peakNits = mhc.baseGrayscale.peakNits;
-            // params.peakNits = baseGrayscale.peakNits (set above via MhcProfileMetadataPeakNits)
-        }
+    } else {
+        // params.peakNits = baseGrayscale.peakNits when enabled (set above via MhcProfileMetadataPeakNits)
+        SetMhcBaseParams(mhc.baseGrayscale, params);
     }
 
     // Desktop gamma (HDR only): sRGB→2.2 baked into 1D LUT, referenced to the display's SDR white level
@@ -316,6 +294,32 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
     // Correction grayscale (fine-tuning on top of base)
     SetMhcCorrectionParams(mhc.correctionGrayscale, params);
     return true;
+}
+
+void SetMhcBaseParams(const GrayscaleSettings& base, MHC2ProfileParams& params) {
+    if (!base.enabled) return;
+    // Safety: if points are empty (e.g., dialog set enabled=true without init), use identity
+    if (base.points.empty()) {
+        params.grayscaleEnabled = false;
+        params.grayscale.enabled = false;
+        return;
+    }
+    params.grayscaleEnabled = true;
+    params.grayscale.enabled = true;
+    params.grayscale.pointCount = base.pointCount;
+    for (int i = 0; i < base.pointCount && i < 32; i++) {
+        params.grayscale.points[i] = (i < (int)base.points.size()) ? base.points[i] : 0.0f;
+        // Compute per-channel values from base * deviation
+        float b = params.grayscale.points[i];
+        float devR = (i < (int)base.rgbDeviations[0].size()) ? base.rgbDeviations[0][i] : 1.0f;
+        float devG = (i < (int)base.rgbDeviations[1].size()) ? base.rgbDeviations[1][i] : 1.0f;
+        float devB = (i < (int)base.rgbDeviations[2].size()) ? base.rgbDeviations[2][i] : 1.0f;
+        params.grayscale.pointsR[i] = b * devR;
+        params.grayscale.pointsG[i] = b * devG;
+        params.grayscale.pointsB[i] = b * devB;
+    }
+    params.grayscale.use24Gamma = base.use24Gamma;
+    params.grayscale.peakNits = base.peakNits;
 }
 
 void SetMhcCorrectionParams(const GrayscaleSettings& gs, MHC2ProfileParams& params) {

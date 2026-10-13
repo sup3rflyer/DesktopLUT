@@ -32,6 +32,10 @@ float GsCurvePercentAt(float t, const GsCurve& c, GsChannel ch);
 
 // A point's value as its fader shows it, and back. Set returns false when the point cannot carry it (a
 // channel of point 0 while the gray point is at black: no output to scale). Values clamp to ±kGsMaxPercent.
+// The curve with `newCount` points (10 / 20 / 32), its shape kept: every new point takes the value the current
+// curve has there (each channel, the bake's own interpolation), so changing the count does not reset the edit.
+GrayscaleSettings ResampleGs(const GrayscaleSettings& gs, int newCount, bool hdr, float bakePeakNits);
+
 float GsPointPercent(const GrayscaleSettings& gs, int i, bool hdr, GsChannel ch);
 bool SetGsPointPercent(GrayscaleSettings& gs, int i, bool hdr, GsChannel ch, float percent);
 // The point back at identity (gray: the point; a channel: its deviation to 1).

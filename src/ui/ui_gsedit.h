@@ -19,8 +19,12 @@ struct Snapshot;
 struct DisplayRow;
 struct ViewState;
 
+// Which of the Grayscale stage's two curves the editor edits: the profile's base curve or the fine-tune on top.
+enum class GsTarget { FineTune, Base };
+
 struct GsEditorState {
     bool open = false;          // the editor shows (its live edit began)
+    GsTarget target = GsTarget::FineTune;
     int mon = -1;
     bool hdr = false;
     std::wstring rowKey;        // the display it belongs to (sidebar row id)
@@ -33,11 +37,12 @@ struct GsEditorState {
     PatchSize patch = PatchSize::Off;   // the measurement patch on the edited display (follows the selection)
     int selected = -1;          // the selected point
     float dragAccum = 0.0f;
+    int pendingCount = 0;       // a point count picked this frame, applied once the frame is drawn (0 = none)
     bool renderOnly = false;    // drawn without a live edit (the screenshot test); never set by the interface
 };
 
-// The FINE-TUNE row's EDIT CURVE: begins the live edit (posted) and opens the editor.
-void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr);
+// The BASE / FINE-TUNE rows' EDIT CURVE: begins the live edit of that curve (posted) and opens the editor.
+void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr, GsTarget target = GsTarget::FineTune);
 // The editor, filling `sizePx` at the cursor.
 void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx);
 // Ends an open edit (window hidden, app exiting): the edits stay, as closing the classic editor kept them.

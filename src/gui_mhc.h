@@ -192,6 +192,9 @@ void SwapDgForAllMonitors(bool dgEnabled);
 // The correction grayscale fields of a profile's params, exactly as BuildMHC2Params sets them (only when the
 // curve is enabled and has points; otherwise the params are left as they are).
 void SetMhcCorrectionParams(const GrayscaleSettings& correction, MHC2ProfileParams& params);
+// The base curve's fields, exactly as BuildMHC2Params sets them for a profile without an imported source file (an
+// enabled curve; an enabled but empty one is identity; a disabled one leaves the params as they are).
+void SetMhcBaseParams(const GrayscaleSettings& base, MHC2ProfileParams& params);
 
 // Install + associate (as the mode's default) a transient identity profile carrying `mhc`'s luminance metadata
 // (the PERM_NOPRIM | PERM_NOGRAY variant's fields), so scanout does nothing while the overlay applies the profile.

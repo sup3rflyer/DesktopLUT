@@ -13,9 +13,10 @@
 namespace act {
 
 // False (with a notice) when another edit, a calibration or an MHC dialog is in progress, when the display is not
-// in this mode, or when the mode has no installed profile (nothing would be baked).
-bool BeginGsEdit(int mon, bool hdr);
-// Writes the curve into the display's correction grayscale and recomposes the preview.
+// in this mode, or when the mode has no installed profile (nothing would be baked). `base`: the profile's base curve
+// instead of the fine-tune (refused when an imported file supplies the base).
+bool BeginGsEdit(int mon, bool hdr, bool base = false);
+// Writes the curve into the display's edited curve (fine-tune or base) and recomposes the preview.
 void PreviewGsEdit(const GrayscaleSettings& gs);
 // Ends the edit: keep = the previewed curve stays (re-baked), else the curve from before Begin returns.
 void EndGsEdit(bool keep);

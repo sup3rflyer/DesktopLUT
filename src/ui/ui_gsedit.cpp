@@ -178,17 +178,18 @@ bool HandleKeys(GsEditorState& ed, int n) {
 
 }  // namespace
 
-void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr) {
+void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr, GsTarget target) {
     GsEditorState* ed = &vs.gsEdit;   // the view state outlives every posted command
     const std::wstring key = RowIdOf(r);
     const int codeCap = r.mode == Mode::SDR ? 255 : 1023;
-    PostToDisplay(r, [ed, hdr, key, codeCap](int mon) {
-        if (!act::BeginGsEdit(mon, hdr)) return;
+    PostToDisplay(r, [ed, hdr, key, codeCap, target](int mon) {
+        if (!act::BeginGsEdit(mon, hdr, target == GsTarget::Base)) return;
         const int step = ed->step;   // the key step and the patch are kept between edits
         const PatchSize patch = ed->patch;
         *ed = GsEditorState{};
         ed->patch = patch;
         ed->open = true;
+        ed->target = target;
         ed->mon = mon;
         ed->hdr = hdr;
         ed->rowKey = key;
@@ -197,7 +198,7 @@ void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr) {
         {
             std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
             const MHCSettings& m = hdr ? g_gui.monitorSettings[(size_t)mon].hdrMHC : g_gui.monitorSettings[(size_t)mon].sdrMHC;
-            ed->work = m.correctionGrayscale;
+            ed->work = target == GsTarget::Base ? m.baseGrayscale : m.correctionGrayscale;
             ed->bakePeakNits = MhcProfileMetadataPeakNits(m, hdr);
         }
         ed->zoom = FittingZoom(ed->work, hdr);
@@ -218,7 +219,8 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     const bool hdr = ed.hdr;
     if (ed.selected >= n) ed.selected = n - 1;
     char title[64];
-    snprintf(title, sizeof(title), "FINE-TUNE  \xC2\xB7  %s  \xC2\xB7  %d POINTS", hdr ? "HDR" : "SDR", n);
+    snprintf(title, sizeof(title), "%s  \xC2\xB7  %s  \xC2\xB7  %d POINTS", ed.target == GsTarget::Base ? "BASE" : "FINE-TUNE",
+             hdr ? "HDR" : "SDR", n);
     BeginPanel("##gsedit", title, nullptr, sizePx);
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 origin(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
@@ -469,9 +471,24 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
                 ImGui::SetTooltip("A patch at the selected point's level on the display being edited, for the meter.\n"
                                   "It goes through the whole pipeline, the live edit included. 10 %%: a window on black. Esc closes it.");
         }
+        // The point count: changing it keeps the curve's shape (each new point takes the curve's value there).
+        const float row4y = Snap(row3y + Px(kControlH) + Px(8));
+        {
+            DrawText(dl, Font::Label, kSizeLabel, ax0, row4y + Px(kControlH) * 0.5f, pal::InkDim, "POINTS");
+            const float segX = Snap(ax0 + Px(52));
+            ImGui::SetCursorScreenPos(ImVec2(segX, row4y));
+            static const char* const kCounts[] = { "10", "20", "32" };
+            static const int kCountValues[] = { 10, 20, 32 };
+            const int cur = n == 10 ? 0 : (n == 20 ? 1 : (n == 32 ? 2 : -1));
+            const int pick = Segmented("##gs_points", kCounts, 3, cur, 40);
+            if (pick >= 0 && kCountValues[pick] != n) ed.pendingCount = kCountValues[pick];
+            if (ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) && ImGui::IsWindowHovered())
+                ImGui::SetTooltip("Points on the curve. The shape stays: each new point takes the curve's value there.\n"
+                                  "CANCEL restores the count too.");
+        }
         // The four faders.
         const float colW = (ax1 - ax0) / 4.0f;
-        const float labelY = row3y + Px(kControlH) + Px(16);
+        const float labelY = row4y + Px(kControlH) + Px(16);
         const float trackTop = labelY + Px(12), trackBottom = sb.y - pad - Px(kControlH) - Px(12);
         if (ed.selected >= 0 && trackBottom - trackTop > Px(40)) {
             auto ySt = [&](float pct) { return trackTop + (trackBottom - trackTop) * (0.5f - pct / (2.0f * zoom)); };
@@ -529,6 +546,14 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             x += DrawText(dl, Font::Mono, 11.0f, x, cy, pal::InkDim, h.keys) + Px(6);
             x += DrawText(dl, Font::Label, 11.0f, x, cy, pal::InkFaint, h.what) + Px(18);
         }
+    }
+    // A new point count, once nothing in this frame indexes the old one: resampled (the shape stays).
+    if (ed.pendingCount) {
+        ed.work = ResampleGs(ed.work, ed.pendingCount, hdr, ed.bakePeakNits);
+        const int nn = ed.work.pointCount;
+        if (ed.selected >= 0 && n > 1) ed.selected = (int)std::lround((float)ed.selected * (float)(nn - 1) / (float)(n - 1));
+        ed.pendingCount = 0;
+        changed = true;
     }
     if (changed) {
         Preview(ed);

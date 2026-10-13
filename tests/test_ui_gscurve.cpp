@@ -168,3 +168,35 @@ TEST_CASE("gs editor: the patch shows the input the point's label names") {
     CHECK(mid == doctest::Approx(PqEOTF(GsSlotT(10, 20) * pq) * 10000.0f).epsilon(1e-5));
     CHECK(std::to_string((int)std::lround(mid)) == GsPointLabel(10, 20, true, pq, 1023));
 }
+
+TEST_CASE("gs editor: a new point count keeps the curve's shape (every channel, at every new point)") {
+    for (bool hdr : { false, true }) {
+        CAPTURE(hdr);
+        const float peak = 1612.0f;
+        GrayscaleSettings gs = Curve(20, hdr);
+        Shape(gs, hdr);
+        SetGsPointPercent(gs, 0, hdr, GsChannel::Gray, 0.4f);   // a lifted black (additive)
+        const GsCurve before = MakeGsCurve(gs, hdr, peak);
+        CHECK(ResampleGs(gs, 20, hdr, peak).points == gs.points);   // same count: untouched
+        for (int nn : { 10, 32 }) {
+            CAPTURE(nn);
+            const GrayscaleSettings out = ResampleGs(gs, nn, hdr, peak);
+            REQUIRE(out.pointCount == nn);
+            REQUIRE((int)out.points.size() == nn);
+            for (const auto& d : out.rgbDeviations) REQUIRE((int)d.size() == nn);
+            const GsCurve after = MakeGsCurve(out, hdr, peak);
+            for (int i = 0; i < nn; i++) {
+                const float t = GsSlotT(i, nn);
+                for (GsChannel ch : { GsChannel::Gray, GsChannel::R, GsChannel::G, GsChannel::B }) {
+                    CAPTURE(i);
+                    CHECK(GsCurvePercentAt(t, after, ch) == doctest::Approx(GsCurvePercentAt(t, before, ch)).epsilon(1e-4));
+                }
+            }
+        }
+        // An identity curve stays identity at any count.
+        const GrayscaleSettings id = ResampleGs(Curve(20, hdr), 32, hdr, peak);
+        for (int i = 0; i < 32; i++)
+            for (GsChannel ch : { GsChannel::Gray, GsChannel::R, GsChannel::G, GsChannel::B })
+                CHECK(std::fabs(GsPointPercent(id, i, hdr, ch)) < 1e-3f);
+    }
+}

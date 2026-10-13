@@ -20,6 +20,7 @@ struct GsEdit {
     bool active = false;
     int mon = -1;
     bool hdr = false;
+    bool base = false;                     // the base curve (else the fine-tune)
     GrayscaleSettings before;              // restored on cancel
     bool startedForPreview = false;        // this edit started processing / the overlay: stop it after
     bool startedOverlayForPreview = false;
@@ -33,6 +34,8 @@ MHCSettings& MhcOf(int mon, bool hdr) {
     return hdr ? ms.hdrMHC : ms.sdrMHC;
 }
 
+GrayscaleSettings& CurveOf(MHCSettings& m, bool base) { return base ? m.baseGrayscale : m.correctionGrayscale; }
+
 // Undoes Begin's processing start (a failed Begin, or End).
 void StopPreviewProcessing(const GsEdit& e) {
     if (e.startedForPreview) StopProcessing();
@@ -44,7 +47,7 @@ void StopPreviewProcessing(const GsEdit& e) {
 
 }  // namespace
 
-bool BeginGsEdit(int mon, bool hdr) {
+bool BeginGsEdit(int mon, bool hdr, bool base) {
     if (g_edit.active || !ValidMonitor(mon)) return false;
     if (IsCalibrationOrLiveEditActive() || g_mhcEditDialogOpen.load() || MhcPreviewActive()) {
         notify::Post(notify::Sev::Warning, mon, L"mhc", L"Another edit or a calibration is in progress");
@@ -54,10 +57,16 @@ bool BeginGsEdit(int mon, bool hdr) {
     e.pin = std::make_unique<MonitorSettingsPin>();
     e.mon = mon;
     e.hdr = hdr;
+    e.base = base;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         MHCSettings& m = MhcOf(mon, hdr);
-        GrayscaleSettings& gs = m.correctionGrayscale;
+        if (base && !m.sourceFilePath.empty()) {
+            // The imported file supplies the base: the bake ignores the base curve, so there is nothing to edit.
+            notify::Post(notify::Sev::Warning, mon, L"mhc", L"The base curve comes from the imported file");
+            return false;
+        }
+        GrayscaleSettings& gs = CurveOf(m, base);
         if (gs.points.empty() || (int)gs.points.size() != gs.pointCount) {
             gs.points.resize(gs.pointCount);
             if (hdr) gs.initLinearPQ(); else gs.initLinear();
@@ -72,6 +81,10 @@ bool BeginGsEdit(int mon, bool hdr) {
     const bool livePreview = ReadyMhcPreviewDisplay(mon, hdr, e.startedForPreview, e.startedOverlayForPreview);
     std::wstring why = L"The display is not in this mode";
     if (!livePreview || !BeginMhcPreview(mon, hdr, e.preview, &why)) {
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);   // the edit did not start: the curve as it was
+            if (ValidMonitor(mon)) CurveOf(MhcOf(mon, hdr), base) = e.before;
+        }
         StopPreviewProcessing(e);
         notify::Post(notify::Sev::Warning, mon, L"mhc", L"Live edit unavailable: " + why);
         return false;
@@ -85,11 +98,16 @@ bool BeginGsEdit(int mon, bool hdr) {
 
 void PreviewGsEdit(const GrayscaleSettings& gs) {
     if (!g_edit.active) return;
+    GrayscaleSettings correction;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        if (ValidMonitor(g_edit.mon)) MhcOf(g_edit.mon, g_edit.hdr).correctionGrayscale = gs;
+        if (!ValidMonitor(g_edit.mon)) return;
+        MHCSettings& m = MhcOf(g_edit.mon, g_edit.hdr);
+        CurveOf(m, g_edit.base) = gs;
+        correction = m.correctionGrayscale;
     }
-    UpdateMhcPreview(g_edit.preview, gs);
+    if (g_edit.base) UpdateMhcPreviewBase(g_edit.preview, gs, correction);
+    else UpdateMhcPreview(g_edit.preview, gs);
 }
 
 void EndGsEdit(bool keep) {
@@ -98,7 +116,7 @@ void EndGsEdit(bool keep) {
     const bool hdr = g_edit.hdr;
     if (!keep) {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        if (ValidMonitor(mon)) MhcOf(mon, hdr).correctionGrayscale = g_edit.before;
+        if (ValidMonitor(mon)) CurveOf(MhcOf(mon, hdr), g_edit.base) = g_edit.before;
     }
     // The overlay stops applying the profile, the bake puts the real one (with the kept or restored curve) on
     // scanout, and only then is the identity profile dropped: never a frame with nothing associated.

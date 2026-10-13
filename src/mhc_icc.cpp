@@ -519,7 +519,6 @@ bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out) {
     // SDR: 1024 entries (sRGB signal, sufficient for 8-bit output)
     // HDR: 4096 entries (PQ signal needs more precision at low luminance due to steep slope)
     out.lutSize = params.isHDR ? 4096 : 1024;
-    const int lutSize = out.lutSize;
 
     // Matrix (source primaries: see GenerateMHC2Profile).
     const DisplayPrimariesData srcPrim = MhcSourcePrimaries(params);
@@ -552,6 +551,13 @@ bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out) {
         }
     }
 
+    return ComputeMhcScanoutBaseLuts(params, out);
+}
+
+bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out) {
+    out.isHDR = params.isHDR;
+    out.lutSize = params.isHDR ? 4096 : 1024;
+    const int lutSize = out.lutSize;
     for (auto& l : out.lut) l.assign(lutSize, 0.0f);
     float* lutR = out.lut[0].data();
     float* lutG = out.lut[1].data();

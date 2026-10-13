@@ -70,6 +70,31 @@ float GsCurvePercentAt(float t, const GsCurve& c, GsChannel ch) {
     return (out / identity - 1.0f) * 100.0f;
 }
 
+GrayscaleSettings ResampleGs(const GrayscaleSettings& gs, int newCount, bool hdr, float bakePeakNits) {
+    if (newCount == gs.pointCount || newCount < 2 || newCount > 32) return gs;
+    GrayscaleSettings src = gs;
+    EnsureSized(src, hdr);
+    const GsCurve c = MakeGsCurve(src, hdr, bakePeakNits);
+    GrayscaleSettings out = gs;
+    out.pointCount = newCount;
+    out.points.assign(newCount, 0.0f);
+    for (auto& d : out.rgbDeviations) d.assign(newCount, 1.0f);
+    for (int i = 0; i < newCount; i++) {
+        const float t = GsSlotT(i, newCount);
+        const float identity = GsIdentity(t, hdr);
+        // In point units, as SetGsPointPercent stores them (black additive).
+        auto valueOf = [&](GsChannel ch) {
+            const float pct = GsCurvePercentAt(t, c, ch);
+            return i == 0 ? pct / 100.0f : identity * (1.0f + pct / 100.0f);
+        };
+        const float gray = Clamp(valueOf(GsChannel::Gray), 0.0f, 1.0f);
+        out.points[i] = gray;
+        for (int ch = 0; ch < 3; ch++)
+            out.rgbDeviations[ch][i] = gray > 1e-6f ? Clamp(valueOf((GsChannel)ch) / gray, 1.0f - kGsMaxPercent / 100.0f, 1.0f + kGsMaxPercent / 100.0f) : 1.0f;
+    }
+    return out;
+}
+
 float GsPointPercent(const GrayscaleSettings& gs, int i, bool hdr, GsChannel ch) {
     const int n = gs.pointCount;
     if (i < 0 || i >= n) return 0.0f;

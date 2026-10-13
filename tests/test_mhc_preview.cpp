@@ -232,6 +232,48 @@ TEST_CASE("MHC preview: from the settings, the preview composes exactly what the
     }
 }
 
+TEST_CASE("MHC preview: an edited BASE curve previews exactly what the bake installs") {
+    for (bool hdr : { false, true }) {
+        CAPTURE(hdr);
+        MHCSettings m = FullSettings();   // a base from points (no imported file), a fine-tune, WB, DG
+        m.baseGrayscale.peakNits = 1450.0f;
+        auto check = [&](const MHCSettings& prepared, const MHCSettings& edited) {
+            MhcPreviewSession s;
+            REQUIRE(PrepareMhcPreview(prepared, hdr, 0, s));
+            MhcScanout preview, bake;
+            ComposeMhcPreviewBase(s, edited.baseGrayscale, edited.correctionGrayscale, preview);
+            MHC2ProfileParams bp;
+            REQUIRE(BuildMHC2ParamsForPerm(edited, hdr, 0, ComputeMhcPermutation(edited, hdr), bp));
+            REQUIRE(ComputeMhcScanout(bp, bake));
+            CheckScanoutsIdentical(preview, bake);
+            std::vector<uint8_t> file;
+            REQUIRE(GenerateMHC2Profile(bp, file));
+            CheckFileCarries(file, preview);
+        };
+        SUBCASE("points and channels edited") {
+            MHCSettings e = m;
+            e.baseGrayscale.points[4] *= 1.05f;
+            e.baseGrayscale.points[13] *= 0.96f;
+            e.baseGrayscale.rgbDeviations[1][9] = 1.03f;
+            check(m, e);
+        }
+        SUBCASE("a base switched on by the edit (the HDR peak follows it)") {
+            MHCSettings off = m;
+            off.baseGrayscale.enabled = false;
+            MHCSettings e = m;
+            e.baseGrayscale.points[7] *= 1.04f;
+            check(off, e);
+        }
+        SUBCASE("a new point count") {
+            MHCSettings e = m;
+            e.baseGrayscale.pointCount = 32;
+            e.baseGrayscale.initLinear();
+            e.baseGrayscale.points[20] *= 0.97f;
+            check(m, e);
+        }
+    }
+}
+
 TEST_CASE("MHC preview: with the grayscale stage switched off, neither the preview nor the bake has the curve") {
     for (bool hdr : { false, true }) {
         CAPTURE(hdr);

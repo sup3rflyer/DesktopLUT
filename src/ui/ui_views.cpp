@@ -842,20 +842,31 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
     const GrayscaleSettings& gs = mhc.correctionGrayscale;
 
-    RowCtx row = BeginRow("BASE");
-    if (RowButtons(row, "base", { "EDIT\xE2\x80\xA6" }) == 0)
-        PostTo(r, [hdr](int mon) { RunClassicCommand(mon, hdr ? ID_MHC_HDR_EDIT : ID_MHC_TAB_EDIT); });
-    RowText(row, mhc.sourceIs1DCube ? "1D cube" : (mhc.hasPerChannelTRC ? "ICC curves"
-                 : (mhc.baseGrayscale.enabled ? Fmt("%.0f points", mhc.baseGrayscale.pointCount) : std::string("standard"))));
-    EndRow(row);
-
-    row = BeginRow("FINE-TUNE");
-    // The edit previews exactly what the bake installs: it needs that profile, and the display in this mode.
+    // The profile's 1D LUT holds two curves, both edited live in the same editor: the base, and the fine-tune on top.
+    // An edit previews exactly what the bake installs: it needs that profile, and the display in this mode.
     const bool inMode = r.mode == Mode::Unknown || (r.mode == Mode::HDR) == hdr;
     const char* cannot = mhc.bypassGrayscale ? nullptr
                        : r.liveIndex < 0 ? "Display not connected."
                        : mhc.profileName.empty() ? "Needs an installed MHC profile."
                        : !inMode ? (hdr ? "Display is in SDR." : "Display is in HDR.") : nullptr;
+
+    RowCtx row = BeginRow("BASE");
+    if (!mhc.sourceFilePath.empty()) {
+        // An imported file supplies the base (the curve's points are then unused by the bake).
+        RowTip(row, "From the imported file (Primaries \xE2\x80\xBA EDIT\xE2\x80\xA6 chooses it).");
+        RowText(row, mhc.sourceIs1DCube ? "1D cube" : "ICC curves");
+        RowText(row, FileName(mhc.sourceFilePath), pal::InkDim, Font::Mono, kSizeMono, mhc.sourceFilePath);
+    } else {
+        if (cannot) RowTip(row, cannot);
+        ImGui::BeginDisabled(mhc.bypassGrayscale || cannot != nullptr);
+        if (RowButtons(row, "base", { "EDIT CURVE\xE2\x80\xA6" }) == 0) OpenGsEditor(vs, r, hdr, GsTarget::Base);
+        ImGui::EndDisabled();
+        RowText(row, mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty()
+                         ? Fmt("%.0f points", mhc.baseGrayscale.pointCount) : std::string("standard"));
+    }
+    EndRow(row);
+
+    row = BeginRow("FINE-TUNE");
     if (cannot) RowTip(row, cannot);
     ImGui::BeginDisabled(mhc.bypassGrayscale || cannot != nullptr);
     const int b = RowButtons(row, "gs", { "EDIT CURVE\xE2\x80\xA6", "RESET" });
@@ -871,26 +882,13 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     RowPlace(row);
     bool on = false;
     if (OnOff("##gs_on", gs.enabled, &on)) PostTo(r, [hdr, on](int mon) { act::MhcSetCorrectionGsEnabled(mon, hdr, on); });
-    EndRow(row);
-
-    row = BeginRow("POINTS");
-    RowPlace(row);
-    static const char* kPoints[] = { "10", "20", "32" };
-    const int cur = gs.pointCount == 10 ? 0 : (gs.pointCount == 32 ? 2 : 1);
-    const int pick = Segmented("##gs_points", kPoints, 3, cur, 52);
-    if (pick >= 0) {
-        const int count = pick == 0 ? 10 : (pick == 2 ? 32 : 20);
-        const DisplayRow target = r;
-        Ask(vs, "CHANGE POINT COUNT?", "Resets the fine-tune curve to neutral.", "CHANGE", [target, hdr, count]() {
-            RunOnDisplay(target.settings.identity, target.liveIndex,
-                         [hdr, count](int mon) { act::MhcSetCorrectionGsPoints(mon, hdr, count); });
-        });
-    }
+    RowNext(row);
+    RowText(row, Fmt("%.0f points", gs.pointCount), pal::InkDim);   // the count is set in the editor
     EndRow(row);
 
     if (hdr) {
         row = BeginRow("PEAK");
-        RowTip(row, "Where the HDR points sit: the profile's peak (set with the base curve).");
+        RowTip(row, "Where the HDR points sit: the profile's peak (Primaries \xE2\x80\xBA EDIT\xE2\x80\xA6 sets it).");
         RowText(row, Fmt("%.0f nits", MhcProfileMetadataPeakNits(mhc, true)), pal::InkDim);
         EndRow(row);
 

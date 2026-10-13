@@ -189,6 +189,9 @@ struct MhcScanout {
 // Matrix + base LUTs (base grayscale / ICC TRC / 1D cube; correction grayscale and desktop gamma not composed,
 // entries not quantized). Logs the LUT source like the bake always did.
 bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out);
+// The base LUTs alone (the matrix fields of `out` are left as they are): a live edit of the base curve recomputes
+// these and keeps the matrix.
+bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out);
 // The bake's compose step: params' correction grayscale (first), then desktop gamma (last, HDR), clamped to
 // [0,1] and quantized to the file's s15Fixed16 grid. Reads only the correction / desktop gamma fields and the
 // peak; cheap (no files). Logs nothing.

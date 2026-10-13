@@ -44,6 +44,9 @@ bool ReadyMhcPreviewDisplay(int mon, bool hdr, bool& startedForPreview, bool& st
 bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why = nullptr);
 // Recomposes with this correction grayscale and hands the result to the overlay or the hook. Cheap; safe in a frame.
 void UpdateMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& correction);
+// The same with an edited BASE curve too (the session's profile must not take its base from an imported file):
+// the base LUTs are recomputed from it, the matrix stays. Cheap (points, no files).
+void UpdateMhcPreviewBase(const MhcPreviewSession& s, const GrayscaleSettings& base, const GrayscaleSettings& correction);
 // Waits (pumping messages) until the last update is on screen: the hook applies it and DWM has re-composed the
 // screen. Immediate with the overlay (its next frame). False on timeout. Not inside an ImGui frame.
 bool WaitMhcPreviewShown(const MhcPreviewSession& s, DWORD timeoutMs);
@@ -70,6 +73,9 @@ bool MhcEditorNeedsOverlay();
 bool PrepareMhcPreview(const MHCSettings& mhc, bool hdr, int mon, MhcPreviewSession& s);
 // UpdateMhcPreview's computation: the scanout the bake would install with this correction. Exposed for testing.
 void ComposeMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& correction, MhcScanout& out);
+// UpdateMhcPreviewBase's computation. Exposed for testing.
+void ComposeMhcPreviewBase(const MhcPreviewSession& s, const GrayscaleSettings& base, const GrayscaleSettings& correction,
+                           MhcScanout& out);
 
 // ---------------------------------------------------------------------------
 // Render-thread side: what the overlay applies. Written by the session under the mutex, generation bumped after;

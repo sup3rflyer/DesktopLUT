@@ -194,6 +194,36 @@ void ComposeMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& corr
     ComposeMhcScanout(p, s.base, out);
 }
 
+void ComposeMhcPreviewBase(const MhcPreviewSession& s, const GrayscaleSettings& base, const GrayscaleSettings& correction,
+                           MhcScanout& out) {
+    MHC2ProfileParams p = s.params;
+    MhcScanout b = s.base;   // the matrix stays; the base LUTs follow the edited curve
+    if (!(s.perm & MHCSettings::PERM_NOGRAY)) {
+        // The bake's base fields for these settings (a session never edits a base an imported file supplies), and
+        // the luminance metadata that follows them (MhcProfileMetadataPeakNits: the base curve's peak once it is on).
+        p.grayscaleEnabled = false;
+        p.grayscale = GrayscaleData{};
+        SetMhcBaseParams(base, p);
+        MHCSettings forPeak;
+        forPeak.baseGrayscale = base;
+        p.peakNits = MhcProfileMetadataPeakNits(forPeak, s.hdr);
+        ComputeMhcScanoutBaseLuts(p, b);
+    }
+    const bool withCorrection = !(s.perm & MHCSettings::PERM_NOGRAY) && correction.enabled && !correction.points.empty();
+    p.correctionGrayscaleEnabled = false;
+    p.correctionGrayscale.enabled = false;
+    if (withCorrection) SetMhcCorrectionParams(correction, p);
+    ComposeMhcScanout(p, b, out);
+}
+
+void UpdateMhcPreviewBase(const MhcPreviewSession& s, const GrayscaleSettings& base, const GrayscaleSettings& correction) {
+    if (!s.active) return;
+    MhcScanout scan;
+    ComposeMhcPreviewBase(s, base, correction, scan);
+    if (s.onHook) g_hookGen = PublishDwmHookMhcPreview(s.mon, s.hdr, scan.applied, scan.lutSize, scan.lut);
+    else PublishStage(s.mon, s.hdr, &scan);
+}
+
 void UpdateMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& correction) {
     if (!s.active) return;
     MhcScanout scan;
