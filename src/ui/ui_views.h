@@ -45,6 +45,9 @@ struct ViewState {
     bool showNotices = false;      // Settings > About: third-party notices expanded
     LogView log;
     GsEditorState gsEdit;          // the grayscale fine-tune editor (open while its live edit runs)
+    int whitelist = 0;             // the whitelist editor: 0 closed, 1 desktop gamma, 2 passthrough (VRR)
+    bool whitelistOpenRequested = false;
+    char whitelistAdd[128] = {};   // the add field (UTF-8)
 };
 
 // The sidebar row id of a display (live / remembered + its identity).

@@ -162,6 +162,12 @@ void Ask(ViewState& vs, std::string title, std::string detail, std::string actio
     vs.confirmOpenRequested = true;
 }
 
+void OpenWhitelist(ViewState& vs, int which) {
+    vs.whitelist = which;
+    vs.whitelistOpenRequested = true;
+    vs.whitelistAdd[0] = 0;
+}
+
 // What the live layers are doing (the lights never claim more).
 PathRuntime RuntimeOf(const Snapshot& snap) {
     PathRuntime rt;
@@ -320,7 +326,7 @@ float FooterTop() {
     return Snap(vp->WorkPos.y + vp->WorkSize.y - Px(kFooterH));
 }
 
-void DrawFooter(const Snapshot& snap, bool busy) {
+void DrawFooter(const Snapshot& snap, ViewState& vs, bool busy) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const ImVec2 p(vp->WorkPos.x, FooterTop());
     const float w = vp->WorkSize.x;
@@ -366,8 +372,20 @@ void DrawFooter(const Snapshot& snap, bool busy) {
     x += DrawText(dl, Font::Label, kSizeLabel, x, cy, state == Off ? pal::InkFaint : pal::InkDim, what) + Px(10);
     if (stateText) DrawText(dl, Font::Label, kSizeLabel, x, cy, pal::Ink, stateText);
     x = Shape().bevel ? p.x + Px(kSidebarW) + Px(12) : p.x + Px(kSidebarW) + Px(kGutter);
-    if (busy) DrawText(dl, Font::Label, kSizeLabel, x, cy, pal::Ink, "APPLYING");
-    else if (!snap.lastStatus.empty()) DrawText(dl, Font::Mono, 12.0f, x, cy, pal::InkFaint, Utf8(snap.lastStatus).c_str());
+    if (busy) {
+        DrawText(dl, Font::Label, kSizeLabel, x, cy, pal::Ink, "APPLYING");
+    } else if (!snap.lastStatus.empty()) {
+        // The newest status, a warning in amber; a click opens Events (its detail is there).
+        const bool warn = snap.lastStatusSev == notify::Sev::Warning || snap.lastStatusSev == notify::Sev::Error;
+        const std::string text = Utf8(snap.lastStatus);
+        const float tw = MeasureInk(Font::Mono, 12.0f, text.c_str()).advance;
+        ImGui::SetCursorScreenPos(ImVec2(x, p.y));
+        ImGui::InvisibleButton("##footer_status", ImVec2(std::max(tw, 1.0f), h));
+        const bool hot = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked()) vs.page = Page::Events;
+        if (hot) ImGui::SetTooltip("Events");
+        DrawText(dl, Font::Mono, 12.0f, x, cy, warn ? pal::Alarm : (hot ? pal::InkDim : pal::InkFaint), text.c_str());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -907,7 +925,7 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
         row = BeginRow("DESKTOP GAMMA");
         RowTip(row, "SDR content in HDR as gamma 2.2 at the Windows SDR white level.\n"
                     "The whitelist turns it off while a listed app runs.");
-        if (RowButtons(row, "dg_wl", { "WHITELIST" }) == 0) Post([]() { ShowGammaWhitelistDialog(Window()); });
+        if (RowButtons(row, "dg_wl", { "WHITELIST" }) == 0) OpenWhitelist(vs, 1);
         RowPlace(row);
         bool dg = false;
         if (OnOff("##dg_on", mhc.desktopGammaEnabled, &dg)) PostTo(r, [dg](int mon) { act::MhcSetDesktopGamma(mon, dg); });
@@ -1349,7 +1367,7 @@ void SettingsGeneral() {
     EndRow(row);
 }
 
-void SettingsEngine(const Snapshot& snap) {
+void SettingsEngine(const Snapshot& snap, ViewState& vs) {
     bool v = false;
     RowCtx row = BeginRow("DWM HOOK");
     RowTip(row, "3D LUT and tone mapping inside DWM: no overlay window.\nOff: the overlay applies them.");
@@ -1380,7 +1398,7 @@ void SettingsEngine(const Snapshot& snap) {
     auto listText = [](const std::wstring& raw) { return raw.empty() ? std::string("\xE2\x80\x94") : Utf8(raw); };
     row = BeginRow("PASSTHROUGH");
     RowTip(row, "Hide the overlay while a whitelisted app runs (keeps G-Sync).");
-    if (RowButtons(row, "set_vrr", { "WHITELIST" }) == 0) Post([]() { ShowVrrWhitelistDialog(Window()); });
+    if (RowButtons(row, "set_vrr", { "WHITELIST" }) == 0) OpenWhitelist(vs, 2);
     RowPlace(row);
     if (OnOff("##set_vrr_on", g_vrrWhitelistEnabled.load(), &v)) Post([v]() { act::SetVrrWhitelistEnabled(v); });
     RowNext(row);
@@ -1389,7 +1407,7 @@ void SettingsEngine(const Snapshot& snap) {
 
     row = BeginRow("DESKTOP GAMMA");
     RowTip(row, "Desktop gamma turns off while a whitelisted app runs.");
-    if (RowButtons(row, "set_gwl", { "WHITELIST" }) == 0) Post([]() { ShowGammaWhitelistDialog(Window()); });
+    if (RowButtons(row, "set_gwl", { "WHITELIST" }) == 0) OpenWhitelist(vs, 1);
     RowText(row, listText(g_gammaWhitelistRaw), g_gammaWhitelistRaw.empty() ? pal::InkFaint : pal::InkDim);
     EndRow(row);
 }
@@ -1540,7 +1558,7 @@ void DrawSettingsPage(const Snapshot& snap, ViewState& vs) {
     };
     if (ImGui::GetContentRegionAvail().x < Px(kSettingsTwoColW)) {
         section("##s_general", "GENERAL", [] { SettingsGeneral(); });
-        section("##s_engine", "ENGINE", [&] { SettingsEngine(snap); });
+        section("##s_engine", "ENGINE", [&] { SettingsEngine(snap, vs); });
         section("##s_calib", "CALIBRATION", [&] { SettingsCalibration(snap); });
         section("##s_hotkeys", "HOTKEYS", [] { SettingsHotkeys(); });
         section("##s_diag", "DIAGNOSTICS", [] { SettingsDiagnostics(); });
@@ -1556,7 +1574,7 @@ void DrawSettingsPage(const Snapshot& snap, ViewState& vs) {
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
         section("##s_general", "GENERAL", [] { SettingsGeneral(); });
-        section("##s_engine", "ENGINE", [&] { SettingsEngine(snap); });
+        section("##s_engine", "ENGINE", [&] { SettingsEngine(snap, vs); });
         section("##s_diag", "DIAGNOSTICS", [] { SettingsDiagnostics(); });
         ImGui::TableSetColumnIndex(2);
         section("##s_calib", "CALIBRATION", [&] { SettingsCalibration(snap); });
@@ -1854,11 +1872,9 @@ void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
 
 // A confirmation: the title, one line, the action (the default button) and CANCEL. In Light it is a
 // Windows 98 dialog: a raised frame and a navy caption carrying the title.
-void DrawConfirm(ViewState& vs) {
-    if (vs.confirmOpenRequested) {
-        ImGui::OpenPopup("##confirm");
-        vs.confirmOpenRequested = false;
-    }
+// A modal in the interface's look (a panel; Windows 98: a raised window with a blue caption). True = open: draw the
+// content, then ImGui::EndPopup().
+bool BeginModal(const char* id, const char* title) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.4f),
                             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
@@ -1869,11 +1885,11 @@ void DrawConfirm(ViewState& vs) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
     ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, bevel ? 0.0f : 1.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, Px(Shape().panelRounding));
-    const bool open = ImGui::BeginPopupModal("##confirm", nullptr,
+    const bool open = ImGui::BeginPopupModal(id, nullptr,
                                              ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
     ImGui::PopStyleVar(3);
     ImGui::PopStyleColor(2);
-    if (!open) return;
+    if (!open) return false;
     if (bevel) {
         const ImVec2 a = ImGui::GetWindowPos(), s = ImGui::GetWindowSize(), b(a.x + s.x, a.y + s.y);
         ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1883,13 +1899,163 @@ void DrawConfirm(ViewState& vs) {
         const ImVec2 ca(a.x + 3 * t, a.y + 3 * t), cb(b.x - 3 * t, a.y + 3 * t + captionH);
         dl->AddRectFilledMultiColor(ca, cb, Col(pal::Strong), Col(IM_COL32(0x10, 0x84, 0xd0, 0xff)),
                                     Col(IM_COL32(0x10, 0x84, 0xd0, 0xff)), Col(pal::Strong));
-        DrawText(dl, Font::Label, kSizeLabel, ca.x + Px(6), (ca.y + cb.y) * 0.5f, pal::StrongInk, vs.confirm.title.c_str());
+        DrawText(dl, Font::Label, kSizeLabel, ca.x + Px(6), (ca.y + cb.y) * 0.5f, pal::StrongInk, title);
         dl->PopClipRect();
-        ImGui::Dummy(ImVec2(MeasureInk(Font::Label, kSizeLabel, vs.confirm.title.c_str()).advance + Px(24), captionH - Px(6)));
+        ImGui::Dummy(ImVec2(MeasureInk(Font::Label, kSizeLabel, title).advance + Px(24), captionH - Px(6)));
     } else {
-        Text(Font::Label, 13.0f, pal::Ink, vs.confirm.title.c_str());
+        Text(Font::Label, 13.0f, pal::Ink, title);
         ImGui::Dummy(ImVec2(0, Px(4)));
     }
+    return true;
+}
+
+std::vector<std::wstring> SplitWhitelist(const std::wstring& raw) {
+    std::vector<std::wstring> out;
+    std::wstring item;
+    auto flush = [&]() {
+        const size_t a = item.find_first_not_of(L" \t"), b = item.find_last_not_of(L" \t");
+        if (a != std::wstring::npos) out.push_back(item.substr(a, b - a + 1));
+        item.clear();
+    };
+    for (wchar_t c : raw) {
+        if (c == L',' || c == L';' || c == L'\n' || c == L'\r') flush();
+        else item += c;
+    }
+    flush();
+    return out;
+}
+
+std::wstring JoinWhitelist(const std::vector<std::wstring>& items) {
+    std::wstring raw;
+    for (const auto& s : items) { if (!raw.empty()) raw += L", "; raw += s; }
+    return raw;
+}
+
+// Process names of the apps with a visible window now (the RUNNING list), sorted, without DesktopLUT itself.
+std::vector<std::wstring> RunningAppNames() {
+    struct Ctx { std::vector<std::wstring> names; DWORD self; } ctx{ {}, GetCurrentProcessId() };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        Ctx* c = (Ctx*)lp;
+        if (!IsWindowVisible(h) || GetWindow(h, GW_OWNER) || GetWindowTextLengthW(h) == 0) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        if (pid == c->self) return TRUE;
+        HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!p) return TRUE;
+        wchar_t path[MAX_PATH];
+        DWORD n = MAX_PATH;
+        if (QueryFullProcessImageNameW(p, 0, path, &n)) {
+            std::wstring name(path, n);
+            const size_t slash = name.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) name = name.substr(slash + 1);
+            for (wchar_t& ch : name) ch = (wchar_t)towlower(ch);
+            if (name != L"explorer.exe" && name != L"applicationframehost.exe" && name != L"textinputhost.exe")
+                c->names.push_back(name);
+        }
+        CloseHandle(p);
+        return TRUE;
+    }, (LPARAM)&ctx);
+    std::sort(ctx.names.begin(), ctx.names.end());
+    ctx.names.erase(std::unique(ctx.names.begin(), ctx.names.end()), ctx.names.end());
+    return ctx.names;
+}
+
+void DrawWhitelist(ViewState& vs) {
+    if (vs.whitelistOpenRequested) {
+        ImGui::OpenPopup("##whitelist");
+        vs.whitelistOpenRequested = false;
+    }
+    const bool gamma = vs.whitelist == 1;
+    if (!BeginModal("##whitelist", gamma ? "DESKTOP GAMMA WHITELIST" : "PASSTHROUGH WHITELIST")) return;
+    const std::wstring& raw = gamma ? g_gammaWhitelistRaw : g_vrrWhitelistRaw;
+    std::vector<std::wstring> items = SplitWhitelist(raw);
+    auto apply = [gamma](std::vector<std::wstring> next) {
+        const std::wstring joined = JoinWhitelist(next);
+        Post([gamma, joined]() { if (gamma) act::SetGammaWhitelist(joined); else act::SetVrrWhitelist(joined); });
+    };
+    ImGui::Dummy(ImVec2(0, Px(6)));
+
+    // The apps as chips, wrapped; the cross removes one.
+    const float maxW = Px(460);
+    const ImVec2 start(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    float x = start.x, y = start.y;
+    const float chipH = Snap(Px(kControlH));
+    int remove = -1;
+    for (size_t i = 0; i < items.size(); i++) {
+        const std::string name = Utf8(items[i]);
+        const float tw = MeasureInk(Font::Mono, 12.0f, name.c_str()).advance;
+        const float w = Snap(tw + Px(12) + Px(22));
+        if (x > start.x && x + w > start.x + maxW) { x = start.x; y += chipH + Px(6); }
+        const ImVec2 a(x, y), b(x + w, y + chipH);
+        DrawFieldBox(dl, a, b);
+        DrawText(dl, Font::Mono, 12.0f, a.x + Px(8), (a.y + b.y) * 0.5f, pal::Ink, name.c_str());
+        ImGui::SetCursorScreenPos(ImVec2(b.x - Px(22), a.y));
+        ImGui::PushID((int)i);
+        if (ImGui::InvisibleButton("##rm", ImVec2(Px(22), chipH))) remove = (int)i;
+        const bool hot = ImGui::IsItemHovered();
+        ImGui::PopID();
+        const ImVec2 c(b.x - Px(11), (a.y + b.y) * 0.5f);
+        const float r = Px(3.5f);
+        const ImU32 xc = Col(hot ? pal::Ink : pal::InkFaint);
+        dl->AddLine(ImVec2(c.x - r, c.y - r), ImVec2(c.x + r, c.y + r), xc, Px(1.3f));
+        dl->AddLine(ImVec2(c.x - r, c.y + r), ImVec2(c.x + r, c.y - r), xc, Px(1.3f));
+        if (hot) ImGui::SetTooltip("Remove");
+        x += w + Px(6);
+    }
+    if (items.empty()) {
+        DrawText(dl, Font::Label, kSizeLabel, start.x, start.y + chipH * 0.5f, pal::InkFaint, "NO APPS");
+    }
+    ImGui::SetCursorScreenPos(ImVec2(start.x, y + chipH + Px(14)));
+    ImGui::Dummy(ImVec2(maxW, 0));
+    if (remove >= 0) {
+        items.erase(items.begin() + remove);
+        apply(items);
+    }
+
+    // Add: typed, or picked from the apps running now.
+    auto addName = [&](std::wstring name) {
+        const size_t a = name.find_first_not_of(L" \t"), b = name.find_last_not_of(L" \t");
+        if (a == std::wstring::npos) return;
+        name = name.substr(a, b - a + 1);
+        if (name.find(L'.') == std::wstring::npos) name += L".exe";
+        for (const auto& s : items) if (_wcsicmp(s.c_str(), name.c_str()) == 0) return;
+        items.push_back(name);
+        apply(items);
+    };
+    const bool entered = TextField("##wl_add", "app.exe", vs.whitelistAdd, sizeof(vs.whitelistAdd), 220) ||
+                         false;
+    const bool enterKey = ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Enter);
+    (void)entered;
+    ImGui::SameLine(0, Px(8));
+    if (Button("##wl_addbtn", "ADD", 64) || enterKey) {
+        addName(Wide(vs.whitelistAdd));
+        vs.whitelistAdd[0] = 0;
+    }
+    ImGui::SameLine(0, Px(8));
+    static std::vector<std::wstring> s_running;
+    if (BeginDropdown("##wl_running", "RUNNING", 150)) {
+        if (ImGui::IsWindowAppearing()) s_running = RunningAppNames();
+        if (s_running.empty()) Text(Font::Label, kSizeLabel, pal::InkFaint, "NONE");
+        for (const auto& n : s_running)
+            if (DropdownItem(Utf8(n).c_str(), false)) addName(n);
+        EndDropdown();
+    }
+
+    ImGui::Dummy(ImVec2(0, Px(14)));
+    if (PushButton("##wl_done", "DONE", kButtonW, 26, true) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        vs.whitelist = 0;
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
+void DrawConfirm(ViewState& vs) {
+    if (vs.confirmOpenRequested) {
+        ImGui::OpenPopup("##confirm");
+        vs.confirmOpenRequested = false;
+    }
+    if (!BeginModal("##confirm", vs.confirm.title.c_str())) return;
     ImGui::TextUnformatted(vs.confirm.detail.c_str());
     ImGui::Dummy(ImVec2(0, Px(14)));
     if (PushButton("##confirm_yes", vs.confirm.action.c_str(), kButtonW, 26, true)) {
@@ -1931,8 +2097,9 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     else DrawPipelinePage(snap, vs);
     ImGui::EndDisabled();
     ImGui::PopStyleVar();
-    DrawFooter(snap, busy);
+    DrawFooter(snap, vs, busy);
     DrawConfirm(vs);
+    DrawWhitelist(vs);
     ImGui::End();
 }
 

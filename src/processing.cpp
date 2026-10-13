@@ -20,6 +20,7 @@
 #include "gui_mhc.h"
 #include "whitelist.h"
 #include "dwm_inject.h"
+#include "actions/notify.h"
 #include <objbase.h>
 #include <iostream>
 #include <map>
@@ -1307,10 +1308,15 @@ static void StartProcessingImpl() {
                 // Injected, but a LUT file could not be read: that display runs without its cube.
                 // Same non-blocking dialog as an injection error (a pipe-driven start must not block).
                 SetStatus(L"Active (DWM Hook) - a LUT file could not be read");
-                std::thread([msg = stagingWarning]() {
-                    MessageBoxW(nullptr, (msg + L"\n\nThat display runs without its 3D LUT.").c_str(),
-                                L"DesktopLUT — DWM Hook", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-                }).detach();
+                if (g_uiClassic) {
+                    std::thread([msg = stagingWarning]() {
+                        MessageBoxW(nullptr, (msg + L"\n\nThat display runs without its 3D LUT.").c_str(),
+                                    L"DesktopLUT — DWM Hook", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+                    }).detach();
+                } else {   // the new interface: a warning (the footer shows it in amber; Events has the detail)
+                    notify::Post(notify::Sev::Warning, -1, L"hook", L"A 3D LUT file could not be read",
+                                 stagingWarning + L"\n\nThat display runs without its 3D LUT.");
+                }
             }
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
@@ -1325,10 +1331,14 @@ static void StartProcessingImpl() {
                 // nobody is there to click during an unattended calibration run.
                 std::wstring firstLine = err.substr(0, err.find(L'\n'));
                 SetStatus(firstLine.c_str());
-                std::thread([msg = err]() {
-                    MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
-                                MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-                }).detach();
+                if (g_uiClassic) {
+                    std::thread([msg = err]() {
+                        MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
+                                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+                    }).detach();
+                } else {   // the new interface: an error (the footer shows it in amber; Events has the detail)
+                    notify::Post(notify::Sev::Error, -1, L"hook", firstLine, err);
+                }
                 return;
             }
         }

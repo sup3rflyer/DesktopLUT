@@ -144,8 +144,14 @@ void TakeSnapshot(Snapshot& out) {
     out.hookActive = out.hookMode && IsDwmHookActive();
 
     out.lastStatus.clear();
+    out.lastStatusSev = notify::Sev::Info;
     for (auto it = notify::Snapshot(32); !it.empty(); it.pop_back()) {
-        if (it.back().source == L"status") { out.lastStatus = it.back().title; break; }
+        const notify::Event& e = it.back();
+        if (e.source == L"status" || e.sev == notify::Sev::Warning || e.sev == notify::Sev::Error) {
+            out.lastStatus = e.title;
+            out.lastStatusSev = e.sev;
+            break;
+        }
     }
 }
 

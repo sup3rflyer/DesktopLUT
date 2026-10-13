@@ -1,5 +1,6 @@
 #include "doctest.h"
 #include "mhc_preview.h"   // kMhcHeld*
+#include "globals.h"       // g_gammaWhitelistRaw
 #include "ui/ui_views.h"
 #include "ui/ui_theme.h"
 #include "ui/ui_widgets.h"
@@ -259,6 +260,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "fald", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1 },
         { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
         { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
+        { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
     };
     const float scales[] = { 1.0f, 1.5f };
     int written = 0;
@@ -316,6 +318,11 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 if (shot.confirm) {
                     vs.confirm = { "REMOVE PROFILE?", "Deletes the calibration profile and its cached variants.", "REMOVE", nullptr };
                     vs.confirmOpenRequested = true;
+                }
+                if (shot.variant == 5) {   // the desktop gamma whitelist editor
+                    g_gammaWhitelistRaw = L"mpvnet.exe, mpv.exe, mpc-hc64.exe, mpc-be64.exe, madvr.exe";
+                    vs.whitelist = 1;
+                    vs.whitelistOpenRequested = true;
                 }
                 for (int frame = 0; frame < 4; frame++) {   // a few frames: auto-sized panels settle
                     io.DisplaySize = ImVec2((float)w, (float)h);

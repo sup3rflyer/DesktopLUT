@@ -5,6 +5,7 @@
 
 #include "ui_model.h"
 #include "dlc/dlc_join.h"
+#include "actions/notify.h"
 #include <windows.h>
 #include <memory>
 #include <string>
@@ -36,7 +37,8 @@ struct Snapshot {
     std::shared_ptr<const dlc::Data> dlc;   // the latest DLC scan (never null)
     bool hookMode = false;
     bool hookActive = false;
-    std::wstring lastStatus;
+    std::wstring lastStatus;       // the newest status line or warning / error (any source)
+    notify::Sev lastStatusSev = notify::Sev::Info;
 };
 
 // Fills `out` from the live state. Cheap (a few KB copied per display); call once per frame.

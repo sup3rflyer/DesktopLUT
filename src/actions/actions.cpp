@@ -669,6 +669,18 @@ void SetVrrWhitelistEnabled(bool on) {
     SyncClassicGlobalControls();
 }
 
+void SetGammaWhitelist(const std::wstring& raw) {
+    g_gammaWhitelistRaw = NormalizeWhitelistRaw(raw);
+    ParseGammaWhitelist();
+    SaveSettings();
+}
+
+void SetVrrWhitelist(const std::wstring& raw) {
+    g_vrrWhitelistRaw = NormalizeWhitelistRaw(raw);
+    ParseVrrWhitelist();
+    SaveSettings();
+}
+
 // ---------------------------------------------------------------------------------------------------
 // Live layers
 

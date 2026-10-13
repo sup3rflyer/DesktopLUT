@@ -80,6 +80,9 @@ void SetStartMinimized(bool on);
 void SetRunAtStartup(bool on);
 void SetConsoleLog(bool on);
 void SetVrrWhitelistEnabled(bool on);
+// The whitelists, as a list of process names (any separator; normalised to "a.exe, b.exe"). Applied and saved.
+void SetGammaWhitelist(const std::wstring& raw);
+void SetVrrWhitelist(const std::wstring& raw);
 void SetDlcFolder(const std::wstring& folder);   // empty = detect next to DesktopLUT
 void SetUiTheme(int theme);                     // 0 dark, 1 gray, 2 light (the interface applies it)
 void SetRecalReminderDays(int days);             // 0 = off
