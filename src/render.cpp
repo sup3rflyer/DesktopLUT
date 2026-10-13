@@ -800,7 +800,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
 // ============================================================================
 // SECTION: Render Loop
 // ============================================================================
-
+
 
 // Live edit preview (mhc_preview.h): pull the stage when it changed since this context last looked, uploading its
 // LUTs to t11. The stage is for one display in one mode; every other context runs without it. A failed Map leaves

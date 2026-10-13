@@ -493,7 +493,7 @@ TEST_CASE("Device instance id from a monitor device path") {
     CHECK(DeviceInstanceIdFromPath(L"\\\\?\\PCI#VEN_10DE").empty());
     CHECK(DeviceInstanceIdFromPath(L"").empty());
 }
-
+
 TEST_CASE("Night Light: the CloudStore state blob reads on / off / unknown") {
     // Captured on Windows 11 25H2 with Night Light off (2026-10-13): byte 18 = 0x13.
     const unsigned char off[] = { 0x43, 0x42, 0x01, 0x00, 0x0A, 0x02, 0x01, 0x00, 0x2A, 0x06, 0xF8, 0xF3, 0x8F, 0xD5,
