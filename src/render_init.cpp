@@ -13,6 +13,7 @@
 #include "displayconfig.h"
 #include "processing.h"
 #include "mhc.h"
+#include "gui_mhc.h"   // MhcScanoutName
 #include "gui_mhc.h"
 #include <dwmapi.h>
 #include <avrt.h>
@@ -525,7 +526,7 @@ void ReapplyMhcProfilesOnModeSwitch(MonitorContext* ctx) {
         const auto& ms = g_gui.monitorSettings[ctx->index];
         const auto& mhc = isHDR ? ms.hdrMHC : ms.sdrMHC;
         mhcEnabled = mhc.enabled;
-        profileName = mhc.profileName;
+        profileName = MhcScanoutName(mhc);   // a live edit's identity profile while one previews
         bool sdrA = ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty();
         bool hdrA = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
         bool sdrHasGs = ms.sdrMHC.baseGrayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||

@@ -36,7 +36,7 @@ struct AtomicTimePoint {
 // Atomic wrapper that allows copy/move (for use in vector-stored structs).
 // Copies are relaxed (copying a whole context is not a publish). The implicit read/write
 // (`flag = true`, `if (flag)`) is acquire/release: these flags PUBLISH plain data written just
-// before them (e.g. previewResult / previewBaseLut before previewBaseLutDirty), and a relaxed
+// before them (e.g. faldDumpDir before its request flag), and a relaxed
 // store let the compiler sink those writes past the flag. Free on x86 (plain mov).
 template<typename T>
 struct MovableAtomic {
@@ -83,12 +83,15 @@ struct MovableAtomic {
 #define WM_DWMHOOK_INJECTED      (WM_USER + 106)  // DwmHook.dll loaded into dwm.exe: run an identity-beacon session
 #define WM_FALD_RECOMPOSE        (WM_USER + 107)  // hook FALD needs one full-screen recomposition (any thread -> GUI thread)
 #define WM_MHC_REGENERATE_MISSING (WM_USER + 108) // the active MHC profile's .icm is gone: regenerate it (verify -> GUI thread)
+#define WM_STATUS_TEXT           (WM_USER + 109)  // SetStatus from a non-GUI thread: show the latest status text (any thread -> GUI thread)
+// Registered message a second launch posts to the running instance's hub window: show the active interface.
+#define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
-#define ID_TRAY_APPLY       2002
-#define ID_TRAY_STOP        2003
+#define ID_TRAY_SUSPEND     2003   // "Suspend live layers" (replaces Start / Stop; 2002 retired)
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
 #define ID_TRAY_CALIBRATION 2006
+#define ID_TRAY_CLASSIC_UI  2007
 
 // Tab control
 #define ID_TAB_CONTROL      200
@@ -274,13 +277,16 @@ const int MONITOR_IDENTITY_TIMER_ID = 112;      // Deferred/retried settings re-
 const int MONITOR_IDENTITY_RETRY_MS = 3000;     // (also armed at startup when a display is not identifiable yet)
 const int MONITOR_IDENTITY_MAX_RETRIES = 5;
 const int TOPOLOGY_PIPELINE_TIMER_ID = 115;     // After the live settings attachment changed: start / restart the
-const int TOPOLOGY_PIPELINE_SETTLE_MS = 5000;   //   pipeline once the display transition has settled
+const int TOPOLOGY_PIPELINE_SETTLE_MS = 5000;   //   pipeline once the display transition has settled (hook mode,
+                                                //   running: after any modeset, a display may have moved)
 const int MHC_MATRIX_REBAKE_TIMER_ID = 116;     // Re-bake profiles baked by older matrix maths (startup / re-attach)
 const int MHC_MATRIX_REBAKE_DELAY_MS = 4000;
 const int RENDER_HEALTH_TIMER_ID = 117;          // GUI-side hang check of the overlay render loop (T2.20)
 const int RENDER_HEALTH_INTERVAL_MS = 2000;
 const int RENDER_HANG_TIMEOUT_MS = 30000;       // no render-loop iteration this long (display on) = hung;
                                                 //   6x the in-thread watchdog, so a slow recovery is not one
+const int RECONCILE_TIMER_ID = 118;             // Retry of a live-layer reconcile that had to wait (act::ReconcileLiveLayers)
+const int RECONCILE_RETRY_MS = 500;
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
@@ -729,17 +735,15 @@ struct MonitorContext {
     MovableAtomic<bool> sdrMhcGrayscaleActive{ false };   // SDR MHC grayscale installed at GPU scanout
     MovableAtomic<bool> hdrMhcPrimariesActive{ false };   // HDR MHC primaries installed at GPU scanout
     MovableAtomic<bool> hdrMhcGrayscaleActive{ false };   // HDR MHC grayscale installed at GPU scanout
-    MovableAtomic<bool> corrGsPreviewActive{ false };    // Correction GS preview: let shader GS through MHC suppression
 
-    // SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md). When engaged,
-    // SDR scanout is the transient passthrough (identity) profile and the overlay shader
-    // reproduces the WHOLE MHC2 transform (previewResult matrix + previewBaseLut) before the
-    // live correction, so the preview is bit-identical to the bake (incl. per-channel/WB).
-    MovableAtomic<bool> corrGsFullPreviewActive{ false };
-    float previewResult[9] = { 1,0,0, 0,1,0, 0,0,1 };    // net as-applied RGB->RGB matrix (row-major)
-    std::vector<float> previewBaseLut[3];                // per-channel base 1D LUT staged for t11 upload
-    int previewBaseLutSize = 1024;                       // entries per channel in previewBaseLut
-    MovableAtomic<bool> previewBaseLutDirty{ false };    // render thread uploads previewBaseLut to t11 when set
+    // Live edit preview (mhc_preview.h): the overlay applies this display's MHC profile as its last stage while
+    // scanout runs an identity profile. Render-thread owned: pulled from g_mhcPreviewStage whenever
+    // g_mhcPreviewStageGen differs from mhcPreviewGen (a context rebuilt mid-edit starts at 0 and pulls again).
+    bool mhcPreviewOn = false;
+    float mhcPreviewMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };   // MhcScanout::applied (row-major)
+    int mhcPreviewLutSize = 0;                             // entries per channel in the t11 texture
+    bool mhcPreviewHdr = false;                            // the mode the stage is for (applies only in it)
+    unsigned mhcPreviewGen = 0;
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     MovableAtomic<bool> cbDirty{ true };     // True when constant buffer needs update (GUI thread sets it cross-thread)
@@ -864,6 +868,10 @@ struct MHCSettings {
     bool enabled = false;              // User wants MHC active for this monitor
     std::wstring profilePath;          // Full path to generated .icm file
     std::wstring profileName;          // Filename only (for ICC API)
+    // Runtime only (never saved): while a live edit previews this profile in the overlay (mhc_preview.h), the
+    // identity profile scanout runs instead. The self-heal paths expect THIS name meanwhile (MhcScanoutName), and
+    // permutation swaps / re-bakes wait, so nothing puts the real profile under the overlay's copy of it.
+    std::wstring previewScanoutName;
 
     // Source ICC/Cube file path (if set, profile was generated from this file)
     // When non-empty, primaries + TRC come from the file, not manual editors
@@ -900,23 +908,38 @@ struct MHCSettings {
     // 80 = the original fixed bake (and the value assumed for profiles saved before this was tracked).
     float dgSdrWhiteNits = 80.0f;
 
+    // Stage bypasses (the interface's per-stage switches). The stage's own settings stay as they are; the
+    // installed variant leaves the stage out (permutation bits PERM_NOPRIM / PERM_NOGRAY), so switching back
+    // restores exactly what was there. Both on = an identity profile that keeps the luminance metadata.
+    // The MHC flags the shader reads (UpdateMhcFlagsLive) ignore them on purpose: a bypassed stage must not
+    // hand its work to the shader (desktop gamma, the corrections layer) — bypassed means nobody does it.
+    bool bypassPrimaries = false;      // primaries + white balance (the matrix) -> identity
+    bool bypassGrayscale = false;      // base curve / imported TRC / correction GS / desktop gamma -> identity 1D LUT
+
     // Permutation profile cache — indexed by correction bitmask
     // Each bit controls whether that correction is baked into the ICC profile.
     // Profiles are generated on-demand and cached for instant runtime swapping.
     // Bit 0 (0x1): White Balance    (matrix)
     // Bit 1 (0x2): Desktop Gamma    (1D LUT, HDR only)
     // Bit 2 (0x4): Correction GS    (1D LUT)
+    // Bit 3 (0x8): Primaries stage bypassed  (identity matrix; WB never set with it)
+    // Bit 4 (0x10): Grayscale stage bypassed (identity 1D LUT; DG / GS never set with it)
     static constexpr uint8_t PERM_WB = 0x1;
     static constexpr uint8_t PERM_DG = 0x2;
     static constexpr uint8_t PERM_GS = 0x4;
-    static constexpr int PERM_COUNT = 8;
+    static constexpr uint8_t PERM_NOPRIM = 0x8;
+    static constexpr uint8_t PERM_NOGRAY = 0x10;
+    static constexpr int PERM_COUNT = 32;
 
     std::wstring permNames[PERM_COUNT];  // Cached profile filenames (indexed by bitmask)
     std::wstring permPaths[PERM_COUNT];  // Cached profile full paths
     // SDR white level (nits) each cached profile's desktop gamma was baked with; 0 = that bake carries no DG
     // (W-independent). A DG permutation whose stamp differs from dgSdrWhiteNits is stale (MhcPermDgBakedAt):
     // regenerated on demand, and re-baked when it is the active one. Persisted (HDR) with the cache.
-    float permDgWhiteNits[PERM_COUNT] = { 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f };
+    float permDgWhiteNits[PERM_COUNT] = {
+        80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
+        80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
+    };
     uint8_t activePerm = 0;              // Currently active permutation bitmask
     // Runtime: the active profile was baked by a build whose white-balance matrix maths is older than
     // this one (INI MHCMatrixRev < kMhcMatrixRev) — re-baked once at startup (RebakePendingMhcProfiles).
@@ -945,6 +968,10 @@ struct DisplayIdentity {
 struct MonitorSettings {
     std::wstring sdrPath;
     std::wstring hdrPath;
+    // 3D LUT stage bypass per mode (the interface's stage switch): the cube stays loaded and staged, nothing
+    // applies it. INI LUT_SDR_Bypass / LUT_HDR_Bypass. Read the cube that RUNS through LiveLutPath.
+    bool sdrLutBypass = false;
+    bool hdrLutBypass = false;
     ColorCorrectionSettings sdrColorCorrection;  // Color correction for SDR mode
     ColorCorrectionSettings hdrColorCorrection;  // Color correction for HDR mode
     MaxTmlSettings maxTml;                       // Display Peak Override settings
@@ -960,7 +987,15 @@ struct MonitorSettings {
                             // is stamped on it
     std::wstring firstSeen; // ISO date (YYYY-MM-DD) the display was first attached; informational
     std::wstring lastSeen;  // ISO date it was last attached / saved while connected; informational
+    std::wstring label;     // the user's name for the display (INI Label); empty = automatic. Never used for matching
 };
+
+// The cube that runs in a mode: the configured one, unless its stage is bypassed (empty then).
+inline const std::wstring& LiveLutPath(const MonitorSettings& ms, bool hdr) {
+    static const std::wstring kNone;
+    if (hdr) return ms.hdrLutBypass ? kNone : ms.hdrPath;
+    return ms.sdrLutBypass ? kNone : ms.sdrPath;
+}
 
 // [Display<slot>] slots are allocated below this cap (lowest free slot first).
 constexpr int kMaxDisplaySlots = 256;

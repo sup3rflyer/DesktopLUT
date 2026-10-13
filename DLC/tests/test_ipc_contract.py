@@ -662,6 +662,7 @@ def test_grayscale_set_live_carries_decomposed_sliders_on_the_wire():
     points curve exactly as the C++ ApplyGrayscalePayload does."""
     ctrl = CalibrationController.mock()
     transport = ctrl.client.transport
+    ctrl.apply_mhc(0, "HDR")   # the live preview needs an installed profile
     ctrl.grayscale_live_begin(0, "HDR")
 
     n = 10   # DesktopLUT accepts 10/20/32-point curves only
@@ -702,6 +703,7 @@ def test_grayscale_set_live_decomposed_sdr_bridge_keeps_invariant():
     deviations are re-derived from the RESAMPLED pair — so deviations == luminance*rgb
     holds exactly per slot even after the bridge."""
     ctrl = CalibrationController.mock()
+    ctrl.apply_mhc(0, "SDR")   # the live preview needs an installed profile
     ctrl.grayscale_live_begin(0, "SDR")
     m = 10   # DesktopLUT accepts 10/20/32-point curves only
     points = [(i / (m - 1)) ** 0.5 for i in range(m)]   # DLC's own signal grid, not DesktopLUT's
@@ -1065,3 +1067,15 @@ def test_snapshot_correction_grayscale_keeps_the_wire_block_and_says_why_when_no
     assert _cg_probe(empty) == (None, "none")
     assert _cg_probe({"mhc": {"0:SDR": {"applied": True, "profile_name": "user.icm"}}}) == (None, "unsupported")
     assert _cg_probe({"mhc": {}}) == (None, "unreadable")
+
+
+def test_grayscale_live_begin_needs_an_installed_profile():
+    """The live preview IS the profile the commit installs (mhc_preview.h: identity scanout while the
+    overlay applies it), so a mode with no installed MHC profile has nothing to preview: begin refuses,
+    and works once a profile is applied."""
+    ctrl = CalibrationController.mock()
+    with pytest.raises(DesktopLutApiError, match="No MHC profile installed"):
+        ctrl.grayscale_live_begin(0, "SDR")
+    ctrl.apply_mhc(0, "SDR")
+    ctrl.grayscale_live_begin(0, "SDR")
+    ctrl.grayscale_cancel(0, "SDR")

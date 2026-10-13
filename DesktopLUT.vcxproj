@@ -49,15 +49,15 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;IMGUI_IMPL_WIN32_DISABLE_GAMEPAD;IMGUI_DISABLE_DEMO_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/await:strict %(AdditionalOptions)</AdditionalOptions>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
-      <AdditionalIncludeDirectories>$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)shared;$(SolutionDir)src;$(SolutionDir)third_party\imgui;$(SolutionDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;dcomp.lib;windowsapp.lib;winmm.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;dcomp.lib;windowsapp.lib;winmm.lib;avrt.lib;imm32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
@@ -68,14 +68,14 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;IMGUI_DISABLE_OBSOLETE_FUNCTIONS;IMGUI_IMPL_WIN32_DISABLE_GAMEPAD;IMGUI_DISABLE_DEMO_WINDOWS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/await:strict %(AdditionalOptions)</AdditionalOptions>
-      <AdditionalIncludeDirectories>$(SolutionDir)shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(SolutionDir)shared;$(SolutionDir)src;$(SolutionDir)third_party\imgui;$(SolutionDir)third_party\imgui\backends;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;dcomp.lib;windowsapp.lib;winmm.lib;avrt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;dxgi.lib;d3dcompiler.lib;dwmapi.lib;dcomp.lib;windowsapp.lib;winmm.lib;avrt.lib;imm32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
@@ -105,6 +105,7 @@
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\mhc_icc.cpp" />
     <ClCompile Include="src\mhc_install.cpp" />
+    <ClCompile Include="src\mhc_preview.cpp" />
     <ClCompile Include="src\mhc_read.cpp" />
     <ClCompile Include="src\whitelist.cpp" />
     <ClCompile Include="src\framepacer.cpp" />
@@ -113,6 +114,36 @@
     <ClCompile Include="shared\fald_panel.cpp" />
     <ClCompile Include="shared\fald_temporal.cpp" />
     <ClCompile Include="src\fald.cpp" />
+    <ClCompile Include="src\ui\ui_theme.cpp" />
+    <ClCompile Include="src\actions\notify.cpp" />
+    <ClCompile Include="src\actions\actions.cpp" />
+    <ClCompile Include="src\actions\reconcile.cpp" />
+    <ClCompile Include="src\actions\gs_live.cpp" />
+    <ClCompile Include="src\actions\logcap.cpp" />
+    <ClCompile Include="src\dlc\dlc_yaml.cpp" />
+    <ClCompile Include="src\dlc\dlc_data.cpp" />
+    <ClCompile Include="src\dlc\dlc_join.cpp" />
+    <ClCompile Include="src\dlc\dlc_scan.cpp" />
+    <ClCompile Include="src\ui\ui_model.cpp" />
+    <ClCompile Include="src\ui\ui_gscurve.cpp" />
+    <ClCompile Include="src\ui\ui_gsedit.cpp" />
+    <ClCompile Include="src\ui\ui_patch.cpp" />
+    <ClCompile Include="src\ui\ui_snapshot.cpp" />
+    <ClCompile Include="src\ui\ui_present.cpp" />
+    <ClCompile Include="src\ui\ui_widgets.cpp" />
+    <ClCompile Include="src\ui\ui_views.cpp" />
+    <ClCompile Include="src\ui\ui_window.cpp" />
+    <ClCompile Include="src\ui\ui_logo.cpp" />
+    <ClCompile Include="src\ui\ui_notices.cpp" />
+  </ItemGroup>
+  <!-- Dear ImGui v1.92.9b (third_party/imgui, MIT). Vendored as-is: no SDL checks, CRT deprecation silenced. -->
+  <ItemGroup>
+    <ClCompile Include="third_party\imgui\imgui.cpp"><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_draw.cpp"><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_tables.cpp"><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="third_party\imgui\imgui_widgets.cpp"><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_win32.cpp"><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
+    <ClCompile Include="third_party\imgui\backends\imgui_impl_dx11.cpp"><SDLCheck>false</SDLCheck><PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions></ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\types.h" />
@@ -125,6 +156,8 @@
     <ClInclude Include="src\fald.h" />
     <ClInclude Include="shared\fald_shader.h" />
     <ClInclude Include="shared\tonemap_curves.h" />
+    <ClInclude Include="shared\mhc_scanout_hlsl.h" />
+    <ClInclude Include="src\mhc_preview.h" />
     <ClInclude Include="src\lut.h" />
     <ClInclude Include="src\color.h" />
     <ClInclude Include="src\settings.h" />

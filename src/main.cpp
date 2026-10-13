@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "gui.h"
 #include "crash_handler.h"
+#include "actions/logcap.h"
 #include <objbase.h>
 
 // ============================================================================
@@ -23,16 +24,25 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
     // Single instance check - prevent multiple copies from running
     g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, L"DesktopLUT_SingleInstance_Mutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        // Another instance is running - try to bring its window to foreground
+        // Another instance is running: ask it to show the interface it uses (the classic window is its
+        // hub; the new one is a separate window only it knows about). This process was just launched by
+        // the user, so it may hand the foreground on.
         HWND existingWnd = FindWindowW(L"DesktopLUT_GUI", L"DesktopLUT");
         if (existingWnd) {
-            ShowWindow(existingWnd, SW_RESTORE);
-            SetForegroundWindow(existingWnd);
+            DWORD pid = 0;
+            GetWindowThreadProcessId(existingWnd, &pid);
+            if (pid) AllowSetForegroundWindow(pid);
+            const UINT showUi = RegisterWindowMessageW(DESKTOPLUT_SHOW_UI_MESSAGE);
+            if (!showUi || !PostMessageW(existingWnd, showUi, 0, 0)) {
+                ShowWindow(existingWnd, SW_RESTORE);
+                SetForegroundWindow(existingWnd);
+            }
         }
         CloseHandle(g_singleInstanceMutex);
         return 0;
     }
 
+    logcap::Install();   // the diagnostic log for the Events page, before anything else writes
     int result = RunGUI();
     CloseHandle(g_singleInstanceMutex);
     return result;

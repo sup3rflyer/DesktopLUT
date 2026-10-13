@@ -6,6 +6,7 @@
 #include "doctest.h"
 #include "desktoplut_ipc_server.h"
 #include "globals.h"
+#include "gui.h"
 #include "ipc_client_check.h"
 
 #include <windows.h>
@@ -138,6 +139,42 @@ TEST_CASE("Calibration pipe: a request round-trips; Stop and re-arm work") {
     CHECK(MsToStop() < 1000);
     StartCalibrationIpcServer();
     CHECK(Contains(RoundTrip(R"({"method":"no.such.method"})"), "unknown method"));
+}
+
+TEST_CASE("Calibration pipe: state.get reports the user's Suspend beside running") {
+    ArmedServer server(false);
+    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
+    const bool old = g_userStopped.load();
+    g_userStopped = true;
+    std::string reply = RoundTrip(R"({"method":"state.get"})");
+    CHECK(Contains(reply, "\"suspended\":true"));
+    CHECK(Contains(reply, "\"running\":"));   // unchanged field, still there
+    g_userStopped = false;
+    reply = RoundTrip(R"({"method":"state.get"})");
+    CHECK(Contains(reply, "\"suspended\":false"));
+    g_userStopped = old;
+}
+
+TEST_CASE("Calibration pipe: state.get reports the interface's stage bypasses for every pair") {
+    ArmedServer server(false);
+    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
+    std::vector<MonitorSettings> saved;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        saved = g_gui.monitorSettings;
+        g_gui.monitorSettings.assign(1, MonitorSettings{});
+        g_gui.monitorSettings[0].hdrLutBypass = true;
+        g_gui.monitorSettings[0].sdrMHC.bypassGrayscale = true;
+    }
+    const std::string reply = RoundTrip(R"({"method":"state.get"})");
+    CHECK(Contains(reply, "\"bypass_3dlut\":true"));       // 0:HDR
+    CHECK(Contains(reply, "\"bypass_3dlut\":false"));      // 0:SDR
+    CHECK(Contains(reply, "\"bypass_grayscale\":true"));   // 0:SDR
+    CHECK(Contains(reply, "\"bypass_primaries\":false"));
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        g_gui.monitorSettings = saved;
+    }
 }
 
 TEST_CASE("Calibration pipe: a client that connects and sends nothing does not block Stop") {

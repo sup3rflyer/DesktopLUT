@@ -306,6 +306,7 @@ class MockDesktopLutState:
     def as_dict(self) -> dict[str, Any]:
         return {
             "running": self.running,
+            "suspended": False,
             "corrections_enabled": self.corrections_enabled,
             "calibration_mode": deepcopy(self.calibration_mode),
             "snapshots": deepcopy(self.snapshots),
@@ -314,7 +315,8 @@ class MockDesktopLutState:
             "hdr": deepcopy(self.hdr),
             # C++ reports every monitor:mode pair (absent = a fresh install, all OFF), fald settings included
             "layers": {k: {"tonemap": False, "fald": False, "desktop_gamma": False, "white_balance": False,
-                           "grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
+                           "grayscale": False, "bypass_3dlut": False, "bypass_primaries": False,
+                           "bypass_grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "fald": deepcopy(self.fald),
             "overlay_model": {"keep_awake": self.overlay_keep_awake, "sleep_lag_polls": self.overlay_sleep_lag_polls,
@@ -569,8 +571,9 @@ class MockDesktopLutServer:
                 else:
                     st.pop("correction_grayscale", None)
 
-    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
-    SHADER_LAYERS = ("tonemap", "fald")      # shader flags: no MHC re-bake
+    LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald",
+                   "bypass_3dlut", "bypass_primaries", "bypass_grayscale")
+    SHADER_LAYERS = ("tonemap", "fald", "bypass_3dlut")   # no MHC re-bake (the 3D LUT bypass rides the hook config)
 
     def correction_grayscale_view(self, key: str) -> dict[str, Any]:
         """The ``correction_grayscale`` block C++ ``HandleStateGet`` emits on an mhc entry: the
@@ -862,6 +865,11 @@ class MockDesktopLutServer:
             if state.get("gs_live_active"):
                 return DesktopLutResponse(
                     ok=False, error="grayscale live preview already active for this monitor/mode")
+            # C++ BeginMhcPreview (mhc_preview.h): the preview IS the profile the commit installs (an
+            # identity profile on scanout while the overlay applies it), so the mode needs one installed.
+            if not state.get("profile_name"):
+                return DesktopLutResponse(
+                    ok=False, error="live preview unavailable: No MHC profile installed for this mode")
             state["gs_preview_active"] = True
             state["gs_live_active"] = True
             state["gs_live_saved"] = deepcopy(state.get("correction_grayscale"))
@@ -918,6 +926,9 @@ class MockDesktopLutServer:
             # C++ DoMhcApply bakes + installs and reports the profile name inside the mhc
             # object ({applied:true, profile_name}). Carry a simulated name so the DLC-side
             # profile_name plumbing is exercised under --simulate (fable Phase 9).
+            # A pipe apply makes the whole profile live: the pair's MHC stage bypasses go.
+            layers = self.state.layers.setdefault(key, {n: False for n in self.LAYER_NAMES})
+            layers["bypass_primaries"] = layers["bypass_grayscale"] = False
             state["applied"] = True
             state.setdefault("profile_name", f"DesktopLUT-sim-{key.replace(':', '-')}.icm")
         elif method == "mhc.remove":
@@ -1051,6 +1062,8 @@ class MockDesktopLutServer:
             if not Path(cube).exists():
                 return DesktopLutResponse(ok=False, error="cube_path does not exist")
             state["cube_path"] = params["cube_path"]
+            # A pipe apply makes its cube live: the pair's 3D LUT bypass goes.
+            self.state.layers.setdefault(key, {n: False for n in self.LAYER_NAMES})["bypass_3dlut"] = False
         elif method == "runtime.clear_3dlut":
             state.pop("cube_path", None)
         elif method == "runtime.set_grayscale_tweak":

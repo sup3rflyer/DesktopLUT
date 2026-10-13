@@ -180,7 +180,9 @@ TEST_CASE("SDR white stamps: recording a level forgets only the cached variants 
     CHECK(m.dgSdrWhiteNits == 116.0f);
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
         CAPTURE(k);
-        const bool dropped = (k == MHCSettings::PERM_DG) || (k == (MHCSettings::PERM_DG | MHCSettings::PERM_WB));
+        // Every cached DG variant still stamped 80 goes (the stage-bypass slots too); the two re-stamped above stay.
+        const bool dropped = (k & MHCSettings::PERM_DG) != 0 && k != (MHCSettings::PERM_DG | MHCSettings::PERM_GS) &&
+                             k != (MHCSettings::PERM_DG | MHCSettings::PERM_WB | MHCSettings::PERM_GS);
         CHECK(m.permNames[k].empty() == dropped);
     }
     // Nothing stale any more: a repeat is a no-op.

@@ -58,12 +58,8 @@ extern ID3D11ShaderResourceView* g_wbGammaSRV;
 
 // Per-channel SDR base 1D LUT for the grayscale FULL-PREVIEW (realization A; t11/t12/t13).
 // DYNAMIC — re-uploaded by the render thread on full-preview begin (1024 entries each).
-extern ID3D11Texture2D* g_baseLutPreviewTexR;
-extern ID3D11ShaderResourceView* g_baseLutPreviewSRV_R;
-extern ID3D11Texture2D* g_baseLutPreviewTexG;
-extern ID3D11ShaderResourceView* g_baseLutPreviewSRV_G;
-extern ID3D11Texture2D* g_baseLutPreviewTexB;
-extern ID3D11ShaderResourceView* g_baseLutPreviewSRV_B;
+extern ID3D11Texture2D* g_mhcPreviewLutTex;            // live edit preview: the profile's LUTs (t11, 4096x3)
+extern ID3D11ShaderResourceView* g_mhcPreviewLutSRV;
 
 // ============================================================================
 // Monitor State
@@ -140,6 +136,10 @@ extern std::atomic<char> g_hotkeyGammaKey;        // Key for gamma toggle (defau
 extern std::atomic<char> g_hotkeyHdrKey;          // Key for HDR toggle (default 'Z')
 extern std::atomic<char> g_hotkeyAnalysisKey;     // Key for analysis toggle (default 'X')
 extern std::atomic<bool> g_startMinimized;        // Start minimized to tray
+extern bool g_uiClassic;                          // [UI] Interface=classic: the classic window instead of the new one (GUI thread)
+extern std::wstring g_dlcFolder;                  // [UI] DlcFolder: where DLC keeps its runs; empty = auto-detect (GUI thread)
+extern int g_uiTheme;                             // [UI] Theme=dark|gray|light: 0 / 1 / 2 (GUI thread)
+extern int g_recalReminderDays;                   // [UI] RecalReminderDays: remind when the verification is older; 0 = off (GUI thread)
 
 // ============================================================================
 // Gamma Whitelist (auto-disable gamma when whitelisted apps are running)

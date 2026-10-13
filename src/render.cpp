@@ -12,6 +12,7 @@
 #include "displayconfig.h"
 #include "processing.h"
 #include "mhc.h"
+#include "mhc_preview.h"
 #include "gui_mhc.h"
 #include "fald.h"
 #include "../shared/hdr_dither.h"  // DlutHdrDitherLsb
@@ -386,11 +387,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Select color correction based on HDR state
         auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
         // Suppress primaries/grayscale/WB when MHC handles them
-        // corrGsPreviewActive: correction GS editor open — MHC has base calibration,
-        // shader adds correction GS on top. DG stays suppressed (already in MHC LUT).
-        bool corrGsPreview = ctx->corrGsPreviewActive.load();
         bool shaderPrimaries = cc.primariesEnabled && !mhcPrim;
-        bool shaderGrayscale = cc.grayscale.enabled && (!mhcGs || corrGsPreview);
+        bool shaderGrayscale = cc.grayscale.enabled && !mhcGs;
         bool shaderWhiteBalance = cc.primariesEnabled && !mhcPrim &&
             (cc.whiteBalanceGains[0] != 1.0f || cc.whiteBalanceGains[1] != 1.0f || cc.whiteBalanceGains[2] != 1.0f);
         cbData[7] = (shaderPrimaries || shaderGrayscale || shaderWhiteBalance) ? 1.0f : 0.0f;  // useManualCorrection
@@ -510,29 +508,20 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             cbData[129] = 0.0f;
         }
         cbData[130] = useICtCp ? 1.0f : 0.0f;  // grayscaleICtCp
+        // Live edit preview (mhc_preview.h): the stage this context pulled, in the mode it is for.
+        const bool mhcPreview = ctx->mhcPreviewOn && ctx->mhcPreviewHdr == ctx->isHDREnabled;
         // HDR output dither after the LUT (shared/hdr_dither.h): +-1 LSB of 10-bit PQ, TPDF; 0 = off
-        // Processing = LUT, tonemap, or a shader correction (primaries / grayscale / WB / desktop gamma).
+        // Processing = LUT, tonemap, a shader correction (primaries / grayscale / WB / desktop gamma) or the preview.
         cbData[131] = DlutHdrDitherLsb(ctx->isHDREnabled,
                                        cbData[6] < 0.5f || cbData[10] > 0.5f || cbData[7] > 0.5f
-                                           || cbData[9] > 0.5f || cbData[4] > 0.5f,
+                                           || cbData[9] > 0.5f || cbData[4] > 0.5f || mhcPreview,
                                        g_hdrDither.load());
-        // Rows 33-35 (cbData[132..143]): SDR grayscale FULL-PREVIEW matrix + flags (realization A).
-        // Active SDR only; when off, the flag (.w of row0) is 0 and the shader ignores this block.
-        bool corrGsFullPreview = ctx->corrGsFullPreviewActive.load() && !ctx->isHDREnabled;
-        cbData[132] = ctx->previewResult[0];
-        cbData[133] = ctx->previewResult[1];
-        cbData[134] = ctx->previewResult[2];
-        cbData[135] = corrGsFullPreview ? 1.0f : 0.0f;          // corrPreviewMatRow0.w = flag
-        cbData[136] = ctx->previewResult[3];
-        cbData[137] = ctx->previewResult[4];
-        cbData[138] = ctx->previewResult[5];
-        cbData[139] = (float)ctx->previewBaseLutSize;           // corrPreviewMatRow1.w = base LUT size
-        cbData[140] = ctx->previewResult[6];
-        cbData[141] = ctx->previewResult[7];
-        cbData[142] = ctx->previewResult[8];
-        // corrPreviewMatRow2.w = correction-grayscale use24Gamma (full-preview applies it per-channel,
-        // independent of the shared grayscale24 suppression which doesn't apply in this path).
-        cbData[143] = (corrGsFullPreview && cc.grayscale.use24Gamma) ? 1.0f : 0.0f;
+        // Rows 33-35 (cbData[132..143]): the preview's as-applied matrix rows; .w = on, LUT entries, reserved.
+        for (int row = 0; row < 3; row++)
+            for (int col = 0; col < 3; col++) cbData[132 + row * 4 + col] = ctx->mhcPreviewMatrix[row * 3 + col];
+        cbData[135] = mhcPreview ? 1.0f : 0.0f;
+        cbData[139] = (float)ctx->mhcPreviewLutSize;
+        cbData[143] = 0.0f;
         // Row 36: desktop gamma reference white in scRGB units + its reciprocal, computed here so an 80-nit
         // white is exactly 1.0 (the scale the fixed-80-nit desktop gamma used).
         const float sdrWhiteScRGB = curSdrWhiteNits / 80.0f;
@@ -681,27 +670,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     g_context->PSSetShaderResources(8, 1, &g_srgbEotfSRV);       // sRGB EOTF (sRGB->Linear)
     g_context->PSSetShaderResources(9, 1, &g_gammaRatioSRV);     // pow(Y, 1/11) for 2.4 gamma
     g_context->PSSetShaderResources(10, 1, &g_wbGammaSRV);       // pow(gain, 1/2.2) for WB
-    // SDR grayscale full-preview base LUTs (t11-t13). Re-upload once per begin (atomic dirty
-    // handshake; begin is the only writer and is serialized per editor session). Harmless when
-    // the full-preview flag is off — the shader ignores t11-t13.
-    // Consumed with an exchange: a begin that republishes while this upload runs sets the flag
-    // again and is picked up next frame (a load-then-clear would drop it).
-    if (ctx->previewBaseLutDirty.exchange(false, std::memory_order_acq_rel)) {
-        int n = ctx->previewBaseLutSize;
-        ID3D11Texture2D* baseTex[3] = { g_baseLutPreviewTexR, g_baseLutPreviewTexG, g_baseLutPreviewTexB };
-        for (int ch = 0; ch < 3; ch++) {
-            if (baseTex[ch] && (int)ctx->previewBaseLut[ch].size() >= n) {
-                D3D11_MAPPED_SUBRESOURCE bm;
-                if (SUCCEEDED(g_context->Map(baseTex[ch], 0, D3D11_MAP_WRITE_DISCARD, 0, &bm))) {
-                    memcpy(bm.pData, ctx->previewBaseLut[ch].data(), (size_t)n * sizeof(float));
-                    g_context->Unmap(baseTex[ch], 0);
-                }
-            }
-        }
-    }
-    g_context->PSSetShaderResources(11, 1, &g_baseLutPreviewSRV_R);  // SDR full-preview base LUT (R)
-    g_context->PSSetShaderResources(12, 1, &g_baseLutPreviewSRV_G);  // (G)
-    g_context->PSSetShaderResources(13, 1, &g_baseLutPreviewSRV_B);  // (B)
+    // Live edit preview LUTs (t11; written by SyncMhcPreview). Harmless while the preview is off: unread.
+    g_context->PSSetShaderResources(11, 1, &g_mhcPreviewLutSRV);
 
     ID3D11SamplerState* samplers[] = { g_samplerPoint, g_samplerLinear, g_samplerWrap };
     g_context->PSSetSamplers(0, 3, samplers);
@@ -830,6 +800,35 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
 // ============================================================================
 // SECTION: Render Loop
 // ============================================================================
+
+
+// Live edit preview (mhc_preview.h): pull the stage when it changed since this context last looked, uploading its
+// LUTs to t11. The stage is for one display in one mode; every other context runs without it. A failed Map leaves
+// the generation untaken, so the next frame retries.
+static void SyncMhcPreview(MonitorContext& ctx) {
+    const unsigned gen = g_mhcPreviewStageGen.load(std::memory_order_acquire);
+    if (gen == ctx.mhcPreviewGen) return;
+    std::lock_guard<std::mutex> lk(g_mhcPreviewStageMutex);
+    const MhcPreviewStage& st = g_mhcPreviewStage;
+    bool on = st.mon == ctx.index && g_mhcPreviewLutTex && st.lutSize >= 2 && st.lutSize <= kMhcPreviewLutMax;
+    for (int ch = 0; ch < 3 && on; ch++) on = (int)st.lut[ch].size() >= st.lutSize;
+    if (on) {
+        D3D11_MAPPED_SUBRESOURCE m;
+        if (FAILED(g_context->Map(g_mhcPreviewLutTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+        for (int ch = 0; ch < 3; ch++)
+            memcpy((uint8_t*)m.pData + (size_t)ch * m.RowPitch, st.lut[ch].data(), (size_t)st.lutSize * sizeof(float));
+        g_context->Unmap(g_mhcPreviewLutTex, 0);
+        memcpy(ctx.mhcPreviewMatrix, st.matrix, sizeof(st.matrix));
+        ctx.mhcPreviewLutSize = st.lutSize;
+        ctx.mhcPreviewHdr = st.hdr;
+    }
+    if (on || ctx.mhcPreviewOn) {
+        ctx.cbDirty = true;
+        ctx.redrawRequested.store(true);   // a static desktop (a measurement patch) shows the change too
+    }
+    ctx.mhcPreviewOn = on;
+    ctx.mhcPreviewGen = gen;
+}
 
 void RenderAll(FramePacer* fp) {
     int activeCount = 0;
@@ -917,10 +916,14 @@ void RenderAll(FramePacer* fp) {
         } else {
             Sleep(50);
         }
-        // Fall through if reinit, pending corrections, or analysis state change
-        // need processing — all can change whether the overlay needs to render.
+        // Fall through if reinit, pending corrections, analysis or a live edit preview (mhc_preview.h: a new stage
+        // generation) need processing — all can change whether the overlay needs to render.
+        static unsigned s_sleepPreviewGen = 0;
+        const unsigned previewGen = g_mhcPreviewStageGen.load(std::memory_order_acquire);
+        const bool previewMoved = previewGen != s_sleepPreviewGen;
+        s_sleepPreviewGen = previewGen;
         if (!g_forceReinit.load() && !g_hasPendingColorCorrections.load()
-            && !g_analysisEnabled.load()) {
+            && !g_analysisEnabled.load() && !previewMoved) {
             return;
         }
     }
@@ -1144,6 +1147,7 @@ void RenderAll(FramePacer* fp) {
     // after pending corrections are applied above.
     for (auto& ctx : g_monitors) {
         if (!ctx.enabled) continue;
+        SyncMhcPreview(ctx);
         bool mhcP = ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive.load() : ctx.sdrMhcPrimariesActive.load();
         bool mhcG = ctx.isHDREnabled ? ctx.hdrMhcGrayscaleActive.load() : ctx.sdrMhcGrayscaleActive.load();
         const auto& cc2 = ctx.isHDREnabled ? ctx.hdrColorCorrection : ctx.sdrColorCorrection;
@@ -1158,7 +1162,8 @@ void RenderAll(FramePacer* fp) {
         bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;
         bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only
-        bool hasMhcPreview = g_mhcEditDialogOpen.load();                  // MHC/grayscale editor live preview
+        // An MHC editor's live preview: this display's exact preview, or a dialog that previews through the overlay
+        bool hasMhcPreview = (ctx.mhcPreviewOn && ctx.mhcPreviewHdr == ctx.isHDREnabled) || MhcEditorNeedsOverlay();
         ctx.shaderCorrActive = hasPrim || hasGs || hasWB || hasTonemap || hasDG || has24
                                || hasFald || hasAnalysis || hasMhcPreview;
     }

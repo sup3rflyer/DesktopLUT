@@ -62,6 +62,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {},
             {
                 "running": "boolean",
+                "suspended": "boolean (user Suspend switch; a DLC apply clears it — see DesktopLUT event log)",
                 "corrections_enabled": "boolean (the OVERLAY-draw flag, NOT 'a correction is live' — "
                                        "false in DWM-hook mode even with a cube loaded; see ../docs/NAMING.md S4)",
                 "calibration_mode": "object or null",
@@ -96,7 +97,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
-                          "panel file is readable}. mhc entries also carry "
+                          "panel file is readable; bypass_3dlut, bypass_primaries, bypass_grayscale (bool, every "
+                          "pair: the interface's stage switches — the stage keeps its settings but is NOT applied; "
+                          "runtime.set_3dlut clears bypass_3dlut and mhc.apply both MHC bypasses of its pair, "
+                          "calibration.enter clears all three for the calibrated pair and restore puts them back; "
+                          "absent on builds before 2026-10-13)}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
                           "Absent on pre-2026-09-03 builds (then the ini is the only layer evidence).",
@@ -185,8 +190,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "desktop_gamma": ApiParamSpec("boolean", required=False, description="Desktop Gamma bit, HDR only (optional)"),
                 "tonemap": ApiParamSpec("boolean", required=False, description="HDR tonemap shader flag, HDR only (optional)"),
                 "fald": ApiParamSpec("boolean", required=False, description="FALD compensation layer (Experimental), overlay path, per mode: HDR, or SDR under Windows ACM (optional)"),
+                "bypass_3dlut": ApiParamSpec("boolean", required=False, description="3D LUT stage bypass: the cube stays loaded, nothing applies it (optional; builds after 2026-10-13)"),
+                "bypass_primaries": ApiParamSpec("boolean", required=False, description="MHC primaries + white balance stage bypass: the profile is re-baked without the matrix (optional; builds after 2026-10-13)"),
+                "bypass_grayscale": ApiParamSpec("boolean", required=False, description="MHC grayscale + gamma stage bypass: the profile is re-baked with an identity 1D LUT (optional; builds after 2026-10-13)"),
             },
-            {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap,fald}",
+            {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap,fald,bypass_3dlut,bypass_primaries,bypass_grayscale}",
              "after": "object (same shape)", "regenerated": "boolean (MHC profile re-baked)",
              "profile_name": "string (the profile now associated)"},
             mutates_state=True,
@@ -577,9 +585,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ApiMethodSpec(
             "mhc.grayscale_live_begin",
             "Engage the correction-grayscale LIVE-EDIT preview (the GUI editor's 'Edit Points' "
-            "over the pipe): the correction GS stacks on top of MHC+3D-LUT so the meter sees it. "
-            "Snapshots the pre-begin correctionGrayscale for cancel/abort restore. Errors if a "
-            "session (or the GUI editor) is already active for this monitor/mode.",
+            "over the pipe): scanout runs an identity profile while the overlay applies the very "
+            "profile the commit installs (same matrix and LUT entries, the live curve composed in), "
+            "so the meter sees the bake, after the 3D LUT. Snapshots the pre-begin "
+            "correctionGrayscale for cancel/abort restore. Errors if a session (or a GUI editor) "
+            "is already active, or the mode has no installed MHC profile.",
             {"monitor": _monitor_param(), "mode": _mode_param()},
             {"monitor_mode": "string", "preview": "boolean true"},
             mutates_state=True,
@@ -587,8 +597,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "mhc.grayscale_set_live",
-            "Nudge the live-edit correction grayscale (per-patch, no ICC re-bake); the next frame "
-            "reflects it. Errors without an active grayscale_live_begin session.",
+            "Nudge the live-edit correction grayscale (per-patch, no ICC re-bake). Returns once the "
+            "change is on screen (in DWM-hook mode: the hook applied it and the screen was re-composed, "
+            "a static patch included). Errors without an active grayscale_live_begin session, or when "
+            "the change did not reach the screen.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

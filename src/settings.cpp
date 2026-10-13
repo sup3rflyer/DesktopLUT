@@ -7,6 +7,7 @@
 #include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
 #include "displayconfig.h"   // IsValidSdrWhiteNits
 #include "grayscale_validate.h"
+#include "ui/ui_window.h"
 #include <algorithm>
 #include <cwchar>
 #include <cmath>
@@ -291,6 +292,10 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileFloat(section, (p + L"MHCWhiteBalanceWx").c_str(), mhc.whiteBalanceWx, iniPath);
     WritePrivateProfileFloat(section, (p + L"MHCWhiteBalanceWy").c_str(), mhc.whiteBalanceWy, iniPath);
 
+    // Stage bypasses (the interface's per-stage switches)
+    WritePrivateProfileBool(section, (p + L"MHCBypassPrimaries").c_str(), mhc.bypassPrimaries, iniPath);
+    WritePrivateProfileBool(section, (p + L"MHCBypassGrayscale").c_str(), mhc.bypassGrayscale, iniPath);
+
     // Desktop gamma (HDR only) + the SDR white level the installed profile's DG was baked with
     if (isHDR) {
         WritePrivateProfileBool(section, (p + L"MHCDesktopGamma").c_str(), mhc.desktopGammaEnabled, iniPath);
@@ -309,11 +314,16 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     }
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
         std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
-        WritePrivateProfileStringW(section, key.c_str(), mhc.permPaths[k].c_str(), iniPath);
+        // The bypass variants (k >= 8) are written only while cached, so an INI that never used a stage
+        // switch keeps the eight entries it always had.
+        const bool keep = k < 8 || !mhc.permPaths[k].empty();
+        WritePrivateProfileStringW(section, key.c_str(), keep ? mhc.permPaths[k].c_str() : nullptr, iniPath);
         // HDR: the SDR white each cached variant's desktop gamma was baked with (0 = no DG in that bake)
-        if (isHDR)
-            WritePrivateProfileFloat(section, (p + L"MHCPermDgWhite" + std::to_wstring(k)).c_str(),
-                                     mhc.permDgWhiteNits[k], iniPath);
+        if (isHDR) {
+            const std::wstring stampKey = p + L"MHCPermDgWhite" + std::to_wstring(k);
+            if (keep) WritePrivateProfileFloat(section, stampKey.c_str(), mhc.permDgWhiteNits[k], iniPath);
+            else WritePrivateProfileStringW(section, stampKey.c_str(), nullptr, iniPath);
+        }
     }
 
     // Correction grayscale (fine-tuning on top of base)
@@ -478,6 +488,10 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         mhc.whiteBalanceWx = 0.3127f;
     if (!std::isfinite(mhc.whiteBalanceWy) || mhc.whiteBalanceWy <= 0.0f || mhc.whiteBalanceWy >= 1.0f)
         mhc.whiteBalanceWy = 0.3290f;
+
+    // Stage bypasses (absent = not bypassed)
+    mhc.bypassPrimaries = GetPrivateProfileBool(section, (p + L"MHCBypassPrimaries").c_str(), false, iniPath);
+    mhc.bypassGrayscale = GetPrivateProfileBool(section, (p + L"MHCBypassGrayscale").c_str(), false, iniPath);
 
     // Desktop gamma (HDR only). A missing reference white = a profile baked before it was tracked, i.e. at
     // the original fixed 80 nits; RefreshDesktopGammaSdrWhite re-bakes it once the live level differs.
@@ -686,6 +700,60 @@ static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key
     }
 }
 
+std::wstring EncodeIniText(const std::wstring& text) {
+    bool plain = text.compare(0, 3, L"u8:") != 0 && (text.empty() || (text.front() != L' ' && text.back() != L' '));
+    for (wchar_t c : text) if (c < 0x20 || c > 0x7E) { plain = false; break; }
+    if (plain) return text;
+    std::string utf8;
+    if (!text.empty()) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), nullptr, 0, nullptr, nullptr);
+        utf8.resize((size_t)(n > 0 ? n : 0));
+        if (n > 0) WideCharToMultiByte(CP_UTF8, 0, text.data(), (int)text.size(), utf8.data(), n, nullptr, nullptr);
+    }
+    static const wchar_t* kHex = L"0123456789ABCDEF";
+    std::wstring out = L"u8:";
+    for (unsigned char b : utf8) {
+        if (b > 0x20 && b < 0x7F && b != '%') {
+            out += (wchar_t)b;
+        } else {
+            out += L'%';
+            out += kHex[b >> 4];
+            out += kHex[b & 15];
+        }
+    }
+    return out;
+}
+
+std::wstring DecodeIniText(const std::wstring& stored) {
+    if (stored.compare(0, 3, L"u8:") != 0) return stored;
+    auto hex = [](wchar_t c) -> int {
+        if (c >= L'0' && c <= L'9') return c - L'0';
+        if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+        if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+        return -1;
+    };
+    std::string utf8;
+    for (size_t i = 3; i < stored.size(); i++) {
+        if (stored[i] == L'%') {
+            if (i + 2 >= stored.size()) return stored;   // truncated escape
+            const int hi = hex(stored[i + 1]), lo = hex(stored[i + 2]);
+            if (hi < 0 || lo < 0) return stored;
+            utf8 += (char)(hi * 16 + lo);
+            i += 2;
+        } else if (stored[i] > 0x7E) {
+            return stored;   // not ours: leave it as written
+        } else {
+            utf8 += (char)stored[i];
+        }
+    }
+    if (utf8.empty()) return std::wstring();
+    const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), (int)utf8.size(), nullptr, 0);
+    if (n <= 0) return stored;
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8.data(), (int)utf8.size(), w.data(), n);
+    return w;
+}
+
 // ============================================================================
 // SECTION: Per-monitor sections (identity-keyed [Display<slot>] + legacy [Monitor<N>])
 // ============================================================================
@@ -760,6 +828,8 @@ void LoadMonitorSettings(const wchar_t* section, MonitorSettings& ms, const wcha
 
     ms.sdrPath = sdrPath;
     ms.hdrPath = hdrPath;
+    ms.sdrLutBypass = GetPrivateProfileBool(section, L"LUT_SDR_Bypass", false, iniPath);
+    ms.hdrLutBypass = GetPrivateProfileBool(section, L"LUT_HDR_Bypass", false, iniPath);
 
     // Load color correction settings for both SDR and HDR
     LoadColorCorrectionSettings(section, L"SDR_", ms.sdrColorCorrection, iniPath);
@@ -778,6 +848,8 @@ void LoadMonitorSettings(const wchar_t* section, MonitorSettings& ms, const wcha
 void SaveMonitorSettings(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
     WritePrivateProfileStringW(section, L"LUT_SDR", ms.sdrPath.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"LUT_HDR", ms.hdrPath.c_str(), iniPath);
+    WritePrivateProfileBool(section, L"LUT_SDR_Bypass", ms.sdrLutBypass, iniPath);
+    WritePrivateProfileBool(section, L"LUT_HDR_Bypass", ms.hdrLutBypass, iniPath);
 
     // Save color correction settings for both SDR and HDR
     SaveColorCorrectionSettings(section, L"SDR_", ms.sdrColorCorrection, iniPath);
@@ -798,12 +870,17 @@ static void LoadIdentityKeys(const wchar_t* section, MonitorSettings& ms, const 
     ms.identity.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
     ms.firstSeen             = ReadLongINIString(section, L"FirstSeen", iniPath);
     ms.lastSeen              = ReadLongINIString(section, L"LastSeen", iniPath);
+    ms.label                 = DecodeIniText(ReadLongINIString(section, L"Label", iniPath));
 }
 
 static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
     if (!ms.firstSeen.empty()) WritePrivateProfileStringW(section, L"FirstSeen", ms.firstSeen.c_str(), iniPath);
     if (!ms.lastSeen.empty())  WritePrivateProfileStringW(section, L"LastSeen", ms.lastSeen.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"DisplayName", ms.identity.friendlyName.c_str(), iniPath);
+    // The user's own name for the display; absent = the automatic one (the key is removed, not left empty).
+    // Free text: escaped to ASCII (the INI stays in the system code page; DLC reads it as UTF-8).
+    const std::wstring label = EncodeIniText(ms.label);
+    WritePrivateProfileStringW(section, L"Label", label.empty() ? nullptr : label.c_str(), iniPath);
     WritePrivateProfileStringW(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
     // Written last of all the section's keys: a section with a DevicePath is a complete one.
     WritePrivateProfileStringW(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
@@ -920,6 +997,13 @@ void SaveSettings() {
     // Save startup settings
     WritePrivateProfileBool(L"General", L"StartMinimized", g_startMinimized.load(), iniPath.c_str());
 
+    // Interface
+    WritePrivateProfileStringW(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
+    WritePrivateProfileStringW(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
+    WritePrivateProfileStringW(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
+    static const wchar_t* const kThemeKeys[] = { L"dark", L"gray", L"light" };
+    WritePrivateProfileStringW(L"UI", L"Theme", kThemeKeys[g_uiTheme >= 0 && g_uiTheme <= 2 ? g_uiTheme : 0], iniPath.c_str());
+
     WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
 
     // Save per-display settings: live displays and parked (currently disconnected) ones,
@@ -950,6 +1034,7 @@ void SaveSettings() {
             }
         }
     }
+    ui::Invalidate();   // every settings change ends in a save: let the interface redraw (any thread)
 }
 
 bool LoadSettings() {
@@ -994,6 +1079,20 @@ bool LoadSettings() {
 
     // Load startup settings
     g_startMinimized.store(GetPrivateProfileBool(L"General", L"StartMinimized", false, iniPath.c_str()));
+
+    // Interface (absent = the new one)
+    {
+        wchar_t buf[MAX_PATH] = {};
+        GetPrivateProfileStringW(L"UI", L"Interface", L"new", buf, MAX_PATH, iniPath.c_str());
+        g_uiClassic = _wcsicmp(buf, L"classic") == 0;
+        buf[0] = 0;
+        g_dlcFolder = ReadLongINIString(L"UI", L"DlcFolder", iniPath.c_str());
+        const int days = (int)GetPrivateProfileIntW(L"UI", L"RecalReminderDays", 90, iniPath.c_str());
+        g_recalReminderDays = days >= 0 && days <= 3650 ? days : 90;
+        buf[0] = 0;
+        GetPrivateProfileStringW(L"UI", L"Theme", L"dark", buf, MAX_PATH, iniPath.c_str());
+        g_uiTheme = _wcsicmp(buf, L"gray") == 0 ? 1 : (_wcsicmp(buf, L"light") == 0 ? 2 : 0);   // unknown -> dark
+    }
 
     // Per-display settings: read every saved display into the parked pool, then attach
     // each live monitor's entry by identity. A display that is powered off right now

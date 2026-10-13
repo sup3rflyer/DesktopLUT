@@ -171,17 +171,37 @@ DisplayPrimariesData MhcSourcePrimaries(const MHC2ProfileParams& params);
 // source is the panel's native primaries. False (gains 1) for a degenerate basis or target.
 bool MhcWhiteBalanceGains(const DisplayPrimariesData& src, float wx, float wy, float outGains[3]);
 
-// Compute the SDR scanout transform a live grayscale FULL-PREVIEW shader must reproduce:
-//   outResult9   = net as-applied RGB->RGB matrix (row-major 3x3, WB baked in, pre-conjugation)
-//   outBaseLut*  = per-channel base 1D LUT (1024 entries, sRGB signal), correctionGrayscale OFF
-// Mirrors GenerateMHC2Profile's SDR matrix + base-LUT generation EXACTLY for the given params
-// (build them for the PERM_GS-stripped perm so corrGS is off — the shader applies corrGS live).
-// SDR only; returns false if params.isHDR. See docs realization-A (CODEX_PREVIEW_BAKE_PROMPT.md).
-bool ComputeSdrScanoutForShader(const MHC2ProfileParams& params,
-                                float outResult9[9],
-                                std::vector<float>& outBaseLutR,
-                                std::vector<float>& outBaseLutG,
-                                std::vector<float>& outBaseLutB);
+// ============================================================================
+// Scanout: what a profile does at scanout, as the file carries it
+// ============================================================================
+// GenerateMHC2Profile writes its matrix and LUTs from an MhcScanout, and the live edit preview reproduces the same
+// MhcScanout in a shader while scanout runs an identity profile (mhc_preview.h): both read the very same numbers.
+// The model of Windows' MHC2 stage (see ComputeMHC2Matrix): wire signal -> degamma (SDR sRGB, HDR PQ) -> `applied`
+// (linear RGB) -> clamp [0,1] -> regamma -> per-channel 1D LUT, linearly interpolated between its entries.
+struct MhcScanout {
+    bool isHDR = false;
+    int lutSize = 0;                 // entries per channel: 1024 SDR, 4096 HDR
+    float emit[12] = {};             // the tag's 3x4 matrix (row-major, offsets 0) before s15Fixed16
+    float applied[9] = {};           // as-applied linear RGB->RGB of the WRITTEN tag: inv(B) * s15(emit) * B
+    std::vector<float> lut[3];       // per channel; after ComposeMhcScanout exactly the values the file stores
+};
+
+// Matrix + base LUTs (base grayscale / ICC TRC / 1D cube; correction grayscale and desktop gamma not composed,
+// entries not quantized). Logs the LUT source like the bake always did.
+bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out);
+// The bake's compose step: params' correction grayscale (first), then desktop gamma (last, HDR), clamped to
+// [0,1] and quantized to the file's s15Fixed16 grid. Reads only the correction / desktop gamma fields and the
+// peak; cheap (no files). Logs nothing.
+void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, MhcScanout& out);
+// Base + compose: the profile's complete scanout.
+bool ComputeMhcScanout(const MHC2ProfileParams& params, MhcScanout& out);
+// One wire value through the scanout. lin = linear-light wire RGB (SDR relative to reference white, HDR relative
+// to 10000 nits), clamped to [0,1] as the wire carries it; out = the LUT output (SDR sRGB-encoded, HDR PQ).
+// The reference for the shader's DlutMhcScanout (shared/mhc_scanout_hlsl.h): the same steps, evaluated in double
+// on the exact curves (PQ without PqOETF's 1e-10 floor).
+void EvalMhcScanout(const MhcScanout& s, const float lin[3], float out[3]);
+// The value an s15Fixed16 field stores for f (FloatToS15Fixed16, decoded).
+float QuantizeS15Fixed16(float f);
 
 // Generate MHC2 1D LUT for SDR (1024 entries, sRGB signal domain)
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize = 1024);

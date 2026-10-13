@@ -3,6 +3,7 @@
 #include "globals.h"
 #include "monitor_identity.h"
 #include "processing.h"
+#include "dwm_inject.h"   // DwmHookMonitorLUT
 #include "fald.h"    // FALD_TAU_MAX_MS
 #include <cstdio>
 #include <cmath>
@@ -842,6 +843,15 @@ TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") 
     CHECK(ms.hdrMHC.activePerm == (MHCSettings::PERM_WB | MHCSettings::PERM_DG));
     CHECK(ms.hdrMHC.permNames[ms.hdrMHC.activePerm] == L"DesktopLUT_Mon1_HDR_1.icm");
     CHECK(ms.sdrMHC.enabled == false);
+    // No stage switch used: the bypass flags are off and the bypass variant slots (8..31) wrote nothing.
+    CHECK_FALSE(ms.hdrLutBypass);
+    CHECK_FALSE(ms.hdrMHC.bypassPrimaries);
+    CHECK_FALSE(ms.hdrMHC.bypassGrayscale);
+    wchar_t probe[64] = {};
+    GetPrivateProfileStringW(L"Display7", L"HDR_MHCPermPath9", L"<absent>", probe, 64, ini.c_str());
+    CHECK(std::wstring(probe) == L"<absent>");
+    GetPrivateProfileStringW(L"Display7", L"HDR_MHCPermPath7", L"<absent>", probe, 64, ini.c_str());
+    CHECK(std::wstring(probe) == L"");   // the classic eight are written as before
     // Bookkeeping is not part of the per-monitor keys.
     CHECK(ms.slot == -1);
     CHECK(ms.legacyIndex == -1);
@@ -855,11 +865,46 @@ TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") 
     CHECK(none.hdrMHC.desktopGammaEnabled == false);
 }
 
+TEST_CASE("Monitor settings: stage bypasses and their profile variants round-trip") {
+    TempIni ini;
+    MonitorSettings original;
+    original.hdrPath = L"C:\\luts\\hdr.cube";
+    original.hdrLutBypass = true;
+    original.hdrMHC.enabled = true;
+    original.hdrMHC.bypassGrayscale = true;
+    original.sdrMHC.bypassPrimaries = true;
+    const uint8_t perm = MHCSettings::PERM_WB | MHCSettings::PERM_NOGRAY;
+    original.hdrMHC.activePerm = perm;
+    original.hdrMHC.permPaths[perm] = L"C:\\color\\DesktopLUT_Mon0_HDR_P17_1.icm";
+    original.hdrMHC.permDgWhiteNits[perm] = 0.0f;
+    original.hdrMHC.baseGrayscale.pointCount = 20;
+    original.hdrMHC.baseGrayscale.initLinear();
+    original.sdrMHC.baseGrayscale.pointCount = 20;
+    original.sdrMHC.baseGrayscale.initLinear();
+    SaveMonitorSettings(L"Display2", original, ini.c_str());
+
+    MonitorSettings ms;
+    LoadMonitorSettings(L"Display2", ms, ini.c_str());
+    CHECK(ms.hdrLutBypass);
+    CHECK_FALSE(ms.sdrLutBypass);
+    CHECK(ms.hdrMHC.bypassGrayscale);
+    CHECK_FALSE(ms.hdrMHC.bypassPrimaries);
+    CHECK(ms.sdrMHC.bypassPrimaries);
+    CHECK(ms.hdrMHC.activePerm == perm);
+    CHECK(ms.hdrMHC.permNames[perm] == L"DesktopLUT_Mon0_HDR_P17_1.icm");
+    CHECK(ms.hdrMHC.permDgWhiteNits[perm] == 0.0f);
+    // The cube that runs: none while bypassed, the configured one otherwise.
+    CHECK(LiveLutPath(ms, true).empty());
+    ms.hdrLutBypass = false;
+    CHECK(LiveLutPath(ms, true) == L"C:\\luts\\hdr.cube");
+}
+
 TEST_CASE("Pool: loads identity-keyed displays and unclaimed legacy sections") {
     TempIni ini;
     WritePrivateProfileStringW(L"Display3", L"DevicePath", L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}", ini.c_str());
     WritePrivateProfileStringW(L"Display3", L"EdidId", L"GSM84CD-16843009", ini.c_str());
     WritePrivateProfileStringW(L"Display3", L"DisplayName", L"LG TV SSCR2", ini.c_str());
+    WritePrivateProfileStringW(L"Display3", L"Label", L"Living room TV", ini.c_str());
     WritePrivateProfileStringW(L"Display3", L"LUT_SDR", L"C:\\luts\\lg.cube", ini.c_str());
     WritePrivateProfileStringW(L"Monitor0", L"LUT_SDR", L"C:\\luts\\mon0.cube", ini.c_str());
     WritePrivateProfileStringW(L"Monitor1", L"LUT_SDR", L"C:\\luts\\mon1.cube", ini.c_str());
@@ -873,9 +918,11 @@ TEST_CASE("Pool: loads identity-keyed displays and unclaimed legacy sections") {
     CHECK(pool[0].identity.devicePath == L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}");
     CHECK(pool[0].identity.edidId == L"GSM84CD-16843009");
     CHECK(pool[0].identity.friendlyName == L"LG TV SSCR2");
+    CHECK(pool[0].label == L"Living room TV");   // the user's name rides with the display
     CHECK(pool[0].sdrPath == L"C:\\luts\\lg.cube");
 
     CHECK(pool[1].slot == -1);
+    CHECK(pool[1].label.empty());
     CHECK(pool[1].legacyIndex == 0);
     CHECK(pool[1].identity.empty());
     CHECK(pool[1].sdrPath == L"C:\\luts\\mon0.cube");
@@ -932,6 +979,83 @@ TEST_CASE("LoadSettings/SaveSettings: [General] HdrDither defaults on and round-
     LoadSettings();
     CHECK(g_hdrDither.load() == false);                 // the kill switch survives a restart
     g_hdrDither = true;
+}
+
+TEST_CASE("INI free text: plain ASCII stays readable, anything else round-trips through an ASCII escape") {
+    CHECK(EncodeIniText(L"Desk left") == L"Desk left");
+    CHECK(EncodeIniText(L"") == L"");
+    const std::wstring nordic = L"\x00C1g\x00FAst's \x00DE\x00F3r";   // non-ASCII letters
+    const std::wstring enc = EncodeIniText(nordic);
+    CHECK(enc.compare(0, 3, L"u8:") == 0);
+    for (wchar_t c : enc) CHECK((c >= 0x20 && c <= 0x7E));
+    CHECK(DecodeIniText(enc) == nordic);
+    const std::wstring emoji = L"TV \xD83D\xDCFA";                       // a surrogate pair
+    CHECK(DecodeIniText(EncodeIniText(emoji)) == emoji);
+    CHECK(DecodeIniText(EncodeIniText(L" padded ")) == L" padded ");     // ends kept
+    CHECK(DecodeIniText(EncodeIniText(L"u8:literal")) == L"u8:literal"); // the prefix itself is escaped
+    CHECK(DecodeIniText(EncodeIniText(L"100%")) == L"100%");
+    CHECK(DecodeIniText(L"Plain name") == L"Plain name");               // written by an older build
+    CHECK(DecodeIniText(L"u8:bad%G1") == L"u8:bad%G1");                 // not ours: unchanged
+    CHECK(DecodeIniText(L"u8:cut%4") == L"u8:cut%4");
+}
+
+TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, round-trip and clear") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    WritePrivateProfileStringW(L"General", L"StartMinimized", L"false", ini);   // an INI without [UI]
+    g_uiClassic = true;
+    g_dlcFolder = L"stale";
+    LoadSettings();
+    CHECK(g_uiClassic == false);                        // absent -> the new interface
+    CHECK(g_dlcFolder.empty());
+    CHECK(g_recalReminderDays == 90);                   // absent -> 90 days
+    g_recalReminderDays = 0;                            // off survives a round trip
+    SaveSettings();
+    g_recalReminderDays = 7;
+    LoadSettings();
+    CHECK(g_recalReminderDays == 0);
+    WritePrivateProfileStringW(L"UI", L"RecalReminderDays", L"-5", ini);
+    LoadSettings();
+    CHECK(g_recalReminderDays == 90);                   // nonsense -> the default
+    CHECK(g_uiTheme == 0);                              // absent -> dark
+    wchar_t buf0[MAX_PATH] = {};
+    g_uiTheme = 2;
+    SaveSettings();
+    GetPrivateProfileStringW(L"UI", L"Theme", L"", buf0, MAX_PATH, ini);
+    CHECK(std::wstring(buf0) == L"light");
+    g_uiTheme = 0;
+    LoadSettings();
+    CHECK(g_uiTheme == 2);
+    WritePrivateProfileStringW(L"UI", L"Theme", L"GRAY", ini);
+    LoadSettings();
+    CHECK(g_uiTheme == 1);                              // case-insensitive
+    WritePrivateProfileStringW(L"UI", L"Theme", L"sepia", ini);
+    LoadSettings();
+    CHECK(g_uiTheme == 0);                              // unknown -> dark
+    g_uiClassic = true;
+    g_dlcFolder = L"D:\\Calibration\\DLC";
+    SaveSettings();
+    wchar_t buf[MAX_PATH] = {};
+    GetPrivateProfileStringW(L"UI", L"Interface", L"", buf, MAX_PATH, ini);
+    CHECK(std::wstring(buf) == L"classic");
+    g_uiClassic = false;
+    g_dlcFolder.clear();
+    LoadSettings();
+    CHECK(g_uiClassic == true);
+    CHECK(g_dlcFolder == L"D:\\Calibration\\DLC");
+    g_dlcFolder.clear();
+    SaveSettings();                                     // empty folder: the key goes
+    GetPrivateProfileStringW(L"UI", L"DlcFolder", L"<absent>", buf, MAX_PATH, ini);
+    CHECK(std::wstring(buf) == L"<absent>");
+    WritePrivateProfileStringW(L"UI", L"Interface", L"CLASSIC", ini);
+    g_uiClassic = false;
+    LoadSettings();
+    CHECK(g_uiClassic == true);                         // case-insensitive
+    g_uiClassic = false;
 }
 
 TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sections once matched") {
@@ -1201,6 +1325,189 @@ TEST_CASE("Processing predicates: MHC-only needs no processing but counts as a c
 
     g_userDesktopGammaMode = dg;
     g_gui.monitorSettings.clear();
+}
+
+namespace {
+
+// Saves and restores the globals the processing predicates read.
+struct PredicateGlobalsGuard {
+    bool hook = g_dwmHookMode.load();
+    bool dg = g_userDesktopGammaMode.load();
+    bool analysis = g_analysisEnabled.load();
+    std::vector<HMONITOR> monitors = g_gui.monitors;
+    PredicateGlobalsGuard() {
+        g_userDesktopGammaMode = false;
+        g_analysisEnabled = false;
+        g_gui.monitorSettings.clear();
+    }
+    ~PredicateGlobalsGuard() {
+        g_dwmHookMode = hook;
+        g_userDesktopGammaMode = dg;
+        g_analysisEnabled = analysis;
+        g_gui.monitors = monitors;
+        g_gui.monitorSettings.clear();
+    }
+};
+
+const wchar_t* kHdrPanel = L"C:\\panels\\pa32ucxr_fald_panel.bin";
+const wchar_t* kSdrPanel = L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin";
+
+}  // namespace
+
+// A display whose only correction is the FALD layer never got the DWM hook: MonitorNeedsProcessing counted
+// FALD only in overlay mode (from when the layer was overlay-only), so StartProcessing, the hook watchdog and
+// the live-layer reconcile (all built on DesiredDwmHookStagingSet) filtered it out, although the DLL runs
+// exactly that setup. Hook mode: the layer on with that mode's panel file. Overlay: the switch alone, as
+// before. And in hook mode the overlay stays down for it: the hook runs the layer.
+TEST_CASE("Processing predicates: the FALD layer needs processing in both engines; hook mode needs its panel file") {
+    PredicateGlobalsGuard guard;
+    REQUIRE_FALSE(g_gui.processingThread.joinable());   // HasActiveShaderCorrections then checks the settings
+    REQUIRE_FALSE(g_mhcEditDialogOpen.load());
+
+    MonitorSettings fald;      // HDR row on, with its panel file; nothing else
+    fald.hdrColorCorrection.fald.enabled = true;
+    fald.hdrColorCorrection.fald.paramsPath = kHdrPanel;
+    MonitorSettings sdrFald;   // SDR (ACM) row alone
+    sdrFald.sdrColorCorrection.fald.enabled = true;
+    sdrFald.sdrColorCorrection.fald.paramsPath = kSdrPanel;
+    MonitorSettings noFile;    // on without a panel file (an old INI; the GUI refuses to switch it on so)
+    noFile.hdrColorCorrection.fald.enabled = true;
+    MonitorSettings off;       // panel file set, layer off
+    off.hdrColorCorrection.fald.paramsPath = kHdrPanel;
+    MonitorSettings crossed;   // HDR row on, only the SDR row has a file: the rows are per mode
+    crossed.hdrColorCorrection.fald.enabled = true;
+    crossed.sdrColorCorrection.fald.paramsPath = kSdrPanel;
+
+    SUBCASE("hook mode") {
+        g_dwmHookMode = true;
+        CHECK(MonitorNeedsProcessing(fald));
+        CHECK(MonitorNeedsProcessing(sdrFald));
+        CHECK_FALSE(MonitorNeedsProcessing(noFile));
+        CHECK_FALSE(MonitorNeedsProcessing(off));
+        CHECK_FALSE(MonitorNeedsProcessing(crossed));
+
+        g_gui.monitorSettings = { fald };
+        CHECK(AnyMonitorNeedsProcessing());     // startup, display change, topology tick and reconcile start it
+        CHECK(AnyMonitorHasCorrections());
+        CHECK_FALSE(HasActiveShaderCorrections());           // no overlay, no analysis-only thread
+        CHECK_FALSE(EvalNonAnalysisShaderCorrections());
+
+        g_gui.monitorSettings = { sdrFald };
+        CHECK_FALSE(HasActiveShaderCorrections());
+        CHECK_FALSE(EvalNonAnalysisShaderCorrections());
+
+        g_gui.monitorSettings = { off, noFile, crossed };
+        CHECK_FALSE(AnyMonitorNeedsProcessing());
+    }
+    SUBCASE("overlay mode: the switch alone, as before") {
+        g_dwmHookMode = false;
+        CHECK(MonitorNeedsProcessing(fald));
+        CHECK(MonitorNeedsProcessing(sdrFald));
+        CHECK(MonitorNeedsProcessing(noFile));
+        CHECK(MonitorNeedsProcessing(crossed));
+        CHECK_FALSE(MonitorNeedsProcessing(off));
+
+        g_gui.monitorSettings = { fald };
+        CHECK(HasActiveShaderCorrections());
+        CHECK(EvalNonAnalysisShaderCorrections());
+    }
+}
+
+// Desktop gamma configured but toggled off by its hotkey (the hotkey flips only the in-memory flag): the
+// running pipeline hosts that hotkey, so the reconcile counts the persisted setting. StartProcessing filtered
+// displays by MonitorNeedsProcessing (the in-memory flag), so any restart in that state (a re-staged hook, a
+// cleared cube, an engine switch) ended stopped with the hotkey unregistered, and every later reconcile asked
+// for a start that started nothing. A start now runs exactly when the live layers are needed.
+TEST_CASE("Processing predicates: configured desktop gamma keeps the pipeline and its hotkey through a restart") {
+    PredicateGlobalsGuard guard;   // g_userDesktopGammaMode false: toggled off
+    MonitorSettings dg;            // desktop gamma configured (HDR MHC), nothing else
+    dg.hdrMHC.desktopGammaEnabled = true;
+    MonitorSettings plain;         // nothing at all
+    g_gui.monitorSettings = { dg, plain };
+    CHECK_FALSE(AnyMonitorNeedsProcessing());
+    CHECK(LiveLayersNeeded());
+    std::vector<MonitorLUTConfig> configs = BuildPipelineConfigs();   // what StartProcessing builds
+    REQUIRE(configs.size() == 2);                                     // every display, as with the mode on
+    CHECK(configs[0].monitorIndex == 0);
+    CHECK(configs[1].monitorIndex == 1);
+
+    // Not configured anywhere: nothing to run (the MHC-only path).
+    g_gui.monitorSettings = { plain };
+    CHECK_FALSE(LiveLayersNeeded());
+    CHECK(BuildPipelineConfigs().empty());
+
+    // A start builds a pipeline exactly when the live layers are needed, in both engines; without desktop
+    // gamma, exactly the displays that need processing join.
+    MonitorSettings cube;
+    cube.sdrPath = L"C:\\luts\\x.cube";
+    for (int bits = 0; bits < 16; bits++) {
+        const bool hook = bits & 1, dgOn = bits & 2, dgConfigured = bits & 4, withCube = bits & 8;
+        CAPTURE(bits);
+        g_dwmHookMode = hook;
+        g_userDesktopGammaMode = dgOn;
+        MonitorSettings first = plain;
+        first.hdrMHC.desktopGammaEnabled = dgConfigured;
+        g_gui.monitorSettings = { first, withCube ? cube : plain };
+        configs = BuildPipelineConfigs();
+        CHECK(!configs.empty() == LiveLayersNeeded());
+        CHECK(LiveLayersNeeded() == (dgOn || dgConfigured || withCube));
+        const size_t expected = (dgOn || dgConfigured) ? 2u : (withCube ? 1u : 0u);
+        CHECK(configs.size() == expected);
+        if (expected == 1) CHECK(configs[0].sdrLutPath == cube.sdrPath);
+    }
+}
+
+// The staging set StartProcessing injects, the watchdog re-injects and the reconcile compares against the
+// resident hook. Only GetMonitorInfo on the primary display: nothing is injected.
+TEST_CASE("DesiredDwmHookStagingSet: a FALD-only display is staged with its panel files") {
+    PredicateGlobalsGuard guard;
+    HMONITOR primary = MonitorFromPoint(POINT{ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!primary || !GetMonitorInfo(primary, &mi)) { MESSAGE("skipped: no display to stage"); return; }
+    g_gui.monitors = { primary };
+    g_dwmHookMode = true;
+
+    MonitorSettings ms;
+    ms.hdrColorCorrection.fald.enabled = true;
+    ms.hdrColorCorrection.fald.paramsPath = kHdrPanel;
+    ms.sdrColorCorrection.fald.paramsPath = kSdrPanel;   // SDR row off
+
+    g_gui.monitorSettings = { ms };
+    std::vector<DwmHookMonitorLUT> set = DesiredDwmHookStagingSet();
+    REQUIRE(set.size() == 1);
+    CHECK(set[0].left == mi.rcMonitor.left);
+    CHECK(set[0].top == mi.rcMonitor.top);
+    CHECK(set[0].sdrLutPath.empty());
+    CHECK(set[0].hdrLutPath.empty());
+    CHECK(set[0].hdrFaldPath == kHdrPanel);
+    CHECK(set[0].sdrFaldPath == kSdrPanel);   // staged too: switching that row on rides the shared config
+
+    // The set is the displays with hook work (MonitorNeedsDwmHook, a panel file is enough); whether the
+    // pipeline runs at all is MonitorNeedsProcessing's call. Once it runs for another display, a layer
+    // switched on later rides the shared config.
+    SUBCASE("layer off, nothing else: staged, but nothing needs the pipeline") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.enabled = false;
+        CHECK(DesiredDwmHookStagingSet().size() == 1);
+        CHECK_FALSE(AnyMonitorNeedsProcessing());
+    }
+    SUBCASE("on without its own panel file: staged for the other row's file, nothing needs the pipeline") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.paramsPath.clear();
+        CHECK(DesiredDwmHookStagingSet().size() == 1);
+        CHECK_FALSE(AnyMonitorNeedsProcessing());
+    }
+    SUBCASE("no panel file on either row: no hook work") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.paramsPath.clear();
+        g_gui.monitorSettings[0].sdrColorCorrection.fald.paramsPath.clear();
+        CHECK(DesiredDwmHookStagingSet().empty());
+    }
+    SUBCASE("layer off beside a cube: the panel files still ride along") {
+        g_gui.monitorSettings[0].hdrColorCorrection.fald.enabled = false;
+        g_gui.monitorSettings[0].hdrPath = L"C:\\luts\\x.cube";
+        set = DesiredDwmHookStagingSet();
+        REQUIRE(set.size() == 1);
+        CHECK(set[0].hdrFaldPath == kHdrPanel);
+        CHECK(set[0].sdrFaldPath == kSdrPanel);
+    }
 }
 
 TEST_CASE("MHC settings: profiles baked by older white-balance maths are forgotten / re-baked once") {

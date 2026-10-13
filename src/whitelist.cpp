@@ -337,8 +337,8 @@ static void CheckMhcProfiles() {
         for (int i = 0; i < numMonitors; i++) {
             const auto& ms = g_gui.monitorSettings[i];
             snapshots.push_back({
-                ms.sdrMHC.enabled, ms.sdrMHC.profileName,
-                ms.hdrMHC.enabled, ms.hdrMHC.profileName
+                ms.sdrMHC.enabled, MhcScanoutName(ms.sdrMHC),
+                ms.hdrMHC.enabled, MhcScanoutName(ms.hdrMHC)
             });
         }
         hwndMain = g_gui.hwndMain;
@@ -384,7 +384,7 @@ static void CheckMhcProfiles() {
                 if (i >= (int)g_gui.monitorSettings.size()) return;
                 const MHCSettings& mNow = isHDR ? g_gui.monitorSettings[i].hdrMHC
                                                 : g_gui.monitorSettings[i].sdrMHC;
-                if (!mNow.enabled || mNow.profileName != expected) return;
+                if (!mNow.enabled || MhcScanoutName(mNow) != expected) return;
             }
             std::wcout << L"MHC monitor: " << (isHDR ? L"HDR" : L"SDR") << L" profile displaced on monitor " << i
                        << L" (expected '" << expected

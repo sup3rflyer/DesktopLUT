@@ -6589,13 +6589,13 @@ class Calibration:
         """Patch-by-patch main-GUI Grayscale touch-up — automates DesktopLUT's live editor.
 
         Mirrors the manual "Edit Points → adjust → OK" workflow over the pipe: ``grayscale_live_begin``
-        engages the preview shader (the MHC ``correctionGrayscale`` stacks live on top of MHC+3D-LUT so
-        the meter SEES it — render.cpp:346 ``corrGsPreviewActive`` gate), then per editor grey point we
-        measure → nudge the point's R/G/B live → re-measure, move on; ``grayscale_commit`` (the
-        editor's "OK") bakes the result into the ICM at the END of this stage so ``measure:verify``
-        scores the REAL baked result (the live preview is only bit-identical to the bake on the SDR
-        realization-A path — HDR previews light that differs, so verifying the preview would ship an
-        unverified deliverable). Revert is DLC-owned (fable Phase 7a, Design B): the pre-begin
+        engages the live preview (scanout runs an identity profile while the overlay applies the very
+        profile the commit installs, the live ``correctionGrayscale`` composed in — mhc_preview.h — so
+        the meter SEES the bake, SDR and HDR), then per editor grey point we measure → nudge the
+        point's R/G/B live → re-measure, move on; ``grayscale_commit`` (the editor's "OK") bakes the
+        result into the ICM at the END of this stage so ``measure:verify`` scores the REAL baked result
+        (the preview equals the bake's maths; the installed profile is what ships, and Windows' own MHC2
+        evaluator is what the panel sees). Revert is DLC-owned (fable Phase 7a, Design B): the pre-begin
         correctionGrayscale is snapshotted to dlc_state before the edit, and ``verify:accept =
         revert`` re-applies it (``_restore_correction_grayscale``) rather than relying on the C++
         ``grayscale_cancel`` (a no-op once commit has run) — robust across a DesktopLUT restart.

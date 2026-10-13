@@ -1,0 +1,152 @@
+#include "ui_snapshot.h"
+
+#include "globals.h"
+#include "displayconfig.h"
+#include "dwm_inject.h"
+#include "actions/notify.h"
+#include "actions/reconcile.h"
+#include "dlc/dlc_scan.h"
+#include "desktoplut_ipc_server.h"
+#include <dxgi1_6.h>
+#include <mutex>
+
+namespace ui {
+
+namespace {
+
+struct ModeEntry {
+    HMONITOR hmon = nullptr;
+    Mode mode = Mode::Unknown;
+    std::wstring name;
+};
+std::vector<ModeEntry> g_modeCache;   // GUI thread only
+
+Mode FromDisplayColorMode(DisplayColorMode m) {
+    switch (m) {
+    case DisplayColorMode::HDR:    return Mode::HDR;
+    case DisplayColorMode::AcmSdr: return Mode::AcmSdr;
+    case DisplayColorMode::SDR:    return Mode::SDR;
+    default:                       return Mode::Unknown;
+    }
+}
+
+const ModeEntry* FindMode(HMONITOR h) {
+    for (const ModeEntry& e : g_modeCache) if (e.hmon == h) return &e;
+    return nullptr;
+}
+
+}  // namespace
+
+void RefreshModeCache() {
+    std::vector<HMONITOR> mons;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        mons = g_gui.monitors;
+    }
+    std::vector<ModeEntry> fresh;
+    fresh.reserve(mons.size());
+    for (HMONITOR h : mons) {
+        ModeEntry e;
+        e.hmon = h;
+        DisplayInfo di;
+        const bool haveDi = GetDisplayInfoForHMonitor(h, di);
+        if (haveDi) e.name = di.name;
+        DXGI_OUTPUT_DESC1 desc = {};
+        if (QueryFreshOutputDesc(h, desc)) {
+            // Same verdict as windows.query_monitors: DXGI sees HDR / FP16 SDR but not ACM, which comes
+            // from DisplayConfig (displayconfig.h DisplayColorMode).
+            const bool hdrActive = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+            const bool fp16Sdr = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            DisplayColorModeResult cm = haveDi ? QueryDisplayColorMode(di, hdrActive, fp16Sdr)
+                                               : ClassifyDisplayColorMode(hdrActive, fp16Sdr, false, 0, false, false);
+            e.mode = FromDisplayColorMode(cm.mode);
+        }
+        fresh.push_back(std::move(e));
+    }
+    g_modeCache = std::move(fresh);
+}
+
+void TakeSnapshot(Snapshot& out) {
+    out.live.clear();
+    out.parked.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        out.live.reserve(g_gui.monitorSettings.size());
+        for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+            DisplayRow r;
+            r.liveIndex = (int)i;
+            r.hmon = i < g_gui.monitors.size() ? g_gui.monitors[i] : nullptr;
+            r.settings = g_gui.monitorSettings[i];
+            out.live.push_back(std::move(r));
+        }
+        out.parked.reserve(g_gui.parkedSettings.size());
+        for (const MonitorSettings& ms : g_gui.parkedSettings) {
+            DisplayRow r;
+            r.settings = ms;
+            r.name = !ms.label.empty() ? ms.label : DisplayLabel(ms.identity, std::wstring());
+            out.parked.push_back(std::move(r));
+        }
+    }
+    for (DisplayRow& r : out.live) {
+        const ModeEntry* m = FindMode(r.hmon);
+        r.mode = m ? m->mode : Mode::Unknown;
+        r.name = !r.settings.label.empty() ? r.settings.label : DisplayLabel(r.settings.identity, m ? m->name : std::wstring());
+        MONITORINFO mi = { sizeof(mi) };
+        if (r.hmon && GetMonitorInfo(r.hmon, &mi)) {
+            r.primary = (mi.dwFlags & MONITORINFOF_PRIMARY) != 0;
+            r.widthPx = mi.rcMonitor.right - mi.rcMonitor.left;
+            r.heightPx = mi.rcMonitor.bottom - mi.rcMonitor.top;
+        }
+    }
+
+    // DLC records for every display, live and remembered.
+    out.dlc = dlc::Current();
+    // Identical twins: how many displays (live or remembered) share each hardware id.
+    std::vector<std::string> ids;
+    for (const DisplayRow& r : out.live) ids.push_back(dlc::HardwareIdOf(r.settings.identity.edidId, r.settings.identity.devicePath));
+    for (const DisplayRow& r : out.parked) ids.push_back(dlc::HardwareIdOf(r.settings.identity.edidId, r.settings.identity.devicePath));
+    auto twins = [&](const DisplayRow& r) {
+        const std::string id = dlc::HardwareIdOf(r.settings.identity.edidId, r.settings.identity.devicePath);
+        if (id.empty()) return 1;
+        int n = 0;
+        for (const std::string& x : ids) if (_stricmp(x.c_str(), id.c_str()) == 0) n++;
+        return n > 0 ? n : 1;
+    };
+    auto attach = [&](DisplayRow& r) {
+        const MonitorSettings& ms = r.settings;
+        dlc::LiveDisplay& live = r.dlcLive;
+        live = dlc::LiveDisplay();
+        live.hardwareId = dlc::HardwareIdOf(ms.identity.edidId, ms.identity.devicePath);
+        live.monitor = r.liveIndex;
+        live.sameModelCount = twins(r);
+        // What RUNS: a bypassed stage is not DLC's record any more (its verification no longer describes it).
+        const MHCSettings* mhc[2] = { &ms.sdrMHC, &ms.hdrMHC };
+        for (int k = 0; k < 2; k++)
+            if (mhc[k]->enabled && !mhc[k]->profileName.empty() && !mhc[k]->bypassPrimaries && !mhc[k]->bypassGrayscale)
+                live.mhcSource[k] = mhc[k]->sourceFilePath;
+        live.lut[0] = LiveLutPath(ms, false);
+        live.lut[1] = LiveLutPath(ms, true);
+        r.dlcMatch = out.dlc->folder.empty() ? dlc::DisplayMatch() : dlc::MatchDisplay(*out.dlc, live);
+        r.reminderDue = false;
+        for (int k = 0; k < 2; k++) {
+            r.dlcRecord[k] = r.dlcMatch.name.empty() ? dlc::ModeRecord()
+                                                     : dlc::RecordFor(*out.dlc, r.dlcMatch.name, k, live, g_recalReminderDays);
+        }
+        if (!r.dlcMatch.name.empty()) r.reminderDue = r.dlcRecord[PipelineIsHdr(r.mode) ? 1 : 0].reminderDue;
+    };
+    for (DisplayRow& r : out.live) attach(r);
+    for (DisplayRow& r : out.parked) attach(r);
+
+    out.running = g_gui.isRunning.load();
+    out.suspended = act::LiveLayersSuspended();
+    out.calibrating = IsCalibrationOrLiveEditActive();   // locks of its own: outside the settings lock above
+    out.hookMode = g_dwmHookMode.load();
+    out.hookActive = out.hookMode && IsDwmHookActive();
+
+    out.lastStatus.clear();
+    for (auto it = notify::Snapshot(32); !it.empty(); it.pop_back()) {
+        if (it.back().source == L"status") { out.lastStatus = it.back().title; break; }
+    }
+}
+
+}  // namespace ui

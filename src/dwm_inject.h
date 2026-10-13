@@ -30,6 +30,8 @@ struct DwmHookMonitorLUT {
 // stalls dwm.exe on the detach, re-patches, and re-rolls twin routing (T2.10). Files are read at attach
 // only, so a changed file at the same path still needs a Stop (eject) + Start.
 bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors);
+// The staging set of the last successful injection (empty, `*valid` false, when none describes the hook).
+std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid);
 
 // Check if the DWM hook is active via named event (lightweight, no elevation needed).
 // The injected DLL creates Global\DesktopLUT_DwmHook_Active on attach.
@@ -58,6 +60,20 @@ void UpdateDwmHookSharedConfig();
 
 // Close shared memory mapping. Called on uninject/stop.
 void CloseDwmHookSharedMemory();
+
+// --- Live edit preview through the hook (DwmHookMhcPreview; src/mhc_preview.h) ---
+// Writes the preview block for monitor `monitorIndex` (its desktop position is the key) and publishes its generation in
+// the config; the DLL applies it from its next present. Returns the generation (0 = not written: no shared memory, or
+// no such monitor). `lut` = three channels of `lutSize` entries.
+uint32_t PublishDwmHookMhcPreview(int monitorIndex, bool isHdr, const float applied[9], int lutSize,
+                                  const std::vector<float> lut[3]);
+// No preview: generation 0 in the config. True when a preview was published (a recomposition is then requested).
+bool ClearDwmHookMhcPreview();
+// The generation the resident DLL last acknowledged (0 = none: no block, or a DLL that predates the preview).
+uint32_t DwmHookMhcPreviewAck();
+// The generation the config carries now (0 = none). A re-created shared memory re-publishes the wanted block under a
+// new one, so this can move without a publish.
+uint32_t DwmHookMhcPreviewGen();
 
 // Invalidate cached DXGI monitor info (call on WM_DISPLAYCHANGE).
 void InvalidateDxgiMonitorCache();

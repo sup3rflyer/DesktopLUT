@@ -8,6 +8,7 @@
 #include "noise.h"     // NOISE_SIZE
 #include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the overlay)
 #include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF dither, shared with the overlay)
+#include "../shared/mhc_scanout_hlsl.h" // DLUT_MHC_SCANOUT_HLSL (the live edit preview's MHC2 stage, shared with the overlay)
 
 // Main vertex + pixel shader (VS, PS) — handles HDR/SDR/ACM color modes, ICtCp tonemapping, 3D LUT, output dither
 static char g_shaders[] = R"(
@@ -49,6 +50,15 @@ cbuffer Constants : register(b0) {
 	float hdrDitherLsb;  // HDR output dither amplitude: 1/1023 (+-1 LSB of 10-bit PQ, TPDF) or 0 = off
 	float pad2;
 };
+
+// Live edit preview (src/mhc_preview.h): this monitor's scanout runs an identity profile and the pass applies its MHC
+// profile last (DLUT_MHC_SCANOUT_HLSL). Unbound (reads 0) = off. xyz = the as-applied matrix rows.
+cbuffer MhcPreview : register(b1) {
+	float4 mhcRow0;      // w = on (0/1)
+	float4 mhcRow1;      // w = LUT entries per channel
+	float4 mhcRow2;      // w = 0
+};
+Texture2D<float> mhcLutTex : register(t6);   // the profile's LUTs, rows R/G/B
 
 // BT.709 <-> Rec.2020 conversion
 static float3x3 scrgb_to_bt2100 = {
@@ -213,6 +223,9 @@ float3 HdrDitherNoise(float2 pos) {
 	              noiseTex.Sample(noiseSmp, uv + float2(0.0, 0.5)).x);
 }
 
+)" DLUT_MHC_SCANOUT_HLSL R"(
+float3x3 MhcPreviewMatrix() { return float3x3(mhcRow0.xyz, mhcRow1.xyz, mhcRow2.xyz); }
+
 // ========== LUT sampling ==========
 
 float3 SampleLut(float3 index) {
@@ -303,6 +316,17 @@ float4 PS(VS_OUTPUT input) : SV_TARGET {
 			rec2020 = mul(LMS_to_Rec2020, PQ_to_Linear(lmsPQ2));
 		}
 
+		if (mhcRow0.w > 0.5) {
+			// Live edit preview: the profile applied to exactly what this pass outputs otherwise (BT.2020, 10000
+			// nits = 1, before the dither), then the dither, in PQ, on the panel's signal.
+			float3 lin = rec2020;
+			if (hasLut) lin = pq_eotf(saturate(LutTransformTetrahedral(pq_inv_eotf(saturate(rec2020)))));
+			float3 outPQ = DlutMhcScanout(lin, MhcPreviewMatrix(), mhcLutTex, (int)mhcRow1.w, true);
+			outPQ = saturate(DlutDitherPQ(outPQ, HdrDitherNoise(input.pos.xy), hdrDitherLsb));
+			return float4(mul(bt2100_to_scrgb,
+				float3(DlutMhcPqEotf(outPQ.x), DlutMhcPqEotf(outPQ.y), DlutMhcPqEotf(outPQ.z))), 1);
+		}
+
 		// Output dither in the display quantizer's domain (PQ), AFTER the LUT (shared/hdr_dither.h).
 		float3 u = HdrDitherNoise(input.pos.xy);
 		float3 pq = pq_inv_eotf(saturate(rec2020));
@@ -319,12 +343,30 @@ float4 PS(VS_OUTPUT input) : SV_TARGET {
 		}
 	}
 	else if (colorMode == 2) {
+		if (mhcRow0.w > 0.5) {
+			// Live edit preview: the profile applied to what this pass outputs otherwise (the desktop itself when no
+			// LUT runs); scanout encodes the output and the identity profile passes it, so it is decoded exactly.
+			float3 lin = saturate(sample);
+			if (hasLut) lin = srgb_decode(LutTransformTetrahedral(srgb_encode(saturate(sample))));
+			float3 o = DlutMhcScanout(lin, MhcPreviewMatrix(), mhcLutTex, (int)mhcRow1.w, false);
+			return float4(DlutMhcSrgbEotf(o.r), DlutMhcSrgbEotf(o.g), DlutMhcSrgbEotf(o.b), 1);
+		}
 		// ACM SDR: scRGB linear -> sRGB encode -> LUT -> sRGB decode -> scRGB
 		float3 srgb = srgb_encode(saturate(sample));
 		float3 res = LutTransformTetrahedral(srgb);
 		return float4(srgb_decode(res), 1);
 	}
 	else {
+		if (mhcRow0.w > 0.5) {
+			// Live edit preview: the profile applied to the encoded signal this pass outputs otherwise (through the
+			// profile's sRGB degamma), then the same dither to the back buffer's depth.
+			float3 sig = sample;
+			if (hasLut) sig = LutTransformTetrahedral(sample);
+			float3 w = saturate(sig);
+			float3 o = DlutMhcScanout(float3(DlutMhcSrgbEotf(w.r), DlutMhcSrgbEotf(w.g), DlutMhcSrgbEotf(w.b)),
+			                          MhcPreviewMatrix(), mhcLutTex, (int)mhcRow1.w, false);
+			return float4(OrderedDither(o, input.pos.xy), 1);
+		}
 		// Legacy SDR: 8-bit sRGB gamma input -> LUT -> dither
 		float3 res = LutTransformTetrahedral(sample);
 		res = OrderedDither(res, input.pos.xy);

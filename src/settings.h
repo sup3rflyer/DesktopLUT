@@ -60,6 +60,12 @@ constexpr int kIniVersion = 2;
 // Today's local date as ISO "YYYY-MM-DD" (the FirstSeen / LastSeen stamps).
 std::wstring TodayIsoDate();
 
+// Free text for the INI, which stays in the system code page (DLC reads it as UTF-8, so it never becomes
+// UTF-16): printable ASCII as is, anything else as "u8:" + UTF-8 with %XX escapes. Decode leaves text
+// it did not write unchanged.
+std::wstring EncodeIniText(const std::wstring& text);
+std::wstring DecodeIniText(const std::wstring& stored);
+
 // Sorted, unique numeric suffixes of sections named "<prefix><digits>" — the prefix is
 // matched case-insensitively (the profile API is case-insensitive, so "[display3]" IS
 // section Display3); digit strings with a leading zero are skipped with a log line

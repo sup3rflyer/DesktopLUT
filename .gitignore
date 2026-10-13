@@ -17,6 +17,7 @@ ipch/
 *.cube
 *.txt
 !README*.txt
+!third_party/**/LICENSE*.txt
 !tests/fixtures/*.cube
 
 # Calibration data

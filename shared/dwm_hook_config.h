@@ -75,11 +75,26 @@ struct DwmHookSharedConfig {
     // reserved words read 0) leaves the dither on. 1 = off (INI [General] HdrDither=0 / the GUI checkbox).
     uint32_t hdrDitherOff;
 
-    uint32_t _reserved[4];           // Future expansion
+    // 3D LUT stage bypass (the interface's stage switch): bit i = monitors[i]'s cube is skipped for the mode
+    // it is in RIGHT NOW (the host picks the SDR or HDR flag by monitors[i].isHdr, as for faldFlags). The
+    // cube stays staged and loaded, so switching back is instant. Taken from _reserved for the same reason
+    // as faldFlags: 0 = applied, so a host that predates the field leaves every cube on.
+    uint32_t lutOffMask;
+
+    // Live edit preview (DwmHookMhcPreview below): the generation of the preview block the host last wrote, 0 = no
+    // preview. Taken from _reserved like the fields above: a host that predates it leaves 0 (no preview).
+    uint32_t mhcPreviewGen;
+
+    uint32_t _reserved[2];           // Future expansion
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
+static_assert(offsetof(DwmHookSharedConfig, mhcPreviewGen) == 464 - 3 * sizeof(uint32_t),
+              "mhcPreviewGen must sit where _reserved[0] was");
 static_assert(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * sizeof(uint32_t),
               "hdrDitherOff must sit where _reserved[0] was");
+static_assert(offsetof(DwmHookSharedConfig, lutOffMask) == 464 - 4 * sizeof(uint32_t),
+              "lutOffMask must sit where _reserved[1] was");
+static_assert(MAX_DWM_HOOK_MONITORS <= 32, "lutOffMask holds one bit per monitor");
 #pragma pack(pop)
 
 // ---------------------------------------------------------------------------
@@ -153,6 +168,39 @@ static inline int      DwmHookFaldStar(uint32_t w)     { return (w & DWM_HOOK_FA
 #define DWM_HOOK_FALD_PRIME_EVENT       L"Local\\DesktopLUT_DwmHook_FaldPrime"
 #define DWM_HOOK_FALD_KICK_PX       1
 #define DWM_HOOK_FALD_KICK_ZONE_PX  16
+
+// ---------------------------------------------------------------------------
+// Live edit preview (src/mhc_preview.h)
+// ---------------------------------------------------------------------------
+// While a display's MHC correction grayscale is edited, its scanout runs an identity profile and the hook applies the
+// display's profile instead, as the last step of its pass (shared/mhc_scanout_hlsl.h): exactly the matrix and LUT
+// entries the bake writes, so the preview is the bake. Its own mapping: the LUTs are 48 KB, and the config is copied
+// onto the present thread's stack on every change. The host writes the block under its own seqlock, THEN publishes
+// its `gen` in DwmHookSharedConfig::mhcPreviewGen (0 = no preview). The DLL copies the block when that generation
+// moves (accepting it only when `gen` matches), uploads it, and writes the generation to `ackGen`: the host knows the
+// resident DLL applies it (an older DLL never acks, and the host then does not start the edit).
+#define DWM_HOOK_MHC_PREVIEW_NAME     L"Global\\DesktopLUT_DwmHook_MhcPreview"
+#define DWM_HOOK_MHC_PREVIEW_MAGIC    0x56504D44u   // 'DMPV'
+#define DWM_HOOK_MHC_PREVIEW_LUT_MAX  4096
+
+#pragma pack(push, 4)
+struct DwmHookMhcPreview {
+    volatile uint32_t version;       // seqlock: odd = write in progress, even = complete
+    uint32_t magic;                  // DWM_HOOK_MHC_PREVIEW_MAGIC
+    uint32_t gen;                    // the generation this block is (DwmHookSharedConfig::mhcPreviewGen)
+    int32_t  left, top;              // the monitor (DwmHookMonitorConfig match key)
+    uint32_t isHdr;                  // the mode it is for: applied only while the monitor is in it
+    uint32_t lutSize;                // entries per channel: 1024 SDR, 4096 HDR
+    uint32_t _pad;
+    float    matrix[9];              // as-applied linear RGB->RGB, row-major (MhcScanout::applied)
+    uint32_t _pad2[3];
+    float    lut[3][DWM_HOOK_MHC_PREVIEW_LUT_MAX];   // R, G, B: the profile's LUT entries (s15Fixed16 values)
+    volatile uint32_t ackGen;        // written by the DLL (outside the seqlock): the generation it now applies
+};
+#pragma pack(pop)
+static_assert(offsetof(DwmHookMhcPreview, matrix) == 32, "DwmHookMhcPreview layout");
+static_assert(offsetof(DwmHookMhcPreview, lut) == 80, "DwmHookMhcPreview layout");
+static_assert(sizeof(DwmHookMhcPreview) == 80 + 3 * 4 * DWM_HOOK_MHC_PREVIEW_LUT_MAX + 4, "DwmHookMhcPreview layout");
 
 #define DWM_HOOK_TAIL_MAGIC          0x444C4654u   // 'TFLD'
 #define DWM_HOOK_TAIL_LAYOUT_VERSION 1u
