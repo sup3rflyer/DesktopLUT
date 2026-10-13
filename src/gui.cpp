@@ -1393,22 +1393,30 @@ static void OnMonitorSettingsTopologyChanged() {
 }
 
 // TOPOLOGY_PIPELINE_TIMER_ID: the live attachment changed (a display arrived, left, was swapped, or was
-// identified late — including by the identity retry, which no WM_DISPLAYCHANGE follows).
+// identified late — including by the identity retry, which no WM_DISPLAYCHANGE follows), or, in hook mode
+// while running, any modeset (a display may have moved: WM_DISPLAYCHANGE).
 //   not running -> start, when a live display needs processing and the user has not pressed Stop
 //                  (the display a correction is for was absent or unidentified until now);
 //   running     -> restart, when a display now attached has a LUT the running pipeline was built
 //                  without (SettingsChanged, per display slot: overlay contexts are built once per
 //                  thread), or, in hook mode, when the hook's staged files do not match the displays now
-//                  attached (act::HookStale: a late display's FALD panel file, a display the change moved,
-//                  a cube under a swapped-in display; or no hook resident yet for a late display's tone
-//                  mapper). The hook reads its files only at injection, so nothing else picks these up; the
-//                  tone mapper reaches a resident hook through the shared config by itself.
+//                  attached (act::HookStale: a late display's FALD panel file, a display that moved, a
+//                  cube under a swapped-in display; or no hook resident — none had work at the start, or
+//                  the watchdog stood down while the TV was off — for a returning display's work). The
+//                  hook reads its files only at injection, so nothing else picks these up; the tone
+//                  mapper reaches a resident hook through the shared config by itself.
 // Never stops (act::DecideTopologyTick): the owner's TV powering off must not cost a re-inject when it
 // comes back. Waits while an editor holds the settings or a calibration / live edit runs (a restart
-// would pull the pipeline out from under it), re-checking until that ends. Not armed by a modeset that
-// only moves displays (a rearrangement, a resolution change beside them): no attachment change.
+// would pull the pipeline out from under it), and holds a restart while an exclusive-fullscreen game runs,
+// re-checking until that ends.
+static bool FullscreenExclusiveRunning() {
+    QUERY_USER_NOTIFICATION_STATE state = QUNS_ACCEPTS_NOTIFICATIONS;
+    return SUCCEEDED(SHQueryUserNotificationState(&state)) && state == QUNS_RUNNING_D3D_FULL_SCREEN;
+}
+
 static void TickTopologyPipeline(HWND hwnd) {
     KillTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID);
+    static bool s_heldForFullscreen = false;   // logged once per hold
     act::TopologyInputs in;
     in.busy = act::LiveLayersBusy();
     in.suspended = g_userStopped.load();
@@ -1416,7 +1424,12 @@ static void TickTopologyPipeline(HWND hwnd) {
     in.needed = !in.busy && !in.running && AnyMonitorNeedsProcessing();
     in.lutsChanged = !in.busy && in.running && SettingsChanged();
     in.hookStale = !in.busy && in.running && !in.lutsChanged && act::HookStale();
-    switch (act::DecideTopologyTick(in)) {
+    in.fullscreenExclusive = (in.lutsChanged || in.hookStale) && FullscreenExclusiveRunning();
+    const act::ReconcileDecision decision = act::DecideTopologyTick(in);
+    if (in.fullscreenExclusive && decision == act::ReconcileDecision::Defer && !s_heldForFullscreen)
+        std::cout << "[Monitor identity] restart held while an exclusive-fullscreen app runs" << std::endl;
+    s_heldForFullscreen = in.fullscreenExclusive && decision == act::ReconcileDecision::Defer;
+    switch (decision) {
     case act::ReconcileDecision::Defer:
         SetTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID, TOPOLOGY_PIPELINE_SETTLE_MS, nullptr);
         break;
@@ -2603,53 +2616,62 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
                 return 0;
             }
-            if (!IsDwmHookActive()) {
+            const bool hookActive = IsDwmHookActive();
+            // Re-derive the staging set from current settings + monitors (the same set StartProcessing
+            // injects: the displays with a .cube, a FALD panel file or the HDR tonemapper)
+            std::vector<DwmHookMonitorLUT> dwmMonitors;
+            if (!hookActive) dwmMonitors = DesiredDwmHookStagingSet();
+            const act::WatchdogAction action = act::DecideHookWatchdog(
+                hookActive, g_dwmHookReinjectCount, DWM_HOOK_WATCHDOG_MAX_REINJECTS, dwmMonitors.empty());
+            if (action == act::WatchdogAction::GiveUp) {
                 // Flap detector: a re-injection that "succeeds" (the hook's named
                 // event appears) but is then lost again next tick will loop forever,
                 // flashing the screen black on every cycle. Count total cycles — not
                 // just consecutive failures — and give up once the hook proves it
                 // won't stay attached on this system (common on some Windows 10
                 // builds where the dwmcore offsets don't match). See issue #3.
-                if (g_dwmHookReinjectCount >= DWM_HOOK_WATCHDOG_MAX_REINJECTS) {
-                    KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
-                    SetStatus(L"DWM Hook unstable — disabled (use overlay mode)");
-                    std::cout << "[DWM Hook Watchdog] Hook keeps dropping after "
-                              << g_dwmHookReinjectCount << " re-injections — giving up to stop "
-                                 "the re-injection flash loop. DWM Hook Mode is unreliable on "
-                                 "this system (common on Windows 10); turn it off and use overlay "
-                                 "mode in Settings." << std::endl;
-                    return 0;
-                }
-
+                KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                SetStatus(L"DWM Hook unstable — disabled (use overlay mode)");
+                std::cout << "[DWM Hook Watchdog] Hook keeps dropping after "
+                          << g_dwmHookReinjectCount << " re-injections — giving up to stop "
+                             "the re-injection flash loop. DWM Hook Mode is unreliable on "
+                             "this system (common on Windows 10); turn it off and use overlay "
+                             "mode in Settings." << std::endl;
+                return 0;
+            }
+            if (action == act::WatchdogAction::StandDown) {
+                // Nothing for the hook on any display (e.g. the only one with hook work, the owner's TV, is
+                // off): stand down idle. Not a give-up: once a display has hook work again (the TV returns,
+                // a layer is switched on) the topology tick / reconcile re-inject (act::HookStale).
+                if (!DwmHookIdle())
+                    std::cout << "[DWM Hook Watchdog] Hook gone and no display has hook work: idle until one does"
+                              << std::endl;
+                SetDwmHookIdle(true);
+                KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                return 0;
+            }
+            if (action == act::WatchdogAction::Reinject) {
+                // The re-injection is the watchdog's from here: its give-up must stand, not read as idle.
+                SetDwmHookIdle(false);
                 std::cout << "[DWM Hook Watchdog] Hook lost (DWM restart?), attempting re-injection..." << std::endl;
-
-                // Re-derive the staging set from current settings + monitors (the same set StartProcessing
-                // injects: a .cube, a FALD panel file or the HDR tonemapper on a display that needs processing)
-                std::vector<DwmHookMonitorLUT> dwmMonitors = DesiredDwmHookStagingSet();
-
-                if (!dwmMonitors.empty()) {
-                    std::wstring err = InjectDwmHook(dwmMonitors);
-                    if (err.empty()) {
-                        g_dwmHookReinjectCount++;
-                        std::cout << "[DWM Hook Watchdog] Re-injection successful (cycle "
-                                  << g_dwmHookReinjectCount << "/" << DWM_HOOK_WATCHDOG_MAX_REINJECTS
-                                  << ")" << std::endl;
-                        g_dwmHookWatchdogRetries = 0;
-                        SetStatus(L"Active (DWM Hook)");
-                    } else {
-                        g_dwmHookWatchdogRetries++;
-                        std::wcout << L"[DWM Hook Watchdog] Re-injection failed (attempt "
-                                   << g_dwmHookWatchdogRetries << L"/" << DWM_HOOK_WATCHDOG_MAX_RETRIES
-                                   << L"): " << err << std::endl;
-                        if (g_dwmHookWatchdogRetries >= DWM_HOOK_WATCHDOG_MAX_RETRIES) {
-                            KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
-                            SetStatus(L"DWM Hook lost — re-injection failed");
-                            std::cout << "[DWM Hook Watchdog] Max retries reached, giving up" << std::endl;
-                        }
-                    }
+                std::wstring err = InjectDwmHook(dwmMonitors);
+                if (err.empty()) {
+                    g_dwmHookReinjectCount++;
+                    std::cout << "[DWM Hook Watchdog] Re-injection successful (cycle "
+                              << g_dwmHookReinjectCount << "/" << DWM_HOOK_WATCHDOG_MAX_REINJECTS
+                              << ")" << std::endl;
+                    g_dwmHookWatchdogRetries = 0;
+                    SetStatus(L"Active (DWM Hook)");
                 } else {
-                    // Nothing for the hook on any display (no cube, FALD file or tonemapper) — nothing to inject
-                    KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                    g_dwmHookWatchdogRetries++;
+                    std::wcout << L"[DWM Hook Watchdog] Re-injection failed (attempt "
+                               << g_dwmHookWatchdogRetries << L"/" << DWM_HOOK_WATCHDOG_MAX_RETRIES
+                               << L"): " << err << std::endl;
+                    if (g_dwmHookWatchdogRetries >= DWM_HOOK_WATCHDOG_MAX_RETRIES) {
+                        KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                        SetStatus(L"DWM Hook lost — re-injection failed");
+                        std::cout << "[DWM Hook Watchdog] Max retries reached, giving up" << std::endl;
+                    }
                 }
             } else {
                 // Hook is healthy — reset retry counter. (Config resends after a
@@ -2872,6 +2894,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Runs after the `changed` block so a topology update lands first.
         if (g_dwmHookMode.load() && g_gui.isRunning) {
             StartDwmHookConfigResends(hwnd);
+            // The hook matches its staged files to displays by desktop position, read at injection: a modeset
+            // can move displays with the same set attached (a rearrangement, a resolution change beside them),
+            // which no re-attach reports. The topology tick re-checks once the change has settled; a refresh
+            // rate or HDR switch moves nothing and finds nothing to do (act::HookStale).
+            SetTimer(hwnd, TOPOLOGY_PIPELINE_TIMER_ID, TOPOLOGY_PIPELINE_SETTLE_MS, nullptr);
         }
         return 0;
     }

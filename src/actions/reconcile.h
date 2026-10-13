@@ -16,7 +16,7 @@ struct ReconcileInputs {
     bool suspended = false;        // the user's Suspend (g_userStopped)
     bool busy = false;             // LiveLayersBusy(): nothing may start or stop now
     bool running = false;          // g_gui.isRunning
-    bool needed = false;           // AnyMonitorNeedsProcessing()
+    bool needed = false;           // LiveLayersNeeded()
     bool hookStale = false;        // HookStale(): the resident DWM hook must be re-injected
 };
 
@@ -32,9 +32,10 @@ struct HookStaging {
     std::vector<DwmHookMonitorLUT> injected;   // DwmHookInjectedSet(): what the resident hook was injected with
     bool injectedKnown = false;                // ...and whether that set describes the resident hook
     bool hookActive = false;                   // IsDwmHookActive()
-    bool startStagedNothing = false;           // DwmHookStartStagedNothing(): the running start injected nothing
-    bool restartInjects = false;               // AnyMonitorNeedsProcessing(): a restart starts again and injects
-                                               // `desired` (otherwise it only ejects the hook and stays stopped)
+    bool hookIdle = false;                     // DwmHookIdle(): none resident because no display had hook work
+                                               // when one was last due (the start, or the watchdog's re-inject)
+    bool restartInjects = false;               // LiveLayersNeeded(): a restart starts again and injects `desired`
+                                               // (otherwise it only ejects the hook and stays stopped)
     std::vector<DisplayPosition> identified;   // live displays whose settings carry a display identity
 };
 
@@ -45,8 +46,9 @@ struct HookStaging {
 //   - a restart injects, and a display stages a file the hook lacks at its position: a cube, or a panel file
 //     whatever its switch (so that switching the layer on rides the shared config) — it gained one, arrived
 //     late, or the attachment change moved it;
-//   - a restart injects, the running start injected nothing (no display had hook work then), and now some
-//     display has hook work: tone mapping too, it needs the hook resident.
+//   - a restart injects, no hook is resident because none had work when it was last due (the running start
+//     staged nothing, or the watchdog found the hook gone while the TV — the only display with hook work —
+//     was off), and now some display has hook work: tone mapping too, it needs the hook resident.
 // Not stale:
 //   - tone mapping on a display the hook was not injected with: a resident hook tone maps every display;
 //   - a display that only lost live-switch work (tone mapping off, the FALD layer off);
@@ -56,7 +58,8 @@ struct HookStaging {
 //     again when it comes back at the same position;
 //   - an unidentified display over files staged for another: it may be the very display they are for (the
 //     identity query lags), so it waits for its identity, as the settings re-attach does;
-//   - a hook that is gone (DWM restarted, or the watchdog gave up re-injecting): the watchdog's business;
+//   - a hook that is gone while some display had work for it (DWM restarted: the watchdog re-injects; or the
+//     watchdog gave up, flapping or failing: that stands);
 //   - a resident hook whose staging set is unknown.
 bool DecideHookStale(const HookStaging& s);
 
@@ -72,22 +75,38 @@ bool LiveLayersBusy();
 ReconcileDecision ReconcileLiveLayers(const char* why);
 
 // TOPOLOGY_PIPELINE_TIMER_ID: the live settings attachment changed (a display arrived, left, was swapped, or
-// was identified late).
+// was identified late), or, in hook mode while running, any modeset (a display may have moved).
 struct TopologyInputs {
     bool busy = false;             // LiveLayersBusy()
     bool suspended = false;        // the user's Suspend (g_userStopped)
     bool running = false;          // g_gui.isRunning
-    bool needed = false;           // AnyMonitorNeedsProcessing()
+    bool needed = false;           // AnyMonitorNeedsProcessing() (the tick's own start rule, kept as it was)
     bool lutsChanged = false;      // SettingsChanged(): a live display's cube paths differ from the running ones
     bool hookStale = false;        // HookStale()
+    bool fullscreenExclusive = false;   // a D3D exclusive-fullscreen app runs (SHQueryUserNotificationState)
 };
 
 // Pure (tested): what the topology tick does. Busy: wait (Defer = re-arm the tick). Not running: Start when
 // a live display needs processing and the user has not suspended. Running: Restart when the pipeline was
-// built without what the attached displays now need (lutsChanged, hookStale). Never Stop: a display that
-// left (the owner's TV powering off) does not stop what runs for it, so its return costs no re-inject; a
-// configuration change still stops what nothing needs (ReconcileLiveLayers).
+// built without what the attached displays now need (lutsChanged, hookStale) — but not while an
+// exclusive-fullscreen game runs: its resolution change moves the displays beside it, a restart would
+// re-inject and re-apply the MHC profiles under the game, and when it exits the positions usually come
+// back to what the hook has (nothing to do then). Never Stop: a display that left (the owner's TV powering
+// off) does not stop what runs for it, so its return costs no re-inject; a configuration change still
+// stops what nothing needs (ReconcileLiveLayers).
 ReconcileDecision DecideTopologyTick(const TopologyInputs& in);
+
+// The DWM hook watchdog's tick (DWM_HOOK_WATCHDOG_TIMER_ID, hook mode, running).
+enum class WatchdogAction {
+    Healthy,     // the hook is resident
+    GiveUp,      // it keeps dropping after re-injections (the flap cap): stop the re-inject flash loop, for good
+    StandDown,   // gone, and no display has hook work: idle (SetDwmHookIdle), not a give-up — HookStale
+                 // re-injects once a display has work again (the TV returns, a layer is switched on)
+    Reinject,    // gone (DWM restarted?): re-inject the staging set
+};
+
+// Pure (tested). `reinjects` = the watchdog's re-injection cycles so far, `maxReinjects` its cap.
+WatchdogAction DecideHookWatchdog(bool hookActive, int reinjects, int maxReinjects, bool nothingToInject);
 
 // GUI thread. Suspend stops the live layers and keeps them stopped (display changes and wakes do not
 // start them); resume reconciles. Suspending is refused while a calibration session or live edit is

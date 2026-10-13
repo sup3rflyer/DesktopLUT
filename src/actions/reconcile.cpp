@@ -21,7 +21,14 @@ ReconcileDecision DecideReconcile(const ReconcileInputs& in) {
 ReconcileDecision DecideTopologyTick(const TopologyInputs& in) {
     if (in.busy) return ReconcileDecision::Defer;
     if (!in.running) return (!in.suspended && in.needed) ? ReconcileDecision::Start : ReconcileDecision::None;
-    return (in.lutsChanged || in.hookStale) ? ReconcileDecision::Restart : ReconcileDecision::None;
+    if (!in.lutsChanged && !in.hookStale) return ReconcileDecision::None;
+    return in.fullscreenExclusive ? ReconcileDecision::Defer : ReconcileDecision::Restart;
+}
+
+WatchdogAction DecideHookWatchdog(bool hookActive, int reinjects, int maxReinjects, bool nothingToInject) {
+    if (hookActive) return WatchdogAction::Healthy;
+    if (reinjects >= maxReinjects) return WatchdogAction::GiveUp;   // the flap cap wins over standing down
+    return nothingToInject ? WatchdogAction::StandDown : WatchdogAction::Reinject;
 }
 
 namespace {
@@ -50,8 +57,8 @@ bool PositionStale(const DwmHookMonitorLUT& want, const DwmHookMonitorLUT& had, 
 }  // namespace
 
 bool DecideHookStale(const HookStaging& s) {
-    // Never injected (no display had hook work at the start): any hook work now needs the hook resident.
-    if (!s.hookActive) return s.restartInjects && s.startStagedNothing && !s.desired.empty();
+    // Idle (no display had hook work when the hook was last due): any hook work now needs it resident.
+    if (!s.hookActive) return s.restartInjects && s.hookIdle && !s.desired.empty();
     if (!s.injectedKnown) return false;
     const DwmHookMonitorLUT none;
     for (const DwmHookMonitorLUT& want : s.desired) {   // the displays with hook work (live)
@@ -72,8 +79,8 @@ bool HookStale() {
     HookStaging s;
     s.desired = DesiredDwmHookStagingSet();
     s.hookActive = IsDwmHookActive();
-    s.startStagedNothing = DwmHookStartStagedNothing();
-    s.restartInjects = AnyMonitorNeedsProcessing();
+    s.hookIdle = DwmHookIdle();
+    s.restartInjects = LiveLayersNeeded();   // a start runs exactly then, and injects `desired`
     s.injected = DwmHookInjectedSet(&s.injectedKnown);
     for (size_t i = 0; i < g_gui.monitors.size() && i < g_gui.monitorSettings.size(); i++) {
         if (g_gui.monitorSettings[i].identity.empty()) continue;   // unknown: may be the display the files are for
@@ -95,9 +102,9 @@ ReconcileDecision ReconcileLiveLayers(const char* why) {
     in.suspended = g_userStopped;
     in.busy = LiveLayersBusy();
     in.running = g_gui.isRunning.load();
-    // Desktop gamma counts by its persisted setting: its hotkey toggles the in-memory flag, and stopping
-    // on that toggle would unregister the very hotkey that turns it back on.
-    in.needed = AnyMonitorNeedsProcessing() || AnyDesktopGammaConfigured();
+    // Desktop gamma counts by its persisted setting (LiveLayersNeeded): its hotkey toggles the in-memory flag,
+    // and stopping on that toggle would unregister the very hotkey that turns it back on.
+    in.needed = LiveLayersNeeded();
     in.hookStale = !in.busy && in.running && in.needed && HookStale();
     const char* reason = why ? why : "";
     const ReconcileDecision decision = DecideReconcile(in);

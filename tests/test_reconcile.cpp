@@ -121,7 +121,8 @@ HookStaging AfterReinject(const HookStaging& before) {
     REQUIRE(before.restartInjects);
     HookStaging s = before;
     s.hookActive = !before.desired.empty();
-    s.startStagedNothing = before.desired.empty();
+    s.hookIdle = before.desired.empty();
+    s.injectedKnown = !before.desired.empty();   // a successful injection records its set (DwmHookInjectedSet)
     s.injected = before.desired;
     return s;
 }
@@ -153,7 +154,7 @@ TEST_CASE("hook staging: a late display's FALD panel file re-stages; its tone ma
 TEST_CASE("hook staging: the running start injected nothing and now a display has hook work") {
     HookStaging s;   // the pipeline runs for overlay work only (a shader tweak, desktop gamma): no hook resident
     s.hookActive = false;
-    s.startStagedNothing = true;
+    s.hookIdle = true;
     s.restartInjects = true;
     s.identified = { kPa, kTv };
     CHECK_FALSE(DecideHookStale(s));
@@ -162,13 +163,13 @@ TEST_CASE("hook staging: the running start injected nothing and now a display ha
     CHECK_FALSE(DecideHookStale(AfterReinject(s)));
 }
 
-// The pipeline also runs while nothing needs processing: desktop gamma configured but toggled off by its
-// hotkey (the reconcile keeps the hotkey alive), or a display that left (the topology tick never stops). A
-// restart then starts nothing again (and drops the hotkey): it is worth it only to take a wrong cube away.
+// The pipeline also runs while nothing needs it: a display that left (the topology tick never stops). A
+// restart then starts nothing again: it is worth it only to take a wrong cube away. (Desktop gamma configured
+// but toggled off by its hotkey does need it — LiveLayersNeeded — so a restart then starts and injects.)
 TEST_CASE("hook staging: a restart that would inject nothing again adds no hook work") {
     HookStaging never;   // no hook resident; a display with a panel file (layer off) arrives
     never.hookActive = false;
-    never.startStagedNothing = true;
+    never.hookIdle = true;
     never.desired = { kTvFaldOnly };
     never.identified = { kPa, kTv };
     CHECK_FALSE(DecideHookStale(never));
@@ -182,14 +183,32 @@ TEST_CASE("hook staging: a restart that would inject nothing again adds no hook 
     CHECK(DecideHookStale(wrongCube));
 }
 
-TEST_CASE("hook staging: a hook that is gone is the watchdog's") {
-    HookStaging s;   // injected at start, then lost (DWM restarted, or the watchdog gave up re-injecting)
+TEST_CASE("hook staging: a hook lost while a display had work for it is the watchdog's") {
+    HookStaging s;   // lost (DWM restarted: the watchdog re-injects; or it gave up, flapping or failing: that stands)
     s.hookActive = false;
-    s.startStagedNothing = false;
+    s.hookIdle = false;
     s.restartInjects = true;
     s.desired = { kPaCube, kTvToneMapOnly };
     s.identified = { kPa, kTv };
     CHECK_FALSE(DecideHookStale(s));
+}
+
+// The watchdog found the hook gone (DWM restarted) while the TV, the only display with hook work, was off:
+// nothing to re-inject, so it stood down idle. It used to kill its timer for good, and the returning TV stayed
+// uncorrected until something restarted the pipeline.
+TEST_CASE("hook staging: a hook the watchdog stood down for lack of work returns with the work") {
+    HookStaging s;
+    s.hookActive = false;
+    s.hookIdle = true;          // SetDwmHookIdle(true): stood down, not a give-up
+    s.restartInjects = false;   // TV off: nothing needs processing
+    s.identified = { kPa };
+    CHECK_FALSE(DecideHookStale(s));
+
+    s.restartInjects = true;    // the TV is back with its cube (the topology tick checks)
+    s.desired = { kTvCube };
+    s.identified = { kPa, kTv };
+    CHECK(DecideHookStale(s));
+    CHECK_FALSE(DecideHookStale(AfterReinject(s)));
 }
 
 TEST_CASE("hook staging: a resident hook whose staging set is unknown stays") {
@@ -269,7 +288,7 @@ using act::TopologyInputs;
 
 namespace {
 TopologyInputs Topo(bool running, bool needed, bool suspended = false, bool lutsChanged = false,
-                    bool hookStale = false, bool busy = false) {
+                    bool hookStale = false, bool busy = false, bool fullscreenExclusive = false) {
     TopologyInputs in;
     in.running = running;
     in.needed = needed;
@@ -277,15 +296,17 @@ TopologyInputs Topo(bool running, bool needed, bool suspended = false, bool luts
     in.lutsChanged = lutsChanged;
     in.hookStale = hookStale;
     in.busy = busy;
+    in.fullscreenExclusive = fullscreenExclusive;
     return in;
 }
 }  // namespace
 
 TEST_CASE("topology tick: never stops (a display that left keeps what runs for it)") {
-    for (int bits = 0; bits < 32; bits++) {
-        const bool running = bits & 1, needed = bits & 2, suspended = bits & 4, luts = bits & 8, stale = bits & 16;
+    for (int bits = 0; bits < 64; bits++) {
+        const bool running = bits & 1, needed = bits & 2, suspended = bits & 4, luts = bits & 8, stale = bits & 16,
+                   fse = bits & 32;
         CAPTURE(bits);
-        CHECK(DecideTopologyTick(Topo(running, needed, suspended, luts, stale)) != ReconcileDecision::Stop);
+        CHECK(DecideTopologyTick(Topo(running, needed, suspended, luts, stale, false, fse)) != ReconcileDecision::Stop);
     }
     // The TV powered off and nothing else needs processing: the pipeline keeps running for its return.
     CHECK(DecideTopologyTick(Topo(true, false)) == ReconcileDecision::None);
@@ -314,4 +335,37 @@ TEST_CASE("topology tick: busy waits") {
         CAPTURE(bits);
         CHECK(DecideTopologyTick(Topo(running, needed, suspended, luts, stale, true)) == ReconcileDecision::Defer);
     }
+}
+
+// An exclusive-fullscreen game changing the primary's resolution moves the displays beside it (WM_DISPLAYCHANGE
+// arms the tick in hook mode): a restart under the game would re-inject the hook and re-apply the MHC profiles.
+// The restart waits; when the game exits the positions usually come back to what the hook has (nothing to do).
+TEST_CASE("topology tick: a restart waits while an exclusive-fullscreen game runs") {
+    CHECK(DecideTopologyTick(Topo(true, true, false, false, true, false, true)) == ReconcileDecision::Defer);
+    CHECK(DecideTopologyTick(Topo(true, true, false, true, false, false, true)) == ReconcileDecision::Defer);
+    CHECK(DecideTopologyTick(Topo(true, true, false, false, true)) == ReconcileDecision::Restart);   // it exited
+    CHECK(DecideTopologyTick(Topo(true, true, false, false, false, false, true)) == ReconcileDecision::None);
+    // Not running: the start rule is unchanged (the game does not hold a display's first start).
+    CHECK(DecideTopologyTick(Topo(false, true, false, false, false, false, true)) == ReconcileDecision::Start);
+}
+
+// ============================================================================
+// DWM hook watchdog (act::DecideHookWatchdog, DWM_HOOK_WATCHDOG_TIMER_ID)
+// ============================================================================
+
+using act::DecideHookWatchdog;
+using act::WatchdogAction;
+
+TEST_CASE("hook watchdog: re-inject a lost hook, stand down idle when nothing needs it, give up on a flap") {
+    const int cap = 3;
+    CHECK(DecideHookWatchdog(true, 0, cap, false) == WatchdogAction::Healthy);
+    CHECK(DecideHookWatchdog(true, cap, cap, true) == WatchdogAction::Healthy);
+    CHECK(DecideHookWatchdog(false, 0, cap, false) == WatchdogAction::Reinject);       // DWM restarted
+    CHECK(DecideHookWatchdog(false, cap - 1, cap, false) == WatchdogAction::Reinject);
+    // DWM restarted while the TV, the only display with hook work, was off: idle, not a give-up
+    // (HookStale re-injects when the TV returns: "a hook the watchdog stood down ... returns with the work").
+    CHECK(DecideHookWatchdog(false, 0, cap, true) == WatchdogAction::StandDown);
+    // The flap cap wins over standing down: a hook that keeps dropping stays down for good.
+    CHECK(DecideHookWatchdog(false, cap, cap, false) == WatchdogAction::GiveUp);
+    CHECK(DecideHookWatchdog(false, cap, cap, true) == WatchdogAction::GiveUp);
 }

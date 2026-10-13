@@ -277,7 +277,8 @@ const int MONITOR_IDENTITY_TIMER_ID = 112;      // Deferred/retried settings re-
 const int MONITOR_IDENTITY_RETRY_MS = 3000;     // (also armed at startup when a display is not identifiable yet)
 const int MONITOR_IDENTITY_MAX_RETRIES = 5;
 const int TOPOLOGY_PIPELINE_TIMER_ID = 115;     // After the live settings attachment changed: start / restart the
-const int TOPOLOGY_PIPELINE_SETTLE_MS = 5000;   //   pipeline once the display transition has settled
+const int TOPOLOGY_PIPELINE_SETTLE_MS = 5000;   //   pipeline once the display transition has settled (hook mode,
+                                                //   running: after any modeset, a display may have moved)
 const int MHC_MATRIX_REBAKE_TIMER_ID = 116;     // Re-bake profiles baked by older matrix maths (startup / re-attach)
 const int MHC_MATRIX_REBAKE_DELAY_MS = 4000;
 const int RENDER_HEALTH_TIMER_ID = 117;          // GUI-side hang check of the overlay render loop (T2.20)

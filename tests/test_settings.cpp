@@ -1355,6 +1355,50 @@ TEST_CASE("Processing predicates: the FALD layer needs processing in both engine
     }
 }
 
+// Desktop gamma configured but toggled off by its hotkey (the hotkey flips only the in-memory flag): the
+// running pipeline hosts that hotkey, so the reconcile counts the persisted setting. StartProcessing filtered
+// displays by MonitorNeedsProcessing (the in-memory flag), so any restart in that state (a re-staged hook, a
+// cleared cube, an engine switch) ended stopped with the hotkey unregistered, and every later reconcile asked
+// for a start that started nothing. A start now runs exactly when the live layers are needed.
+TEST_CASE("Processing predicates: configured desktop gamma keeps the pipeline and its hotkey through a restart") {
+    PredicateGlobalsGuard guard;   // g_userDesktopGammaMode false: toggled off
+    MonitorSettings dg;            // desktop gamma configured (HDR MHC), nothing else
+    dg.hdrMHC.desktopGammaEnabled = true;
+    MonitorSettings plain;         // nothing at all
+    g_gui.monitorSettings = { dg, plain };
+    CHECK_FALSE(AnyMonitorNeedsProcessing());
+    CHECK(LiveLayersNeeded());
+    std::vector<MonitorLUTConfig> configs = BuildPipelineConfigs();   // what StartProcessing builds
+    REQUIRE(configs.size() == 2);                                     // every display, as with the mode on
+    CHECK(configs[0].monitorIndex == 0);
+    CHECK(configs[1].monitorIndex == 1);
+
+    // Not configured anywhere: nothing to run (the MHC-only path).
+    g_gui.monitorSettings = { plain };
+    CHECK_FALSE(LiveLayersNeeded());
+    CHECK(BuildPipelineConfigs().empty());
+
+    // A start builds a pipeline exactly when the live layers are needed, in both engines; without desktop
+    // gamma, exactly the displays that need processing join.
+    MonitorSettings cube;
+    cube.sdrPath = L"C:\\luts\\x.cube";
+    for (int bits = 0; bits < 16; bits++) {
+        const bool hook = bits & 1, dgOn = bits & 2, dgConfigured = bits & 4, withCube = bits & 8;
+        CAPTURE(bits);
+        g_dwmHookMode = hook;
+        g_userDesktopGammaMode = dgOn;
+        MonitorSettings first = plain;
+        first.hdrMHC.desktopGammaEnabled = dgConfigured;
+        g_gui.monitorSettings = { first, withCube ? cube : plain };
+        configs = BuildPipelineConfigs();
+        CHECK(!configs.empty() == LiveLayersNeeded());
+        CHECK(LiveLayersNeeded() == (dgOn || dgConfigured || withCube));
+        const size_t expected = (dgOn || dgConfigured) ? 2u : (withCube ? 1u : 0u);
+        CHECK(configs.size() == expected);
+        if (expected == 1) CHECK(configs[0].sdrLutPath == cube.sdrPath);
+    }
+}
+
 // The staging set StartProcessing injects, the watchdog re-injects and the reconcile compares against the
 // resident hook. Only GetMonitorInfo on the primary display: nothing is injected.
 TEST_CASE("DesiredDwmHookStagingSet: a FALD-only display is staged with its panel files") {

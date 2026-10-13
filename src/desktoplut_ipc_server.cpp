@@ -276,7 +276,9 @@ bool AnyCorrectionActive() {
 void ReapplyProcessing() {
     StopProcessing();
     FaldTrace("ReapplyProcessing: AnyCorrectionActive?");
-    if (AnyCorrectionActive()) {
+    // LiveLayersNeeded too: desktop gamma configured (even toggled off by its hotkey, even with no MHC profile
+    // enabled) keeps the pipeline that hosts its hotkey.
+    if (AnyCorrectionActive() || LiveLayersNeeded()) {
         act::ResumeLiveLayersForPipe();   // a user Suspend gives way to what DLC applies, visibly
         FaldTrace("ReapplyProcessing: StartProcessing");
         StartProcessing();

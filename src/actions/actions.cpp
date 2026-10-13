@@ -503,7 +503,7 @@ Result MhcSetDesktopGamma(int mon, bool on) {
         SwapMhcToPermutation(mon, true, perm);
     }
     SaveSettings();
-    ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (MonitorNeedsProcessing)
+    ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (LiveLayersNeeded)
     Finish(mon);
     return Done();
 }
