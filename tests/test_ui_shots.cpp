@@ -293,7 +293,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     ui::GsEditorState& ed = vs.gsEdit;
                     ed.open = true;
                     ed.renderOnly = true;
-                    ed.renderHeld = hdr ? (kMhcHeldTonemap | kMhcHeldFald | kMhcHeldDesktopGamma) : kMhcHeldFald;
+                    ed.renderHeld = hdr ? (kMhcHeldTonemap | kMhcHeldFald | kMhcHeldDesktopGamma | kMhcHeldWhiteBalance)
+                                        : (kMhcHeldFald | kMhcHeldWhiteBalance);
                     ed.renderNightLight = !hdr;   // the SDR shot shows the Night Light warning
                     ed.hdr = hdr;
                     ed.mon = shot.display;

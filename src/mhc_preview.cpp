@@ -125,6 +125,7 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
         if (hdr && cc.tonemap.enabled) held |= kMhcHeldTonemap;
         if (cc.fald.enabled && !cc.fald.paramsPath.empty()) held |= kMhcHeldFald;
         if (hdr && mhc.desktopGammaEnabled) held |= kMhcHeldDesktopGamma;
+        if (ComputeMhcPermutation(mhc, hdr) & MHCSettings::PERM_WB) held |= kMhcHeldWhiteBalance;   // a real move
     }
     // The bake (RegenerateMhcIfActive) installs a profile only where one is named: without one there is nothing
     // the edit would change on screen, so nothing to preview either.
@@ -179,10 +180,11 @@ bool PrepareMhcPreview(const MHCSettings& mhc, bool hdr, int mon, MhcPreviewSess
     s = MhcPreviewSession{};
     s.mon = mon;
     s.hdr = hdr;
-    // The variant the bake will install, without its correction (composed live) and without desktop gamma (held for
-    // the edit: the points are measured against PQ / the target gamma, and the bake puts desktop gamma back on top,
-    // last, as always). Built from the settings, like the bake.
-    s.perm = (uint8_t)(ComputeMhcPermutation(mhc, hdr) & ~(MHCSettings::PERM_GS | MHCSettings::PERM_DG));
+    // The variant the bake will install, without its correction (composed live), without desktop gamma and without the
+    // user's white balance tweak (held for the edit: the points are measured against the calibration — PQ / the target
+    // gamma at its white — and the bake puts both back, as they always sit). Built from the settings, like the bake.
+    s.perm = (uint8_t)(ComputeMhcPermutation(mhc, hdr) &
+                       ~(MHCSettings::PERM_GS | MHCSettings::PERM_DG | MHCSettings::PERM_WB));
     return BuildMHC2ParamsForPerm(mhc, hdr, mon, s.perm, s.params) && ComputeMhcScanoutBase(s.params, s.base);
 }
 

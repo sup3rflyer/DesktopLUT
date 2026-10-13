@@ -575,6 +575,7 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             if (held & kMhcHeldTonemap) add("TONE MAP");
             if (held & kMhcHeldFald) add("FALD");
             if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
+            if (held & kMhcHeldWhiteBalance) add("WHITE BALANCE");
             const float hw = MeasureInk(Font::Label, 11.0f, "OFF").advance + Px(8);
             const float lw = MeasureInk(Font::Label, 11.0f, list.c_str()).advance;
             const float x1 = right, x0 = x1 - lw - hw;

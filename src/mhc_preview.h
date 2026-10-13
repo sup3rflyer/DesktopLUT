@@ -10,10 +10,11 @@
 // Who applies it: the DWM hook when it is live (hook mode — it applies the 3D LUT itself, so the preview follows it in
 // the same pass and no overlay is needed), otherwise the overlay (after its own 3D LUT).
 //
-// Ready to measure: what would stand between the patch and a PQ / gamma reading is held off on the edited display
-// for the edit — tone mapping and FALD (MhcPreviewHolds; the engines read it, the settings are not touched), and
-// desktop gamma (left out of the previewed profile). All return with DONE / CANCEL: the bake has desktop gamma again,
-// and the hold ends with the session.
+// Ready to measure: what would stand between the patch and the calibration it refines is held off on the edited
+// display for the edit — tone mapping and FALD (MhcPreviewHolds; the engines read it, the settings are not touched),
+// desktop gamma and the user's white balance tweak (both left out of the previewed profile). All return with DONE /
+// CANCEL: the bake has them again, and the hold ends with the session. The calibration itself stays on: the 3D LUT,
+// the primaries (with the measured native white), the base curve, the target gamma.
 //
 // One preview at a time, GUI thread. Used by the interface's editor (actions/gs_live), the classic editor
 // (gui.cpp ID_MHC_*_GS_EDIT) and the pipe's mhc.grayscale_live_* (desktoplut_ipc_server.cpp).
@@ -30,6 +31,7 @@
 constexpr unsigned kMhcHeldTonemap = 1u;
 constexpr unsigned kMhcHeldFald = 2u;
 constexpr unsigned kMhcHeldDesktopGamma = 4u;
+constexpr unsigned kMhcHeldWhiteBalance = 8u;   // the user's white balance tweak (MHCSettings::whiteBalance*)
 
 struct MhcPreviewSession {
     bool active = false;
@@ -81,7 +83,8 @@ bool MhcPreviewUsesHook();
 bool MhcEditorNeedsOverlay();
 
 // BeginMhcPreview's computation, touching neither scanout nor the overlay: the variant the bake installs without
-// its correction and without desktop gamma (perm), its params (source files read here) and its matrix + base LUTs.
+// its correction, desktop gamma and white balance tweak (perm), its params (source files read here) and its matrix +
+// base LUTs.
 // Exposed for testing.
 bool PrepareMhcPreview(const MHCSettings& mhc, bool hdr, int mon, MhcPreviewSession& s);
 // UpdateMhcPreview's computation: the scanout the bake would install with this correction. Exposed for testing.

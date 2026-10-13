@@ -199,8 +199,9 @@ TEST_CASE("MHC preview: from the settings, the preview composes exactly what the
 
         auto bakeOf = [&](const MHCSettings& now, MhcScanout& out, std::vector<uint8_t>& file) {
             MHC2ProfileParams bp;
-            // The edit holds desktop gamma out: the bake it previews is the variant without it.
-            const uint8_t perm = (uint8_t)(ComputeMhcPermutation(now, hdr) & ~MHCSettings::PERM_DG);
+            // The edit holds desktop gamma and the white balance tweak out: the bake it previews is the variant
+            // without them.
+            const uint8_t perm = (uint8_t)(ComputeMhcPermutation(now, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB));
             REQUIRE(BuildMHC2ParamsForPerm(now, hdr, 0, perm, bp));
             REQUIRE(ComputeMhcScanout(bp, out));
             REQUIRE(GenerateMHC2Profile(bp, file));
@@ -246,7 +247,7 @@ TEST_CASE("MHC preview: an edited BASE curve previews exactly what the bake inst
             ComposeMhcPreviewBase(s, edited.baseGrayscale, edited.correctionGrayscale, preview);
             MHC2ProfileParams bp;
             REQUIRE(BuildMHC2ParamsForPerm(edited, hdr, 0,
-                                           (uint8_t)(ComputeMhcPermutation(edited, hdr) & ~MHCSettings::PERM_DG), bp));
+                                           (uint8_t)(ComputeMhcPermutation(edited, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB)), bp));
             REQUIRE(ComputeMhcScanout(bp, bake));
             CheckScanoutsIdentical(preview, bake);
             std::vector<uint8_t> file;
@@ -277,18 +278,32 @@ TEST_CASE("MHC preview: an edited BASE curve previews exactly what the bake inst
     }
 }
 
-TEST_CASE("MHC preview: desktop gamma is held out of the preview; the DONE bake has it again") {
-    MHCSettings m = FullSettings();   // HDR desktop gamma on at 116 nits
+TEST_CASE("MHC preview: desktop gamma and the white balance tweak are held out; the DONE bake has them again") {
+    MHCSettings m = FullSettings();   // HDR desktop gamma on at 116 nits, white balance tweak to 0.3100 / 0.3300
     MhcPreviewSession s;
     REQUIRE(PrepareMhcPreview(m, true, 0, s));
     CHECK(!(s.perm & MHCSettings::PERM_DG));
+    CHECK(!(s.perm & MHCSettings::PERM_WB));
     CHECK_FALSE(s.params.desktopGammaEnabled);
+    for (float g : s.params.whiteBalanceGains) CHECK(g == 1.0f);
     MhcScanout preview, withDg;
     ComposeMhcPreview(s, m.correctionGrayscale, preview);
     MHC2ProfileParams bp;
     REQUIRE(BuildMHC2ParamsForPerm(m, true, 0, ComputeMhcPermutation(m, true), bp));
     CHECK(bp.desktopGammaEnabled);   // what DONE installs
+    CHECK(bp.whiteBalanceGains[2] != 1.0f);
     REQUIRE(ComputeMhcScanout(bp, withDg));
+    // The white balance tweak lives in the matrix: the preview's is the calibration's alone.
+    bool matrixDiffers = false;
+    for (int i = 0; i < 9; i++) matrixDiffers |= preview.applied[i] != withDg.applied[i];
+    CHECK(matrixDiffers);
+    MHCSettings noWb = m;
+    noWb.whiteBalanceEnabled = false;
+    MHC2ProfileParams cal;
+    REQUIRE(BuildMHC2ParamsForPerm(noWb, true, 0, ComputeMhcPermutation(noWb, true), cal));
+    MhcScanout calScan;
+    REQUIRE(ComputeMhcScanout(cal, calScan));
+    for (int i = 0; i < 9; i++) CHECK(preview.applied[i] == calScan.applied[i]);
     // They differ exactly in the SDR range (below the SDR white the 2.2 remap applies), and agree above it.
     const int n = preview.lutSize;
     int differBelow = 0, differAbove = 0;
@@ -316,7 +331,7 @@ TEST_CASE("MHC preview: with the grayscale stage switched off, neither the previ
         MhcPreviewSession s;
         REQUIRE(PrepareMhcPreview(m, hdr, 0, s));
         MHC2ProfileParams bp;
-        REQUIRE(BuildMHC2ParamsForPerm(m, hdr, 0, (uint8_t)(ComputeMhcPermutation(m, hdr) & ~MHCSettings::PERM_DG), bp));
+        REQUIRE(BuildMHC2ParamsForPerm(m, hdr, 0, (uint8_t)(ComputeMhcPermutation(m, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB)), bp));
         MhcScanout bake, preview;
         REQUIRE(ComputeMhcScanout(bp, bake));
         ComposeMhcPreview(s, m.correctionGrayscale, preview);
