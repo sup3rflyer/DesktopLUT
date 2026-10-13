@@ -146,6 +146,11 @@ class FaldParams:
     est_aniso: float = 1.0                # vertical/horizontal scale of the ESTIMATE kernel (1 = isotropic
                                           # in mm; 45/80 = isotropic in cells → shorter vertical reach)
     est_support_cells: int = 0            # >0: the estimate only sums cells within ±N cells in each axis
+    est_tent: float = 0.0                 # "knots" only, EXPERIMENT (work guide P11, 2026-09-22): weight of a separable
+                                          #   bilinear TENT (1 − |dx|/cell_w)(1 − |dy|/cell_h), relative to the knots
+                                          #   profile's centre weight 1 — a smooth LED-to-LED interpolation instead of
+                                          #   a centre spike (the spike draws a dot lattice inside small bright shapes
+                                          #   that the panel does not show). 0 = off, bit-identical.
     est_support_soft: float = 0.0         # >0: the support edge rolls off smoothly over ±soft cells around ±N
                                           #   (0 = hard box, the fitted default; a hard edge imprints a cell-periodic
                                           #   lattice on smooth gradients)
@@ -549,7 +554,7 @@ class FaldModel:
         if kind == "knots":
             r_knot, lw_knot = self.est_knots() if knots is None else knots
             r_knot = np.asarray(r_knot, dtype=float); lw_knot = np.asarray(lw_knot, dtype=float)
-            knots_key = (tuple(np.round(r_knot, 4)), tuple(np.round(lw_knot, 6)))
+            knots_key = (tuple(np.round(r_knot, 4)), tuple(np.round(lw_knot, 6)), round(float(p.est_tent), 6))
         key = (kind, round(scale_mm, 4), round(core_mm, 4), round(tail_frac, 5),
                round(phase_mm[0], 4), round(phase_mm[1], 4), round(aniso, 5), int(support_cells), round(pnorm, 4), sub,
                round(support_soft, 4), knots_key)
@@ -614,6 +619,9 @@ class FaldModel:
                     beyond = d > r_knot[-1]                                # exponential continuation past the last
                     lw = np.where(beyond, lw_knot[-1] + slope * (d - r_knot[-1]), lw)
                     k = np.exp(lw)
+                    if p.est_tent > 0:                                     # P11 experiment: + a separable bilinear tent
+                        tx = np.clip(1.0 - np.abs(dx) / cwmm, 0.0, None); ty = np.clip(1.0 - np.abs(dy) / chmm, 0.0, None)
+                        k = k + p.est_tent * tx * ty
                 else:
                     raise ValueError(kind)
                 if support_cells > 0:
