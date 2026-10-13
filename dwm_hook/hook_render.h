@@ -19,6 +19,7 @@ struct LocalTonemapParams {
     bool dynamicPeak;
     float pqSourcePeak;
     float pqTargetPeak;
+    bool lutOff;                // the host bypasses this monitor's 3D LUT (DwmHookSharedConfig::lutOffMask)
 };
 
 // Per-monitor HDR state detected via DXGI output enumeration

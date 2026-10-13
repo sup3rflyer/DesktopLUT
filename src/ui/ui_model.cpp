@@ -1,5 +1,6 @@
 #include "ui_model.h"
 
+#include <cmath>
 #include <cwctype>
 
 namespace ui {
@@ -30,6 +31,35 @@ const char* StageLabel(StageId id) {
 
 Light MhcLight(const MHCSettings& mhc) {
     return (mhc.enabled && !mhc.profileName.empty()) ? Light::Configured : Light::Off;
+}
+
+Light CombineLights(Light a, Light b) {
+    auto rank = [](Light l) {
+        switch (l) {
+        case Light::Fault:      return 4;
+        case Light::Configured:
+        case Light::Verified:   return 3;
+        case Light::Pending:
+        case Light::Off:        return 2;
+        default:                return 1;
+        }
+    };
+    return rank(a) >= rank(b) ? a : b;
+}
+
+bool MhcPrimariesContent(const MHCSettings& mhc) {
+    const bool d65 = std::fabs(mhc.whiteBalanceWx - 0.3127f) < 0.001f && std::fabs(mhc.whiteBalanceWy - 0.3290f) < 0.001f;
+    const bool wb = mhc.whiteBalanceEnabled && mhc.whiteBalanceWy > 0.001f && !d65;
+    return mhc.primariesEnabled || wb;
+}
+
+bool MhcGrayscaleContent(const MHCSettings& mhc, bool hdr) {
+    // An imported file carries a curve when it is a 1D cube, or an SDR ICC profile's TRC (HDR ICC curves
+    // are not used: only the primaries come from them).
+    const bool imported = !mhc.sourceFilePath.empty() && (mhc.sourceIs1DCube || (!hdr && mhc.hasPerChannelTRC));
+    const bool base = mhc.sourceFilePath.empty() && mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty();
+    const bool correction = mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty();
+    return imported || base || correction || (hdr && mhc.desktopGammaEnabled);
 }
 
 bool ShaderTweakActive(const ColorCorrectionSettings& cc) {
@@ -80,34 +110,45 @@ std::wstring DisplayLabel(const DisplayIdentity& id, const std::wstring& osName)
     return L"Display";
 }
 
-std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode live) {
+std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode live, const PathRuntime& rt) {
     const bool hdr = PipelineIsHdr(shown);
     const ColorCorrectionSettings& cc = hdr ? ms.hdrColorCorrection : ms.sdrColorCorrection;
     const MHCSettings& mhc = hdr ? ms.hdrMHC : ms.sdrMHC;
     const std::wstring& lut = hdr ? ms.hdrPath : ms.sdrPath;
+    // Faults only for the mode the display is in (the other side shows what would run there).
+    const bool liveSide = live != Mode::Unknown && PipelineIsHdr(live) == hdr;
+    const bool liveLayersDown = !rt.running || (rt.hookMode && !rt.hookActive);
+
+    // A live layer (tone map, 3D LUT, FALD): nothing set / switched off or suspended / runs / should run.
+    auto liveLayer = [&](bool content, bool on, bool cannotRun) {
+        if (!content) return Light::None;
+        if (!on || rt.suspended) return Light::Off;
+        if (liveSide && (liveLayersDown || cannotRun)) return Light::Fault;
+        return Light::Configured;
+    };
+    // An MHC stage: nothing to do or no MHC / bypassed / in the installed profile / enabled but not installed.
+    const bool mhcInstalled = mhc.enabled && !mhc.profileName.empty();
+    auto mhcStage = [&](bool content, bool bypassed) {
+        if (!content || !mhc.enabled) return Light::None;
+        if (bypassed) return Light::Off;
+        return mhcInstalled ? Light::Configured : Light::Fault;
+    };
+    // Dimmed (a dashed node) = not changing the picture.
+    auto stage = [](StageId id, Light l) { return Stage{ id, l, true, l == Light::None || l == Light::Off }; };
 
     std::vector<Stage> path;
     path.push_back({ StageId::Desktop, Light::NotApplicable, false, false });
 
-    // Tone mapping runs before the 3D LUT in the hook (and overlay) shader, HDR only.
-    if (hdr) path.push_back({ StageId::ToneMap, cc.tonemap.enabled ? Light::Configured : Light::Off, true, false });
+    // Tone mapping runs before the 3D LUT in the hook (and overlay) shader, HDR only. Its switch is all it
+    // has: off is nothing set.
+    if (hdr) path.push_back(stage(StageId::ToneMap, liveLayer(cc.tonemap.enabled, true, false)));
 
-    path.push_back({ StageId::Lut3D, lut.empty() ? Light::Off : Light::Configured, true, false });
+    path.push_back(stage(StageId::Lut3D, liveLayer(!lut.empty(), !(hdr ? ms.hdrLutBypass : ms.sdrLutBypass), false)));
 
     // FALD needs a panel file to exist at all; it runs only on FP16 back buffers (HDR or ACM SDR).
     if (!cc.fald.paramsPath.empty()) {
-        const bool fp16 = (live == Mode::HDR || live == Mode::AcmSdr || live == Mode::Unknown);
-        const bool liveMatchesSide = (live == Mode::Unknown) || (PipelineIsHdr(live) == hdr);
-        Stage s{ StageId::Fald, Light::Off, true, false };
-        if (!fp16 && liveMatchesSide) {
-            s.light = Light::NotApplicable;   // legacy SDR: the layer cannot run
-            s.dimmed = true;
-        } else if (cc.fald.enabled) {
-            s.light = Light::Configured;
-        } else {
-            s.dimmed = true;                  // file loaded, layer switched off
-        }
-        path.push_back(s);
+        const bool fp16 = live == Mode::HDR || live == Mode::AcmSdr || live == Mode::Unknown;
+        path.push_back(stage(StageId::Fald, liveLayer(true, cc.fald.enabled, !fp16)));
     }
 
     // The overlay shader tweak (pipe / INI only, no classic control) — shown so a live correction is
@@ -116,9 +157,8 @@ std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode li
 
     path.push_back({ StageId::Scanout, Light::NotApplicable, false, false });
 
-    const Light m = MhcLight(mhc);
-    path.push_back({ StageId::Primaries, m, true, false });
-    path.push_back({ StageId::Grayscale, m, true, false });
+    path.push_back(stage(StageId::Primaries, mhcStage(MhcPrimariesContent(mhc), mhc.bypassPrimaries)));
+    path.push_back(stage(StageId::Grayscale, mhcStage(MhcGrayscaleContent(mhc, hdr), mhc.bypassGrayscale)));
     path.push_back({ StageId::Panel, Light::NotApplicable, false, false });
     return path;
 }

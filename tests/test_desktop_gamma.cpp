@@ -812,3 +812,73 @@ TEST_CASE("Desktop gamma: the overlay pixel shader splices the shared function, 
     refl->Release();
     blob->Release();
 }
+
+TEST_CASE("MHC permutations: a bypassed stage drops its own bits, and every swap normalises") {
+    MHCSettings m;
+    m.whiteBalanceEnabled = true;
+    m.whiteBalanceWx = 0.30f;
+    m.whiteBalanceWy = 0.32f;
+    m.desktopGammaEnabled = true;
+    m.correctionGrayscale.enabled = true;
+    m.correctionGrayscale.points = { 0.5f };
+    const uint8_t WB = MHCSettings::PERM_WB, DG = MHCSettings::PERM_DG, GS = MHCSettings::PERM_GS;
+    const uint8_t NOPRIM = MHCSettings::PERM_NOPRIM, NOGRAY = MHCSettings::PERM_NOGRAY;
+    CHECK(ComputeMhcPermutation(m, true) == (WB | DG | GS));
+    CHECK(ComputeMhcPermutation(m, false) == (WB | GS));          // desktop gamma is HDR only
+    m.bypassPrimaries = true;
+    CHECK(ComputeMhcPermutation(m, true) == (NOPRIM | DG | GS));
+    m.bypassGrayscale = true;
+    CHECK(ComputeMhcPermutation(m, true) == (NOPRIM | NOGRAY));   // both: the identity variant
+    m.bypassPrimaries = false;
+    CHECK(ComputeMhcPermutation(m, true) == (WB | NOGRAY));
+    // A caller flipping one bit on the active permutation (the DG hotkey) cannot undo a bypass.
+    CHECK(NormalizeMhcPerm(NOGRAY | WB | DG) == (NOGRAY | WB));
+    CHECK(NormalizeMhcPerm(NOGRAY | GS) == NOGRAY);
+    CHECK(NormalizeMhcPerm(NOPRIM | WB | DG) == (NOPRIM | DG));
+    CHECK(NormalizeMhcPerm(0xFF) == (NOPRIM | NOGRAY));          // out-of-range bits never index past the cache
+    CHECK(NormalizeMhcPerm(WB | DG | GS) == (WB | DG | GS));
+}
+
+TEST_CASE("MHC permutations: a bypassed stage bakes as the identity profile's stage, keeping the peak") {
+    MHCSettings m;
+    m.enabled = true;
+    m.primariesEnabled = true;
+    m.primariesPreset = 0;
+    m.whiteBalanceEnabled = true;
+    m.whiteBalanceWx = 0.30f;
+    m.whiteBalanceWy = 0.32f;
+    m.desktopGammaEnabled = true;
+    m.sourceFilePath = L"C:\\DesktopLUT_UnitTest\\no_such_file.cube";   // unreadable on purpose
+    m.sourceIs1DCube = true;
+    m.baseGrayscale.peakNits = 1612.0f;
+    MHC2ProfileParams full;
+    CHECK_FALSE(BuildMHC2ParamsForPerm(m, true, 0, ComputeMhcPermutation(m, true), full));   // needs the file
+
+    m.bypassGrayscale = true;
+    MHC2ProfileParams gray;
+    REQUIRE(BuildMHC2ParamsForPerm(m, true, 0, ComputeMhcPermutation(m, true), gray));       // does not
+    CHECK_FALSE(gray.grayscaleEnabled);
+    CHECK_FALSE(gray.hasPrecomputedCorrection);
+    CHECK_FALSE(gray.hasPerChannelTRC);
+    CHECK_FALSE(gray.desktopGammaEnabled);
+    CHECK_FALSE(gray.correctionGrayscaleEnabled);
+    CHECK(gray.peakNits == 1612.0f);           // what Windows reports to HDR apps does not move
+    CHECK(gray.primariesEnabled);              // the other stage untouched
+    CHECK(gray.whiteBalanceGains[0] != 1.0f);
+
+    m.bypassPrimaries = true;
+    MHC2ProfileParams both;
+    REQUIRE(BuildMHC2ParamsForPerm(m, true, 0, ComputeMhcPermutation(m, true), both));
+    CHECK_FALSE(both.primariesEnabled);
+    CHECK(both.whiteBalanceGains[0] == 1.0f);
+    CHECK(both.whiteBalanceGains[1] == 1.0f);
+    CHECK(both.whiteBalanceGains[2] == 1.0f);
+    CHECK(both.peakNits == 1612.0f);
+    // Both stages off: field for field the identity profile, plus the same metadata.
+    const MHC2ProfileParams ident = BuildIdentityMHC2Params(true, 1612.0f, L"x");
+    CHECK(both.grayscaleEnabled == ident.grayscaleEnabled);
+    CHECK(both.grayscale.use24Gamma == ident.grayscale.use24Gamma);
+    CHECK(both.desktopGammaEnabled == ident.desktopGammaEnabled);
+    CHECK(both.primariesEnabled == ident.primariesEnabled);
+    CHECK(both.peakNits == ident.peakNits);
+}

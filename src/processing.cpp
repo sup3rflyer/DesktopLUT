@@ -1083,7 +1083,8 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
 }
 
 bool MonitorNeedsProcessing(const MonitorSettings& ms) {
-    bool hasLUT = !ms.sdrPath.empty() || !ms.hdrPath.empty();
+    // A bypassed cube is no work: with nothing else to do, the live layers stop.
+    bool hasLUT = !LiveLutPath(ms, false).empty() || !LiveLutPath(ms, true).empty();
     bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
                                  ms.sdrColorCorrection.grayscale.enabled ||
                                  ms.sdrColorCorrection.grayscale.use24Gamma ||
@@ -1109,7 +1110,8 @@ std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet() {
         // A monitor with only a FALD panel file, or only the HDR tonemapper, and no .cube still belongs
         // in the list: the hook runs that work on it (empty cube paths stage nothing). The panel file is
         // always staged when a path is set, enabled or not, so switching the layer on later rides the
-        // shared config instead of a re-inject.
+        // shared config instead of a re-inject. A bypassed cube is staged too, for the same reason
+        // (the hook skips it: DwmHookSharedConfig::lutOffMask).
         if (!MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection))
             continue;
         MONITORINFO mi = { sizeof(mi) };
@@ -1197,8 +1199,8 @@ static void StartProcessingImpl() {
         if (MonitorNeedsProcessing(ms)) {
             MonitorLUTConfig config;
             config.monitorIndex = (int)i;
-            config.sdrLutPath = ms.sdrPath;
-            config.hdrLutPath = ms.hdrPath;
+            config.sdrLutPath = LiveLutPath(ms, false);   // the overlay applies only what runs
+            config.hdrLutPath = LiveLutPath(ms, true);
             config.sdrColorCorrection = ConvertColorCorrection(ms.sdrColorCorrection, false);
             config.hdrColorCorrection = ConvertColorCorrection(ms.hdrColorCorrection, true);
             configs.push_back(config);

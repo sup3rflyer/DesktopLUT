@@ -842,6 +842,15 @@ TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") 
     CHECK(ms.hdrMHC.activePerm == (MHCSettings::PERM_WB | MHCSettings::PERM_DG));
     CHECK(ms.hdrMHC.permNames[ms.hdrMHC.activePerm] == L"DesktopLUT_Mon1_HDR_1.icm");
     CHECK(ms.sdrMHC.enabled == false);
+    // No stage switch used: the bypass flags are off and the bypass variant slots (8..31) wrote nothing.
+    CHECK_FALSE(ms.hdrLutBypass);
+    CHECK_FALSE(ms.hdrMHC.bypassPrimaries);
+    CHECK_FALSE(ms.hdrMHC.bypassGrayscale);
+    wchar_t probe[64] = {};
+    GetPrivateProfileStringW(L"Display7", L"HDR_MHCPermPath9", L"<absent>", probe, 64, ini.c_str());
+    CHECK(std::wstring(probe) == L"<absent>");
+    GetPrivateProfileStringW(L"Display7", L"HDR_MHCPermPath7", L"<absent>", probe, 64, ini.c_str());
+    CHECK(std::wstring(probe) == L"");   // the classic eight are written as before
     // Bookkeeping is not part of the per-monitor keys.
     CHECK(ms.slot == -1);
     CHECK(ms.legacyIndex == -1);
@@ -853,6 +862,40 @@ TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") 
     CHECK(none.hdrPath.empty());
     CHECK(none.hdrMHC.enabled == false);
     CHECK(none.hdrMHC.desktopGammaEnabled == false);
+}
+
+TEST_CASE("Monitor settings: stage bypasses and their profile variants round-trip") {
+    TempIni ini;
+    MonitorSettings original;
+    original.hdrPath = L"C:\\luts\\hdr.cube";
+    original.hdrLutBypass = true;
+    original.hdrMHC.enabled = true;
+    original.hdrMHC.bypassGrayscale = true;
+    original.sdrMHC.bypassPrimaries = true;
+    const uint8_t perm = MHCSettings::PERM_WB | MHCSettings::PERM_NOGRAY;
+    original.hdrMHC.activePerm = perm;
+    original.hdrMHC.permPaths[perm] = L"C:\\color\\DesktopLUT_Mon0_HDR_P17_1.icm";
+    original.hdrMHC.permDgWhiteNits[perm] = 0.0f;
+    original.hdrMHC.baseGrayscale.pointCount = 20;
+    original.hdrMHC.baseGrayscale.initLinear();
+    original.sdrMHC.baseGrayscale.pointCount = 20;
+    original.sdrMHC.baseGrayscale.initLinear();
+    SaveMonitorSettings(L"Display2", original, ini.c_str());
+
+    MonitorSettings ms;
+    LoadMonitorSettings(L"Display2", ms, ini.c_str());
+    CHECK(ms.hdrLutBypass);
+    CHECK_FALSE(ms.sdrLutBypass);
+    CHECK(ms.hdrMHC.bypassGrayscale);
+    CHECK_FALSE(ms.hdrMHC.bypassPrimaries);
+    CHECK(ms.sdrMHC.bypassPrimaries);
+    CHECK(ms.hdrMHC.activePerm == perm);
+    CHECK(ms.hdrMHC.permNames[perm] == L"DesktopLUT_Mon0_HDR_P17_1.icm");
+    CHECK(ms.hdrMHC.permDgWhiteNits[perm] == 0.0f);
+    // The cube that runs: none while bypassed, the configured one otherwise.
+    CHECK(LiveLutPath(ms, true).empty());
+    ms.hdrLutBypass = false;
+    CHECK(LiveLutPath(ms, true) == L"C:\\luts\\hdr.cube");
 }
 
 TEST_CASE("Pool: loads identity-keyed displays and unclaimed legacy sections") {

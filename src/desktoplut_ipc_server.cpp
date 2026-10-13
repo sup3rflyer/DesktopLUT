@@ -473,6 +473,10 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_ped_mode", JNum((double)fs.pedMode));
                 l.set("fald_temporal_mode", JNum((double)fs.temporalMode));   // temporal drive state (runtime.fald_temporal)
                 l.set("fald_tau_rise_ms", JNum((double)fs.tauRiseMs));
+                // Stage bypasses (the interface's stage switches; layers.set takes them too)
+                l.set("bypass_3dlut", JBool(isHDR ? s.hdrLutBypass : s.sdrLutBypass));
+                l.set("bypass_primaries", JBool(m.bypassPrimaries));
+                l.set("bypass_grayscale", JBool(m.bypassGrayscale));
                 l.set("fald_tau_fall_ms", JNum((double)fs.tauFallMs));
                 l.set("fald_delay_frames", JNum((double)fs.delayFrames));
                 l.set("fald_temporal_closure", JNum((double)fs.clockClosure));   // temporal mode 3 "panel clock" (work guide C13)
@@ -843,6 +847,11 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
         mhc.hasPerChannelTRC = false;
         mhc.sourceIs1DCube = false;
         mhc.desktopGammaEnabled = false;
+        // The interface's stage bypasses: a build measures and installs whole layers (the capture
+        // above keeps the user's switches for restore).
+        mhc.bypassPrimaries = false;
+        mhc.bypassGrayscale = false;
+        (isHDR ? ms.hdrLutBypass : ms.sdrLutBypass) = false;
         // Clear the runtime 3D LUT + shader correction layers for the CALIBRATED mode
         // only. The other mode's layers are inert while the display is in the calibrated
         // mode, and clearing them here destroyed them on the apply path: exit with
@@ -1037,6 +1046,10 @@ static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
     const FaldSettings& fs = isHDR ? s.hdrColorCorrection.fald : s.sdrColorCorrection.fald;   // per mode
     out.set("fald", JBool(fs.enabled));
     out.set("fald_params_path", JStr(WideToUtf8(fs.paramsPath)));
+    // Stage bypasses (the interface's stage switches): the stage keeps its settings but is not applied.
+    out.set("bypass_3dlut", JBool(isHDR ? s.hdrLutBypass : s.sdrLutBypass));
+    out.set("bypass_primaries", JBool(m.bypassPrimaries));
+    out.set("bypass_grayscale", JBool(m.bypassGrayscale));
 }
 
 void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1050,6 +1063,10 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     };
     bool hasWb = false, wb = false, hasGs = false, gs = false, hasDg = false, dg = false,
          hasTm = false, tm = false, hasFd = false, fd = false;
+    bool hasBl = false, bl = false, hasBp = false, bp = false, hasBg = false, bg = false;
+    want("bypass_3dlut", hasBl, bl);
+    want("bypass_primaries", hasBp, bp);
+    want("bypass_grayscale", hasBg, bg);
     want("white_balance", hasWb, wb);
     want("grayscale", hasGs, gs);
     want("desktop_gamma", hasDg, dg);
@@ -1063,6 +1080,7 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     }
     JsonValue before = JObj(), after = JObj();
     bool mhcChanged = false, tmChanged = false, dgChanged = false, mhcEnabled = false, profileNamed = false;
+    bool lutBypassChanged = false;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
@@ -1080,6 +1098,11 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         if (hasTm && ms.hdrColorCorrection.tonemap.enabled != tm) { ms.hdrColorCorrection.tonemap.enabled = tm; tmChanged = true; }
         FaldSettings& fs = isHDR ? ms.hdrColorCorrection.fald : ms.sdrColorCorrection.fald;
         if (hasFd && fs.enabled != fd) { fs.enabled = fd; tmChanged = true; }   // same propagation as tonemap, for the addressed mode
+        // Stage bypasses: an MHC one rebuilds the profile as its variant (same path as the bits above).
+        if (hasBp && m.bypassPrimaries != bp) { m.bypassPrimaries = bp; mhcChanged = true; }
+        if (hasBg && m.bypassGrayscale != bg) { m.bypassGrayscale = bg; mhcChanged = true; }
+        bool& lutBypass = isHDR ? ms.hdrLutBypass : ms.sdrLutBypass;
+        if (hasBl && lutBypass != bl) { lutBypass = bl; lutBypassChanged = true; }
         mhcEnabled = m.enabled;
         profileNamed = !m.profileName.empty();
     }
@@ -1122,6 +1145,16 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         FaldTrace("LayersSet: UpdateColorCorrectionControls");
         UpdateColorCorrectionControls();   // the GUI checkboxes follow the pipe
         FaldTrace("LayersSet: controls updated");
+    }
+    if (lutBypassChanged) {
+        // As act::SetLutBypass: the hook skips the staged cube (shared config), the overlay restarts without it.
+        SaveSettings();
+        if (g_gui.isRunning) {
+            if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
+            else RestartLiveLayers();
+        }
+        act::ReconcileLiveLayers("pipe 3D LUT bypass");
+        GuiNotifySettingsChanged(mon);
     }
     std::string profileName;
     {
@@ -1263,6 +1296,12 @@ void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
     // opened a window in which the whitelist monitor saw enabled + the REMOVED profile's name + the
     // identity stand-in as default and re-asserted the removed profile; a failed apply also left the
     // removed profile marked active.
+    // A pipe apply makes the whole profile live: the interface's stage bypasses for this mode go.
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
+        m.bypassPrimaries = m.bypassGrayscale = false;
+    }
     // GenerateAndInstallMhcProfile snapshots settings under the mutex internally,
     // so it MUST be called without g_monitorSettingsMutex held.
     if (!GenerateAndInstallMhcProfile(mon, isHDR)) {
@@ -1587,6 +1626,7 @@ void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
         if (isHDR) ms.hdrPath = cube; else ms.sdrPath = cube;
+        (isHDR ? ms.hdrLutBypass : ms.sdrLutBypass) = false;   // a pipe apply makes its cube live
     }
     SaveSettings();
     ReapplyProcessing();

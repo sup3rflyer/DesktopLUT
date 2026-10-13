@@ -58,6 +58,14 @@ Result MhcSetCorrectionGsEnabled(int mon, bool hdr, bool on);
 Result MhcSetCorrectionGsPoints(int mon, bool hdr, int count);        // 10 / 20 / 32; resets the curve
 Result MhcResetCorrectionGs(int mon, bool hdr);
 Result MhcSet24Gamma(int mon, bool on);                               // SDR fine-tune
+
+// ---- Stage bypass (the interface's per-stage switches) -------------------------------------------
+// A bypassed stage keeps its settings and is left out of what runs: the 3D LUT stays loaded (the hook
+// skips it; the overlay restarts without it), an MHC stage is swapped for the profile variant without it.
+// Refused while a calibration session or live grayscale edit runs (it measures what it set up).
+enum class MhcStage { Primaries, Grayscale };
+Result SetLutBypass(int mon, bool hdr, bool bypass);
+Result MhcSetStageBypass(int mon, bool hdr, MhcStage stage, bool bypass);
 Result MhcSetCorrectionGsPeak(int mon, float nits);                   // HDR fine-tune, 10..10000
 Result MhcSetDesktopGamma(int mon, bool on);                          // HDR
 

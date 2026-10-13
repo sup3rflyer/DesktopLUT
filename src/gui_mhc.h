@@ -54,6 +54,10 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR);
 // permutation variants. Exposed for testing.
 // False = the imported source file is set but unreadable (callers keep the installed profile).
 bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2ProfileParams& params);
+// The params of one permutation variant: the full settings minus the corrections its bits leave out. A
+// bypassed stage gets the identity profile's fields (and needs none of its inputs, e.g. an imported file);
+// the luminance metadata stays the full profile's. Exposed for testing.
+bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex, uint8_t perm, MHC2ProfileParams& params);
 // Only the matrix inputs of BuildMHC2Params (primaries + white-balance gains): no files read.
 void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams& params);
 
@@ -159,11 +163,14 @@ void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, i
 // ============================================================================
 // MHC inline corrections (WB, DG, GS) are baked into ICC profiles. To toggle
 // any correction at runtime (hotkey, whitelist) without regeneration delay, we
-// cache profile variants keyed by a 3-bit permutation bitmask (see MHCSettings::PERM_*).
+// cache profile variants keyed by a 5-bit permutation bitmask (see MHCSettings::PERM_*).
 // Profiles are generated on-demand and cached until the base calibration data changes.
 
 // Compute the permutation bitmask from current MHCSettings enable flags
 uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR);
+// A bypassed stage never carries its own bits: NOPRIM clears WB, NOGRAY clears DG and GS. Applied by every
+// swap, so callers that flip one bit on the active permutation stay correct.
+uint8_t NormalizeMhcPerm(uint8_t perm);
 
 // Ensure a specific permutation profile exists in the system color directory.
 // Generates on-demand if not cached. Thread-safe (takes g_monitorSettingsMutex internally).

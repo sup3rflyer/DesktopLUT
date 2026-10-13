@@ -145,29 +145,43 @@ void Bevel(ImDrawList* dl, ImVec2 a, ImVec2 b, BevelKind kind) {
     }
 }
 
-void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap) {
+void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap, float rounding) {
     const ImU32 c = Col(col);
     a = ImVec2(a.x + 0.5f, a.y + 0.5f);   // on pixel centres: crisp 1 px dashes
     b = ImVec2(b.x - 0.5f, b.y - 0.5f);
-    auto seg = [&](ImVec2 p, ImVec2 q) {
+    // The outline as a closed polyline (rounded corners included), dashed by distance along it, so the
+    // pattern runs on through the corners.
+    dl->PathRect(a, b, rounding > 0.5f ? rounding - 0.5f : 0.0f);
+    std::vector<ImVec2> pts(dl->_Path.Data, dl->_Path.Data + dl->_Path.Size);
+    dl->PathClear();
+    if (pts.size() < 2) return;
+    pts.push_back(pts.front());
+    const float period = dash + gap;
+    float along = 0.0f;   // distance into the current period
+    for (size_t i = 0; i + 1 < pts.size(); i++) {
+        const ImVec2 p = pts[i], q = pts[i + 1];
         const float len = std::hypot(q.x - p.x, q.y - p.y);
-        if (len <= 0.0f) return;
+        if (len <= 0.0f) continue;
         const ImVec2 d((q.x - p.x) / len, (q.y - p.y) / len);
-        for (float t = 0.0f; t < len; t += dash + gap) {
-            const float e = (t + dash < len) ? t + dash : len;
-            dl->AddLine(ImVec2(p.x + d.x * t, p.y + d.y * t), ImVec2(p.x + d.x * e, p.y + d.y * e), c, 1.0f);
+        float t = 0.0f;
+        while (t < len) {
+            const float left = (along < dash ? dash : period) - along;   // to the end of this dash or gap
+            const float step = left < len - t ? left : len - t;
+            if (along < dash)
+                dl->AddLine(ImVec2(p.x + d.x * t, p.y + d.y * t), ImVec2(p.x + d.x * (t + step), p.y + d.y * (t + step)), c, 1.0f);
+            t += step;
+            along += step;
+            if (along >= period) along -= period;
         }
-    };
-    seg(a, ImVec2(b.x, a.y));
-    seg(ImVec2(b.x, a.y), b);
-    seg(b, ImVec2(a.x, b.y));
-    seg(ImVec2(a.x, b.y), a);
+    }
 }
 
 void DrawLight(ImDrawList* dl, ImVec2 c, Light l, float d, ImU32 inkOverride) {
     const ImU32 ink = Col(inkOverride ? inkOverride : pal::LightOn);
     const ImU32 faint = Col(inkOverride ? inkOverride : pal::InkFaint);
     switch (l) {
+    case Light::None:
+        break;   // nothing set: the place stays empty
     case Light::Verified:
     case Light::Configured:
         dl->AddCircleFilled(c, d * 0.5f, ink);
@@ -176,8 +190,9 @@ void DrawLight(ImDrawList* dl, ImVec2 c, Light l, float d, ImU32 inkOverride) {
         dl->AddCircle(c, d * 0.5f - Px(0.75f), ink, 0, Px(1.5f));
         break;
     case Light::Fault: {
-        const float h = d * 0.6f;
-        dl->AddTriangleFilled(ImVec2(c.x, c.y - h), ImVec2(c.x + h, c.y + h * 0.75f), ImVec2(c.x - h, c.y + h * 0.75f),
+        // Its bounding box centred on c (an apex-anchored triangle sits visibly high beside text).
+        const float h = d * 0.6f, half = h * 0.875f;
+        dl->AddTriangleFilled(ImVec2(c.x, c.y - half), ImVec2(c.x + h, c.y + half), ImVec2(c.x - h, c.y + half),
                               Col(inkOverride ? inkOverride : pal::Alarm));
         break;
     }
@@ -396,7 +411,7 @@ bool Node(const char* id, const char* label, Light light, bool selected, bool of
         } else {
             // Opaque, so the signal line drawn behind stops at the box.
             Fill(dl, p, q, hovered ? pal::Hover : pal::Panel, r);
-            if (off) DashedRect(dl, p, q, pal::RuleStrong, Px(4.0f), Px(3.0f));
+            if (off) DashedRect(dl, p, q, pal::RuleStrong, Px(4.0f), Px(3.0f), r);
             else Edge(dl, p, q, hovered ? pal::InkFaint : pal::RuleStrong, r);
             text = off ? pal::InkFaint : pal::Ink;
         }
@@ -422,17 +437,13 @@ float SwitchWidth(const char* label) {
     return Snap(labelW + Px(10) + Px(kSwitchTrackW));
 }
 
-bool Switch(const char* id, const char* label, bool on) {
-    const float w = SwitchWidth(label), h = Snap(Px(kControlH));
-    const ImVec2 p = SnapV(ImGui::GetCursorScreenPos());
-    ImGui::SetCursorScreenPos(p);
-    const bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
-    const bool hovered = ImGui::IsItemHovered();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float cy = p.y + h * 0.5f;
+namespace {
+
+// The switch body at x, centred on cy: a check box (Light) or a pill track with a knob.
+void DrawSwitchBody(ImDrawList* dl, float x, float cy, bool on, bool hovered) {
     if (Shape().checkboxSwitch) {
         const float s = Snap(Px(kCheckBox));
-        const ImVec2 a(p.x, Snap(cy - s * 0.5f)), b(a.x + s, a.y + s);
+        const ImVec2 a(Snap(x), Snap(cy - s * 0.5f)), b(a.x + s, a.y + s);
         Fill(dl, a, b, pal::Field);
         Bevel(dl, a, b, BevelKind::Sunken);
         if (on) {   // the check mark
@@ -441,12 +452,10 @@ bool Switch(const char* id, const char* label, bool on) {
                                     ImVec2(a.x + 9.5f * u, a.y + 4.0f * u) };
             dl->AddPolyline(pts, 3, Col(pal::Ink), Px(1.8f));
         }
-        DrawText(dl, Font::Label, kSizeLabel, b.x + Px(7), cy, pal::Ink, label);
-        return clicked;
+        return;
     }
-    const float labelW = DrawText(dl, Font::Label, kSizeLabel, p.x, cy, hovered ? pal::Ink : pal::InkDim, label);
     const float tw = Snap(Px(kSwitchTrackW)), th = Snap(Px(kSwitchTrackH));
-    const ImVec2 a(Snap(p.x + labelW + Px(10)), Snap(cy - th * 0.5f)), b(a.x + tw, a.y + th);
+    const ImVec2 a(Snap(x), Snap(cy - th * 0.5f)), b(a.x + tw, a.y + th);
     const float knob = th * 0.5f - Px(3);
     if (on) {
         Fill(dl, a, b, pal::SwitchOn, th * 0.5f);
@@ -456,6 +465,36 @@ bool Switch(const char* id, const char* label, bool on) {
         Edge(dl, a, b, hovered ? pal::InkFaint : pal::ControlEdge, th * 0.5f);
         dl->AddCircleFilled(ImVec2(a.x + th * 0.5f, a.y + th * 0.5f), knob, Col(pal::InkDim));
     }
+}
+
+}  // namespace
+
+float ToggleSwitchWidth() { return Snap(Px(Shape().checkboxSwitch ? kCheckBox : kSwitchTrackW)); }
+
+bool ToggleSwitch(const char* id, bool on) {
+    const float w = ToggleSwitchWidth(), h = Snap(Px(kControlH));
+    const ImVec2 p = SnapV(ImGui::GetCursorScreenPos());
+    ImGui::SetCursorScreenPos(p);
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
+    DrawSwitchBody(ImGui::GetWindowDrawList(), p.x, p.y + h * 0.5f, on, ImGui::IsItemHovered());
+    return clicked;
+}
+
+bool Switch(const char* id, const char* label, bool on) {
+    const float w = SwitchWidth(label), h = Snap(Px(kControlH));
+    const ImVec2 p = SnapV(ImGui::GetCursorScreenPos());
+    ImGui::SetCursorScreenPos(p);
+    const bool clicked = ImGui::InvisibleButton(id, ImVec2(w, h));
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float cy = p.y + h * 0.5f;
+    if (Shape().checkboxSwitch) {
+        DrawSwitchBody(dl, p.x, cy, on, hovered);
+        DrawText(dl, Font::Label, kSizeLabel, p.x + Snap(Px(kCheckBox)) + Px(7), cy, pal::Ink, label);
+        return clicked;
+    }
+    const float labelW = DrawText(dl, Font::Label, kSizeLabel, p.x, cy, hovered ? pal::Ink : pal::InkDim, label);
+    DrawSwitchBody(dl, p.x + labelW + Px(10), cy, on, hovered);
     return clicked;
 }
 
@@ -639,6 +678,8 @@ struct PanelFrame {
     std::string title;
     bool hasLight = false;
     Light light = Light::Off;
+    PanelSwitch* sw = nullptr;
+    std::string id;
 };
 std::vector<PanelFrame> g_panels;
 
@@ -646,8 +687,10 @@ float PanelTitleH() { return Snap(Px(Shape().groupBoxPanels ? 26.0f : 40.0f)); }
 
 }  // namespace
 
-void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx) {
+void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx, PanelSwitch* sw) {
     PanelFrame f;
+    f.sw = sw;
+    f.id = id;
     f.pos = SnapV(ImGui::GetCursorScreenPos());
     f.w = Snap(sizePx.x > 0.0f ? sizePx.x : ImGui::GetContentRegionAvail().x);
     f.titleH = PanelTitleH();
@@ -674,8 +717,26 @@ void EndPanel() {
     // The frame is drawn on the parent's draw list, which renders below the child's content.
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const float bottom = Snap(ImGui::GetItemRectMax().y + (Shape().groupBoxPanels ? Px(6) : 0.0f));
+    const ImVec2 after = ImGui::GetCursorScreenPos();
     const ImVec2 a = f.pos, b(f.pos.x + f.w, bottom);
     const float d = Snap(Px(7));
+    // The header switch, after the frame (so the frame does not paint over it), right-aligned on the
+    // title's line. In a group box it sits on the top edge, in a gap like the title's.
+    auto headerSwitch = [&](float cy) {
+        if (!f.sw) return;
+        const float sw = ToggleSwitchWidth();
+        const float x = Snap(b.x - Px(Shape().groupBoxPanels ? 12.0f : 16.0f) - sw);
+        if (Shape().groupBoxPanels)
+            dl->AddRectFilled(ImVec2(x - Px(4), cy - Px(2)), ImVec2(x + sw + Px(4), cy + Px(3)), Col(pal::Ground));
+        ImGui::SetCursorScreenPos(ImVec2(x, Snap(cy - Px(kControlH) * 0.5f)));
+        ImGui::PushID(f.id.c_str());
+        ImGui::BeginDisabled(!f.sw->enabled);
+        f.sw->clicked = ToggleSwitch("##stage_switch", f.sw->on);
+        ImGui::EndDisabled();
+        if (f.sw->tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip("%s", f.sw->tip);
+        ImGui::PopID();
+        ImGui::SetCursorScreenPos(after);
+    };
     if (Shape().groupBoxPanels) {
         // An etched group box, titled in its top edge.
         const float lineY = Snap(a.y + Px(9));
@@ -687,6 +748,7 @@ void EndPanel() {
         dl->AddRectFilled(ImVec2(gapStart, lineY - 1), ImVec2(x + textW + Px(3), lineY + 2 * BevelPx() + 1), Col(pal::Ground));
         if (f.hasLight) DrawLight(dl, ImVec2(a.x + Snap(Px(10)) + d * 0.5f, lineY), f.light, d);
         DrawText(dl, Font::Label, 13.0f, x, lineY, pal::Ink, f.title.c_str());
+        headerSwitch(lineY);
         return;
     }
     const float r = Snap(Px(Shape().panelRounding));
@@ -700,6 +762,7 @@ void EndPanel() {
     }
     DrawText(dl, Font::Label, 13.0f, x, cy, pal::Ink, f.title.c_str());
     dl->AddRectFilled(ImVec2(a.x + 1, a.y + f.titleH - 1), ImVec2(b.x - 1, a.y + f.titleH), Col(pal::PanelEdge));
+    headerSwitch(cy);
 }
 
 // ---- Logo ----------------------------------------------------------------------------------------

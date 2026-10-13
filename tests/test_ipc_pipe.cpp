@@ -155,6 +155,28 @@ TEST_CASE("Calibration pipe: state.get reports the user's Suspend beside running
     g_userStopped = old;
 }
 
+TEST_CASE("Calibration pipe: state.get reports the interface's stage bypasses for every pair") {
+    ArmedServer server(false);
+    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
+    std::vector<MonitorSettings> saved;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        saved = g_gui.monitorSettings;
+        g_gui.monitorSettings.assign(1, MonitorSettings{});
+        g_gui.monitorSettings[0].hdrLutBypass = true;
+        g_gui.monitorSettings[0].sdrMHC.bypassGrayscale = true;
+    }
+    const std::string reply = RoundTrip(R"({"method":"state.get"})");
+    CHECK(Contains(reply, "\"bypass_3dlut\":true"));       // 0:HDR
+    CHECK(Contains(reply, "\"bypass_3dlut\":false"));      // 0:SDR
+    CHECK(Contains(reply, "\"bypass_grayscale\":true"));   // 0:SDR
+    CHECK(Contains(reply, "\"bypass_primaries\":false"));
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        g_gui.monitorSettings = saved;
+    }
+}
+
 TEST_CASE("Calibration pipe: a client that connects and sends nothing does not block Stop") {
     ArmedServer server(false);
     if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }

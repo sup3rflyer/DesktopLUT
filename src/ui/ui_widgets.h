@@ -53,7 +53,7 @@ float BevelPx();   // one bevel line: 1 px, 2 px from 175 % scaling
 // Windows 98 bevel inside a-b: raised (button), pressed (a button held or toggled in), sunken (a field).
 enum class BevelKind { Raised, Pressed, Sunken, Etched };
 void Bevel(ImDrawList* dl, ImVec2 a, ImVec2 b, BevelKind kind);
-void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap);
+void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap, float rounding = 0.0f);
 // A status light centred at c. `onStrong`: drawn on the Strong (or list-selection) fill, in its ink.
 void DrawLight(ImDrawList* dl, ImVec2 c, Light l, float diameterPx, ImU32 inkOverride = 0);
 // Full-width hairline at the cursor.
@@ -87,6 +87,9 @@ bool Node(const char* id, const char* label, Light light, bool selected, bool of
 // The live-layers switch (a check box in Light). Draws at the cursor; returns true when clicked.
 bool Switch(const char* id, const char* label, bool on);
 float SwitchWidth(const char* label);   // pixels
+// The switch alone (no label), vertically centred in a control-height box at the cursor.
+bool ToggleSwitch(const char* id, bool on);
+float ToggleSwitchWidth();              // pixels
 
 // Number field in mono. Edits a draft; returns true only when the field is left (Enter, Tab, click
 // elsewhere) with a changed value, written to *v. Never commits a half-typed value.
@@ -106,7 +109,15 @@ void EndDropdown();
 
 // A titled surface. sizePx.x <= 0: the space left on the line; sizePx.y <= 0: fits its content (no
 // scrolling). The content is a child window with its own padding; nest rows in it as anywhere else.
-void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx);
+// `sw` (optional) puts a switch at the right end of the header: it is drawn by EndPanel, which sets
+// sw->clicked (read it after EndPanel). A light of Light::None keeps its place, empty.
+struct PanelSwitch {
+    bool on = false;
+    bool enabled = true;
+    const char* tip = nullptr;   // tooltip (shown when disabled too)
+    bool clicked = false;        // out
+};
+void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx, PanelSwitch* sw = nullptr);
 void EndPanel();
 
 // The RGB-cube logo, per-corner colours (the only saturated chrome: a quick wide-gamut tell).

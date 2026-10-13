@@ -339,11 +339,46 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
 // SECTION: Permutation Profile System
 // ============================================================================
 
+uint8_t NormalizeMhcPerm(uint8_t perm) {
+    perm &= (uint8_t)(MHCSettings::PERM_COUNT - 1);
+    if (perm & MHCSettings::PERM_NOPRIM) perm &= (uint8_t)~MHCSettings::PERM_WB;
+    if (perm & MHCSettings::PERM_NOGRAY) perm &= (uint8_t)~(MHCSettings::PERM_DG | MHCSettings::PERM_GS);
+    return perm;
+}
+
 // Build MHC2ProfileParams for a specific permutation bitmask.
-// Starts from the full MHCSettings, then disables corrections not in the bitmask.
-static bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex,
-                                    uint8_t perm, MHC2ProfileParams& params) {
-    if (!BuildMHC2Params(mhc, isHDR, monitorIndex, params)) return false;
+// Starts from the full MHCSettings, then disables corrections not in the bitmask. A bypassed stage gets
+// exactly the identity profile's fields (BuildIdentityMHC2Params) while the luminance metadata stays what
+// the full profile carries, so a stage switch never changes the peak Windows reports to HDR apps.
+bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex,
+                            uint8_t perm, MHC2ProfileParams& params) {
+    perm = NormalizeMhcPerm(perm);
+    if (perm & MHCSettings::PERM_NOGRAY) {
+        // The grayscale stage's inputs are not needed (an unreadable imported file must not block it).
+        MHCSettings m = mhc;
+        m.sourceFilePath.clear();
+        m.sourceIs1DCube = false;
+        m.hasPerChannelTRC = false;
+        m.baseGrayscale.enabled = false;
+        m.correctionGrayscale.enabled = false;
+        m.desktopGammaEnabled = false;
+        if (!BuildMHC2Params(m, isHDR, monitorIndex, params)) return false;
+        params.peakNits = MhcProfileMetadataPeakNits(mhc, isHDR);
+        params.grayscaleEnabled = false;
+        params.grayscale.enabled = false;
+        params.grayscale.use24Gamma = false;
+        params.hasPerChannelTRC = false;
+        params.hasPrecomputedCorrection = false;
+        params.desktopGammaEnabled = false;
+        params.correctionGrayscaleEnabled = false;
+        params.correctionGrayscale.enabled = false;
+    } else if (!BuildMHC2Params(mhc, isHDR, monitorIndex, params)) {
+        return false;
+    }
+    if (perm & MHCSettings::PERM_NOPRIM) {
+        params.primariesEnabled = false;   // display := src => identity matrix
+        params.whiteBalanceGains[0] = params.whiteBalanceGains[1] = params.whiteBalanceGains[2] = 1.0f;
+    }
 
     // Disable white balance if PERM_WB bit is not set
     if (!(perm & MHCSettings::PERM_WB)) {
@@ -384,7 +419,10 @@ uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR) {
     if (mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty())
         perm |= MHCSettings::PERM_GS;
 
-    return perm;
+    // Stage bypasses (the interface's switches) override the stage's own bits.
+    if (mhc.bypassPrimaries) perm |= MHCSettings::PERM_NOPRIM;
+    if (mhc.bypassGrayscale) perm |= MHCSettings::PERM_NOGRAY;
+    return NormalizeMhcPerm(perm);
 }
 
 // Delete all cached permutation profiles from disk (except the active one if keepActive=true)
@@ -416,6 +454,7 @@ bool MhcPermDgBakedAt(const MHCSettings& m, int perm, float sdrWhiteNits) {
 
 bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
     if (!IsMHC2ApiAvailable()) return false;
+    perm = NormalizeMhcPerm(perm);
 
     // Check cache — fast path under lock. A DG variant baked under another SDR white level than the recorded
     // one (it raced a level change, or predates it) is regenerated rather than swapped in.
@@ -501,6 +540,8 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
 }
 
 bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
+    // Callers flip single bits on the active permutation; a bypassed stage keeps its bits clear.
+    newPerm = NormalizeMhcPerm(newPerm);
     // Ensure the target variant exists
     if (!EnsureMhcPermProfile(monitorIndex, isHDR, newPerm)) return false;
 
@@ -778,8 +819,11 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
                         : g_gui.monitorSettings[monitorIndex].sdrMHC;
     }
 
+    // Built for the variant the settings ask for, stage bypasses included: the profile filed under that
+    // permutation must be the one on screen.
+    const uint8_t installPerm = ComputeMhcPermutation(mhcCopy, isHDR);
     MHC2ProfileParams params;
-    if (!BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params)) return false;   // nothing installed
+    if (!BuildMHC2ParamsForPerm(mhcCopy, isHDR, monitorIndex, installPerm, params)) return false;   // nothing installed
 
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
@@ -844,8 +888,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     GetSystemDirectory(sysDir, MAX_PATH);
     std::wstring profilePath = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + profileName;
 
-    // Compute the active permutation from current settings
-    uint8_t perm = ComputeMhcPermutation(mhcCopy, isHDR);
+    const uint8_t perm = installPerm;
 
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
@@ -857,7 +900,8 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         mhc.enabled = true;
         mhc.profilePath = profilePath;
         mhc.profileName = profileName;
-        mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
+        // Describes the imported curve; a grayscale-bypassed bake carries none and must not erase it.
+        if (!(perm & MHCSettings::PERM_NOGRAY)) mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
         mhc.activePerm = perm;
         mhc.permNames[perm] = profileName;
         mhc.permPaths[perm] = profilePath;
@@ -936,7 +980,7 @@ static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSe
         mhc.enabled = true;
         mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
         mhc.profileName = newProfileName;
-        mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
+        if (!(perm & MHCSettings::PERM_NOGRAY)) mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
         mhc.activePerm = perm;
         mhc.permNames[perm] = newProfileName;
         mhc.permPaths[perm] = mhc.profilePath;
@@ -962,15 +1006,16 @@ MhcRegenResult RegenerateMhcIfActive(int monitorIndex, bool isHDR) {
     if (mhcCopy.profileName.empty()) return MhcRegenResult::NoProfile;
     if (!IsMHC2ApiAvailable()) return MhcRegenResult::Failed;
 
+    // Recompute the active permutation (corrections or stage bypasses may have changed) and bake that variant.
+    const uint8_t perm = ComputeMhcPermutation(mhcCopy, isHDR);
     MHC2ProfileParams params;
-    if (!BuildMHC2Params(mhcCopy, isHDR, monitorIndex, params)) {
+    if (!BuildMHC2ParamsForPerm(mhcCopy, isHDR, monitorIndex, perm, params)) {
         std::cerr << "[MHC] monitor " << monitorIndex << (isHDR ? " HDR" : " SDR")
                   << ": source file unreadable, keeping the installed profile" << std::endl;
         return MhcRegenResult::Failed;   // matrixRebakePending stays set: retried once the file is back
     }
 
-    // Recompute active permutation (corrections may have changed)
-    if (!ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, ComputeMhcPermutation(mhcCopy, isHDR)))
+    if (!ReplaceInstalledMhcProfile(monitorIndex, isHDR, mhcCopy, params, perm))
         return MhcRegenResult::Failed;
 
     // Whatever this was asked for, the installed profile now carries the current matrix maths.

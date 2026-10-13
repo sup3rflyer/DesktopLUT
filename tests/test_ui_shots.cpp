@@ -170,6 +170,9 @@ ui::Snapshot FakeSnapshot() {
     m.desktopGammaEnabled = true;
     m.dgSdrWhiteNits = 116;
     m.whiteBalanceEnabled = true;
+    m.whiteBalanceWx = 0.3135f;
+    m.whiteBalanceWy = 0.3301f;
+    m.primariesEnabled = true;
     m.correctionGrayscale.enabled = true;
     m.correctionGrayscale.pointCount = 20;
     m.correctionGrayscale.peakNits = 1612.4f;
@@ -233,8 +236,9 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     notify::Post(notify::Sev::Warning, 1, L"mhc", L"Profile restored", L"Windows dropped the association");
     notify::Post(notify::Sev::Info, 0, L"hook", L"Injected into dwm.exe");
 
-    const ui::Snapshot snap = FakeSnapshot();
-    struct Shot { const char* name; ui::Page page; ui::StageId stage; int display; bool confirm; float mx, my; float w = 1180, h = 760; };
+    const ui::Snapshot base = FakeSnapshot();
+    // variant: 0 as made, 1 the 3D LUT and primaries stages of the HDR display switched off, 2 suspended
+    struct Shot { const char* name; ui::Page page; ui::StageId stage; int display; bool confirm; float mx, my; float w = 1180, h = 760; int variant = 0; };
     const Shot shots[] = {
         { "tonemap", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1 },
         { "grayscale", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1 },
@@ -244,6 +248,9 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "confirm", ui::Page::Pipeline, ui::StageId::Primaries, 0, true, -1, -1 },
         { "narrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520 },
         { "narrowsettings", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520 },
+        { "bypass", ui::Page::Pipeline, ui::StageId::Lut3D, 0, false, -1, -1, 1180, 760, 1 },
+        { "bypassprim", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 1 },
+        { "suspended", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 2 },
     };
     const float scales[] = { 1.0f, 1.5f };
     int written = 0;
@@ -251,6 +258,13 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         ui::ApplyTheme((ui::ThemeId)t);
         for (float scale : scales) {
             for (const Shot& shot : shots) {
+                ui::Snapshot snap = base;
+                if (shot.variant == 1) {
+                    snap.live[0].settings.hdrLutBypass = true;
+                    snap.live[0].settings.hdrMHC.bypassPrimaries = true;
+                } else if (shot.variant == 2) {
+                    snap.suspended = true;
+                }
                 const UINT w = (UINT)(shot.w * scale), h = (UINT)(shot.h * scale);
                 gpu.Resize(w, h);
                 // A fresh context per shot: popups and widget state never carry over.

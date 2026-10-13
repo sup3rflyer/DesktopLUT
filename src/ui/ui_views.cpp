@@ -150,6 +150,16 @@ void Ask(ViewState& vs, std::string title, std::string detail, std::string actio
     vs.confirmOpenRequested = true;
 }
 
+// What the live layers are doing (the lights never claim more).
+PathRuntime RuntimeOf(const Snapshot& snap) {
+    PathRuntime rt;
+    rt.suspended = snap.suspended;
+    rt.running = snap.running;
+    rt.hookMode = snap.hookMode;
+    rt.hookActive = snap.hookActive;
+    return rt;
+}
+
 // Text with its cap height centred on centerY, without taking layout space.
 void TextAt(Font f, float sizeDip, ImU32 col, float x, float centerY, const char* text) {
     DrawText(ImGui::GetWindowDrawList(), f, sizeDip, x, centerY, col, text);
@@ -376,7 +386,7 @@ void CommitRename(ViewState& vs, const DisplayRow& r) {
     Post([slot, live, label]() { act::SetDisplayLabel(slot, live, label); });
 }
 
-void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
+void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRuntime& rt) {
     const float w = ImGui::GetContentRegionAvail().x;
     const bool live = r.liveIndex >= 0;
     const float h = Snap(Px(live ? 60.0f : 44.0f));
@@ -444,10 +454,13 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
     }
 
     if (live) {
-        // Layer lights for the live mode's side: calibration (MHC), 3D LUT; centred on the resolution's digits.
-        const bool hdr = PipelineIsHdr(r.mode);
-        const Light cal = MhcLight(hdr ? r.settings.hdrMHC : r.settings.sdrMHC);
-        const Light lut = (hdr ? r.settings.hdrPath : r.settings.sdrPath).empty() ? Light::Off : Light::Configured;
+        // Layer lights for the live mode's side, by the pixel path's rules: calibration (both MHC stages), 3D LUT;
+        // centred on the resolution's digits. Nothing set = no light (the place stays).
+        Light cal = Light::None, lut = Light::None;
+        for (const Stage& s : BuildPixelPath(r.settings, r.mode, r.mode, rt)) {
+            if (s.id == StageId::Primaries || s.id == StageId::Grayscale) cal = CombineLights(cal, s.light);
+            else if (s.id == StageId::Lut3D) lut = s.light;
+        }
         const float cy = p.y + Px(42);
         const float d = Snap(Px(7));
         float x = Snap(p.x + pad);
@@ -473,8 +486,9 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
 
 void DrawSidebar(const Snapshot& snap, ViewState& vs, const DisplayRow* sel) {
     if (Shape().cardSidebar) ImGui::Dummy(ImVec2(0, Px(7)));
-    for (const DisplayRow& r : snap.live) SidebarRow(r, sel == &r, vs);
-    for (const DisplayRow& r : snap.parked) SidebarRow(r, sel == &r, vs);
+    const PathRuntime rt = RuntimeOf(snap);
+    for (const DisplayRow& r : snap.live) SidebarRow(r, sel == &r, vs, rt);
+    for (const DisplayRow& r : snap.parked) SidebarRow(r, sel == &r, vs, rt);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -514,7 +528,7 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
             widestLabel = lw > widestLabel ? lw : widestLabel;
         }
     }
-    const float minGap = Px(12);
+    const float minGap = Px(strip ? 26.0f : 12.0f);   // Gray: room for the chevron between elements
     float stageW = stages ? (avail - markers - minGap * (float)(path.size() - 1)) / (float)stages : 0.0f;
     const float withLight = widestLabel + Px(7 + 7 + 22), bare = widestLabel + Px(18);
     const bool lights = stageW >= withLight;
@@ -553,7 +567,7 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
             char id[32];
             snprintf(id, sizeof(id), "##stage%d", (int)s.id);
             const bool selected = vs.stage == s.id;
-            const bool off = s.light == Light::Off || s.dimmed;
+            const bool off = s.dimmed;   // not changing the picture (nothing set, switched off, suspended)
             if (Node(id, StageLabel(s.id), s.light, selected, off, ImVec2(w / Dpi(), 34), lights)) vs.stage = s.id;
         }
         // Gray: a chevron in the gap after each element (not into or out of the scan-out cut).
@@ -621,13 +635,7 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     const TonemapSettings& tm = r.settings.hdrColorCorrection.tonemap;
     auto post = [&r](TonemapSettings t) { PostTo(r, [t](int mon) { act::SetTonemap(mon, t); }); };
 
-    RowCtx row = BeginRow("STATE");
-    RowPlace(row);
-    bool on = false;
-    if (OnOff("##tm_on", tm.enabled, &on)) { TonemapSettings t = tm; t.enabled = on; post(t); }
-    EndRow(row);
-
-    row = BeginRow("CURVE");
+    RowCtx row = BeginRow("CURVE");
     RowPlace(row);
     static const char* kCurves[] = { "BT.2390", "BT.2446A", "REINHARD", "SOFT CLIP", "HARD CLIP" };
     const int pick = Segmented("##tm_curve", kCurves, 5, TonemapCurveToDropdownIndex(tm.curve), 88);
@@ -679,17 +687,7 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
 void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
 
-    RowCtx row = BeginRow("STATE");
-    if (st.light == Light::NotApplicable) {
-        RowText(row, "n/a in SDR", pal::InkFaint);
-    } else {
-        RowPlace(row);
-        bool on = false;
-        if (OnOff("##fald_on", f.enabled, &on)) PostTo(r, [hdr, on](int mon) { act::SetFaldEnabled(mon, hdr, on); });
-    }
-    EndRow(row);
-
-    row = BeginRow("PANEL FILE");
+    RowCtx row = BeginRow("PANEL FILE");
     const int b = RowButtons(row, "fald", { "BROWSE\xE2\x80\xA6", "RELOAD" });
     if (b == 0)
         PostPickThen(r,
@@ -920,7 +918,8 @@ std::string DateAge(const std::string& date, int days) {
     return s;
 }
 
-const char* LayerText(dlc::LayerState s) {
+const char* LayerText(dlc::LayerState s, bool bypassed = false) {
+    if (bypassed) return "BYPASSED";
     switch (s) {
     case dlc::LayerState::Matches: return "AS APPLIED";
     case dlc::LayerState::Differs: return "CHANGED";
@@ -974,7 +973,7 @@ Light MeasuredLight(const DisplayRow& r, bool showHdr) {
     const dlc::ModeRecord& rec = r.dlcRecord[showHdr ? 1 : 0];
     if (rec.current >= 0) return rec.reminderDue ? Light::Fault : Light::Configured;
     if (rec.latest >= 0) return Light::Fault;
-    return Light::Off;
+    return Light::None;
 }
 
 void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs) {
@@ -1008,8 +1007,15 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
             why = "Last verified " + std::to_string(rec.verifiedDaysAgo) + " days ago." + (why.empty() ? "" : "\n" + why);
         MeasuredRow("DUE", "RECALIBRATE", pal::Alarm, Font::Label, why.c_str());
     }
-    MeasuredRow("MHC", LayerText(rec.mhc), LayerColour(rec.mhc), Font::Label);
-    MeasuredRow("3D LUT", LayerText(rec.cube), LayerColour(rec.cube), Font::Label);
+    // A bypassed stage is what runs (nothing): the record no longer describes the screen.
+    const MHCSettings& mhcShown = showHdr ? r.settings.hdrMHC : r.settings.sdrMHC;
+    const bool mhcBypassed = mhcShown.enabled && (mhcShown.bypassPrimaries || mhcShown.bypassGrayscale);
+    const bool cubeBypassed = (showHdr ? r.settings.hdrLutBypass : r.settings.sdrLutBypass) &&
+                              !(showHdr ? r.settings.hdrPath : r.settings.sdrPath).empty();
+    MeasuredRow("MHC", LayerText(rec.mhc, mhcBypassed), mhcBypassed ? pal::InkFaint : LayerColour(rec.mhc), Font::Label,
+                mhcBypassed ? "A stage of the MHC profile is switched off." : nullptr);
+    MeasuredRow("3D LUT", LayerText(rec.cube, cubeBypassed), cubeBypassed ? pal::InkFaint : LayerColour(rec.cube), Font::Label,
+                cubeBypassed ? "The 3D LUT stage is switched off." : nullptr);
 
     if (shown < 0) {
         MeasuredRow("VERIFIED", "NO REPORT", pal::InkFaint, Font::Label);
@@ -1040,6 +1046,77 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     if (!rec.correctionMade.empty())
         MeasuredRow("METER", DateAge(rec.correctionMade, rec.correctionDaysAgo), rec.correctionStale ? pal::Alarm : pal::InkDim,
                     Font::Mono, rec.correctionStale ? "Meter correction older than the profile's max_age_days." : nullptr);
+}
+
+// The stage switch in the inspector's header: whether the stage runs. False = the stage has none (the
+// shader tweak). Switching off keeps the stage's settings; the 3D LUT and MHC switches wait while DLC
+// calibrates (as Suspend does).
+bool StageSwitchState(const Snapshot& snap, const DisplayRow& r, const Stage& st, bool hdr, PanelSwitch& sw) {
+    const bool parked = r.liveIndex < 0;
+    const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
+    const bool mhcInstalled = mhc.enabled && !mhc.profileName.empty();
+    switch (st.id) {
+    case StageId::ToneMap:
+        sw.on = r.settings.hdrColorCorrection.tonemap.enabled;
+        sw.enabled = !parked;
+        sw.tip = "Tone mapping on or off.";
+        return true;
+    case StageId::Lut3D: {
+        const bool cube = !(hdr ? r.settings.hdrPath : r.settings.sdrPath).empty();
+        sw.on = cube && !(hdr ? r.settings.hdrLutBypass : r.settings.sdrLutBypass);
+        sw.enabled = cube && !parked && !snap.calibrating;
+        sw.tip = !cube ? "No cube loaded." : snap.calibrating ? "Calibration in progress."
+                                           : "Off keeps the cube loaded and applies nothing.";
+        return true;
+    }
+    case StageId::Fald: {
+        const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
+        sw.on = f.enabled;
+        sw.enabled = !parked;
+        sw.tip = st.light == Light::Fault && r.mode == Mode::SDR ? "FALD cannot run in legacy SDR (ACM or HDR only)."
+                                                                 : "FALD correction on or off.";
+        return true;
+    }
+    case StageId::Primaries:
+    case StageId::Grayscale: {
+        const bool primaries = st.id == StageId::Primaries;
+        const bool content = primaries ? MhcPrimariesContent(mhc) : MhcGrayscaleContent(mhc, hdr);
+        sw.on = mhcInstalled && content && !(primaries ? mhc.bypassPrimaries : mhc.bypassGrayscale);
+        sw.enabled = mhcInstalled && content && !parked && !snap.calibrating;
+        sw.tip = !mhcInstalled ? "No MHC profile installed." : !content ? "Nothing set in this stage."
+                 : snap.calibrating ? "Calibration in progress."
+                 : primaries ? "Off swaps in the profile without primaries and white balance. Settings stay."
+                             : "Off swaps in the profile without its grayscale and gamma. Settings stay.";
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void ApplyStageSwitch(const DisplayRow& r, const Stage& st, bool hdr, bool on) {
+    switch (st.id) {
+    case StageId::ToneMap: {
+        TonemapSettings t = r.settings.hdrColorCorrection.tonemap;
+        t.enabled = on;
+        PostTo(r, [t](int mon) { act::SetTonemap(mon, t); });
+        break;
+    }
+    case StageId::Lut3D:
+        PostTo(r, [hdr, on](int mon) { act::SetLutBypass(mon, hdr, !on); });
+        break;
+    case StageId::Fald:
+        PostTo(r, [hdr, on](int mon) { act::SetFaldEnabled(mon, hdr, on); });
+        break;
+    case StageId::Primaries:
+        PostTo(r, [hdr, on](int mon) { act::MhcSetStageBypass(mon, hdr, act::MhcStage::Primaries, !on); });
+        break;
+    case StageId::Grayscale:
+        PostTo(r, [hdr, on](int mon) { act::MhcSetStageBypass(mon, hdr, act::MhcStage::Grayscale, !on); });
+        break;
+    default:
+        break;
+    }
 }
 
 void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
@@ -1112,7 +1189,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         ImGui::Dummy(ImVec2(0, Px(16)));
     }
 
-    const std::vector<Stage> path = BuildPixelPath(sel->settings, shown, sel->mode);
+    const std::vector<Stage> path = BuildPixelPath(sel->settings, shown, sel->mode, RuntimeOf(snap));
     const Stage* st = nullptr;
     for (const Stage& s : path) if (s.id == vs.stage) st = &s;
     if (!st) {
@@ -1128,8 +1205,10 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     const float measuredW = Snap(Px(kMeasuredW)), gutter = Snap(Px(kGutter));
     const bool stacked = total - measuredW - gutter < Px(kInspectorMinW);
     const float inspW = stacked ? total : total - measuredW - gutter;
+    PanelSwitch sw;
+    const bool hasSwitch = st && StageSwitchState(snap, *sel, *st, showHdr, sw);
     BeginPanel("##inspector", st ? InspectorTitle(st->id) : "SELECT A STAGE", st ? &st->light : nullptr,
-               ImVec2(inspW, stacked ? 0.0f : colH));
+               ImVec2(inspW, stacked ? 0.0f : colH), hasSwitch ? &sw : nullptr);
     if (st) {
         ImGui::BeginDisabled(sel->liveIndex < 0);   // a remembered display that is not connected: view only
         // Widget ids per display and mode: a field being typed in stays with its display and mode (it ends
@@ -1142,6 +1221,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         ImGui::EndDisabled();
     }
     EndPanel();
+    if (hasSwitch && sw.clicked) ApplyStageSwitch(*sel, *st, showHdr, !sw.on);
     if (stacked) ImGui::Dummy(ImVec2(0, Px(kPanelGap)));
     else ImGui::SetCursorScreenPos(ImVec2(top.x + inspW + gutter, top.y));
     const Light measured = MeasuredLight(*sel, showHdr);

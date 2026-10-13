@@ -75,11 +75,20 @@ struct DwmHookSharedConfig {
     // reserved words read 0) leaves the dither on. 1 = off (INI [General] HdrDither=0 / the GUI checkbox).
     uint32_t hdrDitherOff;
 
-    uint32_t _reserved[4];           // Future expansion
+    // 3D LUT stage bypass (the interface's stage switch): bit i = monitors[i]'s cube is skipped for the mode
+    // it is in RIGHT NOW (the host picks the SDR or HDR flag by monitors[i].isHdr, as for faldFlags). The
+    // cube stays staged and loaded, so switching back is instant. Taken from _reserved for the same reason
+    // as faldFlags: 0 = applied, so a host that predates the field leaves every cube on.
+    uint32_t lutOffMask;
+
+    uint32_t _reserved[3];           // Future expansion
 };
 static_assert(sizeof(DwmHookSharedConfig) == 464, "DwmHookSharedConfig must be 464 bytes");
 static_assert(offsetof(DwmHookSharedConfig, hdrDitherOff) == 464 - 5 * sizeof(uint32_t),
               "hdrDitherOff must sit where _reserved[0] was");
+static_assert(offsetof(DwmHookSharedConfig, lutOffMask) == 464 - 4 * sizeof(uint32_t),
+              "lutOffMask must sit where _reserved[1] was");
+static_assert(MAX_DWM_HOOK_MONITORS <= 32, "lutOffMask holds one bit per monitor");
 #pragma pack(pop)
 
 // ---------------------------------------------------------------------------

@@ -677,6 +677,7 @@ static void UpdateLocalTonemapFromShared() {
 			tp.sourcePeakNits = mc.sourcePeakNits;
 			tp.targetPeakNits = mc.targetPeakNits;
 			tp.dynamicPeak = (mc.dynamicPeak != 0);
+			tp.lutOff = ((local.lutOffMask >> i) & 1u) != 0;
 			tp.pqSourcePeak = LinearToPQ(mc.sourcePeakNits / 10000.0f);
 			tp.pqTargetPeak = LinearToPQ(mc.targetPeakNits / 10000.0f);
 			if (tp.dynamicPeak != prevDynamic) {

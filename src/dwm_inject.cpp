@@ -1286,6 +1286,9 @@ void UpdateDwmHookSharedConfig()
                         mc.targetPeakNits = tm.targetPeakNits;
                         mc.dynamicPeak = tm.dynamicPeak ? 1 : 0;
                         mc.beaconColorId = beacon ? DwmHookBeaconColorIdForMonitor(static_cast<uint32_t>(mi)) : 0;
+                        // 3D LUT bypass of the mode the monitor is in now (the cube itself stays staged).
+                        if (mc.isHdr ? g_gui.monitorSettings[mi].hdrLutBypass : g_gui.monitorSettings[mi].sdrLutBypass)
+                            cfg.lutOffMask |= 1u << i;
                         // FALD: the settings of the mode the monitor is in RIGHT NOW — the hook holds
                         // one correction per monitor and picked its panel file by that mode at attach.
                         // A configured-but-pathless layer is off (the DLL has no file to read either).

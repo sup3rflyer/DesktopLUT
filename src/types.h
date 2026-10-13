@@ -905,23 +905,38 @@ struct MHCSettings {
     // 80 = the original fixed bake (and the value assumed for profiles saved before this was tracked).
     float dgSdrWhiteNits = 80.0f;
 
+    // Stage bypasses (the interface's per-stage switches). The stage's own settings stay as they are; the
+    // installed variant leaves the stage out (permutation bits PERM_NOPRIM / PERM_NOGRAY), so switching back
+    // restores exactly what was there. Both on = an identity profile that keeps the luminance metadata.
+    // The MHC flags the shader reads (UpdateMhcFlagsLive) ignore them on purpose: a bypassed stage must not
+    // hand its work to the shader (desktop gamma, the corrections layer) — bypassed means nobody does it.
+    bool bypassPrimaries = false;      // primaries + white balance (the matrix) -> identity
+    bool bypassGrayscale = false;      // base curve / imported TRC / correction GS / desktop gamma -> identity 1D LUT
+
     // Permutation profile cache — indexed by correction bitmask
     // Each bit controls whether that correction is baked into the ICC profile.
     // Profiles are generated on-demand and cached for instant runtime swapping.
     // Bit 0 (0x1): White Balance    (matrix)
     // Bit 1 (0x2): Desktop Gamma    (1D LUT, HDR only)
     // Bit 2 (0x4): Correction GS    (1D LUT)
+    // Bit 3 (0x8): Primaries stage bypassed  (identity matrix; WB never set with it)
+    // Bit 4 (0x10): Grayscale stage bypassed (identity 1D LUT; DG / GS never set with it)
     static constexpr uint8_t PERM_WB = 0x1;
     static constexpr uint8_t PERM_DG = 0x2;
     static constexpr uint8_t PERM_GS = 0x4;
-    static constexpr int PERM_COUNT = 8;
+    static constexpr uint8_t PERM_NOPRIM = 0x8;
+    static constexpr uint8_t PERM_NOGRAY = 0x10;
+    static constexpr int PERM_COUNT = 32;
 
     std::wstring permNames[PERM_COUNT];  // Cached profile filenames (indexed by bitmask)
     std::wstring permPaths[PERM_COUNT];  // Cached profile full paths
     // SDR white level (nits) each cached profile's desktop gamma was baked with; 0 = that bake carries no DG
     // (W-independent). A DG permutation whose stamp differs from dgSdrWhiteNits is stale (MhcPermDgBakedAt):
     // regenerated on demand, and re-baked when it is the active one. Persisted (HDR) with the cache.
-    float permDgWhiteNits[PERM_COUNT] = { 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f };
+    float permDgWhiteNits[PERM_COUNT] = {
+        80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
+        80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
+    };
     uint8_t activePerm = 0;              // Currently active permutation bitmask
     // Runtime: the active profile was baked by a build whose white-balance matrix maths is older than
     // this one (INI MHCMatrixRev < kMhcMatrixRev) — re-baked once at startup (RebakePendingMhcProfiles).
@@ -950,6 +965,10 @@ struct DisplayIdentity {
 struct MonitorSettings {
     std::wstring sdrPath;
     std::wstring hdrPath;
+    // 3D LUT stage bypass per mode (the interface's stage switch): the cube stays loaded and staged, nothing
+    // applies it. INI LUT_SDR_Bypass / LUT_HDR_Bypass. Read the cube that RUNS through LiveLutPath.
+    bool sdrLutBypass = false;
+    bool hdrLutBypass = false;
     ColorCorrectionSettings sdrColorCorrection;  // Color correction for SDR mode
     ColorCorrectionSettings hdrColorCorrection;  // Color correction for HDR mode
     MaxTmlSettings maxTml;                       // Display Peak Override settings
@@ -967,6 +986,13 @@ struct MonitorSettings {
     std::wstring lastSeen;  // ISO date it was last attached / saved while connected; informational
     std::wstring label;     // the user's name for the display (INI Label); empty = automatic. Never used for matching
 };
+
+// The cube that runs in a mode: the configured one, unless its stage is bypassed (empty then).
+inline const std::wstring& LiveLutPath(const MonitorSettings& ms, bool hdr) {
+    static const std::wstring kNone;
+    if (hdr) return ms.hdrLutBypass ? kNone : ms.hdrPath;
+    return ms.sdrLutBypass ? kNone : ms.sdrPath;
+}
 
 // [Display<slot>] slots are allocated below this cap (lowest free slot first).
 constexpr int kMaxDisplaySlots = 256;

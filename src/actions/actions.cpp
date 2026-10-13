@@ -10,6 +10,7 @@
 #include "displayconfig.h"
 #include "fald.h"
 #include "mhc.h"
+#include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
 #include <cstdio>
 #include <iostream>
 #include <mutex>
@@ -74,6 +75,14 @@ void Finish(int mon) {
     GuiNotifySettingsChanged(mon);
 }
 
+// A stage switch waits while DLC calibrates or a live grayscale edit runs: the session measures exactly
+// what it set up.
+bool RefusedDuringCalibration(int mon) {
+    if (!IsCalibrationOrLiveEditActive()) return false;
+    notify::Post(notify::Sev::Warning, mon, L"stage", L"Calibration in progress: stage switches stay as they are");
+    return true;
+}
+
 }  // namespace
 
 bool ValidMonitor(int mon) { return mon >= 0 && mon < (int)g_gui.monitorSettings.size(); }
@@ -87,11 +96,33 @@ Result SetLutPath(int mon, bool hdr, const std::wstring& path) {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
         (hdr ? ms.hdrPath : ms.sdrPath) = path;
+        if (!path.empty()) (hdr ? ms.hdrLutBypass : ms.sdrLutBypass) = false;   // a cube just picked is meant to be seen
     }
     SaveSettings();
     // The hook reads cube files only when it is injected; re-setting the same path is a reload.
     if (g_gui.isRunning) RestartLiveLayers();
     else ReconcileLiveLayers("3D LUT");
+    Finish(mon);
+    return Done();
+}
+
+Result SetLutBypass(int mon, bool hdr, bool bypass) {
+    if (!ValidMonitor(mon) || RefusedDuringCalibration(mon)) return Done(false);
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        MonitorSettings& ms = g_gui.monitorSettings[mon];
+        bool& flag = hdr ? ms.hdrLutBypass : ms.sdrLutBypass;
+        if (flag == bypass) return Done(false);
+        flag = bypass;
+    }
+    SaveSettings();
+    // The hook keeps the cube staged and skips it (shared config: instant, no re-inject); the overlay reads
+    // the cubes it applies when it starts.
+    if (g_gui.isRunning) {
+        if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
+        else RestartLiveLayers();
+    }
+    ReconcileLiveLayers("3D LUT bypass");   // the cube may have been the only live-layer need
     Finish(mon);
     return Done();
 }
@@ -504,6 +535,38 @@ Result MhcSetDesktopGamma(int mon, bool on) {
     }
     SaveSettings();
     ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (MonitorNeedsProcessing)
+    Finish(mon);
+    return Done();
+}
+
+Result MhcSetStageBypass(int mon, bool hdr, MhcStage stage, bool bypass) {
+    if (!ValidMonitor(mon) || RefusedDuringCalibration(mon)) return Done(false);
+    const bool primaries = stage == MhcStage::Primaries;
+    uint8_t perm = 0;
+    bool installed = false;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        MHCSettings& m = MhcOf(g_gui.monitorSettings[mon], hdr);
+        bool& flag = primaries ? m.bypassPrimaries : m.bypassGrayscale;
+        if (flag == bypass) return Done(false);
+        flag = bypass;
+        installed = m.enabled && !m.profileName.empty();
+        perm = ComputeMhcPermutation(m, hdr);
+    }
+    // The variant without the stage (built on first use, cached after) replaces the installed one. If it
+    // cannot be built the switch goes back: the setting must never disagree with what is on screen.
+    if (installed && !SwapMhcToPermutation(mon, hdr, perm)) {
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            if (ValidMonitor(mon)) {
+                MHCSettings& m = MhcOf(g_gui.monitorSettings[mon], hdr);
+                (primaries ? m.bypassPrimaries : m.bypassGrayscale) = !bypass;
+            }
+        }
+        Finish(mon);
+        return Told(mon, L"mhc", Fail(notify::Sev::Warning, L"Stage switch failed: the profile variant could not be built"));
+    }
+    SaveSettings();
     Finish(mon);
     return Done();
 }

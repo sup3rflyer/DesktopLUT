@@ -119,11 +119,13 @@ void TakeSnapshot(Snapshot& out) {
         live.hardwareId = dlc::HardwareIdOf(ms.identity.edidId, ms.identity.devicePath);
         live.monitor = r.liveIndex;
         live.sameModelCount = twins(r);
+        // What RUNS: a bypassed stage is not DLC's record any more (its verification no longer describes it).
         const MHCSettings* mhc[2] = { &ms.sdrMHC, &ms.hdrMHC };
         for (int k = 0; k < 2; k++)
-            if (mhc[k]->enabled && !mhc[k]->profileName.empty()) live.mhcSource[k] = mhc[k]->sourceFilePath;
-        live.lut[0] = ms.sdrPath;
-        live.lut[1] = ms.hdrPath;
+            if (mhc[k]->enabled && !mhc[k]->profileName.empty() && !mhc[k]->bypassPrimaries && !mhc[k]->bypassGrayscale)
+                live.mhcSource[k] = mhc[k]->sourceFilePath;
+        live.lut[0] = LiveLutPath(ms, false);
+        live.lut[1] = LiveLutPath(ms, true);
         r.dlcMatch = out.dlc->folder.empty() ? dlc::DisplayMatch() : dlc::MatchDisplay(*out.dlc, live);
         r.reminderDue = false;
         for (int k = 0; k < 2; k++) {

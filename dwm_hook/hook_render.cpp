@@ -1108,6 +1108,9 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	}
 	LocalTonemapParams* tp = FindTonemapForMonitor(monLeft, monTop);
 	bool tmEnabled = (colorMode == 1 && tp && tp->enabled);
+	// The 3D LUT stage is bypassed for this monitor: present as a monitor without a cube (tonemap and FALD
+	// still run). The host requests a full recompose with the change, so no corrected pixels linger.
+	if (lut && tp && tp->lutOff) lut = NULL;
 
 	// FALD correction (hook_fald.h). FP16 back buffers only: index 1 is colorMode 1 (HDR) and 2 (ACM
 	// SDR), the two modes that carry the scRGB domain the layer is defined in; colorMode 0 never
