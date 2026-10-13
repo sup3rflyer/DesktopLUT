@@ -1,32 +1,87 @@
 #pragma once
-// "Instrument" theme for the ImGui interface.
+// Themes for the ImGui interface: Dark ("Instrument"), Gray (the Rev1 mock-up) and Light (Windows 98
+// colours: a grey face, bevelled controls, navy selection).
 //
-// The chrome is achromatic: neutral greys, hairline rules, square-ish frames. Colour is reserved
-// for data (channel curves, swatches, gamut), for health states (green healthy / amber fault, always
-// with a shape and a label) and for the full-colour cube logo, which doubles as a quick wide-gamut
-// tell. Keep new UI inside this palette; a hue in the chrome would bias the eye judging the screen.
+// Every theme keeps one grammar, so a control's kind reads the same in all three:
+//   tab      page navigation: text in the header, the current one underlined (Light: a property-sheet tab)
+//   node     a stage of the pixel path, on the signal line, with its status light; the selected one is
+//            the strongest mark on the page
+//   panel    a surface with a title; what a node or a page section opens
+//   segment  one value of several, in a recessed track (Light: pressed in)
+//   button   an action: a filled face (Light: raised)
+//   switch   a global state (live layers)
+//   field    a value typed in: sunken
+// The chrome stays achromatic in Dark and Gray: colour is for data, health (green healthy / amber
+// fault, always with a shape and a label) and the logo. Gray adds one quiet blue for selection;
+// Light uses Windows 98 navy for selection.
 
 #include "imgui.h"
 
 namespace ui {
 
-// Palette tokens (sRGB, as ImGui consumes them).
+enum class ThemeId { Dark = 0, Gray = 1, Light = 2, Count };
+
+// Palette tokens (sRGB, as ImGui consumes them), set by ApplyTheme. GUI thread.
 namespace pal {
-    constexpr ImU32 Ground      = IM_COL32(0x0b, 0x0b, 0x0c, 0xff);  // window background
-    constexpr ImU32 Raised      = IM_COL32(0x14, 0x14, 0x15, 0xff);  // input / plot background
-    constexpr ImU32 Hover       = IM_COL32(0x1c, 0x1c, 0x1e, 0xff);
-    constexpr ImU32 Rule        = IM_COL32(0x26, 0x26, 0x26, 0xff);  // hairlines between regions
-    constexpr ImU32 RuleStrong  = IM_COL32(0x4a, 0x4a, 0x4a, 0xff);  // signal line, axes
-    constexpr ImU32 Ink         = IM_COL32(0xe6, 0xe6, 0xe6, 0xff);  // primary text; inverted selection fill
-    constexpr ImU32 InkDim      = IM_COL32(0x9b, 0x9b, 0x9b, 0xff);  // secondary text, neutral data marks
-    constexpr ImU32 InkFaint    = IM_COL32(0x80, 0x80, 0x80, 0xff);  // tertiary text (>= 4.5:1 on Ground)
-    constexpr ImU32 Alarm       = IM_COL32(0xe3, 0xa5, 0x4a, 0xff);  // fault (always a triangle + label)
-    constexpr ImU32 Good        = IM_COL32(0x2f, 0xa3, 0x6b, 0xff);  // healthy (a filled dot + label); CVD-checked vs Alarm
-    // Channel identity in data plots (validated for CVD separation on Ground with direct labels).
-    constexpr ImU32 ChanR       = IM_COL32(0xd4, 0x50, 0x4c, 0xff);
-    constexpr ImU32 ChanG       = IM_COL32(0x86, 0xcc, 0x8a, 0xff);
-    constexpr ImU32 ChanB       = IM_COL32(0x5f, 0x93, 0xea, 0xff);
+    inline ImU32 Ground;        // window background
+    inline ImU32 Raised;        // popups, plot backgrounds
+    inline ImU32 Hover;         // hover fill on the ground
+    inline ImU32 Rule;          // hairlines between regions
+    inline ImU32 RuleStrong;    // signal line, axes
+    inline ImU32 Ink;           // primary text
+    inline ImU32 InkDim;        // secondary text, labels, neutral data marks
+    inline ImU32 InkFaint;      // tertiary text (>= 4.5:1 on Ground and Panel)
+    inline ImU32 Alarm;         // fault (always a triangle + label)
+    inline ImU32 Good;          // healthy (a filled dot + label); CVD-checked vs Alarm
+    inline ImU32 ChanR, ChanG, ChanB;   // channel identity in data plots
+    // Panels
+    inline ImU32 Panel;         // panel surface
+    inline ImU32 PanelEdge;     // panel border, the rule under a panel title
+    // Buttons (actions)
+    inline ImU32 Control, ControlHover, ControlEdge;
+    // Segments (values): the recessed track and the selected segment
+    inline ImU32 Track, TrackEdge;
+    inline ImU32 Sel, SelInk, SelEdge;
+    // The strongest selection: the selected pixel-path node, a primary button
+    inline ImU32 Strong, StrongInk, StrongEdge;
+    // List selection (the sidebar, log rows) and the accent of tabs and the sidebar bar
+    inline ImU32 ListSel, ListSelInk;
+    inline ImU32 Accent;
+    // Fields
+    inline ImU32 Field, FieldEdge;
+    // Menus and drop-down lists; tooltips
+    inline ImU32 Menu;
+    inline ImU32 Tip, TipEdge;
+    // Bevel shades (Light): highlight, light, shadow, dark
+    inline ImU32 BevelHi, BevelLight, BevelShadow, BevelDark;
+    // A layer's "on" light; the live-layers switch when on, and its knob
+    inline ImU32 LightOn, SwitchOn, SwitchKnob;
 }
+
+// Shape rules of the current theme.
+struct ThemeShape {
+    float controlRounding;   // DIPs: buttons, segments, fields, nodes
+    float panelRounding;     // DIPs: panels
+    bool bevel;              // Windows 98 bevels instead of flat outlines
+    bool groupBoxPanels;     // panels as etched group boxes, titled in the frame (Light)
+    bool sheetTabs;          // page tabs as property-sheet tabs (Light)
+    bool checkboxSwitch;     // the live-layers switch as a check box (Light)
+    bool sunkenSidebar;      // the display list in a sunken white list box (Light)
+    bool cardSidebar;        // the display list as rounded cards (Gray)
+    bool pathStrip;          // the pixel path in a rounded strip, chevrons between stages (Gray)
+};
+
+ThemeId CurrentTheme();
+const ThemeShape& Shape();
+const char* ThemeKey(ThemeId t);          // "dark" / "gray" / "light" (the INI value)
+ThemeId ThemeFromIndex(int i);            // out of range -> Dark
+
+// Sets the palette and shape. Call before ApplyStyle (which copies the palette into ImGui's colours).
+void ApplyTheme(ThemeId t);
+
+// Caption colours for the window frame (DWM): background, text, and whether the frame is dark.
+struct CaptionColours { unsigned long caption, text; bool dark; };
+CaptionColours Caption();
 
 enum class Font {
     Body,       // Segoe UI
@@ -48,7 +103,7 @@ constexpr float kSizeReadout = 52.0f;  // the big ΔE number
 void LoadFonts();
 ImFont* GetFont(Font f);
 
-// Applies colours and metrics. dpiScale = window DPI / 96.
+// Applies the current theme's colours and metrics. dpiScale = window DPI / 96.
 void ApplyStyle(float dpiScale);
 
 // Re-applies DPI-dependent metrics after WM_DPICHANGED (fonts rescale dynamically in 1.92).

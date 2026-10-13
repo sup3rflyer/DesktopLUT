@@ -26,17 +26,19 @@ namespace ui {
 
 namespace {
 
-// One gutter everywhere: header, sidebar, main column, footer. Heights in DIPs.
+// One gutter everywhere: header, sidebar, main column, footer. Heights in DIPs. Rows share one pitch
+// in every panel, so rows of neighbouring panels line up.
 constexpr float kGutter = 24.0f;
 constexpr float kHeaderH = 56.0f;
-constexpr float kFooterH = 32.0f;
+constexpr float kFooterH = 30.0f;
 constexpr float kSidebarW = 228.0f;
 constexpr float kMeasuredW = 300.0f;
 constexpr float kRowLabelW = 150.0f;
 constexpr float kRowH = 30.0f;
-constexpr float kSectionH = 24.0f;
 constexpr float kButtonW = 92.0f;
-constexpr float kControlH = 24.0f;
+constexpr float kPanelGap = 16.0f;   // between stacked panels
+constexpr float kInspectorMinW = 560.0f;   // narrower: the measured panel goes under the inspector
+constexpr float kSettingsTwoColW = 1000.0f; // narrower: the settings panels in one column
 
 // The physical display (device path, else EDID id): follows it between live and remembered.
 std::wstring KeyOf(const DisplayRow& r) {
@@ -148,21 +150,21 @@ void Ask(ViewState& vs, std::string title, std::string detail, std::string actio
     vs.confirmOpenRequested = true;
 }
 
-// Text drawn at a vertical centre without taking layout space.
+// Text with its cap height centred on centerY, without taking layout space.
 void TextAt(Font f, float sizeDip, ImU32 col, float x, float centerY, const char* text) {
-    const ImVec2 ts = MeasureText(f, sizeDip, text);
-    ImGui::GetWindowDrawList()->AddText(GetFont(f), sizeDip * Dpi(), ImVec2(x, centerY - ts.y * 0.5f), col, text);
+    DrawText(ImGui::GetWindowDrawList(), f, sizeDip, x, centerY, col, text);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Inspector rows: a caps label column, values left, action buttons right-aligned, everything centred
-// on the row line. Values are shortened (middle ellipsis) so they never run under the buttons.
+// Rows: a caps label column, values left, action buttons right-aligned, everything centred on the
+// row's middle line (text by its cap height). Values are shortened (middle ellipsis) so they never run
+// under the buttons.
 
 struct RowCtx { float x0, y0, h, x, right, limit; };
 
 RowCtx BeginRow(const char* label, float hDip = kRowH) {
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float h = Px(hDip);
+    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float h = Snap(Px(hDip));
     const float right = p.x + ImGui::GetContentRegionAvail().x;
     TextAt(Font::Label, kSizeLabel, pal::InkDim, p.x, p.y + h * 0.5f, label);
     return { p.x, p.y, h, p.x + Px(kRowLabelW), right, right };
@@ -172,16 +174,14 @@ void RowText(RowCtx& r, const std::string& text, ImU32 col = pal::Ink, Font f = 
              const std::wstring& tooltip = {}) {
     const std::string shown = Ellipsize(f, sizeDip, text, r.limit - r.x);
     if (shown.empty()) return;
-    const ImVec2 ts = MeasureText(f, sizeDip, shown.c_str());
-    const ImVec2 at(r.x, r.y0 + (r.h - ts.y) * 0.5f);
-    ImGui::GetWindowDrawList()->AddText(GetFont(f), sizeDip * Dpi(), at, col, shown.c_str());
-    if (!tooltip.empty() && ImGui::IsMouseHoveringRect(at, ImVec2(at.x + ts.x, at.y + ts.y)))
+    const float w = DrawText(ImGui::GetWindowDrawList(), f, sizeDip, r.x, r.y0 + r.h * 0.5f, col, shown.c_str());
+    if (!tooltip.empty() && ImGui::IsMouseHoveringRect(ImVec2(r.x, r.y0), ImVec2(r.x + w, r.y0 + r.h)))
         ImGui::SetTooltip("%s", Utf8(tooltip).c_str());
-    r.x += ts.x + Px(12);
+    r.x += w + Px(12);
 }
 
 void RowPlace(RowCtx& r, float widgetHDip = kControlH) {
-    ImGui::SetCursorScreenPos(ImVec2(r.x, r.y0 + (r.h - Px(widgetHDip)) * 0.5f));
+    ImGui::SetCursorScreenPos(ImVec2(Snap(r.x), Snap(r.y0 + (r.h - Snap(Px(widgetHDip))) * 0.5f)));
 }
 
 void RowNext(RowCtx& r) { r.x = ImGui::GetItemRectMax().x + Px(8); }
@@ -195,7 +195,7 @@ int RowButtons(RowCtx& r, const char* idPrefix, const std::vector<const char*>& 
     r.limit = x - Px(12);
     int clicked = -1;
     for (size_t i = 0; i < labels.size(); i++) {
-        ImGui::SetCursorScreenPos(ImVec2(x, r.y0 + (r.h - Px(kControlH)) * 0.5f));
+        ImGui::SetCursorScreenPos(ImVec2(Snap(x), Snap(r.y0 + (r.h - Snap(Px(kControlH))) * 0.5f)));
         char id[64];
         snprintf(id, sizeof(id), "##%s%d", idPrefix, (int)i);
         if (Button(id, labels[i], kButtonW, kControlH)) clicked = (int)i;
@@ -215,84 +215,95 @@ void EndRow(const RowCtx& r) {
     ImGui::Dummy(ImVec2(0, 0));
 }
 
-// A section title of fixed height, then a hairline. Every column uses it, so their rules line up.
-void SectionHeader(const char* title, const Light* light) {
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float h = Px(kSectionH), cy = p.y + h * 0.5f;
-    float x = p.x;
-    if (light) {
-        const ImVec2 save = ImGui::GetCursorScreenPos();
-        ImGui::SetCursorScreenPos(ImVec2(x, cy - ImGui::GetTextLineHeight() * 0.5f));
-        StatusLight(*light, 8.0f);
-        ImGui::SetCursorScreenPos(save);
-        x += Px(18);
-    }
-    TextAt(Font::Label, 13.0f, light ? pal::Ink : pal::InkDim, x, cy, title);
-    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h + Px(6)));
-    Hairline();
-    ImGui::Dummy(ImVec2(0, Px(8)));
-}
-
 // ---------------------------------------------------------------------------------------------
 // Header / footer
 
+// The header: brand, page tabs, and at the far end the live-layers switch (a global state, not a page).
 void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const float w = ImGui::GetContentRegionAvail().x;
-    const float h = Px(kHeaderH), cy = p.y + h * 0.5f;
+    const float h = Snap(Px(kHeaderH)), cy = p.y + h * 0.5f;
+    const bool sheet = Shape().sheetTabs;
+    const float t = BevelPx();
+    // The edge under the header: a hairline, or the top highlight of the property sheet below the tabs.
+    if (sheet) dl->AddRectFilled(ImVec2(p.x, p.y + h - t), ImVec2(p.x + w, p.y + h), Col(pal::BevelHi));
+    else dl->AddRectFilled(ImVec2(p.x, p.y + h - 1), ImVec2(p.x + w, p.y + h), Col(pal::Rule));
+
     // The logo artwork (mipmapped texture); the drawn cube only if the texture could not be made.
-    const float logo = Px(34);
-    const float lx = p.x + Px(kGutter);
+    const float logo = Snap(Px(34));
+    const float lx = Snap(p.x + Px(kGutter));
     if (void* tex = LogoTexture())
-        dl->AddImage(ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(lx, cy - logo * 0.5f), ImVec2(lx + logo, cy + logo * 0.5f));
+        dl->AddImage(ImTextureRef((ImTextureID)(uintptr_t)tex), ImVec2(lx, Snap(cy - logo * 0.5f)),
+                     ImVec2(lx + logo, Snap(cy - logo * 0.5f) + logo));
     else
         DrawCubeLogo(dl, ImVec2(lx + logo * 0.5f, cy), logo * 0.5f);
     const float textX = lx + logo + Px(12);
-    TextAt(Font::Label, 14.0f, pal::Ink, textX, cy, "DESKTOPLUT");
-    TextAt(Font::Label, kSizeLabel, pal::InkFaint, textX + MeasureText(Font::Label, 14.0f, "DESKTOPLUT").x + Px(14), cy, "PREVIEW");
+    const float nameW = DrawText(dl, Font::Label, 14.0f, textX, cy, pal::Ink, "DESKTOPLUT");
+    const float tagW = DrawText(dl, Font::Label, kSizeLabel, textX + nameW + Px(12), cy, pal::InkFaint, "PREVIEW");
 
-    // Fixed slots, right-aligned: SUSPEND, a wider gap, then the page switch.
-    const float bw = 92.0f, bh = 28.0f, gap = 8.0f, groupGap = 24.0f;
-    float x = p.x + w - Px(kGutter) - Px(bw * 4 + gap * 2 + groupGap);
-    ImGui::SetCursorScreenPos(ImVec2(x, cy - Px(bh) * 0.5f));
-    ImGui::BeginDisabled(busy || (snap.calibrating && !snap.suspended));
-    if (Toggle("##suspend", "SUSPEND", snap.suspended, ImVec2(bw, bh))) {
-        const bool want = !snap.suspended;
-        Post([want]() { act::SetLiveLayersSuspended(want); });
+    // Page tabs: the first one's text starts on the main column's edge when the brand leaves room.
+    struct PageTab { const char* id; const char* label; Page page; };
+    static const PageTab kTabs[] = {
+        { "##pg_pipe", "PIPELINE", Page::Pipeline },
+        { "##pg_events", "EVENTS", Page::Events },
+        { "##pg_settings", "SETTINGS", Page::Settings },
+    };
+    const float brandEnd = textX + nameW + Px(12) + tagW + Px(20);
+    const float columnX = p.x + Px(kSidebarW) + Px(kGutter) - Px(18);   // a tab's text sits 18 DIP in
+    float x = Snap(brandEnd > columnX ? brandEnd : columnX);
+    const float tabTop = sheet ? p.y + Px(14) : p.y;
+    const float tabBottom = sheet ? p.y + h - t : p.y + h;
+    float tabX[3];
+    for (int i = 0; i < 3; i++) {
+        tabX[i] = x;
+        x += TabWidth(kTabs[i].label) + (sheet ? Px(2) : 0.0f);
     }
+    // The selected tab last: a property-sheet tab overlaps its neighbours.
+    const Page shownPage = vs.page;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < 3; i++) {
+            const PageTab& tab = kTabs[i];
+            if ((tab.page == shownPage) != (pass == 1)) continue;
+            const float tw = TabWidth(tab.label);
+            if (Tab(tab.id, tab.label, shownPage == tab.page, ImVec2(tabX[i], tabTop), ImVec2(tabX[i] + tw, tabBottom))) {
+                if (tab.page == Page::Settings && vs.page != Page::Settings)
+                    Post([]() { RefreshStartupEnabledCache(); });   // COM: not in a frame
+                vs.page = tab.page;
+            }
+        }
+    }
+
+    // Live layers: on = 3D LUT, tone mapping and FALD run; off = suspended (MHC stays on).
+    const bool live = !snap.suspended;
+    const char* label = "LIVE LAYERS";
+    const float sw = SwitchWidth(label);
+    ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Px(kGutter) - sw), Snap(cy - Px(kControlH) * 0.5f)));
+    ImGui::BeginDisabled(busy || (snap.calibrating && live));
+    if (Switch("##live", label, live)) Post([live]() { act::SetLiveLayersSuspended(live); });
     ImGui::EndDisabled();
     if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip(snap.calibrating && !snap.suspended ? "Calibration in progress."
-                          : snap.suspended ? "3D LUT, tone mapping and FALD off. MHC stays on."
-                                           : "Turn off 3D LUT, tone mapping and FALD. MHC stays on.");
-    ImGui::SameLine(0, Px(groupGap));
-    if (Toggle("##pg_pipe", "PIPELINE", vs.page == Page::Pipeline, ImVec2(bw, bh))) vs.page = Page::Pipeline;
-    ImGui::SameLine(0, Px(gap));
-    if (Toggle("##pg_events", "EVENTS", vs.page == Page::Events, ImVec2(bw, bh))) vs.page = Page::Events;
-    ImGui::SameLine(0, Px(gap));
-    if (Toggle("##pg_settings", "SETTINGS", vs.page == Page::Settings, ImVec2(bw, bh))) {
-        if (vs.page != Page::Settings) Post([]() { RefreshStartupEnabledCache(); });   // COM: not in a frame
-        vs.page = Page::Settings;
-    }
+        ImGui::SetTooltip(snap.calibrating && live ? "Calibration in progress."
+                          : live ? "3D LUT, tone mapping and FALD. Off suspends them; MHC stays on."
+                                 : "Suspended: 3D LUT, tone mapping and FALD off. MHC stays on.");
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
-    Hairline();
+    ImGui::Dummy(ImVec2(0, 0));
 }
 
 // The footer is pinned to the window's bottom edge (not placed after the body), so spacing above it can
 // never push it down or clip it.
 float FooterTop() {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
-    return vp->WorkPos.y + vp->WorkSize.y - Px(kFooterH);
+    return Snap(vp->WorkPos.y + vp->WorkSize.y - Px(kFooterH));
 }
 
 void DrawFooter(const Snapshot& snap, bool busy) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const ImVec2 p(vp->WorkPos.x, FooterTop());
+    const float w = vp->WorkSize.x;
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    dl->AddLine(p, ImVec2(p.x + vp->WorkSize.x, p.y), pal::Rule, 1.0f);
-    const float h = Px(kFooterH), cy = p.y + h * 0.5f;
+    const float h = Snap(Px(kFooterH)), cy = p.y + h * 0.5f;
     float x = p.x + Px(kGutter);
     // Engine health: green dot = running, amber triangle = should run but does not, ring = stopped.
     enum { Off, Good, Fault } state;
@@ -304,16 +315,36 @@ void DrawFooter(const Snapshot& snap, bool busy) {
         what = "OVERLAY";
         state = snap.running ? Good : Off;
     }
-    const float r = Px(4);
-    const ImVec2 c(x + r, cy);
-    if (state == Good) dl->AddCircleFilled(c, r, pal::Good);
-    else if (state == Fault) dl->AddTriangleFilled(ImVec2(c.x, c.y - r * 1.2f), ImVec2(c.x + r * 1.2f, c.y + r), ImVec2(c.x - r * 1.2f, c.y + r), pal::Alarm);
-    else dl->AddCircle(c, r - Px(0.5f), pal::InkFaint, 0, Px(1));
-    x += r * 2 + Px(8);
-    TextAt(Font::Label, kSizeLabel, state == Off ? pal::InkFaint : pal::InkDim, x, cy, what);
-    x += MeasureText(Font::Label, kSizeLabel, what).x + Px(24);
-    if (busy) TextAt(Font::Label, kSizeLabel, pal::Ink, x, cy, "APPLYING");
-    else if (!snap.lastStatus.empty()) TextAt(Font::Mono, 12.0f, pal::InkFaint, x, cy, Utf8(snap.lastStatus).c_str());
+    const char* stateText = snap.suspended ? "SUSPENDED" : nullptr;
+    if (Shape().bevel) {
+        // A Windows 98 status bar: two shallow sunken panes.
+        const float t = BevelPx(), in = Snap(Px(3));
+        dl->AddRectFilled(ImVec2(p.x, p.y), ImVec2(p.x + w, p.y + t), Col(pal::BevelHi));
+        auto pane = [&](float x0, float x1) {
+            const ImVec2 a(Snap(x0), p.y + in), b(Snap(x1), p.y + h - in);
+            dl->AddRectFilled(a, ImVec2(b.x, a.y + t), Col(pal::BevelShadow));
+            dl->AddRectFilled(a, ImVec2(a.x + t, b.y), Col(pal::BevelShadow));
+            dl->AddRectFilled(ImVec2(a.x, b.y - t), b, Col(pal::BevelHi));
+            dl->AddRectFilled(ImVec2(b.x - t, a.y), b, Col(pal::BevelHi));
+        };
+        const float split = p.x + Px(kSidebarW);
+        pane(p.x + in, split - Px(2));
+        pane(split + Px(2), p.x + w - in);
+        x = p.x + Px(12);
+    } else {
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + 1), Col(pal::Rule));
+    }
+    const float d = Snap(Px(8));
+    const ImVec2 c(Snap(x) + d * 0.5f, Snap(cy));
+    if (state == Good) dl->AddCircleFilled(c, d * 0.5f, Col(pal::Good));
+    else if (state == Fault) DrawLight(dl, c, Light::Fault, d);
+    else DrawLight(dl, c, Light::Off, d);
+    x += d + Px(8);
+    x += DrawText(dl, Font::Label, kSizeLabel, x, cy, state == Off ? pal::InkFaint : pal::InkDim, what) + Px(10);
+    if (stateText) DrawText(dl, Font::Label, kSizeLabel, x, cy, pal::Ink, stateText);
+    x = Shape().bevel ? p.x + Px(kSidebarW) + Px(12) : p.x + Px(kSidebarW) + Px(kGutter);
+    if (busy) DrawText(dl, Font::Label, kSizeLabel, x, cy, pal::Ink, "APPLYING");
+    else if (!snap.lastStatus.empty()) DrawText(dl, Font::Mono, 12.0f, x, cy, pal::InkFaint, Utf8(snap.lastStatus).c_str());
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -348,10 +379,11 @@ void CommitRename(ViewState& vs, const DisplayRow& r) {
 void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
     const float w = ImGui::GetContentRegionAvail().x;
     const bool live = r.liveIndex >= 0;
-    const float h = Px(live ? 60.0f : 44.0f);
-    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = Snap(Px(live ? 60.0f : 44.0f));
+    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
     const std::wstring key = RowIdOf(r);
     const bool renaming = vs.renamingKey == key;
+    const bool list = Shape().sunkenSidebar;   // a white list box with a navy selection (Light)
     ImGui::PushID(Utf8(key).c_str());
     bool hovered = false;
     if (renaming) {
@@ -371,16 +403,28 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
         }
     }
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const ImU32 ink = selected ? pal::Ground : (live ? pal::Ink : pal::InkFaint);
-    const ImU32 dim = selected ? pal::Ground : pal::InkDim;
-    if (selected) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), pal::Ink);
-    else if (hovered) dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), pal::Hover);
-    dl->AddLine(ImVec2(p.x, p.y + h - 1), ImVec2(p.x + w, p.y + h - 1), pal::Rule);
+    // On a list selection (navy in Light) every mark takes the selection's ink.
+    const bool onSel = selected && list;
+    const ImU32 ink = onSel ? pal::ListSelInk : (live ? pal::Ink : pal::InkFaint);
+    const ImU32 dim = onSel ? pal::ListSelInk : pal::InkDim;
+    const bool cards = Shape().cardSidebar;   // rounded cards (Gray)
+    if (cards) {
+        const float m = Snap(Px(10)), gy = Snap(Px(3)), rr = Snap(Px(8));
+        const ImVec2 ca(p.x + m, p.y + gy), cb(p.x + w - m, p.y + h - gy);
+        dl->AddRectFilled(ca, cb, Col(selected ? pal::ListSel : (hovered ? pal::Hover : pal::Panel)), rr);
+        dl->AddRect(ca, cb, Col(selected ? pal::Accent : pal::PanelEdge), rr);
+    } else if (selected) {
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), Col(pal::ListSel));
+        if (!list) dl->AddRectFilled(p, ImVec2(p.x + Snap(Px(3)), p.y + h), Col(pal::Accent));
+    } else if (hovered && !list) {
+        dl->AddRectFilled(p, ImVec2(p.x + w, p.y + h), Col(pal::Hover));
+    }
+    if (!list && !cards) dl->AddRectFilled(ImVec2(p.x, p.y + h - 1), ImVec2(p.x + w, p.y + h), Col(pal::Rule));
 
-    const float pad = Px(kGutter);
-    const float nameY = p.y + (live ? Px(20) : h * 0.5f);
+    const float pad = Px(list ? 12.0f : (cards ? 22.0f : kGutter));
+    const float nameY = p.y + (live ? Px(21) : h * 0.5f);
     const char* badge = live ? ModeBadge(r.mode) : "OFFLINE";
-    const float badgeW = MeasureText(Font::Label, kSizeLabel, badge).x;
+    const float badgeW = MeasureInk(Font::Label, kSizeLabel, badge).advance;
     TextAt(Font::Label, kSizeLabel, dim, p.x + w - pad - badgeW, nameY, badge);
 
     if (renaming) {
@@ -396,30 +440,30 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
         else if (enter || ImGui::IsItemDeactivated()) CommitRename(vs, r);
     } else {
         const std::string name = Ellipsize(Font::BodyBold, kSizeBody, Utf8(r.name), w - pad * 2 - badgeW - Px(8));
-        TextAt(Font::BodyBold, kSizeBody, ink, p.x + pad, nameY, name.c_str());
+        TextAt(selected ? Font::BodyBold : Font::Body, kSizeBody, ink, p.x + pad, nameY, name.c_str());
     }
 
     if (live) {
-        // Layer lights for the live mode's side: calibration (MHC), 3D LUT.
+        // Layer lights for the live mode's side: calibration (MHC), 3D LUT; centred on the resolution's digits.
         const bool hdr = PipelineIsHdr(r.mode);
         const Light cal = MhcLight(hdr ? r.settings.hdrMHC : r.settings.sdrMHC);
         const Light lut = (hdr ? r.settings.hdrPath : r.settings.sdrPath).empty() ? Light::Off : Light::Configured;
         const float cy = p.y + Px(42);
-        float x = p.x + pad + Px(3.5f);
+        const float d = Snap(Px(7));
+        float x = Snap(p.x + pad);
         for (Light l : { cal, lut }) {
-            if (l == Light::Off) dl->AddCircle(ImVec2(x, cy), Px(3.0f), selected ? pal::Ground : pal::InkFaint, 0, Px(1));
-            else dl->AddCircleFilled(ImVec2(x, cy), Px(3.5f), ink);
-            x += Px(12);
+            DrawLight(dl, ImVec2(x + d * 0.5f, Snap(cy)), l, d, onSel ? pal::ListSelInk : 0);
+            x += d + Snap(Px(5));
         }
         if (r.widthPx > 0) {
             char res[32];
             snprintf(res, sizeof(res), "%d\xC3\x97%d", r.widthPx, r.heightPx);
-            TextAt(Font::Mono, kSizeMono, dim, x + Px(4), cy, res);
+            TextAt(Font::Mono, 12.0f, dim, x + Px(4), cy, res);
         }
         if (r.reminderDue) {   // right-aligned under the mode badge: nothing else moves
             const char* due = "RECAL";
-            const float dueW = MeasureText(Font::Label, kSizeLabel, due).x;
-            TextAt(Font::Label, kSizeLabel, selected ? pal::Ground : pal::Alarm, p.x + w - pad - dueW, cy, due);
+            const float dueW = MeasureInk(Font::Label, kSizeLabel, due).advance;
+            TextAt(Font::Label, kSizeLabel, onSel ? pal::ListSelInk : pal::Alarm, p.x + w - pad - dueW, cy, due);
         }
     }
     ImGui::PopID();
@@ -428,37 +472,55 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
 }
 
 void DrawSidebar(const Snapshot& snap, ViewState& vs, const DisplayRow* sel) {
+    if (Shape().cardSidebar) ImGui::Dummy(ImVec2(0, Px(7)));
     for (const DisplayRow& r : snap.live) SidebarRow(r, sel == &r, vs);
     for (const DisplayRow& r : snap.parked) SidebarRow(r, sel == &r, vs);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pixel path
+// Pixel path: the stages as nodes on the signal line, from the desktop to the panel (Gray: in a rounded
+// strip, chevrons between the stages).
 
 void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
     ImDrawList* dl = ImGui::GetWindowDrawList();
-    const float h = Px(34);
-    const ImVec2 p0 = ImGui::GetCursorScreenPos();
-    const float avail = ImGui::GetContentRegionAvail().x;
+    const float h = Snap(Px(34));
+    const bool strip = Shape().pathStrip;
+    const float pad = strip ? Snap(Px(8)) : 0.0f;
+    const ImVec2 outer(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float outerW = ImGui::GetContentRegionAvail().x;
+    const ImVec2 p0(outer.x + pad, outer.y + pad);
+    const float avail = outerW - 2.0f * pad;
     const float midY = p0.y + h * 0.5f;
-    dl->AddLine(ImVec2(p0.x, midY), ImVec2(p0.x + avail, midY), pal::RuleStrong, 1.0f);
+    if (strip) {
+        const float r = Snap(Px(Shape().panelRounding));
+        dl->AddRectFilled(outer, ImVec2(outer.x + outerW, outer.y + h + 2 * pad), Col(pal::Raised), r);
+        dl->AddRect(outer, ImVec2(outer.x + outerW, outer.y + h + 2 * pad), Col(pal::Rule), r);
+    } else {
+        dl->AddRectFilled(ImVec2(p0.x, Snap(midY)), ImVec2(p0.x + avail, Snap(midY) + 1), Col(pal::RuleStrong));
+    }
 
-    // Markers take their text width; every stage box has the same width (as wide as fits, capped), and
-    // the gaps between all elements are equal.
+    // Markers take their text width; every stage node has the same width (as wide as fits, capped), and
+    // the gaps between all elements are equal. Nodes carry their light while there is room for it.
     std::vector<float> widths(path.size(), 0.0f);
-    float markers = 0.0f;
+    float markers = 0.0f, widestLabel = 0.0f;
     int stages = 0;
     for (size_t i = 0; i < path.size(); i++) {
+        const float lw = MeasureInk(Font::Label, kSizeLabel, StageLabel(path[i].id)).advance;
         if (!path[i].selectable) {
-            widths[i] = MeasureText(Font::Label, kSizeLabel, StageLabel(path[i].id)).x + Px(16);
+            widths[i] = lw + Px(16);
             markers += widths[i];
         } else {
             stages++;
+            widestLabel = lw > widestLabel ? lw : widestLabel;
         }
     }
-    const float minGap = Px(14);
+    const float minGap = Px(12);
     float stageW = stages ? (avail - markers - minGap * (float)(path.size() - 1)) / (float)stages : 0.0f;
-    stageW = stageW > Px(120) ? Px(120) : (stageW < Px(64) ? Px(64) : stageW);
+    const float withLight = widestLabel + Px(7 + 7 + 22), bare = widestLabel + Px(18);
+    const bool lights = stageW >= withLight;
+    const float minW = lights ? withLight : bare;
+    stageW = stageW > Px(132) ? Px(132) : (stageW < minW ? minW : stageW);
+    stageW = Snap(stageW);
     for (size_t i = 0; i < path.size(); i++) if (path[i].selectable) widths[i] = stageW;
     const float total = markers + stageW * (float)stages;
     const float gap = path.size() > 1 ? (avail - total) / (float)(path.size() - 1) : 0.0f;
@@ -469,40 +531,60 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
         const float w = widths[i];
         if (!s.selectable) {
             const char* t = StageLabel(s.id);
-            const ImVec2 ts = MeasureText(Font::Label, kSizeLabel, t);
-            const float tx = x + (w - ts.x) * 0.5f;
-            dl->AddRectFilled(ImVec2(x, midY - ts.y * 0.5f - Px(2)), ImVec2(x + w, midY + ts.y * 0.5f + Px(2)), pal::Ground);
+            const InkBox ib = MeasureInk(Font::Label, kSizeLabel, t);
+            const float halfH = (ib.baseline - ib.capTop) * 0.5f + Px(4);
+            if (strip && s.id != StageId::Scanout)   // the ends as quiet chips
+                dl->AddRectFilled(ImVec2(Snap(x), p0.y), ImVec2(Snap(x + w), p0.y + h), Col(pal::Panel), Snap(Px(Shape().controlRounding)));
+            else if (!strip)
+                dl->AddRectFilled(ImVec2(Snap(x), Snap(midY - halfH)), ImVec2(Snap(x + w), Snap(midY + halfH)), Col(pal::Ground));
             if (s.id == StageId::Scanout) {
                 // The cut: dashes above and below the label, never through it.
-                const float gapTop = midY - ts.y * 0.5f - Px(4), gapBottom = midY + ts.y * 0.5f + Px(4);
-                const float cx = x + w * 0.5f;
-                for (float yy = p0.y - Px(6); yy < gapTop; yy += Px(6))
-                    dl->AddLine(ImVec2(cx, yy), ImVec2(cx, yy + Px(3) < gapTop ? yy + Px(3) : gapTop), pal::InkFaint);
-                for (float yy = gapBottom; yy < p0.y + h + Px(6); yy += Px(6))
-                    dl->AddLine(ImVec2(cx, yy), ImVec2(cx, yy + Px(3)), pal::InkFaint);
+                const float gapTop = midY - halfH - Px(2), gapBottom = midY + halfH + Px(2);
+                const float cx = Snap(x + w * 0.5f);
+                for (float yy = strip ? p0.y : p0.y - Px(6); yy < gapTop; yy += Px(6))
+                    dl->AddRectFilled(ImVec2(cx, Snap(yy)), ImVec2(cx + 1, Snap(yy + Px(3) < gapTop ? yy + Px(3) : gapTop)),
+                                      Col(pal::InkFaint));
+                for (float yy = gapBottom; yy < p0.y + h + (strip ? 0.0f : Px(6)); yy += Px(6))
+                    dl->AddRectFilled(ImVec2(cx, Snap(yy)), ImVec2(cx + 1, Snap(yy + Px(3))), Col(pal::InkFaint));
             }
-            dl->AddText(GetFont(Font::Label), kSizeLabel * Dpi(), ImVec2(tx, midY - ts.y * 0.5f), pal::InkFaint, t);
+            DrawTextIn(dl, Font::Label, kSizeLabel, ImVec2(x, p0.y), ImVec2(x + w, p0.y + h), pal::InkFaint, t);
         } else {
-            ImGui::SetCursorScreenPos(ImVec2(x, p0.y));
+            ImGui::SetCursorScreenPos(ImVec2(Snap(x), p0.y));
             char id[32];
             snprintf(id, sizeof(id), "##stage%d", (int)s.id);
             const bool selected = vs.stage == s.id;
-            const bool off = s.light == Light::Off;
-            if (Toggle(id, StageLabel(s.id), selected, ImVec2(w / Dpi(), 34), s.dimmed || off, s.dimmed || off))
-                vs.stage = s.id;
+            const bool off = s.light == Light::Off || s.dimmed;
+            if (Node(id, StageLabel(s.id), s.light, selected, off, ImVec2(w / Dpi(), 34), lights)) vs.stage = s.id;
+        }
+        // Gray: a chevron in the gap after each element (not into or out of the scan-out cut).
+        if (strip && i + 1 < path.size() && s.id != StageId::Scanout && path[i + 1].id != StageId::Scanout) {
+            const float cx = x + w + gap * 0.5f, s3 = Px(3.5f);
+            const ImVec2 pts[3] = { ImVec2(cx - s3 * 0.5f, midY - s3), ImVec2(cx + s3 * 0.5f, midY), ImVec2(cx - s3 * 0.5f, midY + s3) };
+            dl->AddPolyline(pts, 3, Col(pal::RuleStrong), Px(1.5f));
         }
         x += w + gap;
     }
-    ImGui::SetCursorScreenPos(ImVec2(p0.x, p0.y + h));
-    ImGui::Dummy(ImVec2(avail, 0));
+    ImGui::SetCursorScreenPos(ImVec2(outer.x, outer.y + h + 2 * pad));
+    ImGui::Dummy(ImVec2(outerW, 0));
 }
 
 // ---------------------------------------------------------------------------------------------
-// Inspectors
+// Inspectors (each fills the panel the selected node opens; the panel carries the title and light)
+
+const char* InspectorTitle(StageId id) {
+    switch (id) {
+    case StageId::Lut3D:       return "3D LUT";
+    case StageId::ToneMap:     return "TONE MAP";
+    case StageId::Fald:        return "FALD";
+    case StageId::ShaderTweak: return "SHADER TWEAK";
+    case StageId::Primaries:   return "PRIMARIES & WHITE";
+    case StageId::Grayscale:   return "GRAYSCALE & GAMMA";
+    default:                   return "";
+    }
+}
 
 void InspectLut(const Snapshot& snap, const DisplayRow& r, const Stage& st, bool hdr) {
     const std::wstring& path = hdr ? r.settings.hdrPath : r.settings.sdrPath;
-    SectionHeader("3D LUT", &st.light);
 
     RowCtx row = BeginRow("CUBE");
     std::vector<const char*> buttons = { "BROWSE\xE2\x80\xA6" };
@@ -537,7 +619,6 @@ void InspectLut(const Snapshot& snap, const DisplayRow& r, const Stage& st, bool
 
 void InspectToneMap(const DisplayRow& r, const Stage& st) {
     const TonemapSettings& tm = r.settings.hdrColorCorrection.tonemap;
-    SectionHeader("TONE MAP", &st.light);
     auto post = [&r](TonemapSettings t) { PostTo(r, [t](int mon) { act::SetTonemap(mon, t); }); };
 
     RowCtx row = BeginRow("STATE");
@@ -564,7 +645,7 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     row = BeginRow("CONTENT PEAK");
     RowPlace(row);
     bool dyn = false;
-    if (OnOff("##tm_dyn", tm.dynamicPeak, &dyn, "DYNAMIC", "FIXED")) { TonemapSettings t = tm; t.dynamicPeak = dyn; post(t); }
+    if (OnOff("##tm_dyn", tm.dynamicPeak, &dyn, "DYNAMIC", "FIXED", 84.0f)) { TonemapSettings t = tm; t.dynamicPeak = dyn; post(t); }
     RowNext(row);
     // The value stays in place (disabled) while dynamic, so the row does not change shape.
     RowPlace(row);
@@ -583,7 +664,7 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     }
     RowPlace(row);
     bool en = false;
-    if (OnOff("##mtml_on", r.settings.maxTml.enabled, &en, "AT START", "OFF"))
+    if (OnOff("##mtml_on", r.settings.maxTml.enabled, &en, "AT START", "OFF", 84.0f))
         PostTo(r, [en](int mon) { act::SetMaxTmlEnabled(mon, en); });
     RowNext(row);
     RowPlace(row);
@@ -597,7 +678,6 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
 
 void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
-    SectionHeader("FALD", &st.light);
 
     RowCtx row = BeginRow("STATE");
     if (st.light == Light::NotApplicable) {
@@ -649,7 +729,6 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
 
 void InspectShaderTweak(const DisplayRow& r, const Stage& st, bool hdr) {
     const ColorCorrectionSettings& cc = hdr ? r.settings.hdrColorCorrection : r.settings.sdrColorCorrection;
-    SectionHeader("SHADER TWEAK", &st.light);
     RowCtx row = BeginRow("PRIMARIES"); RowText(row, OnOffText(cc.primariesEnabled)); EndRow(row);
     row = BeginRow("GRAYSCALE"); RowText(row, OnOffText(cc.grayscale.enabled)); EndRow(row);
     row = BeginRow("GAMMA 2.4"); RowText(row, OnOffText(cc.grayscale.use24Gamma)); EndRow(row);
@@ -657,7 +736,6 @@ void InspectShaderTweak(const DisplayRow& r, const Stage& st, bool hdr) {
 
 void InspectPrimaries(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
     const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
-    SectionHeader("PRIMARIES & WHITE", &st.light);
     const bool installed = !mhc.profileName.empty();
 
     RowCtx row = BeginRow("PROFILE");
@@ -721,7 +799,6 @@ void InspectPrimaries(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
 void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
     const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
     const GrayscaleSettings& gs = mhc.correctionGrayscale;
-    SectionHeader("GRAYSCALE & GAMMA", &st.light);
 
     RowCtx row = BeginRow("BASE");
     if (RowButtons(row, "base", { "EDIT\xE2\x80\xA6" }) == 0)
@@ -788,37 +865,50 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     }
 }
 
-void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage* st, bool hdr, ViewState& vs) {
-    if (!st) { SectionHeader("SELECT A STAGE", nullptr); return; }
-    switch (st->id) {
-    case StageId::Lut3D:       InspectLut(snap, r, *st, hdr); break;
-    case StageId::ToneMap:     InspectToneMap(r, *st); break;
-    case StageId::Fald:        InspectFald(r, *st, hdr); break;
-    case StageId::ShaderTweak: InspectShaderTweak(r, *st, hdr); break;
-    case StageId::Primaries:   InspectPrimaries(r, *st, hdr, vs); break;
-    case StageId::Grayscale:   InspectGrayscale(r, *st, hdr, vs); break;
+void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
+    switch (st.id) {
+    case StageId::Lut3D:       InspectLut(snap, r, st, hdr); break;
+    case StageId::ToneMap:     InspectToneMap(r, st); break;
+    case StageId::Fald:        InspectFald(r, st, hdr); break;
+    case StageId::ShaderTweak: InspectShaderTweak(r, st, hdr); break;
+    case StageId::Primaries:   InspectPrimaries(r, st, hdr, vs); break;
+    case StageId::Grayscale:   InspectGrayscale(r, st, hdr, vs); break;
     default: break;
     }
 }
 
 // ---------------------------------------------------------------------------------------------
-// Measured column: what DLC recorded and measured for the selected display and the mode shown.
+// Measured panel: what DLC recorded and measured for the selected display and the mode shown. Its rows
+// keep the inspector's pitch, so the two panels' rows line up.
 
 constexpr float kMeasuredLabelW = 84.0f;
 
-// A compact row of the measured column: label, value (ellipsized), optional tooltip on the row.
+// A row of the measured panel: label, value (ellipsized), optional tooltip on the row.
 void MeasuredRow(const char* label, const std::string& value, ImU32 col = pal::Ink, Font f = Font::Mono,
                  const char* tip = nullptr) {
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float w = ImGui::GetContentRegionAvail().x, h = Px(24), cy = p.y + h * 0.5f;
-    TextAt(Font::Label, kSizeLabel, pal::InkDim, p.x, cy, label);
-    const float x = p.x + Px(kMeasuredLabelW);
-    const float size = f == Font::Mono ? kSizeMono : kSizeLabel;
-    const std::string shown = Ellipsize(f, size, value, p.x + w - x);
-    TextAt(f, size, col, x, cy, shown.c_str());
-    if (tip && ImGui::IsMouseHoveringRect(p, ImVec2(p.x + w, p.y + h))) ImGui::SetTooltip("%s", tip);
-    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
-    ImGui::Dummy(ImVec2(0, 0));
+    RowCtx row = BeginRow("", kRowH);
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, row.y0 + row.h * 0.5f, label);
+    row.x = row.x0 + Px(kMeasuredLabelW);
+    RowText(row, value, col, f, f == Font::Mono ? kSizeMono : kSizeLabel);
+    if (tip && ImGui::IsMouseHoveringRect(ImVec2(row.x0, row.y0), ImVec2(row.right, row.y0 + row.h))) ImGui::SetTooltip("%s", tip);
+    EndRow(row);
+}
+
+// Readouts: the verification's numbers as label-over-value tiles, three to a row, two rows to three
+// row pitches.
+struct Readout { const char* label; std::string value; ImU32 col; };
+void Readouts(const std::vector<Readout>& items) {
+    if (items.empty()) return;
+    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float colW = w / 3.0f, tileH = Snap(Px((kRowH + 2.0f) * 1.5f));
+    for (size_t i = 0; i < items.size(); i++) {
+        const float x = p.x + colW * (float)(i % 3), y = p.y + tileH * (float)(i / 3);
+        TextAt(Font::Label, 11.0f, pal::InkDim, x, y + tileH * 0.28f, items[i].label);
+        TextAt(Font::Mono, 17.0f, items[i].col, x, y + tileH * 0.68f, items[i].value.c_str());
+    }
+    const int rows = (int)((items.size() + 2) / 3);
+    ImGui::Dummy(ImVec2(w, tileH * (float)rows));
 }
 
 std::string Num2(double v) { return std::isfinite(v) ? Fmt("%.2f", v) : std::string("\xE2\x80\x94"); }
@@ -861,22 +951,30 @@ void PatchHistogram(const std::vector<dlc::Patch>& patches) {
     if (n == 0) return;
     int top = 1;
     for (int b : bins) top = b > top ? b : top;
-    const ImVec2 p = ImGui::GetCursorScreenPos();
-    const float w = ImGui::GetContentRegionAvail().x, barH = Px(56), labelH = Px(16);
+    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y + Px(6)));
+    const float w = ImGui::GetContentRegionAvail().x, barH = Snap(Px(56)), labelH = Px(18);
     const float gap = Px(4), bw = (w - gap * 5) / 6;
     ImDrawList* dl = ImGui::GetWindowDrawList();
     for (int k = 0; k < 6; k++) {
         const float x = p.x + k * (bw + gap);
         const float h = barH * (float)bins[k] / (float)top;
-        dl->AddRectFilled(ImVec2(x, p.y + barH - (h > 0 ? (h < Px(1) ? Px(1) : h) : 0)), ImVec2(x + bw, p.y + barH),
-                          k >= 4 ? pal::Alarm : pal::InkDim);
-        const ImVec2 ts = MeasureText(Font::Mono, 11.0f, kLabels[k]);
-        dl->AddText(GetFont(Font::Mono), 11.0f * Dpi(), ImVec2(x + (bw - ts.x) * 0.5f, p.y + barH + Px(3)), pal::InkFaint, kLabels[k]);
+        dl->AddRectFilled(ImVec2(Snap(x), Snap(p.y + barH - (h > 0 ? (h < Px(1) ? Px(1) : h) : 0))),
+                          ImVec2(Snap(x + bw), p.y + barH), Col(k >= 4 ? pal::Alarm : pal::InkDim));
+        DrawTextIn(dl, Font::Mono, 11.0f, ImVec2(x, p.y + barH), ImVec2(x + bw, p.y + barH + labelH), pal::InkFaint, kLabels[k]);
         if (ImGui::IsMouseHoveringRect(ImVec2(x, p.y), ImVec2(x + bw, p.y + barH + labelH)))
             ImGui::SetTooltip("%d of %d patches", bins[k], n);
     }
-    dl->AddLine(ImVec2(p.x, p.y + barH), ImVec2(p.x + w, p.y + barH), pal::Rule);
-    ImGui::Dummy(ImVec2(w, barH + labelH + Px(4)));
+    dl->AddRectFilled(ImVec2(p.x, p.y + barH), ImVec2(p.x + w, p.y + barH + 1), Col(pal::Rule));
+    ImGui::Dummy(ImVec2(w, Px(6) + barH + labelH + Px(4)));
+}
+
+// The measured panel's light: verified (and not due), a fault when only an older report exists or a
+// reminder is due, off when nothing is recorded.
+Light MeasuredLight(const DisplayRow& r, bool showHdr) {
+    const dlc::ModeRecord& rec = r.dlcRecord[showHdr ? 1 : 0];
+    if (rec.current >= 0) return rec.reminderDue ? Light::Fault : Light::Configured;
+    if (rec.latest >= 0) return Light::Fault;
+    return Light::Off;
 }
 
 void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs) {
@@ -884,15 +982,14 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     const int mi = showHdr ? 1 : 0;
     const dlc::ModeRecord& rec = r.dlcRecord[mi];
     const int shown = rec.current >= 0 ? rec.current : rec.latest;
-    Light light = Light::Off;
-    if (rec.current >= 0) light = rec.reminderDue ? Light::Fault : Light::Configured;
-    else if (shown >= 0) light = Light::Fault;
-    SectionHeader("MEASURED", &light);
 
     if (d.folder.empty()) {
         MeasuredRow("DLC", "NO FOLDER", pal::InkFaint, Font::Label, "No DLC folder set or found. Settings > Calibration.");
-        ImGui::Dummy(ImVec2(0, Px(6)));
+        RowCtx row = BeginRow("", kRowH);
+        row.x = row.x0 + Px(kMeasuredLabelW);
+        RowPlace(row);
         if (Button("##meas_settings", "SETTINGS", kButtonW)) vs.page = Page::Settings;
+        EndRow(row);
         return;
     }
     if (r.dlcMatch.name.empty()) {
@@ -904,7 +1001,7 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     const char* by = r.dlcMatch.by == dlc::MatchBy::HardwareId ? "Matched by hardware id."
                      : r.dlcMatch.by == dlc::MatchBy::StackEvidence ? "Matched by the files DLC applied."
                                                                     : "Matched by a verification's hardware id.";
-    MeasuredRow("DLC", r.dlcMatch.name, pal::InkDim, Font::Label, by);
+    MeasuredRow("DLC", r.dlcMatch.name, pal::Ink, Font::Label, by);
     if (rec.reminderDue) {
         std::string why = rec.correctionStale ? "Meter correction older than the profile allows." : "";
         if (g_recalReminderDays > 0 && rec.verifiedDaysAgo > g_recalReminderDays)
@@ -913,7 +1010,6 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     }
     MeasuredRow("MHC", LayerText(rec.mhc), LayerColour(rec.mhc), Font::Label);
     MeasuredRow("3D LUT", LayerText(rec.cube), LayerColour(rec.cube), Font::Label);
-    ImGui::Dummy(ImVec2(0, Px(8)));
 
     if (shown < 0) {
         MeasuredRow("VERIFIED", "NO REPORT", pal::InkFaint, Font::Label);
@@ -929,13 +1025,12 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
         MeasuredRow("RUN", flow, pal::InkDim, Font::Mono);
         const dlc::Verification& v = rep.verification;
         MeasuredRow("METRIC", dlc::MetricLabel(v.metric), pal::InkDim, Font::Mono);
-        MeasuredRow("AVG", Num2(v.avg), val);
-        MeasuredRow("P95", Num2(v.p95), val);
-        MeasuredRow("MAX", Num2(v.max), val);
-        MeasuredRow("WHITE", Num2(v.white), val);
-        MeasuredRow("GRAY", Num2(v.grayAvg), val);
-        if (v.patchCount > 0) MeasuredRow("PATCHES", std::to_string(v.patchCount), pal::InkDim);
-        ImGui::Dummy(ImVec2(0, Px(8)));
+        std::vector<Readout> nums = {
+            { "AVG", Num2(v.avg), val }, { "P95", Num2(v.p95), val }, { "MAX", Num2(v.max), val },
+            { "WHITE", Num2(v.white), val }, { "GRAY", Num2(v.grayAvg), val },
+        };
+        if (v.patchCount > 0) nums.push_back({ "PATCHES", std::to_string(v.patchCount), pal::InkDim });
+        Readouts(nums);
         if (!rep.runDir.empty()) {
             const auto patches = dlc::Patches(rep.runDir);
             if (!patches) MeasuredRow("", "LOADING", pal::InkFaint, Font::Label);
@@ -949,22 +1044,37 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
 
 void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     const DisplayRow* sel = FindSelected(snap, vs);
-    const float bodyH = FooterTop() - ImGui::GetCursorScreenPos().y;   // down to the pinned footer
+    const ImVec2 body(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float bodyH = FooterTop() - body.y;   // down to the pinned footer
+    const float sideW = Snap(Px(kSidebarW));
+    ImDrawList* dl = ImGui::GetWindowDrawList();
 
-    ImGui::BeginChild("##sidebar", ImVec2(Px(kSidebarW), bodyH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    if (Shape().sunkenSidebar) {
+        // The display list in a sunken white list box.
+        const float in = Snap(Px(8)), bi = 2.0f * BevelPx();
+        const ImVec2 a(body.x + in, body.y + in), b(body.x + sideW - Snap(Px(2)), body.y + bodyH - in);
+        dl->AddRectFilled(a, b, Col(pal::Field));
+        Bevel(dl, a, b, BevelKind::Sunken);
+        ImGui::SetCursorScreenPos(ImVec2(a.x + bi, a.y + bi));
+        ImGui::BeginChild("##sidebar", ImVec2(b.x - a.x - 2 * bi, b.y - a.y - 2 * bi), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoScrollbar);
+    } else {
+        ImGui::SetCursorScreenPos(body);
+        ImGui::BeginChild("##sidebar", ImVec2(sideW, bodyH), ImGuiChildFlags_None, ImGuiWindowFlags_NoScrollbar);
+    }
     DrawSidebar(snap, vs, sel);
     ImGui::EndChild();
-    {
-        const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-        ImGui::GetWindowDrawList()->AddLine(ImVec2(b.x, a.y), ImVec2(b.x, b.y), pal::Rule);
-    }
-    ImGui::SameLine(0, 0);
+    if (!Shape().sunkenSidebar)
+        dl->AddRectFilled(ImVec2(body.x + sideW - 1, body.y), ImVec2(body.x + sideW, body.y + bodyH), Col(pal::Rule));
 
+    ImGui::SetCursorScreenPos(ImVec2(body.x + sideW, body.y));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
     ImGui::BeginChild("##main", ImVec2(0, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PopStyleVar();
     if (!sel) {
-        SectionHeader("NO DISPLAYS", nullptr);
+        BeginPanel("##none", "NO DISPLAYS", nullptr, ImVec2(0, 0));
+        Text(Font::Label, kSizeLabel, pal::InkFaint, "NOTHING CONNECTED OR REMEMBERED");
+        EndPanel();
         ImGui::EndChild();
         return;
     }
@@ -975,34 +1085,29 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     // Title row: name left, mode switch right, both centred on one line. The "other mode" note is drawn
     // on this line without taking layout space, so nothing moves when it appears.
     {
-        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
         const float w = ImGui::GetContentRegionAvail().x;
-        const float h = Px(30), cy = p.y + h * 0.5f;
+        const float h = Snap(Px(30)), cy = p.y + h * 0.5f;
         const std::string name = Utf8(sel->name);
-        TextAt(Font::BodyBold, 19.0f, pal::Ink, p.x, cy, name.c_str());
-        if (vs.showOtherMode && sel->liveIndex >= 0) {
-            const float nameW = MeasureText(Font::BodyBold, 19.0f, name.c_str()).x;
+        const float nameW = DrawText(ImGui::GetWindowDrawList(), Font::BodyBold, kSizeTitle, p.x, cy, pal::Ink, name.c_str());
+        if (vs.showOtherMode && sel->liveIndex >= 0)
             TextAt(Font::Label, kSizeLabel, pal::Alarm, p.x + nameW + Px(16), cy, liveHdr ? "DISPLAY IS IN HDR" : "DISPLAY IS IN SDR");
-        }
-        const float bw = 64.0f;
-        const bool parked = sel->liveIndex < 0;
         // Which side's settings are shown; a green light marks the mode the display is in now.
-        ImGui::SetCursorScreenPos(ImVec2(p.x + w - Px(bw * 2), cy - Px(13)));
-        auto modeButton = [&](const char* id, const char* label, bool isHdr) {
-            const bool live = !parked && liveHdr == isHdr;
-            const bool clicked = Toggle(id, label, showHdr == isHdr, ImVec2(bw, 26));
-            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
-            if (live) ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(a.x + Px(10), (a.y + b.y) * 0.5f), Px(3), pal::Good);
-            if (ImGui::IsItemHovered()) {
-                if (parked) ImGui::SetTooltip("%s settings. Display not connected.", label);
-                else if (live) ImGui::SetTooltip("%s settings. The display is in %s now.", label, label);
-                else ImGui::SetTooltip("%s settings. The display is in %s now.", label, isHdr ? "SDR" : "HDR");
-            }
-            return clicked;
-        };
-        if (modeButton("##m_hdr", "HDR", true)) vs.showOtherMode = !liveHdr;
-        ImGui::SameLine(0, 0);
-        if (modeButton("##m_sdr", "SDR", false)) vs.showOtherMode = liveHdr;
+        const bool parked = sel->liveIndex < 0;
+        static const char* const kModes[] = { "HDR", "SDR" };
+        const ImU32 dots[2] = { !parked && liveHdr ? pal::Good : 0u, !parked && !liveHdr ? pal::Good : 0u };
+        const float segW = 72.0f;
+        ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Snap(Px(segW)) * 2), Snap(cy - Snap(Px(kControlH)) * 0.5f)));
+        const int pick = Segmented("##mode", kModes, 2, showHdr ? 0 : 1, segW, dots);
+        if (pick == 0) vs.showOtherMode = !liveHdr;
+        else if (pick == 1) vs.showOtherMode = liveHdr;
+        const ImVec2 ga = ImGui::GetItemRectMin(), gb = ImGui::GetItemRectMax();
+        if (ImGui::IsMouseHoveringRect(ga, gb) && ImGui::IsWindowHovered()) {
+            const bool overHdr = ImGui::GetIO().MousePos.x < (ga.x + gb.x) * 0.5f;
+            const char* label = overHdr ? "HDR" : "SDR";
+            if (parked) ImGui::SetTooltip("%s settings. Display not connected.", label);
+            else ImGui::SetTooltip("%s settings. The display is in %s now.", label, liveHdr ? "HDR" : "SDR");
+        }
         ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
         ImGui::Dummy(ImVec2(0, Px(16)));
     }
@@ -1014,34 +1119,42 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         for (const Stage& s : path) if (s.selectable) { vs.stage = s.id; st = &s; break; }
     }
     DrawPixelPath(path, vs);
-    ImGui::Dummy(ImVec2(0, Px(22)));
+    ImGui::Dummy(ImVec2(0, Px(20)));
 
-    const float colH = ImGui::GetContentRegionAvail().y;
-    ImGui::BeginChild("##inspector", ImVec2(-Px(kMeasuredW + kGutter), colH), ImGuiChildFlags_None);
-    ImGui::BeginDisabled(sel->liveIndex < 0);   // a remembered display that is not connected: view only
-    // Widget ids per display and mode: a field being typed in stays with its display and mode (it ends
-    // if either changes under it) instead of committing to whatever is shown next.
-    ImGui::PushID(Utf8(RowIdOf(*sel)).c_str());
-    ImGui::PushID(showHdr ? 1 : 0);
-    DrawInspector(snap, *sel, st, showHdr, vs);
-    ImGui::PopID();
-    ImGui::PopID();
-    ImGui::EndDisabled();
-    ImGui::EndChild();
-    ImGui::SameLine(0, Px(kGutter));
-    ImGui::BeginChild("##measured", ImVec2(0, colH), ImGuiChildFlags_None);
+    // The selected node's panel, and the measured panel beside it; in a narrow window the measured panel
+    // goes under it (both fit their content and the column scrolls).
+    const ImVec2 top(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float total = ImGui::GetContentRegionAvail().x, colH = ImGui::GetContentRegionAvail().y;
+    const float measuredW = Snap(Px(kMeasuredW)), gutter = Snap(Px(kGutter));
+    const bool stacked = total - measuredW - gutter < Px(kInspectorMinW);
+    const float inspW = stacked ? total : total - measuredW - gutter;
+    BeginPanel("##inspector", st ? InspectorTitle(st->id) : "SELECT A STAGE", st ? &st->light : nullptr,
+               ImVec2(inspW, stacked ? 0.0f : colH));
+    if (st) {
+        ImGui::BeginDisabled(sel->liveIndex < 0);   // a remembered display that is not connected: view only
+        // Widget ids per display and mode: a field being typed in stays with its display and mode (it ends
+        // if either changes under it) instead of committing to whatever is shown next.
+        ImGui::PushID(Utf8(RowIdOf(*sel)).c_str());
+        ImGui::PushID(showHdr ? 1 : 0);
+        DrawInspector(snap, *sel, *st, showHdr, vs);
+        ImGui::PopID();
+        ImGui::PopID();
+        ImGui::EndDisabled();
+    }
+    EndPanel();
+    if (stacked) ImGui::Dummy(ImVec2(0, Px(kPanelGap)));
+    else ImGui::SetCursorScreenPos(ImVec2(top.x + inspW + gutter, top.y));
+    const Light measured = MeasuredLight(*sel, showHdr);
+    BeginPanel("##measured", "MEASURED", &measured, stacked ? ImVec2(total, 0.0f) : ImVec2(total - inspW - gutter, colH));
     DrawMeasured(snap, *sel, showHdr, vs);
-    ImGui::EndChild();
+    EndPanel();
     ImGui::EndChild();
 }
 
 // ---------------------------------------------------------------------------------------------
 // Settings
 
-void SettingsSpacer() { ImGui::Dummy(ImVec2(0, Px(18))); }
-
 void SettingsGeneral() {
-    SectionHeader("GENERAL", nullptr);
     RowCtx row = BeginRow("INTERFACE");
     RowTip(row, "Classic: the previous window. The tray switches too.");
     RowPlace(row);
@@ -1050,6 +1163,19 @@ void SettingsGeneral() {
     if (pick >= 0) {
         const bool classic = pick == 1;
         Post([classic]() { SetInterfaceClassic(classic); });
+    }
+    EndRow(row);
+
+    row = BeginRow("THEME");
+    RowTip(row, "Dark: Instrument. Gray: softer greys. Light: Windows 98 colours.");
+    RowPlace(row);
+    static const char* const kThemes[] = { "DARK", "GRAY", "LIGHT" };
+    const int theme = Segmented("##set_theme", kThemes, 3, (int)CurrentTheme(), 64);
+    if (theme >= 0) {
+        Post([theme]() {
+            act::SetUiTheme(theme);
+            ApplyUiTheme();
+        });
     }
     EndRow(row);
 
@@ -1069,7 +1195,6 @@ void SettingsGeneral() {
 }
 
 void SettingsEngine(const Snapshot& snap) {
-    SectionHeader("ENGINE", nullptr);
     bool v = false;
     RowCtx row = BeginRow("DWM HOOK");
     RowTip(row, "3D LUT and tone mapping inside DWM: no overlay window.\nOff: the overlay applies them.");
@@ -1115,7 +1240,6 @@ void SettingsEngine(const Snapshot& snap) {
 }
 
 void SettingsHotkeys() {
-    SectionHeader("HOTKEYS", nullptr);
     struct Hotkey { const char* label; const char* id; int hotkey; const std::atomic<bool>* on; const std::atomic<char>* key; };
     const Hotkey keys[] = {
         { "DESKTOP GAMMA", "##hk_gamma", HOTKEY_GAMMA, &g_hotkeyGammaEnabled, &g_hotkeyGammaKey },
@@ -1170,7 +1294,6 @@ bool PickFolder(HWND owner, std::wstring& path) {
 }
 
 void SettingsCalibration(const Snapshot& snap) {
-    SectionHeader("CALIBRATION", nullptr);
     RowCtx row = BeginRow("DLC CONTROL");
     RowTip(row, "Lets DLC drive DesktopLUT over a local pipe while it calibrates.");
     RowPlace(row);
@@ -1217,7 +1340,6 @@ void SettingsCalibration(const Snapshot& snap) {
 }
 
 void SettingsDiagnostics() {
-    SectionHeader("DIAGNOSTICS", nullptr);
     RowCtx row = BeginRow("CONSOLE LOG");
     RowTip(row, "A console window with the log.");
     RowPlace(row);
@@ -1227,7 +1349,6 @@ void SettingsDiagnostics() {
 }
 
 void SettingsAbout(ViewState& vs) {
-    SectionHeader("ABOUT", nullptr);
     RowCtx row = BeginRow("VERSION");
     RowText(row, DESKTOPLUT_VERSION_STR);
     EndRow(row);
@@ -1255,25 +1376,37 @@ void DrawSettingsPage(const Snapshot& snap, ViewState& vs) {
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
     ImGui::BeginChild("##settings", ImVec2(0, bodyH), ImGuiChildFlags_AlwaysUseWindowPadding);
     ImGui::PopStyleVar();
-    // Two equal columns with a double gutter between them.
+    // Two equal columns of panels, a gutter between them.
+    auto section = [](const char* id, const char* title, const std::function<void()>& body) {
+        BeginPanel(id, title, nullptr, ImVec2(0, 0));
+        body();
+        EndPanel();
+        ImGui::Dummy(ImVec2(0, Px(kPanelGap)));
+    };
+    if (ImGui::GetContentRegionAvail().x < Px(kSettingsTwoColW)) {
+        section("##s_general", "GENERAL", [] { SettingsGeneral(); });
+        section("##s_engine", "ENGINE", [&] { SettingsEngine(snap); });
+        section("##s_calib", "CALIBRATION", [&] { SettingsCalibration(snap); });
+        section("##s_hotkeys", "HOTKEYS", [] { SettingsHotkeys(); });
+        section("##s_diag", "DIAGNOSTICS", [] { SettingsDiagnostics(); });
+        section("##s_about", "ABOUT", [&] { SettingsAbout(vs); });
+        ImGui::EndChild();
+        return;
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(0, 0));
     if (ImGui::BeginTable("##settings_cols", 3, ImGuiTableFlags_None)) {
         ImGui::TableSetupColumn("left", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("gap", ImGuiTableColumnFlags_WidthFixed, Px(kGutter * 2));
+        ImGui::TableSetupColumn("gap", ImGuiTableColumnFlags_WidthFixed, Px(kGutter));
         ImGui::TableSetupColumn("right", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
-        SettingsGeneral();
-        SettingsSpacer();
-        SettingsEngine(snap);
-        SettingsSpacer();
-        SettingsHotkeys();
+        section("##s_general", "GENERAL", [] { SettingsGeneral(); });
+        section("##s_engine", "ENGINE", [&] { SettingsEngine(snap); });
+        section("##s_diag", "DIAGNOSTICS", [] { SettingsDiagnostics(); });
         ImGui::TableSetColumnIndex(2);
-        SettingsCalibration(snap);
-        SettingsSpacer();
-        SettingsDiagnostics();
-        SettingsSpacer();
-        SettingsAbout(vs);
+        section("##s_calib", "CALIBRATION", [&] { SettingsCalibration(snap); });
+        section("##s_hotkeys", "HOTKEYS", [] { SettingsHotkeys(); });
+        section("##s_about", "ABOUT", [&] { SettingsAbout(vs); });
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
@@ -1289,7 +1422,7 @@ struct LogRow {
     uint64_t ticks = 0;          // local time as FILETIME ticks (merge order)
     char time[16] = {};
     const char* level = "";
-    ImU32 levelCol = 0;
+    enum class Tone : unsigned char { Good, Alarm, Dim, Faint } tone = Tone::Dim;   // resolved per frame (themes change)
     std::string source, display, message, detail;
     std::string search;          // lower-case haystack for the text filter
 };
@@ -1351,10 +1484,10 @@ void RebuildLog(LogCache& c, const Snapshot& snap, const ViewState& vs) {
         r.ticks = Ticks(e.time);
         snprintf(r.time, sizeof(r.time), "%02u:%02u:%02u.%03u", e.time.wHour, e.time.wMinute, e.time.wSecond, e.time.wMilliseconds);
         switch (e.sev) {
-        case notify::Sev::Success: r.level = "OK"; r.levelCol = pal::Good; break;
-        case notify::Sev::Warning: r.level = "WARN"; r.levelCol = pal::Alarm; break;
-        case notify::Sev::Error: r.level = "ERROR"; r.levelCol = pal::Alarm; break;
-        default: r.level = "INFO"; r.levelCol = pal::InkDim; break;
+        case notify::Sev::Success: r.level = "OK"; r.tone = LogRow::Tone::Good; break;
+        case notify::Sev::Warning: r.level = "WARN"; r.tone = LogRow::Tone::Alarm; break;
+        case notify::Sev::Error: r.level = "ERROR"; r.tone = LogRow::Tone::Alarm; break;
+        default: r.level = "INFO"; r.tone = LogRow::Tone::Dim; break;
         }
         r.source = Utf8(e.source);
         for (char& ch : r.source) ch = (char)toupper((unsigned char)ch);
@@ -1377,7 +1510,7 @@ void RebuildLog(LogCache& c, const Snapshot& snap, const ViewState& vs) {
             r.ticks = Ticks(l.time);
             snprintf(r.time, sizeof(r.time), "%02u:%02u:%02u.%03u", l.time.wHour, l.time.wMinute, l.time.wSecond, l.time.wMilliseconds);
             r.level = l.err ? "ERR" : "LOG";
-            r.levelCol = l.err ? pal::InkDim : pal::InkFaint;
+            r.tone = l.err ? LogRow::Tone::Dim : LogRow::Tone::Faint;
             SplitTag(l.text, r.source, r.message);
             c.rows.push_back(std::move(r));
         }
@@ -1404,33 +1537,35 @@ void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
     // Toolbar: what, how severe, which display, text filter; copy and clear at the right end.
     LogView& lv = vs.log;
     {
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        const float w = ImGui::GetContentRegionAvail().x, h = Px(28), cy = p.y + h * 0.5f;
-        ImGui::SetCursorScreenPos(ImVec2(p.x, cy - Px(12)));
+        const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+        const float w = ImGui::GetContentRegionAvail().x, h = Snap(Px(28));
+        const float y = Snap(p.y + (h - Snap(Px(kControlH))) * 0.5f);
+        float x = p.x;
+        auto next = [&]() { x = ImGui::GetItemRectMax().x + Px(16); ImGui::SetCursorScreenPos(ImVec2(Snap(x), y)); };
+        ImGui::SetCursorScreenPos(ImVec2(x, y));
         static const char* const kWhat[] = { "EVENTS", "ALL OUTPUT" };
         const int what = Segmented("##log_what", kWhat, 2, lv.allOutput ? 1 : 0, 92);
         if (what >= 0) lv.allOutput = what == 1;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("All output: the diagnostic log too (what the console shows).");
-        ImGui::SameLine(0, Px(16));
+        if (ImGui::IsMouseHoveringRect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax()) && ImGui::IsWindowHovered())
+            ImGui::SetTooltip("All output: the diagnostic log too (what the console shows).");
+        next();
         static const char* const kSev[] = { "ALL", "WARNINGS" };
         const int sev = Segmented("##log_sev", kSev, 2, lv.warningsOnly ? 1 : 0, 72);
         if (sev >= 0) lv.warningsOnly = sev == 1;
-        ImGui::SameLine(0, Px(16));
+        next();
         std::string current = "ALL DISPLAYS";
         for (const DisplayRow& d : snap.live) if (d.liveIndex == lv.display) current = Utf8(d.name);
-        ImGui::SetNextItemWidth(Px(170));
-        if (ImGui::BeginCombo("##log_disp", current.c_str())) {
-            if (ImGui::Selectable("ALL DISPLAYS", lv.display < 0)) lv.display = -1;
+        if (BeginDropdown("##log_disp", current.c_str(), 170)) {
+            if (DropdownItem("ALL DISPLAYS", lv.display < 0)) lv.display = -1;
             for (const DisplayRow& d : snap.live)
-                if (ImGui::Selectable(Utf8(d.name).c_str(), lv.display == d.liveIndex)) lv.display = d.liveIndex;
-            ImGui::EndCombo();
+                if (DropdownItem(Utf8(d.name).c_str(), lv.display == d.liveIndex)) lv.display = d.liveIndex;
+            EndDropdown();
         }
-        ImGui::SameLine(0, Px(16));
-        ImGui::SetNextItemWidth(Px(200));
-        ImGui::InputTextWithHint("##log_filter", "FILTER", lv.filter, sizeof(lv.filter));
+        next();
+        TextField("##log_filter", "FILTER", lv.filter, sizeof(lv.filter), 200);
 
         const float bw = 72.0f;
-        ImGui::SetCursorScreenPos(ImVec2(p.x + w - Px(bw * 2 + 8), cy - Px(12)));
+        ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Px(bw * 2 + 8)), y));
         if (Button("##log_copy", "COPY", bw)) {
             std::string all;
             for (const LogRow& r : cache.rows) all += LogLineText(r) + "\r\n";
@@ -1457,13 +1592,28 @@ void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
         cache.filterKey = filterKey;
     }
 
+    // The log sits in a panel surface (Light: a sunken white list).
+    const ImVec2 la(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const ImVec2 lb(la.x + ImGui::GetContentRegionAvail().x, la.y + ImGui::GetContentRegionAvail().y);
+    const bool list = Shape().bevel;
+    float inset = 1.0f;
+    if (list) {
+        ImGui::GetWindowDrawList()->AddRectFilled(la, lb, Col(pal::Field));
+        Bevel(ImGui::GetWindowDrawList(), la, lb, BevelKind::Sunken);
+        inset = 2.0f * BevelPx();
+    } else {
+        const float r = Snap(Px(Shape().panelRounding));
+        ImGui::GetWindowDrawList()->AddRectFilled(la, lb, Col(pal::Panel), r);
+        ImGui::GetWindowDrawList()->AddRect(la, lb, Col(pal::PanelEdge), r);
+    }
+    ImGui::SetCursorScreenPos(ImVec2(la.x + inset, la.y + inset));
+
     const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit |
                                   ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_Resizable;
     ImGui::PushStyleColor(ImGuiCol_TableRowBg, IM_COL32(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_TableRowBgAlt, IM_COL32(255, 255, 255, 6));
-    ImGui::PushStyleColor(ImGuiCol_TableBorderLight, pal::Rule);
+    ImGui::PushStyleColor(ImGuiCol_TableBorderLight, list ? pal::BevelLight : pal::Rule);
     ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(Px(8), Px(3)));
-    if (ImGui::BeginTable("##log", 5, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) {
+    if (ImGui::BeginTable("##log", 5, flags, ImVec2(lb.x - la.x - 2 * inset, lb.y - la.y - 2 * inset))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("TIME", ImGuiTableColumnFlags_WidthFixed, Px(96));
         ImGui::TableSetupColumn("LEVEL", ImGuiTableColumnFlags_WidthFixed, Px(52));
@@ -1489,29 +1639,37 @@ void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
                 const bool selected = lv.selectedKey == r.key;
                 if (ImGui::Selectable("##row", selected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
                     lv.selectedKey = selected ? 0 : r.key;
+                ImGui::PushStyleColor(ImGuiCol_PopupBg, pal::Menu);
                 if (ImGui::BeginPopupContextItem("##rowmenu")) {
-                    if (ImGui::Selectable("COPY LINE")) ImGui::SetClipboardText(LogLineText(r).c_str());
+                    if (DropdownItem("COPY LINE", false)) ImGui::SetClipboardText(LogLineText(r).c_str());
                     ImGui::EndPopup();
                 }
+                ImGui::PopStyleColor();
+                // On the selection fill (navy in Light) every cell takes the selection's ink.
+                auto ink = [&](ImU32 c) { return selected ? pal::ListSelInk : c; };
                 ImGui::SameLine(0, 0);
-                ImGui::PushStyleColor(ImGuiCol_Text, pal::InkFaint);
+                ImGui::PushStyleColor(ImGuiCol_Text, ink(pal::InkFaint));
                 ImGui::TextUnformatted(r.time);
                 ImGui::PopStyleColor();
                 ImGui::TableSetColumnIndex(1);
-                ImGui::PushStyleColor(ImGuiCol_Text, r.levelCol);
+                const ImU32 levelCol = r.tone == LogRow::Tone::Good ? pal::Good : r.tone == LogRow::Tone::Alarm ? pal::Alarm
+                                       : r.tone == LogRow::Tone::Dim ? pal::InkDim : pal::InkFaint;
+                ImGui::PushStyleColor(ImGuiCol_Text, ink(levelCol));
                 ImGui::TextUnformatted(r.level);
                 ImGui::PopStyleColor();
                 ImGui::TableSetColumnIndex(2);
-                ImGui::PushStyleColor(ImGuiCol_Text, pal::InkDim);
+                ImGui::PushStyleColor(ImGuiCol_Text, ink(pal::InkDim));
                 ImGui::TextUnformatted(r.source.c_str());
                 ImGui::TableSetColumnIndex(3);
                 ImGui::TextUnformatted(r.display.c_str());
                 ImGui::PopStyleColor();
                 ImGui::TableSetColumnIndex(4);
+                ImGui::PushStyleColor(ImGuiCol_Text, ink(pal::Ink));
                 ImGui::TextUnformatted(r.message.c_str());
+                ImGui::PopStyleColor();
                 if (!r.detail.empty()) {
                     ImGui::SameLine(0, Px(10));
-                    ImGui::PushStyleColor(ImGuiCol_Text, pal::InkFaint);
+                    ImGui::PushStyleColor(ImGuiCol_Text, ink(pal::InkFaint));
                     ImGui::TextUnformatted(r.detail.c_str());
                     ImGui::PopStyleColor();
                 }
@@ -1535,10 +1693,12 @@ void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
         ImGui::EndTable();
     }
     ImGui::PopStyleVar();
-    ImGui::PopStyleColor(3);
+    ImGui::PopStyleColor(2);
     ImGui::EndChild();
 }
 
+// A confirmation: the title, one line, the action (the default button) and CANCEL. In Light it is a
+// Windows 98 dialog: a raised frame and a navy caption carrying the title.
 void DrawConfirm(ViewState& vs) {
     if (vs.confirmOpenRequested) {
         ImGui::OpenPopup("##confirm");
@@ -1547,26 +1707,47 @@ void DrawConfirm(ViewState& vs) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(vp->WorkPos.x + vp->WorkSize.x * 0.5f, vp->WorkPos.y + vp->WorkSize.y * 0.4f),
                             ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    const bool bevel = Shape().bevel;
+    const float captionH = Snap(Px(22));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, bevel ? pal::Ground : pal::Panel);
+    ImGui::PushStyleColor(ImGuiCol_Border, bevel ? pal::BevelDark : pal::PanelEdge);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
-    if (ImGui::BeginPopupModal("##confirm", nullptr,
-                               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, bevel ? 0.0f : 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, Px(Shape().panelRounding));
+    const bool open = ImGui::BeginPopupModal("##confirm", nullptr,
+                                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove);
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(2);
+    if (!open) return;
+    if (bevel) {
+        const ImVec2 a = ImGui::GetWindowPos(), s = ImGui::GetWindowSize(), b(a.x + s.x, a.y + s.y);
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->PushClipRect(a, b, false);
+        Bevel(dl, a, b, BevelKind::Raised);
+        const float t = BevelPx();
+        const ImVec2 ca(a.x + 3 * t, a.y + 3 * t), cb(b.x - 3 * t, a.y + 3 * t + captionH);
+        dl->AddRectFilledMultiColor(ca, cb, Col(pal::Strong), Col(IM_COL32(0x10, 0x84, 0xd0, 0xff)),
+                                    Col(IM_COL32(0x10, 0x84, 0xd0, 0xff)), Col(pal::Strong));
+        DrawText(dl, Font::Label, kSizeLabel, ca.x + Px(6), (ca.y + cb.y) * 0.5f, pal::StrongInk, vs.confirm.title.c_str());
+        dl->PopClipRect();
+        ImGui::Dummy(ImVec2(MeasureInk(Font::Label, kSizeLabel, vs.confirm.title.c_str()).advance + Px(24), captionH - Px(6)));
+    } else {
         Text(Font::Label, 13.0f, pal::Ink, vs.confirm.title.c_str());
         ImGui::Dummy(ImVec2(0, Px(4)));
-        ImGui::TextUnformatted(vs.confirm.detail.c_str());
-        ImGui::Dummy(ImVec2(0, Px(12)));
-        if (Toggle("##confirm_yes", vs.confirm.action.c_str(), true, ImVec2(kButtonW, 28))) {
-            if (vs.confirm.onConfirm) Post(vs.confirm.onConfirm);
-            vs.confirm = {};
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine(0, Px(8));
-        if (Toggle("##confirm_no", "CANCEL", false, ImVec2(kButtonW, 28)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            vs.confirm = {};
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
     }
-    ImGui::PopStyleVar();
+    ImGui::TextUnformatted(vs.confirm.detail.c_str());
+    ImGui::Dummy(ImVec2(0, Px(14)));
+    if (PushButton("##confirm_yes", vs.confirm.action.c_str(), kButtonW, 26, true)) {
+        if (vs.confirm.onConfirm) Post(vs.confirm.onConfirm);
+        vs.confirm = {};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::SameLine(0, Px(8));
+    if (PushButton("##confirm_no", "CANCEL", kButtonW, 26) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+        vs.confirm = {};
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
 }
 
 }  // namespace

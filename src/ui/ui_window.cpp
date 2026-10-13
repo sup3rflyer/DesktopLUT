@@ -37,7 +37,7 @@ constexpr UINT_PTR kDlcTimer = 4;       // re-read the DLC folder while visible
 constexpr UINT_PTR kDeviceRetryTimer = 5;   // rebuild the device after a loss, with backoff
 constexpr UINT kSettleMs = 16, kAnimMs = 33, kReleaseMs = 30000, kDlcMs = 60000;
 constexpr int kSettleFrames = 3;
-constexpr float kDefaultW = 1180.0f, kDefaultH = 760.0f, kMinW = 820.0f, kMinH = 520.0f;
+constexpr float kDefaultW = 1180.0f, kDefaultH = 760.0f, kMinW = 920.0f, kMinH = 520.0f;
 
 HWND g_hwnd = nullptr;
 std::atomic<HWND> g_hwndForPost{nullptr};
@@ -76,6 +76,17 @@ float WindowDpiScale(HWND h) {
     return dpi ? (float)dpi / 96.0f : 1.0f;
 }
 
+// The window frame follows the theme: caption colour, caption text, light or dark caption buttons.
+void ApplyCaption() {
+    if (!g_hwnd) return;
+    const CaptionColours c = Caption();
+    BOOL dark = c.dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    COLORREF caption = c.caption, text = c.text;
+    DwmSetWindowAttribute(g_hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+    DwmSetWindowAttribute(g_hwnd, 36 /* DWMWA_TEXT_COLOR */, &text, sizeof(text));
+}
+
 void ReleaseImGui() {
     StopAnimTimer();
     if (!g_imguiReady) return;
@@ -98,6 +109,7 @@ bool EnsureImGui() {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     LoadFonts();
     g_dpiScale = WindowDpiScale(g_hwnd);
+    ApplyTheme(ThemeFromIndex(g_uiTheme));
     ApplyStyle(g_dpiScale);
     if (!ImGui_ImplWin32_Init(g_hwnd) || !ImGui_ImplDX11_Init(g_present.Device(), g_present.Context())) {
         ImGui::DestroyContext();
@@ -312,11 +324,9 @@ bool CreateUiWindow() {
                              (int)kDefaultW, (int)kDefaultH, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return false;
 
-    // Dark caption to match the ground colour (Windows 11 colour attribute; harmless where unsupported).
-    BOOL dark = TRUE;
-    DwmSetWindowAttribute(g_hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
-    COLORREF caption = RGB(0x0b, 0x0b, 0x0c);
-    DwmSetWindowAttribute(g_hwnd, 35 /* DWMWA_CAPTION_COLOR */, &caption, sizeof(caption));
+    // Caption colours from the theme (Windows 11 colour attributes; harmless where unsupported).
+    ApplyTheme(ThemeFromIndex(g_uiTheme));
+    ApplyCaption();
     // The header draws the logo and name; the caption's own icon and title would repeat them. The
     // taskbar and Alt+Tab keep the class icon and window text.
     WTA_OPTIONS nc = { WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON, WTNCA_NODRAWCAPTION | WTNCA_NODRAWICON };
@@ -420,6 +430,13 @@ std::wstring DlcFolder() {
 }
 
 void RequestDlcScan() { dlc::RequestScan(DlcFolder()); }
+
+void ApplyUiTheme() {
+    ApplyTheme(ThemeFromIndex(g_uiTheme));
+    if (g_imguiReady) ApplyStyle(g_dpiScale);
+    ApplyCaption();
+    Invalidate();
+}
 
 void SetLogRedraws(bool on) { g_logRedraws.store(on, std::memory_order_relaxed); }
 

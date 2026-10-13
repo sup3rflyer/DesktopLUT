@@ -73,6 +73,7 @@ void SetRunAtStartup(bool on);
 void SetConsoleLog(bool on);
 void SetVrrWhitelistEnabled(bool on);
 void SetDlcFolder(const std::wstring& folder);   // empty = detect next to DesktopLUT
+void SetUiTheme(int theme);                     // 0 dark, 1 gray, 2 light (the interface applies it)
 void SetRecalReminderDays(int days);             // 0 = off
 
 // ---- Live layers -----------------------------------------------------------------------------------

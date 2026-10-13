@@ -984,6 +984,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
     WritePrivateProfileStringW(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
     WritePrivateProfileStringW(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
+    static const wchar_t* const kThemeKeys[] = { L"dark", L"gray", L"light" };
+    WritePrivateProfileStringW(L"UI", L"Theme", kThemeKeys[g_uiTheme >= 0 && g_uiTheme <= 2 ? g_uiTheme : 0], iniPath.c_str());
 
     WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
 
@@ -1070,6 +1072,9 @@ bool LoadSettings() {
         g_dlcFolder = ReadLongINIString(L"UI", L"DlcFolder", iniPath.c_str());
         const int days = (int)GetPrivateProfileIntW(L"UI", L"RecalReminderDays", 90, iniPath.c_str());
         g_recalReminderDays = days >= 0 && days <= 3650 ? days : 90;
+        buf[0] = 0;
+        GetPrivateProfileStringW(L"UI", L"Theme", L"dark", buf, MAX_PATH, iniPath.c_str());
+        g_uiTheme = _wcsicmp(buf, L"gray") == 0 ? 1 : (_wcsicmp(buf, L"light") == 0 ? 2 : 0);   // unknown -> dark
     }
 
     // Per-display settings: read every saved display into the parked pool, then attach

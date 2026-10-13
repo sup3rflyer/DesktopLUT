@@ -977,6 +977,21 @@ TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, roun
     WritePrivateProfileStringW(L"UI", L"RecalReminderDays", L"-5", ini);
     LoadSettings();
     CHECK(g_recalReminderDays == 90);                   // nonsense -> the default
+    CHECK(g_uiTheme == 0);                              // absent -> dark
+    wchar_t buf0[MAX_PATH] = {};
+    g_uiTheme = 2;
+    SaveSettings();
+    GetPrivateProfileStringW(L"UI", L"Theme", L"", buf0, MAX_PATH, ini);
+    CHECK(std::wstring(buf0) == L"light");
+    g_uiTheme = 0;
+    LoadSettings();
+    CHECK(g_uiTheme == 2);
+    WritePrivateProfileStringW(L"UI", L"Theme", L"GRAY", ini);
+    LoadSettings();
+    CHECK(g_uiTheme == 1);                              // case-insensitive
+    WritePrivateProfileStringW(L"UI", L"Theme", L"sepia", ini);
+    LoadSettings();
+    CHECK(g_uiTheme == 0);                              // unknown -> dark
     g_uiClassic = true;
     g_dlcFolder = L"D:\\Calibration\\DLC";
     SaveSettings();

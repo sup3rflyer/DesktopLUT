@@ -590,6 +590,11 @@ void SetDlcFolder(const std::wstring& folder) {
     SaveSettings();
 }
 
+void SetUiTheme(int theme) {
+    g_uiTheme = theme >= 0 && theme <= 2 ? theme : 0;
+    SaveSettings();
+}
+
 void SetRecalReminderDays(int days) {
     g_recalReminderDays = days < 0 ? 0 : (days > 3650 ? 3650 : days);
     SaveSettings();

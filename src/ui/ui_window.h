@@ -29,5 +29,6 @@ void NotifyDisplayChanged();    // GUI thread: displays or colour modes changed;
 std::wstring DlcFolder();       // GUI thread: the DLC folder in use (configured, else detected); "" none
 void RequestDlcScan();          // GUI thread: re-read the DLC folder (off-thread; redraws when done)
 void SetLogRedraws(bool on);    // a diagnostic line redraws the interface (the log view is showing)
+void ApplyUiTheme();            // GUI thread, outside a frame: g_uiTheme changed; re-theme the window
 
 }  // namespace ui

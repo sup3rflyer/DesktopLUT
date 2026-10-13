@@ -1,6 +1,12 @@
 #pragma once
-// Instrument-style building blocks on top of ImGui: inverted toggles, caps labels, mono readouts,
-// status lights, the colour-cube logo. Sizes are in DIPs and scaled by the current DPI.
+// Building blocks on top of ImGui, one per kind of control (see ui_theme.h for the grammar): tabs,
+// pixel-path nodes, segments, buttons, the live-layers switch, fields, panels, status lights. Each
+// draws in the current theme. Sizes are in DIPs unless a name says Px; colours go through Col() so a
+// disabled block (ImGui::BeginDisabled) fades like ImGui's own widgets.
+//
+// Text is placed by its ink, not its line box: CalcTextSize's box includes the font's descender and
+// side bearings, which leaves caps visibly off-centre in a button. Labels are centred on the cap
+// height (digits share it) and horizontally on their glyph extents.
 
 #include "imgui.h"
 #include "ui_model.h"
@@ -9,33 +15,78 @@
 
 namespace ui {
 
+constexpr float kControlH = 24.0f;   // buttons, segments, fields
+
 float Dpi();                         // current DPI scale (style.FontScaleDpi)
 inline float Px(float dip) { return dip * Dpi(); }
+inline float Snap(float px) { return (float)(int)(px + 0.5f); }   // whole pixel (positive coordinates)
+
+// A palette colour with the current style alpha (fades inside BeginDisabled).
+ImU32 Col(ImU32 c);
 
 std::string Utf8(const std::wstring& w);
 
-// Text in a given font and base size (DIPs).
+// ---- Text ----------------------------------------------------------------------------------------
+
+// Text laid out by ImGui (it takes layout space), in a given font and base size (DIPs).
 void Text(Font f, float sizeDip, ImU32 col, const char* text);
 inline void Label(const char* caps, ImU32 col = pal::InkDim) { Text(Font::Label, kSizeLabel, col, caps); }
 inline void Mono(const char* s, ImU32 col = pal::Ink) { Text(Font::Mono, kSizeMono, col, s); }
-ImVec2 MeasureText(Font f, float sizeDip, const char* text);
+ImVec2 MeasureText(Font f, float sizeDip, const char* text);   // the advance box (layout width)
 
-// A rectangular button: outlined, filled white with dark text when `selected` (the Instrument
-// selection), dashed outline when `dashed`, faint text when `dimmed`. Returns true when clicked.
-bool Toggle(const char* id, const char* label, bool selected, ImVec2 sizeDip,
-            bool dashed = false, bool dimmed = false, Font font = Font::Label);
+// Where a string's glyphs are, in pixels from its pen position (the line's top-left).
+struct InkBox {
+    float left = 0, right = 0;        // horizontal ink extent
+    float capTop = 0, baseline = 0;   // the cap height band ('H')
+    float advance = 0;                // layout width
+};
+InkBox MeasureInk(Font f, float sizeDip, const char* text);
 
-// Plain outlined button.
-inline bool Button(const char* id, const char* label, float widthDip, float heightDip = 24.0f) {
-    return Toggle(id, label, false, ImVec2(widthDip, heightDip));
+// Text with its pen at x and its cap height centred on cy (no layout). Returns the advance width.
+float DrawText(ImDrawList* dl, Font f, float sizeDip, float x, float cy, ImU32 col, const char* text);
+// Text centred in the box a-b: ink extent horizontally, cap height vertically (no layout).
+void DrawTextIn(ImDrawList* dl, Font f, float sizeDip, ImVec2 a, ImVec2 b, ImU32 col, const char* text);
+
+// ---- Shapes --------------------------------------------------------------------------------------
+
+float BevelPx();   // one bevel line: 1 px, 2 px from 175 % scaling
+// Windows 98 bevel inside a-b: raised (button), pressed (a button held or toggled in), sunken (a field).
+enum class BevelKind { Raised, Pressed, Sunken, Etched };
+void Bevel(ImDrawList* dl, ImVec2 a, ImVec2 b, BevelKind kind);
+void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap);
+// A status light centred at c. `onStrong`: drawn on the Strong (or list-selection) fill, in its ink.
+void DrawLight(ImDrawList* dl, ImVec2 c, Light l, float diameterPx, ImU32 inkOverride = 0);
+// Full-width hairline at the cursor.
+void Hairline(ImU32 col = pal::Rule);
+
+// ---- Controls ------------------------------------------------------------------------------------
+
+// An action. `primary`: the one default action of a dialog (the strongest fill).
+bool PushButton(const char* id, const char* label, float widthDip, float heightDip = kControlH, bool primary = false);
+inline bool Button(const char* id, const char* label, float widthDip, float heightDip = kControlH) {
+    return PushButton(id, label, widthDip, heightDip);
 }
 
+// One-of-n values: equal segments sized to the widest label (at least minSegWidthDip) and shrunk to fit
+// the line. `dots` (optional, per segment, 0 = none) draws a coloured light before a label. Returns the
+// newly picked index, or -1.
+int Segmented(const char* id, const char* const* labels, int count, int current, float minSegWidthDip,
+              const ImU32* dots = nullptr);
 // ON | OFF pair. Returns true when the user picked the other state (written to *out).
-bool OnOff(const char* id, bool value, bool* out, const char* onLabel = "ON", const char* offLabel = "OFF");
+bool OnOff(const char* id, bool value, bool* out, const char* onLabel = "ON", const char* offLabel = "OFF",
+           float minSegWidthDip = 52.0f);
 
-// One-of-n row of equal-width toggles, sized to the widest label (at least minSegWidthDip) and shrunk to
-// fit the space left on the line. Returns the newly picked index, or -1.
-int Segmented(const char* id, const char* const* labels, int count, int current, float minSegWidthDip);
+// A page tab in the header, in the rect a-b (pixels). Returns true when clicked.
+bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b);
+float TabWidth(const char* label);   // pixels
+
+// A pixel-path stage on the signal line: its light, its label; `off` = not doing anything (dashed).
+// `showLight` = false leaves the light out (a narrow window).
+bool Node(const char* id, const char* label, Light light, bool selected, bool off, ImVec2 sizeDip, bool showLight = true);
+
+// The live-layers switch (a check box in Light). Draws at the cursor; returns true when clicked.
+bool Switch(const char* id, const char* label, bool on);
+float SwitchWidth(const char* label);   // pixels
 
 // Number field in mono. Edits a draft; returns true only when the field is left (Enter, Tab, click
 // elsewhere) with a changed value, written to *v. Never commits a half-typed value.
@@ -43,15 +94,22 @@ int Segmented(const char* id, const char* const* labels, int count, int current,
 bool NumberInput(const char* id, float* v, const char* fmt, float widthDip);
 int FormatDecimals(const char* fmt);   // "%.4f" -> 4, "%.0f" -> 0, "%f" -> 6
 
-// Light for a layer state: filled = configured/verified, ring = off, amber triangle = fault.
-void StatusLight(Light l, float diameterDip = 7.0f);
+// A one-line text field (hint shown while empty). Returns true while it changed this frame.
+bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip);
 
-// Full-width hairline at the cursor.
-void Hairline(ImU32 col = pal::Rule);
+// A drop-down list: the field shows `preview`; while open, add DropdownItem rows and call EndDropdown.
+bool BeginDropdown(const char* id, const char* preview, float widthDip);
+bool DropdownItem(const char* label, bool selected);
+void EndDropdown();
+
+// ---- Panels --------------------------------------------------------------------------------------
+
+// A titled surface. sizePx.x <= 0: the space left on the line; sizePx.y <= 0: fits its content (no
+// scrolling). The content is a child window with its own padding; nest rows in it as anywhere else.
+void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 sizePx);
+void EndPanel();
 
 // The RGB-cube logo, per-corner colours (the only saturated chrome: a quick wide-gamut tell).
 void DrawCubeLogo(ImDrawList* dl, ImVec2 center, float halfSize);
-
-void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap);
 
 }  // namespace ui

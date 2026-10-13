@@ -161,6 +161,7 @@
     <ClCompile Include="tests\test_lut_canonical.cpp" />
     <ClCompile Include="tests\test_notify.cpp" />
     <ClCompile Include="tests\test_ui_model.cpp" />
+    <ClCompile Include="tests\test_ui_shots.cpp" />
     <ClCompile Include="tests\test_reconcile.cpp" />
     <ClCompile Include="tests\test_dlc.cpp" />
     <ClCompile Include="dwm_hook\hook_lut.cpp">
