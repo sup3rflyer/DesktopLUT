@@ -407,9 +407,9 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs) {
     const bool onSel = selected && list;
     const ImU32 ink = onSel ? pal::ListSelInk : (live ? pal::Ink : pal::InkFaint);
     const ImU32 dim = onSel ? pal::ListSelInk : pal::InkDim;
-    const bool cards = Shape().cardSidebar;   // rounded cards (Gray)
+    const bool cards = Shape().cardSidebar;   // cards (Gray)
     if (cards) {
-        const float m = Snap(Px(10)), gy = Snap(Px(3)), rr = Snap(Px(8));
+        const float m = Snap(Px(10)), gy = Snap(Px(3)), rr = Snap(Px(Shape().panelRounding));
         const ImVec2 ca(p.x + m, p.y + gy), cb(p.x + w - m, p.y + h - gy);
         dl->AddRectFilled(ca, cb, Col(selected ? pal::ListSel : (hovered ? pal::Hover : pal::Panel)), rr);
         dl->AddRect(ca, cb, Col(selected ? pal::Accent : pal::PanelEdge), rr);
@@ -478,7 +478,7 @@ void DrawSidebar(const Snapshot& snap, ViewState& vs, const DisplayRow* sel) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Pixel path: the stages as nodes on the signal line, from the desktop to the panel (Gray: in a rounded
+// Pixel path: the stages as nodes on the signal line, from the desktop to the panel (Gray: in a
 // strip, chevrons between the stages).
 
 void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {

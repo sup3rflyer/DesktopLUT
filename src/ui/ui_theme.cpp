@@ -87,27 +87,28 @@ struct ThemeDef {
     CaptionColours caption;
 };
 
-// Dark: the Instrument palette. Achromatic chrome; the selected node is the one inverted block.
+// Dark: the Instrument palette on pure black (the ground, recessed tracks and fields). Achromatic chrome;
+// the selected node is the one inverted block.
 const ThemeDef kDark = {
-    Hex(0x0b0b0c), Hex(0x141415), Hex(0x1c1c1e), Hex(0x262626), Hex(0x4a4a4a),
+    Hex(0x000000), Hex(0x0e0e0f), Hex(0x161618), Hex(0x1e1e1e), Hex(0x424242),
     Hex(0xe6e6e6), Hex(0x9b9b9b), Hex(0x808080), Hex(0xe3a54a), Hex(0x2fa36b),
     Hex(0xd4504c), Hex(0x86cc8a), Hex(0x5f93ea),
-    /* panel   */ Hex(0x121214), Hex(0x252528),
-    /* control */ Hex(0x1e1e21), Hex(0x2a2a2e), Hex(0x404045),
-    /* track   */ Hex(0x0b0b0c), Hex(0x2a2a2d), Hex(0x343438), Hex(0xe6e6e6), Hex(0x4c4c52),
-    /* strong  */ Hex(0xe6e6e6), Hex(0x0b0b0c), Hex(0xe6e6e6),
-    /* list    */ Hex(0x18181a), Hex(0xe6e6e6), Hex(0xe6e6e6),
-    /* field   */ Hex(0x0b0b0c), Hex(0x36363a),
-    /* menu    */ Hex(0x18181a), Hex(0x18181a), Hex(0x36363a),
+    /* panel   */ Hex(0x0a0a0b), Hex(0x1f1f22),
+    /* control */ Hex(0x161618), Hex(0x222225), Hex(0x38383c),
+    /* track   */ Hex(0x000000), Hex(0x232326), Hex(0x2b2b2f), Hex(0xe6e6e6), Hex(0x444449),
+    /* strong  */ Hex(0xe6e6e6), Hex(0x000000), Hex(0xe6e6e6),
+    /* list    */ Hex(0x111113), Hex(0xe6e6e6), Hex(0xe6e6e6),
+    /* field   */ Hex(0x000000), Hex(0x2e2e32),
+    /* menu    */ Hex(0x111113), Hex(0x111113), Hex(0x2e2e32),
     /* bevel   */ kNone, kNone, kNone, kNone,
     /* lights  */ Hex(0xe6e6e6), Hex(0x2fa36b), Hex(0xe6e6e6),
-    /* imgui   */ Hex(0x808080), kNone, Hex(0x2e2e30), Hex(0x3c3c3e), Hex(0x9b9b9b), Hex(0xffffff, 0x06),
-                  Hex(0x3a3a3c), Hex(0x000000, 0x99),
-    { 2.0f, 3.0f, false, false, false, false, false, false, false },
-    { RGB(0x0b, 0x0b, 0x0c), RGB(0xe6, 0xe6, 0xe6), true },
+    /* imgui   */ Hex(0x808080), kNone, Hex(0x262628), Hex(0x343436), Hex(0x9b9b9b), Hex(0xffffff, 0x06),
+                  Hex(0x333335), Hex(0x000000, 0x99),
+    { 2.0f, 0.0f, false, false, false, false, false, false, false },
+    { RGB(0x00, 0x00, 0x00), RGB(0xe6, 0xe6, 0xe6), true },
 };
 
-// Gray: the Rev1 mock-up. Softer greys, rounder shapes, one quiet blue for selection.
+// Gray: the Rev1 mock-up. Softer greys, rounder controls, one quiet blue for selection.
 const ThemeDef kGray = {
     Hex(0x161618), Hex(0x1b1b1e), Hex(0x222226), Hex(0x2c2c31), Hex(0x55555c),
     Hex(0xececee), Hex(0xa6a6ad), Hex(0x8b8b93), Hex(0xe3a54a), Hex(0x2fa36b),
@@ -123,7 +124,7 @@ const ThemeDef kGray = {
     /* lights  */ Hex(0x7aa7d9), Hex(0x7aa7d9), Hex(0x161618),
     /* imgui   */ Hex(0x8b8b93), kNone, Hex(0x34343a), Hex(0x44444b), Hex(0xa6a6ad), Hex(0xffffff, 0x05),
                   Hex(0x3d4d60), Hex(0x000000, 0x99),
-    { 6.0f, 10.0f, false, false, false, false, false, true, true },
+    { 6.0f, 0.0f, false, false, false, false, false, true, true },
     { RGB(0x16, 0x16, 0x18), RGB(0xec, 0xec, 0xee), true },
 };
 
@@ -254,7 +255,7 @@ void ApplyMetrics(ImGuiStyle& s) {
     s.WindowBorderSize  = 0.0f;
     s.ChildRounding     = 0.0f;
     s.ChildBorderSize   = 0.0f;   // panels draw their own frame
-    s.PopupRounding     = sh.controlRounding;
+    s.PopupRounding     = sh.panelRounding;     // tooltips and drop-down lists are boxes
     s.PopupBorderSize   = 1.0f;
     s.FramePadding      = ImVec2(8, 5);
     s.FrameRounding     = sh.controlRounding;

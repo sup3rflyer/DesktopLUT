@@ -61,14 +61,14 @@ namespace pal {
 // Shape rules of the current theme.
 struct ThemeShape {
     float controlRounding;   // DIPs: buttons, segments, fields, nodes
-    float panelRounding;     // DIPs: panels
+    float panelRounding;     // DIPs: boxes (panels, cards, the path strip, popups); 0 = square in every theme
     bool bevel;              // Windows 98 bevels instead of flat outlines
     bool groupBoxPanels;     // panels as etched group boxes, titled in the frame (Light)
     bool sheetTabs;          // page tabs as property-sheet tabs (Light)
     bool checkboxSwitch;     // the live-layers switch as a check box (Light)
     bool sunkenSidebar;      // the display list in a sunken white list box (Light)
-    bool cardSidebar;        // the display list as rounded cards (Gray)
-    bool pathStrip;          // the pixel path in a rounded strip, chevrons between stages (Gray)
+    bool cardSidebar;        // the display list as cards (Gray)
+    bool pathStrip;          // the pixel path in a strip, chevrons between stages (Gray)
 };
 
 ThemeId CurrentTheme();
