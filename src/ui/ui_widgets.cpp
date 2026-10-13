@@ -176,7 +176,57 @@ void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float
     }
 }
 
+namespace {
+
+// A check mark centred at c, `s` wide (the Windows 98 check box's mark, bolder at small sizes).
+void CheckMark(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const ImVec2 pts[3] = { ImVec2(c.x - s * 0.45f, c.y - s * 0.02f), ImVec2(c.x - s * 0.12f, c.y + s * 0.32f),
+                            ImVec2(c.x + s * 0.47f, c.y - s * 0.36f) };
+    dl->AddPolyline(pts, 3, col, Px(2.0f));
+}
+
+// Windows 98 status symbols: a check (runs), an embossed grey check (switched off: the disabled look), the
+// yellow warning triangle with "!" (fault).
+void DrawLight98(ImDrawList* dl, ImVec2 c, Light l, float d, ImU32 inkOverride) {
+    const float s = d * 1.45f;
+    switch (l) {
+    case Light::Verified:
+    case Light::Configured:
+        CheckMark(dl, c, s, Col(inkOverride ? inkOverride : pal::Ink));
+        break;
+    case Light::Off:
+    case Light::Pending:
+        CheckMark(dl, ImVec2(c.x + 1.0f, c.y + 1.0f), s, Col(pal::BevelHi));   // the emboss
+        CheckMark(dl, c, s, Col(pal::BevelShadow));
+        break;
+    case Light::Fault: {
+        const float hw = s * 0.62f, top = c.y - s * 0.6f, bottom = c.y + s * 0.5f;
+        const ImVec2 a(c.x, top), b(c.x + hw, bottom), e(c.x - hw, bottom);
+        dl->AddTriangleFilled(a, b, e, Col(IM_COL32(0xff, 0xff, 0x00, 0xff)));
+        dl->AddTriangle(a, b, e, Col(pal::BevelDark), 1.0f);
+        const float bw = Snap(Px(1.0f)) > 1.0f ? Snap(Px(1.0f)) : 1.0f;   // the "!"
+        const float x0 = Snap(c.x - bw * 0.5f);
+        dl->AddRectFilled(ImVec2(x0, Snap(top + (bottom - top) * 0.32f)), ImVec2(x0 + bw, Snap(top + (bottom - top) * 0.68f)),
+                          Col(pal::BevelDark));
+        dl->AddRectFilled(ImVec2(x0, Snap(top + (bottom - top) * 0.78f)), ImVec2(x0 + bw, Snap(top + (bottom - top) * 0.78f) + bw),
+                          Col(pal::BevelDark));
+        break;
+    }
+    case Light::NotApplicable:
+        dl->AddLine(ImVec2(c.x - d * 0.4f, c.y), ImVec2(c.x + d * 0.4f, c.y), Col(pal::BevelShadow), Px(1.0f));
+        break;
+    default:
+        break;   // None: the place stays empty
+    }
+}
+
+}  // namespace
+
 void DrawLight(ImDrawList* dl, ImVec2 c, Light l, float d, ImU32 inkOverride) {
+    if (Shape().bevel) {
+        DrawLight98(dl, c, l, d, inkOverride);
+        return;
+    }
     const ImU32 ink = Col(inkOverride ? inkOverride : pal::LightOn);
     const ImU32 faint = Col(inkOverride ? inkOverride : pal::InkFaint);
     switch (l) {

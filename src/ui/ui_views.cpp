@@ -346,7 +346,8 @@ void DrawFooter(const Snapshot& snap, bool busy) {
     }
     const float d = Snap(Px(8));
     const ImVec2 c(Snap(x) + d * 0.5f, Snap(cy));
-    if (state == Good) dl->AddCircleFilled(c, d * 0.5f, Col(pal::Good));
+    if (state == Good && Shape().bevel) DrawLight(dl, c, Light::Configured, d, pal::Good);   // Windows 98: a green check
+    else if (state == Good) dl->AddCircleFilled(c, d * 0.5f, Col(pal::Good));
     else if (state == Fault) DrawLight(dl, c, Light::Fault, d);
     else DrawLight(dl, c, Light::Off, d);
     x += d + Px(8);
@@ -466,7 +467,7 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
         float x = Snap(p.x + pad);
         for (Light l : { cal, lut }) {
             DrawLight(dl, ImVec2(x + d * 0.5f, Snap(cy)), l, d, onSel ? pal::ListSelInk : 0);
-            x += d + Snap(Px(5));
+            x += Shape().bevel ? Snap(d * 1.45f + Px(6)) : d + Snap(Px(5));   // Windows 98 checks are wider than dots
         }
         if (r.widthPx > 0) {
             char res[32];
@@ -513,31 +514,48 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
         dl->AddRectFilled(ImVec2(p0.x, Snap(midY)), ImVec2(p0.x + avail, Snap(midY) + 1), Col(pal::RuleStrong));
     }
 
-    // Markers take their text width; every stage node has the same width (as wide as fits, capped), and
-    // the gaps between all elements are equal. Nodes carry their light while there is room for it.
-    std::vector<float> widths(path.size(), 0.0f);
-    float markers = 0.0f, widestLabel = 0.0f;
+    // The layout that fits, best first; the lights are the last thing to go:
+    //   0  equal nodes (as wide as fits, capped), markers labelled, chevrons (Gray)
+    //   1  nodes as wide as their own label and light
+    //   2  the markers lose their labels (the line ends and the scan-out cut stay), no chevrons
+    //   3  no lights (only below the minimum window)
+    // The gaps between all elements are equal.
+    const size_t n = path.size();
+    std::vector<float> label(n, 0.0f);
+    float widestLabel = 0.0f;
     int stages = 0;
-    for (size_t i = 0; i < path.size(); i++) {
-        const float lw = MeasureInk(Font::Label, kSizeLabel, StageLabel(path[i].id)).advance;
-        if (!path[i].selectable) {
-            widths[i] = lw + Px(16);
-            markers += widths[i];
-        } else {
-            stages++;
-            widestLabel = lw > widestLabel ? lw : widestLabel;
-        }
+    for (size_t i = 0; i < n; i++) {
+        label[i] = MeasureInk(Font::Label, kSizeLabel, StageLabel(path[i].id)).advance;
+        if (path[i].selectable) { stages++; widestLabel = label[i] > widestLabel ? label[i] : widestLabel; }
     }
-    const float minGap = Px(strip ? 26.0f : 12.0f);   // Gray: room for the chevron between elements
-    float stageW = stages ? (avail - markers - minGap * (float)(path.size() - 1)) / (float)stages : 0.0f;
-    const float withLight = widestLabel + Px(7 + 7 + 22), bare = widestLabel + Px(18);
-    const bool lights = stageW >= withLight;
-    const float minW = lights ? withLight : bare;
-    stageW = stageW > Px(132) ? Px(132) : (stageW < minW ? minW : stageW);
-    stageW = Snap(stageW);
-    for (size_t i = 0; i < path.size(); i++) if (path[i].selectable) widths[i] = stageW;
-    const float total = markers + stageW * (float)stages;
-    const float gap = path.size() > 1 ? (avail - total) / (float)(path.size() - 1) : 0.0f;
+    const float nodePad = Px(22), lightW = Px(7 + 7);
+    std::vector<float> widths(n, 0.0f);
+    int level = 0;
+    float gap = 0.0f;
+    for (; level <= 3; level++) {
+        const bool compactMarkers = level >= 2;
+        const float minGap = Px(strip && !compactMarkers ? 26.0f : (compactMarkers ? 6.0f : 12.0f));
+        float markers = 0.0f;
+        for (size_t i = 0; i < n; i++)
+            if (!path[i].selectable) { widths[i] = compactMarkers ? Px(8) : label[i] + Px(16); markers += widths[i]; }
+        const float light = level <= 2 ? lightW : 0.0f;
+        float nodes = 0.0f;
+        if (level == 0) {
+            float stageW = stages ? (avail - markers - minGap * (float)(n - 1)) / (float)stages : 0.0f;
+            if (stageW < widestLabel + light + nodePad) continue;
+            stageW = Snap(stageW > Px(132) ? Px(132) : stageW);
+            for (size_t i = 0; i < n; i++) if (path[i].selectable) { widths[i] = stageW; nodes += stageW; }
+        } else {
+            for (size_t i = 0; i < n; i++)
+                if (path[i].selectable) { widths[i] = Snap(label[i] + light + nodePad); nodes += widths[i]; }
+            if (level < 3 && markers + nodes + minGap * (float)(n - 1) > avail) continue;
+        }
+        gap = n > 1 ? (avail - markers - nodes) / (float)(n - 1) : 0.0f;
+        break;
+    }
+    const bool lights = level <= 2;
+    const bool markerLabels = level <= 1;
+    const bool chevrons = strip && level <= 1;
 
     float x = p0.x;
     for (size_t i = 0; i < path.size(); i++) {
@@ -546,7 +564,17 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
         if (!s.selectable) {
             const char* t = StageLabel(s.id);
             const InkBox ib = MeasureInk(Font::Label, kSizeLabel, t);
-            const float halfH = (ib.baseline - ib.capTop) * 0.5f + Px(4);
+            const float halfH = markerLabels ? (ib.baseline - ib.capTop) * 0.5f + Px(4) : 0.0f;
+            if (!markerLabels) {
+                // Compact: only the scan-out cut stays (the line itself shows where the path starts and ends).
+                if (s.id == StageId::Scanout) {
+                    const float cx = Snap(x + w * 0.5f);
+                    for (float yy = strip ? p0.y : p0.y - Px(6); yy < p0.y + h + (strip ? 0.0f : Px(6)); yy += Px(6))
+                        dl->AddRectFilled(ImVec2(cx, Snap(yy)), ImVec2(cx + 1, Snap(yy + Px(3))), Col(pal::InkFaint));
+                }
+                x += w + gap;
+                continue;
+            }
             if (strip && s.id != StageId::Scanout)   // the ends as quiet chips
                 dl->AddRectFilled(ImVec2(Snap(x), p0.y), ImVec2(Snap(x + w), p0.y + h), Col(pal::Panel), Snap(Px(Shape().controlRounding)));
             else if (!strip)
@@ -571,7 +599,7 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
             if (Node(id, StageLabel(s.id), s.light, selected, off, ImVec2(w / Dpi(), 34), lights)) vs.stage = s.id;
         }
         // Gray: a chevron in the gap after each element (not into or out of the scan-out cut).
-        if (strip && i + 1 < path.size() && s.id != StageId::Scanout && path[i + 1].id != StageId::Scanout) {
+        if (chevrons && i + 1 < path.size() && s.id != StageId::Scanout && path[i + 1].id != StageId::Scanout) {
             const float cx = x + w + gap * 0.5f, s3 = Px(3.5f);
             const ImVec2 pts[3] = { ImVec2(cx - s3 * 0.5f, midY - s3), ImVec2(cx + s3 * 0.5f, midY), ImVec2(cx - s3 * 0.5f, midY + s3) };
             dl->AddPolyline(pts, 3, Col(pal::RuleStrong), Px(1.5f));

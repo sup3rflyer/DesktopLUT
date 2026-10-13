@@ -158,6 +158,8 @@ ui::Snapshot FakeSnapshot() {
     tm.targetPeakNits = 1700;
     tm.dynamicPeak = true;
     tm.sourcePeakNits = 4000;
+    a.settings.hdrColorCorrection.fald.paramsPath = L"D:/Calibration/DLC/fald/PA32UCXR.bin";
+    a.settings.hdrColorCorrection.fald.enabled = true;
     a.settings.maxTml.enabled = true;
     a.settings.maxTml.peakNits = 10000;
     a.settings.hdrPath = L"D:\\Calibration\\DLC\\results\\PA32UCXR_HDR\\final_hdr.cube";
@@ -251,6 +253,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "bypass", ui::Page::Pipeline, ui::StageId::Lut3D, 0, false, -1, -1, 1180, 760, 1 },
         { "bypassprim", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 1 },
         { "suspended", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 2 },
+        { "fald", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1 },
     };
     const float scales[] = { 1.0f, 1.5f };
     int written = 0;
