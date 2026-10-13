@@ -152,6 +152,7 @@
     <ClCompile Include="tests\test_displayconfig.cpp" />
     <ClCompile Include="tests\test_monitor_identity.cpp" />
     <ClCompile Include="tests\test_settings.cpp" />
+    <ClCompile Include="tests\test_ini_roundtrip.cpp" />
     <ClCompile Include="tests\test_calib_snapshot.cpp" />
     <ClCompile Include="tests\test_fald.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
