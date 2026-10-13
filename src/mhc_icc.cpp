@@ -505,34 +505,59 @@ void ComputeMHC2Matrix(const DisplayPrimariesData& srcPrimaries,
     outMHC[8]  = result[6]; outMHC[9]  = result[7]; outMHC[10] = result[8]; outMHC[11] = 0.0f;
 }
 
-// Compute the SDR scanout (net as-applied matrix + per-channel base 1D LUT) the live grayscale
-// full-preview shader reproduces. Mirrors the SDR matrix + base-LUT generation in
-// GenerateMHC2Profile (srcPrim=sRGB; displayPrim=params.displayPrimaries when primariesEnabled;
-// LUT source = 1D-cube corr / per-channel TRC / base grayscale, in that priority). corrGS is NOT
-// composed here — the shader applies it live (params should be built for the PERM_GS-stripped perm).
-bool ComputeSdrScanoutForShader(const MHC2ProfileParams& params,
-                                float outResult9[9],
-                                std::vector<float>& outBaseLutR,
-                                std::vector<float>& outBaseLutG,
-                                std::vector<float>& outBaseLutB) {
-    if (params.isHDR) return false;
-    const int lutSize = 1024;
+// ============================================================================
+// SECTION: Scanout (the profile's matrix + LUTs, shared by the bake and the live preview)
+// ============================================================================
 
-    // SDR source/display primaries — identical derivation to GenerateMHC2Profile (SDR branch).
-    const DisplayPrimariesData& srcPrim = g_srgbPrimaries;
-    const DisplayPrimariesData& displayPrim = params.primariesEnabled
-        ? params.displayPrimaries : g_srgbPrimaries;
-    bool hasWB = (params.whiteBalanceGains[0] != 1.0f || params.whiteBalanceGains[1] != 1.0f
-                  || params.whiteBalanceGains[2] != 1.0f);
-    const float* wbGains = hasWB ? params.whiteBalanceGains : nullptr;
+float QuantizeS15Fixed16(float f) {
+    return (float)FloatToS15Fixed16(f) / 65536.0f;
+}
 
-    float mhcMatrix[12];
-    ComputeMHC2Matrix(srcPrim, displayPrim, false, mhcMatrix, wbGains, outResult9);
+bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out) {
+    out = MhcScanout{};
+    out.isHDR = params.isHDR;
+    // SDR: 1024 entries (sRGB signal, sufficient for 8-bit output)
+    // HDR: 4096 entries (PQ signal needs more precision at low luminance due to steep slope)
+    out.lutSize = params.isHDR ? 4096 : 1024;
+    const int lutSize = out.lutSize;
 
-    outBaseLutR.assign(lutSize, 0.0f);
-    outBaseLutG.assign(lutSize, 0.0f);
-    outBaseLutB.assign(lutSize, 0.0f);
+    // Matrix (source primaries: see GenerateMHC2Profile).
+    const DisplayPrimariesData srcPrim = MhcSourcePrimaries(params);
+    const DisplayPrimariesData& displayPrim = params.primariesEnabled ? params.displayPrimaries : srcPrim;
+    const bool hasWB = (params.whiteBalanceGains[0] != 1.0f || params.whiteBalanceGains[1] != 1.0f
+                        || params.whiteBalanceGains[2] != 1.0f);
+    ComputeMHC2Matrix(srcPrim, displayPrim, params.isHDR, out.emit, hasWB ? params.whiteBalanceGains : nullptr);
 
+    // What the WRITTEN tag does: Windows reads the s15Fixed16 matrix and applies it as inv(B) * M * B in the
+    // mode's basis (ComputeMHC2Matrix), so the reproduction uses the quantized matrix, conjugated back.
+    {
+        double q[9], bTo[9], bFrom[9];
+        for (int r = 0; r < 3; r++)
+            for (int c = 0; c < 3; c++) q[r * 3 + c] = QuantizeS15Fixed16(out.emit[r * 4 + c]);
+        const DisplayPrimariesData& basisPrim = params.isHDR ? g_bt2020Primaries : g_srgbPrimaries;
+        float bToF[9], bFromF[9];
+        if (BuildRGBtoXYZ(basisPrim, bToF) && MatInv3(bToF, bFromF)) {
+            for (int i = 0; i < 9; i++) { bTo[i] = bToF[i]; bFrom[i] = bFromF[i]; }
+            double t[9];
+            for (int r = 0; r < 3; r++)       // t = inv(B) * q
+                for (int c = 0; c < 3; c++)
+                    t[r * 3 + c] = bFrom[r * 3 + 0] * q[0 * 3 + c] + bFrom[r * 3 + 1] * q[1 * 3 + c]
+                                 + bFrom[r * 3 + 2] * q[2 * 3 + c];
+            for (int r = 0; r < 3; r++)       // applied = t * B
+                for (int c = 0; c < 3; c++)
+                    out.applied[r * 3 + c] = (float)(t[r * 3 + 0] * bTo[0 * 3 + c] + t[r * 3 + 1] * bTo[1 * 3 + c]
+                                                   + t[r * 3 + 2] * bTo[2 * 3 + c]);
+        } else {
+            for (int i = 0; i < 9; i++) out.applied[i] = (float)q[i];   // ComputeMHC2Matrix emitted unconjugated
+        }
+    }
+
+    for (auto& l : out.lut) l.assign(lutSize, 0.0f);
+    float* lutR = out.lut[0].data();
+    float* lutG = out.lut[1].data();
+    float* lutB = out.lut[2].data();
+
+    // Resample a correction curve to target size via linear interpolation
     auto resampleCurve = [](const std::vector<float>& src, float* dst, int dstSize) {
         for (int j = 0; j < dstSize; j++) {
             float t = (float)j / (float)(dstSize - 1);
@@ -545,20 +570,134 @@ bool ComputeSdrScanoutForShader(const MHC2ProfileParams& params,
     };
 
     if (params.hasPrecomputedCorrection && !params.corrR.empty() && !params.corrG.empty() && !params.corrB.empty()) {
-        resampleCurve(params.corrR, outBaseLutR.data(), lutSize);
-        resampleCurve(params.corrG, outBaseLutG.data(), lutSize);
-        resampleCurve(params.corrB, outBaseLutB.data(), lutSize);
+        // Pre-computed correction curves from 1D .cube: use directly, just resample
+        std::cout << "MHC2: Using pre-computed 1D LUT correction (" << params.corrR.size() << " entries)" << std::endl;
+        resampleCurve(params.corrR, lutR, lutSize);
+        resampleCurve(params.corrG, lutG, lutSize);
+        resampleCurve(params.corrB, lutB, lutSize);
     } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
-        float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
-        GenerateMHC2LUT_FromTRC_SDR(params.trcR, outBaseLutR.data(), lutSize, targetGamma);
-        GenerateMHC2LUT_FromTRC_SDR(params.trcG, outBaseLutG.data(), lutSize, targetGamma);
-        GenerateMHC2LUT_FromTRC_SDR(params.trcB, outBaseLutB.data(), lutSize, targetGamma);
+        // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
+        // Note: TRC may not reach 1.0 on all channels (e.g. Curves+Matrix HDR profiles where
+        // per-channel peaks differ). This is valid data — InvertTRC handles it by clamping.
+        // LUT-based profiles with garbage fallback TRC are rejected at import time in gui_mhc.cpp.
+        if (params.isHDR) {
+            // ICC TRC from HDR-mode profiling (e.g. DisplayCal with PQ pattern generator like
+            // Dogegen/Resolve): TRC maps PQ signal → measured linear light (normalized to peak).
+            // Use per-channel PQ correction to fix the display's PQ tracking errors.
+            std::cout << "MHC2: Using per-channel TRC for HDR PQ correction (" << params.trcR.size() << " points, peak " << params.peakNits << " nits)" << std::endl;
+            GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR, lutSize, params.peakNits);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG, lutSize, params.peakNits);
+            GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB, lutSize, params.peakNits);
+        } else {
+            float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
+            std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
+            GenerateMHC2LUT_FromTRC_SDR(params.trcR, lutR, lutSize, targetGamma);
+            GenerateMHC2LUT_FromTRC_SDR(params.trcG, lutG, lutSize, targetGamma);
+            GenerateMHC2LUT_FromTRC_SDR(params.trcB, lutB, lutSize, targetGamma);
+        }
+    } else if (params.isHDR) {
+        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutR, lutSize, 0);
+        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutG, lutSize, 1);
+        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutB, lutSize, 2);
     } else {
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, outBaseLutR.data(), lutSize, 0);
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, outBaseLutG.data(), lutSize, 1);
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, outBaseLutB.data(), lutSize, 2);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutR, lutSize, 0);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutG, lutSize, 1);
+        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutB, lutSize, 2);
     }
     return true;
+}
+
+void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, MhcScanout& out) {
+    if (&out != &base) out = base;
+    // Order: correction grayscale first (calibration), then desktop gamma (look).
+    // DG must be last so correction GS sees un-DG'd values matching calibration.
+    const bool hasDG = params.isHDR && params.desktopGammaEnabled;
+    const bool hasCorrGS = params.correctionGrayscaleEnabled && params.correctionGrayscale.enabled;
+    // DG reference white = the display's SDR white level; a non-finite / non-positive value keeps the
+    // original 80-nit reference rather than baking garbage.
+    const float dgWhiteNits = (std::isfinite(params.sdrWhiteNits) && params.sdrWhiteNits > 0.0f)
+        ? params.sdrWhiteNits : 80.0f;
+    const float pqPeak = params.isHDR ? PqOETF(params.peakNits / 10000.0f) : 0.0f;
+
+    for (int ch = 0; ch < 3; ch++) {
+        float* lut = out.lut[ch].data();
+        const int n = (int)out.lut[ch].size();
+        for (int j = 0; j < n; j++) {
+            float v = lut[j];  // Base LUT output (signal domain)
+
+            if (params.isHDR) {
+                // HDR: LUT output is PQ signal
+
+                // Correction grayscale first (calibration refinement)
+                // Must precede DG so the correction curve sees un-DG'd values
+                // matching its calibration conditions.
+                if (hasCorrGS) {
+                    v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
+                }
+
+                // Desktop gamma last: sRGB→2.2 over the SDR range (0, SDR white], per channel
+                if (hasDG) {
+                    v = DesktopGammaPQ(v, dgWhiteNits);
+                }
+            } else {
+                // SDR: LUT output is sRGB signal
+
+                // Correction grayscale (fine-tuning on top of base). SIGNAL-domain
+                // (mirrors GenerateMHC2LUT_SDR_Channel): feed the signal `v` straight into
+                // the eval — NO sRGB decode/encode around it, or the slot index would land on
+                // the wrong slider.
+                if (hasCorrGS) {
+                    float corrected = EvalGrayscaleSDR_Channel(v, params.correctionGrayscale, ch);
+                    // Optional 2.2→2.4 gamma is a linear-light transform: decode, pow, re-encode.
+                    if (params.correctionGrayscale.use24Gamma) {
+                        float lin = SrgbEOTF((std::max)(corrected, 0.0f));
+                        lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
+                        corrected = SrgbOETF((std::max)(lin, 0.0f));
+                    }
+                    v = corrected;
+                }
+            }
+
+            // The file stores s15Fixed16: quantized here, so the preview reads what Windows reads.
+            lut[j] = QuantizeS15Fixed16(std::clamp(v, 0.0f, 1.0f));
+        }
+    }
+}
+
+bool ComputeMhcScanout(const MHC2ProfileParams& params, MhcScanout& out) {
+    if (!ComputeMhcScanoutBase(params, out)) return false;
+    ComposeMhcScanout(params, out, out);
+    return true;
+}
+
+// The reference evaluation is in double: the exact curves (PQ without PqOETF's 1e-10 floor, so linear black is the
+// standard's PQ(0) = c1^m2), the exact interpolation between the file's entries. The shader is measured against it.
+static double MhcPqOetfD(double l) {
+    const double ym = std::pow((std::max)(l, 0.0), 0.1593017578125);
+    return std::pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375);
+}
+static double MhcSrgbOetfD(double l) { return l <= 0.0031308 ? l * 12.92 : 1.055 * std::pow(l, 1.0 / 2.4) - 0.055; }
+
+static double MhcLutAt(const std::vector<float>& lut, int n, double v) {
+    const double idx = std::clamp(v, 0.0, 1.0) * (double)(n - 1);
+    const double i0f = std::floor(idx);
+    const int i0 = (int)i0f;
+    const int i1 = (std::min)(i0 + 1, n - 1);
+    const double t = idx - i0f;
+    const double a = lut[i0], b = lut[i1];
+    return a + (b - a) * t;
+}
+
+void EvalMhcScanout(const MhcScanout& s, const float lin[3], float out[3]) {
+    double c[3];
+    for (int i = 0; i < 3; i++) c[i] = std::clamp((double)lin[i], 0.0, 1.0);
+    for (int r = 0; r < 3; r++) {
+        double m = (double)s.applied[r * 3 + 0] * c[0] + (double)s.applied[r * 3 + 1] * c[1]
+                 + (double)s.applied[r * 3 + 2] * c[2];
+        m = std::clamp(m, 0.0, 1.0);
+        const double e = s.isHDR ? MhcPqOetfD(m) : MhcSrgbOetfD(m);
+        out[r] = (float)MhcLutAt(s.lut[r], s.lutSize, e);
+    }
 }
 
 // ============================================================================
@@ -657,129 +796,20 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         std::cout << "MHC2: primariesEnabled=false, identity matrix" << std::endl;
     }
 
-    // Check if white balance gains are non-identity
-    bool hasWB = (params.whiteBalanceGains[0] != 1.0f || params.whiteBalanceGains[1] != 1.0f || params.whiteBalanceGains[2] != 1.0f);
-    const float* wbGains = hasWB ? params.whiteBalanceGains : nullptr;
-
-    float mhcMatrix[12];
-    ComputeMHC2Matrix(srcPrim, displayPrim, params.isHDR, mhcMatrix, wbGains);
-
-    // Generate 1D LUTs
-    // SDR: 1024 entries (sRGB signal, sufficient for 8-bit output)
-    // HDR: 4096 entries (PQ signal needs more precision at low luminance due to steep slope)
-    const int lutSize = params.isHDR ? 4096 : 1024;
-    std::vector<float> lutR(lutSize), lutG(lutSize), lutB(lutSize);
-
-    // Resample a correction curve to target size via linear interpolation
-    auto resampleCurve = [](const std::vector<float>& src, float* dst, int dstSize) {
-        for (int j = 0; j < dstSize; j++) {
-            float t = (float)j / (float)(dstSize - 1);
-            float srcIdx = t * (float)(src.size() - 1);
-            int i0 = (int)srcIdx;
-            int i1 = (std::min)(i0 + 1, (int)src.size() - 1);
-            float frac = srcIdx - floorf(srcIdx);
-            dst[j] = std::clamp(src[i0] + (src[i1] - src[i0]) * frac, 0.0f, 1.0f);
-        }
-    };
-
-    if (params.hasPrecomputedCorrection && !params.corrR.empty() && !params.corrG.empty() && !params.corrB.empty()) {
-        // Pre-computed correction curves from 1D .cube: use directly, just resample
-        std::cout << "MHC2: Using pre-computed 1D LUT correction (" << params.corrR.size() << " entries)" << std::endl;
-        resampleCurve(params.corrR, lutR.data(), lutSize);
-        resampleCurve(params.corrG, lutG.data(), lutSize);
-        resampleCurve(params.corrB, lutB.data(), lutSize);
-    } else if (params.hasPerChannelTRC && !params.trcR.empty() && !params.trcG.empty() && !params.trcB.empty()) {
-        // Per-channel TRC from ICC file: generate independent R/G/B correction LUTs
-        // Note: TRC may not reach 1.0 on all channels (e.g. Curves+Matrix HDR profiles where
-        // per-channel peaks differ). This is valid data — InvertTRC handles it by clamping.
-        // LUT-based profiles with garbage fallback TRC are rejected at import time in gui_mhc.cpp.
-        if (params.isHDR) {
-            // ICC TRC from HDR-mode profiling (e.g. DisplayCal with PQ pattern generator like
-            // Dogegen/Resolve): TRC maps PQ signal → measured linear light (normalized to peak).
-            // Use per-channel PQ correction to fix the display's PQ tracking errors.
-            std::cout << "MHC2: Using per-channel TRC for HDR PQ correction (" << params.trcR.size() << " points, peak " << params.peakNits << " nits)" << std::endl;
-            GenerateMHC2LUT_FromTRC_HDR(params.trcR, lutR.data(), lutSize, params.peakNits);
-            GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG.data(), lutSize, params.peakNits);
-            GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB.data(), lutSize, params.peakNits);
-        } else {
-            float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
-            std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
-            GenerateMHC2LUT_FromTRC_SDR(params.trcR, lutR.data(), lutSize, targetGamma);
-            GenerateMHC2LUT_FromTRC_SDR(params.trcG, lutG.data(), lutSize, targetGamma);
-            GenerateMHC2LUT_FromTRC_SDR(params.trcB, lutB.data(), lutSize, targetGamma);
-        }
-    } else if (params.isHDR) {
-        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutR.data(), lutSize, 0);
-        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutG.data(), lutSize, 1);
-        GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutB.data(), lutSize, 2);
-    } else {
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutR.data(), lutSize, 0);
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutG.data(), lutSize, 1);
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutB.data(), lutSize, 2);
-    }
-
-    // ========================================================================
-    // Compose additional corrections on top of base LUT
-    // Order: correction grayscale first (calibration), then desktop gamma (look).
-    // DG must be last so correction GS sees un-DG'd values matching calibration.
-    // ========================================================================
-
-    bool hasDG = params.isHDR && params.desktopGammaEnabled;
-    bool hasCorrGS = params.correctionGrayscaleEnabled && params.correctionGrayscale.enabled;
-    // DG reference white = the display's SDR white level; a non-finite / non-positive value keeps the
-    // original 80-nit reference rather than baking garbage.
-    const float dgWhiteNits = (std::isfinite(params.sdrWhiteNits) && params.sdrWhiteNits > 0.0f)
-        ? params.sdrWhiteNits : 80.0f;
-
-    if (hasDG || hasCorrGS) {
-        float pqPeak = params.isHDR ? PqOETF(params.peakNits / 10000.0f) : 0.0f;
-
-        float* luts[3] = { lutR.data(), lutG.data(), lutB.data() };
-        for (int ch = 0; ch < 3; ch++) {
-            for (int j = 0; j < lutSize; j++) {
-                float v = luts[ch][j];  // Base LUT output (signal domain)
-
-                if (params.isHDR) {
-                    // HDR: LUT output is PQ signal
-
-                    // Correction grayscale first (calibration refinement)
-                    // Must precede DG so the correction curve sees un-DG'd values
-                    // matching its calibration conditions.
-                    if (hasCorrGS) {
-                        v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
-                    }
-
-                    // Desktop gamma last: sRGB→2.2 over the SDR range (0, SDR white], per channel
-                    if (hasDG) {
-                        v = DesktopGammaPQ(v, dgWhiteNits);
-                    }
-                } else {
-                    // SDR: LUT output is sRGB signal
-
-                    // Correction grayscale (fine-tuning on top of base). SIGNAL-domain
-                    // (mirrors GenerateMHC2LUT_SDR_Channel / the shader): feed the signal `v`
-                    // straight into the eval — NO sRGB decode/encode around it, or the slot
-                    // index would land on the wrong slider and disagree with the live preview.
-                    if (hasCorrGS) {
-                        float corrected = EvalGrayscaleSDR_Channel(v, params.correctionGrayscale, ch);
-                        // Optional 2.2→2.4 gamma is a linear-light transform: decode, pow, re-encode.
-                        if (params.correctionGrayscale.use24Gamma) {
-                            float lin = SrgbEOTF((std::max)(corrected, 0.0f));
-                            lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
-                            corrected = SrgbOETF((std::max)(lin, 0.0f));
-                        }
-                        v = corrected;
-                    }
-                }
-
-                luts[ch][j] = std::clamp(v, 0.0f, 1.0f);
-            }
-        }
-
+    // Matrix + 1D LUTs: one computation shared with the live edit preview (mhc_preview.h), which reproduces
+    // exactly these numbers. Correction grayscale and desktop gamma are composed on top of the base LUT.
+    MhcScanout scan;
+    if (!ComputeMhcScanout(params, scan)) return false;
+    {
+        const bool hasDG = params.isHDR && params.desktopGammaEnabled;
+        const bool hasCorrGS = params.correctionGrayscaleEnabled && params.correctionGrayscale.enabled;
+        const float dgWhiteNits = (std::isfinite(params.sdrWhiteNits) && params.sdrWhiteNits > 0.0f)
+            ? params.sdrWhiteNits : 80.0f;
         if (hasDG) std::cout << "MHC2: Desktop gamma (sRGB→2.2, SDR white " << dgWhiteNits
                              << " nits) composed into HDR LUT" << std::endl;
         if (hasCorrGS) std::cout << "MHC2: Correction grayscale composed on top of base LUT" << std::endl;
     }
+    const int lutSize = scan.lutSize;
 
     // Build ICC colorants (D50-adapted)
     // Always use wire-format primaries (sRGB for SDR, BT.2020 for HDR) so the profile's
@@ -850,7 +880,8 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
 
     // MHC2 - the correction data
     float mhcPeakNits = params.isHDR ? params.peakNits : 80.0f;
-    WriteMHC2Tag(tagMHC2, mhcMatrix, lutR.data(), lutG.data(), lutB.data(), lutSize, params.isHDR, mhcPeakNits);
+    WriteMHC2Tag(tagMHC2, scan.emit, scan.lut[0].data(), scan.lut[1].data(), scan.lut[2].data(), lutSize,
+                 params.isHDR, mhcPeakNits);
 
     // ========================================================================
     // Calculate layout

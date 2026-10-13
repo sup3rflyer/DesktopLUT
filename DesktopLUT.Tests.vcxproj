@@ -103,6 +103,7 @@
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\mhc_icc.cpp" />
     <ClCompile Include="src\mhc_install.cpp" />
+    <ClCompile Include="src\mhc_preview.cpp" />
     <ClCompile Include="src\mhc_read.cpp" />
     <ClCompile Include="src\whitelist.cpp" />
     <ClCompile Include="src\framepacer.cpp" />
@@ -166,6 +167,7 @@
     <ClCompile Include="tests\test_notify.cpp" />
     <ClCompile Include="tests\test_ui_model.cpp" />
     <ClCompile Include="tests\test_ui_gscurve.cpp" />
+    <ClCompile Include="tests\test_mhc_preview.cpp" />
     <ClCompile Include="tests\test_ui_shots.cpp" />
     <ClCompile Include="tests\test_reconcile.cpp" />
     <ClCompile Include="tests\test_dlc.cpp" />

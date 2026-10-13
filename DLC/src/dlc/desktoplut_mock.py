@@ -865,6 +865,11 @@ class MockDesktopLutServer:
             if state.get("gs_live_active"):
                 return DesktopLutResponse(
                     ok=False, error="grayscale live preview already active for this monitor/mode")
+            # C++ BeginMhcPreview (mhc_preview.h): the preview IS the profile the commit installs (an
+            # identity profile on scanout while the overlay applies it), so the mode needs one installed.
+            if not state.get("profile_name"):
+                return DesktopLutResponse(
+                    ok=False, error="live preview unavailable: No MHC profile installed for this mode")
             state["gs_preview_active"] = True
             state["gs_live_active"] = True
             state["gs_live_saved"] = deepcopy(state.get("correction_grayscale"))

@@ -5,6 +5,7 @@
 #include "fald.h"
 #include "gui_shared.h"
 #include "gui_mhc.h"
+#include "mhc_preview.h"
 #include "gui_whitelist.h"
 #include "globals.h"
 #include "settings.h"
@@ -2083,96 +2084,24 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 bool livePreview, startedForPreview, startedOverlayForPreview;
                 EnsureProcessingForPreview(monIdx, isHDR, livePreview, startedForPreview, startedOverlayForPreview);
 
-                // Keep MHC ICC profile active — swap to permutation WITHOUT correction GS
-                // so the shader can preview correction GS on top of the base calibration.
-                bool hadProfile = mhc.enabled && !mhc.profileName.empty();
-                uint8_t savedPerm = mhc.activePerm;
-                std::wstring sdrPassthroughName;   // realization-A transient identity profile (SDR)
-                bool fullPreview = false;
-                if (livePreview && hadProfile) {
-                    uint8_t previewPerm = savedPerm & ~MHCSettings::PERM_GS;
-                    float previewResult9[9] = { 1,0,0, 0,1,0, 0,0,1 };
-                    std::vector<float> previewBaseLut[3];
-                    // SDR (realization A): neutralize scanout to identity + shader reproduces the
-                    // whole MHC2 transform, so the preview is bit-identical to the bake (incl. WB).
-                    if (!isHDR &&
-                        ComputeSdrPreviewScanout(monIdx, previewPerm, previewResult9,
-                                                 previewBaseLut[0], previewBaseLut[1], previewBaseLut[2])) {
-                        sdrPassthroughName = EngageSdrPassthroughScanout(monIdx);
-                        fullPreview = !sdrPassthroughName.empty();
-                    }
-                    // Legacy path (HDR, or SDR full-preview unavailable): strip PERM_GS from scanout.
-                    if (!fullPreview && previewPerm != savedPerm) {
-                        SwapMhcToPermutation(monIdx, isHDR, previewPerm);
-                    }
-                    // Enable corrGsPreviewActive so shader GS passes through MHC suppression
-                    {
-                        std::lock_guard<std::mutex> lk(g_monitorsMutex);
-                        for (auto& ctx : g_monitors) {
-                            if (ctx.index == monIdx) {
-                                ctx.corrGsPreviewActive = true;
-                                if (fullPreview) {
-                                    memcpy(ctx.previewResult, previewResult9, sizeof(previewResult9));
-                                    for (int ch = 0; ch < 3; ch++) ctx.previewBaseLut[ch] = std::move(previewBaseLut[ch]);
-                                    ctx.previewBaseLutSize = 1024;
-                                    ctx.previewBaseLutDirty = true;
-                                    ctx.corrGsFullPreviewActive = true;
-                                }
-                                ctx.cbDirty = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+                // The preview is exact to the bake (mhc_preview.h): scanout runs an identity profile while the
+                // overlay applies the profile the close re-bake installs, the edited curve composed in. Without it
+                // (the display is in the other mode, or the mode has no installed profile) the editor still edits.
+                MhcPreviewSession preview;
+                const bool previewing = livePreview && !MhcPreviewActive() && BeginMhcPreview(monIdx, isHDR, preview);
+                g_mhcEditDialogOpen.store(true);
 
-                if (!startedOverlayForPreview)
-                    g_mhcEditDialogOpen.store(true);
-
-                // Live preview callback: push correction grayscale to shader overlay.
-                // MHC ICC stays active (base + DG + WB + primaries), shader adds correction GS on top.
-                // Uses PQ/linear gain path (not ICtCp) so per-channel behavior matches MHC LUT.
-                // Only push when live preview is active — avoids stale entries in pending queue
-                // that would overwrite correct CC data if processing starts later.
-                ShowGrayscaleEditor(hwnd, gs, isHDR, livePreview
-                    ? std::function<void()>([monIdx, isHDR, &mhc]() {
-                        ColorCorrectionSettings tempCC;
-                        tempCC.grayscale = mhc.correctionGrayscale;
-                        ColorCorrectionData data = ConvertColorCorrection(tempCC, isHDR);
-                        std::lock_guard<std::mutex> lock(g_colorCorrectionMutex);
-                        g_pendingColorCorrections.erase(
-                            std::remove_if(g_pendingColorCorrections.begin(), g_pendingColorCorrections.end(),
-                                [monIdx](const PendingColorCorrection& p) { return p.monitorIndex == monIdx; }),
-                            g_pendingColorCorrections.end());
-                        g_pendingColorCorrections.push_back({ monIdx, isHDR, data, false, false });
-                        g_hasPendingColorCorrections.store(true, std::memory_order_release);
-                        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-                    })
+                ShowGrayscaleEditor(hwnd, gs, isHDR, previewing
+                    ? std::function<void()>([&preview, &mhc]() { UpdateMhcPreview(preview, mhc.correctionGrayscale); })
                     : std::function<void()>(nullptr));
 
+                // The overlay stops applying the profile, the re-bake associates the real one, then the identity
+                // profile goes (never a frame with nothing associated).
+                StopMhcPreviewOverlay(preview);
                 g_mhcEditDialogOpen.store(false);
-
-                // Disable preview flag and restore full permutation
-                {
-                    std::lock_guard<std::mutex> lk(g_monitorsMutex);
-                    for (auto& ctx : g_monitors) {
-                        if (ctx.index == monIdx) {
-                            ctx.corrGsPreviewActive = false;
-                            ctx.corrGsFullPreviewActive = false;   // realization-A full-preview off
-                            ctx.cbDirty = true;
-                            break;
-                        }
-                    }
-                }
-                // Regenerate ICC profile with updated correction GS (clears stale perm cache)
                 RegenerateMhcFromGui(monIdx, isHDR);
-                // realization A: real profile re-associated; drop the transient passthrough (after).
-                if (!sdrPassthroughName.empty()) DisengageSdrPassthroughScanout(monIdx, sdrPassthroughName);
-                if (livePreview) {
-                    UpdateMhcFlagsLive(monIdx);
-                    if (!startedForPreview) {
-                        UpdateColorCorrectionLive(monIdx, isHDR);
-                    }
-                }
+                EndMhcPreview(preview);
+                if (livePreview) UpdateMhcFlagsLive(monIdx);
                 if (startedForPreview) {
                     StopProcessing();
                 }

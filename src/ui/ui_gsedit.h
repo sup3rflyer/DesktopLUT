@@ -26,7 +26,6 @@ struct GsEditorState {
     std::wstring rowKey;        // the display it belongs to (sidebar row id)
     GrayscaleSettings work;     // the curve being edited (what the preview shows)
     float bakePeakNits = 1000;  // HDR: the peak the bake places the points by
-    float curvePeakNits = 1000; // HDR: correctionGrayscale.peakNits (labels / overlay preview)
     int codeCap = 255;          // SDR code labels: 255 (legacy) or 1023 (ACM)
     GsChannel channel = GsChannel::Gray;
     int zoom = 0;               // index into the scale choices (+-5 / 10 / 25 / 50 %)

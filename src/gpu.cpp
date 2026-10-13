@@ -9,6 +9,7 @@
 #include "render.h"
 #include "processing.h"
 #include "mhc.h"
+#include "mhc_preview.h"
 #include "fald.h"
 #include <d3dcompiler.h>
 #include <iostream>
@@ -458,30 +459,25 @@ bool InitD3D() {
         hr = g_device->CreateShaderResourceView(g_wbGammaTexture, nullptr, &g_wbGammaSRV);
         if (FAILED(hr)) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; return false; }
 
-        // Per-channel SDR base 1D LUT for the grayscale FULL-PREVIEW (realization A;
-        // CODEX_PREVIEW_BAKE_PROMPT.md). DYNAMIC — the render thread re-uploads it on each
-        // full-preview begin so the shader can reproduce the MHC base calibration before the
-        // live correction. R32_FLOAT (matches the other transfer LUTs — filterable on target HW).
-        D3D11_TEXTURE2D_DESC baseLutDesc = {};
-        baseLutDesc.Width = 1024;
-        baseLutDesc.Height = 1;
-        baseLutDesc.MipLevels = 1;
-        baseLutDesc.ArraySize = 1;
-        baseLutDesc.Format = DXGI_FORMAT_R32_FLOAT;
-        baseLutDesc.SampleDesc.Count = 1;
-        baseLutDesc.Usage = D3D11_USAGE_DYNAMIC;
-        baseLutDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        baseLutDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-        ID3D11Texture2D** baseTex[3] = { &g_baseLutPreviewTexR, &g_baseLutPreviewTexG, &g_baseLutPreviewTexB };
-        ID3D11ShaderResourceView** baseSrv[3] = { &g_baseLutPreviewSRV_R, &g_baseLutPreviewSRV_G, &g_baseLutPreviewSRV_B };
-        for (int ch = 0; ch < 3; ch++) {
-            hr = g_device->CreateTexture2D(&baseLutDesc, nullptr, baseTex[ch]);
-            if (FAILED(hr)) { std::cerr << "Failed to create base-LUT preview texture\n"; return false; }
-            hr = g_device->CreateShaderResourceView(*baseTex[ch], nullptr, baseSrv[ch]);
-            if (FAILED(hr)) { (*baseTex[ch])->Release(); *baseTex[ch] = nullptr; return false; }
-        }
+        // Live edit preview (mhc_preview.h): the profile's three LUTs, one row per channel, read with Load (no
+        // filtering: the shader interpolates in fp32 exactly like the CPU twin). DYNAMIC — written when a preview
+        // starts or its curve changes. 4096 wide: HDR profiles' entry count (SDR uses the first 1024).
+        D3D11_TEXTURE2D_DESC previewDesc = {};
+        previewDesc.Width = kMhcPreviewLutMax;
+        previewDesc.Height = 3;
+        previewDesc.MipLevels = 1;
+        previewDesc.ArraySize = 1;
+        previewDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        previewDesc.SampleDesc.Count = 1;
+        previewDesc.Usage = D3D11_USAGE_DYNAMIC;
+        previewDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        previewDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = g_device->CreateTexture2D(&previewDesc, nullptr, &g_mhcPreviewLutTex);
+        if (FAILED(hr)) { std::cerr << "Failed to create the MHC preview LUT texture\n"; return false; }
+        hr = g_device->CreateShaderResourceView(g_mhcPreviewLutTex, nullptr, &g_mhcPreviewLutSRV);
+        if (FAILED(hr)) { g_mhcPreviewLutTex->Release(); g_mhcPreviewLutTex = nullptr; return false; }
 
-        std::cout << "SDR transfer LUTs: enabled (sRGB OETF/EOTF + gamma ratio + WB gamma + base-preview)" << std::endl;
+        std::cout << "SDR transfer LUTs: enabled (sRGB OETF/EOTF + gamma ratio + WB gamma + MHC preview)" << std::endl;
     }
 
     return true;
@@ -683,12 +679,8 @@ void ReleaseSharedD3DResources() {
     if (g_gammaRatioTexture) { g_gammaRatioTexture->Release(); g_gammaRatioTexture = nullptr; }
     if (g_wbGammaSRV) { g_wbGammaSRV->Release(); g_wbGammaSRV = nullptr; }
     if (g_wbGammaTexture) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; }
-    if (g_baseLutPreviewSRV_R) { g_baseLutPreviewSRV_R->Release(); g_baseLutPreviewSRV_R = nullptr; }
-    if (g_baseLutPreviewTexR) { g_baseLutPreviewTexR->Release(); g_baseLutPreviewTexR = nullptr; }
-    if (g_baseLutPreviewSRV_G) { g_baseLutPreviewSRV_G->Release(); g_baseLutPreviewSRV_G = nullptr; }
-    if (g_baseLutPreviewTexG) { g_baseLutPreviewTexG->Release(); g_baseLutPreviewTexG = nullptr; }
-    if (g_baseLutPreviewSRV_B) { g_baseLutPreviewSRV_B->Release(); g_baseLutPreviewSRV_B = nullptr; }
-    if (g_baseLutPreviewTexB) { g_baseLutPreviewTexB->Release(); g_baseLutPreviewTexB = nullptr; }
+    if (g_mhcPreviewLutSRV) { g_mhcPreviewLutSRV->Release(); g_mhcPreviewLutSRV = nullptr; }
+    if (g_mhcPreviewLutTex) { g_mhcPreviewLutTex->Release(); g_mhcPreviewLutTex = nullptr; }
     if (g_constantBuffer) { g_constantBuffer->Release(); g_constantBuffer = nullptr; }
     if (g_samplerPoint) { g_samplerPoint->Release(); g_samplerPoint = nullptr; }
     if (g_samplerLinear) { g_samplerLinear->Release(); g_samplerLinear = nullptr; }

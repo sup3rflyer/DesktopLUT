@@ -295,7 +295,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     ed.hdr = hdr;
                     ed.mon = shot.display;
                     ed.codeCap = 1023;
-                    ed.bakePeakNits = ed.curvePeakNits = 1612.0f;
+                    ed.bakePeakNits = 1612.0f;
                     ed.work.pointCount = hdr ? 20 : 32;
                     ed.work.points.resize(ed.work.pointCount);
                     if (hdr) ed.work.initLinearPQ(); else ed.work.initLinear();

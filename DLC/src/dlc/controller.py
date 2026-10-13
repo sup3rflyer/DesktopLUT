@@ -262,8 +262,8 @@ class CalibrationController:
 
     # -- MHC correction-grayscale LIVE-EDIT (the toggleable third "+1" touch-up) -----------
     # Drives DesktopLUT's main-GUI grayscale editor over the pipe (CODEX_GRAYSCALE_LIVE_EDIT_PROMPT.md):
-    # ``live_begin`` engages the preview shader (correction GS stacked on top of MHC+3D-LUT so the meter
-    # sees it — render.cpp:346 corrGsPreviewActive gate), ``set_live`` nudges the 32-point editor table
+    # ``live_begin`` engages the live preview (identity scanout while the overlay applies the profile the
+    # commit installs, live curve composed in — mhc_preview.h), ``set_live`` nudges the 32-point editor table
     # live, ``commit`` bakes it into the ICM (the editor's "OK"), ``cancel`` reverts. Same store as
     # ``set_correction_grayscale`` (``MHCSettings::correctionGrayscale``); the core (matrix + base
     # grayscale + 3D LUT) is never touched, and the result is one-toggle revertible to the vanilla ICM.

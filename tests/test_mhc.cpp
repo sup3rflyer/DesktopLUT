@@ -1761,13 +1761,20 @@ TEST_CASE("MHC LUT SDR per-channel: R/G/B differ") {
 }
 
 // ============================================================================
-// SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md)
+// Scanout base (the live edit preview's matrix + base LUTs; mhc_preview.h, test_mhc_preview.cpp)
 // ============================================================================
 
-TEST_CASE("SDR full-preview: ComputeSdrScanoutForShader mirrors the bake building blocks") {
-    // The overlay shader reproduces the MHC2 scanout (matrix + base 1D LUT) from these outputs,
-    // then composes the live correction per-channel. Lock the helper to the SAME matrix + base
-    // LUT the real bake (ComputeMHC2Matrix / GenerateMHC2LUT_SDR_Channel) produces.
+TEST_CASE("MHC scanout base: the bake's building blocks") {
+    // The preview reproduces the profile from these (with the correction composed per edit). Lock them to the
+    // matrix + base LUT the bake's own building blocks (ComputeMHC2Matrix / GenerateMHC2LUT_SDR_Channel) produce.
+    auto ComputeSdrScanoutForShader = [](const MHC2ProfileParams& p, float r9[9], std::vector<float>& bR,
+                                         std::vector<float>& bG, std::vector<float>& bB) {
+        MhcScanout s;
+        if (!ComputeMhcScanoutBase(p, s)) return false;
+        for (int i = 0; i < 9; i++) r9[i] = s.applied[i];
+        bR = s.lut[0]; bG = s.lut[1]; bB = s.lut[2];
+        return true;
+    };
 
     // (1) primaries OFF + no base GS => identity matrix + identity base LUT.
     {

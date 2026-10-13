@@ -806,7 +806,9 @@ TEST_CASE("Desktop gamma: the overlay pixel shader splices the shared function, 
     };
     CHECK(offsetOf("sdrWhiteNits") == 1 * 4);
     CHECK(offsetOf("desktopGamma") == 4 * 4);
-    CHECK(offsetOf("corrPreviewMatRow2") == 140 * 4);
+    CHECK(offsetOf("mhcPreviewRow0") == 132 * 4);
+    CHECK(offsetOf("mhcPreviewRow1") == 136 * 4);
+    CHECK(offsetOf("mhcPreviewRow2") == 140 * 4);
     CHECK(offsetOf("sdrWhiteScRGB") == 144 * 4);
     CHECK(offsetOf("sdrWhiteScRGBRcp") == 145 * 4);
     refl->Release();

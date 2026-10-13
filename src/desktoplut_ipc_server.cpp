@@ -25,6 +25,7 @@
 #include "globals.h"
 #include "calib_snapshot.h"
 #include "gui_mhc.h"
+#include "mhc_preview.h"
 #include "gui_shared.h"
 #include "mhc.h"
 #include "fald.h"
@@ -181,39 +182,37 @@ std::string MonitorModeKey(int mon, bool isHDR) {
 // never the matrix, baseGrayscale, primaries/white, or the 3D LUT — and is
 // one-toggle revertible to the vanilla core ICM. This mirrors the GUI handler at
 // gui.cpp ID_MHC_SDR_GS_EDIT, just split across begin/set/commit/cancel calls so
-// a tiny per-(monitor,mode) record carries savedPerm and the pre-begin correction
-// across the calls. Guarded by g_monitorSettingsMutex.
+// a tiny per-(monitor,mode) record carries the preview session and the pre-begin
+// correction across the calls. Guarded by g_monitorSettingsMutex.
+// The preview is exact to the bake (mhc_preview.h): scanout runs an identity profile while
+// the overlay applies the very profile the commit installs, curve included.
 struct GsLiveState {
     bool active = false;
-    uint8_t savedPerm = 0;                 // active permutation before PERM_GS was stripped
     bool startedForPreview = false;        // this preview started full processing
     bool startedOverlayForPreview = false; // this preview started the DWM-hook overlay
     GrayscaleSettings savedCorrectionGs;   // pre-begin correctionGrayscale, for cancel/abort restore
-    std::wstring sdrPassthroughName;       // realization-A: transient identity scanout profile (SDR full-preview)
+    MhcPreviewSession preview;             // the overlay applies the profile the commit installs
 };
 std::map<std::pair<int, bool>, GsLiveState> g_gsLive;  // keyed by (monitor, isHDR)
+
+// Undoes the begin's processing start (a failed begin, or the teardown).
+void StopGsLiveProcessing(bool startedForPreview, bool startedOverlayForPreview) {
+    if (startedForPreview) StopProcessing();
+    if (startedOverlayForPreview) {
+        g_mhcEditDialogOpen.store(false);   // what kept the hook-mode overlay awake
+        DwmHookReevaluateOverlay();
+    }
+}
 
 // Tear down an active grayscale live preview. bake=true regenerates the MHC ICC
 // with the previewed correctionGrayscale baked in (commit / "OK"); bake=false
 // restores correctionGrayscale to its pre-begin value first, so the regen reverts
-// to the vanilla core (cancel / abort). RegenerateMhcIfActive recomputes the active
-// permutation from the (now-restored or now-final) settings — so it re-includes
-// PERM_GS on commit and drops it on cancel without an explicit perm swap, exactly
-// as the GUI editor's close path relies on. Must be called WITHOUT
+// to the vanilla core (cancel / abort). The overlay stops applying the profile, the
+// regen associates the real one, and only then is the identity scanout profile dropped
+// (never a frame with nothing associated). Must be called WITHOUT
 // g_monitorSettingsMutex held (RegenerateMhcIfActive locks it internally).
 // Returns false when the profile could not be rebuilt (the edit is in the settings, not on screen).
 bool FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
-    g_mhcEditDialogOpen.store(false);  // re-arm MHC profile monitoring (suppressed during preview)
-    {
-        std::lock_guard<std::mutex> lk(g_monitorsMutex);
-        for (auto& ctx : g_monitors)
-            if (ctx.index == mon) {
-                ctx.corrGsPreviewActive = false;
-                ctx.corrGsFullPreviewActive = false;   // realization-A full-preview off
-                ctx.cbDirty = true;
-                break;
-            }
-    }
     if (!bake) {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         if (mon >= 0 && mon < (int)g_gui.monitorSettings.size()) {
@@ -222,20 +221,15 @@ bool FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
             m.correctionGrayscale = st.savedCorrectionGs;
         }
     }
-    // Bake the (restored or final) correctionGrayscale into the ICC and restore the
-    // full permutation. No-op if MHC isn't active (no profileName).
+    MhcPreviewSession preview = st.preview;
+    StopMhcPreviewOverlay(preview);
+    g_mhcEditDialogOpen.store(false);  // re-arm MHC profile monitoring (suppressed during preview)
+    // Bake the (restored or final) correctionGrayscale into the ICC (the full permutation).
+    // No-op if MHC isn't active (no profileName).
     const bool rebuilt = RegenerateMhcIfActive(mon, isHDR) != MhcRegenResult::Failed;
+    EndMhcPreview(preview);
     UpdateMhcFlagsLive(mon);
-    // realization-A: now the real profile is re-associated, drop the transient passthrough
-    // (remove association + delete the .icm). Done AFTER the real reassoc to avoid a no-profile flash.
-    if (!st.sdrPassthroughName.empty()) DisengageSdrPassthroughScanout(mon, st.sdrPassthroughName);
-    // If the overlay was already running (we didn't spin it up), flush the transient
-    // preview push by re-queuing the REAL shader CC (correctionGrayscale lives in the
-    // ICC now, not the shader). UpdateColorCorrectionLive reads sdr/hdrColorCorrection,
-    // whose grayscale is off in the calibration stack — so this clears the preview.
-    if (!st.startedForPreview) UpdateColorCorrectionLive(mon, isHDR);
-    if (st.startedForPreview) StopProcessing();
-    if (st.startedOverlayForPreview) DwmHookReevaluateOverlay();
+    StopGsLiveProcessing(st.startedForPreview, st.startedOverlayForPreview);
     SaveSettings();
     // Desktop gamma waited for the live edit: catch up with the SDR white level (debounced re-check).
     if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
@@ -243,7 +237,7 @@ bool FinishGsLive(int mon, bool isHDR, const GsLiveState& st, bool bake) {
 }
 
 // Abort any active grayscale live preview (e.g. the client died between begin and
-// commit, leaving corrGsPreviewActive set + PERM_GS stripped). Reverts to vanilla.
+// commit, leaving the identity scanout + the overlay's copy of the profile). Reverts to vanilla.
 // Called from calibration.exit / corrections.disable_all. Snapshots + clears g_gsLive
 // under the lock, then runs teardown OUTSIDE it (FinishGsLive locks internally).
 void CleanupActiveGsLive() {
@@ -1809,15 +1803,15 @@ void DoDisableGrayscaleTweak(const JsonValue& p, JsonValue& result, std::string&
 // --- Correction-grayscale live preview handlers (see GsLiveState above) -------
 
 // mhc.grayscale_live_begin {monitor, mode}: engage the live-edit preview. Spins up
-// the overlay if needed, strips PERM_GS from the active MHC permutation so the shader
-// can preview correctionGrayscale on top of the base calibration, and flips
-// corrGsPreviewActive so the shader grayscale passes through MHC suppression
-// (render.cpp:346). Caches savedPerm + the pre-begin correctionGrayscale for revert.
+// the overlay if needed, puts an identity profile on scanout and has the overlay apply
+// the profile the commit will install (mhc_preview.h: the same matrix and LUT entries,
+// the live curve composed in), so what the meter reads IS the bake. Caches the
+// pre-begin correctionGrayscale for revert. Needs an installed profile for the mode.
 void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    // Don't double-drive the preview if a human has the editor dialog open.
-    if (g_mhcEditDialogOpen.load()) { error = "grayscale editor already open in the GUI"; return; }
+    // Don't double-drive the preview if a human has an editor open.
+    if (g_mhcEditDialogOpen.load() || MhcPreviewActive()) { error = "grayscale editor already open in the GUI"; return; }
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         auto it = g_gsLive.find({mon, isHDR});
@@ -1836,79 +1830,40 @@ void DoGrayscaleLiveBegin(const JsonValue& p, JsonValue& result, std::string& er
         error = "overlay not available for live preview (monitor mode does not match run mode, or processing could not start)";
         return;
     }
-    // Suppress MHC profile monitoring for the duration of the edit (EnsureProcessingForPreview
-    // already set it when it spun up the overlay itself).
-    if (!startedOverlayForPreview) g_mhcEditDialogOpen.store(true);
 
     GsLiveState st;
     st.active = true;
     st.startedForPreview = startedForPreview;
     st.startedOverlayForPreview = startedOverlayForPreview;
-    bool hadProfile = false;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        st.savedPerm = m.activePerm;
+        const MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
         st.savedCorrectionGs = m.correctionGrayscale;  // for cancel/abort restore
-        hadProfile = m.enabled && !m.profileName.empty();
     }
-
-    // Engage the live preview. SDR (realization A; CODEX_PREVIEW_BAKE_PROMPT.md): neutralize
-    // scanout to IDENTITY (transient passthrough profile) and have the shader reproduce the WHOLE
-    // MHC2 transform + the live correction, so the preview is bit-identical to the bake (incl.
-    // per-channel / white balance). HDR keeps the legacy path (strip PERM_GS; full-preview is
-    // out of scope for HDR). Falls back to the legacy strip if scanout reproduction is unavailable.
-    bool fullPreview = false;
-    float previewResult9[9] = { 1,0,0, 0,1,0, 0,0,1 };
-    std::vector<float> previewBaseLut[3];
-    if (!isHDR && hadProfile) {
-        uint8_t strippedPerm = (uint8_t)(st.savedPerm & ~MHCSettings::PERM_GS);
-        if (ComputeSdrPreviewScanout(mon, strippedPerm, previewResult9,
-                                     previewBaseLut[0], previewBaseLut[1], previewBaseLut[2])) {
-            st.sdrPassthroughName = EngageSdrPassthroughScanout(mon);
-            fullPreview = !st.sdrPassthroughName.empty();
-        }
+    std::wstring why;
+    if (!BeginMhcPreview(mon, isHDR, st.preview, &why)) {
+        StopGsLiveProcessing(startedForPreview, startedOverlayForPreview);
+        error = "live preview unavailable: " + WideToUtf8(why);
+        return;
     }
-    if (!fullPreview && hadProfile && (st.savedPerm & MHCSettings::PERM_GS))
-        SwapMhcToPermutation(mon, isHDR, (uint8_t)(st.savedPerm & ~MHCSettings::PERM_GS));
-
-    {
-        std::lock_guard<std::mutex> lk(g_monitorsMutex);
-        for (auto& ctx : g_monitors)
-            if (ctx.index == mon) {
-                ctx.corrGsPreviewActive = true;
-                if (fullPreview) {
-                    memcpy(ctx.previewResult, previewResult9, sizeof(previewResult9));
-                    for (int ch = 0; ch < 3; ch++) ctx.previewBaseLut[ch] = std::move(previewBaseLut[ch]);
-                    ctx.previewBaseLutSize = 1024;
-                    ctx.previewBaseLutDirty = true;
-                    ctx.corrGsFullPreviewActive = true;
-                }
-                ctx.cbDirty = true;
-                break;
-            }
-    }
+    // Suppress MHC profile monitoring, re-attach and the desktop gamma follow for the edit.
+    g_mhcEditDialogOpen.store(true);
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        g_gsLive[{mon, isHDR}] = st;
+        g_gsLive[{mon, isHDR}] = std::move(st);
     }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("preview", JBool(true));
 }
 
 // mhc.grayscale_set_live {monitor, mode, grayscale:{point_count,points,deviations}}:
-// the per-patch nudge. Applies the payload to correctionGrayscale and pushes it to the
-// overlay so the next frame reflects it. NOTE: UpdateColorCorrectionLive reads
-// sdr/hdrColorCorrection (the shader CC), NOT correctionGrayscale, so it CANNOT be used
-// here — we replicate the GUI editor's live-preview callback (gui.cpp ID_MHC_*_GS_EDIT)
-// which pushes a temp CC carrying correctionGrayscale straight onto the pending queue.
+// the per-patch nudge. Applies the payload to correctionGrayscale and recomposes the
+// preview, so the next frame shows the profile the commit would install with it.
 void DoGrayscaleSetLive(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* gs = p.find("grayscale");
     if (!gs || gs->type != JsonValue::Obj) { error = "missing parameter: grayscale"; return; }
-
-    ColorCorrectionSettings tempCC;  // default ctor: only grayscale is enabled below
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         auto it = g_gsLive.find({mon, isHDR});
@@ -1918,20 +1873,8 @@ void DoGrayscaleSetLive(const JsonValue& p, JsonValue& result, std::string& erro
         }
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
         if (!ApplyGrayscalePayload(m.correctionGrayscale, *gs, isHDR, error)) return;  // sets enabled = true
-        tempCC.grayscale = m.correctionGrayscale;           // snapshot for the overlay push
-    }
-    ColorCorrectionData data = ConvertColorCorrection(tempCC, isHDR);
-    {
-        std::lock_guard<std::mutex> lk(g_colorCorrectionMutex);
-        g_pendingColorCorrections.erase(
-            std::remove_if(g_pendingColorCorrections.begin(), g_pendingColorCorrections.end(),
-                [mon, isHDR](const PendingColorCorrection& pc) {
-                    return pc.monitorIndex == mon && pc.isHDR == isHDR;
-                }),
-            g_pendingColorCorrections.end());
-        g_pendingColorCorrections.push_back({ mon, isHDR, data, false, false });
-        g_hasPendingColorCorrections.store(true, std::memory_order_release);
-        if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+        // Lock order settings -> preview stage (UpdateMhcPreview takes only the stage mutex).
+        UpdateMhcPreview(it->second.preview, m.correctionGrayscale);
     }
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
 }
@@ -2308,6 +2251,7 @@ void AbortLiveEditsForShutdown() {
 
 bool IsCalibrationOrLiveEditActive() {
     if (act::GsEditActive()) return true;   // the interface's grayscale editor (GUI thread state)
+    if (MhcPreviewActive()) return true;    // any live edit preview (the classic editor's too)
     // Sequential, never nested: the GUI-thread enter nests settings -> calib.
     {
         std::lock_guard<std::mutex> lk(g_calibMutex);

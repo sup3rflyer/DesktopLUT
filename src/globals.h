@@ -58,12 +58,8 @@ extern ID3D11ShaderResourceView* g_wbGammaSRV;
 
 // Per-channel SDR base 1D LUT for the grayscale FULL-PREVIEW (realization A; t11/t12/t13).
 // DYNAMIC — re-uploaded by the render thread on full-preview begin (1024 entries each).
-extern ID3D11Texture2D* g_baseLutPreviewTexR;
-extern ID3D11ShaderResourceView* g_baseLutPreviewSRV_R;
-extern ID3D11Texture2D* g_baseLutPreviewTexG;
-extern ID3D11ShaderResourceView* g_baseLutPreviewSRV_G;
-extern ID3D11Texture2D* g_baseLutPreviewTexB;
-extern ID3D11ShaderResourceView* g_baseLutPreviewSRV_B;
+extern ID3D11Texture2D* g_mhcPreviewLutTex;            // live edit preview: the profile's LUTs (t11, 4096x3)
+extern ID3D11ShaderResourceView* g_mhcPreviewLutSRV;
 
 // ============================================================================
 // Monitor State

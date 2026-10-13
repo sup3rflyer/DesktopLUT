@@ -5,6 +5,7 @@
 #include "globals.h"
 #include "displayconfig.h"
 #include "types.h"
+#include "gui_mhc.h"   // MhcScanoutName
 #include <iostream>
 #include <set>
 #include <mutex>
@@ -249,6 +250,9 @@ void CleanupOrphanedMhcProfiles() {
             // never restores it.
             if (!ms.sdrMHC.profileName.empty()) activeProfiles.insert(ms.sdrMHC.profileName);
             if (!ms.hdrMHC.profileName.empty()) activeProfiles.insert(ms.hdrMHC.profileName);
+            // A live edit's identity scanout profile (mhc_preview.h) is in use until the edit ends.
+            if (!ms.sdrMHC.previewScanoutName.empty()) activeProfiles.insert(ms.sdrMHC.previewScanoutName);
+            if (!ms.hdrMHC.previewScanoutName.empty()) activeProfiles.insert(ms.hdrMHC.previewScanoutName);
             for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
                 if (!ms.sdrMHC.permNames[k].empty())
                     activeProfiles.insert(ms.sdrMHC.permNames[k]);
@@ -334,6 +338,9 @@ void SweepStaleMhcAssociations() {
             }
             if (!ms.sdrMHC.profileName.empty()) keep.insert(ms.sdrMHC.profileName);
             if (!ms.hdrMHC.profileName.empty()) keep.insert(ms.hdrMHC.profileName);
+            // A live edit's identity scanout profile (mhc_preview.h): the mode's default until the edit ends.
+            if (!ms.sdrMHC.previewScanoutName.empty()) keep.insert(ms.sdrMHC.previewScanoutName);
+            if (!ms.hdrMHC.previewScanoutName.empty()) keep.insert(ms.hdrMHC.previewScanoutName);
         };
         for (const auto& ms : g_gui.monitorSettings) collect(ms);
         for (const auto& ms : g_gui.parkedSettings) collect(ms);  // absent panels keep their names
@@ -414,9 +421,10 @@ void VerifyAndRestoreMhcProfiles() {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         snapshots.reserve(g_gui.monitorSettings.size());
         for (const auto& ms : g_gui.monitorSettings) {
+            // What scanout should run: the live edit's identity profile while one previews (mhc_preview.h).
             snapshots.push_back({
-                ms.sdrMHC.enabled, ms.sdrMHC.profileName,
-                ms.hdrMHC.enabled, ms.hdrMHC.profileName
+                ms.sdrMHC.enabled, MhcScanoutName(ms.sdrMHC),
+                ms.hdrMHC.enabled, MhcScanoutName(ms.hdrMHC)
             });
         }
     }
@@ -448,7 +456,7 @@ void VerifyAndRestoreMhcProfiles() {
                 if (i >= (int)g_gui.monitorSettings.size()) return;
                 const MHCSettings& mNow = isHDR ? g_gui.monitorSettings[i].hdrMHC
                                                 : g_gui.monitorSettings[i].sdrMHC;
-                if (!mNow.enabled || mNow.profileName != expected) return;
+                if (!mNow.enabled || MhcScanoutName(mNow) != expected) return;
             }
 
             // Before trying to re-associate, confirm the profile file actually
@@ -600,8 +608,8 @@ void ReapplyAllMhcProfiles() {
         snapshots.reserve(g_gui.monitorSettings.size());
         for (const auto& ms : g_gui.monitorSettings) {
             snapshots.push_back({
-                ms.sdrMHC.enabled, ms.sdrMHC.profileName,
-                ms.hdrMHC.enabled, ms.hdrMHC.profileName
+                ms.sdrMHC.enabled, MhcScanoutName(ms.sdrMHC),
+                ms.hdrMHC.enabled, MhcScanoutName(ms.hdrMHC)
             });
         }
     }

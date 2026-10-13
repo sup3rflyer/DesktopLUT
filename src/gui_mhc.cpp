@@ -314,25 +314,27 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
     }
 
     // Correction grayscale (fine-tuning on top of base)
-    if (mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty()) {
-        params.correctionGrayscaleEnabled = true;
-        params.correctionGrayscale.enabled = true;
-        params.correctionGrayscale.pointCount = mhc.correctionGrayscale.pointCount;
-        for (int i = 0; i < mhc.correctionGrayscale.pointCount && i < 32; i++) {
-            params.correctionGrayscale.points[i] = (i < (int)mhc.correctionGrayscale.points.size())
-                ? mhc.correctionGrayscale.points[i] : 0.0f;
-            float base = params.correctionGrayscale.points[i];
-            float devR = (i < (int)mhc.correctionGrayscale.rgbDeviations[0].size()) ? mhc.correctionGrayscale.rgbDeviations[0][i] : 1.0f;
-            float devG = (i < (int)mhc.correctionGrayscale.rgbDeviations[1].size()) ? mhc.correctionGrayscale.rgbDeviations[1][i] : 1.0f;
-            float devB = (i < (int)mhc.correctionGrayscale.rgbDeviations[2].size()) ? mhc.correctionGrayscale.rgbDeviations[2][i] : 1.0f;
-            params.correctionGrayscale.pointsR[i] = base * devR;
-            params.correctionGrayscale.pointsG[i] = base * devG;
-            params.correctionGrayscale.pointsB[i] = base * devB;
-        }
-        params.correctionGrayscale.use24Gamma = mhc.correctionGrayscale.use24Gamma;
-        params.correctionGrayscale.peakNits = mhc.correctionGrayscale.peakNits;
-    }
+    SetMhcCorrectionParams(mhc.correctionGrayscale, params);
     return true;
+}
+
+void SetMhcCorrectionParams(const GrayscaleSettings& gs, MHC2ProfileParams& params) {
+    if (!gs.enabled || gs.points.empty()) return;
+    params.correctionGrayscaleEnabled = true;
+    params.correctionGrayscale.enabled = true;
+    params.correctionGrayscale.pointCount = gs.pointCount;
+    for (int i = 0; i < gs.pointCount && i < 32; i++) {
+        params.correctionGrayscale.points[i] = (i < (int)gs.points.size()) ? gs.points[i] : 0.0f;
+        float base = params.correctionGrayscale.points[i];
+        float devR = (i < (int)gs.rgbDeviations[0].size()) ? gs.rgbDeviations[0][i] : 1.0f;
+        float devG = (i < (int)gs.rgbDeviations[1].size()) ? gs.rgbDeviations[1][i] : 1.0f;
+        float devB = (i < (int)gs.rgbDeviations[2].size()) ? gs.rgbDeviations[2][i] : 1.0f;
+        params.correctionGrayscale.pointsR[i] = base * devR;
+        params.correctionGrayscale.pointsG[i] = base * devG;
+        params.correctionGrayscale.pointsB[i] = base * devB;
+    }
+    params.correctionGrayscale.use24Gamma = gs.use24Gamma;
+    params.correctionGrayscale.peakNits = gs.peakNits;
 }
 
 // ============================================================================
@@ -555,6 +557,13 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
         auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                            : g_gui.monitorSettings[monitorIndex].sdrMHC;
         if (newPerm == mhc.activePerm) return true;  // already active
+        if (!mhc.previewScanoutName.empty()) {
+            // The overlay applies this profile as it was when the live edit began; another variant under it
+            // would be applied twice. The edit's own re-bake installs the right variant at its end.
+            std::cout << "MHC perm: swap to P" << (int)newPerm << " for monitor " << monitorIndex
+                      << " waits for the live edit" << std::endl;
+            return false;
+        }
         oldName = mhc.profileName;
         newName = mhc.permNames[newPerm];
         newPath = mhc.permPaths[newPerm];
@@ -583,81 +592,57 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
 }
 
 // ----------------------------------------------------------------------------
-// SDR grayscale FULL-PREVIEW scanout support (realization A — see
-// CODEX_PREVIEW_BAKE_PROMPT.md). During the SDR correction-grayscale live edit we
-// neutralize scanout to IDENTITY (via a transient passthrough profile) and have the
-// overlay shader reproduce the WHOLE MHC2 transform + the live correction, so the
-// preview is bit-identical to the bake (including per-channel / white-balance).
+// Live edit preview scanout (mhc_preview.h): while the overlay applies a display's profile, scanout runs a transient
+// identity profile with the same luminance metadata.
 // ----------------------------------------------------------------------------
 
-// Compute the matrix + base 1D LUT the full-preview shader must reproduce, for the
-// PERM_GS-stripped SDR perm (corrGS off — the shader applies it live). SDR only.
-bool ComputeSdrPreviewScanout(int monitorIndex, uint8_t strippedPerm,
-                              float outResult9[9],
-                              std::vector<float>& outBaseLutR,
-                              std::vector<float>& outBaseLutG,
-                              std::vector<float>& outBaseLutB) {
-    MHCSettings mhcCopy;
-    {
-        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
-        mhcCopy = g_gui.monitorSettings[monitorIndex].sdrMHC;
-    }
-    MHC2ProfileParams params;
-    if (!BuildMHC2ParamsForPerm(mhcCopy, /*isHDR=*/false, monitorIndex, strippedPerm, params)) return false;
-    return ComputeSdrScanoutForShader(params, outResult9, outBaseLutR, outBaseLutG, outBaseLutB);
+const std::wstring& MhcScanoutName(const MHCSettings& m) {
+    return m.previewScanoutName.empty() ? m.profileName : m.previewScanoutName;
 }
 
-// Install + associate a transient identity (passthrough) SDR MHC profile so scanout
-// contributes IDENTITY during the full-preview. Returns the installed profile name (for
-// teardown) or empty on failure. The real profile name in MHCSettings is left untouched
-// so FinishGsLive's RegenerateMhcIfActive can re-associate the real profile on exit.
-std::wstring EngageSdrPassthroughScanout(int monitorIndex) {
+std::wstring EngagePassthroughScanout(int monitorIndex, bool isHDR, const MHCSettings& mhc) {
     if (!IsMHC2ApiAvailable()) return L"";
     DisplayInfo displayInfo;
     if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return L"";
 
-    // All-default SDR params ⇒ primaries off (identity matrix) + grayscale off (identity 1D LUT)
-    // + WB off + corrGS off ⇒ a true passthrough profile.
+    // Both stages bypassed: identity matrix + identity LUTs, the full profile's luminance metadata (so HDR
+    // applications are told the same peak while the edit runs).
     MHC2ProfileParams params;
-    params.monitorName = (monitorIndex < (int)g_gui.monitorNames.size())
-        ? g_gui.monitorNames[monitorIndex] : L"Monitor";
-    params.isHDR = false;
-
+    if (!BuildMHC2ParamsForPerm(mhc, isHDR, monitorIndex,
+                                (uint8_t)(MHCSettings::PERM_NOPRIM | MHCSettings::PERM_NOGRAY), params))
+        return L"";
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return L"";
 
     wchar_t monTag[8];
     swprintf_s(monTag, L"Mon%d", monitorIndex);
-    std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag)
-        + L"_SDR_Passthru_" + std::to_wstring(GetTickCount64()) + L".icm";
+    std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag) + (isHDR ? L"_HDR" : L"_SDR")
+        + L"_Passthru_" + std::to_wstring(GetTickCount64()) + L".icm";
     wchar_t tempDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tempDir);
     std::wstring tempPath = std::wstring(tempDir) + profileName;
     if (!WriteMHC2Profile(profileData, tempPath)) return L"";
 
-    // InstallMHC2Profile copies to the system color dir AND associates as the active default.
-    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, false)) {
+    // InstallMHC2Profile copies to the system color dir AND associates as the mode's active default.
+    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
         DeleteFileW(tempPath.c_str());
         return L"";
     }
     DeleteFileW(tempPath.c_str());
-    std::cout << "MHC: engaged SDR passthrough scanout for monitor " << monitorIndex << std::endl;
+    std::cout << "MHC: preview scanout (identity) engaged for monitor " << monitorIndex << (isHDR ? " HDR" : " SDR")
+              << std::endl;
     return profileName;
 }
 
-// Disassociate + delete the transient passthrough profile. Scanout is restored to the real
-// profile separately (RegenerateMhcIfActive re-associates it). Safe to call with empty name.
-void DisengageSdrPassthroughScanout(int monitorIndex, const std::wstring& passthroughName) {
+void DisengagePassthroughScanout(int monitorIndex, bool isHDR, const std::wstring& passthroughName) {
     if (passthroughName.empty()) return;
     DisplayInfo displayInfo;
-    if (GetDisplayInfoForMonitor(monitorIndex, displayInfo)) {
-        RemoveMHC2Profile(passthroughName, displayInfo.adapterId, displayInfo.sourceId, false);
-    }
+    if (GetDisplayInfoForMonitor(monitorIndex, displayInfo))
+        RemoveMHC2ProfileQuiet(passthroughName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
     wchar_t sysDir[MAX_PATH];
     GetSystemDirectory(sysDir, MAX_PATH);
     DeleteFileW((std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + passthroughName).c_str());
-    std::cout << "MHC: disengaged SDR passthrough scanout for monitor " << monitorIndex << std::endl;
+    std::cout << "MHC: preview scanout dropped for monitor " << monitorIndex << (isHDR ? " HDR" : " SDR") << std::endl;
 }
 
 // ----------------------------------------------------------------------------
@@ -916,6 +901,13 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
 // RegenerateMhcIfActive and RebakeHdrMhcForSdrWhite. Returns false (old profile kept) on any failure.
 static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSettings& mhcCopy,
                                        const MHC2ProfileParams& params, uint8_t perm) {
+    if (!mhcCopy.previewScanoutName.empty()) {
+        // A live edit's overlay applies the profile (mhc_preview.h): a re-bake under it would be applied twice.
+        // The edit re-bakes when it ends.
+        std::cout << "[MHC] monitor " << monitorIndex << (isHDR ? " HDR" : " SDR")
+                  << ": re-bake waits for the live edit" << std::endl;
+        return false;
+    }
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return false;
 

@@ -36,7 +36,7 @@ struct AtomicTimePoint {
 // Atomic wrapper that allows copy/move (for use in vector-stored structs).
 // Copies are relaxed (copying a whole context is not a publish). The implicit read/write
 // (`flag = true`, `if (flag)`) is acquire/release: these flags PUBLISH plain data written just
-// before them (e.g. previewResult / previewBaseLut before previewBaseLutDirty), and a relaxed
+// before them (e.g. faldDumpDir before its request flag), and a relaxed
 // store let the compiler sink those writes past the flag. Free on x86 (plain mov).
 template<typename T>
 struct MovableAtomic {
@@ -734,17 +734,15 @@ struct MonitorContext {
     MovableAtomic<bool> sdrMhcGrayscaleActive{ false };   // SDR MHC grayscale installed at GPU scanout
     MovableAtomic<bool> hdrMhcPrimariesActive{ false };   // HDR MHC primaries installed at GPU scanout
     MovableAtomic<bool> hdrMhcGrayscaleActive{ false };   // HDR MHC grayscale installed at GPU scanout
-    MovableAtomic<bool> corrGsPreviewActive{ false };    // Correction GS preview: let shader GS through MHC suppression
 
-    // SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md). When engaged,
-    // SDR scanout is the transient passthrough (identity) profile and the overlay shader
-    // reproduces the WHOLE MHC2 transform (previewResult matrix + previewBaseLut) before the
-    // live correction, so the preview is bit-identical to the bake (incl. per-channel/WB).
-    MovableAtomic<bool> corrGsFullPreviewActive{ false };
-    float previewResult[9] = { 1,0,0, 0,1,0, 0,0,1 };    // net as-applied RGB->RGB matrix (row-major)
-    std::vector<float> previewBaseLut[3];                // per-channel base 1D LUT staged for t11 upload
-    int previewBaseLutSize = 1024;                       // entries per channel in previewBaseLut
-    MovableAtomic<bool> previewBaseLutDirty{ false };    // render thread uploads previewBaseLut to t11 when set
+    // Live edit preview (mhc_preview.h): the overlay applies this display's MHC profile as its last stage while
+    // scanout runs an identity profile. Render-thread owned: pulled from g_mhcPreviewStage whenever
+    // g_mhcPreviewStageGen differs from mhcPreviewGen (a context rebuilt mid-edit starts at 0 and pulls again).
+    bool mhcPreviewOn = false;
+    float mhcPreviewMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };   // MhcScanout::applied (row-major)
+    int mhcPreviewLutSize = 0;                             // entries per channel in the t11 texture
+    bool mhcPreviewHdr = false;                            // the mode the stage is for (applies only in it)
+    unsigned mhcPreviewGen = 0;
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
     MovableAtomic<bool> cbDirty{ true };     // True when constant buffer needs update (GUI thread sets it cross-thread)
@@ -869,6 +867,10 @@ struct MHCSettings {
     bool enabled = false;              // User wants MHC active for this monitor
     std::wstring profilePath;          // Full path to generated .icm file
     std::wstring profileName;          // Filename only (for ICC API)
+    // Runtime only (never saved): while a live edit previews this profile in the overlay (mhc_preview.h), the
+    // identity profile scanout runs instead. The self-heal paths expect THIS name meanwhile (MhcScanoutName), and
+    // permutation swaps / re-bakes wait, so nothing puts the real profile under the overlay's copy of it.
+    std::wstring previewScanoutName;
 
     // Source ICC/Cube file path (if set, profile was generated from this file)
     // When non-empty, primaries + TRC come from the file, not manual editors

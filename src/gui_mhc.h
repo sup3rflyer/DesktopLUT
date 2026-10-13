@@ -11,6 +11,7 @@
 
 struct MHCSettings;
 struct MHC2ProfileParams;
+struct GrayscaleSettings;
 
 // Outcome of the live-preview mode gate (see EvaluatePreviewModeGate).
 enum class PreviewModeGate {
@@ -185,22 +186,23 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm);
 void SwapDgForAllMonitors(bool dgEnabled);
 
 // ============================================================================
-// SDR grayscale FULL-PREVIEW scanout (realization A; CODEX_PREVIEW_BAKE_PROMPT.md)
+// Live edit preview scanout (mhc_preview.h)
 // ============================================================================
-#include <vector>
 
-// Compute the matrix (row-major 3x3) + per-channel base 1D LUT the full-preview shader
-// reproduces, for the PERM_GS-stripped SDR perm. SDR only; false on failure.
-bool ComputeSdrPreviewScanout(int monitorIndex, uint8_t strippedPerm,
-                              float outResult9[9],
-                              std::vector<float>& outBaseLutR,
-                              std::vector<float>& outBaseLutG,
-                              std::vector<float>& outBaseLutB);
+// The correction grayscale fields of a profile's params, exactly as BuildMHC2Params sets them (only when the
+// curve is enabled and has points; otherwise the params are left as they are).
+void SetMhcCorrectionParams(const GrayscaleSettings& correction, MHC2ProfileParams& params);
 
-// Engage/disengage a transient identity SDR scanout profile during the full-preview.
-// Engage returns the installed passthrough profile name (empty on failure).
-std::wstring EngageSdrPassthroughScanout(int monitorIndex);
-void DisengageSdrPassthroughScanout(int monitorIndex, const std::wstring& passthroughName);
+// Install + associate (as the mode's default) a transient identity profile carrying `mhc`'s luminance metadata
+// (the PERM_NOPRIM | PERM_NOGRAY variant's fields), so scanout does nothing while the overlay applies the profile.
+// Returns its name (empty on failure). The real profile stays named in the settings.
+std::wstring EngagePassthroughScanout(int monitorIndex, bool isHDR, const MHCSettings& mhc);
+// Disassociate + delete it. Safe with an empty name.
+void DisengagePassthroughScanout(int monitorIndex, bool isHDR, const std::wstring& passthroughName);
+
+// The profile scanout should run for this mode right now: the live edit's identity profile while one previews
+// (previewScanoutName), else the profile itself. What the verify / reapply / mode-switch paths re-assert.
+const std::wstring& MhcScanoutName(const MHCSettings& m);
 
 // ============================================================================
 // Identity (neutral) MHC2 profile on explicit Remove / disable (see mhc.h)

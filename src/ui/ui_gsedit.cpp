@@ -199,7 +199,6 @@ void OpenGsEditor(ViewState& vs, const DisplayRow& r, bool hdr) {
             const MHCSettings& m = hdr ? g_gui.monitorSettings[(size_t)mon].hdrMHC : g_gui.monitorSettings[(size_t)mon].sdrMHC;
             ed->work = m.correctionGrayscale;
             ed->bakePeakNits = MhcProfileMetadataPeakNits(m, hdr);
-            ed->curvePeakNits = m.correctionGrayscale.peakNits;
         }
         ed->zoom = FittingZoom(ed->work, hdr);
         ed->selected = 1;   // the first point above black: ready for the keys
@@ -228,6 +227,11 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     bool changed = false;
     const float zoom = kZooms[ed.zoom];
     const GsCurve curve = MakeGsCurve(ed.work, hdr, ed.bakePeakNits);
+    // The overlay applies the edited profile while the display shows this mode (it may switch mid-edit).
+    const DisplayRow* row = nullptr;
+    for (const DisplayRow& r : snap.live) if (r.liveIndex == ed.mon) row = &r;
+    const bool previewing = ed.renderOnly ||
+        (act::GsEditPreviewing() && row && (row->mode == Mode::Unknown || (row->mode == Mode::HDR) == hdr));
 
     // ---- toolbar: what the bank's faders move, the scale, the key step; the actions at the right -------
     {
@@ -258,14 +262,9 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         // A condition worth knowing, as a label (its explanation in the tooltip); drawn without layout.
         const char* label = nullptr;
         const char* tip = nullptr;
-        char peak[64];
-        if (!ed.renderOnly && !act::GsEditPreviewing()) {
-            label = hdr ? "NO PREVIEW \xC2\xB7 DISPLAY IN SDR" : "NO PREVIEW \xC2\xB7 DISPLAY IN HDR";
-            tip = "The display is in the other mode: nothing to preview. The edit applies when it switches.";
-        } else if (hdr && std::fabs(ed.curvePeakNits - ed.bakePeakNits) > 0.5f) {
-            snprintf(peak, sizeof(peak), "CURVE PEAK %.0f \xC2\xB7 PROFILE %.0f", ed.curvePeakNits, ed.bakePeakNits);
-            label = peak;
-            tip = "The bake places the points by the profile's peak; the live preview by CURVE PEAK.\nThe curve here is the bake's.";
+        if (!previewing) {
+            label = "NO PREVIEW";
+            tip = "The display left this mode: nothing to preview. The edit applies when it is back.";
         }
         if (label) {
             const float x0 = afterStep + Px(14);
@@ -530,8 +529,8 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
     // The patch: the selected point's input on the edited display, while the display shows this mode.
     if (!ed.renderOnly) {
         HMONITOR hmon = nullptr;
-        for (const DisplayRow& r : snap.live) if (r.liveIndex == ed.mon) hmon = r.hmon;
-        if (ed.patch != PatchSize::Off && hmon && act::GsEditPreviewing()) {
+        if (row) hmon = row->hmon;
+        if (ed.patch != PatchSize::Off && hmon && previewing) {
             PatchLevel level;
             level.hdr = hdr;
             level.value = GsPatchValue(ed.selected >= 0 ? ed.selected : 0, n, hdr, curve.pqPeak, ed.codeCap);

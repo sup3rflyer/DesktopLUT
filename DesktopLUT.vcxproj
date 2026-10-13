@@ -105,6 +105,7 @@
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\mhc_icc.cpp" />
     <ClCompile Include="src\mhc_install.cpp" />
+    <ClCompile Include="src\mhc_preview.cpp" />
     <ClCompile Include="src\mhc_read.cpp" />
     <ClCompile Include="src\whitelist.cpp" />
     <ClCompile Include="src\framepacer.cpp" />
@@ -155,6 +156,8 @@
     <ClInclude Include="src\fald.h" />
     <ClInclude Include="shared\fald_shader.h" />
     <ClInclude Include="shared\tonemap_curves.h" />
+    <ClInclude Include="shared\mhc_scanout_hlsl.h" />
+    <ClInclude Include="src\mhc_preview.h" />
     <ClInclude Include="src\lut.h" />
     <ClInclude Include="src\color.h" />
     <ClInclude Include="src\settings.h" />

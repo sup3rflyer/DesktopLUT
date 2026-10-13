@@ -585,9 +585,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ApiMethodSpec(
             "mhc.grayscale_live_begin",
             "Engage the correction-grayscale LIVE-EDIT preview (the GUI editor's 'Edit Points' "
-            "over the pipe): the correction GS stacks on top of MHC+3D-LUT so the meter sees it. "
-            "Snapshots the pre-begin correctionGrayscale for cancel/abort restore. Errors if a "
-            "session (or the GUI editor) is already active for this monitor/mode.",
+            "over the pipe): scanout runs an identity profile while the overlay applies the very "
+            "profile the commit installs (same matrix and LUT entries, the live curve composed in), "
+            "so the meter sees the bake, after the 3D LUT. Snapshots the pre-begin "
+            "correctionGrayscale for cancel/abort restore. Errors if a session (or a GUI editor) "
+            "is already active, or the mode has no installed MHC profile.",
             {"monitor": _monitor_param(), "mode": _mode_param()},
             {"monitor_mode": "string", "preview": "boolean true"},
             mutates_state=True,

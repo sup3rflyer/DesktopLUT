@@ -13,6 +13,7 @@
 #include "version.h"
 #include "globals.h"
 #include "gui.h"
+#include "gui_mhc.h"   // MhcProfileMetadataPeakNits
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -849,7 +850,14 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     EndRow(row);
 
     row = BeginRow("FINE-TUNE");
-    ImGui::BeginDisabled(mhc.bypassGrayscale);
+    // The edit previews exactly what the bake installs: it needs that profile, and the display in this mode.
+    const bool inMode = r.mode == Mode::Unknown || (r.mode == Mode::HDR) == hdr;
+    const char* cannot = mhc.bypassGrayscale ? nullptr
+                       : r.liveIndex < 0 ? "Display not connected."
+                       : mhc.profileName.empty() ? "Needs an installed MHC profile."
+                       : !inMode ? (hdr ? "Display is in SDR." : "Display is in HDR.") : nullptr;
+    if (cannot) RowTip(row, cannot);
+    ImGui::BeginDisabled(mhc.bypassGrayscale || cannot != nullptr);
     const int b = RowButtons(row, "gs", { "EDIT CURVE\xE2\x80\xA6", "RESET" });
     ImGui::EndDisabled();
     if (b == 0) {
@@ -881,12 +889,9 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     EndRow(row);
 
     if (hdr) {
-        row = BeginRow("CURVE PEAK");
-        RowPlace(row);
-        float peak = gs.peakNits;
-        if (NumberInput("##gs_peak", &peak, "%.0f", 80)) PostTo(r, [peak](int mon) { act::MhcSetCorrectionGsPeak(mon, peak); });
-        RowNext(row);
-        RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
+        row = BeginRow("PEAK");
+        RowTip(row, "Where the HDR points sit: the profile's peak (set with the base curve).");
+        RowText(row, Fmt("%.0f nits", MhcProfileMetadataPeakNits(mhc, true)), pal::InkDim);
         EndRow(row);
 
         row = BeginRow("DESKTOP GAMMA");

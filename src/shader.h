@@ -6,6 +6,7 @@
 #include "../shared/peak_detect.h"     // g_peakReduceCSSource / g_peakSmoothCSSource
 #include "../shared/tonemap_curves.h"  // DLUT_TONEMAP_CURVES_HLSL (SoftClip / Reinhard, shared with the hook)
 #include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF output dither, shared with the hook)
+#include "../shared/mhc_scanout_hlsl.h" // DLUT_MHC_SCANOUT_HLSL (the live edit preview's MHC2 stage, CPU twin in mhc_icc.cpp)
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -124,11 +125,11 @@ cbuffer LUTParams : register(b0) {
     float motionBarPosition;
     float grayscaleICtCp;          // HDR: use ICtCp offsets instead of PQ per-channel gains
     float hdrDitherLsb;            // HDR output dither amplitude: 1/1023 (+-1 LSB 10-bit PQ, TPDF) or 0 = off
-    // SDR grayscale FULL-PREVIEW (realization A; CODEX_PREVIEW_BAKE_PROMPT.md). xyz = net
-    // as-applied MHC2 RGB->RGB matrix rows; w packs flags.
-    float4 corrPreviewMatRow0;     // xyz = result row 0; w = corrGsFullPreview (0/1)
-    float4 corrPreviewMatRow1;     // xyz = result row 1; w = base-LUT size (entries)
-    float4 corrPreviewMatRow2;     // xyz = result row 2; w = reserved
+    // Live edit preview (mhc_preview.h): this display's scanout runs an identity profile and the shader applies
+    // its MHC profile last (DLUT_MHC_SCANOUT_HLSL, LUTs in t11). xyz = the as-applied matrix rows.
+    float4 mhcPreviewRow0;         // w = on (0/1)
+    float4 mhcPreviewRow1;         // w = LUT entries per channel
+    float4 mhcPreviewRow2;         // w = reserved
     float sdrWhiteScRGB;           // Desktop gamma reference white: Windows SDR white level / 80 (scRGB units)
     float sdrWhiteScRGBRcp;        // 1 / sdrWhiteScRGB (CPU-computed: exactly 1.0 at 80 nits)
 };
@@ -144,9 +145,7 @@ Texture2D<float> srgbOetfLUT : register(t7);      // sRGB OETF: Linear->sRGB (10
 Texture2D<float> srgbEotfLUT : register(t8);      // sRGB EOTF: sRGB->Linear (1024x1)
 Texture2D<float> gammaRatioLUT : register(t9);     // pow(Y, 1/11) ratio for 2.4 gamma (1024x1)
 Texture2D<float> wbGammaLUT : register(t10);       // pow(gain, 1/2.2) for WB gains [0,2] (512x1)
-Texture2D<float> baseLutPreviewR : register(t11);  // SDR grayscale full-preview base 1D LUT (R)
-Texture2D<float> baseLutPreviewG : register(t12);  // SDR grayscale full-preview base 1D LUT (G)
-Texture2D<float> baseLutPreviewB : register(t13);  // SDR grayscale full-preview base 1D LUT (B)
+Texture2D<float> mhcPreviewLut : register(t11);    // live edit preview: the profile's LUTs, rows R/G/B (4096x3)
 SamplerState pointSampler : register(s0);
 SamplerState linearSampler : register(s1);
 SamplerState wrapSampler : register(s2);
@@ -245,72 +244,9 @@ float3 ApplySDRCorrections(float3 rgb) {
     return rgb;
 }
 
-// Sample the per-channel SDR base 1D LUT (full-preview). Size = corrPreviewMatRow1.w.
-float sampleBaseLutPreview(float v, int ch) {
-    float n = max(corrPreviewMatRow1.w, 2.0f);
-    float scale = (n - 1.0f) / n;
-    float bias = 0.5f / n;
-    float u = saturate(v) * scale + bias;
-    if (ch == 0) return baseLutPreviewR.SampleLevel(linearSampler, float2(u, 0.5f), 0);
-    if (ch == 1) return baseLutPreviewG.SampleLevel(linearSampler, float2(u, 0.5f), 0);
-    return baseLutPreviewB.SampleLevel(linearSampler, float2(u, 0.5f), 0);
-}
-
-// Per-channel correction, mirroring the bake's EvalGrayscaleSDR_Channel EXACTLY (mhc.cpp:107):
-// index by sqrt(this channel's value), interpolate the channel curve in sqrt domain, square.
-// This is NOT the luma-ratio ApplyGrayscaleCorrection — that only matches the bake for gray; the
-// bake composes per-channel curves into the LUT, so per-channel/WB corrections need this form.
-float evalCorrChannelPreview(float v, int ch) {
-    if (v <= 0.0f) return 0.0f;
-    float pc = max(2.0f, grayscalePoints);
-    float idx = sqrt(saturate(v)) * (pc - 1.0f);
-    int i0 = (int)floor(idx);
-    int i1 = min(i0 + 1, (int)pc - 1);
-    float t = idx - floor(idx);
-    float v0, v1;
-    if (ch == 0)      { v0 = grayscaleR[i0/4][i0%4]; v1 = grayscaleR[i1/4][i1%4]; }
-    else if (ch == 1) { v0 = grayscaleG[i0/4][i0%4]; v1 = grayscaleG[i1/4][i1%4]; }
-    else              { v0 = grayscaleB[i0/4][i0%4]; v1 = grayscaleB[i1/4][i1%4]; }
-    float s0 = sqrt(max(v0, 0.0f));
-    float s1 = sqrt(max(v1, 0.0f));
-    float cs = lerp(s0, s1, t);
-    return cs * cs;
-}
-
-// SDR grayscale FULL-PREVIEW (realization A): reproduce the ENTIRE MHC2 SDR scanout
-// (sRGB-decode -> as-applied matrix -> sRGB-encode -> base 1D LUT), then apply the live
-// correction LAST (per-channel, signal-domain, post base LUT) — exactly as the bake composes
-// it. Scanout is the identity passthrough during preview, so the shader output IS the panel
-// signal (no inversion). Input/output: sRGB-encoded signal. Matches GenerateMHC2Profile.
-// corrPreviewMatRow2.w = correctionGrayscale.use24Gamma (per-channel 2.2->2.4, like the bake).
-float3 ApplyFullGsPreviewSDR(float3 sig) {
-    float3x3 M = float3x3(corrPreviewMatRow0.xyz, corrPreviewMatRow1.xyz, corrPreviewMatRow2.xyz);
-    // Reproduce scanout up to the base-LUT output (the signal the bake corrects).
-    float3 lin = sRGB_EOTF3(sig);
-    float3 mlin = max(mul(M, lin), 0.0f);
-    float3 vbase = sRGB_OETF3(mlin);
-    vbase = float3(sampleBaseLutPreview(vbase.r, 0),
-                   sampleBaseLutPreview(vbase.g, 1),
-                   sampleBaseLutPreview(vbase.b, 2));
-    // Per-channel correction, exactly as the bake composes EvalGrayscaleSDR_Channel.
-    float3 outSig = float3(evalCorrChannelPreview(vbase.r, 0),
-                           evalCorrChannelPreview(vbase.g, 1),
-                           evalCorrChannelPreview(vbase.b, 2));
-    // Correction-grayscale 2.4 gamma — PER-CHANNEL pow(lin, 2.4/2.2) (mhc_icc.cpp compose),
-    // realized as lin * pow(lin, 1/11) via gammaRatioLUT. Not the luma-based Apply24GammaLinear.
-    if (corrPreviewMatRow2.w > 0.5f) {
-        float gscale = 1023.0f / 1024.0f;
-        float gbias = 0.5f / 1024.0f;
-        float3 l = sRGB_EOTF3(outSig);
-        float3 ratio = float3(
-            gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(l.x) * gscale + gbias, 0.5f), 0),
-            gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(l.y) * gscale + gbias, 0.5f), 0),
-            gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(l.z) * gscale + gbias, 0.5f), 0));
-        outSig = sRGB_OETF3(max(l * ratio, 0.0f));
-    }
-    return saturate(outSig);   // bake clamps each composed LUT entry to [0,1]
-}
 )"
+// The live edit preview's MHC2 stage (one copy shared with the tests; CPU twin EvalMhcScanout)
+DLUT_MHC_SCANOUT_HLSL
 // Part 2b: ICTCP color space infrastructure (Dolby ICtCp for HDR)
 // Based on Dolby white paper "What is ICtCp?" v7.1
 // Provides perceptually uniform processing for tonemapping and grayscale
@@ -759,29 +695,45 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
         // STAGE 7: LUT application or passthrough -> Output
         // ═══════════════════════════════════════════════════════════════════════
 
-        // Output dither in the display quantizer's domain (PQ), AFTER the LUT (shared/hdr_dither.h).
+        // Output dither in the display quantizer's domain (PQ), AFTER the LUT (shared/hdr_dither.h). With the live
+        // edit preview on, the profile stage below is the last step and the dither follows it instead.
+        bool mhcPreview = mhcPreviewRow0.w > 0.5f;
+        float ditherLsb = mhcPreview ? 0.0f : hdrDitherLsb;
         float3 linearRec2020;
         if (usePassthrough > 0.5) {
             // No LUT — skip the PQ round-trip unless dithering; then today's value plus only the dither's
             // linear delta (colours outside Rec.2020 pass through untouched).
             linearRec2020 = rec2020_out;
-            if (hdrDitherLsb > 0.0f) {
+            if (ditherLsb > 0.0f) {
                 float3 pq0 = Linear_to_PQ(saturate(rec2020_out));
-                linearRec2020 += PQ_to_Linear(DlutDitherPQ(pq0, HdrDitherNoise(pos.xy), hdrDitherLsb))
+                linearRec2020 += PQ_to_Linear(DlutDitherPQ(pq0, HdrDitherNoise(pos.xy), ditherLsb))
                                  - PQ_to_Linear(pq0);
             }
             linearRec2020 *= (10000.0f / 80.0f);
         } else {
             float3 pqRGB = Linear_to_PQ(rec2020_out);
             float3 lutResult = SampleLUT(pqRGB);
-            if (hdrDitherLsb > 0.0f)
-                lutResult = saturate(DlutDitherPQ(lutResult, HdrDitherNoise(pos.xy), hdrDitherLsb));
+            if (ditherLsb > 0.0f)
+                lutResult = saturate(DlutDitherPQ(lutResult, HdrDitherNoise(pos.xy), ditherLsb));
             linearRec2020 = PQ_to_Linear(lutResult) * (10000.0f / 80.0f);
         }
 
         // White balance: applied after LUT (which was calibrated for D65 input)
         if (useManualCorrection > 0.5) {
             linearRec2020 *= float3(primariesRow0.w, primariesRow1.w, primariesRow2.w);
+        }
+
+        // Live edit preview (mhc_preview.h): scanout runs an identity profile, so the display's profile is applied
+        // here, to exactly what this overlay would otherwise hand to scanout (BT.2020, 10000 nits = 1). The output
+        // goes back through Windows' scRGB -> PQ conversion, the inverse of the decode below.
+        if (mhcPreview) {
+            float3x3 mm = float3x3(mhcPreviewRow0.xyz, mhcPreviewRow1.xyz, mhcPreviewRow2.xyz);
+            float3 outPQ = DlutMhcScanout(linearRec2020 * (80.0f / 10000.0f), mm, mhcPreviewLut,
+                                          (int)mhcPreviewRow1.w, true);
+            if (hdrDitherLsb > 0.0f)
+                outPQ = saturate(DlutDitherPQ(outPQ, HdrDitherNoise(pos.xy), hdrDitherLsb));
+            linearRec2020 = float3(DlutMhcPqEotf(outPQ.x), DlutMhcPqEotf(outPQ.y), DlutMhcPqEotf(outPQ.z))
+                            * (10000.0f / 80.0f);
         }
 
         // Rec.2020 -> BT.709 (scRGB output)
@@ -817,6 +769,9 @@ float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {
 R"(
     else {
         float3 input = color.rgb;
+        // Nothing here changes the frame (the overlay would sleep): the live edit preview then takes the desktop
+        // as scanout would (ACM: the FP16 value itself, not a sRGB encode/decode round trip of it).
+        bool sdrIdle = usePassthrough > 0.5 && useManualCorrection < 0.5 && grayscaleEnabled < 0.5 && grayscale24 < 0.5;
 
         // ═══════════════════════════════════════════════════════════════════════
         // STAGE 1-2: Input handling + primaries (mode-dependent)
@@ -845,11 +800,7 @@ R"(
         // STAGE 3: Linear-space corrections (matches MHC 1D LUT pipeline)
         // Single sRGB decode/encode roundtrip for grayscale + 2.4 gamma
         // ═══════════════════════════════════════════════════════════════════════
-        if (corrPreviewMatRow0.w > 0.5)
-            // Full-preview (realization A): scanout is identity passthrough; reproduce the
-            // WHOLE MHC2 transform + live correction so preview is bit-identical to the bake.
-            input = ApplyFullGsPreviewSDR(input);
-        else if (grayscaleEnabled > 0.5 || grayscale24 > 0.5)
+        if (grayscaleEnabled > 0.5 || grayscale24 > 0.5)
             input = ApplySDRCorrections(input);
 
         float3 corrected;
@@ -870,6 +821,25 @@ R"(
         }
 
         // ═══════════════════════════════════════════════════════════════════════
+        // STAGE 3b: Live edit preview (mhc_preview.h). Scanout runs an identity profile, so the display's profile
+        // is applied here, last, to exactly what this overlay would otherwise hand to scanout: legacy the encoded
+        // signal (the profile's sRGB degamma), ACM the linear value it would output (scanout encodes and the
+        // profile decodes it again). The output is then the panel's signal.
+        // ═══════════════════════════════════════════════════════════════════════
+        bool mhcPreview = mhcPreviewRow0.w > 0.5f;
+        if (mhcPreview) {
+            float3x3 mm = float3x3(mhcPreviewRow0.xyz, mhcPreviewRow1.xyz, mhcPreviewRow2.xyz);
+            float3 lin;
+            if (isFP16SDR > 0.5)
+                lin = sdrIdle ? color.rgb : sRGB_EOTF3(max(corrected, 0.0));
+            else {
+                float3 w = saturate(corrected);
+                lin = float3(DlutMhcSrgbEotf(w.r), DlutMhcSrgbEotf(w.g), DlutMhcSrgbEotf(w.b));
+            }
+            corrected = DlutMhcScanout(lin, mm, mhcPreviewLut, (int)mhcPreviewRow1.w, false);
+        }
+
+        // ═══════════════════════════════════════════════════════════════════════
         // STAGE 4: Dithering + Output conversion
         // ═══════════════════════════════════════════════════════════════════════
         // Dither in encoded/gamma space (before EOTF decode) so 1/1024 magnitude is correct
@@ -879,8 +849,14 @@ R"(
         float3 dithered = corrected.rgb + dither;
 
         if (isFP16SDR > 0.5) {
-            // ACM: FP16 swapchain expects linear - sRGB decode
-            dithered = sRGB_EOTF3(max(dithered, 0.0));
+            // ACM: FP16 swapchain expects linear - sRGB decode. The preview's output is the panel's signal and
+            // scanout re-encodes this value, so it is decoded exactly (the inverse of that encode).
+            if (mhcPreview) {
+                float3 w = saturate(dithered);
+                dithered = float3(DlutMhcSrgbEotf(w.r), DlutMhcSrgbEotf(w.g), DlutMhcSrgbEotf(w.b));
+            } else {
+                dithered = sRGB_EOTF3(max(dithered, 0.0));
+            }
         }
         // Legacy: R10G10B10A2 + G22 swapchain - already sRGB-encoded
         float4 finalColor = float4(dithered, 1.0);
