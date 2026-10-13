@@ -62,18 +62,18 @@ MIX_OFFSET = {"G": 0.40, "B": 0.40, "R": 0.40}
 MIX_RADIUS = {"G": 0.57, "B": 0.57, "R": 0.57}
 # Sphere and haze, in units of R (cube centre to top vertex; the faces' inner
 # corners sit at 0.93-1.04 R, the middles of the outer edges at about 0.83 R).
-SPHERE_RADIUS = 0.86         # radius of the sphere the mix is wrapped on
+SPHERE_RADIUS = 0.94         # radius of the sphere the mix is wrapped on
 SPHERE_BULGE = 0.6           # 0 = flat, 1 = full sphere
 SPHERE_RAISE = 0.08          # cloud centre above the cube centre, so the white-grey
                              # middle spills a little onto the green (top) face
 CLOUD_BLUR = 0.18            # Gaussian sigma of the haze
-CLOUD_DENSITY = 2.0          # haze opacity: alpha' = 1 - (1 - alpha)^density
+CLOUD_DENSITY = 2.5          # haze opacity: alpha' = 1 - (1 - alpha)^density
 CLOUD_VALUE = 0.5            # 0 = blends are the plain average, 1 = lifted to full value
 
 # Back edges (the three hidden edges of the box) -----------------------------
 # Crisp black lines behind the cloud: sharp wherever the cloud does not reach,
 # veiled only by the cloud's own haze in front of them.
-BACK_EDGE_WIDTH = 0.45       # line width, in frame widths
+BACK_EDGE_WIDTH = 0.82       # line width, in frame widths
 
 # Rendering ------------------------------------------------------------------
 SIZES = [16, 20, 24, 32, 40, 48, 64, 96, 128, 256, 512, 1024]

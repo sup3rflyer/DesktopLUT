@@ -38,13 +38,13 @@ The generator needs only Pillow and numpy, and its output is deterministic. Ever
 | `FRAME_WIDTH` | 0.046 | frame width / logo height (12 px at 256) |
 | `MIX_ANGLE` | 120 | blue and red circles at -/+ this angle from green |
 | `MIX_OFFSET`, `MIX_RADIUS` | 0.40, 0.57 | circle centre distance and radius, in sphere radii |
-| `SPHERE_RADIUS` | 0.86 | sphere radius, as a fraction of R (cube centre to top vertex) |
+| `SPHERE_RADIUS` | 0.94 | sphere radius, as a fraction of R (cube centre to top vertex) |
 | `SPHERE_BULGE` | 0.6 | 0 = flat mix, 1 = full equidistant wrap |
 | `SPHERE_RAISE` | 0.08 | cloud centre above the cube centre, fraction of R |
 | `CLOUD_BLUR` | 0.18 | Gaussian sigma of the haze, fraction of R |
-| `CLOUD_DENSITY` | 2.0 | haze opacity: alpha' = 1 - (1 - alpha)^density |
+| `CLOUD_DENSITY` | 2.5 | haze opacity: alpha' = 1 - (1 - alpha)^density |
 | `CLOUD_VALUE` | 0.5 | 0 = blends are the plain average, 1 = lifted to full value |
-| `BACK_EDGE_WIDTH` | 0.45 | back-edge line width, in frame widths |
+| `BACK_EDGE_WIDTH` | 0.82 | back-edge line width, in frame widths |
 | `SMALL` | per size | hinting for 16–64 px |
 
 ## Colour
