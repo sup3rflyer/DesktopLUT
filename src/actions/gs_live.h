@@ -25,5 +25,6 @@ bool GsEditActive();
 int GsEditMonitor();      // -1 when none
 bool GsEditHdr();
 bool GsEditPreviewing();  // the overlay shows the edit (always, while an edit runs: Begin refuses otherwise)
+unsigned GsEditHeld();    // what the edit holds off that was on (kMhcHeld* in mhc_preview.h)
 
 }  // namespace act

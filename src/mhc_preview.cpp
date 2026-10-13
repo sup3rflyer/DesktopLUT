@@ -22,6 +22,7 @@ namespace {
 std::atomic<bool> g_previewActive{ false };   // one preview at a time (one LUT texture in the overlay, one block in the hook)
 std::atomic<bool> g_previewOnHook{ false };   // ...and the hook applies it (the overlay is not needed for it)
 std::atomic<int> g_previewMon{ -1 };          // the display it previews (-1 = none)
+std::atomic<bool> g_previewHdr{ false };      // ...in this mode
 uint32_t g_hookGen = 0;                       // the generation last handed to the hook (GUI thread)
 
 constexpr DWORD kHookAckWaitMs = 2000;        // the DLL acknowledges at its next present (DWM is made to present)
@@ -114,25 +115,25 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
     };
     if (s.active || g_previewActive) return fail(L"Another live edit is in progress");
     MHCSettings mhc;
-    bool fald = false;
+    unsigned held = 0;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         if (mon < 0 || mon >= (int)g_gui.monitorSettings.size()) return fail(L"No such display");
         mhc = MhcOf(mon, hdr);
-        const FaldSettings& f = hdr ? g_gui.monitorSettings[mon].hdrColorCorrection.fald
-                                    : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        fald = f.enabled && !f.paramsPath.empty();
+        const ColorCorrectionSettings& cc = hdr ? g_gui.monitorSettings[mon].hdrColorCorrection
+                                                : g_gui.monitorSettings[mon].sdrColorCorrection;
+        if (hdr && cc.tonemap.enabled) held |= kMhcHeldTonemap;
+        if (cc.fald.enabled && !cc.fald.paramsPath.empty()) held |= kMhcHeldFald;
+        if (hdr && mhc.desktopGammaEnabled) held |= kMhcHeldDesktopGamma;
     }
     // The bake (RegenerateMhcIfActive) installs a profile only where one is named: without one there is nothing
     // the edit would change on screen, so nothing to preview either.
     if (mhc.profileName.empty()) return fail(L"No MHC profile installed for this mode");
     if (!IsMHC2ApiAvailable()) return fail(L"MHC profiles need Windows 10 21H2 or later");
-    // The FALD pass runs after the pass that applies the preview (overlay and hook alike): the profile would land
-    // before FALD instead of after it, so the preview would not be the bake.
-    if (fald) return fail(L"FALD is on for this display");
 
     MhcPreviewSession n;
     if (!PrepareMhcPreview(mhc, hdr, mon, n)) return fail(L"The profile's source file cannot be read");
+    n.held = held;
     n.onHook = MhcPreviewUsesHook();
     // What scanout runs now, to put back if the preview cannot start after the identity profile went on.
     DisplayInfo di;
@@ -147,9 +148,11 @@ bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why)
         if (mon < (int)g_gui.monitorSettings.size()) MhcOf(mon, hdr).previewScanoutName = n.passthrough;
     }
     n.active = true;
-    g_previewActive = true;
-    g_previewOnHook = n.onHook;
+    // The hold starts with the first publish (the hook's config carries both; the overlay reads it each frame).
     g_previewMon = mon;
+    g_previewHdr = hdr;
+    g_previewOnHook = n.onHook;
+    g_previewActive = true;
     s = std::move(n);
     UpdateMhcPreview(s, mhc.correctionGrayscale);
 
@@ -176,9 +179,10 @@ bool PrepareMhcPreview(const MHCSettings& mhc, bool hdr, int mon, MhcPreviewSess
     s = MhcPreviewSession{};
     s.mon = mon;
     s.hdr = hdr;
-    // The variant the bake will install, without its correction (composed live). Built from the settings, like the
-    // bake: a desktop gamma variant the whitelist or the hotkey has swapped in meanwhile is not what it installs.
-    s.perm = (uint8_t)(ComputeMhcPermutation(mhc, hdr) & ~MHCSettings::PERM_GS);
+    // The variant the bake will install, without its correction (composed live) and without desktop gamma (held for
+    // the edit: the points are measured against PQ / the target gamma, and the bake puts desktop gamma back on top,
+    // last, as always). Built from the settings, like the bake.
+    s.perm = (uint8_t)(ComputeMhcPermutation(mhc, hdr) & ~(MHCSettings::PERM_GS | MHCSettings::PERM_DG));
     return BuildMHC2ParamsForPerm(mhc, hdr, mon, s.perm, s.params) && ComputeMhcScanoutBase(s.params, s.base);
 }
 
@@ -257,16 +261,21 @@ void EndMhcPreview(MhcPreviewSession& s) {
     if (!s.active) return;
     StopMhcPreviewDraw(s);   // no-op work when the caller already stopped it
     DisengagePassthroughScanout(s.mon, s.hdr, s.passthrough);
+    // The hold ends after the real profile is back on scanout: tone mapping and FALD return over it.
+    const bool onHook = s.onHook;
     g_previewActive = false;
     g_previewOnHook = false;
     g_previewMon = -1;
     g_hookGen = 0;
     s = MhcPreviewSession{};
+    if (onHook) UpdateDwmHookSharedConfig();   // the hook's tone mapping / FALD flags (the overlay reads it per frame)
 }
 
 bool MhcPreviewActive() { return g_previewActive; }
 
-bool MhcPreviewOnDisplay(int mon) { return g_previewActive && g_previewMon.load() == mon; }
+bool MhcPreviewHolds(int mon, bool hdr) {
+    return g_previewActive.load() && g_previewMon.load() == mon && g_previewHdr.load() == hdr;
+}
 
 bool MhcPreviewApplied(const MhcPreviewSession& s) {
     if (!s.active) return false;

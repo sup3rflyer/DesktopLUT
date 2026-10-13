@@ -1071,11 +1071,6 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     want("desktop_gamma", hasDg, dg);
     want("tonemap", hasTm, tm);
     want("fald", hasFd, fd);
-    if (hasFd && fd && MhcPreviewOnDisplay(mon)) {
-        // The FALD pass would land after the live edit's preview (mhc_preview.h): not the bake.
-        error = "fald cannot be switched on during a live grayscale edit on this display";
-        return;
-    }
     if (!isHDR && (hasDg || hasTm)) {
         // HDR-only layers; asking to change them in SDR is a client error, asking
         // for them OFF is a harmless no-op (a "disable everything" client). fald is per mode.

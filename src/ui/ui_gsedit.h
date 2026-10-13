@@ -39,6 +39,7 @@ struct GsEditorState {
     float dragAccum = 0.0f;
     int pendingCount = 0;       // a point count picked this frame, applied once the frame is drawn (0 = none)
     bool renderOnly = false;    // drawn without a live edit (the screenshot test); never set by the interface
+    unsigned renderHeld = 0;    // renderOnly: the held layers to show (kMhcHeld*)
 };
 
 // The BASE / FINE-TUNE rows' EDIT CURVE: begins the live edit of that curve (posted) and opens the editor.

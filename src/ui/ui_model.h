@@ -41,6 +41,7 @@ struct PathRuntime {
     bool running = false;      // the live layers run
     bool hookMode = false;     // the DWM hook engine (else the overlay)
     bool hookActive = false;   // the hook is injected
+    bool editHeld = false;     // a live edit holds tone mapping and FALD off on this display, this mode (mhc_preview.h)
 };
 
 // The pixel path for one display, in pixel order: what the desktop goes through on its way to the

@@ -90,6 +90,28 @@ TEST_CASE("ui_model: FALD exists only with a panel file and only runs on FP16 ba
     CHECK(Get(off, StageId::Fald).dimmed);
 }
 
+TEST_CASE("ui_model: a live edit's hold shows tone mapping and FALD switched off (a ring)") {
+    MonitorSettings ms;
+    ms.hdrColorCorrection.tonemap.enabled = true;
+    ms.hdrColorCorrection.fald.paramsPath = L"panel_hdr.bin";
+    ms.hdrColorCorrection.fald.enabled = true;
+    PathRuntime rt = Running();
+    rt.editHeld = true;
+    auto p = BuildPixelPath(ms, Mode::HDR, Mode::HDR, rt);
+    CHECK(Get(p, StageId::ToneMap).light == Light::Off);
+    CHECK(Get(p, StageId::ToneMap).dimmed);
+    CHECK(Get(p, StageId::Fald).light == Light::Off);
+    CHECK(Get(p, StageId::Fald).dimmed);
+    rt.editHeld = false;
+    p = BuildPixelPath(ms, Mode::HDR, Mode::HDR, rt);
+    CHECK(Get(p, StageId::ToneMap).light == Light::Configured);
+    CHECK(Get(p, StageId::Fald).light == Light::Configured);
+    // Nothing set stays nothing (no light), held or not.
+    MonitorSettings none;
+    rt.editHeld = true;
+    CHECK(Get(BuildPixelPath(none, Mode::HDR, Mode::HDR, rt), StageId::ToneMap).light == Light::None);
+}
+
 TEST_CASE("ui_model: the overlay shader tweak is a stage whenever it is active") {
     MonitorSettings ms;
     CHECK_FALSE(Has(BuildPixelPath(ms, Mode::SDR, Mode::SDR), StageId::ShaderTweak));

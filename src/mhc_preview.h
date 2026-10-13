@@ -7,8 +7,13 @@
 // GenerateMHC2Profile writes the file from), with the edited curve composed in. Each edit recomposes the LUTs on the
 // CPU (no files, no profile I/O); the bake at the end installs the profile that was on screen.
 //
-// Who applies it: the DWM hook when it is live (hook mode — it applies the 3D LUT and tonemap itself, so the preview
-// follows them in the same pass and no overlay is needed), otherwise the overlay (after its own 3D LUT).
+// Who applies it: the DWM hook when it is live (hook mode — it applies the 3D LUT itself, so the preview follows it in
+// the same pass and no overlay is needed), otherwise the overlay (after its own 3D LUT).
+//
+// Ready to measure: what would stand between the patch and a PQ / gamma reading is held off on the edited display
+// for the edit — tone mapping and FALD (MhcPreviewHolds; the engines read it, the settings are not touched), and
+// desktop gamma (left out of the previewed profile). All return with DONE / CANCEL: the bake has desktop gamma again,
+// and the hold ends with the session.
 //
 // One preview at a time, GUI thread. Used by the interface's editor (actions/gs_live), the classic editor
 // (gui.cpp ID_MHC_*_GS_EDIT) and the pipe's mhc.grayscale_live_* (desktoplut_ipc_server.cpp).
@@ -21,11 +26,17 @@
 #include <string>
 #include <vector>
 
+// Layers a preview holds off on its display (MhcPreviewSession::held).
+constexpr unsigned kMhcHeldTonemap = 1u;
+constexpr unsigned kMhcHeldFald = 2u;
+constexpr unsigned kMhcHeldDesktopGamma = 4u;
+
 struct MhcPreviewSession {
     bool active = false;
     int mon = -1;
     bool hdr = false;
     bool onHook = false;          // the DWM hook applies it (else the overlay)
+    unsigned held = 0;            // what the edit holds off that was on (kMhcHeld*), for the editor's label
     std::wstring passthrough;     // the identity profile on scanout meanwhile (dropped by EndMhcPreview)
     MHC2ProfileParams params;     // the profile's inputs without the correction (source files read once, at begin)
     uint8_t perm = 0;             // its permutation without PERM_GS
@@ -38,9 +49,9 @@ struct MhcPreviewSession {
 // not in that mode, or no overlay could run for it. Pumps messages.
 bool ReadyMhcPreviewDisplay(int mon, bool hdr, bool& startedForPreview, bool& startedOverlayForPreview);
 // Starts the preview of display `mon`'s `hdr` profile (after ReadyMhcPreviewDisplay). Requires an installed profile
-// for the mode (without one nothing is baked, so there is nothing to preview), FALD off on the display (its pass
-// follows the one that applies the preview), and no other preview. With the hook it waits for the DLL to acknowledge
-// (pumps messages). False = nothing changed (`why` says what is missing).
+// for the mode (without one nothing is baked, so there is nothing to preview) and no other preview. Holds tone
+// mapping and FALD off on the display for the edit. With the hook it waits for the DLL to acknowledge (pumps
+// messages). False = nothing changed (`why` says what is missing).
 bool BeginMhcPreview(int mon, bool hdr, MhcPreviewSession& s, std::wstring* why = nullptr);
 // Recomposes with this correction grayscale and hands the result to the overlay or the hook. Cheap; safe in a frame.
 void UpdateMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& correction);
@@ -57,8 +68,9 @@ void StopMhcPreviewDraw(const MhcPreviewSession& s);
 void EndMhcPreview(MhcPreviewSession& s);
 
 bool MhcPreviewActive();
-// A preview runs on display `mon` (any mode). FALD changes wait for it: the FALD pass follows the one that applies it.
-bool MhcPreviewOnDisplay(int mon);
+// A preview holds tone mapping and FALD off on display `mon` while it shows mode `hdr` (the engines' gate: the hook's
+// shared config, the overlay's frame). Any thread.
+bool MhcPreviewHolds(int mon, bool hdr);
 // The session's preview is being applied: always with the overlay; with the hook, while the DLL is resident and the
 // block is published (it is not after the hook went away mid-edit). Cheap; for the editor's NO PREVIEW label.
 bool MhcPreviewApplied(const MhcPreviewSession& s);
@@ -69,7 +81,8 @@ bool MhcPreviewUsesHook();
 bool MhcEditorNeedsOverlay();
 
 // BeginMhcPreview's computation, touching neither scanout nor the overlay: the variant the bake installs without
-// its correction (perm), its params (source files read here) and its matrix + base LUTs. Exposed for testing.
+// its correction and without desktop gamma (perm), its params (source files read here) and its matrix + base LUTs.
+// Exposed for testing.
 bool PrepareMhcPreview(const MHCSettings& mhc, bool hdr, int mon, MhcPreviewSession& s);
 // UpdateMhcPreview's computation: the scanout the bake would install with this correction. Exposed for testing.
 void ComposeMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& correction, MhcScanout& out);

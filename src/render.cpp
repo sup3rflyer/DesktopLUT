@@ -396,7 +396,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         cbData[8] = (float)cc.grayscale.pointCount;
         cbData[9] = shaderGrayscale ? 1.0f : 0.0f;
         // Exclude tonemapping when DWM hook handles it (hook applies before DD capture)
-        cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled && !g_dwmHookMode.load()) ? 1.0f : 0.0f;  // tonemapEnabled
+        cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled && !g_dwmHookMode.load() && !ctx->editHeld) ? 1.0f : 0.0f;  // tonemapEnabled
         cbData[11] = (float)static_cast<int>(cc.tonemap.curve);  // tonemapCurve
         // Row 3-5: Primaries matrix (xyz) + white balance gains (w)
         // Write identity when MHC handles primaries/WB — useManualCorrection may still be true
@@ -549,7 +549,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
 
     // Run peak detection compute shader if dynamic tonemapping enabled
     const auto& cc = ctx->isHDREnabled ? ctx->hdrColorCorrection : ctx->sdrColorCorrection;
-    if (ctx->isHDREnabled && cc.tonemap.enabled && cc.tonemap.dynamicPeak &&
+    if (ctx->isHDREnabled && cc.tonemap.enabled && cc.tonemap.dynamicPeak && !ctx->editHeld &&
         g_peakDetectCS && g_peakCB && ctx->captureSRV) {
         // Create peak resources on first use
         if (!ctx->peakTexture) {
@@ -633,7 +633,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     // The swapchain must be FP16 too (the intermediate is created at its format; a stale R10G10B10A2 swapchain
     // would clamp scRGB at 1.0 — capture.cpp SwapchainModeChanged keeps them in step, this is the belt).
     bool faldOn = (ctx->isHDREnabled || ctx->isFP16SDR) && ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT &&
-                  cc.fald.enabled && !g_dwmHookMode.load() && FaldEnsureResources(ctx, cc.fald);
+                  cc.fald.enabled && !g_dwmHookMode.load() && !ctx->editHeld && FaldEnsureResources(ctx, cc.fald);
     // The layer does not run this frame (disabled, refused file, hook mode, wrong format) — or it runs but its output does
     // not reach the panel because the overlay window is hidden (VRR whitelist, auto-sleep, the frames before the first
     // show after a (re)commit, a hide by the lost / watchdog paths): its temporal state is void (fald.h). With the
@@ -1148,6 +1148,14 @@ void RenderAll(FramePacer* fp) {
     for (auto& ctx : g_monitors) {
         if (!ctx.enabled) continue;
         SyncMhcPreview(ctx);
+        {   // A live edit's hold (mhc_preview.h): tone mapping and FALD off on this display while it edits.
+            const bool held = MhcPreviewHolds(ctx.index, ctx.isHDREnabled);
+            if (held != ctx.editHeld) {
+                ctx.editHeld = held;
+                ctx.cbDirty = true;
+                ctx.redrawRequested.store(true);
+            }
+        }
         bool mhcP = ctx.isHDREnabled ? ctx.hdrMhcPrimariesActive.load() : ctx.sdrMhcPrimariesActive.load();
         bool mhcG = ctx.isHDREnabled ? ctx.hdrMhcGrayscaleActive.load() : ctx.sdrMhcGrayscaleActive.load();
         const auto& cc2 = ctx.isHDREnabled ? ctx.hdrColorCorrection : ctx.sdrColorCorrection;
@@ -1155,8 +1163,8 @@ void RenderAll(FramePacer* fp) {
         bool hasGs = cc2.grayscale.enabled && !mhcG;
         bool hasWB = cc2.primariesEnabled && !mhcP &&
             (cc2.whiteBalanceGains[0] != 1.0f || cc2.whiteBalanceGains[1] != 1.0f || cc2.whiteBalanceGains[2] != 1.0f);
-        bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled && !g_dwmHookMode.load();
-        bool hasFald = (ctx.isHDREnabled || ctx.isFP16SDR) && cc2.fald.enabled && !cc2.fald.paramsPath.empty() &&
+        bool hasTonemap = ctx.isHDREnabled && cc2.tonemap.enabled && !g_dwmHookMode.load() && !ctx.editHeld;
+        bool hasFald = (ctx.isHDREnabled || ctx.isFP16SDR) && cc2.fald.enabled && !cc2.fald.paramsPath.empty() && !ctx.editHeld &&
                        FaldShadersReady() && !g_dwmHookMode.load() &&   // never keep the overlay awake for a layer that cannot run:
                        !FaldLayerRefused(&ctx, cc2.fald);               // a panel file refused for this path/mode counts as "cannot"
         bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only

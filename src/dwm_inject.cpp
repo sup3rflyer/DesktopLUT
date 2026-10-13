@@ -5,6 +5,7 @@
 #include "../shared/dwm_hook_config.h"
 #include "globals.h"
 #include "gui.h"
+#include "mhc_preview.h"   // MhcPreviewHolds
 #include "fald.h"
 #include "lut.h"   // LoadLUT + WriteCanonicalCube: the staged cube is the host's parse
 
@@ -1319,7 +1320,9 @@ void UpdateDwmHookSharedConfig()
                 if (GetMonitorInfo(g_gui.monitors[mi], &info)) {
                     if (info.rcMonitor.left == mc.left && info.rcMonitor.top == static_cast<int32_t>(mc.top)) {
                         const auto& tm = g_gui.monitorSettings[mi].hdrColorCorrection.tonemap;
-                        mc.tonemapEnabled = tm.enabled ? 1 : 0;
+                        // A live edit on this display holds tone mapping and FALD off (mhc_preview.h).
+                        const bool held = MhcPreviewHolds(static_cast<int>(mi), mc.isHdr != 0);
+                        mc.tonemapEnabled = (tm.enabled && !held) ? 1 : 0;
                         mc.tonemapCurve = ConvertTonemapCurve(static_cast<int>(tm.curve));
                         mc.sourcePeakNits = tm.sourcePeakNits;
                         mc.targetPeakNits = tm.targetPeakNits;
@@ -1333,7 +1336,7 @@ void UpdateDwmHookSharedConfig()
                         // A configured-but-pathless layer is off (the DLL has no file to read either).
                         const auto& fs = mc.isHdr ? g_gui.monitorSettings[mi].hdrColorCorrection.fald
                                                   : g_gui.monitorSettings[mi].sdrColorCorrection.fald;
-                        cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty(),
+                        cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty() && !held,
                                                            static_cast<uint32_t>(fs.debugMode),
                                                            static_cast<int>(fs.pedMode),
                                                            fs.star.enabled ? 1 : 0);

@@ -1350,7 +1350,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	backBufferDesc = newBackBufferDesc;
 
 	// The pass runs for a LUT, tonemap or the live edit preview; FALD (which follows the pass) never meets the preview:
-	// the host does not start a preview on a display with FALD on (src/mhc_preview.cpp).
+	// the host holds FALD (and tone mapping) off on the previewed display (src/mhc_preview.h MhcPreviewHolds).
 	bool hasLutOrTonemap = (lut || tmEnabled || mhcOn);
 
 	if (hasLutOrTonemap || faldOn) {

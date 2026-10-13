@@ -138,5 +138,6 @@ bool GsEditActive() { return g_edit.active; }
 int GsEditMonitor() { return g_edit.active ? g_edit.mon : -1; }
 bool GsEditHdr() { return g_edit.hdr; }
 bool GsEditPreviewing() { return g_edit.active && MhcPreviewApplied(g_edit.preview); }
+unsigned GsEditHeld() { return g_edit.active ? g_edit.preview.held : 0u; }
 
 }  // namespace act

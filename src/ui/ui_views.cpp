@@ -14,6 +14,7 @@
 #include "globals.h"
 #include "gui.h"
 #include "gui_mhc.h"   // MhcProfileMetadataPeakNits
+#include "mhc_preview.h"   // MhcPreviewHolds
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -473,7 +474,9 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
         // Layer lights for the live mode's side, by the pixel path's rules: calibration (both MHC stages), 3D LUT;
         // centred on the resolution's digits. Nothing set = no light (the place stays).
         Light cal = Light::None, lut = Light::None;
-        for (const Stage& s : BuildPixelPath(r.settings, r.mode, r.mode, rt)) {
+        PathRuntime rowRt = rt;
+        rowRt.editHeld = r.liveIndex >= 0 && MhcPreviewHolds(r.liveIndex, PipelineIsHdr(r.mode));
+        for (const Stage& s : BuildPixelPath(r.settings, r.mode, r.mode, rowRt)) {
             if (s.id == StageId::Primaries || s.id == StageId::Grayscale) cal = CombineLights(cal, s.light);
             else if (s.id == StageId::Lut3D) lut = s.light;
         }
@@ -1241,7 +1244,9 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         ImGui::Dummy(ImVec2(0, Px(16)));
     }
 
-    const std::vector<Stage> path = BuildPixelPath(sel->settings, shown, sel->mode, RuntimeOf(snap));
+    PathRuntime selRt = RuntimeOf(snap);
+    selRt.editHeld = sel->liveIndex >= 0 && MhcPreviewHolds(sel->liveIndex, PipelineIsHdr(shown));
+    const std::vector<Stage> path = BuildPixelPath(sel->settings, shown, sel->mode, selRt);
     const Stage* st = nullptr;
     for (const Stage& s : path) if (s.id == vs.stage) st = &s;
     if (!st) {

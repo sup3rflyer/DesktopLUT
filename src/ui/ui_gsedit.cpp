@@ -1,4 +1,5 @@
 #include "ui_gsedit.h"
+#include "mhc_preview.h"   // kMhcHeld*
 
 #include "ui_views.h"
 #include "ui_widgets.h"
@@ -545,6 +546,24 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
         for (const KeyHint& h : kHints) {
             x += DrawText(dl, Font::Mono, 11.0f, x, cy, pal::InkDim, h.keys) + Px(6);
             x += DrawText(dl, Font::Label, 11.0f, x, cy, pal::InkFaint, h.what) + Px(18);
+        }
+        // What the edit holds off for the meter, at the right (drawn without layout; only when it fits).
+        const unsigned held = ed.renderOnly ? ed.renderHeld : act::GsEditHeld();
+        if (held) {
+            std::string list;
+            auto add = [&](const char* s) { if (!list.empty()) list += "  \xC2\xB7  "; list += s; };
+            if (held & kMhcHeldTonemap) add("TONE MAP");
+            if (held & kMhcHeldFald) add("FALD");
+            if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
+            const float hw = MeasureInk(Font::Label, 11.0f, "OFF").advance + Px(8);
+            const float lw = MeasureInk(Font::Label, 11.0f, list.c_str()).advance;
+            const float x1 = origin.x + width, x0 = x1 - lw - hw;
+            if (x0 > x + Px(10)) {
+                DrawText(dl, Font::Label, 11.0f, x0, cy, pal::InkFaint, "OFF");
+                DrawText(dl, Font::Label, 11.0f, x0 + hw, cy, pal::InkDim, list.c_str());
+                if (ImGui::IsMouseHoveringRect(ImVec2(x0, cy - Px(9)), ImVec2(x1, cy + Px(9))))
+                    ImGui::SetTooltip("Off while you edit, so the meter reads the curve alone.\nBack on with DONE or CANCEL.");
+            }
         }
     }
     // A new point count, once nothing in this frame indexes the old one: resampled (the shape stays).

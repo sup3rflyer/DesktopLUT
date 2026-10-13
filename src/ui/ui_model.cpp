@@ -141,14 +141,15 @@ std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode li
 
     // Tone mapping runs before the 3D LUT in the hook (and overlay) shader, HDR only. Its switch is all it
     // has: off is nothing set.
-    if (hdr) path.push_back(stage(StageId::ToneMap, liveLayer(cc.tonemap.enabled, true, false)));
+    // A live edit holds it off (switched off, a ring) while it runs.
+    if (hdr) path.push_back(stage(StageId::ToneMap, liveLayer(cc.tonemap.enabled, !rt.editHeld, false)));
 
     path.push_back(stage(StageId::Lut3D, liveLayer(!lut.empty(), !(hdr ? ms.hdrLutBypass : ms.sdrLutBypass), false)));
 
     // FALD needs a panel file to exist at all; it runs only on FP16 back buffers (HDR or ACM SDR).
     if (!cc.fald.paramsPath.empty()) {
         const bool fp16 = live == Mode::HDR || live == Mode::AcmSdr || live == Mode::Unknown;
-        path.push_back(stage(StageId::Fald, liveLayer(true, cc.fald.enabled, !fp16)));
+        path.push_back(stage(StageId::Fald, liveLayer(true, cc.fald.enabled && !rt.editHeld, !fp16)));
     }
 
     // The overlay shader tweak (pipe / INI only, no classic control) — shown so a live correction is

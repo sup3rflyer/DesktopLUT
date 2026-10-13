@@ -1,4 +1,5 @@
 #include "doctest.h"
+#include "mhc_preview.h"   // kMhcHeld*
 #include "ui/ui_views.h"
 #include "ui/ui_theme.h"
 #include "ui/ui_widgets.h"
@@ -292,6 +293,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     ui::GsEditorState& ed = vs.gsEdit;
                     ed.open = true;
                     ed.renderOnly = true;
+                    ed.renderHeld = hdr ? (kMhcHeldTonemap | kMhcHeldFald | kMhcHeldDesktopGamma) : kMhcHeldFald;
                     ed.hdr = hdr;
                     ed.mon = shot.display;
                     ed.codeCap = 1023;

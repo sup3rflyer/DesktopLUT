@@ -743,6 +743,7 @@ struct MonitorContext {
     float mhcPreviewMatrix[9] = { 1,0,0, 0,1,0, 0,0,1 };   // MhcScanout::applied (row-major)
     int mhcPreviewLutSize = 0;                             // entries per channel in the t11 texture
     bool mhcPreviewHdr = false;                            // the mode the stage is for (applies only in it)
+    bool editHeld = false;                                 // a live edit holds tone mapping and FALD off here (MhcPreviewHolds)
     unsigned mhcPreviewGen = 0;
 
     // Constant buffer dirty tracking (avoid Map/Unmap every frame)
