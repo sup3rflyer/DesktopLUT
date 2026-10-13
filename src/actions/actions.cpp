@@ -146,7 +146,7 @@ void SetDwmHookMode(bool on) {
     g_dwmHookMode.store(on);
     SaveSettings();
     if (g_gui.isRunning) RestartLiveLayers();
-    else ReconcileLiveLayers("engine");   // the overlay FALD layer needs processing, the hook's does not
+    else ReconcileLiveLayers("engine");   // the FALD layer's need differs per engine (the hook's needs a panel file)
     if (ValidMonitor(g_gui.currentMonitor)) Finish(g_gui.currentMonitor);
     SyncClassicGlobalControls();
 }
@@ -547,7 +547,7 @@ Result MhcSetDesktopGamma(int mon, bool on) {
         SwapMhcToPermutation(mon, true, perm);
     }
     SaveSettings();
-    ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (MonitorNeedsProcessing)
+    ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (LiveLayersNeeded)
     Finish(mon);
     return Done();
 }

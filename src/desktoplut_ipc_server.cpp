@@ -271,7 +271,9 @@ bool AnyCorrectionActive() {
 void ReapplyProcessing() {
     StopProcessing();
     FaldTrace("ReapplyProcessing: AnyCorrectionActive?");
-    if (AnyCorrectionActive()) {
+    // LiveLayersNeeded too: desktop gamma configured (even toggled off by its hotkey, even with no MHC profile
+    // enabled) keeps the pipeline that hosts its hotkey.
+    if (AnyCorrectionActive() || LiveLayersNeeded()) {
         act::ResumeLiveLayersForPipe();   // a user Suspend gives way to what DLC applies, visibly
         FaldTrace("ReapplyProcessing: StartProcessing");
         StartProcessing();
@@ -1031,6 +1033,8 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
 //     ID_MHC_*_GS_ENABLE. Desktop Gamma also drives the live gamma atomics (ID_MHC_HDR_DG_ENABLE).
 //   * tonemap (HDR) is the shader flag: ID_CORR_TONEMAP_ENABLE's live update path.
 //   * fald is the shader flag of the addressed mode (HDR, or SDR under ACM): ID_CORR_FALD_[SDR_]ENABLE's path.
+//   * hook mode, running: switching either ON then reconciles the live layers like the GUI's (re-injects the
+//     hook when it lacks what the layer needs; waits out a calibration session). OFF only updates the config.
 // Result: {monitor_mode, before:{...}, after:{...}, regenerated, profile_name}.
 static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
     const MHCSettings& m = isHDR ? s.hdrMHC : s.sdrMHC;
@@ -1081,6 +1085,8 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     JsonValue before = JObj(), after = JObj();
     bool mhcChanged = false, tmChanged = false, dgChanged = false, mhcEnabled = false, profileNamed = false;
     bool lutBypassChanged = false;
+    bool switchedOn = false;       // this call switched the tone mapper or the FALD layer ON
+    bool reconcileHook = false;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MonitorSettings& ms = g_gui.monitorSettings[mon];
@@ -1095,9 +1101,17 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
             mhcChanged = true;
         }
         if (hasDg && m.desktopGammaEnabled != dg) { m.desktopGammaEnabled = dg; mhcChanged = true; dgChanged = true; }
-        if (hasTm && ms.hdrColorCorrection.tonemap.enabled != tm) { ms.hdrColorCorrection.tonemap.enabled = tm; tmChanged = true; }
+        if (hasTm && ms.hdrColorCorrection.tonemap.enabled != tm) {
+            ms.hdrColorCorrection.tonemap.enabled = tm;
+            tmChanged = true;
+            switchedOn |= tm;
+        }
         FaldSettings& fs = isHDR ? ms.hdrColorCorrection.fald : ms.sdrColorCorrection.fald;
-        if (hasFd && fs.enabled != fd) { fs.enabled = fd; tmChanged = true; }   // same propagation as tonemap, for the addressed mode
+        if (hasFd && fs.enabled != fd) {   // same propagation as tonemap, for the addressed mode
+            fs.enabled = fd;
+            tmChanged = true;
+            switchedOn |= fd;
+        }
         // Stage bypasses: an MHC one rebuilds the profile as its variant (same path as the bits above).
         if (hasBp && m.bypassPrimaries != bp) { m.bypassPrimaries = bp; mhcChanged = true; }
         if (hasBg && m.bypassGrayscale != bg) { m.bypassGrayscale = bg; mhcChanged = true; }
@@ -1126,8 +1140,15 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         if (g_gui.isRunning) {
             UpdateColorCorrectionLive(mon, isHDR);   // tonemap is HDR-only; fald follows the addressed mode
             FaldTrace("LayersSet: after UpdateColorCorrectionLive");
-            if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
-            else DwmHookReevaluateOverlay();
+            if (g_dwmHookMode.load()) {
+                UpdateDwmHookSharedConfig();
+                // Switched on: the hook may lack what it needs for it (no hook resident yet, or the display's
+                // FALD panel file was never staged). Reconciled below, as the GUI's switches are. Switched off
+                // needs nothing: the shared config carries it.
+                reconcileHook = switchedOn;
+            } else {
+                DwmHookReevaluateOverlay();
+            }
             FaldTrace("LayersSet: after reevaluate");
         } else if ((hasTm && tm) || (hasFd && fd)) {
             act::ResumeLiveLayersForPipe();
@@ -1146,14 +1167,15 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         UpdateColorCorrectionControls();   // the GUI checkboxes follow the pipe
         FaldTrace("LayersSet: controls updated");
     }
+    bool restartForBypass = false;
     if (lutBypassChanged) {
-        // As act::SetLutBypass: the hook skips the staged cube (shared config), the overlay restarts without it.
+        // As act::SetLutBypass: the hook skips the staged cube (shared config), the overlay restarts without it
+        // (below, with the reconcile: both pump messages).
         SaveSettings();
         if (g_gui.isRunning) {
             if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
-            else RestartLiveLayers();
+            else restartForBypass = true;
         }
-        act::ReconcileLiveLayers("pipe 3D LUT bypass");
         GuiNotifySettingsChanged(mon);
     }
     std::string profileName;
@@ -1168,6 +1190,20 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("after", after);
     result.set("regenerated", JBool(regenerated));
     result.set("profile_name", JStr(profileName));
+    // Last, once nothing indexes `mon` any more: a restart pumps messages while it stops (a display change
+    // pumped then may re-attach the settings vector). The reconcile re-injects the hook when it lacks what
+    // the layer switched on needs (act::HookStale); during a calibration session it waits for
+    // calibration.exit. The switch resumes a Suspend first, as the start above does: the reconcile would
+    // stop otherwise.
+    if (reconcileHook) {
+        act::ResumeLiveLayersForPipe();
+        FaldTrace("LayersSet: ReconcileLiveLayers");
+        act::ReconcileLiveLayers("layers.set");
+    }
+    if (lutBypassChanged) {
+        if (restartForBypass) RestartLiveLayers();
+        act::ReconcileLiveLayers("pipe 3D LUT bypass");
+    }
 }
 
 void DoDisableAll(const JsonValue& /*p*/, JsonValue& result, std::string& /*error*/) {

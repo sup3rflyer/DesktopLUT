@@ -587,7 +587,7 @@ static std::thread LaunchRenderThread(std::vector<MonitorLUTConfig> configs) {
 // falls back to GUI state check when overlay isn't running yet.
 // Must mirror the conditions in render.cpp's shaderCorrActive evaluation to avoid
 // silently dropping corrections when the overlay thread isn't started.
-static bool HasActiveShaderCorrections() {
+bool HasActiveShaderCorrections() {
     // Analysis overlay requires the render thread regardless of corrections
     if (g_analysisEnabled.load()) return true;
     // Render thread is the source of truth when running — use its last evaluation
@@ -1083,17 +1083,25 @@ void AnalysisOnlyThreadFunc(unsigned generation) {
     PostMessage(g_gui.hwndMain, WM_ANALYSIS_ONLY_EXITED, needsFullOverlay ? 1 : 0, 0);
 }
 
+// One mode's FALD layer is live-layer work in either engine. Hook mode also needs that mode's panel file:
+// the hook runs nothing without one, and DesiredDwmHookStagingSet stages a display only for hook work
+// (MonitorNeedsDwmHook). The overlay counts the switch alone (its render gate refuses a missing file and
+// the overlay auto-sleeps), as before.
+static bool FaldNeedsProcessing(const FaldSettings& fald) {
+    return fald.enabled && (!g_dwmHookMode.load() || !fald.paramsPath.empty());
+}
+
 bool MonitorNeedsProcessing(const MonitorSettings& ms) {
     // A bypassed cube is no work: with nothing else to do, the live layers stop.
     bool hasLUT = !LiveLutPath(ms, false).empty() || !LiveLutPath(ms, true).empty();
     bool hasSdrColorCorrection = ms.sdrColorCorrection.primariesEnabled ||
                                  ms.sdrColorCorrection.grayscale.enabled ||
                                  ms.sdrColorCorrection.grayscale.use24Gamma ||
-                                 (ms.sdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
+                                 FaldNeedsProcessing(ms.sdrColorCorrection.fald);
     bool hasHdrColorCorrection = ms.hdrColorCorrection.primariesEnabled ||
                                  ms.hdrColorCorrection.grayscale.enabled ||
                                  ms.hdrColorCorrection.tonemap.enabled ||
-                                 (ms.hdrColorCorrection.fald.enabled && !g_dwmHookMode.load());
+                                 FaldNeedsProcessing(ms.hdrColorCorrection.fald);
     bool hasDesktopGamma = g_userDesktopGammaMode.load();
     return hasLUT || hasSdrColorCorrection || hasHdrColorCorrection || hasDesktopGamma;
 }
@@ -1112,7 +1120,8 @@ std::vector<DwmHookMonitorLUT> DesiredDwmHookStagingSet() {
         // in the list: the hook runs that work on it (empty cube paths stage nothing). The panel file is
         // always staged when a path is set, enabled or not, so switching the layer on later rides the
         // shared config instead of a re-inject. A bypassed cube is staged too, for the same reason
-        // (the hook skips it: DwmHookSharedConfig::lutOffMask).
+        // (the hook skips it: DwmHookSharedConfig::lutOffMask). Whether the pipeline runs at all is
+        // LiveLayersNeeded's call (a FALD layer needs it only switched on, in hook mode with its panel file).
         if (!MonitorNeedsDwmHook(ms.sdrPath, ms.hdrPath, ms.sdrColorCorrection, ms.hdrColorCorrection))
             continue;
         MONITORINFO mi = { sizeof(mi) };
@@ -1135,8 +1144,32 @@ bool AnyDesktopGammaConfigured() {
     return false;
 }
 
-static bool s_hookStartStagedNothing = false;
-bool DwmHookStartStagedNothing() { return s_hookStartStagedNothing; }
+bool LiveLayersNeeded() {
+    return AnyMonitorNeedsProcessing() || AnyDesktopGammaConfigured();
+}
+
+std::vector<MonitorLUTConfig> BuildPipelineConfigs() {
+    // Every display that needs processing; every display while desktop gamma is configured, even toggled off by
+    // its hotkey (the pipeline hosts that hotkey; all join, as with the mode on, so turning it back on finds them).
+    std::vector<MonitorLUTConfig> configs;
+    const bool desktopGammaConfigured = AnyDesktopGammaConfigured();
+    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
+        const auto& ms = g_gui.monitorSettings[i];
+        if (!MonitorNeedsProcessing(ms) && !desktopGammaConfigured) continue;
+        MonitorLUTConfig config;
+        config.monitorIndex = (int)i;
+        config.sdrLutPath = LiveLutPath(ms, false);   // the overlay applies only what runs (a bypassed cube: none)
+        config.hdrLutPath = LiveLutPath(ms, true);
+        config.sdrColorCorrection = ConvertColorCorrection(ms.sdrColorCorrection, false);
+        config.hdrColorCorrection = ConvertColorCorrection(ms.hdrColorCorrection, true);
+        configs.push_back(config);
+    }
+    return configs;
+}
+
+static bool s_hookIdle = false;
+bool DwmHookIdle() { return s_hookIdle; }
+void SetDwmHookIdle(bool idle) { s_hookIdle = idle; }
 
 void RestartLiveLayers() {
     StopProcessing();
@@ -1193,20 +1226,9 @@ static void StartProcessingImpl() {
         return;
     }
 
-    // Build config from all monitors with SDR LUT or color correction configured
-    std::vector<MonitorLUTConfig> configs;
-    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        const auto& ms = g_gui.monitorSettings[i];
-        if (MonitorNeedsProcessing(ms)) {
-            MonitorLUTConfig config;
-            config.monitorIndex = (int)i;
-            config.sdrLutPath = LiveLutPath(ms, false);   // the overlay applies only what runs
-            config.hdrLutPath = LiveLutPath(ms, true);
-            config.sdrColorCorrection = ConvertColorCorrection(ms.sdrColorCorrection, false);
-            config.hdrColorCorrection = ConvertColorCorrection(ms.hdrColorCorrection, true);
-            configs.push_back(config);
-        }
-    }
+    // Build config from all monitors with SDR LUT or color correction configured (or every monitor while desktop
+    // gamma is configured: BuildPipelineConfigs). Empty exactly when !LiveLayersNeeded().
+    std::vector<MonitorLUTConfig> configs = BuildPipelineConfigs();
 
     // MaxTML (display peak override) is not a live layer: it holds whether or not anything else runs, so an
     // MHC-only setup gets it too (C16).
@@ -1264,7 +1286,9 @@ static void StartProcessingImpl() {
 
         // Build monitor LUT list for injection (the configs above, filtered to displays with hook work)
         std::vector<DwmHookMonitorLUT> dwmMonitors = DesiredDwmHookStagingSet();
-        s_hookStartStagedNothing = dwmMonitors.empty();
+        // Nothing for the hook: none injected (act::HookStale watches for work) — unless one is still resident
+        // (an overlay-loss restart keeps it): that one is the watchdog's and the reconcile's to judge.
+        s_hookIdle = dwmMonitors.empty() && !IsDwmHookActive();
 
         std::wcout << L"[DWM Hook] " << dwmMonitors.size() << L" monitor(s) with hook work (cube / FALD / tonemap)"
                    << std::endl;

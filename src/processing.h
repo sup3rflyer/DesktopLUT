@@ -26,8 +26,8 @@ void StopProcessing();
 // being ejected and re-injected on every retry. Every other start re-injects.
 void StartProcessingAfterOverlayLoss();
 
-// One display needs the processing pipeline (a LUT, a shader correction, tonemap, FALD in overlay mode,
-// or desktop gamma) — StartProcessing's per-monitor filter.
+// One display needs the processing pipeline (a LUT, a shader correction, tonemap, the FALD layer — in hook
+// mode only with that mode's panel file — or desktop gamma) — StartProcessing's per-monitor filter.
 bool MonitorNeedsProcessing(const MonitorSettings& ms);
 // Any LIVE display needs the processing pipeline.
 bool AnyMonitorNeedsProcessing();
@@ -35,8 +35,22 @@ bool AnyMonitorNeedsProcessing();
 bool AnyMonitorHasCorrections();
 // Desktop gamma is configured on some live display (its persisted setting, not the hotkey's toggle).
 bool AnyDesktopGammaConfigured();
-// The last hook-mode start staged no display (nothing for the hook then), so no hook was injected.
-bool DwmHookStartStagedNothing();
+// The live layers are needed: a live display needs processing, or desktop gamma is configured (by its persisted
+// setting: its hotkey toggles only the in-memory flag, and the running pipeline hosts that hotkey — stopping on
+// the toggle would unregister the very hotkey that turns it back on). The reconcile's `needed`. A start builds
+// a non-empty pipeline exactly then (BuildPipelineConfigs), so a restart does not end stopped for want of work
+// while this holds (it still can on a failed hook injection or a start deferred behind a stuck thread). GUI thread.
+bool LiveLayersNeeded();
+// The per-display configs a start builds: every display that needs processing, and every display while desktop
+// gamma is configured anywhere (as with the mode on, so the hotkey turning it back on finds them all). Empty
+// exactly when !LiveLayersNeeded() (an MHC-only setup). GUI thread. Exposed for tests (StartProcessing uses it).
+std::vector<MonitorLUTConfig> BuildPipelineConfigs();
+// Hook mode: no hook is resident because no display had hook work the last time one was due — the running start
+// staged nothing, or the watchdog found the hook gone with nothing to re-inject and stood down. Any hook work
+// then makes the resident hook stale (act::HookStale), which re-injects. A start with hook work, or a watchdog
+// re-injection attempt (its give-ups stand), clears it. GUI thread.
+bool DwmHookIdle();
+void SetDwmHookIdle(bool idle);
 // Stop + Start that leaves the live layers stopped when the user suspended them meanwhile (the Stop's
 // join pumps messages: a Suspend can arrive inside it). GUI thread.
 void RestartLiveLayers();
@@ -87,6 +101,10 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode = fa
 // Evaluate whether non-analysis shader corrections need the full overlay.
 // Always iterates g_gui.monitorSettings — MUST only be called from the GUI thread.
 bool EvalNonAnalysisShaderCorrections();
+// Any overlay work at all (analysis included): the render thread's last verdict while it runs, else the
+// GUI-state check a start uses to pick the overlay / analysis-only thread. Hook-mode tonemap and FALD are
+// the hook's, not overlay work. Exposed for tests.
+bool HasActiveShaderCorrections();
 
 // Check if current settings differ from active (running) settings
 bool SettingsChanged();

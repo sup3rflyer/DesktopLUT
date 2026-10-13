@@ -6,7 +6,6 @@
 #include "globals.h"
 #include "gui.h"
 #include "processing.h"
-#include <algorithm>
 #include <iostream>
 
 namespace act {
@@ -19,41 +18,93 @@ ReconcileDecision DecideReconcile(const ReconcileInputs& in) {
     return in.hookStale ? ReconcileDecision::Restart : ReconcileDecision::None;
 }
 
+ReconcileDecision DecideTopologyTick(const TopologyInputs& in) {
+    if (in.busy) return ReconcileDecision::Defer;
+    if (!in.running) return (!in.suspended && in.needed) ? ReconcileDecision::Start : ReconcileDecision::None;
+    if (!in.lutsChanged && !in.hookStale) return ReconcileDecision::None;
+    return in.fullscreenExclusive ? ReconcileDecision::Defer : ReconcileDecision::Restart;
+}
+
+WatchdogAction DecideHookWatchdog(bool hookActive, int reinjects, int maxReinjects, bool nothingToInject) {
+    if (hookActive) return WatchdogAction::Healthy;
+    if (reinjects >= maxReinjects) return WatchdogAction::GiveUp;   // the flap cap wins over standing down
+    return nothingToInject ? WatchdogAction::StandDown : WatchdogAction::Reinject;
+}
+
 namespace {
 
-// Hook mode, running: does the configuration want hook work the resident hook was not injected with? A
-// display that gained hook work (tone mapping switched on, a FALD panel file) while the pipeline ran
-// without it would otherwise wait for the next restart. Not stale:
-//   - a display that only LOST hook work: the live switches reach the DLL through the shared config, and
-//     a re-inject would flash for nothing;
-//   - a hook that is gone (DWM restarted, or the watchdog gave up re-injecting): that is the watchdog's
-//     business, and a restart here would undo its give-up.
-bool HookStale() {
-    if (!g_dwmHookMode.load() || !g_gui.isRunning) return false;
-    const std::vector<DwmHookMonitorLUT> desired = DesiredDwmHookStagingSet();
-    if (desired.empty()) return false;
-    if (!IsDwmHookActive()) return DwmHookStartStagedNothing();   // never injected: now there is hook work
-    bool valid = false;
-    const std::vector<DwmHookMonitorLUT> injected = DwmHookInjectedSet(&valid);
-    if (!valid) return false;
-    for (const DwmHookMonitorLUT& want : desired)
-        if (std::find(injected.begin(), injected.end(), want) == injected.end()) return true;
-    return false;
+const DwmHookMonitorLUT* EntryAt(const std::vector<DwmHookMonitorLUT>& set, int left, int top) {
+    for (const DwmHookMonitorLUT& e : set)
+        if (e.left == left && e.top == top) return &e;
+    return nullptr;
+}
+
+// One live position: what the configuration stages there (`want`) against what the hook staged (`had`).
+bool PositionStale(const DwmHookMonitorLUT& want, const DwmHookMonitorLUT& had, bool restartInjects) {
+    // A staged cube applies to whatever display sits there: one it does not want must go, even if the
+    // restart injects nothing again.
+    if ((!had.sdrLutPath.empty() && had.sdrLutPath != want.sdrLutPath) ||
+        (!had.hdrLutPath.empty() && had.hdrLutPath != want.hdrLutPath))
+        return true;
+    if (!restartInjects) return false;
+    // A file the hook lacks there. A panel file it has that is not wanted is inert (the layer's switch needs
+    // the display's own file); tone mapping stages no file.
+    auto lacks = [](const std::wstring& w, const std::wstring& h) { return !w.empty() && w != h; };
+    return lacks(want.sdrLutPath, had.sdrLutPath) || lacks(want.hdrLutPath, had.hdrLutPath) ||
+           lacks(want.sdrFaldPath, had.sdrFaldPath) || lacks(want.hdrFaldPath, had.hdrFaldPath);
 }
 
 }  // namespace
+
+bool DecideHookStale(const HookStaging& s) {
+    // Idle (no display had hook work when the hook was last due): any hook work now needs it resident.
+    if (!s.hookActive) return s.restartInjects && s.hookIdle && !s.desired.empty();
+    if (!s.injectedKnown) return false;
+    const DwmHookMonitorLUT none;
+    for (const DwmHookMonitorLUT& want : s.desired) {   // the displays with hook work (live)
+        const DwmHookMonitorLUT* had = EntryAt(s.injected, want.left, want.top);
+        if (PositionStale(want, had ? *had : none, s.restartInjects)) return true;
+    }
+    for (const DisplayPosition& p : s.identified) {     // the others: files staged for a display gone from there
+        if (EntryAt(s.desired, p.left, p.top)) continue;
+        const DwmHookMonitorLUT* had = EntryAt(s.injected, p.left, p.top);
+        if (had && PositionStale(none, *had, s.restartInjects)) return true;
+    }
+    return false;   // entries at positions no live display has: a display that left (they are right again
+                    // if it comes back there)
+}
+
+bool HookStale() {
+    if (!g_dwmHookMode.load() || !g_gui.isRunning) return false;
+    HookStaging s;
+    s.desired = DesiredDwmHookStagingSet();
+    s.hookActive = IsDwmHookActive();
+    s.hookIdle = DwmHookIdle();
+    s.restartInjects = LiveLayersNeeded();   // a start runs exactly then, and injects `desired`
+    s.injected = DwmHookInjectedSet(&s.injectedKnown);
+    for (size_t i = 0; i < g_gui.monitors.size() && i < g_gui.monitorSettings.size(); i++) {
+        if (g_gui.monitorSettings[i].identity.empty()) continue;   // unknown: may be the display the files are for
+        MONITORINFO mi = { sizeof(mi) };
+        if (GetMonitorInfo(g_gui.monitors[i], &mi)) s.identified.push_back({ mi.rcMonitor.left, mi.rcMonitor.top });
+    }
+    return DecideHookStale(s);
+}
+
+bool LiveLayersBusy() {
+    return IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
+           IsCalibrationOrLiveEditActive();
+}
 
 ReconcileDecision ReconcileLiveLayers(const char* why) {
     if (!g_gui.hwndMain) return ReconcileDecision::None;
     ReconcileInputs in;
     in.shuttingDown = g_appShuttingDown.load();
     in.suspended = g_userStopped;
-    in.busy = IsProcessingTransitionActive() || g_monitorSettingsPins > 0 || g_mhcEditDialogOpen.load() ||
-              IsCalibrationOrLiveEditActive();
+    in.busy = LiveLayersBusy();
     in.running = g_gui.isRunning.load();
-    // Desktop gamma counts by its persisted setting: its hotkey toggles the in-memory flag, and stopping
-    // on that toggle would unregister the very hotkey that turns it back on.
-    in.needed = AnyMonitorNeedsProcessing() || AnyDesktopGammaConfigured();
+    // Desktop gamma counts by its persisted setting (LiveLayersNeeded): its hotkey toggles the in-memory flag,
+    // and stopping on that toggle would unregister the very hotkey that turns it back on.
+    in.needed = LiveLayersNeeded();
     in.hookStale = !in.busy && in.running && in.needed && HookStale();
     const char* reason = why ? why : "";
     const ReconcileDecision decision = DecideReconcile(in);
@@ -67,7 +118,8 @@ ReconcileDecision ReconcileLiveLayers(const char* why) {
         StopProcessing();
         break;
     case ReconcileDecision::Restart:
-        std::cout << "[Live layers] restart: a display gained DWM hook work (" << reason << ")" << std::endl;
+        std::cout << "[Live layers] restart: the DWM hook's staged files do not match the displays (" << reason << ")"
+                  << std::endl;
         RestartLiveLayers();
         break;
     case ReconcileDecision::Defer:
