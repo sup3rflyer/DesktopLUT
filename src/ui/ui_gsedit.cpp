@@ -1,5 +1,6 @@
 #include "ui_gsedit.h"
 #include "mhc_preview.h"   // kMhcHeld*
+#include "displayconfig.h"   // WindowsNightLightState
 
 #include "ui_views.h"
 #include "ui_widgets.h"
@@ -547,7 +548,26 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             x += DrawText(dl, Font::Mono, 11.0f, x, cy, pal::InkDim, h.keys) + Px(6);
             x += DrawText(dl, Font::Label, 11.0f, x, cy, pal::InkFaint, h.what) + Px(18);
         }
-        // What the edit holds off for the meter, at the right (drawn without layout; only when it fits).
+        // Right-aligned, drawn without layout and only when it fits: a Night Light warning (Windows tints the screen
+        // outside DesktopLUT: the one thing the edit cannot hold), then what the edit holds off for the meter.
+        float right = origin.x + width;
+        static int s_nightLight = 0;
+        static ULONGLONG s_nightLightAt = 0;
+        if (!ed.renderOnly && GetTickCount64() - s_nightLightAt > 1000) {   // a registry read, at most once a second
+            s_nightLight = WindowsNightLightState();
+            s_nightLightAt = GetTickCount64();
+        }
+        if (ed.renderOnly ? ed.renderNightLight : s_nightLight == 1) {
+            const char* nl = "NIGHT LIGHT ON";
+            const float w = MeasureInk(Font::Label, 11.0f, nl).advance;
+            if (right - w > x + Px(10)) {
+                DrawText(dl, Font::Label, 11.0f, right - w, cy, pal::Alarm, nl);
+                if (ImGui::IsMouseHoveringRect(ImVec2(right - w, cy - Px(9)), ImVec2(right, cy + Px(9))))
+                    ImGui::SetTooltip("Windows Night Light tints every display: turn it off before measuring.\n"
+                                      "Settings \xE2\x80\xBA System \xE2\x80\xBA Display");
+                right -= w + Px(24);
+            }
+        }
         const unsigned held = ed.renderOnly ? ed.renderHeld : act::GsEditHeld();
         if (held) {
             std::string list;
@@ -557,7 +577,7 @@ void DrawGsEditor(const Snapshot& snap, ViewState& vs, ImVec2 sizePx) {
             if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
             const float hw = MeasureInk(Font::Label, 11.0f, "OFF").advance + Px(8);
             const float lw = MeasureInk(Font::Label, 11.0f, list.c_str()).advance;
-            const float x1 = origin.x + width, x0 = x1 - lw - hw;
+            const float x1 = right, x0 = x1 - lw - hw;
             if (x0 > x + Px(10)) {
                 DrawText(dl, Font::Label, 11.0f, x0, cy, pal::InkFaint, "OFF");
                 DrawText(dl, Font::Label, 11.0f, x0 + hw, cy, pal::InkDim, list.c_str());

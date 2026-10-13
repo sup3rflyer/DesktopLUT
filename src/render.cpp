@@ -360,7 +360,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     }
 
     // Motion bar position changes every frame — force CB update when enabled
-    bool motionBar = g_showMotionBar.load();
+    bool motionBar = g_showMotionBar.load() && !ctx->editHeld;   // a live edit's hold: nothing drawn over the patch
     if (motionBar) ctx->cbDirty = true;
 
     // Multi-monitor: always update CB since it's shared across monitors (272-byte Map/Unmap is ~1-5μs)
@@ -381,7 +381,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Suppress shader corrections when MHC ICC profile handles them at GPU scanout
         bool mhcPrim = ctx->isHDREnabled ? ctx->hdrMhcPrimariesActive.load() : ctx->sdrMhcPrimariesActive.load();
         bool mhcGs = ctx->isHDREnabled ? ctx->hdrMhcGrayscaleActive.load() : ctx->sdrMhcGrayscaleActive.load();
-        cbData[4] = (ctx->isHDREnabled && g_desktopGammaMode.load() && !mhcGs) ? 1.0f : 0.0f;  // Desktop gamma (HDR-only, MHC bakes into 1D LUT)
+        cbData[4] = (ctx->isHDREnabled && g_desktopGammaMode.load() && !mhcGs && !ctx->editHeld) ? 1.0f : 0.0f;  // Desktop gamma (HDR-only, MHC bakes into 1D LUT)
         cbData[5] = curTetrahedral ? 1.0f : 0.0f; // Tetrahedral interpolation (always in hook mode)
         cbData[6] = ctx->usePassthrough ? 1.0f : 0.0f;  // HDR passthrough (no LUT)
         // Select color correction based on HDR state
@@ -441,7 +441,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // In ICtCp mode: R=deltaI, G=deltaCt, B=deltaCp (additive offsets)
         // In PQ mode: R/G/B = normalized PQ corrections (per-channel gains)
         bool useICtCp = ctx->isHDREnabled && cc.grayscale.enabled &&
-                        (cc.tonemap.enabled || ctx->grayscaleICtCp);
+                        ((cc.tonemap.enabled && !ctx->editHeld) || ctx->grayscaleICtCp);
         if (ctx->isHDREnabled && cc.grayscale.enabled) {
             if (useICtCp) {
                 // ICtCp mode: send precomputed delta offsets
@@ -1167,7 +1167,7 @@ void RenderAll(FramePacer* fp) {
         bool hasFald = (ctx.isHDREnabled || ctx.isFP16SDR) && cc2.fald.enabled && !cc2.fald.paramsPath.empty() && !ctx.editHeld &&
                        FaldShadersReady() && !g_dwmHookMode.load() &&   // never keep the overlay awake for a layer that cannot run:
                        !FaldLayerRefused(&ctx, cc2.fald);               // a panel file refused for this path/mode counts as "cannot"
-        bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG;  // DG is HDR-only
+        bool hasDG = ctx.isHDREnabled && g_desktopGammaMode.load() && !mhcG && !ctx.editHeld;  // DG is HDR-only
         bool has24 = cc2.grayscale.use24Gamma && !mhcG;
         bool hasAnalysis = (ctx.index == 0) && g_analysisEnabled.load();  // analysis runs on primary only
         // An MHC editor's live preview: this display's exact preview, or a dialog that previews through the overlay

@@ -493,3 +493,22 @@ TEST_CASE("Device instance id from a monitor device path") {
     CHECK(DeviceInstanceIdFromPath(L"\\\\?\\PCI#VEN_10DE").empty());
     CHECK(DeviceInstanceIdFromPath(L"").empty());
 }
+
+TEST_CASE("Night Light: the CloudStore state blob reads on / off / unknown") {
+    // Captured on Windows 11 25H2 with Night Light off (2026-10-13): byte 18 = 0x13.
+    const unsigned char off[] = { 0x43, 0x42, 0x01, 0x00, 0x0A, 0x02, 0x01, 0x00, 0x2A, 0x06, 0xF8, 0xF3, 0x8F, 0xD5,
+                                  0x06, 0x2A, 0x2B, 0x0E, 0x13, 0x43, 0x42, 0x01, 0x00, 0xD0, 0x0A, 0x02 };
+    CHECK(ParseNightLightState(off, sizeof(off)) == 0);
+    unsigned char on[sizeof(off)];
+    memcpy(on, off, sizeof(off));
+    on[18] = 0x15;
+    CHECK(ParseNightLightState(on, sizeof(on)) == 1);
+    on[18] = 0x99;
+    CHECK(ParseNightLightState(on, sizeof(on)) == -1);       // a format we do not know: no claim
+    CHECK(ParseNightLightState(off, 18) == -1);               // too short
+    CHECK(ParseNightLightState(nullptr, 0) == -1);
+    unsigned char bad[sizeof(off)];
+    memcpy(bad, off, sizeof(off));
+    bad[0] = 0;
+    CHECK(ParseNightLightState(bad, sizeof(bad)) == -1);      // not the CloudStore header
+}

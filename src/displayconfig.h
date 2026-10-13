@@ -36,6 +36,13 @@ bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo);
 // Query fresh DXGI output descriptor for a monitor (creates new factory to avoid stale data)
 bool QueryFreshOutputDesc(HMONITOR hMonitor, DXGI_OUTPUT_DESC1& outDesc);
 
+// Windows Night Light (blue-light reduction), which tints every display outside DesktopLUT's pipeline: 1 on, 0 off,
+// -1 unknown. Read from the user's CloudStore state blob (undocumented: byte 18 is 0x15 while active, 0x13 while not,
+// on every Windows 10 1709+ / 11 build seen); anything else is unknown.
+int WindowsNightLightState();
+// The blob parse (exposed for testing).
+int ParseNightLightState(const unsigned char* data, size_t size);
+
 // Get/set HDR state for a display
 bool GetDisplayHdrState(const DisplayInfo& display, bool& outEnabled);
 bool SetDisplayHdrState(const DisplayInfo& display, bool enable);

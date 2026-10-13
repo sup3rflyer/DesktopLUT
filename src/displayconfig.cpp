@@ -209,6 +209,25 @@ bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo) {
     return false;
 }
 
+int ParseNightLightState(const unsigned char* data, size_t size) {
+    if (!data || size < 19 || data[0] != 0x43 || data[1] != 0x42) return -1;   // "CB" header
+    if (data[18] == 0x15) return 1;
+    if (data[18] == 0x13) return 0;
+    return -1;
+}
+
+int WindowsNightLightState() {
+    static const wchar_t kKey[] =
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\CloudStore\\Store\\DefaultAccount\\Current\\"
+        L"default$windows.data.bluelightreduction.bluelightreductionstate\\"
+        L"windows.data.bluelightreduction.bluelightreductionstate";
+    unsigned char buf[256];
+    DWORD size = sizeof(buf), type = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, kKey, L"Data", RRF_RT_REG_BINARY, &type, buf, &size) != ERROR_SUCCESS)
+        return 0;   // never used: off
+    return ParseNightLightState(buf, size);
+}
+
 bool QueryFreshOutputDesc(HMONITOR hMonitor, DXGI_OUTPUT_DESC1& outDesc) {
     IDXGIFactory1* factory = nullptr;
     if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
