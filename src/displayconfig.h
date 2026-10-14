@@ -1,5 +1,5 @@
 // DesktopLUT - displayconfig.h
-// Display configuration utilities (MaxTML, etc.)
+// Display configuration utilities (the HDR peak override, EDID parsing, etc.)
 
 #pragma once
 
@@ -9,7 +9,7 @@
 #include <vector>
 #include "types.h"  // DisplayIdentity
 
-// Display info for MaxTML operations
+// Display info for the DisplayConfig / ICC profile operations
 struct DisplayInfo {
     std::wstring name;
     std::wstring devicePath;
@@ -26,9 +26,14 @@ bool EnumerateDisplaysForMaxTml(std::vector<DisplayInfo>& displays);
 // Get current MaxTML for a display (returns 0 if not available)
 float GetDisplayMaxTml(const DisplayInfo& display);
 
-// Set MaxTML for a display (nits value, e.g., 1000, 4000, 10000)
-// Returns true on success
-bool SetDisplayMaxTml(const DisplayInfo& display, float nits);
+struct MonitorPrimaries;
+// What the DisplayConfig override (SET_ADVANCED_COLOR_PARAM) tells Windows, and through DXGI every app, about an HDR
+// display: primaries, white and luminance range, all in one packet. Windows keeps it until a mode change, a wake or a
+// driver reset — or until an HDR profile is associated, whose tags replace it (windows_tonemap.h). Needs HDR on.
+bool SetDisplayPeakOverride(const DisplayInfo& display, const MonitorPrimaries& primaries, float minNits, float maxNits,
+                            float maxFrameAvgNits);
+// The display's EDID (exact device instance first, then its hardware id): false when it cannot be read.
+bool ReadEDIDForDisplay(const DisplayInfo& display, std::vector<BYTE>& edidData);
 
 // Get display info for a specific monitor index (matches g_monitors order)
 bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo);
@@ -137,6 +142,15 @@ MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex);
 
 // EDID parsing (exposed for testing)
 bool ParseEDIDChromaticity(const BYTE* edid, size_t edidSize, MonitorPrimaries& primaries);
+
+// The luminance an EDID's CTA-861 HDR Static Metadata Data Block declares — what Windows reports for the display on
+// its own, without a profile or an override. 0 = not declared. False when there is no such block (or no max).
+struct EdidHdrLuminance {
+    float maxNits = 0.0f;           // desired content max luminance
+    float maxFrameAvgNits = 0.0f;   // desired content max frame-average luminance
+    float minNits = 0.0f;           // desired content min luminance
+};
+bool ParseEDIDHdrLuminance(const BYTE* edid, size_t edidSize, EdidHdrLuminance& out);
 std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath);
 
 // Serial number from an EDID block: the ASCII serial descriptor (tag 0xFF) when present,

@@ -585,13 +585,50 @@ TEST_CASE("Float: a value that is not entirely a finite number returns the defau
     CHECK(GetPrivateProfileFloat(L"F", L"k", 42.0f, ini.c_str()) == 1000.0f);
 }
 
-TEST_CASE("Monitor settings: a non-numeric MaxTmlPeak loads the default, not 10 nits") {
+TEST_CASE("Monitor settings: the Windows tone map replaces the pre-3.0 MaxTML override") {
     TempIni ini;
-    WritePrivateProfileStringW(L"Display0", L"MaxTmlEnabled", L"true", ini.c_str());
-    WritePrivateProfileStringW(L"Display0", L"MaxTmlPeak", L"abc", ini.c_str());
+    auto load = [&](const wchar_t* section) {
+        MonitorSettings ms;
+        LoadMonitorSettings(section, ms, ini.c_str());
+        return ms.windowsToneMap;
+    };
+    // Nothing written: Auto (10000 nits exactly while DesktopLUT tone maps).
+    CHECK(load(L"Fresh") == WindowsToneMap::Auto);
+    // The override on at 10000 with DesktopLUT's tone map on: Auto is the same while it runs.
+    WritePrivateProfileStringW(L"A", L"MaxTmlEnabled", L"true", ini.c_str());
+    WritePrivateProfileStringW(L"A", L"MaxTmlPeak", L"10000.0000", ini.c_str());
+    WritePrivateProfileStringW(L"A", L"HDR_TonemapEnabled", L"true", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Auto);
+    // ...with the tone map off, the user tone maps elsewhere and wanted Windows out regardless: Bypass.
+    WritePrivateProfileStringW(L"A", L"HDR_TonemapEnabled", L"false", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Bypass);
+    // A custom peak, the override off, or a value that is not a number: Auto.
+    WritePrivateProfileStringW(L"A", L"MaxTmlPeak", L"1000.0000", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Auto);
+    WritePrivateProfileStringW(L"A", L"MaxTmlPeak", L"abc", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Auto);
+    WritePrivateProfileStringW(L"A", L"MaxTmlPeak", L"10000", ini.c_str());
+    WritePrivateProfileStringW(L"A", L"MaxTmlEnabled", L"false", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Auto);
+    // The new key wins over the old ones, and a save writes it and drops them.
+    WritePrivateProfileStringW(L"A", L"MaxTmlEnabled", L"true", ini.c_str());
+    WritePrivateProfileStringW(L"A", L"WindowsToneMap", L"panel", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Panel);
     MonitorSettings ms;
-    LoadMonitorSettings(L"Display0", ms, ini.c_str());
-    CHECK(ms.maxTml.peakNits == 1000.0f);
+    LoadMonitorSettings(L"A", ms, ini.c_str());
+    SaveMonitorSettings(L"A", ms, ini.c_str());
+    wchar_t buf[32] = {};
+    GetPrivateProfileStringW(L"A", L"WindowsToneMap", L"", buf, 32, ini.c_str());
+    CHECK(std::wstring(buf) == L"panel");
+    GetPrivateProfileStringW(L"A", L"MaxTmlEnabled", L"<absent>", buf, 32, ini.c_str());
+    CHECK(std::wstring(buf) == L"<absent>");
+    GetPrivateProfileStringW(L"A", L"MaxTmlPeak", L"<absent>", buf, 32, ini.c_str());
+    CHECK(std::wstring(buf) == L"<absent>");
+    // Any spelling it does not know is Auto; the keys are case-insensitive.
+    WritePrivateProfileStringW(L"A", L"WindowsToneMap", L"BYPASS", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Bypass);
+    WritePrivateProfileStringW(L"A", L"WindowsToneMap", L"sometimes", ini.c_str());
+    CHECK(load(L"A") == WindowsToneMap::Auto);
 }
 
 // ============================================================================
@@ -808,12 +845,11 @@ TEST_CASE("Sections: out-of-range index is ignored, not clamped") {
     CHECK(display[0] == 1);
 }
 
-TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") {
+TEST_CASE("Monitor settings: section round-trip keeps LUTs, the Windows tone map, DG/WB/MHC") {
     TempIni ini;
     MonitorSettings original;
     original.hdrPath = L"C:\\luts\\mon1_hdr.cube";
-    original.maxTml.enabled = true;
-    original.maxTml.peakNits = 800.0f;
+    original.windowsToneMap = WindowsToneMap::Panel;
     original.hdrMHC.enabled = true;
     original.hdrMHC.profilePath = L"C:\\WINDOWS\\system32\\spool\\drivers\\color\\DesktopLUT_Mon1_HDR_1.icm";
     original.hdrMHC.desktopGammaEnabled = true;
@@ -833,8 +869,7 @@ TEST_CASE("Monitor settings: section round-trip keeps LUTs, MaxTML, DG/WB/MHC") 
     LoadMonitorSettings(L"Display7", ms, ini.c_str());
     CHECK(ms.sdrPath.empty());
     CHECK(ms.hdrPath == L"C:\\luts\\mon1_hdr.cube");
-    CHECK(ms.maxTml.enabled == true);
-    CHECK(ms.maxTml.peakNits == doctest::Approx(800.0f).epsilon(0.001));
+    CHECK(ms.windowsToneMap == WindowsToneMap::Panel);
     CHECK(ms.hdrMHC.enabled == true);
     CHECK(ms.hdrMHC.profileName == L"DesktopLUT_Mon1_HDR_1.icm");
     CHECK(ms.hdrMHC.desktopGammaEnabled == true);
@@ -1879,7 +1914,7 @@ TEST_CASE("IniWriteBatch: the saved file is byte-identical to unbatched writes")
         ms.hdrMHC.permPaths[9].clear();
         ms.hdrMHC.permPaths[12] = L"C:\\y.icm";
         ms.hdrMHC.correctionGrayscale.points[3] *= 1.01f;
-        ms.maxTml.enabled = true;
+        ms.windowsToneMap = WindowsToneMap::Bypass;
         SaveMonitorSettings(L"Display0", ms, path.c_str());
         batch.reset();
         return ReadFileBytes(path);

@@ -40,6 +40,7 @@
 #include "actions/gs_live.h"
 #include "actions/mhc_edit.h"
 #include "dwm_inject.h"
+#include "windows_tonemap.h"
 
 #pragma comment(lib, "Advapi32.lib")
 
@@ -905,6 +906,9 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("dummy_icc_path", JStr(WideToUtf8(dummy)));
     result.set("corrections_reset", JBool(true));
     result.set("identity_profile", JStr(WideToUtf8(identityName)));
+    // The session switched tone mapping off: the flags follow at once (a profile DLC installs bakes the panel's peak);
+    // the swaps and overrides wait for calibration.exit.
+    RequestWindowsToneMap(false);
     // Honest re-enter tell for DLC: true = this call KEPT the session's original capture of this
     // display instead of capturing the cleared state. A build predating the snapshot store omits
     // the field entirely, which is how DLC tells the two apart (additive: no contract bump).
@@ -1017,6 +1021,8 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
     }
     // Desktop gamma waited for the session: catch up with the SDR white level now (debounced re-check).
     if (g_gui.hwndMain) SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
+    // ...and the Windows tone map (it held for the session, and the restore may have re-installed profiles).
+    RequestWindowsToneMap(true);
     result.set("active", JBool(false));
     result.set("restored", JBool(restored));
     // Which displays went back (at their CURRENT index), and any the session captured but could
@@ -1152,6 +1158,7 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
             StartProcessing();
         }
     }
+    if (tmChanged) RequestWindowsToneMap(false);   // Auto follows the tone map (held while a calibration runs)
     if (mhcChanged || tmChanged) {
         FaldTrace("LayersSet: UpdateMhcFlagsLive");
         UpdateMhcFlagsLive(mon);
@@ -1220,6 +1227,7 @@ void DoDisableAll(const JsonValue& /*p*/, JsonValue& result, std::string& /*erro
     }
     SaveSettings();
     ReapplyProcessing();
+    RequestWindowsToneMap(false);   // tone mapping went off everywhere: Auto reports the panel's peak
     result.set("corrections_enabled", JBool(false));
 }
 

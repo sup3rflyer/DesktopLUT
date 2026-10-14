@@ -599,7 +599,7 @@ void CreateGUILayout(HWND hwnd) {
 
     g_gui.contentHeight[1] = innerY + h + 8;
 
-    // === TAB 2: Corrections (HDR-only: Tonemapping + MaxTML) ===
+    // === TAB 2: Corrections (HDR-only: Tonemapping + Windows tone map) ===
     // SDR corrections (White Point, Grayscale, Desktop Gamma) moved to MHC tab
     innerY = 8;
     HWND panel2 = g_gui.hwndScrollPanel[2];
@@ -657,44 +657,21 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 228, tonemapY, 70, h, panel2, (HMENU)ID_CORR_TONEMAP_DYNAMIC, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndTonemapDynamic);
 
-    // MaxTML group (Windows HDR peak luminance override, HDR only)
+    // Windows tone map group (what Windows tells apps the HDR peak is, HDR only)
     innerY += 80;
-    ctrl = CreateWindow(L"BUTTON", L"Display Peak Override (MaxTML)", WS_CHILD | BS_GROUPBOX,
+    ctrl = CreateWindow(L"BUTTON", L"Windows Tone Map", WS_CHILD | BS_GROUPBOX,
         innerX, innerY, groupW, 48, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
 
-    g_gui.hwndMaxTmlEnable = CreateWindow(L"BUTTON", L"Enable",
-        WS_CHILD | BS_AUTOCHECKBOX,
-        innerX + 10, innerY + 18, 55, h, panel2, (HMENU)ID_CORR_MAXTML_ENABLE, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlEnable);
-
-
-    g_gui.hwndMaxTmlCombo = CreateWindow(L"COMBOBOX", nullptr,
+    // In WindowsToneMap order (the item index is the value).
+    g_gui.hwndWinToneMapCombo = CreateWindow(L"COMBOBOX", nullptr,
         WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
-        innerX + 70, innerY + 18, 85, 150, panel2, (HMENU)ID_CORR_MAXTML_COMBO, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlCombo);
-
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"Custom");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"400 nits");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"600 nits");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"1000 nits");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"1400 nits");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"4000 nits");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_ADDSTRING, 0, (LPARAM)L"10000 nits");
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_SETCURSEL, 3, 0);  // Default to 1000
-
-    g_gui.hwndMaxTmlEdit = CreateWindow(L"EDIT", L"1000", WS_CHILD | WS_BORDER | ES_NUMBER,
-        innerX + 160, innerY + 18, 50, h, panel2, (HMENU)ID_CORR_MAXTML_EDIT, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlEdit);
-
-
-    ctrl = CreateWindow(L"STATIC", L"nits", WS_CHILD, innerX + 212, innerY + 20, 25, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-
-
-    g_gui.hwndMaxTmlApply = CreateWindow(L"BUTTON", L"Apply",
-        WS_CHILD | BS_OWNERDRAW, innerX + 245, innerY + 18, 45, h, panel2, (HMENU)ID_CORR_MAXTML_APPLY, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndMaxTmlApply);
+        innerX + 10, innerY + 18, 85, 150, panel2, (HMENU)ID_CORR_WINTONEMAP_COMBO, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndWinToneMapCombo);
+    SendMessage(g_gui.hwndWinToneMapCombo, CB_ADDSTRING, 0, (LPARAM)L"Auto");
+    SendMessage(g_gui.hwndWinToneMapCombo, CB_ADDSTRING, 0, (LPARAM)L"Bypass");
+    SendMessage(g_gui.hwndWinToneMapCombo, CB_ADDSTRING, 0, (LPARAM)L"Panel");
+    SendMessage(g_gui.hwndWinToneMapCombo, CB_SETCURSEL, 0, 0);
 
 
     // FALD compensation group (Experimental; overlay path only). One Enable + panel-file row per mode:
@@ -861,12 +838,11 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 250, faldS2Y, 30, h, panel2, (HMENU)ID_CORR_FALD_STAR_REACH, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldStarReach);
 
-    g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + MaxTML (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
+    g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + Windows tone map (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);
     SetNumericEdit(g_gui.hwndTonemapSource, 0);
-    SetNumericEdit(g_gui.hwndMaxTmlEdit, 0);
     SetNumericEdit(g_gui.hwndFaldTauRise, 1);
     SetNumericEdit(g_gui.hwndFaldTauFall, 1);
     SetNumericEdit(g_gui.hwndFaldDelay, 0);

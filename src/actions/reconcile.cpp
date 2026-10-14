@@ -6,6 +6,7 @@
 #include "globals.h"
 #include "gui.h"
 #include "processing.h"
+#include "windows_tonemap.h"
 #include <iostream>
 
 namespace act {
@@ -150,6 +151,7 @@ void SetLiveLayersSuspended(bool suspended) {
     } else {
         ReconcileLiveLayers("resume");
     }
+    ReconcileWindowsToneMap(suspended ? "suspend" : "resume", false);   // Auto: nothing tone maps while suspended
     GuiNotifySettingsChanged(-1);
 }
 
@@ -159,6 +161,7 @@ void ResumeLiveLayersForPipe() {
     if (!g_userStopped) return;
     g_userStopped = false;
     notify::Post(notify::Sev::Info, -1, L"live", L"Live layers resumed by DLC");
+    RequestWindowsToneMap(false);
     GuiNotifySettingsChanged(-1);
 }
 

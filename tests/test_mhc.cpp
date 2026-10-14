@@ -2457,7 +2457,7 @@ TEST_CASE("Identity MHC profile: name recognizer") {
     CHECK_FALSE(IsMhcIdentityProfileName(L""));
 }
 
-TEST_CASE("Identity MHC profile: HDR peak metadata follows the monitor's MaxTML, then the removed profile") {
+TEST_CASE("Identity MHC profile: HDR peak metadata is the removed profile's, never the Windows tone map's 10000") {
     const float kDefault = MHC2ProfileParams().peakNits;
     MonitorSettings ms;
     // (1) Nothing configured -> the params default.
@@ -2466,20 +2466,101 @@ TEST_CASE("Identity MHC profile: HDR peak metadata follows the monitor's MaxTML,
     ms.hdrMHC.sourceFilePath = L"C:/nonexistent/base.cube";
     ms.hdrMHC.baseGrayscale.peakNits = 1450.0f;
     CHECK(MhcIdentityPeakNits(ms, true) == 1450.0f);
-    // (3) Display Peak Override (MaxTML) enabled -> the monitor's own peak wins.
-    ms.maxTml.enabled = true;
-    ms.maxTml.peakNits = 10000.0f;
-    CHECK(MhcIdentityPeakNits(ms, true) == 10000.0f);
-    // MaxTML disabled again -> back to the removed profile's peak.
-    ms.maxTml.enabled = false;
+    // (3) The bypass in force: still the panel's. The identity profile outlives DesktopLUT (after a Remove, across an
+    // exit and a reboot) and Windows re-applies its tags at every association; while 10000 is wanted the DisplayConfig
+    // override carries it over the identity.
+    ms.hdrMHC.reportPeakMax = true;
     CHECK(MhcIdentityPeakNits(ms, true) == 1450.0f);
-    // Invalid MaxTML value is ignored.
-    ms.maxTml.enabled = true;
-    ms.maxTml.peakNits = 0.0f;
-    CHECK(MhcIdentityPeakNits(ms, true) == 1450.0f);
-    // SDR: MaxTML is an HDR concept; the SDR value is unused (writer pins 80) but stays the MHC's.
-    ms.maxTml.peakNits = 10000.0f;
+    // SDR: unused (the writer pins 80) but stays the MHC's.
+    ms.sdrMHC.reportPeakMax = true;
     CHECK(MhcIdentityPeakNits(ms, false) == MhcProfileMetadataPeakNits(ms.sdrMHC, false));
+}
+
+TEST_CASE("Windows tone map: the bypass variant changes the luminance tags only, never the curves") {
+    // The imported 1D cube (DLC's base), found from the repository root or the test binary's folder.
+    std::wstring cube = L"tests/fixtures/test_1d.cube";
+    if (GetFileAttributesW(cube.c_str()) == INVALID_FILE_ATTRIBUTES) cube = L"../../tests/fixtures/test_1d.cube";
+    // 0 base curve, 1 + fine-tune, 2 + desktop gamma at a 116-nit SDR white, 3 the imported 1D cube + fine-tune + DG.
+    for (int variant : { 0, 1, 2, 3 }) {
+        CAPTURE(variant);
+        const bool corr = variant >= 1;
+        MHCSettings m;
+        m.enabled = true;
+        m.primariesEnabled = true;
+        m.primariesPreset = 0;
+        m.baseGrayscale.enabled = true;
+        m.baseGrayscale.pointCount = 20;
+        m.baseGrayscale.initLinearPQ();
+        m.baseGrayscale.peakNits = 1729.26f;
+        m.baseGrayscale.points[3] *= 1.03f;   // a real curve, scaled to the panel's peak
+        if (corr) {
+            m.correctionGrayscale.enabled = true;
+            m.correctionGrayscale.pointCount = 20;
+            m.correctionGrayscale.initLinearPQ();
+            m.correctionGrayscale.peakNits = 1729.26f;
+            m.correctionGrayscale.points[5] *= 0.98f;
+        }
+        if (variant >= 2) {
+            m.desktopGammaEnabled = true;
+            m.dgSdrWhiteNits = 116.0f;
+        }
+        if (variant == 3) {
+            if (GetFileAttributesW(cube.c_str()) == INVALID_FILE_ATTRIBUTES) { WARN("test_1d.cube not found"); continue; }
+            m.sourceFilePath = cube;
+            m.sourceIs1DCube = true;
+        }
+        const uint8_t panelPerm = ComputeMhcPermutation(m, true);
+        CHECK((panelPerm & MHCSettings::PERM_PEAK_MAX) == 0);
+        m.reportPeakMax = true;
+        const uint8_t maxPerm = ComputeMhcPermutation(m, true);
+        CHECK(maxPerm == (panelPerm | MHCSettings::PERM_PEAK_MAX));
+        CHECK((ComputeMhcPermutation(m, false) & MHCSettings::PERM_PEAK_MAX) == 0);   // HDR only
+
+        MHC2ProfileParams panel, max;
+        REQUIRE(BuildMHC2ParamsForPerm(m, true, 0, panelPerm, panel));
+        REQUIRE(BuildMHC2ParamsForPerm(m, true, 0, maxPerm, max));
+        CHECK(MhcReportedPeakNits(panel) == doctest::Approx(1729.26f));
+        CHECK(MhcReportedPeakNits(max) == kWindowsToneMapBypassNits);
+        CHECK(max.peakNits == panel.peakNits);   // the curves' scale stays the panel's
+
+        // The same 1D LUTs and matrix, bit for bit: only the lumi and MHC2 luminance fields differ.
+        MhcScanout a, b;
+        REQUIRE(ComputeMhcScanout(panel, a));
+        REQUIRE(ComputeMhcScanout(max, b));
+        REQUIRE(a.lutSize == b.lutSize);
+        for (int ch = 0; ch < 3; ch++) CHECK(a.lut[ch] == b.lut[ch]);
+        for (int k = 0; k < 12; k++) CHECK(a.emit[k] == b.emit[k]);
+        std::vector<uint8_t> pa, pb;
+        REQUIRE(GenerateMHC2Profile(panel, pa));
+        REQUIRE(GenerateMHC2Profile(max, pb));
+        REQUIRE(pa.size() == pb.size());
+        int differing = 0;
+        for (size_t i = 0; i < pa.size(); i++)
+            if (i < 84 || i >= 100) differing += pa[i] != pb[i];   // not the header's profile ID (an MD5 of the rest)
+        CHECK(differing > 0);
+        CHECK(differing <= 8);   // two s15Fixed16 values (lumi Y, MHC2 max luminance), at most 4 bytes each
+
+        TempFile tmp(L"_test_peak_max.icm");
+        REQUIRE(WriteMHC2Profile(pb, tmp.path));
+        ICCProfileData icc;
+        REQUIRE(ReadICCProfile(tmp.path, icc));
+        REQUIRE(icc.hasLuminance);
+        CHECK(icc.luminance == doctest::Approx(kWindowsToneMapBypassNits).epsilon(0.0001));
+    }
+    // The live edit's identity scanout (EngagePassthroughScanout: both stages bypassed, the active variant's peak
+    // bit kept): identity curves, the bypass's tags.
+    MHCSettings m;
+    m.enabled = true;
+    m.baseGrayscale.enabled = true;
+    m.baseGrayscale.pointCount = 20;
+    m.baseGrayscale.initLinearPQ();
+    m.baseGrayscale.peakNits = 1729.26f;
+    MHC2ProfileParams pass;
+    REQUIRE(BuildMHC2ParamsForPerm(m, true, 0, (uint8_t)(MHCSettings::PERM_NOPRIM | MHCSettings::PERM_NOGRAY |
+                                                         MHCSettings::PERM_PEAK_MAX), pass));
+    CHECK(MhcReportedPeakNits(pass) == kWindowsToneMapBypassNits);
+    CHECK(pass.peakNits == doctest::Approx(1729.26f));
+    CHECK_FALSE(pass.grayscaleEnabled);
 }
 
 TEST_CASE("Identity MHC profile: identity matrix + identity LUTs + mode metadata (SDR and HDR)") {

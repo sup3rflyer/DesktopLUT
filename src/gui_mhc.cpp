@@ -493,6 +493,9 @@ bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex
         params.correctionGrayscaleEnabled = false;
         params.correctionGrayscale.enabled = false;
     }
+
+    // The Windows tone map bypass: only the luminance tags say 10000 nits; every curve stays scaled to the panel.
+    params.reportedPeakNits = (isHDR && (perm & MHCSettings::PERM_PEAK_MAX)) ? kWindowsToneMapBypassNits : 0.0f;
     return true;
 }
 
@@ -518,6 +521,9 @@ uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR) {
     // Stage bypasses (the interface's switches) override the stage's own bits.
     if (mhc.bypassPrimaries) perm |= MHCSettings::PERM_NOPRIM;
     if (mhc.bypassGrayscale) perm |= MHCSettings::PERM_NOGRAY;
+
+    // What Windows is told the peak is (the Windows tone map, resolved at runtime): HDR only.
+    if (isHDR && mhc.reportPeakMax) perm |= MHCSettings::PERM_PEAK_MAX;
     return NormalizeMhcPerm(perm);
 }
 
@@ -629,7 +635,12 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
     return true;
 }
 
-bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
+// One permutation swap at a time: the GUI, whitelist and render threads swap (desktop gamma, the Windows tone map, the
+// stage switches). SwapMhcPermBits reads the variant it changes inside it, so two swaps of different bits never undo
+// each other (a reconcile computing its bits from a stale copy dropped the whitelist's desktop gamma change).
+static std::mutex g_mhcSwapMutex;
+
+static bool SwapMhcToPermutationLocked(int monitorIndex, bool isHDR, uint8_t newPerm) {
     // Callers flip single bits on the active permutation; a bypassed stage keeps its bits clear.
     newPerm = NormalizeMhcPerm(newPerm);
     // Ensure the target variant exists
@@ -686,6 +697,22 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
     return true;
 }
 
+bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
+    std::lock_guard<std::mutex> swap(g_mhcSwapMutex);
+    return SwapMhcToPermutationLocked(monitorIndex, isHDR, newPerm);
+}
+
+bool SwapMhcPermBits(int monitorIndex, bool isHDR, uint8_t setBits, uint8_t clearBits) {
+    std::lock_guard<std::mutex> swap(g_mhcSwapMutex);
+    uint8_t active;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
+        active = (isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC : g_gui.monitorSettings[monitorIndex].sdrMHC).activePerm;
+    }
+    return SwapMhcToPermutationLocked(monitorIndex, isHDR, (uint8_t)((active | setBits) & ~clearBits));
+}
+
 // ----------------------------------------------------------------------------
 // Live edit preview scanout (mhc_preview.h): while the overlay applies a display's profile, scanout runs a transient
 // identity profile with the same luminance metadata.
@@ -701,10 +728,11 @@ std::wstring EngagePassthroughScanout(int monitorIndex, bool isHDR, const MHCSet
     if (!GetDisplayInfoForMonitor(monitorIndex, displayInfo)) return L"";
 
     // Both stages bypassed: identity matrix + identity LUTs, the full profile's luminance metadata (so HDR
-    // applications are told the same peak while the edit runs).
+    // applications are told the same peak while the edit runs — the installed variant's, Windows tone map included).
     MHC2ProfileParams params;
     if (!BuildMHC2ParamsForPerm(mhc, isHDR, monitorIndex,
-                                (uint8_t)(MHCSettings::PERM_NOPRIM | MHCSettings::PERM_NOGRAY), params))
+                                (uint8_t)(MHCSettings::PERM_NOPRIM | MHCSettings::PERM_NOGRAY |
+                                          (mhc.activePerm & MHCSettings::PERM_PEAK_MAX)), params))
         return L"";
     std::vector<uint8_t> profileData;
     if (!GenerateMHC2Profile(params, profileData)) return L"";
@@ -749,11 +777,10 @@ void DisengagePassthroughScanout(int monitorIndex, bool isHDR, const std::wstrin
 // ----------------------------------------------------------------------------
 
 float MhcIdentityPeakNits(const MonitorSettings& ms, bool isHDR) {
-    // The monitor's own peak setting first (Display Peak Override / MaxTML — what DesktopLUT tells
-    // Windows the panel peaks at), so Remove doesn't silently change what HDR apps are told.
-    if (isHDR && ms.maxTml.enabled && std::isfinite(ms.maxTml.peakNits) && ms.maxTml.peakNits > 0.0f)
-        return ms.maxTml.peakNits;
-    // ...else what the removed profile carried (its configured peak, or the params default).
+    // What the removed profile carried (its configured peak, or the params default) — the PANEL's, never the Windows
+    // tone map's 10000: an identity profile stays associated with nothing of DesktopLUT's running it (after a Remove,
+    // across an exit, a reboot), and Windows re-applies its tags at every association. While the bypass is wanted the
+    // DisplayConfig override carries the 10000 over it (windows_tonemap.cpp: no profile of ours = the override).
     return MhcProfileMetadataPeakNits(isHDR ? ms.hdrMHC : ms.sdrMHC, isHDR);
 }
 
@@ -912,7 +939,8 @@ static bool SwapDgAll(bool dgEnabled) {
             if (newPerm != mhc.activePerm) needSwap = true;
         }
 
-        if (needSwap && !SwapMhcToPermutation(i, true, newPerm)) ok = false;
+        if (needSwap && !SwapMhcPermBits(i, true, dgEnabled ? MHCSettings::PERM_DG : 0,
+                                         dgEnabled ? 0 : MHCSettings::PERM_DG)) ok = false;
     }
     return ok;
 }

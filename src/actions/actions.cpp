@@ -11,6 +11,7 @@
 #include "fald.h"
 #include "mhc.h"
 #include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
+#include "windows_tonemap.h"
 #include <cstdio>
 #include <iostream>
 #include <mutex>
@@ -175,56 +176,28 @@ Result SetTonemap(int mon, const TonemapSettings& t) {
     SaveSettings();
     // An enable change can start or stop the live layers, or change the hook's display list.
     if (enableChanged) ReconcileLiveLayers("tone map");
+    if (enableChanged) ReconcileWindowsToneMap("tone map", false);   // Auto follows whether DesktopLUT tone maps
     Finish(mon);
     return Done();
 }
 
 // ---------------------------------------------------------------------------------------------------
-// MaxTML
+// Windows tone map
 
-Result SetMaxTmlEnabled(int mon, bool on) {
+Result SetWindowsToneMap(int mon, WindowsToneMap mode) {
     if (!ValidMonitor(mon)) return Done(false);
-    {
-        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        g_gui.monitorSettings[mon].maxTml.enabled = on;
-    }
-    SaveSettings();
-    Finish(mon);
-    return Done();
-}
-
-Result SetMaxTmlPeak(int mon, float nits) {
-    if (!ValidMonitor(mon)) return Done(false);
-    nits = Clamp(nits, 100.0f, 10000.0f);
     bool changed;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        float& stored = g_gui.monitorSettings[mon].maxTml.peakNits;
-        changed = stored != nits;
-        stored = nits;
+        WindowsToneMap& stored = g_gui.monitorSettings[mon].windowsToneMap;
+        changed = stored != mode;
+        stored = mode;
     }
-    if (changed) SaveSettings();
+    if (!changed) return Done(false);
+    SaveSettings();
+    ReconcileWindowsToneMap("setting", false);
     Finish(mon);
-    return Done(changed);
-}
-
-Result ApplyMaxTmlNow(int mon, float nits) {
-    if (!ValidMonitor(mon)) return Done(false);
-    SetMaxTmlPeak(mon, nits);
-    nits = Clamp(nits, 100.0f, 10000.0f);
-    DisplayInfo info;
-    if (!GetDisplayInfoForMonitor(mon, info))
-        return Told(mon, L"maxtml", Fail(notify::Sev::Error, L"Could not find display information for this monitor."));
-    if (!SetDisplayMaxTml(info, nits))
-        return Told(mon, L"maxtml", Fail(notify::Sev::Error, L"Failed to set MaxTML. Make sure HDR is enabled."));
-    wchar_t msg[256];
-    const wchar_t* name = info.name.empty() ? L"selected monitor" : info.name.c_str();
-    _swprintf_s_l(msg, _countof(msg), L"MaxTML set to %.0f nits for %s", GetCLocale(), nits, name);
-    Result r;
-    r.sev = notify::Sev::Success;
-    r.text = msg;
-    r.changed = true;
-    return Told(mon, L"maxtml", r);
+    return Done();
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -517,14 +490,12 @@ Result MhcSetDesktopGamma(int mon, bool on) {
     }
     // No MHC profile yet: generate an identity one to carry the desktop gamma.
     if (on && !mhcEnabled) GenerateAndInstallMhcProfile(mon, true);
-    uint8_t perm = 0;
     bool haveProfile;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         const MHCSettings& mhc = g_gui.monitorSettings[mon].hdrMHC;
         mhcEnabled = mhc.enabled;
         haveProfile = !mhc.profileName.empty();
-        perm = mhc.activePerm;
     }
     const bool dgActive = on && mhcEnabled;
     g_userDesktopGammaMode.store(dgActive);
@@ -532,9 +503,7 @@ Result MhcSetDesktopGamma(int mon, bool on) {
     // Swap to the cached permutation with / without DG (instant, no regenerate). If the variant cannot be built or
     // associated the previous profile stays, and so does the setting: it must never claim a gamma the screen lacks.
     if (haveProfile) {
-        if (on) perm |= MHCSettings::PERM_DG;
-        else perm &= (uint8_t)~MHCSettings::PERM_DG;
-        if (!SwapMhcToPermutation(mon, true, perm)) {
+        if (!SwapMhcPermBits(mon, true, on ? MHCSettings::PERM_DG : 0, on ? 0 : MHCSettings::PERM_DG)) {
             {
                 std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
                 if (ValidMonitor(mon)) g_gui.monitorSettings[mon].hdrMHC.desktopGammaEnabled = wasOn;

@@ -89,6 +89,9 @@ struct MovableAtomic {
 // -> GUI thread). wParam: MhcReloadReason.
 #define WM_MHC_RELOAD_HARDWARE   (WM_USER + 110)
 enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss = 1, kMhcReloadAdapter = 2 };
+// Resolve each display's Windows tone map again (ReconcileWindowsToneMap; any thread -> GUI thread). wParam 1 =
+// Windows may have dropped the DisplayConfig override (a mode change, a wake, a driver reset): send it again.
+#define WM_WINDOWS_TONEMAP       (WM_USER + 111)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
@@ -132,11 +135,9 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_CORR_TONEMAP_SOURCE   523
 #define ID_CORR_TONEMAP_DYNAMIC  524
 
-// MaxTML (Display Peak Luminance) control IDs (Corrections tab, HDR only)
-#define ID_CORR_MAXTML_ENABLE    525
-#define ID_CORR_MAXTML_COMBO     526
-#define ID_CORR_MAXTML_EDIT      527
-#define ID_CORR_MAXTML_APPLY     528
+// Windows tone map (what Windows tells apps the HDR peak is) control ID (Corrections tab, HDR only; 525, 527 and
+// 528 retired with the MaxTML enable / value / apply controls)
+#define ID_CORR_WINTONEMAP_COMBO 526
 
 // FALD compensation layer (Experimental, overlay path; one row per mode — HDR and SDR under ACM)
 #define ID_CORR_FALD_ENABLE      529   // HDR row
@@ -292,6 +293,8 @@ const int RENDER_HANG_TIMEOUT_MS = 30000;       // no render-loop iteration this
                                                 //   6x the in-thread watchdog, so a slow recovery is not one
 const int RECONCILE_TIMER_ID = 118;             // Retry of a live-layer reconcile that had to wait (act::ReconcileLiveLayers)
 const int RECONCILE_RETRY_MS = 500;
+const int WINDOWS_TONEMAP_TIMER_ID = 119;      // Retry of a Windows tone map reconcile that had to wait (profile maintenance,
+                                                //   a calibration / live edit / MHC dialog) or whose profile swap failed
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
@@ -850,11 +853,16 @@ struct TonemapSettings {
     float targetPeakNits = 1000.0f;
 };
 
-// MaxTML (Display Peak Override) settings for GUI
-struct MaxTmlSettings {
-    bool enabled = false;
-    float peakNits = 1000.0f;
+// What Windows tells games and apps an HDR display peaks at (the "Windows tone map" setting). DesktopLUT tone maps
+// itself; told the panel's real peak, Windows or an app would tone map as well (a second roll-off at the top). The
+// HDR MHC profile carries it in its luminance tags (MHCSettings::PERM_PEAK_MAX); a display without one gets the
+// DisplayConfig override (windows_tonemap.h). INI WindowsToneMap=auto|bypass|panel.
+enum class WindowsToneMap : uint8_t {
+    Auto,     // 10000 nits while DesktopLUT's own tone map is meant to run on the display, else the panel's peak
+    Bypass,   // always 10000 nits: Windows and apps never tone map
+    Panel,    // always the panel's peak (the HDR profile's measured peak, else the display's EDID)
 };
+constexpr float kWindowsToneMapBypassNits = 10000.0f;   // the top of PQ: nothing above it to tone map
 
 // Color correction settings for GUI
 struct ColorCorrectionSettings {
@@ -930,12 +938,15 @@ struct MHCSettings {
     // Bit 2 (0x4): Correction GS    (1D LUT)
     // Bit 3 (0x8): Primaries stage bypassed  (identity matrix; WB never set with it)
     // Bit 4 (0x10): Grayscale stage bypassed (identity 1D LUT; DG / GS never set with it)
+    // Bit 5 (0x20): Reports the 10000-nit peak (HDR only; the Windows tone map setting): the luminance tags say
+    //               kWindowsToneMapBypassNits, the curves stay scaled to the panel's peak — the 1D LUT is the same.
     static constexpr uint8_t PERM_WB = 0x1;
     static constexpr uint8_t PERM_DG = 0x2;
     static constexpr uint8_t PERM_GS = 0x4;
     static constexpr uint8_t PERM_NOPRIM = 0x8;
     static constexpr uint8_t PERM_NOGRAY = 0x10;
-    static constexpr int PERM_COUNT = 32;
+    static constexpr uint8_t PERM_PEAK_MAX = 0x20;
+    static constexpr int PERM_COUNT = 64;
 
     std::wstring permNames[PERM_COUNT];  // Cached profile filenames (indexed by bitmask)
     std::wstring permPaths[PERM_COUNT];  // Cached profile full paths
@@ -945,8 +956,14 @@ struct MHCSettings {
     float permDgWhiteNits[PERM_COUNT] = {
         80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
         80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
+        80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
+        80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
     };
     uint8_t activePerm = 0;              // Currently active permutation bitmask
+    // Runtime only (never saved): the HDR profile should report the 10000-nit peak now (the display's Windows tone
+    // map setting resolved against what runs: ReconcileWindowsToneMap). ComputeMhcPermutation bakes it in
+    // (PERM_PEAK_MAX), so a re-bake installs the variant the reconcile would swap to.
+    bool reportPeakMax = false;
     // Runtime: the active profile was baked by a build whose white-balance matrix maths is older than
     // this one (INI MHCMatrixRev < kMhcMatrixRev) — re-baked once at startup (RebakePendingMhcProfiles).
     bool matrixRebakePending = false;
@@ -980,7 +997,7 @@ struct MonitorSettings {
     bool hdrLutBypass = false;
     ColorCorrectionSettings sdrColorCorrection;  // Color correction for SDR mode
     ColorCorrectionSettings hdrColorCorrection;  // Color correction for HDR mode
-    MaxTmlSettings maxTml;                       // Display Peak Override settings
+    WindowsToneMap windowsToneMap = WindowsToneMap::Auto;   // what Windows tells apps the HDR peak is
     MHCSettings sdrMHC;                          // MHC profile for SDR mode
     MHCSettings hdrMHC;                          // MHC profile for HDR mode
 
@@ -1070,11 +1087,8 @@ struct GUIState {
     HWND hwndTonemapSource = nullptr;
     HWND hwndTonemapDynamic = nullptr;
 
-    // MaxTML controls (Corrections tab, HDR only)
-    HWND hwndMaxTmlEnable = nullptr;
-    HWND hwndMaxTmlCombo = nullptr;
-    HWND hwndMaxTmlEdit = nullptr;
-    HWND hwndMaxTmlApply = nullptr;
+    // Windows tone map (Corrections tab, HDR only)
+    HWND hwndWinToneMapCombo = nullptr;
 
     // FALD compensation (Experimental) controls: one Enable + panel-file row per mode, shared View / pedestal
     HWND hwndFaldEnable = nullptr;      // HDR row

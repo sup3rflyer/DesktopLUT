@@ -90,6 +90,7 @@
     <ClCompile Include="src\osd.cpp" />
     <ClCompile Include="src\analysis.cpp" />
     <ClCompile Include="src\processing.cpp" />
+    <ClCompile Include="src\windows_tonemap.cpp" />
     <ClCompile Include="src\gui.cpp" />
     <ClCompile Include="src\gui_layout.cpp" />
     <ClCompile Include="src\gui_shared.cpp" />

@@ -5,6 +5,7 @@
 #include "displayconfig.h"
 #include "globals.h"
 #include "settings.h"
+#include "windows_tonemap.h"   // EdidHdrPeakNits
 #include <algorithm>
 #include <cmath>
 #include <cwctype>
@@ -273,8 +274,13 @@ MonitorResolveOutcome ResolveMonitorSettings(const std::vector<HMONITOR>& monito
         if (!r.fresh[i]) continue;
         DXGI_OUTPUT_DESC1 desc = {};
         if (!QueryFreshOutputDesc(live[i].hmon, desc)) continue;
-        const float maxNits = desc.MaxLuminance;
-        if (!(maxNits >= 400.0f && maxNits <= 10000.0f)) continue;
+        // 10000 is no panel's: the Windows tone map's bypass (a profile or override from an earlier run) — the EDID's.
+        float maxNits = desc.MaxLuminance;
+        if (maxNits >= kWindowsToneMapBypassNits - 1.0f) {
+            DisplayInfo di;
+            maxNits = GetDisplayInfoForHMonitor(live[i].hmon, di) ? EdidHdrPeakNits(di) : 0.0f;
+        }
+        if (!(maxNits >= 400.0f && maxNits < kWindowsToneMapBypassNits - 1.0f)) continue;
         const float seeded = std::round(maxNits / 10.0f) * 10.0f;
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         if (i >= g_gui.monitorSettings.size()) break;

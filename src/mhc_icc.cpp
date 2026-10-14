@@ -894,12 +894,12 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
     // chad - chromatic adaptation matrix (D65 -> D50 Bradford)
     WriteSf32Tag(tagChad, g_bradfordD65toD50);
 
-    // lumi - peak luminance
-    float peakLum = params.isHDR ? params.peakNits : 80.0f;
+    // lumi - peak luminance (what Windows reports to apps; the curves above were scaled to params.peakNits)
+    float peakLum = params.isHDR ? MhcReportedPeakNits(params) : 80.0f;
     WriteXYZTag(tagLumi, 0.0f, peakLum, 0.0f);  // Only Y component used for luminance
 
     // MHC2 - the correction data
-    float mhcPeakNits = params.isHDR ? params.peakNits : 80.0f;
+    float mhcPeakNits = params.isHDR ? MhcReportedPeakNits(params) : 80.0f;
     WriteMHC2Tag(tagMHC2, scan.emit, scan.lut[0].data(), scan.lut[1].data(), scan.lut[2].data(), lutSize,
                  params.isHDR, mhcPeakNits);
 
@@ -1087,6 +1087,11 @@ bool IsMhcIdentityProfileName(const std::wstring& name, bool* outIsHDR) {
         if (name[i] < L'0' || name[i] > L'9') return false;
     if (outIsHDR) *outIsHDR = isHDR;
     return true;
+}
+
+float MhcReportedPeakNits(const MHC2ProfileParams& params) {
+    return (std::isfinite(params.reportedPeakNits) && params.reportedPeakNits > 0.0f) ? params.reportedPeakNits
+                                                                                       : params.peakNits;
 }
 
 MHC2ProfileParams BuildIdentityMHC2Params(bool isHDR, float peakNits, const std::wstring& monitorName) {

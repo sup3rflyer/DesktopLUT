@@ -10,6 +10,7 @@
 #include <setupapi.h>
 #include <devguid.h>
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <cstring>
 
@@ -150,36 +151,50 @@ float GetDisplayMaxTml(const DisplayInfo& display) {
     return 0.0f;
 }
 
-bool SetDisplayMaxTml(const DisplayInfo& display, float nits) {
+bool SetDisplayPeakOverride(const DisplayInfo& display, const MonitorPrimaries& primaries, float minNits, float maxNits,
+                            float maxFrameAvgNits) {
     DISPLAYCONFIG_SET_ADVANCED_COLOR_PARAM params = {};
     params.header.type = DISPLAYCONFIG_DEVICE_INFO_SET_ADVANCED_COLOR_PARAM;
     params.header.size = sizeof(params);
     params.header.adapterId = display.adapterId;
     params.header.id = display.targetId;
 
-    // sRGB/Rec.709 primaries (scaled by 10000)
-    params.colorParams.RedPointX = 6400;    // 0.64
-    params.colorParams.RedPointY = 3300;    // 0.33
-    params.colorParams.GreenPointX = 3000;  // 0.30
-    params.colorParams.GreenPointY = 6000;  // 0.60
-    params.colorParams.BluePointX = 1500;   // 0.15
-    params.colorParams.BluePointY = 600;    // 0.06
-    // D65 white point (scaled by 10000)
-    params.colorParams.WhitePointX = 3127;  // 0.3127
-    params.colorParams.WhitePointY = 3290;  // 0.3290
+    // Chromaticities scaled by 10000: the display's own (its EDID) — this packet replaces what Windows reports for
+    // them too — else sRGB / D65, what it always sent before.
+    auto xy = [](float v) { return (unsigned int)std::lround((double)std::clamp(v, 0.0f, 1.0f) * 10000.0); };
+    const bool own = primaries.valid;
+    params.colorParams.RedPointX = own ? xy(primaries.Rx) : 6400;
+    params.colorParams.RedPointY = own ? xy(primaries.Ry) : 3300;
+    params.colorParams.GreenPointX = own ? xy(primaries.Gx) : 3000;
+    params.colorParams.GreenPointY = own ? xy(primaries.Gy) : 6000;
+    params.colorParams.BluePointX = own ? xy(primaries.Bx) : 1500;
+    params.colorParams.BluePointY = own ? xy(primaries.By) : 600;
+    params.colorParams.WhitePointX = own ? xy(primaries.Wx) : 3127;
+    params.colorParams.WhitePointY = own ? xy(primaries.Wy) : 3290;
     // Luminance values (nits * 10000)
-    params.colorParams.MinLuminance = 0;
-    params.colorParams.MaxLuminance = (unsigned int)(nits * 10000.0f);
-    params.colorParams.MaxFullFrameLuminance = (unsigned int)(nits * 10000.0f);
+    auto nits = [](float v) { return (unsigned int)std::lround((double)std::clamp(v, 0.0f, 10000.0f) * 10000.0); };
+    params.colorParams.MinLuminance = nits(minNits);
+    params.colorParams.MaxLuminance = nits(maxNits);
+    params.colorParams.MaxFullFrameLuminance = nits(maxFrameAvgNits);
 
     LONG result = DisplayConfigSetDeviceInfo(&params.header);
     if (result != ERROR_SUCCESS) {
-        std::cerr << "SetDisplayMaxTml failed with error: " << result << std::endl;
+        std::cerr << "Display peak override failed with error: " << result << std::endl;
         return false;
     }
 
-    std::wcout << L"Set MaxTML to " << nits << L" nits for " << LogName(display) << std::endl;
+    std::wcout << L"Windows told " << LogName(display) << L" peaks at " << maxNits << L" nits (full frame "
+               << maxFrameAvgNits << L", " << (own ? L"EDID" : L"sRGB") << L" primaries)" << std::endl;
     return true;
+}
+
+static bool ReadEDIDFromRegistry(const wchar_t* targetHardwareId, std::vector<BYTE>& edidData);   // below
+
+bool ReadEDIDForDisplay(const DisplayInfo& display, std::vector<BYTE>& edidData) {
+    // The exact device instance first (twin panels of one model have distinct instance ids), the hardware id second.
+    if (ReadEDIDForDevicePath(display.devicePath, edidData)) return true;
+    const std::wstring hardwareId = ExtractHardwareIdFromPath(display.devicePath);
+    return !hardwareId.empty() && ReadEDIDFromRegistry(hardwareId.c_str(), edidData);
 }
 
 bool GetDisplayInfoForMonitor(int monitorIndex, DisplayInfo& outInfo) {
@@ -685,6 +700,35 @@ MonitorPrimaries GetMonitorPrimaries(int monitorIndex) {
 // ============================================================================
 // EDID-based Primaries Detection
 // ============================================================================
+
+bool ParseEDIDHdrLuminance(const BYTE* edid, size_t edidSize, EdidHdrLuminance& out) {
+    out = EdidHdrLuminance();
+    static const BYTE edidHeader[] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    if (!edid || edidSize < 256 || memcmp(edid, edidHeader, 8) != 0) return false;
+    // CTA-861.3 code values: max / max frame-average luminance = 50 * 2^(CV/32) cd/m2, min = max * (CV/255)^2 / 100.
+    auto luminance = [](BYTE cv) { return 50.0f * std::pow(2.0f, (float)cv / 32.0f); };
+    for (size_t b = 128; b + 128 <= edidSize; b += 128) {
+        const BYTE* ext = edid + b;
+        if (ext[0] != 0x02) continue;                 // a CTA-861 extension
+        const size_t end = ext[2];                    // the data block collection runs from byte 4 up to the timings
+        if (end <= 4 || end > 127) continue;
+        for (size_t i = 4; i < end;) {
+            const BYTE tag = (BYTE)(ext[i] >> 5);
+            const size_t len = ext[i] & 0x1F;         // payload bytes after this header
+            if (i + 1 + len > end) break;             // malformed: never read past the collection
+            if (tag == 7 && len >= 3 && ext[i + 1] == 0x06) {   // extended tag 6: HDR Static Metadata Data Block
+                const BYTE* p = ext + i + 2;          // EOTFs, descriptors, then the optional luminance bytes
+                const size_t n = len - 1;
+                if (n >= 3 && p[2]) out.maxNits = luminance(p[2]);
+                if (n >= 4 && p[3]) out.maxFrameAvgNits = luminance(p[3]);
+                if (n >= 5 && out.maxNits > 0.0f) out.minNits = out.maxNits * std::pow((float)p[4] / 255.0f, 2.0f) / 100.0f;
+                return out.maxNits > 0.0f;
+            }
+            i += 1 + len;
+        }
+    }
+    return false;
+}
 
 // Parse chromaticity coordinates from EDID bytes 25-34
 // EDID encodes each coordinate as a 10-bit value: 8 MSBs in one byte, 2 LSBs packed with others

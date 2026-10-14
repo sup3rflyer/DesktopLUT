@@ -14,6 +14,7 @@
 #include "osd.h"
 #include "displayconfig.h"
 #include "display_power.h"
+#include "windows_tonemap.h"
 #include "mhc.h"
 #include "dwm_inject.h"
 #include "analysis.h"
@@ -418,7 +419,7 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     const auto& settings = g_gui.monitorSettings[g_gui.currentMonitor];
     wchar_t buf[16];
 
-    // === HDR Corrections tab (Tonemapping + MaxTML only) ===
+    // === HDR Corrections tab (Tonemapping + Windows tone map only) ===
     const auto& hdrCC = settings.hdrColorCorrection;
 
     // Tonemapping (HDR only)
@@ -504,20 +505,8 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     EnableWindow(g_gui.hwndFaldStarReach, TRUE);
     EnableWindow(g_gui.hwndFaldStarSigma, TRUE);
 
-    // MaxTML
-    SendMessage(g_gui.hwndMaxTmlEnable, BM_SETCHECK,
-        settings.maxTml.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
-    _swprintf_s_l(tonemapBuf, _countof(tonemapBuf), L"%.0f", GetCLocale(), settings.maxTml.peakNits);
-    SetWindowText(g_gui.hwndMaxTmlEdit, tonemapBuf);
-    float peakNits = settings.maxTml.peakNits;
-    int comboSel = 0;
-    if (peakNits == 400.0f) comboSel = 1;
-    else if (peakNits == 600.0f) comboSel = 2;
-    else if (peakNits == 1000.0f) comboSel = 3;
-    else if (peakNits == 1400.0f) comboSel = 4;
-    else if (peakNits == 4000.0f) comboSel = 5;
-    else if (peakNits == 10000.0f) comboSel = 6;
-    SendMessage(g_gui.hwndMaxTmlCombo, CB_SETCURSEL, comboSel, 0);
+    // Windows tone map (the combo lists WindowsToneMap in order)
+    SendMessage(g_gui.hwndWinToneMapCombo, CB_SETCURSEL, (WPARAM)settings.windowsToneMap, 0);
 
     // MHC info display (both sections)
     UpdateMhcInfoDisplay(g_gui.currentMonitor, false);
@@ -905,6 +894,9 @@ static void StartMhcTransitionBurst(HWND hwnd, const char* reason, bool displayT
     // A display transition is a fresh chance for a desktop-gamma re-bake that failed before (it backs off
     // between steady-state checks; a transition flickers anyway). An engine restart is not one.
     if (displayTransition) ResetDesktopGammaSdrWhiteBackoff();
+    // A transition can drop the Windows tone map's DisplayConfig override (and swap the HDR profile in): resolve it
+    // again — also with no MHC profile at all, the displays the override serves.
+    RequestWindowsToneMap(true);
     if (!AnyMhcProfileActive()) return;
     std::cout << "[MHC] Transition burst started (" << reason << ")" << std::endl;
     g_mhcBurstStage = 0;
@@ -1534,7 +1526,7 @@ static bool IgnoredDuringShutdown(UINT msg) {
     case WM_DEVICECHANGE: case WM_POWERBROADCAST: case WM_COMMAND: case WM_TRAYICON: case WM_HOTKEY:
     case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
     case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD: case WM_MHC_REGENERATE_MISSING:
-    case WM_MHC_RELOAD_HARDWARE:
+    case WM_MHC_RELOAD_HARDWARE: case WM_WINDOWS_TONEMAP:
         return true;
     default:
         return msg == WM_TASKBARCREATED;
@@ -1548,7 +1540,7 @@ static void KillAllGuiTimers(HWND hwnd) {
         DWM_HOOK_WATCHDOG_TIMER_ID, MHC_VERIFY_TIMER_ID, MHC_BLIND_KICK_TIMER_ID, MHC_REGISTRY_KICK_TIMER_ID,
         MHC_BURST_TIMER_ID, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_BEACON_TIMER_ID, MONITOR_IDENTITY_TIMER_ID,
         FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
-        RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID,
+        RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID, WINDOWS_TONEMAP_TIMER_ID,
     };
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
@@ -1887,53 +1879,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // MaxTML controls (HDR only)
-        case ID_CORR_MAXTML_ENABLE:
-            act::SetMaxTmlEnabled(g_gui.currentMonitor, SendMessage(g_gui.hwndMaxTmlEnable, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            return 0;
-
-        case ID_CORR_MAXTML_COMBO:
+        // Windows tone map (HDR only)
+        case ID_CORR_WINTONEMAP_COMBO:
             if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
-                int sel = (int)SendMessage(g_gui.hwndMaxTmlCombo, CB_GETCURSEL, 0, 0);
-                const wchar_t* values[] = { L"", L"400", L"600", L"1000", L"1400", L"4000", L"10000" };
-                const float nitsValues[] = { 0, 400, 600, 1000, 1400, 4000, 10000 };
-                if (sel >= 0 && sel < 7) {
-                    if (sel > 0) {
-                        SetWindowText(g_gui.hwndMaxTmlEdit, values[sel]);
-                        act::SetMaxTmlPeak(g_gui.currentMonitor, nitsValues[sel]);
-                    } else {
-                        // "Custom": take the edit box's value, clamped to [100, 10000] like Apply. An empty or
-                        // partial box keeps the stored value (it is pushed to the display at the next start, so
-                        // a guessed 100 nits would really be applied).
-                        float v = g_gui.monitorSettings[g_gui.currentMonitor].maxTml.peakNits;
-                        if (CommitNumericEdit(g_gui.hwndMaxTmlEdit, 100.0f, 10000.0f, v, 0))
-                            act::SetMaxTmlPeak(g_gui.currentMonitor, v);
-                    }
-                }
-            }
-            return 0;
-
-        case ID_CORR_MAXTML_APPLY:
-            {
-                wchar_t buf[16];
-                GetWindowText(g_gui.hwndMaxTmlEdit, buf, 16);
-                float nits = 0.0f;
-                if (!ParseWholeNumber(buf, nits)) {
-                    // Never push a guessed peak to the display: an empty box used to apply 100 nits.
-                    SetStatus(L"MaxTML: enter a peak in nits (100-10000)");
-                    return 0;
-                }
-                if (nits < 100.0f) nits = 100.0f;
-                if (nits > 10000.0f) nits = 10000.0f;
-                {
-                    wchar_t shown[16];
-                    _swprintf_s_l(shown, _countof(shown), L"%.0f", GetCLocale(), nits);
-                    SetWindowText(g_gui.hwndMaxTmlEdit, shown);
-                }
-                act::Result r = act::ApplyMaxTmlNow(g_gui.currentMonitor, nits);
-                if (!r.text.empty())   // the classic window keeps its message boxes
-                    MessageBox(hwnd, r.text.c_str(), r.ok() ? L"DesktopLUT" : L"Error",
-                               MB_OK | (r.ok() ? MB_ICONINFORMATION : MB_ICONERROR));
+                const int sel = (int)SendMessage(g_gui.hwndWinToneMapCombo, CB_GETCURSEL, 0, 0);
+                if (sel >= 0 && sel <= (int)WindowsToneMap::Panel)
+                    act::SetWindowsToneMap(g_gui.currentMonitor, (WindowsToneMap)sel);
             }
             return 0;
 
@@ -2378,6 +2329,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_WINDOWS_TONEMAP:
+        ReconcileWindowsToneMap("request", false);   // a pending reapply rides along (RequestWindowsToneMap)
+        return 0;
+
     case WM_MHC_RELOAD_HARDWARE: {
         static const char* const kWhy[] = { "pending reapply", "restart after overlay loss", "adapter change" };
         if (wParam == kMhcReloadOverlayLoss) {
@@ -2594,6 +2549,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // builds where the dwmcore offsets don't match). See issue #3.
                 KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
                 SetStatus(L"DWM Hook unstable — disabled (use overlay mode)");
+                RequestWindowsToneMap(false);   // nothing tone maps now: Auto reports the panel's peak again
                 std::cout << "[DWM Hook Watchdog] Hook keeps dropping after "
                           << g_dwmHookReinjectCount << " re-injections — giving up to stop "
                              "the re-injection flash loop. DWM Hook Mode is unreliable on "
@@ -2708,6 +2664,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // of the processing thread so MHC-only users are also protected.
             VerifyAndRestoreMhcProfiles();
             RetryDgSwap();                // a desktop gamma switch (hotkey, whitelist) whose profile swap did not land
+            ReconcileWindowsToneMap("periodic", false);   // what no trigger saw (a profile installed or removed, ...)
             ui::NotifyDisplayChanged();   // re-read display modes while the new interface is open
             // A display given up on by the identity retry runs on index-attached settings that are
             // never saved: re-attach as soon as it can be identified (only queried while one exists).
@@ -2762,6 +2719,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
         }
+        if (wParam == WINDOWS_TONEMAP_TIMER_ID) {
+            KillTimer(hwnd, WINDOWS_TONEMAP_TIMER_ID);
+            ReconcileWindowsToneMap("retry", false);
+            return 0;
+        }
         if (wParam == MHC_BURST_TIMER_ID) {
             KillTimer(hwnd, MHC_BURST_TIMER_ID);
             int stage = g_mhcBurstStage;
@@ -2785,6 +2747,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             if (++g_mhcBurstStage < MHC_BURST_STAGES) {
                 SetTimer(hwnd, MHC_BURST_TIMER_ID, MHC_BURST_DELAYS_MS[g_mhcBurstStage], nullptr);
+            } else {
+                ReconcileWindowsToneMap("transition settled", true);   // a late reset of the override
             }
             return 0;
         }
@@ -2995,6 +2959,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         AbortLiveEditsForShutdown();       // a live grayscale edit gives scanout back to the user's profile
         StopDwmHookBeacon(hwnd);
         StopProcessing();                  // joins the processing thread (inside a running Start/Stop: replayed after it)
+        ReleaseWindowsToneMapForExit(g_sessionEnding.load());   // Auto: nothing tone maps once DesktopLUT is gone
         KillAllGuiTimers(hwnd);            // anything the teardown above armed
         RemoveTrayIcon();
         // Unregister session change notifications
@@ -3095,12 +3060,12 @@ int RunGUI() {
     // powered on after boot) starts processing from WM_DISPLAYCHANGE — see g_userStopped.
     bool hasAnyCorrection = AnyMonitorHasCorrections();
 
-    // Auto-start processing if any correction is enabled. MaxTML holds either way (StartProcessing applies
-    // it; a setup with nothing else configured still gets it).
+    // What Windows tells apps the HDR peak is, before anything bakes a profile (the variant follows it) and whether
+    // or not anything starts.
+    ReconcileWindowsToneMap("startup", true);
+    // Auto-start processing if any correction is enabled.
     if (hasAnyCorrection) {
         StartProcessing();
-    } else {
-        ApplyMaxTmlSettings();
     }
     // The Calibration Loader kicks of a transition burst (no flicker), for the hardware LUT Windows' own logon
     // loader or a late GPU-panel / driver start can leave stale. (Every start used to get one by accident: the

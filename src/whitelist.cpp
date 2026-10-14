@@ -7,6 +7,7 @@
 #include "mhc.h"
 #include "gui_mhc.h"
 #include "displayconfig.h"
+#include "windows_tonemap.h"
 #include <tlhelp32.h>
 #include <thread>
 #include <iostream>
@@ -225,6 +226,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
         if (g_vrrWhitelistActive.load()) {
             // Was active, now disabled - show overlays again (unless auto-sleeping)
             g_vrrWhitelistActive.store(false);
+            RequestWindowsToneMap(false);
             {
                 std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
                 g_vrrWhitelistMatch.clear();
@@ -286,12 +288,14 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                 }
             }
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            RequestWindowsToneMap(false);   // overlay mode: nothing tone maps the game, so Auto tells it the real peak
             std::wcout << L"VRR whitelist: detected " << matchedProcess << L", hiding overlays" << std::endl;
         }
     } else {
         if (wasActive) {
             // Whitelisted app exited - show overlays again (unless auto-sleeping)
             g_vrrWhitelistActive.store(false);
+            RequestWindowsToneMap(false);
             std::wstring exitedProcess;
             {
                 std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
@@ -518,7 +522,7 @@ void StopGammaWhitelistThread() {
     }
 
     // Reset VRR whitelist state
-    g_vrrWhitelistActive.store(false);
+    if (g_vrrWhitelistActive.exchange(false)) RequestWindowsToneMap(false);
     {
         std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
         g_vrrWhitelistMatch.clear();

@@ -33,10 +33,8 @@ void SetDwmHookMode(bool on);
 // Values are clamped to 10..10000 nits. Enabling while stopped starts processing (as the classic box did).
 Result SetTonemap(int mon, const TonemapSettings& t);
 
-// ---- Windows HDR peak (MaxTML) -----------------------------------------------------------------
-Result SetMaxTmlEnabled(int mon, bool on);         // stored; applied at start
-Result SetMaxTmlPeak(int mon, float nits);         // clamped 100..10000; stored
-Result ApplyMaxTmlNow(int mon, float nits);        // stores and writes it to the display now
+// ---- Windows tone map (what Windows tells apps the HDR peak is: windows_tonemap.h) ---------------
+Result SetWindowsToneMap(int mon, WindowsToneMap mode);   // stored, and in force at once
 
 // ---- FALD (per mode, plus rows shared by both modes) ----------------------------------------------
 // The refusal message when a panel file's transfer (PQ / gamma fit) does not match the mode; empty when

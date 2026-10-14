@@ -89,11 +89,27 @@ TEST_CASE("INI roundtrip: a real INI loads and saves back with every key and val
     SaveSettings();
     const IniMap after = ReadIni(ini);
 
+    // Keys a later build replaced: gone on purpose, but only where their successor was written.
+    struct Retired { const wchar_t* key; const wchar_t* successor; };
+    static const Retired kRetired[] = {
+        { L"MaxTmlEnabled", L"WindowsToneMap" },   // 3.0: the Windows tone map replaced the MaxTML override
+        { L"MaxTmlPeak", L"WindowsToneMap" },
+    };
+    auto retiredFor = [&](const std::map<std::wstring, std::wstring>* sec, const std::wstring& k) -> const wchar_t* {
+        for (const Retired& r : kRetired)
+            if (_wcsicmp(k.c_str(), r.key) == 0 && sec && sec->find(r.successor) != sec->end()) return r.successor;
+        return nullptr;
+    };
+
     int lost = 0, changed = 0, added = 0, finer = 0;
     for (const auto& [sec, keys] : before) {
         auto s = after.find(sec);
         for (const auto& [k, v] : keys) {
-            if (s == after.end() || s->second.find(k) == s->second.end()) {
+            if (const wchar_t* successor = retiredFor(s == after.end() ? nullptr : &s->second, k);
+                successor && (s == after.end() || s->second.find(k) == s->second.end())) {
+                MESSAGE("RETIRED [" << Narrow(sec) << "] " << Narrow(k) << "=" << Narrow(v) << " -> "
+                        << Narrow(successor) << "=" << Narrow(s->second.at(successor)));
+            } else if (s == after.end() || s->second.find(k) == s->second.end()) {
                 MESSAGE("LOST    [" << Narrow(sec) << "] " << Narrow(k) << "=" << Narrow(v));
                 lost++;
             } else if (s->second.at(k) != v && OnlyFinerPrecision(v, s->second.at(k))) {

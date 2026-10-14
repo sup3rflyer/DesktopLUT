@@ -29,14 +29,14 @@ always check *which struct* you hold before reasoning about the value.
 | `GrayscaleData::peakNits` ([types.h:272](../src/types.h)) | HDR peak luminance the grayscale **curve is scaled to** (config input; must match the ColourSpace target used to author the curve) | config input |
 | `GrayscaleSettings::peakNits` ([types.h:647](../src/types.h)) | Same as above, GUI/settings-side mirror | config input |
 | `GrayscaleEditorData::peakNits` ([types.h:922](../src/types.h)) | Same value, used only for editor label math | config input |
-| `MHC2ProfileParams::peakNits` ([mhc.h:23](../src/mhc.h)) | Dual-use: HDR luminance **metadata (MaxCLL)** + grayscale curve scaling for LUT gen | config input |
+| `MHC2ProfileParams::peakNits` ([mhc.h:23](../src/mhc.h)) | Dual-use: grayscale curve scaling for LUT gen + HDR luminance **metadata (MaxCLL)** — the metadata only while `reportedPeakNits` is 0 | config input |
 | `MHCSettings::metaPeakNits` ([types.h:756](../src/types.h)) | HDR MHC2 luminance **metadata (MaxCLL)** label only; `0` = not set | metadata |
-| `MaxTmlSettings::peakNits` ([types.h:690](../src/types.h)) | Max Tone-Mapping Luminance target | config input |
+| `MHC2ProfileParams::reportedPeakNits` ([mhc.h](../src/mhc.h)) | The peak an HDR profile's **luminance tags** tell Windows (lumi, MHC2 max luminance): 10000 for the Windows tone map bypass (`PERM_PEAK_MAX`), `0` = `peakNits`. Never scales a curve | metadata |
 | `TonemapData::sourcePeakNits` / `targetPeakNits` ([types.h:481-482](../src/types.h)) | Tonemapper **input** (content) peak / **output** (display) peak | config input |
 | `TonemapSettings::sourcePeakNits` / `targetPeakNits` ([types.h:683-684](../src/types.h)) | Settings-side mirror of the tonemap pair | config input |
 | `AnalysisResult::peakNits` ([types.h:309](../src/types.h)) | **MEASURED** peak read off the screen by the analysis overlay | observation |
 | `MonitorContext::detectedPeakNits` ([types.h:549](../src/types.h)) | Last **DETECTED** peak (cached for the analysis overlay) | observation |
-| `ui::DisplayRow::reportedPeakNits` ([ui_snapshot.h:22](../src/ui/ui_snapshot.h)) | The peak **Windows reports to apps** right now (DXGI `MaxLuminance`, fresh factory) while in HDR; `0` = unknown / not HDR. With an HDR MHC2 profile it follows the profile's luminance tag, not `MaxTmlSettings::peakNits` | observation (of the OS, not the screen) |
+| `ui::DisplayRow::reportedPeakNits` ([ui_snapshot.h:22](../src/ui/ui_snapshot.h)) | The peak **Windows reports to apps** right now (DXGI `MaxLuminance`, fresh factory) while in HDR; `0` = unknown / not HDR. With an HDR MHC2 profile it follows the profile's luminance tags (`MhcReportedPeakNits`: 10000 while the display's Windows tone map reports the maximum) | observation (of the OS, not the screen) |
 | `DwmHookMonitorConfig::sourcePeakNits` / `targetPeakNits` ([dwm_hook_config.h:29-30](../shared/dwm_hook_config.h)) | Tonemap pair pushed to the injected DLL | **WIRE CONTRACT** (struct ABI; offset-checked in `test_displayconfig.cpp`) |
 
 **The trap:** "peak" reads either as *what we tell the pipeline the peak is* (config input)

@@ -93,6 +93,7 @@
     <ClCompile Include="src\osd.cpp" />
     <ClCompile Include="src\analysis.cpp" />
     <ClCompile Include="src\processing.cpp" />
+    <ClCompile Include="src\windows_tonemap.cpp" />
     <ClCompile Include="src\gui.cpp" />
     <ClCompile Include="src\gui_layout.cpp" />
     <ClCompile Include="src\gui_shared.cpp" />
@@ -153,6 +154,7 @@
     <ClInclude Include="src\ipc_json.h" />
     <ClInclude Include="src\ipc_client_check.h" />
     <ClInclude Include="src\display_power.h" />
+    <ClInclude Include="src\windows_tonemap.h" />
     <ClInclude Include="src\shader.h" />
     <ClInclude Include="shared\fald_panel.h" />
     <ClInclude Include="shared\fald_temporal.h" />

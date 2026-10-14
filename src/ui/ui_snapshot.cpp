@@ -8,6 +8,7 @@
 #include "dlc/dlc_scan.h"
 #include "desktoplut_ipc_server.h"
 #include "processing.h"   // IsProcessingTransitionActive
+#include "windows_tonemap.h"   // EdidHdrPeakNits
 #include <dxgi1_6.h>
 #include <mutex>
 
@@ -20,6 +21,7 @@ struct ModeEntry {
     Mode mode = Mode::Unknown;
     std::wstring name;
     float maxLuminance = 0;   // DXGI_OUTPUT_DESC1::MaxLuminance (what apps are told)
+    float edidPeakNits = 0;   // the HDR peak its EDID declares (EdidHdrPeakNits, cached per device path)
 };
 std::vector<ModeEntry> g_modeCache;   // GUI thread only
 
@@ -81,6 +83,7 @@ void RefreshModeCache() {
         DisplayInfo di;
         const bool haveDi = GetDisplayInfoForHMonitor(h, di);
         if (haveDi) e.name = di.name;
+        if (haveDi) e.edidPeakNits = EdidHdrPeakNits(di);
         DXGI_OUTPUT_DESC1 desc = {};
         if (QueryFreshOutputDesc(h, desc)) {
             e.maxLuminance = desc.MaxLuminance;
@@ -122,6 +125,7 @@ void TakeSnapshot(Snapshot& out) {
         const ModeEntry* m = FindMode(r.hmon);
         r.mode = m ? m->mode : Mode::Unknown;
         r.reportedPeakNits = m && r.mode == Mode::HDR ? m->maxLuminance : 0.0f;
+        r.edidPeakNits = m ? m->edidPeakNits : 0.0f;
         r.name = !r.settings.label.empty() ? r.settings.label : DisplayLabel(r.settings.identity, m ? m->name : std::wstring());
         MONITORINFO mi = { sizeof(mi) };
         if (r.hmon && GetMonitorInfo(r.hmon, &mi)) {

@@ -101,8 +101,10 @@ HDR_TonemapTargetPeak=1000.0
 ; 1 = detect peak per-frame
 HDR_TonemapDynamic=0
 
-MaxTmlEnabled=0
-MaxTmlPeak=1000.0
+; what Windows tells games and apps this display peaks at (HDR): auto = 10000 nits while DesktopLUT's tone map
+; runs, else the panel's; bypass = always 10000 (Windows and apps never tone map); panel = always the panel's.
+; Replaces MaxTmlEnabled / MaxTmlPeak (removed on save).
+WindowsToneMap=auto
 
 ; --- MHC ICC Profile (SDR) ---
 SDR_MHCEnabled=true
@@ -130,7 +132,7 @@ SDR_MHCWhiteBalanceWy=0.3290
 SDR_MHCCorrGSEnabled=false
 SDR_MHCCorrGSPoints=20
 SDR_MHCCorrGSData=...
-; Active permutation bitmask (WB=1, DG=2, GS=4)
+; Active permutation bitmask (WB=1, DG=2, GS=4, NOPRIM=8, NOGRAY=16, PEAK_MAX=32 — HDR: reports 10000 nits)
 SDR_MHCActivePerm=0
 ; Cached profile paths indexed by permutation bitmask
 SDR_MHCPermPath0=
@@ -154,7 +156,7 @@ HDR_MHCWhiteBalanceEnabled=false
 ; Fine-tuning grayscale on top of base
 HDR_MHCCorrGSEnabled=false
 HDR_MHCCorrGSPeak=10000.0
-; Active permutation bitmask (WB=1, DG=2, GS=4)
+; Active permutation bitmask (WB=1, DG=2, GS=4, NOPRIM=8, NOGRAY=16, PEAK_MAX=32 — HDR: reports 10000 nits)
 HDR_MHCActivePerm=2
 ; Cached profiles indexed by bitmask (0-7)
 HDR_MHCPermPath0=
@@ -323,9 +325,18 @@ The toggle converts SDR content from sRGB OETF to 2.2 gamma before HDR processin
 | Setting | Scope | Purpose |
 |---------|-------|---------|
 | **MaxCLL** (swapchain metadata) | Per-app | "My content peaks at X nits" |
-| **MaxTML** (display config) | System-wide | "My display can handle Y nits" |
+| **Reported peak** (DXGI `MaxLuminance`) | Per display | "My display can handle Y nits" |
 
-DesktopLUT always declares MaxCLL = 10000 nits. Set MaxTML to 10000 to bypass Windows tonemapping entirely. (Behavior may vary by GPU driver.)
+DesktopLUT always declares MaxCLL = 10000 nits. The display's **Windows tone map** setting decides the reported peak:
+Bypass (and Auto while DesktopLUT's tone map runs) reports 10000 nits, so Windows and apps leave the highlights to
+DesktopLUT instead of tone mapping a second time; Panel (and Auto otherwise: tone map off, suspended, the hook given
+up, the overlay hidden for a VRR-whitelisted game, DesktopLUT quit) reports the panel's own peak. A sign-out or
+restart keeps 10000 until DesktopLUT starts again (it runs from sign-in); so does a crash, and a display that is
+disconnected when DesktopLUT quits keeps its 10000 variant until DesktopLUT sees it again. The carrier is the HDR MHC profile when one is installed: its `lumi` tag and MHC2
+max luminance say 10000 in a variant whose curves are unchanged (`PERM_PEAK_MAX`) — every profile association replaces
+any other reported peak, so a DisplayConfig override (the old MaxTML) lost to it within seconds. Without one, DesktopLUT
+sends the DisplayConfig override with the display's EDID primaries, again after every transition that drops it, and
+sends the EDID's own peak back when it no longer applies (`windows_tonemap.h`).
 
 ## LUT Interpolation
 

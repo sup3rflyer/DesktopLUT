@@ -115,6 +115,3 @@ bool SettingsChanged();
 //   HDR: Rec.2020 → measured (correction in Rec.2020 space after BT.709→Rec.2020)
 ColorCorrectionData ConvertColorCorrection(const ColorCorrectionSettings& src, bool isHDR);
 
-// Apply MaxTML settings for all monitors that have it enabled
-// Call after any event that might reset MaxTML (startup, sleep/wake, TDR, HDR toggle)
-void ApplyMaxTmlSettings();

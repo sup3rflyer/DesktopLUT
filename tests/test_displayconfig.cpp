@@ -2,6 +2,7 @@
 #include "displayconfig.h"
 #include "capture.h"
 #include "display_power.h"
+#include "windows_tonemap.h"
 #include "fixtures/edid_samples.h"
 #include <cmath>
 #include <string>
@@ -561,4 +562,125 @@ TEST_CASE("DisplayPowerTracker: only on-after-off is a wake") {
         CHECK(b.OnState(0) == DisplayPowerEvent::Off);
         CHECK(b.OnState(1) == DisplayPowerEvent::Wake);
     }
+}
+
+// ============================================================================
+// Windows tone map (windows_tonemap.h): what Windows tells apps an HDR display peaks at
+// ============================================================================
+
+TEST_CASE("Windows tone map: Auto reports 10000 nits exactly while DesktopLUT's tone map is meant to run") {
+    // mode, tone map on, suspended, exiting
+    CHECK(WindowsToneMapReportsMax(WindowsToneMap::Auto, true, false, false));
+    CHECK_FALSE(WindowsToneMapReportsMax(WindowsToneMap::Auto, false, false, false));   // the tone map off
+    CHECK_FALSE(WindowsToneMapReportsMax(WindowsToneMap::Auto, true, true, false));     // suspended
+    CHECK_FALSE(WindowsToneMapReportsMax(WindowsToneMap::Auto, true, false, true));     // DesktopLUT exits
+    for (bool on : { false, true })
+        for (bool suspended : { false, true })
+            for (bool exiting : { false, true }) {
+                CHECK(WindowsToneMapReportsMax(WindowsToneMap::Bypass, on, suspended, exiting));
+                CHECK_FALSE(WindowsToneMapReportsMax(WindowsToneMap::Panel, on, suspended, exiting));
+            }
+}
+
+TEST_CASE("Windows tone map: the INI spelling round-trips, anything else is Auto") {
+    for (WindowsToneMap m : { WindowsToneMap::Auto, WindowsToneMap::Bypass, WindowsToneMap::Panel })
+        CHECK(ParseWindowsToneMap(WindowsToneMapKey(m)) == m);
+    CHECK(std::wstring(WindowsToneMapKey(WindowsToneMap::Auto)) == L"auto");
+    CHECK(std::wstring(WindowsToneMapKey(WindowsToneMap::Bypass)) == L"bypass");
+    CHECK(std::wstring(WindowsToneMapKey(WindowsToneMap::Panel)) == L"panel");
+    CHECK(ParseWindowsToneMap(L"Panel") == WindowsToneMap::Panel);
+    CHECK(ParseWindowsToneMap(L"") == WindowsToneMap::Auto);
+    CHECK(ParseWindowsToneMap(nullptr) == WindowsToneMap::Auto);
+    CHECK(ParseWindowsToneMap(L"10000") == WindowsToneMap::Auto);
+}
+
+namespace {
+
+// A 256-byte EDID: a base block and one CTA-861 extension whose data block collection is `blocks`.
+std::vector<BYTE> EdidWithCta(const std::vector<BYTE>& blocks, BYTE extensionTag = 0x02) {
+    std::vector<BYTE> e(256, 0);
+    const BYTE header[] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    memcpy(e.data(), header, 8);
+    e[126] = 1;                                  // one extension
+    BYTE* x = e.data() + 128;
+    x[0] = extensionTag;
+    x[1] = 3;                                    // CTA revision 3
+    x[2] = (BYTE)(4 + blocks.size());            // the timings start right after the data blocks
+    memcpy(x + 4, blocks.data(), blocks.size());
+    return e;
+}
+
+float CtaLuminance(BYTE cv) { return 50.0f * std::pow(2.0f, cv / 32.0f); }
+
+}  // namespace
+
+TEST_CASE("EDID: the CTA-861 HDR static metadata block gives the panel's own HDR luminance") {
+    // A video data block first (tag 2, three SVDs), then the HDR static metadata block (tag 7, extended tag 6):
+    // EOTFs, descriptors, max 138 (~994 nits), max frame-average 115 (~604 nits), min 50.
+    const std::vector<BYTE> blocks = { (2 << 5) | 3, 0x10, 0x04, 0x03,
+                                       (7 << 5) | 6, 0x06, 0x0D, 0x01, 138, 115, 50 };
+    std::vector<BYTE> edid = EdidWithCta(blocks);
+    EdidHdrLuminance lum;
+    REQUIRE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    CHECK(lum.maxNits == doctest::Approx(CtaLuminance(138)));
+    CHECK(lum.maxNits == doctest::Approx(993.6f).epsilon(0.001));
+    CHECK(lum.maxFrameAvgNits == doctest::Approx(CtaLuminance(115)));
+    CHECK(lum.minNits == doctest::Approx(CtaLuminance(138) * (50.0f / 255.0f) * (50.0f / 255.0f) / 100.0f));
+
+    // Only the optional max byte: no frame average, no min.
+    edid = EdidWithCta({ (7 << 5) | 4, 0x06, 0x0D, 0x01, 160 });
+    REQUIRE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    CHECK(lum.maxNits == doctest::Approx(1600.0f));
+    CHECK(lum.maxFrameAvgNits == 0.0f);
+    CHECK(lum.minNits == 0.0f);
+}
+
+TEST_CASE("EDID: no HDR peak declared, or nothing to read it from") {
+    EdidHdrLuminance lum;
+    // The block without its luminance bytes (EOTFs and descriptors only), or a max of 0 ("not indicated").
+    std::vector<BYTE> edid = EdidWithCta({ (7 << 5) | 3, 0x06, 0x0D, 0x01 });
+    CHECK_FALSE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    edid = EdidWithCta({ (7 << 5) | 6, 0x06, 0x0D, 0x01, 0, 115, 50 });
+    CHECK_FALSE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    CHECK(lum.maxNits == 0.0f);
+    // Another extended tag (colorimetry, 5) is not it.
+    edid = EdidWithCta({ (7 << 5) | 3, 0x05, 0xC0, 0x00 });
+    CHECK_FALSE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    // A block length running past the data block collection: nothing is read past it.
+    edid = EdidWithCta({ (7 << 5) | 20, 0x06, 0x0D, 0x01, 138 });
+    CHECK_FALSE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    // Not a CTA extension (DisplayID, 0x70), a base block alone, no EDID header.
+    edid = EdidWithCta({ (7 << 5) | 6, 0x06, 0x0D, 0x01, 138, 115, 50 }, 0x70);
+    CHECK_FALSE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    CHECK_FALSE(ParseEDIDHdrLuminance(kEDID_sRGB, sizeof(kEDID_sRGB), lum));
+    edid = EdidWithCta({ (7 << 5) | 6, 0x06, 0x0D, 0x01, 138, 115, 50 });
+    edid[0] = 0x01;
+    CHECK_FALSE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    CHECK_FALSE(ParseEDIDHdrLuminance(nullptr, 256, lum));
+}
+
+TEST_CASE("EDID: a real HDR monitor's CTA-861 extension (captured, not built by the parser's own reading)") {
+    // A mini-LED HDR monitor's extension block as its EDID carries it: video, audio, speaker, vendor and colorimetry
+    // blocks before the HDR static metadata block (E6 06 0F 01 AA A0 04), then detailed timings. An independent
+    // CTA-861.3 decode of the same bytes gives 1987 / 1600 / 0.0049 nits.
+    static const BYTE kCta[128] = {
+        0x02, 0x03, 0x36, 0xC0, 0x52, 0x61, 0x10, 0x04, 0x03, 0x02, 0x60, 0x1F, 0x13, 0x12, 0x11, 0x05,
+        0x14, 0x07, 0x16, 0x0F, 0x0E, 0x1E, 0x1D, 0x23, 0x09, 0x17, 0x07, 0x83, 0x01, 0x00, 0x00, 0xE2,
+        0x00, 0xEA, 0xE3, 0x05, 0xE3, 0x01, 0xE6, 0x06, 0x0F, 0x01, 0xAA, 0xA0, 0x04, 0x68, 0x1A, 0x00,
+        0x00, 0x01, 0x01, 0x28, 0x3C, 0x00, 0x40, 0xAD, 0x00, 0xA4, 0xF0, 0x70, 0x96, 0x80, 0x34, 0x20,
+        0x35, 0x00, 0xC0, 0x1C, 0x32, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xA2,
+    };
+    std::vector<BYTE> edid(256, 0);
+    const BYTE header[] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    memcpy(edid.data(), header, 8);
+    edid[126] = 1;
+    memcpy(edid.data() + 128, kCta, 128);
+    EdidHdrLuminance lum;
+    REQUIRE(ParseEDIDHdrLuminance(edid.data(), edid.size(), lum));
+    CHECK(lum.maxNits == doctest::Approx(1987.0f).epsilon(0.001));
+    CHECK(lum.maxFrameAvgNits == doctest::Approx(1600.0f).epsilon(0.001));
+    CHECK(lum.minNits == doctest::Approx(0.0049f).epsilon(0.01));
 }

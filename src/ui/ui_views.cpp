@@ -739,42 +739,46 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
     EndRow(row);
 
-    row = BeginRow("WINDOWS PEAK");
-    if (RowButtons(row, "mtml", { "APPLY NOW" }) == 0) {
-        const float nits = r.settings.maxTml.peakNits;
-        PostTo(r, [nits](int mon) { act::ApplyMaxTmlNow(mon, nits); });
+    // What Windows tells games and apps the peak is (windows_tonemap.h), and what it reports now: 10000 nits leaves
+    // the highlights to DesktopLUT's tone map, the panel's peak lets them tone map themselves.
+    const MHCSettings& hm = r.settings.hdrMHC;
+    const bool ownProfile = hm.enabled && !hm.profileName.empty();   // it carries the peak (else the override)
+    const float panelNits = ownProfile ? MhcProfileMetadataPeakNits(hm, true) : r.edidPeakNits;
+    row = BeginRow("WINDOWS TONE MAP");
+    {
+        std::string tip = "Peak Windows reports to games and apps.\n"
+                          "Auto: 10000 nits while DesktopLUT tone maps, else the panel's.\n"
+                          "Bypass: always 10000 nits; Windows and apps never tone map.\n"
+                          "Panel: the panel's peak; apps tone map themselves.";
+        // The profile's peak is the panel's when it was measured (an imported file or a base curve), else a default.
+        const bool measured = !hm.sourceFilePath.empty() || (hm.baseGrayscale.enabled && !hm.baseGrayscale.points.empty());
+        if (panelNits > 0.0f)
+            tip += Fmt(!ownProfile ? "\nPanel peak: %.0f nits (EDID)." : measured ? "\nPanel peak: %.0f nits."
+                                                                                  : "\nProfile peak: %.0f nits.", panelNits);
+        RowTip(row, tip.c_str());
     }
     RowPlace(row);
-    bool en = false;
-    if (OnOff("##mtml_on", r.settings.maxTml.enabled, &en, "AT START", "OFF", 84.0f))
-        PostTo(r, [en](int mon) { act::SetMaxTmlEnabled(mon, en); });
+    static const char* kWinToneMap[] = { "AUTO", "BYPASS", "PANEL" };
+    const int mode = Segmented("##wtm", kWinToneMap, 3, (int)r.settings.windowsToneMap, 72);
+    if (mode >= 0) {
+        const WindowsToneMap m = (WindowsToneMap)mode;
+        PostTo(r, [m](int mon) { act::SetWindowsToneMap(mon, m); });
+    }
     RowNext(row);
-    RowPlace(row);
-    float peak = r.settings.maxTml.peakNits;
-    if (NumberInput("##mtml_peak", &peak, "%.0f", 80))
-        PostTo(r, [peak](int mon) { act::SetMaxTmlPeak(mon, peak); });
-    RowNext(row);
-    RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
-    EndRow(row);
-
-    // What apps are told now. An associated HDR profile reports its own peak (its luminance tag), and every profile
-    // re-association replaces an override with it — so the override can read one thing while Windows reports another.
-    // Its own row, always there, the value in the slot the inputs above use (the unit lines up with theirs).
-    row = BeginRow("REPORTED PEAK");
-    RowTip(row, "The peak Windows reports to apps now (display in HDR).\n"
-                "An installed HDR MHC profile reports its own peak, and re-applying a profile replaces the override.");
     {
-        const float reported = r.reportedPeakNits;
+        const float reported = r.reportedPeakNits;   // 0: unknown, or the display is not in HDR
         if (reported > 0.0f) {
-            const float peak = r.settings.maxTml.peakNits;
-            const bool off = r.settings.maxTml.enabled && std::fabs(reported - peak) > 1.0f;
-            wchar_t tip[160] = {};
+            // Without a profile of ours the panel's value is Windows' own (or another tool's profile): not judged.
+            const float expected = hm.reportPeakMax ? kWindowsToneMapBypassNits : ownProfile ? panelNits : 0.0f;
+            const bool off = expected > 0.0f && std::fabs(reported - expected) > 1.0f;
+            wchar_t tip[200] = {};
             if (off)
-                swprintf_s(tip, L"Not the %.0f nits set above: a profile re-applied since, or the value was not applied.\n"
-                                L"APPLY NOW sets it.", peak);
-            const float slot = row.x;
+                swprintf_s(tip, L"Windows reports %.0f, not %.0f nits: being applied, waiting for a calibration or an "
+                                L"edit to end, or another HDR profile replaced it.", reported, expected);
+            // The unit in a fixed place (the widest reading), so it does not move as the reading changes.
+            const float unitX = row.x + MeasureText(Font::Mono, kSizeMono, "10000").x + Px(12);
             RowText(row, Fmt("%.0f", reported), off ? pal::Alarm : pal::Ink, Font::Mono, kSizeMono, tip);
-            row.x = slot + Px(80) + Px(8);
+            row.x = (std::max)(row.x, unitX);
             RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
         } else {
             RowText(row, "\xE2\x80\x94", pal::InkFaint);

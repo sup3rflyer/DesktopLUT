@@ -168,8 +168,9 @@ void UpdateHDRMetadata(MonitorContext* ctx) {
 
     // Determine our output peak brightness
     // If tonemapping enabled: we handle tonemapping, tell Windows max (10000) so it passes through
-    // If tonemapping disabled: content is unclamped, tell Windows max so it applies system tonemapping based on MaxTML
-    // In both cases, 10000 nits ensures Windows uses MaxTML setting to decide tonemapping behavior
+    // If tonemapping disabled: content is unclamped, tell Windows max so it applies system tonemapping based on the
+    // display's reported peak. In both cases, 10000 nits leaves the decision to the display's reported peak (the
+    // Windows tone map setting, windows_tonemap.h)
     float contentPeakNits = 10000.0f;
 
     // HDR10 metadata (static metadata)

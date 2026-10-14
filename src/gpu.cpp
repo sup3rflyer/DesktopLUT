@@ -11,6 +11,7 @@
 #include "mhc.h"
 #include "mhc_preview.h"
 #include "fald.h"
+#include "windows_tonemap.h"
 #include <d3dcompiler.h>
 #include <iostream>
 
@@ -784,8 +785,8 @@ bool AttemptDeviceRecovery() {
         std::cout << "Monitor " << ctx.index << " recovered" << std::endl;
     }
 
-    // Reapply MaxTML settings (may be lost after TDR/driver recovery)
-    ApplyMaxTmlSettings();
+    // The Windows tone map's DisplayConfig override (may be lost after TDR/driver recovery)
+    RequestWindowsToneMap(true);
     // Reapply MHC profiles (may be lost after TDR/driver recovery)
     ReapplyAllMhcProfiles();
 

@@ -23,6 +23,9 @@ struct MHC2ProfileParams {
     bool isHDR = false;
     float peakNits = 1000.0f;             // Dual-use config input: HDR luminance METADATA (MaxCLL) +
                                           //   grayscale curve scaling for LUT gen. NOT a measured peak. docs/NAMING.md §1.
+    float reportedPeakNits = 0.0f;        // HDR: the peak the luminance tags tell Windows (lumi, MHC2 max luminance)
+                                          //   instead of peakNits, which keeps scaling the curves — the Windows tone
+                                          //   map bypass (PERM_PEAK_MAX). 0 = peakNits. MhcReportedPeakNits.
 
     // Per-channel TRC from ICC file (when set, overrides grayscale for LUT generation)
     // Each vector holds the display's measured transfer curve: signal(0-1) → linear(0-1)
@@ -52,6 +55,10 @@ struct MHC2ProfileParams {
 
 // Generate complete ICC v4 profile binary data with MHC2 tag
 bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& outData);
+
+// The peak an HDR profile's luminance tags carry (lumi, MHC2 max luminance): reportedPeakNits when set, else
+// peakNits. SDR profiles pin 80 nits in the writer.
+float MhcReportedPeakNits(const MHC2ProfileParams& params);
 
 // Write profile binary data to disk
 bool WriteMHC2Profile(const std::vector<uint8_t>& data, const std::wstring& filePath);

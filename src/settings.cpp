@@ -7,6 +7,7 @@
 #include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
 #include "displayconfig.h"   // IsValidSdrWhiteNits
 #include "grayscale_validate.h"
+#include "windows_tonemap.h"   // WindowsToneMapKey / ParseWindowsToneMap
 #include "ui/ui_window.h"
 #include <algorithm>
 #include <atomic>
@@ -207,7 +208,7 @@ float GetPrivateProfileFloat(const wchar_t* section, const wchar_t* key, float d
     GetPrivateProfileStringW(section, key, L"", buf, 32, file);
     if (buf[0] == L'\0') return def;
     // The whole value must be a finite number: a hand-edited "abc" used to parse as 0 (then
-    // clamped to a nonsense-but-in-range value and applied, e.g. a 10-nit MaxTML override).
+    // clamped to a nonsense-but-in-range value and applied, e.g. a 10-nit display peak).
     wchar_t* end = nullptr;
     double v = _wcstod_l(buf, &end, GetCLocale());
     if (end == buf) return def;
@@ -1011,10 +1012,20 @@ void LoadMonitorSettings(const wchar_t* section, MonitorSettings& ms, const wcha
     LoadColorCorrectionSettings(section, L"SDR_", ms.sdrColorCorrection, iniPath);
     LoadColorCorrectionSettings(section, L"HDR_", ms.hdrColorCorrection, iniPath);
 
-    // Load MaxTML settings
-    ms.maxTml.enabled = GetPrivateProfileBool(section, L"MaxTmlEnabled", false, iniPath);
-    float rawPeak = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath);
-    ms.maxTml.peakNits = (std::min)(10000.0f, (std::max)(10.0f, rawPeak));
+    // What Windows tells apps the HDR peak is (windows_tonemap.h). Before 3.0 it was a DisplayConfig override
+    // (MaxTmlEnabled / MaxTmlPeak, applied at start): Auto replaces it — 10000 nits exactly while DesktopLUT tone maps,
+    // what the override was for — except where it said 10000 with DesktopLUT's tone map off (the user tone maps
+    // elsewhere and wanted Windows to stay out regardless): Bypass keeps that. A custom peak has no successor.
+    wchar_t toneMapKey[16] = {};
+    GetPrivateProfileStringW(section, L"WindowsToneMap", L"", toneMapKey, 16, iniPath);
+    if (toneMapKey[0]) {
+        ms.windowsToneMap = ParseWindowsToneMap(toneMapKey);
+    } else {
+        const bool legacyOn = GetPrivateProfileBool(section, L"MaxTmlEnabled", false, iniPath);
+        const float legacyPeak = GetPrivateProfileFloat(section, L"MaxTmlPeak", 1000.0f, iniPath);
+        ms.windowsToneMap = legacyOn && legacyPeak >= kWindowsToneMapBypassNits && !ms.hdrColorCorrection.tonemap.enabled
+                                ? WindowsToneMap::Bypass : WindowsToneMap::Auto;
+    }
 
     // Load MHC settings (with own primaries and grayscale)
     LoadMHCSettings(section, L"SDR_", ms.sdrMHC, iniPath);
@@ -1031,9 +1042,10 @@ void SaveMonitorSettings(const wchar_t* section, const MonitorSettings& ms, cons
     SaveColorCorrectionSettings(section, L"SDR_", ms.sdrColorCorrection, iniPath);
     SaveColorCorrectionSettings(section, L"HDR_", ms.hdrColorCorrection, iniPath);
 
-    // Save MaxTML settings
-    WritePrivateProfileBool(section, L"MaxTmlEnabled", ms.maxTml.enabled, iniPath);
-    WritePrivateProfileFloat(section, L"MaxTmlPeak", ms.maxTml.peakNits, iniPath);
+    // What Windows tells apps the HDR peak is; the pre-3.0 override keys it replaces go.
+    IniWriteString(section, L"WindowsToneMap", WindowsToneMapKey(ms.windowsToneMap), iniPath);
+    IniWriteString(section, L"MaxTmlEnabled", nullptr, iniPath);
+    IniWriteString(section, L"MaxTmlPeak", nullptr, iniPath);
 
     // Save MHC settings (with own primaries and grayscale)
     SaveMHCSettings(section, L"SDR_", ms.sdrMHC, iniPath);

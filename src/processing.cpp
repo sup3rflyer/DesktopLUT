@@ -2,6 +2,7 @@
 // Processing thread management
 
 #include "processing.h"
+#include "windows_tonemap.h"
 #include "mhc_preview.h"   // MhcEditorNeedsOverlay
 #include "globals.h"
 #include "lut.h"
@@ -1239,9 +1240,9 @@ static void StartProcessingImpl() {
     // gamma is configured: BuildPipelineConfigs). Empty exactly when !LiveLayersNeeded().
     std::vector<MonitorLUTConfig> configs = BuildPipelineConfigs();
 
-    // MaxTML (display peak override) is not a live layer: it holds whether or not anything else runs, so an
-    // MHC-only setup gets it too (C16).
-    ApplyMaxTmlSettings();
+    // The Windows tone map is not a live layer: it holds whether or not anything else runs, so an MHC-only setup
+    // gets it too (C16). A start may follow a reset that dropped the DisplayConfig override: send it again.
+    RequestWindowsToneMap(true);
 
     if (configs.empty()) {
         // Nothing for a processing thread or the hook. An MHC-only setup (the VRR-safe one) is not
@@ -1761,34 +1762,3 @@ bool SettingsChanged() {
     return false;
 }
 
-void ApplyMaxTmlSettings() {
-    // Apply MaxTML (Display Peak Override) for all monitors that have it enabled
-    // This should be called on:
-    // - Startup (StartProcessing)
-    // - Sleep/wake recovery
-    // - TDR recovery
-    // - After HDR mode changes (swapchain recreation)
-    // Reapplying is cheap and safe, so we do it liberally to ensure the setting isn't lost
-
-    // Snapshot MaxTML settings under lock (called from render thread, GUI thread writes settings)
-    struct MaxTmlEntry { bool enabled; float peakNits; };
-    std::vector<MaxTmlEntry> entries;
-    {
-        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        entries.reserve(g_gui.monitorSettings.size());
-        for (const auto& ms : g_gui.monitorSettings) {
-            entries.push_back({ms.maxTml.enabled, ms.maxTml.peakNits});
-        }
-    }
-
-    for (size_t i = 0; i < entries.size(); i++) {
-        if (entries[i].enabled) {
-            DisplayInfo displayInfo;
-            if (GetDisplayInfoForMonitor((int)i, displayInfo)) {
-                if (SetDisplayMaxTml(displayInfo, entries[i].peakNits)) {
-                    std::cout << "Applied MaxTML " << entries[i].peakNits << " nits to monitor " << i << std::endl;
-                }
-            }
-        }
-    }
-}

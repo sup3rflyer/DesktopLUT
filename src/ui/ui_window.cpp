@@ -37,9 +37,14 @@ constexpr UINT_PTR kDlcTimer = 4;       // re-read the DLC folder while visible
 constexpr UINT_PTR kDeviceRetryTimer = 5;   // rebuild the device after a loss, with backoff
 constexpr UINT_PTR kModeTimer = 6;      // re-read what Windows reports per display while visible
 constexpr UINT kSettleMs = 16, kAnimMs = 33, kReleaseMs = 30000, kDlcMs = 60000;
-// The reported peak changes without a display-change message: a MaxTML override, a profile re-association (the
-// transition bursts, DLC, the SDR white level following). One DXGI read per tick, only while that reading is shown.
+// The reported peak changes without a display-change message: the Windows tone map (a profile variant swap, the
+// DisplayConfig override), a profile re-association (the transition bursts, DLC, the SDR white level following).
+// One DXGI read per tick, only while that reading is shown.
 constexpr UINT kModeMs = 5000;
+// After a command (a swap Windows reports a moment later): a few quick reads, then back to kModeMs.
+constexpr UINT kModeFastMs = 700;
+constexpr int kModeFastTicks = 3;
+int g_modeFastTicks = 0;
 constexpr int kSettleFrames = 3;
 constexpr float kDefaultW = 1180.0f, kDefaultH = 760.0f, kMinW = 920.0f, kMinH = 520.0f;
 
@@ -151,7 +156,11 @@ void DrainCommands() {
         }
     }
     g_busy = false;
-    RefreshModeCache();   // a command may have changed what Windows reports (MaxTML, a profile)
+    RefreshModeCache();   // a command may have changed what Windows reports (the Windows tone map, a profile)
+    if (g_hwnd && IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) {
+        g_modeFastTicks = kModeFastTicks;   // ...and Windows may report it a moment later
+        SetTimer(g_hwnd, kModeTimer, kModeFastMs, nullptr);
+    }
     Invalidate();
 }
 
@@ -287,7 +296,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else KillTimer(hwnd, kDlcTimer);
         } else if (wParam == kModeTimer) {
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
-                // Only while the reading is on screen (the tone map inspector's REPORTED PEAK of a connected display in
+                // Only while the reading is on screen (the tone map inspector's WINDOWS TONE MAP of a connected display in
                 // HDR; any other shows "—"), not while a command runs, and only the DXGI read: DisplayConfig polling is
                 // a known micro-stutter source, and a mode change arrives as a message. A frame only when it changed.
                 bool shown = !g_busy && g_view.page == Page::Pipeline && g_view.stage == StageId::ToneMap &&
@@ -298,6 +307,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (r.mode == Mode::HDR && RowIdOf(r) == g_view.selectedKey) shown = true;
                 }
                 if (shown && RefreshReportedPeaks()) Invalidate();
+                if (g_modeFastTicks > 0 && --g_modeFastTicks == 0) SetTimer(hwnd, kModeTimer, kModeMs, nullptr);
             } else {
                 KillTimer(hwnd, kModeTimer);
             }

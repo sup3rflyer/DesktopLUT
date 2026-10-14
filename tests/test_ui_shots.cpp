@@ -164,8 +164,8 @@ ui::Snapshot FakeSnapshot() {
     tm.sourcePeakNits = 4000;
     a.settings.hdrColorCorrection.fald.paramsPath = L"D:/Calibration/DLC/fald/PA32UCXR.bin";
     a.settings.hdrColorCorrection.fald.enabled = true;
-    a.settings.maxTml.enabled = true;
-    a.settings.maxTml.peakNits = 10000;
+    a.settings.windowsToneMap = WindowsToneMap::Auto;
+    a.settings.hdrMHC.reportPeakMax = true;   // Auto with the tone map on: 10000 nits
     a.settings.hdrPath = L"D:\\Calibration\\DLC\\results\\PA32UCXR_HDR\\final_hdr.cube";
     MHCSettings& m = a.settings.hdrMHC;
     m.enabled = true;
@@ -173,6 +173,7 @@ ui::Snapshot FakeSnapshot() {
     m.profilePath = L"C:\\Windows\\System32\\spool\\drivers\\color\\DesktopLUT_HDR_AUS322A.icm";
     m.sourceFilePath = L"D:\\Calibration\\DLC\\results\\PA32UCXR_HDR\\mhc_hdr.cube";
     m.sourceIs1DCube = true;
+    m.baseGrayscale.peakNits = 1729.26f;   // the measured peak the cube was made at (the panel peak)
     m.desktopGammaEnabled = true;
     m.dgSdrWhiteNits = 116;
     m.whiteBalanceEnabled = true;
@@ -190,7 +191,8 @@ ui::Snapshot FakeSnapshot() {
     a.dlcRecord[1].verifiedDaysAgo = 11;
     a.dlcRecord[1].correctionMade = "2026-08-30";
     a.dlcRecord[1].correctionDaysAgo = 44;
-    a.reportedPeakNits = 10000;   // Windows reports the override
+    a.reportedPeakNits = 10000;   // Windows reports the bypass
+    a.edidPeakNits = 1600;
     s.live.push_back(a);
 
     ui::DisplayRow b;
@@ -246,7 +248,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     const ui::Snapshot base = FakeSnapshot();
     // variant: 0 as made, 1 the 3D LUT and primaries stages of the HDR display switched off, 2 suspended, 3/4 grayscale
     // editor HDR/SDR, 5 whitelist editor, 6/7 MHC profile editor HDR/SDR, 8 the hook not injected (the engine should
-    // run and does not) with Windows reporting the profile's peak instead of the override
+    // run and does not) with Windows reporting the profile's peak instead of the bypass, 9 the Windows tone map on PANEL
     struct Shot { const char* name; ui::Page page; ui::StageId stage; int display; bool confirm; float mx, my; float w = 1180, h = 760; int variant = 0; };
     const Shot shots[] = {
         { "tonemap", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1 },
@@ -268,6 +270,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "mhceditsdr", ui::Page::Pipeline, ui::StageId::Primaries, 1, false, -1, -1, 1180, 760, 7 },
         { "mhceditnarrow", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 920, 520, 6 },
         { "notrunning", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 8 },
+        { "wtmpanel", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 9 },
     };
     // With the cube off the screen the records read against what runs (TakeSnapshot): the cube is off, and a report
     // that verified the cube is the latest, not current.
@@ -293,11 +296,17 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     snap.suspended = true;
                     cubeOffRecord(snap.live[0], 1);
                     cubeOffRecord(snap.live[1], 0);
+                    snap.live[0].settings.hdrMHC.reportPeakMax = false;   // Auto, nothing tone maps: the panel's peak
+                    snap.live[0].reportedPeakNits = 1729;
                 } else if (shot.variant == 8) {
                     snap.hookActive = false;
                     cubeOffRecord(snap.live[0], 1);
                     cubeOffRecord(snap.live[1], 0);
                     snap.live[0].reportedPeakNits = 1612;
+                } else if (shot.variant == 9) {
+                    snap.live[0].settings.windowsToneMap = WindowsToneMap::Panel;
+                    snap.live[0].settings.hdrMHC.reportPeakMax = false;
+                    snap.live[0].reportedPeakNits = 1729;
                 }
                 const UINT w = (UINT)(shot.w * scale), h = (UINT)(shot.h * scale);
                 gpu.Resize(w, h);

@@ -837,7 +837,10 @@ TEST_CASE("MHC permutations: a bypassed stage drops its own bits, and every swap
     CHECK(NormalizeMhcPerm(NOGRAY | WB | DG) == (NOGRAY | WB));
     CHECK(NormalizeMhcPerm(NOGRAY | GS) == NOGRAY);
     CHECK(NormalizeMhcPerm(NOPRIM | WB | DG) == (NOPRIM | DG));
-    CHECK(NormalizeMhcPerm(0xFF) == (NOPRIM | NOGRAY));          // out-of-range bits never index past the cache
+    // Out-of-range bits never index past the cache; the reported-peak bit is no stage and survives the bypasses.
+    CHECK(NormalizeMhcPerm(0xFF) == (NOPRIM | NOGRAY | MHCSettings::PERM_PEAK_MAX));
+    CHECK(NormalizeMhcPerm(0xFF) < MHCSettings::PERM_COUNT);
+    CHECK(NormalizeMhcPerm(NOGRAY | DG | MHCSettings::PERM_PEAK_MAX) == (NOGRAY | MHCSettings::PERM_PEAK_MAX));
     CHECK(NormalizeMhcPerm(WB | DG | GS) == (WB | DG | GS));
 }
 

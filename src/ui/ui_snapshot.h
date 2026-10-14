@@ -20,6 +20,7 @@ struct DisplayRow {
     std::wstring name;           // friendly name (identity, else the DisplayConfig name)
     Mode mode = Mode::Unknown;   // from the mode cache
     float reportedPeakNits = 0;  // the peak Windows reports to apps now (DXGI MaxLuminance) while in HDR; 0 = unknown
+    float edidPeakNits = 0;      // the HDR peak the display's EDID declares (the panel's, without our profile); 0 = unknown
     bool primary = false;
     int widthPx = 0, heightPx = 0;
     // DLC records (empty match when there is no DLC folder or nothing names this display).
@@ -50,8 +51,8 @@ void TakeSnapshot(Snapshot& out);
 void RefreshModeCache();
 
 // Re-reads only the peak each display reports (one fresh DXGI factory, no DisplayConfig): what the tone map
-// inspector's REPORTED PEAK shows changes without any display-change message (a profile re-association, a MaxTML
-// override). Cheap enough to poll while that reading is on screen. True when a reading changed.
+// inspector's WINDOWS TONE MAP reading changes without any display-change message (a profile variant swap, the
+// DisplayConfig override). Cheap enough to poll while that reading is on screen. True when a reading changed.
 bool RefreshReportedPeaks();
 
 // Whether the engine that draws tone mapping and the 3D LUT is up: in hook mode the injected hook (it stays resident

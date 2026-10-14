@@ -3,6 +3,7 @@
 // (Initialization code in render_init.cpp)
 
 #include "render.h"
+#include "windows_tonemap.h"
 #include "globals.h"
 #include "gpu.h"
 #include "color.h"
@@ -91,7 +92,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
             // ReinitDesktopDuplication handles HDR change + swapchain recreation internally.
             // Apply additional mode-switch steps not covered by reinit:
             if (ctx->isHDREnabled != ctx->wasHDREnabled) {
-                ApplyMaxTmlSettings();
+                RequestWindowsToneMap(true);   // a mode change drops a DisplayConfig peak override
                 ctx->cbDirty = true;
                 ReapplyMhcProfilesOnModeSwitch(ctx);
             }
@@ -300,7 +301,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
                     : (ctx->lutSRV_SDR != nullptr);
                 ctx->usePassthrough = !hasApplicableLUT;
                 RecreateSwapchain(ctx);
-                ApplyMaxTmlSettings();
+                RequestWindowsToneMap(true);
                 // Reapply MHC ICC profiles only if display mode actually changed
                 if (ctx->isHDREnabled != ctx->wasHDREnabled) {
                     ReapplyMhcProfilesOnModeSwitch(ctx);
@@ -966,8 +967,8 @@ void RenderAll(FramePacer* fp) {
         }
         // Reset watchdog to avoid timeout during recovery
         g_lastSuccessfulFrame = std::chrono::steady_clock::now();
-        // Reapply MaxTML settings (may be lost after sleep/wake)
-        ApplyMaxTmlSettings();
+        // The Windows tone map's DisplayConfig override (may be lost after sleep/wake)
+        RequestWindowsToneMap(true);
         // Reapply MHC profiles only when specifically requested (sleep/wake, TDR)
         // — not for every reinit source (ImmersiveColorSet, device tree, DWM composition)
         if (g_forceMhcReapply.exchange(false)) {

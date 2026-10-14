@@ -105,7 +105,7 @@ std::wstring DecodeIniText(const std::wstring& stored);
 // ("Display007" is not the section the canonical name "Display7" addresses).
 std::vector<int> EnumerateSavedSectionIndices(const wchar_t* prefix, const wchar_t* iniPath);
 
-// One display's per-monitor keys (LUT paths, corrections, MaxTML, MHC) — the
+// One display's per-monitor keys (LUT paths, corrections, Windows tone map, MHC) — the
 // identity keys and slot/legacy bookkeeping are handled by the pool functions.
 // Missing keys fall back to defaults.
 void LoadMonitorSettings(const wchar_t* section, MonitorSettings& ms, const wchar_t* iniPath);

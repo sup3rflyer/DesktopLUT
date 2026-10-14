@@ -180,6 +180,9 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm);
 // Swap the active MHC ICC profile to a different permutation.
 // Calls EnsureMhcPermProfile, then Remove+Reassociate. Updates profileName/profilePath.
 bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm);
+// Sets / clears permutation bits on the variant active WHEN the swap runs (one swap at a time): what a caller flipping
+// one bit uses, so a concurrent swap of another bit is kept.
+bool SwapMhcPermBits(int monitorIndex, bool isHDR, uint8_t setBits, uint8_t clearBits);
 
 // Toggle the DG bit in the active permutation for all HDR monitors.
 // Called by hotkey handlers and whitelist when desktop gamma changes at runtime.
@@ -233,7 +236,7 @@ struct MonitorSettings;
 float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR);
 
 // Peak metadata the identity profile carries (HDR; SDR is pinned to 80 nits by the writer):
-// the monitor's Display Peak Override (MaxTML) peak when enabled, else the removed profile's
+// the removed profile's
 // MhcProfileMetadataPeakNits (its configured peak, or the params default of 1000). Pure.
 float MhcIdentityPeakNits(const MonitorSettings& ms, bool isHDR);
 
