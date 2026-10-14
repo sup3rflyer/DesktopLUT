@@ -23,8 +23,9 @@ Settings saved to `DesktopLUT.ini` next to executable.
 
 ```ini
 [General]
-; written by the app: 2 = identity-keyed [Display<slot>] sections
-IniVersion=2
+; written by the app: 2 = identity-keyed [Display<slot>] sections, 3 = floats written exactly
+; (4 decimals when that reads back as the same number, else up to 9 significant digits)
+IniVersion=3
 ; overlay 3D LUT interpolation: 1 = tetrahedral (default), 0 = trilinear. The DWM hook is always
 ; tetrahedral, and in hook mode the overlay (preview / analysis) follows it whatever this says.
 TetrahedralInterp=1

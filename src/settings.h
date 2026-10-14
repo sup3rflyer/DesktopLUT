@@ -17,6 +17,31 @@ std::wstring GetIniPath();
 // Helper to write float to INI
 void WritePrivateProfileFloat(const wchar_t* section, const wchar_t* key, float value, const wchar_t* file);
 
+// A float as INI text: "%.4f" (what every earlier build wrote) when that reads back as the same float, else the
+// 9 significant digits that always do. Locale-independent.
+std::wstring FormatIniFloat(float value);
+
+// While one is alive on this thread, this file's INI writes (the settings writers above and SaveSettings) skip a
+// value the file already stores: each section is read once, through the profile API, and only changed keys are
+// written. Per thread; SaveSettings holds one for its whole save.
+namespace settings_detail { struct IniWriteCache; }
+class IniWriteBatch {
+public:
+    explicit IniWriteBatch(const std::wstring& file);
+    ~IniWriteBatch();
+    IniWriteBatch(const IniWriteBatch&) = delete;
+    IniWriteBatch& operator=(const IniWriteBatch&) = delete;
+    // A write made inside this batch (or the outer one it joined) did not land.
+    bool AnyWriteFailed() const;
+
+private:
+    settings_detail::IniWriteCache* m_cache = nullptr;
+    settings_detail::IniWriteCache* m_prev = nullptr;
+};
+// How many writes this file's INI writers have handed to the profile API so far (each one rewrites the file).
+// For tests: a batched save of unchanged settings must add none.
+uint64_t IniWritesIssued();
+
 // Helper to read float from INI
 float GetPrivateProfileFloat(const wchar_t* section, const wchar_t* key, float def, const wchar_t* file);
 
@@ -39,6 +64,11 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
 void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
                       MHCSettings& mhc, const wchar_t* iniPath);
 
+// A grayscale slot loaded from an INI an older build wrote (every point at 4 decimals): each point that is exactly
+// the 4-decimal spelling of its identity value becomes the exact identity value. Returns how many changed.
+// (Exposed for testing; the loader calls it for every slot.)
+int RestoreLegacyIdentityPoints(GrayscaleSettings& gs, bool isHDR);
+
 // Per-display sections. Settings are keyed by physical display identity:
 //   [Display<slot>]  the per-monitor keys + DevicePath= / EdidId= / DisplayName= /
 //                    FirstSeen= / LastSeen=. The identity keys are written LAST: they are
@@ -54,8 +84,11 @@ constexpr const wchar_t* kLegacySectionPrefix  = L"Monitor";
 // cannot balloon anything.
 constexpr size_t kMaxSavedMonitorSections = (size_t)kMaxDisplaySlots;
 // [General] IniVersion: 2 = identity-keyed [Display<slot>] sections, legacy sections marked
-// (not deleted) on migration.
-constexpr int kIniVersion = 2;
+// (not deleted) on migration. 3 = floats written round-trip exact (FormatIniFloat): below it, every float was
+// written at 4 decimals, and a grayscale point that reads back as its identity value's 4-decimal spelling is that
+// identity point (RestoreLegacyIdentityPoints); from 3 on such a point is taken as written.
+constexpr int kIniVersion = 3;
+constexpr int kIniVersionExactFloats = 3;
 
 // Today's local date as ISO "YYYY-MM-DD" (the FirstSeen / LastSeen stamps).
 std::wstring TodayIsoDate();

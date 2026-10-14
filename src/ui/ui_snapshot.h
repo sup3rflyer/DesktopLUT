@@ -19,6 +19,7 @@ struct DisplayRow {
     MonitorSettings settings;    // copy
     std::wstring name;           // friendly name (identity, else the DisplayConfig name)
     Mode mode = Mode::Unknown;   // from the mode cache
+    float reportedPeakNits = 0;  // the peak Windows reports to apps now (DXGI MaxLuminance) while in HDR; 0 = unknown
     bool primary = false;
     int widthPx = 0, heightPx = 0;
     // DLC records (empty match when there is no DLC folder or nothing names this display).
@@ -47,5 +48,24 @@ void TakeSnapshot(Snapshot& out);
 // Re-queries every live display's colour mode (fresh DXGI factory + DisplayConfig, ~2-20 ms in all).
 // Call when the interface is shown and after display / colour-mode changes — never per frame.
 void RefreshModeCache();
+
+// Re-reads only the peak each display reports (one fresh DXGI factory, no DisplayConfig): what the tone map
+// inspector's REPORTED PEAK shows changes without any display-change message (a profile re-association, a MaxTML
+// override). Cheap enough to poll while that reading is on screen. True when a reading changed.
+bool RefreshReportedPeaks();
+
+// Whether the engine that draws tone mapping and the 3D LUT is up: in hook mode the injected hook (it stays resident
+// while a dead overlay thread waits for its auto-restart, and a Stop or Suspend ejects it), else the overlay.
+inline bool CubeEngineUp(const Snapshot& s) { return s.hookMode ? s.hookActive : s.running; }
+
+// Whether a connected display's configured 3D LUT for one mode is off the screen: suspended live layers (both
+// modes), or the engine down on the mode the display is in. The other mode shows what would run there, and an
+// unknown mode faults nothing, as the pipeline's lights do (BuildPixelPath). The MEASURED panel and the DLC record
+// read against it.
+inline bool CubeOffScreen(const Snapshot& s, const DisplayRow& r, bool hdr) {
+    if (r.liveIndex < 0) return false;
+    if (s.suspended) return true;
+    return r.mode != Mode::Unknown && PipelineIsHdr(r.mode) == hdr && !CubeEngineUp(s);
+}
 
 }  // namespace ui

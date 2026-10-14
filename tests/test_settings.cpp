@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cwctype>
+#include <memory>
 #include <string>
 
 // Helper to create a temp INI file and clean up
@@ -16,7 +17,7 @@ struct TempIni {
     TempIni() {
         wchar_t tmp[MAX_PATH];
         GetTempPathW(MAX_PATH, tmp);
-        path = std::wstring(tmp) + L"desktoplut_test.ini";
+        path = std::wstring(tmp) + L"desktoplut_test_" + std::to_wstring(GetCurrentProcessId()) + L".ini";   // per run
     }
     ~TempIni() {
         _wremove(path.c_str());
@@ -1122,7 +1123,7 @@ TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sectio
         GetPrivateProfileStringW(L"Monitor1", L"Migrated", L"", mark, 64, ini);
         CHECK(std::wstring(mark).empty());
         GetPrivateProfileStringW(L"General", L"IniVersion", L"", mark, 64, ini);
-        CHECK(std::wstring(mark) == L"2");
+        CHECK(std::wstring(mark) == std::to_wstring(kIniVersion));
     }
     CHECK(g_gui.monitorSettings[0].legacyIndex == -1);
 
@@ -1602,4 +1603,296 @@ TEST_CASE("StartProcessing is a no-op once the app teardown began") {
     CHECK_FALSE(running);
     CHECK_FALSE(threadStarted);
     CHECK_FALSE(inTransition);
+}
+
+// ============================================================================
+// INI precision and batched saves (2026-10-14 live test: 4-decimal floats, 3–5 s saves)
+// ============================================================================
+
+namespace {
+std::string ReadFileBytes(const std::wstring& path) {
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || !f) return {};
+    std::string s;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) s.append(buf, n);
+    fclose(f);
+    return s;
+}
+
+float ParseIniFloat(const std::wstring& s) { return (float)_wcstod_l(s.c_str(), nullptr, GetCLocale()); }
+
+std::wstring Old4(float v) {   // what every build before 3.0 wrote
+    wchar_t buf[32];
+    _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), v);
+    return buf;
+}
+
+// Holds the file open without write sharing: any write attempt fails while it lives.
+struct WriteLock {
+    HANDLE h;
+    explicit WriteLock(const wchar_t* path)
+        : h(CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr)) {}
+    ~WriteLock() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+};
+}  // namespace
+
+TEST_CASE("FormatIniFloat: the old 4-decimal spelling where it is exact, otherwise a round-trip-exact one") {
+    CHECK(FormatIniFloat(0.3127f) == L"0.3127");
+    CHECK(FormatIniFloat(1700.0f) == L"1700.0000");
+    CHECK(FormatIniFloat(1.0f) == L"1.0000");
+    CHECK(FormatIniFloat(0.0f) == L"0.0000");
+    CHECK(FormatIniFloat(-0.25f) == L"-0.2500");
+    // Values the 4 decimals cannot hold come back as the same float.
+    const float hard[] = { 1.0f / 31.0f, (1.0f / 31.0f) * (1.0f / 31.0f), 1729.26294f, 0.0001234f, 3.0e-7f,
+                           2.0f / 3.0f, 9999.99902f, -0.000061035f };
+    for (float v : hard) {
+        const std::wstring s = FormatIniFloat(v);
+        CHECK(ParseIniFloat(s) == v);
+        CHECK(s.find(L',') == std::wstring::npos);   // locale-independent
+    }
+    // Every float the 4-decimal format wrote reads back unchanged and keeps its spelling (no INI churn on upgrade).
+    for (int i = 0; i <= 20000; i += 7) {
+        const std::wstring old = Old4((float)(i / 10000.0));
+        CHECK(FormatIniFloat(ParseIniFloat(old)) == old);
+    }
+}
+
+TEST_CASE("WritePrivateProfileFloat and the primaries round-trip exactly") {
+    TempIni ini;
+    const float v = 1.0f / 31.0f;
+    WritePrivateProfileFloat(L"P", L"v", v, ini.c_str());
+    CHECK(GetPrivateProfileFloat(L"P", L"v", -1.0f, ini.c_str()) == v);
+    MHCSettings mhc;
+    mhc.customPrimaries.Rx = 0.69283712f;
+    mhc.customPrimaries.Ry = 0.30271846f;
+    mhc.whiteBalanceWx = 0.31271003f;
+    SaveMHCSettings(L"D", L"HDR_", mhc, ini.c_str());
+    MHCSettings back;
+    LoadMHCSettings(L"D", L"HDR_", back, ini.c_str());
+    CHECK(back.customPrimaries.Rx == mhc.customPrimaries.Rx);
+    CHECK(back.customPrimaries.Ry == mhc.customPrimaries.Ry);
+    CHECK(back.whiteBalanceWx == mhc.whiteBalanceWx);
+}
+
+TEST_CASE("Grayscale points and gains survive the INI bit for bit") {
+    TempIni ini;
+    MHCSettings mhc;
+    mhc.correctionGrayscale.pointCount = 32;
+    mhc.correctionGrayscale.initLinearPQ();
+    mhc.correctionGrayscale.enabled = true;
+    mhc.correctionGrayscale.points[7] *= 1.0037f;                 // a fine-tune level
+    mhc.correctionGrayscale.rgbDeviations[0][7] = 1.00123457f;    // a fine-tune balance
+    SaveMHCSettings(L"D", L"HDR_", mhc, ini.c_str());
+    MHCSettings back;
+    LoadMHCSettings(L"D", L"HDR_", back, ini.c_str());
+    REQUIRE(back.correctionGrayscale.points.size() == 32);
+    for (int i = 0; i < 32; i++) CHECK(back.correctionGrayscale.points[i] == mhc.correctionGrayscale.points[i]);
+    CHECK(back.correctionGrayscale.rgbDeviations[0][7] == mhc.correctionGrayscale.rgbDeviations[0][7]);
+}
+
+TEST_CASE("RestoreLegacyIdentityPoints: 4-decimal neutral points become exact, edits stay") {
+    for (bool hdr : { false, true }) {
+        for (int n : { 10, 20, 32 }) {
+            GrayscaleSettings exact;
+            exact.pointCount = n;
+            if (hdr) exact.initLinearPQ(); else exact.initLinear();
+            GrayscaleSettings legacy = exact;
+            for (float& p : legacy.points) p = ParseIniFloat(Old4(p));   // what an older build wrote and read back
+            legacy.points[n / 2] = exact.points[n / 2] * 1.02f;           // a real edit (2 %) stays
+            CHECK(RestoreLegacyIdentityPoints(legacy, hdr) > 0);
+            for (int i = 0; i < n; i++) {
+                if (i == n / 2) CHECK(legacy.points[i] == exact.points[i] * 1.02f);
+                else CHECK(legacy.points[i] == exact.points[i]);
+            }
+            CHECK(RestoreLegacyIdentityPoints(legacy, hdr) == 0);   // idempotent
+        }
+    }
+}
+
+TEST_CASE("LoadMHCSettings: a pre-3.0 INI's neutral fine-tune loads as the exact identity") {
+    TempIni ini;
+    // The SDR point 1 of 32 an older build wrote as 0.0010 read 3.9 % low in the editor.
+    WritePrivateProfileStringW(L"D", L"SDR_MHCCorrGSEnabled", L"true", ini.c_str());
+    WritePrivateProfileStringW(L"D", L"SDR_MHCCorrGSPoints", L"32", ini.c_str());
+    std::wstring data;
+    for (int i = 0; i < 32; i++) {
+        const float t = (float)i / 31.0f;
+        data += (i ? L"; " : L"") + Old4(t * t);
+    }
+    WritePrivateProfileStringW(L"D", L"SDR_MHCCorrGSData", data.c_str(), ini.c_str());
+    MHCSettings mhc;
+    LoadMHCSettings(L"D", L"SDR_", mhc, ini.c_str());
+    REQUIRE(mhc.correctionGrayscale.points.size() == 32);
+    for (int i = 0; i < 32; i++) {
+        const float t = (float)i / 31.0f;
+        CHECK(mhc.correctionGrayscale.points[i] == t * t);
+    }
+}
+
+TEST_CASE("LoadMHCSettings: in an INI this build wrote, a point at such a spelling is a level the user set") {
+    // +0.13 % on HDR point 1 of 32 is exactly 0.0323f: written as "0.0323" (it round-trips), it must load as is.
+    TempIni ini;
+    WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), ini.c_str());
+    MHCSettings mhc;
+    mhc.correctionGrayscale.enabled = true;
+    mhc.correctionGrayscale.pointCount = 32;
+    mhc.correctionGrayscale.initLinearPQ();
+    mhc.correctionGrayscale.points[1] = ParseIniFloat(L"0.0323");
+    SaveMHCSettings(L"D", L"HDR_", mhc, ini.c_str());
+    MHCSettings back;
+    LoadMHCSettings(L"D", L"HDR_", back, ini.c_str());
+    REQUIRE(back.correctionGrayscale.points.size() == 32);
+    CHECK(back.correctionGrayscale.points[1] == ParseIniFloat(L"0.0323"));
+    CHECK(back.correctionGrayscale.points[1] != 1.0f / 31.0f);
+}
+
+TEST_CASE("IniWriteBatch: values already stored are not written at all") {
+    TempIni ini;
+    MonitorSettings ms;
+    ms.sdrPath = L"C:\\luts\\a.cube";
+    ms.hdrColorCorrection.tonemap.targetPeakNits = 1700.0f;
+    ms.hdrMHC.correctionGrayscale.pointCount = 32;
+    ms.hdrMHC.correctionGrayscale.initLinearPQ();
+    SaveMonitorSettings(L"Display0", ms, ini.c_str());
+    const std::string before = ReadFileBytes(ini.path);
+    REQUIRE_FALSE(before.empty());
+    {
+        // A batched save of the same settings hands the profile API no write at all.
+        const uint64_t writes = IniWritesIssued();
+        IniWriteBatch batch(ini.path);
+        SaveMonitorSettings(L"Display0", ms, ini.c_str());
+        WritePrivateProfileFloat(L"Display0", L"HDR_TonemapTargetPeak", 1700.0f, ini.c_str());
+        CHECK(IniWritesIssued() == writes);
+    }
+    CHECK(ReadFileBytes(ini.path) == before);
+    // A changed value goes through, and only it.
+    {
+        const uint64_t writes = IniWritesIssued();
+        IniWriteBatch batch(ini.path);
+        ms.hdrColorCorrection.tonemap.targetPeakNits = 1600.0f;
+        SaveMonitorSettings(L"Display0", ms, ini.c_str());
+        CHECK(IniWritesIssued() == writes + 1);
+    }
+    CHECK(GetPrivateProfileFloat(L"Display0", L"HDR_TonemapTargetPeak", 0.0f, ini.c_str()) == 1600.0f);
+    MonitorSettings back;
+    LoadMonitorSettings(L"Display0", back, ini.c_str());
+    CHECK(back.sdrPath == ms.sdrPath);
+}
+
+TEST_CASE("IniWriteBatch: a write that failed is retried by the next one") {
+    TempIni ini;
+    WritePrivateProfileFloat(L"S", L"k", 1.0f, ini.c_str());
+    IniWriteBatch batch(ini.path);
+    {
+        WriteLock lock(ini.c_str());
+        WritePrivateProfileFloat(L"S", L"k", 2.0f, ini.c_str());   // refused: the file is locked
+    }
+    CHECK(GetPrivateProfileFloat(L"S", L"k", 0.0f, ini.c_str()) == 1.0f);
+    CHECK(batch.AnyWriteFailed());   // SaveSettings then leaves IniVersion as it was
+    WritePrivateProfileFloat(L"S", L"k", 2.0f, ini.c_str());       // not mistaken for "already stored"
+    CHECK(GetPrivateProfileFloat(L"S", L"k", 0.0f, ini.c_str()) == 2.0f);
+}
+
+TEST_CASE("IniWriteBatch: a batch whose writes all landed reports none failed") {
+    TempIni ini;
+    IniWriteBatch batch(ini.path);
+    WritePrivateProfileFloat(L"S", L"k", 1.0f, ini.c_str());
+    WritePrivateProfileFloat(L"S", L"k", 1.0f, ini.c_str());   // skipped
+    CHECK_FALSE(batch.AnyWriteFailed());
+}
+
+TEST_CASE("LoadMHCSettings: a pre-identity [Monitor<N>] section is an older build's, whatever IniVersion says") {
+    // Adopted after this build's first save (the display came later): the file says 3, the section was never rewritten.
+    TempIni ini;
+    WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), ini.c_str());
+    std::wstring data;
+    for (int i = 0; i < 32; i++) {
+        const float t = (float)i / 31.0f;
+        data += (i ? L"; " : L"") + Old4(t * t);
+    }
+    for (const wchar_t* section : { L"Monitor1", L"Display1" }) {
+        WritePrivateProfileStringW(section, L"SDR_MHCCorrGSEnabled", L"true", ini.c_str());
+        WritePrivateProfileStringW(section, L"SDR_MHCCorrGSPoints", L"32", ini.c_str());
+        WritePrivateProfileStringW(section, L"SDR_MHCCorrGSData", data.c_str(), ini.c_str());
+    }
+    MHCSettings legacy, current;
+    LoadMHCSettings(L"Monitor1", L"SDR_", legacy, ini.c_str());
+    LoadMHCSettings(L"Display1", L"SDR_", current, ini.c_str());
+    REQUIRE(legacy.correctionGrayscale.points.size() == 32);
+    REQUIRE(current.correctionGrayscale.points.size() == 32);
+    CHECK(legacy.correctionGrayscale.points[1] == (1.0f / 31.0f) * (1.0f / 31.0f));   // restored
+    CHECK(current.correctionGrayscale.points[1] == ParseIniFloat(Old4((1.0f / 31.0f) * (1.0f / 31.0f))));   // as written
+}
+
+TEST_CASE("IniWriteBatch: a removal is never skipped for a key the section read may have missed") {
+    // A section past the profile API's 32,767-character limit can come back cut short: the key at its end is not in
+    // what the batch read, and a removal of it must still reach the file (a cleared display name, a forgotten profile
+    // variant, the DLC folder going back to automatic would otherwise come back at the next start).
+    TempIni ini;
+    const std::wstring filler(200, L'x');
+    for (int i = 0; i < 200; i++)   // ~42,000 characters before the key
+        WritePrivateProfileStringW(L"Big", (L"Filler" + std::to_wstring(i)).c_str(), filler.c_str(), ini.c_str());
+    WritePrivateProfileStringW(L"Big", L"HDR_FaldGlowFill", L"true", ini.c_str());
+    {
+        IniWriteBatch batch(ini.path);
+        SaveMonitorSettings(L"Big", MonitorSettings(), ini.c_str());   // removes the glow fill's dead keys
+    }
+    wchar_t after[16] = {};
+    GetPrivateProfileStringW(L"Big", L"HDR_FaldGlowFill", L"<absent>", after, 16, ini.c_str());
+    CHECK(std::wstring(after) == L"<absent>");
+}
+
+TEST_CASE("IniWriteBatch: a batch inside a batch for the same file shares its cache") {
+    TempIni ini;
+    WritePrivateProfileFloat(L"S", L"k", 1.0f, ini.c_str());
+    {
+        IniWriteBatch outer(ini.path);
+        WritePrivateProfileFloat(L"S", L"k", 1.0f, ini.c_str());     // the outer read sees 1
+        {
+            IniWriteBatch inner(ini.path);
+            WritePrivateProfileFloat(L"S", L"k", 2.0f, ini.c_str());
+        }
+        WritePrivateProfileFloat(L"S", L"k", 1.0f, ini.c_str());     // must not be skipped as "already stored"
+    }
+    CHECK(GetPrivateProfileFloat(L"S", L"k", 0.0f, ini.c_str()) == 1.0f);
+}
+
+TEST_CASE("IniWriteBatch: the saved file is byte-identical to unbatched writes") {
+    // Two saves in a row (the second changes, removes and adds keys) through the batch and straight through.
+    auto run = [](const std::wstring& path, bool batched) {
+        _wremove(path.c_str());
+        // Keys the writers delete (the glow fill's dead switches, a bypass variant no longer cached), in another case.
+        WritePrivateProfileStringW(L"Display0", L"HDR_FaldGlowFill", L"true", path.c_str());
+        WritePrivateProfileStringW(L"display0", L"hdr_mhcpermpath9", L"C:\\x.icm", path.c_str());
+        WritePrivateProfileStringW(L"Display0", L"UserKeptKey", L"kept", path.c_str());
+        MonitorSettings ms;
+        ms.sdrPath = L"C:\\luts\\a.cube";
+        ms.hdrMHC.correctionGrayscale.pointCount = 32;
+        ms.hdrMHC.correctionGrayscale.initLinearPQ();
+        ms.hdrMHC.permPaths[9] = L"C:\\x.icm";
+        std::unique_ptr<IniWriteBatch> batch;
+        if (batched) batch = std::make_unique<IniWriteBatch>(path);
+        SaveMonitorSettings(L"Display0", ms, path.c_str());
+        ms.sdrPath.clear();
+        ms.hdrMHC.permPaths[9].clear();
+        ms.hdrMHC.permPaths[12] = L"C:\\y.icm";
+        ms.hdrMHC.correctionGrayscale.points[3] *= 1.01f;
+        ms.maxTml.enabled = true;
+        SaveMonitorSettings(L"Display0", ms, path.c_str());
+        batch.reset();
+        return ReadFileBytes(path);
+    };
+    wchar_t tmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    const std::wstring a = std::wstring(tmp) + L"desktoplut_test_batch_a_" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    const std::wstring b = std::wstring(tmp) + L"desktoplut_test_batch_b_" + std::to_wstring(GetCurrentProcessId()) + L".ini";
+    const std::string direct = run(a, false), batched = run(b, true);
+    _wremove(a.c_str());
+    _wremove(b.c_str());
+    REQUIRE_FALSE(direct.empty());
+    CHECK(batched == direct);
+    CHECK(direct.find("FaldGlowFill") == std::string::npos);
+    CHECK(direct.find("UserKeptKey=kept") != std::string::npos);
 }

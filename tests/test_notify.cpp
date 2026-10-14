@@ -83,6 +83,46 @@ TEST_CASE("logcap: a tee buffer forwards everything and hands over whole lines")
     CHECK(lines[2].first == "partial done");                       // CR stripped
 }
 
+namespace {
+// What the original std::cout / std::wcout buffer is in a GUI process without a console: every write and every
+// flush fails (the standard handles are invalid).
+template <class Ch>
+struct DeadBuf : std::basic_streambuf<Ch> {
+    using Traits = typename std::basic_streambuf<Ch>::traits_type;
+    int syncs = 0;
+    typename Traits::int_type overflow(typename Traits::int_type) override { return Traits::eof(); }
+    std::streamsize xsputn(const Ch*, std::streamsize) override { return 0; }
+    int sync() override { syncs++; return -1; }
+};
+}  // namespace
+
+TEST_CASE("logcap: a failing forward (no console) never breaks the stream; every line is still captured") {
+    // 2026-10-14: sync() passed the dead stdout's -1 on, so the first std::endl set badbit and the stream dropped
+    // every later line (the Events log kept one line per stream for a whole session).
+    {
+        DeadBuf<char> dead;
+        std::vector<std::string> lines;
+        logcap::TeeBuf<char> tee(&dead, false, [&](const std::string& l, bool) { lines.push_back(l); });
+        std::ostream out(&tee);
+        for (int i = 0; i < 5; i++) out << "[Tag] line " << i << std::endl;
+        CHECK(out.good());
+        CHECK(dead.syncs == 5);   // the forward is still flushed (a console attached later works)
+        REQUIRE(lines.size() == 5);
+        CHECK(lines[4] == "[Tag] line 4");
+    }
+    {
+        DeadBuf<wchar_t> dead;
+        std::vector<std::wstring> lines;
+        logcap::TeeBuf<wchar_t> tee(&dead, true, [&](const std::wstring& l, bool) { lines.push_back(l); });
+        std::wostream out(&tee);
+        for (int i = 0; i < 5; i++) out << L"[Wide] line " << i << std::endl;
+        out.flush();
+        CHECK(out.good());
+        REQUIRE(lines.size() == 5);
+        CHECK(lines[0] == L"[Wide] line 0");
+    }
+}
+
 TEST_CASE("logcap: lines from two threads never interleave; the ring is bounded") {
     logcap::ResetForTest();
     logcap::TeeBuf<char> tee(nullptr, false, [](const std::string& l, bool err) { logcap::Append(l, err); });

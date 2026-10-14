@@ -9,10 +9,13 @@
 #include "grayscale_validate.h"
 #include "ui/ui_window.h"
 #include <algorithm>
+#include <atomic>
 #include <cwchar>
 #include <cmath>
 #include <iostream>
 #include <locale.h>
+#include <mutex>
+#include <unordered_map>
 
 // Cached C locale for locale-independent float parsing/writing.
 // _wtof and swprintf_s use the thread locale which may use comma as decimal
@@ -33,10 +36,170 @@ std::wstring GetIniPath() {
     return path + L"DesktopLUT.ini";
 }
 
-void WritePrivateProfileFloat(const wchar_t* section, const wchar_t* key, float value, const wchar_t* file) {
-    wchar_t buf[32];
+// ============================================================================
+// SECTION: Batched INI writes
+// ============================================================================
+// WritePrivateProfileString rewrites the whole file on every call (and the virus scanner reads it again), and a
+// save writes every key — ~430 of them — so each setting change froze the GUI thread for 3–5 s (2026-10-14).
+// Inside an IniWriteBatch the file is read once per section through the profile API itself (the same parsing as
+// the writes: case-insensitive names, the first of a duplicated key wins), and a write whose text is already
+// stored is skipped: only what changed reaches the file. Outside a batch every write goes straight through.
+
+namespace {
+
+std::wstring LowerName(const wchar_t* s) {
+    std::wstring out = s ? s : L"";
+    // Trimmed like the profile API trims names around the '='.
+    const size_t a = out.find_first_not_of(L" \t");
+    const size_t b = out.find_last_not_of(L" \t");
+    out = a == std::wstring::npos ? std::wstring() : out.substr(a, b - a + 1);
+    for (wchar_t& c : out) c = towlower(c);
+    return out;
+}
+
+}  // namespace
+
+namespace settings_detail {
+
+struct IniSectionCache {
+    std::unordered_map<std::wstring, std::wstring> keys;   // lower-case key -> stored text (first occurrence)
+    // The read is known to hold every key of the section. When it may not (the read failed — the file held without
+    // read sharing by another process for a moment — or the section outgrew what the API returns), a key missing
+    // from `keys` may still be in the file: its removal is checked against the file instead of skipped.
+    bool complete = true;
+};
+
+struct IniWriteCache {
+    std::wstring file;
+    std::unordered_map<std::wstring, IniSectionCache> sections;   // lower-case section -> its keys, once read
+    bool failed = false;                                           // a write of this batch did not land
+
+    IniSectionCache& Section(const wchar_t* section) {
+        const std::wstring name = LowerName(section);
+        auto it = sections.find(name);
+        if (it != sections.end()) return it->second;
+        IniSectionCache& cache = sections[name];
+        std::vector<wchar_t> buf(8192);
+        DWORD n = 0, err = ERROR_SUCCESS;
+        for (;;) {
+            SetLastError(ERROR_SUCCESS);
+            n = GetPrivateProfileSectionW(section, buf.data(), (DWORD)buf.size(), file.c_str());
+            err = GetLastError();
+            if (n < buf.size() - 2) break;
+            if (buf.size() >= (1u << 22)) {   // unreadable as a whole: cache nothing, so every write goes through
+                cache.keys.clear();
+                cache.complete = false;
+                return cache;
+            }
+            buf.resize(buf.size() * 2);
+        }
+        // Empty is "no such section" only when nothing went wrong; near the API's 32,767-character section limit
+        // the read may be cut short.
+        cache.complete = n < 32000 && (n > 0 || err == ERROR_SUCCESS || err == ERROR_FILE_NOT_FOUND ||
+                                       err == ERROR_PATH_NOT_FOUND);
+        for (const wchar_t* line = buf.data(); *line; line += wcslen(line) + 1) {
+            const wchar_t* eq = wcschr(line, L'=');
+            if (!eq) continue;
+            const std::wstring key = LowerName(std::wstring(line, eq).c_str());
+            if (!key.empty()) cache.keys.emplace(key, std::wstring(eq + 1));   // emplace: the first one wins
+        }
+        return cache;
+    }
+};
+
+}  // namespace settings_detail
+
+namespace {
+
+using settings_detail::IniSectionCache;
+using settings_detail::IniWriteCache;
+
+thread_local IniWriteCache* t_iniCache = nullptr;
+std::atomic<uint64_t> g_iniWritesIssued{ 0 };
+
+BOOL WriteThrough(const wchar_t* section, const wchar_t* key, const wchar_t* value, const wchar_t* file) {
+    g_iniWritesIssued.fetch_add(1, std::memory_order_relaxed);
+    return WritePrivateProfileStringW(section, key, value, file);
+}
+
+// Every INI write of this file goes through here (a raw WritePrivateProfileStringW inside a batch would leave the
+// cache behind the file, and a later identical write would then be skipped).
+BOOL IniWriteString(const wchar_t* section, const wchar_t* key, const wchar_t* value, const wchar_t* file) {
+    IniWriteCache* cache = t_iniCache;
+    if (!cache || !section || !file || _wcsicmp(cache->file.c_str(), file) != 0)
+        return WriteThrough(section, key, value, file);
+    if (!key) {   // the whole section goes
+        const BOOL ok = WriteThrough(section, nullptr, nullptr, file);
+        cache->sections.erase(LowerName(section));   // read again if written to later
+        if (!ok) cache->failed = true;
+        return ok;
+    }
+    IniSectionCache& sec = cache->Section(section);
+    const std::wstring name = LowerName(key);
+    auto it = sec.keys.find(name);
+    if (!value) {   // the key goes
+        if (it == sec.keys.end()) {
+            if (sec.complete) return TRUE;   // not there: nothing to remove
+            // The read may have missed it: ask the file for this key (a missing key returns the default).
+            wchar_t probe[2] = {};
+            GetPrivateProfileStringW(section, key, L"\x01", probe, 2, file);
+            if (probe[0] == L'\x01') return TRUE;
+        }
+        const BOOL ok = WriteThrough(section, key, nullptr, file);
+        if (ok) sec.keys.erase(name);   // a failed removal leaves it known to be there
+        else cache->failed = true;
+        return ok;
+    }
+    if (it != sec.keys.end() && it->second == value) return TRUE;   // already stored, byte for byte
+    const BOOL ok = WriteThrough(section, key, value, file);
+    if (ok) sec.keys[name] = value;
+    else {
+        cache->failed = true;
+        if (it != sec.keys.end()) sec.keys.erase(it);   // unknown now: a later write of it goes through
+    }
+    return ok;
+}
+
+}  // namespace
+
+IniWriteBatch::IniWriteBatch(const std::wstring& file) : m_prev(t_iniCache) {
+    // Inside a batch for the same file this one is that batch: a second cache would fall behind the writes of the
+    // other, and the outer one would then skip a write as "already stored" that the inner one had just changed.
+    if (m_prev && _wcsicmp(m_prev->file.c_str(), file.c_str()) == 0) {
+        m_prev = nullptr;
+        return;
+    }
+    m_cache = new settings_detail::IniWriteCache();
+    m_cache->file = file;
+    t_iniCache = m_cache;
+}
+
+IniWriteBatch::~IniWriteBatch() {
+    if (!m_cache) return;   // joined an outer batch
+    t_iniCache = m_prev;
+    delete m_cache;
+}
+
+bool IniWriteBatch::AnyWriteFailed() const {
+    const settings_detail::IniWriteCache* cache = m_cache ? m_cache : t_iniCache;   // joined: the outer batch's
+    return cache && cache->failed;
+}
+
+uint64_t IniWritesIssued() { return g_iniWritesIssued.load(std::memory_order_relaxed); }
+
+std::wstring FormatIniFloat(float value) {
+    wchar_t buf[48];
     _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), value);
-    WritePrivateProfileStringW(section, key, buf, file);
+    // The 4-decimal form every earlier build wrote, when it reads back as the same float; otherwise the 9
+    // significant digits that always do (a float written at 4 decimals lost the rest: a neutral grayscale point
+    // at 1/31 read back 0.13 % off, an SDR one 3.9 % off, and the bake used the rounded value).
+    if (std::isfinite(value) && (float)_wcstod_l(buf, nullptr, GetCLocale()) == value) return buf;
+    _swprintf_s_l(buf, _countof(buf), L"%.9g", GetCLocale(), value);
+    return buf;
+}
+
+void WritePrivateProfileFloat(const wchar_t* section, const wchar_t* key, float value, const wchar_t* file) {
+    IniWriteString(section, key, FormatIniFloat(value).c_str(), file);
 }
 
 float GetPrivateProfileFloat(const wchar_t* section, const wchar_t* key, float def, const wchar_t* file) {
@@ -54,7 +217,7 @@ float GetPrivateProfileFloat(const wchar_t* section, const wchar_t* key, float d
 }
 
 void WritePrivateProfileBool(const wchar_t* section, const wchar_t* key, bool value, const wchar_t* file) {
-    WritePrivateProfileStringW(section, key, value ? L"true" : L"false", file);
+    IniWriteString(section, key, value ? L"true" : L"false", file);
 }
 
 bool GetPrivateProfileBool(const wchar_t* section, const wchar_t* key, bool def, const wchar_t* file) {
@@ -70,9 +233,17 @@ bool GetPrivateProfileBool(const wchar_t* section, const wchar_t* key, bool def,
 }
 
 void WritePrivateProfileXY(const wchar_t* section, const wchar_t* key, float x, float y, const wchar_t* file) {
-    wchar_t buf[64];
-    _swprintf_s_l(buf, _countof(buf), L"%.4f, %.4f", GetCLocale(), x, y);
-    WritePrivateProfileStringW(section, key, buf, file);
+    IniWriteString(section, key, (FormatIniFloat(x) + L", " + FormatIniFloat(y)).c_str(), file);
+}
+
+// A ';'-separated float list (grayscale points, per-channel gains), each value as FormatIniFloat writes it.
+static std::wstring JoinIniFloats(const std::vector<float>& values) {
+    std::wstring out;
+    for (size_t j = 0; j < values.size(); j++) {
+        if (j > 0) out += L"; ";
+        out += FormatIniFloat(values[j]);
+    }
+    return out;
 }
 
 bool GetPrivateProfileXY(const wchar_t* section, const wchar_t* key, float& x, float& y, const wchar_t* file) {
@@ -118,7 +289,7 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     bool isHDR = (p.find(L"HDR") != std::wstring::npos);
     if (isHDR) {
         WritePrivateProfileBool(section, (p + L"TonemapEnabled").c_str(), cc.tonemap.enabled, iniPath);
-        WritePrivateProfileStringW(section, (p + L"TonemapCurve").c_str(),
+        IniWriteString(section, (p + L"TonemapCurve").c_str(),
             TonemapCurveToString(cc.tonemap.curve), iniPath);
         WritePrivateProfileFloat(section, (p + L"TonemapSourcePeak").c_str(), cc.tonemap.sourcePeakNits, iniPath);
         WritePrivateProfileFloat(section, (p + L"TonemapTargetPeak").c_str(), cc.tonemap.targetPeakNits, iniPath);
@@ -126,16 +297,16 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
     // FALD compensation layer: per mode (HDR_ and SDR_ — SDR runs it under Windows ACM).
     WritePrivateProfileBool(section, (p + L"FaldEnabled").c_str(), cc.fald.enabled, iniPath);
-    WritePrivateProfileStringW(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
+    IniWriteString(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
     WritePrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), cc.fald.pedMode == 1, iniPath);
     // temporal drive state (LED-lag filter): mode 0/1/2 + rise/fall time constants in ms (0 = instant on that edge);
     // mode 3 = panel clock (work guide C13) with its closure per tick + tick parity (-1 unknown / 0 / 1)
-    WritePrivateProfileStringW(section, (p + L"FaldTemporalMode").c_str(), std::to_wstring(cc.fald.temporalMode).c_str(), iniPath);
+    IniWriteString(section, (p + L"FaldTemporalMode").c_str(), std::to_wstring(cc.fald.temporalMode).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), cc.fald.tauRiseMs, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), cc.fald.tauFallMs, iniPath);
-    WritePrivateProfileStringW(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
+    IniWriteString(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTemporalClosure").c_str(), cc.fald.clockClosure, iniPath);
-    WritePrivateProfileStringW(section, (p + L"FaldTemporalParity").c_str(), std::to_wstring(cc.fald.clockParity).c_str(), iniPath);
+    IniWriteString(section, (p + L"FaldTemporalParity").c_str(), std::to_wstring(cc.fald.clockParity).c_str(), iniPath);
     // starfield balancing (experimental, default off; work guide S1): the GUI row's values + the INI/pipe-only ones
     const FaldStarfieldSettings& st = cc.fald.star;
     WritePrivateProfileBool(section, (p + L"FaldStarfield").c_str(), st.enabled, iniPath);
@@ -144,18 +315,18 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileFloat(section, (p + L"FaldStarTargetGain").c_str(), st.targetGain, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarTargetSigma").c_str(), st.targetSigma, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarKeepNits").c_str(), st.keepNits, iniPath);
-    WritePrivateProfileStringW(section, (p + L"FaldStarEvenReach").c_str(), std::to_wstring(st.evenReach).c_str(), iniPath);
+    IniWriteString(section, (p + L"FaldStarEvenReach").c_str(), std::to_wstring(st.evenReach).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarCapNits").c_str(), st.capNits, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarStrength").c_str(), st.strength, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarAreaLo").c_str(), st.areaLo, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarAreaHi").c_str(), st.areaHi, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarPeakHi").c_str(), st.peakHi, iniPath);
-    WritePrivateProfileStringW(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
+    IniWriteString(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
     // the glow fill's keys (work guide S2, removed 2026-10-07): deleted, so a saved file carries no dead switch
     for (const wchar_t* k : { L"FaldGlowFill", L"FaldGlowStrength", L"FaldGlowReach", L"FaldGlowCapNits" })
-        WritePrivateProfileStringW(section, (p + k).c_str(), nullptr, iniPath);
+        IniWriteString(section, (p + k).c_str(), nullptr, iniPath);
 }
 
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
@@ -229,8 +400,8 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
                       const MHCSettings& mhc, const wchar_t* iniPath) {
     std::wstring p(prefix);
     WritePrivateProfileBool(section, (p + L"MHCEnabled").c_str(), mhc.enabled, iniPath);
-    WritePrivateProfileStringW(section, (p + L"MHCProfilePath").c_str(), mhc.profilePath.c_str(), iniPath);
-    WritePrivateProfileStringW(section, (p + L"MHCSourceFile").c_str(), mhc.sourceFilePath.c_str(), iniPath);
+    IniWriteString(section, (p + L"MHCProfilePath").c_str(), mhc.profilePath.c_str(), iniPath);
+    IniWriteString(section, (p + L"MHCSourceFile").c_str(), mhc.sourceFilePath.c_str(), iniPath);
     WritePrivateProfileBool(section, (p + L"MHCSourceIs1DCube").c_str(), mhc.sourceIs1DCube, iniPath);
     WritePrivateProfileBool(section, (p + L"MHCPerChannelTRC").c_str(), mhc.hasPerChannelTRC, iniPath);
 
@@ -238,7 +409,7 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileBool(section, (p + L"MHCPrimariesEnabled").c_str(), mhc.primariesEnabled, iniPath);
     wchar_t presetBuf[8];
     swprintf_s(presetBuf, L"%d", mhc.primariesPreset);
-    WritePrivateProfileStringW(section, (p + L"MHCPrimariesPreset").c_str(), presetBuf, iniPath);
+    IniWriteString(section, (p + L"MHCPrimariesPreset").c_str(), presetBuf, iniPath);
     WritePrivateProfileXY(section, (p + L"MHCPrimariesRed").c_str(),
         mhc.customPrimaries.Rx, mhc.customPrimaries.Ry, iniPath);
     WritePrivateProfileXY(section, (p + L"MHCPrimariesGreen").c_str(),
@@ -252,31 +423,16 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileBool(section, (p + L"MHCGrayscaleEnabled").c_str(), mhc.baseGrayscale.enabled, iniPath);
     wchar_t pointsBuf[8];
     swprintf_s(pointsBuf, L"%d", mhc.baseGrayscale.pointCount);
-    WritePrivateProfileStringW(section, (p + L"MHCGrayscalePoints").c_str(), pointsBuf, iniPath);
+    IniWriteString(section, (p + L"MHCGrayscalePoints").c_str(), pointsBuf, iniPath);
 
-    std::wstring grayscaleData;
-    for (size_t j = 0; j < mhc.baseGrayscale.points.size(); j++) {
-        wchar_t val[16];
-        _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), mhc.baseGrayscale.points[j]);
-        if (j > 0) grayscaleData += L"; ";
-        grayscaleData += val;
-    }
-    WritePrivateProfileStringW(section, (p + L"MHCGrayscaleData").c_str(), grayscaleData.c_str(), iniPath);
+    IniWriteString(section, (p + L"MHCGrayscaleData").c_str(), JoinIniFloats(mhc.baseGrayscale.points).c_str(), iniPath);
 
     // Save per-channel RGB deviations for MHC grayscale
     {
         const wchar_t* devSuffix[] = { L"MHCGrayscaleDevR", L"MHCGrayscaleDevG", L"MHCGrayscaleDevB" };
         for (int ch = 0; ch < 3; ch++) {
-            auto& dev = mhc.baseGrayscale.rgbDeviations[ch];
-            if (!dev.empty()) {
-                std::wstring devData;
-                for (size_t j = 0; j < dev.size(); j++) {
-                    wchar_t val[16]; _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), dev[j]);
-                    if (j > 0) devData += L"; ";
-                    devData += val;
-                }
-                WritePrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), devData.c_str(), iniPath);
-            }
+            const auto& dev = mhc.baseGrayscale.rgbDeviations[ch];
+            if (!dev.empty()) IniWriteString(section, (p + devSuffix[ch]).c_str(), JoinIniFloats(dev).c_str(), iniPath);
         }
     }
 
@@ -306,23 +462,23 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     {
         wchar_t permBuf[8];
         swprintf_s(permBuf, L"%d", (int)mhc.activePerm);
-        WritePrivateProfileStringW(section, (p + L"MHCActivePerm").c_str(), permBuf, iniPath);
+        IniWriteString(section, (p + L"MHCActivePerm").c_str(), permBuf, iniPath);
         // The matrix maths revision the cached profiles were baked with; a re-bake still owed keeps the
         // old revision on disk so it is not lost to a save before it happens.
         swprintf_s(permBuf, L"%d", mhc.matrixRebakePending ? kMhcMatrixRev - 1 : kMhcMatrixRev);
-        WritePrivateProfileStringW(section, (p + L"MHCMatrixRev").c_str(), permBuf, iniPath);
+        IniWriteString(section, (p + L"MHCMatrixRev").c_str(), permBuf, iniPath);
     }
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
         std::wstring key = p + L"MHCPermPath" + std::to_wstring(k);
         // The bypass variants (k >= 8) are written only while cached, so an INI that never used a stage
         // switch keeps the eight entries it always had.
         const bool keep = k < 8 || !mhc.permPaths[k].empty();
-        WritePrivateProfileStringW(section, key.c_str(), keep ? mhc.permPaths[k].c_str() : nullptr, iniPath);
+        IniWriteString(section, key.c_str(), keep ? mhc.permPaths[k].c_str() : nullptr, iniPath);
         // HDR: the SDR white each cached variant's desktop gamma was baked with (0 = no DG in that bake)
         if (isHDR) {
             const std::wstring stampKey = p + L"MHCPermDgWhite" + std::to_wstring(k);
             if (keep) WritePrivateProfileFloat(section, stampKey.c_str(), mhc.permDgWhiteNits[k], iniPath);
-            else WritePrivateProfileStringW(section, stampKey.c_str(), nullptr, iniPath);
+            else IniWriteString(section, stampKey.c_str(), nullptr, iniPath);
         }
     }
 
@@ -331,31 +487,14 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     {
         wchar_t ptsBuf[8];
         swprintf_s(ptsBuf, L"%d", mhc.correctionGrayscale.pointCount);
-        WritePrivateProfileStringW(section, (p + L"MHCCorrGSPoints").c_str(), ptsBuf, iniPath);
+        IniWriteString(section, (p + L"MHCCorrGSPoints").c_str(), ptsBuf, iniPath);
     }
-    {
-        std::wstring gsData;
-        for (size_t j = 0; j < mhc.correctionGrayscale.points.size(); j++) {
-            wchar_t val[16];
-            _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), mhc.correctionGrayscale.points[j]);
-            if (j > 0) gsData += L"; ";
-            gsData += val;
-        }
-        WritePrivateProfileStringW(section, (p + L"MHCCorrGSData").c_str(), gsData.c_str(), iniPath);
-    }
+    IniWriteString(section, (p + L"MHCCorrGSData").c_str(), JoinIniFloats(mhc.correctionGrayscale.points).c_str(), iniPath);
     {
         const wchar_t* devSuffix[] = { L"MHCCorrGSDevR", L"MHCCorrGSDevG", L"MHCCorrGSDevB" };
         for (int ch = 0; ch < 3; ch++) {
-            auto& dev = mhc.correctionGrayscale.rgbDeviations[ch];
-            if (!dev.empty()) {
-                std::wstring devData;
-                for (size_t j = 0; j < dev.size(); j++) {
-                    wchar_t val[16]; _swprintf_s_l(val, _countof(val), L"%.4f", GetCLocale(), dev[j]);
-                    if (j > 0) devData += L"; ";
-                    devData += val;
-                }
-                WritePrivateProfileStringW(section, (p + devSuffix[ch]).c_str(), devData.c_str(), iniPath);
-            }
+            const auto& dev = mhc.correctionGrayscale.rgbDeviations[ch];
+            if (!dev.empty()) IniWriteString(section, (p + devSuffix[ch]).c_str(), JoinIniFloats(dev).c_str(), iniPath);
         }
     }
     if (isHDR) {
@@ -365,9 +504,9 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     }
 
     // Metadata for display labels
-    WritePrivateProfileStringW(section, (p + L"MHCMetaPrimaries").c_str(), mhc.metaPrimaries.c_str(), iniPath);
-    WritePrivateProfileStringW(section, (p + L"MHCMetaGamma").c_str(), mhc.metaGamma.c_str(), iniPath);
-    WritePrivateProfileStringW(section, (p + L"MHCMetaWhiteBalance").c_str(), mhc.metaWhiteBalance.c_str(), iniPath);
+    IniWriteString(section, (p + L"MHCMetaPrimaries").c_str(), mhc.metaPrimaries.c_str(), iniPath);
+    IniWriteString(section, (p + L"MHCMetaGamma").c_str(), mhc.metaGamma.c_str(), iniPath);
+    IniWriteString(section, (p + L"MHCMetaWhiteBalance").c_str(), mhc.metaWhiteBalance.c_str(), iniPath);
     if (isHDR) {
         WritePrivateProfileFloat(section, (p + L"MHCMetaPeakNits").c_str(), mhc.metaPeakNits, iniPath);
     }
@@ -391,6 +530,39 @@ static std::vector<float> ReadFloatListKey(const wchar_t* section, const std::ws
     return out;
 }
 
+int RestoreLegacyIdentityPoints(GrayscaleSettings& gs, bool isHDR) {
+    // Builds before 3.0 wrote every point at 4 decimals, so an untouched (identity) point came back slightly off
+    // its grid value: SDR point 1 of 32 (1/31)^2 = 0.0010406 as 0.0010 (-3.9 %), HDR 1/31 = 0.032258 as 0.0323
+    // (+0.13 %). The editor showed those as edits nobody made and the bake used them. A point that reads back as
+    // exactly the 4-decimal spelling of its identity value is that identity point (a deliberate level there is
+    // below what the old format could store anyway).
+    GrayscaleSettings identity;
+    identity.pointCount = gs.pointCount;
+    InitIdentityGrayscale(identity, isHDR);
+    int restored = 0;
+    for (size_t i = 0; i < gs.points.size() && i < identity.points.size(); i++) {
+        const float exact = identity.points[i];
+        if (gs.points[i] == exact) continue;
+        wchar_t buf[32];
+        _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), exact);
+        if (gs.points[i] == (float)_wcstod_l(buf, nullptr, GetCLocale())) {
+            gs.points[i] = exact;
+            restored++;
+        }
+    }
+    return restored;
+}
+
+// Whether this section's floats were written exactly (FormatIniFloat). A pre-identity [Monitor<N>] section only ever
+// comes from an older build (this one marks it Migrated and never writes it again), whatever the file's version says;
+// every other section is rewritten by each save, so the file's IniVersion — written last, and only by a save whose
+// writes all landed — speaks for it.
+static bool WrittenWithExactFloats(const wchar_t* section, const wchar_t* iniPath) {
+    const size_t n = wcslen(kLegacySectionPrefix);
+    if (_wcsnicmp(section, kLegacySectionPrefix, n) == 0 && iswdigit(section[n])) return false;
+    return GetPrivateProfileIntW(L"General", L"IniVersion", 0, iniPath) >= kIniVersionExactFloats;
+}
+
 // One grayscale slot: count (10/20/32, else 20), points, three per-channel gain lists. Whatever
 // fails the shared rules is reset — the points to the slot's identity curve, a channel's gains to
 // 1 — with a log line, and never reaches the MHC LUT bake. Base and correction slots alike.
@@ -406,6 +578,10 @@ static void LoadGrayscaleBlock(const wchar_t* section, const std::wstring& count
                        << L" invalid (count/NaN/range), reinitializing to the identity curve" << std::endl;
         }
         InitIdentityGrayscale(gs, isHDR);
+    } else if (!WrittenWithExactFloats(section, iniPath) && RestoreLegacyIdentityPoints(gs, isHDR) > 0) {
+        // Only what an older build wrote: from this build on a point at such a spelling is a level the user set.
+        std::wcout << L"Settings: " << section << L"/" << dataKey
+                   << L": neutral points an older build rounded to 4 decimals restored to the exact identity" << std::endl;
     }
     for (int ch = 0; ch < 3; ch++) {
         std::vector<float> gains = ReadFloatListKey(section, devKeys[ch], iniPath);
@@ -846,8 +1022,8 @@ void LoadMonitorSettings(const wchar_t* section, MonitorSettings& ms, const wcha
 }
 
 void SaveMonitorSettings(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
-    WritePrivateProfileStringW(section, L"LUT_SDR", ms.sdrPath.c_str(), iniPath);
-    WritePrivateProfileStringW(section, L"LUT_HDR", ms.hdrPath.c_str(), iniPath);
+    IniWriteString(section, L"LUT_SDR", ms.sdrPath.c_str(), iniPath);
+    IniWriteString(section, L"LUT_HDR", ms.hdrPath.c_str(), iniPath);
     WritePrivateProfileBool(section, L"LUT_SDR_Bypass", ms.sdrLutBypass, iniPath);
     WritePrivateProfileBool(section, L"LUT_HDR_Bypass", ms.hdrLutBypass, iniPath);
 
@@ -874,16 +1050,16 @@ static void LoadIdentityKeys(const wchar_t* section, MonitorSettings& ms, const 
 }
 
 static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, const wchar_t* iniPath) {
-    if (!ms.firstSeen.empty()) WritePrivateProfileStringW(section, L"FirstSeen", ms.firstSeen.c_str(), iniPath);
-    if (!ms.lastSeen.empty())  WritePrivateProfileStringW(section, L"LastSeen", ms.lastSeen.c_str(), iniPath);
-    WritePrivateProfileStringW(section, L"DisplayName", ms.identity.friendlyName.c_str(), iniPath);
+    if (!ms.firstSeen.empty()) IniWriteString(section, L"FirstSeen", ms.firstSeen.c_str(), iniPath);
+    if (!ms.lastSeen.empty())  IniWriteString(section, L"LastSeen", ms.lastSeen.c_str(), iniPath);
+    IniWriteString(section, L"DisplayName", ms.identity.friendlyName.c_str(), iniPath);
     // The user's own name for the display; absent = the automatic one (the key is removed, not left empty).
     // Free text: escaped to ASCII (the INI stays in the system code page; DLC reads it as UTF-8).
     const std::wstring label = EncodeIniText(ms.label);
-    WritePrivateProfileStringW(section, L"Label", label.empty() ? nullptr : label.c_str(), iniPath);
-    WritePrivateProfileStringW(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
+    IniWriteString(section, L"Label", label.empty() ? nullptr : label.c_str(), iniPath);
+    IniWriteString(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
     // Written last of all the section's keys: a section with a DevicePath is a complete one.
-    WritePrivateProfileStringW(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
+    IniWriteString(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
 }
 
 void LoadMonitorSettingsPool(std::vector<MonitorSettings>& pool, const wchar_t* iniPath) {
@@ -946,7 +1122,7 @@ static std::vector<int> SaveMonitorSettingsPool(const std::vector<MonitorSetting
             // twice, and the user's original copy survives a mis-adoption (another panel on
             // the old display's connector).
             std::wstring legacy = SectionName(kLegacySectionPrefix, ms.legacyIndex);
-            WritePrivateProfileStringW(legacy.c_str(), L"Migrated", section.c_str(), iniPath);
+            IniWriteString(legacy.c_str(), L"Migrated", section.c_str(), iniPath);
             std::wcout << L"Settings: migrated [" << legacy << L"] -> [" << section << L"]" << std::endl;
             migratedSlots.push_back(ms.slot);
         }
@@ -958,6 +1134,13 @@ static std::vector<int> SaveMonitorSettingsPool(const std::vector<MonitorSetting
 
 void SaveSettings() {
     std::wstring iniPath = GetIniPath();
+
+    // One save at a time (any thread): the batch below decides "already stored" from what it read, so a save
+    // running alongside another could skip a key the other one had just changed back.
+    static std::mutex s_saveMutex;
+    std::lock_guard<std::mutex> saveLock(s_saveMutex);
+    // Only the keys whose value changed are written (each WritePrivateProfileString rewrites the whole file).
+    IniWriteBatch batch(iniPath);
 
     // Save general settings
     // DesktopGamma is now per-monitor (MHCDesktopGamma in each monitor section) — not saved globally
@@ -974,37 +1157,35 @@ void SaveSettings() {
     {
         wchar_t buf[32];
         swprintf_s(buf, L"%d", g_frameBufferIdleMs.load());
-        WritePrivateProfileStringW(L"General", L"FrameBufferIdleMs", buf, iniPath.c_str());
+        IniWriteString(L"General", L"FrameBufferIdleMs", buf, iniPath.c_str());
     }
     WritePrivateProfileBool(L"General", L"DwmHookMode", g_dwmHookMode.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"CalibrationControl", g_calibrationControlEnabled.load(), iniPath.c_str());
     // One line in the INI: a raw line break in the value would end it there (the rest of the list lost).
-    WritePrivateProfileStringW(L"General", L"GammaWhitelist", NormalizeWhitelistRaw(g_gammaWhitelistRaw).c_str(), iniPath.c_str());
+    IniWriteString(L"General", L"GammaWhitelist", NormalizeWhitelistRaw(g_gammaWhitelistRaw).c_str(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
-    WritePrivateProfileStringW(L"General", L"VRRWhitelist", NormalizeWhitelistRaw(g_vrrWhitelistRaw).c_str(), iniPath.c_str());
+    IniWriteString(L"General", L"VRRWhitelist", NormalizeWhitelistRaw(g_vrrWhitelistRaw).c_str(), iniPath.c_str());
 
     // Save hotkey settings
     WritePrivateProfileBool(L"General", L"HotkeyGammaEnabled", g_hotkeyGammaEnabled.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"HotkeyHdrEnabled", g_hotkeyHdrEnabled.load(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"HotkeyAnalysisEnabled", g_hotkeyAnalysisEnabled.load(), iniPath.c_str());
     wchar_t keyBuf[2] = { (wchar_t)g_hotkeyGammaKey, 0 };
-    WritePrivateProfileStringW(L"General", L"HotkeyGammaKey", keyBuf, iniPath.c_str());
+    IniWriteString(L"General", L"HotkeyGammaKey", keyBuf, iniPath.c_str());
     keyBuf[0] = (wchar_t)g_hotkeyHdrKey;
-    WritePrivateProfileStringW(L"General", L"HotkeyHdrKey", keyBuf, iniPath.c_str());
+    IniWriteString(L"General", L"HotkeyHdrKey", keyBuf, iniPath.c_str());
     keyBuf[0] = (wchar_t)g_hotkeyAnalysisKey;
-    WritePrivateProfileStringW(L"General", L"HotkeyAnalysisKey", keyBuf, iniPath.c_str());
+    IniWriteString(L"General", L"HotkeyAnalysisKey", keyBuf, iniPath.c_str());
 
     // Save startup settings
     WritePrivateProfileBool(L"General", L"StartMinimized", g_startMinimized.load(), iniPath.c_str());
 
     // Interface
-    WritePrivateProfileStringW(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
-    WritePrivateProfileStringW(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
-    WritePrivateProfileStringW(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
+    IniWriteString(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
+    IniWriteString(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
+    IniWriteString(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
     static const wchar_t* const kThemeKeys[] = { L"dark", L"gray", L"light" };
-    WritePrivateProfileStringW(L"UI", L"Theme", kThemeKeys[g_uiTheme >= 0 && g_uiTheme <= 2 ? g_uiTheme : 0], iniPath.c_str());
-
-    WritePrivateProfileStringW(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
+    IniWriteString(L"UI", L"Theme", kThemeKeys[g_uiTheme >= 0 && g_uiTheme <= 2 ? g_uiTheme : 0], iniPath.c_str());
 
     // Save per-display settings: live displays and parked (currently disconnected) ones,
     // each under its identity-keyed [Display<slot>] section. Written from a snapshot taken
@@ -1034,6 +1215,11 @@ void SaveSettings() {
             }
         }
     }
+    // The version last, and only when every write above landed: it tells the next load how the values were written
+    // (kIniVersionExactFloats), so a save cut short or refused part-way must not claim the new format for sections
+    // still holding the old one. The next complete save writes it.
+    if (!batch.AnyWriteFailed())
+        IniWriteString(L"General", L"IniVersion", std::to_wstring(kIniVersion).c_str(), iniPath.c_str());
     ui::Invalidate();   // every settings change ends in a save: let the interface redraw (any thread)
 }
 

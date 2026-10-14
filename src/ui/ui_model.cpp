@@ -117,13 +117,16 @@ std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode li
     const std::wstring& lut = hdr ? ms.hdrPath : ms.sdrPath;
     // Faults only for the mode the display is in (the other side shows what would run there).
     const bool liveSide = live != Mode::Unknown && PipelineIsHdr(live) == hdr;
-    const bool liveLayersDown = !rt.running || (rt.hookMode && !rt.hookActive);
+    // Tone mapping and the 3D LUT are drawn by the hook in hook mode (it stays resident while a dead overlay
+    // thread waits for its auto-restart), else by the overlay; FALD runs in the overlay engine.
+    const bool cubeEngineDown = rt.hookMode ? !rt.hookActive : !rt.running;
+    const bool faldEngineDown = !rt.running || (rt.hookMode && !rt.hookActive);
 
     // A live layer (tone map, 3D LUT, FALD): nothing set / switched off or suspended / runs / should run.
-    auto liveLayer = [&](bool content, bool on, bool cannotRun) {
+    auto liveLayer = [&](bool content, bool on, bool cannotRun, bool engineDown) {
         if (!content) return Light::None;
         if (!on || rt.suspended) return Light::Off;
-        if (liveSide && (liveLayersDown || cannotRun)) return Light::Fault;
+        if (liveSide && (engineDown || cannotRun)) return Light::Fault;
         return Light::Configured;
     };
     // An MHC stage: nothing to do or no MHC / bypassed / in the installed profile / enabled but not installed.
@@ -142,14 +145,15 @@ std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode li
     // Tone mapping runs before the 3D LUT in the hook (and overlay) shader, HDR only. Its switch is all it
     // has: off is nothing set.
     // A live edit holds it off (switched off, a ring) while it runs.
-    if (hdr) path.push_back(stage(StageId::ToneMap, liveLayer(cc.tonemap.enabled, !rt.editHeld, false)));
+    if (hdr) path.push_back(stage(StageId::ToneMap, liveLayer(cc.tonemap.enabled, !rt.editHeld, false, cubeEngineDown)));
 
-    path.push_back(stage(StageId::Lut3D, liveLayer(!lut.empty(), !(hdr ? ms.hdrLutBypass : ms.sdrLutBypass), false)));
+    path.push_back(stage(StageId::Lut3D,
+                         liveLayer(!lut.empty(), !(hdr ? ms.hdrLutBypass : ms.sdrLutBypass), false, cubeEngineDown)));
 
     // FALD needs a panel file to exist at all; it runs only on FP16 back buffers (HDR or ACM SDR).
     if (!cc.fald.paramsPath.empty()) {
         const bool fp16 = live == Mode::HDR || live == Mode::AcmSdr || live == Mode::Unknown;
-        path.push_back(stage(StageId::Fald, liveLayer(true, cc.fald.enabled && !rt.editHeld, !fp16)));
+        path.push_back(stage(StageId::Fald, liveLayer(true, cc.fald.enabled && !rt.editHeld, !fp16, faldEngineDown)));
     }
 
     // The overlay shader tweak (pipe / INI only, no classic control) — shown so a live correction is

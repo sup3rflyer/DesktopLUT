@@ -506,10 +506,12 @@ Result MhcSetCorrectionGsPeak(int mon, float nits) {
 
 Result MhcSetDesktopGamma(int mon, bool on) {
     if (!ValidMonitor(mon)) return Done(false);
-    bool mhcEnabled;
+    bool mhcEnabled, wasOn;
+    const bool userModeBefore = g_userDesktopGammaMode.load(), modeBefore = g_desktopGammaMode.load();
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         MHCSettings& mhc = g_gui.monitorSettings[mon].hdrMHC;
+        wasOn = mhc.desktopGammaEnabled;
         mhc.desktopGammaEnabled = on;
         mhcEnabled = mhc.enabled;
     }
@@ -527,11 +529,23 @@ Result MhcSetDesktopGamma(int mon, bool on) {
     const bool dgActive = on && mhcEnabled;
     g_userDesktopGammaMode.store(dgActive);
     if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(dgActive);
-    // Swap to the cached permutation with / without DG (instant, no regenerate).
+    // Swap to the cached permutation with / without DG (instant, no regenerate). If the variant cannot be built or
+    // associated the previous profile stays, and so does the setting: it must never claim a gamma the screen lacks.
     if (haveProfile) {
         if (on) perm |= MHCSettings::PERM_DG;
         else perm &= (uint8_t)~MHCSettings::PERM_DG;
-        SwapMhcToPermutation(mon, true, perm);
+        if (!SwapMhcToPermutation(mon, true, perm)) {
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                if (ValidMonitor(mon)) g_gui.monitorSettings[mon].hdrMHC.desktopGammaEnabled = wasOn;
+            }
+            g_userDesktopGammaMode.store(userModeBefore);
+            if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(modeBefore);
+            SaveSettings();   // an identity profile generated above to carry the gamma stays installed
+            Finish(mon);
+            return Told(mon, L"mhc", Fail(notify::Sev::Warning,
+                                          L"Desktop gamma switch failed: the profile variant could not be swapped in"));
+        }
     }
     SaveSettings();
     ReconcileLiveLayers("desktop gamma");   // desktop gamma is a live-layer need (LiveLayersNeeded)
@@ -637,8 +651,11 @@ void SetConsoleLog(bool on) {
             FILE* fp;
             freopen_s(&fp, "CONOUT$", "w", stdout);
             freopen_s(&fp, "CONOUT$", "w", stderr);
+            SetConsoleOutputCP(CP_UTF8);   // the narrow log lines are UTF-8 ("→" read as CP-1252 is "â†'")
             std::cout.clear();
             std::cerr.clear();
+            std::wcout.clear();
+            std::wcerr.clear();
             std::cout << "Console enabled" << std::endl;
         }
     } else if (GetConsoleWindow() != nullptr) {

@@ -50,6 +50,7 @@ struct ViewState {
     int whitelist = 0;             // the whitelist editor: 0 closed, 1 desktop gamma, 2 passthrough (VRR)
     bool whitelistOpenRequested = false;
     char whitelistAdd[128] = {};   // the add field (UTF-8)
+    bool whitelistRefocus = false; // an app was added with Enter: the field keeps the focus for the next one
 };
 
 // An editor holds the page (its display, its mode, the pipeline) until DONE / CANCEL.

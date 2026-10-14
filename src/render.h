@@ -6,6 +6,7 @@
 #include "types.h"
 #include "whitelist.h"
 #include "framepacer.h"
+#include "display_power.h"
 
 // Create swapchain for a monitor
 bool CreateSwapChain(MonitorContext* ctx);
@@ -60,7 +61,7 @@ extern const int MAX_RECOVERY_RETRIES;
 extern std::chrono::steady_clock::time_point s_motionBarOrigin;
 extern bool s_motionBarOriginSet;
 extern int s_watchdogRecoveryAttempts;
-extern std::chrono::steady_clock::time_point g_powerNotifyRegisteredTime;
+extern DisplayPowerTracker g_overlayDisplayPower;   // the overlay window's GUID_CONSOLE_DISPLAY_STATE state
 extern const GUID GUID_CONSOLE_DISPLAY_STATE_LOCAL;
 
 // Compositor Clock API availability (for status display)

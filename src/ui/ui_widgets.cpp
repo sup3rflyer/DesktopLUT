@@ -648,10 +648,14 @@ bool NumberInput(const char* id, float* v, const char* fmt, float widthDip, floa
     return false;
 }
 
-bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip) {
+bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip, bool* entered) {
     const ImGuiID key = ImGui::GetID(id);
     const FieldText ft = BeginFieldText(key, widthDip, Font::Mono, 12.0f);
     const bool changed = ImGui::InputTextWithHint(id, hint, buf, size);
+    // Enter validates a one-line field and leaves it in the same frame (ImGui clears the active id there).
+    if (entered)
+        *entered = ImGui::IsItemDeactivated() &&
+                   (ImGui::IsKeyPressed(ImGuiKey_Enter, false) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false));
     EndFieldText(ft);
     return changed;
 }

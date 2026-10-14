@@ -57,7 +57,27 @@ protected:
         Feed(s, n);
         return n;
     }
-    int sync() override { return m_forward ? m_forward->pubsync() : 0; }
+    // The forward's result is not ours: in a GUI process without a console the standard handles are invalid, so
+    // flushing the original stdout buffer fails; passing that -1 on made every std::endl set badbit on the stream,
+    // and the stream then dropped every later line (the log kept the first line of each stream and nothing more).
+    int sync() override {
+        if (m_forward) m_forward->pubsync();
+        return 0;
+    }
+
+#if defined(_MSC_VER)
+    // The stream's sentry locks its buffer for the whole insertion. MSVC's std::cout / std::wcout buffer is a filebuf
+    // that writes straight into the stdout FILE's buffer and makes that lock the FILE's own (_lock_file); this buffer
+    // in its place would otherwise lock nothing, and two threads writing at once (render + GUI + pipe) could race on
+    // the FILE's buffer pointers — a heap overrun with no console, where stdout is fully buffered. Lock what the
+    // forward locks, as the stream did before the tee was installed.
+    void _Lock() override {
+        if (m_forward) m_forward->_Lock();
+    }
+    void _Unlock() override {
+        if (m_forward) m_forward->_Unlock();
+    }
+#endif
 
 private:
     void Feed(const Ch* s, std::streamsize n) {

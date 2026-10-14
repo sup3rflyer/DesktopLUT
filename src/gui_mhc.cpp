@@ -16,7 +16,9 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
+#include "actions/notify.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -567,13 +569,11 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
 
     // Snapshot settings for generation (release lock during I/O)
     MHCSettings mhcCopy;
-    std::wstring currentActiveName;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         const auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                                  : g_gui.monitorSettings[monitorIndex].sdrMHC;
         mhcCopy = mhc;
-        currentActiveName = mhc.profileName;
     }
 
     // Build params for the specific permutation
@@ -599,16 +599,12 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
 
     if (!WriteMHC2Profile(profileData, tempPath)) return false;
 
-    // Install to system color dir (disassociated — not the active profile)
-    if (!InstallMHC2Profile(tempPath, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+    // Into the system color dir only, associated with nothing: the swap associates it. (It used to be installed AS
+    // the default, removed, and the active profile re-associated — three visible profile switches on the display
+    // before the swap itself, the first time a variant was needed.)
+    if (!InstallMHC2ProfileFile(tempPath)) {
         DeleteFileW(tempPath.c_str());
         return false;
-    }
-    // Immediately disassociate — we only want it in the color dir, ready for swap
-    RemoveMHC2Profile(profileName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-    // Re-associate the currently active profile (Install may have switched it)
-    if (!currentActiveName.empty()) {
-        ReassociateMHC2Profile(currentActiveName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
     }
     DeleteFileW(tempPath.c_str());
 
@@ -665,7 +661,14 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm) {
 
     // Swap ICC profiles via Windows Color Management
     RemoveMHC2Profile(oldName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
-    ReassociateMHC2Profile(newName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+    if (!ReassociateMHC2Profile(newName, displayInfo.adapterId, displayInfo.sourceId, isHDR)) {
+        // The variant is only a file in the color directory until this association (EnsureMhcPermProfile no longer
+        // associates it on the way): if it fails, put the profile that was on back, and the settings keep saying so.
+        if (!oldName.empty()) ReassociateMHC2Profile(oldName, displayInfo.adapterId, displayInfo.sourceId, isHDR);
+        std::cerr << "MHC perm: swap to P" << (int)newPerm << " for monitor " << monitorIndex
+                  << " failed to associate; the previous profile stays" << std::endl;
+        return false;
+    }
 
     // Update state
     {
@@ -831,7 +834,44 @@ void DisengageIdentityMhcProfile(int monitorIndex, bool isHDR) {
     DisengageIdentityForDisplay(monitorIndex, isHDR, di);
 }
 
-void SwapDgForAllMonitors(bool dgEnabled) {
+// A desktop gamma switch whose profile swap did not land (a variant that could not be built or associated, or a live
+// edit holding the display): RetryDgSwap replays it toward the mode in force then, so the screen does not stay on the
+// other gamma for the session (the swap keeps the previous profile and settings on a failure).
+static std::atomic<bool> g_dgSwapRetry{ false };
+static std::atomic<int> g_dgSwapRetries{ 0 };
+constexpr int kMaxDgSwapRetries = 8;   // verify ticks (~2 min); any later switch arms it afresh
+
+static bool SwapDgAll(bool dgEnabled);
+
+bool SwapDgForAllMonitors(bool dgEnabled) {
+    const bool ok = SwapDgAll(dgEnabled);
+    g_dgSwapRetries.store(0);
+    g_dgSwapRetry.store(!ok);
+    if (!ok) std::cerr << "MHC perm: desktop gamma " << (dgEnabled ? "on" : "off") << " did not reach every display; will retry" << std::endl;
+    return ok;
+}
+
+void RetryDgSwap() {
+    if (!g_dgSwapRetry.load()) return;
+    // A calibration or live edit owns the profiles until it ends (the edit's re-bake installs its own variant), and
+    // an open MHC dialog holds a reference into the settings: wait.
+    if (IsCalibrationOrLiveEditActive() || g_mhcEditDialogOpen.load()) return;
+    const bool dg = g_desktopGammaMode.load();
+    if (SwapDgAll(dg)) {
+        g_dgSwapRetry.store(false);
+        std::cout << "MHC perm: desktop gamma " << (dg ? "on" : "off") << " retry landed" << std::endl;
+        return;
+    }
+    if (g_dgSwapRetries.fetch_add(1) + 1 >= kMaxDgSwapRetries) {
+        g_dgSwapRetry.store(false);
+        notify::Post(notify::Sev::Warning, -1, L"mhc", dg ? L"Desktop gamma could not be switched on"
+                                                          : L"Desktop gamma could not be switched off",
+                     L"The MHC profile variant could not be swapped in");
+    }
+}
+
+static bool SwapDgAll(bool dgEnabled) {
+    bool ok = true;
     // First pass: auto-generate identity MHC profiles for monitors that have
     // DG enabled in settings but no MHC profile yet (DG needs MHC to carry it)
     if (dgEnabled) {
@@ -872,10 +912,9 @@ void SwapDgForAllMonitors(bool dgEnabled) {
             if (newPerm != mhc.activePerm) needSwap = true;
         }
 
-        if (needSwap) {
-            SwapMhcToPermutation(i, true, newPerm);
-        }
+        if (needSwap && !SwapMhcToPermutation(i, true, newPerm)) ok = false;
     }
+    return ok;
 }
 
 // Generate, write, and install MHC2 ICC profile from current MHCSettings

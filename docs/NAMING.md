@@ -18,7 +18,7 @@ Convention used below:
 
 ---
 
-## 1. `peakNits` — four unrelated concepts share this stem
+## 1. `peakNits` — five unrelated concepts share this stem
 
 The bare member name `peakNits` recurs in unrelated structs with **different semantics**.
 The receiving struct disambiguates at a use-site (`gs.peakNits` vs `result.peakNits`), so
@@ -36,6 +36,7 @@ always check *which struct* you hold before reasoning about the value.
 | `TonemapSettings::sourcePeakNits` / `targetPeakNits` ([types.h:683-684](../src/types.h)) | Settings-side mirror of the tonemap pair | config input |
 | `AnalysisResult::peakNits` ([types.h:309](../src/types.h)) | **MEASURED** peak read off the screen by the analysis overlay | observation |
 | `MonitorContext::detectedPeakNits` ([types.h:549](../src/types.h)) | Last **DETECTED** peak (cached for the analysis overlay) | observation |
+| `ui::DisplayRow::reportedPeakNits` ([ui_snapshot.h:22](../src/ui/ui_snapshot.h)) | The peak **Windows reports to apps** right now (DXGI `MaxLuminance`, fresh factory) while in HDR; `0` = unknown / not HDR. With an HDR MHC2 profile it follows the profile's luminance tag, not `MaxTmlSettings::peakNits` | observation (of the OS, not the screen) |
 | `DwmHookMonitorConfig::sourcePeakNits` / `targetPeakNits` ([dwm_hook_config.h:29-30](../shared/dwm_hook_config.h)) | Tonemap pair pushed to the injected DLL | **WIRE CONTRACT** (struct ABI; offset-checked in `test_displayconfig.cpp`) |
 
 **The trap:** "peak" reads either as *what we tell the pipeline the peak is* (config input)

@@ -190,6 +190,7 @@ ui::Snapshot FakeSnapshot() {
     a.dlcRecord[1].verifiedDaysAgo = 11;
     a.dlcRecord[1].correctionMade = "2026-08-30";
     a.dlcRecord[1].correctionDaysAgo = 44;
+    a.reportedPeakNits = 10000;   // Windows reports the override
     s.live.push_back(a);
 
     ui::DisplayRow b;
@@ -243,7 +244,9 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     notify::Post(notify::Sev::Info, 0, L"hook", L"Injected into dwm.exe");
 
     const ui::Snapshot base = FakeSnapshot();
-    // variant: 0 as made, 1 the 3D LUT and primaries stages of the HDR display switched off, 2 suspended
+    // variant: 0 as made, 1 the 3D LUT and primaries stages of the HDR display switched off, 2 suspended, 3/4 grayscale
+    // editor HDR/SDR, 5 whitelist editor, 6/7 MHC profile editor HDR/SDR, 8 the hook not injected (the engine should
+    // run and does not) with Windows reporting the profile's peak instead of the override
     struct Shot { const char* name; ui::Page page; ui::StageId stage; int display; bool confirm; float mx, my; float w = 1180, h = 760; int variant = 0; };
     const Shot shots[] = {
         { "tonemap", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1 },
@@ -264,6 +267,17 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "mhcedit", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 6 },
         { "mhceditsdr", ui::Page::Pipeline, ui::StageId::Primaries, 1, false, -1, -1, 1180, 760, 7 },
         { "mhceditnarrow", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 920, 520, 6 },
+        { "notrunning", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 8 },
+    };
+    // With the cube off the screen the records read against what runs (TakeSnapshot): the cube is off, and a report
+    // that verified the cube is the latest, not current.
+    auto cubeOffRecord = [](ui::DisplayRow& r, int k) {
+        dlc::ModeRecord& rec = r.dlcRecord[k];
+        if (rec.current >= 0) rec.latest = rec.current;
+        rec.current = -1;
+        rec.verifiedDaysAgo = -1;
+        rec.reminderDue = rec.correctionStale;
+        rec.cube = dlc::LayerState::Off;
     };
     const float scales[] = { 1.0f, 1.5f };
     int written = 0;
@@ -277,6 +291,13 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     snap.live[0].settings.hdrMHC.bypassPrimaries = true;
                 } else if (shot.variant == 2) {
                     snap.suspended = true;
+                    cubeOffRecord(snap.live[0], 1);
+                    cubeOffRecord(snap.live[1], 0);
+                } else if (shot.variant == 8) {
+                    snap.hookActive = false;
+                    cubeOffRecord(snap.live[0], 1);
+                    cubeOffRecord(snap.live[1], 0);
+                    snap.live[0].reportedPeakNits = 1612;
                 }
                 const UINT w = (UINT)(shot.w * scale), h = (UINT)(shot.h * scale);
                 gpu.Resize(w, h);
@@ -392,4 +413,55 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     notify::ResetForTest();
     gpu.Destroy();
     ui::ApplyTheme(ui::ThemeId::Dark);
+}
+
+// Real ImGui frames (offscreen device): typing into a TextField and pressing Enter reports `entered` once. The
+// whitelist editor asked IsItemDeactivated() after the field, which is the field box's spacer, so Enter never added
+// an app (2026-10-14 live test).
+TEST_CASE("ui: Enter in a text field is reported once, by the field") {
+    Offscreen gpu;
+    REQUIRE(gpu.Create());
+    gpu.Resize(400, 200);
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    ui::LoadFonts();
+    ui::ApplyStyle(1.0f);
+    REQUIRE(ImGui_ImplDX11_Init(gpu.device, gpu.context));
+    char buf[64] = {};
+    int enteredFrames = 0, enteredAt = -1;
+    std::string textWhenEntered;
+    for (int frame = 0; frame < 12; frame++) {
+        io.DisplaySize = ImVec2(400, 200);
+        io.DeltaTime = 1.0f / 60.0f;
+        if (frame == 2) io.AddInputCharactersUTF8("notepad");
+        if (frame == 5) io.AddKeyEvent(ImGuiKey_Enter, true);
+        if (frame == 6) io.AddKeyEvent(ImGuiKey_Enter, false);
+        ImGui_ImplDX11_NewFrame();
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2(400, 200));
+        ImGui::Begin("##t", nullptr, ImGuiWindowFlags_NoDecoration);
+        if (frame == 0) ImGui::SetKeyboardFocusHere();
+        bool entered = false;
+        ui::TextField("##field", "app.exe", buf, sizeof buf, 220, &entered);
+        // The trap the whitelist fell into: after TextField the last item is the field box, never deactivated.
+        if (entered) CHECK_FALSE(ImGui::IsItemDeactivated());
+        ImGui::End();
+        ImGui::Render();
+        gpu.context->OMSetRenderTargets(1, &gpu.rtv, nullptr);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());   // the renderer creates the font textures
+        if (entered) {
+            enteredFrames++;
+            enteredAt = frame;
+            textWhenEntered = buf;
+        }
+    }
+    ImGui_ImplDX11_Shutdown();
+    ImGui::DestroyContext();
+    gpu.Destroy();
+    CHECK(enteredFrames == 1);
+    CHECK(enteredAt == 5);
+    CHECK(textWhenEntered == "notepad");
 }

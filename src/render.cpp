@@ -1367,23 +1367,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == PBT_POWERSETTINGCHANGE) {
             POWERBROADCAST_SETTING* pbs = reinterpret_cast<POWERBROADCAST_SETTING*>(lParam);
             if (pbs && pbs->PowerSetting == GUID_CONSOLE_DISPLAY_STATE_LOCAL) {
-                DWORD displayState = *reinterpret_cast<DWORD*>(pbs->Data);
-                // 0 = off, 1 = on, 2 = dimmed
-                if (displayState == 1) {
-                    // Ignore spurious "display on" notification that fires immediately
-                    // after registering (display is already on at startup)
-                    auto elapsed = std::chrono::steady_clock::now() - g_powerNotifyRegisteredTime;
-                    if (elapsed < std::chrono::seconds(3)) {
-                        std::cout << "Ignoring initial display power notification" << std::endl;
-                        g_displayOff.store(false);
-                        return TRUE;
-                    }
+                // 0 = off, 1 = on, 2 = dimmed. The first notification after the registration is the state then
+                // (on, at every start): not a wake — nor is a repeat or the way back from dimmed (display_power.h).
+                // A time window after the registration used to stand in for that, and a late first notification
+                // (a busy start) still read as a wake.
+                const DWORD displayState = *reinterpret_cast<DWORD*>(pbs->Data);
+                const DisplayPowerEvent ev = g_overlayDisplayPower.OnState(displayState);
+                if (ev == DisplayPowerEvent::None) {
+                    if (displayState == 1) g_displayOff.store(false);
+                } else if (ev == DisplayPowerEvent::Wake) {
                     std::cout << "Display waking from sleep, forcing reinit..." << std::endl;
                     g_displayOff.store(false);
                     g_forceReinit.store(true);
                     g_forceMhcReapply.store(true);
                     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-                } else if (displayState == 0) {
+                } else if (ev == DisplayPowerEvent::Off) {
                     std::cout << "Display entering sleep mode" << std::endl;
                     g_displayOff.store(true);
                     // Reset watchdog to prevent timeout during display sleep

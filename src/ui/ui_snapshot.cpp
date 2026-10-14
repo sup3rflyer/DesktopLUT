@@ -7,6 +7,7 @@
 #include "actions/reconcile.h"
 #include "dlc/dlc_scan.h"
 #include "desktoplut_ipc_server.h"
+#include "processing.h"   // IsProcessingTransitionActive
 #include <dxgi1_6.h>
 #include <mutex>
 
@@ -18,6 +19,7 @@ struct ModeEntry {
     HMONITOR hmon = nullptr;
     Mode mode = Mode::Unknown;
     std::wstring name;
+    float maxLuminance = 0;   // DXGI_OUTPUT_DESC1::MaxLuminance (what apps are told)
 };
 std::vector<ModeEntry> g_modeCache;   // GUI thread only
 
@@ -37,6 +39,34 @@ const ModeEntry* FindMode(HMONITOR h) {
 
 }  // namespace
 
+bool RefreshReportedPeaks() {
+    if (g_modeCache.empty()) return false;
+    IDXGIFactory1* factory = nullptr;   // fresh: a cached factory keeps the luminance it saw first
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return false;
+    bool changed = false;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT a = 0; factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+        IDXGIOutput* output = nullptr;
+        for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
+            IDXGIOutput6* output6 = nullptr;
+            if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), reinterpret_cast<void**>(&output6)))) {
+                DXGI_OUTPUT_DESC1 desc = {};
+                if (SUCCEEDED(output6->GetDesc1(&desc)))
+                    for (ModeEntry& e : g_modeCache)
+                        if (e.hmon == desc.Monitor && e.maxLuminance != desc.MaxLuminance) {
+                            e.maxLuminance = desc.MaxLuminance;
+                            changed = true;
+                        }
+                output6->Release();
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return changed;
+}
+
 void RefreshModeCache() {
     std::vector<HMONITOR> mons;
     {
@@ -53,6 +83,7 @@ void RefreshModeCache() {
         if (haveDi) e.name = di.name;
         DXGI_OUTPUT_DESC1 desc = {};
         if (QueryFreshOutputDesc(h, desc)) {
+            e.maxLuminance = desc.MaxLuminance;
             // Same verdict as windows.query_monitors: DXGI sees HDR / FP16 SDR but not ACM, which comes
             // from DisplayConfig (displayconfig.h DisplayColorMode).
             const bool hdrActive = desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
@@ -90,6 +121,7 @@ void TakeSnapshot(Snapshot& out) {
     for (DisplayRow& r : out.live) {
         const ModeEntry* m = FindMode(r.hmon);
         r.mode = m ? m->mode : Mode::Unknown;
+        r.reportedPeakNits = m && r.mode == Mode::HDR ? m->maxLuminance : 0.0f;
         r.name = !r.settings.label.empty() ? r.settings.label : DisplayLabel(r.settings.identity, m ? m->name : std::wstring());
         MONITORINFO mi = { sizeof(mi) };
         if (r.hmon && GetMonitorInfo(r.hmon, &mi)) {
@@ -112,6 +144,17 @@ void TakeSnapshot(Snapshot& out) {
         for (const std::string& x : ids) if (_stricmp(x.c_str(), id.c_str()) == 0) n++;
         return n > 0 ? n : 1;
     };
+    // The engine state first: the DLC records read against what reaches the screen. A Start / Stop in progress
+    // (a cube change or a pipe call restarts the engine, pumping frames while it joins) keeps the last state: the
+    // lights and MEASURED would otherwise flash a fault for a restart nobody needs to see.
+    if (!IsProcessingTransitionActive()) {
+        out.running = g_gui.isRunning.load();
+        out.hookActive = g_dwmHookMode.load() && IsDwmHookActive();
+    }
+    out.hookMode = g_dwmHookMode.load();
+    out.hookActive = out.hookActive && out.hookMode;
+    out.suspended = act::LiveLayersSuspended();
+    out.calibrating = IsCalibrationOrLiveEditActive();   // locks of its own: outside the settings lock above
     auto attach = [&](DisplayRow& r) {
         const MonitorSettings& ms = r.settings;
         dlc::LiveDisplay& live = r.dlcLive;
@@ -127,21 +170,32 @@ void TakeSnapshot(Snapshot& out) {
         live.lut[0] = LiveLutPath(ms, false);
         live.lut[1] = LiveLutPath(ms, true);
         r.dlcMatch = out.dlc->folder.empty() ? dlc::DisplayMatch() : dlc::MatchDisplay(*out.dlc, live);
+        // Suspended live layers, or the engine down on the mode the display is in, leave a connected display's cube
+        // off the screen (MHC stays): the panel's record is read against what runs, as for a bypassed cube
+        // (CubeOffScreen). The display is still matched by what it is configured with, and the sidebar's reminder is
+        // the configured record's — how old the calibration is does not change with a suspend or a restart.
+        dlc::LiveDisplay running = live;
+        bool cubeOff[2] = {};
+        for (int k = 0; k < 2; k++) {
+            cubeOff[k] = !running.lut[k].empty() && CubeOffScreen(out, r, k == 1);
+            if (cubeOff[k]) running.lut[k].clear();
+        }
         r.reminderDue = false;
         for (int k = 0; k < 2; k++) {
-            r.dlcRecord[k] = r.dlcMatch.name.empty() ? dlc::ModeRecord()
-                                                     : dlc::RecordFor(*out.dlc, r.dlcMatch.name, k, live, g_recalReminderDays);
+            if (r.dlcMatch.name.empty()) {
+                r.dlcRecord[k] = dlc::ModeRecord();
+                continue;
+            }
+            r.dlcRecord[k] = dlc::RecordFor(*out.dlc, r.dlcMatch.name, k, running, g_recalReminderDays);
         }
-        if (!r.dlcMatch.name.empty()) r.reminderDue = r.dlcRecord[PipelineIsHdr(r.mode) ? 1 : 0].reminderDue;
+        if (!r.dlcMatch.name.empty()) {
+            const int k = PipelineIsHdr(r.mode) ? 1 : 0;
+            r.reminderDue = cubeOff[k] ? dlc::RecordFor(*out.dlc, r.dlcMatch.name, k, live, g_recalReminderDays).reminderDue
+                                       : r.dlcRecord[k].reminderDue;
+        }
     };
     for (DisplayRow& r : out.live) attach(r);
     for (DisplayRow& r : out.parked) attach(r);
-
-    out.running = g_gui.isRunning.load();
-    out.suspended = act::LiveLayersSuspended();
-    out.calibrating = IsCalibrationOrLiveEditActive();   // locks of its own: outside the settings lock above
-    out.hookMode = g_dwmHookMode.load();
-    out.hookActive = out.hookMode && IsDwmHookActive();
 
     out.lastStatus.clear();
     out.lastStatusSev = notify::Sev::Info;

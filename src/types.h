@@ -84,6 +84,11 @@ struct MovableAtomic {
 #define WM_FALD_RECOMPOSE        (WM_USER + 107)  // hook FALD needs one full-screen recomposition (any thread -> GUI thread)
 #define WM_MHC_REGENERATE_MISSING (WM_USER + 108) // the active MHC profile's .icm is gone: regenerate it (verify -> GUI thread)
 #define WM_STATUS_TEXT           (WM_USER + 109)  // SetStatus from a non-GUI thread: show the latest status text (any thread -> GUI thread)
+// The MHC hardware LUT may be stale (adapter change, a start that superseded a pending reapply, a restart after the
+// overlay was lost): run an MHC transition burst — verify, sweep, Calibration Loader kicks, no flicker (any thread
+// -> GUI thread). wParam: MhcReloadReason.
+#define WM_MHC_RELOAD_HARDWARE   (WM_USER + 110)
+enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss = 1, kMhcReloadAdapter = 2 };
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001

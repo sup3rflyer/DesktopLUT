@@ -183,7 +183,12 @@ bool SwapMhcToPermutation(int monitorIndex, bool isHDR, uint8_t newPerm);
 
 // Toggle the DG bit in the active permutation for all HDR monitors.
 // Called by hotkey handlers and whitelist when desktop gamma changes at runtime.
-void SwapDgForAllMonitors(bool dgEnabled);
+// False when a display's swap did not land: a retry toward g_desktopGammaMode is armed (RetryDgSwap).
+bool SwapDgForAllMonitors(bool dgEnabled);
+
+// GUI thread, the periodic MHC verify tick: replays a desktop gamma switch that did not land, toward the mode in
+// force now, outside calibrations / live edits / an open MHC dialog; gives up with a warning after a few tries.
+void RetryDgSwap();
 
 // ============================================================================
 // Live edit preview scanout (mhc_preview.h)

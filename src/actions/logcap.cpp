@@ -9,8 +9,10 @@ namespace logcap {
 
 namespace {
 
-std::mutex g_mutex;
-std::deque<std::shared_ptr<const Line>> g_ring;
+// Never destroyed, like the stream buffers that feed them: a thread still writing during static destruction (a
+// detached processing thread unblocking at exit) must find them alive.
+std::mutex& g_mutex = *new std::mutex();
+std::deque<std::shared_ptr<const Line>>& g_ring = *new std::deque<std::shared_ptr<const Line>>();
 uint64_t g_seq = 0;
 std::atomic<void (*)()> g_listener{ nullptr };
 

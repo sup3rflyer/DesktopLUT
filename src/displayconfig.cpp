@@ -49,6 +49,16 @@ struct DISPLAYCONFIG_SET_ADVANCED_COLOR_PARAM {
 
 static bool GetDisplayInfoAtPoint(POINT pt, DisplayInfo& outInfo);  // fwd decl
 
+// A display's name for log lines: the friendly name, else the hardware id from the device path (a CRU override
+// can leave the EDID name empty: "Set MaxTML ... for " named nothing), else the target id.
+static std::wstring LogName(const DisplayInfo& d) {
+    if (!d.name.empty()) return d.name;
+    const size_t a = d.devicePath.find(L'#');
+    const size_t b = a == std::wstring::npos ? a : d.devicePath.find(L'#', a + 1);
+    if (b != std::wstring::npos && b > a + 1) return d.devicePath.substr(a + 1, b - a - 1);
+    return L"target " + std::to_wstring(d.targetId);
+}
+
 // Query the active display paths/modes with a retry loop. The topology can change
 // between GetDisplayConfigBufferSizes and QueryDisplayConfig (the latter then returns
 // ERROR_INSUFFICIENT_BUFFER); MSDN prescribes re-querying sizes and retrying. This
@@ -168,7 +178,7 @@ bool SetDisplayMaxTml(const DisplayInfo& display, float nits) {
         return false;
     }
 
-    std::wcout << L"Set MaxTML to " << nits << L" nits for " << display.name << std::endl;
+    std::wcout << L"Set MaxTML to " << nits << L" nits for " << LogName(display) << std::endl;
     return true;
 }
 
@@ -501,7 +511,7 @@ bool SetDisplayHdrState(const DisplayInfo& display, bool enable) {
         return false;
     }
 
-    std::wcout << L"HDR " << (enable ? L"enabled" : L"disabled") << L" on " << display.name << std::endl;
+    std::wcout << L"HDR " << (enable ? L"enabled" : L"disabled") << L" on " << LogName(display) << std::endl;
     return true;
 }
 

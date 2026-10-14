@@ -64,7 +64,8 @@ int s_watchdogRecoveryAttempts = 0;
 
 // Display power notification handle
 static HPOWERNOTIFY g_displayPowerNotify = nullptr;
-std::chrono::steady_clock::time_point g_powerNotifyRegisteredTime;
+// Reset at each registration: the first notification after it is the state at registration (see display_power.h)
+DisplayPowerTracker g_overlayDisplayPower;
 
 // GUID_CONSOLE_DISPLAY_STATE - notifies when display goes on/off/dimmed
 // {6FE69556-704A-47A0-8F24-C28D936FDA47}
@@ -74,11 +75,11 @@ const GUID GUID_CONSOLE_DISPLAY_STATE_LOCAL =
 void RegisterDisplayPowerNotification(HWND hwnd) {
     if (g_displayPowerNotify) return;  // Already registered
 
+    g_overlayDisplayPower = DisplayPowerTracker();   // before: the registration may deliver the current state at once
     g_displayPowerNotify = RegisterPowerSettingNotification(
         hwnd, &GUID_CONSOLE_DISPLAY_STATE_LOCAL, DEVICE_NOTIFY_WINDOW_HANDLE);
 
     if (g_displayPowerNotify) {
-        g_powerNotifyRegisteredTime = std::chrono::steady_clock::now();
         std::cout << "Registered for display power state notifications" << std::endl;
     }
 }

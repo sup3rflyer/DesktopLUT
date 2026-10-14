@@ -360,6 +360,10 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
             DestroyWindow(ctx.hwnd);
             continue;
         }
+        // The mode the display is in now: a later reinit compares against it to detect an HDR / SDR switch. Left at
+        // its default (SDR), the first duplication recovery of an HDR session — a forced reinit, an ACCESS_LOST
+        // from a UAC prompt or a fullscreen app — read as a mode switch and removed + re-added the HDR profile.
+        ctx.wasHDREnabled = ctx.isHDREnabled;
 
         // Set passthrough mode if no applicable LUT for current mode
         // Overlay still runs for live color corrections, desktop gamma, MHC profiles, etc.
@@ -408,23 +412,11 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
         return;
     }
 
-    {
-        // Held across the block: the cleanup keys "orphan" on a settings snapshot, so a GUI-thread re-bake
-        // (desktop gamma following the SDR white level) installing a new profile mid-scan would have its
-        // fresh file deleted as an orphan. The GUI side try-locks and retries.
-        std::lock_guard<std::mutex> maintenanceLock(g_mhcMaintenanceMutex);
-
-        // Clean up orphaned MHC profiles from previous sessions and reapply all active profiles.
-        // Sweep stale association entries first — orphan cleanup deletes files but
-        // can't disassociate (no LUID for prior-session state), and Windows can
-        // re-broker defaults to dead entries during mode switches.
-        CleanupOrphanedMhcProfiles();
-        SweepStaleMhcAssociations();
-        ReapplyAllMhcProfiles();
-
-        // Auto-generate identity MHC profiles for monitors with DG enabled but no profile
-        // (This is the processing thread: the candidates are read under the settings mutex, and
-        // each is re-checked just before its install in case the GUI re-attached the vector.)
+    // The MHC pass (startup hygiene once per process, a verify after that), then — still inside the maintenance
+    // lock, so the orphan scan cannot delete what it installs — identity MHC profiles for monitors with desktop
+    // gamma but no profile. (This is the processing thread: the candidates are read under the settings mutex,
+    // and each is re-checked just before its install in case the GUI re-attached the vector.)
+    RunMhcStartPass([]() {
         if (g_userDesktopGammaMode.load()) {
             std::vector<std::pair<int, int>> needIdentity;   // (index, slot)
             {
@@ -442,7 +434,7 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
                 GenerateAndInstallMhcProfile(i, true);
             }
         }
-    }
+    });
 
     g_mainHwnd = g_monitors[0].hwnd;
 
@@ -577,7 +569,21 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
 
 // Every overlay render thread starts here: clears g_renderLoopStarted first (the new thread sets it once
 // its init + MHC hygiene are done) and hands the thread its generation.
+// A pending reinit request is moot for whatever starts now (a start is a whole initialization, and its MHC pass
+// verifies the associations). Only the overlay render loop consumes these flags, so in hook mode, MHC-only or
+// while suspended a request from a display wake, a settings change or an adapter change stayed latched for as
+// long as the session ran, and the next overlay start ran a spurious forced reinit with an MHC remove + re-add on
+// every display. What the MHC reapply request was for — the hardware LUT may be stale — is still owed: it
+// becomes a transition burst (Calibration Loader kicks, no flicker).
+static void SupersedePendingReinit() {
+    g_forceReinit.store(false);
+    // Without the window (no start comes before it) the request stays for whoever can serve it.
+    if (g_gui.hwndMain && g_forceMhcReapply.exchange(false))
+        PostMessage(g_gui.hwndMain, WM_MHC_RELOAD_HARDWARE, kMhcReloadPending, 0);
+}
+
 static std::thread LaunchRenderThread(std::vector<MonitorLUTConfig> configs) {
+    SupersedePendingReinit();   // every overlay start comes through here (StartProcessing, the hook's re-evaluation)
     g_renderLoopStarted.store(false);
     return std::thread(ProcessingThreadFunc, std::move(configs), g_renderLoopGen.load());
 }
@@ -1227,6 +1233,8 @@ static void StartProcessingImpl() {
         return;
     }
 
+    SupersedePendingReinit();   // also for the starts that launch no overlay thread (hook-only, MHC-only)
+
     // Build config from all monitors with SDR LUT or color correction configured (or every monitor while desktop
     // gamma is configured: BuildPipelineConfigs). Empty exactly when !LiveLayersNeeded().
     std::vector<MonitorLUTConfig> configs = BuildPipelineConfigs();
@@ -1246,21 +1254,8 @@ static void StartProcessingImpl() {
                 (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty())) { anyMhc = true; break; }
         }
         if (anyMhc) {
-            // Once per process (the startup pass): ReapplyAllMhcProfiles is a remove + re-add per
-            // profile, and pipe verbs restart processing many times per calibration run — later
-            // MHC-only starts only verify the associations (no flicker).
-            static bool s_mhcOnlyHygieneDone = false;
-            if (!s_mhcOnlyHygieneDone) {
-                s_mhcOnlyHygieneDone = true;
-                // Same guard as the processing thread's startup pass (a re-bake installing a profile
-                // mid-scan must not have its fresh file deleted as an orphan).
-                std::lock_guard<std::mutex> maintenanceLock(g_mhcMaintenanceMutex);
-                CleanupOrphanedMhcProfiles();
-                SweepStaleMhcAssociations();
-                ReapplyAllMhcProfiles();
-            } else {
-                VerifyAndRestoreMhcProfiles();
-            }
+            // Startup hygiene once per process, a verify on every later start (no flicker). GUI thread: try-lock.
+            RunMhcStartPass({}, false);
             SetStatus(L"Active (MHC profiles only - nothing else to run)");
         } else {
             SetStatus(L"Configure at least one monitor with LUT or color correction");
@@ -1389,6 +1384,10 @@ static void StartProcessingImpl() {
 
             StartAnalysisOnlyMode();
 
+            // No processing thread here either: the same MHC pass as the LUT-only start, before the whitelist
+            // thread (its first desktop-gamma swap installs a variant the orphan scan must not race).
+            RunMhcStartPass({}, false);
+
             // Start whitelist thread (analysis-only mode has g_monitors but
             // ProcessingThreadFunc isn't running to start it)
             StartGammaWhitelistThread();
@@ -1414,14 +1413,14 @@ static void StartProcessingImpl() {
             // Create analysis overlay (for potential hotkey toggle)
             CreateAnalysisOverlay(GetModuleHandle(nullptr));
 
+            // No processing thread to run the MHC pass: startup hygiene once per process, a verify after that
+            // (it used to remove + re-add every profile on every hook start, and without the maintenance lock).
+            // Before the whitelist thread, as the overlay thread does: its first desktop-gamma swap installs a
+            // variant the orphan scan must not race.
+            RunMhcStartPass({}, false);
+
             // Start whitelist thread (no ProcessingThreadFunc to start it)
             StartGammaWhitelistThread();
-
-            // Clean up orphaned MHC profiles, sweep stale association entries,
-            // and reapply active ones
-            CleanupOrphanedMhcProfiles();
-            SweepStaleMhcAssociations();
-            ReapplyAllMhcProfiles();
         }
 
         EnableWindow(g_gui.hwndApply, FALSE);
@@ -1465,7 +1464,11 @@ void StartProcessing() {
 
 void StartProcessingAfterOverlayLoss() {
     if (g_appShuttingDown.load()) return;
-    if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(true); return; }   // replays as a plain start
+    // The overlay died (a failed GPU recovery among the causes: a TDR or driver reset can revert the MHC hardware LUT
+    // while every association still reads right). The start only verifies associations; the reload is a burst — also
+    // when this start waits for a transition in progress (it then replays as a plain start).
+    if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_MHC_RELOAD_HARDWARE, kMhcReloadOverlayLoss, 0);
+    if (g_procTransition != ProcTransition::Idle) { RecordNestedIntent(true); return; }
     {
         TransitionScope scope(ProcTransition::Starting);
         s_restartKeepsResidentHook = true;

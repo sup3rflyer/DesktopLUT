@@ -100,8 +100,10 @@ int FormatDecimals(const char* fmt);   // "%.4f" -> 4, "%.0f" -> 0, "%f" -> 6
 // A field's box (sunken in Light): the background of plots and lists as well as of text fields.
 void DrawFieldBox(ImDrawList* dl, ImVec2 a, ImVec2 b, bool hovered = false, bool active = false);
 
-// A one-line text field (hint shown while empty). Returns true while it changed this frame.
-bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip);
+// A one-line text field (hint shown while empty). Returns true while it changed this frame. `entered` (optional)
+// is set when Enter (or keypad Enter) left the field this frame — read here, on the text item itself: the field
+// box drawn after it is the last item, so a caller's IsItemDeactivated() would ask the box and never be true.
+bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip, bool* entered = nullptr);
 
 // A drop-down list: the field shows `preview`; while open, add DropdownItem rows and call EndDropdown.
 bool BeginDropdown(const char* id, const char* preview, float widthDip);

@@ -5,6 +5,7 @@
 #pragma once
 
 #include "types.h"
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,10 @@ bool IsMHC2ApiAvailable();
 // - Copies .icm file to system color directory via InstallColorProfileW
 // - Associates with display and sets as default via ColorProfileAddDisplayAssociation
 bool InstallMHC2Profile(const std::wstring& profilePath, LUID adapterLuid, UINT32 sourceId, bool isHDR = false);
+
+// Copies the .icm file into the system color directory and associates it with nothing (what
+// InstallMHC2Profile does before its association): a cached permutation waits there for its swap.
+bool InstallMHC2ProfileFile(const std::wstring& profilePath);
 
 // Remove MHC2 profile from a display
 // - Disassociates from display via ColorProfileRemoveDisplayAssociation
@@ -331,6 +336,18 @@ void ReapplyAllMhcProfiles();
 // the Color Management control panel, driver resets, and ImmersiveColorSet
 // changes that don't fire WM_DISPLAYCHANGE.
 void VerifyAndRestoreMhcProfiles();
+
+// The MHC pass of a processing start, whatever runs (overlay thread, DWM hook, analysis-only, MHC profiles only).
+// Every start cleans up orphaned profile files and stale association entries (neither shows). The process's first
+// start also removes and re-adds every active profile (a visible reload on each display); every later start — a
+// cube loaded or cleared, a FALD file reloaded, suspend/resume, an engine switch, each pipe verb that restarts
+// processing — only verifies the associations (VerifyAndRestoreMhcProfiles): no flicker on displays nothing changed
+// on. `underLock` runs inside the maintenance lock after that (the overlay thread's desktop-gamma identity
+// profiles). Takes g_mhcMaintenanceMutex (so never call it holding g_monitorSettingsMutex); with mayWait false (the
+// GUI thread) it only tries it, and verifies when another start's pass holds it.
+void RunMhcStartPass(const std::function<void()>& underLock = {}, bool mayWait = true);
+// Whether the process's first start pass has run (for tests and diagnostics).
+bool MhcStartupPassDone();
 
 // Ask Windows to reload calibrations for all associated displays using its own
 // scheduled task (\Microsoft\Windows\WindowsColorSystem\Calibration Loader).

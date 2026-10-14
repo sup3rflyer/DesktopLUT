@@ -13,6 +13,7 @@
 #include "color.h"
 #include "osd.h"
 #include "displayconfig.h"
+#include "display_power.h"
 #include "mhc.h"
 #include "dwm_inject.h"
 #include "analysis.h"
@@ -900,10 +901,10 @@ static bool AnyMhcProfileActive() {
 // (Re)start the burst from stage 0. Coalesces: a new trigger during a running
 // burst restarts the schedule, which is the desired behavior — the most recent
 // transition is the one whose settling we need to outlast.
-static void StartMhcTransitionBurst(HWND hwnd, const char* reason) {
+static void StartMhcTransitionBurst(HWND hwnd, const char* reason, bool displayTransition = true) {
     // A display transition is a fresh chance for a desktop-gamma re-bake that failed before (it backs off
-    // between steady-state checks; a transition flickers anyway).
-    ResetDesktopGammaSdrWhiteBackoff();
+    // between steady-state checks; a transition flickers anyway). An engine restart is not one.
+    if (displayTransition) ResetDesktopGammaSdrWhiteBackoff();
     if (!AnyMhcProfileActive()) return;
     std::cout << "[MHC] Transition burst started (" << reason << ")" << std::endl;
     g_mhcBurstStage = 0;
@@ -1533,6 +1534,7 @@ static bool IgnoredDuringShutdown(UINT msg) {
     case WM_DEVICECHANGE: case WM_POWERBROADCAST: case WM_COMMAND: case WM_TRAYICON: case WM_HOTKEY:
     case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
     case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD: case WM_MHC_REGENERATE_MISSING:
+    case WM_MHC_RELOAD_HARDWARE:
         return true;
     default:
         return msg == WM_TASKBARCREATED;
@@ -2376,6 +2378,22 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
     }
 
+    case WM_MHC_RELOAD_HARDWARE: {
+        static const char* const kWhy[] = { "pending reapply", "restart after overlay loss", "adapter change" };
+        if (wParam == kMhcReloadOverlayLoss) {
+            // An overlay that keeps dying is restarted every few seconds: one reload a minute covers it (the
+            // blind kick covers the rest), each one a Calibration Loader run and, with the task disabled, a flicker.
+            static ULONGLONG s_lastOverlayLoss = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (s_lastOverlayLoss != 0 && now - s_lastOverlayLoss < 60000) return 0;
+            s_lastOverlayLoss = now;
+            StartMhcTransitionBurst(hwnd, kWhy[kMhcReloadOverlayLoss], /*displayTransition=*/false);
+            return 0;
+        }
+        StartMhcTransitionBurst(hwnd, wParam < 3 ? kWhy[wParam] : "reload");
+        return 0;
+    }
+
     case WM_MHC_REGENERATE_MISSING: {
         // The verify found the ACTIVE profile's .icm gone (Windows / disk cleanup). Regenerate it from the
         // settings under a new name — once per profile name (a regeneration that cannot succeed must not
@@ -2689,6 +2707,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // the OS default for its monitor, put it back. Runs independently
             // of the processing thread so MHC-only users are also protected.
             VerifyAndRestoreMhcProfiles();
+            RetryDgSwap();                // a desktop gamma switch (hotkey, whitelist) whose profile swap did not land
             ui::NotifyDisplayChanged();   // re-read display modes while the new interface is open
             // A display given up on by the identity retry runs on index-attached settings that are
             // never saved: re-attach as soon as it can be identified (only queried while one exists).
@@ -2909,14 +2928,18 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         else if (wParam == PBT_POWERSETTINGCHANGE) {
             POWERBROADCAST_SETTING* pbs = reinterpret_cast<POWERBROADCAST_SETTING*>(lParam);
             if (pbs && pbs->PowerSetting == GUID_CONSOLE_DISPLAY_STATE_GUI) {
-                DWORD displayState = *reinterpret_cast<DWORD*>(pbs->Data);
-                if (displayState == 0) {
+                // The first notification is the state at registration (on, at every startup): not a wake.
+                static DisplayPowerTracker s_displayPower;
+                const DWORD displayState = *reinterpret_cast<DWORD*>(pbs->Data);
+                const DisplayPowerEvent ev = s_displayPower.OnState(displayState);
+                if (ev == DisplayPowerEvent::None && displayState == 1) g_displayOff.store(false);
+                if (ev == DisplayPowerEvent::Off) {
                     // Display off — set flag and unblock processing thread
                     std::cout << "[GUI] Display entering sleep mode" << std::endl;
                     g_displayOff.store(true);
                     g_lastSuccessfulFrame = std::chrono::steady_clock::now();
                     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-                } else if (displayState == 1) {
+                } else if (ev == DisplayPowerEvent::Wake) {
                     // Display on — trigger reinit or restart processing
                     std::cout << "[GUI] Display waking from sleep" << std::endl;
                     g_displayOff.store(false);
@@ -3012,8 +3035,11 @@ int RunGUI() {
             FILE* fp;
             freopen_s(&fp, "CONOUT$", "w", stdout);
             freopen_s(&fp, "CONOUT$", "w", stderr);
+            SetConsoleOutputCP(CP_UTF8);   // the narrow log lines are UTF-8 ("→" read as CP-1252 is "â†'")
             std::cout.clear();
             std::cerr.clear();
+            std::wcout.clear();
+            std::wcerr.clear();
         }
     }
 
@@ -3076,6 +3102,10 @@ int RunGUI() {
     } else {
         ApplyMaxTmlSettings();
     }
+    // The Calibration Loader kicks of a transition burst (no flicker), for the hardware LUT Windows' own logon
+    // loader or a late GPU-panel / driver start can leave stale. (Every start used to get one by accident: the
+    // display state Windows reports at registration was taken for a wake.)
+    StartMhcTransitionBurst(g_gui.hwndMain, "startup");
 
     // Only start minimized if user explicitly enabled the setting
     if (!g_startMinimized.load()) ShowActiveUi();

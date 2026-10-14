@@ -35,7 +35,11 @@ constexpr UINT_PTR kAnimTimer = 2;      // while an item is active (caret blink,
 constexpr UINT_PTR kReleaseTimer = 3;   // release the device after being hidden this long
 constexpr UINT_PTR kDlcTimer = 4;       // re-read the DLC folder while visible
 constexpr UINT_PTR kDeviceRetryTimer = 5;   // rebuild the device after a loss, with backoff
+constexpr UINT_PTR kModeTimer = 6;      // re-read what Windows reports per display while visible
 constexpr UINT kSettleMs = 16, kAnimMs = 33, kReleaseMs = 30000, kDlcMs = 60000;
+// The reported peak changes without a display-change message: a MaxTML override, a profile re-association (the
+// transition bursts, DLC, the SDR white level following). One DXGI read per tick, only while that reading is shown.
+constexpr UINT kModeMs = 5000;
 constexpr int kSettleFrames = 3;
 constexpr float kDefaultW = 1180.0f, kDefaultH = 760.0f, kMinW = 920.0f, kMinH = 520.0f;
 
@@ -147,6 +151,7 @@ void DrainCommands() {
         }
     }
     g_busy = false;
+    RefreshModeCache();   // a command may have changed what Windows reports (MaxTML, a profile)
     Invalidate();
 }
 
@@ -234,6 +239,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_minimized = true;
                 StopAnimTimer();
                 KillTimer(hwnd, kDlcTimer);
+                KillTimer(hwnd, kModeTimer);
                 SetTimer(hwnd, kReleaseTimer, kReleaseMs, nullptr);
             }
             return 0;
@@ -244,6 +250,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             RefreshModeCache();
             RequestDlcScan();
             SetTimer(hwnd, kDlcTimer, kDlcMs, nullptr);
+            SetTimer(hwnd, kModeTimer, kModeMs, nullptr);
         }
         if (g_present.Valid()) g_present.Resize(LOWORD(lParam), HIWORD(lParam));
         RenderFrame();
@@ -278,6 +285,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         } else if (wParam == kDlcTimer) {
             if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) RequestDlcScan();
             else KillTimer(hwnd, kDlcTimer);
+        } else if (wParam == kModeTimer) {
+            if (IsWindowVisible(hwnd) && !IsIconic(hwnd)) {
+                // Only while the reading is on screen (the tone map inspector's REPORTED PEAK of a connected display in
+                // HDR; any other shows "—"), not while a command runs, and only the DXGI read: DisplayConfig polling is
+                // a known micro-stutter source, and a mode change arrives as a message. A frame only when it changed.
+                bool shown = !g_busy && g_view.page == Page::Pipeline && g_view.stage == StageId::ToneMap &&
+                             !g_view.showOtherMode && !g_view.gsEdit.open && !g_view.mhcEdit.open;
+                if (shown) {
+                    shown = false;
+                    for (const DisplayRow& r : g_snap.live)
+                        if (r.mode == Mode::HDR && RowIdOf(r) == g_view.selectedKey) shown = true;
+                }
+                if (shown && RefreshReportedPeaks()) Invalidate();
+            } else {
+                KillTimer(hwnd, kModeTimer);
+            }
         } else if (wParam == kDeviceRetryTimer) {
             KillTimer(hwnd, kDeviceRetryTimer);
             Invalidate();
@@ -291,6 +314,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         KillTimer(hwnd, kAnimTimer);
         KillTimer(hwnd, kReleaseTimer);
         KillTimer(hwnd, kDlcTimer);
+        KillTimer(hwnd, kModeTimer);
         KillTimer(hwnd, kDeviceRetryTimer);
         g_animTimer = false;
         ReleaseImGui();
@@ -382,6 +406,7 @@ bool Show() {
     SetForegroundWindow(g_hwnd);
     RequestDlcScan();
     SetTimer(g_hwnd, kDlcTimer, kDlcMs, nullptr);
+    SetTimer(g_hwnd, kModeTimer, kModeMs, nullptr);
     Kick();
     return true;
 }
@@ -400,6 +425,7 @@ void Hide() {
     ShowWindow(g_hwnd, SW_HIDE);
     StopAnimTimer();
     KillTimer(g_hwnd, kDlcTimer);
+    KillTimer(g_hwnd, kModeTimer);
     SetTimer(g_hwnd, kReleaseTimer, kReleaseMs, nullptr);
 }
 

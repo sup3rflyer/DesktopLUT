@@ -1,6 +1,7 @@
 #include "doctest.h"
 #include "ui/ui_model.h"
 #include "ui/ui_widgets.h"
+#include "ui/ui_snapshot.h"
 #include <algorithm>
 
 // ============================================================================
@@ -177,6 +178,18 @@ TEST_CASE("ui_model: live layers follow Suspend and the engine; faults only for 
     CHECK(Get(BuildPixelPath(ms, Mode::HDR, Mode::HDR, rt), StageId::Lut3D).light == Light::Fault);
     // The same, viewed from the other mode (the display is in SDR): what would run, no fault.
     CHECK(Get(BuildPixelPath(ms, Mode::HDR, Mode::SDR, rt), StageId::Lut3D).light == Light::Configured);
+    // The overlay thread died in hook mode and waits for its auto-restart (isRunning false): the resident hook still
+    // draws tone mapping and the cube; FALD, which the overlay draws, is down.
+    rt = PathRuntime{};
+    rt.hookMode = true;
+    rt.hookActive = true;
+    ms.hdrColorCorrection.fald.paramsPath = L"panel.fld";
+    ms.hdrColorCorrection.fald.enabled = true;
+    auto restarting = BuildPixelPath(ms, Mode::HDR, Mode::HDR, rt);
+    CHECK(Get(restarting, StageId::Lut3D).light == Light::Configured);
+    CHECK(Get(restarting, StageId::ToneMap).light == Light::Configured);
+    CHECK(Get(restarting, StageId::Fald).light == Light::Fault);
+    ms.hdrColorCorrection.fald = FaldSettings();
     // Not running at all (and not suspended): a fault too.
     CHECK(Get(BuildPixelPath(ms, Mode::HDR, Mode::HDR, PathRuntime{}), StageId::ToneMap).light == Light::Fault);
     // The 3D LUT stage switched off: a ring, dimmed, whatever the engine does.
@@ -246,4 +259,42 @@ TEST_CASE("ui: number fields know the decimals they show (rounding-only commits 
     CHECK(ui::FormatDecimals("%f") == 6);
     CHECK(ui::FormatDecimals("x = %.2f nits") == 2);
     CHECK(ui::FormatDecimals("plain") == 6);
+}
+
+TEST_CASE("ui_snapshot: when a connected display's cube is off the screen (MEASURED, the DLC record)") {
+    Snapshot s;
+    s.running = true;
+    DisplayRow r;
+    r.liveIndex = 0;
+    r.mode = Mode::HDR;
+    CHECK_FALSE(CubeOffScreen(s, r, true));
+    CHECK_FALSE(CubeOffScreen(s, r, false));
+    // Suspended: both modes (nothing live runs at all).
+    s.suspended = true;
+    CHECK(CubeOffScreen(s, r, true));
+    CHECK(CubeOffScreen(s, r, false));
+    s.suspended = false;
+    // The engine down: only the mode the display is in; the other shows what would run there.
+    s.running = false;
+    CHECK(CubeOffScreen(s, r, true));
+    CHECK_FALSE(CubeOffScreen(s, r, false));
+    r.mode = Mode::AcmSdr;
+    CHECK(CubeOffScreen(s, r, false));
+    CHECK_FALSE(CubeOffScreen(s, r, true));
+    // An unknown mode faults nothing, as the lights do; a remembered display is never on screen to begin with.
+    r.mode = Mode::Unknown;
+    CHECK_FALSE(CubeOffScreen(s, r, false));
+    CHECK_FALSE(CubeOffScreen(s, r, true));
+    r.mode = Mode::HDR;
+    r.liveIndex = -1;
+    CHECK_FALSE(CubeOffScreen(s, r, true));
+    r.liveIndex = 0;
+    // Hook mode: the injected hook draws the cube, also while a dead overlay thread waits for its restart.
+    s.hookMode = true;
+    s.hookActive = true;
+    s.running = false;
+    CHECK_FALSE(CubeOffScreen(s, r, true));
+    s.running = true;
+    s.hookActive = false;
+    CHECK(CubeOffScreen(s, r, true));
 }

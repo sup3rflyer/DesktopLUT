@@ -1,6 +1,7 @@
 #include "doctest.h"
 #include "displayconfig.h"
 #include "capture.h"
+#include "display_power.h"
 #include "fixtures/edid_samples.h"
 #include <cmath>
 #include <string>
@@ -511,4 +512,53 @@ TEST_CASE("Night Light: the CloudStore state blob reads on / off / unknown") {
     memcpy(bad, off, sizeof(off));
     bad[0] = 0;
     CHECK(ParseNightLightState(bad, sizeof(bad)) == -1);      // not the CloudStore header
+}
+
+// The state Windows sends right after the registration is not a wake (2026-10-14: every startup logged
+// "Display waking from sleep", ran an MHC burst and latched a forced reinit + MHC reapply).
+TEST_CASE("DisplayPowerTracker: only on-after-off is a wake") {
+    SUBCASE("startup: the initial 'on' and repeats are nothing") {
+        DisplayPowerTracker t;
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+    }
+    SUBCASE("off then on is a wake, every off is reported") {
+        DisplayPowerTracker t;
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+        CHECK(t.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(t.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(t.OnState(1) == DisplayPowerEvent::Wake);
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+    }
+    SUBCASE("registered while the display is off: its first 'on' is a wake") {
+        DisplayPowerTracker t;
+        CHECK(t.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(t.OnState(1) == DisplayPowerEvent::Wake);
+    }
+    SUBCASE("dimmed and back is not a wake; dimmed, off, on is") {
+        DisplayPowerTracker t;
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+        CHECK(t.OnState(2) == DisplayPowerEvent::None);
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+        CHECK(t.OnState(2) == DisplayPowerEvent::None);
+        CHECK(t.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(t.OnState(1) == DisplayPowerEvent::Wake);
+    }
+    SUBCASE("off, then dimmed, then on is still a wake") {
+        DisplayPowerTracker t;
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+        CHECK(t.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(t.OnState(2) == DisplayPowerEvent::None);
+        CHECK(t.OnState(1) == DisplayPowerEvent::Wake);
+        CHECK(t.OnState(1) == DisplayPowerEvent::None);
+    }
+    SUBCASE("registered while dimmed, or off twice") {
+        DisplayPowerTracker a;
+        CHECK(a.OnState(2) == DisplayPowerEvent::None);
+        CHECK(a.OnState(1) == DisplayPowerEvent::None);
+        DisplayPowerTracker b;
+        CHECK(b.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(b.OnState(0) == DisplayPowerEvent::Off);
+        CHECK(b.OnState(1) == DisplayPowerEvent::Wake);
+    }
 }

@@ -756,6 +756,31 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     RowNext(row);
     RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
     EndRow(row);
+
+    // What apps are told now. An associated HDR profile reports its own peak (its luminance tag), and every profile
+    // re-association replaces an override with it — so the override can read one thing while Windows reports another.
+    // Its own row, always there, the value in the slot the inputs above use (the unit lines up with theirs).
+    row = BeginRow("REPORTED PEAK");
+    RowTip(row, "The peak Windows reports to apps now (display in HDR).\n"
+                "An installed HDR MHC profile reports its own peak, and re-applying a profile replaces the override.");
+    {
+        const float reported = r.reportedPeakNits;
+        if (reported > 0.0f) {
+            const float peak = r.settings.maxTml.peakNits;
+            const bool off = r.settings.maxTml.enabled && std::fabs(reported - peak) > 1.0f;
+            wchar_t tip[160] = {};
+            if (off)
+                swprintf_s(tip, L"Not the %.0f nits set above: a profile re-applied since, or the value was not applied.\n"
+                                L"APPLY NOW sets it.", peak);
+            const float slot = row.x;
+            RowText(row, Fmt("%.0f", reported), off ? pal::Alarm : pal::Ink, Font::Mono, kSizeMono, tip);
+            row.x = slot + Px(80) + Px(8);
+            RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
+        } else {
+            RowText(row, "\xE2\x80\x94", pal::InkFaint);
+        }
+    }
+    EndRow(row);
 }
 
 void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
@@ -1088,12 +1113,20 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     // A bypassed stage is what runs (nothing): the record no longer describes the screen.
     const MHCSettings& mhcShown = showHdr ? r.settings.hdrMHC : r.settings.sdrMHC;
     const bool mhcBypassed = mhcShown.enabled && (mhcShown.bypassPrimaries || mhcShown.bypassGrayscale);
-    const bool cubeBypassed = (showHdr ? r.settings.hdrLutBypass : r.settings.sdrLutBypass) &&
-                              !(showHdr ? r.settings.hdrPath : r.settings.sdrPath).empty();
+    const bool cubeSet = !(showHdr ? r.settings.hdrPath : r.settings.sdrPath).empty();
+    const bool cubeBypassed = (showHdr ? r.settings.hdrLutBypass : r.settings.sdrLutBypass) && cubeSet;
+    // Suspended live layers, or an engine that should run and does not on the mode the display is in, take a
+    // connected display's cube off the screen too (MHC stays): the record is read against what runs (TakeSnapshot).
+    const bool cubeOff = cubeSet && !cubeBypassed && CubeOffScreen(snap, r, showHdr);
+    const bool cubeSuspended = cubeOff && snap.suspended;
+    const bool cubeDown = cubeOff && !snap.suspended;
     MeasuredRow("MHC", LayerText(rec.mhc, mhcBypassed), mhcBypassed ? pal::InkFaint : LayerColour(rec.mhc), Font::Label,
                 mhcBypassed ? "A stage of the MHC profile is switched off." : nullptr);
-    MeasuredRow("3D LUT", LayerText(rec.cube, cubeBypassed), cubeBypassed ? pal::InkFaint : LayerColour(rec.cube), Font::Label,
-                cubeBypassed ? "The 3D LUT stage is switched off." : nullptr);
+    MeasuredRow("3D LUT", cubeSuspended ? "SUSPENDED" : cubeDown ? "NOT RUNNING" : LayerText(rec.cube, cubeBypassed),
+                cubeDown ? pal::Alarm : (cubeBypassed || cubeSuspended ? pal::InkFaint : LayerColour(rec.cube)), Font::Label,
+                cubeBypassed ? "The 3D LUT stage is switched off."
+                : cubeSuspended ? "Live layers are suspended."
+                : cubeDown ? "The engine is not running: the 3D LUT is not on screen." : nullptr);
 
     if (shown < 0) {
         MeasuredRow("VERIFIED", "NO REPORT", pal::InkFaint, Font::Label);
@@ -2028,14 +2061,17 @@ void DrawWhitelist(ViewState& vs) {
         items.push_back(name);
         apply(items);
     };
-    const bool entered = TextField("##wl_add", "app.exe", vs.whitelistAdd, sizeof(vs.whitelistAdd), 220) ||
-                         false;
-    const bool enterKey = ImGui::IsItemDeactivated() && ImGui::IsKeyPressed(ImGuiKey_Enter);
-    (void)entered;
+    if (vs.whitelistRefocus) {
+        ImGui::SetKeyboardFocusHere();
+        vs.whitelistRefocus = false;
+    }
+    bool enterKey = false;   // read inside the field (its box is the last item after it)
+    TextField("##wl_add", "app.exe", vs.whitelistAdd, sizeof(vs.whitelistAdd), 220, &enterKey);
     ImGui::SameLine(0, Px(8));
     if (Button("##wl_addbtn", "ADD", 64) || enterKey) {
         addName(Wide(vs.whitelistAdd));
         vs.whitelistAdd[0] = 0;
+        if (enterKey) vs.whitelistRefocus = true;
     }
     ImGui::SameLine(0, Px(8));
     static std::vector<std::wstring> s_running;

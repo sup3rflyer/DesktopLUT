@@ -84,6 +84,42 @@ bool InstallMHC2Profile(const std::wstring& profilePath, LUID adapterLuid, UINT3
         std::cerr << "MHC2: Install API not available" << std::endl;
         return false;
     }
+    if (!InstallMHC2ProfileFile(profilePath)) return false;
+
+    std::wstring profileName = profilePath;
+    size_t lastSlash = profileName.find_last_of(L"\\/");
+    if (lastSlash != std::wstring::npos) {
+        profileName = profileName.substr(lastSlash + 1);
+    }
+
+    // SDR profiles: associateAsAdvancedColor=FALSE → classified as "SDR Profile"
+    // HDR profiles: associateAsAdvancedColor=TRUE → classified as "HDR Profile"
+    HRESULT hr = g_pfnAddAssociation(
+        1,                  // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
+        profileName.c_str(),
+        adapterLuid,
+        sourceId,
+        TRUE,               // setAsDefault
+        isHDR ? TRUE : FALSE  // associateAsAdvancedColor
+    );
+
+    if (FAILED(hr)) {
+        std::cerr << "MHC2: ColorProfileAddDisplayAssociation failed: 0x"
+                  << std::hex << hr << std::dec << std::endl;
+        return false;
+    }
+
+    std::wcout << L"MHC2: Profile installed and associated: " << profileName << std::endl;
+    return true;
+}
+
+bool InstallMHC2ProfileFile(const std::wstring& profilePath) {
+    EnsureMscmsLoaded();
+
+    if (!g_pfnInstallColorProfile) {
+        std::cerr << "MHC2: Install API not available" << std::endl;
+        return false;
+    }
 
     // Extract filename from full path
     std::wstring profileName = profilePath;
@@ -109,25 +145,6 @@ bool InstallMHC2Profile(const std::wstring& profilePath, LUID adapterLuid, UINT3
             return false;
         }
     }
-
-    // SDR profiles: associateAsAdvancedColor=FALSE → classified as "SDR Profile"
-    // HDR profiles: associateAsAdvancedColor=TRUE → classified as "HDR Profile"
-    HRESULT hr = g_pfnAddAssociation(
-        1,                  // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
-        profileName.c_str(),
-        adapterLuid,
-        sourceId,
-        TRUE,               // setAsDefault
-        isHDR ? TRUE : FALSE  // associateAsAdvancedColor
-    );
-
-    if (FAILED(hr)) {
-        std::cerr << "MHC2: ColorProfileAddDisplayAssociation failed: 0x"
-                  << std::hex << hr << std::dec << std::endl;
-        return false;
-    }
-
-    std::wcout << L"MHC2: Profile installed and associated: " << profileName << std::endl;
     return true;
 }
 
@@ -236,6 +253,15 @@ std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool 
 }
 
 void CleanupOrphanedMhcProfiles() {
+    // A file put in the color directory shortly before the settings below were read may belong to an install that
+    // has not recorded its name yet (EnsureMhcPermProfile installs, then records; it runs on the GUI, whitelist and
+    // render threads without the maintenance lock): it is left to a later cleanup.
+    FILETIME nowFt;
+    GetSystemTimeAsFileTime(&nowFt);
+    const ULONGLONG kRecentFt = 120ull * 10000000ull;   // two minutes in 100 ns units
+    const ULONGLONG keepAfter = ((ULONGLONG)nowFt.dwHighDateTime << 32 | nowFt.dwLowDateTime) - kRecentFt;
+    auto ftValue = [](const FILETIME& ft) { return (ULONGLONG)ft.dwHighDateTime << 32 | ft.dwLowDateTime; };
+
     // Build set of profile names currently referenced by settings
     std::set<std::wstring> activeProfiles;
     {
@@ -287,6 +313,7 @@ void CleanupOrphanedMhcProfiles() {
     do {
         std::wstring fileName = fd.cFileName;
         if (IsMhcIdentityProfileName(fileName)) continue;
+        if (ftValue(fd.ftCreationTime) >= keepAfter || ftValue(fd.ftLastWriteTime) >= keepAfter) continue;   // just installed
         if (activeProfiles.find(fileName) == activeProfiles.end()) {
             std::wstring fullPath = colorDir + fileName;
             if (DeleteFileW(fullPath.c_str())) {
@@ -637,6 +664,43 @@ void ReapplyAllMhcProfiles() {
         }
     }
 }
+
+namespace {
+std::atomic<bool> g_mhcStartupPassDone{ false };
+}
+
+void RunMhcStartPass(const std::function<void()>& underLock, bool mayWait) {
+    // The cleanup keys "orphan" on a settings snapshot: a GUI-thread re-bake (desktop gamma following the SDR white
+    // level) installing a new profile mid-scan would have its fresh file deleted. The GUI side try-locks; so does a
+    // start on the GUI thread (mayWait false): the holder can only be another start's pass (an overlay thread still
+    // in it), which is this hygiene already.
+    std::unique_lock<std::mutex> maintenanceLock(g_mhcMaintenanceMutex, std::defer_lock);
+    if (mayWait) {
+        maintenanceLock.lock();
+    } else if (!maintenanceLock.try_lock()) {
+        std::cout << "[MHC] start pass: maintenance busy (another start's pass) - verifying only" << std::endl;
+        VerifyAndRestoreMhcProfiles();
+        return;
+    }
+    // Every start: orphaned profile files (variants a session re-baked away wait for this) and stale association
+    // entries — neither touches an active profile, so neither shows. Orphan cleanup deletes files but cannot
+    // disassociate (no LUID for prior-session state); the sweep removes the stale association entries Windows could
+    // re-broker a default to during a mode switch.
+    CleanupOrphanedMhcProfiles();
+    SweepStaleMhcAssociations();
+    // Once per process: the remove + re-add of every profile is a visible reload on every display, and processing
+    // restarts many times a session (every cube or FALD change, suspend/resume, engine switch, a DLC run's pipe
+    // verbs). It ran on every overlay or hook start (only the MHC-only path had this guard), so loading one display's
+    // cube flickered the calibration of all of them (2026-10-14 live test). Later starts verify the associations;
+    // a hardware reload a start superseded is a transition burst (WM_MHC_RELOAD_HARDWARE).
+    const bool startup = !g_mhcStartupPassDone.exchange(true);
+    if (startup) ReapplyAllMhcProfiles();
+    if (underLock) underLock();
+    maintenanceLock.unlock();
+    if (!startup) VerifyAndRestoreMhcProfiles();
+}
+
+bool MhcStartupPassDone() { return g_mhcStartupPassDone.load(); }
 
 // ============================================================================
 // SECTION: ICM Registry Watcher

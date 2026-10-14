@@ -422,6 +422,9 @@ static void CheckSystemHealth() {
             g_forceReinit.store(true);
             g_forceMhcReapply.store(true);
             if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
+            // The flags reach only an overlay render loop; the hook-only and MHC-only setups need the hardware LUT
+            // reloaded too (a driver update or GPU reset can revert it while the associations still read right).
+            if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_MHC_RELOAD_HARDWARE, kMhcReloadAdapter, 0);
         }
     }
 
