@@ -536,14 +536,12 @@ void ChartTile(ViewState& vs, int i, DlcChart k, const dlc::LiveCharts* c, bool 
     } else if (headHover) {
         ImGui::SetTooltip("%s", DlcChartTip(k));
     }
-    if (wheel != 0) {   // the next / previous chart that has something to show (any chart when none has)
-        const int n = (int)DlcChart::Count;
-        int next = (int)k;
-        for (int step = 0; step < n; step++) {
-            next = (next + wheel + n) % n;
-            if (!c || !c->present || DlcChartHasData((DlcChart)next, *c)) break;
-        }
-        vs.dlc.tile[i] = next;
+    if (wheel != 0) {   // the list's order: AUTOMATIC on top, then the charts with something to show; the ends stop
+        std::vector<int> order{ -1 };
+        for (int j = 0; j < (int)DlcChart::Count; j++)
+            if (j == pick || !c || !c->present || DlcChartHasData((DlcChart)j, *c)) order.push_back(j);
+        const int at = (int)(std::find(order.begin(), order.end(), pick < 0 ? -1 : pick) - order.begin());
+        vs.dlc.tile[i] = order[(size_t)std::clamp(at + wheel, 0, (int)order.size() - 1)];
     }
     ImGui::SetCursorScreenPos(ImVec2(Snap(tb.x - Px(kMaxBtnW)), ta.y));
     if (Button("##full", full ? "TILES" : "FULL", kMaxBtnW)) vs.dlc.maximized = full ? -1 : i;
