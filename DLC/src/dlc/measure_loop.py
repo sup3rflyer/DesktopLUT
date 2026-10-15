@@ -1182,8 +1182,10 @@ class _Loop:
     def _mirror_patch_read(self, record: dict[str, Any]) -> None:
         """Mirror one measurements.ndjson read onto the spine as a compact, stream-tier
         ``patch_read`` (the dense record stays in the ndjson). This is the dashboard's
-        live firehose + per-read liveness; the LLM digest drops it. No dE here — it's
-        target-relative and computed by the scoring/verify stage, not the meter loop."""
+        live firehose + per-read liveness; the LLM digest drops it. The loop stays
+        target-agnostic: the read's ``dE`` is attached by the run log's scorer
+        (:attr:`dlc.events.RunLog.patch_scorer`), which the orchestrator installs once the
+        target is known."""
         if self.runlog is None:
             return
         xyz = record.get("xyz")

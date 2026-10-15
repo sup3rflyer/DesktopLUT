@@ -66,6 +66,7 @@ import math
 import os
 import re
 import shutil
+import sys
 from argparse import Namespace
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -157,7 +158,8 @@ from .patch_sets import (
     outside_in_indices,
 )
 from .paths import atomic_write_text, runs_dir
-from .runs import RunContext, create_run, open_run
+from .runs import (RunContext, create_run, open_run, publish_active_pointer,
+                   update_active_pointer)
 from .stages import _common, build_mhc
 
 __all__ = [
@@ -270,6 +272,51 @@ def _reading_xy(reading: Any) -> Optional[list[float]]:
         tot = sum(xyz)
         return [round(xyz[0] / tot, 5), round(xyz[1] / tot, 5)]
     return None
+
+
+PatchScorer = Callable[[dict[str, Any]], Optional[dict[str, Any]]]
+
+
+def patch_read_scorer(header: Mapping[str, Any]) -> Optional[PatchScorer]:
+    """The spine's per-read ΔE (:attr:`dlc.events.RunLog.patch_scorer`) for one run-header payload
+    (:meth:`Calibration._header_data`), or ``None`` while there is nothing to score against: no
+    resolved target yet, or an SDR target with no white luminance.
+
+    ONE metric per mode (owner directive): dE_ITP against the PQ/Rec.2020 ideal for an HDR target,
+    CIEDE2000 against the γ-power ideal at the header's white luminance for SDR — both at the
+    header's resolved white, via :func:`dlc.dashboard.colorimetry.patch_delta_e` (stdlib, pinned to
+    ``dlc.metrics`` / ``engine.score_hdr``). The header is the same reference the dashboard's live
+    per-patch ΔE reads, so a ``patch_read``'s ``dE`` is the number the dashboard shows. It scores
+    against the raw target — no reachable-gamut clamp and no measured-white normalisation; those
+    belong to the per-stage score (``metrics_scored``), which stays authoritative."""
+    if not header.get("target") or header.get("is_hdr") is None:
+        return None
+    from .dashboard.colorimetry import patch_delta_e
+
+    is_hdr = bool(header["is_hdr"])
+    white = header.get("white")
+    white_xy = (white.get("xy") if isinstance(white, Mapping) else None) or (0.3127, 0.3290)
+    try:
+        wxy = (float(white_xy[0]), float(white_xy[1]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    luminance = _as_float_local(header.get("luminance"))
+    gamma = _as_float_local(header.get("gamma")) or 2.2
+    if not is_hdr and not (luminance is not None and luminance > 0):
+        return None
+    metric = "dE_ITP" if is_hdr else "CIEDE2000"
+
+    def score(data: dict[str, Any]) -> Optional[dict[str, Any]]:
+        xy, big_y, sig = data.get("xy"), data.get("Y"), data.get("signal")
+        if data.get("ok") is False or not xy or len(xy) < 2 or big_y is None or not sig or len(sig) < 3:
+            return None
+        de = patch_delta_e([float(c) for c in sig[:3]], float(xy[0]), float(xy[1]), float(big_y),
+                           is_hdr=is_hdr, white_xy=wxy, luminance=luminance, gamma=gamma)
+        if de is None or not math.isfinite(de):
+            return None
+        return {"dE": round(de, 3), "dE_metric": metric}
+
+    return score
 
 
 def resolve_run_spec(ctx: RunContext, state: Mapping[str, Any], *, mode: str,
@@ -1021,6 +1068,9 @@ class Calibration:
             return
         self._last_header = data
         self.runlog.header(**data)
+        # Every patch_read from here on carries its ΔE against this header's target / white /
+        # luminance — the same reference the dashboard's live ΔE reads from this header event.
+        self.runlog.patch_scorer = patch_read_scorer(data)
 
     def _stage(self, key: str, run_fn: Callable[[], StageOutcome]) -> StageOutcome:
         """Run (or replay) a memoised stage. A recorded ``done`` stage is returned
@@ -1126,18 +1176,35 @@ class Calibration:
             decision = self.adjudicator.adjudicate(request)   # may raise AdjudicationRequired
         except AdjudicationRequired:
             # The run is pausing for a human/LLM decision — make the pause visible on the
-            # spine (the dashboard shows "waiting at <seam>"; the LLM digest sees the ask).
+            # spine (the dashboard shows "waiting at <seam>"; the LLM digest sees the ask) WITH
+            # the whole judgment packet, so a viewer of the spine can decide it without the
+            # exit-10 stdout.
             self.runlog.seam(request.stage, key=request.key, status="paused",
-                             question=request.question, options=list(request.options))
+                             **self._seam_packet(request))
             raise
         if not self._valid_choice(request, decision, source="adjudicator"):
             # A seeded/custom adjudicator answered outside the vocabulary — re-asking it
             # would loop, so pause the run for a real judge instead.
             self.runlog.seam(request.stage, key=request.key, status="paused",
-                             question=request.question, options=list(request.options))
+                             **self._seam_packet(request))
             raise AdjudicationRequired(request)
         self._record_decision(request, decision)
         return decision
+
+    @staticmethod
+    def _seam_packet(request: AdjudicationRequest) -> dict[str, Any]:
+        """The judgment packet a seam event carries — everything the exit-10 request prints
+        (:meth:`AdjudicationRequest.as_dict`: the seam type, question, options, the core's
+        recommendation, the digest, and a structured seam's ``recommended_payload``) — plus the
+        operator ``checklist`` lifted out of the digest when the request has one, so a viewer can
+        render it without knowing where each seam keeps it. Digest tier (``RunLog.seam``)."""
+        packet = request.as_dict()
+        for k in ("key", "stage"):   # the seam event carries these itself
+            packet.pop(k, None)
+        checklist = request.digest.get("checklist") if isinstance(request.digest, Mapping) else None
+        if checklist:
+            packet["checklist"] = list(checklist)
+        return packet
 
     def _valid_choice(self, request: AdjudicationRequest, decision: Decision, *,
                       source: str) -> bool:
@@ -1172,8 +1239,7 @@ class Calibration:
             # if it disagrees; the run does not pause.
             self.runlog.seam(request.stage, key=request.key, status="auto_accepted",
                              choice=decision.choice, note=decision.note,
-                             question=request.question, options=list(request.options),
-                             recommendation=request.recommendation, digest=request.digest,
+                             **self._seam_packet(request),
                              veto=(f"--cancel mid-run, or --decide {request.key}=<choice> "
                                    f"--run {self.ctx.root.name} on resume (an override beats "
                                    "this recorded decision without --force)"))
@@ -4550,6 +4616,13 @@ class Calibration:
                 ),
                 options=("ready", "abort"), recommendation="ready",
                 digest={"required": True, "monitor": self.monitor, "mode": self.mode,
+                        # The question's three checks as a list a viewer can tick off.
+                        "checklist": [
+                            f"Meter aimed at the patch area on monitor {self.monitor} "
+                            f"({self.display.name})",
+                            "DogeGen visible and foregrounded on that display",
+                            "No window or overlay covering the sensor",
+                        ],
                         "content_mode": self.content_mode,
                         "bit_depth": self.bit_depth, "dogegen_required": True,
                         "neutral_audit": audit,
@@ -8261,22 +8334,69 @@ class Calibration:
     # ====================================================================
     # Flows
     # ====================================================================
+    def _active_pointer_identity(self) -> dict[str, Any]:
+        """Who this run is, for ``active.json``: the display / monitor / mode, and the panel's EDID
+        hardware id — the profile's recorded one (``quirks.hardware_id``) when it has one, else the
+        id the preflight read from live enumeration, else omitted."""
+        out: dict[str, Any] = {"display": self.display.name, "monitor": self.monitor,
+                               "mode": self.mode, "content_mode": self.content_mode}
+        hw = str(self.display.quirks.get("hardware_id") or "").strip()
+        source = "profile"
+        if not hw:
+            pre = ((self.calib.get("stages") or {}).get("preflight") or {}).get("digest") or {}
+            hw = str((pre.get("monitor_map") or {}).get("hardware_id") or "").strip()
+            source = "preflight"
+        if hw:
+            out["hardware_id"] = hw
+            out["hardware_id_source"] = source
+        return out
+
     def _publish_active_pointer(self) -> None:
         """Point ``runs/active.json`` at this run's spine so the mission-control
-        dashboard follows it (and the next run) without being told which folder. Purely
-        advisory — a failure here must never touch the run, so it's swallowed. The
-        pointer is left in place after the run ends (the dash keeps showing the last
-        run until another starts)."""
+        dashboard follows it (and the next run) without being told which folder, with who is
+        running it (``pid``), on what (display / monitor / mode / hardware id) and its ``state``
+        (``running`` here; :meth:`_set_active_state` moves it on). Purely advisory — a failure here
+        must never touch the run, so it's swallowed. The pointer is left in place after the run
+        ends (the dash keeps showing the last run until another starts)."""
         try:
+            now = datetime.now().isoformat(timespec="seconds")
             pointer = {
                 "run": str(self.ctx.root),
                 "events": str(self.ctx.events_path),
                 "flow": self.calib.get("flow"),
-                "updated": datetime.now().isoformat(timespec="seconds"),
+                **self._active_pointer_identity(),
+                "pid": os.getpid(),
+                "started": now,                          # this invocation (pairs with pid)
+                "run_created": self.ctx.manifest.created,
+                "state": "running",
+                "updated": now,
             }
-            atomic_write_text(runs_dir() / "active.json", json.dumps(pointer, indent=2))
+            publish_active_pointer(pointer)
         except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
             pass
+
+    def _set_active_state(self, state: str, **extra: Any) -> None:
+        """Move ``active.json``'s ``state`` on (``paused_seam`` at a seam pause; ``done`` /
+        ``failed`` / ``cancelled`` at exit) — only while the pointer still names this run (a newer
+        run's pointer is never clobbered). Advisory: any failure is swallowed, never touches the run."""
+        try:
+            update_active_pointer(self.ctx.root, state=state, pid=os.getpid(),
+                                  updated=datetime.now().isoformat(timespec="seconds"),
+                                  **self._active_pointer_identity(), **extra)
+        except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
+            pass
+
+    @staticmethod
+    def _active_state_for(result: "CalibrationResult") -> str:
+        """``active.json`` state for a returned result: an applied or reverted finish is ``done``
+        (the run ran to its end), an abort is ``cancelled`` when the cancel lever caused it
+        (control.json / --cancel) and ``failed`` otherwise (a seam abort, a stall, a dead meter,
+        a refused resume)."""
+        if result.status == "aborted":
+            return "cancelled" if (result.digest or {}).get("cancelled") else "failed"
+        if result.status == "completed" or str(result.status).startswith("revert"):
+            return "done"
+        return "failed"
 
     def run(self, flow: str) -> CalibrationResult:
         import time
@@ -8341,15 +8461,22 @@ class Calibration:
         try:
             with keep_awake(reason=f"dlc calibration run ({flow})"):
                 result = self._run_flow(flow)
-        except AdjudicationRequired:
-            raise          # a PAUSE: the run continues later in the measurement state
-        except BaseException:
+        except AdjudicationRequired as req:
+            # a PAUSE: the run continues later in the measurement state
+            self._set_active_state("paused_seam", seam=req.request.key)
+            raise
+        except BaseException as exc:
+            self._set_active_state("cancelled" if isinstance(exc, KeyboardInterrupt) else "failed",
+                                   error=f"{type(exc).__name__}: {exc}"[:500])
             self._restore_viewing_layers()   # any other exit is terminal for this run
             raise
         finally:
             if self._enable_watchdog:
                 self.liveness.stop()
         self._restore_viewing_layers()       # completed / reverted / aborted (result returned)
+        self._set_active_state(self._active_state_for(result), result_status=result.status,
+                               **({"aborted_at": (result.digest or {}).get("aborted_at")}
+                                  if result.status == "aborted" else {}))
         return result
 
     def _patch_window_resume_check(self) -> None:
@@ -8433,7 +8560,9 @@ class Calibration:
                 status="aborted", stages=list(self.calib["stages"].keys()),
                 results_dir=None, report_path=None,
                 digest={"aborted_at": exc.outcome.stage, "message": exc.outcome.digest.get("message"),
-                        "reason": str(exc)})
+                        "reason": str(exc),
+                        # the cancel lever (control.json / --cancel), as opposed to any other abort
+                        **({"cancelled": True} if (exc.outcome.digest or {}).get("cancelled") else {})})
 
     def _warm_tau(self) -> Optional[int]:
         """The panel's measured thermal time constant (in patches) for the warm-start
@@ -12160,6 +12289,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     ctx = open_run(args.run) if args.run and (args.run / "manifest.json").exists() \
         else create_run(normalize_mode(args.mode), display=profile.display_for(args.monitor).name,
                         run_dir=args.run)
+    # The exact invocation, into the manifest (the first launch is kept; later ones append), so a
+    # resumer (the LLM, a dashboard, the DesktopLUT DLC tab) can relaunch with the same flags plus
+    # `--run <dir> --decide KEY=CHOICE`. Advisory: a manifest write that fails never stops the run.
+    try:
+        ctx.record_launch(sys.argv[1:] if argv is None else argv,
+                          program=sys.argv[0] if argv is None else None)
+    except Exception as exc:  # noqa: BLE001
+        ctx.log(f"could not record the launch argv in the manifest: {type(exc).__name__}: {exc}")
 
     # Seed decisions from the run-record + any new --decide flags. The --decide flags are ALSO
     # kept as explicit overrides so they win over an already-recorded decision on resume (the
@@ -12247,6 +12384,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                        mode=args.mode, run_root=ctx.root, flow=eff_flow, log=ctx.log)
         if payload.get("verify_candidate") is not None:
             _common.save_dlc_state(ctx, state)   # restore_candidate updated calib['verify_candidate']
+        try:   # advisory: the run is over (only if active.json still names it)
+            update_active_pointer(ctx.root, state="cancelled", aborted_by="--abort", abort_exit_code=code,
+                                  updated=datetime.now().isoformat(timespec="seconds"))
+        except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
+            pass
         print(json.dumps(payload, indent=2, default=str))
         return code
 

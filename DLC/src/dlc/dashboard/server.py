@@ -33,6 +33,7 @@ from urllib.parse import urlsplit
 from typing import Any, Optional
 
 from ..events import Event
+from ..paths import atomic_write_text
 from .report import render_report_html
 from .state import DashboardState
 from .tail import EventTail
@@ -275,8 +276,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             ctrl = root / "control.json"
             payload = {"action": action, "requested": datetime.now().isoformat(timespec="seconds")}
             payload.update(extra)
-            ctrl.write_text(json.dumps(payload),
-                            encoding="utf-8")
+            # Atomic (temp file + replace), like `dlc-calibrate --cancel`: the run's watchdog polls
+            # this file off its main thread, and a torn write would read as "no control" — a cancel
+            # or pause silently lost until the next click.
+            atomic_write_text(ctrl, json.dumps(payload))
             return {"ok": True, "control": str(ctrl)}
         except OSError as exc:
             return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}

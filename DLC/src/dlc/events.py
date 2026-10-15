@@ -35,7 +35,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 # Bumped when the on-disk event schema changes in a way a consumer must notice.
 # Carried in the run_header so a long-lived dashboard tailing an older/newer run's
@@ -49,6 +49,20 @@ SCHEMA_VERSION = 1
 # silently (so we'd lose exactly the stall event that matters). Writes are tiny, so a
 # single lock costs nothing and guarantees whole lines.
 _WRITE_LOCK = threading.Lock()
+
+
+def _json_fallback(obj: Any) -> Any:
+    """Serialise what ``json`` can't — a seam digest may carry a numpy scalar/array or a Path.
+    Logging must never crash a run, so an unknown value is written as its ``str``."""
+    tolist = getattr(obj, "tolist", None)      # numpy scalars and arrays
+    if callable(tolist):
+        try:
+            return tolist()
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(obj, (set, frozenset)):
+        return sorted(obj, key=str)
+    return str(obj)
 
 
 def _now_iso() -> str:
@@ -129,7 +143,7 @@ class EventWriter:
     def write(self, level: str, stage: str, event: str, *,
               tier: Optional[str] = None, phase: Optional[str] = None, **data: Any) -> Event:
         record = Event(level=level, stage=stage, event=event, data=data, tier=tier, phase=phase)
-        line = json.dumps(asdict(record), separators=(",", ":")) + "\n"
+        line = json.dumps(asdict(record), separators=(",", ":"), default=_json_fallback) + "\n"
         # Best-effort, never let logging crash a run: a transient file lock / disk blip
         # must not abort calibration. The dashboard tolerates gaps; the run goes on.
         # The lock keeps concurrent writers (watchdog thread + main thread) from tearing
@@ -158,6 +172,11 @@ class RunLog:
         # previous snapshot to report "what happened since the last check-in" (anomalies, seams,
         # reads, optimizer iterations) without re-reading the firehose off disk.
         self.tally: dict[str, int] = {}
+        # The per-read ΔE scorer, installed by the orchestrator once the target is known (and
+        # refreshed when the white/luminance it scores against changes). Maps one patch_read's
+        # data to the fields to add (``dE`` + ``dE_metric``), or None when the read can't be
+        # scored. None (the default) ⇒ no dE: the spine itself stays target-agnostic.
+        self.patch_scorer: Optional[Callable[[dict[str, Any]], Optional[dict[str, Any]]]] = None
 
     # -- core emit ---------------------------------------------------------
     def emit(self, level: str, stage: str, event: str, *,
@@ -193,11 +212,24 @@ class RunLog:
 
     def patch_read(self, stage: str, **data: Any) -> Event:
         """A compact mirror of one measurements.ndjson read, so the dashboard can
-        render the firehose from the single spine. The dumb-browser contract: carry
-        ``role, seq, signal, rgb, Y, xy, dE, ok, disposition`` — with ``dE`` computed
-        Python-side against the RESOLVED target white (not textbook D65), so the
-        dashboard's numbers match verify + the LLM digest. The dense record (spectral,
-        provenance, per-read agreement) stays in measurements.ndjson."""
+        render the firehose from the single spine. Carries ``role, seq, label, signal,
+        rgb, Y, xy, ok, disposition`` from the producer, plus ``dE`` + ``dE_metric`` from
+        the installed :attr:`patch_scorer`: the read's error against its ideal target in
+        the run's ONE metric (dE_ITP for an HDR target, CIEDE2000 for SDR), at the
+        resolved target white and the run header's white luminance — scored from the
+        wire values above, so any consumer recomputing from this event gets the same
+        number. Absent before the target resolves (no scorer yet) and on a read with no
+        usable xy/Y. This is the live per-read evidence the check-ins aggregate (max ΔE
+        + which patch); the authoritative per-stage score (reachable-gamut clamp, white
+        normalisation) stays ``metrics_scored``. The dense record (spectral, provenance,
+        per-read agreement) stays in measurements.ndjson."""
+        if self.patch_scorer is not None and "dE" not in data:
+            try:
+                extra = self.patch_scorer(data)
+            except Exception:  # noqa: BLE001 - a monitoring number must never break a read
+                extra = None
+            if extra:
+                data.update(extra)
         return self.emit("INFO", stage, Ev.PATCH_READ, tier="stream", **data)
 
     def heartbeat(self, stage: str, **data: Any) -> Event:

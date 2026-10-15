@@ -172,6 +172,12 @@ python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
     makes the run open its own per-step patch windows, so repeat it.
 - **Run folder:** a fresh run creates `runs/<timestamp>_…`. Find it in the first seam's `"run"` field or in
   `runs/active.json` (the newest run). You need it for resumes, check-ins and `--cancel`.
+  - `runs/active.json` also says what that run is doing: `state` is `running`, `paused_seam` (with the waiting
+    `seam` key), `done`, `failed` or `cancelled`, next to its `pid`, display, monitor, mode and hardware id.
+  - The run's `manifest.json` keeps the exact first launch (`launch.argv` + `launch.cwd`) and appends every
+    resume. A resume is `launch.argv` run from `launch.cwd`, plus `--run <dir> --decide <key>=<option>`.
+  - A paused seam is also on the spine: its `seam` event (`status: paused`) carries the same question, options,
+    recommendation and digest as the printed request, plus a `checklist` when the seam has operator steps.
 - `--bit-depth`: pass it explicitly, identical to the daemon's. Preflight compares it with the **live link** and
   raises `preflight:link-depth` on a mismatch.
 - Early seams come in a quick burst, so handle them in the foreground. Once a long measure stage starts, run the
@@ -212,7 +218,11 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
 - Launch the measuring command in the background, then wake on a timer of about `--checkin-interval` and read the
   new `check_in` events in `runs/<run>/events.jsonl`.
 - **Judge each packet:**
-  - Is the max ΔE plausible for this patch region?
+  - Is the max ΔE plausible for this patch region? `evidence.max_dE` is the worst target-patch read in the
+    window (`dE_metric`: dE_ITP for HDR, CIEDE2000 for SDR), against the raw target. `evidence.max_dE_read`
+    says which read: phase, code, signal, Y, xy. An HDR read above the panel's peak, or a colour outside its
+    gamut, reads high by physics. Warm-up reads are left out; 3D-LUT build probes are summarised apart under
+    `evidence.probe`.
   - Are re-reads converging?
   - Is drift a panel state flip (sub-JND, recurrent) or real drift (growing)?
   - Any `present_stall` (the screen froze; abort fast)?

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .events import EventWriter
 from .paths import atomic_write_text, runs_dir
@@ -26,6 +28,29 @@ class RunManifest:
     desktoplut: dict[str, Any] = field(default_factory=dict)
     human_actions: dict[str, Any] = field(default_factory=dict)
     stages: list[dict[str, Any]] = field(default_factory=list)
+    # The CLI invocation that STARTED the run (exact argv + cwd — a relative --profile / --run
+    # resolves against it), kept as first recorded; every later invocation on the run (a resume
+    # with --decide, an --abort) is appended to `resumes`. A resumer relaunches with
+    # launch.argv + `--run <dir> --decide KEY=CHOICE`. Empty for in-process runs (no CLI).
+    launch: dict[str, Any] = field(default_factory=dict)
+    resumes: list[dict[str, Any]] = field(default_factory=list)
+
+
+def launch_record(argv: Sequence[str], *, cwd: Path | str | None = None,
+                  program: str | None = None) -> dict[str, Any]:
+    """One CLI invocation as the manifest keeps it: the exact ``argv`` (arguments after the
+    program), the working directory it resolves relative paths against, the interpreter, the
+    program as invoked (``sys.argv[0]``, when the argv came from the command line), and when."""
+    rec: dict[str, Any] = {
+        "argv": [str(a) for a in argv],
+        "cwd": str(cwd if cwd is not None else os.getcwd()),
+        "python": sys.executable,
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "pid": os.getpid(),
+    }
+    if program:
+        rec["program"] = str(program)
+    return rec
 
 
 @dataclass
@@ -88,10 +113,69 @@ class RunContext:
             encoding="utf-8",
         )
 
+    def record_launch(self, argv: Sequence[str], *, cwd: Path | str | None = None,
+                      program: str | None = None) -> dict[str, Any]:
+        """Persist this CLI invocation in the manifest: the first one becomes ``launch`` (never
+        overwritten), every later one is appended to ``resumes``. Saved atomically at once, so a
+        run that pauses or dies at its first seam still records how it was started."""
+        rec = launch_record(argv, cwd=cwd, program=program)
+        if not self.manifest.launch:
+            self.manifest.launch = rec
+        else:
+            self.manifest.resumes.append(rec)
+        self.save()
+        return rec
+
     def log(self, message: str) -> None:
         line = f"{datetime.now().isoformat(timespec='seconds')}  {message}"
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+
+# ---------------------------------------------------------------------------
+# runs/active.json — the advisory "which run is live, and in what state" pointer.
+#
+# The run that starts last owns it (the dashboard, and the DesktopLUT DLC tab, follow it to the
+# next run on their own). ``state`` tracks that run: running → paused_seam (exit 10, waiting for a
+# --decide resume) → running … → done / failed / cancelled. Purely advisory: every write is
+# best-effort and swallowed by the callers, and a state update only lands while the pointer still
+# names THIS run — a finishing older run never clobbers a newer run's pointer.
+# ---------------------------------------------------------------------------
+
+ACTIVE_POINTER_NAME = "active.json"
+ACTIVE_STATES = ("running", "paused_seam", "done", "failed", "cancelled")
+
+
+def active_pointer_path() -> Path:
+    return runs_dir() / ACTIVE_POINTER_NAME
+
+
+def _same_path(a: Any, b: Any) -> bool:
+    try:
+        return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def publish_active_pointer(pointer: dict[str, Any]) -> Path:
+    """Write ``active.json`` (atomically) — the run that calls this takes the pointer over."""
+    return atomic_write_text(active_pointer_path(), json.dumps(pointer, indent=2, default=str))
+
+
+def update_active_pointer(run_root: Path | str, **fields: Any) -> bool:
+    """Merge ``fields`` into ``active.json`` IF it still points at ``run_root``. Returns whether it
+    wrote. Raises on I/O errors — callers treat the pointer as advisory and swallow them."""
+    path = active_pointer_path()
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    owner = current.get("run") if isinstance(current, dict) else None
+    if not owner or not _same_path(owner, run_root):
+        return False
+    current.update(fields)
+    atomic_write_text(path, json.dumps(current, indent=2, default=str))
+    return True
 
 
 def make_run_name(mode: str, display: str | None) -> str:
@@ -130,5 +214,7 @@ def open_run(run_dir: Path) -> RunContext:
         desktoplut=raw.get("desktoplut", {}),
         human_actions=raw.get("human_actions", {}),
         stages=raw.get("stages", []),
+        launch=raw.get("launch") or {},
+        resumes=list(raw.get("resumes") or []),
     )
     return RunContext(root=run_dir.resolve(), manifest=manifest)
