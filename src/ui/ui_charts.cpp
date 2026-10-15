@@ -39,10 +39,13 @@ namespace {
 
 constexpr int kLocusN = 65;
 constexpr float kPi = 3.14159265f;
-// Fixed scales, in visibility units (1 ≈ just visible in both metrics); what falls outside is marked, never rescaled.
-constexpr float kAlarmDe = 3.0f;      // a core patch above it is plainly visible
+// Fixed scales, in visibility units; what falls outside is marked, never rescaled. Where each number comes from (a
+// standard, research, a convention or a judgement call): DLC/docs/practical-thresholds.md.
+//   1 = just visible: ΔE ITP by its standard (ITU-R BT.2124, at the most critical adaptation); ΔE2000 by convention
+//   (research puts its perceptibility at 0.8, reflective samples).
+constexpr float kAlarmDe = 3.0f;      // a core patch above it: past the tolerance BT.2124 suggests for a reference display
 constexpr float kDeScale = 3.0f;      // band / stage means
-constexpr float kBandAlarm = 2.0f;    // a band mean above it, on a band holding >= 2 % of content: amber
+constexpr float kBandAlarm = 2.0f;    // a band mean above it, on a band holding >= 2 % of content: amber (judgement call)
 constexpr float kBandAlarmShare = 0.02f;
 constexpr float kToneScale = 10.0f;   // tone error, %
 constexpr float kTintScale = 2.0f;    // grey tint / colour by level lanes, metric units (the band: ±1)
@@ -401,7 +404,7 @@ void DrawToneError(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {
     for (const Grey& g : gs) {
         const bool over = std::fabs(g.dY) > kToneScale;
         const ImVec2 q = p.P(g.x, std::clamp(g.dY, -kToneScale, kToneScale));
-        const bool visible = Finite(g.jnd) && std::fabs(g.dY) > 2.0f * g.jnd;   // plainly visible: amber
+        const bool visible = Finite(g.jnd) && std::fabs(g.dY) > 2.0f * g.jnd;   // likely visible (judgement call): amber
         ImU32 col = g.carried || g.limit ? Col(pal::InkFaint) : (visible && !g.hollow ? Col(pal::Alarm) : Col(pal::Data));
         if (over) {
             OverMark(p.dl, q.x, g.dY > 0 ? p.t + Px(4) : p.btm - Px(4), g.dY > 0, col);
