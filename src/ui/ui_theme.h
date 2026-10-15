@@ -59,6 +59,11 @@ namespace pal {
     // Plots: the scale lines and the zero / selected line (quieter than structural rules on a white field); a
     // tolerance band behind the data (light enough that the scale lines still show through it)
     inline ImU32 PlotGrid, PlotAxis, PlotBand;
+    // Data in charts, muted so the alarm colour still stands out: the main series and a second one (luminance vs
+    // colour); the tint directions of a grey; a calm colour for "under the visible threshold"
+    inline ImU32 Data, DataAlt;
+    inline ImU32 Warm, Cool, Magenta, Green;
+    inline ImU32 Fine;
 }
 
 // Shape rules of the current theme.

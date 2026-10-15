@@ -1973,9 +1973,13 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(vp->WorkPos);
     ImGui::SetNextWindowSize(vp->WorkSize);
+    // The root never scrolls: the footer sits at the viewport's bottom in screen space, so any scroll of the root
+    // (a wheel over a page that cannot scroll itself, a pixel of rounding overflow) moved the content down by that
+    // much and made room for more — the whole interface crept up without end.
+    ImGui::SetNextWindowScroll(ImVec2(0.0f, 0.0f));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), 0));
-    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollWithMouse |
                                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
     ImGui::Begin("##root", nullptr, flags);
     ImGui::PopStyleVar(2);

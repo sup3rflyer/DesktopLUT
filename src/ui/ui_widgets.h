@@ -108,7 +108,9 @@ void DrawFieldBox(ImDrawList* dl, ImVec2 a, ImVec2 b, bool hovered = false, bool
 bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip, bool* entered = nullptr);
 
 // A drop-down list: the field shows `preview`; while open, add DropdownItem rows and call EndDropdown.
-bool BeginDropdown(const char* id, const char* preview, float widthDip);
+// `wheel` (optional): the mouse wheel over the closed field steps the choice instead of scrolling the page; set to
+// -1 (wheel up: the previous choice), +1 (the next) or 0.
+bool BeginDropdown(const char* id, const char* preview, float widthDip, int* wheel = nullptr);
 bool DropdownItem(const char* label, bool selected);
 void EndDropdown();
 

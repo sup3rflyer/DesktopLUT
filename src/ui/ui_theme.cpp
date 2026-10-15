@@ -153,6 +153,12 @@ const ThemeDef kLight = {
     { RGB(0x00, 0x00, 0x80), RGB(0xff, 0xff, 0xff), true },
 };
 
+// Chart data colours per theme (pal::Data ...): muted on the dark grounds, deeper on Light's white plot field.
+struct DataColours { ImU32 data, dataAlt, warm, cool, magenta, green, fine; };
+const DataColours kDarkData  = { Hex(0x8cb4dc), Hex(0xc59bd0), Hex(0xe8a070), Hex(0x6fa5e3), Hex(0xd47cc9), Hex(0x7cc490), Hex(0x77c29a) };
+const DataColours kGrayData  = { Hex(0x93b6da), Hex(0xc4a0cf), Hex(0xe2a276), Hex(0x76a8e0), Hex(0xcf83c6), Hex(0x82c495), Hex(0x7fc29f) };
+const DataColours kLightData = { Hex(0x235f9c), Hex(0x7f3f93), Hex(0xb5561a), Hex(0x1f5fbf), Hex(0x9a2f8f), Hex(0x2a7f3a), Hex(0x1f6f45) };
+
 ThemeId g_theme = ThemeId::Dark;
 const ThemeDef* g_def = &kDark;
 
@@ -182,6 +188,10 @@ void CopyPalette(const ThemeDef& d) {
     pal::BevelShadow = d.bevelShadow; pal::BevelDark = d.bevelDark;
     pal::LightOn = d.lightOn; pal::SwitchOn = d.switchOn; pal::SwitchKnob = d.switchKnob;
     pal::PlotGrid = d.plotGrid; pal::PlotAxis = d.plotAxis; pal::PlotBand = d.plotBand;
+    const DataColours& c = &d == &kLight ? kLightData : &d == &kGray ? kGrayData : kDarkData;
+    pal::Data = c.data; pal::DataAlt = c.dataAlt;
+    pal::Warm = c.warm; pal::Cool = c.cool; pal::Magenta = c.magenta; pal::Green = c.green;
+    pal::Fine = c.fine;
 }
 
 // The palette holds Dark before any theme is chosen, so nothing ever draws with zero colours.

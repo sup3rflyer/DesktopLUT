@@ -699,7 +699,7 @@ struct DropdownState { bool pushedSpacing = false; };
 DropdownState g_dropdown;
 }
 
-bool BeginDropdown(const char* id, const char* preview, float widthDip) {
+bool BeginDropdown(const char* id, const char* preview, float widthDip, int* wheel) {
     const float w = Snap(Px(widthDip)), h = Snap(Px(kControlH));
     const ImVec2 a = SnapV(ImGui::GetCursorScreenPos()), b(a.x + w, a.y + h);
     ImGui::SetCursorScreenPos(a);
@@ -707,6 +707,19 @@ bool BeginDropdown(const char* id, const char* preview, float widthDip) {
     if (ImGui::InvisibleButton(id, ImVec2(w, h))) ImGui::OpenPopup(popup);
     const bool hovered = ImGui::IsItemHovered();
     const bool open = ImGui::IsPopupOpen(popup, 0);
+    if (wheel) {
+        // The field owns the wheel while hovered (the page does not scroll). A notch is one step; a touchpad's small
+        // deltas add up to one.
+        *wheel = 0;
+        if (!open && ImGui::SetItemKeyOwner(ImGuiKey_MouseWheelY)) {
+            ImGuiStorage* st = ImGui::GetStateStorage();
+            const ImGuiID key = ImGui::GetID("##wheel");
+            float acc = st->GetFloat(key, 0.0f) + ImGui::GetIO().MouseWheel;
+            if (acc >= 1.0f) { *wheel = -1; acc = 0.0f; }
+            else if (acc <= -1.0f) { *wheel = 1; acc = 0.0f; }
+            st->SetFloat(key, acc);
+        }
+    }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     DrawField(dl, a, b, hovered, open);
     // The arrow: a small raised button (Light) or a chevron.

@@ -527,13 +527,23 @@ void ChartTile(ViewState& vs, int i, DlcChart k, const dlc::LiveCharts* c, bool 
     const int pick = vs.dlc.tile[i];
     const ImVec2 ha(ta.x, ta.y), hb(ta.x + Px(ddW), ta.y + Snap(Px(kTileHeadH)));
     const bool headHover = ImGui::IsMouseHoveringRect(ha, hb) && ImGui::IsWindowHovered();
-    if (BeginDropdown("##chart", DlcChartTitle(k, hdr), ddW)) {
+    int wheel = 0;
+    if (BeginDropdown("##chart", DlcChartTitle(k, hdr), ddW, &wheel)) {
         if (DropdownItem("AUTOMATIC", pick < 0)) vs.dlc.tile[i] = -1;
         for (int j = 0; j < (int)DlcChart::Count; j++)
             if (DropdownItem(DlcChartTitle((DlcChart)j, hdr), pick == j)) vs.dlc.tile[i] = j;
         EndDropdown();
     } else if (headHover) {
         ImGui::SetTooltip("%s", DlcChartTip(k));
+    }
+    if (wheel != 0) {   // the next / previous chart that has something to show (any chart when none has)
+        const int n = (int)DlcChart::Count;
+        int next = (int)k;
+        for (int step = 0; step < n; step++) {
+            next = (next + wheel + n) % n;
+            if (!c || !c->present || DlcChartHasData((DlcChart)next, *c)) break;
+        }
+        vs.dlc.tile[i] = next;
     }
     ImGui::SetCursorScreenPos(ImVec2(Snap(tb.x - Px(kMaxBtnW)), ta.y));
     if (Button("##full", full ? "TILES" : "FULL", kMaxBtnW)) vs.dlc.maximized = full ? -1 : i;
