@@ -224,6 +224,31 @@ std::shared_ptr<dlc::LiveCharts> FakeCharts(bool hdr, int reads) {
                  { "0.35 nit \xC2\xB7 red 75 %", "p0077", 1.38f, 0.006f, 0.0043f, -3.0f, 'L', dlc::Zone::Core, 0xEB4A3Au, 0xD8463Au } };
     pr.apart = { { "1726 nit \xC2\xB7 grey", "p0005", 14.02f, 0.0f, 0.0f, -14.4f, 'L', dlc::Zone::Anchor, 0xEBEBEBu, 0xEBDCDCu },
                  { "0.67 nit \xC2\xB7 orange 85 %", "p0125", 12.55f, 0.0138f, 0.0011f, -1.6f, 'H', dlc::Zone::Limits, 0xEB601Eu, 0xEB0027u } };
+    const float comps[5][3] = { { 1.6f, 0.2f, 0.1f }, { -0.3f, -1.7f, 0.4f }, { 0.8f, -0.2f, 0.1f }, { -0.2f, 0.9f, -2.9f }, { -0.9f, 0.3f, 0.6f } };
+    const char* turns[5] = { "", "blue", "", "red", "orange" };
+    for (size_t i = 0; i < pr.worst.size() && i < 5; i++) {
+        pr.worst[i].L = comps[i][0];
+        pr.worst[i].C = comps[i][1];
+        pr.worst[i].H = comps[i][2];
+        pr.worst[i].hueTo = turns[i];
+    }
+    pr.impactTotal = 0.21f;
+    const char famKeys[6] = { 'R', 'Y', 'G', 'C', 'B', 'M' };
+    const char* famNames[6] = { "red", "yellow", "green", "cyan", "blue", "magenta" };
+    for (int f = 0; f < 6; f++) {
+        dlc::FamilyRow row;
+        row.key = famKeys[f];
+        row.name = famNames[f];
+        row.thin = f == 5;
+        row.n = row.thin ? 2 : 18;
+        row.w = row.thin ? 0.002f : 0.1f;
+        for (int k = 0; k < (row.thin ? 1 : 5); k++) {
+            const float y = std::pow(10.0f, (hdr ? -1.0f : 0.0f) + 0.7f * (float)k);
+            row.points.push_back({ y, -0.4f + 0.15f * (float)f - 0.05f * (float)k, -1.2f * std::exp(-0.6f * (float)k) + 0.1f * (float)f,
+                                   0.1f, -3.0f, 1.1f, 3 + k });
+        }
+        pr.families.push_back(row);
+    }
     for (int i = 0; i < 40; i++) {
         const float t = 140.0f + 75.0f * (float)i;
         const int seg = i < 24 ? 0 : 1;
@@ -610,11 +635,11 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
-                if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = 0;
+                if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = shot.variant == 16 ? 3 : 0;   // 16: WORST MISSES, wide
                 if (shot.variant == 19 || shot.variant == 20) {
                     using K = ui::DlcChart;
-                    const K picks[2][4] = { { K::Hues, K::Cie, K::Distribution, K::Stability },
-                                            { K::Convergence, K::Hues, K::ToneError, K::Distribution } };
+                    const K picks[2][4] = { { K::Colours, K::Hues, K::Cie, K::Stability },
+                                            { K::Colours, K::Convergence, K::ToneError, K::Distribution } };
                     for (int i = 0; i < 4; i++) vs.dlc.tile[i] = (int)picks[shot.variant - 19][i];
                 }
                 if (shot.variant == 3 || shot.variant == 4) {

@@ -121,3 +121,41 @@ def test_content_weights_from_the_patch_file_named_by_the_header(tmp_path: Path)
     s.content_weights = load_content_weights(s.verify_patches_file)   # what the publisher does
     pt = s.charts()["cie"]["points"][0]
     assert pt["w"] == 0.4 and pt["crole"] == "content"
+
+
+def test_colour_by_level_families():
+    pts = [_pt(ty, 1.0, L=-0.5, C=-1.0 if ty < 1 else 0.2, sig=(1.0, 0.1, 0.1))     # a red ramp: 5 per half decade
+           for ty in [0.2] * 5 + [2.0] * 5 + [20.0] * 5]
+    pts.append(_pt(5.0, 1.0, C=0.5, sig=(0.9, 0.2, 0.9)))                            # one magenta
+    pts.append(_pt(5.0, 9.0, sig=(0.1, 0.1, 1.0), zone="clamped"))                   # a clamped blue: left out
+    pts.append(_pt(5.0, 0.4, sig=(0.5, 0.5, 0.5)))                                   # a grey: no family
+    v = summarize(pts, [], hdr=True)
+    assert [f["key"] for f in v["families"]] == ["R", "Y", "G", "C", "B", "M"]
+    fam = {f["key"]: f for f in v["families"]}
+    r = fam["R"]
+    assert r["n"] == 15 and not r["thin"]
+    assert [p["n"] for p in r["points"]] == [5, 5, 5]
+    assert r["points"][0]["C"] == pytest.approx(-1.0) and r["points"][2]["C"] == pytest.approx(0.2)
+    assert r["points"][0]["L"] == pytest.approx(-0.5)
+    assert r["points"][0]["Y"] == pytest.approx(0.2, rel=1e-3)                       # the bin's (log) mean level
+    assert fam["M"]["n"] == 1 and fam["M"]["thin"]
+    assert fam["B"]["n"] == 0 and fam["B"]["points"] == []
+
+
+def test_colour_by_level_merges_single_patch_bins():
+    pts = [_pt(ty, 1.0, C=0.3, sig=(0.1, 1.0, 0.1)) for ty in (0.1, 1.0, 10.0, 100.0, 1000.0)]   # one per bin
+    g = {f["key"]: f for f in summarize(pts, [], hdr=True)["families"]}["G"]
+    assert sum(p["n"] for p in g["points"]) == 5
+    assert [p["n"] for p in g["points"]] == [5]                                  # five lone readings: one level
+
+
+def test_worst_rows_carry_signed_components_and_hue_direction():
+    pts = [_pt(0.35, 7.4, L=-1.2, C=-0.8, H=6.9, sig=(1.0, 0.55, 0.2), w=0.004),     # orange turning toward yellow
+           _pt(5.0, 1.0, L=0.2, w=0.996)]
+    v = summarize(pts, [], hdr=True)
+    assert "grey" in v["worst"][0]["desc"]                                          # the content-heavy grey ranks first
+    top = next(r for r in v["worst"] if "orange" in r["desc"])
+    assert (top["L"], top["C"], top["H"]) == (-1.2, -0.8, 6.9)
+    assert top["hue_to"] == "yellow"
+    assert v["worst"][0]["hue_to"] is None                                          # a grey has no hue to turn
+    assert v["impact_total"] == pytest.approx(7.4 * 0.004 + 1.0 * 0.996, abs=1e-4)

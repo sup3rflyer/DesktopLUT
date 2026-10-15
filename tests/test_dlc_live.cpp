@@ -352,3 +352,22 @@ TEST_CASE("dlc live: the practical view (bands, hues, misses, limits, drift, sta
     CHECK_FALSE(old.practical.present);
     CHECK(old.stages.empty());
 }
+
+TEST_CASE("dlc live: colour by level (hue families along brightness)") {
+    LiveCharts c;
+    REQUIRE(ParseLiveCharts(R"({"live_schema": 1, "seq": 1, "practical": {"weighting": "survey", "bands": [],
+      "families": [{"key": "R", "name": "red", "n": 9, "w": 0.12, "thin": false,
+                    "points": [{"Y": 0.6, "n": 3, "L": -0.5, "C": -1.0, "H": 0.1, "dY": -4.0, "de": 1.2},
+                               {"Y": null, "n": 3}, {"Y": 60.0, "n": 3, "L": 0.1, "C": 0.2, "H": 0.0}]},
+                   {"key": "M", "name": "magenta", "n": 1, "w": 0.002, "thin": true, "points": []}]}})", c));
+    REQUIRE(c.practical.families.size() == 2);
+    const FamilyRow& r = c.practical.families[0];
+    CHECK(r.key == 'R');
+    CHECK(r.name == "red");
+    CHECK_FALSE(r.thin);
+    REQUIRE(r.points.size() == 2);   // a point without its level is dropped
+    CHECK(r.points[0].C == doctest::Approx(-1.0f));
+    CHECK(r.points[0].n == 3);
+    CHECK(r.points[1].Y == doctest::Approx(60.0f));
+    CHECK(c.practical.families[1].thin);
+}

@@ -18,6 +18,7 @@ enum class DlcChart {
     Bands,          // ERROR BY LEVEL: content-weighted ΔE per luminance band, lightness vs colour share
     ToneError,      // TONE ERROR: luminance error % along the grey ramp (log nits), the 1-JND envelope
     GreyTint,       // GREY TINT: warm↔cool and green↔magenta of each grey, an exaggerated swatch ribbon
+    Colours,        // COLOUR BY LEVEL: each hue family's brightness and saturation error along nits
     Worst,          // WORST THAT MATTERS: misses ranked by content × ΔE, in words; limits apart
     Hues,           // HUE ERROR: per hue sector, signed saturation (radial) and hue rotation (tangential)
     Stability,      // STABILITY: per-channel drift of the drift reference over the run

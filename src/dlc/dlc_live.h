@@ -134,7 +134,25 @@ struct DriftPoint { float elapsedS, r, g, b; int seg; };
 // The practical view of the charted stage.
 struct BandRow { std::string label; float lo, hi, share, mean, p95, L, C, H; int n; float Lr = (float)kNaN; };   // L signed mean; Lr, C, H RMS
 struct HueRow { int sector; std::string name; int n; float w, de, C, H; };
-struct WorstRow { std::string desc, label; float de, impact, w, dY; char comp; Zone zone; uint32_t intended, measured; };
+struct WorstRow {
+    std::string desc, label;
+    float de, impact, w, dY;
+    char comp;                              // the largest component: L / C / H
+    Zone zone;
+    uint32_t intended, measured;
+    float L = (float)kNaN, C = (float)kNaN, H = (float)kNaN;   // signed: + brighter / + more saturated / + toward hueTo
+    std::string hueTo;                      // the neighbouring hue the colour turns toward ("" none)
+};
+// A hue family's error along brightness (colour by level): metric units, + brighter / + more saturated.
+struct FamilyPoint { float Y, L, C, H, dY, de; int n; };
+struct FamilyRow {
+    char key = ' ';                        // R Y G C B M
+    std::string name;
+    int n = 0;
+    float w = (float)kNaN;                 // share of the content
+    bool thin = false;                     // too few patches to show a trend
+    std::vector<FamilyPoint> points;       // brightness order
+};
 struct PanelLimits {
     float peak = (float)kNaN, targetPeak = (float)kNaN, neutralPeak = (float)kNaN, black = (float)kNaN;
     bool hasWhite = false;
@@ -148,7 +166,9 @@ struct Practical {
     float score = (float)kNaN, coverage = (float)kNaN, offsetL = (float)kNaN;
     int n = 0;
     std::vector<HueRow> hues;
+    std::vector<FamilyRow> families;       // R Y G C B M
     std::vector<WorstRow> worst, apart;    // the misses that matter; anchors / peak / limits / clamped apart
+    float impactTotal = (float)kNaN;       // the sum of content x error over every core patch (worst rows' share of it)
     PanelLimits limits;
     std::string contentClass;              // e.g. seq_hdr_balanced
     float contentScore = (float)kNaN;      // DLC's scored content-weighted ΔE

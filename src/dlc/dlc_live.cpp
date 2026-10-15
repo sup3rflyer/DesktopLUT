@@ -154,18 +154,46 @@ void ParsePractical(const JsonValue& pr, Practical& out) {
                                  F(Num(&h, "de")), F(Num(&h, "C")), F(Num(&h, "H")) });
         }
     }
+    if (const JsonValue* fams = Arr(&pr, "families")) {
+        for (const JsonValue& f : fams->arr) {
+            if (f.type != JsonValue::Obj) continue;
+            FamilyRow row;
+            const std::string key = Str(&f, "key");
+            row.key = key.empty() ? ' ' : key[0];
+            row.name = Str(&f, "name");
+            row.n = Int(&f, "n", 0);
+            row.w = F(Num(&f, "w"));
+            row.thin = Bool(&f, "thin");
+            if (const JsonValue* pts = Arr(&f, "points")) {
+                for (const JsonValue& p : pts->arr) {
+                    if (p.type != JsonValue::Obj) continue;
+                    const double y = Num(&p, "Y");
+                    if (!std::isfinite(y) || y <= 0) continue;
+                    row.points.push_back({ F(y), F(Num(&p, "L")), F(Num(&p, "C")), F(Num(&p, "H")), F(Num(&p, "dY")),
+                                           F(Num(&p, "de")), Int(&p, "n", 0) });
+                }
+            }
+            out.families.push_back(std::move(row));
+        }
+    }
     auto worst = [](const JsonValue* arr, std::vector<WorstRow>& rows) {
         if (!arr) return;
         for (const JsonValue& r : arr->arr) {
             if (r.type != JsonValue::Obj) continue;
             const std::string comp = Str(&r, "comp");
-            rows.push_back({ Str(&r, "desc"), Str(&r, "label"), F(Num(&r, "de")), F(Num(&r, "impact")), F(Num(&r, "w")),
-                             F(Num(&r, "dY")), comp.empty() ? ' ' : comp[0], ZoneOf(Str(&r, "zone")),
-                             Hex(Str(&r, "sc")), Hex(Str(&r, "mc")) });
+            WorstRow row{ Str(&r, "desc"), Str(&r, "label"), F(Num(&r, "de")), F(Num(&r, "impact")), F(Num(&r, "w")),
+                          F(Num(&r, "dY")), comp.empty() ? ' ' : comp[0], ZoneOf(Str(&r, "zone")),
+                          Hex(Str(&r, "sc")), Hex(Str(&r, "mc")) };
+            row.L = F(Num(&r, "L"));
+            row.C = F(Num(&r, "C"));
+            row.H = F(Num(&r, "H"));
+            row.hueTo = Str(&r, "hue_to");
+            rows.push_back(std::move(row));
         }
     };
     worst(Arr(&pr, "worst"), out.worst);
     worst(Arr(&pr, "worst_apart"), out.apart);
+    out.impactTotal = F(Num(&pr, "impact_total"));
     if (const JsonValue* lim = Obj(&pr, "limits")) {
         PanelLimits& l = out.limits;
         l.peak = F(Num(lim, "peak"));

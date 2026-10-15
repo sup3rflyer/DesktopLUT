@@ -33,6 +33,11 @@ SURVEY_SHARE = {"hdr": (0.519, 0.257, 0.179, 0.027, 0.018), "sdr": (0.33, 0.28, 
 NEUTRAL_TINT = 1.0          # a grey whose tint is under this (metric units) reads neutral
 HUE_NAMES = ("red", "orange", "yellow", "lime", "green", "spring", "cyan", "azure", "blue", "violet",
              "magenta", "rose")
+FAMILIES = (("R", "red"), ("Y", "yellow"), ("G", "green"), ("C", "cyan"), ("B", "blue"), ("M", "magenta"))
+FAMILY_BINS_PER_DECADE = 2  # colour-by-level bins along log nits
+FAMILY_MIN_BIN = 5          # adjacent bins merge until each holds this many patches
+FAMILY_THIN = 8             # a family with fewer fresh patches is drawn faint: too few to show a trend
+FAMILY_ZONES_OUT = ("clamped", "anchor", "peak")   # panel limits / anchors: not a calibration trend
 
 
 def _f(v: Any) -> Optional[float]:
@@ -89,6 +94,65 @@ def signal_hue(sig: Optional[Sequence[float]]) -> tuple[Optional[int], float]:
     if s < 0.08:
         return None, s
     return int(((h * 360.0 + 15.0) % 360.0) // 30.0), s
+
+
+def family_of(sig: Optional[Sequence[float]]) -> Optional[int]:
+    """The intended colour's hue family — 0 red, 1 yellow, 2 green, 3 cyan, 4 blue, 5 magenta (60° each, centred
+    on the primaries and secondaries); None for a grey."""
+    try:
+        r, g, b = (max(0.0, min(1.0, float(c))) for c in sig[:3])  # type: ignore[index]
+    except (TypeError, ValueError, IndexError):
+        return None
+    h, s, _ = colorsys.rgb_to_hsv(r, g, b)
+    if s < 0.08:
+        return None
+    return int(((h * 360.0 + 30.0) % 360.0) // 60.0)
+
+
+def colour_by_level(pts: Sequence[dict], weights: Sequence[float]) -> list[dict]:
+    """Each hue family's error along brightness: the lightness and the saturation component (metric units, 1 = just
+    visible, signed: + brighter / + more saturated) and the hue rotation, binned at FAMILY_BINS_PER_DECADE bins
+    per decade of target nits, weighted like the score. Panel limits and anchors are left out."""
+    by: list[dict[int, list[tuple[dict, float]]]] = [{} for _ in FAMILIES]
+    for p, w in zip(pts, weights):
+        f = family_of(p.get("sig"))
+        ty = _f(p.get("tY"))
+        if f is None or ty is None or ty <= 0 or (p.get("zone") or "core") in FAMILY_ZONES_OUT:
+            continue
+        k = math.floor(math.log10(ty) * FAMILY_BINS_PER_DECADE)
+        by[f].setdefault(k, []).append((p, w))
+    total = sum(weights) or 1.0
+    out = []
+    for f, (key, name) in enumerate(FAMILIES):
+        bins = by[f]
+        n = sum(len(v) for v in bins.values())
+        fam_w = sum(w for v in bins.values() for _, w in v)
+        # Adjacent bins merge until each holds FAMILY_MIN_BIN patches: one patch is a reading, not a level.
+        groups: list[list[tuple[dict, float]]] = []
+        cur: list[tuple[dict, float]] = []
+        for k in sorted(bins):
+            cur += bins[k]
+            if len(cur) >= FAMILY_MIN_BIN:
+                groups.append(cur)
+                cur = []
+        if cur:
+            if groups:
+                groups[-1] += cur
+            else:
+                groups.append(cur)
+        points = []
+        for rows in groups:
+            wsum = sum(w for _, w in rows)
+            ws = [(w if wsum > 0 else 1.0) for _, w in rows]   # weightless rows (anchors' kin) count equally
+            def mean(key_: str) -> Optional[float]:
+                return _wmean([(_f(p.get(key_)), w) for (p, _), w in zip(rows, ws) if _f(p.get(key_)) is not None])
+            logs = _wmean([(math.log10(_f(p["tY"])), w) for (p, _), w in zip(rows, ws)])
+            points.append({"Y": _r(10.0 ** logs if logs is not None else None, 4), "n": len(rows),
+                           "L": _r(mean("L")), "C": _r(mean("C")), "H": _r(mean("H")),
+                           "dY": _r(mean("dY"), 2), "de": _r(mean("de"))})
+        out.append({"key": key, "name": name, "n": n, "w": _r(fam_w / total, 4), "thin": n < FAMILY_THIN,
+                    "points": points})
+    return out
 
 
 def describe(p: dict, hdr: bool) -> str:
@@ -161,10 +225,17 @@ def summarize(points: Sequence[dict], grays: Sequence[dict], *, hdr: bool,
         e = _f(p["de"])
         w = _weight(p, i, counts, prior, weighted)
         comps = {k: abs(_f(p.get(k)) or 0.0) for k in ("L", "C", "H")}
+        sector, _ = signal_hue(p.get("sig"))
+        hval = _f(p.get("H"))
+        # Which neighbour the hue turns toward (+ H turns toward the next sector on the wheel).
+        hue_to = (HUE_NAMES[(sector + (1 if hval > 0 else 11)) % 12]
+                  if sector is not None and hval is not None and abs(hval) >= 0.05 else None)
         rows.append({"desc": describe(p, hdr), "de": _r(e), "impact": _r(e * w, 5), "w": _r(w, 5),
                      "comp": max(comps, key=comps.get) if any(comps.values()) else None,
+                     "L": _r(_f(p.get("L"))), "C": _r(_f(p.get("C"))), "H": _r(hval), "hue_to": hue_to,
                      "zone": p.get("zone") or "core", "dY": _r(_f(p.get("dY")), 1),
                      "sc": p.get("lsc") or p.get("sc"), "mc": p.get("lmc") or p.get("mc"), "label": p.get("label")})
+    impact_total = sum(r["impact"] or 0.0 for r in rows if r["zone"] == "core")
     main = sorted((r for r in rows if r["zone"] == "core"), key=lambda r: r["impact"] or 0.0, reverse=True)[:12]
     apart = sorted((r for r in rows if r["zone"] != "core"), key=lambda r: r["de"] or 0.0, reverse=True)[:6]
 
@@ -192,6 +263,8 @@ def summarize(points: Sequence[dict], grays: Sequence[dict], *, hdr: bool,
             "cct": _r(_f(white.get("cct")), 0), "duv": _r(_f(white.get("duv")), 4),
             "tw": _r(_f(white.get("tw")), 2), "tm": _r(_f(white.get("tm")), 2), "dY": _r(_f(white.get("dY")), 2)},
     }
+    families = colour_by_level(pts, [_weight(p, i, counts, prior, weighted) for p, i in zip(pts, idx)])
     return {"weighting": "content" if weighted else "survey", "bands": band_rows, "score": _r(score),
             "coverage": _r(cov_share, 4), "offset_L": _r(_wmean(bright)), "n": len(pts),
-            "hues": hues, "worst": main, "worst_apart": apart, "limits": limits}
+            "hues": hues, "worst": main, "worst_apart": apart, "impact_total": _r(impact_total, 5),
+            "limits": limits, "families": families}

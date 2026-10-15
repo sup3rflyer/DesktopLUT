@@ -45,7 +45,7 @@ constexpr float kDeScale = 3.0f;      // band / stage means
 constexpr float kBandAlarm = 2.0f;    // a band mean above it, on a band holding >= 2 % of content: amber
 constexpr float kBandAlarmShare = 0.02f;
 constexpr float kToneScale = 10.0f;   // tone error, %
-constexpr float kTintScale = 3.0f;    // grey tint, metric units
+constexpr float kTintScale = 2.0f;    // grey tint / colour by level lanes, metric units (the band: ±1)
 constexpr float kDriftScale = 2.0f;   // drift, %
 constexpr float kDriftBand = 0.5f;
 constexpr float kCdfMax = 5.0f;       // the CDF's ΔE axis
@@ -72,9 +72,12 @@ ImU32 Fade(ImU32 c, float f) {
 }
 
 // A hue sector's colour (the intended colour's hue, sRGB-named sectors of 30°).
-ImU32 HueCol(int sector, float alpha) {
+// `muted`: softer, for lines that share a plot (colour by level).
+ImU32 HueCol(int sector, float alpha, bool muted = false) {
     float r, g, b;
-    ImGui::ColorConvertHSVtoRGB((float)sector / 12.0f, 0.78f, Shape().lightPlots ? 0.78f : 0.95f, r, g, b);
+    const float sat = muted ? (Shape().lightPlots ? 0.70f : 0.50f) : 0.78f;
+    const float val = muted ? (Shape().lightPlots ? 0.62f : 0.90f) : (Shape().lightPlots ? 0.78f : 0.95f);
+    ImGui::ColorConvertHSVtoRGB((float)sector / 12.0f, sat, val, r, g, b);
     return IM_COL32((int)(r * 255.0f), (int)(g * 255.0f), (int)(b * 255.0f), (int)(alpha * ImGui::GetStyle().Alpha * 255.0f));
 }
 
@@ -481,7 +484,7 @@ void DrawGreyTint(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {
             const float y = Snap(Y(v));
             DashedLine(p.dl, ImVec2(p.l, y), ImVec2(p.r, y), Fade(pal::InkFaint, 0.7f), Px(3), Px(4), 1.0f);
         }
-        for (float v : { 2.0f, 0.0f, -2.0f }) {
+        for (float v : { 1.0f, 0.0f, -1.0f }) {
             const std::string t = v == 0.0f ? std::string("0") : Fmt("%+.0f", v);
             const float tw = MeasureInk(Font::Mono, 10.0f, t.c_str()).advance;
             DrawText(p.dl, Font::Mono, 10.0f, Snap(p.l - tw - Px(6)), Snap(Y(v)), pal::InkFaint, t.c_str());
@@ -529,6 +532,112 @@ void DrawGreyTint(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {
     }
 }
 
+// ---- COLOUR BY LEVEL: each hue family's error along brightness, in two lanes — brighter / darker above, more / less
+// saturated below — one line per family in its own colour. A family with too few patches is faint; hovering a
+// family in the legend shows it alone. ------------------------------------------------------------------------------
+const int kFamilySector[6] = { 0, 2, 4, 6, 8, 10 };   // R Y G C B M on the 12-sector wheel
+
+void DrawColours(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {
+    const std::vector<dlc::FamilyRow>& fams = c.practical.families;
+    float lo = 1e9f, hi = 0.0f;
+    for (const dlc::FamilyRow& f : fams)
+        for (const dlc::FamilyPoint& q : f.points) { lo = std::min(lo, q.Y); hi = std::max(hi, q.Y); }
+    if (hi <= 0.0f) { Empty(a, b, "NO COLOURS"); return; }
+    Plot p = Field(a, b, 30, 22, 26, 12);
+    p.logX = true;
+    LogRange(lo, hi, p.x0, p.x1);
+    const ImVec2 m = ImGui::GetIO().MousePos;
+    const bool hover = Hovering(a, b);
+    // The legend (top right): each family's letter in its colour. Hovering one shows that family alone.
+    const float hy = Snap(a.y + Px(12));
+    int focus = -1;
+    struct Key { float x0, x1; };
+    Key keys[6] = {};
+    {
+        float x = p.r;
+        for (int i = (int)fams.size() - 1; i >= 0 && i < 6; i--) {
+            const char txt[2] = { fams[(size_t)i].key, 0 };
+            const float w = MeasureInk(Font::Label, 10.0f, txt).advance + Px(14);
+            keys[i] = { x - w, x };
+            x -= w + Px(4);
+            if (hover && fams[(size_t)i].n > 0 && m.x >= keys[i].x0 && m.x < keys[i].x1 && m.y >= a.y && m.y < p.t) focus = i;
+        }
+    }
+    Clip(p);
+    DecadeTicks(p);
+    const float gap = Snap(Px(10));
+    const float laneH = Snap((p.btm - p.t - gap) * 0.5f);
+    struct Lane { float t, btm; const char* upName; const char* downName; bool sat; };
+    const Lane lanes[2] = { { p.t, p.t + laneH, "BRIGHTER", "DARKER", false },
+                            { p.btm - laneH, p.btm, "MORE SATURATED", "LESS SATURATED", true } };
+    p.dl->AddRectFilled(ImVec2(p.l, lanes[0].btm + 1), ImVec2(p.r + 1, lanes[1].t), Col(pal::Field));
+    const dlc::FamilyRow* hotF = nullptr;
+    const dlc::FamilyPoint* hotP = nullptr;
+    float hotD = Px(12) * Px(12);
+    for (const Lane& ln : lanes) {
+        auto Y = [&](float v) { return ln.btm - (std::clamp(v, -kTintScale, kTintScale) + kTintScale) / (2.0f * kTintScale) * (ln.btm - ln.t); };
+        p.dl->AddRectFilled(ImVec2(p.l, Snap(Y(1.0f))), ImVec2(p.r + 1, Snap(Y(-1.0f)) + 1), Col(pal::PlotBand));   // just visible
+        p.dl->AddRectFilled(ImVec2(p.l, Snap(Y(0.0f))), ImVec2(p.r + 1, Snap(Y(0.0f)) + 1), Col(pal::PlotAxis));
+        for (float v : { 1.0f, 0.0f, -1.0f }) {
+            const std::string t = v == 0.0f ? std::string("0") : Fmt("%+.0f", v);
+            const float tw = MeasureInk(Font::Mono, 10.0f, t.c_str()).advance;
+            DrawText(p.dl, Font::Mono, 10.0f, Snap(p.l - tw - Px(6)), Snap(Y(v)), pal::InkFaint, t.c_str());
+        }
+        // Faint families first, the focused one last (on top).
+        for (int pass = 0; pass < 2; pass++) {
+            for (size_t i = 0; i < fams.size() && i < 6; i++) {
+                const dlc::FamilyRow& f = fams[i];
+                const bool front = focus >= 0 ? (int)i == focus : !f.thin;
+                if (front != (pass == 1) || f.points.empty()) continue;
+                const float alpha = focus >= 0 ? ((int)i == focus ? 1.0f : 0.12f) : (f.thin ? 0.35f : 0.95f);
+                const ImU32 col = HueCol(kFamilySector[i], alpha, true);
+                std::vector<ImVec2> line;
+                for (const dlc::FamilyPoint& q : f.points) {
+                    const float v = ln.sat ? q.C : q.L;
+                    if (!Finite(v)) continue;
+                    line.push_back(ImVec2(p.X(q.Y), Y(v)));
+                }
+                if (line.size() >= 2) p.dl->AddPolyline(line.data(), (int)line.size(), col, Px(1.6f), ImDrawFlags_None);
+                for (const dlc::FamilyPoint& q : f.points) {
+                    const float v = ln.sat ? q.C : q.L;
+                    if (!Finite(v)) continue;
+                    const ImVec2 d(p.X(q.Y), Y(v));
+                    if (std::fabs(v) > kTintScale) OverMark(p.dl, d.x, v > 0 ? ln.t + Px(4) : ln.btm - Px(4), v > 0, col);
+                    else if (f.thin) p.dl->AddCircle(d, Px(2.4f), col, 10, 1.0f);
+                    else p.dl->AddCircleFilled(d, Px(2.3f), col, 10);
+                    if (hover && (focus < 0 || (int)i == focus)) {
+                        const float dx = m.x - d.x, dy = m.y - d.y;
+                        if (dx * dx + dy * dy < hotD) { hotD = dx * dx + dy * dy; hotF = &f; hotP = &q; }
+                    }
+                }
+            }
+        }
+        DrawText(p.dl, Font::Label, 9.5f, Snap(p.l + Px(5)), Snap(ln.t + Px(7)), pal::InkFaint, ln.upName);
+        DrawText(p.dl, Font::Label, 9.5f, Snap(p.l + Px(5)), Snap(ln.btm - Px(7)), pal::InkFaint, ln.downName);
+    }
+    p.dl->PopClipRect();
+    Caption(p, p.a.x + Px(10), "SHADE: JUST VISIBLE");
+    for (size_t i = 0; i < fams.size() && i < 6; i++) {   // the legend
+        const dlc::FamilyRow& f = fams[i];
+        const char txt[2] = { f.key, 0 };
+        const bool has = f.n > 0;
+        const ImU32 col = has ? HueCol(kFamilySector[i], focus < 0 || (int)i == focus ? (f.thin ? 0.5f : 1.0f) : 0.3f, true) : Col(pal::InkFaint);
+        p.dl->AddCircleFilled(ImVec2(keys[i].x0 + Px(4), hy), Px(3.2f), has ? col : Fade(pal::InkFaint, 0.5f), 10);
+        DrawText(p.dl, Font::Label, 10.0f, Snap(keys[i].x0 + Px(10)), hy, has ? pal::InkDim : pal::InkFaint, txt);
+    }
+    if (focus >= 0 && !hotP) {
+        const dlc::FamilyRow& f = fams[(size_t)focus];
+        ImGui::SetTooltip("%s  \xC2\xB7  %d patches%s", f.name.c_str(), f.n, f.thin ? "  \xC2\xB7  too few for a trend" : "");
+    } else if (hotP) {
+        std::string tip = hotF->name + "  \xC2\xB7  " + Nits(hotP->Y) + " nit  \xC2\xB7  " + std::to_string(hotP->n) + " patches\n" +
+                          Lean(hotP->L, "brighter", "darker", "brightness exact") + "  \xC2\xB7  " +
+                          Lean(hotP->C, "more saturated", "less saturated", "saturation exact");
+        if (Finite(hotP->H) && std::fabs(hotP->H) >= 0.05f) tip += Fmt("\nhue turned %.2f", std::fabs(hotP->H));
+        if (hotF->thin) tip += "\ntoo few patches for a trend";
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
+}
+
 // ---- WORST MISSES: ranked by content × ΔE, in words; panel limits and anchors apart --------------------------------
 const char* ZoneTag(dlc::Zone z) {
     switch (z) {
@@ -540,37 +649,85 @@ const char* ZoneTag(dlc::Zone z) {
     }
 }
 
+// What the miss mostly is, in two or three words: DARKER 9% / LESS SAT / TURNS RED.
 std::string CompTag(const dlc::WorstRow& r) {
     switch (r.comp) {
-    case 'L': return Finite(r.dY) ? Fmt("LUM %+.0f%%", r.dY) : std::string("LUM");
-    case 'C': return "SAT";
-    case 'H': return "HUE";
-    default:  return std::string();
+    case 'L':
+        if (Finite(r.dY) && std::fabs(r.dY) >= 0.5f) return Fmt(r.dY < 0 ? "DARKER %.0f%%" : "BRIGHTER %.0f%%", std::fabs(r.dY));
+        return Finite(r.L) ? std::string(r.L < 0 ? "DARKER" : "BRIGHTER") : std::string("LUM");
+    case 'C': return Finite(r.C) ? std::string(r.C < 0 ? "LESS SAT" : "MORE SAT") : std::string("SAT");
+    case 'H': {
+        if (r.hueTo.empty()) return "HUE";
+        std::string t = "TURNS " + r.hueTo;
+        for (char& ch : t) ch = (char)std::toupper((unsigned char)ch);
+        return t;
+    }
+    default: return std::string();
     }
 }
 
-void WorstSwatches(ImDrawList* dl, float x, float cy, uint32_t intended, uint32_t measured, float sw, float alpha) {
-    dl->AddRectFilled(ImVec2(x, cy - sw * 0.5f), ImVec2(x + sw, cy + sw * 0.5f), intended ? (Rgb(intended) & ~IM_COL32_A_MASK) | ((ImU32)(alpha * 255.0f) << IM_COL32_A_SHIFT) : Col(pal::InkFaint));
-    dl->AddRectFilled(ImVec2(x + sw, cy - sw * 0.5f), ImVec2(x + 2 * sw, cy + sw * 0.5f), measured ? (Rgb(measured) & ~IM_COL32_A_MASK) | ((ImU32)(alpha * 255.0f) << IM_COL32_A_SHIFT) : Col(pal::InkFaint));
-    dl->AddRect(ImVec2(x, cy - sw * 0.5f), ImVec2(x + 2 * sw, cy + sw * 0.5f), Col(pal::Rule));
+// A description cut at its end to fit (the level and the hue lead it).
+std::string CutEnd(Font f, float size, const std::string& s, float maxW) {
+    if (MeasureInk(f, size, s.c_str()).advance <= maxW) return s;
+    const std::string dots = "\xE2\x80\xA6";
+    for (size_t cut = s.size(); cut > 0; cut--) {
+        if ((s[cut] & 0xC0) == 0x80) continue;   // not on a UTF-8 code point start
+        std::string t = s.substr(0, cut);
+        while (!t.empty() && t.back() == ' ') t.pop_back();
+        t += dots;
+        if (MeasureInk(f, size, t.c_str()).advance <= maxW) return t;
+    }
+    return dots;
+}
+
+// One square, the target's colour on the left half and the measured one on the right: touching halves show a
+// difference best.
+void SplitSwatch(ImDrawList* dl, float x, float cy, uint32_t intended, uint32_t measured, float s, float alpha) {
+    auto fill = [&](uint32_t hex) {
+        return hex ? (Rgb(hex) & ~IM_COL32_A_MASK) | ((ImU32)(alpha * ImGui::GetStyle().Alpha * 255.0f) << IM_COL32_A_SHIFT) : Col(pal::InkFaint);
+    };
+    const float y0 = Snap(cy - s * 0.5f), mid = Snap(x + s * 0.5f);
+    dl->AddRectFilled(ImVec2(x, y0), ImVec2(mid, y0 + s), fill(intended));
+    dl->AddRectFilled(ImVec2(mid, y0), ImVec2(x + s, y0 + s), fill(measured));
+    dl->AddRect(ImVec2(x, y0), ImVec2(x + s, y0 + s), Col(pal::Rule));
 }
 
 void DrawWorstLegacy(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {   // a report without the practical view
     ImDrawList* dl = ImGui::GetWindowDrawList();
     DrawFieldBox(dl, a, b);
-    const float rowH = Snap(Px(22)), pad = Px(10), sw = Snap(Px(14));
+    const float rowH = Snap(Px(22)), pad = Px(10), sw = Snap(Px(16));
     float y = a.y + Px(6);
     for (const dlc::Offender& o : c.offenders) {
         if (y + rowH > b.y - Px(4)) break;
         const float cy = Snap(y + rowH * 0.5f);
         const float x = Snap(a.x + pad);
-        WorstSwatches(dl, x, cy, o.intended, o.measured, sw, 1.0f);
-        DrawText(dl, Font::Mono, 11.0f, x + 2 * sw + Px(10), cy, pal::InkDim, o.label.c_str());
-        if (o.oog) DrawText(dl, Font::Label, 10.0f, x + 2 * sw + Px(74), cy, pal::InkFaint, "OOG");
+        SplitSwatch(dl, x, cy, o.intended, o.measured, sw, 1.0f);
+        DrawText(dl, Font::Mono, 11.0f, x + sw + Px(10), cy, pal::InkDim, o.label.c_str());
+        if (o.oog) DrawText(dl, Font::Label, 10.0f, x + sw + Px(74), cy, pal::InkFaint, "OOG");
         const std::string de = Num(o.de);
         const float tw = MeasureInk(Font::Mono, 12.0f, de.c_str()).advance;
         DrawText(dl, Font::Mono, 12.0f, Snap(b.x - pad - tw), cy, o.de > kAlarmDe && !o.oog ? pal::Alarm : pal::Ink, de.c_str());
         y += rowH;
+    }
+}
+
+// A signed component as a small bar from a centre line: right = + (brighter / more saturated / toward the next hue),
+// on the lanes' fixed ±2 scale (an arrow past it).
+void MiniBar(ImDrawList* dl, float x, float cy, float w, float v, ImU32 col) {
+    const float h = Snap(Px(8)), c = Snap(x + w * 0.5f);
+    dl->AddRectFilled(ImVec2(x, cy), ImVec2(x + w, cy + 1), Col(pal::PlotGrid));
+    dl->AddRectFilled(ImVec2(c, cy - h * 0.5f - Px(1)), ImVec2(c + 1, cy + h * 0.5f + Px(1)), Col(pal::PlotAxis));
+    if (!Finite(v)) return;
+    const float len = std::min(std::fabs(v), kTintScale) / kTintScale * (w * 0.5f);
+    if (len >= 0.5f) {
+        const float e = v > 0 ? c + 1 + len : c - len;
+        dl->AddRectFilled(ImVec2(Snap(std::min(c + (v > 0 ? 1.0f : 0.0f), e)), Snap(cy - h * 0.5f)),
+                          ImVec2(Snap(std::max(c + (v > 0 ? 1.0f : 0.0f), e)), Snap(cy + h * 0.5f)), col);
+    }
+    if (std::fabs(v) > kTintScale) {   // past the scale
+        const float s = Px(3.0f), tip = v > 0 ? x + w + Px(4) : x - Px(4);
+        if (v > 0) dl->AddTriangleFilled(ImVec2(tip, cy), ImVec2(tip - s, cy + s), ImVec2(tip - s, cy - s), col);
+        else dl->AddTriangleFilled(ImVec2(tip, cy), ImVec2(tip + s, cy - s), ImVec2(tip + s, cy + s), col);
     }
 }
 
@@ -583,40 +740,86 @@ void DrawWorst(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {
     }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     DrawFieldBox(dl, a, b);
-    const float rowH = Snap(Px(20)), pad = Px(10), sw = Snap(Px(12));
-    const int rows = std::max(0, (int)((b.y - a.y - Px(10)) / rowH));
-    int core = std::min((int)pr.worst.size(), pr.apart.empty() ? rows : std::max(rows - 4, rows * 2 / 3));
+    const float rowH = Snap(Px(22)), pad = Px(10), sw = Snap(Px(16));
+    const float top = a.y + Px(24);
+    const int rows = std::max(0, (int)((b.y - top - Px(4)) / rowH));
+    int core = std::min((int)pr.worst.size(), pr.apart.empty() ? rows : std::max(rows - 3, rows * 2 / 3));
     int apart = std::min((int)pr.apart.size(), rows - core - 1);
     if (apart < 1) { apart = 0; core = std::min((int)pr.worst.size(), rows); }
+    // Columns from the right: ΔE, the share of content (when there is room), what the miss is — the signed L / C / H
+    // bars in a wide tile, two or three words otherwise — and the description takes the rest.
+    const float deW = MeasureInk(Font::Mono, 12.0f, "00.00").advance;
+    const float contW = MeasureInk(Font::Mono, 10.0f, "00.0%").advance;
+    const float barW = Snap(Px(34)), barGap = Snap(Px(8)), barsW = 3.0f * barW + 2.0f * barGap;
+    const float wordW = MeasureInk(Font::Label, 10.0f, "BRIGHTER 99%").advance;
+    const float avail = b.x - a.x - 2.0f * pad - sw - Px(10);
+    const bool showBars = avail >= Px(460);
+    const float whatW = showBars ? barsW : wordW;
+    const bool showCont = avail - deW - contW - whatW - Px(36) >= Px(130);
+    const float deX = Snap(b.x - pad - deW);
+    const float contX = showCont ? Snap(deX - Px(12) - contW) : deX;
+    const float barsX = Snap(contX - Px(12) - whatW);
+    const float tx = Snap(a.x + pad + sw + Px(10));
     const float inset = Shape().bevel ? 2.0f * BevelPx() : 1.0f;
     dl->PushClipRect(ImVec2(a.x + inset, a.y + inset), ImVec2(b.x - inset, b.y - inset), true);
     const ImVec2 m = ImGui::GetIO().MousePos;
     const bool hover = Hovering(a, b);
     const dlc::WorstRow* hot = nullptr;
-    const float deW = MeasureInk(Font::Mono, 12.0f, "00.00").advance;
-    const float tagW = MeasureInk(Font::Label, 10.0f, "LUM +00%").advance;
-    float y = a.y + Px(5);
+    // Column heads, and how much of the error the listed misses carry.
+    const float hy = Snap(a.y + Px(12));
+    float shownImpact = 0.0f;
+    for (int i = 0; i < core; i++) if (Finite(pr.worst[(size_t)i].impact)) shownImpact += pr.worst[(size_t)i].impact;
+    if (Finite(pr.impactTotal) && pr.impactTotal > 0.0f && core > 0) {
+        const std::string head = Fmt("TOP %.0f", core) + Fmt("  \xC2\xB7  %.0f%% OF ERROR", 100.0f * shownImpact / pr.impactTotal);
+        DrawText(dl, Font::Label, 10.0f, Snap(a.x + pad), hy, pal::InkFaint, CutEnd(Font::Label, 10.0f, head, barsX - a.x - pad - Px(10)).c_str());
+    }
+    if (showBars) {
+        const char* heads[3] = { "L", "C", "H" };
+        for (int k = 0; k < 3; k++) {
+            const float cx = barsX + (float)k * (barW + barGap) + barW * 0.5f;
+            const float w = MeasureInk(Font::Label, 10.0f, heads[k]).advance;
+            DrawText(dl, Font::Label, 10.0f, Snap(cx - w * 0.5f), hy, pal::InkFaint, heads[k]);
+        }
+    }
+    if (showCont) {
+        const float w = MeasureInk(Font::Label, 10.0f, "CONT.").advance;
+        DrawText(dl, Font::Label, 10.0f, Snap(contX + contW - w), hy, pal::InkFaint, "CONT.");
+    }
+    {
+        const float w = MeasureInk(Font::Label, 10.0f, "\xCE\x94" "E").advance;
+        DrawText(dl, Font::Label, 10.0f, Snap(deX + deW - w), hy, pal::InkFaint, "\xCE\x94" "E");
+    }
+    float y = top;
     auto row = [&](const dlc::WorstRow& r, bool isApart) {
         const float cy = Snap(y + rowH * 0.5f);
-        const float x = Snap(a.x + pad);
-        WorstSwatches(dl, x, cy, r.intended, r.measured, sw, isApart ? 0.55f : 1.0f);
-        const float tx = x + 2 * sw + Px(10);
-        const float deX = Snap(b.x - pad - deW), tagX = Snap(deX - Px(10) - tagW);
-        const std::string tag = isApart ? std::string(ZoneTag(r.zone)) : CompTag(r);
-        const std::string desc = Ellipsize(Font::Mono, 11.0f, r.desc.empty() ? r.label : r.desc, tagX - tx - Px(8));
+        SplitSwatch(dl, Snap(a.x + pad), cy, r.intended, r.measured, sw, isApart ? 0.55f : 1.0f);
+        const std::string desc = CutEnd(Font::Mono, 11.0f, r.desc.empty() ? r.label : r.desc, barsX - tx - Px(10));
         DrawText(dl, Font::Mono, 11.0f, tx, cy, isApart ? pal::InkFaint : pal::Ink, desc.c_str());
-        DrawText(dl, Font::Label, 10.0f, tagX, cy, isApart ? pal::InkFaint : pal::InkDim, tag.c_str());
+        if (isApart) {   // a limit or an anchor: what it is instead of how it misses
+            DrawText(dl, Font::Label, 10.0f, barsX, cy, pal::InkFaint, ZoneTag(r.zone));
+        } else if (showBars) {
+            const float vals[3] = { r.L, r.C, r.H };
+            const ImU32 cols[3] = { Fade(pal::Data, 0.95f), Fade(pal::DataAlt, 0.95f), Fade(pal::InkDim, 0.95f) };
+            for (int k = 0; k < 3; k++) MiniBar(dl, barsX + (float)k * (barW + barGap), cy, barW, vals[k], cols[k]);
+        } else {
+            DrawText(dl, Font::Label, 10.0f, barsX, cy, pal::InkDim, CompTag(r).c_str());
+        }
+        if (showCont && Finite(r.w) && r.w > 0.0f && !isApart) {
+            const std::string t = r.w * 100.0f >= 0.1f ? Fmt(r.w * 100.0f >= 9.95f ? "%.0f%%" : "%.1f%%", r.w * 100.0f) : std::string("<0.1%");
+            const float w = MeasureInk(Font::Mono, 10.0f, t.c_str()).advance;
+            DrawText(dl, Font::Mono, 10.0f, Snap(contX + contW - w), cy, pal::InkDim, t.c_str());
+        }
         const std::string de = Num(r.de);
         const float tw = MeasureInk(Font::Mono, 12.0f, de.c_str()).advance;
         DrawText(dl, Font::Mono, 12.0f, Snap(b.x - pad - tw), cy,
-                 isApart ? pal::InkFaint : (r.de > kAlarmDe ? pal::Alarm : pal::Ink), de.c_str());
+                 isApart ? pal::InkFaint : r.de > kAlarmDe ? pal::Alarm : r.de <= 1.0f ? pal::Fine : pal::Ink, de.c_str());
         if (hover && m.y >= y && m.y < y + rowH) hot = &r;
         y += rowH;
     };
     for (int i = 0; i < core; i++) row(pr.worst[(size_t)i], false);
     if (apart > 0) {
         const float cy = Snap(y + rowH * 0.5f);
-        const float w = DrawText(dl, Font::Label, 10.0f, Snap(a.x + pad), cy, pal::InkFaint, "LIMITS & ANCHORS");
+        const float w = DrawText(dl, Font::Label, 10.0f, Snap(a.x + pad), cy, pal::InkFaint, "PANEL LIMITS & ANCHORS");
         dl->AddRectFilled(ImVec2(Snap(a.x + pad + w + Px(8)), cy), ImVec2(Snap(b.x - pad), cy + 1), Col(pal::Rule));
         y += rowH;
         for (int i = 0; i < apart; i++) row(pr.apart[(size_t)i], true);
@@ -624,9 +827,15 @@ void DrawWorst(const dlc::LiveCharts& c, ImVec2 a, ImVec2 b) {
     dl->PopClipRect();
     if (hot) {
         std::string tip = hot->desc + "\n\xCE\x94" "E " + Num(hot->de);
-        if (hot->comp == 'L') tip += Finite(hot->dY) ? Fmt(", brightness %+.1f %%", hot->dY) : std::string(", brightness");
-        else if (hot->comp == 'C') tip += ", saturation";
-        else if (hot->comp == 'H') tip += ", hue";
+        if (Finite(hot->w) && hot->w > 0.0f) tip += Fmt("  \xC2\xB7  %.2f %% of content", hot->w * 100.0f);
+        std::string how;
+        auto add = [&](const std::string& s) { if (!s.empty()) how += (how.empty() ? "" : "  \xC2\xB7  ") + s; };
+        if (Finite(hot->dY) && std::fabs(hot->dY) >= 0.5f) add(Fmt(hot->dY < 0 ? "too dark %.0f %%" : "too bright %.0f %%", std::fabs(hot->dY)));
+        else if (Finite(hot->L) && std::fabs(hot->L) >= 0.05f) add(Lean(hot->L, "too bright", "too dark"));
+        if (Finite(hot->C) && std::fabs(hot->C) >= 0.05f) add(Lean(hot->C, "over-saturated", "under-saturated"));
+        if (Finite(hot->H) && std::fabs(hot->H) >= 0.05f)
+            add(hot->hueTo.empty() ? Fmt("hue %.2f", std::fabs(hot->H)) : "toward " + hot->hueTo + Fmt(" %.2f", std::fabs(hot->H)));
+        if (!how.empty()) tip += "\n" + how;
         switch (hot->zone) {
         case dlc::Zone::Peak:    tip += "\nthe panel's peak"; break;
         case dlc::Zone::Limits:  tip += "\nrare in content"; break;
@@ -1107,7 +1316,8 @@ const char* EmptyText(DlcChart k) {
     case DlcChart::Bands:      return "NO BAND DATA";
     case DlcChart::ToneError:
     case DlcChart::GreyTint:   return "NO GREY STEPS";
-    case DlcChart::Hues:       return "NO COLOURS";
+    case DlcChart::Hues:
+    case DlcChart::Colours:    return "NO COLOURS";
     case DlcChart::Stability:  return "NO DRIFT CHECKS";
     case DlcChart::BuildDelta: return "ONE STAGE";
     case DlcChart::Convergence:return "NO BUILD";
@@ -1123,6 +1333,7 @@ const char* DlcChartTitle(DlcChart k, bool hdr) {
     case DlcChart::Bands:        return "ERROR BY LEVEL";
     case DlcChart::ToneError:    return "TONE ERROR";
     case DlcChart::GreyTint:     return "GREY TINT";
+    case DlcChart::Colours:      return "COLOUR BY LEVEL";
     case DlcChart::Worst:        return "WORST MISSES";
     case DlcChart::Hues:         return "HUE ERROR";
     case DlcChart::Stability:    return "STABILITY";
@@ -1139,6 +1350,7 @@ const char* DlcChartTip(DlcChart k) {
     case DlcChart::Bands:        return "Average error per brightness range. 1 is just visible.";
     case DlcChart::ToneError:    return "How far each grey is from its target brightness.";
     case DlcChart::GreyTint:     return "The colour cast of each grey. Dashed lines: just visible.";
+    case DlcChart::Colours:      return "Each colour family's brightness and saturation error, by level.";
     case DlcChart::Worst:        return "The misses you are most likely to see. Panel limits are listed apart.";
     case DlcChart::Hues:         return "Error per hue. Outside the wheel: too saturated. Bigger dot: more content.";
     case DlcChart::Stability:    return "How much the panel drifted during the run.";
@@ -1155,6 +1367,9 @@ bool DlcChartHasData(DlcChart k, const dlc::LiveCharts& c) {
     case DlcChart::Bands:        return c.practical.present;
     case DlcChart::ToneError:    return AnyGrey(c, false);
     case DlcChart::GreyTint:     return AnyGrey(c, true);
+    case DlcChart::Colours:
+        for (const dlc::FamilyRow& f : c.practical.families) if (!f.points.empty()) return true;
+        return false;
     case DlcChart::Worst:        return !c.practical.worst.empty() || !c.practical.apart.empty() || !c.offenders.empty();
     case DlcChart::Hues:
         for (const dlc::HueRow& h : c.practical.hues) if (h.n > 0) return true;
@@ -1180,6 +1395,7 @@ void DrawDlcChart(DlcChart k, const dlc::LiveCharts& c, ImVec2 a, ImVec2 b, cons
     case DlcChart::Bands:        DrawBands(c, a, b); break;
     case DlcChart::ToneError:    DrawToneError(c, a, b); break;
     case DlcChart::GreyTint:     DrawGreyTint(c, a, b); break;
+    case DlcChart::Colours:      DrawColours(c, a, b); break;
     case DlcChart::Worst:        DrawWorst(c, a, b); break;
     case DlcChart::Hues:         DrawHues(c, a, b); break;
     case DlcChart::Stability:    DrawStability(c, a, b, ctx); break;
