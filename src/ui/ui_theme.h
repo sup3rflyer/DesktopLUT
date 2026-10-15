@@ -56,8 +56,9 @@ namespace pal {
     inline ImU32 BevelHi, BevelLight, BevelShadow, BevelDark;
     // A layer's "on" light; the live-layers switch when on, and its knob
     inline ImU32 LightOn, SwitchOn, SwitchKnob;
-    // Plots: the scale lines and the zero / selected line (quieter than structural rules on a white field)
-    inline ImU32 PlotGrid, PlotAxis;
+    // Plots: the scale lines and the zero / selected line (quieter than structural rules on a white field); a
+    // tolerance band behind the data (light enough that the scale lines still show through it)
+    inline ImU32 PlotGrid, PlotAxis, PlotBand;
 }
 
 // Shape rules of the current theme.

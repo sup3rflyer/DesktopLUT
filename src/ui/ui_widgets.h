@@ -50,8 +50,9 @@ void DrawTextIn(ImDrawList* dl, Font f, float sizeDip, ImVec2 a, ImVec2 b, ImU32
 // ---- Shapes --------------------------------------------------------------------------------------
 
 float BevelPx();   // one bevel line: 1 px, 2 px from 175 % scaling
-// Windows 98 bevel inside a-b: raised (button), pressed (a button held or toggled in), sunken (a field).
-enum class BevelKind { Raised, Pressed, Sunken, Etched };
+// Windows 98 bevel inside a-b: raised (button), pressed (a button held or toggled in), sunken (a field), etched
+// (a group box), shallow (one line sunken: a status-bar pane, a progress bar's border).
+enum class BevelKind { Raised, Pressed, Sunken, Etched, Shallow };
 void Bevel(ImDrawList* dl, ImVec2 a, ImVec2 b, BevelKind kind);
 void DashedRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap, float rounding = 0.0f);
 // A status light centred at c. `onStrong`: drawn on the Strong (or list-selection) fill, in its ink.
@@ -76,8 +77,9 @@ int Segmented(const char* id, const char* const* labels, int count, int current,
 bool OnOff(const char* id, bool value, bool* out, const char* onLabel = "ON", const char* offLabel = "OFF",
            float minSegWidthDip = 52.0f);
 
-// A page tab in the header, in the rect a-b (pixels). Returns true when clicked.
-bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b);
+// A page tab in the header, in the rect a-b (pixels). Returns true when clicked. `light` (optional) sits in the
+// tab's right margin, on the label's line, without moving the label.
+bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b, Light light = Light::None);
 float TabWidth(const char* label);   // pixels
 
 // A pixel-path stage on the signal line: its light, its label; `off` = not doing anything (dashed).

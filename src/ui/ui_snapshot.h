@@ -5,6 +5,7 @@
 
 #include "ui_model.h"
 #include "dlc/dlc_join.h"
+#include "dlc/dlc_live.h"
 #include "actions/notify.h"
 #include <windows.h>
 #include <memory>
@@ -28,6 +29,7 @@ struct DisplayRow {
     dlc::DisplayMatch dlcMatch;
     dlc::ModeRecord dlcRecord[2];   // 0 SDR, 1 HDR
     bool reminderDue = false;       // for the mode the display is in
+    bool dlcRun = false;            // the DLC run (Snapshot::run) measures this display
 };
 
 struct Snapshot {
@@ -37,6 +39,7 @@ struct Snapshot {
     bool suspended = false;   // the user's Suspend (act::LiveLayersSuspended)
     bool calibrating = false; // a DLC calibration session or live edit is open (IsCalibrationOrLiveEditActive)
     std::shared_ptr<const dlc::Data> dlc;   // the latest DLC scan (never null)
+    std::shared_ptr<const dlc::Live> run;   // DLC's run in progress, or the last one (never null)
     bool hookMode = false;
     bool hookActive = false;
     std::wstring lastStatus;       // the newest status line or warning / error (any source)

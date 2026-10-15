@@ -3,6 +3,7 @@
 #include "ui_gsedit.h"   // LiveEditNotes, NightLightOn
 #include "ui_views.h"
 #include "ui_widgets.h"
+#include "ui_charts.h"
 #include "ui_window.h"
 #include "actions/mhc_edit.h"
 #include <commdlg.h>
@@ -107,33 +108,6 @@ std::string Fit(Font f, float sizeDip, const std::string& s, float maxW) {
         if (MeasureText(f, sizeDip, t.c_str()).x <= maxW) return t;
     }
     return "\xE2\x80\xA6";
-}
-
-// A spectral colour for the diagram's tint: xy at unit luminance to linear sRGB, out-of-gamut parts dropped,
-// brightest channel to 1, sRGB-encoded.
-ImU32 TintOf(float x, float y, float alpha) {
-    const float X = x / y, Y = 1.0f, Z = (1.0f - x - y) / y;
-    float c[3] = { 3.2406f * X - 1.5372f * Y - 0.4986f * Z, -0.9689f * X + 1.8758f * Y + 0.0415f * Z,
-                   0.0557f * X - 0.2040f * Y + 1.0570f * Z };
-    float m = 0.0f;
-    for (float& v : c) { v = std::max(v, 0.0f); m = std::max(m, v); }
-    int out[3];
-    for (int i = 0; i < 3; i++) {
-        const float l = m > 0.0f ? c[i] / m : 0.0f;
-        const float e = l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
-        out[i] = (int)std::lround(std::clamp(e, 0.0f, 1.0f) * 255.0f);
-    }
-    return IM_COL32(out[0], out[1], out[2], (int)std::lround(alpha * 255.0f));
-}
-
-void DashedLine(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float dash, float gap, float thick) {
-    const float dx = b.x - a.x, dy = b.y - a.y, len = std::sqrt(dx * dx + dy * dy);
-    if (len < 1.0f) return;
-    const float ux = dx / len, uy = dy / len;
-    for (float t = 0.0f; t < len; t += dash + gap) {
-        const float e = std::min(t + dash, len);
-        dl->AddLine(ImVec2(a.x + ux * t, a.y + uy * t), ImVec2(a.x + ux * e, a.y + uy * e), col, thick);
-    }
 }
 
 // ---- one input line of the column: a label, then widgets left to right ---------------------------------------
@@ -245,12 +219,12 @@ int DrawDiagram(MhcEditorState& ed, ImVec2 a, ImVec2 b) {
     {
         const ImVec2 uv = ImGui::GetFontTexUvWhitePixel();
         const ImVec2 c = P(kD65x, kD65y);
-        const ImU32 cc = TintOf(kD65x, kD65y, 0.0f);
+        const ImU32 cc = SpectralTint(kD65x, kD65y, 0.0f);
         ImVec2 pts[kLocusN];
         ImU32 cols[kLocusN];
         for (int i = 0; i < kLocusN; i++) {
             pts[i] = P(kCieLocus[i][0], kCieLocus[i][1]);
-            cols[i] = TintOf(kCieLocus[i][0], kCieLocus[i][1], 0.34f);
+            cols[i] = SpectralTint(kCieLocus[i][0], kCieLocus[i][1], 0.34f);
         }
         dl->PrimReserve(kLocusN * 3, kLocusN * 3);
         for (int i = 0; i < kLocusN; i++) {   // a fan from the white point; the last closes the line of purples

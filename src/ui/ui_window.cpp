@@ -12,6 +12,7 @@
 #include "actions/logcap.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
+#include "dlc/dlc_live.h"
 #include "globals.h"
 #include "../resource.h"
 #include <windows.h>
@@ -248,6 +249,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_minimized = true;
                 StopAnimTimer();
                 KillTimer(hwnd, kDlcTimer);
+                dlc::SetLiveWatchActive(false);
                 KillTimer(hwnd, kModeTimer);
                 SetTimer(hwnd, kReleaseTimer, kReleaseMs, nullptr);
             }
@@ -381,6 +383,7 @@ bool CreateUiWindow() {
     g_minimized = false;
     notify::SetListener(&Invalidate);
     dlc::SetScanListener(&Invalidate);   // a scan or a patch load finished on the worker
+    dlc::SetLiveListener(&Invalidate);   // the DLC run moved, or a record's charts loaded
     logcap::SetListener(&OnLogLine);
     return true;
 }
@@ -435,6 +438,7 @@ void Hide() {
     ShowWindow(g_hwnd, SW_HIDE);
     StopAnimTimer();
     KillTimer(g_hwnd, kDlcTimer);
+    dlc::SetLiveWatchActive(false);
     KillTimer(g_hwnd, kModeTimer);
     SetTimer(g_hwnd, kReleaseTimer, kReleaseMs, nullptr);
 }
@@ -450,6 +454,7 @@ void Shutdown() {
     notify::SetListener(nullptr);
     logcap::SetListener(nullptr);
     dlc::StopScanner();   // joins the worker (a scan in flight finishes first)
+    dlc::StopLiveWatch();
     if (g_hwnd) DestroyWindow(g_hwnd);
 }
 
@@ -470,7 +475,12 @@ std::wstring DlcFolder() {
     return dlc::ResolveFolder(g_dlcFolder, dir);
 }
 
-void RequestDlcScan() { dlc::RequestScan(DlcFolder()); }
+void RequestDlcScan() {
+    const std::wstring folder = DlcFolder();
+    dlc::RequestScan(folder);
+    dlc::WatchLive(folder);          // the run in progress: polled while the interface is visible
+    dlc::SetLiveWatchActive(true);
+}
 
 void ApplyUiTheme() {
     ApplyTheme(ThemeFromIndex(g_uiTheme));

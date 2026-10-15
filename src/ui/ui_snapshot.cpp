@@ -201,6 +201,29 @@ void TakeSnapshot(Snapshot& out) {
     for (DisplayRow& r : out.live) attach(r);
     for (DisplayRow& r : out.parked) attach(r);
 
+    // The display the DLC run measures: the DLC display it names (its profile name), else its hardware id, else
+    // the DesktopLUT index it was started on. One display or none, never a guess between two.
+    out.run = dlc::CurrentLive();
+    if (out.run->phase != dlc::RunPhase::None) {
+        const dlc::Live& run = *out.run;
+        const std::string name = run.state && !run.state->display.empty() ? run.state->display : run.active.display;
+        const std::string& hw = run.active.hardwareId;
+        const int mon = run.state && run.state->monitor >= 0 ? run.state->monitor : run.active.monitor;
+        auto unique = [&](auto pred) {
+            int found = -1;
+            for (int i = 0; i < (int)out.live.size(); i++) {
+                if (!pred(out.live[i])) continue;
+                if (found >= 0) return -2;   // more than one
+                found = i;
+            }
+            return found;
+        };
+        int at = name.empty() ? -1 : unique([&](const DisplayRow& r) { return _stricmp(r.dlcMatch.name.c_str(), name.c_str()) == 0; });
+        if (at == -1 && !hw.empty()) at = unique([&](const DisplayRow& r) { return _stricmp(r.dlcLive.hardwareId.c_str(), hw.c_str()) == 0; });
+        if (at == -1 && mon >= 0 && mon < (int)out.live.size()) at = mon;
+        if (at >= 0) out.live[(size_t)at].dlcRun = true;
+    }
+
     out.lastStatus.clear();
     out.lastStatusSev = notify::Sev::Info;
     for (auto it = notify::Snapshot(32); !it.empty(); it.pop_back()) {

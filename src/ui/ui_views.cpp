@@ -1,6 +1,8 @@
 #include "ui_views.h"
 
 #include "ui_widgets.h"
+#include "ui_kit.h"
+#include "ui_dlc.h"
 #include "ui_window.h"
 #include "actions/actions.h"
 #include "actions/notify.h"
@@ -28,20 +30,6 @@ namespace ui {
 
 namespace {
 
-// One gutter everywhere: header, sidebar, main column, footer. Heights in DIPs. Rows share one pitch
-// in every panel, so rows of neighbouring panels line up.
-constexpr float kGutter = 24.0f;
-constexpr float kHeaderH = 56.0f;
-constexpr float kFooterH = 30.0f;
-constexpr float kSidebarW = 228.0f;
-constexpr float kMeasuredW = 300.0f;
-constexpr float kRowLabelW = 150.0f;
-constexpr float kRowH = 30.0f;
-constexpr float kButtonW = 92.0f;
-constexpr float kPanelGap = 16.0f;   // between stacked panels
-constexpr float kInspectorMinW = 560.0f;   // narrower: the measured panel goes under the inspector
-constexpr float kSettingsTwoColW = 1000.0f; // narrower: the settings panels in one column
-
 // The physical display (device path, else EDID id): follows it between live and remembered.
 std::wstring KeyOf(const DisplayRow& r) {
     if (!r.settings.identity.devicePath.empty()) return r.settings.identity.devicePath;
@@ -59,42 +47,7 @@ std::wstring RowIdOf(const DisplayRow& r) {
 
 namespace {
 
-std::string FileName(const std::wstring& path) {
-    if (path.empty()) return "\xE2\x80\x94";
-    size_t s = path.find_last_of(L"\\/");
-    return Utf8(s == std::wstring::npos ? path : path.substr(s + 1));
-}
-
-std::wstring Wide(const char* utf8) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, nullptr, 0);
-    if (n <= 1) return {};
-    std::wstring w((size_t)n - 1, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w.data(), n);
-    return w;
-}
-
 const char* OnOffText(bool on) { return on ? "ON" : "OFF"; }
-
-std::string Fmt(const char* fmt, double v) {
-    char b[64];
-    snprintf(b, sizeof(b), fmt, v);
-    return b;
-}
-
-// Shortens `s` with a middle ellipsis until it fits `maxW` pixels (file names keep both ends).
-std::string Ellipsize(Font f, float sizeDip, const std::string& s, float maxW) {
-    if (maxW <= 0.0f) return std::string();
-    if (MeasureText(f, sizeDip, s.c_str()).x <= maxW) return s;
-    std::vector<size_t> cps;   // code point starts
-    for (size_t i = 0; i < s.size(); i++) if ((s[i] & 0xC0) != 0x80) cps.push_back(i);
-    const size_t n = cps.size();
-    for (size_t keep = n > 1 ? n - 1 : 0; keep > 0; keep--) {
-        const size_t head = (keep + 1) / 2, tail = keep / 2;
-        std::string t = s.substr(0, cps[head]) + "\xE2\x80\xA6" + s.substr(tail ? cps[n - tail] : s.size());
-        if (MeasureText(f, sizeDip, t.c_str()).x <= maxW) return t;
-    }
-    return "\xE2\x80\xA6";
-}
 
 // ---------------------------------------------------------------------------------------------
 // Commands aimed at a display. The live index can change between this frame and the command running
@@ -178,71 +131,6 @@ PathRuntime RuntimeOf(const Snapshot& snap) {
     return rt;
 }
 
-// Text with its cap height centred on centerY, without taking layout space.
-void TextAt(Font f, float sizeDip, ImU32 col, float x, float centerY, const char* text) {
-    DrawText(ImGui::GetWindowDrawList(), f, sizeDip, x, centerY, col, text);
-}
-
-// ---------------------------------------------------------------------------------------------
-// Rows: a caps label column, values left, action buttons right-aligned, everything centred on the
-// row's middle line (text by its cap height). Values are shortened (middle ellipsis) so they never run
-// under the buttons.
-
-struct RowCtx { float x0, y0, h, x, right, limit; };
-
-RowCtx BeginRow(const char* label, float hDip = kRowH) {
-    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
-    const float h = Snap(Px(hDip));
-    const float right = p.x + ImGui::GetContentRegionAvail().x;
-    TextAt(Font::Label, kSizeLabel, pal::InkDim, p.x, p.y + h * 0.5f, label);
-    return { p.x, p.y, h, p.x + Px(kRowLabelW), right, right };
-}
-
-void RowText(RowCtx& r, const std::string& text, ImU32 col = pal::Ink, Font f = Font::Mono, float sizeDip = kSizeMono,
-             const std::wstring& tooltip = {}) {
-    const std::string shown = Ellipsize(f, sizeDip, text, r.limit - r.x);
-    if (shown.empty()) return;
-    const float w = DrawText(ImGui::GetWindowDrawList(), f, sizeDip, r.x, r.y0 + r.h * 0.5f, col, shown.c_str());
-    if (!tooltip.empty() && ImGui::IsMouseHoveringRect(ImVec2(r.x, r.y0), ImVec2(r.x + w, r.y0 + r.h)))
-        ImGui::SetTooltip("%s", Utf8(tooltip).c_str());
-    r.x += w + Px(12);
-}
-
-void RowPlace(RowCtx& r, float widgetHDip = kControlH) {
-    ImGui::SetCursorScreenPos(ImVec2(Snap(r.x), Snap(r.y0 + (r.h - Snap(Px(widgetHDip))) * 0.5f)));
-}
-
-void RowNext(RowCtx& r) { r.x = ImGui::GetItemRectMax().x + Px(8); }
-
-// Buttons right-aligned at the row's end (same width each). Returns the index clicked, -1 none.
-// Call before RowText so the value is shortened to stop short of them.
-int RowButtons(RowCtx& r, const char* idPrefix, const std::vector<const char*>& labels) {
-    if (labels.empty()) return -1;
-    const float bw = Px(kButtonW), gap = Px(8);
-    float x = r.right - (float)labels.size() * bw - (float)(labels.size() - 1) * gap;
-    r.limit = x - Px(12);
-    int clicked = -1;
-    for (size_t i = 0; i < labels.size(); i++) {
-        ImGui::SetCursorScreenPos(ImVec2(Snap(x), Snap(r.y0 + (r.h - Snap(Px(kControlH))) * 0.5f)));
-        char id[64];
-        snprintf(id, sizeof(id), "##%s%d", idPrefix, (int)i);
-        if (Button(id, labels[i], kButtonW, kControlH)) clicked = (int)i;
-        x += bw + gap;
-    }
-    return clicked;
-}
-
-// The explanation of a row lives in a tooltip on its label (labels stay terse).
-void RowTip(const RowCtx& r, const char* tip) {
-    if (ImGui::IsMouseHoveringRect(ImVec2(r.x0, r.y0), ImVec2(r.x0 + Px(kRowLabelW) - Px(8), r.y0 + r.h)))
-        ImGui::SetTooltip("%s", tip);
-}
-
-void EndRow(const RowCtx& r) {
-    ImGui::SetCursorScreenPos(ImVec2(r.x0, r.y0 + r.h + Px(2)));
-    ImGui::Dummy(ImVec2(0, 0));
-}
-
 // ---------------------------------------------------------------------------------------------
 // Header / footer
 
@@ -274,27 +162,31 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
     struct PageTab { const char* id; const char* label; Page page; };
     static const PageTab kTabs[] = {
         { "##pg_pipe", "PIPELINE", Page::Pipeline },
+        { "##pg_dlc", "DLC", Page::Dlc },
         { "##pg_events", "EVENTS", Page::Events },
         { "##pg_settings", "SETTINGS", Page::Settings },
     };
+    constexpr int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
     const float brandEnd = textX + nameW + Px(12) + tagW + Px(20);
     const float columnX = p.x + Px(kSidebarW) + Px(kGutter) - Px(18);   // a tab's text sits 18 DIP in
     float x = Snap(brandEnd > columnX ? brandEnd : columnX);
     const float tabTop = sheet ? p.y + Px(14) : p.y;
     const float tabBottom = sheet ? p.y + h - t : p.y + h;
-    float tabX[3];
-    for (int i = 0; i < 3; i++) {
+    float tabX[kTabCount];
+    for (int i = 0; i < kTabCount; i++) {
         tabX[i] = x;
         x += TabWidth(kTabs[i].label) + (sheet ? Px(2) : 0.0f);
     }
     // The selected tab last: a property-sheet tab overlaps its neighbours.
     const Page shownPage = vs.page;
     for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < kTabCount; i++) {
             const PageTab& tab = kTabs[i];
             if ((tab.page == shownPage) != (pass == 1)) continue;
             const float tw = TabWidth(tab.label);
-            if (Tab(tab.id, tab.label, shownPage == tab.page, ImVec2(tabX[i], tabTop), ImVec2(tabX[i] + tw, tabBottom))) {
+            // A DLC run in progress: its light in the DLC tab's right margin, seen from every page.
+            const Light light = tab.page == Page::Dlc ? DlcRunLight(snap) : Light::None;
+            if (Tab(tab.id, tab.label, shownPage == tab.page, ImVec2(tabX[i], tabTop), ImVec2(tabX[i] + tw, tabBottom), light)) {
                 if (tab.page == Page::Settings && vs.page != Page::Settings)
                     Post([]() { RefreshStartupEnabledCache(); });   // COM: not in a frame
                 vs.page = tab.page;
@@ -417,7 +309,7 @@ void CommitRename(ViewState& vs, const DisplayRow& r) {
     Post([slot, live, label]() { act::SetDisplayLabel(slot, live, label); });
 }
 
-void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRuntime& rt) {
+void SidebarRow(const Snapshot& snap, const DisplayRow& r, bool selected, ViewState& vs, const PathRuntime& rt) {
     const float w = ImGui::GetContentRegionAvail().x;
     const bool live = r.liveIndex >= 0;
     const float h = Snap(Px(live ? 60.0f : 44.0f));
@@ -505,7 +397,11 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
             DrawLight(dl, ImVec2(x + d * 0.5f, Snap(cy)), l, d, onSel ? selInk : 0);
             x += Shape().bevel ? Snap(d * 1.45f + Px(6)) : d + Snap(Px(5));   // Windows 98 checks are wider than dots
         }
-        if (r.widthPx > 0) {
+        std::string runText;
+        ImU32 runCol = 0;
+        if (DlcRunBadge(snap, r, runText, runCol)) {   // a DLC run measures this display: in the resolution's place
+            TextAt(Font::Label, kSizeLabel, onSel ? selInk : runCol, x + Px(4), cy, runText.c_str());
+        } else if (r.widthPx > 0) {
             char res[32];
             snprintf(res, sizeof(res), "%d\xC3\x97%d", r.widthPx, r.heightPx);
             TextAt(Font::Mono, 12.0f, dim, x + Px(4), cy, res);
@@ -525,8 +421,8 @@ void SidebarRow(const DisplayRow& r, bool selected, ViewState& vs, const PathRun
 void DrawSidebar(const Snapshot& snap, ViewState& vs, const DisplayRow* sel) {
     if (Shape().cardSidebar) ImGui::Dummy(ImVec2(0, Px(7)));
     const PathRuntime rt = RuntimeOf(snap);
-    for (const DisplayRow& r : snap.live) SidebarRow(r, sel == &r, vs, rt);
-    for (const DisplayRow& r : snap.parked) SidebarRow(r, sel == &r, vs, rt);
+    for (const DisplayRow& r : snap.live) SidebarRow(snap, r, sel == &r, vs, rt);
+    for (const DisplayRow& r : snap.parked) SidebarRow(snap, r, sel == &r, vs, rt);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1000,32 +896,6 @@ void MeasuredRow(const char* label, const std::string& value, ImU32 col = pal::I
     EndRow(row);
 }
 
-// Readouts: the verification's numbers as label-over-value tiles, three to a row, two rows to three
-// row pitches.
-struct Readout { const char* label; std::string value; ImU32 col; };
-void Readouts(const std::vector<Readout>& items) {
-    if (items.empty()) return;
-    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
-    const float w = ImGui::GetContentRegionAvail().x;
-    const float colW = w / 3.0f, tileH = Snap(Px((kRowH + 2.0f) * 1.5f));
-    for (size_t i = 0; i < items.size(); i++) {
-        const float x = p.x + colW * (float)(i % 3), y = p.y + tileH * (float)(i / 3);
-        TextAt(Font::Label, 11.0f, pal::InkDim, x, y + tileH * 0.28f, items[i].label);
-        TextAt(Font::Mono, 17.0f, items[i].col, x, y + tileH * 0.68f, items[i].value.c_str());
-    }
-    const int rows = (int)((items.size() + 2) / 3);
-    ImGui::Dummy(ImVec2(w, tileH * (float)rows));
-}
-
-std::string Num2(double v) { return std::isfinite(v) ? Fmt("%.2f", v) : std::string("\xE2\x80\x94"); }
-
-std::string DateAge(const std::string& date, int days) {
-    if (date.empty()) return "\xE2\x80\x94";
-    std::string s = date.substr(0, 10);
-    if (days >= 0) s += "  \xC2\xB7  " + std::to_string(days) + " D";
-    return s;
-}
-
 const char* LayerText(dlc::LayerState s, bool bypassed = false) {
     if (bypassed) return "BYPASSED";
     switch (s) {
@@ -1040,39 +910,6 @@ ImU32 LayerColour(dlc::LayerState s) {
     if (s == dlc::LayerState::Matches) return pal::Ink;
     if (s == dlc::LayerState::Differs) return pal::Alarm;
     return pal::InkFaint;
-}
-
-// Distribution of the per-patch error: six bins, bars scaled to the fullest.
-void PatchHistogram(const std::vector<dlc::Patch>& patches) {
-    static const double kEdges[] = { 0.5, 1.0, 2.0, 3.0, 5.0 };
-    static const char* const kLabels[] = { "<.5", "<1", "<2", "<3", "<5", "5+" };
-    int bins[6] = {};
-    int n = 0;
-    for (const dlc::Patch& p : patches) {
-        if (!std::isfinite(p.de)) continue;
-        int b = 5;
-        for (int k = 0; k < 5; k++) if (p.de < kEdges[k]) { b = k; break; }
-        bins[b]++;
-        n++;
-    }
-    if (n == 0) return;
-    int top = 1;
-    for (int b : bins) top = b > top ? b : top;
-    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y + Px(6)));
-    const float w = ImGui::GetContentRegionAvail().x, barH = Snap(Px(56)), labelH = Px(18);
-    const float gap = Px(4), bw = (w - gap * 5) / 6;
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    for (int k = 0; k < 6; k++) {
-        const float x = p.x + k * (bw + gap);
-        const float h = barH * (float)bins[k] / (float)top;
-        dl->AddRectFilled(ImVec2(Snap(x), Snap(p.y + barH - (h > 0 ? (h < Px(1) ? Px(1) : h) : 0))),
-                          ImVec2(Snap(x + bw), p.y + barH), Col(k >= 4 ? pal::Alarm : pal::InkDim));
-        DrawTextIn(dl, Font::Mono, 11.0f, ImVec2(x, p.y + barH), ImVec2(x + bw, p.y + barH + labelH), pal::InkFaint, kLabels[k]);
-        if (ImGui::IsMouseHoveringRect(ImVec2(x, p.y), ImVec2(x + bw, p.y + barH + labelH)))
-            ImGui::SetTooltip("%d of %d patches", bins[k], n);
-    }
-    dl->AddRectFilled(ImVec2(p.x, p.y + barH), ImVec2(p.x + w, p.y + barH + 1), Col(pal::Rule));
-    ImGui::Dummy(ImVec2(w, Px(6) + barH + labelH + Px(4)));
 }
 
 // The measured panel's light: verified (and not due), a fault when only an older report exists or a
@@ -1162,6 +999,10 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     if (!rec.correctionMade.empty())
         MeasuredRow("METER", DateAge(rec.correctionMade, rec.correctionDaysAgo), rec.correctionStale ? pal::Alarm : pal::InkDim,
                     Font::Mono, rec.correctionStale ? "Meter correction older than the profile's max_age_days." : nullptr);
+    RowCtx row = BeginRow("", kRowH);
+    if (RowButtons(row, "meas_rec", { "RECORD" }) == 0) vs.page = Page::Dlc;
+    RowTip(row, "Charts and runs: the DLC page.");
+    EndRow(row);
 }
 
 // The stage switch in the inspector's header: whether the stage runs. False = the stage has none (the
@@ -1235,13 +1076,10 @@ void ApplyStageSwitch(const DisplayRow& r, const Stage& st, bool hdr, bool on) {
     }
 }
 
-void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
-    const DisplayRow* sel = FindSelected(snap, vs);
-    const ImVec2 body(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
-    const float bodyH = FooterTop() - body.y;   // down to the pinned footer
+// The display list column at `body`, `bodyH` high (the Pipeline and DLC pages).
+void DisplayListColumn(const Snapshot& snap, ViewState& vs, const DisplayRow* sel, ImVec2 body, float bodyH) {
     const float sideW = Snap(Px(kSidebarW));
     ImDrawList* dl = ImGui::GetWindowDrawList();
-
     if (Shape().sunkenSidebar) {
         // The display list in a sunken white list box.
         const float in = Snap(Px(8)), bi = 2.0f * BevelPx();
@@ -1261,6 +1099,47 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     ImGui::EndChild();
     if (!Shape().sunkenSidebar)
         dl->AddRectFilled(ImVec2(body.x + sideW - 1, body.y), ImVec2(body.x + sideW, body.y + bodyH), Col(pal::Rule));
+}
+
+// Title row: name left, mode switch right, both centred on one line. Notes go on this line without taking layout
+// space (TitleRow::noteX), so nothing moves when they appear.
+TitleRow DisplayTitleRow(const DisplayRow& sel, ViewState& vs) {
+    const bool liveHdr = PipelineIsHdr(sel.mode);
+    const bool showHdr = vs.showOtherMode ? !liveHdr : liveHdr;
+    const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float w = ImGui::GetContentRegionAvail().x;
+    const float h = Snap(Px(30)), cy = p.y + h * 0.5f;
+    const std::string name = Utf8(sel.name);
+    const float nameW = DrawText(ImGui::GetWindowDrawList(), Font::BodyBold, kSizeTitle, p.x, cy, pal::Ink, name.c_str());
+    // Which side's settings are shown; a green light marks the mode the display is in now.
+    const bool parked = sel.liveIndex < 0;
+    static const char* const kModes[] = { "HDR", "SDR" };
+    const ImU32 dots[2] = { !parked && liveHdr ? pal::Good : 0u, !parked && !liveHdr ? pal::Good : 0u };
+    const float segW = 72.0f;
+    ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Snap(Px(segW)) * 2), Snap(cy - Snap(Px(kControlH)) * 0.5f)));
+    ImGui::BeginDisabled(EditorOpen(vs));
+    const int pick = Segmented("##mode", kModes, 2, showHdr ? 0 : 1, segW, dots);
+    ImGui::EndDisabled();
+    if (pick == 0) vs.showOtherMode = !liveHdr;
+    else if (pick == 1) vs.showOtherMode = liveHdr;
+    const ImVec2 ga = ImGui::GetItemRectMin(), gb = ImGui::GetItemRectMax();
+    if (ImGui::IsMouseHoveringRect(ga, gb) && ImGui::IsWindowHovered()) {
+        const bool overHdr = ImGui::GetIO().MousePos.x < (ga.x + gb.x) * 0.5f;
+        const char* label = overHdr ? "HDR" : "SDR";
+        if (parked) ImGui::SetTooltip("%s settings. Display not connected.", label);
+        else ImGui::SetTooltip("%s settings. The display is in %s now.", label, liveHdr ? "HDR" : "SDR");
+    }
+    ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
+    ImGui::Dummy(ImVec2(0, Px(16)));
+    return { p.x + nameW + Px(16), cy, vs.showOtherMode ? !liveHdr : liveHdr };
+}
+
+void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
+    const DisplayRow* sel = FindSelected(snap, vs);
+    const ImVec2 body(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float bodyH = FooterTop() - body.y;   // down to the pinned footer
+    const float sideW = Snap(Px(kSidebarW));
+    DisplayListColumn(snap, vs, sel, body, bodyH);
 
     ImGui::SetCursorScreenPos(ImVec2(body.x + sideW, body.y));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(kGutter), Px(18)));
@@ -1274,40 +1153,11 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         return;
     }
     const bool liveHdr = PipelineIsHdr(sel->mode);
-    const bool showHdr = vs.showOtherMode ? !liveHdr : liveHdr;
+    const TitleRow title = DisplayTitleRow(*sel, vs);
+    if (vs.showOtherMode && sel->liveIndex >= 0)
+        TextAt(Font::Label, kSizeLabel, pal::Alarm, title.noteX, title.cy, liveHdr ? "DISPLAY IS IN HDR" : "DISPLAY IS IN SDR");
+    const bool showHdr = title.showHdr;
     const Mode shown = showHdr ? Mode::HDR : (sel->mode == Mode::AcmSdr ? Mode::AcmSdr : Mode::SDR);
-
-    // Title row: name left, mode switch right, both centred on one line. The "other mode" note is drawn
-    // on this line without taking layout space, so nothing moves when it appears.
-    {
-        const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
-        const float w = ImGui::GetContentRegionAvail().x;
-        const float h = Snap(Px(30)), cy = p.y + h * 0.5f;
-        const std::string name = Utf8(sel->name);
-        const float nameW = DrawText(ImGui::GetWindowDrawList(), Font::BodyBold, kSizeTitle, p.x, cy, pal::Ink, name.c_str());
-        if (vs.showOtherMode && sel->liveIndex >= 0)
-            TextAt(Font::Label, kSizeLabel, pal::Alarm, p.x + nameW + Px(16), cy, liveHdr ? "DISPLAY IS IN HDR" : "DISPLAY IS IN SDR");
-        // Which side's settings are shown; a green light marks the mode the display is in now.
-        const bool parked = sel->liveIndex < 0;
-        static const char* const kModes[] = { "HDR", "SDR" };
-        const ImU32 dots[2] = { !parked && liveHdr ? pal::Good : 0u, !parked && !liveHdr ? pal::Good : 0u };
-        const float segW = 72.0f;
-        ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Snap(Px(segW)) * 2), Snap(cy - Snap(Px(kControlH)) * 0.5f)));
-        ImGui::BeginDisabled(EditorOpen(vs));
-        const int pick = Segmented("##mode", kModes, 2, showHdr ? 0 : 1, segW, dots);
-        ImGui::EndDisabled();
-        if (pick == 0) vs.showOtherMode = !liveHdr;
-        else if (pick == 1) vs.showOtherMode = liveHdr;
-        const ImVec2 ga = ImGui::GetItemRectMin(), gb = ImGui::GetItemRectMax();
-        if (ImGui::IsMouseHoveringRect(ga, gb) && ImGui::IsWindowHovered()) {
-            const bool overHdr = ImGui::GetIO().MousePos.x < (ga.x + gb.x) * 0.5f;
-            const char* label = overHdr ? "HDR" : "SDR";
-            if (parked) ImGui::SetTooltip("%s settings. Display not connected.", label);
-            else ImGui::SetTooltip("%s settings. The display is in %s now.", label, liveHdr ? "HDR" : "SDR");
-        }
-        ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
-        ImGui::Dummy(ImVec2(0, Px(16)));
-    }
 
     PathRuntime selRt = RuntimeOf(snap);
     selRt.editHeld = sel->liveIndex >= 0 && MhcPreviewHolds(sel->liveIndex, PipelineIsHdr(shown));
@@ -2140,6 +1990,7 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     SetLogRedraws(vs.page == Page::Events && vs.log.allOutput);   // diagnostic lines redraw only here
     if (vs.page == Page::Events) DrawEventsPage(snap, vs);
     else if (vs.page == Page::Settings) DrawSettingsPage(snap, vs);
+    else if (vs.page == Page::Dlc) DrawDlcPage(snap, vs);
     else DrawPipelinePage(snap, vs);
     ImGui::EndDisabled();
     ImGui::PopStyleVar();
@@ -2147,6 +1998,20 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     DrawConfirm(vs);
     DrawWhitelist(vs);
     ImGui::End();
+}
+
+const DisplayRow* SelectedDisplay(const Snapshot& snap, ViewState& vs) { return FindSelected(snap, vs); }
+
+void DrawDisplayList(const Snapshot& snap, ViewState& vs, const DisplayRow* sel, ImVec2 body, float bodyH) {
+    DisplayListColumn(snap, vs, sel, body, bodyH);
+}
+
+TitleRow DrawDisplayTitle(const DisplayRow& sel, ViewState& vs) { return DisplayTitleRow(sel, vs); }
+
+float PageFooterTop() { return FooterTop(); }
+
+void AskConfirm(ViewState& vs, std::string title, std::string detail, std::string action, std::function<void()> onConfirm) {
+    Ask(vs, std::move(title), std::move(detail), std::move(action), std::move(onConfirm));
 }
 
 }  // namespace ui

@@ -1,0 +1,186 @@
+#pragma once
+// The DLC run in progress (or the last one), for the DLC page. DLC's live publisher folds the run's
+// spine into runs\<id>\live\state.json + charts.json (dlc/dashboard/publish.py); runs\active.json points
+// at the run. This side only reads and renders: every number, word and verdict comes from DLC.
+//
+// Pure parsers (tests feed them text) + a watcher thread that polls while the interface is visible and
+// publishes an immutable snapshot (CurrentLive) — the same pattern as the folder scanner (dlc_scan).
+
+#include "dlc/dlc_data.h"
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace dlc {
+
+constexpr int kLiveSchema = 1;   // the live_schema this reader understands fully
+
+// ---- runs\active.json ----------------------------------------------------------------------------
+struct ActivePointer {
+    bool present = false;
+    std::wstring run;               // the run folder
+    std::string flow, updated;
+    // Newer DLC adds these (absent: unknown).
+    std::string state;              // running / paused_seam / done / failed / cancelled
+    std::string display, hardwareId, mode, driver, started;
+    int monitor = -1;
+    uint32_t pid = 0;
+};
+bool ParseActivePointer(const std::string& json, ActivePointer& out);
+
+// ---- live\state.json -----------------------------------------------------------------------------
+enum class StepStatus { Upcoming, Current, Done };
+struct LiveStep { std::string key, label; StepStatus status = StepStatus::Upcoming; };
+
+struct FeedRow {
+    std::string time;               // ISO, local
+    std::string level, stage, event, title, text;
+};
+
+struct SeamPacket {
+    std::string key, stage, status; // status: paused / decided / auto_accepted / invalid_decision / resumed
+    std::string question, choice, note, recommendation;
+    std::vector<std::string> options, checklist;
+    bool Pending() const { return status == "paused"; }
+};
+
+struct LiveRead {                   // the last meter read
+    bool present = false, ok = false, neutral = false;
+    std::string label, role;
+    double signal[3] = { kNaN, kNaN, kNaN };
+    double x = kNaN, y = kNaN, Y = kNaN;          // measured
+    double tx = kNaN, ty = kNaN, tY = kNaN;       // target
+    double de = kNaN, cct = kNaN, duv = kNaN;
+    uint32_t swatch = 0;            // 0xRRGGBB of the intended colour (DLC's sc); 0 = unknown
+};
+
+struct LiveDe {                     // rolling per-patch ΔE of the current stage (live_de)
+    std::string metric;             // "itp" / "de2000"
+    double avg = kNaN, max = kNaN, last = kNaN;
+    int n = 0;
+};
+
+struct ScoredDe {                   // the scoring stage's verdict (de)
+    bool present = false;
+    std::string metric, phase;
+    double avg = kNaN, p95 = kNaN, max = kNaN, white = kNaN, gray = kNaN;
+};
+
+struct LiveState {
+    bool present = false;
+    int schema = 0;
+    uint64_t seq = 0;
+    uint32_t pid = 0;
+    std::wstring runDir;
+    std::string runId, publishedIso, nowIso;
+    // header
+    std::string display, mode, flow, target;
+    int monitor = -1;
+    bool hdr = false;
+    double luminance = kNaN, gamma = kNaN;
+    // progress
+    std::string phase, stage, runStatus;     // run_status: idle / running / stalled / completed / ...
+    std::vector<LiveStep> steps;
+    int stepIndex = 0, stepTotal = 0;        // 1-based current; 0 = none
+    int patchesDone = 0, patchesTotal = 0, reads = 0, readsOk = 0, readsFailed = 0;
+    double runElapsedS = kNaN, stageElapsedS = kNaN, etaS = kNaN, etaHiS = kNaN, sPerPatch = kNaN;
+    // liveness: live / slow / stalled / paused / done / unknown
+    std::string light;
+    double ageS = kNaN, progressAgeS = kNaN;
+    LiveRead lastRead;
+    LiveDe liveDe;
+    ScoredDe scored;
+    SeamPacket seam;
+    std::vector<FeedRow> feed;               // oldest first
+};
+bool ParseLiveState(const std::string& json, LiveState& out);
+
+// ---- live\charts.json ----------------------------------------------------------------------------
+struct CiePoint { float x, y, tx, ty, de; bool carried, neutral; std::string label; };
+struct GrayRow { float signal, Y, cct, duv, de, r, g, b; bool dim; };
+struct CurvePoint { float x, y; };
+struct ConvergencePoint { float elapsedS, avg, max; bool scored; };
+struct Offender { std::string label; float de; uint32_t intended, measured; bool oog; };
+
+struct LiveCharts {
+    bool present = false;
+    uint64_t seq = 0;
+    std::string stage;
+    bool hdr = false;
+    // CIE
+    std::vector<CiePoint> cie;
+    float primaries[3][2] = {};              // target gamut r, g, b
+    bool hasMeasuredPrimaries = false;
+    float measuredPrimaries[3][2] = {};
+    float white[2] = { 0.3127f, 0.3290f };
+    std::string gamutLabel;
+    // grayscale (signal order)
+    std::vector<GrayRow> gray;
+    double targetDuv = kNaN;
+    // tone response
+    std::string eotfKind;                    // "pq" / "power"
+    double gamma = kNaN, luminance = kNaN;
+    std::vector<CurvePoint> eotfReference;   // (signal, Y relative to `luminance`, 0..1) — DLC's form
+    std::vector<CurvePoint> eotfPoints;      // (signal, Y in cd/m2)
+    std::vector<ConvergencePoint> convergence;
+    std::vector<Offender> offenders;
+};
+bool ParseLiveCharts(const std::string& json, LiveCharts& out);
+
+// ---- the snapshot the page reads -----------------------------------------------------------------
+enum class RunPhase {
+    None,       // no run on record
+    Running,    // live / slow
+    Stalled,    // DLC's own verdict (no progress past its threshold)
+    Waiting,    // paused at a seam: the process exited, a judge decides
+    Paused,     // a requested pause (control.json), the process is holding
+    Done,       // finished (completed / aborted / reverted)
+    Failed,     // the process is gone without finishing
+    NoData,     // the process runs but the live files are stale or missing
+};
+
+struct Live {
+    std::wstring dlcFolder;
+    ActivePointer active;
+    std::shared_ptr<const LiveState> state;    // null: none / unreadable
+    std::shared_ptr<const LiveCharts> charts;  // null: none / unreadable
+    RunPhase phase = RunPhase::None;
+    bool processAlive = false;                 // the run's pid is running (false: unknown or gone)
+    double stateAgeS = kNaN;                   // since state.json was last written
+    bool pauseRequested = false;               // control.json says pause (until DLC consumes it)
+    bool cancelRequested = false;
+    std::string pauseRequestedIso;
+};
+
+// The phase from the parsed state + what the watcher saw (pure; tested).
+RunPhase DeriveRunPhase(const ActivePointer& active, const LiveState* state, bool processAlive,
+                        double stateAgeS, bool pauseRequested);
+
+// ---- the watcher -------------------------------------------------------------------------------
+void SetLiveListener(std::function<void()> onChange);   // called on the watcher after each change
+// Start or move the watch to a DLC folder ("" stops watching). Any thread.
+void WatchLive(const std::wstring& dlcFolder);
+// Poll only while the interface is visible (hidden: the thread sleeps). Any thread.
+void SetLiveWatchActive(bool active);
+void StopLiveWatch();                                     // GUI thread, at shutdown
+std::shared_ptr<const Live> CurrentLive();                // any thread; never null
+
+// A finished run's final charts (runs\<id>\live\charts.json, written when the run ended or paused): the cached
+// charts; a LiveCharts with present == false when the run has none (an older DLC); null while it loads (the
+// listener fires when it is in). Any thread.
+std::shared_ptr<const LiveCharts> RunCharts(const std::wstring& runDir);
+void SeedRunChartsForTest(const std::wstring& runDir, std::shared_ptr<const LiveCharts> charts);
+
+// Charts from a report's patch metrics, for runs without a final snapshot: the CIE scatter (measured and target
+// xy, ΔE), the grey steps' luminance against their targets, the worst patches. No balance or convergence.
+std::shared_ptr<const LiveCharts> ChartsFromPatches(const std::vector<Patch>& patches, bool hdr);
+
+// ---- control (cooperative, DLC polls it) --------------------------------------------------------
+enum class RunControl { Pause, Resume, Cancel };
+// Writes runs\<id>\control.json atomically. Pause holds the run for up to 180 s, then DLC rolls it back.
+bool WriteRunControl(const std::wstring& runDir, RunControl action, std::string* error = nullptr);
+
+}  // namespace dlc

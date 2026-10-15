@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 namespace ui {
@@ -142,6 +143,9 @@ void Bevel(ImDrawList* dl, ImVec2 a, ImVec2 b, BevelKind kind) {
         frame(a, ImVec2(b.x - t, b.y - t), pal::BevelShadow, pal::BevelShadow);
         frame(a1, b, pal::BevelHi, pal::BevelHi);
         break;
+    case BevelKind::Shallow:
+        frame(a, b, pal::BevelShadow, pal::BevelHi);
+        break;
     }
 }
 
@@ -185,8 +189,27 @@ void CheckMark(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
     dl->AddPolyline(pts, 3, col, Px(2.0f));
 }
 
-// Windows 98 status symbols: a check (runs), an embossed grey check (switched off: the disabled look), the
-// yellow warning triangle with "!" (fault).
+// An hourglass centred at c, `s` tall (the Windows 98 wait symbol): the frame's two bars, the glass as two
+// triangles meeting in the middle, sand in the lower one.
+void Hourglass(ImDrawList* dl, ImVec2 c, float s, ImU32 col) {
+    const float lw = BevelPx();                          // 1 px, 2 px from 175 %
+    const float x0 = Snap(c.x - lw * 0.5f), ax = x0 + lw * 0.5f;   // the axis: whole pixel columns
+    const float hw = Snap(s * 0.34f), top = Snap(c.y - s * 0.46f), bottom = Snap(c.y + s * 0.46f);
+    dl->AddRectFilled(ImVec2(x0 - hw, top), ImVec2(x0 + lw + hw, top + lw), col);                // top bar
+    dl->AddRectFilled(ImVec2(x0 - hw, bottom - lw), ImVec2(x0 + lw + hw, bottom), col);          // bottom bar
+    const float l = x0 - hw + lw * 0.5f, r = x0 + hw + lw * 0.5f;
+    const ImVec2 mid(ax, (top + bottom) * 0.5f);
+    dl->AddLine(ImVec2(l, top + lw), mid, col, lw);
+    dl->AddLine(ImVec2(r, top + lw), mid, col, lw);
+    dl->AddLine(mid, ImVec2(l, bottom - lw), col, lw);
+    dl->AddLine(mid, ImVec2(r, bottom - lw), col, lw);
+    // Sand in the lower glass, from the bottom up.
+    const float sand = (bottom - lw - mid.y) * 0.55f;
+    dl->AddTriangleFilled(ImVec2(ax, bottom - lw - sand), ImVec2(r, bottom - lw), ImVec2(l, bottom - lw), col);
+}
+
+// Windows 98 status symbols: a check (runs), an embossed grey check (switched off: the disabled look), an
+// hourglass (waiting), the yellow warning triangle with "!" (fault).
 void DrawLight98(ImDrawList* dl, ImVec2 c, Light l, float d, ImU32 inkOverride) {
     const float s = d * 1.45f;
     switch (l) {
@@ -195,9 +218,11 @@ void DrawLight98(ImDrawList* dl, ImVec2 c, Light l, float d, ImU32 inkOverride) 
         CheckMark(dl, c, s, Col(inkOverride ? inkOverride : pal::Ink));
         break;
     case Light::Off:
-    case Light::Pending:
         CheckMark(dl, ImVec2(c.x + 1.0f, c.y + 1.0f), s, Col(pal::BevelHi));   // the emboss
         CheckMark(dl, c, s, Col(pal::BevelShadow));
+        break;
+    case Light::Pending:
+        Hourglass(dl, c, s, Col(inkOverride ? inkOverride : pal::Ink));
         break;
     case Light::Fault: {
         const float hw = s * 0.62f, top = c.y - s * 0.6f, bottom = c.y + s * 0.5f;
@@ -395,13 +420,14 @@ float TabWidth(const char* label) {
     return Snap(MeasureInk(Font::Label, 13.0f, label).advance + Px(36));
 }
 
-bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b) {
+bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b, Light light) {
     a = SnapV(a);
     b = SnapV(b);
     ImGui::SetCursorScreenPos(a);
     const bool clicked = ImGui::InvisibleButton(id, ImVec2(b.x - a.x, b.y - a.y));
     const bool hovered = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList();
+    const float lightD = Snap(Px(6));
     if (Shape().sheetTabs) {
         // A property-sheet tab standing on the sheet's top edge; the selected one is taller and joins the
         // sheet (it covers the sheet's highlight line under itself).
@@ -417,12 +443,20 @@ bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b) {
         dl->AddRectFilled(ImVec2(x1 - t, top + 2 * t), ImVec2(x1, bottom), Col(pal::BevelDark));        // right
         dl->AddRectFilled(ImVec2(x1 - 2 * t, top + 2 * t), ImVec2(x1 - t, bottom), Col(pal::BevelShadow));
         DrawTextIn(dl, Font::Label, 13.0f, ImVec2(x0, top), ImVec2(x1, b.y), pal::Ink, label);
+        if (light != Light::None) {
+            // Centred in the margin between the label's ink and the right bevel (a check is wider than a dot), on
+            // the label's cap height (the tab's text sits lower than the tab's middle).
+            const InkBox ib = MeasureInk(Font::Label, 13.0f, label);
+            const float inkRight = (x0 + x1 + (ib.right - ib.left)) * 0.5f;
+            DrawLight(dl, ImVec2(Snap((inkRight + x1 - 2 * t) * 0.5f), Snap((top + b.y) * 0.5f)), light, lightD);
+        }
     } else {
         DrawTextIn(dl, Font::Label, 13.0f, a, b, selected || hovered ? pal::Ink : pal::InkDim, label);
         if (selected) {
             const float inset = Snap(Px(12)), bar = Snap(Px(2));
             dl->AddRectFilled(ImVec2(a.x + inset, b.y - bar), ImVec2(b.x - inset, b.y), Col(pal::Accent));
         }
+        if (light != Light::None) DrawLight(dl, ImVec2(Snap(b.x - Px(8)), Snap((a.y + b.y) * 0.5f)), light, lightD);
     }
     return clicked;
 }
@@ -756,6 +790,10 @@ struct PanelFrame {
     Light light = Light::Off;
     PanelSwitch* sw = nullptr;
     std::string id;
+    // A scrolling panel draws its fill on a layer under the child: ImGui draws a child's scrollbar on the parent's
+    // draw list as the child ends, and a fill drawn after it would paint it over. Its own splitter: a panel may sit
+    // in a table cell, whose columns already split the list.
+    std::shared_ptr<ImDrawListSplitter> splitter;
 };
 std::vector<PanelFrame> g_panels;
 
@@ -773,6 +811,11 @@ void BeginPanel(const char* id, const char* title, const Light* light, ImVec2 si
     f.title = title ? title : "";
     f.hasLight = light != nullptr;
     if (light) f.light = *light;
+    if (sizePx.y > 0.0f && !Shape().groupBoxPanels) {   // a group box draws no fill: nothing to lay under
+        f.splitter = std::make_shared<ImDrawListSplitter>();
+        f.splitter->Split(ImGui::GetWindowDrawList(), 2);
+        f.splitter->SetCurrentChannel(ImGui::GetWindowDrawList(), 1);
+    }
     g_panels.push_back(f);
     ImGui::SetCursorScreenPos(ImVec2(f.pos.x, f.pos.y + f.titleH));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Snap(Px(16)), Snap(Px(Shape().groupBoxPanels ? 4.0f : 10.0f))));
@@ -888,6 +931,7 @@ void EndPanel() {
         headerSwitch(lineY);
         return;
     }
+    if (f.splitter) f.splitter->SetCurrentChannel(dl, 0);   // under the child's scrollbar
     const float r = Snap(Px(Shape().panelRounding));
     Fill(dl, a, b, pal::Panel, r);
     Edge(dl, a, b, pal::PanelEdge, r);
@@ -900,6 +944,7 @@ void EndPanel() {
     const float titleRight = x + DrawText(dl, Font::Label, 13.0f, x, cy, pal::Ink, f.title.c_str());
     dl->AddRectFilled(ImVec2(a.x + 1, a.y + f.titleH - 1), ImVec2(b.x - 1, a.y + f.titleH), Col(pal::PanelEdge));
     headerNotes(Snap(cy), titleRight);
+    if (f.splitter) f.splitter->Merge(dl);
     headerSwitch(cy);
 }
 

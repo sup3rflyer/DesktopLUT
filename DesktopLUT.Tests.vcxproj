@@ -123,6 +123,7 @@
     <ClCompile Include="src\dlc\dlc_data.cpp" />
     <ClCompile Include="src\dlc\dlc_join.cpp" />
     <ClCompile Include="src\dlc\dlc_scan.cpp" />
+    <ClCompile Include="src\dlc\dlc_live.cpp" />
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_gscurve.cpp" />
     <ClCompile Include="src\ui\ui_gsedit.cpp" />
@@ -132,6 +133,9 @@
     <ClCompile Include="src\ui\ui_present.cpp" />
     <ClCompile Include="src\ui\ui_widgets.cpp" />
     <ClCompile Include="src\ui\ui_views.cpp" />
+    <ClCompile Include="src\ui\ui_kit.cpp" />
+    <ClCompile Include="src\ui\ui_charts.cpp" />
+    <ClCompile Include="src\ui\ui_dlc.cpp" />
     <ClCompile Include="src\ui\ui_window.cpp" />
     <ClCompile Include="src\ui\ui_logo.cpp" />
     <ClCompile Include="src\ui\ui_notices.cpp" />
@@ -177,6 +181,7 @@
     <ClCompile Include="tests\test_ui_shots.cpp" />
     <ClCompile Include="tests\test_reconcile.cpp" />
     <ClCompile Include="tests\test_dlc.cpp" />
+    <ClCompile Include="tests\test_dlc_live.cpp" />
     <ClCompile Include="dwm_hook\hook_lut.cpp">
       <!-- the DLL's own parser, compiled as the DLL builds it (test_lut_canonical.cpp round trip) -->
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
