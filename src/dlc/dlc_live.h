@@ -95,15 +95,65 @@ struct LiveState {
     ScoredDe scored;
     SeamPacket seam;
     std::vector<FeedRow> feed;               // oldest first
+    // DLC's warm-up settling verdict: settled (-1 unknown, 0 still moving, 1 settled), the fastest channel, its slope
+    int settled = -1;
+    std::string driftChannel;
+    double driftSlopePct10 = kNaN;           // % per 10 min
 };
 bool ParseLiveState(const std::string& json, LiveState& out);
 
 // ---- live\charts.json ----------------------------------------------------------------------------
-struct CiePoint { float x, y, tx, ty, de; bool carried, neutral; std::string label; };
-struct GrayRow { float signal, Y, cct, duv, de, r, g, b; bool dim; };
+// Where a patch sits for the practical view (DLC's dashboard/practical.py): a weightless content anchor, an HDR grey
+// at the panel's top (a sustain limit), a target outside the panel's gamut, a reachable target outside the content
+// core (HDR > 203 nit / outside Rec.709), or the core.
+enum class Zone : uint8_t { Core, Limits, Clamped, Peak, Anchor };
+struct CiePoint {
+    float x, y, tx, ty, de;
+    bool carried, neutral;
+    std::string label;
+    // practical (NaN when the file predates them)
+    float Y = (float)kNaN, tY = (float)kNaN;        // measured / target nits
+    float L = (float)kNaN, C = (float)kNaN, H = (float)kNaN;   // the metric's signed lightness / chroma / hue split
+    float tw = (float)kNaN, tm = (float)kNaN;       // tint: + warmer / + more magenta (metric units)
+    float dY = (float)kNaN, jnd = (float)kNaN;      // luminance error %, and one JND in %
+    float w = (float)kNaN;                          // content weight (content-sampled sets)
+    Zone zone = Zone::Core;
+    uint32_t liftIntended = 0, liftMeasured = 0;    // lightness-lifted swatches (hue visible on a dark theme)
+};
+struct GrayRow {
+    float signal, Y, cct, duv, de, r, g, b;
+    bool dim;
+    float tY = (float)kNaN, dY = (float)kNaN, jnd = (float)kNaN, tw = (float)kNaN, tm = (float)kNaN;
+    bool carried = false;
+};
 struct CurvePoint { float x, y; };
 struct ConvergencePoint { float elapsedS, avg, max; bool scored; };
 struct Offender { std::string label; float de; uint32_t intended, measured; bool oog; };
+struct DriftPoint { float elapsedS, r, g, b; int seg; };
+
+// The practical view of the charted stage.
+struct BandRow { std::string label; float lo, hi, share, mean, p95, L, C, H; int n; float Lr = (float)kNaN; };   // L signed mean; Lr, C, H RMS
+struct HueRow { int sector; std::string name; int n; float w, de, C, H; };
+struct WorstRow { std::string desc, label; float de, impact, w, dY; char comp; Zone zone; uint32_t intended, measured; };
+struct PanelLimits {
+    float peak = (float)kNaN, targetPeak = (float)kNaN, neutralPeak = (float)kNaN, black = (float)kNaN;
+    bool hasWhite = false;
+    float whiteY = (float)kNaN, whiteTargetY = (float)kNaN, whiteDe = (float)kNaN, whiteCct = (float)kNaN,
+          whiteDuv = (float)kNaN, whiteTw = (float)kNaN, whiteTm = (float)kNaN, whiteDY = (float)kNaN;
+};
+struct Practical {
+    bool present = false;
+    bool contentWeighted = false;          // weights from the patch set (else the survey's film shares)
+    std::vector<BandRow> bands;
+    float score = (float)kNaN, coverage = (float)kNaN, offsetL = (float)kNaN;
+    int n = 0;
+    std::vector<HueRow> hues;
+    std::vector<WorstRow> worst, apart;    // the misses that matter; anchors / peak / limits / clamped apart
+    PanelLimits limits;
+    std::string contentClass;              // e.g. seq_hdr_balanced
+    float contentScore = (float)kNaN;      // DLC's scored content-weighted ΔE
+};
+struct StagePractical { std::string stage; float score; int n; std::vector<float> bands; };
 
 struct LiveCharts {
     bool present = false;
@@ -127,6 +177,9 @@ struct LiveCharts {
     std::vector<CurvePoint> eotfPoints;      // (signal, Y in cd/m2)
     std::vector<ConvergencePoint> convergence;
     std::vector<Offender> offenders;
+    std::vector<DriftPoint> drift;           // channel drift (% from each segment's first checkpoint)
+    Practical practical;
+    std::vector<StagePractical> stages;      // each measurement stage's band means (a build's before / after)
 };
 bool ParseLiveCharts(const std::string& json, LiveCharts& out);
 

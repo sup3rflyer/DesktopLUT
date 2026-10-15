@@ -124,6 +124,73 @@ std::vector<std::string> Strings(const JsonValue* arr) {
     return out;
 }
 
+Zone ZoneOf(const std::string& z) {
+    if (z == "limits") return Zone::Limits;
+    if (z == "clamped") return Zone::Clamped;
+    if (z == "peak") return Zone::Peak;
+    if (z == "anchor") return Zone::Anchor;
+    return Zone::Core;
+}
+
+void ParsePractical(const JsonValue& pr, Practical& out) {
+    out.contentWeighted = Str(&pr, "weighting") == "content";
+    out.score = F(Num(&pr, "score"));
+    out.coverage = F(Num(&pr, "coverage"));
+    out.offsetL = F(Num(&pr, "offset_L"));
+    out.n = Int(&pr, "n", 0);
+    if (const JsonValue* bands = Arr(&pr, "bands")) {
+        for (const JsonValue& b : bands->arr) {
+            if (b.type != JsonValue::Obj) continue;
+            const double hi = Num(&b, "hi");
+            out.bands.push_back({ Str(&b, "label"), F(Num(&b, "lo")), std::isfinite(hi) ? F(hi) : INFINITY,
+                                  F(Num(&b, "share")), F(Num(&b, "mean")), F(Num(&b, "p95")), F(Num(&b, "L")),
+                                  F(Num(&b, "C")), F(Num(&b, "H")), Int(&b, "n", 0), F(Num(&b, "Lr")) });
+        }
+    }
+    if (const JsonValue* hues = Arr(&pr, "hues")) {
+        for (const JsonValue& h : hues->arr) {
+            if (h.type != JsonValue::Obj) continue;
+            out.hues.push_back({ Int(&h, "sector", 0), Str(&h, "name"), Int(&h, "n", 0), F(Num(&h, "w")),
+                                 F(Num(&h, "de")), F(Num(&h, "C")), F(Num(&h, "H")) });
+        }
+    }
+    auto worst = [](const JsonValue* arr, std::vector<WorstRow>& rows) {
+        if (!arr) return;
+        for (const JsonValue& r : arr->arr) {
+            if (r.type != JsonValue::Obj) continue;
+            const std::string comp = Str(&r, "comp");
+            rows.push_back({ Str(&r, "desc"), Str(&r, "label"), F(Num(&r, "de")), F(Num(&r, "impact")), F(Num(&r, "w")),
+                             F(Num(&r, "dY")), comp.empty() ? ' ' : comp[0], ZoneOf(Str(&r, "zone")),
+                             Hex(Str(&r, "sc")), Hex(Str(&r, "mc")) });
+        }
+    };
+    worst(Arr(&pr, "worst"), out.worst);
+    worst(Arr(&pr, "worst_apart"), out.apart);
+    if (const JsonValue* lim = Obj(&pr, "limits")) {
+        PanelLimits& l = out.limits;
+        l.peak = F(Num(lim, "peak"));
+        l.targetPeak = F(Num(lim, "target_peak"));
+        l.neutralPeak = F(Num(lim, "neutral_peak"));
+        l.black = F(Num(lim, "black"));
+        if (const JsonValue* w = Obj(lim, "white")) {
+            l.hasWhite = true;
+            l.whiteY = F(Num(w, "Y"));
+            l.whiteTargetY = F(Num(w, "tY"));
+            l.whiteDe = F(Num(w, "de"));
+            l.whiteCct = F(Num(w, "cct"));
+            l.whiteDuv = F(Num(w, "duv"));
+            l.whiteTw = F(Num(w, "tw"));
+            l.whiteTm = F(Num(w, "tm"));
+            l.whiteDY = F(Num(w, "dY"));
+        }
+    }
+    if (const JsonValue* c = Obj(&pr, "content")) {
+        out.contentClass = Str(c, "class");
+        out.contentScore = F(Num(c, "score"));
+    }
+    out.present = !out.bands.empty();
+}
+
 }  // namespace
 
 // ---- parsers ---------------------------------------------------------------------------------------
@@ -257,6 +324,12 @@ bool ParseLiveState(const std::string& json, LiveState& out) {
         s.gray = Num(de, "grayscale");
         s.present = std::isfinite(s.avg);
     }
+    if (const JsonValue* warm = Obj(&root, "warmup")) {
+        const JsonValue* settled = warm->find("settled");
+        out.settled = settled && settled->type == JsonValue::Bool ? (settled->b ? 1 : 0) : -1;
+        out.driftChannel = Str(warm, "channel");
+        out.driftSlopePct10 = Num(warm, "slope_pct_per_10min");
+    }
     if (const JsonValue* seam = Obj(&root, "seam")) {
         SeamPacket& p = out.seam;
         p.key = Str(seam, "key");
@@ -307,8 +380,22 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
                 if (p.type != JsonValue::Obj) continue;
                 const double x = Num(&p, "x"), y = Num(&p, "y");
                 if (!std::isfinite(x) || !std::isfinite(y)) continue;
-                out.cie.push_back({ F(x), F(y), F(Num(&p, "tx")), F(Num(&p, "ty")), F(Num(&p, "de")),
-                                    Bool(&p, "carried"), Bool(&p, "neutral"), Str(&p, "label") });
+                CiePoint c{ F(x), F(y), F(Num(&p, "tx")), F(Num(&p, "ty")), F(Num(&p, "de")),
+                            Bool(&p, "carried"), Bool(&p, "neutral"), Str(&p, "label") };
+                c.Y = F(Num(&p, "Y"));
+                c.tY = F(Num(&p, "tY"));
+                c.L = F(Num(&p, "L"));
+                c.C = F(Num(&p, "C"));
+                c.H = F(Num(&p, "H"));
+                c.tw = F(Num(&p, "tw"));
+                c.tm = F(Num(&p, "tm"));
+                c.dY = F(Num(&p, "dY"));
+                c.jnd = F(Num(&p, "jnd"));
+                c.w = F(Num(&p, "w"));
+                c.zone = ZoneOf(Str(&p, "zone"));
+                c.liftIntended = Hex(Str(&p, "lsc"));
+                c.liftMeasured = Hex(Str(&p, "lmc"));
+                out.cie.push_back(std::move(c));
             }
         }
     }
@@ -317,8 +404,15 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
             if (g.type != JsonValue::Obj) continue;
             const double s = Num(&g, "signal");
             if (!std::isfinite(s)) continue;
-            out.gray.push_back({ F(s), F(Num(&g, "Y")), F(Num(&g, "cct")), F(Num(&g, "duv")), F(Num(&g, "de")),
-                                 F(Num(&g, "r")), F(Num(&g, "g")), F(Num(&g, "b")), Bool(&g, "dim") });
+            GrayRow row{ F(s), F(Num(&g, "Y")), F(Num(&g, "cct")), F(Num(&g, "duv")), F(Num(&g, "de")),
+                         F(Num(&g, "r")), F(Num(&g, "g")), F(Num(&g, "b")), Bool(&g, "dim") };
+            row.tY = F(Num(&g, "tY"));
+            row.dY = F(Num(&g, "dY"));
+            row.jnd = F(Num(&g, "jnd"));
+            row.tw = F(Num(&g, "tw"));
+            row.tm = F(Num(&g, "tm"));
+            row.carried = Bool(&g, "carried");
+            out.gray.push_back(row);
         }
         std::sort(out.gray.begin(), out.gray.end(), [](const GrayRow& a, const GrayRow& b) { return a.signal < b.signal; });
     }
@@ -354,6 +448,24 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
             const JsonValue* oog = o.find("oog");
             out.offenders.push_back({ Str(&o, "label"), F(Num(&o, "de")), Hex(Str(&o, "sc")), Hex(Str(&o, "mc")),
                                       oog && ((oog->type == JsonValue::Bool && oog->b) || oog->type == JsonValue::Str) });
+        }
+    }
+    if (const JsonValue* drift = Arr(&root, "channel_drift")) {
+        for (const JsonValue& d : drift->arr) {
+            if (d.type != JsonValue::Obj) continue;
+            const double e = Num(&d, "elapsed_s");
+            if (!std::isfinite(e)) continue;
+            out.drift.push_back({ F(e), F(Num(&d, "r")), F(Num(&d, "g")), F(Num(&d, "b")), Int(&d, "seg", 0) });
+        }
+    }
+    if (const JsonValue* pr = Obj(&root, "practical")) ParsePractical(*pr, out.practical);
+    if (const JsonValue* stages = Arr(&root, "stages_practical")) {
+        for (const JsonValue& s : stages->arr) {
+            if (s.type != JsonValue::Obj) continue;
+            StagePractical sp{ Str(&s, "stage"), F(Num(&s, "score")), Int(&s, "n", 0), {} };
+            if (const JsonValue* b = Arr(&s, "bands"))
+                for (size_t i = 0; i < b->arr.size(); i++) sp.bands.push_back(F(NumAt(*b, i)));
+            out.stages.push_back(std::move(sp));
         }
     }
     out.present = true;

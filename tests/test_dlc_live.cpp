@@ -265,3 +265,90 @@ TEST_CASE("dlc live: charts from a report's patch metrics") {
     CHECK(c->primaries[0][0] == doctest::Approx(0.64f));
     CHECK_FALSE(ChartsFromPatches({}, true)->present);
 }
+
+TEST_CASE("dlc live: the practical view (bands, hues, misses, limits, drift, stages, warm-up)") {
+    const char* charts = R"({
+  "live_schema": 1, "seq": 7, "stage": "measure:verify",
+  "cie": {"points": [{"x": 0.30, "y": 0.32, "tx": 0.31, "ty": 0.33, "de": 0.8, "Y": 121.4, "tY": 122.7, "L": -0.81,
+                      "C": -0.04, "H": -0.08, "tw": 0.08, "tm": 0.03, "dY": -1.09, "jnd": 1.37, "w": 0.0026,
+                      "zone": "limits", "lsc": "#e5e9eb", "lmc": "#d7e7eb"}]},
+  "grayscale": [{"signal": 0.05, "Y": 0.055, "cct": 7043, "duv": 0.004, "de": 1.88, "r": -4, "g": -1, "b": 5,
+                 "tY": 0.0496, "dY": 11.1, "jnd": 6.9, "tw": -0.55, "tm": -0.82, "carried": true}],
+  "channel_drift": [{"elapsed_s": 140.7, "r": 0.0, "g": 0.0, "b": 0.0, "seg": 0},
+                    {"elapsed_s": 237.7, "r": -0.1, "g": -0.17, "b": -0.15, "seg": 1}, {"r": 1}],
+  "practical": {"weighting": "content", "score": 1.175, "coverage": 1.0, "offset_L": -0.536, "n": 451,
+                "bands": [{"label": "<1", "lo": 0.0, "hi": 1.0, "share": 0.3845, "n": 82, "mean": 1.217, "p95": 2.963,
+                           "L": -0.2, "Lr": 0.6, "C": 0.83, "H": 1.276},
+                          {"label": ">203", "lo": 203.0, "hi": null, "share": 0.02, "n": 9, "mean": 2.4, "p95": 4.1,
+                           "L": -0.8, "C": 1.5, "H": 1.1}],
+                "hues": [{"sector": 1, "name": "orange", "n": 131, "w": 0.2968, "de": 1.472, "C": 0.358, "H": -0.694},
+                         {"sector": 5, "name": "spring", "n": 0}],
+                "worst": [{"desc": "0.064 nit \u00b7 grey", "de": 1.917, "impact": 0.0244, "w": 0.0127, "comp": "L",
+                           "zone": "core", "dY": 8.9, "sc": "#ebe2eb", "mc": "#e2d5eb", "label": "p0262"}],
+                "worst_apart": [{"desc": "1726 nit \u00b7 grey", "de": 14.02, "impact": 0.0, "w": 0.0, "comp": "L",
+                                 "zone": "anchor", "dY": -14.4, "sc": "#ebebeb", "mc": "#ebdcdc", "label": "p0005"}],
+                "limits": {"peak": 1476.2, "target_peak": 1729.3, "neutral_peak": 397.6, "black": 0.00235,
+                           "white": {"Y": 200.3, "tY": 202.9, "de": 1.015, "cct": 6499.0, "duv": 0.0035, "tw": 0.21,
+                                     "tm": -0.11, "dY": -1.28}},
+                "content": {"class": "seq_hdr_balanced", "score": 1.153}},
+  "stages_practical": [{"stage": "measure:baseline", "score": 2.4, "n": 309, "bands": [3.4, null, 1.6]},
+                       {"stage": "measure:verify", "score": 1.175, "n": 451, "bands": [1.2, 1.1, 0.9]}]
+})";
+    LiveCharts c;
+    REQUIRE(ParseLiveCharts(charts, c));
+    REQUIRE(c.cie.size() == 1);
+    const CiePoint& p = c.cie[0];
+    CHECK(p.tY == doctest::Approx(122.7f));
+    CHECK(p.L == doctest::Approx(-0.81f));
+    CHECK(p.jnd == doctest::Approx(1.37f));
+    CHECK(p.w == doctest::Approx(0.0026f));
+    CHECK(p.zone == Zone::Limits);
+    CHECK(p.liftIntended == 0xE5E9EBu);
+    REQUIRE(c.gray.size() == 1);
+    CHECK(c.gray[0].dY == doctest::Approx(11.1f));
+    CHECK(c.gray[0].tw == doctest::Approx(-0.55f));
+    CHECK(c.gray[0].carried);
+    REQUIRE(c.drift.size() == 2);   // a check without its time is dropped
+    CHECK(c.drift[1].seg == 1);
+    CHECK(c.drift[1].g == doctest::Approx(-0.17f));
+    const Practical& pr = c.practical;
+    REQUIRE(pr.present);
+    CHECK(pr.contentWeighted);
+    CHECK(pr.score == doctest::Approx(1.175f));
+    CHECK(pr.offsetL == doctest::Approx(-0.536f));
+    REQUIRE(pr.bands.size() == 2);
+    CHECK(pr.bands[0].Lr == doctest::Approx(0.6f));
+    CHECK(std::isnan(pr.bands[1].Lr));           // an older file: no RMS lightness
+    CHECK(std::isinf(pr.bands[1].hi));            // the open top band
+    REQUIRE(pr.hues.size() == 2);
+    CHECK(pr.hues[0].name == "orange");
+    CHECK(pr.hues[1].n == 0);
+    REQUIRE(pr.worst.size() == 1);
+    CHECK(pr.worst[0].comp == 'L');
+    CHECK(pr.worst[0].zone == Zone::Core);
+    CHECK(pr.worst[0].intended == 0xEBE2EBu);
+    REQUIRE(pr.apart.size() == 1);
+    CHECK(pr.apart[0].zone == Zone::Anchor);
+    CHECK(pr.limits.neutralPeak == doctest::Approx(397.6f));
+    CHECK(pr.limits.hasWhite);
+    CHECK(pr.limits.whiteCct == doctest::Approx(6499.0f));
+    CHECK(pr.contentClass == "seq_hdr_balanced");
+    CHECK(pr.contentScore == doctest::Approx(1.153f));
+    REQUIRE(c.stages.size() == 2);
+    CHECK(c.stages[0].bands.size() == 3);
+    CHECK(std::isnan(c.stages[0].bands[1]));
+
+    LiveState s;
+    REQUIRE(ParseLiveState(R"({"live_schema": 1, "seq": 1, "warmup": {"settled": false, "channel": "b",
+                                 "slope_pct_per_10min": 0.42}})", s));
+    CHECK(s.settled == 0);
+    CHECK(s.driftChannel == "b");
+    CHECK(s.driftSlopePct10 == doctest::Approx(0.42));
+    REQUIRE(ParseLiveState(R"({"live_schema": 1, "seq": 1})", s));
+    CHECK(s.settled == -1);
+
+    LiveCharts old;   // a file from before the practical view: nothing claimed
+    REQUIRE(ParseLiveCharts(R"({"live_schema": 1, "seq": 1})", old));
+    CHECK_FALSE(old.practical.present);
+    CHECK(old.stages.empty());
+}

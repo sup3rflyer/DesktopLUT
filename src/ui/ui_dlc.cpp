@@ -2,12 +2,14 @@
 
 #include "ui_charts.h"
 #include "ui_kit.h"
+#include "ui_model.h"
 #include "ui_window.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
 #include "globals.h"
 #include <shellapi.h>
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -399,7 +401,7 @@ void ReadoutRow(const std::vector<Tile>& tiles) {
 
 std::string N2(double v) { return Num2(v); }
 
-std::vector<Tile> LiveTiles(const dlc::LiveState& st) {
+std::vector<Tile> LiveTiles(const dlc::LiveState& st, const dlc::LiveCharts* charts) {
     std::vector<Tile> t;
     const dlc::LiveRead& r = st.lastRead;
     const char* metric = MetricName(st.liveDe.metric, st.hdr);
@@ -416,7 +418,10 @@ std::vector<Tile> LiveTiles(const dlc::LiveState& st) {
     const double avg = live ? st.liveDe.avg : st.scored.avg, mx = live ? st.liveDe.max : st.scored.max;
     t.push_back({ "AVG", N2(avg), live ? (st.liveDe.n > 0 ? std::to_string(st.liveDe.n) + " PATCHES" : std::string()) : std::string("SCORED"),
                   pal::Ink });
-    t.push_back({ "MAX", N2(mx), std::string(), std::isfinite(mx) && mx > 3.0 ? pal::Alarm : pal::Ink });
+    // Weighted by where content lives (the practical view), the max beside it: a max is a trophy, not a verdict.
+    const dlc::Practical* pr = charts && charts->present && charts->practical.present ? &charts->practical : nullptr;
+    if (pr) t.push_back({ "SCORE", N2(pr->score), "MAX " + N2(mx), pal::Ink });
+    else t.push_back({ "MAX", N2(mx), std::string(), pal::Ink });
     char reads[48];
     snprintf(reads, sizeof(reads), "%d", st.readsOk);
     t.push_back({ "READS", reads, st.readsFailed > 0 ? std::to_string(st.readsFailed) + " FAILED" : std::string(),
@@ -447,44 +452,122 @@ std::vector<Tile> RecordTiles(const dlc::Report* rep) {
     };
 }
 
+std::string NitsText(float v) {
+    if (!std::isfinite(v)) return "\xE2\x80\x94";
+    return Fmt(v >= 100.0f ? "%.0f" : v >= 1.0f ? "%.1f" : v >= 0.1f ? "%.2f" : v >= 0.01f ? "%.3f" : "%.4f", v) + " NIT";
+}
+
+// A record's readouts from its practical view: what a person acts on — the content-weighted score, the worst miss
+// that matters, the white, the panel's reach. The report's own p95 / max stay beside them.
+std::vector<Tile> PracticalTiles(const dlc::Practical& pr, const dlc::Report* rep, bool hdr) {
+    std::vector<Tile> t;
+    const bool scored = std::isfinite(pr.contentScore);
+    t.push_back({ "SCORE", N2(scored ? pr.contentScore : pr.score), pr.contentWeighted ? "CONTENT" : "SURVEY", pal::Ink, 0u, 0.9f });
+    t.push_back({ "P95", rep ? N2(rep->verification.p95) : std::string("\xE2\x80\x94"),
+                  rep ? "MAX " + N2(rep->verification.max) : std::string(), pal::Ink, 0u, 0.9f });
+    if (!pr.worst.empty()) {
+        const dlc::WorstRow& w = pr.worst.front();
+        t.push_back({ "WORST", N2(w.de), w.desc, w.de > 3.0f ? pal::Alarm : pal::Ink, w.intended, 1.6f });
+    } else {
+        t.push_back({ "WORST", "\xE2\x80\x94", std::string(), pal::InkFaint, 0u, 1.6f });
+    }
+    const dlc::PanelLimits& l = pr.limits;
+    if (l.hasWhite) {
+        std::string sub = NitsText(l.whiteY);
+        if (std::isfinite(l.whiteTargetY)) sub = Fmt(l.whiteY >= 100.0f ? "%.0f" : "%.1f", l.whiteY) + " / " + NitsText(l.whiteTargetY);
+        if (std::isfinite(l.whiteDe)) sub += "  \xC2\xB7  " + N2(l.whiteDe);
+        t.push_back({ hdr ? "WHITE 203" : "WHITE", std::isfinite(l.whiteCct) ? Fmt("%.0f K", l.whiteCct) : std::string("\xE2\x80\x94"), sub, pal::Ink,
+                      0u, 1.3f });
+    } else {
+        t.push_back({ hdr ? "WHITE 203" : "WHITE", "\xE2\x80\x94", std::string(), pal::InkFaint, 0u, 1.3f });
+    }
+    std::string peakSub;
+    if (std::isfinite(l.targetPeak)) peakSub = "TARGET " + Fmt("%.0f", l.targetPeak);
+    if (std::isfinite(l.neutralPeak)) peakSub += (peakSub.empty() ? "" : "  ") + std::string("NEUTRAL ") + Fmt("%.0f", l.neutralPeak);
+    t.push_back({ "PEAK", NitsText(l.peak), peakSub, pal::Ink, 0u, 1.6f });
+    t.push_back({ "BLACK", NitsText(l.black), std::string(), pal::Ink, 0u, 0.9f });
+    return t;
+}
+
 // ---- the chart tiles ---------------------------------------------------------------------------------------------
-DlcChart DefaultChart(int tile, const dlc::LiveCharts& c, bool live) {
-    const bool building = live && c.convergence.size() > 1 && !c.offenders.empty();
-    switch (tile) {
-    case 0: return DlcChart::Cie;
-    case 1: return DlcChart::Tone;
-    case 2: return c.gray.empty() ? DlcChart::Worst : DlcChart::Balance;
-    default: return building ? DlcChart::Convergence : DlcChart::DeDistribution;
+// The charts a view opens with. A run in progress: fixed (nothing moves as data arrives). A record: the preferred
+// ones that have data, then the others that do.
+std::array<DlcChart, 4> DefaultTiles(const dlc::LiveCharts& c, bool live) {
+    using K = DlcChart;
+    const bool building = c.convergence.size() > 1;
+    std::vector<K> pref;
+    if (live) pref = building ? std::vector<K>{ K::Convergence, K::Bands, K::Hues, K::Stability }
+                              : std::vector<K>{ K::ToneError, K::GreyTint, K::Stability, K::Bands };
+    else pref = building ? std::vector<K>{ K::Bands, K::BuildDelta, K::GreyTint, K::Worst }
+                         : std::vector<K>{ K::Bands, K::ToneError, K::GreyTint, K::Worst };
+    std::array<K, 4> out{};
+    if (live) {
+        for (int i = 0; i < 4; i++) out[(size_t)i] = pref[(size_t)i];
+        return out;
+    }
+    std::vector<K> order;
+    auto add = [&](K k) { if (std::find(order.begin(), order.end(), k) == order.end()) order.push_back(k); };
+    for (K k : pref) if (DlcChartHasData(k, c)) add(k);
+    for (K k : { K::Bands, K::ToneError, K::GreyTint, K::Worst, K::Hues, K::Distribution, K::Cie, K::BuildDelta, K::Stability, K::Convergence })
+        if (DlcChartHasData(k, c)) add(k);
+    for (K k : pref) add(k);
+    for (int i = 0; i < 4; i++) out[(size_t)i] = order[(size_t)i];
+    return out;
+}
+
+// One tile: the chart picker, FULL / TILES, the chart. A double-click on the chart does what FULL / TILES does.
+void ChartTile(ViewState& vs, int i, DlcChart k, const dlc::LiveCharts* c, bool hdr, ImVec2 ta, ImVec2 tb, const char* emptyText,
+               const ChartContext& ctx) {
+    constexpr float kMaxBtnW = 60.0f;
+    const float tw = tb.x - ta.x;
+    const bool full = vs.dlc.maximized == i;
+    ImGui::PushID(i);
+    ImGui::SetCursorScreenPos(ta);
+    const float ddW = (tw - Px(kMaxBtnW) - Px(8)) / Dpi();
+    const int pick = vs.dlc.tile[i];
+    const ImVec2 ha(ta.x, ta.y), hb(ta.x + Px(ddW), ta.y + Snap(Px(kTileHeadH)));
+    const bool headHover = ImGui::IsMouseHoveringRect(ha, hb) && ImGui::IsWindowHovered();
+    if (BeginDropdown("##chart", DlcChartTitle(k, hdr), ddW)) {
+        if (DropdownItem("AUTOMATIC", pick < 0)) vs.dlc.tile[i] = -1;
+        for (int j = 0; j < (int)DlcChart::Count; j++)
+            if (DropdownItem(DlcChartTitle((DlcChart)j, hdr), pick == j)) vs.dlc.tile[i] = j;
+        EndDropdown();
+    } else if (headHover) {
+        ImGui::SetTooltip("%s", DlcChartTip(k));
+    }
+    ImGui::SetCursorScreenPos(ImVec2(Snap(tb.x - Px(kMaxBtnW)), ta.y));
+    if (Button("##full", full ? "TILES" : "FULL", kMaxBtnW)) vs.dlc.maximized = full ? -1 : i;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip(full ? "Back to four charts." : "This chart over the whole area.");
+    ImGui::PopID();
+    const ImVec2 pa(ta.x, ta.y + Snap(Px(kTileHeadH)) + Snap(Px(6))), pb = tb;
+    if (!c || !c->present) {
+        DrawFieldBox(ImGui::GetWindowDrawList(), pa, pb);
+        DrawTextIn(ImGui::GetWindowDrawList(), Font::Label, kSizeLabel, pa, pb, pal::InkFaint, emptyText);
+    } else {
+        DrawDlcChart(k, *c, pa, pb, ctx);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsMouseHoveringRect(pa, pb) && ImGui::IsWindowHovered())
+            vs.dlc.maximized = full ? -1 : i;
     }
 }
 
-void ChartTiles(ViewState& vs, const dlc::LiveCharts* c, bool hdr, bool live, ImVec2 size, const char* emptyText) {
+void ChartTiles(ViewState& vs, const dlc::LiveCharts* c, bool hdr, bool live, ImVec2 size, const char* emptyText,
+                const ChartContext& ctx) {
     const ImVec2 a(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
-    const float gap = Snap(Px(12));
-    const float tw = Snap((size.x - gap) * 0.5f), th = Snap((size.y - gap) * 0.5f);
     static const dlc::LiveCharts kNone;
-    const dlc::LiveCharts& cc = c ? *c : kNone;
-    for (int i = 0; i < 4; i++) {
-        const ImVec2 ta(a.x + (float)(i % 2) * (tw + gap), a.y + (float)(i / 2) * (th + gap));
+    const std::array<DlcChart, 4> def = DefaultTiles(c ? *c : kNone, live);
+    auto chartOf = [&](int i) {
         const int pick = vs.dlc.tile[i];
-        const DlcChart k = pick >= 0 && pick < (int)DlcChart::Count ? (DlcChart)pick : DefaultChart(i, cc, live);
-        ImGui::SetCursorScreenPos(ta);
-        char id[24];
-        snprintf(id, sizeof(id), "##dlc_tile%d", i);
-        ImGui::PushID(i);
-        if (BeginDropdown(id, DlcChartTitle(k, hdr), tw / Dpi())) {
-            if (DropdownItem("AUTOMATIC", pick < 0)) vs.dlc.tile[i] = -1;
-            for (int j = 0; j < (int)DlcChart::Count; j++)
-                if (DropdownItem(DlcChartTitle((DlcChart)j, hdr), pick == j)) vs.dlc.tile[i] = j;
-            EndDropdown();
-        }
-        ImGui::PopID();
-        const ImVec2 pa(ta.x, ta.y + Snap(Px(kTileHeadH)) + Snap(Px(6))), pb(ta.x + tw, ta.y + th);
-        if (!c || !c->present) {
-            DrawFieldBox(ImGui::GetWindowDrawList(), pa, pb);
-            DrawTextIn(ImGui::GetWindowDrawList(), Font::Label, kSizeLabel, pa, pb, pal::InkFaint, emptyText);
-        } else {
-            DrawDlcChart(k, *c, pa, pb);
+        return pick >= 0 && pick < (int)DlcChart::Count ? (DlcChart)pick : def[(size_t)i];
+    };
+    if (vs.dlc.maximized >= 0 && vs.dlc.maximized < 4) {
+        const int i = vs.dlc.maximized;
+        ChartTile(vs, i, chartOf(i), c, hdr, a, ImVec2(a.x + size.x, a.y + size.y), emptyText, ctx);
+    } else {
+        const float gap = Snap(Px(12));
+        const float tw = Snap((size.x - gap) * 0.5f), th = Snap((size.y - gap) * 0.5f);
+        for (int i = 0; i < 4; i++) {
+            const ImVec2 ta(a.x + (float)(i % 2) * (tw + gap), a.y + (float)(i / 2) * (th + gap));
+            ChartTile(vs, i, chartOf(i), c, hdr, ta, ImVec2(ta.x + tw, ta.y + th), emptyText, ctx);
         }
     }
     ImGui::SetCursorScreenPos(ImVec2(a.x, a.y + size.y));
@@ -570,8 +653,98 @@ void FeedRows(const dlc::LiveState& st) {
     }
 }
 
+// "20261012_140312_..." -> "2026-10-12 14:03" (the run id as it is otherwise).
+std::string RunWhen(const std::string& id) {
+    if (id.size() >= 13 && id[8] == '_')
+        return id.substr(0, 4) + "-" + id.substr(4, 2) + "-" + id.substr(6, 2) + " " + id.substr(9, 2) + ":" + id.substr(11, 2);
+    return id;
+}
+
+// A layer of the stack: its light, what it is and where it came from.
+void LayerRow(const char* label, Light light, const std::string& value, ImU32 col, const std::string& tip) {
+    RowCtx row = BeginRow("", kRowH);
+    const float cy = row.y0 + row.h * 0.5f;
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, cy, label);
+    const float d = Snap(Px(7));
+    DrawLight(ImGui::GetWindowDrawList(), ImVec2(Snap(row.x0 + Px(96) + d * 0.5f), cy), light, d);
+    row.x = row.x0 + Px(96) + d + Px(8);
+    RowText(row, value, col, Font::Label, kSizeLabel);
+    if (!tip.empty()) RowTip(row, tip.c_str());
+    EndRow(row);
+}
+
+// The layers this display runs in the shown mode, in pixel order; DLC's own with the run that made them.
+void StackLayers(const Snapshot& snap, const DisplayRow& r, bool showHdr) {
+    const dlc::Data& d = *snap.dlc;
+    const dlc::ModeRecord& rec = r.dlcRecord[showHdr ? 1 : 0];
+    const dlc::StackRecord* st = rec.stack >= 0 && rec.stack < (int)d.stacks.size() ? &d.stacks[(size_t)rec.stack] : nullptr;
+    const Mode shown = showHdr ? Mode::HDR : (r.mode == Mode::AcmSdr ? Mode::AcmSdr : Mode::SDR);
+    PathRuntime rt;
+    rt.suspended = snap.suspended;
+    rt.running = snap.running;
+    rt.hookMode = snap.hookMode;
+    rt.hookActive = snap.hookActive;
+    const std::vector<Stage> path = BuildPixelPath(r.settings, shown, r.mode, rt);
+    auto onOff = [](Light l) -> std::pair<std::string, ImU32> {
+        switch (l) {
+        case Light::Configured:
+        case Light::Verified: return { "ON", pal::Ink };
+        case Light::Fault:    return { "NOT REACHING THE SCREEN", pal::Alarm };
+        case Light::Off:      return { "OFF", pal::InkFaint };
+        default:              return { "\xE2\x80\x94", pal::InkFaint };
+        }
+    };
+    auto dlcLayer = [&](dlc::LayerState s, const std::string& runId, Light l) -> std::pair<std::string, ImU32> {
+        if (s == dlc::LayerState::Off) return onOff(l);
+        std::string v = runId.empty() ? std::string() : RunWhen(runId) + "  \xC2\xB7  ";
+        switch (s) {
+        case dlc::LayerState::Matches:    return { v + "AS APPLIED", l == Light::Fault ? pal::Alarm : pal::Ink };
+        case dlc::LayerState::Differs:    return { v + "CHANGED", pal::Alarm };
+        case dlc::LayerState::Unrecorded: return { "NOT FROM DLC", pal::InkDim };
+        default:                          return onOff(l);
+        }
+    };
+    Light mhc = Light::None;
+    for (const Stage& s : path) if (s.id == StageId::Primaries || s.id == StageId::Grayscale) mhc = CombineLights(mhc, s.light);
+    bool mhcDone = false;
+    for (const Stage& s : path) {
+        switch (s.id) {
+        case StageId::ToneMap: {
+            const auto v = onOff(s.light);
+            LayerRow("TONE MAP", s.light, v.first, v.second, "Applied over the calibration; a verification measures it only when it ran then.");
+            break;
+        }
+        case StageId::Lut3D: {
+            const auto v = dlcLayer(rec.cube, st ? st->cubeRunId : std::string(), s.light);
+            LayerRow("3D LUT", s.light, v.first, v.second, st && !st->cubeRunId.empty() ? "DLC run " + st->cubeRunId : std::string());
+            break;
+        }
+        case StageId::Fald: {
+            const auto v = onOff(s.light);
+            LayerRow("FALD", s.light, v.first, v.second, std::string());
+            break;
+        }
+        case StageId::ShaderTweak: {
+            const auto v = onOff(s.light);
+            LayerRow("TWEAK", s.light, v.first, v.second, "The grayscale tweak over the 3D LUT.");
+            break;
+        }
+        case StageId::Primaries:
+        case StageId::Grayscale: {
+            if (mhcDone) break;
+            mhcDone = true;
+            const auto v = dlcLayer(rec.mhc, st ? st->runId : std::string(), mhc);
+            LayerRow("MHC", mhc, v.first, v.second, st && !st->runId.empty() ? "DLC run " + st->runId : std::string());
+            break;
+        }
+        default: break;
+        }
+    }
+}
+
 // ---- right column, record view: what DLC recorded for this display + the way to start a run ---------------------
-void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs) {
+// `stack`: the CURRENT STACK view — the layers in pixel order and the verification that measured them.
+void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs, bool stack = false) {
     const dlc::Data& d = *snap.dlc;
     if (d.folder.empty()) {
         SeamRow("DLC", "NO FOLDER", pal::InkFaint, Font::Label);
@@ -599,8 +772,27 @@ void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, Vi
         default: return "OFF";
         }
     };
-    SeamRow("MHC", layer(rec.mhc), rec.mhc == dlc::LayerState::Differs ? pal::Alarm : pal::Ink, Font::Label);
-    SeamRow("3D LUT", layer(rec.cube), rec.cube == dlc::LayerState::Differs ? pal::Alarm : pal::Ink, Font::Label);
+    if (stack) {
+        if (rec.current >= 0) {
+            const dlc::Report& cur = d.reports[(size_t)rec.current];
+            std::string when = cur.date.substr(0, 10);
+            const std::string id = dlc::RunIdFromPath(cur.runDir);
+            if (id.size() >= 13 && id[8] == '_') when = RunWhen(id);
+            SeamRow("VERIFIED", when, pal::Ink, Font::Label);
+        } else {
+            SeamRow("VERIFIED", "NOT SINCE APPLIED", pal::InkFaint, Font::Label);
+        }
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        Hairline(pal::Rule);
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        StackLayers(snap, r, showHdr);
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        Hairline(pal::Rule);
+        ImGui::Dummy(ImVec2(0, Px(4)));
+    } else {
+        SeamRow("MHC", layer(rec.mhc), rec.mhc == dlc::LayerState::Differs ? pal::Alarm : pal::Ink, Font::Label);
+        SeamRow("3D LUT", layer(rec.cube), rec.cube == dlc::LayerState::Differs ? pal::Alarm : pal::Ink, Font::Label);
+    }
     if (!rec.correctionMade.empty())
         SeamRow("METER", DateAge(rec.correctionMade, rec.correctionDaysAgo), rec.correctionStale ? pal::Alarm : pal::InkDim);
     // Runs are started from Claude Code: the prompt, ready to paste.
@@ -707,23 +899,28 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
     RunStrip(snap, vs, sel);
     ImGui::Dummy(ImVec2(0, Px(12)));
 
-    // Which view: the live run (this display's run, picked or automatic while in progress) or a record.
+    // Which view: the live run (this display's run, picked or automatic while in progress), the current stack (what
+    // the display runs now and the newest verification of it), or one record.
     const bool runHere = sel->dlcRun && L.state && L.state->present && ((L.state->mode == "HDR") == showHdr);
     std::vector<int> reports = sel->dlcMatch.name.empty() ? std::vector<int>() : ReportsFor(d, sel->dlcMatch.name, showHdr);
-    bool liveView = false;
+    const dlc::ModeRecord& rec = sel->dlcRecord[showHdr ? 1 : 0];
+    const bool hasStack = !d.folder.empty() && !sel->dlcMatch.name.empty() && (rec.stack >= 0 || rec.current >= 0);
+    bool liveView = false, stackView = false;
     int shown = -1;
     if (vs.dlc.pick == kDlcPickLive) liveView = runHere;
+    else if (vs.dlc.pick == kDlcPickStack) stackView = hasStack;
     else if (!vs.dlc.pick.empty()) {
         for (int i : reports) if (dlc::SamePath(d.reports[i].path, vs.dlc.pick)) shown = i;
     }
-    if (!liveView && shown < 0) {
+    if (!liveView && !stackView && shown < 0) {
         if (vs.dlc.pick.empty() && runHere && InProgress(L.phase)) liveView = true;
+        else if (hasStack) stackView = true;
         else {
-            const dlc::ModeRecord& rec = sel->dlcRecord[showHdr ? 1 : 0];
-            shown = rec.current >= 0 ? rec.current : (reports.empty() ? -1 : reports.front());
+            shown = reports.empty() ? -1 : reports.front();
             if (shown < 0 && runHere) liveView = true;
         }
     }
+    if (stackView) shown = rec.current;
     const Look look = LookOf(L);
 
     // Second row: the stepper (live) or the record picker.
@@ -748,22 +945,31 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         const float w = ImGui::GetContentRegionAvail().x, h = Snap(Px(kStepsH)), cy = p.y + h * 0.5f;
         TextAt(Font::Label, kSizeLabel, pal::InkDim, p.x, cy, "RUN");
         ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + Px(48)), Snap(cy - Px(kControlH) * 0.5f)));
-        const std::string preview = shown >= 0 ? ReportLabel(d.reports[shown]) : std::string("NO RUNS");
-        ImGui::BeginDisabled(reports.empty() && !runHere);
+        const std::string preview = stackView ? std::string("CURRENT STACK") : shown >= 0 ? ReportLabel(d.reports[shown]) : std::string("NO RUNS");
+        ImGui::BeginDisabled(reports.empty() && !runHere && !hasStack);
         if (BeginDropdown("##dlc_run", preview.c_str(), kRunPickerW)) {
             if (runHere && DropdownItem(("LIVE  \xC2\xB7  " + Upper(L.state->flow)).c_str(), false)) vs.dlc.pick = kDlcPickLive;
+            if (hasStack && DropdownItem("CURRENT STACK", stackView)) vs.dlc.pick = kDlcPickStack;
             for (int i : reports) {
                 ImGui::PushID(i);   // two runs can share a label (same day, same flow): ids by report
-                if (DropdownItem(ReportLabel(d.reports[i]).c_str(), i == shown)) vs.dlc.pick = d.reports[i].path;
+                if (DropdownItem(ReportLabel(d.reports[i]).c_str(), !stackView && i == shown)) vs.dlc.pick = d.reports[i].path;
                 ImGui::PopID();
             }
             EndDropdown();
         }
         ImGui::EndDisabled();
+        if (ImGui::IsItemHovered() && stackView)
+            ImGui::SetTooltip("What the display runs now: its layers and the newest verification of them.");
         float x = Snap(p.x + Px(48) + Px(kRunPickerW) + Px(12));
+        if (stackView && shown >= 0) {   // the verification the stack's charts come from
+            const std::string from = "VERIFIED  " + ReportLabel(d.reports[shown]);
+            TextAt(Font::Label, kSizeLabel, pal::InkDim, x, cy,
+                   Ellipsize(Font::Label, kSizeLabel, from, p.x + w - Px(kButtonW) - Px(16) - x).c_str());
+        } else if (stackView) {
+            TextAt(Font::Label, kSizeLabel, pal::InkFaint, x, cy, "NOT VERIFIED SINCE APPLIED");
+        }
         if (shown >= 0) {
-            const dlc::ModeRecord& rec = sel->dlcRecord[showHdr ? 1 : 0];
-            const char* tag = shown == rec.current ? "ON SCREEN" : nullptr;
+            const char* tag = !stackView && shown == rec.current ? "ON SCREEN" : nullptr;
             if (tag) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
                 const InkBox ib = MeasureInk(Font::Label, 11.0f, tag);
@@ -787,17 +993,8 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
     }
     ImGui::Dummy(ImVec2(0, Px(10)));
 
-    // Readouts.
+    // The charts (they also feed the readouts).
     const dlc::Report* rep = shown >= 0 ? &d.reports[shown] : nullptr;
-    ReadoutRow(liveView ? LiveTiles(*L.state) : RecordTiles(rep));
-    ImGui::Dummy(ImVec2(0, Px(14)));
-
-    // Charts left, the feed / record panel right (under the charts in a narrow window).
-    const ImVec2 top(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
-    const float total = ImGui::GetContentRegionAvail().x, colH = std::max(ImGui::GetContentRegionAvail().y, Px(360));
-    const float sideW = Snap(Px(kMeasuredW)), gutter = Snap(Px(kGutter));
-    const bool stacked = total - sideW - gutter < Px(440);
-    const float chartsW = stacked ? total : total - sideW - gutter;
     std::shared_ptr<const dlc::LiveCharts> charts;
     const char* emptyText = "NO CHARTS";
     if (liveView) {
@@ -821,10 +1018,31 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
             }
         }
     } else if (!rep) {
-        emptyText = d.folder.empty() ? "NO DLC FOLDER" : (sel->dlcMatch.name.empty() ? "NOT A DLC DISPLAY" : "NO RUNS");
+        emptyText = stackView ? "NOT VERIFIED SINCE APPLIED"
+                    : d.folder.empty() ? "NO DLC FOLDER" : (sel->dlcMatch.name.empty() ? "NOT A DLC DISPLAY" : "NO RUNS");
     }
     const bool chartsHdr = liveView ? L.state->hdr : showHdr;
-    ChartTiles(vs, charts.get(), chartsHdr, liveView, ImVec2(chartsW, stacked ? Px(440) : colH), emptyText);
+
+    // Readouts: the run's live numbers; a record's practical view (its report's numbers when it has none).
+    const dlc::LiveCharts* lc = charts && charts->present ? charts.get() : nullptr;
+    if (liveView) ReadoutRow(LiveTiles(*L.state, lc));
+    else if (lc && lc->practical.present) ReadoutRow(PracticalTiles(lc->practical, rep, chartsHdr));
+    else ReadoutRow(RecordTiles(rep));
+    ImGui::Dummy(ImVec2(0, Px(14)));
+
+    // Charts left, the feed / record panel right (under the charts in a narrow window).
+    const ImVec2 top(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+    const float total = ImGui::GetContentRegionAvail().x, colH = std::max(ImGui::GetContentRegionAvail().y, Px(360));
+    const float sideW = Snap(Px(kMeasuredW)), gutter = Snap(Px(kGutter));
+    const bool stacked = total - sideW - gutter < Px(440);
+    const float chartsW = stacked ? total : total - sideW - gutter;
+    ChartContext ctx;
+    if (liveView) {
+        ctx.settled = L.state->settled;
+        ctx.slopePct10 = L.state->driftSlopePct10;
+        ctx.channel = L.state->driftChannel.c_str();
+    }
+    ChartTiles(vs, charts.get(), chartsHdr, liveView, ImVec2(chartsW, stacked ? Px(440) : colH), emptyText, ctx);
     if (stacked) ImGui::Dummy(ImVec2(0, Px(kPanelGap)));
     else ImGui::SetCursorScreenPos(ImVec2(top.x + chartsW + gutter, top.y));
     const ImVec2 sideSize(stacked ? total : sideW, stacked ? 0.0f : colH);
@@ -842,10 +1060,9 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         FeedRows(*L.state);
         EndPanel();
     } else {
-        const Light light = sel->dlcRecord[showHdr ? 1 : 0].reminderDue ? Light::Fault
-                            : (sel->dlcRecord[showHdr ? 1 : 0].current >= 0 ? Light::Configured : Light::None);
-        BeginPanel("##dlc_record", "CALIBRATION", &light, sideSize);
-        RecordPanelRows(snap, *sel, showHdr, vs);
+        const Light light = rec.reminderDue ? Light::Fault : (rec.current >= 0 ? Light::Configured : Light::None);
+        BeginPanel(stackView ? "##dlc_stack" : "##dlc_record", stackView ? "CURRENT STACK" : "CALIBRATION", &light, sideSize);
+        RecordPanelRows(snap, *sel, showHdr, vs, stackView);
         EndPanel();
     }
     ImGui::EndChild();

@@ -11,6 +11,15 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **The practical view in the live charts** (2026-10-15). `charts.json` now says what a person acts on:
+  - Per patch: the luminance error in % with its one-JND width, the tint direction (warm/cool, magenta/green),
+    the content weight (from the content-sampled verify set the run names in its header) and a zone (core,
+    limits, clamped, peak, anchor).
+  - `practical`: error by luminance band, weighted by where content lives (content weights, else the film
+    survey's shares), split into lightness / saturation / hue; error per hue sector; the misses that matter
+    (content × ΔE, described in words) with panel limits and anchors apart; the peak reached, the brightest
+    neutral grey, the black floor and the white.
+  - `stages_practical`: each measured stage's band means (a build's before / after).
 - **Live state for DesktopLUT's DLC tab; supervisor notes** (2026-10-15).
   - A live run (`dlc.calibrate` CLI) folds its own spine with the dashboard's state code on a separate thread and
     writes `runs/<run>/live/state.json` + `charts.json` (atomic, NaN-free, `live_schema` 1). The final write at exit

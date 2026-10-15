@@ -134,6 +134,24 @@ def feed_entry(wire: dict[str, Any]) -> dict[str, Any]:
             "title": title, "text": text}
 
 
+def load_content_weights(path: Any) -> dict[tuple, tuple]:
+    """A content-sampled verify set's per-patch weights ({code triple: (weight, role)}) from its file (the
+    run header's ``verify_patches_file``); {} on any read problem. Never reads the run's own state files: the
+    run replaces them atomically, and an open reader on Windows would make that replace fail."""
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        codes, weights = doc.get("codes") or [], doc.get("content_weight") or []
+        roles = doc.get("role") or [None] * len(codes)
+        out: dict[tuple, tuple] = {}
+        for c, w, r in zip(codes, weights, roles):
+            key = tuple(int(v) for v in c[:3])
+            if key not in out:   # a repeated signal (a bookend) carries 0 after its first occurrence
+                out[key] = (float(w), r)
+        return out
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}
+
+
 def read_notes(run_root: Path, limit: int = FEED_MAX) -> list[dict[str, Any]]:
     """The supervisor's notes (``notes.jsonl``) as feed rows; unreadable lines are skipped."""
     path = Path(run_root) / NOTES_FILE
@@ -184,16 +202,32 @@ class LivePublisher:
         self._chart_stage: Optional[str] = None
         self._failures = 0
         self._logged_failure = False
+        self._weights_from: Optional[str] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
 
     # -- folding -------------------------------------------------------------
+    def _maybe_load_weights(self) -> None:
+        """Load the content weights once the fold knows the run's content-sampled verify file (the header, or the
+        scored verification for older runs). One read of that file, never of the run's own state."""
+        path = self.state.verify_patches_file
+        if not path or self.state.content_weights or path == self._weights_from:
+            return
+        self._weights_from = path
+        self.state.content_weights = load_content_weights(path)
+
     def _ingest_new(self) -> int:
         events, switched = self.tail.poll()
         if switched:   # fixed path: only on first resolve; a reset keeps the fold consistent
             self.state = DashboardState()
             self.feed.clear()
+            self._weights_from = None
+        n = self._ingest_events(events)
+        self._maybe_load_weights()
+        return n
+
+    def _ingest_events(self, events) -> int:
         n = 0
         for ev in events:
             try:

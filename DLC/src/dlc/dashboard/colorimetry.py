@@ -336,14 +336,55 @@ def patch_deltas(signal: Sequence[float], x: float, y: float, big_y: float, *,
         nits = [_pq_eotf_norm(max(0.0, min(1.0, s))) * 10000.0 for s in signal[:3]]
         ideal = matvec(npm, nits)                                  # absolute XYZ (RGB_to_XYZ·10000)
         return {"scoring": "itp", "target": _target_xyy(ideal),
-                "metrics": {"itp": _itp_metric(meas, ideal)}}
+                "metrics": {"itp": _itp_metric(meas, ideal)},
+                **_practical_split(meas, ideal, is_hdr=True)}
     if luminance is None or luminance <= 0:
         return None
     npm = _npm(_SRGB_PRIMARIES, white_xy)
     linear = [max(0.0, min(1.0, s)) ** gamma for s in signal[:3]]
     ideal = [luminance * v for v in matvec(npm, linear)]
+    wxyz = _white_xyz(white_xy, luminance)
     return {"scoring": "de2000", "target": _target_xyy(ideal),
-            "metrics": {"de2000": _de2000_metric(meas, ideal, _white_xyz(white_xy, luminance))}}
+            "metrics": {"de2000": _de2000_metric(meas, ideal, wxyz)},
+            **_practical_split(meas, ideal, is_hdr=False, white_xyz=wxyz)}
+
+
+def lightness_jnd_pct(nits: float) -> Optional[float]:
+    """The luminance change (in % of ``nits``) that is ONE ΔE ITP unit of lightness (720·ΔI = 1) at that
+    level — the visibility yardstick of a luminance error: about 1.4 % at 100 nit, 7 % at 0.05 nit. PQ is
+    absolute, so the same yardstick serves SDR (at the desktop's own nits) and HDR."""
+    if nits is None or not math.isfinite(nits) or nits <= 0:
+        return None
+    i0 = _pq_oetf_norm(min(1.0, nits / 10000.0))
+    i1 = min(1.0, i0 + 1.0 / _DE_ITP_SCALE)
+    return (_pq_eotf_norm(i1) * 10000.0 / nits - 1.0) * 100.0
+
+
+def _practical_split(meas: Sequence[float], ideal: Sequence[float], *, is_hdr: bool,
+                     white_xyz: Optional[Sequence[float]] = None) -> dict:
+    """What a person reads off an error, beside the metric: the luminance error in % with its 1-JND width,
+    and the TINT direction (which the metric's L/C/H split hides on greys: C carries all of it, unsigned).
+    ``warm`` > 0 = yellower / warmer, < 0 = bluer / cooler; ``magenta`` > 0 = more magenta / red, < 0 =
+    greener. HDR in ΔE ITP units (720·ΔT, ΔP; ICtCp's Ct grows toward blue), SDR in CIELAB units (Δb*,
+    Δa* against the target white). ``hue`` / ``chroma``: the TARGET's hue angle (deg) and chroma in the
+    metric's plane (ITP: unscaled T,P magnitude; Lab: C*), for grouping errors by colour."""
+    out: dict = {}
+    ty = ideal[1]
+    if ty > 0 and math.isfinite(meas[1]):
+        out["dY_pct"] = (meas[1] / ty - 1.0) * 100.0
+        out["jnd_pct"] = lightness_jnd_pct(ty)
+    if is_hdr:
+        im = list(_xyz_to_ictcp(meas));  im[1] *= 0.5
+        ii = list(_xyz_to_ictcp(ideal)); ii[1] *= 0.5
+        out["tint"] = {"warm": -(im[1] - ii[1]) * _DE_ITP_SCALE, "magenta": (im[2] - ii[2]) * _DE_ITP_SCALE}
+        out["hue"] = math.degrees(math.atan2(ii[2], ii[1])) % 360.0
+        out["chroma"] = math.hypot(ii[1], ii[2])
+    elif white_xyz is not None:
+        li, lm = xyz_to_lab(ideal, white_xyz), xyz_to_lab(meas, white_xyz)
+        out["tint"] = {"warm": lm[2] - li[2], "magenta": lm[1] - li[1]}
+        out["hue"] = _hue_angle(li[1], li[2])
+        out["chroma"] = math.hypot(li[1], li[2])
+    return out
 
 
 def patch_delta_e(signal: Sequence[float], x: float, y: float, big_y: float, *,

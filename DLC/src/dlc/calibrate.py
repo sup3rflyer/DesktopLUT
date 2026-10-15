@@ -1023,6 +1023,10 @@ class Calibration:
             "flow": self.calib.get("flow"),
             "bit_depth": self.bit_depth,
         }
+        if self.calib.get("verify_patches_file"):
+            # A content-sampled verify set carries per-patch content weights: the live view weights its
+            # charts by them (dashboard/publish.py reads the FILE, never this run's own state files).
+            data["verify_patches_file"] = str(self.calib["verify_patches_file"])
         plan = self._planned_stages()
         if plan:
             data["stage_plan"] = plan   # the dashboard stepper's "stage K of N" pipeline

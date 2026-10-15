@@ -13,10 +13,11 @@ or sockets: :meth:`DashboardState.snapshot` takes the current time as an argumen
 
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Deque, Optional
+from typing import Any, Deque, Optional, Sequence
 
 from ..events import Ev, Event
 from ..gamut import point_in_triangle
@@ -25,6 +26,7 @@ from ..metrics import SRGB_PRIMARIES as _SHARED_SRGB_PRIMARIES
 from ..metrics import is_core_target
 from .._pq import CONTAINER_NITS as _PQ_CONTAINER_NITS
 from .._pq import eotf_norm as _pq_eotf_norm
+from . import practical as _practical
 from .colorimetry import (
     linear_rgb, neutral_metrics, patch_deltas, planckian_locus_xy, rgb_balance,
 )
@@ -164,6 +166,37 @@ def _median(values: list[float]) -> Optional[float]:
     if n % 2:
         return ordered[mid]
     return 0.5 * (ordered[mid - 1] + ordered[mid])
+
+
+def _round_or_none(v: Any, nd: int) -> Optional[float]:
+    f = _as_float(v)
+    return round(f, nd) if f is not None and math.isfinite(f) else None
+
+
+def _lift_hex(rgb: Sequence[float]) -> str:
+    """A swatch with its lightness lifted (brightest channel to 0.92): a dark patch's HUE stays visible on a
+    dark theme, where its true swatch is a black square."""
+    m = max(rgb) if rgb else 0.0
+    if not m or m <= 0 or not math.isfinite(m):
+        return "#777777"
+    r, g, b = (max(0, min(255, int(round(c / m * 0.92 * 255)))) for c in rgb[:3])
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _lift_xy_hex(x: Any, y: Any) -> Optional[str]:
+    """The measured chromaticity as a lifted sRGB swatch (unit luminance, brightest channel to 0.92)."""
+    x, y = _as_float(x), _as_float(y)
+    if x is None or y is None or y <= 0:
+        return None
+    X, Y, Z = x / y, 1.0, (1.0 - x - y) / y
+    lin = (3.2406 * X - 1.5372 * Y - 0.4986 * Z, -0.9689 * X + 1.8758 * Y + 0.0415 * Z,
+           0.0557 * X - 0.2040 * Y + 1.0570 * Z)
+    lin = [max(0.0, c) for c in lin]
+    m = max(lin)
+    if m <= 0:
+        return None
+    enc = [(c / m) ** (1 / 2.2) for c in lin]
+    return _lift_hex(enc)
 
 
 def _fold_gray_sample(gray_map: dict, level: float, sample: dict,
@@ -373,6 +406,12 @@ class DashboardState:
     _white_track: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
     _white_fallback: Deque[dict] = field(default_factory=lambda: deque(maxlen=600))
     _optimizer_history: list = field(default_factory=list)
+    # Per-patch content weights of a content-sampled verify set (the run's --verify-patches-file), keyed by the
+    # integer code triple a patch_read carries: {codes: (weight, role)}. Set by the publisher; empty otherwise.
+    content_weights: dict = field(default_factory=dict)
+    # The content-sampled verify file those weights come from: the run header's verify_patches_file, else
+    # the scored verification's practical.content_weighted.patch_weights.source (runs before the header had it).
+    verify_patches_file: Optional[str] = None
 
     # ----------------------------------------------------------------------
     def ingest(self, ev: Event) -> dict[str, Any]:
@@ -390,6 +429,8 @@ class DashboardState:
 
         if name == Ev.RUN_HEADER:
             self.header = dict(data)
+            if data.get("verify_patches_file"):
+                self.verify_patches_file = str(data["verify_patches_file"])
             self.schema_version = data.get("schema_version", self.schema_version)
             self.run_id = data.get("run_id", self.run_id)
             # The planned pipeline (the chosen flow's ordered stage list) rides the header so the
@@ -618,12 +659,17 @@ class DashboardState:
         if d is None:
             return None
         tgt = d.get("target")
+        tint = d.get("tint") or {}
         return {"scoring": d["scoring"],
                 "target": ({"x": round(tgt["x"], 4), "y": round(tgt["y"], 4),
-                            "Y": round(tgt["Y"], 3)} if tgt else None),
+                            "Y": round(tgt["Y"], 5)} if tgt else None),
                 "metrics": {
                     m: {k: round(val, _DE_DECIMALS.get(m, 3)) for k, val in metric.items()}
-                    for m, metric in d["metrics"].items()}}
+                    for m, metric in d["metrics"].items()},
+                # the practical split (colorimetry._practical_split): luminance error + its JND, tint direction
+                "dY_pct": _round_or_none(d.get("dY_pct"), 3), "jnd_pct": _round_or_none(d.get("jnd_pct"), 3),
+                "tint": {"warm": _round_or_none(tint.get("warm"), 3),
+                         "magenta": _round_or_none(tint.get("magenta"), 3)} if tint else None}
 
     def _patch_delta_e(self, data: dict[str, Any]) -> Optional[float]:
         """The single scoring-metric per-patch ΔE (dE_ITP for HDR, CIEDE2000 for SDR) — the dense
@@ -647,6 +693,14 @@ class DashboardState:
         if role in ("warmup", "neutral_ref", "probe") or data.get("disposition") == "probe":
             return None
         return ev.phase or ev.stage or "measure"
+
+    def _content_weight(self, rgb: Any) -> Optional[tuple]:
+        if not self.content_weights or not rgb or len(rgb) < 3:
+            return None
+        try:
+            return self.content_weights.get(tuple(int(round(float(c))) for c in rgb[:3]))
+        except (TypeError, ValueError):
+            return None
 
     def _accumulate_charts(self, ev: Event, data: dict[str, Any], x: float, y: float,
                            Y: Any, enriched: dict[str, Any],
@@ -712,6 +766,8 @@ class DashboardState:
             self._open_stage_bucket(stage)
         tgt = (deltas or {}).get("target")
         de = deltas["metrics"][deltas["scoring"]]["de"] if deltas else None
+        comp = deltas["metrics"][deltas["scoring"]] if deltas else {}
+        tint = (deltas or {}).get("tint") or {}
         cie = self._cie_by_stage[stage]
         key = _patch_key(data)
         if key not in cie and len(cie) >= _CIE_CAP:
@@ -723,12 +779,25 @@ class DashboardState:
             "sc": _sig_hex(sig) if sig else None, "mc": self._measured_hex(x, y, Y),
             # target chromaticity + scoring ΔE → the scatter draws the error vector and shows ΔE on hover
             "tx": round(tgt["x"], 5) if tgt else None, "ty": round(tgt["y"], 5) if tgt else None,
-            "de": de, "label": data.get("label"), "origin": stage}
+            "de": de, "label": data.get("label"), "origin": stage,
+            # the practical view (dashboard/practical.py): measured / target nits, the metric's signed
+            # L/C/H split, the tint direction, the luminance error in % and its 1-JND width, the content weight
+            "Y": _round_or_none(Y, 5), "tY": _round_or_none(tgt.get("Y") if tgt else None, 5),
+            "L": _round_or_none(comp.get("L"), 3), "C": _round_or_none(comp.get("C"), 3),
+            "H": _round_or_none(comp.get("H"), 3),
+            "tw": _round_or_none(tint.get("warm"), 3), "tm": _round_or_none(tint.get("magenta"), 3),
+            "dY": _round_or_none((deltas or {}).get("dY_pct"), 3),
+            "jnd": _round_or_none((deltas or {}).get("jnd_pct"), 3),
+            "sig": [round(_as_float(s) or 0.0, 4) for s in sig[:3]] if sig and len(sig) >= 3 else None,
+            "codes": list(rgb[:3]) if rgb and len(rgb) >= 3 else None}
         level = _as_float(sig[0]) if (neutral and sig and len(sig) >= 1) else None
         if level is not None:
             _fold_gray_sample(self._gray_by_stage[stage], round(level, 5), {
                 "Y": Y, "x": round(x, 5), "y": round(y, 5),
-                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de}, origin=stage)
+                "cct": enriched.get("cct"), "duv": enriched.get("duv"), "de": de,
+                "tY": tgt.get("Y") if tgt else None, "dY": (deltas or {}).get("dY_pct"),
+                "jnd": (deltas or {}).get("jnd_pct"), "tw": tint.get("warm"), "tm": tint.get("magenta")},
+                origin=stage)
         elif not neutral and sig and len(sig) >= 3 and Y is not None:
             # a colour patch: keep the latest measured Y per distinct signal for the
             # Colour Luminance chart (luminance error vs target is derived in charts()).
@@ -868,6 +937,9 @@ class DashboardState:
         }
         self.de = entry
         self.de_history.append(entry)
+        src = (((data.get("practical") or {}).get("content_weighted") or {}).get("patch_weights") or {}).get("source")
+        if src and not self.verify_patches_file:
+            self.verify_patches_file = str(src)
         if len(self.de_history) > 64:
             self.de_history = self.de_history[-64:]
 
@@ -914,6 +986,10 @@ class DashboardState:
                    "r": round(bal[0], 2) if bal else None,
                    "g": round(bal[1], 2) if bal else None,
                    "b": round(bal[2], 2) if bal else None,
+                   # the practical view: target nits, luminance error % + its 1-JND width, tint direction
+                   "tY": _round_or_none(med("tY"), 5), "dY": _round_or_none(med("dY"), 3),
+                   "jnd": _round_or_none(med("jnd"), 3),
+                   "tw": _round_or_none(med("tw"), 3), "tm": _round_or_none(med("tm"), 3),
                    "origin": e.get("origin")}     # the stage that measured it (carried hover)
             if e.get("carried"):
                 row["carried"] = True
@@ -957,7 +1033,21 @@ class DashboardState:
         color_map = self._color_by_stage.get(stage, {}) if stage else {}
         gamma = self.header.get("gamma") or 2.2
         luminance = self.header.get("luminance")
+        # The practical view (dashboard/practical.py): zones, lifted swatches, the per-stage summaries.
+        native = self._native_primaries()
+        tri = ((tuple(native["r"]), tuple(native["g"]), tuple(native["b"]))
+               if native and all(k in native for k in ("r", "g", "b")) else None)
+        peak = _as_float(luminance)
+        for p in cie_points:
+            cw = self._content_weight(p.get("codes"))   # applied here: weights may land after the reads
+            p["w"], p["crole"] = (cw[0], cw[1]) if cw else (None, None)
+            p["zone"] = self._zone(p, tri, hdr, peak)
+            if p.get("sig") and not p.get("lsc"):
+                p["lsc"] = _lift_hex(p["sig"])
+                p["lmc"] = _lift_xy_hex(p.get("x"), p.get("y"))
         return {
+            "practical": self._practical_view(cie_points, gray, hdr=hdr, peak=peak),
+            "stages_practical": self._stages_practical(hdr, peak),
             "stage": stage,                       # the measurement stage these snapshot charts reflect
             "stages": list(self._stage_seq),
             # The TARGET white's own Duv. D65 sits ≈ +0.003 ABOVE the Planckian locus, so a
@@ -1021,6 +1111,48 @@ class DashboardState:
                    for d in self.de_history],
                 key=lambda e: e.get("elapsed_s") or 0.0),
         }
+
+    def _zone(self, p: dict, tri: Optional[tuple], hdr: bool, peak: Optional[float]) -> str:
+        """Where a patch sits for the practical view: ``anchor`` (a content set's weightless anchor), ``peak``
+        (an HDR grey at the panel's top — a sustain limit, not a calibration miss), ``clamped`` (target outside
+        the panel's measured full-drive gamut), ``limits`` (HDR: reachable but outside the content core —
+        BT.2408 white / Rec.709, the shared :func:`dlc.metrics.is_core_target`), else ``core``."""
+        if p.get("crole") == "anchor":
+            return "anchor"
+        ty_nits = _as_float(p.get("tY"))
+        if hdr and p.get("neutral") and peak and ty_nits and ty_nits >= 0.85 * peak:
+            return "peak"
+        tx, ty = _as_float(p.get("tx")), _as_float(p.get("ty"))
+        if tx is None or ty is None:
+            return "core"
+        if tri is not None and not point_in_triangle((tx, ty), *tri):
+            return "clamped"
+        if hdr and not is_core_target((tx, ty), ty_nits):
+            return "limits"
+        return "core"
+
+    def _black_floor(self) -> Optional[float]:
+        cw = (((self.de or {}).get("practical") or {}).get("content_weighted") or {})
+        head = cw.get("headline") or {}
+        return _as_float(head.get("black_floor_nits")) or _as_float((cw.get("black_aware") or {}).get("floor_nits"))
+
+    def _practical_view(self, points: list, gray: list, *, hdr: bool, peak: Optional[float]) -> dict[str, Any]:
+        view = _practical.summarize(points, gray, hdr=hdr, target_peak=peak, black_floor=self._black_floor())
+        head = ((((self.de or {}).get("practical") or {}).get("content_weighted") or {}).get("headline") or {})
+        view["content"] = ({"class": head.get("class"), "score": _as_float(head.get("score"))} if head else None)
+        return view
+
+    def _stages_practical(self, hdr: bool, peak: Optional[float]) -> list[dict[str, Any]]:
+        """Each measurement stage's band means + score (fresh reads only) — the before → after of a build."""
+        out = []
+        for s in self._stage_seq:
+            pts = [p for p in self._cie_by_stage.get(s, {}).values() if not p.get("carried")]
+            if not pts:
+                continue
+            v = _practical.summarize(pts, [], hdr=hdr, target_peak=peak)
+            out.append({"stage": s, "score": v["score"], "n": v["n"], "weighting": v["weighting"],
+                        "bands": [b["mean"] for b in v["bands"]]})
+        return out
 
     def _offenders(self, cie_points) -> list[dict[str, Any]]:
         """Worst fresh reads this stage, flagged by target reachability (F4): ``oog`` mirrors

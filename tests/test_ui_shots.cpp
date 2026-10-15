@@ -6,6 +6,7 @@
 #include "ui/ui_widgets.h"
 #include "actions/notify.h"
 #include "ui/ui_gscurve.h"
+#include "ui/ui_charts.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
@@ -170,6 +171,67 @@ std::shared_ptr<dlc::LiveCharts> FakeCharts(bool hdr, int reads) {
     c->convergence = { { 600, 2.9f, 8.1f, false }, { 1500, 1.4f, 4.8f, false }, { 2300, 0.9f, 3.1f, false }, { 3000, 0.62f, 2.1f, true } };
     c->offenders = { { "p0125", 2.10f, 0xBF1F1Au, 0xC21E19u, false }, { "p0098", 1.67f, 0x1A1ABFu, 0x1D1AC4u, false },
                      { "p0044", 1.50f, 0x2A9F2Au, 0x2B9D2Bu, false }, { "p0005", 0.71f, 0x8F8F8Fu, 0x919090u, false } };
+    // The practical view (DLC's dashboard/practical.py): per-patch levels and weights, the greys' tone error and tint,
+    // the band / hue summary, the misses that matter, the panel's limits, the drift reference, a build's stages.
+    for (size_t i = 0; i < c->cie.size(); i++) {
+        dlc::CiePoint& p = c->cie[i];
+        const float f = (float)(i % 8 + 1) / 8.0f;
+        p.tY = std::pow(10.0f, hdr ? -1.3f + 4.0f * f : -1.0f + 3.0f * f);
+        p.Y = p.tY * (1.0f + 0.01f * std::sin((float)i));
+        if (hdr) p.w = 1.0f / (float)c->cie.size();
+    }
+    for (dlc::GrayRow& g : c->gray) {
+        g.tY = std::max(g.Y / (1.0f + 0.01f * std::sin(5.0f * g.signal)), 1e-4f);
+        g.dY = 100.0f * (g.Y / g.tY - 1.0f) + 9.0f * std::exp(-g.tY / 0.12f);
+        g.jnd = 1.39f * std::pow(100.0f / std::max(g.tY, 0.01f), 0.27f);
+        g.tw = 0.8f * std::sin(3.0f * g.signal) - 0.3f;
+        g.tm = 0.2f - 0.5f * std::cos(4.0f * g.signal);
+    }
+    dlc::Practical& pr = c->practical;
+    pr.present = true;
+    pr.contentWeighted = hdr;
+    if (hdr) {
+        pr.bands = { { "<1", 0, 1, 0.519f, 1.21f, 2.62f, -0.20f, 0.83f, 1.28f, 82, 0.62f },
+                     { "1-10", 1, 10, 0.257f, 0.92f, 1.84f, -0.55f, 0.65f, 0.71f, 99, 0.71f },
+                     { "10-100", 10, 100, 0.179f, 0.74f, 1.42f, -0.31f, 0.52f, 0.48f, 140, 0.49f },
+                     { "100-203", 100, 203, 0.027f, 0.63f, 1.12f, -0.12f, 0.41f, 0.40f, 60, 0.33f },
+                     { ">203", 203, INFINITY, 0.018f, 2.41f, 4.10f, -0.80f, 1.50f, 1.10f, 70, 1.12f } };
+        pr.limits = { 1476.2f, 1729.3f, 397.6f, 0.00235f, true, 200.3f, 202.9f, 1.02f, 6499.0f, 0.0035f, 0.21f, -0.11f, -1.28f };
+        pr.contentClass = "seq_hdr_balanced";
+        pr.contentScore = 1.153f;
+    } else {
+        pr.bands = { { "<1", 0, 1, 0.33f, 0.61f, 1.20f, 0.15f, 0.35f, 0.30f, 40, 0.42f },
+                     { "1-10", 1, 10, 0.28f, 0.44f, 0.90f, 0.08f, 0.30f, 0.21f, 52, 0.28f },
+                     { "10-100", 10, 100, 0.38f, 0.36f, 0.71f, -0.05f, 0.26f, 0.19f, 80, 0.20f },
+                     { ">100", 100, INFINITY, 0.01f, 0.52f, 0.88f, -0.21f, 0.30f, 0.22f, 14, 0.35f } };
+        pr.limits = { 118.4f, 120.0f, 118.4f, 0.094f, true, 118.4f, 120.0f, 0.31f, 6512.0f, 0.0012f, 0.12f, -0.05f, -1.33f };
+    }
+    pr.score = hdr ? 1.175f : 0.47f;
+    pr.coverage = 1.0f;
+    pr.offsetL = hdr ? -0.54f : 0.04f;
+    pr.n = (int)c->cie.size();
+    const char* names[12] = { "red", "orange", "yellow", "lime", "green", "spring", "cyan", "azure", "blue", "violet", "magenta", "rose" };
+    for (int s = 0; s < 12; s++) {
+        const float x = (float)s;
+        if (s == 5) { pr.hues.push_back({ s, names[s], 0, (float)dlc::kNaN, (float)dlc::kNaN, (float)dlc::kNaN, (float)dlc::kNaN }); continue; }
+        pr.hues.push_back({ s, names[s], 8 + s * 3, s == 1 ? 0.30f : 0.02f + 0.01f * (float)(s % 4), 0.8f + 0.5f * std::fabs(std::sin(x)),
+                            0.9f * std::sin(0.9f * x) + (s == 0 ? 2.4f : 0.0f), -0.7f * std::cos(1.3f * x) });
+    }
+    pr.worst = { { "0.064 nit \xC2\xB7 grey", "p0262", 1.92f, 0.024f, 0.0127f, 8.9f, 'L', dlc::Zone::Core, 0xEBE2EBu, 0xE2D5EBu },
+                 { "0.062 nit \xC2\xB7 azure 35 %", "p0296", 2.05f, 0.019f, 0.0093f, -8.8f, 'C', dlc::Zone::Core, 0x9ABAEBu, 0x65ABEBu },
+                 { "3.4 nit \xC2\xB7 orange 70 %", "p0141", 3.31f, 0.012f, 0.0036f, -2.1f, 'H', dlc::Zone::Core, 0xEB8A3Cu, 0xEB6A3Cu },
+                 { "41 nit \xC2\xB7 green 45 %", "p0187", 1.44f, 0.008f, 0.0055f, 0.4f, 'C', dlc::Zone::Core, 0x7BC97Bu, 0x8BD97Bu },
+                 { "0.35 nit \xC2\xB7 red 75 %", "p0077", 1.38f, 0.006f, 0.0043f, -3.0f, 'L', dlc::Zone::Core, 0xEB4A3Au, 0xD8463Au } };
+    pr.apart = { { "1726 nit \xC2\xB7 grey", "p0005", 14.02f, 0.0f, 0.0f, -14.4f, 'L', dlc::Zone::Anchor, 0xEBEBEBu, 0xEBDCDCu },
+                 { "0.67 nit \xC2\xB7 orange 85 %", "p0125", 12.55f, 0.0138f, 0.0011f, -1.6f, 'H', dlc::Zone::Limits, 0xEB601Eu, 0xEB0027u } };
+    for (int i = 0; i < 40; i++) {
+        const float t = 140.0f + 75.0f * (float)i;
+        const int seg = i < 24 ? 0 : 1;
+        const float k = (float)(seg ? i - 24 : i);
+        c->drift.push_back({ t, 0.02f * k * std::sin(0.3f * k), -0.015f * k, seg ? 0.03f * k : 0.06f * k - 0.002f * k * k, seg });
+    }
+    c->stages = { { "measure:baseline", hdr ? 2.41f : 1.12f, 309, hdr ? std::vector<float>{ 3.4f, 2.1f, 1.6f, 1.2f, 2.9f } : std::vector<float>{ 1.4f, 1.0f, 0.9f, 1.3f } },
+                  { "measure:verify", pr.score, 309, hdr ? std::vector<float>{ 1.21f, 0.92f, 0.74f, 0.63f, 2.41f } : std::vector<float>{ 0.61f, 0.44f, 0.36f, 0.52f } } };
     return c;
 }
 
@@ -375,6 +437,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     char dirBuf[MAX_PATH] = {};
     if (GetEnvironmentVariableA("DLUT_UI_SHOT", dirBuf, MAX_PATH) == 0) return;   // opt-in
     const std::string dir = dirBuf;
+    char onlyBuf[64] = {};   // DLUT_UI_SHOT_ONLY: render only the shots whose name starts with it
+    const std::string only = GetEnvironmentVariableA("DLUT_UI_SHOT_ONLY", onlyBuf, sizeof(onlyBuf)) ? onlyBuf : "";
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     Offscreen gpu;
@@ -420,24 +484,41 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "dlcnarrow", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 10 },
         { "dlcnone", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 13 },
         { "pipelinerun", ui::Page::Pipeline, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 10 },
-        // 14: a real run's published files (DLUT_LIVE_RUN = its run folder), shown on the HDR display.
+        // 14: a real run's published files (DLUT_LIVE_RUN = its run folder), shown on the HDR display; 15 the same
+        // charts as the HDR display's current stack (the record view), 16 its first chart over the whole area; 17 an
+        // SDR run's charts (DLUT_LIVE_RUN_SDR) as the BenQ's record. 18 the BenQ's fake record, full-size.
         { "dlcreal", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 14 },
+        { "dlcrealstack", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 15 },
+        { "dlcrealfull", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 16 },
+        { "dlcrealsdr", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 17 },
+        { "dlcfull", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 18 },
+        // 19 / 20: shots 15 / 17 with the other charts picked (hue rose, CIE, CDF, stability; convergence, tone).
+        { "dlcrealalt", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 19 },
+        { "dlcrealsdralt", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 20 },
     };
-    // The real run for shot 14 (skipped without DLUT_LIVE_RUN).
+    // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
+    auto read = [](const std::wstring& path) {
+        std::string out;
+        HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return out;
+        char buf[65536];
+        DWORD got = 0;
+        while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got) out.append(buf, got);
+        CloseHandle(h);
+        return out;
+    };
+    std::shared_ptr<dlc::LiveCharts> realSdrCharts;
+    {
+        wchar_t runDir[MAX_PATH] = {};
+        auto ch = std::make_shared<dlc::LiveCharts>();
+        if (GetEnvironmentVariableW(L"DLUT_LIVE_RUN_SDR", runDir, MAX_PATH) != 0 &&
+            dlc::ParseLiveCharts(read(std::wstring(runDir) + L"\\live\\charts.json"), *ch))
+            realSdrCharts = ch;
+    }
     std::shared_ptr<dlc::Live> realRun;
     {
         wchar_t runDir[MAX_PATH] = {};
         if (GetEnvironmentVariableW(L"DLUT_LIVE_RUN", runDir, MAX_PATH) != 0) {
-            auto read = [](const std::wstring& path) {
-                std::string out;
-                HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-                if (h == INVALID_HANDLE_VALUE) return out;
-                char buf[65536];
-                DWORD got = 0;
-                while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got) out.append(buf, got);
-                CloseHandle(h);
-                return out;
-            };
             auto st = std::make_shared<dlc::LiveState>();
             auto ch = std::make_shared<dlc::LiveCharts>();
             if (dlc::ParseLiveState(read(std::wstring(runDir) + L"\\live\\state.json"), *st) &&
@@ -468,6 +549,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         ui::ApplyTheme((ui::ThemeId)t);
         for (float scale : scales) {
             for (const Shot& shot : shots) {
+                if (!only.empty() && std::string(shot.name).rfind(only, 0) != 0) continue;
                 ui::Snapshot snap = base;
                 if (shot.variant == 1) {
                     snap.live[0].settings.hdrLutBypass = true;
@@ -487,7 +569,18 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     if (!realRun) continue;
                     snap.run = realRun;
                     snap.live[0].dlcRun = true;
-                } else if (shot.variant == 10 || shot.variant == 11) {
+                } else if (shot.variant >= 15 && shot.variant <= 20 && shot.variant != 18) {
+                    // A report whose run left these charts: the HDR display's (or the BenQ's) current verification.
+                    const bool sdr = shot.variant == 17 || shot.variant == 20;
+                    if (sdr ? !realSdrCharts : !realRun) continue;
+                    auto data = std::make_shared<dlc::Data>(*snap.dlc);
+                    dlc::Report& r = data->reports[sdr ? 1 : 0];
+                    r.runDir = sdr ? L"D:\\Calibration\\DLC\\runs\\20260925_133655_000000_sdr" : L"D:\\Calibration\\DLC\\runs\\20261014_205100_000000_hdr";
+                    r.path = r.runDir + L"\\report.json";
+                    dlc::SeedRunChartsForTest(r.runDir, sdr ? realSdrCharts : realRun->charts);
+                    snap.dlc = data;
+                }
+                if (shot.variant == 10 || shot.variant == 11) {
                     snap.run = FakeRun(shot.variant == 11);
                     snap.live[0].dlcRun = true;
                 } else if (shot.variant == 13) {
@@ -517,6 +610,13 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
+                if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = 0;
+                if (shot.variant == 19 || shot.variant == 20) {
+                    using K = ui::DlcChart;
+                    const K picks[2][4] = { { K::Hues, K::Cie, K::Distribution, K::Stability },
+                                            { K::Convergence, K::Hues, K::ToneError, K::Distribution } };
+                    for (int i = 0; i < 4; i++) vs.dlc.tile[i] = (int)picks[shot.variant - 19][i];
+                }
                 if (shot.variant == 3 || shot.variant == 4) {
                     // The grayscale editor, drawn without a live edit: HDR 20 points (gray), SDR 32 points (R).
                     const bool hdr = shot.variant == 3;
