@@ -11,6 +11,13 @@ sets, measurement loops, integrity gates, LUT generation); the LLM only routes t
 request, adjudicates ambiguous results on digests, and writes the report.
 
 ### Added
+- **Live state for DesktopLUT's DLC tab; supervisor notes** (2026-10-15).
+  - A live run (`dlc.calibrate` CLI) folds its own spine with the dashboard's state code on a separate thread and
+    writes `runs/<run>/live/state.json` + `charts.json` (atomic, NaN-free, `live_schema` 1). The final write at exit
+    or at a seam pause is the run's record. A viewer can never touch the run: every publisher error is swallowed,
+    and `--no-live-state` turns it off. `python -m dlc.dashboard.publish --run <dir>` folds a finished run once.
+  - `python -m dlc.note "<one line>"` appends the supervising LLM's judgment to `runs/<run>/notes.jsonl`; the
+    feed shows it next to the run's own events.
 - **Public operating manual for the LLM, an agent skill, and an example profile** (2026-10-10). DLC is
   operated by an LLM agent with the user in the loop, and until now its manual was local to one rig.
   - `docs/operator-guide.md` is the generic manual: the operating law, panel safety per class (OLED /

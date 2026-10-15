@@ -462,6 +462,7 @@ class Calibration:
         stall_kill_hook: Optional[Callable[[], None]] = None,
         pause_handler: Optional[Callable[[Mapping[str, Any]], None]] = None,
         enable_watchdog: bool = False,
+        enable_live_state: bool = False,
         checkin_interval_s: float = 600.0,
         require_hardware_readiness: bool = False,
         neutral_min_reads: Optional[int] = None,
@@ -789,6 +790,11 @@ class Calibration:
                                  on_pause=self._pause_requested,
                                  on_resume=self._resume_requested)
         self._enable_watchdog = enable_watchdog
+        # live/state.json + live/charts.json for DesktopLUT's DLC tab: the dashboard's fold on its own
+        # thread, tailing this run's events.jsonl. Opt-in like the watchdog (live CLI runs only);
+        # it never touches the run (dlc.dashboard.publish).
+        self._enable_live_state = enable_live_state
+        self._live_publisher = None
         # §12 timed check-in: a coarse wall-clock floor (0 disables) past which the next safe
         # checkpoint (a stage boundary, an optimizer iteration) surfaces a rich "status — continue?"
         # so a multi-hour run never goes dark. monotonic so it is immune to wall-clock changes;
@@ -8323,6 +8329,7 @@ class Calibration:
                 status="aborted", stages=list(self.calib["stages"].keys()), results_dir=None,
                 report_path=None, digest={"aborted_at": "run-args", "message": bad})
         self._publish_active_pointer()   # let the dashboard find this run (and the next)
+        self._start_live_state()
         self._emit_header()   # open the spine with what we know; enriched as the run proceeds
         if self._preheat_change:
             self.runlog.note("run", f"--preheat changed on resume: {self._preheat_change['from']} -> "
@@ -8349,8 +8356,30 @@ class Calibration:
         finally:
             if self._enable_watchdog:
                 self.liveness.stop()
+            self._stop_live_state()
         self._restore_viewing_layers()       # completed / reverted / aborted (result returned)
         return result
+
+    def _start_live_state(self) -> None:
+        """Start the live state publisher (DesktopLUT's DLC tab reads its files). Advisory: any
+        failure is swallowed — a viewer must never touch the run."""
+        if not self._enable_live_state or self._live_publisher is not None:
+            return
+        try:
+            from .dashboard.publish import LivePublisher
+            self._live_publisher = LivePublisher(self.ctx.root, log=self.ctx.log).start()
+        except Exception:  # noqa: BLE001 - the live view is a convenience, never a gate
+            self._live_publisher = None
+
+    def _stop_live_state(self) -> None:
+        """Stop the publisher; its final flush is the run's state at exit or at a seam pause."""
+        pub, self._live_publisher = self._live_publisher, None
+        if pub is None:
+            return
+        try:
+            pub.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _patch_window_resume_check(self) -> None:
         """A RESUMED run re-checks the presenter's patch window against the one its (memoised)
@@ -11960,6 +11989,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                 "VISIBLE, vetoable judgment packets on the digest (seam status=auto_accepted, full "
                                 "request + veto lever) and pauses only at safety-critical seams (foundation collapse "
                                 "/ optimizer floor / failed verify). Kept for supervised experiments.")
+    parser.add_argument("--no-live-state", action="store_true", dest="no_live_state",
+                        help="don't write live/state.json + live/charts.json (DesktopLUT's DLC tab)")
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
@@ -12470,7 +12501,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             characterize_config=characterize_config, decision_overrides=overrides,
                             adaptive_planning=args.adaptive_planning,
                             stall_kill_hook=_stall_kill, pause_handler=_pause_park,
-                            enable_watchdog=True, checkin_interval_s=args.checkin_interval,
+                            enable_watchdog=True, enable_live_state=not args.no_live_state,
+                            checkin_interval_s=args.checkin_interval,
                             require_hardware_readiness=True,
                             neutral_min_reads=args.neutral_min_reads,
                             dark_min_reads=args.dark_min_reads,

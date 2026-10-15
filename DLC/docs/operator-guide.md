@@ -153,8 +153,10 @@ Show the human the size before a long run.
   - Run only **one** daemon on the port.
 - [ ] Confirm the window is fullscreen on the right monitor (Alt+Enter once if not) and the meter is aimed at its
   centre, on the screen, with room light stable.
-- [ ] Optional: **one** dashboard for the human, `python -m dlc.dashboard --open`. It follows new runs by itself;
-  don't start one per run.
+- [ ] The human watches the run in DesktopLUT's **DLC** tab: state, stages, live readouts, charts, the feed, your
+  seams. A live run writes `runs/<run>/live/state.json` + `charts.json` for it; `--no-live-state` turns that off.
+  Tell the human to keep the DesktopLUT window off the display being measured (the tab warns and offers MOVE).
+  The browser dashboard still works (`python -m dlc.dashboard --open`, **one** instance; it follows new runs).
 - [ ] The human is reachable: early seams ask them to adjust the OSD.
 
 ## 7. Run, seams, resume
@@ -220,11 +222,17 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
 - Dark reads (< 1 nit) are slow: several seconds each, and the bulk of a long run's time. Long quiet stretches
   are normal; a check-in still arrives.
 - Use an adversarial second opinion (a separate agent asked to refute your read) on long or uncertain runs.
+- **Post your judgment where the human looks:** `python -m dlc.note "red max is the panel floor at 75 %; no
+  action"` (one line; `--run <dir>` for a run other than `runs/active.json`'s). Notes go to `runs/<run>/notes.jsonl`
+  and show in the DLC tab's feed. Post one per check-in you judged, and one per seam you decided with its reason.
+  The run never reads them.
 
 ## 9. Stopping a run
 
 - **Cancel a running run:** `python -m dlc.calibrate --cancel --run <dir>` (writes `control.json`). The live
-  process rolls DesktopLUT back to the pre-run setup at its next checkpoint.
+  process rolls DesktopLUT back to the pre-run setup at its next checkpoint. The human can do the same from the
+  DLC tab (CANCEL), or PAUSE it (DLC rolls back after 3 minutes unless resumed): a `control.json` you did not
+  write is the human's, so read it before resuming or deciding a seam.
 - **Abandon a paused run:** `python -m dlc.calibrate --run <dir> --abort` rolls DesktopLUT back and exits.
   Without `--run` it can't restore what the run changed (candidate cube, viewing layers).
 - **Read the restore status it prints.** It is DesktopLUT's own answer. Full success is `reverted` (`--abort`,
@@ -296,6 +304,8 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
 |---|---|
 | `calibration_profile.yaml` | the user's displays, targets, meter (local) |
 | `runs/<run>/` | one run: `dlc_state.json`, `events.jsonl` (check-ins), measurements, reports, the settings backup |
+| `runs/<run>/live/` | `state.json` + `charts.json`: the run as DesktopLUT's DLC tab shows it (final copy at exit or a seam) |
+| `runs/<run>/notes.jsonl` | your `python -m dlc.note` lines (shown in the DLC tab's feed) |
 | `results/` | applied profiles / cubes and reports |
 | `correction_store.json`, `dip_store.json`, `stack_registry.json` | per display + mode: meter correction, learned panel facts, what's installed |
 | `python -m dlc.calibrate --help` | every flag's syntax; operating policy (e.g. never `--supervised` on hardware) comes from this guide |
