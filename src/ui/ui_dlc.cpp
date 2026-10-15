@@ -21,6 +21,7 @@ constexpr float kStepsH = 30.0f;       // the stepper / the record picker
 constexpr float kReadoutsH = 60.0f;    // the readouts row
 constexpr float kTileHeadH = kControlH;
 constexpr float kFeedRowH = 40.0f;
+constexpr float kRunPickerW = 400.0f;   // the record picker (DIPs)
 
 const dlc::Live& RunOf(const Snapshot& s) {
     static const dlc::Live kNone;
@@ -628,8 +629,15 @@ std::vector<int> ReportsFor(const dlc::Data& d, const std::string& name, bool hd
     return out;
 }
 
+// "2026-10-03 21:28 · VERIFY-ONLY · SDR CONTENT · 333": the run's start time tells same-day runs apart, and the
+// content mode says when a run measured the other mode's content (SDR content on the HDR desktop).
 std::string ReportLabel(const dlc::Report& r) {
-    std::string s = r.date.substr(0, 10) + "  \xC2\xB7  " + Upper(r.flow);
+    std::string s = r.date.substr(0, 10);
+    const std::string id = dlc::RunIdFromPath(r.runDir);   // YYYYMMDD_HHMMSS_...
+    if (id.size() >= 13 && id[8] == '_') s += " " + id.substr(9, 2) + ":" + id.substr(11, 2);
+    s += "  \xC2\xB7  " + Upper(r.flow);
+    if (!r.contentMode.empty() && dlc::NormMode(r.contentMode) != dlc::NormMode(r.mode))
+        s += "  \xC2\xB7  " + Upper(r.contentMode) + " CONTENT";
     if (r.verification.patchCount > 0) s += "  \xC2\xB7  " + std::to_string(r.verification.patchCount);
     return s;
 }
@@ -742,14 +750,17 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + Px(48)), Snap(cy - Px(kControlH) * 0.5f)));
         const std::string preview = shown >= 0 ? ReportLabel(d.reports[shown]) : std::string("NO RUNS");
         ImGui::BeginDisabled(reports.empty() && !runHere);
-        if (BeginDropdown("##dlc_run", preview.c_str(), 320)) {
+        if (BeginDropdown("##dlc_run", preview.c_str(), kRunPickerW)) {
             if (runHere && DropdownItem(("LIVE  \xC2\xB7  " + Upper(L.state->flow)).c_str(), false)) vs.dlc.pick = kDlcPickLive;
-            for (int i : reports)
+            for (int i : reports) {
+                ImGui::PushID(i);   // two runs can share a label (same day, same flow): ids by report
                 if (DropdownItem(ReportLabel(d.reports[i]).c_str(), i == shown)) vs.dlc.pick = d.reports[i].path;
+                ImGui::PopID();
+            }
             EndDropdown();
         }
         ImGui::EndDisabled();
-        float x = Snap(p.x + Px(48) + Px(320) + Px(12));
+        float x = Snap(p.x + Px(48) + Px(kRunPickerW) + Px(12));
         if (shown >= 0) {
             const dlc::ModeRecord& rec = sel->dlcRecord[showHdr ? 1 : 0];
             const char* tag = shown == rec.current ? "ON SCREEN" : nullptr;
