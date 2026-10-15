@@ -747,7 +747,8 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     row = BeginRow("WINDOWS TONE MAP");
     {
         std::string tip = "Peak Windows reports to games and apps.\n"
-                          "Auto: 10000 nits while DesktopLUT tone maps, else the panel's.\n"
+                          "Auto: 10000 nits while DesktopLUT tone maps the full range (dynamic, or content peak "
+                          "10000), else the panel's.\n"
                           "Bypass: always 10000 nits; Windows and apps never tone map.\n"
                           "Panel: the panel's peak; apps tone map themselves.";
         // The profile's peak is the panel's when it was measured (an imported file or a base curve), else a default.

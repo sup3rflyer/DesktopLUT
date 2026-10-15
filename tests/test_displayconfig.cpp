@@ -582,6 +582,23 @@ TEST_CASE("Windows tone map: Auto reports 10000 nits exactly while DesktopLUT's 
             }
 }
 
+TEST_CASE("Windows tone map: Auto's 10000 needs a tone map that takes the full range") {
+    TonemapSettings tm;
+    CHECK_FALSE(ToneMapTakesFullRange(tm));               // off
+    tm.enabled = true;
+    tm.dynamicPeak = true;
+    CHECK(ToneMapTakesFullRange(tm));                     // dynamic: the detected peak lands on the target
+    tm.dynamicPeak = false;
+    tm.sourcePeakNits = 1000.0f;                          // the INI default: hard-clips above 1000
+    CHECK_FALSE(ToneMapTakesFullRange(tm));
+    tm.sourcePeakNits = 4000.0f;                          // flat above 4000
+    CHECK_FALSE(ToneMapTakesFullRange(tm));
+    tm.sourcePeakNits = 10000.0f;
+    CHECK(ToneMapTakesFullRange(tm));
+    tm.enabled = false;
+    CHECK_FALSE(ToneMapTakesFullRange(tm));
+}
+
 TEST_CASE("Windows tone map: the INI spelling round-trips, anything else is Auto") {
     for (WindowsToneMap m : { WindowsToneMap::Auto, WindowsToneMap::Bypass, WindowsToneMap::Panel })
         CHECK(ParseWindowsToneMap(WindowsToneMapKey(m)) == m);

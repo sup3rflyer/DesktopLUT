@@ -858,7 +858,8 @@ struct TonemapSettings {
 // HDR MHC profile carries it in its luminance tags (MHCSettings::PERM_PEAK_MAX); a display without one gets the
 // DisplayConfig override (windows_tonemap.h). INI WindowsToneMap=auto|bypass|panel.
 enum class WindowsToneMap : uint8_t {
-    Auto,     // 10000 nits while DesktopLUT's own tone map is meant to run on the display, else the panel's peak
+    Auto,     // 10000 nits while DesktopLUT's own tone map is meant to run on the display and takes the full range
+              // (dynamic, or a static content peak of 10000: ToneMapTakesFullRange), else the panel's peak
     Bypass,   // always 10000 nits: Windows and apps never tone map
     Panel,    // always the panel's peak (the HDR profile's measured peak, else the display's EDID)
 };

@@ -30,6 +30,10 @@ bool WindowsToneMapReportsMax(WindowsToneMap mode, bool toneMapOn, bool liveLaye
     }
 }
 
+bool ToneMapTakesFullRange(const TonemapSettings& tm) {
+    return tm.enabled && (tm.dynamicPeak || tm.sourcePeakNits >= kWindowsToneMapBypassNits - 0.5f);
+}
+
 const wchar_t* WindowsToneMapKey(WindowsToneMap mode) {
     switch (mode) {
     case WindowsToneMap::Bypass: return L"bypass";
@@ -174,7 +178,8 @@ void ReconcileWindowsToneMap(const char* why, bool reapply) {
             MonitorSettings& ms = g_gui.monitorSettings[i];
             Entry e;
             e.index = (int)i;
-            e.want = WindowsToneMapReportsMax(ms.windowsToneMap, ms.hdrColorCorrection.tonemap.enabled && !engineOff,
+            e.want = WindowsToneMapReportsMax(ms.windowsToneMap,
+                                              ToneMapTakesFullRange(ms.hdrColorCorrection.tonemap) && !engineOff,
                                               suspended, g_exiting);
             ms.hdrMHC.reportPeakMax = e.want;   // a re-bake installs the variant that says so (ComputeMhcPermutation)
             e.installed = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();

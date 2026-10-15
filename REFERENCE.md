@@ -102,7 +102,7 @@ HDR_TonemapTargetPeak=1000.0
 HDR_TonemapDynamic=0
 
 ; what Windows tells games and apps this display peaks at (HDR): auto = 10000 nits while DesktopLUT's tone map
-; runs, else the panel's; bypass = always 10000 (Windows and apps never tone map); panel = always the panel's.
+; runs over the full range (dynamic, or a static content peak of 10000), else the panel's; bypass = always 10000 (Windows and apps never tone map); panel = always the panel's.
 ; Replaces MaxTmlEnabled / MaxTmlPeak (removed on save).
 WindowsToneMap=auto
 
@@ -177,7 +177,7 @@ When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injec
 4. Live parameter updates (tonemapping changes, monitor hotplug) are communicated via shared memory IPC (`Global\DesktopLUT_DwmHook_Config`) — no re-injection needed.
 5. **Live edit preview** (MHC fine-tune editors, `mhc.grayscale_live_*`): the edited display's scanout runs an identity profile and the hook applies the display's MHC profile as the last step of its pass — the very matrix and LUT entries the bake writes (`src/mhc_preview.h`, `shared/mhc_scanout_hlsl.h`). The data travels in its own mapping (`Global\DesktopLUT_DwmHook_MhcPreview`, `DwmHookMhcPreview`); the config carries its generation (`mhcPreviewGen`) and the DLL acknowledges each one (`ackGen`), so an older resident DLL is detected and the edit does not start. Without a live hook (overlay mode, or no hook work) the overlay applies the preview instead, after its own 3D LUT.
 
-**Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for the classic MHC base editor's preview or non-DWM-hook shader corrections (the fine-tune live edit is applied by the hook itself). State tracked by `g_analysisOnlyMode` atomic.
+**Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for the classic MHC base editor's preview or non-DWM-hook shader corrections (the fine-tune live edit is applied by the hook itself). State tracked by `g_analysisOnlyMode` atomic. Desktop Duplication delivers the frame BEFORE the hook, so in hook mode the analysis readout is the content signal ahead of the 3D LUT and tone map — it measures what apps draw, never what the hook outputs (PA32 2026-10-15: a PQ 860 window read Peak 2257.5 nits with the tone map on; a post-hook capture would read ≤ the 1700-nit target).
 
 **Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event). Max 3 consecutive re-injection retries. Orphan detection via `hostPid` in shared memory — DLL self-unloads if host process dies.
 
@@ -328,7 +328,8 @@ The toggle converts SDR content from sRGB OETF to 2.2 gamma before HDR processin
 | **Reported peak** (DXGI `MaxLuminance`) | Per display | "My display can handle Y nits" |
 
 DesktopLUT always declares MaxCLL = 10000 nits. The display's **Windows tone map** setting decides the reported peak:
-Bypass (and Auto while DesktopLUT's tone map runs) reports 10000 nits, so Windows and apps leave the highlights to
+Bypass (and Auto while DesktopLUT's tone map runs over the full range: dynamic peak, or a static content peak of
+10000 — a lower static content peak clips everything above it flat at the target) reports 10000 nits, so Windows and apps leave the highlights to
 DesktopLUT instead of tone mapping a second time; Panel (and Auto otherwise: tone map off, suspended, the hook given
 up, the overlay hidden for a VRR-whitelisted game, DesktopLUT quit) reports the panel's own peak. A sign-out or
 restart keeps 10000 until DesktopLUT starts again (it runs from sign-in); so does a crash, and a display that is

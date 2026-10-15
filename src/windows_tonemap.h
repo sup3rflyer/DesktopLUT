@@ -19,6 +19,12 @@
 // false then). Pure.
 bool WindowsToneMapReportsMax(WindowsToneMap mode, bool toneMapOn, bool liveLayersSuspended, bool appExiting);
 
+// Whether DesktopLUT's tone map takes content up to 10000 nits — what Auto's 10000 lets apps send: switched on, and
+// dynamic (the detected frame peak lands on the target) or a static content peak of 10000. A static content peak
+// below that clips everything above it flat at the target (the INI default, static 1000, hard-clips above 1000), so
+// Auto keeps reporting the panel's peak then and apps tone map to it. Pure.
+bool ToneMapTakesFullRange(const TonemapSettings& tm);
+
 // INI spelling ("auto", "bypass", "panel"); anything else parses as Auto.
 const wchar_t* WindowsToneMapKey(WindowsToneMap mode);
 WindowsToneMap ParseWindowsToneMap(const wchar_t* text);

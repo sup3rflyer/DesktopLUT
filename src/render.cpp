@@ -396,7 +396,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // Row 2: Grayscale control + tonemapping toggles
         cbData[8] = (float)cc.grayscale.pointCount;
         cbData[9] = shaderGrayscale ? 1.0f : 0.0f;
-        // Exclude tonemapping when DWM hook handles it (hook applies before DD capture)
+        // Exclude tonemapping when DWM hook handles it: the hook tone maps the composed frame, this overlay's pixels
+        // included. (DD hands the overlay the PRE-hook frame — measured on the PA32 2026-10-15.)
         cbData[10] = (ctx->isHDREnabled && cc.tonemap.enabled && !g_dwmHookMode.load() && !ctx->editHeld) ? 1.0f : 0.0f;  // tonemapEnabled
         cbData[11] = (float)static_cast<int>(cc.tonemap.curve);  // tonemapCurve
         // Row 3-5: Primaries matrix (xyz) + white balance gains (w)

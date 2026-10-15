@@ -159,11 +159,12 @@ Result SetTonemap(int mon, const TonemapSettings& t) {
     TonemapSettings v = t;
     v.targetPeakNits = Clamp(v.targetPeakNits, 10.0f, 10000.0f);
     v.sourcePeakNits = Clamp(v.sourcePeakNits, 10.0f, 10000.0f);
-    bool enableChanged = false, changed = false;
+    bool enableChanged = false, changed = false, rangeChanged = false;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         TonemapSettings& tm = g_gui.monitorSettings[mon].hdrColorCorrection.tonemap;
         enableChanged = tm.enabled != v.enabled;
+        rangeChanged = ToneMapTakesFullRange(tm) != ToneMapTakesFullRange(v);
         changed = enableChanged || tm.curve != v.curve || tm.dynamicPeak != v.dynamicPeak ||
                   tm.targetPeakNits != v.targetPeakNits || tm.sourcePeakNits != v.sourcePeakNits;
         tm = v;
@@ -176,7 +177,8 @@ Result SetTonemap(int mon, const TonemapSettings& t) {
     SaveSettings();
     // An enable change can start or stop the live layers, or change the hook's display list.
     if (enableChanged) ReconcileLiveLayers("tone map");
-    if (enableChanged) ReconcileWindowsToneMap("tone map", false);   // Auto follows whether DesktopLUT tone maps
+    // Auto follows whether DesktopLUT tone maps the full range (on, and dynamic or a static content peak of 10000).
+    if (rangeChanged) ReconcileWindowsToneMap("tone map", false);
     Finish(mon);
     return Done();
 }
