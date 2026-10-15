@@ -56,11 +56,13 @@ the same three titles move it 1.436 → 1.406 (−2 %).
 * Modelled shift to a general catalogue (two bracketing models, not published band shares): < 1 nit about 20–34 %,
   10–100 nit about 24–30 %, > 100 nit about 13–19 % (three times the survey).
 
-**Reading.** For the owner the library is the right reference: it is what the owner watches. As a general weighting it is
-dark, by about one catalogue quartile. The weighting is robust to a few added titles. A general profile would move
-weight from < 1 nit to 10–200 nit, so it matters for calibrations whose error depends on level. Open: a "general"
-profile from published data, and showing the score under both profiles so a reading that depends on the weighting
-is visible.
+**Reading.** As a general weighting the library is dark, by about one catalogue quartile. The weighting is robust to a
+few added titles. A more general mix would move weight from < 1 nit to 10–200 nit, so it matters for calibrations
+whose error depends on level.
+
+**Owner decision (2026-10-15).** One content reference, meant to be general; the owner's library is a fine start. No
+second profile and no dual score. If it is revisited, the way forward is widening the one reference toward a general
+mix (more and brighter titles, checked against published catalogue data), not a second reference.
 
 ## Sources
 
