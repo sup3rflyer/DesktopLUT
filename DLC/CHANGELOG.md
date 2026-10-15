@@ -18,6 +18,17 @@ request, adjudicates ambiguous results on digests, and writes the report.
     and `--no-live-state` turns it off. `python -m dlc.dashboard.publish --run <dir>` folds a finished run once.
   - `python -m dlc.note "<one line>"` appends the supervising LLM's judgment to `runs/<run>/notes.jsonl`; the
     feed shows it next to the run's own events.
+- **The run spine carries what any viewer needs** (2026-10-15).
+  - A paused seam's event carries the whole decision packet (question, options, recommendation,
+    digest, structured fallback, operator checklist), not only the question. `hardware-readiness:confirm`
+    lists its three checks.
+  - Every meter read carries its ΔE once the target is known (`dE` + `dE_metric`: dE_ITP for HDR,
+    CIEDE2000 for SDR). Check-ins now report a real max ΔE and the read it came from (`max_dE_read`);
+    3D-LUT build probes are summarised apart.
+  - `manifest.json` records the launch command (argv + working directory) and appends each resume.
+  - `runs/active.json` adds the process id, display, monitor, mode, hardware id and a `state`
+    (running / paused_seam / done / failed / cancelled).
+  - The dashboard's Pause / Resume / Cancel write `control.json` atomically.
 - **Public operating manual for the LLM, an agent skill, and an example profile** (2026-10-10). DLC is
   operated by an LLM agent with the user in the loop, and until now its manual was local to one rig.
   - `docs/operator-guide.md` is the generic manual: the operating law, panel safety per class (OLED /

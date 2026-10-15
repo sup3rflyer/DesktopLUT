@@ -23,6 +23,7 @@ Spine-tier: stdlib only, imports nothing from the rest of DLC.
 from __future__ import annotations
 
 import json
+import math
 import time
 from typing import Any, Optional
 
@@ -181,6 +182,29 @@ def checkin_evidence(cal: Any) -> dict[str, Any]:
     return window_evidence(cal.runlog.path, cal._last_checkin_pos or 0)
 
 
+# Reads whose ΔE is NOT the calibration error at a target patch, so they never set the window's
+# max ΔE (the dashboard's live ΔE excludes the same population): warm-up reads are the reference
+# patch still settling, and a build probe reads an optimizer DRIVE — the panel's response at a
+# code the optimizer chose, not a colour the calibration is meant to hit. Probes get their own
+# summary instead.
+_NON_TARGET_ROLES = frozenset({"warmup", "probe"})
+
+
+def _is_probe_read(data: dict[str, Any]) -> bool:
+    return data.get("role") == "probe" or data.get("disposition") == "probe"
+
+
+def _worst_read(e: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+    """Which read set the max ΔE — enough to find it and judge it without the firehose."""
+    return {k: v for k, v in (("label", data.get("label")), ("role", data.get("role")),
+                              ("phase", e.get("phase")), ("stage", e.get("stage")),
+                              ("rgb", data.get("rgb")), ("signal", data.get("signal")),
+                              ("Y", data.get("Y")), ("xy", data.get("xy")),
+                              ("read_index", data.get("read_index")),
+                              ("disposition", data.get("disposition")), ("time", e.get("time")))
+            if v is not None}
+
+
 def window_evidence(path: Any, pos: int, *,
                     skip_kinds: tuple[str, ...] = ()) -> dict[str, Any]:
     """The REAL evidence in an events.jsonl window, read back from byte offset ``pos``:
@@ -188,8 +212,18 @@ def window_evidence(path: Any, pos: int, *,
     read count. This is data for the LLM to JUDGE — deliberately NOT a verdict and NOT a
     recommendation. The full firehose is always on disk; this is the at-a-glance packet.
     ``skip_kinds`` drops warnings (by event name or ``kind``) a caller already carries in its
-    own packet (the measure loop inlines its read-plausibility flags as ``new_anomalies``)."""
+    own packet (the measure loop inlines its read-plausibility flags as ``new_anomalies``).
+
+    The ΔE is each ``patch_read``'s own ``dE`` (the run's one metric, named in ``dE_metric``;
+    see :meth:`dlc.events.RunLog.patch_read`). ``max_dE`` / ``max_dE_patch`` (its label) /
+    ``max_dE_read`` (where it was read: role, phase, code, signal, Y, xy) cover target-patch
+    reads; ``scored_reads`` counts the reads that carried a ΔE. Build-probe reads are summarised
+    apart in ``probe`` (count + max ΔE at a drive), and warm-up reads are left out of both."""
     out: dict[str, Any] = {"reads": 0, "max_dE": None, "max_dE_patch": None, "warnings": []}
+    scored = 0
+    metric: Optional[str] = None
+    worst: Optional[dict[str, Any]] = None
+    probe: dict[str, Any] = {"reads": 0, "max_dE": None, "max_dE_patch": None}
     try:
         with path.open("r", encoding="utf-8") as fh:
             fh.seek(pos or 0)
@@ -209,9 +243,22 @@ def window_evidence(path: Any, pos: int, *,
         if ev == "patch_read":
             out["reads"] += 1
             de = data.get("dE")
-            if isinstance(de, (int, float)) and (out["max_dE"] is None or de > out["max_dE"]):
+            if not isinstance(de, (int, float)) or isinstance(de, bool) or not math.isfinite(de):
+                continue
+            metric = data.get("dE_metric") or metric
+            if _is_probe_read(data):
+                probe["reads"] += 1
+                if probe["max_dE"] is None or de > probe["max_dE"]:
+                    probe["max_dE"] = round(de, 3)
+                    probe["max_dE_patch"] = data.get("label") or data.get("signal")
+                continue
+            if data.get("role") in _NON_TARGET_ROLES:
+                continue
+            scored += 1
+            if out["max_dE"] is None or de > out["max_dE"]:
                 out["max_dE"] = round(de, 3)
                 out["max_dE_patch"] = data.get("label") or data.get("role") or data.get("signal")
+                worst = _worst_read(e, data)
         elif ev in ("anomaly", "read_plausibility_anomaly", "stall"):
             if ev in skip_kinds or data.get("kind") in skip_kinds:
                 continue
@@ -220,6 +267,13 @@ def window_evidence(path: Any, pos: int, *,
                 if k in data:
                     w[k] = data[k]
             out["warnings"].append(w)
+    if worst is not None:
+        out["max_dE_read"] = worst
+    if scored or probe["reads"]:
+        out["scored_reads"] = scored
+        out["dE_metric"] = metric
+    if probe["reads"]:
+        out["probe"] = probe
     # Per-type totals BEFORE any truncation, so the cap can never hide the SCALE of a
     # problem (25 shown of 400 read-anomalies is a different judgment than 25 of 26).
     counts: dict[str, int] = {}
