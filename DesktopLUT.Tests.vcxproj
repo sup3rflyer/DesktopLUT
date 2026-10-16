@@ -110,6 +110,7 @@
     <ClCompile Include="src\framepacer.cpp" />
     <ClCompile Include="src\dwm_inject.cpp" />
     <ClCompile Include="shared\fald_panel.cpp" />
+    <ClCompile Include="shared\fald_panel_live.cpp" />
     <ClCompile Include="shared\fald_temporal.cpp" />
     <ClCompile Include="src\fald.cpp" />
     <ClCompile Include="src\ui\ui_theme.cpp" />
@@ -162,6 +163,7 @@
     <ClCompile Include="tests\test_ini_roundtrip.cpp" />
     <ClCompile Include="tests\test_calib_snapshot.cpp" />
     <ClCompile Include="tests\test_fald.cpp" />
+    <ClCompile Include="tests\test_fald_live.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
     <ClCompile Include="tests\test_hdr_dither.cpp" />

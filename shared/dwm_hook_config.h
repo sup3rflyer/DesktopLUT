@@ -67,7 +67,8 @@ struct DwmHookSharedConfig {
     // still resident in a running dwm.exe reads what these words used to be — zero, i.e. FALD off —
     // instead of misreading a moved layout. Pack/unpack with the helpers below.
     // The panel parameter file itself does NOT come through here: it is staged as a file beside the
-    // .cube LUTs and read once at attach (see DWM_HOOK_FALD_SUBDIR).
+    // .cube LUTs and read at attach (see DWM_HOOK_FALD_SUBDIR); a later change of it travels in its own
+    // section (DwmHookFaldPanelBlob below), announced by DwmHookFaldTuning::panelGen.
     uint32_t faldFlags[MAX_DWM_HOOK_MONITORS];
 
     // HDR output dither kill switch (shared/hdr_dither.h), global. Taken from _reserved for the same reason as
@@ -100,14 +101,18 @@ static_assert(MAX_DWM_HOOK_MONITORS <= 32, "lutOffMask holds one bit per monitor
 // ---------------------------------------------------------------------------
 // FALD correction (mini-LED local dimming context-dependence) — host <-> hook
 // ---------------------------------------------------------------------------
-// Two channels, deliberately split by how often each changes:
+// Three channels, deliberately split by how often each changes:
 //
 //   * the per-panel parameter file (*.bin, `python -m dlc.fald.export`) is STAGED AS A FILE, in
 //     this subdirectory of the LUT staging dir, and read once during DllMain like the .cube files.
 //     Its own subdirectory because AddLUTs feeds every non-directory file whose name starts
-//     "<int>_<int>" to the .cube parser, and a panel file is named the same way. Changing the panel
-//     file therefore needs a re-injection — it is a rare, deliberate act (a new fit), and keeping it
-//     out of the present path means no file polling inside dwm.exe.
+//     "<int>_<int>" to the .cube parser, and a panel file is named the same way. That is the FIRST
+//     load of an injection (and of every re-injection: it always stages the current file).
+//
+//   * a CHANGE of the panel file while the hook is resident (another path, the same path re-exported,
+//     an explicit reload) is delivered live through shared memory — see "FALD panel file live
+//     delivery" below — so the layer never blinks off for a re-injection: a blind A/B of two panel
+//     files must show the files, not the blink. No file I/O inside dwm.exe either way.
 //
 //   * the three live settings below travel in faldFlags[] over the seqlock, so toggling the layer
 //     or a debug view does NOT re-inject (a re-injection re-rolls twin-panel routing).
@@ -222,9 +227,15 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     float    tempClockClosure;
     int32_t  tempClockParity;        // -1 unknown, 0, 1
     float    refreshMs;              // exact nominal refresh period of this monitor (DisplayConfig vSyncFreq); 0 = unknown
-    uint32_t _reserved[8];           // room for later fields without a layout bump (24 used + 8 = 32 words)
+    // FALD panel file live delivery (DwmHookFaldPanelBlob below): the generation of the file this monitor's layer is
+    // to hold, per mode — index 0 = SDR (ACM), 1 = HDR. BOTH modes, unlike the fields above (a file delivered for the
+    // other mode waits there). 0 = the file staged at injection. Taken from _reserved: a host that predates it writes
+    // 0, and a DLL that predates it never reads it (the host then re-injects: DWM_HOOK_FALD_PANEL_LIVE_EVENT).
+    uint32_t panelGen[2];
+    uint32_t _reserved[6];           // room for later fields without a layout bump (26 used + 6 = 32 words)
 };
 static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
+static_assert(offsetof(DwmHookFaldTuning, panelGen) == 96, "panelGen must sit where _reserved[0] was");
 
 struct DwmHookSharedConfigTail {
     uint32_t magic;                  // DWM_HOOK_TAIL_MAGIC
@@ -240,6 +251,61 @@ struct DwmHookSharedConfigEx {
 };
 static_assert(sizeof(DwmHookSharedConfigTail) == 16 + 128 * MAX_DWM_HOOK_MONITORS, "tail layout");
 static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigTail), "head must stay at 464");
+
+// ---------------------------------------------------------------------------
+// FALD panel file live delivery (no re-injection)
+// ---------------------------------------------------------------------------
+// The panel file is staged as a file and read at attach (DWM_HOOK_FALD_SUBDIR above). A CHANGE of it while the hook is
+// resident reaches the DLL through shared memory instead (re-injecting blinked the layer off for ~1 s on every switch,
+// which made a live A/B of two panel files impossible to judge). Per delivery the host
+//   1. reads and validates the file with the parser the DLL uses (shared/fald_panel.h ParseFaldPanelParams), its
+//      transfer against the mode and its lattice against the display — a file it refuses is never delivered;
+//   2. creates a NEW named section DWM_HOOK_FALD_PANEL_NAME_FMT (its pid + a host-wide generation, never 0): a
+//      DwmHookFaldPanelBlob header, then the file's bytes unchanged. Written completely, then never again;
+//   3. publishes the generation in the shared config (DwmHookFaldTuning::panelGen[mode] of that monitor's entry,
+//      inside the config's seqlock) — the DLL cannot know the name before the section is complete.
+// The DLL, on a present of that monitor whose config carries a generation it has not processed for that mode, opens
+// the section, copies header and payload out (SEH-guarded), checks the header (magic, size, generation, position,
+// mode: shared/fald_panel_live.h FaldPanelBlobCheck) and parses the payload with the staged file's parser (+ transfer
+// vs mode). Accepted: it replaces the file the DLL holds for that (position, mode); the monitor's layer rebuilds its
+// panel resources at its next run in that mode and switches over between two presents, keeping its clean source
+// primed. Until they are built — and for good if they cannot be — the layer keeps running on the previous file.
+// Refused: nothing changes. Either way the DLL writes its verdict into the section (ackGen / ackStatus), and a
+// generation is processed once. One section per generation, so a reader can never see a half-rewritten block; the
+// host closes a superseded one (the DLL drops its view when it takes the next). A re-injection stages the CURRENT file
+// again and starts every generation over at 0 (= the staged file).
+#define DWM_HOOK_FALD_PANEL_NAME_FMT    L"Global\\DesktopLUT_DwmHook_FaldPanel_%lu_%lu"   // host pid, generation
+// Created by a DLL that takes live deliveries (beside the heartbeat event, closed with it). An older resident DLL has
+// none: the host then changes a panel file by re-injecting, as before.
+#define DWM_HOOK_FALD_PANEL_LIVE_EVENT  L"Global\\DesktopLUT_DwmHook_FaldPanelLive"
+#define DWM_HOOK_FALD_PANEL_MAGIC       0x504C4446u   // 'FDLP'
+// A payload above this is refused on both sides (real panel files are < 1 MB; the parser's own bounds allow ~34 MB).
+#define DWM_HOOK_FALD_PANEL_MAX_BYTES   (64u << 20)
+
+// DwmHookFaldPanelBlob::ackStatus (written by the DLL)
+#define DWM_HOOK_FALD_PANEL_ACK_NONE         0u   // not processed yet
+#define DWM_HOOK_FALD_PANEL_ACK_INGESTED     1u   // parsed and held for that (position, mode): the layer takes it at its next run there
+#define DWM_HOOK_FALD_PANEL_ACK_APPLIED      2u   // the layer runs on it
+#define DWM_HOOK_FALD_PANEL_ACK_REFUSED      3u   // the block or the file is invalid: the previous file stays
+#define DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED 4u   // its GPU resources could not be built: a running layer stays on the
+                                                  // previous file (one not running stays off, as with a staged file)
+
+#pragma pack(push, 4)
+struct DwmHookFaldPanelBlob {
+    uint32_t magic;                  // DWM_HOOK_FALD_PANEL_MAGIC
+    uint32_t headerBytes;            // sizeof(DwmHookFaldPanelBlob): the payload starts here
+    uint32_t gen;                    // the generation this section is (its name carries it too)
+    int32_t  left, top;              // the monitor (DwmHookMonitorConfig match key)
+    uint32_t isHdr;                  // the mode the file is for: 1 = HDR (a PQ fit), 0 = SDR under ACM (a gamma fit)
+    uint32_t payloadBytes;           // the panel file's size; its bytes follow the header unchanged
+    uint32_t _pad;
+    volatile uint32_t ackGen;        // written by the DLL: the generation of its verdict (== gen once processed)
+    volatile uint32_t ackStatus;     // written by the DLL: DWM_HOOK_FALD_PANEL_ACK_*
+    uint32_t _reserved[2];
+};
+#pragma pack(pop)
+static_assert(sizeof(DwmHookFaldPanelBlob) == 48, "DwmHookFaldPanelBlob layout");
+static_assert(offsetof(DwmHookFaldPanelBlob, ackGen) == 32, "DwmHookFaldPanelBlob layout");
 
 // ---------------------------------------------------------------------------
 // Identity beacon palette — shared by the host (paints) and the DLL (classifies)
