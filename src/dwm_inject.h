@@ -84,29 +84,59 @@ uint32_t DwmHookMhcPreviewGen();
 // A panel file change reaches the resident hook without a re-injection: the layer keeps running on the old file until
 // the new one is built and switches between two presents (re-injecting blinked it off for ~1 s per switch).
 // Hand the file at `path` to the resident hook for the display at (left, top), mode `hdr`. The file is read and
-// validated here with the DLL's parser (transfer vs mode, lattice vs display), copied into a new named section, and
-// its generation published in the shared config; the injected set then names it. True = delivered. False (`why`
-// says why): the hook cannot take it (not resident, an older DLL, no tuning tail, unknown staging set) or the file is
-// refused — the caller then re-injects as before, which also gives a refused file exactly the old outcome.
+// validated here with the DLL's parser (transfer vs mode; lattice and zone sweep vs the display, which must be in the
+// DXGI list), copied into a new named section, and its generation (`*gen`) published in the shared config; the
+// injected set names it at once (the live-layer reconcile must not re-inject for the path change) and is taken back
+// if the hook's verdict says otherwise (CheckDwmHookFaldPanelVerdicts). True = sent. False (`why` says why): the hook
+// cannot take it (not resident, an older DLL, no tuning tail, unknown staging set) or the file is refused — the
+// caller then re-injects as before, which also gives a refused file exactly the old outcome.
 // GUI thread; takes g_dwmInjectMutex, then g_monitorSettingsMutex (never call it holding the latter).
-bool DeliverDwmHookFaldPanel(int left, int top, bool hdr, const std::wstring& path, std::wstring* why = nullptr);
+bool DeliverDwmHookFaldPanel(int left, int top, bool hdr, const std::wstring& path, std::wstring* why = nullptr,
+                             uint32_t* gen = nullptr);
 // The display's FALD path for `hdr` was cleared: the file the hook holds there is inert (the layer is off for want of
 // a path, DwmHookSharedConfig::faldFlags) and is no longer watched for re-exports. True when a resident hook took
 // note (no re-injection needed); false = no hook to tell.
 bool ForgetDwmHookFaldPanel(int left, int top, bool hdr);
 // The resident DLL takes live deliveries (DWM_HOOK_FALD_PANEL_LIVE_EVENT exists).
 bool DwmHookFaldPanelLiveSupported();
-// GUI thread, on the hook watchdog's healthy tick: a held panel file re-exported IN PLACE (size / mtime moved since it
-// was read) is delivered again — the overlay path's stamp poll; a half-written one is skipped until it changes again.
-// Also passes on, once per delivery, a DLL verdict that kept the previous file (refused / build failed) in `problems`.
-void PollDwmHookFaldPanelFiles(std::vector<std::wstring>* problems);
-// What the hook holds per (position, mode), for state.get: gen 0 = the file staged at injection.
+
+// What the GUI is told about a delivery (status line / notification).
+struct DwmHookFaldPanelNotice {
+    enum class Kind { Loaded, LoadedIdle, Failed } kind = Kind::Loaded;   // LoadedIdle: held, the layer is not running
+    int left = 0, top = 0;                                                //   there now (applies when it runs)
+    bool hdr = false;
+    uint32_t gen = 0;
+    std::wstring text;                                                    // Failed: what to tell the user
+};
+// GUI thread: fold the hook's answers on outstanding deliveries in. Applied / held -> Loaded / LoadedIdle. Refused,
+// could not be built, or no answer within a few hook-watchdog ticks (`watchdogTick`: one of them; counted only while
+// the display is on and attached) -> Failed: the injected set and state.get name what the hook actually holds, and a
+// fallback re-injection is owed — once per failed file stamp (DwmHookFaldPanelFallbackOwed / Take...).
+// `wantRecompose`: a watchdog tick found a delivery still unanswered — ask DWM for a composition (a static desktop
+// presents nothing, so the DLL never sees the new generation).
+void CheckDwmHookFaldPanelVerdicts(bool watchdogTick, std::vector<DwmHookFaldPanelNotice>* notices, bool* wantRecompose);
+bool DwmHookFaldPanelVerdictPending();   // a delivery is still unanswered
+bool DwmHookFaldPanelFallbackOwed();     // a failed delivery owes the old path's re-injection
+bool TakeDwmHookFaldPanelFallback();     // true (and cleared) when one is owed: the caller re-injects now
+// Re-export poll (the overlay path's stamp poll): on the hook watchdog's healthy tick, the files the hook was given are
+// stat'ed and read on a WORKER thread (never under g_dwmInjectMutex, never on the GUI thread: an unreachable share
+// would stall both); the results come back as `doneMsg` (lParam) to `notifyHwnd`, and FinishDwmHookFaldPanelPoll
+// (GUI thread) delivers what changed: a new content only (same bytes, touched: nothing), a file being written is
+// retried (never recorded as bad), a refused one is not re-read until it changes again and is reported once if it
+// stays. False = nothing to poll, or a poll still in flight.
+bool StartDwmHookFaldPanelPoll(void* notifyHwnd, unsigned int doneMsg);
+void FinishDwmHookFaldPanelPoll(intptr_t result, std::vector<DwmHookFaldPanelNotice>* notices, bool* delivered);
+void DiscardDwmHookFaldPanelPoll(intptr_t result);   // frees a result without acting on it (shutdown)
+// Per (position, mode), for state.get: what the hook HOLDS (its verdicts) and what was SENT last.
 struct DwmHookFaldPanelState {
     int left = 0, top = 0;
     bool hdr = false;
-    std::wstring path;
-    uint32_t gen = 0;
-    uint32_t ack = 0;    // DWM_HOOK_FALD_PANEL_ACK_* of that delivery (NONE = not processed yet, or staged)
+    std::wstring heldPath;   // the file the hook holds there ("" = none)
+    uint32_t heldGen = 0;    // its generation (0 = staged at injection)
+    std::wstring sentPath;   // the last file delivered live ("" = none since the injection)
+    uint32_t sentGen = 0;    // its generation: a client that sent one waits for status "applied" on it
+    std::wstring wantPath;   // the file the host wants there ("" = path cleared)
+    std::string status;      // staged | delivered | ingested | applied | refused | build_failed | no_ack
 };
 std::vector<DwmHookFaldPanelState> DwmHookFaldPanels();
 

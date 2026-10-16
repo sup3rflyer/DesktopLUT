@@ -351,27 +351,26 @@ JsonValue BuildHookStateJson() {
         hook.set("routing", routing);
     }
     hook.set("needs_check", JBool(needsCheck));
-    // FALD panel files the hook holds, per display and mode (dwm_inject.h DwmHookFaldPanels): staged at injection
-    // (gen 0) or delivered live since. A client that switches panel files (a blind A/B) confirms here that the switch
-    // reached the hook: status applied = the layer runs on it.
-    //   fald_panels: [{ left, top, mode:"HDR"|"SDR", path, gen,
-    //                   status: staged | delivered (not taken yet: no present of that display since) | ingested (held,
-    //                           taken at the layer's next run in that mode) | applied | refused | build_failed }]
+    // FALD panel files of the hook, per display and mode (dwm_inject.h DwmHookFaldPanels): what it HOLDS (its verdicts
+    // say so; held_gen 0 = staged at injection) apart from what was SENT last. A client that switches panel files (a
+    // blind A/B) waits until sent_gen is the hook_gen runtime.set_fald_params returned and status is "applied".
+    //   fald_panels: [{ left, top, mode:"HDR"|"SDR", held_path, held_gen, sent_path, sent_gen, want_path,
+    //                   status: staged (nothing sent since the injection) | delivered (sent, no answer yet) | ingested
+    //                           (held; the layer takes it at its next run in that mode) | applied | refused |
+    //                           build_failed | no_ack (the last three: the hook keeps held_path; the host re-injects
+    //                           once per failed file) }]
     JsonValue panels = JArr();
     for (const DwmHookFaldPanelState& p : DwmHookFaldPanels()) {
         JsonValue j = JObj();
         j.set("left", JNum(p.left));
         j.set("top", JNum(p.top));
         j.set("mode", JStr(p.hdr ? "HDR" : "SDR"));
-        j.set("path", JStr(WideToUtf8(p.path)));
-        j.set("gen", JNum((double)p.gen));
-        const char* status = p.gen == 0 ? "staged"
-                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_INGESTED ? "ingested"
-                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_APPLIED ? "applied"
-                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_REFUSED ? "refused"
-                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED ? "build_failed"
-                           : "delivered";
-        j.set("status", JStr(status));
+        j.set("held_path", JStr(WideToUtf8(p.heldPath)));
+        j.set("held_gen", JNum((double)p.heldGen));
+        j.set("sent_path", JStr(WideToUtf8(p.sentPath)));
+        j.set("sent_gen", JNum((double)p.sentGen));
+        j.set("want_path", JStr(WideToUtf8(p.wantPath)));
+        j.set("status", JStr(p.status));
         panels.arr.push_back(j);
     }
     hook.set("fald_panels", panels);
@@ -1483,10 +1482,16 @@ void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) 
     SaveSettings();
     // Hook mode: a resident hook takes the file live (no re-injection: the layer switches between two presents);
     // otherwise the DLL reads it at injection.
-    const bool live = FaldPanelFileChangedLive(mon, isHDR);
+    uint32_t gen = 0;
+    const bool live = FaldPanelFileChangedLive(mon, isHDR, &gen);
     FaldPropagate(mon, isHDR);
-    if (!live) FaldPanelFileChangedReinject();
+    const bool reinjected = !live && FaldPanelFileChangedReinject();
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    // DWM hook mode: "live" = sent to the resident hook as generation hook_gen — wait for state.get hook.fald_panels
+    // [this display + mode].sent_gen == hook_gen with status "applied" (or a failure status: the host then re-injects
+    // by itself); "reinject" = the hook was re-injected with the file staged; "none" = no hook to tell.
+    result.set("hook_delivery", JStr(live ? "live" : (reinjected ? "reinject" : "none")));
+    result.set("hook_gen", JNum((double)gen));
     result.set("params_path", JStr(WideToUtf8(path)));
     result.set("transfer", JStr(known ? (transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq") : "unknown"));
 }

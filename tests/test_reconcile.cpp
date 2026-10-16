@@ -238,17 +238,26 @@ TEST_CASE("hook staging: the TV powering off and on costs no re-inject") {
     CHECK_FALSE(DecideHookStale(Resident({ kTvCube }, {}, { kPa })));   // the TV was the only display with hook work
     // On again at the same position with the same settings: the resident entry is already right.
     CHECK_FALSE(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube, kTvCube }, { kPa, kTv })));
+    // On again, its identity not read yet (default settings, no identity): it is most likely the TV itself,
+    // so its cube stays until the identity says otherwise.
+    CHECK_FALSE(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube }, { kPa })));
+    // On again elsewhere: it moved.
+    DwmHookMonitorLUT tvLeft = kTvCube;
+    tvLeft.left = -3840;
+    CHECK(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube, tvLeft }, { kPa, { -3840, 0 } })));
 }
 
 // A FALD panel file change reaches a resident hook live (dwm_inject.h DeliverDwmHookFaldPanel: no re-injection, the
 // layer switches between two presents — re-injecting blinked it off for ~1 s, which made a blind A/B of two panel
 // files unjudgeable). The delivery updates the injected set BEFORE the reconcile runs, so the reconcile sees nothing
-// stale. Not delivered (an older resident DLL, a refused file): the same change is stale, a re-inject as before.
+// stale. Not delivered (an older resident DLL, a refused file) — or taken back after the hook's verdict refused it
+// (CheckDwmHookFaldPanelVerdicts names the file the hook holds again): the same change is stale, a re-inject as before.
 TEST_CASE("hook staging: a FALD panel file delivered live is no reason to re-inject") {
     const wchar_t* kPanelC = L"C:\\panels\\candidate_C_fade3_only.bin";
     const DwmHookMonitorLUT paCur = Entry(kPa, L"", L"C:\\luts\\pa_hdr.cube", L"", kPanel);
     const DwmHookMonitorLUT paC = Entry(kPa, L"", L"C:\\luts\\pa_hdr.cube", L"", kPanelC);
-    // CUR -> C: not delivered -> the hook lacks the file -> re-inject; delivered -> the injected set names C
+    // CUR -> C: not delivered (or delivered and refused: the set names CUR again) -> the hook lacks the file ->
+    // re-inject; delivered -> the injected set names C
     CHECK(DecideHookStale(Resident({ paCur, kTvCube }, { paC, kTvCube }, { kPa, kTv })));
     CHECK_FALSE(DecideHookStale(Resident({ paC, kTvCube }, { paC, kTvCube }, { kPa, kTv })));
     // and back, C -> CUR (the A/B): the same
@@ -275,13 +284,12 @@ TEST_CASE("hook staging: the resident set compares as a set (a live delivery app
     DwmHookMonitorLUT otherPanel = kTvFaldOnly;
     otherPanel.hdrFaldPath = L"C:\\panels\\candidate_A.bin";
     CHECK_FALSE(DwmHookStagingSetsEqual({ kPaCube, kTvFaldOnly }, { otherPanel, kPaCube }));
-    // On again, its identity not read yet (default settings, no identity): it is most likely the TV itself,
-    // so its cube stays until the identity says otherwise.
-    CHECK_FALSE(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube }, { kPa })));
-    // On again elsewhere: it moved.
-    DwmHookMonitorLUT tvLeft = kTvCube;
-    tvLeft.left = -3840;
-    CHECK(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube, tvLeft }, { kPa, { -3840, 0 } })));
+    // An entry that stages no file is no entry: a tone-mapper-only display, or a display whose panel file was cleared
+    // (ForgetDwmHookFaldPanel leaves it file-less) while the configuration no longer lists it at all.
+    CHECK(DwmHookStagingSetsEqual({ kPaCube, kTvToneMapOnly }, { kPaCube }));
+    CHECK(DwmHookStagingSetsEqual({ kPaCube }, { kPaCube, kTvToneMapOnly }));
+    CHECK(DwmHookStagingSetsEqual({ kTvToneMapOnly }, {}));
+    CHECK_FALSE(DwmHookStagingSetsEqual({ kPaCube, kTvToneMapOnly }, { kPaCube, kTvFaldOnly }));
 }
 
 TEST_CASE("hook staging: a cube under a display swapped onto the connector re-stages") {
