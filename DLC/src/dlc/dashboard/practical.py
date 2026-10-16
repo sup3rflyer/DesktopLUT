@@ -5,9 +5,10 @@ info"; three-model review the same day). Everything is computed from the folded 
 
 * ``bands`` — error by LUMINANCE BAND, weighted by where content lives. With per-patch content weights (a
   content-sampled verify set) the band width is the weight share and every number is weighted; otherwise the
-  width is the film-pixel share from the 2026-10-09 content survey (``results/practical_score_2026-10-09``:
-  HDR live action 51.9 / 25.7 / 17.9 / 2.7 / 1.8 % at < 1 / 1–10 / 10–100 / 100–203 / > 203 nit; SDR live
-  action ≈ 33 / 28 / 38 / 1 % at < 1 / 1–10 / 10–100 / > 100 nit) and patches inside a band count equally.
+  width is the film-pixel share from the 2026-10-16 content survey (``results/practical_score_2026-10-16``:
+  HDR live action = the owner's library + the HT Demos films, every film counted once, end credits excluded,
+  41.9 / 29.3 / 22.8 / 3.8 / 2.2 % at < 1 / 1–10 / 10–100 / 100–203 / > 203 nit; SDR live action
+  33.0 / 28.1 / 35.8 / 3.1 % at < 1 / 1–10 / 10–100 / > 100 nit) and patches inside a band count equally.
   Per band: mean / p95 ΔE, the signed mean lightness error, and the RMS lightness / chroma / hue error (what KIND
   of error: their squares split the band's mean squared ΔE).
 * ``offset_L`` — the shared lightness offset above 1 nit: one number (often inside the meter's own accuracy),
@@ -29,7 +30,7 @@ INF = float("inf")
 HDR_BANDS = (("<1", 0.0, 1.0), ("1-10", 1.0, 10.0), ("10-100", 10.0, 100.0), ("100-203", 100.0, 203.0),
              (">203", 203.0, INF))
 SDR_BANDS = (("<1", 0.0, 1.0), ("1-10", 1.0, 10.0), ("10-100", 10.0, 100.0), (">100", 100.0, INF))
-SURVEY_SHARE = {"hdr": (0.519, 0.257, 0.179, 0.027, 0.018), "sdr": (0.33, 0.28, 0.38, 0.01)}
+SURVEY_SHARE = {"hdr": (0.419, 0.293, 0.228, 0.038, 0.022), "sdr": (0.330, 0.281, 0.358, 0.031)}
 NEUTRAL_TINT = 1.0          # a grey whose tint is under this (metric units) reads neutral
 HUE_NAMES = ("red", "orange", "yellow", "lime", "green", "spring", "cyan", "azure", "blue", "violet",
              "magenta", "rose")
