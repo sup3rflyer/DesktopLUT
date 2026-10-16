@@ -12,8 +12,10 @@
 #include "fald_panel.h"
 
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iterator>
+#include <utility>
 
 static const uint32_t FALD_MAGIC = 0x464C4431u;   // 'FLD1' (32-word header)
 static const uint32_t FALD_MAGIC2 = 0x464C4432u;  // 'FLD2' (40-word header: + pedestal colour, DLC export.py)
@@ -39,12 +41,32 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     std::ifstream f(path, std::ios::binary);
     if (!f) { err = "cannot open params file"; return false; }
     std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    if (buf.size() < 128) { err = "params file too short"; return false; }
-    const uint32_t* u = reinterpret_cast<const uint32_t*>(buf.data());
-    const float* fl = reinterpret_cast<const float*>(buf.data());
+    return ParseFaldPanelParams(buf.data(), buf.size(), out, err);
+}
+
+// out = FaldPanelParams{}, except that the three tables keep their allocations (emptied): a caller that parses into the
+// same object again (the DWM hook's spare in shared/fald_panel_live.cpp) reuses memory that is already faulted in.
+// Nothing of the previous file survives — the tables are empty, every other field is its default.
+static void ResetFaldPanelParams(FaldPanelParams& out) {
+    std::vector<float> curve = std::move(out.curve), kTrue = std::move(out.kTrue), kEst = std::move(out.kEst);
+    out = FaldPanelParams{};
+    curve.clear(); kTrue.clear(); kEst.clear();
+    out.curve = std::move(curve); out.kTrue = std::move(kTrue); out.kEst = std::move(kEst);
+}
+
+bool ParseFaldPanelParams(const void* data, size_t bytes, FaldPanelParams& out, std::string& err) {
+    ResetFaldPanelParams(out);
+    if (!data || bytes < 128) { err = "params file too short"; return false; }
+    // The image may sit at any alignment (a delivery block's payload, a file buffer): the header words are copied out
+    // once into an aligned array, the tables with memcpy below. Bit for bit what reading the words in place gives.
+    const size_t headerWordsMax = 104;   // FLD4, the longest header
+    uint32_t hw[headerWordsMax] = {};
+    std::memcpy(hw, data, (bytes < sizeof(hw) ? bytes : sizeof(hw)));
+    const uint32_t* u = hw;
+    const float* fl = reinterpret_cast<const float*>(hw);
     if (!FaldMagicKnown(u[0])) { err = "bad magic (expected FLD1, FLD2, FLD3 or FLD4)"; return false; }
     const size_t headerBytes = FaldHeaderBytes(u[0]);
-    if (buf.size() < headerBytes) { err = "params file too short"; return false; }
+    if (bytes < headerBytes) { err = "params file too short"; return false; }
     out.cols = u[1]; out.rows = u[2]; out.sub = u[3]; out.cellW = u[4]; out.cellH = u[5];
     out.originX = u[6]; out.originY = u[7];
     out.reachTrueC = u[8]; out.reachTrueR = u[9]; out.reachEstC = u[10]; out.reachEstR = u[11];
@@ -134,11 +156,11 @@ bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::st
     size_t nTrue = (size_t)out.sub * out.sub * (2 * out.reachTrueR + 1) * (2 * out.reachTrueC + 1);
     size_t nEst = (size_t)out.sub * out.sub * (2 * out.reachEstR + 1) * (2 * out.reachEstC + 1);
     size_t need = headerBytes + 4 * ((size_t)out.curveN + nTrue + nEst);
-    if (buf.size() != need) { err = "size mismatch (" + std::to_string(buf.size()) + " vs " + std::to_string(need) + ")"; return false; }
-    const float* p = reinterpret_cast<const float*>(buf.data() + headerBytes);
-    out.curve.assign(p, p + out.curveN); p += out.curveN;
-    out.kTrue.assign(p, p + nTrue); p += nTrue;
-    out.kEst.assign(p, p + nEst);
+    if (bytes != need) { err = "size mismatch (" + std::to_string(bytes) + " vs " + std::to_string(need) + ")"; return false; }
+    const unsigned char* p = static_cast<const unsigned char*>(data) + headerBytes;
+    out.curve.resize(out.curveN); std::memcpy(out.curve.data(), p, 4 * (size_t)out.curveN); p += 4 * (size_t)out.curveN;
+    out.kTrue.resize(nTrue);      std::memcpy(out.kTrue.data(), p, 4 * nTrue);              p += 4 * nTrue;
+    out.kEst.resize(nEst);        std::memcpy(out.kEst.data(), p, 4 * nEst);
     return true;
 }
 
