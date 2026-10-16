@@ -371,3 +371,32 @@ TEST_CASE("dlc live: colour by level (hue families along brightness)") {
     CHECK(r.points[1].Y == doctest::Approx(60.0f));
     CHECK(c.practical.families[1].thin);
 }
+
+TEST_CASE("dlc live: tone stages, gamut coverage, drift view, tone and tint readouts") {
+    LiveCharts c;
+    REQUIRE(ParseLiveCharts(R"({"live_schema": 1, "seq": 1,
+      "cie": {"points": [{"x": 0.31, "y": 0.33, "tx": 0.3127, "ty": 0.329, "de": 0.4, "jncd": 1.7}],
+              "coverage": {"target": 95.5, "p3": null}},
+      "stages_tone": [{"stage": "measure:raw", "points": [{"signal": 0.75, "Y": 70.1, "tY": 63.7, "dY": 10.0},
+                                                           {"signal": 0.25, "Y": 6.25, "tY": 5.68, "dY": 10.0},
+                                                           {"signal": null, "Y": 1.0}]},
+                      {"stage": "measure:verify", "points": [{"signal": 0.5, "Y": 26.1, "tY": 26.1, "dY": 0.0}]}],
+      "drift_view": {"noise_pct": 0.0142, "settled_at_s": 1936.7, "settled": false, "channel": "r", "slope_pct_per_10min": -0.68},
+      "practical": {"weighting": "survey", "bands": [], "tone": {"dark": -2.58, "n_dark": 10, "light": 0.9, "n_light": 7,
+                                                                 "tint_spread": 0.799}}})", c));
+    REQUIRE(c.cie.size() == 1);
+    CHECK(c.cie[0].jncd == doctest::Approx(1.7f));
+    CHECK(c.coverageTarget == doctest::Approx(95.5f));
+    CHECK(std::isnan(c.coverageP3));
+    REQUIRE(c.stagesTone.size() == 2);
+    CHECK(c.stagesTone[0].stage == "measure:raw");
+    REQUIRE(c.stagesTone[0].points.size() == 2);   // a point without its signal is dropped
+    CHECK(c.stagesTone[0].points[0].signal == doctest::Approx(0.25f));   // signal order
+    CHECK(c.driftView.noise == doctest::Approx(0.0142f));
+    CHECK(c.driftView.settledAtS == doctest::Approx(1936.7f));
+    CHECK(c.driftView.settled == 0);
+    CHECK(c.driftView.channel == "r");
+    CHECK(c.practical.toneDark == doctest::Approx(-2.58f));
+    CHECK(c.practical.nLight == 7);
+    CHECK(c.practical.tintSpread == doctest::Approx(0.799f));
+}

@@ -233,6 +233,23 @@ std::shared_ptr<dlc::LiveCharts> FakeCharts(bool hdr, int reads) {
         pr.worst[i].hueTo = turns[i];
     }
     pr.impactTotal = 0.21f;
+    pr.toneDark = hdr ? 2.4f : -1.1f;
+    pr.toneLight = hdr ? -0.8f : 0.3f;
+    pr.nDark = 6;
+    pr.nLight = 5;
+    pr.tintSpread = hdr ? 1.3f : 0.6f;
+    for (int st = 0; st < 2; st++) {   // a build's first and last pass
+        dlc::StageTone tone{ st == 0 ? "measure:raw" : "measure:verify", {} };
+        for (const dlc::GrayRow& g : c->gray)
+            tone.points.push_back({ g.signal, g.Y * (st == 0 ? 1.0f + 0.12f * std::sin(4.0f * g.signal) : 1.0f), g.tY,
+                                    st == 0 ? g.dY + 12.0f * std::sin(4.0f * g.signal) : g.dY });
+        c->stagesTone.push_back(tone);
+    }
+    c->coverageTarget = hdr ? 78.4f : 96.2f;
+    if (hdr) c->coverageP3 = 98.1f;
+    c->driftView.noise = 0.06f;
+    c->driftView.settledAtS = 1200.0f;
+    c->driftView.settled = 1;
     const char famKeys[6] = { 'R', 'Y', 'G', 'C', 'B', 'M' };
     const char* famNames[6] = { "red", "yellow", "green", "cyan", "blue", "magenta" };
     for (int f = 0; f < 6; f++) {
@@ -639,7 +656,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 if (shot.variant == 19 || shot.variant == 20) {
                     using K = ui::DlcChart;
                     const K picks[2][4] = { { K::Colours, K::Hues, K::Cie, K::Stability },
-                                            { K::Colours, K::Convergence, K::ToneError, K::Distribution } };
+                                            { K::ToneCurve, K::Colours, K::Cie, K::Stability } };
                     for (int i = 0; i < 4; i++) vs.dlc.tile[i] = (int)picks[shot.variant - 19][i];
                 }
                 if (shot.variant == 3 || shot.variant == 4) {

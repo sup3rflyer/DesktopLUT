@@ -462,9 +462,17 @@ std::string NitsText(float v) {
 std::vector<Tile> PracticalTiles(const dlc::Practical& pr, const dlc::Report* rep, bool hdr) {
     std::vector<Tile> t;
     const bool scored = std::isfinite(pr.contentScore);
-    t.push_back({ "SCORE", N2(scored ? pr.contentScore : pr.score), pr.contentWeighted ? "CONTENT" : "SURVEY", pal::Ink, 0u, 0.9f });
-    t.push_back({ "P95", rep ? N2(rep->verification.p95) : std::string("\xE2\x80\x94"),
-                  rep ? "MAX " + N2(rep->verification.max) : std::string(), pal::Ink, 0u, 0.9f });
+    t.push_back({ "SCORE", N2(scored ? pr.contentScore : pr.score),
+                  rep ? "P95 " + N2(rep->verification.p95) + "  MAX " + N2(rep->verification.max) : std::string(), pal::Ink, 0u, 1.1f });
+    // Tone: the mean error of the darks and of the lights (signal below / above half), %.
+    {
+        auto pct = [](float v) { return std::isfinite(v) ? Fmt("%+.1f", v) : std::string("\xE2\x80\x94"); };
+        const bool any = std::isfinite(pr.toneDark) || std::isfinite(pr.toneLight);
+        t.push_back({ "TONE", pct(pr.toneDark) + " / " + pct(pr.toneLight), "DARK / LIGHT %", any ? pal::Ink : pal::InkFaint, 0u, 1.2f, 15.0f });
+    }
+    // Tint: how far the greys' tint wanders across the ramp (1 is just visible).
+    t.push_back({ "TINT", N2(pr.tintSpread), "ACROSS GREYS",
+                  !std::isfinite(pr.tintSpread) ? pal::InkFaint : pr.tintSpread <= 1.0f ? pal::Fine : pal::Ink, 0u, 0.8f });
     if (!pr.worst.empty()) {
         const dlc::WorstRow& w = pr.worst.front();
         t.push_back({ "WORST", N2(w.de), w.desc, w.de > 3.0f ? pal::Alarm : pal::Ink, w.intended, 1.6f });
@@ -474,18 +482,23 @@ std::vector<Tile> PracticalTiles(const dlc::Practical& pr, const dlc::Report* re
     const dlc::PanelLimits& l = pr.limits;
     if (l.hasWhite) {
         std::string sub = NitsText(l.whiteY);
-        if (std::isfinite(l.whiteTargetY)) sub = Fmt(l.whiteY >= 100.0f ? "%.0f" : "%.1f", l.whiteY) + " / " + NitsText(l.whiteTargetY);
-        if (std::isfinite(l.whiteDe)) sub += "  \xC2\xB7  " + N2(l.whiteDe);
+        if (std::isfinite(l.whiteTargetY))
+            sub = Fmt(l.whiteY >= 100.0f ? "%.0f" : "%.1f", l.whiteY) + "/" + Fmt(l.whiteTargetY >= 100.0f ? "%.0f" : "%.1f", l.whiteTargetY) + " NIT";
+        if (std::isfinite(l.whiteDe)) sub += "  \xCE\x94" "E " + N2(l.whiteDe);
         t.push_back({ hdr ? "WHITE 203" : "WHITE", std::isfinite(l.whiteCct) ? Fmt("%.0f K", l.whiteCct) : std::string("\xE2\x80\x94"), sub, pal::Ink,
-                      0u, 1.3f });
+                      0u, 1.4f });
     } else {
-        t.push_back({ hdr ? "WHITE 203" : "WHITE", "\xE2\x80\x94", std::string(), pal::InkFaint, 0u, 1.3f });
+        t.push_back({ hdr ? "WHITE 203" : "WHITE", "\xE2\x80\x94", std::string(), pal::InkFaint, 0u, 1.4f });
     }
     std::string peakSub;
     if (std::isfinite(l.targetPeak)) peakSub = "TARGET " + Fmt("%.0f", l.targetPeak);
     if (std::isfinite(l.neutralPeak)) peakSub += (peakSub.empty() ? "" : "  ") + std::string("NEUTRAL ") + Fmt("%.0f", l.neutralPeak);
     t.push_back({ "PEAK", NitsText(l.peak), peakSub, pal::Ink, 0u, 1.6f });
-    t.push_back({ "BLACK", NitsText(l.black), std::string(), pal::Ink, 0u, 0.9f });
+    {   // the unit below the number: a black needs its decimals
+        std::string black = NitsText(l.black);
+        if (black.size() > 4 && black.compare(black.size() - 4, 4, " NIT") == 0) black.resize(black.size() - 4);
+        t.push_back({ "BLACK", black, std::isfinite(l.black) ? std::string("NIT") : std::string(), pal::Ink, 0u, 0.9f });
+    }
     return t;
 }
 

@@ -16,6 +16,7 @@ namespace ui {
 
 enum class DlcChart {
     Bands,          // ERROR BY LEVEL: content-weighted ΔE per luminance band, lightness vs colour share
+    ToneCurve,      // TONE CURVE: signal in, nits out — the target, the greys (first pass faint), the panel peak
     ToneError,      // TONE ERROR: luminance error % along the grey ramp (log nits), the 1-JND envelope
     GreyTint,       // GREY TINT: warm↔cool and green↔magenta of each grey, an exaggerated swatch ribbon
     Colours,        // COLOUR BY LEVEL: each hue family's brightness and saturation error along nits
@@ -23,7 +24,7 @@ enum class DlcChart {
     Hues,           // HUE ERROR: per hue sector, signed saturation (radial) and hue rotation (tangential)
     Stability,      // STABILITY: per-channel drift of the drift reference over the run
     BuildDelta,     // BUILD DELTA: band means at the first vs the last measured stage
-    Cie,            // CIE 1931: target gamut, measured corners, error vectors magnified ×k
+    Cie,            // CIE 1976 u'v': target and measured gamut, coverage, each patch coloured by its JNCD miss
     Distribution,   // ΔE CDF, weighted by content (patch count faint)
     Convergence,    // the 3D-LUT build's iterations and scored passes
     Count

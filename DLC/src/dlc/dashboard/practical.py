@@ -96,6 +96,103 @@ def signal_hue(sig: Optional[Sequence[float]]) -> tuple[Optional[int], float]:
     return int(((h * 360.0 + 15.0) % 360.0) // 30.0), s
 
 
+JNCD_UV = 0.004            # one just-noticeable colour difference in CIE 1976 u'v' (DisplayMate's yardstick)
+P3_D65 = ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060))
+
+
+def xy_to_uv(x: Optional[float], y: Optional[float]) -> Optional[tuple[float, float]]:
+    x, y = _f(x), _f(y)
+    if x is None or y is None:
+        return None
+    d = -2.0 * x + 12.0 * y + 3.0
+    return (4.0 * x / d, 9.0 * y / d) if d > 0 else None
+
+
+def jncd(x: Optional[float], y: Optional[float], tx: Optional[float], ty: Optional[float]) -> Optional[float]:
+    """The chromaticity miss in just-noticeable colour differences (u'v' distance / 0.004)."""
+    a, b = xy_to_uv(x, y), xy_to_uv(tx, ty)
+    if a is None or b is None:
+        return None
+    return math.hypot(a[0] - b[0], a[1] - b[1]) / JNCD_UV
+
+
+def _area(poly: Sequence[tuple[float, float]]) -> float:
+    s = 0.0
+    for i in range(len(poly)):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % len(poly)]
+        s += x0 * y1 - x1 * y0
+    return s / 2.0
+
+
+def _clip(subject: list[tuple[float, float]], clipper: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Sutherland–Hodgman: ``subject`` clipped by the convex polygon ``clipper`` (either winding)."""
+    sign = 1.0 if _area(clipper) >= 0 else -1.0
+    out = list(subject)
+    for i in range(len(clipper)):
+        a, b = clipper[i], clipper[(i + 1) % len(clipper)]
+        inside = lambda p: sign * ((b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0])) >= 0.0  # noqa: E731
+        src, out = out, []
+        for j in range(len(src)):
+            p, q = src[j], src[(j + 1) % len(src)]
+            if inside(q):
+                if not inside(p):
+                    out.append(_cross(p, q, a, b))
+                out.append(q)
+            elif inside(p):
+                out.append(_cross(p, q, a, b))
+        if not out:
+            break
+    return out
+
+
+def _cross(p, q, a, b) -> tuple[float, float]:
+    """Where segment p→q meets the line a→b."""
+    dx, dy = q[0] - p[0], q[1] - p[1]
+    ex, ey = b[0] - a[0], b[1] - a[1]
+    den = dx * ey - dy * ex
+    if den == 0:
+        return q
+    t = ((a[0] - p[0]) * ey - (a[1] - p[1]) * ex) / den
+    return (p[0] + t * dx, p[1] + t * dy)
+
+
+def coverage_uv(measured: Sequence[Sequence[float]], target: Sequence[Sequence[float]]) -> Optional[float]:
+    """How much of the ``target`` gamut triangle the ``measured`` one covers, in % of the target's u'v' area
+    (CIE 1976, as display reviews quote it)."""
+    m = [xy_to_uv(*p[:2]) for p in measured]
+    t = [xy_to_uv(*p[:2]) for p in target]
+    if any(v is None for v in m + t):
+        return None
+    ta = abs(_area(t))
+    if ta <= 0:
+        return None
+    return 100.0 * abs(_area(_clip(t, m))) / ta   # type: ignore[arg-type]
+
+
+def tone_and_tint(grays: Sequence[dict], *, peak: Optional[float], black: Optional[float]) -> dict:
+    """Two plain readouts from the fresh greys: the mean tone error (%) in the darks (signal < 0.5) and the lights,
+    and how far the greys' tint wanders across the ramp (the largest tint difference between two greys at 1 nit
+    or more, metric units — DisplayCAL's grey range). Greys at the panel's limits or below the meter floor are
+    left out."""
+    def usable(g: dict) -> bool:
+        ty = _f(g.get("tY")) or _f(g.get("Y"))
+        if ty is None or ty < 0.05:
+            return False
+        if peak is not None and ty > peak * 1.02:
+            return False
+        return not (black is not None and black > 0 and ty < 3.0 * black)
+    use = [g for g in grays if not g.get("carried") and usable(g)]
+    dark = [_f(g.get("dY")) for g in use if (_f(g.get("signal")) or 0.0) < 0.5 and _f(g.get("dY")) is not None]
+    light = [_f(g.get("dY")) for g in use if (_f(g.get("signal")) or 0.0) >= 0.5 and _f(g.get("dY")) is not None]
+    tints = [(_f(g.get("tw")), _f(g.get("tm"))) for g in use
+             if (_f(g.get("tY")) or _f(g.get("Y")) or 0.0) >= 1.0 and _f(g.get("tw")) is not None and _f(g.get("tm")) is not None]
+    spread = max((math.hypot(a[0] - b[0], a[1] - b[1]) for i, a in enumerate(tints) for b in tints[i + 1:]), default=None)
+    return {"dark": _r(sum(dark) / len(dark), 2) if dark else None, "n_dark": len(dark),
+            "light": _r(sum(light) / len(light), 2) if light else None, "n_light": len(light),
+            "tint_spread": _r(spread, 3)}
+
+
 def family_of(sig: Optional[Sequence[float]]) -> Optional[int]:
     """The intended colour's hue family — 0 red, 1 yellow, 2 green, 3 cyan, 4 blue, 5 magenta (60° each, centred
     on the primaries and secondaries); None for a grey."""
@@ -256,8 +353,12 @@ def summarize(points: Sequence[dict], grays: Sequence[dict], *, hdr: bool,
         "peak": _r(_f(top["Y"]), 1) if top else None,
         "target_peak": _r(_f(target_peak), 1),
         "neutral_peak": _r(max((_f(g["Y"]) for g in neutral), default=None), 1),
+        # The black: DLC's floor, else the darkest near-black grey (signal under 5 %) — never a mid grey that happens
+        # to be the darkest one measured.
         "black": _r(_f(black_floor) if _f(black_floor) is not None else
-                    (min((_f(g["Y"]) for g in fresh if (_f(g["Y"]) or 0) > 0), default=None)), 5),
+                    (min((_f(g["Y"]) for g in fresh
+                          if (_f(g["Y"]) or 0) > 0 and (_f(g.get("signal")) if _f(g.get("signal")) is not None else 1.0) < 0.05),
+                         default=None)), 5),
         "white": None if not white else {
             "Y": _r(_f(white.get("Y")), 1), "tY": _r(_f(white.get("tY")), 1), "de": _r(_f(white.get("de"))),
             "cct": _r(_f(white.get("cct")), 0), "duv": _r(_f(white.get("duv")), 4),
@@ -267,4 +368,5 @@ def summarize(points: Sequence[dict], grays: Sequence[dict], *, hdr: bool,
     return {"weighting": "content" if weighted else "survey", "bands": band_rows, "score": _r(score),
             "coverage": _r(cov_share, 4), "offset_L": _r(_wmean(bright)), "n": len(pts),
             "hues": hues, "worst": main, "worst_apart": apart, "impact_total": _r(impact_total, 5),
-            "limits": limits, "families": families}
+            "limits": limits, "families": families,
+            "tone": tone_and_tint(grays, peak=limits["peak"], black=limits["black"])}

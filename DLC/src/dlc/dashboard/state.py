@@ -1042,9 +1042,20 @@ class DashboardState:
             cw = self._content_weight(p.get("codes"))   # applied here: weights may land after the reads
             p["w"], p["crole"] = (cw[0], cw[1]) if cw else (None, None)
             p["zone"] = self._zone(p, tri, hdr, peak)
+            jn = _practical.jncd(p.get("x"), p.get("y"), p.get("tx"), p.get("ty"))
+            p["jncd"] = round(jn, 2) if jn is not None else None
             if p.get("sig") and not p.get("lsc"):
                 p["lsc"] = _lift_hex(p["sig"])
                 p["lmc"] = _lift_xy_hex(p.get("x"), p.get("y"))
+        measured = self._corner_primaries(stage)
+        target_prims = _REC2020_PRIMARIES if hdr else _SRGB_PRIMARIES
+        coverage = None
+        if measured and all(k in measured for k in ("r", "g", "b")):
+            mtri = [measured[k] for k in ("r", "g", "b")]
+            cov_t = _practical.coverage_uv(mtri, [target_prims[k] for k in ("r", "g", "b")])
+            cov_p3 = _practical.coverage_uv(mtri, _practical.P3_D65) if hdr else None
+            coverage = {"target": round(cov_t, 1) if cov_t is not None else None,
+                        "p3": round(cov_p3, 1) if cov_p3 is not None else None}
         return {
             "practical": self._practical_view(cie_points, gray, hdr=hdr, peak=peak),
             "stages_practical": self._stages_practical(hdr, peak),
@@ -1068,10 +1079,13 @@ class DashboardState:
                 # (post-MHC while profiling, verify once verified), matching the scatter — NOT the
                 # raw native gamut (which the OOG split below still uses). None until all three
                 # corners have an above-noise read.
-                "measured": self._corner_primaries(stage),
+                "measured": measured,
+                "coverage": coverage,   # % of the target (and, HDR, of P3) the measured gamut covers, u'v' area
                 "locus": [[round(x, 5), round(y, 5)] for (x, y) in planckian_locus_xy()],
             },
             "grayscale": gray,
+            "stages_tone": self._stages_tone(hdr, bal_white),
+            "drift_view": self._drift_view(hdr, white),
             "eotf": {
                 "kind": "pq" if hdr else "power",
                 "gamma": gamma,
@@ -1153,6 +1167,41 @@ class DashboardState:
             out.append({"stage": s, "score": v["score"], "n": v["n"], "weighting": v["weighting"],
                         "bands": [b["mean"] for b in v["bands"]]})
         return out
+
+    def _stages_tone(self, hdr: bool, bal_white: tuple) -> list[dict[str, Any]]:
+        """The first and the last measured stage's greys (fresh reads, at least three) — the before / after of the
+        tone curve. One entry when the run measured greys in one stage only."""
+        out = []
+        for s in self._stage_seq:
+            rows = [g for g in self._gray_rows(self._gray_by_stage.get(s, {}), hdr=hdr, bal_white=bal_white)
+                    if not g.get("carried") and g.get("Y") is not None]
+            if len(rows) >= 3:
+                out.append({"stage": s, "points": [{"signal": g["signal"], "Y": g["Y"], "tY": g.get("tY"),
+                                                    "dY": g.get("dY")} for g in rows]})
+        return [out[0], out[-1]] if len(out) >= 2 else out
+
+    def _drift_view(self, hdr: bool, white: Optional[list]) -> dict[str, Any]:
+        """The stability chart's frame, kept with the run's record: the meter's noise on the drift reference (a
+        robust σ from successive re-reads, %), when the panel first counted as settled (the warm-up rule: the
+        fastest channel's slope over the trailing window under the threshold, within one segment), and the final
+        verdict."""
+        drift = self._channel_drift(hdr, white)
+        diffs = [abs(b[c] - a[c]) for a, b in zip(drift, drift[1:]) if a["seg"] == b["seg"] for c in ("r", "g", "b")]
+        noise = (1.4826 * _median(diffs) / math.sqrt(2.0)) if len(diffs) >= 6 else None
+        settled_at = None
+        for i, p in enumerate(drift):
+            win = [q for q in drift[:i + 1] if q["seg"] == p["seg"] and q["elapsed_s"] >= p["elapsed_s"] - _SETTLE_WINDOW_S]
+            span_min = (win[-1]["elapsed_s"] - win[0]["elapsed_s"]) / 60.0 if len(win) >= 2 else 0.0
+            if span_min < _SETTLE_WINDOW_S / 120.0:   # half the window at least: two quick reads say nothing
+                continue
+            slope = max(abs(win[-1][c] - win[0][c]) / span_min * 10.0 for c in ("r", "g", "b"))
+            if slope < _SETTLE_SLOPE_PCT_PER_10MIN:
+                settled_at = p["elapsed_s"]
+                break
+        verdict = self._warmup_view()
+        return {"noise_pct": round(noise, 4) if noise is not None else None, "settled_at_s": settled_at,
+                "settled": verdict.get("settled"), "channel": verdict.get("channel"),
+                "slope_pct_per_10min": verdict.get("slope_pct_per_10min")}
 
     def _offenders(self, cie_points) -> list[dict[str, Any]]:
         """Worst fresh reads this stage, flagged by target reachability (F4): ``oog`` mirrors

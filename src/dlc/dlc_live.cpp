@@ -212,6 +212,13 @@ void ParsePractical(const JsonValue& pr, Practical& out) {
             l.whiteDY = F(Num(w, "dY"));
         }
     }
+    if (const JsonValue* tone = Obj(&pr, "tone")) {
+        out.toneDark = F(Num(tone, "dark"));
+        out.toneLight = F(Num(tone, "light"));
+        out.nDark = Int(tone, "n_dark", 0);
+        out.nLight = Int(tone, "n_light", 0);
+        out.tintSpread = F(Num(tone, "tint_spread"));
+    }
     if (const JsonValue* c = Obj(&pr, "content")) {
         out.contentClass = Str(c, "class");
         out.contentScore = F(Num(c, "score"));
@@ -401,6 +408,10 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
         out.gamutLabel = Str(cie, "gamut_label");
         Primaries(Obj(cie, "primaries"), out.primaries);
         out.hasMeasuredPrimaries = Primaries(Obj(cie, "measured"), out.measuredPrimaries);
+        if (const JsonValue* cov = Obj(cie, "coverage")) {
+            out.coverageTarget = F(Num(cov, "target"));
+            out.coverageP3 = F(Num(cov, "p3"));
+        }
         Xy(Arr(cie, "white"), out.white);
         if (const JsonValue* pts = Arr(cie, "points")) {
             out.cie.reserve(pts->arr.size());
@@ -423,6 +434,7 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
                 c.zone = ZoneOf(Str(&p, "zone"));
                 c.liftIntended = Hex(Str(&p, "lsc"));
                 c.liftMeasured = Hex(Str(&p, "lmc"));
+                c.jncd = F(Num(&p, "jncd"));
                 out.cie.push_back(std::move(c));
             }
         }
@@ -487,6 +499,29 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
         }
     }
     if (const JsonValue* pr = Obj(&root, "practical")) ParsePractical(*pr, out.practical);
+    if (const JsonValue* st = Arr(&root, "stages_tone")) {
+        for (const JsonValue& s : st->arr) {
+            if (s.type != JsonValue::Obj) continue;
+            StageTone tone{ Str(&s, "stage"), {} };
+            if (const JsonValue* pts = Arr(&s, "points")) {
+                for (const JsonValue& p : pts->arr) {
+                    const double sig = Num(&p, "signal"), y = Num(&p, "Y");
+                    if (!std::isfinite(sig) || !std::isfinite(y)) continue;
+                    tone.points.push_back({ F(sig), F(y), F(Num(&p, "tY")), F(Num(&p, "dY")) });
+                }
+            }
+            std::sort(tone.points.begin(), tone.points.end(), [](const TonePoint& a, const TonePoint& b) { return a.signal < b.signal; });
+            out.stagesTone.push_back(std::move(tone));
+        }
+    }
+    if (const JsonValue* dv = Obj(&root, "drift_view")) {
+        out.driftView.noise = F(Num(dv, "noise_pct"));
+        out.driftView.settledAtS = F(Num(dv, "settled_at_s"));
+        const JsonValue* settled = dv->find("settled");
+        out.driftView.settled = settled && settled->type == JsonValue::Bool ? (settled->b ? 1 : 0) : -1;
+        out.driftView.channel = Str(dv, "channel");
+        out.driftView.slope = F(Num(dv, "slope_pct_per_10min"));
+    }
     if (const JsonValue* stages = Arr(&root, "stages_practical")) {
         for (const JsonValue& s : stages->arr) {
             if (s.type != JsonValue::Obj) continue;

@@ -159,3 +159,52 @@ def test_worst_rows_carry_signed_components_and_hue_direction():
     assert top["hue_to"] == "yellow"
     assert v["worst"][0]["hue_to"] is None                                          # a grey has no hue to turn
     assert v["impact_total"] == pytest.approx(7.4 * 0.004 + 1.0 * 0.996, abs=1e-4)
+
+
+def test_uv_distance_and_gamut_coverage():
+    from dlc.dashboard.practical import P3_D65, coverage_uv, jncd, xy_to_uv
+    u, v = xy_to_uv(0.3127, 0.3290)
+    assert u == pytest.approx(0.1978, abs=1e-4) and v == pytest.approx(0.4683, abs=1e-4)   # D65
+    assert jncd(0.3127, 0.3290, 0.3127, 0.3290) == pytest.approx(0.0)
+    r709 = ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06))
+    r2020 = ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046))
+    assert coverage_uv(r2020, r709) == pytest.approx(100.0)                  # the wider gamut covers all of the narrower
+    assert coverage_uv(P3_D65, r2020) == pytest.approx(72.8, abs=0.3)        # P3 is about 73 % of Rec.2020 in u'v'
+    assert coverage_uv(r709, P3_D65) == pytest.approx(79.6, abs=0.3)
+    assert coverage_uv(r709[::-1], r2020) == pytest.approx(coverage_uv(r709, r2020))   # either winding
+
+
+def test_tone_halves_and_tint_spread():
+    from dlc.dashboard.practical import tone_and_tint
+    greys = [{"signal": 0.2, "Y": 1.1, "tY": 1.0, "dY": 10.0, "tw": 0.5, "tm": 0.0},
+             {"signal": 0.3, "Y": 5.0, "tY": 5.0, "dY": -2.0, "tw": -0.5, "tm": 0.0},
+             {"signal": 0.8, "Y": 300.0, "tY": 300.0, "dY": 1.0, "tw": 0.0, "tm": 0.2},
+             {"signal": 0.95, "Y": 900.0, "tY": 1500.0, "dY": -40.0, "tw": 0.0, "tm": 3.0},   # past the peak: out
+             {"signal": 0.05, "Y": 0.02, "tY": 0.01, "dY": 100.0, "tw": 0.0, "tm": 0.0},      # below the meter floor: out
+             {"signal": 0.4, "Y": 50.0, "tY": 50.0, "dY": 9.0, "carried": True}]                # an earlier stage: out
+    t = tone_and_tint(greys, peak=900.0, black=0.002)
+    assert (t["dark"], t["n_dark"]) == (pytest.approx(4.0), 2)
+    assert (t["light"], t["n_light"]) == (pytest.approx(1.0), 1)
+    assert t["tint_spread"] == pytest.approx(1.0)                            # (0.5, 0) against (-0.5, 0)
+
+
+def test_fold_publishes_tone_stages_coverage_and_drift_view():
+    s = DashboardState()
+    s.ingest(Event(level="INFO", stage="run", event="run_header",
+                   data={"mode": "SDR", "luminance": 120.0, "gamma": 2.2, "flow": "full"}))
+    seq = 0
+    for stage, gain in (("measure:raw", 1.1), ("measure:verify", 1.0)):
+        s.ingest(Event(level="INFO", stage=stage, event="stage_start"))
+        for sig in (0.25, 0.5, 0.75):
+            seq += 1
+            s.ingest(Event(level="INFO", stage=stage, event="patch_read", tier="stream",
+                           data={"seq": seq, "role": "measurement", "label": f"G{sig}", "rgb": [round(sig * 255)] * 3,
+                                 "signal": [sig, sig, sig], "Y": 120.0 * sig ** 2.2 * gain,
+                                 "xy": [0.3127, 0.3290], "ok": True}))
+    c = s.charts()
+    assert [t["stage"] for t in c["stages_tone"]] == ["measure:raw", "measure:verify"]
+    assert len(c["stages_tone"][0]["points"]) == 3
+    assert c["cie"]["points"][0]["jncd"] == pytest.approx(0.0, abs=0.05)
+    assert "coverage" in c["cie"] and "drift_view" in c
+    assert c["drift_view"]["noise_pct"] is None                              # no drift checkpoints in this run
+    assert c["practical"]["tone"]["n_light"] + c["practical"]["tone"]["n_dark"] == 3

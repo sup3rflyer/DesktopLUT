@@ -119,6 +119,7 @@ struct CiePoint {
     float w = (float)kNaN;                          // content weight (content-sampled sets)
     Zone zone = Zone::Core;
     uint32_t liftIntended = 0, liftMeasured = 0;    // lightness-lifted swatches (hue visible on a dark theme)
+    float jncd = (float)kNaN;                       // the chromaticity miss in just-noticeable differences (u'v' / 0.004)
 };
 struct GrayRow {
     float signal, Y, cct, duv, de, r, g, b;
@@ -171,9 +172,21 @@ struct Practical {
     float impactTotal = (float)kNaN;       // the sum of content x error over every core patch (worst rows' share of it)
     PanelLimits limits;
     std::string contentClass;              // e.g. seq_hdr_balanced
+    float toneDark = (float)kNaN, toneLight = (float)kNaN;   // mean tone error %, signal < 0.5 / >= 0.5
+    int nDark = 0, nLight = 0;
+    float tintSpread = (float)kNaN;        // the largest tint difference between two greys >= 1 nit (metric units)
     float contentScore = (float)kNaN;      // DLC's scored content-weighted ΔE
 };
 struct StagePractical { std::string stage; float score; int n; std::vector<float> bands; };
+struct TonePoint { float signal, Y, tY, dY; };
+struct StageTone { std::string stage; std::vector<TonePoint> points; };   // a stage's fresh greys
+struct DriftView {
+    float noise = (float)kNaN;             // the meter's noise on the drift reference, % (robust sigma)
+    float settledAtS = (float)kNaN;        // when the panel first counted as settled (run seconds)
+    int settled = -1;                      // the final verdict: -1 unknown, 0 still moving, 1 settled
+    std::string channel;
+    float slope = (float)kNaN;             // % per 10 min, the fastest channel
+};
 
 struct LiveCharts {
     bool present = false;
@@ -200,6 +213,9 @@ struct LiveCharts {
     std::vector<DriftPoint> drift;           // channel drift (% from each segment's first checkpoint)
     Practical practical;
     std::vector<StagePractical> stages;      // each measurement stage's band means (a build's before / after)
+    std::vector<StageTone> stagesTone;       // the first and the last stage's greys (one entry: one stage)
+    float coverageTarget = (float)kNaN, coverageP3 = (float)kNaN;   // % of the target / P3 gamut covered, u'v'
+    DriftView driftView;
 };
 bool ParseLiveCharts(const std::string& json, LiveCharts& out);
 
