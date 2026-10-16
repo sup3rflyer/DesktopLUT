@@ -4,15 +4,19 @@
 #include "ui_kit.h"
 #include "ui_model.h"
 #include "ui_window.h"
+#include "actions/actions.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
 #include "globals.h"
+#include "settings.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace ui {
 
@@ -531,12 +535,15 @@ std::array<DlcChart, 4> DefaultTiles(const dlc::LiveCharts& c, bool live) {
 // One tile: the chart picker, FULL / TILES, the chart. A double-click on the chart does what FULL / TILES does.
 void ChartTile(ViewState& vs, int i, DlcChart k, const dlc::LiveCharts* c, bool hdr, ImVec2 ta, ImVec2 tb, const char* emptyText,
                const ChartContext& ctx) {
-    constexpr float kMaxBtnW = 60.0f;
+    constexpr float kMaxBtnW = 60.0f, kOptBtnW = 28.0f;
     const float tw = tb.x - ta.x;
     const bool full = vs.dlc.maximized == i;
+    const int tileBefore = vs.dlc.tile[i];
+    uint8_t optsBefore[kDlcChartMaxOptions];
+    std::memcpy(optsBefore, vs.dlc.opt[(int)k], sizeof(optsBefore));
     ImGui::PushID(i);
     ImGui::SetCursorScreenPos(ta);
-    const float ddW = (tw - Px(kMaxBtnW) - Px(8)) / Dpi();
+    const float ddW = (tw - Px(kMaxBtnW) - Px(kOptBtnW) - Px(14)) / Dpi();
     const int pick = vs.dlc.tile[i];
     const ImVec2 ha(ta.x, ta.y), hb(ta.x + Px(ddW), ta.y + Snap(Px(kTileHeadH)));
     const bool headHover = ImGui::IsMouseHoveringRect(ha, hb) && ImGui::IsWindowHovered();
@@ -556,16 +563,75 @@ void ChartTile(ViewState& vs, int i, DlcChart k, const dlc::LiveCharts* c, bool 
         const int at = (int)(std::find(order.begin(), order.end(), pick < 0 ? -1 : pick) - order.begin());
         vs.dlc.tile[i] = order[(size_t)std::clamp(at + wheel, 0, (int)order.size() - 1)];
     }
+    // The chart's options: what it shows or hides, and its views. The button's mark is solid while any differ from
+    // the defaults.
+    int nOpt = 0;
+    const DlcChartOption* opts = DlcChartOptions(k, nOpt);
+    uint8_t* ov = vs.dlc.opt[(int)k];
+    bool custom = false;
+    for (int o = 0; o < nOpt && o < kDlcChartMaxOptions; o++) custom |= ov[o] != 0;
+    const ImVec2 ob(Snap(tb.x - Px(kMaxBtnW) - Px(6) - Px(kOptBtnW)), ta.y);
+    ImGui::SetCursorScreenPos(ob);
+    ImGui::BeginDisabled(nOpt == 0);
+    if (Button("##opts", "", kOptBtnW) || vs.dlc.openOptions == i) ImGui::OpenPopup("##optmenu");
+    if (vs.dlc.openOptions == i) vs.dlc.openOptions = -1;
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) ImGui::SetTooltip(nOpt ? "Show or hide parts of this chart." : "Nothing to set.");
+    {   // the mark: three slider lines, their knobs set at different places
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const float cx = ob.x + Px(kOptBtnW) * 0.5f, cy = ob.y + Px(kControlH) * 0.5f, hw = Px(6.0f);
+        const ImU32 col = Col(nOpt == 0 ? pal::InkFaint : custom ? pal::Ink : pal::InkDim);
+        const float knob[3] = { -2.5f, 2.5f, -0.5f };
+        for (int r = 0; r < 3; r++) {
+            const float y = Snap(cy + (float)(r - 1) * Px(4.0f));
+            dl->AddRectFilled(ImVec2(Snap(cx - hw), y), ImVec2(Snap(cx + hw), y + 1), col);
+            const float kx = Snap(cx + Px(knob[r]));
+            if (custom) dl->AddRectFilled(ImVec2(kx - Px(1.5f), y - Px(1.5f)), ImVec2(kx + Px(1.5f), y + Px(2.5f)), col);
+            else dl->AddRect(ImVec2(kx - Px(1.5f), y - Px(1.5f)), ImVec2(kx + Px(1.5f), y + Px(2.5f)), col);
+        }
+    }
+    // Under the button when the menu fits below it, else above it.
+    float menuH = Px(8) + Px(kControlH) + Px(9);   // padding, DEFAULTS, the rule
+    for (int o = 0; o < nOpt && o < kDlcChartMaxOptions; o++)
+        menuH += opts[o].choices ? Px(20) + (float)opts[o].nChoices * Snap(Px(kControlH)) : Snap(Px(kControlH));
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const bool above = ob.y + Px(kControlH) + Px(2) + menuH > vp->WorkPos.y + vp->WorkSize.y - Px(8);
+    const ImVec2 anchor(ob.x + Px(kOptBtnW), above ? ob.y - Px(2) : ob.y + Px(kControlH) + Px(2));
+    if (BeginOptionsMenu("##optmenu", anchor, 230.0f, above)) {
+        for (int o = 0; o < nOpt && o < kDlcChartMaxOptions; o++) {
+            const DlcChartOption& op = opts[o];
+            const int cur = ov[o] ? ov[o] - 1 : op.def;
+            if (op.choices) {
+                OptionsHeader(op.label);
+                for (int ch = 0; ch < op.nChoices; ch++)
+                    if (OptionsRow(op.choices[ch], cur == ch, true)) ov[o] = ch == op.def ? 0 : (uint8_t)(ch + 1);
+            } else if (OptionsRow(op.label, cur != 0, false)) {
+                const int next = cur ? 0 : 1;
+                ov[o] = next == op.def ? 0 : (uint8_t)(next + 1);
+            }
+        }
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        Hairline(pal::Rule);
+        ImGui::Dummy(ImVec2(0, Px(4)));
+        ImGui::BeginDisabled(!custom);
+        if (DropdownItem("DEFAULTS", false))   // an action, not a setting: it closes the menu
+            for (int o = 0; o < kDlcChartMaxOptions; o++) ov[o] = 0;
+        ImGui::EndDisabled();
+        EndOptionsMenu();
+    }
     ImGui::SetCursorScreenPos(ImVec2(Snap(tb.x - Px(kMaxBtnW)), ta.y));
     if (Button("##full", full ? "TILES" : "FULL", kMaxBtnW)) vs.dlc.maximized = full ? -1 : i;
     if (ImGui::IsItemHovered()) ImGui::SetTooltip(full ? "Back to four charts." : "This chart over the whole area.");
     ImGui::PopID();
+    if (vs.dlc.tile[i] != tileBefore || std::memcmp(optsBefore, ov, sizeof(optsBefore)) != 0) vs.dlc.dirty = true;
     const ImVec2 pa(ta.x, ta.y + Snap(Px(kTileHeadH)) + Snap(Px(6))), pb = tb;
     if (!c || !c->present) {
         DrawFieldBox(ImGui::GetWindowDrawList(), pa, pb);
         DrawTextIn(ImGui::GetWindowDrawList(), Font::Label, kSizeLabel, pa, pb, pal::InkFaint, emptyText);
     } else {
-        DrawDlcChart(k, *c, pa, pb, ctx);
+        ChartContext tctx = ctx;
+        tctx.opts = ov;
+        DrawDlcChart(k, *c, pa, pb, tctx);
         if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && ImGui::IsMouseHoveringRect(pa, pb) && ImGui::IsWindowHovered())
             vs.dlc.maximized = full ? -1 : i;
     }
@@ -857,6 +923,74 @@ std::string ReportLabel(const dlc::Report& r) {
 
 }  // namespace
 
+// The saved form of the tile picks and chart options ([UI] DlcCharts), by stable names so a reordered chart list
+// keeps them: "t=auto,tone_curve,auto,worst;o=cie.diagram:0,cie.patches:0". Empty when everything is a default.
+std::wstring EncodeDlcCharts(const DlcView& v) {
+    std::string t, o;
+    bool anyTile = false;
+    for (int i = 0; i < 4; i++) {
+        const int k = v.tile[i];
+        const char* key = k >= 0 && k < (int)DlcChart::Count ? DlcChartKey((DlcChart)k) : nullptr;
+        t += (i ? "," : "") + std::string(key ? key : "auto");
+        anyTile |= key != nullptr;
+    }
+    for (int k = 0; k < (int)DlcChart::Count && k < 16; k++) {
+        int n = 0;
+        const DlcChartOption* opts = DlcChartOptions((DlcChart)k, n);
+        for (int i = 0; i < n && i < kDlcChartMaxOptions; i++)
+            if (v.opt[k][i]) o += (o.empty() ? "" : ",") + std::string(DlcChartKey((DlcChart)k)) + "." + opts[i].key + ":" + std::to_string(v.opt[k][i] - 1);
+    }
+    if (!anyTile && o.empty()) return std::wstring();
+    std::string s = "t=" + t;
+    if (!o.empty()) s += ";o=" + o;
+    return Wide(s.c_str());
+}
+
+void DecodeDlcCharts(const std::wstring& w, DlcView& v) {
+    const std::string s = Utf8(w);
+    auto chartOf = [](const std::string& key) {
+        for (int k = 0; k < (int)DlcChart::Count; k++) if (key == DlcChartKey((DlcChart)k)) return k;
+        return -1;
+    };
+    size_t pos = 0;
+    while (pos < s.size()) {
+        size_t end = s.find(';', pos);
+        if (end == std::string::npos) end = s.size();
+        const std::string part = s.substr(pos, end - pos);
+        pos = end + 1;
+        if (part.rfind("t=", 0) == 0) {
+            size_t p = 2;
+            for (int i = 0; i < 4 && p <= part.size(); i++) {
+                size_t e = part.find(',', p);
+                if (e == std::string::npos) e = part.size();
+                v.tile[i] = chartOf(part.substr(p, e - p));   // "auto" or unknown: the default
+                p = e + 1;
+            }
+        } else if (part.rfind("o=", 0) == 0) {
+            size_t p = 2;
+            while (p < part.size()) {
+                size_t e = part.find(',', p);
+                if (e == std::string::npos) e = part.size();
+                const std::string item = part.substr(p, e - p);   // chart.option:value
+                p = e + 1;
+                const size_t dot = item.find('.'), colon = item.find(':');
+                if (dot == std::string::npos || colon == std::string::npos || colon < dot) continue;
+                const int k = chartOf(item.substr(0, dot));
+                if (k < 0 || k >= 16) continue;
+                int n = 0;
+                const DlcChartOption* opts = DlcChartOptions((DlcChart)k, n);
+                const std::string okey = item.substr(dot + 1, colon - dot - 1);
+                const int val = std::atoi(item.c_str() + colon + 1);
+                for (int i = 0; i < n && i < kDlcChartMaxOptions; i++) {
+                    if (okey != opts[i].key) continue;
+                    const int top = opts[i].choices ? opts[i].nChoices - 1 : 1;
+                    if (val >= 0 && val <= top && val != opts[i].def) v.opt[k][i] = (uint8_t)(val + 1);
+                }
+            }
+        }
+    }
+}
+
 Light DlcRunLight(const Snapshot& snap) {
     const dlc::Live& L = RunOf(snap);
     if (!InProgress(L.phase) && L.phase != dlc::RunPhase::Failed) return Light::None;
@@ -881,6 +1015,10 @@ bool DlcRunBadge(const Snapshot& snap, const DisplayRow& r, std::string& text, I
 }
 
 void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
+    if (!vs.dlc.loaded) {   // the viewer's tile picks and chart options from last time
+        DecodeDlcCharts(g_uiDlcCharts, vs.dlc);
+        vs.dlc.loaded = true;
+    }
     const DisplayRow* sel = SelectedDisplay(snap, vs);
     const ImVec2 body(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
     const float bodyH = PageFooterTop() - body.y;
@@ -1087,6 +1225,10 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         EndPanel();
     }
     ImGui::EndChild();
+    if (vs.dlc.dirty) {   // the viewer changed a chart pick or option: keep it for next time
+        vs.dlc.dirty = false;
+        act::SetUiDlcCharts(EncodeDlcCharts(vs.dlc));
+    }
 }
 
 }  // namespace ui

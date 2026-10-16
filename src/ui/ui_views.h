@@ -37,6 +37,10 @@ struct DlcView {
     std::wstring pick;                     // the record shown: a report.json path, kDlcPickLive, kDlcPickStack, or empty = automatic
     int tile[4] = { -1, -1, -1, -1 };      // the chart in each tile (DlcChart); -1 = the default for the stage
     int maximized = -1;                    // the tile shown alone over the whole chart area; -1 = the four tiles
+    uint8_t opt[16][8] = {};               // per chart (DlcChart): each option's value + 1; 0 = the chart's default
+    bool loaded = false;                   // tile picks and options read from the saved settings ([UI] DlcCharts)
+    bool dirty = false;                    // the viewer changed a pick or an option: save them
+    int openOptions = -1;                  // a tile whose options menu opens on the next frame (the UI shots)
 };
 inline const wchar_t* const kDlcPickLive = L"<live>";
 inline const wchar_t* const kDlcPickStack = L"<stack>";   // what the display runs now: its layers and their verification

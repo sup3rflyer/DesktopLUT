@@ -865,6 +865,8 @@ void ParseVrrWhitelist() {
 }
 
 // Read potentially long INI strings with expanding buffer (avoids truncation)
+std::wstring g_uiDlcCharts;
+
 static std::wstring ReadLongINIString(const wchar_t* section, const wchar_t* key, const wchar_t* path) {
     DWORD size = 1024;
     std::wstring buf(size, L'\0');
@@ -1198,6 +1200,7 @@ void SaveSettings() {
     IniWriteString(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
     static const wchar_t* const kThemeKeys[] = { L"dark", L"gray", L"light" };
     IniWriteString(L"UI", L"Theme", kThemeKeys[g_uiTheme >= 0 && g_uiTheme <= 2 ? g_uiTheme : 0], iniPath.c_str());
+    IniWriteString(L"UI", L"DlcCharts", g_uiDlcCharts.empty() ? nullptr : g_uiDlcCharts.c_str(), iniPath.c_str());
 
     // Save per-display settings: live displays and parked (currently disconnected) ones,
     // each under its identity-keyed [Display<slot>] section. Written from a snapshot taken
@@ -1290,6 +1293,7 @@ bool LoadSettings() {
         buf[0] = 0;
         GetPrivateProfileStringW(L"UI", L"Theme", L"dark", buf, MAX_PATH, iniPath.c_str());
         g_uiTheme = _wcsicmp(buf, L"gray") == 0 ? 1 : (_wcsicmp(buf, L"light") == 0 ? 2 : 0);   // unknown -> dark
+        g_uiDlcCharts = ReadLongINIString(L"UI", L"DlcCharts", iniPath.c_str());
     }
 
     // Per-display settings: read every saved display into the parked pool, then attach

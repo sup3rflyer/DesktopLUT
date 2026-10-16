@@ -83,6 +83,7 @@ void SetGammaWhitelist(const std::wstring& raw);
 void SetVrrWhitelist(const std::wstring& raw);
 void SetDlcFolder(const std::wstring& folder);   // empty = detect next to DesktopLUT
 void SetUiTheme(int theme);                     // 0 dark, 1 gray, 2 light (the interface applies it)
+void SetUiDlcCharts(const std::wstring& encoded);   // the DLC tab's chart picks and options ([UI] DlcCharts)
 void SetRecalReminderDays(int days);             // 0 = off
 
 // ---- Live layers -----------------------------------------------------------------------------------

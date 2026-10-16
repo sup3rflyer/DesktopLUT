@@ -784,6 +784,63 @@ void EndDropdown() {
     ImGui::EndPopup();
 }
 
+bool BeginOptionsMenu(const char* id, ImVec2 anchor, float widthDip, bool above) {
+    ImGui::SetNextWindowPos(anchor, ImGuiCond_Always, ImVec2(1.0f, above ? 1.0f : 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(Px(widthDip), 0.0f), ImVec2(Px(widthDip) * 1.5f, Px(520)));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, pal::Menu);
+    ImGui::PushStyleColor(ImGuiCol_Border, Shape().bevel ? pal::BevelDark : pal::ControlEdge);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(2), Px(4)));
+    const bool shown = ImGui::BeginPopup(id, ImGuiWindowFlags_NoMove);
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor(2);
+    if (shown) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    return shown;
+}
+
+void OptionsHeader(const char* label) {
+    const float w = ImGui::GetContentRegionAvail().x, h = Snap(Px(20));
+    const ImVec2 a = SnapV(ImGui::GetCursorScreenPos());
+    DrawText(ImGui::GetWindowDrawList(), Font::Label, 10.0f, a.x + Px(8), a.y + h * 0.6f, pal::InkFaint, label);
+    ImGui::Dummy(ImVec2(w, h));
+}
+
+bool OptionsRow(const char* label, bool on, bool radio) {
+    const float w = ImGui::GetContentRegionAvail().x, h = Snap(Px(kControlH));
+    const ImVec2 a = SnapV(ImGui::GetCursorScreenPos()), b(a.x + w, a.y + h);
+    ImGui::PushID(label);
+    ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(0, 0, 0, 0));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(0, 0, 0, 0));
+    const bool clicked = ImGui::Selectable("##row", false, ImGuiSelectableFlags_NoAutoClosePopups, ImVec2(w, h));
+    ImGui::PopStyleColor(3);
+    const bool hovered = ImGui::IsItemHovered();
+    ImGui::PopID();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImU32 text = pal::Ink, mark = pal::InkDim;
+    if (hovered && Shape().bevel) {   // Windows 98 lists highlight what the pointer is on
+        Fill(dl, a, b, pal::ListSel);
+        text = mark = pal::ListSelInk;
+    } else if (hovered) {
+        Fill(dl, a, b, pal::Hover);
+    }
+    const float s = Snap(Px(10)), cx = Snap(a.x + Px(10) + s * 0.5f), cy = Snap((a.y + b.y) * 0.5f);
+    if (radio) {
+        dl->AddCircle(ImVec2(cx, cy), s * 0.5f, Col(mark), 16, 1.0f);
+        if (on) dl->AddCircleFilled(ImVec2(cx, cy), s * 0.25f, Col(text), 12);
+    } else {
+        const ImVec2 ba(Snap(cx - s * 0.5f), Snap(cy - s * 0.5f)), bb(ba.x + s, ba.y + s);
+        dl->AddRect(ba, bb, Col(mark));
+        if (on) dl->AddRectFilled(ImVec2(ba.x + Px(2), ba.y + Px(2)), ImVec2(bb.x - Px(2), bb.y - Px(2)), Col(text));
+    }
+    DrawText(dl, Font::Label, kSizeLabel, a.x + Px(28), cy, on || (hovered && Shape().bevel) ? text : pal::InkDim, label);
+    return clicked;
+}
+
+void EndOptionsMenu() {
+    ImGui::PopStyleVar();
+    ImGui::EndPopup();
+}
+
 // ---- Panels --------------------------------------------------------------------------------------
 
 namespace {

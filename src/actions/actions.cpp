@@ -646,6 +646,11 @@ void SetUiTheme(int theme) {
     SaveSettings();
 }
 
+void SetUiDlcCharts(const std::wstring& encoded) {
+    g_uiDlcCharts = encoded;
+    SaveSettings();
+}
+
 void SetRecalReminderDays(int days) {
     g_recalReminderDays = days < 0 ? 0 : (days > 3650 ? 3650 : days);
     SaveSettings();

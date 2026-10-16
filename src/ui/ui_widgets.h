@@ -114,6 +114,14 @@ bool BeginDropdown(const char* id, const char* preview, float widthDip, int* whe
 bool DropdownItem(const char* label, bool selected);
 void EndDropdown();
 
+// A small menu of on / off rows and choices (a chart's options), opened with ImGui::OpenPopup(id) from a button; its top
+// right corner sits at `anchor` (its bottom right with `above`). Rows do not close it: the viewer can flip several in
+// one go.
+bool BeginOptionsMenu(const char* id, ImVec2 anchor, float widthDip, bool above = false);
+void OptionsHeader(const char* label);                      // a caps heading over a group of choices
+bool OptionsRow(const char* label, bool on, bool radio);    // a check box (or a radio dot) row; true when clicked
+void EndOptionsMenu();
+
 // ---- Panels --------------------------------------------------------------------------------------
 
 // A titled surface. sizePx.x <= 0: the space left on the line; sizePx.y <= 0: fits its content (no

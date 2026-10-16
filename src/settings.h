@@ -120,6 +120,9 @@ void LoadMonitorSettingsPool(std::vector<MonitorSettings>& pool, const wchar_t* 
 // is marked Migrated=Display<slot> (kept on disk, skipped by later loads).
 void SaveSettings();
 
+// [UI] DlcCharts: the DLC tab's chart picks and chart options, as the interface encodes them (GUI thread).
+extern std::wstring g_uiDlcCharts;
+
 // Load all settings from INI file, then attach each live monitor's entry
 // (g_gui.monitorSettings, one per g_gui.monitors) by identity; the rest of the
 // saved displays stay in g_gui.parkedSettings. Returns false when some live display could

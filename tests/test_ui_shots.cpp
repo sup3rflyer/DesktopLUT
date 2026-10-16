@@ -7,6 +7,7 @@
 #include "actions/notify.h"
 #include "ui/ui_gscurve.h"
 #include "ui/ui_charts.h"
+#include "ui/ui_dlc.h"
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
@@ -537,6 +538,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         // 19 / 20: shots 15 / 17 with the other charts picked (hue rose, CIE, CDF, stability; convergence, tone).
         { "dlcrealalt", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 19 },
         { "dlcrealsdralt", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 20 },
+        // 21: shot 19 with the CIE tile's options menu open.
+        { "dlcrealoptions", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 21 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -611,7 +614,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     if (!realRun) continue;
                     snap.run = realRun;
                     snap.live[0].dlcRun = true;
-                } else if (shot.variant >= 15 && shot.variant <= 20 && shot.variant != 18) {
+                } else if (shot.variant >= 15 && shot.variant <= 21 && shot.variant != 18) {
                     // A report whose run left these charts: the HDR display's (or the BenQ's) current verification.
                     const bool sdr = shot.variant == 17 || shot.variant == 20;
                     if (sdr ? !realSdrCharts : !realRun) continue;
@@ -653,11 +656,13 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
                 if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = shot.variant == 16 ? 3 : 0;   // 16: WORST MISSES, wide
-                if (shot.variant == 19 || shot.variant == 20) {
+                if (shot.variant == 19 || shot.variant == 20 || shot.variant == 21) {
                     using K = ui::DlcChart;
                     const K picks[2][4] = { { K::Colours, K::Hues, K::Cie, K::Stability },
                                             { K::ToneCurve, K::Colours, K::Cie, K::Stability } };
-                    for (int i = 0; i < 4; i++) vs.dlc.tile[i] = (int)picks[shot.variant - 19][i];
+                    for (int i = 0; i < 4; i++) vs.dlc.tile[i] = (int)picks[shot.variant == 20 ? 1 : 0][i];
+                    if (shot.variant != 20) vs.dlc.opt[(int)K::Cie][0] = 1;   // the CIE tile on the 1931 diagram
+                    if (shot.variant == 21) vs.dlc.openOptions = 2;
                 }
                 if (shot.variant == 3 || shot.variant == 4) {
                     // The grayscale editor, drawn without a live edit: HDR 20 points (gray), SDR 32 points (R).
@@ -810,4 +815,31 @@ TEST_CASE("ui: Enter in a text field is reported once, by the field") {
     CHECK(enteredFrames == 1);
     CHECK(enteredAt == 5);
     CHECK(textWhenEntered == "notepad");
+}
+
+TEST_CASE("dlc tab: chart picks and chart options survive the saved form") {
+    using K = ui::DlcChart;
+    ui::DlcView v;
+    CHECK(ui::EncodeDlcCharts(v).empty());                    // all defaults: nothing to save
+    v.tile[1] = (int)K::ToneCurve;
+    v.tile[3] = (int)K::Worst;
+    v.opt[(int)K::Cie][0] = 1;                                 // diagram: 1931 xy (choice 0; the default is u'v')
+    v.opt[(int)K::Cie][1] = 1;                                 // patches: off
+    v.opt[(int)K::Stability][2] = 1;                           // blue: off
+    const std::wstring enc = ui::EncodeDlcCharts(v);
+    CHECK(enc == L"t=auto,tone_curve,auto,worst;o=stability.b:0,cie.diagram:0,cie.patches:0");
+    ui::DlcView w;
+    ui::DecodeDlcCharts(enc, w);
+    for (int i = 0; i < 4; i++) CHECK(w.tile[i] == v.tile[i]);
+    CHECK(w.opt[(int)K::Cie][0] == 1);
+    CHECK(w.opt[(int)K::Cie][1] == 1);
+    CHECK(w.opt[(int)K::Stability][2] == 1);
+    CHECK(w.opt[(int)K::Cie][2] == 0);
+    // Unknown names, values out of range and a value equal to the default leave the default.
+    ui::DlcView x;
+    ui::DecodeDlcCharts(L"t=nope,cie;o=cie.diagram:1,cie.patches:7,cie.what:0,ghost.x:1,garbage", x);
+    CHECK(x.tile[0] == -1);
+    CHECK(x.tile[1] == (int)K::Cie);
+    CHECK(x.opt[(int)K::Cie][0] == 0);
+    CHECK(x.opt[(int)K::Cie][1] == 0);
 }

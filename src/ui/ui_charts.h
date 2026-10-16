@@ -24,7 +24,7 @@ enum class DlcChart {
     Hues,           // HUE ERROR: per hue sector, signed saturation (radial) and hue rotation (tangential)
     Stability,      // STABILITY: per-channel drift of the drift reference over the run
     BuildDelta,     // BUILD DELTA: band means at the first vs the last measured stage
-    Cie,            // CIE 1976 u'v': target and measured gamut, coverage, each patch coloured by its JNCD miss
+    Cie,            // CIE (1931 xy or 1976 u'v'): target and measured gamut, coverage, each patch coloured by its JNCD miss
     Distribution,   // ΔE CDF, weighted by content (patch count faint)
     Convergence,    // the 3D-LUT build's iterations and scored passes
     Count
@@ -35,12 +35,30 @@ const char* DlcChartTitle(DlcChart k, bool hdr);
 // One-line explanation for the tile's tooltip.
 const char* DlcChartTip(DlcChart k);
 bool DlcChartHasData(DlcChart k, const dlc::LiveCharts& c);
+// A stable name for a chart (saved settings): "bands", "tone_curve", ... nullptr for Count.
+const char* DlcChartKey(DlcChart k);
+
+// What a chart lets the viewer show or hide: a layer (on / off) or a choice between views. Values: 0 / 1 for a layer,
+// the choice's index otherwise. `key` is the stable name saved settings use.
+constexpr int kDlcChartMaxOptions = 8;
+struct DlcChartOption {
+    const char* key;
+    const char* label;
+    const char* const* choices;   // nullptr: an on / off layer
+    int nChoices;
+    int def;
+};
+// Chart k's options; `n` gets their count (0: none).
+const DlcChartOption* DlcChartOptions(DlcChart k, int& n);
+
 // Draws chart `k` into a-b (pixels): the plot field, its scale, the data; hover readouts as tooltips.
 // `settled`/`slope`/`channel`: DLC's warm-up verdict when the run is live (Stability), else -1 / NaN.
+// `opts`: the chart's option values + 1 (kDlcChartMaxOptions; 0 = that option's default), or null for the defaults.
 struct ChartContext {
     int settled = -1;
     double slopePct10 = dlc::kNaN;
     const char* channel = nullptr;
+    const uint8_t* opts = nullptr;
 };
 void DrawDlcChart(DlcChart k, const dlc::LiveCharts& c, ImVec2 a, ImVec2 b, const ChartContext& ctx = {});
 

@@ -16,4 +16,9 @@ Light DlcRunLight(const Snapshot& snap);
 // The sidebar's badge for the display a run measures ("MEASURING 59%", "WAITING", ...); false for any other.
 bool DlcRunBadge(const Snapshot& snap, const DisplayRow& r, std::string& text, ImU32& col);
 
+// The saved form of the DLC tab's chart picks and chart options ([UI] DlcCharts), by stable names; empty when
+// everything is a default. Decode leaves what it cannot read at the default.
+std::wstring EncodeDlcCharts(const DlcView& v);
+void DecodeDlcCharts(const std::wstring& encoded, DlcView& v);
+
 }  // namespace ui
