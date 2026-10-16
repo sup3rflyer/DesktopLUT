@@ -445,11 +445,24 @@ for now; each of those is documented as bit-identical when off, so the hook's ou
 exactly for the same input frame. Both paths run the same HLSL (`shared/fald_shader.h`) and the same panel-file
 reader (`shared/fald_panel.h`) — there is no second implementation of the correction.
 
-- **The panel file is staged, not messaged.** The host copies it beside the `.cube` files
-  (`…\Temp\DesktopLUT_luts\fald\<left>_<top>[_hdr].bin`) and the DLL reads it once during `DllMain`; the
-  staging directory is deleted right afterwards. A changed panel file therefore needs a re-injection. The three
-  live switches (enable, view, per-channel pedestal) travel in `DwmHookSharedConfig::faldFlags` over the
-  seqlock instead, so toggling them does not re-inject — a re-injection re-rolls twin-panel routing.
+- **The panel file is staged at injection, then delivered live.** The host copies it beside the `.cube` files
+  (`…\Temp\DesktopLUT_luts\fald\<left>_<top>[_hdr].bin`) and the DLL reads it during `DllMain`; the
+  staging directory is deleted right afterwards. A CHANGE of the panel file while the hook is resident (another
+  path, the same path re-set — a reload — or re-exported in place, polled on the hook watchdog's 5 s tick) does
+  not re-inject (that blinked the layer off for ~1 s per switch, which made an A/B of two panel files
+  unjudgeable): the host reads and validates the file with the DLL's parser (transfer vs mode, lattice vs
+  display), writes it unchanged into a new named section `Global\DesktopLUT_DwmHook_FaldPanel_<hostPid>_<gen>`
+  behind a `DwmHookFaldPanelBlob` header, and publishes the generation in the tuning tail
+  (`DwmHookFaldTuning::panelGen[SDR, HDR]`). On the next present of that display the DLL takes it (header
+  checks, the same parser straight from the view, SEH-guarded, ~25 µs warm / ~250 µs cold for a 576 KB file)
+  and the layer swaps its panel part before any pass of a present: new tables, flat response and LED-lag state;
+  the clean source stays primed, so there is no gap. If the new panel part cannot be built the layer stays on
+  the previous file. The DLL's verdict (ingested / applied / refused / build failed) is written back into the
+  section and shown in `state.get → hook.fald_panels`; a refusal is a warning notification. A resident DLL
+  without the feature (no `Global\DesktopLUT_DwmHook_FaldPanelLive` event), or a file the host refuses, falls
+  back to the re-injection, and every re-injection stages the current file and starts the generations over.
+  The three live switches (enable, view, per-channel pedestal) travel in `DwmHookSharedConfig::faldFlags` over
+  the seqlock, so toggling them does not re-inject either — a re-injection re-rolls twin-panel routing.
 - **Dirty rects are given up while the layer is on.** One zone's content changes the correction of pixels far
   outside any changed rectangle, so that context copies and redraws the whole frame every present.
 - **It refuses a coin-toss routing.** A context whose monitor position came from first-present order among

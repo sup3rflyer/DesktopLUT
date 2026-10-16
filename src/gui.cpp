@@ -285,9 +285,34 @@ static bool CurrentMonitorIsHDR() {
 
 void RequestFaldFullRecompose();   // below: forces one full DWM composition for the hook's FALD layer
 
-// A FALD panel file was set / changed / re-set. The DWM hook reads panel files ONLY at injection (they are staged
-// beside the .cube files), so in hook mode the change takes effect through a re-injection — the same Stop + Start a
-// .cube change uses. (The overlay path rebuilds from the path / reloadSeq by itself.) GUI thread.
+// A FALD panel file was set / changed / re-set / cleared, hook mode: hand it to the resident hook live (dwm_inject.h
+// DeliverDwmHookFaldPanel). Re-browsing / re-setting the same path delivers it again whatever its stamp says (an
+// explicit reload, as reloadSeq is for the overlay path).
+bool FaldPanelFileChangedLive(int mon, bool hdr) {
+    if (!g_gui.isRunning || !g_dwmHookMode.load()) return false;
+    if (mon < 0 || mon >= (int)g_gui.monitors.size() || mon >= (int)g_gui.monitorSettings.size()) return false;
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);   // released before the delivery (it takes it again)
+        const MonitorSettings& ms = g_gui.monitorSettings[mon];
+        path = (hdr ? ms.hdrColorCorrection.fald : ms.sdrColorCorrection.fald).paramsPath;
+    }
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfo(g_gui.monitors[mon], &mi)) return false;
+    if (path.empty())   // the layer is off for want of a file (the shared config says so); nothing to load
+        return ForgetDwmHookFaldPanel(mi.rcMonitor.left, mi.rcMonitor.top, hdr);
+    std::wstring why;
+    if (DeliverDwmHookFaldPanel(mi.rcMonitor.left, mi.rcMonitor.top, hdr, path, &why)) {
+        SetStatus(L"FALD panel file loaded live");
+        return true;
+    }
+    std::wcout << L"[FALD] panel file not delivered to the DWM hook live (" << why << L"): re-injecting" << std::endl;
+    return false;
+}
+
+// A FALD panel file was set / changed / re-set and could not be delivered live (FaldPanelFileChangedLive). The DWM
+// hook then reads it at injection (staged beside the .cube files): a re-injection — the same Stop + Start a .cube
+// change uses. (The overlay path rebuilds from the path / reloadSeq by itself.) GUI thread.
 void FaldPanelFileChangedReinject() {
     if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
     RestartLiveLayers();   // stays stopped if the user suspended meanwhile
@@ -2607,6 +2632,14 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     s_dwmHookHealthyStreak = 0;
                 } else if (g_dwmHookReinjectCount == 0) {
                     s_dwmHookHealthyStreak = 0;
+                }
+                // FALD panel files the hook holds that were re-exported in place reach it live (the overlay path
+                // polls its file stamp the same way); a live delivery the DLL could not use is reported once.
+                std::vector<std::wstring> faldProblems;
+                PollDwmHookFaldPanelFiles(&faldProblems);
+                for (const std::wstring& problem : faldProblems) {
+                    notify::Post(notify::Sev::Warning, -1, L"fald", problem);
+                    std::wcout << L"[DWM Hook Watchdog] " << problem << std::endl;
                 }
             }
             return 0;

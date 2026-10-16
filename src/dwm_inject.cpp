@@ -3,6 +3,7 @@
 
 #include "dwm_inject.h"
 #include "../shared/dwm_hook_config.h"
+#include "../shared/fald_panel_live.h"
 #include "globals.h"
 #include "gui.h"
 #include "mhc_preview.h"   // MhcPreviewHolds
@@ -23,13 +24,59 @@
 #include <atomic>
 #include <cstdio>
 #include <cctype>
+#include <fstream>
+#include <iterator>
 
 static std::recursive_mutex g_dwmInjectMutex;
 
 // The staging set of the last successful InjectDwmHook (DwmHookResidentWith). Under g_dwmInjectMutex.
-// Invalidated by every inject attempt (until it succeeds) and every uninject.
+// Invalidated by every inject attempt (until it succeeds) and every uninject. A FALD panel file delivered live
+// (DeliverDwmHookFaldPanel) updates its entry: the set keeps describing what the resident hook holds.
 static std::vector<DwmHookMonitorLUT> g_injectedSet;
 static bool g_injectedSetValid = false;
+
+// The FALD panel files the hook holds, per (position, mode): staged at the last injection (gen 0) or delivered live
+// since (dwm_hook_config.h, "FALD panel file live delivery"). Under g_dwmInjectMutex. Reset by every injection (the
+// DLL starts over from the staged files) and when the shared memory closes.
+struct HookFaldPanel {
+    int left = 0, top = 0;
+    bool hdr = false;
+    std::wstring path;                          // the file the hook holds there ("" = none wanted any more: inert)
+    unsigned long long size = 0, mtime = 0;     // its stamp, taken BEFORE it was read (a later write re-delivers)
+    bool stampValid = false;
+    unsigned long long badSize = 0, badMtime = 0;   // a re-export the host refused (not re-read until it changes)
+    bool badValid = false;
+    uint32_t gen = 0;                           // 0 = staged at injection; else the live delivery's generation
+    HANDLE section = nullptr;                   // that delivery's section: kept open for the DLL's verdict
+    DwmHookFaldPanelBlob* view = nullptr;
+    uint32_t reportedAck = DWM_HOOK_FALD_PANEL_ACK_NONE;   // the DLL verdict already passed on (PollDwmHookFaldPanelFiles)
+};
+static std::vector<HookFaldPanel> g_hookFaldPanels;
+static uint32_t g_faldPanelGenCounter = 0;      // host-wide, never 0 on the wire (section names carry our pid too)
+
+static void CloseHookFaldPanelSection(HookFaldPanel& e) {
+    if (e.view) { UnmapViewOfFile(e.view); e.view = nullptr; }
+    if (e.section) { CloseHandle(e.section); e.section = nullptr; }
+}
+
+static void ResetHookFaldPanels() {
+    for (HookFaldPanel& e : g_hookFaldPanels) CloseHookFaldPanelSection(e);
+    g_hookFaldPanels.clear();
+}
+
+static HookFaldPanel* FindHookFaldPanel(int left, int top, bool hdr) {
+    for (HookFaldPanel& e : g_hookFaldPanels)
+        if (e.left == left && e.top == top && e.hdr == hdr) return &e;
+    return nullptr;
+}
+
+static HookFaldPanel& HookFaldPanelAt(int left, int top, bool hdr) {
+    if (HookFaldPanel* e = FindHookFaldPanel(left, top, hdr)) return *e;
+    HookFaldPanel e;
+    e.left = left; e.top = top; e.hdr = hdr;
+    g_hookFaldPanels.push_back(e);
+    return g_hookFaldPanels.back();
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -372,10 +419,23 @@ static const std::vector<DxgiMonInfo>& EnumerateDxgiMonitors(bool forceRefresh =
 
 static const wchar_t* const kDllName   = L"DwmHook.dll";
 
+bool DwmHookStagingSetsEqual(const std::vector<DwmHookMonitorLUT>& a, const std::vector<DwmHookMonitorLUT>& b)
+{
+    if (a.size() != b.size()) return false;
+    auto contains = [](const std::vector<DwmHookMonitorLUT>& set, const DwmHookMonitorLUT& e) {
+        for (const DwmHookMonitorLUT& o : set)
+            if (o == e) return true;
+        return false;
+    };
+    for (const DwmHookMonitorLUT& e : a) if (!contains(b, e)) return false;
+    for (const DwmHookMonitorLUT& e : b) if (!contains(a, e)) return false;
+    return true;
+}
+
 bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors)
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
-    return g_injectedSetValid && g_injectedSet == monitors && IsDwmHookActive();
+    return g_injectedSetValid && DwmHookStagingSetsEqual(g_injectedSet, monitors) && IsDwmHookActive();
 }
 
 std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid)
@@ -548,6 +608,8 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
         ClearDACL(dest);
         return {};
     };
+    // The new DLL starts from the files staged below: every live delivery of the old one is over (generations 0).
+    ResetHookFaldPanels();
     for (const auto& mon : monitors) {
         std::wstring posPrefix = std::to_wstring(mon.left) + L"_" + std::to_wstring(mon.top);
 
@@ -576,10 +638,17 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
             std::wstring dest = faldDir + posPrefix + (hdr ? L"_hdr.bin" : L".bin");
             std::wcout << L"[DWM Hook] Staging " << (hdr ? L"HDR" : L"SDR") << L" FALD panel file: pos("
                        << mon.left << L"," << mon.top << L") " << src << std::endl;
+            // Stamp BEFORE the copy: a write that lands after it is seen as a change and delivered live.
+            unsigned long long stampSize = 0, stampMtime = 0;
+            const bool stamped = FaldPanelFileStamp(src, stampSize, stampMtime);
             if (!CopyFileW(src.c_str(), dest.c_str(), FALSE)) {
                 std::wcerr << L"[DWM Hook] WARNING: Failed to copy FALD panel file: " << GetLastErrorString() << std::endl;
             } else {
                 ClearDACL(dest);
+                HookFaldPanel& held = HookFaldPanelAt(mon.left, mon.top, hdr != 0);
+                held.path = src;
+                held.size = stampSize; held.mtime = stampMtime; held.stampValid = stamped;
+                held.gen = 0;
             }
         }
     }
@@ -623,6 +692,9 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
 
     // --- Create shared memory for live IPC (before injection so DLL can open in DLL_PROCESS_ATTACH) ---
     CreateDwmHookSharedMemory();
+    // A mapping that outlived the previous DLL (the watchdog's re-injection after a DWM restart) still announces that
+    // DLL's live panel deliveries: publish generation 0 everywhere before the new one attaches.
+    UpdateDwmHookSharedConfig();
 
     // --- Inject into all dwm.exe processes ---
     // Resolve LoadLibraryW address (same virtual address in all processes due to kernel32 ASLR base sharing)
@@ -1362,6 +1434,13 @@ void UpdateDwmHookSharedConfig()
         }
     }
 
+    // FALD panel files delivered live: the generation each monitor's layer is to hold, per mode (0 = the staged file).
+    // From the hook's own table, not from the settings: a generation is only ever published for a complete section.
+    for (uint32_t i = 0; i < cfg.numMonitors; i++)
+        for (const HookFaldPanel& e : g_hookFaldPanels)
+            if (e.left == cfg.monitors[i].left && e.top == cfg.monitors[i].top)
+                ex.tail.fald[i].panelGen[e.hdr ? 1 : 0] = e.gen;
+
     // Seqlock write: odd version = write in progress, even = complete.
     // Reader rejects odd versions and mismatched pre/post-copy versions.
     g_sharedMemPtr->version = ++g_sharedMemVersion;  // odd = write in progress
@@ -1398,6 +1477,7 @@ void CloseDwmHookSharedMemory()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     StopFaldSettleKicker();   // (its thread never takes g_dwmInjectMutex)
+    ResetHookFaldPanels();    // the live deliveries' sections (the DLL that read them is gone or going)
     if (g_sharedMemPtr) {
         UnmapViewOfFile(g_sharedMemPtr);
         g_sharedMemPtr = nullptr;
@@ -1489,6 +1569,206 @@ uint32_t DwmHookMhcPreviewAck()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     return g_mhcPreviewPtr ? (uint32_t)g_mhcPreviewPtr->ackGen : 0u;
+}
+
+// ---------------------------------------------------------------------------
+// FALD panel file live delivery (dwm_hook_config.h, "FALD panel file live delivery")
+// ---------------------------------------------------------------------------
+bool DwmHookFaldPanelLiveSupported()
+{
+    HANDLE h = OpenEventW(SYNCHRONIZE, FALSE, DWM_HOOK_FALD_PANEL_LIVE_EVENT);
+    if (!h) return false;
+    CloseHandle(h);
+    return true;
+}
+
+// The resident hook can take a delivery now: injected by us with a known staging set, alive, a DLL that reads
+// deliveries, and a shared config with the tuning tail (where the generations travel). g_dwmInjectMutex held.
+static bool HookTakesFaldPanels(std::wstring* why)
+{
+    auto no = [why](const wchar_t* w) { if (why) *why = w; return false; };
+    if (!g_sharedMemPtr) return no(L"no shared memory");
+    if (g_sharedMemBytes != sizeof(DwmHookSharedConfigEx)) return no(L"shared memory without the tuning tail");
+    if (!g_injectedSetValid) return no(L"the hook's staging set is unknown");
+    if (!IsDwmHookActive()) return no(L"the hook is not resident");
+    if (!DwmHookFaldPanelLiveSupported()) return no(L"the resident DLL predates live panel delivery");
+    return true;
+}
+
+// Read + validate the file as the DLL will (same parser, transfer vs mode) and against the display's frame (the DLL
+// refuses a lattice that does not fit at build time: refused here, the caller re-injects as before and the layer goes
+// off loudly instead of the old file staying on screen). `stamp` is taken before the read.
+static bool ReadFaldPanelForHook(const std::wstring& path, bool hdr, int left, int top, std::vector<char>& bytes,
+                                 unsigned long long& size, unsigned long long& mtime, std::wstring& why)
+{
+    if (!FaldPanelFileStamp(path, size, mtime)) { why = L"the file cannot be read"; return false; }
+    if (size == 0 || size > DWM_HOOK_FALD_PANEL_MAX_BYTES) { why = L"implausible file size"; return false; }
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) { why = L"the file cannot be opened"; return false; }
+        bytes.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    if (bytes.empty() || bytes.size() > DWM_HOOK_FALD_PANEL_MAX_BYTES) { why = L"implausible file size"; return false; }
+    FaldPanelParams p;
+    std::string err;
+    if (!ParseFaldPanelParams(bytes.data(), bytes.size(), p, err)) {
+        why = L"not a valid panel file (" + std::wstring(err.begin(), err.end()) + L")";
+        return false;
+    }
+    if (!FaldTransferMatchesMode(p.transfer, hdr)) {
+        why = hdr ? L"an SDR (gamma) fit for the HDR row" : L"an HDR (PQ) fit for the SDR row";
+        return false;
+    }
+    for (const auto& mi : EnumerateDxgiMonitors()) {
+        if (mi.left != left || mi.top != top) continue;
+        if (!FaldLatticeFits(p, mi.w, mi.h)) { why = L"its lattice does not fit the display"; return false; }
+        break;
+    }
+    return true;
+}
+
+// Section + generation + config (g_dwmInjectMutex held, HookTakesFaldPanels checked, `bytes` validated).
+static bool PublishFaldPanel(int left, int top, bool hdr, const std::wstring& path, const std::vector<char>& bytes,
+                             unsigned long long size, unsigned long long mtime, std::wstring& why)
+{
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);   // dwm.exe (Window Manager\DWM-n / SYSTEM) opens it
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+    const unsigned long long total = FaldPanelBlobBytes(bytes.size());
+    HANDLE section = nullptr;
+    DwmHookFaldPanelBlob* view = nullptr;
+    uint32_t gen = 0;
+    for (int attempt = 0; attempt < 3 && !view; attempt++) {
+        gen = ++g_faldPanelGenCounter;
+        if (gen == 0) gen = ++g_faldPanelGenCounter;   // 0 = "the staged file" on the wire
+        wchar_t name[96];
+        swprintf_s(name, DWM_HOOK_FALD_PANEL_NAME_FMT, (unsigned long)GetCurrentProcessId(), (unsigned long)gen);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, (DWORD)(total >> 32), (DWORD)total, name);
+        if (!section) { why = L"section creation failed (" + std::to_wstring(GetLastError()) + L")"; return false; }
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {   // never write into a section someone else made: next name
+            CloseHandle(section); section = nullptr;
+            continue;
+        }
+        view = static_cast<DwmHookFaldPanelBlob*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, (SIZE_T)total));
+        if (!view) { CloseHandle(section); section = nullptr; why = L"section map failed"; return false; }
+    }
+    if (!view) { why = L"no free section name"; return false; }
+    if (!FaldPanelBlobWrite(view, (size_t)total, gen, left, top, hdr, bytes.data(), bytes.size())) {
+        UnmapViewOfFile(view); CloseHandle(section);
+        why = L"delivery block not written";
+        return false;
+    }
+
+    HookFaldPanel& held = HookFaldPanelAt(left, top, hdr);
+    CloseHookFaldPanelSection(held);   // the superseded delivery (the DLL keeps its own view until it takes this one)
+    held.path = path;
+    held.size = size; held.mtime = mtime; held.stampValid = true;
+    held.badValid = false;
+    held.gen = gen;
+    held.section = section;
+    held.view = view;
+    held.reportedAck = DWM_HOOK_FALD_PANEL_ACK_NONE;
+
+    // The staging set describes what the hook holds now: a FALD-path-only change is no reason to re-inject (act::HookStale).
+    DwmHookMonitorLUT* entry = nullptr;
+    for (DwmHookMonitorLUT& e : g_injectedSet)
+        if (e.left == left && e.top == top) { entry = &e; break; }
+    if (!entry) {
+        DwmHookMonitorLUT e;
+        e.left = left; e.top = top;
+        g_injectedSet.push_back(e);
+        entry = &g_injectedSet.back();
+    }
+    (hdr ? entry->hdrFaldPath : entry->sdrFaldPath) = path;
+
+    UpdateDwmHookSharedConfig();   // publishes the generation (its render hash moves: DWM recomposes, the DLL takes it)
+    std::wcout << L"[DWM Hook] FALD panel file delivered live: pos(" << left << L"," << top << L") "
+               << (hdr ? L"HDR" : L"SDR") << L" gen " << gen << L", " << bytes.size() << L" bytes: " << path << std::endl;
+    return true;
+}
+
+bool DeliverDwmHookFaldPanel(int left, int top, bool hdr, const std::wstring& path, std::wstring* why)
+{
+    std::wstring w;
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    if (!HookTakesFaldPanels(&w)) { if (why) *why = w; return false; }
+    std::vector<char> bytes;
+    unsigned long long size = 0, mtime = 0;
+    if (!ReadFaldPanelForHook(path, hdr, left, top, bytes, size, mtime, w) ||
+        !PublishFaldPanel(left, top, hdr, path, bytes, size, mtime, w)) {
+        if (why) *why = w;
+        return false;
+    }
+    return true;
+}
+
+bool ForgetDwmHookFaldPanel(int left, int top, bool hdr)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    if (!HookTakesFaldPanels(nullptr)) return false;
+    if (HookFaldPanel* held = FindHookFaldPanel(left, top, hdr)) { held->path.clear(); held->badValid = false; }
+    for (DwmHookMonitorLUT& e : g_injectedSet)
+        if (e.left == left && e.top == top) (hdr ? e.hdrFaldPath : e.sdrFaldPath).clear();
+    return true;
+}
+
+void PollDwmHookFaldPanelFiles(std::vector<std::wstring>* problems)
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    if (!HookTakesFaldPanels(nullptr)) return;
+    // Indices, not references: PublishFaldPanel may add an entry (it never does for a held position, but stay safe).
+    for (size_t i = 0; i < g_hookFaldPanels.size(); i++) {
+        // 1. the DLL's verdict on the last delivery, passed on once
+        {
+            HookFaldPanel& e = g_hookFaldPanels[i];
+            if (e.gen != 0 && e.view && e.view->ackGen == e.gen) {
+                const uint32_t ack = e.view->ackStatus;
+                if (ack != e.reportedAck) {
+                    e.reportedAck = ack;
+                    const wchar_t* what = ack == DWM_HOOK_FALD_PANEL_ACK_REFUSED ? L"refused by the DWM hook"
+                                        : ack == DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED ? L"could not be built by the DWM hook"
+                                        : nullptr;
+                    if (what && problems)
+                        problems->push_back(std::wstring(L"FALD panel file ") + what + L" (the previous file stays): " + e.path);
+                }
+            }
+        }
+        // 2. the same path re-exported in place (the overlay path's stamp poll, src/fald.cpp FaldEnsureResources)
+        const HookFaldPanel snapshot = g_hookFaldPanels[i];
+        if (snapshot.path.empty()) continue;
+        unsigned long long size = 0, mtime = 0;
+        if (!FaldPanelFileStamp(snapshot.path, size, mtime)) continue;   // gone / locked: keep what the hook holds
+        if (snapshot.stampValid && size == snapshot.size && mtime == snapshot.mtime) continue;
+        if (snapshot.badValid && size == snapshot.badSize && mtime == snapshot.badMtime) continue;
+        std::vector<char> bytes;
+        std::wstring why;
+        if (!ReadFaldPanelForHook(snapshot.path, snapshot.hdr, snapshot.left, snapshot.top, bytes, size, mtime, why) ||
+            !PublishFaldPanel(snapshot.left, snapshot.top, snapshot.hdr, snapshot.path, bytes, size, mtime, why)) {
+            // Half-written (an export in progress) or wrong: the hook keeps its file; tried again once the file changes.
+            HookFaldPanel& e = g_hookFaldPanels[i];
+            e.badSize = size; e.badMtime = mtime; e.badValid = true;
+            // Log only: a poll that lands inside an export sees a short file, and the next one delivers it.
+            std::wcout << L"[DWM Hook] FALD panel file changed on disk but not delivered (" << why << L"): "
+                       << snapshot.path << std::endl;
+            continue;
+        }
+    }
+}
+
+std::vector<DwmHookFaldPanelState> DwmHookFaldPanels()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    std::vector<DwmHookFaldPanelState> out;
+    for (const HookFaldPanel& e : g_hookFaldPanels) {
+        DwmHookFaldPanelState s;
+        s.left = e.left; s.top = e.top; s.hdr = e.hdr;
+        s.path = e.path;
+        s.gen = e.gen;
+        s.ack = (e.gen != 0 && e.view && e.view->ackGen == e.gen) ? (uint32_t)e.view->ackStatus : DWM_HOOK_FALD_PANEL_ACK_NONE;
+        out.push_back(s);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

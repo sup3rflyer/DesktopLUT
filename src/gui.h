@@ -67,6 +67,12 @@ void RequestFaldFullRecompose();
 void RequestDesktopRecompose();
 // A RequestDesktopRecompose is still running (its full-screen composition has not finished). GUI thread.
 bool DesktopRecomposePending();
+// Hook FALD: monitor `mon`'s panel file for `hdr` was set, changed, re-set or cleared. Hook mode, running, a resident
+// hook that takes live deliveries: the file is handed to it without a re-injection (no blink; the layer switches
+// between two presents) and true is returned. False = not delivered (not hook mode / not running / an older DLL / the
+// file refused): the caller falls back to FaldPanelFileChangedReinject. Call it BEFORE the live-layer reconcile, so the
+// reconcile sees the hook holding the new file. GUI thread.
+bool FaldPanelFileChangedLive(int mon, bool hdr);
 // Hook FALD: a panel file was set or changed — re-inject so the DLL loads it (hook mode, running). GUI thread.
 void FaldPanelFileChangedReinject();
 

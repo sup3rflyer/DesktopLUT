@@ -351,6 +351,30 @@ JsonValue BuildHookStateJson() {
         hook.set("routing", routing);
     }
     hook.set("needs_check", JBool(needsCheck));
+    // FALD panel files the hook holds, per display and mode (dwm_inject.h DwmHookFaldPanels): staged at injection
+    // (gen 0) or delivered live since. A client that switches panel files (a blind A/B) confirms here that the switch
+    // reached the hook: status applied = the layer runs on it.
+    //   fald_panels: [{ left, top, mode:"HDR"|"SDR", path, gen,
+    //                   status: staged | delivered (not taken yet: no present of that display since) | ingested (held,
+    //                           taken at the layer's next run in that mode) | applied | refused | build_failed }]
+    JsonValue panels = JArr();
+    for (const DwmHookFaldPanelState& p : DwmHookFaldPanels()) {
+        JsonValue j = JObj();
+        j.set("left", JNum(p.left));
+        j.set("top", JNum(p.top));
+        j.set("mode", JStr(p.hdr ? "HDR" : "SDR"));
+        j.set("path", JStr(WideToUtf8(p.path)));
+        j.set("gen", JNum((double)p.gen));
+        const char* status = p.gen == 0 ? "staged"
+                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_INGESTED ? "ingested"
+                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_APPLIED ? "applied"
+                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_REFUSED ? "refused"
+                           : p.ack == DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED ? "build_failed"
+                           : "delivered";
+        j.set("status", JStr(status));
+        panels.arr.push_back(j);
+    }
+    hook.set("fald_panels", panels);
     return hook;
 }
 
@@ -1457,8 +1481,11 @@ void DoSetFaldParams(const JsonValue& p, JsonValue& result, std::string& error) 
         fs.reloadSeq++;   // same path re-set = "reload the file" (HW 2026-09-13: it did not rebuild before)
     }
     SaveSettings();
+    // Hook mode: a resident hook takes the file live (no re-injection: the layer switches between two presents);
+    // otherwise the DLL reads it at injection.
+    const bool live = FaldPanelFileChangedLive(mon, isHDR);
     FaldPropagate(mon, isHDR);
-    FaldPanelFileChangedReinject();   // hook mode: the DLL reads panel files only at injection
+    if (!live) FaldPanelFileChangedReinject();
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("params_path", JStr(WideToUtf8(path)));
     result.set("transfer", JStr(known ? (transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq") : "unknown"));

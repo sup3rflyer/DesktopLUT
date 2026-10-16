@@ -238,6 +238,43 @@ TEST_CASE("hook staging: the TV powering off and on costs no re-inject") {
     CHECK_FALSE(DecideHookStale(Resident({ kTvCube }, {}, { kPa })));   // the TV was the only display with hook work
     // On again at the same position with the same settings: the resident entry is already right.
     CHECK_FALSE(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube, kTvCube }, { kPa, kTv })));
+}
+
+// A FALD panel file change reaches a resident hook live (dwm_inject.h DeliverDwmHookFaldPanel: no re-injection, the
+// layer switches between two presents — re-injecting blinked it off for ~1 s, which made a blind A/B of two panel
+// files unjudgeable). The delivery updates the injected set BEFORE the reconcile runs, so the reconcile sees nothing
+// stale. Not delivered (an older resident DLL, a refused file): the same change is stale, a re-inject as before.
+TEST_CASE("hook staging: a FALD panel file delivered live is no reason to re-inject") {
+    const wchar_t* kPanelC = L"C:\\panels\\candidate_C_fade3_only.bin";
+    const DwmHookMonitorLUT paCur = Entry(kPa, L"", L"C:\\luts\\pa_hdr.cube", L"", kPanel);
+    const DwmHookMonitorLUT paC = Entry(kPa, L"", L"C:\\luts\\pa_hdr.cube", L"", kPanelC);
+    // CUR -> C: not delivered -> the hook lacks the file -> re-inject; delivered -> the injected set names C
+    CHECK(DecideHookStale(Resident({ paCur, kTvCube }, { paC, kTvCube }, { kPa, kTv })));
+    CHECK_FALSE(DecideHookStale(Resident({ paC, kTvCube }, { paC, kTvCube }, { kPa, kTv })));
+    // and back, C -> CUR (the A/B): the same
+    CHECK_FALSE(DecideHookStale(Resident({ paCur, kTvCube }, { paCur, kTvCube }, { kPa, kTv })));
+    // a display the injection did not stage gets its first panel file live: the delivery appended its entry
+    CHECK_FALSE(DecideHookStale(Resident({ kPaCube, kTvFaldOnly }, { kTvFaldOnly, kPaCube }, { kPa, kTv })));
+    // the path cleared: the file the hook holds is inert (the layer is off for want of a path) — nothing to do
+    const DwmHookMonitorLUT paNoPanel = Entry(kPa, L"", L"C:\\luts\\pa_hdr.cube");
+    CHECK_FALSE(DecideHookStale(Resident({ paCur }, { paNoPanel }, { kPa })));
+    CHECK_FALSE(DecideHookStale(Resident({ paNoPanel }, { paNoPanel }, { kPa })));   // (ForgetDwmHookFaldPanel)
+    // a cube changed in the same breath still re-injects: only the panel file travels live
+    const DwmHookMonitorLUT paCNewCube = Entry(kPa, L"", L"C:\\luts\\pa_hdr_v2.cube", L"", kPanelC);
+    CHECK(DecideHookStale(Resident({ paC }, { paCNewCube }, { kPa })));
+}
+
+TEST_CASE("hook staging: the resident set compares as a set (a live delivery appends a display's entry)") {
+    // DwmHookResidentWith keeps a healthy resident hook on an overlay restart: the order DesiredDwmHookStagingSet
+    // lists displays in is not the order a live delivery appended one in.
+    CHECK(DwmHookStagingSetsEqual({ kPaCube, kTvFaldOnly }, { kTvFaldOnly, kPaCube }));
+    CHECK(DwmHookStagingSetsEqual({}, {}));
+    CHECK_FALSE(DwmHookStagingSetsEqual({ kPaCube, kTvFaldOnly }, { kPaCube }));
+    CHECK_FALSE(DwmHookStagingSetsEqual({ kPaCube, kPaCube }, { kPaCube, kTvFaldOnly }));
+    CHECK_FALSE(DwmHookStagingSetsEqual({ kPaCube, kTvFaldOnly }, { kPaCube, kTvCube }));
+    DwmHookMonitorLUT otherPanel = kTvFaldOnly;
+    otherPanel.hdrFaldPath = L"C:\\panels\\candidate_A.bin";
+    CHECK_FALSE(DwmHookStagingSetsEqual({ kPaCube, kTvFaldOnly }, { otherPanel, kPaCube }));
     // On again, its identity not read yet (default settings, no identity): it is most likely the TV itself,
     // so its cube stays until the identity says otherwise.
     CHECK_FALSE(DecideHookStale(Resident({ kPaCube, kTvCube }, { kPaCube }, { kPa })));

@@ -12,9 +12,10 @@ struct DwmHookMonitorLUT {
     int left = 0, top = 0;           // Desktop position from MONITORINFO
     std::wstring sdrLutPath;          // SDR .cube path (empty = no SDR LUT)
     std::wstring hdrLutPath;          // HDR .cube path (empty = no HDR LUT)
-    // FALD panel parameter files (*.bin). Staged beside the LUTs and read once at attach, so a
-    // changed panel file needs a re-injection; the layer's live switches travel over the shared
-    // config instead (DwmHookSharedConfig::faldFlags). Empty = no FALD file for that mode.
+    // FALD panel parameter files (*.bin). Staged beside the LUTs and read at attach; a later change
+    // is delivered to the resident hook live (DeliverDwmHookFaldPanel), which also updates these in
+    // the injected set. The layer's live switches travel over the shared config
+    // (DwmHookSharedConfig::faldFlags). Empty = no FALD file for that mode.
     std::wstring sdrFaldPath;
     std::wstring hdrFaldPath;
 
@@ -27,9 +28,13 @@ struct DwmHookMonitorLUT {
 // The hook is resident AND was injected by this process with exactly this staging set (positions +
 // cube / FALD paths). A start that finds this — e.g. the auto-restart after the overlay thread died in
 // hook mode, where nothing ejected the hook — need not eject and re-inject a healthy hook: each cycle
-// stalls dwm.exe on the detach, re-patches, and re-rolls twin routing (T2.10). Files are read at attach
-// only, so a changed file at the same path still needs a Stop (eject) + Start.
+// stalls dwm.exe on the detach, re-patches, and re-rolls twin routing (T2.10). Cubes are read at attach
+// only, so a changed cube at the same path still needs a Stop (eject) + Start; a FALD panel file is
+// delivered live instead (DeliverDwmHookFaldPanel), and the set then names the file the hook holds.
 bool DwmHookResidentWith(const std::vector<DwmHookMonitorLUT>& monitors);
+// The same entries in any order (one entry per display position): a live panel delivery appends the entry of a display
+// the injection did not stage, where DesiredDwmHookStagingSet lists it in display order. Pure (tested).
+bool DwmHookStagingSetsEqual(const std::vector<DwmHookMonitorLUT>& a, const std::vector<DwmHookMonitorLUT>& b);
 // The staging set of the last successful injection (empty, `*valid` false, when none describes the hook).
 std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid);
 
@@ -74,6 +79,36 @@ uint32_t DwmHookMhcPreviewAck();
 // The generation the config carries now (0 = none). A re-created shared memory re-publishes the wanted block under a
 // new one, so this can move without a publish.
 uint32_t DwmHookMhcPreviewGen();
+
+// --- FALD panel file live delivery (dwm_hook_config.h DwmHookFaldPanelBlob) ---
+// A panel file change reaches the resident hook without a re-injection: the layer keeps running on the old file until
+// the new one is built and switches between two presents (re-injecting blinked it off for ~1 s per switch).
+// Hand the file at `path` to the resident hook for the display at (left, top), mode `hdr`. The file is read and
+// validated here with the DLL's parser (transfer vs mode, lattice vs display), copied into a new named section, and
+// its generation published in the shared config; the injected set then names it. True = delivered. False (`why`
+// says why): the hook cannot take it (not resident, an older DLL, no tuning tail, unknown staging set) or the file is
+// refused — the caller then re-injects as before, which also gives a refused file exactly the old outcome.
+// GUI thread; takes g_dwmInjectMutex, then g_monitorSettingsMutex (never call it holding the latter).
+bool DeliverDwmHookFaldPanel(int left, int top, bool hdr, const std::wstring& path, std::wstring* why = nullptr);
+// The display's FALD path for `hdr` was cleared: the file the hook holds there is inert (the layer is off for want of
+// a path, DwmHookSharedConfig::faldFlags) and is no longer watched for re-exports. True when a resident hook took
+// note (no re-injection needed); false = no hook to tell.
+bool ForgetDwmHookFaldPanel(int left, int top, bool hdr);
+// The resident DLL takes live deliveries (DWM_HOOK_FALD_PANEL_LIVE_EVENT exists).
+bool DwmHookFaldPanelLiveSupported();
+// GUI thread, on the hook watchdog's healthy tick: a held panel file re-exported IN PLACE (size / mtime moved since it
+// was read) is delivered again — the overlay path's stamp poll; a half-written one is skipped until it changes again.
+// Also passes on, once per delivery, a DLL verdict that kept the previous file (refused / build failed) in `problems`.
+void PollDwmHookFaldPanelFiles(std::vector<std::wstring>* problems);
+// What the hook holds per (position, mode), for state.get: gen 0 = the file staged at injection.
+struct DwmHookFaldPanelState {
+    int left = 0, top = 0;
+    bool hdr = false;
+    std::wstring path;
+    uint32_t gen = 0;
+    uint32_t ack = 0;    // DWM_HOOK_FALD_PANEL_ACK_* of that delivery (NONE = not processed yet, or staged)
+};
+std::vector<DwmHookFaldPanelState> DwmHookFaldPanels();
 
 // Invalidate cached DXGI monitor info (call on WM_DISPLAYCHANGE).
 void InvalidateDxgiMonitorCache();
