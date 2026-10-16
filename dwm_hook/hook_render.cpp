@@ -1263,6 +1263,13 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	// does. The layer needs the whole frame, so switching it on also switches this context off
 	// dirty-rect rendering for as long as it is on — see the draw block below.
 	FaldMonitor* faldMon = NULL;
+	// A panel file the host delivered live for this monitor (either mode) since the last present: taken into the
+	// panel table now, so FaldAcquire below swaps it in before any pass of this present (hook_fald.h).
+	if (index != -1 && FaldShadersReady())
+	{
+		const LocalFaldParams* dp = FindFaldForMonitor(monLeft, monTop);
+		if (dp && dp->hasTuning) FaldSyncPanelDeliveries(monLeft, monTop, dp->hostPid, dp->tuning.panelGen);
+	}
 	if (index == 1 && FaldShadersReady())
 	{
 		LocalFaldParams* fp = FindFaldForMonitor(monLeft, monTop);
