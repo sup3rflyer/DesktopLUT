@@ -1,6 +1,15 @@
 // DesktopLUT - fald_panel_live.cpp
-// FALD panel file live delivery: block checks + the hook's panel table. See fald_panel_live.h.
+// FALD panel file live delivery: block checks, the hook's panel table, the host's verdict bookkeeping.
+// See fald_panel_live.h.
 #include "fald_panel_live.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 
 #include <cstring>
 #include <utility>
@@ -46,7 +55,8 @@ bool FaldPanelBlobCheck(const DwmHookFaldPanelBlob& h, size_t viewBytes, uint32_
 void FaldPanelTable::Clear() {
     for (int i = 0; i < n_; i++) slots_[i] = FaldPanelSlot{};
     n_ = 0;
-    spare_ = FaldPanelParams{};   // its memory too
+    for (int i = 0; i < kCapacity; i++) overflow_[i] = Overflow{};
+    overflowNext_ = 0;
 }
 
 int FaldPanelTable::IndexOf(int left, int top, bool isHdr) const {
@@ -56,6 +66,11 @@ int FaldPanelTable::IndexOf(int left, int top, bool isHdr) const {
 }
 
 const FaldPanelSlot* FaldPanelTable::Find(int left, int top, bool isHdr) const {
+    const int i = IndexOf(left, top, isHdr);
+    return i >= 0 ? &slots_[i] : nullptr;
+}
+
+FaldPanelSlot* FaldPanelTable::FindMutable(int left, int top, bool isHdr) {
     const int i = IndexOf(left, top, isHdr);
     return i >= 0 ? &slots_[i] : nullptr;
 }
@@ -77,6 +92,19 @@ FaldPanelSlot* FaldPanelTable::FindOrAdd(int left, int top, bool isHdr) {
     return &s;
 }
 
+void FaldPanelTable::RecordOverflow(int left, int top, bool isHdr, uint32_t gen) {
+    Overflow* unused = nullptr;
+    for (int i = 0; i < kCapacity; i++) {
+        Overflow& o = overflow_[i];
+        if (o.used && o.left == left && o.top == top && o.isHdr == isHdr) { o.gen = gen; return; }
+        if (!o.used && !unused) unused = &o;
+    }
+    // The shared config names at most 2 * MAX_DWM_HOOK_MONITORS (position, mode) pairs at a time, so with one record
+    // each this never wraps in practice; if it does, the oldest record goes (that pair is then processed once more).
+    Overflow& o = unused ? *unused : overflow_[(overflowNext_++) % kCapacity];
+    o.used = true; o.left = left; o.top = top; o.isHdr = isHdr; o.gen = gen;
+}
+
 bool FaldPanelTable::AddStaged(int left, int top, bool isHdr, FaldPanelParams&& params) {
     FaldPanelSlot* s = FindOrAdd(left, top, isHdr);
     if (!s) return false;
@@ -84,18 +112,23 @@ bool FaldPanelTable::AddStaged(int left, int top, bool isHdr, FaldPanelParams&& 
     s->present = true;
     s->gen = 0;
     s->seq++;
+    s->hasPrev = false;
     return true;
 }
 
 bool FaldPanelTable::Wants(int left, int top, bool isHdr, uint32_t gen) const {
     if (gen == 0) return false;
-    const FaldPanelSlot* s = Find(left, top, isHdr);
-    return !s || s->seenGen != gen;
+    if (const FaldPanelSlot* s = Find(left, top, isHdr)) return s->seenGen != gen;
+    for (int i = 0; i < kCapacity; i++) {
+        const Overflow& o = overflow_[i];
+        if (o.used && o.left == left && o.top == top && o.isHdr == isHdr && o.gen == gen) return false;
+    }
+    return true;
 }
 
 void FaldPanelTable::MarkSeen(int left, int top, bool isHdr, uint32_t gen, uint32_t ack) {
     FaldPanelSlot* s = FindOrAdd(left, top, isHdr);
-    if (!s) return;
+    if (!s) { RecordOverflow(left, top, isHdr, gen); return; }
     s->seenGen = gen;
     s->seenAck = ack;
 }
@@ -103,21 +136,151 @@ void FaldPanelTable::MarkSeen(int left, int top, bool isHdr, uint32_t gen, uint3
 uint32_t FaldPanelTable::Deliver(int left, int top, bool isHdr, uint32_t gen, const void* payload, size_t bytes,
                                  std::string& err) {
     FaldPanelSlot* s = FindOrAdd(left, top, isHdr);
-    if (!s) { err = "no free panel slot"; return DWM_HOOK_FALD_PANEL_ACK_REFUSED; }
+    if (!s) {   // processed all the same: never opened, mapped and refused again on every present
+        RecordOverflow(left, top, isHdr, gen);
+        err = "no free panel slot";
+        return DWM_HOOK_FALD_PANEL_ACK_REFUSED;
+    }
     s->seenGen = gen;
     s->seenAck = DWM_HOOK_FALD_PANEL_ACK_REFUSED;   // until the file is in (a fault inside the parse leaves this)
-    // Parsed into the spare, swapped in only when accepted: a refusal leaves the slot exactly as it was. The slot's
-    // previous file becomes the next spare, so an A/B of two files reuses the same memory (no page faults in DWM's
-    // present after the first two switches).
-    if (!ParseFaldPanelParams(payload, bytes, spare_, err)) return s->seenAck;
-    if (!FaldTransferMatchesMode(spare_.transfer, isHdr)) {
+    // Parsed into the slot's own spare, moved in only when accepted: a refusal leaves the slot's file exactly as it was.
+    // The memory of a file the slot no longer needs comes back as its spare (Commit, RevertBuild, an unbuilt file replaced),
+    // so an A/B of two files allocates nothing in DWM's present after the first switches.
+    if (!ParseFaldPanelParams(payload, bytes, s->spare, err)) return s->seenAck;
+    if (!FaldTransferMatchesMode(s->spare.transfer, isHdr)) {
         err = isHdr ? "a gamma (SDR) fit delivered for HDR" : "a PQ (HDR) fit delivered for SDR (ACM)";
         return s->seenAck;
     }
-    std::swap(s->params, spare_);
+    if (!s->hasPrev) {   // the first delivery since the layer last built this slot's file: keep that one to revert to
+        s->prev = std::move(s->params);
+        s->prevPresent = s->present;
+        s->prevGen = s->gen;
+        s->hasPrev = true;
+        s->params = std::move(s->spare);
+        s->spare = FaldPanelParams{};
+    } else {             // an earlier delivery the layer never built: replaced (its memory becomes the spare)
+        std::swap(s->params, s->spare);
+    }
     s->present = true;
     s->gen = gen;
     s->seq++;
     s->seenAck = DWM_HOOK_FALD_PANEL_ACK_INGESTED;
     return s->seenAck;
+}
+
+void FaldPanelTable::Commit(int left, int top, bool isHdr) {
+    FaldPanelSlot* s = FindMutable(left, top, isHdr);
+    if (!s || !s->hasPrev) return;
+    s->spare = std::move(s->prev);
+    s->prev = FaldPanelParams{};
+    s->hasPrev = false;
+    s->prevPresent = false;
+    s->prevGen = 0;
+}
+
+bool FaldPanelTable::RevertBuild(int left, int top, bool isHdr, uint32_t* seq) {
+    FaldPanelSlot* s = FindMutable(left, top, isHdr);
+    if (!s || !s->hasPrev) return false;
+    std::swap(s->params, s->prev);
+    s->spare = std::move(s->prev);   // the file that could not be built
+    s->prev = FaldPanelParams{};
+    s->present = s->prevPresent;
+    s->gen = s->prevGen;
+    s->hasPrev = false;
+    s->prevPresent = false;
+    s->prevGen = 0;
+    s->seq++;
+    if (seq) *seq = s->seq;
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Host bookkeeping
+// ---------------------------------------------------------------------------------------------------------------------
+void FaldPanelTrack::Stage(const std::wstring& path) {
+    heldPath = basePath = path;
+    heldGen = baseGen = 0;
+    sentPath.clear();
+    gen = 0;
+    verdict = DWM_HOOK_FALD_PANEL_ACK_NONE;
+    waitTicks = 0;
+    final = true;
+}
+
+void FaldPanelTrack::Sent(const std::wstring& path, uint32_t generation) {
+    sentPath = path;
+    gen = generation;
+    verdict = DWM_HOOK_FALD_PANEL_ACK_NONE;
+    waitTicks = 0;
+    final = false;
+}
+
+FaldPanelStep FaldPanelTrackStep(FaldPanelTrack& t, uint32_t ackGen, uint32_t ackStatus, bool countTick,
+                                 unsigned maxTicks) {
+    if (t.final || t.gen == 0) return FaldPanelStep::None;
+    if (ackGen != t.gen || ackStatus == DWM_HOOK_FALD_PANEL_ACK_NONE) {   // no answer on this generation yet
+        if (!countTick) return FaldPanelStep::None;
+        if (++t.waitTicks < maxTicks) return FaldPanelStep::None;
+        t.verdict = FALD_PANEL_VERDICT_NO_ACK;   // nothing taken, as far as anyone can tell: the hook keeps its file
+        t.final = true;
+        return FaldPanelStep::Failed;
+    }
+    if (ackStatus == t.verdict) return FaldPanelStep::None;
+    switch (ackStatus) {
+    case DWM_HOOK_FALD_PANEL_ACK_INGESTED:     // held; the build verdict follows when the layer runs in that mode
+        t.verdict = ackStatus;
+        t.heldPath = t.sentPath; t.heldGen = t.gen;
+        return FaldPanelStep::Ingested;
+    case DWM_HOOK_FALD_PANEL_ACK_APPLIED:      // built and running: also what a later failed build reverts to
+        t.verdict = ackStatus;
+        t.heldPath = t.basePath = t.sentPath; t.heldGen = t.baseGen = t.gen;
+        t.final = true;
+        return FaldPanelStep::Applied;
+    case DWM_HOOK_FALD_PANEL_ACK_REFUSED:      // the slot never changed
+        t.verdict = ackStatus;
+        t.final = true;
+        return FaldPanelStep::Failed;
+    case DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED: // the DLL went back to its last built / staged file (RevertBuild)
+        t.verdict = ackStatus;
+        t.heldPath = t.basePath; t.heldGen = t.baseGen;
+        t.final = true;
+        return FaldPanelStep::Failed;
+    default:                                    // a word this host does not know: no answer
+        return FaldPanelStep::None;
+    }
+}
+
+bool FaldPanelFallbackGuard::Allow(int left, int top, bool isHdr, const std::wstring& path, unsigned long long size,
+                                   unsigned long long mtime) {
+    for (const Key& k : keys_)
+        if (k.left == left && k.top == top && k.isHdr == isHdr && k.size == size && k.mtime == mtime && k.path == path)
+            return false;
+    keys_.push_back(Key{ left, top, isHdr, path, size, mtime });
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Lock, build decision, content hash
+// ---------------------------------------------------------------------------------------------------------------------
+static_assert(sizeof(SRWLOCK) == sizeof(void*), "FaldPanelLock keeps the SRWLOCK in a void*");
+
+bool FaldPanelLock::TryLock() { return TryAcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_)) != FALSE; }
+void FaldPanelLock::Lock() { AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_)); }
+void FaldPanelLock::Unlock() { ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw_)); }
+
+FaldLayerAction FaldLayerDecide(const FaldLayerBuildState& e, bool sameFrame, const FaldPanelSlot* slot) {
+    const bool file = slot && slot->present;
+    if (sameFrame && e.valid) {
+        if (!file || slot->seq == e.panelSeq || slot->seq == e.refusedSeq) return FaldLayerAction::Run;
+        return FaldLayerAction::Swap;
+    }
+    if (sameFrame && e.failed && (!file || slot->seq == e.failedSeq)) return FaldLayerAction::Off;
+    return file ? FaldLayerAction::Build : FaldLayerAction::Off;
+}
+
+uint64_t FaldPanelContentHash(const void* data, size_t bytes) {
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    for (size_t i = 0; i < bytes; i++) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
 }

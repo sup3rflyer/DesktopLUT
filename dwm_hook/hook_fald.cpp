@@ -16,6 +16,7 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <atomic>
 #include <new>
 #include <vector>
 
@@ -210,24 +211,29 @@ void FaldReleaseShaders() {
 // ---------------------------------------------------------------------------------------------
 // One slot per (position, mode): shared/fald_panel_live.h, the same table the unit tests drive. Fixed-size, like
 // lutTargets in hook_lut.h and for the same reason: DWM may call the Present hooks on more than one thread, and a
-// container that reallocates would hand a concurrent reader a freed pointer. The table is filled at attach and then
-// changed only from a present (a delivery replaces a slot's file in place, as MhcPreviewSync replaces its block);
-// g_monitors below is appended to only from a present. Neither shrinks before FaldReleaseAll.
+// container that reallocates would hand a concurrent reader a freed pointer. Slot files are heap-owning and a delivery
+// or a build changes them, so every use of the table — and of g_monitors below, which FaldAcquire appends to — is
+// under g_panelsLock: TRIED on the present path (busy = skip this present's table work, never a wait inside DWM's
+// present), waited for only at attach and in FaldReleaseAll.
 static const int FALD_MAX_PANEL_FILES = FaldPanelTable::kCapacity;   // one SDR + one HDR per monitor
 static FaldPanelTable g_panels;
-// The params (tables included) a live swap replaced: the next swap copies its file into this memory, so an A/B of two
-// files allocates nothing (no page faults in DWM's present) after the first switches (SwapPanel). Freed with
-// FaldReleaseAll.
-static FaldPanelParams g_swapParamsSpare;
+static FaldPanelLock g_panelsLock;
+// g_panels.AnyPresent() as of the last change under the lock, for readers that must not take it (the direct-flip hooks)
+static std::atomic<bool> g_anyPanelPresent{ false };
+static void RefreshAnyPanelPresent() { g_anyPanelPresent.store(g_panels.AnyPresent()); }   // g_panelsLock held
 
 bool FaldHasPanelFile(int left, int top, bool isHdr) {
+    FaldPanelLockGuard lock(g_panelsLock);
+    if (!lock.owned()) return false;
     const FaldPanelSlot* s = g_panels.Find(left, top, isHdr);
     return s && s->present;
 }
-bool FaldHasAnyPanelFile() { return g_panels.AnyPresent(); }
+bool FaldHasAnyPanelFile() { return g_anyPanelPresent.load(); }
 
 int FaldLoadPanelFiles(const char* lutFolder) {
+    FaldPanelLockGuard lock(g_panelsLock, true);   // attach: no present runs yet
     g_panels.Clear();
+    g_anyPanelPresent.store(false);
     if (!lutFolder) return 0;
 
     char dirA[MAX_PATH];
@@ -273,6 +279,7 @@ int FaldLoadPanelFiles(const char* lutFolder) {
         if (g_panels.AddStaged(left, top, isHdr, std::move(params))) loaded++;
     } while (FindNextFileA(h, &fd) != 0);
     FindClose(h);
+    RefreshAnyPanelPresent();
 
     LogF("FALD: %d panel file(s) loaded", loaded);
     return loaded;
@@ -294,34 +301,50 @@ static void ReleaseDeliveryView(FaldDeliveryView& d) {
 }
 
 // The section is another process's memory: every read and write of it is SEH-guarded (no C++ objects in these
-// functions, as MSVC's __try requires). The header is copied out and checked before anything else is read.
+// functions, as MSVC's __try requires). The header is copied out and checked before anything else is read. The filter
+// takes only what reading mapped memory can raise — an access violation or a paging error — and lets everything else
+// (a C++ exception, a stack overflow) go on to its own handler.
+static int SectionFaultFilter(unsigned long code) {
+    return (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR) ? EXCEPTION_EXECUTE_HANDLER
+                                                                                   : EXCEPTION_CONTINUE_SEARCH;
+}
+
 static bool SehCopy(void* dst, const void* src, size_t n) {
     __try { memcpy(dst, src, n); return true; }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    __except (SectionFaultFilter(GetExceptionCode())) { return false; }
 }
 
 // Deliver straight from the view — no copy of the file in DWM's present. Safe on memory another process could still
 // write: the parser reads the header words once into its own array and bounds every table copy by `bytes`, which the
-// header check proved lies inside the view (values could change under it, never what is read). Guarded all the same
-// (a paging error on the section): a fault refuses the delivery.
+// header check proved lies inside the view (values could change under it, never what is read). A section fault
+// (SehDeliver) or a C++ exception — bad_alloc (DeliverCaught, its own function: MSVC allows one form of exception
+// handling per function) — refuses the delivery; neither ever leaves the present.
 static const uint32_t FALD_DELIVERY_FAULT = 0xFFFFFFFFu;
+static uint32_t DeliverCaught(int left, int top, bool isHdr, uint32_t gen, const void* payload, size_t bytes,
+                              std::string* err) {
+    try {
+        return g_panels.Deliver(left, top, isHdr, gen, payload, bytes, *err);
+    } catch (...) {
+        return FALD_DELIVERY_FAULT;
+    }
+}
 static uint32_t SehDeliver(int left, int top, bool isHdr, uint32_t gen, const void* payload, size_t bytes, std::string* err) {
-    __try { return g_panels.Deliver(left, top, isHdr, gen, payload, bytes, *err); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { return FALD_DELIVERY_FAULT; }
+    __try { return DeliverCaught(left, top, isHdr, gen, payload, bytes, err); }
+    __except (SectionFaultFilter(GetExceptionCode())) { return FALD_DELIVERY_FAULT; }
 }
 
 static void SehWriteAck(DwmHookFaldPanelBlob* v, uint32_t gen, uint32_t status) {
     if (!v) return;
     __try { v->ackStatus = status; v->ackGen = gen; }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    __except (SectionFaultFilter(GetExceptionCode())) {}
 }
 
 // The verdict on the file in slot `slot` (the delivered one only: a staged file has no section to answer in).
-static void AckSlot(int slot, uint32_t status) {
+static void AckSlot(int slot, uint32_t status) {   // g_panelsLock held
     if (slot < 0 || slot >= g_panels.Count()) return;
     const FaldPanelSlot& s = g_panels.At(slot);
     const FaldDeliveryView& d = g_deliveryViews[slot];
-    if (s.gen == 0 || d.gen != s.gen) return;
+    if (!FaldPanelAckApplies(s.gen, d.gen)) return;
     SehWriteAck(d.view, d.gen, status);
 }
 
@@ -332,7 +355,7 @@ static void ReleaseDeliveryViews() {
 // Take delivery `gen` for (left, top, isHdr) into the panel table. Runs in a present of that monitor, once per generation
 // (FaldSyncPanelDeliveries). Cost: one section map + the staged file's parser reading the tables straight out of the
 // view into memory reused from the previous delivery (< 1 MB) — once per delivery, never per frame. No wait, no file
-// I/O; the log line (with the measured time) is the only write.
+// I/O; the log line (with the measured time) is the only write. g_panelsLock held.
 static void IngestDelivery(int left, int top, bool isHdr, uint32_t gen, uint32_t hostPid) {
     LARGE_INTEGER t0, t1, f;
     QueryPerformanceCounter(&t0);
@@ -343,11 +366,12 @@ static void IngestDelivery(int left, int top, bool isHdr, uint32_t gen, uint32_t
     DwmHookFaldPanelBlob* view = map ? (DwmHookFaldPanelBlob*)MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0)
                                      : nullptr;
     if (!view) {
+        const DWORD error = GetLastError();   // before CloseHandle overwrites it
         if (map) CloseHandle(map);
         // Superseded before it was opened (the config then carries a newer generation), or the host is gone.
         g_panels.MarkSeen(left, top, isHdr, gen, DWM_HOOK_FALD_PANEL_ACK_NONE);
         LogF("FALD: pos(%d,%d) %s panel delivery %u cannot be opened (error %lu) - the layer keeps its current file",
-             left, top, modeName, gen, GetLastError());
+             left, top, modeName, gen, error);
         return;
     }
     MEMORY_BASIC_INFORMATION mbi = {};
@@ -373,11 +397,14 @@ static void IngestDelivery(int left, int top, bool isHdr, uint32_t gen, uint32_t
         }
     }
     if (ack != DWM_HOOK_FALD_PANEL_ACK_INGESTED) g_panels.MarkSeen(left, top, isHdr, gen, ack);   // (Deliver marked it too)
+    RefreshAnyPanelPresent();
 
-    // Keep this section for the later verdicts; the slot's previous one is dropped (the host has closed it already).
+    // An accepted delivery's section is kept for its later verdicts (applied / build failed) and replaces the slot's
+    // previous one. A refused one is answered here and dropped: the slot still holds the file of the section it
+    // already keeps, which must stay answerable (AckSlot).
     const int slot = g_panels.IndexOf(left, top, isHdr);
     SehWriteAck(view, gen, ack);
-    if (slot >= 0) {
+    if (slot >= 0 && FaldPanelKeepsView(ack)) {
         ReleaseDeliveryView(g_deliveryViews[slot]);
         g_deliveryViews[slot].map = map;
         g_deliveryViews[slot].view = view;
@@ -402,7 +429,9 @@ static void IngestDelivery(int left, int top, bool isHdr, uint32_t gen, uint32_t
 }
 
 void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsigned int panelGen[2]) {
-    if (!panelGen) return;
+    if (!panelGen || (panelGen[0] == 0 && panelGen[1] == 0)) return;   // nothing delivered: no lock, no table walk
+    FaldPanelLockGuard lock(g_panelsLock);
+    if (!lock.owned()) return;   // another present thread is in the table: taken on a later present, never waited for
     for (int h = 0; h < 2; h++) {
         const bool isHdr = (h == 1);
         if (!g_panels.Wants(left, top, isHdr, panelGen[h])) continue;
@@ -414,6 +443,7 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
+static const size_t FALD_MONITOR_AUDITED_BYTES = 2160;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
 struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_temporal.h (the overlay's FaldResources too)
     int left = 0, top = 0;
     bool isHdr = false;
@@ -508,7 +538,28 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     // GPU cost accumulated between log lines (microseconds; from the timestamp queries)
     double gpuSumUs = 0.0, gpuStarSumUs = 0.0, gpuMaxUs = 0.0;
     unsigned int gpuSamples = 0;
+
+    // Memory of the params a live swap of THIS entry replaced: its next swap copies the new file into it (SwapPanel),
+    // so an A/B allocates nothing in DWM's present after the first switches. Per entry, never shared: two monitors may
+    // swap on two present threads. Freed with the entry's panel part (ReleaseMonitor).
+    FaldPanelParams spareParams;
 };
+
+// Live-swap audit (SwapPanel / MoveFramePart). Every field of FaldMonitor is exactly one of:
+//   COPIED into the scratch entry before the build (identity + live settings): left, top, isHdr, width, height, format,
+//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs;
+//   MOVED with the frame part (MoveFramePart): interTex / interRTV / interSRV, cleanTex / cleanSRV, primed, cover,
+//     coverCols, coverRows, coverLeft, offPresents, settleEvt, contentEvt, evtOpenTick, framesRun, lastRunUs, gpuSumUs,
+//     gpuStarSumUs, gpuMaxUs, gpuSamples;
+//   KEPT on the entry by SwapPanel itself: spareParams;
+//   BUILT FRESH by the swap (BuildTables, defaults, or on demand later): params, valid, failed, panelSeq, failedSeq,
+//     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource, zoneSlices, cb, starOn,
+//     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, and the whole
+//     FaldTemporalState base (the LED-lag bookkeeping).
+// A field added to FaldMonitor changes its size and stops this assert: put it in one of the lists above (and in
+// MoveFramePart / SwapPanel unless it is panel-file state the swap must rebuild), then update the number.
+static_assert(sizeof(FaldMonitor) == FALD_MONITOR_AUDITED_BYTES,
+              "FaldMonitor changed: classify the new field in the live-swap audit above, then update the size");
 
 // The defaults src/types.h gives FaldStarfieldSettings (used until the host sends a
 // tuning tail — an older host — and for the inert CB words while the feature is off).
@@ -573,6 +624,9 @@ static void ReleaseStar(FaldMonitor* m) {
 // One entry per (position, mode) actually seen presenting; fixed-size for the same reason as above.
 static FaldMonitor* g_monitors[FALD_MAX_PANEL_FILES] = {};
 static int g_numMonitors = 0;
+static std::atomic<bool> g_stalePending[FALD_MAX_PANEL_FILES];   // FaldMarkStale while the lock was busy (by index)
+static void MarkEntryStale(FaldMonitor* e);   // with FaldMarkStale
+static void ApplyPendingStale(bool all, int left, int top);   // with FaldMarkStale
 
 static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cb);
@@ -596,11 +650,20 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
     ReleaseTemporal(m);
     ReleaseStar(m);
+    m->spareParams = FaldPanelParams{};
     m->primed = false;
     m->valid = false;
 }
 
 void FaldReleaseAll() {
+    // Detach (under the loader lock), or a failed InitializeStuff: give a present thread that is in the table or
+    // building a bounded chance to leave (one ingest / one build; yields, no Sleep), and never wait unboundedly — a
+    // thread still inside after that is the pre-existing in-flight-present hazard of any detach, not a reason to hang
+    // dwm.exe.
+    bool locked = false;
+    for (int i = 0; i < 20000 && !(locked = g_panelsLock.TryLock()); i++) SwitchToThread();
+    if (!locked) log_to_file("FALD: releasing without the panel table lock (a present thread kept it)");
+    struct Unlock { bool on; ~Unlock() { if (on) g_panelsLock.Unlock(); } } unlock{ locked };
     for (int i = 0; i < 4; i++) { g_tsInFlight[i] = false; g_tsOwner[i] = nullptr; }   // owners are about to go
     for (int i = 0; i < g_numMonitors; i++) {
         if (!g_monitors[i]) continue;
@@ -611,11 +674,12 @@ void FaldReleaseAll() {
         g_monitors[i] = nullptr;
     }
     g_numMonitors = 0;
+    for (int i = 0; i < FALD_MAX_PANEL_FILES; i++) g_stalePending[i].store(false);
     // The panel files go with them, as before (staged ones are not re-read; a delivered one is taken again from its
     // section, which the host keeps open, at the next present: its generation is no longer marked processed).
     g_panels.Clear();
     ReleaseDeliveryViews();
-    g_swapParamsSpare = FaldPanelParams{};
+    g_anyPanelPresent.store(false);
 }
 
 static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11UnorderedAccessView** uav,
@@ -870,7 +934,7 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     n->tuning = m->tuning; n->tempSettings = m->tempSettings; n->refreshMs = m->refreshMs;
     bool built = false, moved = false;
     try {
-        n->params = std::move(g_swapParamsSpare);   // its memory ...
+        n->params = std::move(m->spareParams);      // this entry's spare memory ...
         n->params = params;                         // ... reused by the copy when large enough
         n->starFailed = false;
         MoveFramePart(n, m);
@@ -883,7 +947,7 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     if (!built) {
         if (moved) MoveFramePart(m, n);
         ReleaseMonitor(n);     // the half-built panel part (no frame part, no events)
-        g_swapParamsSpare = std::move(n->params);
+        m->spareParams = std::move(n->params);
         delete n;
         return false;
     }
@@ -892,19 +956,37 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     ReleaseMonitor(m);         // the old panel part (m holds no frame part now)
     *m = std::move(*n);        // m: the new panel part + its own frame part, events and counters back
     delete n;                  // a moved-from shell: its COM pointers are m's now (FaldMonitor releases nothing itself)
-    g_swapParamsSpare = std::move(old);
+    m->spareParams = std::move(old);
     return true;
+}
+
+static FaldMonitor* FindMonitorEntry(int left, int top, bool isHdr) {
+    for (int i = 0; i < g_numMonitors; i++) {
+        FaldMonitor* e = g_monitors[i];
+        if (e && e->left == left && e->top == top && e->isHdr == isHdr) return e;
+    }
+    return nullptr;
 }
 
 FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsigned int height,
                          DXGI_FORMAT format) {
     if (!FaldShadersReady() || width == 0 || height == 0) return nullptr;
 
-    FaldMonitor* m = nullptr;
-    for (int i = 0; i < g_numMonitors; i++) {
-        FaldMonitor* e = g_monitors[i];
-        if (e && e->left == left && e->top == top && e->isHdr == isHdr) { m = e; break; }
+    FaldPanelLockGuard lock(g_panelsLock);
+    if (!lock.owned()) {
+        // Another present thread is in the table (a delivery or a build): this present runs the entry as it is — a
+        // swap waits for a later present; an entry that is not running, or one with a stale mark still to apply, stays
+        // off once more (the caller marks it stale again; nothing of the layer was on screen for it).
+        for (int i = 0; i < g_numMonitors; i++) {
+            FaldMonitor* e = g_monitors[i];
+            if (!e || e->left != left || e->top != top || e->isHdr != isHdr) continue;
+            if (g_stalePending[i].load()) return nullptr;
+            return (e->valid && e->width == width && e->height == height && e->format == format) ? e : nullptr;
+        }
+        return nullptr;
     }
+    ApplyPendingStale(false, left, top);
+    FaldMonitor* m = FindMonitorEntry(left, top, isHdr);
     // The same position's entry for the OTHER mode never sees this mode's presents: its copy and LED-lag state are
     // void, and holding its two full-size frame textures across an HDR <-> SDR switch only costs VRAM. Free it; a
     // switch back rebuilds it fresh (the overlay resets its state on a mode switch too).
@@ -917,12 +999,19 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
     }
     const int slot = g_panels.IndexOf(left, top, isHdr);
     const FaldPanelSlot* pf = slot >= 0 ? &g_panels.At(slot) : nullptr;
-    if (pf && !pf->present) pf = nullptr;   // only refused deliveries so far: no file
-    if (m && m->width == width && m->height == height && m->format == format) {
-        if (m->valid) {
+    FaldLayerBuildState state;   // shared/fald_panel_live.h FaldLayerDecide: the latch rules, unit-tested
+    if (m) {
+        state.valid = m->valid; state.failed = m->failed;
+        state.panelSeq = m->panelSeq; state.failedSeq = m->failedSeq; state.refusedSeq = m->refusedSeq;
+    }
+    const bool sameFrame = m && m->width == width && m->height == height && m->format == format;
+    switch (FaldLayerDecide(state, sameFrame, pf)) {
+    case FaldLayerAction::Run: return m;
+    case FaldLayerAction::Off: return nullptr;
+    case FaldLayerAction::Build: break;   // below
+    case FaldLayerAction::Swap: {
             // A file delivered live since this entry was built (dwm_hook_config.h DwmHookFaldPanelBlob): swap its panel
             // part now, before any pass of this present. A failed swap is not retried for the same file.
-            if (!pf || pf->seq == m->panelSeq || pf->seq == m->refusedSeq) return m;
             LARGE_INTEGER t0, t1, f;
             QueryPerformanceCounter(&t0);
             if (SwapPanel(m, pf->params, pf->seq)) {
@@ -932,19 +1021,24 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
                      left, top, isHdr ? "HDR" : "SDR(ACM)", pf->gen, m->primed ? "primed" : "priming",
                      f.QuadPart > 0 ? (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)f.QuadPart : 0.0);
                 AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_APPLIED);
+                g_panels.Commit(left, top, isHdr);
             } else {
+                const uint32_t failedGen = pf->gen;
                 m->refusedSeq = pf->seq;
+                AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED);   // (before the revert: the slot still names it)
+                // The slot goes back to the file this entry runs (the last one built), so nothing later — a resize, a
+                // mode switch, a release after 600 presents off — rebuilds the file that just failed.
+                uint32_t seq = 0;
+                if (g_panels.RevertBuild(left, top, isHdr, &seq)) m->panelSeq = seq;
                 LogF("FALD: pos(%d,%d) %s could not build the panel file delivered live (gen %u) - the layer stays on "
-                     "the previous file", left, top, isHdr ? "HDR" : "SDR(ACM)", pf->gen);
-                AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED);
+                     "the previous file", left, top, isHdr ? "HDR" : "SDR(ACM)", failedGen);
             }
+            RefreshAnyPanelPresent();
             return m;
         }
-        if (m->failed && (!pf || pf->seq == m->failedSeq)) return nullptr;
-        // released (layer off for a while, or a mode switch), or failed on a file since replaced: rebuild below
     }
-
-    if (!pf) return nullptr;
+    // Build: first sight, a resize, released (layer off for a while, or a mode switch), or failed on a file since
+    // replaced. FaldLayerDecide returns Build only with a file in the slot.
 
     if (!m) {
         if (g_numMonitors >= FALD_MAX_PANEL_FILES) return nullptr;
@@ -965,10 +1059,15 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
         m->failed = true;     // logged once inside BuildMonitor; no per-frame retry inside DWM
         m->failedSeq = pf->seq;
         AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED);
+        // A delivered file goes back to the one it replaced (its seq moves on, so the next present builds that one,
+        // once); a staged file has nothing to go back to and stays latched off, as before.
+        g_panels.RevertBuild(left, top, isHdr, nullptr);
+        RefreshAnyPanelPresent();
         return nullptr;
     }
     m->panelSeq = pf->seq;
     AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_APPLIED);
+    g_panels.Commit(left, top, isHdr);
     return m;
 }
 
@@ -1047,16 +1146,36 @@ static void MarkEntryStale(FaldMonitor* e) {
     }
 }
 
-void FaldMarkStale(int left, int top) {
+// Stale marks that arrived while another present thread held g_panelsLock: kept per entry (g_monitors index) and
+// applied by the next present of that position that gets the lock — FaldAcquire / FaldMarkStale, on the thread that
+// presents it — before the entry is used again (FaldMarkAllStale, which marks every position anyway, applies all).
+static void ApplyPendingStale(bool all, int left, int top) {   // g_panelsLock held
     for (int i = 0; i < g_numMonitors; i++) {
         FaldMonitor* e = g_monitors[i];
-        if (e && e->left == left && e->top == top) MarkEntryStale(e);
+        if (!e || (!all && (e->left != left || e->top != top))) continue;
+        if (g_stalePending[i].exchange(false)) MarkEntryStale(e);
+    }
+}
+
+void FaldMarkStale(int left, int top) {
+    FaldPanelLockGuard lock(g_panelsLock);
+    if (lock.owned()) ApplyPendingStale(false, left, top);
+    for (int i = 0; i < g_numMonitors; i++) {
+        FaldMonitor* e = g_monitors[i];
+        if (!e || e->left != left || e->top != top) continue;
+        if (lock.owned()) MarkEntryStale(e);
+        else g_stalePending[i].store(true);   // never wait in the present: applied before the entry is used again
     }
 }
 
 void FaldMarkAllStale() {
-    for (int i = 0; i < g_numMonitors; i++)
-        if (g_monitors[i]) MarkEntryStale(g_monitors[i]);
+    FaldPanelLockGuard lock(g_panelsLock);
+    if (lock.owned()) ApplyPendingStale(true, 0, 0);
+    for (int i = 0; i < g_numMonitors; i++) {
+        if (!g_monitors[i]) continue;
+        if (lock.owned()) MarkEntryStale(g_monitors[i]);
+        else g_stalePending[i].store(true);
+    }
 }
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,

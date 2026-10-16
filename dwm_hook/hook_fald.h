@@ -60,8 +60,10 @@ int FaldLoadPanelFiles(const char* lutFolder);
 // Live panel-file delivery (dwm_hook_config.h DwmHookFaldPanelBlob): `panelGen` = the generations the shared config
 // carries for this monitor ([0] SDR, [1] HDR; DwmHookFaldTuning::panelGen), `hostPid` = its hostPid (the section name).
 // Takes a generation not processed yet into the panel table — at most one per call, in a present of THAT monitor, so
-// another monitor's present never pays for it. Cheap when nothing moved (four compares). The monitor's layer then
-// switches to the new file at its next FaldAcquire in that mode (between two presents; on failure it keeps the old one).
+// another monitor's present never pays for it. Cheap when nothing moved (two compares, no lock). Under the panel table's
+// lock, only TRIED: busy (another present thread is in the table) = taken on a later present, never waited for. The
+// monitor's layer then switches to the new file at its next FaldAcquire in that mode (between two presents; a file it
+// cannot build goes back to the last one it built).
 void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsigned int panelGen[2]);
 
 // True when this injection holds a panel file (staged or delivered) for this monitor position and mode. Cheap; no D3D.
@@ -74,7 +76,9 @@ bool FaldHasPanelFile(int left, int top, bool isHdr);
 // `format` is the back buffer's, which the full-size intermediate below has to match.
 // A file delivered live since the entry was built is swapped in here, before any pass of the present: the panel part
 // is rebuilt (LED-lag state reset), the clean source stays primed; if it cannot be built the entry keeps running on
-// the previous file (logged once, acknowledged to the host as BUILD_FAILED).
+// the previous file and the panel slot goes back to it (logged once, acknowledged to the host as BUILD_FAILED). The
+// decision is shared/fald_panel_live.h FaldLayerDecide (unit-tested). Takes the panel table's lock with TRY only: busy
+// = the entry runs as it is this present (a swap waits; an entry not running stays off once more).
 FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsigned int height,
                          DXGI_FORMAT format);
 

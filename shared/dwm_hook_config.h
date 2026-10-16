@@ -259,21 +259,27 @@ static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigT
 // resident reaches the DLL through shared memory instead (re-injecting blinked the layer off for ~1 s on every switch,
 // which made a live A/B of two panel files impossible to judge). Per delivery the host
 //   1. reads and validates the file with the parser the DLL uses (shared/fald_panel.h ParseFaldPanelParams), its
-//      transfer against the mode and its lattice against the display — a file it refuses is never delivered;
+//      transfer against the mode, its lattice and zone sweep against the display — a file it refuses is never
+//      delivered (the host re-injects instead, the old path);
 //   2. creates a NEW named section DWM_HOOK_FALD_PANEL_NAME_FMT (its pid + a host-wide generation, never 0): a
 //      DwmHookFaldPanelBlob header, then the file's bytes unchanged. Written completely, then never again;
 //   3. publishes the generation in the shared config (DwmHookFaldTuning::panelGen[mode] of that monitor's entry,
-//      inside the config's seqlock) — the DLL cannot know the name before the section is complete.
+//      inside the config's seqlock) — the DLL cannot know the name before the section is complete — and only then
+//      closes the section it superseded.
 // The DLL, on a present of that monitor whose config carries a generation it has not processed for that mode, opens
-// the section, copies header and payload out (SEH-guarded), checks the header (magic, size, generation, position,
-// mode: shared/fald_panel_live.h FaldPanelBlobCheck) and parses the payload with the staged file's parser (+ transfer
-// vs mode). Accepted: it replaces the file the DLL holds for that (position, mode); the monitor's layer rebuilds its
-// panel resources at its next run in that mode and switches over between two presents, keeping its clean source
-// primed. Until they are built — and for good if they cannot be — the layer keeps running on the previous file.
-// Refused: nothing changes. Either way the DLL writes its verdict into the section (ackGen / ackStatus), and a
-// generation is processed once. One section per generation, so a reader can never see a half-rewritten block; the
-// host closes a superseded one (the DLL drops its view when it takes the next). A re-injection stages the CURRENT file
-// again and starts every generation over at 0 (= the staged file).
+// the section, copies the header out (SEH-guarded), checks it (magic, size, generation, position, mode:
+// shared/fald_panel_live.h FaldPanelBlobCheck) and parses the payload straight from the view with the staged file's
+// parser (+ transfer vs mode), under the panel table's lock (TRIED: a present that finds it busy takes the delivery
+// on a later present). Accepted: it replaces the file the DLL holds for that (position, mode), keeping the last BUILT
+// one; the monitor's layer rebuilds its panel resources at its next run in that mode and switches over between two
+// presents, keeping its clean source primed. A file whose resources cannot be built goes back to the last built one
+// (the layer keeps running on it; a layer not running stays off). Refused: nothing changes. Either way the DLL writes
+// its verdict into the section (ackGen / ackStatus), and a generation is processed once (even with a full table). The
+// host follows the verdicts: its staging set and state.get name what the hook HOLDS, and a delivery refused, not
+// buildable or unanswered falls back to the re-injection, once per failed file. One section per generation, so a
+// reader can never see a half-rewritten block. A re-injection stages the CURRENT file again and starts every
+// generation over at 0 (= the staged file). Two dwm.exe processes (a second session) read the same sections and share
+// one verdict word per section: the last writer's verdict is what the host sees (status reporting only).
 #define DWM_HOOK_FALD_PANEL_NAME_FMT    L"Global\\DesktopLUT_DwmHook_FaldPanel_%lu_%lu"   // host pid, generation
 // Created by a DLL that takes live deliveries (beside the heartbeat event, closed with it). An older resident DLL has
 // none: the host then changes a panel file by re-injecting, as before.
@@ -287,8 +293,8 @@ static_assert(sizeof(DwmHookSharedConfigEx) == 464 + sizeof(DwmHookSharedConfigT
 #define DWM_HOOK_FALD_PANEL_ACK_INGESTED     1u   // parsed and held for that (position, mode): the layer takes it at its next run there
 #define DWM_HOOK_FALD_PANEL_ACK_APPLIED      2u   // the layer runs on it
 #define DWM_HOOK_FALD_PANEL_ACK_REFUSED      3u   // the block or the file is invalid: the previous file stays
-#define DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED 4u   // its GPU resources could not be built: a running layer stays on the
-                                                  // previous file (one not running stays off, as with a staged file)
+#define DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED 4u   // its GPU resources could not be built: the DLL went back to the last
+                                                  // file it built (a layer not running stays off, as with a staged file)
 
 #pragma pack(push, 4)
 struct DwmHookFaldPanelBlob {

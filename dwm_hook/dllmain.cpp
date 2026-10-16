@@ -398,6 +398,12 @@ static HANDLE g_heartbeatEvent = NULL;
 // Capability: this DLL takes live FALD panel-file deliveries (dwm_hook_config.h DWM_HOOK_FALD_PANEL_LIVE_EVENT).
 // Created and closed with the heartbeat: the host checks it before delivering instead of re-injecting.
 static HANDLE g_faldPanelLiveEvent = NULL;
+// Both events are closed from two places that can overlap (the host monitor thread on host exit, DLL_PROCESS_DETACH
+// when that thread's 200 ms join times out): exactly one closer takes the handle.
+static void CloseHandleOnce(HANDLE* h) {
+	HANDLE taken = (HANDLE)InterlockedExchangePointer((PVOID volatile*)h, NULL);
+	if (taken) CloseHandle(taken);
+}
 
 // --- Host process monitoring: detect orphaned injection ---
 // dwm.exe is a Protected Process on Win11 — cannot call OpenProcess() on non-PP processes.
@@ -476,14 +482,8 @@ static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
 			}
 
 			// Close heartbeat event so host watchdog (if restarted) sees it as gone
-			if (g_heartbeatEvent) {
-				CloseHandle(g_heartbeatEvent);
-				g_heartbeatEvent = NULL;
-			}
-			if (g_faldPanelLiveEvent) {
-				CloseHandle(g_faldPanelLiveEvent);
-				g_faldPanelLiveEvent = NULL;
-			}
+			CloseHandleOnce(&g_heartbeatEvent);
+			CloseHandleOnce(&g_faldPanelLiveEvent);
 
 			log_to_file("DWM hook reverted (host exit) — DLL remains loaded but inert");
 			break;
@@ -1793,8 +1793,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		if (g_hostMonitorStopEvent) { CloseHandle(g_hostMonitorStopEvent); g_hostMonitorStopEvent = NULL; }
 
 		// Close heartbeat event (host will see hook as gone)
-		if (g_heartbeatEvent) { CloseHandle(g_heartbeatEvent); g_heartbeatEvent = NULL; }
-		if (g_faldPanelLiveEvent) { CloseHandle(g_faldPanelLiveEvent); g_faldPanelLiveEvent = NULL; }
+		CloseHandleOnce(&g_heartbeatEvent);
+		CloseHandleOnce(&g_faldPanelLiveEvent);
 
 		// Only revert hooks/overlay mode if not already done by host monitor
 		if (!g_hookReverted.exchange(true)) {

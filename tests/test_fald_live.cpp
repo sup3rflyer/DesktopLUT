@@ -13,10 +13,12 @@
 // gate. The host-side staging decision (no re-inject after a live delivery) is in test_reconcile.cpp.
 #include "doctest.h"
 #include "../shared/fald_panel_live.h"
+#include "fald_panel_legacy_loader.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -533,7 +536,14 @@ TEST_CASE("FALD live: a slot with only refused deliveries holds no file; the tab
     std::string why;
     CHECK(Ingest(t, over, over.size(), 99, 99999, 0, true, &why) == DWM_HOOK_FALD_PANEL_ACK_REFUSED);
     CHECK(why == "no free panel slot");
+    // Processed once all the same: the hook never opens, maps and refuses it again on every present (review fix)
+    CHECK_FALSE(t.Wants(99999, 0, true, 99));
+    CHECK(t.Wants(99999, 0, false, 99));                            // the other mode is its own pair
+    CHECK(t.Wants(99999, 0, true, 100));                            // a newer generation is taken (refused again) once
+    t.MarkSeen(99999, 0, true, 100, DWM_HOOK_FALD_PANEL_ACK_NONE);  // (a section that could not be opened)
+    CHECK_FALSE(t.Wants(99999, 0, true, 100));
     CHECK(t.Count() == FaldPanelTable::kCapacity);
+    CHECK(t.Find(99999, 0, true) == nullptr);                       // it never got a slot
     CHECK(t.Find(100, 0, true) == first);                           // slots never move (the hook holds pointers)
     t.Clear();
     CHECK(t.Count() == 0);
@@ -558,4 +568,397 @@ TEST_CASE("FALD live: the wire layout - generations ride the tuning tail where _
     wchar_t name[96];
     swprintf_s(name, DWM_HOOK_FALD_PANEL_NAME_FMT, 1234ul, 56ul);
     CHECK(std::wstring(name) == L"Global\\DesktopLUT_DwmHook_FaldPanel_1234_56");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Review fixes (2026-10-16): the pre-refactor reference, build reverts, the table lock, the build decision, the host's
+// verdict bookkeeping.
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+
+// Digest of every field (SameBits order) + the tables: a golden value recorded from the pre-refactor loader.
+uint64_t ParamsDigest(const FaldPanelParams& p) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void* d, size_t n) {
+        const unsigned char* b = static_cast<const unsigned char*>(d);
+        for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+#define FLD_MIX(f) mix(&p.f, sizeof(p.f));
+    FLD_MIX(cols) FLD_MIX(rows) FLD_MIX(sub) FLD_MIX(cellW) FLD_MIX(cellH) FLD_MIX(originX) FLD_MIX(originY)
+    FLD_MIX(reachTrueC) FLD_MIX(reachTrueR) FLD_MIX(reachEstC) FLD_MIX(reachEstR) FLD_MIX(curveN)
+    FLD_MIX(white) FLD_MIX(tmin) FLD_MIX(area0) FLD_MIX(gainMin) FLD_MIX(gainMax) FLD_MIX(driveFloor) FLD_MIX(w)
+    FLD_MIX(curveLogMin) FLD_MIX(curveLogMax) FLD_MIX(estPhasePx) FLD_MIX(estPhasePy) FLD_MIX(fadeLo) FLD_MIX(fadeHi)
+    FLD_MIX(gainSmoothCells) FLD_MIX(lumFadeLo) FLD_MIX(lumFadeHi) FLD_MIX(pedRGB) FLD_MIX(pedModeFile)
+    FLD_MIX(chromaGain) FLD_MIX(chromaLo) FLD_MIX(chromaHi) FLD_MIX(hasPedColour) FLD_MIX(transfer) FLD_MIX(sdrGamma)
+    FLD_MIX(hasTransfer) FLD_MIX(boostN) FLD_MIX(boostLo) FLD_MIX(boostVal) FLD_MIX(boostLitNits) FLD_MIX(boostLitFrac)
+    FLD_MIX(boostDimNits) FLD_MIX(boostDimFrac) FLD_MIX(boostRule) FLD_MIX(boostMeanGamma) FLD_MIX(boostMeanThresh)
+    FLD_MIX(hasBoost)
+#undef FLD_MIX
+    if (!p.curve.empty()) mix(p.curve.data(), p.curve.size() * 4);
+    if (!p.kTrue.empty()) mix(p.kTrue.data(), p.kTrue.size() * 4);
+    if (!p.kEst.empty()) mix(p.kEst.data(), p.kEst.size() * 4);
+    return h;
+}
+
+std::wstring FileNameOf(const std::wstring& path) {
+    const size_t s = path.find_last_of(L"\\/");
+    return s == std::wstring::npos ? path : path.substr(s + 1);
+}
+
+}  // namespace
+
+TEST_CASE("FALD live: the parser matches the PRE-refactor loader (main e30d567, frozen copy) bit for bit") {
+    // Accepted images of every version, and refusals: same verdict, same words, the same `out` left behind.
+    std::vector<std::vector<char>> images;
+    for (int v = 1; v <= 4; v++) images.push_back(PanelImage(v));
+    images.push_back(PanelImage(3, true));
+    images.push_back(PanelImage(4, true, 1.7f, 700));
+    {
+        std::vector<char> bad = PanelImage(4); bad.resize(bad.size() - 4); images.push_back(bad);   // size mismatch
+    }
+    {
+        std::vector<char> bad = PanelImage(4); const float z = 0.0f; std::memcpy(bad.data() + 13 * 4, &z, 4);
+        images.push_back(bad);                                                                      // implausible header
+    }
+    {
+        std::vector<char> bad = PanelImage(2); const float lo = 6.0f; std::memcpy(bad.data() + 29 * 4, &lo, 4);
+        images.push_back(bad);                                                                      // lum fade words
+    }
+    {
+        std::vector<char> bad = PanelImage(4); const uint32_t steps = 30; std::memcpy(bad.data() + 48 * 4, &steps, 4);
+        images.push_back(bad);                                                                      // boost step count
+    }
+    {
+        std::vector<char> bad = PanelImage(3, true); const float g = 9.0f; std::memcpy(bad.data() + 41 * 4, &g, 4);
+        images.push_back(bad);                                                                      // sdr gamma word
+    }
+    images.push_back(std::vector<char>(100, 'x'));                                                  // too short
+    images.push_back(std::vector<char>(4096, 'x'));                                                 // bad magic
+    int i = 0;
+    for (const std::vector<char>& img : images) {
+        CAPTURE(i);
+        LiveTempFile tf(L"test_fald_live_legacy.bin");
+        WriteFile(tf.path, img);
+        FaldPanelParams legacy, parsed;
+        std::string e1, e2;
+        const bool ok1 = fald_legacy::LegacyLoadFaldPanelParams(tf.path, legacy, e1);
+        const bool ok2 = ParseFaldPanelParams(img.data(), img.size(), parsed, e2);
+        CHECK(ok1 == ok2);
+        CHECK(e1 == e2);
+        CHECK(SameBits(legacy, parsed));
+        i++;
+    }
+}
+
+TEST_CASE("FALD live: the owner's real panel files - the parser gives what the pre-refactor loader gave (golden digests)") {
+    // Recorded 2026-10-16 with the frozen e30d567 loader (fald_panel_legacy_loader.h) on the owner's files.
+    struct Golden { const wchar_t* name; uint64_t digest; };
+    const Golden golden[] = {
+        { L"candidate_C_fade3_only.bin", 15198191955005425082ull },
+        { L"candidate_A.bin", 8929939367594176627ull },
+        { L"pa32ucxr_fald_panel_boost_meanrule_blur0.7.bin", 1396627848392130778ull },
+        { L"pa32ucxr_refit_sdr_fald_panel_blur0.7.bin", 13859748343925715473ull },
+    };
+    const std::vector<std::wstring> files = RealPanelFiles();
+    if (files.empty()) {
+        MESSAGE("no real panel file on this machine (set FALD_TEST_PANEL_FILES) - covered by the synthetic images only");
+        return;
+    }
+    for (const std::wstring& path : files) {
+        char pathBuf[MAX_PATH * 2] = {};
+        WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, pathBuf, (int)sizeof(pathBuf), nullptr, nullptr);
+        CAPTURE(std::string(pathBuf));
+        FaldPanelParams legacy, parsed;
+        std::string err;
+        REQUIRE(fald_legacy::LegacyLoadFaldPanelParams(path, legacy, err));
+        const std::vector<char> bytes = ReadAll(path);
+        REQUIRE(ParseFaldPanelParams(bytes.data(), bytes.size(), parsed, err));
+        CHECK(SameBits(legacy, parsed));
+        const uint64_t d = ParamsDigest(legacy);
+        for (const Golden& g : golden) {
+            if (FileNameOf(path) != g.name) continue;
+            CHECK(d == g.digest);
+        }
+    }
+}
+
+TEST_CASE("FALD live: a delivered file the layer cannot build goes back to the last one it built (RevertBuild / Commit)") {
+    std::vector<FaldPanelParams> f;
+    std::vector<std::vector<char>> img;
+    for (int k = 0; k < 6; k++) {
+        img.push_back(PanelImage(4, false, 1.0f + 0.1f * (float)k));
+        FaldPanelParams p;
+        std::string e;
+        REQUIRE(ParseFaldPanelParams(img.back().data(), img.back().size(), p, e));
+        f.push_back(p);
+    }
+    FaldPanelTable t;
+    FaldPanelParams a = f[0];
+    REQUIRE(t.AddStaged(0, 0, true, std::move(a)));              // A staged, seq 1
+    std::string e;
+    uint32_t seq = 0;
+    const FaldPanelSlot* s = t.Find(0, 0, true);
+    // B delivered, not buildable -> back to A (seq moves on: the running entry is re-marked as built from it)
+    REQUIRE(t.Deliver(0, 0, true, 1, img[1].data(), img[1].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    CHECK(s->hasPrev);
+    CHECK(t.RevertBuild(0, 0, true, &seq));
+    CHECK(seq == 3u);
+    CHECK(s->seq == 3u);
+    CHECK(s->gen == 0u);                                           // the staged file again
+    CHECK(s->present);
+    CHECK(SameBits(f[0], s->params));
+    CHECK_FALSE(s->hasPrev);
+    CHECK_FALSE(t.RevertBuild(0, 0, true, &seq));                   // nothing more to go back to: the staged file stays
+    // B delivered and built (Commit) -> C delivered, not buildable -> back to B
+    REQUIRE(t.Deliver(0, 0, true, 2, img[1].data(), img[1].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    t.Commit(0, 0, true);
+    CHECK_FALSE(s->hasPrev);
+    REQUIRE(t.Deliver(0, 0, true, 3, img[2].data(), img[2].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    CHECK(t.RevertBuild(0, 0, true, &seq));
+    CHECK(SameBits(f[1], s->params));
+    CHECK(s->gen == 2u);
+    // D and E delivered while the layer was not running (never built): a failed E goes back to B, the last BUILT one
+    REQUIRE(t.Deliver(0, 0, true, 4, img[3].data(), img[3].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    REQUIRE(t.Deliver(0, 0, true, 5, img[4].data(), img[4].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    CHECK(SameBits(f[4], s->params));
+    CHECK(t.RevertBuild(0, 0, true, &seq));
+    CHECK(SameBits(f[1], s->params));
+    CHECK(s->gen == 2u);
+    // a refused delivery between them changes nothing to revert to
+    REQUIRE(t.Deliver(0, 0, true, 6, img[5].data(), img[5].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    std::vector<char> junk(512, 'q');
+    CHECK(t.Deliver(0, 0, true, 7, junk.data(), junk.size(), e) == DWM_HOOK_FALD_PANEL_ACK_REFUSED);
+    CHECK(SameBits(f[5], s->params));
+    CHECK(t.RevertBuild(0, 0, true, &seq));
+    CHECK(SameBits(f[1], s->params));
+    // the first file of a slot that had none goes back to none: no file, the layer stays off
+    REQUIRE(t.Deliver(3840, 0, true, 8, img[0].data(), img[0].size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    REQUIRE(t.Find(3840, 0, true)->present);
+    CHECK(t.RevertBuild(3840, 0, true, &seq));
+    CHECK_FALSE(t.Find(3840, 0, true)->present);
+    CHECK(t.Find(3840, 0, true)->params.curve.empty());
+}
+
+TEST_CASE("FALD live: two monitors never share parse memory; the table lock serialises present threads (stress)") {
+    const std::vector<char> fileA = PanelImage(4, false, 1.0f), fileB = PanelImage(4, false, 1.4f);
+    FaldPanelParams a, b;
+    std::string e;
+    REQUIRE(ParseFaldPanelParams(fileA.data(), fileA.size(), a, e));
+    REQUIRE(ParseFaldPanelParams(fileB.data(), fileB.size(), b, e));
+
+    // Per slot: interleaved deliveries to two displays keep each display's own file and own buffers.
+    {
+        FaldPanelTable t;
+        for (uint32_t g = 1; g <= 6; g++) {
+            const std::vector<char>& f1 = (g & 1) ? fileA : fileB;
+            const std::vector<char>& f2 = (g & 1) ? fileB : fileA;
+            REQUIRE(t.Deliver(0, 0, true, g, f1.data(), f1.size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+            REQUIRE(t.Deliver(3840, 0, true, g, f2.data(), f2.size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+            t.Commit(0, 0, true);
+            if (g % 3) t.Commit(3840, 0, true);
+            const FaldPanelSlot* s1 = t.Find(0, 0, true);
+            const FaldPanelSlot* s2 = t.Find(3840, 0, true);
+            CHECK(SameBits((g & 1) ? a : b, s1->params));
+            CHECK(SameBits((g & 1) ? b : a, s2->params));
+            CHECK(s1->params.kTrue.data() != s2->params.kTrue.data());
+            if (!s1->spare.kTrue.empty() && !s2->spare.kTrue.empty())
+                CHECK(s1->spare.kTrue.data() != s2->spare.kTrue.data());
+        }
+    }
+
+    // Threads: each one delivers to its own display under the lock (spinning on TryLock — a present thread would skip
+    // instead), a reader reads every slot's file under the lock. Any unserialised table write corrupts the heap here.
+    FaldPanelTable t;
+    FaldPanelLock lock;
+    const int kThreads = 6, kRounds = 120;
+    std::atomic<int> skipped{ 0 };
+    std::atomic<bool> stop{ false };
+    std::atomic<int> badReads{ 0 };
+    std::vector<std::thread> threads;
+    for (int k = 0; k < kThreads; k++) {
+        threads.emplace_back([&, k]() {
+            std::string err;
+            for (int r = 1; r <= kRounds; r++) {
+                const std::vector<char>& f = (r & 1) ? fileA : fileB;
+                for (;;) {
+                    FaldPanelLockGuard g(lock);
+                    if (!g.owned()) { skipped++; std::this_thread::yield(); continue; }
+                    t.Deliver(k * 1000, 0, (r % 4) < 2, (uint32_t)r, f.data(), f.size(), err);
+                    if (r % 3 == 0) t.Commit(k * 1000, 0, (r % 4) < 2);
+                    else if (r % 5 == 0) t.RevertBuild(k * 1000, 0, (r % 4) < 2, nullptr);
+                    break;
+                }
+            }
+        });
+    }
+    std::thread reader([&]() {
+        while (!stop.load()) {
+            FaldPanelLockGuard g(lock);
+            if (!g.owned()) { std::this_thread::yield(); continue; }
+            for (int i = 0; i < t.Count(); i++) {
+                const FaldPanelSlot& s = t.At(i);
+                if (!s.present) continue;
+                if (!SameBits(a, s.params) && !SameBits(b, s.params)) badReads++;
+            }
+        }
+    });
+    for (auto& th : threads) th.join();
+    stop = true;
+    reader.join();
+    CHECK(badReads.load() == 0);
+    CHECK(t.Count() == 2 * kThreads);
+    for (int k = 0; k < kThreads; k++)
+        for (bool hdr : { true, false }) {
+            const FaldPanelSlot* s = t.Find(k * 1000, 0, hdr);
+            REQUIRE(s);
+            if (s->present) CHECK((SameBits(a, s->params) || SameBits(b, s->params)));
+        }
+    MESSAGE("lock busy " << skipped.load() << " times (each a skipped present in the hook)");
+}
+
+TEST_CASE("FALD live: the layer's build decision (FaldAcquire's latch rules)") {
+    FaldPanelSlot slot;
+    slot.present = true;
+    slot.seq = 4;
+    FaldLayerBuildState none;
+    CHECK(FaldLayerDecide(none, false, &slot) == FaldLayerAction::Build);     // first sight
+    CHECK(FaldLayerDecide(none, false, nullptr) == FaldLayerAction::Off);     // no file
+    FaldPanelSlot refusedOnly;                                                // only refused deliveries: no file
+    CHECK(FaldLayerDecide(none, false, &refusedOnly) == FaldLayerAction::Off);
+
+    FaldLayerBuildState run;
+    run.valid = true; run.panelSeq = 4;
+    CHECK(FaldLayerDecide(run, true, &slot) == FaldLayerAction::Run);
+    CHECK(FaldLayerDecide(run, false, &slot) == FaldLayerAction::Build);      // a resize rebuilds
+    CHECK(FaldLayerDecide(run, true, nullptr) == FaldLayerAction::Run);       // (no slot: keeps running)
+    slot.seq = 5;                                                             // a delivery
+    CHECK(FaldLayerDecide(run, true, &slot) == FaldLayerAction::Swap);
+    run.refusedSeq = 5;                                                       // that swap failed: not retried
+    CHECK(FaldLayerDecide(run, true, &slot) == FaldLayerAction::Run);
+    slot.seq = 6;                                                             // a newer file: tried
+    CHECK(FaldLayerDecide(run, true, &slot) == FaldLayerAction::Swap);
+
+    FaldLayerBuildState failed;
+    failed.failed = true; failed.failedSeq = 6;
+    CHECK(FaldLayerDecide(failed, true, &slot) == FaldLayerAction::Off);      // latched for this file
+    CHECK(FaldLayerDecide(failed, false, &slot) == FaldLayerAction::Build);   // a resize clears it
+    slot.seq = 7;                                                             // a newer (or reverted) file
+    CHECK(FaldLayerDecide(failed, true, &slot) == FaldLayerAction::Build);
+
+    // The sequences FaldAcquire runs, against a real table.
+    const std::vector<char> fa = PanelImage(4, false, 1.0f), fb = PanelImage(4, false, 1.2f), fc = PanelImage(4, false, 1.3f);
+    FaldPanelParams pa;
+    std::string e;
+    REQUIRE(ParseFaldPanelParams(fa.data(), fa.size(), pa, e));
+    FaldPanelTable t;
+    REQUIRE(t.AddStaged(0, 0, true, std::move(pa)));
+    FaldLayerBuildState m;
+    REQUIRE(FaldLayerDecide(m, false, t.Find(0, 0, true)) == FaldLayerAction::Build);
+    m.valid = true; m.panelSeq = t.Find(0, 0, true)->seq; t.Commit(0, 0, true);          // built
+    REQUIRE(t.Deliver(0, 0, true, 1, fb.data(), fb.size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    REQUIRE(FaldLayerDecide(m, true, t.Find(0, 0, true)) == FaldLayerAction::Swap);
+    m.refusedSeq = t.Find(0, 0, true)->seq;                                                // the swap failed ...
+    uint32_t seq = 0;
+    REQUIRE(t.RevertBuild(0, 0, true, &seq));                                              // ... the slot goes back
+    m.panelSeq = seq;
+    CHECK(FaldLayerDecide(m, true, t.Find(0, 0, true)) == FaldLayerAction::Run);         // and the entry runs A
+    REQUIRE(t.Deliver(0, 0, true, 2, fc.data(), fc.size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    REQUIRE(FaldLayerDecide(m, true, t.Find(0, 0, true)) == FaldLayerAction::Swap);
+    m.panelSeq = t.Find(0, 0, true)->seq; t.Commit(0, 0, true);                          // this one built
+    CHECK(FaldLayerDecide(m, true, t.Find(0, 0, true)) == FaldLayerAction::Run);
+    // A fresh build of a delivered file fails (the entry was released): latched for it, the slot goes back, and the
+    // previous file is built on the next present.
+    FaldLayerBuildState fresh;
+    REQUIRE(t.Deliver(0, 0, true, 3, fb.data(), fb.size(), e) == DWM_HOOK_FALD_PANEL_ACK_INGESTED);
+    REQUIRE(FaldLayerDecide(fresh, true, t.Find(0, 0, true)) == FaldLayerAction::Build);
+    fresh.failed = true; fresh.failedSeq = t.Find(0, 0, true)->seq;
+    REQUIRE(t.RevertBuild(0, 0, true, nullptr));
+    CHECK(FaldLayerDecide(fresh, true, t.Find(0, 0, true)) == FaldLayerAction::Build);
+    // ... and a staged file that cannot be built stays latched off (nothing to go back to)
+    FaldLayerBuildState staged;
+    FaldPanelTable t2;
+    FaldPanelParams pa2;
+    REQUIRE(ParseFaldPanelParams(fa.data(), fa.size(), pa2, e));
+    REQUIRE(t2.AddStaged(0, 0, true, std::move(pa2)));
+    staged.failed = true; staged.failedSeq = t2.Find(0, 0, true)->seq;
+    CHECK_FALSE(t2.RevertBuild(0, 0, true, nullptr));
+    CHECK(FaldLayerDecide(staged, true, t2.Find(0, 0, true)) == FaldLayerAction::Off);
+}
+
+TEST_CASE("FALD live: the DLL answers only in the section of the file a slot holds") {
+    CHECK_FALSE(FaldPanelAckApplies(0, 0));      // a staged file has no section
+    CHECK_FALSE(FaldPanelAckApplies(0, 7));
+    CHECK(FaldPanelAckApplies(7, 7));
+    CHECK_FALSE(FaldPanelAckApplies(7, 8));      // a refused later delivery never replaced the kept section
+    CHECK(FaldPanelKeepsView(DWM_HOOK_FALD_PANEL_ACK_INGESTED));
+    CHECK_FALSE(FaldPanelKeepsView(DWM_HOOK_FALD_PANEL_ACK_REFUSED));
+    CHECK_FALSE(FaldPanelKeepsView(DWM_HOOK_FALD_PANEL_ACK_NONE));
+}
+
+TEST_CASE("FALD live: the host follows the hook's verdicts (held vs sent) and falls back once per failed file") {
+    const unsigned ticks = 3;
+    FaldPanelTrack t;
+    t.Stage(L"A.bin");
+    CHECK(t.heldPath == L"A.bin");
+    CHECK(t.gen == 0u);
+    CHECK(FaldPanelTrackStep(t, 0, 0, true, ticks) == FaldPanelStep::None);      // nothing sent: nothing to wait for
+
+    // no answer: counted only on due ticks; the third one gives up — the hook keeps A
+    t.Sent(L"B.bin", 5);
+    CHECK(FaldPanelTrackStep(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, false, ticks) == FaldPanelStep::None);
+    CHECK(FaldPanelTrackStep(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, true, ticks) == FaldPanelStep::None);
+    CHECK(FaldPanelTrackStep(t, 4, DWM_HOOK_FALD_PANEL_ACK_APPLIED, true, ticks) == FaldPanelStep::None);   // old gen
+    CHECK(FaldPanelTrackStep(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, true, ticks) == FaldPanelStep::Failed);
+    CHECK(t.verdict == FALD_PANEL_VERDICT_NO_ACK);
+    CHECK(t.heldPath == L"A.bin");
+    CHECK(t.final);
+    CHECK(FaldPanelTrackStep(t, 5, DWM_HOOK_FALD_PANEL_ACK_APPLIED, true, ticks) == FaldPanelStep::None);   // decided
+
+    // held, then built
+    t.Sent(L"C.bin", 6);
+    CHECK(FaldPanelTrackStep(t, 6, DWM_HOOK_FALD_PANEL_ACK_INGESTED, false, ticks) == FaldPanelStep::Ingested);
+    CHECK(t.heldPath == L"C.bin");
+    CHECK_FALSE(t.final);
+    CHECK(FaldPanelTrackStep(t, 6, DWM_HOOK_FALD_PANEL_ACK_INGESTED, true, ticks) == FaldPanelStep::None);   // once
+    CHECK(FaldPanelTrackStep(t, 6, DWM_HOOK_FALD_PANEL_ACK_APPLIED, false, ticks) == FaldPanelStep::Applied);
+    CHECK(t.basePath == L"C.bin");
+    CHECK(t.final);
+
+    // refused: the hook keeps C
+    t.Sent(L"D.bin", 7);
+    CHECK(FaldPanelTrackStep(t, 7, DWM_HOOK_FALD_PANEL_ACK_REFUSED, false, ticks) == FaldPanelStep::Failed);
+    CHECK(t.heldPath == L"C.bin");
+
+    // held, then the build failed: the DLL went back to the last built file (C), not to D
+    t.Sent(L"D.bin", 8);
+    t.Sent(L"E.bin", 9);                                                           // D superseded before any answer
+    CHECK(FaldPanelTrackStep(t, 9, DWM_HOOK_FALD_PANEL_ACK_INGESTED, false, ticks) == FaldPanelStep::Ingested);
+    CHECK(t.heldPath == L"E.bin");
+    CHECK(FaldPanelTrackStep(t, 9, DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED, false, ticks) == FaldPanelStep::Failed);
+    CHECK(t.heldPath == L"C.bin");
+    CHECK(t.verdict == DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED);
+
+    // an injection starts everything over from the staged file
+    t.Stage(L"E.bin");
+    CHECK(t.heldPath == L"E.bin");
+    CHECK(t.basePath == L"E.bin");
+    CHECK(t.gen == 0u);
+
+    // one fallback re-injection per failed file stamp — a file that fails again after it must not loop
+    FaldPanelFallbackGuard guard;
+    CHECK(guard.Allow(0, 0, true, L"E.bin", 576416, 1000));
+    CHECK_FALSE(guard.Allow(0, 0, true, L"E.bin", 576416, 1000));
+    CHECK(guard.Allow(0, 0, true, L"E.bin", 576416, 1001));     // re-exported: a new stamp may fall back once more
+    CHECK(guard.Allow(0, 0, false, L"E.bin", 576416, 1000));    // the other mode
+    CHECK(guard.Allow(3840, 0, true, L"E.bin", 576416, 1000));  // another display
+    CHECK(guard.Count() == 4u);
+}
+
+TEST_CASE("FALD live: the content hash tells a touched file from a re-exported one") {
+    const std::vector<char> a = PanelImage(4, false, 1.0f);
+    std::vector<char> b = a;
+    CHECK(FaldPanelContentHash(a.data(), a.size()) == FaldPanelContentHash(b.data(), b.size()));
+    b[b.size() / 2] ^= 1;
+    CHECK(FaldPanelContentHash(a.data(), a.size()) != FaldPanelContentHash(b.data(), b.size()));
+    CHECK(FaldPanelContentHash(a.data(), a.size() - 1) != FaldPanelContentHash(a.data(), a.size()));
 }
