@@ -92,6 +92,8 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 // Resolve each display's Windows tone map again (ReconcileWindowsToneMap; any thread -> GUI thread). wParam 1 =
 // Windows may have dropped the DisplayConfig override (a mode change, a wake, a driver reset): send it again.
 #define WM_WINDOWS_TONEMAP       (WM_USER + 111)
+// The FALD panel re-export poll's worker thread finished (dwm_inject.h StartDwmHookFaldPanelPoll; lParam = results).
+#define WM_FALD_PANEL_POLL_DONE  (WM_USER + 112)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
@@ -296,6 +298,7 @@ const int RECONCILE_RETRY_MS = 500;
 const int WINDOWS_TONEMAP_TIMER_ID = 119;      // Retry of a Windows tone map reconcile that had to wait (profile maintenance,
                                                 //   a calibration / live edit / MHC dialog) or whose profile swap failed
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
+const int FALD_PANEL_VERDICT_TIMER_ID = 120;     // Hook FALD: read the DWM hook's answer on a live panel-file delivery
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
 const int MHC_VERIFY_TIMER_ID = 106;            // Periodic re-assertion of MHC ICC profile associations

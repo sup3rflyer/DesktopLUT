@@ -81,6 +81,14 @@ struct FaldPanelParams {
 
 // Resets `out` first: nothing of a previously loaded file (transfer, pedestal colour, optional words) survives.
 bool LoadFaldPanelParams(const std::wstring& path, FaldPanelParams& out, std::string& err);
+// The same parser over a file image already in memory (any alignment): LoadFaldPanelParams reads the file and calls
+// this, and the DWM hook parses a panel file the host delivered live through shared memory with it (dwm_hook_config.h
+// DwmHookFaldPanelBlob) - so a delivered file and the same file staged at injection give bit-identical params.
+// Resets `out` first, like the loader (the tables keep their allocations, emptied); every check (and every error text)
+// is the loader's. The hook parses straight from another process's section, so this reads the header words exactly
+// once (into its own array) and bounds every table copy by `bytes`: memory written concurrently can change the values
+// it copies, never what it reads.
+bool ParseFaldPanelParams(const void* data, size_t bytes, FaldPanelParams& out, std::string& err);
 // Cheap header peek: does the file at `path` carry a pedestal colour (FLD2/FLD3)? false for FLD1, unreadable or missing.
 bool FaldPanelFileHasPedColour(const std::wstring& path);
 // Cheap header peek: the file's signal transfer (FALD_TRANSFER_PQ / FALD_TRANSFER_GAMMA) without loading the

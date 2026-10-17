@@ -395,6 +395,15 @@ static void ResolveDisableIndependentFlip(const unsigned char* modBase, size_t m
 
 // --- Heartbeat event: signals to host that the DWM hook is active ---
 static HANDLE g_heartbeatEvent = NULL;
+// Capability: this DLL takes live FALD panel-file deliveries (dwm_hook_config.h DWM_HOOK_FALD_PANEL_LIVE_EVENT).
+// Created and closed with the heartbeat: the host checks it before delivering instead of re-injecting.
+static HANDLE g_faldPanelLiveEvent = NULL;
+// Both events are closed from two places that can overlap (the host monitor thread on host exit, DLL_PROCESS_DETACH
+// when that thread's 200 ms join times out): exactly one closer takes the handle.
+static void CloseHandleOnce(HANDLE* h) {
+	HANDLE taken = (HANDLE)InterlockedExchangePointer((PVOID volatile*)h, NULL);
+	if (taken) CloseHandle(taken);
+}
 
 // --- Host process monitoring: detect orphaned injection ---
 // dwm.exe is a Protected Process on Win11 — cannot call OpenProcess() on non-PP processes.
@@ -473,10 +482,8 @@ static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
 			}
 
 			// Close heartbeat event so host watchdog (if restarted) sees it as gone
-			if (g_heartbeatEvent) {
-				CloseHandle(g_heartbeatEvent);
-				g_heartbeatEvent = NULL;
-			}
+			CloseHandleOnce(&g_heartbeatEvent);
+			CloseHandleOnce(&g_faldPanelLiveEvent);
 
 			log_to_file("DWM hook reverted (host exit) — DLL remains loaded but inert");
 			break;
@@ -699,6 +706,7 @@ static void UpdateLocalTonemapFromShared() {
 			fp.flags = local.faldFlags[i];
 			fp.hasTuning = tailValid;
 			if (tailValid) fp.tuning = localEx.tail.fald[i];
+			fp.hostPid = local.hostPid;   // live panel-file deliveries are named by it (hook_fald.h)
 			g_numLocalFald++;
 		}
 	}
@@ -1721,6 +1729,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						log_to_file("Heartbeat event created: Global\\DesktopLUT_DwmHook_Active");
 					else
 						log_to_file("WARNING: Failed to create heartbeat event");
+					// Live FALD panel-file deliveries are taken (no re-injection for a panel-file change). Not fatal:
+					// without it the host re-injects as before.
+					g_faldPanelLiveEvent = CreateEventW(&sa, TRUE, TRUE, DWM_HOOK_FALD_PANEL_LIVE_EVENT);
+					if (!g_faldPanelLiveEvent)
+						log_to_file("WARNING: FALD panel live-delivery event not created - panel file changes re-inject");
 				}
 
 				// Start host process monitor (detects orphaned injection)
@@ -1780,7 +1793,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		if (g_hostMonitorStopEvent) { CloseHandle(g_hostMonitorStopEvent); g_hostMonitorStopEvent = NULL; }
 
 		// Close heartbeat event (host will see hook as gone)
-		if (g_heartbeatEvent) { CloseHandle(g_heartbeatEvent); g_heartbeatEvent = NULL; }
+		CloseHandleOnce(&g_heartbeatEvent);
+		CloseHandleOnce(&g_faldPanelLiveEvent);
 
 		// Only revert hooks/overlay mode if not already done by host monitor
 		if (!g_hookReverted.exchange(true)) {

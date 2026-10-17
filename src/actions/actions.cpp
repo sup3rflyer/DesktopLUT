@@ -260,10 +260,13 @@ Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload
         enabledNow = fald.enabled;
     }
     if (!changed) return Done(false);
+    // Hook mode: a resident hook takes the file live — no re-injection, the layer switches between two presents.
+    // Before PushFald, whose reconcile then sees the hook holding the new file (no restart for the path change).
+    const bool live = FaldPanelFileChangedLive(mon, hdr);
     const ReconcileDecision d = PushFald(mon, hdr, enabledNow);
-    // Hook mode: the DLL reads panel files only at injection (a new path already changed the display list
+    // Not delivered: the DLL reads the file at injection (a new path already changed the display list
     // and restarted it; a reload of the same path did not).
-    if (d != ReconcileDecision::Start && d != ReconcileDecision::Restart) FaldPanelFileChangedReinject();
+    if (!live && d != ReconcileDecision::Start && d != ReconcileDecision::Restart) FaldPanelFileChangedReinject();
     Finish(mon);
     return Done();
 }

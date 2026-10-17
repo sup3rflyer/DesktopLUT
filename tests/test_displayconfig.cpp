@@ -203,7 +203,9 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK(offsetof(DwmHookFaldTuning, tempMode) == 68);
     CHECK(offsetof(DwmHookFaldTuning, tempClockParity) == 88);
     CHECK(offsetof(DwmHookFaldTuning, refreshMs) == 92);
-    CHECK(offsetof(DwmHookFaldTuning, _reserved) == 96);
+    // the live panel-file delivery generations came out of _reserved next (0 = the file staged at injection)
+    CHECK(offsetof(DwmHookFaldTuning, panelGen) == 96);
+    CHECK(offsetof(DwmHookFaldTuning, _reserved) == 104);
     CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 128 * MAX_DWM_HOOK_MONITORS);
 }
 

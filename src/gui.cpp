@@ -285,13 +285,77 @@ static bool CurrentMonitorIsHDR() {
 
 void RequestFaldFullRecompose();   // below: forces one full DWM composition for the hook's FALD layer
 
-// A FALD panel file was set / changed / re-set. The DWM hook reads panel files ONLY at injection (they are staged
-// beside the .cube files), so in hook mode the change takes effect through a re-injection — the same Stop + Start a
-// .cube change uses. (The overlay path rebuilds from the path / reloadSeq by itself.) GUI thread.
-void FaldPanelFileChangedReinject() {
-    if (!g_gui.isRunning || !g_dwmHookMode.load()) return;
+// The hook's answer on a live panel delivery usually lands within a present or two: polled at this pace for a few
+// seconds after each delivery (the hook watchdog's tick keeps checking after that, and owns the no-answer timeout).
+static const UINT FALD_PANEL_VERDICT_POLL_MS = 200;
+static const int FALD_PANEL_VERDICT_FAST_POLLS = 25;
+static int g_faldPanelVerdictPolls = 0;
+
+static void StartFaldPanelVerdictPolls() {
+    if (!g_gui.hwndMain) return;
+    g_faldPanelVerdictPolls = FALD_PANEL_VERDICT_FAST_POLLS;
+    SetTimer(g_gui.hwndMain, FALD_PANEL_VERDICT_TIMER_ID, FALD_PANEL_VERDICT_POLL_MS, nullptr);
+}
+
+// The hook's verdicts on live panel deliveries -> the status line, a notification, and (a failure) the old path: the
+// re-injection with the current file staged, once per failed file stamp, never while the live layers are busy.
+// `watchdogTick`: the hook watchdog's tick (it counts toward the no-answer timeout). GUI thread.
+static void HandleFaldPanelVerdicts(HWND hwnd, bool watchdogTick) {
+    std::vector<DwmHookFaldPanelNotice> notices;
+    bool recompose = false;
+    CheckDwmHookFaldPanelVerdicts(watchdogTick, &notices, &recompose);
+    for (const DwmHookFaldPanelNotice& n : notices) {
+        if (n.kind == DwmHookFaldPanelNotice::Kind::Loaded) SetStatus(L"FALD panel file loaded live");
+        else if (n.kind == DwmHookFaldPanelNotice::Kind::LoadedIdle) SetStatus(L"FALD panel file loaded live (layer idle)");
+        else {
+            notify::Post(notify::Sev::Warning, -1, L"fald", n.text);
+            SetStatus(n.text.c_str());
+        }
+    }
+    if (recompose) RequestFaldFullRecompose();   // a static desktop presents nothing: the DLL never sees the delivery
+    if (DwmHookFaldPanelFallbackOwed() && !act::LiveLayersBusy() && TakeDwmHookFaldPanelFallback()) {
+        std::cout << "[FALD] live panel delivery failed: re-injecting the DWM hook with the current file staged" << std::endl;
+        FaldPanelFileChangedReinject();
+    }
+    const bool more = DwmHookFaldPanelVerdictPending() || DwmHookFaldPanelFallbackOwed();
+    if (!watchdogTick && (!more || --g_faldPanelVerdictPolls <= 0)) KillTimer(hwnd, FALD_PANEL_VERDICT_TIMER_ID);
+}
+
+// A FALD panel file was set / changed / re-set / cleared, hook mode: hand it to the resident hook live (dwm_inject.h
+// DeliverDwmHookFaldPanel). Re-browsing / re-setting the same path delivers it again whatever its stamp says (an
+// explicit reload, as reloadSeq is for the overlay path).
+bool FaldPanelFileChangedLive(int mon, bool hdr, uint32_t* gen) {
+    if (gen) *gen = 0;
+    if (!g_gui.isRunning || !g_dwmHookMode.load()) return false;
+    if (mon < 0 || mon >= (int)g_gui.monitors.size() || mon >= (int)g_gui.monitorSettings.size()) return false;
+    std::wstring path;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);   // released before the delivery (it takes it again)
+        const MonitorSettings& ms = g_gui.monitorSettings[mon];
+        path = (hdr ? ms.hdrColorCorrection.fald : ms.sdrColorCorrection.fald).paramsPath;
+    }
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfo(g_gui.monitors[mon], &mi)) return false;
+    if (path.empty())   // the layer is off for want of a file (the shared config says so); nothing to load
+        return ForgetDwmHookFaldPanel(mi.rcMonitor.left, mi.rcMonitor.top, hdr);
+    std::wstring why;
+    if (DeliverDwmHookFaldPanel(mi.rcMonitor.left, mi.rcMonitor.top, hdr, path, &why, gen)) {
+        SetStatus(L"FALD panel file sent to the DWM hook");   // "loaded" once the hook says so (HandleFaldPanelVerdicts)
+        StartFaldPanelVerdictPolls();
+        return true;
+    }
+    std::wcout << L"[FALD] panel file not delivered to the DWM hook live (" << why << L"): re-injecting" << std::endl;
+    return false;
+}
+
+// A FALD panel file was set / changed / re-set and could not be delivered live (FaldPanelFileChangedLive). The DWM
+// hook then reads it at injection (staged beside the .cube files): a re-injection — the same Stop + Start a .cube
+// change uses. (The overlay path rebuilds from the path / reloadSeq by itself.) GUI thread.
+bool FaldPanelFileChangedReinject() {
+    if (!g_gui.isRunning || !g_dwmHookMode.load()) return false;
     RestartLiveLayers();   // stays stopped if the user suspended meanwhile
     SetStatus(L"FALD panel file changed: DWM hook re-injected to load it");
+    return true;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1540,7 +1604,7 @@ static void KillAllGuiTimers(HWND hwnd) {
         DWM_HOOK_WATCHDOG_TIMER_ID, MHC_VERIFY_TIMER_ID, MHC_BLIND_KICK_TIMER_ID, MHC_REGISTRY_KICK_TIMER_ID,
         MHC_BURST_TIMER_ID, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_BEACON_TIMER_ID, MONITOR_IDENTITY_TIMER_ID,
         FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
-        RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID, WINDOWS_TONEMAP_TIMER_ID,
+        RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID, WINDOWS_TONEMAP_TIMER_ID, FALD_PANEL_VERDICT_TIMER_ID,
     };
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
@@ -2225,6 +2289,19 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
 
+    case WM_FALD_PANEL_POLL_DONE: {   // the re-export poll's worker finished (lParam: its results)
+        if (g_appShuttingDown.load()) { DiscardDwmHookFaldPanelPoll((intptr_t)lParam); return 0; }
+        std::vector<DwmHookFaldPanelNotice> notices;
+        bool delivered = false;
+        FinishDwmHookFaldPanelPoll((intptr_t)lParam, &notices, &delivered);
+        for (const DwmHookFaldPanelNotice& n : notices) notify::Post(notify::Sev::Warning, -1, L"fald", n.text);
+        if (delivered) {
+            SetStatus(L"FALD panel file re-exported: sent to the DWM hook");
+            StartFaldPanelVerdictPolls();
+        }
+        return 0;
+    }
+
     case WM_FALD_RECOMPOSE:    // the hook's FALD layer waits for a primed clean copy (or the pipe changed the layer);
                                // wParam 1 = any mode (RequestDesktopRecompose from another thread)
         if (wParam == 1) RequestDesktopRecompose();
@@ -2608,6 +2685,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else if (g_dwmHookReinjectCount == 0) {
                     s_dwmHookHealthyStreak = 0;
                 }
+                // Live FALD panel deliveries: the hook's verdicts (and the no-answer timeout, counted on these ticks),
+                // then the files it was given, re-exported in place, polled on a worker thread (the overlay path
+                // polls its file stamp the same way). A fallback re-injection here ends this tick's work.
+                HandleFaldPanelVerdicts(hwnd, true);
+                if (g_gui.isRunning && g_dwmHookMode.load())
+                    StartDwmHookFaldPanelPoll(hwnd, WM_FALD_PANEL_POLL_DONE);
             }
             return 0;
         }
@@ -2638,6 +2721,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == FALD_RECOMPOSE_TIMER_ID) {
             FaldRecomposeTick(hwnd);
+            return 0;
+        }
+        if (wParam == FALD_PANEL_VERDICT_TIMER_ID) {
+            HandleFaldPanelVerdicts(hwnd, false);
             return 0;
         }
         if (wParam == DWM_HOOK_RESEND_TIMER_ID) {

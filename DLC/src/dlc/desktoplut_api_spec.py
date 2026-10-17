@@ -128,7 +128,12 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                         "the DWM overlay context on 25H2, so identical panels are matched by first-present "
                         "ORDER — a coin toss the 2026-09-03 3dlut-only run lost (cube on the twin); the "
                         "assignment is now sticky per DWM session and dlc.hook_routing proves it through "
-                        "the meter. Absent on older builds (treat as unknown: cube flows self-check).",
+                        "the meter. Absent on older builds (treat as unknown: cube flows self-check). "
+                        "Builds from 2026-10-16 also carry fald_panels:[{left, top, mode, held_path, held_gen, "
+                        "sent_path, sent_gen, want_path, status: staged|delivered|ingested|applied|refused|"
+                        "build_failed|no_ack}]: the FALD panel file the DWM hook HOLDS per display and mode apart "
+                        "from the one sent to it live (a client that switched files waits for status applied "
+                        "on the sent_gen runtime.set_fald_params returned as hook_gen).",
                 "overlay": "object {awake:bool (the overlay render path is running and not auto-asleep), "
                            "dwm_hook_mode:bool}: which path renders what a meter sees. The awake FP16 "
                            "overlay reads 0.5-2.4 % below the sleeping one at low levels (DLC fald-lessons "
@@ -417,7 +422,11 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "monitor:mode. The file's transfer must match the mode (FLD1/FLD2 = PQ = HDR fit; FLD3 with transfer "
             "gamma = SDR fit) — a mismatch is refused (`panel file transfer ... does not match mode ...`); a file "
             "the header peek cannot classify is accepted here and refused by the GPU loader. Toggle the layer with "
-            "layers.set {fald}. Builds before 2026-09-14 refuse mode SDR (`fald is an HDR-only layer`).",
+            "layers.set {fald}. Builds before 2026-09-14 refuse mode SDR (`fald is an HDR-only layer`). "
+            "Builds from 2026-10-16 in DWM-hook mode hand the file to the resident hook without re-injecting "
+            "and also return hook_delivery ('live' | 'reinject' | 'none') and hook_gen (the live delivery's "
+            "generation): wait for state.get hook.fald_panels[display, mode].sent_gen == hook_gen with status "
+            "applied (a refused / unbuildable / unanswered file is re-injected by the host once).",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),

@@ -127,12 +127,14 @@ void GetMonitorPositionFromContext(void* context, int& left, int& top);
 // FALD live settings per monitor, mirrored out of DwmHookSharedConfig::faldFlags. Keyed by position
 // like the tonemap entries and refreshed in the same debounced pass, so a monitor that is briefly
 // re-brokered cannot lose its entry mid-Present. The panel parameter FILE does not come through
-// here — it is staged and read once at attach (hook_fald.h).
+// here — it is staged and read at attach (hook_fald.h); a later change of it only announces itself
+// here (tuning.panelGen, the section named by hostPid + generation: FaldSyncPanelDeliveries).
 struct LocalFaldParams {
 	int left, top;
 	unsigned int flags;
 	bool hasTuning;             // tuning came from the host's tail; false = run starfield on defaults
 	DwmHookFaldTuning tuning;
+	unsigned int hostPid;       // DwmHookSharedConfig::hostPid of the same snapshot (live panel-file section names)
 };
 extern LocalFaldParams g_localFald[MAX_DWM_HOOK_MONITORS];
 extern int g_numLocalFald;
