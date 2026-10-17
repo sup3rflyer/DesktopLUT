@@ -36,6 +36,11 @@ void StartCalibrationIpcServer();
 // on its own; a re-arm waits for it. Safe to call even if it never started.
 void StopCalibrationIpcServer();
 
+// Tests only: the pipe name the next server is created under (null/empty = the production name, which
+// the app never changes), so the tests serve their own pipe and never reach the user's running
+// DesktopLUT. Refused (false) while a server thread exists, running or finishing, under another name.
+bool SetCalibrationPipeNameForTesting(const wchar_t* name);
+
 // App teardown: abort a grayscale live edit left engaged (its transient passthrough profile would
 // otherwise stay the display's scanout profile after DesktopLUT exits). GUI thread. A calibration
 // session itself is left as is — its settings were saved at enter, and whether an unfinished run

@@ -1,7 +1,7 @@
 // Calibration pipe server lifecycle (T2.4): the pipe is single-instance, so a client that connects and
 // stalls — never sends its line, or never reads its reply — must not wedge it, and Stop must always
-// be able to end the server, including while a request waits on the GUI thread. Runs the REAL server on
-// the real pipe name; skipped when another DesktopLUT already serves it.
+// be able to end the server, including while a request waits on the GUI thread. Runs the REAL server
+// under this process's own pipe name, so it never reaches the user's running DesktopLUT.
 
 #include "doctest.h"
 #include "desktoplut_ipc_server.h"
@@ -16,10 +16,17 @@
 
 namespace {
 
-const wchar_t* const kTestPipeName = L"\\\\.\\pipe\\DesktopLUT.Calibration";
+// Never the production name: the user's DesktopLUT serves that, and a probe for it can land between two
+// of its pipe instances — the test then arms its own server, and the live app answers the requests.
+const std::wstring& TestPipeName() {
+    static const std::wstring name =
+        L"\\\\.\\pipe\\DesktopLUT.Tests.Calibration." + std::to_wstring(GetCurrentProcessId());
+    return name;
+}
 
-bool PipeAlreadyServed() {
-    HANDLE h = CreateFileW(kTestPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+bool PipeServed() {
+    HANDLE h = CreateFileW(TestPipeName().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                           nullptr);
     if (h != INVALID_HANDLE_VALUE) { CloseHandle(h); return true; }
     return GetLastError() == ERROR_PIPE_BUSY;
 }
@@ -27,10 +34,11 @@ bool PipeAlreadyServed() {
 HANDLE ConnectClient(DWORD timeoutMs = 3000) {
     const ULONGLONG until = GetTickCount64() + timeoutMs;
     for (;;) {
-        HANDLE h = CreateFileW(kTestPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE h = CreateFileW(TestPipeName().c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0,
+                               nullptr);
         if (h != INVALID_HANDLE_VALUE) return h;
         if (GetTickCount64() >= until) return INVALID_HANDLE_VALUE;
-        if (GetLastError() == ERROR_PIPE_BUSY) WaitNamedPipeW(kTestPipeName, 100);
+        if (GetLastError() == ERROR_PIPE_BUSY) WaitNamedPipeW(TestPipeName().c_str(), 100);
         else Sleep(20);
     }
 }
@@ -88,14 +96,15 @@ LRESULT CALLBACK TestGuiWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// Arms the server for one test and restores the globals it touched.
+// Arms the server for one test and restores the globals it touched. The test pipe name stays set
+// afterwards: nothing in the test process may serve the production name.
 struct ArmedServer {
-    bool skipped = false;
     bool oldEnabled = false;
     HWND oldMain = nullptr;
     HWND window = nullptr;
     explicit ArmedServer(bool withGuiWindow) {
-        if (PipeAlreadyServed()) { skipped = true; return; }
+        REQUIRE(SetCalibrationPipeNameForTesting(TestPipeName().c_str()));
+        REQUIRE_FALSE(PipeServed());   // a server this test did not arm: never talk to it
         oldEnabled = g_calibrationControlEnabled.load();
         oldMain = g_gui.hwndMain;
         if (withGuiWindow) {
@@ -115,7 +124,6 @@ struct ArmedServer {
         StartCalibrationIpcServer();
     }
     ~ArmedServer() {
-        if (skipped) return;
         StopCalibrationIpcServer();
         g_calibrationControlEnabled.store(oldEnabled);
         g_gui.hwndMain = oldMain;
@@ -130,7 +138,6 @@ struct ArmedServer {
 
 TEST_CASE("Calibration pipe: a request round-trips; Stop and re-arm work") {
     ArmedServer server(false);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
 
     CHECK(Contains(RoundTrip(R"({"method":"no.such.method"})"), "unknown method: no.such.method"));
     // Mutating methods need the GUI window; without one they fail cleanly instead of blocking.
@@ -143,7 +150,6 @@ TEST_CASE("Calibration pipe: a request round-trips; Stop and re-arm work") {
 
 TEST_CASE("Calibration pipe: state.get reports the user's Suspend beside running") {
     ArmedServer server(false);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
     const bool old = g_userStopped.load();
     g_userStopped = true;
     std::string reply = RoundTrip(R"({"method":"state.get"})");
@@ -157,7 +163,6 @@ TEST_CASE("Calibration pipe: state.get reports the user's Suspend beside running
 
 TEST_CASE("Calibration pipe: state.get reports the interface's stage bypasses for every pair") {
     ArmedServer server(false);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
     std::vector<MonitorSettings> saved;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
@@ -179,7 +184,6 @@ TEST_CASE("Calibration pipe: state.get reports the interface's stage bypasses fo
 
 TEST_CASE("Calibration pipe: a client that connects and sends nothing does not block Stop") {
     ArmedServer server(false);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
 
     HANDLE stalled = ConnectClient();
     REQUIRE(stalled != INVALID_HANDLE_VALUE);
@@ -193,7 +197,6 @@ TEST_CASE("Calibration pipe: a client that connects and sends nothing does not b
 
 TEST_CASE("Calibration pipe: a client that never reads its reply frees the pipe on its own") {
     ArmedServer server(false);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
 
     HANDLE silent = ConnectClient();
     REQUIRE(silent != INVALID_HANDLE_VALUE);
@@ -215,7 +218,6 @@ TEST_CASE("Calibration pipe: a client that never reads its reply frees the pipe 
 
 TEST_CASE("Calibration pipe: mutating requests run on the GUI thread; a disarm abandons a queued one") {
     ArmedServer server(true);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
     REQUIRE(server.window != nullptr);
 
     SUBCASE("marshalled and answered while the GUI thread pumps") {
@@ -365,7 +367,6 @@ TEST_CASE("Calibration pipe client check: judging real tokens") {
 
 TEST_CASE("Calibration pipe client check: enforced on the real pipe") {
     ArmedServer server(false);
-    if (server.skipped) { MESSAGE("calibration pipe already served by another process - skipped"); return; }
 
     SUBCASE("a restricted-token client reaches the pipe and is refused per connection") {
         HANDLE restricted = RestrictedToken();

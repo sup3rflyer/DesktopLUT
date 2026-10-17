@@ -46,7 +46,11 @@
 
 namespace {
 
-const wchar_t* kPipeName = L"\\\\.\\pipe\\DesktopLUT.Calibration";
+const wchar_t* const kPipeName = L"\\\\.\\pipe\\DesktopLUT.Calibration";
+// The name the server is created under: kPipeName in the app; the tests serve their own
+// (SetCalibrationPipeNameForTesting). Written only while no server thread exists, so the thread
+// reads it unlocked.
+std::wstring g_pipeName = kPipeName;
 constexpr size_t kMaxRequestBytes = 256 * 1024;  // DoS guard
 constexpr DWORD kGuiTimeoutMs = 60000;           // MHC install can be slow
 // The calibration wire-contract version this server speaks, reported in state.get (fable
@@ -2285,7 +2289,7 @@ DWORD WINAPI ServerThreadProc(LPVOID) {
     while (keepServing && WaitForSingleObject(g_stopEvent, 0) != WAIT_OBJECT_0) {
         // FILE_FLAG_FIRST_PIPE_INSTANCE: never serve under a name another process created first.
         HANDLE pipe = CreateNamedPipeW(
-            kPipeName,
+            g_pipeName.c_str(),
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             1,                       // single instance — one client at a time
@@ -2387,6 +2391,14 @@ void StopCalibrationIpcServer() {
     }
     // else: still inside a slow read-only handler (e.g. a DisplayConfig flip); it exits on its own
     // (the stop event stays set), and a re-arm waits for it (StartCalibrationIpcServer).
+}
+
+bool SetCalibrationPipeNameForTesting(const wchar_t* name) {
+    const std::wstring wanted = (name && *name) ? name : kPipeName;
+    if (wanted == g_pipeName) return true;
+    if (g_serverThread) return false;   // a server, running or finishing, still reads the current name
+    g_pipeName = wanted;
+    return true;
 }
 
 // An interface editor (the grayscale editor, the MHC profile editor) holds its display's profile until DONE / CANCEL:
