@@ -176,6 +176,7 @@
     <ClCompile Include="tests\test_ui_model.cpp" />
     <ClCompile Include="tests\test_ui_gscurve.cpp" />
     <ClCompile Include="tests\test_mhc_preview.cpp" />
+    <ClCompile Include="tests\test_gamma24.cpp" />
     <ClCompile Include="tests\test_mhc_edit.cpp" />
     <ClCompile Include="tests\test_mhc_preview_hook.cpp" />
     <ClCompile Include="tests\test_ui_shots.cpp" />

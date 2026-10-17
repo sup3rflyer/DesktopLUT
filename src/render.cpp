@@ -670,7 +670,7 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     g_context->PSSetShaderResources(6, 1, &g_pqEotfSRV);         // PQ EOTF (PQ->Linear)
     g_context->PSSetShaderResources(7, 1, &g_srgbOetfSRV);       // sRGB OETF (Linear->sRGB)
     g_context->PSSetShaderResources(8, 1, &g_srgbEotfSRV);       // sRGB EOTF (sRGB->Linear)
-    g_context->PSSetShaderResources(9, 1, &g_gammaRatioSRV);     // pow(Y, 1/11) for 2.4 gamma
+    // (t9 unused: it held the 2.4 gamma ratio LUT; GAMMA 2.4 is a plain per-channel pow now)
     g_context->PSSetShaderResources(10, 1, &g_wbGammaSRV);       // pow(gain, 1/2.2) for WB
     // Live edit preview LUTs (t11; written by SyncMhcPreview). Harmless while the preview is off: unread.
     g_context->PSSetShaderResources(11, 1, &g_mhcPreviewLutSRV);

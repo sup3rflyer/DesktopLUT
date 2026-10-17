@@ -860,6 +860,7 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
         EndRow(row);
     } else {
         row = BeginRow("GAMMA 2.4");
+        RowTip(row, "Pure gamma 2.4 (BT.1886) over the 2.2 calibration, for the whole desktop.");
         RowPlace(row);
         bool g24 = false;
         if (OnOff("##g24_on", gs.use24Gamma, &g24)) PostTo(r, [g24](int mon) { act::MhcSet24Gamma(mon, g24); });

@@ -46,6 +46,12 @@ float PqOETF(float L) {
     return powf((PQ_c1 + PQ_c2 * Ym) / (1.0f + PQ_c3 * Ym), PQ_m2);
 }
 
+// SDR GAMMA 2.4: the signal a pure-2.2 calibration must be fed to show t^2.4 ((t^(2.4/2.2))^2.2 = t^2.4). Pure
+// powers on both sides: DLC calibrates SDR to the 2.2 power law, never to the piecewise sRGB curve.
+float MhcGamma24Warp(float t) {
+    return t > 0.0f ? powf(t, 2.4f / 2.2f) : 0.0f;
+}
+
 // ============================================================================
 // SECTION: Grayscale Evaluation
 // ============================================================================
@@ -161,6 +167,9 @@ float EvalGrayscaleHDR_Channel(float pqValue, const GrayscaleData& gs, float pqP
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize) {
     for (int j = 0; j < lutSize; j++) {
         float t = (float)j / (float)(lutSize - 1);  // scanout signal (sRGB-encoded)
+        // GAMMA 2.4 goes in AHEAD of the calibration curve (MhcGamma24Warp): the curve makes the panel a pure 2.2
+        // display, so reading it at t^(2.4/2.2) shows t^2.4 whatever the panel's own response.
+        if (gs.use24Gamma) t = MhcGamma24Warp(t);
 
         if (!gs.enabled) {
             // Identity LUT - linear ramp
@@ -175,13 +184,6 @@ void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize) {
         // sqrt-index/sqrt-interp math is domain-agnostic; we just feed it the signal, not the
         // sRGB-decoded linear light.
         float corrected = EvalGrayscaleSDR(t, gs);
-
-        // 2.2->2.4 gamma (BT.1886) is a linear-light transform: decode, pow, re-encode.
-        if (gs.use24Gamma) {
-            float lin = SrgbEOTF((std::max)(corrected, 0.0f));
-            lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
-            corrected = SrgbOETF((std::max)(lin, 0.0f));
-        }
 
         outLUT[j] = std::clamp(corrected, 0.0f, 1.0f);
     }
@@ -210,14 +212,10 @@ void GenerateMHC2LUT_HDR(const GrayscaleData& gs, float peakNits, float* outLUT,
 void GenerateMHC2LUT_SDR_Channel(const GrayscaleData& gs, float* outLUT, int lutSize, int channel) {
     for (int j = 0; j < lutSize; j++) {
         float t = (float)j / (float)(lutSize - 1);  // scanout signal
+        if (gs.use24Gamma) t = MhcGamma24Warp(t);   // ahead of the curve (see GenerateMHC2LUT_SDR)
         if (!gs.enabled) { outLUT[j] = t; continue; }
         // Signal-domain (see GenerateMHC2LUT_SDR): index by sqrt(signal), correct in signal.
         float corrected = EvalGrayscaleSDR_Channel(t, gs, channel);
-        if (gs.use24Gamma) {
-            float lin = SrgbEOTF((std::max)(corrected, 0.0f));
-            lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
-            corrected = SrgbOETF((std::max)(lin, 0.0f));
-        }
         outLUT[j] = std::clamp(corrected, 0.0f, 1.0f);
     }
 }

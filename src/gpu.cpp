@@ -397,17 +397,6 @@ bool InitD3D() {
                 eotfData[i] = powf((V + 0.055f) / 1.055f, 2.4f);
         }
 
-        // Gamma 2.4/2.2 ratio LUT: stores pow(Y, 1/11) for Y in [0,1]
-        // Apply24GammaLinear needs ratio = pow(Y, 12/11) / Y = pow(Y, 1/11)
-        float gammaRatioData[SRGB_LUT_SIZE];
-        for (int i = 0; i < SRGB_LUT_SIZE; i++) {
-            float Y = static_cast<float>(i) / static_cast<float>(SRGB_LUT_SIZE - 1);
-            if (Y < 1e-6f)
-                gammaRatioData[i] = 1.0f;  // Avoid 0^(1/11) = 0 → ratio = 0/0
-            else
-                gammaRatioData[i] = powf(Y, 1.0f / 11.0f);  // pow(Y, 1/11) = pow(Y,12/11)/Y
-        }
-
         // White balance gamma LUT: stores pow(gain, 1/2.2) for gain in [0,2]
         // Domain [0,2] covers typical WB gains; UV = gain/2
         const int WB_LUT_SIZE = 512;
@@ -442,13 +431,6 @@ bool InitD3D() {
         if (FAILED(hr)) { std::cerr << "Failed to create sRGB EOTF LUT\n"; return false; }
         hr = g_device->CreateShaderResourceView(g_srgbEotfTexture, nullptr, &g_srgbEotfSRV);
         if (FAILED(hr)) { g_srgbEotfTexture->Release(); g_srgbEotfTexture = nullptr; return false; }
-
-        // Gamma 2.4/2.2 ratio
-        initData.pSysMem = gammaRatioData;
-        hr = g_device->CreateTexture2D(&srgbDesc, &initData, &g_gammaRatioTexture);
-        if (FAILED(hr)) { std::cerr << "Failed to create gamma ratio LUT\n"; return false; }
-        hr = g_device->CreateShaderResourceView(g_gammaRatioTexture, nullptr, &g_gammaRatioSRV);
-        if (FAILED(hr)) { g_gammaRatioTexture->Release(); g_gammaRatioTexture = nullptr; return false; }
 
         // White balance gamma
         D3D11_TEXTURE2D_DESC wbDesc = srgbDesc;
@@ -676,8 +658,6 @@ void ReleaseSharedD3DResources() {
     if (g_srgbOetfTexture) { g_srgbOetfTexture->Release(); g_srgbOetfTexture = nullptr; }
     if (g_srgbEotfSRV) { g_srgbEotfSRV->Release(); g_srgbEotfSRV = nullptr; }
     if (g_srgbEotfTexture) { g_srgbEotfTexture->Release(); g_srgbEotfTexture = nullptr; }
-    if (g_gammaRatioSRV) { g_gammaRatioSRV->Release(); g_gammaRatioSRV = nullptr; }
-    if (g_gammaRatioTexture) { g_gammaRatioTexture->Release(); g_gammaRatioTexture = nullptr; }
     if (g_wbGammaSRV) { g_wbGammaSRV->Release(); g_wbGammaSRV = nullptr; }
     if (g_wbGammaTexture) { g_wbGammaTexture->Release(); g_wbGammaTexture = nullptr; }
     if (g_mhcPreviewLutSRV) { g_mhcPreviewLutSRV->Release(); g_mhcPreviewLutSRV = nullptr; }

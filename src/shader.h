@@ -143,7 +143,6 @@ Texture2D<float> pqOetfLUT : register(t5);        // PQ OETF: Linear->PQ, sqrt-d
 Texture2D<float> pqEotfLUT : register(t6);        // PQ EOTF: PQ->Linear, uniform (4096x1)
 Texture2D<float> srgbOetfLUT : register(t7);      // sRGB OETF: Linear->sRGB (1024x1)
 Texture2D<float> srgbEotfLUT : register(t8);      // sRGB EOTF: sRGB->Linear (1024x1)
-Texture2D<float> gammaRatioLUT : register(t9);     // pow(Y, 1/11) ratio for 2.4 gamma (1024x1)
 Texture2D<float> wbGammaLUT : register(t10);       // pow(gain, 1/2.2) for WB gains [0,2] (512x1)
 Texture2D<float> mhcPreviewLut : register(t11);    // live edit preview: the profile's LUTs, rows R/G/B (4096x3)
 SamplerState pointSampler : register(s0);
@@ -219,28 +218,12 @@ float3 ApplyGrayscaleCorrection(float3 rgb) {
     return float3(rgb.r * corrR / Y, rgb.g * corrG / Y, rgb.b * corrB / Y);
 }
 
-// 2.4 gamma: pow(Y, 2.4/2.2) in linear space via LUT ratio
-// Matches MHC's pow(Y_corrected, 2.4/2.2) in GenerateMHC2LUT_SDR_Channel.
-float3 Apply24GammaLinear(float3 lin) {
-    float Y = dot(lin, float3(0.2126f, 0.7152f, 0.0722f));
-    if (Y < 1e-6f) return lin;
-    float scale = 1023.0f / 1024.0f;
-    float bias = 0.5f / 1024.0f;
-    // gammaRatioLUT stores pow(Y, 1/11); lin * pow(Y, 1/11) = lin * pow(Y, 12/11)/Y = lin * pow(Y, 2.4/2.2)/Y
-    float ratio = gammaRatioLUT.SampleLevel(linearSampler, float2(saturate(Y) * scale + bias, 0.5f), 0);
-    return lin * ratio;
-}
-
-// Combined SDR corrections. Grayscale runs in SIGNAL domain (no decode), matching the baked
-// MHC 1D LUT. 2.4 gamma stays a linear-light transform, so it's wrapped in a decode/encode
-// roundtrip applied AFTER the signal-domain grayscale (mirrors GenerateMHC2LUT_SDR).
+// Combined SDR corrections, in the SIGNAL domain like the baked MHC 1D LUT. GAMMA 2.4 goes in first, per channel:
+// the signal enters the calibrated 2.2 chain after it (grayscale, 3D LUT, scanout) at t^(2.4/2.2), which shows
+// t^2.4 (mirrors GenerateMHC2LUT_SDR_Channel / MhcGamma24Warp).
 float3 ApplySDRCorrections(float3 rgb) {
+    if (grayscale24 > 0.5f) rgb = pow(max(rgb, 0.0f), 2.4f / 2.2f);
     if (grayscaleEnabled > 0.5) rgb = ApplyGrayscaleCorrection(rgb);
-    if (grayscale24 > 0.5f) {
-        float3 lin = sRGB_EOTF3(rgb);
-        lin = Apply24GammaLinear(lin);
-        rgb = sRGB_OETF3(max(lin, 0.0));
-    }
     return rgb;
 }
 
@@ -797,8 +780,8 @@ R"(
         }
 
         // ═══════════════════════════════════════════════════════════════════════
-        // STAGE 3: Linear-space corrections (matches MHC 1D LUT pipeline)
-        // Single sRGB decode/encode roundtrip for grayscale + 2.4 gamma
+        // STAGE 3: Signal-domain corrections (matches MHC 1D LUT pipeline)
+        // GAMMA 2.4, then grayscale, on the sRGB-encoded signal: no decode/encode
         // ═══════════════════════════════════════════════════════════════════════
         if (grayscaleEnabled > 0.5 || grayscale24 > 0.5)
             input = ApplySDRCorrections(input);

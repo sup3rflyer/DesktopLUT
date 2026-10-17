@@ -51,6 +51,10 @@ void UpdateMhcFlagsLive(int monitorIndex);
 // Compute metadata strings for display in MHC section labels
 void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR);
 
+// SDR GAMMA 2.4 is on: the switch (correctionGrayscale.use24Gamma, saved as MHCCorrGS24) or the base curve's older
+// flag (MHCGrayscale24). Independent of the fine-tune curve being on. Read for the SDR profile only.
+bool MhcSdrGamma24(const MHCSettings& mhc);
+
 // MHC2ProfileParams for an MHCSettings (every correction it has on), shared by Generate / Regenerate and the
 // permutation variants. Exposed for testing.
 // False = the imported source file is set but unreadable (callers keep the installed profile).

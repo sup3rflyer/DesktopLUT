@@ -43,7 +43,8 @@ void UpdateMhcFlagsLive(int monitorIndex) {
         hdrMhcActive = ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty();
         // Grayscale flag covers all MHC gamma/grayscale forms that suppress shader equivalents
         sdrHasGs = ms.sdrMHC.baseGrayscale.enabled || ms.sdrMHC.correctionGrayscale.enabled ||
-                   ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty();
+                   ms.sdrMHC.hasPerChannelTRC || !ms.sdrMHC.sourceFilePath.empty() ||
+                   MhcSdrGamma24(ms.sdrMHC);
         hdrHasGs = ms.hdrMHC.baseGrayscale.enabled || ms.hdrMHC.correctionGrayscale.enabled ||
                    ms.hdrMHC.hasPerChannelTRC || !ms.hdrMHC.sourceFilePath.empty() ||
                    ms.hdrMHC.desktopGammaEnabled;
@@ -82,6 +83,10 @@ void UpdateMhcFlagsLive(int monitorIndex) {
     }
 }
 
+bool MhcSdrGamma24(const MHCSettings& mhc) {
+    return mhc.correctionGrayscale.use24Gamma || mhc.baseGrayscale.use24Gamma;
+}
+
 // Compute metadata strings for display in MHC section labels
 void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
     // --- Primaries label ---
@@ -89,7 +94,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
         mhc.metaPrimaries = isHDR ? L"Rec.2020" : L"sRGB";
     } else if (mhc.primariesPreset == 0) {
         // Preset 0 = sRGB/Rec.709
-        if (!isHDR && mhc.baseGrayscale.use24Gamma)
+        if (!isHDR && MhcSdrGamma24(mhc))
             mhc.metaPrimaries = L"Rec.709";
         else
             mhc.metaPrimaries = L"sRGB";
@@ -106,7 +111,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
                 fabsf(mhc.customPrimaries.Bx - p.Bx) < tol && fabsf(mhc.customPrimaries.By - p.By) < tol) {
                 mhc.metaPrimaries = p.name;
                 // Refine sRGB vs Rec.709
-                if (i == 0 && !isHDR && mhc.baseGrayscale.use24Gamma)
+                if (i == 0 && !isHDR && MhcSdrGamma24(mhc))
                     mhc.metaPrimaries = L"Rec.709";
                 matched = true;
                 break;
@@ -147,7 +152,7 @@ void ComputeMhcMetadata(MHCSettings& mhc, bool isHDR) {
             wchar_t buf[32];
             swprintf_s(buf, L"Custom (%dpt)", mhc.baseGrayscale.pointCount);
             gammaBase = buf;
-        } else if (mhc.baseGrayscale.use24Gamma) {
+        } else if (MhcSdrGamma24(mhc)) {
             gammaBase = L"2.2\u21922.4";
         } else {
             gammaBase = L"2.2";
@@ -383,6 +388,10 @@ bool BuildMHC2Params(const MHCSettings& mhc, bool isHDR, int monitorIndex, MHC2P
 
     // Correction grayscale (fine-tuning on top of base)
     SetMhcCorrectionParams(mhc.correctionGrayscale, params);
+
+    // SDR GAMMA 2.4, ahead of the whole calibration (base + fine-tune) — with or without a fine-tune curve. (The
+    // grayscale.use24Gamma set above is the base flag alone: it keeps choosing the profile's TRC tag.)
+    params.sdrGamma24 = !isHDR && MhcSdrGamma24(mhc);
     return true;
 }
 
@@ -427,7 +436,7 @@ void SetMhcCorrectionParams(const GrayscaleSettings& gs, MHC2ProfileParams& para
         params.correctionGrayscale.pointsG[i] = base * devG;
         params.correctionGrayscale.pointsB[i] = base * devB;
     }
-    params.correctionGrayscale.use24Gamma = gs.use24Gamma;
+    // (The curve's use24Gamma is the GAMMA 2.4 switch: params.sdrGamma24, set by BuildMHC2Params — not a part of it.)
     params.correctionGrayscale.peakNits = gs.peakNits;
 }
 
@@ -463,6 +472,7 @@ bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex
         params.grayscaleEnabled = false;
         params.grayscale.enabled = false;
         params.grayscale.use24Gamma = false;
+        params.sdrGamma24 = false;            // GAMMA 2.4 belongs to the grayscale stage
         params.hasPerChannelTRC = false;
         params.hasPrecomputedCorrection = false;
         params.desktopGammaEnabled = false;

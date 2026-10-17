@@ -12,7 +12,7 @@
 //
 // Ready to measure: what would stand between the patch and the calibration it refines is held off on the edited
 // display for the edit — tone mapping and FALD (MhcPreviewHolds; the engines read it, the settings are not touched),
-// desktop gamma and the user's white balance tweak (both left out of the previewed profile). All return with DONE /
+// desktop gamma, SDR GAMMA 2.4 and the user's white balance tweak (left out of the previewed profile). All return with DONE /
 // CANCEL: the bake has them again, and the hold ends with the session. The calibration itself stays on: the 3D LUT,
 // the primaries (with the measured native white), the base curve, the target gamma.
 //
@@ -35,6 +35,7 @@ constexpr unsigned kMhcHeldTonemap = 1u;
 constexpr unsigned kMhcHeldFald = 2u;
 constexpr unsigned kMhcHeldDesktopGamma = 4u;
 constexpr unsigned kMhcHeldWhiteBalance = 8u;   // the user's white balance tweak (MHCSettings::whiteBalance*)
+constexpr unsigned kMhcHeldGamma24 = 16u;       // SDR GAMMA 2.4 (MhcSdrGamma24)
 
 struct MhcPreviewSession {
     bool active = false;
@@ -70,7 +71,7 @@ void UpdateMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& corre
 // the base LUTs are recomputed from it, the matrix stays. Cheap (points, no files).
 void UpdateMhcPreviewBase(const MhcPreviewSession& s, const GrayscaleSettings& base, const GrayscaleSettings& correction);
 // A profile edit (the source file, the primaries, the white, the peak): recomputes the profile from `work` — the
-// bake's own params for it, without the held desktop gamma and white balance tweak — and hands it to the overlay or
+// bake's own params for it, without the held desktop gamma, GAMMA 2.4 and white balance tweak — and hands it to the overlay or
 // the hook. `matrixOnly`: only the primaries or the white changed since the last call, so the LUTs stay (no files,
 // cheap enough for every frame of a drag); the session's first call is always complete. False: `work`'s source file
 // cannot be read (nothing changed on screen). Logs nothing (a drag recomputes per frame).
@@ -103,8 +104,8 @@ bool MhcPreviewUsesHook();
 bool MhcEditorNeedsOverlay();
 
 // BeginMhcPreview's computation, touching neither scanout nor the overlay: the variant the bake installs without
-// its correction, desktop gamma and white balance tweak (perm), its params (source files read here) and its matrix +
-// base LUTs.
+// its correction, desktop gamma and white balance tweak (perm) and GAMMA 2.4 (params.sdrGamma24), its params (source
+// files read here) and its matrix + base LUTs.
 // Exposed for testing.
 bool PrepareMhcPreview(const MHCSettings& mhc, bool hdr, int mon, MhcPreviewSession& s);
 // UpdateMhcPreview's computation: the scanout the bake would install with this correction. Exposed for testing.
@@ -112,8 +113,8 @@ void ComposeMhcPreview(const MhcPreviewSession& s, const GrayscaleSettings& corr
 // UpdateMhcPreviewBase's computation. Exposed for testing.
 void ComposeMhcPreviewBase(const MhcPreviewSession& s, const GrayscaleSettings& base, const GrayscaleSettings& correction,
                            MhcScanout& out);
-// UpdateMhcPreviewProfile's computations: the complete scanout of `work` (the variant without desktop gamma and the
-// white balance tweak), and its matrix alone into `inout` (the LUTs stay). Exposed for testing.
+// UpdateMhcPreviewProfile's computations: the complete scanout of `work` (the variant without desktop gamma, GAMMA 2.4
+// and the white balance tweak), and its matrix alone into `inout` (the LUTs stay). Exposed for testing.
 bool ComputeMhcPreviewProfile(const MHCSettings& work, bool hdr, int mon, MhcScanout& out);
 void ComputeMhcPreviewMatrix(const MHCSettings& work, bool hdr, MhcScanout& inout);
 

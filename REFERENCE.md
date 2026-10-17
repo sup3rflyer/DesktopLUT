@@ -123,7 +123,7 @@ SDR_MHCGrayscaleEnabled=true
 ; 10, 20, or 32
 SDR_MHCGrayscalePoints=20
 SDR_MHCGrayscaleData=0.000; 0.003; ...
-; true = apply 2.4 gamma (BT.1886) in LUT
+; older base-curve flag: GAMMA 2.4 as MHCCorrGS24 below, and the profile's TRC tag becomes 2.4
 SDR_MHCGrayscale24=false
 SDR_MHCWhiteBalanceEnabled=false
 SDR_MHCWhiteBalanceWx=0.3127
@@ -132,6 +132,9 @@ SDR_MHCWhiteBalanceWy=0.3290
 SDR_MHCCorrGSEnabled=false
 SDR_MHCCorrGSPoints=20
 SDR_MHCCorrGSData=...
+; the GAMMA 2.4 switch (independent of CorrGSEnabled): the 1D LUT reads base + fine-tune at t^(2.4/2.2), so the
+; 2.2 calibration shows pure 2.4 (BT.1886 at zero black) on the grey axis; held off during live curve/profile edits
+SDR_MHCCorrGS24=false
 ; Active permutation bitmask (WB=1, DG=2, GS=4, NOPRIM=8, NOGRAY=16, PEAK_MAX=32 — HDR: reports 10000 nits)
 SDR_MHCActivePerm=0
 ; Cached profile paths indexed by permutation bitmask
@@ -276,15 +279,15 @@ ICtCp pipeline adds ~4 matrix multiplies and LUT-based PQ encode/decode (~100 ex
 ## SDR Color Pipeline
 
 ```
-Primaries (matrix, linear) → sRGB encode (t7 LUT) → Per-channel Grayscale (sqrt-domain R/G/B)
-    → 2.4γ (t9 LUT) → 3D LUT → White Balance (t10 LUT) → Output (ACM: sRGB decode via t8)
+Primaries (matrix, linear) → sRGB encode (t7 LUT) → 2.4γ (per-channel pow) → Per-channel Grayscale
+    (sqrt-domain R/G/B) → 3D LUT → White Balance (t10 LUT) → Output (ACM: sRGB decode via t8)
 ```
 
-Zero analytical pow() — all transfer functions via precomputed 1D texture lookups.
+Transfer functions via precomputed 1D texture lookups; the optional 2.4γ is the one analytical pow().
 
 **Grayscale**: Per-channel (R/G/B independent corrections) in sqrt-domain sRGB signal space. Uses sqrt distribution matching 2.2 gamma signal levels, so slider N affects patch N in calibration software.
 
-**2.4 Gamma**: Optional BT.1886 transform via ratio LUT (1 tex sample). `pow(Y, 12/11) = Y × pow(Y, 1/11)` where the ratio `pow(Y, 1/11)` is a LUT lookup. Independent of grayscale correction - can be used alone or combined.
+**2.4 Gamma**: Optional BT.1886 transform: each channel's signal enters the calibrated 2.2 chain at `pow(t, 2.4/2.2)`, ahead of the grayscale correction, so a display calibrated to pure 2.2 shows `t^2.4` (the same warp the MHC bake applies ahead of its base + fine-tune curve, `MhcGamma24Warp`). Independent of grayscale correction - can be used alone or combined.
 
 **Primaries Matrix**: Uses gamma 2.2 decode AND encode (not sRGB). This ensures:
 - Identity matrix = zero change (perfect round-trip)

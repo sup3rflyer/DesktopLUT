@@ -577,10 +577,16 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
     float* lutG = out.lut[1].data();
     float* lutB = out.lut[2].data();
 
+    // SDR GAMMA 2.4: every base source is read at t^(2.4/2.2) instead of t (MHC2ProfileParams::sdrGamma24). The
+    // correction composed on top (ComposeMhcScanout) then sees the warped signal too: base + fine-tune together are
+    // the calibration, and the warp goes in ahead of all of it.
+    const bool warp24 = !params.isHDR && params.sdrGamma24;
+
     // Resample a correction curve to target size via linear interpolation
-    auto resampleCurve = [](const std::vector<float>& src, float* dst, int dstSize) {
+    auto resampleCurve = [warp24](const std::vector<float>& src, float* dst, int dstSize) {
         for (int j = 0; j < dstSize; j++) {
             float t = (float)j / (float)(dstSize - 1);
+            if (warp24) t = MhcGamma24Warp(t);
             float srcIdx = t * (float)(src.size() - 1);
             int i0 = (int)srcIdx;
             int i1 = (std::min)(i0 + 1, (int)src.size() - 1);
@@ -609,7 +615,8 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
             GenerateMHC2LUT_FromTRC_HDR(params.trcG, lutG, lutSize, params.peakNits);
             GenerateMHC2LUT_FromTRC_HDR(params.trcB, lutB, lutSize, params.peakNits);
         } else {
-            float targetGamma = params.grayscale.use24Gamma ? 2.4f : 2.2f;
+            // The inverted TRC aimed at t^2.4 is the 2.2 aim read at the warp: (t^(2.4/2.2))^2.2.
+            float targetGamma = warp24 ? 2.4f : 2.2f;
             if (Loud()) std::cout << "MHC2: Using per-channel TRC (" << params.trcR.size() << " points, target gamma " << targetGamma << ")" << std::endl;
             GenerateMHC2LUT_FromTRC_SDR(params.trcR, lutR, lutSize, targetGamma);
             GenerateMHC2LUT_FromTRC_SDR(params.trcG, lutG, lutSize, targetGamma);
@@ -620,9 +627,12 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
         GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutG, lutSize, 1);
         GenerateMHC2LUT_HDR_Channel(params.grayscale, params.peakNits, lutB, lutSize, 2);
     } else {
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutR, lutSize, 0);
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutG, lutSize, 1);
-        GenerateMHC2LUT_SDR_Channel(params.grayscale, lutB, lutSize, 2);
+        // The base curve (or identity) read at the warp; its own use24Gamma is the TRC tag's (see sdrGamma24).
+        GrayscaleData gs = params.grayscale;
+        gs.use24Gamma = warp24;
+        GenerateMHC2LUT_SDR_Channel(gs, lutR, lutSize, 0);
+        GenerateMHC2LUT_SDR_Channel(gs, lutG, lutSize, 1);
+        GenerateMHC2LUT_SDR_Channel(gs, lutB, lutSize, 2);
     }
     return true;
 }
@@ -665,16 +675,10 @@ void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, 
                 // Correction grayscale (fine-tuning on top of base). SIGNAL-domain
                 // (mirrors GenerateMHC2LUT_SDR_Channel): feed the signal `v` straight into
                 // the eval — NO sRGB decode/encode around it, or the slot index would land on
-                // the wrong slider.
+                // the wrong slider. GAMMA 2.4 is not composed here: it is in the base already,
+                // ahead of both curves (ComputeMhcScanoutBaseLuts, sdrGamma24).
                 if (hasCorrGS) {
-                    float corrected = EvalGrayscaleSDR_Channel(v, params.correctionGrayscale, ch);
-                    // Optional 2.2→2.4 gamma is a linear-light transform: decode, pow, re-encode.
-                    if (params.correctionGrayscale.use24Gamma) {
-                        float lin = SrgbEOTF((std::max)(corrected, 0.0f));
-                        lin = powf((std::max)(lin, 0.0f), 2.4f / 2.2f);
-                        corrected = SrgbOETF((std::max)(lin, 0.0f));
-                    }
-                    v = corrected;
+                    v = EvalGrayscaleSDR_Channel(v, params.correctionGrayscale, ch);
                 }
             }
 

@@ -64,7 +64,7 @@ Mhc2Tag ReadMhc2(const std::vector<uint8_t>& profile) {
 }
 
 // Every correction a profile can carry, per channel: a native-gamut panel with a measured white, a white-balance
-// move, a per-channel base grayscale, a per-channel correction (SDR: with the 2.4 gamma; HDR: desktop gamma on).
+// move, a per-channel base grayscale, a per-channel correction (SDR: GAMMA 2.4 on; HDR: desktop gamma on).
 MHC2ProfileParams FullParams(bool hdr) {
     MHC2ProfileParams p;
     p.monitorName = L"PreviewTest";
@@ -88,7 +88,7 @@ MHC2ProfileParams FullParams(bool hdr) {
     p.correctionGrayscaleEnabled = true;
     p.correctionGrayscale.enabled = true;
     p.correctionGrayscale.pointCount = 10;
-    p.correctionGrayscale.use24Gamma = !hdr;
+    p.sdrGamma24 = !hdr;
     for (int i = 0; i < 10; i++) {
         const float t = (float)i / 9.0f;
         const float b = hdr ? t : t * t;
@@ -198,13 +198,16 @@ TEST_CASE("MHC preview: from the settings, the preview composes exactly what the
         MhcPreviewSession s;
         REQUIRE(PrepareMhcPreview(m, hdr, 0, s));
         CHECK(!(s.perm & MHCSettings::PERM_GS));
+        CHECK_FALSE(s.params.sdrGamma24);
 
         auto bakeOf = [&](const MHCSettings& now, MhcScanout& out, std::vector<uint8_t>& file) {
             MHC2ProfileParams bp;
-            // The edit holds desktop gamma and the white balance tweak out: the bake it previews is the variant
-            // without them.
+            // The edit holds desktop gamma, the white balance tweak and GAMMA 2.4 out: the bake it previews is the
+            // variant without them.
             const uint8_t perm = (uint8_t)(ComputeMhcPermutation(now, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB));
             REQUIRE(BuildMHC2ParamsForPerm(now, hdr, 0, perm, bp));
+            CHECK(bp.sdrGamma24 == !hdr);   // the installed profile has it
+            bp.sdrGamma24 = false;
             REQUIRE(ComputeMhcScanout(bp, out));
             REQUIRE(GenerateMHC2Profile(bp, file));
         };
@@ -242,6 +245,7 @@ TEST_CASE("MHC preview: an edited BASE curve previews exactly what the bake inst
         CAPTURE(hdr);
         MHCSettings m = FullSettings();   // a base from points (no imported file), a fine-tune, WB, DG
         m.baseGrayscale.peakNits = 1450.0f;
+        if (!hdr) m.correctionGrayscale.use24Gamma = true;   // GAMMA 2.4: held like desktop gamma
         auto check = [&](const MHCSettings& prepared, const MHCSettings& edited) {
             MhcPreviewSession s;
             REQUIRE(PrepareMhcPreview(prepared, hdr, 0, s));
@@ -250,6 +254,8 @@ TEST_CASE("MHC preview: an edited BASE curve previews exactly what the bake inst
             MHC2ProfileParams bp;
             REQUIRE(BuildMHC2ParamsForPerm(edited, hdr, 0,
                                            (uint8_t)(ComputeMhcPermutation(edited, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB)), bp));
+            CHECK(bp.sdrGamma24 == !hdr);
+            bp.sdrGamma24 = false;
             REQUIRE(ComputeMhcScanout(bp, bake));
             CheckScanoutsIdentical(preview, bake);
             std::vector<uint8_t> file;
@@ -353,8 +359,9 @@ TEST_CASE("MHC profile edit: the preview is the bake of the edited settings") {
     }
 }
 
-TEST_CASE("MHC profile edit: desktop gamma and the white balance tweak stay out of the preview") {
-    MHCSettings m = FullSettings();   // both on
+TEST_CASE("MHC profile edit: desktop gamma, GAMMA 2.4 and the white balance tweak stay out of the preview") {
+    MHCSettings m = FullSettings();   // desktop gamma and the tweak on
+    m.correctionGrayscale.use24Gamma = true;   // GAMMA 2.4 (SDR)
     for (bool hdr : { false, true }) {
         CAPTURE(hdr);
         MhcScanout preview;
@@ -362,23 +369,24 @@ TEST_CASE("MHC profile edit: desktop gamma and the white balance tweak stay out 
         const uint8_t held = (uint8_t)(ComputeMhcPermutation(m, hdr) & ~(MHCSettings::PERM_DG | MHCSettings::PERM_WB));
         MHC2ProfileParams vp;
         REQUIRE(BuildMHC2ParamsForPerm(m, hdr, 0, held, vp));
+        vp.sdrGamma24 = false;
         MhcScanout variant;
         REQUIRE(ComputeMhcScanout(vp, variant));
         CheckScanoutsIdentical(preview, variant);
-        // ...and the DONE bake has them again: another matrix (the tweak), HDR other LUTs too (desktop gamma).
+        // ...and the DONE bake has them again: another matrix (the tweak) and other LUTs (HDR desktop gamma, SDR
+        // GAMMA 2.4).
         MHC2ProfileParams fp;
         REQUIRE(BuildMHC2ParamsForPerm(m, hdr, 0, ComputeMhcPermutation(m, hdr), fp));
+        CHECK(fp.sdrGamma24 == !hdr);
         MhcScanout full;
         REQUIRE(ComputeMhcScanout(fp, full));
         bool matrixDiffers = false;
         for (int i = 0; i < 9; i++) matrixDiffers |= !SameBits(preview.applied[i], full.applied[i]);
         CHECK(matrixDiffers);
-        if (hdr) {
-            int lutDiffers = 0;
-            for (int ch = 0; ch < 3; ch++)
-                for (int j = 0; j < full.lutSize; j++) lutDiffers += !SameBits(preview.lut[ch][j], full.lut[ch][j]);
-            CHECK(lutDiffers > 0);
-        }
+        int lutDiffers = 0;
+        for (int ch = 0; ch < 3; ch++)
+            for (int j = 0; j < full.lutSize; j++) lutDiffers += !SameBits(preview.lut[ch][j], full.lut[ch][j]);
+        CHECK(lutDiffers > 0);
     }
 }
 
@@ -822,6 +830,55 @@ TEST_CASE("MHC preview: the production overlay shader applies the bake, exactly,
             CHECK(worst < (hdr ? 1e-5 : 2e-6));
             CHECK(worstBlackNits < 1e-6);
         }
+    }
+}
+
+TEST_CASE("Overlay shader: GAMMA 2.4 is the bake's warp, per channel, ahead of the grayscale curve") {
+    OverlayGpu gpu;
+    if (!gpu.Init()) {
+        if (gpu.unavailable) { MESSAGE("skipped: " << gpu.error); return; }
+        FAIL("overlay shader setup: " << gpu.error);
+    }
+    std::vector<float> id2(8 * 4);
+    for (int i = 0; i < 8; i++) { id2[i * 4] = (float)(i & 1); id2[i * 4 + 1] = (float)((i >> 1) & 1); id2[i * 4 + 2] = (float)((i >> 2) & 1); id2[i * 4 + 3] = 1; }
+    gpu.SetLut3D(2, id2);
+    const int N = OverlayGpu::W;
+    std::vector<float> in((size_t)N * 4);
+    for (int i = 0; i < N; i++) {
+        in[i * 4] = in[i * 4 + 1] = in[i * 4 + 2] = (float)i / (N - 1);   // legacy SDR: the wire's code
+        in[i * 4 + 3] = 1.0f;
+    }
+    // A per-channel curve that is not channel-symmetric: the warp after it instead of before shows.
+    GrayscaleData gs;
+    gs.enabled = true;
+    gs.pointCount = 20;
+    for (int i = 0; i < 20; i++) {
+        const float t = (float)i / 19.0f, b = t * t * (i == 6 ? 1.08f : 1.0f);
+        gs.points[i] = b;
+        gs.pointsR[i] = (std::min)(1.0f, b * 1.03f);
+        gs.pointsG[i] = b;
+        gs.pointsB[i] = b * 0.96f;
+    }
+    for (bool withCurve : { false, true }) {
+        CAPTURE(withCurve);
+        float cb[148];
+        BaseCb(cb, false, false, false, 2);
+        cb[27] = 1.0f;   // grayscale24
+        if (withCurve) {
+            cb[8] = (float)gs.pointCount;
+            cb[9] = 1.0f;   // grayscaleEnabled
+            for (int i = 0; i < 32; i++) { cb[32 + i] = gs.pointsR[i]; cb[64 + i] = gs.pointsG[i]; cb[96 + i] = gs.pointsB[i]; }
+        }
+        const std::vector<float> got = gpu.Run(in, cb);
+        double worst = 0.0;
+        for (int i = 0; i < N; i++) {
+            const float w = MhcGamma24Warp(in[i * 4]);
+            for (int ch = 0; ch < 3; ch++) {
+                const float want = withCurve ? EvalGrayscaleSDR_Channel(w, gs, ch) : w;
+                worst = (std::max)(worst, (double)std::fabs(got[i * 4 + ch] - want));
+            }
+        }
+        CHECK(worst < 4e-6);   // fp32 pow on the GPU vs the CRT
     }
 }
 

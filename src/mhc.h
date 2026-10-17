@@ -51,6 +51,12 @@ struct MHC2ProfileParams {
     // Correction grayscale (fine-tuning on top of base grayscale from Edit dialog)
     GrayscaleData correctionGrayscale;
     bool correctionGrayscaleEnabled = false;
+
+    // SDR GAMMA 2.4 (MhcSdrGamma24): the 1D LUT reads the calibrated curve (base + fine-tune) at t^(2.4/2.2)
+    // (MhcGamma24Warp), so a display calibrated to pure 2.2 shows pure 2.4 — BT.1886 at zero black — whatever the
+    // panel's own response. Per channel after the matrix, like desktop gamma: greys are exact, saturated colours keep
+    // a small residual. The profile's TRC tag is not this: it follows grayscale.use24Gamma (the base curve's flag).
+    bool sdrGamma24 = false;
 };
 
 // Generate complete ICC v4 profile binary data with MHC2 tag
@@ -198,8 +204,8 @@ struct MhcScanout {
     std::vector<float> lut[3];       // per channel; after ComposeMhcScanout exactly the values the file stores
 };
 
-// Matrix + base LUTs (base grayscale / ICC TRC / 1D cube; correction grayscale and desktop gamma not composed,
-// entries not quantized). Logs the LUT source like the bake always did.
+// Matrix + base LUTs (base grayscale / ICC TRC / 1D cube, each read at MhcGamma24Warp(t) under sdrGamma24; correction
+// grayscale and desktop gamma not composed, entries not quantized). Logs the LUT source like the bake always did.
 bool ComputeMhcScanoutBase(const MHC2ProfileParams& params, MhcScanout& out);
 // The matrix alone (emit + applied; the LUTs of `out` are left as they are): the primaries, the white and the white
 // balance gains are its only inputs, so a live edit of them keeps the LUTs it already has.
@@ -229,7 +235,8 @@ void EvalMhcScanout(const MhcScanout& s, const float lin[3], float out[3]);
 // The value an s15Fixed16 field stores for f (FloatToS15Fixed16, decoded).
 float QuantizeS15Fixed16(float f);
 
-// Generate MHC2 1D LUT for SDR (1024 entries, sRGB signal domain)
+// Generate MHC2 1D LUT for SDR (1024 entries, sRGB signal domain). gs.use24Gamma: the curve is read at
+// MhcGamma24Warp(t) (an identity curve included).
 void GenerateMHC2LUT_SDR(const GrayscaleData& gs, float* outLUT, int lutSize = 1024);
 
 // Generate MHC2 1D LUT for HDR (4096 entries, PQ signal domain)
@@ -283,6 +290,9 @@ float SrgbEOTF(float v);
 float SrgbOETF(float v);
 float PqEOTF(float pq);
 float PqOETF(float L);
+
+// SDR GAMMA 2.4's input warp, t^(2.4/2.2): a chain calibrated to pure 2.2 that is fed it shows t^2.4.
+float MhcGamma24Warp(float t);
 
 // Desktop gamma on one channel's HDR drive signal (PQ): Windows composites SDR content as
 // sdrWhiteNits * sRGB_EOTF(code); over (0, sdrWhiteNits] this re-decodes it as

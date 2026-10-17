@@ -188,6 +188,7 @@ void LiveEditNotes(unsigned held, bool nightLight) {
         if (held & kMhcHeldFald) add("FALD");
         if (held & kMhcHeldDesktopGamma) add("DESKTOP GAMMA");
         if (held & kMhcHeldWhiteBalance) add("WHITE BALANCE");
+        if (held & kMhcHeldGamma24) add("GAMMA 2.4");
         const char* tip = "Off while you edit, so the meter reads the calibration alone.\nBack on with DONE or CANCEL.";
         PanelNote("OFF", pal::InkFaint, tip);
         PanelNote(list.c_str(), pal::InkDim, tip);
