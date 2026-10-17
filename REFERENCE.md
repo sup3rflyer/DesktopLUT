@@ -455,7 +455,7 @@ reader (`shared/fald_panel.h`) — there is no second implementation of the corr
   publishes the generation in the tuning tail (`DwmHookFaldTuning::panelGen[SDR, HDR]`). On the next present of
   that display the DLL takes it (header checks, the same parser straight from the view, SEH-guarded, under the
   panel table's lock — tried only, never waited for in a present; ~20 µs warm / ~150 µs cold for a 576 KB file)
-  and the layer swaps its panel part before any pass of a present: new tables, flat response and LED-lag state;
+  and the layer swaps its panel part before any pass of a present (a present that is still using the entry - a 25H2 twin context on another thread - defers the swap, a build or a release of it; nothing waits, and a deferred swap asks for a later present a few times): new tables, flat response and LED-lag state;
   the clean source stays primed, so there is no gap. A file whose panel part cannot be built goes back to the
   last one built (the layer stays on it). The DLL's verdict (ingested / applied / refused / build failed) is
   written back into the section; the host follows it — `state.get → hook.fald_panels` separates what the hook

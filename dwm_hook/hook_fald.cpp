@@ -221,6 +221,7 @@ static FaldPanelLock g_panelsLock;
 // g_panels.AnyPresent() as of the last change under the lock, for readers that must not take it (the direct-flip hooks)
 static std::atomic<bool> g_anyPanelPresent{ false };
 static void RefreshAnyPanelPresent() { g_anyPanelPresent.store(g_panels.AnyPresent()); }   // g_panelsLock held
+static void NoteSlotChanged(int left, int top, bool isHdr);   // with FaldAcquire: that entry owes a swap
 
 bool FaldHasAnyPanelFile() { return g_anyPanelPresent.load(); }
 
@@ -391,6 +392,7 @@ static void IngestDelivery(int left, int top, bool isHdr, uint32_t gen, uint32_t
         }
     }
     if (ack != DWM_HOOK_FALD_PANEL_ACK_INGESTED) g_panels.MarkSeen(left, top, isHdr, gen, ack);   // (Deliver marked it too)
+    else NoteSlotChanged(left, top, isHdr);   // its entry owes a swap (asked for if it cannot be done this present)
     RefreshAnyPanelPresent();
 
     // An accepted delivery's section is kept for its later verdicts (applied / build failed) and replaces the slot's
@@ -622,12 +624,31 @@ static std::atomic<FaldMonitor*> g_monitors[FALD_MAX_PANEL_FILES] = {};
 static std::atomic<int> g_numMonitors{ 0 };
 static int MonitorCount() { return g_numMonitors.load(std::memory_order_acquire); }
 static FaldMonitor* MonitorAt(int i) { return g_monitors[i].load(std::memory_order_acquire); }
-// Per entry (g_monitors index): a stale mark still to apply, and "its resources are being rebuilt" (a swap or a build
-// under the lock) — a present that finds the lock busy never uses an entry that is being rebuilt.
-static std::atomic<bool> g_stalePending[FALD_MAX_PANEL_FILES];
-static std::atomic<bool> g_entryRebuilding[FALD_MAX_PANEL_FILES];
+// Entry use vs entry rebuild — the protocol (one gate per g_monitors index: shared/fald_panel_live.h FaldEntryGate,
+// whose state machine the unit tests drive):
+//   * A present that gets an entry from FaldAcquire has BORROWED it, for the rest of that present: RenderLUT returns it
+//     with FaldReturn on every path (FaldBorrowScope). Several presents may borrow one entry (25H2 twin contexts).
+//   * Everything that changes an entry's resources or state outside its own use — a live swap, a build or resize, a
+//     stale mark (and the release after 600 of them), the other-mode release, FaldReleaseAll — runs under g_panelsLock
+//     AND claims the entry's gate first. A claim that finds a borrow is refused: the work stays pending (the slot's
+//     newer file, the stale mark) and a later present redoes it; a deferred swap asks for that present (bounded).
+//   * Nothing waits: a busy lock, a borrowed entry or a claimed one each mean "not this present".
+static std::atomic<bool> g_stalePending[FALD_MAX_PANEL_FILES];   // a stale mark still to apply (by index)
+static FaldEntryGate g_entryGate[FALD_MAX_PANEL_FILES];
+// A panel file delivered for this entry's (position, mode) is not built yet: a present that cannot do the swap now asks
+// for a later present, at most kFaldSwapKicksMax times per delivered file (HookRequestFullRecompose: once a second).
+static std::atomic<bool> g_entryNeedsSwap[FALD_MAX_PANEL_FILES];
+static std::atomic<unsigned> g_entryKicks[FALD_MAX_PANEL_FILES];
+static const unsigned kFaldSwapKicksMax = 5;
+// FaldReleaseAll is running: an append refuses (its timeout path does not hold the lock).
+static std::atomic<bool> g_faldReleasing{ false };
 static void MarkEntryStale(FaldMonitor* e);   // with FaldMarkStale
 static void ApplyPendingStale(int left, int top);   // with FaldMarkStale
+
+static void RequestDeferredSwap(int i) {
+    if (i < 0 || !g_entryNeedsSwap[i].load() || g_entryKicks[i].load() >= kFaldSwapKicksMax) return;
+    if (HookRequestFullRecompose()) g_entryKicks[i].fetch_add(1);   // throttled inside; counted only when signalled
+}
 
 static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cb);
@@ -675,23 +696,35 @@ void FaldReleaseAll() {
     }
     if (!locked) log_to_file("FALD: releasing without the panel table lock (a present thread kept it)");
     struct Unlock { bool on; ~Unlock() { if (on) g_panelsLock.Unlock(); } } unlock{ locked };
+    g_faldReleasing.store(true);                          // an append refuses from here on
     for (int i = 0; i < 4; i++) { g_tsInFlight[i] = false; g_tsOwner[i] = nullptr; }   // owners are about to go
-    const int count = MonitorCount();
-    g_numMonitors.store(0, std::memory_order_release);   // a busy-lock reader sees no entry from here on
+    const int count = g_numMonitors.exchange(0);          // a lookup finds no entry from here on (an append's CAS fails)
+    int leaked = 0;
     for (int i = 0; i < count; i++) {
-        FaldMonitor* e = g_monitors[i].exchange(nullptr, std::memory_order_acq_rel);
+        // Claimed first, like any rebuild: an entry a present still uses (or a lock holder is rebuilding, on the timeout
+        // path) is LEFT ALIVE — taken out of the list and leaked — rather than freed under it. The claim is kept, so a
+        // borrower that found it before it left the list backs off; a new entry at this index resets the gate.
+        if (!g_entryGate[i].TryBeginRebuild()) { g_monitors[i].store(nullptr); leaked++; continue; }
+        FaldMonitor* e = g_monitors[i].exchange(nullptr);
         if (!e) continue;
         ReleaseMonitor(e);
         if (e->settleEvt) CloseHandle(e->settleEvt);
         if (e->contentEvt) CloseHandle(e->contentEvt);
         delete e;
     }
-    for (int i = 0; i < FALD_MAX_PANEL_FILES; i++) { g_stalePending[i].store(false); g_entryRebuilding[i].store(false); }
+    if (leaked) LogF("FALD: %d layer entr%s still in use at release - left allocated", leaked, leaked == 1 ? "y" : "ies");
+    for (int i = 0; i < FALD_MAX_PANEL_FILES; i++) {
+        g_stalePending[i].store(false); g_entryNeedsSwap[i].store(false); g_entryKicks[i].store(0);
+    }
     // The panel files go with them, as before (staged ones are not re-read; a delivered one is taken again from its
-    // section, which the host keeps open, at the next present: its generation is no longer marked processed).
-    g_panels.Clear();
-    ReleaseDeliveryViews();
-    g_anyPanelPresent.store(false);
+    // section, which the host keeps open, at the next present: its generation is no longer marked processed). Not on
+    // the timeout path: a lock holder may be inside the table — its memory is left as it is.
+    if (locked) {
+        g_panels.Clear();
+        ReleaseDeliveryViews();
+        g_anyPanelPresent.store(false);
+    }
+    g_faldReleasing.store(false);
 }
 
 static bool MakeRWTexture(UINT w, UINT h, ID3D11Texture2D** tex, ID3D11UnorderedAccessView** uav,
@@ -982,12 +1015,34 @@ static FaldMonitor* FindMonitorEntry(int left, int top, bool isHdr, int* index) 
     return nullptr;
 }
 
-// Marks entry `index` as being rebuilt for the scope (under g_panelsLock): a present that finds the lock busy skips it.
-struct EntryRebuild {
+// A claim on entry `index` for the scope (g_panelsLock held): refused (owned() false) while a present borrows it.
+struct EntryClaim {
     int index;
-    explicit EntryRebuild(int i) : index(i) { if (index >= 0) g_entryRebuilding[index].store(true, std::memory_order_release); }
-    ~EntryRebuild() { if (index >= 0) g_entryRebuilding[index].store(false, std::memory_order_release); }
+    bool ok;
+    explicit EntryClaim(int i) : index(i), ok(i >= 0 && g_entryGate[i].TryBeginRebuild()) {}
+    ~EntryClaim() { if (ok) g_entryGate[index].EndRebuild(); }
+    bool owned() const { return ok; }
 };
+
+// Borrow entry `i` (found as `e`) for this present: false when it is claimed, or no longer the entry at `i`.
+static FaldMonitor* BorrowEntry(int i, FaldMonitor* e) {
+    if (i < 0 || !e || !g_entryGate[i].TryBorrow()) return nullptr;
+    if (MonitorAt(i) != e) { g_entryGate[i].Return(); return nullptr; }   // released between the lookup and the borrow
+    return e;
+}
+
+void FaldReturn(FaldMonitor* m) {
+    if (!m) return;
+    for (int i = 0, n = MonitorCount(); i < n; i++)
+        if (MonitorAt(i) == m) { g_entryGate[i].Return(); return; }
+    // not in the list any more: FaldReleaseAll left it allocated (it was borrowed) and nothing will count it again
+}
+
+// A panel file for (left, top, isHdr) changed in the table (g_panelsLock held): its entry, if any, owes a swap.
+static void NoteSlotChanged(int left, int top, bool isHdr) {
+    int i = -1;
+    if (FindMonitorEntry(left, top, isHdr, &i)) { g_entryKicks[i].store(0); g_entryNeedsSwap[i].store(true); }
+}
 
 FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsigned int height,
                          DXGI_FORMAT format) {
@@ -995,14 +1050,20 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
 
     FaldPanelLockGuard lock(g_panelsLock);
     if (!lock.owned()) {
-        // Another present thread is in the table (a delivery or a build): this present runs the entry as it is — a
-        // swap waits for a later present. It stays off once more (the caller marks it stale again; nothing of the layer
-        // was on screen for it) when it is not running, has a stale mark still to apply, or is the entry being rebuilt
-        // right now (a second context of the same position on another thread: 25H2 recreates contexts).
+        // Another present thread is in the table (a delivery, a build): this present BORROWS the entry as it is, if it
+        // can — a swap it owes waits for a later present (asked for). It stays off once more (the caller marks it stale
+        // again; nothing of the layer was on screen for it) when it is claimed by a rebuild, not running, or has a
+        // stale mark still to apply.
         int i = -1;
-        FaldMonitor* e = FindMonitorEntry(left, top, isHdr, &i);
-        if (!e || g_stalePending[i].load() || g_entryRebuilding[i].load(std::memory_order_acquire)) return nullptr;
-        return (e->valid && e->width == width && e->height == height && e->format == format) ? e : nullptr;
+        FaldMonitor* found = FindMonitorEntry(left, top, isHdr, &i);   // (sets i: a statement of its own)
+        FaldMonitor* e = BorrowEntry(i, found);
+        if (!e) return nullptr;
+        if (g_stalePending[i].load() || !e->valid || e->width != width || e->height != height || e->format != format) {
+            g_entryGate[i].Return();
+            return nullptr;
+        }
+        RequestDeferredSwap(i);
+        return e;
     }
     ApplyPendingStale(left, top);
     int mIndex = -1;
@@ -1013,7 +1074,8 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
     for (int i = 0, n = MonitorCount(); i < n; i++) {
         FaldMonitor* e = MonitorAt(i);
         if (e && e != m && e->left == left && e->top == top && e->isHdr != isHdr && e->valid) {
-            EntryRebuild busy(i);
+            EntryClaim claim(i);
+            if (!claim.owned()) continue;   // in use (a context of the other mode still presenting): a later present
             ReleaseMonitor(e);
             CoverReset(e);
         }
@@ -1027,15 +1089,24 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
     }
     const bool sameFrame = m && m->width == width && m->height == height && m->format == format;
     switch (FaldLayerDecide(state, sameFrame, pf)) {
-    case FaldLayerAction::Run: return m;
+    case FaldLayerAction::Run:
+        g_entryNeedsSwap[mIndex].store(false);   // built from the slot's file (or a failed swap of it: not retried)
+        return BorrowEntry(mIndex, m);
     case FaldLayerAction::Off: return nullptr;
     case FaldLayerAction::Build: break;   // below
     case FaldLayerAction::Swap: {
             // A file delivered live since this entry was built (dwm_hook_config.h DwmHookFaldPanelBlob): swap its panel
-            // part now, before any pass of this present. A failed swap is not retried for the same file.
+            // part now, before any pass of this present. A failed swap is not retried for the same file. Another
+            // present still using the entry (a twin context on another thread) defers it: this one runs the entry as it
+            // is, and a later present — asked for — swaps.
+            g_entryNeedsSwap[mIndex].store(true);
+            EntryClaim claim(mIndex);
+            if (!claim.owned()) {
+                RequestDeferredSwap(mIndex);
+                return BorrowEntry(mIndex, m);
+            }
             LARGE_INTEGER t0, t1, f;
             QueryPerformanceCounter(&t0);
-            EntryRebuild busy(mIndex);
             if (SwapPanel(m, pf->params, pf->seq)) {
                 QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
                 LogF("FALD: pos(%d,%d) %s switched to the panel file delivered live (gen %u) between two presents "
@@ -1055,45 +1126,71 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
                 LogF("FALD: pos(%d,%d) %s could not build the panel file delivered live (gen %u) - the layer stays on "
                      "the previous file", left, top, isHdr ? "HDR" : "SDR(ACM)", failedGen);
             }
+            g_entryNeedsSwap[mIndex].store(false);
             RefreshAnyPanelPresent();
-            return m;
         }
+        return BorrowEntry(mIndex, m);   // (the claim has ended: the destructor ran with the block)
     }
     // Build: first sight, a resize, released (layer off for a while, or a mode switch), or failed on a file since
-    // replaced. FaldLayerDecide returns Build only with a file in the slot.
-
-    if (!m) {
-        const int n = MonitorCount();
-        if (n >= FALD_MAX_PANEL_FILES) return nullptr;
-        m = new FaldMonitor();
-        m->left = left; m->top = top; m->isHdr = isHdr;
-        m->tuning = DefaultTuning();
-        // Published last (release): a concurrent reader either does not see the slot or sees a complete entry.
-        mIndex = n;
-        g_monitors[n].store(m, std::memory_order_release);
-        g_numMonitors.store(n + 1, std::memory_order_release);
+    // replaced. FaldLayerDecide returns Build only with a file in the slot. The entry is claimed for the build (a new one
+    // before anyone can see it); the claim ends with the block, and only then is the entry borrowed for this present.
+    {
+        bool claimedNew = false;
+        if (!m) {
+            const int n = MonitorCount();
+            if (n >= FALD_MAX_PANEL_FILES || g_faldReleasing.load()) return nullptr;
+            m = new (std::nothrow) FaldMonitor();
+            if (!m) return nullptr;
+            m->left = left; m->top = top; m->isHdr = isHdr;
+            m->tuning = DefaultTuning();
+            // Claimed, then published (pointer first, count last): a concurrent reader either does not see the slot or
+            // sees a complete, claimed entry. The count moves only from what it was: a FaldReleaseAll on its timeout
+            // path that zeroed it meanwhile makes this append undo itself (nothing leaks, the count stays 0).
+            g_entryGate[n].ClaimNew();
+            g_stalePending[n].store(false); g_entryNeedsSwap[n].store(false); g_entryKicks[n].store(0);
+            g_monitors[n].store(m);
+            int expected = n;
+            if (!g_numMonitors.compare_exchange_strong(expected, n + 1)) {
+                g_monitors[n].store(nullptr);
+                g_entryGate[n].EndRebuild();
+                delete m;
+                return nullptr;
+            }
+            mIndex = n;
+            claimedNew = true;
+        }
+        // A build of an existing entry claims it like a swap: one still in use (a twin context on another thread, at its
+        // old size) is rebuilt by a later present — asked for.
+        EntryClaim claim(claimedNew ? -1 : mIndex);
+        struct NewClaim { int i; ~NewClaim() { if (i >= 0) g_entryGate[i].EndRebuild(); } } newClaim{ claimedNew ? mIndex : -1 };
+        if (!claimedNew && !claim.owned()) {
+            g_entryNeedsSwap[mIndex].store(true);
+            RequestDeferredSwap(mIndex);
+            return nullptr;
+        }
+        // A resize (or the first sight of this monitor) rebuilds and clears the latch: the lattice may
+        // fit the new frame even though it did not fit the old one.
+        m->width = width; m->height = height; m->format = format;
+        m->failed = false;
+        m->refusedSeq = 0;
+        if (!BuildMonitor(m, pf->params)) {
+            ReleaseMonitor(m);
+            m->failed = true;     // logged once inside BuildMonitor; no per-frame retry inside DWM
+            m->failedSeq = pf->seq;
+            AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED);
+            // A delivered file goes back to the one it replaced (its seq moves on, so the next present builds that one,
+            // once); a staged file has nothing to go back to and stays latched off, as before.
+            g_panels.RevertBuild(left, top, isHdr, nullptr);
+            g_entryNeedsSwap[mIndex].store(false);
+            RefreshAnyPanelPresent();
+            return nullptr;
+        }
+        m->panelSeq = pf->seq;
+        AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_APPLIED);
+        g_panels.Commit(left, top, isHdr);
+        g_entryNeedsSwap[mIndex].store(false);
     }
-    EntryRebuild busy(mIndex);
-    // A resize (or the first sight of this monitor) rebuilds and clears the latch: the lattice may
-    // fit the new frame even though it did not fit the old one.
-    m->width = width; m->height = height; m->format = format;
-    m->failed = false;
-    m->refusedSeq = 0;
-    if (!BuildMonitor(m, pf->params)) {
-        ReleaseMonitor(m);
-        m->failed = true;     // logged once inside BuildMonitor; no per-frame retry inside DWM
-        m->failedSeq = pf->seq;
-        AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED);
-        // A delivered file goes back to the one it replaced (its seq moves on, so the next present builds that one,
-        // once); a staged file has nothing to go back to and stays latched off, as before.
-        g_panels.RevertBuild(left, top, isHdr, nullptr);
-        RefreshAnyPanelPresent();
-        return nullptr;
-    }
-    m->panelSeq = pf->seq;
-    AckSlot(slot, DWM_HOOK_FALD_PANEL_ACK_APPLIED);
-    g_panels.Commit(left, top, isHdr);
-    return m;
+    return BorrowEntry(mIndex, m);
 }
 
 ID3D11RenderTargetView* FaldIntermediateRTV(FaldMonitor* m) { return m ? m->interRTV : nullptr; }
@@ -1175,11 +1272,19 @@ static void MarkEntryStale(FaldMonitor* e) {
 // present thread held g_panelsLock. Applied only by a present of the entry's OWN position — FaldAcquire / FaldMarkStale,
 // on the thread that uses the entry — so no thread ever changes (or, after 600 marks, releases) another monitor's entry
 // while that monitor's thread is using it outside the lock (FaldUpdateClean / FaldRun).
+// Each mark claims the entry first: one a present is using (a twin context of the same position on another thread,
+// or a provisional 25H2 context resolved onto the other twin's position) keeps its mark pending for a later present.
+static void MarkEntryStaleClaimed(int i, FaldMonitor* e) {   // g_panelsLock held
+    EntryClaim claim(i);
+    if (!claim.owned()) { g_stalePending[i].store(true); return; }
+    MarkEntryStale(e);
+}
+
 static void ApplyPendingStale(int left, int top) {   // g_panelsLock held
     for (int i = 0, n = MonitorCount(); i < n; i++) {
         FaldMonitor* e = MonitorAt(i);
         if (!e || e->left != left || e->top != top) continue;
-        if (g_stalePending[i].exchange(false)) MarkEntryStale(e);
+        if (g_stalePending[i].exchange(false)) MarkEntryStaleClaimed(i, e);
     }
 }
 
@@ -1189,7 +1294,7 @@ void FaldMarkStale(int left, int top) {
     for (int i = 0, n = MonitorCount(); i < n; i++) {
         FaldMonitor* e = MonitorAt(i);
         if (!e || e->left != left || e->top != top) continue;
-        if (lock.owned()) MarkEntryStale(e);
+        if (lock.owned()) MarkEntryStaleClaimed(i, e);
         else g_stalePending[i].store(true);   // never wait in the present: applied before the entry is used again
     }
 }

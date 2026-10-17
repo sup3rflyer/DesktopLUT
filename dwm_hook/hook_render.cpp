@@ -1263,6 +1263,12 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 	// does. The layer needs the whole frame, so switching it on also switches this context off
 	// dirty-rect rendering for as long as it is on — see the draw block below.
 	FaldMonitor* faldMon = NULL;
+	// The entry FaldAcquire lends this present is returned when RenderLUT leaves, on every path (an exception included):
+	// until then no swap, build, stale mark or release of another present thread touches it (hook_fald.h FaldReturn).
+	struct FaldBorrowScope {
+		FaldMonitor* m = NULL;
+		~FaldBorrowScope() { if (m) FaldReturn(m); }
+	} faldBorrow;
 	// A panel file the host delivered live for this monitor (either mode) since the last present: taken into the
 	// panel table now, so FaldAcquire below swaps it in before any pass of this present (hook_fald.h).
 	if (index != -1 && FaldShadersReady())
@@ -1277,6 +1283,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		{
 			faldMon = FaldAcquire(monLeft, monTop, colorMode == 1,
 				newBackBufferDesc.Width, newBackBufferDesc.Height, newBackBufferDesc.Format);
+			faldBorrow.m = faldMon;   // kept even if faldMon is cleared below (the entry was used: FaldUpdateClean)
 			if (faldMon)
 				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags),
 					DwmHookFaldStar(fp->flags) != 0,

@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+#include <atomic>
 
 #include "dwm_hook_config.h"
 #include "fald_panel.h"
@@ -124,6 +125,39 @@ private:
     int n_ = 0;
     Overflow overflow_[kCapacity];
     int overflowNext_ = 0;
+};
+
+// The gate between the presents that USE a layer entry lock-free and the lock holder that REBUILDS it (dwm_hook/
+// hook_fald.cpp: a live swap, a build, a stale mark, a release). Neither side ever waits:
+//   - a present that wants to use the entry BORROWS it (TryBorrow) for the rest of its present and RETURNS it at the
+//     end (Return, on every path); a borrow that meets a rebuild backs off — the present runs without the layer;
+//   - a rebuilder (holding the table lock) claims the entry (TryBeginRebuild) before it touches the entry's resources
+//     and releases the claim after (EndRebuild); a claim that meets a borrow — or another claim — is refused, and the
+//     work stays pending for a later present (the caller asks for one).
+// Both sides announce first and look second, sequentially consistent (Dekker): of a borrow and a claim that overlap,
+// at least one sees the other, so a rebuild never runs under a borrower and a borrower never uses a half-rebuilt entry.
+// A borrower re-checks, after borrowing, that the entry it found is still the one in the list (a release between its
+// lookup and its borrow), because a release, too, claims the gate first.
+struct FaldEntryGate {
+    std::atomic<int> borrows{ 0 };
+    std::atomic<bool> rebuilding{ false };
+
+    bool TryBorrow() {
+        borrows.fetch_add(1);
+        if (rebuilding.load()) { borrows.fetch_sub(1); return false; }
+        return true;
+    }
+    void Return() { borrows.fetch_sub(1); }
+    bool TryBeginRebuild() {
+        bool expected = false;
+        if (!rebuilding.compare_exchange_strong(expected, true)) return false;   // another claim (a release on its
+        if (borrows.load() != 0) { rebuilding.store(false); return false; }      // timeout path, or a lock holder)
+        return true;
+    }
+    void EndRebuild() { rebuilding.store(false); }
+    // A new entry, not yet visible to anyone: no borrows, claimed by its builder.
+    void ClaimNew() { borrows.store(0); rebuilding.store(true); }
+    bool Borrowed() const { return borrows.load() != 0; }
 };
 
 // The layer's build decision for one monitor entry in one mode (dwm_hook/hook_fald.cpp FaldAcquire), pure so the latch

@@ -78,6 +78,10 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // = the entry runs as it is this present (a swap waits; an entry not running stays off once more).
 FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsigned int height,
                          DXGI_FORMAT format);
+// A non-null FaldAcquire BORROWS the entry for the present: no swap, build, stale mark or release touches it until it
+// is returned. Every non-null result must be returned exactly once, at the end of the present's use of it, on every
+// path (RenderLUT: FaldBorrowScope). Never waits.
+void FaldReturn(FaldMonitor* m);
 
 // The layer's own full-size intermediate. The hook's LUT/tonemap pass renders the WHOLE frame here
 // instead of the back buffer (or, with neither configured, the back buffer is copied in), and

@@ -1019,6 +1019,85 @@ TEST_CASE("FALD live: a held-but-idle delivery never asks for a composition; an 
     CHECK(FaldPanelTrackPublishedGen(t) == 5u);
 }
 
+TEST_CASE("FALD live: the entry gate - a rebuild never runs under a borrow, a borrow never takes a claimed entry") {
+    FaldEntryGate g;
+    // a present borrows; a rebuild (swap / build / stale mark / release) is refused while it does, and nobody waits
+    REQUIRE(g.TryBorrow());
+    CHECK(g.Borrowed());
+    CHECK_FALSE(g.TryBeginRebuild());
+    CHECK_FALSE(g.rebuilding.load());                 // a refused claim leaves no trace
+    REQUIRE(g.TryBorrow());                           // two twin contexts may borrow together
+    g.Return();
+    CHECK_FALSE(g.TryBeginRebuild());                 // one still borrows
+    g.Return();
+    CHECK_FALSE(g.Borrowed());
+    // the rebuild claims it: a borrow backs off (the present runs without the layer), a second claim is refused
+    REQUIRE(g.TryBeginRebuild());
+    CHECK_FALSE(g.TryBorrow());
+    CHECK_FALSE(g.Borrowed());                        // a backed-off borrow leaves no trace either
+    CHECK_FALSE(g.TryBeginRebuild());                 // (a release on its timeout path vs a lock holder)
+    g.EndRebuild();
+    CHECK(g.TryBorrow());
+    g.Return();
+    // a new entry is claimed before anyone can see it, whatever its index held before
+    g.borrows.store(3);                               // a stale count from an entry left behind at release
+    g.ClaimNew();
+    CHECK_FALSE(g.Borrowed());
+    CHECK_FALSE(g.TryBorrow());
+    g.EndRebuild();
+    CHECK(g.TryBorrow());
+    g.Return();
+}
+
+TEST_CASE("FALD live: the entry gate under threads - no borrower ever sees an entry rebuilt or freed under it") {
+    // Borrowers stand for the presents of twin contexts (FaldUpdateClean / FaldRun on the entry), the rebuilder for the
+    // lock holder's swap / build / release: it replaces the entry, marking the old one dead (standing for the freed COM
+    // resources — they are not really freed, so a violation is counted instead of crashing the test).
+    struct Entry { std::atomic<int> alive{ 1 }; int payload = 0; };
+    std::vector<Entry> pool(4096);
+    std::atomic<Entry*> current{ &pool[0] };
+    FaldEntryGate gate;
+    std::atomic<bool> stop{ false };
+    std::atomic<int> violations{ 0 }, borrows{ 0 }, backedOff{ 0 }, rebuilds{ 0 }, deferred{ 0 };
+    std::vector<std::thread> borrowers;
+    for (int k = 0; k < 4; k++) {
+        borrowers.emplace_back([&]() {
+            while (!stop.load()) {
+                if (!gate.TryBorrow()) { backedOff++; std::this_thread::yield(); continue; }
+                Entry* e = current.load();
+                for (int r = 0; r < 50; r++) {                     // a present's worth of use
+                    if (e->alive.load() != 1) violations++;
+                    std::this_thread::yield();
+                }
+                gate.Return();
+                borrows++;
+            }
+        });
+    }
+    std::thread rebuilder([&]() {
+        size_t next = 1;
+        while (!stop.load() && next < pool.size()) {
+            if (!gate.TryBeginRebuild()) { deferred++; std::this_thread::yield(); continue; }   // borrowed: later
+            Entry* old = current.load();
+            old->alive.store(0);                                    // the swap releases the old resources ...
+            current.store(&pool[next++]);                           // ... and the entry holds new ones
+            gate.EndRebuild();
+            rebuilds++;
+        }
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
+    while (std::chrono::steady_clock::now() < until && (rebuilds.load() < 200 || borrows.load() < 200))
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    stop = true;
+    for (auto& t : borrowers) t.join();
+    rebuilder.join();
+    CHECK(violations.load() == 0);
+    CHECK(borrows.load() > 0);
+    CHECK(rebuilds.load() > 0);
+    MESSAGE("borrows " << borrows.load() << " (backed off " << backedOff.load() << "), rebuilds " << rebuilds.load()
+                       << " (deferred " << deferred.load() << ")");
+}
+
 TEST_CASE("FALD live: an acknowledgement word the host does not know counts as no answer (bounded, never forever)") {
     const unsigned ticks = 3;
     FaldPanelTrack t;
