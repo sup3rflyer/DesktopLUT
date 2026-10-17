@@ -250,6 +250,14 @@ FaldPanelStep FaldPanelTrackStep(FaldPanelTrack& t, uint32_t ackGen, uint32_t ac
     }
 }
 
+bool FaldPanelTrackWantsRecompose(const FaldPanelTrack& t, bool watchdogTick, bool presentsDue, bool attached) {
+    return watchdogTick && presentsDue && attached && !t.final && t.gen != 0 && t.verdict == DWM_HOOK_FALD_PANEL_ACK_NONE;
+}
+
+uint32_t FaldPanelTrackPublishedGen(const FaldPanelTrack& t) {
+    return t.verdict == FALD_PANEL_VERDICT_NO_ACK ? 0u : t.gen;
+}
+
 bool FaldPanelFallbackGuard::Allow(int left, int top, bool isHdr, const std::wstring& path, unsigned long long size,
                                    unsigned long long mtime) {
     for (const Key& k : keys_)

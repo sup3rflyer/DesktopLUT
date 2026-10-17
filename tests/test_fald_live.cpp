@@ -962,3 +962,59 @@ TEST_CASE("FALD live: the content hash tells a touched file from a re-exported o
     CHECK(FaldPanelContentHash(a.data(), a.size()) != FaldPanelContentHash(b.data(), b.size()));
     CHECK(FaldPanelContentHash(a.data(), a.size() - 1) != FaldPanelContentHash(a.data(), a.size()));
 }
+
+TEST_CASE("FALD live: a held-but-idle delivery never asks for a composition; an unanswered one only while a present is due") {
+    // CheckDwmHookFaldPanelVerdicts' order on every reading: FaldPanelTrackStep, then (no step) the recompose question.
+    const unsigned ticks = 3;
+    auto tick = [&](FaldPanelTrack& t, uint32_t ackGen, uint32_t ackStatus, bool watchdogTick, bool due, bool attached,
+                    int& asks) {
+        const FaldPanelStep step = FaldPanelTrackStep(t, ackGen, ackStatus, watchdogTick && due && attached, ticks);
+        if (step == FaldPanelStep::None && FaldPanelTrackWantsRecompose(t, watchdogTick, due, attached)) asks++;
+        return step;
+    };
+    FaldPanelTrack t;
+    t.Stage(L"A.bin");
+    int asks = 0;
+    tick(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, true, true, true, asks);
+    CHECK(asks == 0);                                                       // nothing sent
+
+    // An HDR file set while the display is in SDR, or the layer off, or twin routing not trusted: the DLL takes it on
+    // any present of that display and answers INGESTED. From then on no tick ever asks for a composition (each ask is
+    // a full-screen topmost window: it would drop G-Sync every 5 s), however long the file stays idle.
+    t.Sent(L"B_hdr.bin", 3);
+    CHECK(FaldPanelTrackWantsRecompose(t, true, true, true));               // unanswered, due: one composition helps
+    CHECK_FALSE(FaldPanelTrackWantsRecompose(t, false, true, true));        // the 200 ms verdict poll never asks
+    CHECK_FALSE(FaldPanelTrackWantsRecompose(t, true, false, true));        // display off / occluded
+    CHECK_FALSE(FaldPanelTrackWantsRecompose(t, true, true, false));        // not attached
+    REQUIRE(tick(t, 3, DWM_HOOK_FALD_PANEL_ACK_INGESTED, true, true, true, asks) == FaldPanelStep::Ingested);
+    for (int k = 0; k < 200; k++) {
+        CHECK(tick(t, 3, DWM_HOOK_FALD_PANEL_ACK_INGESTED, true, true, true, asks) == FaldPanelStep::None);
+        CHECK_FALSE(FaldPanelTrackWantsRecompose(t, true, true, true));
+    }
+    CHECK(asks == 0);
+    CHECK_FALSE(t.final);                                                   // its build verdict comes when the layer runs
+    CHECK(FaldPanelTrackPublishedGen(t) == 3u);
+    CHECK(tick(t, 3, DWM_HOOK_FALD_PANEL_ACK_APPLIED, true, true, true, asks) == FaldPanelStep::Applied);
+
+    // Unanswered while no present is due (display off, or detached): never asks, never times out.
+    t.Sent(L"C.bin", 4);
+    for (int k = 0; k < 50; k++) {
+        CHECK(tick(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, true, false, true, asks) == FaldPanelStep::None);
+        CHECK(tick(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, true, true, false, asks) == FaldPanelStep::None);
+        CHECK(tick(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, false, true, true, asks) == FaldPanelStep::None);
+    }
+    CHECK(asks == 0);
+    CHECK_FALSE(t.final);
+
+    // Unanswered while presents are due: a bounded number of compositions, then no_ack withdraws the generation (the
+    // config publishes 0 for it from then on: a late ingest cannot leave the hook on a file the host says it lacks).
+    for (int k = 0; k < 10; k++) tick(t, 0, DWM_HOOK_FALD_PANEL_ACK_NONE, true, true, true, asks);
+    CHECK(asks == (int)ticks - 1);
+    CHECK(t.verdict == FALD_PANEL_VERDICT_NO_ACK);
+    CHECK(t.final);
+    CHECK(FaldPanelTrackPublishedGen(t) == 0u);
+    CHECK_FALSE(FaldPanelTrackWantsRecompose(t, true, true, true));
+    // the next delivery is published again
+    t.Sent(L"D.bin", 5);
+    CHECK(FaldPanelTrackPublishedGen(t) == 5u);
+}

@@ -1505,7 +1505,7 @@ void UpdateDwmHookSharedConfig()
     for (uint32_t i = 0; i < cfg.numMonitors; i++)
         for (const HookFaldPanel& e : g_hookFaldPanels)
             if (e.left == cfg.monitors[i].left && e.top == cfg.monitors[i].top)
-                ex.tail.fald[i].panelGen[e.hdr ? 1 : 0] = e.track.gen;
+                ex.tail.fald[i].panelGen[e.hdr ? 1 : 0] = FaldPanelTrackPublishedGen(e.track);
 
     // Seqlock write: odd version = write in progress, even = complete.
     // Reader rejects odd versions and mismatched pre/post-copy versions.
@@ -1696,9 +1696,10 @@ static bool DisplaySizeAt(int left, int top, int& width, int& height)   // g_dwm
     return false;
 }
 
-// Read (stamp first: a write that lands after it is seen as a change and delivered again) and validate.
-static bool ReadFaldPanelForHook(const std::wstring& path, bool hdr, int left, int top, std::vector<char>& bytes,
-                                 unsigned long long& size, unsigned long long& mtime, std::wstring& why)
+// Read (stamp first: a write that lands after it is seen as a change and delivered again). Called WITHOUT
+// g_dwmInjectMutex: a slow or unreachable file never holds up state.get or the hook's other users.
+static bool ReadFaldPanelFile(const std::wstring& path, std::vector<char>& bytes, unsigned long long& size,
+                              unsigned long long& mtime, std::wstring& why)
 {
     if (!FaldPanelFileStamp(path, size, mtime)) { why = L"the file cannot be read"; return false; }
     DWORD error = 0;
@@ -1706,9 +1707,7 @@ static bool ReadFaldPanelForHook(const std::wstring& path, bool hdr, int left, i
         why = IsTransientFileError(error) ? L"the file is being written (try again)" : L"the file cannot be read";
         return false;
     }
-    int width = 0, height = 0;
-    const bool display = DisplaySizeAt(left, top, width, height);
-    return ValidateFaldPanelForHook(bytes, hdr, display, width, height, why);
+    return true;
 }
 
 // Section + generation + config (g_dwmInjectMutex held, HookTakesFaldPanels checked, `bytes` validated). The host names
@@ -1772,15 +1771,22 @@ static bool PublishFaldPanel(int left, int top, bool hdr, const std::wstring& pa
 bool DeliverDwmHookFaldPanel(int left, int top, bool hdr, const std::wstring& path, std::wstring* why, uint32_t* gen)
 {
     std::wstring w;
-    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
-    if (!HookTakesFaldPanels(&w)) { if (why) *why = w; return false; }
+    auto fail = [&]() { if (why) *why = w; return false; };
+    int width = 0, height = 0;
+    bool display = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+        if (!HookTakesFaldPanels(&w)) return fail();
+        display = DisplaySizeAt(left, top, width, height);
+    }
+    // The file is read and parsed with the mutex released (the GUI thread still waits for it: the user just picked it,
+    // as the transfer peek before this already read it).
     std::vector<char> bytes;
     unsigned long long size = 0, mtime = 0;
-    if (!ReadFaldPanelForHook(path, hdr, left, top, bytes, size, mtime, w) ||
-        !PublishFaldPanel(left, top, hdr, path, bytes, size, mtime, gen, w)) {
-        if (why) *why = w;
-        return false;
-    }
+    if (!ReadFaldPanelFile(path, bytes, size, mtime, w) || !ValidateFaldPanelForHook(bytes, hdr, display, width, height, w))
+        return fail();
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    if (!HookTakesFaldPanels(&w) || !PublishFaldPanel(left, top, hdr, path, bytes, size, mtime, gen, w)) return fail();
     return true;
 }
 
@@ -1792,6 +1798,7 @@ bool ForgetDwmHookFaldPanel(int left, int top, bool hdr)
         e->wantPath.clear();          // not watched for re-exports; what the hook holds there is inert (no path, no layer)
         e->badValid = false;
         e->fallbackOwed = false;
+        e->track.final = true;        // no longer waited for: an unanswered delivery of it never falls back later
         e->epoch = ++g_faldPanelEpoch;
     }
     SetInjectedFaldPath(left, top, hdr, L"");
@@ -1814,6 +1821,7 @@ void CheckDwmHookFaldPanelVerdicts(bool watchdogTick, std::vector<DwmHookFaldPan
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     if (!g_sharedMemPtr) return;
     const bool presentsDue = watchdogTick && !DisplayOffOrOccluded();
+    bool republish = false;
     for (HookFaldPanel& e : g_hookFaldPanels) {
         if (e.track.final || e.track.gen == 0) continue;
         uint32_t ackGen = 0, ackStatus = DWM_HOOK_FALD_PANEL_ACK_NONE;
@@ -1825,7 +1833,12 @@ void CheckDwmHookFaldPanelVerdicts(bool watchdogTick, std::vector<DwmHookFaldPan
         n.left = e.left; n.top = e.top; n.hdr = e.hdr; n.gen = e.track.gen;
         switch (step) {
         case FaldPanelStep::None:
-            if (watchdogTick && !e.track.final && wantRecompose) *wantRecompose = true;   // a static desktop presents nothing
+            // Unanswered on a tick on which a present of the attached, lit display is due: a static desktop presents
+            // nothing, so ask DWM for one composition. Only while there is NO answer at all (a held, idle file has
+            // answered: no full-screen window every tick, which would also drop G-Sync), and at most kFaldPanelAckTicks
+            // times per delivery (then it is no_ack).
+            if (wantRecompose && FaldPanelTrackWantsRecompose(e.track, watchdogTick, presentsDue, attached))
+                *wantRecompose = true;
             continue;
         case FaldPanelStep::Ingested:
             n.kind = DwmHookFaldPanelNotice::Kind::LoadedIdle;
@@ -1837,21 +1850,28 @@ void CheckDwmHookFaldPanelVerdicts(bool watchdogTick, std::vector<DwmHookFaldPan
             // The hook holds what its verdict says, not the file sent: the staging set says so too, until the fallback.
             SetInjectedFaldPath(e.left, e.top, e.hdr, e.track.heldPath);
             e.epoch = ++g_faldPanelEpoch;
-            // The old path: re-inject with the current file staged — once per failed file stamp (a file that fails
-            // again after that re-injection must not re-inject forever).
-            const bool fallback = g_faldPanelFallbacks.Allow(e.left, e.top, e.hdr, e.track.sentPath, e.wantSize, e.wantMtime);
+            // No answer: the generation is withdrawn from the config (FaldPanelTrackPublishedGen = 0), so a late ingest
+            // cannot leave the hook holding a file the host says it does not.
+            if (e.track.verdict == FALD_PANEL_VERDICT_NO_ACK) republish = true;
+            // The old path: re-inject with the current file staged — only while that file is still the one wanted here
+            // (a cleared or replaced path is not), and once per failed file stamp (a file that fails again after that
+            // re-injection must not re-inject forever).
+            const bool fallback = e.wantPath == e.track.sentPath &&
+                                  g_faldPanelFallbacks.Allow(e.left, e.top, e.hdr, e.track.sentPath, e.wantSize, e.wantMtime);
             e.fallbackOwed = fallback;
+            const std::wstring held = e.track.heldPath.empty() ? std::wstring(L"no file") : e.track.heldPath;
             n.kind = DwmHookFaldPanelNotice::Kind::Failed;
             n.text = L"FALD panel file " + FaldPanelVerdictText(e.track.verdict) + L": " + e.track.sentPath +
                      (fallback ? L" - re-injecting the DWM hook"
-                               : L" - not re-injected again (it already failed once): the hook keeps " +
-                                 (e.track.heldPath.empty() ? std::wstring(L"no file") : e.track.heldPath));
+                               : L" - the hook keeps " + held + L" (no re-injection forced: this file already failed "
+                                 L"after one; the next re-injection loads it again)");
             std::wcout << L"[DWM Hook] " << n.text << std::endl;
             break;
         }
         }
         if (notices) notices->push_back(n);
     }
+    if (republish) UpdateDwmHookSharedConfig();
 }
 
 bool DwmHookFaldPanelVerdictPending()

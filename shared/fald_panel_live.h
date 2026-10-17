@@ -181,6 +181,14 @@ enum class FaldPanelStep {
 // another generation is ignored. A step is returned once; after a final one the track ignores further readings.
 FaldPanelStep FaldPanelTrackStep(FaldPanelTrack& t, uint32_t ackGen, uint32_t ackStatus, bool countTick,
                                  unsigned maxTicks);
+// Should the host ask DWM for a full composition for this delivery now? Only on a watchdog tick, while a present of the
+// display is due (display on, not occluded, `attached` to the desktop) and the hook has given NO answer at all on it:
+// a held-but-idle file (ingested: the display is in the other mode, its layer is off, its routing is not trusted) has
+// answered — a full-screen topmost window every tick for it would drop G-Sync and spoil pacing, for nothing.
+bool FaldPanelTrackWantsRecompose(const FaldPanelTrack& t, bool watchdogTick, bool presentsDue, bool attached);
+// The generation the shared config carries for this (position, mode): the delivery's, until it went unanswered
+// (no_ack) — then 0, so a late ingest cannot leave the hook holding a file the host says it does not.
+uint32_t FaldPanelTrackPublishedGen(const FaldPanelTrack& t);
 
 // The host falls back to a re-injection once per failed file STAMP (position, mode, path, size, mtime): a file that
 // fails again after that re-injection must not re-inject forever. Kept across injections.

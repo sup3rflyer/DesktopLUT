@@ -462,7 +462,7 @@ reader (`shared/fald_panel.h`) — there is no second implementation of the corr
   HOLDS (`held_path`, `held_gen`) from what was SENT (`sent_path`, `sent_gen`, `status`), and
   `runtime.set_fald_params` returns `hook_delivery` (`live` / `reinject` / `none`) and `hook_gen`, so a client
   can wait for `status: applied` on its own generation. A delivery refused, not buildable, or unanswered within
-  three hook-watchdog ticks while the display is on falls back to the old path — a re-injection with the current
+  three hook-watchdog ticks while the display is on (each such tick asks DWM for one composition; an answered, held-but-idle file never does) falls back to the old path — a re-injection with the current
   file staged — once per failed file stamp (a file that fails again after that re-injection is reported, not
   re-injected again). A resident DLL without the feature (no `Global\DesktopLUT_DwmHook_FaldPanelLive` event), or
   a file the host refuses, re-injects as before, and every re-injection starts the generations over. In-place
