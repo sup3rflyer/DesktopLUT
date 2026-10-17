@@ -222,12 +222,6 @@ static FaldPanelLock g_panelsLock;
 static std::atomic<bool> g_anyPanelPresent{ false };
 static void RefreshAnyPanelPresent() { g_anyPanelPresent.store(g_panels.AnyPresent()); }   // g_panelsLock held
 
-bool FaldHasPanelFile(int left, int top, bool isHdr) {
-    FaldPanelLockGuard lock(g_panelsLock);
-    if (!lock.owned()) return false;
-    const FaldPanelSlot* s = g_panels.Find(left, top, isHdr);
-    return s && s->present;
-}
 bool FaldHasAnyPanelFile() { return g_anyPanelPresent.load(); }
 
 int FaldLoadPanelFiles(const char* lutFolder) {
@@ -621,12 +615,19 @@ static void ReleaseStar(FaldMonitor* m) {
     m->starOn = false;
 }
 
-// One entry per (position, mode) actually seen presenting; fixed-size for the same reason as above.
-static FaldMonitor* g_monitors[FALD_MAX_PANEL_FILES] = {};
-static int g_numMonitors = 0;
-static std::atomic<bool> g_stalePending[FALD_MAX_PANEL_FILES];   // FaldMarkStale while the lock was busy (by index)
+// One entry per (position, mode) actually seen presenting; fixed-size for the same reason as above. Appended to only
+// under g_panelsLock, but read lock-free by a present that finds the lock busy: the pointer is published (release)
+// before the count, and both are read with acquire (MonitorAt / MonitorCount).
+static std::atomic<FaldMonitor*> g_monitors[FALD_MAX_PANEL_FILES] = {};
+static std::atomic<int> g_numMonitors{ 0 };
+static int MonitorCount() { return g_numMonitors.load(std::memory_order_acquire); }
+static FaldMonitor* MonitorAt(int i) { return g_monitors[i].load(std::memory_order_acquire); }
+// Per entry (g_monitors index): a stale mark still to apply, and "its resources are being rebuilt" (a swap or a build
+// under the lock) — a present that finds the lock busy never uses an entry that is being rebuilt.
+static std::atomic<bool> g_stalePending[FALD_MAX_PANEL_FILES];
+static std::atomic<bool> g_entryRebuilding[FALD_MAX_PANEL_FILES];
 static void MarkEntryStale(FaldMonitor* e);   // with FaldMarkStale
-static void ApplyPendingStale(bool all, int left, int top);   // with FaldMarkStale
+static void ApplyPendingStale(int left, int top);   // with FaldMarkStale
 
 static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cb);
@@ -660,21 +661,32 @@ void FaldReleaseAll() {
     // building a bounded chance to leave (one ingest / one build; yields, no Sleep), and never wait unboundedly — a
     // thread still inside after that is the pre-existing in-flight-present hazard of any detach, not a reason to hang
     // dwm.exe.
-    bool locked = false;
-    for (int i = 0; i < 20000 && !(locked = g_panelsLock.TryLock()); i++) SwitchToThread();
+    bool locked = g_panelsLock.TryLock();
+    if (!locked) {
+        LARGE_INTEGER now, freq, until;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&now);
+        until.QuadPart = now.QuadPart + freq.QuadPart / 20;   // 50 ms at most
+        while (!(locked = g_panelsLock.TryLock())) {
+            QueryPerformanceCounter(&now);
+            if (now.QuadPart >= until.QuadPart) break;
+            SwitchToThread();
+        }
+    }
     if (!locked) log_to_file("FALD: releasing without the panel table lock (a present thread kept it)");
     struct Unlock { bool on; ~Unlock() { if (on) g_panelsLock.Unlock(); } } unlock{ locked };
     for (int i = 0; i < 4; i++) { g_tsInFlight[i] = false; g_tsOwner[i] = nullptr; }   // owners are about to go
-    for (int i = 0; i < g_numMonitors; i++) {
-        if (!g_monitors[i]) continue;
-        ReleaseMonitor(g_monitors[i]);
-        if (g_monitors[i]->settleEvt) CloseHandle(g_monitors[i]->settleEvt);
-        if (g_monitors[i]->contentEvt) CloseHandle(g_monitors[i]->contentEvt);
-        delete g_monitors[i];
-        g_monitors[i] = nullptr;
+    const int count = MonitorCount();
+    g_numMonitors.store(0, std::memory_order_release);   // a busy-lock reader sees no entry from here on
+    for (int i = 0; i < count; i++) {
+        FaldMonitor* e = g_monitors[i].exchange(nullptr, std::memory_order_acq_rel);
+        if (!e) continue;
+        ReleaseMonitor(e);
+        if (e->settleEvt) CloseHandle(e->settleEvt);
+        if (e->contentEvt) CloseHandle(e->contentEvt);
+        delete e;
     }
-    g_numMonitors = 0;
-    for (int i = 0; i < FALD_MAX_PANEL_FILES; i++) g_stalePending[i].store(false);
+    for (int i = 0; i < FALD_MAX_PANEL_FILES; i++) { g_stalePending[i].store(false); g_entryRebuilding[i].store(false); }
     // The panel files go with them, as before (staged ones are not re-read; a delivered one is taken again from its
     // section, which the host keeps open, at the next present: its generation is no longer marked processed).
     g_panels.Clear();
@@ -960,13 +972,22 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     return true;
 }
 
-static FaldMonitor* FindMonitorEntry(int left, int top, bool isHdr) {
-    for (int i = 0; i < g_numMonitors; i++) {
-        FaldMonitor* e = g_monitors[i];
-        if (e && e->left == left && e->top == top && e->isHdr == isHdr) return e;
+static FaldMonitor* FindMonitorEntry(int left, int top, bool isHdr, int* index) {
+    const int n = MonitorCount();
+    for (int i = 0; i < n; i++) {
+        FaldMonitor* e = MonitorAt(i);
+        if (e && e->left == left && e->top == top && e->isHdr == isHdr) { if (index) *index = i; return e; }
     }
+    if (index) *index = -1;
     return nullptr;
 }
+
+// Marks entry `index` as being rebuilt for the scope (under g_panelsLock): a present that finds the lock busy skips it.
+struct EntryRebuild {
+    int index;
+    explicit EntryRebuild(int i) : index(i) { if (index >= 0) g_entryRebuilding[index].store(true, std::memory_order_release); }
+    ~EntryRebuild() { if (index >= 0) g_entryRebuilding[index].store(false, std::memory_order_release); }
+};
 
 FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsigned int height,
                          DXGI_FORMAT format) {
@@ -975,24 +996,24 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
     FaldPanelLockGuard lock(g_panelsLock);
     if (!lock.owned()) {
         // Another present thread is in the table (a delivery or a build): this present runs the entry as it is — a
-        // swap waits for a later present; an entry that is not running, or one with a stale mark still to apply, stays
-        // off once more (the caller marks it stale again; nothing of the layer was on screen for it).
-        for (int i = 0; i < g_numMonitors; i++) {
-            FaldMonitor* e = g_monitors[i];
-            if (!e || e->left != left || e->top != top || e->isHdr != isHdr) continue;
-            if (g_stalePending[i].load()) return nullptr;
-            return (e->valid && e->width == width && e->height == height && e->format == format) ? e : nullptr;
-        }
-        return nullptr;
+        // swap waits for a later present. It stays off once more (the caller marks it stale again; nothing of the layer
+        // was on screen for it) when it is not running, has a stale mark still to apply, or is the entry being rebuilt
+        // right now (a second context of the same position on another thread: 25H2 recreates contexts).
+        int i = -1;
+        FaldMonitor* e = FindMonitorEntry(left, top, isHdr, &i);
+        if (!e || g_stalePending[i].load() || g_entryRebuilding[i].load(std::memory_order_acquire)) return nullptr;
+        return (e->valid && e->width == width && e->height == height && e->format == format) ? e : nullptr;
     }
-    ApplyPendingStale(false, left, top);
-    FaldMonitor* m = FindMonitorEntry(left, top, isHdr);
+    ApplyPendingStale(left, top);
+    int mIndex = -1;
+    FaldMonitor* m = FindMonitorEntry(left, top, isHdr, &mIndex);
     // The same position's entry for the OTHER mode never sees this mode's presents: its copy and LED-lag state are
     // void, and holding its two full-size frame textures across an HDR <-> SDR switch only costs VRAM. Free it; a
     // switch back rebuilds it fresh (the overlay resets its state on a mode switch too).
-    for (int i = 0; i < g_numMonitors; i++) {
-        FaldMonitor* e = g_monitors[i];
+    for (int i = 0, n = MonitorCount(); i < n; i++) {
+        FaldMonitor* e = MonitorAt(i);
         if (e && e != m && e->left == left && e->top == top && e->isHdr != isHdr && e->valid) {
+            EntryRebuild busy(i);
             ReleaseMonitor(e);
             CoverReset(e);
         }
@@ -1014,6 +1035,7 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
             // part now, before any pass of this present. A failed swap is not retried for the same file.
             LARGE_INTEGER t0, t1, f;
             QueryPerformanceCounter(&t0);
+            EntryRebuild busy(mIndex);
             if (SwapPanel(m, pf->params, pf->seq)) {
                 QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
                 LogF("FALD: pos(%d,%d) %s switched to the panel file delivered live (gen %u) between two presents "
@@ -1041,14 +1063,17 @@ FaldMonitor* FaldAcquire(int left, int top, bool isHdr, unsigned int width, unsi
     // replaced. FaldLayerDecide returns Build only with a file in the slot.
 
     if (!m) {
-        if (g_numMonitors >= FALD_MAX_PANEL_FILES) return nullptr;
+        const int n = MonitorCount();
+        if (n >= FALD_MAX_PANEL_FILES) return nullptr;
         m = new FaldMonitor();
         m->left = left; m->top = top; m->isHdr = isHdr;
         m->tuning = DefaultTuning();
-        // Published last: a concurrent reader either does not see the slot or sees a complete entry.
-        g_monitors[g_numMonitors] = m;
-        g_numMonitors++;
+        // Published last (release): a concurrent reader either does not see the slot or sees a complete entry.
+        mIndex = n;
+        g_monitors[n].store(m, std::memory_order_release);
+        g_numMonitors.store(n + 1, std::memory_order_release);
     }
+    EntryRebuild busy(mIndex);
     // A resize (or the first sight of this monitor) rebuilds and clears the latch: the lattice may
     // fit the new frame even though it did not fit the old one.
     m->width = width; m->height = height; m->format = format;
@@ -1146,36 +1171,36 @@ static void MarkEntryStale(FaldMonitor* e) {
     }
 }
 
-// Stale marks that arrived while another present thread held g_panelsLock: kept per entry (g_monitors index) and
-// applied by the next present of that position that gets the lock — FaldAcquire / FaldMarkStale, on the thread that
-// presents it — before the entry is used again (FaldMarkAllStale, which marks every position anyway, applies all).
-static void ApplyPendingStale(bool all, int left, int top) {   // g_panelsLock held
-    for (int i = 0; i < g_numMonitors; i++) {
-        FaldMonitor* e = g_monitors[i];
-        if (!e || (!all && (e->left != left || e->top != top))) continue;
+// Stale marks kept per entry (g_monitors index): from FaldMarkAllStale (always), and from FaldMarkStale while another
+// present thread held g_panelsLock. Applied only by a present of the entry's OWN position — FaldAcquire / FaldMarkStale,
+// on the thread that uses the entry — so no thread ever changes (or, after 600 marks, releases) another monitor's entry
+// while that monitor's thread is using it outside the lock (FaldUpdateClean / FaldRun).
+static void ApplyPendingStale(int left, int top) {   // g_panelsLock held
+    for (int i = 0, n = MonitorCount(); i < n; i++) {
+        FaldMonitor* e = MonitorAt(i);
+        if (!e || e->left != left || e->top != top) continue;
         if (g_stalePending[i].exchange(false)) MarkEntryStale(e);
     }
 }
 
 void FaldMarkStale(int left, int top) {
     FaldPanelLockGuard lock(g_panelsLock);
-    if (lock.owned()) ApplyPendingStale(false, left, top);
-    for (int i = 0; i < g_numMonitors; i++) {
-        FaldMonitor* e = g_monitors[i];
+    if (lock.owned()) ApplyPendingStale(left, top);
+    for (int i = 0, n = MonitorCount(); i < n; i++) {
+        FaldMonitor* e = MonitorAt(i);
         if (!e || e->left != left || e->top != top) continue;
         if (lock.owned()) MarkEntryStale(e);
         else g_stalePending[i].store(true);   // never wait in the present: applied before the entry is used again
     }
 }
 
+// A present whose monitor could not be resolved (the conservative fallback): every entry's copy may have missed its
+// rects. Only MARKED here — this thread is not the entries' own, and an entry is used lock-free by its own thread —
+// and applied by each position's own next present (ApplyPendingStale). An entry whose monitor never presents again
+// keeps its GPU memory from these marks (as an entry of a resolved context that stops presenting always did).
 void FaldMarkAllStale() {
-    FaldPanelLockGuard lock(g_panelsLock);
-    if (lock.owned()) ApplyPendingStale(true, 0, 0);
-    for (int i = 0; i < g_numMonitors; i++) {
-        if (!g_monitors[i]) continue;
-        if (lock.owned()) MarkEntryStale(g_monitors[i]);
-        else g_stalePending[i].store(true);
-    }
+    for (int i = 0, n = MonitorCount(); i < n; i++)
+        if (MonitorAt(i)) g_stalePending[i].store(true);
 }
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,

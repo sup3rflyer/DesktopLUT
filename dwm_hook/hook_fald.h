@@ -66,9 +66,6 @@ int FaldLoadPanelFiles(const char* lutFolder);
 // cannot build goes back to the last one it built).
 void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsigned int panelGen[2]);
 
-// True when this injection holds a panel file (staged or delivered) for this monitor position and mode. Cheap; no D3D.
-bool FaldHasPanelFile(int left, int top, bool isHdr);
-
 // The monitor's resources, built on first use for this (position, mode, frame size, format).
 // Returns null when there is no panel file for it, when the file's transfer does not match the
 // mode, when the lattice does not fit the frame, or when a resource could not be created — all of
@@ -99,7 +96,8 @@ ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m);
 // mode): the rects of that present never reached the copy, so it has to be re-primed.
 bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const struct tagRECT* rects, int numRects);
 void FaldMarkStale(int left, int top);
-// Every entry: a present whose monitor cannot be resolved went past the layer (the conservative fallback).
+// Every entry: a present whose monitor cannot be resolved went past the layer (the conservative fallback). Only marks
+// them: each entry applies the mark on its own position's next present (no thread changes another monitor's entry).
 void FaldMarkAllStale();
 // At least one panel file is held (staged for this injection, or delivered since): the hook has FALD work even with no
 // .cube and no tonemap.
