@@ -1018,3 +1018,20 @@ TEST_CASE("FALD live: a held-but-idle delivery never asks for a composition; an 
     t.Sent(L"D.bin", 5);
     CHECK(FaldPanelTrackPublishedGen(t) == 5u);
 }
+
+TEST_CASE("FALD live: an acknowledgement word the host does not know counts as no answer (bounded, never forever)") {
+    const unsigned ticks = 3;
+    FaldPanelTrack t;
+    t.Stage(L"A.bin");
+    t.Sent(L"B.bin", 9);
+    int asks = 0;
+    for (int k = 0; k < 10; k++) {
+        const FaldPanelStep step = FaldPanelTrackStep(t, 9, 0x77u, true, ticks);   // a future / garbage verdict word
+        if (step == FaldPanelStep::None && FaldPanelTrackWantsRecompose(t, true, true, true)) asks++;
+    }
+    CHECK(asks == (int)ticks - 1);
+    CHECK(t.verdict == FALD_PANEL_VERDICT_NO_ACK);
+    CHECK(t.final);
+    CHECK(t.heldPath == L"A.bin");
+    CHECK(FaldPanelTrackPublishedGen(t) == 0u);
+}

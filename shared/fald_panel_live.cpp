@@ -218,7 +218,10 @@ void FaldPanelTrack::Sent(const std::wstring& path, uint32_t generation) {
 FaldPanelStep FaldPanelTrackStep(FaldPanelTrack& t, uint32_t ackGen, uint32_t ackStatus, bool countTick,
                                  unsigned maxTicks) {
     if (t.final || t.gen == 0) return FaldPanelStep::None;
-    if (ackGen != t.gen || ackStatus == DWM_HOOK_FALD_PANEL_ACK_NONE) {   // no answer on this generation yet
+    const bool known = ackStatus == DWM_HOOK_FALD_PANEL_ACK_INGESTED || ackStatus == DWM_HOOK_FALD_PANEL_ACK_APPLIED ||
+                       ackStatus == DWM_HOOK_FALD_PANEL_ACK_REFUSED || ackStatus == DWM_HOOK_FALD_PANEL_ACK_BUILD_FAILED;
+    if (ackGen != t.gen || !known) {   // no answer on this generation yet (a word this host does not know is none:
+                                       // it counts toward the timeout, so it cannot keep a delivery waiting forever)
         if (!countTick) return FaldPanelStep::None;
         if (++t.waitTicks < maxTicks) return FaldPanelStep::None;
         t.verdict = FALD_PANEL_VERDICT_NO_ACK;   // nothing taken, as far as anyone can tell: the hook keeps its file
@@ -245,8 +248,8 @@ FaldPanelStep FaldPanelTrackStep(FaldPanelTrack& t, uint32_t ackGen, uint32_t ac
         t.heldPath = t.basePath; t.heldGen = t.baseGen;
         t.final = true;
         return FaldPanelStep::Failed;
-    default:                                    // a word this host does not know: no answer
-        return FaldPanelStep::None;
+    default:
+        return FaldPanelStep::None;   // (unreachable: an unknown word is handled as no answer above)
     }
 }
 
