@@ -13,8 +13,14 @@
 #include <vector>
 
 // Constant-buffer size shared by the host's FillCB (src/fald.cpp), the hook's FillCB
-// (dwm_hook/hook_fald.cpp) and cbuffer FaldCB (shared/fald_shader.h): 76 words.
-constexpr unsigned int FALD_CB_BYTES = 304;
+// (dwm_hook/hook_fald.cpp) and cbuffer FaldCB (shared/fald_shader.h): 80 words (76-79: the lattice extent + pads,
+// fractional zone pitch, docs/fald-fractional-pitch.md; words 0-75 are what the 304-byte buffer held).
+constexpr unsigned int FALD_CB_BYTES = 320;
+
+// Zone lattice extent limit (docs/fald-fractional-pitch.md): a lattice is at most this many pixels on each axis. The
+// panel file's extent word (31) packs both axes in 16 bits each, and the shaders' integer zone math (2 * 512 * 65535)
+// stays inside 32 bits. No D3D11 frame comes near it (16384).
+constexpr unsigned int FALD_LATTICE_MAX_PX = 65535;
 
 // Panel-file signal transfer (FLD3 header word 40; see FaldPanelParams::transfer).
 constexpr uint32_t FALD_TRANSFER_PQ = 0;      // HDR: PQ codes (FLD1/FLD2 files are implicitly PQ)
@@ -24,6 +30,13 @@ constexpr uint32_t FALD_TRANSFER_GAMMA = 1;   // SDR under ACM: gamma-encoded co
 // firmware multiplies every LED drive by a staircase function of the number of NON-BLACK zones of
 // the frame it receives. At most this many steps fit the file's fixed-size block.
 constexpr unsigned int FALD_BOOST_MAX_STEPS = 24;
+// The range of one step's LED factor (2026-10-19; 0.5..2 before). A step BELOW 1 is a panel that SUPPRESSES small
+// highlights (27-inch 1152-zone class: a 1 % window reaches 0.35-0.6 x mid-APL, zoo research 2026-10-19 §3). The factor
+// multiplies B_true only; the inverse divides by max(B_true, 1e-9), so any positive step is numerically safe — the
+// range is the layer's gain clamp (export default 0.25..4): a step beyond it would only drive every gain into the clamp.
+// Old exes refuse a step outside 0.5..2 (fail safe); every file inside it loads as before.
+constexpr float FALD_BOOST_STEP_MIN = 0.25f;
+constexpr float FALD_BOOST_STEP_MAX = 4.0f;
 // Which zones the firmware counts as NON-BLACK (FLD4 word 53, CB word 72; DLC FaldParams.boost_rule,
 // work guide C12b). Both rules share the LIT criterion; 0 = LIT-or-DIM (every FLD4 file before
 // 2026-09-20: the word was reserved, zero), 1 = LIT-or-MEAN (the 2026-09-20 refit over all 64 meter
@@ -33,7 +46,13 @@ constexpr uint32_t FALD_BOOST_RULE_MEAN = 1;
 
 // Parsed panel parameter file.
 struct FaldPanelParams {
+    // The zone lattice (docs/fald-fractional-pitch.md): cols x rows zones over latW x latH px from (originX, originY); the
+    // pitch latW / cols x latH / rows is RATIONAL. Zone c spans [FaldZoneEdge(c), FaldZoneEdge(c + 1)) — c * pitch rounded
+    // to the nearest pixel edge — and a pixel belongs to the zone its centre lies in (FaldZoneOfPixel). cellW / cellH =
+    // the WIDEST zone (ceil of the pitch; = the pitch for an integer lattice, the only kind before 2026-10-19: words 4/5).
+    // latW / latH = cols * cellW / rows * cellH for an integer file, the extent word 31 of a fractional one.
     uint32_t cols = 0, rows = 0, sub = 0, cellW = 0, cellH = 0, originX = 0, originY = 0;
+    uint32_t latW = 0, latH = 0;
     uint32_t reachTrueC = 0, reachTrueR = 0, reachEstC = 0, reachEstR = 0, curveN = 0;
     float white = 0, tmin = 0, area0 = 0, gainMin = 0, gainMax = 0, driveFloor = 0;
     float w[3] = { 0, 0, 0 };                // channel shares of white (header words 16-18). Carried into the CB as
@@ -71,7 +90,7 @@ struct FaldPanelParams {
     // >= boostMeanThresh (C12b). A file with word 53 = 0 behaves exactly as before the word existed.
     uint32_t boostN = 0;                     // steps in use (0 = none)
     float boostLo[FALD_BOOST_MAX_STEPS] = {};   // zone fraction where step i starts, strictly ascending, 0..1
-    float boostVal[FALD_BOOST_MAX_STEPS] = {};  // its LED boost, 0.5..2
+    float boostVal[FALD_BOOST_MAX_STEPS] = {};  // its LED boost, FALD_BOOST_STEP_MIN..MAX (0.25..4; < 1 = suppression)
     float boostLitNits = 0.35f, boostLitFrac = 0.0f, boostDimNits = 0.011f, boostDimFrac = 0.19f;
     uint32_t boostRule = FALD_BOOST_RULE_DIM;   // FALD_BOOST_RULE_*
     float boostMeanGamma = 0.62f, boostMeanThresh = 0.0693f;   // rule MEAN only (gamma in (0, 4], thresh > 0)
@@ -109,7 +128,16 @@ float FaldBoostOfCount(const FaldPanelParams& p, unsigned int activeZones);
 bool FaldBoostZoneActive(const FaldPanelParams& p, const float* maxChannelNits, size_t n);
 // Does a file with this transfer belong to this monitor mode? (PQ <-> HDR, gamma <-> SDR/ACM.)
 bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr);
-// The panel lattice (origin + cols*cellW x rows*cellH) must lie inside the monitor's frame.
+// The panel lattice (origin + latW x latH) must lie inside the monitor's frame.
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height);
+// CPU reference of the shaders' zone mapping (HLSL ZoneEdgeX / ZoneEdgeY / ZoneOfPixel; docs/fald-fractional-pitch.md),
+// one axis: `count` zones over `extent` px. FaldZoneEdge = the lattice-local first pixel of zone `index` (0 .. count;
+// edge(count) = extent): index * extent / count rounded to the nearest pixel edge, ties to the lower one.
+// FaldZoneOfPixel = the zone whose span holds lattice-local pixel `local` (< extent): the zone its centre lies in. Exact
+// integer math; an integer pitch P gives index * P and local / P. count >= 1, extent <= FALD_LATTICE_MAX_PX.
+uint32_t FaldZoneEdge(uint32_t index, uint32_t count, uint32_t extent);
+uint32_t FaldZoneOfPixel(uint32_t local, uint32_t count, uint32_t extent);
+// Does the lattice have a fractional pitch on either axis (latW % cols or latH % rows non-zero)?
+bool FaldLatticeFractional(const FaldPanelParams& p);
 // Size + last-write stamp of the params file (false when it cannot be read). Both paths rebuild on a change.
 bool FaldPanelFileStamp(const std::wstring& path, unsigned long long& size, unsigned long long& mtime);

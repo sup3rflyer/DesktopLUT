@@ -8,7 +8,7 @@ the overseeing LLM judges before invoking the next; long phases stream ``check_i
 into the run's ``events.jsonl`` and honour ``control.json`` cancel):
 
   preflight   panel class (seam fald_profile:panel_class: OLED / no local dimming on record) + the exported
-              lattice (refused when the loader would refuse it; seam fald_profile:cell_pitch when rounded),
+              lattice (refused when the loader would refuse it; any pitch fits since 2026-10-19 — fractional),
               both before anything is entered or shown; pipe + monitor geometry + colour space (HDR or
               ACM SDR) + hook off; ENTER the native state (calibration.enter + identity MHC) and refuse if
               any DesktopLUT layer is still on. Seams are answered with --decide KEY=abort|proceed[=REASON]
@@ -689,12 +689,10 @@ def _run_patterns(s: Session, phase: str, patterns: list, result: StageResult, *
 
 # ----------------------------------------------------------------------------- preflight seams (panel class, cell pitch)
 SEAM_PANEL_CLASS = "fald_profile:panel_class"
-SEAM_CELL_PITCH = "fald_profile:cell_pitch"
+SEAM_CELL_PITCH = "fald_profile:cell_pitch"   # never raised since fractional zone pitch (2026-10-19); still accepted
 SEAM_OPTIONS = ("abort", "proceed")
 # a panel.tech naming local dimming (with no backlight_zones on record) still counts as a zone-dimmed panel
 LOCAL_DIMMING_TECH_WORDS = ("mini", "fald", "local", "zone")
-# a cell-pitch seam recommends abort once the far-edge zone boundary lands this many true pitches off the panel's grid
-CELL_DRIFT_ABORT_CELLS = 0.5
 
 
 def panel_class_concern(tech: Optional[str], zones: Any) -> Optional[str]:
@@ -817,36 +815,29 @@ def _panel_class_gate(args, st: dict[str, Any], result: StageResult) -> bool:
 
 
 def _cell_pitch_gate(args, st: dict[str, Any], result: StageResult, width: int, height: int, cols: int, rows: int) -> bool:
-    """The exported lattice, decided BEFORE measuring with the export's own arithmetic (:func:`dlc.fald.export.lattice_fit`):
-    a lattice wider / taller than the frame is a hard refusal (mechanical — DesktopLUT's loader refuses the file,
-    ``FaldLatticeFits``); a rounded lattice that fits is seam ``fald_profile:cell_pitch`` (uncovered strip + zone drift);
-    an exact pitch passes silently. True = carry on."""
+    """The exported lattice, decided BEFORE measuring with the export's own arithmetic (:func:`dlc.fald.export.lattice_fit`).
+    Since fractional zone pitch (2026-10-19, docs/fald-fractional-pitch.md) the lattice IS the frame — whole-pixel cells or
+    the extent of a rational pitch — so it always covers the frame with every zone boundary on the panel's own grid; what
+    is left is a hard refusal (mechanical) of a lattice the C++ loader cannot hold: more than 512 zones per axis, a frame
+    over 65535 px, fewer pixels than zones. The ``fald_profile:cell_pitch`` seam of the whole-pixel exporter (a rounded
+    lattice: an uncovered strip + zone drift) can no longer arise; its key stays accepted by ``--decide``. A fractional
+    pitch is recorded (metrics ``lattice``) and noted. True = carry on."""
     from ..fald.export import lattice_fit
     lat = lattice_fit(width, height, cols, rows)
-    if lat["exact"]:
+    (pw, ph) = lat["pitch_px"]
+    grid = f"{width}x{height} at {cols}x{rows} zones (pitch {pw:g} x {ph:g} px)"
+    if lat["fits"]:
+        if lat["fractional"]:
+            result.metrics["lattice"] = lat
+            (zw0, zw1), (zh0, zh1) = lat["zone_px"]
+            result.note(f"{grid}: a fractional zone pitch (zones of {zw0}-{zw1} x {zh0}-{zh1} px) — the panel file carries the "
+                        "lattice extent (word 31) and needs a DesktopLUT build from 2026-10-19 on; older builds refuse it")
         return True
     result.metrics["lattice"] = lat
-    (pw, ph), (cw, ch), (lw, lh) = lat["pitch_px"], lat["cell_px"], lat["lattice_px"]
-    grid = f"{width}x{height} at {cols}x{rows} zones (pitch {pw:g} x {ph:g} px)"
-    if not lat["fits"]:
-        result.block("lattice_refused", f"{grid}: the panel file's lattice would be {cw}x{ch}-px cells = {lw}x{lh} px, "
-                     f"larger than the {width}x{height} frame — DesktopLUT's loader REFUSES such a file (FaldLatticeFits), "
-                     "so a ~40-min profiling run would end in a file that never loads. Check --zones against the panel's "
-                     "spec sheet and the monitor's resolution. If they are right, the cause is the exporter: it rounds the "
-                     "model canvas to whole-pixel cells (fald.profile.choose_scale), which cannot represent this grid on "
-                     "this resolution yet (fractional cell pitch is a known limitation)")
-        return False
-    (ux, uy), (dx, dy), (dcx, dcy) = lat["uncovered_px"], lat["max_drift_px"], lat["max_drift_cells"]
-    question = (f"{grid}: the zone pitch is not one the model renders exactly — the panel file's lattice will be "
-                f"{cw}x{ch}-px cells = {lw}x{lh} px, leaving {ux} px at the right and {uy} px at the bottom with no "
-                f"correction, and the zone boundaries drift from the panel's real grid by up to {dx:g} px "
-                f"({dcx:.2f} cells) horizontally and {dy:g} px ({dcy:.2f} cells) vertically (at the far edge). "
-                "abort = stop now (nothing entered or measured yet) and check --zones against the spec; proceed = "
-                "profile anyway with that coverage and drift.")
-    return _seam(args, st, result, key=SEAM_CELL_PITCH, question=question,
-                 recommendation="abort" if max(dcx, dcy) >= CELL_DRIFT_ABORT_CELLS else "proceed",
-                 evidence={"frame_px": lat["frame_px"], "zones": lat["zones"]},
-                 digest={"lattice": lat, "drift_abort_cells": CELL_DRIFT_ABORT_CELLS}) == "proceed"
+    result.block("lattice_refused", f"{grid}: {lat['refused']} — DesktopLUT's loader REFUSES such a panel file, so a ~40-min "
+                 "profiling run would end in a file that never loads. Check --zones against the panel's spec sheet and the "
+                 "monitor's resolution")
+    return False
 
 
 # ----------------------------------------------------------------------------- phases
@@ -1649,7 +1640,15 @@ def phase_export(s: Session, result: StageResult) -> None:
     out_dir = Path(s.args.out) if s.args.out else (Path("results") / f"fald_profile_{short}_{mode}_{time.strftime('%Y-%m-%d')}")
     out_dir.mkdir(parents=True, exist_ok=True)
     bin_path = (out_dir / f"{short}_{mode}_fald_panel.bin").resolve()
-    info = export_panel_params(FaldModel(params), bin_path)
+    # the lattice is the MONITOR's frame (fractional zone pitch, docs/fald-fractional-pitch.md), not the model canvas
+    # choose_scale rendered the fit on (they differ whenever the frame has no integer-cell canvas)
+    geo = s.st["fald"].get("geometry") or {}
+    frame = (int(geo["width"]), int(geo["height"])) if geo.get("width") and geo.get("height") else None
+    info = export_panel_params(FaldModel(params), bin_path, frame=frame)
+    if info["lattice"]["fractional"]:
+        fw, fh = info["lattice"]["frame_px"]
+        result.note(f"fractional zone pitch: the panel file carries the {fw}x{fh}-px lattice extent (word 31) — "
+                    "needs a DesktopLUT build from 2026-10-19 on (older builds refuse it)")
     if info.get("boost_in_file"):
         result.note(f"black-frame LED boost LUT ({info['boost_lut_steps']} steps) written into the panel file (FLD4, work guide "
                     "C12): needs a DesktopLUT build from 2026-09-18 on — older builds refuse the FLD4 magic (deliberately: they "

@@ -542,7 +542,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "backlight fields and the frame it saw into `dir` (reference comparison against the Python "
             "model, see results/.../sim/fald_compare_dump.py). With starfield balancing on it adds five zone textures, "
             "cols x rows x 4 float32 each: fald_star_stat.f32 (peak, speck-zone flag, sparse, solid), fald_star_bg.f32 "
-            "(ln background of the zone's darkest pixel, the brightest pixel's index ly * cellW + lx inside the zone, lit sum, "
+            "(ln background of the zone's darkest pixel, the brightest pixel's index ly * zw + lx inside the zone [zw = its own width], lit sum,"
             "a_eff above the background), fald_star_w.f32 (wt = the zone's weight in the target average [0 on a flank zone], "
             "wt ln peak, flank flag, speck-zone flag), fald_star_plan.f32 (w0_field, ln target, ln lift, ln peak) and "
             "fald_star_plan2.f32 (ln background, near = the tapered protection field, speck-zone flag, w) — and `starfield ...` lines "

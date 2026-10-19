@@ -308,6 +308,11 @@ class Emu:
             raise ValueError(f"sampler={sampler!r} models a device's sub-texel fraction: give subtexel_bits (8)")
         self.sampler = sampler                 # with subtexel_bits: "hw" rounds the fraction, "warp" = WARP's rule
         self.W, self.H = width, height
+        if o.get("fractional"):
+            # the zone sweeps below reshape the lattice into equal cellW x cellH blocks; a fractional pitch (zones of
+            # floor / ceil of the pitch, docs/fald-fractional-pitch.md) is not emulated — refuse rather than mis-sweep
+            raise ValueError(f"gpuemu emulates whole-pixel zone lattices only; this panel file has a fractional pitch "
+                             f"({o['latW']} x {o['latH']} px over {o['cols']} x {o['rows']} zones)")
         self.white = float(o["white"]); self.gamma = float(o["sdrGamma"]); self.transfer = o["transfer"]
         self.sub = o["sub"]; self.cols = o["cols"]; self.rows = o["rows"]; self.cw = o["cellW"]; self.ch = o["cellH"]
         self.ox, self.oy = int(o.get("originX", 0)), int(o.get("originY", 0))

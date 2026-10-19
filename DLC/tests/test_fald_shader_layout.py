@@ -150,8 +150,15 @@ def test_both_paths_dispatch_the_slices_and_run_the_combine(path, v):
     assert c.count(f"Dispatch(p.cols, p.rows, {v}->zoneSlices);") == 2                 # stat, S0
     assert c.count(f"if ({v}->zoneSlices > 1) {{") == 2
     assert c.count("g_faldZoneCombineDefine") >= 1
-    for src, combine in (("g_faldStatSource", "StatCombineCS"), ("g_faldStarStatSource", "StarStatCombineCS")):
-        assert re.search(re.escape(src) + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from {src}"
+    # the overlay compiles from a source set (FaldShaderSources: shared/fald_shader.h by default, a frozen copy in the
+    # bit-identity test, docs/fald-fractional-pitch.md); the hook from the globals
+    for src, alias, combine in (("g_faldStatSource", "stat", "StatCombineCS"),
+                                ("g_faldStarStatSource", "starStat", "StarStatCombineCS")):
+        if v == "r":
+            assert re.search(r"src\." + alias + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from src.{alias}"
+            assert f"s.{alias} = {src};" in c, f"FaldDefaultShaderSources does not map {alias} to {src}"
+        else:
+            assert re.search(re.escape(src) + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from {src}"
     assert f"SafeRelease({v}->zonePartUAV); SafeRelease({v}->zonePartBuf);" in c
     assert f"if ({v}->zoneSlices > FALD_ZONE_SLICES_MAX)" in c                            # a slice grid D3D11 cannot dispatch
     assert "static const unsigned int FALD_ZONE_SLICES_MAX = 65535u;" in _SHADER.read_text(encoding="utf-8")

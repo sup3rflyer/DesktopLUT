@@ -7,7 +7,7 @@ caused real mistakes when editing the code (acting on a use-site with the wrong 
 in mind).
 
 Read this before touching: `peakNits`, anything "grayscale", anything "white balance",
-or `corrections_enabled` / `g_shaderCorrectionsActive`.
+`corrections_enabled` / `g_shaderCorrectionsActive`, or the FALD `cellW` / `cellH`.
 
 Convention used below:
 - **IS** — the one true meaning at that site.
@@ -102,6 +102,25 @@ idle**, so `corrections_enabled` reads **`false` even while a 3D LUT cube is liv
 the hook. To judge whether a correction is actually live in hook mode, check `cube_path`
 + hook health, **not** `corrections_enabled`. The name suggests "are corrections on?" — it
 actually means "is the overlay drawing?". See `OVERLAY_LUT_RELOAD_BUG.md`.
+
+---
+
+## 5. FALD `cellW` / `cellH` — the pitch, or only the WIDEST zone
+
+Since fractional zone pitch (2026-10-19, [docs/fald-fractional-pitch.md](fald-fractional-pitch.md)) a FALD lattice is
+`cols × rows` zones over an integer extent `latW × latH`: the pitch `latW / cols` need not be a whole pixel (48 × 24
+zones on 2560 × 1440 = 53.33 × 60 px, zones of 53 and 54 px).
+
+| Name | IS |
+|------|----|
+| `FaldPanelParams::cellW` / `cellH`, CB words 5/6 | The **widest zone** in px (`ceil(latW / cols)`): it sizes the zone sweeps' slices (`FaldZoneSlices`). Equals the pitch only for an integer lattice. |
+| `FaldPanelParams::latW` / `latH`, CB words 76/77 | The lattice **extent** in px (`cols * cellW` for an integer lattice). Every pixel → zone map uses it: `FaldZoneEdge` / `FaldZoneOfPixel` (C++), `ZoneEdgeX` / `ZoneOfPixel` (HLSL), `export.zone_edge` / `zone_of_pixel` (DLC). |
+| Panel-file words 4/5 | **WIRE CONTRACT.** The cell size of a whole-pixel lattice, or **0 / 0** when word 31 carries the extent (fractional pitch; old exes refuse it). |
+| DLC `FaldParams.cell_w` / `PanelGeometry.cell_w` | The **float** pitch (`width / cols`) of the model canvas / the panel — never rounded. |
+
+**The trap:** `cols * cellW` was the lattice width. For a fractional lattice it overshoots the frame (48 × 54 = 2592 >
+2560); `c * cellW` is no longer zone `c`'s first pixel, and `(x - originX) / cellW` is no longer the pixel's zone. Use
+the extent and the zone-edge functions.
 
 ---
 

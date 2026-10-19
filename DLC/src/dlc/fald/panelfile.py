@@ -12,6 +12,7 @@ MAGIC1, MAGIC2, MAGIC3, MAGIC4, MAGIC5 = 0x464C4431, 0x464C4432, 0x464C4433, 0x4
 STAT_AREA, STAT_CTXPOW = 0, 1     # FLD5 word 42 (P10 context statistic; every older file: area)
 BOOST_MAX_STEPS = 24         # src/fald.h FALD_BOOST_MAX_STEPS
 BOOST_RULE_DIM, BOOST_RULE_MEAN = 0, 1   # FLD4 word 53 / CB word 72 (src/fald.h FALD_BOOST_RULE_*)
+LATTICE_MAX_PX = 65535       # shared/fald_panel.h FALD_LATTICE_MAX_PX (word 31 packs 16 bits per axis)
 f32 = np.float32
 
 
@@ -144,7 +145,7 @@ def read_panel_file(path) -> dict:
             lut = []
             for i in range(n):
                 lo, val = f32(fl[56 + 2 * i]), f32(fl[57 + 2 * i])
-                if not (0.0 <= lo <= 1.0) or (i > 0 and not lo > lut[-1][0]) or not (0.5 <= val <= 2.0):
+                if not (0.0 <= lo <= 1.0) or (i > 0 and not lo > lut[-1][0]) or not (0.25 <= val <= 4.0):   # FALD_BOOST_STEP_MIN..MAX
                     raise ValueError("implausible boost LUT words")
                 lut.append((lo, val))
             o["hasBoost"], o["boostN"], o["boostLut"] = True, n, lut
@@ -153,13 +154,30 @@ def read_panel_file(path) -> dict:
             if rule == BOOST_RULE_MEAN:                # kind 0: words 54/55 are ignored (the defaults stay, unused)
                 o["boostMeanGamma"], o["boostMeanThresh"] = mg, mt
         o["words53_55"] = [int(x) for x in u[53:56]]   # raw: zone rule kind, mean gamma, mean thresh (all zero = legacy)
-    o["reserved31"] = int(u[31])
-    if (o["cols"] == 0 or o["rows"] == 0 or o["sub"] == 0 or o["sub"] > 16 or o["cellW"] == 0 or o["cellH"] == 0
+    # word 31: the lattice EXTENT of a fractional zone pitch (words 4/5 = 0; docs/fald-fractional-pitch.md), else 0 —
+    # C++ ParseFaldPanelParams, rule for rule (a zero cell word WITHOUT an extent is the implausible header it always was)
+    ext = int(u[31])
+    o["extentWord"] = ext
+    no_lattice = (o["cellW"] == 0 or o["cellH"] == 0) and ext == 0
+    if (o["cols"] == 0 or o["rows"] == 0 or o["sub"] == 0 or o["sub"] > 16 or no_lattice
             or o["curveN"] < 16 or o["curveN"] > 16384 or o["white"] <= 0 or o["cols"] > 512 or o["rows"] > 512
             or max(o["reachTrueC"], o["reachTrueR"], o["reachEstC"], o["reachEstR"]) > 64
             or not (o["curveLogMax"] > o["curveLogMin"]) or not (o["gainMin"] > 0 and o["gainMin"] <= o["gainMax"])
             or not (o["tmin"] >= 0) or not (o["area0"] > 0) or not (o["driveFloor"] >= 0)):
         raise ValueError("implausible header")
+    if ext == 0:                                       # whole-pixel cells (every file before 2026-10-19)
+        lw, lh = o["cols"] * o["cellW"], o["rows"] * o["cellH"]
+        if lw > LATTICE_MAX_PX or lh > LATTICE_MAX_PX:
+            raise ValueError("implausible lattice words (a lattice of more than 65535 px)")
+    else:                                              # the extent: a rational pitch; cellW / cellH = the WIDEST zone
+        if o["cellW"] != 0 or o["cellH"] != 0:
+            raise ValueError("implausible lattice words (cell size words 4/5 and an extent word 31 together)")
+        lw, lh = ext & 0xFFFF, ext >> 16
+        if lw < o["cols"] or lh < o["rows"]:
+            raise ValueError("implausible lattice words (an extent of fewer pixels than zones)")
+        o["cellW"], o["cellH"] = -(-lw // o["cols"]), -(-lh // o["rows"])
+    o["latW"], o["latH"] = lw, lh
+    o["fractional"] = lw % o["cols"] != 0 or lh % o["rows"] != 0
     S = o["sub"]
     nT = S * S * (2 * o["reachTrueR"] + 1) * (2 * o["reachTrueC"] + 1)
     nE = S * S * (2 * o["reachEstR"] + 1) * (2 * o["reachEstC"] + 1)
@@ -232,4 +250,6 @@ def cb(o: dict, ped_mode_setting: int = 0) -> dict:
     # CB words 72-74 (the zone rule; read only when word 34 != 0)
     c["boostRuleCB"], c["boostMeanGammaCB"], c["boostMeanThreshCB"] = o.get("boostRule", 0), o.get("boostMeanGamma", f32(0.62)), o.get("boostMeanThresh", f32(0.0693))
     c["boostLutCounts"] = [(f32(boost_zone_threshold(lo, o["cols"] * o["rows"])), val) for lo, val in o.get("boostLut", [])]
+    # CB words 76 / 77: the zone lattice's extent (cols * cellW / rows * cellH for an integer pitch)
+    c["latWCB"], c["latHCB"] = o["latW"], o["latH"]
     return c

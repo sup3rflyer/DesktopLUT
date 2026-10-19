@@ -32,7 +32,7 @@
 namespace {
 
 // A new FaldPanelParams field must be added to SameBits below (and then this number updated).
-static_assert(sizeof(FaldPanelParams) == 464, "FaldPanelParams changed: add the new field to SameBits");
+static_assert(sizeof(FaldPanelParams) == 472, "FaldPanelParams changed: add the new field to SameBits");
 
 template <typename T> bool BitsEq(const T& a, const T& b) { return std::memcmp(&a, &b, sizeof(T)) == 0; }
 bool VecBitsEq(const std::vector<float>& a, const std::vector<float>& b) {
@@ -43,6 +43,7 @@ bool VecBitsEq(const std::vector<float>& a, const std::vector<float>& b) {
 bool SameBits(const FaldPanelParams& a, const FaldPanelParams& b) {
 #define FLD_EQ(f) if (!BitsEq(a.f, b.f)) return false;
     FLD_EQ(cols) FLD_EQ(rows) FLD_EQ(sub) FLD_EQ(cellW) FLD_EQ(cellH) FLD_EQ(originX) FLD_EQ(originY)
+    FLD_EQ(latW) FLD_EQ(latH)
     FLD_EQ(reachTrueC) FLD_EQ(reachTrueR) FLD_EQ(reachEstC) FLD_EQ(reachEstR) FLD_EQ(curveN)
     FLD_EQ(white) FLD_EQ(tmin) FLD_EQ(area0) FLD_EQ(gainMin) FLD_EQ(gainMax) FLD_EQ(driveFloor) FLD_EQ(w)
     FLD_EQ(curveLogMin) FLD_EQ(curveLogMax) FLD_EQ(estPhasePx) FLD_EQ(estPhasePy) FLD_EQ(fadeLo) FLD_EQ(fadeHi)
@@ -53,6 +54,20 @@ bool SameBits(const FaldPanelParams& a, const FaldPanelParams& b) {
     FLD_EQ(hasBoost)
 #undef FLD_EQ
     return VecBitsEq(a.curve, b.curve) && VecBitsEq(a.kTrue, b.kTrue) && VecBitsEq(a.kEst, b.kEst);
+}
+
+// The frozen pre-refactor loader (fald_panel_legacy_loader.h) predates the lattice extent (FaldPanelParams::latW / latH,
+// fractional zone pitch 2026-10-19, docs/fald-fractional-pitch.md) and leaves it 0. Every other field must match bit for
+// bit, and where the current parser got as far as the lattice it must hold the whole-pixel lattice's extent
+// (cols * cellW x rows * cellH) — a file without the extent word is a whole-pixel lattice, exactly as before.
+bool SameBitsAsLegacy(const FaldPanelParams& legacy, const FaldPanelParams& parsed) {
+    if (legacy.latW != 0 || legacy.latH != 0) return false;
+    if (parsed.latW != 0 || parsed.latH != 0) {
+        if (parsed.latW != parsed.cols * parsed.cellW || parsed.latH != parsed.rows * parsed.cellH) return false;
+    }
+    FaldPanelParams q = parsed;
+    q.latW = 0; q.latH = 0;
+    return SameBits(legacy, q);
 }
 
 struct LiveTempFile {
@@ -645,7 +660,7 @@ TEST_CASE("FALD live: the parser matches the PRE-refactor loader (main e30d567, 
         const bool ok2 = ParseFaldPanelParams(img.data(), img.size(), parsed, e2);
         CHECK(ok1 == ok2);
         CHECK(e1 == e2);
-        CHECK(SameBits(legacy, parsed));
+        CHECK(SameBitsAsLegacy(legacy, parsed));
         i++;
     }
 }
@@ -673,7 +688,8 @@ TEST_CASE("FALD live: the owner's real panel files - the parser gives what the p
         REQUIRE(fald_legacy::LegacyLoadFaldPanelParams(path, legacy, err));
         const std::vector<char> bytes = ReadAll(path);
         REQUIRE(ParseFaldPanelParams(bytes.data(), bytes.size(), parsed, err));
-        CHECK(SameBits(legacy, parsed));
+        CHECK(SameBitsAsLegacy(legacy, parsed));
+        CHECK_FALSE(FaldLatticeFractional(parsed));                         // every existing file: whole-pixel cells
         const uint64_t d = ParamsDigest(legacy);
         for (const Golden& g : golden) {
             if (FileNameOf(path) != g.name) continue;

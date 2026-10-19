@@ -101,13 +101,45 @@ def test_fld4_round_trip_and_a_lutless_fit_is_unchanged(tmp_path):
     assert i2["format"] == "FLD4" and o2["hasPedColour"] and o2["transfer"] == 1 and float(o2["sdrGamma"]) == float(np.float32(2.27))
     assert o2["boostN"] == 15
 
+# A panel that SUPPRESSES small highlights (27-inch 1152-zone class: a 1 % window reaches 0.35-0.6 x mid-APL, zoo research
+# 2026-10-19 §3): steps below 1, down to 0.35 — the loader / exporter take 0.25..4 since 2026-10-19 (0.5..2 before).
+SUPPRESS_LUT = ((0.0, 0.35), (0.01, 0.6), (0.1, 0.8), (0.5, 1.0))
+
+
+def test_a_suppression_step_below_one_exports_loads_and_looks_up_like_the_model(tmp_path):
+    """A 0.35 step: the export writes it (FLD4), the loader's twin reads it, the count lookup (HLSL pass 1a / C++
+    FaldBoostOfCount) equals the model's fraction lookup at every zone count, and the model's correction stays finite."""
+    m = FaldModel(replace(_small_params(), boost_lut=SUPPRESS_LUT))
+    info = export_panel_params(m, tmp_path / "suppress.bin")
+    assert info["format"] == "FLD4" and info["boost_lut_steps"] == 4
+    o = read_panel_file(tmp_path / "suppress.bin")
+    assert o["hasBoost"] and [float(v) for _, v in o["boostLut"]] == [float(np.float32(v)) for _, v in SUPPRESS_LUT]
+    zones = m.p.rows * m.p.cols
+    for n in range(zones + 1):
+        assert float(boost_of_count(o, n)) == float(np.float32(m.boost_of_fraction(n / zones))), n
+    assert float(boost_of_count(o, 1)) == float(np.float32(0.35))
+    for edge in (0.25, 4.0):                                          # the gate's edges are in
+        export_panel_params(FaldModel(replace(_small_params(), boost_lut=((0.0, edge),))), tmp_path / "edge.bin")
+        assert float(read_panel_file(tmp_path / "edge.bin")["boostLut"][0][1]) == edge
+    # the model's inverse with a suppressing panel: a small bright window inside ONE zone on black (1 of 144 zones ->
+    # x0.35) comes out finite and brighter than the same model without the boost term would make it
+    from dlc.fald.correct import correct_image
+    img = np.zeros((3, m.h, m.w))
+    win = (slice(None), slice(47, 51), slice(84, 92))                 # inside zone (5, 5): rows 45..53, columns 80..95
+    img[win] = 400.0
+    assert m.led_boost(img) == pytest.approx(0.35)
+    req = correct_image(m, img)["req"]
+    req0 = correct_image(FaldModel(replace(m.p, boost_lut=())), img)["req"]
+    assert np.all(np.isfinite(req)) and req[win].mean() > req0[win].mean()
+
 
 def test_export_and_reader_refuse_what_the_cpp_loader_refuses(tmp_path):
     p = _small_params()
     bad_luts = {"steps": tuple((i / 40, 1.1) for i in range(BOOST_MAX_STEPS + 1)),
                 "gate": ((0.0, 1.17), (0.2, 1.1), (0.1, 1.0)),                    # descending
                 "gate ": ((0.0, 1.17), (0.2, 1.1), (0.2, 1.0)),                   # not strictly ascending
-                "gate  ": ((0.0, 1.17), (1.5, 1.0)), "gate   ": ((0.0, 2.5),), "gate    ": ((0.0, 0.4),)}
+                "gate  ": ((0.0, 1.17), (1.5, 1.0)), "gate   ": ((0.0, 4.5),), "gate    ": ((0.0, 0.2),),   # steps 0.25..4
+                "gate     ": ((0.0, 0.0),)}
     for needle, lut in bad_luts.items():
         with pytest.raises(ValueError, match=needle.strip()):
             export_panel_params(FaldModel(replace(p, boost_lut=lut)), tmp_path / "never.bin")
@@ -126,8 +158,9 @@ def test_export_and_reader_refuse_what_the_cpp_loader_refuses(tmp_path):
     cases = [("implausible boost step count", {48: ("I", 25)}),
              ("implausible boost LUT words", {58: ("f", 0.9), 60: ("f", 0.5)}),   # step 1 above step 2
              ("implausible boost LUT words", {58: ("f", 1.5)}),
-             ("implausible boost LUT words", {57: ("f", 0.4)}),
-             ("implausible boost LUT words", {57: ("f", 2.5)}),
+             ("implausible boost LUT words", {57: ("f", 0.2)}),                  # below FALD_BOOST_STEP_MIN 0.25
+             ("implausible boost LUT words", {57: ("f", 4.5)}),                  # above FALD_BOOST_STEP_MAX 4
+             ("implausible boost LUT words", {57: ("f", -0.35)}),
              ("implausible boost LUT words", {57: ("f", float("nan"))}),
              ("implausible boost LUT words", {57: ("I", 0)}),                      # a missing boost is not 1.0
              ("implausible boost activation words", {49: ("f", -1.0)}),
@@ -149,7 +182,8 @@ def test_export_and_reader_refuse_what_the_cpp_loader_refuses(tmp_path):
 
 def test_lookup_by_zone_count_equals_the_models_fraction_lookup(tmp_path):
     """HLSL pass 1a / C++ FaldBoostOfCount look the step up by the integer zone count; the model by the fraction."""
-    for params, lut in ((FaldParams(), PA_LUT), (_small_params(), SMALL_LUT), (FaldParams(), ((0.25, 1.1), (0.5, 1.0)))):
+    for params, lut in ((FaldParams(), PA_LUT), (_small_params(), SMALL_LUT), (FaldParams(), SUPPRESS_LUT),
+                        (FaldParams(), ((0.25, 1.1), (0.5, 1.0)))):      # (the last one's lut.bin is read again below)
         m = FaldModel(replace(params, boost_lut=lut))
         export_panel_params(m, tmp_path / "lut.bin")
         o = read_panel_file(tmp_path / "lut.bin")
@@ -304,7 +338,7 @@ def test_hlsl_boost_passes_mirror_the_reference():
     loader = (_SHARED / "fald_panel.cpp").read_text(encoding="utf-8")
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     hook = _HOOK.read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 304" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 76 words since the glow fill (S2) was removed, 2026-10-07
+    assert "FALD_CB_BYTES = 320" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 80 words since the lattice extent (fractional pitch, 2026-10-19)
     assert "FALD_MAGIC4 = 0x464C4434u;" in loader and "if (magic == FALD_MAGIC4) return 104 * 4;" in loader   # FLD4 = 416 B
     assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in loader     # panelfile.boost_zone_threshold's twin
     for cpp, v in ((c, "r"), (hook, "m")):                              # both paths read the file with the shared loader

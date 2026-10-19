@@ -161,14 +161,17 @@ TEST_CASE("FALD loader: bad magic, truncation and size mismatch are refused") {
 TEST_CASE("FALD lattice must lie inside the monitor frame") {
     FaldPanelParams p;
     p.cols = 48; p.rows = 48; p.cellW = 80; p.cellH = 45; p.originX = 0; p.originY = 0;
+    p.latW = 3840; p.latH = 2160;                 // the loader's extent of a whole-pixel lattice (cols * cellW x rows * cellH)
     CHECK(FaldLatticeFits(p, 3840, 2160));        // the PA32UCXR grid on its own frame
     CHECK_FALSE(FaldLatticeFits(p, 2560, 1440));  // a smaller mode: refuse, never wrap
     CHECK_FALSE(FaldLatticeFits(p, 3840, 2159));
     p.originX = 1;
     CHECK_FALSE(FaldLatticeFits(p, 3840, 2160));  // origin pushes the last column off-screen
-    p.originX = 0; p.cols = 24;
+    p.originX = 0; p.cols = 24; p.latW = 1920;
     CHECK(FaldLatticeFits(p, 3840, 2160));        // a lattice smaller than the frame is fine
     CHECK_FALSE(FaldLatticeFits(p, 0, 2160));
+    p.latW = 0;                                   // never produced by the loader: no extent, no lattice
+    CHECK_FALSE(FaldLatticeFits(p, 3840, 2160));
 }
 
 TEST_CASE("FALD loader: an FLD1 file has a white pedestal; FLD2 carries the pedestal colour") {
@@ -280,12 +283,13 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
     }
 }
 
-TEST_CASE("FALD constant buffer is 76 words") {
-    // FillCB writes words up to index 75 (temporal drive state 44-47; boost activation rule 48-51; starfield balancing
+TEST_CASE("FALD constant buffer is 80 words") {
+    // FillCB writes words up to index 79 (temporal drive state 44-47; boost activation rule 48-51; starfield balancing
     // 52-65; panel clock 66-71; the boost's zone rule 72-74 (C12b); 75 unused — the glow fill's switch until its removal
-    // 2026-10-07; word 31 = transfer, 34 = boost step count, 35 = starfield on, 43 = sdrGamma); the HLSL cbuffer FaldCB
-    // declares 19 float4 rows.
-    CHECK(FALD_CB_BYTES == 304u);
+    // 2026-10-07; 76/77 the zone lattice's extent (fractional pitch, 2026-10-19), 78/79 pads; word 31 = transfer, 34 =
+    // boost step count, 35 = starfield on, 43 = sdrGamma); the HLSL cbuffer FaldCB declares 20 float4 rows. Words 0-75 are
+    // the 304-byte buffer of the pre-fractional-pitch shader (tests/fald_shader_legacy.h reads exactly those).
+    CHECK(FALD_CB_BYTES == 320u);
     CHECK(FALD_CB_BYTES % 16 == 0);
 }
 
@@ -1021,8 +1025,11 @@ TEST_CASE("FALD loader: implausible FLD4 boost words are refused, not defaulted"
     { Image im = Fld4Image({ { 0.0f, 1.17f }, { 0.2f, 1.1f }, { 0.2f, 1.0f } }); refused(L"test_fald_fld4_equal.bin", im, "boost LUT"); }
     { Image im = Fld4Image({ { 0.0f, 1.17f }, { 1.5f, 1.0f } }); refused(L"test_fald_fld4_lo_hi.bin", im, "boost LUT"); }
     { Image im = Fld4Image({ { -0.1f, 1.17f }, { 0.5f, 1.0f } }); refused(L"test_fald_fld4_lo_neg.bin", im, "boost LUT"); }
-    { Image im = Fld4Image({ { 0.0f, 0.4f } }); refused(L"test_fald_fld4_val_lo.bin", im, "boost LUT"); }
-    { Image im = Fld4Image({ { 0.0f, 2.5f } }); refused(L"test_fald_fld4_val_hi.bin", im, "boost LUT"); }
+    // the step range is FALD_BOOST_STEP_MIN..MAX = 0.25..4 since 2026-10-19 (0.5..2 before: 0.4 / 2.5 now load)
+    { Image im = Fld4Image({ { 0.0f, 0.2f } }); refused(L"test_fald_fld4_val_lo.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 0.2499f } }); refused(L"test_fald_fld4_val_lo2.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, 4.001f } }); refused(L"test_fald_fld4_val_hi.bin", im, "boost LUT"); }
+    { Image im = Fld4Image({ { 0.0f, -1.0f } }); refused(L"test_fald_fld4_val_neg.bin", im, "boost LUT"); }
     { Image im = Fld4Image({ { 0.0f, 1.17f } }); im.header[57] = 0x7FC00000u; refused(L"test_fald_fld4_nan.bin", im, "boost LUT"); }
     { Image im = Fld4Image({ { 0.0f, 1.17f } }); im.header[57] = 0u; refused(L"test_fald_fld4_zero.bin", im, "boost LUT"); }   // a missing boost is not 1.0
     { Image im = Fld4Image(kBoostSteps); im.SetF(49, -1.0f); refused(L"test_fald_fld4_lit.bin", im, "boost activation"); }
@@ -1207,6 +1214,40 @@ TEST_CASE("FALD boost lookup by zone count follows DLC FaldModel.boost_of_fracti
     CHECK(FaldBoostOfCount(p, 1u) == doctest::Approx(1.1f));
 }
 
+TEST_CASE("FALD boost LUT: steps below 0.5 (small-highlight SUPPRESSION) load and look up like the CPU reference") {
+    // The 27-inch 1152-zone class dims isolated highlights: a 1 % window reaches 0.35-0.6 x the mid-APL level (zoo research
+    // 2026-10-19 §3). A fitted LUT therefore steps BELOW 1 at small non-black zone counts; the loader takes 0.25..4 since
+    // 2026-10-19 (the shader multiplies B_true by the step and divides by max(B_true, 1e-9) — any positive step is safe).
+    // 48 x 24 = 1152 zones: x0.35 up to 11 non-black zones (1 %), x0.6 up to 115 (10 %), x1 above 50 %, the edges 0.25 / 4.
+    const double edges[6] = { 0.0, 12.0 / 1152.0, 116.0 / 1152.0, 0.5, 0.9, 0.95 };   // the fit's zone fractions (float64)
+    const float steps[6] = { 0.35f, 0.6f, 0.8f, 1.0f, 0.25f, 4.0f };
+    std::vector<std::pair<float, float>> suppress;
+    for (int i = 0; i < 6; i++) suppress.push_back({ (float)edges[i], steps[i] });                    // the file: float32
+    FaldTempFile tf(L"test_fald_fld4_suppress.bin");
+    Image im = Fld4Image(suppress);
+    im.header[1] = 48u; im.header[2] = 24u;                           // the lookup needs cols x rows
+    WriteBytes(tf.path, im.Bytes());
+    FaldPanelParams p; std::string err;
+    REQUIRE_MESSAGE(LoadFaldPanelParams(tf.path, p, err), err);
+    REQUIRE(p.hasBoost); REQUIRE(p.boostN == 6u);
+    CHECK(p.boostVal[0] == 0.35f); CHECK(p.boostVal[4] == 0.25f); CHECK(p.boostVal[5] == 4.0f);
+    CHECK(FaldPanelFileHasBoost(tf.path));
+    // the CPU reference of HLSL pass 1a = the model's boost_of_fraction on the fit's float64 edges (the last step with
+    // lo <= N / zones, 1 below the first): every zone count of the lattice
+    size_t bad = 0;
+    for (unsigned int n = 0; n <= 1152u; n++) {
+        const double frac = (double)n / 1152.0;
+        float want = 1.0f;
+        for (int i = 0; i < 6; i++) if (frac >= edges[i]) want = steps[i];
+        if (FaldBoostOfCount(p, n) != want) bad++;
+    }
+    CHECK(bad == 0);
+    CHECK(FaldBoostOfCount(p, 0u) == 0.35f);   CHECK(FaldBoostOfCount(p, 11u) == 0.35f);   // a 1 % highlight: x0.35
+    CHECK(FaldBoostOfCount(p, 12u) == 0.6f);   CHECK(FaldBoostOfCount(p, 115u) == 0.6f);
+    CHECK(FaldBoostOfCount(p, 576u) == 1.0f);  CHECK(FaldBoostOfCount(p, 1037u) == 0.25f);
+    CHECK(FaldBoostOfCount(p, 1095u) == 4.0f); CHECK(FaldBoostOfCount(p, 1152u) == 4.0f);
+}
+
 TEST_CASE("FALD panel file peeks understand FLD4") {
     FaldTempFile tf(L"test_fald_peek_fld4.bin");
     WriteBytes(tf.path, Fld4Image(kBoostSteps).Bytes());
@@ -1297,7 +1338,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     FaldPanelParams pp; std::string err;
     REQUIRE_MESSAGE(LoadFaldPanelParams(dir + L"/panel.bin", pp, err), err);
     MonitorContext ctx;
-    ctx.width = (int)(pp.originX + pp.cols * pp.cellW); ctx.height = (int)(pp.originY + pp.rows * pp.cellH);
+    ctx.width = (int)(pp.originX + pp.latW); ctx.height = (int)(pp.originY + pp.latH);   // the lattice (any pitch) = the frame
     ctx.isHDREnabled = true;
     ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
     ctx.frameTimeExactMs = periodMs;

@@ -87,55 +87,66 @@ static bool CompileOne(const std::string& src, const char* name, const char* tar
     return true;
 }
 
-bool InitFaldShaders() {
+FaldShaderSources FaldDefaultShaderSources() {
+    FaldShaderSources s;
+    s.common = g_faldCommonSource; s.stat = g_faldStatSource; s.conv = g_faldConvSource; s.gain = g_faldGainSource;
+    s.blur = g_faldBlurSource; s.temporal = g_faldTemporalSource; s.panelClock = g_faldPanelClockSource;
+    s.boost = g_faldBoostSource; s.starStat = g_faldStarStatSource; s.starWeight = g_faldStarWeightSource;
+    s.starPlan = g_faldStarPlanSource; s.zoneCombineDefine = g_faldZoneCombineDefine; s.pixel = g_faldPixelSource;
+    return s;
+}
+
+bool InitFaldShaders() { return InitFaldShadersFrom(FaldDefaultShaderSources()); }
+
+bool InitFaldShadersFrom(const FaldShaderSources& src) {
     if (!g_device) return false;
     ID3DBlob* b = nullptr;
-    std::string common = g_faldCommonSource;
-    if (!CompileOne(common + g_faldStatSource, "FaldStatCS", "cs_5_0", &b)) return false;
+    std::string common = src.common;
+    if (!CompileOne(common + src.stat, "FaldStatCS", "cs_5_0", &b)) return false;
     HRESULT hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStatCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(stat) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldConvSource, "FaldConvCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.conv, "FaldConvCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldConvCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(conv) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldGainSource, "FaldGainCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.gain, "FaldGainCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldGainCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(gain) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldBlurSource, "FaldBlurCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.blur, "FaldBlurCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldBlurCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(blur) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldTemporalSource, "FaldTemporalCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.temporal, "FaldTemporalCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldTemporalCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(temporal) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldPanelClockSource, "FaldPanelClockCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.panelClock, "FaldPanelClockCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPanelClockCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(panel clock) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldBoostSource, "FaldBoostCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.boost, "FaldBoostCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldBoostCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(boost) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldStarStatSource, "FaldStarStatCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.starStat, "FaldStarStatCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarStatCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star stat) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldStarWeightSource, "FaldStarWeightCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.starWeight, "FaldStarWeightCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarWeightCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star weight) failed" << std::endl; return false; }
-    if (!CompileOne(common + g_faldStarPlanSource, "FaldStarPlanCS", "cs_5_0", &b)) return false;
+    if (!CompileOne(common + src.starPlan, "FaldStarPlanCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarPlanCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(star plan) failed" << std::endl; return false; }
     {
-        const std::string combine = std::string(g_faldZoneCombineDefine) + common;   // the same sources, FALD_ZONE_COMBINE
+        const std::string combine = std::string(src.zoneCombineDefine) + common;   // the same sources, FALD_ZONE_COMBINE
         struct { const char* src; const char* name; ID3D11ComputeShader** cs; } zc[2] = {
-            { g_faldStatSource, "FaldStatCombineCS", &g_faldStatCombineCS },
-            { g_faldStarStatSource, "FaldStarStatCombineCS", &g_faldStarStatCombineCS } };
+            { src.stat, "FaldStatCombineCS", &g_faldStatCombineCS },
+            { src.starStat, "FaldStarStatCombineCS", &g_faldStarStatCombineCS } };
         for (auto& z : zc) {
             if (!CompileOne(combine + z.src, z.name, "cs_5_0", &b)) continue;   // logged; lattices of one-slice zones don't need it
             hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, z.cs);
@@ -143,7 +154,7 @@ bool InitFaldShaders() {
             if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(" << z.name << ") failed" << std::endl; *z.cs = nullptr; }
         }
     }
-    if (!CompileOne(common + g_faldPixelSource, "FaldPS", "ps_5_0", &b)) return false;
+    if (!CompileOne(common + src.pixel, "FaldPS", "ps_5_0", &b)) return false;
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreatePixelShader failed" << std::endl; return false; }
@@ -354,7 +365,7 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
         return false;
     }
     if (!FaldLatticeFits(p, ctx->width, ctx->height)) {
-        r->lastError = "panel lattice (" + std::to_string(p.cols * p.cellW) + "x" + std::to_string(p.rows * p.cellH) +
+        r->lastError = "panel lattice (" + std::to_string(p.latW) + "x" + std::to_string(p.latH) +
                        ") does not fit the monitor (" + std::to_string(ctx->width) + "x" + std::to_string(ctx->height) + ")";
         r->refusedByFile = true;
         return false;
@@ -417,14 +428,15 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
         if (!MakeFloatBuffer(lut, &r->boostLutBuf, &r->boostLutSRV)) { r->lastError = "boost LUT buffer"; return false; }
     }
     D3D11_BUFFER_DESC cbd = {};
-    cbd.ByteWidth = FALD_CB_BYTES;   // 76 words, see FaldCB
+    cbd.ByteWidth = FALD_CB_BYTES;   // 80 words, see FaldCB
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_device->CreateBuffer(&cbd, nullptr, &r->cb))) { r->lastError = "constant buffer"; return false; }
     r->valid = true;
     r->lastError.clear();
     ComputeFlatResponse(r);
-    std::cout << "[FALD] Monitor " << ctx->index << " resources ready: " << p.cols << "x" << p.rows << " cells of "
-              << p.cellW << "x" << p.cellH << " px, sub " << p.sub << ", white " << p.white << " nits, transfer "
+    std::cout << "[FALD] Monitor " << ctx->index << " resources ready: " << p.cols << "x" << p.rows << " cells on a "
+              << p.latW << "x" << p.latH << "-px lattice (" << (FaldLatticeFractional(p) ? "fractional pitch, " : "")
+              << "zones up to " << p.cellW << "x" << p.cellH << " px), sub " << p.sub << ", white " << p.white << " nits, transfer "
               << (p.transfer == FALD_TRANSFER_GAMMA ? "gamma " + std::to_string(p.sdrGamma) : std::string("PQ"))
               << " (" << (ctx->isHDREnabled ? "HDR" : "ACM SDR") << "), kernels "
               << (2 * p.reachTrueC + 1) << "x" << (2 * p.reachTrueR + 1) << " / " << (2 * p.reachEstC + 1) << "x" << (2 * p.reachEstR + 1)
@@ -536,6 +548,8 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
     u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
     u[75] = 0u;                                                                     // unused (was the glow fill's switch)
+    // the zone lattice's extent (words 76/77; cols * cellW / rows * cellH for an integer pitch): the zones' own spans
+    u[76] = p.latW; u[77] = p.latH; u[78] = 0u; u[79] = 0u;                         // (docs/fald-fractional-pitch.md)
     g_context->Unmap(r->cb, 0);
 }
 
@@ -840,7 +854,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         DumpTexture(r->starWTex, dir + L"fald_star_w.f32", p.cols, p.rows, 16);         // target weight wt, wt ln peak, flank flag, speck-zone flag
         DumpTexture(r->starPlanTex, dir + L"fald_star_plan.f32", p.cols, p.rows, 16);   // w0_field, ln target, ln lift, ln peak
         DumpTexture(r->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16); // ln background, near, speck-zone flag, w
-        DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * cellW + lx, lit sum, a_eff
+        DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * zw + lx, lit sum, a_eff
     }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
@@ -852,6 +866,9 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
              (double)r->clkFactor[2], (double)r->clkFactor[3]);
     std::ofstream meta(dir + L"fald_dump.txt");
     meta << "width " << r->width << "\nheight " << r->height << "\ncols " << p.cols << "\nrows " << p.rows
+         << "\nlattice_px " << p.latW << " " << p.latH << " (origin " << p.originX << " " << p.originY << "; pitch latW / cols x"
+         << " latH / rows px" << (FaldLatticeFractional(p) ? ", FRACTIONAL" : "") << ", zones up to " << p.cellW << "x" << p.cellH
+         << " px: docs/fald-fractional-pitch.md)"
          << "\nsub " << p.sub << "\nframe_format " << (bpp == 8 ? "R16G16B16A16_FLOAT scRGB linear (1.0 = 80 nits)" : "R10G10B10A2_UNORM")
          << "\nmode " << (r->builtForHdr ? "HDR" : "SDR_ACM")
          << "\ntransfer " << (p.transfer == FALD_TRANSFER_GAMMA ? "gamma" : "pq") << "\nsdr_gamma " << p.sdrGamma << "\nwhite_nits " << p.white
@@ -884,7 +901,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "; 1 = every pass read Balance(fald_frame); files fald_star_stat.f32 [peak, speck-zone flag, sparse, solid], fald_star_w.f32"
          << " [target weight wt, wt ln peak, flank flag, speck-zone flag], fald_star_plan.f32 [w0_field, ln target, ln lift, ln peak],"
          << " fald_star_plan2.f32 [ln background, near, speck-zone flag, w], fald_star_bg.f32 [ln background, brightest pixel's"
-         << " index ly * cellW + lx, lit sum, a_eff]:"
+         << " index ly * zw + lx (zw = the zone's own width), lit sum, a_eff]:"
          << " cols x rows x 4 float32)"
          << "\nstarfield even " << r->star.even << " lift " << r->star.lift << " target_gain " << r->star.targetGain
          << " target_sigma " << r->star.targetSigma << " keep_nits " << r->star.keepNits

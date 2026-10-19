@@ -37,12 +37,18 @@
 //   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
 //   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
+//
+// Zone lattice (docs/fald-fractional-pitch.md): cols x rows zones over latW x latH px from (originX, originY) — a
+// RATIONAL pitch latW / cols, so a 48 x 24 lattice on a 2560 x 1440 frame has 53.33-px zones. Every pixel -> zone map
+// goes through ZoneEdgeX / ZoneEdgeY / ZoneOfPixel (integer math, exact on every device); an integer pitch gives
+// exactly the whole-pixel formulas (c * cellW, lx / cellW). The fine grid and the kernel tables are in CELL units.
 #pragma once
 
 inline const char* g_faldCommonSource = R"(
 cbuffer FaldCB : register(b0) {
     uint frameW; uint frameH; uint cols; uint rows;
-    uint sub; uint cellW; uint cellH; uint roundIdx;
+    uint sub; uint cellW; uint cellH; uint roundIdx;                // cellW / cellH: the WIDEST zone (= the pitch of an
+                                                                    // integer lattice); the zones' own spans: ZoneEdgeX / Y
     uint reachTrueC; uint reachTrueR; uint reachEstC; uint reachEstR;
     uint curveN; float white; float tmin; float area0;
     float wR; float wG; float wB; float gainMin;
@@ -104,6 +110,8 @@ cbuffer FaldCB : register(b0) {
                                                                     // as-if-white nits)^boostMeanGamma >= boostMeanThresh;
                                                                     // _pad75: unused (was the glow fill's switch, S2 — removed
                                                                     // 2026-10-07), written 0
+    uint latW; uint latH; uint _pad78; uint _pad79;                 // the zone lattice's extent in px (cols * cellW / rows *
+                                                                    // cellH for an integer pitch; docs/fald-fractional-pitch.md)
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -130,8 +138,8 @@ Texture2D<float4> starWTex     : register(t17); // S1 out: (wt = the zone's weig
                                                 // flag, speck-zone flag) — read by S2
 Texture2D<float4> starPlan2Tex : register(t18); // S1 out: (ln background, near, speck-zone flag, w) — Balance samples .xy
                                                 // bilinearly and loads .z of the pixel's OWN zone (nearest)
-Texture2D<float4> starBgTex    : register(t19); // S0 out: (ln background, the brightest pixel's index ly * cellW + lx inside
-                                                // the zone, lit sum, a_eff) — read by S1
+Texture2D<float4> starBgTex    : register(t19); // S0 out: (ln background, the brightest pixel's index ly * zw + lx inside
+                                                // the zone (zw = the zone's own width), lit sum, a_eff) — read by S1
 SamplerState linearClamp : register(s0);
 )" /* MSVC caps ONE string literal at 16380 bytes (C2026); adjacent literals concatenate (limit 65535), so the common
       source is split here. Tools that read this header as text (DLC tests, the fxc checkers) drop the seam. */ R"(
@@ -196,10 +204,10 @@ float DriveOf(float statNits) {
 }
 
 // Fine-grid sample position for a frame pixel: the fine grid spans the cell LATTICE (origin..origin+
-// cols*cellW), so texel centres map to pixel centres with plain clamped bilinear sampling
+// latW), so texel centres map to pixel centres with plain clamped bilinear sampling
 // (= FaldModel._bilinear) once the lattice origin is removed.
 float2 FineUV(float2 px) {
-    return (px - float2((float)originX, (float)originY) + 0.5f) / float2((float)(cols * cellW), (float)(rows * cellH));
+    return (px - float2((float)originX, (float)originY) + 0.5f) / float2((float)latW, (float)latH);
 }
 // Both fields at a frame pixel, divided by their flat-lattice response (FaldModel.backlights with
 // flat_norm): a uniform field then gives B_true == B_est everywhere -> gain 1, no sub-cell sawtooth,
@@ -212,7 +220,16 @@ void SampleFields(float2 px, out float bTrue, out float bEst) {
 // Pixels outside the lattice have no cell and no reference behaviour: pass them through.
 bool InLattice(int2 px) {
     return px.x >= (int)originX && px.y >= (int)originY &&
-           px.x < (int)(originX + cols * cellW) && px.y < (int)(originY + rows * cellH);
+           px.x < (int)(originX + latW) && px.y < (int)(originY + latH);
+}
+// The zones (C++ reference FaldZoneEdge / FaldZoneOfPixel): zone c spans the lattice-local pixels [ZoneEdgeX(c),
+// ZoneEdgeX(c + 1)) — c * pitch rounded to the nearest pixel edge, ties to the lower one — and a pixel belongs to the
+// zone its CENTRE lies in. Integer pitch P: c * P and lx / P. < 2^32 for the loader's 512 zones x 65535 px.
+uint ZoneEdgeX(uint c) { return (2u * c * latW + cols - 1u) / (2u * cols); }
+uint ZoneEdgeY(uint r) { return (2u * r * latH + rows - 1u) / (2u * rows); }
+uint2 ZoneOfPixel(int2 px) {                                              // px inside the lattice
+    uint2 l = uint2((uint)(px.x - (int)originX), (uint)(px.y - (int)originY));
+    return uint2(((2u * l.x + 1u) * cols) / (2u * latW), ((2u * l.y + 1u) * rows) / (2u * latH));
 }
 
 // Starfield balancing (work guide S1; reference DLC dlc/fald/starfield.py, GPU-order twin dlc/fald/gpuemu.py).
@@ -246,7 +263,7 @@ static const float FALD_STAR_FLAT_REL = 0.02f;
 static const float FALD_STAR_PULL_EPS = 1e-5f;
 // balance_image for one pixel: img = as-if-white nits per channel of the SOURCE frame, px = the frame pixel. The plan
 // texture holds one texel per zone, so clamped hardware bilinear at FineUV (texel coordinate
-// (px - origin + 0.5) / cell - 0.5) IS starfield._bilinear_zones: interpolation between zone CENTRES, the border
+// (px - origin + 0.5) / pitch - 0.5) IS starfield._bilinear_zones: interpolation between zone CENTRES, the border
 // zones' values held outside the outermost centres (t18's ln background and near likewise). The protection (near) is
 // interpolated on its own and applied per pixel, so a star drifting away from solid content gains weight continuously.
 // OWN-ZONE GATE: a pixel is acted on only when the zone it lies in is a speck zone (nearest-zone Load of the flag) — a
@@ -258,7 +275,7 @@ static const float FALD_STAR_PULL_EPS = 1e-5f;
 float3 Balance(float3 img, int2 px) {
     float m = max(img.r, max(img.g, img.b));
     if (!(m > 0.0f)) return img;                                          // the cheap tests first: black pixels ...
-    uint2 zone = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);   // integer math, as view 9
+    uint2 zone = ZoneOfPixel(px);                                         // integer math, as view 9
     if (!(starPlan2Tex.Load(int3((int2)zone, 0)).z > 0.5f)) return img;   // ... and the own-zone gate, before the two taps
     float2 uv = FineUV(float2(px));
     float4 plan = starPlanTex.SampleLevel(linearClamp, uv, 0);           // w0, ln target, ln lift, ln peak
@@ -385,7 +402,10 @@ float3 Correct(float3 img, float bTrue, float bEst, float2 gs) {
 // group exactly as before (bit-identical). With more slices each group writes its partial (ZonePart, u2) and the pass's
 // combine variant (compiled with FALD_ZONE_COMBINE, one group per zone) folds them — thread t the slices t, t + 256, ...
 // in order, then the same tree — and finishes the zone. C++: FALD_ZONE_SLICE_PX / FaldZoneSlices (below the shaders);
-// DLC gpuemu.Emu.zone_pow_sum emulates the order.
+// DLC gpuemu.Emu.zone_pow_sum emulates the order. Each zone sweeps its OWN zw x zh pixels (ZoneEdgeX / Y; a fractional
+// pitch makes zones differ by one pixel); the slice count is the WIDEST zone's (cellW x cellH), so a narrower zone's last
+// slice may hold no pixel — its group writes the identity partial (max 0, sums 0, min 3e38, count 0) and the fold is
+// unchanged.
 static const uint FALD_ZONE_SLICE_PX = 4096u;
 struct ZonePart { float4 f; uint4 u; };
 uint ZoneSlices() { return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX; }
@@ -412,7 +432,9 @@ groupshared float gPow[256];
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint cx = gid.x, cy = gid.y;
-    uint n = cellW * cellH;
+    uint x0 = ZoneEdgeX(cx), y0 = ZoneEdgeY(cy);                  // the zone's own pixels (lattice-local)
+    uint zw = ZoneEdgeX(cx + 1u) - x0, zh = ZoneEdgeY(cy + 1u) - y0;
+    uint n = zw * zh;
     float m = 0.0f, sum = 0.0f;
     uint lit = 0, dim = 0;
     float powSum = 0.0f;
@@ -424,8 +446,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 #else
     uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
     for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
-        uint px = originX + cx * cellW + (k % cellW);
-        uint py = originY + cy * cellH + (k / cellW);
+        uint px = originX + x0 + (k % zw);
+        uint py = originY + y0 + (k / zw);
         if (px >= frameW || py >= frameH) continue;
         float3 img = PanelNits(frameTex.Load(int3(px, py, 0)).rgb);
         if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));   // the frame the layer works on (S1)
@@ -472,7 +494,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         driveOut[uint2(cx, cy)] = DriveOf(stat);
         if (boostN != 0u) {
             // LIT-or-DIM / LIT-or-MEAN (FaldModel.active_zones): fractions of the zone's pixels (the lattice lies inside
-            // the frame — FaldLatticeFits — so every zone has cellW * cellH of them)
+            // the frame — FaldLatticeFits — so every zone has its zw * zh of them)
             float litF = (float)gLit[0] / (float)n;
             float dimF = (float)gDim[0] / (float)n;
             bool second = (boostRule == 1u) ? (gPow[0] / (float)n >= boostMeanThresh) : (dimF > boostDimFrac);
@@ -491,8 +513,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 // Per zone                                                                                          pass  texture.channel
 //   peak, total   floored statistic (pixels above driveFloor), has = peak > 0, drive = DriveOf(min(peak, total / A0))  S0
 //   peakAll, b, sumAll, n   over ALL in-frame pixels (no floor): b = min = the zone's BACKGROUND            S0
-//   arg     = ly * cellW + lx of the brightest pixel (ties: nearest a zone border, key max(|2lx - (cw-1)| ch,
-//             |2ly - (ch-1)| cw), then the first in row-major order)                                        S0   bg.y
+//   arg     = ly * zw + lx of the brightest pixel (zw x zh = the zone's own size; ties: nearest a zone border, key
+//             max(|2lx - (zw-1)| zh, |2ly - (zh-1)| zw), then the first in row-major order)                 S0   bg.y
 //   speck   = peakAll - b > max(FLAT_ABS 1e-6, FLAT_REL 0.02 * peakAll)                                     S0
 //   a_eff   = (sumAll - b n) / (peakAll - b)   px^2 at the peak level above the background (0 if !speck)    S0   bg.w
 //   sparse  = 1 - ss(areaLo, areaHi, a_eff) [x 1 - ss(peakHi, 2 peakHi, peak) if peakHi > 0], 0 unless has && speck   stat.z
@@ -548,7 +570,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 //   spk = has && speck && a_eff < areaHi: the SPECK-ZONE flag (a lit peak that rises above the zone's own background
 //     with a STAR-SIZED area above it — a grainy sky passes the flat rule but reads about half the zone) — the carry,
 //     the lift and the peak field of the plan pass and the own-zone gate of Balance key on it;
-//   arg = the brightest pixel's position inside the zone, ly * cellW + lx (un-gated maximum; ties: the pixel nearest a
+//   arg = the brightest pixel's position inside the zone, ly * zw + lx (un-gated maximum; ties: the pixel nearest a
 //     zone border — mirror-symmetric — then the first in row-major order; StarEdgeKey / StarBetter) — S1's flank test.
 // u0 = (peak, spk, sparse, solid); u1 = (ln b, arg, lit sum, a_eff) — S1 copies ln b into the texture the pixels sample.
 // Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source); the
@@ -565,16 +587,17 @@ groupshared float gSumAll[256];
 groupshared uint gCount[256];
 groupshared uint gArg[256];
 
-// Position of the zone's brightest pixel: k = ly * cellW + lx. Ties: the pixel nearest the zone border (largest key),
-// then the first in row-major order — a total order, so the parallel reduction gives the same pixel whatever its shape
-// (the emulator applies the same rule). A flat-topped speck at an edge then counts as AT the edge on either side.
-uint StarEdgeKey(uint k) {
-    int lx = (int)(k % cellW), ly = (int)(k / cellW);
-    return (uint)max(abs(2 * lx - ((int)cellW - 1)) * (int)cellH, abs(2 * ly - ((int)cellH - 1)) * (int)cellW);
+// Position of the zone's brightest pixel: k = ly * zw + lx (zw x zh = the zone's own size). Ties: the pixel nearest the
+// zone border (largest key), then the first in row-major order — a total order, so the parallel reduction gives the same
+// pixel whatever its shape (the emulator applies the same rule). A flat-topped speck at an edge then counts as AT the
+// edge on either side.
+uint StarEdgeKey(uint k, uint zw, uint zh) {
+    int lx = (int)(k % zw), ly = (int)(k / zw);
+    return (uint)max(abs(2 * lx - ((int)zw - 1)) * (int)zh, abs(2 * ly - ((int)zh - 1)) * (int)zw);
 }
-bool StarBetter(float va, uint ka, float vb, uint kb) {          // is (vb, kb) preferred over (va, ka)?
+bool StarBetter(float va, uint ka, float vb, uint kb, uint zw, uint zh) {   // is (vb, kb) preferred over (va, ka)?
     if (vb != va) return vb > va;
-    uint ea = StarEdgeKey(ka), eb = StarEdgeKey(kb);
+    uint ea = StarEdgeKey(ka, zw, zh), eb = StarEdgeKey(kb, zw, zh);
     if (eb != ea) return eb > ea;
     return kb < ka;
 }
@@ -582,26 +605,28 @@ bool StarBetter(float va, uint ka, float vb, uint kb) {          // is (vb, kb) 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint cx = gid.x, cy = gid.y;
-    uint n = cellW * cellH;
+    uint x0 = ZoneEdgeX(cx), y0 = ZoneEdgeY(cy);                  // the zone's own pixels (lattice-local)
+    uint zw = ZoneEdgeX(cx + 1u) - x0, zh = ZoneEdgeY(cy + 1u) - y0;
+    uint n = zw * zh;
     float m = 0.0f, sum = 0.0f, mAll = -1.0f, mn = 3.0e38f, sumAll = 0.0f;
     uint count = 0, kAll = 0;
 #ifdef FALD_ZONE_COMBINE
     for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
         ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
         m = max(m, q.f.x); sum += q.f.y;
-        if (StarBetter(mAll, kAll, q.f.z, q.u.x)) { mAll = q.f.z; kAll = q.u.x; }
+        if (StarBetter(mAll, kAll, q.f.z, q.u.x, zw, zh)) { mAll = q.f.z; kAll = q.u.x; }
         mn = min(mn, q.f.w); sumAll += asfloat(q.u.z); count += q.u.y;
     }
 #else
     uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
     for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
-        uint px = originX + cx * cellW + (k % cellW);
-        uint py = originY + cy * cellH + (k / cellW);
+        uint px = originX + x0 + (k % zw);
+        uint py = originY + y0 + (k / zw);
         if (px >= frameW || py >= frameH) continue;          // only in-frame pixels count (n, min and sums alike)
         float3 img = PanelNits(frameTex.Load(int3(px, py, 0)).rgb);
         float s = min(max(img.r, max(img.g, img.b)), white);
         if (s > driveFloor) { m = max(m, s); sum += s; }
-        if (StarBetter(mAll, kAll, s, k)) { mAll = s; kAll = k; }
+        if (StarBetter(mAll, kAll, s, k, zw, zh)) { mAll = s; kAll = k; }
         mn = min(mn, s); sumAll += s; count++;
     }
 #endif
@@ -612,7 +637,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (tid.x < stride) {
             gMax[tid.x] = max(gMax[tid.x], gMax[tid.x + stride]);
             gSum[tid.x] += gSum[tid.x + stride];
-            if (StarBetter(gMaxAll[tid.x], gArg[tid.x], gMaxAll[tid.x + stride], gArg[tid.x + stride])) {
+            if (StarBetter(gMaxAll[tid.x], gArg[tid.x], gMaxAll[tid.x + stride], gArg[tid.x + stride], zw, zh)) {
                 gMaxAll[tid.x] = gMaxAll[tid.x + stride]; gArg[tid.x] = gArg[tid.x + stride];
             }
             gMin[tid.x] = min(gMin[tid.x], gMin[tid.x + stride]);
@@ -681,7 +706,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     // flank: this zone's brightest pixel hugs the edge / corner shared with a neighbour of LARGER peak whose own brightest
     // pixel lies just behind that edge (and near this one along it): one feature straddling the border
     uint k0 = (uint)(starBgTex.Load(int3(id.xy, 0)).y + 0.5f);
-    int lx = (int)(k0 % cellW), ly = (int)(k0 / cellW);
+    int zw0 = (int)(ZoneEdgeX(id.x + 1u) - ZoneEdgeX(id.x)), zh0 = (int)(ZoneEdgeY(id.y + 1u) - ZoneEdgeY(id.y));   // own size
+    int lx = (int)(k0 % (uint)zw0), ly = (int)(k0 / (uint)zw0);
     bool flank = false;
     float partners = 0.0f;                                        // neighbours with the same geometry and an EQUAL peak
     for (int fy = -1; fy <= 1; fy++) {
@@ -691,12 +717,13 @@ void main(uint3 id : SV_DispatchThreadID) {
             float np_ = starStatTex.Load(int3(x, y, 0)).r;        // a LARGER peak = this zone is its flank; an EQUAL one = a
             if (!(np_ >= st.r && np_ > 0.0f)) continue;           // flat-topped feature straddling the border: they share a vote
             uint k1 = (uint)(starBgTex.Load(int3(x, y, 0)).y + 0.5f);
-            int nx = (int)(k1 % cellW), ny = (int)(k1 / cellW);
-            bool okx = (fx == 1) ? (lx >= (int)cellW - FALD_STAR_FLANK_PX && nx < FALD_STAR_FLANK_NEAR_PX)
-                     : (fx == -1) ? (lx < FALD_STAR_FLANK_PX && nx >= (int)cellW - FALD_STAR_FLANK_NEAR_PX)
+            int zw1 = (int)(ZoneEdgeX((uint)x + 1u) - ZoneEdgeX((uint)x)), zh1 = (int)(ZoneEdgeY((uint)y + 1u) - ZoneEdgeY((uint)y));
+            int nx = (int)(k1 % (uint)zw1), ny = (int)(k1 / (uint)zw1);   // the neighbour's index in ITS own size
+            bool okx = (fx == 1) ? (lx >= zw0 - FALD_STAR_FLANK_PX && nx < FALD_STAR_FLANK_NEAR_PX)
+                     : (fx == -1) ? (lx < FALD_STAR_FLANK_PX && nx >= zw1 - FALD_STAR_FLANK_NEAR_PX)
                      : (abs(lx - nx) <= FALD_STAR_FLANK_NEAR_PX);
-            bool oky = (fy == 1) ? (ly >= (int)cellH - FALD_STAR_FLANK_PX && ny < FALD_STAR_FLANK_NEAR_PX)
-                     : (fy == -1) ? (ly < FALD_STAR_FLANK_PX && ny >= (int)cellH - FALD_STAR_FLANK_NEAR_PX)
+            bool oky = (fy == 1) ? (ly >= zh0 - FALD_STAR_FLANK_PX && ny < FALD_STAR_FLANK_NEAR_PX)
+                     : (fy == -1) ? (ly < FALD_STAR_FLANK_PX && ny >= zh1 - FALD_STAR_FLANK_NEAR_PX)
                      : (abs(ly - ny) <= FALD_STAR_FLANK_NEAR_PX);
             if (okx && oky) { if (np_ > st.r) flank = true; else partners += 1.0f; }
         }
@@ -887,9 +914,9 @@ inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
 }
 
 // Zone sweeps (work guide C14; the rules above ZoneSlices in the common source). The statistic pass and starfield S0
-// dispatch cols x rows x FaldZoneSlices(cellW, cellH) groups; with more than one slice per zone the
-// pass's combine variant (its source compiled after g_faldZoneCombineDefine) follows over cols x rows. The partials: one
-// structured buffer per monitor of cols * rows * slices ZonePart records, bound at u2. A 1-slice lattice has no buffer
+// dispatch cols x rows x FaldZoneSlices(cellW, cellH) groups (cellW x cellH = the WIDEST zone); with more than one slice
+// per zone the pass's combine variant (its source compiled after g_faldZoneCombineDefine) follows over cols x rows. The
+// partials: one structured buffer per monitor of cols * rows * slices ZonePart records, bound at u2. A 1-slice lattice has no buffer
 // and runs neither the partial write nor the combine. A lattice needing more than FALD_ZONE_SLICES_MAX (D3D11's 65535
 // groups per dimension) is refused at build; real frames stay far below (a 7680 x 4320 frame as one zone = 8100).
 static const unsigned int FALD_ZONE_SLICE_PX = 4096u;     // = the HLSL's FALD_ZONE_SLICE_PX
@@ -1041,7 +1068,7 @@ float4 main(PS_INPUT i) : SV_Target {
     if (debugMode == 2) { float v = saturate(bT) * DebugWhite(); return float4(v, v, v, 1.0f); }
     if (debugMode == 3) { float v = saturate(bE) * DebugWhite(); return float4(v, v, v, 1.0f); }
     if (debugMode == 7) {
-        uint2 c = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);   // inside the lattice here
+        uint2 c = ZoneOfPixel(px);                          // inside the lattice here
         float dInst = driveTex.Load(int3((int2)c, 0));
         float dFilt = driveEstTex.Load(int3((int2)c, 0));
         float diff = dInst - dFilt;                         // > 0: instantaneous drive above the state (rising)
@@ -1051,13 +1078,13 @@ float4 main(PS_INPUT i) : SV_Target {
     }
     if (debugMode == 8) {
         if (boostN == 0u) return src;
-        uint2 c8 = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);
+        uint2 c8 = ZoneOfPixel(px);
         float v8 = (activeTex.Load(int3((int2)c8, 0)) > 0.5f) ? DebugWhite() : 0.0f;
         return float4(v8, v8, v8, 1.0f);
     }
     if (debugMode == 9) {
         if (starOn == 0u) return src;
-        uint2 c9 = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);
+        uint2 c9 = ZoneOfPixel(px);
         float4 zp = starPlanTex.Load(int3((int2)c9, 0));              // w0_field, ln target, ln lift, ln peak
         float wz = zp.x * (1.0f - StarSmooth(starNbLo, starNbHi, starPlan2Tex.Load(int3((int2)c9, 0)).y));   // x the protection
         float down = wz * starEven * min(zp.y - zp.w, 0.0f);          // ln(new peak / peak) of a zone above its target

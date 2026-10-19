@@ -267,9 +267,9 @@ int FaldLoadPanelFiles(const char* lutFolder) {
                  isHdr ? "HDR" : "SDR (ACM)");
             continue;
         }
-        LogF("FALD: panel file %s loaded: pos(%d,%d) %s, %ux%u cells of %ux%u px, sub %u, white %.1f nits, boost %s",
+        LogF("FALD: panel file %s loaded: pos(%d,%d) %s, %ux%u cells on a %ux%u-px lattice, sub %u, white %.1f nits, boost %s",
              fd.cFileName, left, top, isHdr ? "HDR" : "SDR(ACM)",
-             params.cols, params.rows, params.cellW, params.cellH, params.sub,
+             params.cols, params.rows, params.latW, params.latH, params.sub,
              params.white, params.hasBoost ? "yes" : "none");
         if (g_panels.AddStaged(left, top, isHdr, std::move(params))) loaded++;
     } while (FindNextFileA(h, &fd) != 0);
@@ -414,9 +414,9 @@ static void IngestDelivery(int left, int top, bool isHdr, uint32_t gen, uint32_t
     const double us = f.QuadPart > 0 ? (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)f.QuadPart : 0.0;
     if (ack == DWM_HOOK_FALD_PANEL_ACK_INGESTED) {
         const FaldPanelParams& p = g_panels.At(slot).params;
-        LogF("FALD: pos(%d,%d) %s panel file delivered live (gen %u, %u bytes): %ux%u cells of %ux%u px, sub %u, "
+        LogF("FALD: pos(%d,%d) %s panel file delivered live (gen %u, %u bytes): %ux%u cells on a %ux%u-px lattice, sub %u, "
              "white %.1f nits, boost %s - taken in %.0f us; the layer switches at its next run",
-             left, top, modeName, gen, h.payloadBytes, p.cols, p.rows, p.cellW, p.cellH, p.sub, p.white,
+             left, top, modeName, gen, h.payloadBytes, p.cols, p.rows, p.latW, p.latH, p.sub, p.white,
              p.hasBoost ? "yes" : "none", us);
     } else {
         LogF("FALD: pos(%d,%d) %s panel delivery %u REFUSED (%s) - the layer keeps its current file",
@@ -439,7 +439,9 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 2160;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 2176;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+                                                         // (2026-10-19: + FaldPanelParams::latW / latH in params and
+                                                         // spareParams — panel-file state, BUILT FRESH / KEPT as before)
 struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_temporal.h (the overlay's FaldResources too)
     int left = 0, top = 0;
     bool isHdr = false;
@@ -833,7 +835,7 @@ static bool PanelFits(FaldMonitor* m) {
     const FaldPanelParams& p = m->params;
     if (FaldLatticeFits(p, (int)m->width, (int)m->height)) return true;
     LogF("FALD: panel lattice (%ux%u) does not fit monitor %ux%u at pos(%d,%d) — layer off",
-         p.cols * p.cellW, p.rows * p.cellH, m->width, m->height, m->left, m->top);
+         p.latW, p.latH, m->width, m->height, m->left, m->top);
     return false;
 }
 
@@ -927,8 +929,9 @@ static bool BuildTables(FaldMonitor* m) {
     m->valid = true;
     ComputeFlatResponse(m);
     FaldUnbindAll();   // the flat pass bound CS b0 / s0; a build can end the present without FaldRun (unprimed)
-    LogF("FALD: monitor pos(%d,%d) %s ready: %ux%u cells of %ux%u px, sub %u, white %.1f nits, transfer %s, boost %s",
-         m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", p.cols, p.rows, p.cellW, p.cellH, p.sub, p.white,
+    LogF("FALD: monitor pos(%d,%d) %s ready: %ux%u cells on a %ux%u-px lattice%s, sub %u, white %.1f nits, transfer %s, boost %s",
+         m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", p.cols, p.rows, p.latW, p.latH,
+         FaldLatticeFractional(p) ? " (fractional pitch)" : "", p.sub, p.white,
          p.transfer == FALD_TRANSFER_GAMMA ? "gamma" : "PQ", p.hasBoost ? "yes" : "none");
     return true;
 }
@@ -1380,6 +1383,8 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
     u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
     u[75] = 0u;                                                                     // unused (was the glow fill's switch)
+    // the zone lattice's extent (words 76/77; cols * cellW / rows * cellH for an integer pitch): the zones' own spans
+    u[76] = p.latW; u[77] = p.latH; u[78] = 0u; u[79] = 0u;                         // (docs/fald-fractional-pitch.md)
     g_ctx->Unmap(m->cb, 0);
 }
 

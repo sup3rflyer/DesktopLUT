@@ -509,29 +509,31 @@ def test_preflight_exact_pitch_is_silent_pa_frame(tmp_path):
 
 def test_preflight_refuses_a_lattice_the_loader_would_refuse(tmp_path):
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
-    res = _run(ctx, "preflight", zones="48x24")                          # 2560x1440: 55-px cells -> a 2640-px lattice
+    res = _run(ctx, "preflight", zones="600x24")                         # more zones per axis than the loader holds (512)
     assert res.status == "blocked" and res.anomalies[0].code == "lattice_refused"
-    assert "2640x1440" in res.anomalies[0].detail and "48x24" in res.anomalies[0].detail
+    assert "600x24" in res.anomalies[0].detail and "512" in res.anomalies[0].detail
     assert res.metrics["lattice"]["fits"] is False and _nothing_entered(ctx)
     # mechanical: no seam a decision could answer
-    again = _run(ctx, "preflight", zones="48x24", decide=["fald_profile:cell_pitch=proceed"])
+    again = _run(ctx, "preflight", zones="600x24", decide=["fald_profile:cell_pitch=proceed"])
     assert again.status == "blocked" and again.anomalies[0].code == "lattice_refused"
 
 
-def test_preflight_rounded_lattice_is_a_cell_pitch_seam(tmp_path):
+def test_preflight_fractional_pitch_runs_at_native_resolution(tmp_path):
+    """The most common mini-LED monitor (27-inch 2560x1440, 1152 zones = 48x24, 53.33 x 60 px) used to be refused (a
+    2640-px rounded lattice) and 36x18 / 30x18 were cell-pitch seams (uncovered strip + drift). Since fractional zone pitch
+    (docs/fald-fractional-pitch.md) the panel file's lattice is the frame: no seam, a note, the lattice in the metrics."""
     ctx = create_run("SDR", display="sim", run_dir=tmp_path / "run")
-    res = _run(ctx, "preflight", zones="36x18")                          # 2560/36 = 71.1 px -> 70-px cells, 2520 px
-    assert res.status == "blocked" and res.anomalies[0].code == "cell_pitch"
-    seam = res.raw["seam"]
-    lat = seam["digest"]["lattice"]
-    assert lat["lattice_px"] == [2520, 1440] and lat["uncovered_px"] == [40, 0]
-    assert lat["max_drift_cells"][0] == pytest.approx(40 / (2560 / 36), abs=1e-3)
-    assert seam["recommendation"] == "abort" and "40 px at the right" in seam["question"] and _nothing_entered(ctx)
-    small = _run(ctx, "preflight", zones="30x18")                        # 10 px uncovered, 0.12 cell drift
-    assert small.status == "blocked" and small.raw["seam"]["recommendation"] == "proceed"
-    go = _run(ctx, "preflight", zones="30x18", decide=["fald_profile:cell_pitch=proceed"])
-    assert go.status == "ran" and go.metrics["lattice"]["lattice_px"] == [2550, 1440]
-    assert _common.load_dlc_state(ctx)["fald"]["geometry"]["cols"] == 30
+    for zones, pitch, zone_w in (("48x24", 2560 / 48, [53, 54]), ("36x18", 2560 / 36, [71, 72]), ("30x18", 2560 / 30, [85, 86])):
+        res = _run(ctx, "preflight", zones=zones)                        # simulated monitor 1 = 2560x1440
+        assert res.status == "ran", res.as_dict()
+        assert "seam" not in res.raw and not {"cell_pitch", "lattice_refused"} & {a.code for a in res.anomalies}
+        lat = res.metrics["lattice"]
+        assert lat["fits"] and lat["exact"] and lat["fractional"] and lat["lattice_px"] == [2560, 1440]
+        assert lat["uncovered_px"] == [0, 0] and lat["max_drift_cells"] == [0.0, 0.0]
+        assert lat["pitch_px"][0] == pytest.approx(pitch, abs=1e-4) and lat["zone_px"][0] == zone_w
+        assert lat["header_cell_px"] == [0, 0] and lat["extent_word"] == 2560 | (1440 << 16)
+        assert any("fractional zone pitch" in n for n in res.notes)
+        assert _common.load_dlc_state(ctx)["fald"]["geometry"]["cols"] == int(zones.split("x")[0])
 
 
 def test_preflight_rejects_a_malformed_decide(tmp_path):
