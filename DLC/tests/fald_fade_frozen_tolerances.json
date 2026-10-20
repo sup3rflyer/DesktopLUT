@@ -1,0 +1,69 @@
+{
+  "frozen": "2026-10-20, branch fald/asf10-port, BEFORE any comparison run of the port (no gpuemu-f32 / HLSL fade code existed when this was written)",
+  "source": "results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md section 5 (sha256 84c5b6d021fa0733b92db6dc4c0585d80a4ff0257564490f035ed2be2102be77)",
+  "rule": "These numbers are not changed after a comparison has run. A failure is investigated and reported; a tolerance is never widened.",
+  "steps": "per pixel = the max over its three channels of |a - b| / spacing(|b|) in FP16 (the existing WARP replays' _steps)",
+
+  "off_gate": {
+    "what": "flank fade OFF: every field + the output frame of the 51-run matrix (tests/test_fald_fade.cpp OffMatrix) hash-equal to tests/fixtures/fald_fade_off_main.hashes (main 6273464)",
+    "tolerance": "bit for bit (every FNV-1a 64 hash equal)"
+  },
+
+  "gate1_f32_vs_f64": {
+    "what": "the float32 GPU-order port (DLC dlc/fald/fadeemu.py) against the frozen float64 study twin (r10/temu.py TEmu + r11/cands11.make_post11 + r11/T/tl11.TL11State, variant F10_TMTC), CPU, same inputs, zone drives frozen (FixedMaps: both sides' kernels see the twin's own stateless round drives)",
+    "fields_abs": {
+      "tolerance": 2e-4,
+      "fields": ["fade (the instantaneous ASF9o field)", "fade_T", "s (quarter-res T state)", "reach_r0", "reach_r1"],
+      "measure": "max |a - b| over every element"
+    },
+    "floor_F": {
+      "lit_abs": 2e-4,
+      "F_rel": 2e-4,
+      "note": "F is in nits (0.05 .. 1e4): an absolute 2e-4 on 1e4-nit values is below float32 resolution (ulp(1e4) ~ 1e-3), so the plan's 'F within 2e-4 absolute' is read as: the consumed quantity lit = smoothstep(1, 3, F) within 2e-4 absolute AND F itself within 2e-4 relative, every element"
+    },
+    "out16": { "share_le_2_steps_min": 0.999, "max_steps": 8, "pixels": "every frame pixel" },
+    "cut": "identical decision on every frame",
+    "shift": {
+      "used": "accepted / rejected identical on every frame",
+      "abs_texel": 0.01,
+      "measure": "|used shift (dy, dx) difference| per axis, 1/8-res texels, frames where both accept it",
+      "note": "the raw phase-correlation estimate of a REJECTED shift (e.g. a cut frame's noise peak) is a diagnostic, not compared"
+    },
+    "study_logs": "the twin run here must reproduce r11/T/out/motion11/<seq>.json F10_TMTC cutlog: cut identical, shift_used identical, used shift within 1e-6 texel (the same float64 rule; only the reduction order differs)"
+  },
+
+  "gate2_hlsl_vs_f32": {
+    "what": "the HLSL on WARP (tests/test_fald_fade.cpp dumps) against fadeemu (Emu(sampler='warp', subtexel_bits=8)), the device stateless (temporal mode off), drives recomputed by the replay as in the existing WARP replays",
+    "out16_max_steps": 1,
+    "base_fields": { "rtol": 1e-6, "atol": 2e-5, "fields": ["drive (round 1)", "btrue", "best", "gain (fine grid)"] },
+    "fade_fields": {
+      "rtol": 1e-6,
+      "atol": 5e-5,
+      "fields": ["fade", "fade_T", "s", "reach (round 1)", "lit = smoothstep(1, 3, F)"],
+      "note": "atol 5e-5 instead of 2e-5 as PORT_PLAN 5.2 allows for the long separable sums (sigma 32 = 257 taps); stated here before the run"
+    },
+    "floor_F_rel": {
+      "tolerance": 1e-5,
+      "note": "F = exp(...) goes through a device transcendental directly (WARP's exp vs numpy's: a few ulp); 1e-5 relative is far below what lit = smoothstep(1, 3, F) can see"
+    },
+    "flags": "array_equal: cut, shift used, advance, has-history",
+    "shift_abs_texel": 1e-3
+  },
+
+  "cells": {
+    "stills": ["p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0", "s10_sm_seattle", "s10_ac_firewater", "x_naninf", "x_odd1366"],
+    "sequences": ["s10_sm_seattle p6n", "s10_ac_firewater p6", "t_hl0_v16", "t_cutdark"],
+    "still_rule": "a still = the first frame after a reset (no history: s = f_q, fade_T = fade)",
+    "x_naninf": "the sanitise cell. Gate 1 compares the fade field only (the twin's T / OF / base layer propagate NaN through torch where the HLSL's max() drops it: not a port question). Gate 2 compares the fade-stack fields everywhere and the output on pixels whose input is finite.",
+    "x_odd1366": "1366 x 768 on its own 17 x 9 panel file (DLC tests/fald_fade_cells.py odd_panel.bin): gate 2 only (the study twin is 3840 x 2160 / the owner's file)"
+  },
+
+  "negative_control": {
+    "rule": "a deliberate one-constant mutation must FAIL the gate it belongs to; the code is restored and the gate passes again",
+    "mutations": [
+      "gate 1: fadeemu push-pull confidence 4 -> 3",
+      "gate 2: HLSL flank lambda 80 -> 81",
+      "gate 2 (sequence): HLSL T base rate a0 0.25 -> 0.3"
+    ]
+  }
+}
