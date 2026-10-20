@@ -19,12 +19,14 @@
 #include <windows.h>
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <semaphore>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1051,51 +1053,135 @@ TEST_CASE("FALD live: the entry gate - a rebuild never runs under a borrow, a bo
 
 TEST_CASE("FALD live: the entry gate under threads - no borrower ever sees an entry rebuilt or freed under it") {
     // Borrowers stand for the presents of twin contexts (FaldUpdateClean / FaldRun on the entry), the rebuilder for the
-    // lock holder's swap / build / release: it replaces the entry, marking the old one dead (standing for the freed COM
-    // resources — they are not really freed, so a violation is counted instead of crashing the test).
-    struct Entry { std::atomic<int> alive{ 1 }; int payload = 0; };
-    std::vector<Entry> pool(4096);
-    std::atomic<Entry*> current{ &pool[0] };
+    // lock holder's swap / build / release: it replaces the entry's resources — a new generation, the entry torn while
+    // it works (standing for the freed COM resources: a violation is counted instead of crashing the test). Both sides
+    // also watch each other: a borrower must see one whole generation for all of its use, a rebuilder no borrower inside.
+    //
+    // The gate never waits, so it promises no progress to a claim that keeps meeting borrows — it is refused, and the
+    // hook redoes the work at a later present. A test that waits a wall-clock time for claims to land therefore starves
+    // when the borrowers always hold one (on 2 CPUs: every run). Nothing here depends on time or on the scheduler: a
+    // fixed number of frames, and in each frame
+    //   - forced, in this order by semaphores: a claim while a borrow is held (refused, leaves no trace); once every
+    //     present of the frame is over, a claim (lands); while it is held and the entry torn, a borrow (backs off,
+    //     leaves no trace);
+    //   - free, around those: each borrower makes kPresents presents and the rebuilder up to kFreeClaims claims while
+    //     they run, racing (how they fall is reported, not checked: any outcome is legal, only a violation is not).
+    constexpr int kBorrowers = 4, kFrames = 2000, kPresents = 3, kFreeClaims = 16, kUse = 64;
+    struct Entry { std::atomic<uint32_t> gen{ 0 }; std::atomic<bool> torn{ false }; } entry;
     FaldEntryGate gate;
-    std::atomic<bool> stop{ false };
-    std::atomic<int> violations{ 0 }, borrows{ 0 }, backedOff{ 0 }, rebuilds{ 0 }, deferred{ 0 };
+    std::atomic<int> inside{ 0 };                       // borrowers between a granted borrow and its return
+    std::atomic<int> violations{ 0 }, traces{ 0 };      // a refused borrow / claim must leave the gate as it was
+    std::atomic<int> heldBorrows{ 0 }, refusedClaims{ 0 }, landedClaims{ 0 }, refusedBorrows{ 0 };   // forced
+    std::atomic<int> borrows{ 0 }, backedOff{ 0 }, rebuilds{ 0 }, deferred{ 0 };                    // free
+    std::atomic<int> presentsDone{ 0 };
+    std::barrier frameStart(kBorrowers + 1);
+    std::binary_semaphore held{ 0 }, probed{ 0 }, claimed{ 0 }, tried{ 0 };
+
+    auto check = [&](uint32_t gen) {                    // inside a borrow
+        if (entry.torn.load() || entry.gen.load() != gen) violations++;
+    };
+    auto present = [&]() {                              // a present's worth of use of a borrowed entry
+        inside.fetch_add(1);
+        const uint32_t gen = entry.gen.load();
+        for (int r = 0; r < kUse; r++) check(gen);
+        inside.fetch_sub(1);
+    };
+    auto tear = [&]() {                                 // under a claim: the swap releases the old resources ...
+        if (inside.load() != 0) violations++;
+        entry.torn.store(true);
+    };
+    auto finish = [&]() {                               // ... and the entry holds new ones
+        for (int r = 0; r < kUse; r++)
+            if (inside.load() != 0) violations++;
+        entry.gen.fetch_add(1);
+        entry.torn.store(false);
+        if (inside.load() != 0) violations++;
+    };
+
     std::vector<std::thread> borrowers;
-    for (int k = 0; k < 4; k++) {
-        borrowers.emplace_back([&]() {
-            while (!stop.load()) {
-                if (!gate.TryBorrow()) { backedOff++; std::this_thread::yield(); continue; }
-                Entry* e = current.load();
-                for (int r = 0; r < 50; r++) {                     // a present's worth of use
-                    if (e->alive.load() != 1) violations++;
-                    std::this_thread::yield();
+    for (int k = 0; k < kBorrowers; k++) {
+        borrowers.emplace_back([&, k]() {
+            for (int f = 0; f < kFrames; f++) {
+                frameStart.arrive_and_wait();
+                const bool forced = f % kBorrowers == k;   // this frame's forced borrower
+                if (forced) {
+                    // Nothing claims before `held` (the rebuilder waits for it): the borrow is granted, and held
+                    // across the rebuilder's claim.
+                    if (gate.TryBorrow()) {
+                        heldBorrows++;
+                        inside.fetch_add(1);
+                        const uint32_t gen = entry.gen.load();
+                        check(gen);
+                        held.release();
+                        probed.acquire();
+                        for (int r = 0; r < kUse; r++) check(gen);
+                        inside.fetch_sub(1);
+                        gate.Return();
+                    } else {
+                        held.release();
+                        probed.acquire();
+                    }
                 }
-                gate.Return();
-                borrows++;
+                for (int p = 0; p < kPresents; p++) {
+                    if (!gate.TryBorrow()) { backedOff++; continue; }   // the present runs without the layer
+                    present();
+                    gate.Return();
+                    borrows++;
+                }
+                presentsDone.fetch_add(1);
+                presentsDone.notify_all();
+                if (forced) {
+                    claimed.acquire();                     // a claim is held, the entry torn
+                    if (!gate.TryBorrow()) refusedBorrows++;
+                    else { present(); gate.Return(); }     // (a broken gate: the use sees the torn entry)
+                    tried.release();
+                }
             }
         });
     }
     std::thread rebuilder([&]() {
-        size_t next = 1;
-        while (!stop.load() && next < pool.size()) {
-            if (!gate.TryBeginRebuild()) { deferred++; std::this_thread::yield(); continue; }   // borrowed: later
-            Entry* old = current.load();
-            old->alive.store(0);                                    // the swap releases the old resources ...
-            current.store(&pool[next++]);                           // ... and the entry holds new ones
-            gate.EndRebuild();
-            rebuilds++;
+        for (int f = 0; f < kFrames; f++) {
+            frameStart.arrive_and_wait();
+            held.acquire();
+            if (!gate.TryBeginRebuild()) {
+                refusedClaims++;
+                if (gate.rebuilding.load()) traces++;
+            } else {                                       // (a broken gate: rebuilt under the borrower)
+                tear(); finish(); gate.EndRebuild();
+            }
+            probed.release();
+            const int allPresents = (f + 1) * kBorrowers;
+            for (int a = 0; a < kFreeClaims && presentsDone.load() < allPresents; a++) {
+                if (gate.TryBeginRebuild()) { tear(); finish(); gate.EndRebuild(); rebuilds++; }
+                else deferred++;                                         // borrowed: a later present
+                for (int s = 0; s < kUse; s++) (void)entry.gen.load();   // spread the claims over the presents
+            }
+            for (int d; (d = presentsDone.load()) < allPresents;) presentsDone.wait(d);
+            // Every present of this frame has returned its borrow (and nothing borrows until the next frame starts):
+            // nothing can refuse this claim.
+            const bool landed = gate.TryBeginRebuild();
+            if (landed) { landedClaims++; tear(); }
+            claimed.release();
+            tried.acquire();
+            if (gate.Borrowed()) traces++;
+            if (landed) { finish(); gate.EndRebuild(); }
         }
     });
-    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(800);
-    while (std::chrono::steady_clock::now() < until && (rebuilds.load() < 200 || borrows.load() < 200))
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    stop = true;
     for (auto& t : borrowers) t.join();
     rebuilder.join();
+
     CHECK(violations.load() == 0);
-    CHECK(borrows.load() > 0);
-    CHECK(rebuilds.load() > 0);
-    MESSAGE("borrows " << borrows.load() << " (backed off " << backedOff.load() << "), rebuilds " << rebuilds.load()
-                       << " (deferred " << deferred.load() << ")");
+    CHECK(traces.load() == 0);
+    CHECK(heldBorrows.load() == kFrames);
+    CHECK(refusedClaims.load() == kFrames);
+    CHECK(landedClaims.load() == kFrames);
+    CHECK(refusedBorrows.load() == kFrames);
+    CHECK(borrows.load() + backedOff.load() == kFrames * kBorrowers * kPresents);
+    CHECK(entry.gen.load() == (uint32_t)(landedClaims.load() + rebuilds.load()));   // no claim landed elsewhere
+    CHECK_FALSE(gate.Borrowed());
+    CHECK_FALSE(gate.rebuilding.load());
+    MESSAGE("free race: borrows " << borrows.load() << " (backed off " << backedOff.load() << "), rebuilds "
+                                  << rebuilds.load() << " (deferred " << deferred.load() << ")");
 }
 
 TEST_CASE("FALD live: an acknowledgement word the host does not know counts as no answer (bounded, never forever)") {
