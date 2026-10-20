@@ -156,7 +156,6 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
         DrawCubeLogo(dl, ImVec2(lx + logo * 0.5f, cy), logo * 0.5f);
     const float textX = lx + logo + Px(12);
     const float nameW = DrawText(dl, Font::Label, 14.0f, textX, cy, pal::Ink, "DESKTOPLUT");
-    const float tagW = DrawText(dl, Font::Label, kSizeLabel, textX + nameW + Px(12), cy, pal::InkFaint, "PREVIEW");
 
     // Page tabs: the first one's text starts on the main column's edge when the brand leaves room.
     struct PageTab { const char* id; const char* label; Page page; };
@@ -167,7 +166,7 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
         { "##pg_settings", "SETTINGS", Page::Settings },
     };
     constexpr int kTabCount = (int)(sizeof(kTabs) / sizeof(kTabs[0]));
-    const float brandEnd = textX + nameW + Px(12) + tagW + Px(20);
+    const float brandEnd = textX + nameW + Px(20);
     const float columnX = p.x + Px(kSidebarW) + Px(kGutter) - Px(18);   // a tab's text sits 18 DIP in
     float x = Snap(brandEnd > columnX ? brandEnd : columnX);
     const float tabTop = sheet ? p.y + Px(14) : p.y;
