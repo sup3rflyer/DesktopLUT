@@ -16,6 +16,7 @@
 #include "../shared/fald_fade.h"
 #include "../shared/fald_fade_shader.h"
 #include <d3dcompiler.h>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -464,9 +465,12 @@ TEST_CASE("FALD fade: the passes compile with IEEE strictness and contain no flo
 // on, one monitor context per still (= no history) and per sequence (16 content frames in order), each frame's fade-stack
 // fields, base fields, T flags and output dumped to FALD_TEST_FADE_ON/<run>/tNN/ for DLC tests/test_fald_fade_gate2.py.
 // FALD_TEST_FADE_ONLY (optional) = a substring of the run ids to do.
+// FALD_TEST_FADE_FRAMES (optional) = at most this many frames per sequence (the negative control's short runs).
 TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FALD_TEST_FADE_ON)") {
     const std::string cellDir = EnvStr("FALD_TEST_FADE_DIR"), outDir = EnvStr("FALD_TEST_FADE_ON"), only = EnvStr("FALD_TEST_FADE_ONLY");
     if (cellDir.empty() || outDir.empty()) return;
+    const std::string framesEnv = EnvStr("FALD_TEST_FADE_FRAMES");
+    const int seqFrames = framesEnv.empty() ? 16 : (std::max)(1, (std::min)(16, atoi(framesEnv.c_str())));
     CreateDirectoryA(outDir.c_str(), nullptr);
     FadeWarp w;
     REQUIRE(w.ok);
@@ -486,7 +490,7 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
     if (!SDR.empty()) add("still_sdr_n7_lamp", SDR, false, true, { "n7_lamp" }, 3840, 2160);
     for (const char* q : { "s10_sm_seattle__p6n", "s10_ac_firewater__p6", "t_hl0_v16__mv", "t_cutdark__mv" }) {
         std::vector<std::string> fr;
-        for (int t = 0; t < 16; t++) { char b[64]; snprintf(b, sizeof(b), "seq_%s/t%02d", q, t); fr.push_back(b); }
+        for (int t = 0; t < seqFrames; t++) { char b[64]; snprintf(b, sizeof(b), "seq_%s/t%02d", q, t); fr.push_back(b); }
         add(std::string("seq_") + q, C, true, true, fr, 3840, 2160);
     }
     for (const OnSpec& rs : runs) {

@@ -808,6 +808,7 @@ class FadeEmu:
             reach = reach_of(kc, dec, mi.shape)
             post, parts = fade_post(req, img32, fade_t, F, reach)
             out[f"drive{r}"] = np.asarray(d, f32)
+            out[f"bT{r}"], out[f"bE{r}"], out[f"gain{r}"], out[f"boost{r}"] = bT, bE, gB, boost
             out[f"kc{r}"] = kc
             out[f"reach{r}"] = reach
             out[f"keep{r}"] = parts["keep"]
