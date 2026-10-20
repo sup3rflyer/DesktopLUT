@@ -228,6 +228,10 @@ int WarmUp(HookMonitor& hm, HookMonitor::Result& last) {
     return 0;
 }
 
+bool HaveCell(const std::string& cells, const char* name) {
+    return GetFileAttributesA((cells + "/" + name + ".rgba16f").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
 std::string SeqFrame(const std::string& cells, int t) {
     char b[160];
     snprintf(b, sizeof(b), "%s/seq_s10_sm_seattle__p6n/t%02d.rgba16f", cells.c_str(), t);
@@ -276,6 +280,10 @@ TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay'
     struct Still { const char* name; const char* cell; std::wstring panel; bool hdr, star; unsigned w, h; };
     const Still stills[] = {
         { "still_n7_lamp", "n7_lamp", C, true, true, 3840, 2160 },
+        // round 12a's three (F12A_B16), when the cell dir holds them
+        { "still_aces_m18", "aces_m18", HaveCell(cells, "aces_m18") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_aces_m52", "aces_m52", HaveCell(cells, "aces_m52") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_s10_ac_redspot", "s10_ac_redspot", HaveCell(cells, "s10_ac_redspot") ? C : std::wstring(), true, true, 3840, 2160 },
         { "still_x_naninf", "x_naninf", C, true, false, 3840, 2160 },
         { "still_x_odd1366", "x_odd1366", ODD + L"\\odd_panel.bin", true, true, 1366, 768 },
         { "still_sdr_n7_lamp", "n7_lamp", SDR, false, true, 3840, 2160 },

@@ -2,13 +2,14 @@
 GPU-order port (dlc.fald.fadeemu) against the frozen float64 study twin, on the plan's cells, with the tolerances frozen in
 tests/fald_fade_frozen_tolerances.json before any comparison ran.
 
-The twin = the study's own sources (r10/temu.py TEmu + r11/cands11.build of variant B10 for stills, F10_TMTC with its
-TL11State for sequences), imported read-only from the main checkout's results folder and hash-checked against
-FROZEN_hashlog.txt ("FREEZE 2026-10-19"); dlc.fald.gpuemu is the frozen file (content hash checked). It runs on the CPU
-(float64; CUDA hidden): only the reduction order of torch's sums differs from the study's GPU runs. Zone drives and boosts
-are frozen to the twin's own stateless round drives (fadeemu.FrozenDrives = the r10 FixedMaps pattern), so the gate tests
-the per-pixel stack. Sequences also check the twin run against the study's per-frame logs (r11/T/out/motion11/*.json,
-F10_TMTC cutlog).
+The twin = the study's own sources: since FREEZE 2026-10-20 F12A_B16 (r12a/PORT_DELTA.md) r12a/cands12a.build of variant
+F12A_B16 (stills: still=True; sequences: with the F10_TMTC TL11State) on r10/temu.py TEmu and the 2026-10-19 sources,
+imported read-only from the main checkout's results folder and hash-checked against FROZEN_hashlog.txt; dlc.fald.gpuemu is
+the frozen file (content hash checked). It runs on the CPU (float64; CUDA hidden): only the reduction order of torch's sums
+differs from the study's GPU runs. Zone drives and boosts are frozen to the twin's own stateless round drives
+(fadeemu.FrozenDrives = the r10 FixedMaps pattern), so the gate tests the per-pixel stack. Sequences also check the twin run
+against the study's per-frame logs (r12a/out/motion12a/*.json, F12A_B16 cutlog). The tolerances: the 2026-10-20 file's
+numbers, re-frozen unchanged for this port in tests/fald_fade_frozen_tolerances_f12a.json (both hashes checked).
 
 Opt-in (minutes per 4K frame):
     $env:FALD_FADE_GATE_CELLS = "H:/scratch/DesktopLUT/fald_asf10_port/cells"   # tests/fald_fade_cells.py stills + seqs
@@ -37,7 +38,10 @@ PANEL = Path(os.environ.get("FALD_FADE_PANEL",
                             "H:/Projects/DesktopLUT/DLC/results/fald_candidate_2026-10-09/candidate_C_fade3_only.bin"))
 TOL_FILE = HERE / "fald_fade_frozen_tolerances.json"
 TOL_SHA_LF = "9267ba793571f4f1da0eb35986f7ca7ac11a423ee02817c9365bbcc051f1fb25"
-FROZEN = {                                   # FROZEN_hashlog.txt, "FREEZE 2026-10-19"
+TOL_F12A_FILE = HERE / "fald_fade_frozen_tolerances_f12a.json"   # the F12A_B16 port's freeze (the same numbers)
+TOL_F12A_SHA_LF = "15dc5ff7e070096c20d3f855147a4ab62236857fe2968d417a33b9d8c1693f1f"
+FROZEN = {                                   # FROZEN_hashlog.txt, "FREEZE 2026-10-19" + "FREEZE 2026-10-20 F12A_B16"
+    "r12a/cands12a.py": "08eb919a0574a69c5ab05ca2a486a3c5d2844aea2bab7c97bef718abb106df61",
     "r9/cands9.py": "cd6097afe3ffe6848b4375d1b43a580dc27e93f8cb547e610c867a6602e0ba9c",
     "r10/cands10.py": "b738f3b9871568eacb0efdf61b6c7c695308fed21bf08977b7f5bab3279ffbda",
     "r10/temu.py": "7e43465df74b076f2054b3177c9b8e9a793533c86033ca6d91906b5e70c7fa04",
@@ -52,7 +56,8 @@ GPUEMU_SHA_LF = "906ba21638e90d354ddd4c33712df48b94b99060387f1790fd7ec8a782c2b0b
 GPUEMU_FRACTIONAL_GUARD_SHA_LF = "d79bd33b9e9171af84f18c94c75ea1cf10e4559c9048206288d6741c3a6f5ee1"
 PANEL_SHA = "f6e51a6a86fe1c0dc39ea3391176dec35c64f68bb4ad780421810d41926ef25c"
 STILLS = ("p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0",
-          "s10_sm_seattle", "s10_ac_firewater")
+          "s10_sm_seattle", "s10_ac_firewater",
+          "aces_m18", "aces_m52", "s10_ac_redspot")    # + round 12a's three (r12a/PORT_DELTA.md §4)
 SEQS = ("s10_sm_seattle__p6n", "s10_ac_firewater__p6", "t_hl0_v16__mv", "t_cutdark__mv")
 STUDY_LOG = {"s10_sm_seattle__p6n": "s10_sm_seattle__p6n", "s10_ac_firewater__p6": "s10_ac_firewater__p6",
              "t_hl0_v16__mv": "t_hl0_v16__mv", "t_cutdark__mv": "t_cutdark__mv"}
@@ -84,6 +89,7 @@ def env():
     except Exception:
         pass
     assert _sha(TOL_FILE, lf=True) == TOL_SHA_LF, "the frozen tolerance file changed"
+    assert _sha(TOL_F12A_FILE, lf=True) == TOL_F12A_SHA_LF, "the F12A_B16 tolerance freeze changed"
     for rel, sha in FROZEN.items():
         assert _sha(STUDY / rel) == sha, f"frozen twin source changed: {rel}"
     # gpuemu.py = the frozen file, or the frozen file + exactly the fractional-pitch refusal (merged 2026-10-20 from
@@ -102,7 +108,7 @@ def env():
     from dlc.fald import fadeemu as FE                         # this checkout's dlc first (its gpuemu = the frozen file)
     from dlc.fald.gpuemu import Emu
     from dlc.fald.panelfile import read_panel_file
-    for p in (STUDY / "r11" / "T", STUDY / "r11", STUDY / "r10", STUDY / "r9", STUDY):
+    for p in (STUDY / "r12a", STUDY / "r11" / "T", STUDY / "r11", STUDY / "r10", STUDY / "r9", STUDY):
         if str(p) not in sys.path:
             sys.path.insert(1, str(p))
     import temu as TM
@@ -110,6 +116,7 @@ def env():
     TM.sync = lambda: None
     import cands10 as K10
     import cands11 as K11
+    import cands12a as K12   # F12A_B16 (it calls cands10.knee_reach through the module: the capture below sees it)
     import tl11 as TL
     from nlib import C
     cap = {"reach": []}
@@ -120,7 +127,7 @@ def env():
         cap["reach"].append(TM.npy(r))
         return r
     K10.knee_reach = rec
-    _ENV.update(FE=FE, Emu=Emu, read_panel_file=read_panel_file, TM=TM, K11=K11, TL=TL, C=C, torch=torch, cap=cap,
+    _ENV.update(FE=FE, Emu=Emu, read_panel_file=read_panel_file, TM=TM, K11=K11, K12=K12, TL=TL, C=C, torch=torch, cap=cap,
                 tol=json.loads(TOL_FILE.read_text(encoding="utf-8")), o=read_panel_file(PANEL))
     return _ENV
 
@@ -190,9 +197,9 @@ def save(name: str, rep: dict) -> None:
 @pytest.mark.parametrize("cell", STILLS)
 def test_gate1_still(cell):
     E = env()
-    FE, K11 = E["FE"], E["K11"]
+    FE, K12 = E["FE"], E["K12"]
     f16 = load16(Path(CELLS) / f"{cell}.rgba16f")
-    te, _post = K11.build(E["o"], K11.spec_of("B10"), still=True)   # the frozen variant on a still (TL dropped)
+    te, _post, _tl = K12.build(E["o"], "F12A_B16", still=True)   # the frozen variant on a still (TL dropped)
     t0 = time.time()
     tw = twin_frame(E, te, f16)
     t1 = time.time()
@@ -217,7 +224,8 @@ def test_gate1_naninf_fade():
     mi = nits.max(axis=-1)                                      # (no NaN left: fmax dropped it; +inf kept)
     import cands9 as K9
     P = {**K9.DEF, "intr": False}
-    f64 = TM.npy(TM.fade9_t(TM.T(mi), P))
+    K12 = E["K12"]
+    f64 = TM.npy(K12.fade12(TM.T(mi), K12.P9(), K12.VARIANTS["F12A_B16"]["X"]))   # F12A_B16 (fade9_t + A)
     f32_ = FE.fade9(mi.astype(np.float32))
     d = float(np.max(np.abs(f32_.astype(np.float64) - f64)))
     tol = E["tol"]["gate1_f32_vs_f64"]["fields_abs"]["tolerance"]
@@ -240,8 +248,9 @@ def test_gate1_odd_fade_informative():
     f16 = load16(Path(CELLS) / "x_odd1366.rgba16f", 1366, 768)
     mi = (np.fmax(f16.astype(np.float64) @ BT709_TO_BT2020.T, 0.0) * 80.0).max(axis=-1)
     P = {**K9.DEF, "intr": False}
-    d_fade = float(np.max(np.abs(FE.fade9(mi.astype(np.float32)).astype(np.float64) - TM.npy(TM.fade9_t(TM.T(mi), P)))))
-    F64 = TM.npy(K10.floor_lit(TM.T(mi), K10.OF_DEF))
+    K12, X = E["K12"], E["K12"].VARIANTS["F12A_B16"]["X"]
+    d_fade = float(np.max(np.abs(FE.fade9(mi.astype(np.float32)).astype(np.float64) - TM.npy(K12.fade12(TM.T(mi), K12.P9(), X)))))
+    F64 = TM.npy(K12.floor_lit12(TM.T(mi), K12.PO10(), X))                     # B16
     d_F = float(np.max(np.abs(FE.floor_lit(mi.astype(np.float32)) / F64 - 1.0)))
     kc = np.clip(mi / max(float(mi.max()), 1e-9), 0, 1)
     r64 = TM.npy(K10.knee_reach(TM.T(kc), 96.0, TM.T(mi), 2.0))
@@ -258,11 +267,11 @@ def test_gate1_odd_fade_informative():
 @pytest.mark.parametrize("seq", SEQS)
 def test_gate1_sequence(seq):
     E = env()
-    FE, K11, TL, TM = E["FE"], E["K11"], E["TL"], E["TM"]
+    FE, K12, TL, TM = E["FE"], E["K12"], E["TL"], E["TM"]
     d = Path(CELLS) / f"seq_{seq}"
     spec = TL.spec_of("F10_TMTC")
     tl = TL.tl_state(spec)
-    te, _post = K11.build(E["o"], spec, tl_state=tl, still=False)
+    te, _post, _tl = K12.build(E["o"], "F12A_B16", tl_state=tl, still=False)
     ts = FE.TState()
     fe = FE.FadeEmu(E["Emu"](E["o"]))
     tol = E["tol"]["gate1_f32_vs_f64"]
@@ -293,8 +302,8 @@ def test_gate1_sequence(seq):
         ok = ok and rep["pass"]
         frames.append(rep)
         print(json.dumps(rep), flush=True)
-    # the twin run here must be the study's: its per-frame log (F10_TMTC) reproduced
-    study = json.loads((STUDY / "r11" / "T" / "out" / "motion11" / f"{STUDY_LOG[seq]}.json").read_text())["F10_TMTC"]["cutlog"]
+    # the twin run here must be the study's: its per-frame log (F12A_B16, round 12a) reproduced
+    study = json.loads((STUDY / "r12a" / "out" / "motion12a" / f"{STUDY_LOG[seq]}.json").read_text())["F12A_B16"]["cutlog"]
     log_ok = len(study) == len(tl.log)
     worst = 0.0
     for a, s in zip(tl.log, study):

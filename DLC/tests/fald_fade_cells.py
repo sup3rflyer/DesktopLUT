@@ -6,6 +6,7 @@ receives (RGBA half, alpha 1, the fald_frame.rgba16f layout) plus a cells.txt in
     python tests/fald_fade_cells.py stills [<dir>]    # CPU only: the still cells, the NaN / Inf cell, the odd-size cell + its panel
     python tests/fald_fade_cells.py seqs [<dir>]      # the four motion sequences (CUDA: the study's grain is drawn by a
                                                       # CUDA generator, so the frames equal the study's frame for frame)
+    python tests/fald_fade_cells.py f12a [<dir>]      # CPU only: round 12a's three stills (F12A_B16, r12a/PORT_DELTA.md §4)
 
 <dir> defaults to H:/scratch/DesktopLUT/fald_asf10_port/cells. Inputs (read only): the study's cached frames under
 H:/scratch/fald_nearfield_r10|r11 and the frozen study sources under the main checkout's DLC/results (the frozen twin)."""
@@ -35,6 +36,11 @@ STILLS = ("p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k
 # PORT_PLAN §5.2 sequence cells: (study sequence, test) of r11/T/motion11.py, 16 content frames each
 SEQS = (("s10_sm_seattle", "p6n"), ("s10_ac_firewater", "p6"), ("t_hl0_v16", "mv"), ("t_cutdark", "mv"))
 ODD_W, ODD_H = 1366, 768
+# round 12a (F12A_B16, r12a/PORT_DELTA.md §4): the owner's ACES markers 18 / 52 (A's and B16's target frames) and A's largest
+# effect (a caption 50-100 px above the bottom border). NOT listed in cells.txt: cells.txt is the OFF gate's cell set, frozen
+# with its manifest (tests/fixtures/fald_fade_off_main.hashes, recorded on main 6273464)
+F12A_STILLS = ("aces_m18", "aces_m52", "s10_ac_redspot")
+ACES = Path("H:/scratch/DesktopLUT/fald_fade_lines")   # m18 / m52_tm16.npy (results/fald_fade_lines_2026-10-20/make_inputs.py)
 ODD_LATTICE = (17, 9)                  # 80 x 85 px zones = 1360 x 765 px: 6 columns + 3 rows outside the lattice
 ODD_SRC = ("n9_cactus", 700, 1200)     # the odd cell = this still cropped at (y0, x0)
 
@@ -109,6 +115,19 @@ def stills(root: Path) -> None:
     print(f"{len(index)} still cells -> {root}")
 
 
+def f12a_still(name: str) -> np.ndarray:
+    if name.startswith("aces_m"):
+        return np.load(ACES / f"m{name[6:8]}_tm16.npy")       # r12a/run12a.py pair_input
+    return cached_still(name)
+
+
+def f12a(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name in F12A_STILLS:
+        rgba16(f12a_still(name)).tofile(root / f"{name}.rgba16f")
+        print(f"{name} -> {root}")
+
+
 def seqs(root: Path) -> None:
     """The four sequences through r11/T/motion11.py's own frame builders and FP16 encode (motion11.to16), so frame t here
     is the frame the study's TEmu.run saw at t (grain from the same CUDA generator seeds)."""
@@ -141,4 +160,4 @@ def seqs(root: Path) -> None:
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else "stills"
     root = Path(sys.argv[2]) if len(sys.argv) > 2 else OUT
-    {"stills": stills, "seqs": seqs}[what](root)
+    {"stills": stills, "seqs": seqs, "f12a": f12a}[what](root)
