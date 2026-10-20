@@ -12,6 +12,7 @@
 
 #include "dlc/dlc_data.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -20,6 +21,9 @@ namespace dlc {
 // One scan of the DLC folder (immutable once published).
 struct Data {
     std::wstring folder;                    // empty: no DLC folder configured or found
+    std::wstring configured;                // the configured folder the scan was asked for ("" = found automatically)
+    bool detected = false;                  // the folder was found (dlc::FolderCandidates), not configured
+    uint64_t request = 0;                   // the dlc::RequestScan this scan answered (0: none)
     bool profileFound = false;
     Profile profile;
     std::vector<StackRecord> stacks;

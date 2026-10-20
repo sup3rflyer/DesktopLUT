@@ -94,7 +94,10 @@ void SetVrrWhitelistEnabled(bool on);
 // The whitelists, as a list of process names (any separator; normalised to "a.exe, b.exe"). Applied and saved.
 void SetGammaWhitelist(const std::wstring& raw);
 void SetVrrWhitelist(const std::wstring& raw);
-void SetDlcFolder(const std::wstring& folder);   // empty = detect next to DesktopLUT
+// The DLC folder ([UI] DlcFolder, authoritative). Empty = found automatically (dlc::FolderCandidates); clearing it
+// also forgets the folder last found ([UI] DlcFolderLast), so CLEAR goes back to what is next to DesktopLUT.
+void SetDlcFolder(const std::wstring& folder);
+void SetDlcFolderLastUsed(const std::wstring& folder);   // a scan found DLC here (no folder configured)
 void SetUiTheme(int theme);                     // 0 dark, 1 gray, 2 light (the interface applies it)
 void SetUiDlcCharts(const std::wstring& encoded);   // the DLC tab's chart picks and options ([UI] DlcCharts)
 void SetRecalReminderDays(int days);             // 0 = off

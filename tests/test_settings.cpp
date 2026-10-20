@@ -1093,6 +1093,18 @@ TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, roun
     SaveSettings();                                     // empty folder: the key goes
     GetPrivateProfileStringW(L"UI", L"DlcFolder", L"<absent>", buf, MAX_PATH, ini);
     CHECK(std::wstring(buf) == L"<absent>");
+    // The folder auto-detect last found DLC in: absent = none, round-trips, empty = the key goes.
+    CHECK(g_dlcFolderLast.empty());
+    g_dlcFolderLast = L"E:\\Tools\\DLC";
+    SaveSettings();
+    g_dlcFolderLast.clear();
+    LoadSettings();
+    CHECK(g_dlcFolderLast == L"E:\\Tools\\DLC");
+    CHECK(g_dlcFolder.empty());                         // the setting stays unset: only what was found is remembered
+    g_dlcFolderLast.clear();
+    SaveSettings();
+    GetPrivateProfileStringW(L"UI", L"DlcFolderLast", L"<absent>", buf, MAX_PATH, ini);
+    CHECK(std::wstring(buf) == L"<absent>");
     WritePrivateProfileStringW(L"UI", L"Interface", L"CLASSIC", ini);
     g_uiClassic = false;
     LoadSettings();

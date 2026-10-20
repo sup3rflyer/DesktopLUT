@@ -1480,7 +1480,9 @@ void SettingsCalibration(const Snapshot& snap) {
     EndRow(row);
 
     row = BeginRow("DLC FOLDER");
-    RowTip(row, "Where DLC keeps its profile, runs and results.\nEmpty: found next to DesktopLUT when it is there.");
+    RowTip(row, "Where DLC keeps its profile, runs and results.\n"
+                "Not set: a DLC folder next to DesktopLUT or one or two folders up, else where it was last found.\n"
+                "CLEAR goes back to that and forgets the last one.");
     const int b = RowButtons(row, "set_dlc", { "BROWSE", "CLEAR" });
     if (b == 0) {
         Post([]() {
@@ -1495,10 +1497,14 @@ void SettingsCalibration(const Snapshot& snap) {
             RequestDlcScan();
         });
     }
+    // What the last scan read; a set folder the scan for it did not find shows as set, in amber (the setting stays
+    // authoritative).
     const std::wstring& folder = snap.dlc->folder;
-    std::string shown = folder.empty() ? std::string("\xE2\x80\x94") : Utf8(folder);
+    const bool missing = folder.empty() && !g_dlcFolder.empty() && snap.dlc->configured == g_dlcFolder;
+    std::string shown = !folder.empty() ? Utf8(folder) : missing ? Utf8(g_dlcFolder) : std::string("\xE2\x80\x94");
     if (g_dlcFolder.empty() && !folder.empty()) shown = "AUTO  " + shown;
-    RowText(row, shown, folder.empty() ? pal::InkFaint : pal::Ink, Font::Mono, kSizeMono, folder);
+    RowText(row, shown, missing ? pal::Alarm : folder.empty() ? pal::InkFaint : pal::Ink, Font::Mono, kSizeMono,
+            missing ? L"Not found: " + g_dlcFolder : folder);
     EndRow(row);
 
     row = BeginRow("REMINDER");

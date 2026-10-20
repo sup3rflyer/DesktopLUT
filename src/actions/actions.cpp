@@ -688,6 +688,13 @@ void SetConsoleLog(bool on) {
 
 void SetDlcFolder(const std::wstring& folder) {
     g_dlcFolder = folder;
+    if (folder.empty()) g_dlcFolderLast.clear();
+    SaveSettings();
+}
+
+void SetDlcFolderLastUsed(const std::wstring& folder) {
+    if (g_dlcFolderLast == folder) return;
+    g_dlcFolderLast = folder;
     SaveSettings();
 }
 

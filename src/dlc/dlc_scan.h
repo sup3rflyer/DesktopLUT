@@ -15,10 +15,18 @@
 
 namespace dlc {
 
-// A folder holding DLC's files (calibration_profile.yaml or stack_registry.json).
+// A folder holding DLC's files: its profile (calibration_profile.yaml) or stack registry (stack_registry.json), or (a
+// DLC not set up yet) its sources beside the example profile (src\dlc, calibration_profile.example.yaml).
 bool LooksLikeDlcFolder(const std::wstring& dir);
-// The folder to read: the configured one, else <exeDir>\..\..\DLC when it holds DLC's files; "" none.
-std::wstring ResolveFolder(const std::wstring& configured, const std::wstring& exeDir);
+// Where an unconfigured DesktopLUT looks for DLC, best first: next to the exe (<exe>\DLC, or the exe's own folder),
+// beside the exe's folder (<exe>\..\DLC), a source checkout's layout (<exe>\..\..\DLC: bin\Release), then `lastUsed`
+// (the folder a scan last found it in). Full paths, no duplicates; no file is touched.
+std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std::wstring& lastUsed);
+// The folder to read: the configured one (authoritative: as it is, even when it does not exist), else the first
+// candidate that holds DLC's files; "" none. `detected` (optional): true when it came from the candidates. Touches the
+// file system (the scan worker calls it, never the GUI thread).
+std::wstring ResolveFolder(const std::wstring& configured, const std::vector<std::wstring>& candidates,
+                           bool* detected = nullptr);
 // The newest verification_iterNN_patch_metrics.json of a run ("" none).
 std::wstring PatchMetricsPath(const std::wstring& runDir);
 
@@ -37,7 +45,9 @@ std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, c
 
 // ---- the worker ------------------------------------------------------------------------------------
 void SetScanListener(std::function<void()> onChange);   // called on the worker after each publish / load
-void RequestScan(const std::wstring& folder);            // any thread; coalesced; starts the worker
+// Any thread; coalesced; starts the worker. The worker resolves the folder (ResolveFolder) and scans it. Returns the
+// request's number: Data::request of the scan that answers it.
+uint64_t RequestScan(const std::wstring& configured, const std::vector<std::wstring>& candidates);
 void StopScanner();                                       // GUI thread, at shutdown
 std::shared_ptr<const Data> Current();                    // any thread; never null
 // Patch metrics of a run: the cached list, or null while it loads (the listener fires when it is in).
