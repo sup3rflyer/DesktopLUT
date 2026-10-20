@@ -114,7 +114,8 @@ bool HookRequestFullRecompose();
 
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
 // the next run. star: starfield balancing. tuning = null: its defaults (older host). fade: the frozen fade stack
-// (faldFlags bit 8; shared/fald_fade.h) — its passes are compiled the first time any monitor turns it on.
+// (faldFlags bit 8; shared/fald_fade.h) — its passes (shipped bytecode) and resources are created over the first presents
+// any monitor wants it (paced, fald_fade.h); the layer runs without the fade until they exist.
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
                          const DwmHookFaldTuning* tuning, bool fade = false);
 
@@ -141,3 +142,14 @@ double FaldLastRunMicros(const FaldMonitor* m);
 void FaldPollDumpRequest();
 
 void FaldReleaseAll();
+
+#ifdef DLUT_HOOK_TESTING
+// Test seams (tests/test_fald_hook.cpp; the test exe only, never the DLL): a live panel delivery without its named
+// section (true = ingested: the entry swaps at its next FaldAcquire), and read access to an entry's fade state.
+struct FaldFade;
+struct ID3D11Buffer;
+bool FaldTestDeliver(int left, int top, bool isHdr, unsigned int gen, const void* payload, size_t bytes);
+FaldFade* FaldTestFade(FaldMonitor* m);
+bool FaldTestFadeOn(const FaldMonitor* m);
+ID3D11Buffer* FaldTestCB(FaldMonitor* m);
+#endif

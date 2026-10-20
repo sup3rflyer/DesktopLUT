@@ -21,7 +21,11 @@ inline const char* GetLogFilePath()
 	static char path[MAX_PATH] = {0};
 	if (path[0] == '\0')
 	{
+#ifdef DLUT_HOOK_TESTING   // the hook's sources compiled into the test exe: never the real hook's log
+		ExpandEnvironmentStringsA("%TEMP%\\DesktopLUT_dwmhook_test.log", path, sizeof(path));
+#else
 		ExpandEnvironmentStringsA("%SYSTEMROOT%\\Temp\\DesktopLUT_dwmhook.log", path, sizeof(path));
+#endif
 	}
 	return path;
 }

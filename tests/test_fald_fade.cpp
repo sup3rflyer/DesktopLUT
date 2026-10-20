@@ -305,16 +305,6 @@ TEST_CASE("FALD fade OFF: every field and the output hash as on main (WARP; FALD
 // ---------------------------------------------------------------------------------------------------------------------
 namespace {
 
-struct FadeKernelSrc { const char* name; const char* src; bool warp; };
-const FadeKernelSrc kFadeKernels[] = {
-    { "gauss", g_faldFadeGaussSource, false }, { "ext", g_faldFadeExtSource, false }, { "grad", g_faldFadeGradSource, false },
-    { "down", g_faldFadeDownSource, false }, { "up", g_faldFadeUpSource, false }, { "pix", g_faldFadePixSource, false },
-    { "knee", g_faldFadeKneeSource, false }, { "advance", g_faldFadeAdvanceSource, false },
-    { "meanwin", g_faldFadeMeanWinSource, false }, { "dft", g_faldFadeDftSource, false }, { "cross", g_faldFadeCrossSource, false },
-    { "norm", g_faldFadeNormSource, false }, { "maxmag", g_faldFadeMaxMagSource, false }, { "argmax", g_faldFadeArgmaxSource, false },
-    { "overlap", g_faldFadeOverlapSource, true }, { "cut", g_faldFadeCutSource, true }, { "warpq", g_faldFadeWarpQSource, true },
-    { "tm", g_faldFadeTmSource, true }, { "select", g_faldFadeSelectSource, false } };
-
 // DXBC disassembly lines whose instruction is a float mad (indentation varies with nesting; imad / umad are integer)
 size_t CountFloatMads(const std::string& text) {
     size_t n = 0, a = 0;
@@ -364,6 +354,8 @@ struct OnSpec {
     bool fade = true;                  // false = the layer without the fade (base fields + output only: a diagnostic)
 };
 
+int g_lastFadeWarmupRuns = 0;   // RunOn: runs of the first frame before the paced fade was on
+
 bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, const OnSpec& rs, std::string& err, double& secs) {
     MonitorContext ctx;
     ctx.width = rs.w; ctx.height = rs.h;
@@ -382,6 +374,25 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
         err = "target"; if (target) target->Release(); FaldReleaseResources(&ctx); return false;
     }
     std::vector<uint16_t> frame;
+    if (rs.fade) {
+        // The fade's creation is paced (shaders + resources over several runs, the layer without the fade meanwhile —
+        // fald_fade.h): run the first frame until the fade is on, then reset its T state, so the gate's frame 0 is a still
+        // exactly as it was before the pacing existed.
+        if (!ReadFrame(cellDir + "/" + rs.frames[0] + ".rgba16f", rs.w, rs.h, frame)) err = "frame " + rs.frames[0];
+        int runs = 0;
+        for (; err.empty() && runs < 400 && !ctx.fald->fadeOn; runs++) {
+            D3D11_VIEWPORT vp = { 0, 0, (float)rs.w, (float)rs.h, 0, 1 };
+            w.ic->RSSetViewports(1, &vp);
+            w.ic->VSSetShader(w.vs, nullptr, 0);
+            w.ic->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            w.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)rs.w * 8u, 0);
+            FaldRunPasses(&ctx, rtv, true);
+            w.ic->Flush();
+        }
+        if (err.empty() && !ctx.fald->fadeOn) err = "the fade did not turn on within 400 runs";
+        if (err.empty()) FaldFadeReset(ctx.fald->fade);
+        g_lastFadeWarmupRuns = runs;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < rs.frames.size() && err.empty(); i++) {
         if (!ReadFrame(cellDir + "/" + rs.frames[i] + ".rgba16f", rs.w, rs.h, frame)) { err = "frame " + rs.frames[i]; break; }
@@ -432,26 +443,71 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
 
 // The fade passes compile under IEEE strictness and their float arithmetic is never fused: DLC dlc/fald/fadeemu.py
 // emulates the operation order, which a `mad` would break (D3D lets a device run it fused or not).
-TEST_CASE("FALD fade: the passes compile with IEEE strictness and contain no float mad") {
-    const std::string common = std::string(g_faldCommonSource) + g_faldFadeCommonSource;
+// The passes ship as bytecode (shared/fald_fade_bytecode.h): it must be exactly what D3DCompile makes of the current sources
+// (cs_5_0 + D3DCOMPILE_IEEE_STRICTNESS, fald_fade.cpp FaldFadeCompileKernel) — a source edit without a regenerated header
+// fails here. FALD_TEST_FADE_WRITE_BYTECODE=<path of shared/fald_fade_bytecode.h> (re)writes it instead (then rebuild).
+// What ships contains no float mad: D3D lets a device run a mad fused or not, and fadeemu emulates the unfused order.
+TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, with no float mad") {
+    const unsigned int n = FaldFadeKernelCount();
+    REQUIRE(n == 19u);
+    std::vector<std::vector<unsigned char>> fresh(n);
     const auto t0 = std::chrono::steady_clock::now();
-    for (const auto& k : kFadeKernels) {
-        std::string src = common;
-        if (k.warp) src += g_faldFadeWarpFnSource;
-        src += k.src;
-        ID3DBlob* blob = nullptr; ID3DBlob* msg = nullptr;
-        const HRESULT hr = D3DCompile(src.c_str(), src.size(), k.name, nullptr, nullptr, "main", "cs_5_0", D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &msg);
-        CHECK_MESSAGE(SUCCEEDED(hr), k.name << ": " << (msg ? (const char*)msg->GetBufferPointer() : ""));
-        if (msg) msg->Release();
-        if (FAILED(hr)) continue;
-        ID3DBlob* dis = nullptr;
-        REQUIRE(SUCCEEDED(D3DDisassemble(blob->GetBufferPointer(), blob->GetBufferSize(), 0, nullptr, &dis)));
-        const std::string text((const char*)dis->GetBufferPointer(), dis->GetBufferSize());
-        const size_t mads = CountFloatMads(text);
-        CHECK_MESSAGE(mads == 0u, k.name << ": " << mads << " float mad instruction(s)");
-        dis->Release(); blob->Release();
+    for (unsigned int k = 0; k < n; k++) {
+        std::string err;
+        CHECK_MESSAGE(FaldFadeCompileKernel(k, fresh[k], &err), FaldFadeKernelName(k) << ": " << err);
+        CHECK(fresh[k].size() % 4u == 0u);   // DXBC is a sequence of 4-byte words
     }
     MESSAGE("fade passes compiled in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s");
+    const std::string writePath = EnvStr("FALD_TEST_FADE_WRITE_BYTECODE");
+    if (!writePath.empty()) {
+        std::ostringstream h;
+        size_t total = 0;
+        h << "// DesktopLUT - shared/fald_fade_bytecode.h — GENERATED, do not edit.\n"
+             "// The fade passes (shared/fald_fade.h) as D3DCompile builds them from fald_shader.h's common source +\n"
+             "// fald_fade_shader.h: cs_5_0, entry \"main\", D3DCOMPILE_IEEE_STRICTNESS (fald_fade.cpp FaldFadeCompileKernel).\n"
+             "// Written by tests/test_fald_fade.cpp with FALD_TEST_FADE_WRITE_BYTECODE=<this file>; the same test fails while\n"
+             "// this file is not a fresh compile of the current sources. Shipping bytecode keeps the shader compiler out of the\n"
+             "// hook's present and the overlay's render thread.\n"
+             "#pragma once\n#include <stddef.h>\n#include <stdint.h>\n\n"
+             "struct FaldFadeBytecodeEntry { const uint32_t* words; size_t bytes; };\n\n";
+        for (unsigned int k = 0; k < n; k++) {
+            const std::vector<unsigned char>& b = fresh[k];
+            REQUIRE(b.size() % 4u == 0u);
+            total += b.size();
+            h << "static const uint32_t kFaldFadeBc" << k << "[] = {   // " << FaldFadeKernelName(k) << ", " << b.size() << " bytes\n";
+            for (size_t i = 0; i < b.size(); i += 4) {
+                const uint32_t w = (uint32_t)b[i] | ((uint32_t)b[i + 1] << 8) | ((uint32_t)b[i + 2] << 16) | ((uint32_t)b[i + 3] << 24);
+                char word[16];
+                snprintf(word, sizeof(word), "0x%08x,", w);
+                h << ((i / 4) % 8 == 0 ? "    " : " ") << word << ((i / 4) % 8 == 7 || i + 4 >= b.size() ? "\n" : "");
+            }
+            h << "};\n";
+        }
+        h << "\nstatic const unsigned int kFaldFadeBytecodeCount = " << n << ";\n"
+          << "static const FaldFadeBytecodeEntry g_faldFadeBytecode[" << n << "] = {\n";
+        for (unsigned int k = 0; k < n; k++)
+            h << "    { kFaldFadeBc" << k << ", " << fresh[k].size() << " },   // " << FaldFadeKernelName(k) << "\n";
+        h << "};\n";
+        const std::string text = h.str();
+        REQUIRE(WriteBytes(writePath, text.data(), text.size()));
+        MESSAGE("wrote " << writePath << ": " << n << " passes, " << total << " bytes of bytecode");
+        return;
+    }
+    for (unsigned int k = 0; k < n; k++) {
+        const void* bc = nullptr; size_t bytes = 0;
+        const bool have = FaldFadeEmbeddedBytecode(k, &bc, &bytes);
+        CHECK_MESSAGE(have, FaldFadeKernelName(k) << ": no embedded bytecode (FALD_TEST_FADE_WRITE_BYTECODE)");
+        if (!have) continue;
+        const bool same = bytes == fresh[k].size() && std::memcmp(bc, fresh[k].data(), bytes) == 0;
+        CHECK_MESSAGE(same, FaldFadeKernelName(k) << ": shared/fald_fade_bytecode.h is not a fresh compile of the sources "
+                            "(regenerate: FALD_TEST_FADE_WRITE_BYTECODE)");
+        ID3DBlob* dis = nullptr;
+        REQUIRE(SUCCEEDED(D3DDisassemble(bc, bytes, 0, nullptr, &dis)));
+        const std::string text((const char*)dis->GetBufferPointer(), dis->GetBufferSize());
+        const size_t mads = CountFloatMads(text);
+        CHECK_MESSAGE(mads == 0u, FaldFadeKernelName(k) << ": " << mads << " float mad instruction(s)");
+        dis->Release();
+    }
     // the detector itself: the layer's statistic pass (no `precise`, default flags) does fuse — else the check above
     // proves nothing
     const std::string src = std::string(g_faldCommonSource) + g_faldStatSource;
@@ -501,11 +557,23 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
         for (int t = 0; t < seqFrames; t++) { char b[64]; snprintf(b, sizeof(b), "seq_%s/t%02d", q, t); fr.push_back(b); }
         add(std::string("seq_") + q, C, true, true, fr, 3840, 2160);
     }
+    // the references of tests/test_fald_hook.cpp's resets: a FRESH context from a mid-sequence frame (= what the hook must
+    // show after a live panel swap to B07 at frame 8, an idle reset at frame 8, a re-injection at frame 12)
+    const std::wstring B07 = OwnerPanel(L"DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_fald_panel_boost_meanrule_blur0.7.bin");
+    auto seattleFrom = [&](int first) {
+        std::vector<std::string> fr;
+        for (int t = first; t < 16; t++) { char b[64]; snprintf(b, sizeof(b), "seq_s10_sm_seattle__p6n/t%02d", t); fr.push_back(b); }
+        return fr;
+    };
+    if (!B07.empty()) add("ref_seattle_from8_B07", B07, true, true, seattleFrom(8), 3840, 2160);
+    add("ref_seattle_from8_C", C, true, true, seattleFrom(8), 3840, 2160);
+    add("ref_seattle_from12_C", C, true, true, seattleFrom(12), 3840, 2160);
     for (const OnSpec& rs : runs) {
         if (!only.empty() && rs.id.find(only) == std::string::npos) continue;
         std::string err; double secs = 0.0;
         const bool ok = RunOn(w, cellDir, outDir, rs, err, secs);
         CHECK_MESSAGE(ok, rs.id << ": " << err);
-        MESSAGE(rs.id << ": " << rs.frames.size() << " frame(s), " << secs << " s");
+        MESSAGE(rs.id << ": " << rs.frames.size() << " frame(s), " << secs << " s (the fade on after " << g_lastFadeWarmupRuns
+                << " paced run(s) of frame 0)");
     }
 }

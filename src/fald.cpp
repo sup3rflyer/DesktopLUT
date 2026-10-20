@@ -30,9 +30,12 @@ static ID3D11ComputeShader* g_faldStatCombineCS = nullptr;
 static ID3D11ComputeShader* g_faldStarStatCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
-// The fade stack's passes (shared/fald_fade.cpp) are compiled the first time a monitor turns the flank fade on: a session
-// that never uses it pays nothing. A failure is latched (logged once) until the shaders are released (device loss).
-static bool g_faldFadeInitTried = false;
+// The fade stack's passes (shared/fald_fade.cpp) are created from their shipped bytecode the first time a monitor turns the
+// flank fade on — no shader compiler on the render thread, FALD_FADE_SHADERS_PER_RUN per run of the layer — and its
+// resources the same way (FALD_FADE_RESOURCES_PER_RUN / FALD_FADE_BYTES_PER_RUN per run). Until both are complete the
+// layer runs without the fade (today's layer, bit for bit). A session that never uses it pays nothing. A shader failure
+// is latched (logged once) until the shaders are released (device loss).
+static bool g_faldFadeShadersFailed = false;
 
 static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
 // (FALD_RESUME_GAP_MS and the temporal helpers — FaldTemporalAlpha, FaldSettleFrames, the panel clock, the settle
@@ -161,7 +164,7 @@ bool InitFaldShaders() {
 
 void ReleaseFaldShaders() {
     FaldFadeReleaseShaders();
-    g_faldFadeInitTried = false;
+    g_faldFadeShadersFailed = false;
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
     if (g_faldStarStatCombineCS) { g_faldStarStatCombineCS->Release(); g_faldStarStatCombineCS = nullptr; }
@@ -758,27 +761,30 @@ static FaldFadeCommon FadeCommon(FaldResources* r, bool roundFields) {
 // it goes off. A failed creation runs the layer without it and is retried every ~300 runs (as EnsureStar).
 static bool EnsureFade(FaldResources* r) {
     if (!FaldFadeShadersReady()) {
-        if (g_faldFadeInitTried) return false;
-        g_faldFadeInitTried = true;
+        if (g_faldFadeShadersFailed) return false;
         std::string err;
-        if (!FaldFadeInitShaders(g_device, &err)) {
-            std::cerr << "[FALD] fade stack shaders failed to compile: " << err << " - the flank fade stays off" << std::endl;
+        const FaldFadeStatus st = FaldFadeShadersStep(g_device, FALD_FADE_SHADERS_PER_RUN, &err);
+        if (st == FaldFadeStatus::Failed) {
+            g_faldFadeShadersFailed = true;
+            std::cerr << "[FALD] fade stack shaders could not be created: " << err << " - the flank fade stays off" << std::endl;
             return false;
         }
-        std::cout << "FALD fade stack shaders: compiled" << std::endl;
+        if (st == FaldFadeStatus::Pending) return false;   // the rest on the next runs; the layer runs without the fade
+        std::cout << "FALD fade stack shaders: created" << std::endl;
     }
     if (!r->fade) r->fade = FaldFadeCreate();
     if (!r->fade) return false;
-    if (FaldFadeBuilt(r->fade)) {
-        if (FaldFadeEnsure(r->fade, g_device, (unsigned int)r->width, (unsigned int)r->height)) return true;
-    }
-    if (r->fadeRetryCounter != 0 && (r->fadeRetryCounter++ % 300) != 0) return false;
-    if (FaldFadeEnsure(r->fade, g_device, (unsigned int)r->width, (unsigned int)r->height)) {
+    if (r->fadeRetryCounter != 0 && (r->fadeRetryCounter++ % 300) != 0) return false;   // after a failure: every ~300 runs
+    const bool wasBuilt = FaldFadeBuilt(r->fade);
+    const FaldFadeStatus st = FaldFadeEnsureStep(r->fade, g_device, (unsigned int)r->width, (unsigned int)r->height,
+                                                 FALD_FADE_RESOURCES_PER_RUN, FALD_FADE_BYTES_PER_RUN);
+    if (st == FaldFadeStatus::Ready) {
         r->fadeRetryCounter = 0;
         r->fadeFailLogged = false;
-        std::cout << "[FALD] fade stack resources: " << (FaldFadeVramBytes(r->fade) >> 20) << " MB" << std::endl;
+        if (!wasBuilt) std::cout << "[FALD] fade stack resources: " << (FaldFadeVramBytes(r->fade) >> 20) << " MB" << std::endl;
         return true;
     }
+    if (st == FaldFadeStatus::Pending) return false;      // paced build: the layer runs without the fade meanwhile
     r->fadeRetryCounter = 1;
     if (!r->fadeFailLogged) {
         std::cerr << "[FALD] fade stack textures could not be created: the flank fade stays off" << std::endl;

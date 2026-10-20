@@ -65,6 +65,13 @@ static unsigned int g_tsHead = 0;
 static const unsigned int HOOK_FALD_COVER_TILE = 32u;       // priming coverage granularity (px)
 static const unsigned int HOOK_FALD_RELEASE_AFTER = 600u;   // presents off before an entry frees its GPU memory
 static HANDLE g_primeEvent = NULL;                          // DWM_HOOK_FALD_PRIME_EVENT (the host creates it)
+// The host's named events (prime, settle, content). The hook's sources compiled into the test exe (DLUT_HOOK_TESTING) open
+// none: a test must never signal a DesktopLUT host running on the same machine.
+#ifdef DLUT_HOOK_TESTING
+static HANDLE OpenHostEvent(const wchar_t*) { return NULL; }
+#else
+static HANDLE OpenHostEvent(const wchar_t* name) { return OpenEventW(EVENT_MODIFY_STATE, FALSE, name); }
+#endif
 static long long g_primeLastQpc = 0;                        // the last prime request (throttle)
 
 // t0..t35 (HOOK_FALD_SRV_SLOTS): the layer's t0..t22 as the HLSL declares them (t20..t22 = the fade stack's views) and
@@ -195,11 +202,11 @@ static void CompileFeatureShaders() {
          StarShadersReady() ? "compiled" : "UNAVAILABLE", (g_temporalCS && g_clockCS) ? "compiled" : "UNAVAILABLE");
 }
 
-static bool g_fadeInitTried = false;   // the fade stack's passes: compiled once, the first time a monitor wants them
+static bool g_fadeShadersFailed = false;   // the fade stack's passes could not be created (latched until released)
 
 void FaldReleaseShaders() {
     FaldFadeReleaseShaders();
-    g_fadeInitTried = false;
+    g_fadeShadersFailed = false;
     ReleaseFeatureShaders();
     SafeRelease(g_faldSampler);
     SafeRelease(g_faldVS);
@@ -689,7 +696,7 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
     ReleaseTemporal(m);
     ReleaseStar(m);
-    FaldFadeDestroy(m->fade); m->fade = nullptr; m->fadeOn = false; m->fadeKey = 0;
+    FaldFadeDestroy(m->fade); m->fade = nullptr; m->fadeOn = false; m->fadeKey = 0; m->fadeFailed = false;
     m->spareParams = FaldPanelParams{};
     m->primed = false;
     m->valid = false;
@@ -833,32 +840,38 @@ static bool EnsureClock(FaldMonitor* m) {
     return false;
 }
 
-// Resolve this frame's starfield state from the live request (FaldSetLiveSettings). Off =
-// textures released and nothing downstream knows the feature exists (CB word 35 = 0,
-// t15 / t18 unbound) — the bit-identical-when-off rule of src/fald.cpp.
-// The fade stack's resources for this frame size (shared/fald_fade.h): its passes are compiled the first time any monitor
-// wants them (0.4 s on a desktop CPU, once per attach; a failure is logged once and leaves the feature off for the attach),
-// the textures on the first run the setting is on. A failed creation is latched (fadeFailed) until the next rebuild.
+// The fade stack for this frame size (shared/fald_fade.h). Its passes ship as bytecode — no shader compiler in DWM's
+// present — and are created FALD_FADE_SHADERS_PER_RUN per present the first time any monitor wants them; its resources
+// (~120, ~550 MB at 4K) FALD_FADE_RESOURCES_PER_RUN / FALD_FADE_BYTES_PER_RUN per present. Until both are complete the
+// layer runs without the fade (CB word 75 = 0: today's layer). A failure is latched (shaders: until released; resources:
+// fadeFailed, until the next rebuild) and logged once.
 static bool EnsureFade(FaldMonitor* m) {
-    if (m->fadeFailed) return false;
+    if (m->fadeFailed || g_fadeShadersFailed) return false;
     if (!FaldFadeShadersReady()) {
-        if (g_fadeInitTried) return false;
-        g_fadeInitTried = true;
         std::string err;
-        LARGE_INTEGER t0, t1, f;
-        QueryPerformanceCounter(&t0);
-        const bool ok = FaldFadeInitShaders(g_dev, &err);
-        QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
-        if (!ok) { LogF("FALD: fade stack shaders failed to compile (%s) - the flank fade stays off", err.c_str()); return false; }
-        LogF("FALD: fade stack shaders compiled in %.0f ms", f.QuadPart > 0 ? (double)(t1.QuadPart - t0.QuadPart) * 1e3 / (double)f.QuadPart : 0.0);
+        const FaldFadeStatus st = FaldFadeShadersStep(g_dev, FALD_FADE_SHADERS_PER_RUN, &err);
+        if (st == FaldFadeStatus::Failed) {
+            g_fadeShadersFailed = true;
+            LogF("FALD: fade stack shaders could not be created (%s) - the flank fade stays off", err.c_str());
+            return false;
+        }
+        if (st == FaldFadeStatus::Pending) return false;
+        log_to_file("FALD: fade stack shaders created from their bytecode");
     }
     if (!m->fade) m->fade = FaldFadeCreate();
-    if (m->fade && FaldFadeEnsure(m->fade, g_dev, m->width, m->height)) return true;
+    if (!m->fade) { m->fadeFailed = true; return false; }
+    const FaldFadeStatus st = FaldFadeEnsureStep(m->fade, g_dev, m->width, m->height, FALD_FADE_RESOURCES_PER_RUN,
+                                                 FALD_FADE_BYTES_PER_RUN);
+    if (st == FaldFadeStatus::Ready) return true;
+    if (st == FaldFadeStatus::Pending) return false;
     m->fadeFailed = true;
     LogF("FALD: pos(%d,%d) fade stack textures could not be created - the flank fade stays off", m->left, m->top);
     return false;
 }
 
+// Resolve this frame's starfield state from the live request (FaldSetLiveSettings). Off =
+// textures released and nothing downstream knows the feature exists (CB word 35 = 0,
+// t15 / t18 unbound) — the bit-identical-when-off rule of src/fald.cpp. The flank fade likewise (CB word 75 = 0, t20-t22 unbound).
 static void ResolveFeatures(FaldMonitor* m) {
     const bool wasStar = m->starOn;
     if (m->starWanted) m->starOn = EnsureStar(m);
@@ -1266,7 +1279,7 @@ bool HookRequestFullRecompose() {
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
     if (g_primeLastQpc != 0 && f.QuadPart > 0 && (now.QuadPart - g_primeLastQpc) < f.QuadPart) return false;
     g_primeLastQpc = now.QuadPart;
-    if (!g_primeEvent) g_primeEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, DWM_HOOK_FALD_PRIME_EVENT);
+    if (!g_primeEvent) g_primeEvent = OpenHostEvent(DWM_HOOK_FALD_PRIME_EVENT);
     return g_primeEvent && SetEvent(g_primeEvent);
 }
 
@@ -2053,11 +2066,11 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
             wchar_t name[96];
             if (!m->settleEvt) {
                 swprintf_s(name, DWM_HOOK_FALD_SETTLE_EVENT_FMT, m->left, m->top);
-                m->settleEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+                m->settleEvt = OpenHostEvent(name);
             }
             if (!m->contentEvt) {
                 swprintf_s(name, DWM_HOOK_FALD_CONTENT_EVENT_FMT, m->left, m->top);
-                m->contentEvt = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+                m->contentEvt = OpenHostEvent(name);
             }
         }
         if (newContent && m->contentEvt) SetEvent(m->contentEvt);
@@ -2085,3 +2098,22 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     }
     return true;
 }
+
+#ifdef DLUT_HOOK_TESTING
+// ---------------------------------------------------------------------------------------------
+// Test seams (tests/test_fald_hook.cpp): compiled into the test exe only, never into the DLL
+// ---------------------------------------------------------------------------------------------
+// A live panel delivery without the named section (the section path is IngestDelivery's; this is the rest of it).
+bool FaldTestDeliver(int left, int top, bool isHdr, unsigned int gen, const void* payload, size_t bytes) {
+    FaldPanelLockGuard lock(g_panelsLock, true);
+    if (!g_panels.Wants(left, top, isHdr, gen)) return false;
+    std::string err;
+    const uint32_t ack = g_panels.Deliver(left, top, isHdr, gen, payload, bytes, err);
+    if (ack == DWM_HOOK_FALD_PANEL_ACK_INGESTED) NoteSlotChanged(left, top, isHdr);
+    RefreshAnyPanelPresent();
+    return ack == DWM_HOOK_FALD_PANEL_ACK_INGESTED;
+}
+FaldFade* FaldTestFade(FaldMonitor* m) { return m ? m->fade : nullptr; }
+bool FaldTestFadeOn(const FaldMonitor* m) { return m && m->fadeOn; }
+ID3D11Buffer* FaldTestCB(FaldMonitor* m) { return m ? m->cb : nullptr; }
+#endif

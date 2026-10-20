@@ -6,6 +6,7 @@
 #include "fald_fade.h"
 #include "fald_shader.h"
 #include "fald_fade_shader.h"
+#include "fald_fade_bytecode.h"   // generated: the passes' bytecode (fald_fade.h)
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -44,6 +45,7 @@ const char* KernelSource(unsigned int k) {
 }
 
 ID3D11ComputeShader* g_cs[K_COUNT] = {};
+ID3D11Device* g_csDev = nullptr;   // the device g_cs were created on (not owned)
 bool g_ready = false;
 
 // fald_fade_shader.h FadePix ops
@@ -116,6 +118,11 @@ struct FaldFade {
     bool hasHistory = false;
     bool frameValid = false;
     unsigned long long vram = 0;
+    // a paced build in progress (FaldFadeEnsureStep): what is still to be created, in order
+    struct BuildItem { FadeTex* t; unsigned int w, h; int kind; };   // kind: 0 R32F, 1 R32G32F, 2+ a table step
+    std::vector<BuildItem> plan;
+    size_t planPos = 0;
+    bool planning = false;
 };
 
 namespace {
@@ -229,6 +236,7 @@ void ReleaseAll(FaldFade* f) {
     SafeRel(f->cb); SafeRel(f->frameCb);
     f->built = false; f->hasHistory = false; f->frameValid = false; f->parity = 0; f->vram = 0;
     f->W = f->H = f->Wq = f->Hq = f->W8 = f->H8 = 0;
+    f->plan.clear(); f->planPos = 0; f->planning = false;
 }
 
 // ---- dispatch
@@ -352,39 +360,74 @@ void UnbindEverything(ID3D11DeviceContext* ctx) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------------
-bool FaldFadeInitShaders(ID3D11Device* dev, std::string* err) {
-    if (g_ready) return true;
-    if (!dev) { if (err) *err = "no device"; return false; }
-    const std::string common = std::string(g_faldCommonSource) + g_faldFadeCommonSource;
-    for (unsigned int k = 0; k < K_COUNT; k++) {
-        std::string src = common;
-        if (kKernels[k].warpFn) src += g_faldFadeWarpFnSource;
-        src += KernelSource(k);
-        ID3DBlob* blob = nullptr; ID3DBlob* msg = nullptr;
-        HRESULT hr = D3DCompile(src.c_str(), src.size(), kKernels[k].name, nullptr, nullptr, "main", "cs_5_0",
-                                D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &msg);
-        if (FAILED(hr)) {
-            if (err) *err = std::string(kKernels[k].name) + ": " + (msg ? (const char*)msg->GetBufferPointer() : "compile failed");
-            if (msg) msg->Release();
-            FaldFadeReleaseShaders();
-            return false;
-        }
+unsigned int FaldFadeKernelCount() { return K_COUNT; }
+const char* FaldFadeKernelName(unsigned int k) { return k < K_COUNT ? kKernels[k].name : ""; }
+
+// The compile the embedded bytecode was generated with (tests and the generator only; never on a present path).
+bool FaldFadeCompileKernel(unsigned int k, std::vector<unsigned char>& out, std::string* err) {
+    out.clear();
+    if (k >= K_COUNT) { if (err) *err = "no such pass"; return false; }
+    std::string src = std::string(g_faldCommonSource) + g_faldFadeCommonSource;
+    if (kKernels[k].warpFn) src += g_faldFadeWarpFnSource;
+    src += KernelSource(k);
+    ID3DBlob* blob = nullptr; ID3DBlob* msg = nullptr;
+    const HRESULT hr = D3DCompile(src.c_str(), src.size(), kKernels[k].name, nullptr, nullptr, "main", "cs_5_0",
+                                  D3DCOMPILE_IEEE_STRICTNESS, 0, &blob, &msg);
+    if (FAILED(hr)) {
+        if (err) *err = std::string(kKernels[k].name) + ": " + (msg ? (const char*)msg->GetBufferPointer() : "compile failed");
         if (msg) msg->Release();
-        hr = dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_cs[k]);
-        blob->Release();
-        if (FAILED(hr)) {
+        if (blob) blob->Release();
+        return false;
+    }
+    if (msg) msg->Release();
+    const unsigned char* p = (const unsigned char*)blob->GetBufferPointer();
+    out.assign(p, p + blob->GetBufferSize());
+    blob->Release();
+    return true;
+}
+
+bool FaldFadeEmbeddedBytecode(unsigned int k, const void** data, size_t* bytes) {
+    if (k >= K_COUNT || k >= kFaldFadeBytecodeCount || g_faldFadeBytecode[k].bytes == 0) return false;
+    if (data) *data = g_faldFadeBytecode[k].words;
+    if (bytes) *bytes = g_faldFadeBytecode[k].bytes;
+    return true;
+}
+
+FaldFadeStatus FaldFadeShadersStep(ID3D11Device* dev, unsigned int maxCreates, std::string* err) {
+    if (!dev) { if (err) *err = "no device"; return FaldFadeStatus::Failed; }
+    if (g_csDev && g_csDev != dev) FaldFadeReleaseShaders();   // another device: its shaders are not this one's
+    if (g_ready) return FaldFadeStatus::Ready;
+    g_csDev = dev;
+    unsigned int made = 0;
+    for (unsigned int k = 0; k < K_COUNT; k++) {
+        if (g_cs[k]) continue;
+        if (maxCreates && made >= maxCreates) return FaldFadeStatus::Pending;
+        const void* bc = nullptr; size_t n = 0;
+        if (!FaldFadeEmbeddedBytecode(k, &bc, &n)) {
+            if (err) *err = std::string(kKernels[k].name) + ": no embedded bytecode (regenerate shared/fald_fade_bytecode.h)";
+            FaldFadeReleaseShaders();
+            return FaldFadeStatus::Failed;
+        }
+        if (FAILED(dev->CreateComputeShader(bc, n, nullptr, &g_cs[k]))) {
+            g_cs[k] = nullptr;
             if (err) *err = std::string(kKernels[k].name) + ": CreateComputeShader failed";
             FaldFadeReleaseShaders();
-            return false;
+            return FaldFadeStatus::Failed;
         }
+        made++;
     }
     g_ready = true;
-    return true;
+    return FaldFadeStatus::Ready;
+}
+
+bool FaldFadeInitShaders(ID3D11Device* dev, std::string* err) {
+    return FaldFadeShadersStep(dev, 0, err) == FaldFadeStatus::Ready;
 }
 
 void FaldFadeReleaseShaders() {
     for (auto& c : g_cs) SafeRel(c);
     g_ready = false;
+    g_csDev = nullptr;
 }
 
 bool FaldFadeShadersReady() { return g_ready; }
@@ -404,38 +447,56 @@ unsigned long long FaldFadeVramBytes(const FaldFade* f) { return f ? f->vram : 0
 bool FaldFadeFrameValid(const FaldFade* f) { return f && f->built && f->frameValid; }
 void FaldFadeInvalidateFrame(FaldFade* f) { if (f) f->frameValid = false; }
 
-bool FaldFadeEnsure(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned int height) {
-    if (!f || !dev || width < 16 || height < 16 || !g_ready) return false;
-    if (f->built && f->dev == dev && f->W == width && f->H == height) return true;
-    ReleaseAll(f);
-    f->dev = dev;
+namespace {
+
+enum BuildKind : int { BK_R32F = 0, BK_RG32F = 1, BK_GAUSS_TABLE = 2, BK_TWIDDLES = 3, BK_HANN = 4, BK_SPEC = 5, BK_BUFFERS = 6 };
+
+// The creations of one build, in order (the same resources the all-at-once build made; the order changes nothing the
+// passes compute). Sizes and the push-pull levels are fixed here.
+void PlanBuild(FaldFade* f, unsigned int width, unsigned int height) {
     f->W = width; f->H = height;
     f->Wq = (width + 3) / 4; f->Hq = (height + 3) / 4;
     f->W8 = (width + 7) / 8; f->H8 = (height + 7) / 8;
-    bool ok = MakeTex(f, f->mi, width, height) && MakeTex(f, f->w, width, height) && MakeTex(f, f->fade, width, height) &&
-              MakeTex(f, f->fadeT, width, height) && MakeTex(f, f->floorF, width, height) &&
-              MakeTex(f, f->reach[0], width, height) && MakeTex(f, f->reach[1], width, height);
-    for (unsigned int i = 1; ok && i < 8; i++) ok = MakeTex(f, f->S[i], width, height);
-    FadeTex* q[] = { &f->qFq, &f->qCone, &f->qA, &f->qB, &f->qTmp, &f->qLq, &f->qLqPrev[0], &f->qLqPrev[1], &f->qLq4,
-                     &f->qG, &f->qDec, &f->qSw, &f->qLw, &f->qGlq, &f->qGlw, &f->qS[0], &f->qS[1], &f->qD, &f->qKq };
-    for (FadeTex* t : q) ok = ok && MakeTex(f, *t, f->Wq, f->Hq);
-    FadeTex* e[] = { &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eFc, &f->eAdd8, &f->eL8raw,
-                     &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1] };
-    for (FadeTex* t : e) ok = ok && MakeTex(f, *t, f->W8, f->H8);
-    FadeTex* ec[] = { &f->eC1, &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1] };
-    for (FadeTex* t : ec) ok = ok && MakeTex(f, *t, f->W8, f->H8, DXGI_FORMAT_R32G32_FLOAT);
+    auto& p = f->plan;
+    p.clear();
+    auto add = [&p](FadeTex* t, unsigned int w, unsigned int h, int kind) { p.push_back(FaldFade::BuildItem{ t, w, h, kind }); };
+    for (FadeTex* t : { &f->mi, &f->w, &f->fade, &f->fadeT, &f->floorF, &f->reach[0], &f->reach[1] }) add(t, width, height, BK_R32F);
+    for (unsigned int i = 1; i < 8; i++) add(&f->S[i], width, height, BK_R32F);
+    for (FadeTex* t : { &f->qFq, &f->qCone, &f->qA, &f->qB, &f->qTmp, &f->qLq, &f->qLqPrev[0], &f->qLqPrev[1], &f->qLq4,
+                        &f->qG, &f->qDec, &f->qSw, &f->qLw, &f->qGlq, &f->qGlw, &f->qS[0], &f->qS[1], &f->qD, &f->qKq })
+        add(t, f->Wq, f->Hq, BK_R32F);
+    for (FadeTex* t : { &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eFc, &f->eAdd8, &f->eL8raw,
+                        &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1] })
+        add(t, f->W8, f->H8, BK_R32F);
+    for (FadeTex* t : { &f->eC1, &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1] }) add(t, f->W8, f->H8, BK_RG32F);
     // the push-pull pyramid: halve (ceil) while the smaller side of the last level is > 2 (cands9.pushpull)
     unsigned int h = height, w = width;
+    f->lvH.clear(); f->lvW.clear();
     f->lvH.push_back(h); f->lvW.push_back(w);
     while (std::min(h, w) > 2u) { h = (h + 1) / 2; w = (w + 1) / 2; f->lvH.push_back(h); f->lvW.push_back(w); }
     const size_t L = f->lvH.size();
-    for (auto* v : { &f->pS, &f->pW, &f->pE, &f->pU, &f->pT }) v->resize(L);
-    for (size_t k = 1; ok && k < L; k++)
-        ok = MakeTex(f, f->pS[k], f->lvW[k], f->lvH[k]) && MakeTex(f, f->pW[k], f->lvW[k], f->lvH[k]) &&
-             MakeTex(f, f->pE[k], f->lvW[k], f->lvH[k]) && MakeTex(f, f->pU[k], f->lvW[k], f->lvH[k]) &&
-             MakeTex(f, f->pT[k], f->lvW[k], f->lvH[k]);
-    // tables
-    if (ok) {
+    for (auto* v : { &f->pS, &f->pW, &f->pE, &f->pU, &f->pT }) { v->clear(); v->resize(L); }
+    for (size_t k = 1; k < L; k++)
+        for (auto* v : { &f->pS, &f->pW, &f->pE, &f->pU, &f->pT }) add(&(*v)[k], f->lvW[k], f->lvH[k], BK_R32F);
+    // tables, then the flags buffer and the two constant buffers
+    add(nullptr, 0, 0, BK_GAUSS_TABLE);
+    add(nullptr, 0, 0, BK_TWIDDLES);
+    add(&f->hann, f->W8, f->H8, BK_HANN);
+    add(&f->specG, f->W8, f->H8, BK_SPEC);
+    add(nullptr, 0, 0, BK_BUFFERS);
+    f->planPos = 0;
+    f->planning = true;
+}
+
+unsigned long long ItemBytes(const FaldFade::BuildItem& it) {
+    return (unsigned long long)it.w * it.h * (it.kind == BK_RG32F ? 8u : 4u);
+}
+
+bool BuildItemNow(FaldFade* f, const FaldFade::BuildItem& it) {
+    switch (it.kind) {
+    case BK_R32F: return MakeTex(f, *it.t, it.w, it.h);
+    case BK_RG32F: return MakeTex(f, *it.t, it.w, it.h, DXGI_FORMAT_R32G32_FLOAT);
+    case BK_GAUSS_TABLE: {
         std::vector<float> all;
         for (unsigned int i = 0; i < kNumSigmas; i++) {
             std::vector<float> half;
@@ -443,33 +504,68 @@ bool FaldFadeEnsure(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned
             f->gwOff[i] = (unsigned int)all.size();
             all.insert(all.end(), half.begin(), half.end());
         }
-        ok = MakeConstBuffer(f, all.data(), (UINT)(all.size() * sizeof(float)), DXGI_FORMAT_R32_FLOAT, (UINT)all.size(), &f->gwBuf, &f->gw);
+        return MakeConstBuffer(f, all.data(), (UINT)(all.size() * sizeof(float)), DXGI_FORMAT_R32_FLOAT, (UINT)all.size(),
+                               &f->gwBuf, &f->gw);
     }
-    if (ok) {
+    case BK_TWIDDLES: {
         const std::vector<float> tw = Twiddles(f->W8), th = Twiddles(f->H8);
-        ok = MakeConstBuffer(f, tw.data(), (UINT)(tw.size() * sizeof(float)), DXGI_FORMAT_R32G32_FLOAT, f->W8, &f->twWBuf, &f->twW) &&
-             MakeConstBuffer(f, th.data(), (UINT)(th.size() * sizeof(float)), DXGI_FORMAT_R32G32_FLOAT, f->H8, &f->twHBuf, &f->twH) &&
-             MakeConstTex(f, f->hann, f->W8, f->H8, Hann2(f->H8, f->W8)) &&
-             MakeConstTex(f, f->specG, f->W8, f->H8, SpecGauss(f->H8, f->W8, 3.0));
+        return MakeConstBuffer(f, tw.data(), (UINT)(tw.size() * sizeof(float)), DXGI_FORMAT_R32G32_FLOAT, f->W8, &f->twWBuf, &f->twW) &&
+               MakeConstBuffer(f, th.data(), (UINT)(th.size() * sizeof(float)), DXGI_FORMAT_R32G32_FLOAT, f->H8, &f->twHBuf, &f->twH);
     }
-    if (ok) {
+    case BK_HANN: return MakeConstTex(f, *it.t, it.w, it.h, Hann2(it.h, it.w));
+    case BK_SPEC: return MakeConstTex(f, *it.t, it.w, it.h, SpecGauss(it.h, it.w, 3.0));
+    case BK_BUFFERS: {
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = 16 * sizeof(uint32_t); bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
         bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride = sizeof(uint32_t);
-        ok = SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &f->flagsBuf));
-        if (ok) {
-            D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
-            ud.Format = DXGI_FORMAT_UNKNOWN; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = 16;
-            ok = SUCCEEDED(dev->CreateUnorderedAccessView(f->flagsBuf, &ud, &f->flagsUAV));
-        }
+        const uint32_t zeros[16] = {};   // defined contents from the start (a device need not zero a new buffer)
+        D3D11_SUBRESOURCE_DATA init = {};
+        init.pSysMem = zeros;
+        if (FAILED(f->dev->CreateBuffer(&bd, &init, &f->flagsBuf))) return false;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_UNKNOWN; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = 16;
+        if (FAILED(f->dev->CreateUnorderedAccessView(f->flagsBuf, &ud, &f->flagsUAV))) return false;
+        return MakeDynamicCB(f, sizeof(FadeCBData), &f->cb) && MakeDynamicCB(f, 16, &f->frameCb);
     }
-    ok = ok && MakeDynamicCB(f, sizeof(FadeCBData), &f->cb) && MakeDynamicCB(f, 16, &f->frameCb);
-    if (!ok) { ReleaseAll(f); return false; }
+    default: return false;
+    }
+}
+
+}  // namespace
+
+FaldFadeStatus FaldFadeEnsureStep(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned int height,
+                                  unsigned int maxCreates, unsigned long long maxBytes) {
+    if (!f || !dev || width < 16 || height < 16 || !g_ready) return FaldFadeStatus::Failed;
+    if (f->built && f->dev == dev && f->W == width && f->H == height) return FaldFadeStatus::Ready;
+    if (!(f->planning && f->dev == dev && f->W == width && f->H == height)) {
+        ReleaseAll(f);   // a new build (first, a resize, another device): nothing of the old one is kept
+        f->dev = dev;
+        PlanBuild(f, width, height);
+    }
+    unsigned int made = 0;
+    unsigned long long bytes = 0;
+    while (f->planPos < f->plan.size()) {
+        const FaldFade::BuildItem it = f->plan[f->planPos];
+        const unsigned long long b = ItemBytes(it);
+        if (made > 0 && ((maxCreates && made >= maxCreates) || (maxBytes && bytes + b > maxBytes)))
+            return FaldFadeStatus::Pending;   // the rest on the next call (at least one per call)
+        if (!BuildItemNow(f, it)) { ReleaseAll(f); return FaldFadeStatus::Failed; }
+        f->planPos++;
+        made++;
+        bytes += b;
+    }
+    f->plan.clear(); f->plan.shrink_to_fit();
+    f->planPos = 0;
+    f->planning = false;
     f->built = true;
     f->hasHistory = false;
     f->frameValid = false;
     f->parity = 0;
-    return true;
+    return FaldFadeStatus::Ready;
+}
+
+bool FaldFadeEnsure(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned int height) {
+    return FaldFadeEnsureStep(f, dev, width, height, 0, 0) == FaldFadeStatus::Ready;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -485,6 +581,13 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
             std::memcpy(m.pData, v, sizeof(v));
             ctx->Unmap(f->frameCb, 0);
         }
+    }
+    if (stepT && !f->hasHistory) {
+        // The first content frame after a reset writes only the advance flag; the rest of the flags buffer (cut, shift,
+        // the cut test's numbers) would keep the last frame's values. Nothing reads them on such a frame, but a reset
+        // must leave the same state as a fresh build: zero them (64 bytes).
+        const uint32_t zeros[16] = {};
+        ctx->UpdateSubresource(f->flagsBuf, 0, nullptr, zeros, 0, 0);
     }
     BindCommonState(ctx, common);
     // F1: mi (the max channel of Balance(PanelNits(frame)), unsanitised) and lv = ln max(clamp(mi, 0, 1e4), 0.05)

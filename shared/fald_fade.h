@@ -19,8 +19,10 @@
 // Standalone: D3D11 only, no project headers (compiled into DesktopLUT.exe, DwmHook.dll and the tests).
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 #include <string>
+#include <vector>
 
 struct ID3D11Device;
 struct ID3D11DeviceContext;
@@ -41,19 +43,40 @@ struct FaldFadeCommon {
     ID3D11SamplerState* sampler = nullptr;
 };
 
-// Compile the fade passes (process-global; once per device). False = unavailable: the layer runs without the fade
-// (FaldFadeShadersReady false; the callers then never set fadeFlags). `faldCommonSource` = fald_shader.h's common source.
-// `err` gets the first failure. Compiled with D3DCOMPILE_IEEE_STRICTNESS (the twin emulates the operation order).
-bool FaldFadeInitShaders(ID3D11Device* dev, std::string* err);
+// The fade passes ship as BYTECODE (shared/fald_fade_bytecode.h, generated from fald_shader.h's common source +
+// fald_fade_shader.h with D3DCompile cs_5_0 + D3DCOMPILE_IEEE_STRICTNESS — the twin emulates that operation order): no
+// shader compiler runs in the hook's present or the overlay's render thread (a compile of the 19 passes took 0.4-0.55 s).
+// tests/test_fald_fade.cpp fails when the embedded bytecode is not a fresh compile of the current sources, and writes
+// the header (FALD_TEST_FADE_WRITE_BYTECODE).
+//
+// Create the passes from the bytecode (process-global; once per device), at most `maxCreates` per call (0 = all): the
+// callers pace it over presents and run the layer WITHOUT the fade (today's layer) until Ready. Failed = unavailable for
+// this attach (`err` gets the first failure); the callers then never set fadeFlags.
+enum class FaldFadeStatus { Ready, Pending, Failed };
+FaldFadeStatus FaldFadeShadersStep(ID3D11Device* dev, unsigned int maxCreates, std::string* err);
+bool FaldFadeInitShaders(ID3D11Device* dev, std::string* err);   // = FaldFadeShadersStep(dev, 0, err) == Ready
 void FaldFadeReleaseShaders();
 bool FaldFadeShadersReady();
+// The passes' sources and bytecode (tests, the bytecode generator): k < FaldFadeKernelCount().
+unsigned int FaldFadeKernelCount();
+const char* FaldFadeKernelName(unsigned int k);
+bool FaldFadeCompileKernel(unsigned int k, std::vector<unsigned char>& out, std::string* err);   // from the sources, now
+bool FaldFadeEmbeddedBytecode(unsigned int k, const void** data, size_t* bytes);                // what ships
 
 struct FaldFade;
 FaldFade* FaldFadeCreate();                       // nothing allocated on the GPU yet
 void FaldFadeDestroy(FaldFade* f);                // releases everything (null ok)
-// (Re)build for a frame of width x height on `dev` (a no-op when already built for it). False = a resource could not be
-// created (everything released; the caller runs the layer without the fade). A build resets T (no history).
-bool FaldFadeEnsure(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned int height);
+// (Re)build for a frame of width x height on `dev` (a no-op when already built for it). Paced: each call creates at most
+// `maxCreates` resources and `maxBytes` of them (0 = no limit; at least one per call) — ~120 resources, ~550 MB at 4K —
+// Pending until the last one exists; the caller runs the layer without the fade meanwhile. Failed = a resource could not
+// be created (everything released; the caller runs the layer without the fade). A build resets T (no history).
+FaldFadeStatus FaldFadeEnsureStep(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned int height,
+                                  unsigned int maxCreates, unsigned long long maxBytes);
+bool FaldFadeEnsure(FaldFade* f, ID3D11Device* dev, unsigned int width, unsigned int height);   // all at once
+// The pace the overlay and the hook use (per present / per run of the layer)
+constexpr unsigned int FALD_FADE_SHADERS_PER_RUN = 4;
+constexpr unsigned int FALD_FADE_RESOURCES_PER_RUN = 12;
+constexpr unsigned long long FALD_FADE_BYTES_PER_RUN = 64ull << 20;
 void FaldFadeRelease(FaldFade* f);                // GPU memory back (the next Ensure rebuilds; T reset)
 bool FaldFadeBuilt(const FaldFade* f);
 void FaldFadeReset(FaldFade* f);                  // T: the next content frame has no history (s = f_q)
