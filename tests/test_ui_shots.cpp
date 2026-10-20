@@ -511,6 +511,10 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "bypassprim", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 1 },
         { "suspended", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 2 },
         { "fald", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1 },
+        // ADD FALD (the BenQ's SDR side has no panel file); 23: the HDR display's FALD with starfield on and a view.
+        { "faldadd", ui::Page::Pipeline, ui::StageId::Fald, 1, false, -1, -1 },
+        { "faldstar", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 23 },
+        { "faldnarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 23 },
         { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
         { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
         { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
@@ -639,6 +643,12 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     snap.live[0].settings.windowsToneMap = WindowsToneMap::Panel;
                     snap.live[0].settings.hdrMHC.reportPeakMax = false;
                     snap.live[0].reportedPeakNits = 1729;
+                } else if (shot.variant == 23) {
+                    FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;
+                    f.star.enabled = true;
+                    f.star.targetSigma = 0.5f;
+                    f.debugMode = 1;   // the gain map
+                    f.temporalMode = 3;
                 }
                 const UINT w = (UINT)(shot.w * scale), h = (UINT)(shot.h * scale);
                 gpu.Resize(w, h);

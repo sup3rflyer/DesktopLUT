@@ -537,7 +537,8 @@ void DrawPixelPath(const std::vector<Stage>& path, ViewState& vs) {
             snprintf(id, sizeof(id), "##stage%d", (int)s.id);
             const bool selected = vs.stage == s.id;
             const bool off = s.dimmed;   // not changing the picture (nothing set, switched off, suspended)
-            if (Node(id, StageLabel(s.id), s.light, selected, off, ImVec2(w / Dpi(), 34), lights)) vs.stage = s.id;
+            if (Node(id, StageLabel(s.id), s.light, selected, off, ImVec2(w / Dpi(), 34), lights, s.add)) vs.stage = s.id;
+            if (s.add && ImGui::IsItemHovered()) ImGui::SetTooltip("Add %s", StageLabel(s.id));
         }
         // Gray: a chevron in the gap after each element (not into or out of the scan-out cut).
         if (chevrons && i + 1 < path.size() && s.id != StageId::Scanout && path[i + 1].id != StageId::Scanout) {
@@ -683,12 +684,43 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     EndRow(row);
 }
 
+// The FALD views (FaldSettings::debugMode, fald_shader.h's pixel pass): what the layer outputs instead of the picture.
+struct FaldView { const char* label; const char* tip; };
+const FaldView kFaldViews[act::kFaldDebugViews] = {
+    { "CORRECTED", "The corrected picture." },
+    { "GAIN MAP", "The correction: white none, red brighter, blue darker (\xC2\xB1" "25 % full scale)." },
+    { "REAL BACKLIGHT", "The backlight the panel produces, as modelled." },
+    { "PANEL ESTIMATE", "The panel's own estimate of its backlight, as modelled." },
+    { "PASSTHROUGH", "The layer's input, unchanged: the baseline for an A/B." },
+    { "PEDESTAL \xC3\x97" "100", "The pedestal term applied, \xC3\x97" "100 (1 nit shows as 100)." },
+    { "PER-CHANNEL \xC3\x97" "100", "What the per-channel pedestal changes against the white one, \xC3\x97" "100." },
+    { "SETTLING", "LED lag: red where the LEDs are still rising, blue still falling." },
+    { "BOOST ZONES", "White: the zones the black-frame boost counts as lit." },
+    { "STARFIELD ZONES", "Starfield, per zone: blue pulled down, red lifted." },
+};
+
+// A small caps label before a field on a row (it sits close to the field it names).
+void FieldLabel(RowCtx& row, const char* label) {
+    RowText(row, label, pal::InkDim, Font::Label, kSizeLabel);
+    row.x -= Px(6);
+    RowPlace(row);
+}
+
 void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
+    const bool hasFile = !f.paramsPath.empty();
 
+    // A panel file belongs to the mode it was profiled in: the other mode's row refuses it (act::FaldTransferMismatch).
     RowCtx row = BeginRow("PANEL FILE");
-    const int b = RowButtons(row, "fald", { "BROWSE\xE2\x80\xA6", "RELOAD" });
-    if (b == 0)
+    RowTip(row, hdr ? "The panel file DLC's FALD profiling made for this display in HDR."
+                    : "The panel file DLC's FALD profiling made for this display in SDR under ACM.");
+    std::vector<const char*> buttons = { "BROWSE\xE2\x80\xA6" };
+    if (hasFile) {
+        buttons.push_back("RELOAD");
+        buttons.push_back("CLEAR");
+    }
+    const int b = RowButtons(row, "fald", buttons);
+    if (b == 0) {
         PostPickThen(r,
                      [](std::wstring& out) {
                          wchar_t file[1024] = {};
@@ -697,30 +729,37 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
                          return true;
                      },
                      [hdr](int mon, const std::wstring& file) { act::SetFaldPanelFile(mon, hdr, file, true); });
-    else if (b == 1) {
+    } else if (b == 1) {
         const std::wstring path = f.paramsPath;
         PostTo(r, [hdr, path](int mon) { act::SetFaldPanelFile(mon, hdr, path, true); });
+    } else if (b == 2) {
+        PostTo(r, [hdr](int mon) { act::ClearFaldPanelFile(mon, hdr); });
     }
-    RowText(row, FileName(f.paramsPath), pal::Ink, Font::Mono, kSizeMono, f.paramsPath);
+    RowText(row, FileName(f.paramsPath), hasFile ? pal::Ink : pal::InkFaint, Font::Mono, kSizeMono, f.paramsPath);
     EndRow(row);
+    if (!hasFile) return;   // ADD FALD: the panel file comes first
+
+    // The rows below apply to HDR and SDR at once (act::EditFaldShared).
+    auto shared = [&r](std::function<bool(FaldSettings&)> edit) {
+        PostTo(r, [edit](int mon) { act::EditFaldShared(mon, edit); });
+    };
 
     row = BeginRow("PEDESTAL");
+    RowTip(row, "The pedestal the correction subtracts: the panel file's own colour, or white.");
     RowPlace(row);
     bool ped = false;
     if (OnOff("##fald_ped", f.pedMode != 0, &ped, "COLOUR", "WHITE"))
-        PostTo(r, [ped](int mon) {
-            act::EditFaldShared(mon, [ped](FaldSettings& s) { unsigned v = ped ? 1u : 0u; bool c = s.pedMode != v; s.pedMode = v; return c; });
-        });
+        shared([ped](FaldSettings& s) { unsigned v = ped ? 1u : 0u; bool c = s.pedMode != v; s.pedMode = v; return c; });
     EndRow(row);
 
     row = BeginRow("LED LAG");
+    RowTip(row, "Experimental. The LEDs' lag behind the picture: a first-order filter (the LEDs and the panel's "
+                "estimate, or the LEDs only), or the panel clock.");
     RowPlace(row);
     static const char* kLag[] = { "OFF", "LEDS + EST", "LEDS ONLY", "PANEL CLOCK" };
     const int lag = Segmented("##fald_lag", kLag, 4, (int)(f.temporalMode <= 3 ? f.temporalMode : 0), 100);
     if (lag >= 0)
-        PostTo(r, [lag](int mon) {
-            act::EditFaldShared(mon, [lag](FaldSettings& s) { bool c = s.temporalMode != (unsigned)lag; s.temporalMode = (unsigned)lag; return c; });
-        });
+        shared([lag](FaldSettings& s) { bool c = s.temporalMode != (unsigned)lag; s.temporalMode = (unsigned)lag; return c; });
     EndRow(row);
 
     // The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h); both modes at once like LED LAG. Default off.
@@ -729,10 +768,69 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     RowPlace(row);
     bool fade = false;
     if (OnOff("##fald_flank_fade", f.flankFade, &fade))
-        PostTo(r, [fade](int mon) {
-            act::EditFaldShared(mon, [fade](FaldSettings& s) { bool c = s.flankFade != fade; s.flankFade = fade; return c; });
-        });
+        shared([fade](FaldSettings& s) { bool c = s.flankFade != fade; s.flankFade = fade; return c; });
     EndRow(row);
+
+    // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields the classic rows have; the rest
+    // are INI / pipe only. The fields stay in place, disabled, while it is off.
+    const FaldStarfieldSettings& sf = f.star;
+    auto starField = [&shared](act::FaldStarField field, float v) {
+        shared([field, v](FaldSettings& s) { return act::SetFaldStarField(s.star, field, v); });
+    };
+    row = BeginRow("STARFIELD");
+    RowTip(row, "Experimental. Evens scattered highlights, so their zones do not haze unevenly.\n"
+                "EVEN: how far a peak is pulled onto its target, 0 to 1.\n"
+                "STRENGTH: the overall blend, 0 to 1.");
+    RowPlace(row);
+    bool star = false;
+    if (OnOff("##fald_star", sf.enabled, &star))
+        shared([star](FaldSettings& s) { bool c = s.star.enabled != star; s.star.enabled = star; return c; });
+    RowNext(row);
+    ImGui::BeginDisabled(!sf.enabled);
+    float even = sf.even, strength = sf.strength;
+    FieldLabel(row, "EVEN");
+    if (NumberInput("##fald_star_even", &even, "%.2f", 56)) starField(act::FaldStarField::Even, even);
+    RowNext(row);
+    FieldLabel(row, "STRENGTH");
+    if (NumberInput("##fald_star_strength", &strength, "%.2f", 56)) starField(act::FaldStarField::Strength, strength);
+    ImGui::EndDisabled();
+    EndRow(row);
+
+    row = BeginRow("STAR TARGET");
+    RowTip(row, "Where the peaks are pulled to: the local mean of the star-like peaks.\n"
+                "SPREAD: standard deviations above that mean, 0 to 4 (0 = the mean).\n"
+                "REACH: zones each side the mean looks at, 0 to 12.\n"
+                "KEEP: the target never falls below this.");
+    ImGui::BeginDisabled(!sf.enabled);
+    float spread = sf.targetSigma, reach = (float)sf.evenReach, keep = sf.keepNits;
+    FieldLabel(row, "SPREAD");
+    if (NumberInput("##fald_star_spread", &spread, "%.2f", 56)) starField(act::FaldStarField::Spread, spread);
+    RowNext(row);
+    FieldLabel(row, "REACH");
+    if (NumberInput("##fald_star_reach", &reach, "%.0f", 44)) starField(act::FaldStarField::Reach, reach);
+    RowNext(row);
+    FieldLabel(row, "KEEP");
+    if (NumberInput("##fald_star_keep", &keep, "%.1f", 64)) starField(act::FaldStarField::Keep, keep);
+    RowNext(row);
+    RowText(row, "nits", pal::InkDim, Font::Label, kSizeLabel);
+    ImGui::EndDisabled();
+    EndRow(row);
+
+    // The views draw what the layer computes in place of the picture (a diagnostic; not saved).
+    const unsigned int view = f.debugMode < act::kFaldDebugViews ? f.debugMode : 0u;
+    row = BeginRow("VIEW");
+    RowTip(row, "What the layer outputs. Any view but CORRECTED replaces the picture while the layer runs. Not saved.");
+    RowPlace(row);
+    if (BeginDropdown("##fald_view", kFaldViews[view].label, 180)) {
+        for (unsigned int i = 0; i < act::kFaldDebugViews; i++) {
+            if (DropdownItem(kFaldViews[i].label, i == view) && i != view)
+                shared([i](FaldSettings& s) { return act::SetFaldDebugView(s, i); });
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kFaldViews[i].tip);
+        }
+        EndDropdown();
+    }
+    EndRow(row);
+    if (view != 0) PanelNote(kFaldViews[view].label, pal::Alarm, "A FALD view replaces the picture. VIEW \xE2\x80\xBA CORRECTED ends it.");
 }
 
 void InspectShaderTweak(const DisplayRow& r, const Stage& st, bool hdr) {
@@ -1039,10 +1137,12 @@ bool StageSwitchState(const Snapshot& snap, const DisplayRow& r, const Stage& st
     }
     case StageId::Fald: {
         const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
-        sw.on = f.enabled;
-        sw.enabled = !parked;
-        sw.tip = st.light == Light::Fault && r.mode == Mode::SDR ? "FALD cannot run in legacy SDR (ACM or HDR only)."
-                                                                 : "FALD correction on or off.";
+        const bool hasFile = !f.paramsPath.empty();
+        sw.on = hasFile && f.enabled;
+        sw.enabled = hasFile && !parked;
+        sw.tip = !hasFile ? "No panel file."
+                 : st.light == Light::Fault && r.mode == Mode::SDR ? "FALD cannot run in legacy SDR (ACM or HDR only)."
+                                                                   : "FALD correction on or off.";
         return true;
     }
     case StageId::Primaries:
@@ -1172,6 +1272,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 
     PathRuntime selRt = RuntimeOf(snap);
     selRt.editHeld = sel->liveIndex >= 0 && MhcPreviewHolds(sel->liveIndex, PipelineIsHdr(shown));
+    selRt.offerFald = true;   // a mode without a panel file: ADD FALD in the stage's place
     const std::vector<Stage> path = BuildPixelPath(sel->settings, shown, sel->mode, selRt);
     const Stage* st = nullptr;
     for (const Stage& s : path) if (s.id == vs.stage) st = &s;
@@ -1204,7 +1305,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
     const float inspW = stacked ? total : total - measuredW - gutter;
     PanelSwitch sw;
     const bool hasSwitch = st && StageSwitchState(snap, *sel, *st, showHdr, sw);
-    BeginPanel("##inspector", st ? InspectorTitle(st->id) : "SELECT A STAGE", st ? &st->light : nullptr,
+    BeginPanel("##inspector", !st ? "SELECT A STAGE" : st->add ? "ADD FALD" : InspectorTitle(st->id), st ? &st->light : nullptr,
                ImVec2(inspW, stacked ? 0.0f : colH), hasSwitch ? &sw : nullptr);
     if (st) {
         ImGui::BeginDisabled(sel->liveIndex < 0);   // a remembered display that is not connected: view only

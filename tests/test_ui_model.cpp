@@ -91,6 +91,40 @@ TEST_CASE("ui_model: FALD exists only with a panel file and only runs on FP16 ba
     CHECK(Get(off, StageId::Fald).dimmed);
 }
 
+TEST_CASE("ui_model: the Pipeline page offers FALD in its place until a mode has a panel file") {
+    MonitorSettings ms;
+    PathRuntime rt = Running();
+    rt.offerFald = true;
+    // Where the layer could run: HDR, ACM SDR, and SDR settings seen while the display is in HDR or not connected.
+    const struct { Mode shown, live; } offered[] = {
+        { Mode::HDR, Mode::HDR }, { Mode::HDR, Mode::SDR }, { Mode::HDR, Mode::Unknown }, { Mode::AcmSdr, Mode::AcmSdr },
+        { Mode::SDR, Mode::HDR }, { Mode::SDR, Mode::Unknown },
+    };
+    for (const auto& c : offered) {
+        const auto p = BuildPixelPath(ms, c.shown, c.live, rt);
+        REQUIRE(Has(p, StageId::Fald));
+        const Stage& s = Get(p, StageId::Fald);
+        CHECK(s.add);
+        CHECK(s.selectable);
+        CHECK(s.dimmed);
+        CHECK(s.light == Light::None);           // nothing set: never a fault, never on
+        CHECK(IndexOf(p, StageId::Fald) == IndexOf(p, StageId::Lut3D) + 1);
+    }
+    // Legacy SDR (an 8-bit desktop never runs the layer): nothing offered.
+    CHECK_FALSE(Has(BuildPixelPath(ms, Mode::SDR, Mode::SDR, rt), StageId::Fald));
+    // Other views of the path (the sidebar, the DLC stack) are not offered it.
+    CHECK_FALSE(Has(BuildPixelPath(ms, Mode::HDR, Mode::HDR, Running()), StageId::Fald));
+    // With a panel file the stage itself takes the same place; a file for one mode leaves the other offered.
+    const auto offer = BuildPixelPath(ms, Mode::HDR, Mode::HDR, rt);
+    ms.hdrColorCorrection.fald.paramsPath = L"panel_hdr.bin";
+    const auto p = BuildPixelPath(ms, Mode::HDR, Mode::HDR, rt);
+    REQUIRE(p.size() == offer.size());
+    CHECK_FALSE(Get(p, StageId::Fald).add);
+    CHECK(Get(p, StageId::Fald).light == Light::Off);
+    CHECK(IndexOf(p, StageId::Fald) == IndexOf(offer, StageId::Fald));
+    CHECK(Get(BuildPixelPath(ms, Mode::AcmSdr, Mode::AcmSdr, rt), StageId::Fald).add);
+}
+
 TEST_CASE("ui_model: a live edit's hold shows tone mapping and FALD switched off (a ring)") {
     MonitorSettings ms;
     ms.hdrColorCorrection.tonemap.enabled = true;

@@ -29,6 +29,7 @@ struct Stage {
     Light light = Light::Off;
     bool selectable = true;   // false for the Desktop / Scanout / Panel markers
     bool dimmed = false;      // configured but disabled (FALD file set, layer off) or not applicable
+    bool add = false;         // not set up: the path offers the stage in its place (FALD before its first panel file)
 };
 
 // Which side of the per-mode settings a pipeline shows: HDR uses the hdr* fields; SDR and ACM SDR
@@ -42,12 +43,16 @@ struct PathRuntime {
     bool hookMode = false;     // the DWM hook engine (else the overlay)
     bool hookActive = false;   // the hook is injected
     bool editHeld = false;     // a live edit holds tone mapping and FALD off on this display, this mode (mhc_preview.h)
+    bool offerFald = false;    // the path offers FALD where a mode has no panel file (the Pipeline page; see below)
 };
 
 // The pixel path for one display, in pixel order: what the desktop goes through on its way to the
 // panel. `shown` is the mode whose settings are displayed (the live mode, or the other one when the
 // user edits it); `live` is the display's actual mode (FALD only runs on FP16 back buffers). Faults
 // from `rt` are reported only for the mode the display is in.
+// FALD is a stage only with a panel file. Without one, `rt.offerFald` puts an add slot in its place (Stage::add: no
+// light, dimmed) wherever the layer could run: the HDR side, and the SDR side unless the display is in legacy SDR
+// (an 8-bit desktop never runs it). Every display is offered it alike — the panel's technology is not known here.
 std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode live, const PathRuntime& rt = {});
 
 // Whether an MHC stage has anything to do (before its switch): primaries = the primaries correction or a
