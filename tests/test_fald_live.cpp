@@ -1059,13 +1059,15 @@ TEST_CASE("FALD live: the entry gate under threads - no borrower ever sees an en
     //
     // The gate never waits, so it promises no progress to a claim that keeps meeting borrows — it is refused, and the
     // hook redoes the work at a later present. A test that waits a wall-clock time for claims to land therefore starves
-    // when the borrowers always hold one (on 2 CPUs: every run). Nothing here depends on time or on the scheduler: a
-    // fixed number of frames, and in each frame
+    // when the borrowers always hold one (on 2 CPUs: every run). Here nothing waits on time and no check depends on how
+    // the threads are scheduled: a fixed number of frames, and in each frame
     //   - forced, in this order by semaphores: a claim while a borrow is held (refused, leaves no trace); once every
     //     present of the frame is over, a claim (lands); while it is held and the entry torn, a borrow (backs off,
     //     leaves no trace);
     //   - free, around those: each borrower makes kPresents presents and the rebuilder up to kFreeClaims claims while
-    //     they run, racing (how they fall is reported, not checked: any outcome is legal, only a violation is not).
+    //     they run, racing. How they fall is reported, not checked: any outcome is legal, only a violation is not. This
+    //     is the part that catches a side that looks before it announces, which only threads running at the same time
+    //     show; when the scheduler runs them one after another it races nothing (free rebuilds 0, deferred 0).
     constexpr int kBorrowers = 4, kFrames = 2000, kPresents = 3, kFreeClaims = 16, kUse = 64;
     struct Entry { std::atomic<uint32_t> gen{ 0 }; std::atomic<bool> torn{ false }; } entry;
     FaldEntryGate gate;
