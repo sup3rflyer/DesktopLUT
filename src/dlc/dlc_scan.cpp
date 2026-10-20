@@ -394,4 +394,28 @@ std::shared_ptr<const std::vector<Patch>> Patches(const std::wstring& runDir) {
     return nullptr;
 }
 
+void ResetScannerForTest() {
+    StopScanner();   // joined: nothing below races the worker
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_stop = false;
+    g_cancel.store(false);
+    g_scanWanted = false;
+    g_request = ScanRequest();
+    g_folder.clear();
+    g_patchQueue.clear();
+    g_current = std::make_shared<Data>();
+    g_patches.clear();
+}
+
+namespace {
+
+// Declared last, so destroyed first at exit, while everything the worker touches is still alive: a process that
+// started the worker and never called StopScanner (the interface drawn without ui::Shutdown: the UI shot tests) joins
+// it here. A std::thread destroyed joinable calls std::terminate -> abort -> __fastfail, exit code 0xC0000409.
+struct JoinAtExit {
+    ~JoinAtExit() { StopScanner(); }
+} g_joinAtExit;
+
+}  // namespace
+
 }  // namespace dlc

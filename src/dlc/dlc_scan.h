@@ -48,9 +48,12 @@ void SetScanListener(std::function<void()> onChange);   // called on the worker 
 // Any thread; coalesced; starts the worker. The worker resolves the folder (ResolveFolder) and scans it. Returns the
 // request's number: Data::request of the scan that answers it.
 uint64_t RequestScan(const std::wstring& configured, const std::vector<std::wstring>& candidates);
-void StopScanner();                                       // GUI thread, at shutdown
+// GUI thread, at shutdown; final (nothing starts the worker again). Joined at exit too if the host never calls it.
+void StopScanner();
 std::shared_ptr<const Data> Current();                    // any thread; never null
 // Patch metrics of a run: the cached list, or null while it loads (the listener fires when it is in).
 std::shared_ptr<const std::vector<Patch>> Patches(const std::wstring& runDir);
+// Tests: StopScanner, then forget every scan, patch list and the listener; the next request starts a new worker.
+void ResetScannerForTest();
 
 }  // namespace dlc

@@ -948,9 +948,32 @@ void SeedRunChartsForTest(const std::wstring& runDir, std::shared_ptr<const Live
     g_runCharts[NormPath(runDir)] = std::move(charts);
 }
 
+void ResetLiveWatchForTest() {
+    StopLiveWatch();   // joined: nothing below races the watcher
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_stop = false;
+    g_active = false;
+    g_kick = false;
+    g_folder.clear();
+    g_live = std::make_shared<Live>();
+    g_chartQueue.clear();
+    g_runCharts.clear();
+}
+
 std::shared_ptr<const Live> CurrentLive() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_live;
 }
+
+namespace {
+
+// Declared last, so destroyed first at exit, while everything the watcher touches is still alive: a process that
+// started it and never called StopLiveWatch (the interface drawn without ui::Shutdown: the UI shot tests) joins it
+// here. A std::thread destroyed joinable calls std::terminate -> abort -> __fastfail, exit code 0xC0000409.
+struct JoinAtExit {
+    ~JoinAtExit() { StopLiveWatch(); }
+} g_joinAtExit;
+
+}  // namespace
 
 }  // namespace dlc
