@@ -278,7 +278,12 @@ TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay'
         { "still_n7_lamp", "n7_lamp", C, true, true, 3840, 2160 },
         { "still_x_naninf", "x_naninf", C, true, false, 3840, 2160 },
         { "still_x_odd1366", "x_odd1366", ODD + L"\\odd_panel.bin", true, true, 1366, 768 },
-        { "still_sdr_n7_lamp", "n7_lamp", SDR, false, true, 3840, 2160 } };
+        { "still_sdr_n7_lamp", "n7_lamp", SDR, false, true, 3840, 2160 },
+        // a fractional zone pitch (48 x 24 over 2560 x 1440), when the cell dir holds it (test_fald_fade.cpp still_frac2560)
+        { "still_frac2560", "x_frac2560",
+          GetFileAttributesW((ODD + L"\\frac_panel_48x24.bin").c_str()) != INVALID_FILE_ATTRIBUTES ? ODD + L"\\frac_panel_48x24.bin"
+                                                                                                    : std::wstring(),
+          true, true, 2560, 1440 } };
     for (const Still& s : stills) {
         if (!want(s.name) || s.panel.empty()) continue;
         HookWarp w;

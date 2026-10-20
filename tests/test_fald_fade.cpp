@@ -454,7 +454,7 @@ TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, w
     const auto t0 = std::chrono::steady_clock::now();
     for (unsigned int k = 0; k < n; k++) {
         std::string err;
-        CHECK_MESSAGE(FaldFadeCompileKernel(k, fresh[k], &err), FaldFadeKernelName(k) << ": " << err);
+        CHECK_MESSAGE(FaldFadeCompileKernel(k, fresh[k], &err), std::string(FaldFadeKernelName(k)) << ": " << err);
         CHECK(fresh[k].size() % 4u == 0u);   // DXBC is a sequence of 4-byte words
     }
     MESSAGE("fade passes compiled in " << std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() << " s");
@@ -496,16 +496,16 @@ TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, w
     for (unsigned int k = 0; k < n; k++) {
         const void* bc = nullptr; size_t bytes = 0;
         const bool have = FaldFadeEmbeddedBytecode(k, &bc, &bytes);
-        CHECK_MESSAGE(have, FaldFadeKernelName(k) << ": no embedded bytecode (FALD_TEST_FADE_WRITE_BYTECODE)");
+        CHECK_MESSAGE(have, std::string(FaldFadeKernelName(k)) << ": no embedded bytecode (FALD_TEST_FADE_WRITE_BYTECODE)");
         if (!have) continue;
         const bool same = bytes == fresh[k].size() && std::memcmp(bc, fresh[k].data(), bytes) == 0;
-        CHECK_MESSAGE(same, FaldFadeKernelName(k) << ": shared/fald_fade_bytecode.h is not a fresh compile of the sources "
+        CHECK_MESSAGE(same, std::string(FaldFadeKernelName(k)) << ": shared/fald_fade_bytecode.h is not a fresh compile of the sources "
                             "(regenerate: FALD_TEST_FADE_WRITE_BYTECODE)");
         ID3DBlob* dis = nullptr;
         REQUIRE(SUCCEEDED(D3DDisassemble(bc, bytes, 0, nullptr, &dis)));
         const std::string text((const char*)dis->GetBufferPointer(), dis->GetBufferSize());
         const size_t mads = CountFloatMads(text);
-        CHECK_MESSAGE(mads == 0u, FaldFadeKernelName(k) << ": " << mads << " float mad instruction(s)");
+        CHECK_MESSAGE(mads == 0u, std::string(FaldFadeKernelName(k)) << ": " << mads << " float mad instruction(s)");
         dis->Release();
     }
     // the detector itself: the layer's statistic pass (no `precise`, default flags) does fuse — else the check above
@@ -568,6 +568,11 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
     if (!B07.empty()) add("ref_seattle_from8_B07", B07, true, true, seattleFrom(8), 3840, 2160);
     add("ref_seattle_from8_C", C, true, true, seattleFrom(8), 3840, 2160);
     add("ref_seattle_from12_C", C, true, true, seattleFrom(12), 3840, 2160);
+    // a fractional zone pitch with the fade on (sanity, no twin reference): a DLC export of a 27" 2560 x 1440 panel with
+    // 48 x 24 zones (53.33 x 60 px; docs/fald-fractional-pitch.md) and a 2560 x 1440 crop, when the cell dir holds them
+    const std::string fracPanel = cellDir + "/frac_panel_48x24.bin";
+    if (GetFileAttributesA(fracPanel.c_str()) != INVALID_FILE_ATTRIBUTES)
+        add("still_frac2560", Widen(fracPanel), true, true, { "x_frac2560" }, 2560, 1440);
     for (const OnSpec& rs : runs) {
         if (!only.empty() && rs.id.find(only) == std::string::npos) continue;
         std::string err; double secs = 0.0;
