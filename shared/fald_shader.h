@@ -98,12 +98,13 @@ cbuffer FaldCB : register(b0) {
                                                                     // this frame's first refresh (True) and of the refresh
                                                                     // before it, which the panel's compensation uses (Est):
                                                                     // 1 - (1 - closure)^ticks (C++ FaldPanelClockFactors)
-    uint boostRule; float boostMeanGamma; float boostMeanThresh; uint _pad75; // the boost count's zone rule (work guide C12b; read
-                                                                    // only when boostN != 0): 0 = LIT-or-DIM as above, 1 =
+    uint boostRule; float boostMeanGamma; float boostMeanThresh; uint fadeFlags; // the boost count's zone rule (work guide C12b;
+                                                                    // read only when boostN != 0): 0 = LIT-or-DIM as above, 1 =
                                                                     // LIT-or-MEAN: LIT OR the zone mean of (brightest channel,
                                                                     // as-if-white nits)^boostMeanGamma >= boostMeanThresh;
-                                                                    // _pad75: unused (was the glow fill's switch, S2 — removed
-                                                                    // 2026-10-07), written 0
+                                                                    // fadeFlags: bit 0 = the frozen fade stack ASF10 + T11_TMTC
+                                                                    // (FadePost, t20-t22; shared/fald_fade.h), bit 1 = item L
+                                                                    // (reserved, always 0); 0 = the layer without it
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -132,6 +133,11 @@ Texture2D<float4> starPlan2Tex : register(t18); // S1 out: (ln background, near,
                                                 // bilinearly and loads .z of the pixel's OWN zone (nearest)
 Texture2D<float4> starBgTex    : register(t19); // S0 out: (ln background, the brightest pixel's index ly * cellW + lx inside
                                                 // the zone, lit sum, a_eff) — read by S1
+// The fade stack (fadeFlags bit 0; shared/fald_fade.h), full-res R32F, read by FadePost only:
+Texture2D<float>  fadeTTex     : register(t20); // fade_T: the ASF9o field low-passed over content frames (T11_TMTC)
+Texture2D<float>  floorTex     : register(t21); // F: the lit floor (OF), nits
+Texture2D<float>  reachTex     : register(t22); // reach of THIS round's soft knee (OF): round 0 in the round-1 statistic,
+                                                // round 1 in the pixel pass
 SamplerState linearClamp : register(s0);
 )" /* MSVC caps ONE string literal at 16380 bytes (C2026); adjacent literals concatenate (limit 65535), so the common
       source is split here. Tools that read this header as text (DLC tests, the fxc checkers) drop the seam. */ R"(
@@ -390,6 +396,31 @@ static const uint FALD_ZONE_SLICE_PX = 4096u;
 struct ZonePart { float4 f; uint4 u; };
 uint ZoneSlices() { return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX; }
 uint ZonePartIndex(uint cx, uint cy, uint s) { return (cy * cols + cx) * ZoneSlices() + s; }
+
+// The fade stack's post-Correct scale (fadeFlags bit 0; DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md 1.3, the
+// study twin's make_post11 with gc = oc = None; float32 twin dlc.fald.fadeemu.fade_post). req = Correct(img, ...), img = the
+// as-if-white nits Correct received, px = the pixel. ls = ln(max req / max img) (0 unless max img > 1e-9 and max req >
+// 1e-12); keep = smooth(1, 3, F) smooth(0, 0.03, ls) (1 - reach); fade = fade_T (1 - keep); ONE scale for the three
+// channels: req exp(ls (1 - fade) - ls) = req (max img / max req)^fade. Off: req unchanged.
+// NO `precise` here: precise propagates backwards to every operation feeding the value — it would turn all of Correct
+// (and the passes around it) precise, i.e. change the compiled layer with the fade OFF. The compiler may fuse a
+// multiply-add in these few lines (~1e-7 relative; the WARP gate allows one FP16 step).
+float FadePostSmooth(float a, float b, float x) {
+    float t = saturate((x - a) / (b - a));
+    return t * t * (3.0f - 2.0f * t);
+}
+float3 FadePost(float3 req, float3 img, int2 px) {
+    if ((fadeFlags & 1u) == 0u) return req;
+    float mi = max(img.r, max(img.g, img.b));
+    float mr = max(req.r, max(req.g, req.b));
+    float ls = (mi > 1e-9f && mr > 1e-12f) ? log(max(mr, 1e-12f) / max(mi, 1e-9f)) : 0.0f;
+    float lit = FadePostSmooth(1.0f, 3.0f, floorTex.Load(int3(px, 0)));
+    float pos = FadePostSmooth(0.0f, 0.03f, ls);
+    float keep = lit * pos * (1.0f - reachTex.Load(int3(px, 0)));
+    float fade = fadeTTex.Load(int3(px, 0)) * (1.0f - keep);
+    float lsEff = ls * (1.0f - fade);
+    return max(req * exp(lsEff - ls), 0.0f);
+}
 )";
 
 // Pass 1: per-cell area statistic -> drive. One thread group per cell, 256 threads sweep the block.
@@ -432,7 +463,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (roundIdx == 1) {
             float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
             float2 g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
-            img = Correct(img, bT, bE, g);
+            img = FadePost(Correct(img, bT, bE, g), img, int2((int)px, (int)py));   // fade stack: round 0's reach (t22)
         }
         float mc = max(img.r, max(img.g, img.b));
         float s = min(mc, white);
@@ -1074,7 +1105,7 @@ float4 main(PS_INPUT i) : SV_Target {
         float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? t1 : t0) : abs(t1 - t0);
         return float4(PanelNitsToScRGB(min(shown * 100.0f, white)), 1.0f);   // x100 nits per nit
     }
-    float3 req = Correct(img, bT, bE, gain);
+    float3 req = FadePost(Correct(img, bT, bE, gain), img, px);   // fade stack: round 1's reach (t22)
     return float4(PanelNitsToScRGB(req), src.a);
 }
 )";

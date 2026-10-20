@@ -605,6 +605,14 @@ struct FaldSettings {
     // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
     // resource for resource and dispatch for dispatch.
     FaldStarfieldSettings star;
+    // The frozen fade stack ASF10 + T11_TMTC (persisted INI <mode>_FaldFlankFade, GUI "Flank fade" /
+    // runtime.fald_flank_fade; shared/fald_fade.h): the correction fades toward "layer off" on smooth steep flanks, low-
+    // passed along the content's motion. Default OFF = today's layer bit for bit (until the owner's hardware gates pass;
+    // DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md section 6). An INI without the key loads OFF.
+    bool flankFade = false;
+    // Item L (the 1-3-nit zone-floor extension, round 12): RESERVED. Persisted (<mode>_FaldLowExt) so the setting has its
+    // home, but nothing reads it — the shader word (fadeFlags bit 1) is never set in this build.
+    bool lowExt = false;
 };
 
 // Tonemapping settings (HDR only)

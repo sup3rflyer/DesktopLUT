@@ -132,6 +132,15 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
         float nbLo = 0.15f, nbHi = 0.30f; uint32_t reach = 2, evenReach = 8;
         float targetSigma = 0.0f, keepNits = 100.0f;
     } star;
+    // The frozen fade stack ASF10 + T11_TMTC (FaldSettings::flankFade; shared/fald_fade.h): its resources and T state exist
+    // only while the setting is on (released when it goes off). fadeOn = this run applies it (CB word 75 bit 0, t20-t22).
+    // fadeKey = the settings the cached frame part was computed under (the frame the layer works on: starfield and its
+    // parameters): a change re-forms the fade on the next run without a T step.
+    struct FaldFade* fade = nullptr;
+    bool fadeOn = false;
+    bool fadeFailLogged = false;
+    unsigned int fadeRetryCounter = 0;       // frames since the fade resources failed to create (retry every ~300)
+    unsigned long long fadeKey = 0;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
     uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)
