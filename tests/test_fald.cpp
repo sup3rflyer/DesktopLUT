@@ -7,6 +7,7 @@
 #include "../src/fald.h"
 #include "../src/types.h"
 #include "../src/globals.h"
+#include "../src/actions/actions.h"
 #include <d3dcompiler.h>
 #include <cmath>
 #include <cstdint>
@@ -1518,4 +1519,46 @@ TEST_CASE("FALD temporal run plan: routing, delay ring, resets, panel clock, set
     FaldTemporalIdle(&s);                      // the layer did not run: all void
     CHECK_FALSE(s.stateValid); CHECK(s.settleLeft == 0u); CHECK(s.delayCount == 0u); CHECK(s.lastRunQpc == 0);
     CHECK_FALSE(FaldTemporalSettlePending(nullptr));
+}
+
+// The interfaces' FALD rows (act::SetFaldStarField / act::SetFaldDebugView, applied to both modes by EditFaldShared):
+// the ranges the classic Corrections rows clamp to, and "changed" only when a value moves.
+TEST_CASE("FALD rows: starfield fields clamp to their ranges, views out of range read as the corrected image") {
+    FaldStarfieldSettings s;
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Even, 0.5f));
+    CHECK(s.even == doctest::Approx(0.5f));
+    CHECK_FALSE(act::SetFaldStarField(s, act::FaldStarField::Even, 0.5f));    // the same value: no edit
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Even, 3.0f));
+    CHECK(s.even == 1.0f);
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Strength, -1.0f));
+    CHECK(s.strength == 0.0f);
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Spread, 9.0f));
+    CHECK(s.targetSigma == 4.0f);
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Keep, 25000.0f));
+    CHECK(s.keepNits == 10000.0f);
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Keep, std::nanf("")));
+    CHECK(s.keepNits == 0.0f);                                                  // NaN = 0, as the classic rows
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Reach, 3.6f));
+    CHECK(s.evenReach == 4u);                                                   // whole zones
+    CHECK(act::SetFaldStarField(s, act::FaldStarField::Reach, 99.0f));
+    CHECK(s.evenReach == FALD_STAR_EVEN_REACH_MAX);
+    CHECK_FALSE(act::SetFaldStarField(s, act::FaldStarField::Reach, (float)FALD_STAR_EVEN_REACH_MAX));
+    // Only the field asked for moves.
+    const FaldStarfieldSettings d;
+    FaldStarfieldSettings t;
+    act::SetFaldStarField(t, act::FaldStarField::Spread, 1.25f);
+    CHECK(t.targetSigma == doctest::Approx(1.25f));
+    CHECK(t.even == d.even);
+    CHECK(t.strength == d.strength);
+    CHECK(t.keepNits == d.keepNits);
+    CHECK(t.evenReach == d.evenReach);
+    CHECK(t.lift == d.lift);
+    CHECK(t.enabled == d.enabled);
+
+    FaldSettings f;
+    CHECK_FALSE(act::SetFaldDebugView(f, 0));
+    CHECK(act::SetFaldDebugView(f, act::kFaldDebugViews - 1));
+    CHECK(f.debugMode == act::kFaldDebugViews - 1);
+    CHECK(act::SetFaldDebugView(f, act::kFaldDebugViews));                      // out of range: the corrected image
+    CHECK(f.debugMode == 0u);
 }

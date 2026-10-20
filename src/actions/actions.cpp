@@ -12,6 +12,7 @@
 #include "mhc.h"
 #include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
 #include "windows_tonemap.h"
+#include <cmath>
 #include <cstdio>
 #include <iostream>
 #include <mutex>
@@ -269,6 +270,52 @@ Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload
     if (!live && d != ReconcileDecision::Start && d != ReconcileDecision::Restart) FaldPanelFileChangedReinject();
     Finish(mon);
     return Done();
+}
+
+Result ClearFaldPanelFile(int mon, bool hdr) {
+    if (!ValidMonitor(mon)) return Done(false);
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);   // the pipe thread reads this wstring
+        FaldSettings& fald = FaldOf(g_gui.monitorSettings[mon], hdr);
+        if (fald.paramsPath.empty() && !fald.enabled) return Done(false);
+        fald.paramsPath.clear();
+        fald.enabled = false;   // a layer switched on without a file would come back on with the next one
+    }
+    // Hook mode: the resident hook forgets the file it holds. Nothing is re-injected for it: with the layer off a
+    // held file is inert (act::DecideHookStale), and the next start stages none.
+    FaldPanelFileChangedLive(mon, hdr);
+    PushFald(mon, hdr, false);
+    Finish(mon);
+    return Done();
+}
+
+bool SetFaldDebugView(FaldSettings& f, unsigned int view) {
+    if (view >= kFaldDebugViews) view = 0;
+    const bool changed = f.debugMode != view;
+    f.debugMode = view;
+    return changed;
+}
+
+bool SetFaldStarField(FaldStarfieldSettings& s, FaldStarField field, float v) {
+    if (!(v >= 0.0f)) v = 0.0f;   // NaN too
+    switch (field) {
+    case FaldStarField::Reach: {
+        const float r = std::floor(v + 0.5f);
+        const unsigned int n = r >= (float)FALD_STAR_EVEN_REACH_MAX ? FALD_STAR_EVEN_REACH_MAX : (unsigned int)r;
+        const bool changed = s.evenReach != n;
+        s.evenReach = n;
+        return changed;
+    }
+    case FaldStarField::Even:     v = Clamp(v, 0.0f, 1.0f); break;
+    case FaldStarField::Strength: v = Clamp(v, 0.0f, 1.0f); break;
+    case FaldStarField::Spread:   v = Clamp(v, 0.0f, 4.0f); break;
+    case FaldStarField::Keep:     v = Clamp(v, 0.0f, 10000.0f); break;
+    }
+    float& t = field == FaldStarField::Even ? s.even : field == FaldStarField::Strength ? s.strength
+             : field == FaldStarField::Spread ? s.targetSigma : s.keepNits;
+    const bool changed = t != v;
+    t = v;
+    return changed;
 }
 
 Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit) {
@@ -641,6 +688,13 @@ void SetConsoleLog(bool on) {
 
 void SetDlcFolder(const std::wstring& folder) {
     g_dlcFolder = folder;
+    if (folder.empty()) g_dlcFolderLast.clear();
+    SaveSettings();
+}
+
+void SetDlcFolderLastUsed(const std::wstring& folder) {
+    if (g_dlcFolderLast == folder) return;
+    g_dlcFolderLast = folder;
     SaveSettings();
 }
 

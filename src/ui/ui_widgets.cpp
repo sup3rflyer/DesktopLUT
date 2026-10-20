@@ -461,7 +461,7 @@ bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b, L
     return clicked;
 }
 
-bool Node(const char* id, const char* label, Light light, bool selected, bool off, ImVec2 sizeDip, bool showLight) {
+bool Node(const char* id, const char* label, Light light, bool selected, bool off, ImVec2 sizeDip, bool showLight, bool add) {
     const ImVec2 size(Snap(Px(sizeDip.x)), Snap(Px(sizeDip.y)));
     const ImVec2 p = SnapV(ImGui::GetCursorScreenPos());
     ImGui::SetCursorScreenPos(p);
@@ -506,7 +506,15 @@ bool Node(const char* id, const char* label, Light light, bool selected, bool of
     const float groupW = d + gap + (ib.right - ib.left);
     const float x0 = Snap(p.x + (size.x - groupW) * 0.5f) + shift;
     const float cy = p.y + size.y * 0.5f + shift;
-    if (showLight) DrawLight(dl, ImVec2(x0 + d * 0.5f, Snap(cy)), light, d, lightInk);
+    if (showLight && add) {
+        // The offer: a plus in the label's ink, as wide as a light.
+        const float t = Snap(Px(1.0f)) > 1.0f ? Snap(Px(1.0f)) : 1.0f;
+        const float lx = Snap(x0), ly = Snap(cy - d * 0.5f), mx = Snap(x0 + (d - t) * 0.5f), my = Snap(cy - t * 0.5f);
+        dl->AddRectFilled(ImVec2(lx, my), ImVec2(lx + d, my + t), Col(text));
+        dl->AddRectFilled(ImVec2(mx, ly), ImVec2(mx + t, ly + d), Col(text));
+    } else if (showLight) {
+        DrawLight(dl, ImVec2(x0 + d * 0.5f, Snap(cy)), light, d, lightInk);
+    }
     DrawText(dl, Font::Label, kSizeLabel, x0 + d + gap - ib.left, cy, text, label);
     return clicked;
 }

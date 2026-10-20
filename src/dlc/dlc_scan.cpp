@@ -103,16 +103,43 @@ std::wstring FolderStamp(const std::wstring& folderName) {
 }  // namespace
 
 bool LooksLikeDlcFolder(const std::wstring& dir) {
-    return !dir.empty() && (IsFile(dir + L"\\calibration_profile.yaml") || IsFile(dir + L"\\stack_registry.json"));
+    if (dir.empty()) return false;
+    if (IsFile(dir + L"\\calibration_profile.yaml") || IsFile(dir + L"\\stack_registry.json")) return true;
+    return IsFile(dir + L"\\calibration_profile.example.yaml") && IsDir(dir + L"\\src\\dlc");
 }
 
-std::wstring ResolveFolder(const std::wstring& configured, const std::wstring& exeDir) {
+std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std::wstring& lastUsed) {
+    std::vector<std::wstring> out;
+    auto add = [&out](const std::wstring& path) {
+        if (path.empty()) return;
+        // Lexical only (GetFullPathNameW resolves "..": no file is touched); no trailing separator.
+        std::vector<wchar_t> full(32768);
+        const DWORD n = GetFullPathNameW(path.c_str(), (DWORD)full.size(), full.data(), nullptr);
+        if (n == 0 || n >= full.size()) return;
+        std::wstring p(full.data(), n);
+        while (p.size() > 3 && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+        for (const std::wstring& q : out) if (NormPath(q) == NormPath(p)) return;
+        out.push_back(p);
+    };
+    if (!exeDir.empty()) {
+        add(exeDir + L"\\DLC");
+        add(exeDir);
+        add(exeDir + L"\\..\\DLC");
+        add(exeDir + L"\\..\\..\\DLC");
+    }
+    add(lastUsed);
+    return out;
+}
+
+std::wstring ResolveFolder(const std::wstring& configured, const std::vector<std::wstring>& candidates, bool* detected) {
+    if (detected) *detected = false;
     if (!configured.empty()) return configured;
-    if (exeDir.empty()) return {};
-    wchar_t full[MAX_PATH] = {};
-    const std::wstring guess = exeDir + L"\\..\\..\\DLC";
-    if (!GetFullPathNameW(guess.c_str(), MAX_PATH, full, nullptr)) return {};
-    return LooksLikeDlcFolder(full) ? std::wstring(full) : std::wstring();
+    for (const std::wstring& c : candidates) {
+        if (!LooksLikeDlcFolder(c)) continue;
+        if (detected) *detected = true;
+        return c;
+    }
+    return {};
 }
 
 std::wstring PatchMetricsPath(const std::wstring& runDir) {
@@ -237,7 +264,13 @@ std::thread g_thread;
 bool g_stop = false;
 std::atomic<bool> g_cancel{ false };   // StopScanner: an in-flight scan returns early
 bool g_scanWanted = false;
-std::wstring g_folder;
+struct ScanRequest {
+    std::wstring configured;
+    std::vector<std::wstring> candidates;
+    uint64_t seq = 0;
+};
+ScanRequest g_request;       // the newest request (a scan takes the newest one)
+std::wstring g_folder;       // the folder the last scan read (worker)
 std::deque<std::wstring> g_patchQueue;
 std::shared_ptr<const Data> g_current = std::make_shared<Data>();
 std::map<std::wstring, std::shared_ptr<const std::vector<Patch>>> g_patches;   // run dir -> patches
@@ -255,7 +288,8 @@ void Notify() {
 void WorkerMain() {
     ScanCache cache;
     for (;;) {
-        std::wstring folder, patchRun;
+        ScanRequest req;
+        std::wstring patchRun;
         bool scan = false;
         {
             std::unique_lock<std::mutex> lock(g_mutex);
@@ -264,15 +298,26 @@ void WorkerMain() {
             if (g_scanWanted) {
                 scan = true;
                 g_scanWanted = false;
-                folder = g_folder;
+                req = g_request;
             } else {
                 patchRun = g_patchQueue.front();
                 g_patchQueue.pop_front();
             }
         }
         if (scan) {
-            std::shared_ptr<const Data> d = ScanFolder(folder, cache, Today(), &g_cancel);
+            // Resolved here, not by the caller: a candidate (the last folder used) may sit on a slow or absent drive.
+            bool detected = false;
+            const std::wstring folder = ResolveFolder(req.configured, req.candidates, &detected);
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (NormPath(folder) != NormPath(g_folder)) g_patches.clear();   // another folder: other runs
+                g_folder = folder;
+            }
+            std::shared_ptr<Data> d = ScanFolder(folder, cache, Today(), &g_cancel);
             if (g_cancel.load()) return;
+            d->configured = req.configured;
+            d->detected = detected && !d->folder.empty();
+            d->request = req.seq;
             {
                 std::lock_guard<std::mutex> lock(g_mutex);
                 g_current = d;
@@ -303,16 +348,19 @@ void SetScanListener(std::function<void()> onChange) {
     g_listener = std::move(onChange);
 }
 
-void RequestScan(const std::wstring& folder) {
+uint64_t RequestScan(const std::wstring& configured, const std::vector<std::wstring>& candidates) {
+    uint64_t seq = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (g_stop) return;
-        if (NormPath(folder) != NormPath(g_folder)) g_patches.clear();   // another folder: other runs
-        g_folder = folder;
+        if (g_stop) return 0;
+        g_request.configured = configured;
+        g_request.candidates = candidates;
+        seq = ++g_request.seq;
         g_scanWanted = true;
         EnsureWorkerLocked();
     }
     g_cv.notify_one();
+    return seq;
 }
 
 void StopScanner() {

@@ -83,8 +83,10 @@ bool Tab(const char* id, const char* label, bool selected, ImVec2 a, ImVec2 b, L
 float TabWidth(const char* label);   // pixels
 
 // A pixel-path stage on the signal line: its light, its label; `off` = not doing anything (dashed).
-// `showLight` = false leaves the light out (a narrow window).
-bool Node(const char* id, const char* label, Light light, bool selected, bool off, ImVec2 sizeDip, bool showLight = true);
+// `showLight` = false leaves the light out (a narrow window). `add`: a stage not set up yet, offered in its place —
+// a "+" where the light goes, so the node keeps its size when the stage arrives.
+bool Node(const char* id, const char* label, Light light, bool selected, bool off, ImVec2 sizeDip, bool showLight = true,
+          bool add = false);
 
 // The live-layers switch (a check box in Light). Draws at the cursor; returns true when clicked.
 bool Switch(const char* id, const char* label, bool on);

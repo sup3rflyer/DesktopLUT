@@ -502,7 +502,57 @@ TEST_CASE("dlc scan: a folder with profile, registry, reports and runs; reports 
     // No folder, or one that does not exist: an empty scan.
     CHECK(ScanFolder(L"", cache, "2026-03-10")->folder.empty());
     CHECK(ScanFolder(root + L"\\missing", cache, "2026-03-10")->folder.empty());
-    CHECK(ResolveFolder(L"X:\\configured", L"") == L"X:\\configured");
+    CHECK(ResolveFolder(L"X:\\configured", {}) == L"X:\\configured");
+}
+
+// Where an unconfigured DesktopLUT finds DLC: a release unpacked beside DLC, a DLC folder inside the exe's folder, a
+// source checkout (bin\Release), then the folder DLC was last found in. The configured folder is authoritative.
+TEST_CASE("dlc folder: candidates in order, the first one holding DLC's files wins, the setting is authoritative") {
+    // Candidates: lexical (no file touched), full paths, no duplicates, the last one used at the end.
+    const auto c = FolderCandidates(L"C:\\Apps\\Repo\\bin\\Release", L"d:\\dlc");
+    REQUIRE(c.size() == 5);
+    CHECK(c[0] == L"C:\\Apps\\Repo\\bin\\Release\\DLC");
+    CHECK(c[1] == L"C:\\Apps\\Repo\\bin\\Release");
+    CHECK(c[2] == L"C:\\Apps\\Repo\\bin\\DLC");
+    CHECK(c[3] == L"C:\\Apps\\Repo\\DLC");
+    CHECK(c[4] == L"d:\\dlc");
+    CHECK(FolderCandidates(L"C:\\Apps\\Repo\\bin\\Release", L"C:\\apps\\repo\\DLC\\").size() == 4);   // already a candidate
+    CHECK(FolderCandidates(L"", L"D:\\DLC") == std::vector<std::wstring>{ L"D:\\DLC" });
+    CHECK(FolderCandidates(L"", L"").empty());
+
+    TempDir t;
+    const std::wstring exe = t.mkdir(L"Tools\\DesktopLUT");
+    const std::wstring last = t.mkdir(L"Elsewhere\\DLC");
+    t.write(L"Elsewhere\\DLC\\stack_registry.json", "{}");
+    bool detected = true;
+    // Nothing next to the exe: the folder last found.
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(exe, last), &detected), last));
+    CHECK(detected);
+    // Beside the exe's folder (a release unpacked next to DLC) comes first...
+    const std::wstring beside = t.mkdir(L"Tools\\DLC");
+    t.write(L"Tools\\DLC\\calibration_profile.yaml", "displays: []\n");
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(exe, last)), beside));
+    // ...and a DLC folder inside the exe's own folder before that. A DLC not set up yet (its sources beside the example
+    // profile) counts; an empty "DLC" folder does not.
+    const std::wstring inside = t.mkdir(L"Tools\\DesktopLUT\\DLC");
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(exe, last)), beside));
+    t.mkdir(L"Tools\\DesktopLUT\\DLC\\src\\dlc");
+    t.write(L"Tools\\DesktopLUT\\DLC\\calibration_profile.example.yaml", "displays: []\n");
+    CHECK(LooksLikeDlcFolder(inside));
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(exe, last)), inside));
+    // A source checkout: <repo>\bin\Release\DesktopLUT.exe finds <repo>\DLC.
+    const std::wstring repoExe = t.mkdir(L"Repo\\bin\\Release");
+    const std::wstring repoDlc = t.mkdir(L"Repo\\DLC");
+    t.write(L"Repo\\DLC\\stack_registry.json", "{}");
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(repoExe, L"")), repoDlc));
+    // The setting wins, even over a folder found next to the exe and even when it does not exist (nothing found then).
+    CHECK(ResolveFolder(L"X:\\Not\\There", FolderCandidates(exe, last), &detected) == L"X:\\Not\\There");
+    CHECK_FALSE(detected);
+    ScanCache cache;
+    CHECK(ScanFolder(L"X:\\Not\\There", cache, "2026-10-20")->folder.empty());
+    // Nothing anywhere: none.
+    CHECK(ResolveFolder(L"", FolderCandidates(t.mkdir(L"Bare\\App"), L""), &detected).empty());
+    CHECK_FALSE(detected);
 }
 
 // Developer check against a real DLC folder (read-only): set DLUT_REAL_DLC to its path. Skipped otherwise.

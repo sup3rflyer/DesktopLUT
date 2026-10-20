@@ -150,10 +150,15 @@ std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode li
     path.push_back(stage(StageId::Lut3D,
                          liveLayer(!lut.empty(), !(hdr ? ms.hdrLutBypass : ms.sdrLutBypass), false, cubeEngineDown)));
 
-    // FALD needs a panel file to exist at all; it runs only on FP16 back buffers (HDR or ACM SDR).
+    // FALD needs a panel file to exist at all; it runs only on FP16 back buffers (HDR or ACM SDR). Without one the
+    // path may offer it in the same place (same label, a "+" where the light goes: nothing moves when it is added).
     if (!cc.fald.paramsPath.empty()) {
         const bool fp16 = live == Mode::HDR || live == Mode::AcmSdr || live == Mode::Unknown;
         path.push_back(stage(StageId::Fald, liveLayer(true, cc.fald.enabled && !rt.editHeld, !fp16, faldEngineDown)));
+    } else if (rt.offerFald && (hdr || live != Mode::SDR)) {
+        Stage add = stage(StageId::Fald, Light::None);
+        add.add = true;
+        path.push_back(add);
     }
 
     // The overlay shader tweak (pipe / INI only, no classic control) — shown so a live correction is

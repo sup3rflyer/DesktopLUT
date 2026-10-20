@@ -1203,6 +1203,7 @@ void SaveSettings() {
     // Interface
     IniWriteString(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
     IniWriteString(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
+    IniWriteString(L"UI", L"DlcFolderLast", g_dlcFolderLast.empty() ? nullptr : g_dlcFolderLast.c_str(), iniPath.c_str());
     IniWriteString(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
     static const wchar_t* const kThemeKeys[] = { L"dark", L"gray", L"light" };
     IniWriteString(L"UI", L"Theme", kThemeKeys[g_uiTheme >= 0 && g_uiTheme <= 2 ? g_uiTheme : 0], iniPath.c_str());
@@ -1294,6 +1295,7 @@ bool LoadSettings() {
         g_uiClassic = _wcsicmp(buf, L"classic") == 0;
         buf[0] = 0;
         g_dlcFolder = ReadLongINIString(L"UI", L"DlcFolder", iniPath.c_str());
+        g_dlcFolderLast = ReadLongINIString(L"UI", L"DlcFolderLast", iniPath.c_str());
         const int days = (int)GetPrivateProfileIntW(L"UI", L"RecalReminderDays", 90, iniPath.c_str());
         g_recalReminderDays = days >= 0 && days <= 3650 ? days : 90;
         buf[0] = 0;

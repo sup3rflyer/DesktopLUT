@@ -9,6 +9,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #include "imgui_internal.h"   // ClearActiveID (commit an edit before hiding)
+#include "actions/actions.h"
 #include "actions/logcap.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
@@ -68,6 +69,33 @@ bool g_shutDown = false;                         // ui::Shutdown ran: nothing is
 bool g_deactivateNextFrame = false;              // end the active edit in the next frame (it commits)
 bool g_minimized = false;
 int g_deviceFailures = 0;                        // consecutive device losses / creation failures
+uint64_t g_dlcRequest = 0;                       // the newest DLC scan request (dlc::RequestScan)
+std::wstring g_dlcWatched;                       // the folder the DLC run watch follows
+bool g_dlcWatchStarted = false;
+
+// The folder DesktopLUT.exe runs from.
+std::wstring ExeDir() {
+    wchar_t exe[MAX_PATH] = {};
+    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir(exe, n);
+    const size_t slash = dir.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : dir.substr(0, slash);
+}
+
+// The scan worker resolves the DLC folder (the configured one, else one it found): the run watch follows what it read,
+// and a folder found for the newest request is remembered as the last one used ([UI] DlcFolderLast), so a DesktopLUT
+// moved away from it still finds it. Outside a frame and outside a command (it saves).
+void FollowDlcFolder() {
+    const std::shared_ptr<const dlc::Data> d = dlc::Current();
+    if (!g_dlcWatchStarted || dlc::NormPath(d->folder) != dlc::NormPath(g_dlcWatched)) {
+        g_dlcWatchStarted = true;
+        g_dlcWatched = d->folder;
+        dlc::WatchLive(d->folder);
+    }
+    if (!g_busy && d->request != 0 && d->request == g_dlcRequest && d->detected && g_dlcFolder.empty() &&
+        dlc::NormPath(d->folder) != dlc::NormPath(g_dlcFolderLast))
+        act::SetDlcFolderLastUsed(d->folder);
+}
 
 void StopAnimTimer() {
     if (g_hwnd) KillTimer(g_hwnd, kAnimTimer);
@@ -205,6 +233,7 @@ void RenderFrame() {
     }
     g_inFrame = false;
     DrainCommands();
+    FollowDlcFolder();   // a scan finished (its listener asked for this frame)
 }
 
 // Input reaches ImGui first; a few extra frames let hover/press states and layout settle. The frame
@@ -467,18 +496,14 @@ void Invalidate() {
 }
 
 std::wstring DlcFolder() {
-    wchar_t exe[MAX_PATH] = {};
-    const DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    std::wstring dir(exe, n);
-    const size_t slash = dir.find_last_of(L"\\/");
-    dir = slash == std::wstring::npos ? std::wstring() : dir.substr(0, slash);
-    return dlc::ResolveFolder(g_dlcFolder, dir);
+    if (!g_dlcFolder.empty()) return g_dlcFolder;   // the setting is authoritative
+    return dlc::Current()->folder;                  // else what the last scan found
 }
 
 void RequestDlcScan() {
-    const std::wstring folder = DlcFolder();
-    dlc::RequestScan(folder);
-    dlc::WatchLive(folder);          // the run in progress: polled while the interface is visible
+    // The worker resolves the folder (the candidates' file checks never run on this thread) and scans it.
+    g_dlcRequest = dlc::RequestScan(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast));
+    FollowDlcFolder();               // the run in progress: polled while the interface is visible
     dlc::SetLiveWatchActive(true);
 }
 

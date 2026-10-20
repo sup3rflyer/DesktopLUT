@@ -43,9 +43,22 @@ std::wstring FaldTransferMismatch(const std::wstring& path, bool hdr);
 Result SetFaldEnabled(int mon, bool hdr, bool on);
 // Sets the panel file; `reload` also bumps reloadSeq when the path is unchanged (re-browsing = reload).
 Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload);
+// Takes a mode's panel file away and switches its layer off (the stage goes; the shared rows keep their values).
+Result ClearFaldPanelFile(int mon, bool hdr);
 // Applies `edit` to both modes' FALD settings under the lock (the shared rows: view, pedestal, LED lag,
 // starfield). `edit` returns true when it changed something; only then is the change pushed and saved.
 Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit);
+
+// Edits for EditFaldShared (pure; tested). Each returns true when it changed something.
+// The debug view (FaldSettings::debugMode, not persisted): 0 the corrected image, 1..9 the views fald_shader.h
+// draws; out of range = 0.
+constexpr unsigned int kFaldDebugViews = 10;
+bool SetFaldDebugView(FaldSettings& f, unsigned int view);
+// The starfield fields the interfaces show (the others are INI / pipe only), clamped to the ranges the classic rows
+// use: even and strength 0..1, spread (targetSigma) 0..4, keep 0..10000 nits, reach (evenReach) whole zones
+// 0..FALD_STAR_EVEN_REACH_MAX. NaN and negatives = 0.
+enum class FaldStarField { Even, Strength, Spread, Keep, Reach };
+bool SetFaldStarField(FaldStarfieldSettings& s, FaldStarField field, float v);
 
 // ---- MHC profile (per mode) -----------------------------------------------------------------------
 Result MhcInstall(int mon, bool hdr);
@@ -81,7 +94,10 @@ void SetVrrWhitelistEnabled(bool on);
 // The whitelists, as a list of process names (any separator; normalised to "a.exe, b.exe"). Applied and saved.
 void SetGammaWhitelist(const std::wstring& raw);
 void SetVrrWhitelist(const std::wstring& raw);
-void SetDlcFolder(const std::wstring& folder);   // empty = detect next to DesktopLUT
+// The DLC folder ([UI] DlcFolder, authoritative). Empty = found automatically (dlc::FolderCandidates); clearing it
+// also forgets the folder last found ([UI] DlcFolderLast), so CLEAR goes back to what is next to DesktopLUT.
+void SetDlcFolder(const std::wstring& folder);
+void SetDlcFolderLastUsed(const std::wstring& folder);   // a scan found DLC here (no folder configured)
 void SetUiTheme(int theme);                     // 0 dark, 1 gray, 2 light (the interface applies it)
 void SetUiDlcCharts(const std::wstring& encoded);   // the DLC tab's chart picks and options ([UI] DlcCharts)
 void SetRecalReminderDays(int days);             // 0 = off

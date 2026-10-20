@@ -26,7 +26,7 @@ bool IsVisible();               // GUI thread.
 void Shutdown();                // GUI thread: hub teardown, before anything pumps.
 void Invalidate();              // Any thread: request one redraw (coalesced).
 void NotifyDisplayChanged();    // GUI thread: displays or colour modes changed; refresh if visible.
-std::wstring DlcFolder();       // GUI thread: the DLC folder in use (configured, else detected); "" none
+std::wstring DlcFolder();       // GUI thread: the DLC folder in use (configured, else the last scan's find); "" none
 void RequestDlcScan();          // GUI thread: re-read the DLC folder (off-thread; redraws when done)
 void SetLogRedraws(bool on);    // a diagnostic line redraws the interface (the log view is showing)
 void ApplyUiTheme();            // GUI thread, outside a frame: g_uiTheme changed; re-theme the window
