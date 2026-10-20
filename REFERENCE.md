@@ -439,6 +439,14 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   show on a static desktop.
 - Cost: four small compute passes on the zone grid (48×48 × 2 sub-cells on the PA32UCXR) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
+- **Flank fade** (experimental, default off; the frozen fade stack ASF10 + T11_TMTC, `shared/fald_fade.h`): fades
+  the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside the soft knee's reach,
+  and low-passes the fade over content frames along the content's motion (phase correlation + a cut test). INI per
+  monitor and mode `…FaldFlankFade` (absent = off; `…FaldLowExt` is reserved and not applied). Pipe:
+  `runtime.fald_flank_fade`; `state.get` reports `fald_flank_fade` / `fald_low_ext`. Overlay and hook (faldFlags
+  bit 8); its temporal state resets when the layer idles, on a panel-file switch and on re-injection. Cost at 4K:
+  ~550 MB VRAM, ~250 compute dispatches per content frame — not measured on hardware. Float32 twin:
+  `DLC/src/dlc/fald/fadeemu.py`.
 
 ### In the DWM hook (phase one)
 
