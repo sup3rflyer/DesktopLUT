@@ -52,7 +52,7 @@ bool g_ready = false;
 enum PixOp : unsigned int {
     P_MI = 0, P_RAW0 = 1, P_THIN = 2, P_W = 3, P_CARE = 4, P_PP0 = 5, P_DIV = 6, P_BLEND = 7, P_HYB = 8, P_LOG = 9,
     P_LOGEPS = 10, P_CLGATE = 11, P_CLADD8 = 12, P_ADDF = 13, P_CONE = 14, P_CONEF = 15, P_CONEAP = 16, P_DEC = 17,
-    P_SUB = 18, P_TOUT = 19
+    P_SUB = 18, P_TOUT = 19, P_PAD = 20
 };
 
 // the FadeCB layout (fald_fade_shader.h)
@@ -65,8 +65,10 @@ struct FadeCBData {
 static_assert(sizeof(FadeCBData) == 64, "FadeCB is 4 rows");
 
 // The Gaussian sigmas the stack uses (PORT_PLAN 1.1-1.3), their half kernels in one buffer
-const double kSigmas[] = { 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 24.0, 32.0 };
-const unsigned int kNumSigmas = 8;
+const double kSigmas[] = { 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 24.0, 32.0, 16.0 };   // 16: B16, the lit floor (F12A_B16)
+const unsigned int kNumSigmas = 9;
+// A (F12A_B16): the CL closing runs on the 1/8-res fade zero-padded by 2 x its radius 40 (fald_fade_shader.h FADE_CL_PAD)
+const unsigned int kClPad = 80;
 
 // dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
 // order in double, w[r + j] / sum stored float32.
@@ -98,7 +100,8 @@ struct FaldFade {
     // quarter resolution
     FadeTex qFq, qCone, qA, qB, qTmp, qLq, qLqPrev[2], qLq4, qG, qDec, qSw, qLw, qGlq, qGlw, qS[2], qD, qKq;
     // eighth resolution
-    FadeTex eF8, eTmp, eL8c, eA, eB, eOpen, eGate, eFc, eAdd8, eL8raw, eLf, eFopen, eX, eMag, eR, eL8, eL8Prev[2];
+    FadeTex eF8, eTmp, eL8c, eA, eB, eOpen, eGate, eAdd8, eL8raw, eLf, eFopen, eX, eMag, eR, eL8, eL8Prev[2];
+    FadeTex ePad0, ePad1, ePad2;                                 // A: the closing's padded maps, (W8 + 2 kClPad) x (H8 + 2 kClPad)
     FadeTex eC1, eC2, eSpec, eSpecPrev[2];                       // complex (R32G32F)
     // the push-pull pyramid, levels 1 .. top (level 0 = full res, in S[]); (h, w) per level
     std::vector<FadeTex> pS, pW, pE, pU, pT;
@@ -225,9 +228,9 @@ void ReleaseAll(FaldFade* f) {
     for (auto& t : f->S) RelTex(t);
     FadeTex* q[] = { &f->qFq, &f->qCone, &f->qA, &f->qB, &f->qTmp, &f->qLq, &f->qLqPrev[0], &f->qLqPrev[1], &f->qLq4,
                      &f->qG, &f->qDec, &f->qSw, &f->qLw, &f->qGlq, &f->qGlw, &f->qS[0], &f->qS[1], &f->qD, &f->qKq,
-                     &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eFc, &f->eAdd8, &f->eL8raw,
+                     &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eAdd8, &f->eL8raw,
                      &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1], &f->eC1,
-                     &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1], &f->hann, &f->specG };
+                     &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1], &f->hann, &f->specG, &f->ePad0, &f->ePad1, &f->ePad2 };
     for (FadeTex* t : q) RelTex(*t);
     for (auto* v : { &f->pS, &f->pW, &f->pE, &f->pU, &f->pT }) { for (auto& t : *v) RelTex(t); v->clear(); }
     f->lvH.clear(); f->lvW.clear();
@@ -465,10 +468,11 @@ void PlanBuild(FaldFade* f, unsigned int width, unsigned int height) {
     for (FadeTex* t : { &f->qFq, &f->qCone, &f->qA, &f->qB, &f->qTmp, &f->qLq, &f->qLqPrev[0], &f->qLqPrev[1], &f->qLq4,
                         &f->qG, &f->qDec, &f->qSw, &f->qLw, &f->qGlq, &f->qGlw, &f->qS[0], &f->qS[1], &f->qD, &f->qKq })
         add(t, f->Wq, f->Hq, BK_R32F);
-    for (FadeTex* t : { &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eFc, &f->eAdd8, &f->eL8raw,
+    for (FadeTex* t : { &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eAdd8, &f->eL8raw,
                         &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1] })
         add(t, f->W8, f->H8, BK_R32F);
     for (FadeTex* t : { &f->eC1, &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1] }) add(t, f->W8, f->H8, BK_RG32F);
+    for (FadeTex* t : { &f->ePad0, &f->ePad1, &f->ePad2 }) add(t, f->W8 + 2 * kClPad, f->H8 + 2 * kClPad, BK_R32F);   // A
     // the push-pull pyramid: halve (ceil) while the smaller side of the last level is > 2 (cands9.pushpull)
     unsigned int h = height, w = width;
     f->lvH.clear(); f->lvW.clear();
@@ -642,9 +646,12 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     Ext(f, ctx, 50, 1, f->eL8c, f->eA, f->eB);
     Ext(f, ctx, 50, 0, f->eB, f->eA, f->eOpen);                            // grey opening, 101
     Pix(f, ctx, P_CLGATE, W8, H8, { &f->eL8c, &f->eOpen }, { &f->eGate });
-    Ext(f, ctx, 40, 0, f->eF8, f->eA, f->eB);
-    Ext(f, ctx, 40, 1, f->eB, f->eA, f->eFc);                              // grey closing, 81
-    Pix(f, ctx, P_CLADD8, W8, H8, { &f->eFc, &f->eF8, &f->eGate }, { &f->eAdd8 });
+    // A: the closing of f8 embedded in fade 0 (r12a/cands12a.py closing12): pad by 2 rc = 80 texels of 0, grey closing 81 on
+    // the padded map (its clamp at the padded edges replicates zeros), CLADD8 reads it back at the +80 offset
+    Pix(f, ctx, P_PAD, W8 + 2 * kClPad, H8 + 2 * kClPad, { &f->eF8 }, { &f->ePad0 });
+    Ext(f, ctx, 40, 0, f->ePad0, f->ePad1, f->ePad2);                      // max 81
+    Ext(f, ctx, 40, 1, f->ePad2, f->ePad1, f->ePad0);                      // min 81: ePad0 = the padded closing
+    Pix(f, ctx, P_CLADD8, W8, H8, { &f->ePad0, &f->eF8, &f->eGate }, { &f->eAdd8 });
     Up(f, ctx, 8, f->eAdd8, S[1]);
     Gauss(f, ctx, 8.0, S[1], S[2], S[1]);
     Pix(f, ctx, P_ADDF, W, H, { &S[1] }, { nullptr, &f->fade });
@@ -663,10 +670,11 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     Down(f, ctx, 4, f->mi, f->qTmp);
     Pix(f, ctx, P_LOGEPS, Wq, Hq, { &f->qTmp }, { &f->qLq });
     Down(f, ctx, 4, f->fade, f->qFq);
-    // O1: the lit floor F = exp(up8(grey_open(ln max(down8(mi), 0.05), 101)))
+    // O1: the lit floor F = exp(up8(G16(grey_open(ln max(down8(mi), 0.05), 101)))) (B16: r12a/cands12a.py floor_lit12)
     Pix(f, ctx, P_LOG, W8, H8, { &f->eL8raw }, { &f->eLf });
     Ext(f, ctx, 50, 1, f->eLf, f->eA, f->eB);
     Ext(f, ctx, 50, 0, f->eB, f->eA, f->eFopen);
+    Gauss(f, ctx, 16.0, f->eFopen, f->eA, f->eFopen);                      // B16 (the H pass writes over the opening)
     Up(f, ctx, 8, f->eFopen, f->floorF, 1u);
     // knee_reach's per-texel step: 4 / 96 + |grad G1(ln max(down4(mi), 0.05))| / 2
     Pix(f, ctx, P_LOG, Wq, Hq, { &f->qTmp }, { &f->qLq4 });

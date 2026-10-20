@@ -549,6 +549,11 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
     for (const char* n : { "p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0",
                            "s10_sm_seattle", "s10_ac_firewater" })
         add(std::string("still_") + n, C, true, true, { n }, 3840, 2160);
+    // round 12a's three stills (F12A_B16, r12a/PORT_DELTA.md §4: the ACES markers 18 / 52 and A's largest effect), when the
+    // cell dir holds them (DLC tests/fald_fade_cells.py f12a; not in cells.txt, which is the OFF matrix's frozen set)
+    for (const char* n : { "aces_m18", "aces_m52", "s10_ac_redspot" })
+        if (GetFileAttributesA((cellDir + "/" + n + ".rgba16f").c_str()) != INVALID_FILE_ATTRIBUTES)
+            add(std::string("still_") + n, C, true, true, { n }, 3840, 2160);
     add("still_x_naninf", C, true, false, { "x_naninf" }, 3840, 2160);                       // star off: the sanitise cell
     add("still_x_odd1366", Widen(cellDir + "/odd_panel.bin"), true, true, { "x_odd1366" }, 1366, 768);
     if (!SDR.empty()) add("still_sdr_n7_lamp", SDR, false, true, { "n7_lamp" }, 3840, 2160);

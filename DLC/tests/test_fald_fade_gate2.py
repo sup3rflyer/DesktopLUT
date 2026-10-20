@@ -36,8 +36,11 @@ PANEL_SDR = Path(os.environ.get("FALD_FADE_PANEL_SDR",
                                 "H:/Projects/DesktopLUT/DLC/results/fald_daily_2026-10-06/pa32ucxr_refit_sdr_fald_panel_blur0.7.bin"))
 TOL_FILE = HERE / "fald_fade_frozen_tolerances.json"
 TOL_SHA_LF = "9267ba793571f4f1da0eb35986f7ca7ac11a423ee02817c9365bbcc051f1fb25"
+TOL_F12A_FILE = HERE / "fald_fade_frozen_tolerances_f12a.json"   # the F12A_B16 port's freeze (the same numbers)
+TOL_F12A_SHA_LF = "15dc5ff7e070096c20d3f855147a4ab62236857fe2968d417a33b9d8c1693f1f"
 STILLS = ("p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0",
-          "s10_sm_seattle", "s10_ac_firewater", "x_naninf", "x_odd1366", "sdr_n7_lamp")
+          "s10_sm_seattle", "s10_ac_firewater", "x_naninf", "x_odd1366", "sdr_n7_lamp",
+          "aces_m18", "aces_m52", "s10_ac_redspot")    # + round 12a's three (r12a/PORT_DELTA.md §4)
 SEQS = ("s10_sm_seattle__p6n", "s10_ac_firewater__p6", "t_hl0_v16__mv", "t_cutdark__mv")
 F_ADVANCE, F_PC_DY, F_PC_DX, F_USED, F_DY, F_DX, F_FRAC, F_EMD, F_CUT = 0, 1, 2, 7, 8, 9, 10, 11, 12
 
@@ -47,6 +50,8 @@ pytestmark = pytest.mark.skipif(not (CELLS and ON), reason="FALD_FADE_GATE_CELLS
 def _tol():
     b = TOL_FILE.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(b).hexdigest() == TOL_SHA_LF, "the frozen tolerance file changed"
+    b12 = TOL_F12A_FILE.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(b12).hexdigest() == TOL_F12A_SHA_LF, "the F12A_B16 tolerance freeze changed"
     return json.loads(b.decode("utf-8"))["gate2_hlsl_vs_f32"]
 
 
