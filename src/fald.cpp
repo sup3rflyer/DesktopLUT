@@ -931,6 +931,15 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         DumpTexture(r->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16); // ln background, near, speck-zone flag, w
         DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * cellW + lx, lit sum, a_eff
     }
+    if (r->fadeOn) {   // the fade stack: full res float32 (fade, fade_T, the lit floor F, reach of rounds 0 / 1), s at quarter res
+        const FaldFadeDebug d = FaldFadeDebugViews(r->fade);
+        DumpTexture(d.fade, dir + L"fald_fade.f32", d.width, d.height, 4);
+        DumpTexture(d.fadeT, dir + L"fald_fade_t.f32", d.width, d.height, 4);
+        DumpTexture(d.floorF, dir + L"fald_fade_floor.f32", d.width, d.height, 4);
+        DumpTexture(d.reach[0], dir + L"fald_fade_reach0.f32", d.width, d.height, 4);
+        DumpTexture(d.reach[1], dir + L"fald_fade_reach1.f32", d.width, d.height, 4);
+        DumpTexture(d.s, dir + L"fald_fade_s.f32", d.wq, d.hq, 4);
+    }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
     char clockText[3][192];                  // full-precision clock numbers (the stream's 6 digits cannot check k offline)
@@ -980,6 +989,10 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " even_reach " << r->star.evenReach << " cap_nits " << r->star.capNits << " strength " << r->star.strength
          << "\nstarfield area_lo " << r->star.areaLo << " area_hi " << r->star.areaHi << " peak_hi " << r->star.peakHi
          << " reach " << r->star.reach << " nb_lo " << r->star.nbLo << " nb_hi " << r->star.nbHi
+         << "\nflank_fade " << (r->fadeOn ? 1 : 0) << " (setting " << (fs.flankFade ? 1 : 0)
+         << "; the frozen fade stack ASF10 + T11_TMTC: files fald_fade.f32 / fald_fade_t.f32 / fald_fade_floor.f32 /"
+         << " fald_fade_reach0.f32 / fald_fade_reach1.f32 width x height float32, fald_fade_s.f32 quarter res; "
+         << (r->fade ? FaldFadeVramBytes(r->fade) >> 20 : 0ull) << " MB)"
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }

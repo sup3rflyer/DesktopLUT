@@ -325,6 +325,9 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     IniWriteString(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
+    // the frozen fade stack (ASF10 + T11_TMTC; default off) and item L (reserved: persisted, read by nothing yet)
+    WritePrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), cc.fald.flankFade, iniPath);
+    WritePrivateProfileBool(section, (p + L"FaldLowExt").c_str(), cc.fald.lowExt, iniPath);
     // the glow fill's keys (work guide S2, removed 2026-10-07): deleted, so a saved file carries no dead switch
     for (const wchar_t* k : { L"FaldGlowFill", L"FaldGlowStrength", L"FaldGlowReach", L"FaldGlowCapNits" })
         IniWriteString(section, (p + k).c_str(), nullptr, iniPath);
@@ -395,6 +398,9 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         FaldStarfieldClamp(st);
         cc.fald.star = st;
     }
+    // the frozen fade stack: an INI without the key loads OFF (= the layer before the port, bit for bit); item L reserved
+    cc.fald.flankFade = GetPrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), false, iniPath);
+    cc.fald.lowExt = GetPrivateProfileBool(section, (p + L"FaldLowExt").c_str(), false, iniPath);
 }
 
 void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,

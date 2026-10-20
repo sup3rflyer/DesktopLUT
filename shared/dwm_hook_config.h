@@ -131,18 +131,24 @@ static_assert(MAX_DWM_HOOK_MONITORS <= 32, "lutOffMask holds one bit per monitor
 
 // Starfield (work guide S1). Bit 7 was the glow fill's (S2, removed 2026-10-07): never set, ignored.
 #define DWM_HOOK_FALD_STAR_BIT      0x00000040u   // bit 6: starfield balancing
+// The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h): bit 8. Bit 9 = item L (the 1-3-nit extension, round 12):
+// RESERVED, never set by this host and ignored by this DLL. Bits 10-31 free. A host that predates bit 8 sends 0 = off.
+#define DWM_HOOK_FALD_FADE_BIT      0x00000100u   // bit 8: flank fade
+#define DWM_HOOK_FALD_LOWEXT_BIT    0x00000200u   // bit 9: item L (reserved)
 
-static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0) {
+static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int fade = 0) {
     if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
     return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
          | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
          | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u)
-         | (star ? DWM_HOOK_FALD_STAR_BIT : 0u);
+         | (star ? DWM_HOOK_FALD_STAR_BIT : 0u)
+         | (fade ? DWM_HOOK_FALD_FADE_BIT : 0u);
 }
 static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
 static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
 static inline int      DwmHookFaldPedMode(uint32_t w)  { return (w & DWM_HOOK_FALD_PEDMODE_BIT) != 0; }
 static inline int      DwmHookFaldStar(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) != 0; }
+static inline int      DwmHookFaldFade(uint32_t w)     { return (w & DWM_HOOK_FALD_FADE_BIT) != 0; }
 
 // ---------------------------------------------------------------------------
 // Tuning tail — the starfield parameters (floats), appended AFTER DwmHookSharedConfig

@@ -837,6 +837,14 @@ void CreateGUILayout(HWND hwnd) {
     g_gui.hwndFaldStarReach = CreateWindow(L"EDIT", L"8", WS_CHILD | WS_BORDER | ES_RIGHT,
         innerX + 250, faldS2Y, 30, h, panel2, (HMENU)ID_CORR_FALD_STAR_REACH, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldStarReach);
+    // Flank fade (2026-10-20, the frozen fade stack ASF10 + T11_TMTC; shared/fald_fade.h, brief
+    // DLC/results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md): the correction fades toward "layer off" on smooth steep
+    // flanks, low-passed along the content's motion. Applies to both modes like View. Default off until the owner's
+    // hardware gates pass. On the second starfield row's free right end: no new row, the group keeps its height.
+    g_gui.hwndFaldFlankFade = CreateWindow(L"BUTTON", L"Flank fade",
+        WS_CHILD | BS_AUTOCHECKBOX,
+        innerX + 300, faldS2Y, 90, h, panel2, (HMENU)ID_CORR_FALD_FLANK_FADE, nullptr, nullptr);
+    g_gui.tab2Controls.push_back(g_gui.hwndFaldFlankFade);
 
     g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + Windows tone map (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
 

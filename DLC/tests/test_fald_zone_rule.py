@@ -396,7 +396,7 @@ def test_hlsl_and_cpp_carry_the_zone_rule():
         return re.search(name + r' = R"\((.*?)\)";', src, re.S).group(1)
     common, stat = part("g_faldCommonSource"), part("g_faldStatSource")
     fields = re.findall(r"(?:uint|float) (\w+);", re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", common, re.S).group(1))
-    assert len(fields) == 76 and fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "_pad75"]
+    assert len(fields) == 76 and fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "fadeFlags"]
     # the sweep: the sum only under rule 1, only over mc > 0 (no pow(0), no negative, no NaN), exp(gamma * log) not pow()
     assert "if (boostRule == 1u && mc > 0.0f) powSum += exp(boostMeanGamma * log(mc));" in stat and "pow(" not in stat
     assert stat.index("if (mc > boostDimNits) dim++;") < stat.index("powSum += exp(") < stat.index("gPow[tid.x] = powSum;")

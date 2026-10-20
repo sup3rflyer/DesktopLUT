@@ -162,6 +162,7 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
 #define ID_CORR_FALD_STAR_STRENGTH 545
 #define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach   (lift is INI / pipe only)
+#define ID_CORR_FALD_FLANK_FADE  549   // flank fade (the frozen fade stack ASF10 + T11_TMTC), applies to both modes
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -1128,6 +1129,7 @@ struct GUIState {
     HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
     HWND hwndFaldStarStrength = nullptr;
     HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
+    HWND hwndFaldFlankFade = nullptr;   // flank fade (FaldSettings::flankFade), on the second starfield row
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

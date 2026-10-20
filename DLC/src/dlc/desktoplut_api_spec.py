@@ -95,7 +95,9 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "two absent on builds before 2026-09-20), fald_starfield (bool) + fald_star_even, "
                           "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
-                          "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), and "
+                          "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), "
+                          "fald_flank_fade (bool, runtime.fald_flank_fade) + fald_low_ext (bool, reserved; both absent "
+                          "on builds before 2026-10-20), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable; bypass_3dlut, bypass_primaries, bypass_grayscale (bool, every "
                           "pair: the interface's stage switches — the stage keeps its settings but is NOT applied; "
@@ -533,6 +535,23 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {"monitor_mode": "string", "enabled": "boolean", "even": "number", "lift": "number", "target_gain": "number", "target_sigma": "number", "keep_nits": "number",
              "even_reach": "number", "cap_nits": "number", "strength": "number", "area_lo": "number", "area_hi": "number",
              "peak_hi": "number", "reach": "number", "nb_lo": "number", "nb_hi": "number"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.fald_flank_fade",
+            "FALD compensation layer: the frozen fade stack ASF10 + T11_TMTC (frozen 2026-10-19; default off until the "
+            "owner's hardware gates pass; shared/fald_fade.h, float32 twin dlc/fald/fadeemu.py, brief "
+            "results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md): the correction fades toward 'layer off' on smooth steep "
+            "flanks, low-passed over content frames along the content's motion, kept on lit floors outside the soft knee's "
+            "reach. Persisted per mode (INI <mode>_FaldFlankFade); reported as fald_flank_fade in state.get. Item L "
+            "(fald_low_ext) is reserved and has no setter.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "enabled": ApiParamSpec("boolean", description="the switch (default false)"),
+            },
+            {"monitor_mode": "string", "enabled": "boolean"},
             mutates_state=True,
             gui_thread_required=True,
         ),
