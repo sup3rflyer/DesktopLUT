@@ -419,7 +419,12 @@ float3 FadePost(float3 req, float3 img, int2 px) {
     float keep = lit * pos * (1.0f - reachTex.Load(int3(px, 0)));
     float fade = fadeTTex.Load(int3(px, 0)) * (1.0f - keep);
     float lsEff = ls * (1.0f - fade);
-    return max(req * exp(lsEff - ls), 0.0f);
+    // = max(req * exp(lsEff - ls), 0): req >= 0 (Correct clamps it) and exp >= 0, so the optimiser drops a plain max — and
+    // with it the max's NaN -> 0 (an inf input pixel: ls = ln(inf / inf) = NaN). Seen on WARP 2026-10-20: the NaN reached
+    // the round-1 statistic, where min(NaN, white) counts the pixel as white (that zone's drive 0.59 instead of 0.10).
+    // An integer NaN test the optimiser cannot fold restores the max: NaN -> 0, everything else unchanged.
+    float3 o = req * exp(lsEff - ls);
+    return ((asuint(o) & 0x7fffffffu) > 0x7f800000u) ? 0.0f : o;
 }
 )";
 
