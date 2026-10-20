@@ -777,7 +777,8 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "return img * (outM / safe);" in bal
     assert "max(hi - lo, 1e-12f)" in common                                            # StarSmooth = starfield._smoothstep
     # the balanced frame is what every pass reads: before Correct in the statistic pass, before the fields in the pixel pass
-    assert stat.index("if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));") < stat.index("img = Correct(img, bT, bE, g);")
+    corrected = "img = FadePost(Correct(img, bT, bE, g), img, int2((int)px, (int)py));"   # FadePost: the fade stack (fadeFlags 0 = req as it is)
+    assert stat.index("if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));") < stat.index(corrected)
     assert pixel.index("debugMode == 4) return src;") < pixel.index("if (starOn != 0u) img = Balance(") < pixel.index("Correct(img, bT, bE, gain)")
     assert "if (debugMode == 9)" in pixel and "if (starOn == 0u) return src;" in pixel
     assert stat.count("starOn") == 1 and "starOn" not in part("g_faldConvSource")
@@ -837,7 +838,7 @@ def test_hlsl_star_passes_mirror_the_reference():
     # C++ order: the plan of the source frame first, then the layer
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     assert c.index("if (r->starOn) RunStar(r);") < c.index("RunStat(r, 0);")
-    assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 20" in c
+    assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 23" in c   # t0..t22 (t20-t22: the fade stack)
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     assert "FALD_CB_BYTES = 320" in (_SHARED / "fald_panel.h").read_text(encoding="utf-8")        # 80 words since the lattice extent (fractional pitch, 2026-10-19)
     assert f"FALD_STAR_EVEN_REACH_MAX = {gpuemu.STAR_EVEN_REACH_MAX}" in h and f"FALD_STAR_REACH_MAX = {gpuemu.STAR_REACH_MAX}" in h
