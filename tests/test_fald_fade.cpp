@@ -361,6 +361,7 @@ struct OnSpec {
     bool star = true;
     std::vector<std::string> frames;   // paths relative to the cell dir, without extension
     int w = 3840, h = 2160;
+    bool fade = true;                  // false = the layer without the fade (base fields + output only: a diagnostic)
 };
 
 bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, const OnSpec& rs, std::string& err, double& secs) {
@@ -370,7 +371,7 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
     ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
     ctx.frameTimeExactMs = 16.667f;
     FaldSettings& fs = rs.hdr ? ctx.hdrColorCorrection.fald : ctx.sdrColorCorrection.fald;
-    fs.enabled = true; fs.paramsPath = rs.panel; fs.star.enabled = rs.star; fs.flankFade = true;
+    fs.enabled = true; fs.paramsPath = rs.panel; fs.star.enabled = rs.star; fs.flankFade = rs.fade;
     if (!FaldEnsureResources(&ctx, fs)) { err = ctx.fald ? ctx.fald->lastError : std::string("no resources"); FaldReleaseResources(&ctx); return false; }
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)rs.w; td.Height = (UINT)rs.h; td.MipLevels = 1; td.ArraySize = 1;
@@ -392,8 +393,10 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
         FaldRunPasses(&ctx, rtv, true);
         w.ic->Flush();
         const FaldResources* r = ctx.fald;
-        if (!r->fadeOn) { err = "the fade did not turn on"; break; }
-        const FaldFadeDebug d = FaldFadeDebugViews(r->fade);
+        if (rs.fade != r->fadeOn) { err = rs.fade ? "the fade did not turn on" : "the fade is on"; break; }
+        FaldFadeDebug d = {};
+        if (rs.fade) d = FaldFadeDebugViews(r->fade);
+        else { d.width = (unsigned)rs.w; d.height = (unsigned)rs.h; }
         char sub[32]; snprintf(sub, sizeof(sub), "/t%02zu", i);
         const std::string dir = outDir + "/" + rs.id + sub;
         CreateDirectoryA((outDir + "/" + rs.id).c_str(), nullptr);
@@ -409,12 +412,15 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
             const std::vector<uint8_t> b = ReadBack(t.second);
             if (!WriteBytes(dir + "/" + t.first, b.data(), b.size())) { err = "write " + dir; break; }
         }
-        const std::vector<uint8_t> fl = ReadBackBuffer(d.flags);
-        WriteBytes(dir + "/flags.u32", fl.data(), fl.size());
+        if (rs.fade) {
+            const std::vector<uint8_t> fl = ReadBackBuffer(d.flags);
+            WriteBytes(dir + "/flags.u32", fl.data(), fl.size());
+        }
         std::ofstream meta(dir + "/meta.txt");
         meta << "width " << d.width << "\nheight " << d.height << "\nwq " << d.wq << "\nhq " << d.hq << "\nw8 " << d.w8 << "\nh8 " << d.h8
              << "\nhas_history " << (d.hasHistory ? 1 : 0) << "\nstar " << (rs.star ? 1 : 0) << "\nhdr " << (rs.hdr ? 1 : 0)
-             << "\nframe " << rs.frames[i] << "\nvram_bytes " << FaldFadeVramBytes(r->fade) << "\n";
+             << "\nframe " << rs.frames[i] << "\nvram_bytes " << (rs.fade ? FaldFadeVramBytes(r->fade) : 0ull)
+             << "\nfade " << (rs.fade ? 1 : 0) << "\n";
     }
     secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     rtv->Release(); target->Release();
@@ -466,11 +472,13 @@ TEST_CASE("FALD fade: the passes compile with IEEE strictness and contain no flo
 // fields, base fields, T flags and output dumped to FALD_TEST_FADE_ON/<run>/tNN/ for DLC tests/test_fald_fade_gate2.py.
 // FALD_TEST_FADE_ONLY (optional) = a substring of the run ids to do.
 // FALD_TEST_FADE_FRAMES (optional) = at most this many frames per sequence (the negative control's short runs).
+// FALD_TEST_FADE_BASEONLY=1 (diagnostic) = the same runs with the flank fade OFF: base fields + output only.
 TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FALD_TEST_FADE_ON)") {
     const std::string cellDir = EnvStr("FALD_TEST_FADE_DIR"), outDir = EnvStr("FALD_TEST_FADE_ON"), only = EnvStr("FALD_TEST_FADE_ONLY");
     if (cellDir.empty() || outDir.empty()) return;
     const std::string framesEnv = EnvStr("FALD_TEST_FADE_FRAMES");
     const int seqFrames = framesEnv.empty() ? 16 : (std::max)(1, (std::min)(16, atoi(framesEnv.c_str())));
+    const bool baseOnly = EnvStr("FALD_TEST_FADE_BASEONLY") == "1";
     CreateDirectoryA(outDir.c_str(), nullptr);
     FadeWarp w;
     REQUIRE(w.ok);
@@ -479,7 +487,7 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
     REQUIRE_FALSE(C.empty());
     std::vector<OnSpec> runs;
     auto add = [&](const std::string& id, const std::wstring& panel, bool hdr, bool star, const std::vector<std::string>& frames, int fw, int fh) {
-        OnSpec s; s.id = id; s.panel = panel; s.hdr = hdr; s.star = star; s.frames = frames; s.w = fw; s.h = fh;
+        OnSpec s; s.id = id; s.panel = panel; s.hdr = hdr; s.star = star; s.frames = frames; s.w = fw; s.h = fh; s.fade = !baseOnly;
         runs.push_back(s);
     };
     for (const char* n : { "p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0",
