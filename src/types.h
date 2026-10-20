@@ -162,6 +162,7 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
 #define ID_CORR_FALD_STAR_STRENGTH 545
 #define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach   (lift is INI / pipe only)
+#define ID_CORR_FALD_FLANK_FADE  549   // flank fade (the frozen fade stack ASF10 + T11_TMTC), applies to both modes
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -605,6 +606,14 @@ struct FaldSettings {
     // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
     // resource for resource and dispatch for dispatch.
     FaldStarfieldSettings star;
+    // The frozen fade stack ASF10 + T11_TMTC (persisted INI <mode>_FaldFlankFade, GUI "Flank fade" /
+    // runtime.fald_flank_fade; shared/fald_fade.h): the correction fades toward "layer off" on smooth steep flanks, low-
+    // passed along the content's motion. Default OFF = today's layer bit for bit (until the owner's hardware gates pass;
+    // DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md section 6). An INI without the key loads OFF.
+    bool flankFade = false;
+    // Item L (the 1-3-nit zone-floor extension, round 12): RESERVED. Persisted (<mode>_FaldLowExt) so the setting has its
+    // home, but nothing reads it — the shader word (fadeFlags bit 1) is never set in this build.
+    bool lowExt = false;
 };
 
 // Tonemapping settings (HDR only)
@@ -1120,6 +1129,7 @@ struct GUIState {
     HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
     HWND hwndFaldStarStrength = nullptr;
     HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
+    HWND hwndFaldFlankFade = nullptr;   // flank fade (FaldSettings::flankFade), on the second starfield row
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;

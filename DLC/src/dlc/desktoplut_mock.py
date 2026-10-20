@@ -212,6 +212,9 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     star = _fald_star(entry)
     out["fald_starfield"] = star["enabled"]
     out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
+    # the frozen fade stack (2026-10-20; runtime.fald_flank_fade) and item L (reserved, no setter)
+    out["fald_flank_fade"] = bool(entry.get("flank_fade", False))
+    out["fald_low_ext"] = False
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -1035,6 +1038,14 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(ok=False, error="nb_hi must be >= nb_lo")
             fs["star"] = st
             return self.ok({"monitor_mode": key, **_fald_star(fs)})
+        if method == "runtime.fald_flank_fade":
+            # C++ DoFaldFlankFade (2026-10-20): the frozen fade stack's switch, persisted per mode; refusals word for word
+            if "enabled" not in params:
+                return DesktopLutResponse(ok=False, error="missing parameter: enabled")
+            if not isinstance(params.get("enabled"), bool):
+                return DesktopLutResponse(ok=False, error="enabled must be a boolean")
+            fs["flank_fade"] = params["enabled"]
+            return self.ok({"monitor_mode": key, "enabled": params["enabled"]})
         if method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

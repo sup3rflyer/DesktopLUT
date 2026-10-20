@@ -523,6 +523,9 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_star_reach", JNum((double)fs.star.reach));
                 l.set("fald_star_nb_lo", JNum((double)fs.star.nbLo));
                 l.set("fald_star_nb_hi", JNum((double)fs.star.nbHi));
+                // the frozen fade stack (runtime.fald_flank_fade) and item L (reserved: no setter, never applied)
+                l.set("fald_flank_fade", JBool(fs.flankFade));
+                l.set("fald_low_ext", JBool(fs.lowExt));
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)
                 uint32_t transfer = 0;
@@ -1658,6 +1661,25 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("nb_hi", JNum((double)out.nbHi));
 }
 
+// runtime.fald_flank_fade {monitor, mode, enabled}: the frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h; default
+// off). Persisted per mode. Item L (FaldSettings::lowExt) has no setter: reserved for round 12.
+void DoFaldFlankFade(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    const JsonValue* en = p.find("enabled");
+    if (!en) { error = "missing parameter: enabled"; return; }
+    if (en->type != JsonValue::Bool) { error = "enabled must be a boolean"; return; }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        fs.flankFade = en->b;
+    }
+    SaveSettings();
+    FaldPropagate(mon, isHDR);
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("enabled", JBool(en->b));
+}
+
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -2447,6 +2469,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_dump") DoFaldDump(params, result, error);
         else if (m == "runtime.fald_temporal") DoFaldTemporal(params, result, error);
         else if (m == "runtime.fald_starfield") DoFaldStarfield(params, result, error);
+        else if (m == "runtime.fald_flank_fade") DoFaldFlankFade(params, result, error);
         else if (m == "hook.set_routing") DoHookSetRouting(params, result, error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(params, result, error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(params, result, error);

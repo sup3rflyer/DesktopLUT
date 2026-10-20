@@ -547,6 +547,7 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     }
     if (!typing(g_gui.hwndFaldStarReach))
         SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(shown.star.evenReach).c_str());
+    SendMessage(g_gui.hwndFaldFlankFade, BM_SETCHECK, shown.flankFade ? BST_CHECKED : BST_UNCHECKED, 0);   // the fade stack
     // The whole layer runs in both paths (overlay: src/fald.cpp; DWM hook: dwm_hook/hook_fald.cpp), so every FALD
     // control is live in either mode.
     EnableWindow(g_gui.hwndFaldEnable, TRUE);
@@ -568,6 +569,7 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     EnableWindow(g_gui.hwndFaldStarStrength, TRUE);
     EnableWindow(g_gui.hwndFaldStarReach, TRUE);
     EnableWindow(g_gui.hwndFaldStarSigma, TRUE);
+    EnableWindow(g_gui.hwndFaldFlankFade, TRUE);   // the fade stack runs in both paths too
 
     // Windows tone map (the combo lists WindowsToneMap in order)
     SendMessage(g_gui.hwndWinToneMapCombo, CB_SETCURSEL, (WPARAM)settings.windowsToneMap, 0);
@@ -1833,6 +1835,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     bool c = f.star.enabled != on; f.star.enabled = on; return c; });
                 if (on)
                     SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose");
+            }
+            return 0;
+        // Flank fade (the frozen fade stack ASF10 + T11_TMTC, shared/fald_fade.h): both modes at once like View. Persisted.
+        case ID_CORR_FALD_FLANK_FADE:
+            if (HIWORD(wParam) == BN_CLICKED && act::ValidMonitor(g_gui.currentMonitor)) {
+                bool on = (SendMessage(g_gui.hwndFaldFlankFade, BM_GETCHECK, 0, 0) == BST_CHECKED);
+                act::EditFaldShared(g_gui.currentMonitor, [on](FaldSettings& f) {
+                    bool c = f.flankFade != on; f.flankFade = on; return c; });
+                if (on)
+                    SetStatus(L"FALD flank fade on (experimental)");
             }
             return 0;
         case ID_CORR_FALD_STAR_EVEN:

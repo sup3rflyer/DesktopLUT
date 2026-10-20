@@ -37,8 +37,8 @@ struct ID3D11Texture2D;
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
 // (t0..t19, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
-#define HOOK_FALD_SRV_SLOTS 20
-#define HOOK_FALD_UAV_SLOTS 4   // u0..u3: the panel-clock pass (LED lag mode 3) binds four
+#define HOOK_FALD_SRV_SLOTS 36  // t0..t35: the layer t0..t22 (t20..t22 = the fade stack's views), the fade passes t24..t35
+#define HOOK_FALD_UAV_SLOTS 8   // u0..u7: the fade passes bind up to u7 (the panel clock four)
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed
 // out by FaldAcquire and released wholesale by FaldReleaseAll (UninitializeStuff).
@@ -113,9 +113,11 @@ ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
 bool HookRequestFullRecompose();
 
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
-// the next run. star: starfield balancing. tuning = null: its defaults (older host).
+// the next run. star: starfield balancing. tuning = null: its defaults (older host). fade: the frozen fade stack
+// (faldFlags bit 8; shared/fald_fade.h) — its passes (shipped bytecode) and resources are created over the first presents
+// any monitor wants it (paced, fald_fade.h); the layer runs without the fade until they exist.
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning);
+                         const DwmHookFaldTuning* tuning, bool fade = false);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing
@@ -140,3 +142,14 @@ double FaldLastRunMicros(const FaldMonitor* m);
 void FaldPollDumpRequest();
 
 void FaldReleaseAll();
+
+#ifdef DLUT_HOOK_TESTING
+// Test seams (tests/test_fald_hook.cpp; the test exe only, never the DLL): a live panel delivery without its named
+// section (true = ingested: the entry swaps at its next FaldAcquire), and read access to an entry's fade state.
+struct FaldFade;
+struct ID3D11Buffer;
+bool FaldTestDeliver(int left, int top, bool isHdr, unsigned int gen, const void* payload, size_t bytes);
+FaldFade* FaldTestFade(FaldMonitor* m);
+bool FaldTestFadeOn(const FaldMonitor* m);
+ID3D11Buffer* FaldTestCB(FaldMonitor* m);
+#endif

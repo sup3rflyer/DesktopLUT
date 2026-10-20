@@ -112,6 +112,7 @@
     <ClCompile Include="shared\fald_panel.cpp" />
     <ClCompile Include="shared\fald_panel_live.cpp" />
     <ClCompile Include="shared\fald_temporal.cpp" />
+    <ClCompile Include="shared\fald_fade.cpp" />
     <ClCompile Include="src\fald.cpp" />
     <ClCompile Include="src\ui\ui_theme.cpp" />
     <ClCompile Include="src\actions\notify.cpp" />
@@ -164,6 +165,7 @@
     <ClCompile Include="tests\test_calib_snapshot.cpp" />
     <ClCompile Include="tests\test_fald.cpp" />
     <ClCompile Include="tests\test_fald_live.cpp" />
+    <ClCompile Include="tests\test_fald_fade.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
     <ClCompile Include="tests\test_hdr_dither.cpp" />
@@ -186,8 +188,18 @@
     <ClCompile Include="tests\test_dlc.cpp" />
     <ClCompile Include="tests\test_dlc_live.cpp" />
     <ClCompile Include="dwm_hook\hook_lut.cpp">
-      <!-- the DLL's own parser, compiled as the DLL builds it (test_lut_canonical.cpp round trip) -->
-      <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- the DLL's own parser, compiled as the DLL builds it (test_lut_canonical.cpp round trip). DLUT_HOOK_TESTING: the
+           hook sources in this exe log to %TEMP%, never to the real hook's log (hook_log.h; the same in every hook TU) -->
+      <PreprocessorDefinitions>DLUT_HOOK_TESTING;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="dwm_hook\hook_fald.cpp">
+      <!-- the hook's FALD layer, compiled as the DLL builds it, driven on WARP by tests/test_fald_hook.cpp. Its one name
+           shared with src/fald.cpp (FaldShadersReady) is renamed in this exe; DLUT_HOOK_TESTING adds the test seams and
+           keeps it off the host's named events (hook_fald.cpp OpenHostEvent) -->
+      <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="tests\test_fald_hook.cpp">
+      <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemGroup>
   <!-- Headers -->

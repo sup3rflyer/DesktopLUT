@@ -723,6 +723,17 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
             act::EditFaldShared(mon, [lag](FaldSettings& s) { bool c = s.temporalMode != (unsigned)lag; s.temporalMode = (unsigned)lag; return c; });
         });
     EndRow(row);
+
+    // The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h); both modes at once like LED LAG. Default off.
+    row = BeginRow("FLANK FADE");
+    RowTip(row, "Experimental. Fades the correction on smooth steep edges, along the motion.");
+    RowPlace(row);
+    bool fade = false;
+    if (OnOff("##fald_flank_fade", f.flankFade, &fade))
+        PostTo(r, [fade](int mon) {
+            act::EditFaldShared(mon, [fade](FaldSettings& s) { bool c = s.flankFade != fade; s.flankFade = fade; return c; });
+        });
+    EndRow(row);
 }
 
 void InspectShaderTweak(const DisplayRow& r, const Stage& st, bool hdr) {

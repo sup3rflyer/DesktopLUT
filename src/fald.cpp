@@ -1,6 +1,7 @@
 // FALD context-dependence correction — resources, passes, debug dump. See fald.h / shared/fald_shader.h.
 #include "fald.h"
 #include "../shared/fald_shader.h"
+#include "../shared/fald_fade.h"
 #include "types.h"
 #include "globals.h"
 #include <d3dcompiler.h>
@@ -29,6 +30,12 @@ static ID3D11ComputeShader* g_faldStatCombineCS = nullptr;
 static ID3D11ComputeShader* g_faldStarStatCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
+// The fade stack's passes (shared/fald_fade.cpp) are created from their shipped bytecode the first time a monitor turns the
+// flank fade on — no shader compiler on the render thread, FALD_FADE_SHADERS_PER_RUN per run of the layer — and its
+// resources the same way (FALD_FADE_RESOURCES_PER_RUN / FALD_FADE_BYTES_PER_RUN per run). Until both are complete the
+// layer runs without the fade (today's layer, bit for bit). A session that never uses it pays nothing. A shader failure
+// is latched (logged once) until the shaders are released (device loss).
+static bool g_faldFadeShadersFailed = false;
 
 static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz between params-file stamp checks
 // (FALD_RESUME_GAP_MS and the temporal helpers — FaldTemporalAlpha, FaldSettleFrames, the panel clock, the settle
@@ -156,6 +163,8 @@ bool InitFaldShaders() {
 }
 
 void ReleaseFaldShaders() {
+    FaldFadeReleaseShaders();
+    g_faldFadeShadersFailed = false;
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
     if (g_faldStarStatCombineCS) { g_faldStarStatCombineCS->Release(); g_faldStarStatCombineCS = nullptr; }
@@ -228,6 +237,7 @@ static void ReleaseAll(FaldResources* r) {
     SafeRelease(r->zonePartUAV); SafeRelease(r->zonePartBuf); r->zoneSlices = 1;
     ReleaseStar(r);
     ReleaseClock(r);
+    FaldFadeDestroy(r->fade); r->fade = nullptr; r->fadeOn = false; r->fadeKey = 0; r->fadeRetryCounter = 0;
     SafeRelease(r->cb);
     r->valid = false;
 }
@@ -535,11 +545,12 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     f[68] = r->clkFactor[0]; f[69] = r->clkFactor[1]; f[70] = r->clkFactor[2]; f[71] = r->clkFactor[3];
     // black-frame LED boost: the zone rule (words 72-74; read only when word 34 != 0)
     u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
-    u[75] = 0u;                                                                     // unused (was the glow fill's switch)
+    u[75] = r->fadeOn ? FALD_FADE_FLAG_FLANK : 0u;                                  // fadeFlags: the fade stack (bit 1 = L, reserved)
     g_context->Unmap(r->cb, 0);
 }
 
-static const UINT FALD_SRV_SLOTS = 20;   // t0..t19 (fald_shader.h)
+static const UINT FALD_SRV_SLOTS = 23;   // t0..t22 (fald_shader.h; t20..t22 = the fade stack's views: bound by RunStat(1) and
+                                         // the pixel pass while it is on, null elsewhere)
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
@@ -577,6 +588,10 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
         ID3D11ShaderResourceView* fields[2] = { r->bTrueSRV, r->bEstSRV };
         g_context->CSSetShaderResources(5, 2, fields);
         g_context->CSSetShaderResources(9, 1, &r->gainBSRV);      // smoothed (gain, ceiling B_est) of the previous round (C15)
+        if (r->fadeOn) {                                          // FadePost on round 0's request: fade_T, F, reach of round 0
+            ID3D11ShaderResourceView* fv[3] = { FaldFadeSrvFadeT(r->fade), FaldFadeSrvFloor(r->fade), FaldFadeSrvReach(r->fade, 0) };
+            g_context->CSSetShaderResources(20, 3, fv);
+        }
     }
     ID3D11UnorderedAccessView* uavs[3] = { r->driveUAV, r->activeUAV[roundIdx & 1u],    // u1: nullptr without a boost LUT
                                            r->zonePartUAV };                              // (the shader then never writes it)
@@ -724,6 +739,86 @@ static void RunGain(FaldResources* r) {
     g_context->CopyResource(r->gainBTex, r->gainATex);
 }
 
+// ---------------------------------------------------------------------------------------------
+// The frozen fade stack (FaldSettings::flankFade; shared/fald_fade.h — the same module the DWM hook runs)
+// ---------------------------------------------------------------------------------------------
+// The common views the fade passes that read the frame / a round's fields need (BindCommon's t0..t19; for a round's
+// reach also t5 / t6 = its fields, t9 = its smoothed gain).
+static FaldFadeCommon FadeCommon(FaldResources* r, bool roundFields) {
+    FaldFadeCommon c;
+    c.faldCB = r->cb;
+    c.sampler = g_faldSampler;
+    ID3D11ShaderResourceView* v[20] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
+                                        r->flatTrueSRV, r->flatEstSRV, nullptr, nullptr, nullptr, r->boostLutSRV, nullptr, nullptr,
+                                        r->starOn ? r->starPlanSRV : nullptr, nullptr, nullptr,
+                                        r->starOn ? r->starPlan2SRV : nullptr, nullptr };
+    for (int i = 0; i < 20; i++) c.srv[i] = v[i];
+    if (roundFields) { c.srv[5] = r->bTrueSRV; c.srv[6] = r->bEstSRV; c.srv[9] = r->gainBSRV; }
+    return c;
+}
+
+// The fade's resources for this frame size: created on the first run the setting is on (the shaders too), released when
+// it goes off. A failed creation runs the layer without it and is retried every ~300 runs (as EnsureStar).
+static bool EnsureFade(FaldResources* r) {
+    if (!FaldFadeShadersReady()) {
+        if (g_faldFadeShadersFailed) return false;
+        std::string err;
+        const FaldFadeStatus st = FaldFadeShadersStep(g_device, FALD_FADE_SHADERS_PER_RUN, &err);
+        if (st == FaldFadeStatus::Failed) {
+            g_faldFadeShadersFailed = true;
+            std::cerr << "[FALD] fade stack shaders could not be created: " << err << " - the flank fade stays off" << std::endl;
+            return false;
+        }
+        if (st == FaldFadeStatus::Pending) return false;   // the rest on the next runs; the layer runs without the fade
+        std::cout << "FALD fade stack shaders: created" << std::endl;
+    }
+    if (!r->fade) r->fade = FaldFadeCreate();
+    if (!r->fade) return false;
+    if (r->fadeRetryCounter != 0 && (r->fadeRetryCounter++ % 300) != 0) return false;   // after a failure: every ~300 runs
+    const bool wasBuilt = FaldFadeBuilt(r->fade);
+    const FaldFadeStatus st = FaldFadeEnsureStep(r->fade, g_device, (unsigned int)r->width, (unsigned int)r->height,
+                                                 FALD_FADE_RESOURCES_PER_RUN, FALD_FADE_BYTES_PER_RUN);
+    if (st == FaldFadeStatus::Ready) {
+        r->fadeRetryCounter = 0;
+        r->fadeFailLogged = false;
+        if (!wasBuilt) std::cout << "[FALD] fade stack resources: " << (FaldFadeVramBytes(r->fade) >> 20) << " MB" << std::endl;
+        return true;
+    }
+    if (st == FaldFadeStatus::Pending) return false;      // paced build: the layer runs without the fade meanwhile
+    r->fadeRetryCounter = 1;
+    if (!r->fadeFailLogged) {
+        std::cerr << "[FALD] fade stack textures could not be created: the flank fade stays off" << std::endl;
+        r->fadeFailLogged = true;
+    }
+    return false;
+}
+
+// The settings the cached frame part depends on (the frame the layer works on): the starfield and its parameters.
+static unsigned long long FadeInputKey(const FaldResources* r) {
+    unsigned long long h = 1469598103934665603ull;
+    auto mix = [&h](const void* p, size_t n) { const unsigned char* b = (const unsigned char*)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
+    const unsigned int on = r->starOn ? 1u : 0u;
+    mix(&on, sizeof(on));
+    if (r->starOn) mix(&r->star, sizeof(r->star));
+    return h;
+}
+
+// Once per content frame (fald_fade.h): newContent steps T; a run without new content re-forms the frame part only when
+// it is stale (built / reset / a starfield change) and otherwise reuses it (settle frames, a C2 re-process).
+static void RunFadeFrame(FaldResources* r, bool newContent) {
+    const unsigned long long key = FadeInputKey(r);
+    const bool stale = !FaldFadeFrameValid(r->fade) || key != r->fadeKey;
+    if (!newContent && !stale) return;
+    r->fadeKey = key;
+    FillCB(r, 0);
+    FaldFadeRunFrame(r->fade, g_context, FadeCommon(r, false), newContent);
+}
+
+static void RunFadeReach(FaldResources* r, uint32_t round) {
+    FillCB(r, round);
+    FaldFadeRunReach(r->fade, g_context, FadeCommon(r, true), round);
+}
+
 static std::string NarrowUtf8(const std::wstring& w) {
     if (w.empty()) return std::string();
     int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -842,6 +937,15 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         DumpTexture(r->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16); // ln background, near, speck-zone flag, w
         DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * cellW + lx, lit sum, a_eff
     }
+    if (r->fadeOn) {   // the fade stack: full res float32 (fade, fade_T, the lit floor F, reach of rounds 0 / 1), s at quarter res
+        const FaldFadeDebug d = FaldFadeDebugViews(r->fade);
+        DumpTexture(d.fade, dir + L"fald_fade.f32", d.width, d.height, 4);
+        DumpTexture(d.fadeT, dir + L"fald_fade_t.f32", d.width, d.height, 4);
+        DumpTexture(d.floorF, dir + L"fald_fade_floor.f32", d.width, d.height, 4);
+        DumpTexture(d.reach[0], dir + L"fald_fade_reach0.f32", d.width, d.height, 4);
+        DumpTexture(d.reach[1], dir + L"fald_fade_reach1.f32", d.width, d.height, 4);
+        DumpTexture(d.s, dir + L"fald_fade_s.f32", d.wq, d.hq, 4);
+    }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
     char clockText[3][192];                  // full-precision clock numbers (the stream's 6 digits cannot check k offline)
@@ -891,6 +995,10 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " even_reach " << r->star.evenReach << " cap_nits " << r->star.capNits << " strength " << r->star.strength
          << "\nstarfield area_lo " << r->star.areaLo << " area_hi " << r->star.areaHi << " peak_hi " << r->star.peakHi
          << " reach " << r->star.reach << " nb_lo " << r->star.nbLo << " nb_hi " << r->star.nbHi
+         << "\nflank_fade " << (r->fadeOn ? 1 : 0) << " (setting " << (fs.flankFade ? 1 : 0)
+         << "; the frozen fade stack ASF10 + T11_TMTC: files fald_fade.f32 / fald_fade_t.f32 / fald_fade_floor.f32 /"
+         << " fald_fade_reach0.f32 / fald_fade_reach1.f32 width x height float32, fald_fade_s.f32 quarter res; "
+         << (r->fade ? FaldFadeVramBytes(r->fade) >> 20 : 0ull) << " MB)"
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -929,6 +1037,12 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
         if (st.enabled) r->starOn = EnsureStar(r);
         else if (r->starStatTex || r->starWTex || r->starPlanTex || r->starBgTex || r->starPlan2Tex || r->starOn) ReleaseStar(r);
     }
+    // The frozen fade stack (shared/fald_fade.h): on = its resources exist; off = released, and nothing below knows it
+    // exists (CB word 75 = 0, t20-t22 null, no dispatch) — today's layer bit for bit.
+    if (fs.flankFade) r->fadeOn = EnsureFade(r);
+    else if (r->fade || r->fadeOn) {
+        FaldFadeDestroy(r->fade); r->fade = nullptr; r->fadeOn = false; r->fadeKey = 0; r->fadeRetryCounter = 0; r->fadeFailLogged = false;
+    }
 
     // Temporal drive state ("LED lag", passes 1b / 1c): the bookkeeping — dt, the mode / ring / reset rules, the panel
     // clock's time law, which map each kernel reads — is shared/fald_temporal.cpp FaldTemporalBeginRun (the DWM hook runs
@@ -962,17 +1076,20 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     // black-frame LED boost (panel files with a LUT): each round's boost comes from the zone flags of the frame the
     // panel receives in that round, and is NOT filtered by the temporal state (instant on the panel)
     if (r->starOn) RunStar(r);             // the plan of THIS source frame; every pass below reads Balance(source)
+    if (r->fadeOn) RunFadeFrame(r, newContent);   // fade stack: the fade, F, T (once per content frame; fald_fade.h)
     if (plan.runPass) RunPanelClock(r);    // mode 3: the state of this frame comes from PAST frames only (PanelDriveState.fields)
     RunStat(r, 0);
     RunBoost(r, 0);
     if (temporal) RunTemporal(r, inDrive); // both rounds read the SAME committed state (DriveState.peek)
     RunConv(r, trueDrive, estDrive, r->boostSRV[0]);
     RunGain(r);
+    if (r->fadeOn) RunFadeReach(r, 0);     // reach of round 0's knee: FadePost in the round-1 statistic
     RunStat(r, 1);
     RunBoost(r, 1);
     if (temporal) RunTemporal(r, inDrive);
     RunConv(r, trueDrive, estDrive, r->boostSRV[1]);
     RunGain(r);
+    if (r->fadeOn) RunFadeReach(r, 1);     // reach of round 1's knee: FadePost in the pixel pass
     r->framesRun++;
     const std::wstring dumpDir = TakeDumpRequest(ctx);
     if (!dumpDir.empty()) DumpFields(ctx, r, dumpDir);   // before the commit: the state file is the map the pass read
@@ -1002,6 +1119,10 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     g_context->PSSetShaderResources(4, 1, &r->driveSRV);
     g_context->PSSetShaderResources(10, 1, &filt);
     g_context->PSSetShaderResources(13, 1, &r->activeSRV[1]);                     // debug view 8 (nullptr without a boost LUT)
+    if (r->fadeOn) {                                                              // FadePost: fade_T, F, reach of round 1
+        ID3D11ShaderResourceView* fv[3] = { FaldFadeSrvFadeT(r->fade), FaldFadeSrvFloor(r->fade), FaldFadeSrvReach(r->fade, 1) };
+        g_context->PSSetShaderResources(20, 3, fv);
+    }
     g_context->Draw(3, 0);
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
@@ -1020,4 +1141,5 @@ bool FaldSettlePending(const MonitorContext* ctx) {
 void FaldLayerIdle(MonitorContext* ctx) {
     FaldResources* r = ctx ? ctx->fald : nullptr;
     FaldTemporalIdle(r);
+    if (r) FaldFadeReset(r->fade);         // the fade stack's T state is void too (the panel did not show our frames)
 }

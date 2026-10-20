@@ -122,6 +122,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
         ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
         ("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.8, "even_reach": 6}),
+        ("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": True}),
         ("layers.set", {**mm, "fald": True}),
         ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),
@@ -419,6 +420,25 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert not bad.ok and client.call("state.get", {}).result["layers"]["0:SDR"]["fald_star_even"] == 0.7
     pair = client.call("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "area_lo": 200, "area_hi": 300, "enabled": False})
     assert pair.ok and pair.result["area_lo"] == 200.0 and pair.result["area_hi"] == 300.0 and pair.result["enabled"] is False
+    # the frozen fade stack ASF10 + T11_TMTC (2026-10-20): one switch per mode, default off; item L reserved (no setter)
+    st0 = client.call("state.get", {}).result["layers"]
+    assert st0["0:SDR"]["fald_flank_fade"] is False and st0["0:SDR"]["fald_low_ext"] is False
+    ff = client.call("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": True})
+    assert ff.ok and ff.result == {"monitor_mode": "0:SDR", "enabled": True}
+    st1 = client.call("state.get", {}).result["layers"]
+    assert st1["0:SDR"]["fald_flank_fade"] is True and st1["0:HDR"]["fald_flank_fade"] is False        # per mode
+    for bad_params, text in (({}, "missing parameter: enabled"), ({"enabled": 1}, "enabled must be a boolean")):
+        bad = client.send(DesktopLutCommand("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", **bad_params}), raise_on_error=False)
+        assert not bad.ok and bad.error == text, (bad_params, bad.error)
+    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_flank_fade"] is True            # a refusal stores nothing
+    client.call("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": False})
+    if CPP_SERVER.exists():
+        cpp = CPP_SERVER.read_text(encoding="utf-8", errors="replace")
+        fn = re.search(r"\nvoid DoFaldFlankFade\(.*?\n\}", cpp, re.S).group(0)
+        for text in ('"missing parameter: enabled"', '"enabled must be a boolean"', "fs.flankFade = en->b;", "SaveSettings();",
+                     "FaldPropagate(mon, isHDR);"):
+            assert text in fn, text
+        assert 'l.set("fald_flank_fade", JBool(fs.flankFade));' in cpp and 'l.set("fald_low_ext", JBool(fs.lowExt));' in cpp
     dbg9 = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 12})
     assert dbg9.ok and dbg9.result["debug_mode"] == 9                                    # clamped to the last view
     dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})

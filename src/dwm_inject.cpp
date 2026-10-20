@@ -1477,7 +1477,8 @@ void UpdateDwmHookSharedConfig()
                         cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty() && !held,
                                                            static_cast<uint32_t>(fs.debugMode),
                                                            static_cast<int>(fs.pedMode),
-                                                           fs.star.enabled ? 1 : 0);
+                                                           fs.star.enabled ? 1 : 0,
+                                                           fs.flankFade ? 1 : 0);   // bit 8; bit 9 (L) never set
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];

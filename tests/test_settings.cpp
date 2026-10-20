@@ -286,6 +286,8 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.star.evenReach = 5; original.fald.star.capNits = 400.0f; original.fald.star.strength = 0.5f;
         original.fald.star.areaLo = 30.0f; original.fald.star.areaHi = 200.0f; original.fald.star.peakHi = 900.0f;
         original.fald.star.reach = 3; original.fald.star.nbLo = 0.1f; original.fald.star.nbHi = 0.4f;
+        original.fald.flankFade = true;      // the frozen fade stack (2026-10-20): persisted per mode
+        original.fald.lowExt = true;         // item L (reserved): persisted, never applied
         SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
 
         ColorCorrectionSettings loaded;
@@ -315,6 +317,8 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.star.reach == 3u);
         CHECK(loaded.fald.star.nbLo == doctest::Approx(0.1f).epsilon(1e-4));
         CHECK(loaded.fald.star.nbHi == doctest::Approx(0.4f).epsilon(1e-4));
+        CHECK(loaded.fald.flankFade);
+        CHECK(loaded.fald.lowExt);
     }
     // a fresh INI (no keys) = the filter OFF; out-of-range values are clamped, an unknown mode is OFF
     {
@@ -326,6 +330,8 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(fresh.fald.tauFallMs == 0.0f);
         CHECK(fresh.fald.clockClosure == FALD_CLOCK_CLOSURE_DEFAULT);   // panel clock: 0.72, parity unknown
         CHECK(fresh.fald.clockParity == -1);
+        CHECK_FALSE(fresh.fald.flankFade);      // an INI without FaldFlankFade = today's layer, bit for bit
+        CHECK_FALSE(fresh.fald.lowExt);
         WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalClosure", L"3.5", ini.c_str());
         WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalParity", L"4", ini.c_str());
         WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalMode", L"7", ini.c_str());
