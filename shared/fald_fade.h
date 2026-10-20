@@ -1,5 +1,7 @@
 // DesktopLUT - shared/fald_fade.h
-// The frozen fade stack (ASF10 + T11_TMTC, frozen by the owner 2026-10-19) — resources, state and passes, ONE
+// The frozen fade stack F12A_B16 (FREEZE 2026-10-20: ASF10 + T11_TMTC of 2026-10-19 + the line fixes A — the CL closing on
+// the zero-padded 1/8-res map — and B16 — the lit floor's sigma-16 Gaussian; DLC results/fald_nearfield_2026-10-17/r12a/
+// PORT_DELTA.md) — resources, state and passes, ONE
 // implementation for the overlay (src/fald.cpp) and the DWM hook (dwm_hook/hook_fald.cpp), as shared/fald_temporal.cpp is
 // for LED lag. The HLSL and the rule: shared/fald_fade_shader.h (header comment); the float32 twin: DLC
 // dlc/fald/fadeemu.py; the brief: DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md.

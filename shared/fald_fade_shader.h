@@ -1,4 +1,6 @@
-// The frozen fade stack (ASF10 + T11_TMTC, frozen by the owner 2026-10-19: "freeze without the floor fix") — HLSL.
+// The frozen fade stack F12A_B16 — HLSL: ASF10 + T11_TMTC (frozen by the owner 2026-10-19: "freeze without the floor fix")
+// + round 12a's line fixes A (FADE_CL_PAD: the CL closing on the zero-padded map) and B16 (the lit floor's sigma-16
+// Gaussian), FREEZE 2026-10-20 F12A_B16 (r12a/PORT_DELTA.md; twin r12a/cands12a.py F12A_B16).
 //
 // What it is: a field `fade` in [0, 1] per pixel that pulls the FALD layer's correction back toward "layer off" on smooth
 // steep flanks (the ASF9o fade: flank term, robust thin-step protection, push-pull + hybrid fill, closing CL, cone), low-
@@ -75,6 +77,7 @@ static const float FADE_CARE_LO = 0.3f, FADE_CARE_HI = 0.6f;
 static const float FADE_PP_CONF = 4.0f;
 static const float FADE_HYB_W0 = 0.25f;
 static const float FADE_CL_TH_LO = 0.7f, FADE_CL_TH_HI = 1.5f;
+static const uint FADE_CL_PAD = 80u;   // A (F12A_B16): the CL closing's zero padding = 2 x its radius 40 (1/8-res texels)
 static const float FADE_OF_LIT_LO = 1.0f, FADE_OF_LIT_HI = 3.0f, FADE_OF_POS_HI = 0.03f;
 static const float FADE_T_EPS = 0.02f, FADE_T_A0 = 0.25f, FADE_T_R_LO = 0.05f, FADE_T_R_HI = 0.2f;
 static const float FADE_T_CD = 0.5f, FADE_T_CFRAC = 0.15f, FADE_T_CH = 0.2f;
@@ -272,7 +275,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 //   9 LOG    t24 -> u0 ln max(x, 0.05)
 //  10 LOGEPS t24 -> u0 ln(x + 0.02)
 //  11 CLGATE t24 l8, t25 its opening -> u0 smooth(0.7, 1.5, l8 - open)
-//  12 CLADD8 t24 fc, t25 f8, t26 gate -> u0 max(fc - f8, 0) gate
+//  12 CLADD8 t24 fc (the PADDED closing: read at +FADE_CL_PAD), t25 f8, t26 gate -> u0 max(fc - f8, 0) gate
 //  13 ADDF   u1 fade (in place), t24 add -> clamp(fade + add (1 - fade), 0, 1)
 //  14 CONE   u1 cone (in place), t24 maxf3(cone): cone = max(cone, mf - fC0)
 //  15 CONEF  u1 cone (in place), t24 maxf3(cone), t25 dec: cone = max(cone, mf - dec)
@@ -280,6 +283,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 //  17 DEC    t24 grad -> u0 fC0 + g / 2 (knee_reach's per-texel step, fC0 = 4 / 96)
 //  18 SUB    t24 a, t25 b -> u0 a - b
 //  19 TOUT   t24 fade, t25 up4(s - fq) -> u0 clamp(fade + d, 0, 1)
+//  20 PAD    t24 f8 -> u0 f8 zero-padded by FADE_CL_PAD on every side (dispatched over the padded domain; A)
 inline const char* g_faldFadePixSource = R"(
 RWTexture2D<float> pOut0 : register(u0);
 RWTexture2D<float> pOut1 : register(u1);
@@ -349,7 +353,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         precise float th = L(fIn0, p) - L(fIn1, p);
         pOut0[p] = FadeSmooth(FADE_CL_TH_LO, FADE_CL_TH_HI, th);
     } else if (fOp == 12u) {
-        precise float a = max(L(fIn0, p) - L(fIn1, p), 0.0f) * L(fIn2, p);
+        precise float a = max(L(fIn0, p + uint2(FADE_CL_PAD, FADE_CL_PAD)) - L(fIn1, p), 0.0f) * L(fIn2, p);
         pOut0[p] = a;
     } else if (fOp == 13u) {
         precise float f = pOut1[p];
@@ -372,6 +376,12 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else if (fOp == 19u) {
         precise float v = min(max(L(fIn0, p) + L(fIn1, p), 0.0f), 1.0f);
         pOut0[p] = v;
+    } else if (fOp == 20u) {
+        uint w8, h8;
+        fIn0.GetDimensions(w8, h8);
+        int2 q = int2(p) - (int)FADE_CL_PAD;
+        bool inside = q.x >= 0 && q.y >= 0 && q.x < (int)w8 && q.y < (int)h8;
+        pOut0[p] = inside ? L(fIn0, uint2(q)) : 0.0f;
     }
 }
 )";

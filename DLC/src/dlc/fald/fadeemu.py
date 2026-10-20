@@ -1,11 +1,15 @@
-"""The frozen fade stack (ASF10 + T11_TMTC, frozen 2026-10-19; the owner: "freeze without the floor fix") as a float32,
+"""The frozen fade stack F12A_B16 (FREEZE 2026-10-20: ASF10 + T11_TMTC of 2026-10-19 + the line fixes A and B16) as a float32,
 GPU-order twin: what shared/fald_fade_shader.h computes, operation for operation, next to :class:`dlc.fald.gpuemu.Emu`
 (which this module uses unchanged for the layer underneath).
 
 Reference = the float64 study twin (DLC results/fald_nearfield_2026-10-17: r10/temu.py ``fade9_t`` + r10/cands10.py
 ``floor_lit`` / ``knee_reach`` + r11/cands11.py ``make_post11`` (gc = oc = None) + r11/T/tl11.py ``TL11State`` with
-``T11_DEF``, variant ``F10_TMTC``), hash-logged in that folder's FROZEN_hashlog.txt ("FREEZE 2026-10-19"). The port brief
-is r11/PORT_PLAN.md. To reproduce the frozen twin itself, import those study sources with this package on the path (they
+``T11_DEF``, variant ``F10_TMTC``), hash-logged in that folder's FROZEN_hashlog.txt ("FREEZE 2026-10-19"), plus round 12a's
+two fixes (r12a/cands12a.py variant ``F12A_B16``, "FREEZE 2026-10-20 F12A_B16"):
+  * A — the CL closing of the 1/8-res fade runs on the map zero-padded by ``CL_PAD`` = 2 x 40 texels (the closing of the
+    map embedded in fade 0; cropped back);
+  * B16 — the lit floor's 1/8-res opening is blurred by a Gaussian sigma ``OF_FLOOR_SIG`` = 16 texels before up8.
+The port briefs are r11/PORT_PLAN.md and its delta r12a/PORT_DELTA.md. To reproduce the frozen twin itself, import those study sources with this package on the path (they
 use :mod:`dlc.fald.gpuemu`, whose file is unchanged): DLC tests/test_fald_fade_gate1.py does exactly that.
 
 What is float32 GPU order here (and therefore in the HLSL):
@@ -48,9 +52,11 @@ CARE = (0.3, 0.6)
 PP_PRIOR, PP_CONF = 0.05, 4.0
 HYB_SIG, HYB_W0 = 32.0, 0.25
 CL_Q, CL_OPEN_R, CL_CLOSE_R, CL_TH, CL_SIG = 8, 50, 40, (0.7, 1.5), 8.0
+CL_PAD = 2 * CL_CLOSE_R               # A: the closing's zero padding (texels at 1/8 res; fald_fade_shader.h FADE_CL_PAD)
 CONE_Q, CONE_DEC, CONE_ITERS, CONE_SIG = 4, 4.0 / 64.0, 16, 4.0
 LOG_FLOOR = 0.05
 OF_LIT, OF_POS_HI, OF_D, OF_LAM, OF_OPEN_R, OF_ITERS, OF_SIG = (1.0, 3.0), 0.03, 96.0, 2.0, 50, 24, 4.0
+OF_FLOOR_SIG = 16.0                  # B16: the lit floor's Gaussian on the 1/8-res opening (floor(50 / 3) texels)
 T_EPS, T_A0, T_R, T_RSIG = 0.02, 0.25, (0.05, 0.2), 1.0
 T_CD, T_CFRAC, T_CH, T_NBINS = 0.5, 0.15, 0.2, 64
 T_HLO, T_HHI = math.log(0.02), math.log(2000.0)
@@ -316,7 +322,11 @@ def fade9(mi, keep: bool = False):
     l8 = np.log(hmax(down(ms, CL_Q), f32(LOG_FLOOR))).astype(f32)
     th = (l8 - grey_open(l8, 2 * CL_OPEN_R + 1)).astype(f32)
     gate8 = smooth(CL_TH[0], CL_TH[1], th)
-    fc = grey_close(f8, 2 * CL_CLOSE_R + 1)
+    # A: the closing of f8 embedded in fade 0 (cands12a.closing12): zero padding of 2 rc, grey_close, crop
+    h8, w8 = f8.shape
+    f8p = np.zeros((h8 + 2 * CL_PAD, w8 + 2 * CL_PAD), f32)
+    f8p[CL_PAD:CL_PAD + h8, CL_PAD:CL_PAD + w8] = f8
+    fc = grey_close(f8p, 2 * CL_CLOSE_R + 1)[CL_PAD:CL_PAD + h8, CL_PAD:CL_PAD + w8]
     add = gauss(up((hmax(fc - f8, f32(0.0)) * gate8).astype(f32), CL_Q, (H, W)), CL_SIG)
     fade = hclamp(fade + add * (f32(1.0) - fade), 0.0, 1.0)
     # cone at 1/4 res
@@ -333,10 +343,13 @@ def fade9(mi, keep: bool = False):
 
 # ================================================================================================= OF (1.3)
 def floor_lit(mi):
-    """cands10.floor_lit: F = exp(up8(grey_open(ln max(down8(mi), 0.05), 101))), mi UNSANITISED (as the twin)."""
+    """cands12a.floor_lit12 (F12A_B16): F = exp(up8(G16(grey_open(ln max(down8(mi), 0.05), 101)))), mi UNSANITISED (as
+    the twin); G16 = the Kahan float32 Gaussian sigma 16 (vertical then horizontal = the HLSL Gauss) at 1/8 res."""
     mi = np.asarray(mi, f32)
     l8 = np.log(hmax(down(mi, CL_Q), f32(LOG_FLOOR))).astype(f32)
-    return np.exp(up(grey_open(l8, 2 * OF_OPEN_R + 1), CL_Q, mi.shape)).astype(f32)
+    op = grey_open(l8, 2 * OF_OPEN_R + 1)
+    op = gauss(op, OF_FLOOR_SIG)
+    return np.exp(up(op, CL_Q, mi.shape)).astype(f32)
 
 
 def reach_dec(mi):
