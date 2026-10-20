@@ -1,0 +1,18 @@
+{
+  "frozen": "2026-10-20, branch fald/f12a-port (from main e522df9), BEFORE any comparison run of the F12A_B16 port (no fadeemu / HLSL code for A or B16 existed when this was written)",
+  "source": "results/fald_nearfield_2026-10-17/r12a/PORT_DELTA.md (sha256 c569c0eef590ff2185d1c3b763ba86e7816fdd009ff331b65ccd0d5acbdfffc7) + r12a/FREEZE_F12A_B16.md (sha256 7c62105160b9dd5cca99cd033d8976de9bd5f4d4f2c841b81574b948161f18ad)",
+  "rule": "These numbers are not changed after a comparison has run. A failure is investigated and reported; a tolerance is never widened.",
+  "numbers_from": "DLC/tests/fald_fade_frozen_tolerances.json, sha256 (LF) 9267ba793571f4f1da0eb35986f7ca7ac11a423ee02817c9365bbcc051f1fb25 — its gate1_f32_vs_f64 and gate2_hlsl_vs_f32 blocks, unchanged; the gate tests read the numbers from it and check both files' hashes",
+  "off_gate": "unchanged: bit for bit against tests/fixtures/fald_fade_off_main.hashes",
+  "gate1_f32_vs_f64": "as fald_fade_frozen_tolerances.json gate1_f32_vs_f64 (fields 2e-4 abs incl. fade, fade_T, s, reach_r0/1; lit 2e-4 abs, F 2e-4 rel; out16 >= 99.9 % within 2 FP16 steps, max 8; cut / shift as before), the twin = r12a/cands12a.py F12A_B16, the study logs = r12a/out/motion12a F12A_B16",
+  "gate2_hlsl_vs_f32": "as fald_fade_frozen_tolerances.json gate2_hlsl_vs_f32 (out16 <= 1 step; base fields rtol 1e-6 / atol 2e-5; fade fields rtol 1e-6 / atol 5e-5; F rel 1e-5; flags array_equal; shift 1e-3 texel)",
+  "note": "the padded closing and the sigma-16 floor Gaussian are inside the compared fields (fade / fade_T, lit, F); no new field, no new tolerance. B16's Gaussian is the same Kahan kernel as sigma 24 / 32 (129 taps < 193 / 257), so atol 5e-5 on lit and F rel 1e-5 are stated without a pre-run.",
+  "cells": "the current set + aces_m18, aces_m52, s10_ac_redspot",
+  "negative_control": {
+    "rule": "a deliberate one-constant mutation must FAIL the gate it belongs to; the code is restored and the gate passes again",
+    "mutations": [
+      "A: the closing's zero padding 80 -> 40 texels (fadeemu CL_PAD for gate 1; HLSL FADE_CL_PAD + the C++ pad for gate 2)",
+      "B16: the lit-floor Gaussian sigma 16 -> 12 (fadeemu OF_FLOOR_SIG for gate 1; the C++ Gauss call for gate 2)"
+    ]
+  }
+}
