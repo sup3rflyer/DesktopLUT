@@ -1,8 +1,7 @@
 // FALD (mini-LED local dimming) context-dependence correction — the OVERLAY path's layer (HDR, and SDR under
 // Windows ACM where the overlay frame is FP16 scRGB too). This file never runs in DWM hook mode; there the
-// hook runs the layer's stateless core itself (dwm_hook/hook_fald.h), out of the same HLSL and the same
-// panel-file reader. Everything below that hook_fald.h does not have — starfield, the temporal
-// modes, the settle hold, the dump — is what keeps this the experiment bench of the two.
+// hook runs the same layer itself (dwm_hook/hook_fald.h): the core, starfield, LED lag (panel clock, settle
+// hold) and the flank fade, out of the same HLSL and the same panel-file reader.
 // Design + measurements: DLC/docs/fald-shader-design.md, DLC/docs/fald-spatial-probe-2026-09-10.md.
 // The per-panel parameter file (*.bin) is produced by `python -m dlc.fald.export <fit.json> <out.bin>`
 // (layout documented there); the shaders live in shared/fald_shader.h — shared with the DWM hook, so both
