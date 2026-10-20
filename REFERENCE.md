@@ -17,7 +17,7 @@ Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurabl
 
 Settings saved to `DesktopLUT.ini` next to executable.
 
-**Comments must be on their own line.** The Windows INI API keeps everything after `=` as the value, so `EdidId=AUS322A-S4LMSB007317 ; comment` stores the comment too — that identity then never matches and the display is treated as new. The example below keeps every comment on its own line for that reason.
+**Comments must be on their own line.** The Windows INI API keeps everything after `=` as the value, so `EdidId=ABC1234-SN0001 ; comment` stores the comment too — that identity then never matches and the display is treated as new. The example below keeps every comment on its own line for that reason.
 
 **Note**: Primaries, grayscale, white balance, and desktop gamma are per-monitor in the MHC sections. The Corrections section only persists tonemapping. `DesktopGamma` is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
 
@@ -67,6 +67,22 @@ FramePacerLog=0
 ; 1 = start minimized to system tray
 StartMinimized=0
 
+[UI]
+; new (the ImGui interface, default) or classic (the previous window)
+Interface=new
+; dark (default), gray or light
+Theme=dark
+; where DLC keeps its profile, runs and results. Absent = found automatically: a DLC folder
+; next to DesktopLUT.exe (<exe>\DLC, or the exe's own folder), one folder up (<exe>\..\DLC),
+; two up (<exe>\..\..\DLC, a source checkout's bin\Release), else DlcFolderLast. When set, it
+; is used as it is, even if it does not exist.
+DlcFolder=D:\Calibration\DLC
+; written by the app, absent = none: the folder automatic detection last found DLC in (so a
+; DesktopLUT moved away from it still finds it); CLEAR in Settings > Calibration forgets it
+DlcFolderLast=E:\Tools\DLC
+; days after the last verification before a display is marked for recalibration (0 = off)
+RecalReminderDays=90
+
 ; One section per physical display ever seen, keyed by identity — NOT by the order
 ; Windows enumerates displays. Settings follow the panel if it is enumerated at
 ; another index, a panel that is disconnected keeps its section, and a different
@@ -78,11 +94,11 @@ StartMinimized=0
 ; The identity keys (DevicePath / EdidId / DisplayName / FirstSeen / LastSeen) are
 ; written last; a section without them is kept but never matched.
 [Display0]
-DevicePath=\\?\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}
+DevicePath=\\?\DISPLAY#ABC1234#5&1a2b3c4&0&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}
 ; EDID manufacturer+product code, "-" serial (matches the same panel on another connector)
-EdidId=AUS322A-S4LMSB007317
+EdidId=ABC1234-SN0001
 ; informational only
-DisplayName=PA32UCXR
+DisplayName=Example Monitor
 ; dates the display was first / last connected (informational)
 FirstSeen=2026-09-14
 LastSeen=2026-10-07
@@ -180,7 +196,7 @@ When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injec
 4. Live parameter updates (tonemapping changes, monitor hotplug) are communicated via shared memory IPC (`Global\DesktopLUT_DwmHook_Config`) — no re-injection needed.
 5. **Live edit preview** (MHC fine-tune editors, `mhc.grayscale_live_*`): the edited display's scanout runs an identity profile and the hook applies the display's MHC profile as the last step of its pass — the very matrix and LUT entries the bake writes (`src/mhc_preview.h`, `shared/mhc_scanout_hlsl.h`). The data travels in its own mapping (`Global\DesktopLUT_DwmHook_MhcPreview`, `DwmHookMhcPreview`); the config carries its generation (`mhcPreviewGen`) and the DLL acknowledges each one (`ackGen`), so an older resident DLL is detected and the edit does not start. Without a live hook (overlay mode, or no hook work) the overlay applies the preview instead, after its own 3D LUT.
 
-**Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for the classic MHC base editor's preview or non-DWM-hook shader corrections (the fine-tune live edit is applied by the hook itself). State tracked by `g_analysisOnlyMode` atomic. Desktop Duplication delivers the frame BEFORE the hook, so in hook mode the analysis readout is the content signal ahead of the 3D LUT and tone map — it measures what apps draw, never what the hook outputs (PA32 2026-10-15: a PQ 860 window read Peak 2257.5 nits with the tone map on; a post-hook capture would read ≤ the 1700-nit target).
+**Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for the classic MHC base editor's preview or non-DWM-hook shader corrections (the fine-tune live edit is applied by the hook itself). State tracked by `g_analysisOnlyMode` atomic. Desktop Duplication delivers the frame BEFORE the hook, so in hook mode the analysis readout is the content signal ahead of the 3D LUT and tone map — it measures what apps draw, never what the hook outputs (measured 2026-10-15: a PQ 860 window read Peak 2257.5 nits with the tone map on; a post-hook capture would read ≤ the 1700-nit target).
 
 **Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event). Max 3 consecutive re-injection retries. Orphan detection via `hostPid` in shared memory — DLL self-unloads if host process dies.
 
@@ -411,38 +427,57 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
 
 - **HDR, and SDR when Windows "Automatically manage color for apps" (ACM) is on** — the ACM
   desktop is composed in FP16 scRGB like HDR, a plain 8-bit SDR desktop never runs the layer. Runs on the
-  overlay path, and — since the phase-one hook port — on the DWM hook path too, where a reduced *stateless
-  core* of it runs (see below). The Corrections tab has one *Enable* + *panel file*
-  row per mode (HDR / SDR (ACM)); a panel file belongs to the mode it was profiled in (an HDR fit is a PQ file,
-  an SDR fit a gamma file) and is refused on the other row. The correction is exact for the colour state the
+  overlay path and on the DWM hook path, the whole layer on both (see below). It is set up per display and
+  mode (HDR / SDR (ACM)); a panel file belongs to the mode it was profiled in (an HDR fit is a PQ file,
+  an SDR fit a gamma file) and is refused for the other mode. The correction is exact for the colour state the
   panel was profiled in; with a different MHC calibration active it is approximate.
-- **Needs a per-panel parameter file** (Corrections tab → the mode's row; INI `HDR_FaldParamsPath` / `SDR_FaldParamsPath`), produced by
+- **Where to set it.** New interface: **PIPELINE** → the display → **HDR | SDR** → the **FALD** stage. A mode
+  without a panel file shows the stage as **+ FALD** in the same place (every display alike, wherever the layer
+  could run: not on the SDR side of a display in legacy SDR); selecting it opens **ADD FALD**, whose
+  **PANEL FILE › BROWSE…** loads the first file. With a file the stage carries the header switch (on / off) and
+  the rows PANEL FILE (BROWSE… / RELOAD / CLEAR — clear takes the file away and switches the layer off),
+  PEDESTAL, LED LAG, FLANK FADE, STARFIELD, STAR TARGET and VIEW; all but PANEL FILE and the switch apply to
+  HDR and SDR at once. Classic window: the Corrections tab's *Enable* + *panel file* row per mode, with the
+  same shared rows below it.
+- **Needs a per-panel parameter file** (INI `HDR_FaldParamsPath` / `SDR_FaldParamsPath`), produced by
   the DLC calibrator's profiling pass (`python -m dlc.stages.fald_profile`, one colorimeter spot, ≈ 40 min,
   no camera: it needs the panel's zone count and diagonal from the spec sheet, and ends with a verify pass
-  of the file on your unit — `DLC/docs/fald-profile-flow.md`). Only the ASUS PA32UCXR has one
-  (`DLC/results/fald_native_2026-09-11/pa32ucxr_fald_panel.bin`, local); the code is panel-agnostic, the
-  numbers are not. The layer refuses, logging once, when the file's zone lattice does not fit the monitor's
-  resolution.
+  of the file on your unit — `DLC/docs/fald-profile-flow.md`). None is shipped: a file describes the unit it
+  was profiled on; the code is panel-agnostic, the numbers are not. The layer refuses, logging once, when the
+  file's zone lattice does not fit the monitor's resolution.
 - **Any zone pitch, not only whole pixels** (2026-10-19, `docs/fald-fractional-pitch.md`). A 27" 2560×1440 panel
   with 48×24 zones has 53.33-px zones; the panel file then carries the lattice's pixel extent instead of a cell size.
-  Builds older than this refuse such a file. Files with whole-pixel zones (the PA32UCXR's 80×45) are unchanged and
-  render bit for bit as before. The black-frame boost table also accepts steps from 0.25 to 4 (was 0.5 to 2), so a
+  Builds older than this refuse such a file. Files with whole-pixel zones (80×45-px zones on a 3840×2160 panel, for
+  example) are unchanged and render bit for bit as before. The black-frame boost table also accepts steps from 0.25 to 4 (was 0.5 to 2), so a
   panel that dims small highlights can be described.
 - **Not a bloom remover.** Light leaking through a closed LCD (the blue pedestal under black beside a
-  highlight), the peak loss of small highlights (a 160 px window on the PA32UCXR reaches 47 % of full-field
-  white) and content below the LED floor (~0.5 nit) are panel physics a pixel shader cannot change.
+  highlight), the peak loss of small highlights (on the panel it was developed on, a 160 px window reaches 47 % of
+  full-field white) and content below the LED floor (~0.5 nit there) are panel physics a pixel shader cannot change.
 - **Calibrate with the layer OFF.** Calibration mode (`calibration.enter`) clears it; a meter reading through
   it depends on the surround, not just the patch.
-- *View* combo: 0 correct, 1 gain map (grey 0.5 = no change), 2 / 3 predicted backlight (true / panel's
-  estimate), 4 identity passthrough (the A/B baseline — the awake overlay itself differs from the sleeping
-  overlay by 0.5–2 % at low levels, so compare against 4, not against OFF).
+- **View** (the VIEW row, the classic *View* combo; both modes, not saved): 0 CORRECTED, 1 GAIN MAP (white = no
+  change, red = brighter, blue = darker, ±25 % full scale), 2 / 3 REAL BACKLIGHT / PANEL ESTIMATE (the predicted
+  backlight: true / the panel's own estimate), 4 PASSTHROUGH (identity: the A/B baseline — the awake overlay itself
+  differs from the sleeping overlay by 0.5–2 % at low levels, so compare against 4, not against OFF), 5 PEDESTAL ×100
+  (the pedestal term applied), 6 PER-CHANNEL ×100 (what the per-channel pedestal changes against the white one),
+  7 SETTLING (LED lag: red = still rising, blue = still falling), 8 BOOST ZONES (white = a zone the black-frame boost
+  counts as lit), 9 STARFIELD ZONES (blue = a peak pulled down, red = lifted). The new interface names the view on the
+  FALD panel's title line, in amber, while one other than CORRECTED is on.
+- **Starfield balancing** (experimental, default off): a field of scattered specks drives its zones unevenly (zone-
+  shaped haze patches); the option pulls the star-like peaks toward the local mean of their neighbours' peaks. The
+  STARFIELD / STAR TARGET rows (and the classic Starfield rows) set EVEN (how far a peak is pulled, 0–1), STRENGTH
+  (the overall blend, 0–1), SPREAD (the target's standard deviations of ln peak above the local mean, 0–4), REACH
+  (zones each side the mean looks at, 0–12) and KEEP (nits the target never falls below), both modes at once; INI per
+  monitor and mode `…FaldStarfield`, `…FaldStarEven`, `…FaldStarStrength`, `…FaldStarTargetSigma`,
+  `…FaldStarEvenReach`, `…FaldStarKeepNits`, the other `…FaldStar*` parameters INI / pipe only
+  (`runtime.fald_starfield`).
 - INI per monitor and mode: `HDR_FaldEnabled`, `HDR_FaldParamsPath`, `SDR_FaldEnabled`, `SDR_FaldParamsPath`
   (+ `…FaldPerChannelPedestal`). Pipe, per `monitor:mode`: `layers.set {fald}`, `runtime.set_fald_params`,
   `runtime.fald_debug`, `runtime.fald_dump` (writes the model fields, the input and the output frame for a
   reference comparison). `windows.query_monitors` reports `color_space` `ACM_SDR` when ACM is on (read through
   DisplayConfig — the DXGI colour space cannot see ACM). Settings changes re-process the last frame, so they
   show on a static desktop.
-- Cost: four small compute passes on the zone grid (48×48 × 2 sub-cells on the PA32UCXR) plus one full-screen
+- Cost: four small compute passes on the zone grid (48×48 zones × 2 sub-cells, for example) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
 - **Flank fade** (experimental, default off; the frozen fade stack ASF10 + T11_TMTC, `shared/fald_fade.h`): fades
   the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside the soft knee's reach,
@@ -456,13 +491,14 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   ~550 MB VRAM, ~250 compute dispatches per content frame — not measured on hardware. Float32 twin:
   `DLC/src/dlc/fald/fadeemu.py`.
 
-### In the DWM hook (phase one)
+### In the DWM hook
 
-The hook runs the layer's **stateless core** — statistic → black-frame boost → convolution → gain, twice, then
-the pixel pass. Starfield balancing, the temporal modes and the settle hold stay on the overlay path
-for now; each of those is documented as bit-identical when off, so the hook's output must equal the overlay's
-exactly for the same input frame. Both paths run the same HLSL (`shared/fald_shader.h`) and the same panel-file
-reader (`shared/fald_panel.h`) — there is no second implementation of the correction.
+The hook runs the **whole layer** the overlay path runs: the core (statistic → black-frame boost → convolution →
+gain, twice, then the pixel pass), starfield balancing, LED lag (the temporal modes, the panel clock and the settle
+hold — DWM presents nothing on a static desktop, so the host keeps it composing while the LED state settles) and the
+flank fade. Both paths run the same HLSL (`shared/fald_shader.h`), the same panel-file reader (`shared/fald_panel.h`)
+and the same LED-lag bookkeeping (`shared/fald_temporal.cpp`) — there is no second implementation of the correction,
+and for the same input frame the hook's output must equal the overlay's (the field dump below checks it).
 
 - **The panel file is staged at injection, then delivered live.** The host copies it beside the `.cube` files
   (`…\Temp\DesktopLUT_luts\fald\<left>_<top>[_hdr].bin`) and the DLL reads it during `DllMain`; the
@@ -489,9 +525,10 @@ reader (`shared/fald_panel.h`) — there is no second implementation of the corr
   outside the hook lock, so a panel file on an unreachable share stalls nothing): a touched file with the same
   bytes is not re-delivered, a file being written is retried, a refused one is re-read only when it changes and
   reported once if it stays. Two dwm.exe processes (a second session) read the same sections and share one
-  verdict word per section (status reporting only). The three live switches (enable, view, per-channel
-  pedestal) travel in `DwmHookSharedConfig::faldFlags` over the seqlock, so toggling them does not re-inject
-  either — a re-injection re-rolls twin-panel routing.
+  verdict word per section (status reporting only). The live switches (enable, view, per-channel pedestal,
+  starfield, flank fade) travel in `DwmHookSharedConfig::faldFlags`, and the starfield and LED-lag parameters in its
+  tuning tail (`DwmHookFaldTuning`), over the seqlock, so changing them does not re-inject either — a re-injection
+  re-rolls twin-panel routing.
 - **Dirty rects are given up while the layer is on.** One zone's content changes the correction of pixels far
   outside any changed rectangle, so that context copies and redraws the whole frame every present.
 - **It refuses a coin-toss routing.** A context whose monitor position came from first-present order among
@@ -499,8 +536,8 @@ reader (`shared/fald_panel.h`) — there is no second implementation of the corr
   a fit applied to the wrong panel pre-distorts for the other panel's LEDs. The `.cube` path still tolerates
   that risk; the correction does not.
 - **Cost is logged, not assumed.** Each monitor logs the CPU time its passes spend in the present path every
-  ~600 frames (`DesktopLUT_dwmhook.log`). Overrunning DWM's budget stutters the whole desktop, so this is the
-  number to watch first.
+  ~600 frames (`%SYSTEMROOT%\Temp\DesktopLUT_dwmhook.log`). Overrunning DWM's budget stutters the whole desktop, so
+  this is the number to watch first.
 - **Field dump for the bit-for-bit check.** Write a directory path into
   `…\Temp\DesktopLUT_hook_fald_dump.txt`; the next frame writes the same files as the overlay's
   `runtime.fald_dump` (drive, B_true, B_est, the flat response, the gain, the input and output frames) and the
