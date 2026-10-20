@@ -188,6 +188,7 @@
     <ClCompile Include="tests\test_reconcile.cpp" />
     <ClCompile Include="tests\test_dlc.cpp" />
     <ClCompile Include="tests\test_dlc_live.cpp" />
+    <ClCompile Include="tests\test_dlc_workers.cpp" />
     <ClCompile Include="dwm_hook\hook_lut.cpp">
       <!-- the DLL's own parser, compiled as the DLL builds it (test_lut_canonical.cpp round trip). DLUT_HOOK_TESTING: the
            hook sources in this exe log to %TEMP%, never to the real hook's log (hook_log.h; the same in every hook TU) -->

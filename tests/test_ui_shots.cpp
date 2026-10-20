@@ -8,6 +8,8 @@
 #include "ui/ui_gscurve.h"
 #include "ui/ui_charts.h"
 #include "ui/ui_dlc.h"
+#include "dlc/dlc_live.h"   // ResetLiveWatchForTest
+#include "dlc/dlc_scan.h"   // ResetScannerForTest
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
@@ -488,6 +490,10 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     REQUIRE(gpu.Create());
 
     notify::ResetForTest();
+    // Drawing a record starts DLC's workers (dlc::Patches, dlc::RunCharts); the app stops them in ui::Shutdown, this
+    // case at its end. Reset first: no patches or charts cached by an earlier case.
+    dlc::ResetScannerForTest();
+    dlc::ResetLiveWatchForTest();
     notify::Post(notify::Sev::Info, -1, L"status", L"Active (DWM Hook)");
     notify::Post(notify::Sev::Success, 0, L"mhc", L"Profile installed", L"DesktopLUT_HDR_AUS322A.icm");
     notify::Post(notify::Sev::Warning, 1, L"mhc", L"Profile restored", L"Windows dropped the association");
@@ -779,6 +785,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     }
     MESSAGE("ui shots written: " << written);
     g_dlcFolder.clear();
+    dlc::ResetScannerForTest();   // joins the workers the shots started, as ui::Shutdown does
+    dlc::ResetLiveWatchForTest();
     notify::ResetForTest();
     gpu.Destroy();
     ui::ApplyTheme(ui::ThemeId::Dark);

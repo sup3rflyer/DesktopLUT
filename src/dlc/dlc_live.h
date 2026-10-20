@@ -254,7 +254,8 @@ void SetLiveListener(std::function<void()> onChange);   // called on the watcher
 void WatchLive(const std::wstring& dlcFolder);
 // Poll only while the interface is visible (hidden: the thread sleeps). Any thread.
 void SetLiveWatchActive(bool active);
-void StopLiveWatch();                                     // GUI thread, at shutdown
+// GUI thread, at shutdown; final (nothing starts the watcher again). Joined at exit too if the host never calls it.
+void StopLiveWatch();
 std::shared_ptr<const Live> CurrentLive();                // any thread; never null
 
 // A finished run's final charts (runs\<id>\live\charts.json, written when the run ended or paused): the cached
@@ -262,6 +263,8 @@ std::shared_ptr<const Live> CurrentLive();                // any thread; never n
 // listener fires when it is in). Any thread.
 std::shared_ptr<const LiveCharts> RunCharts(const std::wstring& runDir);
 void SeedRunChartsForTest(const std::wstring& runDir, std::shared_ptr<const LiveCharts> charts);
+// Tests: StopLiveWatch, then forget the watch, every run's charts and the listener; the next call starts a new watcher.
+void ResetLiveWatchForTest();
 
 // Charts from a report's patch metrics, for runs without a final snapshot: the CIE scatter (measured and target
 // xy, ΔE), the grey steps' luminance against their targets, the worst patches. No balance or convergence.
