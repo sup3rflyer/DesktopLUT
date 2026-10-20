@@ -117,7 +117,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* starStatTex = nullptr; ID3D11UnorderedAccessView* starStatUAV = nullptr; ID3D11ShaderResourceView* starStatSRV = nullptr;
     ID3D11Texture2D* starWTex = nullptr;    ID3D11UnorderedAccessView* starWUAV = nullptr;    ID3D11ShaderResourceView* starWSRV = nullptr;
     ID3D11Texture2D* starPlanTex = nullptr; ID3D11UnorderedAccessView* starPlanUAV = nullptr; ID3D11ShaderResourceView* starPlanSRV = nullptr;
-    // bg = (ln b, the brightest pixel's index ly * cellW + lx, lit sum, a_eff), b = the zone's darkest pixel (S0 -> S1;
+    // bg = (ln b, the brightest pixel's index ly * zw + lx, lit sum, a_eff), b = the zone's darkest pixel (S0 -> S1;
     // evidence in the dump)
     ID3D11Texture2D* starBgTex = nullptr;   ID3D11UnorderedAccessView* starBgUAV = nullptr;   ID3D11ShaderResourceView* starBgSRV = nullptr;
     // plan2 = the second field texture the pixels read: (ln b, tapered protection `near`, speck-zone flag, w) — .xy
@@ -154,6 +154,16 @@ void FaldTrace(const char* msg);
 
 // Process-global shaders (compiled in InitD3D via InitFaldShaders; released in ReleaseFaldShaders).
 bool InitFaldShaders();
+// The HLSL the overlay path compiles: by default the sources of shared/fald_shader.h (InitFaldShaders). A test swaps in
+// another set — the frozen pre-fractional-pitch copy (tests/fald_shader_legacy.h) — to hold the current shaders to it
+// bit for bit on integer lattices. Release the shaders (ReleaseFaldShaders) before compiling another set.
+struct FaldShaderSources {
+    const char* common; const char* stat; const char* conv; const char* gain; const char* blur; const char* temporal;
+    const char* panelClock; const char* boost; const char* starStat; const char* starWeight; const char* starPlan;
+    const char* zoneCombineDefine; const char* pixel;
+};
+FaldShaderSources FaldDefaultShaderSources();
+bool InitFaldShadersFrom(const FaldShaderSources& src);
 void ReleaseFaldShaders();
 bool FaldShadersReady();
 

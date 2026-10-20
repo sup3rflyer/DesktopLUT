@@ -49,6 +49,7 @@ FROZEN = {                                   # FROZEN_hashlog.txt, "FREEZE 2026-
     "nlib.py": "6e65528af986316fbb71ccbef52005123ef7962b4e8767b46392169ecc26c5ee",
 }
 GPUEMU_SHA_LF = "906ba21638e90d354ddd4c33712df48b94b99060387f1790fd7ec8a782c2b0bc"
+GPUEMU_FRACTIONAL_GUARD_SHA_LF = "d79bd33b9e9171af84f18c94c75ea1cf10e4559c9048206288d6741c3a6f5ee1"
 PANEL_SHA = "f6e51a6a86fe1c0dc39ea3391176dec35c64f68bb4ad780421810d41926ef25c"
 STILLS = ("p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0",
           "s10_sm_seattle", "s10_ac_firewater")
@@ -85,7 +86,15 @@ def env():
     assert _sha(TOL_FILE, lf=True) == TOL_SHA_LF, "the frozen tolerance file changed"
     for rel, sha in FROZEN.items():
         assert _sha(STUDY / rel) == sha, f"frozen twin source changed: {rel}"
-    assert _sha(DLC / "src" / "dlc" / "fald" / "gpuemu.py", lf=True) == GPUEMU_SHA_LF, "gpuemu.py is not the frozen file"
+    # gpuemu.py = the frozen file, or the frozen file + exactly the fractional-pitch refusal (merged 2026-10-20 from
+    # 429cffa: a ValueError for a fractional panel file, which no gate cell uses): with that block cut out, the frozen hash
+    emu = (DLC / "src" / "dlc" / "fald" / "gpuemu.py").read_bytes().replace(b"\r\n", b"\n")
+    i = emu.find(b'        if o.get("fractional"):\n')
+    if i >= 0:
+        j = emu.index(b'        self.white = float(o["white"])', i)
+        assert hashlib.sha256(emu[i:j]).hexdigest() == GPUEMU_FRACTIONAL_GUARD_SHA_LF, "gpuemu.py's fractional guard changed"
+        emu = emu[:i] + emu[j:]
+    assert hashlib.sha256(emu).hexdigest() == GPUEMU_SHA_LF, "gpuemu.py is not the frozen file"
     assert _sha(PANEL) == PANEL_SHA, "not the live panel file candidate_C_fade3_only.bin"
     import torch
     torch.set_num_threads(int(os.environ.get("FALD_FADE_TORCH_THREADS", "2")))

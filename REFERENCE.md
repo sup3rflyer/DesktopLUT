@@ -423,6 +423,11 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   (`DLC/results/fald_native_2026-09-11/pa32ucxr_fald_panel.bin`, local); the code is panel-agnostic, the
   numbers are not. The layer refuses, logging once, when the file's zone lattice does not fit the monitor's
   resolution.
+- **Any zone pitch, not only whole pixels** (2026-10-19, `docs/fald-fractional-pitch.md`). A 27" 2560×1440 panel
+  with 48×24 zones has 53.33-px zones; the panel file then carries the lattice's pixel extent instead of a cell size.
+  Builds older than this refuse such a file. Files with whole-pixel zones (the PA32UCXR's 80×45) are unchanged and
+  render bit for bit as before. The black-frame boost table also accepts steps from 0.25 to 4 (was 0.5 to 2), so a
+  panel that dims small highlights can be described.
 - **Not a bloom remover.** Light leaking through a closed LCD (the blue pedestal under black beside a
   highlight), the peak loss of small highlights (a 160 px window on the PA32UCXR reaches 47 % of full-field
   white) and content below the LED floor (~0.5 nit) are panel physics a pixel shader cannot change.

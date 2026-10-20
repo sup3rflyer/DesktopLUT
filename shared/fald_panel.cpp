@@ -136,8 +136,9 @@ bool ParseFaldPanelParams(const void* data, size_t bytes, FaldPanelParams& out, 
             }
             for (uint32_t i = 0; i < n; i++) {
                 const float lo = fl[FALD_BOOST_WORD_LUT + 2 * i], val = fl[FALD_BOOST_WORD_LUT + 2 * i + 1];
-                if (!(lo >= 0.0f && lo <= 1.0f) || (i > 0 && !(lo > out.boostLo[i - 1])) || !(val >= 0.5f && val <= 2.0f)) {
-                    err = "implausible boost LUT words (steps must ascend, fractions 0..1, boosts 0.5..2)"; return false;
+                if (!(lo >= 0.0f && lo <= 1.0f) || (i > 0 && !(lo > out.boostLo[i - 1])) ||
+                    !(val >= FALD_BOOST_STEP_MIN && val <= FALD_BOOST_STEP_MAX)) {
+                    err = "implausible boost LUT words (steps must ascend, fractions 0..1, boosts 0.25..4)"; return false;
                 }
                 out.boostLo[i] = lo; out.boostVal[i] = val;
             }
@@ -146,12 +147,37 @@ bool ParseFaldPanelParams(const void* data, size_t bytes, FaldPanelParams& out, 
             out.boostRule = rule; out.boostMeanGamma = meanGamma; out.boostMeanThresh = meanThresh;
         }
     }
-    if (out.cols == 0 || out.rows == 0 || out.sub == 0 || out.sub > 16 || out.cellW == 0 || out.cellH == 0 ||
+    // The lattice (docs/fald-fractional-pitch.md): words 4/5 = whole-pixel cells with word 31 = 0 (every file before
+    // 2026-10-19 — word 31 was reserved, written 0), OR words 4/5 = 0 with word 31 = the lattice EXTENT latW | latH << 16
+    // (a fractional pitch). An exe from before 2026-10-19 refuses the second form as an implausible header (cellW == 0) —
+    // deliberately: it would run the zones on a drifting whole-pixel lattice. A zero cell word WITHOUT an extent is the
+    // implausible header it always was.
+    const uint32_t extentWord = u[31];
+    const bool noLattice = (out.cellW == 0 || out.cellH == 0) && extentWord == 0;
+    if (out.cols == 0 || out.rows == 0 || out.sub == 0 || out.sub > 16 || noLattice ||
         out.curveN < 16 || out.curveN > 16384 || out.white <= 0 || out.cols > 512 || out.rows > 512 ||
         out.reachTrueC > 64 || out.reachTrueR > 64 || out.reachEstC > 64 || out.reachEstR > 64 ||
         !(out.curveLogMax > out.curveLogMin) || !(out.gainMin > 0 && out.gainMin <= out.gainMax) ||
         !(out.tmin >= 0) || !(out.area0 > 0) || !(out.driveFloor >= 0)) {
         err = "implausible header"; return false;
+    }
+    if (extentWord == 0) {                                                                  // whole-pixel cells
+        const unsigned long long lw = (unsigned long long)out.cols * out.cellW, lh = (unsigned long long)out.rows * out.cellH;
+        if (lw > FALD_LATTICE_MAX_PX || lh > FALD_LATTICE_MAX_PX) {
+            err = "implausible lattice words (a lattice of more than 65535 px)"; return false;
+        }
+        out.latW = (uint32_t)lw; out.latH = (uint32_t)lh;
+    } else {                                                                                // the extent: a rational pitch
+        if (out.cellW != 0 || out.cellH != 0) {
+            err = "implausible lattice words (cell size words 4/5 and an extent word 31 together)"; return false;
+        }
+        const uint32_t lw = extentWord & 0xFFFFu, lh = extentWord >> 16;
+        if (lw < out.cols || lh < out.rows) {
+            err = "implausible lattice words (an extent of fewer pixels than zones)"; return false;
+        }
+        out.latW = lw; out.latH = lh;
+        out.cellW = (lw + out.cols - 1) / out.cols;                                         // the widest zone (sweep slices)
+        out.cellH = (lh + out.rows - 1) / out.rows;
     }
     size_t nTrue = (size_t)out.sub * out.sub * (2 * out.reachTrueR + 1) * (2 * out.reachTrueC + 1);
     size_t nEst = (size_t)out.sub * out.sub * (2 * out.reachEstR + 1) * (2 * out.reachEstC + 1);
@@ -238,9 +264,27 @@ bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr) {
 
 bool FaldLatticeFits(const FaldPanelParams& p, int width, int height) {
     if (width <= 0 || height <= 0) return false;
-    unsigned long long right = (unsigned long long)p.originX + (unsigned long long)p.cols * p.cellW;
-    unsigned long long bottom = (unsigned long long)p.originY + (unsigned long long)p.rows * p.cellH;
+    if (p.cols == 0 || p.rows == 0 || p.latW < p.cols || p.latH < p.rows ||
+        p.latW > FALD_LATTICE_MAX_PX || p.latH > FALD_LATTICE_MAX_PX) return false;   // (the loader never produces these)
+    unsigned long long right = (unsigned long long)p.originX + p.latW;
+    unsigned long long bottom = (unsigned long long)p.originY + p.latH;
     return right <= (unsigned long long)width && bottom <= (unsigned long long)height;
+}
+
+uint32_t FaldZoneEdge(uint32_t index, uint32_t count, uint32_t extent) {
+    if (count == 0) return 0;
+    // ceil(index * extent / count - 1/2) = floor((2 index extent + count - 1) / (2 count)); 64-bit here, < 2^32 on the GPU
+    return (uint32_t)((2ull * index * extent + count - 1ull) / (2ull * count));
+}
+
+uint32_t FaldZoneOfPixel(uint32_t local, uint32_t count, uint32_t extent) {
+    if (extent == 0) return 0;
+    // floor((local + 1/2) * count / extent): the zone the pixel's centre lies in
+    return (uint32_t)(((2ull * local + 1ull) * count) / (2ull * extent));
+}
+
+bool FaldLatticeFractional(const FaldPanelParams& p) {
+    return p.cols != 0 && p.rows != 0 && (p.latW % p.cols != 0 || p.latH % p.rows != 0);
 }
 
 bool FaldPanelFileStamp(const std::wstring& path, unsigned long long& size, unsigned long long& mtime) {

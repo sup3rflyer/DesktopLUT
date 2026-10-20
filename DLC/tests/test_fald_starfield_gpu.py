@@ -758,8 +758,10 @@ def test_hlsl_star_passes_mirror_the_reference():
     # the protection is interpolated on its own and applied per pixel; the own-zone gate is a NEAREST load of the flag
     assert "float2 p2 = starPlan2Tex.SampleLevel(linearClamp, uv, 0).xy;" in bal
     assert "float wPx = plan.x * (1.0f - StarSmooth(starNbLo, starNbHi, p2.y));" in bal
-    # the zone index in INTEGER math (as view 9), the cheap early-outs (black pixel, own-zone gate) BEFORE the two taps
-    assert "uint2 zone = uint2((uint)(px.x - (int)originX) / cellW, (uint)(px.y - (int)originY) / cellH);" in bal
+    # the zone index in INTEGER math (as view 9; the zone of the pixel's centre at a possibly fractional pitch,
+    # docs/fald-fractional-pitch.md), the cheap early-outs (black pixel, own-zone gate) BEFORE the two taps
+    assert "uint2 zone = ZoneOfPixel(px);" in bal
+    assert "return uint2(((2u * l.x + 1u) * cols) / (2u * latW), ((2u * l.y + 1u) * rows) / (2u * latH));" in common
     assert "if (!(starPlan2Tex.Load(int3((int2)zone, 0)).z > 0.5f)) return img;" in bal
     assert bal.index("if (!(m > 0.0f)) return img;") < bal.index("starPlan2Tex.Load(") < bal.index("starPlanTex.SampleLevel(")
     # the MONOTONE pull: threshold T' = lerp(ln max(t, b + SPECK_LO span), ln t, g); no gate inside the exponent
@@ -783,11 +785,13 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "if (s > driveFloor) { m = max(m, s); sum += s; }" in sstat and "Balance(" not in sstat and "Correct(" not in sstat
     # ... and the un-gated background statistic next to it: every in-frame pixel, no drive floor
     assert "mn = min(mn, s); sumAll += s; count++;" in sstat
-    assert sstat.index("if (px >= frameW || py >= frameH) continue;") < sstat.index("if (StarBetter(mAll, kAll, s, k)) { mAll = s; kAll = k; }")
+    assert sstat.index("if (px >= frameW || py >= frameH) continue;") < sstat.index("if (StarBetter(mAll, kAll, s, k, zw, zh)) { mAll = s; kAll = k; }")
     # the brightest pixel's position: value, then nearest the zone border, then row-major first — a total order
     assert "if (vb != va) return vb > va;" in sstat and "if (eb != ea) return eb > ea;" in sstat and "return kb < ka;" in sstat
-    assert "max(abs(2 * lx - ((int)cellW - 1)) * (int)cellH, abs(2 * ly - ((int)cellH - 1)) * (int)cellW)" in sstat
-    assert "if (StarBetter(gMaxAll[tid.x], gArg[tid.x], gMaxAll[tid.x + stride], gArg[tid.x + stride])) {" in sstat
+    # ... in the zone's OWN size zw x zh (a fractional pitch makes zones differ by one pixel)
+    assert "max(abs(2 * lx - ((int)zw - 1)) * (int)zh, abs(2 * ly - ((int)zh - 1)) * (int)zw)" in sstat
+    assert "if (StarBetter(gMaxAll[tid.x], gArg[tid.x], gMaxAll[tid.x + stride], gArg[tid.x + stride], zw, zh)) {" in sstat
+    assert "uint zw = ZoneEdgeX(cx + 1u) - x0, zh = ZoneEdgeY(cy + 1u) - y0;" in sstat
     assert "bool speck = span > max(FALD_STAR_FLAT_ABS, FALD_STAR_FLAT_REL * peakAll);" in sstat
     assert "float aEff = speck ? (sumAll0 - b * cnt) / max(span, 1e-12f) : 0.0f;" in sstat
     assert "(has && speck) ? 1.0f - StarSmooth(starAreaLo, starAreaHi, aEff) : 0.0f" in sstat
@@ -797,9 +801,12 @@ def test_hlsl_star_passes_mirror_the_reference():
     # S1: flank zones carry no target weight (wt), keep their w (plan2.w)
     assert "starWOut[id.xy] = float4(wt, wt * log(max(st.r, 1e-12f)), flank ? 1.0f : 0.0f, st.g);" in sweight
     assert "float wt = flank ? 0.0f : w / (1.0f + partners);" in sweight                # equal-peak partners share one vote
-    assert "(lx >= (int)cellW - FALD_STAR_FLANK_PX && nx < FALD_STAR_FLANK_NEAR_PX)" in sweight
-    assert "(lx < FALD_STAR_FLANK_PX && nx >= (int)cellW - FALD_STAR_FLANK_NEAR_PX)" in sweight
-    assert "(ly >= (int)cellH - FALD_STAR_FLANK_PX && ny < FALD_STAR_FLANK_NEAR_PX)" in sweight
+    # the flank test in each zone's OWN size: this zone's (zw0 / zh0) for its edge, the neighbour's (zw1 / zh1) for its index
+    assert "(lx >= zw0 - FALD_STAR_FLANK_PX && nx < FALD_STAR_FLANK_NEAR_PX)" in sweight
+    assert "(lx < FALD_STAR_FLANK_PX && nx >= zw1 - FALD_STAR_FLANK_NEAR_PX)" in sweight
+    assert "(ly >= zh0 - FALD_STAR_FLANK_PX && ny < FALD_STAR_FLANK_NEAR_PX)" in sweight
+    assert "(ly < FALD_STAR_FLANK_PX && ny >= zh1 - FALD_STAR_FLANK_NEAR_PX)" in sweight
+    assert "int nx = (int)(k1 % (uint)zw1), ny = (int)(k1 / (uint)zw1);" in sweight
     assert "if (!(np_ >= st.r && np_ > 0.0f)) continue;" in sweight
     assert "if (okx && oky) { if (np_ > st.r) flank = true; else partners += 1.0f; }" in sweight
     assert f"static const int FALD_STAR_FLANK_PX = {gpuemu.STAR_FLANK_PX};" in common
@@ -832,7 +839,7 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert c.index("if (r->starOn) RunStar(r);") < c.index("RunStat(r, 0);")
     assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 20" in c
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
-    assert "FALD_CB_BYTES = 304" in (_SHARED / "fald_panel.h").read_text(encoding="utf-8")        # 76 words since the glow fill (S2) was removed, 2026-10-07
+    assert "FALD_CB_BYTES = 320" in (_SHARED / "fald_panel.h").read_text(encoding="utf-8")        # 80 words since the lattice extent (fractional pitch, 2026-10-19)
     assert f"FALD_STAR_EVEN_REACH_MAX = {gpuemu.STAR_EVEN_REACH_MAX}" in h and f"FALD_STAR_REACH_MAX = {gpuemu.STAR_REACH_MAX}" in h
     # ... and the DWM hook (acb94f5): the same order, the same t15 / t18 bindings, the same reach limits
     hk = _HOOK.read_text(encoding="utf-8")
