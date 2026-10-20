@@ -36,7 +36,7 @@
    - edge-lit LCD: reachable black, i.e. the pedestal, on the correction side;
    - sub-sRGB: no SDR out-of-gamut mapping.
 5. **FALD layer:** the shader is parameterised, but the onboarding flow is PA-shaped:
-   - cell pitch must be a whole number of pixels;
+   - ~~cell pitch must be a whole number of pixels;~~ (fixed 2026-10-20, G1);
    - the zone grid must be uniform;
    - the boost probe is a one-off;
    - the temporal tick is fixed at refresh ÷ 2.
@@ -52,7 +52,7 @@
 
 | Class | Today | What blocks / degrades it |
 |---|---|---|
-| **Another FALD mini-LED** | DLC calibration: OK (same physics family). FALD layer: only if the cell pitch is a whole number of pixels and the grid is uniform. | G1–G5 (FALD); B3/B4 are PA fits but the same family; E6 (a boosting panel could be misread as WRGB). |
+| **Another FALD mini-LED** | DLC calibration: OK (same physics family). FALD layer: only if the grid is uniform (a non-integer cell pitch is supported since 2026-10-20, G1 fixed). | G1–G5 (FALD); B3/B4 are PA fits but the same family; E6 (a boosting panel could be misread as WRGB). |
 | **WOLED (LG)** | Works with operator discipline (C6 HDR MHC applied 09-02). | B1 window unguarded; B2 no park; B3 wrong load model; C1 luminance drift invisible; B4 PA thermal law; E1 SDR primaries; E7 band above the D65 reach; E9 window-less peak; F9 no APL-aware tonemap; no two-tier sparse re-profile (planned, open). |
 | **QD-OLED** | Never run. | All the OLED items except WRGB. E6 power-limit sub-additivity; E8 correction caps tuned on the PA; F3 ACM-SDR wide-gamut clip if the owner uses ACM. |
 | **Edge-lit / global-dimming LCD** | BenQ SDR works (applied 10-02). | E3 no reachable-black (pedestal) model on the correction side; E4/E5 pedestal colour / level edge; B4 meaningless thermal law; F4 overlay SDR dither undersized at 8-bit; E10 1023 hardcodes. |
@@ -155,7 +155,7 @@
 
 | ID | Where | Issue | Sev |
 |---|---|---|---|
-| G1 | `export.py:173-177`; `profile.py:209-222`; `fald_panel.cpp:217-222`; `stages/fald_profile.py:768` | **Non-integer cell pitch.** Rounding up (e.g. 2560×1440 @ 48×24 → 2640 px lattice) means the C++ **refuses** the file after a ~40-min run. Rounding down (3440×1440 @ 48 cols → 70 px cells, 3360 px lattice) is **silently accepted**: zones drift by more than one cell and the right 80 px get no correction. Preflight only raises a "medium" anomaly. *latent* (PA 48×48 @ 4K is exact). | WRONG |
+| G1 | `export.py:173-177`; `profile.py:209-222`; `fald_panel.cpp:217-222`; `stages/fald_profile.py:768` | **Non-integer cell pitch.** Rounding up (e.g. 2560×1440 @ 48×24 → 2640 px lattice) means the C++ **refuses** the file after a ~40-min run. Rounding down (3440×1440 @ 48 cols → 70 px cells, 3360 px lattice) is **silently accepted**: zones drift by more than one cell and the right 80 px get no correction. Preflight only raises a "medium" anomaly. *latent* (PA 48×48 @ 4K is exact). | WRONG **FIXED 2026-10-20** (fractional pitch, merge 3e462bf on main; the model-side canvas raster is still open) |
 | G2 | `fald_panel.h:36`; `fald_shader.h:201-216` | Uniform grid only (one `cellW`/`cellH`, integer zone indexing). | BLOCKER for non-uniform TV grids |
 | G3 | `profile.py:27-28`; `export.py` `kernel_tables` | True kernel is isotropic in mm with the LED at the cell centre, so it can't express an edge-lit light-guide spread. | BLOCKER (accuracy) for edge-lit LD |
 | G4 | `stages/fald_profile.py:1183-1196`; root `agent_fald_inside_probe.py`; gitignored `build_boost_table.py` | Black-frame boost has **no generic flow**: `--boost-table` only, built by a one-off with PA pixel sizes. Leaving it unmodelled biases the fit (the stage says so). A continuous APL / power-limit law can't be expressed. | SUBOPT / BLOCKER for boosting panels |
