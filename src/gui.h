@@ -79,6 +79,12 @@ bool FaldPanelFileChangedLive(int mon, bool hdr, uint32_t* gen = nullptr);
 // Hook FALD: a panel file was set or changed — re-inject so the DLL loads it (hook mode, running). True = it did.
 // GUI thread.
 bool FaldPanelFileChangedReinject();
+// FALD views: list DesktopLUT's own windows again for the layer (shared/fald_exempt.h): while any view is on, its
+// visible top-level windows (and follow their moves with a window-event hook); none otherwise. `push`: hand a changed
+// list to a running hook now (a caller about to send the shared config itself passes false). True = the list changed.
+// GUI thread.
+bool FaldExemptRefresh(bool push = true);
+void FaldExemptShutdown();   // GUI thread, at teardown: the window-event hook goes
 
 // Startup registry functions
 bool IsStartupEnabled();

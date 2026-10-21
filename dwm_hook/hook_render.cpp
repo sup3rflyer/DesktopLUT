@@ -1284,10 +1284,20 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			faldMon = FaldAcquire(monLeft, monTop, colorMode == 1,
 				newBackBufferDesc.Width, newBackBufferDesc.Height, newBackBufferDesc.Format);
 			faldBorrow.m = faldMon;   // kept even if faldMon is cleared below (the entry was used: FaldUpdateClean)
-			if (faldMon)
+			if (faldMon) {
+				// The monitor's desktop size (the debounced state list): a debug view's exempt rects (DesktopLUT's own
+				// windows, monitor pixels) are mapped onto this back buffer with it. Unknown = 0 = the buffer's size.
+				unsigned int monW = 0, monH = 0;
+				for (int s = 0; s < g_numMonitorHdrStates; s++)
+					if (g_monitorHdrStates[s].left == monLeft && g_monitorHdrStates[s].top == monTop) {
+						monW = g_monitorHdrStates[s].width;
+						monH = g_monitorHdrStates[s].height;
+						break;
+					}
 				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags),
 					DwmHookFaldStar(fp->flags) != 0,
-					fp->hasTuning ? &fp->tuning : NULL, DwmHookFaldFade(fp->flags) != 0);
+					fp->hasTuning ? &fp->tuning : NULL, DwmHookFaldFade(fp->flags) != 0, monW, monH);
+			}
 			// Feed this present's dirty rects into the layer's clean source. Until a full-frame
 			// composition has primed it, the layer stays off and this present takes the ordinary
 			// dirty-rect path below (the host forces a full recompose when the layer is switched on).

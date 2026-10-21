@@ -54,6 +54,10 @@ Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit);
 // draws; out of range = 0.
 constexpr unsigned int kFaldDebugViews = 10;
 bool SetFaldDebugView(FaldSettings& f, unsigned int view);
+// A view is set on some connected display, either mode (it replaces the picture while that layer runs). GUI thread.
+bool FaldViewOn();
+// Every display back to the corrected picture (Esc, the tray's "End FALD view"). True = a view was on.
+bool ClearFaldViews();
 // The starfield fields the interfaces show (the others are INI / pipe only), clamped to the ranges the classic rows
 // use: even and strength 0..1, spread (targetSigma) 0..4, keep 0..10000 nits, reach (evenReach) whole zones
 // 0..FALD_STAR_EVEN_REACH_MAX. NaN and negatives = 0.

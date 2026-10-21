@@ -296,6 +296,28 @@ bool SetFaldDebugView(FaldSettings& f, unsigned int view) {
     return changed;
 }
 
+bool FaldViewOn() {
+    std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+    for (const MonitorSettings& ms : g_gui.monitorSettings)
+        if (ms.hdrColorCorrection.fald.debugMode != 0 || ms.sdrColorCorrection.fald.debugMode != 0) return true;
+    return false;
+}
+
+bool ClearFaldViews() {
+    bool any = false;
+    for (int mon = 0; ValidMonitor(mon); mon++) {
+        bool on;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            const MonitorSettings& ms = g_gui.monitorSettings[mon];
+            on = ms.hdrColorCorrection.fald.debugMode != 0 || ms.sdrColorCorrection.fald.debugMode != 0;
+        }
+        if (on && EditFaldShared(mon, [](FaldSettings& s) { return SetFaldDebugView(s, 0); }).changed) any = true;
+    }
+    if (any) notify::Post(notify::Sev::Info, -1, L"fald", L"FALD view ended: corrected picture");
+    return any;
+}
+
 bool SetFaldStarField(FaldStarfieldSettings& s, FaldStarField field, float v) {
     if (!(v >= 0.0f)) v = 0.0f;   // NaN too
     switch (field) {
@@ -327,6 +349,9 @@ Result EditFaldShared(int mon, const std::function<bool(FaldSettings&)>& edit) {
         for (bool hdr : { true, false }) changed = edit(FaldOf(ms, hdr)) || changed;
     }
     if (!changed) return Done(false);
+    // A view on or off: DesktopLUT's own windows are listed for the layer (or the list emptied) before the push below
+    // carries it (shared/fald_exempt.h).
+    FaldExemptRefresh(false);
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(mon, true);
         UpdateColorCorrectionLive(mon, false);

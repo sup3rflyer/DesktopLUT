@@ -699,6 +699,13 @@ const FaldView kFaldViews[act::kFaldDebugViews] = {
     { "STARFIELD ZONES", "Starfield, per zone: blue pulled down, red lifted." },
 };
 
+// A FALD view is set on a connected display (either mode): Esc ends it.
+bool AnyFaldView(const Snapshot& snap) {
+    for (const DisplayRow& r : snap.live)
+        if (r.settings.hdrColorCorrection.fald.debugMode != 0 || r.settings.sdrColorCorrection.fald.debugMode != 0) return true;
+    return false;
+}
+
 // A small caps label before a field on a row (it sits close to the field it names).
 void FieldLabel(RowCtx& row, const char* label) {
     RowText(row, label, pal::InkDim, Font::Label, kSizeLabel);
@@ -819,7 +826,8 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     // The views draw what the layer computes in place of the picture (a diagnostic; not saved).
     const unsigned int view = f.debugMode < act::kFaldDebugViews ? f.debugMode : 0u;
     row = BeginRow("VIEW");
-    RowTip(row, "What the layer outputs. Any view but CORRECTED replaces the picture while the layer runs. Not saved.");
+    RowTip(row, "What the layer outputs. Any view but CORRECTED replaces the picture while the layer runs; "
+                "DesktopLUT's own windows keep the corrected one.\nEsc or the tray ends it. Not saved.");
     RowPlace(row);
     if (BeginDropdown("##fald_view", kFaldViews[view].label, 180)) {
         for (unsigned int i = 0; i < act::kFaldDebugViews; i++) {
@@ -830,7 +838,7 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
         EndDropdown();
     }
     EndRow(row);
-    if (view != 0) PanelNote(kFaldViews[view].label, pal::Alarm, "A FALD view replaces the picture. VIEW \xE2\x80\xBA CORRECTED ends it.");
+    if (view != 0) PanelNote(kFaldViews[view].label, pal::Alarm, "A FALD view replaces the picture outside DesktopLUT's windows. Esc ends it.");
 }
 
 void InspectShaderTweak(const DisplayRow& r, const Stage& st, bool hdr) {
@@ -2106,6 +2114,11 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     ImGuiIO& io = ImGui::GetIO();
     if (EditorOpen(vs)) io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableKeyboard;
     else io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    // Esc ends a FALD view, unless something else takes it this frame: an editor (its own Esc), a modal or a drop-down
+    // (Esc closes it), a field being typed in or a rename (Esc cancels it). Decided before anything is drawn.
+    const bool escEndsView = !busy && !EditorOpen(vs) && vs.renamingKey.empty() && !ImGui::IsAnyItemActive() &&
+                             !ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) &&
+                             ImGui::IsKeyPressed(ImGuiKey_Escape, false) && AnyFaldView(snap);
     DrawHeader(snap, vs, busy || EditorOpen(vs));
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
@@ -2119,6 +2132,7 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     DrawFooter(snap, vs, busy);
     DrawConfirm(vs);
     DrawWhitelist(vs);
+    if (escEndsView) Post([]() { act::ClearFaldViews(); });
     ImGui::End();
 }
 

@@ -205,7 +205,9 @@ TEST_CASE("DwmHookSharedConfigEx: the FALD tuning tail sits after the frozen 464
     CHECK(offsetof(DwmHookFaldTuning, refreshMs) == 92);
     // the live panel-file delivery generations came out of _reserved next (0 = the file staged at injection)
     CHECK(offsetof(DwmHookFaldTuning, panelGen) == 96);
-    CHECK(offsetof(DwmHookFaldTuning, _reserved) == 104);
+    // DesktopLUT's own windows exempt from a FALD view came out of _reserved last: all six words (0 = no rect)
+    CHECK(offsetof(DwmHookFaldTuning, exempt) == 104);
+    CHECK(sizeof(DwmHookFaldTuning::exempt) == 6 * 4);
     CHECK(sizeof(DwmHookSharedConfigEx) == 464 + 16 + 128 * MAX_DWM_HOOK_MONITORS);
 }
 

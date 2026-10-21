@@ -371,7 +371,8 @@ static bool IsProcessDwm(HANDLE hProcess)
 
 // Cached DXGI monitor info — refreshed on InjectDwmHook and InvalidateDxgiMonitorCache.
 // Must be accessed under g_dwmInjectMutex.
-struct DxgiMonInfo { int left, top, w, h, bpc; bool hdr; float refreshMs; };
+// rotation: DXGI_MODE_ROTATION (desktop orientation); a FALD view's exempt rects are mirrored for an upside-down monitor.
+struct DxgiMonInfo { int left, top, w, h, bpc; bool hdr; float refreshMs; int rotation = 0; };
 static std::vector<DxgiMonInfo> g_cachedDxgiMons;
 static bool g_dxgiCacheValid = false;
 
@@ -423,6 +424,7 @@ static std::vector<DxgiMonInfo> DoDxgiEnumerateOnce()
                         mi.bpc = static_cast<int>(desc1.BitsPerColor);
                         mi.hdr = (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
                         mi.refreshMs = RefreshPeriodMsAt(mi.left, mi.top);
+                        mi.rotation = static_cast<int>(desc1.Rotation);
                         result.push_back(mi);
                     }
                     output6->Release();
@@ -1494,6 +1496,17 @@ void UpdateDwmHookSharedConfig()
                         t.tempClockClosure = FaldPanelClockClosure(fs.clockClosure);
                         t.tempClockParity = FaldPanelClockParity(fs.clockParity);
                         t.refreshMs = mons[i].refreshMs;
+                        // A debug view: DesktopLUT's own windows on this monitor keep the corrected picture
+                        // (shared/fald_exempt.h). Only while the view is on; else the words stay 0.
+                        if (fs.debugMode != 0) {
+                            const std::vector<FaldExemptRect> desk = FaldExemptRects();
+                            FaldExemptRect mr[FALD_EXEMPT_WIRE_RECTS];
+                            const int n = FaldExemptForMonitor(desk.data(), static_cast<int>(desk.size()), mc.left, mc.top,
+                                                               static_cast<int>(mc.width), static_cast<int>(mc.height),
+                                                               mons[i].rotation == DXGI_MODE_ROTATION_ROTATE180, mr,
+                                                               FALD_EXEMPT_WIRE_RECTS);
+                            FaldExemptPack(mr, n, t.exempt);
+                        }
                         break;
                     }
                 }
