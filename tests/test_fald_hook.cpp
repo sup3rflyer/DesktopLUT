@@ -5,7 +5,8 @@
 // FaldReturn. Its output and fade-stack fields must equal, BYTE FOR BYTE, the overlay path's WARP dumps of the same frames
 // (tests/test_fald_fade.cpp "FALD fade ON", FALD_TEST_FADE_ON) — the hook and the overlay run the same passes.
 //
-// Cases: four stills (HDR with the starfield on; the sanitise cell with it off; the odd size on its own panel; ACM SDR);
+// Cases: the stills (HDR with the starfield on — n7_lamp, round 12a's three, round 12b's ten halo frames when the cell dir
+// holds them; the sanitise cell with it off; the odd size on its own panel; ACM SDR; a fractional pitch);
 // the seattle pan (16 content frames, two presents WITHOUT new content in between: nothing steps, the output repeats);
 // the same pan with a live panel swap at frame 8 (the fade moves with the frame part, T resets: frames 8..15 = a fresh
 // context from frame 8 on the new file) and with an idle reset at frame 8 (FaldMarkStale) plus a re-injection at frame
@@ -284,6 +285,17 @@ TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay'
         { "still_aces_m18", "aces_m18", HaveCell(cells, "aces_m18") ? C : std::wstring(), true, true, 3840, 2160 },
         { "still_aces_m52", "aces_m52", HaveCell(cells, "aces_m52") ? C : std::wstring(), true, true, 3840, 2160 },
         { "still_s10_ac_redspot", "s10_ac_redspot", HaveCell(cells, "s10_ac_redspot") ? C : std::wstring(), true, true, 3840, 2160 },
+        // round 12b's ten halo stills (F12B_V8d: dark objects next to glows, the R-2 band frame), when the cell dir holds them
+        { "still_ax_552", "ax_552", HaveCell(cells, "ax_552") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_ax_412", "ax_412", HaveCell(cells, "ax_412") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_ax_422", "ax_422", HaveCell(cells, "ax_422") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_ax_442", "ax_442", HaveCell(cells, "ax_442") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_ax_492", "ax_492", HaveCell(cells, "ax_492") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_ax_522", "ax_522", HaveCell(cells, "ax_522") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_s10_sm_windmill", "s10_sm_windmill", HaveCell(cells, "s10_sm_windmill") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_s10_sm_cows", "s10_sm_cows", HaveCell(cells, "s10_sm_cows") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_s10_sm_snowfence", "s10_sm_snowfence", HaveCell(cells, "s10_sm_snowfence") ? C : std::wstring(), true, true, 3840, 2160 },
+        { "still_s10_ac_rec2020", "s10_ac_rec2020", HaveCell(cells, "s10_ac_rec2020") ? C : std::wstring(), true, true, 3840, 2160 },
         { "still_x_naninf", "x_naninf", C, true, false, 3840, 2160 },
         { "still_x_odd1366", "x_odd1366", ODD + L"\\odd_panel.bin", true, true, 1366, 768 },
         { "still_sdr_n7_lamp", "n7_lamp", SDR, false, true, 3840, 2160 },

@@ -1,4 +1,5 @@
-// The frozen fade stack (ASF10 + T11_TMTC; DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md) — WARP gates.
+// The frozen fade stack (F12B_V8d = ASF10 + T11_TMTC + A + B16 + V8d; DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md
+// and its deltas r12a/PORT_DELTA.md, r12b/PORT_DELTA.md) — WARP gates.
 //
 // OFF gate (PORT_PLAN §5.1): with the flank fade OFF the layer is today's, bit for bit. Every field the overlay's layer
 // leaves behind and the output frame are hashed (FNV-1a 64) for a fixed matrix of runs: the gate's still cells x the
@@ -356,6 +357,10 @@ struct OnSpec {
 
 int g_lastFadeWarmupRuns = 0;   // RunOn: runs of the first frame before the paced fade was on
 
+// round 12b's halo stills (DLC tests/fald_fade_cells.py F12B_STILLS; tests/test_fald_hook.cpp runs them too)
+const char* const kHaloCells[] = { "ax_552", "ax_412", "ax_422", "ax_442", "ax_492", "ax_522", "s10_sm_windmill", "s10_sm_cows",
+                                   "s10_sm_snowfence", "s10_ac_rec2020" };
+
 bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, const OnSpec& rs, std::string& err, double& secs) {
     MonitorContext ctx;
     ctx.width = rs.w; ctx.height = rs.h;
@@ -415,7 +420,7 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
         const std::pair<const char*, ID3D11Texture2D*> tex[] = {
             { "mi.f32", d.mi }, { "fade.f32", d.fade }, { "fade_t.f32", d.fadeT }, { "floor.f32", d.floorF },
             { "reach0.f32", d.reach[0] }, { "reach1.f32", d.reach[1] }, { "s.f32", d.s }, { "fq.f32", d.fq },
-            { "dec.f32", d.dec }, { "kq1.f32", d.kq }, { "drive.f32", r->driveTex }, { "btrue.f32", r->bTrueTex },
+            { "dec.f32", d.dec }, { "kq1.f32", d.kq }, { "v8.f32", d.v8 }, { "drive.f32", r->driveTex }, { "btrue.f32", r->bTrueTex },
             { "best.f32", r->bEstTex }, { "gain.rg32f", r->gainBTex }, { "boost_r0.f32", r->boostTex[0] },
             { "boost_r1.f32", r->boostTex[1] }, { "out.rgba16f", target } };
         for (const auto& t : tex) {
@@ -552,6 +557,11 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
     // round 12a's three stills (F12A_B16, r12a/PORT_DELTA.md §4: the ACES markers 18 / 52 and A's largest effect), when the
     // cell dir holds them (DLC tests/fald_fade_cells.py f12a; not in cells.txt, which is the OFF matrix's frozen set)
     for (const char* n : { "aces_m18", "aces_m52", "s10_ac_redspot" })
+        if (GetFileAttributesA((cellDir + "/" + n + ".rgba16f").c_str()) != INVALID_FILE_ATTRIBUTES)
+            add(std::string("still_") + n, C, true, true, { n }, 3840, 2160);
+    // round 12b's ten halo stills (F12B_V8d, r12b/PORT_DELTA.md §4: its held-out frames with dark objects next to glows, and
+    // an R-2 band frame), when the cell dir holds them (DLC tests/fald_fade_cells.py f12b; not in cells.txt either)
+    for (const char* n : kHaloCells)
         if (GetFileAttributesA((cellDir + "/" + n + ".rgba16f").c_str()) != INVALID_FILE_ATTRIBUTES)
             add(std::string("still_") + n, C, true, true, { n }, 3840, 2160);
     add("still_x_naninf", C, true, false, { "x_naninf" }, 3840, 2160);                       // star off: the sanitise cell

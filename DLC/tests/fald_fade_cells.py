@@ -7,6 +7,7 @@ receives (RGBA half, alpha 1, the fald_frame.rgba16f layout) plus a cells.txt in
     python tests/fald_fade_cells.py seqs [<dir>]      # the four motion sequences (CUDA: the study's grain is drawn by a
                                                       # CUDA generator, so the frames equal the study's frame for frame)
     python tests/fald_fade_cells.py f12a [<dir>]      # CPU only: round 12a's three stills (F12A_B16, r12a/PORT_DELTA.md §4)
+    python tests/fald_fade_cells.py f12b [<dir>]      # CPU only: round 12b's ten halo stills (F12B_V8d, r12b/PORT_DELTA.md §4)
 
 <dir> defaults to H:/scratch/DesktopLUT/fald_asf10_port/cells. Inputs (read only): the study's cached frames under
 H:/scratch/fald_nearfield_r10|r11 and the frozen study sources under the main checkout's DLC/results (the frozen twin)."""
@@ -41,6 +42,12 @@ ODD_W, ODD_H = 1366, 768
 # with its manifest (tests/fixtures/fald_fade_off_main.hashes, recorded on main 6273464)
 F12A_STILLS = ("aces_m18", "aces_m52", "s10_ac_redspot")
 ACES = Path("H:/scratch/DesktopLUT/fald_fade_lines")   # m18 / m52_tm16.npy (results/fald_fade_lines_2026-10-20/make_inputs.py)
+# round 12b (F12B_V8d, r12b/PORT_DELTA.md §4): its held-out halo frames (dark objects next to big glows: ACES frames decoded
+# by r12b/aces12b.py, the s10 real frames) and s10_ac_rec2020 (an R-2 band frame, where V moves the band most). Like
+# F12A_STILLS, NOT listed in cells.txt (the OFF gate's frozen set)
+F12B_STILLS = ("ax_552", "ax_412", "ax_422", "ax_442", "ax_492", "ax_522",
+               "s10_sm_windmill", "s10_sm_cows", "s10_sm_snowfence", "s10_ac_rec2020")
+R12B_INPUTS = Path("H:/scratch/DesktopLUT/fald_r12b/inputs")   # ax_<s>/tm16.npy (r12b/run12b.py pair_input)
 ODD_LATTICE = (17, 9)                  # 80 x 85 px zones = 1360 x 765 px: 6 columns + 3 rows outside the lattice
 ODD_SRC = ("n9_cactus", 700, 1200)     # the odd cell = this still cropped at (y0, x0)
 
@@ -128,6 +135,19 @@ def f12a(root: Path) -> None:
         print(f"{name} -> {root}")
 
 
+def f12b_still(name: str) -> np.ndarray:
+    if name.startswith("ax_"):
+        return np.load(R12B_INPUTS / name / "tm16.npy")
+    return cached_still(name)
+
+
+def f12b(root: Path) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    for name in F12B_STILLS:
+        rgba16(f12b_still(name)).tofile(root / f"{name}.rgba16f")
+        print(f"{name} -> {root}")
+
+
 def seqs(root: Path) -> None:
     """The four sequences through r11/T/motion11.py's own frame builders and FP16 encode (motion11.to16), so frame t here
     is the frame the study's TEmu.run saw at t (grain from the same CUDA generator seeds)."""
@@ -160,4 +180,4 @@ def seqs(root: Path) -> None:
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else "stills"
     root = Path(sys.argv[2]) if len(sys.argv) > 2 else OUT
-    {"stills": stills, "seqs": seqs, "f12a": f12a}[what](root)
+    {"stills": stills, "seqs": seqs, "f12a": f12a, "f12b": f12b}[what](root)
