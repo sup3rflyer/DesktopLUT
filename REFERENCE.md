@@ -463,6 +463,17 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   7 SETTLING (LED lag: red = still rising, blue = still falling), 8 BOOST ZONES (white = a zone the black-frame boost
   counts as lit), 9 STARFIELD ZONES (blue = a peak pulled down, red = lifted). The new interface names the view on the
   FALD panel's title line, in amber, while one other than CORRECTED is on.
+  **DesktopLUT's own windows keep the corrected picture** while a view is on (`shared/fald_exempt.h`): both paths draw
+  the pixel pass a second time with the view off, scissored to DesktopLUT's visible top-level windows (the new
+  interface, the classic window and its dialogs, the tray menu, the console log; not minimised, not cloaked), so the
+  VIEW row stays readable. The host lists them in desktop pixels and follows their moves, sizes, minimising and
+  cloaking with a window-event hook on its own process (installed only while a view is on); the overlay reads the list
+  per frame, the hook gets up to three merged rects per monitor in monitor pixels in `DwmHookFaldTuning::exempt` (a
+  monitor turned upside down also gets them mirrored; a back buffer whose width and height are the monitor's swapped
+  gets both quarter turns). With the view off no rect is sent and no draw is added: the output is the same bytes. Ways
+  back: **Esc** in DesktopLUT's window (unless an editor, a drop-down, a modal or a field being typed in takes it), the
+  tray's **End FALD view** (shown only while a view is on), or VIEW › CORRECTED. A view is never saved: every start is
+  on the corrected picture.
 - **Starfield balancing** (experimental, default off): a field of scattered specks drives its zones unevenly (zone-
   shaped haze patches); the option pulls the star-like peaks toward the local mean of their neighbours' peaks. The
   STARFIELD / STAR TARGET rows (and the classic Starfield rows) set EVEN (how far a peak is pulled, 0–1), STRENGTH
