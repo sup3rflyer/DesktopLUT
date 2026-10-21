@@ -52,7 +52,7 @@ bool g_ready = false;
 enum PixOp : unsigned int {
     P_MI = 0, P_RAW0 = 1, P_THIN = 2, P_W = 3, P_CARE = 4, P_PP0 = 5, P_DIV = 6, P_BLEND = 7, P_HYB = 8, P_LOG = 9,
     P_LOGEPS = 10, P_CLGATE = 11, P_CLADD8 = 12, P_ADDF = 13, P_CONE = 14, P_CONEF = 15, P_CONEAP = 16, P_DEC = 17,
-    P_SUB = 18, P_TOUT = 19, P_PAD = 20
+    P_SUB = 18, P_TOUT = 19, P_PAD = 20, P_FVV = 21, P_FVLEV = 22, P_FVGATE = 23, P_FVSRC = 24
 };
 
 // the FadeCB layout (fald_fade_shader.h)
@@ -69,6 +69,9 @@ const double kSigmas[] = { 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 24.0, 32.0, 16.0 };   /
 const unsigned int kNumSigmas = 9;
 // A (F12A_B16): the CL closing runs on the 1/8-res fade zero-padded by 2 x its radius 40 (fald_fade_shader.h FADE_CL_PAD)
 const unsigned int kClPad = 80;
+// V8d (F12B_V8d): the floor-valley gate's radii at 1/8 res — grey_close 33 (264 px), grey_open 133 (1064 px), the 11-texel
+// dilation / reach (40 px) (r12b/cands12b.py floor_valley8; fadeemu FV_CLOSE_R / FV_OPEN_R / FV_DIL_R)
+const unsigned int kFvCloseR = 16, kFvOpenR = 66, kFvDilR = 5;
 
 // dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
 // order in double, w[r + j] / sum stored float32.
@@ -102,6 +105,7 @@ struct FaldFade {
     // eighth resolution
     FadeTex eF8, eTmp, eL8c, eA, eB, eOpen, eGate, eAdd8, eL8raw, eLf, eFopen, eX, eMag, eR, eL8, eL8Prev[2];
     FadeTex ePad0, ePad1, ePad2;                                 // A: the closing's padded maps, (W8 + 2 kClPad) x (H8 + 2 kClPad)
+    FadeTex eVlmin, eVlc, eVv, eVd, eVlev;                       // V8d: lmin8, Lc, v (then V8), maxf11(v), the object level
     FadeTex eC1, eC2, eSpec, eSpecPrev[2];                       // complex (R32G32F)
     // the push-pull pyramid, levels 1 .. top (level 0 = full res, in S[]); (h, w) per level
     std::vector<FadeTex> pS, pW, pE, pU, pT;
@@ -230,7 +234,8 @@ void ReleaseAll(FaldFade* f) {
                      &f->qG, &f->qDec, &f->qSw, &f->qLw, &f->qGlq, &f->qGlw, &f->qS[0], &f->qS[1], &f->qD, &f->qKq,
                      &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eAdd8, &f->eL8raw,
                      &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1], &f->eC1,
-                     &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1], &f->hann, &f->specG, &f->ePad0, &f->ePad1, &f->ePad2 };
+                     &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1], &f->hann, &f->specG, &f->ePad0, &f->ePad1, &f->ePad2,
+                     &f->eVlmin, &f->eVlc, &f->eVv, &f->eVd, &f->eVlev };
     for (FadeTex* t : q) RelTex(*t);
     for (auto* v : { &f->pS, &f->pW, &f->pE, &f->pU, &f->pT }) { for (auto& t : *v) RelTex(t); v->clear(); }
     f->lvH.clear(); f->lvW.clear();
@@ -469,7 +474,8 @@ void PlanBuild(FaldFade* f, unsigned int width, unsigned int height) {
                         &f->qG, &f->qDec, &f->qSw, &f->qLw, &f->qGlq, &f->qGlw, &f->qS[0], &f->qS[1], &f->qD, &f->qKq })
         add(t, f->Wq, f->Hq, BK_R32F);
     for (FadeTex* t : { &f->eF8, &f->eTmp, &f->eL8c, &f->eA, &f->eB, &f->eOpen, &f->eGate, &f->eAdd8, &f->eL8raw,
-                        &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1] })
+                        &f->eLf, &f->eFopen, &f->eX, &f->eMag, &f->eR, &f->eL8, &f->eL8Prev[0], &f->eL8Prev[1],
+                        &f->eVlmin, &f->eVlc, &f->eVv, &f->eVd, &f->eVlev })   // the last five: V8d
         add(t, f->W8, f->H8, BK_R32F);
     for (FadeTex* t : { &f->eC1, &f->eC2, &f->eSpec, &f->eSpecPrev[0], &f->eSpecPrev[1] }) add(t, f->W8, f->H8, BK_RG32F);
     for (FadeTex* t : { &f->ePad0, &f->ePad1, &f->ePad2 }) add(t, f->W8 + 2 * kClPad, f->H8 + 2 * kClPad, BK_R32F);   // A
@@ -596,12 +602,10 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     BindCommonState(ctx, common);
     // F1: mi (the max channel of Balance(PanelNits(frame)), unsanitised) and lv = ln max(clamp(mi, 0, 1e4), 0.05)
     Pix(f, ctx, P_MI, W, H, {}, { &f->mi, &S[1] });
-    // F2-F3: the flank term raw = G4(maxf25(1 - 1 / (1 + (80 min(|grad G4 lv|, |grad G24 lv|))^2)))
+    // F2: the flank term's raw0 = 1 - 1 / (1 + (80 min(|grad G4 lv|, |grad G24 lv|))^2), kept in S6 until w exists
     Gauss(f, ctx, 4.0, S[1], S[2], S[3]);   Grad(f, ctx, S[3], S[4]);
     Gauss(f, ctx, 24.0, S[1], S[2], S[3]);  Grad(f, ctx, S[3], S[5]);
-    Pix(f, ctx, P_RAW0, W, H, { &S[4], &S[5] }, { &S[2] });
-    Ext(f, ctx, 12, 0, S[2], S[3], S[4]);
-    Gauss(f, ctx, 4.0, S[4], S[3], S[6]);                                  // S6 = raw
+    Pix(f, ctx, P_RAW0, W, H, { &S[4], &S[5] }, { &S[6] });               // S6 = raw0
     // F4: the robust thin-step flag -> step = clamp(G4(maxf65(thin)), 0, 1), w = 1 - step
     Gauss(f, ctx, 2.0, S[1], S[2], S[3]);   Grad(f, ctx, S[3], S[4]);      // S4 = g1
     Gauss(f, ctx, 6.0, S[1], S[2], S[3]);   Grad(f, ctx, S[3], S[5]);      // S5 = g2
@@ -611,6 +615,27 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     Ext(f, ctx, 32, 0, S[2], S[3], S[4]);
     Gauss(f, ctx, 4.0, S[4], S[3], S[5], 2u);                              // step (saturated)
     Pix(f, ctx, P_W, W, H, { &S[5] }, { &f->w });
+    // V8d (F12B_V8d, r12b/cands12b.py floor_valley8 with the darkest-object test): the floor-valley gate at 1/8 res, from the
+    // sanitised max channel (the Down passes' clamp). l8 is the CL's (F7 reads eL8c too)
+    Down(f, ctx, 8, f->mi, f->eTmp, 1u);
+    Pix(f, ctx, P_LOG, W8, H8, { &f->eTmp }, { &f->eL8c });                // l8 = ln max(down8(ms), 0.05)
+    Down(f, ctx, 8, f->mi, f->eTmp, 3u);
+    Pix(f, ctx, P_LOG, W8, H8, { &f->eTmp }, { &f->eVlmin });              // lmin8 = ln max(min8(ms), 0.05)
+    Ext(f, ctx, kFvCloseR, 0, f->eL8c, f->eA, f->eB);
+    Ext(f, ctx, kFvCloseR, 1, f->eB, f->eA, f->eVlc);                      // Lc = grey_close(l8, 33)
+    Ext(f, ctx, kFvOpenR, 1, f->eVlc, f->eA, f->eB);
+    Ext(f, ctx, kFvOpenR, 0, f->eB, f->eA, f->eB);                         // eB = grey_open(Lc, 133) (the H pass reads eA)
+    Pix(f, ctx, P_FVV, W8, H8, { &f->eVlc, &f->eVlmin, &f->eB }, { &f->eVv });   // v
+    Ext(f, ctx, kFvDilR, 0, f->eVv, f->eA, f->eVd);                        // Vd = maxf(v, 11)
+    Pix(f, ctx, P_FVLEV, W8, H8, { &f->eVlmin, &f->eVv }, { &f->eB });
+    Ext(f, ctx, kFvDilR, 1, f->eB, f->eA, f->eVlev);                       // vlev = minf(lmin8 + (1 - v) 20, 11)
+    Ext(f, ctx, kFvDilR, 1, f->eVlmin, f->eA, f->eB);                      // eB = dmin = minf(lmin8, 11)
+    Pix(f, ctx, P_FVGATE, W8, H8, { &f->eVd, &f->eVlev, &f->eB }, { &f->eVv });  // eVv = V8 (v is dead)
+    Up(f, ctx, 8, f->eVv, S[2]);                                           // V (clamped in FVSRC)
+    // F3: raw = G4(maxf25(raw0 (1 - (1 - w) V)))
+    Pix(f, ctx, P_FVSRC, W, H, { &S[6], &f->w, &S[2] }, { &S[3] });
+    Ext(f, ctx, 12, 0, S[3], S[2], S[4]);
+    Gauss(f, ctx, 4.0, S[4], S[2], S[6]);                                  // S6 = raw
     // care = smooth(0.3, 0.6, G2(clamp(mi, 0, 1e4)))
     Gauss(f, ctx, 2.0, f->mi, S[1], S[2], 1u);
     Pix(f, ctx, P_CARE, W, H, { &S[2] }, { &S[3] });
@@ -639,10 +664,8 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
         Pix(f, ctx, P_DIV, W, H, { &S[1], &S[2] }, { &S[7] });
     }
     Pix(f, ctx, P_HYB, W, H, { &S[4], &S[5], &S[7], &f->w, &S[6] }, { &f->fade });
-    // F7: CL — closing at 1/8 res over regions above their large-scale floor
+    // F7: CL — closing at 1/8 res over regions above their large-scale floor (l8 = eL8c, formed for V8d above)
     Down(f, ctx, 8, f->fade, f->eF8);
-    Down(f, ctx, 8, f->mi, f->eTmp, 1u);
-    Pix(f, ctx, P_LOG, W8, H8, { &f->eTmp }, { &f->eL8c });
     Ext(f, ctx, 50, 1, f->eL8c, f->eA, f->eB);
     Ext(f, ctx, 50, 0, f->eB, f->eA, f->eOpen);                            // grey opening, 101
     Pix(f, ctx, P_CLGATE, W8, H8, { &f->eL8c, &f->eOpen }, { &f->eGate });
@@ -754,7 +777,7 @@ FaldFadeDebug FaldFadeDebugViews(const FaldFade* f) {
     if (!f || !f->built) return d;
     d.mi = f->mi.t; d.fade = f->fade.t; d.fadeT = f->fadeT.t; d.floorF = f->floorF.t;
     d.reach[0] = f->reach[0].t; d.reach[1] = f->reach[1].t;
-    d.s = f->qS[f->parity].t; d.fq = f->qFq.t; d.dec = f->qDec.t; d.kq = f->qKq.t; d.flags = f->flagsBuf;
+    d.s = f->qS[f->parity].t; d.fq = f->qFq.t; d.dec = f->qDec.t; d.kq = f->qKq.t; d.v8 = f->eVv.t; d.flags = f->flagsBuf;
     d.width = f->W; d.height = f->H; d.wq = f->Wq; d.hq = f->Hq; d.w8 = f->W8; d.h8 = f->H8;
     d.hasHistory = f->hasHistory;
     return d;
