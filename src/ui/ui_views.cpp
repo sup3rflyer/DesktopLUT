@@ -833,13 +833,18 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
         ImGui::OpenPopup("##fald_view");
         vs.faldViewOpenRequested = false;
     }
-    if (BeginDropdown("##fald_view", kFaldViews[view].label, 180)) {
+    int wheel = 0;
+    if (BeginDropdown("##fald_view", kFaldViews[view].label, 180, &wheel)) {
         for (unsigned int i = 0; i < act::kFaldDebugViews; i++) {
             if (DropdownItem(kFaldViews[i].label, i == view) && i != view)
                 shared([i](FaldSettings& s) { return act::SetFaldDebugView(s, i); });
             if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kFaldViews[i].tip);
         }
         EndDropdown();
+    }
+    if (wheel != 0) {   // the wheel over the field steps through the views in the list's order; the ends stop
+        const unsigned int next = (unsigned int)std::clamp((int)view + wheel, 0, (int)act::kFaldDebugViews - 1);
+        if (next != view) shared([next](FaldSettings& s) { return act::SetFaldDebugView(s, next); });
     }
     EndRow(row);
     if (view != 0) PanelNote(kFaldViews[view].label, pal::Alarm, "A FALD view replaces the picture outside DesktopLUT's windows. Esc ends it.");

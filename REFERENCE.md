@@ -473,7 +473,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   gets both quarter turns). With the view off no rect is sent and no draw is added: the output is the same bytes. Ways
   back: **Esc** in DesktopLUT's window (unless an editor, a drop-down, a modal or a field being typed in takes it), the
   tray's **End FALD view** (shown only while a view is on), or VIEW › CORRECTED. A view is never saved: every start is
-  on the corrected picture.
+  on the corrected picture. The wheel over the VIEW field steps through the views in this order (the ends stop).
 - **Starfield balancing** (experimental, default off): a field of scattered specks drives its zones unevenly (zone-
   shaped haze patches); the option pulls the star-like peaks toward the local mean of their neighbours' peaks. The
   STARFIELD / STAR TARGET rows (and the classic Starfield rows) set EVEN (how far a peak is pulled, 0–1), STRENGTH
