@@ -857,6 +857,10 @@ bool DropdownItem(const char* label, bool selected) {
         Fill(dl, a, b, pal::ListSel);
         text = pal::ListSelInk;
     }
+    // Dark marks the selected row as its display list does, with a bar at the left edge: its selection fill is the
+    // list's own colour there.
+    if (selected && !Shape().sunkenSidebar && !Shape().cardSidebar)
+        Fill(dl, a, ImVec2(a.x + Snap(Px(3)), b.y), pal::Accent);
     DrawText(dl, Font::Label, kSizeLabel, a.x + Px(8), (a.y + b.y) * 0.5f, text, label);
     return clicked;
 }
