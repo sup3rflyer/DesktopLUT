@@ -109,7 +109,8 @@ void DrawFieldBox(ImDrawList* dl, ImVec2 a, ImVec2 b, bool hovered = false, bool
 // box drawn after it is the last item, so a caller's IsItemDeactivated() would ask the box and never be true.
 bool TextField(const char* id, const char* hint, char* buf, size_t size, float widthDip, bool* entered = nullptr);
 
-// A drop-down list: the field shows `preview`; while open, add DropdownItem rows and call EndDropdown.
+// A drop-down list: the field shows `preview`; while open, add DropdownItem rows and call EndDropdown. The list stays
+// in the window: under the field, or over it, or scrolling when neither side has room; it opens at its selected row.
 // `wheel` (optional): the mouse wheel over the closed field steps the choice instead of scrolling the page; set to
 // -1 (wheel up: the previous choice), +1 (the next) or 0.
 bool BeginDropdown(const char* id, const char* preview, float widthDip, int* wheel = nullptr);

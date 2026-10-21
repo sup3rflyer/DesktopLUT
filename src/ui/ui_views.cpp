@@ -713,7 +713,7 @@ void FieldLabel(RowCtx& row, const char* label) {
     RowPlace(row);
 }
 
-void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
+void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
     const FaldSettings& f = hdr ? r.settings.hdrColorCorrection.fald : r.settings.sdrColorCorrection.fald;
     const bool hasFile = !f.paramsPath.empty();
 
@@ -829,6 +829,10 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr) {
     RowTip(row, "What the layer outputs. Any view but CORRECTED replaces the picture while the layer runs; "
                 "DesktopLUT's own windows keep the corrected one.\nEsc or the tray ends it. Not saved.");
     RowPlace(row);
+    if (vs.faldViewOpenRequested) {
+        ImGui::OpenPopup("##fald_view");
+        vs.faldViewOpenRequested = false;
+    }
     if (BeginDropdown("##fald_view", kFaldViews[view].label, 180)) {
         for (unsigned int i = 0; i < act::kFaldDebugViews; i++) {
             if (DropdownItem(kFaldViews[i].label, i == view) && i != view)
@@ -988,7 +992,7 @@ void DrawInspector(const Snapshot& snap, const DisplayRow& r, const Stage& st, b
     switch (st.id) {
     case StageId::Lut3D:       InspectLut(snap, r, st, hdr); break;
     case StageId::ToneMap:     InspectToneMap(r, st); break;
-    case StageId::Fald:        InspectFald(r, st, hdr); break;
+    case StageId::Fald:        InspectFald(r, st, hdr, vs); break;
     case StageId::ShaderTweak: InspectShaderTweak(r, st, hdr); break;
     case StageId::Primaries:   InspectPrimaries(r, st, hdr, vs); break;
     case StageId::Grayscale:   InspectGrayscale(r, st, hdr, vs); break;

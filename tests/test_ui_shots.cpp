@@ -521,6 +521,9 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "faldadd", ui::Page::Pipeline, ui::StageId::Fald, 1, false, -1, -1 },
         { "faldstar", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 23 },
         { "faldnarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 23 },
+        // 25: shot 23 on BOOST ZONES with the VIEW list open: under the field, and over it where the window is short.
+        { "faldview", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 25 },
+        { "faldviewnarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 25 },
         { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
         { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
         { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
@@ -655,11 +658,11 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     auto data = std::make_shared<dlc::Data>();
                     data->configured = L"X:\\Moved\\DLC";   // the scan for it found nothing there
                     snap.dlc = data;
-                } else if (shot.variant == 23) {
+                } else if (shot.variant == 23 || shot.variant == 25) {
                     FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;
                     f.star.enabled = true;
                     f.star.targetSigma = 0.5f;
-                    f.debugMode = 1;   // the gain map
+                    f.debugMode = shot.variant == 25 ? 8 : 1;   // boost zones (a row near the list's end), the gain map
                     f.temporalMode = 3;
                 }
                 const UINT w = (UINT)(shot.w * scale), h = (UINT)(shot.h * scale);
@@ -677,6 +680,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
+                if (shot.variant == 25) vs.faldViewOpenRequested = true;
                 if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = shot.variant == 16 ? 3 : 0;   // 16: WORST MISSES, wide
                 if (shot.variant == 19 || shot.variant == 20 || shot.variant == 21) {
                     using K = ui::DlcChart;
@@ -841,6 +845,174 @@ TEST_CASE("ui: Enter in a text field is reported once, by the field") {
     CHECK(enteredFrames == 1);
     CHECK(enteredAt == 5);
     CHECK(textWhenEntered == "notepad");
+}
+
+// Real ImGui frames (offscreen device): a drop-down list never runs past the window (rows there cannot be reached;
+// the FALD VIEW list did, low on the Pipeline page): under the field when it fits, over it when it fits there
+// instead, else on the side with more room, whole rows, and it scrolls. It opens with the selected row in view on a
+// whole row, or at the top when nothing is selected (even after an open that scrolled); the wheel moves it whole rows.
+TEST_CASE("ui: a drop-down list stays in the window, scrolls when it must and opens at its selected row") {
+    Offscreen gpu;
+    REQUIRE(gpu.Create());
+    struct Seen {
+        bool shown = false;
+        float winH = 0, fieldTop = 0, fieldBottom = 0, gap = 0, pad = 0, rowH = 0;
+        float top = 0, bottom = 0, scrollY = 0, scrollMaxY = 0, selTop = 0, selBottom = 0;
+        bool selSeen = false;
+        float scrollBeforeWheel = 0;
+    };
+    // A 180-DIP list of `rows` rows, its field fieldY DIPs down a 600 x 400 DIP window: the list on the last frame.
+    // `reopen`: then closed, and opened again with nothing selected. `wheel`: then that many notches over the list.
+    // `png`: the last frame written there.
+    struct Run { float scale; float fieldY; int rows; int selected; bool reopen = false; float wheel = 0.0f; std::string png; };
+    auto run = [&gpu](const Run& o) {
+        const float W = 600.0f * o.scale, H = 400.0f * o.scale;
+        gpu.Resize((UINT)W, (UINT)H);
+        ImGui::CreateContext();
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = nullptr;
+        io.LogFilename = nullptr;
+        ui::LoadFonts();
+        ui::ApplyStyle(o.scale);
+        REQUIRE(ImGui_ImplDX11_Init(gpu.device, gpu.context));
+        Seen seen;
+        const int frames = o.reopen ? 12 : o.wheel != 0.0f ? 8 : 5;
+        for (int frame = 0; frame < frames; frame++) {
+            io.DisplaySize = ImVec2(W, H);
+            io.DeltaTime = 1.0f / 60.0f;
+            if (o.wheel != 0.0f && frame == 5) io.AddMousePosEvent(ui::Snap(ui::Px(60)), (seen.top + seen.bottom) * 0.5f);
+            if (o.wheel != 0.0f && frame == 6) io.AddMouseWheelEvent(0.0f, o.wheel);
+            ImGui_ImplDX11_NewFrame();
+            ImGui::NewFrame();
+            ImGui::SetNextWindowPos(ImVec2(0, 0));
+            ImGui::SetNextWindowSize(ImVec2(W, H));
+            ImGui::Begin("##t", nullptr, ImGuiWindowFlags_NoDecoration);
+            const bool reopen = o.reopen, again = reopen && frame >= 6;   // the second open: nothing selected
+            const int rows = o.rows, selected = o.selected;
+            if (frame == 0 || (reopen && frame == 6)) ImGui::OpenPopup("##dd");
+            const float before = seen.scrollBeforeWheel;
+            seen = Seen();
+            seen.scrollBeforeWheel = before;
+            seen.winH = H;
+            seen.gap = ui::Px(2);
+            seen.pad = ui::Px(2);
+            seen.rowH = ui::Snap(ui::Px(ui::kControlH));
+            ImGui::SetCursorScreenPos(ImVec2(ui::Snap(ui::Px(20)), ui::Snap(ui::Px(o.fieldY))));
+            seen.fieldTop = ImGui::GetCursorScreenPos().y;
+            seen.fieldBottom = seen.fieldTop + seen.rowH;
+            if (ui::BeginDropdown("##dd", "PICK", 180)) {
+                seen.shown = true;
+                seen.top = ImGui::GetWindowPos().y;
+                seen.bottom = seen.top + ImGui::GetWindowSize().y;
+                seen.scrollY = ImGui::GetScrollY();
+                seen.scrollMaxY = ImGui::GetScrollMaxY();
+                if (frame == 5) seen.scrollBeforeWheel = seen.scrollY;
+                for (int i = 0; i < rows; i++) {
+                    char label[16];
+                    snprintf(label, sizeof label, "ROW %d", i);
+                    const bool sel = !again && i == selected;
+                    ui::DropdownItem(label, sel);
+                    if (sel) {
+                        seen.selSeen = true;
+                        seen.selTop = ImGui::GetItemRectMin().y;
+                        seen.selBottom = ImGui::GetItemRectMax().y;
+                    }
+                }
+                if (reopen && frame == 4) ImGui::CloseCurrentPopup();
+                ui::EndDropdown();
+            }
+            ImGui::End();
+            ImGui::Render();
+            const ImVec4 bg = ImGui::ColorConvertU32ToFloat4(ui::pal::Ground);
+            const float clear[4] = { bg.x, bg.y, bg.z, 1.0f };
+            gpu.context->OMSetRenderTargets(1, &gpu.rtv, nullptr);
+            gpu.context->ClearRenderTargetView(gpu.rtv, clear);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());   // the renderer creates the font textures
+        }
+        if (!o.png.empty()) {
+            gpu.context->CopyResource(gpu.staging, gpu.target);
+            D3D11_MAPPED_SUBRESOURCE map = {};
+            REQUIRE(SUCCEEDED(gpu.context->Map(gpu.staging, 0, D3D11_MAP_READ, 0, &map)));
+            const bool ok = WritePng(std::wstring(o.png.begin(), o.png.end()), static_cast<const unsigned char*>(map.pData),
+                                     (UINT)W, (UINT)H, map.RowPitch);
+            gpu.context->Unmap(gpu.staging, 0);
+            CHECK(ok);
+        }
+        ImGui_ImplDX11_Shutdown();
+        ImGui::DestroyContext();
+        return seen;
+    };
+    auto inWindow = [](const Seen& s) { return s.top >= 0.0f && s.bottom <= s.winH; };
+    auto under = [](const Seen& s) { return std::fabs(s.top - (s.fieldBottom + s.gap)) <= 1.0f; };
+    auto over = [](const Seen& s) { return std::fabs(s.bottom - (s.fieldTop - s.gap)) <= 1.0f; };
+    auto selInView = [](const Seen& s) {
+        return s.selSeen && s.selTop >= s.top + s.pad - 0.5f && s.selBottom <= s.bottom - s.pad + 0.5f;
+    };
+    auto onRow = [](const Seen& s, float y) { return std::fabs(y / s.rowH - std::round(y / s.rowH)) < 0.01f; };
+    for (float scale : { 1.0f, 1.5f }) {
+        CAPTURE(scale);
+        // Room under the field: the list drops down, whole, no scrolling.
+        Seen s = run({ scale, 40, 10, 7 });
+        REQUIRE(s.shown);
+        CHECK(inWindow(s));
+        CHECK(under(s));
+        CHECK(s.scrollMaxY < 0.5f);
+        CHECK(selInView(s));
+        CHECK(std::fabs((s.bottom - s.top) - (2.0f * s.pad + 10.0f * s.rowH)) <= 1.0f);
+        // The field low in the window (the FALD VIEW row on a short window): the list opens over it, whole.
+        s = run({ scale, 340, 10, 2 });
+        REQUIRE(s.shown);
+        CHECK(inWindow(s));
+        CHECK(over(s));
+        CHECK(s.scrollMaxY < 0.5f);
+        CHECK(selInView(s));
+        // Room for neither: the side with more room (over), whole rows, scrolled on a whole row to the selected row
+        // near the end.
+        s = run({ scale, 220, 30, 25 });
+        REQUIRE(s.shown);
+        CHECK(inWindow(s));
+        CHECK(over(s));
+        CHECK(s.scrollMaxY > 0.0f);
+        CHECK(s.scrollY > 0.0f);
+        CHECK(onRow(s, s.scrollY));
+        CHECK(selInView(s));
+        const float rowsShown = (s.bottom - s.top - 2.0f * s.pad) / s.rowH;
+        CHECK(onRow(s, s.bottom - s.top - 2.0f * s.pad));
+        CHECK(std::round(rowsShown) >= 4.0f);
+        // Selected in the middle: centred (as near as whole rows allow).
+        s = run({ scale, 220, 30, 12 });
+        REQUIRE(s.shown);
+        CHECK(selInView(s));
+        CHECK(onRow(s, s.scrollY));
+        CHECK(std::fabs((s.selTop + s.selBottom) * 0.5f - (s.top + s.bottom) * 0.5f) <= s.rowH * 0.5f + 1.0f);
+        // The wheel over the open list: a notch up moves it three whole rows.
+        s = run({ scale, 220, 30, 25, false, 1.0f });
+        REQUIRE(s.shown);
+        CHECK(s.scrollBeforeWheel > 3.0f * s.rowH);
+        CHECK(std::fabs(s.scrollY - (s.scrollBeforeWheel - 3.0f * s.rowH)) < 0.5f);
+        CHECK(onRow(s, s.scrollY));
+        // Opened again with nothing selected: at the top, not where the last open scrolled to.
+        s = run({ scale, 220, 30, 25, true });
+        REQUIRE(s.shown);
+        CHECK(inWindow(s));
+        CHECK(s.scrollMaxY > 0.0f);
+        CHECK(s.scrollY < 0.5f);
+    }
+    // DLUT_UI_SHOT (as the ui shots): the scrolled list in each theme and scale, <theme>_dropdownscroll_<scale>.png.
+    char dirBuf[MAX_PATH] = {};
+    if (GetEnvironmentVariableA("DLUT_UI_SHOT", dirBuf, MAX_PATH) != 0) {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        for (int t = 0; t < (int)ui::ThemeId::Count; t++) {
+            ui::ApplyTheme((ui::ThemeId)t);
+            for (float scale : { 1.0f, 1.5f }) {
+                char name[96];
+                snprintf(name, sizeof(name), "\\%s_dropdownscroll_%d.png", ui::ThemeKey((ui::ThemeId)t), (int)(scale * 100));
+                CHECK(run({ scale, 220, 30, 25, false, 0.0f, std::string(dirBuf) + name }).shown);
+            }
+        }
+        ui::ApplyTheme(ui::ThemeId::Dark);
+    }
+    gpu.Destroy();
 }
 
 TEST_CASE("dlc tab: chart picks and chart options survive the saved form") {
