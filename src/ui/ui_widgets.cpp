@@ -2,6 +2,7 @@
 
 #include "imgui_internal.h"   // GetActiveID (draft handling in NumberInput), ImTextCharFromUtf8, GetItemFlags
 #include <windows.h>
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -703,9 +704,49 @@ bool TextField(const char* id, const char* hint, char* buf, size_t size, float w
 }
 
 namespace {
-struct DropdownState { bool pushedSpacing = false; };
+
+constexpr float kDropdownMaxH = 320.0f;      // the tallest a list gets (DIPs); a longer one scrolls
+constexpr float kDropdownWheelRows = 3.0f;   // rows a wheel notch moves an open list (Windows' default)
+
+// The open list (BeginDropdown .. EndDropdown).
+struct DropdownState {
+    ImGuiWindow* list = nullptr;   // its popup window
+    ImVec2 a, b;                   // its field (pixels)
+    float selY = -1.0f;            // the selected row's top in the list's content (pixels); -1: none
+};
 DropdownState g_dropdown;
+
+// A list's whole height (pixels), every row shown: its rows as laid out on its last (or current) frame, and its
+// padding. ImGui draws a popup hidden on the frame it opens to lay it out, so this is known before it is first seen.
+float ListHeight(const ImGuiWindow* list) {
+    return (std::max)(list->DC.CursorMaxPos.y, list->DC.IdealMaxPos.y) - list->DC.CursorStartPos.y + list->WindowPadding.y * 2.0f;
 }
+
+// Where a list of whole height `full` goes for its field a-b (rows are the field's height). It never runs past the
+// window (rows there cannot be reached): under the field when it fits, over it when it fits there instead, else on
+// the side with more room, as many whole rows as fit, and it scrolls.
+struct ListFit {
+    bool above = false;
+    float maxH = 0.0f;    // the list's height limit (pixels)
+    ImVec2 pos;           // its top left (above: its bottom left)
+};
+ListFit FitList(ImVec2 a, ImVec2 b, float full, float pad) {
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const float rowH = b.y - a.y, gap = Px(2), margin = Px(4);
+    const float top = vp->WorkPos.y + margin, bottom = vp->WorkPos.y + vp->WorkSize.y - margin;
+    const float roomBelow = bottom - (b.y + gap), roomAbove = (a.y - gap) - top;
+    ListFit f;
+    f.above = full > roomBelow && (full <= roomAbove || roomAbove > roomBelow);
+    f.maxH = (std::min)(Px(kDropdownMaxH), f.above ? roomAbove : roomBelow);
+    if (full > f.maxH) f.maxH = pad * 2.0f + (std::max)(1.0f, std::floor((f.maxH - pad * 2.0f) / rowH)) * rowH;
+    // Kept in the window even when the field is not (scrolled away while the list is open).
+    const float listH = (std::min)(full, f.maxH);
+    f.pos = f.above ? ImVec2(a.x, (std::max)((std::min)(a.y - gap, bottom), top + listH))
+                    : ImVec2(a.x, (std::max)((std::min)(b.y + gap, bottom - listH), top));
+    return f;
+}
+
+}  // namespace
 
 bool BeginDropdown(const char* id, const char* preview, float widthDip, int* wheel) {
     const float w = Snap(Px(widthDip)), h = Snap(Px(kControlH));
@@ -749,16 +790,47 @@ bool BeginDropdown(const char* id, const char* preview, float widthDip, int* whe
     ImGui::SetCursorScreenPos(a);
     ImGui::Dummy(ImVec2(w, h));
 
-    ImGui::SetNextWindowPos(ImVec2(a.x, b.y + Px(2)));
-    ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0.0f), ImVec2(w * 2.0f, Px(320)));
+    // The list stays in the window (FitList). Its height is known from the frame it opened on, drawn hidden.
+    const float pad = Px(2);   // the list's padding
+    if (open) {
+        const ImGuiContext& g = *ImGui::GetCurrentContext();
+        float full = Px(kDropdownMaxH);
+        for (const ImGuiPopupData& p : g.OpenPopupStack)
+            if (p.PopupId == popup && p.Window && p.Window->WasActive) full = ListHeight(p.Window);
+        const ListFit fit = FitList(a, b, full, pad);
+        ImGui::SetNextWindowPos(fit.pos, ImGuiCond_Always, ImVec2(0.0f, fit.above ? 1.0f : 0.0f));
+        ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0.0f), ImVec2(w * 2.0f, fit.maxH));
+    }
     ImGui::PushStyleColor(ImGuiCol_PopupBg, pal::Menu);
     ImGui::PushStyleColor(ImGuiCol_Border, Shape().bevel ? pal::BevelDark : pal::ControlEdge);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(Px(2), Px(2)));
-    const bool shown = ImGui::BeginPopup(id, ImGuiWindowFlags_NoMove);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(pad, pad));
+    // The list takes the wheel itself (whole rows); ImGui's own step would leave part rows at its edges.
+    const bool shown = ImGui::BeginPopup(id, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollWithMouse);
     ImGui::PopStyleVar();
     ImGui::PopStyleColor(2);
-    if (shown) ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
-    return shown;
+    if (!shown) return false;
+    g_dropdown = DropdownState();
+    g_dropdown.list = ImGui::GetCurrentWindow();
+    g_dropdown.a = a;
+    g_dropdown.b = b;
+    ImGuiStorage* st = ImGui::GetStateStorage();
+    const ImGuiID wheelKey = ImGui::GetID("##listwheel");
+    if (ImGui::IsWindowAppearing()) {
+        ImGui::SetScrollY(0.0f);   // opens at the top, or at the selected row (EndDropdown)
+        st->SetFloat(wheelKey, 0.0f);
+    } else if (ImGui::IsWindowHovered() && ImGui::GetIO().MouseWheel != 0.0f && ImGui::GetScrollMaxY() > 0.0f) {
+        // A notch moves kDropdownWheelRows rows; a touchpad's small deltas add up to a row.
+        float acc = st->GetFloat(wheelKey, 0.0f) + ImGui::GetIO().MouseWheel * kDropdownWheelRows;
+        const float rows = std::trunc(acc);
+        acc -= rows;
+        st->SetFloat(wheelKey, acc);
+        if (rows != 0.0f) {
+            const float first = std::round(ImGui::GetScrollY() / h) - rows;
+            ImGui::SetScrollY((std::max)(0.0f, (std::min)(first * h, ImGui::GetScrollMaxY())));
+        }
+    }
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
+    return true;
 }
 
 bool DropdownItem(const char* label, bool selected) {
@@ -768,6 +840,8 @@ bool DropdownItem(const char* label, bool selected) {
     ImGui::PushStyleColor(ImGuiCol_Header, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderHovered, IM_COL32(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_HeaderActive, IM_COL32(0, 0, 0, 0));
+    if (selected && ImGui::GetCurrentWindow() == g_dropdown.list)   // the list opens at it (EndDropdown)
+        g_dropdown.selY = ImGui::GetCursorScreenPos().y - ImGui::GetCurrentWindow()->DC.CursorStartPos.y;
     const bool clicked = ImGui::Selectable("##item", false, 0, ImVec2(w, h));
     ImGui::PopStyleColor(3);
     const bool hovered = ImGui::IsItemHovered();
@@ -783,11 +857,26 @@ bool DropdownItem(const char* label, bool selected) {
         Fill(dl, a, b, pal::ListSel);
         text = pal::ListSelInk;
     }
+    // Dark marks the selected row as its display list does, with a bar at the left edge: its selection fill is the
+    // list's own colour there.
+    if (selected && !Shape().sunkenSidebar && !Shape().cardSidebar)
+        Fill(dl, a, ImVec2(a.x + Snap(Px(3)), b.y), pal::Accent);
     DrawText(dl, Font::Label, kSizeLabel, a.x + Px(8), (a.y + b.y) * 0.5f, text, label);
     return clicked;
 }
 
 void EndDropdown() {
+    // On the frame the list opens (drawn hidden while ImGui lays it out): scroll so the selected row is in view, centred
+    // where the list allows, on a whole row, at the height the list gets when it is first shown (BeginDropdown).
+    ImGuiWindow* list = ImGui::GetCurrentWindow();
+    if (list == g_dropdown.list && g_dropdown.selY >= 0.0f && ImGui::IsWindowAppearing()) {
+        const float pad = list->WindowPadding.y, rowH = g_dropdown.b.y - g_dropdown.a.y;
+        const float full = ListHeight(list);
+        const float view = (std::min)(full, FitList(g_dropdown.a, g_dropdown.b, full, pad).maxH) - pad * 2.0f;
+        const float first = std::floor((g_dropdown.selY + (rowH - view) * 0.5f) / rowH + 0.5f) * rowH;
+        ImGui::SetScrollY((std::max)(0.0f, (std::min)(first, full - pad * 2.0f - view)));
+    }
+    g_dropdown = DropdownState();
     ImGui::PopStyleVar();
     ImGui::EndPopup();
 }
