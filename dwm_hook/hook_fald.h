@@ -116,8 +116,11 @@ bool HookRequestFullRecompose();
 // the next run. star: starfield balancing. tuning = null: its defaults (older host). fade: the frozen fade stack
 // (faldFlags bit 8; shared/fald_fade.h) — its passes (shipped bytecode) and resources are created over the first presents
 // any monitor wants it (paced, fald_fade.h); the layer runs without the fade until they exist.
+// monW / monH: the monitor's desktop size (the host's monitors[] entry; 0 = unknown = the frame's). While a debug view is
+// on, the rects in tuning->exempt (DesktopLUT's own windows, monitor pixels; shared/fald_exempt.h) are mapped onto the
+// frame with it and drawn again with the view off.
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning, bool fade = false);
+                         const DwmHookFaldTuning* tuning, bool fade = false, unsigned int monW = 0, unsigned int monH = 0);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing

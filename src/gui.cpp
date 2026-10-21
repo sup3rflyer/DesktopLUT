@@ -27,6 +27,7 @@
 #include "../resource.h"
 #include <commctrl.h>
 #include <commdlg.h>
+#include <dwmapi.h>      // DWMWA_CLOAKED / EXTENDED_FRAME_BOUNDS: the FALD views' window exemption
 #include <algorithm>
 #include <iostream>
 #include <cstdio>
@@ -441,6 +442,105 @@ static void FaldRecomposeTick(HWND hwnd) {
             KillTimer(hwnd, FALD_RECOMPOSE_TIMER_ID);
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// FALD views: DesktopLUT's own windows keep the corrected picture (shared/fald_exempt.h)
+// ---------------------------------------------------------------------------------------------
+// A view replaces the picture the layer outputs, DesktopLUT's interface included. While one is on, the layer draws the
+// corrected picture again inside DesktopLUT's own windows: their rects are listed here (desktop pixels) and handed to
+// both engines (FaldSetExemptRects: the overlay reads it per frame, the hook through the shared config). A window-event
+// hook on this process (out of context: callbacks on this thread, from its message loop) follows every show, hide,
+// move, size, minimise and cloak of a top-level window, coalesced into one WM_FALD_EXEMPT_REFRESH per burst. The hook is
+// installed only while a view is on; with every view off the list is empty and nothing is sent.
+static HWINEVENTHOOK g_faldExemptHooks[3] = {};
+static bool g_faldExemptPosted = false;
+
+// A window the layer must leave readable: this process's, visible, not minimised, not cloaked (another virtual
+// desktop), not a click-through overlay (the overlay windows, the analysis overlay, the OSD, the beacon / settle-kick /
+// recompose windows are all WS_EX_TRANSPARENT). Rect = the visible frame (DWM), else the window rect.
+static bool FaldExemptWindowRect(HWND h, FaldExemptRect& out) {
+    if (!IsWindowVisible(h) || IsIconic(h)) return false;
+    if (GetWindowLongPtrW(h, GWL_EXSTYLE) & WS_EX_TRANSPARENT) return false;
+    BOOL cloaked = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked) return false;
+    RECT rc = {};
+    if (FAILED(DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &rc, sizeof(rc))) && !GetWindowRect(h, &rc)) return false;
+    if (rc.right <= rc.left || rc.bottom <= rc.top) return false;
+    out = { rc.left, rc.top, rc.right, rc.bottom };
+    return true;
+}
+
+static BOOL CALLBACK FaldExemptEnumProc(HWND h, LPARAM lp) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    FaldExemptRect r;
+    if (FaldExemptWindowRect(h, r)) reinterpret_cast<std::vector<FaldExemptRect>*>(lp)->push_back(r);
+    return TRUE;
+}
+
+static void CALLBACK FaldExemptWinEvent(HWINEVENTHOOK, DWORD, HWND hwnd, LONG idObject, LONG idChild, DWORD, DWORD) {
+    if (idObject != OBJID_WINDOW || idChild != CHILDID_SELF || !hwnd) return;
+    if (IsWindow(hwnd) && (GetAncestor(hwnd, GA_ROOT) != hwnd ||                         // a control: its window did not move
+                           (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TRANSPARENT)))   // an overlay / kick / recompose window
+        return;
+    if (g_faldExemptPosted || !g_gui.hwndMain) return;
+    g_faldExemptPosted = PostMessage(g_gui.hwndMain, WM_FALD_EXEMPT_REFRESH, 0, 0) != FALSE;
+}
+
+static void SetFaldExemptHooks(bool on) {
+    if (on && !g_faldExemptHooks[0]) {
+        const DWORD pid = GetCurrentProcessId();
+        const struct { DWORD lo, hi; } ranges[3] = {
+            { EVENT_OBJECT_CREATE, EVENT_OBJECT_LOCATIONCHANGE },        // create, destroy, show, hide, ..., state, location
+            { EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND },
+            { EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED } };
+        for (int i = 0; i < 3; i++)
+            g_faldExemptHooks[i] = SetWinEventHook(ranges[i].lo, ranges[i].hi, nullptr, FaldExemptWinEvent, pid, 0, WINEVENT_OUTOFCONTEXT);
+        if (!g_faldExemptHooks[0]) std::cerr << "[FALD] window-event hook failed: the views' window exemption follows changes late" << std::endl;
+    } else if (!on) {
+        for (HWINEVENTHOOK& h : g_faldExemptHooks)
+            if (h) { UnhookWinEvent(h); h = nullptr; }
+    }
+}
+
+bool FaldExemptRefresh(bool push) {
+    g_faldExemptPosted = false;
+    const bool on = act::FaldViewOn();
+    SetFaldExemptHooks(on);
+    std::vector<FaldExemptRect> rects;
+    if (on) {
+        EnumWindows(FaldExemptEnumProc, reinterpret_cast<LPARAM>(&rects));
+        // The console log window belongs to the console host, not to this process: it is DesktopLUT's all the same.
+        FaldExemptRect c;
+        if (HWND console = GetConsoleWindow(); console && FaldExemptWindowRect(console, c)) rects.push_back(c);
+    }
+    const bool changed = FaldSetExemptRects(rects);
+    if (changed && push && g_gui.isRunning) {
+        // The hook: the shared config carries the rects (a changed render state asks DWM for a full composition itself).
+        // The overlay reads them per frame; the composition gives it a frame after the window stopped moving.
+        if (g_dwmHookMode.load()) UpdateDwmHookSharedConfig();
+        else RequestDesktopRecompose();
+    }
+    return changed;
+}
+
+void FaldExemptShutdown() { SetFaldExemptHooks(false); }
+
+// Esc in the classic window while a FALD view is on ends the view, as in the new interface. Not when the key is a
+// control's own: an edit field (Esc restores its value, gui_shared.cpp), a combo box with its list down. The classic
+// editors and dialogs are windows of their own (their root is not the main window) and keep their Esc.
+static bool ClassicEscEndsFaldView(const MSG& msg) {
+    if (msg.message != WM_KEYDOWN || msg.wParam != VK_ESCAPE || !msg.hwnd || !g_gui.hwndMain) return false;
+    if (GetAncestor(msg.hwnd, GA_ROOT) != g_gui.hwndMain) return false;
+    wchar_t cls[32] = {};
+    GetClassNameW(msg.hwnd, cls, 32);
+    if (_wcsicmp(cls, L"Edit") == 0) return false;
+    if (_wcsicmp(cls, L"ComboBox") == 0 && SendMessageW(msg.hwnd, CB_GETDROPPEDSTATE, 0, 0)) return false;
+    if (!act::FaldViewOn()) return false;
+    act::ClearFaldViews();
+    return true;
 }
 
 bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
@@ -887,6 +987,11 @@ void ShowTrayMenu(HWND hwnd) {
     GetCursorPos(&pt);
 
     HMENU hMenu = CreatePopupMenu();
+    // A FALD view replaces the picture: the way back first, while one is on (the menu itself is exempt from it).
+    if (act::FaldViewOn()) {
+        AppendMenu(hMenu, MF_STRING, ID_TRAY_FALD_VIEW, L"End FALD view");
+        AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
+    }
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
     AppendMenu(hMenu, g_uiClassic ? (MF_STRING | MF_CHECKED) : MF_STRING, ID_TRAY_CLASSIC_UI, L"Classic interface");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
@@ -1592,7 +1697,7 @@ static bool IgnoredDuringShutdown(UINT msg) {
     case WM_DEVICECHANGE: case WM_POWERBROADCAST: case WM_COMMAND: case WM_TRAYICON: case WM_HOTKEY:
     case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
     case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD: case WM_MHC_REGENERATE_MISSING:
-    case WM_MHC_RELOAD_HARDWARE: case WM_WINDOWS_TONEMAP:
+    case WM_MHC_RELOAD_HARDWARE: case WM_WINDOWS_TONEMAP: case WM_FALD_EXEMPT_REFRESH:
         return true;
     default:
         return msg == WM_TASKBARCREATED;
@@ -2271,6 +2376,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case ID_TRAY_CLASSIC_UI:
             SetInterfaceClassic(!g_uiClassic);
             return 0;
+        case ID_TRAY_FALD_VIEW:
+            act::ClearFaldViews();
+            return 0;
         case ID_TRAY_SHOW:
             ShowActiveUi();
             return 0;
@@ -2318,6 +2426,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                // wParam 1 = any mode (RequestDesktopRecompose from another thread)
         if (wParam == 1) RequestDesktopRecompose();
         else RequestFaldFullRecompose();
+        return 0;
+
+    case WM_FALD_EXEMPT_REFRESH:   // one of DesktopLUT's windows changed while a FALD view is on (FaldExemptWinEvent)
+        FaldExemptRefresh(true);
         return 0;
 
     case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively
@@ -3053,6 +3165,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_appShuttingDown.store(true);
         ui::Shutdown();                    // before anything pumps: no interface frame during the teardown
         KillAllGuiTimers(hwnd);
+        FaldExemptShutdown();              // the FALD views' window-event hook (it posts WM_FALD_EXEMPT_REFRESH)
         StopIcmRegistryWatcher();          // its thread arms MHC_REGISTRY_KICK_TIMER_ID
         StopCalibrationIpcServer();        // no new pipe commands; a queued one runs nothing
         AbortLiveEditsForShutdown();       // a live grayscale edit gives scanout back to the user's profile
@@ -3189,6 +3302,7 @@ int RunGUI() {
     BOOL bRet;
     while ((bRet = GetMessage(&msg, nullptr, 0, 0)) != 0) {
         if (bRet == -1) break;  // Error occurred
+        if (ClassicEscEndsFaldView(msg)) continue;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }

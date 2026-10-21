@@ -202,6 +202,10 @@
     <ClCompile Include="tests\test_fald_hook.cpp">
       <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ClCompile Include="tests\test_fald_exempt.cpp">
+      <!-- drives both paths' layers (src/fald.cpp and dwm_hook/hook_fald.cpp) on WARP: the hook's names as test_fald_hook.cpp -->
+      <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>

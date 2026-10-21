@@ -10,6 +10,7 @@
 #include <cwctype>
 #include <memory>
 #include <string>
+#include <vector>
 
 // Helper to create a temp INI file and clean up
 struct TempIni {
@@ -289,6 +290,18 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.flankFade = true;      // the frozen fade stack (2026-10-20): persisted per mode
         original.fald.lowExt = true;         // item L (reserved): persisted, never applied
         SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
+        // The FALD view is never written: a restart always starts on the corrected picture (no key names it).
+        {
+            std::vector<wchar_t> sec(1 << 16);
+            GetPrivateProfileSectionW(L"TestMon", sec.data(), (DWORD)sec.size(), ini.c_str());
+            int keys = 0;
+            for (const wchar_t* kv = sec.data(); *kv; kv += wcslen(kv) + 1, keys++) {
+                const std::wstring line = kv;
+                CHECK(line.find(L"Debug") == std::wstring::npos);
+                CHECK(line.find(L"View") == std::wstring::npos);
+            }
+            CHECK(keys > 10);   // the section was written (the check above saw real keys)
+        }
 
         ColorCorrectionSettings loaded;
         LoadColorCorrectionSettings(L"TestMon", prefix, loaded, ini.c_str());

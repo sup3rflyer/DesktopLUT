@@ -12,6 +12,7 @@
 #include "fald_temporal.h"
 #include "fald_panel_live.h"
 #include "fald_fade.h"
+#include "fald_exempt.h"
 
 #include <cstdarg>
 #include <cstring>
@@ -39,6 +40,9 @@ static ID3D11ComputeShader* g_statCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11VertexShader* g_faldVS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
+// DesktopLUT's own windows while a debug view is on (shared/fald_exempt.h): the pixel pass again, scissored, the view off.
+// NOT part of FaldShadersReady: without it a view covers the whole screen, as before.
+static ID3D11RasterizerState* g_exemptRS = nullptr;
 
 // Starfield feature (starfield balancing S0-S2). Compiled beside the core
 // but NOT part of FaldShadersReady: a compile failure here costs the feature, never the correction.
@@ -152,6 +156,12 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
         FaldReleaseShaders();
         return false;
     }
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+    if (FAILED(g_dev->CreateRasterizerState(&rd, &g_exemptRS))) {
+        g_exemptRS = nullptr;   // checked before every use: the views then cover DesktopLUT's windows too
+        log_to_file("FALD: rasterizer state for the views' window exemption failed (views cover the whole screen)");
+    }
     log_to_file("FALD: correction shaders compiled (stateless core)");
     CompileFeatureShaders();
     return true;
@@ -208,6 +218,7 @@ void FaldReleaseShaders() {
     FaldFadeReleaseShaders();
     g_fadeShadersFailed = false;
     ReleaseFeatureShaders();
+    SafeRelease(g_exemptRS);
     SafeRelease(g_faldSampler);
     SafeRelease(g_faldVS);
     SafeRelease(g_faldPS);
@@ -452,7 +463,7 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 2200;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 2208;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
                                                          // 2026-10-20: + the fade stack's five fields)
@@ -472,6 +483,9 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     uint32_t pedMode = 0;
     unsigned long long framesRun = 0;
     double lastRunUs = 0.0;
+    // The monitor's desktop size (the host's monitors[] entry; 0 = unknown = the frame's): DesktopLUT's own windows,
+    // exempt from a debug view (tuning.exempt, shared/fald_exempt.h), are in monitor pixels and mapped onto the frame.
+    unsigned int exemptMonW = 0, exemptMonH = 0;
 
     // Full-size intermediate: the hook's LUT/tonemap pass renders the whole frame here, the pixel
     // pass below reads it and writes the back buffer. Same role as FaldResources::inter in the
@@ -570,7 +584,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 
 // Live-swap audit (SwapPanel / MoveFramePart). Every field of FaldMonitor is exactly one of:
 //   COPIED into the scratch entry before the build (identity + live settings): left, top, isHdr, width, height, format,
-//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs, fadeWanted;
+//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs, fadeWanted, exemptMonW, exemptMonH;
 //   MOVED with the frame part (MoveFramePart): interTex / interRTV / interSRV, cleanTex / cleanSRV, primed, cover,
 //     coverCols, coverRows, coverLeft, offPresents, settleEvt, contentEvt, evtOpenTick, framesRun, lastRunUs, gpuSumUs,
 //     gpuStarSumUs, gpuMaxUs, gpuSamples, fade (its T state is then reset by SwapPanel: the switch acts as a cut);
@@ -1046,6 +1060,7 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     n->debugMode = m->debugMode; n->pedMode = m->pedMode; n->starWanted = m->starWanted;
     n->tuning = m->tuning; n->tempSettings = m->tempSettings; n->refreshMs = m->refreshMs;
     n->fadeWanted = m->fadeWanted;
+    n->exemptMonW = m->exemptMonW; n->exemptMonH = m->exemptMonH;
     bool built = false, moved = false;
     try {
         n->params = std::move(m->spareParams);      // this entry's spare memory ...
@@ -1381,9 +1396,11 @@ void FaldMarkAllStale() {
 }
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning, bool fade) {
+                         const DwmHookFaldTuning* tuning, bool fade, unsigned int monW, unsigned int monH) {
     if (!m) return;
     m->debugMode = debugMode;
+    m->exemptMonW = monW;
+    m->exemptMonH = monH;
     m->pedMode = pedMode ? 1u : 0u;
     m->starWanted = star;
     m->fadeWanted = fade;
@@ -1409,8 +1426,9 @@ double FaldLastRunMicros(const FaldMonitor* m) { return m ? m->lastRunUs : 0.0; 
 // ---------------------------------------------------------------------------------------------
 // Passes — mirror of src/fald.cpp with the stateless core only
 // ---------------------------------------------------------------------------------------------
-// boostOn = false: the flat-lattice normalisation pass (a boost-free conv whatever the file says).
-static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool boostOn = true) {
+// boostOn = false: the flat-lattice normalisation pass (a boost-free conv whatever the file says). view >= 0 replaces
+// the debug view (word 24): the exempt draws (DrawExempt) write 0 there.
+static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool boostOn = true, int view = -1) {
     const FaldPanelParams& p = m->params;
     D3D11_MAPPED_SUBRESOURCE map;
     if (FAILED(g_ctx->Map(m->cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return;
@@ -1422,7 +1440,7 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     u[12] = p.curveN; f[13] = p.white; f[14] = p.tmin; f[15] = p.area0;
     f[16] = p.w[0]; f[17] = p.w[1]; f[18] = p.w[2]; f[19] = p.gainMin;
     f[20] = p.gainMax; f[21] = p.driveFloor; f[22] = p.curveLogMin; f[23] = p.curveLogMax;
-    u[24] = m->debugMode; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
+    u[24] = view < 0 ? m->debugMode : (uint32_t)view; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
     f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
     u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
@@ -1952,6 +1970,34 @@ static void GpuTimingEnd(int slot, FaldMonitor* m) {
     g_tsOwner[slot] = m;
 }
 
+// A debug view is on: the pixel pass again, the view off, inside DesktopLUT's own windows on this monitor (tuning.exempt,
+// monitor pixels; shared/fald_exempt.h), so the interface stays readable. The main draw's bindings are still in place;
+// only the CB (word 24 = 0), the rasterizer state and the scissor change, and DWM's own rasterizer state and scissor
+// rects are put back exactly as they were. No pointer read, no wait: D3D calls on the context the main draw used.
+static void DrawExempt(FaldMonitor* m) {
+    if (!g_exemptRS) return;
+    FaldExemptRect wire[FALD_EXEMPT_WIRE_RECTS], fr[FALD_EXEMPT_FRAME_RECTS];
+    const int n = FaldExemptUnpack(m->tuning.exempt, wire);
+    if (n == 0) return;
+    const int k = FaldExemptToFrame(wire, n, (int)m->exemptMonW, (int)m->exemptMonH, (int)m->width, (int)m->height, fr);
+    if (k == 0) return;
+    FillCB(m, 1, 0, true, 0);
+    ID3D11RasterizerState* prevRS = nullptr;
+    g_ctx->RSGetState(&prevRS);
+    D3D11_RECT prevScissor[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT prevCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    g_ctx->RSGetScissorRects(&prevCount, prevScissor);
+    g_ctx->RSSetState(g_exemptRS);
+    for (int i = 0; i < k; i++) {
+        const D3D11_RECT rc = { fr[i].x0, fr[i].y0, fr[i].x1, fr[i].y1 };
+        g_ctx->RSSetScissorRects(1, &rc);
+        g_ctx->Draw(3, 0);
+    }
+    g_ctx->RSSetState(prevRS);
+    if (prevRS) prevRS->Release();
+    g_ctx->RSSetScissorRects(prevCount, prevCount ? prevScissor : nullptr);
+}
+
 bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     if (!m || !m->valid || !m->interSRV || !dstRTV) return false;
 
@@ -2051,6 +2097,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
         g_ctx->PSSetShaderResources(20, 3, fv);
     }
     g_ctx->Draw(3, 0);
+    if (m->debugMode != 0) DrawExempt(m);   // a view: DesktopLUT's windows keep the corrected picture
     GpuTimingEnd(ts, m);
 
     if (!dumpDir.empty()) {

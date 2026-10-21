@@ -149,6 +149,7 @@
     <ClInclude Include="..\shared\fald_fade.h" />
     <ClInclude Include="..\shared\fald_fade_shader.h" />
     <ClInclude Include="..\shared\fald_fade_bytecode.h" />
+    <ClInclude Include="..\shared\fald_exempt.h" />
     <ClInclude Include="..\shared\fald_shader.h" />
     <ClInclude Include="..\shared\tonemap_curves.h" />
     <ClInclude Include="hook_fald.h" />

@@ -20,6 +20,7 @@
 // the same bytes with the same code (FaldPanelParams, LoadFaldPanelParams, the boost helpers,
 // FALD_CB_BYTES, the transfer / boost-rule constants).
 #include "../shared/fald_panel.h"
+#include "../shared/fald_exempt.h"   // FaldExemptRect: DesktopLUT's own windows, exempt from the FALD views
 
 struct MonitorContext;
 struct FaldSettings;
@@ -194,3 +195,9 @@ bool FaldSettlePending(const MonitorContext* ctx);
 // content with the OLD content's drives when the layer comes back on a static desktop, and nothing would settle it.
 void FaldLayerIdle(MonitorContext* ctx);
 void FaldReleaseResources(MonitorContext* ctx);
+
+// DesktopLUT's own windows, exempt from the FALD views (shared/fald_exempt.h): the host's list in desktop pixels (the GUI
+// thread sets it while a view is on, empty otherwise; FaldRunPasses and the hook's shared config read it). Any thread.
+// Set returns true when the list changed.
+bool FaldSetExemptRects(const std::vector<FaldExemptRect>& desktop);
+std::vector<FaldExemptRect> FaldExemptRects();

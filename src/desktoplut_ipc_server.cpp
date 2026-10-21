@@ -1451,6 +1451,7 @@ void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
 // Each of these also reaches the screen on a static desktop (render thread re-processes the last frame).
 static void FaldPropagate(int mon, bool isHDR) {
     FaldTrace("FaldPropagate: begin");
+    FaldExemptRefresh(false);   // a view set or ended over the pipe: DesktopLUT's own windows stay readable (fald_exempt.h)
     if (g_gui.isRunning) {
         UpdateColorCorrectionLive(mon, isHDR);
         if (g_dwmHookMode.load()) {

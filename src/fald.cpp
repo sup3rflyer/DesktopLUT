@@ -30,6 +30,11 @@ static ID3D11ComputeShader* g_faldStatCombineCS = nullptr;
 static ID3D11ComputeShader* g_faldStarStatCombineCS = nullptr;
 static ID3D11PixelShader* g_faldPS = nullptr;
 static ID3D11SamplerState* g_faldSampler = nullptr;
+// DesktopLUT's own windows while a view is on (shared/fald_exempt.h): the pixel pass again, scissored, the view off.
+// Optional: without it a view covers the whole screen, as before.
+static ID3D11RasterizerState* g_faldExemptRS = nullptr;
+static std::mutex g_faldExemptMutex;
+static std::vector<FaldExemptRect> g_faldExemptDesktop;   // the host's list, desktop pixels (empty = no view on)
 // The fade stack's passes (shared/fald_fade.cpp) are created from their shipped bytecode the first time a monitor turns the
 // flank fade on — no shader compiler on the render thread, FALD_FADE_SHADERS_PER_RUN per run of the layer — and its
 // resources the same way (FALD_FADE_RESOURCES_PER_RUN / FALD_FADE_BYTES_PER_RUN per run). Until both are complete the
@@ -169,6 +174,12 @@ bool InitFaldShadersFrom(const FaldShaderSources& src) {
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     if (FAILED(g_device->CreateSamplerState(&sd, &g_faldSampler))) { std::cerr << "[FALD] sampler failed" << std::endl; return false; }
+    D3D11_RASTERIZER_DESC rd = {};
+    rd.FillMode = D3D11_FILL_SOLID; rd.CullMode = D3D11_CULL_NONE; rd.DepthClipEnable = TRUE; rd.ScissorEnable = TRUE;
+    if (FAILED(g_device->CreateRasterizerState(&rd, &g_faldExemptRS))) {
+        g_faldExemptRS = nullptr;
+        std::cerr << "[FALD] rasterizer state for the views' window exemption failed: a view covers DesktopLUT's windows too" << std::endl;
+    }
     std::cout << "FALD correction shaders: compiled" << std::endl;
     return true;
 }
@@ -176,6 +187,7 @@ bool InitFaldShadersFrom(const FaldShaderSources& src) {
 void ReleaseFaldShaders() {
     FaldFadeReleaseShaders();
     g_faldFadeShadersFailed = false;
+    if (g_faldExemptRS) { g_faldExemptRS->Release(); g_faldExemptRS = nullptr; }
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
     if (g_faldPS) { g_faldPS->Release(); g_faldPS = nullptr; }
     if (g_faldStarStatCombineCS) { g_faldStarStatCombineCS->Release(); g_faldStarStatCombineCS = nullptr; }
@@ -512,8 +524,9 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings) {
 // ---------------------------------------------------------------------------------------------
 // Passes
 // ---------------------------------------------------------------------------------------------
-// boostOn = false: the flat-lattice normalisation pass (a boost-free conv whatever the file says).
-static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bool boostOn = true) {
+// boostOn = false: the flat-lattice normalisation pass (a boost-free conv whatever the file says). view >= 0 replaces
+// the debug view (word 24): the exempt draws (DrawExempt) write 0 there.
+static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bool boostOn = true, int view = -1) {
     const FaldPanelParams& p = r->params;
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(g_context->Map(r->cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
@@ -525,7 +538,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     u[12] = p.curveN; f[13] = p.white; f[14] = p.tmin; f[15] = p.area0;
     f[16] = p.w[0]; f[17] = p.w[1]; f[18] = p.w[2]; f[19] = p.gainMin;
     f[20] = p.gainMax; f[21] = p.driveFloor; f[22] = p.curveLogMin; f[23] = p.curveLogMax;
-    u[24] = r->debugMode; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
+    u[24] = view < 0 ? r->debugMode : (uint32_t)view; u[25] = p.originX; u[26] = p.originY; u[27] = blurDir;
     f[28] = p.fadeLo; f[29] = p.fadeHi; f[30] = p.gainSmoothCells * (float)p.sub;   // sigma in fine samples
     u[31] = p.transfer;                                                             // 0 = PQ (HDR), 1 = gamma (ACM SDR)
     f[32] = p.lumFadeLo; f[33] = p.lumFadeHi;                                       // pixel-luminance fade (nits)
@@ -1035,6 +1048,56 @@ static void DumpOutput(MonitorContext* ctx, FaldResources* r, ID3D11RenderTarget
     res->Release();
 }
 
+bool FaldSetExemptRects(const std::vector<FaldExemptRect>& desktop) {
+    std::lock_guard<std::mutex> lock(g_faldExemptMutex);
+    const bool same = desktop.size() == g_faldExemptDesktop.size() &&
+                      (desktop.empty() || memcmp(desktop.data(), g_faldExemptDesktop.data(), desktop.size() * sizeof(FaldExemptRect)) == 0);
+    if (same) return false;
+    g_faldExemptDesktop = desktop;
+    return true;
+}
+
+std::vector<FaldExemptRect> FaldExemptRects() {
+    std::lock_guard<std::mutex> lock(g_faldExemptMutex);
+    return g_faldExemptDesktop;
+}
+
+// A debug view is on: the pixel pass again, the view off, inside DesktopLUT's own windows on this monitor
+// (shared/fald_exempt.h), so the interface stays readable. The main draw's bindings are still in place; only the CB
+// (word 24 = 0), the rasterizer state and the scissor change, and both are put back as they were.
+static void DrawExempt(const MonitorContext* ctx, FaldResources* r) {
+    if (!g_faldExemptRS) return;
+    FaldExemptRect desk[FALD_EXEMPT_HOST_RECTS];
+    int n = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_faldExemptMutex);
+        for (const FaldExemptRect& d : g_faldExemptDesktop) {
+            if (n == FALD_EXEMPT_HOST_RECTS) { desk[n - 1] = FaldExemptUnion(desk[n - 1], d); continue; }
+            desk[n++] = d;
+        }
+    }
+    if (n == 0) return;
+    FaldExemptRect mon[FALD_EXEMPT_WIRE_RECTS], fr[FALD_EXEMPT_FRAME_RECTS];
+    const int m = FaldExemptForMonitor(desk, n, ctx->x, ctx->y, ctx->width, ctx->height, false, mon, FALD_EXEMPT_WIRE_RECTS);
+    const int k = FaldExemptToFrame(mon, m, ctx->width, ctx->height, r->width, r->height, fr);
+    if (k == 0) return;
+    FillCB(r, 1, 0, true, 0);
+    ID3D11RasterizerState* prevRS = nullptr;
+    g_context->RSGetState(&prevRS);
+    D3D11_RECT prevScissor[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+    UINT prevCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    g_context->RSGetScissorRects(&prevCount, prevScissor);
+    g_context->RSSetState(g_faldExemptRS);
+    for (int i = 0; i < k; i++) {
+        const D3D11_RECT rc = { fr[i].x0, fr[i].y0, fr[i].x1, fr[i].y1 };
+        g_context->RSSetScissorRects(1, &rc);
+        g_context->Draw(3, 0);
+    }
+    g_context->RSSetState(prevRS);
+    if (prevRS) prevRS->Release();
+    g_context->RSSetScissorRects(prevCount, prevCount ? prevScissor : nullptr);
+}
+
 void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent) {
     FaldResources* r = ctx ? ctx->fald : nullptr;
     if (!r || !r->valid || !finalRT) return;
@@ -1141,6 +1204,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
         g_context->PSSetShaderResources(20, 3, fv);
     }
     g_context->Draw(3, 0);
+    if (r->debugMode != 0) DrawExempt(ctx, r);   // a view: DesktopLUT's windows keep the corrected picture
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
     if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);

@@ -94,6 +94,9 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define WM_WINDOWS_TONEMAP       (WM_USER + 111)
 // The FALD panel re-export poll's worker thread finished (dwm_inject.h StartDwmHookFaldPanelPoll; lParam = results).
 #define WM_FALD_PANEL_POLL_DONE  (WM_USER + 112)
+// One of DesktopLUT's own windows was shown, hidden, moved, sized, minimised or cloaked while a FALD view is on: list
+// them again for the layer (gui.cpp FaldExemptRefresh; posted once per burst by the window-event hook, GUI thread).
+#define WM_FALD_EXEMPT_REFRESH   (WM_USER + 113)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
@@ -102,6 +105,7 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_TRAY_STARTUP     2005
 #define ID_TRAY_CALIBRATION 2006
 #define ID_TRAY_CLASSIC_UI  2007
+#define ID_TRAY_FALD_VIEW   2008   // "End FALD view": shown only while a FALD view is on
 
 // Tab control
 #define ID_TAB_CONTROL      200

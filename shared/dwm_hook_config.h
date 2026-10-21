@@ -238,10 +238,15 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     // other mode waits there). 0 = the file staged at injection. Taken from _reserved: a host that predates it writes
     // 0, and a DLL that predates it never reads it (the host then re-injects: DWM_HOOK_FALD_PANEL_LIVE_EVENT).
     uint32_t panelGen[2];
-    uint32_t _reserved[6];           // room for later fields without a layout bump (26 used + 6 = 32 words)
+    // DesktopLUT's own windows on this monitor while a FALD view is on (shared/fald_exempt.h): up to three rects in
+    // monitor pixels, packed by FaldExemptPack (0 = none). The pixel pass draws them again with the view off, so the
+    // interface stays readable. Taken from _reserved: a host that predates it writes 0 (no rect: the view everywhere, as
+    // before), a DLL that predates it never reads it. Written only for a monitor whose view is on (else all 0).
+    uint32_t exempt[6];              // FALD_EXEMPT_WIRE_WORDS (26 + 6 = 32 words, no room left without a layout bump)
 };
 static_assert(sizeof(DwmHookFaldTuning) == 128, "DwmHookFaldTuning must be 128 bytes");
 static_assert(offsetof(DwmHookFaldTuning, panelGen) == 96, "panelGen must sit where _reserved[0] was");
+static_assert(offsetof(DwmHookFaldTuning, exempt) == 104, "exempt must sit where _reserved[0] was");
 
 struct DwmHookSharedConfigTail {
     uint32_t magic;                  // DWM_HOOK_TAIL_MAGIC
