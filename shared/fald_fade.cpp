@@ -25,7 +25,7 @@ enum FadeKernel : unsigned int {
     K_GRAD, K_DOWN, K_UP, K_PIX, K_KNEE, K_ADVANCE, K_MEANWIN, K_DFT, K_CROSS, K_NORM, K_MAXMAG, K_ARGMAX, K_OVERLAP,
     K_CUT, K_WARPQ, K_TM, K_SELECT,
     K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2, K_GT2P,
-    K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT,
+    K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT, K_DOWNMI,
     K_COUNT
 };
 struct KernelDef {
@@ -72,7 +72,8 @@ const KernelDef kKernels[K_COUNT] = {
     { "FadeExtT50", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 50\n" },
     { "FadeExtT66", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 66\n" },
     { "FadeConeT", &g_faldFadeConeTSource, nullptr, "" },
-    { "FadeFft", &g_faldFadeFftSource, nullptr, "" } };
+    { "FadeFft", &g_faldFadeFftSource, nullptr, "" },
+    { "FadeDownMi", &g_faldFadeDownMiSource, nullptr, "" } };
 
 unsigned int GaussKernel(int r) {
     switch (r) {
@@ -510,6 +511,25 @@ void Down(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int factor, const Fade
     Pass(f, ctx, K_DOWN, c, a, G16(out.w), G16(out.h));
 }
 
+// Two maps of the same size by the same reduction in one pass (FadeDown fOp bit 2: t25 -> u1)
+void Down2(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int factor, const FadeTex& inA, const FadeTex& inB,
+           const FadeTex& outA, const FadeTex& outB) {
+    FadeCBData c = Cb();
+    c.inW = inA.w; c.inH = inA.h; c.outW = outA.w; c.outH = outA.h; c.factor = factor; c.op = 4u;
+    c.c0 = 1.0f / (float)(factor * factor);
+    Io a; a.in[0] = inA.srv; a.in[1] = inB.srv; a.out[0] = outA.uav; a.out[1] = outB.uav;
+    Pass(f, ctx, K_DOWN, c, a, G16(outA.w), G16(outA.h));
+}
+
+// mi's four block reductions in one pass (FadeDownMi): mean8 / min8 of clamp(mi, 0, 1e4), mean8 / mean4 of mi
+void DownMi(FaldFade* f, ID3D11DeviceContext* ctx, const FadeTex& mean8c, const FadeTex& min8c, const FadeTex& mean8,
+            const FadeTex& mean4) {
+    FadeCBData c = Cb();
+    c.inW = f->mi.w; c.inH = f->mi.h; c.outW = mean8.w; c.outH = mean8.h;
+    Io a; a.in[0] = f->mi.srv; a.out[0] = mean8c.uav; a.out[1] = min8c.uav; a.out[2] = mean8.uav; a.out[3] = mean4.uav;
+    Pass(f, ctx, K_DOWNMI, c, a, G16(mean8.w), G16(mean8.h));
+}
+
 void Up(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int factor, const FadeTex& in, const FadeTex& out, unsigned int op = 0) {
     FadeCBData c = Cb();
     c.inW = in.w; c.inH = in.h; c.outW = out.w; c.outH = out.h; c.factor = factor; c.op = op;
@@ -871,10 +891,11 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     { GOpt o; o.sat = true; o.epi = E_W; o.plain = kPlainSums; Gauss(f, ctx, 4.0, S[4], W, H, S[3], &f->w, o); }
     // V8d (F12B_V8d, r12b/cands12b.py floor_valley8 with the darkest-object test): the floor-valley gate at 1/8 res, from the
     // sanitised max channel (the Down passes' clamp). l8 is the CL's (F7 reads eL8c too)
-    Down(f, ctx, 8, f->mi, f->eTmp, 1u);
+    // mi's block reductions in one pass: mean8 / min8 of ms -> eTmp / eA, and for T1 / O1 below mean8 / mean4 of mi ->
+    // eL8raw / qTmp (mi does not change in between; nothing else writes them)
+    DownMi(f, ctx, f->eTmp, f->eA, f->eL8raw, f->qTmp);
     Pix(f, ctx, P_LOG, W8, H8, { &f->eTmp }, { &f->eL8c });                // l8 = ln max(down8(ms), 0.05)
-    Down(f, ctx, 8, f->mi, f->eTmp, 3u);
-    Pix(f, ctx, P_LOG, W8, H8, { &f->eTmp }, { &f->eVlmin });              // lmin8 = ln max(min8(ms), 0.05)
+    Pix(f, ctx, P_LOG, W8, H8, { &f->eA }, { &f->eVlmin });                // lmin8 = ln max(min8(ms), 0.05)
     Ext(f, ctx, kFvCloseR, 0, f->eL8c, f->eA, f->eB);
     Ext(f, ctx, kFvCloseR, 1, f->eB, f->eA, f->eVlc);                      // Lc = grey_close(l8, 33)
     Ext(f, ctx, kFvOpenR, 1, f->eVlc, f->eA, f->eB);
@@ -898,8 +919,7 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     for (size_t k = 1; k < L; k++) {
         const FadeTex& sIn = (k == 1) ? S[1] : f->pS[k - 1];
         const FadeTex& wIn = (k == 1) ? S[2] : f->pW[k - 1];
-        Down(f, ctx, 2, sIn, f->pS[k]);
-        Down(f, ctx, 2, wIn, f->pW[k]);
+        Down2(f, ctx, 2, sIn, wIn, f->pS[k], f->pW[k]);
     }
     if (L >= 2) {
         Pix(f, ctx, P_DIV, f->lvW[L - 1], f->lvH[L - 1], { &f->pS[L - 1], &f->pW[L - 1] }, { &f->pE[L - 1] });
@@ -935,9 +955,7 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
         Gauss(f, ctx, 4.0, cone, W, H, S[2], nullptr, o);
     }
     // T1: the maps (mi unsanitised) and f_q
-    Down(f, ctx, 8, f->mi, f->eL8raw);
-    Pix(f, ctx, P_LOGEPS, W8, H8, { &f->eL8raw }, { &f->eL8 });
-    Down(f, ctx, 4, f->mi, f->qTmp);
+    Pix(f, ctx, P_LOGEPS, W8, H8, { &f->eL8raw }, { &f->eL8 });          // eL8raw / qTmp: DownMi above
     Pix(f, ctx, P_LOGEPS, Wq, Hq, { &f->qTmp }, { &f->qLq });
     Down(f, ctx, 4, f->fade, f->qFq);
     // O1: the lit floor's 1/8-res opening G16(grey_open(ln max(down8(mi), 0.05), 101)) (B16: r12a/cands12a.py floor_lit12);

@@ -217,6 +217,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 // the f x f block MIN instead (the twin's replicate-padded -max_pool2d(-x): V8d's min8; the same indexing, row-major).
 inline const char* g_faldFadeDownSource = R"(
 RWTexture2D<float> dOut : register(u0);
+RWTexture2D<float> dOut1 : register(u1);
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= fOutW || id.y >= fOutH) return;
@@ -234,17 +235,79 @@ void main(uint3 id : SV_DispatchThreadID) {
         dOut[id.xy] = mn;
         return;
     }
+    // fOp bit 2 = a pair: t25 into u1 as well, the same reduction (the push-pull's S and W levels in one pass)
+    const bool pair = (fOp & 4u) != 0u;
     precise float s = 0.0f;
+    precise float s1 = 0.0f;
     for (int dy = 0; dy < f; dy++) {
         int sy = min((int)id.y * f + dy, (int)fInH - 1);
         for (int dx = 0; dx < f; dx++) {
-            float v = fIn0.Load(int3(min((int)id.x * f + dx, (int)fInW - 1), sy, 0));
+            const int3 q = int3(min((int)id.x * f + dx, (int)fInW - 1), sy, 0);
+            float v = fIn0.Load(q);
             if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
             s = s + v;
+            if (pair) {
+                float v1 = fIn1.Load(q);
+                if ((fOp & 1u) != 0u) v1 = min(max(v1, 0.0f), 1e4f);
+                s1 = s1 + v1;
+            }
         }
     }
     precise float m = s * fC0;
     dOut[id.xy] = m;
+    if (pair) {
+        precise float m1 = s1 * fC0;
+        dOut1[id.xy] = m1;
+    }
+}
+)";
+
+// ---- the four block reductions of mi in one pass, one thread per 8 x 8 block (FadeDown's arithmetic for each output:
+// row-major sums x 1/f^2, the min order-free): u0 = mean8 of clamp(mi, 0, 1e4) (V8d / CL's l8), u1 = min8 of it (V8d's
+// lmin8), u2 = mean8 of mi (T's and the lit floor's), u3 = mean4 of mi (the block's 2 x 2 quarter-res texels: T's and the
+// reach step's; each sub-block's sum takes its texels in their own row-major order). mi is read once instead of 4 times.
+inline const char* g_faldFadeDownMiSource = R"(
+RWTexture2D<float> dmOut0 : register(u0);
+RWTexture2D<float> dmOut1 : register(u1);
+RWTexture2D<float> dmOut2 : register(u2);
+RWTexture2D<float> dmOut3 : register(u3);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= fOutW || id.y >= fOutH) return;
+    precise float sc = 0.0f;
+    precise float sr = 0.0f;
+    precise float q00 = 0.0f;
+    precise float q01 = 0.0f;
+    precise float q10 = 0.0f;
+    precise float q11 = 0.0f;
+    float mn = 0.0f;
+    for (int dy = 0; dy < 8; dy++) {
+        const int sy = min((int)id.y * 8 + dy, (int)fInH - 1);
+        for (int dx = 0; dx < 8; dx++) {
+            const float v = fIn0.Load(int3(min((int)id.x * 8 + dx, (int)fInW - 1), sy, 0));
+            const float vc = min(max(v, 0.0f), 1e4f);
+            sc = sc + vc;
+            mn = (dy == 0 && dx == 0) ? vc : min(mn, vc);
+            sr = sr + v;
+            if (dy < 4) { if (dx < 4) q00 = q00 + v; else q01 = q01 + v; }
+            else { if (dx < 4) q10 = q10 + v; else q11 = q11 + v; }
+        }
+    }
+    precise float m8c = sc * 0.015625f;
+    precise float m8r = sr * 0.015625f;
+    dmOut0[id.xy] = m8c;
+    dmOut1[id.xy] = mn;
+    dmOut2[id.xy] = m8r;
+    const uint wq = (fInW + 3u) / 4u, hq = (fInH + 3u) / 4u;
+    const uint2 b = id.xy * 2u;
+    precise float m00 = q00 * 0.0625f;
+    precise float m01 = q01 * 0.0625f;
+    precise float m10 = q10 * 0.0625f;
+    precise float m11 = q11 * 0.0625f;
+    dmOut3[b] = m00;
+    if (b.x + 1u < wq) dmOut3[b + uint2(1, 0)] = m01;
+    if (b.y + 1u < hq) dmOut3[b + uint2(0, 1)] = m10;
+    if (b.x + 1u < wq && b.y + 1u < hq) dmOut3[b + uint2(1, 1)] = m11;
 }
 )";
 
