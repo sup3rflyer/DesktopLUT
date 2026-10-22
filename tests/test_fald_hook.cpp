@@ -26,8 +26,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -139,13 +141,21 @@ struct HookMonitor {
     }
     // One present. newContent: DWM composed a new frame (one full-frame dirty rect); false = a present with no dirty rect.
     // Returns the run's state; out / fields are read only when asked.
-    struct Result { bool ran = false, fadeOn = false; uint32_t word75 = 0xFFFFFFFFu; FaldFade* fade = nullptr; std::string err; };
+    struct Result { bool ran = false, fadeOn = false; uint32_t word75 = 0xFFFFFFFFu; FaldFade* fade = nullptr; std::string err;
+                    unsigned int govState = 0; };
+    bool forceFade = true;   // the governor forced on (false: it decides — on WARP that is "weak GPU": never on)
+    bool fadeWanted = true;  // the flank fade setting (faldFlags bit 8)
     Result Present(bool newContent, bool readCB) {
         Result r;
         if (newContent) w.ic->UpdateSubresource(back, 0, nullptr, frame.data(), W * 8u, 0);
         FaldMonitor* m = FaldAcquire(0, 0, hdr, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (!m) { r.err = "FaldAcquire: no layer"; return r; }
+#ifdef FALD_RUN_HAS_FRAME_KEY
+        // the governor forced on (faldFlags bit 10): WARP is a software adapter, which it would never start the fade on
+        FaldSetLiveSettings(m, 0, 0, star, nullptr, fadeWanted, 0, 0, forceFade);
+#else
         FaldSetLiveSettings(m, 0, 0, star, nullptr, true);
+#endif
         RECT full = { 0, 0, (LONG)W, (LONG)H };
         if (!FaldUpdateClean(m, back, newContent ? &full : nullptr, newContent ? 1 : 0)) {
             FaldReturn(m);
@@ -154,7 +164,12 @@ struct HookMonitor {
             return r;
         }
         w.ic->CopyResource(FaldIntermediateTexture(m), FaldCleanTexture(m));   // no LUT, no tone map (RenderLUT)
+#ifdef FALD_RUN_HAS_FRAME_KEY
+        r.ran = FaldRun(m, backRTV, newContent, 0x9E3779B97F4A7C15ull);   // hook_render.cpp's key for "no LUT pass"
+        r.govState = FaldTestFadeGovState(m);
+#else
         r.ran = FaldRun(m, backRTV, newContent);
+#endif
         if (!r.ran) w.ic->CopyResource(back, FaldIntermediateTexture(m));
         r.fadeOn = FaldTestFadeOn(m);
         r.fade = FaldTestFade(m);
@@ -168,15 +183,44 @@ struct HookMonitor {
     }
 };
 
+// The overlay's ON run as a hash manifest instead of dumps (FALD_TEST_FADE_HOOK_HASHES = tests/test_fald_fade.cpp's
+// FALD_TEST_FADE_HASHES output): "<run>/tNN <file>" -> "<bytes> <fnv>". `g_hookOnRoot` = the FALD_TEST_FADE_ON prefix the
+// reference paths carry (stripped to form the key).
+std::map<std::string, std::string>* g_hookHashes = nullptr;
+std::string g_hookOnRoot;
+
+std::string HookFnvLine(const std::vector<unsigned char>& b) {
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : b) { h ^= c; h *= 1099511628211ull; }
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%zu %016llx", b.size(), (unsigned long long)h);
+    return buf;
+}
+
 // Byte-compare this present's output + fade fields with the overlay's dump directory `ref`.
 void CompareWithOverlay(HookMonitor& hm, FaldFade* fade, const std::string& ref, const std::string& what, int& compared, int& equal) {
     struct Item { const char* file; ID3D11Texture2D* tex; ID3D11Buffer* buf; };
+#ifdef FALD_FADE_HAS_DEBUG_MATERIALIZE
+    FaldFadeDebugMaterialize(fade, hm.w.ic);   // fade_T and F as full-res maps (FadePost forms them per pixel)
+#endif
     const FaldFadeDebug d = FaldFadeDebugViews(fade);
     const Item items[] = { { "out.rgba16f", hm.back, nullptr }, { "fade.f32", d.fade, nullptr }, { "fade_t.f32", d.fadeT, nullptr },
                            { "floor.f32", d.floorF, nullptr }, { "reach0.f32", d.reach[0], nullptr },
                            { "reach1.f32", d.reach[1], nullptr }, { "s.f32", d.s, nullptr }, { "mi.f32", d.mi, nullptr },
                            { "flags.u32", nullptr, d.flags } };
     for (const Item& it : items) {
+        if (g_hookHashes) {
+            const std::string key = ref.substr((std::min)(ref.size(), g_hookOnRoot.size() + 1)) + " " + it.file;
+            auto f = g_hookHashes->find(key);
+            CHECK_MESSAGE(f != g_hookHashes->end(), what << ": no overlay hash for " << key);
+            if (f == g_hookHashes->end()) continue;
+            const std::vector<unsigned char> got = it.tex ? ReadBackTex(hm.w.dev, hm.w.ic, it.tex) : ReadBackBuf(hm.w.dev, hm.w.ic, it.buf);
+            const bool same = HookFnvLine(got) == f->second;
+            compared++;
+            if (same) equal++;
+            CHECK_MESSAGE(same, what << ": " << std::string(it.file) << " differs from the overlay's " << key);
+            continue;
+        }
         std::vector<unsigned char> want;
         const bool have = ReadAll(ref + "/" + it.file, want);
         CHECK_MESSAGE(have, what << ": no overlay dump " << ref << "/" << std::string(it.file));
@@ -269,6 +313,21 @@ TEST_CASE("FALD hook: faldFlags bit 8 carries the flank fade, alone") {
 TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay's, frame for frame (WARP; FALD_TEST_FADE_ON)") {
     const std::string cells = HookEnv("FALD_TEST_FADE_DIR"), on = HookEnv("FALD_TEST_FADE_ON"), only = HookEnv("FALD_TEST_FADE_HOOK_ONLY");
     if (cells.empty() || on.empty()) return;
+    std::map<std::string, std::string> hashes;
+    const std::string hashPath = HookEnv("FALD_TEST_FADE_HOOK_HASHES");
+    if (!hashPath.empty()) {   // "<run>/tNN <file> <bytes> <fnv>" per line
+        std::ifstream f(hashPath);
+        std::string line;
+        while (std::getline(f, line)) {
+            std::istringstream is(line);
+            std::string run, file, bytes, fnv;
+            if (is >> run >> file >> bytes >> fnv) hashes[run + " " + file] = bytes + " " + fnv;
+        }
+        REQUIRE_FALSE(hashes.empty());
+        g_hookHashes = &hashes;
+        g_hookOnRoot = on;
+    }
+    struct ClearHashes { ~ClearHashes() { g_hookHashes = nullptr; } } clearHashes;
     const std::wstring C = OwnerPanelPath(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
     const std::wstring B07 = OwnerPanelPath(L"DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_fald_panel_boost_meanrule_blur0.7.bin");
     const std::wstring SDR = OwnerPanelPath(L"DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_refit_sdr_fald_panel_blur0.7.bin");
@@ -398,3 +457,46 @@ TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay'
     }
     MESSAGE("hook vs overlay: " << equal << " of " << compared << " files byte-identical");
 }
+
+#ifdef FALD_RUN_HAS_FRAME_KEY
+// The fade's safety governor in the hook (shared/fald_fade_governor.h): WARP is a software adapter, so without the force
+// bit the governor never starts the fade — the layer runs as C (CB word 75 = 0, nothing built) and its output equals the
+// layer with the fade switched off, byte for byte; with the force bit it runs.
+TEST_CASE("FALD hook: a fade the governor holds back is C byte for byte (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cells = HookEnv("FALD_TEST_FADE_DIR");
+    if (cells.empty()) return;
+    const std::wstring ODD = std::wstring(cells.begin(), cells.end()) + L"\\odd_panel.bin";
+    auto run = [&](bool fade, bool force, int presents, HookMonitor::Result& last) {
+        HookWarp w;
+        REQUIRE(w.ok);
+        Staged staged(ODD, true);
+        REQUIRE(staged.ok);
+        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+        HookMonitor hm(w, 1366, 768, true, true);
+        hm.fadeWanted = fade;
+        hm.forceFade = force;
+        REQUIRE(hm.Load(cells + "/x_odd1366.rgba16f"));
+        for (int i = 0; i < presents; i++) {
+            last = hm.Present(true, true);
+            if (!last.ran && last.err == "unprimed") { i--; continue; }
+            REQUIRE_MESSAGE(last.ran, last.err);
+        }
+        return ReadBackTex(w.dev, w.ic, hm.back);
+    };
+    HookMonitor::Result r;
+    const std::vector<unsigned char> C = run(false, false, 3, r);
+    CHECK(r.govState == 0u);                               // Off: the setting is off
+    const std::vector<unsigned char> held = run(true, false, 40, r);
+    CHECK(r.govState == 3u);                               // SuspendedWeakGpu
+    CHECK_FALSE(r.fadeOn);
+    CHECK(r.fade == nullptr);
+    CHECK(r.word75 == 0u);
+    REQUIRE(!C.empty());
+    CHECK(held == C);
+    const std::vector<unsigned char> forced = run(true, true, 40, r);
+    CHECK(r.govState == 4u);                               // Forced
+    CHECK(r.fadeOn);
+    CHECK(r.word75 == 1u);
+    CHECK(forced != C);
+}
+#endif

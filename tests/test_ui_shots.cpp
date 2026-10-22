@@ -10,6 +10,7 @@
 #include "ui/ui_dlc.h"
 #include "dlc/dlc_live.h"   // ResetLiveWatchForTest
 #include "dlc/dlc_scan.h"   // ResetScannerForTest
+#include "fald_fade_status.h"   // FaldFadeGovPostEvent (the flank fade governor's Events line)
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
@@ -498,6 +499,12 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     notify::Post(notify::Sev::Success, 0, L"mhc", L"Profile installed", L"DesktopLUT_HDR_AUS322A.icm");
     notify::Post(notify::Sev::Warning, 1, L"mhc", L"Profile restored", L"Windows dropped the association");
     notify::Post(notify::Sev::Info, 0, L"hook", L"Injected into dwm.exe");
+    {   // the flank fade governor's Events line (src/fald_fade_status.cpp), as the render path posts it
+        FaldFadeGovReport g;
+        g.known = true; g.state = FaldFadeGovState::SuspendedBudget;
+        g.p90Ms = 9.4; g.budgetMs = 6.3; g.contentMs = 41.7; g.refreshMs = 6.94;
+        FaldFadeGovPostEvent(0, true, g);
+    }
 
     const ui::Snapshot base = FakeSnapshot();
     // variant: 0 as made, 1 the 3D LUT and primaries stages of the HDR display switched off, 2 suspended, 3/4 grayscale
@@ -524,6 +531,11 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         // 25: shot 23 on BOOST ZONES with the VIEW list open: under the field, and over it where the window is short.
         { "faldview", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 25 },
         { "faldviewnarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 25 },
+        // the flank fade on and its governor: 26 paused over budget (p90 / budget), 27 paused on a weak GPU, 28 forced
+        { "faldfadepaused", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 26 },
+        { "faldfadepausednarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 26 },
+        { "faldfadeweak", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 27 },
+        { "faldfadeforced", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 28 },
         { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
         { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
         { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
@@ -658,6 +670,13 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     auto data = std::make_shared<dlc::Data>();
                     data->configured = L"X:\\Moved\\DLC";   // the scan for it found nothing there
                     snap.dlc = data;
+                } else if (shot.variant == 26 || shot.variant == 27 || shot.variant == 28) {
+                    snap.live[0].settings.hdrColorCorrection.fald.flankFade = true;
+                    FaldFadeGovReport& g = snap.live[0].fadeGov[1];
+                    g.known = true;
+                    g.state = shot.variant == 26 ? FaldFadeGovState::SuspendedBudget
+                            : shot.variant == 27 ? FaldFadeGovState::SuspendedWeakGpu : FaldFadeGovState::Forced;
+                    g.p90Ms = 9.4; g.budgetMs = shot.variant == 28 ? 0.0 : 6.3; g.contentMs = 41.7; g.refreshMs = 6.94;
                 } else if (shot.variant == 23 || shot.variant == 25) {
                     FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;
                     f.star.enabled = true;

@@ -780,6 +780,10 @@ struct MonitorContext {
     bool lastTetrahedralInterp = false;      // Cached atomic value
     bool lastHdrDither = true;               // Cached atomic value (g_hdrDither)
     bool grayscaleICtCp = false;             // true = shader uses ICtCp offsets for HDR grayscale
+    // The FALD layer's frame key (render.cpp -> FaldRunPasses frameKey): the desktop image's generation (a new image per
+    // acquired frame with LastPresentTime != 0) and the hash of the last constant buffer the main pass was given
+    unsigned long long faldImageGen = 0;     // render thread
+    unsigned long long mainCbHash = 0;       // render thread
 
     // Thread-safe visibility requests (whitelist thread → render thread)
     MovableAtomic<int> requestedVisibility{0};  // 0=no change, 1=show, -1=hide

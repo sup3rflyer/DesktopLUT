@@ -24,6 +24,7 @@
 #include <iostream>
 #include <iomanip>
 #include <algorithm>
+#include <cstring>
 
 #ifndef STATUS_GRAPHICS_PRESENT_OCCLUDED
 #define STATUS_GRAPHICS_PRESENT_OCCLUDED ((DWORD)0xC01E05A1)
@@ -372,7 +373,10 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     D3D11_MAPPED_SUBRESOURCE mapped;
     hr = g_context->Map(g_constantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (SUCCEEDED(hr)) {
-        float* cbData = (float*)mapped.pData;
+        // Filled here, then copied into the mapping whole (every one of the 148 words is written below): its hash is the
+        // main pass's settings in the FALD layer's frame key (FaldRunPasses' reach reuse).
+        float cbLocal[148] = {};
+        float* cbData = cbLocal;
         // Row 0: Core settings
         cbData[0] = ctx->isHDREnabled ? 1.0f : 0.0f;
         cbData[1] = curSdrWhiteNits;   // Windows SDR white level (desktop gamma reference)
@@ -531,7 +535,14 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         cbData[145] = 1.0f / sdrWhiteScRGB;
         cbData[146] = 0.0f;
         cbData[147] = 0.0f;
+        std::memcpy(mapped.pData, cbLocal, sizeof(cbLocal));
         g_context->Unmap(g_constantBuffer, 0);
+        {
+            unsigned long long h = 1469598103934665603ull;
+            const unsigned char* b = (const unsigned char*)cbLocal;
+            for (size_t i = 0; i < sizeof(cbLocal); i++) { h ^= b[i]; h *= 1099511628211ull; }
+            ctx->mainCbHash = h;
+        }
 
         // Only clear dirty flag and update cached atomics AFTER successful write.
         // If Map failed, cbDirty stays true so we retry next frame.
@@ -685,7 +696,21 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         // newContent: a real desktop frame (not the cached-frame re-process, not a cursor-only update): the
         // temporal drive state re-arms its settle hold on it (fald.h FaldRunPasses)
         const bool newContent = !reprocess && frameInfo.LastPresentTime.QuadPart != 0;
-        FaldRunPasses(ctx, finalTarget, newContent);   // leaves finalTarget bound, PS SRVs cleared
+        // The frame the main pass just drew into the layer's intermediate, as a key (fald.h FaldRunPasses frameKey): the
+        // desktop image (its generation: a cursor-only frame keeps it), the main pass's constant buffer and cube. 0 = not
+        // known to repeat: a re-process (a setting changed, maybe one the buffer does not show) or the dynamic peak (it
+        // moves frame by frame on the same image).
+        if (newContent) ctx->faldImageGen++;
+        const bool dynamicPeak = ctx->isHDREnabled && cc.tonemap.enabled && cc.tonemap.dynamicPeak;
+        unsigned long long frameKey = 0;
+        if (!reprocess && !dynamicPeak) {
+            frameKey = 1469598103934665603ull;
+            const uintptr_t lut = (uintptr_t)activeLUT;
+            for (unsigned long long v : { ctx->faldImageGen, ctx->mainCbHash, (unsigned long long)lut })
+                for (int i = 0; i < 8; i++) { frameKey ^= (v >> (8 * i)) & 0xFFu; frameKey *= 1099511628211ull; }
+            if (frameKey == 0) frameKey = 1;
+        }
+        FaldRunPasses(ctx, finalTarget, newContent, frameKey);   // leaves finalTarget bound, PS SRVs cleared
     }
     }   // !settleOnly
 

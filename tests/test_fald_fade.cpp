@@ -357,6 +357,33 @@ struct OnSpec {
 
 int g_lastFadeWarmupRuns = 0;   // RunOn: runs of the first frame before the paced fade was on
 
+// Hash-only ON runs (FALD_TEST_FADE_HASHES=<manifest>): every file the dump would write is hashed instead ("<run>/tNN
+// <file> <bytes> <fnv>"), for a byte-for-byte comparison of two builds without 30 GB of dumps. FALD_TEST_FADE_STILL=1
+// adds, after every content frame, one run of the layer WITHOUT new content on the same frame (dumped as tNNs): the
+// presents a desktop makes between content frames (the fade's reach reuse, fald_fade.h FaldFadeReachCurrent).
+Manifest* g_onHashes = nullptr;
+
+// The run of the layer the harness makes: newContent + (where this build has it) the frame's key — content frames count
+// up, a run without new content repeats the last key. The governor is forced on: WARP is a software adapter (no VRAM),
+// which the governor would never start the fade on (shared/fald_fade_governor.h).
+void HarnessRun(MonitorContext* ctx, ID3D11RenderTargetView* rtv, bool newContent, unsigned long long key) {
+#ifdef FALD_RUN_HAS_FRAME_KEY
+    g_faldFadeForce.store(true);
+    FaldRunPasses(ctx, rtv, newContent, key);
+#else
+    (void)key;
+    FaldRunPasses(ctx, rtv, newContent);
+#endif
+}
+
+void HarnessMaterialize(FaldFade* f, ID3D11DeviceContext* ic) {
+#ifdef FALD_FADE_HAS_DEBUG_MATERIALIZE
+    FaldFadeDebugMaterialize(f, ic);
+#else
+    (void)f; (void)ic;
+#endif
+}
+
 // round 12b's halo stills (DLC tests/fald_fade_cells.py F12B_STILLS; tests/test_fald_hook.cpp runs them too)
 const char* const kHaloCells[] = { "ax_552", "ax_412", "ax_422", "ax_442", "ax_492", "ax_522", "s10_sm_windmill", "s10_sm_cows",
                                    "s10_sm_snowfence", "s10_ac_rec2020" };
@@ -391,32 +418,36 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
             w.ic->VSSetShader(w.vs, nullptr, 0);
             w.ic->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
             w.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)rs.w * 8u, 0);
-            FaldRunPasses(&ctx, rtv, true);
+            HarnessRun(&ctx, rtv, true, 0);
             w.ic->Flush();
         }
         if (err.empty() && !ctx.fald->fadeOn) err = "the fade did not turn on within 400 runs";
         if (err.empty()) FaldFadeReset(ctx.fald->fade);
         g_lastFadeWarmupRuns = runs;
     }
+    const bool still = EnvStr("FALD_TEST_FADE_STILL") == "1";
     const auto t0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < rs.frames.size() && err.empty(); i++) {
         if (!ReadFrame(cellDir + "/" + rs.frames[i] + ".rgba16f", rs.w, rs.h, frame)) { err = "frame " + rs.frames[i]; break; }
+        for (int pass = 0; pass < (still ? 2 : 1) && err.empty(); pass++) {   // pass 1: the same frame, no new content
         D3D11_VIEWPORT vp = { 0, 0, (float)rs.w, (float)rs.h, 0, 1 };
         w.ic->RSSetViewports(1, &vp);
         w.ic->VSSetShader(w.vs, nullptr, 0);
         w.ic->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        w.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)rs.w * 8u, 0);
-        FaldRunPasses(&ctx, rtv, true);
+        if (pass == 0) w.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)rs.w * 8u, 0);
+        HarnessRun(&ctx, rtv, pass == 0, 1000ull + i);
         w.ic->Flush();
         const FaldResources* r = ctx.fald;
         if (rs.fade != r->fadeOn) { err = rs.fade ? "the fade did not turn on" : "the fade is on"; break; }
         FaldFadeDebug d = {};
-        if (rs.fade) d = FaldFadeDebugViews(r->fade);
+        if (rs.fade) { HarnessMaterialize(r->fade, w.ic); d = FaldFadeDebugViews(r->fade); }
         else { d.width = (unsigned)rs.w; d.height = (unsigned)rs.h; }
-        char sub[32]; snprintf(sub, sizeof(sub), "/t%02zu", i);
+        char sub[32]; snprintf(sub, sizeof(sub), pass == 0 ? "/t%02zu" : "/t%02zus", i);
         const std::string dir = outDir + "/" + rs.id + sub;
-        CreateDirectoryA((outDir + "/" + rs.id).c_str(), nullptr);
-        CreateDirectoryA(dir.c_str(), nullptr);
+        if (!g_onHashes) {
+            CreateDirectoryA((outDir + "/" + rs.id).c_str(), nullptr);
+            CreateDirectoryA(dir.c_str(), nullptr);
+        }
         const std::pair<const char*, ID3D11Texture2D*> tex[] = {
             { "mi.f32", d.mi }, { "fade.f32", d.fade }, { "fade_t.f32", d.fadeT }, { "floor.f32", d.floorF },
             { "reach0.f32", d.reach[0] }, { "reach1.f32", d.reach[1] }, { "s.f32", d.s }, { "fq.f32", d.fq },
@@ -426,17 +457,27 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
         for (const auto& t : tex) {
             if (!t.second) continue;
             const std::vector<uint8_t> b = ReadBack(t.second);
-            if (!WriteBytes(dir + "/" + t.first, b.data(), b.size())) { err = "write " + dir; break; }
+            if (g_onHashes) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%zu %016llx", b.size(), (unsigned long long)Fnv(b));
+                g_onHashes->emplace_back(rs.id + sub + " " + t.first, buf);
+            } else if (!WriteBytes(dir + "/" + t.first, b.data(), b.size())) { err = "write " + dir; break; }
         }
         if (rs.fade) {
             const std::vector<uint8_t> fl = ReadBackBuffer(d.flags);
-            WriteBytes(dir + "/flags.u32", fl.data(), fl.size());
+            if (g_onHashes) {
+                char buf[64];
+                snprintf(buf, sizeof(buf), "%zu %016llx", fl.size(), (unsigned long long)Fnv(fl));
+                g_onHashes->emplace_back(rs.id + sub + " flags.u32", buf);
+            } else WriteBytes(dir + "/flags.u32", fl.data(), fl.size());
         }
+        if (g_onHashes) continue;
         std::ofstream meta(dir + "/meta.txt");
         meta << "width " << d.width << "\nheight " << d.height << "\nwq " << d.wq << "\nhq " << d.hq << "\nw8 " << d.w8 << "\nh8 " << d.h8
              << "\nhas_history " << (d.hasHistory ? 1 : 0) << "\nstar " << (rs.star ? 1 : 0) << "\nhdr " << (rs.hdr ? 1 : 0)
              << "\nframe " << rs.frames[i] << "\nvram_bytes " << (rs.fade ? FaldFadeVramBytes(r->fade) : 0ull)
              << "\nfade " << (rs.fade ? 1 : 0) << "\n";
+        }
     }
     secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     rtv->Release(); target->Release();
@@ -454,7 +495,7 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
 // What ships contains no float mad: D3D lets a device run a mad fused or not, and fadeemu emulates the unfused order.
 TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, with no float mad") {
     const unsigned int n = FaldFadeKernelCount();
-    REQUIRE(n == 19u);
+    REQUIRE(n == 36u);   // 17 passes + the tiled Gaussians (8 radius classes, lv's four, num / den), max / min (8), cone
     std::vector<std::vector<unsigned char>> fresh(n);
     const auto t0 = std::chrono::steady_clock::now();
     for (unsigned int k = 0; k < n; k++) {
@@ -588,6 +629,9 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
     const std::string fracPanel = cellDir + "/frac_panel_48x24.bin";
     if (GetFileAttributesA(fracPanel.c_str()) != INVALID_FILE_ATTRIBUTES)
         add("still_frac2560", Widen(fracPanel), true, true, { "x_frac2560" }, 2560, 1440);
+    const std::string hashPath = EnvStr("FALD_TEST_FADE_HASHES");
+    Manifest hashes;
+    if (!hashPath.empty()) g_onHashes = &hashes;
     for (const OnSpec& rs : runs) {
         if (!only.empty() && rs.id.find(only) == std::string::npos) continue;
         std::string err; double secs = 0.0;
@@ -595,5 +639,8 @@ TEST_CASE("FALD fade ON: WARP dumps for the DLC replay (FALD_TEST_FADE_DIR + FAL
         CHECK_MESSAGE(ok, rs.id << ": " << err);
         MESSAGE(rs.id << ": " << rs.frames.size() << " frame(s), " << secs << " s (the fade on after " << g_lastFadeWarmupRuns
                 << " paced run(s) of frame 0)");
+        if (!hashPath.empty()) WriteManifest(hashPath, hashes);   // as it goes (a long run can be read while it runs)
     }
+    g_onHashes = nullptr;
+    if (!hashPath.empty()) { REQUIRE(WriteManifest(hashPath, hashes)); MESSAGE(hashes.size() << " hashes -> " << hashPath); }
 }

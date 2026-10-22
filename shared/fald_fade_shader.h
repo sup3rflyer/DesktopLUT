@@ -20,11 +20,20 @@
 // with float32 weights (never the sampler's 8-bit fractions). Tables (Gaussian weights, DFT twiddles, the Hann window, the
 // spectral Gaussian) come from the C++ (shared/fald_fade.cpp), computed in float64.
 //
-// Resources (the common FALD source, fald_shader.h, is compiled in front of every pass: b0 / t0..t22 / s0):
+// Resources (the common FALD source, fald_shader.h, is compiled in front of every pass: b0 / t0..t23 / s0):
 //   b1 FadeCB        per dispatch (immutable buffers built with the monitor's fade resources)
 //   b2 FadeFrameCB   per content frame (hasHistory)
 //   t24..t28 float inputs, t29 / t30 complex (float2) inputs, t31 / t32 twiddles (width / height), t33 Gaussian weights,
 //   t34 the Hann window, t35 the spectral Gaussian; u0..u3 float outputs, u4 / u5 complex outputs, u7 the flags buffer.
+//
+// Speed (2026-10-22, DLC results/fald_fade_tiers_2026-10-20; ZERO-CHANGE: every pass computes the float operations of
+// the kernels it replaced in the same order, so the output is the same bit for bit — tests/test_fald_fade.cpp): the
+// Gaussians and the max / min filters read their taps from groupshared tiles (FadeGaussT / FadeExtT, the latter by
+// doubling), lv's four Gaussians share one vertical pass (FadeGaussT4), the hybrid fill's two sigma-32 sums one pass
+// (FadeGaussT2), the cone / the reach run 8 iterations per dispatch (FadeConeT), an up-sampling that fed a Gaussian or a
+// pixel step is formed where it is read (FadeUpAt), the pixel step after a Gaussian is done by its horizontal pass, the
+// DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit floor F itself (fald_shader.h).
+// FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
 #pragma once
 
 // MSVC caps one string literal at 16380 bytes (C2026): each pass is its own literal; the common fade source too.
@@ -134,7 +143,7 @@ bool FadeWarpValid(int i, float d, int n) {
 
 // ---- the separable Gaussian (scipy mode 'nearest', truncate 4): one axis per dispatch, Kahan sum of the symmetric
 // pairs in ascending distance (the twin's _corr1d order). fOp bit 0 = clamp the INPUT into [0, 1e4] (fade9's sanitise:
-// the max channel of the frame), bit 1 = saturate the OUTPUT (step / reach).
+// the max channel of the frame), bit 1 = saturate the OUTPUT (step / reach). The REFERENCE of FadeGaussT (not shipped).
 inline const char* g_faldFadeGaussSource = R"(
 RWTexture2D<float> gOut : register(u0);
 float GTap(int x, int y, int k) {
@@ -160,7 +169,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-// ---- separable max (fOp 0) / min (fOp 1) filter of radius fRadius along one axis, replicate edges.
+// ---- separable max (fOp 0) / min (fOp 1) filter of radius fRadius along one axis, replicate edges. The REFERENCE of
+// FadeExtT (not shipped).
 inline const char* g_faldFadeExtSource = R"(
 RWTexture2D<float> eOut : register(u0);
 float ETap(int x, int y, int k) {
@@ -311,6 +321,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 //  23 FVGATE t24 Vd = maxf11(v), t25 vlev = minf11(FVLEV), t26 minf11(lmin8) -> u0 V8 = Vd (1 - smooth(ln 1.5, ln 2,
 //            vlev - dmin))
 //  24 FVSRC  full res: t24 raw0, t25 w, t26 up8(V8) -> u0 raw0 (1 - (1 - w) clamp(V, 0, 1)) (the flank term's source)
+//  25 FVSRC8 the same with t26 = V8 itself (1/8 res): up8 formed here (FadeUpAt = FadeUp's arithmetic), no full-res V map
 inline const char* g_faldFadePixSource = R"(
 RWTexture2D<float> pOut0 : register(u0);
 RWTexture2D<float> pOut1 : register(u1);
@@ -425,6 +436,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         precise float V = min(max(L(fIn2, p), 0.0f), 1.0f);
         precise float s = L(fIn0, p) * (1.0f - (1.0f - L(fIn1, p)) * V);
         pOut0[p] = s;
+    } else if (fOp == 25u) {
+        precise float V = min(max(FadeUpAt(fIn2, int2(p), 0.125f), 0.0f), 1.0f);
+        precise float s = L(fIn0, p) * (1.0f - (1.0f - L(fIn1, p)) * V);
+        pOut0[p] = s;
     }
 }
 )";
@@ -526,19 +541,24 @@ void main(uint3 tid : SV_GroupThreadID) {
 // ---- T: dense DFTs (sizes need not be powers of two). Kahan sums over the input index in ascending order.
 //   fOp 0: forward along x of a REAL map (t24) -> u4 complex; 1: forward along y of a complex map (t29) -> u4;
 //   2: inverse along x of a complex map (t29) -> u4; 3: inverse along y, real part x fC0 (= 1 / (W H)) -> u0.
+// The twiddle index (k n) mod N is carried by increment (tw += k; tw -= N when it reaches N: k < N, so one subtraction),
+// the same integer for every n as the product's remainder (DLC results/fald_fade_tiers_2026-10-20 zc_proofs.json P5).
 inline const char* g_faldFadeDftSource = R"(
 RWTexture2D<float> dfReal : register(u0);
 RWTexture2D<float2> dfOut : register(u4);
+uint FadeTwNext(uint i, uint step, uint n) { uint j = i + step; return (j >= n) ? j - n : j; }
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     uint W = fInW, H = fInH;
     if (id.x >= W || id.y >= H) return;
     uint x = id.x, y = id.y;
     precise float re = 0.0f, cre = 0.0f, im = 0.0f, cim = 0.0f;
+    uint ti0 = 0u;                         // (step x index) mod N of the loop's current index
     if (fOp == 0u) {                       // X[y, k = x] = sum_n x[y, n] (cos - i sin)(2 pi k n / W)
         for (uint n = 0; n < W; n++) {
             float v = fIn0.Load(int3(n, y, 0));
-            float2 tw = fTwW[(x * n) % W];
+            float2 tw = fTwW[ti0];
+            ti0 = FadeTwNext(ti0, x, W);
             precise float tr = v * tw.x;
             precise float ti = -(v * tw.y);
             FadeKAdd(re, cre, tr); FadeKAdd(im, cim, ti);
@@ -547,7 +567,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else if (fOp == 1u) {                // B[ky = y, kx = x] = sum_m Z[m, kx] (cos - i sin)(2 pi ky m / H)
         for (uint m = 0; m < H; m++) {
             float2 z = fInC0.Load(int3(x, m, 0));
-            float2 tw = fTwH[(y * m) % H];
+            float2 tw = fTwH[ti0];
+            ti0 = FadeTwNext(ti0, y, H);
             precise float tr = z.x * tw.x + z.y * tw.y;
             precise float ti = z.y * tw.x - z.x * tw.y;
             FadeKAdd(re, cre, tr); FadeKAdd(im, cim, ti);
@@ -556,7 +577,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else if (fOp == 2u) {                // Z[ky = y, x] = sum_kx R[ky, kx] (cos + i sin)(2 pi kx x / W)
         for (uint k = 0; k < W; k++) {
             float2 r = fInC0.Load(int3(k, y, 0));
-            float2 tw = fTwW[(k * x) % W];
+            float2 tw = fTwW[ti0];
+            ti0 = FadeTwNext(ti0, x, W);
             precise float tr = r.x * tw.x - r.y * tw.y;
             precise float ti = r.x * tw.y + r.y * tw.x;
             FadeKAdd(re, cre, tr); FadeKAdd(im, cim, ti);
@@ -565,7 +587,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {                               // r[y, x] = sum_ky Re(Z[ky, x] (cos + i sin)(2 pi ky y / H)) / (W H)
         for (uint k = 0; k < H; k++) {
             float2 z = fInC0.Load(int3(x, k, 0));
-            float2 tw = fTwH[(k * y) % H];
+            float2 tw = fTwH[ti0];
+            ti0 = FadeTwNext(ti0, y, H);
             precise float tr = z.x * tw.x - z.y * tw.y;
             FadeKAdd(re, cre, tr);
         }
@@ -868,5 +891,368 @@ void main(uint3 id : SV_DispatchThreadID) {
     bool take = (fHasHistory == 0u) || (fFlags[FADE_FLAG_ADVANCE] != 0u);
     if (fOp == 0u) selOut[id.xy] = take ? fIn0.Load(int3(id.xy, 0)) : fIn1.Load(int3(id.xy, 0));
     else selOut2[id.xy] = take ? fInC0.Load(int3(id.xy, 0)) : fInC1.Load(int3(id.xy, 0));
+}
+)";
+
+// =====================================================================================================================
+// The tiled kernels (DLC results/fald_fade_tiers_2026-10-20, zero-change: the same float operations in the same order per
+// output as the kernels they replace; only the data path changes — taps from groupshared memory, a window max / min by
+// doubling, the cone's iterations in one dispatch, an up-sampling or a pixel step folded into the pass beside it).
+// Each is compiled per radius class (TG_RMAX / TE_RMAX prepended by fald_fade.cpp: the groupshared line is sized to it).
+// =====================================================================================================================
+
+// The Gaussian tile (FadeGaussT, FadeGaussT4): TG_LINES lines across x TG_LEN outputs along the filter axis per group; the
+// line holds the TG_LEN + 2 r taps from a0 - r (replicate edges: FadeGauss's clamp of the tap index). Every thread sums
+// four CONSECUTIVE outputs of one line: s = x[c] w0; for j = 1..r: term = (x[c - j] + x[c + j]) w_j; Kahan (FadeGauss's
+// order), the four sharing their taps in registers (two groupshared reads per step instead of eight). The stride is
+// 1 mod 32 and a warp's two lane rows sit 16 words apart (FadeLanePerm): its 32 reads fall on 32 banks.
+// A tap: fFactor > 1 = the input up-sampled by fFactor (fIn0 at 1 / fFactor res, fC1 = 1 / fFactor; FadeUpAt = FadeUp's
+// value), else fIn0 itself; fOp bit 0 = clamp it into [0, 1e4] (GTap).
+inline const char* g_faldFadeTileFnSource = R"(
+#define TG_LEN 64
+#define TG_LINES 16
+#define TG_BASE (TG_LEN + 2 * TG_RMAX)
+#define TG_STRIDE (TG_BASE + ((33 - (TG_BASE & 31)) & 31))
+groupshared float gT[TG_LINES * TG_STRIDE];
+uint FadeLanePerm(uint y) { return ((y & 1u) << 2) | ((y >> 1) & 3u) | (y & 8u); }
+float GtTap(int x, int y) {
+    float v = (fFactor > 1u) ? FadeUpAt(fIn0, int2(x, y), fC1) : fIn0.Load(int3(x, y, 0));
+    if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
+    return v;
+}
+void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
+    const uint span = (uint)(TG_LEN + 2 * r);
+    for (uint i = t; i < TG_LINES * span; i += 256u) {
+        uint ln, k;
+        if (vert) { ln = i % TG_LINES; k = i / TG_LINES; }   // consecutive threads: consecutive x
+        else { k = i % span; ln = i / span; }
+        const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
+        const int gc = min(c0 + (int)ln, nC - 1);
+        gT[ln * TG_STRIDE + k] = vert ? GtTap(gc, ga) : GtTap(ga, gc);
+    }
+}
+void GtSweep(int base, int r, uint off, out float o0, out float o1, out float o2, out float o3) {
+    const float w0 = fGW[off];
+    const float x0 = gT[base], x1 = gT[base + 1], x2 = gT[base + 2], x3 = gT[base + 3];
+    precise float s0 = x0 * w0;
+    precise float s1 = x1 * w0;
+    precise float s2 = x2 * w0;
+    precise float s3 = x3 * w0;
+    precise float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+    float l0 = x0, l1 = x1, l2 = x2, q1 = x1, q2 = x2, q3 = x3;   // x[o_k - (j - 1)] / x[o_k + (j - 1)] of the next step
+    for (int j = 1; j <= r; j++) {
+        const float wj = fGW[off + (uint)j];
+        const float nl = gT[base - j], nr = gT[base + 3 + j];
+        precise float t0 = (nl + q1) * wj;
+        precise float t1 = (l0 + q2) * wj;
+        precise float t2 = (l1 + q3) * wj;
+        precise float t3 = (l2 + nr) * wj;
+        FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
+        l2 = l1; l1 = l0; l0 = nl;
+        q1 = q2; q2 = q3; q3 = nr;
+    }
+    o0 = s0; o1 = s1; o2 = s2; o3 = s3;
+}
+)";
+
+// ---- the separable Gaussian through the tile (replaces FadeGauss): one axis per dispatch (fDir 0 = vertical, 1 =
+// horizontal), fOp bit 1 = saturate the output, bits 4-6 = what the horizontal pass stores (the FadePix step that read
+// this Gaussian, done here on the same value): 0 the sum -> u0; 1 W: 1 - s -> u0; 2 CARE: smooth(0.3, 0.6, s) -> u0;
+// 3 ADDF: u1 fade in place, clamp(f + s (1 - f), 0, 1); 4 CONEAP: u1 fade in place, t25 w, clamp(f + w max(s - f, 0), 0, 1).
+// The outputs leave through groupshared memory, transposed: consecutive threads store consecutive x.
+inline const char* g_faldFadeGaussTSource = R"(
+RWTexture2D<float> gtOut : register(u0);
+RWTexture2D<float> gtIo : register(u1);
+void GtStore(int2 p, float s) {
+    const uint e = (fOp >> 4) & 7u;
+    if (e == 0u) {
+        gtOut[p] = s;
+    } else if (e == 1u) {
+        precise float w = 1.0f - s;
+        gtOut[p] = w;
+    } else if (e == 2u) {
+        gtOut[p] = FadeSmooth(FADE_CARE_LO, FADE_CARE_HI, s);
+    } else if (e == 3u) {
+        precise float f = gtIo[p];
+        precise float v = min(max(f + s * (1.0f - f), 0.0f), 1.0f);
+        gtIo[p] = v;
+    } else {
+        precise float f = gtIo[p];
+        precise float v = f + fIn1.Load(int3(p, 0)) * max(s - f, 0.0f);
+        gtIo[p] = min(max(v, 0.0f), 1.0f);
+    }
+}
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const bool vert = (fDir == 0u);
+    const int r = (int)fRadius;
+    const int nA = vert ? (int)fInH : (int)fInW;
+    const int nC = vert ? (int)fInW : (int)fInH;
+    const int a0 = (int)(vert ? gid.y : gid.x) * TG_LEN;
+    const int c0 = (int)(vert ? gid.x : gid.y) * TG_LINES;
+    const uint t = tid.y * 16u + tid.x;
+    GtFill(vert, a0, c0, r, nA, nC, t);
+    GroupMemoryBarrierWithGroupSync();
+    const uint lineIx = tid.x, lane = FadeLanePerm(tid.y);
+    float o0, o1, o2, o3;
+    GtSweep((int)(lineIx * TG_STRIDE) + r + 4 * (int)lane, r, fWOff, o0, o1, o2, o3);
+    if ((fOp & 2u) != 0u) { o0 = saturate(o0); o1 = saturate(o1); o2 = saturate(o2); o3 = saturate(o3); }
+    GroupMemoryBarrierWithGroupSync();   // every tap read: the tile takes the outputs
+    const uint tb = lineIx * 65u + 4u * lane;
+    gT[tb] = o0; gT[tb + 1u] = o1; gT[tb + 2u] = o2; gT[tb + 3u] = o3;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint e = t; e < (uint)(TG_LINES * TG_LEN); e += 256u) {
+        uint ln, a;
+        if (vert) { ln = e % TG_LINES; a = e / TG_LINES; }
+        else { a = e % TG_LEN; ln = e / TG_LEN; }
+        const int ga = a0 + (int)a, gc = c0 + (int)ln;
+        if (ga < nA && gc < nC) GtStore(vert ? int2(gc, ga) : int2(ga, gc), gT[ln * 65u + a]);
+    }
+}
+)";
+
+// ---- the vertical pass of the four Gaussians of lv (sigma 4, 24, 2, 6 -> u0..u3) from ONE tile (sized for the largest,
+// fRadius); per Gaussian (radius, weights offset) packed (r << 16 | off) in fWOff, fN, fPad0, fPad1. Each is FadeGaussT's
+// vertical pass of lv, value for value.
+inline const char* g_faldFadeGaussT4Source = R"(
+RWTexture2D<float> g4Out0 : register(u0);
+RWTexture2D<float> g4Out1 : register(u1);
+RWTexture2D<float> g4Out2 : register(u2);
+RWTexture2D<float> g4Out3 : register(u3);
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const int nA = (int)fInH, nC = (int)fInW;
+    const int a0 = (int)gid.y * TG_LEN, c0 = (int)gid.x * TG_LINES;
+    const int rmax = (int)fRadius;
+    const uint t = tid.y * 16u + tid.x;
+    GtFill(true, a0, c0, rmax, nA, nC, t);
+    GroupMemoryBarrierWithGroupSync();
+    const uint lineIx = tid.x, lane = FadeLanePerm(tid.y);
+    const int base = (int)(lineIx * TG_STRIDE) + rmax + 4 * (int)lane;
+    const int gx = c0 + (int)lineIx, gy = a0 + 4 * (int)lane;
+    const bool inX = gx < nC;
+    float o0, o1, o2, o3;
+    GtSweep(base, (int)(fWOff >> 16), fWOff & 0xFFFFu, o0, o1, o2, o3);
+    if (inX) {
+        if (gy < nA) g4Out0[uint2(gx, gy)] = o0;
+        if (gy + 1 < nA) g4Out0[uint2(gx, gy + 1)] = o1;
+        if (gy + 2 < nA) g4Out0[uint2(gx, gy + 2)] = o2;
+        if (gy + 3 < nA) g4Out0[uint2(gx, gy + 3)] = o3;
+    }
+    GtSweep(base, (int)(fN >> 16), fN & 0xFFFFu, o0, o1, o2, o3);
+    if (inX) {
+        if (gy < nA) g4Out1[uint2(gx, gy)] = o0;
+        if (gy + 1 < nA) g4Out1[uint2(gx, gy + 1)] = o1;
+        if (gy + 2 < nA) g4Out1[uint2(gx, gy + 2)] = o2;
+        if (gy + 3 < nA) g4Out1[uint2(gx, gy + 3)] = o3;
+    }
+    GtSweep(base, (int)(fPad0 >> 16), fPad0 & 0xFFFFu, o0, o1, o2, o3);
+    if (inX) {
+        if (gy < nA) g4Out2[uint2(gx, gy)] = o0;
+        if (gy + 1 < nA) g4Out2[uint2(gx, gy + 1)] = o1;
+        if (gy + 2 < nA) g4Out2[uint2(gx, gy + 2)] = o2;
+        if (gy + 3 < nA) g4Out2[uint2(gx, gy + 3)] = o3;
+    }
+    GtSweep(base, (int)(fPad1 >> 16), fPad1 & 0xFFFFu, o0, o1, o2, o3);
+    if (inX) {
+        if (gy < nA) g4Out3[uint2(gx, gy)] = o0;
+        if (gy + 1 < nA) g4Out3[uint2(gx, gy + 1)] = o1;
+        if (gy + 2 < nA) g4Out3[uint2(gx, gy + 2)] = o2;
+        if (gy + 3 < nA) g4Out3[uint2(gx, gy + 3)] = o3;
+    }
+}
+)";
+
+// ---- the hybrid fill's two sigma-32 sums in one pass (num = G32(raw ws) from t24, den = G32(ws) from t25 -> u0 / u1),
+// one axis per dispatch: 8 lines x 64 outputs per group (two 16-line tiles would not fit), every thread two consecutive
+// outputs of both maps (four Kahan chains, FadeGauss's order each). T2LanePerm puts a warp's four lane groups 8 words
+// apart (stride 1 mod 32: 32 banks).
+inline const char* g_faldFadeGaussT2Source = R"(
+RWTexture2D<float> g2Out0 : register(u0);
+RWTexture2D<float> g2Out1 : register(u1);
+#define T2_LEN 64
+#define T2_LINES 8
+#define T2_BASE (T2_LEN + 2 * TG_RMAX)
+#define T2_STRIDE (T2_BASE + ((33 - (T2_BASE & 31)) & 31))
+groupshared float gA2[T2_LINES * T2_STRIDE];
+groupshared float gB2[T2_LINES * T2_STRIDE];
+uint T2LanePerm(uint q) { return 4u * (q & 3u) + ((q >> 2) & 3u) + 16u * (q >> 4); }
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const bool vert = (fDir == 0u);
+    const int r = (int)fRadius;
+    const int nA = vert ? (int)fInH : (int)fInW;
+    const int nC = vert ? (int)fInW : (int)fInH;
+    const int a0 = (int)(vert ? gid.y : gid.x) * T2_LEN;
+    const int c0 = (int)(vert ? gid.x : gid.y) * T2_LINES;
+    const uint t = tid.y * 16u + tid.x;
+    const uint span = (uint)(T2_LEN + 2 * r);
+    for (uint i = t; i < T2_LINES * span; i += 256u) {
+        uint ln, k;
+        if (vert) { ln = i % T2_LINES; k = i / T2_LINES; }
+        else { k = i % span; ln = i / span; }
+        const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
+        const int gc = min(c0 + (int)ln, nC - 1);
+        const int3 q = vert ? int3(gc, ga, 0) : int3(ga, gc, 0);
+        gA2[ln * T2_STRIDE + k] = fIn0.Load(q);
+        gB2[ln * T2_STRIDE + k] = fIn1.Load(q);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint lineIx = t % T2_LINES, lane = T2LanePerm(t / T2_LINES);
+    const int base = (int)(lineIx * T2_STRIDE) + r + 2 * (int)lane;
+    const float w0 = fGW[fWOff];
+    const float a0v = gA2[base], a1v = gA2[base + 1], b0v = gB2[base], b1v = gB2[base + 1];
+    precise float sa0 = a0v * w0;
+    precise float sa1 = a1v * w0;
+    precise float sb0 = b0v * w0;
+    precise float sb1 = b1v * w0;
+    precise float ka0 = 0.0f, ka1 = 0.0f, kb0 = 0.0f, kb1 = 0.0f;
+    float la = a0v, ra = a1v, lb = b0v, rb = b1v;   // x[o1 - (j - 1)] / x[o0 + (j - 1)] of the next step
+    for (int j = 1; j <= r; j++) {
+        const float wj = fGW[fWOff + (uint)j];
+        const float nla = gA2[base - j], nra = gA2[base + 1 + j];
+        const float nlb = gB2[base - j], nrb = gB2[base + 1 + j];
+        precise float ta0 = (nla + ra) * wj;
+        precise float ta1 = (la + nra) * wj;
+        precise float tb0 = (nlb + rb) * wj;
+        precise float tb1 = (lb + nrb) * wj;
+        FadeKAdd(sa0, ka0, ta0); FadeKAdd(sa1, ka1, ta1); FadeKAdd(sb0, kb0, tb0); FadeKAdd(sb1, kb1, tb1);
+        la = nla; ra = nra; lb = nlb; rb = nrb;
+    }
+    GroupMemoryBarrierWithGroupSync();   // every tap read: the tiles take the outputs
+    const uint tb = lineIx * 65u + 2u * lane;
+    gA2[tb] = sa0; gA2[tb + 1u] = sa1; gB2[tb] = sb0; gB2[tb + 1u] = sb1;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint e = t; e < (uint)(T2_LINES * T2_LEN); e += 256u) {
+        uint ln, a;
+        if (vert) { ln = e % T2_LINES; a = e / T2_LINES; }
+        else { a = e % T2_LEN; ln = e / T2_LEN; }
+        const int ga = a0 + (int)a, gc = c0 + (int)ln;
+        if (ga >= nA || gc >= nC) continue;
+        const uint2 p = vert ? uint2(gc, ga) : uint2(ga, gc);
+        g2Out0[p] = gA2[ln * 65u + a];
+        g2Out1[p] = gB2[ln * 65u + a];
+    }
+}
+)";
+
+// ---- the separable max (fOp 0) / min (fOp 1) of window 2r + 1 along one axis (replicate edges) by doubling (replaces
+// FadeExt): the tile as the Gaussian's (16 lines x 64 outputs), M_1 = x, M_2P[k] = ext(M_P[k], M_P[k + P]), out[o] =
+// ext(M_P[o], M_P[o + n - P]) for P = the largest power of two <= n = 2r + 1. max / min are exact and order-free (a NaN
+// operand yields the other one either way), so every output equals FadeExt's scan (zc_proofs.json P1 / P2).
+inline const char* g_faldFadeExtTSource = R"(
+RWTexture2D<float> etOut : register(u0);
+#define TE_LEN 64
+#define TE_LINES 16
+#define TE_BASE (TE_LEN + 2 * TE_RMAX)
+#define TE_STRIDE (TE_BASE + ((33 - (TE_BASE & 31)) & 31))
+groupshared float gEa[TE_LINES * TE_STRIDE];
+groupshared float gEb[TE_LINES * TE_STRIDE];
+float FadeExOp(float a, float b) { return (fOp == 0u) ? max(a, b) : min(a, b); }
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const bool vert = (fDir == 0u);
+    const int r = (int)fRadius;
+    const int nA = vert ? (int)fInH : (int)fInW;
+    const int nC = vert ? (int)fInW : (int)fInH;
+    const int a0 = (int)(vert ? gid.y : gid.x) * TE_LEN;
+    const int c0 = (int)(vert ? gid.x : gid.y) * TE_LINES;
+    const uint t = tid.y * 16u + tid.x;
+    const uint span = (uint)(TE_LEN + 2 * r);
+    for (uint i = t; i < TE_LINES * span; i += 256u) {
+        uint ln, k;
+        if (vert) { ln = i % TE_LINES; k = i / TE_LINES; }
+        else { k = i % span; ln = i / span; }
+        const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
+        const int gc = min(c0 + (int)ln, nC - 1);
+        gEa[ln * TE_STRIDE + k] = vert ? fIn0.Load(int3(gc, ga, 0)) : fIn0.Load(int3(ga, gc, 0));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint n = 2u * (uint)r + 1u;
+    uint P = 1u;
+    bool inA = true;
+    for (uint lv = 0u; lv < 8u; lv++) {   // 2^8 > the largest window (133): a fixed count, the doubling predicated
+        if (2u * P <= n) {
+            for (uint i = t; i < TE_LINES * span; i += 256u) {
+                const uint ln = i / span, k = i % span, q = ln * TE_STRIDE + k;
+                if (inA) gEb[q] = (k + P < span) ? FadeExOp(gEa[q], gEa[q + P]) : gEa[q];
+                else gEa[q] = (k + P < span) ? FadeExOp(gEb[q], gEb[q + P]) : gEb[q];
+            }
+            inA = !inA;
+            P *= 2u;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    for (uint e = t; e < (uint)(TE_LINES * TE_LEN); e += 256u) {
+        uint ln, a;
+        if (vert) { ln = e % TE_LINES; a = e / TE_LINES; }
+        else { a = e % TE_LEN; ln = e / TE_LEN; }
+        const int ga = a0 + (int)a, gc = c0 + (int)ln;
+        if (ga >= nA || gc >= nC) continue;
+        const uint q = ln * TE_STRIDE + a;
+        const float m = inA ? FadeExOp(gEa[q], gEa[q + n - P]) : FadeExOp(gEb[q], gEb[q + n - P]);
+        etOut[vert ? uint2(gc, ga) : uint2(ga, gc)] = m;
+    }
+}
+)";
+
+// ---- the cone / the reach (fN <= 8 iterations per dispatch; replaces each iteration's FadeExt r 1 vertical + horizontal
+// + FadePix CONE / CONEF): c <- max(c, maxf3(c) - dec), maxf3 = the vertical max(max(c[y-1], c[y]), c[y+1]) then the
+// horizontal one on it, every neighbour index clamped to the FRAME (the replicate border). A group = 32 x 32 outputs and
+// a halo of 8 (each iteration spoils one more ring of the halo, never the 32 x 32 inside). t24 the state in, u0 the state
+// out (in place is impossible across tiles); fOp 0: dec = fC0 (the cone), 1: dec = the map t25 (the reach).
+inline const char* g_faldFadeConeTSource = R"(
+RWTexture2D<float> ctOut : register(u0);
+#define TC_OUT 32
+#define TC_HALO 8
+#define TC_T (TC_OUT + 2 * TC_HALO)
+groupshared float gCc[TC_T * TC_T];
+groupshared float gCv[TC_T * TC_T];
+groupshared float gCd[TC_T * TC_T];
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const int W = (int)fInW, H = (int)fInH, N = (int)fN;
+    const int x0 = (int)gid.x * TC_OUT - TC_HALO, y0 = (int)gid.y * TC_OUT - TC_HALO;
+    const uint t = tid.y * 16u + tid.x;
+    const int lxMin = max(0, -x0), lyMin = max(0, -y0);
+    const int lxMax = min(TC_T - 1, W - 1 - x0), lyMax = min(TC_T - 1, H - 1 - y0);
+    for (uint i = t; i < (uint)(TC_T * TC_T); i += 256u) {
+        const int lx = (int)(i % (uint)TC_T), ly = (int)(i / (uint)TC_T);
+        const int gx = clamp(x0 + lx, 0, W - 1), gy = clamp(y0 + ly, 0, H - 1);
+        gCc[i] = fIn0.Load(int3(gx, gy, 0));
+        gCd[i] = (fOp == 0u) ? fC0 : fIn1.Load(int3(gx, gy, 0));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (int it = 0; it < 8; it++) {   // a fixed count, predicated (the barriers stay in uniform flow)
+        if (it < N) {
+            for (uint i = t; i < (uint)(TC_T * TC_T); i += 256u) {
+                const int lx = (int)(i % (uint)TC_T), ly = (int)(i / (uint)TC_T);
+                const int ym = max(ly - 1, lyMin), yp = min(ly + 1, lyMax);
+                float m = gCc[ym * TC_T + lx];
+                m = max(m, gCc[ly * TC_T + lx]);
+                m = max(m, gCc[yp * TC_T + lx]);
+                gCv[i] = m;
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (it < N) {
+            for (uint i = t; i < (uint)(TC_T * TC_T); i += 256u) {
+                const int lx = (int)(i % (uint)TC_T), ly = (int)(i / (uint)TC_T);
+                const int xm = max(lx - 1, lxMin), xp = min(lx + 1, lxMax);
+                float m = gCv[ly * TC_T + xm];
+                m = max(m, gCv[ly * TC_T + lx]);
+                m = max(m, gCv[ly * TC_T + xp]);
+                precise float mf = m - gCd[i];
+                gCc[i] = max(gCc[i], mf);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    for (int dy = 0; dy < TC_OUT; dy += 16)
+        for (int dx = 0; dx < TC_OUT; dx += 16) {
+            const int lx = TC_HALO + (int)tid.x + dx, ly = TC_HALO + (int)tid.y + dy;
+            const int gx = x0 + lx, gy = y0 + ly;
+            if (gx < W && gy < H) ctOut[uint2(gx, gy)] = gCc[ly * TC_T + lx];
+        }
 }
 )";

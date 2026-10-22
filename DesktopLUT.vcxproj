@@ -116,6 +116,8 @@
     <ClCompile Include="shared\fald_panel_live.cpp" />
     <ClCompile Include="shared\fald_temporal.cpp" />
     <ClCompile Include="shared\fald_fade.cpp" />
+    <ClCompile Include="shared\fald_fade_governor.cpp" />
+    <ClCompile Include="src\fald_fade_status.cpp" />
     <ClCompile Include="src\fald.cpp" />
     <ClCompile Include="src\ui\ui_theme.cpp" />
     <ClCompile Include="src\actions\notify.cpp" />
@@ -166,6 +168,8 @@
     <ClInclude Include="shared\fald_panel_live.h" />
     <ClInclude Include="shared\fald_temporal.h" />
     <ClInclude Include="shared\fald_fade.h" />
+    <ClInclude Include="shared\fald_fade_governor.h" />
+    <ClInclude Include="src\fald_fade_status.h" />
     <ClInclude Include="shared\fald_fade_shader.h" />
     <ClInclude Include="shared\fald_fade_bytecode.h" />
     <ClInclude Include="shared\fald_exempt.h" />

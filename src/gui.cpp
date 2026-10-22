@@ -3,6 +3,7 @@
 
 #include "gui.h"
 #include "fald.h"
+#include "fald_fade_status.h"   // FaldFadeGovPollHookEvents
 #include "gui_shared.h"
 #include "gui_mhc.h"
 #include "mhc_preview.h"
@@ -2809,6 +2810,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 } else if (g_dwmHookReinjectCount == 0) {
                     s_dwmHookHealthyStreak = 0;
                 }
+                // The flank fade governor's status changes the DLL reported (shared/fald_fade_governor.h): Events lines
+                FaldFadeGovPollHookEvents();
                 // Live FALD panel deliveries: the hook's verdicts (and the no-answer timeout, counted on these ticks),
                 // then the files it was given, re-exported in place, polled on a worker thread (the overlay path
                 // polls its file stamp the same way). A fallback re-injection here ends this tick's work.

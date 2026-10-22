@@ -66,6 +66,12 @@ void UpdateDwmHookSharedConfig();
 // Close shared memory mapping. Called on uninject/stop.
 void CloseDwmHookSharedMemory();
 
+// The flank fade governor's status the resident DLL reports (dwm_hook_config.h DwmHookFaldStatus): a consistent copy of
+// the block (false = none: no section, no DLL wrote, or a write kept overlapping the copy). Any thread, no lock.
+bool ReadDwmHookFaldStatus(DwmHookFaldStatus& out);
+// Empties the block (the injection does it before a DLL attaches). GUI thread.
+void ResetDwmHookFaldStatus();
+
 // --- Live edit preview through the hook (DwmHookMhcPreview; src/mhc_preview.h) ---
 // Writes the preview block for monitor `monitorIndex` (its desktop position is the key) and publishes its generation in
 // the config; the DLL applies it from its next present. Returns the generation (0 = not written: no shared memory, or

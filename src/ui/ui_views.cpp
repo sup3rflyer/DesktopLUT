@@ -771,11 +771,29 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
 
     // The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h); both modes at once like LED LAG. Default off.
     row = BeginRow("FLANK FADE");
-    RowTip(row, "Experimental. Fades the correction on smooth steep edges, along the motion.");
+    RowTip(row, "Experimental. Fades the correction on smooth steep edges, along the motion.\n"
+                "Paused while the GPU cannot run it in time (15 % of the content frame interval).");
     RowPlace(row);
     bool fade = false;
     if (OnOff("##fald_flank_fade", f.flankFade, &fade))
         shared([fade](FaldSettings& s) { bool c = s.flankFade != fade; s.flankFade = fade; return c; });
+    {   // the safety governor (shared/fald_fade_governor.h): drawn after the switch on the same row (no layout shift)
+        const FaldFadeGovReport& g = r.fadeGov[hdr ? 1 : 0];
+        if (f.flankFade && g.known) {
+            const std::wstring tip = FaldFadeGovExplain(g);
+            if (g.state == FaldFadeGovState::SuspendedBudget) {
+                RowNext(row);   // past the switch; each RowText then advances by itself
+                RowText(row, "PAUSED", pal::Alarm, Font::Label, kSizeLabel, tip);
+                RowText(row, Fmt("%.1f", g.p90Ms) + " / " + Fmt("%.1f", g.budgetMs) + " ms", pal::Alarm, Font::Mono, kSizeMono, tip);
+            } else if (g.state == FaldFadeGovState::SuspendedWeakGpu) {
+                RowNext(row);
+                RowText(row, "PAUSED: WEAK GPU", pal::Alarm, Font::Label, kSizeLabel, tip);
+            } else if (g.state == FaldFadeGovState::Forced) {
+                RowNext(row);
+                RowText(row, "FORCED", pal::InkDim, Font::Label, kSizeLabel, tip);
+            }
+        }
+    }
     EndRow(row);
 
     // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields the classic rows have; the rest
