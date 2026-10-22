@@ -759,6 +759,24 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
         shared([ped](FaldSettings& s) { unsigned v = ped ? 1u : 0u; bool c = s.pedMode != v; s.pedMode = v; return c; });
     EndRow(row);
 
+    {   // the core layer's rate-cap governor (shared/fald_core_governor.h): its GPU time per full run against the budget
+        const FaldCoreGovReport& g = r.coreGov[hdr ? 1 : 0];
+        row = BeginRow("GPU");
+        RowTip(row, "The layer's GPU time per full run (p90) against its budget, 15 % of the refresh interval.\n"
+                    "Over budget the full run is rate-capped: the presents between keep the last fields and run only the pixel pass.");
+        RowPlace(row);
+        if (g.known && g.state != FaldCoreGovState::Off) {
+            const std::wstring tip = FaldCoreGovExplain(g);
+            const bool capped = g.state == FaldCoreGovState::Capped;
+            RowText(row, Fmt("%.2f", g.p90Ms) + " / " + Fmt("%.2f", g.budgetMs) + " ms", capped ? pal::Alarm : pal::Ink, Font::Mono, kSizeMono, tip);
+            if (capped) RowText(row, "CAPPED: A FULL RUN EVERY " + Fmt("%.0f", g.spacingMs) + " MS", pal::Alarm, Font::Label, kSizeLabel, tip);
+            else if (g.state == FaldCoreGovState::Forced) RowText(row, "FORCED", pal::InkDim, Font::Label, kSizeLabel, tip);
+        } else {
+            RowText(row, "--", pal::InkFaint, Font::Mono, kSizeMono, L"No run yet.");
+        }
+        EndRow(row);
+    }
+
     row = BeginRow("LED LAG");
     RowTip(row, "Experimental. The LEDs' lag behind the picture: a first-order filter (the LEDs and the panel's "
                 "estimate, or the LEDs only), or the panel clock.");

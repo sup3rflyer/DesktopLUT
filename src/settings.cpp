@@ -1255,6 +1255,8 @@ bool LoadSettings() {
     // The flank fade's safety governor forced on (fald.h g_faldFadeForce; REFERENCE.md): an INI-only key, read, never
     // written (absent = 0 = the governor decides)
     g_faldFadeForce.store(GetPrivateProfileBool(L"General", L"FaldFlankFadeForce", false, iniPath.c_str()));
+    // The core layer's rate-cap governor forced off (fald.h g_faldCoreForce; REFERENCE.md): the same kind of key
+    g_faldCoreForce.store(GetPrivateProfileBool(L"General", L"FaldCoreForce", false, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
     g_showFrameTiming.store(GetPrivateProfileBool(L"General", L"ShowFrameTiming", false, iniPath.c_str()));

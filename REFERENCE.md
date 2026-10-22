@@ -36,6 +36,9 @@ ShowFrameTiming=0
 ; 1 = the FALD flank fade's GPU safety governor never pauses it: on an integrated / small GPU and over its
 ; budget alike (it may then stall the desktop on every content frame). Read at start, never written; absent = 0.
 FaldFlankFadeForce=0
+; 1 = the FALD layer's GPU rate cap never holds a run: the full correction on every present whatever it costs (on a
+; weak GPU that stalls the desktop). Read at start, never written; absent = 0.
+FaldCoreForce=0
 ; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis)
 DwmHookMode=1
 ; Auto-disable desktop gamma when these apps run
@@ -526,6 +529,19 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   forced / unknown; `p90_ms`, `budget_ms`, `content_ms`, `refresh_ms`; `forced`). In hook mode the DLL reports it
   through the section `Global\DesktopLUT_DwmHook_FaldStatus` (`shared/dwm_hook_config.h DwmHookFaldStatus`; the force
   key travels as faldFlags bit 10).
+- **The layer's GPU rate cap** (`shared/fald_core_governor.h`, overlay and hook alike): the GPU time of the layer's full
+  run (the zone statistics, both convolutions, the gains, the pixel pass — not the flank fade) is measured on every full
+  run with timestamp queries read a few runs later. Budget = 15 % of the refresh interval. When the p90 over the last
+  120 full runs (30 at least) is over the budget, or three full runs in a row each take longer than a whole refresh
+  interval, the full run is **rate-capped**: it happens at most every p90 / 15 % of wall time (never less than a refresh
+  interval, never more than a second), and the presents between keep the last run's fields and run only the pixel pass
+  — the picture stays corrected, the dimming follows with that delay. Small changes still take the change-driven path
+  on every present. Released when the capped full runs fit with 25 % headroom, on a mode change, or when the layer is
+  switched off and on. `FaldCoreForce=1` in `[General]` (above) disables the cap. The FALD panel's `GPU` row shows
+  the p90 / budget and `CAPPED` with the spacing (tooltip: why), an Events line records each change, and `state.get`
+  reports `fald_core_governor` per monitor and mode (`state`: off / running / capped / forced / unknown; `p90_ms`,
+  `budget_ms`, `refresh_ms`, `spacing_ms`, `content_ms`; `forced`). In hook mode the DLL reports it through the same
+  section as the fade's (`DwmHookFaldStatus::core`; the force key travels as faldFlags bit 11).
 
 ### In the DWM hook
 

@@ -1367,6 +1367,7 @@ void ResetDwmHookFaldStatus() {
     InterlockedExchange((volatile LONG*)&b->version, v | 1);
     b->magic = 0; b->dwmPid = 0;
     for (DwmHookFaldFadeStatusEntry& e : b->entry) e = DwmHookFaldFadeStatusEntry{};
+    for (DwmHookFaldCoreStatusEntry& e : b->core) e = DwmHookFaldCoreStatusEntry{};
     InterlockedExchange((volatile LONG*)&b->version, (v | 1) + 1);
 }
 
@@ -1534,7 +1535,8 @@ void UpdateDwmHookSharedConfig()
                                                            static_cast<int>(fs.pedMode),
                                                            fs.star.enabled ? 1 : 0,
                                                            fs.flankFade ? 1 : 0,    // bit 8; bit 9 (L) never set
-                                                           g_faldFadeForce.load() ? 1 : 0);   // bit 10: the governor forced
+                                                           g_faldFadeForce.load() ? 1 : 0,    // bit 10: the governor forced
+                                                           g_faldCoreForce.load() ? 1 : 0);   // bit 11: the core's rate cap forced off
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];

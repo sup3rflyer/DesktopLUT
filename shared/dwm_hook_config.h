@@ -137,14 +137,15 @@ static_assert(MAX_DWM_HOOK_MONITORS <= 32, "lutOffMask holds one bit per monitor
 #define DWM_HOOK_FALD_LOWEXT_BIT    0x00000200u   // bit 9: item L (reserved)
 
 static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int fade = 0,
-                                       int fadeForce = 0) {
+                                       int fadeForce = 0, int coreForce = 0) {
     if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
     return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
          | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
          | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u)
          | (star ? DWM_HOOK_FALD_STAR_BIT : 0u)
          | (fade ? DWM_HOOK_FALD_FADE_BIT : 0u)
-         | (fadeForce ? 0x00000400u : 0u);   // DWM_HOOK_FALD_FADE_FORCE_BIT (below)
+         | (fadeForce ? 0x00000400u : 0u)    // DWM_HOOK_FALD_FADE_FORCE_BIT (below)
+         | (coreForce ? 0x00000800u : 0u);   // DWM_HOOK_FALD_CORE_FORCE_BIT (below)
 }
 static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
 static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
@@ -155,6 +156,10 @@ static inline int      DwmHookFaldFade(uint32_t w)     { return (w & DWM_HOOK_FA
 // suspended, whatever the adapter or the cost. Bit 10; a host that predates it sends 0 (the governor decides).
 #define DWM_HOOK_FALD_FADE_FORCE_BIT 0x00000400u
 static inline int      DwmHookFaldFadeForce(uint32_t w) { return (w & DWM_HOOK_FALD_FADE_FORCE_BIT) != 0; }
+// The core layer's rate-cap governor (shared/fald_core_governor.h) forced off: INI [General] FaldCoreForce=1 — the full
+// path on every present whatever it costs. Bit 11; a host that predates it sends 0 (the governor decides).
+#define DWM_HOOK_FALD_CORE_FORCE_BIT 0x00000800u
+static inline int      DwmHookFaldCoreForce(uint32_t w) { return (w & DWM_HOOK_FALD_CORE_FORCE_BIT) != 0; }
 
 // ---------------------------------------------------------------------------
 // The flank fade governor's status, DLL -> host
@@ -182,16 +187,31 @@ struct DwmHookFaldFadeStatusEntry {
     uint32_t used;                   // 1 = this slot holds an entry
     uint32_t _reserved[2];
 };
+// The core layer's rate-cap governor (shared/fald_core_governor.h), per entry as the fade's: appended after the fade
+// entries (a DLL that predates it never writes them: used 0 = no status known).
+struct DwmHookFaldCoreStatusEntry {
+    int32_t  left, top;              // the monitor (DwmHookMonitorConfig match key)
+    uint32_t isHdr;                  // the mode of the entry (1 HDR, 0 SDR under ACM)
+    uint32_t state;                  // FaldCoreGovState: 0 off, 1 running, 2 capped, 3 forced
+    float    p90Us, budgetUs;        // the window's p90 of the full path's GPU time / the budget (15 % of the refresh)
+    float    refreshMs, spacingMs;   // the refresh interval; capped: the wall time between full runs
+    float    contentMs;              // the content-frame interval (median; information)
+    uint32_t generation;             // the governor's: bumps on every state change
+    uint32_t used;                   // 1 = this slot holds an entry
+    uint32_t _reserved;
+};
 struct DwmHookFaldStatus {
     volatile uint32_t version;       // seqlock, written by the DLL (see above)
     uint32_t magic;                  // DWM_HOOK_FALD_STATUS_MAGIC once a DLL wrote
     uint32_t dwmPid;                 // the writer
     uint32_t _reserved;
     DwmHookFaldFadeStatusEntry entry[DWM_HOOK_FALD_STATUS_SLOTS];
+    DwmHookFaldCoreStatusEntry core[DWM_HOOK_FALD_STATUS_SLOTS];
 };
 #pragma pack(pop)
 static_assert(sizeof(DwmHookFaldFadeStatusEntry) == 48, "DwmHookFaldFadeStatusEntry layout");
-static_assert(sizeof(DwmHookFaldStatus) == 16 + 48 * DWM_HOOK_FALD_STATUS_SLOTS, "DwmHookFaldStatus layout");
+static_assert(sizeof(DwmHookFaldCoreStatusEntry) == 48, "DwmHookFaldCoreStatusEntry layout");
+static_assert(sizeof(DwmHookFaldStatus) == 16 + 96 * DWM_HOOK_FALD_STATUS_SLOTS, "DwmHookFaldStatus layout");
 
 // ---------------------------------------------------------------------------
 // Tuning tail — the starfield parameters (floats), appended AFTER DwmHookSharedConfig

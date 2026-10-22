@@ -47,6 +47,7 @@
 // goes through ZoneEdgeX / ZoneEdgeY / ZoneOfPixel (integer math, exact on every device); an integer pitch gives
 // exactly the whole-pixel formulas (c * cellW, lx / cellW). The fine grid and the kernel tables are in CELL units.
 #pragma once
+#include <cmath>   // FaldGainBlurFused (ceilf) for every includer
 
 inline const char* g_faldCommonSource = R"(
 cbuffer FaldCB : register(b0) {

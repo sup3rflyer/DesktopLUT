@@ -136,6 +136,7 @@ void TakeSnapshot(Snapshot& out) {
         }
         // the flank fade governor's status per mode (the overlay's table, or the hook's section by position)
         for (int h = 0; h < 2; h++) FaldFadeGovReportFor(r.liveIndex, r.hmon, h == 1, r.fadeGov[h]);
+        for (int h = 0; h < 2; h++) FaldCoreGovReportFor(r.liveIndex, r.hmon, h == 1, r.coreGov[h]);
     }
 
     // DLC records for every display, live and remembered.

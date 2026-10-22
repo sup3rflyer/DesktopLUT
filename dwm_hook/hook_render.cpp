@@ -1297,7 +1297,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags),
 					DwmHookFaldStar(fp->flags) != 0,
 					fp->hasTuning ? &fp->tuning : NULL, DwmHookFaldFade(fp->flags) != 0, monW, monH,
-					DwmHookFaldFadeForce(fp->flags) != 0);
+					DwmHookFaldFadeForce(fp->flags) != 0, DwmHookFaldCoreForce(fp->flags) != 0);
 			}
 			// Feed this present's dirty rects into the layer's clean source. Until a full-frame
 			// composition has primed it, the layer stays off and this present takes the ordinary

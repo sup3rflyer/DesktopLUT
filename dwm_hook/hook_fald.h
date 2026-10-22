@@ -128,9 +128,11 @@ bool HookRequestFullRecompose();
 // frame with it and drawn again with the view off.
 // fadeForce: the fade's safety governor never suspends it (faldFlags bit 10, INI [General] FaldFlankFadeForce;
 // shared/fald_fade_governor.h).
+// coreForce: the core layer's rate-cap governor never caps the full path (faldFlags bit 11, INI [General] FaldCoreForce;
+// shared/fald_core_governor.h).
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
                          const DwmHookFaldTuning* tuning, bool fade = false, unsigned int monW = 0, unsigned int monH = 0,
-                         bool fadeForce = false);
+                         bool fadeForce = false, bool coreForce = false);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing
@@ -172,4 +174,7 @@ bool FaldTestFadeOn(const FaldMonitor* m);
 ID3D11Buffer* FaldTestCB(FaldMonitor* m);
 // The entry's governor state (shared/fald_fade_governor.h FaldFadeGovState as a number).
 unsigned int FaldTestFadeGovState(const FaldMonitor* m);
+// The entry's core governor state (shared/fald_core_governor.h FaldCoreGovState as a number) and its held runs.
+unsigned int FaldTestCoreGovState(const FaldMonitor* m);
+unsigned long long FaldTestHeldRuns(const FaldMonitor* m);
 #endif

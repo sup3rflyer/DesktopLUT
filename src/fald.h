@@ -22,6 +22,7 @@
 #include "../shared/fald_panel.h"
 #include "../shared/fald_exempt.h"   // FaldExemptRect: DesktopLUT's own windows, exempt from the FALD views
 #include "../shared/fald_fade_governor.h"   // the flank fade's safety governor (FaldResources::fadeGov)
+#include "../shared/fald_core_governor.h"   // the core layer's rate-cap governor (FaldResources::coreGov)
 #include "../shared/fald_change.h"          // the change-driven path: touched zones, the rules, the argument slots
 
 struct MonitorContext;
@@ -132,6 +133,9 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Buffer* argsBuf = nullptr; ID3D11UnorderedAccessView* argsUAV = nullptr;   // FALD_ARGS_BYTES, raw, indirect
     uint32_t runMode = 0;                  // CB word 79 of the next FillCB (fald_shader.h runMode)
     bool stateComplete = false;            // the previous run left every texture of a complete run (FaldChangeInputs)
+    bool fieldsStand = false;              // a full or partial run's textures stand for this panel / size: a held run (the
+                                           // rate-cap governor's) corrects the new frame with them; false after a build, idle
+    unsigned long long heldRuns = 0;       // the runs that kept the fields (the governor's cap; the log, the tests)
     unsigned long long lastSettingsKey = 0, lastFrameKey = 0;   // of the previous run
     bool lastPartial = false;              // the previous run took the partial path (the dump, the tests)
     std::vector<uint32_t> touched;         // the touched-zone list of the current run
@@ -177,6 +181,12 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     bool fadeGovConfigured = false;
     bool fadeGovWeak = false;                // the device's adapter is weak for the fade (FaldFadeWeakAdapter)
     uint32_t fadeGovPublishedGen = 0xFFFFFFFFu;
+    // The core layer's rate-cap governor (shared/fald_core_governor.h): the full path's GPU time per run (coreTiming:
+    // timestamp queries read a few runs later) against 15 % of the refresh interval; capped = the full path every
+    // `spacing`, held runs (the pixel pass on the standing fields) in between. Published as the fade's (FaldCoreGovPublish).
+    FaldCoreGovernor coreGov;
+    FaldCoreTiming coreTiming;
+    uint32_t coreGovPublishedGen = 0xFFFFFFFFu;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
     uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)
@@ -250,6 +260,10 @@ void FaldReleaseResources(MonitorContext* ctx);
 extern std::atomic<bool> g_faldFadeForce;
 // The governor's status per monitor and mode, for the interface and the pipe (src/fald_fade_status.h reads both paths).
 void FaldFadeGovPublish(int monitorIndex, bool hdr, const FaldFadeGovernorStatus& st);
+// The core layer's rate-cap governor, likewise: the INI force key ([General] FaldCoreForce=1: never capped) and the
+// status per monitor and mode (src/fald_core_status.h).
+extern std::atomic<bool> g_faldCoreForce;
+void FaldCoreGovPublish(int monitorIndex, bool hdr, const FaldCoreGovernorStatus& st);
 
 // Test seam (tests/test_fald_fade_hw.cpp FALD_HW_PROFILE_CORE=1): a hook called before and after every GPU command of
 // FaldRunPasses, so a harness can put timestamp queries around each pass. Null in production: one pointer test per pass.

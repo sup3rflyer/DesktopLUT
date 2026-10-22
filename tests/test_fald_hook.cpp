@@ -18,6 +18,7 @@
 #include "doctest.h"
 #include "../dwm_hook/hook_fald.h"
 #include "../shared/fald_fade.h"
+#include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride (the held-run case)
 
 #include <windows.h>
 #include <d3d11.h>
@@ -142,7 +143,7 @@ struct HookMonitor {
     // One present. newContent: DWM composed a new frame (one full-frame dirty rect); false = a present with no dirty rect.
     // Returns the run's state; out / fields are read only when asked.
     struct Result { bool ran = false, fadeOn = false, partial = false; uint32_t word75 = 0xFFFFFFFFu; FaldFade* fade = nullptr; std::string err;
-                    unsigned int govState = 0; };
+                    unsigned int govState = 0; unsigned int coreGovState = 0; unsigned long long heldRuns = 0; };
     bool forceFade = true;   // the governor forced on (false: it decides — on WARP that is "weak GPU": never on)
     bool fadeWanted = true;  // the flank fade setting (faldFlags bit 8)
     // rects: this present's dirty rects (the frame already edited inside them); null = a full-frame rect (new content) or none
@@ -187,6 +188,8 @@ struct HookMonitor {
 #ifdef FALD_RUN_HAS_FRAME_KEY
         r.ran = FaldRun(m, backRTV, newContent, 0x9E3779B97F4A7C15ull);   // hook_render.cpp's key for "no LUT pass"
         r.govState = FaldTestFadeGovState(m);
+        r.coreGovState = FaldTestCoreGovState(m);
+        r.heldRuns = FaldTestHeldRuns(m);
 #else
         r.ran = FaldRun(m, backRTV, newContent);
 #endif
@@ -570,5 +573,73 @@ TEST_CASE("FALD hook: a fade the governor holds back is C byte for byte (WARP; F
     CHECK(r.fadeOn);
     CHECK(r.word75 == 1u);
     CHECK(forced != C);
+}
+
+// The core governor's cap in the hook (shared/fald_core_governor.h): a held run keeps the entry's fields, reproduces the
+// full run's output on the same frame, corrects a new frame with the old fields, and leaves no residue — the full run
+// after it equals a fresh entry's full run on the same frames.
+TEST_CASE("FALD hook: a held run (the core governor's cap) keeps the fields and corrects the new frame with them (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cells = HookEnv("FALD_TEST_FADE_DIR");
+    if (cells.empty()) return;
+    const std::wstring ODD = std::wstring(cells.begin(), cells.end()) + L"\\odd_panel.bin";
+    const int saved = g_faldCoreHoldOverride;
+    auto present = [&](HookMonitor& hm) {
+        HookMonitor::Result r;
+        for (int i = 0; i < 3; i++) { r = hm.Present(true, false); if (r.ran || r.err != "unprimed") break; }
+        REQUIRE_MESSAGE(r.ran, r.err);
+        return r;
+    };
+    auto whitePatch = [](std::vector<unsigned char>& f) {   // a 200 x 200 white patch (FP16 1.0 = 0x3C00, little-endian)
+        for (int y = 100; y < 300; y++)
+            for (int x = 100; x < 300; x++)
+                for (int c = 0; c < 3; c++) { f[((size_t)y * 1366 + x) * 8 + c * 2] = 0x00; f[((size_t)y * 1366 + x) * 8 + c * 2 + 1] = 0x3C; }
+    };
+    std::vector<unsigned char> fullA, heldB, fullB, refB;
+    {
+        HookWarp w;
+        REQUIRE(w.ok);
+        Staged staged(ODD, true);
+        REQUIRE(staged.ok);
+        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+        HookMonitor hm(w, 1366, 768, true, false);
+        hm.fadeWanted = false;
+        REQUIRE(hm.Load(cells + "/x_odd1366.rgba16f"));
+        g_faldCoreHoldOverride = 0;
+        HookMonitor::Result r = present(hm);                   // full (primed)
+        CHECK(r.heldRuns == 0ull);
+        fullA = ReadBackTex(w.dev, w.ic, hm.back);
+        g_faldCoreHoldOverride = 1;
+        r = present(hm);                                       // held on the same frame: the same output
+        CHECK(r.heldRuns == 1ull);
+        CHECK(ReadBackTex(w.dev, w.ic, hm.back) == fullA);
+        whitePatch(hm.frame);
+        r = present(hm);                                       // held on the new frame: A's fields, B's picture
+        CHECK(r.heldRuns == 2ull);
+        heldB = ReadBackTex(w.dev, w.ic, hm.back);
+        CHECK(heldB != fullA);
+        g_faldCoreHoldOverride = 0;
+        r = present(hm);                                       // the full run after: B's fields
+        CHECK(r.heldRuns == 2ull);
+        CHECK(r.coreGovState == 1u);                           // Running (the seam held, not the governor)
+        fullB = ReadBackTex(w.dev, w.ic, hm.back);
+        CHECK(fullB != heldB);
+    }
+    {   // no residue: a fresh entry's full runs on A then B give the same B
+        HookWarp w;
+        REQUIRE(w.ok);
+        Staged staged(ODD, true);
+        REQUIRE(staged.ok);
+        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+        HookMonitor hm(w, 1366, 768, true, false);
+        hm.fadeWanted = false;
+        REQUIRE(hm.Load(cells + "/x_odd1366.rgba16f"));
+        present(hm);
+        whitePatch(hm.frame);
+        present(hm);
+        refB = ReadBackTex(w.dev, w.ic, hm.back);
+    }
+    REQUIRE(!fullB.empty());
+    CHECK(fullB == refB);
+    g_faldCoreHoldOverride = saved;
 }
 #endif

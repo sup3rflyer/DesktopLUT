@@ -129,6 +129,10 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
+    <ClCompile Include="..\shared\fald_core_governor.cpp">
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
+      <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="minhook\src\hook.c">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
@@ -156,6 +160,7 @@
     <ClInclude Include="..\shared\fald_temporal.h" />
     <ClInclude Include="..\shared\fald_fade.h" />
     <ClInclude Include="..\shared\fald_fade_governor.h" />
+    <ClInclude Include="..\shared\fald_core_governor.h" />
     <ClInclude Include="..\shared\fald_fade_shader.h" />
     <ClInclude Include="..\shared\fald_fade_bytecode.h" />
     <ClInclude Include="..\shared\fald_exempt.h" />

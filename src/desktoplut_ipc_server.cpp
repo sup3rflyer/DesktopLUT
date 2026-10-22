@@ -30,6 +30,7 @@
 #include "mhc.h"
 #include "fald.h"
 #include "fald_fade_status.h"   // the flank fade governor's report (state.get)
+#include "fald_core_status.h"   // the core layer's rate-cap governor's report (state.get)
 #include "displayconfig.h"
 #include "ipc_json.h"
 #include "ipc_grayscale.h"
@@ -542,6 +543,23 @@ void HandleStateGet(JsonValue& result) {
                     }
                     gj.set("forced", JBool(g_faldFadeForce.load()));            // INI [General] FaldFlankFadeForce
                     l.set("fald_flank_fade_governor", gj);
+                }
+                {   // the core layer's rate-cap governor (shared/fald_core_governor.h; the overlay's or the hook's report)
+                    JsonValue cj = JObj();
+                    FaldCoreGovReport cg;
+                    const HMONITOR hm2 = idx < g_gui.monitors.size() ? g_gui.monitors[idx] : nullptr;
+                    if (FaldCoreGovReportFor((int)idx, hm2, isHDR, cg)) {
+                        cj.set("state", JStr(FaldCoreGovStateName(cg.state)));
+                        cj.set("p90_ms", JNum(cg.p90Ms));
+                        cj.set("budget_ms", JNum(cg.budgetMs));
+                        cj.set("refresh_ms", JNum(cg.refreshMs));
+                        cj.set("spacing_ms", JNum(cg.spacingMs));
+                        cj.set("content_ms", JNum(cg.contentMs));
+                    } else {
+                        cj.set("state", JStr("unknown"));                         // not run yet / no report
+                    }
+                    cj.set("forced", JBool(g_faldCoreForce.load()));            // INI [General] FaldCoreForce
+                    l.set("fald_core_governor", cj);
                 }
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)

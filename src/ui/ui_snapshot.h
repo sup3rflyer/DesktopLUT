@@ -8,6 +8,7 @@
 #include "dlc/dlc_live.h"
 #include "actions/notify.h"
 #include "fald_fade_status.h"
+#include "fald_core_status.h"
 #include <windows.h>
 #include <memory>
 #include <string>
@@ -32,6 +33,7 @@ struct DisplayRow {
     bool reminderDue = false;       // for the mode the display is in
     bool dlcRun = false;            // the DLC run (Snapshot::run) measures this display
     FaldFadeGovReport fadeGov[2];   // the flank fade governor's status, 0 SDR, 1 HDR (src/fald_fade_status.h)
+    FaldCoreGovReport coreGov[2];   // the core layer's rate-cap governor's status, likewise (src/fald_core_status.h)
 };
 
 struct Snapshot {
