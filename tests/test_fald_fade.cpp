@@ -17,6 +17,8 @@
 #include "../shared/fald_fade.h"
 #include "../shared/fald_fade_shader.h"
 #include <d3dcompiler.h>
+#include <dxgi1_2.h>
+#pragma comment(lib, "dxgi.lib")
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -50,7 +52,29 @@ struct FadeWarp {
     bool ok = false;
     FadeWarp() {
         D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic))) return;
+        // FALD_TEST_FADE_ADAPTER = a substring of a hardware adapter's name: the same runs on that GPU instead of WARP (a
+        // diagnostic: two builds' fields compared on hardware)
+        char* want = nullptr; size_t wantN = 0;
+        IDXGIAdapter1* pick = nullptr;
+        if (_dupenv_s(&want, &wantN, "FALD_TEST_FADE_ADAPTER") == 0 && want && *want) {
+            IDXGIFactory1* fac = nullptr;
+            if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&fac))) {
+                for (UINT i = 0; !pick; i++) {
+                    IDXGIAdapter1* a = nullptr;
+                    if (fac->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
+                    DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d);
+                    char name[256] = {};
+                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name), nullptr, nullptr);
+                    if (std::strstr(name, want) && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) pick = a; else a->Release();
+                }
+                fac->Release();
+            }
+        }
+        if (want) free(want);
+        const HRESULT hr = pick ? D3D11CreateDevice(pick, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic)
+                                : D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic);
+        if (pick) pick->Release();
+        if (FAILED(hr)) return;
         g_device = dev; g_context = ic;
         ID3DBlob* b = nullptr;
         if (FAILED(D3DCompile(g_faldFullscreenVsSource, std::strlen(g_faldFullscreenVsSource), "vs", nullptr, nullptr, "main",
