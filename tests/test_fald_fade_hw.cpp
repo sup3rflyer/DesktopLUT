@@ -253,6 +253,7 @@ struct HwCase { std::string id; std::wstring panel; std::vector<std::string> fra
 
 TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content / no new content (FALD_HW_DIR + FALD_HW_OUT)") {
     const std::string dir = HwEnv("FALD_HW_DIR"), out = HwEnv("FALD_HW_OUT"), only = HwEnv("FALD_HW_ONLY");
+    const bool core2Mode = HwEnv("FALD_HW_CORE2") == "1";   // the always-on core round 2 prototype off / on instead of the fade
     if (dir.empty() || out.empty()) return;
     const int n = std::max(4, atoi(HwEnv("FALD_HW_N").empty() ? "30" : HwEnv("FALD_HW_N").c_str()));
     CreateDirectoryA(out.c_str(), nullptr);
@@ -304,6 +305,7 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 41.708f;   // a 23.976 Hz grid
             FaldSettings& fs = ctx.hdrColorCorrection.fald;
             fs.enabled = true; fs.paramsPath = hc.panel; fs.star.enabled = true; fs.flankFade = fade != 0;
+            if (core2Mode) { fs.flankFade = false; fs.core2 = fade != 0; }   // FALD_HW_CORE2=1: column `fade` = the core round 2
             REQUIRE(FaldEnsureResources(&ctx, fs));
             D3D11_TEXTURE2D_DESC td = {};
             td.Width = (UINT)hc.w; td.Height = (UINT)hc.h; td.MipLevels = 1; td.ArraySize = 1;
@@ -381,8 +383,8 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             // the paced build (shaders, their warm-up, resources): content frames until the fade is on; the run that turns it
             // on is the first content frame with the fade
             int warm = 0;
-            for (; warm < 400 && !stop && (fade ? !ctx.fald->fadeOn : warm < 4); warm++) run("build", warm, true);
-            if (fade) {
+            for (; warm < 400 && !stop && ((fade && !core2Mode) ? !ctx.fald->fadeOn : warm < 4); warm++) run("build", warm, true);
+            if (fade && !core2Mode) {
                 CHECK(ctx.fald->fadeOn);
                 MESSAGE(hc.id << ": the fade on after " << warm << " runs, " << (FaldFadeVramBytes(ctx.fald->fade) >> 20) << " MB");
             }

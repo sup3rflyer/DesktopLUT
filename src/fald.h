@@ -138,6 +138,10 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     // fadeKey = the settings the cached frame part was computed under (the frame the layer works on: starfield and its
     // parameters): a change re-forms the fade on the next run without a T step.
     struct FaldFade* fade = nullptr;
+    // The always-on core round 2 (PROTOTYPE, FaldSettings::core2; shared/fald_core2.h): its zone textures and IIR state exist
+    // only while the setting is on; core2On = this run applies it (b3 flags, t42 field, the round-0 statistics).
+    struct FaldCore2* core2 = nullptr;
+    bool core2On = false;
     bool fadeOn = false;
     bool fadeFailLogged = false;
     unsigned int fadeRetryCounter = 0;       // frames since the fade resources failed to create (retry every ~300)

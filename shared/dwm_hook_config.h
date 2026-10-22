@@ -155,6 +155,11 @@ static inline int      DwmHookFaldFade(uint32_t w)     { return (w & DWM_HOOK_FA
 // suspended, whatever the adapter or the cost. Bit 10; a host that predates it sends 0 (the governor decides).
 #define DWM_HOOK_FALD_FADE_FORCE_BIT 0x00000400u
 static inline int      DwmHookFaldFadeForce(uint32_t w) { return (w & DWM_HOOK_FALD_FADE_FORCE_BIT) != 0; }
+// The always-on core round 2 — PROTOTYPE (branch fald/principled, shared/fald_core2.h; FaldSettings::core2): bit 16, set by
+// DwmHookFaldPackCore2 on top of DwmHookFaldPack. A host that predates it sends 0 = off.
+#define DWM_HOOK_FALD_CORE2_BIT 0x00010000u
+static inline uint32_t DwmHookFaldPackCore2(uint32_t w, int core2) { return core2 ? (w | DWM_HOOK_FALD_CORE2_BIT) : w; }
+static inline int      DwmHookFaldCore2(uint32_t w) { return (w & DWM_HOOK_FALD_CORE2_BIT) != 0; }
 
 // ---------------------------------------------------------------------------
 // The flank fade governor's status, DLL -> host

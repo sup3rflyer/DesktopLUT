@@ -145,6 +145,7 @@ struct HookMonitor {
                     unsigned int govState = 0; };
     bool forceFade = true;   // the governor forced on (false: it decides — on WARP that is "weak GPU": never on)
     bool fadeWanted = true;  // the flank fade setting (faldFlags bit 8)
+    bool core2 = false;      // the always-on core round 2 prototype (faldFlags bit 16)
     Result Present(bool newContent, bool readCB) {
         Result r;
         if (newContent) w.ic->UpdateSubresource(back, 0, nullptr, frame.data(), W * 8u, 0);
@@ -152,7 +153,7 @@ struct HookMonitor {
         if (!m) { r.err = "FaldAcquire: no layer"; return r; }
 #ifdef FALD_RUN_HAS_FRAME_KEY
         // the governor forced on (faldFlags bit 10): WARP is a software adapter, which it would never start the fade on
-        FaldSetLiveSettings(m, 0, 0, star, nullptr, fadeWanted, 0, 0, forceFade);
+        FaldSetLiveSettings(m, 0, 0, star, nullptr, fadeWanted, 0, 0, forceFade, core2);
 #else
         FaldSetLiveSettings(m, 0, 0, star, nullptr, true);
 #endif
@@ -499,4 +500,49 @@ TEST_CASE("FALD hook: a fade the governor holds back is C byte for byte (WARP; F
     CHECK(r.word75 == 1u);
     CHECK(forced != C);
 }
+// The always-on core round 2 — PROTOTYPE (shared/fald_core2.h; faldFlags bit 16): the hook's layer with the core on equals
+// the overlay's, BYTE FOR BYTE, on the frames of DLC tests/test_fald_core2_warp.py (FALD_TEST_CORE2_DIR: panel.bin,
+// fNN.rgba16f and the overlay's dumps dNN/fald_out.rgba16f from tests/test_fald_core2.cpp's case, run first). Both advance the
+// zone IIR by one refresh per run (g_faldCore2TestRefreshes); the flank fade and the starfield are off.
+#include "../shared/fald_core2.h"
+TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overlay's, frame for frame (WARP; FALD_TEST_CORE2_DIR)") {
+    const std::string dir = HookEnv("FALD_TEST_CORE2_DIR");
+    if (dir.empty()) return;
+    std::ifstream probe(dir + "/d00/fald_out.rgba16f", std::ios::binary);
+    if (!probe) return;                                    // the overlay's case has not run on this directory
+    probe.close();
+    HookWarp w;
+    REQUIRE(w.ok);
+    REQUIRE(FaldCore2ShadersReady());
+    const std::wstring panel = std::wstring(dir.begin(), dir.end()) + L"\\panel.bin";
+    Staged staged(panel, true);
+    REQUIRE(staged.ok);
+    REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+    HookMonitor hm(w, 960, 540, true, false);
+    hm.fadeWanted = false;
+    hm.forceFade = false;
+    hm.core2 = true;
+    g_faldCore2TestRefreshes = 1;
+    int compared = 0;
+    for (int run = 0; run < 100; run++) {
+        char name[64];
+        snprintf(name, sizeof(name), "/f%02d.rgba16f", run);
+        if (!hm.Load(dir + name)) break;
+        HookMonitor::Result r;
+        for (int tries = 0; tries < 50; tries++) {          // unprimed presents do not run the layer (no IIR step)
+            r = hm.Present(true, false);
+            if (r.ran || r.err != "unprimed") break;
+        }
+        REQUIRE_MESSAGE(r.ran, r.err);
+        std::vector<unsigned char> ref;
+        snprintf(name, sizeof(name), "/d%02d/fald_out.rgba16f", run);
+        REQUIRE(ReadAll(dir + name, ref));
+        const std::vector<unsigned char> got = ReadBackTex(w.dev, w.ic, hm.back);
+        CHECK_MESSAGE(got == ref, "run " << run << ": the hook's output differs from the overlay's");
+        compared++;
+    }
+    g_faldCore2TestRefreshes = 0;
+    CHECK(compared > 0);
+}
+
 #endif

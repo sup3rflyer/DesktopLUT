@@ -15,6 +15,7 @@
 #include "fald_fade_governor.h"
 #include "fald_exempt.h"
 
+#include <cmath>
 #include <cstdarg>
 #include <cstring>
 #include <string>
@@ -57,6 +58,7 @@ static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_star
 // (the settle / content events are per monitor: FaldMonitor::settleEvt / contentEvt)
 static void CompileFeatureShaders();   // below FaldReleaseShaders
 static void FaldUnbindAll();          // with FaldRun
+#include "../shared/fald_core2.h"
 static void CoverReset(FaldMonitor* m);   // with FaldUpdateClean
 
 // GPU timing (timestamp queries, read back without flushing a few frames later — never a stall in
@@ -211,6 +213,8 @@ static void CompileFeatureShaders() {
     }
     LogF("FALD: starfield shaders %s, LED lag shaders %s",
          StarShadersReady() ? "compiled" : "UNAVAILABLE", (g_temporalCS && g_clockCS) ? "compiled" : "UNAVAILABLE");
+    std::string core2Err;                                          // the always-on core round 2 (prototype): optional
+    if (!FaldCore2InitShaders(g_dev, g_faldCommonSource, &core2Err)) LogF("FALD: core round 2 shaders UNAVAILABLE: %s", core2Err.c_str());
 }
 
 static bool g_fadeShadersFailed = false;   // the fade stack's passes could not be created (latched until released)
@@ -284,6 +288,7 @@ static bool WriteFadeStatus(int left, int top, bool isHdr, const FaldFadeGoverno
 
 void FaldReleaseShaders() {
     FaldFadeReleaseShaders();
+    FaldCore2ReleaseShaders();
     g_fadeShadersFailed = false;
     g_fadeWeakAdapter = -1;   // the next device is asked again
     ReleaseFeatureShaders();
@@ -532,7 +537,7 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 4248;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 4264;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
                                                          // 2026-10-20: + the fade stack's five fields; 2026-10-22: + the
@@ -643,6 +648,11 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     FaldFade* fade = nullptr;
     bool fadeWanted = false;
     bool fadeOn = false;
+    // The always-on core round 2 (PROTOTYPE, shared/fald_core2.h; faldFlags bit 16): its zone textures + IIR state (panel
+    // part: released with it, a swap rebuilds them); core2Wanted = the live setting; core2On = this run applies it.
+    FaldCore2* core2 = nullptr;
+    bool core2Wanted = false;
+    bool core2On = false;
     bool fadeFailed = false;
     unsigned long long fadeKey = 0;
     // The fade's safety governor (shared/fald_fade_governor.h): fadeGov = its state (moved with the frame part: a panel
@@ -663,7 +673,8 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 
 // Live-swap audit (SwapPanel / MoveFramePart). Every field of FaldMonitor is exactly one of:
 //   COPIED into the scratch entry before the build (identity + live settings): left, top, isHdr, width, height, format,
-//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs, fadeWanted, fadeForce, exemptMonW, exemptMonH;
+//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs, fadeWanted, fadeForce, exemptMonW, exemptMonH,
+//     core2Wanted (the core round 2 prototype's live setting);
 //   MOVED with the frame part (MoveFramePart): interTex / interRTV / interSRV, cleanTex / cleanSRV, primed, cover,
 //     coverCols, coverRows, coverLeft, offPresents, settleEvt, contentEvt, evtOpenTick, framesRun, lastRunUs, gpuSumUs,
 //     gpuStarSumUs, gpuMaxUs, gpuSamples, fade (its T state is then reset by SwapPanel: the switch acts as a cut),
@@ -672,7 +683,9 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 //   BUILT FRESH by the swap (BuildTables, defaults, or on demand later): params, valid, failed, panelSeq, failedSeq,
 //     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource, zoneSlices, cb, starOn,
 //     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, fadeOn, fadeFailed,
-//     fadeKey, and the whole FaldTemporalState base (the LED-lag bookkeeping).
+//     fadeKey, core2 / core2On (the core round 2 prototype: its zone textures + IIR state, released with the old panel
+//     part by ReleaseMonitor, rebuilt by ResolveFeatures — the swap acts as a cut), and the whole FaldTemporalState base
+//     (the LED-lag bookkeeping).
 // A field added to FaldMonitor changes its size and stops this assert: put it in one of the lists above (and in
 // MoveFramePart / SwapPanel unless it is panel-file state the swap must rebuild), then update the number.
 static_assert(sizeof(FaldMonitor) == FALD_MONITOR_AUDITED_BYTES,
@@ -794,6 +807,7 @@ static void ReleaseMonitor(FaldMonitor* m) {
     ReleaseTemporal(m);
     ReleaseStar(m);
     FaldFadeDestroy(m->fade); m->fade = nullptr; m->fadeOn = false; m->fadeKey = 0; m->fadeFailed = false;
+    FaldCore2Destroy(m->core2); m->core2 = nullptr; m->core2On = false;
     m->spareParams = FaldPanelParams{};
     m->primed = false;
     m->valid = false;
@@ -992,6 +1006,15 @@ static void ResolveFeatures(FaldMonitor* m) {
         if (m->fade) { FaldFadeDestroy(m->fade); m->fade = nullptr; }
         m->fadeOn = false; m->fadeFailed = false; m->fadeKey = 0;
     }
+    const bool wasCore2 = m->core2On;                             // the always-on core round 2 (prototype)
+    if (m->core2Wanted && FaldCore2ShadersReady()) {
+        if (!m->core2) m->core2 = FaldCore2Create();
+        m->core2On = FaldCore2Ensure(m->core2, g_dev, m->params.cols, m->params.rows);
+    } else if (m->core2 || m->core2On) {
+        FaldCore2Destroy(m->core2); m->core2 = nullptr; m->core2On = false;
+    }
+    if (m->core2On != wasCore2)
+        LogF("FALD: pos(%d,%d) %s core round 2 %s", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->core2On ? "ON" : "off");
     if (m->fadeOn != wasFade) {
         const FaldFadeGovernorStatus gs = m->fadeGov.Status();
         LogF("FALD: pos(%d,%d) %s flank fade %s (%llu MB; governor %s, p90 %.2f ms, budget %.2f ms, content %.1f ms)", m->left,
@@ -1156,7 +1179,7 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     n->width = m->width; n->height = m->height; n->format = m->format;
     n->debugMode = m->debugMode; n->pedMode = m->pedMode; n->starWanted = m->starWanted;
     n->tuning = m->tuning; n->tempSettings = m->tempSettings; n->refreshMs = m->refreshMs;
-    n->fadeWanted = m->fadeWanted; n->fadeForce = m->fadeForce;
+    n->fadeWanted = m->fadeWanted; n->fadeForce = m->fadeForce; n->core2Wanted = m->core2Wanted;
     n->exemptMonW = m->exemptMonW; n->exemptMonH = m->exemptMonH;
     bool built = false, moved = false;
     try {
@@ -1435,6 +1458,7 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
     if (!m->primed) {
         FaldTemporalIdle(m);   // the layer does not run this present (src FaldLayerIdle)
         FaldFadeReset(m->fade);   // ... and the fade stack's T state with it
+        FaldCore2Invalidate(m->core2);   // ... and the core's zone IIR
         RequestPrime();        // the host recomposes the screen; nothing else would on a static desktop
     }
     return m->primed;
@@ -1447,6 +1471,7 @@ static void MarkEntryStale(FaldMonitor* e) {
     CoverReset(e);
     FaldTemporalIdle(e);
     FaldFadeReset(e->fade);
+    FaldCore2Invalidate(e->core2);
     if (e->valid && ++e->offPresents > HOOK_FALD_RELEASE_AFTER) {
         ReleaseMonitor(e);   // valid = false, failed stays false: rebuilt on demand
         e->offPresents = 0;
@@ -1495,7 +1520,8 @@ void FaldMarkAllStale() {
 }
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning, bool fade, unsigned int monW, unsigned int monH, bool fadeForce) {
+                         const DwmHookFaldTuning* tuning, bool fade, unsigned int monW, unsigned int monH, bool fadeForce,
+                         bool core2) {
     if (!m) return;
     m->debugMode = debugMode;
     m->exemptMonW = monW;
@@ -1504,6 +1530,7 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
     m->starWanted = star;
     m->fadeWanted = fade;
     m->fadeForce = fadeForce;
+    m->core2Wanted = core2;
     m->tuning = tuning ? SanitizeTuning(*tuning) : DefaultTuning();
     // LED lag: from the tail (none = off). Bounded here too — the delay indexes a texture array.
     FaldTemporalSettings ts;
@@ -1589,14 +1616,21 @@ static void BindCommon(FaldMonitor* m, bool compute) {
         m->starOn ? m->starPlan2SRV : nullptr,         // t18: ln background, near, spk (Balance)
         nullptr                                        // t19: star pass S1 only (RunStar)
     };
+    // the always-on core round 2 (prototype): b3 + its field (t42); off = b3 unbound (reads 0: CoreGain = identity)
+    ID3D11Buffer* coreCB = m->core2On ? FaldCore2CB(m->core2) : nullptr;
+    ID3D11ShaderResourceView* coreField = m->core2On ? FaldCore2FieldSRV(m->core2) : nullptr;
     if (compute) {
         g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
         g_ctx->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
+        g_ctx->CSSetConstantBuffers(3, 1, &coreCB);
+        g_ctx->CSSetShaderResources(42, 1, &coreField);
     } else {
         g_ctx->PSSetConstantBuffers(0, 1, &m->cb);
         g_ctx->PSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_ctx->PSSetSamplers(0, 1, &g_faldSampler);
+        g_ctx->PSSetConstantBuffers(3, 1, &coreCB);
+        g_ctx->PSSetShaderResources(42, 1, &coreField);
     }
 }
 
@@ -1604,7 +1638,10 @@ static void UnbindCompute() {
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     ID3D11UnorderedAccessView* nullUav[FALD_UAV_SLOTS] = {};
     g_ctx->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
+    g_ctx->CSSetShaderResources(40, 8, nullSrv);                  // the core round 2's t40..t47 (prototype)
     g_ctx->CSSetUnorderedAccessViews(0, FALD_UAV_SLOTS, nullUav, nullptr);
+    ID3D11Buffer* nullCB = nullptr;
+    g_ctx->CSSetConstantBuffers(3, 1, &nullCB);
     g_ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
@@ -1623,9 +1660,14 @@ static void RunStat(FaldMonitor* m, uint32_t roundIdx) {
             g_ctx->CSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
         }
     }
-    ID3D11UnorderedAccessView* uavs[3] = { m->driveUAV, m->activeUAV[roundIdx & 1u],    // u1: null without a boost LUT
-                                           m->zonePartUAV };                              // (the shader then never writes it)
-    g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);                               // u2: partials, zones > one slice
+    ID3D11UnorderedAccessView* uavs[5] = { m->driveUAV, m->activeUAV[roundIdx & 1u],    // u1: null without a boost LUT
+                                           m->zonePartUAV, nullptr, nullptr };            // (the shader then never writes it)
+    if (roundIdx == 0 && m->core2On) {                       // core round 2: the source's P, M, lnG (u3) + the cut sum (u4)
+        ID3D11ShaderResourceView* lz = nullptr;
+        FaldCore2StatViews(m->core2, &uavs[3], &lz);
+        g_ctx->CSSetShaderResources(45, 1, &lz);
+    }
+    g_ctx->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);                               // u2: partials, zones > one slice
     g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
     if (m->zoneSlices > 1) {                                                             // fold the slices, finish the zones
         g_ctx->CSSetShader(g_statCombineCS, nullptr, 0);
@@ -2023,10 +2065,14 @@ static void FaldUnbindAll() {
     g_ctx->CSSetUnorderedAccessViews(0, FALD_UAV_SLOTS, nullUav, nullptr);
     g_ctx->CSSetSamplers(0, 1, nullSamp);
     g_ctx->CSSetConstantBuffers(0, 3, nullCBs);
+    g_ctx->CSSetConstantBuffers(3, 1, &nullCB);                   // b3 / t40..t47: the core round 2 (prototype)
+    g_ctx->CSSetShaderResources(40, 8, nullSrv);
     g_ctx->CSSetShader(nullptr, nullptr, 0);
     g_ctx->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
+    g_ctx->PSSetShaderResources(40, 8, nullSrv);
     g_ctx->PSSetSamplers(0, 1, nullSamp);
     g_ctx->PSSetConstantBuffers(0, 1, &nullCB);
+    g_ctx->PSSetConstantBuffers(3, 1, &nullCB);
     g_ctx->PSSetShader(nullptr, nullptr, 0);
     g_ctx->VSSetShader(nullptr, nullptr, 0);
     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
@@ -2169,21 +2215,31 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     const bool reachReuse = m->fadeOn && !newContent && FaldFadeReachCurrent(m->fade, reachKey);
     GpuTimingStamp(ts, 1);
     if (trun.clock.runPass) RunPanelClock(m);   // mode 3: this frame's LED state comes from PAST frames only
+    // The always-on core round 2 (PROTOTYPE, shared/fald_core2.h): the zone IIR advances by the refreshes since the
+    // previous run (mode 3's k; else the run interval over the refresh period); a resume / mode change resets it.
+    if (m->core2On) {
+        const unsigned long long k = FaldCore2Refreshes(trun.panel, m->clkElapsed, m->dtMs, m->refreshMs);
+        if (trun.resumed || trun.stateReset) FaldCore2Invalidate(m->core2);
+        FaldCore2BeginRun(m->core2, g_ctx, FALD_CORE2_KC2C, FaldCore2IirFactor(k));
+    }
 
     // Two inverse rounds. Round 0's output is what round 1's statistic and boost count see, so the
     // panel's own response is accounted for in the frame it actually receives.
     // LED lag modes 1 / 2 filter each round's drive (both rounds read the SAME committed state).
     RunStat(m, 0);
+    if (m->core2On) FaldCore2RunZone(m->core2, g_ctx, m->cb);   // the cut test, alpha (IIR + Gaussian), the spread gate
     RunBoost(m, 0);
     if (trun.temporal) RunTemporal(m, inDrive);
     RunConv(m, trueDrive, estDrive, m->boostSRV[0]);
     RunGain(m);
+    if (m->core2On) FaldCore2RunDeficit(m->core2, g_ctx, m->cb, m->gainBSRV, 0);   // round 0's deficit -> t42 (stat 1)
     if (m->fadeOn && !reachReuse) RunFadeReach(m, 0, reachKey);   // reach of round 0's knee: FadePost in the round-1 statistic
     RunStat(m, 1);
     RunBoost(m, 1);
     if (trun.temporal) RunTemporal(m, inDrive);
     RunConv(m, trueDrive, estDrive, m->boostSRV[1]);
     RunGain(m);
+    if (m->core2On) FaldCore2RunDeficit(m->core2, g_ctx, m->cb, m->gainBSRV, 1);   // round 1's deficit -> t42 (pixel)
     if (m->fadeOn && !reachReuse) RunFadeReach(m, 1, reachKey);   // reach of round 1's knee: FadePost in the pixel pass
     m->framesRun++;
 
@@ -2231,6 +2287,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     }
     g_ctx->Draw(3, 0);
     if (m->debugMode != 0) DrawExempt(m);   // a view: DesktopLUT's windows keep the corrected picture
+    if (m->core2On) FaldCore2EndRun(m->core2);
     GpuTimingEnd(ts, m);
 
     if (!dumpDir.empty()) {

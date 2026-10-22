@@ -114,6 +114,7 @@
     <ClCompile Include="shared\fald_temporal.cpp" />
     <ClCompile Include="shared\fald_fade.cpp" />
     <ClCompile Include="shared\fald_fade_governor.cpp" />
+    <ClCompile Include="shared\fald_core2.cpp" />
     <ClCompile Include="src\fald_fade_status.cpp" />
     <ClCompile Include="tests\test_fald_fade_governor.cpp" />
     <ClCompile Include="src\fald.cpp" />
@@ -171,6 +172,7 @@
     <ClCompile Include="tests\test_fald_fade.cpp" />
     <ClCompile Include="tests\test_fald_fade_hw.cpp" />
     <ClCompile Include="tests\test_fald_pitch.cpp" />
+    <ClCompile Include="tests\test_fald_core2.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
     <ClCompile Include="tests\test_hdr_dither.cpp" />

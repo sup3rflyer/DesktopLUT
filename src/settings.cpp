@@ -327,6 +327,7 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
     // the frozen fade stack (ASF10 + T11_TMTC; default off) and item L (reserved: persisted, read by nothing yet)
     WritePrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), cc.fald.flankFade, iniPath);
+    WritePrivateProfileBool(section, (p + L"FaldCore2").c_str(), cc.fald.core2, iniPath);
     WritePrivateProfileBool(section, (p + L"FaldLowExt").c_str(), cc.fald.lowExt, iniPath);
     // the glow fill's keys (work guide S2, removed 2026-10-07): deleted, so a saved file carries no dead switch
     for (const wchar_t* k : { L"FaldGlowFill", L"FaldGlowStrength", L"FaldGlowReach", L"FaldGlowCapNits" })
@@ -400,6 +401,7 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
     // the frozen fade stack: an INI without the key loads OFF (= the layer before the port, bit for bit); item L reserved
     cc.fald.flankFade = GetPrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), false, iniPath);
+    cc.fald.core2 = GetPrivateProfileBool(section, (p + L"FaldCore2").c_str(), false, iniPath);   // prototype (fald_core2.h)
     cc.fald.lowExt = GetPrivateProfileBool(section, (p + L"FaldLowExt").c_str(), false, iniPath);
 }
 
