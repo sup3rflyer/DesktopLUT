@@ -28,11 +28,12 @@
 //
 // Speed (2026-10-22, DLC results/fald_fade_tiers_2026-10-20; ZERO-CHANGE: every pass computes the float operations of
 // the kernels it replaced in the same order, so the output is the same bit for bit — tests/test_fald_fade.cpp): the
-// Gaussians and the max / min filters read their taps from groupshared tiles (FadeGaussT / FadeExtT, the latter by
-// van Herk / Gil-Werman up to r 32, by doubling above), lv's four Gaussians share one vertical pass (FadeGaussT4), the hybrid fill's two sigma-32 sums one pass
-// (FadeGaussT2), the cone / the reach run 8 iterations per dispatch (FadeConeT), an up-sampling that fed a Gaussian or a
-// pixel step is formed where it is read (FadeUpAt), the pixel step after a Gaussian is done by its horizontal pass, the
-// DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit floor F itself (fald_shader.h).
+// Gaussians and the max / min filters read their taps from groupshared tiles (FadeGaussT / FadeExtT, the latter by van
+// Herk / Gil-Werman up to r 32, by doubling above), lv's four Gaussians share one vertical pass (FadeGaussT4), the hybrid
+// fill's two sigma-32 sums one pass (FadeGaussT2), the cone / the reach run 8 iterations per dispatch (FadeConeT), an
+// up-sampling that fed a Gaussian or a pixel step is formed where it is read (FadeUpAt), the pixel step after a Gaussian
+// is done by its horizontal pass, the DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit
+// floor F itself (fald_shader.h).
 // The tiled Gaussians have their radius and their float32 weights compiled in (one class per sigma, fald_fade.cpp
 // BakedWeightsSource) and their steps unrolled (2026-10-22, the same operations without the weight loads and the loop).
 // FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
@@ -1102,7 +1103,9 @@ inline const char* g_faldFadeTileFnSource = R"(
 groupshared float gT[TG_LINES * TG_STRIDE];
 uint FadeLanePerm(uint y) { return ((y & 1u) << 2) | ((y >> 1) & 3u) | (y & 8u); }
 float GtTap(int x, int y) {
-    float v = (fFactor > 1u) ? FadeUpAt(fIn0, int2(x, y), fC1) : fIn0.Load(int3(x, y, 0));
+    float v;
+    [branch] if (fFactor > 1u) v = FadeUpAt(fIn0, int2(x, y), fC1);   // a uniform branch: one path's loads, not both
+    else v = fIn0.Load(int3(x, y, 0));
     if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
     return v;
 }
@@ -1114,7 +1117,8 @@ void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
         else { k = i % span; ln = i / span; }
         const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
         const int gc = min(c0 + (int)ln, nC - 1);
-        gT[ln * TG_STRIDE + k] = vert ? GtTap(gc, ga) : GtTap(ga, gc);
+        const int2 q = vert ? int2(gc, ga) : int2(ga, gc);   // one tap (a select of its position, not two taps)
+        gT[ln * TG_STRIDE + k] = GtTap(q.x, q.y);
     }
 }
 // The sweep of four consecutive outputs: s = x[c] w0, then for j = 1..r term = (x[c - j] + x[c + j]) w_j added by the Kahan
@@ -1252,7 +1256,9 @@ RWTexture2D<float> g2dIo : register(u1);
 #define G2_ROWS (G2_TH + 2 * TG_RMAX)
 groupshared float g2[G2_ROWS * G2_S];
 float G2Tap(int x, int y) {
-    float v = (fFactor > 1u) ? FadeUpAt(fIn0, int2(x, y), fC1) : fIn0.Load(int3(x, y, 0));
+    float v;
+    [branch] if (fFactor > 1u) v = FadeUpAt(fIn0, int2(x, y), fC1);   // a uniform branch: one path's loads, not both
+    else v = fIn0.Load(int3(x, y, 0));
     if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
     return v;
 }
