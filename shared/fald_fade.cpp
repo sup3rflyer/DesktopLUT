@@ -24,7 +24,7 @@ const double kPi = 3.14159265358979323846;
 enum FadeKernel : unsigned int {
     K_GRAD, K_DOWN, K_UP, K_PIX, K_KNEE, K_ADVANCE, K_MEANWIN, K_DFT, K_CROSS, K_NORM, K_MAXMAG, K_ARGMAX, K_OVERLAP,
     K_CUT, K_WARPQ, K_TM, K_SELECT,
-    K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2,
+    K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2, K_GT2P,
     K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT,
     K_COUNT
 };
@@ -62,6 +62,7 @@ const KernelDef kKernels[K_COUNT] = {
     { "FadeGaussT96", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n" },
     { "FadeGaussT4V", &g_faldFadeGaussT4Source, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n" },
     { "FadeGaussT2", &g_faldFadeGaussT2Source, nullptr, "#define TG_RMAX 128\n" },
+    { "FadeGaussT2P", &g_faldFadeGaussT2PSource, nullptr, "#define TG_RMAX 128\n" },
     { "FadeExtT5", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 5\n" },
     { "FadeExtT8", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 8\n" },
     { "FadeExtT12", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 12\n" },
@@ -455,12 +456,14 @@ void GaussNumDen(FaldFade* f, ID3D11DeviceContext* ctx, const FadeTex& a, const 
     FadeCBData c = Cb();
     c.inW = a.w; c.inH = a.h; c.radius = (uint32_t)f->gwR[s]; c.wOff = f->gwOff[s];
     c.op = kPlainSums ? 8u : 0u;   // Z9
+    // plain sums: FadeGaussT2P (8 lines x 128 outputs a group, 4 per thread; the same value per output)
+    const unsigned int k = kPlainSums ? K_GT2P : K_GT2, len = kPlainSums ? 128u : 64u;
     c.dir = 0;
     Io v; v.in[0] = a.srv; v.in[1] = b.srv; v.out[0] = ta.uav; v.out[1] = tb.uav;
-    Pass(f, ctx, K_GT2, c, v, Gd(a.w, 8), Gd(a.h, 64));
+    Pass(f, ctx, k, c, v, Gd(a.w, 8), Gd(a.h, len));
     c.dir = 1;
     Io hz; hz.in[0] = ta.srv; hz.in[1] = tb.srv; hz.out[0] = a.uav; hz.out[1] = b.uav;
-    Pass(f, ctx, K_GT2, c, hz, Gd(a.w, 64), Gd(a.h, 8));
+    Pass(f, ctx, k, c, hz, Gd(a.w, len), Gd(a.h, 8));
 }
 
 // separable max (op 0) / min (op 1) of window 2r + 1 by doubling (FadeExtT): vertical into tmp, horizontal into out

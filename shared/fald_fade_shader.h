@@ -1251,6 +1251,93 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 }
 )";
 
+// ---- FadeGaussT2 with plain sums (Z9; kPlainSums), longer tiles: 8 lines x 128 outputs per group, every thread FOUR
+// consecutive outputs of both maps (8 plain chains: the registers the Kahan terms took), so the 2r-tap halo is loaded
+// 3x per output instead of 5x and the sweep reads half as many taps per output. Each output: s = x0 w0, then
+// s = s + (x[o - j] + x[o + j]) w_j for j = 1..r — GtSweep's plain order, the same value as FadeGaussT2's plain branch.
+// T2PLanePerm: a warp's 8 lines x 4 lanes on 32 banks (lanes 2 apart: 4 lane x 4 outputs = 8 words apart).
+inline const char* g_faldFadeGaussT2PSource = R"(
+RWTexture2D<float> g2Out0 : register(u0);
+RWTexture2D<float> g2Out1 : register(u1);
+#define T2P_LEN 128
+#define T2P_LINES 8
+#define T2P_BASE (T2P_LEN + 2 * TG_RMAX)
+#define T2P_STRIDE (T2P_BASE + ((33 - (T2P_BASE & 31)) & 31))
+groupshared float gA2[T2P_LINES * T2P_STRIDE];
+groupshared float gB2[T2P_LINES * T2P_STRIDE];
+uint T2PLanePerm(uint w, uint i) { return 8u * (w >> 1) + (w & 1u) + 2u * i; }   // warp w (0..7), its i-th lane (0..3)
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const bool vert = (fDir == 0u);
+    const int r = (int)fRadius;
+    const int nA = vert ? (int)fInH : (int)fInW;
+    const int nC = vert ? (int)fInW : (int)fInH;
+    const int a0 = (int)(vert ? gid.y : gid.x) * T2P_LEN;
+    const int c0 = (int)(vert ? gid.x : gid.y) * T2P_LINES;
+    const uint t = tid.x;
+    const uint span = (uint)(T2P_LEN + 2 * r);
+    for (uint i = t; i < T2P_LINES * span; i += 256u) {
+        uint ln, k;
+        if (vert) { ln = i % T2P_LINES; k = i / T2P_LINES; }
+        else { k = i % span; ln = i / span; }
+        const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
+        const int gc = min(c0 + (int)ln, nC - 1);
+        const int3 q = vert ? int3(gc, ga, 0) : int3(ga, gc, 0);
+        gA2[ln * T2P_STRIDE + k] = fIn0.Load(q);
+        gB2[ln * T2P_STRIDE + k] = fIn1.Load(q);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint lineIx = t % T2P_LINES, lane = T2PLanePerm(t / 32u, (t % 32u) / T2P_LINES);
+    const int base = (int)(lineIx * T2P_STRIDE) + r + 4 * (int)lane;
+    const float w0 = fGW[fWOff];
+    const float xa0 = gA2[base], xa1 = gA2[base + 1], xa2 = gA2[base + 2], xa3 = gA2[base + 3];
+    const float xb0 = gB2[base], xb1 = gB2[base + 1], xb2 = gB2[base + 2], xb3 = gB2[base + 3];
+    precise float sa0 = xa0 * w0;
+    precise float sa1 = xa1 * w0;
+    precise float sa2 = xa2 * w0;
+    precise float sa3 = xa3 * w0;
+    precise float sb0 = xb0 * w0;
+    precise float sb1 = xb1 * w0;
+    precise float sb2 = xb2 * w0;
+    precise float sb3 = xb3 * w0;
+    // x[o_k - (j - 1)] / x[o_k + (j - 1)] of the next step, as GtSweep
+    float la0 = xa0, la1 = xa1, la2 = xa2, qa1 = xa1, qa2 = xa2, qa3 = xa3;
+    float lb0 = xb0, lb1 = xb1, lb2 = xb2, qb1 = xb1, qb2 = xb2, qb3 = xb3;
+    for (int j = 1; j <= r; j++) {
+        const float wj = fGW[fWOff + (uint)j];
+        const float nla = gA2[base - j], nra = gA2[base + 3 + j];
+        const float nlb = gB2[base - j], nrb = gB2[base + 3 + j];
+        precise float ta0 = (nla + qa1) * wj;
+        precise float ta1 = (la0 + qa2) * wj;
+        precise float ta2 = (la1 + qa3) * wj;
+        precise float ta3 = (la2 + nra) * wj;
+        precise float tb0 = (nlb + qb1) * wj;
+        precise float tb1 = (lb0 + qb2) * wj;
+        precise float tb2 = (lb1 + qb3) * wj;
+        precise float tb3 = (lb2 + nrb) * wj;
+        sa0 = sa0 + ta0; sa1 = sa1 + ta1; sa2 = sa2 + ta2; sa3 = sa3 + ta3;
+        sb0 = sb0 + tb0; sb1 = sb1 + tb1; sb2 = sb2 + tb2; sb3 = sb3 + tb3;
+        la2 = la1; la1 = la0; la0 = nla; qa1 = qa2; qa2 = qa3; qa3 = nra;
+        lb2 = lb1; lb1 = lb0; lb0 = nlb; qb1 = qb2; qb2 = qb3; qb3 = nrb;
+    }
+    GroupMemoryBarrierWithGroupSync();   // every tap read: the tiles take the outputs
+    const uint tb = lineIx * (T2P_LEN + 1u) + 4u * lane;
+    gA2[tb] = sa0; gA2[tb + 1u] = sa1; gA2[tb + 2u] = sa2; gA2[tb + 3u] = sa3;
+    gB2[tb] = sb0; gB2[tb + 1u] = sb1; gB2[tb + 2u] = sb2; gB2[tb + 3u] = sb3;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint e = t; e < (uint)(T2P_LINES * T2P_LEN); e += 256u) {
+        uint ln, a;
+        if (vert) { ln = e % T2P_LINES; a = e / T2P_LINES; }
+        else { a = e % T2P_LEN; ln = e / T2P_LEN; }
+        const int ga = a0 + (int)a, gc = c0 + (int)ln;
+        if (ga >= nA || gc >= nC) continue;
+        const uint2 p = vert ? uint2(gc, ga) : uint2(ga, gc);
+        g2Out0[p] = gA2[ln * (T2P_LEN + 1u) + a];
+        g2Out1[p] = gB2[ln * (T2P_LEN + 1u) + a];
+    }
+}
+)";
+
 // ---- the separable max (fOp 0) / min (fOp 1) of window 2r + 1 along one axis (replicate edges) by doubling (replaces
 // FadeExt): the tile as the Gaussian's (16 lines x 64 outputs), M_1 = x, M_2P[k] = ext(M_P[k], M_P[k + P]), out[o] =
 // ext(M_P[o], M_P[o + n - P]) for P = the largest power of two <= n = 2r + 1. max / min are exact and order-free (a NaN
