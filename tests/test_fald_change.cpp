@@ -156,6 +156,7 @@ struct ChLayer {
             { "drive_state", r->driveStateTex }, { "active_r0", r->activeTex[0] }, { "active_r1", r->activeTex[1] },
             { "boost_r0", r->boostTex[0] }, { "boost_r1", r->boostTex[1] }, { "btrue0", r->bTrue0Tex }, { "best0", r->bEst0Tex },
             { "gain0", r->gain0Tex }, { "btrue", r->bTrueTex }, { "best", r->bEstTex }, { "gainB", r->gainBTex },
+            { "fields0", r->fields0Tex }, { "fields", r->fieldsTex },
             { "star_stat", r->starStatTex }, { "star_w", r->starWTex }, { "star_plan", r->starPlanTex }, { "star_plan2", r->starPlan2Tex },
             { "star_bg", r->starBgTex }, { "OUTPUT", target } };
         std::vector<std::pair<std::string, uint64_t>> out;

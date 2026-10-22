@@ -48,6 +48,7 @@ constexpr uint32_t FALD_FADE_FLAG_LOWEXT = 2u;   // bit 1: item L (the 1-3-nit e
 struct FaldFadeCommon {
     ID3D11Buffer* faldCB = nullptr;
     ID3D11ShaderResourceView* srv[20] = {};
+    ID3D11ShaderResourceView* fields = nullptr;   // t39 (FALD_FIELDS_SLOT): the round's packed fields (SampleFields; the reach pass)
     ID3D11SamplerState* sampler = nullptr;
 };
 

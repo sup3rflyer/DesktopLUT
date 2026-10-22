@@ -541,7 +541,7 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 4552;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 4600;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
                                                          // 2026-10-20: + the fade stack's five fields; 2026-10-22: + the
@@ -603,6 +603,9 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* driveTex = nullptr;  ID3D11UnorderedAccessView* driveUAV = nullptr; ID3D11ShaderResourceView* driveSRV = nullptr;
     ID3D11Texture2D* bTrueTex = nullptr;  ID3D11UnorderedAccessView* bTrueUAV = nullptr; ID3D11ShaderResourceView* bTrueSRV = nullptr;
     ID3D11Texture2D* bEstTex = nullptr;   ID3D11UnorderedAccessView* bEstUAV = nullptr;  ID3D11ShaderResourceView* bEstSRV = nullptr;
+    // the same two PACKED with their flat response, (B_true, flat, B_est, flat) RGBA32F (fald_shader.h t39): what SampleFields
+    // and the gain passes read, one sample / load for the four; the conv pass writes it next to the two above
+    ID3D11Texture2D* fieldsTex = nullptr; ID3D11UnorderedAccessView* fieldsUAV = nullptr; ID3D11ShaderResourceView* fieldsSRV = nullptr;
     ID3D11Texture2D* gainATex = nullptr;  ID3D11UnorderedAccessView* gainAUAV = nullptr; ID3D11ShaderResourceView* gainASRV = nullptr;
     ID3D11Texture2D* gainBTex = nullptr;  ID3D11UnorderedAccessView* gainBUAV = nullptr; ID3D11ShaderResourceView* gainBSRV = nullptr;
     // flat-lattice response of both kernels (computed once at build): a flat field must give gain 1
@@ -620,6 +623,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* driveFilt0Tex = nullptr; ID3D11UnorderedAccessView* driveFilt0UAV = nullptr; ID3D11ShaderResourceView* driveFilt0SRV = nullptr;
     ID3D11Texture2D* bTrue0Tex = nullptr; ID3D11UnorderedAccessView* bTrue0UAV = nullptr; ID3D11ShaderResourceView* bTrue0SRV = nullptr;
     ID3D11Texture2D* bEst0Tex = nullptr;  ID3D11UnorderedAccessView* bEst0UAV = nullptr;  ID3D11ShaderResourceView* bEst0SRV = nullptr;
+    ID3D11Texture2D* fields0Tex = nullptr; ID3D11UnorderedAccessView* fields0UAV = nullptr; ID3D11ShaderResourceView* fields0SRV = nullptr;
     ID3D11Texture2D* gain0Tex = nullptr;  ID3D11UnorderedAccessView* gain0UAV = nullptr;  ID3D11ShaderResourceView* gain0SRV = nullptr;
     ID3D11Buffer* zoneListBuf = nullptr; ID3D11ShaderResourceView* zoneListSRV = nullptr;
     ID3D11Buffer* changeFlagsBuf = nullptr; ID3D11UnorderedAccessView* changeFlagsUAV = nullptr;
@@ -817,6 +821,7 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->driveFilt0SRV); SafeRelease(m->driveFilt0UAV); SafeRelease(m->driveFilt0Tex);
     SafeRelease(m->bTrue0SRV); SafeRelease(m->bTrue0UAV); SafeRelease(m->bTrue0Tex);
     SafeRelease(m->bEst0SRV); SafeRelease(m->bEst0UAV); SafeRelease(m->bEst0Tex);
+    SafeRelease(m->fields0SRV); SafeRelease(m->fields0UAV); SafeRelease(m->fields0Tex);
     SafeRelease(m->gain0SRV); SafeRelease(m->gain0UAV); SafeRelease(m->gain0Tex);
     SafeRelease(m->zoneListSRV); SafeRelease(m->zoneListBuf);
     SafeRelease(m->changeFlagsUAV); SafeRelease(m->changeFlagsBuf);
@@ -832,6 +837,7 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->flatTrueSRV); SafeRelease(m->flatTrueUAV); SafeRelease(m->flatTrueTex);
     SafeRelease(m->gainBSRV); SafeRelease(m->gainBUAV); SafeRelease(m->gainBTex);
     SafeRelease(m->gainASRV); SafeRelease(m->gainAUAV); SafeRelease(m->gainATex);
+    SafeRelease(m->fieldsSRV); SafeRelease(m->fieldsUAV); SafeRelease(m->fieldsTex);
     SafeRelease(m->bEstSRV); SafeRelease(m->bEstUAV); SafeRelease(m->bEstTex);
     SafeRelease(m->bTrueSRV); SafeRelease(m->bTrueUAV); SafeRelease(m->bTrueTex);
     SafeRelease(m->driveSRV); SafeRelease(m->driveUAV); SafeRelease(m->driveTex);
@@ -1191,9 +1197,11 @@ static bool BuildTables(FaldMonitor* m) {
     const UINT fw = p.cols * p.sub, fh = p.rows * p.sub;
     if (!MakeRWTexture(fw, fh, &m->bTrue0Tex, &m->bTrue0UAV, &m->bTrue0SRV)) { log_to_file("FALD: B_true texture (round 0) failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bEst0Tex, &m->bEst0UAV, &m->bEst0SRV)) { log_to_file("FALD: B_est texture (round 0) failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->fields0Tex, &m->fields0UAV, &m->fields0SRV, DXGI_FORMAT_R32G32B32A32_FLOAT)) { log_to_file("FALD: packed fields texture (round 0) failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->gain0Tex, &m->gain0UAV, &m->gain0SRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture (round 0) failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bTrueTex, &m->bTrueUAV, &m->bTrueSRV)) { log_to_file("FALD: B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bEstTex, &m->bEstUAV, &m->bEstSRV)) { log_to_file("FALD: B_est texture failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->fieldsTex, &m->fieldsUAV, &m->fieldsSRV, DXGI_FORMAT_R32G32B32A32_FLOAT)) { log_to_file("FALD: packed fields texture failed"); return false; }
     // R32G32F: (gain, the flat-normalised B_est of the soft knee's ceiling), low-passed together (C15)
     if (!MakeRWTexture(fw, fh, &m->gainATex, &m->gainAUAV, &m->gainASRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture A failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->gainBTex, &m->gainBUAV, &m->gainBSRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture B failed"); return false; }
@@ -1774,6 +1782,7 @@ static void RunStat(FaldMonitor* m, uint32_t roundIdx, StatDispatch d = kStatFul
     if (roundIdx == 1) {                                          // round 0's fields and smoothed (gain, ceiling B_est) (C15)
         ID3D11ShaderResourceView* fields[2] = { m->bTrue0SRV, m->bEst0SRV };
         g_ctx->CSSetShaderResources(5, 2, fields);
+        g_ctx->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &m->fields0SRV);   // t39: the same packed (SampleFields)
         ID3D11ShaderResourceView* gain0 = m->gainFused ? m->gain0SRV : m->gainBSRV;   // (the three-pass path leaves it in gainB)
         g_ctx->CSSetShaderResources(9, 1, &gain0);
         if (m->fadeOn) {                                          // FadePost on round 0's request: fade, F's opening, reach 0, s - f_q
@@ -1827,8 +1836,9 @@ static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11S
     ID3D11ShaderResourceView* k4[2] = { m->kTrue4SRV, m->kEst4SRV };   // the tables four floats wide (t36 / t37)
     g_ctx->CSSetShaderResources(36, 2, k4);
     // round 0 writes its own fields (the round-1 sweep and the change-driven path compare / read them later)
-    ID3D11UnorderedAccessView* uavs[2] = { roundIdx == 0 ? m->bTrue0UAV : m->bTrueUAV, roundIdx == 0 ? m->bEst0UAV : m->bEstUAV };
-    g_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    ID3D11UnorderedAccessView* uavs[3] = { roundIdx == 0 ? m->bTrue0UAV : m->bTrueUAV, roundIdx == 0 ? m->bEst0UAV : m->bEstUAV,
+                                           roundIdx == 0 ? m->fields0UAV : m->fieldsUAV };   // u2: the two packed with their flat response
+    g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
     // cells x sub-offset groups (fald_shader.h: FALD_CONV_SO sub-offsets per thread); indirect: the decide pass's arguments
     if (indirect) g_ctx->DispatchIndirect(m->argsBuf, roundIdx ? FALD_ARGS_CONV1 : FALD_ARGS_CONV0);
     else g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(m->convVariant)), 1);
@@ -1840,10 +1850,12 @@ static void RunGain(FaldMonitor* m, uint32_t roundIdx, bool indirect = false) {
     const FaldPanelParams& p = m->params;
     const UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
     ID3D11ShaderResourceView* fields[2] = { roundIdx ? m->bTrueSRV : m->bTrue0SRV, roundIdx ? m->bEstSRV : m->bEst0SRV };   // the round's own
+    ID3D11ShaderResourceView* packed = roundIdx ? m->fieldsSRV : m->fields0SRV;                                             // t39: the same packed
     if (m->gainFused) {                    // one dispatch: gain + both blurs straight into the round's map (fald_shader.h)
         g_ctx->CSSetShader(g_gainBlurCS, nullptr, 0);
         BindCommon(m, true);
         g_ctx->CSSetShaderResources(5, 2, fields);
+        g_ctx->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &packed);
         ID3D11UnorderedAccessView* out = roundIdx ? m->gainBUAV : m->gain0UAV;
         g_ctx->CSSetUnorderedAccessViews(0, 1, &out, nullptr);
         if (indirect) g_ctx->DispatchIndirect(m->argsBuf, roundIdx ? FALD_ARGS_GAIN1 : FALD_ARGS_GAIN0);
@@ -1979,6 +1991,7 @@ static FaldFadeCommon FadeCommon(FaldMonitor* m, bool roundFields, uint32_t roun
     for (int i = 0; i < 20; i++) c.srv[i] = v[i];
     if (roundFields) {                     // the round's own fields and smoothed gain
         c.srv[5] = round ? m->bTrueSRV : m->bTrue0SRV; c.srv[6] = round ? m->bEstSRV : m->bEst0SRV;
+        c.fields = round ? m->fieldsSRV : m->fields0SRV;                          // t39: the same packed (SampleFields)
         c.srv[9] = (round || !m->gainFused) ? m->gainBSRV : m->gain0SRV;
     }
     return c;
@@ -2024,7 +2037,8 @@ static void RunFadeReach(FaldMonitor* m, uint32_t round, unsigned long long key)
 
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
 // Must run after the fine textures exist; the flat textures are bound as SRVs t7/t8 from then on
-// (they are null during this call, which the conv pass does not read).
+// (they are null during this call: the conv pass's packed output (u2) gets zeros for them here, and every conv run of a
+// round rewrites its packed texture before the round's readers run).
 static void ComputeFlatResponse(FaldMonitor* m) {
     const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     g_ctx->ClearUnorderedAccessViewFloat(m->driveUAV, one);
@@ -2476,6 +2490,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     BindCommon(m, false);
     ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
     g_ctx->PSSetShaderResources(5, 2, fields);
+    g_ctx->PSSetShaderResources(FALD_FIELDS_SLOT, 1, &m->fieldsSRV);   // t39: the same packed (SampleFields)
     g_ctx->PSSetShaderResources(9, 1, &m->gainBSRV);
     // t4 / t10 = debug view 7: instantaneous vs filtered (mode 3: vs the clocks' mean LED state of this frame)
     ID3D11ShaderResourceView* filt = mapSrv(trun.debugFiltMap, 1);

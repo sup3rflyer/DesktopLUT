@@ -100,6 +100,9 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* driveTex = nullptr;   ID3D11UnorderedAccessView* driveUAV = nullptr;  ID3D11ShaderResourceView* driveSRV = nullptr;
     ID3D11Texture2D* bTrueTex = nullptr;   ID3D11UnorderedAccessView* bTrueUAV = nullptr;  ID3D11ShaderResourceView* bTrueSRV = nullptr;
     ID3D11Texture2D* bEstTex = nullptr;    ID3D11UnorderedAccessView* bEstUAV = nullptr;   ID3D11ShaderResourceView* bEstSRV = nullptr;
+    // the same two PACKED with their flat response, (B_true, flat, B_est, flat) RGBA32F (fald_shader.h t39): what
+    // SampleFields and the gain passes read, one sample / load for the four; the conv pass writes it next to the two above
+    ID3D11Texture2D* fieldsTex = nullptr;  ID3D11UnorderedAccessView* fieldsUAV = nullptr; ID3D11ShaderResourceView* fieldsSRV = nullptr;
     // gain on the fine grid (pass 2b) and its blurred version (pass 2c, ping-pong)
     ID3D11Texture2D* gainATex = nullptr; ID3D11UnorderedAccessView* gainAUAV = nullptr; ID3D11ShaderResourceView* gainASRV = nullptr;
     ID3D11Texture2D* gainBTex = nullptr; ID3D11UnorderedAccessView* gainBUAV = nullptr; ID3D11ShaderResourceView* gainBSRV = nullptr;
@@ -122,6 +125,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* driveFilt0Tex = nullptr; ID3D11UnorderedAccessView* driveFilt0UAV = nullptr; ID3D11ShaderResourceView* driveFilt0SRV = nullptr;
     ID3D11Texture2D* bTrue0Tex = nullptr; ID3D11UnorderedAccessView* bTrue0UAV = nullptr; ID3D11ShaderResourceView* bTrue0SRV = nullptr;
     ID3D11Texture2D* bEst0Tex = nullptr;  ID3D11UnorderedAccessView* bEst0UAV = nullptr;  ID3D11ShaderResourceView* bEst0SRV = nullptr;
+    ID3D11Texture2D* fields0Tex = nullptr; ID3D11UnorderedAccessView* fields0UAV = nullptr; ID3D11ShaderResourceView* fields0SRV = nullptr;
     ID3D11Texture2D* gain0Tex = nullptr;  ID3D11UnorderedAccessView* gain0UAV = nullptr;  ID3D11ShaderResourceView* gain0SRV = nullptr;
     ID3D11Buffer* zoneListBuf = nullptr; ID3D11ShaderResourceView* zoneListSRV = nullptr;   // dynamic, cols * rows uints
     ID3D11Buffer* changeFlagsBuf = nullptr; ID3D11UnorderedAccessView* changeFlagsUAV = nullptr;   // 3 uints, zeroed

@@ -654,15 +654,16 @@ void One(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int k, unsigned int w, 
 void BindCommonState(ID3D11DeviceContext* ctx, const FaldFadeCommon& cm) {
     ctx->CSSetConstantBuffers(0, 1, &cm.faldCB);
     ctx->CSSetShaderResources(0, 20, cm.srv);
+    ctx->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &cm.fields);   // t39: the round's packed fields (SampleFields)
     ctx->CSSetSamplers(0, 1, &cm.sampler);
 }
 
 void UnbindEverything(ID3D11DeviceContext* ctx) {
-    ID3D11ShaderResourceView* nullSrv[36] = {};
+    ID3D11ShaderResourceView* nullSrv[40] = {};   // t0..t39 (t39 = the packed fields)
     ID3D11UnorderedAccessView* nullUav[8] = {};
     ID3D11Buffer* nullCb[3] = {};
     ID3D11SamplerState* nullS = nullptr;
-    ctx->CSSetShaderResources(0, 36, nullSrv);
+    ctx->CSSetShaderResources(0, 40, nullSrv);
     ctx->CSSetUnorderedAccessViews(0, 8, nullUav, nullptr);
     ctx->CSSetConstantBuffers(0, 3, nullCb);
     ctx->CSSetSamplers(0, 1, &nullS);

@@ -275,6 +275,7 @@ static void ReleaseAll(FaldResources* r) {
     r->stateValid = false; r->settleLeft = 0;
     SafeRelease(r->bTrueSRV); SafeRelease(r->bTrueUAV); SafeRelease(r->bTrueTex);
     SafeRelease(r->bEstSRV); SafeRelease(r->bEstUAV); SafeRelease(r->bEstTex);
+    SafeRelease(r->fieldsSRV); SafeRelease(r->fieldsUAV); SafeRelease(r->fieldsTex);
     SafeRelease(r->gainASRV); SafeRelease(r->gainAUAV); SafeRelease(r->gainATex);
     SafeRelease(r->gainBSRV); SafeRelease(r->gainBUAV); SafeRelease(r->gainBTex);
     SafeRelease(r->flatTrueSRV); SafeRelease(r->flatTrueUAV); SafeRelease(r->flatTrueTex);
@@ -289,6 +290,7 @@ static void ReleaseAll(FaldResources* r) {
     SafeRelease(r->driveFilt0SRV); SafeRelease(r->driveFilt0UAV); SafeRelease(r->driveFilt0Tex);
     SafeRelease(r->bTrue0SRV); SafeRelease(r->bTrue0UAV); SafeRelease(r->bTrue0Tex);
     SafeRelease(r->bEst0SRV); SafeRelease(r->bEst0UAV); SafeRelease(r->bEst0Tex);
+    SafeRelease(r->fields0SRV); SafeRelease(r->fields0UAV); SafeRelease(r->fields0Tex);
     SafeRelease(r->gain0SRV); SafeRelease(r->gain0UAV); SafeRelease(r->gain0Tex);
     SafeRelease(r->zoneListSRV); SafeRelease(r->zoneListBuf);
     SafeRelease(r->changeFlagsUAV); SafeRelease(r->changeFlagsBuf);
@@ -539,9 +541,11 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     r->stateValid = false; r->settleLeft = 0; r->temporalMode = FALD_TEMPORAL_OFF;
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bTrue0Tex, &r->bTrue0UAV, &r->bTrue0SRV)) { r->lastError = "B_true texture (round 0)"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bEst0Tex, &r->bEst0UAV, &r->bEst0SRV)) { r->lastError = "B_est texture (round 0)"; return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->fields0Tex, &r->fields0UAV, &r->fields0SRV, DXGI_FORMAT_R32G32B32A32_FLOAT)) { r->lastError = "packed fields texture (round 0)"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gain0Tex, &r->gain0UAV, &r->gain0SRV, DXGI_FORMAT_R32G32_FLOAT)) { r->lastError = "gain texture (round 0)"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bTrueTex, &r->bTrueUAV, &r->bTrueSRV)) { r->lastError = "B_true texture"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->bEstTex, &r->bEstUAV, &r->bEstSRV)) { r->lastError = "B_est texture"; return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->fieldsTex, &r->fieldsUAV, &r->fieldsSRV, DXGI_FORMAT_R32G32B32A32_FLOAT)) { r->lastError = "packed fields texture"; return false; }
     // R32G32F: (gain, the flat-normalised B_est of the soft knee's ceiling), low-passed together (C15)
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainATex, &r->gainAUAV, &r->gainASRV, DXGI_FORMAT_R32G32_FLOAT)) { r->lastError = "gain texture A"; return false; }
     if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->gainBTex, &r->gainBUAV, &r->gainBSRV, DXGI_FORMAT_R32G32_FLOAT)) { r->lastError = "gain texture B"; return false; }
@@ -705,8 +709,8 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
 
 static const UINT FALD_SRV_SLOTS = 24;   // t0..t23 (fald_shader.h; t20..t23 = the fade stack's views: bound by RunStat(1) and
                                          // the pixel pass while it is on, null elsewhere)
-static const UINT FALD_SRV_SLOTS_ALL = 39;   // ... + the fade passes' t24..t35, the conv pass's float4 kernel views t36 / t37,
-                                             // the touched-zone list t38
+static const UINT FALD_SRV_SLOTS_ALL = 40;   // ... + the fade passes' t24..t35, the conv pass's float4 kernel views t36 / t37,
+                                             // the touched-zone list t38, the packed fields t39
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
@@ -753,6 +757,7 @@ static void RunStat(FaldResources* r, uint32_t roundIdx, StatDispatch d = kStatF
     if (roundIdx == 1) {                                          // round 0's fields and smoothed (gain, ceiling B_est) (C15)
         ID3D11ShaderResourceView* fields[2] = { r->bTrue0SRV, r->bEst0SRV };
         g_context->CSSetShaderResources(5, 2, fields);
+        g_context->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &r->fields0SRV);   // t39: the same packed (SampleFields)
         ID3D11ShaderResourceView* gain0 = r->gainFused ? r->gain0SRV : r->gainBSRV;   // (the three-pass path leaves it in gainB)
         g_context->CSSetShaderResources(9, 1, &gain0);
         if (r->fadeOn) {                                          // FadePost on round 0's request: fade, F's opening, reach 0, s - f_q
@@ -907,8 +912,9 @@ static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D1
     ID3D11ShaderResourceView* k4[2] = { r->kTrue4SRV, r->kEst4SRV };   // the tables four floats wide (t36 / t37)
     g_context->CSSetShaderResources(36, 2, k4);
     // round 0 writes its own fields (the round-1 sweep and the change-driven path compare / read them later)
-    ID3D11UnorderedAccessView* uavs[2] = { roundIdx == 0 ? r->bTrue0UAV : r->bTrueUAV, roundIdx == 0 ? r->bEst0UAV : r->bEstUAV };
-    g_context->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    ID3D11UnorderedAccessView* uavs[3] = { roundIdx == 0 ? r->bTrue0UAV : r->bTrueUAV, roundIdx == 0 ? r->bEst0UAV : r->bEstUAV,
+                                           roundIdx == 0 ? r->fields0UAV : r->fieldsUAV };   // u2: the two packed with their flat response
+    g_context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
     {
         // roundIdx < 0 = the flat response at build (no pass of a run: the hook sees FALD_PASS_COUNT and ignores it)
         FaldPassScope ps(roundIdx < 0 ? FALD_PASS_COUNT : (roundIdx ? FALD_PASS_CONV1 : FALD_PASS_CONV0));
@@ -924,10 +930,12 @@ static void RunGain(FaldResources* r, uint32_t roundIdx, bool indirect = false) 
     const FaldPanelParams& p = r->params;
     UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
     ID3D11ShaderResourceView* fields[2] = { roundIdx ? r->bTrueSRV : r->bTrue0SRV, roundIdx ? r->bEstSRV : r->bEst0SRV };   // the round's own
+    ID3D11ShaderResourceView* packed = roundIdx ? r->fieldsSRV : r->fields0SRV;                                             // t39: the same packed
     if (r->gainFused) {                    // one dispatch: gain + both blurs straight into the round's map (fald_shader.h)
         g_context->CSSetShader(g_faldGainBlurCS, nullptr, 0);
         BindCommon(r, true);
         g_context->CSSetShaderResources(5, 2, fields);
+        g_context->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &packed);
         ID3D11UnorderedAccessView* out = roundIdx ? r->gainBUAV : r->gain0UAV;
         g_context->CSSetUnorderedAccessViews(0, 1, &out, nullptr);
         {
@@ -980,6 +988,7 @@ static FaldFadeCommon FadeCommon(FaldResources* r, bool roundFields, uint32_t ro
     for (int i = 0; i < 20; i++) c.srv[i] = v[i];
     if (roundFields) {                     // the round's own fields and smoothed gain
         c.srv[5] = round ? r->bTrueSRV : r->bTrue0SRV; c.srv[6] = round ? r->bEstSRV : r->bEst0SRV;
+        c.fields = round ? r->fieldsSRV : r->fields0SRV;                          // t39: the same packed (SampleFields)
         c.srv[9] = (round || !r->gainFused) ? r->gainBSRV : r->gain0SRV;
     }
     return c;
@@ -1071,7 +1080,8 @@ static std::string NarrowUtf8(const std::wstring& w) {
 
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
 // Must run after the fine textures exist; the flat textures are bound as SRVs t7/t8 from then on
-// (they are nullptr during this call, which the conv pass does not read).
+// (they are nullptr during this call: the conv pass's packed output (u2) gets zeros for them here, and every conv run of a
+// round rewrites its packed texture before the round's readers run).
 static void ComputeFlatResponse(FaldResources* r) {
     const float one[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
     g_context->ClearUnorderedAccessViewFloat(r->driveUAV, one);
@@ -1515,6 +1525,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     BindCommon(r, false);
     ID3D11ShaderResourceView* fields[2] = { r->bTrueSRV, r->bEstSRV };
     g_context->PSSetShaderResources(5, 2, fields);
+    g_context->PSSetShaderResources(FALD_FIELDS_SLOT, 1, &r->fieldsSRV);          // t39: the same packed (SampleFields)
     g_context->PSSetShaderResources(9, 1, &r->gainBSRV);
     // debug view 7: instantaneous vs filtered (mode 3: vs the clocks' mean LED state of this frame)
     ID3D11ShaderResourceView* filt = mapSrv(trun.debugFiltMap, 1);
@@ -1530,6 +1541,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     if (r->debugMode != 0) DrawExempt(ctx, r);   // a view: DesktopLUT's windows keep the corrected picture
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
+    g_context->PSSetShaderResources(FALD_FIELDS_SLOT, 1, nullSrv);                // t39 (the conv pass's u2 next run)
     if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);
 
     // The commit's indices and the settle hold (render.cpp asks FaldSettlePending on an acquire timeout and re-runs the

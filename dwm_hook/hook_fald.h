@@ -37,8 +37,8 @@ struct ID3D11Texture2D;
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
 // (t0..t19, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
-#define HOOK_FALD_SRV_SLOTS 39  // t0..t38: the layer t0..t22 (t20..t22 = the fade stack's views), the fade passes t24..t35,
-                                // the conv pass's float4 kernel views t36 / t37, the touched-zone list t38
+#define HOOK_FALD_SRV_SLOTS 40  // t0..t39: the layer t0..t22 (t20..t22 = the fade stack's views), the fade passes t24..t35,
+                                // the conv pass's float4 kernel views t36 / t37, the touched-zone list t38, the packed fields t39
 #define HOOK_FALD_UAV_SLOTS 8   // u0..u7: the fade passes bind up to u7 (the panel clock four)
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed

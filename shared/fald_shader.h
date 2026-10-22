@@ -160,6 +160,10 @@ Texture2D<float>  reachTex     : register(t22); // full res: reach of THIS round
 Texture2D<float>  fadeDTex     : register(t23); // 1/4 res: s - f_q (T11_TMTC); fade_T = clamp(fade + up4(.), 0, 1)
 Buffer<uint>      zoneList     : register(t38); // the partial path (runMode bits 0-7 = 1): the zones (row * cols + col) a
                                                 // present's rects touched, one per group of the statistic / S0 sweeps
+Texture2D<float4> fieldsTex    : register(t39); // the round's fields PACKED, (B_true, flat B_true, B_est, flat B_est) per fine
+                                                // texel (the conv pass's u2): SampleFields and the gain passes read all four
+                                                // with ONE sample / load (bit-identical: the filter runs per channel on the
+                                                // same texels with the same weights; t5..t8 stay for the dumps and the tests)
 SamplerState linearClamp : register(s0);
 uint RunModePartial() { return runMode & 0xFFu; }
 // The zone of a sweep's group: its id in a full sweep, the list's entry on the partial path (the group's x)
@@ -239,9 +243,9 @@ float2 FineUV(float2 px) {
 // flat_norm): a uniform field then gives B_true == B_est everywhere -> gain 1, no sub-cell sawtooth,
 // no border ramp.
 void SampleFields(float2 px, out float bTrue, out float bEst) {
-    float2 uv = FineUV(px);
-    bTrue = bTrueTex.SampleLevel(linearClamp, uv, 0) / max(flatTrueTex.SampleLevel(linearClamp, uv, 0), 1e-6f);
-    bEst  = bEstTex.SampleLevel(linearClamp, uv, 0)  / max(flatEstTex.SampleLevel(linearClamp, uv, 0), 1e-6f);
+    float4 f = fieldsTex.SampleLevel(linearClamp, FineUV(px), 0);   // (B_true, flat B_true, B_est, flat B_est): one sample
+    bTrue = f.x / max(f.y, 1e-6f);
+    bEst  = f.z / max(f.w, 1e-6f);
 }
 // Pixels outside the lattice have no cell and no reference behaviour: pass them through.
 bool InLattice(int2 px) {
@@ -1004,6 +1008,7 @@ inline const char* g_faldConvSource = R"(
 #endif
 RWTexture2D<float> bTrueOut : register(u0);
 RWTexture2D<float> bEstOut  : register(u1);
+RWTexture2D<float4> fieldsOut : register(u2);   // the two with their flat response: (B_true, flat, B_est, flat) = t39
 Buffer<float4> kTrue4 : register(t36);   // t2 viewed four floats wide (every table row starts at a multiple of 4)
 Buffer<float4> kEst4  : register(t37);   // t3 likewise
 
@@ -1104,6 +1109,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             uint fx = (uint)cx * sub + so % sub, fy = (uint)cy * sub + so / sub;
             bTrueOut[uint2(fx, fy)] = accT[s2];
             bEstOut[uint2(fx, fy)] = accE[s2];
+            fieldsOut[uint2(fx, fy)] = float4(accT[s2], flatTrueTex.Load(int3(fx, fy, 0)), accE[s2], flatEstTex.Load(int3(fx, fy, 0)));
         }
     }
 }
@@ -1121,6 +1127,9 @@ inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
 // host compiles the pass once per variant with g_faldConvSoDefine[v] in front of the common source, and runs the one
 // FaldConvVariant picks for the device and lattice (the kernel tables re-laid out for that S: fald_panel.h).
 static const unsigned int FALD_CONV_SO_VARIANTS = 4u;
+// The packed fields texture's SRV slot (fieldsTex above): bound per round next to t5 / t6 by the hosts (round 0's for the
+// round-1 sweep and round 0's gain / reach, round 1's for the pixel pass and round 1's gain / reach).
+static const unsigned int FALD_FIELDS_SLOT = 39u;
 inline unsigned int FaldConvSoOf(unsigned int variant) { return 1u << (variant < FALD_CONV_SO_VARIANTS ? variant : 0u); }
 inline const char* const g_faldConvSoDefine[FALD_CONV_SO_VARIANTS] = {
     "#define FALD_CONV_SO 1\n", "#define FALD_CONV_SO 2\n", "#define FALD_CONV_SO 4\n", "#define FALD_CONV_SO 8\n" };
@@ -1203,8 +1212,9 @@ RWTexture2D<float2> gainOut : register(u0);
 void main(uint3 id : SV_DispatchThreadID) {
     uint fx = id.x, fy = id.y;
     if (fx >= cols * sub || fy >= rows * sub) return;
-    float bT = bTrueTex.Load(int3(fx, fy, 0)) / max(flatTrueTex.Load(int3(fx, fy, 0)), 1e-6f);
-    float bE = bEstTex.Load(int3(fx, fy, 0))  / max(flatEstTex.Load(int3(fx, fy, 0)), 1e-6f);
+    float4 f = fieldsTex.Load(int3(fx, fy, 0));                        // (B_true, flat, B_est, flat): one load
+    float bT = f.x / max(f.y, 1e-6f);
+    float bE = f.z / max(f.w, 1e-6f);
     gainOut[uint2(fx, fy)] = float2(RawGain(bT, bE), bE);
 }
 )";
@@ -1326,8 +1336,9 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     for (uint e = t; e < (uint)(span * span); e += 256u) {
         int ax = (int)(e % (uint)span), ay = (int)(e / (uint)span);
         int fx = clamp(x0 + ax, 0, W - 1), fy = clamp(y0 + ay, 0, H - 1);
-        float bT = bTrueTex.Load(int3(fx, fy, 0)) / max(flatTrueTex.Load(int3(fx, fy, 0)), 1e-6f);
-        float bE = bEstTex.Load(int3(fx, fy, 0))  / max(flatEstTex.Load(int3(fx, fy, 0)), 1e-6f);
+        float4 f = fieldsTex.Load(int3(fx, fy, 0));                    // (B_true, flat, B_est, flat): one load
+        float bT = f.x / max(f.y, 1e-6f);
+        float bE = f.z / max(f.w, 1e-6f);
         gG[ay * 56 + ax] = float2(RawGain(bT, bE), bE);
     }
     GroupMemoryBarrierWithGroupSync();
