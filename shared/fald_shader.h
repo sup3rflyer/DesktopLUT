@@ -558,7 +558,8 @@ RWStructuredBuffer<uint> boostCount : register(u3);     // [round] = the non-bla
                                                         // every finished zone adds (new flag - old flag), so the count
                                                         // follows the map whether the sweep is full or partial
 RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [round] = a drive / flag of that round moved,
-                                                        // [2] = the starfield's S0 moved (read and cleared by the decide pass)
+                                                        // [2] = the starfield's S0 moved, [3] = the caller's "the frame changed
+                                                        // everywhere" (read and cleared by the decide pass; fald_change.h)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared uint gLit[256];
@@ -1252,6 +1253,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 // sweep in full, and so on; nothing moved runs the round-1 sweep on the touched zones only, and the pixel pass over the
 // rects alone (the hosts draw that one; the full-frame pixel pass is the indirect draw here). The flags are cleared by
 // the last decide of the run. On the full path only the boost is written (the hosts dispatch everything directly).
+// roundIdx 3 = BEFORE any sweep, when the caller's pass may have changed the whole frame (changeFlags[3], the dynamic
+// tone map's peak: shared/fald_change.h): it orders S0 and round 0's sweep over the whole lattice (the touched-zone
+// sweeps still run first: harmless, their values are rewritten), and every later decide takes that flag as "moved".
 // Argument slots (bytes; 3 uints each, the pixel pass 4): shared/fald_change.h FALD_ARGS_*.
 inline const char* g_faldDecideSource = R"(
 RWStructuredBuffer<uint> boostCount : register(u3);
@@ -1260,7 +1264,8 @@ RWStructuredBuffer<uint> changeFlags : register(u5);
 RWByteAddressBuffer args : register(u6);                 // the indirect arguments
 static const uint ARGS_STAR_S1 = 0, ARGS_STAR_S2 = 16, ARGS_STAT0_FULL = 32, ARGS_STAT0_FULL_COMBINE = 48, ARGS_STAT0_PART = 64,
                   ARGS_STAT0_PART_COMBINE = 80, ARGS_CONV0 = 96, ARGS_GAIN0 = 112, ARGS_STAT1_FULL = 128, ARGS_STAT1_FULL_COMBINE = 144,
-                  ARGS_STAT1_PART = 160, ARGS_STAT1_PART_COMBINE = 176, ARGS_CONV1 = 192, ARGS_GAIN1 = 208, ARGS_PIXEL = 224;
+                  ARGS_STAT1_PART = 160, ARGS_STAT1_PART_COMBINE = 176, ARGS_CONV1 = 192, ARGS_GAIN1 = 208, ARGS_PIXEL = 224,
+                  ARGS_STAR_S0_FULL = 240, ARGS_STAR_S0_FULL_COMBINE = 256;
 
 [numthreads(1, 1, 1)]
 void main() {
@@ -1276,15 +1281,25 @@ void main() {
         boostOut[uint2(1, 0)] = (float)count;
     }
     if (mode != 1u) return;
-    uint flagS = changeFlags[2], flag0 = changeFlags[0], flag1 = changeFlags[1];
+    uint flagS = changeFlags[2], flag0 = changeFlags[0], flag1 = changeFlags[1], flagF = changeFlags[3];
     uint3 none = uint3(0u, 0u, 0u);
     uint3 zonesFull = uint3(cols, rows, ZoneSlices()), zonesFullC = uint3(cols, rows, 1u);
     uint3 zonesPart = uint3(nList, 1u, ZoneSlices()), zonesPartC = uint3(nList, 1u, 1u);
     uint3 lattice = uint3((cols + 15u) / 16u, (rows + 15u) / 16u, 1u);
     uint3 conv = uint3((cols * rows + 63u) / 64u, (sub * sub + so - 1u) / so, 1u);
     uint3 fine = uint3((cols * sub + 15u) / 16u, (rows * sub + 15u) / 16u, 1u);
+    if (roundIdx == 3u) {                                                // before any sweep: the frame changed everywhere?
+        bool all = flagF != 0u;
+        args.Store3(ARGS_STAR_S0_FULL, all ? zonesFull : none);
+        args.Store3(ARGS_STAR_S0_FULL_COMBINE, all ? zonesFullC : none);
+        args.Store3(ARGS_STAT0_FULL, all ? zonesFull : none);
+        args.Store3(ARGS_STAT0_FULL_COMBINE, all ? zonesFullC : none);
+        args.Store3(ARGS_STAT0_PART, all ? none : zonesPart);
+        args.Store3(ARGS_STAT0_PART_COMBINE, all ? none : zonesPartC);
+        return;
+    }
     if (roundIdx == 2u) {                                                // after S0: the plan passes + round 0's sweep
-        bool star = flagS != 0u;
+        bool star = (flagS | flagF) != 0u;
         args.Store3(ARGS_STAR_S1, star ? lattice : none);
         args.Store3(ARGS_STAR_S2, star ? lattice : none);
         args.Store3(ARGS_STAT0_FULL, star ? zonesFull : none);
@@ -1294,7 +1309,7 @@ void main() {
         return;
     }
     if (roundIdx == 0u) {                                                // after round 0's sweep (+ LED lag)
-        bool c = (flagS | flag0) != 0u;
+        bool c = (flagS | flag0 | flagF) != 0u;
         args.Store3(ARGS_CONV0, c ? conv : none);
         args.Store3(ARGS_GAIN0, c ? fine : none);
         args.Store3(ARGS_STAT1_FULL, c ? zonesFull : none);
@@ -1303,11 +1318,11 @@ void main() {
         args.Store3(ARGS_STAT1_PART_COMBINE, c ? none : zonesPartC);
         return;
     }
-    bool c1 = (flagS | flag0 | flag1) != 0u;                             // after round 1's sweep (+ LED lag)
+    bool c1 = (flagS | flag0 | flag1 | flagF) != 0u;                     // after round 1's sweep (+ LED lag)
     args.Store3(ARGS_CONV1, c1 ? conv : none);
     args.Store3(ARGS_GAIN1, c1 ? fine : none);
     args.Store4(ARGS_PIXEL, uint4(3u, c1 ? 1u : 0u, 0u, 0u));           // DrawInstancedIndirect: the fullscreen triangle or nothing
-    changeFlags[0] = 0u; changeFlags[1] = 0u; changeFlags[2] = 0u;
+    changeFlags[0] = 0u; changeFlags[1] = 0u; changeFlags[2] = 0u; changeFlags[3] = 0u;
 }
 )";
 

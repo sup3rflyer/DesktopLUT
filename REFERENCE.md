@@ -529,6 +529,16 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   forced / unknown; `p90_ms`, `budget_ms`, `content_ms`, `refresh_ms`; `forced`). In hook mode the DLL reports it
   through the section `Global\DesktopLUT_DwmHook_FaldStatus` (`shared/dwm_hook_config.h DwmHookFaldStatus`; the force
   key travels as faldFlags bit 10).
+- **The change-driven path** (`shared/fald_change.h`, overlay and hook alike): a present whose dirty rects touch few
+  zones (at most half of them) recomputes only those zones' statistics; the GPU itself decides, with a decide pass
+  after each sweep and indirect dispatches, whether the convolution, the gain, a full round-1 sweep and the full pixel
+  pass have to run (a moved drive, zone flag, starfield statistic or LED-lag map), and in hook mode the pixel pass draws
+  only the rects DWM re-composed. Exact by construction (every field equals the full run's, bit for bit). It needs the
+  pass that makes the frame to be the same function as at the previous present: a LUT or a static tone map is keyed by
+  its settings; a DYNAMIC tone map's peak detector says on the GPU, every present, whether the smoothed peak moved — when
+  it stands only the rects go through the tone map and the layer, when it moves the whole frame is redrawn and every zone
+  recomputed (the presents while the peak settles after a content change: about 0.5 s after a brightening, up to ~3 s
+  after a large darkening at 60 Hz). A live edit preview keys 0: the full path. The hook's log line carries `partial runs`.
 - **The layer's GPU rate cap** (`shared/fald_core_governor.h`, overlay and hook alike): the GPU time of the layer's full
   run (the zone statistics, both convolutions, the gains, the pixel pass — not the flank fade) is measured on every full
   run with timestamp queries read a few runs later. Budget = 15 % of the refresh interval. When the p90 over the last

@@ -64,9 +64,18 @@ enum FaldArgsSlot : unsigned int {
     FALD_ARGS_STAR_S1 = 0, FALD_ARGS_STAR_S2 = 16, FALD_ARGS_STAT0_FULL = 32, FALD_ARGS_STAT0_FULL_COMBINE = 48,
     FALD_ARGS_STAT0_PART = 64, FALD_ARGS_STAT0_PART_COMBINE = 80, FALD_ARGS_CONV0 = 96, FALD_ARGS_GAIN0 = 112,
     FALD_ARGS_STAT1_FULL = 128, FALD_ARGS_STAT1_FULL_COMBINE = 144, FALD_ARGS_STAT1_PART = 160, FALD_ARGS_STAT1_PART_COMBINE = 176,
-    FALD_ARGS_CONV1 = 192, FALD_ARGS_GAIN1 = 208, FALD_ARGS_PIXEL = 224
+    FALD_ARGS_CONV1 = 192, FALD_ARGS_GAIN1 = 208, FALD_ARGS_PIXEL = 224,
+    FALD_ARGS_STAR_S0_FULL = 240, FALD_ARGS_STAR_S0_FULL_COMBINE = 256   // S0 over the whole lattice (the frame changed everywhere)
 };
-constexpr unsigned int FALD_ARGS_BYTES = 240;
+constexpr unsigned int FALD_ARGS_BYTES = 272;
+// The change flags (u5, FALD_CHANGE_FLAGS uints, zeroed at build and by the last decide of a run): [0] / [1] = a drive, a
+// zone flag or an LED-lag map of that round moved, [2] = the starfield's S0 moved, [3] = THE FRAME CHANGED EVERYWHERE —
+// the caller's word that the pass which made the intermediate (the tone map with a dynamic peak: shared/peak_detect.h,
+// the smoothing pass's draw arguments) is not the function it was at the previous run, so no zone's statistic can be
+// taken as unchanged: a decide pass before any sweep (RunDecide 3) then orders S0 and round 0's sweep in full, and
+// every later decide treats it as "moved". The hosts copy the caller's 4-byte flag into [3] (a GPU copy, no readback).
+constexpr unsigned int FALD_CHANGE_FLAGS = 4;
+constexpr unsigned int FALD_CHANGE_FLAG_FRAME_BYTES = 12;   // byte offset of [3]
 // CB word 79 (fald_shader.h runMode): the path, the conv pass's sub-offsets per thread, the list's length.
 inline uint32_t FaldRunModeWord(bool partial, unsigned int convSo, unsigned int listLen) {
     return (partial ? 1u : 0u) | ((convSo & 0xFFu) << 8) | ((listLen > 0xFFFFu ? 0xFFFFu : listLen) << 16);

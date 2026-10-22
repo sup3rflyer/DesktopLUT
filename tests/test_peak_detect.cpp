@@ -118,6 +118,9 @@ struct PeakGpuHarness {
     ID3D11ComputeShader* smoothCS = nullptr;
     ID3D11Buffer* cb = nullptr;
     ID3D11Texture2D* staging = nullptr;
+    ID3D11Buffer* argsBuf = nullptr;                  // the smoothing pass's draw arguments (CreatePeakArgsBuffer)
+    ID3D11UnorderedAccessView* argsUAV = nullptr;
+    ID3D11Buffer* argsStaging = nullptr;
     std::string error;
     bool deviceUnavailable = false;
 
@@ -133,6 +136,7 @@ struct PeakGpuHarness {
     ~PeakGpuHarness() {
         auto rel = [](IUnknown* p) { if (p) p->Release(); };
         for (auto& d : detectors) { rel(d.rawUAV); rel(d.rawTex); rel(d.peakUAV); rel(d.peakTex); }
+        rel(argsStaging); rel(argsUAV); rel(argsBuf);
         rel(staging); rel(cb); rel(smoothCS); rel(reduceCS); rel(dc); rel(device);
     }
 
@@ -200,7 +204,32 @@ struct PeakGpuHarness {
         sd.Format = DXGI_FORMAT_R32_FLOAT; sd.SampleDesc.Count = 1;
         sd.Usage = D3D11_USAGE_STAGING; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         if (FAILED(device->CreateTexture2D(&sd, nullptr, &staging))) { error = "staging create failed"; return false; }
+        if (FAILED(CreatePeakArgsBuffer(device, &argsBuf, &argsUAV))) { error = "args buffer create failed"; return false; }
+        D3D11_BUFFER_DESC ad = {};
+        ad.ByteWidth = 16; ad.Usage = D3D11_USAGE_STAGING; ad.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(device->CreateBuffer(&ad, nullptr, &argsStaging))) { error = "args staging create failed"; return false; }
         return true;
+    }
+    // The production dispatch with the draw-argument buffer bound: the smoothed peak (nits) and the arguments' four words
+    // (4, moved, 0, 0) — `moved` = the PQ value the pixel shader reads differs from the previous frame's.
+    float RunFrameArgs(const SyntheticFrame& f, uint32_t args[4], const PeakParams& params = PeakParams{}, int which = 0) {
+        ID3D11Texture2D* tex = nullptr;
+        ID3D11ShaderResourceView* srv = UploadFrame(f, &tex);
+        REQUIRE(srv != nullptr);
+        Detector& d = detectors[which];
+        DispatchPeakDetection(dc, reduceCS, smoothCS, cb, srv, d.peakUAV, d.rawUAV, f.width, f.height, &params, argsUAV);
+        dc->CopyResource(staging, d.peakTex);
+        dc->CopyResource(argsStaging, argsBuf);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        REQUIRE(SUCCEEDED(dc->Map(staging, 0, D3D11_MAP_READ, 0, &m)));
+        float pq = *(const float*)m.pData;
+        dc->Unmap(staging, 0);
+        REQUIRE(SUCCEEDED(dc->Map(argsStaging, 0, D3D11_MAP_READ, 0, &m)));
+        std::memcpy(args, m.pData, 16);
+        dc->Unmap(argsStaging, 0);
+        srv->Release();
+        tex->Release();
+        return PQToLinearScalar(pq) * 10000.0f;
     }
 
     ID3D11ShaderResourceView* UploadFrame(const SyntheticFrame& f, ID3D11Texture2D** texOut) {
@@ -318,6 +347,55 @@ TEST_CASE("PeakDetect: temporal smoothing reference (rise/fall rates + slew limi
 // =============================================================================================
 // Real HLSL on a D3D11 device (WARP) through the production DispatchPeakDetection
 // =============================================================================================
+
+// The smoothing pass's draw arguments (peak_detect.h peakArgs, u2; the FALD layer's change-driven path, 2026-10-22):
+// (4, moved, 0, 0) with moved = 1 iff the PQ peak the pixel shader reads differs from the previous frame's. The first
+// frame moves (the history was empty); a brightening moves it until the exponential + slew settle EXACTLY (the stored
+// PQ is a fixed point of the float32 decode / smooth / encode); a still frame then reads 0 every frame — the owner's
+// desktop between content changes; a darkening moves it again. The settle count on WARP is reported: the number of
+// presents after a change on which a dynamic-peak desktop still takes the layer's full path.
+TEST_CASE("PeakDetect: the draw arguments say whether the peak moved, and a still frame settles to 0 (WARP)") {
+    PeakGpuHarness gpu;
+    PEAK_GPU_INIT_OR_SKIP(gpu);
+    uint32_t a[4] = {};
+    SyntheticFrame still{ 1920, 1080, { { 100, 100, 64, 64, 5.0f, 5.0f, 5.0f } } };      // 400 nits
+    gpu.RunFrameArgs(still, a);
+    CHECK(a[0] == 4u); CHECK(a[1] == 1u); CHECK(a[2] == 0u); CHECK(a[3] == 0u);           // the first frame: moved
+    int settledAfter = -1;
+    float last = 0.0f;
+    for (int i = 1; i <= 200 && settledAfter < 0; i++) {
+        last = gpu.RunFrameArgs(still, a);
+        CHECK(a[0] == 4u);
+        if (a[1] == 0u) settledAfter = i;
+    }
+    MESSAGE("a still 400-nit frame: the peak stands (moved = 0) from frame " << settledAfter << " on (" << last << " nits)");
+    REQUIRE(settledAfter >= 1);
+    CHECK(settledAfter <= 3);                                                            // a constant input is a fixed point at once
+    for (int i = 0; i < 20; i++) { gpu.RunFrameArgs(still, a); CHECK(a[1] == 0u); }      // ... and stays one
+    // a brighter frame: the peak rises over several frames (30 % of the gap, <= 100 nits per frame), moving each time,
+    // then settles exactly; a darker one falls (5 %, <= 50 nits) the same way
+    SyntheticFrame bright{ 1920, 1080, { { 100, 100, 64, 64, 20.0f, 20.0f, 20.0f } } };   // 1600 nits
+    int moving = 0, settledRise = -1;
+    for (int i = 1; i <= 400 && settledRise < 0; i++) {
+        last = gpu.RunFrameArgs(bright, a);
+        if (a[1] != 0u) moving++; else settledRise = i;
+    }
+    MESSAGE("1600 nits: " << moving << " moving frames, settled at " << last << " nits");
+    CHECK(moving >= 10);                                                                 // 1200 nits at <= 100 per frame
+    REQUIRE(settledRise >= 1);
+    CHECK(last == doctest::Approx(1600.0f).epsilon(0.002));
+    for (int i = 0; i < 20; i++) { gpu.RunFrameArgs(bright, a); CHECK(a[1] == 0u); }
+    int fall = 0, settledFall = -1;
+    for (int i = 1; i <= 2000 && settledFall < 0; i++) {
+        last = gpu.RunFrameArgs(still, a);
+        if (a[1] != 0u) fall++; else settledFall = i;
+    }
+    MESSAGE("back to 400 nits: " << fall << " moving frames, settled at " << last << " nits");
+    CHECK(fall >= 24);                                                                   // 1200 nits at <= 50 per frame
+    REQUIRE(settledFall >= 1);
+    CHECK(last == doctest::Approx(400.0f).epsilon(0.002));
+    for (int i = 0; i < 20; i++) { gpu.RunFrameArgs(still, a); CHECK(a[1] == 0u); }
+}
 
 TEST_CASE("PeakDetect: GPU reduction + smoothing match the CPU reference at 4K") {
     PeakGpuHarness gpu;

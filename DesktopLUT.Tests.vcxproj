@@ -176,6 +176,7 @@
     <ClCompile Include="tests\test_fald_fade_hw.cpp" />
     <ClCompile Include="tests\test_fald_pitch.cpp" />
     <ClCompile Include="tests\test_fald_change.cpp" />
+    <ClCompile Include="tests\test_fald_clock_gate.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
     <ClCompile Include="tests\test_tonemap_curves.cpp" />
     <ClCompile Include="tests\test_hdr_dither.cpp" />

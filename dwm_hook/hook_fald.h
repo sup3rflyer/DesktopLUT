@@ -33,6 +33,7 @@ struct ID3D11DeviceContext;
 struct ID3D11ShaderResourceView;
 struct ID3D11RenderTargetView;
 struct ID3D11Texture2D;
+struct ID3D11Buffer;
 
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
 // (t0..t19, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
@@ -145,8 +146,15 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
 // pass on the same inputs; 0 = unknown or time-varying, e.g. the dynamic peak). With the clean copy unchanged since the
 // last run (FaldUpdateClean copied no rect), the same key = the same intermediate: with the flank fade on and LED lag off
 // both rounds' reach are reused (shared/fald_fade.h FaldFadeReachCurrent).
+// frameChanged / frameChangedOffset (shared/fald_change.h changeFlags[3]): a buffer whose uint at that byte offset the GPU
+// set to 1 when the pass that made the intermediate changed the WHOLE frame this present — the dynamic tone map's peak
+// moved (shared/peak_detect.h: the smoothing pass's draw arguments, PEAK_ARGS_MOVED_OFFSET) — and 0 when it is the same
+// function as at the previous present; null = the pass is the same function whenever lutPassKey is equal. On a partial
+// run the layer copies it into its change flags (GPU to GPU, no readback) and its decide passes order full sweeps when set.
 #define FALD_RUN_HAS_FRAME_KEY 1
-bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, unsigned long long lutPassKey = 0);
+#define FALD_RUN_HAS_FRAME_CHANGED 1
+bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, unsigned long long lutPassKey = 0,
+             ID3D11Buffer* frameChanged = nullptr, unsigned int frameChangedOffset = 0);
 
 // Microseconds the last FaldRun spent on the CPU side of the present path (QPC span around the
 // dispatches; the GPU work is asynchronous). Logged periodically so the frame cost is a number
@@ -177,4 +185,9 @@ unsigned int FaldTestFadeGovState(const FaldMonitor* m);
 // The entry's core governor state (shared/fald_core_governor.h FaldCoreGovState as a number) and its held runs.
 unsigned int FaldTestCoreGovState(const FaldMonitor* m);
 unsigned long long FaldTestHeldRuns(const FaldMonitor* m);
+// The panel clock's k of the last run (shared/fald_temporal.h clkElapsed), whether that run seeded the clocks, and whether
+// it took the change-driven path.
+unsigned long long FaldTestClockElapsed(const FaldMonitor* m);
+bool FaldTestClockSeeded(const FaldMonitor* m);
+bool FaldTestLastPartial(const FaldMonitor* m);
 #endif

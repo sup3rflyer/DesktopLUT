@@ -153,6 +153,11 @@ bool CreatePeakDetectionResources(MonitorContext* ctx) {
         return false;
     }
 
+    // The smoothing pass's draw arguments ("the peak moved this frame"): the FALD layer's change-driven path needs the
+    // word; non-fatal — without it a dynamic-peak frame takes the layer's full path (the frame key stays 0).
+    if (FAILED(CreatePeakArgsBuffer(g_device, &ctx->peakArgsBuf, &ctx->peakArgsUAV)))
+        std::cerr << "Monitor " << ctx->index << " peak draw-argument buffer failed (the FALD layer's change-driven path is off with a dynamic peak)" << std::endl;
+
     std::cout << "Monitor " << ctx->index << " peak detection resources created" << std::endl;
     return true;
 }

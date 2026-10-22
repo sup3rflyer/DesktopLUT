@@ -100,6 +100,8 @@ void main(uint3 DTid : SV_DispatchThreadID, uint GI : SV_GroupIndex) {
 inline const char* g_peakSmoothCSSource = R"(
 RWTexture2D<float> peakOutput : register(u0);
 RWTexture2D<uint> peakRaw : register(u1);
+RWByteAddressBuffer peakArgs : register(u2);   // optional (unbound = the stores are dropped): the tone-map pass's
+                                               // full-frame draw arguments for a change-driven caller — see below
 
 cbuffer PeakParams : register(b0) {
     uint frameWidth;
@@ -153,9 +155,47 @@ void main() {
     // PQ OETF: nits -> linear -> PQ (runs once per frame, 1 thread)
     float Y = max(smoothedPeak / 10000.0f, 1e-10f);
     float Ym = pow(Y, 0.1593017578125f);
-    peakOutput[uint2(0, 0)] = pow((0.8359375f + 18.8515625f * Ym) / (1.0f + 18.6875f * Ym), 78.84375f);
+    float newPQ = pow((0.8359375f + 18.8515625f * Ym) / (1.0f + 18.6875f * Ym), 78.84375f);
+    peakOutput[uint2(0, 0)] = newPQ;
+    // Did the value the pixel shader reads MOVE this frame? The tone-map pass is then a different function of every
+    // pixel, so a change-driven caller (the FALD layer's partial path, shared/fald_change.h) must redraw the whole frame
+    // through it and treat every zone as changed; when it stands, the pass is the same function as last frame and only
+    // the dirty rects need drawing. Written as DrawInstancedIndirect arguments for the pass's full-frame quad (4 vertices
+    // of a strip; instance count 1 = draw it, 0 = nothing) — the caller also copies the instance count into the layer's
+    // change flags. Decided on the GPU, bit for bit, with no readback: the first frame after a reset (prevPQ <= 0) moved.
+    peakArgs.Store4(0, uint4(4u, (newPQ != prevPQ) ? 1u : 0u, 0u, 0u));
 }
 )";
+
+// The smoothing pass's draw-argument buffer (peakArgs above, u2): 16 bytes, raw, usable as DrawInstancedIndirect
+// arguments and as a copy source. Starts as "draw" (instance count 1): nothing reads it before the pass writes it.
+inline HRESULT CreatePeakArgsBuffer(ID3D11Device* device, ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav) {
+    const uint32_t init[4] = { 4u, 1u, 0u, 0u };
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    D3D11_SUBRESOURCE_DATA sd = {};
+    sd.pSysMem = init;
+    *buf = nullptr; *uav = nullptr;
+    HRESULT hr = device->CreateBuffer(&bd, &sd, buf);
+    if (SUCCEEDED(hr)) {
+        D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+        ud.Format = DXGI_FORMAT_R32_TYPELESS;
+        ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        ud.Buffer.NumElements = 4;
+        ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        hr = device->CreateUnorderedAccessView(*buf, &ud, uav);
+    }
+    if (FAILED(hr)) {
+        if (*uav) { (*uav)->Release(); *uav = nullptr; }
+        if (*buf) { (*buf)->Release(); *buf = nullptr; }
+    }
+    return hr;
+}
+// The byte offset of the instance count inside the arguments (what the FALD layer copies into its change flags).
+constexpr unsigned PEAK_ARGS_MOVED_OFFSET = 4;
 
 // 1x1 R32_UINT raw-max texture + UAV, cleared to zero (the smoothing pass reads, then resets it).
 // On failure nothing is left allocated.
@@ -234,12 +274,14 @@ inline int AcquirePeakSlot(PeakSlotKey* keys, int count, int left, int top,
 // Both passes for one frame. Writes the constant buffer every call (32 bytes): the buffer is
 // shared by every monitor, so a per-monitor "dimensions changed" skip would reduce one monitor's
 // frame with another monitor's size. Leaves no CS state bound (the hook runs on DWM's context).
+// argsUAV: the smoothing pass's draw-argument buffer (CreatePeakArgsBuffer; null = not wanted).
 inline void DispatchPeakDetection(ID3D11DeviceContext* dc,
                                   ID3D11ComputeShader* reduceCS, ID3D11ComputeShader* smoothCS,
                                   ID3D11Buffer* peakCB, ID3D11ShaderResourceView* frameSRV,
                                   ID3D11UnorderedAccessView* peakUAV, ID3D11UnorderedAccessView* rawUAV,
                                   unsigned width, unsigned height,
-                                  const PeakParams* paramsOverride = nullptr) {
+                                  const PeakParams* paramsOverride = nullptr,
+                                  ID3D11UnorderedAccessView* argsUAV = nullptr) {
     PeakParams params = paramsOverride ? *paramsOverride : PeakParams{};
     params.frameWidth = width;
     params.frameHeight = height;
@@ -248,17 +290,17 @@ inline void DispatchPeakDetection(ID3D11DeviceContext* dc,
     memcpy(mapped.pData, &params, sizeof(params));
     dc->Unmap(peakCB, 0);
 
-    ID3D11UnorderedAccessView* uavs[2] = { peakUAV, rawUAV };
+    ID3D11UnorderedAccessView* uavs[3] = { peakUAV, rawUAV, argsUAV };
     dc->CSSetShader(reduceCS, nullptr, 0);
     dc->CSSetConstantBuffers(0, 1, &peakCB);
     dc->CSSetShaderResources(0, 1, &frameSRV);
-    dc->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
+    dc->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
     dc->Dispatch(PeakGroupCount(width), PeakGroupCount(height), 1);
     dc->CSSetShader(smoothCS, nullptr, 0);
     dc->Dispatch(1, 1, 1);
 
-    ID3D11UnorderedAccessView* nullUAVs[2] = { nullptr, nullptr };
-    dc->CSSetUnorderedAccessViews(0, 2, nullUAVs, nullptr);
+    ID3D11UnorderedAccessView* nullUAVs[3] = { nullptr, nullptr, nullptr };
+    dc->CSSetUnorderedAccessViews(0, 3, nullUAVs, nullptr);
     ID3D11ShaderResourceView* nullSRV = nullptr;
     dc->CSSetShaderResources(0, 1, &nullSRV);
     ID3D11Buffer* nullCB = nullptr;

@@ -137,6 +137,8 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
                                            // rate-cap governor's) corrects the new frame with them; false after a build, idle
     unsigned long long heldRuns = 0;       // the runs that kept the fields (the governor's cap; the log, the tests)
     unsigned long long lastSettingsKey = 0, lastFrameKey = 0;   // of the previous run
+    uint32_t lastTrueMap = 0xFFFFFFFFu, lastEstMap = 0xFFFFFFFFu;   // the maps (FaldDriveMap) its kernels read: a run whose
+                                           // routing differs (a panel-clock seed / the first clock run after it) is full
     bool lastPartial = false;              // the previous run took the partial path (the dump, the tests)
     std::vector<uint32_t> touched;         // the touched-zone list of the current run
     // zone sweeps (work guide C14; fald_shader.h above ZoneSlices): slices per zone, and for a lattice of more than one
@@ -240,10 +242,17 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // (frameKey equal) is taken as "nothing changed". When the rules allow it (FaldChangeDecide) the sweeps run on the touched
 // zones only and the GPU decides what else has to run (the decide pass + indirect dispatches); the pixel pass draws the
 // whole target as always (this path's swap chain gets a whole frame per present). Bit for bit the full run.
+// frameChanged / frameChangedOffset (fald_change.h changeFlags[3]): a buffer whose uint at that byte offset the GPU set to
+// 1 when the pass that made the intermediate changed the whole frame this present (the dynamic tone map's peak moved:
+// shared/peak_detect.h, the smoothing pass's draw arguments + PEAK_ARGS_MOVED_OFFSET) and 0 when it is the same function
+// as at the previous run; null = the caller knows the pass is the same function whenever the key is equal (static). On a
+// partial run the layer copies it into its change flags (GPU to GPU) and a decide pass orders full sweeps when set.
 #define FALD_RUN_HAS_FRAME_KEY 1
 #define FALD_RUN_HAS_RECTS 1
+#define FALD_RUN_HAS_FRAME_CHANGED 1
 void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true, unsigned long long frameKey = 0,
-                   const FaldChangeRect* rects = nullptr, int numRects = -1);
+                   const FaldChangeRect* rects = nullptr, int numRects = -1, ID3D11Buffer* frameChanged = nullptr,
+                   unsigned int frameChangedOffset = 0);
 // True while the temporal drive state still owes settle frames after the last content change (render thread).
 // The render loop then re-runs ONLY the FALD passes on the layer's own intermediate (the main pass output of the
 // last frame) and presents — no Desktop Duplication read (the released frame texture is not a valid source; HW

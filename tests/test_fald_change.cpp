@@ -6,13 +6,16 @@
 #include "../src/types.h"
 #include "../src/globals.h"
 #include "../shared/fald_shader.h"
+#include "../shared/peak_detect.h"
 #include <d3dcompiler.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -121,12 +124,16 @@ std::wstring ChOwnerPanel(const wchar_t* rel) {
     const std::wstring p = std::wstring(L"H:\\Projects\\DesktopLUT\\") + rel;
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES ? p : std::wstring();
 }
-// One layer context (its own monitor context + target) run on a frame with a path override.
+// One layer context (its own monitor context + target) run on a frame with a path override. `partialOverride` is applied
+// at EVERY run (g_faldPartialOverride is read by FaldRunPasses, not at build): 0 = the full path always (the reference),
+// -1 = the change-driven path by its rules.
 struct ChLayer {
     MonitorContext ctx;
     ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
     bool ok = false;
-    ChLayer(ChWarp& w, const std::wstring& panel, int fw, int fh, bool star, unsigned int temporal) {
+    int partialOverride = -1;
+    ChLayer(ChWarp& w, const std::wstring& panel, int fw, int fh, bool star, unsigned int temporal, int partialOverrideAtRun = -1)
+        : partialOverride(partialOverrideAtRun) {
         ctx.width = fw; ctx.height = fh; ctx.isHDREnabled = true; ctx.isFP16SDR = false;
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 16.667f;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
@@ -140,15 +147,18 @@ struct ChLayer {
         ok = SUCCEEDED(w.dev->CreateTexture2D(&td, nullptr, &target)) && SUCCEEDED(w.dev->CreateRenderTargetView(target, nullptr, &rtv));
     }
     ~ChLayer() { if (rtv) rtv->Release(); if (target) target->Release(); FaldReleaseResources(&ctx); }
-    // upload the whole frame, run with the rects (numRects < 0: unknown = full), return the hashes of every field + the output
+    // upload the whole frame, run with the rects (numRects < 0: unknown = full), return the hashes of every field + the output;
+    // word = the caller's "the frame changed everywhere" buffer (fald.h frameChanged; (4, moved, 0, 0) as the peak pass writes)
     std::vector<std::pair<std::string, uint64_t>> Run(ChWarp& w, const std::vector<uint16_t>& frame, unsigned long long key, bool newContent,
-                                                     const std::vector<FaldChangeRect>* rects) {
+                                                     const std::vector<FaldChangeRect>* rects, ID3D11Buffer* word = nullptr) {
         D3D11_VIEWPORT vp = { 0, 0, (float)ctx.width, (float)ctx.height, 0, 1 };
         w.ic->RSSetViewports(1, &vp);
         w.ic->VSSetShader(w.vs, nullptr, 0);
         w.ic->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         w.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)ctx.width * 8u, 0);
-        FaldRunPasses(&ctx, rtv, newContent, key, rects ? rects->data() : nullptr, rects ? (int)rects->size() : -1);
+        g_faldPartialOverride = partialOverride;
+        FaldRunPasses(&ctx, rtv, newContent, key, rects ? rects->data() : nullptr, rects ? (int)rects->size() : -1, word, 4u);
+        g_faldPartialOverride = -1;
         w.ic->Flush();
         const FaldResources* r = ctx.fald;
         const std::pair<const char*, ID3D11Texture2D*> tex[] = {
@@ -203,10 +213,8 @@ TEST_CASE("FALD change: the partial path equals the full path, field for field a
     };
     for (unsigned int temporal : { 0u, 2u })
         for (int star = 0; star < 2; star++) {
-            g_faldPartialOverride = 0;
-            ChLayer full(w, C, W, H, star != 0, temporal);
-            g_faldPartialOverride = -1;
-            ChLayer part(w, C, W, H, star != 0, temporal);
+            ChLayer full(w, C, W, H, star != 0, temporal, 0);    // the reference: the full path at every run
+            ChLayer part(w, C, W, H, star != 0, temporal, -1);   // the change-driven path by its rules
             REQUIRE(full.ok); REQUIRE(part.ok);
             std::vector<uint16_t> frame = base;
             unsigned long long key = 1000;
@@ -255,4 +263,327 @@ TEST_CASE("FALD change: the partial path needs a complete state, the same settin
     { FaldChangeInputs x = in; x.touchedZones = 0; CHECK(FaldChangeDecide(x, cap) == FALD_CHANGE_PARTIAL); }
     // LED lag: every known mode is partial-able (its passes compare their outputs on the GPU and flag a movement)
     for (unsigned int mode : { 1u, 2u, 3u }) { FaldChangeInputs x = in; x.temporalMode = mode; CHECK(FaldChangeDecide(x, cap) == FALD_CHANGE_PARTIAL); }
+}
+
+namespace {
+// every pixel of a half frame scaled (alpha untouched): "the tone map's peak moved"
+void ChScaleAll(std::vector<uint16_t>& f, float k) {
+    for (size_t i = 0; i < f.size(); i++) {
+        if (i % 4 == 3) continue;
+        const uint16_t h = f[i];
+        const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+        float v = e == 0 ? (float)m * (1.0f / 16777216.0f) : (e == 31 ? 0.0f : std::ldexp(1.0f + (float)m / 1024.0f, (int)e - 15));
+        if (s) v = -v;
+        v *= k;
+        uint16_t o = 0;
+        if (v != 0.0f) {
+            const float av = v < 0 ? -v : v;
+            int ex; const float fr = std::frexp(av, &ex);
+            const int e2 = ex - 1 + 15;
+            if (e2 >= 1 && e2 <= 30) o = (uint16_t)((v < 0 ? 0x8000u : 0u) | ((uint32_t)e2 << 10) | ((uint32_t)((fr * 2.0f - 1.0f) * 1024.0f + 0.5f) & 0x3FFu));
+        }
+        f[i] = o;
+    }
+}
+}  // namespace
+
+// The dynamic tone map's peak in the overlay (fald.h FaldRunPasses frameChanged; shared/peak_detect.h): the pass that
+// makes the intermediate is the same function between two runs unless the smoothed peak MOVED, which the smoothing pass
+// decides on the GPU and writes as (4, moved, 0, 0). The layer copies `moved` into its change flags: set, every zone
+// counts as changed and the sweeps run in full; clear, the rects' zones alone. The full-path context and the
+// change-driven one run the same frames (the whole frame scaled when the "peak" moved, a rect edited otherwise) and must
+// agree field for field; without the word (the negative control) a whole-frame change under a small rect is wrong.
+TEST_CASE("FALD change: the frame-changed word (the dynamic peak) keeps the partial path exact when the whole frame moved (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cellDir = ChEnv("FALD_TEST_FADE_DIR");
+    if (cellDir.empty()) return;
+    const std::wstring C = ChOwnerPanel(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
+    REQUIRE_FALSE(C.empty());
+    const int W = 3840, H = 2160;
+    std::vector<uint16_t> base((size_t)W * H * 4);
+    {
+        std::ifstream f(cellDir + "/n7_lamp.rgba16f", std::ios::binary);
+        REQUIRE(f.good());
+        f.read((char*)base.data(), (std::streamsize)(base.size() * 2));
+        REQUIRE((size_t)f.gcount() == base.size() * 2);
+    }
+    ChWarp w;
+    REQUIRE(w.ok);
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT; bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    const uint32_t init[4] = { 4u, 0u, 0u, 0u };
+    D3D11_SUBRESOURCE_DATA sd = { init, 0, 0 };
+    ID3D11Buffer* word = nullptr;
+    REQUIRE(SUCCEEDED(w.dev->CreateBuffer(&bd, &sd, &word)));
+    struct Step { FaldChangeRect rc; uint16_t value; float scale; const char* what; };
+    const Step steps[] = {
+        { { 1000, 1500, 1040, 1530 }, 0x0400, 1.0f, "a dark patch, the pass as it was" },
+        { { 1000, 1500, 1040, 1530 }, 0x0400, 0.9f, "the same rect, the pass 0.9 x on the whole frame (the peak moved)" },
+        { { 0, 0, 1, 1 }, 0x0000, 0.9f, "a kick pixel, the pass as it was" },
+        { { 300, 300, 500, 500 }, 0x3C00, 1.1f, "a white patch and the pass 1.1 x (moved)" },
+        { { 2000, 1000, 2002, 1002 }, 0x3C00, 1.1f, "a speck, the pass as it was" },
+        { { 2000, 1000, 2002, 1002 }, 0x3C00, 0.8f, "the same speck, the pass 0.8 x (moved)" },
+    };
+    const int n = (int)(sizeof(steps) / sizeof(steps[0]));
+    for (int star = 0; star < 2; star++) {
+        ChLayer full(w, C, W, H, star != 0, 0, 0);
+        ChLayer part(w, C, W, H, star != 0, 0, -1);
+        ChLayer bare(w, C, W, H, star != 0, 0, -1);   // the negative control: the partial path without the word
+        REQUIRE(full.ok); REQUIRE(part.ok); REQUIRE(bare.ok);
+        std::vector<uint16_t> composed = base, passed = base;
+        unsigned long long key = 7000;
+        auto a0 = full.Run(w, passed, key, true, nullptr);
+        auto b0 = part.Run(w, passed, key, true, nullptr);
+        auto c0 = bare.Run(w, passed, key, true, nullptr);
+        REQUIRE(a0 == b0); REQUIRE(a0 == c0);
+        float prevScale = 1.0f;
+        int partialRuns = 0, movedSteps = 0;
+        for (int i = 0; i < n; i++) {
+            const Step& s = steps[i];
+            ChPatch(composed, W, s.rc, s.value);
+            passed = composed;
+            if (s.scale != 1.0f) ChScaleAll(passed, s.scale);
+            const bool moved = s.scale != prevScale;
+            prevScale = s.scale;
+            const uint32_t movedWord[4] = { 4u, moved ? 1u : 0u, 0u, 0u };
+            w.ic->UpdateSubresource(word, 0, nullptr, movedWord, 0, 0);
+            key++;
+            std::vector<FaldChangeRect> rects = { s.rc };
+            auto fa = full.Run(w, passed, key, true, nullptr);
+            auto pb = part.Run(w, passed, key, true, &rects, word);
+            auto cb = bare.Run(w, passed, key, true, &rects, nullptr);
+            const bool same = fa == pb;
+            CHECK_MESSAGE(same, "star " << star << ": " << std::string(s.what) << ": the partial path with the word differs from the full one");
+            if (!same)
+                for (size_t j = 0; j < fa.size() && j < pb.size(); j++)
+                    if (fa[j] != pb[j]) MESSAGE("  differs: " << fa[j].first);
+            CHECK_MESSAGE(part.ctx.fald->lastPartial, "star " << star << ": " << std::string(s.what) << ": should be partial");
+            if (part.ctx.fald->lastPartial) partialRuns++;
+            if (moved) {
+                movedSteps++;
+                CHECK_MESSAGE(cb != fa, "star " << star << ": " << std::string(s.what) << ": WITHOUT the word the partial path should be wrong (the negative control)");
+            }
+        }
+        MESSAGE("star " << star << ": " << partialRuns << " of " << n << " runs partial with the word, exact on all; the whole frame redone on "
+                << movedSteps << " of them by the GPU's own decision");
+    }
+    word->Release();
+}
+
+namespace {
+// The REAL dynamic-peak detector (shared/peak_detect.h: the two passes, the per-monitor state, the draw arguments) on the
+// test's WARP device, as the hosts run it on the composed frame before their tone-map pass.
+struct ChPeak {
+    ID3D11ComputeShader* reduceCS = nullptr; ID3D11ComputeShader* smoothCS = nullptr;
+    ID3D11Buffer* cb = nullptr;
+    ID3D11Texture2D* peakTex = nullptr; ID3D11UnorderedAccessView* peakUAV = nullptr;
+    ID3D11Texture2D* rawTex = nullptr; ID3D11UnorderedAccessView* rawUAV = nullptr;
+    ID3D11Buffer* argsBuf = nullptr; ID3D11UnorderedAccessView* argsUAV = nullptr;
+    ID3D11Texture2D* staging = nullptr; ID3D11Buffer* argsStaging = nullptr;
+    ID3D11Texture2D* frameTex = nullptr; ID3D11ShaderResourceView* frameSRV = nullptr;
+    bool ok = false;
+    ChPeak(ChWarp& w, int W, int H) {
+        auto compile = [&](const char* src, const char* name, ID3D11ComputeShader** out) {
+            ID3DBlob* b = nullptr;
+            if (FAILED(D3DCompile(src, std::strlen(src), name, nullptr, nullptr, "main", "cs_5_0", 0, 0, &b, nullptr))) return false;
+            const HRESULT hr = w.dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, out);
+            b->Release();
+            return SUCCEEDED(hr);
+        };
+        if (!compile(g_peakReduceCSSource, "PeakReduceCS", &reduceCS) || !compile(g_peakSmoothCSSource, "PeakSmoothCS", &smoothCS)) return;
+        D3D11_BUFFER_DESC cbd = {};
+        cbd.ByteWidth = sizeof(PeakParams); cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        if (FAILED(w.dev->CreateBuffer(&cbd, nullptr, &cb))) return;
+        D3D11_TEXTURE2D_DESC pd = {};
+        pd.Width = 1; pd.Height = 1; pd.MipLevels = 1; pd.ArraySize = 1; pd.Format = DXGI_FORMAT_R32_FLOAT; pd.SampleDesc.Count = 1;
+        pd.Usage = D3D11_USAGE_DEFAULT; pd.BindFlags = D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE;
+        const float zero = 0.0f;
+        D3D11_SUBRESOURCE_DATA init = { &zero, sizeof(float), 0 };
+        if (FAILED(w.dev->CreateTexture2D(&pd, &init, &peakTex)) || FAILED(w.dev->CreateUnorderedAccessView(peakTex, nullptr, &peakUAV))) return;
+        if (FAILED(CreatePeakRawTexture(w.dev, w.ic, &rawTex, &rawUAV))) return;
+        if (FAILED(CreatePeakArgsBuffer(w.dev, &argsBuf, &argsUAV))) return;
+        pd.Usage = D3D11_USAGE_STAGING; pd.BindFlags = 0; pd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(w.dev->CreateTexture2D(&pd, nullptr, &staging))) return;
+        D3D11_BUFFER_DESC ad = {};
+        ad.ByteWidth = 16; ad.Usage = D3D11_USAGE_STAGING; ad.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(w.dev->CreateBuffer(&ad, nullptr, &argsStaging))) return;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)W; td.Height = (UINT)H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(w.dev->CreateTexture2D(&td, nullptr, &frameTex)) || FAILED(w.dev->CreateShaderResourceView(frameTex, nullptr, &frameSRV))) return;
+        ok = true;
+    }
+    ~ChPeak() {
+        auto rel = [](IUnknown* p) { if (p) p->Release(); };
+        rel(frameSRV); rel(frameTex); rel(argsStaging); rel(staging); rel(argsUAV); rel(argsBuf); rel(rawUAV); rel(rawTex);
+        rel(peakUAV); rel(peakTex); rel(cb); rel(smoothCS); rel(reduceCS);
+    }
+    // the detector on this present's composed frame; returns the smoothed PQ peak and the arguments' `moved` (read back:
+    // a test, not a host)
+    float Run(ChWarp& w, const std::vector<uint16_t>& composed, int W, int H, uint32_t& moved) {
+        w.ic->UpdateSubresource(frameTex, 0, nullptr, composed.data(), (UINT)W * 8u, 0);
+        DispatchPeakDetection(w.ic, reduceCS, smoothCS, cb, frameSRV, peakUAV, rawUAV, (unsigned)W, (unsigned)H, nullptr, argsUAV);
+        w.ic->CopyResource(staging, peakTex);
+        w.ic->CopyResource(argsStaging, argsBuf);
+        D3D11_MAPPED_SUBRESOURCE m = {};
+        float pq = 0.0f;
+        if (SUCCEEDED(w.ic->Map(staging, 0, D3D11_MAP_READ, 0, &m))) { pq = *(const float*)m.pData; w.ic->Unmap(staging, 0); }
+        uint32_t a[4] = {};
+        if (SUCCEEDED(w.ic->Map(argsStaging, 0, D3D11_MAP_READ, 0, &m))) { std::memcpy(a, m.pData, 16); w.ic->Unmap(argsStaging, 0); }
+        moved = a[1];
+        return pq;
+    }
+};
+// a stand-in for the tone map: every pixel scaled by a smooth function of the smoothed PQ peak (any ulp of the peak moves
+// every pixel, as a real curve's knee would), in float, re-packed to half
+void ChToneMap(const std::vector<uint16_t>& in, std::vector<uint16_t>& out, float pq) {
+    const float k = 0.5f + 0.5f * pq;
+    out = in;
+    for (size_t i = 0; i < out.size(); i++) {
+        if (i % 4 == 3) continue;
+        const uint16_t h = in[i];
+        const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, mm = h & 0x3FFu;
+        float v = e == 0 ? (float)mm * (1.0f / 16777216.0f) : (e == 31 ? 0.0f : std::ldexp(1.0f + (float)mm / 1024.0f, (int)e - 15));
+        if (s) v = -v;
+        v *= k;
+        uint16_t o = 0;
+        if (v != 0.0f) {
+            const float av = v < 0 ? -v : v;
+            int ex; const float fr = std::frexp(av, &ex);
+            const int e2 = ex - 1 + 15;
+            if (e2 >= 1 && e2 <= 30) o = (uint16_t)((v < 0 ? 0x8000u : 0u) | ((uint32_t)e2 << 10) | ((uint32_t)((fr * 2.0f - 1.0f) * 1024.0f + 0.5f) & 0x3FFu));
+        }
+        out[i] = o;
+    }
+}
+}  // namespace
+
+// A desktop with the DYNAMIC peak, end to end on WARP: the real detector runs on each present's composed frame (as the
+// hosts run it on the clean copy), a stand-in tone map scales every pixel by the smoothed peak, and the layer gets the
+// detector's draw arguments as its frame-changed word. The change-driven context must equal the full one on every
+// present, and the share of partial presents is what a dynamic-peak desktop gets: a present whose peak stands is partial;
+// the presents while the peak settles after a content change (30 % rise / 5 % fall per frame, slew-limited) are full —
+// and rightly so, the tone map moves every pixel then. (Before 2026-10-22 a dynamic peak keyed 0: never partial.)
+TEST_CASE("FALD change: a desktop with the dynamic peak (the real detector): the partial share, exact against the full path (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cellDir = ChEnv("FALD_TEST_FADE_DIR");
+    if (cellDir.empty()) return;
+    const std::wstring C = ChOwnerPanel(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
+    REQUIRE_FALSE(C.empty());
+    const int W = 3840, H = 2160;
+    std::map<std::string, std::vector<uint16_t>> frames;
+    for (const char* name : { "n7_lamp", "p02_hl_black", "n8_chess" }) {
+        std::vector<uint16_t>& f = frames[name];
+        f.resize((size_t)W * H * 4);
+        std::ifstream in(cellDir + "/" + name + ".rgba16f", std::ios::binary);
+        REQUIRE(in.good());
+        in.read((char*)f.data(), (std::streamsize)(f.size() * 2));
+        REQUIRE((size_t)in.gcount() == f.size() * 2);
+    }
+    ChWarp w;
+    REQUIRE(w.ok);
+    ChPeak peak(w, W, H);
+    REQUIRE(peak.ok);
+    // (2026-10-22: the reference context ran by the rules too — the override was set at construction, which the layer does
+    // not read — and at a still whose frame the peak had moved it rightly took "the same frame again": a harness bug, not
+    // the layer's; a fresh third context arbitrated it)
+    ChLayer full(w, C, W, H, true, 0, 0);
+    ChLayer part(w, C, W, H, true, 0, -1);
+    REQUIRE(full.ok); REQUIRE(part.ok);
+    // the desktop: a content frame, stills (the settle re-runs / the kick), carets (a 2 x 12 rect toggling), another frame...
+    struct Present { const char* frame; int stills; int carets; };
+    const Present script[] = { { "n7_lamp", 12, 8 }, { "p02_hl_black", 24, 8 }, { "n8_chess", 12, 8 } };
+    std::vector<uint16_t> composed, passed;
+    unsigned long long key = 9000;
+    int presents = 0, partialRuns = 0, movedPresents = 0, firstMoved = 0;
+    const FaldChangeRect caret = { 500, 500, 502, 512 };
+    auto present = [&](bool newContent, const FaldChangeRect* rc, const char* what) {
+        uint32_t moved = 0;
+        const float pq = peak.Run(w, composed, W, H, moved);
+        static std::vector<uint16_t> prevPassed;
+        ChToneMap(composed, passed, pq);
+        const bool frameSame = passed == prevPassed;
+        size_t frameDiffs = 0;
+        if (!frameSame && prevPassed.size() == passed.size()) for (size_t t = 0; t < passed.size(); t++) if (passed[t] != prevPassed[t]) frameDiffs++;
+        prevPassed = passed;
+        if (newContent) key++;
+        std::vector<FaldChangeRect> rects;
+        if (rc) rects.push_back(*rc);
+        const bool full0 = rc == nullptr && newContent;                       // a whole new frame: unknown rects
+        auto fa = full.Run(w, passed, key, newContent, nullptr);
+        auto pb = part.Run(w, passed, key, newContent, full0 ? nullptr : &rects, peak.argsBuf);
+        const bool same = fa == pb;
+        CHECK_MESSAGE(same, "present " << presents << " (" << std::string(what) << ", peak pq " << pq << ", moved " << moved << ", partial "
+                      << part.ctx.fald->lastPartial << ", the frame as the previous present's " << frameSame << " (" << frameDiffs
+                      << " halves differ)): the change-driven context differs from the full one");
+        if (!same) {
+            for (size_t j = 0; j < fa.size() && j < pb.size(); j++)
+                if (fa[j] != pb[j]) MESSAGE("  differs: " << fa[j].first);
+            // where: the first differing texels of the star statistic, the round-1 drive and the boost counts
+            struct Pair { const char* name; ID3D11Texture2D* a; ID3D11Texture2D* b; unsigned comps; };
+            const FaldResources* ra = full.ctx.fald; const FaldResources* rb = part.ctx.fald;
+            const Pair pairs[] = { { "star_stat", ra->starStatTex, rb->starStatTex, 4 }, { "star_bg", ra->starBgTex, rb->starBgTex, 4 },
+                                   { "drive", ra->driveTex, rb->driveTex, 1 }, { "boost_r1", ra->boostTex[1], rb->boostTex[1], 1 },
+                                   { "active_r1", ra->activeTex[1], rb->activeTex[1], 1 } };
+            for (const Pair& pr : pairs) {
+                if (!pr.a || !pr.b) continue;
+                const std::vector<uint8_t> A = ChReadBack(pr.a), B = ChReadBack(pr.b);
+                if (A.size() != B.size() || A.size() % 4) { MESSAGE("  " << pr.name << ": sizes " << A.size() << " / " << B.size()); continue; }
+                const float* fA = (const float*)A.data(); const float* fB = (const float*)B.data();
+                size_t n = A.size() / 4, nd = 0;
+                std::string first;
+                for (size_t t = 0; t < n; t++) {
+                    if (std::memcmp(&fA[t], &fB[t], 4) == 0) continue;
+                    if (nd < 6) {
+                        char buf[160];
+                        snprintf(buf, sizeof(buf), " [texel %zu c%u: %.9g vs %.9g]", t / pr.comps, (unsigned)(t % pr.comps), fA[t], fB[t]);
+                        first += buf;
+                    }
+                    nd++;
+                }
+                MESSAGE("  " << std::string(pr.name) << ": " << nd << " of " << n << " floats differ" << first);
+            }
+            auto readBuf = [&](ID3D11Buffer* b) {
+                std::vector<uint32_t> out;
+                if (!b) return out;
+                D3D11_BUFFER_DESC d; b->GetDesc(&d);
+                d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0; d.StructureByteStride = 0;
+                ID3D11Buffer* st = nullptr;
+                if (FAILED(g_device->CreateBuffer(&d, nullptr, &st))) return out;
+                g_context->CopyResource(st, b);
+                D3D11_MAPPED_SUBRESOURCE mm;
+                if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &mm))) { out.assign((const uint32_t*)mm.pData, (const uint32_t*)mm.pData + d.ByteWidth / 4); g_context->Unmap(st, 0); }
+                st->Release();
+                return out;
+            };
+            {   // the arbiter: a fresh context with no history, one full run on this frame — which of the two does it agree with?
+                ChLayer fresh(w, C, W, H, true, 0, 0);
+                REQUIRE(fresh.ok);
+                auto fr = fresh.Run(w, passed, key, true, nullptr);
+                MESSAGE("  a fresh context's full run equals every texture of: the full context " << (int)(fr == fa) << ", the change-driven context " << (int)(fr == pb));
+            }
+            // did the word arrive? the decide pass's arguments after the run (slot 240 = S0 over the whole lattice: (cols,
+            // rows, slices) iff flag [3] was set; 32 = round 0's full sweep) and the detector's own arguments
+            const std::vector<uint32_t> args = readBuf(part.ctx.fald->argsBuf), word = readBuf(peak.argsBuf);
+            if (args.size() >= 68 && word.size() >= 4)
+                MESSAGE("  args: S0 full (" << args[60] << "," << args[61] << "," << args[62] << ") stat0 full (" << args[8] << "," << args[9] << "," << args[10]
+                        << ") stat0 part (" << args[16] << "," << args[17] << "," << args[18] << ") conv0 (" << args[24] << "," << args[25] << ") pixel ("
+                        << args[56] << "," << args[57] << "); the detector's word (" << word[0] << "," << word[1] << "," << word[2] << "," << word[3] << ")");
+        }
+        presents++;
+        if (part.ctx.fald->lastPartial) partialRuns++;
+        if (moved) movedPresents++;
+        if (moved && presents > 1 && firstMoved == 0) firstMoved = presents;
+    };
+    for (const Present& p : script) {
+        composed = frames[p.frame];
+        present(true, nullptr, p.frame);
+        for (int i = 0; i < p.stills; i++) present(false, nullptr, "still");
+        for (int i = 0; i < p.carets; i++) {
+            ChPatch(composed, W, caret, (i & 1) ? 0x3C00 : 0x0000);
+            present(true, &caret, "caret");
+        }
+    }
+    MESSAGE(partialRuns << " of " << presents << " presents took the change-driven path with the dynamic peak (the peak moved on "
+            << movedPresents << " of them: the content frames and the frames while it settled after each)");
+    CHECK(partialRuns >= 20);   // at least n7_lamp's stills and carets once its peak stands (the rise settles within ~30 frames)
 }

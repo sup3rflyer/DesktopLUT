@@ -697,6 +697,8 @@ struct MonitorContext {
     ID3D11ShaderResourceView* peakSRV = nullptr;      // SRV for pixel shader read
     ID3D11Texture2D* peakRawTexture = nullptr;        // 1x1 R32_UINT: this frame's raw max (InterlockedMax target)
     ID3D11UnorderedAccessView* peakRawUAV = nullptr;  //   ... reset by the smoothing pass every frame
+    ID3D11Buffer* peakArgsBuf = nullptr;              // the smoothing pass's draw arguments (peak_detect.h CreatePeakArgsBuffer):
+    ID3D11UnorderedAccessView* peakArgsUAV = nullptr; //   "the peak moved this frame", the FALD layer's frameChanged word
     ID3D11Texture2D* peakStagingTexture = nullptr;    // Staging texture for CPU readback
     ID3D11Texture2D* peakStagingTexture2 = nullptr;  // Second staging for double-buffered readback
     int peakStagingReadIndex = 0;                     // Alternates 0/1 for deferred readback
@@ -783,6 +785,8 @@ struct MonitorContext {
     // The FALD layer's frame key (render.cpp -> FaldRunPasses frameKey): the desktop image's generation (a new image per
     // acquired frame with LastPresentTime != 0) and the hash of the last constant buffer the main pass was given
     unsigned long long faldImageGen = 0;     // render thread
+    unsigned long long faldLastFrameKey = 0; // render thread: the key of the frame in the layer's intermediate (a settle
+                                             // re-run of the layer passes it: the same frame again, fald.h FaldRunPasses)
     unsigned long long mainCbHash = 0;       // render thread
 
     // Thread-safe visibility requests (whitelist thread → render thread)

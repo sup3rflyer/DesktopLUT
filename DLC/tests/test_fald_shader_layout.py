@@ -144,8 +144,8 @@ def test_boost_is_a_persistent_count_finished_by_the_decide_pass():
         assert f"{v}->boostCountUAV, nullptr," in c                                     # u3 of the sweep (u4 unused there)
         assert f"MakeCounterBuffer(2, &{v}->boostCountBuf, &{v}->boostCountUAV)" in c   # zeroed at creation
         assert c.count("ClearUnorderedAccessViewFloat(" + v + "->activeUAV[") == 2         # the flag maps start zero
-        assert f"RunDecide({v}, 0);" in c and f"RunDecide({v}, 1);" in c
-        assert c.index(f"RunStat({v}, 1);") < c.index(f"RunDecide({v}, 1);") < c.index(f"RunConv({v}, mapSrv(trun.trueMap, 1)")
+        assert f"RunDecide({v}, 0, partial);" in c and f"RunDecide({v}, 1, partial);" in c   # (the run's path sets the CB's runMode bit)
+        assert c.index(f"RunStat({v}, 1);") < c.index(f"RunDecide({v}, 1, partial);") < c.index(f"RunConv({v}, mapSrv(trun.trueMap, 1")
 
 
 # ---- zone sweeps in slices (work guide C14): the statistic pass and starfield S0 ---------------------------------------

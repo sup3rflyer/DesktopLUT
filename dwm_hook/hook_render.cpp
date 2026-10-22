@@ -74,6 +74,10 @@ ID3D11SamplerState* linearSamplerState = NULL;
 ID3D11ComputeShader* peakDetectCS = NULL;   // pass 1: dense reduction (every 4th pixel) -> raw max
 ID3D11ComputeShader* peakSmoothCS = NULL;   // pass 2: temporal smoothing -> PQ peak
 ID3D11Buffer* peakCB = NULL;               // shared: DispatchPeakDetection rewrites it every call
+ID3D11Buffer* peakArgsBuf = NULL;          // shared: the smoothing pass's draw arguments (peak_detect.h CreatePeakArgsBuffer):
+ID3D11UnorderedAccessView* peakArgsUAV = NULL;   // the LUT pass's full-frame quad iff the peak moved this present, and the
+                                           // FALD layer's "the frame changed everywhere" word (written and consumed within
+                                           // one present, so one buffer serves every monitor)
 
 // Per-monitor peak state. The smoothing pass reads the previous smoothed peak, so one shared pair
 // smoothed each HDR monitor's peak against the other monitor's frames. One slot per monitor
@@ -655,7 +659,9 @@ void MarkContextCopiesStale(void* context)
 }
 
 // Draw `rect` of the back buffer from a source texture of texW x texH (UVs are rect / tex size).
-static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
+// The quad of `rect` (screen and texture coordinates) into the vertex buffer and bound, without the draw: for a draw
+// whose instance count the GPU decides (DrawInstancedIndirect: 4 vertices of the strip).
+static void SetRectangleTex(struct tagRECT* rect, float texW, float texH)
 {
 	float width = backBufferDesc.Width;
 	float height = backBufferDesc.Height;
@@ -688,7 +694,11 @@ static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
 	deviceContext->Unmap(vertexBuffer, 0);
 
 	deviceContext->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+}
 
+static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
+{
+	SetRectangleTex(rect, texW, texH);
 	deviceContext->Draw(numVerts, 0);
 }
 
@@ -1044,6 +1054,10 @@ void InitializeStuff(ID3D11Device* inputDevice)
 			peakCbDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 			peakCbDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 			EXECUTE_WITH_LOG(device->CreateBuffer(&peakCbDesc, NULL, &peakCB))
+			// the smoothing pass's draw arguments (non-fatal: without them a dynamic-peak present takes the FALD
+			// layer's full path, as before 2026-10-22)
+			if (FAILED(CreatePeakArgsBuffer(device, &peakArgsBuf, &peakArgsUAV)))
+				log_to_file("WARNING: peak draw-argument buffer failed - the FALD layer's change-driven path is off with a dynamic peak");
 
 			LOG_ONLY_ONCE("Peak detection resources created")
 		}
@@ -1125,6 +1139,8 @@ void UninitializeStuff()
 	RELEASE_IF_NOT_NULL(peakSmoothCS)
 	ReleasePeakSlots();
 	RELEASE_IF_NOT_NULL(peakCB)
+	RELEASE_IF_NOT_NULL(peakArgsUAV)
+	RELEASE_IF_NOT_NULL(peakArgsBuf)
 	ReleaseMhcPreview();
 	// FALD: the per-monitor resources first (they hold views onto DWM's device), then the shaders.
 	FaldReleaseAll();
@@ -1464,7 +1480,8 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		if (peakSlot) {
 			// Leaves no CS state bound on DWM's context.
 			DispatchPeakDetection(deviceContext, peakDetectCS, peakSmoothCS, peakCB, srcSRV,
-				peakSlot->peakUAV, peakSlot->rawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height);
+				peakSlot->peakUAV, peakSlot->rawUAV, newBackBufferDesc.Width, newBackBufferDesc.Height,
+				NULL, peakArgsUAV);   // + did the peak move: the LUT pass's full-frame draw arguments below
 			deviceContext->PSSetShaderResources(5, 1, &peakSlot->peakSRV);
 		}
 
@@ -1566,12 +1583,15 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		// updated from this present's dirty rects in FaldUpdateClean), never from the back buffer.
 		// What the pass makes of the clean copy (hook_fald.h FaldRun lutPassKey): no pass = the copy itself; a LUT /
 		// static tone map = its constant buffer and cube (both fixed between their changes; the noise and PQ tables
-		// never change); the dynamic peak or the live edit preview vary on their own: 0 = unknown.
+		// never change); the DYNAMIC peak = the same, with the peak's own movement decided on the GPU per present (the
+		// smoothing pass's draw arguments, peakArgsBuf: the full-frame quad below and the layer's "the frame changed
+		// everywhere" word) — the owner's tone map is dynamic, and a key of 0 there never engaged the change-driven path
+		// (2026-10-22); the live edit preview varies on its own: 0 = unknown.
 		unsigned long long faldLutPassKey = 0;
 		if (faldOn) {
 			if (!hasLutOrTonemap) {
 				faldLutPassKey = 0x9E3779B97F4A7C15ull;
-			} else if (!peakSlot && !mhcOn) {
+			} else if (!mhcOn && (!peakSlot || peakArgsBuf)) {
 				faldLutPassKey = 1469598103934665603ull;
 				const unsigned char* kb = (const unsigned char*)&cb;
 				for (size_t i = 0; i < sizeof(cb); i++) { faldLutPassKey ^= kb[i]; faldLutPassKey *= 1099511628211ull; }
@@ -1590,6 +1610,16 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 			{
 				if (faldPartial)
 				{
+					// the dynamic peak: the whole frame iff the smoothing pass found the peak moved this present (its
+					// draw arguments: 4 vertices, 1 or 0 instances; the layer gets the same word through FaldRun),
+					// then the rects as always (DWM re-composed them; the rest of the intermediate is the previous
+					// frame through the same pass)
+					if (peakSlot && peakArgsBuf)
+					{
+						struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
+						SetRectangleTex(&fullFrame, (float)backBufferDesc.Width, (float)backBufferDesc.Height);
+						deviceContext->DrawInstancedIndirect(peakArgsBuf, 0);
+					}
 					for (int i = 0; i < numRects; i++)
 						DrawRectangleTex(&rects[i], (float)backBufferDesc.Width, (float)backBufferDesc.Height);
 				}
@@ -1650,7 +1680,8 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				const bool inTop = rc.bottom <= kz, inBottom = rc.top >= bh - kz;
 				if (!((inLeft || inRight) && (inTop || inBottom))) newContent = true;
 			}
-			if (!FaldRun(faldMon, renderTargetView, newContent, faldLutPassKey))
+			if (!FaldRun(faldMon, renderTargetView, newContent, faldLutPassKey,
+			             (peakSlot && peakArgsBuf) ? peakArgsBuf : NULL, PEAK_ARGS_MOVED_OFFSET))
 			{
 				deviceContext->CopyResource((ID3D11Resource*)backBuffer,
 				                            (ID3D11Resource*)FaldIntermediateTexture(faldMon));

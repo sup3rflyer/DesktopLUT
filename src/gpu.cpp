@@ -571,6 +571,8 @@ void ReleaseMonitorD3DResources(MonitorContext* ctx) {
     if (ctx->peakTexture) { ctx->peakTexture->Release(); ctx->peakTexture = nullptr; }
     if (ctx->peakRawUAV) { ctx->peakRawUAV->Release(); ctx->peakRawUAV = nullptr; }
     if (ctx->peakRawTexture) { ctx->peakRawTexture->Release(); ctx->peakRawTexture = nullptr; }
+    if (ctx->peakArgsUAV) { ctx->peakArgsUAV->Release(); ctx->peakArgsUAV = nullptr; }
+    if (ctx->peakArgsBuf) { ctx->peakArgsBuf->Release(); ctx->peakArgsBuf = nullptr; }
     if (ctx->peakStagingTexture) { ctx->peakStagingTexture->Release(); ctx->peakStagingTexture = nullptr; }
     if (ctx->peakStagingTexture2) { ctx->peakStagingTexture2->Release(); ctx->peakStagingTexture2 = nullptr; }
     FaldReleaseResources(ctx);

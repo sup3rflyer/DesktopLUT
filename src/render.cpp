@@ -572,7 +572,8 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         if (ctx->peakTexture && ctx->peakUAV && ctx->peakRawUAV && g_peakSmoothCS) {
             // Pass 1: dense reduction (every 4th pixel) -> raw max; pass 2: temporal smoothing -> PQ peak.
             DispatchPeakDetection(g_context, g_peakDetectCS, g_peakSmoothCS, g_peakCB, ctx->captureSRV,
-                                  ctx->peakUAV, ctx->peakRawUAV, (unsigned)ctx->width, (unsigned)ctx->height);
+                                  ctx->peakUAV, ctx->peakRawUAV, (unsigned)ctx->width, (unsigned)ctx->height,
+                                  nullptr, ctx->peakArgsUAV);   // + did the peak move (the FALD layer's frameChanged word)
 
             // Double-buffered peak readback: copy to staging[N], read staging[N-1] from previous frame.
             // This avoids GPU pipeline stalls by reading data that's guaranteed to be ready.
@@ -660,8 +661,9 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
     g_context->VSSetShader(g_vs, nullptr, 0);
     g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (settleOnly) {
-        // the intermediate still holds the last main-pass output: only the FALD passes run (they bind their own targets)
-        FaldRunPasses(ctx, finalTarget, false);
+        // the intermediate still holds the last main-pass output: only the FALD passes run (they bind their own targets);
+        // its key says so — the same frame again, the change-driven path's cheapest case (fald.h FaldRunPasses)
+        FaldRunPasses(ctx, finalTarget, false, ctx->faldLastFrameKey);
     } else {
     float clearColor[4] = { 0, 0, 0, 0 };
     g_context->ClearRenderTargetView(renderTarget, clearColor);
@@ -698,19 +700,22 @@ void RenderMonitor(MonitorContext* ctx, FramePacer* fp, bool bufferActive) {
         const bool newContent = !reprocess && frameInfo.LastPresentTime.QuadPart != 0;
         // The frame the main pass just drew into the layer's intermediate, as a key (fald.h FaldRunPasses frameKey): the
         // desktop image (its generation: a cursor-only frame keeps it), the main pass's constant buffer and cube. 0 = not
-        // known to repeat: a re-process (a setting changed, maybe one the buffer does not show) or the dynamic peak (it
-        // moves frame by frame on the same image).
+        // known to repeat: a re-process (a setting changed, maybe one the buffer does not show). The dynamic peak moves
+        // frame by frame on the same image, but whether it moved THIS frame the smoothing pass decided on the GPU
+        // (ctx->peakArgsBuf): the layer gets that word and takes everything as changed when it is set.
         if (newContent) ctx->faldImageGen++;
         const bool dynamicPeak = ctx->isHDREnabled && cc.tonemap.enabled && cc.tonemap.dynamicPeak;
         unsigned long long frameKey = 0;
-        if (!reprocess && !dynamicPeak) {
+        if (!reprocess && (!dynamicPeak || ctx->peakArgsBuf)) {
             frameKey = 1469598103934665603ull;
             const uintptr_t lut = (uintptr_t)activeLUT;
-            for (unsigned long long v : { ctx->faldImageGen, ctx->mainCbHash, (unsigned long long)lut })
+            for (unsigned long long v : { ctx->faldImageGen, ctx->mainCbHash, (unsigned long long)lut, dynamicPeak ? 1ull : 0ull })
                 for (int i = 0; i < 8; i++) { frameKey ^= (v >> (8 * i)) & 0xFFu; frameKey *= 1099511628211ull; }
             if (frameKey == 0) frameKey = 1;
         }
-        FaldRunPasses(ctx, finalTarget, newContent, frameKey);   // leaves finalTarget bound, PS SRVs cleared
+        ctx->faldLastFrameKey = frameKey;
+        FaldRunPasses(ctx, finalTarget, newContent, frameKey, nullptr, -1, dynamicPeak ? ctx->peakArgsBuf : nullptr,
+                      PEAK_ARGS_MOVED_OFFSET);   // leaves finalTarget bound, PS SRVs cleared
     }
     }   // !settleOnly
 
