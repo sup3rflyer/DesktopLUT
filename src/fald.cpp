@@ -949,6 +949,7 @@ static void RunGain(FaldResources* r, uint32_t roundIdx, bool indirect = false) 
     g_context->CSSetShader(g_faldGainCS, nullptr, 0);   // (the three-pass path is never indirect: the partial path needs the fused one)
     BindCommon(r, true);
     g_context->CSSetShaderResources(5, 2, fields);
+    g_context->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &packed);
     g_context->CSSetUnorderedAccessViews(0, 1, &r->gainAUAV, nullptr);
     { FaldPassScope ps(roundIdx ? FALD_PASS_GAIN1 : FALD_PASS_GAIN0); g_context->Dispatch(gx, gy, 1); }
     UnbindCompute();

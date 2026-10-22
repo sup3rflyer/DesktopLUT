@@ -1866,6 +1866,7 @@ static void RunGain(FaldMonitor* m, uint32_t roundIdx, bool indirect = false) {
     g_ctx->CSSetShader(g_gainCS, nullptr, 0);   // (the three-pass path is never indirect: the partial path needs the fused one)
     BindCommon(m, true);
     g_ctx->CSSetShaderResources(5, 2, fields);
+    g_ctx->CSSetShaderResources(FALD_FIELDS_SLOT, 1, &packed);
     g_ctx->CSSetUnorderedAccessViews(0, 1, &m->gainAUAV, nullptr);
     g_ctx->Dispatch(gx, gy, 1);
     UnbindCompute();
