@@ -1296,7 +1296,8 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 					}
 				FaldSetLiveSettings(faldMon, DwmHookFaldDebugMode(fp->flags), DwmHookFaldPedMode(fp->flags),
 					DwmHookFaldStar(fp->flags) != 0,
-					fp->hasTuning ? &fp->tuning : NULL, DwmHookFaldFade(fp->flags) != 0, monW, monH);
+					fp->hasTuning ? &fp->tuning : NULL, DwmHookFaldFade(fp->flags) != 0, monW, monH,
+					DwmHookFaldFadeForce(fp->flags) != 0);
 			}
 			// Feed this present's dirty rects into the layer's clean source. Until a full-frame
 			// composition has primed it, the layer stays off and this present takes the ordinary
@@ -1607,7 +1608,21 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				const bool inTop = rc.bottom <= kz, inBottom = rc.top >= bh - kz;
 				if (!((inLeft || inRight) && (inTop || inBottom))) newContent = true;
 			}
-			if (!FaldRun(faldMon, renderTargetView, newContent))
+			// What the pass above made of the clean copy (hook_fald.h FaldRun lutPassKey): no pass = the copy itself; a
+			// LUT / static tone map = its constant buffer and cube (both fixed between their changes; the noise and PQ
+			// tables never change); the dynamic peak or the live edit preview vary on their own: 0 = unknown.
+			unsigned long long lutPassKey = 0;
+			if (!hasLutOrTonemap) {
+				lutPassKey = 0x9E3779B97F4A7C15ull;
+			} else if (!peakSlot && !mhcOn) {
+				lutPassKey = 1469598103934665603ull;
+				const unsigned char* kb = (const unsigned char*)&cb;
+				for (size_t i = 0; i < sizeof(cb); i++) { lutPassKey ^= kb[i]; lutPassKey *= 1099511628211ull; }
+				const uintptr_t lp = (uintptr_t)lut;
+				for (int i = 0; i < 8; i++) { lutPassKey ^= (lp >> (8 * i)) & 0xFFu; lutPassKey *= 1099511628211ull; }
+				if (lutPassKey == 0) lutPassKey = 1;
+			}
+			if (!FaldRun(faldMon, renderTargetView, newContent, lutPassKey))
 			{
 				deviceContext->CopyResource((ID3D11Resource*)backBuffer,
 				                            (ID3D11Resource*)FaldIntermediateTexture(faldMon));

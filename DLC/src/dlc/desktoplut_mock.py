@@ -215,6 +215,8 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     # the frozen fade stack (2026-10-20; runtime.fald_flank_fade) and item L (reserved, no setter)
     out["fald_flank_fade"] = bool(entry.get("flank_fade", False))
     out["fald_low_ext"] = False
+    # the fade's GPU safety governor (2026-10-22): the mock renders nothing, so an enabled fade has no report yet
+    out["fald_flank_fade_governor"] = {"state": "unknown" if out["fald_flank_fade"] else "off", "forced": False}
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer

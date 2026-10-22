@@ -9,6 +9,7 @@
 #include "desktoplut_ipc_server.h"
 #include "processing.h"   // IsProcessingTransitionActive
 #include "windows_tonemap.h"   // EdidHdrPeakNits
+#include "fald_fade_status.h"  // FaldFadeGovReportFor
 #include <dxgi1_6.h>
 #include <mutex>
 
@@ -133,6 +134,8 @@ void TakeSnapshot(Snapshot& out) {
             r.widthPx = mi.rcMonitor.right - mi.rcMonitor.left;
             r.heightPx = mi.rcMonitor.bottom - mi.rcMonitor.top;
         }
+        // the flank fade governor's status per mode (the overlay's table, or the hook's section by position)
+        for (int h = 0; h < 2; h++) FaldFadeGovReportFor(r.liveIndex, r.hmon, h == 1, r.fadeGov[h]);
     }
 
     // DLC records for every display, live and remembered.

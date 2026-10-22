@@ -119,8 +119,11 @@ bool HookRequestFullRecompose();
 // monW / monH: the monitor's desktop size (the host's monitors[] entry; 0 = unknown = the frame's). While a debug view is
 // on, the rects in tuning->exempt (DesktopLUT's own windows, monitor pixels; shared/fald_exempt.h) are mapped onto the
 // frame with it and drawn again with the view off.
+// fadeForce: the fade's safety governor never suspends it (faldFlags bit 10, INI [General] FaldFlankFadeForce;
+// shared/fald_fade_governor.h).
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning, bool fade = false, unsigned int monW = 0, unsigned int monH = 0);
+                         const DwmHookFaldTuning* tuning, bool fade = false, unsigned int monW = 0, unsigned int monH = 0,
+                         bool fadeForce = false);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing
@@ -129,7 +132,12 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
 // return value (false = copy the intermediate to the back buffer and carry on uncorrected).
 // newContent: this present carries a content change (not only the host's settle kick — see
 // DWM_HOOK_FALD_SETTLE_EVENT); it re-arms the LED-lag settle hold.
-bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent);
+// lutPassKey: the identity of what the LUT / tone map pass made of the clean copy this present (equal keys = the same
+// pass on the same inputs; 0 = unknown or time-varying, e.g. the dynamic peak). With the clean copy unchanged since the
+// last run (FaldUpdateClean copied no rect), the same key = the same intermediate: with the flank fade on and LED lag off
+// both rounds' reach are reused (shared/fald_fade.h FaldFadeReachCurrent).
+#define FALD_RUN_HAS_FRAME_KEY 1
+bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, unsigned long long lutPassKey = 0);
 
 // Microseconds the last FaldRun spent on the CPU side of the present path (QPC span around the
 // dispatches; the GPU work is asynchronous). Logged periodically so the frame cost is a number
@@ -155,4 +163,6 @@ bool FaldTestDeliver(int left, int top, bool isHdr, unsigned int gen, const void
 FaldFade* FaldTestFade(FaldMonitor* m);
 bool FaldTestFadeOn(const FaldMonitor* m);
 ID3D11Buffer* FaldTestCB(FaldMonitor* m);
+// The entry's governor state (shared/fald_fade_governor.h FaldFadeGovState as a number).
+unsigned int FaldTestFadeGovState(const FaldMonitor* m);
 #endif

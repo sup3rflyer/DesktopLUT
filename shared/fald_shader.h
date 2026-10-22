@@ -112,7 +112,8 @@ cbuffer FaldCB : register(b0) {
                                                                     // (FadePost, t20-t22; shared/fald_fade.h), bit 1 = item L
                                                                     // (reserved, always 0); 0 = the layer without it
     uint latW; uint latH; uint _pad78; uint _pad79;                 // the zone lattice's extent in px (cols * cellW / rows *
-                                                                    // cellH for an integer pitch; docs/fald-fractional-pitch.md)
+                                                                    // cellH for an integer pitch; docs/fald-fractional-pitch.md);
+                                                                    // _pad78 = 0 always: FadePost's FadeNoFuse operand
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -141,11 +142,13 @@ Texture2D<float4> starPlan2Tex : register(t18); // S1 out: (ln background, near,
                                                 // bilinearly and loads .z of the pixel's OWN zone (nearest)
 Texture2D<float4> starBgTex    : register(t19); // S0 out: (ln background, the brightest pixel's index ly * zw + lx inside
                                                 // the zone (zw = the zone's own width), lit sum, a_eff) — read by S1
-// The fade stack (fadeFlags bit 0; shared/fald_fade.h), full-res R32F, read by FadePost only:
-Texture2D<float>  fadeTTex     : register(t20); // fade_T: the ASF9o field low-passed over content frames (T11_TMTC)
-Texture2D<float>  floorTex     : register(t21); // F: the lit floor (OF), nits
-Texture2D<float>  reachTex     : register(t22); // reach of THIS round's soft knee (OF): round 0 in the round-1 statistic,
-                                                // round 1 in the pixel pass
+// The fade stack (fadeFlags bit 0; shared/fald_fade.h), R32F, read by FadePost only. fade_T and the lit floor F are
+// formed per pixel in FadePost from the small maps (up-sampled exactly as the fade passes' FadeUp: FadeUpAt below):
+Texture2D<float>  fadeFieldTex : register(t20); // full res: the ASF9o field of the last content frame (fade)
+Texture2D<float>  floorOpenTex : register(t21); // 1/8 res: G16(grey_open(ln max(down8(mi), 0.05), 101)); F = exp(up8(.))
+Texture2D<float>  reachTex     : register(t22); // full res: reach of THIS round's soft knee (OF): round 0 in the round-1
+                                                // statistic, round 1 in the pixel pass
+Texture2D<float>  fadeDTex     : register(t23); // 1/4 res: s - f_q (T11_TMTC); fade_T = clamp(fade + up4(.), 0, 1)
 SamplerState linearClamp : register(s0);
 )" /* MSVC caps ONE string literal at 16380 bytes (C2026); adjacent literals concatenate (limit 65535), so the common
       source is split here. Tools that read this header as text (DLC tests, the fxc checkers) drop the seam. */ R"(
@@ -429,15 +432,76 @@ float FadePostSmooth(float a, float b, float x) {
     float t = saturate((x - a) / (b - a));
     return t * t * (3.0f - 2.0f * t);
 }
+// The fade passes' bilinear up-sampling (fald_fade_shader.h FadeUp, the twin's up(): texel-centre alignment t = (i + 0.5) /
+// f - 0.5 with rcp = 1 / f, the edge texel held outside, rows first, four Loads, float32 weights) evaluated at one output
+// texel: the same operations in the same order, `precise`, so the value is FadeUp's bit for bit. For the fade passes ONLY
+// (fald_fade_shader.h, strict compile): a layer pass must never call it (see FadeUpAtPost).
+void FadeUpAxisAt(int i, int nIn, float rcp, out int i0, out int i1, out float fr) {
+    precise float t = ((float)i + 0.5f) * rcp - 0.5f;
+    precise float fl = floor(t);
+    i0 = clamp((int)fl, 0, nIn - 1);
+    i1 = clamp(i0 + 1, 0, nIn - 1);
+    precise float r = min(max(t - fl, 0.0f), 1.0f);
+    if (t < 0.0f) r = 0.0f;
+    else if (t > (float)(nIn - 1)) r = 1.0f;
+    fr = r;
+}
+float FadeUpAt(Texture2D<float> t, int2 p, float rcp) {
+    uint w, h;
+    t.GetDimensions(w, h);
+    int y0, y1, x0, x1; float fy, fx;
+    FadeUpAxisAt(p.y, (int)h, rcp, y0, y1, fy);
+    FadeUpAxisAt(p.x, (int)w, rcp, x0, x1, fx);
+    precise float ofy = 1.0f - fy;
+    precise float ofx = 1.0f - fx;
+    precise float c0 = t.Load(int3(x0, y0, 0)) * ofy + t.Load(int3(x0, y1, 0)) * fy;
+    precise float c1 = t.Load(int3(x1, y0, 0)) * ofy + t.Load(int3(x1, y1, 0)) * fy;
+    precise float v = c0 * ofx + c1 * fx;
+    return v;
+}
+// FadeUpAt for FadePost (the layer's pixel pass and round-1 statistic, compiled with the default flags), WITHOUT
+// `precise`: precise propagates backwards through the compiled layer — with it here every operation of Correct and of
+// the passes around it turned precise, the compiled layer changed and its output moved with the fade OFF (the OFF gate,
+// tests/test_fald_fade.cpp). Instead every product (and every sum a product or an add follows) passes FadeNoFuse, an
+// integer XOR with _pad78 (always 0: both hosts write it so): neither the compiler nor the driver can fuse a multiply
+// into an add or re-associate across it, and D3D11's mul and add round correctly — the value is FadeUpAt's bit for bit.
+// The texel-centre arithmetic is exact for rcp = 1/4 and 1/8 in any order (multiples of 1/16 below 2^12).
+float FadeNoFuse(float x) { return asfloat(asuint(x) ^ _pad78); }
+void FadeUpAxisPost(int i, int nIn, float rcp, out int i0, out int i1, out float fr) {
+    float t = ((float)i + 0.5f) * rcp - 0.5f;
+    float fl = floor(t);
+    i0 = clamp((int)fl, 0, nIn - 1);
+    i1 = clamp(i0 + 1, 0, nIn - 1);
+    float r = min(max(t - fl, 0.0f), 1.0f);
+    if (t < 0.0f) r = 0.0f;
+    else if (t > (float)(nIn - 1)) r = 1.0f;
+    fr = r;
+}
+float FadeUpAtPost(Texture2D<float> t, int2 p, float rcp) {
+    uint w, h;
+    t.GetDimensions(w, h);
+    int y0, y1, x0, x1; float fy, fx;
+    FadeUpAxisPost(p.y, (int)h, rcp, y0, y1, fy);
+    FadeUpAxisPost(p.x, (int)w, rcp, x0, x1, fx);
+    const float ofy = 1.0f - fy;
+    const float ofx = 1.0f - fx;
+    const float c0 = FadeNoFuse(FadeNoFuse(t.Load(int3(x0, y0, 0)) * ofy) + FadeNoFuse(t.Load(int3(x0, y1, 0)) * fy));
+    const float c1 = FadeNoFuse(FadeNoFuse(t.Load(int3(x1, y0, 0)) * ofy) + FadeNoFuse(t.Load(int3(x1, y1, 0)) * fy));
+    return FadeNoFuse(FadeNoFuse(c0 * ofx) + FadeNoFuse(c1 * fx));
+}
 float3 FadePost(float3 req, float3 img, int2 px) {
     if ((fadeFlags & 1u) == 0u) return req;
     float mi = max(img.r, max(img.g, img.b));
     float mr = max(req.r, max(req.g, req.b));
     float ls = (mi > 1e-9f && mr > 1e-12f) ? log(max(mr, 1e-12f) / max(mi, 1e-9f)) : 0.0f;
-    float lit = FadePostSmooth(1.0f, 3.0f, floorTex.Load(int3(px, 0)));
+    // the lit floor F = exp(up8(the 1/8-res opening)) and fade_T = clamp(fade + up4(s - f_q), 0, 1): the values the fade
+    // passes' FadeUp (fOp bit 0 = exp) + FadePix TOUT wrote to full-res maps before (fald_fade.h)
+    const float floorF = exp(FadeUpAtPost(floorOpenTex, px, 0.125f));
+    const float fadeT = min(max(FadeNoFuse(fadeFieldTex.Load(int3(px, 0)) + FadeUpAtPost(fadeDTex, px, 0.25f)), 0.0f), 1.0f);
+    float lit = FadePostSmooth(1.0f, 3.0f, floorF);
     float pos = FadePostSmooth(0.0f, 0.03f, ls);
     float keep = lit * pos * (1.0f - reachTex.Load(int3(px, 0)));
-    float fade = fadeTTex.Load(int3(px, 0)) * (1.0f - keep);
+    float fade = fadeT * (1.0f - keep);
     float lsEff = ls * (1.0f - fade);
     // = max(req * exp(lsEff - ls), 0): req >= 0 (Correct clamps it) and exp >= 0, so the optimiser drops a plain max — and
     // with it the max's NaN -> 0 (an inf input pixel: ls = ln(inf / inf) = NaN). Seen on WARP 2026-10-20: the NaN reached

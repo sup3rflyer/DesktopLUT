@@ -21,6 +21,7 @@
 // FALD_CB_BYTES, the transfer / boost-rule constants).
 #include "../shared/fald_panel.h"
 #include "../shared/fald_exempt.h"   // FaldExemptRect: DesktopLUT's own windows, exempt from the FALD views
+#include "../shared/fald_fade_governor.h"   // the flank fade's safety governor (FaldResources::fadeGov)
 
 struct MonitorContext;
 struct FaldSettings;
@@ -141,6 +142,13 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     bool fadeFailLogged = false;
     unsigned int fadeRetryCounter = 0;       // frames since the fade resources failed to create (retry every ~300)
     unsigned long long fadeKey = 0;
+    // The fade's safety governor (shared/fald_fade_governor.h): its GPU time per content frame against 15 % of the content
+    // interval; suspended = the layer runs without the fade (the setting stays on). Its status is published for the
+    // interface / the pipe (FaldFadeGovPublish).
+    FaldFadeGovernor fadeGov;
+    bool fadeGovConfigured = false;
+    bool fadeGovWeak = false;                // the device's adapter is weak for the fade (FaldFadeWeakAdapter)
+    uint32_t fadeGovPublishedGen = 0xFFFFFFFFu;
     ID3D11Buffer* cb = nullptr;
     uint32_t debugMode = 0;
     uint32_t pedMode = 0;                    // FaldSettings::pedMode at the last FaldRunPasses (GUI toggle)
@@ -184,7 +192,12 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // settle hold (FaldSettlePending), so a static desktop keeps re-running the layer for ~5 tau.
 // Starfield balancing (FaldSettings::star) recomputes its zone plan from ctx->fald->inter on EVERY call — new frame,
 // C2 re-process and settle frame alike (the plan is a stateless function of the source frame the caller left there).
-void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true);
+// frameKey = the caller's identity of the frame in ctx->fald->inter (equal keys = bit-identical frames; 0 = unknown):
+// with the flank fade on and LED lag off, a run without new content on the frame the last reach was formed from, under
+// the same settings, reuses both rounds' reach (shared/fald_fade.h FaldFadeReachCurrent) — the fields are a pure
+// function of that frame then.
+#define FALD_RUN_HAS_FRAME_KEY 1
+void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true, unsigned long long frameKey = 0);
 // True while the temporal drive state still owes settle frames after the last content change (render thread).
 // The render loop then re-runs ONLY the FALD passes on the layer's own intermediate (the main pass output of the
 // last frame) and presents — no Desktop Duplication read (the released frame texture is not a valid source; HW
@@ -195,6 +208,12 @@ bool FaldSettlePending(const MonitorContext* ctx);
 // content with the OLD content's drives when the layer comes back on a static desktop, and nothing would settle it.
 void FaldLayerIdle(MonitorContext* ctx);
 void FaldReleaseResources(MonitorContext* ctx);
+
+// The flank fade's governor, process-wide inputs (render thread reads): the INI force key ([General]
+// FaldFlankFadeForce=1: never suspended, whatever the adapter or the cost; REFERENCE.md) and, for the tests, the same.
+extern std::atomic<bool> g_faldFadeForce;
+// The governor's status per monitor and mode, for the interface and the pipe (src/fald_fade_status.h reads both paths).
+void FaldFadeGovPublish(int monitorIndex, bool hdr, const FaldFadeGovernorStatus& st);
 
 // DesktopLUT's own windows, exempt from the FALD views (shared/fald_exempt.h): the host's list in desktop pixels (the GUI
 // thread sets it while a view is on, empty otherwise; FaldRunPasses and the hook's shared config read it). Any thread.

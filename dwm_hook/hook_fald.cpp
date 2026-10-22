@@ -12,6 +12,7 @@
 #include "fald_temporal.h"
 #include "fald_panel_live.h"
 #include "fald_fade.h"
+#include "fald_fade_governor.h"
 #include "fald_exempt.h"
 
 #include <cstdarg>
@@ -214,9 +215,77 @@ static void CompileFeatureShaders() {
 
 static bool g_fadeShadersFailed = false;   // the fade stack's passes could not be created (latched until released)
 
+// The flank fade's safety governor (shared/fald_fade_governor.h): DWM's adapter, once per attach (D3D11 / DXGI calls on
+// the device only — no pointer read into DWM), and the status section the host reads (dwm_hook_config.h DwmHookFaldStatus:
+// host-created; opened from the present path rarely, never per present; written only when an entry changes, under the
+// block's compare-exchange seqlock — a busy block skips the write to a later present, never a wait).
+static int g_fadeWeakAdapter = -1;                  // -1 unknown, 0 / 1
+static HANDLE g_faldStatusMap = NULL;
+static DwmHookFaldStatus* g_faldStatusView = nullptr;
+static unsigned int g_faldStatusOpenTick = 0;
+
+static bool FadeWeakAdapter() {
+    if (g_fadeWeakAdapter < 0 && g_dev) {
+        std::string desc;
+        g_fadeWeakAdapter = FaldFadeWeakAdapter(g_dev, &desc) ? 1 : 0;
+        LogF("FALD: flank fade governor: %s", desc.c_str());
+    }
+    return g_fadeWeakAdapter == 1;
+}
+
+#ifdef DLUT_HOOK_TESTING
+static HANDLE OpenFaldStatusMap() { return NULL; }   // a test must never write a DesktopLUT host's section
+#else
+static HANDLE OpenFaldStatusMap() { return OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, DWM_HOOK_FALD_STATUS_NAME); }
+#endif
+
+static void CloseFaldStatus() {
+    if (g_faldStatusView) { UnmapViewOfFile(g_faldStatusView); g_faldStatusView = nullptr; }
+    if (g_faldStatusMap) { CloseHandle(g_faldStatusMap); g_faldStatusMap = NULL; }
+    g_faldStatusOpenTick = 0;
+}
+
+// One entry of the status block (true = written; false = no section yet, or another writer holds the block: the caller
+// tries again on a later present).
+static bool WriteFadeStatus(int left, int top, bool isHdr, const FaldFadeGovernorStatus& st) {
+    if (!g_faldStatusView) {
+        if ((g_faldStatusOpenTick++ % 240u) != 0u) return false;   // the host creates it; asked rarely
+        g_faldStatusMap = OpenFaldStatusMap();
+        if (!g_faldStatusMap) return false;
+        g_faldStatusView = (DwmHookFaldStatus*)MapViewOfFile(g_faldStatusMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+                                                            sizeof(DwmHookFaldStatus));
+        if (!g_faldStatusView) { CloseHandle(g_faldStatusMap); g_faldStatusMap = NULL; return false; }
+    }
+    DwmHookFaldStatus* b = g_faldStatusView;
+    const LONG v = (LONG)b->version;
+    if (v & 1) return false;   // a write in progress (another present thread, another session's DWM)
+    if (InterlockedCompareExchange((volatile LONG*)&b->version, v + 1, v) != v) return false;
+    int slot = -1;
+    for (int i = 0; i < DWM_HOOK_FALD_STATUS_SLOTS && slot < 0; i++) {
+        const DwmHookFaldFadeStatusEntry& e = b->entry[i];
+        if (e.used && e.left == left && e.top == top && e.isHdr == (isHdr ? 1u : 0u)) slot = i;
+    }
+    for (int i = 0; i < DWM_HOOK_FALD_STATUS_SLOTS && slot < 0; i++)
+        if (!b->entry[i].used) slot = i;
+    if (slot >= 0) {
+        DwmHookFaldFadeStatusEntry& e = b->entry[slot];
+        e.left = left; e.top = top; e.isHdr = isHdr ? 1u : 0u;
+        e.state = (uint32_t)st.state;
+        e.p90Us = (float)st.p90Us; e.budgetUs = (float)st.budgetUs;
+        e.contentMs = (float)st.contentMs; e.refreshMs = (float)st.refreshMs;
+        e.generation = st.generation;
+        e.used = 1u;
+        b->magic = DWM_HOOK_FALD_STATUS_MAGIC;
+        b->dwmPid = GetCurrentProcessId();
+    }
+    InterlockedExchange((volatile LONG*)&b->version, v + 2);
+    return true;
+}
+
 void FaldReleaseShaders() {
     FaldFadeReleaseShaders();
     g_fadeShadersFailed = false;
+    g_fadeWeakAdapter = -1;   // the next device is asked again
     ReleaseFeatureShaders();
     SafeRelease(g_exemptRS);
     SafeRelease(g_faldSampler);
@@ -463,10 +532,11 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 2208;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 4248;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
-                                                         // 2026-10-20: + the fade stack's five fields)
+                                                         // 2026-10-20: + the fade stack's five fields; 2026-10-22: + the
+                                                         // fade governor's five and cleanGen)
 struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_temporal.h (the overlay's FaldResources too)
     int left = 0, top = 0;
     bool isHdr = false;
@@ -575,6 +645,15 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     bool fadeOn = false;
     bool fadeFailed = false;
     unsigned long long fadeKey = 0;
+    // The fade's safety governor (shared/fald_fade_governor.h): fadeGov = its state (moved with the frame part: a panel
+    // swap keeps a suspension); fadeForce = the live setting (faldFlags bit 10); fadeGovWrittenGen / fadeGovWriteRuns =
+    // what the status section last got and the runs since. cleanGen counts the clean copy's changes (FaldUpdateClean):
+    // with the LUT pass's key it identifies the intermediate (FaldRun's reach reuse).
+    FaldFadeGovernor fadeGov;
+    bool fadeForce = false;
+    uint32_t fadeGovWrittenGen = 0xFFFFFFFFu;
+    uint32_t fadeGovWriteRuns = 0;
+    unsigned long long cleanGen = 0;
 
     // Memory of the params a live swap of THIS entry replaced: its next swap copies the new file into it (SwapPanel),
     // so an A/B allocates nothing in DWM's present after the first switches. Per entry, never shared: two monitors may
@@ -584,10 +663,11 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 
 // Live-swap audit (SwapPanel / MoveFramePart). Every field of FaldMonitor is exactly one of:
 //   COPIED into the scratch entry before the build (identity + live settings): left, top, isHdr, width, height, format,
-//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs, fadeWanted, exemptMonW, exemptMonH;
+//     debugMode, pedMode, starWanted, tuning, tempSettings, refreshMs, fadeWanted, fadeForce, exemptMonW, exemptMonH;
 //   MOVED with the frame part (MoveFramePart): interTex / interRTV / interSRV, cleanTex / cleanSRV, primed, cover,
 //     coverCols, coverRows, coverLeft, offPresents, settleEvt, contentEvt, evtOpenTick, framesRun, lastRunUs, gpuSumUs,
-//     gpuStarSumUs, gpuMaxUs, gpuSamples, fade (its T state is then reset by SwapPanel: the switch acts as a cut);
+//     gpuStarSumUs, gpuMaxUs, gpuSamples, fade (its T state is then reset by SwapPanel: the switch acts as a cut),
+//     fadeGov, fadeGovWrittenGen, fadeGovWriteRuns, cleanGen;
 //   KEPT on the entry by SwapPanel itself: spareParams;
 //   BUILT FRESH by the swap (BuildTables, defaults, or on demand later): params, valid, failed, panelSeq, failedSeq,
 //     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource, zoneSlices, cb, starOn,
@@ -766,6 +846,9 @@ void FaldReleaseAll() {
         ReleaseDeliveryViews();
         g_anyPanelPresent.store(false);
     }
+    // The fade governor's status section: unmapped only when no entry is still in use (a present inside FaldRun may be
+    // writing it); otherwise left mapped, like a leaked entry.
+    if (locked && leaked == 0) CloseFaldStatus();
     g_faldReleasing.store(false);
 }
 
@@ -866,19 +949,19 @@ static bool EnsureFade(FaldMonitor* m) {
     if (m->fadeFailed || g_fadeShadersFailed) return false;
     if (!FaldFadeShadersReady()) {
         std::string err;
-        const FaldFadeStatus st = FaldFadeShadersStep(g_dev, FALD_FADE_SHADERS_PER_RUN, &err);
+        const FaldFadeStatus st = FaldFadeShadersStep(g_dev, g_ctx, FALD_FADE_SHADERS_PER_RUN, &err);
         if (st == FaldFadeStatus::Failed) {
             g_fadeShadersFailed = true;
             LogF("FALD: fade stack shaders could not be created (%s) - the flank fade stays off", err.c_str());
             return false;
         }
         if (st == FaldFadeStatus::Pending) return false;
-        log_to_file("FALD: fade stack shaders created from their bytecode");
+        log_to_file("FALD: fade stack shaders created from their bytecode and warmed");
     }
     if (!m->fade) m->fade = FaldFadeCreate();
     if (!m->fade) { m->fadeFailed = true; return false; }
     const FaldFadeStatus st = FaldFadeEnsureStep(m->fade, g_dev, m->width, m->height, FALD_FADE_RESOURCES_PER_RUN,
-                                                 FALD_FADE_BYTES_PER_RUN);
+                                                 FALD_FADE_BYTES_PER_RUN, g_ctx);
     if (st == FaldFadeStatus::Ready) return true;
     if (st == FaldFadeStatus::Pending) return false;
     m->fadeFailed = true;
@@ -896,14 +979,25 @@ static void ResolveFeatures(FaldMonitor* m) {
     if (m->starOn != wasStar)
         LogF("FALD: pos(%d,%d) %s starfield %s", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->starOn ? "ON" : "off");
     const bool wasFade = m->fadeOn;
-    if (m->fadeWanted) m->fadeOn = EnsureFade(m);
+    // The fade's governor (shared/fald_fade_governor.h): the adapter + the force key, the mode (size + refresh; the mode
+    // itself is this entry's), the setting. Suspended = off below (the setting stays on; the resources go back, a retry
+    // rebuilds them, paced).
+    m->fadeGov.Configure(FadeWeakAdapter(), m->fadeForce);
+    m->fadeGov.SetRefreshMs(m->refreshMs);
+    m->fadeGov.SetMode(((unsigned long long)m->width << 40) ^ ((unsigned long long)m->height << 20) ^
+                       (unsigned long long)(m->refreshMs * 1000.0f + 0.5f));
+    m->fadeGov.SetEnabled(m->fadeWanted);
+    if (m->fadeWanted && m->fadeGov.Allowed()) m->fadeOn = EnsureFade(m);
     else {                                                        // off: released, nothing below knows it exists
         if (m->fade) { FaldFadeDestroy(m->fade); m->fade = nullptr; }
         m->fadeOn = false; m->fadeFailed = false; m->fadeKey = 0;
     }
-    if (m->fadeOn != wasFade)
-        LogF("FALD: pos(%d,%d) %s flank fade %s (%llu MB)", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->fadeOn ? "ON" : "off",
-             m->fadeOn ? FaldFadeVramBytes(m->fade) >> 20 : 0ull);
+    if (m->fadeOn != wasFade) {
+        const FaldFadeGovernorStatus gs = m->fadeGov.Status();
+        LogF("FALD: pos(%d,%d) %s flank fade %s (%llu MB; governor %s, p90 %.2f ms, budget %.2f ms, content %.1f ms)", m->left,
+             m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->fadeOn ? "ON" : "off", m->fadeOn ? FaldFadeVramBytes(m->fade) >> 20 : 0ull,
+             FaldFadeGovStateName(gs.state), gs.p90Us / 1000.0, gs.budgetUs / 1000.0, gs.contentMs);
+    }
 }
 
 static void ComputeFlatResponse(FaldMonitor* m);
@@ -1039,6 +1133,9 @@ static void MoveFramePart(FaldMonitor* to, FaldMonitor* from) {
     to->gpuSumUs = from->gpuSumUs; to->gpuStarSumUs = from->gpuStarSumUs; to->gpuMaxUs = from->gpuMaxUs;
     to->gpuSamples = from->gpuSamples;
     to->fade = from->fade; from->fade = nullptr;          // the fade stack's textures depend on the frame size only
+    to->fadeGov = from->fadeGov;                          // its governor too (its cost is the frame's, not the file's)
+    to->fadeGovWrittenGen = from->fadeGovWrittenGen; to->fadeGovWriteRuns = from->fadeGovWriteRuns;
+    to->cleanGen = from->cleanGen;
 }
 
 // Live panel-file swap of a RUNNING entry (a delivery replaced its slot's file). The new panel part is built into a
@@ -1059,7 +1156,7 @@ static bool SwapPanel(FaldMonitor* m, const FaldPanelParams& params, uint32_t se
     n->width = m->width; n->height = m->height; n->format = m->format;
     n->debugMode = m->debugMode; n->pedMode = m->pedMode; n->starWanted = m->starWanted;
     n->tuning = m->tuning; n->tempSettings = m->tempSettings; n->refreshMs = m->refreshMs;
-    n->fadeWanted = m->fadeWanted;
+    n->fadeWanted = m->fadeWanted; n->fadeForce = m->fadeForce;
     n->exemptMonW = m->exemptMonW; n->exemptMonH = m->exemptMonH;
     bool built = false, moved = false;
     try {
@@ -1286,6 +1383,7 @@ ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m) { return m ? m->cleanSRV 
 // The clean copy went stale (created, or a present of this monitor the layer did not see): every tile owes a refresh.
 static void CoverReset(FaldMonitor* m) {
     m->primed = false;
+    m->cleanGen++;   // the copy is stale: whatever it holds is no frame a reach was formed from
     if (!m->cover.empty()) std::fill(m->cover.begin(), m->cover.end(), (uint8_t)0);
     m->coverLeft = m->coverCols * m->coverRows;
 }
@@ -1317,6 +1415,7 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
         if (r <= l || b <= t) continue;
         D3D11_BOX box = { (UINT)l, (UINT)t, 0, (UINT)r, (UINT)b, 1 };
         g_ctx->CopySubresourceRegion(m->cleanTex, 0, (UINT)l, (UINT)t, 0, backBuffer, 0, &box);
+        m->cleanGen++;   // the copy changed (FaldRun's reach reuse: a new intermediate)
         if (m->primed || m->coverLeft == 0) continue;
         // tiles this rect covers COMPLETELY (a tile clipped by the frame edge counts up to the edge)
         const LONG tx0 = (l + T - 1) / T, ty0 = (t + T - 1) / T;
@@ -1396,7 +1495,7 @@ void FaldMarkAllStale() {
 }
 
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning, bool fade, unsigned int monW, unsigned int monH) {
+                         const DwmHookFaldTuning* tuning, bool fade, unsigned int monW, unsigned int monH, bool fadeForce) {
     if (!m) return;
     m->debugMode = debugMode;
     m->exemptMonW = monW;
@@ -1404,6 +1503,7 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
     m->pedMode = pedMode ? 1u : 0u;
     m->starWanted = star;
     m->fadeWanted = fade;
+    m->fadeForce = fadeForce;
     m->tuning = tuning ? SanitizeTuning(*tuning) : DefaultTuning();
     // LED lag: from the tail (none = off). Bounded here too — the delay indexes a texture array.
     FaldTemporalSettings ts;
@@ -1517,9 +1617,10 @@ static void RunStat(FaldMonitor* m, uint32_t roundIdx) {
         ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
         g_ctx->CSSetShaderResources(5, 2, fields);
         g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);      // smoothed (gain, ceiling B_est) of the previous round (C15)
-        if (m->fadeOn) {                                      // FadePost on round 0's request: fade_T, F, reach of round 0
-            ID3D11ShaderResourceView* fv[3] = { FaldFadeSrvFadeT(m->fade), FaldFadeSrvFloor(m->fade), FaldFadeSrvReach(m->fade, 0) };
-            g_ctx->CSSetShaderResources(20, 3, fv);
+        if (m->fadeOn) {                                      // FadePost on round 0's request: fade, F's opening, reach 0, s - f_q
+            ID3D11ShaderResourceView* fv[FALD_FADE_POST_VIEWS];
+            FaldFadePostViews(m->fade, 0, fv);
+            g_ctx->CSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
         }
     }
     ID3D11UnorderedAccessView* uavs[3] = { m->driveUAV, m->activeUAV[roundIdx & 1u],    // u1: null without a boost LUT
@@ -1702,9 +1803,19 @@ static void RunFadeFrame(FaldMonitor* m, bool newContent) {
     FaldFadeRunFrame(m->fade, g_ctx, FadeCommon(m, false), newContent);
 }
 
-static void RunFadeReach(FaldMonitor* m, uint32_t round) {
+// src/fald.cpp ReachKey: the identity of what both rounds' reach are formed from (the input frame + the run-time settings
+// the fields depend on besides the panel file); 0 = never reused (an unknown frame, or LED lag).
+static unsigned long long ReachKey(const FaldMonitor* m, unsigned long long frameKey, bool temporal, bool panel) {
+    if (frameKey == 0 || temporal || panel) return 0;
+    unsigned long long h = FadeInputKey(m);
+    auto mix = [&h](unsigned long long v) { for (int i = 0; i < 8; i++) { h ^= (v >> (8 * i)) & 0xFFu; h *= 1099511628211ull; } };
+    mix(frameKey); mix(m->pedMode); mix(m->debugMode);
+    return h ? h : 1ull;
+}
+
+static void RunFadeReach(FaldMonitor* m, uint32_t round, unsigned long long key) {
     FillCB(m, round);
-    FaldFadeRunReach(m->fade, g_ctx, FadeCommon(m, true), round);
+    FaldFadeRunReach(m->fade, g_ctx, FadeCommon(m, true), round, key);
 }
 
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
@@ -1859,6 +1970,7 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
         DumpTexture(m->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);
     }
     if (m->fadeOn) {   // the fade stack (same files as the overlay's dump): full res float32, s at quarter res
+        FaldFadeDebugMaterialize(m->fade, g_ctx);   // fade_T and F as full-res maps (FadePost forms them per pixel)
         const FaldFadeDebug d = FaldFadeDebugViews(m->fade);
         DumpTexture(d.fade, dir + L"fald_fade.f32", d.width, d.height, 4);
         DumpTexture(d.fadeT, dir + L"fald_fade_t.f32", d.width, d.height, 4);
@@ -1998,7 +2110,7 @@ static void DrawExempt(FaldMonitor* m) {
     g_ctx->RSSetScissorRects(prevCount, prevCount ? prevScissor : nullptr);
 }
 
-bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
+bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, unsigned long long lutPassKey) {
     if (!m || !m->valid || !m->interSRV || !dstRTV) return false;
 
     LARGE_INTEGER t0, t1, freq;
@@ -2008,7 +2120,24 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     const std::wstring dumpDir = g_dumpDir;
     g_dumpDir.clear();                       // one frame only, whatever happens below
 
-    ResolveFeatures(m);                      // starfield on or off for THIS frame
+    // The fade governor (shared/fald_fade_governor.h): the GPU time of finished content frames (timestamp queries read
+    // without a flush or a wait), this run's content-frame clock — before ResolveFeatures, which acts on its verdict.
+    if (m->fade) {
+        double us[4];
+        const unsigned int n = FaldFadeCollectTiming(m->fade, g_ctx, us, 4);
+        for (unsigned int i = 0; i < n; i++) m->fadeGov.OnSample(us[i]);
+    }
+    if (newContent && freq.QuadPart > 0) m->fadeGov.OnContentFrame((double)t0.QuadPart * 1000.0 / (double)freq.QuadPart);
+
+    ResolveFeatures(m);                      // starfield on or off for THIS frame (and the fade, by its governor)
+    // The intermediate's identity: the clean copy's generation + what the LUT / tone map pass made of it (0 = unknown)
+    unsigned long long frameKey = 0;
+    if (lutPassKey != 0) {
+        frameKey = 1469598103934665603ull;
+        for (unsigned long long v : { m->cleanGen, lutPassKey })
+            for (int i = 0; i < 8; i++) { frameKey ^= (v >> (8 * i)) & 0xFFu; frameKey *= 1099511628211ull; }
+        if (frameKey == 0) frameKey = 1;
+    }
 
     // GPU timing: collect finished slots (no flush, no wait), then start this run's slot if it is free.
     GpuTimingCollect(m);
@@ -2035,6 +2164,9 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     // Starfield first: every pass below reads Balance(source) from its plan.
     if (m->starOn) RunStar(m);
     if (m->fadeOn) RunFadeFrame(m, newContent);  // fade stack: the fade, F, T — once per content frame (fald_fade.h)
+    // Both rounds' reach of the intermediate they were formed from (no new content, LED lag off, the same settings): reused
+    const unsigned long long reachKey = m->fadeOn ? ReachKey(m, frameKey, trun.temporal, trun.panel) : 0ull;
+    const bool reachReuse = m->fadeOn && !newContent && FaldFadeReachCurrent(m->fade, reachKey);
     GpuTimingStamp(ts, 1);
     if (trun.clock.runPass) RunPanelClock(m);   // mode 3: this frame's LED state comes from PAST frames only
 
@@ -2046,13 +2178,13 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     if (trun.temporal) RunTemporal(m, inDrive);
     RunConv(m, trueDrive, estDrive, m->boostSRV[0]);
     RunGain(m);
-    if (m->fadeOn) RunFadeReach(m, 0);          // reach of round 0's knee: FadePost in the round-1 statistic
+    if (m->fadeOn && !reachReuse) RunFadeReach(m, 0, reachKey);   // reach of round 0's knee: FadePost in the round-1 statistic
     RunStat(m, 1);
     RunBoost(m, 1);
     if (trun.temporal) RunTemporal(m, inDrive);
     RunConv(m, trueDrive, estDrive, m->boostSRV[1]);
     RunGain(m);
-    if (m->fadeOn) RunFadeReach(m, 1);          // reach of round 1's knee: FadePost in the pixel pass
+    if (m->fadeOn && !reachReuse) RunFadeReach(m, 1, reachKey);   // reach of round 1's knee: FadePost in the pixel pass
     m->framesRun++;
 
     if (!dumpDir.empty()) {                   // before the commit: the state files are the maps the passes read
@@ -2092,9 +2224,10 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
     g_ctx->PSSetShaderResources(4, 1, &m->driveSRV);
     g_ctx->PSSetShaderResources(10, 1, &filt);
     g_ctx->PSSetShaderResources(13, 1, &m->activeSRV[1]);   // debug view 8 (null without a boost LUT)
-    if (m->fadeOn) {                                        // FadePost: fade_T, F, reach of round 1
-        ID3D11ShaderResourceView* fv[3] = { FaldFadeSrvFadeT(m->fade), FaldFadeSrvFloor(m->fade), FaldFadeSrvReach(m->fade, 1) };
-        g_ctx->PSSetShaderResources(20, 3, fv);
+    if (m->fadeOn) {                                        // FadePost: fade, F's opening, reach of round 1, s - f_q
+        ID3D11ShaderResourceView* fv[FALD_FADE_POST_VIEWS];
+        FaldFadePostViews(m->fade, 1, fv);
+        g_ctx->PSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
     }
     g_ctx->Draw(3, 0);
     if (m->debugMode != 0) DrawExempt(m);   // a view: DesktopLUT's windows keep the corrected picture
@@ -2128,6 +2261,14 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent) {
         }
         if (newContent && m->contentEvt) SetEvent(m->contentEvt);
         if (pending && m->settleEvt) SetEvent(m->settleEvt);
+    }
+
+    // The governor's status for the host (its FALD panel note, Events, state.get): on a state change, and every ~240 runs
+    // while the fade is wanted (the numbers). A busy or missing section leaves it for a later present.
+    {
+        const FaldFadeGovernorStatus gs = m->fadeGov.Status();
+        const bool due = gs.generation != m->fadeGovWrittenGen || (m->fadeWanted && ++m->fadeGovWriteRuns >= 240u);
+        if (due && WriteFadeStatus(m->left, m->top, m->isHdr, gs)) { m->fadeGovWrittenGen = gs.generation; m->fadeGovWriteRuns = 0; }
     }
 
     QueryPerformanceCounter(&t1);
@@ -2168,5 +2309,6 @@ bool FaldTestDeliver(int left, int top, bool isHdr, unsigned int gen, const void
 }
 FaldFade* FaldTestFade(FaldMonitor* m) { return m ? m->fade : nullptr; }
 bool FaldTestFadeOn(const FaldMonitor* m) { return m && m->fadeOn; }
+unsigned int FaldTestFadeGovState(const FaldMonitor* m) { return m ? (unsigned int)m->fadeGov.State() : 0u; }
 ID3D11Buffer* FaldTestCB(FaldMonitor* m) { return m ? m->cb : nullptr; }
 #endif

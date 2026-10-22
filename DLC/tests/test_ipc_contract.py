@@ -427,6 +427,12 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert ff.ok and ff.result == {"monitor_mode": "0:SDR", "enabled": True}
     st1 = client.call("state.get", {}).result["layers"]
     assert st1["0:SDR"]["fald_flank_fade"] is True and st1["0:HDR"]["fald_flank_fade"] is False        # per mode
+    # the fade's GPU safety governor (2026-10-22): its state per pair; 'unknown' = on, no report (nothing rendered yet)
+    assert st0["0:SDR"]["fald_flank_fade_governor"]["state"] == "off"
+    assert st1["0:SDR"]["fald_flank_fade_governor"]["state"] in ("unknown", "running", "suspended_budget",
+                                                                   "suspended_weak_gpu", "forced")
+    assert st1["0:HDR"]["fald_flank_fade_governor"]["state"] == "off"
+    assert isinstance(st1["0:SDR"]["fald_flank_fade_governor"]["forced"], bool)
     for bad_params, text in (({}, "missing parameter: enabled"), ({"enabled": 1}, "enabled must be a boolean")):
         bad = client.send(DesktopLutCommand("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", **bad_params}), raise_on_error=False)
         assert not bad.ok and bad.error == text, (bad_params, bad.error)
@@ -439,6 +445,8 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
                      "FaldPropagate(mon, isHDR);"):
             assert text in fn, text
         assert 'l.set("fald_flank_fade", JBool(fs.flankFade));' in cpp and 'l.set("fald_low_ext", JBool(fs.lowExt));' in cpp
+        assert 'l.set("fald_flank_fade_governor", gj);' in cpp and 'gj.set("state", JStr(FaldFadeGovStateName(gov.state)));' in cpp
+        assert 'gj.set("state", JStr(fs.flankFade ? "unknown" : "off"));' in cpp
     dbg9 = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 12})
     assert dbg9.ok and dbg9.result["debug_mode"] == 9                                    # clamped to the last view
     dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})

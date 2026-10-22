@@ -29,6 +29,7 @@
 #include "gui_shared.h"
 #include "mhc.h"
 #include "fald.h"
+#include "fald_fade_status.h"   // the flank fade governor's report (state.get)
 #include "displayconfig.h"
 #include "ipc_json.h"
 #include "ipc_grayscale.h"
@@ -526,6 +527,22 @@ void HandleStateGet(JsonValue& result) {
                 // the frozen fade stack (runtime.fald_flank_fade) and item L (reserved: no setter, never applied)
                 l.set("fald_flank_fade", JBool(fs.flankFade));
                 l.set("fald_low_ext", JBool(fs.lowExt));
+                {   // the fade's safety governor (shared/fald_fade_governor.h; the overlay's or the hook's report)
+                    JsonValue gj = JObj();
+                    FaldFadeGovReport gov;
+                    const HMONITOR hm = idx < g_gui.monitors.size() ? g_gui.monitors[idx] : nullptr;
+                    if (FaldFadeGovReportFor((int)idx, hm, isHDR, gov)) {
+                        gj.set("state", JStr(FaldFadeGovStateName(gov.state)));
+                        gj.set("p90_ms", JNum(gov.p90Ms));
+                        gj.set("budget_ms", JNum(gov.budgetMs));
+                        gj.set("content_ms", JNum(gov.contentMs));
+                        gj.set("refresh_ms", JNum(gov.refreshMs));
+                    } else {
+                        gj.set("state", JStr(fs.flankFade ? "unknown" : "off"));   // not run yet / no report
+                    }
+                    gj.set("forced", JBool(g_faldFadeForce.load()));            // INI [General] FaldFlankFadeForce
+                    l.set("fald_flank_fade_governor", gj);
+                }
                 l.set("fald_ped_colour_in_file", JBool(FaldPanelFileHasPedColour(fs.paramsPath)));
                 l.set("fald_boost_in_file", JBool(FaldPanelFileHasBoost(fs.paramsPath)));   // FLD4: black-frame LED boost LUT (C12)
                 uint32_t transfer = 0;

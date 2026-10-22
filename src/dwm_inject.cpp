@@ -584,6 +584,10 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
         }
     }
 
+    // No DLL of ours is resident from here on: the flank fade governor's status block starts empty (a block a crashed
+    // dwm.exe left mid-write — odd version — would otherwise refuse every later write).
+    ResetDwmHookFaldStatus();
+
     // --- Paths ---
     std::wstring basePath = ExpandEnv(L"%SYSTEMROOT%\\Temp\\");
     if (basePath.empty())
@@ -1332,9 +1336,58 @@ static void StopFaldSettleKicker() {
     CloseHandle(g_faldPrimeEvent); g_faldPrimeEvent = nullptr;
 }
 
+// The flank fade governor's status block (dwm_hook_config.h DwmHookFaldStatus; the DLL writes, the host reads): created
+// once and kept for the life of the process — never unmapped, so the readers (the interface, the pipe, the watchdog tick)
+// need no lock against a close. NULL DACL as the config: dwm.exe's identity opens it.
+static std::atomic<DwmHookFaldStatus*> g_faldStatusPtr{ nullptr };
+static HANDLE g_faldStatusHandle = nullptr;
+
+static DwmHookFaldStatus* EnsureDwmHookFaldStatus() {   // g_dwmInjectMutex held
+    DwmHookFaldStatus* b = g_faldStatusPtr.load();
+    if (b) return b;
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+    g_faldStatusHandle = CreateFileMappingW(INVALID_HANDLE_VALUE, &sa, PAGE_READWRITE, 0, sizeof(DwmHookFaldStatus),
+                                            DWM_HOOK_FALD_STATUS_NAME);
+    if (!g_faldStatusHandle) return nullptr;
+    b = static_cast<DwmHookFaldStatus*>(MapViewOfFile(g_faldStatusHandle, FILE_MAP_WRITE, 0, 0, sizeof(DwmHookFaldStatus)));
+    if (!b) { CloseHandle(g_faldStatusHandle); g_faldStatusHandle = nullptr; return nullptr; }
+    g_faldStatusPtr.store(b);
+    return b;
+}
+
+void ResetDwmHookFaldStatus() {
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    DwmHookFaldStatus* b = EnsureDwmHookFaldStatus();
+    if (!b) return;
+    // no DLL writes now (called with none resident): an odd version is a dead writer's, taken over
+    const LONG v = (LONG)b->version;
+    InterlockedExchange((volatile LONG*)&b->version, v | 1);
+    b->magic = 0; b->dwmPid = 0;
+    for (DwmHookFaldFadeStatusEntry& e : b->entry) e = DwmHookFaldFadeStatusEntry{};
+    InterlockedExchange((volatile LONG*)&b->version, (v | 1) + 1);
+}
+
+bool ReadDwmHookFaldStatus(DwmHookFaldStatus& out) {
+    DwmHookFaldStatus* b = g_faldStatusPtr.load();
+    if (!b) return false;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        const uint32_t v1 = b->version;
+        if (v1 & 1u) { YieldProcessor(); continue; }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        std::memcpy(&out, (const void*)b, sizeof(out));
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (b->version == v1) return out.magic == DWM_HOOK_FALD_STATUS_MAGIC;
+    }
+    return false;
+}
+
 bool CreateDwmHookSharedMemory()
 {
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    EnsureDwmHookFaldStatus();   // the DLL opens it from its present path (not fatal without it: no status shown)
     if (g_sharedMemPtr) return true;
 
     // NULL DACL = unrestricted access. Required because dwm.exe runs as SYSTEM and
@@ -1480,7 +1533,8 @@ void UpdateDwmHookSharedConfig()
                                                            static_cast<uint32_t>(fs.debugMode),
                                                            static_cast<int>(fs.pedMode),
                                                            fs.star.enabled ? 1 : 0,
-                                                           fs.flankFade ? 1 : 0);   // bit 8; bit 9 (L) never set
+                                                           fs.flankFade ? 1 : 0,    // bit 8; bit 9 (L) never set
+                                                           g_faldFadeForce.load() ? 1 : 0);   // bit 10: the governor forced
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];

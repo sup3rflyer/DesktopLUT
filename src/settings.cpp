@@ -1252,6 +1252,9 @@ bool LoadSettings() {
     // DesktopGamma is now per-monitor (derived from MHCDesktopGamma after monitors load below)
     g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", true, iniPath.c_str()));
     g_hdrDither.store(GetPrivateProfileBool(L"General", L"HdrDither", true, iniPath.c_str()));
+    // The flank fade's safety governor forced on (fald.h g_faldFadeForce; REFERENCE.md): an INI-only key, read, never
+    // written (absent = 0 = the governor decides)
+    g_faldFadeForce.store(GetPrivateProfileBool(L"General", L"FaldFlankFadeForce", false, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));
     g_showFrameTiming.store(GetPrivateProfileBool(L"General", L"ShowFrameTiming", false, iniPath.c_str()));
