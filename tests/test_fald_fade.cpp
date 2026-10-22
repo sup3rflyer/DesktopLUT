@@ -569,6 +569,32 @@ TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, w
     dis->Release(); blob->Release();
 }
 
+// The layer's own passes (src/fald.cpp CompileOne: the default flags; the hook compiles the same sources) hold no
+// `precise`: it propagates backwards through everything that feeds the marked value, so one in FadePost compiled ALL of
+// Correct and the passes around it precise (no mad) and moved the layer's output with the fade OFF (2026-10-22: 5 of the
+// OFF gate's 1210 hashes). FadePost keeps the fade passes' rounding without it (fald_shader.h FadeUpAtPost).
+TEST_CASE("FALD layer: no `precise` in the layer's compiled passes (the fade-OFF layer compiles as main's)") {
+    const FaldShaderSources s = FaldDefaultShaderSources();
+    struct P { const char* name; const char* src; const char* target; };
+    const P passes[] = { { "pixel", s.pixel, "ps_5_0" }, { "stat", s.stat, "cs_5_0" }, { "conv", s.conv, "cs_5_0" },
+                         { "gain", s.gain, "cs_5_0" }, { "blur", s.blur, "cs_5_0" }, { "temporal", s.temporal, "cs_5_0" },
+                         { "panelClock", s.panelClock, "cs_5_0" }, { "boost", s.boost, "cs_5_0" },
+                         { "starStat", s.starStat, "cs_5_0" }, { "starWeight", s.starWeight, "cs_5_0" },
+                         { "starPlan", s.starPlan, "cs_5_0" } };
+    for (const P& p : passes) {
+        const std::string src = std::string(s.common) + p.src;
+        ID3DBlob* blob = nullptr; ID3DBlob* err = nullptr;
+        const HRESULT hr = D3DCompile(src.c_str(), src.size(), p.name, nullptr, nullptr, "main", p.target, 0, 0, &blob, &err);
+        if (err) err->Release();
+        REQUIRE_MESSAGE(SUCCEEDED(hr), p.name);
+        ID3DBlob* dis = nullptr;
+        REQUIRE(SUCCEEDED(D3DDisassemble(blob->GetBufferPointer(), blob->GetBufferSize(), 0, nullptr, &dis)));
+        const std::string text((const char*)dis->GetBufferPointer(), dis->GetBufferSize());
+        CHECK_MESSAGE(text.find("precise") == std::string::npos, p.name << ": a `precise` instruction in a layer pass");
+        dis->Release(); blob->Release();
+    }
+}
+
 // The ON gate's device side (PORT_PLAN 5.2 step 2): every gate cell through the overlay's layer on WARP with the flank fade
 // on, one monitor context per still (= no history) and per sequence (16 content frames in order), each frame's fade-stack
 // fields, base fields, T flags and output dumped to FALD_TEST_FADE_ON/<run>/tNN/ for DLC tests/test_fald_fade_gate2.py.
