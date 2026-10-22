@@ -23,7 +23,7 @@ const double kPi = 3.14159265358979323846;
 // (fald_fade_shader.h); a Gaussian's radius picks its kernel (GaussKernel), a max / min filter's likewise (ExtKernel).
 enum FadeKernel : unsigned int {
     K_GRAD, K_DOWN, K_UP, K_PIX, K_KNEE, K_ADVANCE, K_MEANWIN, K_DFT, K_CROSS, K_NORM, K_MAXMAG, K_ARGMAX, K_OVERLAP,
-    K_CUT, K_WARPQ, K_TM, K_SELECT,
+    K_CUT, K_WARPQ, K_TM, K_SELECT, K_OVERLAPR, K_CUTR,
     K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2, K_GT2P,
     K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT, K_DOWNMI,
     K_G2D4, K_G2D8, K_G2D12, K_G2D16,
@@ -53,6 +53,8 @@ const KernelDef kKernels[K_COUNT] = {
     { "FadeWarpQ", &g_faldFadeWarpQSource, &g_faldFadeWarpFnSource, "" },
     { "FadeTm", &g_faldFadeTmSource, &g_faldFadeWarpFnSource, "" },
     { "FadeSelect", &g_faldFadeSelectSource, nullptr, "" },
+    { "FadeOverlapR", &g_faldFadeOverlapRSource, &g_faldFadeWarpFnSource, "" },
+    { "FadeCutR", &g_faldFadeCutRSource, nullptr, "" },
     { "FadeGaussT4", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 4\n" },
     { "FadeGaussT8", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 8\n" },
     { "FadeGaussT12", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 12\n" },
@@ -138,6 +140,8 @@ const unsigned int kFftMax = 1024;
 const bool kPlainSums = true;
 // Gaussians of radius <= 16 (sigma <= 4) in one pass (FadeGauss2D, value for value the two passes); false = two passes
 const bool kGauss2D = true;
+// the overlap / cut partials buffer: 1024 chains x 16 bytes, then two 64-bin histograms (fald_fade_shader.h fPart)
+const unsigned int kPartBytes = 16384u + 2u * 64u * 4u;
 
 // dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
 // order in double, w[r + j] / sum stored float32.
@@ -197,6 +201,8 @@ struct FaldFade {
     int gwR[kNumSigmas] = {};
     FadeTex hann, specG;
     ID3D11Buffer* flagsBuf = nullptr; ID3D11UnorderedAccessView* flagsUAV = nullptr;
+    // the overlap / cut reductions' chain partials (1024 x 16 bytes) + the cut's two 64-bin histograms (u6, raw)
+    ID3D11Buffer* partBuf = nullptr; ID3D11UnorderedAccessView* partUAV = nullptr;
     ID3D11Buffer* cb = nullptr;       // b1, per dispatch
     ID3D11Buffer* frameCb = nullptr;  // b2, per content frame
     FadeTiming timing;
@@ -354,6 +360,7 @@ void ReleaseAll(FaldFade* f) {
     f->lvH.clear(); f->lvW.clear();
     SafeRel(f->twW); SafeRel(f->twWBuf); SafeRel(f->twH); SafeRel(f->twHBuf); SafeRel(f->gw); SafeRel(f->gwBuf);
     SafeRel(f->flagsUAV); SafeRel(f->flagsBuf);
+    SafeRel(f->partUAV); SafeRel(f->partBuf);
     SafeRel(f->cb); SafeRel(f->frameCb);
     ReleaseTiming(f->timing);
     f->built = false; f->hasHistory = false; f->frameValid = false; f->parity = 0; f->vram = 0;
@@ -382,7 +389,7 @@ void Pass(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int k, const FadeCBDat
     ID3D11ShaderResourceView* srv[12] = { io.in[0], io.in[1], io.in[2], io.in[3], io.in[4], io.inC[0], io.inC[1],
                                           f->twW, f->twH, f->gw, f->hann.srv, f->specG.srv };
     ctx->CSSetShaderResources(24, 12, srv);
-    ID3D11UnorderedAccessView* uav[8] = { io.out[0], io.out[1], io.out[2], io.out[3], io.outC[0], io.outC[1], nullptr, f->flagsUAV };
+    ID3D11UnorderedAccessView* uav[8] = { io.out[0], io.out[1], io.out[2], io.out[3], io.outC[0], io.outC[1], f->partUAV, f->flagsUAV };
     ctx->CSSetUnorderedAccessViews(0, 8, uav, nullptr);
     if (g_faldFadePassHook) g_faldFadePassHook->Before(ctx, k);
     ctx->Dispatch(gx, gy, 1);
@@ -828,6 +835,17 @@ bool BuildItemNow(FaldFade* f, const FaldFade::BuildItem& it, ID3D11DeviceContex
         D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
         ud.Format = DXGI_FORMAT_UNKNOWN; ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER; ud.Buffer.NumElements = 16;
         if (FAILED(f->dev->CreateUnorderedAccessView(f->flagsBuf, &ud, &f->flagsUAV))) return false;
+        D3D11_BUFFER_DESC pd = {};
+        pd.ByteWidth = kPartBytes; pd.Usage = D3D11_USAGE_DEFAULT; pd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        pd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+        std::vector<uint32_t> pz(kPartBytes / 4u, 0u);
+        D3D11_SUBRESOURCE_DATA pinit = {};
+        pinit.pSysMem = pz.data();
+        if (FAILED(f->dev->CreateBuffer(&pd, &pinit, &f->partBuf))) return false;
+        D3D11_UNORDERED_ACCESS_VIEW_DESC pu = {};
+        pu.Format = DXGI_FORMAT_R32_TYPELESS; pu.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+        pu.Buffer.NumElements = kPartBytes / 4u; pu.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+        if (FAILED(f->dev->CreateUnorderedAccessView(f->partBuf, &pu, &f->partUAV))) return false;
         if (!(MakeDynamicCB(f, sizeof(FadeCBData), &f->cb) && MakeDynamicCB(f, 16, &f->frameCb))) return false;
         MakeTiming(f);   // optional
         return true;
@@ -1020,12 +1038,22 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
             { Io a; a.inC[0] = f->eC2.srv; a.outC[0] = f->eC1.uav; transform(2, a); }
             { Io a; a.inC[0] = f->eC1.srv; a.out[0] = f->eR.uav; transform(3, a); }
             { Io a; a.in[0] = f->eR.srv; One(f, ctx, K_ARGMAX, W8, H8, a); }
-            { Io a; a.in[0] = f->eL8.srv; a.in[1] = f->eL8Prev[p].srv; One(f, ctx, K_OVERLAP, W8, H8, a); }
+            {   // the overlap: 1024 chains in 16 groups, then the tree (one group)
+                Io a; a.in[0] = f->eL8.srv; a.in[1] = f->eL8Prev[p].srv;
+                FadeCBData oc = Cb(); oc.inW = W8; oc.inH = H8;
+                Pass(f, ctx, K_OVERLAP, oc, a, 16, 1);
+                One(f, ctx, K_OVERLAPR, W8, H8, a);
+            }
             {
                 FadeCBData hc = Cb();
                 const double lo = std::log(0.02), hi = std::log(2000.0);
                 hc.c0 = (float)lo; hc.c1 = (float)(64.0 / (hi - lo)); hc.c2 = (float)(hi - 1e-9); hc.c3 = (float)((hi - lo) / 64.0);
-                Io a; a.in[0] = f->eL8.srv; a.in[1] = f->eL8Prev[p].srv; One(f, ctx, K_CUT, W8, H8, a, &hc);
+                Io a; a.in[0] = f->eL8.srv; a.in[1] = f->eL8Prev[p].srv;
+                const UINT zero4[4] = { 0u, 0u, 0u, 0u };
+                ctx->ClearUnorderedAccessViewUint(f->partUAV, zero4);   // the histograms start at 0
+                hc.inW = W8; hc.inH = H8;
+                Pass(f, ctx, K_CUT, hc, a, 16, 1);                      // 1024 chains in 16 groups
+                One(f, ctx, K_CUTR, W8, H8, a, &hc);                    // the tree and the finish (one group)
             }
             { Io a; a.in[0] = f->qS[p].srv; a.in[1] = f->qLqPrev[p].srv; a.out[0] = f->qSw.uav; a.out[1] = f->qLw.uav;
               FadeCBData wc = Cb(); wc.inW = Wq; wc.inH = Hq; Pass(f, ctx, K_WARPQ, wc, a, G16(Wq), G16(Hq)); }

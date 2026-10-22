@@ -871,12 +871,11 @@ bool FadeFinite(float v) { return (asuint(v) & 0x7f800000u) != 0x7f800000u; }
 // accepted iff m1 < m0. Kahan sums per thread (a texel outside the overlap adds 0), tree, / count -> flags RES0 / RES1 /
 // USED / DY / DX.
 inline const char* g_faldFadeOverlapSource = R"(
-groupshared float gS0[1024];
-groupshared float gS1[1024];
-groupshared uint gN0[1024];
-groupshared uint gN1[1024];
-[numthreads(1024, 1, 1)]
-void main(uint3 tid : SV_GroupThreadID) {
+// pass 1 of 2: chain g = 64 gid + tid (0..1023) = the one-group pass's thread g, its partials -> u6 (16 bytes at 16 g)
+RWByteAddressBuffer fPart : register(u6);
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    const uint3 tid = uint3(gid.x * 64u + gtid.x, 0u, 0u);
     int W = (int)fInW, H = (int)fInH;
     uint n = fInW * fInH;
     float dy = asfloat(fFlags[FADE_FLAG_PC_DY]), dx = asfloat(fFlags[FADE_FLAG_PC_DX]);
@@ -901,7 +900,25 @@ void main(uint3 tid : SV_GroupThreadID) {
             n1 += v1 ? 1u : 0u;
         }
     }
-    gS0[tid.x] = s0; gS1[tid.x] = s1; gN0[tid.x] = n0; gN1[tid.x] = n1;
+    fPart.Store4(16u * tid.x, uint4(asuint(s0), asuint(s1), n0, n1));
+}
+)";
+
+// ---- the overlap's pass 2 (one group): the 1024 chains' partials from u6, the tree and the finish of the one-group pass
+inline const char* g_faldFadeOverlapRSource = R"(
+RWByteAddressBuffer fPart : register(u6);
+groupshared float gS0[1024];
+groupshared float gS1[1024];
+groupshared uint gN0[1024];
+groupshared uint gN1[1024];
+[numthreads(1024, 1, 1)]
+void main(uint3 tid : SV_GroupThreadID) {
+    int W = (int)fInW, H = (int)fInH;
+    float dy = asfloat(fFlags[FADE_FLAG_PC_DY]), dx = asfloat(fFlags[FADE_FLAG_PC_DX]);
+    bool ok = abs(dy) < 0.25f * (float)H && abs(dx) < 0.25f * (float)W && FadeFinite(dy) && FadeFinite(dx);
+    bool need1 = ok && (abs(dy) > 1e-6f || abs(dx) > 1e-6f);
+    const uint4 pt = fPart.Load4(16u * tid.x);
+    gS0[tid.x] = asfloat(pt.x); gS1[tid.x] = asfloat(pt.y); gN0[tid.x] = pt.z; gN1[tid.x] = pt.w;
     GroupMemoryBarrierWithGroupSync();
     for (uint st = 512u; st > 0u; st >>= 1) {
         if (tid.x < st) {
@@ -930,22 +947,20 @@ void main(uint3 tid : SV_GroupThreadID) {
 // [ln 0.02, ln 2000] (values clamped in; bin = floor((x - lo) fC1), fC0 = lo, fC2 = the clamp top, fC3 = bin width);
 // cut iff frac >= 0.15 or EMD > 0.2 -> flags FRAC / EMD / CUT.
 inline const char* g_faldFadeCutSource = R"(
-groupshared uint gHa[64];
-groupshared uint gHb[64];
-groupshared uint gCnt[1024];
-groupshared uint gGt[1024];
+// pass 1 of 2: chain g as the overlap's; (cnt, gt) -> u6 at 16 g; the two histograms -> u6 from byte 16384 (64 + 64
+// counters, zeroed by the caller; integer counts: the order does not matter)
+RWByteAddressBuffer fPart : register(u6);
 uint Bin(float x) {
     precise float xc = min(max(x, fC0), fC2);
     precise float tb = (xc - fC0) * fC1;
     int b = (int)floor(tb);
     return (uint)clamp(b, 0, 63);
 }
-[numthreads(1024, 1, 1)]
-void main(uint3 tid : SV_GroupThreadID) {
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID) {
+    const uint3 tid = uint3(gid.x * 64u + gtid.x, 0u, 0u);
     int W = (int)fInW, H = (int)fInH;
     uint n = fInW * fInH;
-    if (tid.x < 64u) { gHa[tid.x] = 0u; gHb[tid.x] = 0u; }
-    GroupMemoryBarrierWithGroupSync();
     float dy = asfloat(fFlags[FADE_FLAG_DY]), dx = asfloat(fFlags[FADE_FLAG_DX]);
     int fly, flx; float wy0, wy1, wy2, wy3, wx0, wx1, wx2, wx3;
     FadeCubicW(dy, fly, wy0, wy1, wy2, wy3);
@@ -960,10 +975,26 @@ void main(uint3 tid : SV_GroupThreadID) {
             precise float d = abs(a - FadeWarpAt(fIn1, x, y, W, H, flx, wx0, wx1, wx2, wx3, fly, wy0, wy1, wy2, wy3));
             if (d > FADE_T_CD) gt++;
         }
-        InterlockedAdd(gHa[Bin(a)], 1u);
-        InterlockedAdd(gHb[Bin(b)], 1u);
+        fPart.InterlockedAdd(16384u + 4u * Bin(a), 1u);
+        fPart.InterlockedAdd(16640u + 4u * Bin(b), 1u);
     }
-    gCnt[tid.x] = cnt; gGt[tid.x] = gt;
+    fPart.Store2(16u * tid.x, uint2(cnt, gt));
+}
+)";
+
+// ---- the cut test's pass 2 (one group): the chains' counts and the histograms from u6, the tree and the finish
+inline const char* g_faldFadeCutRSource = R"(
+RWByteAddressBuffer fPart : register(u6);
+groupshared uint gHa[64];
+groupshared uint gHb[64];
+groupshared uint gCnt[1024];
+groupshared uint gGt[1024];
+[numthreads(1024, 1, 1)]
+void main(uint3 tid : SV_GroupThreadID) {
+    uint n = fInW * fInH;
+    if (tid.x < 64u) { gHa[tid.x] = fPart.Load(16384u + 4u * tid.x); gHb[tid.x] = fPart.Load(16640u + 4u * tid.x); }
+    const uint2 pt = fPart.Load2(16u * tid.x);
+    gCnt[tid.x] = pt.x; gGt[tid.x] = pt.y;
     GroupMemoryBarrierWithGroupSync();
     for (uint st = 512u; st > 0u; st >>= 1) {
         if (tid.x < st) { gCnt[tid.x] += gCnt[tid.x + st]; gGt[tid.x] += gGt[tid.x + st]; }
