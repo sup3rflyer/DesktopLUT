@@ -33,6 +33,8 @@
 // (FadeGaussT2), the cone / the reach run 8 iterations per dispatch (FadeConeT), an up-sampling that fed a Gaussian or a
 // pixel step is formed where it is read (FadeUpAt), the pixel step after a Gaussian is done by its horizontal pass, the
 // DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit floor F itself (fald_shader.h).
+// The tiled Gaussians have their radius and their float32 weights compiled in (one class per sigma, fald_fade.cpp
+// BakedWeightsSource) and their steps unrolled (2026-10-22, the same operations without the weight loads and the loop).
 // FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
 // Within the frozen gate-1 tolerances (not bit-identical; DLC tests/fald_fade_frozen_tolerances_f12b.json): Z8, the
 // phase correlation's transforms by a float32 FFT (FadeFft; the dense DFT stays for 1/8-res lines over 1024); Z9, plain
@@ -1088,6 +1090,11 @@ void main(uint3 id : SV_DispatchThreadID) {
 // A tap: fFactor > 1 = the input up-sampled by fFactor (fIn0 at 1 / fFactor res, fC1 = 1 / fFactor; FadeUpAt = FadeUp's
 // value), else fIn0 itself; fOp bit 0 = clamp it into [0, 1e4] (GTap).
 inline const char* g_faldFadeTileFnSource = R"(
+#define FADE_CAT_(a, b) a##b
+#define FADE_CAT(a, b) FADE_CAT_(a, b)
+#if defined(TG_SIGMA) && FADE_CAT(FADE_GR_S, TG_SIGMA) != TG_RMAX
+#error the class's sigma does not have the class's radius
+#endif
 #define TG_LEN 64
 #define TG_LINES 16
 #define TG_BASE (TG_LEN + 2 * TG_RMAX)
@@ -1110,41 +1117,56 @@ void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
         gT[ln * TG_STRIDE + k] = vert ? GtTap(gc, ga) : GtTap(ga, gc);
     }
 }
-// plain (Z9, fOp bit 3: the Gaussians the fade is insensitive to; within the frozen gate-1 tolerances, not bit-identical):
-// s = s + term in float32 instead of the Kahan step (DLC fadeemu.gauss_plain). lv's four stay Kahan (they feed gradients)
-void GtSweep(int base, int r, uint off, bool plain, out float o0, out float o1, out float o2, out float o3) {
-    const float w0 = fGW[off];
+// The sweep of four consecutive outputs: s = x[c] w0, then for j = 1..r term = (x[c - j] + x[c + j]) w_j added by the Kahan
+// step (FadeGauss's order) or — plain (Z9, fOp bit 3: the Gaussians the fade is insensitive to; within the frozen gate-1
+// tolerances, not bit-identical) — s = s + term in float32 (DLC fadeemu.gauss_plain; lv's four stay Kahan: they feed
+// gradients). The radius and the weights are COMPILED IN (sigma `sg` a literal: FadeGR / FadeGW, fald_fade.cpp
+// BakedWeightsSource — t33's float32 values bit for bit; AMD FidelityFX Blur's one permutation per kernel size) and the
+// steps unrolled — all of them up to FADE_UNROLL_ALL, else 8 at a time — so a step has no weight load, no loop test and
+// no register rotation: the same operations in the same order per output as the loop over t33 they replace.
+#ifndef FADE_UNROLL_ALL
+#define FADE_UNROLL_ALL 32
+#endif
+void GtStep(int base, int j, float wj, bool plain, inout float s0, inout float s1, inout float s2, inout float s3,
+            inout float k0, inout float k1, inout float k2, inout float k3, inout float l0, inout float l1, inout float l2,
+            inout float q1, inout float q2, inout float q3) {
+    const float nl = gT[base - j], nr = gT[base + 3 + j];
+    precise float t0 = (nl + q1) * wj;
+    precise float t1 = (l0 + q2) * wj;
+    precise float t2 = (l1 + q3) * wj;
+    precise float t3 = (l2 + nr) * wj;
+    if (plain) {
+        precise float a0 = s0 + t0;
+        precise float a1 = s1 + t1;
+        precise float a2 = s2 + t2;
+        precise float a3 = s3 + t3;
+        s0 = a0; s1 = a1; s2 = a2; s3 = a3;
+    } else {
+        FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
+    }
+    l2 = l1; l1 = l0; l0 = nl;
+    q1 = q2; q2 = q3; q3 = nr;
+}
+void GtSweep(int base, int sg, bool plain, out float o0, out float o1, out float o2, out float o3) {
+    const int r = FadeGR(sg);
+    const float w0 = FadeGW(sg, 0);
     const float x0 = gT[base], x1 = gT[base + 1], x2 = gT[base + 2], x3 = gT[base + 3];
     precise float s0 = x0 * w0;
     precise float s1 = x1 * w0;
     precise float s2 = x2 * w0;
     precise float s3 = x3 * w0;
     precise float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
-    float l0 = x0, l1 = x1, l2 = x2, q1 = x1, q2 = x2, q3 = x3;   // x[o_k - (j - 1)] / x[o_k + (j - 1)] of the next step
-    if (plain) {
-        for (int j = 1; j <= r; j++) {
-            const float wj = fGW[off + (uint)j];
-            const float nl = gT[base - j], nr = gT[base + 3 + j];
-            precise float t0 = (nl + q1) * wj;
-            precise float t1 = (l0 + q2) * wj;
-            precise float t2 = (l1 + q3) * wj;
-            precise float t3 = (l2 + nr) * wj;
-            s0 = s0 + t0; s1 = s1 + t1; s2 = s2 + t2; s3 = s3 + t3;
-            l2 = l1; l1 = l0; l0 = nl;
-            q1 = q2; q2 = q3; q3 = nr;
-        }
+    float l0 = x0, l1 = x1, l2 = x2, q1 = x1, q2 = x2, q3 = x3;
+    if (r <= FADE_UNROLL_ALL) {
+        [unroll] for (int j = 1; j <= r; j++)
+            GtStep(base, j, FadeGW(sg, j), plain, s0, s1, s2, s3, k0, k1, k2, k3, l0, l1, l2, q1, q2, q3);
     } else {
-        for (int j = 1; j <= r; j++) {
-            const float wj = fGW[off + (uint)j];
-            const float nl = gT[base - j], nr = gT[base + 3 + j];
-            precise float t0 = (nl + q1) * wj;
-            precise float t1 = (l0 + q2) * wj;
-            precise float t2 = (l1 + q3) * wj;
-            precise float t3 = (l2 + nr) * wj;
-            FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
-            l2 = l1; l1 = l0; l0 = nl;
-            q1 = q2; q2 = q3; q3 = nr;
+        [loop] for (int jb = 0; jb < r / 8; jb++) {
+            [unroll] for (int ju = 1; ju <= 8; ju++)
+                GtStep(base, 8 * jb + ju, FadeGW(sg, 8 * jb + ju), plain, s0, s1, s2, s3, k0, k1, k2, k3, l0, l1, l2, q1, q2, q3);
         }
+        [unroll] for (int jt = 8 * (r / 8) + 1; jt <= r; jt++)
+            GtStep(base, jt, FadeGW(sg, jt), plain, s0, s1, s2, s3, k0, k1, k2, k3, l0, l1, l2, q1, q2, q3);
     }
     o0 = s0; o1 = s1; o2 = s2; o3 = s3;
 }
@@ -1180,7 +1202,7 @@ void GtStore(int2 p, float s) {
 [numthreads(16, 16, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const bool vert = (fDir == 0u);
-    const int r = (int)fRadius;
+    const int r = TG_RMAX;
     const int nA = vert ? (int)fInH : (int)fInW;
     const int nC = vert ? (int)fInW : (int)fInH;
     const int a0 = (int)(vert ? gid.y : gid.x) * TG_LEN;
@@ -1189,8 +1211,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     GtFill(vert, a0, c0, r, nA, nC, t);
     GroupMemoryBarrierWithGroupSync();
     const uint lineIx = tid.x, lane = FadeLanePerm(tid.y);
+    const int base = (int)(lineIx * TG_STRIDE) + r + 4 * (int)lane;
     float o0, o1, o2, o3;
-    GtSweep((int)(lineIx * TG_STRIDE) + r + 4 * (int)lane, r, fWOff, (fOp & 8u) != 0u, o0, o1, o2, o3);
+    if ((fOp & 8u) != 0u) GtSweep(base, TG_SIGMA, true, o0, o1, o2, o3);
+    else GtSweep(base, TG_SIGMA, false, o0, o1, o2, o3);
     if ((fOp & 2u) != 0u) { o0 = saturate(o0); o1 = saturate(o1); o2 = saturate(o2); o3 = saturate(o3); }
     GroupMemoryBarrierWithGroupSync();   // every tap read: the tile takes the outputs
     const uint tb = lineIx * 65u + 4u * lane;
@@ -1214,6 +1238,11 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 // horizontal pass value for value (the same taps, the same order: GtSweep's, Kahan or plain by fOp bit 3) without the
 // full-resolution intermediate and with one dispatch instead of two.
 inline const char* g_faldFadeGauss2DSource = R"(
+#define FADE_CAT_(a, b) a##b
+#define FADE_CAT(a, b) FADE_CAT_(a, b)
+#if FADE_CAT(FADE_GR_S, TG_SIGMA) != TG_RMAX
+#error the class's sigma does not have the class's radius
+#endif
 RWTexture2D<float> g2dOut : register(u0);
 RWTexture2D<float> g2dIo : register(u1);
 #define G2_TW 64
@@ -1227,9 +1256,30 @@ float G2Tap(int x, int y) {
     if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
     return v;
 }
-// GtSweep along groupshared memory with a stride (`step` words between taps): outputs at base, base + step, ...
-void G2Sweep(int base, int step, int r, uint off, bool plain, out float o0, out float o1, out float o2, out float o3) {
-    const float w0 = fGW[off];
+// GtSweep along groupshared memory with a stride (`step` words between taps, a literal): outputs at base, base + step, ...
+// (the radius and the weights compiled in: TG_SIGMA's, FadeGR / FadeGW)
+void G2Step(int base, int step, int j, float wj, bool plain, inout float s0, inout float s1, inout float s2, inout float s3,
+            inout float k0, inout float k1, inout float k2, inout float k3, inout float l0, inout float l1, inout float l2,
+            inout float q1, inout float q2, inout float q3) {
+    const float nl = g2[base - j * step], nr = g2[base + (3 + j) * step];
+    precise float t0 = (nl + q1) * wj;
+    precise float t1 = (l0 + q2) * wj;
+    precise float t2 = (l1 + q3) * wj;
+    precise float t3 = (l2 + nr) * wj;
+    if (plain) {
+        precise float a0 = s0 + t0;
+        precise float a1 = s1 + t1;
+        precise float a2 = s2 + t2;
+        precise float a3 = s3 + t3;
+        s0 = a0; s1 = a1; s2 = a2; s3 = a3;
+    } else {
+        FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
+    }
+    l2 = l1; l1 = l0; l0 = nl;
+    q1 = q2; q2 = q3; q3 = nr;
+}
+void G2Sweep(int base, int step, bool plain, out float o0, out float o1, out float o2, out float o3) {
+    const float w0 = FadeGW(TG_SIGMA, 0);
     const float x0 = g2[base], x1 = g2[base + step], x2 = g2[base + 2 * step], x3 = g2[base + 3 * step];
     precise float s0 = x0 * w0;
     precise float s1 = x1 * w0;
@@ -1237,31 +1287,8 @@ void G2Sweep(int base, int step, int r, uint off, bool plain, out float o0, out 
     precise float s3 = x3 * w0;
     precise float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
     float l0 = x0, l1 = x1, l2 = x2, q1 = x1, q2 = x2, q3 = x3;
-    if (plain) {
-        for (int j = 1; j <= r; j++) {
-            const float wj = fGW[off + (uint)j];
-            const float nl = g2[base - j * step], nr = g2[base + (3 + j) * step];
-            precise float t0 = (nl + q1) * wj;
-            precise float t1 = (l0 + q2) * wj;
-            precise float t2 = (l1 + q3) * wj;
-            precise float t3 = (l2 + nr) * wj;
-            s0 = s0 + t0; s1 = s1 + t1; s2 = s2 + t2; s3 = s3 + t3;
-            l2 = l1; l1 = l0; l0 = nl;
-            q1 = q2; q2 = q3; q3 = nr;
-        }
-    } else {
-        for (int j = 1; j <= r; j++) {
-            const float wj = fGW[off + (uint)j];
-            const float nl = g2[base - j * step], nr = g2[base + (3 + j) * step];
-            precise float t0 = (nl + q1) * wj;
-            precise float t1 = (l0 + q2) * wj;
-            precise float t2 = (l1 + q3) * wj;
-            precise float t3 = (l2 + nr) * wj;
-            FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
-            l2 = l1; l1 = l0; l0 = nl;
-            q1 = q2; q2 = q3; q3 = nr;
-        }
-    }
+    [unroll] for (int j = 1; j <= TG_RMAX; j++)
+        G2Step(base, step, j, FadeGW(TG_SIGMA, j), plain, s0, s1, s2, s3, k0, k1, k2, k3, l0, l1, l2, q1, q2, q3);
     o0 = s0; o1 = s1; o2 = s2; o3 = s3;
 }
 void G2Store(int2 p, float s) {   // = FadeGaussT's GtStore
@@ -1285,7 +1312,7 @@ void G2Store(int2 p, float s) {   // = FadeGaussT's GtStore
 }
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
-    const int r = (int)fRadius;
+    const int r = TG_RMAX;
     const int W = (int)fInW, H = (int)fInH;
     const int x0 = (int)gid.x * G2_TW, y0 = (int)gid.y * G2_TH;
     const uint t = tid.x;
@@ -1302,7 +1329,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     [unroll] for (uint n = 0; n < 3u; n++) {
         const uint e = t + 256u * n;
         const int i = (int)(e % (uint)cols), g = (int)(e / (uint)cols);
-        if (g < G2_TH / 4) G2Sweep((4 * g + r) * G2_S + i, G2_S, r, fWOff, plain, v[n][0], v[n][1], v[n][2], v[n][3]);
+        if (g < G2_TH / 4) {
+            if (plain) G2Sweep((4 * g + r) * G2_S + i, G2_S, true, v[n][0], v[n][1], v[n][2], v[n][3]);
+            else G2Sweep((4 * g + r) * G2_S + i, G2_S, false, v[n][0], v[n][1], v[n][2], v[n][3]);
+        }
     }
     GroupMemoryBarrierWithGroupSync();   // every tap read: the tile takes the vertical sums (row = output row)
     [unroll] for (uint n2 = 0; n2 < 3u; n2++) {
@@ -1321,7 +1351,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     [unroll] for (uint m = 0; m < 2u; m++) {
         const uint e = t + 256u * m;
         const int y = (int)(e % (uint)G2_TH), q = (int)(e / (uint)G2_TH);
-        G2Sweep(y * G2_S + r + 4 * q, 1, r, fWOff, plain, h[m][0], h[m][1], h[m][2], h[m][3]);
+        if (plain) G2Sweep(y * G2_S + r + 4 * q, 1, true, h[m][0], h[m][1], h[m][2], h[m][3]);
+        else G2Sweep(y * G2_S + r + 4 * q, 1, false, h[m][0], h[m][1], h[m][2], h[m][3]);
         if ((fOp & 2u) != 0u) { h[m][0] = saturate(h[m][0]); h[m][1] = saturate(h[m][1]); h[m][2] = saturate(h[m][2]); h[m][3] = saturate(h[m][3]); }
     }
     GroupMemoryBarrierWithGroupSync();   // every vertical sum read: the tile takes the outputs (stride G2_TW + 1)
@@ -1342,8 +1373,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 )";
 
 // ---- the vertical pass of the four Gaussians of lv (sigma 4, 24, 2, 6 -> u0..u3) from ONE tile (sized for the largest,
-// fRadius); per Gaussian (radius, weights offset) packed (r << 16 | off) in fWOff, fN, fPad0, fPad1. Each is FadeGaussT's
-// vertical pass of lv, value for value.
+// TG_RMAX = 96), their radii and weights compiled in (GtSweep). Each is FadeGaussT's vertical pass of lv, value for value.
 inline const char* g_faldFadeGaussT4Source = R"(
 RWTexture2D<float> g4Out0 : register(u0);
 RWTexture2D<float> g4Out1 : register(u1);
@@ -1353,7 +1383,7 @@ RWTexture2D<float> g4Out3 : register(u3);
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const int nA = (int)fInH, nC = (int)fInW;
     const int a0 = (int)gid.y * TG_LEN, c0 = (int)gid.x * TG_LINES;
-    const int rmax = (int)fRadius;
+    const int rmax = TG_RMAX;
     const uint t = tid.y * 16u + tid.x;
     GtFill(true, a0, c0, rmax, nA, nC, t);
     GroupMemoryBarrierWithGroupSync();
@@ -1362,28 +1392,28 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const int gx = c0 + (int)lineIx, gy = a0 + 4 * (int)lane;
     const bool inX = gx < nC;
     float o0, o1, o2, o3;
-    GtSweep(base, (int)(fWOff >> 16), fWOff & 0xFFFFu, false, o0, o1, o2, o3);
+    GtSweep(base, 4, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out0[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out0[uint2(gx, gy + 1)] = o1;
         if (gy + 2 < nA) g4Out0[uint2(gx, gy + 2)] = o2;
         if (gy + 3 < nA) g4Out0[uint2(gx, gy + 3)] = o3;
     }
-    GtSweep(base, (int)(fN >> 16), fN & 0xFFFFu, false, o0, o1, o2, o3);
+    GtSweep(base, 24, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out1[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out1[uint2(gx, gy + 1)] = o1;
         if (gy + 2 < nA) g4Out1[uint2(gx, gy + 2)] = o2;
         if (gy + 3 < nA) g4Out1[uint2(gx, gy + 3)] = o3;
     }
-    GtSweep(base, (int)(fPad0 >> 16), fPad0 & 0xFFFFu, false, o0, o1, o2, o3);
+    GtSweep(base, 2, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out2[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out2[uint2(gx, gy + 1)] = o1;
         if (gy + 2 < nA) g4Out2[uint2(gx, gy + 2)] = o2;
         if (gy + 3 < nA) g4Out2[uint2(gx, gy + 3)] = o3;
     }
-    GtSweep(base, (int)(fPad1 >> 16), fPad1 & 0xFFFFu, false, o0, o1, o2, o3);
+    GtSweep(base, 6, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out3[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out3[uint2(gx, gy + 1)] = o1;
@@ -1483,7 +1513,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 // ---- FadeGaussT2 with plain sums (Z9; kPlainSums), longer tiles: 8 lines x 128 outputs per group, every thread FOUR
 // consecutive outputs of both maps (8 plain chains: the registers the Kahan terms took), so the 2r-tap halo is loaded
 // 3x per output instead of 5x and the sweep reads half as many taps per output. Each output: s = x0 w0, then
-// s = s + (x[o - j] + x[o + j]) w_j for j = 1..r — GtSweep's plain order, the same value as FadeGaussT2's plain branch.
+// s = s + (x[o - j] + x[o + j]) w_j for j = 1..r — GtSweep's plain order, the same value as FadeGaussT2's plain branch;
+// sigma 32 (r 128) and its weights are compiled in (FadeGR / FadeGW), the steps unrolled T2P_UNROLL at a time.
 // T2PLanePerm: a warp's 8 lines x 4 lanes on 32 banks (lanes 2 apart: 4 lane x 4 outputs = 8 words apart).
 inline const char* g_faldFadeGaussT2PSource = R"(
 RWTexture2D<float> g2Out0 : register(u0);
@@ -1495,10 +1526,42 @@ RWTexture2D<float> g2Out1 : register(u1);
 groupshared float gA2[T2P_LINES * T2P_STRIDE];
 groupshared float gB2[T2P_LINES * T2P_STRIDE];
 uint T2PLanePerm(uint w, uint i) { return 8u * (w >> 1) + (w & 1u) + 2u * i; }   // warp w (0..7), its i-th lane (0..3)
+// one step j of the sweep (weight wj): the eight chains' terms and plain sums, the taps rotated (the loop body before the
+// radius and the weights were compiled in: sigma 32, FadeGR / FadeGW; T2P_UNROLL steps unrolled at a time)
+#ifndef T2P_UNROLL
+#define T2P_UNROLL 8
+#endif
+void T2PStep(int base, int j, float wj, inout float sa0, inout float sa1, inout float sa2, inout float sa3,
+             inout float sb0, inout float sb1, inout float sb2, inout float sb3,
+             inout float la0, inout float la1, inout float la2, inout float qa1, inout float qa2, inout float qa3,
+             inout float lb0, inout float lb1, inout float lb2, inout float qb1, inout float qb2, inout float qb3) {
+    const float nla = gA2[base - j], nra = gA2[base + 3 + j];
+    const float nlb = gB2[base - j], nrb = gB2[base + 3 + j];
+    precise float ta0 = (nla + qa1) * wj;
+    precise float ta1 = (la0 + qa2) * wj;
+    precise float ta2 = (la1 + qa3) * wj;
+    precise float ta3 = (la2 + nra) * wj;
+    precise float tb0 = (nlb + qb1) * wj;
+    precise float tb1 = (lb0 + qb2) * wj;
+    precise float tb2 = (lb1 + qb3) * wj;
+    precise float tb3 = (lb2 + nrb) * wj;
+    precise float ua0 = sa0 + ta0;
+    precise float ua1 = sa1 + ta1;
+    precise float ua2 = sa2 + ta2;
+    precise float ua3 = sa3 + ta3;
+    precise float ub0 = sb0 + tb0;
+    precise float ub1 = sb1 + tb1;
+    precise float ub2 = sb2 + tb2;
+    precise float ub3 = sb3 + tb3;
+    sa0 = ua0; sa1 = ua1; sa2 = ua2; sa3 = ua3;
+    sb0 = ub0; sb1 = ub1; sb2 = ub2; sb3 = ub3;
+    la2 = la1; la1 = la0; la0 = nla; qa1 = qa2; qa2 = qa3; qa3 = nra;
+    lb2 = lb1; lb1 = lb0; lb0 = nlb; qb1 = qb2; qb2 = qb3; qb3 = nrb;
+}
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const bool vert = (fDir == 0u);
-    const int r = (int)fRadius;
+    const int r = FadeGR(32);
     const int nA = vert ? (int)fInH : (int)fInW;
     const int nC = vert ? (int)fInW : (int)fInH;
     const int a0 = (int)(vert ? gid.y : gid.x) * T2P_LEN;
@@ -1518,7 +1581,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     GroupMemoryBarrierWithGroupSync();
     const uint lineIx = t % T2P_LINES, lane = T2PLanePerm(t / 32u, (t % 32u) / T2P_LINES);
     const int base = (int)(lineIx * T2P_STRIDE) + r + 4 * (int)lane;
-    const float w0 = fGW[fWOff];
+    const float w0 = FadeGW(32, 0);
     const float xa0 = gA2[base], xa1 = gA2[base + 1], xa2 = gA2[base + 2], xa3 = gA2[base + 3];
     const float xb0 = gB2[base], xb1 = gB2[base + 1], xb2 = gB2[base + 2], xb3 = gB2[base + 3];
     precise float sa0 = xa0 * w0;
@@ -1532,23 +1595,14 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     // x[o_k - (j - 1)] / x[o_k + (j - 1)] of the next step, as GtSweep
     float la0 = xa0, la1 = xa1, la2 = xa2, qa1 = xa1, qa2 = xa2, qa3 = xa3;
     float lb0 = xb0, lb1 = xb1, lb2 = xb2, qb1 = xb1, qb2 = xb2, qb3 = xb3;
-    for (int j = 1; j <= r; j++) {
-        const float wj = fGW[fWOff + (uint)j];
-        const float nla = gA2[base - j], nra = gA2[base + 3 + j];
-        const float nlb = gB2[base - j], nrb = gB2[base + 3 + j];
-        precise float ta0 = (nla + qa1) * wj;
-        precise float ta1 = (la0 + qa2) * wj;
-        precise float ta2 = (la1 + qa3) * wj;
-        precise float ta3 = (la2 + nra) * wj;
-        precise float tb0 = (nlb + qb1) * wj;
-        precise float tb1 = (lb0 + qb2) * wj;
-        precise float tb2 = (lb1 + qb3) * wj;
-        precise float tb3 = (lb2 + nrb) * wj;
-        sa0 = sa0 + ta0; sa1 = sa1 + ta1; sa2 = sa2 + ta2; sa3 = sa3 + ta3;
-        sb0 = sb0 + tb0; sb1 = sb1 + tb1; sb2 = sb2 + tb2; sb3 = sb3 + tb3;
-        la2 = la1; la1 = la0; la0 = nla; qa1 = qa2; qa2 = qa3; qa3 = nra;
-        lb2 = lb1; lb1 = lb0; lb0 = nlb; qb1 = qb2; qb2 = qb3; qb3 = nrb;
+    [loop] for (int jb = 0; jb < r / T2P_UNROLL; jb++) {
+        [unroll] for (int ju = 1; ju <= T2P_UNROLL; ju++)
+            T2PStep(base, T2P_UNROLL * jb + ju, FadeGW(32, T2P_UNROLL * jb + ju), sa0, sa1, sa2, sa3, sb0, sb1, sb2, sb3,
+                    la0, la1, la2, qa1, qa2, qa3, lb0, lb1, lb2, qb1, qb2, qb3);
     }
+    [unroll] for (int jt = T2P_UNROLL * (r / T2P_UNROLL) + 1; jt <= r; jt++)
+        T2PStep(base, jt, FadeGW(32, jt), sa0, sa1, sa2, sa3, sb0, sb1, sb2, sb3, la0, la1, la2, qa1, qa2, qa3, lb0, lb1, lb2,
+                qb1, qb2, qb3);
     GroupMemoryBarrierWithGroupSync();   // every tap read: the tiles take the outputs
     const uint tb = lineIx * (T2P_LEN + 1u) + 4u * lane;
     gA2[tb] = sa0; gA2[tb + 1u] = sa1; gA2[tb + 2u] = sa2; gA2[tb + 3u] = sa3;
@@ -1626,6 +1680,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     }
 }
 )";
+
 
 // ---- the cone / the reach (fN <= 8 iterations per dispatch; replaces each iteration's FadeExt r 1 vertical + horizontal
 // + FadePix CONE / CONEF): c <- max(c, maxf3(c) - dec), maxf3 = the vertical max(max(c[y-1], c[y]), c[y+1]) then the
