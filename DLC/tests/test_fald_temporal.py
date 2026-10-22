@@ -277,9 +277,9 @@ def test_panel_file_reader_refuses_what_the_cpp_loader_refuses(tmp_path):
 def test_hlsl_temporal_pass_mirrors_the_reference():
     src = _SHADER.read_text(encoding="utf-8")
     body = re.search(r'g_faldTemporalSource = R"\((.*?)\)";', src, re.S).group(1)
-    assert "if (tempInit != 0u) { driveFiltOut[id.xy] = d; return; }" in body           # no state: copy (DriveState.peek)
+    assert "if (tempInit != 0u) o = d;" in body                                          # no state: copy (DriveState.peek)
     assert "float a = (d > s) ? tempAlphaRise : tempAlphaFall;" in body                  # per-edge blend
-    assert "driveFiltOut[id.xy] = s + a * (d - s);" in body
+    assert "o = s + a * (d - s);" in body and "driveFiltOut[id.xy] = o;" in body        # (compared on the partial path first)
     assert "stateTex.Load" in body and "driveTex.Load" in body
     conv = re.search(r'g_faldConvSource = R"\((.*?)\)";', src, re.S).group(1)
     assert "ConvRow(driveTex, kTrue," in conv and "ConvRow(driveEstTex, kEst," in conv    # true / est kernels on their own maps

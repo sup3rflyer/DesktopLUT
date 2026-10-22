@@ -94,7 +94,7 @@ def test_python_reference_constants_match_the_hlsl_source():
     fields = re.findall(r"(?:uint|float) (\w+);", cb)
     assert len(fields) == 80 and fields[31] == "transfer" and fields[43] == "sdrGamma"
     assert fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "fadeFlags"]
-    assert fields[76:80] == ["latW", "latH", "_pad78", "_pad79"]
+    assert fields[76:80] == ["latW", "latH", "_pad78", "runMode"]   # word 79: the change-driven path's run mode (2026-10-22)
     assert fields[64:68] == ["starTargetSigma", "starKeepNits", "clkW0", "clkW1"]
     assert fields[68:72] == ["clkTrue0", "clkEst0", "clkTrue1", "clkEst1"]
     assert fields[44:48] == ["tempAlphaRise", "tempAlphaFall", "tempMode", "tempInit"]
@@ -308,10 +308,11 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
              "boostDimFrac": 51, "starEven": 52, "starCapNits": 55, "starStrength": 56, "starPeakHi": 59, "starNbLo": 60,
              "starReach": 62, "starEvenReach": 63, "starTargetSigma": 64, "starKeepNits": 65, "clkW0": 66, "clkW1": 67,
              "clkTrue0": 68, "clkEst0": 69, "clkTrue1": 70, "clkEst1": 71, "boostRule": 72, "boostMeanGamma": 73,
-             "boostMeanThresh": 74, "fadeFlags": 75, "latW": 76, "latH": 77, "_pad78": 78, "_pad79": 79}
+             "boostMeanThresh": 74, "fadeFlags": 75, "latW": 76, "latH": 77, "_pad78": 78, "runMode": 79}
     for shader, target in (("g_faldPixelSource", "ps_5_0"), ("g_faldStatSource", "cs_5_0"), ("g_faldStarStatSource", "cs_5_0"),
                            ("g_faldStarPlanSource", "cs_5_0"), ("g_faldConvSource", "cs_5_0"), ("g_faldPanelClockSource", "cs_5_0"),
-                           ("g_faldGainSource", "cs_5_0"), ("g_faldBlurSource", "cs_5_0")):   # the two-channel gain (C15)
+                           ("g_faldGainSource", "cs_5_0"), ("g_faldBlurSource", "cs_5_0"),    # the two-channel gain (C15)
+                           ("g_faldGainBlurSource", "cs_5_0"), ("g_faldDecideSource", "cs_5_0")):   # fused 2b + 2c, the decide pass
         asm = _d3d_disassemble(part("g_faldCommonSource") + part(shader), target)
         block = re.search(r"cbuffer FaldCB\s*//\s*\{(.*?)//\s*\}", asm, re.S).group(1)
         members = re.findall(r"//\s+(uint|float|int|float\d\w*|uint\d\w*)\s+(\w+);\s*//\s*Offset:\s*(\d+)\s+Size:\s*(\d+)", block)

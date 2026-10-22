@@ -28,15 +28,19 @@
 //                       the kernels see in BOTH rounds are written; modes 1 / 2 run "CS temporal" below instead
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)
 //                       (+ the zone's NON-BLACK flag for the black-frame LED boost when the panel file has a boost LUT)
-//   CS boost (opt.)   : non-black zone count of the frame -> step LUT -> the frame's LED boost (2 x 1 texture)
+//                       (+ with a boost LUT: the frame's non-black zone count -> step LUT -> LED boost, 2 x 1 texture,
+//                       finished by the last zone of the sweep)
 //   CS temporal (opt.): per cell, first-order drive STATE (rise/fall time constants) -> the drive the kernels see
 //   CS conv           : drives (x) K_true [x boost], drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
 //   CS stat  (round 1): same statistic (and zone flags) on the CORRECTED frame (the correction moves the drives, and
 //                       the panel counts the zones of the frame it RECEIVES)
-//   CS boost (opt.)   : the corrected frame's boost
 //   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
 //   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
+// The change-driven (PARTIAL) path, shared/fald_change.h: with a present's dirty rects and an otherwise unchanged state,
+// the sweeps run on the touched zones only and compare; a decide pass (g_faldDecideSource) after each writes the indirect
+// arguments of what follows, so the GPU skips the convolution, the gain, the full round-1 sweep and the full pixel pass
+// when nothing moved — the same shaders, the same values, bit for bit.
 //
 // Zone lattice (docs/fald-fractional-pitch.md): cols x rows zones over latW x latH px from (originX, originY) — a
 // RATIONAL pitch latW / cols, so a 48 x 24 lattice on a 2560 x 1440 frame has 53.33-px zones. Every pixel -> zone map
@@ -111,9 +115,14 @@ cbuffer FaldCB : register(b0) {
                                                                     // fadeFlags: bit 0 = the frozen fade stack ASF10 + T11_TMTC
                                                                     // (FadePost, t20-t22; shared/fald_fade.h), bit 1 = item L
                                                                     // (reserved, always 0); 0 = the layer without it
-    uint latW; uint latH; uint _pad78; uint _pad79;                 // the zone lattice's extent in px (cols * cellW / rows *
+    uint latW; uint latH; uint _pad78; uint runMode;                // the zone lattice's extent in px (cols * cellW / rows *
                                                                     // cellH for an integer pitch; docs/fald-fractional-pitch.md);
-                                                                    // _pad78 = 0 always: FadePost's FadeNoFuse operand
+                                                                    // _pad78 = 0 always: FadePost's FadeNoFuse operand;
+                                                                    // runMode (shared/fald_change.h, the partial path): bits
+                                                                    // 0-7 = 0 full sweep (a zone per group id) / 1 partial
+                                                                    // (the zones of t38, the touched-zone list, and a change
+                                                                    // flag per moved value), bits 8-15 = the conv pass's
+                                                                    // sub-offsets per thread, bits 16-31 = the list's length
 };
 Texture2D<float4> frameTex : register(t0);   // processed frame, scRGB linear BT.709, 1.0 = 80 nits
 Texture2D<float>  curveTex : register(t1);   // drive vs ln(nits), curveN x 1, linear in ln(nits)
@@ -149,7 +158,15 @@ Texture2D<float>  floorOpenTex : register(t21); // 1/8 res: G16(grey_open(ln max
 Texture2D<float>  reachTex     : register(t22); // full res: reach of THIS round's soft knee (OF): round 0 in the round-1
                                                 // statistic, round 1 in the pixel pass
 Texture2D<float>  fadeDTex     : register(t23); // 1/4 res: s - f_q (T11_TMTC); fade_T = clamp(fade + up4(.), 0, 1)
+Buffer<uint>      zoneList     : register(t38); // the partial path (runMode bits 0-7 = 1): the zones (row * cols + col) a
+                                                // present's rects touched, one per group of the statistic / S0 sweeps
 SamplerState linearClamp : register(s0);
+uint RunModePartial() { return runMode & 0xFFu; }
+// The zone of a sweep's group: its id in a full sweep, the list's entry on the partial path (the group's x)
+uint2 SweepZone(uint3 gid) {
+    if (RunModePartial() == 1u) { uint z = zoneList[gid.x]; return uint2(z % cols, z / cols); }
+    return gid.xy;
+}
 )" /* MSVC caps ONE string literal at 16380 bytes (C2026); adjacent literals concatenate (limit 65535), so the common
       source is split here. Tools that read this header as text (DLC tests, the fxc checkers) drop the seam. */ R"(
 // Ceiling-rule soft knee (correct.py KNEE_START / KNEE_CAP_TRUST; DLC tests/test_fald_transfer.py pins them equal).
@@ -519,10 +536,24 @@ float3 FadePost(float3 req, float3 img, int2 px) {
 // nits^boostMeanGamma over the zone's pixels (exp(gamma * log) under mc > 0: no pow(0) / negative / NaN case) and
 // replaces the DIM test by mean >= boostMeanThresh; rule 0 computes exactly what it did before the rule existed.
 // Zones of more than FALD_ZONE_SLICE_PX pixels are swept in slices (the rules above ZoneSlices in the common source).
+// The frame's LED boost (2026-10-22, work guide core-speed; before: a 1-group pass per round, ~5-18 us of a dispatch each):
+// every finished zone adds (its new flag - its old flag) to boostCount[round], so the counter is the map's non-black zone
+// count after any sweep, full or partial (the flag map and the counter start zeroed; a device loss rebuilds them); the
+// decide pass (g_faldDecideSource) that follows each round's sweep reads it and looks the staircase up by COUNT exactly
+// as FaldModel.boost_of_fraction (the last step whose first count is <= N; below the first step 1) into the 2 x 1
+// texture the conv reads. An integer count in any order: the same N, the same step, bit for bit the separate pass.
+// The partial path (shared/fald_change.h; runMode): the group's zone comes from the touched-zone list, and a drive or a
+// flag that differs from the texture's previous value sets changeFlags[round] — a zone the rects did not touch has the
+// same pixels, so its values stand unchanged.
 inline const char* g_faldStatSource = R"(
 RWTexture2D<float> driveOut : register(u0);
 RWTexture2D<float> activeOut : register(u1);
 RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
+RWStructuredBuffer<uint> boostCount : register(u3);     // [round] = the non-black zones of that round's map (boost LUT only):
+                                                        // every finished zone adds (new flag - old flag), so the count
+                                                        // follows the map whether the sweep is full or partial
+RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [round] = a drive / flag of that round moved,
+                                                        // [2] = the starfield's S0 moved (read and cleared by the decide pass)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared uint gLit[256];
@@ -531,7 +562,8 @@ groupshared float gPow[256];
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
-    uint cx = gid.x, cy = gid.y;
+    uint2 zone = SweepZone(gid);                                  // the group's zone (full sweep) or the list's (partial)
+    uint cx = zone.x, cy = zone.y;
     uint x0 = ZoneEdgeX(cx), y0 = ZoneEdgeY(cy);                  // the zone's own pixels (lattice-local)
     uint zw = ZoneEdgeX(cx + 1u) - x0, zh = ZoneEdgeY(cy + 1u) - y0;
     uint n = zw * zh;
@@ -545,9 +577,12 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     }
 #else
     uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
-    for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
-        uint px = originX + x0 + (k % zw);
-        uint py = originY + y0 + (k / zw);
+    // thread t sweeps k = t, t + 256, ... of its slice (the same pixels in the same order as ever); k = ly * zw + lx is
+    // stepped with a carry (256 = sq * zw + sr) instead of a division and a modulo per pixel
+    uint kS = gid.z * FALD_ZONE_SLICE_PX + tid.x, lx = kS % zw, ly = kS / zw, sq = 256u / zw, sr = 256u % zw;
+    for (uint k = kS; k < kEnd; k += 256, ly += sq + ((lx + sr >= zw) ? 1u : 0u), lx = (lx + sr >= zw) ? lx + sr - zw : lx + sr) {
+        uint px = originX + x0 + lx;
+        uint py = originY + y0 + ly;
         if (px >= frameW || py >= frameH) continue;
         float3 img = PanelNits(frameTex.Load(int3(px, py, 0)).rgb);
         if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));   // the frame the layer works on (S1)
@@ -591,14 +626,24 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         }
 #endif
         float stat = min(gMax[0], gSum[0] / area0);   // min(brightest lit px, sum lit nits*px^2 / A0)
-        driveOut[uint2(cx, cy)] = DriveOf(stat);
+        float drive = DriveOf(stat);
+        // the partial path: a drive that moved flags this round (the decide pass then runs everything downstream)
+        if (RunModePartial() == 1u && driveOut[uint2(cx, cy)] != drive) InterlockedOr(changeFlags[roundIdx], 1u);
+        driveOut[uint2(cx, cy)] = drive;
         if (boostN != 0u) {
             // LIT-or-DIM / LIT-or-MEAN (FaldModel.active_zones): fractions of the zone's pixels (the lattice lies inside
             // the frame — FaldLatticeFits — so every zone has its zw * zh of them)
             float litF = (float)gLit[0] / (float)n;
             float dimF = (float)gDim[0] / (float)n;
             bool second = (boostRule == 1u) ? (gPow[0] / (float)n >= boostMeanThresh) : (dimF > boostDimFrac);
-            activeOut[uint2(cx, cy)] = (litF > boostLitFrac || second) ? 1.0f : 0.0f;
+            bool active = litF > boostLitFrac || second;
+            // the round's non-black count follows the flag map: + (new - old) per zone (the map starts all zero)
+            uint newA = active ? 1u : 0u, oldA = (activeOut[uint2(cx, cy)] > 0.5f) ? 1u : 0u;
+            if (newA != oldA) {
+                InterlockedAdd(boostCount[roundIdx], newA - oldA);
+                if (RunModePartial() == 1u) InterlockedOr(changeFlags[roundIdx], 1u);
+            }
+            activeOut[uint2(cx, cy)] = active ? 1.0f : 0.0f;
         }
     }
 }
@@ -679,6 +724,7 @@ inline const char* g_faldStarStatSource = R"(
 RWTexture2D<float4> starStatOut : register(u0);
 RWTexture2D<float4> starBgOut : register(u1);
 RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
+RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [2] = a zone's stat / bg moved (the statistic pass's u5)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared float gMaxAll[256];
@@ -704,7 +750,8 @@ bool StarBetter(float va, uint ka, float vb, uint kb, uint zw, uint zh) {   // i
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
-    uint cx = gid.x, cy = gid.y;
+    uint2 zone = SweepZone(gid);                                  // the group's zone (full sweep) or the list's (partial)
+    uint cx = zone.x, cy = zone.y;
     uint x0 = ZoneEdgeX(cx), y0 = ZoneEdgeY(cy);                  // the zone's own pixels (lattice-local)
     uint zw = ZoneEdgeX(cx + 1u) - x0, zh = ZoneEdgeY(cy + 1u) - y0;
     uint n = zw * zh;
@@ -719,9 +766,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     }
 #else
     uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
-    for (uint k = gid.z * FALD_ZONE_SLICE_PX + tid.x; k < kEnd; k += 256) {
-        uint px = originX + x0 + (k % zw);
-        uint py = originY + y0 + (k / zw);
+    uint kS = gid.z * FALD_ZONE_SLICE_PX + tid.x, lx = kS % zw, ly = kS / zw, sq = 256u / zw, sr = 256u % zw;   // as the statistic pass
+    for (uint k = kS; k < kEnd; k += 256, ly += sq + ((lx + sr >= zw) ? 1u : 0u), lx = (lx + sr >= zw) ? lx + sr - zw : lx + sr) {
+        uint px = originX + x0 + lx;
+        uint py = originY + y0 + ly;
         if (px >= frameW || py >= frameH) continue;          // only in-frame pixels count (n, min and sums alike)
         float3 img = PanelNits(frameTex.Load(int3(px, py, 0)).rgb);
         float s = min(max(img.r, max(img.g, img.b)), white);
@@ -767,8 +815,13 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         float sparse = (has && speck) ? 1.0f - StarSmooth(starAreaLo, starAreaHi, aEff) : 0.0f;
         if (starPeakHi > 0.0f) sparse *= 1.0f - StarSmooth(starPeakHi, 2.0f * starPeakHi, peak);
         float solid = has ? (1.0f - sparse) * DriveOf(min(peak, total / area0)) : 0.0f;
-        starStatOut[uint2(cx, cy)] = float4(peak, (has && speck && aEff < starAreaHi) ? 1.0f : 0.0f, sparse, solid);
-        starBgOut[uint2(cx, cy)] = float4(log(max(b, 1e-12f)), (gCount[0] != 0u) ? (float)gArg[0] : 0.0f, total, aEff);
+        float4 statV = float4(peak, (has && speck && aEff < starAreaHi) ? 1.0f : 0.0f, sparse, solid);
+        float4 bgV = float4(log(max(b, 1e-12f)), (gCount[0] != 0u) ? (float)gArg[0] : 0.0f, total, aEff);
+        // the partial path: a zone whose star statistic moved flags the starfield (its plan is then re-formed everywhere)
+        if (RunModePartial() == 1u && (any(starStatOut[uint2(cx, cy)] != statV) || any(starBgOut[uint2(cx, cy)] != bgV)))
+            InterlockedOr(changeFlags[2], 1u);
+        starStatOut[uint2(cx, cy)] = statV;
+        starBgOut[uint2(cx, cy)] = bgV;
     }
 }
 )";
@@ -846,24 +899,38 @@ void main(uint3 id : SV_DispatchThreadID) {
 //             pixels of the neighbouring speck zones (own-zone gate in Balance)
 //   ln_t    = ln(target) (ln(white) where the target is 0), ln_g = lift * (ln_t - ln peak) for a speck zone below its
 //             target (else 0), ln_pk = ln(peak) of a speck zone (ln_t for a zone without a speck: its sky is no "peak")
+// (2026-10-22, work guide core-speed) The window of starWTex a 16 x 16 group of zones reads — the tile + an apron of E
+// each side, E <= FALD_STAR_EVEN_REACH_MAX 12: 40 x 40 texels — is staged in groupshared memory by the whole group (a few
+// loads per thread) instead of ~300 serial texture loads per thread: the pass was a latency floor of ~38 us at every
+// resolution. The sums are the same terms in the same order (dy, then dx, ascending; the lattice's zones only); the
+// barrier comes before any thread returns.
 inline const char* g_faldStarPlanSource = R"(
 RWTexture2D<float4> starPlanOut : register(u0);
+groupshared float4 gW[40 * 40];   // starWTex over the tile + apron (row-major, 40 wide); outside the lattice unread
 
 [numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    int E = (int)starEvenReach;
+    int span = 16 + 2 * E;
+    int wx0 = (int)gid.x * 16 - E, wy0 = (int)gid.y * 16 - E;               // the window's origin in zones
+    for (uint e = tid.y * 16u + tid.x; e < (uint)(span * span); e += 256u) {
+        int ax = (int)(e % (uint)span), ay = (int)(e / (uint)span);
+        int x = wx0 + ax, y = wy0 + ay;
+        if (x >= 0 && x < (int)cols && y >= 0 && y < (int)rows) gW[ay * 40 + ax] = starWTex.Load(int3(x, y, 0));
+    }
+    GroupMemoryBarrierWithGroupSync();
     if (id.x >= cols || id.y >= rows) return;
     float4 st = starStatTex.Load(int3(id.xy, 0));
     float peak = st.r;
-    float4 sw = starWTex.Load(int3(id.xy, 0));
+    float4 sw = gW[((int)tid.y + E) * 40 + (int)tid.x + E];                  // = starWTex.Load(id.xy)
     bool spk = sw.a > 0.5f;
     float lp = log(max(peak, 1e-12f));
-    int E = (int)starEvenReach;
     float wsum = 0.0f, wl = 0.0f;
     for (int dy = -E; dy <= E; dy++) {
         int y = (int)id.y + dy; if (y < 0 || y >= (int)rows) continue;
         for (int dx = -E; dx <= E; dx++) {
             int x = (int)id.x + dx; if (x < 0 || x >= (int)cols) continue;
-            float4 t = starWTex.Load(int3(x, y, 0));
+            float4 t = gW[((int)tid.y + E + dy) * 40 + (int)tid.x + E + dx];
             float k = (float)(E + 1 - max(abs(dx), abs(dy))) / (float)(E + 1);   // tapered window: continuous at its rim
             wsum += t.r * k; wl += t.g * k;
         }
@@ -879,7 +946,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 int y2 = (int)id.y + vy; if (y2 < 0 || y2 >= (int)rows) continue;
                 for (int vx = -E; vx <= E; vx++) {
                     int x2 = (int)id.x + vx; if (x2 < 0 || x2 >= (int)cols) continue;
-                    float4 t2 = starWTex.Load(int3(x2, y2, 0));
+                    float4 t2 = gW[((int)tid.y + E + vy) * 40 + (int)tid.x + E + vx];
                     if (!(t2.r > 0.0f)) continue;
                     float k2 = (float)(E + 1 - max(abs(vx), abs(vy))) / (float)(E + 1);
                     float dl = t2.g / t2.r - mean;
@@ -898,7 +965,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         int y = (int)id.y + ey; if (y < 0 || y >= (int)rows) continue;
         for (int ex = -1; ex <= 1; ex++) {
             int x = (int)id.x + ex; if (x < 0 || x >= (int)cols) continue;
-            s3 += starStatTex.Load(int3(x, y, 0)).b; n3 += starWTex.Load(int3(x, y, 0)).a;
+            s3 += starStatTex.Load(int3(x, y, 0)).b; n3 += gW[((int)tid.y + E + ey) * 40 + (int)tid.x + E + ex].a;
         }
     }
     float carry = s3 * starStrength / max(n3, 1.0f) * (1.0f - StarSmooth(starNbLo, starNbHi, st.a));   // sparse > 0 only in speck zones
@@ -909,109 +976,154 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-// Pass 1a (boost LUT only): the frame's black-frame LED boost. Counts the non-black zones of the statistic pass
-// (t13) and looks the staircase up by COUNT: the last step whose first count is <= N applies, below the first step
-// the boost is 1 (FaldModel.boost_of_fraction; the C++ turns the file's zone fractions into counts —
-// FaldBoostZoneThreshold — so no float division decides a step edge on the GPU). Instantaneous by design: the panel
-// switches within one meter read in both directions, so the temporal drive state does not filter it.
-// The count is a 256-thread reduction (an integer sum: any order gives the same N), then thread 0 looks the step up.
-// (One thread walking every zone cost ~53 us per round at 2304 zones on an RTX 5090; the loader allows 512 x 512.)
-inline const char* g_faldBoostSource = R"(
-RWTexture2D<float> boostOut : register(u0);
-groupshared uint gCount[256];
-
-[numthreads(256, 1, 1)]
-void main(uint3 tid : SV_GroupThreadID) {
-    uint count = 0;
-    for (uint k = tid.x; k < cols * rows; k += 256) {
-        uint x = k % cols, y = k / cols;
-        if (activeTex.Load(int3(x, y, 0)) > 0.5f) count++;
-    }
-    gCount[tid.x] = count;
-    GroupMemoryBarrierWithGroupSync();
-    for (uint stride = 128; stride > 0; stride >>= 1) {
-        if (tid.x < stride) gCount[tid.x] += gCount[tid.x + stride];
-        GroupMemoryBarrierWithGroupSync();
-    }
-    if (tid.x != 0) return;
-    count = gCount[0];
-    float b = 1.0f;
-    [loop] for (uint i = 0; i < boostN; i++) {
-        if ((float)count < boostLut[2 * i]) break;
-        b = boostLut[2 * i + 1];
-    }
-    boostOut[uint2(0, 0)] = b;
-    boostOut[uint2(1, 0)] = (float)count;
-}
-)";
+// (Pass 1a, the black-frame LED boost's own dispatch, was folded into the statistic pass on 2026-10-22: see its header.)
 
 // Pass 2: the two backlight fields on the sub-cell grid. out[k] = sum_i d[k - i] * kern[i]
 // (scipy fftconvolve 'same', odd kernels, zero outside the lattice), kernel chosen by sub-offset.
 // The black-frame LED boost (boostN != 0) multiplies B_true ONLY — the panel's own estimate does not know it
 // (FaldModel.backlights). The flat-lattice normalisation fields are built with boostN = 0.
-// Thread layout: one thread per (cell, sub-offset). A group is FALD_CONV_THREADS consecutive cells (row-major) of ONE
-// sub-offset (SV_GroupID.y), so all its threads read the SAME kernel tap at every step of the sum, and neighbouring
-// drive texels. The kernel table is sub * sub separate slices; the previous 16 x 16 block of the fine grid spanned 64
-// sub-offsets and so read 64 slices per step (2x slower on a 5090). A linear cell index wastes no lanes on a lattice
-// that is not a multiple of 16 (edge-lit strips, odd grids). Dispatch: FaldConvGroupsX(cols, rows) x sub * sub.
-// The loops run over the taps whose source cell lies on the lattice (the range is clamped once instead of testing
-// every tap) and issue four taps' loads before their four adds: the pass was bound by the latency of one load pair
-// per iteration (another 1.6x on a 5090). Layout and scheduling only: every output's terms, their ascending order
-// and each operation are what they were (bit-identical, HW + WARP, 2026-09-22).
+// Thread layout (2026-10-22, work guide core-speed): one thread per (cell, GROUP of FALD_CONV_SO consecutive sub-offsets
+// so = g * S .. g * S + S - 1, S = 1 / 2 / 4 / 8). The C++ compiles the pass once per S (g_faldConvSoDefine) and picks
+// one per device and lattice (FaldConvVariant): a thread's drive texel feeds S multiply-adds instead of one, and the S
+// weights of a tap are CONTIGUOUS — the panel file's [sub][sub][H][W] table is re-laid out as [g][jj][ii][s] with every
+// (g, jj) row starting at a multiple of 4 floats (shared/fald_panel.h FaldConvTableLayout), so they are read four at a
+// time through the float4 views at t36 / t37 (the same buffers as t2 / t3). Every row starts with one float4 header:
+// the first and last tap column (as ints) at which any of the row's S slices is non-zero — the estimate kernel's table
+// holds exact zeros outside its hard support (28-86 % of it on the owner's files) and a tap that is exactly +0 on every
+// slice adds +0 to every accumulator, which leaves a non-negative sum bit for bit (the C++ writes full rows for a table
+// with a negative tap, where a -0 could differ: FaldConvTableLayout). A group is FALD_CONV_THREADS consecutive
+// cells (row-major) of ONE sub-offset group, so all its threads read the SAME kernel taps at every step and neighbouring
+// drive texels; a linear cell index wastes no lanes on a lattice that is not a multiple of 16. The loops run over the
+// taps whose source cell lies on the lattice (the range is clamped once instead of testing every tap).
+// Per OUTPUT the multiply-adds are the same taps in the same order as ever — rows, then columns, ascending, one add after
+// the other (the pre-2026-09-22 loop; S = 1 = the 2026-09-22 pass with four loads in flight) — so the fields are
+// bit-identical for every S (HW + WARP gates); only how the taps are fetched changed.
 inline const char* g_faldConvSource = R"(
+#ifndef FALD_CONV_SO
+#define FALD_CONV_SO 1
+#endif
 RWTexture2D<float> bTrueOut : register(u0);
 RWTexture2D<float> bEstOut  : register(u1);
+Buffer<float4> kTrue4 : register(t36);   // t2 viewed four floats wide (every table row starts at a multiple of 4)
+Buffer<float4> kEst4  : register(t37);   // t3 likewise
 
-// acc + the sum over i = i0 .. i1 (ascending) of dmap(cx - i, sy) * kt[kb + i]; kb = the slice row's index at i = 0.
-float ConvRow(Texture2D<float> dmap, Buffer<float> kt, int cx, int sy, uint kb, int i0, int i1, float acc) {
+// acc[s] += the sum over i = i0 .. i1 (ascending) of dmap(cx - i, sy) * k(tap ii = i + RC, s), s = 0 .. S - 1.
+// rowHead = the (g, jj) row's first float: its header float4 (lo, hi: the row's non-zero tap columns), then the taps —
+// the S weights of tap ii sit at rowHead + 4 + ii * S (a multiple of 4 for S >= 4: the tap's float4 index is (rowHead + 4
+// + ii * S) / 4; S = 2: a float4 holds taps ii, ii + 1 for even ii; S = 1: the taps one at a time through t2, four loads
+// in flight).
+void ConvRow(Texture2D<float> dmap, Buffer<float> kt, Buffer<float4> kt4, int cx, int sy, uint rowHead, int RC, int i0, int i1,
+             inout float acc[FALD_CONV_SO]) {
+    float4 head = kt4[rowHead >> 2];
+    i0 = max(i0, asint(head.x) - RC); i1 = min(i1, asint(head.y) - RC);   // the row's non-zero taps only (header: lo, hi)
+    uint rowBase = rowHead + 4u;
     int i = i0;
+#if FALD_CONV_SO == 1
+    // the 2026-09-22 loop: four taps' loads in flight, the adds one after the other (a float4 fetch with its alignment
+    // head / tail measured slower at 1080p on an RTX 5090: short rows)
+    uint kb = rowBase + (uint)RC;
     [loop] for (; i + 3 <= i1; i += 4) {
         float d0 = dmap.Load(int3(cx - i, sy, 0)),     d1 = dmap.Load(int3(cx - i - 1, sy, 0));
         float d2 = dmap.Load(int3(cx - i - 2, sy, 0)), d3 = dmap.Load(int3(cx - i - 3, sy, 0));
         float k0 = kt[kb + (uint)i], k1 = kt[kb + (uint)(i + 1)], k2 = kt[kb + (uint)(i + 2)], k3 = kt[kb + (uint)(i + 3)];
-        acc += d0 * k0; acc += d1 * k1; acc += d2 * k2; acc += d3 * k3;
+        acc[0] += d0 * k0; acc[0] += d1 * k1; acc[0] += d2 * k2; acc[0] += d3 * k3;
     }
-    [loop] for (; i <= i1; i++) acc += dmap.Load(int3(cx - i, sy, 0)) * kt[kb + (uint)i];
-    return acc;
+    [loop] for (; i <= i1; i++) acc[0] += dmap.Load(int3(cx - i, sy, 0)) * kt[kb + (uint)i];
+#elif FALD_CONV_SO == 2
+    if (i <= i1 && (((uint)(i + RC)) & 1u) != 0u) {                                // an odd first tap: its float4's second pair
+        float d = dmap.Load(int3(cx - i, sy, 0));
+        float4 k = kt4[(rowBase + 2u * (uint)(i + RC)) >> 2];
+        acc[0] += d * k.z; acc[1] += d * k.w;
+        i++;
+    }
+    [loop] for (; i + 1 <= i1; i += 2) {
+        float d0 = dmap.Load(int3(cx - i, sy, 0)), d1 = dmap.Load(int3(cx - i - 1, sy, 0));
+        float4 k = kt4[(rowBase + 2u * (uint)(i + RC)) >> 2];
+        acc[0] += d0 * k.x; acc[1] += d0 * k.y; acc[0] += d1 * k.z; acc[1] += d1 * k.w;
+    }
+    if (i <= i1) {
+        float d = dmap.Load(int3(cx - i, sy, 0));
+        float4 k = kt4[(rowBase + 2u * (uint)(i + RC)) >> 2];
+        acc[0] += d * k.x; acc[1] += d * k.y;
+    }
+#elif FALD_CONV_SO == 4
+    [loop] for (; i + 1 <= i1; i += 2) {
+        float d0 = dmap.Load(int3(cx - i, sy, 0)), d1 = dmap.Load(int3(cx - i - 1, sy, 0));
+        uint q = (rowBase + 4u * (uint)(i + RC)) >> 2;
+        float4 ka = kt4[q], kb = kt4[q + 1u];
+        acc[0] += d0 * ka.x; acc[1] += d0 * ka.y; acc[2] += d0 * ka.z; acc[3] += d0 * ka.w;
+        acc[0] += d1 * kb.x; acc[1] += d1 * kb.y; acc[2] += d1 * kb.z; acc[3] += d1 * kb.w;
+    }
+    if (i <= i1) {
+        float d = dmap.Load(int3(cx - i, sy, 0));
+        float4 k = kt4[(rowBase + 4u * (uint)(i + RC)) >> 2];
+        acc[0] += d * k.x; acc[1] += d * k.y; acc[2] += d * k.z; acc[3] += d * k.w;
+    }
+#else
+    [loop] for (; i <= i1; i++) {
+        float d = dmap.Load(int3(cx - i, sy, 0));
+        uint q = (rowBase + 8u * (uint)(i + RC)) >> 2;
+        float4 ka = kt4[q], kb = kt4[q + 1u];
+        acc[0] += d * ka.x; acc[1] += d * ka.y; acc[2] += d * ka.z; acc[3] += d * ka.w;
+        acc[4] += d * kb.x; acc[5] += d * kb.y; acc[6] += d * kb.z; acc[7] += d * kb.w;
+    }
+#endif
 }
 
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint cell = gid.x * 64u + tid.x;
     if (cell >= cols * rows) return;
-    uint so = gid.y;                                    // sub-offset = (fy % sub) * sub + (fx % sub)
+    uint g = gid.y;                                     // the sub-offset group: so = g * FALD_CONV_SO + s
     int cx = (int)(cell % cols), cy = (int)(cell / cols);
-    uint fx = (uint)cx * sub + so % sub, fy = (uint)cy * sub + so / sub;
 
     // taps whose source cell sx = cx - i, sy = cy - j lies on the lattice (zero outside it: those terms are absent)
     int RC = (int)reachTrueC, RR = (int)reachTrueR;
     uint Wt = 2 * reachTrueC + 1, Ht = 2 * reachTrueR + 1;
+    uint strideT = 4u + ((Wt * FALD_CONV_SO + 3u) & ~3u);   // = FaldConvRowStride(Wt, S): the header + the padded taps
     int i0 = max(-RC, cx - (int)cols + 1), i1 = min(RC, cx);
     int j0 = max(-RR, cy - (int)rows + 1), j1 = min(RR, cy);
-    float accT = 0.0f;
+    float accT[FALD_CONV_SO], accE[FALD_CONV_SO];
+    [unroll] for (uint s0 = 0; s0 < FALD_CONV_SO; s0++) { accT[s0] = 0.0f; accE[s0] = 0.0f; }
     [loop] for (int j = j0; j <= j1; j++)
-        accT = ConvRow(driveTex, kTrue, cx, cy - j, (so * Ht + (uint)(j + RR)) * Wt + (uint)RC, i0, i1, accT);
+        ConvRow(driveTex, kTrue, kTrue4, cx, cy - j, (g * Ht + (uint)(j + RR)) * strideT, RC, i0, i1, accT);
     int EC = (int)reachEstC, ER = (int)reachEstR;
     uint We = 2 * reachEstC + 1, He = 2 * reachEstR + 1;
+    uint strideE = 4u + ((We * FALD_CONV_SO + 3u) & ~3u);
     int e0 = max(-EC, cx - (int)cols + 1), e1 = min(EC, cx);
     int f0 = max(-ER, cy - (int)rows + 1), f1 = min(ER, cy);
-    float accE = 0.0f;
     [loop] for (int j2 = f0; j2 <= f1; j2++)
-        accE = ConvRow(driveEstTex, kEst, cx, cy - j2, (so * He + (uint)(j2 + ER)) * We + (uint)EC, e0, e1, accE);
-    if (boostN != 0u) accT *= boostTex.Load(int3(0, 0, 0));
-    bTrueOut[uint2(fx, fy)] = accT;
-    bEstOut[uint2(fx, fy)] = accE;
+        ConvRow(driveEstTex, kEst, kEst4, cx, cy - j2, (g * He + (uint)(j2 + ER)) * strideE, EC, e0, e1, accE);
+    if (boostN != 0u) {
+        float b = boostTex.Load(int3(0, 0, 0));
+        [unroll] for (uint s1 = 0; s1 < FALD_CONV_SO; s1++) accT[s1] *= b;
+    }
+    [unroll] for (uint s2 = 0; s2 < FALD_CONV_SO; s2++) {
+        uint so = g * FALD_CONV_SO + s2;
+        if (so < sub * sub) {                           // (the last group of a sub * sub not divisible by S)
+            uint fx = (uint)cx * sub + so % sub, fy = (uint)cy * sub + so / sub;
+            bTrueOut[uint2(fx, fy)] = accT[s2];
+            bEstOut[uint2(fx, fy)] = accE[s2];
+        }
+    }
 }
 )";
 
 // The conv pass's group size: the literal in its [numthreads(64, 1, 1)] and `gid.x * 64u` above (DLC
 // tests/test_fald_shader_layout.py pins that all three agree). Both RunConv sites (src/fald.cpp, dwm_hook/hook_fald.cpp)
-// dispatch FaldConvGroupsX(cols, rows) x sub * sub groups; the loader's limits (cols, rows <= 512, sub <= 16) keep that
-// inside D3D11's 65535 groups per dimension (<= 4096 x 256).
+// dispatch FaldConvGroupsX(cols, rows) x FaldConvGroups(sub, S) groups; the loader's limits (cols, rows <= 512, sub <= 16)
+// keep that inside D3D11's 65535 groups per dimension (<= 4096 x 256).
 static const unsigned int FALD_CONV_THREADS = 64u;
 inline unsigned int FaldConvGroupsX(unsigned int cols, unsigned int rows) {
     return (cols * rows + FALD_CONV_THREADS - 1u) / FALD_CONV_THREADS;
 }
+// The sub-offsets-per-thread variants of the conv pass (FALD_CONV_SO above): index v = 0..3 <-> S = 1, 2, 4, 8. Each
+// host compiles the pass once per variant with g_faldConvSoDefine[v] in front of the common source, and runs the one
+// FaldConvVariant picks for the device and lattice (the kernel tables re-laid out for that S: fald_panel.h).
+static const unsigned int FALD_CONV_SO_VARIANTS = 4u;
+inline unsigned int FaldConvSoOf(unsigned int variant) { return 1u << (variant < FALD_CONV_SO_VARIANTS ? variant : 0u); }
+inline const char* const g_faldConvSoDefine[FALD_CONV_SO_VARIANTS] = {
+    "#define FALD_CONV_SO 1\n", "#define FALD_CONV_SO 2\n", "#define FALD_CONV_SO 4\n", "#define FALD_CONV_SO 8\n" };
 
 // Zone sweeps (work guide C14; the rules above ZoneSlices in the common source). The statistic pass and starfield S0
 // dispatch cols x rows x FaldZoneSlices(cellW, cellH) groups (cellW x cellH = the WIDEST zone); with more than one slice
@@ -1034,15 +1146,21 @@ inline unsigned int FaldZoneSlices(unsigned int cellW, unsigned int cellH) {
 // C++ copies round 1's output into the state texture afterwards (DriveState.commit).
 inline const char* g_faldTemporalSource = R"(
 RWTexture2D<float> driveFiltOut : register(u0);
+RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: a filtered drive that moved flags this round
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= cols || id.y >= rows) return;
     float d = driveTex.Load(int3(id.xy, 0));
-    if (tempInit != 0u) { driveFiltOut[id.xy] = d; return; }
-    float s = stateTex.Load(int3(id.xy, 0));
-    float a = (d > s) ? tempAlphaRise : tempAlphaFall;
-    driveFiltOut[id.xy] = s + a * (d - s);
+    float o;
+    if (tempInit != 0u) o = d;
+    else {
+        float s = stateTex.Load(int3(id.xy, 0));
+        float a = (d > s) ? tempAlphaRise : tempAlphaFall;
+        o = s + a * (d - s);
+    }
+    if (RunModePartial() == 1u && driveFiltOut[id.xy] != o) InterlockedOr(changeFlags[roundIdx], 1u);
+    driveFiltOut[id.xy] = o;
 }
 )";
 
@@ -1058,6 +1176,7 @@ RWTexture2D<float> clkTrueOut : register(u0);
 RWTexture2D<float> clkEstOut  : register(u1);
 RWTexture2D<float> clkState0  : register(u2);
 RWTexture2D<float> clkState1  : register(u3);
+RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: a map that moved flags round 0 (both rounds read them)
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -1066,8 +1185,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     float s0 = clkState0[id.xy], s1 = clkState1[id.xy];
     float g0 = d - s0, g1 = d - s1;
     float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;
-    clkTrueOut[id.xy] = clkW0 * t0 + clkW1 * t1;
-    clkEstOut[id.xy] = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);
+    float oTrue = clkW0 * t0 + clkW1 * t1;
+    float oEst = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);
+    if (RunModePartial() == 1u && (clkTrueOut[id.xy] != oTrue || clkEstOut[id.xy] != oEst)) InterlockedOr(changeFlags[0], 1u);
+    clkTrueOut[id.xy] = oTrue;
+    clkEstOut[id.xy] = oEst;
     clkState0[id.xy] = t0; clkState1[id.xy] = t1;
 }
 )";
@@ -1110,6 +1232,140 @@ void main(uint3 id : SV_DispatchThreadID) {
     blurOut[uint2(fx, fy)] = acc / wsum;
 }
 )";
+
+// The decide pass (2026-10-22, work guide core-speed; shared/fald_change.h): one thread after each round's statistic sweep
+// (roundIdx 0 / 1) and, with the starfield on, after S0 (roundIdx 2). It finishes the round's black-frame boost from the
+// persistent count (the 2 x 1 texture the conv reads), and on the PARTIAL path (runMode bits 0-7 = 1) writes the indirect
+// arguments of everything downstream from the change flags: a moved star statistic re-forms the plan (S1, S2) and
+// re-sweeps round 0 in full; a moved drive / flag / LED-lag map of round 0 runs the convolution, the gain, the round-1
+// sweep in full, and so on; nothing moved runs the round-1 sweep on the touched zones only, and the pixel pass over the
+// rects alone (the hosts draw that one; the full-frame pixel pass is the indirect draw here). The flags are cleared by
+// the last decide of the run. On the full path only the boost is written (the hosts dispatch everything directly).
+// Argument slots (bytes; 3 uints each, the pixel pass 4): shared/fald_change.h FALD_ARGS_*.
+inline const char* g_faldDecideSource = R"(
+RWStructuredBuffer<uint> boostCount : register(u3);
+RWTexture2D<float> boostOut : register(u4);              // this round's 2 x 1 (boost, count)
+RWStructuredBuffer<uint> changeFlags : register(u5);
+RWByteAddressBuffer args : register(u6);                 // the indirect arguments
+static const uint ARGS_STAR_S1 = 0, ARGS_STAR_S2 = 16, ARGS_STAT0_FULL = 32, ARGS_STAT0_FULL_COMBINE = 48, ARGS_STAT0_PART = 64,
+                  ARGS_STAT0_PART_COMBINE = 80, ARGS_CONV0 = 96, ARGS_GAIN0 = 112, ARGS_STAT1_FULL = 128, ARGS_STAT1_FULL_COMBINE = 144,
+                  ARGS_STAT1_PART = 160, ARGS_STAT1_PART_COMBINE = 176, ARGS_CONV1 = 192, ARGS_GAIN1 = 208, ARGS_PIXEL = 224;
+
+[numthreads(1, 1, 1)]
+void main() {
+    uint mode = runMode & 0xFFu, so = (runMode >> 8) & 0xFFu, nList = runMode >> 16;
+    if (boostN != 0u && roundIdx < 2u) {                                 // this round's boost from the persistent count
+        uint count = boostCount[roundIdx];
+        float b = 1.0f;
+        [loop] for (uint i = 0; i < boostN; i++) {
+            if ((float)count < boostLut[2 * i]) break;
+            b = boostLut[2 * i + 1];
+        }
+        boostOut[uint2(0, 0)] = b;
+        boostOut[uint2(1, 0)] = (float)count;
+    }
+    if (mode != 1u) return;
+    uint flagS = changeFlags[2], flag0 = changeFlags[0], flag1 = changeFlags[1];
+    uint3 none = uint3(0u, 0u, 0u);
+    uint3 zonesFull = uint3(cols, rows, ZoneSlices()), zonesFullC = uint3(cols, rows, 1u);
+    uint3 zonesPart = uint3(nList, 1u, ZoneSlices()), zonesPartC = uint3(nList, 1u, 1u);
+    uint3 lattice = uint3((cols + 15u) / 16u, (rows + 15u) / 16u, 1u);
+    uint3 conv = uint3((cols * rows + 63u) / 64u, (sub * sub + so - 1u) / so, 1u);
+    uint3 fine = uint3((cols * sub + 15u) / 16u, (rows * sub + 15u) / 16u, 1u);
+    if (roundIdx == 2u) {                                                // after S0: the plan passes + round 0's sweep
+        bool star = flagS != 0u;
+        args.Store3(ARGS_STAR_S1, star ? lattice : none);
+        args.Store3(ARGS_STAR_S2, star ? lattice : none);
+        args.Store3(ARGS_STAT0_FULL, star ? zonesFull : none);
+        args.Store3(ARGS_STAT0_FULL_COMBINE, star ? zonesFullC : none);
+        args.Store3(ARGS_STAT0_PART, star ? none : zonesPart);
+        args.Store3(ARGS_STAT0_PART_COMBINE, star ? none : zonesPartC);
+        return;
+    }
+    if (roundIdx == 0u) {                                                // after round 0's sweep (+ LED lag)
+        bool c = (flagS | flag0) != 0u;
+        args.Store3(ARGS_CONV0, c ? conv : none);
+        args.Store3(ARGS_GAIN0, c ? fine : none);
+        args.Store3(ARGS_STAT1_FULL, c ? zonesFull : none);
+        args.Store3(ARGS_STAT1_FULL_COMBINE, c ? zonesFullC : none);
+        args.Store3(ARGS_STAT1_PART, c ? none : zonesPart);
+        args.Store3(ARGS_STAT1_PART_COMBINE, c ? none : zonesPartC);
+        return;
+    }
+    bool c1 = (flagS | flag0 | flag1) != 0u;                             // after round 1's sweep (+ LED lag)
+    args.Store3(ARGS_CONV1, c1 ? conv : none);
+    args.Store3(ARGS_GAIN1, c1 ? fine : none);
+    args.Store4(ARGS_PIXEL, uint4(3u, c1 ? 1u : 0u, 0u, 0u));           // DrawInstancedIndirect: the fullscreen triangle or nothing
+    changeFlags[0] = 0u; changeFlags[1] = 0u; changeFlags[2] = 0u;
+}
+)";
+
+// Passes 2b + 2c in ONE dispatch (2026-10-22, work guide core-speed): (gain, ceiling B_est) on the fine grid and its
+// separable Gaussian low-pass, bit for bit the three dispatches + copy above. Per fine texel the same gain from the same
+// four loads, the same horizontal sum (k = -R .. R, the weight the same expression, acc and wsum in the same order) of
+// the same clamped neighbours, then the same vertical sum of those sums — staged through groupshared memory instead of
+// the two ping-pong textures, so the per-texel arithmetic is unchanged. A 16 x 16 tile of outputs with an apron of R
+// each side; the apron's texels beyond the grid hold the gain of the clamped coordinate, exactly what the passes'
+// clamp(x + k, 0, W - 1) read (a replicated edge row's horizontal sum is the edge row's). R = ceil(3 sigma) <=
+// FALD_GAIN_BLUR_RMAX only (the groupshared limit); a larger sigma runs the three passes (the hosts decide at build:
+// FaldGainBlurFused). gainSmoothFine <= 0: the gain itself (the blur passes copied it).
+static const int FALD_GAIN_BLUR_RMAX = 20;                                     // 56 x 56 + 56 x 16 float2 = 32256 bytes
+inline const char* g_faldGainBlurSource = R"(
+RWTexture2D<float2> gainBlurOut : register(u0);
+groupshared float2 gG[56 * 56];   // the gain over the tile + apron (row-major, 56 wide)
+groupshared float2 gH[56 * 16];   // its horizontal blur on the tile's 16 columns, apron rows included
+
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    int W = (int)(cols * sub), H = (int)(rows * sub);
+    int R = (gainSmoothFine > 0.0f) ? (int)ceil(3.0f * gainSmoothFine) : 0;
+    int span = 16 + 2 * R;
+    int x0 = (int)gid.x * 16 - R, y0 = (int)gid.y * 16 - R;              // the apron's origin on the fine grid
+    uint t = tid.y * 16u + tid.x;
+    // the gain of every apron texel, at the clamped coordinate (= the blur passes' clamped loads of pass 2b's texture)
+    for (uint e = t; e < (uint)(span * span); e += 256u) {
+        int ax = (int)(e % (uint)span), ay = (int)(e / (uint)span);
+        int fx = clamp(x0 + ax, 0, W - 1), fy = clamp(y0 + ay, 0, H - 1);
+        float bT = bTrueTex.Load(int3(fx, fy, 0)) / max(flatTrueTex.Load(int3(fx, fy, 0)), 1e-6f);
+        float bE = bEstTex.Load(int3(fx, fy, 0))  / max(flatEstTex.Load(int3(fx, fy, 0)), 1e-6f);
+        gG[ay * 56 + ax] = float2(RawGain(bT, bE), bE);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (gainSmoothFine <= 0.0f) {                                            // no low-pass: the gain as it is
+        int ox0 = (int)gid.x * 16 + (int)tid.x, oy0 = (int)gid.y * 16 + (int)tid.y;
+        if (ox0 < W && oy0 < H) gainBlurOut[uint2(ox0, oy0)] = gG[(tid.y + R) * 56 + tid.x + R];
+        return;
+    }
+    // horizontal: the tile's 16 columns on every apron row (the vertical sum reads them), the passes' k order and weights
+    for (uint e2 = t; e2 < (uint)(span * 16); e2 += 256u) {
+        int cx = (int)(e2 % 16u), ry = (int)(e2 / 16u);
+        float2 acc = float2(0.0f, 0.0f);
+        float wsum = 0.0f;
+        for (int k = -R; k <= R; k++) {
+            float w = exp(-0.5f * (float)(k * k) / (gainSmoothFine * gainSmoothFine));
+            acc += w * gG[ry * 56 + cx + R + k]; wsum += w;
+        }
+        gH[ry * 16 + cx] = acc / wsum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // vertical, on the tile's own texels
+    int ox = (int)gid.x * 16 + (int)tid.x, oy = (int)gid.y * 16 + (int)tid.y;
+    if (ox >= W || oy >= H) return;
+    float2 acc2 = float2(0.0f, 0.0f);
+    float wsum2 = 0.0f;
+    for (int k2 = -R; k2 <= R; k2++) {
+        float w2 = exp(-0.5f * (float)(k2 * k2) / (gainSmoothFine * gainSmoothFine));
+        acc2 += w2 * gH[((int)tid.y + R + k2) * 16 + (int)tid.x]; wsum2 += w2;
+    }
+    gainBlurOut[uint2(ox, oy)] = acc2 / wsum2;
+}
+)";
+// Both hosts run the fused pass when the file's sigma allows it (the same float32 arithmetic as the shader's R).
+inline bool FaldGainBlurFused(float gainSmoothCells, unsigned int sub) {
+    const float sigma = gainSmoothCells * (float)sub;
+    const int R = sigma > 0.0f ? (int)ceilf(3.0f * sigma) : 0;
+    return R <= FALD_GAIN_BLUR_RMAX;
+}
 
 // Pass 3: per-pixel correction of the ORIGINAL processed frame with the final fields.
 // debugMode 1 = visualise gain-1 (white = no change, red = brighten, blue = darken, +-25 % full scale), 2 = B_true, 3 = B_est,

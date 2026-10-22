@@ -181,8 +181,11 @@ def test_cpp_and_hlsl_carry_the_same_law():
     run = cpp[cpp.index("void FaldRunPasses("):]
     assert "const FaldTemporalRun trun = FaldTemporalBeginRun(r, ts, clockOk," in run and "const FaldClockPlan plan = trun.clock;" in run
     assert run.count("RunPanelClock(r);") == 1 and run.index("if (plan.runPass) RunPanelClock(r);") < run.index("RunStat(r, 0);")
-    assert "return m == FALD_MAP_FILTERED ? r->driveFiltSRV : (m == FALD_MAP_CLOCK_EST ? r->clkEstSRV : r->driveSRV);" in run
-    assert "trueDrive = mapSrv(trun.trueMap);" in run and "estDrive = mapSrv(trun.estMap);" in run and run.count("clkEstSRV") == 1
+    # (2026-10-22: the maps per round — round 0 has its own instantaneous / filtered maps; the clock's est map is one)
+    assert "return m == FALD_MAP_FILTERED ? (round ? r->driveFiltSRV : r->driveFilt0SRV)" in run
+    assert ": (m == FALD_MAP_CLOCK_EST ? r->clkEstSRV : (round ? r->driveSRV : r->drive0SRV));" in run
+    assert "RunConv(r, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), r->boostSRV[0], 0, partial);" in run
+    assert "RunConv(r, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), r->boostSRV[1], 1, partial);" in run and run.count("clkEstSRV") == 1
     assert run.index("RunStat(r, 1);") < run.index("if (plan.commitPrev) g_context->CopyResource(r->clkPrevTex, r->driveTex);")
     assert run.count("CopyResource(r->clkPrevTex") == 1 and run.count("plan.seedStates") == 1
     assert "FaldTemporalEndRun(r, trun, ts, newContent);" in run and "settleLeft--" not in run
@@ -191,8 +194,10 @@ def test_cpp_and_hlsl_carry_the_same_law():
     hrun = hook[hook.index("bool FaldRun("):]
     assert "const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk," in hrun
     assert hrun.count("RunPanelClock(m);") == 1 and hrun.index("if (trun.clock.runPass) RunPanelClock(m);") < hrun.index("RunStat(m, 0);")
-    assert "return k == FALD_MAP_FILTERED ? m->driveFiltSRV : (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : m->driveSRV);" in hrun
-    assert "trueDrive = mapSrv(trun.trueMap);" in hrun and "estDrive = mapSrv(trun.estMap);" in hrun and hrun.count("clkEstSRV") == 1
+    assert "return k == FALD_MAP_FILTERED ? (round ? m->driveFiltSRV : m->driveFilt0SRV)" in hrun
+    assert ": (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : (round ? m->driveSRV : m->drive0SRV));" in hrun
+    assert "RunConv(m, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), m->boostSRV[0], 0, partial);" in hrun
+    assert "RunConv(m, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), m->boostSRV[1], 1, partial);" in hrun and hrun.count("clkEstSRV") == 1
     assert hrun.index("RunStat(m, 1);") < hrun.index("if (trun.clock.commitPrev) g_ctx->CopyResource(m->clkPrevTex, m->driveTex);")
     assert hrun.count("CopyResource(m->clkPrevTex") == 1 and hrun.count("clock.seedStates") == 1
     assert "FaldTemporalEndRun(m, trun, m->tempSettings, newContent);" in hrun and "settleLeft--" not in hrun
@@ -201,8 +206,8 @@ def test_cpp_and_hlsl_carry_the_same_law():
     # the pass: one blend per clock toward the previous frame's drives, the weighted maps, the states advanced in place
     body = re.search(r'g_faldPanelClockSource = R"\((.*?)\)";', sh, re.S).group(1)
     for line in ("float g0 = d - s0, g1 = d - s1;", "float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;",
-                 "clkTrueOut[id.xy] = clkW0 * t0 + clkW1 * t1;",
-                 "clkEstOut[id.xy] = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);",
+                 "float oTrue = clkW0 * t0 + clkW1 * t1;",
+                 "float oEst = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);",
                  "clkState0[id.xy] = t0; clkState1[id.xy] = t1;"):
         assert line in body, line
     # the first-order pass is untouched by the new mode

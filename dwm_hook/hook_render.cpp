@@ -1564,12 +1564,40 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		// far outside any dirty rect. So when the layer is on, this context gives up dirty-rect
 		// rendering — the LUT/tonemap pass draws the full frame from the layer's clean source (already
 		// updated from this present's dirty rects in FaldUpdateClean), never from the back buffer.
+		// What the pass makes of the clean copy (hook_fald.h FaldRun lutPassKey): no pass = the copy itself; a LUT /
+		// static tone map = its constant buffer and cube (both fixed between their changes; the noise and PQ tables
+		// never change); the dynamic peak or the live edit preview vary on their own: 0 = unknown.
+		unsigned long long faldLutPassKey = 0;
+		if (faldOn) {
+			if (!hasLutOrTonemap) {
+				faldLutPassKey = 0x9E3779B97F4A7C15ull;
+			} else if (!peakSlot && !mhcOn) {
+				faldLutPassKey = 1469598103934665603ull;
+				const unsigned char* kb = (const unsigned char*)&cb;
+				for (size_t i = 0; i < sizeof(cb); i++) { faldLutPassKey ^= kb[i]; faldLutPassKey *= 1099511628211ull; }
+				const uintptr_t lp = (uintptr_t)lut;
+				for (int i = 0; i < 8; i++) { faldLutPassKey ^= (lp >> (8 * i)) & 0xFFu; faldLutPassKey *= 1099511628211ull; }
+				if (faldLutPassKey == 0) faldLutPassKey = 1;
+			}
+		}
+		// The change-driven path (hook_fald.h FaldPlanPartial): with the same LUT pass on a complete intermediate, only
+		// this present's rects are drawn into it (the rest of it IS the previous frame through the same pass) and the
+		// layer recomputes only the zones they touch.
+		const bool faldPartial = faldOn && FaldPlanPartial(faldMon, faldLutPassKey);
 		if (faldOn)
 		{
 			if (hasLutOrTonemap)
 			{
-				struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
-				DrawRectangleTex(&fullFrame, (float)backBufferDesc.Width, (float)backBufferDesc.Height);
+				if (faldPartial)
+				{
+					for (int i = 0; i < numRects; i++)
+						DrawRectangleTex(&rects[i], (float)backBufferDesc.Width, (float)backBufferDesc.Height);
+				}
+				else
+				{
+					struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
+					DrawRectangleTex(&fullFrame, (float)backBufferDesc.Width, (float)backBufferDesc.Height);
+				}
 			}
 		}
 		else
@@ -1589,8 +1617,22 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				// Nothing to colour-correct before the layer: hand it the composed frame as it is.
 				// (Running the LUT pixel shader as a passthrough would add its dither, which the
 				// overlay path does not do either when no LUT and no tonemap are configured.)
-				deviceContext->CopyResource((ID3D11Resource*)FaldIntermediateTexture(faldMon),
-				                            (ID3D11Resource*)FaldCleanTexture(faldMon));
+				if (faldPartial)
+				{
+					const LONG w = (LONG)backBufferDesc.Width, h = (LONG)backBufferDesc.Height;
+					for (int i = 0; i < numRects; i++)
+					{
+						const LONG l = rects[i].left > 0 ? rects[i].left : 0, t = rects[i].top > 0 ? rects[i].top : 0;
+						const LONG r = rects[i].right < w ? rects[i].right : w, b = rects[i].bottom < h ? rects[i].bottom : h;
+						if (r <= l || b <= t) continue;
+						D3D11_BOX box = { (UINT)l, (UINT)t, 0, (UINT)r, (UINT)b, 1 };
+						deviceContext->CopySubresourceRegion((ID3D11Resource*)FaldIntermediateTexture(faldMon), 0, (UINT)l, (UINT)t, 0,
+						                                     (ID3D11Resource*)FaldCleanTexture(faldMon), 0, &box);
+					}
+				}
+				else
+					deviceContext->CopyResource((ID3D11Resource*)FaldIntermediateTexture(faldMon),
+					                            (ID3D11Resource*)FaldCleanTexture(faldMon));
 			}
 			// The passes write the back buffer themselves. If any step refuses, the intermediate
 			// still holds the frame that should have been shown, so copy it out rather than leave
@@ -1608,21 +1650,7 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 				const bool inTop = rc.bottom <= kz, inBottom = rc.top >= bh - kz;
 				if (!((inLeft || inRight) && (inTop || inBottom))) newContent = true;
 			}
-			// What the pass above made of the clean copy (hook_fald.h FaldRun lutPassKey): no pass = the copy itself; a
-			// LUT / static tone map = its constant buffer and cube (both fixed between their changes; the noise and PQ
-			// tables never change); the dynamic peak or the live edit preview vary on their own: 0 = unknown.
-			unsigned long long lutPassKey = 0;
-			if (!hasLutOrTonemap) {
-				lutPassKey = 0x9E3779B97F4A7C15ull;
-			} else if (!peakSlot && !mhcOn) {
-				lutPassKey = 1469598103934665603ull;
-				const unsigned char* kb = (const unsigned char*)&cb;
-				for (size_t i = 0; i < sizeof(cb); i++) { lutPassKey ^= kb[i]; lutPassKey *= 1099511628211ull; }
-				const uintptr_t lp = (uintptr_t)lut;
-				for (int i = 0; i < 8; i++) { lutPassKey ^= (lp >> (8 * i)) & 0xFFu; lutPassKey *= 1099511628211ull; }
-				if (lutPassKey == 0) lutPassKey = 1;
-			}
-			if (!FaldRun(faldMon, renderTargetView, newContent, lutPassKey))
+			if (!FaldRun(faldMon, renderTargetView, newContent, faldLutPassKey))
 			{
 				deviceContext->CopyResource((ID3D11Resource*)backBuffer,
 				                            (ID3D11Resource*)FaldIntermediateTexture(faldMon));

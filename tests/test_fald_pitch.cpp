@@ -184,10 +184,22 @@ struct Warp {
 FaldShaderSources LegacySources() {
     namespace L = fald_legacy_hlsl;
     FaldShaderSources s;
-    s.common = L::g_faldCommonSource; s.stat = L::g_faldStatSource; s.conv = L::g_faldConvSource; s.gain = L::g_faldGainSource;
-    s.blur = L::g_faldBlurSource; s.temporal = L::g_faldTemporalSource; s.panelClock = L::g_faldPanelClockSource;
-    s.boost = L::g_faldBoostSource; s.starStat = L::g_faldStarStatSource; s.starWeight = L::g_faldStarWeightSource;
+    // The conv pass's kernel-table layout changed on 2026-10-22 (fald/core-speed: sub-offset groups, float4 rows with a
+    // range header), which the frozen conv cannot read, and the frozen set has no fused gain + blur pass: both come from
+    // the current header here; so does the statistic pass, which finishes the black-frame boost itself since the same day
+    // (the frozen set expects the boost pass that no longer exists). Their identity with the earlier passes is held by the
+    // fade-OFF manifest recorded on main (tests/fixtures/fald_fade_off_main.hashes) and the fused-vs-three-pass case in
+    // test_fald_fade.cpp.
+    // ... and the current statistic pass needs the current common source (the zone list, the run mode, the change flags);
+    // the frozen passes below compile against it too (they use nothing it lost). What this case still holds bit for bit:
+    // the frozen gain / blur (the three passes, forced by g_faldGainFusedOverride below), temporal, panel clock, starfield
+    // S0 / S1 / S2 and pixel passes against today's — i.e. the 2026-10-22 rewrites of S2, the fused gain + blur and the
+    // compared LED-lag passes. The pre-fractional-pitch zone math was held to the fractional one when that landed (429cffa).
+    s.common = g_faldCommonSource; s.stat = g_faldStatSource; s.conv = g_faldConvSource; s.gain = L::g_faldGainSource;
+    s.blur = L::g_faldBlurSource; s.gainBlur = g_faldGainBlurSource; s.temporal = L::g_faldTemporalSource; s.panelClock = L::g_faldPanelClockSource;
+    s.starStat = L::g_faldStarStatSource; s.starWeight = L::g_faldStarWeightSource;
     s.starPlan = L::g_faldStarPlanSource; s.zoneCombineDefine = L::g_faldZoneCombineDefine; s.pixel = L::g_faldPixelSource;
+    s.decide = g_faldDecideSource;   // (the decide pass, 2026-10-22: the frozen set has none)
     return s;
 }
 
@@ -271,7 +283,9 @@ bool RunLayer(Warp& w, const std::wstring& panel, bool hdr, int width, int heigh
     const std::pair<const char*, ID3D11Texture2D*> tex[] = {
         { "drive", r->driveTex }, { "active_r0", r->activeTex[0] }, { "active_r1", r->activeTex[1] },
         { "boost_r0", r->boostTex[0] }, { "boost_r1", r->boostTex[1] }, { "btrue", r->bTrueTex }, { "best", r->bEstTex },
-        { "flat_btrue", r->flatTrueTex }, { "flat_best", r->flatEstTex }, { "gainA", r->gainATex }, { "gainB", r->gainBTex },
+        { "flat_btrue", r->flatTrueTex }, { "flat_best", r->flatEstTex },
+        // (the fused gain + blur pass leaves the final map in gainB alone; the three-pass path leaves it in both)
+        { "gainA", r->gainFused ? r->gainBTex : r->gainATex }, { "gainB", r->gainBTex },
         { "star_stat", r->starStatTex }, { "star_w", r->starWTex }, { "star_plan", r->starPlanTex },
         { "star_plan2", r->starPlan2Tex }, { "star_bg", r->starBgTex } };
     for (const auto& t : tex) lr.fields.emplace_back(t.first, ReadBack(t.second));
@@ -520,7 +534,8 @@ TEST_CASE("FALD fractional pitch: integer lattices render bit for bit as before 
     }
     MESSAGE("bit-identity cases: " << cases.size() << " (" << owner.size() << " owner panel file(s) found)");
 
-    // the frozen pre-change HLSL ...
+    // the frozen pre-change HLSL (its three-pass gain + blur: the fused pass is not in the frozen set) ...
+    g_faldGainFusedOverride = 0;
     REQUIRE(InitFaldShadersFrom(LegacySources()));
     std::vector<std::vector<std::pair<std::string, std::pair<size_t, uint64_t>>>> ref(cases.size());
     for (size_t i = 0; i < cases.size(); i++) {
@@ -532,6 +547,7 @@ TEST_CASE("FALD fractional pitch: integer lattices render bit for bit as before 
         ref[i].push_back({ "OUTPUT", { lr.out.size(), Fnv(lr.out) } });
     }
     ReleaseFaldShaders();
+    g_faldGainFusedOverride = -1;
     // ... and the current HLSL: every field and the output, bit for bit
     REQUIRE(InitFaldShaders());
     size_t mismatches = 0;

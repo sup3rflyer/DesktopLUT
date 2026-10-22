@@ -796,9 +796,11 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "bool speck = span > max(FALD_STAR_FLAT_ABS, FALD_STAR_FLAT_REL * peakAll);" in sstat
     assert "float aEff = speck ? (sumAll0 - b * cnt) / max(span, 1e-12f) : 0.0f;" in sstat
     assert "(has && speck) ? 1.0f - StarSmooth(starAreaLo, starAreaHi, aEff) : 0.0f" in sstat
-    assert "starBgOut[uint2(cx, cy)] = float4(log(max(b, 1e-12f)), (gCount[0] != 0u) ? (float)gArg[0] : 0.0f, total, aEff);" in sstat
+    # (2026-10-22: the two outputs are formed first and compared with the previous values on the partial path)
+    assert "float4 bgV = float4(log(max(b, 1e-12f)), (gCount[0] != 0u) ? (float)gArg[0] : 0.0f, total, aEff);" in sstat
+    assert "starBgOut[uint2(cx, cy)] = bgV;" in sstat and "starStatOut[uint2(cx, cy)] = statV;" in sstat
     # the speck-zone flag (lit peak above its own background) travels S0 -> S1 -> S2; carry, lift and peak field key on it
-    assert "starStatOut[uint2(cx, cy)] = float4(peak, (has && speck && aEff < starAreaHi) ? 1.0f : 0.0f, sparse, solid);" in sstat
+    assert "float4 statV = float4(peak, (has && speck && aEff < starAreaHi) ? 1.0f : 0.0f, sparse, solid);" in sstat   # (compared, then stored)
     # S1: flank zones carry no target weight (wt), keep their w (plan2.w)
     assert "starWOut[id.xy] = float4(wt, wt * log(max(st.r, 1e-12f)), flank ? 1.0f : 0.0f, st.g);" in sweight
     assert "float wt = flank ? 0.0f : w / (1.0f + partners);" in sweight                # equal-peak partners share one vote
@@ -817,7 +819,9 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "bool spk = sw.a > 0.5f;" in splan and "wsum += t.r * k; wl += t.g * k;" in splan
     assert "float k = (float)(E + 1 - max(abs(dx), abs(dy))) / (float)(E + 1);" in splan           # the tapered target window
     # the carry is on w0 = sparse * strength (the protection is NOT baked into the interpolated weight)
-    assert "s3 += starStatTex.Load(int3(x, y, 0)).b; n3 += starWTex.Load(int3(x, y, 0)).a;" in splan
+    # (2026-10-22, fald/core-speed: S2 stages starWTex's window in groupshared gW; .a of the staged texel = starWTex's)
+    assert "s3 += starStatTex.Load(int3(x, y, 0)).b; n3 += gW[((int)tid.y + E + ey) * 40 + (int)tid.x + E + ex].a;" in splan
+    assert "gW[ay * 40 + ax] = starWTex.Load(int3(x, y, 0));" in splan and "GroupMemoryBarrierWithGroupSync();" in splan
     assert "float carry = s3 * starStrength / max(n3, 1.0f) * (1.0f - StarSmooth(starNbLo, starNbHi, st.a));" in splan
     assert "StarSmooth(starPeakHi, 2.0f * starPeakHi, peak)" in sstat
     assert "(1.0f - sparse) * DriveOf(min(peak, total / area0))" in sstat
@@ -837,7 +841,8 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "starPlanOut[id.xy] = float4(wField, lnT, lnG, spk ? lp : lnT);" in splan
     # C++ order: the plan of the source frame first, then the layer
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
-    assert c.index("if (r->starOn) RunStar(r);") < c.index("RunStat(r, 0);")
+    # (2026-10-22: the full path's calls; the partial path runs S0 on the touched zones and the plan by the decide pass)
+    assert c.index("if (!partial) RunStar(r);") < c.index("if (!partial) RunStat(r, 0);")
     assert "r->starOn ? r->starPlanSRV : nullptr" in c and "r->starOn ? r->starPlan2SRV : nullptr" in c and "FALD_SRV_SLOTS = 24" in c   # t0..t23 (t20-t23: the fade stack)
     h = (_SRC / "fald.h").read_text(encoding="utf-8")
     assert "FALD_CB_BYTES = 320" in (_SHARED / "fald_panel.h").read_text(encoding="utf-8")        # 80 words since the lattice extent (fractional pitch, 2026-10-19)
@@ -845,7 +850,7 @@ def test_hlsl_star_passes_mirror_the_reference():
     # ... and the DWM hook (acb94f5): the same order, the same t15 / t18 bindings, the same reach limits
     hk = _HOOK.read_text(encoding="utf-8")
     hrun = hk[hk.index("bool FaldRun("):]
-    assert hrun.index("if (m->starOn) RunStar(m);") < hrun.index("RunStat(m, 0);")
+    assert hrun.index("if (!partial) RunStar(m);") < hrun.index("if (!partial) RunStat(m, 0);")   # (the full path's calls)
     assert "m->starOn ? m->starPlanSRV : nullptr" in hk and "m->starOn ? m->starPlan2SRV : nullptr" in hk
     assert f"if (t.starReach > {gpuemu.STAR_REACH_MAX}u) t.starReach = {gpuemu.STAR_REACH_MAX}u;" in hk
     assert f"if (t.starEvenReach > {gpuemu.STAR_EVEN_REACH_MAX}u) t.starEvenReach = {gpuemu.STAR_EVEN_REACH_MAX}u;" in hk

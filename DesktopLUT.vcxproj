@@ -115,6 +115,7 @@
     <ClCompile Include="shared\fald_panel.cpp" />
     <ClCompile Include="shared\fald_panel_live.cpp" />
     <ClCompile Include="shared\fald_temporal.cpp" />
+    <ClCompile Include="shared\fald_change.cpp" />
     <ClCompile Include="shared\fald_fade.cpp" />
     <ClCompile Include="shared\fald_fade_governor.cpp" />
     <ClCompile Include="src\fald_fade_status.cpp" />

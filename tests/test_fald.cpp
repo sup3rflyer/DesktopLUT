@@ -4,6 +4,8 @@
 // block, words 48-103), curve[curve_n], k_true, k_est. No D3D here (but the opt-in WARP case at the end) —
 // the GPU passes are checked against the Python reference by DLC's fald_compare_dump on a live dump.
 #include "doctest.h"
+#include <cstring>
+#include <utility>
 #include "../src/fald.h"
 #include "../src/types.h"
 #include "../src/globals.h"
@@ -282,6 +284,85 @@ TEST_CASE("FALD loader: FLD2 colour-part gain and fade words") {
         CHECK_FALSE(LoadFaldPanelParams(tf.path, p, err));
         CHECK(err.find("chroma") != std::string::npos);
     }
+}
+
+// The conv pass's kernel-table layout (shared/fald_panel.h FaldConvTableLayout; the shader reads tap (jj, ii) of
+// sub-offset so = g * S + s at float (g * Ht + jj) * FaldConvRowStride(Wt, S) + ii * S + s, four at a time).
+TEST_CASE("FALD conv table layout: every weight lands where the pass reads it, rows padded to float4s, spare slices zero") {
+    for (unsigned int sub : { 1u, 2u, 3u, 8u })
+        for (unsigned int Wt : { 1u, 3u, 13u, 35u })
+            for (unsigned int Ht : { 1u, 5u, 59u })
+                for (unsigned int S : { 1u, 2u, 4u, 8u }) {
+                    std::vector<float> k((size_t)sub * sub * Ht * Wt);
+                    for (size_t i = 0; i < k.size(); i++) k[i] = (float)(i + 1) * 0.5f;
+                    const std::vector<float> out = FaldConvTableLayout(k, sub, Wt, Ht, S);
+                    const unsigned int stride = FaldConvRowStride(Wt, S), groups = FaldConvGroups(sub, S);
+                    REQUIRE(stride % 4 == 0);
+                    REQUIRE(stride >= Wt * S);
+                    REQUIRE(groups * S >= sub * sub);
+                    REQUIRE(out.size() == (size_t)groups * Ht * stride);
+                    REQUIRE(out.size() % 4 == 0);
+                    double sum = 0.0;
+                    for (unsigned int so = 0; so < sub * sub; so++)
+                        for (unsigned int jj = 0; jj < Ht; jj++)
+                            for (unsigned int ii = 0; ii < Wt; ii++) {
+                                const float want = k[((size_t)so * Ht + jj) * Wt + ii];
+                                const float got = out[((size_t)(so / S) * Ht + jj) * stride + 4 + (size_t)ii * S + so % S];
+                                CHECK(got == want);
+                                sum += want;
+                            }
+                    double outSum = 0.0;
+                    for (unsigned int g = 0; g < groups; g++)
+                        for (unsigned int jj = 0; jj < Ht; jj++) {
+                            const float* row = &out[((size_t)g * Ht + jj) * stride];
+                            int lo = 0, hi = 0;
+                            std::memcpy(&lo, &row[0], 4); std::memcpy(&hi, &row[1], 4);
+                            CHECK(lo == 0); CHECK(hi == (int)Wt - 1);                   // every tap non-zero: full rows
+                            CHECK(row[2] == 0.0f); CHECK(row[3] == 0.0f);
+                            for (unsigned int e = 4; e < stride; e++) outSum += row[e];
+                        }
+                    CHECK(outSum == doctest::Approx(sum).epsilon(1e-9));   // the padding and the spare slices hold nothing else
+                }
+    CHECK(FaldConvRowStride(35, 1) == 40);
+    CHECK(FaldConvRowStride(35, 2) == 76);
+    CHECK(FaldConvRowStride(13, 8) == 108);
+    // the per-row ranges: an estimate table with a hard support (zeros outside), its rows' non-zero spans; a table with a
+    // negative tap keeps full rows (the sign of a zero sum could change); an all-zero row is an empty range
+    {
+        const unsigned int Wt = 7, Ht = 3, sub = 2;                       // 4 slices
+        std::vector<float> k((size_t)sub * sub * Ht * Wt, 0.0f);
+        auto at = [&](unsigned int so, unsigned int jj, unsigned int ii) -> float& { return k[((size_t)so * Ht + jj) * Wt + ii]; };
+        at(0, 0, 2) = 1.0f; at(0, 0, 4) = 1.0f;                            // slice 0 row 0: taps 2..4
+        at(1, 0, 5) = 2.0f;                                               // slice 1 row 0: tap 5
+        at(2, 1, 0) = 3.0f; at(3, 1, 6) = 3.0f;                            // slices 2 / 3 row 1: taps 0 and 6
+        for (unsigned int S : { 1u, 2u, 4u }) {
+            const std::vector<float> out = FaldConvTableLayout(k, sub, Wt, Ht, S);
+            const unsigned int stride = FaldConvRowStride(Wt, S);
+            auto range = [&](unsigned int g, unsigned int jj) {
+                int lo = 0, hi = 0;
+                std::memcpy(&lo, &out[((size_t)g * Ht + jj) * stride], 4); std::memcpy(&hi, &out[((size_t)g * Ht + jj) * stride + 1], 4);
+                return std::make_pair(lo, hi);
+            };
+            if (S == 1) {
+                CHECK(range(0, 0) == std::make_pair(2, 4)); CHECK(range(1, 0) == std::make_pair(5, 5));
+                CHECK(range(2, 1) == std::make_pair(0, 0)); CHECK(range(3, 1) == std::make_pair(6, 6));
+                CHECK(range(0, 2) == std::make_pair(1, 0));                 // all zero: empty
+            } else if (S == 2) {
+                CHECK(range(0, 0) == std::make_pair(2, 5)); CHECK(range(1, 1) == std::make_pair(0, 6));
+                CHECK(range(1, 0) == std::make_pair(1, 0));
+            } else {
+                CHECK(range(0, 0) == std::make_pair(2, 5)); CHECK(range(0, 1) == std::make_pair(0, 6)); CHECK(range(0, 2) == std::make_pair(1, 0));
+            }
+        }
+        at(0, 2, 3) = -0.0f;                                              // a -0 tap anywhere: full rows throughout
+        const std::vector<float> full = FaldConvTableLayout(k, sub, Wt, Ht, 2);
+        int lo = 0, hi = 0;
+        std::memcpy(&lo, &full[0], 4); std::memcpy(&hi, &full[1], 4);
+        CHECK(lo == 0); CHECK(hi == (int)Wt - 1);
+    }
+    CHECK(FaldConvGroups(8, 8) == 8);
+    CHECK(FaldConvGroups(3, 8) == 2);
+    CHECK(FaldConvGroups(1, 8) == 1);
 }
 
 TEST_CASE("FALD constant buffer is 80 words") {

@@ -7,6 +7,7 @@
 // gate, checked with the one-shot field dump (FaldPollDumpRequest) against the overlay and dlc/fald/gpuemu.py.
 #include "pch.h"
 #include "hook_fald.h"
+#include "../shared/fald_change.h"
 #include "hook_log.h"
 #include "fald_shader.h"
 #include "fald_temporal.h"
@@ -30,10 +31,11 @@ static ID3D11Device* g_dev = nullptr;
 static ID3D11DeviceContext* g_ctx = nullptr;
 
 static ID3D11ComputeShader* g_statCS = nullptr;
-static ID3D11ComputeShader* g_convCS = nullptr;
+static ID3D11ComputeShader* g_convCS[FALD_CONV_SO_VARIANTS] = {};   // pass 2, one per sub-offsets-per-thread variant
 static ID3D11ComputeShader* g_gainCS = nullptr;
 static ID3D11ComputeShader* g_blurCS = nullptr;
-static ID3D11ComputeShader* g_boostCS = nullptr;
+static ID3D11ComputeShader* g_gainBlurCS = nullptr;   // passes 2b + 2c fused (fald_shader.h g_faldGainBlurSource)
+static ID3D11ComputeShader* g_decideCS = nullptr;     // the change-driven path's decide pass (g_faldDecideSource)
 // The statistic pass's combine variant (work guide C14; fald_shader.h above ZoneSlices): folds the slice partials of a
 // lattice whose zones hold more than FALD_ZONE_SLICE_PX pixels. Needed by such lattices only (BuildMonitor refuses one
 // without it); a lattice of one-slice zones never dispatches it, so a compile failure here costs nothing there.
@@ -108,7 +110,8 @@ static bool CompileOne(const std::string& src, const char* name, const char* tar
 }
 
 bool FaldShadersReady() {
-    return g_statCS && g_convCS && g_gainCS && g_blurCS && g_boostCS && g_faldPS && g_faldVS && g_faldSampler;
+    return g_statCS && g_convCS[0] && g_convCS[1] && g_convCS[2] && g_convCS[3] && g_gainCS && g_blurCS && g_gainBlurCS && g_decideCS &&
+           g_faldPS && g_faldVS && g_faldSampler;
 }
 
 bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
@@ -122,16 +125,21 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     HRESULT hr = S_OK;
 
     const std::string combine = std::string(g_faldZoneCombineDefine) + common;   // the zone sweeps' combine variants
-    struct { const char* src; const char* name; ID3D11ComputeShader** out; bool comb; } cs[] = {
-        { g_faldStatSource,  "FaldStatCS",  &g_statCS,  false },
-        { g_faldStatSource,  "FaldStatCombineCS", &g_statCombineCS, true },
-        { g_faldConvSource,  "FaldConvCS",  &g_convCS,  false },
-        { g_faldGainSource,  "FaldGainCS",  &g_gainCS,  false },
-        { g_faldBlurSource,  "FaldBlurCS",  &g_blurCS,  false },
-        { g_faldBoostSource, "FaldBoostCS", &g_boostCS, false },
+    struct { const char* src; const char* name; ID3D11ComputeShader** out; const char* prefix; } cs[] = {
+        { g_faldStatSource,  "FaldStatCS",  &g_statCS,  nullptr },
+        { g_faldStatSource,  "FaldStatCombineCS", &g_statCombineCS, g_faldZoneCombineDefine },
+        { g_faldConvSource,  "FaldConvCS1", &g_convCS[0], g_faldConvSoDefine[0] },   // pass 2 per variant (fald_shader.h FALD_CONV_SO)
+        { g_faldConvSource,  "FaldConvCS2", &g_convCS[1], g_faldConvSoDefine[1] },
+        { g_faldConvSource,  "FaldConvCS4", &g_convCS[2], g_faldConvSoDefine[2] },
+        { g_faldConvSource,  "FaldConvCS8", &g_convCS[3], g_faldConvSoDefine[3] },
+        { g_faldGainSource,  "FaldGainCS",  &g_gainCS,  nullptr },
+        { g_faldBlurSource,  "FaldBlurCS",  &g_blurCS,  nullptr },
+        { g_faldGainBlurSource, "FaldGainBlurCS", &g_gainBlurCS, nullptr },
+        { g_faldDecideSource, "FaldDecideCS", &g_decideCS, nullptr },
     };
     for (const auto& s : cs) {
-        if (!CompileOne((s.comb ? combine : common) + s.src, s.name, "cs_5_0", &b)) { FaldReleaseShaders(); return false; }
+        const std::string pre = s.prefix ? (s.prefix == g_faldZoneCombineDefine ? combine : std::string(s.prefix) + common) : common;
+        if (!CompileOne(pre + s.src, s.name, "cs_5_0", &b)) { FaldReleaseShaders(); return false; }
         hr = g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.out);
         b->Release(); b = nullptr;
         if (FAILED(hr)) { LogF("FALD: CreateComputeShader(%s) failed hr=0x%08X", s.name, (unsigned)hr); FaldReleaseShaders(); return false; }
@@ -291,11 +299,12 @@ void FaldReleaseShaders() {
     SafeRelease(g_faldSampler);
     SafeRelease(g_faldVS);
     SafeRelease(g_faldPS);
-    SafeRelease(g_boostCS);
     SafeRelease(g_statCombineCS);
+    SafeRelease(g_decideCS);
+    SafeRelease(g_gainBlurCS);
     SafeRelease(g_blurCS);
     SafeRelease(g_gainCS);
-    SafeRelease(g_convCS);
+    for (unsigned int v = 0; v < FALD_CONV_SO_VARIANTS; v++) SafeRelease(g_convCS[v]);
     SafeRelease(g_statCS);
 }
 
@@ -532,7 +541,7 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 4248;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 4552;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
                                                          // 2026-10-20: + the fade stack's five fields; 2026-10-22: + the
@@ -583,10 +592,13 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     HANDLE settleEvt = NULL, contentEvt = NULL;           // DWM_HOOK_FALD_SETTLE / CONTENT events of this position
     unsigned int evtOpenTick = 0;                         // open retried every ~120 runs while the host has none
 
-    // panel tables
+    // panel tables (the kernels re-laid out for the conv pass's variant, shared/fald_panel.h FaldConvTableLayout: a float
+    // view at t2 / t3 and a float4 view of the same buffer at t36 / t37)
     ID3D11Texture2D* curveTex = nullptr;  ID3D11ShaderResourceView* curveSRV = nullptr;
-    ID3D11Buffer* kTrueBuf = nullptr;     ID3D11ShaderResourceView* kTrueSRV = nullptr;
-    ID3D11Buffer* kEstBuf = nullptr;      ID3D11ShaderResourceView* kEstSRV = nullptr;
+    ID3D11Buffer* kTrueBuf = nullptr;     ID3D11ShaderResourceView* kTrueSRV = nullptr; ID3D11ShaderResourceView* kTrue4SRV = nullptr;
+    ID3D11Buffer* kEstBuf = nullptr;      ID3D11ShaderResourceView* kEstSRV = nullptr;  ID3D11ShaderResourceView* kEst4SRV = nullptr;
+    unsigned int convVariant = 0;         // FaldConvVariant at build: 0..3 <-> 1 / 2 / 4 / 8 sub-offsets per thread
+    bool gainFused = false;               // FaldGainBlurFused at build: passes 2b + 2c in one dispatch into gainB (gainA unused)
     // per-frame fields
     ID3D11Texture2D* driveTex = nullptr;  ID3D11UnorderedAccessView* driveUAV = nullptr; ID3D11ShaderResourceView* driveSRV = nullptr;
     ID3D11Texture2D* bTrueTex = nullptr;  ID3D11UnorderedAccessView* bTrueUAV = nullptr; ID3D11ShaderResourceView* bTrueSRV = nullptr;
@@ -600,6 +612,27 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* activeTex[2] = {}; ID3D11UnorderedAccessView* activeUAV[2] = {}; ID3D11ShaderResourceView* activeSRV[2] = {};
     ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
+    // the statistic pass's non-black zone counters, one per round (zeroed at creation; + (new - old) per finished zone)
+    ID3D11Buffer* boostCountBuf = nullptr; ID3D11UnorderedAccessView* boostCountUAV = nullptr;
+    // The change-driven path (shared/fald_change.h; src/fald.h has the same): round 0's own drive / filtered drive /
+    // fields, the touched-zone list, the change flags, the decide pass's indirect arguments, what the previous run left.
+    ID3D11Texture2D* drive0Tex = nullptr; ID3D11UnorderedAccessView* drive0UAV = nullptr; ID3D11ShaderResourceView* drive0SRV = nullptr;
+    ID3D11Texture2D* driveFilt0Tex = nullptr; ID3D11UnorderedAccessView* driveFilt0UAV = nullptr; ID3D11ShaderResourceView* driveFilt0SRV = nullptr;
+    ID3D11Texture2D* bTrue0Tex = nullptr; ID3D11UnorderedAccessView* bTrue0UAV = nullptr; ID3D11ShaderResourceView* bTrue0SRV = nullptr;
+    ID3D11Texture2D* bEst0Tex = nullptr;  ID3D11UnorderedAccessView* bEst0UAV = nullptr;  ID3D11ShaderResourceView* bEst0SRV = nullptr;
+    ID3D11Texture2D* gain0Tex = nullptr;  ID3D11UnorderedAccessView* gain0UAV = nullptr;  ID3D11ShaderResourceView* gain0SRV = nullptr;
+    ID3D11Buffer* zoneListBuf = nullptr; ID3D11ShaderResourceView* zoneListSRV = nullptr;
+    ID3D11Buffer* changeFlagsBuf = nullptr; ID3D11UnorderedAccessView* changeFlagsUAV = nullptr;
+    ID3D11Buffer* argsBuf = nullptr; ID3D11UnorderedAccessView* argsUAV = nullptr;
+    uint32_t runMode = 0;                  // CB word 79 of the next FillCB
+    bool stateComplete = false;            // the previous run left every texture of a complete run (and the intermediate whole)
+    bool planPartial = false;              // this present's plan (FaldPlanPartial), consumed by FaldRun
+    bool lastPartial = false;              // the previous run took the partial path (the dump)
+    unsigned long long lastSettingsKey = 0, lastLutPassKey = 0, planSettingsKey = 0;
+    std::vector<uint32_t> touched;         // this present's touched zones (FaldUpdateClean)
+    bool touchedOk = false;                // ... within the cap
+    std::vector<RECT> rects;               // this present's rects, clipped to the frame (the pixel pass over them)
+    unsigned long long partialRuns = 0;    // runs that took the partial path (the cost log)
     // zone sweeps (work guide C14; fald_shader.h above ZoneSlices): slices per zone, and for a lattice of more than one
     // the slice partials the statistic / S0 passes write and their combine variants fold (u2); null for one slice
     unsigned int zoneSlices = 1;
@@ -670,7 +703,10 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 //     fadeGov, fadeGovWrittenGen, fadeGovWriteRuns, cleanGen;
 //   KEPT on the entry by SwapPanel itself: spareParams;
 //   BUILT FRESH by the swap (BuildTables, defaults, or on demand later): params, valid, failed, panelSeq, failedSeq,
-//     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource, zoneSlices, cb, starOn,
+//     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource (kTrue4SRV / kEst4SRV and
+//     convVariant, gainFused, the boost counters and the change-driven path's maps / list / flags / arguments and its
+//     runMode, stateComplete, planPartial, lastPartial, lastSettingsKey, lastLutPassKey, planSettingsKey, touched,
+//     touchedOk, rects among the panel tables), zoneSlices, cb, starOn,
 //     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, fadeOn, fadeFailed,
 //     fadeKey, and the whole FaldTemporalState base (the LED-lag bookkeeping).
 // A field added to FaldMonitor changes its size and stops this assert: put it in one of the lists above (and in
@@ -713,6 +749,7 @@ static DwmHookFaldTuning SanitizeTuning(const DwmHookFaldTuning& in) {
 }
 
 static void ReleaseClock(FaldMonitor* m) {
+    m->stateComplete = false;              // (the change-driven path: the next run is a full one)
     for (unsigned int i = 0; i < 2; i++) { SafeRelease(m->clkStateSRV[i]); SafeRelease(m->clkStateUAV[i]); SafeRelease(m->clkStateTex[i]); }
     SafeRelease(m->clkPrevSRV); SafeRelease(m->clkPrevUAV); SafeRelease(m->clkPrevTex);
     SafeRelease(m->clkEstSRV); SafeRelease(m->clkEstUAV); SafeRelease(m->clkEstTex);
@@ -730,6 +767,7 @@ static void ReleaseTemporal(FaldMonitor* m) {
 }
 
 static void ReleaseStar(FaldMonitor* m) {
+    m->stateComplete = false;              // (the change-driven path: the next run is a full one)
     SafeRelease(m->starPlan2SRV); SafeRelease(m->starPlan2UAV); SafeRelease(m->starPlan2Tex);
     SafeRelease(m->starBgSRV);    SafeRelease(m->starBgUAV);    SafeRelease(m->starBgTex);
     SafeRelease(m->starPlanSRV);  SafeRelease(m->starPlanUAV);  SafeRelease(m->starPlanTex);
@@ -774,6 +812,17 @@ static void RequestDeferredSwap(int i) {
 static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->cb);
     SafeRelease(m->boostLutSRV); SafeRelease(m->boostLutBuf);
+    SafeRelease(m->boostCountUAV); SafeRelease(m->boostCountBuf);
+    SafeRelease(m->drive0SRV); SafeRelease(m->drive0UAV); SafeRelease(m->drive0Tex);
+    SafeRelease(m->driveFilt0SRV); SafeRelease(m->driveFilt0UAV); SafeRelease(m->driveFilt0Tex);
+    SafeRelease(m->bTrue0SRV); SafeRelease(m->bTrue0UAV); SafeRelease(m->bTrue0Tex);
+    SafeRelease(m->bEst0SRV); SafeRelease(m->bEst0UAV); SafeRelease(m->bEst0Tex);
+    SafeRelease(m->gain0SRV); SafeRelease(m->gain0UAV); SafeRelease(m->gain0Tex);
+    SafeRelease(m->zoneListSRV); SafeRelease(m->zoneListBuf);
+    SafeRelease(m->changeFlagsUAV); SafeRelease(m->changeFlagsBuf);
+    SafeRelease(m->argsUAV); SafeRelease(m->argsBuf);
+    m->stateComplete = false; m->planPartial = false; m->lastPartial = false; m->runMode = 0;
+    m->lastSettingsKey = 0; m->lastLutPassKey = 0; m->planSettingsKey = 0; m->touched.clear(); m->touchedOk = false; m->rects.clear();
     SafeRelease(m->zonePartUAV); SafeRelease(m->zonePartBuf); m->zoneSlices = 1;
     for (int i = 0; i < 2; i++) {
         SafeRelease(m->boostSRV[i]); SafeRelease(m->boostUAV[i]); SafeRelease(m->boostTex[i]);
@@ -786,8 +835,8 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->bEstSRV); SafeRelease(m->bEstUAV); SafeRelease(m->bEstTex);
     SafeRelease(m->bTrueSRV); SafeRelease(m->bTrueUAV); SafeRelease(m->bTrueTex);
     SafeRelease(m->driveSRV); SafeRelease(m->driveUAV); SafeRelease(m->driveTex);
-    SafeRelease(m->kEstSRV); SafeRelease(m->kEstBuf);
-    SafeRelease(m->kTrueSRV); SafeRelease(m->kTrueBuf);
+    SafeRelease(m->kEst4SRV); SafeRelease(m->kEstSRV); SafeRelease(m->kEstBuf);
+    SafeRelease(m->kTrue4SRV); SafeRelease(m->kTrueSRV); SafeRelease(m->kTrueBuf);
     SafeRelease(m->curveSRV); SafeRelease(m->curveTex);
     SafeRelease(m->interSRV); SafeRelease(m->interRTV); SafeRelease(m->interTex);
     SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
@@ -895,6 +944,71 @@ static bool MakeFloatBuffer(const std::vector<float>& data, ID3D11Buffer** buf, 
     sd.Buffer.FirstElement = 0;
     sd.Buffer.NumElements = (UINT)data.size();
     return SUCCEEDED(g_dev->CreateShaderResourceView(*buf, &sd, srv));
+}
+
+// The statistic pass's counters (fald_shader.h boostCount): `count` uints, zeroed at creation, UAV only.
+static bool MakeCounterBuffer(UINT count, ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav) {
+    std::vector<uint32_t> zero(count, 0u);
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = count * 4u;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+    bd.StructureByteStride = 4u;
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem = zero.data();
+    if (FAILED(g_dev->CreateBuffer(&bd, &init, buf))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_UNKNOWN;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = count;
+    return SUCCEEDED(g_dev->CreateUnorderedAccessView(*buf, &ud, uav));
+}
+
+// The touched-zone list (fald_shader.h zoneList, t38): a dynamic buffer of `count` uints the host maps per present.
+static bool MakeZoneList(UINT count, ID3D11Buffer** buf, ID3D11ShaderResourceView** srv) {
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = count * 4u;
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g_dev->CreateBuffer(&bd, nullptr, buf))) return false;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32_UINT;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    sd.Buffer.FirstElement = 0;
+    sd.Buffer.NumElements = count;
+    return SUCCEEDED(g_dev->CreateShaderResourceView(*buf, &sd, srv));
+}
+
+// The decide pass's indirect arguments (fald_change.h FALD_ARGS_*): a raw buffer the GPU writes and DispatchIndirect /
+// DrawInstancedIndirect read.
+static bool MakeArgsBuffer(ID3D11Buffer** buf, ID3D11UnorderedAccessView** uav) {
+    std::vector<uint32_t> zero(FALD_ARGS_BYTES / 4u, 0u);
+    D3D11_BUFFER_DESC bd = {};
+    bd.ByteWidth = FALD_ARGS_BYTES;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+    bd.MiscFlags = D3D11_RESOURCE_MISC_DRAWINDIRECT_ARGS | D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+    D3D11_SUBRESOURCE_DATA init = {};
+    init.pSysMem = zero.data();
+    if (FAILED(g_dev->CreateBuffer(&bd, &init, buf))) return false;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud = {};
+    ud.Format = DXGI_FORMAT_R32_TYPELESS;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+    ud.Buffer.NumElements = FALD_ARGS_BYTES / 4u;
+    ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+    return SUCCEEDED(g_dev->CreateUnorderedAccessView(*buf, &ud, uav));
+}
+
+// A float4 view of a float buffer whose size is a multiple of 4 floats (the conv pass's kernel reads, t36 / t37).
+static bool MakeFloat4View(ID3D11Buffer* buf, size_t floats, ID3D11ShaderResourceView** srv) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
+    sd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+    sd.Buffer.FirstElement = 0;
+    sd.Buffer.NumElements = (UINT)(floats / 4);
+    return SUCCEEDED(g_dev->CreateShaderResourceView(buf, &sd, srv));
 }
 
 // The five cols x rows RGBA32F starfield textures (src/fald.cpp EnsureStar). A failure is latched per
@@ -1055,9 +1169,19 @@ static bool BuildTables(FaldMonitor* m) {
             log_to_file("FALD: curve texture creation failed"); return false;
         }
     }
-    if (!MakeFloatBuffer(p.kTrue, &m->kTrueBuf, &m->kTrueSRV)) { log_to_file("FALD: kTrue buffer failed"); return false; }
-    if (!MakeFloatBuffer(p.kEst, &m->kEstBuf, &m->kEstSRV)) { log_to_file("FALD: kEst buffer failed"); return false; }
+    // the conv pass's kernel tables, laid out for its variant (shared/fald_panel.h FaldConvTableLayout)
+    m->convVariant = FaldConvVariant(p.cols, p.rows, p.sub);
+    {
+        const unsigned int S = FaldConvSoOf(m->convVariant);
+        const std::vector<float> kT = FaldConvTableLayout(p.kTrue, p.sub, 2 * p.reachTrueC + 1, 2 * p.reachTrueR + 1, S);
+        const std::vector<float> kE = FaldConvTableLayout(p.kEst, p.sub, 2 * p.reachEstC + 1, 2 * p.reachEstR + 1, S);
+        if (!MakeFloatBuffer(kT, &m->kTrueBuf, &m->kTrueSRV) || !MakeFloat4View(m->kTrueBuf, kT.size(), &m->kTrue4SRV)) { log_to_file("FALD: kTrue buffer failed"); return false; }
+        if (!MakeFloatBuffer(kE, &m->kEstBuf, &m->kEstSRV) || !MakeFloat4View(m->kEstBuf, kE.size(), &m->kEst4SRV)) { log_to_file("FALD: kEst buffer failed"); return false; }
+    }
     if (!MakeRWTexture(p.cols, p.rows, &m->driveTex, &m->driveUAV, &m->driveSRV)) { log_to_file("FALD: drive texture failed"); return false; }
+    // round 0's own maps (the change-driven path compares them run to run; round 1's are the textures named as before)
+    if (!MakeRWTexture(p.cols, p.rows, &m->drive0Tex, &m->drive0UAV, &m->drive0SRV)) { log_to_file("FALD: drive texture (round 0) failed"); return false; }
+    if (!MakeRWTexture(p.cols, p.rows, &m->driveFilt0Tex, &m->driveFilt0UAV, &m->driveFilt0SRV)) { log_to_file("FALD: filtered drive texture (round 0) failed"); return false; }
     // LED lag (modes 1 / 2): the filtered drive, the committed state and the delay ring (as src/fald.cpp Build)
     if (!MakeRWTexture(p.cols, p.rows, &m->driveFiltTex, &m->driveFiltUAV, &m->driveFiltSRV)) { log_to_file("FALD: filtered drive texture failed"); return false; }
     if (!MakeRWTexture(p.cols, p.rows, &m->driveStateTex, &m->driveStateUAV, &m->driveStateSRV)) { log_to_file("FALD: drive state texture failed"); return false; }
@@ -1065,6 +1189,9 @@ static bool BuildTables(FaldMonitor* m) {
         if (!MakeRWTexture(p.cols, p.rows, &m->delayTex[i], &m->delayUAV[i], &m->delaySRV[i])) { log_to_file("FALD: delay ring texture failed"); return false; }
     m->clockFailed = false;
     const UINT fw = p.cols * p.sub, fh = p.rows * p.sub;
+    if (!MakeRWTexture(fw, fh, &m->bTrue0Tex, &m->bTrue0UAV, &m->bTrue0SRV)) { log_to_file("FALD: B_true texture (round 0) failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->bEst0Tex, &m->bEst0UAV, &m->bEst0SRV)) { log_to_file("FALD: B_est texture (round 0) failed"); return false; }
+    if (!MakeRWTexture(fw, fh, &m->gain0Tex, &m->gain0UAV, &m->gain0SRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture (round 0) failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bTrueTex, &m->bTrueUAV, &m->bTrueSRV)) { log_to_file("FALD: B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->bEstTex, &m->bEstUAV, &m->bEstSRV)) { log_to_file("FALD: B_est texture failed"); return false; }
     // R32G32F: (gain, the flat-normalised B_est of the soft knee's ceiling), low-passed together (C15)
@@ -1072,6 +1199,7 @@ static bool BuildTables(FaldMonitor* m) {
     if (!MakeRWTexture(fw, fh, &m->gainBTex, &m->gainBUAV, &m->gainBSRV, DXGI_FORMAT_R32G32_FLOAT)) { log_to_file("FALD: gain texture B failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatTrueTex, &m->flatTrueUAV, &m->flatTrueSRV)) { log_to_file("FALD: flat B_true texture failed"); return false; }
     if (!MakeRWTexture(fw, fh, &m->flatEstTex, &m->flatEstUAV, &m->flatEstSRV)) { log_to_file("FALD: flat B_est texture failed"); return false; }
+    m->gainFused = FaldGainBlurFused(p.gainSmoothCells, p.sub) && g_faldGainFusedOverride != 0;   // passes 2b + 2c in one dispatch
     m->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);            // zones larger than one slice: the sweeps' partials
     if (m->zoneSlices > FALD_ZONE_SLICES_MAX) {
         LogF("FALD: zones of %ux%u px need %u sweep slices (max %u) - layer off", p.cellW, p.cellH, m->zoneSlices, FALD_ZONE_SLICES_MAX);
@@ -1092,7 +1220,15 @@ static bool BuildTables(FaldMonitor* m) {
             lut.push_back(p.boostVal[i]);
         }
         if (!MakeFloatBuffer(lut, &m->boostLutBuf, &m->boostLutSRV)) { log_to_file("FALD: boost LUT buffer failed"); return false; }
+        if (!MakeCounterBuffer(2, &m->boostCountBuf, &m->boostCountUAV)) { log_to_file("FALD: boost counters failed"); return false; }
+        const float zero[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // the flag maps start all zero: the counters follow them by deltas
+        g_ctx->ClearUnorderedAccessViewFloat(m->activeUAV[0], zero);
+        g_ctx->ClearUnorderedAccessViewFloat(m->activeUAV[1], zero);
     }
+    // the change-driven path: the touched-zone list, the change flags, the decide pass's indirect arguments
+    if (!MakeZoneList(p.cols * p.rows, &m->zoneListBuf, &m->zoneListSRV)) { log_to_file("FALD: zone list failed"); return false; }
+    if (!MakeCounterBuffer(3, &m->changeFlagsBuf, &m->changeFlagsUAV)) { log_to_file("FALD: change flags failed"); return false; }
+    if (!MakeArgsBuffer(&m->argsBuf, &m->argsUAV)) { log_to_file("FALD: indirect arguments failed"); return false; }
     D3D11_BUFFER_DESC cbd = {};
     cbd.ByteWidth = FALD_CB_BYTES;
     cbd.Usage = D3D11_USAGE_DYNAMIC; cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -1383,6 +1519,7 @@ ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m) { return m ? m->cleanSRV 
 // The clean copy went stale (created, or a present of this monitor the layer did not see): every tile owes a refresh.
 static void CoverReset(FaldMonitor* m) {
     m->primed = false;
+    m->stateComplete = false;   // (the change-driven path: the intermediate / the maps stand for no frame the next run sees)
     m->cleanGen++;   // the copy is stale: whatever it holds is no frame a reach was formed from
     if (!m->cover.empty()) std::fill(m->cover.begin(), m->cover.end(), (uint8_t)0);
     m->coverLeft = m->coverCols * m->coverRows;
@@ -1407,12 +1544,15 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
     m->offPresents = 0;
     const LONG w = (LONG)m->width, h = (LONG)m->height;
     const LONG T = (LONG)HOOK_FALD_COVER_TILE;
+    m->rects.clear();
+    m->planPartial = false;
     for (int i = 0; i < numRects; i++) {
         const LONG l = rects[i].left > 0 ? rects[i].left : 0;
         const LONG t = rects[i].top > 0 ? rects[i].top : 0;
         const LONG r = rects[i].right < w ? rects[i].right : w;
         const LONG b = rects[i].bottom < h ? rects[i].bottom : h;
         if (r <= l || b <= t) continue;
+        { RECT c = { l, t, r, b }; m->rects.push_back(c); }   // (the change-driven path: the zones + the pixel pass over them)
         D3D11_BOX box = { (UINT)l, (UINT)t, 0, (UINT)r, (UINT)b, 1 };
         g_ctx->CopySubresourceRegion(m->cleanTex, 0, (UINT)l, (UINT)t, 0, backBuffer, 0, &box);
         m->cleanGen++;   // the copy changed (FaldRun's reach reuse: a new intermediate)
@@ -1431,6 +1571,15 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
         m->primed = true;
         LogF("FALD: pos(%d,%d) %s clean source primed (every pixel refreshed since it went stale)",
              m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)");
+    }
+    // the zones this present's rects touch (shared/fald_change.h; a long list = the full path)
+    {
+        const FaldPanelParams& p = m->params;
+        std::vector<FaldChangeRect> cr;
+        cr.reserve(m->rects.size());
+        for (const RECT& rc : m->rects) { FaldChangeRect x = { (int)rc.left, (int)rc.top, (int)rc.right, (int)rc.bottom }; cr.push_back(x); }
+        m->touchedOk = FaldTouchedZones(cr.data(), (int)cr.size(), p.originX, p.originY, p.latW, p.latH, p.cols, p.rows,
+                                        FaldChangeMaxZones(p.cols * p.rows), m->touched);
     }
     if (!m->primed) {
         FaldTemporalIdle(m);   // the layer does not run this present (src FaldLayerIdle)
@@ -1572,7 +1721,8 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     u[72] = p.boostRule; f[73] = p.boostMeanGamma; f[74] = p.boostMeanThresh;
     u[75] = m->fadeOn ? FALD_FADE_FLAG_FLANK : 0u;                                  // fadeFlags: the fade stack (bit 1 = L, reserved)
     // the zone lattice's extent (words 76/77; cols * cellW / rows * cellH for an integer pitch): the zones' own spans
-    u[76] = p.latW; u[77] = p.latH; u[78] = 0u; u[79] = 0u;                         // (docs/fald-fractional-pitch.md)
+    u[76] = p.latW; u[77] = p.latH; u[78] = 0u; u[79] = m->runMode;                 // (docs/fald-fractional-pitch.md; word 79:
+                                                                                    // the run's path, fald_change.h FaldRunModeWord)
     g_ctx->Unmap(m->cb, 0);
 }
 
@@ -1592,6 +1742,7 @@ static void BindCommon(FaldMonitor* m, bool compute) {
     if (compute) {
         g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
         g_ctx->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
+        g_ctx->CSSetShaderResources(38, 1, &m->zoneListSRV);   // t38: the touched-zone list (the partial path's sweeps)
         g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
     } else {
         g_ctx->PSSetConstantBuffers(0, 1, &m->cb);
@@ -1608,39 +1759,55 @@ static void UnbindCompute() {
     g_ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
-static void RunStat(FaldMonitor* m, uint32_t roundIdx) {
+// How a statistic sweep is dispatched (the change-driven path, shared/fald_change.h; src/fald.cpp has the same): the
+// full lattice by the host, the touched zones by the host, or either by the decide pass's indirect arguments.
+struct StatDispatch { bool partial; bool indirect; unsigned int slot, combine; };
+static const StatDispatch kStatFull = { false, false, 0, 0 };
+static const StatDispatch kStatPartial = { true, false, 0, 0 };
+
+static void RunStat(FaldMonitor* m, uint32_t roundIdx, StatDispatch d = kStatFull) {
     const FaldPanelParams& p = m->params;
+    m->runMode = (m->runMode & ~0xFFu) | (d.partial ? 1u : 0u);   // the sweep's zones: the group's or the list's
     FillCB(m, roundIdx);
     g_ctx->CSSetShader(g_statCS, nullptr, 0);
     BindCommon(m, true);
-    if (roundIdx == 1) {
-        ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
+    if (roundIdx == 1) {                                          // round 0's fields and smoothed (gain, ceiling B_est) (C15)
+        ID3D11ShaderResourceView* fields[2] = { m->bTrue0SRV, m->bEst0SRV };
         g_ctx->CSSetShaderResources(5, 2, fields);
-        g_ctx->CSSetShaderResources(9, 1, &m->gainBSRV);      // smoothed (gain, ceiling B_est) of the previous round (C15)
-        if (m->fadeOn) {                                      // FadePost on round 0's request: fade, F's opening, reach 0, s - f_q
+        ID3D11ShaderResourceView* gain0 = m->gainFused ? m->gain0SRV : m->gainBSRV;   // (the three-pass path leaves it in gainB)
+        g_ctx->CSSetShaderResources(9, 1, &gain0);
+        if (m->fadeOn) {                                          // FadePost on round 0's request: fade, F's opening, reach 0, s - f_q
             ID3D11ShaderResourceView* fv[FALD_FADE_POST_VIEWS];
             FaldFadePostViews(m->fade, 0, fv);
             g_ctx->CSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
         }
     }
-    ID3D11UnorderedAccessView* uavs[3] = { m->driveUAV, m->activeUAV[roundIdx & 1u],    // u1: null without a boost LUT
-                                           m->zonePartUAV };                              // (the shader then never writes it)
-    g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);                               // u2: partials, zones > one slice
-    g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
+    ID3D11UnorderedAccessView* uavs[6] = { roundIdx ? m->driveUAV : m->drive0UAV, m->activeUAV[roundIdx & 1u],   // u1: null without a boost LUT
+                                           m->zonePartUAV,                                // (the shader then never writes it)
+                                           m->boostCountUAV, nullptr,                     // u3: the boost's counters (LUT only); u2: partials
+                                           m->changeFlagsUAV };                           // u5: the partial path's flags
+    g_ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
+    if (d.indirect) g_ctx->DispatchIndirect(m->argsBuf, d.slot);
+    else if (d.partial) g_ctx->Dispatch((UINT)m->touched.size(), 1, m->zoneSlices);
+    else g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
     if (m->zoneSlices > 1) {                                                             // fold the slices, finish the zones
         g_ctx->CSSetShader(g_statCombineCS, nullptr, 0);
-        g_ctx->Dispatch(p.cols, p.rows, 1);
+        if (d.indirect) g_ctx->DispatchIndirect(m->argsBuf, d.combine);
+        else if (d.partial) g_ctx->Dispatch((UINT)m->touched.size(), 1, 1);
+        else g_ctx->Dispatch(p.cols, p.rows, 1);
     }
     UnbindCompute();
 }
 
-static void RunBoost(FaldMonitor* m, uint32_t roundIdx) {
-    if (!m->params.hasBoost) return;
-    const unsigned int k = roundIdx & 1u;
-    g_ctx->CSSetShader(g_boostCS, nullptr, 0);
+// The decide pass (fald_shader.h g_faldDecideSource), mirror of src/fald.cpp RunDecide: after S0 (which = 2), after round
+// 0's sweep (0) and after round 1's (1). It finishes the round's boost from the persistent count on every path; on the
+// partial path it also writes the indirect arguments of what follows from the change flags.
+static void RunDecide(FaldMonitor* m, uint32_t which) {
+    FillCB(m, which);
+    g_ctx->CSSetShader(g_decideCS, nullptr, 0);
     BindCommon(m, true);
-    g_ctx->CSSetShaderResources(13, 1, &m->activeSRV[k]);
-    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->boostUAV[k], nullptr);
+    ID3D11UnorderedAccessView* uavs[7] = { nullptr, nullptr, nullptr, m->boostCountUAV, m->boostUAV[which & 1u], m->changeFlagsUAV, m->argsUAV };
+    g_ctx->CSSetUnorderedAccessViews(0, 7, uavs, nullptr);
     g_ctx->Dispatch(1, 1, 1);
     UnbindCompute();
 }
@@ -1650,26 +1817,42 @@ static void RunBoost(FaldMonitor* m, uint32_t roundIdx) {
 // trueDrive / estDrive: the drive maps the real-spread and the estimate kernels see (both the instantaneous drive
 // unless LED lag routes a filtered / clock map: FaldTemporalRun::trueMap / estMap).
 static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive,
-                    ID3D11ShaderResourceView* boost) {
+                    ID3D11ShaderResourceView* boost, int roundIdx = -1, bool indirect = false) {
     const FaldPanelParams& p = m->params;
-    g_ctx->CSSetShader(g_convCS, nullptr, 0);
+    g_ctx->CSSetShader(g_convCS[m->convVariant], nullptr, 0);
     BindCommon(m, true);
     g_ctx->CSSetShaderResources(4, 1, &trueDrive);
     g_ctx->CSSetShaderResources(10, 1, &estDrive);
     g_ctx->CSSetShaderResources(14, 1, &boost);
-    ID3D11UnorderedAccessView* uavs[2] = { m->bTrueUAV, m->bEstUAV };
+    ID3D11ShaderResourceView* k4[2] = { m->kTrue4SRV, m->kEst4SRV };   // the tables four floats wide (t36 / t37)
+    g_ctx->CSSetShaderResources(36, 2, k4);
+    // round 0 writes its own fields (the round-1 sweep and the change-driven path compare / read them later)
+    ID3D11UnorderedAccessView* uavs[2] = { roundIdx == 0 ? m->bTrue0UAV : m->bTrueUAV, roundIdx == 0 ? m->bEst0UAV : m->bEstUAV };
     g_ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
-    g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), p.sub * p.sub, 1);   // cells x sub-offsets (fald_shader.h)
+    // cells x sub-offset groups (fald_shader.h: FALD_CONV_SO sub-offsets per thread); indirect: the decide pass's arguments
+    if (indirect) g_ctx->DispatchIndirect(m->argsBuf, roundIdx ? FALD_ARGS_CONV1 : FALD_ARGS_CONV0);
+    else g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(m->convVariant)), 1);
     UnbindCompute();
 }
 
 // Pass 2b/2c: (gain, the knee's ceiling B_est) on the fine grid, then a separable Gaussian low-pass of both (A -> B -> A; final in gainB).
-static void RunGain(FaldMonitor* m) {
+static void RunGain(FaldMonitor* m, uint32_t roundIdx, bool indirect = false) {
     const FaldPanelParams& p = m->params;
     const UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
-    g_ctx->CSSetShader(g_gainCS, nullptr, 0);
+    ID3D11ShaderResourceView* fields[2] = { roundIdx ? m->bTrueSRV : m->bTrue0SRV, roundIdx ? m->bEstSRV : m->bEst0SRV };   // the round's own
+    if (m->gainFused) {                    // one dispatch: gain + both blurs straight into the round's map (fald_shader.h)
+        g_ctx->CSSetShader(g_gainBlurCS, nullptr, 0);
+        BindCommon(m, true);
+        g_ctx->CSSetShaderResources(5, 2, fields);
+        ID3D11UnorderedAccessView* out = roundIdx ? m->gainBUAV : m->gain0UAV;
+        g_ctx->CSSetUnorderedAccessViews(0, 1, &out, nullptr);
+        if (indirect) g_ctx->DispatchIndirect(m->argsBuf, roundIdx ? FALD_ARGS_GAIN1 : FALD_ARGS_GAIN0);
+        else g_ctx->Dispatch(gx, gy, 1);
+        UnbindCompute();
+        return;
+    }
+    g_ctx->CSSetShader(g_gainCS, nullptr, 0);   // (the three-pass path is never indirect: the partial path needs the fused one)
     BindCommon(m, true);
-    ID3D11ShaderResourceView* fields[2] = { m->bTrueSRV, m->bEstSRV };
     g_ctx->CSSetShaderResources(5, 2, fields);
     g_ctx->CSSetUnorderedAccessViews(0, 1, &m->gainAUAV, nullptr);
     g_ctx->Dispatch(gx, gy, 1);
@@ -1697,13 +1880,14 @@ static void RunGain(FaldMonitor* m) {
 // LED lag pass 1b (modes 1 / 2), mirror of src/fald.cpp RunTemporal: filtered drive = state + a * (drive - state) per
 // cell, from the map the panel's pipeline is fed (t4: this round's instantaneous drive, or a delay-ring entry) and the
 // state committed after the previous frame (t11); with no valid state the drive is copied.
-static void RunTemporal(FaldMonitor* m, ID3D11ShaderResourceView* inDrive) {
+static void RunTemporal(FaldMonitor* m, ID3D11ShaderResourceView* inDrive, uint32_t roundIdx) {
     const FaldPanelParams& p = m->params;
     g_ctx->CSSetShader(g_temporalCS, nullptr, 0);
     BindCommon(m, true);
     g_ctx->CSSetShaderResources(4, 1, &inDrive);
     g_ctx->CSSetShaderResources(11, 1, &m->driveStateSRV);
-    g_ctx->CSSetUnorderedAccessViews(0, 1, &m->driveFiltUAV, nullptr);
+    ID3D11UnorderedAccessView* uavs[6] = { roundIdx ? m->driveFiltUAV : m->driveFilt0UAV, nullptr, nullptr, nullptr, nullptr, m->changeFlagsUAV };
+    g_ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
     g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
     UnbindCompute();
 }
@@ -1717,10 +1901,11 @@ static void RunPanelClock(FaldMonitor* m) {
     g_ctx->CSSetShader(g_clockCS, nullptr, 0);
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetShaderResources(4, 1, &m->clkPrevSRV);
-    ID3D11UnorderedAccessView* uavs[4] = { m->driveFiltUAV, m->clkEstUAV, m->clkStateUAV[0], m->clkStateUAV[1] };
-    g_ctx->CSSetUnorderedAccessViews(0, 4, uavs, nullptr);
+    // u0 = the map both rounds' real-spread kernel sees (round 0's filtered slot; round 1 reads the same view)
+    ID3D11UnorderedAccessView* uavs[6] = { m->driveFilt0UAV, m->clkEstUAV, m->clkStateUAV[0], m->clkStateUAV[1], nullptr, m->changeFlagsUAV };
+    g_ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
     g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
-    UnbindCompute();   // clears all FALD_UAV_SLOTS (4)
+    UnbindCompute();   // clears all FALD_UAV_SLOTS
 }
 
 // Starfield balancing, mirror of src/fald.cpp RunStar: S0 star statistic of the SOURCE frame -> S1
@@ -1728,31 +1913,44 @@ static void RunPanelClock(FaldMonitor* m) {
 // (t18). A pure function of the source frame in the intermediate, recomputed every run. The passes
 // bind only what they read (never BindCommon: that would bind plan / plan2 as SRVs while S1 / S2
 // write them).
-static void RunStar(FaldMonitor* m) {
+// S0 over the lattice (full) or the touched zones (partial: compared, a moved zone flags the starfield).
+static void RunStarS0(FaldMonitor* m, bool partial) {
     const FaldPanelParams& p = m->params;
+    m->runMode = (m->runMode & ~0xFFu) | (partial ? 1u : 0u);
     FillCB(m, 0);
     ID3D11ShaderResourceView* in2[2] = { m->interSRV, m->curveSRV };
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
+    g_ctx->CSSetShaderResources(38, 1, &m->zoneListSRV);
     // S0: per zone stat = (peak, speck-zone flag, sparse, solid) + bg = (ln b, brightest pixel's index, lit sum, a_eff)
-    ID3D11UnorderedAccessView* out0[3] = { m->starStatUAV, m->starBgUAV, m->zonePartUAV };   // u2: zones > one slice
+    ID3D11UnorderedAccessView* out0[6] = { m->starStatUAV, m->starBgUAV, m->zonePartUAV, nullptr, nullptr, m->changeFlagsUAV };   // u2: zones > one slice
     g_ctx->CSSetShader(g_starStatCS, nullptr, 0);
     g_ctx->CSSetShaderResources(0, 2, in2);
-    g_ctx->CSSetUnorderedAccessViews(0, 3, out0, nullptr);
-    g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
+    g_ctx->CSSetUnorderedAccessViews(0, 6, out0, nullptr);
+    if (partial) g_ctx->Dispatch((UINT)m->touched.size(), 1, m->zoneSlices);
+    else g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
     if (m->zoneSlices > 1) {
         g_ctx->CSSetShader(g_starStatCombineCS, nullptr, 0);
-        g_ctx->Dispatch(p.cols, p.rows, 1);
+        if (partial) g_ctx->Dispatch((UINT)m->touched.size(), 1, 1);
+        else g_ctx->Dispatch(p.cols, p.rows, 1);
     }
     UnbindCompute();
+}
+
+// S1 + S2, the plan passes: by the host, or by the decide pass's arguments (the partial path: only when S0 moved).
+static void RunStarPlan(FaldMonitor* m, bool indirect) {
+    const FaldPanelParams& p = m->params;
+    FillCB(m, 0);
+    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
+    g_ctx->CSSetSamplers(0, 1, &g_faldSampler);
     // S1: tapered protection field + flank test + zone weights
     ID3D11UnorderedAccessView* out1[2] = { m->starWUAV, m->starPlan2UAV };
     g_ctx->CSSetShader(g_starWeightCS, nullptr, 0);
-    g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetShaderResources(16, 1, &m->starStatSRV);
     g_ctx->CSSetShaderResources(19, 1, &m->starBgSRV);
     g_ctx->CSSetUnorderedAccessViews(0, 2, out1, nullptr);
-    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S1);
+    else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
     UnbindCompute();
     // S2: (w0_field, ln target, ln lift, ln peak)
     ID3D11ShaderResourceView* in3[2] = { m->starStatSRV, m->starWSRV };
@@ -1760,14 +1958,17 @@ static void RunStar(FaldMonitor* m) {
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetShaderResources(16, 2, in3);
     g_ctx->CSSetUnorderedAccessViews(0, 1, &m->starPlanUAV, nullptr);
-    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S2);
+    else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
     UnbindCompute();
 }
+
+static void RunStar(FaldMonitor* m) { RunStarS0(m, false); RunStarPlan(m, false); }
 
 // The fade stack (shared/fald_fade.h — the same module the overlay runs), mirror of src/fald.cpp RunFadeFrame /
 // RunFadeReach: the common views its frame / knee passes read (BindCommon's t0..t19; a round's reach also t5 / t6 = its
 // fields, t9 = its smoothed gain).
-static FaldFadeCommon FadeCommon(FaldMonitor* m, bool roundFields) {
+static FaldFadeCommon FadeCommon(FaldMonitor* m, bool roundFields, uint32_t round = 1) {
     FaldFadeCommon c;
     c.faldCB = m->cb;
     c.sampler = g_faldSampler;
@@ -1776,7 +1977,10 @@ static FaldFadeCommon FadeCommon(FaldMonitor* m, bool roundFields) {
                                         m->starOn ? m->starPlanSRV : nullptr, nullptr, nullptr,
                                         m->starOn ? m->starPlan2SRV : nullptr, nullptr };
     for (int i = 0; i < 20; i++) c.srv[i] = v[i];
-    if (roundFields) { c.srv[5] = m->bTrueSRV; c.srv[6] = m->bEstSRV; c.srv[9] = m->gainBSRV; }
+    if (roundFields) {                     // the round's own fields and smoothed gain
+        c.srv[5] = round ? m->bTrueSRV : m->bTrue0SRV; c.srv[6] = round ? m->bEstSRV : m->bEst0SRV;
+        c.srv[9] = (round || !m->gainFused) ? m->gainBSRV : m->gain0SRV;
+    }
     return c;
 }
 
@@ -1815,7 +2019,7 @@ static unsigned long long ReachKey(const FaldMonitor* m, unsigned long long fram
 
 static void RunFadeReach(FaldMonitor* m, uint32_t round, unsigned long long key) {
     FillCB(m, round);
-    FaldFadeRunReach(m->fade, g_ctx, FadeCommon(m, true), round, key);
+    FaldFadeRunReach(m->fade, g_ctx, FadeCommon(m, true, round), round, key);
 }
 
 // Flat-lattice response: run the convolution once on a drive map of ones and keep the two fields.
@@ -2110,6 +2314,31 @@ static void DrawExempt(FaldMonitor* m) {
     g_ctx->RSSetScissorRects(prevCount, prevCount ? prevScissor : nullptr);
 }
 
+// The settings a run's textures depend on besides the panel file and the frame (the change-driven path's settingsSame).
+static unsigned long long SettingsKey(const FaldMonitor* m) {
+    unsigned long long h = 1469598103934665603ull;
+    auto mix = [&h](const void* p, size_t n) { const unsigned char* b = (const unsigned char*)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
+    const uint32_t words[6] = { m->debugMode, m->pedMode, m->starOn ? 1u : 0u, m->fadeOn ? 1u : 0u, m->gainFused ? 1u : 0u, m->convVariant };
+    mix(words, sizeof(words));
+    mix(&m->tuning, sizeof(m->tuning));
+    mix(&m->tempSettings, sizeof(m->tempSettings));
+    return h;
+}
+
+bool FaldPlanPartial(FaldMonitor* m, unsigned long long lutPassKey) {
+    if (!m || !m->valid || !m->primed) return false;
+    ResolveFeatures(m);                      // the starfield / the fade of THIS present (FaldRun resolves again: idempotent)
+    const FaldPanelParams& p = m->params;
+    m->planSettingsKey = SettingsKey(m);
+    FaldChangeInputs in = {};
+    in.stateComplete = m->stateComplete; in.settingsSame = m->planSettingsKey == m->lastSettingsKey;
+    in.frameKnown = m->touchedOk && lutPassKey != 0 && lutPassKey == m->lastLutPassKey;
+    in.newContent = true; in.gainFused = m->gainFused; in.temporalMode = m->tempSettings.mode; in.fadeOn = m->fadeOn;
+    in.touchedZones = (unsigned int)m->touched.size(); in.totalZones = p.cols * p.rows;
+    m->planPartial = g_faldPartialOverride != 0 && FaldChangeDecide(in, FaldChangeMaxZones(in.totalZones)) == FALD_CHANGE_PARTIAL;
+    return m->planPartial;
+}
+
 bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, unsigned long long lutPassKey) {
     if (!m || !m->valid || !m->interSRV || !dstRTV) return false;
 
@@ -2151,18 +2380,41 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     LARGE_INTEGER qpcNow;
     QueryPerformanceCounter(&qpcNow);
     const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk, qpcNow.QuadPart, freq.QuadPart, m->refreshMs);
-    auto mapSrv = [m](FaldDriveMap k) {
-        return k == FALD_MAP_FILTERED ? m->driveFiltSRV : (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : m->driveSRV);
+    // the drive maps the kernels and the LED-lag pass of a round read (round 0 has its own instantaneous / filtered maps)
+    auto mapSrv = [m](FaldDriveMap k, uint32_t round) {
+        return k == FALD_MAP_FILTERED ? (round ? m->driveFiltSRV : m->driveFilt0SRV)
+             : (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : (round ? m->driveSRV : m->drive0SRV));
     };
-    ID3D11ShaderResourceView* inDrive = trun.delayedSlot >= 0 ? m->delaySRV[trun.delayedSlot] : m->driveSRV;
-    ID3D11ShaderResourceView* trueDrive = mapSrv(trun.trueMap);
-    ID3D11ShaderResourceView* estDrive = mapSrv(trun.estMap);
+    auto inDriveOf = [m, &trun](uint32_t round) { return trun.delayedSlot >= 0 ? m->delaySRV[trun.delayedSlot] : (round ? m->driveSRV : m->drive0SRV); };
+
+    // The path of this present (FaldPlanPartial, decided before the LUT pass drew the rects or the whole frame into the
+    // intermediate; shared/fald_change.h). The settings the plan was made with must still hold (ResolveFeatures above
+    // is idempotent between the two); otherwise the full path — the intermediate is whole either way.
+    const bool partial = m->planPartial && SettingsKey(m) == m->planSettingsKey && m->touchedOk;
+    m->planPartial = false;
+    if (partial && !m->touched.empty()) {                             // the list for the sweeps (t38)
+        D3D11_MAPPED_SUBRESOURCE map;
+        if (SUCCEEDED(g_ctx->Map(m->zoneListBuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) {
+            memcpy(map.pData, m->touched.data(), m->touched.size() * sizeof(uint32_t));
+            g_ctx->Unmap(m->zoneListBuf, 0);
+        }
+    }
+    m->runMode = FaldRunModeWord(partial, FaldConvSoOf(m->convVariant), (unsigned int)m->touched.size());
+    const unsigned long long settingsKey = SettingsKey(m);
 
     // No render target may be bound while the passes write their UAVs.
     g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
-    // Starfield first: every pass below reads Balance(source) from its plan.
-    if (m->starOn) RunStar(m);
+    // Starfield first: every pass below reads Balance(source) from its plan. Partial: S0 on the touched zones, then the
+    // plan and a full round-0 sweep only if a zone's star statistic moved (the decide pass's arguments).
+    const StatDispatch stat0Full = { false, true, FALD_ARGS_STAT0_FULL, FALD_ARGS_STAT0_FULL_COMBINE };
+    const StatDispatch stat0Part = { true, true, FALD_ARGS_STAT0_PART, FALD_ARGS_STAT0_PART_COMBINE };
+    const StatDispatch stat1Full = { false, true, FALD_ARGS_STAT1_FULL, FALD_ARGS_STAT1_FULL_COMBINE };
+    const StatDispatch stat1Part = { true, true, FALD_ARGS_STAT1_PART, FALD_ARGS_STAT1_PART_COMBINE };
+    if (m->starOn) {
+        if (!partial) RunStar(m);
+        else { RunStarS0(m, true); RunDecide(m, 2); RunStarPlan(m, true); }
+    }
     if (m->fadeOn) RunFadeFrame(m, newContent);  // fade stack: the fade, F, T — once per content frame (fald_fade.h)
     // Both rounds' reach of the intermediate they were formed from (no new content, LED lag off, the same settings): reused
     const unsigned long long reachKey = m->fadeOn ? ReachKey(m, frameKey, trun.temporal, trun.panel) : 0ull;
@@ -2173,19 +2425,25 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     // Two inverse rounds. Round 0's output is what round 1's statistic and boost count see, so the
     // panel's own response is accounted for in the frame it actually receives.
     // LED lag modes 1 / 2 filter each round's drive (both rounds read the SAME committed state).
-    RunStat(m, 0);
-    RunBoost(m, 0);
-    if (trun.temporal) RunTemporal(m, inDrive);
-    RunConv(m, trueDrive, estDrive, m->boostSRV[0]);
-    RunGain(m);
+    // Partial: the sweeps on the touched zones (the whole lattice when the starfield / round 0 moved), the rest by the
+    // decide pass's arguments.
+    if (!partial) RunStat(m, 0);
+    else if (!m->starOn) RunStat(m, 0, kStatPartial);
+    else { RunStat(m, 0, stat0Full); RunStat(m, 0, stat0Part); }
+    if (trun.temporal) RunTemporal(m, inDriveOf(0), 0);
+    RunDecide(m, 0);                          // round 0's boost (boostTex[0]); partial: what follows from the flags
+    RunConv(m, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), m->boostSRV[0], 0, partial);
+    RunGain(m, 0, partial);
     if (m->fadeOn && !reachReuse) RunFadeReach(m, 0, reachKey);   // reach of round 0's knee: FadePost in the round-1 statistic
-    RunStat(m, 1);
-    RunBoost(m, 1);
-    if (trun.temporal) RunTemporal(m, inDrive);
-    RunConv(m, trueDrive, estDrive, m->boostSRV[1]);
-    RunGain(m);
+    if (!partial) RunStat(m, 1);
+    else { RunStat(m, 1, stat1Full); RunStat(m, 1, stat1Part); }
+    if (trun.temporal) RunTemporal(m, inDriveOf(1), 1);
+    RunDecide(m, 1);                          // round 1's boost (boostTex[1]); partial: the convolution, the gain, the pixel pass
+    RunConv(m, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), m->boostSRV[1], 1, partial);
+    RunGain(m, 1, partial);
     if (m->fadeOn && !reachReuse) RunFadeReach(m, 1, reachKey);   // reach of round 1's knee: FadePost in the pixel pass
     m->framesRun++;
+    m->lastPartial = partial;
 
     if (!dumpDir.empty()) {                   // before the commit: the state files are the maps the passes read
         DumpFields(m, dumpDir);
@@ -2220,7 +2478,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     g_ctx->PSSetShaderResources(5, 2, fields);
     g_ctx->PSSetShaderResources(9, 1, &m->gainBSRV);
     // t4 / t10 = debug view 7: instantaneous vs filtered (mode 3: vs the clocks' mean LED state of this frame)
-    ID3D11ShaderResourceView* filt = mapSrv(trun.debugFiltMap);
+    ID3D11ShaderResourceView* filt = mapSrv(trun.debugFiltMap, 1);
     g_ctx->PSSetShaderResources(4, 1, &m->driveSRV);
     g_ctx->PSSetShaderResources(10, 1, &filt);
     g_ctx->PSSetShaderResources(13, 1, &m->activeSRV[1]);   // debug view 8 (null without a boost LUT)
@@ -2229,9 +2487,34 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
         FaldFadePostViews(m->fade, 1, fv);
         g_ctx->PSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
     }
-    g_ctx->Draw(3, 0);
+    if (!partial) g_ctx->Draw(3, 0);
+    else {
+        // the whole frame only if anything moved (the decide pass's draw arguments), and always the rects DWM re-composed
+        // (the back buffer holds the previous output everywhere else); scissored draws of the same triangle
+        g_ctx->DrawInstancedIndirect(m->argsBuf, FALD_ARGS_PIXEL);
+        if (g_exemptRS && !m->rects.empty()) {
+            ID3D11RasterizerState* prevRS = nullptr;
+            g_ctx->RSGetState(&prevRS);
+            D3D11_RECT prevScissor[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+            UINT prevCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+            g_ctx->RSGetScissorRects(&prevCount, prevScissor);
+            g_ctx->RSSetState(g_exemptRS);
+            for (const RECT& rc : m->rects) {
+                const D3D11_RECT sc = { rc.left, rc.top, rc.right, rc.bottom };
+                g_ctx->RSSetScissorRects(1, &sc);
+                g_ctx->Draw(3, 0);
+            }
+            g_ctx->RSSetState(prevRS);
+            if (prevRS) prevRS->Release();
+            g_ctx->RSSetScissorRects(prevCount, prevCount ? prevScissor : nullptr);
+        }
+    }
     if (m->debugMode != 0) DrawExempt(m);   // a view: DesktopLUT's windows keep the corrected picture
     GpuTimingEnd(ts, m);
+    // what this run leaves behind for the next present's plan (shared/fald_change.h)
+    m->stateComplete = true;
+    m->lastSettingsKey = settingsKey;
+    m->lastLutPassKey = lutPassKey;
 
     if (!dumpDir.empty()) {
         DumpOutput(dstRTV, dumpDir + L"fald_out.rgba16f", m->width, m->height);
@@ -2277,12 +2560,13 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     // The cost of the whole layer, logged rarely: overrunning DWM's present budget stutters the whole
     // desktop, and a number beats a guess. ~every 10 s at 60 Hz. CPU = submission time in the present
     // path; GPU = the timestamp queries' average / max over the interval, and the starfield share.
+    if (partial) m->partialRuns++;
     if ((m->framesRun % 600ull) == 1ull) {
         if (m->gpuSamples > 0)
-            LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us | GPU avg %.0f us, max %.0f us, starfield+fade frame %.0f us (%u samples) [star %s, fade %s]",
+            LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us | GPU avg %.0f us, max %.0f us, starfield+fade frame %.0f us (%u samples) [star %s, fade %s, partial runs %llu]",
                  m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs,
                  m->gpuSumUs / m->gpuSamples, m->gpuMaxUs, m->gpuStarSumUs / m->gpuSamples, m->gpuSamples,
-                 m->starOn ? "on" : "off", m->fadeOn ? "on" : "off");
+                 m->starOn ? "on" : "off", m->fadeOn ? "on" : "off", m->partialRuns);
         else
             LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us/frame in the present path (no GPU timing yet) [star %s, fade %s]",
                  m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs,

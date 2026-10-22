@@ -126,6 +126,25 @@ float FaldBoostOfCount(const FaldPanelParams& p, unsigned int activeZones);
 // LIT || (boostRule MEAN ? mean(nits^gamma) >= thresh : DIM). Sequential float sums — the GPU's reduction order differs
 // in the last bits only. false for n = 0.
 bool FaldBoostZoneActive(const FaldPanelParams& p, const float* maxChannelNits, size_t n);
+// The conv pass's kernel-table layout for S sub-offsets per thread (shared/fald_shader.h g_faldConvSource, FALD_CONV_SO):
+// the file's [sub * sub][Ht][Wt] table (slice so = (fy % sub) * sub + fx % sub) re-laid out as [g][jj]{header}[ii][s],
+// so = g * S + s: each (g, jj) row = one float4 header (lo, hi as int bits: the first and last tap column ii at which any
+// of the row's S slices is non-zero; lo = 1, hi = 0 for an all-zero row) + the taps padded to a multiple of 4 floats, i.e.
+// FaldConvRowStride(Wt, S) floats per row; the slices of the last group beyond sub * sub are zero. The pass sums only
+// lo .. hi: exact for a table with no negative tap (a +0 term leaves a non-negative float32 sum bit for bit) — a table
+// with a negative or -0 tap gets full rows (lo = 0, hi = Wt - 1). The result's size is a multiple of 4 floats.
+unsigned int FaldConvRowStride(unsigned int Wt, unsigned int S);
+unsigned int FaldConvGroups(unsigned int sub, unsigned int S);
+std::vector<float> FaldConvTableLayout(const std::vector<float>& table, unsigned int sub, unsigned int Wt, unsigned int Ht, unsigned int S);
+// Which variant (0..3 <-> S = 1, 2, 4, 8) a host runs for this lattice: g_faldConvVariantOverride when >= 0 (tests, the
+// HW harness), else the policy below. Both hosts call it at build, so they always agree.
+unsigned int FaldConvVariant(unsigned int cols, unsigned int rows, unsigned int sub);
+extern int g_faldConvVariantOverride;   // -1 = the policy; set before a build (not thread-safe by design: tests only)
+// Passes 2b + 2c fused into one dispatch (shared/fald_shader.h g_faldGainBlurSource) or the three passes + copy: -1 = by
+// the file's sigma (FaldGainBlurFused), 0 = the three passes, 1 = fused when the sigma allows it. Tests only, as above.
+extern int g_faldGainFusedOverride;
+// The change-driven path (shared/fald_change.h): -1 = by the rules, 0 = never (every run full). Tests only, as above.
+extern int g_faldPartialOverride;
 // Does a file with this transfer belong to this monitor mode? (PQ <-> HDR, gamma <-> SDR/ACM.)
 bool FaldTransferMatchesMode(uint32_t transfer, bool monitorHdr);
 // The panel lattice (origin + latW x latH) must lie inside the monitor's frame.

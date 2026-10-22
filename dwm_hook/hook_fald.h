@@ -37,7 +37,8 @@ struct ID3D11Texture2D;
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
 // (t0..t19, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
-#define HOOK_FALD_SRV_SLOTS 36  // t0..t35: the layer t0..t22 (t20..t22 = the fade stack's views), the fade passes t24..t35
+#define HOOK_FALD_SRV_SLOTS 39  // t0..t38: the layer t0..t22 (t20..t22 = the fade stack's views), the fade passes t24..t35,
+                                // the conv pass's float4 kernel views t36 / t37, the touched-zone list t38
 #define HOOK_FALD_UAV_SLOTS 8   // u0..u7: the fade passes bind up to u7 (the panel clock four)
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed
@@ -99,6 +100,12 @@ ID3D11Texture2D* FaldIntermediateTexture(FaldMonitor* m);
 // FaldMarkStale is called for every present of a monitor the layer did NOT see (layer off, other
 // mode): the rects of that present never reached the copy, so it has to be re-primed.
 bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const struct tagRECT* rects, int numRects);
+// The change-driven path (shared/fald_change.h), decided per present AFTER FaldUpdateClean and FaldSetLiveSettings and
+// BEFORE the LUT / tone map pass: true = this present's run recomputes only the zones the present's rects touched, so the
+// caller draws only those rects into the intermediate (the rest of it is the previous run's frame, which the same LUT
+// pass — lutPassKey equal — made of the same clean pixels); false = the full frame as always. FaldRun follows the plan
+// (its pixel pass covers the rects, and the whole frame only if anything moved: the GPU decides).
+bool FaldPlanPartial(FaldMonitor* m, unsigned long long lutPassKey);
 void FaldMarkStale(int left, int top);
 // Every entry: a present whose monitor cannot be resolved went past the layer (the conservative fallback). Only marks
 // them: each entry applies the mark on its own position's next present (no thread changes another monitor's entry).

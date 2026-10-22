@@ -219,7 +219,10 @@ bool RunHashes(FadeWarp& w, const std::string& cellDir, const RunSpec& rs, Manif
             { "delay0", r->delayTex[0] }, { "delay1", r->delayTex[1] }, { "delay2", r->delayTex[2] },
             { "active_r0", r->activeTex[0] }, { "active_r1", r->activeTex[1] },
             { "boost_r0", r->boostTex[0] }, { "boost_r1", r->boostTex[1] }, { "btrue", r->bTrueTex }, { "best", r->bEstTex },
-            { "flat_btrue", r->flatTrueTex }, { "flat_best", r->flatEstTex }, { "gainA", r->gainATex }, { "gainB", r->gainBTex },
+            { "flat_btrue", r->flatTrueTex }, { "flat_best", r->flatEstTex },
+            // main held the final (gain, ceiling) in BOTH ping-pong textures (the copy); the fused gain + blur pass writes
+            // the final map into gainB alone, so its "gainA" line is the same final map (the manifest's lines stay comparable)
+            { "gainA", r->gainFused ? r->gainBTex : r->gainATex }, { "gainB", r->gainBTex },
             { "star_stat", r->starStatTex }, { "star_w", r->starWTex }, { "star_plan", r->starPlanTex },
             { "star_plan2", r->starPlan2Tex }, { "star_bg", r->starBgTex } };
         const std::string key = rs.id + "/" + std::to_string(i);
@@ -595,6 +598,30 @@ TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, w
     dis->Release(); blob->Release();
 }
 
+// Passes 2b + 2c fused into one dispatch (shared/fald_shader.h g_faldGainBlurSource) against the three passes + copy they
+// replace, on the same frame: the final (gain, ceiling) map and the output byte for byte (the OFF manifest above holds the
+// fused path to main's three passes as well; this case keeps the fallback path — a sigma over FALD_GAIN_BLUR_RMAX — honest).
+TEST_CASE("FALD gain + blur: the fused pass equals the three passes byte for byte (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cellDir = EnvStr("FALD_TEST_FADE_DIR");
+    if (cellDir.empty()) return;
+    const std::wstring C = OwnerPanel(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
+    REQUIRE_FALSE(C.empty());
+    FadeWarp w;
+    REQUIRE(w.ok);
+    std::string out[2], gain[2];
+    for (int fused = 0; fused < 2; fused++) {
+        g_faldGainFusedOverride = fused;
+        RunSpec rs; rs.id = "fused"; rs.panel = C; rs.hdr = true; rs.frames = { "n7_lamp" }; rs.w = 3840; rs.h = 2160; rs.star = true;
+        Manifest man; std::string err;
+        REQUIRE_MESSAGE(RunHashes(w, cellDir, rs, man, err), err);
+        for (const auto& kv : man) { if (kv.first == "fused/0 OUTPUT") out[fused] = kv.second; if (kv.first == "fused/0 gainB") gain[fused] = kv.second; }
+    }
+    g_faldGainFusedOverride = -1;
+    REQUIRE_FALSE(out[0].empty());
+    CHECK(out[0] == out[1]);
+    CHECK(gain[0] == gain[1]);
+}
+
 // The layer's own passes (src/fald.cpp CompileOne: the default flags; the hook compiles the same sources) hold no
 // `precise`: it propagates backwards through everything that feeds the marked value, so one in FadePost compiled ALL of
 // Correct and the passes around it precise (no mad) and moved the layer's output with the fade OFF (2026-10-22: 5 of the
@@ -604,7 +631,7 @@ TEST_CASE("FALD layer: no `precise` in the layer's compiled passes (the fade-OFF
     struct P { const char* name; const char* src; const char* target; };
     const P passes[] = { { "pixel", s.pixel, "ps_5_0" }, { "stat", s.stat, "cs_5_0" }, { "conv", s.conv, "cs_5_0" },
                          { "gain", s.gain, "cs_5_0" }, { "blur", s.blur, "cs_5_0" }, { "temporal", s.temporal, "cs_5_0" },
-                         { "panelClock", s.panelClock, "cs_5_0" }, { "boost", s.boost, "cs_5_0" },
+                         { "panelClock", s.panelClock, "cs_5_0" }, { "gainBlur", s.gainBlur, "cs_5_0" },
                          { "starStat", s.starStat, "cs_5_0" }, { "starWeight", s.starWeight, "cs_5_0" },
                          { "starPlan", s.starPlan, "cs_5_0" } };
     for (const P& p : passes) {

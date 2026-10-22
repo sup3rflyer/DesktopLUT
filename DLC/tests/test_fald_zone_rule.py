@@ -402,9 +402,9 @@ def test_hlsl_and_cpp_carry_the_zone_rule():
     assert stat.index("if (mc > boostDimNits) dim++;") < stat.index("powSum += exp(") < stat.index("gPow[tid.x] = powSum;")
     assert "groupshared float gPow[256];" in stat and "gPow[tid.x] += gPow[tid.x + stride];" in stat
     assert "bool second = (boostRule == 1u) ? (gPow[0] / (float)n >= boostMeanThresh) : (dimF > boostDimFrac);" in stat
-    assert "activeOut[uint2(cx, cy)] = (litF > boostLitFrac || second) ? 1.0f : 0.0f;" in stat
+    assert "bool active = litF > boostLitFrac || second;" in stat and "activeOut[uint2(cx, cy)] = active ? 1.0f : 0.0f;" in stat
     assert stat.count("if (boostN != 0u)") == 2                     # no LUT: neither summed nor written
-    for other in ("g_faldConvSource", "g_faldBoostSource", "g_faldPixelSource", "g_faldGainSource", "g_faldTemporalSource"):
+    for other in ("g_faldConvSource", "g_faldPixelSource", "g_faldGainSource", "g_faldTemporalSource"):
         assert "boostRule" not in part(other) and "boostMean" not in part(other)
     # the constants, FaldPanelParams and the loader live in shared/fald_panel.{h,cpp} since e7f542f (one parser for the
     # overlay and the DWM hook); FillCB and the dump stay in src/fald.cpp, the hook's FillCB writes the same words

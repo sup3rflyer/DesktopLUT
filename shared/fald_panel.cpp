@@ -231,6 +231,50 @@ float FaldBoostOfCount(const FaldPanelParams& p, unsigned int activeZones) {
     return b;
 }
 
+unsigned int FaldConvRowStride(unsigned int Wt, unsigned int S) { return 4u + ((Wt * S + 3u) & ~3u); }
+unsigned int FaldConvGroups(unsigned int sub, unsigned int S) { return (sub * sub + S - 1u) / S; }
+
+std::vector<float> FaldConvTableLayout(const std::vector<float>& table, unsigned int sub, unsigned int Wt, unsigned int Ht, unsigned int S) {
+    const unsigned int groups = FaldConvGroups(sub, S), stride = FaldConvRowStride(Wt, S);
+    std::vector<float> out((size_t)groups * Ht * stride, 0.0f);
+    bool nonNegative = true;   // a negative (or -0) tap: a skipped +0 term could change the sign of a zero sum -> full rows
+    for (float v : table) if (std::signbit(v)) { nonNegative = false; break; }
+    for (unsigned int g = 0; g < groups; g++)
+        for (unsigned int jj = 0; jj < Ht; jj++) {
+            float* row = &out[((size_t)g * Ht + jj) * stride];
+            int lo = (int)Wt, hi = -1;
+            for (unsigned int s = 0; s < S; s++) {
+                const unsigned int so = g * S + s;
+                if (so >= sub * sub) continue;
+                for (unsigned int ii = 0; ii < Wt; ii++) {
+                    const float v = table[((size_t)so * Ht + jj) * Wt + ii];
+                    row[4u + ii * S + s] = v;
+                    if (v != 0.0f) { if ((int)ii < lo) lo = (int)ii; if ((int)ii > hi) hi = (int)ii; }
+                }
+            }
+            if (!nonNegative) { lo = 0; hi = (int)Wt - 1; }
+            if (hi < lo) { lo = 1; hi = 0; }   // an all-zero row: an empty range
+            std::memcpy(&row[0], &lo, sizeof(int));
+            std::memcpy(&row[1], &hi, sizeof(int));
+        }
+    return out;
+}
+
+int g_faldConvVariantOverride = -1;
+int g_faldGainFusedOverride = -1;
+int g_faldPartialOverride = -1;
+
+unsigned int FaldConvVariant(unsigned int cols, unsigned int rows, unsigned int sub) {
+    (void)sub;
+    if (g_faldConvVariantOverride >= 0 && g_faldConvVariantOverride < 4) return (unsigned int)g_faldConvVariantOverride;
+    // The policy (RTX 5090, 2026-10-22, DLC/results/fald_core_speed_2026-10-22): a thread per sub-offset (S = 1) keeps
+    // the most threads in flight, which a large GPU needs on a small lattice (S = 2 lost 50 % at 1080p / 1440p); on a
+    // 48 x 48 lattice S = 2 won 14 % of the pass (73k threads still fill the 5090). S = 4 / 8 lost everywhere on it — they
+    // are for devices with far fewer thread slots, where the loads saved matter; a measured auto-tune is the long-term
+    // rule, this is the measured line on one device.
+    return (cols * rows >= 2048u) ? 1u : 0u;
+}
+
 bool FaldBoostZoneActive(const FaldPanelParams& p, const float* maxChannelNits, size_t n) {
     if (!maxChannelNits || n == 0) return false;
     size_t lit = 0, dim = 0;

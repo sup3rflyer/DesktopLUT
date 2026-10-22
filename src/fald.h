@@ -22,6 +22,7 @@
 #include "../shared/fald_panel.h"
 #include "../shared/fald_exempt.h"   // FaldExemptRect: DesktopLUT's own windows, exempt from the FALD views
 #include "../shared/fald_fade_governor.h"   // the flank fade's safety governor (FaldResources::fadeGov)
+#include "../shared/fald_change.h"          // the change-driven path: touched zones, the rules, the argument slots
 
 struct MonitorContext;
 struct FaldSettings;
@@ -89,8 +90,12 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     unsigned int clkRetryCounter = 0;        // frames since the clock textures failed to create (retry every ~300, like Build)
     // panel tables
     ID3D11Texture2D* curveTex = nullptr;   ID3D11ShaderResourceView* curveSRV = nullptr;
-    ID3D11Buffer* kTrueBuf = nullptr;      ID3D11ShaderResourceView* kTrueSRV = nullptr;
-    ID3D11Buffer* kEstBuf = nullptr;       ID3D11ShaderResourceView* kEstSRV = nullptr;
+    // the conv pass's kernel tables, re-laid out for its variant (shared/fald_panel.h FaldConvTableLayout; one float view
+    // at t2 / t3, one float4 view of the same buffer at t36 / t37)
+    ID3D11Buffer* kTrueBuf = nullptr;      ID3D11ShaderResourceView* kTrueSRV = nullptr; ID3D11ShaderResourceView* kTrue4SRV = nullptr;
+    ID3D11Buffer* kEstBuf = nullptr;       ID3D11ShaderResourceView* kEstSRV = nullptr;  ID3D11ShaderResourceView* kEst4SRV = nullptr;
+    unsigned int convVariant = 0;          // FaldConvVariant at Build: 0..3 <-> 1 / 2 / 4 / 8 sub-offsets per thread
+    bool gainFused = false;                // FaldGainBlurFused at Build: passes 2b + 2c in one dispatch into gainB (gainA unused)
     // per-frame fields
     ID3D11Texture2D* driveTex = nullptr;   ID3D11UnorderedAccessView* driveUAV = nullptr;  ID3D11ShaderResourceView* driveSRV = nullptr;
     ID3D11Texture2D* bTrueTex = nullptr;   ID3D11UnorderedAccessView* bTrueUAV = nullptr;  ID3D11ShaderResourceView* bTrueSRV = nullptr;
@@ -107,6 +112,25 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* activeTex[2] = {}; ID3D11UnorderedAccessView* activeUAV[2] = {}; ID3D11ShaderResourceView* activeSRV[2] = {};
     ID3D11Texture2D* boostTex[2] = {};  ID3D11UnorderedAccessView* boostUAV[2] = {};  ID3D11ShaderResourceView* boostSRV[2] = {};
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
+    // the statistic pass's non-black zone counters, one per round (zeroed at creation; + (new - old) per finished zone)
+    ID3D11Buffer* boostCountBuf = nullptr; ID3D11UnorderedAccessView* boostCountUAV = nullptr;
+    // The change-driven path (shared/fald_change.h). Round 0's own drive / filtered drive / fields (round 1's are the
+    // textures above, which the dump and the tests read as before); the touched-zone list the sweeps read on the partial
+    // path; the change flags the sweeps and the LED-lag passes set and the decide pass reads; the indirect arguments the
+    // decide pass writes; what the previous run left behind.
+    ID3D11Texture2D* drive0Tex = nullptr; ID3D11UnorderedAccessView* drive0UAV = nullptr; ID3D11ShaderResourceView* drive0SRV = nullptr;
+    ID3D11Texture2D* driveFilt0Tex = nullptr; ID3D11UnorderedAccessView* driveFilt0UAV = nullptr; ID3D11ShaderResourceView* driveFilt0SRV = nullptr;
+    ID3D11Texture2D* bTrue0Tex = nullptr; ID3D11UnorderedAccessView* bTrue0UAV = nullptr; ID3D11ShaderResourceView* bTrue0SRV = nullptr;
+    ID3D11Texture2D* bEst0Tex = nullptr;  ID3D11UnorderedAccessView* bEst0UAV = nullptr;  ID3D11ShaderResourceView* bEst0SRV = nullptr;
+    ID3D11Texture2D* gain0Tex = nullptr;  ID3D11UnorderedAccessView* gain0UAV = nullptr;  ID3D11ShaderResourceView* gain0SRV = nullptr;
+    ID3D11Buffer* zoneListBuf = nullptr; ID3D11ShaderResourceView* zoneListSRV = nullptr;   // dynamic, cols * rows uints
+    ID3D11Buffer* changeFlagsBuf = nullptr; ID3D11UnorderedAccessView* changeFlagsUAV = nullptr;   // 3 uints, zeroed
+    ID3D11Buffer* argsBuf = nullptr; ID3D11UnorderedAccessView* argsUAV = nullptr;   // FALD_ARGS_BYTES, raw, indirect
+    uint32_t runMode = 0;                  // CB word 79 of the next FillCB (fald_shader.h runMode)
+    bool stateComplete = false;            // the previous run left every texture of a complete run (FaldChangeInputs)
+    unsigned long long lastSettingsKey = 0, lastFrameKey = 0;   // of the previous run
+    bool lastPartial = false;              // the previous run took the partial path (the dump, the tests)
+    std::vector<uint32_t> touched;         // the touched-zone list of the current run
     // zone sweeps (work guide C14; fald_shader.h above ZoneSlices): slices per zone, and for a lattice of more than one
     // the slice partials the statistic / S0 passes write and their combine variants fold (u2); null for one slice
     unsigned int zoneSlices = 1;
@@ -166,8 +190,8 @@ bool InitFaldShaders();
 // another set — the frozen pre-fractional-pitch copy (tests/fald_shader_legacy.h) — to hold the current shaders to it
 // bit for bit on integer lattices. Release the shaders (ReleaseFaldShaders) before compiling another set.
 struct FaldShaderSources {
-    const char* common; const char* stat; const char* conv; const char* gain; const char* blur; const char* temporal;
-    const char* panelClock; const char* boost; const char* starStat; const char* starWeight; const char* starPlan;
+    const char* common; const char* stat; const char* conv; const char* gain; const char* blur; const char* gainBlur; const char* temporal;
+    const char* panelClock; const char* starStat; const char* starWeight; const char* starPlan; const char* decide;
     const char* zoneCombineDefine; const char* pixel;
 };
 FaldShaderSources FaldDefaultShaderSources();
@@ -196,8 +220,16 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // with the flank fade on and LED lag off, a run without new content on the frame the last reach was formed from, under
 // the same settings, reuses both rounds' reach (shared/fald_fade.h FaldFadeReachCurrent) — the fields are a pure
 // function of that frame then.
+// rects / numRects (shared/fald_change.h, the change-driven path): the frame regions that changed since the previous run
+// — the caller's promise that nothing outside them differs from the frame of the previous run. numRects < 0 = unknown
+// (every pass runs); 0 = nothing changed. Without rects, a run without new content on the frame of the previous run
+// (frameKey equal) is taken as "nothing changed". When the rules allow it (FaldChangeDecide) the sweeps run on the touched
+// zones only and the GPU decides what else has to run (the decide pass + indirect dispatches); the pixel pass draws the
+// whole target as always (this path's swap chain gets a whole frame per present). Bit for bit the full run.
 #define FALD_RUN_HAS_FRAME_KEY 1
-void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true, unsigned long long frameKey = 0);
+#define FALD_RUN_HAS_RECTS 1
+void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent = true, unsigned long long frameKey = 0,
+                   const FaldChangeRect* rects = nullptr, int numRects = -1);
 // True while the temporal drive state still owes settle frames after the last content change (render thread).
 // The render loop then re-runs ONLY the FALD passes on the layer's own intermediate (the main pass output of the
 // last frame) and presents — no Desktop Duplication read (the released frame texture is not a valid source; HW
@@ -214,6 +246,24 @@ void FaldReleaseResources(MonitorContext* ctx);
 extern std::atomic<bool> g_faldFadeForce;
 // The governor's status per monitor and mode, for the interface and the pipe (src/fald_fade_status.h reads both paths).
 void FaldFadeGovPublish(int monitorIndex, bool hdr, const FaldFadeGovernorStatus& st);
+
+// Test seam (tests/test_fald_fade_hw.cpp FALD_HW_PROFILE_CORE=1): a hook called before and after every GPU command of
+// FaldRunPasses, so a harness can put timestamp queries around each pass. Null in production: one pointer test per pass.
+enum FaldCorePass : unsigned int {
+    FALD_PASS_STAR_S0 = 0, FALD_PASS_STAR_S1, FALD_PASS_STAR_S2, FALD_PASS_FADE_FRAME, FALD_PASS_CLOCK,
+    FALD_PASS_STAT0, FALD_PASS_TEMPORAL0, FALD_PASS_CONV0, FALD_PASS_GAIN0, FALD_PASS_BLURH0,
+    FALD_PASS_BLURV0, FALD_PASS_COPY0, FALD_PASS_FADE_REACH0,
+    FALD_PASS_STAT1, FALD_PASS_TEMPORAL1, FALD_PASS_CONV1, FALD_PASS_GAIN1, FALD_PASS_BLURH1,
+    FALD_PASS_BLURV1, FALD_PASS_COPY1, FALD_PASS_FADE_REACH1,
+    FALD_PASS_COMMIT, FALD_PASS_PIXEL, FALD_PASS_DECIDE_S, FALD_PASS_DECIDE0, FALD_PASS_DECIDE1, FALD_PASS_COUNT
+};
+const char* FaldCorePassName(unsigned int pass);
+struct FaldCorePassHook {
+    virtual void Before(ID3D11DeviceContext* ctx, unsigned int pass) = 0;
+    virtual void After(ID3D11DeviceContext* ctx, unsigned int pass) = 0;
+};
+extern FaldCorePassHook* g_faldCorePassHook;
+#define FALD_CORE_HAS_PASS_HOOK 1
 
 // DesktopLUT's own windows, exempt from the FALD views (shared/fald_exempt.h): the host's list in desktop pixels (the GUI
 // thread sets it while a view is on, empty otherwise; FaldRunPasses and the hook's shared config read it). Any thread.

@@ -141,13 +141,22 @@ struct HookMonitor {
     }
     // One present. newContent: DWM composed a new frame (one full-frame dirty rect); false = a present with no dirty rect.
     // Returns the run's state; out / fields are read only when asked.
-    struct Result { bool ran = false, fadeOn = false; uint32_t word75 = 0xFFFFFFFFu; FaldFade* fade = nullptr; std::string err;
+    struct Result { bool ran = false, fadeOn = false, partial = false; uint32_t word75 = 0xFFFFFFFFu; FaldFade* fade = nullptr; std::string err;
                     unsigned int govState = 0; };
     bool forceFade = true;   // the governor forced on (false: it decides — on WARP that is "weak GPU": never on)
     bool fadeWanted = true;  // the flank fade setting (faldFlags bit 8)
-    Result Present(bool newContent, bool readCB) {
+    // rects: this present's dirty rects (the frame already edited inside them); null = a full-frame rect (new content) or none
+    Result Present(bool newContent, bool readCB, const std::vector<RECT>* rects = nullptr) {
         Result r;
-        if (newContent) w.ic->UpdateSubresource(back, 0, nullptr, frame.data(), W * 8u, 0);
+        // DWM composes only the dirty rects into its back buffer (elsewhere it holds the previous output); with rects, the
+        // stand-in gets exactly those regions of the frame
+        if (newContent && !rects) w.ic->UpdateSubresource(back, 0, nullptr, frame.data(), W * 8u, 0);
+        else if (rects)
+            for (const RECT& rc : *rects) {
+                if (rc.right <= rc.left || rc.bottom <= rc.top) continue;
+                D3D11_BOX box = { (UINT)rc.left, (UINT)rc.top, 0, (UINT)rc.right, (UINT)rc.bottom, 1 };
+                w.ic->UpdateSubresource(back, 0, &box, frame.data() + ((size_t)rc.top * W + (size_t)rc.left) * 8u, W * 8u, 0);
+            }
         FaldMonitor* m = FaldAcquire(0, 0, hdr, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (!m) { r.err = "FaldAcquire: no layer"; return r; }
 #ifdef FALD_RUN_HAS_FRAME_KEY
@@ -157,13 +166,24 @@ struct HookMonitor {
         FaldSetLiveSettings(m, 0, 0, star, nullptr, true);
 #endif
         RECT full = { 0, 0, (LONG)W, (LONG)H };
-        if (!FaldUpdateClean(m, back, newContent ? &full : nullptr, newContent ? 1 : 0)) {
+        const RECT* rc = rects ? rects->data() : (newContent ? &full : nullptr);
+        const int nrc = rects ? (int)rects->size() : (newContent ? 1 : 0);
+        if (!FaldUpdateClean(m, back, rc, nrc)) {
             FaldReturn(m);
             FaldMarkStale(0, 0);
             r.err = "unprimed";
             return r;
         }
-        w.ic->CopyResource(FaldIntermediateTexture(m), FaldCleanTexture(m));   // no LUT, no tone map (RenderLUT)
+        // no LUT, no tone map (RenderLUT): the whole clean copy into the intermediate, or this present's rects only on the
+        // change-driven path (hook_render.cpp)
+        const bool partial = FaldPlanPartial(m, 0x9E3779B97F4A7C15ull);
+        if (partial) {
+            for (int i = 0; i < nrc; i++) {
+                D3D11_BOX box = { (UINT)rc[i].left, (UINT)rc[i].top, 0, (UINT)rc[i].right, (UINT)rc[i].bottom, 1 };
+                w.ic->CopySubresourceRegion(FaldIntermediateTexture(m), 0, (UINT)rc[i].left, (UINT)rc[i].top, 0, FaldCleanTexture(m), 0, &box);
+            }
+        } else w.ic->CopyResource(FaldIntermediateTexture(m), FaldCleanTexture(m));
+        r.partial = partial;
 #ifdef FALD_RUN_HAS_FRAME_KEY
         r.ran = FaldRun(m, backRTV, newContent, 0x9E3779B97F4A7C15ull);   // hook_render.cpp's key for "no LUT pass"
         r.govState = FaldTestFadeGovState(m);
@@ -456,6 +476,58 @@ TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay'
         delete w;
     }
     MESSAGE("hook vs overlay: " << equal << " of " << compared << " files byte-identical");
+}
+
+// The change-driven path in the hook (hook_fald.h FaldPlanPartial; shared/fald_change.h): presents with small dirty rects
+// after a full one, the layer run twice over the same sequence — once with the path forced off, once by its rules — and
+// the back buffer compared present for present (the overlay's case holds every field). The intermediate receives only the
+// rects on the partial path, as hook_render.cpp draws.
+TEST_CASE("FALD hook: the change-driven path equals the full path present for present (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cells = HookEnv("FALD_TEST_FADE_DIR");
+    if (cells.empty()) return;
+    const std::wstring C = OwnerPanelPath(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
+    REQUIRE_FALSE(C.empty());
+    struct Step { RECT rc; uint16_t value; const char* what; };
+    const Step steps[] = {
+        { { 1000, 1500, 1040, 1530 }, 0x0400, "a dark 40 x 30 patch: no drive moves" },
+        { { 300, 300, 500, 500 }, 0x3C00, "a 200 x 200 white patch: drives move" },
+        { { 0, 0, 1, 1 }, 0x0000, "the kick pixel (no content change)" },
+        { { 300, 300, 500, 500 }, 0x0000, "the white patch to black" },
+        { { 2000, 1000, 2002, 1002 }, 0x3C00, "a 2 x 2 white speck" },
+    };
+    for (int star = 0; star < 2; star++) {
+        std::vector<std::vector<unsigned char>> outs[2];
+        int partialPresents = 0;
+        for (int forced = 0; forced < 2; forced++) {
+            g_faldPartialOverride = forced == 0 ? 0 : -1;
+            HookWarp w;
+            REQUIRE(w.ok);
+            Staged staged(C, true);
+            REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+            HookMonitor hm(w, 3840, 2160, true, star != 0);
+            hm.fadeWanted = false;
+            REQUIRE(hm.Load(cells + "/n7_lamp.rgba16f"));
+            HookMonitor::Result r;
+            for (int i = 0; i < 3; i++) { r = hm.Present(true, false); if (r.ran) break; }   // primed on the first full present
+            REQUIRE_MESSAGE(r.ran, r.err);
+            outs[forced].push_back(ReadBackTex(w.dev, w.ic, hm.back));
+            for (const Step& s : steps) {
+                for (LONG y = s.rc.top; y < s.rc.bottom; y++)
+                    for (LONG x = s.rc.left; x < s.rc.right; x++)
+                        for (int c = 0; c < 3; c++) std::memcpy(&hm.frame[((size_t)y * 3840 + x) * 8 + c * 2], &s.value, 2);
+                std::vector<RECT> rects = { s.rc };
+                r = hm.Present(true, false, &rects);
+                REQUIRE_MESSAGE(r.ran, std::string(s.what) << ": " << r.err);
+                if (forced == 1 && r.partial) partialPresents++;
+                outs[forced].push_back(ReadBackTex(w.dev, w.ic, hm.back));
+            }
+            g_faldPartialOverride = -1;
+        }
+        REQUIRE(outs[0].size() == outs[1].size());
+        for (size_t i = 0; i < outs[0].size(); i++)
+            CHECK_MESSAGE(outs[0][i] == outs[1][i], "star " << star << ": present " << i << " differs between the full and the change-driven path");
+        CHECK_MESSAGE(partialPresents == (int)(sizeof(steps) / sizeof(steps[0])), "star " << star << ": every present after the first should be partial (" << partialPresents << ")");
+    }
 }
 
 #ifdef FALD_RUN_HAS_FRAME_KEY

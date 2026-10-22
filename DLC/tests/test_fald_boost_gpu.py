@@ -308,8 +308,7 @@ def test_emulator_two_round_boost_matches_correct_image_pa32ucxr_frame(tmp_path)
 def test_hlsl_boost_passes_mirror_the_reference():
     src = _SHADER.read_text(encoding="utf-8")
     part = lambda name: re.search(name + r' = R"\((.*?)\)";', src, re.S).group(1)
-    common, stat, boost, conv, pixel = (part(n) for n in ("g_faldCommonSource", "g_faldStatSource", "g_faldBoostSource",
-                                                          "g_faldConvSource", "g_faldPixelSource"))
+    common, stat, conv, pixel = (part(n) for n in ("g_faldCommonSource", "g_faldStatSource", "g_faldConvSource", "g_faldPixelSource"))
     assert "float lumFadeLo; float lumFadeHi; uint boostN; uint starOn;" in common                # CB word 34 (35: S1)
     assert "float boostLitNits; float boostLitFrac; float boostDimNits; float boostDimFrac;" in common   # CB words 48-51
     assert common.index("uint tempMode; uint tempInit;") < common.index("float boostLitNits;")
@@ -321,16 +320,23 @@ def test_hlsl_boost_passes_mirror_the_reference():
     assert "float mc = max(img.r, max(img.g, img.b));" in stat and "if (mc > boostDimNits) dim++;" in stat
     # the second criterion is the file's zone rule since C12b (tests/test_fald_zone_rule.py): rule 0 = DIM, as before
     assert "bool second = (boostRule == 1u) ? (gPow[0] / (float)n >= boostMeanThresh) : (dimF > boostDimFrac);" in stat
-    assert "activeOut[uint2(cx, cy)] = (litF > boostLitFrac || second) ? 1.0f : 0.0f;" in stat
+    assert "bool active = litF > boostLitFrac || second;" in stat and "activeOut[uint2(cx, cy)] = active ? 1.0f : 0.0f;" in stat
     assert "if (px >= frameW || py >= frameH) continue;" in stat
     assert stat.count("if (boostN != 0u)") == 2                     # no LUT: neither counted nor written
-    # boost pass: count -> last step whose first count is <= N, 1 below the first
-    assert "if (activeTex.Load(int3(x, y, 0)) > 0.5f) count++;" in boost
-    assert "if ((float)count < boostLut[2 * i]) break;" in boost and "b = boostLut[2 * i + 1];" in boost
-    assert "float b = 1.0f;" in boost and "boostOut[uint2(0, 0)] = b;" in boost
+    # the boost (2026-10-22, fald/core-speed: no pass of its own): every finished zone adds (new flag - old flag) to the
+    # round's persistent count, so N follows the flag map whether the sweep is full or partial; the decide pass after the
+    # sweep walks the staircase by that N -> last step whose first count is <= N, 1 below the first
+    assert "uint newA = active ? 1u : 0u, oldA = (activeOut[uint2(cx, cy)] > 0.5f) ? 1u : 0u;" in stat
+    assert "InterlockedAdd(boostCount[roundIdx], newA - oldA);" in stat
+    assert stat.index("InterlockedAdd(boostCount[roundIdx], newA - oldA);") < stat.index("activeOut[uint2(cx, cy)] = active ? 1.0f : 0.0f;")
+    decide = part("g_faldDecideSource")
+    assert "uint count = boostCount[roundIdx];" in decide and "if (boostN != 0u && roundIdx < 2u) {" in decide
+    assert "if ((float)count < boostLut[2 * i]) break;" in decide and "b = boostLut[2 * i + 1];" in decide
+    assert "float b = 1.0f;" in decide and "boostOut[uint2(0, 0)] = b;" in decide and "boostOut[uint2(1, 0)] = (float)count;" in decide
     # conv pass: B_true only
-    assert "if (boostN != 0u) accT *= boostTex.Load(int3(0, 0, 0));" in conv and "accE *=" not in conv
-    assert conv.index("accT *= boostTex") < conv.index("bTrueOut[uint2(fx, fy)] = accT;")
+    # (2026-10-22, fald/core-speed: a thread holds FALD_CONV_SO accumulators per field; the boost still scales B_true only)
+    assert "float b = boostTex.Load(int3(0, 0, 0));" in conv and "accT[s1] *= b;" in conv and "accE[s1] *=" not in conv and "accE *=" not in conv
+    assert conv.index("accT[s1] *= b;") < conv.index("bTrueOut[uint2(fx, fy)] = accT[s2];")
     assert "if (debugMode == 8)" in pixel
     # C++: the CB size, the file constants, the boost-free flat-lattice pass. The CB size, the file constants and the
     # loader live in shared/fald_panel.{h,cpp} (one parser for both paths); the passes stay in src/fald.cpp (overlay)
@@ -345,5 +351,8 @@ def test_hlsl_boost_passes_mirror_the_reference():
     for cpp, v in ((c, "r"), (hook, "m")):                              # both paths read the file with the shared loader
         assert "LoadFaldPanelParams(" in cpp
         assert f"FillCB({v}, 0, 0, false);" in cpp and f"RunConv({v}, {v}->driveSRV, {v}->driveSRV, nullptr);" in cpp
-        assert cpp.index(f"RunStat({v}, 0);") < cpp.index(f"RunBoost({v}, 0);") < cpp.index(f"RunConv({v}, trueDrive, estDrive, {v}->boostSRV[0]);")
-        assert cpp.index(f"RunStat({v}, 1);") < cpp.index(f"RunBoost({v}, 1);") < cpp.index(f"RunConv({v}, trueDrive, estDrive, {v}->boostSRV[1]);")
+        assert "RunBoost(" not in cpp                                      # the statistic pass finishes the boost (2026-10-22)
+        # (2026-10-22: the sweep, then the decide pass that finishes the round's boost, then the convolution that reads it)
+        assert cpp.index(f"RunStat({v}, 0);") < cpp.index(f"RunDecide({v}, 0);") < cpp.index(f"RunConv({v}, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), {v}->boostSRV[0]")
+        assert cpp.index(f"RunStat({v}, 1);") < cpp.index(f"RunDecide({v}, 1);") < cpp.index(f"RunConv({v}, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), {v}->boostSRV[1]")
+        assert f"{v}->boostCountUAV, nullptr," in cpp and f"{v}->boostCountUAV, {v}->boostUAV[which & 1u], {v}->changeFlagsUAV, {v}->argsUAV" in cpp

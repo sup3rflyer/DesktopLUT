@@ -15,6 +15,7 @@
 #include "../src/globals.h"
 #include "../shared/fald_shader.h"
 #include "../shared/fald_fade.h"
+#include "../shared/fald_change.h"
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <algorithm>
@@ -159,10 +160,9 @@ RWStructuredBuffer<uint> o : register(u0);
     ~HwHeater() { for (IUnknown* p : { (IUnknown*)cs, (IUnknown*)uav, (IUnknown*)buf, (IUnknown*)cb }) if (p) p->Release(); }
 };
 
-#ifdef FALD_FADE_HAS_PASS_HOOK
-// FALD_HW_PROFILE=1: a timestamp before and after every fade pass of the timed content frames (fade on), summed per
-// kernel -> <out>/profile_<case>.csv (the timestamps serialise the passes a little: shares, not a frame time).
-struct HwProfiler : FaldFadePassHook {
+// A ring of timestamp pairs around passes (the fade's kernels or the core's passes): summed per kernel over the frames
+// collected -> a CSV (the timestamps serialise the passes a little: shares, not a frame time).
+struct HwStampRing {
     static const int kMax = 1024;
     ID3D11Query* q[2 * kMax] = {};
     unsigned int kern[kMax] = {};
@@ -171,18 +171,20 @@ struct HwProfiler : FaldFadePassHook {
     std::vector<double> sumUs;
     std::vector<unsigned long long> count;
     int frames = 0;
-    explicit HwProfiler(ID3D11Device* dev) : sumUs(FaldFadeKernelCount(), 0.0), count(FaldFadeKernelCount(), 0) {
+    const char* (*name)(unsigned int);
+    HwStampRing(ID3D11Device* dev, unsigned int kernels, const char* (*nameFn)(unsigned int))
+        : sumUs(kernels, 0.0), count(kernels, 0), name(nameFn) {
         D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP, 0 };
         for (auto& x : q) dev->CreateQuery(&qd, &x);
     }
-    ~HwProfiler() { for (auto& x : q) if (x) x->Release(); }
-    void Before(ID3D11DeviceContext* ctx, unsigned int k) override {
-        if (!on || n >= kMax) return;
+    ~HwStampRing() { for (auto& x : q) if (x) x->Release(); }
+    void Before(ID3D11DeviceContext* ctx, unsigned int k) {
+        if (!on || n >= kMax || k >= sumUs.size()) return;
         kern[n] = k;
         ctx->End(q[2 * n]);
     }
-    void After(ID3D11DeviceContext* ctx, unsigned int) override {
-        if (!on || n >= kMax) return;
+    void After(ID3D11DeviceContext* ctx, unsigned int k) {
+        if (!on || n >= kMax || k >= sumUs.size()) return;
         ctx->End(q[2 * n + 1]);
         n++;
     }
@@ -197,12 +199,31 @@ struct HwProfiler : FaldFadePassHook {
         if (n) frames++;
         n = 0;
     }
+    void Reset() { std::fill(sumUs.begin(), sumUs.end(), 0.0); std::fill(count.begin(), count.end(), 0ull); frames = 0; n = 0; }
     void Write(const std::string& path) const {
         std::ofstream f(path);
-        f << "kernel,dispatches_per_frame,us_per_frame\n";
+        f << "kernel,dispatches_per_frame,us_per_frame,frames\n";
         for (size_t k = 0; k < sumUs.size(); k++)
-            if (count[k]) f << FaldFadeKernelName((unsigned int)k) << "," << (double)count[k] / frames << "," << sumUs[k] / frames << "\n";
+            if (count[k]) f << name((unsigned int)k) << "," << (double)count[k] / frames << "," << sumUs[k] / frames << "," << frames << "\n";
     }
+};
+
+#ifdef FALD_FADE_HAS_PASS_HOOK
+// FALD_HW_PROFILE=1: a timestamp before and after every fade pass of the timed content frames (fade on), summed per
+// kernel -> <out>/profile_<case>.csv.
+struct HwProfiler : FaldFadePassHook, HwStampRing {
+    explicit HwProfiler(ID3D11Device* dev) : HwStampRing(dev, FaldFadeKernelCount(), FaldFadeKernelName) {}
+    void Before(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::Before(ctx, k); }
+    void After(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::After(ctx, k); }
+};
+#endif
+#ifdef FALD_CORE_HAS_PASS_HOOK
+// FALD_HW_PROFILE_CORE=1: the same around every pass of the layer itself (src/fald.h FaldCorePass), for the content
+// AND the still runs, fade off and on -> <out>/profile_core_<case>_fade<f>_<phase>.csv.
+struct HwCoreProfiler : FaldCorePassHook, HwStampRing {
+    explicit HwCoreProfiler(ID3D11Device* dev) : HwStampRing(dev, FALD_PASS_COUNT, FaldCorePassName) {}
+    void Before(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::Before(ctx, k); }
+    void After(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::After(ctx, k); }
 };
 #endif
 
@@ -263,6 +284,20 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
     if (profile) g_faldFadePassHook = &prof;
     struct ClearHook { ~ClearHook() { g_faldFadePassHook = nullptr; } } clearHook;
 #endif
+#ifdef FALD_CORE_HAS_PASS_HOOK
+    const bool profileCore = HwEnv("FALD_HW_PROFILE_CORE") == "1";
+    HwCoreProfiler coreProf(hw.dev);
+    if (profileCore) g_faldCorePassHook = &coreProf;
+    struct ClearCoreHook { ~ClearCoreHook() { g_faldCorePassHook = nullptr; } } clearCoreHook;
+#endif
+    // FALD_HW_FADE = 0 / 1: only that setting of the flank fade (default: off then on)
+    const std::string fadeSel = HwEnv("FALD_HW_FADE");
+    // FALD_HW_CONV_SO = 1 / 2 / 4 / 8: the conv pass's sub-offsets-per-thread variant (default: the hosts' policy)
+    {
+        const std::string so = HwEnv("FALD_HW_CONV_SO");
+        g_faldConvVariantOverride = so == "1" ? 0 : so == "2" ? 1 : so == "4" ? 2 : so == "8" ? 3 : -1;
+        MESSAGE("conv variant override: " << g_faldConvVariantOverride);
+    }
     const std::wstring C = HwOwnerPanel(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
     REQUIRE_FALSE(C.empty());
     auto widen = [](const std::string& s) { return std::wstring(s.begin(), s.end()); };
@@ -290,6 +325,7 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             frames.push_back(std::move(m));
         }
         for (int fade = 0; fade < 2 && !stop; fade++) {
+            if ((fadeSel == "0" && fade != 0) || (fadeSel == "1" && fade != 1)) continue;
             MonitorContext ctx;
             ctx.width = hc.w; ctx.height = hc.h; ctx.isHDREnabled = true; ctx.isFP16SDR = false;
             ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 41.708f;   // a 23.976 Hz grid
@@ -305,12 +341,19 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             REQUIRE(SUCCEEDED(hw.dev->CreateRenderTargetView(target, nullptr, &rtv)));
             unsigned long long key = 100;
             int frameIdx = 0;
-            auto run = [&](const char* phase, int i, bool newContent) -> bool {
+            // the change-driven path's presents (FALD_HW_PARTIAL=1): a frame edited inside a rect, run with that rect
+            std::vector<uint16_t> edited;
+            std::vector<FaldChangeRect> prects;
+            int partialRuns = 0;
+            auto run = [&](const char* phase, int i, bool newContent, const std::vector<FaldChangeRect>* rects = nullptr) -> bool {
                 D3D11_VIEWPORT vp = { 0, 0, (float)hc.w, (float)hc.h, 0, 1 };
                 hw.ic->RSSetViewports(1, &vp);
                 hw.ic->VSSetShader(hw.vs, nullptr, 0);
                 hw.ic->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-                if (newContent) {
+                if (rects) {                                        // the edited frame (the upload is not part of the run)
+                    hw.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, edited.data(), (UINT)hc.w * 8u, 0);
+                    key++;
+                } else if (newContent) {
                     hw.ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frames[(size_t)frameIdx % frames.size()].data(), (UINT)hc.w * 8u, 0);
                     frameIdx++;
                     key++;
@@ -322,9 +365,17 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
 #ifdef FALD_FADE_HAS_PASS_HOOK
                 prof.on = profile && fade && std::strcmp(phase, "content") == 0;
 #endif
+#ifdef FALD_CORE_HAS_PASS_HOOK
+                coreProf.on = profileCore && (std::strcmp(phase, "content") == 0 || std::strcmp(phase, "still") == 0);
+#endif
 #ifdef FALD_RUN_HAS_FRAME_KEY
                 g_faldFadeForce.store(true);   // the governor measures but never pauses this harness
+#ifdef FALD_RUN_HAS_RECTS
+                FaldRunPasses(&ctx, rtv, newContent, key, rects ? rects->data() : nullptr, rects ? (int)rects->size() : -1);
+                if (ctx.fald->lastPartial) partialRuns++;
+#else
                 FaldRunPasses(&ctx, rtv, newContent, key);
+#endif
 #else
                 FaldRunPasses(&ctx, rtv, newContent);
 #endif
@@ -344,6 +395,10 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
 #ifdef FALD_FADE_HAS_PASS_HOOK
                 if (!dj.Disjoint && dj.Frequency) prof.Collect(hw.ic, dj.Frequency);
                 prof.on = false;
+#endif
+#ifdef FALD_CORE_HAS_PASS_HOOK
+                if (!dj.Disjoint && dj.Frequency) coreProf.Collect(hw.ic, dj.Frequency); else coreProf.n = 0;
+                coreProf.on = false;
 #endif
                 double gov = -1.0;
 #ifdef FALD_RUN_HAS_FRAME_KEY
@@ -379,14 +434,56 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             }
             for (int i = 0; i < 4 && !stop; i++) run("warm", i, true);
             for (int i = 0; i < n && !stop; i++) run("content", i, true);
+#ifdef FALD_CORE_HAS_PASS_HOOK
+            if (profileCore) {
+                coreProf.Write(out + "/profile_core_" + hc.id + "_fade" + std::to_string(fade) + "_content.csv");
+                coreProf.Reset();
+            }
+#endif
             for (int i = 0; i < n && !stop; i++) run("still", i, false);
+#ifdef FALD_RUN_HAS_RECTS
+            if (HwEnv("FALD_HW_PARTIAL") == "1" && !stop) {
+                // the frame of the last content run, edited inside a rect per phase; the first run of each phase is a full
+                // one (the state of the previous run has to be complete and the frame known), then the partial presents
+                edited = frames[(size_t)(frameIdx - 1) % frames.size()];
+                auto paint = [&](const FaldChangeRect& rc, uint16_t v) {
+                    for (int y = rc.top; y < rc.bottom; y++) for (int x = rc.left; x < rc.right; x++) for (int c = 0; c < 3; c++)
+                        edited[((size_t)y * hc.w + x) * 4 + c] = v;
+                };
+                struct PPhase { const char* name; FaldChangeRect rc; uint16_t v0, v1; };   // v1: toggled every other run (0xFFFF = no toggle)
+                const int cx = hc.w / 2, cy = hc.h / 2;
+                const PPhase phases[] = {
+                    { "part_none", { 0, 0, 0, 0 }, 0, 0xFFFF },                                   // no rect at all: the same frame
+                    { "part_kick", { 0, 0, 1, 1 }, 0xFFFF, 0xFFFF },                               // a 1 x 1 rect of unchanged pixels
+                    { "part_dark", { cx, cy, cx + 40, cy + 30 }, 0x0400, 0x0800 },                  // a 40 x 30 patch of ~0.004 / 0.008 nits
+                    { "part_bright", { cx - 100, cy - 100, cx + 100, cy + 100 }, 0x3C00, 0x0000 }, // 200 x 200 white, toggled
+                };
+                for (const PPhase& ph : phases) {
+                    partialRuns = 0;
+                    std::vector<FaldChangeRect> rects;
+                    if (ph.rc.right > ph.rc.left) rects.push_back(ph.rc);
+                    if (ph.v0 != 0xFFFF) paint(ph.rc, ph.v0);
+                    run("warm", 0, true, nullptr);                  // the frame as a whole (full), the state complete
+                    hw.ic->Flush();
+                    for (int i = 0; i < n && !stop; i++) {
+                        if (ph.v1 != 0xFFFF) paint(ph.rc, (i & 1) ? ph.v1 : ph.v0);
+                        if (!run(ph.name, i, true, &rects)) break;
+                    }
+                    MESSAGE(hc.id << " " << ph.name << ": " << partialRuns << " of " << n << " runs took the partial path");
+                }
+            }
+#endif
+#ifdef FALD_CORE_HAS_PASS_HOOK
+            if (profileCore) {
+                coreProf.Write(out + "/profile_core_" + hc.id + "_fade" + std::to_string(fade) + "_still.csv");
+                coreProf.Reset();
+            }
+#endif
             csv.flush();
 #ifdef FALD_FADE_HAS_PASS_HOOK
             if (profile && fade) {
                 prof.Write(out + "/profile_" + hc.id + ".csv");
-                std::fill(prof.sumUs.begin(), prof.sumUs.end(), 0.0);
-                std::fill(prof.count.begin(), prof.count.end(), 0ull);
-                prof.frames = 0;
+                prof.Reset();
             }
 #endif
             rtv->Release(); target->Release();
