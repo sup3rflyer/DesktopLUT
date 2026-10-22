@@ -1175,6 +1175,141 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 }
 )";
 
+// ---- the separable Gaussian in ONE pass for radii <= 16 (FadeGauss2D; per radius class TG_RMAX 4 / 8 / 12 / 16): a
+// group computes a 64 x 32 tile of outputs. The input region (64 + 2r) x (32 + 2r) is filled with GtTap's taps (the
+// up-sampling / the clamp as the vertical pass's), the vertical sums are formed for its 64 + 2r columns (the clamped
+// columns the horizontal pass reads) into groupshared memory, then the horizontal sums of those, then the store as
+// FadeGaussT's horizontal pass (fOp bit 1 sat, bits 4-6 the epilogue). Each output is FadeGaussT's vertical then
+// horizontal pass value for value (the same taps, the same order: GtSweep's, Kahan or plain by fOp bit 3) without the
+// full-resolution intermediate and with one dispatch instead of two.
+inline const char* g_faldFadeGauss2DSource = R"(
+RWTexture2D<float> g2dOut : register(u0);
+RWTexture2D<float> g2dIo : register(u1);
+#define G2_TW 64
+#define G2_TH 32
+#define G2_COLS (G2_TW + 2 * TG_RMAX)
+#define G2_S (G2_COLS + ((33 - (G2_COLS & 31)) & 31))
+#define G2_ROWS (G2_TH + 2 * TG_RMAX)
+groupshared float g2[G2_ROWS * G2_S];
+float G2Tap(int x, int y) {
+    float v = (fFactor > 1u) ? FadeUpAt(fIn0, int2(x, y), fC1) : fIn0.Load(int3(x, y, 0));
+    if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
+    return v;
+}
+// GtSweep along groupshared memory with a stride (`step` words between taps): outputs at base, base + step, ...
+void G2Sweep(int base, int step, int r, uint off, bool plain, out float o0, out float o1, out float o2, out float o3) {
+    const float w0 = fGW[off];
+    const float x0 = g2[base], x1 = g2[base + step], x2 = g2[base + 2 * step], x3 = g2[base + 3 * step];
+    precise float s0 = x0 * w0;
+    precise float s1 = x1 * w0;
+    precise float s2 = x2 * w0;
+    precise float s3 = x3 * w0;
+    precise float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+    float l0 = x0, l1 = x1, l2 = x2, q1 = x1, q2 = x2, q3 = x3;
+    if (plain) {
+        for (int j = 1; j <= r; j++) {
+            const float wj = fGW[off + (uint)j];
+            const float nl = g2[base - j * step], nr = g2[base + (3 + j) * step];
+            precise float t0 = (nl + q1) * wj;
+            precise float t1 = (l0 + q2) * wj;
+            precise float t2 = (l1 + q3) * wj;
+            precise float t3 = (l2 + nr) * wj;
+            s0 = s0 + t0; s1 = s1 + t1; s2 = s2 + t2; s3 = s3 + t3;
+            l2 = l1; l1 = l0; l0 = nl;
+            q1 = q2; q2 = q3; q3 = nr;
+        }
+    } else {
+        for (int j = 1; j <= r; j++) {
+            const float wj = fGW[off + (uint)j];
+            const float nl = g2[base - j * step], nr = g2[base + (3 + j) * step];
+            precise float t0 = (nl + q1) * wj;
+            precise float t1 = (l0 + q2) * wj;
+            precise float t2 = (l1 + q3) * wj;
+            precise float t3 = (l2 + nr) * wj;
+            FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
+            l2 = l1; l1 = l0; l0 = nl;
+            q1 = q2; q2 = q3; q3 = nr;
+        }
+    }
+    o0 = s0; o1 = s1; o2 = s2; o3 = s3;
+}
+void G2Store(int2 p, float s) {   // = FadeGaussT's GtStore
+    const uint e = (fOp >> 4) & 7u;
+    if (e == 0u) {
+        g2dOut[p] = s;
+    } else if (e == 1u) {
+        precise float w = 1.0f - s;
+        g2dOut[p] = w;
+    } else if (e == 2u) {
+        g2dOut[p] = FadeSmooth(FADE_CARE_LO, FADE_CARE_HI, s);
+    } else if (e == 3u) {
+        precise float f = g2dIo[p];
+        precise float v = min(max(f + s * (1.0f - f), 0.0f), 1.0f);
+        g2dIo[p] = v;
+    } else {
+        precise float f = g2dIo[p];
+        precise float v = f + fIn1.Load(int3(p, 0)) * max(s - f, 0.0f);
+        g2dIo[p] = min(max(v, 0.0f), 1.0f);
+    }
+}
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const int r = (int)fRadius;
+    const int W = (int)fInW, H = (int)fInH;
+    const int x0 = (int)gid.x * G2_TW, y0 = (int)gid.y * G2_TH;
+    const uint t = tid.x;
+    const bool plain = (fOp & 8u) != 0u;
+    const int cols = G2_TW + 2 * r, rows = G2_TH + 2 * r;
+    // 1. the taps: row j = input row clamp(y0 - r + j), column i = clamp(x0 - r + i) (consecutive threads: consecutive x)
+    for (uint e = t; e < (uint)(rows * cols); e += 256u) {
+        const int j = (int)(e / (uint)cols), i = (int)(e % (uint)cols);
+        g2[j * G2_S + i] = G2Tap(clamp(x0 - r + i, 0, W - 1), clamp(y0 - r + j, 0, H - 1));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // 2. the vertical sums: column i, output rows 4 g .. 4 g + 3 (tap row = output row + r) — kept in registers
+    float v[3][4];
+    [unroll] for (uint n = 0; n < 3u; n++) {
+        const uint e = t + 256u * n;
+        const int i = (int)(e % (uint)cols), g = (int)(e / (uint)cols);
+        if (g < G2_TH / 4) G2Sweep((4 * g + r) * G2_S + i, G2_S, r, fWOff, plain, v[n][0], v[n][1], v[n][2], v[n][3]);
+    }
+    GroupMemoryBarrierWithGroupSync();   // every tap read: the tile takes the vertical sums (row = output row)
+    [unroll] for (uint n2 = 0; n2 < 3u; n2++) {
+        const uint e = t + 256u * n2;
+        const int i = (int)(e % (uint)cols), g = (int)(e / (uint)cols);
+        if (g < G2_TH / 4) {
+            g2[(4 * g) * G2_S + i] = v[n2][0];
+            g2[(4 * g + 1) * G2_S + i] = v[n2][1];
+            g2[(4 * g + 2) * G2_S + i] = v[n2][2];
+            g2[(4 * g + 3) * G2_S + i] = v[n2][3];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // 3. the horizontal sums: row y (consecutive threads: consecutive rows, stride 1 mod 32), outputs 4 q .. 4 q + 3
+    float h[2][4];
+    [unroll] for (uint m = 0; m < 2u; m++) {
+        const uint e = t + 256u * m;
+        const int y = (int)(e % (uint)G2_TH), q = (int)(e / (uint)G2_TH);
+        G2Sweep(y * G2_S + r + 4 * q, 1, r, fWOff, plain, h[m][0], h[m][1], h[m][2], h[m][3]);
+        if ((fOp & 2u) != 0u) { h[m][0] = saturate(h[m][0]); h[m][1] = saturate(h[m][1]); h[m][2] = saturate(h[m][2]); h[m][3] = saturate(h[m][3]); }
+    }
+    GroupMemoryBarrierWithGroupSync();   // every vertical sum read: the tile takes the outputs (stride G2_TW + 1)
+    [unroll] for (uint m2 = 0; m2 < 2u; m2++) {
+        const uint e = t + 256u * m2;
+        const int y = (int)(e % (uint)G2_TH), q = (int)(e / (uint)G2_TH);
+        const int b = y * (G2_TW + 1) + 4 * q;
+        g2[b] = h[m2][0]; g2[b + 1] = h[m2][1]; g2[b + 2] = h[m2][2]; g2[b + 3] = h[m2][3];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    // 4. the store, consecutive threads: consecutive x
+    for (uint e = t; e < (uint)(G2_TW * G2_TH); e += 256u) {
+        const int a = (int)(e % (uint)G2_TW), y = (int)(e / (uint)G2_TW);
+        const int px = x0 + a, py = y0 + y;
+        if (px < W && py < H) G2Store(int2(px, py), g2[y * (G2_TW + 1) + a]);
+    }
+}
+)";
+
 // ---- the vertical pass of the four Gaussians of lv (sigma 4, 24, 2, 6 -> u0..u3) from ONE tile (sized for the largest,
 // fRadius); per Gaussian (radius, weights offset) packed (r << 16 | off) in fWOff, fN, fPad0, fPad1. Each is FadeGaussT's
 // vertical pass of lv, value for value.

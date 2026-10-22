@@ -519,8 +519,8 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
 // What ships contains no float mad: D3D lets a device run a mad fused or not, and fadeemu emulates the unfused order.
 TEST_CASE("FALD fade: the embedded bytecode is a fresh compile of the sources, with no float mad") {
     const unsigned int n = FaldFadeKernelCount();
-    REQUIRE(n == 39u);   // 17 passes + the tiled Gaussians (8 radius classes, lv's four, num / den Kahan + plain), max / min (8),
-                         // cone, FFT, mi's block reductions
+    REQUIRE(n == 43u);   // 17 passes + the tiled Gaussians (8 radius classes, lv's four, num / den Kahan + plain), max / min (8),
+                         // cone, FFT, mi's block reductions, the one-pass Gaussians (4 radius classes)
     std::vector<std::vector<unsigned char>> fresh(n);
     const auto t0 = std::chrono::steady_clock::now();
     for (unsigned int k = 0; k < n; k++) {

@@ -26,6 +26,7 @@ enum FadeKernel : unsigned int {
     K_CUT, K_WARPQ, K_TM, K_SELECT,
     K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2, K_GT2P,
     K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT, K_DOWNMI,
+    K_G2D4, K_G2D8, K_G2D12, K_G2D16,
     K_COUNT
 };
 struct KernelDef {
@@ -73,7 +74,11 @@ const KernelDef kKernels[K_COUNT] = {
     { "FadeExtT66", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 66\n" },
     { "FadeConeT", &g_faldFadeConeTSource, nullptr, "" },
     { "FadeFft", &g_faldFadeFftSource, nullptr, "" },
-    { "FadeDownMi", &g_faldFadeDownMiSource, nullptr, "" } };
+    { "FadeDownMi", &g_faldFadeDownMiSource, nullptr, "" },
+    { "FadeGauss2D4", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 4\n" },
+    { "FadeGauss2D8", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 8\n" },
+    { "FadeGauss2D12", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 12\n" },
+    { "FadeGauss2D16", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 16\n" } };
 
 unsigned int GaussKernel(int r) {
     switch (r) {
@@ -131,6 +136,8 @@ const unsigned int kFftMax = 1024;
 // results/fald_fade_tiers_2026-10-20 zc_gate1.py plain32 + small). NOT lv's four (they feed gradients: failed gate 1
 // on s10_ac_firewater) nor the T state's G1s. false = Kahan everywhere (Z1-Z8)
 const bool kPlainSums = true;
+// Gaussians of radius <= 16 (sigma <= 4) in one pass (FadeGauss2D, value for value the two passes); false = two passes
+const bool kGauss2D = true;
 
 // dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
 // order in double, w[r + j] / sum stored float32.
@@ -421,8 +428,28 @@ void GaussH(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& 
     b.out[0] = out ? out->uav : nullptr; b.out[1] = o.io ? o.io->uav : nullptr;
     Pass(f, ctx, GaussKernel(f->gwR[s]), c, b, Gd(tmp.w, 64), Gd(tmp.h, 16));
 }
+// Radii <= 16 in one pass (FadeGauss2D: the vertical sums stay in groupshared memory; tmp is not written), unless the
+// output is the input (an in-place Gaussian needs the intermediate)
+unsigned int Gauss2DKernel(int r) {
+    switch (r) {
+    case 4: return K_G2D4; case 8: return K_G2D8; case 12: return K_G2D12; case 16: return K_G2D16;
+    default: return K_COUNT;
+    }
+}
 void Gauss(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& in, unsigned int w, unsigned int h,
            const FadeTex& tmp, const FadeTex* out, const GOpt& o = GOpt()) {
+    const unsigned int s = SigmaIndex(sigma);
+    const unsigned int k2 = Gauss2DKernel(f->gwR[s]);
+    if (kGauss2D && k2 != K_COUNT && (!out || out->t != in.t)) {
+        FadeCBData c = Cb();
+        c.inW = w; c.inH = h; c.radius = (uint32_t)f->gwR[s]; c.wOff = f->gwOff[s];
+        c.op = (o.clampIn ? 1u : 0u) | (o.sat ? 2u : 0u) | (o.plain ? 8u : 0u) | (o.epi << 4);
+        if (o.up > 1u) { c.factor = o.up; c.c1 = 1.0f / (float)o.up; }
+        Io a; a.in[0] = in.srv; a.in[1] = o.epiIn ? o.epiIn->srv : nullptr;
+        a.out[0] = out ? out->uav : nullptr; a.out[1] = o.io ? o.io->uav : nullptr;
+        Pass(f, ctx, k2, c, a, Gd(w, 64), Gd(h, 32));
+        return;
+    }
     GaussV(f, ctx, sigma, in, w, h, tmp, o);
     GaussH(f, ctx, sigma, tmp, out, o);
 }
