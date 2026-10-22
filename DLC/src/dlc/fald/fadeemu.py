@@ -25,7 +25,8 @@ What is float32 GPU order here (and therefore in the HLSL):
   * min / max / clamp follow HLSL's NaN rule (a NaN operand yields the other one): ``np.fmin`` / ``np.fmax``;
   * every long sum (the separable Gaussians, the DFTs, the reductions) is Kahan-compensated: a plain float32 sigma-24
     Gaussian of ln L carries ~1e-6 of rounding, which the flank term's slope (up to 52 per unit gradient) turns into
-    ~2e-4 of fade — the size of the gate;
+    ~2e-4 of fade — the size of the gate; since Z9 (2026-10-22, PLAIN_ON) the Gaussians that feed thresholds and
+    blends rather than a gradient sum plainly (:func:`gauss_plain`), within gate 1's frozen tolerances;
   * the knee-cap fraction kc is evaluated as ln(a / K) / ln(g_eff) (= the twin's 1 - ln(ge) / ln(g_eff) in exact
     arithmetic): the twin's form has no float32 precision left as g_eff -> 1 (ge / g_eff = 1 +- 1 ulp);
   * the phase correlation is a dense DFT (sizes need not be powers of two) with float32 twiddle tables — since Z8
@@ -82,6 +83,11 @@ GROUP = 1024                         # threads of the one-group reductions (shar
 # dense Kahan DFT (FadeDft) everywhere — main eecda39's stack
 FFT_ON = True
 FFT_MAX = 1024
+# Z9 (2026-10-22, DLC results/fald_fade_tiers_2026-10-20 zc_gate1.py variants plain32 + small): plain float32 sums
+# (:func:`gauss_plain`, fald_fade.cpp kPlainSums / fald_fade_shader.h GtSweep's plain branch) on the Gaussians the fade
+# is insensitive to: raw, step, care, G3(g1), the push-pull's, num / den, CL's, the cone's, the lit floor's, the
+# reach's and its step map's. lv's four (they feed gradients) and the T state's stay Kahan. False = Kahan everywhere
+PLAIN_ON = True
 
 
 # ================================================================================================= HLSL scalar rules
@@ -188,6 +194,26 @@ def gauss(x, sigma):
     r, w = _gw(float(sigma))
     x = np.asarray(x, f32)
     return _gauss1d(_gauss1d(x, r, w, 0), r, w, 1)
+
+
+def _gauss1d_plain(x, r, w, axis):
+    n = x.shape[axis]
+    xp = _pad(x, r, axis)
+    sl = (lambda k: xp[r + k: r + k + n]) if axis == 0 else (lambda k: xp[:, r + k: r + k + n])
+    s = (sl(0) * w[0]).astype(f32)
+    for j in range(1, r + 1):
+        s = (s + ((sl(-j) + sl(j)) * w[j]).astype(f32)).astype(f32)
+    return s
+
+
+def gauss_plain(x, sigma):
+    """:func:`gauss` with plain float32 sums (Z9, PLAIN_ON): s = x0 w0; s = s + (x_-j + x_+j) w_j, each product and add
+    rounded (GtSweep's plain branch). With PLAIN_ON False it is :func:`gauss`."""
+    if not PLAIN_ON:
+        return gauss(x, sigma)
+    r, w = _gw(float(sigma))
+    x = np.asarray(x, f32)
+    return _gauss1d_plain(_gauss1d_plain(x, r, w, 0), r, w, 1)
 
 
 def _ext1d(x, r, axis, fn):
@@ -310,7 +336,7 @@ def pushpull(v, w, prior=PP_PRIOR, conf=PP_CONF, sig=1.0):
         Wt.append(down(Wt[-1], 2))
     E = (S[-1] / hmax(Wt[-1], f32(1e-12))).astype(f32)
     for lv in range(len(S) - 2, -1, -1):
-        Eu = gauss(up(E, 2, S[lv].shape), sig)
+        Eu = gauss_plain(up(E, 2, S[lv].shape), sig)
         a = hclamp(Wt[lv] * f32(conf), 0.0, 1.0)
         El = (S[lv] / hmax(Wt[lv], f32(1e-12))).astype(f32)
         E = (a * El + (f32(1.0) - a) * Eu).astype(f32)
@@ -351,29 +377,29 @@ def fade9(mi, keep: bool = False):
     # thin step flag with the robust (noise-floor) gate
     g1 = grad_mag(gauss(lv, 2.0))
     g2 = grad_mag(gauss(lv, 6.0))
-    nf = hmin(minf(gauss(g1, 3.0), RS_WIN), f32(RS_CAP))
+    nf = hmin(minf(gauss_plain(g1, 3.0), RS_WIN), f32(RS_CAP))
     lo_t = hmax(f32(RS_K_LO) * nf, f32(RS_LO))
     hi_t = hmax(f32(RS_K_HI) * nf, f32(RS_HI))
     t = hclamp((g1 - lo_t) / hmax(hi_t - lo_t, f32(1e-12)), 0.0, 1.0)
     gate = (t * t * (f32(3.0) - f32(2.0) * t)).astype(f32)
     thin = (smooth(RS_RATIO[0], RS_RATIO[1], (g1 / hmax(g2, f32(1e-9))).astype(f32)) * gate).astype(f32)
-    step = hclamp(gauss(maxf(thin, 2 * RMAX + 1), 4.0), 0.0, 1.0)
+    step = hclamp(gauss_plain(maxf(thin, 2 * RMAX + 1), 4.0), 0.0, 1.0)
     w = (f32(1.0) - step).astype(f32)
     # V8d: the step's own raw0 does not spread near a small dark object on a lit floor (cands12b.fade12b, fv_mode "m"):
     # src0 = raw0 (1 - (1 - w) V), V = clamp(up8(V8), 0, 1); raw = G4(maxf25(src0)) — raw is formed after w now
     v8 = floor_valley8(ms) if FV_ON else np.zeros((-(-H // FV_Q), -(-W // FV_Q)), f32)
     V = hclamp(up(v8, FV_Q, (H, W)), 0.0, 1.0)
     src0 = (raw0 * (f32(1.0) - (f32(1.0) - w) * V)).astype(f32)
-    raw = gauss(maxf(src0, 2 * RCLOSE + 1), 4.0)
-    care = smooth(CARE[0], CARE[1], gauss(ms, 2.0))
+    raw = gauss_plain(maxf(src0, 2 * RCLOSE + 1), 4.0)
+    care = smooth(CARE[0], CARE[1], gauss_plain(ms, 2.0))
     # push-pull + hybrid fill
     ws = (w * care).astype(f32)
     vsum = (raw * ws).astype(f32)
     wsum = ws
     v = ((vsum / hmax(wsum, f32(1e-12))) * (wsum > f32(1e-9)).astype(f32)).astype(f32)
     Fpp = pushpull(v, hclamp(wsum, 0.0, 1.0))
-    num = gauss(vsum, HYB_SIG)                       # = gauss(raw * ws): the same float32 product
-    den = gauss(ws, HYB_SIG)
+    num = gauss_plain(vsum, HYB_SIG)                     # = gauss(raw * ws): the same float32 product
+    den = gauss_plain(ws, HYB_SIG)
     a = hclamp(den / f32(HYB_W0), 0.0, 1.0)
     F = (a * num / hmax(den, f32(1e-9)) + (f32(1.0) - a) * Fpp).astype(f32)
     fade = hclamp(w * raw + (f32(1.0) - w) * F, 0.0, 1.0)
@@ -388,13 +414,13 @@ def fade9(mi, keep: bool = False):
     f8p = np.zeros((h8 + 2 * CL_PAD, w8 + 2 * CL_PAD), f32)
     f8p[CL_PAD:CL_PAD + h8, CL_PAD:CL_PAD + w8] = f8
     fc = grey_close(f8p, 2 * CL_CLOSE_R + 1)[CL_PAD:CL_PAD + h8, CL_PAD:CL_PAD + w8]
-    add = gauss(up((hmax(fc - f8, f32(0.0)) * gate8).astype(f32), CL_Q, (H, W)), CL_SIG)
+    add = gauss_plain(up((hmax(fc - f8, f32(0.0)) * gate8).astype(f32), CL_Q, (H, W)), CL_SIG)
     fade = hclamp(fade + add * (f32(1.0) - fade), 0.0, 1.0)
     # cone at 1/4 res
     cone = down(fade, CONE_Q)
     for _ in range(CONE_ITERS):
         cone = hmax(cone, (maxf(cone, 3) - f32(CONE_DEC)).astype(f32))
-    cu = gauss(up(cone, CONE_Q, (H, W)), CONE_SIG)
+    cu = gauss_plain(up(cone, CONE_Q, (H, W)), CONE_SIG)
     fade = (fade + w * hmax(cu - fade, f32(0.0))).astype(f32)
     fade = hclamp(fade, 0.0, 1.0)
     if keep:
@@ -405,18 +431,18 @@ def fade9(mi, keep: bool = False):
 # ================================================================================================= OF (1.3)
 def floor_lit(mi):
     """cands12a.floor_lit12 (F12A_B16): F = exp(up8(G16(grey_open(ln max(down8(mi), 0.05), 101)))), mi UNSANITISED (as
-    the twin); G16 = the Kahan float32 Gaussian sigma 16 (vertical then horizontal = the HLSL Gauss) at 1/8 res."""
+    the twin); G16 = the float32 Gaussian sigma 16 (plain sums since Z9) (vertical then horizontal = the HLSL Gauss) at 1/8 res."""
     mi = np.asarray(mi, f32)
     l8 = np.log(hmax(down(mi, CL_Q), f32(LOG_FLOOR))).astype(f32)
     op = grey_open(l8, 2 * OF_OPEN_R + 1)
-    op = gauss(op, OF_FLOOR_SIG)
+    op = gauss_plain(op, OF_FLOOR_SIG)
     return np.exp(up(op, CL_Q, mi.shape)).astype(f32)
 
 
 def reach_dec(mi):
     """knee_reach's per-texel step: 4 / 96 + grad_mag(gauss(ln max(down4(mi), 0.05), 1)) / 2 (once per frame)."""
     lq = np.log(hmax(down(np.asarray(mi, f32), CONE_Q), f32(LOG_FLOOR))).astype(f32)
-    return (f32(CONE_Q / OF_D) + grad_mag(gauss(lq, 1.0)) / f32(OF_LAM)).astype(f32)
+    return (f32(CONE_Q / OF_D) + grad_mag(gauss_plain(lq, 1.0)) / f32(OF_LAM)).astype(f32)
 
 
 def reach_of(kc, dec, shape):
@@ -425,7 +451,7 @@ def reach_of(kc, dec, shape):
     cone = block_max(kc, CONE_Q)
     for _ in range(int(math.ceil(OF_D / CONE_Q))):
         cone = hmax(cone, (maxf(cone, 3) - dec).astype(f32))
-    return hclamp(gauss(up(cone, CONE_Q, shape), OF_SIG), 0.0, 1.0)
+    return hclamp(gauss_plain(up(cone, CONE_Q, shape), OF_SIG), 0.0, 1.0)
 
 
 def log1p32(x):

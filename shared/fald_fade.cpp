@@ -124,6 +124,11 @@ const unsigned int kConeItersPerPass = 8;
 // Z8: the phase correlation's transforms by FadeFft for lines up to this long (fald_fade_shader.h FFT_MAX: 1/8-res maps of
 // frames up to 8192 px); longer lines keep the dense DFT (FadeDft)
 const unsigned int kFftMax = 1024;
+// Z9 (within the frozen gate-1 tolerances): plain float32 sums on the Gaussians the fade is insensitive to — raw, step,
+// care, G3(g1), the push-pull's, num / den, CL's, the cone's, the reach's and its step map's, the lit floor's (DLC
+// results/fald_fade_tiers_2026-10-20 zc_gate1.py plain32 + small). NOT lv's four (they feed gradients: failed gate 1
+// on s10_ac_firewater) nor the T state's G1s. false = Kahan everywhere (Z1-Z8)
+const bool kPlainSums = true;
 
 // dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
 // order in double, w[r + j] / sum stored float32.
@@ -388,6 +393,7 @@ FadeCBData Cb() { FadeCBData c; std::memset(&c, 0, sizeof(c)); return c; }
 // `epiIn` CONEAP's w).
 struct GOpt {
     bool clampIn = false, sat = false;
+    bool plain = false;   // Z9: plain float32 sums (fOp bit 3; kPlainSums), not Kahan
     unsigned int up = 0, epi = E_NONE;
     const FadeTex* io = nullptr;
     const FadeTex* epiIn = nullptr;
@@ -397,7 +403,7 @@ void GaussV(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& 
     const unsigned int s = SigmaIndex(sigma);
     FadeCBData c = Cb();
     c.inW = w; c.inH = h; c.radius = (uint32_t)f->gwR[s]; c.wOff = f->gwOff[s];
-    c.dir = 0; c.op = o.clampIn ? 1u : 0u;
+    c.dir = 0; c.op = (o.clampIn ? 1u : 0u) | (o.plain ? 8u : 0u);
     if (o.up > 1u) { c.factor = o.up; c.c1 = 1.0f / (float)o.up; }   // = FadeUp's fC1 (Up below)
     Io a; a.in[0] = in.srv; a.out[0] = tmp.uav;
     Pass(f, ctx, GaussKernel(f->gwR[s]), c, a, Gd(w, 16), Gd(h, 64));
@@ -406,7 +412,7 @@ void GaussH(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& 
     const unsigned int s = SigmaIndex(sigma);
     FadeCBData c = Cb();
     c.inW = tmp.w; c.inH = tmp.h; c.radius = (uint32_t)f->gwR[s]; c.wOff = f->gwOff[s];
-    c.dir = 1; c.op = (o.sat ? 2u : 0u) | (o.epi << 4);
+    c.dir = 1; c.op = (o.sat ? 2u : 0u) | (o.plain ? 8u : 0u) | (o.epi << 4);
     Io b; b.in[0] = tmp.srv; b.in[1] = o.epiIn ? o.epiIn->srv : nullptr;
     b.out[0] = out ? out->uav : nullptr; b.out[1] = o.io ? o.io->uav : nullptr;
     Pass(f, ctx, GaussKernel(f->gwR[s]), c, b, Gd(tmp.w, 64), Gd(tmp.h, 16));
@@ -416,8 +422,10 @@ void Gauss(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& i
     GaussV(f, ctx, sigma, in, w, h, tmp, o);
     GaussH(f, ctx, sigma, tmp, out, o);
 }
-void Gauss(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& in, const FadeTex& tmp, const FadeTex& out) {
-    Gauss(f, ctx, sigma, in, in.w, in.h, tmp, &out, GOpt());
+void Gauss(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& in, const FadeTex& tmp, const FadeTex& out,
+           bool plain = false) {
+    GOpt o; o.plain = plain;
+    Gauss(f, ctx, sigma, in, in.w, in.h, tmp, &out, o);
 }
 
 // The vertical passes of lv's four Gaussians (sigma 4, 24, 2, 6) from one tile (FadeGaussT4) into out[0..3]
@@ -444,6 +452,7 @@ void GaussNumDen(FaldFade* f, ID3D11DeviceContext* ctx, const FadeTex& a, const 
     const unsigned int s = SigmaIndex(32.0);
     FadeCBData c = Cb();
     c.inW = a.w; c.inH = a.h; c.radius = (uint32_t)f->gwR[s]; c.wOff = f->gwOff[s];
+    c.op = kPlainSums ? 8u : 0u;   // Z9
     c.dir = 0;
     Io v; v.in[0] = a.srv; v.in[1] = b.srv; v.out[0] = ta.uav; v.out[1] = tb.uav;
     Pass(f, ctx, K_GT2, c, v, Gd(a.w, 8), Gd(a.h, 64));
@@ -849,11 +858,11 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     GaussH(f, ctx, 6.0, S[5], &S[2], GOpt());   Grad(f, ctx, S[2], S[5]);   // S5 = g2
     // F4: the robust thin-step flag -> step = clamp(G4(maxf65(thin)), 0, 1), w = 1 - step (the Gaussian's horizontal pass
     // stores w)
-    Gauss(f, ctx, 3.0, S[4], S[1], S[2]);                                  // S2 = G3(g1) (S1 = lv is dead)
+    Gauss(f, ctx, 3.0, S[4], S[1], S[2], kPlainSums);                      // S2 = G3(g1) (S1 = lv is dead)
     Ext(f, ctx, 8, 1, S[2], S[3], S[1]);                                   // S1 = minf17(G3(g1))
     Pix(f, ctx, P_THIN, W, H, { &S[4], &S[5], &S[1] }, { &S[2] });
     Ext(f, ctx, 32, 0, S[2], S[3], S[4]);
-    { GOpt o; o.sat = true; o.epi = E_W; Gauss(f, ctx, 4.0, S[4], W, H, S[3], &f->w, o); }
+    { GOpt o; o.sat = true; o.epi = E_W; o.plain = kPlainSums; Gauss(f, ctx, 4.0, S[4], W, H, S[3], &f->w, o); }
     // V8d (F12B_V8d, r12b/cands12b.py floor_valley8 with the darkest-object test): the floor-valley gate at 1/8 res, from the
     // sanitised max channel (the Down passes' clamp). l8 is the CL's (F7 reads eL8c too)
     Down(f, ctx, 8, f->mi, f->eTmp, 1u);
@@ -873,9 +882,9 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     // F3: raw = G4(maxf25(raw0 (1 - (1 - w) V))), V = clamp(up8(V8), 0, 1) formed in FVSRC8
     Pix(f, ctx, P_FVSRC8, W, H, { &S[6], &f->w, &f->eVv }, { &S[3] });
     Ext(f, ctx, 12, 0, S[3], S[2], S[4]);
-    Gauss(f, ctx, 4.0, S[4], S[2], S[6]);                                  // S6 = raw
+    Gauss(f, ctx, 4.0, S[4], S[2], S[6], kPlainSums);                      // S6 = raw
     // care = smooth(0.3, 0.6, G2(clamp(mi, 0, 1e4))) (stored by the Gaussian's horizontal pass)
-    { GOpt o; o.clampIn = true; o.epi = E_CARE; Gauss(f, ctx, 2.0, f->mi, W, H, S[1], &S[3], o); }
+    { GOpt o; o.clampIn = true; o.epi = E_CARE; o.plain = kPlainSums; Gauss(f, ctx, 2.0, f->mi, W, H, S[1], &S[3], o); }
     // F5-F6: push-pull level 0 + the hybrid's sums (num / den in one pass each way: S4 / S5 via S3 / S7)
     Pix(f, ctx, P_PP0, W, H, { &S[6], &f->w, &S[3] }, { &S[1], &S[2], &S[4], &S[5] }, 0.05f);   // S0, W0, vsum, ws
     GaussNumDen(f, ctx, S[4], S[5], S[3], S[7]);                           // S4 = num, S5 = den
@@ -889,11 +898,11 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     if (L >= 2) {
         Pix(f, ctx, P_DIV, f->lvW[L - 1], f->lvH[L - 1], { &f->pS[L - 1], &f->pW[L - 1] }, { &f->pE[L - 1] });
         for (size_t k = L - 2; k >= 1; k--) {   // Eu = G1(up2(E)): the up-sampling formed in the Gaussian's taps
-            GOpt o; o.up = 2;
+            GOpt o; o.up = 2; o.plain = kPlainSums;
             Gauss(f, ctx, 1.0, f->pE[k + 1], f->lvW[k], f->lvH[k], f->pT[k], &f->pU[k], o);
             Pix(f, ctx, P_BLEND, f->lvW[k], f->lvH[k], { &f->pS[k], &f->pW[k], &f->pU[k] }, { &f->pE[k] });
         }
-        { GOpt o; o.up = 2; Gauss(f, ctx, 1.0, f->pE[1], W, H, S[7], &S[3], o); }
+        { GOpt o; o.up = 2; o.plain = kPlainSums; Gauss(f, ctx, 1.0, f->pE[1], W, H, S[7], &S[3], o); }
         Pix(f, ctx, P_BLEND, W, H, { &S[1], &S[2], &S[3] }, { &S[7] });   // S7 = F_pp
     } else {
         Pix(f, ctx, P_DIV, W, H, { &S[1], &S[2] }, { &S[7] });
@@ -911,12 +920,12 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     Ext(f, ctx, 40, 1, f->ePad2, f->ePad1, f->ePad0);                      // min 81: ePad0 = the padded closing
     Pix(f, ctx, P_CLADD8, W8, H8, { &f->ePad0, &f->eF8, &f->eGate }, { &f->eAdd8 });
     // fade = clamp(fade + G8(up8(add8)) (1 - fade), 0, 1): up8 in the Gaussian's taps, ADDF in its horizontal pass
-    { GOpt o; o.up = 8; o.epi = E_ADDF; o.io = &f->fade; Gauss(f, ctx, 8.0, f->eAdd8, W, H, S[2], nullptr, o); }
+    { GOpt o; o.up = 8; o.epi = E_ADDF; o.io = &f->fade; o.plain = kPlainSums; Gauss(f, ctx, 8.0, f->eAdd8, W, H, S[2], nullptr, o); }
     // F8: the cone at 1/4 res, 16 iterations in two passes; fade += w max(G4(up4(cone)) - fade, 0) (CONEAP in the Gaussian)
     Down(f, ctx, 4, f->fade, f->qCone);
     {
         const FadeTex& cone = Cone(f, ctx, 16, f->qCone, f->qA, 4.0f / 64.0f, nullptr);
-        GOpt o; o.up = 4; o.epi = E_CONEAP; o.io = &f->fade; o.epiIn = &f->w;
+        GOpt o; o.up = 4; o.epi = E_CONEAP; o.io = &f->fade; o.epiIn = &f->w; o.plain = kPlainSums;
         Gauss(f, ctx, 4.0, cone, W, H, S[2], nullptr, o);
     }
     // T1: the maps (mi unsanitised) and f_q
@@ -930,10 +939,10 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     Pix(f, ctx, P_LOG, W8, H8, { &f->eL8raw }, { &f->eLf });
     Ext(f, ctx, 50, 1, f->eLf, f->eA, f->eB);
     Ext(f, ctx, 50, 0, f->eB, f->eA, f->eFopen);
-    Gauss(f, ctx, 16.0, f->eFopen, f->eA, f->eFopen);                      // B16 (the H pass writes over the opening)
+    Gauss(f, ctx, 16.0, f->eFopen, f->eA, f->eFopen, kPlainSums);          // B16 (the H pass writes over the opening)
     // knee_reach's per-texel step: 4 / 96 + |grad G1(ln max(down4(mi), 0.05))| / 2
     Pix(f, ctx, P_LOG, Wq, Hq, { &f->qTmp }, { &f->qLq4 });
-    Gauss(f, ctx, 1.0, f->qLq4, f->qA, f->qB);
+    Gauss(f, ctx, 1.0, f->qLq4, f->qA, f->qB, kPlainSums);
     Grad(f, ctx, f->qB, f->qG);
     Pix(f, ctx, P_DEC, Wq, Hq, { &f->qG }, { &f->qDec }, 4.0f / 96.0f);
     // T: the state step (TL11State.apply), GPU-predicated on the advance test (no readback)
@@ -1001,7 +1010,7 @@ void FaldFadeRunReach(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     { FadeCBData c = Cb(); c.outW = Wq; c.outH = Hq; Io a; a.out[0] = f->qA.uav; Pass(f, ctx, K_KNEE, c, a, G16(Wq), G16(Hq)); }
     // 24 iterations c <- max(c, maxf3(c) - dec) in three passes (qA -> qKq -> qA -> qKq: the dump's kq = the final cone)
     const FadeTex& cone = Cone(f, ctx, 24, f->qA, f->qKq, 0.0f, &f->qDec);
-    { GOpt o; o.up = 4; o.sat = true; Gauss(f, ctx, 4.0, cone, f->W, f->H, f->S[2], &f->reach[round], o); }
+    { GOpt o; o.up = 4; o.sat = true; o.plain = kPlainSums; Gauss(f, ctx, 4.0, cone, f->W, f->H, f->S[2], &f->reach[round], o); }
     UnbindEverything(ctx);
     f->reachValid[round] = true;
     f->reachKey[round] = key;

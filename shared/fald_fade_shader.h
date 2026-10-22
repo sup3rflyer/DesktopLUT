@@ -35,7 +35,8 @@
 // DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit floor F itself (fald_shader.h).
 // FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
 // Within the frozen gate-1 tolerances (not bit-identical; DLC tests/fald_fade_frozen_tolerances_f12b.json): Z8, the
-// phase correlation's transforms by a float32 FFT (FadeFft; the dense DFT stays for 1/8-res lines over 1024).
+// phase correlation's transforms by a float32 FFT (FadeFft; the dense DFT stays for 1/8-res lines over 1024); Z9, plain
+// float32 sums on the Gaussians that feed thresholds and blends (fOp bit 3; lv's four and the T state's stay Kahan).
 #pragma once
 
 // MSVC caps one string literal at 16380 bytes (C2026): each pass is its own literal; the common fade source too.
@@ -1015,7 +1016,9 @@ void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
         gT[ln * TG_STRIDE + k] = vert ? GtTap(gc, ga) : GtTap(ga, gc);
     }
 }
-void GtSweep(int base, int r, uint off, out float o0, out float o1, out float o2, out float o3) {
+// plain (Z9, fOp bit 3: the Gaussians the fade is insensitive to; within the frozen gate-1 tolerances, not bit-identical):
+// s = s + term in float32 instead of the Kahan step (DLC fadeemu.gauss_plain). lv's four stay Kahan (they feed gradients)
+void GtSweep(int base, int r, uint off, bool plain, out float o0, out float o1, out float o2, out float o3) {
     const float w0 = fGW[off];
     const float x0 = gT[base], x1 = gT[base + 1], x2 = gT[base + 2], x3 = gT[base + 3];
     precise float s0 = x0 * w0;
@@ -1024,16 +1027,30 @@ void GtSweep(int base, int r, uint off, out float o0, out float o1, out float o2
     precise float s3 = x3 * w0;
     precise float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
     float l0 = x0, l1 = x1, l2 = x2, q1 = x1, q2 = x2, q3 = x3;   // x[o_k - (j - 1)] / x[o_k + (j - 1)] of the next step
-    for (int j = 1; j <= r; j++) {
-        const float wj = fGW[off + (uint)j];
-        const float nl = gT[base - j], nr = gT[base + 3 + j];
-        precise float t0 = (nl + q1) * wj;
-        precise float t1 = (l0 + q2) * wj;
-        precise float t2 = (l1 + q3) * wj;
-        precise float t3 = (l2 + nr) * wj;
-        FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
-        l2 = l1; l1 = l0; l0 = nl;
-        q1 = q2; q2 = q3; q3 = nr;
+    if (plain) {
+        for (int j = 1; j <= r; j++) {
+            const float wj = fGW[off + (uint)j];
+            const float nl = gT[base - j], nr = gT[base + 3 + j];
+            precise float t0 = (nl + q1) * wj;
+            precise float t1 = (l0 + q2) * wj;
+            precise float t2 = (l1 + q3) * wj;
+            precise float t3 = (l2 + nr) * wj;
+            s0 = s0 + t0; s1 = s1 + t1; s2 = s2 + t2; s3 = s3 + t3;
+            l2 = l1; l1 = l0; l0 = nl;
+            q1 = q2; q2 = q3; q3 = nr;
+        }
+    } else {
+        for (int j = 1; j <= r; j++) {
+            const float wj = fGW[off + (uint)j];
+            const float nl = gT[base - j], nr = gT[base + 3 + j];
+            precise float t0 = (nl + q1) * wj;
+            precise float t1 = (l0 + q2) * wj;
+            precise float t2 = (l1 + q3) * wj;
+            precise float t3 = (l2 + nr) * wj;
+            FadeKAdd(s0, k0, t0); FadeKAdd(s1, k1, t1); FadeKAdd(s2, k2, t2); FadeKAdd(s3, k3, t3);
+            l2 = l1; l1 = l0; l0 = nl;
+            q1 = q2; q2 = q3; q3 = nr;
+        }
     }
     o0 = s0; o1 = s1; o2 = s2; o3 = s3;
 }
@@ -1079,7 +1096,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     GroupMemoryBarrierWithGroupSync();
     const uint lineIx = tid.x, lane = FadeLanePerm(tid.y);
     float o0, o1, o2, o3;
-    GtSweep((int)(lineIx * TG_STRIDE) + r + 4 * (int)lane, r, fWOff, o0, o1, o2, o3);
+    GtSweep((int)(lineIx * TG_STRIDE) + r + 4 * (int)lane, r, fWOff, (fOp & 8u) != 0u, o0, o1, o2, o3);
     if ((fOp & 2u) != 0u) { o0 = saturate(o0); o1 = saturate(o1); o2 = saturate(o2); o3 = saturate(o3); }
     GroupMemoryBarrierWithGroupSync();   // every tap read: the tile takes the outputs
     const uint tb = lineIx * 65u + 4u * lane;
@@ -1116,28 +1133,28 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const int gx = c0 + (int)lineIx, gy = a0 + 4 * (int)lane;
     const bool inX = gx < nC;
     float o0, o1, o2, o3;
-    GtSweep(base, (int)(fWOff >> 16), fWOff & 0xFFFFu, o0, o1, o2, o3);
+    GtSweep(base, (int)(fWOff >> 16), fWOff & 0xFFFFu, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out0[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out0[uint2(gx, gy + 1)] = o1;
         if (gy + 2 < nA) g4Out0[uint2(gx, gy + 2)] = o2;
         if (gy + 3 < nA) g4Out0[uint2(gx, gy + 3)] = o3;
     }
-    GtSweep(base, (int)(fN >> 16), fN & 0xFFFFu, o0, o1, o2, o3);
+    GtSweep(base, (int)(fN >> 16), fN & 0xFFFFu, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out1[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out1[uint2(gx, gy + 1)] = o1;
         if (gy + 2 < nA) g4Out1[uint2(gx, gy + 2)] = o2;
         if (gy + 3 < nA) g4Out1[uint2(gx, gy + 3)] = o3;
     }
-    GtSweep(base, (int)(fPad0 >> 16), fPad0 & 0xFFFFu, o0, o1, o2, o3);
+    GtSweep(base, (int)(fPad0 >> 16), fPad0 & 0xFFFFu, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out2[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out2[uint2(gx, gy + 1)] = o1;
         if (gy + 2 < nA) g4Out2[uint2(gx, gy + 2)] = o2;
         if (gy + 3 < nA) g4Out2[uint2(gx, gy + 3)] = o3;
     }
-    GtSweep(base, (int)(fPad1 >> 16), fPad1 & 0xFFFFu, o0, o1, o2, o3);
+    GtSweep(base, (int)(fPad1 >> 16), fPad1 & 0xFFFFu, false, o0, o1, o2, o3);
     if (inX) {
         if (gy < nA) g4Out3[uint2(gx, gy)] = o0;
         if (gy + 1 < nA) g4Out3[uint2(gx, gy + 1)] = o1;
@@ -1192,16 +1209,30 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     precise float sb1 = b1v * w0;
     precise float ka0 = 0.0f, ka1 = 0.0f, kb0 = 0.0f, kb1 = 0.0f;
     float la = a0v, ra = a1v, lb = b0v, rb = b1v;   // x[o1 - (j - 1)] / x[o0 + (j - 1)] of the next step
-    for (int j = 1; j <= r; j++) {
-        const float wj = fGW[fWOff + (uint)j];
-        const float nla = gA2[base - j], nra = gA2[base + 1 + j];
-        const float nlb = gB2[base - j], nrb = gB2[base + 1 + j];
-        precise float ta0 = (nla + ra) * wj;
-        precise float ta1 = (la + nra) * wj;
-        precise float tb0 = (nlb + rb) * wj;
-        precise float tb1 = (lb + nrb) * wj;
-        FadeKAdd(sa0, ka0, ta0); FadeKAdd(sa1, ka1, ta1); FadeKAdd(sb0, kb0, tb0); FadeKAdd(sb1, kb1, tb1);
-        la = nla; ra = nra; lb = nlb; rb = nrb;
+    if ((fOp & 8u) != 0u) {   // plain sums (Z9: GtSweep's comment)
+        for (int j = 1; j <= r; j++) {
+            const float wj = fGW[fWOff + (uint)j];
+            const float nla = gA2[base - j], nra = gA2[base + 1 + j];
+            const float nlb = gB2[base - j], nrb = gB2[base + 1 + j];
+            precise float ta0 = (nla + ra) * wj;
+            precise float ta1 = (la + nra) * wj;
+            precise float tb0 = (nlb + rb) * wj;
+            precise float tb1 = (lb + nrb) * wj;
+            sa0 = sa0 + ta0; sa1 = sa1 + ta1; sb0 = sb0 + tb0; sb1 = sb1 + tb1;
+            la = nla; ra = nra; lb = nlb; rb = nrb;
+        }
+    } else {
+        for (int j = 1; j <= r; j++) {
+            const float wj = fGW[fWOff + (uint)j];
+            const float nla = gA2[base - j], nra = gA2[base + 1 + j];
+            const float nlb = gB2[base - j], nrb = gB2[base + 1 + j];
+            precise float ta0 = (nla + ra) * wj;
+            precise float ta1 = (la + nra) * wj;
+            precise float tb0 = (nlb + rb) * wj;
+            precise float tb1 = (lb + nrb) * wj;
+            FadeKAdd(sa0, ka0, ta0); FadeKAdd(sa1, ka1, ta1); FadeKAdd(sb0, kb0, tb0); FadeKAdd(sb1, kb1, tb1);
+            la = nla; ra = nra; lb = nlb; rb = nrb;
+        }
     }
     GroupMemoryBarrierWithGroupSync();   // every tap read: the tiles take the outputs
     const uint tb = lineIx * 65u + 2u * lane;
