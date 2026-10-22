@@ -35,7 +35,9 @@
 // is done by its horizontal pass, the DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit
 // floor F itself (fald_shader.h).
 // The tiled Gaussians have their radius and their float32 weights compiled in (one class per sigma, fald_fade.cpp
-// BakedWeightsSource) and their steps unrolled (2026-10-22, the same operations without the weight loads and the loop).
+// BakedWeightsSource) and their steps unrolled (2026-10-22, the same operations without the weight loads and the loop);
+// a tile's plain loads, its stores, mi's 8 x 8 blocks, the knee cap's 4 x 4 and the cone's tile loops are unrolled so a
+// thread's loads are in flight together (the fills were latency-bound: FadeGauss2D16 without its sums took 68 % of it).
 // FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
 // Within the frozen gate-1 tolerances (not bit-identical; DLC tests/fald_fade_frozen_tolerances_f12b.json): Z8, the
 // phase correlation's transforms by a float32 FFT (FadeFft; the dense DFT stays for 1/8-res lines over 1024); Z9, plain
@@ -284,9 +286,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     precise float q10 = 0.0f;
     precise float q11 = 0.0f;
     float mn = 0.0f;
-    for (int dy = 0; dy < 8; dy++) {
+    [unroll] for (int dy = 0; dy < 8; dy++) {   // the block's 64 loads issued together
         const int sy = min((int)id.y * 8 + dy, (int)fInH - 1);
-        for (int dx = 0; dx < 8; dx++) {
+        [unroll] for (int dx = 0; dx < 8; dx++) {
             const float v = fIn0.Load(int3(min((int)id.x * 8 + dx, (int)fInW - 1), sy, 0));
             const float vc = min(max(v, 0.0f), 1e4f);
             sc = sc + vc;
@@ -552,8 +554,8 @@ float KneeCap(int2 px) {
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= fOutW || id.y >= fOutH) return;
     float m = 0.0f;
-    for (int dy = 0; dy < 4; dy++)
-        for (int dx = 0; dx < 4; dx++) {
+    [unroll] for (int dy = 0; dy < 4; dy++)   // the 16 pixels' loads issued together
+        [unroll] for (int dx = 0; dx < 4; dx++) {
             int2 px = int2(min((int)id.x * 4 + dx, (int)frameW - 1), min((int)id.y * 4 + dy, (int)frameH - 1));
             float k = KneeCap(px);
             m = (dx == 0 && dy == 0) ? k : max(m, k);
@@ -1102,23 +1104,37 @@ inline const char* g_faldFadeTileFnSource = R"(
 #define TG_STRIDE (TG_BASE + ((33 - (TG_BASE & 31)) & 31))
 groupshared float gT[TG_LINES * TG_STRIDE];
 uint FadeLanePerm(uint y) { return ((y & 1u) << 2) | ((y >> 1) & 3u) | (y & 8u); }
-float GtTap(int x, int y) {
-    float v;
-    [branch] if (fFactor > 1u) v = FadeUpAt(fIn0, int2(x, y), fC1);   // a uniform branch: one path's loads, not both
-    else v = fIn0.Load(int3(x, y, 0));
+float GtClamp(float v) {   // fOp bit 0: the tap clamped into [0, 1e4] (GTap)
     if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
     return v;
 }
+// The tile's taps; r is the class's (a constant), so a thread's plain loads are issued together (the loop unrolled) and
+// the up-sampling's branch is taken once, outside it (the up-sampled taps stay a loop: unrolled, they doubled the
+// driver's compile of the pass for nothing measurable)
 void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
     const uint span = (uint)(TG_LEN + 2 * r);
-    for (uint i = t; i < TG_LINES * span; i += 256u) {
-        uint ln, k;
-        if (vert) { ln = i % TG_LINES; k = i / TG_LINES; }   // consecutive threads: consecutive x
-        else { k = i % span; ln = i / span; }
-        const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
-        const int gc = min(c0 + (int)ln, nC - 1);
-        const int2 q = vert ? int2(gc, ga) : int2(ga, gc);   // one tap (a select of its position, not two taps)
-        gT[ln * TG_STRIDE + k] = GtTap(q.x, q.y);
+    if (fFactor > 1u) {
+        [loop] for (uint i0 = 0u; i0 < TG_LINES * span; i0 += 256u) {
+            const uint i = i0 + t;
+            if (i >= TG_LINES * span) break;
+            uint ln, k;
+            if (vert) { ln = i % TG_LINES; k = i / TG_LINES; }   // consecutive threads: consecutive x
+            else { k = i % span; ln = i / span; }
+            const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
+            const int gc = min(c0 + (int)ln, nC - 1);
+            gT[ln * TG_STRIDE + k] = GtClamp(FadeUpAt(fIn0, vert ? int2(gc, ga) : int2(ga, gc), fC1));
+        }
+    } else {
+        [unroll] for (uint i0 = 0u; i0 < TG_LINES * span; i0 += 256u) {
+            const uint i = i0 + t;
+            if (i >= TG_LINES * span) break;
+            uint ln, k;
+            if (vert) { ln = i % TG_LINES; k = i / TG_LINES; }
+            else { k = i % span; ln = i / span; }
+            const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
+            const int gc = min(c0 + (int)ln, nC - 1);
+            gT[ln * TG_STRIDE + k] = GtClamp(fIn0.Load(vert ? int3(gc, ga, 0) : int3(ga, gc, 0)));
+        }
     }
 }
 // The sweep of four consecutive outputs: s = x[c] w0, then for j = 1..r term = (x[c - j] + x[c + j]) w_j added by the Kahan
@@ -1224,7 +1240,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const uint tb = lineIx * 65u + 4u * lane;
     gT[tb] = o0; gT[tb + 1u] = o1; gT[tb + 2u] = o2; gT[tb + 3u] = o3;
     GroupMemoryBarrierWithGroupSync();
-    for (uint e = t; e < (uint)(TG_LINES * TG_LEN); e += 256u) {
+    [unroll] for (uint e0 = 0u; e0 < (uint)(TG_LINES * TG_LEN); e0 += 256u) {
+        const uint e = e0 + t;
         uint ln, a;
         if (vert) { ln = e % TG_LINES; a = e / TG_LINES; }
         else { a = e % TG_LEN; ln = e / TG_LEN; }
@@ -1235,7 +1252,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 )";
 
 // ---- the separable Gaussian in ONE pass for radii <= 16 (FadeGauss2D; per radius class TG_RMAX 4 / 8 / 12 / 16): a
-// group computes a 64 x 32 tile of outputs. The input region (64 + 2r) x (32 + 2r) is filled with GtTap's taps (the
+// group computes a 64 x 32 tile of outputs. The input region (64 + 2r) x (32 + 2r) is filled with GtFill's taps (the
 // up-sampling / the clamp as the vertical pass's), the vertical sums are formed for its 64 + 2r columns (the clamped
 // columns the horizontal pass reads) into groupshared memory, then the horizontal sums of those, then the store as
 // FadeGaussT's horizontal pass (fOp bit 1 sat, bits 4-6 the epilogue). Each output is FadeGaussT's vertical then
@@ -1255,10 +1272,7 @@ RWTexture2D<float> g2dIo : register(u1);
 #define G2_S (G2_COLS + ((33 - (G2_COLS & 31)) & 31))
 #define G2_ROWS (G2_TH + 2 * TG_RMAX)
 groupshared float g2[G2_ROWS * G2_S];
-float G2Tap(int x, int y) {
-    float v;
-    [branch] if (fFactor > 1u) v = FadeUpAt(fIn0, int2(x, y), fC1);   // a uniform branch: one path's loads, not both
-    else v = fIn0.Load(int3(x, y, 0));
+float G2Clamp(float v) {   // fOp bit 0: the tap clamped into [0, 1e4] (GTap)
     if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
     return v;
 }
@@ -1324,10 +1338,24 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const uint t = tid.x;
     const bool plain = (fOp & 8u) != 0u;
     const int cols = G2_TW + 2 * r, rows = G2_TH + 2 * r;
-    // 1. the taps: row j = input row clamp(y0 - r + j), column i = clamp(x0 - r + i) (consecutive threads: consecutive x)
-    for (uint e = t; e < (uint)(rows * cols); e += 256u) {
-        const int j = (int)(e / (uint)cols), i = (int)(e % (uint)cols);
-        g2[j * G2_S + i] = G2Tap(clamp(x0 - r + i, 0, W - 1), clamp(y0 - r + j, 0, H - 1));
+    // 1. the taps: row j = input row clamp(y0 - r + j), column i = clamp(x0 - r + i) (consecutive threads: consecutive x);
+    // as GtFill: the plain loads unrolled (issued together), the up-sampling's branch outside the loops
+    if (fFactor > 1u) {
+        [loop] for (uint e0 = 0u; e0 < (uint)(G2_ROWS * G2_COLS); e0 += 256u) {
+            const uint e = e0 + t;
+            if (e < (uint)(G2_ROWS * G2_COLS)) {
+                const int j = (int)(e / (uint)G2_COLS), i = (int)(e % (uint)G2_COLS);
+                g2[j * G2_S + i] = G2Clamp(FadeUpAt(fIn0, int2(clamp(x0 - r + i, 0, W - 1), clamp(y0 - r + j, 0, H - 1)), fC1));
+            }
+        }
+    } else {
+        [unroll] for (uint e0 = 0u; e0 < (uint)(G2_ROWS * G2_COLS); e0 += 256u) {
+            const uint e = e0 + t;
+            if (e < (uint)(G2_ROWS * G2_COLS)) {
+                const int j = (int)(e / (uint)G2_COLS), i = (int)(e % (uint)G2_COLS);
+                g2[j * G2_S + i] = G2Clamp(fIn0.Load(int3(clamp(x0 - r + i, 0, W - 1), clamp(y0 - r + j, 0, H - 1), 0)));
+            }
+        }
     }
     GroupMemoryBarrierWithGroupSync();
     // 2. the vertical sums: column i, output rows 4 g .. 4 g + 3 (tap row = output row + r) — kept in registers
@@ -1370,7 +1398,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
     // 4. the store, consecutive threads: consecutive x
-    for (uint e = t; e < (uint)(G2_TW * G2_TH); e += 256u) {
+    [unroll] for (uint e0 = 0u; e0 < (uint)(G2_TW * G2_TH); e0 += 256u) {
+        const uint e = e0 + t;
         const int a = (int)(e % (uint)G2_TW), y = (int)(e / (uint)G2_TW);
         const int px = x0 + a, py = y0 + y;
         if (px < W && py < H) G2Store(int2(px, py), g2[y * (G2_TW + 1) + a]);
@@ -1574,7 +1603,9 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const int c0 = (int)(vert ? gid.x : gid.y) * T2P_LINES;
     const uint t = tid.x;
     const uint span = (uint)(T2P_LEN + 2 * r);
-    for (uint i = t; i < T2P_LINES * span; i += 256u) {
+    [unroll] for (uint i0 = 0u; i0 < T2P_LINES * span; i0 += 256u) {   // a thread's loads issued together
+        const uint i = i0 + t;
+        if (i >= T2P_LINES * span) break;
         uint ln, k;
         if (vert) { ln = i % T2P_LINES; k = i / T2P_LINES; }
         else { k = i % span; ln = i / span; }
@@ -1614,7 +1645,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     gA2[tb] = sa0; gA2[tb + 1u] = sa1; gA2[tb + 2u] = sa2; gA2[tb + 3u] = sa3;
     gB2[tb] = sb0; gB2[tb + 1u] = sb1; gB2[tb + 2u] = sb2; gB2[tb + 3u] = sb3;
     GroupMemoryBarrierWithGroupSync();
-    for (uint e = t; e < (uint)(T2P_LINES * T2P_LEN); e += 256u) {
+    [unroll] for (uint e0 = 0u; e0 < (uint)(T2P_LINES * T2P_LEN); e0 += 256u) {
+        const uint e = e0 + t;
         uint ln, a;
         if (vert) { ln = e % T2P_LINES; a = e / T2P_LINES; }
         else { a = e % T2P_LEN; ln = e / T2P_LEN; }
@@ -1650,7 +1682,9 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const int c0 = (int)(vert ? gid.x : gid.y) * TE_LINES;
     const uint t = tid.y * 16u + tid.x;
     const uint span = (uint)(TE_LEN + 2 * r);
-    for (uint i = t; i < TE_LINES * span; i += 256u) {
+    [unroll] for (uint i0 = 0u; i0 < TE_LINES * span; i0 += 256u) {   // a thread's loads issued together
+        const uint i = i0 + t;
+        if (i >= TE_LINES * span) break;
         uint ln, k;
         if (vert) { ln = i % TE_LINES; k = i / TE_LINES; }
         else { k = i % span; ln = i / span; }
@@ -1674,7 +1708,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         }
         GroupMemoryBarrierWithGroupSync();
     }
-    for (uint e = t; e < (uint)(TE_LINES * TE_LEN); e += 256u) {
+    [unroll] for (uint e0 = 0u; e0 < (uint)(TE_LINES * TE_LEN); e0 += 256u) {
+        const uint e = e0 + t;
         uint ln, a;
         if (vert) { ln = e % TE_LINES; a = e / TE_LINES; }
         else { a = e % TE_LEN; ln = e / TE_LEN; }
@@ -1727,7 +1762,8 @@ void ExtVChains(bool mx, uint t) {
     }
 }
 void ExtVStore(bool mx, uint t, bool vert, int a0, int c0, int nA, int nC) {
-    for (uint e = t; e < (uint)(TE_LINES * TE_LEN); e += 256u) {
+    [unroll] for (uint e0 = 0u; e0 < (uint)(TE_LINES * TE_LEN); e0 += 256u) {
+        const uint e = e0 + t;
         uint ln, a;
         if (vert) { ln = e % TE_LINES; a = e / TE_LINES; }
         else { a = e % TE_LEN; ln = e / TE_LEN; }
@@ -1745,7 +1781,9 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const int a0 = (int)(vert ? gid.y : gid.x) * TE_LEN;
     const int c0 = (int)(vert ? gid.x : gid.y) * TE_LINES;
     const uint t = tid.x;
-    for (uint i = t; i < (uint)(TE_LINES * TE_SPAN); i += 256u) {
+    [unroll] for (uint i0 = 0u; i0 < (uint)(TE_LINES * TE_SPAN); i0 += 256u) {   // a thread's loads issued together
+        const uint i = i0 + t;
+        if (i >= (uint)(TE_LINES * TE_SPAN)) break;
         uint ln, k;
         if (vert) { ln = i % TE_LINES; k = i / TE_LINES; }   // consecutive threads: consecutive x
         else { k = i % (uint)TE_SPAN; ln = i / (uint)TE_SPAN; }
@@ -1780,16 +1818,21 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const uint t = tid.y * 16u + tid.x;
     const int lxMin = max(0, -x0), lyMin = max(0, -y0);
     const int lxMax = min(TC_T - 1, W - 1 - x0), lyMax = min(TC_T - 1, H - 1 - y0);
-    for (uint i = t; i < (uint)(TC_T * TC_T); i += 256u) {
+    // the state and the step (fOp 0: the constant, 1: the map, loaded only then); a thread's loads issued together
+    const bool decMap = fOp != 0u;
+    [unroll] for (uint i0 = 0u; i0 < (uint)(TC_T * TC_T); i0 += 256u) {
+        const uint i = i0 + t;
         const int lx = (int)(i % (uint)TC_T), ly = (int)(i / (uint)TC_T);
         const int gx = clamp(x0 + lx, 0, W - 1), gy = clamp(y0 + ly, 0, H - 1);
         gCc[i] = fIn0.Load(int3(gx, gy, 0));
-        gCd[i] = (fOp == 0u) ? fC0 : fIn1.Load(int3(gx, gy, 0));
+        [branch] if (decMap) gCd[i] = fIn1.Load(int3(gx, gy, 0));
+        else gCd[i] = fC0;
     }
     GroupMemoryBarrierWithGroupSync();
     for (int it = 0; it < 8; it++) {   // a fixed count, predicated (the barriers stay in uniform flow)
         if (it < N) {
-            for (uint i = t; i < (uint)(TC_T * TC_T); i += 256u) {
+            [unroll] for (uint i0 = 0u; i0 < (uint)(TC_T * TC_T); i0 += 256u) {
+                const uint i = i0 + t;
                 const int lx = (int)(i % (uint)TC_T), ly = (int)(i / (uint)TC_T);
                 const int ym = max(ly - 1, lyMin), yp = min(ly + 1, lyMax);
                 float m = gCc[ym * TC_T + lx];
@@ -1800,7 +1843,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         }
         GroupMemoryBarrierWithGroupSync();
         if (it < N) {
-            for (uint i = t; i < (uint)(TC_T * TC_T); i += 256u) {
+            [unroll] for (uint i0 = 0u; i0 < (uint)(TC_T * TC_T); i0 += 256u) {
+                const uint i = i0 + t;
                 const int lx = (int)(i % (uint)TC_T), ly = (int)(i / (uint)TC_T);
                 const int xm = max(lx - 1, lxMin), xp = min(lx + 1, lxMax);
                 float m = gCv[ly * TC_T + xm];
