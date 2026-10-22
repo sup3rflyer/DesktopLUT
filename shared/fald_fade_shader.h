@@ -29,7 +29,7 @@
 // Speed (2026-10-22, DLC results/fald_fade_tiers_2026-10-20; ZERO-CHANGE: every pass computes the float operations of
 // the kernels it replaced in the same order, so the output is the same bit for bit — tests/test_fald_fade.cpp): the
 // Gaussians and the max / min filters read their taps from groupshared tiles (FadeGaussT / FadeExtT, the latter by
-// doubling), lv's four Gaussians share one vertical pass (FadeGaussT4), the hybrid fill's two sigma-32 sums one pass
+// van Herk / Gil-Werman up to r 32, by doubling above), lv's four Gaussians share one vertical pass (FadeGaussT4), the hybrid fill's two sigma-32 sums one pass
 // (FadeGaussT2), the cone / the reach run 8 iterations per dispatch (FadeConeT), an up-sampling that fed a Gaussian or a
 // pixel step is formed where it is read (FadeUpAt), the pixel step after a Gaussian is done by its horizontal pass, the
 // DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit floor F itself (fald_shader.h).
@@ -1637,7 +1637,7 @@ float FadeExOp(float a, float b) { return (fOp == 0u) ? max(a, b) : min(a, b); }
 [numthreads(16, 16, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     const bool vert = (fDir == 0u);
-    const int r = (int)fRadius;
+    const int r = TE_RMAX;   // the class's radius (compile time: the loops' bounds and divisions are constants)
     const int nA = vert ? (int)fInH : (int)fInW;
     const int nC = vert ? (int)fInW : (int)fInH;
     const int a0 = (int)(vert ? gid.y : gid.x) * TE_LEN;
@@ -1650,13 +1650,13 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         else { k = i % span; ln = i / span; }
         const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
         const int gc = min(c0 + (int)ln, nC - 1);
-        gEa[ln * TE_STRIDE + k] = vert ? fIn0.Load(int3(gc, ga, 0)) : fIn0.Load(int3(ga, gc, 0));
+        gEa[ln * TE_STRIDE + k] = fIn0.Load(vert ? int3(gc, ga, 0) : int3(ga, gc, 0));   // one load (a select of its position)
     }
     GroupMemoryBarrierWithGroupSync();
     const uint n = 2u * (uint)r + 1u;
     uint P = 1u;
     bool inA = true;
-    for (uint lv = 0u; lv < 8u; lv++) {   // 2^8 > the largest window (133): a fixed count, the doubling predicated
+    [unroll] for (uint lv = 0u; lv < 8u; lv++) {   // 2^8 > the largest window (133): a fixed count, the doubling predicated
         if (2u * P <= n) {
             for (uint i = t; i < TE_LINES * span; i += 256u) {
                 const uint ln = i / span, k = i % span, q = ln * TE_STRIDE + k;
@@ -1681,6 +1681,78 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 }
 )";
 
+// ---- the same max / min of window n = 2r + 1 by van Herk / Gil-Werman (O(1) per output; for TE_RMAX <= 32: three tiles
+// fit in groupshared memory): the line's taps in blocks of n from the tile's first, per block its suffix ext S[k] =
+// ext(x[k .. block end]) and its prefix ext P[k] = ext(x[block start .. k]), each a chain of one thread; out[o] =
+// ext(S[o], P[o + n - 1]) — the window [o, o + n - 1] is the end of o's block and the start of the next (o on a block
+// start: the block itself, S[o] = P[o + n - 1]). The radius is the class's (TE_RMAX, compile time). max / min are exact and
+// order-free (a NaN operand yields the other one either way), so every output equals FadeExt's scan.
+inline const char* g_faldFadeExtVSource = R"(
+RWTexture2D<float> evOut : register(u0);
+#define TE_LEN 64
+#define TE_LINES 16
+#define TE_N (2 * TE_RMAX + 1)
+#define TE_NB ((TE_LEN + TE_N - 1 + TE_N - 1) / TE_N)   // blocks over the TE_LEN + n - 1 taps
+#define TE_SPAN (TE_NB * TE_N)                          // whole blocks: the taps past the last output's never reach one
+#define TE_STRIDE (TE_SPAN | 1)
+groupshared float gVx[TE_LINES * TE_STRIDE];
+groupshared float gVs[TE_LINES * TE_STRIDE];
+groupshared float gVp[TE_LINES * TE_STRIDE];
+float FadeExV(bool mx, float a, float b) { return mx ? max(a, b) : min(a, b); }
+// the chains (a literal `mx`: one instruction a step): t = line t % 16, block (t / 16) / 2, suffix (even) / prefix (odd)
+void ExtVChains(bool mx, uint t) {
+    if (t >= (uint)(2 * TE_NB * TE_LINES)) return;
+    const uint ln = t % TE_LINES, bt = t / TE_LINES;
+    const uint q0 = ln * TE_STRIDE + (bt >> 1) * TE_N;
+    if ((bt & 1u) == 0u) {
+        float m = gVx[q0 + TE_N - 1];
+        gVs[q0 + TE_N - 1] = m;
+        [unroll] for (int j = TE_N - 2; j >= 0; j--) {
+            m = FadeExV(mx, m, gVx[q0 + j]);
+            gVs[q0 + j] = m;
+        }
+    } else {
+        float m = gVx[q0];
+        gVp[q0] = m;
+        [unroll] for (int j = 1; j < TE_N; j++) {
+            m = FadeExV(mx, m, gVx[q0 + j]);
+            gVp[q0 + j] = m;
+        }
+    }
+}
+void ExtVStore(bool mx, uint t, bool vert, int a0, int c0, int nA, int nC) {
+    for (uint e = t; e < (uint)(TE_LINES * TE_LEN); e += 256u) {
+        uint ln, a;
+        if (vert) { ln = e % TE_LINES; a = e / TE_LINES; }
+        else { a = e % TE_LEN; ln = e / TE_LEN; }
+        const int ga = a0 + (int)a, gc = c0 + (int)ln;
+        if (ga >= nA || gc >= nC) continue;
+        const uint q = ln * TE_STRIDE + a;
+        evOut[vert ? uint2(gc, ga) : uint2(ga, gc)] = FadeExV(mx, gVs[q], gVp[q + TE_N - 1]);
+    }
+}
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const bool vert = (fDir == 0u);
+    const int nA = vert ? (int)fInH : (int)fInW;
+    const int nC = vert ? (int)fInW : (int)fInH;
+    const int a0 = (int)(vert ? gid.y : gid.x) * TE_LEN;
+    const int c0 = (int)(vert ? gid.x : gid.y) * TE_LINES;
+    const uint t = tid.x;
+    for (uint i = t; i < (uint)(TE_LINES * TE_SPAN); i += 256u) {
+        uint ln, k;
+        if (vert) { ln = i % TE_LINES; k = i / TE_LINES; }   // consecutive threads: consecutive x
+        else { k = i % (uint)TE_SPAN; ln = i / (uint)TE_SPAN; }
+        const int ga = clamp(a0 - TE_RMAX + (int)k, 0, nA - 1);
+        const int gc = min(c0 + (int)ln, nC - 1);
+        gVx[ln * TE_STRIDE + k] = fIn0.Load(vert ? int3(gc, ga, 0) : int3(ga, gc, 0));
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (fOp == 0u) ExtVChains(true, t); else ExtVChains(false, t);
+    GroupMemoryBarrierWithGroupSync();
+    if (fOp == 0u) ExtVStore(true, t, vert, a0, c0, nA, nC); else ExtVStore(false, t, vert, a0, c0, nA, nC);
+}
+)";
 
 // ---- the cone / the reach (fN <= 8 iterations per dispatch; replaces each iteration's FadeExt r 1 vertical + horizontal
 // + FadePix CONE / CONEF): c <- max(c, maxf3(c) - dec), maxf3 = the vertical max(max(c[y-1], c[y]), c[y+1]) then the
