@@ -1121,7 +1121,7 @@ void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
             if (vert) { ln = i % TG_LINES; k = i / TG_LINES; }   // consecutive threads: consecutive x
             else { k = i % span; ln = i / span; }
             const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
-            const int gc = min(c0 + (int)ln, nC - 1);
+            const int gc = clamp(c0 + (int)ln, 0, nC - 1);
             gT[ln * TG_STRIDE + k] = GtClamp(FadeUpAt(fIn0, vert ? int2(gc, ga) : int2(ga, gc), fC1));
         }
     } else {
@@ -1132,7 +1132,7 @@ void GtFill(bool vert, int a0, int c0, int r, int nA, int nC, uint t) {
             if (vert) { ln = i % TG_LINES; k = i / TG_LINES; }
             else { k = i % span; ln = i / span; }
             const int ga = clamp(a0 - r + (int)k, 0, nA - 1);
-            const int gc = min(c0 + (int)ln, nC - 1);
+            const int gc = clamp(c0 + (int)ln, 0, nC - 1);
             gT[ln * TG_STRIDE + k] = GtClamp(fIn0.Load(vert ? int3(gc, ga, 0) : int3(ga, gc, 0)));
         }
     }
@@ -1247,6 +1247,54 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         else { a = e % TG_LEN; ln = e / TG_LEN; }
         const int ga = a0 + (int)a, gc = c0 + (int)ln;
         if (ga < nA && gc < nC) GtStore(vert ? int2(gc, ga) : int2(ga, gc), gT[ln * 65u + a]);
+    }
+}
+)";
+
+// ---- lv's horizontal pass and its |grad| in one (FadeGaussHG, per lv sigma 4 / 24 / 2 / 6): a group walks a strip of
+// HG_W columns down HG_H rows. It forms the horizontal sums of the strip's HG_W + 2 columns (x - 1 .. x + HG_W) for the
+// rows y - 1 .. y + HG_H, TG_LINES rows at a time (FadeGaussT's tile, fill and Kahan sweep: its horizontal pass value
+// for value), keeps them in groupshared memory and writes FadeGrad of the inner HG_W x HG_H from them (np.gradient's
+// central / one-sided differences, the same operations): the horizontal sums are not written and read back, and one
+// dispatch does what two did.
+inline const char* g_faldFadeGaussHGSource = R"(
+RWTexture2D<float> hgOut : register(u0);
+#define HG_W 62
+#define HG_H 46
+#define HG_ROWS (HG_H + 2)    // three tiles of TG_LINES rows
+#define HG_S (HG_W + 3)
+groupshared float gHg[HG_ROWS * HG_S];
+[numthreads(16, 16, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const int r = TG_RMAX;
+    const int W = (int)fInW, H = (int)fInH;
+    const int xi = (int)gid.x * HG_W, yi = (int)gid.y * HG_H;   // the inner block's origin
+    const uint t = tid.y * 16u + tid.x;
+    const uint lineIx = tid.x, lane = FadeLanePerm(tid.y);
+    const int base = (int)(lineIx * TG_STRIDE) + r + 4 * (int)lane;
+    [loop] for (int k = 0; k < HG_ROWS / TG_LINES; k++) {
+        GtFill(false, xi - 1, yi - 1 + TG_LINES * k, r, W, H, t);   // rows / columns outside the frame: clamped, never read
+        GroupMemoryBarrierWithGroupSync();
+        float o0, o1, o2, o3;
+        GtSweep(base, TG_SIGMA, false, o0, o1, o2, o3);
+        const uint hb = (uint)(TG_LINES * k + (int)lineIx) * HG_S + 4u * lane;
+        gHg[hb] = o0; gHg[hb + 1u] = o1; gHg[hb + 2u] = o2; gHg[hb + 3u] = o3;
+        GroupMemoryBarrierWithGroupSync();   // every tap read before the next rows' fill; the sums before the gradient
+    }
+    for (uint e = t; e < (uint)(HG_W * HG_H); e += 256u) {
+        const int ix = (int)(e % (uint)HG_W), iy = (int)(e / (uint)HG_W);
+        const int x = xi + ix, y = yi + iy;
+        if (x >= W || y >= H) continue;
+        const uint q = (uint)(iy + 1) * HG_S + (uint)(ix + 1);   // (x, y)
+        precise float gy, gx;
+        if (y == 0) gy = gHg[q + HG_S] - gHg[q];
+        else if (y == H - 1) gy = gHg[q] - gHg[q - HG_S];
+        else gy = (gHg[q + HG_S] - gHg[q - HG_S]) * 0.5f;
+        if (x == 0) gx = gHg[q + 1u] - gHg[q];
+        else if (x == W - 1) gx = gHg[q] - gHg[q - 1u];
+        else gx = (gHg[q + 1u] - gHg[q - 1u]) * 0.5f;
+        precise float g = sqrt(gy * gy + gx * gx);
+        hgOut[uint2(x, y)] = g;
     }
 }
 )";
