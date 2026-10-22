@@ -506,8 +506,12 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   allocations in one present); each texture is cleared as it is created and each pass is run once over an empty domain
   there, so the driver's first touch of the memory (~40 ms at 4K) and its own compile do not land in the first content
   frame. The layer runs without the fade until then. A run without new content on
-  the same frame (LED lag off) reuses both rounds' reach. VRAM at 4K: ~480 MB. Float32 twin:
-  `DLC/src/dlc/fald/fadeemu.py`.
+  the same frame (LED lag off) reuses both rounds' reach. GPU time of the fade on an RTX 5090 (boosted clock; the layer
+  with it minus without it): 4K 4.8 ms per content frame and 0.1 ms per present without new content, 1440p 2.4 /
+  0.02 ms, 1080p 1.6 / 0.02 ms; the first content frame with it costs the same. VRAM at 4K: ~490 MB. Two steps are
+  within the frozen gate-1 tolerances of the float64 twin rather than the first port's arithmetic bit for bit: the
+  phase correlation by a float32 FFT, and plain float32 sums on the Gaussians that feed thresholds and blends (lv's
+  four, which feed gradients, keep their Kahan sums). Float32 twin: `DLC/src/dlc/fald/fadeemu.py`.
 - **The flank fade's GPU safety governor** (`shared/fald_fade_governor.h`, overlay and hook alike): the GPU time of the
   fade's passes is measured on every content frame with timestamp queries read a few frames later (no flush, no wait).
   Budget = 15 % of the content-frame interval (median over the last 120 content frames), never more than the refresh
