@@ -161,7 +161,9 @@ RWStructuredBuffer<uint> o : register(u0);
 
 #ifdef FALD_FADE_HAS_PASS_HOOK
 // FALD_HW_PROFILE=1: a timestamp before and after every fade pass of the timed content frames (fade on), summed per
-// kernel -> <out>/profile_<case>.csv (the timestamps serialise the passes a little: shares, not a frame time).
+// kernel -> <out>/profile_<case>.csv, and per dispatch in the frame's order -> <out>/profile_<case>_dispatch.csv (one
+// kernel's dispatches told apart: an up-sampled Gaussian from a plain one; the timestamps serialise the passes a little:
+// shares, not a frame time).
 struct HwProfiler : FaldFadePassHook {
     static const int kMax = 1024;
     ID3D11Query* q[2 * kMax] = {};
@@ -170,6 +172,8 @@ struct HwProfiler : FaldFadePassHook {
     bool on = false;
     std::vector<double> sumUs;
     std::vector<unsigned long long> count;
+    std::vector<double> seqUs;          // per dispatch of the frame, in order (the same sequence every content frame)
+    std::vector<unsigned int> seqKern;
     int frames = 0;
     explicit HwProfiler(ID3D11Device* dev) : sumUs(FaldFadeKernelCount(), 0.0), count(FaldFadeKernelCount(), 0) {
         D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP, 0 };
@@ -193,6 +197,8 @@ struct HwProfiler : FaldFadePassHook {
             while (ctx->GetData(q[2 * i + 1], &b, 8, 0) != S_OK) {}
             sumUs[kern[i]] += (double)(b - a) * 1e6 / (double)freq;
             count[kern[i]]++;
+            if ((size_t)i >= seqUs.size()) { seqUs.push_back(0.0); seqKern.push_back(kern[i]); }
+            if (seqKern[(size_t)i] == kern[i]) seqUs[(size_t)i] += (double)(b - a) * 1e6 / (double)freq;
         }
         if (n) frames++;
         n = 0;
@@ -202,6 +208,9 @@ struct HwProfiler : FaldFadePassHook {
         f << "kernel,dispatches_per_frame,us_per_frame\n";
         for (size_t k = 0; k < sumUs.size(); k++)
             if (count[k]) f << FaldFadeKernelName((unsigned int)k) << "," << (double)count[k] / frames << "," << sumUs[k] / frames << "\n";
+        std::ofstream g(path.substr(0, path.size() - 4) + "_dispatch.csv");   // FALD_HW_PROFILE: each dispatch of the frame
+        g << "index,kernel,us_per_frame\n";
+        for (size_t i = 0; i < seqUs.size(); i++) g << i << "," << FaldFadeKernelName(seqKern[i]) << "," << seqUs[i] / frames << "\n";
     }
 };
 #endif
@@ -386,6 +395,7 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
                 prof.Write(out + "/profile_" + hc.id + ".csv");
                 std::fill(prof.sumUs.begin(), prof.sumUs.end(), 0.0);
                 std::fill(prof.count.begin(), prof.count.end(), 0ull);
+                prof.seqUs.clear(); prof.seqKern.clear();
                 prof.frames = 0;
             }
 #endif

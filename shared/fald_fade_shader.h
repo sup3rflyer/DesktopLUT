@@ -37,7 +37,8 @@
 // The tiled Gaussians have their radius and their float32 weights compiled in (one class per sigma, fald_fade.cpp
 // BakedWeightsSource) and their steps unrolled (2026-10-22, the same operations without the weight loads and the loop);
 // a tile's plain loads, its stores, mi's 8 x 8 blocks, the knee cap's 4 x 4 and the cone's tile loops are unrolled so a
-// thread's loads are in flight together (the fills were latency-bound: FadeGauss2D16 without its sums took 68 % of it).
+// thread's loads are in flight together (the fills were latency-bound: FadeGauss2D16 without its sums took 68 % of it),
+// and lv's horizontal passes write their |grad| themselves (FadeGaussHG, a strip walk: the sums are not stored).
 // FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
 // Within the frozen gate-1 tolerances (not bit-identical; DLC tests/fald_fade_frozen_tolerances_f12b.json): Z8, the
 // phase correlation's transforms by a float32 FFT (FadeFft; the dense DFT stays for 1/8-res lines over 1024); Z9, plain
