@@ -1,6 +1,8 @@
-// The frozen fade stack F12A_B16 — HLSL: ASF10 + T11_TMTC (frozen by the owner 2026-10-19: "freeze without the floor fix")
+// The frozen fade stack F12B_V8d — HLSL: ASF10 + T11_TMTC (frozen by the owner 2026-10-19: "freeze without the floor fix")
 // + round 12a's line fixes A (FADE_CL_PAD: the CL closing on the zero-padded map) and B16 (the lit floor's sigma-16
-// Gaussian), FREEZE 2026-10-20 F12A_B16 (r12a/PORT_DELTA.md; twin r12a/cands12a.py F12A_B16).
+// Gaussian), FREEZE 2026-10-20 F12A_B16 (r12a/PORT_DELTA.md; twin r12a/cands12a.py F12A_B16), + round 12b's halo fix V8d
+// (FADE_FV_*: the floor-valley gate V on the flank term, raw = G4(maxf25(raw0 (1 - (1 - w) V)))), FREEZE 2026-10-21
+// F12B_V8d (r12b/PORT_DELTA.md; twin r12b/cands12b.py F12B_V8d).
 //
 // What it is: a field `fade` in [0, 1] per pixel that pulls the FALD layer's correction back toward "layer off" on smooth
 // steep flanks (the ASF9o fade: flank term, robust thin-step protection, push-pull + hybrid fill, closing CL, cone), low-
@@ -78,6 +80,10 @@ static const float FADE_PP_CONF = 4.0f;
 static const float FADE_HYB_W0 = 0.25f;
 static const float FADE_CL_TH_LO = 0.7f, FADE_CL_TH_HI = 1.5f;
 static const uint FADE_CL_PAD = 80u;   // A (F12A_B16): the CL closing's zero padding = 2 x its radius 40 (1/8-res texels)
+// V8d (F12B_V8d): the floor-valley gate's thresholds, float32 of ln 1.5 / ln 2 / ln 3 (0x3ECF991F / 0x3F317218 /
+// 0x3F8C9F54), and the darkest-object test's soft offset (ln units); its radii are the C++'s (fald_fade.cpp kFv*)
+static const float FADE_FV_LN15 = 0.405465096f, FADE_FV_LN2 = 0.693147182f, FADE_FV_LN3 = 1.09861231f;
+static const float FADE_FV_DARK = 20.0f;
 static const float FADE_OF_LIT_LO = 1.0f, FADE_OF_LIT_HI = 3.0f, FADE_OF_POS_HI = 0.03f;
 static const float FADE_T_EPS = 0.02f, FADE_T_A0 = 0.25f, FADE_T_R_LO = 0.05f, FADE_T_R_HI = 0.2f;
 static const float FADE_T_CD = 0.5f, FADE_T_CFRAC = 0.15f, FADE_T_CH = 0.2f;
@@ -194,13 +200,27 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
-// ---- f x f mean (edge replicate): row-major sum, x fC0 (= 1 / f^2). fOp bit 0 = clamp the input into [0, 1e4].
+// ---- f x f mean (edge replicate): row-major sum, x fC0 (= 1 / f^2). fOp bit 0 = clamp the input into [0, 1e4]; bit 1 =
+// the f x f block MIN instead (the twin's replicate-padded -max_pool2d(-x): V8d's min8; the same indexing, row-major).
 inline const char* g_faldFadeDownSource = R"(
 RWTexture2D<float> dOut : register(u0);
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= fOutW || id.y >= fOutH) return;
     int f = (int)fFactor;
+    if ((fOp & 2u) != 0u) {
+        float mn = 0.0f;
+        for (int my = 0; my < f; my++) {
+            int sy = min((int)id.y * f + my, (int)fInH - 1);
+            for (int mx = 0; mx < f; mx++) {
+                float v = fIn0.Load(int3(min((int)id.x * f + mx, (int)fInW - 1), sy, 0));
+                if ((fOp & 1u) != 0u) v = min(max(v, 0.0f), 1e4f);
+                mn = (my == 0 && mx == 0) ? v : min(mn, v);
+            }
+        }
+        dOut[id.xy] = mn;
+        return;
+    }
     precise float s = 0.0f;
     for (int dy = 0; dy < f; dy++) {
         int sy = min((int)id.y * f + dy, (int)fInH - 1);
@@ -284,6 +304,13 @@ void main(uint3 id : SV_DispatchThreadID) {
 //  18 SUB    t24 a, t25 b -> u0 a - b
 //  19 TOUT   t24 fade, t25 up4(s - fq) -> u0 clamp(fade + d, 0, 1)
 //  20 PAD    t24 f8 -> u0 f8 zero-padded by FADE_CL_PAD on every side (dispatched over the padded domain; A)
+// V8d, the floor-valley gate (r12b/cands12b.py floor_valley8 + fade12b; 1/8 res unless noted):
+//  21 FVV    t24 Lc = grey_close(l8, 33), t25 lmin8, t26 grey_open(Lc, 133) -> u0 v = (smooth(ln 1.5, ln 2, Lc - lmin8)
+//            smooth(0, ln 3, Lc)) (1 - smooth(ln 1.5, ln 3, Lc - open))
+//  22 FVLEV  t24 lmin8, t25 v -> u0 lmin8 + (1 - v) 20 (the object level; its minf 11 follows)
+//  23 FVGATE t24 Vd = maxf11(v), t25 vlev = minf11(FVLEV), t26 minf11(lmin8) -> u0 V8 = Vd (1 - smooth(ln 1.5, ln 2,
+//            vlev - dmin))
+//  24 FVSRC  full res: t24 raw0, t25 w, t26 up8(V8) -> u0 raw0 (1 - (1 - w) clamp(V, 0, 1)) (the flank term's source)
 inline const char* g_faldFadePixSource = R"(
 RWTexture2D<float> pOut0 : register(u0);
 RWTexture2D<float> pOut1 : register(u1);
@@ -382,6 +409,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         int2 q = int2(p) - (int)FADE_CL_PAD;
         bool inside = q.x >= 0 && q.y >= 0 && q.x < (int)w8 && q.y < (int)h8;
         pOut0[p] = inside ? L(fIn0, uint2(q)) : 0.0f;
+    } else if (fOp == 21u) {
+        precise float lc = L(fIn0, p);
+        precise float v = FadeSmooth(FADE_FV_LN15, FADE_FV_LN2, lc - L(fIn1, p)) * FadeSmooth(0.0f, FADE_FV_LN3, lc)
+                          * (1.0f - FadeSmooth(FADE_FV_LN15, FADE_FV_LN3, lc - L(fIn2, p)));
+        pOut0[p] = v;
+    } else if (fOp == 22u) {
+        precise float lev = L(fIn0, p) + (1.0f - L(fIn1, p)) * FADE_FV_DARK;
+        pOut0[p] = lev;
+    } else if (fOp == 23u) {
+        precise float gap = L(fIn1, p) - L(fIn2, p);
+        precise float v8 = L(fIn0, p) * (1.0f - FadeSmooth(FADE_FV_LN15, FADE_FV_LN2, gap));
+        pOut0[p] = v8;
+    } else if (fOp == 24u) {
+        precise float V = min(max(L(fIn2, p), 0.0f), 1.0f);
+        precise float s = L(fIn0, p) * (1.0f - (1.0f - L(fIn1, p)) * V);
+        pOut0[p] = s;
     }
 }
 )";

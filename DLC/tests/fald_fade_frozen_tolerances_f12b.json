@@ -1,0 +1,24 @@
+{
+  "frozen": "2026-10-21, branch fald/f12b-port (from main 014d4b9), BEFORE any comparison run of the F12B_V8d port (no fadeemu / HLSL code for V existed when this was written)",
+  "source": "results/fald_nearfield_2026-10-17/r12b/PORT_DELTA.md (sha256 e24126ea7318156efab03a59a44c72fe2c9f77768afe2077123e84898e040f3a) + r12b/FREEZE_F12B_V8d.md (sha256 5e94b3a70f7fb0a7e3939525d235aca288e7d848031501ac01c496bf9dae2189), FROZEN_hashlog.txt FREEZE 2026-10-21 F12B_V8d",
+  "rule": "These numbers are not changed after a comparison has run. A failure is investigated and reported; a tolerance is never widened.",
+  "numbers_from": "DLC/tests/fald_fade_frozen_tolerances.json, sha256 (LF) 9267ba793571f4f1da0eb35986f7ca7ac11a423ee02817c9365bbcc051f1fb25 — its gate1_f32_vs_f64 and gate2_hlsl_vs_f32 blocks, unchanged; the gate tests read the numbers from it and check the three files' hashes",
+  "off_gate": "unchanged: bit for bit against tests/fixtures/fald_fade_off_main.hashes",
+  "gate1_f32_vs_f64": "as fald_fade_frozen_tolerances.json gate1_f32_vs_f64 (fields 2e-4 abs incl. fade, fade_T, s, reach_r0/1; lit 2e-4 abs, F 2e-4 rel; out16 >= 99.9 % within 2 FP16 steps, max 8; cut / shift as before), the twin = r12b/cands12b.py F12B_V8d, the study logs = r12b/out/motion12b F12B_V8d",
+  "gate2_hlsl_vs_f32": "as fald_fade_frozen_tolerances.json gate2_hlsl_vs_f32 (out16 <= 1 step; base fields rtol 1e-6 / atol 2e-5; fade fields rtol 1e-6 / atol 5e-5; F rel 1e-5; flags array_equal; shift 1e-3 texel)",
+  "note": "V (the floor-valley gate) is not a new gated field: it enters the output only through raw -> fade, fade_T, s, reach, out, which are compared as before. Its own differences are reported, not gated: gate 2 the 1/8-res V8 (v8.f32 vs fadeemu), gate 1 the full-res V (cands12b.floor_valley8 vs fadeemu).",
+  "cells": "the current set + the round-12b halo cells ax_552, ax_412, ax_422, ax_442, ax_492, ax_522, s10_sm_windmill, s10_sm_cows, s10_sm_snowfence, s10_ac_rec2020 (DLC tests/fald_fade_cells.py f12b; aces_m18 / aces_m52 already in the set)",
+  "line_halo_checks": {
+    "what": "on the port's own WARP output (stateless, the live HDR file C), luminance of the FP16 output (BT.2020 nits, K_2020), against the base-only dump (C): the m18 lamp ring of r12b/score12b.py lamp_ring (post12a's head mask, ring 4-24 px; median / p95 / max of log2(Y / Y_C) in %) and r12a/lines12a.line_metric (Ln-1 m18 bar, Ln-2 m52 16-px step)",
+    "ring": "each of median / p95 / max within 0.1 pp (one FP16 step ~ 0.1 %) of the twin's same metric on its own FP16 output (H:/scratch/DesktopLUT/fald_r12b/sl/aces_m18__{C,F12B_V8d}/out16.npy); the twin's float64-request numbers 0.57 / 0.94 / 1.28 % (F12A_B16 1.11 / 3.36 / 7.81 %) are reported beside",
+    "lines": "the port's Ln-1 / Ln-2 not above the port's F12A_B16 values (main 014d4b9's build, same metric) + 0.05 pp, and within the round's limits (1.0 % / 3.0 %)"
+  },
+  "misses": "every miss is traced and classified: INHERITED (the same miss of the same kind and size on main 014d4b9's F12A_B16 build, replayed with main's fadeemu) or NEW",
+  "negative_control": {
+    "rule": "a deliberate mutation must FAIL the gate it belongs to on aces_m18; the code is restored and the gate passes again",
+    "mutations": [
+      "one V constant: the dilation radius 5 -> 4 texels (fadeemu FV_DIL_R for gate 1; the C++ kFvDilR for gate 2)",
+      "the gate off: V = 0 (fadeemu FV_ON = False for gate 1; the HLSL FVSRC with V = 0 for gate 2); with V = 0 the HLSL output must equal main's F12A_B16 dump of the same frame byte for byte"
+    ]
+  }
+}

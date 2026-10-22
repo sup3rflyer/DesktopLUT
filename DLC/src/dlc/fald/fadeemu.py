@@ -1,6 +1,6 @@
-"""The frozen fade stack F12A_B16 (FREEZE 2026-10-20: ASF10 + T11_TMTC of 2026-10-19 + the line fixes A and B16) as a float32,
-GPU-order twin: what shared/fald_fade_shader.h computes, operation for operation, next to :class:`dlc.fald.gpuemu.Emu`
-(which this module uses unchanged for the layer underneath).
+"""The frozen fade stack F12B_V8d (FREEZE 2026-10-21: ASF10 + T11_TMTC of 2026-10-19 + the line fixes A and B16 of
+2026-10-20 + round 12b's halo fix V8d) as a float32, GPU-order twin: what shared/fald_fade_shader.h computes, operation for
+operation, next to :class:`dlc.fald.gpuemu.Emu` (which this module uses unchanged for the layer underneath).
 
 Reference = the float64 study twin (DLC results/fald_nearfield_2026-10-17: r10/temu.py ``fade9_t`` + r10/cands10.py
 ``floor_lit`` / ``knee_reach`` + r11/cands11.py ``make_post11`` (gc = oc = None) + r11/T/tl11.py ``TL11State`` with
@@ -8,9 +8,15 @@ Reference = the float64 study twin (DLC results/fald_nearfield_2026-10-17: r10/t
 two fixes (r12a/cands12a.py variant ``F12A_B16``, "FREEZE 2026-10-20 F12A_B16"):
   * A — the CL closing of the 1/8-res fade runs on the map zero-padded by ``CL_PAD`` = 2 x 40 texels (the closing of the
     map embedded in fade 0; cropped back);
-  * B16 — the lit floor's 1/8-res opening is blurred by a Gaussian sigma ``OF_FLOOR_SIG`` = 16 texels before up8.
-The port briefs are r11/PORT_PLAN.md and its delta r12a/PORT_DELTA.md. To reproduce the frozen twin itself, import those study sources with this package on the path (they
-use :mod:`dlc.fald.gpuemu`, whose file is unchanged): DLC tests/test_fald_fade_gate1.py does exactly that.
+  * B16 — the lit floor's 1/8-res opening is blurred by a Gaussian sigma ``OF_FLOOR_SIG`` = 16 texels before up8;
+plus round 12b's fix (r12b/cands12b.py variant ``F12B_V8d``, "FREEZE 2026-10-21 F12B_V8d"):
+  * V8d — the floor-valley gate on the flank term: raw = G4(maxf25(raw0 (1 - (1 - w) V))), V = :func:`floor_valley8`
+    (1/8 res: 1 within ~40 px of a dark object under ~264 px wide, 1.5-2 x darker than its lit surround, the surround on
+    its own floor, the object the darkest thing in reach), so the thin-step mask's own raw0 does not spread or fill the
+    fade round a small dark object on a lit floor (marker 18's lamp-head halo). ``FV_ON = False`` = V 0 = F12A_B16.
+The port briefs are r11/PORT_PLAN.md and its deltas r12a/PORT_DELTA.md, r12b/PORT_DELTA.md. To reproduce the frozen twin
+itself, import those study sources with this package on the path (they use :mod:`dlc.fald.gpuemu`, whose file is
+unchanged): DLC tests/test_fald_fade_gate1.py does exactly that.
 
 What is float32 GPU order here (and therefore in the HLSL):
   * every texture is float32 (R32F; complex = two float32);
@@ -57,6 +63,12 @@ CONE_Q, CONE_DEC, CONE_ITERS, CONE_SIG = 4, 4.0 / 64.0, 16, 4.0
 LOG_FLOOR = 0.05
 OF_LIT, OF_POS_HI, OF_D, OF_LAM, OF_OPEN_R, OF_ITERS, OF_SIG = (1.0, 3.0), 0.03, 96.0, 2.0, 50, 24, 4.0
 OF_FLOOR_SIG = 16.0                  # B16: the lit floor's Gaussian on the 1/8-res opening (floor(50 / 3) texels)
+# V8d (F12B_V8d, r12b/PORT_DELTA.md §1.2; = fald_fade_shader.h FADE_FV_*, fald_fade.cpp kFv*): the floor-valley gate at 1/8 res
+FV_Q = 8                             # its resolution (= CL_Q)
+FV_CLOSE_R, FV_OPEN_R, FV_DIL_R = 16, 66, 5   # grey_close 33 (264 px), grey_open 133 (1064 px), maxf / minf 11 (40 px)
+FV_LN15, FV_LN2, FV_LN3 = math.log(1.5), math.log(2.0), math.log(3.0)   # thresholds (float32 at use)
+FV_DARK = 20.0                       # the darkest-object test's soft offset where v = 0 (ln units)
+FV_ON = True                         # False = V 0 everywhere (src0 = raw0 exactly: F12A_B16) — the negative control
 T_EPS, T_A0, T_R, T_RSIG = 0.02, 0.25, (0.05, 0.2), 1.0
 T_CD, T_CFRAC, T_CH, T_NBINS = 0.5, 0.15, 0.2, 64
 T_HLO, T_HHI = math.log(0.02), math.log(2000.0)
@@ -244,6 +256,22 @@ def block_max(a, f):
     return out
 
 
+def block_min(a, f):
+    """f x f block min (the twin's replicate-padded -max_pool2d(-x): the min over the block's in-frame pixels; FadeDown
+    fOp bit 1)."""
+    a = np.asarray(a, f32)
+    H, W = a.shape
+    Ho, Wo = -(-H // f), -(-W // f)
+    yy, xx = np.arange(Ho) * f, np.arange(Wo) * f
+    out = None
+    for dy in range(f):
+        rows = a[np.minimum(yy + dy, H - 1)]
+        for dx in range(f):
+            v = rows[:, np.minimum(xx + dx, W - 1)]
+            out = v.copy() if out is None else np.fmin(out, v)
+    return out
+
+
 def _up_axis(n_out, n_in, f):
     t = ((np.arange(n_out, dtype=f32) + f32(0.5)) * f32(1.0 / f) - f32(0.5)).astype(f32)
     fl = np.floor(t)
@@ -282,9 +310,30 @@ def pushpull(v, w, prior=PP_PRIOR, conf=PP_CONF, sig=1.0):
     return E
 
 
+def floor_valley8(ms):
+    """cands12b.floor_valley8 with fv_darkest (F12B_V8d) in float32 GPU order: ms = the SANITISED max channel. Returns
+    the 1/8-res gate V8 (the full-res V = clamp(up8(V8), 0, 1)).
+      l8 = ln max(down8(ms), 0.05)  (= the CL's l8),  lmin = ln max(min8(ms), 0.05)
+      Lc = grey_close(l8, 33),  Lo = grey_open(Lc, 133)
+      v = (smooth(ln 1.5, ln 2, Lc - lmin) smooth(0, ln 3, Lc)) (1 - smooth(ln 1.5, ln 3, Lc - Lo))
+      V8 = maxf(v, 11) (1 - smooth(ln 1.5, ln 2, minf(lmin + (1 - v) 20, 11) - minf(lmin, 11)))
+    (FadePix FVV / FVLEV / FVGATE, FadeDown's block min)."""
+    l8 = np.log(hmax(down(ms, FV_Q), f32(LOG_FLOOR))).astype(f32)
+    lmin = np.log(hmax(block_min(ms, FV_Q), f32(LOG_FLOOR))).astype(f32)
+    Lc = grey_close(l8, 2 * FV_CLOSE_R + 1)
+    Lo = grey_open(Lc, 2 * FV_OPEN_R + 1)
+    v = ((smooth(FV_LN15, FV_LN2, (Lc - lmin).astype(f32)) * smooth(0.0, FV_LN3, Lc)).astype(f32)
+         * (f32(1.0) - smooth(FV_LN15, FV_LN3, (Lc - Lo).astype(f32)))).astype(f32)
+    vd = maxf(v, 2 * FV_DIL_R + 1)
+    vlev = minf((lmin + (f32(1.0) - v) * f32(FV_DARK)).astype(f32), 2 * FV_DIL_R + 1)
+    dmin = minf(lmin, 2 * FV_DIL_R + 1)
+    return (vd * (f32(1.0) - smooth(FV_LN15, FV_LN2, (vlev - dmin).astype(f32)))).astype(f32)
+
+
 def fade9(mi, keep: bool = False):
-    """r10/temu.fade9_t with cands9.DEF and intr off (ASF9o), float32 GPU order. mi = the frame's max channel
-    (unsanitised; the sanitise step is the first one here). Returns fade (H, W) float32 (+ the parts with keep)."""
+    """r10/temu.fade9_t with cands9.DEF and intr off (ASF9o) + round 12b's V8d gate on the flank term (r12b/cands12b.fade12b,
+    F12B_V8d), float32 GPU order. mi = the frame's max channel (unsanitised; the sanitise step is the first one here).
+    Returns fade (H, W) float32 (+ the parts with keep)."""
     ms = sanitize(np.asarray(mi, f32))
     H, W = ms.shape
     lv = np.log(hmax(ms, f32(LOG_FLOOR))).astype(f32)
@@ -292,7 +341,6 @@ def fade9(mi, keep: bool = False):
     gl = grad_mag(gauss(lv, SIG_L))
     y = (f32(LAM) * hmin(gs, gl)).astype(f32)
     raw0 = (f32(1.0) - f32(1.0) / (f32(1.0) + y * y)).astype(f32)
-    raw = gauss(maxf(raw0, 2 * RCLOSE + 1), 4.0)
     # thin step flag with the robust (noise-floor) gate
     g1 = grad_mag(gauss(lv, 2.0))
     g2 = grad_mag(gauss(lv, 6.0))
@@ -304,6 +352,12 @@ def fade9(mi, keep: bool = False):
     thin = (smooth(RS_RATIO[0], RS_RATIO[1], (g1 / hmax(g2, f32(1e-9))).astype(f32)) * gate).astype(f32)
     step = hclamp(gauss(maxf(thin, 2 * RMAX + 1), 4.0), 0.0, 1.0)
     w = (f32(1.0) - step).astype(f32)
+    # V8d: the step's own raw0 does not spread near a small dark object on a lit floor (cands12b.fade12b, fv_mode "m"):
+    # src0 = raw0 (1 - (1 - w) V), V = clamp(up8(V8), 0, 1); raw = G4(maxf25(src0)) — raw is formed after w now
+    v8 = floor_valley8(ms) if FV_ON else np.zeros((-(-H // FV_Q), -(-W // FV_Q)), f32)
+    V = hclamp(up(v8, FV_Q, (H, W)), 0.0, 1.0)
+    src0 = (raw0 * (f32(1.0) - (f32(1.0) - w) * V)).astype(f32)
+    raw = gauss(maxf(src0, 2 * RCLOSE + 1), 4.0)
     care = smooth(CARE[0], CARE[1], gauss(ms, 2.0))
     # push-pull + hybrid fill
     ws = (w * care).astype(f32)
@@ -337,7 +391,7 @@ def fade9(mi, keep: bool = False):
     fade = (fade + w * hmax(cu - fade, f32(0.0))).astype(f32)
     fade = hclamp(fade, 0.0, 1.0)
     if keep:
-        return fade, {"raw": raw, "w": w, "care": care, "fade0": fade0, "fill": F, "cl_add": add, "cone": cu}
+        return fade, {"raw": raw, "w": w, "care": care, "fade0": fade0, "fill": F, "cl_add": add, "cone": cu, "v8": v8, "V": V}
     return fade
 
 
@@ -760,7 +814,7 @@ class FrozenDrives:
 
 
 class FadeEmu:
-    """One frame of FaldRunPasses with the flank fade ON (ASF10 + T11_TMTC), the layer underneath = :class:`Emu`
+    """One frame of FaldRunPasses with the flank fade ON (F12B_V8d), the layer underneath = :class:`Emu`
     (unchanged: its own float64 arithmetic where the existing WARP replays accept it). Order (TEmu.run / PORT_PLAN
     2.2): Balance -> the fade, F, T (once per content frame) -> round 0 -> kc -> reach_0 -> FadePost -> round 1's
     statistic -> round 1 -> kc -> reach_1 -> FadePost -> FP16 (truncating, as gpuemu)."""
@@ -794,13 +848,16 @@ class FadeEmu:
                 img, _ = e.balance(src, plan, sp)
         img32 = np.asarray(img, f32)
         mi = hmax(img32[0], hmax(img32[1], img32[2]))
-        fade = fade9(mi)
+        fade, parts9 = fade9(mi, keep=True)
+        v8 = parts9["v8"]                     # V8d's 1/8-res gate (a diagnostic: the device dumps it as v8.f32)
+        del parts9
         fade_t = tstate.apply(fade, mi) if tstate is not None else fade
         F = floor_lit(mi)
         dec = reach_dec(mi)
         sT1 = e.sample(e.flatT.astype(np.float64))
         sE1 = e.sample(e.flatE.astype(np.float64))
-        out = {"mi": mi, "fade": fade, "fade_t": fade_t, "F": F, "dec": dec, "s": None if tstate is None else tstate.s}
+        out = {"mi": mi, "fade": fade, "fade_t": fade_t, "F": F, "dec": dec, "v8": v8,
+               "s": None if tstate is None else tstate.s}
 
         def round_(r, stat_img, img_for_correct):
             if frozen is not None:

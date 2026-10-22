@@ -1,6 +1,8 @@
 """Gate 2 of the frozen fade-stack port (results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md 5.2, step 2): the HLSL on the
 WARP device against the float32 GPU-order twin dlc.fald.fadeemu (on dlc.fald.gpuemu.Emu with WARP's sampler model), with
-the tolerances frozen in tests/fald_fade_frozen_tolerances.json before any comparison ran.
+the tolerances frozen in tests/fald_fade_frozen_tolerances.json before any comparison ran (re-frozen unchanged for the
+F12A_B16 and F12B_V8d ports: tests/fald_fade_frozen_tolerances_f12a.json / _f12b.json, all three hashes checked). Since
+F12B_V8d the dump also holds V8d's 1/8-res gate (v8.f32): its difference is reported (v8_diag), not gated.
 
 Device side: the C++ case "FALD fade ON: WARP dumps for the DLC replay" (tests/test_fald_fade.cpp) — the overlay's layer,
 stateless (temporal mode 0), starfield at its defaults (= the owner's settings), the flank fade on; one monitor context per
@@ -38,9 +40,13 @@ TOL_FILE = HERE / "fald_fade_frozen_tolerances.json"
 TOL_SHA_LF = "9267ba793571f4f1da0eb35986f7ca7ac11a423ee02817c9365bbcc051f1fb25"
 TOL_F12A_FILE = HERE / "fald_fade_frozen_tolerances_f12a.json"   # the F12A_B16 port's freeze (the same numbers)
 TOL_F12A_SHA_LF = "15dc5ff7e070096c20d3f855147a4ab62236857fe2968d417a33b9d8c1693f1f"
+TOL_F12B_FILE = HERE / "fald_fade_frozen_tolerances_f12b.json"   # the F12B_V8d port's freeze (the same numbers)
+TOL_F12B_SHA_LF = "3f87bae6403168534b17c5b0f38d86ca8af5900c8b5624b30a1acc97f58d372d"
 STILLS = ("p03_hl_grey5", "p02_hl_black", "n7_lamp", "n8_chess", "n9_cactus", "k1_held", "o1_held", "p07_dark_bar0",
           "s10_sm_seattle", "s10_ac_firewater", "x_naninf", "x_odd1366", "sdr_n7_lamp",
-          "aces_m18", "aces_m52", "s10_ac_redspot")    # + round 12a's three (r12a/PORT_DELTA.md §4)
+          "aces_m18", "aces_m52", "s10_ac_redspot",    # + round 12a's three (r12a/PORT_DELTA.md §4)
+          "ax_552", "ax_412", "ax_422", "ax_442", "ax_492", "ax_522",          # + round 12b's ten halo stills
+          "s10_sm_windmill", "s10_sm_cows", "s10_sm_snowfence", "s10_ac_rec2020")   # (r12b/PORT_DELTA.md §4)
 SEQS = ("s10_sm_seattle__p6n", "s10_ac_firewater__p6", "t_hl0_v16__mv", "t_cutdark__mv")
 F_ADVANCE, F_PC_DY, F_PC_DX, F_USED, F_DY, F_DX, F_FRAC, F_EMD, F_CUT = 0, 1, 2, 7, 8, 9, 10, 11, 12
 
@@ -52,6 +58,8 @@ def _tol():
     assert hashlib.sha256(b).hexdigest() == TOL_SHA_LF, "the frozen tolerance file changed"
     b12 = TOL_F12A_FILE.read_bytes().replace(b"\r\n", b"\n")
     assert hashlib.sha256(b12).hexdigest() == TOL_F12A_SHA_LF, "the F12A_B16 tolerance freeze changed"
+    b12b = TOL_F12B_FILE.read_bytes().replace(b"\r\n", b"\n")
+    assert hashlib.sha256(b12b).hexdigest() == TOL_F12B_SHA_LF, "the F12B_V8d tolerance freeze changed"
     return json.loads(b.decode("utf-8"))["gate2_hlsl_vs_f32"]
 
 
@@ -177,6 +185,8 @@ def replay(run: str, rels: list) -> dict:
             rel_F = np.abs(F_dev.astype(np.float64) / res["F"].astype(np.float64) - 1.0)
         rep["F_rel"] = float(np.nanmax(rel_F))
         good = good and rep["F_rel"] <= tol["floor_F_rel"]["tolerance"]
+        if (d / "v8.f32").exists() and res.get("v8") is not None:   # V8d's 1/8-res gate: reported, not gated
+            rep["v8_diag"] = float(np.max(np.abs(_f32(d, "v8.f32", W8, H8).astype(np.float64) - res["v8"].astype(np.float64))))
         fl = np.fromfile(d / "flags.u32", dtype=np.uint32)
         rec = ts.log[-1]
         if not rec.get("init"):

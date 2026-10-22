@@ -1,7 +1,8 @@
 // DesktopLUT - shared/fald_fade.h
-// The frozen fade stack F12A_B16 (FREEZE 2026-10-20: ASF10 + T11_TMTC of 2026-10-19 + the line fixes A — the CL closing on
-// the zero-padded 1/8-res map — and B16 — the lit floor's sigma-16 Gaussian; DLC results/fald_nearfield_2026-10-17/r12a/
-// PORT_DELTA.md) — resources, state and passes, ONE
+// The frozen fade stack F12B_V8d (FREEZE 2026-10-21: ASF10 + T11_TMTC of 2026-10-19 + the line fixes A — the CL closing on
+// the zero-padded 1/8-res map — and B16 — the lit floor's sigma-16 Gaussian — of 2026-10-20 + round 12b's halo fix V8d —
+// the floor-valley gate on the flank term; DLC results/fald_nearfield_2026-10-17/r12a/PORT_DELTA.md, r12b/PORT_DELTA.md)
+// — resources, state and passes, ONE
 // implementation for the overlay (src/fald.cpp) and the DWM hook (dwm_hook/hook_fald.cpp), as shared/fald_temporal.cpp is
 // for LED lag. The HLSL and the rule: shared/fald_fade_shader.h (header comment); the float32 twin: DLC
 // dlc/fald/fadeemu.py; the brief: DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md.
@@ -34,7 +35,7 @@ struct ID3D11SamplerState;
 struct ID3D11Texture2D;
 
 // FaldCB word 75 (fald_shader.h `fadeFlags`)
-constexpr uint32_t FALD_FADE_FLAG_FLANK = 1u;    // bit 0: the ASF10 + T11_TMTC stack
+constexpr uint32_t FALD_FADE_FLAG_FLANK = 1u;    // bit 0: the flank-fade stack (F12B_V8d)
 constexpr uint32_t FALD_FADE_FLAG_LOWEXT = 2u;   // bit 1: item L (the 1-3-nit extension) — RESERVED, never set (round 12)
 
 // The FALD common state the fade passes that read the frame / the round's fields need (the caller's BindCommon views:
@@ -110,6 +111,7 @@ struct FaldFadeDebug {
     ID3D11Texture2D* fq = nullptr;      // quarter res: f_q of the last content frame
     ID3D11Texture2D* dec = nullptr;     // quarter res: knee_reach's per-texel step
     ID3D11Texture2D* kq = nullptr;      // quarter res: the last round's knee-cap block max
+    ID3D11Texture2D* v8 = nullptr;      // eighth res: V8d's gate V8 of the last content frame (before up8 + clamp)
     ID3D11Buffer* flags = nullptr;      // 16 uints (fald_fade_shader.h FADE_FLAG_*)
     unsigned int width = 0, height = 0, wq = 0, hq = 0, w8 = 0, h8 = 0;
     bool hasHistory = false;            // the T state holds a previous frame (CPU-side bookkeeping)
