@@ -25,7 +25,7 @@ enum FadeKernel : unsigned int {
     K_GRAD, K_DOWN, K_UP, K_PIX, K_KNEE, K_ADVANCE, K_MEANWIN, K_DFT, K_CROSS, K_NORM, K_MAXMAG, K_ARGMAX, K_OVERLAP,
     K_CUT, K_WARPQ, K_TM, K_SELECT,
     K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2,
-    K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE,
+    K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT,
     K_COUNT
 };
 struct KernelDef {
@@ -70,7 +70,8 @@ const KernelDef kKernels[K_COUNT] = {
     { "FadeExtT40", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 40\n" },
     { "FadeExtT50", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 50\n" },
     { "FadeExtT66", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 66\n" },
-    { "FadeConeT", &g_faldFadeConeTSource, nullptr, "" } };
+    { "FadeConeT", &g_faldFadeConeTSource, nullptr, "" },
+    { "FadeFft", &g_faldFadeFftSource, nullptr, "" } };
 
 unsigned int GaussKernel(int r) {
     switch (r) {
@@ -120,6 +121,9 @@ const unsigned int kClPad = 80;
 const unsigned int kFvCloseR = 16, kFvOpenR = 66, kFvDilR = 5;
 // The cone / reach iterations per FadeConeT dispatch (its halo, fald_fade_shader.h TC_HALO)
 const unsigned int kConeItersPerPass = 8;
+// Z8: the phase correlation's transforms by FadeFft for lines up to this long (fald_fade_shader.h FFT_MAX: 1/8-res maps of
+// frames up to 8192 px); longer lines keep the dense DFT (FadeDft)
+const unsigned int kFftMax = 1024;
 
 // dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
 // order in double, w[r + j] / sum stored float32.
@@ -938,16 +942,23 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
         { Io a; a.in[0] = f->eL8.srv; a.in[1] = f->eL8Prev[p].srv; One(f, ctx, K_ADVANCE, W8, H8, a); }
         { Io a; a.in[0] = f->eL8.srv; a.out[0] = f->eX.uav; One(f, ctx, K_MEANWIN, W8, H8, a); }
         FadeCBData c = Cb(); c.inW = W8; c.inH = H8; c.c0 = (float)(1.0 / (double)(W8 * H8));   // = fadeemu f32(1 / (H W))
-        { Io a; a.in[0] = f->eX.srv; a.outC[0] = f->eC1.uav; c.op = 0; Pass(f, ctx, K_DFT, c, a, G16(W8), G16(H8)); }
-        { Io a; a.inC[0] = f->eC1.srv; a.outC[0] = f->eSpec.uav; c.op = 1; Pass(f, ctx, K_DFT, c, a, G16(W8), G16(H8)); }
+        // the 2-D transforms: the FFT (Z8; one group per line: x passes H8 groups, y passes W8) or the dense DFT
+        const bool fft = W8 <= kFftMax && H8 <= kFftMax;
+        auto transform = [&](unsigned int op, const Io& a) {
+            c.op = op;
+            if (fft) Pass(f, ctx, K_FFT, c, a, (op == 0u || op == 2u) ? H8 : W8, 1);
+            else Pass(f, ctx, K_DFT, c, a, G16(W8), G16(H8));
+        };
+        { Io a; a.in[0] = f->eX.srv; a.outC[0] = f->eC1.uav; transform(0, a); }
+        { Io a; a.inC[0] = f->eC1.srv; a.outC[0] = f->eSpec.uav; transform(1, a); }
         if (f->hasHistory) {
             FadeCBData cc = Cb(); cc.inW = W8; cc.inH = H8;
             { Io a; a.inC[0] = f->eSpec.srv; a.inC[1] = f->eSpecPrev[p].srv; a.out[0] = f->eMag.uav; a.outC[0] = f->eC1.uav;
               Pass(f, ctx, K_CROSS, cc, a, G16(W8), G16(H8)); }
             { Io a; a.in[0] = f->eMag.srv; One(f, ctx, K_MAXMAG, W8, H8, a); }
             { Io a; a.inC[0] = f->eC1.srv; a.in[0] = f->eMag.srv; a.outC[0] = f->eC2.uav; Pass(f, ctx, K_NORM, cc, a, G16(W8), G16(H8)); }
-            { Io a; a.inC[0] = f->eC2.srv; a.outC[0] = f->eC1.uav; c.op = 2; Pass(f, ctx, K_DFT, c, a, G16(W8), G16(H8)); }
-            { Io a; a.inC[0] = f->eC1.srv; a.out[0] = f->eR.uav; c.op = 3; Pass(f, ctx, K_DFT, c, a, G16(W8), G16(H8)); }
+            { Io a; a.inC[0] = f->eC2.srv; a.outC[0] = f->eC1.uav; transform(2, a); }
+            { Io a; a.inC[0] = f->eC1.srv; a.out[0] = f->eR.uav; transform(3, a); }
             { Io a; a.in[0] = f->eR.srv; One(f, ctx, K_ARGMAX, W8, H8, a); }
             { Io a; a.in[0] = f->eL8.srv; a.in[1] = f->eL8Prev[p].srv; One(f, ctx, K_OVERLAP, W8, H8, a); }
             {

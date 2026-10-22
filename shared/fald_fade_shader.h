@@ -34,6 +34,8 @@
 // pixel step is formed where it is read (FadeUpAt), the pixel step after a Gaussian is done by its horizontal pass, the
 // DFT's twiddle index is carried by increment, and FadePost forms fade_T and the lit floor F itself (fald_shader.h).
 // FadeGauss / FadeExt below are the reference the tiled kernels are checked against (tests); they no longer ship.
+// Within the frozen gate-1 tolerances (not bit-identical; DLC tests/fald_fade_frozen_tolerances_f12b.json): Z8, the
+// phase correlation's transforms by a float32 FFT (FadeFft; the dense DFT stays for 1/8-res lines over 1024).
 #pragma once
 
 // MSVC caps one string literal at 16380 bytes (C2026): each pass is its own literal; the common fade source too.
@@ -594,6 +596,88 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         precise float v = re * fC0;
         dfReal[id.xy] = v;
+    }
+}
+)";
+
+// ---- T (Z8, within the frozen gate-1 tolerances; not bit-identical to the dense DFT above): the same four transforms
+// by a float32 mixed-radix Stockham FFT, one line per group (fOp 0: forward along x of a REAL map t24 -> u4; 1: forward
+// along y of t29 -> u4; 2: inverse along x of t29 -> u4; 3: inverse along y, real part x fC0 -> u0). N = the line's
+// length (<= FFT_MAX; longer lines keep the dense DFT); its prime factors in ascending order, one stage each (Ns = the
+// product of the earlier ones): output (j, q), j < N / R, q < R, k = j mod Ns: acc = sum over r = 0..R-1 in order of
+// (x[j + r N / R] tw[r k N / (Ns R)]) tw[((r q) mod R) N / R], written to (j / Ns) Ns R + k + q Ns. tw = the N-point table
+// (cos, sin)(2 pi i / N), conjugated forward; complex products (a.x b.x - a.y b.y, a.x b.y + a.y b.x) and sums in float32,
+// `precise` (DLC fadeemu.fft_axis replays it operation for operation).
+inline const char* g_faldFadeFftSource = R"(
+RWTexture2D<float> ffReal : register(u0);
+RWTexture2D<float2> ffOut : register(u4);
+#define FFT_MAX 1024
+groupshared float2 gF0[FFT_MAX];
+groupshared float2 gF1[FFT_MAX];
+float2 FftTw(uint i, bool row, float sgn) {
+    const float2 t = row ? fTwW[i] : fTwH[i];
+    return float2(t.x, sgn * t.y);
+}
+float2 FftMul(float2 a, float2 b) {
+    precise float re = a.x * b.x - a.y * b.y;
+    precise float im = a.x * b.y + a.y * b.x;
+    return float2(re, im);
+}
+uint FftSmallestPrime(uint n) {
+    for (uint p = 2u; p * p <= n; p++)
+        if (n % p == 0u) return p;
+    return n;
+}
+[numthreads(256, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    const bool row = (fOp == 0u || fOp == 2u);
+    const uint N = row ? fInW : fInH;
+    const uint lineNo = gid.x;                 // the row of an x pass, the column of a y pass
+    const float sgn = (fOp <= 1u) ? -1.0f : 1.0f;
+    const uint t = tid.x;
+    for (uint i = t; i < N; i += 256u) {
+        float2 v;
+        if (fOp == 0u) v = float2(fIn0.Load(int3(i, lineNo, 0)), 0.0f);
+        else if (row) v = fInC0.Load(int3(i, lineNo, 0));
+        else v = fInC0.Load(int3(lineNo, i, 0));
+        gF0[i] = v;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    uint n = N, ns = 1u;
+    bool inA = true;
+    for (uint st = 0u; st < 10u; st++) {      // N <= 1024 has at most 10 prime factors
+        const uint R = (n > 1u) ? FftSmallestPrime(n) : 1u;
+        if (R > 1u) {
+            const uint m = N / R, step = N / (ns * R);
+            for (uint o = t; o < N; o += 256u) {
+                const uint j = o % m, q = o / m, k = j % ns;
+                precise float accR = 0.0f, accI = 0.0f;
+                for (uint r = 0u; r < R; r++) {
+                    const float2 a = inA ? gF0[j + r * m] : gF1[j + r * m];
+                    const float2 v = FftMul(a, FftTw(r * k * step, row, sgn));
+                    const float2 p = FftMul(v, FftTw(((r * q) % R) * m, row, sgn));
+                    accR = accR + p.x;
+                    accI = accI + p.y;
+                }
+                const uint d = (j / ns) * ns * R + k + q * ns;
+                if (inA) gF1[d] = float2(accR, accI); else gF0[d] = float2(accR, accI);
+            }
+            n /= R;
+            ns *= R;
+            inA = !inA;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    for (uint i = t; i < N; i += 256u) {
+        const float2 v = inA ? gF0[i] : gF1[i];
+        if (fOp == 3u) {
+            precise float re = v.x * fC0;
+            ffReal[uint2(lineNo, i)] = re;
+        } else if (row) {
+            ffOut[uint2(i, lineNo)] = v;
+        } else {
+            ffOut[uint2(lineNo, i)] = v;
+        }
     }
 }
 )";

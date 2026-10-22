@@ -28,7 +28,9 @@ What is float32 GPU order here (and therefore in the HLSL):
     ~2e-4 of fade — the size of the gate;
   * the knee-cap fraction kc is evaluated as ln(a / K) / ln(g_eff) (= the twin's 1 - ln(ge) / ln(g_eff) in exact
     arithmetic): the twin's form has no float32 precision left as g_eff -> 1 (ge / g_eff = 1 +- 1 ulp);
-  * the phase correlation is a dense DFT (sizes need not be powers of two) with float32 twiddle tables.
+  * the phase correlation is a dense DFT (sizes need not be powers of two) with float32 twiddle tables — since Z8
+    (2026-10-22, FFT_ON) a float32 mixed-radix Stockham FFT on the same tables (:func:`fft_axis`), within gate 1's
+    frozen tolerances of the dense one.
 Tables (Gaussian weights, twiddles, the Hann window, the spectral Gaussian) are computed in float64 and stored float32,
 exactly as the C++ uploads them (shared/fald_fade.cpp).
 
@@ -75,6 +77,11 @@ T_HLO, T_HHI = math.log(0.02), math.log(2000.0)
 T_PCSIG = 3.0
 KC_EPS = 1e-6
 GROUP = 1024                         # threads of the one-group reductions (shared/fald_fade_shader.h FADE_RED_THREADS)
+# Z8 (2026-10-22, DLC results/fald_fade_tiers_2026-10-20 t_fft_equiv): the phase correlation's four transforms by the
+# float32 mixed-radix Stockham FFT (fald_fade_shader.h FadeFft, :func:`fft_axis`) for lines up to FFT_MAX; False = the
+# dense Kahan DFT (FadeDft) everywhere — main eecda39's stack
+FFT_ON = True
+FFT_MAX = 1024
 
 
 # ================================================================================================= HLSL scalar rules
@@ -534,10 +541,74 @@ def _argmax_first(r):
     return int(np.flatnonzero(flat == m)[0])
 
 
+def _fft_primes(n: int):
+    """n's prime factors in ascending order, as FadeFft finds them (the smallest prime of what is left, one stage each)."""
+    out = []
+    while n > 1:
+        p, r = 2, n
+        while p * p <= n:
+            if n % p == 0:
+                r = p
+                break
+            p += 1
+        out.append(r)
+        n //= r
+    return out
+
+
+def fft_axis(re, im, axis: int, sign: float, tw):
+    """FadeFft along `axis` (Z8): the float32 mixed-radix Stockham FFT of every line, operation for operation — per stage
+    (prime radix R, Ns = the product of the earlier ones) output (j, q): acc = sum over r of (x[j + r m] tw[r k step])
+    tw[((r q) mod R) m] (m = n / R, k = j mod Ns, step = n / (Ns R); complex products (a.x b.x - a.y b.y, a.x b.y +
+    a.y b.x), sums from r = 0, each float32), written to (j / Ns) Ns R + k + q Ns. tw = (cos, sin) float32 of length n;
+    sign -1 = forward (the conjugate), +1 = inverse (no scaling)."""
+    cs, sn = tw
+    s = f32(sign)
+    xr = np.moveaxis(np.asarray(re, f32), axis, -1).copy()
+    xi = np.moveaxis(np.asarray(im, f32), axis, -1).copy()
+    n = xr.shape[-1]
+    ns = 1
+    for R in _fft_primes(n):
+        m, step = n // R, n // (ns * R)
+        o = np.arange(n)
+        j, q = o % m, o // m
+        k = j % ns
+        acc_r = np.zeros_like(xr)
+        acc_i = np.zeros_like(xi)
+        for r in range(R):
+            ar, ai = xr[..., j + r * m], xi[..., j + r * m]
+            i1 = r * k * step
+            w1r, w1i = cs[i1], (s * sn[i1]).astype(f32)
+            vr = (ar * w1r - ai * w1i).astype(f32)
+            vi = (ar * w1i + ai * w1r).astype(f32)
+            i2 = ((r * q) % R) * m
+            w2r, w2i = cs[i2], (s * sn[i2]).astype(f32)
+            pr = (vr * w2r - vi * w2i).astype(f32)
+            pi_ = (vr * w2i + vi * w2r).astype(f32)
+            acc_r = (acc_r + pr).astype(f32)
+            acc_i = (acc_i + pi_).astype(f32)
+        d = (j // ns) * ns * R + k + q * ns
+        yr = np.empty_like(xr)
+        yi = np.empty_like(xi)
+        yr[..., d] = acc_r
+        yi[..., d] = acc_i
+        xr, xi = yr, yi
+        ns *= R
+    return np.moveaxis(xr, -1, axis), np.moveaxis(xi, -1, axis)
+
+
+def _use_fft(H, W):
+    return FFT_ON and H <= FFT_MAX and W <= FFT_MAX
+
+
 def dft2(x, tw_h, tw_w):
-    """Forward 2-D DFT of a real map (rows then columns), Kahan sums in float32 (FadeDftRow / FadeDftCol).
-    Returns (re, im) float32 (H, W)."""
+    """Forward 2-D DFT of a real map (rows then columns), Kahan sums in float32 (FadeDftRow / FadeDftCol) — or, with
+    FFT_ON (Z8), FadeFft along x then y. Returns (re, im) float32 (H, W)."""
     H, W = x.shape
+    if _use_fft(H, W):
+        x = np.asarray(x, f32)
+        re, im = fft_axis(x, np.zeros_like(x), 1, -1.0, tw_w)
+        return fft_axis(re, im, 0, -1.0, tw_h)
     cw, sw = tw_w
     ch_, sh_ = tw_h
     k = np.arange(W)
@@ -566,8 +637,13 @@ def dft2(x, tw_h, tw_w):
 
 
 def idft2_real(Rr, Ri, tw_h, tw_w):
-    """Re(ifft2(R)): inverse along x (complex), then along y keeping the real part, / (H W) (FadeIdftRow / FadeIdftCol)."""
+    """Re(ifft2(R)): inverse along x (complex), then along y keeping the real part, / (H W) (FadeIdftRow / FadeIdftCol) —
+    or, with FFT_ON (Z8), FadeFft's inverse along x then y, the real part x f32(1 / (H W))."""
     H, W = Rr.shape
+    if _use_fft(H, W):
+        zr, zi = fft_axis(Rr, Ri, 1, 1.0, tw_w)
+        r, _ = fft_axis(zr, zi, 0, 1.0, tw_h)
+        return (r * f32(1.0 / (H * W))).astype(f32)
     cw, sw = tw_w
     ch_, sh_ = tw_h
     xs = np.arange(W)
