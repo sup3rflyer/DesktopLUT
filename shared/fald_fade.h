@@ -70,6 +70,14 @@ bool FaldFadeShadersReady();
 // The passes' sources and bytecode (tests, the bytecode generator): k < FaldFadeKernelCount().
 unsigned int FaldFadeKernelCount();
 const char* FaldFadeKernelName(unsigned int k);
+// Test seam (tests/test_fald_fade_hw.cpp FALD_HW_PROFILE, a per-pass GPU profile): when set, every fade pass calls
+// Before / After around its dispatch on the context it runs on. Null in the app and the hook.
+struct FaldFadePassHook {
+    virtual void Before(ID3D11DeviceContext* ctx, unsigned int kernel) = 0;
+    virtual void After(ID3D11DeviceContext* ctx, unsigned int kernel) = 0;
+};
+extern FaldFadePassHook* g_faldFadePassHook;
+#define FALD_FADE_HAS_PASS_HOOK 1
 bool FaldFadeCompileKernel(unsigned int k, std::vector<unsigned char>& out, std::string* err);   // from the sources, now
 bool FaldFadeEmbeddedBytecode(unsigned int k, const void** data, size_t* bytes);                // what ships
 

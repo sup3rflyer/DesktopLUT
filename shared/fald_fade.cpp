@@ -375,7 +375,9 @@ void Pass(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int k, const FadeCBDat
     ctx->CSSetShaderResources(24, 12, srv);
     ID3D11UnorderedAccessView* uav[8] = { io.out[0], io.out[1], io.out[2], io.out[3], io.outC[0], io.outC[1], nullptr, f->flagsUAV };
     ctx->CSSetUnorderedAccessViews(0, 8, uav, nullptr);
+    if (g_faldFadePassHook) g_faldFadePassHook->Before(ctx, k);
     ctx->Dispatch(gx, gy, 1);
+    if (g_faldFadePassHook) g_faldFadePassHook->After(ctx, k);
     ID3D11ShaderResourceView* nullSrv[12] = {};
     ID3D11UnorderedAccessView* nullUav[8] = {};
     ctx->CSSetShaderResources(24, 12, nullSrv);
@@ -582,6 +584,7 @@ void TimingStamp(FaldFade* f, ID3D11DeviceContext* ctx, unsigned int k) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------------
+FaldFadePassHook* g_faldFadePassHook = nullptr;
 unsigned int FaldFadeKernelCount() { return K_COUNT; }
 const char* FaldFadeKernelName(unsigned int k) { return k < K_COUNT ? kKernels[k].name : ""; }
 

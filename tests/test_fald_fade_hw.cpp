@@ -159,6 +159,53 @@ RWStructuredBuffer<uint> o : register(u0);
     ~HwHeater() { for (IUnknown* p : { (IUnknown*)cs, (IUnknown*)uav, (IUnknown*)buf, (IUnknown*)cb }) if (p) p->Release(); }
 };
 
+#ifdef FALD_FADE_HAS_PASS_HOOK
+// FALD_HW_PROFILE=1: a timestamp before and after every fade pass of the timed content frames (fade on), summed per
+// kernel -> <out>/profile_<case>.csv (the timestamps serialise the passes a little: shares, not a frame time).
+struct HwProfiler : FaldFadePassHook {
+    static const int kMax = 1024;
+    ID3D11Query* q[2 * kMax] = {};
+    unsigned int kern[kMax] = {};
+    int n = 0;
+    bool on = false;
+    std::vector<double> sumUs;
+    std::vector<unsigned long long> count;
+    int frames = 0;
+    explicit HwProfiler(ID3D11Device* dev) : sumUs(FaldFadeKernelCount(), 0.0), count(FaldFadeKernelCount(), 0) {
+        D3D11_QUERY_DESC qd = { D3D11_QUERY_TIMESTAMP, 0 };
+        for (auto& x : q) dev->CreateQuery(&qd, &x);
+    }
+    ~HwProfiler() { for (auto& x : q) if (x) x->Release(); }
+    void Before(ID3D11DeviceContext* ctx, unsigned int k) override {
+        if (!on || n >= kMax) return;
+        kern[n] = k;
+        ctx->End(q[2 * n]);
+    }
+    void After(ID3D11DeviceContext* ctx, unsigned int) override {
+        if (!on || n >= kMax) return;
+        ctx->End(q[2 * n + 1]);
+        n++;
+    }
+    void Collect(ID3D11DeviceContext* ctx, UINT64 freq) {   // after the frame's disjoint query is done
+        for (int i = 0; i < n; i++) {
+            UINT64 a = 0, b = 0;
+            while (ctx->GetData(q[2 * i], &a, 8, 0) != S_OK) {}
+            while (ctx->GetData(q[2 * i + 1], &b, 8, 0) != S_OK) {}
+            sumUs[kern[i]] += (double)(b - a) * 1e6 / (double)freq;
+            count[kern[i]]++;
+        }
+        if (n) frames++;
+        n = 0;
+    }
+    void Write(const std::string& path) const {
+        std::ofstream f(path);
+        f << "kernel,dispatches_per_frame,us_per_frame\n";
+        for (size_t k = 0; k < sumUs.size(); k++)
+            if (count[k]) f << FaldFadeKernelName((unsigned int)k) << "," << (double)count[k] / frames << "," << sumUs[k] / frames << "\n";
+    }
+};
+#endif
+
 bool HwReadFrame(const std::string& path, int w, int h, std::vector<uint16_t>& out) {
     out.assign((size_t)w * h * 4, 0);
     std::ifstream f(path, std::ios::binary);
@@ -210,6 +257,12 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
     HwHeater heater(hw);
     if (heatMs > 0.0) REQUIRE(heater.ok);
     MESSAGE("heater: " << heatMs << " ms before each run, " << heater.iters << " iterations a batch; hash every " << hashEvery);
+#ifdef FALD_FADE_HAS_PASS_HOOK
+    const bool profile = HwEnv("FALD_HW_PROFILE") == "1";
+    HwProfiler prof(hw.dev);
+    if (profile) g_faldFadePassHook = &prof;
+    struct ClearHook { ~ClearHook() { g_faldFadePassHook = nullptr; } } clearHook;
+#endif
     const std::wstring C = HwOwnerPanel(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
     REQUIRE_FALSE(C.empty());
     auto widen = [](const std::string& s) { return std::wstring(s.begin(), s.end()); };
@@ -266,6 +319,9 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
                 if (heatMs > 0.0) heater.Heat(hw, heatMs);   // the clock up (queued ahead of the run's first timestamp)
                 hw.ic->Begin(hw.dj);
                 hw.ic->End(hw.q0);
+#ifdef FALD_FADE_HAS_PASS_HOOK
+                prof.on = profile && fade && std::strcmp(phase, "content") == 0;
+#endif
 #ifdef FALD_RUN_HAS_FRAME_KEY
                 g_faldFadeForce.store(true);   // the governor measures but never pauses this harness
                 FaldRunPasses(&ctx, rtv, newContent, key);
@@ -285,6 +341,10 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
                 while (hw.ic->GetData(hw.q0, &a, 8, 0) != S_OK) {}
                 while (hw.ic->GetData(hw.q1, &b, 8, 0) != S_OK) {}
                 const double us = (!dj.Disjoint && dj.Frequency) ? (double)(b - a) * 1e6 / (double)dj.Frequency : -1.0;
+#ifdef FALD_FADE_HAS_PASS_HOOK
+                if (!dj.Disjoint && dj.Frequency) prof.Collect(hw.ic, dj.Frequency);
+                prof.on = false;
+#endif
                 double gov = -1.0;
 #ifdef FALD_RUN_HAS_FRAME_KEY
                 if (ctx.fald->fade) {   // the governor's own measurement of this content frame (read later, without waiting)
@@ -321,6 +381,14 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             for (int i = 0; i < n && !stop; i++) run("content", i, true);
             for (int i = 0; i < n && !stop; i++) run("still", i, false);
             csv.flush();
+#ifdef FALD_FADE_HAS_PASS_HOOK
+            if (profile && fade) {
+                prof.Write(out + "/profile_" + hc.id + ".csv");
+                std::fill(prof.sumUs.begin(), prof.sumUs.end(), 0.0);
+                std::fill(prof.count.begin(), prof.count.end(), 0ull);
+                prof.frames = 0;
+            }
+#endif
             rtv->Release(); target->Release();
             FaldReleaseResources(&ctx);
         }
