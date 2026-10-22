@@ -170,6 +170,8 @@ struct HwStampRing {
     bool on = false;
     std::vector<double> sumUs;
     std::vector<unsigned long long> count;
+    std::vector<double> seqUs;          // per dispatch of the frame, in order (the same sequence every content frame; main 4207200)
+    std::vector<unsigned int> seqKern;
     int frames = 0;
     const char* (*name)(unsigned int);
     HwStampRing(ID3D11Device* dev, unsigned int kernels, const char* (*nameFn)(unsigned int))
@@ -195,16 +197,26 @@ struct HwStampRing {
             while (ctx->GetData(q[2 * i + 1], &b, 8, 0) != S_OK) {}
             sumUs[kern[i]] += (double)(b - a) * 1e6 / (double)freq;
             count[kern[i]]++;
+            if ((size_t)i >= seqUs.size()) { seqUs.push_back(0.0); seqKern.push_back(kern[i]); }
+            if (seqKern[(size_t)i] == kern[i]) seqUs[(size_t)i] += (double)(b - a) * 1e6 / (double)freq;
         }
         if (n) frames++;
         n = 0;
     }
-    void Reset() { std::fill(sumUs.begin(), sumUs.end(), 0.0); std::fill(count.begin(), count.end(), 0ull); frames = 0; n = 0; }
+    void Reset() {
+        std::fill(sumUs.begin(), sumUs.end(), 0.0); std::fill(count.begin(), count.end(), 0ull);
+        seqUs.clear(); seqKern.clear(); frames = 0; n = 0;
+    }
+    // per kernel -> <path>; per dispatch in the frame's order -> <path minus .csv>_dispatch.csv (one kernel's dispatches told
+    // apart: an up-sampled Gaussian from a plain one; main 4207200)
     void Write(const std::string& path) const {
         std::ofstream f(path);
         f << "kernel,dispatches_per_frame,us_per_frame,frames\n";
         for (size_t k = 0; k < sumUs.size(); k++)
             if (count[k]) f << name((unsigned int)k) << "," << (double)count[k] / frames << "," << sumUs[k] / frames << "," << frames << "\n";
+        std::ofstream g(path.substr(0, path.size() - 4) + "_dispatch.csv");
+        g << "index,kernel,us_per_frame\n";
+        for (size_t i = 0; i < seqUs.size(); i++) g << i << "," << name(seqKern[i]) << "," << seqUs[i] / frames << "\n";
     }
 };
 

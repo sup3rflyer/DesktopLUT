@@ -12,12 +12,45 @@
 #include <d3dcompiler.h>
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
 namespace {
 
 const double kPi = 3.14159265358979323846;
+
+// The Gaussian sigmas the stack uses (PORT_PLAN 1.1-1.3), their half kernels in one buffer
+constexpr double kSigmas[] = { 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 24.0, 32.0, 16.0 };   // 16: B16, the lit floor (F12A_B16)
+constexpr unsigned int kNumSigmas = 9;
+
+// dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
+// order in double, w[r + j] / sum stored float32.
+void GaussWeights(double sigma, int& r, std::vector<float>& half) {
+    r = (int)(4.0 * sigma + 0.5);
+    std::vector<double> w((size_t)(2 * r + 1));
+    for (int x = -r; x <= r; x++) w[(size_t)(x + r)] = std::exp((-0.5 * (double)x) * (double)x / (sigma * sigma));
+    double s = 0.0;
+    for (double v : w) s += v;
+    half.resize((size_t)r + 1);
+    for (int j = 0; j <= r; j++) half[(size_t)j] = (float)(w[(size_t)(r + j)] / s);
+}
+
+// A Gaussian pass with its weights COMPILED IN (KernelDef::baked, a bit per kSigmas entry; BakedWeightsSource below): the
+// sigma's bit. A sigma outside kSigmas gives no bit, and the pass then fails to compile (its FadeGW has no such sigma).
+constexpr unsigned int Bake(double sigma) {
+    for (unsigned int i = 0; i < kNumSigmas; i++)
+        if (kSigmas[i] == sigma) return 1u << i;
+    return 0u;
+}
+// GaussWeights' radius of each sigma is its own (a radius names one sigma: GaussKernel / Gauss2DKernel pick the class by it)
+constexpr bool DistinctRadii() {
+    for (unsigned int i = 0; i < kNumSigmas; i++)
+        for (unsigned int j = i + 1; j < kNumSigmas; j++)
+            if ((int)(4.0 * kSigmas[i] + 0.5) == (int)(4.0 * kSigmas[j] + 0.5)) return false;
+    return true;
+}
+static_assert(DistinctRadii(), "two sigmas share a radius: the Gaussian classes would not name their sigma");
 
 // The shipped passes. The tiled kernels exist once per radius class: TG_RMAX / TE_RMAX sizes their groupshared line
 // (fald_fade_shader.h); a Gaussian's radius picks its kernel (GaussKernel), a max / min filter's likewise (ExtKernel).
@@ -26,7 +59,7 @@ enum FadeKernel : unsigned int {
     K_CUT, K_WARPQ, K_TM, K_SELECT, K_OVERLAPR, K_CUTR,
     K_GT4, K_GT8, K_GT12, K_GT16, K_GT24, K_GT32, K_GT64, K_GT96, K_GT4V, K_GT2, K_GT2P,
     K_ET5, K_ET8, K_ET12, K_ET16, K_ET32, K_ET40, K_ET50, K_ET66, K_CONE, K_FFT, K_DOWNMI,
-    K_G2D4, K_G2D8, K_G2D12, K_G2D16,
+    K_G2D4, K_G2D8, K_G2D12, K_G2D16, K_GHG16, K_GHG96, K_GHG8, K_GHG24,
     K_COUNT
 };
 struct KernelDef {
@@ -34,6 +67,7 @@ struct KernelDef {
     const char* const* body;     // the pass's own source
     const char* const* prefix;   // a helper source compiled in front of it (the warp / the Gaussian tile), or null
     const char* define;          // prepended before everything (the radius class)
+    unsigned int baked = 0;      // the sigmas (Bake) whose radius and weights are compiled in (BakedWeightsSource)
 };
 const KernelDef kKernels[K_COUNT] = {
     { "FadeGrad", &g_faldFadeGradSource, nullptr, "" },
@@ -55,33 +89,40 @@ const KernelDef kKernels[K_COUNT] = {
     { "FadeSelect", &g_faldFadeSelectSource, nullptr, "" },
     { "FadeOverlapR", &g_faldFadeOverlapRSource, &g_faldFadeWarpFnSource, "" },
     { "FadeCutR", &g_faldFadeCutRSource, nullptr, "" },
-    { "FadeGaussT4", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 4\n" },
-    { "FadeGaussT8", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 8\n" },
-    { "FadeGaussT12", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 12\n" },
-    { "FadeGaussT16", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 16\n" },
-    { "FadeGaussT24", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 24\n" },
-    { "FadeGaussT32", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 32\n" },
-    { "FadeGaussT64", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 64\n" },
-    { "FadeGaussT96", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n" },
-    { "FadeGaussT4V", &g_faldFadeGaussT4Source, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n" },
+    { "FadeGaussT4", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 4\n#define TG_SIGMA 1\n", Bake(1.0) },
+    { "FadeGaussT8", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 8\n#define TG_SIGMA 2\n", Bake(2.0) },
+    { "FadeGaussT12", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 12\n#define TG_SIGMA 3\n", Bake(3.0) },
+    { "FadeGaussT16", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 16\n#define TG_SIGMA 4\n", Bake(4.0) },
+    { "FadeGaussT24", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 24\n#define TG_SIGMA 6\n", Bake(6.0) },
+    { "FadeGaussT32", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 32\n#define TG_SIGMA 8\n", Bake(8.0) },
+    { "FadeGaussT64", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 64\n#define TG_SIGMA 16\n", Bake(16.0) },
+    { "FadeGaussT96", &g_faldFadeGaussTSource, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n#define TG_SIGMA 24\n", Bake(24.0) },
+    { "FadeGaussT4V", &g_faldFadeGaussT4Source, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n",
+      Bake(4.0) | Bake(24.0) | Bake(2.0) | Bake(6.0) },
     { "FadeGaussT2", &g_faldFadeGaussT2Source, nullptr, "#define TG_RMAX 128\n" },
-    { "FadeGaussT2P", &g_faldFadeGaussT2PSource, nullptr, "#define TG_RMAX 128\n" },
-    { "FadeExtT5", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 5\n" },
-    { "FadeExtT8", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 8\n" },
-    { "FadeExtT12", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 12\n" },
-    { "FadeExtT16", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 16\n" },
-    { "FadeExtT32", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 32\n" },
+    { "FadeGaussT2P", &g_faldFadeGaussT2PSource, nullptr, "#define TG_RMAX 128\n", Bake(32.0) },
+    { "FadeExtT5", &g_faldFadeExtVSource, nullptr, "#define TE_RMAX 5\n" },
+    { "FadeExtT8", &g_faldFadeExtVSource, nullptr, "#define TE_RMAX 8\n" },
+    { "FadeExtT12", &g_faldFadeExtVSource, nullptr, "#define TE_RMAX 12\n" },
+    { "FadeExtT16", &g_faldFadeExtVSource, nullptr, "#define TE_RMAX 16\n" },
+    { "FadeExtT32", &g_faldFadeExtVSource, nullptr, "#define TE_RMAX 32\n" },
     { "FadeExtT40", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 40\n" },
     { "FadeExtT50", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 50\n" },
     { "FadeExtT66", &g_faldFadeExtTSource, nullptr, "#define TE_RMAX 66\n" },
     { "FadeConeT", &g_faldFadeConeTSource, nullptr, "" },
     { "FadeFft", &g_faldFadeFftSource, nullptr, "" },
     { "FadeDownMi", &g_faldFadeDownMiSource, nullptr, "" },
-    { "FadeGauss2D4", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 4\n" },
-    { "FadeGauss2D8", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 8\n" },
-    { "FadeGauss2D12", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 12\n" },
-    { "FadeGauss2D16", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 16\n" } };
+    { "FadeGauss2D4", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 4\n#define TG_SIGMA 1\n", Bake(1.0) },
+    { "FadeGauss2D8", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 8\n#define TG_SIGMA 2\n", Bake(2.0) },
+    { "FadeGauss2D12", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 12\n#define TG_SIGMA 3\n", Bake(3.0) },
+    { "FadeGauss2D16", &g_faldFadeGauss2DSource, nullptr, "#define TG_RMAX 16\n#define TG_SIGMA 4\n", Bake(4.0) },
+    { "FadeGaussHG16", &g_faldFadeGaussHGSource, &g_faldFadeTileFnSource, "#define TG_RMAX 16\n#define TG_SIGMA 4\n", Bake(4.0) },
+    { "FadeGaussHG96", &g_faldFadeGaussHGSource, &g_faldFadeTileFnSource, "#define TG_RMAX 96\n#define TG_SIGMA 24\n", Bake(24.0) },
+    { "FadeGaussHG8", &g_faldFadeGaussHGSource, &g_faldFadeTileFnSource, "#define TG_RMAX 8\n#define TG_SIGMA 2\n", Bake(2.0) },
+    { "FadeGaussHG24", &g_faldFadeGaussHGSource, &g_faldFadeTileFnSource, "#define TG_RMAX 24\n#define TG_SIGMA 6\n", Bake(6.0) } };
 
+// A Gaussian's class by its radius. Each class has ONE sigma's radius and weights compiled in (TG_SIGMA, Bake): the
+// radii of kSigmas are distinct, so the radius names the sigma (the class's HLSL checks TG_SIGMA's radius = TG_RMAX).
 unsigned int GaussKernel(int r) {
     switch (r) {
     case 4: return K_GT4;   case 8: return K_GT8;   case 12: return K_GT12; case 16: return K_GT16;
@@ -120,9 +161,6 @@ struct FadeCBData {
 };
 static_assert(sizeof(FadeCBData) == 64, "FadeCB is 4 rows");
 
-// The Gaussian sigmas the stack uses (PORT_PLAN 1.1-1.3), their half kernels in one buffer
-const double kSigmas[] = { 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 24.0, 32.0, 16.0 };   // 16: B16, the lit floor (F12A_B16)
-const unsigned int kNumSigmas = 9;
 // A (F12A_B16): the CL closing runs on the 1/8-res fade zero-padded by 2 x its radius 40 (fald_fade_shader.h FADE_CL_PAD)
 const unsigned int kClPad = 80;
 // V8d (F12B_V8d): the floor-valley gate's radii at 1/8 res — grey_close 33 (264 px), grey_open 133 (1064 px), the 11-texel
@@ -143,16 +181,34 @@ const bool kGauss2D = true;
 // the overlap / cut partials buffer: 1024 chains x 16 bytes, then two 64-bin histograms (fald_fade_shader.h fPart)
 const unsigned int kPartBytes = 16384u + 2u * 64u * 4u;
 
-// dlc.fald.fadeemu.gauss_weights: r = int(4 sigma + 0.5); w(x) = exp(((-0.5 x) x) / (sigma sigma)), summed in ascending
-// order in double, w[r + j] / sum stored float32.
-void GaussWeights(double sigma, int& r, std::vector<float>& half) {
-    r = (int)(4.0 * sigma + 0.5);
-    std::vector<double> w((size_t)(2 * r + 1));
-    for (int x = -r; x <= r; x++) w[(size_t)(x + r)] = std::exp((-0.5 * (double)x) * (double)x / (sigma * sigma));
-    double s = 0.0;
-    for (double v : w) s += v;
-    half.resize((size_t)r + 1);
-    for (int j = 0; j <= r; j++) half[(size_t)j] = (float)(w[(size_t)(r + j)] / s);
+// The weights of a pass's baked sigmas as HLSL (compiled in front of everything else, fald_fade_shader.h FadeGR / FadeGW):
+// per sigma s (an integer in kSigmas) FADE_GR_S<s> = its radius, FADE_GW_S<s>[0..r] = GaussWeights' float32 values bit for
+// bit (asfloat of their bits: no decimal round trip) — the values the table t33 gets from the same function, so the two
+// cannot drift (the bytecode test compiles every pass afresh, this source included) — and the two lookups by a LITERAL
+// sigma, which the compiler folds (a constant index: an immediate; a loop's: the immediate constant buffer).
+std::string BakedWeightsSource(unsigned int mask) {
+    if (!mask) return std::string();
+    std::string s = "#define FADE_BAKED 1\n", gr = "int FadeGR(int s) {", gw = "float FadeGW(int s, int j) {";
+    for (unsigned int i = 0; i < kNumSigmas; i++) {
+        if (!(mask & (1u << i))) continue;
+        int r = 0;
+        std::vector<float> half;
+        GaussWeights(kSigmas[i], r, half);
+        const std::string sg = std::to_string((int)kSigmas[i]);
+        s += "#define FADE_GR_S" + sg + " " + std::to_string(r) + "\n";
+        s += "static const float FADE_GW_S" + sg + "[" + std::to_string(r + 1) + "] = {";
+        for (int j = 0; j <= r; j++) {
+            uint32_t bits = 0;
+            std::memcpy(&bits, &half[(size_t)j], sizeof(bits));
+            char w[40];
+            snprintf(w, sizeof(w), "%s asfloat(0x%08xu)", j ? "," : "", bits);
+            s += w;
+        }
+        s += " };\n";
+        gr += " if (s == " + sg + ") return FADE_GR_S" + sg + ";";
+        gw += " if (s == " + sg + ") return FADE_GW_S" + sg + "[j];";
+    }
+    return s + gr + " return 0; }\n" + gw + " return 0.0f; }\n";
 }
 
 }  // namespace
@@ -435,6 +491,19 @@ void GaussH(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& 
     b.out[0] = out ? out->uav : nullptr; b.out[1] = o.io ? o.io->uav : nullptr;
     Pass(f, ctx, GaussKernel(f->gwR[s]), c, b, Gd(tmp.w, 64), Gd(tmp.h, 16));
 }
+// The horizontal pass of one of lv's Gaussians (sigma 4 / 24 / 2 / 6, Kahan) and FadeGrad of it in one (FadeGaussHG): the
+// vertical sums `in` -> |grad| into `out` (not `in`: the strips' halos read their neighbours' rows)
+void GaussHGrad(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& in, const FadeTex& out) {
+    unsigned int k = K_COUNT;
+    if (sigma == 4.0) k = K_GHG16;
+    else if (sigma == 24.0) k = K_GHG96;
+    else if (sigma == 2.0) k = K_GHG8;
+    else if (sigma == 6.0) k = K_GHG24;
+    FadeCBData c = Cb();
+    c.inW = in.w; c.inH = in.h; c.dir = 1;
+    Io a; a.in[0] = in.srv; a.out[0] = out.uav;
+    Pass(f, ctx, k, c, a, Gd(in.w, 62), Gd(in.h, 46));   // fald_fade_shader.h HG_W x HG_H per group
+}
 // Radii <= 16 in one pass (FadeGauss2D: the vertical sums stay in groupshared memory; tmp is not written), unless the
 // output is the input (an in-place Gaussian needs the intermediate)
 unsigned int Gauss2DKernel(int r) {
@@ -466,26 +535,18 @@ void Gauss(FaldFade* f, ID3D11DeviceContext* ctx, double sigma, const FadeTex& i
     Gauss(f, ctx, sigma, in, in.w, in.h, tmp, &out, o);
 }
 
-// The vertical passes of lv's four Gaussians (sigma 4, 24, 2, 6) from one tile (FadeGaussT4) into out[0..3]
+// The vertical passes of lv's four Gaussians (sigma 4, 24, 2, 6 — compiled into FadeGaussT4V with their weights, in this
+// order) from one tile into out[0..3]
 void GaussLv4(FaldFade* f, ID3D11DeviceContext* ctx, const FadeTex& lv, const FadeTex* const out[4]) {
-    const double sig[4] = { 4.0, 24.0, 2.0, 6.0 };
-    uint32_t packed[4];
-    int rmax = 0;
-    for (int i = 0; i < 4; i++) {
-        const unsigned int s = SigmaIndex(sig[i]);
-        packed[i] = ((uint32_t)f->gwR[s] << 16) | f->gwOff[s];
-        if (f->gwR[s] > rmax) rmax = f->gwR[s];
-    }
     FadeCBData c = Cb();
-    c.inW = lv.w; c.inH = lv.h; c.radius = (uint32_t)rmax; c.dir = 0;
-    c.wOff = packed[0]; c.n = packed[1]; c.pad0 = packed[2]; c.pad1 = packed[3];
+    c.inW = lv.w; c.inH = lv.h; c.dir = 0;
     Io a; a.in[0] = lv.srv;
     for (int i = 0; i < 4; i++) a.out[i] = out[i]->uav;
     Pass(f, ctx, K_GT4V, c, a, Gd(lv.w, 16), Gd(lv.h, 64));
 }
 
-// The hybrid fill's sigma-32 sums of a and b at once (FadeGaussT2): vertical a, b -> ta, tb, horizontal -> a, b (in place
-// over the inputs, as FadeGauss's horizontal pass wrote over them before)
+// The hybrid fill's sigma-32 sums of a and b at once (FadeGaussT2; FadeGaussT2P has sigma 32 compiled in): vertical a, b ->
+// ta, tb, horizontal -> a, b (in place over the inputs, as FadeGauss's horizontal pass wrote over them before)
 void GaussNumDen(FaldFade* f, ID3D11DeviceContext* ctx, const FadeTex& a, const FadeTex& b, const FadeTex& ta, const FadeTex& tb) {
     const unsigned int s = SigmaIndex(32.0);
     FadeCBData c = Cb();
@@ -649,7 +710,8 @@ const char* FaldFadeKernelName(unsigned int k) { return k < K_COUNT ? kKernels[k
 bool FaldFadeCompileKernel(unsigned int k, std::vector<unsigned char>& out, std::string* err) {
     out.clear();
     if (k >= K_COUNT) { if (err) *err = "no such pass"; return false; }
-    std::string src = std::string(kKernels[k].define) + g_faldCommonSource + g_faldFadeCommonSource;
+    std::string src = std::string(kKernels[k].define) + BakedWeightsSource(kKernels[k].baked) + g_faldCommonSource +
+                      g_faldFadeCommonSource;
     if (kKernels[k].prefix) src += *kKernels[k].prefix;
     src += *kKernels[k].body;
     ID3DBlob* blob = nullptr; ID3DBlob* msg = nullptr;
@@ -920,18 +982,19 @@ void FaldFadeRunFrame(FaldFade* f, ID3D11DeviceContext* ctx, const FaldFadeCommo
     // F1: mi (the max channel of Balance(PanelNits(frame)), unsanitised) and lv = ln max(clamp(mi, 0, 1e4), 0.05)
     Pix(f, ctx, P_MI, W, H, {}, { &f->mi, &S[1] });
     // F2 + F4's gradients: lv's four Gaussians share one vertical pass (sigma 4 / 24 / 2 / 6 -> S2..S5), then each one's
-    // horizontal pass and |grad|. The flank term's raw0 = 1 - 1 / (1 + (80 min(|grad G4 lv|, |grad G24 lv|))^2) -> S6
+    // horizontal pass and |grad| in one (FadeGaussHG: the horizontal sums are not stored). The flank term's raw0 = 1 - 1 /
+    // (1 + (80 min(|grad G4 lv|, |grad G24 lv|))^2) -> S6
     { const FadeTex* v[4] = { &S[2], &S[3], &S[4], &S[5] }; GaussLv4(f, ctx, S[1], v); }
-    GaussH(f, ctx, 4.0, S[2], &S[6], GOpt());   Grad(f, ctx, S[6], S[2]);   // S2 = gs
-    GaussH(f, ctx, 24.0, S[3], &S[6], GOpt());  Grad(f, ctx, S[6], S[3]);   // S3 = gl
-    Pix(f, ctx, P_RAW0, W, H, { &S[2], &S[3] }, { &S[6] });               // S6 = raw0
-    GaussH(f, ctx, 2.0, S[4], &S[2], GOpt());   Grad(f, ctx, S[2], S[4]);   // S4 = g1
-    GaussH(f, ctx, 6.0, S[5], &S[2], GOpt());   Grad(f, ctx, S[2], S[5]);   // S5 = g2
+    GaussHGrad(f, ctx, 4.0, S[2], S[7]);                                   // S7 = gs
+    GaussHGrad(f, ctx, 24.0, S[3], S[2]);                                  // S2 = gl
+    Pix(f, ctx, P_RAW0, W, H, { &S[7], &S[2] }, { &S[6] });               // S6 = raw0
+    GaussHGrad(f, ctx, 2.0, S[4], S[3]);                                   // S3 = g1
+    GaussHGrad(f, ctx, 6.0, S[5], S[4]);                                   // S4 = g2
     // F4: the robust thin-step flag -> step = clamp(G4(maxf65(thin)), 0, 1), w = 1 - step (the Gaussian's horizontal pass
     // stores w)
-    Gauss(f, ctx, 3.0, S[4], S[1], S[2], kPlainSums);                      // S2 = G3(g1) (S1 = lv is dead)
-    Ext(f, ctx, 8, 1, S[2], S[3], S[1]);                                   // S1 = minf17(G3(g1))
-    Pix(f, ctx, P_THIN, W, H, { &S[4], &S[5], &S[1] }, { &S[2] });
+    Gauss(f, ctx, 3.0, S[3], S[1], S[2], kPlainSums);                      // S2 = G3(g1) (S1 = lv is dead)
+    Ext(f, ctx, 8, 1, S[2], S[5], S[1]);                                   // S1 = minf17(G3(g1))
+    Pix(f, ctx, P_THIN, W, H, { &S[3], &S[4], &S[1] }, { &S[2] });
     Ext(f, ctx, 32, 0, S[2], S[3], S[4]);
     { GOpt o; o.sat = true; o.epi = E_W; o.plain = kPlainSums; Gauss(f, ctx, 4.0, S[4], W, H, S[3], &f->w, o); }
     // V8d (F12B_V8d, r12b/cands12b.py floor_valley8 with the darkest-object test): the floor-valley gate at 1/8 res, from the
