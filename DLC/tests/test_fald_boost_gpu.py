@@ -315,7 +315,8 @@ def test_hlsl_boost_passes_mirror_the_reference():
     for reg in ("boostLut    : register(t12)", "activeTex   : register(t13)", "boostTex    : register(t14)"):
         assert reg in common
     # stat pass: counts on the frame the panel receives (after Correct in round 1), raw max channel, strict '>'
-    corrected = "img = FadePost(Correct(img, bT, bE, g), img, int2((int)px, (int)py));"   # FadePost: the fade stack (fadeFlags 0 = req as it is)
+    # FadePost: the fade stack (fadeFlags 0 = req as it is); CoreGain: the always-on core (fald_core2.h; identity with the core off)
+    corrected = "img = FadePost(Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py))), img, int2((int)px, (int)py));"
     assert stat.index(corrected) < stat.index("if (mc > boostLitNits) lit++;")
     assert "float mc = max(img.r, max(img.g, img.b));" in stat and "if (mc > boostDimNits) dim++;" in stat
     # the second criterion is the file's zone rule since C12b (tests/test_fald_zone_rule.py): rule 0 = DIM, as before

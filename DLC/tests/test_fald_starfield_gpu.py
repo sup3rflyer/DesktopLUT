@@ -777,9 +777,10 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "return img * (outM / safe);" in bal
     assert "max(hi - lo, 1e-12f)" in common                                            # StarSmooth = starfield._smoothstep
     # the balanced frame is what every pass reads: before Correct in the statistic pass, before the fields in the pixel pass
-    corrected = "img = FadePost(Correct(img, bT, bE, g), img, int2((int)px, (int)py));"   # FadePost: the fade stack (fadeFlags 0 = req as it is)
+    # FadePost: the fade stack (fadeFlags 0 = req as it is); CoreGain: the always-on core (fald_core2.h; identity with the core off)
+    corrected = "img = FadePost(Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py))), img, int2((int)px, (int)py));"
     assert stat.index("if (starOn != 0u) img = Balance(img, int2((int)px, (int)py));") < stat.index(corrected)
-    assert pixel.index("debugMode == 4) return src;") < pixel.index("if (starOn != 0u) img = Balance(") < pixel.index("Correct(img, bT, bE, gain)")
+    assert pixel.index("debugMode == 4) return src;") < pixel.index("if (starOn != 0u) img = Balance(") < pixel.index("Correct(img, bT, bE, CoreGain(gain, float2(px)))")
     assert "if (debugMode == 9)" in pixel and "if (starOn == 0u) return src;" in pixel
     assert stat.count("starOn") == 1 and "starOn" not in part("g_faldConvSource")
     # S0: the statistic pass's own peak / lit sum on the SOURCE frame (no Balance, no Correct)
