@@ -207,8 +207,19 @@ struct DwmHookFaldCoreStatusEntry {
     float    contentMs;              // the content-frame interval (median; information)
     uint32_t generation;             // the governor's: bumps on every state change
     uint32_t used;                   // 1 = this slot holds an entry
-    uint32_t _reserved;
+    uint32_t extra;                  // DwmHookFaldCoreExtra below (a DLL that predates it wrote 0 = unknown)
 };
+// DwmHookFaldCoreStatusEntry::extra (the overlay publishes the same word): bits 0-7 the conv pass's sub-offsets per thread in
+// use (S = 1 / 2 / 4 / 8; 0 = unknown), bits 8-15 its auto-tune's state (shared/fald_conv_tune.h FaldConvTuner::State: 0 policy,
+// 1 cached, 2 tuning, 3 tuned), bits 16-19 the always-on core's mode applied (shared/fald_core_mode.h FALD_CORE_MODES), bit
+// 20 = the core runs (its shaders compiled and its textures exist).
+static inline uint32_t DwmHookFaldCoreExtra(uint32_t convSo, uint32_t tuneState, uint32_t coreMode, int coreOn) {
+    return (convSo & 0xFFu) | ((tuneState & 0xFFu) << 8) | ((coreMode & 0xFu) << 16) | (coreOn ? (1u << 20) : 0u);
+}
+static inline uint32_t DwmHookFaldCoreExtraSo(uint32_t w)       { return w & 0xFFu; }
+static inline uint32_t DwmHookFaldCoreExtraTune(uint32_t w)     { return (w >> 8) & 0xFFu; }
+static inline uint32_t DwmHookFaldCoreExtraCoreMode(uint32_t w) { return (w >> 16) & 0xFu; }
+static inline int      DwmHookFaldCoreExtraCoreOn(uint32_t w)   { return (w & (1u << 20)) != 0u; }
 struct DwmHookFaldStatus {
     volatile uint32_t version;       // seqlock, written by the DLL (see above)
     uint32_t magic;                  // DWM_HOOK_FALD_STATUS_MAGIC once a DLL wrote

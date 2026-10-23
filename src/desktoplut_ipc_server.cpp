@@ -558,6 +558,13 @@ void HandleStateGet(JsonValue& result) {
                         cj.set("refresh_ms", JNum(cg.refreshMs));
                         cj.set("spacing_ms", JNum(cg.spacingMs));
                         cj.set("content_ms", JNum(cg.contentMs));
+                        if (cg.convSo != 0u) {   // the layer's variant / rule in that path (dwm_hook_config.h DwmHookFaldCoreExtra)
+                            static const char* kTune[4] = { "policy", "cached", "tuning", "tuned" };
+                            cj.set("conv_so", JNum((double)cg.convSo));                               // the conv pass's sub-offsets per thread
+                            cj.set("conv_tune", JStr(kTune[cg.convTune < 4u ? cg.convTune : 0u]));   // its auto-tune's state
+                            cj.set("core_mode_applied", JNum((double)(cg.coreOn ? cg.coreMode : 0u)));   // the always-on core's rule that runs
+                            cj.set("core_on", JBool(cg.coreOn));
+                        }
                     } else {
                         cj.set("state", JStr("unknown"));                         // not run yet / no report
                     }

@@ -116,7 +116,10 @@ def test_both_paths_dispatch_the_conv_grid_the_shader_expects(path):
     assert f"Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf({v}->convVariant)), 1);" in body
     assert body.count("Dispatch(") == 1
     assert "CSSetShaderResources(36, 2, k4);" in body                           # the float4 views the pass declares at t36 / t37
-    assert f"{v}->convVariant = FaldConvVariant(p.cols, p.rows, p.sub);" in c    # the variant and its tables chosen at build
+    # the variant chosen at build (the measured policy, or the test override) and its tables aliased: every variant's tables
+    # are resident for the auto-tune (shared/fald_conv_tune.h), which switches by the same call
+    assert f"SelectConvVariant({v}, FaldConvVariant(p.cols, p.rows, p.sub));" in c
+    assert f"{v}->kTrueBuf = {v}->kTrueBufV[v]; {v}->kTrueSRV = {v}->kTrueSRVV[v]; {v}->kTrue4SRV = {v}->kTrue4SRVV[v];" in c
     assert "FaldConvTableLayout(p.kTrue, p.sub, 2 * p.reachTrueC + 1, 2 * p.reachTrueR + 1, S)" in c
     assert "FaldConvTableLayout(p.kEst, p.sub, 2 * p.reachEstC + 1, 2 * p.reachEstR + 1, S)" in c
 
@@ -150,8 +153,12 @@ def test_boost_is_a_persistent_count_finished_by_the_decide_pass():
 
 # ---- zone sweeps in slices (work guide C14): the statistic pass and starfield S0 ---------------------------------------
 _SWEEPS = {   # source: (partial written by the sliced pass, the combine's fold of it)
-    "g_faldStatSource": ("q.f = float4(gMax[0], gSum[0], gPow[0], 0.0f);", "q.u = uint4(gLit[0], gDim[0], 0u, 0u);",
-                         "m = max(m, q.f.x); sum += q.f.y; powSum += q.f.z; lit += q.u.x; dim += q.u.y;"),
+    # (2026-10-23: the record's spare lanes carry the always-on core's zone statistics — fald_core2.h: max mc, sum mc, sum ln —
+    # when the core is on; 0 otherwise, so the record is the 2026-10-22 one bit for bit with the core off)
+    "g_faldStatSource": ("q.f = float4(gMax[0], gSum[0], gPow[0], coreOn ? gCMax[0] : 0.0f);",
+                         "q.u = uint4(gLit[0], gDim[0], coreOn ? asuint(gCSum[0]) : 0u, coreOn ? asuint(gCLn[0]) : 0u);",
+                         "m = max(m, q.f.x); sum += q.f.y; powSum += q.f.z; lit += q.u.x; dim += q.u.y;",
+                         "if (coreOn) { cMax = max(cMax, q.f.w); cSum += asfloat(q.u.z); cLn += asfloat(q.u.w); }"),
     "g_faldStarStatSource": ("q.f = float4(gMax[0], gSum[0], gMaxAll[0], gMin[0]);",
                              "q.u = uint4(gArg[0], gCount[0], asuint(gSumAll[0]), 0u);",
                              "mn = min(mn, q.f.w); sumAll += asfloat(q.u.z); count += q.u.y;"),

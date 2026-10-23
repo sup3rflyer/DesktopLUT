@@ -3,6 +3,7 @@
 #define NOMINMAX
 #endif
 #include "fald_core_status.h"
+#include "../shared/fald_core_mode.h"   // FaldCoreModeName (the tooltip)
 #include "fald.h"
 #include "dwm_inject.h"
 #include "globals.h"
@@ -20,13 +21,19 @@ namespace {
 std::mutex g_overlayMutex;
 std::map<std::pair<int, bool>, FaldCoreGovReport> g_overlay;   // (monitor index, hdr) -> the render thread's last
 
-FaldCoreGovReport FromStatus(const FaldCoreGovernorStatus& st) {
+void Extra(FaldCoreGovReport& r, uint32_t extra) {   // dwm_hook_config.h DwmHookFaldCoreExtra
+    r.convSo = DwmHookFaldCoreExtraSo(extra); r.convTune = DwmHookFaldCoreExtraTune(extra);
+    r.coreMode = DwmHookFaldCoreExtraCoreMode(extra); r.coreOn = DwmHookFaldCoreExtraCoreOn(extra) != 0;
+}
+
+FaldCoreGovReport FromStatus(const FaldCoreGovernorStatus& st, uint32_t extra) {
     FaldCoreGovReport r;
     r.known = true;
     r.state = st.state;
     r.p90Ms = st.p90Us / 1000.0; r.budgetMs = st.budgetUs / 1000.0;
     r.refreshMs = st.refreshMs; r.spacingMs = st.spacingMs; r.contentMs = st.contentMs;
     r.generation = st.generation;
+    Extra(r, extra);
     return r;
 }
 
@@ -46,6 +53,7 @@ bool FromHookBlock(const DwmHookFaldStatus& b, int left, int top, bool hdr, Fald
         out.p90Ms = e.p90Us / 1000.0; out.budgetMs = e.budgetUs / 1000.0;
         out.refreshMs = e.refreshMs; out.spacingMs = e.spacingMs; out.contentMs = e.contentMs;
         out.generation = e.generation;
+        Extra(out, e.extra);
         return true;
     }
     return false;
@@ -60,9 +68,9 @@ std::wstring ModeName(int monitorIndex, bool hdr) {
 
 }  // namespace
 
-void FaldCoreGovPublish(int monitorIndex, bool hdr, const FaldCoreGovernorStatus& st) {
+void FaldCoreGovPublish(int monitorIndex, bool hdr, const FaldCoreGovernorStatus& st, uint32_t extra) {
     std::lock_guard<std::mutex> lk(g_overlayMutex);
-    g_overlay[{ monitorIndex, hdr }] = FromStatus(st);
+    g_overlay[{ monitorIndex, hdr }] = FromStatus(st, extra);
 }
 
 bool FaldCoreGovReportFor(int monitorIndex, HMONITOR hmon, bool hdr, FaldCoreGovReport& out) {
@@ -99,7 +107,16 @@ std::wstring FaldCoreGovExplain(const FaldCoreGovReport& r) {
     default:
         break;
     }
-    return b;
+    std::wstring s = b;
+    if (r.convSo != 0u) {                      // the layer's variant / rule (dwm_hook_config.h DwmHookFaldCoreExtra)
+        static const wchar_t* kTune[4] = { L"the measured policy", L"cached", L"tuning", L"tuned" };
+        wchar_t v[200] = {};
+        swprintf_s(v, L"%sConvolution: %u sub-offset%s per thread (%s). Core rule: %S%s.", s.empty() ? L"" : L"\n", r.convSo,
+                   r.convSo == 1u ? L"" : L"s", kTune[r.convTune < 4u ? r.convTune : 0u],
+                   r.coreOn ? FaldCoreModeName(r.coreMode) : "C", r.coreOn ? L"" : L" (the core off)");
+        s += v;
+    }
+    return s;
 }
 
 void FaldCoreGovPostEvent(int monitorIndex, bool hdr, const FaldCoreGovReport& r) {

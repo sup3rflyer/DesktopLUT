@@ -62,12 +62,17 @@ static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_star
 static void CompileFeatureShaders();   // below FaldReleaseShaders
 static void FaldUnbindAll();          // with FaldRun
 #include "../shared/fald_core2.h"
+#include "../shared/fald_conv_tune.h"     // the conv pass's variant auto-tune (FaldMonitor::convTune)
 static void CoverReset(FaldMonitor* m);   // with FaldUpdateClean
+static void SelectConvVariant(FaldMonitor* m, unsigned int v);   // the conv pass's variant in use (with the passes)
+static void StartConvTune(FaldMonitor* m);                       // the auto-tune at build: the cache, or tuning
 
 // GPU timing (timestamp queries, read back without flushing a few frames later — never a stall in
 // the present path). Three stamps per run: start, after the starfield passes, end of the pixel pass.
 static FaldCoreTiming g_coreTiming;   // the layer's GPU time per full run (shared/fald_core_governor.h): the rate-cap
                                       // governor's input and the cost log; a slot's result is credited to its owner monitor
+static FaldCoreTiming g_tuneTiming;   // the conv auto-tune's timed dispatches (shared/fald_conv_tune.h): owner = the monitor
+                                      // with the variant in its two low bits (FaldMonitor is heap-allocated, 8-aligned)
 
 static const unsigned int HOOK_FALD_COVER_TILE = 32u;       // priming coverage granularity (px)
 static const unsigned int HOOK_FALD_RELEASE_AFTER = 600u;   // presents off before an entry frees its GPU memory
@@ -185,6 +190,7 @@ static void ReleaseFeatureShaders() {
     SafeRelease(g_starStatCombineCS);
     SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
     FaldCoreTimingRelease(&g_coreTiming);
+    FaldCoreTimingRelease(&g_tuneTiming);
 }
 
 static void CompileFeatureShaders() {
@@ -207,6 +213,7 @@ static void CompileFeatureShaders() {
     }
     // GPU timestamp queries (optional: without them the cost log shows CPU time only and the layer is never rate-capped)
     FaldCoreTimingCreate(&g_coreTiming, g_dev);
+    FaldCoreTimingCreate(&g_tuneTiming, g_dev);   // (without it the conv auto-tune never starts: the policy's variant stands)
     LogF("FALD: starfield shaders %s, LED lag shaders %s",
          StarShadersReady() ? "compiled" : "UNAVAILABLE", (g_temporalCS && g_clockCS) ? "compiled" : "UNAVAILABLE");
     std::string core2Err;                                          // the always-on core round 2 (prototype): optional
@@ -283,7 +290,7 @@ static bool WriteFadeStatus(int left, int top, bool isHdr, const FaldFadeGoverno
 }
 
 // The core governor's entry of the status block (dwm_hook_config.h DwmHookFaldStatus::core), the fade's rules.
-static bool WriteCoreStatus(int left, int top, bool isHdr, const FaldCoreGovernorStatus& st) {
+static bool WriteCoreStatus(int left, int top, bool isHdr, const FaldCoreGovernorStatus& st, uint32_t extra) {
     if (!g_faldStatusView) {
         if ((g_faldStatusOpenTick++ % 240u) != 0u) return false;   // the host creates it; asked rarely
         g_faldStatusMap = OpenFaldStatusMap();
@@ -310,6 +317,7 @@ static bool WriteCoreStatus(int left, int top, bool isHdr, const FaldCoreGoverno
         e.p90Us = (float)st.p90Us; e.budgetUs = (float)st.budgetUs;
         e.refreshMs = (float)st.refreshMs; e.spacingMs = (float)st.spacingMs; e.contentMs = (float)st.contentMs;
         e.generation = st.generation;
+        e.extra = extra;                      // the conv variant / auto-tune state / core mode (DwmHookFaldCoreExtra)
         e.used = 1u;
         b->magic = DWM_HOOK_FALD_STATUS_MAGIC;
         b->dwmPid = GetCurrentProcessId();
@@ -570,12 +578,14 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 6688;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 7240;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
                                                          // 2026-10-20: + the fade stack's five fields; 2026-10-22: + the
                                                          // fade governor's five and cleanGen; 2026-10-23: + the always-on
-                                                         // core's four: core2, coreModeWanted, core2Flags, core2On)
+                                                         // core's four: core2, coreModeWanted, core2Flags, core2On; + the conv
+                                                         // auto-tune's: every variant's 24 table views, 9 scratch views, the
+                                                         // tuner, its key and `stored`)
 struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_temporal.h (the overlay's FaldResources too)
     int left = 0, top = 0;
     bool isHdr = false;
@@ -625,9 +635,20 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     // panel tables (the kernels re-laid out for the conv pass's variant, shared/fald_panel.h FaldConvTableLayout: a float
     // view at t2 / t3 and a float4 view of the same buffer at t36 / t37)
     ID3D11Texture2D* curveTex = nullptr;  ID3D11ShaderResourceView* curveSRV = nullptr;
-    ID3D11Buffer* kTrueBuf = nullptr;     ID3D11ShaderResourceView* kTrueSRV = nullptr; ID3D11ShaderResourceView* kTrue4SRV = nullptr;
-    ID3D11Buffer* kEstBuf = nullptr;      ID3D11ShaderResourceView* kEstSRV = nullptr;  ID3D11ShaderResourceView* kEst4SRV = nullptr;
-    unsigned int convVariant = 0;         // FaldConvVariant at build: 0..3 <-> 1 / 2 / 4 / 8 sub-offsets per thread
+    // every variant's tables (shared/fald_conv_tune.h: the auto-tune times them all); the three below ALIAS the variant in
+    // use (SelectConvVariant; non-owning)
+    ID3D11Buffer* kTrueBufV[FALD_CONV_TUNE_VARIANTS] = {}; ID3D11ShaderResourceView* kTrueSRVV[FALD_CONV_TUNE_VARIANTS] = {}; ID3D11ShaderResourceView* kTrue4SRVV[FALD_CONV_TUNE_VARIANTS] = {};
+    ID3D11Buffer* kEstBufV[FALD_CONV_TUNE_VARIANTS] = {};  ID3D11ShaderResourceView* kEstSRVV[FALD_CONV_TUNE_VARIANTS] = {};  ID3D11ShaderResourceView* kEst4SRVV[FALD_CONV_TUNE_VARIANTS] = {};
+    ID3D11Buffer* kTrueBuf = nullptr;     ID3D11ShaderResourceView* kTrueSRV = nullptr; ID3D11ShaderResourceView* kTrue4SRV = nullptr;   // (aliases)
+    ID3D11Buffer* kEstBuf = nullptr;      ID3D11ShaderResourceView* kEstSRV = nullptr;  ID3D11ShaderResourceView* kEst4SRV = nullptr;    // (aliases)
+    unsigned int convVariant = 0;         // the variant in use: 0..3 <-> 1 / 2 / 4 / 8 sub-offsets per thread (the policy's, the cache's or the tuned one)
+    // the auto-tune's scratch outputs (written by its timed dispatch, never read), the tuner, the cache key, stored
+    ID3D11Texture2D* tuneTrueTex = nullptr;   ID3D11UnorderedAccessView* tuneTrueUAV = nullptr;   ID3D11ShaderResourceView* tuneTrueSRV = nullptr;
+    ID3D11Texture2D* tuneEstTex = nullptr;    ID3D11UnorderedAccessView* tuneEstUAV = nullptr;    ID3D11ShaderResourceView* tuneEstSRV = nullptr;
+    ID3D11Texture2D* tuneFieldsTex = nullptr; ID3D11UnorderedAccessView* tuneFieldsUAV = nullptr; ID3D11ShaderResourceView* tuneFieldsSRV = nullptr;
+    FaldConvTuner convTune;
+    std::string convTuneKey;
+    bool convTuneStored = false;
     bool gainFused = false;               // FaldGainBlurFused at build: passes 2b + 2c in one dispatch into gainB (gainA unused)
     // per-frame fields
     ID3D11Texture2D* driveTex = nullptr;  ID3D11UnorderedAccessView* driveUAV = nullptr; ID3D11ShaderResourceView* driveSRV = nullptr;
@@ -757,8 +778,10 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 //     fadeGov, fadeGovWrittenGen, fadeGovWriteRuns, cleanGen;
 //   KEPT on the entry by SwapPanel itself: spareParams;
 //   BUILT FRESH by the swap (BuildTables, defaults, or on demand later): params, valid, failed, panelSeq, failedSeq,
-//     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource (kTrue4SRV / kEst4SRV and
-//     convVariant, gainFused, the boost counters and the change-driven path's maps / list / flags / arguments and its
+//     refusedSeq, every panel-table / per-frame field / flat / boost / zone-partials resource (every variant's kTrue / kEst
+//     tables and the aliases of the one in use, convVariant, the conv auto-tune's scratch textures / convTune /
+//     convTuneKey / convTuneStored — a swap re-keys the tuner: the cache if it knows the lattice, else tuning again —,
+//     gainFused, the boost counters and the change-driven path's maps / list / flags / arguments and its
 //     runMode, stateComplete, planPartial, lastPartial, lastSettingsKey, lastLutPassKey, planSettingsKey, lastTrueMap,
 //     lastEstMap, touched, touchedOk, rects among the panel tables), zoneSlices, cb, starOn,
 //     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, fadeOn, fadeFailed,
@@ -894,8 +917,18 @@ static void ReleaseMonitor(FaldMonitor* m) {
     SafeRelease(m->bEstSRV); SafeRelease(m->bEstUAV); SafeRelease(m->bEstTex);
     SafeRelease(m->bTrueSRV); SafeRelease(m->bTrueUAV); SafeRelease(m->bTrueTex);
     SafeRelease(m->driveSRV); SafeRelease(m->driveUAV); SafeRelease(m->driveTex);
-    SafeRelease(m->kEst4SRV); SafeRelease(m->kEstSRV); SafeRelease(m->kEstBuf);
-    SafeRelease(m->kTrue4SRV); SafeRelease(m->kTrueSRV); SafeRelease(m->kTrueBuf);
+    m->kEst4SRV = nullptr; m->kEstSRV = nullptr; m->kEstBuf = nullptr;       // aliases of the variant in use (the arrays own them)
+    m->kTrue4SRV = nullptr; m->kTrueSRV = nullptr; m->kTrueBuf = nullptr;
+    for (unsigned int v = 0; v < FALD_CONV_TUNE_VARIANTS; v++) {
+        SafeRelease(m->kEst4SRVV[v]); SafeRelease(m->kEstSRVV[v]); SafeRelease(m->kEstBufV[v]);
+        SafeRelease(m->kTrue4SRVV[v]); SafeRelease(m->kTrueSRVV[v]); SafeRelease(m->kTrueBufV[v]);
+    }
+    SafeRelease(m->tuneTrueSRV); SafeRelease(m->tuneTrueUAV); SafeRelease(m->tuneTrueTex);
+    SafeRelease(m->tuneEstSRV); SafeRelease(m->tuneEstUAV); SafeRelease(m->tuneEstTex);
+    SafeRelease(m->tuneFieldsSRV); SafeRelease(m->tuneFieldsUAV); SafeRelease(m->tuneFieldsTex);
+    m->convTune = FaldConvTuner(); m->convTuneKey.clear(); m->convTuneStored = false;
+    for (int i = 0; i < FaldCoreTiming::kSlots; i++)                                   // a timed dispatch of this entry still in flight
+        if (((uintptr_t)g_tuneTiming.owner[i] & ~(uintptr_t)3u) == (uintptr_t)m) g_tuneTiming.owner[i] = nullptr;
     SafeRelease(m->curveSRV); SafeRelease(m->curveTex);
     SafeRelease(m->interSRV); SafeRelease(m->interRTV); SafeRelease(m->interTex);
     SafeRelease(m->cleanSRV); SafeRelease(m->cleanTex);
@@ -928,7 +961,7 @@ void FaldReleaseAll() {
     if (!locked) log_to_file("FALD: releasing without the panel table lock (a present thread kept it)");
     struct Unlock { bool on; ~Unlock() { if (on) g_panelsLock.Unlock(); } } unlock{ locked };
     g_faldReleasing.store(true);                          // an append refuses from here on
-    for (int i = 0; i < FaldCoreTiming::kSlots; i++) g_coreTiming.owner[i] = nullptr;   // owners are about to go
+    for (int i = 0; i < FaldCoreTiming::kSlots; i++) { g_coreTiming.owner[i] = nullptr; g_tuneTiming.owner[i] = nullptr; }   // owners are about to go
     const int count = g_numMonitors.exchange(0);          // a lookup finds no entry from here on (an append's CAS fails)
     int leaked = 0;
     for (int i = 0; i < count; i++) {
@@ -1248,15 +1281,20 @@ static bool BuildTables(FaldMonitor* m) {
             log_to_file("FALD: curve texture creation failed"); return false;
         }
     }
-    // the conv pass's kernel tables, laid out for its variant (shared/fald_panel.h FaldConvTableLayout)
-    m->convVariant = FaldConvVariant(p.cols, p.rows, p.sub);
-    {
-        const unsigned int S = FaldConvSoOf(m->convVariant);
+    // the conv pass's kernel tables, laid out for EVERY variant (shared/fald_panel.h FaldConvTableLayout; the auto-tune,
+    // shared/fald_conv_tune.h, times them all and switches exactly): the one in use is aliased by SelectConvVariant
+    for (unsigned int v = 0; v < FALD_CONV_TUNE_VARIANTS; v++) {
+        const unsigned int S = FaldConvSoOf(v);
         const std::vector<float> kT = FaldConvTableLayout(p.kTrue, p.sub, 2 * p.reachTrueC + 1, 2 * p.reachTrueR + 1, S);
         const std::vector<float> kE = FaldConvTableLayout(p.kEst, p.sub, 2 * p.reachEstC + 1, 2 * p.reachEstR + 1, S);
-        if (!MakeFloatBuffer(kT, &m->kTrueBuf, &m->kTrueSRV) || !MakeFloat4View(m->kTrueBuf, kT.size(), &m->kTrue4SRV)) { log_to_file("FALD: kTrue buffer failed"); return false; }
-        if (!MakeFloatBuffer(kE, &m->kEstBuf, &m->kEstSRV) || !MakeFloat4View(m->kEstBuf, kE.size(), &m->kEst4SRV)) { log_to_file("FALD: kEst buffer failed"); return false; }
+        if (!MakeFloatBuffer(kT, &m->kTrueBufV[v], &m->kTrueSRVV[v]) || !MakeFloat4View(m->kTrueBufV[v], kT.size(), &m->kTrue4SRVV[v])) { log_to_file("FALD: kTrue buffer failed"); return false; }
+        if (!MakeFloatBuffer(kE, &m->kEstBufV[v], &m->kEstSRVV[v]) || !MakeFloat4View(m->kEstBufV[v], kE.size(), &m->kEst4SRVV[v])) { log_to_file("FALD: kEst buffer failed"); return false; }
     }
+    SelectConvVariant(m, FaldConvVariant(p.cols, p.rows, p.sub));   // the measured policy (or the test override) until the tuner decides
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &m->tuneTrueTex, &m->tuneTrueUAV, &m->tuneTrueSRV)) { log_to_file("FALD: tune scratch failed"); return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &m->tuneEstTex, &m->tuneEstUAV, &m->tuneEstSRV)) { log_to_file("FALD: tune scratch failed"); return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &m->tuneFieldsTex, &m->tuneFieldsUAV, &m->tuneFieldsSRV, DXGI_FORMAT_R32G32B32A32_FLOAT)) { log_to_file("FALD: tune scratch failed"); return false; }
+    StartConvTune(m);
     if (!MakeRWTexture(p.cols, p.rows, &m->driveTex, &m->driveUAV, &m->driveSRV)) { log_to_file("FALD: drive texture failed"); return false; }
     // round 0's own maps (the change-driven path compares them run to run; round 1's are the textures named as before)
     if (!MakeRWTexture(p.cols, p.rows, &m->drive0Tex, &m->drive0UAV, &m->drive0SRV)) { log_to_file("FALD: drive texture (round 0) failed"); return false; }
@@ -1950,6 +1988,106 @@ static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11S
     UnbindCompute();
 }
 
+// The conv pass's variant in use (shared/fald_conv_tune.h), mirror of src/fald.cpp SelectConvVariant: the aliases every
+// pass binds (non-owning) and convVariant (the settings key carries it: a switch takes the full path once).
+static void SelectConvVariant(FaldMonitor* m, unsigned int v) {
+    v = v < FALD_CONV_TUNE_VARIANTS ? v : 0u;
+    m->convVariant = v;
+    m->kTrueBuf = m->kTrueBufV[v]; m->kTrueSRV = m->kTrueSRVV[v]; m->kTrue4SRV = m->kTrue4SRVV[v];
+    m->kEstBuf = m->kEstBufV[v]; m->kEstSRV = m->kEstSRVV[v]; m->kEst4SRV = m->kEst4SRVV[v];
+}
+
+// The auto-tune's cache file: the test seam's path ("-" = none), else %SYSTEMROOT%\Temp\DesktopLUT_fald_conv_tune.txt (the
+// hook's sources in the test exe: %TEMP%\DesktopLUT_fald_conv_tune_test.txt — never the real hook's file).
+static std::string ConvTuneCachePath() {
+    if (!g_faldConvTuneCachePath.empty()) return g_faldConvTuneCachePath == "-" ? std::string() : g_faldConvTuneCachePath;
+    char path[MAX_PATH] = {};
+#ifdef DLUT_HOOK_TESTING
+    ExpandEnvironmentStringsA("%TEMP%\\DesktopLUT_fald_conv_tune_test.txt", path, sizeof(path));
+#else
+    ExpandEnvironmentStringsA("%SYSTEMROOT%\\Temp\\DesktopLUT_fald_conv_tune.txt", path, sizeof(path));
+#endif
+    return path;
+}
+
+// At build, mirror of src/fald.cpp StartConvTune: the key of this device + lattice; the cache if it knows the key (the test
+// seam 0 = the policy only, 1 = tune even when cached), else tuning when the timing ring exists, else the policy.
+static void StartConvTune(FaldMonitor* m) {
+    const FaldPanelParams& p = m->params;
+    m->convTuneKey = FaldConvTuneKey(FaldConvTuneDeviceKey(g_dev), p.cols, p.rows, p.sub, 2 * p.reachTrueC + 1, 2 * p.reachTrueR + 1,
+                                     2 * p.reachEstC + 1, 2 * p.reachEstR + 1);
+    m->convTuneStored = false;
+    const unsigned int policy = m->convVariant;
+    FaldConvTuneRecord rec;
+    const std::string path = ConvTuneCachePath();
+    if (g_faldConvTuneOverride == 0) { m->convTune.UsePolicy(policy); return; }
+    if (g_faldConvTuneOverride != 1 && !path.empty() && FaldConvTuneCacheLookup(path, m->convTuneKey, rec)) {
+        m->convTune.UseCached(rec);
+        SelectConvVariant(m, rec.variant);
+        LogF("FALD: pos(%d,%d) %s conv variant S=%u from the auto-tune cache", m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", FaldConvSoOf(rec.variant));
+        return;
+    }
+    if (g_tuneTiming.ok) m->convTune.Start(policy);
+    else m->convTune.UsePolicy(policy);
+}
+
+// Per full run while tuning (after the pixel pass), mirror of src/fald.cpp TuneConvDispatch: ONE extra dispatch of the
+// variant under test into the scratch outputs between the tune ring's stamps (1..6 back to back: total = the dispatch),
+// with round 1's maps and boost. At most one convolution's cost on top of a present, never a wait (dwm_hook/CLAUDE.md).
+static void TuneConvDispatch(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive) {
+    const unsigned int v = m->convTune.NextVariant();
+    if (v >= FALD_CONV_TUNE_VARIANTS || !g_convCS[v]) return;
+    const int slot = FaldCoreTimingBegin(&g_tuneTiming, g_ctx, (void*)((uintptr_t)m | (uintptr_t)v));
+    if (slot < 0) return;                                            // the ring is full: not this present
+    const FaldPanelParams& p = m->params;
+    const uint32_t savedRunMode = m->runMode;
+    m->runMode = FaldRunModeWord(false, FaldConvSoOf(v), 0);
+    FillCB(m, 1);
+    g_ctx->CSSetShader(g_convCS[v], nullptr, 0);
+    BindCommon(m, true);
+    ID3D11ShaderResourceView* kv[2] = { m->kTrueSRVV[v], m->kEstSRVV[v] };   // t2 / t3: the variant's tables
+    g_ctx->CSSetShaderResources(2, 2, kv);
+    g_ctx->CSSetShaderResources(4, 1, &trueDrive);
+    g_ctx->CSSetShaderResources(10, 1, &estDrive);
+    g_ctx->CSSetShaderResources(14, 1, &m->boostSRV[1]);
+    ID3D11ShaderResourceView* k4[2] = { m->kTrue4SRVV[v], m->kEst4SRVV[v] };   // t36 / t37
+    g_ctx->CSSetShaderResources(36, 2, k4);
+    ID3D11UnorderedAccessView* uavs[3] = { m->tuneTrueUAV, m->tuneEstUAV, m->tuneFieldsUAV };
+    g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+    for (int k = 1; k <= 6; k++) FaldCoreTimingStamp(&g_tuneTiming, g_ctx, slot, k);
+    g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(v)), 1);
+    FaldCoreTimingEnd(&g_tuneTiming, g_ctx, slot);
+    UnbindCompute();
+    m->runMode = savedRunMode;
+}
+
+// At a present's start, mirror of src/fald.cpp UpdateConvTune: the finished timed dispatches (of any entry: the owner is in
+// the sample) into their tuners; a decision switches that entry's variant (exact) and stores the cache record once.
+static void TuneCollect() {
+    FaldCoreTimingSample smp[FaldCoreTiming::kSlots];
+    const unsigned int n = FaldCoreTimingCollect(&g_tuneTiming, g_ctx, smp, FaldCoreTiming::kSlots);
+    for (unsigned int i = 0; i < n; i++) {
+        FaldMonitor* o = (FaldMonitor*)((uintptr_t)smp[i].owner & ~(uintptr_t)3u);
+        const unsigned int v = (unsigned int)((uintptr_t)smp[i].owner & 3u);
+        if (!o) continue;
+        o->convTune.OnSample(v, smp[i].totalUs);
+        if (!o->convTune.Active() || !o->convTune.Decide()) continue;
+        const unsigned int chosen = o->convTune.Variant();
+        const double* med = o->convTune.Medians();
+        LogF("FALD: pos(%d,%d) %s conv auto-tune: S=1 %.0f us, S=2 %.0f us, S=4 %.0f us, S=8 %.0f us -> S=%u%s", o->left, o->top,
+             o->isHdr ? "HDR" : "SDR(ACM)", med[0], med[1], med[2], med[3], FaldConvSoOf(chosen), chosen == o->convVariant ? " (the policy's)" : "");
+        if (chosen != o->convVariant) SelectConvVariant(o, chosen);
+        if (!o->convTuneStored) {
+            FaldConvTuneRecord rec;
+            rec.key = o->convTuneKey; rec.variant = chosen;
+            for (unsigned int k = 0; k < FALD_CONV_TUNE_VARIANTS; k++) rec.us[k] = med[k];
+            const std::string path = ConvTuneCachePath();
+            if (!path.empty()) FaldConvTuneCacheStore(path, rec);   // (a file write, once per entry — not per present)
+            o->convTuneStored = true;
+        }
+    }
+}
+
 // Pass 2b/2c: (gain, the knee's ceiling B_est) on the fine grid, then a separable Gaussian low-pass of both (A -> B -> A; final in gainB).
 static void RunGain(FaldMonitor* m, uint32_t roundIdx, bool indirect = false) {
     const FaldPanelParams& p = m->params;
@@ -2505,7 +2643,8 @@ static void WriteGovernorStatus(FaldMonitor* m) {
                  m->isHdr ? "HDR" : "SDR(ACM)", FaldCoreGovStateName(cs.state), cs.p90Us / 1000.0, cs.budgetUs / 1000.0, cs.spacingMs);
         }
         const bool due = cs.generation != m->coreGovWrittenGen || ++m->coreGovWriteRuns >= 240u;
-        if (due && WriteCoreStatus(m->left, m->top, m->isHdr, cs)) { m->coreGovWrittenGen = cs.generation; m->coreGovWriteRuns = 0; }
+        const uint32_t extra = DwmHookFaldCoreExtra(FaldConvSoOf(m->convVariant), (uint32_t)m->convTune.GetState(), m->coreModeWanted, m->core2On ? 1 : 0);
+        if (due && WriteCoreStatus(m->left, m->top, m->isHdr, cs, extra)) { m->coreGovWrittenGen = cs.generation; m->coreGovWriteRuns = 0; }
     }
 }
 
@@ -2556,6 +2695,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
 
     // GPU timing: collect finished slots (no flush, no wait; the rate-cap governor gets each full run's core time).
     GpuTimingCollect(m);
+    TuneCollect();                           // the conv auto-tune's finished timed dispatches (any entry's)
     const double nowMs = freq.QuadPart > 0 ? (double)t0.QuadPart * 1000.0 / (double)freq.QuadPart : 0.0;
     if (newContent) m->coreGov.OnContentFrame(nowMs);
     // the drive maps the kernels and the LED-lag pass of a round read: round 0 has its own instantaneous / filtered maps
@@ -2716,6 +2856,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     PixelPass(m, dstRTV, mapSrv(trun.debugFiltMap, 1), partial);
     if (m->core2On) FaldCore2EndRun(m->core2);
     GpuTimingEnd(ts, m);
+    if (m->convTune.Active()) TuneConvDispatch(m, mapSrv(trun.trueMap, 1, trun.panel), mapSrv(trun.estMap, 1, trun.panel));   // one timed dispatch
     // what this run leaves behind for the next present's plan (shared/fald_change.h)
     m->stateComplete = true;
     m->fieldsStand = true;

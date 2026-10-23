@@ -13,6 +13,10 @@ struct FaldCoreGovReport {
     FaldCoreGovState state = FaldCoreGovState::Off;
     double p90Ms = 0.0, budgetMs = 0.0, refreshMs = 0.0, spacingMs = 0.0, contentMs = 0.0;
     uint32_t generation = 0;
+    // the layer's variant / rule in that path (dwm_hook_config.h DwmHookFaldCoreExtra): the conv pass's sub-offsets per
+    // thread in use (0 = unknown), its auto-tune's state (shared/fald_conv_tune.h), the always-on core's mode applied
+    uint32_t convSo = 0, convTune = 0, coreMode = 0;
+    bool coreOn = false;
 };
 
 // The status of live monitor `monitorIndex` (its HMONITOR `hmon`) in a mode: hook mode = the DLL's section, by the

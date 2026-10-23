@@ -6,6 +6,8 @@
 #include "fald_core_status.h"
 #include "types.h"
 #include "globals.h"
+#include "settings.h"                 // GetIniPath: the conv auto-tune's cache file lives next to the INI
+#include "../shared/dwm_hook_config.h"   // DwmHookFaldCoreExtra: the status word (conv variant / tune state / core mode) the overlay publishes too
 #include <d3dcompiler.h>
 #include <fstream>
 #include <iostream>
@@ -88,6 +90,8 @@ void FaldStarfieldClamp(FaldStarfieldSettings& s) {
 }
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
+static void SelectConvVariant(FaldResources* r, unsigned int v);   // the conv pass's variant in use (with the passes below)
+static void StartConvTune(FaldResources* r);                       // the auto-tune at build: the cache, or tuning
 #include "../shared/fald_core2.h"
 
 void FaldTrace(const char* msg) {
@@ -274,8 +278,17 @@ static void ReleaseClock(FaldResources* r) {
 static void ReleaseAll(FaldResources* r) {
     SafeRelease(r->interSRV); SafeRelease(r->interRTV); SafeRelease(r->inter);
     SafeRelease(r->curveSRV); SafeRelease(r->curveTex);
-    SafeRelease(r->kTrue4SRV); SafeRelease(r->kTrueSRV); SafeRelease(r->kTrueBuf);
-    SafeRelease(r->kEst4SRV); SafeRelease(r->kEstSRV); SafeRelease(r->kEstBuf);
+    r->kTrue4SRV = nullptr; r->kTrueSRV = nullptr; r->kTrueBuf = nullptr;   // aliases of the variant in use (the arrays own them)
+    r->kEst4SRV = nullptr; r->kEstSRV = nullptr; r->kEstBuf = nullptr;
+    for (unsigned int v = 0; v < FALD_CONV_TUNE_VARIANTS; v++) {
+        SafeRelease(r->kTrue4SRVV[v]); SafeRelease(r->kTrueSRVV[v]); SafeRelease(r->kTrueBufV[v]);
+        SafeRelease(r->kEst4SRVV[v]); SafeRelease(r->kEstSRVV[v]); SafeRelease(r->kEstBufV[v]);
+    }
+    SafeRelease(r->tuneTrueSRV); SafeRelease(r->tuneTrueUAV); SafeRelease(r->tuneTrueTex);
+    SafeRelease(r->tuneEstSRV); SafeRelease(r->tuneEstUAV); SafeRelease(r->tuneEstTex);
+    SafeRelease(r->tuneFieldsSRV); SafeRelease(r->tuneFieldsUAV); SafeRelease(r->tuneFieldsTex);
+    FaldCoreTimingRelease(&r->tuneTiming);
+    r->convTune = FaldConvTuner(); r->convTuneKey.clear(); r->convTuneStored = false;
     SafeRelease(r->driveSRV); SafeRelease(r->driveUAV); SafeRelease(r->driveTex);
     SafeRelease(r->driveFiltSRV); SafeRelease(r->driveFiltUAV); SafeRelease(r->driveFiltTex);
     SafeRelease(r->driveStateSRV); SafeRelease(r->driveStateUAV); SafeRelease(r->driveStateTex);
@@ -531,15 +544,16 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
             r->lastError = "curve texture"; return false;
         }
     }
-    // the conv pass's kernel tables, laid out for its variant (shared/fald_panel.h FaldConvTableLayout)
-    r->convVariant = FaldConvVariant(p.cols, p.rows, p.sub);
-    {
-        const unsigned int S = FaldConvSoOf(r->convVariant);
+    // the conv pass's kernel tables, laid out for EVERY variant (shared/fald_panel.h FaldConvTableLayout; the auto-tune,
+    // shared/fald_conv_tune.h, times them all and switches exactly): the one in use is aliased by SelectConvVariant
+    for (unsigned int v = 0; v < FALD_CONV_TUNE_VARIANTS; v++) {
+        const unsigned int S = FaldConvSoOf(v);
         const std::vector<float> kT = FaldConvTableLayout(p.kTrue, p.sub, 2 * p.reachTrueC + 1, 2 * p.reachTrueR + 1, S);
         const std::vector<float> kE = FaldConvTableLayout(p.kEst, p.sub, 2 * p.reachEstC + 1, 2 * p.reachEstR + 1, S);
-        if (!MakeFloatBuffer(kT, &r->kTrueBuf, &r->kTrueSRV) || !MakeFloat4View(r->kTrueBuf, kT.size(), &r->kTrue4SRV)) { r->lastError = "kTrue buffer"; return false; }
-        if (!MakeFloatBuffer(kE, &r->kEstBuf, &r->kEstSRV) || !MakeFloat4View(r->kEstBuf, kE.size(), &r->kEst4SRV)) { r->lastError = "kEst buffer"; return false; }
+        if (!MakeFloatBuffer(kT, &r->kTrueBufV[v], &r->kTrueSRVV[v]) || !MakeFloat4View(r->kTrueBufV[v], kT.size(), &r->kTrue4SRVV[v])) { r->lastError = "kTrue buffer"; return false; }
+        if (!MakeFloatBuffer(kE, &r->kEstBufV[v], &r->kEstSRVV[v]) || !MakeFloat4View(r->kEstBufV[v], kE.size(), &r->kEst4SRVV[v])) { r->lastError = "kEst buffer"; return false; }
     }
+    SelectConvVariant(r, FaldConvVariant(p.cols, p.rows, p.sub));   // the measured policy (or the test override) until the tuner decides
     if (!MakeRWTexture(p.cols, p.rows, &r->driveTex, &r->driveUAV, &r->driveSRV)) { r->lastError = "drive texture"; return false; }
     if (!MakeRWTexture(p.cols, p.rows, &r->driveFiltTex, &r->driveFiltUAV, &r->driveFiltSRV)) { r->lastError = "filtered drive texture"; return false; }
     // round 0's own maps (the change-driven path compares them run to run; round 1's are the textures above)
@@ -598,6 +612,12 @@ static bool Build(MonitorContext* ctx, FaldResources* r, const std::wstring& pat
     r->lastError.clear();
     ComputeFlatResponse(r);
     FaldCoreTimingCreate(&r->coreTiming, g_device);   // the rate-cap governor's GPU timing (without it the layer is never capped)
+    // the conv auto-tune (shared/fald_conv_tune.h): its scratch outputs, its timing ring, then the cache or tuning
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->tuneTrueTex, &r->tuneTrueUAV, &r->tuneTrueSRV)) { r->lastError = "tune scratch (B_true)"; return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->tuneEstTex, &r->tuneEstUAV, &r->tuneEstSRV)) { r->lastError = "tune scratch (B_est)"; return false; }
+    if (!MakeRWTexture(p.cols * p.sub, p.rows * p.sub, &r->tuneFieldsTex, &r->tuneFieldsUAV, &r->tuneFieldsSRV, DXGI_FORMAT_R32G32B32A32_FLOAT)) { r->lastError = "tune scratch (fields)"; return false; }
+    FaldCoreTimingCreate(&r->tuneTiming, g_device);
+    StartConvTune(r);
     std::cout << "[FALD] Monitor " << ctx->index << " resources ready: " << p.cols << "x" << p.rows << " cells on a "
               << p.latW << "x" << p.latH << "-px lattice (" << (FaldLatticeFractional(p) ? "fractional pitch, " : "")
               << "zones up to " << p.cellW << "x" << p.cellH << " px), sub " << p.sub << ", white " << p.white << " nits, transfer "
@@ -977,6 +997,107 @@ static void RunConv(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D1
         else g_context->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(r->convVariant)), 1);
     }
     UnbindCompute();
+}
+
+// The conv pass's variant in use (shared/fald_conv_tune.h): the aliases every pass binds (non-owning: the V arrays own the
+// tables) and convVariant, which the settings key carries — a switch takes the full path once (the fields are the same bytes
+// from every variant; the key only says "settings changed") and the CB's runMode word follows it (the decide pass's group count).
+static void SelectConvVariant(FaldResources* r, unsigned int v) {
+    v = v < FALD_CONV_TUNE_VARIANTS ? v : 0u;
+    r->convVariant = v;
+    r->kTrueBuf = r->kTrueBufV[v]; r->kTrueSRV = r->kTrueSRVV[v]; r->kTrue4SRV = r->kTrue4SRVV[v];
+    r->kEstBuf = r->kEstBufV[v]; r->kEstSRV = r->kEstSRVV[v]; r->kEst4SRV = r->kEst4SRVV[v];
+}
+
+// The auto-tune's cache file: the test seam's path ("-" = no cache), else DesktopLUT_fald_conv_tune.txt next to the INI.
+static std::string ConvTuneCachePath() {
+    if (!g_faldConvTuneCachePath.empty()) return g_faldConvTuneCachePath == "-" ? std::string() : g_faldConvTuneCachePath;
+    std::wstring dir = GetIniPath();
+    const size_t cut = dir.find_last_of(L"\\/");
+    dir = cut == std::wstring::npos ? std::wstring() : dir.substr(0, cut + 1);
+    const std::wstring w = dir + L"DesktopLUT_fald_conv_tune.txt";
+    const int n = WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string s(n > 0 ? (size_t)n - 1 : 0, '\0');
+    if (n > 0) WideCharToMultiByte(CP_ACP, 0, w.c_str(), -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// At build (after the policy's variant is aliased): the key of this device + lattice; the test seam g_faldConvTuneOverride
+// 0 = the policy only, 1 = tune even when cached, -1 (the app) = the cache if it has this key, else tune when the timing
+// ring exists (no queries: the policy stands, as before 2026-10-23).
+static void StartConvTune(FaldResources* r) {
+    const FaldPanelParams& p = r->params;
+    r->convTuneKey = FaldConvTuneKey(FaldConvTuneDeviceKey(g_device), p.cols, p.rows, p.sub, 2 * p.reachTrueC + 1, 2 * p.reachTrueR + 1,
+                                     2 * p.reachEstC + 1, 2 * p.reachEstR + 1);
+    r->convTuneStored = false;
+    const unsigned int policy = r->convVariant;
+    FaldConvTuneRecord rec;
+    const std::string path = ConvTuneCachePath();
+    if (g_faldConvTuneOverride == 0) { r->convTune.UsePolicy(policy); return; }
+    if (g_faldConvTuneOverride != 1 && !path.empty() && FaldConvTuneCacheLookup(path, r->convTuneKey, rec)) {
+        r->convTune.UseCached(rec);
+        SelectConvVariant(r, rec.variant);
+        return;
+    }
+    if (r->tuneTiming.ok) r->convTune.Start(policy);
+    else r->convTune.UsePolicy(policy);
+}
+
+// Per full run while tuning (after the pixel pass): ONE extra dispatch of the variant under test into the scratch outputs,
+// between the tune ring's stamps (stamps 1..6 back to back: total = the dispatch), with round 1's maps and boost as the
+// real pass had them. At most one convolution's cost on top of a run, never a wait. The CB's runMode word carries the
+// variant's S for the duration (the full path's word; restored after).
+static void TuneConvDispatch(FaldResources* r, ID3D11ShaderResourceView* trueDrive, ID3D11ShaderResourceView* estDrive) {
+    const unsigned int v = r->convTune.NextVariant();
+    if (v >= FALD_CONV_TUNE_VARIANTS || !g_faldConvCS[v]) return;
+    const int slot = FaldCoreTimingBegin(&r->tuneTiming, g_context, (void*)(uintptr_t)(v + 1));
+    if (slot < 0) return;                                            // the ring is full: not this run
+    const FaldPanelParams& p = r->params;
+    const uint32_t savedRunMode = r->runMode;
+    r->runMode = FaldRunModeWord(false, FaldConvSoOf(v), 0);
+    FillCB(r, 1);
+    FaldPassScope ps(FALD_PASS_COUNT);                               // (the harness's per-pass profile hook ignores it)
+    g_context->CSSetShader(g_faldConvCS[v], nullptr, 0);
+    BindCommon(r, true);
+    ID3D11ShaderResourceView* kv[2] = { r->kTrueSRVV[v], r->kEstSRVV[v] };   // t2 / t3: the variant's tables
+    g_context->CSSetShaderResources(2, 2, kv);
+    g_context->CSSetShaderResources(4, 1, &trueDrive);
+    g_context->CSSetShaderResources(10, 1, &estDrive);
+    g_context->CSSetShaderResources(14, 1, &r->boostSRV[1]);
+    ID3D11ShaderResourceView* k4[2] = { r->kTrue4SRVV[v], r->kEst4SRVV[v] };   // t36 / t37
+    g_context->CSSetShaderResources(36, 2, k4);
+    ID3D11UnorderedAccessView* uavs[3] = { r->tuneTrueUAV, r->tuneEstUAV, r->tuneFieldsUAV };
+    g_context->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
+    for (int k = 1; k <= 6; k++) FaldCoreTimingStamp(&r->tuneTiming, g_context, slot, k);
+    g_context->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(v)), 1);
+    FaldCoreTimingEnd(&r->tuneTiming, g_context, slot);
+    UnbindCompute();
+    r->runMode = savedRunMode;
+}
+
+// At the run's start: the finished timed dispatches into the tuner; a decision switches the variant (exact) and stores the
+// cache record once.
+static void UpdateConvTune(MonitorContext* ctx, FaldResources* r) {
+    FaldCoreTimingSample smp[FaldCoreTiming::kSlots];
+    const unsigned int n = FaldCoreTimingCollect(&r->tuneTiming, g_context, smp, FaldCoreTiming::kSlots);
+    for (unsigned int i = 0; i < n; i++) {
+        const unsigned int v = (unsigned int)(uintptr_t)smp[i].owner;
+        if (v >= 1u && v <= FALD_CONV_TUNE_VARIANTS) r->convTune.OnSample(v - 1u, smp[i].totalUs);
+    }
+    if (!r->convTune.Active() || !r->convTune.Decide()) return;
+    const unsigned int chosen = r->convTune.Variant();
+    const double* med = r->convTune.Medians();
+    std::cout << "[FALD] Monitor " << ctx->index << " conv auto-tune: S=1 " << med[0] << " us, S=2 " << med[1] << " us, S=4 " << med[2]
+              << " us, S=8 " << med[3] << " us -> S=" << FaldConvSoOf(chosen) << (chosen == r->convVariant ? " (the policy's)" : "") << std::endl;
+    if (chosen != r->convVariant) SelectConvVariant(r, chosen);
+    if (!r->convTuneStored) {
+        FaldConvTuneRecord rec;
+        rec.key = r->convTuneKey; rec.variant = chosen;
+        for (unsigned int v = 0; v < FALD_CONV_TUNE_VARIANTS; v++) rec.us[v] = med[v];
+        const std::string path = ConvTuneCachePath();
+        if (!path.empty()) FaldConvTuneCacheStore(path, rec);
+        r->convTuneStored = true;
+    }
 }
 
 // Pass 2b/2c: (gain, the knee's ceiling B_est) on the fine grid, then a separable Gaussian low-pass of both (A -> B -> A ... final in gainB).
@@ -1463,7 +1584,8 @@ static unsigned long long SettingsKey(const FaldResources* r, const FaldTemporal
 // The core layer's rate-cap governor (shared/fald_core_governor.h), once per run: the force key, the mode, the refresh
 // interval; the GPU time of finished full runs (the timing ring); this run's content-frame clock. Publishes the status for
 // the interface / the pipe and posts an Events line on a state change (as the fade's).
-static void UpdateCoreGovernor(MonitorContext* ctx, FaldResources* r, bool newContent, double nowMs) {
+// coreMode: the always-on core's mode of this run (the status word carries it with the conv variant / tune state).
+static void UpdateCoreGovernor(MonitorContext* ctx, FaldResources* r, bool newContent, double nowMs, uint32_t coreMode) {
     FaldCoreGovernor& gov = r->coreGov;
     gov.Configure(g_faldCoreForce.load());
     gov.SetRefreshMs(ctx->frameTimeExactMs);
@@ -1477,7 +1599,9 @@ static void UpdateCoreGovernor(MonitorContext* ctx, FaldResources* r, bool newCo
     if (newContent) gov.OnContentFrame(nowMs);
     const FaldCoreGovernorStatus st = gov.Status();
     const bool changed = st.generation != r->coreGovPublishedGen;
-    if (changed || (r->framesRun % 120ull) == 0ull) FaldCoreGovPublish(ctx->index, ctx->isHDREnabled, st);
+    if (changed || (r->framesRun % 120ull) == 0ull)
+        FaldCoreGovPublish(ctx->index, ctx->isHDREnabled, st,
+                           DwmHookFaldCoreExtra(FaldConvSoOf(r->convVariant), (uint32_t)r->convTune.GetState(), coreMode, r->core2On ? 1 : 0));
     if (changed) {
         const bool first = r->coreGovPublishedGen == 0xFFFFFFFFu;
         r->coreGovPublishedGen = st.generation;
@@ -1576,7 +1700,8 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     LARGE_INTEGER qpcNow, qpcFreq;
     QueryPerformanceCounter(&qpcNow); QueryPerformanceFrequency(&qpcFreq);
     const double nowMs = (double)qpcNow.QuadPart * 1000.0 / (double)qpcFreq.QuadPart;
-    UpdateCoreGovernor(ctx, r, newContent, nowMs);
+    UpdateCoreGovernor(ctx, r, newContent, nowMs, fs.coreMode);
+    UpdateConvTune(ctx, r);                 // the conv auto-tune's finished timed dispatches; a decision switches the variant
     // the drive maps the kernels and the LED-lag pass of a round read: round 0 has its own instantaneous / filtered maps
     // (modes 1 / 2 run the temporal pass per round); the panel clock's B_true map — mode 3, ONE pass per run, read by both
     // rounds (clockMaps) — is the round-1 filtered slot, as on main (RunPanelClock)
@@ -1736,6 +1861,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     RunPixel(ctx, r, finalRT, mapSrv(trun.debugFiltMap, 1));
     if (r->core2On) FaldCore2EndRun(r->core2);
     FaldCoreTimingEnd(&r->coreTiming, g_context, tslot);
+    if (r->convTune.Active()) TuneConvDispatch(r, mapSrv(trun.trueMap, 1, panel), mapSrv(trun.estMap, 1, panel));   // one timed dispatch
     if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);
 
     // The commit's indices and the settle hold (render.cpp asks FaldSettlePending on an acquire timeout and re-runs the

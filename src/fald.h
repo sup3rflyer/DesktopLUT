@@ -24,6 +24,7 @@
 #include "../shared/fald_fade_governor.h"   // the flank fade's safety governor (FaldResources::fadeGov)
 #include "../shared/fald_core_governor.h"   // the core layer's rate-cap governor (FaldResources::coreGov)
 #include "../shared/fald_change.h"          // the change-driven path: touched zones, the rules, the argument slots
+#include "../shared/fald_conv_tune.h"       // the conv pass's variant auto-tune (FaldResources::convTune)
 
 struct MonitorContext;
 struct FaldSettings;
@@ -93,9 +94,23 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* curveTex = nullptr;   ID3D11ShaderResourceView* curveSRV = nullptr;
     // the conv pass's kernel tables, re-laid out for its variant (shared/fald_panel.h FaldConvTableLayout; one float view
     // at t2 / t3, one float4 view of the same buffer at t36 / t37)
-    ID3D11Buffer* kTrueBuf = nullptr;      ID3D11ShaderResourceView* kTrueSRV = nullptr; ID3D11ShaderResourceView* kTrue4SRV = nullptr;
-    ID3D11Buffer* kEstBuf = nullptr;       ID3D11ShaderResourceView* kEstSRV = nullptr;  ID3D11ShaderResourceView* kEst4SRV = nullptr;
-    unsigned int convVariant = 0;          // FaldConvVariant at Build: 0..3 <-> 1 / 2 / 4 / 8 sub-offsets per thread
+    // The conv pass's kernel tables for EVERY variant (shared/fald_conv_tune.h: the auto-tune times them all and switches
+    // exactly): these arrays own them; kTrueBuf / kTrueSRV / kTrue4SRV (and kEst) below ALIAS the variant in use
+    // (SelectConvVariant), so the passes bind as before.
+    ID3D11Buffer* kTrueBufV[FALD_CONV_TUNE_VARIANTS] = {}; ID3D11ShaderResourceView* kTrueSRVV[FALD_CONV_TUNE_VARIANTS] = {}; ID3D11ShaderResourceView* kTrue4SRVV[FALD_CONV_TUNE_VARIANTS] = {};
+    ID3D11Buffer* kEstBufV[FALD_CONV_TUNE_VARIANTS] = {};  ID3D11ShaderResourceView* kEstSRVV[FALD_CONV_TUNE_VARIANTS] = {};  ID3D11ShaderResourceView* kEst4SRVV[FALD_CONV_TUNE_VARIANTS] = {};
+    ID3D11Buffer* kTrueBuf = nullptr;      ID3D11ShaderResourceView* kTrueSRV = nullptr; ID3D11ShaderResourceView* kTrue4SRV = nullptr;   // (aliases)
+    ID3D11Buffer* kEstBuf = nullptr;       ID3D11ShaderResourceView* kEstSRV = nullptr;  ID3D11ShaderResourceView* kEst4SRV = nullptr;    // (aliases)
+    unsigned int convVariant = 0;          // the variant in use: 0..3 <-> 1 / 2 / 4 / 8 sub-offsets per thread (the policy's, the cache's or the tuned one)
+    // the auto-tune: scratch outputs of its timed dispatch (written, never read), its own timing ring (a slot per timed
+    // dispatch, read a few runs later), the tuner, the cache key and whether the result was stored
+    ID3D11Texture2D* tuneTrueTex = nullptr;   ID3D11UnorderedAccessView* tuneTrueUAV = nullptr;   ID3D11ShaderResourceView* tuneTrueSRV = nullptr;
+    ID3D11Texture2D* tuneEstTex = nullptr;    ID3D11UnorderedAccessView* tuneEstUAV = nullptr;    ID3D11ShaderResourceView* tuneEstSRV = nullptr;
+    ID3D11Texture2D* tuneFieldsTex = nullptr; ID3D11UnorderedAccessView* tuneFieldsUAV = nullptr; ID3D11ShaderResourceView* tuneFieldsSRV = nullptr;
+    FaldCoreTiming tuneTiming;
+    FaldConvTuner convTune;
+    std::string convTuneKey;
+    bool convTuneStored = false;
     bool gainFused = false;                // FaldGainBlurFused at Build: passes 2b + 2c in one dispatch into gainB (gainA unused)
     // per-frame fields
     ID3D11Texture2D* driveTex = nullptr;   ID3D11UnorderedAccessView* driveUAV = nullptr;  ID3D11ShaderResourceView* driveSRV = nullptr;
@@ -277,7 +292,8 @@ void FaldFadeGovPublish(int monitorIndex, bool hdr, const FaldFadeGovernorStatus
 // The core layer's rate-cap governor, likewise: the INI force key ([General] FaldCoreForce=1: never capped) and the
 // status per monitor and mode (src/fald_core_status.h).
 extern std::atomic<bool> g_faldCoreForce;
-void FaldCoreGovPublish(int monitorIndex, bool hdr, const FaldCoreGovernorStatus& st);
+// extra: the conv variant / auto-tune state / core mode word (dwm_hook_config.h DwmHookFaldCoreExtra; 0 = unknown).
+void FaldCoreGovPublish(int monitorIndex, bool hdr, const FaldCoreGovernorStatus& st, uint32_t extra = 0);
 
 // Test seam (tests/test_fald_fade_hw.cpp FALD_HW_PROFILE_CORE=1): a hook called before and after every GPU command of
 // FaldRunPasses, so a harness can put timestamp queries around each pass. Null in production: one pointer test per pass.
