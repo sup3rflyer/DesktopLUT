@@ -328,6 +328,8 @@ class MockDesktopLutState:
                            "bypass_grayscale": False, **(self.layers.get(k) or {}), **_fald_state_keys(self.fald.get(k))}
                        for k in sorted(set(self.layers) | {f"{m}:{md}" for m in (0, 1) for md in ("SDR", "HDR")})},
             "fald": deepcopy(self.fald),
+            # C++ state.get "refresh_trim" (2026-10-23): the simulator has no DIP and no refresh rate.
+            "refresh_trim": {},
             "overlay_model": {"keep_awake": self.overlay_keep_awake, "sleep_lag_polls": self.overlay_sleep_lag_polls,
                               "awake": self.overlay_awake, "lag_left": self.overlay_lag_left},
             "command_count": self.command_count,
@@ -612,12 +614,19 @@ class MockDesktopLutServer:
         cur = dict(self.state.layers.get(key) or {n: False for n in self.LAYER_NAMES})
         before = {**cur, "fald_params_path": str((self.state.fald.get(key) or {}).get("params_path") or "")}   # C++ LayersJson
         mhc_changed = False
+        if "refresh_trim" in params:
+            # C++ DoLayersSet: the refresh trim's switch, HDR only (the simulator has no trim to apply).
+            if not is_hdr and bool(params["refresh_trim"]):
+                return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap / refresh_trim are HDR-only layers")
+            if is_hdr:
+                cur["refresh_trim"] = bool(params["refresh_trim"])
+                before.setdefault("refresh_trim", True)
         for name in self.LAYER_NAMES:
             if name in params:
                 val = bool(params[name])
                 if not is_hdr and name in ("desktop_gamma", "tonemap"):
                     if val:
-                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap are HDR-only layers")
+                        return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap / refresh_trim are HDR-only layers")
                     continue
                 if cur.get(name) != val:
                     cur[name] = val
