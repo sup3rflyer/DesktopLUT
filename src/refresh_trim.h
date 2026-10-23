@@ -11,9 +11,10 @@
 // over the light at 60 Hz at each level (keyed by the level's 60-Hz light), the run, the date, the identity of the
 // panel and the conditions. A measured response, not a correction. DesktopLUT reads it through the DLC folder setting
 // (the DLC tab's: [UI] DlcFolder, else found next to DesktopLUT) and DERIVES the trim at bake time: g = 1 / ratio,
-// held below the lowest level, extended to the panel peak without crossing 1 (DeriveRefreshTrim). No DLC folder, no
-// DIP, no section, the display's switch off (INI HDR_MHCRefreshTrim=0) = no trim, and every profile byte-identical
-// to one baked without this feature.
+// held below the lowest level, faded out to 1 above the highest — flat at the panel's peak (the section's, else the
+// HDR profile's), both ends the panel's own (DeriveRefreshTrim, mhc.h MhcRefreshTrimGain). No DLC folder, no DIP, no
+// section, the display's switch off (INI HDR_MHCRefreshTrim=0) = no trim, and every profile byte-identical to one
+// baked without this feature.
 //
 // WHICH SECTION: the section's identity.hardware_id (the EDID vendor + product the measurement read off the display,
 // e.g. AUS322A) must equal the live display's (the id part of its EdidId, else of its device path). When more than
@@ -63,8 +64,9 @@ constexpr double kRefreshTrimRateTolHz = 0.01;
 // peak, knots, as their bit patterns). What the variants are stamped with.
 std::string RefreshTrimStamp(const MhcRefreshTrim& trim);
 
-// The trim of one measured rate: ln g = -ln(ratio) per level (ascending, duplicates of a level dropped), extended to
-// peakNits (> 0; else no cap). False (why) when the rate has no usable level or a ratio outside 0.5..2.
+// The trim of one measured rate: ln g = -ln(ratio) per level (ascending, duplicates of a level dropped), faded out to
+// g = 1 at peakNits (> 0; else the measured trend toward 1). False (why) when the rate has no usable level or a ratio
+// outside 0.5..2.
 bool DeriveRefreshTrim(const dlc::DipRefreshRate& rate, double peakNits, MhcRefreshTrim& out, std::string* why = nullptr);
 
 enum class RefreshTrimPick { Reference, Unmeasured, Trim, Invalid };

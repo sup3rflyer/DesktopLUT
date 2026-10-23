@@ -85,6 +85,42 @@ def test_chromaticity_and_channel_checks_pass_on_a_neutral_effect():
     assert res["channels"]["47.952"]["ok"]
 
 
+def _entry(nits, ln_gain):
+    return {"knots": [{"y60_nits": y, "ln_gain": v} for y, v in zip(nits, ln_gain)]}
+
+
+def test_gain_fades_to_one_above_the_top_level():
+    """The C++ bake's twin (DesktopLUT tests/test_refresh_trim.cpp, the same cases and numbers)."""
+    e = _entry([1.0, 10.0, 100.0], [-0.03, -0.02, -0.01])
+    assert rt.gain_at(e, 100.0, 1000.0) == pytest.approx(math.exp(-0.01), rel=1e-12)
+    # from (2, -0.01, slope 0.01 per decade) to (3, 0, flat): the Hermite midpoint -0.01/2 + 1 * 0.01/8
+    assert rt.gain_at(e, math.sqrt(1e5), 1000.0) == pytest.approx(math.exp(-0.00375), rel=1e-12)
+    assert rt.gain_at(e, 1000.0, 1000.0) == 1.0 and rt.gain_at(e, 5000.0, 1000.0) == 1.0
+    assert rt.gain_at(e, math.sqrt(1e5)) == pytest.approx(math.exp(-0.005), rel=1e-12)     # no peak: the top slope
+    assert rt.gain_at(e, 1e5) == pytest.approx(1.0, rel=1e-12)                              # never past 1
+    assert rt.gain_at(e, 1e4, 50.0) == rt.gain_at(e, 50.0, 50.0)                            # a peak below the top: held
+    away = _entry([10.0, 100.0], [-0.01, -0.02])                 # heading away from 1: not followed
+    assert rt.gain_at(away, math.sqrt(1e5), 1000.0) == pytest.approx(math.exp(-0.01), rel=1e-12)
+    assert rt.gain_at(away, 1e4) == pytest.approx(math.exp(-0.02), rel=1e-12)
+    one = _entry([100.0], [math.log(0.97)])
+    assert rt.gain_at(one, 100.0, 1000.0) == pytest.approx(0.97, rel=1e-12)
+    assert rt.gain_at(one, math.sqrt(1e5), 1000.0) == pytest.approx(math.sqrt(0.97), rel=1e-12)
+    bright = _entry([100.0, 1000.0], [0.02, 0.03])               # brightening, the peak just above: stretched
+    end = 1000.0 * 10 ** (6.0 * 0.03 / math.log(10.0))
+    assert rt.gain_at(bright, 1050.0, 1050.0) > 1.0 and rt.gain_at(bright, end * 1.001, 1050.0) == 1.0
+    for ent, peak in ((e, 1000.0), (away, 1000.0), (one, 1000.0), (_entry([100.0, 1000.0], [-0.11, -0.01]), 1e4),
+                      (bright, 1050.0), (bright, 5000.0)):
+        top = ent["knots"][-1]["y60_nits"]
+        v1 = ent["knots"][-1]["ln_gain"]
+        prev, prev_y = v1, top
+        for i in range(1, 2001):
+            y = top * (peak * 1.5 / top) ** (i / 2000)
+            v = math.log(rt.gain_at(ent, y, peak))
+            assert abs(v) <= abs(prev) + 1e-15 and (v == 0.0 or (v > 0) == (v1 > 0))   # only toward 1
+            assert (math.log(y) + v) - (math.log(prev_y) + prev) >= 0.5 * math.log(y / prev_y) - 1e-12   # light rises
+            prev, prev_y = v, y
+
+
 def test_trim_export_and_evaluation():
     res = rt.analyze(synth(), peak_nits=1800.0)
     trim = res["trim"]
@@ -92,12 +128,13 @@ def test_trim_export_and_evaluation():
     e = trim["rates"]["47.952"]
     k = {kk["patch"]: kk for kk in e["knots"]}
     assert k["g520"]["gain"] < 1.0 and k["g520"]["dpq_code_10bit"] < 0
-    # hold below the lowest knot, interpolate between, extend above but never past gain 1, clamp at the peak
+    # hold below the lowest knot, interpolate between, fade out above to gain 1, flat at the peak
     assert rt.gain_at(e, 0.05) == pytest.approx(k["g120"]["gain"], rel=1e-12)
     g_mid = rt.gain_at(e, 70.0)
     assert k["g520"]["gain"] <= g_mid <= k["g451"]["gain"] or k["g451"]["gain"] <= g_mid <= k["g520"]["gain"]
     assert k["g770"]["gain"] < rt.gain_at(e, 1500.0) <= 1.0
-    assert rt.gain_at(e, 5000.0, 1800.0) == pytest.approx(rt.gain_at(e, 1800.0, 1800.0))
+    assert k["g770"]["gain"] < rt.gain_at(e, 1500.0, 1800.0) < 1.0
+    assert rt.gain_at(e, 1800.0, 1800.0) == 1.0 and rt.gain_at(e, 5000.0, 1800.0) == 1.0
     assert rt.trim_for_hz(trim, 60.0, 100.0) == 1.0
     assert rt.trim_for_hz(trim, 48000 / 1001, k["g520"]["y60_nits"]) == pytest.approx(k["g520"]["gain"], rel=1e-9)
     # an unmeasured rate inside the span: the period model; outside: None (no trim)

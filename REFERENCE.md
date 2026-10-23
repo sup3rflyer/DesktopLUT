@@ -206,9 +206,10 @@ its exact rational and, per grey level, the light at that rate over the light at
 two rates equal, e.g. 48 = 47.952, 59.94 = 60). DesktopLUT finds the DLC folder through the DLC tab's setting
 (`[UI] DlcFolder`, else next to DesktopLUT), matches the section to a live display by the EDID hardware id it recorded
 (twin panels also by device path), and derives the trim at bake time: `g = 1 / ratio`, held below the lowest level,
-extended to the panel peak without crossing 1, applied as the HDR MHC 1D LUT's LAST stage (after the fine-tune and desktop
-gamma) on the drive, keyed by the drive's 60-Hz light (the profile's own calibration is the panel model). The matrix is
-untouched. Only measured rates get a trim; 60 Hz, a rate equal to it, and any unmeasured rate get none.
+faded out to 1 above the highest (nothing is measured there: a monotone curve in log level from the top level's gain and
+slope to 1, flat, at the panel's peak — the section's `peak_nits`, else the HDR profile's), applied as the HDR MHC 1D
+LUT's LAST stage (after the fine-tune and desktop gamma) on the drive, keyed by the drive's 60-Hz light (the profile's
+own calibration is the panel model). The matrix is untouched. Only measured rates get a trim; 60 Hz, a rate equal to it, and any unmeasured rate get none.
 
 The variants are the permutation cache's, STAMPED with the trim (`HDR_MHCPermTrim<k>`), like desktop gamma's SDR white:
 on a refresh change (WM_DISPLAYCHANGE, burst stages, the 15 s tick) each display's live vSyncFreq is matched within
