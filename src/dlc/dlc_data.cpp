@@ -6,6 +6,7 @@
 #include <windows.h>
 #include <cmath>
 #include <cwctype>
+#include <algorithm>
 
 namespace dlc {
 
@@ -284,6 +285,104 @@ std::vector<CorrectionRecord> ParseCorrectionStore(const std::string& json) {
         bool taken = false;
         for (const CorrectionRecord& r : out) if (r.display == l.display && r.mode == l.mode) taken = true;
         if (!taken) out.push_back(l);
+    }
+    return out;
+}
+
+namespace {
+
+// A positive rational from a JSON number (an integer the double holds exactly).
+bool Rational(const JsonValue* v, const char* key, uint32_t& out) {
+    const double d = Num(v, key);
+    if (!std::isfinite(d) || d < 1.0 || d > 4294967295.0 || std::floor(d) != d) return false;
+    out = (uint32_t)d;
+    return true;
+}
+
+std::string Upper(std::string s) {
+    for (char& c : s) c = (char)toupper((unsigned char)c);
+    return s;
+}
+
+// One record's refresh_response (DLC dip.py RefreshResponse.from_dict's rules; anything it would refuse is an error
+// here too, so DesktopLUT never derives a trim from a section DLC itself would drop).
+DipRefreshSection ParseRefreshSection(const std::string& key, const JsonValue& rec, const JsonValue& rr) {
+    DipRefreshSection s;
+    s.recordKey = key;
+    s.display = Str(&rec, "display");
+    s.mode = NormMode(Str(&rec, "mode"));
+    if (s.display.empty() || s.mode.empty()) {   // a key "<display>:<MODE>" names both
+        const size_t colon = key.rfind(':');
+        if (colon != std::string::npos) {
+            if (s.display.empty()) s.display = key.substr(0, colon);
+            if (s.mode.empty()) s.mode = NormMode(key.substr(colon + 1));
+        } else if (s.display.empty()) {
+            s.display = key;
+        }
+    }
+    s.maxAgeDays = Int(&rec, "max_age_days", -1);
+    auto fail = [&s](const std::string& why) { s.error = why; s.rates.clear(); return s; };
+    if (rr.type != JsonValue::Obj) return fail("refresh_response is not an object");
+    s.schema = Int(&rr, "schema", kDipRefreshSchema);
+    if (s.schema > kDipRefreshSchema) return fail("schema " + std::to_string(s.schema) + " is newer than this build reads");
+    s.measured = Str(&rr, "measured");
+    if (s.measured.empty()) return fail("no measured date");
+    s.runId = Str(&rr, "run_id");
+    if (const JsonValue* ref = Obj(&rr, "reference")) {
+        if (!Str(ref, "key").empty()) s.referenceKey = Str(ref, "key");
+        uint32_t n = 0, d = 0;
+        if (Rational(ref, "num", n) && Rational(ref, "den", d)) { s.referenceNum = n; s.referenceDen = d; }
+    }
+    if (const JsonValue* id = Obj(&rr, "identity")) {
+        s.hardwareId = Upper(Str(id, "hardware_id"));
+        s.devicePath = WStr(id, "device_path");
+        s.edidId = Str(id, "edid_id");
+    }
+    s.peakNits = Num(&rr, "peak_nits");
+    s.interpolable = Bool(&rr, "interpolable");
+    const JsonValue* rates = rr.find("rates");
+    if (!rates || rates->type != JsonValue::Arr) return fail("no rates");
+    for (const JsonValue& r : rates->arr) {
+        if (r.type != JsonValue::Obj) return fail("a rate is not an object");
+        DipRefreshRate rate;
+        rate.key = Str(&r, "key");
+        if (rate.key.empty() || !Rational(&r, "num", rate.num) || !Rational(&r, "den", rate.den))
+            return fail("a rate without a key or a positive rational");
+        rate.hz = (double)rate.num / (double)rate.den;
+        rate.sameAs = Str(&r, "same_as");
+        if (const JsonValue* levels = r.find("levels"); levels && levels->type == JsonValue::Arr) {
+            for (const JsonValue& l : levels->arr) {
+                DipRefreshLevel lv;
+                lv.nits = Num(&l, "nits");
+                lv.ratio = Num(&l, "ratio");
+                lv.uLn = Num(&l, "u_ln");
+                lv.n = Int(&l, "n", 0);
+                if (!(std::isfinite(lv.nits) && lv.nits > 0.0 && std::isfinite(lv.ratio) && lv.ratio > 0.0))
+                    return fail("rate " + rate.key + ": a level without nits > 0 and ratio > 0");
+                rate.levels.push_back(lv);
+            }
+        }
+        std::sort(rate.levels.begin(), rate.levels.end(),
+                  [](const DipRefreshLevel& a, const DipRefreshLevel& b) { return a.nits < b.nits; });
+        s.rates.push_back(std::move(rate));
+    }
+    return s;
+}
+
+}  // namespace
+
+DipStoreData ParseDipStore(const std::string& json) {
+    DipStoreData out;
+    JsonValue root;
+    if (!ParseJson(json, root) || root.type != JsonValue::Obj) return out;
+    const JsonValue* displays = Obj(&root, "displays");
+    if (!displays) return out;
+    out.readable = true;
+    for (const auto& kv : displays->members) {
+        if (kv.second.type != JsonValue::Obj) continue;
+        const JsonValue* rr = kv.second.find("refresh_response");
+        if (!rr || rr->type == JsonValue::Null) continue;
+        out.refresh.push_back(ParseRefreshSection(kv.first, kv.second, *rr));
     }
     return out;
 }

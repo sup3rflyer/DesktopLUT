@@ -955,6 +955,62 @@ void InspectPrimaries(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
     EndRow(row);
 }
 
+// The REFRESH TRIM row's value: the live rate and what it gets, terse (the tooltip explains). Colour: Ink when the
+// profile on screen carries it, dim while it waits or nothing applies, faint without data, alarm for a broken DIP.
+std::pair<std::string, ImU32> RefreshTrimValue(const RefreshTrimStatus& t, bool enabled) {
+    auto hz = [&t]() {
+        if (!(t.liveHz > 0.0)) return std::string("\xE2\x80\x94 Hz");
+        char b[32];
+        snprintf(b, sizeof(b), "%.3f", t.liveHz);
+        std::string v = b;
+        while (!v.empty() && v.back() == '0') v.pop_back();
+        if (!v.empty() && v.back() == '.') v.pop_back();
+        return v + " Hz";
+    };
+    const std::string dot = " \xC2\xB7 ";
+    if (t.monitor < 0) return { "\xE2\x80\x94", pal::InkFaint };
+    if (!enabled || t.state == "off") return { t.measured.empty() ? std::string() : "DIP " + t.measured, pal::InkFaint };
+    if (t.state == "trim") {
+        const std::string text = t.rateKey + " Hz" + dot + "DIP " + t.measured;
+        if (!t.installed) return { text, pal::InkFaint };
+        return { text, t.applied ? pal::Ink : pal::InkDim };
+    }
+    if (t.state == "reference") return { hz() + dot + "none", pal::InkDim };
+    if (t.state == "unmeasured") return { hz() + dot + "not measured", pal::InkDim };
+    if (t.state == "no_rate") return { hz(), pal::InkFaint };
+    if (t.state == "invalid") return { "DIP unreadable", pal::Alarm };
+    return { "no DIP data", pal::InkFaint };   // no DLC folder, no DIP, no section for this panel
+}
+
+std::string RefreshTrimTip(const RefreshTrimStatus& t) {
+    std::string tip = "Brightness at other refresh rates, trimmed to the 60 Hz calibration's (HDR MHC 1D LUT).\n"
+                      "From the display's DLC DIP. RELOAD reads the DIP again.";
+    char b[256];
+    if (t.monitor < 0) return tip;
+    if (t.state == "trim") {
+        snprintf(b, sizeof(b), "\nNow: the %s Hz trim, gain %.3f at 0.5 nit, %.3f at 100, %.3f at 1000.",
+                 t.rateKey.c_str(), t.gain[0], t.gain[1], t.gain[2]);
+        tip += b;
+    } else if (!t.detail.empty()) {
+        tip += "\nNow: " + t.detail + ".";
+    }
+    if (!t.recordKey.empty()) {
+        tip += "\nDIP: " + t.recordKey + ", measured " + t.measured;
+        if (t.ageDays >= 0) { snprintf(b, sizeof(b), " (%d days)", t.ageDays); tip += b; }
+        if (!t.runId.empty()) tip += ", run " + t.runId;
+        tip += ".";
+        if (!t.rates.empty()) {
+            tip += "\nRates:";
+            for (size_t i = 0; i < t.rates.size(); i++) tip += (i ? "; " : " ") + t.rates[i];
+            tip += ".";
+        }
+        if (t.stale) tip += "\nOlder than the DIP's age limit: measure again.";
+    }
+    if (!t.waiting.empty()) tip += "\nWaiting: " + t.waiting + ".";
+    else if (t.state == "trim" && t.installed && !t.applied) tip += "\nNot on screen yet.";
+    return tip;
+}
+
 void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) {
     const MHCSettings& mhc = hdr ? r.settings.hdrMHC : r.settings.sdrMHC;
     const GrayscaleSettings& gs = mhc.correctionGrayscale;
@@ -1018,6 +1074,19 @@ void InspectGrayscale(const DisplayRow& r, const Stage& st, bool hdr, ViewState&
         if (OnOff("##dg_on", mhc.desktopGammaEnabled, &dg)) PostTo(r, [dg](int mon) { act::MhcSetDesktopGamma(mon, dg); });
         RowNext(row);
         RowText(row, mhc.desktopGammaEnabled ? Fmt("2.2 @ %.0f nits", mhc.dgSdrWhiteNits) : std::string(), pal::InkDim);
+        EndRow(row);
+
+        // The refresh-rate trim (refresh_trim.h): always drawn in HDR, only its value changes (no layout shift).
+        row = BeginRow("REFRESH TRIM");
+        const std::string rtTip = RefreshTrimTip(r.refreshTrim);
+        RowTip(row, rtTip.c_str());
+        if (RowButtons(row, "rt_reload", { "RELOAD" }) == 0) Post([]() { act::ReloadRefreshTrim(); });
+        RowPlace(row);
+        bool rtOn = false;
+        if (OnOff("##rt_on", mhc.refreshTrimEnabled, &rtOn)) PostTo(r, [rtOn](int mon) { act::MhcSetRefreshTrim(mon, rtOn); });
+        RowNext(row);
+        const auto rtValue = RefreshTrimValue(r.refreshTrim, mhc.refreshTrimEnabled);
+        RowText(row, rtValue.first, rtValue.second);
         EndRow(row);
     } else {
         row = BeginRow("GAMMA 2.4");

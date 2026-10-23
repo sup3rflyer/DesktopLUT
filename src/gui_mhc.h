@@ -177,8 +177,25 @@ uint8_t ComputeMhcPermutation(const MHCSettings& mhc, bool isHDR);
 // swap, so callers that flip one bit on the active permutation stay correct.
 uint8_t NormalizeMhcPerm(uint8_t perm);
 
+// The refresh-rate trim (refresh_trim.h) in the cache: a variant is keyed by its permutation and STAMPED with the trim
+// it was baked with (MHCSettings::permTrimStamp, like the DG stamp), never a bit. Whether a bake of `perm` carries the
+// trim the display's live rate wants (HDR, the switch on, a trim wanted, the grayscale stage not bypassed), the stamp
+// such a bake gets ("" = none), and whether slot `perm` holds a variant with that stamp. Pure, exposed for testing.
+bool MhcBakesRefreshTrim(const MHCSettings& mhc, bool isHDR, uint8_t perm);
+std::string MhcExpectedTrimStamp(const MHCSettings& mhc, bool isHDR, uint8_t perm);
+bool MhcPermTrimBakedAt(const MHCSettings& mhc, bool isHDR, int perm);
+// The refresh-trim stash (MHCSettings::trimStash), under g_monitorSettingsMutex. Stash: slot `perm`'s variant is kept
+// for a switch back (forgotten instead when its DG stamp is stale; the stash is bounded and never forgets the
+// associated profile), and the slot is emptied. Take: the stash's variant of `perm` for the trim wanted now goes into
+// the slot (the slot's own into the stash); false when there is none, its DG stamp is stale, or (checkFile) its file
+// is gone. Exposed for testing.
+void StashMhcPermSlotLocked(MHCSettings& mhc, uint8_t perm);
+bool TakeStashedMhcVariantLocked(MHCSettings& mhc, bool isHDR, uint8_t perm, bool checkFile);
+
 // Ensure a specific permutation profile exists in the system color directory.
-// Generates on-demand if not cached. Thread-safe (takes g_monitorSettingsMutex internally).
+// Generates on-demand if not cached. Thread-safe (takes g_monitorSettingsMutex internally). A cached variant is
+// current when its DG stamp and its refresh-trim stamp are what a bake would carry now; a stale one is replaced from
+// the refresh-trim stash when it holds the right variant, else regenerated.
 bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm);
 
 // Swap the active MHC ICC profile to a different permutation.

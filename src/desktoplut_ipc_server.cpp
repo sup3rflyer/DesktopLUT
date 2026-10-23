@@ -2,6 +2,7 @@
 // See desktoplut_ipc_server.h for the security model.
 
 #include "desktoplut_ipc_server.h"
+#include "refresh_trim.h"
 
 #include <windows.h>
 #include <sddl.h>
@@ -412,6 +413,51 @@ JsonValue GrayscaleJson(const GrayscaleSettings& gs) {
     return out;
 }
 
+// state.get "refresh_trim": per "<monitor>:HDR", what the refresh-rate trim does now (refresh_trim.h): the display's live
+// rate, the trim it wants (the DIP rate whose response it is) and whether the profile on screen carries it.
+static JsonValue RefreshTrimJson() {
+    JsonValue out = JObj();
+    for (const RefreshTrimStatus& st : GetRefreshTrimStatus()) {
+        JsonValue e = JObj();
+        e.set("enabled", JBool(st.enabled));
+        e.set("refresh_hz", st.liveHz > 0.0 ? JNum(std::round(st.liveHz * 1e6) / 1e6) : JsonValue());
+        JsonValue rat = JArr();
+        if (st.den) { rat.arr.push_back(JNum((double)st.num)); rat.arr.push_back(JNum((double)st.den)); }
+        e.set("refresh_rational", st.den ? rat : JsonValue());
+        e.set("state", JStr(st.state));
+        e.set("detail", JStr(st.detail));
+        e.set("rate", st.rateKey.empty() ? JsonValue() : JStr(st.rateKey));
+        e.set("stamp", st.wantStamp.empty() ? JsonValue() : JStr(st.wantStamp));
+        e.set("active_stamp", st.activeStamp.empty() ? JsonValue() : JStr(st.activeStamp));
+        e.set("applied", JBool(st.applied));
+        e.set("installed", JBool(st.installed));
+        e.set("waiting", st.waiting.empty() ? JsonValue() : JStr(st.waiting));
+        if (!st.wantStamp.empty()) {
+            JsonValue g = JObj();
+            g.set("0.5", JNum(st.gain[0]));
+            g.set("100", JNum(st.gain[1]));
+            g.set("1000", JNum(st.gain[2]));
+            e.set("gain", g);
+        }
+        if (!st.recordKey.empty()) {
+            JsonValue dip = JObj();
+            dip.set("record", JStr(st.recordKey));
+            dip.set("measured", JStr(st.measured));
+            dip.set("run_id", JStr(st.runId));
+            dip.set("age_days", st.ageDays >= 0 ? JNum(st.ageDays) : JsonValue());
+            dip.set("stale", JBool(st.stale));
+            JsonValue rates = JArr();
+            for (const std::string& r : st.rates) rates.arr.push_back(JStr(r));
+            dip.set("rates", rates);
+            e.set("dip", dip);
+        } else {
+            e.set("dip", JsonValue());
+        }
+        out.set(MonitorModeKey(st.monitor, true), e);
+    }
+    return out;
+}
+
 void HandleStateGet(JsonValue& result) {
     result.set("contract_version", JNum((double)kCalibrationContractVersion));
     result.set("running", JBool(g_running.load() || g_gui.isRunning.load()));
@@ -491,6 +537,9 @@ void HandleStateGet(JsonValue& result) {
                     const float baked = (m.enabled && !m.profileName.empty() && (m.activePerm & MHCSettings::PERM_DG))
                         ? m.permDgWhiteNits[m.activePerm] : 0.0f;
                     l.set("desktop_gamma_baked_sdr_white_nits", baked > 0.0f ? JNum(RoundNits(baked)) : JsonValue());
+                    // The refresh-rate trim's switch (refresh_trim.h; a measurement of the refresh response must run
+                    // with it off — what it measures with it on is the trim's residual). What it does: refresh_trim.
+                    l.set("refresh_trim", JBool(m.refreshTrimEnabled));
                     l.set("tonemap_dynamic", JBool(s.hdrColorCorrection.tonemap.dynamicPeak));
                     l.set("tonemap_target_peak", JNum(s.hdrColorCorrection.tonemap.targetPeakNits));
                 }
@@ -583,6 +632,7 @@ void HandleStateGet(JsonValue& result) {
     result.set("mhc", mhc);
     result.set("runtime", runtime);
     result.set("layers", layers);
+    result.set("refresh_trim", RefreshTrimJson());
     result.set("hook", BuildHookStateJson());
     // Which path renders what a meter sees (DLC readiness evidence, fald-lessons item 5): the
     // awake FP16 overlay reads 0.5-2.4 % below the sleeping one at low levels; in hook mode the
@@ -926,6 +976,10 @@ void DoEnterNeutral(const JsonValue& p, JsonValue& result, std::string& error) {
         mhc.bypassPrimaries = false;
         mhc.bypassGrayscale = false;
         (isHDR ? ms.hdrLutBypass : ms.sdrLutBypass) = false;
+        // The refresh-rate trim (runtime; the switch is the user's and stays): a calibration builds the 60-Hz
+        // calibration, so nothing it bakes carries a trim. The trim reconcile holds for the session and resolves the
+        // display again after calibration.exit (refresh_trim.h).
+        mhc.refreshTrimWant = MhcRefreshTrim{};
         // Clear the runtime 3D LUT + shader correction layers for the CALIBRATED mode
         // only. The other mode's layers are inert while the display is in the calibrated
         // mode, and clearing them here destroyed them on the apply path: exit with
@@ -1131,6 +1185,7 @@ static void LayersJson(const MonitorSettings& s, bool isHDR, JsonValue& out) {
     out.set("bypass_3dlut", JBool(isHDR ? s.hdrLutBypass : s.sdrLutBypass));
     out.set("bypass_primaries", JBool(m.bypassPrimaries));
     out.set("bypass_grayscale", JBool(m.bypassGrayscale));
+    out.set("refresh_trim", JBool(isHDR && m.refreshTrimEnabled));   // the refresh-rate trim's switch (HDR)
 }
 
 void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -1145,6 +1200,8 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     bool hasWb = false, wb = false, hasGs = false, gs = false, hasDg = false, dg = false,
          hasTm = false, tm = false, hasFd = false, fd = false;
     bool hasBl = false, bl = false, hasBp = false, bp = false, hasBg = false, bg = false;
+    bool hasRt = false, rt = false;
+    want("refresh_trim", hasRt, rt);
     want("bypass_3dlut", hasBl, bl);
     want("bypass_primaries", hasBp, bp);
     want("bypass_grayscale", hasBg, bg);
@@ -1153,15 +1210,19 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
     want("desktop_gamma", hasDg, dg);
     want("tonemap", hasTm, tm);
     want("fald", hasFd, fd);
-    if (!isHDR && (hasDg || hasTm)) {
+    if (!isHDR && (hasDg || hasTm || hasRt)) {
         // HDR-only layers; asking to change them in SDR is a client error, asking
         // for them OFF is a harmless no-op (a "disable everything" client). fald is per mode.
-        if ((hasDg && dg) || (hasTm && tm)) { error = "desktop_gamma / tonemap are HDR-only layers"; return; }
-        hasDg = hasTm = false;
+        if ((hasDg && dg) || (hasTm && tm) || (hasRt && rt)) {
+            error = "desktop_gamma / tonemap / refresh_trim are HDR-only layers";
+            return;
+        }
+        hasDg = hasTm = hasRt = false;
     }
     JsonValue before = JObj(), after = JObj();
     bool mhcChanged = false, tmChanged = false, dgChanged = false, mhcEnabled = false, profileNamed = false;
     bool lutBypassChanged = false;
+    bool refreshTrimChanged = false;
     bool switchedOn = false;       // this call switched the tone mapper or the FALD layer ON
     bool reconcileHook = false;
     {
@@ -1194,6 +1255,7 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         if (hasBg && m.bypassGrayscale != bg) { m.bypassGrayscale = bg; mhcChanged = true; }
         bool& lutBypass = isHDR ? ms.hdrLutBypass : ms.sdrLutBypass;
         if (hasBl && lutBypass != bl) { lutBypass = bl; lutBypassChanged = true; }
+        if (hasRt && m.refreshTrimEnabled != rt) { m.refreshTrimEnabled = rt; refreshTrimChanged = true; }
         mhcEnabled = m.enabled;
         profileNamed = !m.profileName.empty();
     }
@@ -1255,6 +1317,14 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
             else restartForBypass = true;
         }
         GuiNotifySettingsChanged(mon);
+    }
+    if (refreshTrimChanged || (hasRt && rt)) {
+        // The switch (persisted), and a fresh read of the DIP either way: a client switching it on after recording a
+        // new measurement gets that one. The reconcile swaps the variant now (outside a calibration session; a
+        // session holds it until calibration.exit).
+        if (refreshTrimChanged) SaveSettings();
+        RequestRefreshTrimDipScan();
+        ReconcileRefreshTrim("layers.set");
     }
     std::string profileName;
     {

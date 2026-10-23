@@ -142,6 +142,20 @@ std::wstring ResolveFolder(const std::wstring& configured, const std::vector<std
     return {};
 }
 
+bool ReadDipStore(const std::wstring& folder, DipStoreData& out, uint64_t& hash) {
+    out = DipStoreData();
+    hash = 0;
+    if (folder.empty()) return false;
+    std::string text;
+    if (!ReadShared(folder + L"\\dip_store.json", text, kStoreBytes)) return false;
+    uint64_t h = 1469598103934665603ull;   // FNV-1a 64
+    for (unsigned char c : text) { h ^= c; h *= 1099511628211ull; }
+    out = ParseDipStore(text);
+    if (!out.readable) { out = DipStoreData(); return false; }
+    hash = h ? h : 1;
+    return true;
+}
+
 std::wstring PatchMetricsPath(const std::wstring& runDir) {
     if (runDir.empty()) return {};
     const std::wstring dir = runDir + L"\\reports";
@@ -175,6 +189,7 @@ std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, c
     }
     if (ReadShared(folder + L"\\stack_registry.json", text, kStoreBytes)) d->stacks = ParseStackRegistry(text);
     if (ReadShared(folder + L"\\correction_store.json", text, kStoreBytes)) d->corrections = ParseCorrectionStore(text);
+    d->dipFound = ReadDipStore(folder, d->dip, d->dipHash);
 
     // Runs: results folder -> run folder, from each run's run_done event (the reliable link).
     const std::wstring runsDir = folder + L"\\runs";
@@ -275,12 +290,31 @@ std::deque<std::wstring> g_patchQueue;
 std::shared_ptr<const Data> g_current = std::make_shared<Data>();
 std::map<std::wstring, std::shared_ptr<const std::vector<Patch>>> g_patches;   // run dir -> patches
 std::function<void()> g_listener;
+std::function<void()> g_dipListener;
+uint64_t g_dipHashPublished = 0;   // the DIP of the last publish (worker; 0 = none)
+std::wstring g_dipFolderPublished;
+bool g_dipPublishedOnce = false;
 
 void Notify() {
     std::function<void()> fn;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
         fn = g_listener;
+    }
+    if (fn) fn();
+}
+
+// After a publish: the DIP listener hears of a DIP that differs from the last publish's (the first publish counts).
+void NotifyDip(const Data& d) {
+    std::function<void()> fn;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        const bool changed = !g_dipPublishedOnce || d.dipHash != g_dipHashPublished ||
+                             NormPath(d.folder) != NormPath(g_dipFolderPublished);
+        g_dipPublishedOnce = true;
+        g_dipHashPublished = d.dipHash;
+        g_dipFolderPublished = d.folder;
+        if (changed) fn = g_dipListener;
     }
     if (fn) fn();
 }
@@ -323,6 +357,7 @@ void WorkerMain() {
                 g_current = d;
             }
             Notify();
+            NotifyDip(*d);
         } else {
             std::vector<Patch> patches;
             const std::wstring path = PatchMetricsPath(patchRun);
@@ -348,6 +383,11 @@ void SetScanListener(std::function<void()> onChange) {
     g_listener = std::move(onChange);
 }
 
+void SetDipListener(std::function<void()> onChange) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_dipListener = std::move(onChange);
+}
+
 uint64_t RequestScan(const std::wstring& configured, const std::vector<std::wstring>& candidates) {
     uint64_t seq = 0;
     {
@@ -368,6 +408,7 @@ void StopScanner() {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_stop = true;
         g_listener = nullptr;
+        g_dipListener = nullptr;
         g_cancel.store(true);
     }
     g_cv.notify_one();
@@ -405,6 +446,9 @@ void ResetScannerForTest() {
     g_patchQueue.clear();
     g_current = std::make_shared<Data>();
     g_patches.clear();
+    g_dipHashPublished = 0;
+    g_dipFolderPublished.clear();
+    g_dipPublishedOnce = false;
 }
 
 namespace {

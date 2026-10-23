@@ -3,6 +3,7 @@
 
 #include "gui.h"
 #include "gui_mhc.h"
+#include "refresh_trim.h"
 #include "globals.h"
 #include "settings.h"
 #include "processing.h"
@@ -426,7 +427,10 @@ Result MhcRemove(int mon, bool hdr) {
                 mhc.permNames[k].clear();
                 mhc.permPaths[k].clear();
             }
+            mhc.permTrimStamp[k].clear();
         }
+        for (const auto& e : mhc.trimStash) DeleteFileW((colorDir + e.name).c_str());   // the other rates' variants
+        mhc.trimStash.clear();
         mhc.enabled = false;
         mhc.profilePath.clear();
         mhc.profileName.clear();
@@ -552,6 +556,22 @@ Result MhcSetCorrectionGsPeak(int mon, float nits) {
     SaveSettings();
     Finish(mon);
     return Done();
+}
+
+Result MhcSetRefreshTrim(int mon, bool on) {
+    if (!ValidMonitor(mon)) return Done(false);
+    bool was;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        was = g_gui.monitorSettings[mon].hdrMHC.refreshTrimEnabled;
+    }
+    SetRefreshTrimEnabled(mon, on);   // persists, reads the DIP again, swaps the variant (or waits out a hold)
+    return Done(was != on);
+}
+
+void ReloadRefreshTrim() {
+    RequestRefreshTrimDipScan();      // a DIP that changed resolves every display again (dlc::SetDipListener)
+    ReconcileRefreshTrim("reload");
 }
 
 Result MhcSetDesktopGamma(int mon, bool on) {

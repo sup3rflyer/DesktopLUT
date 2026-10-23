@@ -637,21 +637,133 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
     return true;
 }
 
+// ---- the refresh-rate trim (types.h MhcRefreshTrim) ---------------------------------------------------------------
+
+double MhcRefreshTrimGain(const MhcRefreshTrim& t, double nits) {
+    const size_t n = (std::min)(t.nits.size(), t.lnGain.size());
+    if (!t.active || n == 0 || !std::isfinite(nits)) return 1.0;
+    double y = nits;
+    if (t.peakNits > 0.0 && y > t.peakNits) y = t.peakNits;            // held above the panel's peak
+    const double ly = std::log10((std::max)(y, 1e-6));
+    double v;
+    if (n == 1 || ly <= std::log10(t.nits[0])) {
+        v = t.lnGain[0];                                                // held below the lowest level
+    } else {
+        v = t.lnGain[n - 1];
+        bool inside = false;
+        for (size_t i = 1; i < n; i++) {
+            const double l0 = std::log10(t.nits[i - 1]), l1 = std::log10(t.nits[i]);
+            if (ly <= l1) {
+                const double w = l1 > l0 ? (ly - l0) / (l1 - l0) : 1.0;
+                v = t.lnGain[i - 1] + (t.lnGain[i] - t.lnGain[i - 1]) * w;
+                inside = true;
+                break;
+            }
+        }
+        if (!inside) {
+            // Above the top level: its segment's slope in log level, never past g = 1.
+            const double l0 = std::log10(t.nits[n - 2]), l1 = std::log10(t.nits[n - 1]);
+            const double slope = l1 > l0 ? (t.lnGain[n - 1] - t.lnGain[n - 2]) / (l1 - l0) : 0.0;
+            v = t.lnGain[n - 1] + slope * (ly - l1);
+            v = t.lnGain[n - 1] >= 0.0 ? (std::max)(v, 0.0) : (std::min)(v, 0.0);
+        }
+    }
+    return std::exp(v);
+}
+
+double MhcRefreshTrimTarget(const MhcRefreshTrim& t, double nits) {
+    if (!t.active || !(nits > 0.0)) return nits;
+    // The knots are keyed by the 60-Hz light of the DRIVE: the drive whose 60-Hz light is y shows y / g(y) at the rate,
+    // so solve y = nits * g(y). ln g moves ~0.014 per decade: each step gains ~2 decimal places.
+    double y = nits * MhcRefreshTrimGain(t, nits);
+    for (int k = 0; k < 4; k++) y = nits * MhcRefreshTrimGain(t, y);
+    return y;
+}
+
+namespace {
+
+double MhcPqEotfD(double pq) {
+    const double e = std::pow(std::clamp(pq, 0.0, 1.0), 1.0 / 78.84375);
+    const double num = (std::max)(e - 0.8359375, 0.0);
+    return std::pow(num / (18.8515625 - 18.6875 * e), 1.0 / 0.1593017578125);   // relative to 10000 nits
+}
+
+double MhcPqOetfLocal(double l) {
+    const double ym = std::pow((std::max)(l, 0.0), 0.1593017578125);
+    return std::pow((0.8359375 + 18.8515625 * ym) / (1.0 + 18.6875 * ym), 78.84375);
+}
+
+// Linear interpolation of a LUT between its entries (the hardware's), at signal v in [0,1].
+double TrimLutAt(const std::vector<float>& lut, double v) {
+    const int n = (int)lut.size();
+    const double idx = std::clamp(v, 0.0, 1.0) * (double)(n - 1);
+    const int i0 = (std::min)((int)std::floor(idx), n - 1);
+    const int i1 = (std::min)(i0 + 1, n - 1);
+    const double t = idx - (double)i0;
+    return (double)lut[i0] + ((double)lut[i1] - (double)lut[i0]) * t;
+}
+
+// The signal whose calibrated drive is `d`: the inverse of a non-decreasing LUT (its running maximum), linear between
+// entries; a flat stretch answers its lowest signal.
+double TrimInvert(const std::vector<float>& env, double d) {
+    const int n = (int)env.size();
+    if (d <= (double)env[0]) return 0.0;
+    if (d >= (double)env[n - 1]) {
+        int j = n - 1;
+        while (j > 0 && env[j - 1] >= env[n - 1]) j--;
+        return (double)j / (double)(n - 1);
+    }
+    int lo = 0, hi = n - 1;   // env[lo] < d <= env[hi]
+    while (hi - lo > 1) {
+        const int mid = (lo + hi) / 2;
+        if ((double)env[mid] < d) lo = mid; else hi = mid;
+    }
+    const double t = (d - (double)env[lo]) / ((double)env[hi] - (double)env[lo]);
+    return ((double)lo + t) / (double)(n - 1);
+}
+
+// One channel's trim stage. `cal` = the calibration's drives (base + correction, before desktop gamma), `fin` = the
+// drives the stages before produce (desktop gamma included), both unclamped; fin becomes the trimmed, quantized LUT.
+void ApplyRefreshTrim(const MhcRefreshTrim& trim, const std::vector<float>& cal, float* fin, int n) {
+    std::vector<float> c((size_t)n), env((size_t)n);
+    for (int j = 0; j < n; j++) {
+        c[j] = std::clamp(cal[j], 0.0f, 1.0f);                         // what the panel is driven with
+        env[j] = j ? (std::max)(env[j - 1], c[j]) : c[j];
+    }
+    for (int j = 0; j < n; j++) {
+        // The signal whose calibrated 60-Hz light this drive gives: the entry's own input where no stage after the
+        // calibration moved it (no desktop gamma, or above its SDR white), else read off the calibration.
+        const double code = fin[j] == cal[j] ? (double)j / (double)(n - 1)
+                                             : TrimInvert(env, std::clamp((double)fin[j], 0.0, 1.0));
+        const double light = MhcPqEotfD(code) * 10000.0;                // its 60-Hz light (nits)
+        const double want = MhcRefreshTrimTarget(trim, light);           // the 60-Hz light to drive instead
+        // (g = 1 there: the entry's own signal, so a trim of gain 1 reproduces the untrimmed LUT exactly.)
+        const double drive = TrimLutAt(c, want == light ? code : MhcPqOetfLocal(want / 10000.0));
+        fin[j] = QuantizeS15Fixed16(std::clamp((float)drive, 0.0f, 1.0f));
+    }
+}
+
+}  // namespace
+
 void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, MhcScanout& out) {
     if (&out != &base) out = base;
-    // Order: correction grayscale first (calibration), then desktop gamma (look).
-    // DG must be last so correction GS sees un-DG'd values matching calibration.
+    // Order: correction grayscale first (calibration), then desktop gamma (look), then the refresh trim (the panel's
+    // response at this rate). DG after the correction so correction GS sees un-DG'd values matching calibration.
     const bool hasDG = params.isHDR && params.desktopGammaEnabled;
     const bool hasCorrGS = params.correctionGrayscaleEnabled && params.correctionGrayscale.enabled;
+    const bool hasTrim = params.isHDR && params.refreshTrim.active && !params.refreshTrim.nits.empty() &&
+                         params.refreshTrim.nits.size() == params.refreshTrim.lnGain.size();
     // DG reference white = the display's SDR white level; a non-finite / non-positive value keeps the
     // original 80-nit reference rather than baking garbage.
     const float dgWhiteNits = (std::isfinite(params.sdrWhiteNits) && params.sdrWhiteNits > 0.0f)
         ? params.sdrWhiteNits : 80.0f;
     const float pqPeak = params.isHDR ? PqOETF(params.peakNits / 10000.0f) : 0.0f;
 
+    std::vector<float> cal;   // the trim's model of the panel: the calibration's drives (base + correction)
     for (int ch = 0; ch < 3; ch++) {
         float* lut = out.lut[ch].data();
         const int n = (int)out.lut[ch].size();
+        if (hasTrim) cal.assign((size_t)n, 0.0f);
         for (int j = 0; j < n; j++) {
             float v = lut[j];  // Base LUT output (signal domain)
 
@@ -664,8 +776,9 @@ void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, 
                 if (hasCorrGS) {
                     v = EvalGrayscaleHDR_Channel(v, params.correctionGrayscale, pqPeak, ch);
                 }
+                if (hasTrim) cal[j] = v;
 
-                // Desktop gamma last: sRGB→2.2 over the SDR range (0, SDR white], per channel
+                // Desktop gamma: sRGB→2.2 over the SDR range (0, SDR white], per channel
                 if (hasDG) {
                     v = DesktopGammaPQ(v, dgWhiteNits);
                 }
@@ -683,8 +796,11 @@ void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, 
             }
 
             // The file stores s15Fixed16: quantized here, so the preview reads what Windows reads.
-            lut[j] = QuantizeS15Fixed16(std::clamp(v, 0.0f, 1.0f));
+            if (hasTrim) lut[j] = v;   // quantized by the trim stage below
+            else lut[j] = QuantizeS15Fixed16(std::clamp(v, 0.0f, 1.0f));
         }
+        // The refresh trim last (HDR): whatever the stages above make the panel show at 60 Hz, at the trim's rate.
+        if (hasTrim) ApplyRefreshTrim(params.refreshTrim, cal, lut, n);
     }
 }
 
@@ -832,6 +948,11 @@ bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& 
         if (hasDG) std::cout << "MHC2: Desktop gamma (sRGB→2.2, SDR white " << dgWhiteNits
                              << " nits) composed into HDR LUT" << std::endl;
         if (hasCorrGS) std::cout << "MHC2: Correction grayscale composed on top of base LUT" << std::endl;
+        if (params.isHDR && params.refreshTrim.active)
+            std::cout << "MHC2: Refresh trim " << params.refreshTrim.rateKey << " Hz composed last (gain "
+                      << MhcRefreshTrimGain(params.refreshTrim, 0.5) << " at 0.5 nit, "
+                      << MhcRefreshTrimGain(params.refreshTrim, 100.0) << " at 100, "
+                      << MhcRefreshTrimGain(params.refreshTrim, 1000.0) << " at 1000)" << std::endl;
     }
     const int lutSize = scan.lutSize;
 

@@ -506,6 +506,35 @@ bool DisplayModeAllowsHdr(const DisplayColorModeResult& mode) {
     return true;
 }
 
+bool QueryDisplayRefreshRate(const DisplayInfo& display, UINT32& numerator, UINT32& denominator) {
+    numerator = denominator = 0;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths;
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes;
+    if (!QueryActivePaths(paths, modes)) return false;
+    for (const auto& path : paths) {
+        if (path.targetInfo.id != display.targetId || path.targetInfo.adapterId.LowPart != display.adapterId.LowPart ||
+            path.targetInfo.adapterId.HighPart != display.adapterId.HighPart)
+            continue;
+        const UINT32 ti = path.targetInfo.modeInfoIdx;
+        if (ti != DISPLAYCONFIG_PATH_MODE_IDX_INVALID && ti < modes.size() &&
+            modes[ti].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_TARGET) {
+            const DISPLAYCONFIG_RATIONAL v = modes[ti].targetMode.targetVideoSignalInfo.vSyncFreq;
+            if (v.Numerator && v.Denominator) {
+                numerator = v.Numerator;
+                denominator = v.Denominator;
+                return true;
+            }
+        }
+        if (path.targetInfo.refreshRate.Numerator && path.targetInfo.refreshRate.Denominator) {
+            numerator = path.targetInfo.refreshRate.Numerator;
+            denominator = path.targetInfo.refreshRate.Denominator;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 bool IsDisplayInHdrMode(const DisplayInfo& display, HMONITOR hMonitor) {
     if (!DisplayModeAllowsHdr(QueryDisplayColorMode(display, /*dxgiHdrActive=*/false))) return false;
     DXGI_OUTPUT_DESC1 desc;

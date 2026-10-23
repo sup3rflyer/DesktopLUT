@@ -83,6 +83,10 @@ Result SetLutBypass(int mon, bool hdr, bool bypass);
 Result MhcSetStageBypass(int mon, bool hdr, MhcStage stage, bool bypass);
 Result MhcSetCorrectionGsPeak(int mon, float nits);                   // HDR fine-tune, 10..10000
 Result MhcSetDesktopGamma(int mon, bool on);                          // HDR
+// The refresh-rate trim's switch (HDR, refresh_trim.h): on = the trim the display's DLC DIP holds for its live rate.
+// Either way the DIP is read again (the switch doubles as the RELOAD of a new measurement).
+Result MhcSetRefreshTrim(int mon, bool on);
+void ReloadRefreshTrim();                                             // read the DIP again, then resolve every display
 
 // ---- Display name ----------------------------------------------------------------------------------
 // The user's name for a display, live or remembered. Found by storage slot (live or parked); a live

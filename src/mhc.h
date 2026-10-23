@@ -57,7 +57,19 @@ struct MHC2ProfileParams {
     // panel's own response. Per channel after the matrix, like desktop gamma: greys are exact, saturated colours keep
     // a small residual. The profile's TRC tag is not this: it follows grayscale.use24Gamma (the base curve's flag).
     bool sdrGamma24 = false;
+
+    // The refresh-rate trim (HDR; types.h MhcRefreshTrim): the LUT's LAST stage, after the correction grayscale and
+    // desktop gamma (ComposeMhcScanout). Inactive = the bake is byte-identical to one without the field.
+    MhcRefreshTrim refreshTrim;
 };
+
+// The refresh trim's gain at 60-Hz light `nits`: ln g piecewise linear in log10(nits) between the knots, held below the
+// lowest, the top segment's slope continued above the highest without crossing g = 1 (ln g keeps the top knot's sign),
+// and held above peakNits. 1 when inactive or without knots.
+double MhcRefreshTrimGain(const MhcRefreshTrim& trim, double nits);
+// The 60-Hz light to drive so the panel at the trim's rate shows `nits`: the y with y = nits * g(y) (the knots are keyed
+// by the 60-Hz light of the drive; a few fixed-point steps, |d ln g / d ln y| is ~0.01). `nits` when inactive.
+double MhcRefreshTrimTarget(const MhcRefreshTrim& trim, double nits);
 
 // Generate complete ICC v4 profile binary data with MHC2 tag
 bool GenerateMHC2Profile(const MHC2ProfileParams& params, std::vector<uint8_t>& outData);
@@ -221,9 +233,13 @@ struct MhcQuietLog {
 // The base LUTs alone (the matrix fields of `out` are left as they are): a live edit of the base curve recomputes
 // these and keeps the matrix.
 bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out);
-// The bake's compose step: params' correction grayscale (first), then desktop gamma (last, HDR), clamped to
-// [0,1] and quantized to the file's s15Fixed16 grid. Reads only the correction / desktop gamma fields and the
-// peak; cheap (no files). Logs nothing.
+// The bake's compose step: params' correction grayscale (first), then desktop gamma (HDR), then the refresh trim (HDR,
+// last), clamped to [0,1] and quantized to the file's s15Fixed16 grid. Reads only the correction / desktop gamma /
+// trim fields and the peak; cheap (no files). Logs nothing.
+// The trim works on the drive the stages before it produce: the drive's 60-Hz light is read off the profile's own
+// calibration (base + correction, inverted where desktop gamma moved the entry), and the drive the calibration gives
+// for MhcRefreshTrimTarget of that light replaces it. So whatever the variant shows at 60 Hz (DG or not), its trimmed
+// twin shows at the rate.
 void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, MhcScanout& out);
 // Base + compose: the profile's complete scanout.
 bool ComputeMhcScanout(const MHC2ProfileParams& params, MhcScanout& out);

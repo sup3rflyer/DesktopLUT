@@ -189,7 +189,38 @@ HDR_MHCPermPath0=
 HDR_MHCPermPath2=C:\...\DesktopLUT_Mon0_HDR_P2_xxx.icm
 ; SDR white each cached variant's DG was baked with (0 = no DG in it; absent = MHCDgSdrWhiteNits); a mismatch regenerates / re-bakes it
 HDR_MHCPermDgWhite2=116.0000
+; Refresh-rate trim (src/refresh_trim.h): the trim each cached variant was baked with, written only for a trimmed one
+; (absent = none). A variant whose stamp is not what the display's live rate wants is swapped from the trim stash or
+; re-baked. The trim's data is the display's DLC DIP (DLC\dip_store.json, refresh_response), never the INI.
+HDR_MHCPermTrim2=3f6c0a1d9e2b4c57
+; The trim's switch, written only when off (absent = on: a DIP refresh response is applied)
+HDR_MHCRefreshTrim=0
 ```
+
+## Refresh-Rate Trim (HDR MHC)
+
+Some panels are brighter at lower refresh rates (the PA32UCXR in HDR: +3.4 % at 0.5-10 nits ... +1.0 % at 1000 at
+47.952 Hz; luminance only, channel-independent, not linear in frame period). DLC measures the response and records it in
+the display's DIP: `<DLC folder>\dip_store.json`, record `"<display>:HDR"`, section `refresh_response` (per measured rate
+its exact rational and, per grey level, the light at that rate over the light at 60 Hz; `same_as` where DLC's tests found
+two rates equal, e.g. 48 = 47.952, 59.94 = 60). DesktopLUT finds the DLC folder through the DLC tab's setting
+(`[UI] DlcFolder`, else next to DesktopLUT), matches the section to a live display by the EDID hardware id it recorded
+(twin panels also by device path), and derives the trim at bake time: `g = 1 / ratio`, held below the lowest level,
+extended to the panel peak without crossing 1, applied as the HDR MHC 1D LUT's LAST stage (after the fine-tune and desktop
+gamma) on the drive, keyed by the drive's 60-Hz light (the profile's own calibration is the panel model). The matrix is
+untouched. Only measured rates get a trim; 60 Hz, a rate equal to it, and any unmeasured rate get none.
+
+The variants are the permutation cache's, STAMPED with the trim (`HDR_MHCPermTrim<k>`), like desktop gamma's SDR white:
+on a refresh change (WM_DISPLAYCHANGE, burst stages, the 15 s tick) each display's live vSyncFreq is matched within
+0.01 Hz to a measured rate and the stamped variant is swapped in (`SwapMhcPermBits`, files only, associated once; a
+switch back takes the variant from the trim stash, no bake), and the MHC transition burst restarts after the swap.
+Nothing changes during a calibration session (`calibration.enter` clears the trim for the pair), a live edit, an open
+MHC dialog. At exit every display goes back to its untrimmed variant. No DLC folder / DIP / section, or the switch off =
+no trim, and the profiles are byte-identical to a build without the feature (`tests/test_mhc_golden.cpp`).
+
+The DIP is read again on every display change, the MHC tab's REFRESH TRIM switch / RELOAD, and `layers.set
+refresh_trim`; `state.get` reports `refresh_trim` per `<monitor>:HDR` (the live rate, the trim, whether it is on
+screen, the DIP section). A refresh-response measurement must run with `layers.set refresh_trim=false`.
 
 ## DWM Hook Mode
 

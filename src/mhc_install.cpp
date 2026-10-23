@@ -285,6 +285,10 @@ void CleanupOrphanedMhcProfiles() {
                 if (!ms.hdrMHC.permNames[k].empty())
                     activeProfiles.insert(ms.hdrMHC.permNames[k]);
             }
+            // The refresh-trim stash: variants for the other rates, kept for this run (not saved: after a restart
+            // they are orphans like any forgotten variant).
+            for (const auto& e : ms.sdrMHC.trimStash) activeProfiles.insert(e.name);
+            for (const auto& e : ms.hdrMHC.trimStash) activeProfiles.insert(e.name);
         };
         for (const auto& ms : g_gui.monitorSettings) collect(ms);
         for (const auto& ms : g_gui.parkedSettings) collect(ms);
@@ -363,6 +367,9 @@ void SweepStaleMhcAssociations() {
                 if (!ms.sdrMHC.permNames[k].empty()) keep.insert(ms.sdrMHC.permNames[k]);
                 if (!ms.hdrMHC.permNames[k].empty()) keep.insert(ms.hdrMHC.permNames[k]);
             }
+            // The refresh-trim stash: cached variants like the slots (a swap may be associating one right now).
+            for (const auto& e : ms.sdrMHC.trimStash) keep.insert(e.name);
+            for (const auto& e : ms.hdrMHC.trimStash) keep.insert(e.name);
             if (!ms.sdrMHC.profileName.empty()) keep.insert(ms.sdrMHC.profileName);
             if (!ms.hdrMHC.profileName.empty()) keep.insert(ms.hdrMHC.profileName);
             // A live edit's identity scanout profile (mhc_preview.h): the mode's default until the edit ends.
