@@ -400,6 +400,11 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     }
     // the frozen fade stack: an INI without the key loads OFF (= the layer before the port, bit for bit); item L reserved
     cc.fald.flankFade = GetPrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), false, iniPath);
+    {   // the always-on core's switch (shared/fald_core_mode.h FALD_CORE_MODES; absent = the default KC3, 0 = C for an A/B
+        // check): read, never written
+        const int cm = (int)GetPrivateProfileIntW(section, (p + L"FaldCoreModeTest").c_str(), (int)FALD_CORE_MODE_DEFAULT, iniPath);
+        cc.fald.coreMode = (cm >= 0 && cm <= (int)FALD_CORE_MODE_MAX) ? (uint32_t)cm : FALD_CORE_MODE_DEFAULT;
+    }
     cc.fald.lowExt = GetPrivateProfileBool(section, (p + L"FaldLowExt").c_str(), false, iniPath);
 }
 

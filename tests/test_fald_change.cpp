@@ -1,6 +1,7 @@
 // The change-driven path's pure decisions (shared/fald_change.h): the zones a present's rects touch, the preconditions.
 #include "doctest.h"
 #include "../shared/fald_change.h"
+#include "../shared/fald_core2.h"       // the always-on core: its textures in the hash list, the mode per layer
 #include "../shared/fald_panel.h"
 #include "../src/fald.h"
 #include "../src/types.h"
@@ -132,12 +133,14 @@ struct ChLayer {
     ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
     bool ok = false;
     int partialOverride = -1;
-    ChLayer(ChWarp& w, const std::wstring& panel, int fw, int fh, bool star, unsigned int temporal, int partialOverrideAtRun = -1)
+    // coreMode: the always-on core's rule (shared/fald_core_mode.h; 0 = C — the 2026-10-22 gates — 2 = KC3, the default)
+    ChLayer(ChWarp& w, const std::wstring& panel, int fw, int fh, bool star, unsigned int temporal, int partialOverrideAtRun = -1,
+            unsigned int coreMode = FALD_CORE_MODE_C)
         : partialOverride(partialOverrideAtRun) {
         ctx.width = fw; ctx.height = fh; ctx.isHDREnabled = true; ctx.isFP16SDR = false;
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 16.667f;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
-        fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = star;
+        fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = star; fs.coreMode = coreMode;
         fs.temporalMode = temporal; fs.tauRiseMs = 40.0f; fs.tauFallMs = 60.0f; fs.delayFrames = temporal ? 1u : 0u;
         if (!FaldEnsureResources(&ctx, fs)) return;
         D3D11_TEXTURE2D_DESC td = {};
@@ -171,6 +174,13 @@ struct ChLayer {
             { "star_bg", r->starBgTex }, { "OUTPUT", target } };
         std::vector<std::pair<std::string, uint64_t>> out;
         for (const auto& t : tex) if (t.second) out.emplace_back(t.first, ChFnv(ChReadBack(t.second)));
+        if (r->core2On) {                                          // the always-on core's textures (shared/fald_core2.h)
+            const FaldCore2Debug cd = FaldCore2DebugViews(r->core2);
+            const std::pair<const char*, ID3D11Texture2D*> core[] = {
+                { "core_stat", cd.stat }, { "core_zone", cd.zone }, { "core_field0", cd.field0 }, { "core_field", cd.field },
+                { "core_node_peak", cd.nodePeak }, { "core_node_d0", cd.nodeD0 }, { "core_node_d", cd.nodeD } };
+            for (const auto& t : core) if (t.second) out.emplace_back(t.first, ChFnv(ChReadBack(t.second)));
+        }
         return out;
     }
 };
@@ -242,6 +252,73 @@ TEST_CASE("FALD change: the partial path equals the full path, field for field a
         }
 }
 
+// The same steps with the always-on core on (shared/fald_core2.h). KC3 (mode 2, the default) is stateless: the touched-zone
+// sweep recomputes and compares the zones' core statistics / node peaks, the decide pass orders the core's lattice passes
+// only when they or the gain moved, and the previous run's core fields stand otherwise — every field (the core's included)
+// and the output equal the full path's, and every step after the first is partial. KC2c (mode 1) has zone IIRs: the
+// change-driven context must take the FULL path on every run (FaldChangeInputs::coreStateful) and equal the reference.
+TEST_CASE("FALD change: the partial path equals the full path with the always-on core on (KC3 partial, KC2c held full) (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cellDir = ChEnv("FALD_TEST_FADE_DIR");
+    if (cellDir.empty()) return;
+    const std::wstring C = ChOwnerPanel(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
+    REQUIRE_FALSE(C.empty());
+    const int W = 3840, H = 2160;
+    std::vector<uint16_t> base((size_t)W * H * 4);
+    {
+        std::ifstream f(cellDir + "/n7_lamp.rgba16f", std::ios::binary);
+        REQUIRE(f.good());
+        f.read((char*)base.data(), (std::streamsize)(base.size() * 2));
+        REQUIRE((size_t)f.gcount() == base.size() * 2);
+    }
+    ChWarp w;
+    REQUIRE(w.ok);
+    struct Step { FaldChangeRect rc; uint16_t value; bool newContent; const char* what; };
+    const Step steps[] = {
+        { { 1000, 1500, 1040, 1530 }, 0x0400, true, "a dark 40 x 30 patch (0.004 nits / channel): no drive moves, the zone's M / lnG do" },
+        { { 300, 300, 500, 500 }, 0x3C00, true, "a 200 x 200 white patch: drives and node peaks move" },
+        { { 0, 0, 0, 0 }, 0, false, "the same frame again (no rect): nothing moves, the core's fields stand" },
+        { { 300, 300, 500, 500 }, 0x0000, true, "the white patch to black: drives move back" },
+        { { 2000, 1000, 2002, 1002 }, 0x3C00, true, "a 2 x 2 white speck: a node peak moves, round 0's drive may not" },
+        { { 79, 44, 81, 46 }, 0x2C00, true, "a 2 x 2 patch across four zones' corner" },
+        { { 1000, 1500, 1040, 1530 }, 0x0000, true, "the dark patch to black again" },
+    };
+    const unsigned long long savedRefreshes = g_faldCore2TestRefreshes;
+    g_faldCore2TestRefreshes = 1;                                  // KC2c's IIR: one refresh per run whatever WARP's timing
+    for (unsigned int coreMode : { FALD_CORE_MODE_KC3, FALD_CORE_MODE_KC2C })
+        for (unsigned int temporal : { 0u, 2u })
+            for (int star = 0; star < 2; star++) {
+                ChLayer full(w, C, W, H, star != 0, temporal, 0, coreMode);    // the reference: the full path at every run
+                ChLayer part(w, C, W, H, star != 0, temporal, -1, coreMode);   // the change-driven path by its rules
+                REQUIRE(full.ok); REQUIRE(part.ok);
+                std::vector<uint16_t> frame = base;
+                unsigned long long key = 2000;
+                auto a = full.Run(w, frame, key, true, nullptr);
+                auto b = part.Run(w, frame, key, true, nullptr);
+                REQUIRE(a == b);
+                REQUIRE(full.ctx.fald->core2On);
+                CHECK_FALSE(part.ctx.fald->lastPartial);
+                int partialRuns = 0;
+                for (const Step& s : steps) {
+                    std::vector<FaldChangeRect> rects;
+                    if (s.newContent) { ChPatch(frame, W, s.rc, s.value); rects.push_back(s.rc); key++; }
+                    const std::vector<FaldChangeRect> none;
+                    auto fa = full.Run(w, frame, key, s.newContent, nullptr);
+                    auto pb = part.Run(w, frame, key, s.newContent, s.newContent ? &rects : &none);
+                    const bool same = fa == pb;
+                    CHECK_MESSAGE(same, "core mode " << coreMode << " temporal " << temporal << " star " << star << ": " << s.what);
+                    if (!same)
+                        for (size_t i = 0; i < fa.size() && i < pb.size(); i++)
+                            if (fa[i] != pb[i]) MESSAGE("  differs: " << fa[i].first);
+                    if (part.ctx.fald->lastPartial) partialRuns++;
+                }
+                const int expect = coreMode == FALD_CORE_MODE_KC3 ? (int)(sizeof(steps) / sizeof(steps[0])) : 0;
+                CHECK_MESSAGE(partialRuns == expect, "core mode " << coreMode << " temporal " << temporal << " star " << star
+                              << ": " << partialRuns << " partial runs, expected " << expect
+                              << (coreMode == FALD_CORE_MODE_KC3 ? " (KC3 is stateless: every step after the first)" : " (KC2c's IIRs: the full path)"));
+            }
+    g_faldCore2TestRefreshes = savedRefreshes;
+}
+
 TEST_CASE("FALD change: the partial path needs a complete state, the same settings, a known frame, the fused gain pass") {
     FaldChangeInputs in = {};
     in.stateComplete = true; in.settingsSame = true; in.frameKnown = true; in.newContent = true; in.gainFused = true;
@@ -258,6 +335,7 @@ TEST_CASE("FALD change: the partial path needs a complete state, the same settin
     CHECK(fails([](FaldChangeInputs& x) { x.touchedZones = 1153; }));
     CHECK(fails([](FaldChangeInputs& x) { x.totalZones = 0; }));
     CHECK(fails([](FaldChangeInputs& x) { x.temporalMode = 7; }));
+    CHECK(fails([](FaldChangeInputs& x) { x.coreStateful = true; }));   // the always-on core with zone IIRs (KC2c): nothing stands
     // a kick-only present (no new content) is partial like any other small change
     { FaldChangeInputs x = in; x.newContent = false; x.touchedZones = 1; CHECK(FaldChangeDecide(x, cap) == FALD_CHANGE_PARTIAL); }
     { FaldChangeInputs x = in; x.touchedZones = 0; CHECK(FaldChangeDecide(x, cap) == FALD_CHANGE_PARTIAL); }

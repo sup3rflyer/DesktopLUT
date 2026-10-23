@@ -88,6 +88,7 @@ void FaldStarfieldClamp(FaldStarfieldSettings& s) {
 }
 
 static void ComputeFlatResponse(FaldResources* r);   // defined with the passes below
+#include "../shared/fald_core2.h"
 
 void FaldTrace(const char* msg) {
     static std::mutex m;
@@ -196,6 +197,11 @@ bool InitFaldShadersFrom(const FaldShaderSources& src) {
     hr = g_device->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreatePixelShader failed" << std::endl; return false; }
+    {                                                         // the always-on core round 2 (prototype): optional
+        std::string cerr2;
+        if (!FaldCore2InitShaders(g_device, src.common, &cerr2))
+            std::cerr << "[FALD] core round 2 shaders unavailable (the setting runs as off): " << cerr2 << std::endl;
+    }
     D3D11_SAMPLER_DESC sd = {};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -212,6 +218,7 @@ bool InitFaldShadersFrom(const FaldShaderSources& src) {
 
 void ReleaseFaldShaders() {
     FaldFadeReleaseShaders();
+    FaldCore2ReleaseShaders();
     g_faldFadeShadersFailed = false;
     if (g_faldExemptRS) { g_faldExemptRS->Release(); g_faldExemptRS = nullptr; }
     if (g_faldSampler) { g_faldSampler->Release(); g_faldSampler = nullptr; }
@@ -303,6 +310,7 @@ static void ReleaseAll(FaldResources* r) {
     ReleaseStar(r);
     ReleaseClock(r);
     FaldFadeDestroy(r->fade); r->fade = nullptr; r->fadeOn = false; r->fadeKey = 0; r->fadeRetryCounter = 0;
+    FaldCore2Destroy(r->core2); r->core2 = nullptr; r->core2On = false;
     SafeRelease(r->cb);
     r->valid = false;
 }
@@ -715,6 +723,8 @@ static const UINT FALD_SRV_SLOTS = 24;   // t0..t23 (fald_shader.h; t20..t23 = t
                                          // the pixel pass while it is on, null elsewhere)
 static const UINT FALD_SRV_SLOTS_ALL = 40;   // ... + the fade passes' t24..t35, the conv pass's float4 kernel views t36 / t37,
                                              // the touched-zone list t38, the packed fields t39
+static const UINT FALD_CORE_SRV_SLOTS = 13;  // t40..t52: the always-on core's (shared/fald_core2.h) — the seam's t40..t43 / t48 and
+                                             // its own kernels' t44..t47 / t49..t52
 
 static void BindCommon(FaldResources* r, bool compute) {
     ID3D11ShaderResourceView* srvs[FALD_SRV_SLOTS] = { r->interSRV, r->curveSRV, r->kTrueSRV, r->kEstSRV, nullptr, nullptr, nullptr,
@@ -724,24 +734,44 @@ static void BindCommon(FaldResources* r, bool compute) {
                                                        nullptr, nullptr,                     // t16/t17: star passes only (RunStar)
                                                        r->starOn ? r->starPlan2SRV : nullptr, // t18: ln background, near, spk (Balance)
                                                        nullptr };                            // t19: star pass S1 only (RunStar)
+    // The always-on core (shared/fald_core2.h): b3, its zone field (t41) and the deficit of the ROUND the consumer reads —
+    // CoreGain in the compute passes is the round-1 statistic's, which reads round 0's (t42 / t48); the pixel pass reads
+    // round 1's. Off = b3 unbound (reads 0: CoreGain = identity).
+    const unsigned int coreRound = compute ? 0u : 1u;
+    ID3D11Buffer* coreCB = r->core2On ? FaldCore2CB(r->core2) : nullptr;
+    ID3D11ShaderResourceView* coreZF[2] = { r->core2On ? FaldCore2ZoneSRV(r->core2) : nullptr,                 // t41 (alpha, k, ln P, rate)
+                                            r->core2On ? FaldCore2FieldSRV(r->core2, coreRound) : nullptr };   // t42 (round 2's field)
+    ID3D11ShaderResourceView* coreND = r->core2On ? FaldCore2NodeDSRV(r->core2, coreRound) : nullptr;       // t48 (round 3's fine D)
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_context->CSSetShaderResources(38, 1, &r->zoneListSRV);   // t38: the touched-zone list (the partial path's sweeps)
         g_context->CSSetSamplers(0, 1, &g_faldSampler);
+        g_context->CSSetConstantBuffers(3, 1, &coreCB);
+        g_context->CSSetShaderResources(41, 2, coreZF);
+        g_context->CSSetShaderResources(48, 1, &coreND);
     } else {
         g_context->PSSetConstantBuffers(0, 1, &r->cb);
         g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_context->PSSetSamplers(0, 1, &g_faldSampler);
+        g_context->PSSetConstantBuffers(3, 1, &coreCB);
+        g_context->PSSetShaderResources(41, 2, coreZF);
+        g_context->PSSetShaderResources(48, 1, &coreND);
     }
 }
 
 static void UnbindCompute() {
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS_ALL] = {};
-    ID3D11UnorderedAccessView* nullUav[7] = {};             // u0 / u1 + u2, the zone sweeps' partials, u3 / u4 the boost's
-                                                            // counters + result, u5 the change flags, u6 the indirect arguments
+    ID3D11UnorderedAccessView* nullUav[8] = {};             // u0 / u1 + u2, the zone sweeps' partials, u3 / u4 the boost's
+                                                            // counters + result (u4 in the sweeps: the core's zone statistics),
+                                                            // u5 the change flags, u6 the indirect arguments (the sweeps: the
+                                                            // core's node peaks), u7 the core's node partials
     g_context->CSSetShaderResources(0, FALD_SRV_SLOTS_ALL, nullSrv);
-    g_context->CSSetUnorderedAccessViews(0, 7, nullUav, nullptr);
+    g_context->CSSetUnorderedAccessViews(0, 8, nullUav, nullptr);
+    ID3D11ShaderResourceView* nullCore[FALD_CORE_SRV_SLOTS] = {};   // the core's t40..t52 (BindCommon's t41 / t42 / t48, its kernels')
+    g_context->CSSetShaderResources(40, FALD_CORE_SRV_SLOTS, nullCore);
+    ID3D11Buffer* nullCB = nullptr;
+    g_context->CSSetConstantBuffers(3, 1, &nullCB);
     g_context->CSSetShader(nullptr, nullptr, 0);
 }
 
@@ -771,11 +801,13 @@ static void RunStat(FaldResources* r, uint32_t roundIdx, StatDispatch d = kStatF
             g_context->CSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
         }
     }
-    ID3D11UnorderedAccessView* uavs[6] = { roundIdx ? r->driveUAV : r->drive0UAV, r->activeUAV[roundIdx & 1u],   // u1: nullptr without a boost LUT
+    ID3D11UnorderedAccessView* uavs[8] = { roundIdx ? r->driveUAV : r->drive0UAV, r->activeUAV[roundIdx & 1u],   // u1: nullptr without a boost LUT
                                            r->zonePartUAV,                                // (the shader then never writes it)
                                            r->boostCountUAV, nullptr,                     // u3: the boost's counters (LUT only); u2: partials
-                                           r->changeFlagsUAV };                           // u5: the partial path's flags
-    g_context->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
+                                           r->changeFlagsUAV, nullptr, nullptr };         // u5: the partial path's flags
+    if (roundIdx == 0 && r->core2On)                 // the always-on core (fald_core2.h), round 0: the zones' P, M, lnG (u4) and,
+        FaldCore2StatViews(r->core2, &uavs[4], &uavs[6], &uavs[7]);   // round 3, the node peaks (u6; slice partials u7) — compared on the partial path
+    g_context->CSSetUnorderedAccessViews(0, 8, uavs, nullptr);
     {
         FaldPassScope ps(roundIdx ? FALD_PASS_STAT1 : FALD_PASS_STAT0);
         if (d.indirect) g_context->DispatchIndirect(r->argsBuf, d.slot);
@@ -1222,6 +1254,21 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         DumpTexture(d.reach[1], dir + L"fald_fade_reach1.f32", d.width, d.height, 4);
         DumpTexture(d.s, dir + L"fald_fade_s.f32", d.wq, d.hq, 4);
     }
+    if (r->core2On) {  // the always-on core round 2 (prototype): zone textures, cols x rows; field = round 1's (alpha_z, D)
+        const FaldCore2Debug cd = FaldCore2DebugViews(r->core2);
+        DumpTexture(cd.stat, dir + L"fald_core2_stat.f32", cd.cols, cd.rows, 16);     // P, M, lnG, 0
+        DumpTexture(cd.zone, dir + L"fald_core2_zone.f32", cd.cols, cd.rows, 16);     // alpha_z, k, ln P, 0
+        DumpTexture(cd.field, dir + L"fald_core2_field.f32", cd.cols, cd.rows, 8);    // alpha_z, D (round 1: the pixel pass's)
+        DumpTexture(cd.field0, dir + L"fald_core2_field0.f32", cd.cols, cd.rows, 8);  // ... of round 0 (the round-1 statistic's)
+        DumpTexture(cd.alphaState, dir + L"fald_core2_alpha_state.f32", cd.cols, cd.rows, 4);
+        DumpTexture(cd.dState[0], dir + L"fald_core2_d_state0.f32", cd.cols, cd.rows, 4);
+        DumpTexture(cd.dState[1], dir + L"fald_core2_d_state1.f32", cd.cols, cd.rows, 4);
+        if (cd.flags & FALD_CORE2_FINE) {   // round 3: the fine grid (cols * sub x rows * sub): node peaks (uint bits), D of round 1
+            DumpTexture(cd.nodePeak, dir + L"fald_core3_node_peak.u32", cd.cols * cd.sub, cd.rows * cd.sub, 4);
+            DumpTexture(cd.nodeD, dir + L"fald_core3_node_d.f32", cd.cols * cd.sub, cd.rows * cd.sub, 4);
+            DumpTexture(cd.nodeD0, dir + L"fald_core3_node_d0.f32", cd.cols * cd.sub, cd.rows * cd.sub, 4);   // round 0's
+        }
+    }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
     char clockText[3][192];                  // full-precision clock numbers (the stream's 6 digits cannot check k offline)
@@ -1280,6 +1327,13 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << (r->fade ? FaldFadeVramBytes(r->fade) >> 20 : 0ull) << " MB)"
          << "\nrun_path " << (r->lastPartial ? "partial" : "full") << " (shared/fald_change.h: partial = the touched zones' statistics only,"
          << " the rest by the decide pass; the fields are the same bytes either way)"
+         << "\ncore2 " << (r->core2On ? 1 : 0) << " (the always-on core, switch coreMode " << fs.coreMode << " = " << FaldCoreModeName(fs.coreMode)
+         << "; shared/fald_core2.h: files fald_core2_stat.f32 [P, M, lnG, 0], fald_core2_zone.f32 [alpha_z, k, ln P, rate],"
+         << " fald_core2_field.f32 [alpha_z, D of round 1] / _field0 [round 0's], fald_core2_alpha_state.f32, fald_core2_d_state0 / 1.f32;"
+         << " round 3: fald_core3_node_peak.u32, fald_core3_node_d.f32 [round 1's D] / _d0 [round 0's])"
+         << "\ncore2_flags " << (r->core2On ? FaldCore2DebugViews(r->core2).flags : 0u)
+         << "\ncore2_a " << (r->core2On ? FaldCore2DebugViews(r->core2).coreA : 0.0f)
+         << "\ncore2_reset " << ((r->core2On && FaldCore2DebugViews(r->core2).reset) ? 1 : 0)
          << "\nparams " << NarrowUtf8(r->paramsPath) << "\nframes_run " << r->framesRun << "\n";
     std::cout << "[FALD] Monitor " << ctx->index << " dump written to " << NarrowUtf8(dir) << std::endl;
 }
@@ -1398,7 +1452,8 @@ static void UpdateFadeGovernor(MonitorContext* ctx, FaldResources* r, const Fald
 static unsigned long long SettingsKey(const FaldResources* r, const FaldTemporalSettings& ts) {
     unsigned long long h = 1469598103934665603ull;
     auto mix = [&h](const void* p, size_t n) { const unsigned char* b = (const unsigned char*)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
-    const uint32_t words[6] = { r->debugMode, r->pedMode, r->starOn ? 1u : 0u, r->fadeOn ? 1u : 0u, r->gainFused ? 1u : 0u, r->convVariant };
+    const uint32_t words[7] = { r->debugMode, r->pedMode, r->starOn ? 1u : 0u, r->fadeOn ? 1u : 0u, r->gainFused ? 1u : 0u, r->convVariant,
+                                r->core2On ? r->core2Flags : 0u };   // the always-on core's mode (its fields are part of the state)
     mix(words, sizeof(words));
     mix(&r->star, sizeof(r->star));
     mix(&ts, sizeof(ts));
@@ -1462,6 +1517,10 @@ static void RunPixel(MonitorContext* ctx, FaldResources* r, ID3D11RenderTargetVi
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
     g_context->PSSetShaderResources(FALD_FIELDS_SLOT, 1, nullSrv);                // t39 (the conv pass's u2 next run)
+    ID3D11ShaderResourceView* nullCore[FALD_CORE_SRV_SLOTS] = {};                 // the core's t41 / t42 / t48 (its passes' UAVs next run)
+    g_context->PSSetShaderResources(40, FALD_CORE_SRV_SLOTS, nullCore);
+    ID3D11Buffer* nullCB = nullptr;
+    g_context->PSSetConstantBuffers(3, 1, &nullCB);
 }
 
 void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool newContent, unsigned long long frameKey,
@@ -1491,6 +1550,16 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     if (fs.flankFade && r->fadeGov.Allowed()) r->fadeOn = EnsureFade(r);
     else if (r->fade || r->fadeOn) {
         FaldFadeDestroy(r->fade); r->fade = nullptr; r->fadeOn = false; r->fadeKey = 0; r->fadeRetryCounter = 0; r->fadeFailLogged = false;
+    }
+
+    // The always-on core (FaldSettings::coreMode; shared/fald_core2.h): on = its zone / fine textures exist and its shaders
+    // compiled; off = released, b3 / t41 / t42 / t48 unbound (CoreGain = identity) — today's layer bit for bit.
+    r->core2Flags = FaldCore2FlagsOfMode(fs.coreMode);
+    if (r->core2Flags && FaldCore2ShadersReady()) {
+        if (!r->core2) r->core2 = FaldCore2Create();
+        r->core2On = FaldCore2Ensure(r->core2, g_device, r->params.cols, r->params.rows, r->params.sub, r->zoneSlices);
+    } else if (r->core2 || r->core2On) {
+        FaldCore2Destroy(r->core2); r->core2 = nullptr; r->core2On = false;
     }
 
     // Temporal drive state ("LED lag", passes 1b / 1c): the bookkeeping — dt, the mode / ring / reset rules, the panel
@@ -1529,6 +1598,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     in.frameKnown = listOk && frameKey != 0; in.newContent = newContent; in.gainFused = r->gainFused;
     in.temporalMode = clockOk ? ts.mode : (ts.mode == FALD_TEMPORAL_PANEL ? 0u : ts.mode);   // the mode that runs (FaldTemporalBeginRun)
     in.fadeOn = r->fadeOn;
+    in.coreStateful = r->core2On && FaldCore2Stateful(r->core2Flags);   // KC2c's zone IIRs: the full path (KC3 is stateless)
     in.touchedZones = (unsigned int)r->touched.size(); in.totalZones = totalZones;
     bool partial = g_faldPartialOverride != 0 && FaldChangeDecide(in, maxZones) == FALD_CHANGE_PARTIAL;   // + the routing rule below
 
@@ -1602,6 +1672,14 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     FaldCoreTimingStamp(&r->coreTiming, g_context, tslot, 1);
     if (r->fadeOn) RunFadeFrame(r, newContent);   // fade stack: the fade, F, T (once per content frame; fald_fade.h)
     FaldCoreTimingStamp(&r->coreTiming, g_context, tslot, 2);   // (the fade's passes are its own governor's)
+    // The always-on core (shared/fald_core2.h): round 2's zone IIR advances by the refreshes since the previous run (mode
+    // 3's k; else the run interval over the refresh period); a resume / mode change resets it (round 3 resets every run).
+    // The test seam (every run = k refreshes, whatever the timing) also stands in for a timing-induced resume.
+    if (r->core2On) {
+        const unsigned long long k = FaldCore2Refreshes(panel, r->clkElapsed, r->dtMs, ctx->frameTimeExactMs);
+        if ((trun.resumed || trun.stateReset) && g_faldCore2TestRefreshes == 0) FaldCore2Invalidate(r->core2);
+        FaldCore2BeginRun(r->core2, g_context, r->core2Flags, FaldCore2IirFactor(k));
+    }
     // Both rounds' reach of the frame they were formed from (no new content, LED lag off, the same settings): reused
     const unsigned long long reachKey = r->fadeOn ? ReachKey(r, frameKey, temporal, panel) : 0ull;
     const bool reachReuse = r->fadeOn && !newContent && FaldFadeReachCurrent(r->fade, reachKey);
@@ -1612,8 +1690,13 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     else { RunStat(r, 0, stat0Full); RunStat(r, 0, stat0Part); }
     if (temporal) RunTemporal(r, inDriveOf(0), 0, partial); // both rounds read the SAME committed state (DriveState.peek)
     RunDecide(r, 0, partial);              // round 0's boost; partial: what follows from the flags
+    // the core's zone passes (the cut, alpha, the spread gate) after the decide: partial = by its arguments (only when a
+    // zone's core statistics or a drive moved; else the previous run's zone field stands — the full path's bytes)
+    if (r->core2On) FaldCore2RunZone(r->core2, g_context, r->cb, partial ? r->argsBuf : nullptr, FALD_ARGS_CORE_LATTICE);
     RunConv(r, mapSrv(trun.trueMap, 0, panel), mapSrv(trun.estMap, 0, panel), r->boostSRV[0], 0, partial);
     RunGain(r, 0, partial);
+    if (r->core2On)                        // round 0's deficit from round 0's gain (the round-1 statistic reads it)
+        FaldCore2RunDeficit(r->core2, g_context, r->cb, r->gainFused ? r->gain0SRV : r->gainBSRV, 0, partial ? r->argsBuf : nullptr, FALD_ARGS_CORE_FINE0);
     FaldCoreTimingStamp(&r->coreTiming, g_context, tslot, 3);
     if (r->fadeOn && !reachReuse) RunFadeReach(r, 0, reachKey);   // reach of round 0's knee: FadePost in the round-1 statistic
     FaldCoreTimingStamp(&r->coreTiming, g_context, tslot, 4);
@@ -1624,6 +1707,8 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     RunDecide(r, 1, partial);              // round 1's boost; partial: the convolution, the gain and the pixel pass from the flags
     RunConv(r, mapSrv(trun.trueMap, 1, panel), mapSrv(trun.estMap, 1, panel), r->boostSRV[1], 1, partial);
     RunGain(r, 1, partial);
+    if (r->core2On)                        // round 1's deficit from round 1's gain (the pixel pass reads it)
+        FaldCore2RunDeficit(r->core2, g_context, r->cb, r->gainBSRV, 1, partial ? r->argsBuf : nullptr, FALD_ARGS_CORE_FINE1);
     FaldCoreTimingStamp(&r->coreTiming, g_context, tslot, 5);
     if (r->fadeOn && !reachReuse) RunFadeReach(r, 1, reachKey);   // reach of round 1's knee: FadePost in the pixel pass
     FaldCoreTimingStamp(&r->coreTiming, g_context, tslot, 6);
@@ -1649,6 +1734,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
 
     // pixel pass: inter + fields -> finalRT (fullscreen triangle; g_vs already bound by the caller)
     RunPixel(ctx, r, finalRT, mapSrv(trun.debugFiltMap, 1));
+    if (r->core2On) FaldCore2EndRun(r->core2);
     FaldCoreTimingEnd(&r->coreTiming, g_context, tslot);
     if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);
 
@@ -1673,6 +1759,7 @@ void FaldLayerIdle(MonitorContext* ctx) {
     FaldTemporalIdle(r);
     if (r) {
         FaldFadeReset(r->fade);            // the fade stack's T state is void too (the panel did not show our frames)
+        FaldCore2Invalidate(r->core2);     // and the core's zone IIR
         r->stateComplete = false; r->fieldsStand = false;          // and the previous run's textures stand for no frame the next run will see
     }
 }

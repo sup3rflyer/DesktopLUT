@@ -1530,13 +1530,15 @@ void UpdateDwmHookSharedConfig()
                         // A configured-but-pathless layer is off (the DLL has no file to read either).
                         const auto& fs = mc.isHdr ? g_gui.monitorSettings[mi].hdrColorCorrection.fald
                                                   : g_gui.monitorSettings[mi].sdrColorCorrection.fald;
-                        cfg.faldFlags[i] = DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty() && !held,
+                        cfg.faldFlags[i] = DwmHookFaldPackCore2(
+                                           DwmHookFaldPack(fs.enabled && !fs.paramsPath.empty() && !held,
                                                            static_cast<uint32_t>(fs.debugMode),
                                                            static_cast<int>(fs.pedMode),
                                                            fs.star.enabled ? 1 : 0,
                                                            fs.flankFade ? 1 : 0,    // bit 8; bit 9 (L) never set
                                                            g_faldFadeForce.load() ? 1 : 0,    // bit 10: the governor forced
-                                                           g_faldCoreForce.load() ? 1 : 0);   // bit 11: the core's rate cap forced off
+                                                           g_faldCoreForce.load() ? 1 : 0),   // bit 11: the core's rate cap forced off
+                                           fs.coreMode);                                      // bits 16-17: the core test switch
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];

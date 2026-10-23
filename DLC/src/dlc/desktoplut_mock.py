@@ -213,6 +213,9 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     out["fald_starfield"] = star["enabled"]
     out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
     # the frozen fade stack (2026-10-20; runtime.fald_flank_fade) and item L (reserved, no setter)
+    # the always-on core's rule (shared/fald_core_mode.h; default KC3 = 2 since 2026-10-23; runtime.fald_core_mode switches it)
+    out["fald_core_mode"] = int(entry.get("core_mode", 2))
+    out["fald_core_mode_name"] = {0: "C", 1: "KC2c", 2: "KC3"}.get(out["fald_core_mode"], "?")
     out["fald_flank_fade"] = bool(entry.get("flank_fade", False))
     out["fald_low_ext"] = False
     # the fade's GPU safety governor (2026-10-22): the mock renders nothing, so an enabled fade has no report yet
@@ -1040,6 +1043,17 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(ok=False, error="nb_hi must be >= nb_lo")
             fs["star"] = st
             return self.ok({"monitor_mode": key, **_fald_star(fs)})
+        if method == "runtime.fald_core_mode":
+            # C++ DoFaldCoreMode (branch fald/principled): runtime only, never saved; refusals word for word
+            if "core" not in params:
+                return DesktopLutResponse(ok=False, error="missing parameter: core")
+            cm = params.get("core")
+            if isinstance(cm, bool) or not isinstance(cm, (int, float)):
+                return DesktopLutResponse(ok=False, error="core must be a number")
+            if cm not in (0, 1, 2):
+                return DesktopLutResponse(ok=False, error="core must be 0, 1 or 2")
+            fs["core_mode"] = int(cm)
+            return self.ok({"monitor_mode": key, "core": cm})
         if method == "runtime.fald_flank_fade":
             # C++ DoFaldFlankFade (2026-10-20): the frozen fade stack's switch, persisted per mode; refusals word for word
             if "enabled" not in params:

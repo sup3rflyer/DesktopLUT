@@ -43,6 +43,9 @@ struct FaldChangeInputs {
                                // own movement is detected on the GPU (the temporal / clock passes compare their outputs
                                // with the previous run's and flag a change), so no settle bookkeeping is needed here
     bool fadeOn;               // the flank fade: its T state advances per content frame (not partial-able here)
+    bool coreStateful;         // the always-on core with temporal state (shared/fald_core2.h FaldCore2Stateful: KC2c's zone
+                               // IIRs advance every run) — its fields on a present that moved nothing would differ from the
+                               // previous run's, so the full path; KC3 (stateless) is partial-able
     unsigned int touchedZones; // the list's size (0 = no rect inside the lattice)
     unsigned int totalZones;
 };
@@ -65,9 +68,11 @@ enum FaldArgsSlot : unsigned int {
     FALD_ARGS_STAT0_PART = 64, FALD_ARGS_STAT0_PART_COMBINE = 80, FALD_ARGS_CONV0 = 96, FALD_ARGS_GAIN0 = 112,
     FALD_ARGS_STAT1_FULL = 128, FALD_ARGS_STAT1_FULL_COMBINE = 144, FALD_ARGS_STAT1_PART = 160, FALD_ARGS_STAT1_PART_COMBINE = 176,
     FALD_ARGS_CONV1 = 192, FALD_ARGS_GAIN1 = 208, FALD_ARGS_PIXEL = 224,
-    FALD_ARGS_STAR_S0_FULL = 240, FALD_ARGS_STAR_S0_FULL_COMBINE = 256   // S0 over the whole lattice (the frame changed everywhere)
+    FALD_ARGS_STAR_S0_FULL = 240, FALD_ARGS_STAR_S0_FULL_COMBINE = 256,  // S0 over the whole lattice (the frame changed everywhere)
+    // the always-on core's lattice passes (shared/fald_core2.h): Z1 / Z2 after round 0's decide; the fine passes per round
+    FALD_ARGS_CORE_LATTICE = 272, FALD_ARGS_CORE_FINE0 = 288, FALD_ARGS_CORE_FINE1 = 304
 };
-constexpr unsigned int FALD_ARGS_BYTES = 272;
+constexpr unsigned int FALD_ARGS_BYTES = 320;
 // The change flags (u5, FALD_CHANGE_FLAGS uints, zeroed at build and by the last decide of a run): [0] / [1] = a drive, a
 // zone flag or an LED-lag map of that round moved, [2] = the starfield's S0 moved, [3] = THE FRAME CHANGED EVERYWHERE —
 // the caller's word that the pass which made the intermediate (the tone map with a dynamic peak: shared/peak_detect.h,
@@ -75,6 +80,10 @@ constexpr unsigned int FALD_ARGS_BYTES = 272;
 // taken as unchanged: a decide pass before any sweep (RunDecide 3) then orders S0 and round 0's sweep in full, and
 // every later decide treats it as "moved". The hosts copy the caller's 4-byte flag into [3] (a GPU copy, no readback).
 constexpr unsigned int FALD_CHANGE_FLAGS = 4;
+// [0]'s bits: 1u = a drive / zone flag / LED-lag map of round 0 moved; 2u = a zone's CORE statistics or node peaks moved
+// (shared/fald_core2.h: the correction changes without any drive moving — the decide pass runs the core's passes, the round-1
+// sweep in full and the pixel pass, but not the convolution / gain).
+constexpr unsigned int FALD_CHANGE_CORE_MOVED = 2u;
 constexpr unsigned int FALD_CHANGE_FLAG_FRAME_BYTES = 12;   // byte offset of [3]
 // CB word 79 (fald_shader.h runMode): the path, the conv pass's sub-offsets per thread, the list's length.
 inline uint32_t FaldRunModeWord(bool partial, unsigned int convSo, unsigned int listLen) {

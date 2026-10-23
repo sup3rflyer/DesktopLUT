@@ -142,6 +142,7 @@ struct CkLayer {
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = periodMs;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
         fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = star;
+        fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
         fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockParity = parity; fs.clockClosure = FALD_CLOCK_CLOSURE_DEFAULT;
         if (!FaldEnsureResources(&ctx, fs)) return;
         D3D11_TEXTURE2D_DESC td = {};

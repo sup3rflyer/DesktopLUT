@@ -31,6 +31,7 @@
 #include "fald.h"
 #include "fald_fade_status.h"   // the flank fade governor's report (state.get)
 #include "fald_core_status.h"   // the core layer's rate-cap governor's report (state.get)
+#include "../shared/fald_core_mode.h"   // the always-on core's mode table (runtime.fald_core_mode, state.get)
 #include "displayconfig.h"
 #include "ipc_json.h"
 #include "ipc_grayscale.h"
@@ -528,6 +529,8 @@ void HandleStateGet(JsonValue& result) {
                 // the frozen fade stack (runtime.fald_flank_fade) and item L (reserved: no setter, never applied)
                 l.set("fald_flank_fade", JBool(fs.flankFade));
                 l.set("fald_low_ext", JBool(fs.lowExt));
+                l.set("fald_core_mode", JNum((double)fs.coreMode));   // the always-on core's switch (runtime.fald_core_mode)
+                l.set("fald_core_mode_name", JStr(FaldCoreModeName(fs.coreMode)));   // "C" / "KC2c" / "KC3" (shared/fald_core2.h)
                 {   // the fade's safety governor (shared/fald_fade_governor.h; the overlay's or the hook's report)
                     JsonValue gj = JObj();
                     FaldFadeGovReport gov;
@@ -1716,6 +1719,34 @@ void DoFaldFlankFade(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("enabled", JBool(en->b));
 }
 
+// runtime.fald_core_mode {monitor, mode, core}: the always-on core's switch (shared/fald_core2.h FALD_CORE_MODES): 0 = C
+// (today's layer), 1 = KC2c (round 2), 2 = KC3 (round 3; the live blind tests' leading rule). Runtime only: NEVER saved (the
+// INI key <mode>_FaldCoreModeTest sets the start value; the owner decides the default). The live blind kits set it per block.
+void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    const JsonValue* cm = p.find("core");
+    if (!cm) { error = "missing parameter: core"; return; }
+    if (cm->type != JsonValue::Num) { error = "core must be a number"; return; }
+    const double v = cm->num;
+    bool known = false;
+    for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++) known = known || v == (double)k;
+    if (!known) {                                  // "core must be 0, 1 or 2" (the mock's text, DLC desktoplut_mock.py)
+        error = "core must be ";
+        for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++)
+            error += std::to_string(k) + (k + 2 < FALD_CORE_MODE_COUNT ? ", " : (k + 1 < FALD_CORE_MODE_COUNT ? " or " : ""));
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        fs.coreMode = (uint32_t)v;
+    }
+    FaldPropagate(mon, isHDR);                     // no SaveSettings: a test switch
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("core", JNum(v));
+}
+
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -2506,6 +2537,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_temporal") DoFaldTemporal(params, result, error);
         else if (m == "runtime.fald_starfield") DoFaldStarfield(params, result, error);
         else if (m == "runtime.fald_flank_fade") DoFaldFlankFade(params, result, error);
+        else if (m == "runtime.fald_core_mode") DoFaldCoreMode(params, result, error);
         else if (m == "hook.set_routing") DoHookSetRouting(params, result, error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(params, result, error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(params, result, error);

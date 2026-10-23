@@ -532,6 +532,41 @@ float3 FadePost(float3 req, float3 img, int2 px) {
     float3 o = req * exp(lsEff - ls);
     return ((asuint(o) & 0x7fffffffu) > 0x7f800000u) ? 0.0f : o;
 }
+)" /* the third seam: the always-on core, rounds 2 / 3 (shared/fald_core2.h; off = coreFlags 0, CoreGain = identity). The hosts
+      bind t42 / t48 per consumer: round 0's fields for the round-1 statistic (compute), round 1's for the pixel pass. */ R"(
+cbuffer FaldCoreCB : register(b3) {
+    uint coreFlags; float coreA; uint coreReset; float coreCutThr;       // flags: bit 0 alpha, 1 deficit (2 soft: reserved)
+    float coreMuInf; float coreLh; float coreZ; float coreKStart;        // alpha(L) = clamp(muInf L / (L + Lh) - z, 0, 1)
+    float coreBeta; float coreTau; float coreFixedRcp; uint _corePad;    // spread gate; 1 / the cut sum's fixed point
+    float coreW0; float coreW1; float coreW2; float coreW3;              // the sigma-0.7 Gaussian's taps (centre .. 3)
+};
+Texture2D<float4> coreStatTex  : register(t40);   // P, M, lnG (stat round 0)
+Texture2D<float4> coreZoneTex  : register(t41);   // alpha_z, k, ln P
+Texture2D<float2> coreFieldTex : register(t42);   // alpha_z, D (this round)
+Buffer<uint>      coreCutSum   : register(t43);   // [0]: sum over zones of |d ln max(M, 0.05)| (fixed point)
+Texture2D<float>  coreNodeDTex : register(t48);   // round 3 (coreFlags bit 3): the deficit D on the FINE grid
+// Correct's gain at both call sites (fald_core2.h): brightening shrunk by alpha, minus the deficit D; darkening untouched.
+// With coreFlags 0 (the core off, b3 bound with zeros or not at all) the input is returned unchanged.
+float2 CoreGain(float2 g, float2 px) {
+    if ((coreFlags & 3u) == 0u || !(g.x > 1.0f)) return g;
+    float lg = log(g.x);
+    if ((coreFlags & 8u) != 0u) {             // round 3 (KC3): alpha from the zone field, D from the fine-grid field
+        const float2 uv = FineUV(px);
+        if ((coreFlags & 1u) != 0u) lg *= saturate(coreZoneTex.SampleLevel(linearClamp, uv, 0).x);
+        if ((coreFlags & 2u) != 0u) lg = max(lg - max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f), 0.0f);
+    } else {                                  // round 2 (KC2c): both from the zone field
+        float2 f = coreFieldTex.SampleLevel(linearClamp, FineUV(px), 0);
+        if ((coreFlags & 1u) != 0u) lg *= saturate(f.x);
+        if ((coreFlags & 2u) != 0u) lg = max(lg - max(f.y, 0.0f), 0.0f);
+    }
+    g.x = exp(lg);
+    return g;
+}
+bool CoreResetNow() {
+    float mean = (float)coreCutSum[0] * coreFixedRcp / (float)(cols * rows);
+    return coreReset != 0u || mean > coreCutThr;
+}
+float CoreW(int d) { d = abs(d); return d == 0 ? coreW0 : (d == 1 ? coreW1 : (d == 2 ? coreW2 : coreW3)); }
 )";
 
 // Pass 1: per-cell area statistic -> drive. One thread group per cell, 256 threads sweep the block.
@@ -557,14 +592,25 @@ RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones
 RWStructuredBuffer<uint> boostCount : register(u3);     // [round] = the non-black zones of that round's map (boost LUT only):
                                                         // every finished zone adds (new flag - old flag), so the count
                                                         // follows the map whether the sweep is full or partial
+RWTexture2D<float4> coreStatOut : register(u4);          // the always-on core (fald_core2.h), round 0 only: P, M, lnG over
+                                                        // ALL the zone's pixels (null = the core off: never written)
 RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [round] = a drive / flag of that round moved,
                                                         // [2] = the starfield's S0 moved, [3] = the caller's "the frame changed
-                                                        // everywhere" (read and cleared by the decide pass; fald_change.h)
+                                                        // everywhere" (read and cleared by the decide pass; fald_change.h);
+                                                        // [0] bit 1 (2u) = a zone's core statistics / node peaks moved
+RWTexture2D<uint> coreNodePeakOut : register(u6);        // core round 3: per FINE node the peak min(mc, white) of the pixels whose
+                                                        // nearest node it is — the finished zone's S x S nodes stored whole
+RWStructuredBuffer<uint> coreNodePart : register(u7);    // core round 3, lattices of more than one slice: each slice's S x S node
+                                                        // peaks ([ZonePartIndex * S * S + node]), folded by the combine variant
+groupshared uint gNodeMax[256];                          // round 3: this zone's S x S node peaks (asuint, S <= 16)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared uint gLit[256];
 groupshared uint gDim[256];
 groupshared float gPow[256];
+groupshared float gCMax[256];
+groupshared float gCSum[256];
+groupshared float gCLn[256];
 
 [numthreads(256, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
@@ -576,10 +622,21 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     float m = 0.0f, sum = 0.0f;
     uint lit = 0, dim = 0;
     float powSum = 0.0f;
+    const bool coreOn = roundIdx == 0 && (coreFlags & 3u) != 0u;   // core round 2: the source's zone statistics
+    const bool coreNodes = coreOn && (coreFlags & 8u) != 0u && sub <= 16u;   // round 3: the per-node peaks too
+    float cMax = 0.0f, cSum = 0.0f, cLn = 0.0f;
+    if (coreNodes) { gNodeMax[tid.x] = 0u; }
+    GroupMemoryBarrierWithGroupSync();
 #ifdef FALD_ZONE_COMBINE
     for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
         ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
         m = max(m, q.f.x); sum += q.f.y; powSum += q.f.z; lit += q.u.x; dim += q.u.y;
+        if (coreOn) { cMax = max(cMax, q.f.w); cSum += asfloat(q.u.z); cLn += asfloat(q.u.w); }
+    }
+    if (coreNodes && tid.x < sub * sub) {                         // the zone's node peaks: the max over its slices' partials
+        uint v = 0u;
+        for (uint s2 = 0; s2 < ZoneSlices(); s2++) v = max(v, coreNodePart[ZonePartIndex(cx, cy, s2) * sub * sub + tid.x]);
+        gNodeMax[tid.x] = v;
     }
 #else
     uint kEnd = min(n, (gid.z + 1u) * FALD_ZONE_SLICE_PX);
@@ -595,11 +652,19 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (roundIdx == 1) {
             float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
             float2 g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
-            img = FadePost(Correct(img, bT, bE, g), img, int2((int)px, (int)py));   // fade stack: round 0's reach (t22)
+            img = FadePost(Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py))), img, int2((int)px, (int)py));   // fade stack: round 0's reach (t22)
         }
         float mc = max(img.r, max(img.g, img.b));
         float s = min(mc, white);
         if (s > driveFloor) { m = max(m, s); sum += s; }
+        if (coreOn) { cMax = max(cMax, s); cSum += mc; cLn += log(max(mc, 0.05f)); }
+        if (coreNodes) {                                          // the pixel's NEAREST fine node, inside this zone
+            const float tx = ((float)(px - originX) + 0.5f) * (float)(cols * sub) / (float)latW - 0.5f;
+            const float ty = ((float)(py - originY) + 0.5f) * (float)(rows * sub) / (float)latH - 0.5f;
+            const int nx = clamp((int)floor(tx + 0.5f) - (int)(cx * sub), 0, (int)sub - 1);
+            const int ny = clamp((int)floor(ty + 0.5f) - (int)(cy * sub), 0, (int)sub - 1);
+            InterlockedMax(gNodeMax[ny * (int)sub + nx], asuint(s));
+        }
         if (boostN != 0u) {
             if (mc > boostLitNits) lit++;
             if (mc > boostDimNits) dim++;
@@ -610,6 +675,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     gMax[tid.x] = m; gSum[tid.x] = sum;
     gLit[tid.x] = lit; gDim[tid.x] = dim;
     gPow[tid.x] = powSum;
+    if (coreOn) { gCMax[tid.x] = cMax; gCSum[tid.x] = cSum; gCLn[tid.x] = cLn; }
     GroupMemoryBarrierWithGroupSync();
     for (uint stride = 128; stride > 0; stride >>= 1) {
         if (tid.x < stride) {
@@ -618,24 +684,43 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
             gLit[tid.x] += gLit[tid.x + stride];
             gDim[tid.x] += gDim[tid.x + stride];
             gPow[tid.x] += gPow[tid.x + stride];
+            if (coreOn) {
+                gCMax[tid.x] = max(gCMax[tid.x], gCMax[tid.x + stride]);
+                gCSum[tid.x] += gCSum[tid.x + stride];
+                gCLn[tid.x] += gCLn[tid.x + stride];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
     }
-    if (tid.x == 0) {
 #ifndef FALD_ZONE_COMBINE
-        if (ZoneSlices() > 1u) {                                  // one slice of a larger zone: its partial, finished later
+    if (ZoneSlices() > 1u) {                                      // one slice of a larger zone: its partials, finished later
+        if (coreNodes && tid.x < sub * sub) coreNodePart[ZonePartIndex(cx, cy, gid.z) * sub * sub + tid.x] = gNodeMax[tid.x];
+        if (tid.x == 0) {
             ZonePart q;
-            q.f = float4(gMax[0], gSum[0], gPow[0], 0.0f);
-            q.u = uint4(gLit[0], gDim[0], 0u, 0u);
+            q.f = float4(gMax[0], gSum[0], gPow[0], coreOn ? gCMax[0] : 0.0f);
+            q.u = uint4(gLit[0], gDim[0], coreOn ? asuint(gCSum[0]) : 0u, coreOn ? asuint(gCLn[0]) : 0u);
             zonePart[ZonePartIndex(cx, cy, gid.z)] = q;
-            return;
         }
+        return;
+    }
 #endif
+    if (coreNodes && tid.x < sub * sub) {                         // the finished zone's node peaks, stored whole (an order-free
+        const uint2 node = uint2(cx * sub + tid.x % sub, cy * sub + tid.x / sub);   // max: = the prototype's cleared InterlockedMax map);
+        if (RunModePartial() == 1u && coreNodePeakOut[node] != gNodeMax[tid.x]) InterlockedOr(changeFlags[0], 2u);   // moved -> the core
+        coreNodePeakOut[node] = gNodeMax[tid.x];
+    }
+    if (tid.x == 0) {
         float stat = min(gMax[0], gSum[0] / area0);   // min(brightest lit px, sum lit nits*px^2 / A0)
         float drive = DriveOf(stat);
         // the partial path: a drive that moved flags this round (the decide pass then runs everything downstream)
         if (RunModePartial() == 1u && driveOut[uint2(cx, cy)] != drive) InterlockedOr(changeFlags[roundIdx], 1u);
         driveOut[uint2(cx, cy)] = drive;
+        if (coreOn) {                                 // P, M, lnG over ALL the zone's pixels (round 0; fald_core2.h) — on the
+            const float M = gCSum[0] / (float)n;      // partial path a value that moved flags the core (bit 1 of [0])
+            const float4 cs = float4(gCMax[0], M, gCLn[0] / (float)n, 0.0f);
+            if (RunModePartial() == 1u && any(coreStatOut[uint2(cx, cy)].xyz != cs.xyz)) InterlockedOr(changeFlags[0], 2u);
+            coreStatOut[uint2(cx, cy)] = cs;
+        }
         if (boostN != 0u) {
             // LIT-or-DIM / LIT-or-MEAN (FaldModel.active_zones): fractions of the zone's pixels (the lattice lies inside
             // the frame — FaldLatticeFits — so every zone has its zw * zh of them)
@@ -1265,7 +1350,8 @@ RWByteAddressBuffer args : register(u6);                 // the indirect argumen
 static const uint ARGS_STAR_S1 = 0, ARGS_STAR_S2 = 16, ARGS_STAT0_FULL = 32, ARGS_STAT0_FULL_COMBINE = 48, ARGS_STAT0_PART = 64,
                   ARGS_STAT0_PART_COMBINE = 80, ARGS_CONV0 = 96, ARGS_GAIN0 = 112, ARGS_STAT1_FULL = 128, ARGS_STAT1_FULL_COMBINE = 144,
                   ARGS_STAT1_PART = 160, ARGS_STAT1_PART_COMBINE = 176, ARGS_CONV1 = 192, ARGS_GAIN1 = 208, ARGS_PIXEL = 224,
-                  ARGS_STAR_S0_FULL = 240, ARGS_STAR_S0_FULL_COMBINE = 256;
+                  ARGS_STAR_S0_FULL = 240, ARGS_STAR_S0_FULL_COMBINE = 256,
+                  ARGS_CORE_LATTICE = 272, ARGS_CORE_FINE0 = 288, ARGS_CORE_FINE1 = 304;   // the always-on core (fald_core2.h)
 
 [numthreads(1, 1, 1)]
 void main() {
@@ -1308,20 +1394,27 @@ void main() {
         args.Store3(ARGS_STAT0_PART_COMBINE, star ? none : zonesPartC);
         return;
     }
+    // flag0's bit 1 (2u) = a zone's CORE statistics / node peaks moved (fald_core2.h, round 3): the correction changes with
+    // no drive moving — the core's lattice passes, the round-1 sweep in full and the pixel pass run; the convolution and
+    // the gain (pure functions of the drive maps) only when a drive / zone flag / LED-lag map did (the other bits). With
+    // the core off bit 1 is never set and drv == any: the arguments of 2026-10-22.
+    uint drv0 = flagS | (flag0 & ~2u) | flagF, any0 = drv0 | (flag0 & 2u);
     if (roundIdx == 0u) {                                                // after round 0's sweep (+ LED lag)
-        bool c = (flagS | flag0 | flagF) != 0u;
-        args.Store3(ARGS_CONV0, c ? conv : none);
-        args.Store3(ARGS_GAIN0, c ? fine : none);
-        args.Store3(ARGS_STAT1_FULL, c ? zonesFull : none);
-        args.Store3(ARGS_STAT1_FULL_COMBINE, c ? zonesFullC : none);
-        args.Store3(ARGS_STAT1_PART, c ? none : zonesPart);
-        args.Store3(ARGS_STAT1_PART_COMBINE, c ? none : zonesPartC);
+        args.Store3(ARGS_CONV0, drv0 != 0u ? conv : none);
+        args.Store3(ARGS_GAIN0, drv0 != 0u ? fine : none);
+        args.Store3(ARGS_CORE_LATTICE, any0 != 0u ? lattice : none);     // the core's Z1 / Z2 (stateless: from this frame's stats)
+        args.Store3(ARGS_CORE_FINE0, any0 != 0u ? fine : none);          // ... and its fine passes of round 0 (the gain or the stats moved)
+        args.Store3(ARGS_STAT1_FULL, any0 != 0u ? zonesFull : none);
+        args.Store3(ARGS_STAT1_FULL_COMBINE, any0 != 0u ? zonesFullC : none);
+        args.Store3(ARGS_STAT1_PART, any0 != 0u ? none : zonesPart);
+        args.Store3(ARGS_STAT1_PART_COMBINE, any0 != 0u ? none : zonesPartC);
         return;
     }
-    bool c1 = (flagS | flag0 | flag1 | flagF) != 0u;                     // after round 1's sweep (+ LED lag)
-    args.Store3(ARGS_CONV1, c1 ? conv : none);
-    args.Store3(ARGS_GAIN1, c1 ? fine : none);
-    args.Store4(ARGS_PIXEL, uint4(3u, c1 ? 1u : 0u, 0u, 0u));           // DrawInstancedIndirect: the fullscreen triangle or nothing
+    uint drv1 = drv0 | flag1, any1 = any0 | flag1;                       // after round 1's sweep (+ LED lag)
+    args.Store3(ARGS_CONV1, drv1 != 0u ? conv : none);
+    args.Store3(ARGS_GAIN1, drv1 != 0u ? fine : none);
+    args.Store3(ARGS_CORE_FINE1, any1 != 0u ? fine : none);              // the core's fine passes of round 1
+    args.Store4(ARGS_PIXEL, uint4(3u, any1 != 0u ? 1u : 0u, 0u, 0u));   // DrawInstancedIndirect: the fullscreen triangle or nothing
     changeFlags[0] = 0u; changeFlags[1] = 0u; changeFlags[2] = 0u; changeFlags[3] = 0u;
 }
 )";
@@ -1484,7 +1577,7 @@ float4 main(PS_INPUT i) : SV_Target {
         float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? t1 : t0) : abs(t1 - t0);
         return float4(PanelNitsToScRGB(min(shown * 100.0f, white)), 1.0f);   // x100 nits per nit
     }
-    float3 req = FadePost(Correct(img, bT, bE, gain), img, px);   // fade stack: round 1's reach (t22)
+    float3 req = FadePost(Correct(img, bT, bE, CoreGain(gain, float2(px))), img, px);   // fade stack: round 1's reach (t22); core round 2 (fald_core2.h)
     return float4(PanelNitsToScRGB(req), src.a);
 }
 )";

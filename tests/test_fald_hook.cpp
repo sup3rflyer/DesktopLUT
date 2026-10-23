@@ -19,6 +19,7 @@
 #include "../dwm_hook/hook_fald.h"
 #include "../shared/fald_fade.h"
 #include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride (the held-run case)
+#include "../shared/fald_core_mode.h"       // the always-on core's modes (the change-driven case runs C and KC3)
 
 #include <windows.h>
 #include <d3d11.h>
@@ -158,6 +159,7 @@ struct HookMonitor {
     // The frame as the LUT / tone-map pass would leave it in the intermediate (null = the clean copy itself, no pass): on
     // a partial present its rects go in (or the whole of it with intermediateWhole), on a full one the whole of it.
     const std::vector<unsigned char>* intermediateFrame = nullptr;
+    unsigned int coreMode = 0;   // the always-on core's switch (faldFlags bits 16-17; shared/fald_core2.h): 0 C, 1 KC2c, 2 KC3
     // rects: this present's dirty rects (the frame already edited inside them); null = a full-frame rect (new content) or none
     Result Present(bool newContent, bool readCB, const std::vector<RECT>* rects = nullptr) {
         Result r;
@@ -174,7 +176,7 @@ struct HookMonitor {
         if (!m) { r.err = "FaldAcquire: no layer"; return r; }
 #ifdef FALD_RUN_HAS_FRAME_KEY
         // the governor forced on (faldFlags bit 10): WARP is a software adapter, which it would never start the fade on
-        FaldSetLiveSettings(m, 0, 0, star, tuning, fadeWanted, 0, 0, forceFade);
+        FaldSetLiveSettings(m, 0, 0, star, tuning, fadeWanted, 0, 0, forceFade, false, coreMode);
 #else
         FaldSetLiveSettings(m, 0, 0, star, nullptr, true);
 #endif
@@ -522,6 +524,8 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
         { { 300, 300, 500, 500 }, 0x0000, "the white patch to black" },
         { { 2000, 1000, 2002, 1002 }, 0x3C00, "a 2 x 2 white speck" },
     };
+    // the always-on core (shared/fald_core_mode.h): C, and KC3 (the default) whose stateless fields the path reuses
+    for (unsigned int coreMode : { FALD_CORE_MODE_C, FALD_CORE_MODE_KC3 })
     for (int star = 0; star < 2; star++) {
         std::vector<std::vector<unsigned char>> outs[2];
         int partialPresents = 0;
@@ -533,6 +537,7 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
             REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
             HookMonitor hm(w, 3840, 2160, true, star != 0);
             hm.fadeWanted = false;
+            hm.coreMode = coreMode;
             REQUIRE(hm.Load(cells + "/n7_lamp.rgba16f"));
             HookMonitor::Result r;
             for (int i = 0; i < 3; i++) { r = hm.Present(true, false); if (r.ran) break; }   // primed on the first full present
@@ -552,8 +557,8 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
         }
         REQUIRE(outs[0].size() == outs[1].size());
         for (size_t i = 0; i < outs[0].size(); i++)
-            CHECK_MESSAGE(outs[0][i] == outs[1][i], "star " << star << ": present " << i << " differs between the full and the change-driven path");
-        CHECK_MESSAGE(partialPresents == (int)(sizeof(steps) / sizeof(steps[0])), "star " << star << ": every present after the first should be partial (" << partialPresents << ")");
+            CHECK_MESSAGE(outs[0][i] == outs[1][i], "core mode " << coreMode << " star " << star << ": present " << i << " differs between the full and the change-driven path");
+        CHECK_MESSAGE(partialPresents == (int)(sizeof(steps) / sizeof(steps[0])), "core mode " << coreMode << " star " << star << ": every present after the first should be partial (" << partialPresents << ")");
     }
 }
 
@@ -743,6 +748,7 @@ struct OverlayClockRef {
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = kClockPeriodMs;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
         fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = true;
+        fs.coreMode = FALD_CORE_MODE_C;   // the overlay reference runs C, as the hook harness's monitors do (coreMode 0)
         fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockParity = -1; fs.clockClosure = FALD_CLOCK_CLOSURE_DEFAULT;
         if (!FaldEnsureResources(&ctx, fs)) return;
         D3D11_TEXTURE2D_DESC td = {};
@@ -997,4 +1003,52 @@ TEST_CASE("FALD hook: the frame-changed word (the dynamic peak) keeps the change
     MESSAGE("the dynamic peak: " << partialWithWord << " of " << n << " presents partial with the word, exact on all; the whole frame redone on "
             << movedSteps << " of them by the GPU's own decision");
 }
+// The always-on core round 2 — PROTOTYPE (shared/fald_core2.h; faldFlags bit 16): the hook's layer with the core on equals
+// the overlay's, BYTE FOR BYTE, on the frames of DLC tests/test_fald_core2_warp.py (FALD_TEST_CORE2_DIR: panel.bin,
+// fNN.rgba16f and the overlay's dumps dNN/fald_out.rgba16f from tests/test_fald_core2.cpp's case, run first). Both advance the
+// zone IIR by one refresh per run (g_faldCore2TestRefreshes); the flank fade and the starfield are off.
+#include "../shared/fald_core2.h"
+TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overlay's, frame for frame (WARP; FALD_TEST_CORE2_DIR)") {
+    const std::string dir = HookEnv("FALD_TEST_CORE2_DIR");
+    if (dir.empty()) return;
+    std::ifstream probe(dir + "/d00/fald_out.rgba16f", std::ios::binary);
+    if (!probe) return;                                    // the overlay's case has not run on this directory
+    probe.close();
+    HookWarp w;
+    REQUIRE(w.ok);
+    REQUIRE(FaldCore2ShadersReady());
+    const std::wstring panel = std::wstring(dir.begin(), dir.end()) + L"\\panel.bin";
+    Staged staged(panel, true);
+    REQUIRE(staged.ok);
+    REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+    HookMonitor hm(w, 960, 540, true, false);
+    hm.fadeWanted = false;
+    hm.forceFade = false;
+    {
+        char mv[8] = {};
+        hm.coreMode = (GetEnvironmentVariableA("FALD_TEST_CORE2_MODE", mv, sizeof(mv)) > 0 && mv[0] == '2') ? 2u : 1u;
+    }
+    g_faldCore2TestRefreshes = 1;
+    int compared = 0;
+    for (int run = 0; run < 100; run++) {
+        char name[64];
+        snprintf(name, sizeof(name), "/f%02d.rgba16f", run);
+        if (!hm.Load(dir + name)) break;
+        HookMonitor::Result r;
+        for (int tries = 0; tries < 50; tries++) {          // unprimed presents do not run the layer (no IIR step)
+            r = hm.Present(true, false);
+            if (r.ran || r.err != "unprimed") break;
+        }
+        REQUIRE_MESSAGE(r.ran, r.err);
+        std::vector<unsigned char> ref;
+        snprintf(name, sizeof(name), "/d%02d/fald_out.rgba16f", run);
+        REQUIRE(ReadAll(dir + name, ref));
+        const std::vector<unsigned char> got = ReadBackTex(w.dev, w.ic, hm.back);
+        CHECK_MESSAGE(got == ref, "run " << run << ": the hook's output differs from the overlay's");
+        compared++;
+    }
+    g_faldCore2TestRefreshes = 0;
+    CHECK(compared > 0);
+}
+
 #endif

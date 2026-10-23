@@ -1426,6 +1426,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     ctx.frameTimeExactMs = periodMs;
     FaldSettings& fs = ctx.hdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
+    fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
     fs.temporalMode = (unsigned int)mode; fs.clockParity = parity;
     fs.tauRiseMs = (float)tauMs; fs.tauFallMs = 0.5f * (float)tauMs; fs.delayFrames = (unsigned int)delay;
     fs.star.enabled = star;                                        // at its defaults

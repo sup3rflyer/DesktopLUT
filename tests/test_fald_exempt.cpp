@@ -322,6 +322,7 @@ struct OverlayWarp {
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
         fs.enabled = true; fs.paramsPath = panel; fs.debugMode = view;
+        fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
         if (!FaldEnsureResources(&ctx, fs)) { FaldReleaseResources(&ctx); return out; }
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = kW; td.Height = kH; td.MipLevels = 1; td.ArraySize = 1;

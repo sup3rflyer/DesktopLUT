@@ -307,6 +307,7 @@ std::vector<uint8_t> RunOdd(GovWarp& w, const OddCell& c, bool fade, bool force,
     ctx->swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx->frameTimeExactMs = 16.667f;
     FaldSettings& fs = ctx->hdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = std::wstring(c.dir.begin(), c.dir.end()) + L"\\odd_panel.bin"; fs.star.enabled = true;
+    fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
     fs.flankFade = fade;
     std::vector<uint8_t> out;
     if (!FaldEnsureResources(ctx, fs)) { delete ctx; return out; }

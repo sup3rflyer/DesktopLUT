@@ -16,6 +16,7 @@
 #include "../shared/fald_shader.h"
 #include "../shared/fald_fade.h"
 #include "../shared/fald_fade_shader.h"
+#include "../shared/fald_core2.h"       // the always-on core: the mode (FALD_TEST_CORE_MODE) and its test seam
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #pragma comment(lib, "dxgi.lib")
@@ -187,6 +188,10 @@ bool RunHashes(FadeWarp& w, const std::string& cellDir, const RunSpec& rs, Manif
     FaldSettings& fs = rs.hdr ? ctx.hdrColorCorrection.fald : ctx.sdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = rs.panel; fs.debugMode = rs.debug; fs.star.enabled = rs.star;
     fs.temporalMode = rs.temporal; fs.tauRiseMs = 0.0f; fs.tauFallMs = 0.0f; fs.delayFrames = rs.temporal ? 2u : 0u;
+    // the always-on core's mode: FALD_TEST_CORE_MODE, absent = 0 = C (the manifest is main's C: the switch forced to 0);
+    // the same matrix hashed with KC2c / KC3 on is the equality gate between two builds (results/fald_core_kc_2026-10-23:
+    // the integration against the prototype b443145)
+    fs.coreMode = (uint32_t)atoi(EnvStr("FALD_TEST_CORE_MODE").c_str());
     if (!FaldEnsureResources(&ctx, fs)) {
         err = ctx.fald ? ctx.fald->lastError : std::string("no resources");
         FaldReleaseResources(&ctx);
@@ -299,6 +304,10 @@ TEST_CASE("FALD fade OFF: every field and the output hash as on main (WARP; FALD
     const std::string cellDir = EnvStr("FALD_TEST_FADE_DIR");
     if (cellDir.empty()) return;
     const std::string record = EnvStr("FALD_TEST_FADE_RECORD"), ref = EnvStr("FALD_TEST_FADE_REF");
+    // with a core mode on, the core's IIR advances exactly one refresh per run whatever WARP's timing (the test seam), so
+    // two builds hash the same sequence
+    const unsigned long long savedRefreshes = g_faldCore2TestRefreshes;
+    g_faldCore2TestRefreshes = atoi(EnvStr("FALD_TEST_CORE_MODE").c_str()) > 0 ? 1ull : 0ull;
     const std::vector<Cell> cells = ReadCells(cellDir);
     REQUIRE_FALSE(cells.empty());
     FadeWarp w;
@@ -313,7 +322,8 @@ TEST_CASE("FALD fade OFF: every field and the output hash as on main (WARP; FALD
         CHECK_MESSAGE(ok, rs.id << ": " << err);
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    MESSAGE(runs.size() << " runs, " << man.size() << " hashes, " << s << " s");
+    g_faldCore2TestRefreshes = savedRefreshes;
+    MESSAGE(runs.size() << " runs, " << man.size() << " hashes, " << s << " s (core mode " << EnvStr("FALD_TEST_CORE_MODE") << ")");
     if (!record.empty()) REQUIRE(WriteManifest(record, man));
     if (!ref.empty()) {
         const std::map<std::string, std::string> want = ReadManifest(ref);
@@ -423,6 +433,7 @@ bool RunOn(FadeWarp& w, const std::string& cellDir, const std::string& outDir, c
     ctx.frameTimeExactMs = 16.667f;
     FaldSettings& fs = rs.hdr ? ctx.hdrColorCorrection.fald : ctx.sdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = rs.panel; fs.star.enabled = rs.star; fs.flankFade = rs.fade;
+    fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: the ON lists are main's C (the switch forced to 0)
     if (!FaldEnsureResources(&ctx, fs)) { err = ctx.fald ? ctx.fald->lastError : std::string("no resources"); FaldReleaseResources(&ctx); return false; }
     D3D11_TEXTURE2D_DESC td = {};
     td.Width = (UINT)rs.w; td.Height = (UINT)rs.h; td.MipLevels = 1; td.ArraySize = 1;

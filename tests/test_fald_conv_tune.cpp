@@ -164,6 +164,7 @@ struct CtLayer {
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 16.667f;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
         fs.enabled = true; fs.paramsPath = panel;
+        fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
         if (!FaldEnsureResources(&ctx, fs)) return;
         D3D11_TEXTURE2D_DESC td = {};
         td.Width = (UINT)fw; td.Height = (UINT)fh; td.MipLevels = 1; td.ArraySize = 1;

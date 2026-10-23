@@ -255,6 +255,7 @@ bool RunLayer(Warp& w, const std::wstring& panel, bool hdr, int width, int heigh
     ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
     FaldSettings& fs = hdr ? ctx.hdrColorCorrection.fald : ctx.sdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = panel; fs.debugMode = debugMode; fs.star.enabled = star;
+    fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
     if (!FaldEnsureResources(&ctx, fs)) {
         lr.error = ctx.fald ? ctx.fald->lastError : std::string("no resources");
         FaldReleaseResources(&ctx);
