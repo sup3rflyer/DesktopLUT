@@ -4,10 +4,12 @@
 // (DLC results/fald_principled_2026-10-22/RESULT_LIVE.md; FALD off / C / KC3: the flicker is the panel's own, C's dark-band
 // artefact in 5 of 12 clips, KC3's in none, real clips identical) made KC3 the default for a few hours; the colorimeter FILL
 // test the same day (DLC results/fald_fill_gt_2026-10-23: RMS vs the target at neutral levels C 1.41 %, KC3 4.57 %, native
-// 5.20 %) showed KC3's alpha removes real correction, so THE DEFAULT IS C again — byte-identical to main / core-speed — and
-// KC3 / KC2c are test modes for A/B checks (the pipe runtime.fald_core_mode, the INI key <mode>_FaldCoreModeTest; no GUI
-// option). KC3's ring removal is still wanted: KC5 (C's fill + KC3's deficit) is being designed on fald/principled and lands
-// here as MODE 4 (mode 3 stays KC4's); both are reserved below so the numbering is fixed before their port deltas arrive.
+// 5.20 %) showed KC3 keeps less of C's fill near bright objects. The owner chose KC3 as the DEFAULT on main anyway (2026-10-23,
+// after the fill result: the dark-band removal is worth it until KC5; the C + flank fade snapshot
+// snapshot/2026-10-22-fade-optimized is the comparison build). C and KC2c are test modes for A/B checks (the pipe
+// runtime.fald_core_mode, the INI key <mode>_FaldCoreModeTest=0 / 1; no GUI option). KC5 (C's fill + KC3's deficit) is being
+// designed on fald/principled and lands here as MODE 4 (mode 3 stays KC4's); both are reserved below so the numbering is
+// fixed before their port deltas arrive.
 #pragma once
 #include <cstdint>
 
@@ -36,9 +38,9 @@ constexpr uint32_t FALD_CORE_MODE_MAX = FALD_CORE_MODE_COUNT - 1u;
 constexpr uint32_t FALD_CORE_MODE_LIMIT = 15u;         // the hook's flag word holds four bits (dwm_hook_config.h DWM_HOOK_FALD_CORE_MASK)
 static_assert(FALD_CORE_MODE_MAX <= FALD_CORE_MODE_LIMIT, "the hook's core-mode field (four bits) cannot carry this many modes");
 
-// THE DEFAULT (the one line to flip): what a FaldSettings is born with and what an INI without the key loads. C since the
-// 2026-10-23 fill test (above); KC3 was the default from ~09:50 to ~13:00 that day and never shipped.
-constexpr uint32_t FALD_CORE_MODE_DEFAULT = FALD_CORE_MODE_C;
+// THE DEFAULT (the one line to flip): what a FaldSettings is born with and what an INI without the key loads. KC3 (the
+// owner, 2026-10-23, merged to main); C was the default on fald/core-kc for the few hours between the fill test and that call.
+constexpr uint32_t FALD_CORE_MODE_DEFAULT = FALD_CORE_MODE_KC3;
 static_assert(FALD_CORE_MODE_DEFAULT <= FALD_CORE_MODE_MAX && !FALD_CORE_MODES[FALD_CORE_MODE_DEFAULT].reserved, "the default must be a mode of the table");
 
 // A mode the table defines (not reserved): what the IPC and the INI accept; anything else runs as C.

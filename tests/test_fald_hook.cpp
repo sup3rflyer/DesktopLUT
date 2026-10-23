@@ -524,7 +524,7 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
         { { 300, 300, 500, 500 }, 0x0000, "the white patch to black" },
         { { 2000, 1000, 2002, 1002 }, 0x3C00, "a 2 x 2 white speck" },
     };
-    // the always-on core (shared/fald_core_mode.h): C (the default), and KC3 whose stateless fields the path reuses
+    // the always-on core (shared/fald_core_mode.h): C, and KC3 (the default) whose stateless fields the path reuses
     for (unsigned int coreMode : { FALD_CORE_MODE_C, FALD_CORE_MODE_KC3 })
     for (int star = 0; star < 2; star++) {
         std::vector<std::vector<unsigned char>> outs[2];

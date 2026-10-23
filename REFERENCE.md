@@ -563,13 +563,14 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   so later starts begin on it. Without timestamp queries the measured policy stands (2 sub-offsets from 2048 zones, else
   1). The decision is logged (`conv auto-tune: S=1 .. us, S=2 .. us, S=4 .. us, S=8 .. us -> S=k`); `state.get
   fald_core_governor` reports `conv_so` (in use) and `conv_tune` (`policy` / `cached` / `tuning` / `tuned`).
-- **The always-on core's rule** (`shared/fald_core_mode.h`): C by default — the layer as it was. Two test modes exist for
-  A/B checks: `<mode>_FaldCoreModeTest=2` in a display's section (read at start, never written; absent = the default) runs
-  KC3 — alpha (the near-field brightening shrunk at dark zone levels) + the fine-grid sliding-window deficit (the soft knee's
-  ring edge removed), no temporal state, so the change-driven path reuses its fields; `=1` KC2c (round 2: the zone-level
-  deficit with a zone IIR — always the full path). The 2026-10-23 colorimeter fill test showed KC3's alpha removes real
-  correction (RMS vs the target at neutral levels C 1.41 %, KC3 4.57 %), so KC3 is not the default; its ring removal returns
-  as KC5 (C's fill + KC3's deficit, mode 4) when it passes. The pipe's `runtime.fald_core_mode {monitor, mode, core}`
+- **The always-on core's rule** (`shared/fald_core_mode.h`): KC3 by default — alpha (the near-field brightening shrunk at
+  dark zone levels) + the fine-grid sliding-window deficit (the soft knee's ring edge removed), no temporal state, so the
+  change-driven path reuses its fields. It removes the layer's dark band beside bright objects (the owner's live blind
+  tests); the 2026-10-23 colorimeter fill test showed it keeps less of the fill beside bright objects than C (RMS vs the
+  target at neutral levels C 1.41 %, KC3 4.57 %), which KC5 (C's fill + KC3's deficit, mode 4) is meant to restore. Test
+  modes for A/B checks: `<mode>_FaldCoreModeTest=0` in a display's section (read at start, never written; absent = the
+  default) runs C, the layer as it was; `=1` KC2c (round 2: the zone-level deficit with a zone IIR — always the full
+  path). The pipe's `runtime.fald_core_mode {monitor, mode, core}`
   switches at runtime (never saved); `state.get` reports `fald_core_mode` + `fald_core_mode_name` per monitor and mode. No
   GUI control.
 
