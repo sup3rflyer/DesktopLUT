@@ -145,7 +145,7 @@ struct HookMonitor {
                     unsigned int govState = 0; };
     bool forceFade = true;   // the governor forced on (false: it decides — on WARP that is "weak GPU": never on)
     bool fadeWanted = true;  // the flank fade setting (faldFlags bit 8)
-    bool core2 = false;      // the always-on core round 2 prototype (faldFlags bit 16)
+    unsigned int coreMode = 0;   // the core prototype's test switch (faldFlags bits 16-17)
     Result Present(bool newContent, bool readCB) {
         Result r;
         if (newContent) w.ic->UpdateSubresource(back, 0, nullptr, frame.data(), W * 8u, 0);
@@ -153,7 +153,7 @@ struct HookMonitor {
         if (!m) { r.err = "FaldAcquire: no layer"; return r; }
 #ifdef FALD_RUN_HAS_FRAME_KEY
         // the governor forced on (faldFlags bit 10): WARP is a software adapter, which it would never start the fade on
-        FaldSetLiveSettings(m, 0, 0, star, nullptr, fadeWanted, 0, 0, forceFade, core2);
+        FaldSetLiveSettings(m, 0, 0, star, nullptr, fadeWanted, 0, 0, forceFade, coreMode);
 #else
         FaldSetLiveSettings(m, 0, 0, star, nullptr, true);
 #endif
@@ -521,7 +521,10 @@ TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overla
     HookMonitor hm(w, 960, 540, true, false);
     hm.fadeWanted = false;
     hm.forceFade = false;
-    hm.core2 = true;
+    {
+        char mv[8] = {};
+        hm.coreMode = (GetEnvironmentVariableA("FALD_TEST_CORE2_MODE", mv, sizeof(mv)) > 0 && mv[0] == '2') ? 2u : 1u;
+    }
     g_faldCore2TestRefreshes = 1;
     int compared = 0;
     for (int run = 0; run < 100; run++) {

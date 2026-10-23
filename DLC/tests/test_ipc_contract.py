@@ -123,6 +123,7 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
         ("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.8, "even_reach": 6}),
         ("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": True}),
+        ("runtime.fald_core_mode", {"monitor": 0, "mode": "SDR", "core": 2}),
         ("layers.set", {**mm, "fald": True}),
         ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),

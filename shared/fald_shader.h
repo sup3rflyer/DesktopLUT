@@ -521,14 +521,21 @@ Texture2D<float4> coreStatTex  : register(t40);   // P, M, lnG (stat round 0)
 Texture2D<float4> coreZoneTex  : register(t41);   // alpha_z, k, ln P
 Texture2D<float2> coreFieldTex : register(t42);   // alpha_z, D (this round)
 Buffer<uint>      coreCutSum   : register(t43);   // [0]: sum over zones of |d ln max(M, 0.05)| (fixed point)
+Texture2D<float>  coreNodeDTex : register(t48);   // round 3 (coreFlags bit 3): the deficit D on the FINE grid
 // Correct's gain at both call sites (fald_core2.h): brightening shrunk by alpha, minus the deficit D; darkening untouched.
 // With coreFlags 0 (the core off, b3 bound with zeros or not at all) the input is returned unchanged.
 float2 CoreGain(float2 g, float2 px) {
     if ((coreFlags & 3u) == 0u || !(g.x > 1.0f)) return g;
-    float2 f = coreFieldTex.SampleLevel(linearClamp, FineUV(px), 0);
     float lg = log(g.x);
-    if ((coreFlags & 1u) != 0u) lg *= saturate(f.x);
-    if ((coreFlags & 2u) != 0u) lg = max(lg - max(f.y, 0.0f), 0.0f);
+    if ((coreFlags & 8u) != 0u) {             // round 3 (KC3): alpha from the zone field, D from the fine-grid field
+        const float2 uv = FineUV(px);
+        if ((coreFlags & 1u) != 0u) lg *= saturate(coreZoneTex.SampleLevel(linearClamp, uv, 0).x);
+        if ((coreFlags & 2u) != 0u) lg = max(lg - max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f), 0.0f);
+    } else {                                  // round 2 (KC2c): both from the zone field
+        float2 f = coreFieldTex.SampleLevel(linearClamp, FineUV(px), 0);
+        if ((coreFlags & 1u) != 0u) lg *= saturate(f.x);
+        if ((coreFlags & 2u) != 0u) lg = max(lg - max(f.y, 0.0f), 0.0f);
+    }
     g.x = exp(lg);
     return g;
 }
@@ -552,7 +559,9 @@ RWTexture2D<float> activeOut : register(u1);
 RWStructuredBuffer<ZonePart> zonePart : register(u2);   // slice partials (zones of more than one slice only)
 RWTexture2D<float4> coreStatOut : register(u3);          // core round 2 (fald_core2.h), round 0 only: P, M, lnG
 RWBuffer<uint> coreCutAcc : register(u4);                // [0] += |ln max(M, 0.05) - the previous run's| (fixed point)
+RWTexture2D<uint> coreNodePeakOut : register(u5);        // round 3: per FINE node the peak min(mc, white) of its nearest px
 Texture2D<float> coreLzPrevT : register(t45);           // the previous run's ln max(M, 0.05) (core Z1)
+groupshared uint gNodeMax[256];                          // round 3: this zone's S x S node peaks (asuint, S <= 16)
 groupshared float gMax[256];
 groupshared float gSum[256];
 groupshared uint gLit[256];
@@ -572,7 +581,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
     uint lit = 0, dim = 0;
     float powSum = 0.0f;
     const bool coreOn = roundIdx == 0 && (coreFlags & 3u) != 0u;   // core round 2: the source's zone statistics
+    const bool coreNodes = coreOn && (coreFlags & 8u) != 0u && sub <= 16u;   // round 3: the per-node peaks too
     float cMax = 0.0f, cSum = 0.0f, cLn = 0.0f;
+    if (coreNodes) { gNodeMax[tid.x] = 0u; }
+    GroupMemoryBarrierWithGroupSync();
 #ifdef FALD_ZONE_COMBINE
     for (uint s = tid.x; s < ZoneSlices(); s += 256) {            // the zone's slice partials, in order
         ZonePart q = zonePart[ZonePartIndex(cx, cy, s)];
@@ -596,6 +608,13 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         float s = min(mc, white);
         if (s > driveFloor) { m = max(m, s); sum += s; }
         if (coreOn) { cMax = max(cMax, s); cSum += mc; cLn += log(max(mc, 0.05f)); }
+        if (coreNodes) {                                          // the pixel's NEAREST fine node, inside this zone
+            const float tx = ((float)(px - originX) + 0.5f) * (float)(cols * sub) / (float)latW - 0.5f;
+            const float ty = ((float)(py - originY) + 0.5f) * (float)(rows * sub) / (float)latH - 0.5f;
+            const int nx = clamp((int)floor(tx + 0.5f) - (int)(cx * sub), 0, (int)sub - 1);
+            const int ny = clamp((int)floor(ty + 0.5f) - (int)(cy * sub), 0, (int)sub - 1);
+            InterlockedMax(gNodeMax[ny * (int)sub + nx], asuint(s));
+        }
         if (boostN != 0u) {
             if (mc > boostLitNits) lit++;
             if (mc > boostDimNits) dim++;
@@ -623,6 +642,10 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         }
         GroupMemoryBarrierWithGroupSync();
     }
+#ifndef FALD_ZONE_COMBINE
+    if (coreNodes && tid.x < sub * sub && gNodeMax[tid.x] != 0u)      // this group's node peaks into the frame's fine map
+        InterlockedMax(coreNodePeakOut[uint2(cx * sub + tid.x % sub, cy * sub + tid.x / sub)], gNodeMax[tid.x]);
+#endif
     if (tid.x == 0) {
 #ifndef FALD_ZONE_COMBINE
         if (ZoneSlices() > 1u) {                                  // one slice of a larger zone: its partial, finished later

@@ -615,9 +615,11 @@ struct FaldSettings {
     // passed along the content's motion. Default OFF = today's layer bit for bit (until the owner's hardware gates pass;
     // DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md section 6). An INI without the key loads OFF.
     bool flankFade = false;
-    // The always-on core, round 2 — PROTOTYPE (branch fald/principled; shared/fald_core2.h): C + alpha + the lattice
-    // deficit + a zone IIR (KC2c). INI <mode>_FaldCore2 (absent = OFF = today's layer bit for bit). No GUI control yet.
-    bool core2 = false;
+    // The always-on core — PROTOTYPE, a TEST-ONLY runtime switch (branch fald/principled; shared/fald_core2.h): 0 = C (today's
+    // layer bit for bit), 1 = KC2c (round 2: alpha + the zone deficit + a zone IIR), 2 = KC3 (round 3: alpha + the fine-grid
+    // deficit). Read from INI <mode>_FaldCoreModeTest (absent = 0), set at runtime by the pipe (runtime.fald_core_mode);
+    // NEVER saved. No GUI control.
+    uint32_t coreMode = 0;
     // Item L (the 1-3-nit zone-floor extension, round 12): RESERVED. Persisted (<mode>_FaldLowExt) so the setting has its
     // home, but nothing reads it — the shader word (fadeFlags bit 1) is never set in this build.
     bool lowExt = false;

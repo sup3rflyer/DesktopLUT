@@ -25,6 +25,12 @@
 #include <vector>
 
 namespace {
+int CoreEnvMode() {                      // FALD_TEST_CORE2_MODE: 1 = KC2c (default), 2 = KC3
+    char* v = nullptr; size_t n = 0;
+    if (_dupenv_s(&v, &n, "FALD_TEST_CORE2_MODE") != 0 || !v) return 1;
+    const int m = atoi(v); free(v);
+    return (m == 2) ? 2 : 1;
+}
 std::wstring CoreEnvDir(const char* name) {
     char* v = nullptr; size_t n = 0;
     if (_dupenv_s(&v, &n, name) != 0 || !v) return std::wstring();
@@ -72,7 +78,7 @@ TEST_CASE("FALD core round 2 on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DI
     FaldSettings& fs = ctx.hdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
     fs.temporalMode = FALD_TEMPORAL_OFF;
-    fs.core2 = true;
+    fs.coreMode = (uint32_t)CoreEnvMode();
     REQUIRE(FaldEnsureResources(&ctx, fs));
     g_faldCore2TestRefreshes = 1;                                   // k = 1 per run, whatever WARP's run time
 
@@ -123,7 +129,7 @@ TEST_CASE("FALD core round 2 on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DI
     }
     CHECK(runs > 0);
     g_faldCore2TestRefreshes = 0;
-    fs.core2 = false;                                               // off: the core's resources are released
+    fs.coreMode = 0;                                                // off (C): the core's resources are released
     ctx.faldDumpRequested.store(false);
     FaldRunPasses(&ctx, rtv, true);
     CHECK_FALSE(ctx.fald->core2On);

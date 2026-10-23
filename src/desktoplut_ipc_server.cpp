@@ -527,6 +527,7 @@ void HandleStateGet(JsonValue& result) {
                 // the frozen fade stack (runtime.fald_flank_fade) and item L (reserved: no setter, never applied)
                 l.set("fald_flank_fade", JBool(fs.flankFade));
                 l.set("fald_low_ext", JBool(fs.lowExt));
+                l.set("fald_core_mode", JNum((double)fs.coreMode));   // the core prototype's test switch (runtime.fald_core_mode)
                 {   // the fade's safety governor (shared/fald_fade_governor.h; the overlay's or the hook's report)
                     JsonValue gj = JObj();
                     FaldFadeGovReport gov;
@@ -1698,6 +1699,27 @@ void DoFaldFlankFade(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("enabled", JBool(en->b));
 }
 
+// runtime.fald_core_mode {monitor, mode, core}: the always-on core PROTOTYPE's TEST-ONLY switch (shared/fald_core2.h;
+// branch fald/principled): 0 = C (today's layer), 1 = KC2c (round 2), 2 = KC3 (round 3). Runtime only: NEVER saved (the
+// INI test key <mode>_FaldCoreModeTest sets the start value). The live blind kit sets it per block.
+void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
+    int mon; bool isHDR;
+    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
+    const JsonValue* cm = p.find("core");
+    if (!cm) { error = "missing parameter: core"; return; }
+    if (cm->type != JsonValue::Num) { error = "core must be a number"; return; }
+    const double v = cm->num;
+    if (!(v == 0.0 || v == 1.0 || v == 2.0)) { error = "core must be 0, 1 or 2"; return; }
+    {
+        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
+        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
+        fs.coreMode = (uint32_t)v;
+    }
+    FaldPropagate(mon, isHDR);                     // no SaveSettings: a test switch
+    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
+    result.set("core", JNum(v));
+}
+
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -2488,6 +2510,7 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_temporal") DoFaldTemporal(params, result, error);
         else if (m == "runtime.fald_starfield") DoFaldStarfield(params, result, error);
         else if (m == "runtime.fald_flank_fade") DoFaldFlankFade(params, result, error);
+        else if (m == "runtime.fald_core_mode") DoFaldCoreMode(params, result, error);
         else if (m == "hook.set_routing") DoHookSetRouting(params, result, error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(params, result, error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(params, result, error);

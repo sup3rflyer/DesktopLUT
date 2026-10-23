@@ -43,7 +43,15 @@
 constexpr uint32_t FALD_CORE2_ALPHA = 1u;
 constexpr uint32_t FALD_CORE2_DEFICIT = 2u;
 constexpr uint32_t FALD_CORE2_SOFT = 4u;               // reserved (KC2), never set by the prototype's hosts
+constexpr uint32_t FALD_CORE2_FINE = 8u;               // ROUND 3: the fine-grid (sliding-window) deficit, no zone IIR
 constexpr uint32_t FALD_CORE2_KC2C = FALD_CORE2_ALPHA | FALD_CORE2_DEFICIT;
+constexpr uint32_t FALD_CORE2_KC3 = FALD_CORE2_ALPHA | FALD_CORE2_DEFICIT | FALD_CORE2_FINE;
+// The test-only runtime switch (FaldSettings::coreMode; INI <mode>_FaldCoreModeTest, pipe runtime.fald_core_mode, hook
+// faldFlags bits 16-17): 0 = C (the core off: today's layer bit for bit), 1 = KC2c (round 2), 2 = KC3 (round 3).
+constexpr uint32_t FALD_CORE_MODE_C = 0u, FALD_CORE_MODE_KC2C = 1u, FALD_CORE_MODE_KC3 = 2u, FALD_CORE_MODE_MAX = 2u;
+inline uint32_t FaldCore2FlagsOfMode(uint32_t mode) {
+    return mode == FALD_CORE_MODE_KC2C ? FALD_CORE2_KC2C : (mode == FALD_CORE_MODE_KC3 ? FALD_CORE2_KC3 : 0u);
+}
 constexpr float FALD_CORE2_A2 = 0.35f;                // the zone IIR's blend per 2-refresh content frame
 constexpr float FALD_CORE2_CUT = 0.25f;               // the cut: mean over zones of |d ln max(M, 0.05)|
 constexpr unsigned int FALD_CORE2_FIXED = 16384u;     // the cut sum's fixed point (2^14 per unit)
@@ -68,7 +76,7 @@ bool FaldCore2ShadersReady();
 struct FaldCore2;                                      // per monitor: the zone textures and the IIR state
 FaldCore2* FaldCore2Create();
 void FaldCore2Destroy(FaldCore2* c);                   // null ok
-bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigned int rows);   // (re)build for a lattice
+bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigned int rows, unsigned int sub);   // a lattice
 void FaldCore2Release(FaldCore2* c);
 void FaldCore2Invalidate(FaldCore2* c);                // the next run resets the IIR (layer idle, resume, mode change)
 unsigned long long FaldCore2VramBytes(const FaldCore2* c);
@@ -77,12 +85,14 @@ unsigned long long FaldCore2VramBytes(const FaldCore2* c);
 //   BeginRun -> stat round 0 with StatViews bound (u3, u4) and the lz SRV on t45 -> RunZone -> RunGain(0) ->
 //   RunDeficit(0) -> stat round 1 (Bind: b3 + t42) -> RunGain(1) -> RunDeficit(1) -> pixel pass (Bind) -> EndRun.
 void FaldCore2BeginRun(FaldCore2* c, ID3D11DeviceContext* ctx, uint32_t flags, float coreA);
-void FaldCore2StatViews(FaldCore2* c, ID3D11UnorderedAccessView* uav[2], ID3D11ShaderResourceView** lzSrv);
+void FaldCore2StatViews(FaldCore2* c, ID3D11UnorderedAccessView* uav[3], ID3D11ShaderResourceView** lzSrv);   // u3, u4, u5
 void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB);
 void FaldCore2RunDeficit(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11ShaderResourceView* gainB,
                          unsigned int round);
 ID3D11Buffer* FaldCore2CB(const FaldCore2* c);         // b3 (with flags 0 when the core does not run: CoreGain = identity)
 ID3D11ShaderResourceView* FaldCore2FieldSRV(const FaldCore2* c);   // t42 (alpha_z, D of the last RunDeficit)
+ID3D11ShaderResourceView* FaldCore2ZoneSRV(const FaldCore2* c);    // t41 (alpha_z, k, ln P, rate) — round 3's alpha
+ID3D11ShaderResourceView* FaldCore2NodeDSRV(const FaldCore2* c);   // t48 the fine-grid D (round 3)
 void FaldCore2EndRun(FaldCore2* c);                    // the state is valid from now on
 
 // Dump access (zone textures, cols x rows): stat (P, M, lnG, 0), zone (alpha_z, k, ln P, 0), field (alpha_z, D),
@@ -90,6 +100,7 @@ void FaldCore2EndRun(FaldCore2* c);                    // the state is valid fro
 struct FaldCore2Debug {
     ID3D11Texture2D* stat = nullptr; ID3D11Texture2D* zone = nullptr; ID3D11Texture2D* field = nullptr;
     ID3D11Texture2D* alphaState = nullptr; ID3D11Texture2D* dState[2] = {}; unsigned int cols = 0, rows = 0;
+    ID3D11Texture2D* nodePeak = nullptr; ID3D11Texture2D* nodeD = nullptr; unsigned int sub = 0;   // round 3 (fine grid)
     bool reset = false;                                // the last BeginRun's reset request
     float coreA = 0.0f; uint32_t flags = 0;
 };

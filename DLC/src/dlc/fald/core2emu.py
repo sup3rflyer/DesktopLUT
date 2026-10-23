@@ -26,8 +26,9 @@ import numpy as np
 from .gpuemu import KNEE_CAP_TRUST, Emu, clamp_star, trunc_half
 from .starfield import StarfieldParams
 
-CORE_ALPHA, CORE_DEFICIT, CORE_SOFT = 1, 2, 4
+CORE_ALPHA, CORE_DEFICIT, CORE_SOFT, CORE_FINE = 1, 2, 4, 8
 CORE_KC2C = CORE_ALPHA | CORE_DEFICIT
+CORE_KC3 = CORE_ALPHA | CORE_DEFICIT | CORE_FINE     # ROUND 3: the fine-grid sliding-window deficit, no zone IIR
 FIXED = 16384.0                 # the cut sum's fixed point (FALD_CORE2_FIXED)
 
 
@@ -118,7 +119,7 @@ class CoreEmu(Emu):
         if st.valid and st.lz is not None:
             q = np.floor(np.minimum(np.abs(lz - st.lz), 32.0) * FIXED + 0.5).sum()      # the shader's fixed-point sum
             cut = q / FIXED / lz.size > cp.cut
-        reset = (not st.valid) or cut
+        reset = (not st.valid) or cut or bool(self.flags & CORE_FINE)      # round 3: no zone IIR
         G = np.exp(lnG)
         raw = np.clip(cp.mu_inf * G / (G + cp.L_h) - cp.z, 0.0, 1.0)
         st.alpha = raw if (reset or st.alpha is None) else st.alpha + a * (raw - st.alpha)
@@ -158,6 +159,58 @@ class CoreEmu(Emu):
             D = np.maximum(D, max3(D) * k)
         return np.maximum(gauss_zone(D, cp.sigma), 0.0)
 
+    # ---- ROUND 3 (CORE_FINE): the fine-grid deficit (shared/fald_core2.cpp F1..F6; the study twin pcore K3sL)
+    def node_peaks(self, img):
+        """per fine node the max of min(mc, white) over the pixels whose NEAREST node it is (the stat pass, round 0)"""
+        S = self.sub
+        mc = np.minimum(img.max(axis=0), self.white)[self.oy: self.oy + self.rows * self.ch, self.ox: self.ox + self.cols * self.cw]
+        ty = (np.arange(self.rows * self.ch) + 0.5) * S / self.ch - 0.5
+        tx = (np.arange(self.cols * self.cw) + 0.5) * S / self.cw - 0.5
+        ny = np.clip(np.floor(ty + 0.5).astype(int), 0, self.rows * S - 1)
+        nx = np.clip(np.floor(tx + 0.5).astype(int), 0, self.cols * S - 1)
+        out = np.zeros((self.rows * S, self.cols * S))
+        np.maximum.at(out, (ny[:, None].repeat(mc.shape[1], 1), nx[None, :].repeat(mc.shape[0], 0)), mc)
+        return out
+
+    @staticmethod
+    def _win(a, wn, fn, axis):
+        h = wn // 2
+        pad = [(0, 0), (0, 0)]; pad[axis] = (h, h)
+        p = np.pad(a, pad, mode="edge")
+        n = a.shape[axis]
+        sl = lambda i: (slice(i, i + n), slice(None)) if axis == 0 else (slice(None), slice(i, i + n))  # noqa: E731
+        out = p[sl(0)]
+        for i in range(1, wn):
+            out = fn(out, p[sl(i)])
+        return out
+
+    def fine_deficit(self, pn, gB, cB, alpha_z, rate_z):
+        cp = self.cp
+        S = self.sub
+        wn = (S + 3) | 1
+        gp = np.maximum(np.log(np.maximum(gB.astype(np.float64), 1e-6)), 0.0)
+        if self.flags & CORE_ALPHA:
+            gp = gp * self._z2n(alpha_z)
+        cn = np.minimum(self.white * cB.astype(np.float64) / KNEE_CAP_TRUST, self.white)
+        P = self._win(self._win(pn, wn, np.maximum, 1), wn, np.maximum, 0)
+        G = self._win(self._win(gp, wn, np.maximum, 1), wn, np.maximum, 0)
+        Cm = self._win(self._win(cn, wn, np.minimum, 1), wn, np.minimum, 0)
+        d = np.where(G > 0, np.minimum(np.maximum(np.log(np.maximum(P, 1e-6)) + G - math.log(cp.kstart)
+                                                  - np.log(np.maximum(Cm, 1e-9)), 0.0), G), 0.0)
+        rate = self._z2n(rate_z) / S
+        R = 2 * S
+        for axis in (1, 0):                                   # the separable L1 cone: x, then y
+            pad = [(0, 0), (0, 0)]; pad[axis] = (R, R)
+            p = np.pad(d, pad, mode="edge")
+            n = d.shape[axis]
+            e = d.copy()
+            for k in range(1, R + 1):
+                lo = p[(slice(R - k, R - k + n), slice(None)) if axis == 0 else (slice(None), slice(R - k, R - k + n))]
+                hi = p[(slice(R + k, R + k + n), slice(None)) if axis == 0 else (slice(None), slice(R + k, R + k + n))]
+                e = np.maximum(e, np.maximum(lo, hi) * np.exp(-rate * k))
+            d = e
+        return np.maximum(gauss_zone(d, cp.sigma * S), 0.0)   # rows, then columns (the shader's order)
+
     def core_gain(self, g, alpha_px, D_px):
         up = g > 1.0
         lg = np.log(np.where(up, g, 1.0))
@@ -187,14 +240,23 @@ class CoreEmu(Emu):
         P, M, lnG = self.core_stats(img)
         alpha_z, k, lnP, reset, cut = self.core_zone(P, M, lnG, core, a)
         alpha_px = self.sample_zone(alpha_z)
+        fine = bool(self.flags & CORE_FINE)
+        if fine:
+            pn = self.node_peaks(img)
+            rate_z = 1.0 + self.cp.beta * np.maximum(grad_mag(np.log(np.maximum(M, 0.05))) - self.cp.tau, 0.0)
         boost0, zones0, active0 = self.frame_boost(img)
         dT0, dE0 = temporal.pair(d0) if temporal is not None else (d0, d0)
         bT0, bE0 = self.fields(dT0, dE0, boost0)
         _, gB0 = self.gain(bT0, bE0)
         cB0 = self.ceil_est(bE0)
-        D0 = self.core_deficit(gB0, cB0, alpha_z, k, lnP, reset, core, 0, a)
+        if fine:
+            D0 = self.fine_deficit(pn, gB0, cB0, alpha_z, rate_z)
+            D0px = self.sample(D0)
+        else:
+            D0 = self.core_deficit(gB0, cB0, alpha_z, k, lnP, reset, core, 0, a)
+            D0px = self.sample_zone(D0)
         sT, sE, g = self.sampled(bT0, bE0, gB0)
-        g = self.core_gain(g, alpha_px, self.sample_zone(D0))
+        g = self.core_gain(g, alpha_px, D0px)
         gc = self.sample(cB0.astype(np.float64)) if self.c15 else None
         cor0, _ = self.correct(img, sT, sE, g, gc)
         d1, st1 = self.stat_drive(cor0)
@@ -203,9 +265,14 @@ class CoreEmu(Emu):
         bT1, bE1 = self.fields(dT1, dE1, boost1)
         graw1, gB1 = self.gain(bT1, bE1)
         cB1 = self.ceil_est(bE1)
-        D1 = self.core_deficit(gB1, cB1, alpha_z, k, lnP, reset, core, 1, a)
+        if fine:
+            D1 = self.fine_deficit(pn, gB1, cB1, alpha_z, rate_z)
+            D1px = self.sample(D1)
+        else:
+            D1 = self.core_deficit(gB1, cB1, alpha_z, k, lnP, reset, core, 1, a)
+            D1px = self.sample_zone(D1)
         sT, sE, g = self.sampled(bT1, bE1, gB1)
-        g = self.core_gain(g, alpha_px, self.sample_zone(D1))
+        g = self.core_gain(g, alpha_px, D1px)
         gc = self.sample(cB1.astype(np.float64)) if self.c15 else None
         req, wfade = self.correct(img, sT, sE, g, gc)
         if temporal is not None:

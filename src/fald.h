@@ -142,6 +142,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     // only while the setting is on; core2On = this run applies it (b3 flags, t42 field, the round-0 statistics).
     struct FaldCore2* core2 = nullptr;
     bool core2On = false;
+    uint32_t core2Flags = 0;                 // FaldCore2FlagsOfMode(FaldSettings::coreMode) of this run (0 = C)
     bool fadeOn = false;
     bool fadeFailLogged = false;
     unsigned int fadeRetryCounter = 0;       // frames since the fade resources failed to create (retry every ~300)

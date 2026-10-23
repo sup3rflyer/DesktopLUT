@@ -48,7 +48,125 @@ void main(uint3 id : SV_DispatchThreadID) {
     float gy = (c.y == 0 || c.y == mx.y) ? (lzD - lzU) : 0.5f * (lzD - lzU);
     float k = exp(-(1.0f + coreBeta * max(sqrt(gx * gx + gy * gy) - coreTau, 0.0f)));
     float P = coreStatTex.Load(int3(c, 0)).x;
-    coreZoneOut[id.xy] = float4(saturate(a), k, log(max(P, 1e-6f)), 0.0f);
+    const float rate = 1.0f + coreBeta * max(sqrt(gx * gx + gy * gy) - coreTau, 0.0f);   // -ln k: the round-3 cone's rate
+    coreZoneOut[id.xy] = float4(saturate(a), k, log(max(P, 1e-6f)), rate);
+}
+)";
+
+// ROUND 3 (KC3; coreFlags bit 3, no zone IIR): the deficit on the FINE grid (cols * sub x rows * sub nodes), translation-
+// consistent at node scale. The zone form's worst-case combination over a SLIDING zone-sized window (W = sub + 3 nodes,
+// odd) centred on every node: d_n = [G > 0] min(max(0, ln P + G - ln 0.9 - ln C), G), P = the window's max node peak,
+// G = its max alpha-shrunk brightening, C = its min ceiling; spread by a separable L1 max-plus cone (reach 2 zones, rate =
+// the zone gate at the target node); Gaussian 0.7 zone (in nodes, rows then columns). Twin: pcore KVARIANTS["K3sL"].
+static const char* kFineHead = R"(
+float CoreZoneAt(int2 node, int ch) {      // a zone field's channel ch, bilinear at a fine node's centre (edge held)
+    float2 t = (float2(node) + 0.5f) / (float)sub - 0.5f;
+    float2 f0 = floor(t);
+    float2 fr = saturate(t - f0);
+    if (t.x < 0.0f) fr.x = 0.0f;
+    if (t.y < 0.0f) fr.y = 0.0f;
+    int2 mx = int2((int)cols - 1, (int)rows - 1);
+    int2 i0 = clamp(int2(f0), int2(0, 0), mx), i1 = clamp(int2(f0) + 1, int2(0, 0), mx);
+    float4 a00 = coreZoneTex.Load(int3(i0.x, i0.y, 0)), a10 = coreZoneTex.Load(int3(i1.x, i0.y, 0));
+    float4 a01 = coreZoneTex.Load(int3(i0.x, i1.y, 0)), a11 = coreZoneTex.Load(int3(i1.x, i1.y, 0));
+    float4 ay0 = a00 * (1.0f - fr.y) + a01 * fr.y, ay1 = a10 * (1.0f - fr.y) + a11 * fr.y;
+    float4 v = ay0 * (1.0f - fr.x) + ay1 * fr.x;
+    return ch == 0 ? v.x : (ch == 1 ? v.y : (ch == 2 ? v.z : v.w));
+}
+int2 CoreFineMax() { return int2((int)(cols * sub) - 1, (int)(rows * sub) - 1); }
+)";
+
+// F1: the window along x of (node peak, brightening, ceiling) -> u0 (RGBA32F)
+static const char* kF1 = R"(
+RWTexture2D<float4> coreF1Out : register(u0);
+Texture2D<uint> coreNodePeakT : register(t49);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int2 mx = CoreFineMax();
+    if ((int)id.x > mx.x || (int)id.y > mx.y) return;
+    const int wh = ((int)sub + 3) / 2;
+    float P = 0.0f, G = 0.0f, Cm = 3.0e38f;
+    for (int dx = -wh; dx <= wh; dx++) {
+        int2 n = int2(clamp((int)id.x + dx, 0, mx.x), (int)id.y);
+        P = max(P, asfloat(coreNodePeakT.Load(int3(n, 0))));
+        float2 g = gainTex.Load(int3(n, 0));
+        float lg = max(log(max(g.x, 1e-6f)), 0.0f);
+        if ((coreFlags & 1u) != 0u && lg > 0.0f) lg *= CoreZoneAt(n, 0);
+        G = max(G, lg);
+        Cm = min(Cm, min(white, white * g.y / FALD_KNEE_CAP_TRUST));
+    }
+    coreF1Out[id.xy] = float4(P, G, Cm, 0.0f);
+}
+)";
+
+// F2: the window along y, then d -> u0 (R32F)
+static const char* kF2 = R"(
+RWTexture2D<float> coreFdOut : register(u0);
+Texture2D<float4> coreF1T : register(t50);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int2 mx = CoreFineMax();
+    if ((int)id.x > mx.x || (int)id.y > mx.y) return;
+    const int wh = ((int)sub + 3) / 2;
+    float P = 0.0f, G = 0.0f, Cm = 3.0e38f;
+    for (int dy = -wh; dy <= wh; dy++) {
+        float4 v = coreF1T.Load(int3((int)id.x, clamp((int)id.y + dy, 0, mx.y), 0));
+        P = max(P, v.x); G = max(G, v.y); Cm = min(Cm, v.z);
+    }
+    float d = (G > 0.0f) ? min(max(log(max(P, 1e-6f)) + G - log(coreKStart) - log(max(Cm, 1e-9f)), 0.0f), G) : 0.0f;
+    coreFdOut[id.xy] = d;
+}
+)";
+
+// F3 / F4: the separable L1 max-plus cone, reach 2 zones, the rate of the target node (x pass, then y pass)
+static const char* kF3 = R"(
+RWTexture2D<float> coreConeOut : register(u0);
+Texture2D<float> coreConeIn : register(t51);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int2 mx = CoreFineMax();
+    if ((int)id.x > mx.x || (int)id.y > mx.y) return;
+    const int R = 2 * (int)sub;
+    const float rate = CoreZoneAt(int2(id.xy), 3) / (float)sub;
+    float e = coreConeIn.Load(int3(id.xy, 0));
+    for (int k = 1; k <= R; k++) {
+        const float f = exp(-rate * (float)k);
+#ifdef CORE_CONE_Y
+        e = max(e, max(coreConeIn.Load(int3((int)id.x, max((int)id.y - k, 0), 0)), coreConeIn.Load(int3((int)id.x, min((int)id.y + k, mx.y), 0))) * f);
+#else
+        e = max(e, max(coreConeIn.Load(int3(max((int)id.x - k, 0), (int)id.y, 0)), coreConeIn.Load(int3(min((int)id.x + k, mx.x), (int)id.y, 0))) * f);
+#endif
+    }
+    coreConeOut[id.xy] = e;
+}
+)";
+
+// F5 / F6: the Gaussian 0.7 zone in nodes (sigma 0.7 sub, radius int(4 sigma + 0.5), scipy's truncate 4, edge held):
+// rows (y) first, then columns (x), as the twin's TM.gauss; the second pass clamps at 0
+static const char* kF5 = R"(
+RWTexture2D<float> coreGaussOut : register(u0);
+Texture2D<float> coreGaussIn : register(t52);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int2 mx = CoreFineMax();
+    if ((int)id.x > mx.x || (int)id.y > mx.y) return;
+    const float sg = 0.7f * (float)sub;
+    const int r = (int)(4.0f * sg + 0.5f);
+    float acc = 0.0f, ws = 0.0f;
+    for (int k = -r; k <= r; k++) {
+        const float w = exp(-0.5f * (float)(k * k) / (sg * sg));
+#ifdef CORE_GAUSS_X
+        acc += w * coreGaussIn.Load(int3(clamp((int)id.x + k, 0, mx.x), (int)id.y, 0));
+#else
+        acc += w * coreGaussIn.Load(int3((int)id.x, clamp((int)id.y + k, 0, mx.y), 0));
+#endif
+        ws += w;
+    }
+#ifdef CORE_GAUSS_X
+    coreGaussOut[id.xy] = max(acc / ws, 0.0f);
+#else
+    coreGaussOut[id.xy] = acc / ws;
+#endif
 }
 )";
 
@@ -150,7 +268,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 // Shaders
 // ---------------------------------------------------------------------------------------------------------------------
 namespace {
-enum { K_Z1, K_Z2, K_D1, K_D2, K_D3, K_COUNT };
+enum { K_Z1, K_Z2, K_D1, K_D2, K_D3, K_F1, K_F2, K_F3X, K_F3Y, K_F5Y, K_F5X, K_COUNT };
 ID3D11ComputeShader* g_cs[K_COUNT] = {};
 template <typename T> void SafeRel(T*& p) { if (p) { p->Release(); p = nullptr; } }
 }
@@ -174,8 +292,11 @@ unsigned long long FaldCore2Refreshes(bool panelClock, unsigned long long clkEla
 bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err) {
     if (FaldCore2ShadersReady()) return true;
     if (!dev || !common) { if (err) *err = "no device"; return false; }
-    const char* src[K_COUNT] = { kZ1, kZ2, kD1, kD2, kD3 };
-    const char* name[K_COUNT] = { "FaldCore2Z1", "FaldCore2Z2", "FaldCore2D1", "FaldCore2D2", "FaldCore2D3" };
+    const std::string fx = std::string(kFineHead);
+    const std::string src[K_COUNT] = { kZ1, kZ2, kD1, kD2, kD3, fx + kF1, fx + kF2, fx + kF3, "#define CORE_CONE_Y 1\n" + fx + kF3,
+                                       fx + kF5, "#define CORE_GAUSS_X 1\n" + fx + kF5 };
+    const char* name[K_COUNT] = { "FaldCore2Z1", "FaldCore2Z2", "FaldCore2D1", "FaldCore2D2", "FaldCore2D3", "FaldCore3F1",
+                                  "FaldCore3F2", "FaldCore3ConeX", "FaldCore3ConeY", "FaldCore3GaussY", "FaldCore3GaussX" };
     const std::string head = std::string(common);
     for (int k = 0; k < K_COUNT; k++) {
         const std::string s = head + src[k];
@@ -202,8 +323,9 @@ bool FaldCore2ShadersReady() { for (auto* c : g_cs) if (!c) return false; return
 // ---------------------------------------------------------------------------------------------------------------------
 struct Tex { ID3D11Texture2D* t = nullptr; ID3D11UnorderedAccessView* u = nullptr; ID3D11ShaderResourceView* s = nullptr; };
 struct FaldCore2 {
-    unsigned int cols = 0, rows = 0;
+    unsigned int cols = 0, rows = 0, sub = 0;
     Tex stat, zone, field, alphaState, lz, dState[2], d0, d2;
+    Tex nodePeak, f1, fa, fb, nodeD;      // round 3 (the fine grid): node peaks (uint), window, ping / pong, the field
     ID3D11Buffer* cutBuf = nullptr; ID3D11UnorderedAccessView* cutUAV = nullptr; ID3D11ShaderResourceView* cutSRV = nullptr;
     ID3D11Buffer* cb = nullptr;
     bool stateValid = false;
@@ -233,15 +355,16 @@ void FaldCore2Release(FaldCore2* c) {
     if (!c) return;
     RelTex(c->stat); RelTex(c->zone); RelTex(c->field); RelTex(c->alphaState); RelTex(c->lz);
     RelTex(c->dState[0]); RelTex(c->dState[1]); RelTex(c->d0); RelTex(c->d2);
+    RelTex(c->nodePeak); RelTex(c->f1); RelTex(c->fa); RelTex(c->fb); RelTex(c->nodeD);
     SafeRel(c->cutSRV); SafeRel(c->cutUAV); SafeRel(c->cutBuf); SafeRel(c->cb);
-    c->cols = c->rows = 0; c->bytes = 0; c->stateValid = false;
+    c->cols = c->rows = c->sub = 0; c->bytes = 0; c->stateValid = false;
 }
 
 void FaldCore2Destroy(FaldCore2* c) { FaldCore2Release(c); delete c; }
 
-bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigned int rows) {
-    if (!c || !dev || cols == 0 || rows == 0) return false;
-    if (c->cb && c->cols == cols && c->rows == rows) return true;
+bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigned int rows, unsigned int sub) {
+    if (!c || !dev || cols == 0 || rows == 0 || sub == 0) return false;
+    if (c->cb && c->cols == cols && c->rows == rows && c->sub == sub) return true;
     FaldCore2Release(c);
     unsigned long long b = 0;
     bool ok = MakeTex(dev, cols, rows, DXGI_FORMAT_R32G32B32A32_FLOAT, c->stat, b, 16)
@@ -252,7 +375,12 @@ bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigne
            && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->dState[0], b, 4)
            && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->dState[1], b, 4)
            && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->d0, b, 4)
-           && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->d2, b, 4);
+           && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->d2, b, 4)
+           && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_UINT, c->nodePeak, b, 4)
+           && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32G32B32A32_FLOAT, c->f1, b, 16)
+           && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_FLOAT, c->fa, b, 4)
+           && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_FLOAT, c->fb, b, 4)
+           && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_FLOAT, c->nodeD, b, 4);
     if (ok) {
         D3D11_BUFFER_DESC bd = {};
         bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_DEFAULT;
@@ -273,7 +401,7 @@ bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigne
         ok = SUCCEEDED(dev->CreateBuffer(&cd, nullptr, &c->cb));
     }
     if (!ok) { FaldCore2Release(c); return false; }
-    c->cols = cols; c->rows = rows; c->bytes = b + 16; c->stateValid = false;
+    c->cols = cols; c->rows = rows; c->sub = sub; c->bytes = b + 16; c->stateValid = false;
     return true;
 }
 
@@ -283,7 +411,7 @@ unsigned long long FaldCore2VramBytes(const FaldCore2* c) { return c ? c->bytes 
 void FaldCore2BeginRun(FaldCore2* c, ID3D11DeviceContext* ctx, uint32_t flags, float coreA) {
     if (!c || !c->cb || !ctx) return;
     c->flags = flags; c->coreA = coreA;
-    c->resetNow = !c->stateValid;
+    c->resetNow = !c->stateValid || (flags & FALD_CORE2_FINE) != 0u;   // round 3 has no zone IIR: every run is a reset
     struct { uint32_t flags; float a; uint32_t reset; float cut; float mu, lh, z, ks; float beta, tau, fixedRcp; uint32_t pad;
              float w[4]; } cb = {};
     cb.flags = flags; cb.a = coreA; cb.reset = c->resetNow ? 1u : 0u; cb.cut = FALD_CORE2_CUT;
@@ -296,18 +424,20 @@ void FaldCore2BeginRun(FaldCore2* c, ID3D11DeviceContext* ctx, uint32_t flags, f
     ctx->UpdateSubresource(c->cb, 0, nullptr, &cb, 0, 0);
     const UINT zero[4] = { 0, 0, 0, 0 };
     ctx->ClearUnorderedAccessViewUint(c->cutUAV, zero);     // stat round 0 adds this run's |d ln M| into [0]
+    if (flags & FALD_CORE2_FINE) ctx->ClearUnorderedAccessViewUint(c->nodePeak.u, zero);   // stat round 0's node peaks
 }
 
-void FaldCore2StatViews(FaldCore2* c, ID3D11UnorderedAccessView* uav[2], ID3D11ShaderResourceView** lzSrv) {
+void FaldCore2StatViews(FaldCore2* c, ID3D11UnorderedAccessView* uav[3], ID3D11ShaderResourceView** lzSrv) {
     uav[0] = c ? c->stat.u : nullptr;
     uav[1] = c ? c->cutUAV : nullptr;
+    uav[2] = c ? c->nodePeak.u : nullptr;
     if (lzSrv) *lzSrv = c ? c->lz.s : nullptr;
 }
 
 static void Unbind(ID3D11DeviceContext* ctx) {
-    ID3D11ShaderResourceView* ns[8] = {};
+    ID3D11ShaderResourceView* ns[13] = {};
     ID3D11UnorderedAccessView* nu[2] = {};
-    ctx->CSSetShaderResources(40, 8, ns);
+    ctx->CSSetShaderResources(40, 13, ns);
     ID3D11ShaderResourceView* n9 = nullptr;
     ctx->CSSetShaderResources(9, 1, &n9);
     ctx->CSSetUnorderedAccessViews(0, 2, nu, nullptr);
@@ -339,9 +469,29 @@ void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* fald
     Unbind(ctx);
 }
 
+static void RunFine(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11ShaderResourceView* gainB) {
+    const unsigned fw = c->cols * c->sub, fh = c->rows * c->sub;
+    struct Step { int k; ID3D11ShaderResourceView* in; UINT slot; ID3D11UnorderedAccessView* out; };
+    const Step steps[6] = { { K_F1, c->nodePeak.s, 49, c->f1.u }, { K_F2, c->f1.s, 50, c->fa.u },
+                            { K_F3X, c->fa.s, 51, c->fb.u }, { K_F3Y, c->fb.s, 51, c->fa.u },
+                            { K_F5Y, c->fa.s, 52, c->fb.u }, { K_F5X, c->fb.s, 52, c->nodeD.u } };
+    for (const Step& st : steps) {
+        ctx->CSSetConstantBuffers(0, 1, &faldCB);
+        ctx->CSSetConstantBuffers(3, 1, &c->cb);
+        ctx->CSSetShader(g_cs[st.k], nullptr, 0);
+        ctx->CSSetShaderResources(9, 1, &gainB);
+        ctx->CSSetShaderResources(41, 1, &c->zone.s);
+        ctx->CSSetShaderResources(st.slot, 1, &st.in);
+        ctx->CSSetUnorderedAccessViews(0, 1, &st.out, nullptr);
+        Dispatch2D(ctx, fw, fh);
+        Unbind(ctx);
+    }
+}
+
 void FaldCore2RunDeficit(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11ShaderResourceView* gainB,
                          unsigned int round) {
     if (!c || !c->cb || !FaldCore2ShadersReady()) return;
+    if (c->flags & FALD_CORE2_FINE) { RunFine(c, ctx, faldCB, gainB); return; }
     const unsigned r = round & 1u;
     // D1: one group per zone
     ctx->CSSetConstantBuffers(0, 1, &faldCB);
@@ -376,6 +526,8 @@ void FaldCore2RunDeficit(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* f
 
 ID3D11Buffer* FaldCore2CB(const FaldCore2* c) { return c ? c->cb : nullptr; }
 ID3D11ShaderResourceView* FaldCore2FieldSRV(const FaldCore2* c) { return c ? c->field.s : nullptr; }
+ID3D11ShaderResourceView* FaldCore2ZoneSRV(const FaldCore2* c) { return c ? c->zone.s : nullptr; }
+ID3D11ShaderResourceView* FaldCore2NodeDSRV(const FaldCore2* c) { return c ? c->nodeD.s : nullptr; }
 void FaldCore2EndRun(FaldCore2* c) { if (c) c->stateValid = true; }
 
 FaldCore2Debug FaldCore2DebugViews(const FaldCore2* c) {
@@ -383,6 +535,7 @@ FaldCore2Debug FaldCore2DebugViews(const FaldCore2* c) {
     if (!c) return d;
     d.stat = c->stat.t; d.zone = c->zone.t; d.field = c->field.t; d.alphaState = c->alphaState.t;
     d.dState[0] = c->dState[0].t; d.dState[1] = c->dState[1].t; d.cols = c->cols; d.rows = c->rows;
+    d.nodePeak = c->nodePeak.t; d.nodeD = c->nodeD.t; d.sub = c->sub;
     d.reset = c->resetNow; d.coreA = c->coreA; d.flags = c->flags;
     return d;
 }

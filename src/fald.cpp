@@ -599,19 +599,23 @@ static void BindCommon(FaldResources* r, bool compute) {
                                                        nullptr };                            // t19: star pass S1 only (RunStar)
     // the always-on core round 2 (prototype): b3 + its field (t42); off = b3 unbound (reads 0: CoreGain = identity)
     ID3D11Buffer* coreCB = r->core2On ? FaldCore2CB(r->core2) : nullptr;
-    ID3D11ShaderResourceView* coreField = r->core2On ? FaldCore2FieldSRV(r->core2) : nullptr;
+    ID3D11ShaderResourceView* coreZF[2] = { r->core2On ? FaldCore2ZoneSRV(r->core2) : nullptr,     // t41 (round 3's alpha)
+                                            r->core2On ? FaldCore2FieldSRV(r->core2) : nullptr };   // t42 (round 2's field)
+    ID3D11ShaderResourceView* coreND = r->core2On ? FaldCore2NodeDSRV(r->core2) : nullptr;       // t48 (round 3's D)
     if (compute) {
         g_context->CSSetConstantBuffers(0, 1, &r->cb);
         g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_context->CSSetSamplers(0, 1, &g_faldSampler);
         g_context->CSSetConstantBuffers(3, 1, &coreCB);
-        g_context->CSSetShaderResources(42, 1, &coreField);
+        g_context->CSSetShaderResources(41, 2, coreZF);
+        g_context->CSSetShaderResources(48, 1, &coreND);
     } else {
         g_context->PSSetConstantBuffers(0, 1, &r->cb);
         g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, srvs);
         g_context->PSSetSamplers(0, 1, &g_faldSampler);
         g_context->PSSetConstantBuffers(3, 1, &coreCB);
-        g_context->PSSetShaderResources(42, 1, &coreField);
+        g_context->PSSetShaderResources(41, 2, coreZF);
+        g_context->PSSetShaderResources(48, 1, &coreND);
     }
 }
 
@@ -620,10 +624,10 @@ static void UnbindCompute() {
     ID3D11UnorderedAccessView* nullUav[4] = {};             // u0 / u1 + u2, the zone sweeps' partials (+ u3: the panel clock)
     g_context->CSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
     g_context->CSSetUnorderedAccessViews(0, 4, nullUav, nullptr);
-    ID3D11ShaderResourceView* nullCore[6] = {};             // the core's t42 (BindCommon) and t45 (stat round 0), u4
-    g_context->CSSetShaderResources(40, 6, nullCore);
-    ID3D11UnorderedAccessView* nullU4 = nullptr;
-    g_context->CSSetUnorderedAccessViews(4, 1, &nullU4, nullptr);
+    ID3D11ShaderResourceView* nullCore[9] = {};             // the core's t41 / t42 / t48 (BindCommon), t45 (stat round 0)
+    g_context->CSSetShaderResources(40, 9, nullCore);
+    ID3D11UnorderedAccessView* nullU4[2] = {};             // u4 / u5 (stat round 0)
+    g_context->CSSetUnorderedAccessViews(4, 2, nullU4, nullptr);
     ID3D11Buffer* nullCB = nullptr;
     g_context->CSSetConstantBuffers(3, 1, &nullCB);
     g_context->CSSetShader(nullptr, nullptr, 0);
@@ -644,14 +648,14 @@ static void RunStat(FaldResources* r, uint32_t roundIdx) {
             g_context->CSSetShaderResources(FALD_FADE_POST_SLOT, FALD_FADE_POST_VIEWS, fv);
         }
     }
-    ID3D11UnorderedAccessView* uavs[5] = { r->driveUAV, r->activeUAV[roundIdx & 1u],    // u1: nullptr without a boost LUT
-                                           r->zonePartUAV, nullptr, nullptr };            // (the shader then never writes it)
+    ID3D11UnorderedAccessView* uavs[6] = { r->driveUAV, r->activeUAV[roundIdx & 1u],    // u1: nullptr without a boost LUT
+                                           r->zonePartUAV, nullptr, nullptr, nullptr };   // (the shader then never writes it)
     if (roundIdx == 0 && r->core2On) {                       // core round 2: the source's P, M, lnG (u3) + the cut sum (u4)
         ID3D11ShaderResourceView* lz = nullptr;
         FaldCore2StatViews(r->core2, &uavs[3], &lz);
         g_context->CSSetShaderResources(45, 1, &lz);
     }
-    g_context->CSSetUnorderedAccessViews(0, 5, uavs, nullptr);                           // u2: partials, zones > one slice
+    g_context->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);                           // u2: partials, zones > one slice
     g_context->Dispatch(p.cols, p.rows, r->zoneSlices);
     if (r->zoneSlices > 1) {                                                             // fold the slices, finish the zones
         g_context->CSSetShader(g_faldStatCombineCS, nullptr, 0);
@@ -1023,6 +1027,10 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
         DumpTexture(cd.alphaState, dir + L"fald_core2_alpha_state.f32", cd.cols, cd.rows, 4);
         DumpTexture(cd.dState[0], dir + L"fald_core2_d_state0.f32", cd.cols, cd.rows, 4);
         DumpTexture(cd.dState[1], dir + L"fald_core2_d_state1.f32", cd.cols, cd.rows, 4);
+        if (cd.flags & FALD_CORE2_FINE) {   // round 3: the fine grid (cols * sub x rows * sub): node peaks (uint bits), D of round 1
+            DumpTexture(cd.nodePeak, dir + L"fald_core3_node_peak.u32", cd.cols * cd.sub, cd.rows * cd.sub, 4);
+            DumpTexture(cd.nodeD, dir + L"fald_core3_node_d.f32", cd.cols * cd.sub, cd.rows * cd.sub, 4);
+        }
     }
     UINT bpp = (ctx->swapchainFormat == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8 : 4;
     DumpTexture(r->inter, dir + (bpp == 8 ? L"fald_frame.rgba16f" : L"fald_frame.rgb10a2"), r->width, r->height, bpp);
@@ -1080,7 +1088,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "; the frozen fade stack ASF10 + T11_TMTC: files fald_fade.f32 / fald_fade_t.f32 / fald_fade_floor.f32 /"
          << " fald_fade_reach0.f32 / fald_fade_reach1.f32 width x height float32, fald_fade_s.f32 quarter res; "
          << (r->fade ? FaldFadeVramBytes(r->fade) >> 20 : 0ull) << " MB)"
-         << "\ncore2 " << (r->core2On ? 1 : 0) << " (setting " << (fs.core2 ? 1 : 0) << "; the always-on core round 2 prototype,"
+         << "\ncore2 " << (r->core2On ? 1 : 0) << " (test switch coreMode " << fs.coreMode << "; the always-on core prototype,"
          << " shared/fald_core2.h: files fald_core2_stat.f32 [P, M, lnG, 0], fald_core2_zone.f32 [alpha_z, k, ln P, 0],"
          << " fald_core2_field.f32 [alpha_z, D of round 1], fald_core2_alpha_state.f32, fald_core2_d_state0 / 1.f32)"
          << "\ncore2_flags " << (r->core2On ? FaldCore2DebugViews(r->core2).flags : 0u)
@@ -1229,9 +1237,10 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
 
     // The always-on core round 2 (PROTOTYPE, FaldSettings::core2): on = its zone textures exist and its shaders compiled;
     // off = released, b3 / t42 unbound (CoreGain = identity) — today's layer bit for bit.
-    if (fs.core2 && FaldCore2ShadersReady()) {
+    r->core2Flags = FaldCore2FlagsOfMode(fs.coreMode);
+    if (r->core2Flags && FaldCore2ShadersReady()) {
         if (!r->core2) r->core2 = FaldCore2Create();
-        r->core2On = FaldCore2Ensure(r->core2, g_device, r->params.cols, r->params.rows);
+        r->core2On = FaldCore2Ensure(r->core2, g_device, r->params.cols, r->params.rows, r->params.sub);
     } else if (r->core2 || r->core2On) {
         FaldCore2Destroy(r->core2); r->core2 = nullptr; r->core2On = false;
     }
@@ -1274,7 +1283,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     if (r->core2On) {
         const unsigned long long k = FaldCore2Refreshes(panel, r->clkElapsed, r->dtMs, ctx->frameTimeExactMs);
         if (trun.resumed || trun.stateReset) FaldCore2Invalidate(r->core2);
-        FaldCore2BeginRun(r->core2, g_context, FALD_CORE2_KC2C, FaldCore2IirFactor(k));
+        FaldCore2BeginRun(r->core2, g_context, r->core2Flags, FaldCore2IirFactor(k));
     }
     // Both rounds' reach of the frame they were formed from (no new content, LED lag off, the same settings): reused
     const unsigned long long reachKey = r->fadeOn ? ReachKey(r, frameKey, temporal, panel) : 0ull;
@@ -1333,7 +1342,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     if (r->debugMode != 0) DrawExempt(ctx, r);   // a view: DesktopLUT's windows keep the corrected picture
     ID3D11ShaderResourceView* nullSrv[FALD_SRV_SLOTS] = {};
     g_context->PSSetShaderResources(0, FALD_SRV_SLOTS, nullSrv);
-    g_context->PSSetShaderResources(42, 1, nullSrv);          // the core's field
+    g_context->PSSetShaderResources(40, 9, nullSrv);          // the core's t41 / t42 / t48
     if (r->core2On) FaldCore2EndRun(r->core2);
     if (!dumpDir.empty()) DumpOutput(ctx, r, finalRT, dumpDir);
 

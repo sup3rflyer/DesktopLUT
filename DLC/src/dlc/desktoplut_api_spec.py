@@ -96,6 +96,8 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), "
+                          "fald_core_mode (0 C / 1 KC2c / 2 KC3: the core prototype's test switch, runtime.fald_core_mode; "
+                          "absent outside branch fald/principled), "
                           "fald_flank_fade (bool, runtime.fald_flank_fade) + fald_low_ext (bool, reserved; both absent "
                           "on builds before 2026-10-20), fald_flank_fade_governor (the fade's GPU safety governor: "
                           "{state: 'off'|'running'|'suspended_budget'|'suspended_weak_gpu'|'forced'|'unknown' (on, no "
@@ -539,6 +541,21 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {"monitor_mode": "string", "enabled": "boolean", "even": "number", "lift": "number", "target_gain": "number", "target_sigma": "number", "keep_nits": "number",
              "even_reach": "number", "cap_nits": "number", "strength": "number", "area_lo": "number", "area_hi": "number",
              "peak_hi": "number", "reach": "number", "nb_lo": "number", "nb_hi": "number"},
+            mutates_state=True,
+            gui_thread_required=True,
+        ),
+        ApiMethodSpec(
+            "runtime.fald_core_mode",
+            "FALD compensation layer: the always-on core PROTOTYPE's TEST-ONLY switch (branch fald/principled, "
+            "shared/fald_core2.h): 0 = C (today's layer bit for bit), 1 = KC2c (round 2: alpha + the zone deficit + a zone "
+            "IIR), 2 = KC3 (round 3: alpha + the fine-grid deficit). Runtime only, never saved (INI <mode>_FaldCoreModeTest "
+            "sets the start value); reported as fald_core_mode in state.get. The live blind kit sets it per block.",
+            {
+                "monitor": _monitor_param(),
+                "mode": _mode_param(),
+                "core": ApiParamSpec("number", description="0, 1 or 2"),
+            },
+            {"monitor_mode": "string", "core": "number"},
             mutates_state=True,
             gui_thread_required=True,
         ),

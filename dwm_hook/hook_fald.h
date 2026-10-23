@@ -123,7 +123,7 @@ bool HookRequestFullRecompose();
 // shared/fald_fade_governor.h).
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
                          const DwmHookFaldTuning* tuning, bool fade = false, unsigned int monW = 0, unsigned int monH = 0,
-                         bool fadeForce = false, bool core2 = false);
+                         bool fadeForce = false, unsigned int coreMode = 0);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing

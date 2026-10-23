@@ -1536,7 +1536,7 @@ void UpdateDwmHookSharedConfig()
                                                            fs.star.enabled ? 1 : 0,
                                                            fs.flankFade ? 1 : 0,    // bit 8; bit 9 (L) never set
                                                            g_faldFadeForce.load() ? 1 : 0),   // bit 10: the governor forced
-                                           fs.core2 ? 1 : 0);                                 // bit 16: core round 2 (prototype)
+                                           fs.coreMode);                                      // bits 16-17: the core test switch
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];
