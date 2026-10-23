@@ -324,6 +324,29 @@ void ReleaseRefreshTrimForExit(bool sessionEnding) {
     if (sessionEnding) return;
     g_exiting = true;
     ReconcileRefreshTrim("exit");
+    // No trimmed variant is left behind in the cache either (forgotten by name; the next start's orphan cleanup deletes
+    // the files): the saved INI then names only untrimmed variants, safe for a build without the trim, and the next
+    // run bakes a trimmed one again at its first switch to a trimmed rate.
+    int forgotten = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        auto forget = [&forgotten](MHCSettings& m) {
+            for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
+                if (m.permTrimStamp[k].empty() || m.permNames[k] == m.profileName) continue;
+                m.permNames[k].clear();
+                m.permPaths[k].clear();
+                m.permTrimStamp[k].clear();
+                forgotten++;
+            }
+            m.trimStash.clear();
+        };
+        for (MonitorSettings& ms : g_gui.monitorSettings) forget(ms.hdrMHC);
+        for (MonitorSettings& ms : g_gui.parkedSettings) forget(ms.hdrMHC);
+    }
+    if (forgotten > 0) {
+        std::cout << "[Refresh trim] exit: " << forgotten << " trimmed cached variant(s) forgotten" << std::endl;
+        SaveSettings();
+    }
 }
 
 void ReconcileRefreshTrim(const char* why) {
