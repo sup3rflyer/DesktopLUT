@@ -642,41 +642,58 @@ bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out)
 double MhcRefreshTrimGain(const MhcRefreshTrim& t, double nits) {
     const size_t n = (std::min)(t.nits.size(), t.lnGain.size());
     if (!t.active || n == 0 || !std::isfinite(nits)) return 1.0;
+    const double top = t.nits[n - 1], v1 = t.lnGain[n - 1];
+    const bool fade = t.peakNits > top;                                 // a peak above the measurements: fade out there
     double y = nits;
-    if (t.peakNits > 0.0 && y > t.peakNits) y = t.peakNits;            // held above the panel's peak
-    const double ly = std::log10((std::max)(y, 1e-6));
-    double v;
-    if (n == 1 || ly <= std::log10(t.nits[0])) {
-        v = t.lnGain[0];                                                // held below the lowest level
-    } else {
-        v = t.lnGain[n - 1];
-        bool inside = false;
-        for (size_t i = 1; i < n; i++) {
-            const double l0 = std::log10(t.nits[i - 1]), l1 = std::log10(t.nits[i]);
-            if (ly <= l1) {
-                const double w = l1 > l0 ? (ly - l0) / (l1 - l0) : 1.0;
-                v = t.lnGain[i - 1] + (t.lnGain[i] - t.lnGain[i - 1]) * w;
-                inside = true;
-                break;
-            }
-        }
-        if (!inside) {
-            // Above the top level: its segment's slope in log level, never past g = 1.
-            const double l0 = std::log10(t.nits[n - 2]), l1 = std::log10(t.nits[n - 1]);
-            const double slope = l1 > l0 ? (t.lnGain[n - 1] - t.lnGain[n - 2]) / (l1 - l0) : 0.0;
-            v = t.lnGain[n - 1] + slope * (ly - l1);
-            v = t.lnGain[n - 1] >= 0.0 ? (std::max)(v, 0.0) : (std::min)(v, 0.0);
+    if (t.peakNits > 0.0 && !fade && y > t.peakNits) y = t.peakNits;   // a peak at or below the top level: held there
+    const double ly = std::log10((std::max)(y, 1e-6)), l1 = std::log10(top);
+    if (ly <= std::log10(t.nits[0])) return std::exp(t.lnGain[0]);    // held below the lowest level
+    for (size_t i = 1; i < n; i++) {
+        const double l0 = std::log10(t.nits[i - 1]), lb = std::log10(t.nits[i]);
+        if (ly <= lb) {
+            const double w = lb > l0 ? (ly - l0) / (lb - l0) : 1.0;
+            return std::exp(t.lnGain[i - 1] + (t.lnGain[i] - t.lnGain[i - 1]) * w);
         }
     }
-    return std::exp(v);
+    // Above the top level, nothing was measured: the trim fades out to g = 1, moving only toward it. The top segment's
+    // slope in log level carries on only where it heads toward g = 1 (one level has none).
+    if (v1 == 0.0) return 1.0;
+    double s = 0.0;
+    if (n > 1) {
+        const double l0 = std::log10(t.nits[n - 2]);
+        s = l1 > l0 ? (v1 - t.lnGain[n - 2]) / (l1 - l0) : 0.0;
+        if (s * v1 > 0.0) s = 0.0;                                      // heading away from g = 1: not followed
+    }
+    if (!fade) {
+        // No peak above the measurements: that slope until it reaches g = 1 (held without one).
+        const double v = v1 + s * (ly - l1);
+        return std::exp(v1 > 0.0 ? (std::max)(v, 0.0) : (std::min)(v, 0.0));
+    }
+    // From the top level (its gain, that slope) to g = 1, flat, at the panel's peak: a cubic Hermite in log level whose
+    // start slope is at most 3x the mean (Fritsch-Carlson), so it is monotone and never passes g = 1. A dimming trim
+    // fading out only adds light; a brightening one takes it away, so its fade is stretched past the peak where needed
+    // to keep the trimmed light rising at least half as fast as the level (|d ln g / d ln y| <= 3 v1 / (h ln 10)).
+    double lp = std::log10(t.peakNits);
+    if (v1 > 0.0) lp = (std::max)(lp, l1 + 6.0 * v1 / std::log(10.0));
+    const double h = lp - l1, u = (std::min)((ly - l1) / h, 1.0);
+    const double d = -v1 / h;                                           // the mean slope to g = 1
+    const double m0 = s / d > 3.0 ? 3.0 * d : s;                        // s has d's sign, or is 0
+    const double h00 = (2.0 * u - 3.0) * u * u + 1.0, h10 = ((u - 2.0) * u + 1.0) * u;
+    return std::exp(v1 * h00 + h * m0 * h10);
 }
 
 double MhcRefreshTrimTarget(const MhcRefreshTrim& t, double nits) {
     if (!t.active || !(nits > 0.0)) return nits;
     // The knots are keyed by the 60-Hz light of the DRIVE: the drive whose 60-Hz light is y shows y / g(y) at the rate,
-    // so solve y = nits * g(y). ln g moves ~0.014 per decade: each step gains ~2 decimal places.
+    // so solve y = nits * g(y). A contraction while |d ln g / d ln y| < 1 (~0.01 on the measured levels, ~0.05 on the
+    // fade above them): iterated until it stops moving.
     double y = nits * MhcRefreshTrimGain(t, nits);
-    for (int k = 0; k < 4; k++) y = nits * MhcRefreshTrimGain(t, y);
+    for (int k = 0; k < 64; k++) {
+        const double next = nits * MhcRefreshTrimGain(t, y);
+        const bool done = std::fabs(next - y) <= 1e-14 * y;
+        y = next;
+        if (done) break;
+    }
     return y;
 }
 

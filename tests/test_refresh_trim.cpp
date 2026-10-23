@@ -1,4 +1,4 @@
-// The per-refresh-rate grey trim (refresh_trim.h, 2026-10-23): the curve (hold / interpolate / extend / peak), the
+// The per-refresh-rate grey trim (refresh_trim.h, 2026-10-23): the curve (hold / interpolate / fade / peak), the
 // fixed point, the stamp, the DIP section parse, the rate match, the panel match, the resolution of the owner's real
 // DIP, the bake (no trim = the untrimmed bytes; a known trim = the expected LUT; a synthetic panel at 47.952 Hz shows
 // the 60-Hz light with and without desktop gamma and the fine-tune), the variant stamps, the stash, the INI.
@@ -113,7 +113,7 @@ bool SameLuts(const MhcScanout& a, const MhcScanout& b, int maxLsb, int* worst =
 // The curve
 // =============================================================================================
 
-TEST_CASE("Refresh trim gain: hold below, log-linear between, extend above without crossing 1, held above the peak") {
+TEST_CASE("Refresh trim gain: hold below, log-linear between, faded out to 1 above, flat at the peak") {
     MhcRefreshTrim t;
     t.active = true;
     t.nits = { 1.0, 10.0, 100.0 };
@@ -122,28 +122,105 @@ TEST_CASE("Refresh trim gain: hold below, log-linear between, extend above witho
     CHECK(MhcRefreshTrimGain(t, 0.01) == doctest::Approx(std::exp(-0.03)).epsilon(1e-12));     // held
     CHECK(MhcRefreshTrimGain(t, 1.0) == doctest::Approx(std::exp(-0.03)).epsilon(1e-12));
     CHECK(MhcRefreshTrimGain(t, std::sqrt(10.0)) == doctest::Approx(std::exp(-0.025)).epsilon(1e-12));   // log midpoint
-    CHECK(MhcRefreshTrimGain(t, 1000.0) == doctest::Approx(1.0).epsilon(1e-12));   // the top slope reaches ln g = 0
-    CHECK(MhcRefreshTrimGain(t, 5000.0) == doctest::Approx(1.0).epsilon(1e-12));   // held above the peak
-    t.peakNits = 0.0;
-    CHECK(MhcRefreshTrimGain(t, 1e5) == doctest::Approx(1.0).epsilon(1e-12));      // never past 1
-    t.peakNits = 316.2278;
-    CHECK(MhcRefreshTrimGain(t, 1e4) == doctest::Approx(std::exp(-0.005)).epsilon(1e-6));
+    CHECK(MhcRefreshTrimGain(t, 100.0) == doctest::Approx(std::exp(-0.01)).epsilon(1e-12));    // the top level
+    // The fade from (2, -0.01, slope 0.01 per decade) to (3, 0, flat): the Hermite midpoint -0.01/2 + 1 * 0.01/8.
+    CHECK(MhcRefreshTrimGain(t, std::sqrt(1e5)) == doctest::Approx(std::exp(-0.00375)).epsilon(1e-12));
+    CHECK(MhcRefreshTrimGain(t, 1000.0) == 1.0);                                                // g = 1 at the peak
+    CHECK(MhcRefreshTrimGain(t, 5000.0) == 1.0);                                                // and above it
+    t.peakNits = 0.0;   // no peak: the top slope until g = 1, never past it
+    CHECK(MhcRefreshTrimGain(t, std::sqrt(1e5)) == doctest::Approx(std::exp(-0.005)).epsilon(1e-12));
+    CHECK(MhcRefreshTrimGain(t, 1e5) == doctest::Approx(1.0).epsilon(1e-12));
+    t.peakNits = 316.2278;   // a nearer peak: a steeper fade (mean 0.02 per decade, start slope 0.01), still 1 there
+    CHECK(MhcRefreshTrimGain(t, 316.2278) == 1.0);
+    CHECK(MhcRefreshTrimGain(t, 1e4) == 1.0);
+    t.peakNits = 50.0;       // a peak at or below the top level: held there
+    CHECK(MhcRefreshTrimGain(t, 1e4) == doctest::Approx(MhcRefreshTrimGain(t, 50.0)).epsilon(1e-15));
     MhcRefreshTrim off = t;
     off.active = false;
     CHECK(MhcRefreshTrimGain(off, 50.0) == 1.0);
     CHECK(MhcRefreshTrimTarget(off, 50.0) == 50.0);
 }
 
+TEST_CASE("Refresh trim gain: the fade above the top level only ever moves toward 1, and keeps the light rising") {
+    auto lnG = [](const MhcRefreshTrim& t, double y) { return std::log(MhcRefreshTrimGain(t, y)); };
+    // Monotone toward 0 and between the top gain and 0 on a fine log grid from the top level to past the fade's end;
+    // the trimmed light y * g(y) rises at least half as fast as y (the brightening trim's stretched fade).
+    auto checkFade = [&](const MhcRefreshTrim& t, double end) {
+        const double top = t.nits.back(), v1 = t.lnGain.back();
+        double prev = lnG(t, top), prevLight = top * std::exp(prev), prevY = top;
+        for (int i = 1; i <= 4000; i++) {
+            const double y = top * std::pow(end * 1.5 / top, i / 4000.0);
+            const double v = lnG(t, y), light = y * std::exp(v);
+            CAPTURE(y);
+            CHECK(std::fabs(v) <= std::fabs(prev) + 1e-15);                        // only toward g = 1
+            CHECK((v == 0.0 || (v > 0.0) == (v1 > 0.0)));                          // never past it
+            CHECK(std::log(light / prevLight) >= 0.5 * std::log(y / prevY) - 1e-12);
+            prev = v; prevLight = light; prevY = y;
+        }
+        CHECK(MhcRefreshTrimGain(t, end) == 1.0);
+    };
+    MhcRefreshTrim away;   // the top segment heads AWAY from 1: not followed — the fade starts flat
+    away.active = true;
+    away.nits = { 10.0, 100.0 };
+    away.lnGain = { -0.01, -0.02 };
+    away.peakNits = 1000.0;
+    CHECK(MhcRefreshTrimGain(away, std::sqrt(1e5)) == doctest::Approx(std::exp(-0.01)).epsilon(1e-12));   // -0.02/2
+    checkFade(away, 1000.0);
+    away.peakNits = 0.0;   // no peak and no trend toward 1: held
+    CHECK(MhcRefreshTrimGain(away, 1e4) == doctest::Approx(std::exp(-0.02)).epsilon(1e-12));
+
+    MhcRefreshTrim one;    // one level: held up to it, faded out above it
+    one.active = true;
+    one.nits = { 100.0 };
+    one.lnGain = { std::log(0.97) };
+    one.peakNits = 1000.0;
+    CHECK(MhcRefreshTrimGain(one, 100.0) == doctest::Approx(0.97).epsilon(1e-12));
+    CHECK(MhcRefreshTrimGain(one, std::sqrt(1e5)) == doctest::Approx(std::exp(0.5 * std::log(0.97))).epsilon(1e-12));
+    checkFade(one, 1000.0);
+
+    MhcRefreshTrim steep;  // the top slope 10x the mean: the start slope is held to 3x (Fritsch-Carlson)
+    steep.active = true;
+    steep.nits = { 100.0, 1000.0 };
+    steep.lnGain = { -0.11, -0.01 };
+    steep.peakNits = 10000.0;
+    checkFade(steep, 10000.0);
+
+    MhcRefreshTrim bright; // a brightening trim with the peak just above the top level: the fade is stretched past it
+    bright.active = true;
+    bright.nits = { 100.0, 1000.0 };
+    bright.lnGain = { 0.02, 0.03 };
+    bright.peakNits = 1050.0;
+    const double end = 1000.0 * std::pow(10.0, 6.0 * 0.03 / std::log(10.0));   // ~1198 nits
+    CHECK(MhcRefreshTrimGain(bright, 1050.0) > 1.0);
+    checkFade(bright, end);
+    bright.peakNits = 5000.0;   // a peak far enough above: the fade ends there
+    checkFade(bright, 5000.0);
+}
+
+TEST_CASE("Refresh trim gain: the owner's 47.952-Hz trim is smooth across the top level and 1 from the peak up") {
+    const MhcRefreshTrim t = Trim47(Pa32Dip());
+    const double top = t.nits.back(), eps = 1e-6;
+    auto lnG = [&t](double y) { return std::log(MhcRefreshTrimGain(t, y)); };
+    const double below = (lnG(top) - lnG(top * std::pow(10.0, -eps))) / eps;
+    const double above = (lnG(top * std::pow(10.0, eps)) - lnG(top)) / eps;
+    CHECK(below > 0.0);
+    CHECK(above == doctest::Approx(below).epsilon(1e-3));   // the measured slope carries on into the fade
+    CHECK(MhcRefreshTrimGain(t, 1300.0) == doctest::Approx(1.0 - 0.00543).epsilon(1e-4));
+    CHECK(MhcRefreshTrimGain(t, 1500.0) == doctest::Approx(1.0 - 0.00211).epsilon(1e-4));
+    CHECK(MhcRefreshTrimGain(t, 1800.0) == 1.0);
+    CHECK(MhcRefreshTrimGain(t, 10000.0) == 1.0);
+}
+
 TEST_CASE("Refresh trim gain: the C++ curve is DLC's gain_at on the owner's 47.952-Hz response") {
     const dlc::DipStoreData d = Pa32Dip();
     const MhcRefreshTrim t = Trim47(d);
-    // dlc.refresh_trim.gain_at(trim_curves["rates"]["47.952"], y, 1800) from the frozen run's trim_curves.json
+    // dlc.refresh_trim.gain_at(trim_curves["rates"]["47.952"], y, 1800) from the frozen run's trim_curves.json (the
+    // fade above the top level since bake/2; every value up to 800 is the one bake/1 had)
     const double ref[][2] = {
         { 0.1, 0.96740505794258458 }, { 0.5, 0.96740505794258458 }, { 1.0, 0.96718467902551253 },
         { 5.0, 0.96720709397854299 }, { 30.0, 0.96972751693556991 }, { 77.0, 0.97284978450779658 },
         { 150.0, 0.97667049601211364 }, { 400.0, 0.98321380697806826 }, { 800.0, 0.98827858097876242 },
-        { 1100.0, 0.99070460312113051 }, { 1400.0, 0.99254576905725322 }, { 1800.0, 0.99446808476511739 },
-        { 3000.0, 0.99446808476511739 },
+        { 1100.0, 0.9910240727097831 }, { 1400.0, 0.9963622472577861 }, { 1800.0, 1.0 }, { 3000.0, 1.0 },
     };
     for (const auto& r : ref) {
         CAPTURE(r[0]);
@@ -161,7 +238,8 @@ TEST_CASE("Refresh trim target: the drive's 60-Hz light y solves y = T * g(y), s
         const double y = MhcRefreshTrimTarget(t, T);
         CHECK(y == doctest::Approx(T * MhcRefreshTrimGain(t, y)).epsilon(1e-12));
         CHECK(y / MhcRefreshTrimGain(t, y) == doctest::Approx(T).epsilon(1e-12));   // what the panel shows at the rate
-        CHECK(y < T);
+        if (T < t.peakNits) CHECK(y < T);
+        else CHECK(y == T);                                                          // faded out: no trim at the peak
     }
     CHECK(MhcRefreshTrimTarget(t, 0.0) == 0.0);
 }

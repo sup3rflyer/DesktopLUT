@@ -926,7 +926,7 @@ struct MhcRefreshTrim {
     double rateHz = 0.0;            // that rate (informational: labels, file names)
     std::vector<double> nits;       // knots: the 60-Hz light of a full-field grey, ascending, > 0
     std::vector<double> lnGain;     // ln g = -ln(ratio) at each knot
-    double peakNits = 0.0;          // the top extension stops here (held above); 0 = no cap
+    double peakNits = 0.0;          // the panel peak: above the top knot the trim fades out to g = 1 here; 0 = unknown
 };
 
 // MHC profile state (per-monitor, per-mode)

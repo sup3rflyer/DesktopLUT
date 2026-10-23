@@ -388,8 +388,9 @@ def trim_curves(comb: dict[str, dict[str, dict[str, Any]]], pred: Optional[dict[
                  "lut_R(x) = base(PQ^-1(T(x) * g_R(T(x)))) with T(x) the target light of x; then at rate R the "
                  "panel's extra light x ratio_R cancels it. Keyed by light, so one curve serves every permutation",
         "extrapolation": {"below": "hold the lowest knot's gain",
-                          "above": "continue the top segment's slope in log10(Y) to the panel peak; the gain never "
-                                   "crosses 1 (ln g keeps the top knot's sign, clamped at 0)"},
+                          "above": "fade out to gain 1, flat, at the panel peak: a monotone cubic in log10(Y) from "
+                                   "the top knot's ln g and its segment's slope (only where that heads toward 1); "
+                                   "without a peak, that slope until gain 1"},
         "peak_nits": peak_nits, "rates": {}}
     for rate, pats in comb.items():
         knots = sorted((v for v in pats.values() if v.get("kind") == "grey"), key=lambda v: v["y60"])
@@ -419,28 +420,53 @@ def trim_curves(comb: dict[str, dict[str, dict[str, Any]]], pred: Optional[dict[
     return out
 
 
-def _interp_log(knots: Sequence[tuple[float, float]], y: float) -> float:
-    """Piecewise linear in log10(y) over (y, value) knots; held flat below the lowest knot; above the top one, the
-    top segment's slope continued, clamped so the value never crosses 0 (keeps the top knot's sign)."""
+def _interp_log(knots: Sequence[tuple[float, float]], y: float, peak: Optional[float] = None, *,
+                keep_rising: bool = False) -> float:
+    """Piecewise linear in log10(y) over (y, value) knots, held flat below the lowest knot. Above the top one nothing
+    was measured: the value fades out to 0, never moving away from it. The top segment's slope carries on only where
+    it heads toward 0 (one knot has none). With ``peak`` above the top knot: a cubic Hermite in log10(y) from the top
+    knot (its value, that slope) to 0, flat, at the peak, the start slope at most 3x the mean (Fritsch-Carlson:
+    monotone, never past 0), 0 above. ``keep_rising`` (the value is ln g): a positive value's fade is stretched past the
+    peak where needed to keep y * g rising at least half as fast as y. Without a peak above the top knot: that slope
+    until it reaches 0 (held without one); a peak at or below the top knot holds the value there. The C++ bake's twin
+    (DesktopLUT mhc_icc.cpp MhcRefreshTrimGain)."""
     ks = sorted(knots)
-    ly = math.log10(max(y, 1e-6))
     lx = [math.log10(k[0]) for k in ks]
     vs = [k[1] for k in ks]
-    if ly <= lx[0] or len(ks) == 1:
+    fade = bool(peak) and peak > ks[-1][0]
+    if peak and not fade:
+        y = min(y, peak)
+    ly = math.log10(max(y, 1e-6))
+    if ly <= lx[0]:
         return vs[0]
     for i in range(1, len(ks)):
         if ly <= lx[i]:
             w = (ly - lx[i - 1]) / (lx[i] - lx[i - 1])
             return vs[i - 1] + (vs[i] - vs[i - 1]) * w
-    slope = (vs[-1] - vs[-2]) / (lx[-1] - lx[-2])
-    v = vs[-1] + slope * (ly - lx[-1])
-    return max(v, 0.0) if vs[-1] >= 0 else min(v, 0.0)
+    v1, l1 = vs[-1], lx[-1]
+    if v1 == 0.0:
+        return 0.0
+    s = (v1 - vs[-2]) / (l1 - lx[-2]) if len(ks) > 1 else 0.0
+    if s * v1 > 0.0:
+        s = 0.0                                          # heading away from 0: not followed
+    if not fade:
+        v = v1 + s * (ly - l1)
+        return max(v, 0.0) if v1 > 0 else min(v, 0.0)
+    lp = math.log10(peak)
+    if keep_rising and v1 > 0.0:
+        lp = max(lp, l1 + 6.0 * v1 / math.log(10.0))     # |d ln g / d ln y| <= 3 v1 / (h ln 10) <= 1/2
+    h = lp - l1
+    u = min((ly - l1) / h, 1.0)
+    d = -v1 / h                                          # the mean slope to 0
+    m0 = 3.0 * d if s / d > 3.0 else s
+    return v1 * ((2.0 * u - 3.0) * u * u + 1.0) + h * m0 * (((u - 2.0) * u + 1.0) * u)
 
 
 def gain_at(rate_entry: dict[str, Any], y_nits: float, peak_nits: Optional[float] = None) -> float:
-    """The trim gain of one measured rate at the 60-Hz light ``y_nits`` (hold below, extend above to the peak)."""
-    y = min(y_nits, peak_nits) if peak_nits else y_nits
-    return math.exp(_interp_log([(k["y60_nits"], k["ln_gain"]) for k in rate_entry["knots"]], y))
+    """The trim gain of one measured rate at the 60-Hz light ``y_nits``: held below the lowest level, faded out to 1
+    above the highest (flat at ``peak_nits``; without it, the measured trend toward 1)."""
+    return math.exp(_interp_log([(k["y60_nits"], k["ln_gain"]) for k in rate_entry["knots"]], y_nits, peak_nits,
+                                keep_rising=True))
 
 
 def trim_for_hz(trim: dict[str, Any], hz: float, y_nits: float, *, tol_hz: float = 0.01) -> Optional[float]:
@@ -459,8 +485,7 @@ def trim_for_hz(trim: dict[str, Any], hz: float, y_nits: float, *, tol_hz: float
     if not (lo - tol_hz <= hz <= hi + tol_hz):
         return None
     x = (1000.0 / hz - 1000.0 / REF_HZ) if m["axis"] == "period" else (REF_HZ - hz)
-    y = min(y_nits, trim["peak_nits"]) if trim.get("peak_nits") else y_nits
-    s = _interp_log([(k["y60_nits"], k["s"]) for k in m["slopes"]], y)
+    s = _interp_log([(k["y60_nits"], k["s"]) for k in m["slopes"]], y_nits, trim.get("peak_nits"))
     return math.exp(-s * x)
 
 

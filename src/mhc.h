@@ -64,11 +64,15 @@ struct MHC2ProfileParams {
 };
 
 // The refresh trim's gain at 60-Hz light `nits`: ln g piecewise linear in log10(nits) between the knots, held below the
-// lowest, the top segment's slope continued above the highest without crossing g = 1 (ln g keeps the top knot's sign),
-// and held above peakNits. 1 when inactive or without knots.
+// lowest. Above the highest (nothing measured there) it fades out to g = 1, never moving away from it: with peakNits
+// above the top knot, a monotone cubic in log level from the top knot (its gain, its segment's slope where that heads
+// toward 1) to g = 1, flat, at peakNits (a brightening trim's fade stretched past it where needed to keep the trimmed
+// light rising), 1 above; without one, that slope until g = 1 (held without it); a peakNits at or below the top knot
+// holds the gain there. 1 when inactive or without knots.
 double MhcRefreshTrimGain(const MhcRefreshTrim& trim, double nits);
 // The 60-Hz light to drive so the panel at the trim's rate shows `nits`: the y with y = nits * g(y) (the knots are keyed
-// by the 60-Hz light of the drive; a few fixed-point steps, |d ln g / d ln y| is ~0.01). `nits` when inactive.
+// by the 60-Hz light of the drive; fixed-point steps until it stops moving, |d ln g / d ln y| is ~0.01 on the measured
+// levels, <= ~0.05 on the fade above them). `nits` when inactive.
 double MhcRefreshTrimTarget(const MhcRefreshTrim& trim, double nits);
 
 // Generate complete ICC v4 profile binary data with MHC2 tag
