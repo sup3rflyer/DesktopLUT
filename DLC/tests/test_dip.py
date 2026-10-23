@@ -7,6 +7,7 @@ the variance→reads-needed rule (averaging cuts SE by √N).
 
 from __future__ import annotations
 
+import json
 import math
 
 from dlc.dip import DipStore, DisplayInstrumentProfile, NoiseBand
@@ -157,3 +158,63 @@ def test_save_stamps_a_schema_version_and_reloads_clean(tmp_path):
     reloaded = DipStore.load(tmp_path / "dip_store.json")
     assert reloaded.dropped == [] and reloaded.corrupt is False
     assert reloaded.get("Test Panel") is not None
+
+
+# ----------------------------------------------------------------------------- the refresh response (display axis)
+from dlc.dip import REFRESH_RESPONSE_SCHEMA, RefreshLevel, RefreshRate, RefreshResponse  # noqa: E402
+
+
+def _response() -> RefreshResponse:
+    return RefreshResponse(
+        measured="2026-10-23", run_id="20261023_180329_refresh_trim_hdr_mon0_trim",
+        rates=[RefreshRate(key="47.952", num=48000, den=1001,
+                           levels=[RefreshLevel(nits=102.6, ratio=1.0264, u_ln=5e-4, n=2, code=520),
+                                   RefreshLevel(nits=0.518, ratio=1.0337, u_ln=7e-4, n=2, code=120)]),
+               RefreshRate(key="48", num=48, den=1, levels=[RefreshLevel(nits=102.6, ratio=1.0264)],
+                           same_as="47.952"),
+               RefreshRate(key="59.94", num=60000, den=1001, levels=[RefreshLevel(nits=102.6, ratio=1.0004)],
+                           same_as="60")],
+        identity={"hardware_id": "AUS322A", "device_path": r"\?\DISPLAY#AUS322A#5&1&UID4353#{x}"},
+        conditions={"mode": "HDR", "layers": {"desktop_gamma": False}}, peak_nits=1800.0, verdict="nonlinear")
+
+
+def test_refresh_response_round_trips_and_sorts_levels(tmp_path):
+    store = DipStore(tmp_path / "dip_store.json")
+    store.record(_dip(mode="HDR", refresh_response=_response()))
+    got = DipStore.load(tmp_path / "dip_store.json").get("Test Panel:HDR")
+    rr = got.refresh_response
+    assert rr is not None and rr.schema == REFRESH_RESPONSE_SCHEMA
+    assert rr.measured == "2026-10-23" and rr.identity["hardware_id"] == "AUS322A"
+    r = rr.rate("47.952")
+    assert (r.num, r.den) == (48000, 1001) and r.hz == 48000 / 1001
+    assert [lv.nits for lv in r.levels] == [0.518, 102.6]           # ascending, whatever the input order
+    assert rr.rate("48").same_as == "47.952" and rr.rate("59.94").same_as == "60"
+    assert rr.peak_nits == 1800.0 and rr.interpolable is False
+
+
+def test_a_record_without_a_refresh_response_is_written_exactly_as_before(tmp_path):
+    """Back-compat both ways: old records load (no section), and a record without one serialises with no key."""
+    dip = _dip(mode="HDR")
+    assert "refresh_response" not in dip.as_dict()
+    store = DipStore(tmp_path / "dip_store.json")
+    store.record(dip)
+    raw = json.loads((tmp_path / "dip_store.json").read_text(encoding="utf-8"))
+    assert "refresh_response" not in raw["displays"]["Test Panel:HDR"]
+    assert DipStore.load(tmp_path / "dip_store.json").get("Test Panel:HDR").refresh_response is None
+
+
+def test_an_unreadable_refresh_response_drops_the_section_not_the_record(tmp_path):
+    for bad in ({"measured": "2026-10-23", "rates": [{"key": "48", "num": 0, "den": 1}]},       # no rational
+                {"measured": "2026-10-23", "rates": [{"key": "48", "num": 48, "den": 1,
+                                                       "levels": [{"nits": 1.0, "ratio": float("nan")}]}]},
+                {"measured": "2026-10-23", "schema": REFRESH_RESPONSE_SCHEMA + 1},           # from a newer DLC
+                {"rates": []}):                                                               # no date
+        rec = _dip(mode="HDR").as_dict()
+        rec["refresh_response"] = bad
+        (tmp_path / "dip_store.json").write_text(json.dumps({"schema": 1, "displays": {"Test Panel:HDR": rec}}),
+                                                 encoding="utf-8")
+        store = DipStore.load(tmp_path / "dip_store.json")
+        got = store.get("Test Panel:HDR")
+        assert got is not None and not store.dropped, bad          # the record (its priors) survives
+        assert got.refresh_response is None
+        assert any("refresh_response dropped" in n for n in got.notes)

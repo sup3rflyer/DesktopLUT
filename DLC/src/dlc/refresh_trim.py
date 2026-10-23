@@ -472,3 +472,173 @@ def analyze(rows: Sequence[dict[str, Any]], *, peak_nits: Optional[float] = None
     return {"ratios": br, "combined": comb, "predictability": pred, "chromaticity": chromaticity(comb),
             "channels": channel_test(comb), "u_interp": u_interp(rows),
             "trim": trim_curves(comb, pred, peak_nits=peak_nits, meta=meta)}
+
+
+# ----------------------------------------------------------------------------- the DIP's refresh response
+# DesktopLUT applies the per-rate trim from the display's DIP (dlc.dip RefreshResponse): DLC records the MEASURED
+# response there (ratios, not gains) and DesktopLUT derives g = 1 / ratio itself at bake time. ``record`` below is the
+# step that puts a finished refresh-trim run into the DIP.
+RATIONALS: dict[str, tuple[int, int]] = {"60": (60, 1), "59.94": (60000, 1001), "50": (50, 1), "48": (48, 1),
+                                         "47.952": (48000, 1001)}
+# The frozen equality tests of the analysis (refresh_result.json "tests", PREREG_REFRESH.md): rate -> (the test, the
+# rate whose response it proved this one equal to). The reference rate's key = no effect.
+SAME_AS_TESTS: dict[str, tuple[str, str]] = {"59.94": ("P3_59_94_control", REF_RATE),
+                                             "48": ("P2_48_eq_47_952", "47.952")}
+
+
+def response_from_run(trim: dict[str, Any], tests: dict[str, Any], *, run_id: str, measured: str,
+                      identity: dict[str, Any], conditions: dict[str, Any],
+                      hz_measured: Optional[dict[str, float]] = None) -> Any:
+    """The DIP section (``dlc.dip.RefreshResponse``) for one analysed run: per measured rate its exact rational,
+    the grey levels (the 60-Hz light, the ratio, its uncertainty, the repeats), and the frozen tests' verdicts
+    (``same_as`` where an equality / control test passed; luminance-only and channel-independence per rate)."""
+    from .dip import RefreshLevel, RefreshRate, RefreshResponse   # stdlib-only; kept out of the analysis' imports
+    p5 = (tests.get("P5_luminance_only") or {}).get("per_rate") or {}
+    p6 = (tests.get("P6_channel_independent") or {}).get("per_rate") or {}
+    rates = []
+    for key, entry in sorted((trim.get("rates") or {}).items(), key=lambda kv: -float(kv[1]["hz"])):
+        if key not in RATIONALS:
+            raise ValueError(f"rate {key!r} is not in the catalogue {sorted(RATIONALS)}")
+        num, den = RATIONALS[key]
+        levels = [RefreshLevel(nits=float(k["y60_nits"]), ratio=float(k["ratio"]), u_ln=float(k["u_ln"]),
+                               n=int(k.get("n_repeats") or 0), code=int((k.get("code") or [0])[0]))
+                  for k in entry["knots"]]
+        same = None
+        if key in SAME_AS_TESTS and (tests.get(SAME_AS_TESTS[key][0]) or {}).get("ok") is True:
+            same = SAME_AS_TESTS[key][1]
+        chroma = p5.get(key) or {}
+        dxy = [v for v in (chroma.get("max_dxy_grey"), chroma.get("max_dxy_colour")) if v is not None]
+        rates.append(RefreshRate(key=key, num=num, den=den, levels=sorted(levels, key=lambda lv: lv.nits),
+                                 hz_measured=(hz_measured or {}).get(key), same_as=same,
+                                 max_dxy=max(dxy) if dxy else None,
+                                 channel_independent=(bool(p6[key]) if key in p6 else None)))
+    model = trim.get("model") or {}
+    num, den = RATIONALS[REF_RATE]
+    return RefreshResponse(measured=measured, run_id=run_id, rates=rates,
+                           reference={"key": REF_RATE, "num": num, "den": den}, identity=dict(identity),
+                           conditions=dict(conditions), peak_nits=trim.get("peak_nits"),
+                           interpolable=bool(model.get("usable_for_unmeasured_rates", False)),
+                           verdict=model.get("verdict"))
+
+
+def run_problems(evidence: dict[str, Any], trim: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    """Why a run must not go into the DIP (empty = it may). A response is only the panel's when the run was real,
+    clean, and measured through the calibration alone: desktop gamma, tone map, FALD and the refresh trim off, the
+    3D LUT bypassed. (A response measured WITH DesktopLUT's trim on would be the trim's residual, and recording it
+    would undo the trim on the next bake.)"""
+    out = []
+    meta = result.get("meta") or {}
+    if trim.get("simulated") or meta.get("simulated"):
+        out.append("simulated run")
+    if meta.get("status") != "ok" or evidence.get("status") not in (None, "ok"):
+        out.append(f"run status {meta.get('status')!r} / {evidence.get('status')!r}")
+    if int(meta.get("anomalies") or 0) or (evidence.get("anomalies") or []):
+        out.append("anomalies recorded")
+    if str(trim.get("mode") or "").upper() != "HDR":
+        out.append(f"mode {trim.get('mode')!r}: only HDR responses are recorded")
+    layers = ((trim.get("measured_through") or {}).get("layers")) or {}
+    for k in ("desktop_gamma", "tonemap", "fald", "refresh_trim"):
+        if layers.get(k):
+            out.append(f"measured with {k} on")
+    if layers.get("bypass_3dlut") is False:
+        out.append("measured through the 3D LUT")
+    if not (trim.get("display") or {}).get("hardware_id"):
+        out.append("no hardware id recorded for the display (DesktopLUT matches the panel by it)")
+    if not trim.get("rates"):
+        out.append("no measured rates")
+    return out
+
+
+def _monitor_identity(evidence: dict[str, Any]) -> dict[str, Any]:
+    for key in ("audit_stack", "audit_before"):
+        mi = (evidence.get(key) or {}).get("monitor_identity")
+        if mi:
+            return mi
+    return {}
+
+
+def _hz_measured(evidence: dict[str, Any]) -> dict[str, float]:
+    acc: dict[str, list[float]] = {}
+    for s in evidence.get("switches") or []:
+        if s.get("ok") and s.get("rate") and s.get("timing_hz"):
+            acc.setdefault(str(s["rate"]), []).append(float(s["timing_hz"]))
+    return {k: sum(v) / len(v) for k, v in acc.items()}
+
+
+def response_for_run_dir(run_dir: Path | str) -> tuple[Any, list[str], dict[str, Any]]:
+    """``(response, problems, trim)`` for a refresh-trim run folder (trim_curves.json, refresh_result.json,
+    evidence.json)."""
+    run = Path(run_dir)
+    trim = json.loads((run / "trim_curves.json").read_text(encoding="utf-8"))
+    result = json.loads((run / "refresh_result.json").read_text(encoding="utf-8"))
+    evidence = json.loads((run / "evidence.json").read_text(encoding="utf-8"))
+    mi = _monitor_identity(evidence)
+    disp = trim.get("display") or {}
+    identity = {"hardware_id": disp.get("hardware_id"), "device_path": mi.get("device_path"),
+                "edid_id": mi.get("edid_id")}
+    through = trim.get("measured_through") or {}
+    meter = evidence.get("meter") or {}
+    instruments = (meter.get("resolve") or {}).get("instruments") or [{}]
+    conditions = {"mode": trim.get("mode"), "through": "the installed MHC profile",
+                  "mhc_profile": through.get("mhc_profile"), "active_perm": through.get("active_perm"),
+                  "mhc_source": through.get("source_file"), "layers": through.get("layers"),
+                  "cube": through.get("cube"), "patch": "full field, time-bracketed against the reference rate",
+                  "instrument": instruments[0].get("description"),
+                  "correction": (meter.get("correction") or {}).get("file")}
+    started = str(evidence.get("started") or "")
+    run_id = str((result.get("meta") or {}).get("run") or run.name)
+    measured = started[:10] if len(started) >= 10 else f"{run_id[:4]}-{run_id[4:6]}-{run_id[6:8]}"
+    resp = response_from_run(trim, result.get("tests") or {}, run_id=run_id, measured=measured, identity=identity,
+                             conditions=conditions, hz_measured=_hz_measured(evidence))
+    return resp, run_problems(evidence, trim, result), trim
+
+
+def record_response(dip_path: Path | str, display: str, mode: str, response: Any, *, today: Optional[str] = None) -> Any:
+    """Put ``response`` into the display's DIP record for ``mode`` (``display:mode``, else a bare record) and save.
+    The record must exist: a refresh response belongs to a characterized display."""
+    from datetime import date
+
+    from .dip import DipStore
+    store = DipStore.load(dip_path)
+    if store.corrupt:
+        raise ValueError(f"{dip_path}: the DIP store is unreadable; not overwriting it")
+    rec = store.get(f"{display}:{mode}") or store.get(display)
+    if rec is None:
+        raise LookupError(f"no DIP record for {display!r} ({mode}) in {dip_path}: characterize the display first")
+    rec.refresh_response = response
+    rec.updated = today or date.today().isoformat()
+    store.record(rec)
+    return rec
+
+
+def _main(argv: Optional[Sequence[str]] = None) -> int:
+    import argparse
+
+    from .paths import PROJECT_DIR
+    ap = argparse.ArgumentParser(prog="python -m dlc.refresh_trim",
+                                 description="Record a refresh-trim run's measured response in the display's DIP "
+                                             "(DesktopLUT applies the trim from there).")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    rp = sub.add_parser("record", help="the run's response -> the DIP (dry run unless --write)")
+    rp.add_argument("--run", required=True, help="the refresh-trim run folder (trim_curves.json, refresh_result.json)")
+    rp.add_argument("--dip", default=str(PROJECT_DIR / "dip_store.json"), help="the DIP store (default: DLC's)")
+    rp.add_argument("--write", action="store_true", help="write it (default: show what would be written)")
+    args = ap.parse_args(argv)
+    resp, problems, trim = response_for_run_dir(args.run)
+    display = (trim.get("display") or {}).get("name")
+    print(json.dumps({"display": display, "mode": trim.get("mode"), "dip": args.dip, "problems": problems,
+                      "refresh_response": resp.as_dict()}, indent=1))
+    if problems:
+        print("NOT recorded: " + "; ".join(problems))
+        return 2
+    if not args.write:
+        print("dry run: --write records it")
+        return 0
+    record_response(args.dip, display, str(trim.get("mode")), resp)
+    print(f"recorded in {args.dip} ({display}:{trim.get('mode')}). DesktopLUT re-reads the DIP on its next refresh "
+          f"switch, the REFRESH TRIM row's RELOAD, or a layers.set refresh_trim.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

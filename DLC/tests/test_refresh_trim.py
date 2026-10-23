@@ -2,6 +2,7 @@
 frame-period law from a step, and the exported trim evaluates with the hold / extend / interpolation rules."""
 from __future__ import annotations
 
+import json
 import math
 import random
 
@@ -124,3 +125,95 @@ def test_birge_inflation_when_repeats_disagree():
     c = rt.combine(br)["48"]["g520"]
     assert c["birge"] > 1 and c["u"] > c["u_propagated"]
     assert c["ln_ratio"] == pytest.approx(0.033)
+
+
+# ----------------------------------------------------------------------------- the DIP section (what DesktopLUT reads)
+META = {"display": {"name": "Test Panel", "hardware_id": "TST1234", "monitor": 0},
+        "measured_through": {"mhc_profile": "DesktopLUT_Mon0_HDR_P4_1.icm", "active_perm": 4,
+                             "layers": {"tonemap": False, "fald": False, "desktop_gamma": False, "bypass_3dlut": True}},
+        "simulated": False}
+TESTS = {"P2_48_eq_47_952": {"ok": True}, "P3_59_94_control": {"ok": True},
+         "P5_luminance_only": {"per_rate": {"47.952": {"max_dxy_grey": 2e-4, "max_dxy_colour": 3e-4}}},
+         "P6_channel_independent": {"per_rate": {"47.952": True, "50": True}}}
+
+
+def _trim():
+    return rt.analyze(synth(), peak_nits=1800.0, meta=META)["trim"]
+
+
+def test_dip_response_carries_ratios_rationals_and_the_frozen_verdicts():
+    trim = _trim()
+    resp = rt.response_from_run(trim, TESTS, run_id="r1", measured="2026-10-23", identity={"hardware_id": "TST1234"},
+                                conditions={"mode": "HDR"}, hz_measured={"47.952": 47.952048})
+    by = {r.key: r for r in resp.rates}
+    assert set(by) == {"47.952", "48", "50", "59.94"}
+    assert (by["47.952"].num, by["47.952"].den) == (48000, 1001) and (by["59.94"].num, by["59.94"].den) == (60000, 1001)
+    # ratios, not gains (the DIP holds the measured response; DesktopLUT derives g = 1 / ratio)
+    k = {kk["patch"]: kk for kk in trim["rates"]["47.952"]["knots"]}
+    lv = {round(x.nits, 6): x for x in by["47.952"].levels}
+    assert lv[round(k["g520"]["y60_nits"], 6)].ratio == pytest.approx(k["g520"]["ratio"], rel=1e-12)
+    assert [x.nits for x in by["47.952"].levels] == sorted(x.nits for x in by["47.952"].levels)
+    assert by["48"].same_as == "47.952" and by["59.94"].same_as == "60" and by["50"].same_as is None
+    assert by["47.952"].max_dxy == 3e-4 and by["47.952"].channel_independent is True
+    assert by["47.952"].hz_measured == 47.952048 and by["50"].hz_measured is None
+    assert resp.peak_nits == 1800.0 and resp.reference == {"key": "60", "num": 60, "den": 1}
+    # a failed equality test: no same_as (each rate keeps its own levels)
+    resp2 = rt.response_from_run(trim, {"P2_48_eq_47_952": {"ok": False}}, run_id="r1", measured="2026-10-23",
+                                 identity={}, conditions={})
+    assert all(r.same_as is None for r in resp2.rates)
+
+
+def test_run_problems_refuse_a_response_not_measured_through_the_calibration_alone():
+    trim = _trim()
+    ok = {"meta": {"status": "ok", "anomalies": 0, "simulated": False}}
+    assert rt.run_problems({"status": "ok", "anomalies": []}, trim, ok) == []
+    for layer in ("desktop_gamma", "tonemap", "fald", "refresh_trim"):
+        t = json.loads(json.dumps(trim))
+        t["measured_through"]["layers"][layer] = True
+        assert any(layer in p for p in rt.run_problems({}, t, ok)), layer
+    t = json.loads(json.dumps(trim))
+    t["simulated"] = True
+    assert "simulated run" in rt.run_problems({}, t, ok)
+    assert rt.run_problems({}, trim, {"meta": {"status": "aborted"}})
+    t = json.loads(json.dumps(trim))
+    t["display"].pop("hardware_id")
+    assert any("hardware id" in p for p in rt.run_problems({}, t, ok))
+
+
+def test_record_puts_the_section_on_the_existing_mode_record_only(tmp_path):
+    from dlc.dip import DipStore, DisplayInstrumentProfile
+    path = tmp_path / "dip_store.json"
+    store = DipStore(path)
+    store.record(DisplayInstrumentProfile(display="Test Panel", mode="HDR", made="2026-06-19", cold_channel="B"))
+    store.record(DisplayInstrumentProfile(display="Test Panel", mode="SDR", made="2026-06-18"))
+    resp = rt.response_from_run(_trim(), TESTS, run_id="r1", measured="2026-10-23",
+                                identity={"hardware_id": "TST1234"}, conditions={"mode": "HDR"})
+    rt.record_response(path, "Test Panel", "HDR", resp, today="2026-10-23")
+    again = DipStore.load(path)
+    hdr, sdr = again.get("Test Panel:HDR"), again.get("Test Panel:SDR")
+    assert hdr.refresh_response is not None and hdr.refresh_response.run_id == "r1"
+    assert hdr.cold_channel == "B" and hdr.made == "2026-06-19" and hdr.updated == "2026-10-23"   # priors kept
+    assert sdr.refresh_response is None
+    with pytest.raises(LookupError):
+        rt.record_response(path, "Other Panel", "HDR", resp)
+
+
+def test_record_cli_is_a_dry_run_unless_written(tmp_path):
+    from dlc.dip import DipStore, DisplayInstrumentProfile
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "trim_curves.json").write_text(json.dumps(_trim()), encoding="utf-8")
+    (run / "refresh_result.json").write_text(json.dumps({"meta": {"run": "r9", "status": "ok", "anomalies": 0},
+                                                         "tests": TESTS}), encoding="utf-8")
+    (run / "evidence.json").write_text(json.dumps({"started": "2026-10-23T18:03:29", "status": "ok",
+                                                   "audit_stack": {"monitor_identity": {"device_path": "p",
+                                                                                        "edid_id": "TST1234-1"}}}),
+                                       encoding="utf-8")
+    dip = tmp_path / "dip_store.json"
+    DipStore(dip).record(DisplayInstrumentProfile(display="Test Panel", mode="HDR", made="2026-06-19"))
+    assert rt._main(["record", "--run", str(run), "--dip", str(dip)]) == 0
+    assert DipStore.load(dip).get("Test Panel:HDR").refresh_response is None
+    assert rt._main(["record", "--run", str(run), "--dip", str(dip), "--write"]) == 0
+    rr = DipStore.load(dip).get("Test Panel:HDR").refresh_response
+    assert rr.run_id == "r9" and rr.measured == "2026-10-23"
+    assert rr.identity == {"hardware_id": "TST1234", "device_path": "p", "edid_id": "TST1234-1"}

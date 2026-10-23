@@ -19,6 +19,12 @@ Three axes (see ``stage_characterize``):
 Persisted per-display like :mod:`dlc.correction_store` (a JSON file keyed by display
 name, with a ``made`` date for staleness). Local-only / private. Dependency-free
 (stdlib only) so importing it is free.
+
+**Refresh response** (display axis, ``refresh_response``, schema 1, 2026-10-23): how the panel's light at
+other refresh rates compares with the reference rate, per measured rate and level — a measured response,
+NOT a correction. DLC records it from a refresh-trim run (``dlc.refresh_trim record``); DesktopLUT reads it
+from this file and derives its per-rate MHC trim itself (g = 1 / ratio). Optional: a record without it
+loads as before, and an unreadable section is dropped (noted) without dropping the record.
 """
 
 from __future__ import annotations
@@ -31,7 +37,10 @@ from typing import Any, Optional
 
 from .paths import atomic_write_text
 
-__all__ = ["NoiseBand", "DisplayInstrumentProfile", "DipStore"]
+__all__ = ["NoiseBand", "DisplayInstrumentProfile", "DipStore", "RefreshLevel", "RefreshRate",
+           "RefreshResponse", "REFRESH_RESPONSE_SCHEMA"]
+
+REFRESH_RESPONSE_SCHEMA = 1
 
 
 @dataclass
@@ -59,6 +68,116 @@ class NoiseBand:
         )
 
 
+def _finite(v: Any, what: str) -> float:
+    f = float(v)
+    if not math.isfinite(f):
+        raise ValueError(f"{what} is not finite")
+    return f
+
+
+@dataclass
+class RefreshLevel:
+    """One level of a measured refresh response: the panel's light at the rate over its light at the
+    reference rate, for a full-field grey whose reference-rate light is ``nits``."""
+
+    nits: float                       # the reference-rate light of the grey at that drive (cd/m2): the key
+    ratio: float                      # light at the rate / light at the reference rate, time-bracketed
+    u_ln: Optional[float] = None      # 1-sigma uncertainty of ln(ratio)
+    n: int = 0                        # bracketed repeats combined
+    code: Optional[int] = None        # the patch's 10-bit signal code (informational)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RefreshLevel":
+        nits, ratio = _finite(d["nits"], "nits"), _finite(d["ratio"], "ratio")
+        if nits <= 0 or ratio <= 0:
+            raise ValueError("a refresh level needs nits > 0 and ratio > 0")
+        return cls(nits=nits, ratio=ratio, u_ln=_opt_float(d.get("u_ln")), n=int(d.get("n", 0) or 0),
+                   code=(int(d["code"]) if d.get("code") is not None else None))
+
+
+@dataclass
+class RefreshRate:
+    """One measured refresh rate: its exact rational, the levels, and the frozen tests' verdicts."""
+
+    key: str                          # the catalogue name ("47.952")
+    num: int                          # the rate's exact rational (48000 / 1001)
+    den: int
+    levels: list[RefreshLevel] = field(default_factory=list)   # ascending nits
+    hz_measured: Optional[float] = None    # the switch read-backs' mean
+    # The rate whose response this one is indistinguishable from (the frozen equality / control tests): a
+    # consumer uses THAT rate's levels for this one. The reference rate's key means "no effect" (59.94 vs 60).
+    same_as: Optional[str] = None
+    max_dxy: Optional[float] = None        # largest chromaticity move on any patch (luminance-only check)
+    channel_independent: Optional[bool] = None
+
+    @property
+    def hz(self) -> float:
+        return self.num / self.den
+
+    def as_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["levels"] = [lv.as_dict() for lv in self.levels]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RefreshRate":
+        num, den = int(d["num"]), int(d["den"])
+        if num <= 0 or den <= 0:
+            raise ValueError("a refresh rate needs a positive rational")
+        levels = sorted((RefreshLevel.from_dict(x) for x in (d.get("levels") or [])), key=lambda lv: lv.nits)
+        return cls(key=str(d["key"]), num=num, den=den, levels=levels, hz_measured=_opt_float(d.get("hz_measured")),
+                   same_as=(str(d["same_as"]) if d.get("same_as") is not None else None),
+                   max_dxy=_opt_float(d.get("max_dxy")),
+                   channel_independent=(bool(d["channel_independent"]) if d.get("channel_independent") is not None
+                                        else None))
+
+
+@dataclass
+class RefreshResponse:
+    """The display's measured refresh response in one mode (the record's): per measured rate, the light
+    against the reference rate (60 Hz) at each level, with the run, the date, the identity of the panel it
+    was measured on and the conditions. A measured response, NOT a correction."""
+
+    measured: str                                   # YYYY-MM-DD (the staleness clock of this section)
+    run_id: str
+    rates: list[RefreshRate] = field(default_factory=list)
+    reference: dict[str, Any] = field(default_factory=lambda: {"key": "60", "num": 60, "den": 1})
+    # The panel it was measured on: hardware_id = EDID vendor + product ("AUS322A", what DesktopLUT matches),
+    # device_path (twin panels: the connector), edid_id (DesktopLUT's EdidId when known: id + serial).
+    identity: dict[str, Any] = field(default_factory=dict)
+    # How it was measured (mode, through which MHC profile, with which layers off, the patch, the meter).
+    conditions: dict[str, Any] = field(default_factory=dict)
+    peak_nits: Optional[float] = None               # the panel peak a consumer extends the top level to
+    interpolable: bool = False                      # the frozen predictability verdict: unmeasured rates may be
+    #                                                 interpolated (False: only the measured rates have a response)
+    verdict: Optional[str] = None                   # "nonlinear" | "linear in frame period" | ...
+    schema: int = REFRESH_RESPONSE_SCHEMA
+    notes: list[str] = field(default_factory=list)
+
+    def rate(self, key: str) -> Optional[RefreshRate]:
+        return next((r for r in self.rates if r.key == key), None)
+
+    def as_dict(self) -> dict[str, Any]:
+        d = asdict(self)
+        d["rates"] = [r.as_dict() for r in self.rates]
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "RefreshResponse":
+        schema = int(d.get("schema", REFRESH_RESPONSE_SCHEMA))
+        if schema > REFRESH_RESPONSE_SCHEMA:
+            raise ValueError(f"refresh_response schema {schema} is newer than this DLC ({REFRESH_RESPONSE_SCHEMA})")
+        ref = dict(d.get("reference") or {"key": "60", "num": 60, "den": 1})
+        return cls(measured=str(d["measured"]), run_id=str(d.get("run_id") or ""),
+                   rates=[RefreshRate.from_dict(r) for r in (d.get("rates") or [])], reference=ref,
+                   identity=dict(d.get("identity") or {}), conditions=dict(d.get("conditions") or {}),
+                   peak_nits=_opt_float(d.get("peak_nits")), interpolable=bool(d.get("interpolable", False)),
+                   verdict=d.get("verdict"), schema=schema, notes=list(d.get("notes") or []))
+
+
 @dataclass
 class DisplayInstrumentProfile:
     """One display+meter pair's measured behavioural model. All fields optional so a
@@ -84,6 +203,7 @@ class DisplayInstrumentProfile:
     #   capture lands → choose_peak_nits falls back to native_white_nits and flags it.
     native_black_nits: Optional[float] = None
     native_primaries: Optional[dict[str, list[float]]] = None    # {"R":[x,y],"G":..,"B":..}
+    refresh_response: Optional[RefreshResponse] = None   # the light at other refresh rates vs the reference (above)
     eotf_undershoot: Optional[float] = None       # HDR: full-field measured-vs-requested luminance error
     #   (e.g. -0.06 = panel renders ~6% below the PQ target across the range — a calibratable gain)
     white_vs_luminance: Optional[list[list[float]]] = None  # HDR: [[nits, x, y], ...] — the panel's
@@ -132,12 +252,24 @@ class DisplayInstrumentProfile:
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["noise_model"] = [b.as_dict() for b in self.noise_model]
+        if self.refresh_response is None:
+            d.pop("refresh_response")        # a record without one is written exactly as before
+        else:
+            d["refresh_response"] = self.refresh_response.as_dict()
         return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "DisplayInstrumentProfile":
         bands = [NoiseBand.from_dict(b) for b in (d.get("noise_model") or [])]
         bands.sort(key=lambda b: b.nits)
+        notes = list(d.get("notes") or [])
+        refresh = None
+        if d.get("refresh_response"):
+            # The section is optional: an unreadable one is dropped (and said), the record's priors are kept.
+            try:
+                refresh = RefreshResponse.from_dict(d["refresh_response"])
+            except (KeyError, TypeError, ValueError) as exc:
+                notes.append(f"refresh_response dropped (unreadable: {exc})")
         return cls(
             display=d["display"],
             mode=d.get("mode"),
@@ -151,6 +283,7 @@ class DisplayInstrumentProfile:
             sustained_peak_nits=_opt_float(d.get("sustained_peak_nits")),
             native_black_nits=_opt_float(d.get("native_black_nits")),
             native_primaries=(dict(d["native_primaries"]) if d.get("native_primaries") else None),
+            refresh_response=refresh,
             eotf_undershoot=_opt_float(d.get("eotf_undershoot")),
             white_vs_luminance=([[float(c) for c in row] for row in d["white_vs_luminance"]]
                                 if d.get("white_vs_luminance") else None),
@@ -171,7 +304,7 @@ class DisplayInstrumentProfile:
             made=d.get("made"),
             max_age_days=(int(d["max_age_days"]) if d.get("max_age_days") is not None else None),
             updated=d.get("updated"),
-            notes=list(d.get("notes") or []),
+            notes=notes,
         )
 
     # -- read-policy bridges ---------------------------------------------
