@@ -442,6 +442,24 @@ ui::Snapshot FakeSnapshot() {
     a.dlcRecord[1].correctionDaysAgo = 44;
     a.reportedPeakNits = 10000;   // Windows reports the bypass
     a.edidPeakNits = 1600;
+    {   // the refresh-rate trim at 47.952 Hz, on screen (refresh_trim.h)
+        RefreshTrimStatus& t = a.refreshTrim;
+        t.monitor = 0;
+        t.liveHz = 47.952;
+        t.num = 47952;
+        t.den = 1000;
+        t.state = "trim";
+        t.detail = "47.952 Hz";
+        t.rateKey = "47.952";
+        t.wantStamp = t.activeStamp = "0123456789abcdef";
+        t.installed = t.applied = true;
+        t.recordKey = "Asus ProArt PA32UCXR:HDR";
+        t.measured = "2026-10-23";
+        t.runId = "20261023_180329_refresh_trim_hdr_mon0_trim";
+        t.ageDays = 0;
+        t.rates = { "59.94 Hz = 60", "50 Hz trim (8 levels)", "48 Hz = 47.952", "47.952 Hz trim (8 levels)" };
+        t.gain[0] = 0.967; t.gain[1] = 0.974; t.gain[2] = 0.990;
+    }
     s.live.push_back(a);
 
     ui::DisplayRow b;
@@ -514,6 +532,11 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     const Shot shots[] = {
         { "tonemap", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1 },
         { "grayscale", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1 },
+        // the REFRESH TRIM row: 29 at 60 Hz (none), 30 no DIP data, 31 switched off, 32 waiting for a calibration
+        { "grayscale60", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 29 },
+        { "grayscalenodip", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 30 },
+        { "grayscaleoff", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 31 },
+        { "grayscalewait", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 920, 520, 32 },
         { "sdr", ui::Page::Pipeline, ui::StageId::Lut3D, 1, false, -1, -1 },
         { "events", ui::Page::Events, ui::StageId::ToneMap, 0, false, -1, -1 },
         { "settings", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1 },
@@ -677,6 +700,21 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     g.state = shot.variant == 26 ? FaldFadeGovState::SuspendedBudget
                             : shot.variant == 27 ? FaldFadeGovState::SuspendedWeakGpu : FaldFadeGovState::Forced;
                     g.p90Ms = 9.4; g.budgetMs = shot.variant == 28 ? 0.0 : 6.3; g.contentMs = 41.7; g.refreshMs = 6.94;
+                } else if (shot.variant >= 29 && shot.variant <= 32) {
+                    RefreshTrimStatus& t = snap.live[0].refreshTrim;
+                    if (shot.variant == 29) {
+                        t.liveHz = 60.0; t.num = 60; t.den = 1; t.state = "reference"; t.detail = "60 Hz is the reference";
+                        t.rateKey.clear(); t.wantStamp.clear(); t.activeStamp.clear();
+                    } else if (shot.variant == 30) {
+                        t = RefreshTrimStatus{};
+                        t.monitor = 0; t.liveHz = 47.952; t.state = "no_dip";
+                        t.detail = "no DIP (dip_store.json) in the DLC folder";
+                    } else if (shot.variant == 31) {
+                        snap.live[0].settings.hdrMHC.refreshTrimEnabled = false;
+                        t.state = "off"; t.wantStamp.clear(); t.applied = false;
+                    } else {
+                        t.waiting = "calibration"; t.applied = false; t.activeStamp.clear();
+                    }
                 } else if (shot.variant == 23 || shot.variant == 25) {
                     FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;
                     f.star.enabled = true;

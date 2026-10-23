@@ -32,6 +32,7 @@ always check *which struct* you hold before reasoning about the value.
 | `MHC2ProfileParams::peakNits` ([mhc.h:23](../src/mhc.h)) | Dual-use: grayscale curve scaling for LUT gen + HDR luminance **metadata (MaxCLL)** — the metadata only while `reportedPeakNits` is 0 | config input |
 | `MHCSettings::metaPeakNits` ([types.h:756](../src/types.h)) | HDR MHC2 luminance **metadata (MaxCLL)** label only; `0` = not set | metadata |
 | `MHC2ProfileParams::reportedPeakNits` ([mhc.h](../src/mhc.h)) | The peak an HDR profile's **luminance tags** tell Windows (lumi, MHC2 max luminance): 10000 for the Windows tone map bypass (`PERM_PEAK_MAX`), `0` = `peakNits`. Never scales a curve | metadata |
+| `MhcRefreshTrim::peakNits` ([types.h](../src/types.h)) | Where the refresh-rate trim's top extension stops (the gain is held above it): the DIP section's `peak_nits`, else the profile's metadata peak (`MhcProfileMetadataPeakNits`). Never scales a curve, never reaches a luminance tag | config input |
 | `TonemapData::sourcePeakNits` / `targetPeakNits` ([types.h:481-482](../src/types.h)) | Tonemapper **input** (content) peak / **output** (display) peak | config input |
 | `TonemapSettings::sourcePeakNits` / `targetPeakNits` ([types.h:683-684](../src/types.h)) | Settings-side mirror of the tonemap pair | config input |
 | `AnalysisResult::peakNits` ([types.h:309](../src/types.h)) | **MEASURED** peak read off the screen by the analysis overlay | observation |

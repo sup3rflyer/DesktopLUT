@@ -122,7 +122,10 @@ void TakeSnapshot(Snapshot& out) {
             out.parked.push_back(std::move(r));
         }
     }
+    const std::vector<RefreshTrimStatus> trims = GetRefreshTrimStatus();
     for (DisplayRow& r : out.live) {
+        for (const RefreshTrimStatus& t : trims)
+            if (t.monitor == r.liveIndex) r.refreshTrim = t;
         const ModeEntry* m = FindMode(r.hmon);
         r.mode = m ? m->mode : Mode::Unknown;
         r.reportedPeakNits = m && r.mode == Mode::HDR ? m->maxLuminance : 0.0f;

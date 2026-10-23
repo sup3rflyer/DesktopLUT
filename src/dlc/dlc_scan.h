@@ -43,8 +43,16 @@ struct ScanCache {
 std::shared_ptr<Data> ScanFolder(const std::wstring& folder, ScanCache& cache, const std::string& today,
                                  const std::atomic<bool>* cancel = nullptr);
 
+// <folder>\dip_store.json (DLC keeps it beside its profile): parsed, and the FNV-1a hash of its bytes. False (out
+// empty, hash 0) when there is none or it is not a DIP store. Touches the file system (the scan worker; the refresh
+// trim's one synchronous read at startup).
+bool ReadDipStore(const std::wstring& folder, DipStoreData& out, uint64_t& hash);
+
 // ---- the worker ------------------------------------------------------------------------------------
 void SetScanListener(std::function<void()> onChange);   // called on the worker after each publish / load
+// Called on the worker after a publish whose dip_store.json differs from the previous publish's (another folder, the
+// file appeared, went or changed): the refresh trim's cue to resolve its displays again. Any thread may set it.
+void SetDipListener(std::function<void()> onChange);
 // Any thread; coalesced; starts the worker. The worker resolves the folder (ResolveFolder) and scans it. Returns the
 // request's number: Data::request of the scan that answers it.
 uint64_t RequestScan(const std::wstring& configured, const std::vector<std::wstring>& candidates);

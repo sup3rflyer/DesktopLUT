@@ -109,6 +109,10 @@ bool QuerySdrWhiteNitsForHMonitor(HMONITOR hMonitor, float& outNits);
 // name match needs the source-name query, which can transiently fail mid-modeset).
 bool ResolveDisplayInfoForHMonitor(HMONITOR hMonitor, DisplayInfo& outInfo);
 
+// The refresh rate the display's target is driven at now: the target mode's vSyncFreq rational (what the timing gives;
+// DLC's refresh probe reads the same field), else the path's refresh rate. False when the display has no active path.
+bool QueryDisplayRefreshRate(const DisplayInfo& display, UINT32& numerator, UINT32& denominator);
+
 // Is the display compositing in HDR right now? The fresh DXGI colour space decides (the project's HDR test),
 // but only after the cheap DisplayConfig mode query allows it: a display it reports as SDR, or as WCG/ACM via
 // the 24H2+ query, is answered without creating a DXGI factory.

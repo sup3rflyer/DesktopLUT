@@ -1,0 +1,386 @@
+{
+ "schema": 1,
+ "displays": {
+  "Asus ProArt PA32UCXR:HDR": {
+   "display": "Asus ProArt PA32UCXR",
+   "mode": "HDR",
+   "noise_model": [],
+   "noise_floor_nits": null,
+   "read_overhead_s": null,
+   "settle_seconds": null,
+   "settle_by_level": null,
+   "native_white_xy": null,
+   "native_white_nits": null,
+   "sustained_peak_nits": null,
+   "native_black_nits": null,
+   "native_primaries": null,
+   "refresh_response": {
+    "measured": "2026-10-23",
+    "run_id": "20261023_180329_refresh_trim_hdr_mon0_trim",
+    "rates": [
+     {
+      "key": "59.94",
+      "num": 60000,
+      "den": 1001,
+      "levels": [
+       {
+        "nits": 0.517805708814874,
+        "ratio": 1.0003355831783391,
+        "u_ln": 0.00018880349782259616,
+        "n": 2,
+        "code": 120
+       },
+       {
+        "nits": 2.0541456913067413,
+        "ratio": 1.000510767487883,
+        "u_ln": 0.00023148117324246916,
+        "n": 2,
+        "code": 193
+       },
+       {
+        "nits": 10.283905012595849,
+        "ratio": 1.0003284163878625,
+        "u_ln": 0.0002471539355401804,
+        "n": 2,
+        "code": 307
+       },
+       {
+        "nits": 51.214423595145846,
+        "ratio": 1.0007635442810778,
+        "u_ln": 0.000254133182481467,
+        "n": 2,
+        "code": 451
+       },
+       {
+        "nits": 102.71962888698545,
+        "ratio": 1.0004151078459247,
+        "u_ln": 0.00015881216855582529,
+        "n": 2,
+        "code": 520
+       },
+       {
+        "nits": 208.38998596232122,
+        "ratio": 1.0003840138744697,
+        "u_ln": 0.00017957266658096303,
+        "n": 2,
+        "code": 594
+       },
+       {
+        "nits": 517.6504053008259,
+        "ratio": 1.0002755716957847,
+        "u_ln": 0.00011333476748354895,
+        "n": 2,
+        "code": 693
+       },
+       {
+        "nits": 1022.1806597167282,
+        "ratio": 1.000238991055235,
+        "u_ln": 6.422399216655489e-05,
+        "n": 2,
+        "code": 770
+       }
+      ],
+      "hz_measured": 59.94005994005994,
+      "same_as": "60",
+      "max_dxy": 6.63968215940669e-05,
+      "channel_independent": true
+     },
+     {
+      "key": "50",
+      "num": 50,
+      "den": 1,
+      "levels": [
+       {
+        "nits": 0.5178315112939988,
+        "ratio": 1.0297897329860712,
+        "u_ln": 0.0003477443876232613,
+        "n": 2,
+        "code": 120
+       },
+       {
+        "nits": 2.054572642385562,
+        "ratio": 1.0306087657479008,
+        "u_ln": 0.0006716897377954945,
+        "n": 2,
+        "code": 193
+       },
+       {
+        "nits": 10.282125833396737,
+        "ratio": 1.0301189011682639,
+        "u_ln": 0.00024699313274852955,
+        "n": 2,
+        "code": 307
+       },
+       {
+        "nits": 51.21319070428716,
+        "ratio": 1.0268029023465624,
+        "u_ln": 0.0002808505067724246,
+        "n": 2,
+        "code": 451
+       },
+       {
+        "nits": 102.69345596327842,
+        "ratio": 1.0238969026201075,
+        "u_ln": 0.00016550468063878851,
+        "n": 2,
+        "code": 520
+       },
+       {
+        "nits": 208.37928474792753,
+        "ratio": 1.0197928523757258,
+        "u_ln": 0.0001399215161444339,
+        "n": 2,
+        "code": 594
+       },
+       {
+        "nits": 517.6028692098544,
+        "ratio": 1.0139687785237446,
+        "u_ln": 0.00011635620724639714,
+        "n": 2,
+        "code": 693
+       },
+       {
+        "nits": 1022.1326584121209,
+        "ratio": 1.009106114234007,
+        "u_ln": 8.606083859433705e-05,
+        "n": 2,
+        "code": 770
+       }
+      ],
+      "hz_measured": 50.0,
+      "same_as": null,
+      "max_dxy": 0.0002502632903927937,
+      "channel_independent": true
+     },
+     {
+      "key": "48",
+      "num": 48,
+      "den": 1,
+      "levels": [
+       {
+        "nits": 0.517855863442467,
+        "ratio": 1.0332999503762146,
+        "u_ln": 0.0005170042955152058,
+        "n": 2,
+        "code": 120
+       },
+       {
+        "nits": 2.0545996981731443,
+        "ratio": 1.0338144623620507,
+        "u_ln": 0.000422190562239118,
+        "n": 2,
+        "code": 193
+       },
+       {
+        "nits": 10.279697800474532,
+        "ratio": 1.033879011548662,
+        "u_ln": 0.0005064613592068399,
+        "n": 2,
+        "code": 307
+       },
+       {
+        "nits": 51.20057558402343,
+        "ratio": 1.0295564654220208,
+        "u_ln": 0.00027410344777830265,
+        "n": 2,
+        "code": 451
+       },
+       {
+        "nits": 102.65089983510359,
+        "ratio": 1.0264451860995447,
+        "u_ln": 0.0002506543533113952,
+        "n": 2,
+        "code": 520
+       },
+       {
+        "nits": 208.30556237700705,
+        "ratio": 1.021656967252994,
+        "u_ln": 0.0002195534284564741,
+        "n": 2,
+        "code": 594
+       },
+       {
+        "nits": 517.488696829449,
+        "ratio": 1.0150416597640544,
+        "u_ln": 0.00022729703346299884,
+        "n": 2,
+        "code": 693
+       },
+       {
+        "nits": 1022.0236615190225,
+        "ratio": 1.0098303224283507,
+        "u_ln": 5.698230668092568e-05,
+        "n": 2,
+        "code": 770
+       }
+      ],
+      "hz_measured": 48.0,
+      "same_as": "47.952",
+      "max_dxy": 0.0002723061469776522,
+      "channel_independent": true
+     },
+     {
+      "key": "47.952",
+      "num": 48000,
+      "den": 1001,
+      "levels": [
+       {
+        "nits": 0.517897359885338,
+        "ratio": 1.0336931689469726,
+        "u_ln": 0.0006865525085287296,
+        "n": 2,
+        "code": 120
+       },
+       {
+        "nits": 2.054202897454582,
+        "ratio": 1.034186458500978,
+        "u_ln": 0.00040032460949224614,
+        "n": 2,
+        "code": 193
+       },
+       {
+        "nits": 10.276666158354663,
+        "ratio": 1.0336766369688246,
+        "u_ln": 0.0004676917204364151,
+        "n": 2,
+        "code": 307
+       },
+       {
+        "nits": 51.16901126807106,
+        "ratio": 1.0299940962883498,
+        "u_ln": 0.0005788659669577722,
+        "n": 2,
+        "code": 451
+       },
+       {
+        "nits": 102.60269618274563,
+        "ratio": 1.0264450782475134,
+        "u_ln": 0.0005345902548158512,
+        "n": 2,
+        "code": 520
+       },
+       {
+        "nits": 208.1960304524718,
+        "ratio": 1.0216833901696825,
+        "u_ln": 0.0006487939140473582,
+        "n": 2,
+        "code": 594
+       },
+       {
+        "nits": 517.2398785817759,
+        "ratio": 1.0152635619503396,
+        "u_ln": 0.00021196447641882784,
+        "n": 2,
+        "code": 693
+       },
+       {
+        "nits": 1021.7544528181559,
+        "ratio": 1.0099562094316767,
+        "u_ln": 0.00019317186873394436,
+        "n": 2,
+        "code": 770
+       }
+      ],
+      "hz_measured": 47.952047952047955,
+      "same_as": null,
+      "max_dxy": 0.0002725228991994344,
+      "channel_independent": true
+     }
+    ],
+    "reference": {
+     "key": "60",
+     "num": 60,
+     "den": 1
+    },
+    "identity": {
+     "hardware_id": "AUS322A",
+     "device_path": "\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}",
+     "edid_id": "AUS322A-335544320"
+    },
+    "conditions": {
+     "mode": "HDR",
+     "through": "the installed MHC profile",
+     "mhc_profile": "DesktopLUT_Mon0_HDR_P4_6083234.icm",
+     "active_perm": 4,
+     "mhc_source": "H:\\Projects\\DesktopLUT\\DLC\\runs\\20260924_132412_307436_hdr_asus_proart_pa32ucxr\\generated\\mhc_base_hdr.cube",
+     "layers": {
+      "tonemap": false,
+      "fald": false,
+      "desktop_gamma": false,
+      "bypass_3dlut": true,
+      "white_balance": false,
+      "grayscale": true,
+      "bypass_primaries": false,
+      "bypass_grayscale": false,
+      "tonemap_dynamic": true,
+      "tonemap_target_peak": 1700,
+      "desktop_gamma_baked_sdr_white_nits": null
+     },
+     "cube": "bypassed",
+     "patch": "full field, time-bracketed against the reference rate",
+     "instrument": "'hid:/13 (X-Rite i1 DisplayPro, ColorMunki Display)'",
+     "correction": "third_party\\argyll\\3.3.0\\bin\\Asus_ProArt_PA32UCXR_HDR-ColorChecker-i1Display3.ccmx"
+    },
+    "peak_nits": 1800.0,
+    "interpolable": false,
+    "verdict": "nonlinear",
+    "schema": 1,
+    "notes": []
+   },
+   "eotf_undershoot": null,
+   "white_vs_luminance": null,
+   "warmup_reads_to_settle": null,
+   "thermal_tau_patches": null,
+   "warmup_minutes": null,
+   "fluctuation_envelope": null,
+   "warmin_magnitude": null,
+   "warm_balance": null,
+   "thermal_regime": null,
+   "cold_channel": "B",
+   "creep_rate_de_per_min": null,
+   "recommended_neutral_interval": null,
+   "recommended_drift_threshold": null,
+   "instrument": null,
+   "correction_file": null,
+   "patch_window_area_pct": null,
+   "made": "2026-06-19",
+   "max_age_days": null,
+   "updated": null,
+   "notes": []
+  },
+  "Asus ProArt PA32UCXR:SDR": {
+   "display": "Asus ProArt PA32UCXR",
+   "mode": "SDR",
+   "noise_model": [],
+   "noise_floor_nits": null,
+   "read_overhead_s": null,
+   "settle_seconds": null,
+   "settle_by_level": null,
+   "native_white_xy": null,
+   "native_white_nits": null,
+   "sustained_peak_nits": null,
+   "native_black_nits": null,
+   "native_primaries": null,
+   "eotf_undershoot": null,
+   "white_vs_luminance": null,
+   "warmup_reads_to_settle": null,
+   "thermal_tau_patches": null,
+   "warmup_minutes": null,
+   "fluctuation_envelope": null,
+   "warmin_magnitude": null,
+   "warm_balance": null,
+   "thermal_regime": null,
+   "cold_channel": null,
+   "creep_rate_de_per_min": null,
+   "recommended_neutral_interval": null,
+   "recommended_drift_threshold": null,
+   "instrument": null,
+   "correction_file": null,
+   "patch_window_area_pct": null,
+   "made": "2026-06-18",
+   "max_age_days": null,
+   "updated": null,
+   "notes": []
+  }
+ }
+}

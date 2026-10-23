@@ -70,6 +70,47 @@ struct CorrectionRecord {
 };
 std::vector<CorrectionRecord> ParseCorrectionStore(const std::string& json);
 
+// ---- dip_store.json: the refresh response per display and mode (DLC dip.py RefreshResponse, schema 1) -----------
+// A measured response, not a correction: per measured refresh rate, the panel's light at that rate over its light at
+// the reference rate (60 Hz) for full-field greys keyed by their 60-Hz light. DesktopLUT derives its per-rate MHC
+// trim from it (refresh_trim.h).
+constexpr int kDipRefreshSchema = 1;            // the newest section schema this build reads
+struct DipRefreshLevel {
+    double nits = kNaN;     // the reference-rate light (cd/m2), > 0
+    double ratio = kNaN;    // light at the rate / at the reference rate, > 0
+    double uLn = kNaN;      // 1-sigma of ln(ratio); NaN = not given
+    int n = 0;              // repeats combined
+};
+struct DipRefreshRate {
+    std::string key;                       // the catalogue name ("47.952")
+    uint32_t num = 0, den = 0;             // the exact rational (48000 / 1001)
+    double hz = kNaN;                      // num / den
+    std::vector<DipRefreshLevel> levels;   // ascending nits
+    std::string sameAs;                    // DLC's verdict: this rate's response is that rate's ("" none; the
+                                           // reference's key = no effect)
+};
+struct DipRefreshSection {
+    std::string recordKey;                 // the DIP record ("Asus ProArt PA32UCXR:HDR")
+    std::string display, mode;             // the record's display name, mode ("HDR"; from the key when absent)
+    int schema = 0;
+    std::string measured, runId;           // YYYY-MM-DD, the run
+    std::string referenceKey = "60";
+    uint32_t referenceNum = 60, referenceDen = 1;
+    std::string hardwareId;                // identity.hardware_id, upper case: the EDID vendor + product it was measured on
+    std::wstring devicePath;               // identity.device_path (the connector; twin panels)
+    std::string edidId;                    // identity.edid_id (informational)
+    double peakNits = kNaN;
+    bool interpolable = false;             // unmeasured rates may be interpolated (DesktopLUT never does: measured only)
+    int maxAgeDays = -1;                   // the record's max_age_days (-1: not set)
+    std::vector<DipRefreshRate> rates;
+    std::string error;                     // non-empty: present but unusable, and why
+};
+struct DipStoreData {
+    bool readable = false;                 // the file parsed as a DIP store
+    std::vector<DipRefreshSection> refresh;   // one per record that carries a refresh_response
+};
+DipStoreData ParseDipStore(const std::string& json);
+
 // ---- report.json ------------------------------------------------------------------------------------
 struct Verification {
     bool present = false;

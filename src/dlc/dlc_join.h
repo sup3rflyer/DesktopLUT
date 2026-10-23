@@ -28,6 +28,9 @@ struct Data {
     Profile profile;
     std::vector<StackRecord> stacks;
     std::vector<CorrectionRecord> corrections;
+    bool dipFound = false;                  // dip_store.json was there and readable
+    DipStoreData dip;                       // its refresh responses (refresh_trim.h)
+    uint64_t dipHash = 0;                   // FNV-1a of the file's bytes (0: no file): what changed between scans
     std::vector<Report> reports;            // newest first
     std::string today;                      // the scan's date, YYYY-MM-DD
 };

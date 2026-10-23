@@ -91,6 +91,7 @@
     <ClCompile Include="src\analysis.cpp" />
     <ClCompile Include="src\processing.cpp" />
     <ClCompile Include="src\windows_tonemap.cpp" />
+    <ClCompile Include="src\refresh_trim.cpp" />
     <ClCompile Include="src\gui.cpp" />
     <ClCompile Include="src\gui_layout.cpp" />
     <ClCompile Include="src\gui_shared.cpp" />
@@ -186,6 +187,8 @@
     <ClCompile Include="tests\test_hdr_dither.cpp" />
     <ClCompile Include="tests\test_desktop_gamma.cpp" />
     <ClCompile Include="tests\test_desktop_gamma_refresh.cpp" />
+    <ClCompile Include="tests\test_mhc_golden.cpp" />
+    <ClCompile Include="tests\test_refresh_trim.cpp" />
     <ClCompile Include="tests\test_ipc_json.cpp" />
     <ClCompile Include="tests\test_ipc_grayscale.cpp" />
     <ClCompile Include="tests\test_ipc_pipe.cpp" />

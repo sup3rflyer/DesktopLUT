@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cwchar>
+#include <cwctype>
 #include <cmath>
 #include <iostream>
 #include <locale.h>
@@ -491,8 +492,18 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
             const std::wstring stampKey = p + L"MHCPermDgWhite" + std::to_wstring(k);
             if (keep) WritePrivateProfileFloat(section, stampKey.c_str(), mhc.permDgWhiteNits[k], iniPath);
             else IniWriteString(section, stampKey.c_str(), nullptr, iniPath);
+            // ...and the refresh trim it was baked with: only while it carries one (an untrimmed cache, every cache
+            // before the trim existed, writes nothing here).
+            const std::wstring trimKey = p + L"MHCPermTrim" + std::to_wstring(k);
+            const std::string& trim = mhc.permTrimStamp[k];
+            const std::wstring trimW(trim.begin(), trim.end());
+            IniWriteString(section, trimKey.c_str(), (keep && !mhc.permPaths[k].empty() && !trim.empty()) ? trimW.c_str()
+                                                                                                         : nullptr,
+                           iniPath);
         }
     }
+    // The refresh-trim switch (HDR): written only when off — absent = on.
+    if (isHDR) IniWriteString(section, (p + L"MHCRefreshTrim").c_str(), mhc.refreshTrimEnabled ? nullptr : L"0", iniPath);
 
     // Correction grayscale (fine-tuning on top of base)
     WritePrivateProfileBool(section, (p + L"MHCCorrGSEnabled").c_str(), mhc.correctionGrayscale.enabled, iniPath);
@@ -715,8 +726,25 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
                 bool parsed = end && end != stampBuf;
                 mhc.permDgWhiteNits[k] = (parsed && (stamp == 0.0f || IsValidSdrWhiteNits(stamp))) ? stamp : -1.0f;
             }
+            // The refresh trim it was baked with. Absent = none (every cache before the trim existed). Anything but
+            // a stamp's 16 hex digits marks the entry stale for every trim, "none" included (regenerated).
+            wchar_t trimBuf[40] = {};
+            GetPrivateProfileStringW(section, (p + L"MHCPermTrim" + std::to_wstring(k)).c_str(), L"", trimBuf, 40,
+                                     iniPath);
+            mhc.permTrimStamp[k].clear();
+            if (trimBuf[0] != L'\0') {
+                bool hex = wcslen(trimBuf) == 16;
+                for (const wchar_t* c = trimBuf; hex && *c; c++) hex = iswxdigit(*c) != 0;
+                mhc.permTrimStamp[k] = "?";
+                if (hex) {
+                    std::string t;
+                    for (const wchar_t* c = trimBuf; *c; c++) t += (char)towlower(*c);
+                    mhc.permTrimStamp[k] = t;
+                }
+            }
         }
     }
+    if (isHDR) mhc.refreshTrimEnabled = GetPrivateProfileBool(section, (p + L"MHCRefreshTrim").c_str(), true, iniPath);
     // Backward compatibility: if no permutation data but old DG path exists, migrate
     if (mhc.permNames[mhc.activePerm].empty() && !mhc.profileName.empty()) {
         // Old format: profilePath is the active profile, compute perm from settings

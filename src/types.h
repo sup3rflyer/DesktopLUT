@@ -89,7 +89,8 @@ struct MovableAtomic {
 // overlay was lost): run an MHC transition burst — verify, sweep, Calibration Loader kicks, no flicker (any thread
 // -> GUI thread). wParam: MhcReloadReason.
 #define WM_MHC_RELOAD_HARDWARE   (WM_USER + 110)
-enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss = 1, kMhcReloadAdapter = 2 };
+enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss = 1, kMhcReloadAdapter = 2,
+                                  kMhcReloadRefreshTrim = 3 };   // a refresh-trim variant swap (an association)
 // Resolve each display's Windows tone map again (ReconcileWindowsToneMap; any thread -> GUI thread). wParam 1 =
 // Windows may have dropped the DisplayConfig override (a mode change, a wake, a driver reset): send it again.
 #define WM_WINDOWS_TONEMAP       (WM_USER + 111)
@@ -98,6 +99,8 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 // One of DesktopLUT's own windows was shown, hidden, moved, sized, minimised or cloaked while a FALD view is on: list
 // them again for the layer (gui.cpp FaldExemptRefresh; posted once per burst by the window-event hook, GUI thread).
 #define WM_FALD_EXEMPT_REFRESH   (WM_USER + 113)
+// Resolve each display's refresh-rate trim again (refresh_trim.h ReconcileRefreshTrim; any thread -> GUI thread).
+#define WM_REFRESH_TRIM          (WM_USER + 114)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
@@ -304,6 +307,9 @@ const int RECONCILE_RETRY_MS = 500;
 const int WINDOWS_TONEMAP_TIMER_ID = 119;      // Retry of a Windows tone map reconcile that had to wait (profile maintenance,
                                                 //   a calibration / live edit / MHC dialog) or whose profile swap failed
 const int FALD_RECOMPOSE_TIMER_ID = 113;        // Hook FALD: show/hide the full-recompose window (primes the clean source)
+const int REFRESH_TRIM_TIMER_ID = 121;           // Retry of a refresh-trim reconcile that had to wait (a hold, the profile
+                                                //   maintenance, an unreadable refresh rate) or whose variant swap failed
+const int REFRESH_TRIM_DEBOUNCE_MS = 500;       // After a display change: the refresh trim follows the new rate
 const int FALD_PANEL_VERDICT_TIMER_ID = 120;     // Hook FALD: read the DWM hook's answer on a live panel-file delivery
 const int DWM_HOOK_BEACON_TICK_MS = 40;         // each tick (forces a composed frame per monitor) and
 const int DWM_HOOK_BEACON_MAX_MS = 2000;        // ends the session once every twin is identified or this elapses
@@ -909,6 +915,20 @@ struct ColorCorrectionSettings {
     FaldSettings fald;        // FALD correction layer (per mode: HDR, or SDR under ACM)
 };
 
+// The per-refresh-rate grey trim one HDR MHC profile bakes (refresh_trim.h derives it from the display's DLC DIP:
+// the panel's measured light at that rate vs 60 Hz). The 1D LUT's last stage keys each drive by the light it gives at
+// 60 Hz and drives the light times g(that light) instead, g = 1 / ratio, so the panel's extra light at the rate
+// cancels (mhc_icc.cpp ComposeMhcScanout). Not a permutation bit: a value per rate, the variants stamped with `stamp`.
+struct MhcRefreshTrim {
+    bool active = false;            // false: no trim — the bake is exactly the untrimmed one
+    std::string stamp;              // the curve's identity (a hash of everything baked): stamps the variants that carry it
+    std::string rateKey;            // the measured rate whose response it is ("47.952"; 48 shares it when DLC says so)
+    double rateHz = 0.0;            // that rate (informational: labels, file names)
+    std::vector<double> nits;       // knots: the 60-Hz light of a full-field grey, ascending, > 0
+    std::vector<double> lnGain;     // ln g = -ln(ratio) at each knot
+    double peakNits = 0.0;          // the top extension stops here (held above); 0 = no cap
+};
+
 // MHC profile state (per-monitor, per-mode)
 // MHC is the foundation calibration layer with its own primaries and grayscale,
 // separate from the shader's post-correction primaries.
@@ -994,6 +1014,26 @@ struct MHCSettings {
         80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f, 80.0f,
     };
     uint8_t activePerm = 0;              // Currently active permutation bitmask
+    // Refresh-rate trim (HDR, refresh_trim.h). The trim each cached variant was baked with: its MhcRefreshTrim stamp,
+    // "" = none. A slot whose stamp is not what the current want bakes (MhcPermTrimBakedAt) is stale for it: a stashed
+    // variant is swapped in, else it is regenerated. Saved with the cache (INI HDR_MHCPermTrim<k>, only when set).
+    std::string permTrimStamp[PERM_COUNT];
+    // The user's switch: off = no trim on this display, whatever its DIP holds. INI HDR_MHCRefreshTrim, written only
+    // when off (absent = on: "present in the DIP = applied").
+    bool refreshTrimEnabled = true;
+    // Runtime only (never saved): the trim the display's live refresh rate asks for (ReconcileRefreshTrim, outside
+    // calibrations and live edits). Every bake of the mode carries it (BuildMHC2ParamsForPerm); inactive = none.
+    MhcRefreshTrim refreshTrimWant;
+    // Runtime only (never saved): variants baked for another trim (or none) than the slot now holds, so a switch back
+    // is a swap of a file already there — no bake. Listed in the orphan cleanup's and the sweep's keep-sets while
+    // here; their files go to the cleanup of the next start. Bounded (EnsureMhcPermProfile).
+    struct TrimStashEntry {
+        uint8_t perm = 0;
+        std::string trimStamp;
+        float dgWhiteNits = 0.0f;
+        std::wstring name, path;
+    };
+    std::vector<TrimStashEntry> trimStash;
     // Runtime only (never saved): the HDR profile should report the 10000-nit peak now (the display's Windows tone
     // map setting resolved against what runs: ReconcileWindowsToneMap). ComputeMhcPermutation bakes it in
     // (PERM_PEAK_MAX), so a re-bake installs the variant the reconcile would swap to.

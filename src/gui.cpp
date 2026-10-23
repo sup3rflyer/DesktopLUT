@@ -17,6 +17,7 @@
 #include "displayconfig.h"
 #include "display_power.h"
 #include "windows_tonemap.h"
+#include "refresh_trim.h"
 #include "mhc.h"
 #include "dwm_inject.h"
 #include "analysis.h"
@@ -1699,7 +1700,7 @@ static bool IgnoredDuringShutdown(UINT msg) {
     case WM_DEVICECHANGE: case WM_POWERBROADCAST: case WM_COMMAND: case WM_TRAYICON: case WM_HOTKEY:
     case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
     case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD: case WM_MHC_REGENERATE_MISSING:
-    case WM_MHC_RELOAD_HARDWARE: case WM_WINDOWS_TONEMAP: case WM_FALD_EXEMPT_REFRESH:
+    case WM_MHC_RELOAD_HARDWARE: case WM_WINDOWS_TONEMAP: case WM_FALD_EXEMPT_REFRESH: case WM_REFRESH_TRIM:
         return true;
     default:
         return msg == WM_TASKBARCREATED;
@@ -1714,6 +1715,7 @@ static void KillAllGuiTimers(HWND hwnd) {
         MHC_BURST_TIMER_ID, DWM_HOOK_RESEND_TIMER_ID, DWM_HOOK_BEACON_TIMER_ID, MONITOR_IDENTITY_TIMER_ID,
         FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
         RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID, WINDOWS_TONEMAP_TIMER_ID, FALD_PANEL_VERDICT_TIMER_ID,
+        REFRESH_TRIM_TIMER_ID,
     };
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
@@ -2536,8 +2538,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ReconcileWindowsToneMap("request", false);   // a pending reapply rides along (RequestWindowsToneMap)
         return 0;
 
+    case WM_REFRESH_TRIM:
+        ReconcileRefreshTrim("request");   // a DIP that changed, a switch, a pipe layer
+        return 0;
+
     case WM_MHC_RELOAD_HARDWARE: {
-        static const char* const kWhy[] = { "pending reapply", "restart after overlay loss", "adapter change" };
+        static const char* const kWhy[] = { "pending reapply", "restart after overlay loss", "adapter change",
+                                            "refresh trim swap" };
         if (wParam == kMhcReloadOverlayLoss) {
             // An overlay that keeps dying is restarted every few seconds: one reload a minute covers it (the
             // blind kick covers the rest), each one a Calibration Loader run and, with the task disabled, a flicker.
@@ -2546,6 +2553,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (s_lastOverlayLoss != 0 && now - s_lastOverlayLoss < 60000) return 0;
             s_lastOverlayLoss = now;
             StartMhcTransitionBurst(hwnd, kWhy[kMhcReloadOverlayLoss], /*displayTransition=*/false);
+            return 0;
+        }
+        if (wParam == kMhcReloadRefreshTrim) {
+            // The swap is an association (the silent-drop bug's trigger): the whole burst follows it. Not a display
+            // transition of its own (the modeset that asked for the swap already counted as one).
+            StartMhcTransitionBurst(hwnd, kWhy[kMhcReloadRefreshTrim], /*displayTransition=*/false);
             return 0;
         }
         StartMhcTransitionBurst(hwnd, wParam < 3 ? kWhy[wParam] : "reload");
@@ -2881,6 +2894,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             VerifyAndRestoreMhcProfiles();
             RetryDgSwap();                // a desktop gamma switch (hotkey, whitelist) whose profile swap did not land
             ReconcileWindowsToneMap("periodic", false);   // what no trigger saw (a profile installed or removed, ...)
+            ReconcileRefreshTrim("periodic");             // a rate change no message carried; a swap that waited
             ui::NotifyDisplayChanged();   // re-read display modes while the new interface is open
             // A display given up on by the identity retry runs on index-attached settings that are
             // never saved: re-attach as soon as it can be identified (only queried while one exists).
@@ -2897,6 +2911,13 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == SDR_WHITE_CHECK_TIMER_ID) {
             KillTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID);
             RefreshDesktopGammaSdrWhite("SDR white / display change");
+            // Armed by every hold's release too (a calibration, a live edit, an MHC dialog): the refresh trim waited.
+            ReconcileRefreshTrim("display change / hold released");
+            return 0;
+        }
+        if (wParam == REFRESH_TRIM_TIMER_ID) {
+            KillTimer(hwnd, REFRESH_TRIM_TIMER_ID);
+            ReconcileRefreshTrim("refresh change / retry");
             return 0;
         }
         if (wParam == MHC_BLIND_KICK_TIMER_ID) {
@@ -2952,6 +2973,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // An HDR switch makes the SDR white level desktop gamma's reference again: re-bake before the
             // hardware kick below so the kick loads the re-baked profile.
             RefreshDesktopGammaSdrWhite("transition burst");
+            // The refresh trim follows the settled rate, likewise before the kick (a swap restarts the burst).
+            ReconcileRefreshTrim("transition burst");
             // Hardware layer: unconditional reload. Associations can read
             // correct while the hardware LUT still has the previous mode's
             // curves — undetectable by any query, so always kick.
@@ -2980,6 +3003,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         ui::NotifyDisplayChanged();
         // HDR on/off and hot-plug change which monitors' SDR white level is desktop gamma's reference.
         SetTimer(hwnd, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
+        // A refresh switch (a video player matching the content's rate): the refresh trim follows the new rate, and
+        // the DLC folder is read again (a DIP measured since is picked up on the next switch).
+        SetTimer(hwnd, REFRESH_TRIM_TIMER_ID, REFRESH_TRIM_DEBOUNCE_MS, nullptr);
+        RequestRefreshTrimDipScan();
 
         // Monitor hotplug: re-enumerate and update if count or handles changed
         std::vector<HMONITOR> newMonitors;
@@ -3176,6 +3203,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         AbortLiveEditsForShutdown();       // a live grayscale edit gives scanout back to the user's profile
         StopDwmHookBeacon(hwnd);
         StopProcessing();                  // joins the processing thread (inside a running Start/Stop: replayed after it)
+        ReleaseRefreshTrimForExit(g_sessionEnding.load());       // nothing follows the rate once DesktopLUT is gone
         ReleaseWindowsToneMapForExit(g_sessionEnding.load());   // Auto: nothing tone maps once DesktopLUT is gone
         KillAllGuiTimers(hwnd);            // anything the teardown above armed
         RemoveTrayIcon();
@@ -3277,8 +3305,10 @@ int RunGUI() {
     // powered on after boot) starts processing from WM_DISPLAYCHANGE — see g_userStopped.
     bool hasAnyCorrection = AnyMonitorHasCorrections();
 
-    // What Windows tells apps the HDR peak is, before anything bakes a profile (the variant follows it) and whether
-    // or not anything starts.
+    // The refresh-rate trim each display's rate wants (its DLC DIP read once here), then what Windows tells apps the
+    // HDR peak is — both before anything bakes a profile (the variants follow them) and whether or not anything starts.
+    InitRefreshTrim();
+    ReconcileRefreshTrim("startup");
     ReconcileWindowsToneMap("startup", true);
     // Auto-start processing if any correction is enabled.
     if (hasAnyCorrection) {

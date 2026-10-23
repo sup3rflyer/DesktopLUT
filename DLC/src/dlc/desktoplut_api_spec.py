@@ -111,10 +111,21 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "pair: the interface's stage switches — the stage keeps its settings but is NOT applied; "
                           "runtime.set_3dlut clears bypass_3dlut and mhc.apply both MHC bypasses of its pair, "
                           "calibration.enter clears all three for the calibrated pair and restore puts them back; "
-                          "absent on builds before 2026-10-13)}. mhc entries also carry "
+                          "absent on builds before 2026-10-13); HDR adds refresh_trim (bool: the per-refresh-rate "
+                          "grey trim's switch, default true — a refresh-response measurement must set it false, or it "
+                          "measures the trim's residual; absent on builds before 2026-10-23)}. mhc entries also carry "
                           "source_file (the DLC base 1D .cube the profile was generated from — the "
                           "identity that survives WB/DG/GS permutation re-bakes) and active_perm. "
                           "Absent on pre-2026-09-03 builds (then the ini is the only layer evidence).",
+                "refresh_trim": "object keyed by '<monitor>:HDR' (live displays): the per-refresh-rate grey trim "
+                                "DesktopLUT derives from the display's DIP refresh_response — {enabled:bool, "
+                                "refresh_hz:number|null, refresh_rational:[num,den]|null, state:'off'|'no_dlc'|'no_dip'|"
+                                "'no_section'|'invalid'|'reference'|'unmeasured'|'trim'|'no_rate', detail:string, "
+                                "rate:string|null (the DIP rate whose response it bakes), stamp:string|null (the "
+                                "trim's identity), active_stamp:string|null (what the HDR profile on screen carries; "
+                                "'?' unknown), applied:bool, installed:bool, waiting:string|null, gain:{'0.5','100',"
+                                "'1000'}|absent, dip:{record, measured, run_id, age_days, stale, rates:[string]}|null}. "
+                                "Absent on builds before 2026-10-23.",
                 "contract_version": "integer: the wire-contract version the server speaks (1). "
                                     "Absent = a build predating the field = 1. DLC checks this at preflight "
                                     "so a mismatch surfaces as 'update DLC/DesktopLUT', not 'unknown method' "
@@ -208,6 +219,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "bypass_3dlut": ApiParamSpec("boolean", required=False, description="3D LUT stage bypass: the cube stays loaded, nothing applies it (optional; builds after 2026-10-13)"),
                 "bypass_primaries": ApiParamSpec("boolean", required=False, description="MHC primaries + white balance stage bypass: the profile is re-baked without the matrix (optional; builds after 2026-10-13)"),
                 "bypass_grayscale": ApiParamSpec("boolean", required=False, description="MHC grayscale + gamma stage bypass: the profile is re-baked with an identity 1D LUT (optional; builds after 2026-10-13)"),
+                "refresh_trim": ApiParamSpec("boolean", required=False, description="The per-refresh-rate grey trim's switch, HDR only (persisted; either value re-reads the DIP; the variant swap waits out a calibration session). A refresh-response measurement sets it false (optional; builds after 2026-10-23)"),
             },
             {"monitor_mode": "string", "before": "object {white_balance,grayscale,desktop_gamma,tonemap,fald,bypass_3dlut,bypass_primaries,bypass_grayscale}",
              "after": "object (same shape)", "regenerated": "boolean (MHC profile re-baked)",

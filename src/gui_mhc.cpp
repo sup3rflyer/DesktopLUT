@@ -451,6 +451,20 @@ uint8_t NormalizeMhcPerm(uint8_t perm) {
     return perm;
 }
 
+bool MhcBakesRefreshTrim(const MHCSettings& mhc, bool isHDR, uint8_t perm) {
+    return isHDR && !(NormalizeMhcPerm(perm) & MHCSettings::PERM_NOGRAY) && mhc.refreshTrimEnabled &&
+           mhc.refreshTrimWant.active && !mhc.refreshTrimWant.stamp.empty();
+}
+
+std::string MhcExpectedTrimStamp(const MHCSettings& mhc, bool isHDR, uint8_t perm) {
+    return MhcBakesRefreshTrim(mhc, isHDR, perm) ? mhc.refreshTrimWant.stamp : std::string();
+}
+
+bool MhcPermTrimBakedAt(const MHCSettings& mhc, bool isHDR, int perm) {
+    if (perm < 0 || perm >= MHCSettings::PERM_COUNT) return true;
+    return mhc.permTrimStamp[perm] == MhcExpectedTrimStamp(mhc, isHDR, (uint8_t)perm);
+}
+
 // Build MHC2ProfileParams for a specific permutation bitmask.
 // Starts from the full MHCSettings, then disables corrections not in the bitmask. A bypassed stage gets
 // exactly the identity profile's fields (BuildIdentityMHC2Params) while the luminance metadata stays what
@@ -506,6 +520,10 @@ bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex
 
     // The Windows tone map bypass: only the luminance tags say 10000 nits; every curve stays scaled to the panel.
     params.reportedPeakNits = (isHDR && (perm & MHCSettings::PERM_PEAK_MAX)) ? kWindowsToneMapBypassNits : 0.0f;
+
+    // The refresh-rate trim the display's live rate asks for (HDR). Part of the grayscale stage: the stage bypass
+    // leaves it out, like desktop gamma (bypassed means nobody does it).
+    params.refreshTrim = MhcBakesRefreshTrim(mhc, isHDR, perm) ? mhc.refreshTrimWant : MhcRefreshTrim{};
     return true;
 }
 
@@ -550,7 +568,75 @@ static void ClearPermCache(MHCSettings& mhc, int monitorIndex, bool isHDR, bool 
             mhc.permNames[k].clear();
             mhc.permPaths[k].clear();
         }
+        mhc.permTrimStamp[k].clear();
     }
+    // The variants kept for other refresh trims were baked from the same (now changed) data.
+    for (const auto& e : mhc.trimStash)
+        if (e.name != mhc.profileName) DeleteFileW((colorDir + e.name).c_str());
+    mhc.trimStash.clear();
+}
+
+// The refresh trim a bake carries: its stamp, "" = none (HDR only).
+static std::string TrimBakeStamp(const MHC2ProfileParams& params) {
+    return (params.isHDR && params.refreshTrim.active) ? params.refreshTrim.stamp : std::string();
+}
+
+// "_R47952" for a profile baked with the 47.952-Hz trim (the rate in mHz), "" without one: what a file name carries.
+static std::wstring TrimNameTag(const MHC2ProfileParams& params) {
+    if (!params.isHDR || !params.refreshTrim.active || !(params.refreshTrim.rateHz > 0.0)) return {};
+    return L"_R" + std::to_wstring((long long)std::llround(params.refreshTrim.rateHz * 1000.0));
+}
+
+constexpr size_t kMhcTrimStashMax = 16;   // a few rates x the permutations a session swaps between
+
+void StashMhcPermSlotLocked(MHCSettings& mhc, uint8_t perm) {
+    if (perm >= MHCSettings::PERM_COUNT || mhc.permNames[perm].empty()) return;
+    if (MhcPermDgBakedAt(mhc, perm, mhc.dgSdrWhiteNits)) {
+        MHCSettings::TrimStashEntry e;
+        e.perm = perm;
+        e.trimStamp = mhc.permTrimStamp[perm];
+        e.dgWhiteNits = mhc.permDgWhiteNits[perm];
+        e.name = mhc.permNames[perm];
+        e.path = mhc.permPaths[perm];
+        mhc.trimStash.erase(std::remove_if(mhc.trimStash.begin(), mhc.trimStash.end(),
+                                           [&](const MHCSettings::TrimStashEntry& x) {
+                                               return x.perm == e.perm && x.trimStamp == e.trimStamp;
+                                           }),
+                            mhc.trimStash.end());
+        mhc.trimStash.push_back(std::move(e));
+        while (mhc.trimStash.size() > kMhcTrimStashMax) {
+            auto victim = std::find_if(mhc.trimStash.begin(), mhc.trimStash.end(),
+                                       [&](const MHCSettings::TrimStashEntry& x) { return x.name != mhc.profileName; });
+            if (victim == mhc.trimStash.end()) break;
+            mhc.trimStash.erase(victim);
+        }
+    }
+    mhc.permNames[perm].clear();
+    mhc.permPaths[perm].clear();
+    mhc.permTrimStamp[perm].clear();
+}
+
+bool TakeStashedMhcVariantLocked(MHCSettings& mhc, bool isHDR, uint8_t perm, bool checkFile) {
+    const std::string want = MhcExpectedTrimStamp(mhc, isHDR, perm);
+    for (size_t i = 0; i < mhc.trimStash.size(); i++) {
+        const MHCSettings::TrimStashEntry& e = mhc.trimStash[i];
+        if (e.perm != perm || e.trimStamp != want) continue;
+        const bool dgOk = !(perm & MHCSettings::PERM_DG) || e.dgWhiteNits == 0.0f ||
+                          SameSdrWhiteNits(e.dgWhiteNits, mhc.dgSdrWhiteNits);
+        if (!dgOk || (checkFile && GetFileAttributesW(e.path.c_str()) == INVALID_FILE_ATTRIBUTES)) {
+            mhc.trimStash.erase(mhc.trimStash.begin() + (ptrdiff_t)i);   // unusable: forgotten
+            return false;
+        }
+        MHCSettings::TrimStashEntry take = e;
+        mhc.trimStash.erase(mhc.trimStash.begin() + (ptrdiff_t)i);
+        StashMhcPermSlotLocked(mhc, perm);
+        mhc.permNames[perm] = take.name;
+        mhc.permPaths[perm] = take.path;
+        mhc.permDgWhiteNits[perm] = take.dgWhiteNits;
+        mhc.permTrimStamp[perm] = take.trimStamp;
+        return true;
+    }
+    return false;
 }
 
 // The SDR white level a bake's desktop gamma used: 0 when the bake carries no DG (W-independent).
@@ -573,13 +659,20 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
         if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
-        const auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
-                                 : g_gui.monitorSettings[monitorIndex].sdrMHC;
-        if (!mhc.permNames[perm].empty() && MhcPermDgBakedAt(mhc, perm, mhc.dgSdrWhiteNits)) {
+        auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
+                           : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        const bool dgCurrent = !mhc.permNames[perm].empty() && MhcPermDgBakedAt(mhc, perm, mhc.dgSdrWhiteNits);
+        if (dgCurrent && MhcPermTrimBakedAt(mhc, isHDR, perm)) {
             // Verify file still exists on disk
             if (GetFileAttributesW(mhc.permPaths[perm].c_str()) != INVALID_FILE_ATTRIBUTES)
                 return true;
             // File missing — fall through to generate
+        } else if (TakeStashedMhcVariantLocked(mhc, isHDR, perm, true)) {
+            // Baked for another refresh trim (or none): the variant for the trim wanted now was kept from an earlier
+            // switch — a swap, no bake.
+            std::cout << "MHC perm: P" << (int)perm << " for monitor " << monitorIndex
+                      << " from the refresh-trim stash" << std::endl;
+            return true;
         }
     }
 
@@ -606,7 +699,7 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
     wchar_t monTag[8];
     swprintf_s(monTag, L"Mon%d", monitorIndex);
     std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag)
-        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_P" + std::to_wstring(perm)
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_P" + std::to_wstring(perm) + TrimNameTag(params)
         + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     wchar_t tempDir[MAX_PATH];
@@ -635,9 +728,13 @@ bool EnsureMhcPermProfile(int monitorIndex, bool isHDR, uint8_t perm) {
         if (monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
         auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                            : g_gui.monitorSettings[monitorIndex].sdrMHC;
+        // The slot's variant for another refresh trim is kept (a switch back swaps it in, no bake).
+        if (!mhc.permNames[perm].empty() && mhc.permTrimStamp[perm] != TrimBakeStamp(params))
+            StashMhcPermSlotLocked(mhc, perm);
         mhc.permNames[perm] = profileName;
         mhc.permPaths[perm] = profilePath;
         mhc.permDgWhiteNits[perm] = DgBakeStamp(params);
+        mhc.permTrimStamp[perm] = TrimBakeStamp(params);
     }
 
     std::cout << "MHC perm: generated P" << (int)perm << " for monitor " << monitorIndex
@@ -665,7 +762,9 @@ static bool SwapMhcToPermutationLocked(int monitorIndex, bool isHDR, uint8_t new
         if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return false;
         auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                            : g_gui.monitorSettings[monitorIndex].sdrMHC;
-        if (newPerm == mhc.activePerm) return true;  // already active
+        // Already active — unless the slot holds another variant than the one on screen now (EnsureMhcPermProfile
+        // just put the one for the refresh trim wanted now there): then that one goes on.
+        if (newPerm == mhc.activePerm && mhc.permNames[newPerm] == mhc.profileName) return true;
         if (!mhc.previewScanoutName.empty()) {
             // The overlay applies this profile as it was when the live edit began; another variant under it
             // would be applied twice. The edit's own re-bake installs the right variant at its end.
@@ -989,7 +1088,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
     wchar_t monTag[8];
     swprintf_s(monTag, L"Mon%d", monitorIndex);
     std::wstring profileName = L"DesktopLUT_" + std::wstring(monTag)
-        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + TrimNameTag(params) + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     // Write to temp directory - InstallColorProfileW copies to system color dir
     wchar_t tempDir[MAX_PATH];
@@ -1060,6 +1159,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         mhc.permNames[perm] = profileName;
         mhc.permPaths[perm] = profilePath;
         mhc.permDgWhiteNits[perm] = DgBakeStamp(params);
+        mhc.permTrimStamp[perm] = TrimBakeStamp(params);
     }
     UpdateMhcFlagsLive(monitorIndex);
     return true;
@@ -1087,7 +1187,7 @@ static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSe
     wchar_t monTag[8];
     swprintf_s(monTag, L"Mon%d", monitorIndex);
     std::wstring newProfileName = L"DesktopLUT_" + std::wstring(monTag)
-        + L"_" + (isHDR ? L"HDR" : L"SDR") + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
+        + L"_" + (isHDR ? L"HDR" : L"SDR") + TrimNameTag(params) + L"_" + std::to_wstring(GetTickCount64()) + L".icm";
 
     wchar_t tempDir[MAX_PATH];
     GetTempPathW(MAX_PATH, tempDir);
@@ -1146,6 +1246,7 @@ static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSe
         mhc.permNames[perm] = newProfileName;
         mhc.permPaths[perm] = mhc.profilePath;
         mhc.permDgWhiteNits[perm] = DgBakeStamp(params);
+        mhc.permTrimStamp[perm] = TrimBakeStamp(params);
     }
     UpdateMhcFlagsLive(monitorIndex);
     return true;
@@ -1298,8 +1399,19 @@ bool RebakeHdrMhcForSdrWhite(int monitorIndex, float sdrWhiteNits, bool* rebakeF
                 continue;
             mhc.permNames[k].clear();
             mhc.permPaths[k].clear();
+            mhc.permTrimStamp[k].clear();
             dropped++;
         }
+        // The refresh-trim stash likewise (by name: the files go to the orphan cleanup).
+        const size_t stashed = mhc.trimStash.size();
+        mhc.trimStash.erase(std::remove_if(mhc.trimStash.begin(), mhc.trimStash.end(),
+                                           [&](const MHCSettings::TrimStashEntry& e) {
+                                               return (e.perm & MHCSettings::PERM_DG) && e.dgWhiteNits != 0.0f &&
+                                                      !SameSdrWhiteNits(e.dgWhiteNits, sdrWhiteNits) &&
+                                                      e.name != mhc.profileName;
+                                           }),
+                            mhc.trimStash.end());
+        dropped += (int)(stashed - mhc.trimStash.size());
         if (rebake) mhcCopy = mhc;
     }
     std::cout << "[Desktop gamma] monitor " << monitorIndex << ": SDR white level " << oldNits << " -> "
