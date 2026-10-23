@@ -22,13 +22,13 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from dlc.fald.core2emu import CORE_KC2C, CORE_KC3, CoreEmu, CoreState, iir_factor  # noqa: E402
+from dlc.fald.core2emu import CORE_KC2C, CORE_KC3, CORE_KC5, CoreEmu, CoreState, iir_factor  # noqa: E402
 from dlc.fald.export import export_panel_params  # noqa: E402
 from dlc.fald.model import FaldModel, FaldParams  # noqa: E402
 from dlc.fald.panelfile import read_panel_file  # noqa: E402
 
 _DIR = os.environ.get("FALD_TEST_CORE2_DIR", "")
-_MODE = 2 if os.environ.get("FALD_TEST_CORE2_MODE", "1") == "2" else 1      # 1 = KC2c (round 2), 2 = KC3 (round 3)
+_MODE = {"2": 2, "4": 4}.get(os.environ.get("FALD_TEST_CORE2_MODE", "1"), 1)   # 1 = KC2c (round 2), 2 = KC3 (round 3), 4 = KC5 (round 5)
 W, H = 960, 540
 N_RUNS = 9
 
@@ -71,7 +71,7 @@ def _meta(d: Path) -> dict:
 def test_warp_core2_fields_and_output_are_the_twin():
     root = Path(_DIR)
     o = read_panel_file(root / "panel.bin")
-    emu = CoreEmu(o, flags=CORE_KC3 if _MODE == 2 else CORE_KC2C, width=W, height=H, subtexel_bits=8, sampler="warp")
+    emu = CoreEmu(o, flags={1: CORE_KC2C, 2: CORE_KC3, 4: CORE_KC5}[_MODE], width=W, height=H, subtexel_bits=8, sampler="warp")
     st = CoreState()
     rows, cols = emu.rows, emu.cols
     worst = {}
@@ -81,11 +81,11 @@ def test_warp_core2_fields_and_output_are_the_twin():
             break
         frame = np.fromfile(d / "fald_frame.rgba16f", dtype=np.float16).reshape(H, W, 4)[..., :3]
         m = _meta(d)
-        assert m["core2"] == "1" and m["core2_flags"] == ("11" if _MODE == 2 else "3")
+        assert m["core2"] == "1" and m["core2_flags"] == {1: "3", 2: "11", 4: "201"}[_MODE]
         assert abs(float(m["core2_a"]) - iir_factor(1)) < 1e-6
         host_reset = m["core2_reset"] == "1"     # the host's reset (no valid state; a resume after a > 250-ms gap — WARP is
-        if run == 0 or _MODE == 2:               # slow enough for that on some machines): the twin follows it; round 3
-            assert host_reset                    # (no zone IIR) resets on every run
+        if run == 0 or _MODE >= 2:               # slow enough for that on some machines): the twin follows it; rounds 3 / 5
+            assert host_reset                    # (no zone IIR) reset on every run
         if host_reset:
             st.invalidate()
         tw = emu.run(frame.astype(np.float64), fp16_out=True, core=st, refreshes=1)
@@ -100,12 +100,19 @@ def test_warp_core2_fields_and_output_are_the_twin():
         assert np.allclose(zone[..., 0], c["alpha_z"], rtol=0, atol=2e-5), (run, float(np.abs(zone[..., 0] - c["alpha_z"]).max()))
         assert np.allclose(zone[..., 1], c["k"], rtol=0, atol=2e-5)
         assert np.allclose(zone[..., 2], np.log(np.maximum(c["P"], 1e-6)), rtol=0, atol=2e-5)
-        if _MODE == 2:                           # the fine grid: node peaks (uint bits of the float) and round 1's D
+        if _MODE >= 2:                           # the fine grid: node peaks (uint bits of the float) and round 1's D / A
             S = emu.sub
             pk = np.fromfile(d / "fald_core3_node_peak.u32", dtype=np.uint32).view(np.float32).reshape(rows * S, cols * S)
             assert np.allclose(pk, emu.node_peaks(tw["img"]), rtol=1e-6, atol=1e-6)
             nd = np.fromfile(d / "fald_core3_node_d.f32", dtype=np.float32).reshape(rows * S, cols * S)
-            dD = float(np.abs(nd - c["D1"]).max())
+            if _MODE == 4:                       # round 5: the cap A (the shader's float32 scans add the step node by node:
+                near = np.minimum(nd, c["D1"]) < 1.0     # absolute where a gain can meet it, relative beyond)
+                assert near.any()
+                assert np.allclose(nd[~near], c["D1"][~near], rtol=2e-5, atol=0), (run, "far")
+                dD = float(np.abs(nd[near] - c["D1"][near]).max())
+                worst.setdefault("capped_nodes", []).append(int((c["D1"] < 0.05).sum()))
+            else:
+                dD = float(np.abs(nd - c["D1"]).max())
         else:
             field = np.fromfile(d / "fald_core2_field.f32", dtype=np.float32).reshape(rows, cols, 2)
             dD = float(np.abs(field[..., 1] - c["D1"]).max())
@@ -116,8 +123,12 @@ def test_warp_core2_fields_and_output_are_the_twin():
         off = np.abs(out[lit].astype(np.float64) - tw["out"][lit].astype(np.float64)) / np.maximum(ulp, 1e-30)
         worst[run] = (float(off.max()), float((off > 1.0 + 1e-9).mean()), dD, bool(c["reset"]), bool(c["cut"]))
         assert float(off.max()) <= 1.0 + 1e-9, (run, worst[run])       # within one FP16 step everywhere (as C15's gate)
+    capped = worst.pop("capped_nodes", None)
     print({r: tuple(round(x, 6) if isinstance(x, float) else x for x in v) for r, v in worst.items()})
     assert len(worst) == N_RUNS
+    if _MODE == 4:                               # the cap must bind on this sequence (the highlights reach the knee)
+        print("capped nodes (A < 0.05)", capped)
+        assert capped and max(capped) > 0
 
 
 if __name__ == "__main__":

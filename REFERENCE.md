@@ -553,7 +553,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   `budget_ms`, `refresh_ms`, `spacing_ms`, `content_ms`; `forced`). In hook mode the DLL reports it through the same
   section as the fade's (`DwmHookFaldStatus::core`; the force key travels as faldFlags bit 11). The same report carries
   the layer's variant and rule: `conv_so` / `conv_tune` (below) and `core_mode_applied` / `core_on` (the always-on core's
-  rule that runs: 0 C, 1 KC2c, 2 KC3 — `fald_core_mode` is the setting, this is what the layer applies).
+  rule that runs: 0 C, 1 KC2c, 2 KC3, 4 KC5 — `fald_core_mode` is the setting, this is what the layer applies).
 - **The convolution's auto-tune** (`shared/fald_conv_tune.h`, overlay and hook alike): the convolution pass exists in four
   byte-identical variants (1 / 2 / 4 / 8 sub-offsets per thread); which is fastest depends on the GPU and the lattice. The
   layer keeps every variant's tables resident and, while tuning, times ONE extra dispatch of the variant under test per
@@ -563,16 +563,18 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   so later starts begin on it. Without timestamp queries the measured policy stands (2 sub-offsets from 2048 zones, else
   1). The decision is logged (`conv auto-tune: S=1 .. us, S=2 .. us, S=4 .. us, S=8 .. us -> S=k`); `state.get
   fald_core_governor` reports `conv_so` (in use) and `conv_tune` (`policy` / `cached` / `tuning` / `tuned`).
-- **The always-on core's rule** (`shared/fald_core_mode.h`): KC3 by default — alpha (the near-field brightening shrunk at
-  dark zone levels) + the fine-grid sliding-window deficit (the soft knee's ring edge removed), no temporal state, so the
-  change-driven path reuses its fields. It removes the layer's dark band beside bright objects (the owner's live blind
-  tests); the 2026-10-23 colorimeter fill test showed it keeps less of the fill beside bright objects than C (RMS vs the
-  target at neutral levels C 1.41 %, KC3 4.57 %), which KC5 (C's fill + KC3's deficit, mode 4) is meant to restore. Test
-  modes for A/B checks: `<mode>_FaldCoreModeTest=0` in a display's section (read at start, never written; absent = the
-  default) runs C, the layer as it was; `=1` KC2c (round 2: the zone-level deficit with a zone IIR — always the full
-  path). The pipe's `runtime.fald_core_mode {monitor, mode, core}`
-  switches at runtime (never saved); `state.get` reports `fald_core_mode` + `fald_core_mode_name` per monitor and mode. No
-  GUI control.
+- **The always-on core's rule** (`shared/fald_core_mode.h`): KC5 by default (mode 4) — C's near-field fill kept, with a
+  brightening CAP on the fine grid away from pixels whose brightening would hit the LCD ceiling (an exact whole-lattice
+  min-plus of the knee headroom, slope 0.10 ln per 100 px, per round) in place of KC3's deficit, plus alpha (the
+  near-field brightening shrunk at dark zone levels: KC3's law below 0.5 nit, none above 2 nit); no temporal state, so the
+  change-driven path reuses its fields. Both outcomes measured on 2026-10-23: the colorimeter fill re-run keeps C's fill
+  (RMS vs the target at neutral levels KC5 1.77 %, C 1.51 %, KC3 5.89 %) and the owner's live blind test saw none of C's
+  dark band beside bright objects (C in 5 of 12 clips, KC5 in none). Test modes for A/B checks: `<mode>_FaldCoreModeTest=0`
+  in a display's section (read at start, never written; absent = the default) runs C, the layer as it was; `=2` KC3 (round
+  3: alpha + the fine-grid sliding-window deficit — the band gone, most of the fill lost); `=1` KC2c (round 2: the
+  zone-level deficit with a zone IIR — always the full path); 3 is reserved (KC4). A lattice of more than 2048 fine nodes
+  per axis (none known) runs KC5 as C. The pipe's `runtime.fald_core_mode {monitor, mode, core}` switches at runtime
+  (never saved); `state.get` reports `fald_core_mode` + `fald_core_mode_name` per monitor and mode. No GUI control.
 
 ### In the DWM hook
 

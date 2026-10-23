@@ -544,9 +544,10 @@ Texture2D<float4> coreStatTex  : register(t40);   // P, M, lnG (stat round 0)
 Texture2D<float4> coreZoneTex  : register(t41);   // alpha_z, k, ln P
 Texture2D<float2> coreFieldTex : register(t42);   // alpha_z, D (this round)
 Buffer<uint>      coreCutSum   : register(t43);   // [0]: sum over zones of |d ln max(M, 0.05)| (fixed point)
-Texture2D<float>  coreNodeDTex : register(t48);   // round 3 (coreFlags bit 3): the deficit D on the FINE grid
-// Correct's gain at both call sites (fald_core2.h): brightening shrunk by alpha, minus the deficit D; darkening untouched.
-// With coreFlags 0 (the core off, b3 bound with zeros or not at all) the input is returned unchanged.
+Texture2D<float>  coreNodeDTex : register(t48);   // round 3 (coreFlags bit 3): the deficit D on the FINE grid; round 5
+                                                  // (bit 6): the brightening cap A there
+// Correct's gain at both call sites (fald_core2.h): brightening shrunk by alpha, minus the deficit D (round 5: capped at A);
+// darkening untouched. With coreFlags 0 (the core off, b3 bound with zeros or not at all) the input is returned unchanged.
 float2 CoreGain(float2 g, float2 px) {
     if ((coreFlags & 3u) == 0u || !(g.x > 1.0f)) return g;
     float lg = log(g.x);
@@ -554,6 +555,7 @@ float2 CoreGain(float2 g, float2 px) {
         const float2 uv = FineUV(px);
         if ((coreFlags & 1u) != 0u) lg *= saturate(coreZoneTex.SampleLevel(linearClamp, uv, 0).x);
         if ((coreFlags & 2u) != 0u) lg = max(lg - max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f), 0.0f);
+        if ((coreFlags & 64u) != 0u) lg = min(lg, max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f));   // round 5 (KC5): the cap A
     } else {                                  // round 2 (KC2c): both from the zone field
         float2 f = coreFieldTex.SampleLevel(linearClamp, FineUV(px), 0);
         if ((coreFlags & 1u) != 0u) lg *= saturate(f.x);

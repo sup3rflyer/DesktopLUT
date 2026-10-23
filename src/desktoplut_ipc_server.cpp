@@ -1726,10 +1726,10 @@ void DoFaldFlankFade(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("enabled", JBool(en->b));
 }
 
-// runtime.fald_core_mode {monitor, mode, core}: the always-on core's switch (shared/fald_core_mode.h FALD_CORE_MODES): 0 = C
-// (the default: today's layer bit for bit), 1 = KC2c (round 2), 2 = KC3 (round 3) — test modes for A/B; 3 / 4 reserved
-// (KC4 / KC5). Runtime only: NEVER saved (the INI key <mode>_FaldCoreModeTest sets the start value). The live blind kits and
-// the bench set it per block / configuration.
+// runtime.fald_core_mode {monitor, mode, core}: the always-on core's switch (shared/fald_core_mode.h FALD_CORE_MODES): 4 = KC5
+// (the default: C's fill + the brightening cap), 0 = C (the 2026-10-22 layer bit for bit), 1 = KC2c (round 2), 2 = KC3 (round
+// 3) — test modes for A/B; 3 reserved (KC4). Runtime only: NEVER saved (the INI key <mode>_FaldCoreModeTest sets the start
+// value). The live blind kits and the bench set it per block / configuration.
 void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -1741,7 +1741,7 @@ void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
     for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++) if (FaldCoreModeKnown(k)) modes.push_back(k);
     bool known = false;
     for (uint32_t k : modes) known = known || v == (double)k;
-    if (!known) {                                  // "core must be 0, 1 or 2" (the mock's text, DLC desktoplut_mock.py)
+    if (!known) {                                  // "core must be 0, 1, 2 or 4" (the mock's text, DLC desktoplut_mock.py)
         error = "core must be ";
         for (size_t i = 0; i < modes.size(); i++)
             error += std::to_string(modes[i]) + (i + 2 < modes.size() ? ", " : (i + 1 < modes.size() ? " or " : ""));

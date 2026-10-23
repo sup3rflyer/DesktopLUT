@@ -159,7 +159,7 @@ struct HookMonitor {
     // The frame as the LUT / tone-map pass would leave it in the intermediate (null = the clean copy itself, no pass): on
     // a partial present its rects go in (or the whole of it with intermediateWhole), on a full one the whole of it.
     const std::vector<unsigned char>* intermediateFrame = nullptr;
-    unsigned int coreMode = 0;   // the always-on core's switch (faldFlags bits 16-17; shared/fald_core2.h): 0 C, 1 KC2c, 2 KC3
+    unsigned int coreMode = 0;   // the always-on core's switch (faldFlags bits 16-19; shared/fald_core_mode.h): 0 C, 1 KC2c, 2 KC3, 4 KC5
     // rects: this present's dirty rects (the frame already edited inside them); null = a full-frame rect (new content) or none
     Result Present(bool newContent, bool readCB, const std::vector<RECT>* rects = nullptr) {
         Result r;
@@ -524,8 +524,8 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
         { { 300, 300, 500, 500 }, 0x0000, "the white patch to black" },
         { { 2000, 1000, 2002, 1002 }, 0x3C00, "a 2 x 2 white speck" },
     };
-    // the always-on core (shared/fald_core_mode.h): C, and KC3 (the default) whose stateless fields the path reuses
-    for (unsigned int coreMode : { FALD_CORE_MODE_C, FALD_CORE_MODE_KC3 })
+    // the always-on core (shared/fald_core_mode.h): C, KC3 and KC5 (the default) — the two stateless rules whose fields the path reuses
+    for (unsigned int coreMode : { FALD_CORE_MODE_C, FALD_CORE_MODE_KC3, FALD_CORE_MODE_KC5 })
     for (int star = 0; star < 2; star++) {
         std::vector<std::vector<unsigned char>> outs[2];
         int partialPresents = 0;
@@ -1026,7 +1026,8 @@ TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overla
     hm.forceFade = false;
     {
         char mv[8] = {};
-        hm.coreMode = (GetEnvironmentVariableA("FALD_TEST_CORE2_MODE", mv, sizeof(mv)) > 0 && mv[0] == '2') ? 2u : 1u;
+        const bool got = GetEnvironmentVariableA("FALD_TEST_CORE2_MODE", mv, sizeof(mv)) > 0;
+        hm.coreMode = (got && mv[0] == '2') ? 2u : ((got && mv[0] == '4') ? 4u : 1u);   // 1 KC2c (default), 2 KC3, 4 KC5
     }
     g_faldCore2TestRefreshes = 1;
     int compared = 0;

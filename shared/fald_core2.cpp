@@ -1,4 +1,4 @@
-// FALD always-on core, rounds 2 / 3 (see fald_core2.h). One implementation for the overlay path (src/fald.cpp) and the DWM
+// FALD always-on core, rounds 2 / 3 / 5 (see fald_core2.h). One implementation for the overlay path (src/fald.cpp) and the DWM
 // hook (dwm_hook/hook_fald.cpp): the HLSL, the shaders, the zone / fine textures and the IIR state.
 #include "fald_core2.h"
 #include <d3dcompiler.h>
@@ -39,7 +39,9 @@ void main(uint3 id : SV_DispatchThreadID, uint3 tid : SV_GroupThreadID) {
 }
 )";
 
-// Z1: the cut decision + the alpha IIR (u0 alphaState, u1 lz, both in place)
+// Z1: the cut decision + the alpha IIR (u0 alphaState, u1 lz, both in place). Round 5 (coreFlags bit 7, ALPHA5): alpha's
+// level law a5 — KC3's a(G) below G0, 1 above G1, a smoothstep in ln G between (CORE_A5_LN0 / LN1 = float32 ln G0 / ln G1,
+// prepended at compile); the branch is not taken in the other modes (their bytes unchanged: the equality gates).
 static const char* kZ1 = R"(
 RWTexture2D<float> coreAlphaState : register(u0);
 RWTexture2D<float> coreLz         : register(u1);
@@ -49,6 +51,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     float4 st = coreStatTex.Load(int3(id.xy, 0));
     float G = exp(st.z);
     float raw = saturate(coreMuInf * G / (G + coreLh) - coreZ);
+    if ((coreFlags & 128u) != 0u) {            // ROUND 5 (KC5): KC3's law below G0, 1 above G1 (smoothstep in ln G)
+        const float t = saturate((st.z - CORE_A5_LN0) / (CORE_A5_LN1 - CORE_A5_LN0));
+        raw = raw + (1.0f - raw) * (t * t * (3.0f - 2.0f * t));
+    }
     float s = coreAlphaState[id.xy];
     coreAlphaState[id.xy] = CoreResetNow() ? raw : s + coreA * (raw - s);
     coreLz[id.xy] = log(max(st.y, 0.05f));
@@ -198,6 +204,81 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// ROUND 5 (KC5; coreFlags bit 6, in place of F1..F6): C1, per node the knee headroom h = max(0, ln(0.9 c3) - ln P3) (P3 =
+// the 3 x 3 node max of the node peaks, c3 = the 3 x 3 node min of the round's ceiling) -> u0 (R32F). Twin: pcore5
+// Core5Emu.cap_field / core2emu.cap_field. (The prototype d01e714's kernel, unchanged.)
+static const char* kC1 = R"(
+RWTexture2D<float> coreCapOut : register(u0);
+Texture2D<uint> coreNodePeakT : register(t49);
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    int2 mx = CoreFineMax();
+    if ((int)id.x > mx.x || (int)id.y > mx.y) return;
+    float P = 0.0f, Cm = 3.0e38f;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            int2 n = clamp(int2(id.xy) + int2(dx, dy), int2(0, 0), mx);
+            P = max(P, asfloat(coreNodePeakT.Load(int3(n, 0))));
+            Cm = min(Cm, min(white, white * gainTex.Load(int3(n, 0)).y / FALD_KNEE_CAP_TRUST));
+        }
+    coreCapOut[id.xy] = max(log(coreKStart) + log(max(Cm, 1e-9f)) - log(max(P, 1e-6f)), 0.0f);
+}
+)";
+
+// CX / CY: the min-plus A(i) = min_k [h(k) + st |i - k|] along one lattice line (x: a group per row; CORE_CAP_Y: per
+// column), st = s / 100 x the node pitch in px: a forward and a backward scan in groupshared memory (threads 0 and 32, so
+// two waves on 32-wide hardware), A = min of the two. Exact over the whole line (no reach). The per-line arithmetic is the
+// prototype d01e714's step for step; what differs is the DISPATCH: the prototype dispatched one group per line, this port
+// dispatches the fine grid's 16 x 16-group grid — the same arguments as C1 and the F passes, so on the change-driven path
+// the decide pass's one FALD_ARGS_CORE_FINE slot gates all three — and maps it onto the lines itself: group L = gy * gxCount
+// + gx scans the lines L, L + G, L + 2G, ... (G = the grid's groups; one line per group wherever G >= the lines, e.g. the
+// PA32's 48 x 48 x 8: 576 groups, 384 lines).
+static const char* kCS = R"(
+groupshared float gCapF[CORE_SCAN_MAX];
+groupshared float gCapB[CORE_SCAN_MAX];
+RWTexture2D<float> coreCapOut : register(u0);
+Texture2D<float> coreCapIn : register(t51);
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
+    int2 mx = CoreFineMax();
+    const int gxCount = (mx.x + 16) / 16, gyCount = (mx.y + 16) / 16;      // the fine grid's 16 x 16 groups
+    const int groups = gxCount * gyCount;
+#ifdef CORE_CAP_Y
+    const int n = mx.y + 1, lines = mx.x + 1;
+    const float st = CORE_CAP_S01 * (float)latH / (float)(rows * sub);
+#else
+    const int n = mx.x + 1, lines = mx.y + 1;
+    const float st = CORE_CAP_S01 * (float)latW / (float)(cols * sub);
+#endif
+    for (int lineIdx = (int)gid.y * gxCount + (int)gid.x; lineIdx < lines; lineIdx += groups) {
+        for (int i = (int)tid.x; i < n; i += 64) {
+#ifdef CORE_CAP_Y
+            const float v = coreCapIn.Load(int3(lineIdx, i, 0));
+#else
+            const float v = coreCapIn.Load(int3(i, lineIdx, 0));
+#endif
+            gCapF[i] = v; gCapB[i] = v;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (tid.x == 0u) {
+            for (int i = 1; i < n; i++) gCapF[i] = min(gCapF[i], gCapF[i - 1] + st);
+        } else if (tid.x == 32u) {
+            for (int i = n - 2; i >= 0; i--) gCapB[i] = min(gCapB[i], gCapB[i + 1] + st);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        for (int i = (int)tid.x; i < n; i += 64) {
+            const float a = min(gCapF[i], gCapB[i]);
+#ifdef CORE_CAP_Y
+            coreCapOut[int2(lineIdx, i)] = a;
+#else
+            coreCapOut[int2(i, lineIdx)] = a;
+#endif
+        }
+        GroupMemoryBarrierWithGroupSync();         // the next line's loads must not race this line's scans
+    }
+}
+)";
+
 // D1 (round 2): per zone (one 64-thread group) the deficit d over its fine nodes + a one-node ring, and its IIR (u0 the
 // round's state, in place; u1 = D0)
 static const char* kD1 = R"(
@@ -296,7 +377,7 @@ void main(uint3 id : SV_DispatchThreadID) {
 // Shaders
 // ---------------------------------------------------------------------------------------------------------------------
 namespace {
-enum { K_Z0, K_Z1, K_Z2, K_D1, K_D2, K_D3, K_F1, K_F2, K_F3X, K_F3Y, K_F5Y, K_F5X, K_COUNT };
+enum { K_Z0, K_Z1, K_Z2, K_D1, K_D2, K_D3, K_F1, K_F2, K_F3X, K_F3Y, K_F5Y, K_F5X, K_C1, K_CX, K_CY, K_COUNT };
 ID3D11ComputeShader* g_cs[K_COUNT] = {};
 template <typename T> void SafeRel(T*& p) { if (p) { p->Release(); p = nullptr; } }
 }
@@ -321,10 +402,18 @@ bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* er
     if (FaldCore2ShadersReady()) return true;
     if (!dev || !common) { if (err) *err = "no device"; return false; }
     const std::string fx = std::string(kFineHead);
-    const std::string src[K_COUNT] = { kZ0, kZ1, kZ2, kD1, kD2, kD3, fx + kF1, fx + kF2, fx + kF3, "#define CORE_CONE_Y 1\n" + fx + kF3,
-                                       fx + kF5, "#define CORE_GAUSS_X 1\n" + fx + kF5 };
+    char a5[160];                                          // round 5: alpha's level law (ln G0, ln G1) as float32
+    std::snprintf(a5, sizeof(a5), "#define CORE_A5_LN0 %.9ef\n#define CORE_A5_LN1 %.9ef\n",
+                  (double)(float)std::log((double)FALD_CORE2_A5_G0), (double)(float)std::log((double)FALD_CORE2_A5_G1));
+    char cs[160];                                          // round 5: the cap's slope per px (s / 100, float32) + scan size
+    std::snprintf(cs, sizeof(cs), "#define CORE_CAP_S01 %.9ef\n#define CORE_SCAN_MAX %u\n",
+                  (double)(FALD_CORE2_CAP_S * 0.01f), FALD_CORE2_SCAN_MAX);
+    const std::string src[K_COUNT] = { kZ0, std::string(a5) + kZ1, kZ2, kD1, kD2, kD3, fx + kF1, fx + kF2, fx + kF3,
+                                       "#define CORE_CONE_Y 1\n" + fx + kF3, fx + kF5, "#define CORE_GAUSS_X 1\n" + fx + kF5,
+                                       fx + kC1, std::string(cs) + fx + kCS, std::string(cs) + "#define CORE_CAP_Y 1\n" + fx + kCS };
     const char* name[K_COUNT] = { "FaldCore2Z0", "FaldCore2Z1", "FaldCore2Z2", "FaldCore2D1", "FaldCore2D2", "FaldCore2D3", "FaldCore3F1",
-                                  "FaldCore3F2", "FaldCore3ConeX", "FaldCore3ConeY", "FaldCore3GaussY", "FaldCore3GaussX" };
+                                  "FaldCore3F2", "FaldCore3ConeX", "FaldCore3ConeY", "FaldCore3GaussY", "FaldCore3GaussX",
+                                  "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
     const std::string head = std::string(common);
     for (int k = 0; k < K_COUNT; k++) {
         const std::string s = head + src[k];
@@ -456,6 +545,9 @@ unsigned long long FaldCore2VramBytes(const FaldCore2* c) { return c ? c->bytes 
 
 void FaldCore2BeginRun(FaldCore2* c, ID3D11DeviceContext* ctx, uint32_t flags, float coreA) {
     if (!c || !c->cb || !ctx) return;
+    if ((flags & FALD_CORE2_CAP) != 0u && !FaldCore2CapFits(c->cols, c->rows, c->sub))
+        flags = 0u;                                        // round 5: a lattice axis longer than the scans hold runs as C
+    if (flags != c->flags) c->stateValid = false;          // a mode switch: no state of another mode carries over
     c->flags = flags; c->coreA = coreA;
     c->resetNow = !c->stateValid || (flags & FALD_CORE2_FINE) != 0u;   // round 3 has no zone IIR: every run is a reset
     struct { uint32_t flags; float a; uint32_t reset; float cut; float mu, lh, z, ks; float beta, tau, fixedRcp; uint32_t pad;
@@ -497,7 +589,7 @@ static void Dispatch2D(ID3D11DeviceContext* ctx, unsigned cols, unsigned rows, I
 }
 
 void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11Buffer* args, unsigned int latticeSlot) {
-    if (!c || !c->cb || !FaldCore2ShadersReady()) return;
+    if (!c || !c->cb || !FaldCore2ShadersReady() || c->flags == 0u) return;   // flags 0: BeginRun made this run C (nothing reads the fields)
     if (FaldCore2Stateful(c->flags)) args = nullptr;      // the IIR rounds are never indirect (the full path)
     if ((c->flags & FALD_CORE2_FINE) == 0u) {              // Z0: the cut sum (round 2 only; round 3 resets every run)
         ctx->CSSetConstantBuffers(0, 1, &faldCB);
@@ -534,10 +626,17 @@ static void RunFine(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB
                     ID3D11Buffer* args, unsigned int fineSlot) {
     const unsigned fw = c->cols * c->sub, fh = c->rows * c->sub;
     struct Step { int k; ID3D11ShaderResourceView* in; UINT slot; ID3D11UnorderedAccessView* out; };
-    const Step steps[6] = { { K_F1, c->nodePeak.s, 49, c->f1.u }, { K_F2, c->f1.s, 50, c->fa.u },
-                            { K_F3X, c->fa.s, 51, c->fb.u }, { K_F3Y, c->fb.s, 51, c->fa.u },
-                            { K_F5Y, c->fa.s, 52, c->fb.u }, { K_F5X, c->fb.s, 52, c->nodeD[round & 1u].u } };
-    for (const Step& st : steps) {
+    // round 5 (KC5): the cap, per round (the round's ceiling): C1 -> CX -> CY, all on the fine grid's group grid (the same
+    // arguments: direct, or the round's FALD_ARGS_CORE_FINE slot on the partial path); F1..F6 do not run
+    const Step cap[3] = { { K_C1, c->nodePeak.s, 49, c->fa.u }, { K_CX, c->fa.s, 51, c->fb.u }, { K_CY, c->fb.s, 51, c->nodeD[round & 1u].u } };
+    const Step fine[6] = { { K_F1, c->nodePeak.s, 49, c->f1.u }, { K_F2, c->f1.s, 50, c->fa.u },
+                           { K_F3X, c->fa.s, 51, c->fb.u }, { K_F3Y, c->fb.s, 51, c->fa.u },
+                           { K_F5Y, c->fa.s, 52, c->fb.u }, { K_F5X, c->fb.s, 52, c->nodeD[round & 1u].u } };
+    const bool isCap = (c->flags & FALD_CORE2_CAP) != 0u;
+    const Step* steps = isCap ? cap : fine;
+    const int nSteps = isCap ? 3 : 6;
+    for (int i = 0; i < nSteps; i++) {
+        const Step& st = steps[i];
         ctx->CSSetConstantBuffers(0, 1, &faldCB);
         ctx->CSSetConstantBuffers(3, 1, &c->cb);
         ctx->CSSetShader(g_cs[st.k], nullptr, 0);
@@ -552,7 +651,7 @@ static void RunFine(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB
 
 void FaldCore2RunDeficit(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11ShaderResourceView* gainB,
                          unsigned int round, ID3D11Buffer* args, unsigned int fineSlot) {
-    if (!c || !c->cb || !FaldCore2ShadersReady()) return;
+    if (!c || !c->cb || !FaldCore2ShadersReady() || c->flags == 0u) return;   // flags 0: BeginRun made this run C
     if (c->flags & FALD_CORE2_FINE) { RunFine(c, ctx, faldCB, gainB, round, args, fineSlot); return; }
     const unsigned r = round & 1u;                         // round 2 (the IIR): never indirect — the full path
     // D1: one group per zone

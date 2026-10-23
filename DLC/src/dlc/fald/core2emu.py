@@ -29,6 +29,14 @@ from .starfield import StarfieldParams
 CORE_ALPHA, CORE_DEFICIT, CORE_SOFT, CORE_FINE = 1, 2, 4, 8
 CORE_KC2C = CORE_ALPHA | CORE_DEFICIT
 CORE_KC3 = CORE_ALPHA | CORE_DEFICIT | CORE_FINE     # ROUND 3: the fine-grid sliding-window deficit, no zone IIR
+# ROUND 5 (KC5, THE DEFAULT; shared/fald_core2.cpp C1 / CX / CY): the brightening CAP on the fine grid in place of the
+# deficit: per node the headroom h = max(0, ln(0.9 c3) - ln P3) (P3 = the 3 x 3 node max of the node peaks, c3 = the 3 x 3
+# node min of the ceiling), A = min_n [h_n + s |x - n|_1 px] over the whole lattice (separable min-plus, x then y);
+# ln g' = min(alpha max(ln g, 0), A) for g > 1. And the alpha law a5: KC3's below a5_g0 nit, 1 above a5_g1.
+# (Bits 4 / 5 = the prototype's KC4 hold, not ported.)
+CORE_CAP = 64
+CORE_A5 = 128
+CORE_KC5 = CORE_ALPHA | CORE_FINE | CORE_CAP | CORE_A5
 FIXED = 16384.0                 # the cut sum's fixed point (FALD_CORE2_FIXED)
 
 
@@ -43,6 +51,9 @@ class CoreParams:
     sigma: float = 0.7
     cut: float = 0.25
     a2: float = 0.35
+    cap_s: float = 0.10                 # FALD_CORE2_CAP_S: ln gain per 100 px
+    a5_g0: float = 0.5                  # FALD_CORE2_A5_G0 / G1 (nit)
+    a5_g1: float = 2.0
 
 
 def iir_factor(refreshes: int, a2: float = 0.35) -> float:
@@ -122,6 +133,9 @@ class CoreEmu(Emu):
         reset = (not st.valid) or cut or bool(self.flags & CORE_FINE)      # round 3: no zone IIR
         G = np.exp(lnG)
         raw = np.clip(cp.mu_inf * G / (G + cp.L_h) - cp.z, 0.0, 1.0)
+        if self.flags & CORE_A5:                # ROUND 5: KC3's law below a5_g0, 1 above a5_g1 (smoothstep in ln G)
+            t = np.clip((lnG - math.log(cp.a5_g0)) / (math.log(cp.a5_g1) - math.log(cp.a5_g0)), 0.0, 1.0)
+            raw = raw + (1.0 - raw) * (t * t * (3.0 - 2.0 * t))
         st.alpha = raw if (reset or st.alpha is None) else st.alpha + a * (raw - st.alpha)
         st.lz = lz
         alpha_z = np.clip(gauss_zone(st.alpha, cp.sigma), 0.0, 1.0)
@@ -211,6 +225,35 @@ class CoreEmu(Emu):
             d = e
         return np.maximum(gauss_zone(d, cp.sigma * S), 0.0)   # rows, then columns (the shader's order)
 
+    # ---- ROUND 5 (CORE_CAP): the brightening cap (shared/fald_core2.cpp C1 / CX / CY; the study twin pcore5 V5["KC5"])
+    def cap_steps(self):
+        """the min-plus cost per node step (x, y): s / 100 x the node pitch in px, in the shader's float32 order"""
+        f32 = np.float32
+        sx = f32(f32(f32(self.cp.cap_s) * f32(0.01)) * f32(self.cols * self.cw)) / f32(self.cols * self.sub)
+        sy = f32(f32(f32(self.cp.cap_s) * f32(0.01)) * f32(self.rows * self.ch)) / f32(self.rows * self.sub)
+        return float(sx), float(sy)
+
+    @staticmethod
+    def minplus_l1(h, cx, cy):
+        """min_n [h_n + cx |dx| + cy |dy|] over the whole lattice, x then y (the shader's forward / backward scans)"""
+        def ax1(a, c, axis):
+            n = a.shape[axis]
+            i = np.arange(n, dtype=np.float64).reshape((1, n) if axis == 1 else (n, 1))
+            fwd = np.minimum.accumulate(a - i * c, axis=axis) + i * c
+            bwd = np.flip(np.minimum.accumulate(np.flip(a + i * c, axis=axis), axis=axis), axis=axis) - i * c
+            return np.minimum(fwd, bwd)
+        return ax1(ax1(np.asarray(h, np.float64), cx, 1), cy, 0)
+
+    def cap_field(self, pn, cB):
+        """C1 (the headroom h per node), then CX / CY (the min-plus scans, x then y) -> the cap A on the fine grid"""
+        cp = self.cp
+        cn = np.minimum(self.white * cB.astype(np.float64) / KNEE_CAP_TRUST, self.white)
+        P3 = max3(pn)
+        c3 = -max3(-cn)
+        h = np.maximum(math.log(cp.kstart) + np.log(np.maximum(c3, 1e-9)) - np.log(np.maximum(P3, 1e-6)), 0.0)
+        sx, sy = self.cap_steps()
+        return self.minplus_l1(h, sx, sy)
+
     def core_gain(self, g, alpha_px, D_px):
         up = g > 1.0
         lg = np.log(np.where(up, g, 1.0))
@@ -218,6 +261,8 @@ class CoreEmu(Emu):
             lg = lg * np.clip(alpha_px, 0.0, 1.0)
         if self.flags & CORE_DEFICIT:
             lg = np.maximum(lg - np.maximum(D_px, 0.0), 0.0)
+        if self.flags & CORE_CAP:               # ROUND 5: the cap A (D_px carries A)
+            lg = np.minimum(lg, np.maximum(D_px, 0.0))
         return np.where(up, np.exp(lg), g)
 
     def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1,
@@ -249,7 +294,10 @@ class CoreEmu(Emu):
         bT0, bE0 = self.fields(dT0, dE0, boost0)
         _, gB0 = self.gain(bT0, bE0)
         cB0 = self.ceil_est(bE0)
-        if fine:
+        if fine and self.flags & CORE_CAP:
+            D0 = self.cap_field(pn, cB0)
+            D0px = self.sample(D0)
+        elif fine:
             D0 = self.fine_deficit(pn, gB0, cB0, alpha_z, rate_z)
             D0px = self.sample(D0)
         else:
@@ -265,7 +313,10 @@ class CoreEmu(Emu):
         bT1, bE1 = self.fields(dT1, dE1, boost1)
         graw1, gB1 = self.gain(bT1, bE1)
         cB1 = self.ceil_est(bE1)
-        if fine:
+        if fine and self.flags & CORE_CAP:
+            D1 = self.cap_field(pn, cB1)
+            D1px = self.sample(D1)
+        elif fine:
             D1 = self.fine_deficit(pn, gB1, cB1, alpha_z, rate_z)
             D1px = self.sample(D1)
         else:

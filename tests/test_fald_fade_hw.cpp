@@ -277,7 +277,8 @@ struct HwCase { std::string id; std::wstring panel; std::vector<std::string> fra
 
 TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content / no new content (FALD_HW_DIR + FALD_HW_OUT)") {
     const std::string dir = HwEnv("FALD_HW_DIR"), out = HwEnv("FALD_HW_OUT"), only = HwEnv("FALD_HW_ONLY");
-    const bool core2Mode = HwEnv("FALD_HW_CORE2") == "1" || HwEnv("FALD_HW_CORE2") == "2";   // the always-on core round 2 prototype off / on instead of the fade
+    const std::string core2Sel = HwEnv("FALD_HW_CORE2");   // the always-on core (1 KC2c / 2 KC3 / 4 KC5) against C instead of the fade
+    const bool core2Mode = core2Sel == "1" || core2Sel == "2" || core2Sel == "4";
     if (dir.empty() || out.empty()) return;
     const int n = std::max(4, atoi(HwEnv("FALD_HW_N").empty() ? "30" : HwEnv("FALD_HW_N").c_str()));
     CreateDirectoryA(out.c_str(), nullptr);
@@ -344,10 +345,13 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 41.708f;   // a 23.976 Hz grid
             FaldSettings& fs = ctx.hdrColorCorrection.fald;
             fs.enabled = true; fs.paramsPath = hc.panel; fs.star.enabled = true; fs.flankFade = fade != 0;
-            // the always-on core: FALD_HW_CORE2=1 / 2 makes the `fade` column KC2c / KC3 against C (the fade off); else C
-            // throughout, so the fade rows read as they did whatever the product default (shared/fald_core_mode.h)
+            // the always-on core: FALD_HW_CORE2=1 / 2 / 4 makes the `fade` column KC2c / KC3 / KC5 against C (the fade off); else
+            // C throughout, so the fade rows read as they did whatever the product default (shared/fald_core_mode.h)
             fs.coreMode = FALD_CORE_MODE_C;
-            if (core2Mode) { fs.flankFade = false; fs.coreMode = fade ? (HwEnv("FALD_HW_CORE2") == "2" ? FALD_CORE_MODE_KC3 : FALD_CORE_MODE_KC2C) : FALD_CORE_MODE_C; }
+            if (core2Mode) {
+                fs.flankFade = false;
+                fs.coreMode = !fade ? FALD_CORE_MODE_C : (core2Sel == "4" ? FALD_CORE_MODE_KC5 : (core2Sel == "2" ? FALD_CORE_MODE_KC3 : FALD_CORE_MODE_KC2C));
+            }
             REQUIRE(FaldEnsureResources(&ctx, fs));
             D3D11_TEXTURE2D_DESC td = {};
             td.Width = (UINT)hc.w; td.Height = (UINT)hc.h; td.MipLevels = 1; td.ArraySize = 1;

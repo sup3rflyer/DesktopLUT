@@ -161,8 +161,8 @@ static inline int      DwmHookFaldFadeForce(uint32_t w) { return (w & DWM_HOOK_F
 #define DWM_HOOK_FALD_CORE_FORCE_BIT 0x00000800u
 static inline int      DwmHookFaldCoreForce(uint32_t w) { return (w & DWM_HOOK_FALD_CORE_FORCE_BIT) != 0; }
 // The always-on core's mode (shared/fald_core_mode.h FALD_CORE_MODES; FaldSettings::coreMode): bits 16-19, set by
-// DwmHookFaldPackCore2 on top of DwmHookFaldPack. 0 = C (the default), 1 KC2c, 2 KC3, 3 / 4 reserved (KC4 / KC5); a host that
-// predates it sends 0; a mode the DLL does not know runs as C. (Two bits until 2026-10-23: the table outgrew them.)
+// DwmHookFaldPackCore2 on top of DwmHookFaldPack. 0 = C, 1 KC2c, 2 KC3, 3 reserved (KC4), 4 KC5 (the default); a host that
+// predates it sends 0 = C; a mode the DLL does not know runs as C. (Two bits until 2026-10-23: the table outgrew them.)
 #define DWM_HOOK_FALD_CORE_SHIFT 16
 #define DWM_HOOK_FALD_CORE_MASK  0x000F0000u
 static inline uint32_t DwmHookFaldPackCore2(uint32_t w, uint32_t coreMode) {

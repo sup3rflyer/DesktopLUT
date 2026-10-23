@@ -133,7 +133,7 @@ struct ChLayer {
     ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
     bool ok = false;
     int partialOverride = -1;
-    // coreMode: the always-on core's rule (shared/fald_core_mode.h; 0 = C, the 2026-10-22 gates; 2 = KC3, the default)
+    // coreMode: the always-on core's rule (shared/fald_core_mode.h; 0 = C, the 2026-10-22 gates; 2 = KC3; 4 = KC5, the default)
     ChLayer(ChWarp& w, const std::wstring& panel, int fw, int fh, bool star, unsigned int temporal, int partialOverrideAtRun = -1,
             unsigned int coreMode = FALD_CORE_MODE_C)
         : partialOverride(partialOverrideAtRun) {
@@ -284,7 +284,7 @@ TEST_CASE("FALD change: the partial path equals the full path with the always-on
     };
     const unsigned long long savedRefreshes = g_faldCore2TestRefreshes;
     g_faldCore2TestRefreshes = 1;                                  // KC2c's IIR: one refresh per run whatever WARP's timing
-    for (unsigned int coreMode : { FALD_CORE_MODE_KC3, FALD_CORE_MODE_KC2C })
+    for (unsigned int coreMode : { FALD_CORE_MODE_KC5, FALD_CORE_MODE_KC3, FALD_CORE_MODE_KC2C })
         for (unsigned int temporal : { 0u, 2u })
             for (int star = 0; star < 2; star++) {
                 ChLayer full(w, C, W, H, star != 0, temporal, 0, coreMode);    // the reference: the full path at every run
@@ -311,10 +311,11 @@ TEST_CASE("FALD change: the partial path equals the full path with the always-on
                             if (fa[i] != pb[i]) MESSAGE("  differs: " << fa[i].first);
                     if (part.ctx.fald->lastPartial) partialRuns++;
                 }
-                const int expect = coreMode == FALD_CORE_MODE_KC3 ? (int)(sizeof(steps) / sizeof(steps[0])) : 0;
+                const bool stateless = !FaldCore2Stateful(FaldCore2FlagsOfMode(coreMode));   // KC3, KC5
+                const int expect = stateless ? (int)(sizeof(steps) / sizeof(steps[0])) : 0;
                 CHECK_MESSAGE(partialRuns == expect, "core mode " << coreMode << " temporal " << temporal << " star " << star
                               << ": " << partialRuns << " partial runs, expected " << expect
-                              << (coreMode == FALD_CORE_MODE_KC3 ? " (KC3 is stateless: every step after the first)" : " (KC2c's IIRs: the full path)"));
+                              << (stateless ? " (a stateless rule: every step after the first)" : " (KC2c's IIRs: the full path)"));
             }
     g_faldCore2TestRefreshes = savedRefreshes;
 }

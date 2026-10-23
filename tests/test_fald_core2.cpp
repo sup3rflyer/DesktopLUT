@@ -25,11 +25,11 @@
 #include <vector>
 
 namespace {
-int CoreEnvMode() {                      // FALD_TEST_CORE2_MODE: 1 = KC2c (default), 2 = KC3
+int CoreEnvMode() {                      // FALD_TEST_CORE2_MODE: 1 = KC2c (default), 2 = KC3, 4 = KC5
     char* v = nullptr; size_t n = 0;
     if (_dupenv_s(&v, &n, "FALD_TEST_CORE2_MODE") != 0 || !v) return 1;
     const int m = atoi(v); free(v);
-    return (m == 2) ? 2 : 1;
+    return (m == 2 || m == 4) ? m : 1;
 }
 std::wstring CoreEnvDir(const char* name) {
     char* v = nullptr; size_t n = 0;

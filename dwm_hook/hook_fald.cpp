@@ -736,7 +736,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     // The always-on core round 2 (PROTOTYPE, shared/fald_core2.h; faldFlags bit 16): its zone textures + IIR state (panel
     // part: released with it, a swap rebuilds them); core2Wanted = the live setting; core2On = this run applies it.
     FaldCore2* core2 = nullptr;
-    uint32_t coreModeWanted = 0;             // the test-only core switch (0 C, 1 KC2c, 2 KC3)
+    uint32_t coreModeWanted = 0;             // the always-on core's mode (shared/fald_core_mode.h: 0 C, 1 KC2c, 2 KC3, 4 KC5 = the default)
     uint32_t core2Flags = 0;
     bool core2On = false;
     bool fadeFailed = false;
@@ -2657,7 +2657,7 @@ bool FaldPlanPartial(FaldMonitor* m, unsigned long long lutPassKey) {
     in.stateComplete = m->stateComplete; in.settingsSame = m->planSettingsKey == m->lastSettingsKey;
     in.frameKnown = m->touchedOk && lutPassKey != 0 && lutPassKey == m->lastLutPassKey;
     in.newContent = true; in.gainFused = m->gainFused; in.temporalMode = m->tempSettings.mode; in.fadeOn = m->fadeOn;
-    in.coreStateful = m->core2On && FaldCore2Stateful(m->core2Flags);   // KC2c's zone IIRs: the full path (KC3 is stateless)
+    in.coreStateful = m->core2On && FaldCore2Stateful(m->core2Flags);   // KC2c's zone IIRs: the full path (KC3 / KC5 are stateless)
     in.touchedZones = (unsigned int)m->touched.size(); in.totalZones = p.cols * p.rows;
     m->planPartial = g_faldPartialOverride != 0 && FaldChangeDecide(in, FaldChangeMaxZones(in.totalZones)) == FALD_CHANGE_PARTIAL;
     return m->planPartial;

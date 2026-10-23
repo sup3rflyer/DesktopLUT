@@ -213,10 +213,10 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     out["fald_starfield"] = star["enabled"]
     out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
     # the frozen fade stack (2026-10-20; runtime.fald_flank_fade) and item L (reserved, no setter)
-    # the always-on core's rule (shared/fald_core_mode.h; the default KC3 = 2 — the owner's 2026-10-23 call; runtime.fald_core_mode
-    # switches to the test modes 0 C / 1 KC2c; 3 / 4 reserved for KC4 / KC5)
-    out["fald_core_mode"] = int(entry.get("core_mode", 2))
-    out["fald_core_mode_name"] = {0: "C", 1: "KC2c", 2: "KC3", 3: "KC4 (reserved)", 4: "KC5 (reserved)"}.get(out["fald_core_mode"], "?")
+    # the always-on core's rule (shared/fald_core_mode.h; the default KC5 = 4 — the 2026-10-23 fill re-run + live blind test;
+    # runtime.fald_core_mode switches to the test modes 0 C / 1 KC2c / 2 KC3; 3 reserved for KC4)
+    out["fald_core_mode"] = int(entry.get("core_mode", 4))
+    out["fald_core_mode_name"] = {0: "C", 1: "KC2c", 2: "KC3", 3: "KC4 (reserved)", 4: "KC5"}.get(out["fald_core_mode"], "?")
     out["fald_flank_fade"] = bool(entry.get("flank_fade", False))
     out["fald_low_ext"] = False
     # the fade's GPU safety governor (2026-10-22): the mock renders nothing, so an enabled fade has no report yet
@@ -1051,8 +1051,8 @@ class MockDesktopLutServer:
             cm = params.get("core")
             if isinstance(cm, bool) or not isinstance(cm, (int, float)):
                 return DesktopLutResponse(ok=False, error="core must be a number")
-            if cm not in (0, 1, 2):
-                return DesktopLutResponse(ok=False, error="core must be 0, 1 or 2")
+            if cm not in (0, 1, 2, 4):              # the table's known modes (3 = KC4 reserved): the C++ text generated from it
+                return DesktopLutResponse(ok=False, error="core must be 0, 1, 2 or 4")
             fs["core_mode"] = int(cm)
             return self.ok({"monitor_mode": key, "core": cm})
         if method == "runtime.fald_flank_fade":

@@ -1723,7 +1723,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     in.frameKnown = listOk && frameKey != 0; in.newContent = newContent; in.gainFused = r->gainFused;
     in.temporalMode = clockOk ? ts.mode : (ts.mode == FALD_TEMPORAL_PANEL ? 0u : ts.mode);   // the mode that runs (FaldTemporalBeginRun)
     in.fadeOn = r->fadeOn;
-    in.coreStateful = r->core2On && FaldCore2Stateful(r->core2Flags);   // KC2c's zone IIRs: the full path (KC3 is stateless)
+    in.coreStateful = r->core2On && FaldCore2Stateful(r->core2Flags);   // KC2c's zone IIRs: the full path (KC3 / KC5 are stateless)
     in.touchedZones = (unsigned int)r->touched.size(); in.totalZones = totalZones;
     bool partial = g_faldPartialOverride != 0 && FaldChangeDecide(in, maxZones) == FALD_CHANGE_PARTIAL;   // + the routing rule below
 
