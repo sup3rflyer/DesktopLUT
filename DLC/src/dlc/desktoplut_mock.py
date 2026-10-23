@@ -213,9 +213,10 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     out["fald_starfield"] = star["enabled"]
     out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
     # the frozen fade stack (2026-10-20; runtime.fald_flank_fade) and item L (reserved, no setter)
-    # the always-on core's rule (shared/fald_core_mode.h; default KC3 = 2 since 2026-10-23; runtime.fald_core_mode switches it)
-    out["fald_core_mode"] = int(entry.get("core_mode", 2))
-    out["fald_core_mode_name"] = {0: "C", 1: "KC2c", 2: "KC3"}.get(out["fald_core_mode"], "?")
+    # the always-on core's rule (shared/fald_core_mode.h; the default C = 0 — the 2026-10-23 fill test; runtime.fald_core_mode
+    # switches to the test modes 1 KC2c / 2 KC3; 3 / 4 reserved for KC4 / KC5)
+    out["fald_core_mode"] = int(entry.get("core_mode", 0))
+    out["fald_core_mode_name"] = {0: "C", 1: "KC2c", 2: "KC3", 3: "KC4 (reserved)", 4: "KC5 (reserved)"}.get(out["fald_core_mode"], "?")
     out["fald_flank_fade"] = bool(entry.get("flank_fade", False))
     out["fald_low_ext"] = False
     # the fade's GPU safety governor (2026-10-22): the mock renders nothing, so an enabled fade has no report yet

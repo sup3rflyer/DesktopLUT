@@ -133,7 +133,7 @@ struct ChLayer {
     ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
     bool ok = false;
     int partialOverride = -1;
-    // coreMode: the always-on core's rule (shared/fald_core_mode.h; 0 = C — the 2026-10-22 gates — 2 = KC3, the default)
+    // coreMode: the always-on core's rule (shared/fald_core_mode.h; 0 = C, the default and the 2026-10-22 gates; 2 = KC3, a test mode)
     ChLayer(ChWarp& w, const std::wstring& panel, int fw, int fh, bool star, unsigned int temporal, int partialOverrideAtRun = -1,
             unsigned int coreMode = FALD_CORE_MODE_C)
         : partialOverride(partialOverrideAtRun) {

@@ -1780,7 +1780,7 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
     m->fadeWanted = fade;
     m->fadeForce = fadeForce;
     m->coreForce = coreForce;
-    m->coreModeWanted = coreMode <= FALD_CORE_MODE_MAX ? coreMode : 0u;   // the always-on core's switch (0 = C)
+    m->coreModeWanted = FaldCoreModeKnown(coreMode) ? coreMode : FALD_CORE_MODE_C;   // the always-on core's switch (a reserved / unknown mode runs as C)
     m->tuning = tuning ? SanitizeTuning(*tuning) : DefaultTuning();
     // LED lag: from the tail (none = off). Bounded here too — the delay indexes a texture array.
     FaldTemporalSettings ts;

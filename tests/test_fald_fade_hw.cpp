@@ -345,7 +345,7 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             FaldSettings& fs = ctx.hdrColorCorrection.fald;
             fs.enabled = true; fs.paramsPath = hc.panel; fs.star.enabled = true; fs.flankFade = fade != 0;
             // the always-on core: FALD_HW_CORE2=1 / 2 makes the `fade` column KC2c / KC3 against C (the fade off); else C
-            // throughout, so the fade rows read as they did (the product default is KC3: shared/fald_core_mode.h)
+            // throughout, so the fade rows read as they did whatever the product default (shared/fald_core_mode.h)
             fs.coreMode = FALD_CORE_MODE_C;
             if (core2Mode) { fs.flankFade = false; fs.coreMode = fade ? (HwEnv("FALD_HW_CORE2") == "2" ? FALD_CORE_MODE_KC3 : FALD_CORE_MODE_KC2C) : FALD_CORE_MODE_C; }
             REQUIRE(FaldEnsureResources(&ctx, fs));

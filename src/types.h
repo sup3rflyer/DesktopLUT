@@ -616,11 +616,12 @@ struct FaldSettings {
     // passed along the content's motion. Default OFF = today's layer bit for bit (until the owner's hardware gates pass;
     // DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md section 6). An INI without the key loads OFF.
     bool flankFade = false;
-    // The always-on core's rule (shared/fald_core_mode.h FALD_CORE_MODES): 0 = C (the 2026-10-22 layer bit for bit), 1 = KC2c
-    // (round 2: alpha + the zone deficit + a zone IIR), 2 = KC3 (round 3: alpha + the fine-grid deficit) — THE DEFAULT
-    // (FALD_CORE_MODE_DEFAULT, the owner's 2026-10-23 decision after two live blind tests). Read from INI
+    // The always-on core's rule (shared/fald_core_mode.h FALD_CORE_MODES): 0 = C (the 2026-10-22 layer bit for bit) — THE
+    // DEFAULT (FALD_CORE_MODE_DEFAULT; the 2026-10-23 colorimeter fill test: C's fill is right at neutral levels, KC3's alpha
+    // removes real correction), 1 = KC2c (round 2: alpha + the zone deficit + a zone IIR), 2 = KC3 (round 3: alpha + the
+    // fine-grid deficit) — test modes for A/B; 3 / 4 reserved for KC4 / KC5 (C's fill + KC3's deficit). Read from INI
     // <mode>_FaldCoreModeTest (absent = the default), set at runtime by the pipe (runtime.fald_core_mode); NEVER saved; no
-    // GUI control: the other modes are the A/B switch.
+    // GUI control.
     uint32_t coreMode = FALD_CORE_MODE_DEFAULT;
     // Item L (the 1-3-nit zone-floor extension, round 12): RESERVED. Persisted (<mode>_FaldLowExt) so the setting has its
     // home, but nothing reads it — the shader word (fadeFlags bit 1) is never set in this build.

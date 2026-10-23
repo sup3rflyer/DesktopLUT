@@ -1726,9 +1726,10 @@ void DoFaldFlankFade(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("enabled", JBool(en->b));
 }
 
-// runtime.fald_core_mode {monitor, mode, core}: the always-on core's switch (shared/fald_core2.h FALD_CORE_MODES): 0 = C
-// (today's layer), 1 = KC2c (round 2), 2 = KC3 (round 3; the live blind tests' leading rule). Runtime only: NEVER saved (the
-// INI key <mode>_FaldCoreModeTest sets the start value; the owner decides the default). The live blind kits set it per block.
+// runtime.fald_core_mode {monitor, mode, core}: the always-on core's switch (shared/fald_core_mode.h FALD_CORE_MODES): 0 = C
+// (the default: today's layer bit for bit), 1 = KC2c (round 2), 2 = KC3 (round 3) — test modes for A/B; 3 / 4 reserved
+// (KC4 / KC5). Runtime only: NEVER saved (the INI key <mode>_FaldCoreModeTest sets the start value). The live blind kits and
+// the bench set it per block / configuration.
 void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
@@ -1736,12 +1737,14 @@ void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
     if (!cm) { error = "missing parameter: core"; return; }
     if (cm->type != JsonValue::Num) { error = "core must be a number"; return; }
     const double v = cm->num;
+    std::vector<uint32_t> modes;                   // the modes the table defines (a reserved KC4 / KC5 slot is refused until it lands)
+    for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++) if (FaldCoreModeKnown(k)) modes.push_back(k);
     bool known = false;
-    for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++) known = known || v == (double)k;
+    for (uint32_t k : modes) known = known || v == (double)k;
     if (!known) {                                  // "core must be 0, 1 or 2" (the mock's text, DLC desktoplut_mock.py)
         error = "core must be ";
-        for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++)
-            error += std::to_string(k) + (k + 2 < FALD_CORE_MODE_COUNT ? ", " : (k + 1 < FALD_CORE_MODE_COUNT ? " or " : ""));
+        for (size_t i = 0; i < modes.size(); i++)
+            error += std::to_string(modes[i]) + (i + 2 < modes.size() ? ", " : (i + 1 < modes.size() ? " or " : ""));
         return;
     }
     {
