@@ -20,7 +20,10 @@ ChangeDisplaySettingsExA / EnumDisplayDevicesA / EnumDisplaySettingsA and no Set
 integer Hz, with flags 0 (dynamic, nothing saved). The difference: it is addressed by the PA32's device name, never
 by nircmd's enumeration index, and never to the other displays (change-refresh.lua co-switches every display; DLC
 must not). Every switch is followed by ``verify_switch()``. It requires the exact rational of the requested rate (so
-47.952 and 48 can never be confused), the same resolution, HDR still on, and every OTHER display unchanged.
+47.952 and 48 can never be confused), the same resolution, HDR still on, and every OTHER display unchanged. Every
+switch is also TEMPORARY, and that is verified: the saved (registry) mode must still be the one before the switch,
+so a reset mid-run comes back at the owner's rate. ``restore_mode`` puts the original back, and repairs the saved
+mode if anything changed it.
 
 Mechanical facts only. What to do about a failed check (refuse, restore, ask) is the caller's decision.
 """
@@ -234,6 +237,7 @@ ENUM_REGISTRY_SETTINGS = 0xFFFFFFFE  # the saved mode a dynamic change does not 
 DM_BITSPERPEL, DM_PELSWIDTH, DM_PELSHEIGHT, DM_DISPLAYFREQUENCY = 0x40000, 0x80000, 0x100000, 0x400000
 CDS_DYNAMIC = 0x0                   # nircmd's default (no -updatereg): change now, write nothing to the registry
 CDS_TEST = 0x2                      # validate only: the mode is NOT set
+CDS_UPDATEREGISTRY = 0x1            # used ONLY by restore_mode, to put a SAVED mode back to the recorded original
 DISP_CHANGE = {0: "SUCCESSFUL", 1: "RESTART", -1: "FAILED", -2: "BADMODE", -3: "NOTUPDATED", -4: "BADFLAGS",
                -5: "BADPARAM", -6: "BADDUALVIEW"}
 COLOR_MODES = {0: "SDR", 1: "WCG", 2: "HDR"}            # DISPLAYCONFIG_ADVANCED_COLOR_MODE (24H2+)
@@ -508,6 +512,7 @@ class SimDisplayApi:
         self.fail_rc: dict[int, int] = {int(k): int(v) for k, v in (faults.get("fail_rc") or {}).items()}
         self.touch_other: dict[int, tuple] = {int(k): (v[0], tuple(v[1])) for k, v in (faults.get("touch_other") or {}).items()}
         self.settle_polls = int(faults.get("settle_polls", 0))
+        self.saves_to_registry: set = {int(v) for v in (faults.get("saves_to_registry") or ())}  # a driver that saves
         self.registry = {k: d.active for k, d in self.displays.items()}
         self._pending: list[tuple[SimDisplay, tuple]] = []
         self._lag = 0
@@ -581,6 +586,8 @@ class SimDisplayApi:
             return 0
         target = self.land_on.get(hz, cands[0])
         self._pending = [(d, target)]
+        if flags & CDS_UPDATEREGISTRY or hz in self.saves_to_registry:
+            self.registry[device.upper()] = target
         if hz in self.touch_other:
             other, r = self.touch_other[hz]                   # the other display by GDI name or hardware ID
             od = self.displays.get(str(other).upper()) or next(
@@ -719,7 +726,7 @@ def switch_and_verify(api: Any, *, hardware_id: str, rate: str, expected_rationa
     w, h = int(src["width"]), int(src["height"])
     rec: dict[str, Any] = {"rate": rate, "device_name": d["device_name"], "request": {"width": w, "height": h, "bpp": 32,
                                                                                      "hz": legacy_hz(rate)},
-                           "before": mode_key(d)}
+                           "before": mode_key(d), "registry_before": api.legacy_registry(d["device_name"])}
     if cds_test_first:
         rc = api.change(d["device_name"], width=w, height=h, bpp=32, hz=legacy_hz(rate), flags=CDS_TEST)
         rec["cds_test_rc"] = rc
@@ -742,19 +749,29 @@ def switch_and_verify(api: Any, *, hardware_id: str, rate: str, expected_rationa
             break
         sleep(poll_s)
     rec.update(last)
+    rec["fails"] = list(rec.get("fails") or [])
     rec["after"] = mode_key(find_display(after, hardware_id))
     rec["verify_s"] = round(now() - t0, 3)
+    # TEMPORARY only: the saved (registry / display-database) mode must still be the one before the switch, so a
+    # reset mid-run comes back at the owner's rate
+    reg0, reg1 = rec["registry_before"], api.legacy_registry(d["device_name"])
+    rec["registry_after"] = reg1
+    if reg0 and (not reg1 or int(reg1.get("hz") or -1) != int(reg0.get("hz") or -1)):
+        rec["fails"].append(f"the switch was SAVED: the registry mode is {(reg1 or {}).get('hz')} Hz, was {reg0.get('hz')} Hz")
+        rec["ok"] = False
     return rec
 
 
 def restore_mode(api: Any, *, hardware_id: str, original: dict[str, Any], others: dict[str, Any],
                  sleep: Callable[[float], None] = time.sleep, now: Callable[[], float] = time.monotonic,
                  timeout_s: float = 10.0) -> dict[str, Any]:
-    """Put the display back on its ``original`` mode (``{"rate", "expected_rational"}``, recorded before the first
-    switch). First the same integer request as any switch, verified. If that fails, and the registry mode IS the
-    original (every switch is dynamic, so it is unless something else saved a mode), the NULL-DEVMODE reset to the
-    registry, verified. ``others`` = :func:`mode_key` of every OTHER display before the run; any difference is
-    reported (never "fixed": DLC does not touch other displays)."""
+    """Put the display back on its ``original`` mode (``{"rate", "expected_rational", "registry_hz"}``, recorded
+    before the first switch). First the same integer request as any switch, verified. If that fails, and the registry
+    mode IS the original (every switch is dynamic, so it is unless something else saved a mode), the NULL-DEVMODE
+    reset to the registry, verified. Then the SAVED mode: if it is no longer ``registry_hz``, one CDS_UPDATEREGISTRY
+    request puts the recorded value back (the only registry write DLC makes), so a reboot comes back at the owner's
+    rate. ``others`` = :func:`mode_key` of every OTHER display before the run; any difference is reported (never
+    "fixed": DLC does not touch other displays)."""
     rec: dict[str, Any] = {"target": original}
     cur = find_display(api.snapshot(), hardware_id)
     if classify_hz(active_hz(cur) or 0.0) == original["rate"]:
@@ -773,11 +790,23 @@ def restore_mode(api: Any, *, hardware_id: str, original: dict[str, Any], others
                 t0 = now()
                 while now() - t0 < timeout_s and classify_hz(active_hz(find_display(api.snapshot(), hardware_id)) or 0.0) != original["rate"]:
                     sleep(0.25)
+    # the SAVED mode: if anything saved a run rate, put the recorded original back (the only registry write DLC makes)
+    reg_hz = original.get("registry_hz")
+    reg = api.legacy_registry(cur["device_name"])
+    if reg_hz is not None and reg and int(reg.get("hz") or -1) != int(reg_hz):
+        src = cur.get("source") or {}
+        rec["registry_found"] = reg
+        rec["registry_repair_rc"] = api.change(cur["device_name"], width=int(src["width"]), height=int(src["height"]),
+                                               bpp=32, hz=int(reg_hz), flags=CDS_UPDATEREGISTRY)
+        sleep(1.0)
+        reg = api.legacy_registry(cur["device_name"])
+    rec["registry_final"] = reg
+    rec["registry_ok"] = reg_hz is None or bool(reg and int(reg.get("hz") or -1) == int(reg_hz))
     snap = api.snapshot()
     fin = find_display(snap, hardware_id)
     rec["final"] = mode_key(fin)
     rec["final_hz"] = active_hz(fin)
-    rec["ok"] = classify_hz(active_hz(fin) or 0.0) == original["rate"]
+    rec["ok"] = classify_hz(active_hz(fin) or 0.0) == original["rate"] and rec["registry_ok"]
     exp = original.get("expected_rational")
     if rec["ok"] and exp and exp[1] and abs((active_hz(fin) or 0.0) - exp[0] / exp[1]) > EXPECTED_TOL_HZ:
         rec["ok"] = False

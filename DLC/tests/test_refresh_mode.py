@@ -134,6 +134,29 @@ def test_restore_mode_back_to_60_and_registry_fallback():
     assert any(x.get("reset_to_registry") for x in api2.calls)
 
 
+def test_switches_are_temporary_and_a_saved_one_refuses():
+    api = rm.sim_pa32_desk()
+    rec = _sw(api, "50")
+    assert rec["ok"] and rec["registry_after"]["hz"] == 60     # dynamic: the saved mode is still 60
+    api2 = rm.sim_pa32_desk(saves_to_registry=[47])
+    rec2 = _sw(api2, "47.952", timeout_s=1.0)
+    assert not rec2["ok"] and any("SAVED" in f for f in rec2["fails"])
+
+
+def test_restore_repairs_a_saved_mode():
+    api = rm.sim_pa32_desk(saves_to_registry=[48])
+    snap = api.snapshot()
+    others = {p["device_name"]: rm.mode_key(p) for p in snap if p["hardware_id"] != "AUS322A"}
+    assert not _sw(api, "48", timeout_s=1.0)["ok"]
+    assert api.legacy_registry(r"\\.\DISPLAY1")["hz"] == 48
+    c = Clock()
+    rec = rm.restore_mode(api, hardware_id="AUS322A", original={"rate": "60", "expected_rational": [60, 1],
+                                                                "registry_hz": 60}, others=others, sleep=c.sleep, now=c.now)
+    assert rec["ok"] and rec["registry_ok"] and rec["registry_repair_rc"] == 0
+    assert api.legacy_registry(r"\\.\DISPLAY1")["hz"] == 60
+    assert [x["flags"] for x in api.calls if x.get("hz") == 60][-1] == rm.CDS_UPDATEREGISTRY
+
+
 def test_find_display_refuses_duplicates_and_edid_mismatch():
     snap = rm.sim_pa32_desk().snapshot()
     with pytest.raises(LookupError):
