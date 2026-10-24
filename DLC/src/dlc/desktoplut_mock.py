@@ -994,7 +994,7 @@ class MockDesktopLutServer:
             df = params.get("delay_frames"); cl = params.get("closure"); pa = params.get("parity")
             num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
             if not (num(tm) or num(tr) or num(tf) or num(df) or num(cl) or num(pa)):
-                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)")
+                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1|-2)")
             if num(tm) and tm not in (0, 1, 2, 3):
                 return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)")
             for name, v in (("tau_rise_ms", tr), ("tau_fall_ms", tf)):
@@ -1004,8 +1004,8 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(ok=False, error="delay_frames must be 0..3")
             if num(cl) and not (0.05 <= cl <= 1.0):
                 return DesktopLutResponse(ok=False, error="closure must be 0.05..1")
-            if num(pa) and pa not in (-1, 0, 1):
-                return DesktopLutResponse(ok=False, error="parity must be -1 (unknown), 0 or 1")
+            if num(pa) and pa not in (-1, 0, 1, -2):     # -2 = unknown, the plain mean of both clocks (the A/B's test arm)
+                return DesktopLutResponse(ok=False, error="parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)")
             if num(tm):
                 fs["temporal_mode"] = int(tm)
             if num(tr):

@@ -62,21 +62,44 @@ def test_static_content_is_settled_from_the_first_frame():
         np.testing.assert_allclose(e, d)
 
 
-def test_drive_state_known_parity_equals_its_clock_and_unknown_is_the_mean():
-    from dlc.fald.paneltime import PanelDriveState
+def test_drive_state_known_parity_equals_its_clock_and_unknown_is_the_robust_combination():
+    from dlc.fald.paneltime import PARITY_MEAN, ROBUST_CAP, PanelDriveState
     law = PanelTimeLaw(closure=0.75)
-    seq = [np.array([[0.2]])] * 3 + [np.array([[1.0]])] * 6
-    states = {p: PanelDriveState(law, p) for p in (0, 1, None)}
+    seq = [np.array([[0.2]])] * 3 + [np.array([[1.0]])] * 6 + [np.array([[0.002]])] * 4 + [np.array([[0.9]])] * 6
+    states = {p: PanelDriveState(law, p) for p in (0, 1, None, PARITY_MEAN)}
+    clamped, free = [], []
     for d in seq:
         f = {p: s.fields(d) for p, s in states.items()}
-        np.testing.assert_allclose(f[None][0], (f[0][0] + f[1][0]) / 2)
+        # B_est: the mean of the two compensation states (both combinations)
         np.testing.assert_allclose(f[None][1], (f[0][1] + f[1][1]) / 2)
+        np.testing.assert_allclose(f[PARITY_MEAN][1], (f[0][1] + f[1][1]) / 2)
+        # B_true: the plain mean (-2), or the mean plus the clocks' mean transient clamped to +-CAP x B_est's map (-1)
+        mean_t = ((f[0][0] - f[0][1]) + (f[1][0] - f[1][1])) / 2
+        lim = ROBUST_CAP * f[None][1]
+        np.testing.assert_allclose(f[None][0], f[None][1] + np.clip(mean_t, -lim, lim))
+        clamped.append(bool(np.any(np.abs(mean_t) > lim * (1 + 1e-9))))
+        free.append(bool(np.any((np.abs(mean_t) > 1e-6) & (np.abs(mean_t) < lim))))
         for s in states.values():
             s.commit(d)
+    # the sequence had a transient the clamp cut (a cut: the whole step in one clock) and one it let through
+    assert any(clamped) and any(free)
     c = PanelClock(law, 1); s = PanelDriveState(law, 1)
     for d in seq:
         got = s.fields(d); s.commit(d); want = c.step(d)
         np.testing.assert_allclose(got[0], want[0]); np.testing.assert_allclose(got[1], want[1])
+
+
+def test_robust_transient_is_the_clamped_mean():
+    from dlc.fald.paneltime import ROBUST_CAP, robust_transient
+    assert ROBUST_CAP == 0.1
+    # one clock stepped 0.2 -> 0.776 (its compensation still at 0.2), the other caught up at 0.776: mean e 0.488, mean
+    # transient 0.288 -> clamped to 0.0488; the plain mean would have dimmed the caught-up clock's frame by ~1/1.6
+    t = robust_transient([(np.array([0.776]), np.array([0.2])), (np.array([0.776]), np.array([0.776]))])
+    assert abs(float(t[0]) - 0.1 * 0.488) < 1e-12
+    # small transients pass unchanged, both signs; nothing on a black (settled-off) zone
+    t = robust_transient([(np.array([0.52, 0.48]), np.array([0.5, 0.5])), (np.array([0.51, 0.49]), np.array([0.5, 0.5]))])
+    assert np.allclose(t, [0.015, -0.015])
+    assert float(robust_transient([(np.array([0.3]), np.array([0.0])), (np.array([0.0]), np.array([0.0]))])[0]) == 0.0
 
 
 # ------------------------------------------------------------------------------------------ k refreshes per frame (C13)

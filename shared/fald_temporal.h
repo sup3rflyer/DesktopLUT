@@ -42,8 +42,8 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
 // targeted that frame's round-1 drives d_prev, so t ticks are ONE blend a = 1 - (1 - closure)^t:
 //   B_true of this frame from S_p + aTrue_p (d_prev - S_p)   (ticks up to this refresh; committed as the new S_p)
 //   B_est  of this frame from S_p + aEst_p  (d_prev - S_p)   (ticks up to the refresh before it)
-// parity -1 (unknown, the default) = the mean of the two clocks (the fields are linear in the drives), 0 / 1 = that
-// clock only (EXPERIMENTAL: the refresh index comes from run timing, not from DXGI frame statistics). The state of a
+// parity -1 (unknown, the default) = both clocks, combined ROBUSTLY (below FALD_CLOCK_ROBUST_CAP), 0 / 1 = that clock only
+// (EXPERIMENTAL: the refresh index comes from run timing, not from DXGI frame statistics). The state of a
 // frame depends on past frames only, so both inverse rounds read the same two maps. First frame after a reset: both
 // clocks = this frame's drives (the panel is taken as settled), the fields are the stateless layer's.
 // TIME: a refresh GRID LOCKED TO THE RUNS (first-order phase lock). The grid has the NOMINAL period (the mode
@@ -73,10 +73,26 @@ constexpr float FALD_CLOCK_CLOSURE_MAX = 1.0f;
 constexpr unsigned int FALD_CLOCK_MAX_REFRESHES = 64;        // more elapsed refreshes than this: blends exactly 1
 constexpr unsigned int FALD_CLOCK_SETTLE_MAX = 120;          // cap of the settle hold, in refreshes
 constexpr double FALD_CLOCK_LOCK_GAIN = 0.08;                // steady gain of the refresh grid's phase lock (per run)
-// Closure into FALD_CLOCK_CLOSURE_MIN..MAX (NaN -> the default); parity into -1 / 0 / 1 (anything else -> -1).
+// The UNKNOWN parity's combination (2026-10-23; DLC paneltime.PanelDriveState, results/fald_parity_robust_2026-10-23):
+// B_est's map = the mean of the two clocks' compensation states e_p; B_true's = that mean plus the mean of the clocks'
+// TRANSIENTS t_p - e_p (what makes the flash / dip correction), clamped per zone to +-FALD_CLOCK_ROBUST_CAP x that mean
+// e. On a cut each clock wants the whole step in a DIFFERENT refresh, so the plain mean applied half a step where the
+// panel needed none — inside new content the LCD is already fully open there and a half-way dimming only harms: the
+// owner's alt-tab / hover-expand, -50 % one refresh after a window appeared on black, a worst refresh 32 % off target on a
+// 5-nit page (clamped: 15 / 11 % off; the bare panel 20 / 11 %). In motion a frame's transient is small against a lit state and passes; the
+// clamp gives back part of the plain mean's surround-flicker gain beside small bright moving objects. Swept 0.05 / 0.1 /
+// 0.2 / 0.35 offline under both parities (0.1 best); HLSL pass 1c.
+constexpr float FALD_CLOCK_ROBUST_CAP = 0.1f;
+// Parity code of the PLAIN mean of the two clocks (the unknown parity before 2026-10-23): a test value for the blind A/B
+// (runtime.fald_temporal parity -2), never saved — the INI keeps -1; the hosts run the FALD_CLOCK_MEAN variant of pass 1c.
+// A DWM hook DLL from before it reads -2 as -1, which there IS the plain mean.
+constexpr int FALD_CLOCK_PARITY_MEAN = -2;
+// Closure into FALD_CLOCK_CLOSURE_MIN..MAX (NaN -> the default); parity into -1 / 0 / 1 / FALD_CLOCK_PARITY_MEAN (anything
+// else -> -1).
 float FaldPanelClockClosure(float closure);
 int FaldPanelClockParity(int parity);
-// Parity from an INI value: exactly "-1", "0" or "1" (surrounding blanks allowed); empty / garbage / anything else -> -1.
+// Parity from an INI value: exactly "-1", "0" or "1" (surrounding blanks allowed); empty / garbage / anything else -> -1
+// (FALD_CLOCK_PARITY_MEAN included: it is never saved).
 int FaldPanelClockParityFromText(const wchar_t* text);
 // Ticks of the clock with this parity (it ticks at refresh n when (n + parity) is even) between a frame first shown at
 // refresh nA and the next one at nA + k (k >= 1): tTrue = ticks in nA+1 .. nA+k, tEst = ticks in nA+1 .. nA+k-1.

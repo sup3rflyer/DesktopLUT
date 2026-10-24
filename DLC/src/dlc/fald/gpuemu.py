@@ -234,6 +234,15 @@ def clock_factors32(n_a: int, k: int, closure: float, parity: int) -> tuple:
     return a(ts0), a(tp0), a(ts1), a(tp1), w[0], w[1]
 
 
+def clock_robust_true32(t0, e0, t1, e1, w0, w1, est) -> np.ndarray:
+    """Pass 1c's unknown-parity B_true map (float32, the HLSL's order): tr = w0 (t0 - e0) + w1 (t1 - e1), lim = CAP x
+    est, est + clamp(tr, -lim, lim); :func:`paneltime.robust_transient` is the float64 reference."""
+    from .paneltime import ROBUST_CAP
+    tr = (w0 * (t0 - e0).astype(np.float32) + w1 * (t1 - e1).astype(np.float32)).astype(np.float32)
+    lim = (f32(ROBUST_CAP) * est).astype(np.float32)
+    return (est + np.minimum(np.maximum(tr, -lim), lim)).astype(np.float32)
+
+
 class GpuPanelDriveState:
     """The GPU side of :class:`dlc.fald.paneltime.PanelDriveState` — temporal mode 3 "panel clock" (work guide C13):
     pass 1c ``g_faldPanelClockSource`` on the R32F zone textures, driven like the C++ ``FaldRunPasses``.
@@ -253,7 +262,8 @@ class GpuPanelDriveState:
         from .paneltime import CLOSURE_MAX, CLOSURE_MIN, MODE_PANEL
         self.mode = MODE_PANEL
         self.closure = float(min(max(float(closure), CLOSURE_MIN), CLOSURE_MAX))
-        self.parity = int(parity) if parity in (0, 1) else -1
+        from .paneltime import PARITY_MEAN
+        self.parity = int(parity) if parity in (0, 1, PARITY_MEAN) else -1   # -2 = the plain mean (the A/B's legacy arm)
         self.reset()
 
     def reset(self) -> None:
@@ -278,8 +288,12 @@ class GpuPanelDriveState:
         d, (s0, s1) = self.d_prev, self.s
         g0 = (d - s0).astype(np.float32); g1 = (d - s1).astype(np.float32)
         t0 = (s0 + aT0 * g0).astype(np.float32); t1 = (s1 + aT1 * g1).astype(np.float32)
-        self.true = (w0 * t0 + w1 * t1).astype(np.float32)
-        self.est = (w0 * (s0 + aE0 * g0).astype(np.float32) + w1 * (s1 + aE1 * g1).astype(np.float32)).astype(np.float32)
+        e0 = (s0 + aE0 * g0).astype(np.float32); e1 = (s1 + aE1 * g1).astype(np.float32)
+        self.est = (w0 * e0 + w1 * e1).astype(np.float32)
+        if self.parity == -1:               # unknown: the robust combination (paneltime.robust_transient; HLSL pass 1c)
+            self.true = clock_robust_true32(t0, e0, t1, e1, w0, w1, self.est)
+        else:                               # known, or PARITY_MEAN (-2): the plain weighted mean (the FALD_CLOCK_MEAN variant)
+            self.true = (w0 * t0 + w1 * t1).astype(np.float32)
         self.s = [t0, t1]
         self.n += k
 

@@ -1649,7 +1649,9 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
 // runtime.fald_temporal {monitor, mode, temporal_mode?, tau_rise_ms?, tau_fall_ms?, delay_frames?, closure?, parity?}: the
 // shader's per-cell drive state (LED-lag filter; fald.h FALD_TEMPORAL_*, DLC dlc/fald/temporal.py). temporal_mode 3 =
 // the measured panel clock (work guide C13, DLC dlc/fald/paneltime.py) with closure (share of the LED gap closed per
-// tick) and parity (-1 unknown / 0 / 1). Persisted per mode like ped_mode (the GUI row sets both modes). Error texts are
+// tick) and parity (-1 unknown / 0 / 1; -2 = unknown with the plain mean of both clocks, the combination before 2026-10-23:
+// a test value for the blind A/B, never saved — the INI keeps -1). Persisted per mode like ped_mode (the GUI row sets both
+// modes). Error texts are
 // mirrored by the DLC mock word for word.
 void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
@@ -1661,13 +1663,13 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     const JsonValue* cl = p.find("closure");
     const JsonValue* pa = p.find("parity");
     auto isNum = [](const JsonValue* v) { return v && v->type == JsonValue::Num; };
-    if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df) && !isNum(cl) && !isNum(pa)) { error = "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)"; return; }
+    if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df) && !isNum(cl) && !isNum(pa)) { error = "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1|-2)"; return; }
     if (isNum(tm) && !(tm->num == 0 || tm->num == 1 || tm->num == 2 || tm->num == 3)) { error = "temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)"; return; }
     if (isNum(tr) && !(tr->num >= 0 && tr->num <= FALD_TAU_MAX_MS)) { error = "tau_rise_ms must be 0..5000 ms"; return; }
     if (isNum(tf) && !(tf->num >= 0 && tf->num <= FALD_TAU_MAX_MS)) { error = "tau_fall_ms must be 0..5000 ms"; return; }
     if (isNum(df) && !(df->num == 0 || df->num == 1 || df->num == 2 || df->num == 3)) { error = "delay_frames must be 0..3"; return; }
     if (isNum(cl) && !(cl->num >= FALD_CLOCK_CLOSURE_MIN && cl->num <= FALD_CLOCK_CLOSURE_MAX)) { error = "closure must be 0.05..1"; return; }
-    if (isNum(pa) && !(pa->num == -1 || pa->num == 0 || pa->num == 1)) { error = "parity must be -1 (unknown), 0 or 1"; return; }
+    if (isNum(pa) && !(pa->num == -1 || pa->num == 0 || pa->num == 1 || pa->num == FALD_CLOCK_PARITY_MEAN)) { error = "parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)"; return; }
     unsigned int mode = 0, delay = 0; float rise = 0.0f, fall = 0.0f, closure = FALD_CLOCK_CLOSURE_DEFAULT; int parity = -1;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);

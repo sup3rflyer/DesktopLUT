@@ -1269,12 +1269,22 @@ void main(uint3 id : SV_DispatchThreadID) {
 // clocks, advanced in place to this frame's first refresh. Out: the drive maps the real-spread kernel (u0) and the
 // estimate kernel (u1: the LED state one refresh earlier) see in BOTH rounds — the clocks' weighted mean. Nothing here
 // depends on this frame's content; the C++ stores this frame's round-1 drives as the next target afterwards.
+// Unknown parity (both weights > 0; shared/fald_temporal.h above FALD_CLOCK_ROBUST_CAP): B_est's map is the mean of the
+// two compensation states e_p, B_true's that mean plus the mean of the clocks' TRANSIENTS t_p - e_p, clamped to
+// +-FALD_CLOCK_ROBUST_CAP x the mean e — on a cut the two clocks want their step in different refreshes, and the half a
+// plain mean applies where the panel needs none must not dim the frame by more than that (DLC
+// paneltime.robust_transient, gpuemu.clock_robust_true32).
+// Compiled a second time with g_faldClockMeanDefine: the plain mean of both maps (the pre-2026-10-23 pass, parity
+// FALD_CLOCK_PARITY_MEAN = the blind A/B's other arm); known parity runs the same arithmetic in both variants.
+inline const char* g_faldClockMeanDefine = "#define FALD_CLOCK_MEAN 1\n";
 inline const char* g_faldPanelClockSource = R"(
 RWTexture2D<float> clkTrueOut : register(u0);
 RWTexture2D<float> clkEstOut  : register(u1);
 RWTexture2D<float> clkState0  : register(u2);
 RWTexture2D<float> clkState1  : register(u3);
 RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: a map that moved flags round 0 (both rounds read them)
+
+static const float FALD_CLOCK_ROBUST_CAP = 0.1f;        // shared/fald_temporal.h (DLC tests pin the three equal)
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -1283,8 +1293,14 @@ void main(uint3 id : SV_DispatchThreadID) {
     float s0 = clkState0[id.xy], s1 = clkState1[id.xy];
     float g0 = d - s0, g1 = d - s1;
     float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;
+    float e0 = s0 + clkEst0 * g0, e1 = s1 + clkEst1 * g1;
+    float oEst = clkW0 * e0 + clkW1 * e1;
+#ifdef FALD_CLOCK_MEAN
     float oTrue = clkW0 * t0 + clkW1 * t1;
-    float oEst = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);
+#else
+    float tr = clkW0 * (t0 - e0) + clkW1 * (t1 - e1), lim = FALD_CLOCK_ROBUST_CAP * oEst;
+    float oTrue = (clkW0 > 0.0f && clkW1 > 0.0f) ? oEst + min(max(tr, -lim), lim) : clkW0 * t0 + clkW1 * t1;
+#endif
     if (RunModePartial() == 1u && (clkTrueOut[id.xy] != oTrue || clkEstOut[id.xy] != oEst)) InterlockedOr(changeFlags[0], 1u);
     clkTrueOut[id.xy] = oTrue;
     clkEstOut[id.xy] = oEst;

@@ -8,8 +8,8 @@ temporal corrections can be designed and scored offline against the law the came
   48 Hz: measured at both, results/phone_camera_2026-09-20/parity_lock/summary.json), not a fixed 30 Hz. Which
   refresh (``parity``) the software does not know TODAY: the parity is locked to the actually PRESENTED frame index
   (48/48 on every run, stable over 13 min) and re-rolls on display mode sets, so using it needs the presented
-  refresh index plus a one-bit calibration after every display event (stage 3, not built; default ``parity`` −1 =
-  the mean of both clocks);
+  refresh index plus a one-bit calibration after every display event (stage 3, archived as a dead end; default
+  ``parity`` −1 = both clocks, combined robustly: :class:`PanelDriveState`);
 * a tick uses content that is at least ``latency_frames`` old, so the first LED step shows 1 or 2 frames after the
   LCD data (camera at 60 Hz: 18–21 or 34–39 ms, the two parity classes);
 * at a tick every zone closes ``closure`` of the remaining gap to its target drive, the same up and down
@@ -54,6 +54,23 @@ SETTLE_RESIDUAL = 0.0005        # the settle hold ends when this share of a DRIV
 SETTLE_MAX = 120                # cap of the settle hold in refreshes (C++ FALD_CLOCK_SETTLE_MAX): a low closure must not
                                 # re-render a static desktop for seconds
 LOCK_GAIN = 0.08                # steady gain of the refresh grid's phase lock, per run (C++ FALD_CLOCK_LOCK_GAIN)
+ROBUST_CAP = 0.1               # the unknown parity's combination (PanelDriveState, C++ FALD_CLOCK_ROBUST_CAP): the mean of
+                                # the two clocks' transients, clamped per zone to +-ROBUST_CAP x the compensation state
+                                # (DLC results/fald_parity_robust_2026-10-23: 0.05 / 0.1 / 0.2 / 0.35 swept, 0.1 best)
+PARITY_MEAN = -2                # parity code of the PRE-2026-10-23 unknown-parity combination (the plain mean): a test value
+                                # for the blind A/B (C++ FALD_CLOCK_PARITY_MEAN), never saved
+
+
+def robust_transient(pairs) -> np.ndarray:
+    """The unknown parity's transient (B_true's drive minus B_est's): the mean of the clocks' T_p − E_p, clamped per zone to
+    ±``ROBUST_CAP`` × mean(E_p). On a cut the two clocks' transients fall in DIFFERENT refreshes (each the whole step
+    against the old state), so the plain mean applies half a step where the panel needs none — inside new content on a
+    lit page the LCD is already fully open there and a half-way dimming is all harm (the owner's alt-tab: −50 % on black,
+    a worst refresh 32 % off target on a 5-nit page; clamped 15 / 11 % off, the bare panel 20 / 11 %). In motion a frame's transient is small
+    against a lit state and passes. ``pairs`` = [(T_p, E_p), ...]."""
+    t = np.asarray(sum(np.asarray(tp, dtype=np.float64) - np.asarray(ep, dtype=np.float64) for tp, ep in pairs) / len(pairs))
+    lim = ROBUST_CAP * (sum(np.asarray(ep, dtype=np.float64) for _, ep in pairs) / len(pairs))
+    return np.clip(t, -lim, lim)
 
 
 @dataclass(frozen=True)
@@ -209,14 +226,18 @@ class PanelDriveState:
     """The correction-side twin of :class:`PanelClock` — a drop-in for :class:`dlc.fald.temporal.DriveState` in
     :func:`dlc.fald.correct.correct_image` (``drive_filter=state.fields``) and :func:`dlc.fald.temporal.correct_sequence`.
 
-    ``parity`` 0 / 1: the tick parity is known (one clock, exact). ``None``: unknown — both clocks run and the kernels see
-    the MEAN of the two LED states and of the two compensation states. The backlight fields are linear in the drives, so
-    this costs no extra kernel pass, and the gain it yields is the arithmetic-mean stand-in for the geometric mean of the
-    two hypotheses' gains (B_est / mean(B_true) vs B_est / sqrt(B_true0 · B_true1): 6 % apart for a x2 step)."""
+    ``parity`` 0 / 1: the tick parity is known (one clock, exact). ``None``: unknown — both clocks run; the kernels see the
+    MEAN of the two compensation states E_p for B_est and, for B_true, that mean plus :func:`robust_transient` — the mean
+    of the two hypotheses' TRANSIENTS (T_p − E_p, what makes the flash / dip correction) clamped to ±``ROBUST_CAP`` of the
+    compensation state, so the half of a cut's step that one hypothesis wants and the other does not can never dim a frame
+    by more than ~10 % (2026-10-23: the plain mean dimmed a window appearing on black by −50 % one refresh after it
+    appeared). The fields stay linear in the two maps: no extra kernel pass. ``PARITY_MEAN`` (−2): unknown, the plain mean
+    of the two states (before 2026-10-23; the A/B's other arm)."""
 
     def __init__(self, law: PanelTimeLaw = PanelTimeLaw(), parity: Optional[int] = None):
         self.law, self.parity = law, parity
-        self.clocks = [PanelClock(law, p) for p in ((0, 1) if parity is None else (int(parity),))]
+        self.mean_only = parity == PARITY_MEAN
+        self.clocks = [PanelClock(law, p) for p in ((0, 1) if parity in (None, PARITY_MEAN) else (int(parity),))]
 
     @property
     def active(self) -> bool:
@@ -229,7 +250,10 @@ class PanelDriveState:
         if pk[0] is None:
             d = np.asarray(drives, dtype=np.float64)
             return d, d
-        return sum(p[0] for p in pk) / len(pk), sum(p[1] for p in pk) / len(pk)
+        if len(pk) == 1 or self.mean_only:
+            return sum(p[0] for p in pk) / len(pk), sum(p[1] for p in pk) / len(pk)
+        est = 0.5 * (pk[0][1] + pk[1][1])
+        return est + robust_transient(pk), est
 
     def commit(self, drives: np.ndarray, refreshes: int = 1) -> np.ndarray:
         """Advance by the frame that was actually sent (its instantaneous zone drives), on the panel for ``refreshes``

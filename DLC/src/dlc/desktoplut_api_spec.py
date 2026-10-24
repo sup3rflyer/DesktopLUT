@@ -495,8 +495,10 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "MEASURED law, 'panel clock' (EXPERIMENT, work guide C13, 2026-09-20; reference dlc/fald/paneltime.py): the "
             "dimming engine samples and holds at half the refresh rate — at a tick every zone closes `closure` (0.05..1, "
             "default 0.72) of the gap to the drive of the frame one refresh earlier, the panel's compensation follows one "
-            "refresh later; `parity` = which refresh it ticks on: -1 unknown (default: the mean of both clocks), 0 / 1 "
-            "known (experimental — the wrong one is as bad as no time law). tau / delay are not used by mode 3; "
+            "refresh later; `parity` = which refresh it ticks on: -1 unknown (default: both clocks, their mean flash / dip "
+            "correction clamped to 10 % of the LED estimate — 2026-10-23), 0 / 1 known (experimental — the "
+            "wrong one is as bad as no time law), -2 unknown with the PLAIN mean of both clocks (the combination before "
+            "2026-10-23; a test value for the blind A/B, never saved: the INI keeps -1). tau / delay are not used by mode 3; "
             "settle_frames_60hz is then its settle hold in elapsed refreshes (closure 0.72 -> 14, capped at 120).",
             {
                 "monitor": _monitor_param(),
@@ -506,7 +508,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "tau_fall_ms": ApiParamSpec("number", required=False, description="0..5000"),
                 "delay_frames": ApiParamSpec("number", required=False, description="0..3"),
                 "closure": ApiParamSpec("number", required=False, description="0.05..1 (temporal_mode 3)"),
-                "parity": ApiParamSpec("number", required=False, description="-1 | 0 | 1 (temporal_mode 3)"),
+                "parity": ApiParamSpec("number", required=False, description="-1 | 0 | 1 | -2 (temporal_mode 3; -2 = test value)"),
             },
             {"monitor_mode": "string", "temporal_mode": "number", "tau_rise_ms": "number", "tau_fall_ms": "number",
              "delay_frames": "number", "closure": "number", "parity": "number", "settle_frames_60hz": "number"},
