@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dlc.fald.paneltime import MAX_REFRESHES, PanelClock, PanelTimeLaw, RefreshGrid
+from dlc.fald.paneltime import MAX_REFRESHES, PanelClock, PanelTimeLaw, RefreshGrid, robust_transient
 
 _DIR = os.environ.get("FALD_TEST_WARP_DIR", "")
 _RUNS = 7
@@ -47,7 +47,8 @@ def test_warp_dumps_follow_the_reference_law_and_the_run_times():
     fine = lambda p: np.fromfile(p, dtype=np.float32).reshape(rows * sub, cols * sub)
     panel = read_panel_file(root / "panel.bin")
     emu = Emu(panel, width=metas[0]["width"], height=metas[0]["height"])
-    weights = {-1: (0.5, 0.5), 0: (1.0, 0.0), 1: (0.0, 1.0)}[metas[0]["parity"]]
+    weights = {-1: (0.5, 0.5), -2: (0.5, 0.5), 0: (1.0, 0.0), 1: (0.0, 1.0)}[metas[0]["parity"]]
+    robust = metas[0]["parity"] == -1           # unknown: the robust combination (2026-10-23); -2 = the plain mean
     files = {"true": "fald_drive_filt.f32", "est": "fald_clock_est.f32", "s0": "fald_clock_s0.f32", "s1": "fald_clock_s1.f32",
              "dprev": "fald_clock_dprev.f32"}
     grid = RefreshGrid(metas[0]["period_ms"])
@@ -89,8 +90,12 @@ def test_warp_dumps_follow_the_reference_law_and_the_run_times():
                 c.step(pending, refreshes=m["k"])                          # the previous frame stayed k refreshes
             assert clocks[0].n == m["n"]
             pk = [c.peek() for c in clocks]
-            ref = {"s0": pk[0][0], "s1": pk[1][0], "true": weights[0] * pk[0][0] + weights[1] * pk[1][0],
-                   "est": weights[0] * pk[0][1] + weights[1] * pk[1][1]}
+            est = weights[0] * pk[0][1] + weights[1] * pk[1][1]
+            if robust:
+                true = est + robust_transient(pk)
+            else:
+                true = weights[0] * pk[0][0] + weights[1] * pk[1][0]
+            ref = {"s0": pk[0][0], "s1": pk[1][0], "true": true, "est": est}
             for name, want in ref.items():
                 err = float(np.max(np.abs(maps[name].astype(np.float64) - want)))
                 assert err <= 2e-6, f"run {i} (k {m['k']}): {name} is {err:.3e} from the reference law"

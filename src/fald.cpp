@@ -25,6 +25,7 @@ static ID3D11ComputeShader* g_faldGainBlurCS = nullptr;   // passes 2b + 2c fuse
 static ID3D11ComputeShader* g_faldDecideCS = nullptr;     // the change-driven path's decide pass (g_faldDecideSource)
 static ID3D11ComputeShader* g_faldTemporalCS = nullptr;   // pass 1b: per-cell drive state (temporal modes 1 / 2 only)
 static ID3D11ComputeShader* g_faldPanelClockCS = nullptr; // pass 1c: the two parity clocks' LED states (temporal mode 3 only)
+static ID3D11ComputeShader* g_faldPanelClockMeanCS = nullptr; // pass 1c, the plain mean of the clocks (FALD_CLOCK_PARITY_MEAN: the A/B)
 static ID3D11ComputeShader* g_faldStarStatCS = nullptr;   // starfield balancing S0: star statistic of the source frame
 static ID3D11ComputeShader* g_faldStarWeightCS = nullptr; // S1: tapered protection field + zone weights
 static ID3D11ComputeShader* g_faldStarPlanCS = nullptr;   // S2: target + the plan the pixels sample
@@ -129,7 +130,7 @@ FaldShaderSources FaldDefaultShaderSources() {
     s.blur = g_faldBlurSource; s.gainBlur = g_faldGainBlurSource; s.temporal = g_faldTemporalSource; s.panelClock = g_faldPanelClockSource;
     s.starStat = g_faldStarStatSource; s.starWeight = g_faldStarWeightSource;
     s.starPlan = g_faldStarPlanSource; s.zoneCombineDefine = g_faldZoneCombineDefine; s.pixel = g_faldPixelSource;
-    s.decide = g_faldDecideSource;
+    s.decide = g_faldDecideSource; s.clockMeanDefine = g_faldClockMeanDefine;
     return s;
 }
 
@@ -173,6 +174,12 @@ bool InitFaldShadersFrom(const FaldShaderSources& src) {
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPanelClockCS);
     b->Release(); b = nullptr;
     if (FAILED(hr)) { std::cerr << "[FALD] CreateComputeShader(panel clock) failed" << std::endl; return false; }
+    // the plain-mean variant is a test arm only: without it parity FALD_CLOCK_PARITY_MEAN runs the pass above
+    if (src.clockMeanDefine && CompileOne(std::string(src.clockMeanDefine) + common + src.panelClock, "FaldPanelClockMeanCS", "cs_5_0", &b)) {
+        if (FAILED(g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldPanelClockMeanCS)))
+            std::cerr << "[FALD] CreateComputeShader(panel clock, mean) failed" << std::endl;
+        b->Release(); b = nullptr;
+    }
     if (!CompileOne(common + src.starStat, "FaldStarStatCS", "cs_5_0", &b)) return false;
     hr = g_device->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &g_faldStarStatCS);
     b->Release(); b = nullptr;
@@ -233,6 +240,7 @@ void ReleaseFaldShaders() {
     if (g_faldStarWeightCS) { g_faldStarWeightCS->Release(); g_faldStarWeightCS = nullptr; }
     if (g_faldStarStatCS) { g_faldStarStatCS->Release(); g_faldStarStatCS = nullptr; }
     if (g_faldPanelClockCS) { g_faldPanelClockCS->Release(); g_faldPanelClockCS = nullptr; }
+    if (g_faldPanelClockMeanCS) { g_faldPanelClockMeanCS->Release(); g_faldPanelClockMeanCS = nullptr; }
     if (g_faldTemporalCS) { g_faldTemporalCS->Release(); g_faldTemporalCS = nullptr; }
     if (g_faldDecideCS) { g_faldDecideCS->Release(); g_faldDecideCS = nullptr; }
     if (g_faldGainBlurCS) { g_faldGainBlurCS->Release(); g_faldGainBlurCS = nullptr; }
@@ -957,7 +965,8 @@ static void RunPanelClock(FaldResources* r, bool partial) {
     const FaldPanelParams& p = r->params;
     r->runMode = (r->runMode & ~0xFFu) | (partial ? 1u : 0u);   // (the pass compares on the partial path: its own bit)
     FillCB(r, 0);
-    g_context->CSSetShader(g_faldPanelClockCS, nullptr, 0);
+    // unknown parity runs the robust combination; FALD_CLOCK_PARITY_MEAN (the A/B's other arm) the plain mean
+    g_context->CSSetShader((r->clkParity == FALD_CLOCK_PARITY_MEAN && g_faldPanelClockMeanCS) ? g_faldPanelClockMeanCS : g_faldPanelClockCS, nullptr, 0);
     g_context->CSSetConstantBuffers(0, 1, &r->cb);
     g_context->CSSetShaderResources(4, 1, &r->clkPrevSRV);
     // u0 = the ONE B_true map both rounds' real-spread kernel reads this run (mapSrv's clockMaps): the round-1 filtered
@@ -1414,7 +1423,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << "\ntau_rise_ms " << fs.tauRiseMs << "\ntau_fall_ms " << fs.tauFallMs << "\ndelay_frames " << r->delayFrames << " (ring " << r->delayCount << ")"
          << "\ntemp_alpha_rise " << r->tempAlphaRise << "\ntemp_alpha_fall " << r->tempAlphaFall << "\ndt_ms " << r->dtMs
          << "\nstate_valid " << (r->stateValid ? 1 : 0)
-         << "\nclock_closure " << r->clkClosure << "\nclock_parity " << r->clkParity << " (-1 unknown: the mean of both clocks)"
+         << "\nclock_closure " << r->clkClosure << "\nclock_parity " << r->clkParity << " (-1 unknown: both clocks, robust; -2 unknown: their plain mean)"
          << "\nclock_seed " << (r->clkSeeded ? 1 : 0) << " (1 = this run (re-)seeded the clocks: the stateless layer, no clock files)"
          << "\nclock_time_ms " << clockText[0] << "\nclock_refresh_ms " << clockText[1]
          << " (time / grid: ms since the seeding run; grid = the centre of this run's refresh on the phase-locked grid AFTER the"

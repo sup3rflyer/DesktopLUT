@@ -23,7 +23,7 @@ float FaldPanelClockClosure(float closure) {
     if (closure != closure) return FALD_CLOCK_CLOSURE_DEFAULT;
     return closure < FALD_CLOCK_CLOSURE_MIN ? FALD_CLOCK_CLOSURE_MIN : (closure > FALD_CLOCK_CLOSURE_MAX ? FALD_CLOCK_CLOSURE_MAX : closure);
 }
-int FaldPanelClockParity(int parity) { return (parity == 0 || parity == 1) ? parity : -1; }
+int FaldPanelClockParity(int parity) { return (parity == 0 || parity == 1 || parity == FALD_CLOCK_PARITY_MEAN) ? parity : -1; }
 int FaldPanelClockParityFromText(const wchar_t* text) {
     if (!text) return -1;
     wchar_t* end = nullptr;

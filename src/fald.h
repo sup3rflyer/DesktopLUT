@@ -229,6 +229,7 @@ struct FaldShaderSources {
     const char* common; const char* stat; const char* conv; const char* gain; const char* blur; const char* gainBlur; const char* temporal;
     const char* panelClock; const char* starStat; const char* starWeight; const char* starPlan; const char* decide;
     const char* zoneCombineDefine; const char* pixel;
+    const char* clockMeanDefine = nullptr;   // pass 1c's plain-mean variant (parity FALD_CLOCK_PARITY_MEAN); none = the pass itself
 };
 FaldShaderSources FaldDefaultShaderSources();
 bool InitFaldShadersFrom(const FaldShaderSources& src);

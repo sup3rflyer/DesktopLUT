@@ -95,9 +95,14 @@ def test_both_rounds_read_the_same_maps_and_the_state_ignores_this_frames_drives
     g.advance(1)
     r0 = g.pair(np.zeros((3, 3))); r1 = g.pair(np.ones((3, 3)))      # round 0 / round 1 drives differ: the maps do not
     assert r0[0] is r1[0] and r0[1] is r1[1]
-    # unknown parity, one refresh after the step: one clock ticked (0.72 of the gap), the other not -> mean 0.36;
-    # the compensation state is still the old one: the flash frame the correction has to pre-empt
-    assert np.allclose(r0[0], 0.2 + 0.5 * 0.72 * 0.8, atol=1e-6) and np.allclose(r0[1], 0.2, atol=1e-6)
+    # unknown parity, one refresh after the step: one clock ticked (0.72 of the gap), the other not; the compensation
+    # state is still the old one: the flash frame the correction has to pre-empt. The mean transient (0.288) is clamped to
+    # ROBUST_CAP x 0.2; the plain mean (-2) takes it whole
+    from dlc.fald.paneltime import PARITY_MEAN, ROBUST_CAP
+    assert np.allclose(r0[0], 0.2 + ROBUST_CAP * 0.2, atol=1e-6) and np.allclose(r0[1], 0.2, atol=1e-6)
+    m = GpuPanelDriveState(0.72, PARITY_MEAN)
+    m.advance(1); m.commit(a); m.advance(1); m.commit(b); m.advance(1)
+    assert np.allclose(m.pair(a)[0], 0.2 + 0.5 * 0.72 * 0.8, atol=1e-6) and np.allclose(m.pair(a)[1], 0.2, atol=1e-6)
 
 
 def test_factors_are_float32_twins_of_the_reference_blend_factors():
@@ -143,8 +148,16 @@ def test_emulator_sequence_with_the_panel_clock(tmp_path):
     assert np.array_equal(first["out"], emu.run(dark, fp16_out=False)["out"])
     step = emu.run(bright, fp16_out=False, temporal=g, refreshes=1)            # the fields are still the dark frame's
     assert np.array_equal(step["drive_true"], first["drive1"]) and np.array_equal(step["drive_est"], first["drive1"])
-    lag = emu.run(bright, fp16_out=False, temporal=g, refreshes=1)             # one refresh later: LEDs half way, estimate not
-    assert float(lag["drive_true"][5, 5]) > float(lag["drive_est"][5, 5]) and np.array_equal(lag["drive_est"], first["drive1"])
+    lag = emu.run(bright, fp16_out=False, temporal=g, refreshes=1)             # one refresh later: one clock ticked, estimate not
+    # the step: the ticked clock's transient is the whole step against the old state, clamped (parity -1) to ROBUST_CAP x
+    # the estimate map; the plain mean (-2) keeps half of the step
+    from dlc.fald.paneltime import PARITY_MEAN, ROBUST_CAP
+    assert np.array_equal(lag["drive_est"], first["drive1"])
+    assert np.allclose(lag["drive_true"][5, 5], lag["drive_est"][5, 5] * np.float32(1 + ROBUST_CAP), rtol=1e-6)
+    gm = GpuPanelDriveState(0.72, PARITY_MEAN)
+    emu.run(dark, fp16_out=False, temporal=gm); emu.run(bright, fp16_out=False, temporal=gm, refreshes=1)
+    lag_m = emu.run(bright, fp16_out=False, temporal=gm, refreshes=1)
+    assert float(lag_m["drive_true"][5, 5]) > float(lag_m["drive_est"][5, 5]) and np.array_equal(lag_m["drive_est"], first["drive1"])
     for _ in range(settle_refreshes(0.72) + 4):
         out = emu.run(bright, fp16_out=False, temporal=g, refreshes=1)
     # at rest both maps ARE the frame's own round-1 drives: fields -> (d, d). The OUTPUT converges to the inverse's fixed
@@ -222,10 +235,22 @@ def test_cpp_and_hlsl_carry_the_same_law():
     # the pass: one blend per clock toward the previous frame's drives, the weighted maps, the states advanced in place
     body = re.search(r'g_faldPanelClockSource = R"\((.*?)\)";', sh, re.S).group(1)
     for line in ("float g0 = d - s0, g1 = d - s1;", "float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;",
-                 "float oTrue = clkW0 * t0 + clkW1 * t1;",
-                 "float oEst = clkW0 * (s0 + clkEst0 * g0) + clkW1 * (s1 + clkEst1 * g1);",
+                 "float e0 = s0 + clkEst0 * g0, e1 = s1 + clkEst1 * g1;", "float oEst = clkW0 * e0 + clkW1 * e1;",
                  "clkState0[id.xy] = t0; clkState1[id.xy] = t1;"):
         assert line in body, line
+    # unknown parity (both weights > 0): the clamped mean transient (gpuemu.clock_robust_true32); FALD_CLOCK_MEAN and known
+    # parity: the plain weighted mean (the pre-2026-10-23 arithmetic)
+    mean_v, robust_v = body.split("#ifdef FALD_CLOCK_MEAN")[1].split("#else")
+    assert "float oTrue = clkW0 * t0 + clkW1 * t1;" in mean_v
+    assert "float tr = clkW0 * (t0 - e0) + clkW1 * (t1 - e1), lim = FALD_CLOCK_ROBUST_CAP * oEst;" in robust_v
+    assert "float oTrue = (clkW0 > 0.0f && clkW1 > 0.0f) ? oEst + min(max(tr, -lim), lim) : clkW0 * t0 + clkW1 * t1;" in robust_v
+    from dlc.fald.paneltime import ROBUST_CAP
+    hl = lambda name: float(re.search(r"static const float " + name + r" = ([\d.]+)f;", body).group(1))
+    assert hl("FALD_CLOCK_ROBUST_CAP") == ROBUST_CAP and num("FALD_CLOCK_ROBUST_CAP") == ROBUST_CAP
+    assert num("FALD_CLOCK_PARITY_MEAN") == -2 and 'g_faldClockMeanDefine = "#define FALD_CLOCK_MEAN 1' in sh
+    # both hosts dispatch the plain-mean variant for the A/B's parity code only
+    assert "(r->clkParity == FALD_CLOCK_PARITY_MEAN && g_faldPanelClockMeanCS) ? g_faldPanelClockMeanCS : g_faldPanelClockCS" in cpp
+    assert "(m->clkParity == FALD_CLOCK_PARITY_MEAN && g_clockMeanCS) ? g_clockMeanCS : g_clockCS" in hook
     # the first-order pass is untouched by the new mode
     old = re.search(r'g_faldTemporalSource = R"\((.*?)\)";', sh, re.S).group(1)
     assert "clk" not in old and "float a = (d > s) ? tempAlphaRise : tempAlphaFall;" in old

@@ -367,15 +367,18 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "closure": 0.01}), raise_on_error=False)
     assert not bad.ok and bad.error == "closure must be 0.05..1"
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 2}), raise_on_error=False)
-    assert not bad.ok and bad.error == "parity must be -1 (unknown), 0 or 1"
+    assert not bad.ok and bad.error == "parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)"
+    ab = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": -2})   # the A/B's plain-mean arm (2026-10-23)
+    assert ab.ok and ab.result["parity"] == -2
+    client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1})
     assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_temporal_closure"] == 0.5                   # a refusal stores nothing
     client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 0, "closure": 0.72, "parity": -1})
     # ... and the C++ handler carries the same refusals word for word
     if CPP_SERVER.exists():
         cpp = CPP_SERVER.read_text(encoding="utf-8", errors="replace")
         for text in ("temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)", "closure must be 0.05..1",
-                     "parity must be -1 (unknown), 0 or 1",
-                     "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1)"):
+                     "parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)",
+                     "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1|-2)"):
             assert text in cpp, text
     # starfield balancing (2026-09-19, work guide S1): partial updates, persisted per mode, reported in layers[key]
     st0 = client.call("state.get", {}).result["layers"]["0:SDR"]

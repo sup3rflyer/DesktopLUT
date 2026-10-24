@@ -308,7 +308,9 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), cc.fald.tauFallMs, iniPath);
     IniWriteString(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTemporalClosure").c_str(), cc.fald.clockClosure, iniPath);
-    IniWriteString(section, (p + L"FaldTemporalParity").c_str(), std::to_wstring(cc.fald.clockParity).c_str(), iniPath);
+    // (FALD_CLOCK_PARITY_MEAN, the blind A/B's plain-mean arm, is a test value: the INI keeps "unknown")
+    IniWriteString(section, (p + L"FaldTemporalParity").c_str(),
+                   std::to_wstring(cc.fald.clockParity == FALD_CLOCK_PARITY_MEAN ? -1 : cc.fald.clockParity).c_str(), iniPath);
     // starfield balancing (experimental, default off; work guide S1): the GUI row's values + the INI/pipe-only ones
     const FaldStarfieldSettings& st = cc.fald.star;
     WritePrivateProfileBool(section, (p + L"FaldStarfield").c_str(), st.enabled, iniPath);

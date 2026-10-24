@@ -57,6 +57,7 @@ static ID3D11ComputeShader* g_starPlanCS = nullptr;     // S2: target + the plan
 static ID3D11ComputeShader* g_starStatCombineCS = nullptr;   // S0 combine variant (zones > one slice, C14)
 static ID3D11ComputeShader* g_temporalCS = nullptr;     // LED lag pass 1b: first-order drive state (modes 1 / 2)
 static ID3D11ComputeShader* g_clockCS = nullptr;        // LED lag pass 1c: the two parity clocks (mode 3)
+static ID3D11ComputeShader* g_clockMeanCS = nullptr;    // pass 1c, the plain mean of the clocks (FALD_CLOCK_PARITY_MEAN: the A/B)
 static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
 // (the settle / content events are per monitor: FaldMonitor::settleEvt / contentEvt)
 static void CompileFeatureShaders();   // below FaldReleaseShaders
@@ -185,7 +186,7 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
 template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 static void ReleaseFeatureShaders() {
-    SafeRelease(g_clockCS); SafeRelease(g_temporalCS);
+    SafeRelease(g_clockCS); SafeRelease(g_clockMeanCS); SafeRelease(g_temporalCS);
     if (g_primeEvent) { CloseHandle(g_primeEvent); g_primeEvent = NULL; }
     SafeRelease(g_starStatCombineCS);
     SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
@@ -196,17 +197,19 @@ static void ReleaseFeatureShaders() {
 static void CompileFeatureShaders() {
     const std::string common = g_faldCommonSource;
     const std::string combine = std::string(g_faldZoneCombineDefine) + common;
-    struct { const char* src; const char* name; ID3D11ComputeShader** out; bool comb; } cs[] = {
+    const std::string clockMean = std::string(g_faldClockMeanDefine) + common;   // pass 1c's plain-mean variant (the A/B)
+    struct { const char* src; const char* name; ID3D11ComputeShader** out; bool comb; bool mean = false; } cs[] = {
         { g_faldStarStatSource,   "FaldStarStatCS",   &g_starStatCS,   false },
         { g_faldStarStatSource,   "FaldStarStatCombineCS", &g_starStatCombineCS, true },
         { g_faldStarWeightSource, "FaldStarWeightCS", &g_starWeightCS, false },
         { g_faldStarPlanSource,   "FaldStarPlanCS",   &g_starPlanCS,   false },
         { g_faldTemporalSource,   "FaldTemporalCS",   &g_temporalCS,   false },
         { g_faldPanelClockSource, "FaldPanelClockCS", &g_clockCS,      false },
+        { g_faldPanelClockSource, "FaldPanelClockMeanCS", &g_clockMeanCS, false, true },   // optional: none = g_clockCS
     };
     for (const auto& s : cs) {
         ID3DBlob* b = nullptr;
-        if (!CompileOne((s.comb ? combine : common) + s.src, s.name, "cs_5_0", &b)) continue;   // logged; that part stays off
+        if (!CompileOne((s.mean ? clockMean : (s.comb ? combine : common)) + s.src, s.name, "cs_5_0", &b)) continue;   // logged; that part stays off
         if (FAILED(g_dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, s.out)))
             LogF("FALD: CreateComputeShader(%s) failed", s.name);
         b->Release();
@@ -2160,7 +2163,8 @@ static void RunPanelClock(FaldMonitor* m, bool partial) {
     const FaldPanelParams& p = m->params;
     m->runMode = (m->runMode & ~0xFFu) | (partial ? 1u : 0u);   // (the pass compares on the partial path: its own bit)
     FillCB(m, 0);
-    g_ctx->CSSetShader(g_clockCS, nullptr, 0);
+    // unknown parity runs the robust combination; FALD_CLOCK_PARITY_MEAN (the A/B's other arm) the plain mean
+    g_ctx->CSSetShader((m->clkParity == FALD_CLOCK_PARITY_MEAN && g_clockMeanCS) ? g_clockMeanCS : g_clockCS, nullptr, 0);
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetShaderResources(4, 1, &m->clkPrevSRV);
     // u0 = the ONE B_true map both rounds' real-spread kernel reads this run (mapSrv's clockMaps): the round-1 filtered

@@ -10,6 +10,7 @@
 #include "../src/types.h"
 #include "../src/globals.h"
 #include "../src/actions/actions.h"
+#include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride (the temporal WARP case)
 #include <d3dcompiler.h>
 #include <cmath>
 #include <cstdint>
@@ -782,6 +783,14 @@ TEST_CASE("FALD panel clock: settle hold, setting clamps, INI parity text") {
     CHECK(FaldPanelClockClosure(std::nanf("")) == FALD_CLOCK_CLOSURE_DEFAULT);
     CHECK(FaldPanelClockParity(-1) == -1); CHECK(FaldPanelClockParity(0) == 0); CHECK(FaldPanelClockParity(1) == 1);
     CHECK(FaldPanelClockParity(2) == -1); CHECK(FaldPanelClockParity(-7) == -1);
+    // the A/B's plain-mean arm (2026-10-23) survives the clamp, weighs both clocks 1/2, and is never read from an INI
+    CHECK(FaldPanelClockParity(FALD_CLOCK_PARITY_MEAN) == FALD_CLOCK_PARITY_MEAN);
+    CHECK(FaldPanelClockParityFromText(L"-2") == -1);
+    {
+        float fac[4], w[2];
+        FaldPanelClockFactors(0, 1, 0.72f, FALD_CLOCK_PARITY_MEAN, fac, w);
+        CHECK(w[0] == 0.5f); CHECK(w[1] == 0.5f);
+    }
     FaldSettings d;
     CHECK(d.temporalMode == 0u);                               // experimental: default OFF
     CHECK(d.clockClosure == FALD_CLOCK_CLOSURE_DEFAULT); CHECK(d.clockParity == -1);
@@ -1409,6 +1418,10 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     const int tauMs = envInt("FALD_TEST_WARP_TAU_MS", 50), delay = envInt("FALD_TEST_WARP_DELAY", 0);
     const float periodMs = (float)envInt("FALD_TEST_WARP_PERIOD_US", 16667) / 1000.0f;
     const bool star = envInt("FALD_TEST_WARP_STAR", 0) != 0;
+    // the core governor (shared/fald_core_governor.h) caps full runs to its GPU budget: WARP is two orders over it, and a
+    // held run advances no LED-lag bookkeeping — every run here is a full one (restored at the end)
+    const int savedHold = g_faldCoreHoldOverride;
+    g_faldCoreHoldOverride = 0;
 
     ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
@@ -1474,6 +1487,8 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     }
     D3D11_VIEWPORT vp = { 0, 0, (float)ctx.width, (float)ctx.height, 0, 1 };
     unsigned int expectSettle = 0;
+    LARGE_INTEGER qf, qPrev = {};
+    QueryPerformanceFrequency(&qf);
     for (int run = 0; run < 7; run++) {
         // every run a DIFFERENT frame (the block moves by a zone and changes its level: 1000 / 500 / 250 / 120 nits): a
         // k = 0 run then carries drives that differ from the frame it replaces, so "d_prev not updated on k = 0" and
@@ -1499,6 +1514,13 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
             ctx.faldDumpDir = dir + L"/d" + std::to_wstring(run);
         }
         ctx.faldDumpRequested.store(true);
+        LARGE_INTEGER qNow;
+        QueryPerformanceCounter(&qNow);
+        // a run more than FALD_RESUME_GAP_MS after the previous one re-arms the hold (a resume): on WARP a run itself takes
+        // longer than that since the 2026-10-22 passes, so it is measured here, not assumed; a gap within 30 ms of the
+        // threshold is the layer's own clock's call (its QPC is taken inside the run) and is not checked
+        const double gapMs = run == 0 ? 0.0 : (double)(qNow.QuadPart - qPrev.QuadPart) * 1000.0 / (double)qf.QuadPart;
+        qPrev = qNow;
         FaldRunPasses(&ctx, rtv, run < 2);
         ic->Flush();
         CHECK_FALSE(ctx.faldDumpRequested.load());
@@ -1512,9 +1534,10 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
             if (run < 2) CHECK(FaldSettlePending(&ctx));          // new content re-arms the hold; later runs pay it off by k:
             const unsigned int hold = FaldPanelClockSettleFrames(fs.clockClosure);   // per ELAPSED REFRESH, not per run
             const unsigned long long paid = ctx.fald->clkSeeded ? 0ull : ctx.fald->clkElapsed;
-            const bool rearmed = run < 2 || run == 5;             // new content; run 5 resumes after the long pause (> 250 ms)
+            const bool rearmed = run < 2 || gapMs > FALD_RESUME_GAP_MS;   // new content, or a resume (run 5: the long pause)
             expectSettle = rearmed ? hold : (paid < expectSettle ? expectSettle - (unsigned int)paid : 0u);
-            CHECK(ctx.fald->settleLeft == expectSettle);
+            if (std::fabs(gapMs - FALD_RESUME_GAP_MS) > 30.0) CHECK(ctx.fald->settleLeft == expectSettle);
+            else expectSettle = ctx.fald->settleLeft;             // (the boundary case: carry the layer's own verdict on)
         }
         Sleep(run == 4 && mode == (int)FALD_TEMPORAL_PANEL ? 1150 : 12);   // one long static pause (k > 64 at 60 Hz): no reset
     }
@@ -1540,6 +1563,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     g_context = nullptr; g_device = nullptr;
     ic->ClearState(); ic->Flush();
     ic->Release(); dev->Release();
+    g_faldCoreHoldOverride = savedHold;
 }
 
 // The shared LED-lag orchestration (shared/fald_temporal.cpp FaldTemporalBeginRun / EndRun) — the overlay and the DWM

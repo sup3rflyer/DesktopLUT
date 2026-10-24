@@ -632,7 +632,8 @@ void UpdateColorCorrectionControls(bool forceEdits) {
         _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), shown.clockClosure);
         SetWindowText(g_gui.hwndFaldClosure, tauBuf);
     }
-    SendMessage(g_gui.hwndFaldParity, CB_SETCURSEL, (WPARAM)(FaldPanelClockParity(shown.clockParity) + 1), 0);   // index = parity + 1
+    const int shownParity = FaldPanelClockParity(shown.clockParity);   // the A/B's plain mean shows as "unknown"
+    SendMessage(g_gui.hwndFaldParity, CB_SETCURSEL, (WPARAM)((shownParity == FALD_CLOCK_PARITY_MEAN ? -1 : shownParity) + 1), 0);   // index = parity + 1
     // starfield balancing row (work guide S1)
     SendMessage(g_gui.hwndFaldStarEnable, BM_SETCHECK, shown.star.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     {
