@@ -800,7 +800,7 @@ static_assert(sizeof(FaldMonitor) == FALD_MONITOR_AUDITED_BYTES,
 // tuning tail — an older host — and for the inert CB words while the feature is off).
 static DwmHookFaldTuning DefaultTuning() {
     DwmHookFaldTuning t = {};
-    t.starEven = 0.8f; t.starLift = 0.0f; t.starTargetGain = 1.0f; t.starTargetSigma = 0.0f;
+    t.starEven = 0.8f; t.starTargetGain = 1.0f; t.starTargetSigma = 0.0f;
     t.starKeepNits = 100.0f; t.starCapNits = 0.0f; t.starStrength = 1.0f; t.starAreaLo = 40.0f;
     t.starAreaHi = 160.0f; t.starPeakHi = 0.0f; t.starNbLo = 0.15f; t.starNbHi = 0.30f;
     t.starReach = 2u; t.starEvenReach = 8u;
@@ -814,7 +814,6 @@ static DwmHookFaldTuning SanitizeTuning(const DwmHookFaldTuning& in) {
     DwmHookFaldTuning t = in;
     auto fix = [](float v, float lo, float hi, float dflt) { return (v != v) ? dflt : (v < lo ? lo : (v > hi ? hi : v)); };
     t.starEven = fix(t.starEven, 0.0f, 1.0f, d.starEven);
-    t.starLift = fix(t.starLift, 0.0f, 1.0f, d.starLift);
     t.starTargetGain = fix(t.starTargetGain, 0.05f, 2.0f, d.starTargetGain);
     t.starTargetSigma = fix(t.starTargetSigma, 0.0f, 4.0f, d.starTargetSigma);
     t.starKeepNits = fix(t.starKeepNits, 0.0f, 10000.0f, d.starKeepNits);
@@ -1841,7 +1840,7 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     // Starfield words 52-65: the clamped settings, written even while the feature is off (the shader
     // reads them only when word 35 is set) — as the overlay does, so the two paths' CBs match.
     const DwmHookFaldTuning& t = m->tuning;
-    f[52] = t.starEven; f[53] = t.starLift; f[54] = t.starTargetGain; f[55] = t.starCapNits;
+    f[52] = t.starEven; f[53] = 0.0f; f[54] = t.starTargetGain; f[55] = t.starCapNits;
     f[56] = t.starStrength; f[57] = t.starAreaLo; f[58] = t.starAreaHi; f[59] = t.starPeakHi;
     f[60] = t.starNbLo; f[61] = t.starNbHi; u[62] = t.starReach; u[63] = t.starEvenReach;
     f[64] = t.starTargetSigma; f[65] = t.starKeepNits;
@@ -2225,7 +2224,7 @@ static void RunStarPlan(FaldMonitor* m, bool indirect) {
     if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S1);
     else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
     UnbindCompute();
-    // S2: (w0_field, ln target, ln lift, ln peak)
+    // S2: (w0_field, ln target, 0, ln peak)
     ID3D11ShaderResourceView* in3[2] = { m->starStatSRV, m->starWSRV };
     g_ctx->CSSetShader(g_starPlanCS, nullptr, 0);
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);

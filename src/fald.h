@@ -36,7 +36,7 @@ struct FaldResources;
 // a zone with star-like content (a small lit area ABOVE the zone's darkest pixel) has its peak pulled part of the way
 // (`even`, log domain) toward the local TARGET = exp(mean + targetSigma std of ln peak) of the star-like peaks around it
 // (tapered window, flank zones of a straddling star excluded), never below keepNits, optionally under an absolute
-// ceiling; peaks below the target are optionally lifted (`lift`, speck pixels only); solid content protects its neighbourhood through a tapered field (`reach` zones fully, one more at
+// ceiling (nothing is brightened: the lift was retired 2026-10-26); solid content protects its neighbourhood through a tapered field (`reach` zones fully, one more at
 // half) that is interpolated per pixel; per pixel ONE hue-preserving scale, only in zones that hold a speck, the zone
 // fields bilinear between zone centres. The balanced frame is what the rest of the layer sees (statistic rounds, boost
 // flags, Correct, output). Off = no resources, no dispatches, the shaders' results bit-identical. Limits of the two reaches:
@@ -163,7 +163,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     // starfield balancing: five zone textures (created on the first frame the option is on, released when it goes off;
     // all cols x rows RGBA32F; channel layout = the rules header in fald_shader.h). S0 writes stat (peak, speck-zone
     // flag, sparse, solid) and bg; S1 writes w (wt = target weight, wt * ln peak, flank flag, speck-zone flag) and plan2; S2 writes plan
-    // (w0_field, ln target, ln lift, ln peak). The statistic rounds and the pixel pass read plan (t15) and plan2 (t18).
+    // (w0_field, ln target, 0, ln peak). The statistic rounds and the pixel pass read plan (t15) and plan2 (t18).
     ID3D11Texture2D* starStatTex = nullptr; ID3D11UnorderedAccessView* starStatUAV = nullptr; ID3D11ShaderResourceView* starStatSRV = nullptr;
     ID3D11Texture2D* starWTex = nullptr;    ID3D11UnorderedAccessView* starWUAV = nullptr;    ID3D11ShaderResourceView* starWSRV = nullptr;
     ID3D11Texture2D* starPlanTex = nullptr; ID3D11UnorderedAccessView* starPlanUAV = nullptr; ID3D11ShaderResourceView* starPlanSRV = nullptr;
@@ -177,7 +177,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     bool starFailLogged = false;
     unsigned int starRetryCounter = 0;       // frames since the star textures failed to create (retry every ~300, like Build)
     struct StarCB {                          // the clamped settings of the last FaldRunPasses (CB words 52-65, dump)
-        float even = 0.8f, lift = 0.0f, targetGain = 1.0f, capNits = 0.0f;
+        float even = 0.8f, targetGain = 1.0f, capNits = 0.0f;
         float strength = 1.0f, areaLo = 40.0f, areaHi = 160.0f, peakHi = 0.0f;
         float nbLo = 0.15f, nbHi = 0.30f; uint32_t reach = 2, evenReach = 8;
         float targetSigma = 0.0f, keepNits = 100.0f;

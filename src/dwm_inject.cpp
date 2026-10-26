@@ -1542,7 +1542,7 @@ void UpdateDwmHookSharedConfig()
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];
-                        t.starEven = st.even; t.starLift = st.lift; t.starTargetGain = st.targetGain;
+                        t.starEven = st.even; t.starTargetGain = st.targetGain;   // _retiredStarLift stays 0 (ex = {})
                         t.starTargetSigma = st.targetSigma; t.starKeepNits = st.keepNits; t.starCapNits = st.capNits;
                         t.starStrength = st.strength; t.starAreaLo = st.areaLo; t.starAreaHi = st.areaHi;
                         t.starPeakHi = st.peakHi; t.starNbLo = st.nbLo; t.starNbHi = st.nbHi;

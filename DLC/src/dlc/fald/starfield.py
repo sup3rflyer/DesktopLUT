@@ -62,15 +62,14 @@ Per zone, in this order
                        carries the mean w0 of the speck zones in its 3x3 neighbourhood x (1 - ss(nb_lo, nb_hi, its own
                        solid)) — so a speck near the border of a star-free zone keeps its weight (the carry only
                        serves the neighbours' border pixels: see the own-zone gate), a window / UI zone carries 0;
-        ``ln_t`` = ln target (ln white where the target is 0);  ``ln_g`` = lift * (ln_t - ln peak) for a speck zone
-        below its target, else 0;  ``ln_pk`` = ln peak of a speck zone, ln_t otherwise;  ``ln_b`` = ln max(b, 1e-12);
+        ``ln_t`` = ln target (ln white where the target is 0);  ``ln_pk`` = ln peak of a speck zone, ln_t otherwise;
+        ``ln_b`` = ln max(b, 1e-12);
         ``near`` (item 6);  ``spk`` (item 5).
 
 Per pixel, m = its brightest channel. Bilinear between zone CENTRES, clamped (the border zones' values are held outside
-the outermost centres): w0_field, ln_t, ln_g, ln_pk, ln_b, near. NEAREST (the pixel's own zone): spk.
+the outermost centres): w0_field, ln_t, ln_pk, ln_b, near. NEAREST (the pixel's own zone): spk.
       w_px     = w0_px * (1 - ss(nb_lo, nb_hi, near_px))      protection interpolated on its own: a star drifting
                                                               away from solid content gains weight continuously
-      is_speck = ss(0.25, 0.5, (m - b_px) / (pk_px - b_px)), 0 where pk_px <= b_px       (background-relative band)
       pull     : g = ss(GATE_LO, GATE_HI, t_px / b_px);  T_floor = b_px + SPECK_LO * max(pk_px - b_px, 0);
                  T' = exp(lerp(ln max(t_px, T_floor), ln t_px, g))   the pull threshold: the target while it is well
                  above the background (the whole profile of a soft star comes down together), rising to the bottom
@@ -79,24 +78,27 @@ the outermost centres): w0_field, ln_t, ln_g, ln_pk, ln_b, near. NEAREST (the pi
                  out = max( exp(ln mc + w_px * even * (ln T' - ln mc)),  min(b_px, m) )   MONOTONE in m (no gate inside
                  the exponent: out(T') = T', slope 1 - w_px even >= 0 above it, flat above white)
                  acts when out < m * (1 - PULL_EPS)   (the floor is exp(ln b): equal to b only to rounding)
-      m <= t_px: out = min(m * exp(ln_g_px * w_px * is_speck), max(t_px, m));  acts when that factor > 1
-      t_px < m <= T': untouched
+      m <= T'  : untouched (nothing is ever brightened)
       a pixel is acted on only when w_px > 0, m > 0 AND its OWN zone is a speck zone (own-zone gate: a non-star shape in
       a carrying zone is never touched); then all three channels x out / m (hue-preserving). Every other pixel is
       returned BIT-identical (scale exactly 1).
 Consequences: a field whose peaks all lie below keep_nits is bit-identical; with the target below / near the sky a star
 stops at the bottom of its speck band b + 0.25 (pk - b) — cap_nits below that level is not reached, by design (the sky
 is never dug into); T' then follows the INTERPOLATED zone peak and may tilt by ~10 % across a wide star.
+Why there is no lift (retired 2026-10-26): lifting specks below the target toward it raised the very haze the pull evens
+(at lift 1 the veil was 4-20 % more even while lifted stars were multiplied x8-x50, p90 x55-x155;
+results/fald_inside_2026-09-18/clip_tools/lift_sweep.py), and a 1-px UI line across a zone passes the speck-area test, so
+SDR desktops grew bright, zone-graded lines. The glow fill took over the evenness job.
 Why target_sigma defaults to 0 (owner's real clips, 2026-09-19, star-zone LED drive change as the haze proxy): with mean +
 1 std / even 0.6 the FALD stress clips lose the win the owner liked (Christmas lights -4 / -0.1 / -1 %, Chroma Galaxies
 -6 / -0.1 %: their specks mostly sit AT the clip level, so mean + sigma lands near the top), while the geometric mean at
 even 0.8 keeps it (-42 / -36 / -18 % and -39 / -13 %). keep_nits 100 is what protects a dim star field — Gravity is left
 alone with it (-0.4 %, 4 stars touched, 175 -> 165 nits) — so the spread term is a tunable, not a default.
 
-Parameters (``StarfieldParams`` defaults = C++ ``FaldStarfieldSettings`` = the mock's): even 0.8, lift 0, target_gain 1,
+Parameters (``StarfieldParams`` defaults = C++ ``FaldStarfieldSettings`` = the mock's): even 0.8, target_gain 1,
 target_sigma 0, keep_nits 100, even_reach 8, cap_nits 0, area_lo 40, area_hi 160, peak_hi 0, reach 2, nb_lo 0.15, nb_hi 0.30,
 strength 1.
-Constants: speck band 0.25 .. 0.5, FLAT_ABS 1e-6, FLAT_REL 0.02, GATE_LO / GATE_HI 1 / 2, PULL_EPS 1e-5, FLANK_PX 2,
+Constants: speck band floor SPECK_LO 0.25, FLAT_ABS 1e-6, FLAT_REL 0.02, GATE_LO / GATE_HI 1 / 2, PULL_EPS 1e-5, FLANK_PX 2,
 FLANK_NEAR_PX 12, floors 1e-12.
 """
 from __future__ import annotations
@@ -112,7 +114,6 @@ from .model import FaldModel
 class StarfieldParams:
     even: float = 0.8                # how far a peak above the local target is pulled onto it in the log domain (0 = off,
                                      # 1 = equalised; < 1 COMPRESSES and keeps the order of the stars)
-    lift: float = 0.0                # how far a speck below the target is lifted (0 = cap-only; lifting raises the haze)
     target_gain: float = 1.0         # the target relative to exp(mean + target_sigma std) (< 1 = a calmer field)
     target_sigma: float = 0.0        # the target sits this many standard deviations of ln peak above the local mean
                                      # (0 = the geometric mean, the default; a tunable, range 0..4 — see "Why" above)
@@ -120,7 +121,7 @@ class StarfieldParams:
                                      # ~100 nits make no visible haze (HW: 0.02-0.03 nits for a 100-nit speck in EVERY zone)
     even_reach: int = 8              # zones (each side) the local target looks at, tapered (offline, even 1 / sigma 0: 3
                                      # leaves the target noisy at ~10 % star occupancy; 8 cut the predicted veil spread
-                                     # 25 % cap-only, 38 % with lift)
+                                     # 25 % cap-only, 38 % with the since-retired lift)
     cap_nits: float = 0.0            # absolute ceiling of the target (as-if-white nits); 0 = none
     area_lo: float = 40.0            # px² effective lit area above the background: fully star-like at / below this ...
     area_hi: float = 160.0           # ... not at all at / above this (a 12x12-px highlight); also the speck-zone limit
@@ -133,7 +134,7 @@ class StarfieldParams:
 
 FLAT_ABS = 1e-6               # a zone whose peak is not more than max(FLAT_ABS, FLAT_REL * peak) above its darkest pixel is
 FLAT_REL = 0.02               # flat: no speck (HLSL FALD_STAR_FLAT_ABS / _REL, gpuemu STAR_FLAT_ABS / _REL)
-SPECK_LO, SPECK_HI = 0.25, 0.5   # speck pixels: this far from the background toward the zone peak (FALD_STAR_SPECK_LO / _HI)
+SPECK_LO = 0.25   # the bottom of a speck: this far from the background toward the zone peak (FALD_STAR_SPECK_LO)
 FLANK_PX = 2                  # a zone's brightest pixel this close to a shared edge ... (HLSL FALD_STAR_FLANK_PX)
 FLANK_NEAR_PX = 12            # ... with the brighter neighbour's maximum this close behind it = one straddling feature
 GATE_LO, GATE_HI = 1.0, 2.0   # pull threshold over target / background: the bottom of the speck band at / below LO, the
@@ -296,7 +297,7 @@ def zone_plan(model: FaldModel, img: np.ndarray, sp: StarfieldParams) -> dict:
     target = np.minimum(target, p.white_nits)
     target = np.where(wsum > 0.0, target, peak)
     lt = np.log(np.maximum(target, 1e-12))
-    pull = np.where(lp > lt, float(np.clip(sp.even, 0.0, 1.0)), float(np.clip(sp.lift, 0.0, 1.0)))
+    pull = np.where(lp > lt, float(np.clip(sp.even, 0.0, 1.0)), 0.0)    # peaks above the target only: nothing is lifted
     new_peak = np.where(has, np.exp(lp + w * pull * (lt - lp)), 0.0)
     return {"peak": peak, "a_eff": a_eff, "sparse": sparse, "near": near, "w0": w0, "w": w, "target": target,
             "new_peak": new_peak, "b": b, "solid": solid, "spk": spk, "flank": flank, "wt": wt, "arg": (lx, ly),
@@ -326,15 +327,13 @@ def pixel_weight(model: FaldModel, w_zone: np.ndarray) -> np.ndarray:
     return _bilinear_zones(model, w_zone)
 
 
-def pixel_rule(m, w_px, t_px, b_px, pk_px, ln_g_px, even: float, white: float = np.inf) -> dict:
+def pixel_rule(m, w_px, t_px, b_px, pk_px, even: float, white: float = np.inf) -> dict:
     """The per-pixel formula of the module docstring for brightest-channel levels ``m`` (arrays broadcast): ``out`` =
     the new level, ``acts`` = the pixel is changed at all (without the own-zone gate), + the intermediate quantities.
-    out(m) is NON-DECREASING in m for fixed fields: m up to the pull threshold T', m^(1 - a) T'^a above it."""
+    out(m) is NON-DECREASING in m for fixed fields: m up to the pull threshold T', m^(1 - a) T'^a above it; never above m."""
     m = np.asarray(m, dtype=float)
     safe = np.maximum(m, 1e-12)
     span_px = pk_px - b_px
-    is_speck = np.where(span_px > 0.0, _smoothstep(SPECK_LO, SPECK_HI, (safe - b_px) / np.maximum(span_px, 1e-12)), 0.0)
-    g_px = np.exp(ln_g_px * w_px * is_speck)
     # the pull threshold T': the target while it is well above the background, the bottom of the speck band as it nears /
     # undercuts it — the sky is never reached
     gate = _smoothstep(GATE_LO, GATE_HI, t_px / b_px)
@@ -345,10 +344,9 @@ def pixel_rule(m, w_px, t_px, b_px, pk_px, ln_g_px, even: float, white: float = 
     shown = np.minimum(safe, white)                        # the pull starts from what the panel SHOWS (it clips at white)
     pulled = np.exp(np.log(shown) + w_px * even * (ln_tp - np.log(shown)))
     pulled = np.maximum(pulled, np.minimum(b_px, safe))    # never below the background, never above the pixel itself
-    lifted = np.minimum(safe * g_px, np.maximum(t_px, safe))
-    out_m = np.where(m > tp_px, pulled, np.where(m <= t_px, lifted, safe))
-    acts = (w_px > 0.0) & (m > 0.0) & np.where(m > tp_px, out_m < safe * (1.0 - PULL_EPS), (m <= t_px) & (g_px > 1.0))
-    return {"out": out_m, "acts": acts, "is_speck": is_speck, "gate": gate, "pull_threshold": tp_px + 0.0 * m}
+    out_m = np.where(m > tp_px, pulled, safe)
+    acts = (w_px > 0.0) & (m > 0.0) & (m > tp_px) & (out_m < safe * (1.0 - PULL_EPS))
+    return {"out": out_m, "acts": acts, "gate": gate, "pull_threshold": tp_px + 0.0 * m}
 
 
 def balance_image(model: FaldModel, img: np.ndarray, sp: StarfieldParams) -> dict:
@@ -360,8 +358,6 @@ def balance_image(model: FaldModel, img: np.ndarray, sp: StarfieldParams) -> dic
     carry = _box(z["w0"], 1, np.sum) / np.maximum(n_spk, 1.0) * (1.0 - _smoothstep(sp.nb_lo, sp.nb_hi, z["solid"]))
     w0_field = np.where(spk, z["w0"], carry)               # (w0 > 0 only in speck zones, so the box sum is theirs)
     ln_t = np.log(np.maximum(np.where(z["target"] > 0.0, z["target"], model.p.white_nits), 1e-12))
-    below = spk & (z["peak"] < z["target"])
-    ln_g = np.where(below, float(np.clip(sp.lift, 0.0, 1.0)) * (ln_t - np.log(np.maximum(z["peak"], 1e-12))), 0.0)
     ln_pk = np.where(spk, np.log(np.maximum(z["peak"], 1e-12)), ln_t)
     # per pixel
     near_px = _bilinear_zones(model, z["near"])
@@ -371,14 +367,14 @@ def balance_image(model: FaldModel, img: np.ndarray, sp: StarfieldParams) -> dic
     pk_px = np.exp(_bilinear_zones(model, ln_pk))
     m = np.max(img, axis=0)
     safe = np.maximum(m, 1e-12)
-    r = pixel_rule(m, w_px, t_px, b_px, pk_px, _bilinear_zones(model, ln_g), float(np.clip(sp.even, 0.0, 1.0)),
+    r = pixel_rule(m, w_px, t_px, b_px, pk_px, float(np.clip(sp.even, 0.0, 1.0)),
                    float(model.p.white_nits))
-    out_m, is_speck, gate, tp_px = r["out"], r["is_speck"], r["gate"], r["pull_threshold"]
+    out_m, gate, tp_px = r["out"], r["gate"], r["pull_threshold"]
     own = _nearest_zones(model, spk)                       # the own-zone gate
     acts = own & r["acts"]
     scale = np.where(acts, out_m / safe, 1.0)              # exactly 1 wherever nothing acts: BIT-identical content
     return {"img": img * scale[None], "scale": scale, "w_pixel": w_px, "target_pixel": t_px, "w_field": w0_field,
-            "near_pixel": near_px, "b_pixel": b_px, "peak_pixel": pk_px, "is_speck": is_speck, "gate": gate,
+            "near_pixel": near_px, "b_pixel": b_px, "peak_pixel": pk_px, "gate": gate,
             "pull_threshold_pixel": tp_px, **z}
 
 

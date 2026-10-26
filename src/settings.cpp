@@ -315,7 +315,6 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     const FaldStarfieldSettings& st = cc.fald.star;
     WritePrivateProfileBool(section, (p + L"FaldStarfield").c_str(), st.enabled, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarEven").c_str(), st.even, iniPath);
-    WritePrivateProfileFloat(section, (p + L"FaldStarLift").c_str(), st.lift, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarTargetGain").c_str(), st.targetGain, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarTargetSigma").c_str(), st.targetSigma, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarKeepNits").c_str(), st.keepNits, iniPath);
@@ -334,6 +333,9 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     // the glow fill's keys (work guide S2, removed 2026-10-07): deleted, so a saved file carries no dead switch
     for (const wchar_t* k : { L"FaldGlowFill", L"FaldGlowStrength", L"FaldGlowReach", L"FaldGlowCapNits" })
         IniWriteString(section, (p + k).c_str(), nullptr, iniPath);
+    // the starfield's lift (retired 2026-10-26: it raised the haze it was meant to even and lit 1-px UI lines): an old
+    // value is never read, and the key is deleted so a saved file carries no dead setting
+    IniWriteString(section, (p + L"FaldStarLift").c_str(), nullptr, iniPath);
 }
 
 void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
@@ -383,7 +385,6 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         FaldStarfieldSettings st;   // defaults = DLC StarfieldParams
         st.enabled = GetPrivateProfileBool(section, (p + L"FaldStarfield").c_str(), false, iniPath);
         st.even = GetPrivateProfileFloat(section, (p + L"FaldStarEven").c_str(), st.even, iniPath);
-        st.lift = GetPrivateProfileFloat(section, (p + L"FaldStarLift").c_str(), st.lift, iniPath);
         st.targetGain = GetPrivateProfileFloat(section, (p + L"FaldStarTargetGain").c_str(), st.targetGain, iniPath);
         st.targetSigma = GetPrivateProfileFloat(section, (p + L"FaldStarTargetSigma").c_str(), st.targetSigma, iniPath);
         st.keepNits = GetPrivateProfileFloat(section, (p + L"FaldStarKeepNits").c_str(), st.keepNits, iniPath);

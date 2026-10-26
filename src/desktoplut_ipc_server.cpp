@@ -562,7 +562,6 @@ void HandleStateGet(JsonValue& result) {
                 // starfield balancing (runtime.fald_starfield; work guide S1)
                 l.set("fald_starfield", JBool(fs.star.enabled));
                 l.set("fald_star_even", JNum((double)fs.star.even));
-                l.set("fald_star_lift", JNum((double)fs.star.lift));
                 l.set("fald_star_target_gain", JNum((double)fs.star.targetGain));
                 l.set("fald_star_target_sigma", JNum((double)fs.star.targetSigma));
                 l.set("fald_star_keep_nits", JNum((double)fs.star.keepNits));
@@ -1697,17 +1696,17 @@ void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
                                                                                : FaldSettleFrames(rise, fall, 1000.0f / 60.0f, delay))));
 }
 
-// runtime.fald_starfield {monitor, mode, enabled?, even?, lift?, target_gain?, target_sigma?, keep_nits?, even_reach?, cap_nits?, strength?,
+// runtime.fald_starfield {monitor, mode, enabled?, even?, target_gain?, target_sigma?, keep_nits?, even_reach?, cap_nits?, strength?,
 // area_lo?, area_hi?, peak_hi?, reach?, nb_lo?, nb_hi?}: starfield balancing (EXPERIMENT, default off; work guide S1,
 // reference DLC dlc/fald/starfield.py). Partial updates; persisted per mode (the GUI row sets both modes). Every value
-// is validated BEFORE anything is stored; error texts are mirrored by the DLC mock word for word.
+// is validated BEFORE anything is stored; error texts are mirrored by the DLC mock word for word. `lift` was retired
+// 2026-10-26 (the starfield only pulls peaks down): a request that still sends it is refused, not silently ignored.
 void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     struct NumKey { const char* name; double lo, hi; bool integer; const char* text; };
     static const NumKey keys[] = {
         { "even", 0.0, 1.0, false, "even must be 0..1" },
-        { "lift", 0.0, 1.0, false, "lift must be 0..1" },
         { "target_gain", 0.05, 2.0, false, "target_gain must be 0.05..2" },
         { "even_reach", 0.0, (double)FALD_STAR_EVEN_REACH_MAX, true, "even_reach must be an integer 0..12" },
         { "cap_nits", 0.0, 10000.0, false, "cap_nits must be 0..10000 (0 = none)" },
@@ -1724,6 +1723,7 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
     const size_t nKeys = sizeof(keys) / sizeof(keys[0]);
     const JsonValue* en = p.find("enabled");
     if (en && en->type != JsonValue::Bool) { error = "enabled must be a boolean"; return; }
+    if (p.find("lift")) { error = "lift was retired: the starfield only pulls peaks down"; return; }
     const JsonValue* vals[sizeof(keys) / sizeof(keys[0])] = {};
     bool any = (en != nullptr);
     for (size_t i = 0; i < nKeys; i++) {
@@ -1735,7 +1735,7 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
         vals[i] = v; any = true;
     }
     if (!any) {
-        error = "missing parameter: enabled, even, lift, target_gain, target_sigma, keep_nits, even_reach, cap_nits, strength, area_lo, area_hi, peak_hi, reach, nb_lo or nb_hi";
+        error = "missing parameter: enabled, even, target_gain, target_sigma, keep_nits, even_reach, cap_nits, strength, area_lo, area_hi, peak_hi, reach, nb_lo or nb_hi";
         return;
     }
     FaldStarfieldSettings out;
@@ -1744,12 +1744,12 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
         FaldStarfieldSettings st = fs.star;
         if (en) st.enabled = en->b;
-        float* fdst[] = { &st.even, &st.lift, &st.targetGain, nullptr, &st.capNits, &st.strength, &st.areaLo, &st.areaHi,
+        float* fdst[] = { &st.even, &st.targetGain, nullptr, &st.capNits, &st.strength, &st.areaLo, &st.areaHi,
                           &st.peakHi, nullptr, &st.nbLo, &st.nbHi, &st.targetSigma, &st.keepNits };
         for (size_t i = 0; i < nKeys; i++) {
             if (!vals[i]) continue;
             if (fdst[i]) *fdst[i] = (float)vals[i]->num;
-            else if (i == 3) st.evenReach = (unsigned int)vals[i]->num;
+            else if (i == 2) st.evenReach = (unsigned int)vals[i]->num;
             else st.reach = (unsigned int)vals[i]->num;
         }
         // the pairs must stay ordered after a partial update (the stored partner counts)
@@ -1764,7 +1764,6 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("enabled", JBool(out.enabled));
     result.set("even", JNum((double)out.even));
-    result.set("lift", JNum((double)out.lift));
     result.set("target_gain", JNum((double)out.targetGain));
     result.set("target_sigma", JNum((double)out.targetSigma));
     result.set("keep_nits", JNum((double)out.keepNits));

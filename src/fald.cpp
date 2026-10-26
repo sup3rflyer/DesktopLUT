@@ -73,7 +73,6 @@ static const unsigned int FALD_FILE_POLL_FRAMES = 120;   // ~2 s at 60 Hz betwee
 void FaldStarfieldClamp(FaldStarfieldSettings& s) {
     auto clampF = [](float v, float lo, float hi, float dflt) { return (v != v) ? dflt : (v < lo ? lo : (v > hi ? hi : v)); };
     s.even = clampF(s.even, 0.0f, 1.0f, 0.8f);
-    s.lift = clampF(s.lift, 0.0f, 1.0f, 0.0f);
     s.targetGain = clampF(s.targetGain, 0.05f, 2.0f, 1.0f);
     s.targetSigma = clampF(s.targetSigma, 0.0f, 4.0f, 0.0f);
     s.keepNits = clampF(s.keepNits, 0.0f, 10000.0f, 100.0f);
@@ -731,7 +730,7 @@ static void FillCB(FaldResources* r, uint32_t roundIdx, uint32_t blurDir = 0, bo
     f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
     // starfield balancing (words 52-65; read only when word 35 != 0)
     const FaldResources::StarCB& sc = r->star;
-    f[52] = sc.even; f[53] = sc.lift; f[54] = sc.targetGain; f[55] = sc.capNits;
+    f[52] = sc.even; f[53] = 0.0f; f[54] = sc.targetGain; f[55] = sc.capNits;
     f[56] = sc.strength; f[57] = sc.areaLo; f[58] = sc.areaHi; f[59] = sc.peakHi;
     f[60] = sc.nbLo; f[61] = sc.nbHi; u[62] = sc.reach; u[63] = sc.evenReach;
     f[64] = sc.targetSigma; f[65] = sc.keepNits;                                    // words 64-65
@@ -922,7 +921,7 @@ static void RunStarPlan(FaldResources* r, bool indirect) {
         else g_context->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
     }
     UnbindCompute();
-    // S2: (w0_field, ln target, ln lift, ln peak)
+    // S2: (w0_field, ln target, 0, ln peak)
     ID3D11ShaderResourceView* in3[2] = { r->starStatSRV, r->starWSRV };
     g_context->CSSetShader(g_faldStarPlanCS, nullptr, 0);
     g_context->CSSetConstantBuffers(0, 1, &r->cb);
@@ -1370,7 +1369,7 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     if (r->starOn) {
         DumpTexture(r->starStatTex, dir + L"fald_star_stat.f32", p.cols, p.rows, 16);   // peak, speck-zone flag, sparse, solid
         DumpTexture(r->starWTex, dir + L"fald_star_w.f32", p.cols, p.rows, 16);         // target weight wt, wt ln peak, flank flag, speck-zone flag
-        DumpTexture(r->starPlanTex, dir + L"fald_star_plan.f32", p.cols, p.rows, 16);   // w0_field, ln target, ln lift, ln peak
+        DumpTexture(r->starPlanTex, dir + L"fald_star_plan.f32", p.cols, p.rows, 16);   // w0_field, ln target, 0 (unused), ln peak
         DumpTexture(r->starPlan2Tex, dir + L"fald_star_plan2.f32", p.cols, p.rows, 16); // ln background, near, speck-zone flag, w
         DumpTexture(r->starBgTex, dir + L"fald_star_bg.f32", p.cols, p.rows, 16);       // ln background, brightest pixel's index ly * zw + lx, lit sum, a_eff
     }
@@ -1442,11 +1441,11 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " (round 1: the corrected frame; this boost is in fald_btrue.f32; files fald_active_r0.f32 / fald_active.f32)"
          << "\nstarfield " << (r->starOn ? 1 : 0) << " (setting " << (fs.star.enabled ? 1 : 0)
          << "; 1 = every pass read Balance(fald_frame); files fald_star_stat.f32 [peak, speck-zone flag, sparse, solid], fald_star_w.f32"
-         << " [target weight wt, wt ln peak, flank flag, speck-zone flag], fald_star_plan.f32 [w0_field, ln target, ln lift, ln peak],"
+         << " [target weight wt, wt ln peak, flank flag, speck-zone flag], fald_star_plan.f32 [w0_field, ln target, 0 (unused), ln peak],"
          << " fald_star_plan2.f32 [ln background, near, speck-zone flag, w], fald_star_bg.f32 [ln background, brightest pixel's"
          << " index ly * zw + lx (zw = the zone's own width), lit sum, a_eff]:"
          << " cols x rows x 4 float32)"
-         << "\nstarfield even " << r->star.even << " lift " << r->star.lift << " target_gain " << r->star.targetGain
+         << "\nstarfield even " << r->star.even << " target_gain " << r->star.targetGain
          << " target_sigma " << r->star.targetSigma << " keep_nits " << r->star.keepNits
          << " even_reach " << r->star.evenReach << " cap_nits " << r->star.capNits << " strength " << r->star.strength
          << "\nstarfield area_lo " << r->star.areaLo << " area_hi " << r->star.areaHi << " peak_hi " << r->star.peakHi
@@ -1669,7 +1668,7 @@ void FaldRunPasses(MonitorContext* ctx, ID3D11RenderTargetView* finalRT, bool ne
     {
         FaldStarfieldSettings st = fs.star;
         FaldStarfieldClamp(st);
-        r->star.even = st.even; r->star.lift = st.lift; r->star.targetGain = st.targetGain; r->star.capNits = st.capNits;
+        r->star.even = st.even; r->star.targetGain = st.targetGain; r->star.capNits = st.capNits;
         r->star.strength = st.strength; r->star.areaLo = st.areaLo; r->star.areaHi = st.areaHi; r->star.peakHi = st.peakHi;
         r->star.nbLo = st.nbLo; r->star.nbHi = st.nbHi; r->star.reach = st.reach; r->star.evenReach = st.evenReach;
         r->star.targetSigma = st.targetSigma; r->star.keepNits = st.keepNits;

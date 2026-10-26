@@ -168,16 +168,31 @@ def test_partial_pull_target_gain_and_cap_match_the_reference(rig):
     _assert_parity(rig, img, SP(strength=0.4, peak_hi=500.0))
 
 
-def test_lift_matches_the_reference_and_spares_the_sky(rig):
+def test_dim_specks_and_the_sky_match_the_reference_and_are_never_brightened(rig):
+    """(The lift was retired 2026-10-26.) Specks below the target and the sky stay bit-identical; nothing ends above
+    its source level."""
     m, _ = rig
     img = _field(m, outliers=((5, 5),), levels=(40.0, 100.0, 250.0), sky=0.3)
-    ref, out = _assert_parity(rig, img, SP(lift=1.0))
-    src = out["star"]["src"]
-    sky = np.isclose(src[0], 0.3, rtol=1e-6)
-    assert np.array_equal(out["img"][:, sky], src[:, sky])                            # the sky is not a speck: untouched
-    dim = np.isclose(src[0], 40.0, rtol=1e-6)
-    assert dim.sum() == 24 * 25 and out["img"][0][dim].min() > 41.0                  # the dim specks were lifted
-    _assert_parity(rig, img, SP(lift=0.5, even=0.7))
+    for sp in (SP(), SP(even=0.7)):
+        ref, out = _assert_parity(rig, img, sp)
+        src = out["star"]["src"]
+        keep = np.isclose(src[0], 0.3, rtol=1e-6) | np.isclose(src[0], 40.0, rtol=1e-6)
+        assert keep.sum() > 24 * 25 and np.array_equal(out["img"][:, keep], src[:, keep])
+        assert np.all(out["img"] <= src)
+
+
+def test_a_one_pixel_ui_line_is_left_alone(rig):
+    """The bug that retired the lift (2026-10-26), at full resolution (the reference model works at 1/5 scale and cannot
+    draw a 1-px line): a 1-px line across an 80 x 45 zone covers 80 px^2, under area_hi 160, so its zones ARE speck
+    zones — and the lift raised dim UI dividers toward the 100-nit floor with a zone-graded gradient along the line.
+    With the shipped defaults a dim line, and the whole frame around it, is now bit-identical."""
+    m, emu = rig
+    nits = np.zeros((3, emu.H, emu.W))
+    y = 6 * 45 + 20
+    nits[:, y, 80:880] = 12.0                                                           # a 12-nit divider across 10 zones
+    out = emu.run(emu.nits_to_scrgb(nits), fp16_out=False, star=StarfieldParams())
+    assert out["star"]["stat"]["spk"][6, 1:11].all()                                    # still classified as specks ...
+    assert np.array_equal(out["img"], out["star"]["src"])                               # ... and never touched
 
 
 def test_a_star_next_to_a_solid_window_is_protected(rig):
@@ -319,7 +334,7 @@ def test_a_lone_outlier_with_the_defaults_matches_the_reference(rig):
 @pytest.mark.slow
 def test_pa32ucxr_frame_star_lattice_with_outliers_matches_the_reference(tmp_path):
     """The hardware-gate pattern at full size (3840 x 2160, 48 x 48 zones, even_reach 8 well inside the lattice): a
-    lattice of 5-px 100-nit stars with a few white outliers and a solid window, cap-only and with lift."""
+    lattice of 5-px 100-nit stars with a few white outliers and a solid window, with and without a target gain."""
     p = FaldParams()
     m = FaldModel(p)
     export_panel_params(m, tmp_path / "pa.bin")
@@ -329,7 +344,7 @@ def test_pa32ucxr_frame_star_lattice_with_outliers_matches_the_reference(tmp_pat
     ref, out = _assert_parity(big, img, SP())
     assert out["star"]["plan"]["w"][20:26, 20:26].max() == 0.0 and out["star"]["plan"]["w"][9, 40] == pytest.approx(1.0)
     assert out["img"][0, 9 * 45:10 * 45, 40 * 80:41 * 80].max() < 0.2 * WHITE
-    _assert_parity(big, img, SP(lift=1.0, target_gain=0.8))
+    _assert_parity(big, img, SP(target_gain=0.8))
     lit = np.where(img > 0.0, img, 1.0)                                               # the same frame on a 1-nit sky
     ref, out = _assert_parity(big, lit, SP())
     assert out["star"]["plan"]["w"][9, 40] == pytest.approx(1.0, abs=1e-4) and out["star"]["stat"]["a_eff"][9, 40] == pytest.approx(25.0, abs=0.05)
@@ -405,7 +420,7 @@ def test_star_free_lit_sky_zones_carry_the_weight_in_the_emulator_too(rig, sky):
     ref, out = _assert_parity(rig, img, SP())
     plan = out["star"]["plan"]
     assert not plan["spk"][6, 7] and plan["spk"][6, 6] and plan["w_field"][6, 7] == pytest.approx(1.0, abs=1e-4)
-    assert plan["ln_pk"][6, 7] == plan["ln_t"][6, 7] and plan["ln_g"][6, 7] == 0.0   # no speck: no peak of its own, no lift
+    assert plan["ln_pk"][6, 7] == plan["ln_t"][6, 7]                                  # no speck: no peak of its own
     assert np.array_equal(out["star"]["stat"]["spk"], ref["spk"])
     zone = (0, slice(6 * 45, 7 * 45), slice(6 * 80, 7 * 80))
     # fully pulled on every sky — 113 nits (rounds 3-5: 106): the TAPERED window of round 6 weighs the outlier's own zone 1
@@ -414,19 +429,15 @@ def test_star_free_lit_sky_zones_carry_the_weight_in_the_emulator_too(rig, sky):
 
 
 @pytest.mark.parametrize("sky", [1.0, 5.0])
-def test_sky_is_bit_identical_under_lift_and_under_a_target_below_it(rig, sky):
+def test_sky_is_bit_identical_under_a_target_below_it(rig, sky):
     m, _ = rig
     img = _field(m, outliers=((5, 5),), levels=(60.0, 100.0, 160.0), sky=sky)
-    for sp in (SP(lift=1.0), SP(cap_nits=0.5 * sky), SP(target_gain=0.05),   # 0.05 = the C++ / emulator minimum (the reference alone takes 0.01)
-               SP(lift=1.0, cap_nits=0.5 * sky)):
+    for sp in (SP(), SP(cap_nits=0.5 * sky), SP(target_gain=0.05)):   # 0.05 = the C++ / emulator minimum (the reference alone takes 0.01)
         ref, out = _assert_parity(rig, img, sp)
         src = out["star"]["src"]
         sky_px = src[0] < 0.5 * 60.0
         assert np.array_equal(out["img"][:, sky_px], src[:, sky_px]), sp
         assert out["img"].min() > sky * (1 - 1e-5)                                    # nothing ends below the sky
-    lifted = _assert_parity(rig, img, SP(lift=1.0))[1]
-    dim = np.isclose(lifted["star"]["src"][0], 60.0, rtol=1e-6)
-    assert lifted["img"][0][dim].min() > 61.0                                         # ... while the dim specks do rise
 
 
 # ------------------------------------------------------------------------------------------------ round 4: grain, soft stars, bright skies
@@ -446,11 +457,11 @@ def _grainy_checker(m, sky, grain, dx, seed=11):
 @pytest.mark.parametrize("sky", [1.0, 5.0])
 def test_grainy_sky_matches_the_reference_and_only_star_pixels_change(rig, sky, grain):
     """D at full resolution: a grainy star-free zone is no speck zone (a_eff ~ half the zone), carries the weight, and
-    every non-star pixel stays bit-identical - with and without lift."""
+    every non-star pixel stays bit-identical."""
     m, _ = rig
     img, stars = _grainy_checker(m, sky, grain, m.cw - 1)
     full_stars = np.repeat(np.repeat(stars, 5, axis=0), 5, axis=1)
-    for sp in (SP(), SP(lift=1.0)):
+    for sp in (SP(even=0.7), SP()):                                                  # SP() last: the zone check below reads it
         ref, out = _assert_parity(rig, img, sp)
         plan, st = out["star"]["plan"], out["star"]["stat"]
         assert np.array_equal(st["spk"], ref["spk"]) and not plan["spk"][6, 7] and st["a_eff"][6, 7] > 1000.0
@@ -483,19 +494,15 @@ def test_soft_star_profile_is_monotone_in_the_emulator(rig, sky):
 
 
 @pytest.mark.parametrize("sky,dim", [(20.0, 60.0), (50.0, 100.0)])
-def test_bright_sky_lift_and_cap_match_the_reference_and_spare_the_sky(rig, sky, dim):
-    """F at full resolution: the background-relative speck band keeps a sky at 33 / 50 % of the star level out of the
-    lift; a cap below the sky flattens the stars into it and leaves the sky bit-identical."""
+def test_bright_sky_and_cap_match_the_reference_and_spare_the_sky(rig, sky, dim):
+    """F at full resolution: a cap below the sky flattens the stars toward it and leaves the sky bit-identical."""
     m, _ = rig
     img = _field(m, outliers=((5, 5),), levels=(dim,), sky=sky)
-    for sp in (SP(lift=1.0), SP(cap_nits=0.6 * sky), SP(lift=1.0, cap_nits=0.6 * sky)):
+    for sp in (SP(), SP(cap_nits=0.6 * sky)):
         ref, out = _assert_parity(rig, img, sp)
         src = out["star"]["src"]
         sky_px = src[0] < 0.5 * (sky + dim)
         assert np.array_equal(out["img"][:, sky_px], src[:, sky_px]), sp
-    lifted = _assert_parity(rig, img, SP(lift=1.0))[1]
-    specks = np.isclose(lifted["star"]["src"][0], dim, rtol=1e-6)
-    assert lifted["img"][0][specks].min() > dim * 1.01
 
 
 # ------------------------------------------------------------------------------------------------ round 5: own-zone gate, tapered protection
@@ -724,16 +731,16 @@ def test_option_off_and_inert_settings_are_bit_identical(rig):
         for k in keys:
             assert np.array_equal(off[k], inert[k]), k
     solid = np.full((3, m.h, m.w), 80.0)                                               # no star-like content at all
-    a, b = emu.run(_scrgb(solid)), emu.run(_scrgb(solid), star=SP(lift=1.0))
+    a, b = emu.run(_scrgb(solid)), emu.run(_scrgb(solid), star=SP())
     assert all(np.array_equal(a[k], b[k]) for k in keys)
     on = emu.run(frame, star=SP())
     assert not np.array_equal(on["out"], off["out"])                                   # ... and ON does change this frame
 
 
 def test_clamp_star_is_the_cpp_clamp():
-    sp = clamp_star(SP(even=3.0, lift=-1.0, target_gain=0.0, even_reach=99, cap_nits=1e9, strength=7.0,
+    sp = clamp_star(SP(even=3.0, target_gain=0.0, even_reach=99, cap_nits=1e9, strength=7.0,
                                     area_lo=500.0, area_hi=100.0, peak_hi=-5.0, reach=40, nb_lo=0.8, nb_hi=0.2))
-    assert (sp.even, sp.lift, sp.target_gain, sp.even_reach, sp.cap_nits, sp.strength) == (1.0, 0.0, 0.05, 12, 10000.0, 1.0)
+    assert (sp.even, sp.target_gain, sp.even_reach, sp.cap_nits, sp.strength) == (1.0, 0.05, 12, 10000.0, 1.0)
     assert (sp.area_lo, sp.area_hi, sp.peak_hi, sp.reach, sp.nb_lo, sp.nb_hi) == (500.0, 500.0, 0.0, 4, 0.8, 0.8)
     assert clamp_star(StarfieldParams()) == StarfieldParams()                          # the defaults are inside every range
 
@@ -754,7 +761,7 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "float3 Balance(float3 img, int2 px)" in common
     # the pull stops at the interpolated zone background and never ends above the pixel itself
     assert "outM = max(outM, min(bPx, safe));" in bal
-    assert "if (!(m > 0.0f)) return img;" in bal and "if (!(wPx > 0.0f)) return img;" in bal and "if (!acts) return img;" in bal
+    assert "if (!(m > 0.0f)) return img;" in bal and "if (!(wPx > 0.0f)) return img;" in bal
     # the protection is interpolated on its own and applied per pixel; the own-zone gate is a NEAREST load of the flag
     assert "float2 p2 = starPlan2Tex.SampleLevel(linearClamp, uv, 0).xy;" in bal
     assert "float wPx = plan.x * (1.0f - StarSmooth(starNbLo, starNbHi, p2.y));" in bal
@@ -767,13 +774,12 @@ def test_hlsl_star_passes_mirror_the_reference():
     # the MONOTONE pull: threshold T' = lerp(ln max(t, b + SPECK_LO span), ln t, g); no gate inside the exponent
     assert "float g = StarSmooth(FALD_STAR_GATE_LO, FALD_STAR_GATE_HI, tPx / bPx);" in bal
     assert "float tFloor = bPx + FALD_STAR_SPECK_LO * max(spanPx, 0.0f);" in bal
-    assert "float lnTp = lerp(log(max(tPx, tFloor)), plan.y, g);" in bal and "if (m > exp(lnTp)) {" in bal
+    assert "float lnTp = lerp(log(max(tPx, tFloor)), plan.y, g);" in bal and "if (!(m > exp(lnTp))) return img;" in bal
     assert "float lnShown = log(min(safe, white));" in bal and "outM = exp(lnShown + wPx * starEven * (lnTp - lnShown));" in bal
-    assert "acts = outM < safe * (1.0f - FALD_STAR_PULL_EPS);" in bal
-    assert "} else if (m <= tPx) {" in bal and "min(safe * gPx, max(tPx, safe))" in bal and "acts = gPx > 1.0f;" in bal
-    assert "} else return img;" in bal
+    assert "if (!(outM < safe * (1.0f - FALD_STAR_PULL_EPS))) return img;" in bal
     assert "float bPx = exp(p2.x);" in bal and "float spanPx = exp(plan.w) - bPx;" in bal
-    assert "(spanPx > 0.0f) ? StarSmooth(FALD_STAR_SPECK_LO, FALD_STAR_SPECK_HI, (safe - bPx) / max(spanPx, 1e-12f)) : 0.0f" in bal
+    # the lift was retired 2026-10-26: no lift branch, no speck-pixel band, nothing is ever brightened
+    assert "gPx" not in bal and "isSpeck" not in bal and "FALD_STAR_SPECK_HI" not in common
     assert "return img * (outM / safe);" in bal
     assert "max(hi - lo, 1e-12f)" in common                                            # StarSmooth = starfield._smoothstep
     # the balanced frame is what every pass reads: before Correct in the statistic pass, before the fields in the pixel pass
@@ -800,7 +806,7 @@ def test_hlsl_star_passes_mirror_the_reference():
     # (2026-10-22: the two outputs are formed first and compared with the previous values on the partial path)
     assert "float4 bgV = float4(log(max(b, 1e-12f)), (gCount[0] != 0u) ? (float)gArg[0] : 0.0f, total, aEff);" in sstat
     assert "starBgOut[uint2(cx, cy)] = bgV;" in sstat and "starStatOut[uint2(cx, cy)] = statV;" in sstat
-    # the speck-zone flag (lit peak above its own background) travels S0 -> S1 -> S2; carry, lift and peak field key on it
+    # the speck-zone flag (lit peak above its own background) travels S0 -> S1 -> S2; carry and peak field key on it
     assert "float4 statV = float4(peak, (has && speck && aEff < starAreaHi) ? 1.0f : 0.0f, sparse, solid);" in sstat   # (compared, then stored)
     # S1: flank zones carry no target weight (wt), keep their w (plan2.w)
     assert "starWOut[id.xy] = float4(wt, wt * log(max(st.r, 1e-12f)), flank ? 1.0f : 0.0f, st.g);" in sweight
@@ -838,8 +844,8 @@ def test_hlsl_star_passes_mirror_the_reference():
     assert "target = exp(mean + starTargetSigma * sqrt(var)) * starTargetGain;" in splan
     assert splan.index("target = max(target, starKeepNits);") < splan.index("if (starCapNits > 0.0f) target = min(target, starCapNits);")
     assert "target = min(target, white);" in splan and "max(wsum" not in splan                      # <= white, no quotient floor
-    assert "float wField = spk ? st.b * starStrength : carry;" in splan and "(spk && peak < target) ? starLift * (lnT - lp) : 0.0f" in splan
-    assert "starPlanOut[id.xy] = float4(wField, lnT, lnG, spk ? lp : lnT);" in splan
+    assert "float wField = spk ? st.b * starStrength : carry;" in splan and "starLift" not in splan
+    assert "starPlanOut[id.xy] = float4(wField, lnT, 0.0f, spk ? lp : lnT);" in splan
     # C++ order: the plan of the source frame first, then the layer
     c = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     # (2026-10-22: the full path's calls; the partial path runs S0 on the touched zones and the plan by the decide pass)
@@ -858,5 +864,5 @@ def test_hlsl_star_passes_mirror_the_reference():
 
 
 def test_every_reference_parameter_reaches_the_emulator():
-    assert {f.name for f in fields(StarfieldParams)} == {"even", "lift", "target_gain", "target_sigma", "keep_nits", "even_reach", "cap_nits", "area_lo",
+    assert {f.name for f in fields(StarfieldParams)} == {"even", "target_gain", "target_sigma", "keep_nits", "even_reach", "cap_nits", "area_lo",
                                                          "area_hi", "peak_hi", "reach", "nb_lo", "nb_hi", "strength"}

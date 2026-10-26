@@ -696,7 +696,7 @@ const FaldView kFaldViews[act::kFaldDebugViews] = {
     { "PER-CHANNEL \xC3\x97" "100", "What the per-channel pedestal changes against the white one, \xC3\x97" "100." },
     { "SETTLING", "LED lag: red where the LEDs are still rising, blue still falling." },
     { "BOOST ZONES", "White: the zones the black-frame boost counts as lit." },
-    { "STARFIELD ZONES", "Starfield, per zone: blue pulled down, red lifted." },
+    { "STARFIELD ZONES", "Starfield, per zone: blue pulled down." },
 };
 
 // A FALD view is set on a connected display (either mode): Esc ends it.

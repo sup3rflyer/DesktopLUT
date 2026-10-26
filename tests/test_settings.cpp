@@ -282,7 +282,7 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.clockClosure = 0.65f;  // panel clock (temporal mode 3, 2026-09-20, work guide C13): persisted
         original.fald.clockParity = 1;
         original.fald.star.enabled = true;   // starfield balancing (2026-09-19, work guide S1): persisted
-        original.fald.star.even = 0.75f; original.fald.star.lift = 0.25f; original.fald.star.targetGain = 0.8f;
+        original.fald.star.even = 0.75f; original.fald.star.targetGain = 0.8f;
         original.fald.star.targetSigma = 1.75f; original.fald.star.keepNits = 60.0f;
         original.fald.star.evenReach = 5; original.fald.star.capNits = 400.0f; original.fald.star.strength = 0.5f;
         original.fald.star.areaLo = 30.0f; original.fald.star.areaHi = 200.0f; original.fald.star.peakHi = 900.0f;
@@ -317,7 +317,6 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.clockParity == 1);
         CHECK(loaded.fald.star.enabled);
         CHECK(loaded.fald.star.even == doctest::Approx(0.75f).epsilon(1e-4));
-        CHECK(loaded.fald.star.lift == doctest::Approx(0.25f).epsilon(1e-4));
         CHECK(loaded.fald.star.targetGain == doctest::Approx(0.8f).epsilon(1e-4));
         CHECK(loaded.fald.star.targetSigma == doctest::Approx(1.75f).epsilon(1e-4));
         CHECK(loaded.fald.star.keepNits == doctest::Approx(60.0f).epsilon(1e-4));
@@ -391,7 +390,6 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(fresh.fald.star.even == doctest::Approx(0.8f));
         CHECK(fresh.fald.star.targetSigma == 0.0f);
         CHECK(fresh.fald.star.keepNits == 100.0f);
-        CHECK(fresh.fald.star.lift == 0.0f);
         CHECK(fresh.fald.star.evenReach == 8u);
         CHECK(fresh.fald.star.reach == 2u);
         CHECK(fresh.fald.star.areaLo == 40.0f);
@@ -416,13 +414,14 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(starClamped.fald.star.reach == 0u);
         CHECK(starClamped.fald.star.areaLo == 300.0f);
         CHECK(starClamped.fald.star.areaHi == 300.0f);
-        // the glow fill's keys (work guide S2, removed 2026-10-07): an old INI's keys are ignored and a save deletes them
-        for (const wchar_t* k : { L"HDR_FaldGlowFill", L"HDR_FaldGlowStrength", L"HDR_FaldGlowReach", L"HDR_FaldGlowCapNits" })
+        // the glow fill's keys (work guide S2, removed 2026-10-07) and the starfield's lift (retired 2026-10-26): an old
+        // INI's keys are ignored and a save deletes them
+        for (const wchar_t* k : { L"HDR_FaldGlowFill", L"HDR_FaldGlowStrength", L"HDR_FaldGlowReach", L"HDR_FaldGlowCapNits", L"HDR_FaldStarLift" })
             WritePrivateProfileStringW(L"TestMon", k, L"1", ini.c_str());
         ColorCorrectionSettings oldIni;
         LoadColorCorrectionSettings(L"TestMon", L"HDR_", oldIni, ini.c_str());
         SaveColorCorrectionSettings(L"TestMon", L"HDR_", oldIni, ini.c_str());
-        for (const wchar_t* k : { L"HDR_FaldGlowFill", L"HDR_FaldGlowStrength", L"HDR_FaldGlowReach", L"HDR_FaldGlowCapNits" }) {
+        for (const wchar_t* k : { L"HDR_FaldGlowFill", L"HDR_FaldGlowStrength", L"HDR_FaldGlowReach", L"HDR_FaldGlowCapNits", L"HDR_FaldStarLift" }) {
             wchar_t left[8] = {};
             CHECK(GetPrivateProfileStringW(L"TestMon", k, L"", left, 8, ini.c_str()) == 0u);
         }

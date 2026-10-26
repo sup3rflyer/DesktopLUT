@@ -301,7 +301,9 @@ static_assert(sizeof(DwmHookMhcPreview) == 80 + 3 * 4 * DWM_HOOK_MHC_PREVIEW_LUT
 
 struct DwmHookFaldTuning {           // per monitors[] index: the settings of the mode it is in NOW
     // starfield (CB words 52-65; same fields and clamps as src FaldStarfieldSettings)
-    float    starEven, starLift, starTargetGain, starTargetSigma;
+    // _retiredStarLift held the starfield's lift (retired 2026-10-26): written 0, never read. Kept so the fields stay
+    // where an already-resident DLL (layoutVersion 1) reads them — and that DLL reads lift 0 from it.
+    float    starEven, _retiredStarLift, starTargetGain, starTargetSigma;
     float    starKeepNits, starCapNits, starStrength, starAreaLo;
     float    starAreaHi, starPeakHi, starNbLo, starNbHi;
     uint32_t starReach, starEvenReach;

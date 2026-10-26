@@ -99,8 +99,9 @@ def test_warp_starfield_dumps_are_the_twin():
     assert np.array_equal(sw[..., 2] > 0.5, pl["flank"]) and np.array_equal(sbg[..., 1], st["arg"])
     assert np.allclose(stat[..., 0], st["peak"], rtol=1e-6, atol=0)
     assert np.allclose(plan[..., 0], pl["w_field"], rtol=0, atol=1e-6) and np.allclose(plan2[..., 3], pl["w"], rtol=0, atol=1e-6)
-    for i, key in ((1, "ln_t"), (2, "ln_g"), (3, "ln_pk")):                         # ln domain: absolute = relative
+    for i, key in ((1, "ln_t"), (3, "ln_pk")):                                     # ln domain: absolute = relative
         assert np.allclose(plan[..., i], pl[key], rtol=0, atol=1e-5), key
+    assert np.all(plan[..., 2] == 0.0)                                              # was the lift (retired 2026-10-26): written 0
     assert np.allclose(plan2[..., 0], pl["ln_b"], rtol=0, atol=1e-5) and np.allclose(plan2[..., 1], pl["near"], rtol=0, atol=5e-5)
     # the scene exercises the feature: speck zones, peaks pulled toward the local target, pixels balanced
     scaled = tw["star"]["scale"] != 1.0

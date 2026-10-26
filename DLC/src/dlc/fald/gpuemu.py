@@ -55,8 +55,7 @@ from .temporal import MODE_BOTH, MODE_OFF, MODE_TRUE_ONLY, alpha_from_tau
 f32 = np.float32
 KNEE_START = 0.9          # FALD_KNEE_START / FALD_KNEE_CAP_TRUST (fald_shader.h; correct.py pins them equal)
 KNEE_CAP_TRUST = 1.0
-STAR_SPECK_LO = 0.25      # FALD_STAR_SPECK_LO / _HI (fald_shader.h Balance; starfield.balance_image's 0.25 .. 0.5 band)
-STAR_SPECK_HI = 0.5
+STAR_SPECK_LO = 0.25      # FALD_STAR_SPECK_LO (fald_shader.h Balance; starfield.SPECK_LO)
 STAR_EVEN_REACH_MAX = 12  # FALD_STAR_EVEN_REACH_MAX / FALD_STAR_REACH_MAX (fald.h; FaldStarfieldClamp)
 STAR_REACH_MAX = 4
 STAR_FLAT_ABS = 1e-6      # FALD_STAR_FLAT_ABS / _REL (fald_shader.h star statistic; starfield.FLAT_ABS / FLAT_REL): a zone whose
@@ -99,12 +98,12 @@ def star_smooth(lo, hi, x):
 
 
 def clamp_star(sp: StarfieldParams) -> StarfieldParams:
-    """C++ FaldStarfieldClamp: the ranges the settings / pipe / CB enforce (the reference clips even, lift and
+    """C++ FaldStarfieldClamp: the ranges the settings / pipe / CB enforce (the reference clips even and
     strength itself; the reaches and the ordered smoothstep pairs are the C++ side's)."""
     from dataclasses import replace
     c = lambda v, lo, hi: float(min(max(float(v), lo), hi))
     area_lo = c(sp.area_lo, 0.0, 1e6); nb_lo = c(sp.nb_lo, 0.0, 1.0)
-    return replace(sp, even=c(sp.even, 0.0, 1.0), lift=c(sp.lift, 0.0, 1.0), target_gain=c(sp.target_gain, 0.05, 2.0),
+    return replace(sp, even=c(sp.even, 0.0, 1.0), target_gain=c(sp.target_gain, 0.05, 2.0),
                    target_sigma=c(sp.target_sigma, 0.0, 4.0), keep_nits=c(sp.keep_nits, 0.0, 10000.0),
                    even_reach=int(min(max(int(sp.even_reach), 0), STAR_EVEN_REACH_MAX)), cap_nits=c(sp.cap_nits, 0.0, 10000.0),
                    strength=c(sp.strength, 0.0, 1.0), area_lo=area_lo, area_hi=max(c(sp.area_hi, 0.0, 1e6), area_lo),
@@ -436,7 +435,7 @@ class Emu:
         """g_faldStarWeightSource (S1) + g_faldStarPlanSource (S2), float32: the tapered protection field, the zone
         weights, the target and the fields the pixels read (starfield.py module docstring, items 6-9)."""
         peak = st["peak"]
-        spk = st["spk"]              # the SPECK-ZONE flag: carry / lift / peak field / own-zone gate key on it
+        spk = st["spk"]              # the SPECK-ZONE flag: carry / peak field / own-zone gate key on it
         near = np.zeros_like(st["solid"], dtype=np.float32)             # S1: max over d <= reach + 1 of solid x k(d)
         for d in range(int(sp.reach) + 2):
             k = f32(min(max((int(sp.reach) + 1 - d) * 0.5, 0.0), 1.0))
@@ -467,10 +466,9 @@ class Emu:
         carry = s3 * f32(sp.strength) / np.maximum(n3, f32(1.0)) * (1.0 - star_smooth(sp.nb_lo, sp.nb_hi, st["solid"]))
         w_field = np.where(spk, w0, carry).astype(np.float32)
         ln_t = np.log(np.maximum(np.where(target > 0, target, f32(self.white)), f32(1e-12))).astype(np.float32)
-        ln_g = np.where(spk & (peak < target), f32(sp.lift) * (ln_t - lp), f32(0.0)).astype(np.float32)
         ln_pk = np.where(spk, lp, ln_t).astype(np.float32)
-        return {"w": w, "w0": w0, "wt": wt, "flank": flank, "near": near, "target": target, "w_field": w_field, "ln_t": ln_t, "ln_g": ln_g,
-                "ln_pk": ln_pk, "spk": spk, "ln_b": st["ln_b"]}     # plan (t15): w_field (= w0_field), ln_t, ln_g, ln_pk; plan2 (t18): ln_b, near, spk, w
+        return {"w": w, "w0": w0, "wt": wt, "flank": flank, "near": near, "target": target, "w_field": w_field, "ln_t": ln_t,
+                "ln_pk": ln_pk, "spk": spk, "ln_b": st["ln_b"]}     # plan (t15): w_field (= w0_field), ln_t, 0, ln_pk; plan2 (t18): ln_b, near, spk, w
 
     @staticmethod
     def _box32_centred_var(wt, wlp, mean, r):
@@ -537,9 +535,6 @@ class Emu:
         t_px = np.exp(ln_t)
         b_px = np.exp(self.sample_zone(plan["ln_b"]))                      # >= 1e-12: a black sky gates fully open
         span_px = np.exp(self.sample_zone(plan["ln_pk"])) - b_px
-        # speck pixels: 25 .. 50 % of the way from the interpolated background to the interpolated zone peak
-        is_speck = np.where(span_px > 0.0, star_smooth(STAR_SPECK_LO, STAR_SPECK_HI, (safe - b_px) / np.maximum(span_px, 1e-12)), 0.0)
-        g_px = np.exp(self.sample_zone(plan["ln_g"]) * w_px * is_speck)
         # the pull threshold T': the target while it is well above the background, the bottom of the speck band as it
         # nears / undercuts it; out(m) = m up to T', m^(1 - a) T'^a above: monotone in m, the sky is never reached
         gate = star_smooth(STAR_GATE_LO, STAR_GATE_HI, t_px / b_px)
@@ -551,9 +546,8 @@ class Emu:
         pulled = np.exp(np.log(shown) + w_px * float(sp.even) * (ln_tp - np.log(shown)))
         # never below the (interpolated) zone background, never above the pixel itself
         pulled = np.maximum(pulled, np.minimum(b_px, safe))
-        lifted = np.minimum(safe * g_px, np.maximum(t_px, safe))
-        out_m = np.where(above, pulled, np.where(m <= t_px, lifted, safe))
-        acts = live & np.where(above, out_m < safe * (1.0 - STAR_PULL_EPS), (m <= t_px) & (g_px > 1.0))
+        out_m = np.where(above, pulled, safe)                              # at / below T': untouched (nothing is lifted)
+        acts = live & above & (out_m < safe * (1.0 - STAR_PULL_EPS))
         scale = np.where(acts, out_m / safe, 1.0)
         return np.where(acts[None], img * scale[None], img), scale
 

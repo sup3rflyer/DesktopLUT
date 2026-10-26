@@ -99,13 +99,13 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert fields[68:72] == ["clkTrue0", "clkEst0", "clkTrue1", "clkEst1"]
     assert fields[44:48] == ["tempAlphaRise", "tempAlphaFall", "tempMode", "tempInit"]
     assert fields[34] == "boostN" and fields[48:52] == ["boostLitNits", "boostLitFrac", "boostDimNits", "boostDimFrac"]
-    assert fields[35] == "starOn" and fields[52:64] == ["starEven", "starLift", "starTargetGain", "starCapNits", "starStrength",
+    assert fields[35] == "starOn" and fields[52:64] == ["starEven", "starRetired53", "starTargetGain", "starCapNits", "starStrength",
                                                         "starAreaLo", "starAreaHi", "starPeakHi", "starNbLo", "starNbHi",
                                                         "starReach", "starEvenReach"]
     # ... and FillCB writes them at those words, uint where the HLSL says uint (the overlay's, src/fald.cpp) ...
     cpp = (_SRC / "fald.cpp").read_text(encoding="utf-8")
     assert "u[35] = r->starOn ? 1u : 0u;" in cpp
-    assert "f[52] = sc.even; f[53] = sc.lift; f[54] = sc.targetGain; f[55] = sc.capNits;" in cpp
+    assert "f[52] = sc.even; f[53] = 0.0f; f[54] = sc.targetGain; f[55] = sc.capNits;" in cpp   # word 53: the retired lift
     assert "f[56] = sc.strength; f[57] = sc.areaLo; f[58] = sc.areaHi; f[59] = sc.peakHi;" in cpp
     assert "f[60] = sc.nbLo; f[61] = sc.nbHi; u[62] = sc.reach; u[63] = sc.evenReach;" in cpp
     assert "f[64] = sc.targetSigma; f[65] = sc.keepNits;" in cpp
@@ -115,7 +115,7 @@ def test_python_reference_constants_match_the_hlsl_source():
     # ... and the DWM hook's (dwm_hook/hook_fald.cpp; its starfield settings come from the tuning tail `t`)
     hook = _HOOK.read_text(encoding="utf-8")
     assert "u[35] = m->starOn ? 1u : 0u;" in hook
-    assert "f[52] = t.starEven; f[53] = t.starLift; f[54] = t.starTargetGain; f[55] = t.starCapNits;" in hook
+    assert "f[52] = t.starEven; f[53] = 0.0f; f[54] = t.starTargetGain; f[55] = t.starCapNits;" in hook
     assert "f[56] = t.starStrength; f[57] = t.starAreaLo; f[58] = t.starAreaHi; f[59] = t.starPeakHi;" in hook
     assert "f[60] = t.starNbLo; f[61] = t.starNbHi; u[62] = t.starReach; u[63] = t.starEvenReach;" in hook
     assert "f[64] = t.starTargetSigma; f[65] = t.starKeepNits;" in hook
@@ -139,7 +139,7 @@ def test_starfield_defaults_and_smoothstep_constants_match_the_cpp_and_hlsl_sour
     body = re.search(r"struct FaldStarfieldSettings \{(.*?)\n\};", types_h, re.S).group(1)
     got = {k: v for k, v in re.findall(r"(?:bool|float|unsigned int) (\w+) = ([\w.]+?)f?;", body)}
     assert got.pop("enabled") == "false"                                            # experimental: default OFF
-    want = {"even": sp.even, "lift": sp.lift, "targetGain": sp.target_gain, "targetSigma": sp.target_sigma, "keepNits": sp.keep_nits, "evenReach": sp.even_reach,
+    want = {"even": sp.even, "targetGain": sp.target_gain, "targetSigma": sp.target_sigma, "keepNits": sp.keep_nits, "evenReach": sp.even_reach,
             "capNits": sp.cap_nits, "strength": sp.strength, "areaLo": sp.area_lo, "areaHi": sp.area_hi,
             "peakHi": sp.peak_hi, "reach": sp.reach, "nbLo": sp.nb_lo, "nbHi": sp.nb_hi}
     assert {k: float(v) for k, v in got.items()} == {k: float(v) for k, v in want.items()}
@@ -147,12 +147,13 @@ def test_starfield_defaults_and_smoothstep_constants_match_the_cpp_and_hlsl_sour
     star_cb = re.search(r"struct StarCB \{(.*?)\} star;", fald_h, re.S).group(1)
     got_cb = {k: float(v) for k, v in re.findall(r"(\w+) = ([\d.]+)f?[,;]", star_cb)}
     assert got_cb == {k: float(v) for k, v in want.items()}
-    # the speck band (the lift belongs to pixels above 25 .. 50 % of the zone peak): HLSL = emulator = reference
+    # the bottom of the speck band (the pull threshold's floor): HLSL = emulator = reference
     lo = float(re.search(r"static const float FALD_STAR_SPECK_LO = ([0-9.]+)f;", src).group(1))
-    hi = float(re.search(r"static const float FALD_STAR_SPECK_HI = ([0-9.]+)f;", src).group(1))
-    assert (lo, hi) == (gpuemu.STAR_SPECK_LO, gpuemu.STAR_SPECK_HI) == (starfield.SPECK_LO, starfield.SPECK_HI) == (0.25, 0.5)
-    assert "_smoothstep(SPECK_LO, SPECK_HI, (safe - b_px) / np.maximum(span_px, 1e-12))" in inspect.getsource(starfield.pixel_rule)
-    assert "StarSmooth(FALD_STAR_SPECK_LO, FALD_STAR_SPECK_HI, (safe - bPx) / max(spanPx, 1e-12f))" in src
+    assert lo == gpuemu.STAR_SPECK_LO == starfield.SPECK_LO == 0.25
+    assert "t_floor = b_px + SPECK_LO * np.maximum(span_px, 0.0)" in inspect.getsource(starfield.pixel_rule)
+    assert "float tFloor = bPx + FALD_STAR_SPECK_LO * max(spanPx, 0.0f);" in src
+    # the lift was retired 2026-10-26: it is in no settings struct, clamp, CB fill or pipe table
+    assert "lift" not in body and "lift" not in star_cb and "FALD_STAR_SPECK_HI" not in src
     # the pull gate over target / background
     glo = float(re.search(r"static const float FALD_STAR_GATE_LO = ([0-9.]+)f;", src).group(1))
     ghi = float(re.search(r"static const float FALD_STAR_GATE_HI = ([0-9.]+)f;", src).group(1))
@@ -178,7 +179,6 @@ def test_starfield_defaults_and_smoothstep_constants_match_the_cpp_and_hlsl_sour
         {f.name: float(getattr(sp, f.name)) for f in __import__("dataclasses").fields(sp)}
     for line in ("s.even = clampF(s.even, 0.0f, 1.0f, 0.8f);", "s.targetSigma = clampF(s.targetSigma, 0.0f, 4.0f, 0.0f);",
                  "s.keepNits = clampF(s.keepNits, 0.0f, 10000.0f, 100.0f);",
-                 "s.lift = clampF(s.lift, 0.0f, 1.0f, 0.0f);",
                  "s.targetGain = clampF(s.targetGain, 0.05f, 2.0f, 1.0f);", "s.capNits = clampF(s.capNits, 0.0f, 10000.0f, 0.0f);",
                  "s.strength = clampF(s.strength, 0.0f, 1.0f, 1.0f);", "s.nbLo = clampF(s.nbLo, 0.0f, 1.0f, 0.15f);",
                  "s.nbHi = clampF(s.nbHi, 0.0f, 1.0f, 0.30f);"):

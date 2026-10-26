@@ -729,7 +729,7 @@ void CreateGUILayout(HWND hwnd) {
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Per-channel vs white (x100)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Temporal settling (red rising)");
     SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Boost zone map (non-black zones)");
-    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Starfield zones (blue pulled, red lifted)");
+    SendMessage(g_gui.hwndFaldDebug, CB_ADDSTRING, 0, (LPARAM)L"Starfield zones (blue = pulled down)");
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, 0, 0);
 
     // Per-channel pedestal (2026-09-13, DLC work guide H2): the panel file (FLD2) carries the measured colour of the
@@ -805,7 +805,7 @@ void CreateGUILayout(HWND hwnd) {
     // the geometric mean; a tunable); keep nits = keep_nits: the target never falls below it (specks up to ~100 nits make
     // no visible haze — this is what keeps a dim, heavy-tailed star field from being flattened); strength = the overall blend; mean reach
     // = even_reach, the zones (each side) the local mean looks at. It changes the content on purpose. Applies to both modes
-    // like View; lift and the remaining parameters are INI / pipe only (runtime.fald_starfield).
+    // like View; the remaining parameters are INI / pipe only (runtime.fald_starfield).
     int faldSY = innerY + 126;
     g_gui.hwndFaldStarEnable = CreateWindow(L"BUTTON", L"Starfield",
         WS_CHILD | BS_AUTOCHECKBOX,

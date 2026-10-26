@@ -245,7 +245,7 @@ def test_overlay_tracker_forces_starfield_balancing_off_and_restores_it():
     """Work guide S1: starfield balancing CHANGES sparse highlights on purpose — identity / ON reads of a measuring phase
     must never go through it. It is a persisted owner setting, so the tracker switches it off and puts it back."""
     ctl = CalibrationController.mock()
-    ctl.call("runtime.fald_starfield", {"monitor": 1, "mode": "SDR", "enabled": True, "even": 0.7, "lift": 0.2, "even_reach": 5})
+    ctl.call("runtime.fald_starfield", {"monitor": 1, "mode": "SDR", "enabled": True, "even": 0.7, "strength": 0.6, "even_reach": 5})
     ctl.call("runtime.fald_temporal", {"monitor": 1, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 80})
     tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")
     layers = ctl.state()["layers"]["1:SDR"]
@@ -254,7 +254,7 @@ def test_overlay_tracker_forces_starfield_balancing_off_and_restores_it():
     meta = tr.file_meta()
     assert meta["starfield_forced_off"] is True and meta["temporal_forced_off"] is True
     assert meta["starfield_saved"]["enabled"] is True and meta["starfield_saved"]["even"] == 0.7
-    assert meta["starfield_saved"]["lift"] == 0.2 and meta["starfield_saved"]["even_reach"] == 5
+    assert meta["starfield_saved"]["strength"] == 0.6 and meta["starfield_saved"]["even_reach"] == 5
     assert "forced OFF" in meta["starfield_note"]
     assert ctl.state()["layers"]["1:HDR"]["fald_starfield"] is False                     # the other mode was never on
     tr.restore()

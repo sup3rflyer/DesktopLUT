@@ -169,7 +169,7 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_CORR_FALD_STAR_SIGMA  543   // spread σ = target_sigma
 #define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
 #define ID_CORR_FALD_STAR_STRENGTH 545
-#define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach   (lift is INI / pipe only)
+#define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach
 #define ID_CORR_FALD_FLANK_FADE  549   // flank fade (the frozen fade stack ASF10 + T11_TMTC), applies to both modes
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
@@ -572,7 +572,6 @@ struct FaldStarfieldSettings {
     bool enabled = false;
     float even = 0.8f;            // 0..1: how far a star-like peak above the local target is pulled onto it (log domain;
                                   // < 1 compresses the outliers and keeps their order)
-    float lift = 0.0f;            // 0..1: how far a peak below the target is lifted (specks only; 0 = cap-only)
     float targetGain = 1.0f;      // 0.05..2: the target relative to exp(mean + targetSigma std) of the local ln peaks
     float targetSigma = 0.0f;     // 0..4: the target sits this many standard deviations of ln peak above the local mean
                                   // (0 = the geometric mean = the default; a tunable: on real clips whose specks sit at

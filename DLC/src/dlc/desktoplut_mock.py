@@ -168,7 +168,6 @@ def _fald_file_transfer(path: Path) -> str | None:
 # and the texts are the C++ table's, word for word; the defaults are dlc.fald.starfield.StarfieldParams'.
 _FALD_STAR_KEYS: dict[str, tuple[float, float, bool, str]] = {
     "even": (0.0, 1.0, False, "even must be 0..1"),
-    "lift": (0.0, 1.0, False, "lift must be 0..1"),
     "target_gain": (0.05, 2.0, False, "target_gain must be 0.05..2"),
     "even_reach": (0.0, 12.0, True, "even_reach must be an integer 0..12"),
     "cap_nits": (0.0, 10000.0, False, "cap_nits must be 0..10000 (0 = none)"),
@@ -182,7 +181,7 @@ _FALD_STAR_KEYS: dict[str, tuple[float, float, bool, str]] = {
     "target_sigma": (0.0, 4.0, False, "target_sigma must be 0..4"),
     "keep_nits": (0.0, 10000.0, False, "keep_nits must be 0..10000 (0 = no floor)"),
 }
-_FALD_STAR_DEFAULTS: dict[str, Any] = {"enabled": False, "even": 0.8, "lift": 0.0, "target_gain": 1.0, "target_sigma": 0.0, "keep_nits": 100.0, "even_reach": 8,
+_FALD_STAR_DEFAULTS: dict[str, Any] = {"enabled": False, "even": 0.8, "target_gain": 1.0, "target_sigma": 0.0, "keep_nits": 100.0, "even_reach": 8,
                                        "cap_nits": 0.0, "strength": 1.0, "area_lo": 40.0, "area_hi": 160.0, "peak_hi": 0.0,
                                        "reach": 2, "nb_lo": 0.15, "nb_hi": 0.30}
 
@@ -1033,6 +1032,8 @@ class MockDesktopLutServer:
             en = params.get("enabled")
             if "enabled" in params and not isinstance(en, bool):
                 return DesktopLutResponse(ok=False, error="enabled must be a boolean")
+            if "lift" in params:                    # retired 2026-10-26: refused, never silently ignored
+                return DesktopLutResponse(ok=False, error="lift was retired: the starfield only pulls peaks down")
             given: dict[str, Any] = {}
             for name, (lo, hi, integer, text) in _FALD_STAR_KEYS.items():
                 v = params.get(name)
@@ -1042,7 +1043,7 @@ class MockDesktopLutServer:
                     return DesktopLutResponse(ok=False, error=text)
                 given[name] = int(v) if integer else float(v)
             if "enabled" not in params and not given:
-                return DesktopLutResponse(ok=False, error="missing parameter: enabled, even, lift, target_gain, target_sigma, keep_nits, even_reach, cap_nits, "
+                return DesktopLutResponse(ok=False, error="missing parameter: enabled, even, target_gain, target_sigma, keep_nits, even_reach, cap_nits, "
                                                           "strength, area_lo, area_hi, peak_hi, reach, nb_lo or nb_hi")
             st = {**_fald_star(fs), **given}
             if "enabled" in params:

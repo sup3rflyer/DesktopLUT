@@ -198,7 +198,10 @@ FaldShaderSources LegacySources() {
     s.common = g_faldCommonSource; s.stat = g_faldStatSource; s.conv = g_faldConvSource; s.gain = L::g_faldGainSource;
     s.blur = L::g_faldBlurSource; s.gainBlur = g_faldGainBlurSource; s.temporal = L::g_faldTemporalSource; s.panelClock = L::g_faldPanelClockSource;
     s.starStat = L::g_faldStarStatSource; s.starWeight = L::g_faldStarWeightSource;
-    s.starPlan = L::g_faldStarPlanSource; s.zoneCombineDefine = L::g_faldZoneCombineDefine; s.pixel = L::g_faldPixelSource;
+    // The starfield's lift was retired 2026-10-26: CB word 53 is now starRetired53, always 0. The frozen plan pass still
+    // computes its lift from that word, so at 0 it holds today's lift-free S2 + Balance to the pre-retirement maths.
+    static const std::string legacyPlan = std::string("#define starLift starRetired53\n") + L::g_faldStarPlanSource;
+    s.starPlan = legacyPlan.c_str(); s.zoneCombineDefine = L::g_faldZoneCombineDefine; s.pixel = L::g_faldPixelSource;
     s.decide = g_faldDecideSource;   // (the decide pass, 2026-10-22: the frozen set has none)
     return s;
 }

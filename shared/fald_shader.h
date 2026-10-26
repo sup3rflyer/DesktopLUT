@@ -84,10 +84,11 @@ cbuffer FaldCB : register(b0) {
                                                                     // when more than LitFrac of its pixels exceed LitNits (0 =
                                                                     // any pixel) OR more than DimFrac of them exceed DimNits
                                                                     // (as-if-white nits of the pixel's brightest channel)
-    float starEven; float starLift; float starTargetGain; float starCapNits; // starfield balancing (DLC dlc/fald/starfield.py
-                                                                    // StarfieldParams; read only when starOn != 0): pull of a
-                                                                    // peak above the local target (fraction of the way, log
-                                                                    // domain), lift of one below it, gain on the local target
+    float starEven; float starRetired53; float starTargetGain; float starCapNits; // starfield balancing (DLC
+                                                                    // dlc/fald/starfield.py StarfieldParams; read only when
+                                                                    // starOn != 0): pull of a peak above the local target
+                                                                    // (fraction of the way, log domain); word 53 held the lift
+                                                                    // (retired 2026-10-26): written 0, never read; gain on the local target
                                                                     // (words 64 / 65 shape it), absolute ceiling in as-if-white
                                                                     // nits (0 = none)
     float starStrength; float starAreaLo; float starAreaHi; float starPeakHi; // overall blend; effective lit area px^2 (fully
@@ -143,7 +144,7 @@ Buffer<float>     boostLut    : register(t12); // [boostN][2]: (first non-black 
 Texture2D<float>  activeTex   : register(t13); // cols x rows: 1 = the zone counts as non-black (boost pass; pixel view 8)
 Texture2D<float>  boostTex    : register(t14); // 2 x 1: [0] = the frame's LED boost, [1] = its non-black zone count (conv pass)
 // Starfield balancing, all cols x rows RGBA32F, texel centres = zone centres (rules: the star-pass header below)
-Texture2D<float4> starPlanTex  : register(t15); // S2 out: (w0_field, ln target, ln lift, ln peak) — Balance samples it bilinearly
+Texture2D<float4> starPlanTex  : register(t15); // S2 out: (w0_field, ln target, 0, ln peak) — Balance samples it bilinearly
                                                 // (statistic rounds + pixel pass; view 9 loads it)
 Texture2D<float4> starStatTex  : register(t16); // S0 out: (peak, speck-zone flag, sparse, solid) — read by S1 and S2
 Texture2D<float4> starWTex     : register(t17); // S1 out: (wt = the zone's weight in the target average, wt * ln peak, flank
@@ -269,14 +270,14 @@ float StarSmooth(float lo, float hi, float x) {
     float t = saturate((x - lo) / max(hi - lo, 1e-12f));
     return t * t * (3.0f - 2.0f * t);
 }
-// A pixel counts as a SPECK when it lies 0.25 .. 0.5 of the way from the (interpolated) zone background to the
-// (interpolated) zone peak — background-relative, so a sky at half the star level is still sky. Speck pixels take the
-// lift. The pull takes every pixel above its THRESHOLD T': the target while the target is well above the background (a
+// The pull takes every pixel above its THRESHOLD T': the target while the target is well above the background (a
 // soft star comes down as a whole: no bright ring around a pulled core), rising to the bottom of the speck band
-// b + SPECK_LO (peak - b) as target / background falls from GATE_HI to GATE_LO — a target below the sky leaves the sky
-// alone, and out(m) stays monotone in m (starfield.pixel_rule; DLC tests/test_fald_transfer.py pins the constants equal).
+// b + SPECK_LO (peak - b) — 0.25 of the way from the (interpolated) zone background to the (interpolated) zone peak —
+// as target / background falls from GATE_HI to GATE_LO: a target below the sky leaves the sky alone, and out(m) stays
+// monotone in m (starfield.pixel_rule; DLC tests/test_fald_transfer.py pins the constants equal). Nothing is ever
+// brightened: the lift of dim specks toward the target was retired 2026-10-26 (it raised the haze it was meant to even,
+// multiplied lifted stars x8-x50, and lit 1-px UI lines — a line across a zone passes the speck-area test).
 static const float FALD_STAR_SPECK_LO = 0.25f;
-static const float FALD_STAR_SPECK_HI = 0.5f;
 static const float FALD_STAR_GATE_LO = 1.0f;
 static const float FALD_STAR_GATE_HI = 2.0f;
 // Flank zones (S1): a zone whose brightest pixel lies within FLANK_PX of the edge / corner it shares with a neighbour of
@@ -309,7 +310,7 @@ float3 Balance(float3 img, int2 px) {
     uint2 zone = ZoneOfPixel(px);                                         // integer math, as view 9
     if (!(starPlan2Tex.Load(int3((int2)zone, 0)).z > 0.5f)) return img;   // ... and the own-zone gate, before the two taps
     float2 uv = FineUV(float2(px));
-    float4 plan = starPlanTex.SampleLevel(linearClamp, uv, 0);           // w0, ln target, ln lift, ln peak
+    float4 plan = starPlanTex.SampleLevel(linearClamp, uv, 0);           // w0, ln target, (unused, 0), ln peak
     float2 p2 = starPlan2Tex.SampleLevel(linearClamp, uv, 0).xy;         // ln background, near
     float wPx = plan.x * (1.0f - StarSmooth(starNbLo, starNbHi, p2.y));
     if (!(wPx > 0.0f)) return img;
@@ -317,26 +318,17 @@ float3 Balance(float3 img, int2 px) {
     float tPx = exp(plan.y);
     float bPx = exp(p2.x);                                                        // >= 1e-12: a black sky gates fully open
     float spanPx = exp(plan.w) - bPx;
-    float isSpeck = (spanPx > 0.0f) ? StarSmooth(FALD_STAR_SPECK_LO, FALD_STAR_SPECK_HI, (safe - bPx) / max(spanPx, 1e-12f)) : 0.0f;
-    float gPx = exp(plan.z * wPx * isSpeck);
     // the pull threshold T': the target while it is well above the background (the whole profile of a soft star comes
     // down together), rising to the bottom of the speck band as target / background falls from GATE_HI to GATE_LO — the
     // sky is never reached. out(m) = m up to T', m^(1 - a) T'^a above it: MONOTONE in m (no bright ring, no "donut")
     float g = StarSmooth(FALD_STAR_GATE_LO, FALD_STAR_GATE_HI, tPx / bPx);
     float tFloor = bPx + FALD_STAR_SPECK_LO * max(spanPx, 0.0f);
     float lnTp = lerp(log(max(tPx, tFloor)), plan.y, g);
-    float outM;
-    bool acts;
-    if (m > exp(lnTp)) {
-        float lnShown = log(min(safe, white));                                    // from the level the panel SHOWS (clips at white)
-        outM = exp(lnShown + wPx * starEven * (lnTp - lnShown));                  // pulled toward T' (log domain)
-        outM = max(outM, min(bPx, safe));                                         // ... never below the background
-        acts = outM < safe * (1.0f - FALD_STAR_PULL_EPS);
-    } else if (m <= tPx) {
-        outM = min(safe * gPx, max(tPx, safe));                                   // lifted, never past the target
-        acts = gPx > 1.0f;
-    } else return img;                                                            // between the target and T': untouched
-    if (!acts) return img;
+    if (!(m > exp(lnTp))) return img;                                             // at / below T': untouched
+    float lnShown = log(min(safe, white));                                        // from the level the panel SHOWS (clips at white)
+    float outM = exp(lnShown + wPx * starEven * (lnTp - lnShown));                // pulled toward T' (log domain)
+    outM = max(outM, min(bPx, safe));                                             // ... never below the background
+    if (!(outM < safe * (1.0f - FALD_STAR_PULL_EPS))) return img;
     return img * (outM / safe);
 }
 
@@ -769,28 +761,26 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 //             weights wt * (E + 1 - d) / (E + 1) over box(evenReach) (tapered; the variance is summed ABOUT the mean in a
 //             second sweep); own peak if no weight within reach                                             S2
 //   w0_field= spk ? sparse * strength : mean(sparse * strength over the 3x3 speck zones) * (1 - ss(nbLo, nbHi, solid))   plan.x
-//   ln_t = ln target (ln white if 0);  ln_g = spk && peak < target ? lift * (ln_t - ln peak) : 0;  ln_pk = spk ? ln peak : ln_t
+//   ln_t = ln target (ln white if 0);  ln_pk = spk ? ln peak : ln_t;  plan.z = 0 (was the lift, retired 2026-10-26)
 //                                                                                                           S2   plan.yzw
 //   ln_b = ln max(b, 1e-12)                                                                                 S0   bg.x -> S1 plan2.x
 // Textures: stat (S0 u0) = peak, spk, sparse, solid | bg (S0 u1) = ln b, arg, total, a_eff | w (S1 u0) = wt, wt ln peak,
-//   flank, spk | plan2 (S1 u1) = ln b, near, spk, w | plan (S2 u0) = w0_field, ln_t, ln_g, ln_pk.
+//   flank, spk | plan2 (S1 u1) = ln b, near, spk, w | plan (S2 u0) = w0_field, ln_t, 0, ln_pk.
 // Bindings: S0 reads t0 frame + t1 curve; S1 reads t16 stat + t19 bg; S2 reads t16 stat + t17 w; the statistic rounds and
 //   the pixel pass (Balance) read t15 plan + t18 plan2. Order per frame: S0, S1, S2, then the unchanged layer.
 //
 // Per pixel (Balance; m = its brightest channel): plan and plan2.xy sampled BILINEARLY at FineUV (= between zone centres,
 //   border zones held), plan2.z loaded for the pixel's OWN zone (nearest).
 //   w_px = w0_px * (1 - ss(nbLo, nbHi, near_px));   untouched unless w_px > 0, m > 0 and the own zone is a speck zone
-//   is_speck = pk_px > b_px ? ss(0.25, 0.5, (m - b_px) / (pk_px - b_px)) : 0                 (background-relative band)
 //   pull threshold T' = exp(lerp(ln max(t_px, b_px + 0.25 max(pk_px - b_px, 0)), ln t_px, ss(GATE_LO 1, GATE_HI 2, t_px / b_px)))
 //   m >  T'  : mc = min(m, white) (the level the panel SHOWS); out = max(exp(ln mc + w_px * even * (ln T' - ln mc)),
 //              min(b_px, m))   MONOTONE in m (out(T') = T', slope 1 - w_px even >= 0, flat above white);
 //              acts if out < m (1 - PULL_EPS 1e-5)
-//   m <= t_px: out = min(m * exp(ln_g_px * w_px * is_speck), max(t_px, m));                 acts if that factor > 1
-//   t_px < m <= T': untouched
+//   m <= T'  : untouched (nothing is ever brightened)
 //   acts -> rgb * out / m (one scale, hue-preserving); else the pixel is returned BIT-identical.
 //   Consequences: a field whose peaks all lie below keepNits is bit-identical; with the target below / near the sky a star
 //   stops at the bottom of its speck band b + 0.25 (pk - b), so capNits below that is not reached.
-// Settings (CB words 35, 52-65; defaults): on 0 | even 0.8, lift 0, targetGain 1, capNits 0 | strength 1, areaLo 40, areaHi 160,
+// Settings (CB words 35, 52-65; defaults): on 0 | even 0.8, (word 53 unused, 0), targetGain 1, capNits 0 | strength 1, areaLo 40, areaHi 160,
 //   peakHi 0 | nbLo 0.15, nbHi 0.30, reach 2 (0..4), evenReach 8 (0..12) | targetSigma 0 (0..4), keepNits 100 (0..10000).
 // =====================================================================================================================
 
@@ -807,7 +797,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 //     dark sky, so the sky does not protect the stars sitting on it);
 //   spk = has && speck && a_eff < areaHi: the SPECK-ZONE flag (a lit peak that rises above the zone's own background
 //     with a STAR-SIZED area above it — a grainy sky passes the flat rule but reads about half the zone) — the carry,
-//     the lift and the peak field of the plan pass and the own-zone gate of Balance key on it;
+//     the peak field of the plan pass and the own-zone gate of Balance key on it;
 //   arg = the brightest pixel's position inside the zone, ly * zw + lx (un-gated maximum; ties: the pixel nearest a
 //     zone border — mirror-symmetric — then the first in row-major order; StarEdgeKey / StarBetter) — S1's flank test.
 // u0 = (peak, spk, sparse, solid); u1 = (ln b, arg, lit sum, a_eff) — S1 copies ln b into the texture the pixels sample.
@@ -990,8 +980,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 //             the speck zones in its 3x3 neighbourhood x its own non-protection 1 - smoothstep(nbLo, nbHi, own solid
 //             drive): a window / UI zone carries 0, a dark sky zone the full mean. The carry only serves the border
 //             pixels of the neighbouring speck zones (own-zone gate in Balance)
-//   ln_t    = ln(target) (ln(white) where the target is 0), ln_g = lift * (ln_t - ln peak) for a speck zone below its
-//             target (else 0), ln_pk = ln(peak) of a speck zone (ln_t for a zone without a speck: its sky is no "peak")
+//   ln_t    = ln(target) (ln(white) where the target is 0), ln_pk = ln(peak) of a speck zone (ln_t for a zone without a
+//             speck: its sky is no "peak"); plan.z is written 0 (it held the lift, retired 2026-10-26)
 // (2026-10-22, work guide core-speed) The window of starWTex a 16 x 16 group of zones reads — the tile + an apron of E
 // each side, E <= FALD_STAR_EVEN_REACH_MAX 12: 40 x 40 texels — is staged in groupshared memory by the whole group (a few
 // loads per thread) instead of ~300 serial texture loads per thread: the pass was a latency floor of ~38 us at every
@@ -1064,8 +1054,7 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : SV
     float carry = s3 * starStrength / max(n3, 1.0f) * (1.0f - StarSmooth(starNbLo, starNbHi, st.a));   // sparse > 0 only in speck zones
     float wField = spk ? st.b * starStrength : carry;
     float lnT = log(max((target > 0.0f) ? target : white, 1e-12f));
-    float lnG = (spk && peak < target) ? starLift * (lnT - lp) : 0.0f;
-    starPlanOut[id.xy] = float4(wField, lnT, lnG, spk ? lp : lnT);
+    starPlanOut[id.xy] = float4(wField, lnT, 0.0f, spk ? lp : lnT);
 }
 )";
 
@@ -1518,8 +1507,8 @@ inline bool FaldGainBlurFused(float gainSmoothCells, unsigned int sub) {
 //     black = it does not; passthrough when the panel file has no boost LUT.
 //     9 = starfield balancing at a glance, per ZONE (single pixels are invisible): grey level = the zone's weight
 //     w0_field x its protection (a zone WITHOUT a speck shows the weight it carries for its neighbours' border
-//     pixels — its own pixels are never acted on), tinted blue by how far the zone's peak is pulled down and red by
-//     how far it is lifted (ln ratio, 2 stops = full tint); passthrough when the option is off. View 4 stays a pure
+//     pixels — its own pixels are never acted on), tinted blue by how far the zone's peak is pulled down (ln ratio,
+//     2 stops = full tint); passthrough when the option is off. View 4 stays a pure
 //     passthrough of the SOURCE frame.
 //     (10 was the glow fill's view; the fill was removed 2026-10-07.)
 // The vertex shader of the pixel pass: a fullscreen triangle with no vertex buffer and no input
@@ -1579,12 +1568,11 @@ float4 main(PS_INPUT i) : SV_Target {
     if (debugMode == 9) {
         if (starOn == 0u) return src;
         uint2 c9 = ZoneOfPixel(px);
-        float4 zp = starPlanTex.Load(int3((int2)c9, 0));              // w0_field, ln target, ln lift, ln peak
+        float4 zp = starPlanTex.Load(int3((int2)c9, 0));              // w0_field, ln target, 0, ln peak
         float wz = zp.x * (1.0f - StarSmooth(starNbLo, starNbHi, starPlan2Tex.Load(int3((int2)c9, 0)).y));   // x the protection
         float down = wz * starEven * min(zp.y - zp.w, 0.0f);          // ln(new peak / peak) of a zone above its target
-        float up = wz * zp.z;                                         // ... of a lifted zone
-        float tb = saturate(-down / 1.3862944f), tr = saturate(up / 1.3862944f);   // 2 stops = ln 4
-        float3 col9 = wz * float3(1.0f - tb, 1.0f - max(tb, tr), 1.0f - tr);
+        float tb = saturate(-down / 1.3862944f);                      // 2 stops = ln 4
+        float3 col9 = wz * float3(1.0f - tb, 1.0f - tb, 1.0f);
         return float4(col9 * DebugWhite(), 1.0f);
     }
     if (debugMode == 5 || debugMode == 6) {

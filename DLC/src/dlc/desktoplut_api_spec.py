@@ -93,7 +93,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "
                           "fald_tau_fall_ms, fald_delay_frames, fald_temporal_closure, fald_temporal_parity (runtime.fald_temporal; the last "
                           "two absent on builds before 2026-09-20), fald_starfield (bool) + fald_star_even, "
-                          "fald_star_lift, fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
+                          "fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), "
                           "fald_core_mode (0 C / 1 KC2c / 2 KC3 / 4 KC5: the always-on core's rule, default 4 = KC5 — the "
@@ -463,7 +463,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "FALD compensation layer: debug view on the panel (0 corrected image, 1 gain map white/red +/blue -, 2 real "
             "backlight, 3 panel estimate, 4 identity passthrough, 5 pedestal term x100, 6 per-channel-vs-white "
             "influence x100, 7 temporal settling map red rising/blue falling, 8 the black-frame boost's non-black zone "
-            "map, 9 the starfield balancing zone map — grey = zone weight, blue = peak pulled down, red = lifted; not "
+            "map, 9 the starfield balancing zone map — grey = zone weight, blue = peak pulled down; not "
             "persisted) and/or the pedestal mode "
             "(ped_mode 0 = white pedestal, 1 = the FLD2 panel file's per-channel leak colour; persisted, "
             "= the GUI 'Per-channel pedestal' checkbox). At least one of the two.",
@@ -528,7 +528,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "below keep_nits (specks up to ~100 nits make no visible haze: a field below it is left bit-identical), "
             "optionally under cap_nits — by `even` in the log domain (defaults: target_sigma 0 = the geometric mean, even "
             "0.8, keep_nits 100; keep_nits is what spares a dim heavy-tailed star field, target_sigma > 0 is a tunable that "
-            "compresses the outliers only, even < 1 keeps their order), dim specks optionally lifted (`lift`), all under `strength`. Solid content (drive nb_lo..nb_hi) "
+            "compresses the outliers only, even < 1 keeps their order), nothing is ever brightened (`lift` was retired 2026-10-26 and is refused), all under `strength`. Solid content (drive nb_lo..nb_hi) "
             "protects its neighbourhood through a tapered field — `reach` zones fully, one more at half — interpolated "
             "per pixel. Per pixel one hue-preserving scale, only inside zones that hold a speck, never below the zone's "
             "background; zone fields bilinear between zone centres; untouched content bit-identical. It CHANGES the "
@@ -542,7 +542,6 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "even": ApiParamSpec("number", required=False, description="0..1 log-domain pull toward the target (default 0.8)"),
                 "target_sigma": ApiParamSpec("number", required=False, description="0..4 standard deviations of ln peak above the local mean (default 0 = geometric mean)"),
                 "keep_nits": ApiParamSpec("number", required=False, description="0..10000 as-if-white nits: the target never falls below it (default 100; 0 = no floor)"),
-                "lift": ApiParamSpec("number", required=False, description="0..1 (default 0 = cap-only)"),
                 "target_gain": ApiParamSpec("number", required=False, description="0.05..2 (default 1)"),
                 "even_reach": ApiParamSpec("number", required=False, description="integer 0..12 zones (default 8)"),
                 "cap_nits": ApiParamSpec("number", required=False, description="0..10000 as-if-white nits, 0 = none (default 0)"),
@@ -554,7 +553,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                 "nb_lo": ApiParamSpec("number", required=False, description="0..1 solid neighbour drive, full effect at / below (default 0.15)"),
                 "nb_hi": ApiParamSpec("number", required=False, description="0..1, no effect at / above; >= nb_lo (default 0.30)"),
             },
-            {"monitor_mode": "string", "enabled": "boolean", "even": "number", "lift": "number", "target_gain": "number", "target_sigma": "number", "keep_nits": "number",
+            {"monitor_mode": "string", "enabled": "boolean", "even": "number", "target_gain": "number", "target_sigma": "number", "keep_nits": "number",
              "even_reach": "number", "cap_nits": "number", "strength": "number", "area_lo": "number", "area_hi": "number",
              "peak_hi": "number", "reach": "number", "nb_lo": "number", "nb_hi": "number"},
             mutates_state=True,
@@ -603,7 +602,7 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             "cols x rows x 4 float32 each: fald_star_stat.f32 (peak, speck-zone flag, sparse, solid), fald_star_bg.f32 "
             "(ln background of the zone's darkest pixel, the brightest pixel's index ly * zw + lx inside the zone [zw = its own width], lit sum,"
             "a_eff above the background), fald_star_w.f32 (wt = the zone's weight in the target average [0 on a flank zone], "
-            "wt ln peak, flank flag, speck-zone flag), fald_star_plan.f32 (w0_field, ln target, ln lift, ln peak) and "
+            "wt ln peak, flank flag, speck-zone flag), fald_star_plan.f32 (w0_field, ln target, 0 [unused], ln peak) and "
             "fald_star_plan2.f32 (ln background, near = the tapered protection field, speck-zone flag, w) — and `starfield ...` lines "
             "in fald_dump.txt; fald_frame.* stays the SOURCE frame.",
             {

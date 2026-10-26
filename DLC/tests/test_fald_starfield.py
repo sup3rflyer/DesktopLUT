@@ -66,13 +66,10 @@ def test_a_uniform_field_is_left_alone(model):
     assert np.allclose(balance_image(model, img, SP())["img"], img, rtol=1e-12, atol=0.0)
 
 
-def test_even_lift_and_strength_are_strengths(model):
+def test_even_and_strength_are_strengths(model):
     img = model.render(field())
     half = balance_image(model, img, SP(even=0.5))
     assert 130.0 < half["img"].max() < 1800.0
-    lifted = balance_image(model, img, SP(lift=1.0))
-    sel = (lum(img) > 0.0) & (lum(img) < 200.0)
-    assert lum(lifted["img"])[sel].min() >= 100.0 - 1e-9 and lum(lifted["img"])[sel].max() > 100.5
     off = balance_image(model, img, SP(strength=0.0))
     assert np.allclose(off["img"], img, rtol=1e-12, atol=0.0)
 
@@ -301,14 +298,16 @@ def test_a_target_below_the_sky_leaves_the_sky_bit_identical(model, sky):
 
 
 @pytest.mark.parametrize("sky", [0.3, 1.0, 5.0])
-def test_lift_never_touches_the_sky(model, sky):
-    """Before: the transition band toward a star-free `has` zone lifted the sky (1 nit: 1732 raster px up to x1.84)."""
+def test_nothing_is_ever_brightened(model, sky):
+    """The lift was retired 2026-10-26: no pixel ends above its source level, and the sky and the specks at / below the
+    local target stay bit-identical (the lift raised them onto the local mean, x8-x50 on real clips)."""
     img = sky_field(model, sky)
-    out = balance_image(model, img, SP(lift=1.0))
-    sky_px = lum(img) == sky
-    assert np.array_equal(out["img"][:, sky_px], img[:, sky_px])
-    dim = lum(img) == 100.0
-    assert lum(out["img"])[dim].min() > 100.5 and lum(out["img"]).max() < 106.0    # the specks rise onto the local mean
+    out = balance_image(model, img, SP())
+    assert np.all(out["img"] <= img)
+    keep = lum(img) <= 100.0
+    assert np.array_equal(out["img"][:, keep], img[:, keep])
+    with pytest.raises(TypeError):
+        StarfieldParams(lift=1.0)                                                   # the parameter itself is gone
 
 
 def test_a_sky_close_to_the_star_level_with_a_cap_below_it(model):
@@ -317,8 +316,7 @@ def test_a_sky_close_to_the_star_level_with_a_cap_below_it(model):
     even considered (round 3: it counted as speck at m / pk = 0.5 and only the background floor held it). The stars are
     above the pull threshold T' = 50 + 0.25 (100 - 50) = 62.5 (round 6, the monotone pull: with the target below the
     background the threshold is the bottom of the speck band; rounds 3-5 flattened them INTO the sky at 50) — a cap below
-    the sky cannot be met; no hole, nothing brightened, the profile stays monotone. With LIFT the sky is untouched
-    too (round 3 lifted it by up to 3.6 % here, up to x1.67 for 60-nit stars under a 100-nit target)."""
+    the sky cannot be met; no hole, nothing brightened, the profile stays monotone."""
     img = sky_field(model, 50.0)
     sky_px = lum(img) == 50.0
     out = balance_image(model, img, SP(cap_nits=30.0))
@@ -328,9 +326,7 @@ def test_a_sky_close_to_the_star_level_with_a_cap_below_it(model):
     assert np.median(got) == pytest.approx(62.5, rel=0.03) and got.min() > 50.0    # the speck band (rounds 3-5: -> 50, the sky)
     plain = balance_image(model, img, SP())
     assert np.array_equal(plain["img"][:, sky_px], img[:, sky_px]) and 100.0 < lum(plain["img"]).max() < 106.0
-    lifted = balance_image(model, img, SP(lift=1.0))
-    assert np.array_equal(lifted["img"][:, sky_px], img[:, sky_px])               # round 3: up to x1.036 (band relative to 0)
-    assert out["is_speck"][sky_px].max() == 0.0 and out["gate"][sky_px].max() == 0.0
+    assert out["gate"][sky_px].max() == 0.0
 
 
 # ------------------------------------------------------------------------------------------------ round 4: grain, soft stars, bright skies
@@ -368,9 +364,6 @@ def test_a_grainy_sky_behaves_like_a_flat_one(model, sky, grain):
         got = float(out["img"][0, y, x])
         assert abs(got / flat - 1.0) < 0.04, (where, got, flat)                        # the flat-sky number within a few %
         assert np.array_equal(out["img"][:, ~star_px], img[:, ~star_px])               # every non-star pixel: BIT-identical
-        lifted = balance_image(model, img, SP(lift=1.0))
-        assert np.array_equal(lifted["img"][:, ~star_px], img[:, ~star_px])            # ... under lift too
-        assert lum(lifted["img"])[star_px].min() >= 100.0                              # while the specks rise
 
 
 def test_a_non_star_shape_inside_a_star_field_is_never_touched(model):
@@ -450,24 +443,11 @@ def test_a_target_below_a_bright_sky_still_leaves_the_sky_bit_identical(model):
     at the bottom of their speck band, 50 + 0.25 x 50 = 62.5 nits (rounds 3-5: at the 50-nit sky)."""
     img = sky_field(model, 50.0)
     sky_px = lum(img) == 50.0
-    for sp in (SP(cap_nits=25.0), SP(target_gain=0.01), SP(cap_nits=25.0, lift=1.0)):
+    for sp in (SP(cap_nits=25.0), SP(target_gain=0.01)):
         out = balance_image(model, img, sp)
         assert np.array_equal(out["img"][:, sky_px], img[:, sky_px])
         got = lum(out["img"])[~sky_px]
         assert np.median(got) == pytest.approx(62.5, rel=0.06) and got.min() > 50.0 and got.max() < 0.26 * model.p.white_nits
-
-
-@pytest.mark.parametrize("sky,dim", [(20.0, 60.0), (50.0, 100.0)])
-def test_lift_on_a_sky_close_to_the_star_level_leaves_the_sky_alone(model, sky, dim):
-    """F: the speck band is relative to the BACKGROUND: (m - b) / (peak - b). A 20-nit sky under 60-nit stars sits at 33 %
-    of the peak but at 0 % of the way from the background - no speck pixel (round 3 lifted such a sky by up to x1.67)."""
-    img = sky_field(model, sky, dim=dim)
-    out = balance_image(model, img, SP(lift=1.0))
-    sky_px = lum(img) == sky
-    assert np.array_equal(out["img"][:, sky_px], img[:, sky_px])                        # 0 sky pixels changed
-    specks = lum(img) == dim
-    assert out["w"][14, 14] == pytest.approx(1.0)
-    assert lum(out["img"])[specks].min() > dim * 1.01 and lum(out["img"])[specks].max() < out["target"][10:20, 10:20].max() * 1.001
 
 
 # ------------------------------------------------------------------------------------------------ round 5: tapered protection
@@ -568,25 +548,25 @@ def test_the_pull_is_monotone_in_the_pixel_level():
         m = np.linspace(b, pk, 4001)
         for w in (1.0, 0.6):
             for even in (1.0, 0.5):
-                r = pixel_rule(m, w, t, b, pk, 0.0, even)
+                r = pixel_rule(m, w, t, b, pk, even)
                 out = r["out"]
                 assert np.all(np.diff(out) >= -1e-9 * out[:-1]), (b, t, pk, w, even)
                 assert np.all(out <= m * (1 + 1e-12)) and np.all(out >= b * (1 - 1e-12))
                 tp = float(r["pull_threshold"][0])
                 assert t <= tp <= max(t, b + 0.25 * (pk - b)) * (1 + 1e-12)
                 assert np.array_equal(out[m <= tp], m[m <= tp])                        # untouched up to the threshold
-    full = pixel_rule(np.array([1800.0, 900.0, 360.0, 150.0, 90.0]), 1.0, 100.0, 1.0, 1800.0, 0.0, 1.0)      # g = 1: T' = t
+    full = pixel_rule(np.array([1800.0, 900.0, 360.0, 150.0, 90.0]), 1.0, 100.0, 1.0, 1800.0, 1.0)      # g = 1: T' = t
     assert np.allclose(full["out"], [100.0, 100.0, 100.0, 100.0, 90.0]) and float(full["pull_threshold"][0]) == pytest.approx(100.0)
-    low = pixel_rule(np.array([10.0, 20.0, 32.5, 40.0, 100.0]), 1.0, 8.0, 10.0, 100.0, 0.0, 1.0)             # target below the sky
+    low = pixel_rule(np.array([10.0, 20.0, 32.5, 40.0, 100.0]), 1.0, 8.0, 10.0, 100.0, 1.0)             # target below the sky
     assert float(low["pull_threshold"][0]) == pytest.approx(32.5) and np.allclose(low["out"], [10.0, 20.0, 32.5, 32.5, 32.5])
     assert not low["acts"][:3].any() and low["acts"][3:].all()
 
 
-def test_lift_is_monotone_too():
+def test_specks_below_the_target_are_untouched():
     from dlc.fald.starfield import pixel_rule
     m = np.linspace(1.0, 60.0, 2001)
-    out = pixel_rule(m, 1.0, 100.0, 1.0, 60.0, np.log(100.0 / 60.0), 1.0)["out"]
-    assert np.all(np.diff(out) >= -1e-9 * out[:-1]) and out[-1] == pytest.approx(100.0) and out[0] == 1.0
+    r = pixel_rule(m, 1.0, 100.0, 1.0, 60.0, 1.0)
+    assert np.array_equal(r["out"], m) and not r["acts"].any()                     # the retired lift raised them to 100
 
 
 def flank_scene(model, sky=0.0):

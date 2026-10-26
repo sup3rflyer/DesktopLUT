@@ -380,7 +380,7 @@ TEST_CASE("FALD starfield balancing: defaults follow the DLC reference and the c
     // dlc/fald/starfield.py StarfieldParams (DLC tests/test_fald_transfer.py pins the same numbers against types.h)
     FaldStarfieldSettings d;
     CHECK_FALSE(d.enabled);                                     // experimental: default OFF
-    CHECK(d.even == 0.8f); CHECK(d.lift == 0.0f); CHECK(d.targetGain == 1.0f); CHECK(d.evenReach == 8u);
+    CHECK(d.even == 0.8f); CHECK(d.targetGain == 1.0f); CHECK(d.evenReach == 8u);
     CHECK(d.targetSigma == 0.0f);                               // round 7: the geometric mean (the spread term is a tunable), even 0.8
     CHECK(d.keepNits == 100.0f);                                // ... and an absolute floor: no haze to fix below ~100 nits
     CHECK(d.capNits == 0.0f); CHECK(d.strength == 1.0f); CHECK(d.areaLo == 40.0f); CHECK(d.areaHi == 160.0f);
@@ -393,12 +393,12 @@ TEST_CASE("FALD starfield balancing: defaults follow the DLC reference and the c
 
     FaldStarfieldSettings s;
     s.enabled = true;
-    s.even = 3.0f; s.lift = -1.0f; s.targetGain = 0.0f; s.evenReach = 99; s.capNits = 1.0e9f; s.strength = 7.0f;
+    s.even = 3.0f; s.targetGain = 0.0f; s.evenReach = 99; s.capNits = 1.0e9f; s.strength = 7.0f;
     s.targetSigma = 9.0f; s.keepNits = 50000.0f;
     s.areaLo = 500.0f; s.areaHi = 100.0f; s.peakHi = -5.0f; s.reach = 40; s.nbLo = 0.8f; s.nbHi = 0.2f;
     FaldStarfieldClamp(s);
     CHECK(s.enabled);                                           // the clamp never touches the switch
-    CHECK(s.even == 1.0f); CHECK(s.lift == 0.0f); CHECK(s.targetGain == 0.05f); CHECK(s.targetSigma == 4.0f); CHECK(s.keepNits == 10000.0f);
+    CHECK(s.even == 1.0f); CHECK(s.targetGain == 0.05f); CHECK(s.targetSigma == 4.0f); CHECK(s.keepNits == 10000.0f);
     CHECK(s.evenReach == FALD_STAR_EVEN_REACH_MAX); CHECK(FALD_STAR_EVEN_REACH_MAX == 12u);
     CHECK(s.capNits == 10000.0f); CHECK(s.strength == 1.0f);
     CHECK(s.areaLo == 500.0f); CHECK(s.areaHi == 500.0f);       // the pair stays ordered (hi >= lo)
@@ -1658,7 +1658,6 @@ TEST_CASE("FALD rows: starfield fields clamp to their ranges, views out of range
     CHECK(t.strength == d.strength);
     CHECK(t.keepNits == d.keepNits);
     CHECK(t.evenReach == d.evenReach);
-    CHECK(t.lift == d.lift);
     CHECK(t.enabled == d.enabled);
 
     FaldSettings f;
