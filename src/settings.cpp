@@ -480,8 +480,8 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
         swprintf_s(permBuf, L"%d", (int)mhc.activePerm);
         IniWriteString(section, (p + L"MHCActivePerm").c_str(), permBuf, iniPath);
         // The matrix maths revision the cached profiles were baked with; a re-bake still owed keeps the
-        // old revision on disk so it is not lost to a save before it happens.
-        swprintf_s(permBuf, L"%d", mhc.matrixRebakePending ? kMhcMatrixRev - 1 : kMhcMatrixRev);
+        // revision the file carried on disk so it is not lost to a save before it happens.
+        swprintf_s(permBuf, L"%d", mhc.matrixRebakePending ? mhc.matrixRevOnDisk : kMhcMatrixRev);
         IniWriteString(section, (p + L"MHCMatrixRev").c_str(), permBuf, iniPath);
     }
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
@@ -781,11 +781,21 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
     // the cached variants (by name; the files go to the startup orphan cleanup) so each is re-baked on
     // demand, and re-bake the active one once — a swap between an old and a new variant would otherwise
     // change SDR brightness / the HDR white.
+    //
+    // Revision 3, HDR only: a profile stamped below it may predate the HDR matrix basis (2026-09-24: every
+    // HDR matrix that is not the identity was emitted unconjugated, leaking red into green) and the HDR
+    // curve's peak rule. Builds before revision 3 stamped such profiles "2" without re-baking them, and
+    // which maths a given profile carries cannot be told from the settings — while a variant baked now (the
+    // reported-peak, desktop-gamma and stage-bypass variants) uses the current maths. So every HDR profile
+    // below revision 3 is re-baked once, whatever its matrix; one that was already current comes out with
+    // the same bytes. Its cached variants are NOT forgotten here: the re-bake drops them when it succeeds
+    // (ReplaceInstalledMhcProfile), and while it cannot run (the imported source file is missing) no new
+    // variant can be baked either, so the old set stays whole and its swaps keep working.
     {
         const int rev = GetPrivateProfileIntW(section, (p + L"MHCMatrixRev").c_str(), 1, iniPath);
         const bool wbMovesWhite = mhc.whiteBalanceEnabled &&
             !(fabsf(mhc.whiteBalanceWx - 0.3127f) < 0.001f && fabsf(mhc.whiteBalanceWy - 0.3290f) < 0.001f);
-        if (rev < kMhcMatrixRev && wbMovesWhite) {
+        if (rev < 2 && wbMovesWhite) {
             for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
                 if (k == mhc.activePerm) continue;
                 mhc.permNames[k].clear();
@@ -793,6 +803,9 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
             }
             mhc.matrixRebakePending = (mhc.activePerm & MHCSettings::PERM_WB) && !mhc.profileName.empty();
         }
+        if (rev < kMhcMatrixRev && isHDR && !mhc.profileName.empty()) mhc.matrixRebakePending = true;
+        // What a save writes back while the re-bake is still owed: the stamp as it was.
+        mhc.matrixRevOnDisk = rev < 1 ? 1 : (rev >= kMhcMatrixRev ? kMhcMatrixRev - 1 : rev);
     }
 
     // Correction grayscale (fine-tuning on top of base)

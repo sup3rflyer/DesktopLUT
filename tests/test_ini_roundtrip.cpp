@@ -118,6 +118,10 @@ TEST_CASE("INI roundtrip: a real INI loads and saves back with every key and val
             } else if (s->second.at(k) != v && _wcsicmp(sec.c_str(), L"General") == 0 && _wcsicmp(k.c_str(), L"IniVersion") == 0 &&
                        s->second.at(k) == std::to_wstring(kIniVersion)) {
                 MESSAGE("UPGRADE [General] IniVersion " << Narrow(v) << " -> " << kIniVersion);
+            } else if (s->second.at(k) != v && k.size() > 12 && _wcsicmp(k.c_str() + k.size() - 12, L"MHCMatrixRev") == 0 &&
+                       s->second.at(k) == std::to_wstring(kMhcMatrixRev)) {
+                // The build's own stamp on a profile that needs no re-bake (one that does keeps its old stamp).
+                MESSAGE("UPGRADE [" << Narrow(sec) << "] " << Narrow(k) << " " << Narrow(v) << " -> " << kMhcMatrixRev);
             } else if (s->second.at(k) != v) {
                 MESSAGE("CHANGED [" << Narrow(sec) << "] " << Narrow(k) << ": " << Narrow(v) << " -> " << Narrow(s->second.at(k)));
                 changed++;

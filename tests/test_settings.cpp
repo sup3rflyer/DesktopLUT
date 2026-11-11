@@ -1598,7 +1598,7 @@ TEST_CASE("MHC settings: profiles baked by older white-balance maths are forgott
         CHECK(mhc.permNames[5].empty());          // other variants re-baked on demand
         // A save before the re-bake keeps the old revision on disk
         SaveMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
-        CHECK(GetPrivateProfileIntW(L"Display0", L"SDR_MHCMatrixRev", 0, ini.c_str()) == kMhcMatrixRev - 1);
+        CHECK(GetPrivateProfileIntW(L"Display0", L"SDR_MHCMatrixRev", 0, ini.c_str()) == 1);
         mhc.matrixRebakePending = false;
         SaveMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
         CHECK(GetPrivateProfileIntW(L"Display0", L"SDR_MHCMatrixRev", 0, ini.c_str()) == kMhcMatrixRev);
@@ -1619,6 +1619,90 @@ TEST_CASE("MHC settings: profiles baked by older white-balance maths are forgott
         LoadMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
         CHECK_FALSE(mhc.matrixRebakePending);
         CHECK_FALSE(mhc.permNames[5].empty());
+    }
+}
+
+// An upgrade from a release that predates the HDR matrix basis (v2.2.0): its HDR profiles carry no stamp, and
+// builds before revision 3 stamped them "2" without re-baking. A variant baked by this build (reported peak,
+// desktop gamma, a stage bypass) uses the current maths, so the active profile is re-baked once — white balance
+// or not. The cached variants stay until that re-bake succeeds (it drops them): with the source file missing
+// nothing can be re-baked, and the old set must keep working.
+TEST_CASE("MHC settings: an HDR profile below matrix revision 3 is re-baked once, whatever its white balance") {
+    auto writeSection = [](const wchar_t* ini, const wchar_t* rev) {
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCEnabled", L"true", ini);
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCProfilePath", L"C:\\color\\DesktopLUT_Mon0_HDR_P0_1.icm", ini);
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCActivePerm", L"0", ini);
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCPermPath0", L"C:\\color\\DesktopLUT_Mon0_HDR_P0_1.icm", ini);
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCPermPath2", L"C:\\color\\DesktopLUT_Mon0_HDR_P2_1.icm", ini);
+        if (rev) WritePrivateProfileStringW(L"Display0", L"HDR_MHCMatrixRev", rev, ini);
+    };
+    {   // no stamp, white balance off: the active one is re-baked, the cache waits for it
+        TempIni ini;
+        writeSection(ini.c_str(), nullptr);
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());
+        CHECK(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[0].empty());    // stays associated until re-baked
+        CHECK_FALSE(mhc.permNames[2].empty());    // dropped by the re-bake itself, not by the load
+        SaveMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());   // a save before the re-bake keeps it owed
+        CHECK(GetPrivateProfileIntW(L"Display0", L"HDR_MHCMatrixRev", 0, ini.c_str()) == 1);
+        MHCSettings again;
+        LoadMHCSettings(L"Display0", L"HDR_", again, ini.c_str());
+        CHECK(again.matrixRebakePending);
+        again.matrixRebakePending = false;
+        SaveMHCSettings(L"Display0", L"HDR_", again, ini.c_str());
+        CHECK(GetPrivateProfileIntW(L"Display0", L"HDR_MHCMatrixRev", 0, ini.c_str()) == kMhcMatrixRev);
+        MHCSettings done;
+        LoadMHCSettings(L"Display0", L"HDR_", done, ini.c_str());
+        CHECK_FALSE(done.matrixRebakePending);
+    }
+    {   // stamped 2 by a build that never re-baked HDR: owed too, and a save keeps the 2 until it is done
+        TempIni ini;
+        writeSection(ini.c_str(), L"2");
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());
+        CHECK(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[2].empty());
+        SaveMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());
+        CHECK(GetPrivateProfileIntW(L"Display0", L"HDR_MHCMatrixRev", 0, ini.c_str()) == 2);
+    }
+    {   // unstamped with a white balance that moves white: the older rule forgets the cache as well
+        TempIni ini;
+        writeSection(ini.c_str(), nullptr);
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCWhiteBalanceEnabled", L"true", ini.c_str());
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCWhiteBalanceWx", L"0.3457", ini.c_str());
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCWhiteBalanceWy", L"0.3585", ini.c_str());
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());
+        CHECK(mhc.matrixRebakePending);           // HDR: owed even though the active variant has no PERM_WB
+        CHECK(mhc.permNames[2].empty());
+    }
+    {   // current stamp: nothing to do, the cache stays
+        TempIni ini;
+        writeSection(ini.c_str(), L"3");
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());
+        CHECK_FALSE(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[2].empty());
+    }
+    {   // no profile installed: nothing to re-bake
+        TempIni ini;
+        WritePrivateProfileStringW(L"Display0", L"HDR_MHCEnabled", L"false", ini.c_str());
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"HDR_", mhc, ini.c_str());
+        CHECK_FALSE(mhc.matrixRebakePending);
+    }
+    {   // the same unstamped section in SDR without white balance: SDR's maths is unchanged, nothing to do
+        TempIni ini;
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCEnabled", L"true", ini.c_str());
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCProfilePath", L"C:\\color\\DesktopLUT_Mon0_SDR_P0_1.icm", ini.c_str());
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCActivePerm", L"0", ini.c_str());
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCPermPath0", L"C:\\color\\DesktopLUT_Mon0_SDR_P0_1.icm", ini.c_str());
+        WritePrivateProfileStringW(L"Display0", L"SDR_MHCPermPath4", L"C:\\color\\DesktopLUT_Mon0_SDR_P4_1.icm", ini.c_str());
+        MHCSettings mhc;
+        LoadMHCSettings(L"Display0", L"SDR_", mhc, ini.c_str());
+        CHECK_FALSE(mhc.matrixRebakePending);
+        CHECK_FALSE(mhc.permNames[4].empty());
     }
 }
 

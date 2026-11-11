@@ -1076,7 +1076,7 @@ void CreateGUILayout(HWND hwnd) {
         std::cout << "[Monitor identity] a display could not be identified at startup; retrying" << std::endl;
         SetTimer(hwnd, MONITOR_IDENTITY_TIMER_ID, MONITOR_IDENTITY_RETRY_MS, nullptr);
     }
-    // Profiles baked by an older build's white-balance matrix maths: re-bake once things have settled.
+    // Profiles baked by an older build's matrix maths: re-bake once things have settled.
     if (AnyMhcMatrixRebakePending()) SetTimer(hwnd, MHC_MATRIX_REBAKE_TIMER_ID, MHC_MATRIX_REBAKE_DELAY_MS, nullptr);
 
     // First run on an INI written in the old index-keyed format: persist the migration

@@ -75,7 +75,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR);
 enum class MhcRegenResult { NoProfile, Installed, Failed };
 MhcRegenResult RegenerateMhcIfActive(int monitorIndex, bool isHDR);
 
-// Profiles loaded with matrixRebakePending (baked by older white-balance matrix maths): any on a live
+// Profiles loaded with matrixRebakePending (baked by older matrix maths): any on a live
 // display? / re-bake them now. GUI thread. False when the MHC maintenance lock was busy (retry later).
 // The 15 s verify found the ACTIVE profile's .icm gone (T1.16): rebuild that profile — its active
 // permutation — under a new name. Only while `missingName` is still the active profile and still missing

@@ -1151,6 +1151,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         // Clear all old cached permutation profiles (base data changed)
         ClearPermCache(mhc, monitorIndex, isHDR, false);
         mhc.enabled = true;
+        mhc.matrixRebakePending = false;   // baked just now, by this build's maths
         mhc.profilePath = profilePath;
         mhc.profileName = profileName;
         // Describes the imported curve; a grayscale-bypassed bake carries none and must not erase it.
@@ -1239,6 +1240,7 @@ static bool ReplaceInstalledMhcProfile(int monitorIndex, bool isHDR, const MHCSe
         // Clear all cached permutation profiles (base data changed, variants are stale)
         ClearPermCache(mhc, monitorIndex, isHDR, false);
         mhc.enabled = true;
+        mhc.matrixRebakePending = false;   // whatever asked for this bake, it carries this build's maths
         mhc.profilePath = std::wstring(sysDir2) + L"\\spool\\drivers\\color\\" + newProfileName;
         mhc.profileName = newProfileName;
         if (!(perm & MHCSettings::PERM_NOGRAY)) mhc.hasPerChannelTRC = params.hasPerChannelTRC || params.hasPrecomputedCorrection;
@@ -1338,7 +1340,9 @@ bool RebakePendingMhcProfiles() {
             {
                 std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
                 const auto& m = isHDR ? g_gui.monitorSettings[i].hdrMHC : g_gui.monitorSettings[i].sdrMHC;
-                pending = m.matrixRebakePending;
+                // A named but switched-off profile is out of scanout (an identity stands in): a re-bake would
+                // install it and switch it on. It stays owed (saved as the old revision) until it is on again.
+                pending = m.matrixRebakePending && m.enabled;
             }
             if (!pending) continue;
             // Same guard as the desktop-gamma re-bake: never install a fresh profile under the processing
@@ -1346,7 +1350,7 @@ bool RebakePendingMhcProfiles() {
             std::unique_lock<std::mutex> maintenance(g_mhcMaintenanceMutex, std::try_to_lock);
             if (!maintenance.owns_lock()) return false;
             std::wcout << L"[MHC] Monitor " << i << (isHDR ? L" HDR" : L" SDR")
-                       << L": re-baking the profile with the current white-balance matrix maths" << std::endl;
+                       << L": re-baking the profile with the current matrix maths" << std::endl;
             if (RegenerateMhcIfActive(i, isHDR) != MhcRegenResult::Failed) {
                 std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
                 auto& m = isHDR ? g_gui.monitorSettings[i].hdrMHC : g_gui.monitorSettings[i].sdrMHC;

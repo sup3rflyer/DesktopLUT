@@ -1037,9 +1037,12 @@ struct MHCSettings {
     // map setting resolved against what runs: ReconcileWindowsToneMap). ComputeMhcPermutation bakes it in
     // (PERM_PEAK_MAX), so a re-bake installs the variant the reconcile would swap to.
     bool reportPeakMax = false;
-    // Runtime: the active profile was baked by a build whose white-balance matrix maths is older than
-    // this one (INI MHCMatrixRev < kMhcMatrixRev) — re-baked once at startup (RebakePendingMhcProfiles).
+    // Runtime: the active profile was baked by a build whose matrix maths is older than this one (INI
+    // MHCMatrixRev < kMhcMatrixRev: white balance in either mode, any HDR profile) — re-baked once at
+    // startup (RebakePendingMhcProfiles).
     bool matrixRebakePending = false;
+    // Runtime: the INI's MHCMatrixRev while that re-bake is owed (a save writes it back unchanged).
+    int matrixRevOnDisk = 1;
 
     // Display metadata for installed profile (computed at Apply time, persisted)
     std::wstring metaPrimaries;  // "sRGB", "Rec.709", "Custom", "P3-D65", etc.
@@ -1098,8 +1101,10 @@ constexpr int kMaxDisplaySlots = 256;
 
 // Revision of the MHC matrix maths cached / installed profiles were baked with (INI MHCMatrixRev).
 // 2 = SDR white-balance target kept reachable at full drive + HDR white-balance gains in the native
-// basis (2026-10-07). Bump when a change alters the bake of existing settings.
-constexpr int kMhcMatrixRev = 2;
+// basis (2026-10-07). 3 = every HDR profile known to carry the HDR matrix basis of 2026-09-24 (revision 2
+// was stamped on HDR profiles without re-baking them). Bump when a change alters the bake of existing
+// settings.
+constexpr int kMhcMatrixRev = 3;
 
 // GUI state
 struct GUIState {
