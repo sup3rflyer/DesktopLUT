@@ -361,6 +361,8 @@ were not measured get no trim.
   With it on, the readings show the trim's residual, not the panel's response.
 - Record a finished run: `python -m dlc.refresh_trim record --run <dir>` prints what would be written and any
   problems; add `--write` to store it. A run with problems is not recorded.
+- The trim is off by default: the human switches it on in the REFRESH TRIM row (or `layers.set` with
+  `refresh_trim: true`).
 - DesktopLUT reads the DIP again on its next refresh-rate switch, on *RELOAD* in the REFRESH TRIM row (**PIPELINE**
   → **GRAYSCALE**, HDR side), or on a `layers.set` with `refresh_trim`. `state.get` → `refresh_trim` says what is
   applied.

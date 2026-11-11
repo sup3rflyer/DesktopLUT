@@ -95,7 +95,7 @@ This correction stays active at the GPU level, even when DesktopLUT is not runni
 2. Generate a .cube file (33³ or 65³) with your calibration software while MHC is enabled.
 3. On **PIPELINE**, pick the mode (HDR or SDR), click **3D LUT**, then **BROWSE…** and choose the file.
 
-With DWM Hook mode on (Settings → **DWM HOOK**), the 3D LUT is applied inside DWM without an overlay.
+With DWM Hook mode on (Settings → **DWM HOOK**; the default on Windows 11), the 3D LUT is applied inside DWM without an overlay.
 
 ### 4. HDR tone mapping
 1. On **PIPELINE**, select the display's HDR side and click **TONE MAP**. Switch it on.
@@ -134,9 +134,8 @@ FALD compensation is an experimental layer for full-array local-dimming LCDs (mi
 - So far it has been fitted and checked on one mini-LED monitor only. Results on other panels are unverified.
 - It does not apply to OLED, to edge-lit LCDs, or to monitors without local dimming.
 - It runs in HDR, and in SDR when Windows "Automatically manage color for apps" is on. Each mode has its own panel file.
-- To add it: on **PIPELINE**, pick the mode (HDR or SDR), click **+ FALD**, then **BROWSE…** under ADD FALD and choose the panel file. The stage then has its own switch and these rows: **PANEL FILE** (BROWSE…, RELOAD, CLEAR), **PEDESTAL**, **GPU**, **LED LAG**, **FLANK FADE**, **STARFIELD**, **STAR TARGET** and **VIEW**.
+- To add it: on **PIPELINE**, pick the mode (HDR or SDR), click **+ FALD**, then **BROWSE…** under ADD FALD and choose the panel file. The stage then has its own switch and these rows: **PANEL FILE** (BROWSE…, RELOAD, CLEAR), **PEDESTAL**, **GPU**, **LED LAG**, **STARFIELD**, **STAR TARGET** and **VIEW**.
 - The correction is built to stay on all day. On a still desktop only the zones that changed are recomputed. The **GPU** row shows the layer's GPU time against its budget (15 % of the refresh interval). On a GPU that cannot keep up, the backlight model is updated less often (the row shows **CAPPED**); the picture stays corrected.
-- **FLANK FADE** (experimental, off by default) fades the correction on smooth, steep edges to reduce rings. It was tuned and judged on one mini-LED monitor only. It needs about 500 MB of video memory at 4K. It pauses itself (**PAUSED**) when the GPU cannot run it in time, and it does not start on integrated graphics.
 - **STARFIELD** (experimental, off by default) evens out scattered small highlights, such as a star field, so their zones do not haze unevenly. It only pulls peaks down; it never brightens.
 - **VIEW** shows what the layer computes in place of the picture (the gain map, the modelled backlight and others), for diagnosis. DesktopLUT's own windows keep the normal picture. **Esc** or the tray's "End FALD view" ends it. A view is never saved.
 - Panels whose zones are not a whole number of pixels (for example 48×24 zones on 2560×1440) can have a panel file too.
@@ -157,7 +156,7 @@ Click the icon to open the window. Right-click for Show, Classic interface, Susp
 
 ## DWM Hook Mode
 
-When enabled (Settings → **DWM HOOK**; off by default), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. This means:
+When enabled (Settings → **DWM HOOK**), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. On a new installation it is on for Windows 11 and off for Windows 10. Nothing is injected until a display has a 3D LUT, tone mapping or FALD configured. If the hook will not stay attached on your system, DesktopLUT switches DWM Hook mode off by itself, says so, and applies your corrections with the overlay instead. This means:
 - No extra overlay window — 3D LUT and tonemapping are fully overlay-free
 - No Desktop Duplication capture overhead
 - No TOPMOST overlay window (eliminates the G-Sync tearline issue from overlay mode)
@@ -174,7 +173,7 @@ Precise neutral-tone adjustment, baked into the MHC ICC profile for zero-latency
 - Uses piecewise linear interpolation.
 - Separate handling for SDR (sRGB gamma space) and HDR (PQ domain, per-channel Rec.2020).
 - **GAMMA 2.4** (SDR): shows a gamma 2.2 calibration as pure gamma 2.4 (BT.1886) on the whole desktop.
-- **REFRESH TRIM** (HDR, on by default): some panels are a few percent brighter at lower refresh rates, such as the 24p video rates. When the display's DLC record holds a refresh-rate measurement, DesktopLUT swaps in a profile trimmed for the rate the display runs at, so greys keep the brightness of the 60 Hz calibration. Rates that were not measured get no trim. Without a measurement it does nothing. **RELOAD** reads the DLC record again.
+- **REFRESH TRIM** (HDR, off by default): some panels are a few percent brighter at lower refresh rates, such as the 24p video rates. Switched on, and when the display's DLC record holds a refresh-rate measurement, DesktopLUT swaps in a profile trimmed for the rate the display runs at, so greys keep the brightness of the 60 Hz calibration. Rates that were not measured get no trim. Without a measurement it does nothing. **RELOAD** reads the DLC record again.
 
 ## HDR tone mapping
 
@@ -217,7 +216,7 @@ Turn hotkeys on or off in Settings → **HOTKEYS**. To change a key letter, clos
 - Some UI elements (such as Start menu animations) may remain uncorrected
 - DWM Hook Mode disables DirectFlip/iFlip when LUT or tonemapping is active — fullscreen/borderless games lose VRR (use Passthrough Mode to restore it for specific apps)
 - DWM Hook Mode is experimental and may need repair after Windows updates
-- DWM Hook Mode is tuned for Windows 11 and can be unstable on Windows 10 (the hook may repeatedly detach, briefly flashing the screen); DesktopLUT now detects this and disables the hook automatically after a few attempts. If this happens, turn off DWM Hook Mode in Settings and use overlay mode instead.
+- DWM Hook Mode is tuned for Windows 11 and can be unstable on Windows 10 (the hook may repeatedly detach, briefly flashing the screen); DesktopLUT detects this, switches DWM Hook Mode off after a few attempts and continues in overlay mode. On Windows 10 a new installation starts in overlay mode.
 - DWM Hook mode, HDR dither and LUT interpolation are global settings, not per display
 - The DWM hook handles up to 8 displays
 - With Windows ACM on, SDR colors outside sRGB are clipped before the SDR 3D LUT

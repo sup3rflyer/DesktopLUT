@@ -199,8 +199,8 @@ HDR_MHCPermDgWhite2=116.0000
 ; (absent = none). A variant whose stamp is not what the display's live rate wants is swapped from the trim stash or
 ; re-baked. The trim's data is the display's DLC DIP (DLC\dip_store.json, refresh_response), never the INI.
 HDR_MHCPermTrim2=3f6c0a1d9e2b4c57
-; The trim's switch, written only when off (absent = on: a DIP refresh response is applied)
-HDR_MHCRefreshTrim=0
+; The trim's switch, written only when on (absent = off, the default)
+HDR_MHCRefreshTrim=1
 ```
 
 ## Refresh-Rate Trim (HDR MHC)
@@ -232,7 +232,7 @@ screen, the DIP section). A refresh-response measurement must run with `layers.s
 
 ## DWM Hook Mode
 
-When `DwmHookMode=1` (Settings → **DWM HOOK**; off by default), 3D LUTs and HDR tonemapping are applied by injecting `DwmHook.dll` into `dwm.exe` instead of using the Desktop Duplication overlay. This is overlay-free — no extra window, no capture latency.
+When `DwmHookMode=1` (Settings → **DWM HOOK**; without the key: on for Windows 11, off for Windows 10), 3D LUTs and HDR tonemapping are applied by injecting `DwmHook.dll` into `dwm.exe` instead of using the Desktop Duplication overlay. This is overlay-free — no extra window, no capture latency.
 
 **How it works**:
 1. When a display needs the live layers, `dwm_inject.cpp` elevates its thread to SYSTEM (it impersonates a system process's token), stages the DLL and the LUT files under `%SYSTEMROOT%\Temp\` (`DesktopLUT_luts\`), and injects the DLL via `CreateRemoteThread(LoadLibraryW)`.
@@ -481,7 +481,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   could run: not on the SDR side of a display in legacy SDR); selecting it opens **ADD FALD**, whose
   **PANEL FILE › BROWSE…** loads the first file. With a file the stage carries the header switch (on / off) and
   the rows PANEL FILE (BROWSE… / RELOAD / CLEAR — clear takes the file away and switches the layer off),
-  PEDESTAL, GPU (a readout, see the rate cap below), LED LAG, FLANK FADE, STARFIELD, STAR TARGET and VIEW; all but
+  PEDESTAL, GPU (a readout, see the rate cap below), LED LAG, STARFIELD, STAR TARGET and VIEW; all but
   PANEL FILE, GPU and the switch apply to HDR and SDR at once. Classic window: the Corrections tab's *Enable* + *panel file* row per mode, with the
   same shared rows below it.
 - **Needs a per-panel parameter file** (INI `HDR_FaldParamsPath` / `SDR_FaldParamsPath`), produced by
@@ -535,7 +535,8 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   show on a static desktop.
 - Cost: four small compute passes on the zone grid (48×48 zones × 2 sub-cells, for example) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
-- **Flank fade** (experimental, default off; `shared/fald_fade.h`): fades the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside
+- **Flank fade** (experimental, default off, **no control in either window since 3.0**: it is switched by the INI or
+  the pipe, and the new interface shows its FLANK FADE row only while it is on; `shared/fald_fade.h`): fades the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside
   the soft knee's reach, keeps a small dark object's own edge from lending fade to the lit floor round it (no bright halo
   round a lamp head next to a glow), and low-passes the fade over content frames along the content's motion (phase
   correlation + a cut test). INI per

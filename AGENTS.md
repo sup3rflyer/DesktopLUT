@@ -1,8 +1,3 @@
-<!-- DRAFT for the owner's review. Publishing an assistant guide is the owner's call.
-     Checked against the tree on 2026-11-11: file names, identifiers, build and test commands, INI and pipe names.
-     Not checked by running anything: the behaviour notes in §7 and §8 (they come from the working notes).
-     CHECK markers below are open questions for the owner. -->
-
 # Working on DesktopLUT (for AI assistants and people)
 
 This file is for anyone changing DesktopLUT's code, including an AI coding assistant working for a user. Read it
@@ -42,7 +37,7 @@ Design goals, in order of how often they decide a change:
 
 ## 2. Ground rules before you run anything
 
-- **Test in overlay mode first** (Settings → DWM HOOK off, which is also the default) for anything the hook also does. Only then test in hook
+- **Test in overlay mode first** (Settings → DWM HOOK off; hook mode is the default on Windows 11) for anything the hook also does. Only then test in hook
   mode. Never test a hook change on a desktop the user cannot afford to lose for a few seconds.
 - **MHC profiles are system-wide.** `DesktopLUT_*.icm` files live in the Windows color directory and stay associated
   after exit. Back up the user's `DesktopLUT.ini` (next to the exe) before testing a build.
@@ -210,9 +205,6 @@ every injected state is lost.
 - Pacing problems under hardware-accelerated GPU scheduling (HAGS) with DWM composing a heavy window happen with the
   DLL inert too. They are not a hook defect.
 
-<!-- CHECK: the local repair guide (DWM_HOOK_REPAIR.md: diagnosis, finding new patterns and offsets, the breakage
-     history, symptom table) is gitignored. It is mostly generic; publish a sanitized copy and link it here? -->
-
 ## 8. Gotchas that have caused real bugs
 
 **MHC profiles**
@@ -299,7 +291,8 @@ pre-corrects each pixel. A per-panel file, fitted with DLC, carries every panel-
   - A speed-up is exact (bit for bit) unless a frozen tolerance says otherwise.
   - DLC's Python twins (`gpuemu.py`, `core2emu.py`, `fadeemu.py`) are the reference for the GPU code.
   - The core must be cheap enough to stay on all day on an ordinary GPU. Do not add a heavy opt-in to fix an
-    artefact; fix the core's rule. The flank fade and the starfield option are experimental and off by default.
+    artefact; fix the core's rule. The flank fade and the starfield option are experimental and off by default; the flank fade has no control in
+    either window (INI or pipe only).
   - Calibrate with the layer off. The layer refuses a display whose routing is a guess.
 - DLC side: `DLC/src/dlc/fald/` (model, fit, export, profile flow `python -m dlc.stages.fald_profile`).
 
