@@ -104,6 +104,17 @@ void FaldTrace(const char* msg) {
         std::wstring s(exe); size_t k = s.find_last_of(L"\\/");
         path = (k == std::wstring::npos ? L"" : s.substr(0, k + 1)) + L"fald_trace.log";
     }
+    // Bounded: past 1 MB the file becomes fald_trace.old.log (replacing the previous one) and a new one
+    // starts, so the two together never hold more than ~2 MB however long the app runs. (The size comes
+    // from the file system: an append stream's tellp() is 0 until its first write.)
+    WIN32_FILE_ATTRIBUTE_DATA fa = {};
+    if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa) &&
+        (fa.nFileSizeHigh != 0 || fa.nFileSizeLow > (1u << 20))) {
+        std::wstring old = path;
+        old.replace(old.size() - 4, 4, L".old.log");
+        if (!MoveFileExW(path.c_str(), old.c_str(), MOVEFILE_REPLACE_EXISTING))
+            std::ofstream(path, std::ios::trunc);   // the old copy is held open elsewhere: start over in place
+    }
     std::ofstream f(path, std::ios::app);
     f << GetTickCount64() << " [" << GetCurrentThreadId() << "] " << msg << "\n";
 }

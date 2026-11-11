@@ -532,7 +532,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     const Shot shots[] = {
         { "tonemap", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1 },
         { "grayscale", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1 },
-        // the REFRESH TRIM row: 29 at 60 Hz (none), 30 no DIP data, 31 switched off, 32 waiting for a calibration
+        // the REFRESH TRIM row: 29 at 60 Hz (none), 30 no DLC data, 31 switched off, 32 waiting for a calibration
         { "grayscale60", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 29 },
         { "grayscalenodip", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 30 },
         { "grayscaleoff", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 31 },

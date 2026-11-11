@@ -1667,3 +1667,37 @@ TEST_CASE("FALD rows: starfield fields clamp to their ranges, views out of range
     CHECK(act::SetFaldDebugView(f, act::kFaldDebugViews));                      // out of range: the corrected image
     CHECK(f.debugMode == 0u);
 }
+
+// The diagnostic trace next to the exe must not grow without bound on a machine that runs for months.
+TEST_CASE("FALD trace: the log rolls over to fald_trace.old.log past 1 MB") {
+    wchar_t exe[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring dir(exe);
+    dir.erase(dir.find_last_of(L"/\\") + 1);
+    const std::wstring log = dir + L"fald_trace.log", old = dir + L"fald_trace.old.log";
+    auto sizeOf = [](const std::wstring& p) -> long long {
+        WIN32_FILE_ATTRIBUTE_DATA fa = {};
+        if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fa)) return -1;
+        return ((long long)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
+    };
+    DeleteFileW(old.c_str());
+    {
+        std::ofstream f(log, std::ios::trunc | std::ios::binary);
+        const std::string block(4096, 'x');
+        for (int i = 0; i < 300; i++) f << block;          // 1.2 MB
+    }
+    REQUIRE(sizeOf(log) > (1ll << 20));
+
+    FaldTrace("after the limit");
+    CHECK(sizeOf(old) > (1ll << 20));                       // the full file moved aside
+    const long long fresh = sizeOf(log);
+    CHECK(fresh > 0);
+    CHECK(fresh < 256);                                     // a new file with the one line
+
+    FaldTrace("under the limit");                           // no second rollover
+    CHECK(sizeOf(old) > (1ll << 20));
+    CHECK(sizeOf(log) > fresh);
+    CHECK(sizeOf(log) < 512);
+    DeleteFileW(old.c_str());
+    DeleteFileW(log.c_str());
+}

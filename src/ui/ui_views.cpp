@@ -978,13 +978,13 @@ std::pair<std::string, ImU32> RefreshTrimValue(const RefreshTrimStatus& t, bool 
     if (t.state == "reference") return { hz() + dot + "none", pal::InkDim };
     if (t.state == "unmeasured") return { hz() + dot + "not measured", pal::InkDim };
     if (t.state == "no_rate") return { hz(), pal::InkFaint };
-    if (t.state == "invalid") return { "DIP unreadable", pal::Alarm };
-    return { "no DIP data", pal::InkFaint };   // no DLC folder, no DIP, no section for this panel
+    if (t.state == "invalid") return { "DLC data unreadable", pal::Alarm };
+    return { "no DLC data", pal::InkFaint };   // no DLC folder, no DIP, no section for this panel
 }
 
 std::string RefreshTrimTip(const RefreshTrimStatus& t) {
     std::string tip = "Brightness at other refresh rates, trimmed to the 60 Hz calibration's (HDR MHC 1D LUT).\n"
-                      "From the display's DLC DIP. RELOAD reads the DIP again.";
+                      "From the display's DLC record (its DIP). RELOAD reads it again.";
     char b[256];
     if (t.monitor < 0) return tip;
     if (t.state == "trim") {

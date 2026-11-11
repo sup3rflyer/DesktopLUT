@@ -2951,6 +2951,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // the writer may still be mid-update, so debouncing prevents
             // racing it, and coalesces bursts of writes into one kick.
             KillTimer(hwnd, MHC_REGISTRY_KICK_TIMER_ID);
+            // Only with a profile of ours to protect (like the periodic reload above): with none, the kick
+            // would only make Windows reload other tools' profiles over whatever they just set.
+            if (!AnyMhcProfileActive()) return 0;
             std::cout << "[MHC] Registry change → kicking calibration" << std::endl;
             if (!TriggerCalibrationLoader()) {
                 ReapplyAllMhcProfiles();

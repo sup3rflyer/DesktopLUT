@@ -217,7 +217,8 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     std::string lastLoggedError;       // log each distinct failure once
 };
 
-// Diagnostic trace (appends "<ms> [tid] msg" to fald_trace.log next to the exe; thread-safe, cheap).
+// Diagnostic trace (appends "<ms> [tid] msg" to fald_trace.log next to the exe; thread-safe, cheap; the
+// file rolls over to fald_trace.old.log at 1 MB).
 void FaldTrace(const char* msg);
 
 // Process-global shaders (compiled in InitD3D via InitFaldShaders; released in ReleaseFaldShaders).
