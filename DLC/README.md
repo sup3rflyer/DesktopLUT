@@ -67,6 +67,14 @@ third time, breaking the 1+1+1 layering). The separate `grayscale-wb` flow is di
 opt-in, user-facing touch-up that tunes DesktopLUT's own Grayscale correction on top of an
 installed stack.
 
+**Refresh-rate response (HDR).** Some panels are a few percent brighter at lower refresh rates.
+`dlc.refresh_mode` switches one display's refresh rate for a reading and checks that the switch
+is temporary. `dlc.refresh_trim` turns readings taken at several rates into the display's
+refresh response and records it in the DIP
+(`python -m dlc.refresh_trim record --run <dir> [--write]`). DesktopLUT 3.0 reads it from there
+and trims the HDR profile for the rate the display runs at. The measurement is not a named flow
+yet.
+
 ## The correction machine
 
 The differentiator (`src/dlc/optimize.py`): a nested-loop optimiser that drives a
@@ -92,6 +100,10 @@ can't reach target are surfaced for adjudication, not silently accepted.
 5. Launch your agent in `DLC/` and ask it to calibrate; it follows
    [`docs/operator-guide.md`](docs/operator-guide.md) (onboarding: meter correction →
    `characterize` → `mhc-only` shakedown → `full`).
+6. Watch the run on DesktopLUT's **DLC** page (stage, live readouts, charts, the agent's
+   decisions; PAUSE and CANCEL). DesktopLUT finds this folder by itself when it is named `DLC`
+   and sits next to `DesktopLUT.exe` or one or two folders up; otherwise set it in Settings →
+   CALIBRATION → DLC FOLDER.
 
 ## Quickstart (no hardware)
 
@@ -112,7 +124,7 @@ A **real** run mutates the live display and is driven by the orchestrator
 (`dlc-calibrate --flow full`, which connects to the live pipe). It needs DesktopLUT
 launched with the calibration pipe enabled (opt-in): an empty
 `DesktopLUT_Calibration.flag` next to the exe, `DESKTOPLUT_CALIBRATION=1`, or the
-in-app "Calibration control" toggle. A pause/resume seam exits 10 so the assistant can
+in-app toggle (Settings → CALIBRATION → DLC CONTROL, or the tray's "Calibration control"). A pause/resume seam exits 10 so the assistant can
 decide and resume (`--decide KEY=CHOICE[=REASON] --run <dir>`). This is a deliberate,
 user-involved step — the live bring-up procedure is in
 [`docs/operator-guide.md`](docs/operator-guide.md); normally the assistant drives it through the
@@ -159,7 +171,7 @@ System Python 3.11+. Contained binaries for real runs go under
 ## Tests
 
 ```bash
-python -m pytest -q     # ~2000 tests (xdist-parallel); green-or-skipped on any box
+python -m pytest -q     # ~2500 tests (xdist-parallel); green-or-skipped on any box
 ```
 
 The suite is deterministic on any machine: every environment-dependent test skips
@@ -181,8 +193,9 @@ DLC/
   src/dlc/engine/     scientific stack (numpy/scipy/colour, lazy): patches, model,
                       lut_rbf, lut_sdr, whitepoint
   src/dlc/stages/     stage tools + the end-to-end mock simulator
+  src/dlc/fald/       FALD panel profiling: model, fit, panel-file export, GPU reference twins
   src/dlc/dashboard/  mission-control live view + HTML report (stdlib-only)
-  tests/              the pytest suite (~2000 tests)
+  tests/              the pytest suite (~2500 tests)
   docs/               operator-guide.md (the LLM's manual), NAMING.md (glossary)
   .claude/skills/     calibrate-display — the agent entry point (loads the operator guide)
   calibration_profile.example.yaml   template for your local calibration_profile.yaml

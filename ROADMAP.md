@@ -6,11 +6,13 @@ Open items, roughly by leverage. Each entry says what the user sees today, what 
 
 **Done 2026-09-08:** per-monitor settings are keyed by display identity (`[Display<slot>]` with `DevicePath` / `EdidId`; `src/monitor_identity.cpp`), re-attached on every display change, and a disconnected panel's settings are parked in memory and on disk. Legacy `[Monitor<N>]` sections migrate by index on first sight and are retired on save.
 
-**Today:** parked displays are invisible in the GUI. There is no way to see which panels DesktopLUT remembers, to forget one (its `[Display<slot>]` section and cached MHC profile files stay forever), or to hand a parked configuration to a new panel of the same model.
+**Done in 3.0:** the new interface lists disconnected displays as OFFLINE, with their settings.
 
-**Change:** a "Remembered displays" list in the Settings tab (name, EDID id, last seen, connected or parked) with Forget and Copy-settings-to actions; forgetting also deletes that display's `DesktopLUT_*` profile files. Optionally carry the identity into the DWM-hook routing file's `mon` lines so twin-panel routing survives a re-shuffle without the beacon.
+**Today:** there is no way to forget a remembered display (its `[Display<slot>]` section and cached MHC profile files stay forever), or to hand a parked configuration to a new panel of the same model.
 
-**Where:** `src/gui_layout.cpp` (Settings tab list), `src/gui.cpp` (actions), `src/settings.cpp` (delete section), `src/mhc_install.cpp` (per-display profile cleanup), `src/dwm_inject.cpp` (routing file).
+**Change:** Forget and Copy-settings-to actions on an OFFLINE display (with its EDID id and when it was last seen); forgetting also deletes that display's `DesktopLUT_*` profile files. Optionally carry the identity into the DWM-hook routing file's `mon` lines so twin-panel routing survives a re-shuffle without the beacon.
+
+**Where:** `src/ui/ui_views.cpp` (the display list), `src/actions/` (actions), `src/settings.cpp` (delete section), `src/mhc_install.cpp` (per-display profile cleanup), `src/dwm_inject.cpp` (routing file).
 
 ## Tell the user when the 3D LUT is not being applied
 

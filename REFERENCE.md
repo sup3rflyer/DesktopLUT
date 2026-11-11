@@ -1,17 +1,17 @@
 # DesktopLUT Reference
 
-Detailed technical reference. For development guidance, see CLAUDE.md.
+Detailed technical reference. For working on the code, see [AGENTS.md](AGENTS.md).
 
 ## Usage
 
 Run `DesktopLUT.exe` to launch the GUI. Configure LUTs and color corrections per-monitor in the interface.
 
-### Hotkeys (configurable in Settings tab)
+### Hotkeys
 - **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR)
 - **Win+Shift+Z**: Toggle HDR on/off for the focused monitor
 - **Win+Shift+X**: Toggle analysis overlay
 
-Hotkeys can be enabled/disabled in the Settings tab. Key letters are configurable via INI file.
+Hotkeys can be enabled/disabled in **SETTINGS** → **HOTKEYS** (classic window: the Settings tab). Key letters are configurable via INI file only.
 
 ## Settings File (INI)
 
@@ -19,7 +19,7 @@ Settings saved to `DesktopLUT.ini` next to executable.
 
 **Comments must be on their own line.** The Windows INI API keeps everything after `=` as the value, so `EdidId=ABC1234-SN0001 ; comment` stores the comment too — that identity then never matches and the display is treated as new. The example below keeps every comment on its own line for that reason.
 
-**Note**: Primaries, grayscale, white balance, and desktop gamma are per-monitor in the MHC sections. The Corrections section only persists tonemapping. `DesktopGamma` is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
+**Note**: Primaries, grayscale, white balance, and desktop gamma are per-monitor in the MHC sections. Besides them, a display's section persists its 3D LUT paths, tonemapping and FALD settings. `DesktopGamma` is derived at startup from per-monitor `HDR_MHCDesktopGamma` (only active when the HDR MHC profile is also enabled).
 
 ```ini
 [General]
@@ -39,8 +39,12 @@ FaldFlankFadeForce=0
 ; 1 = the FALD layer's GPU rate cap never holds a run: the full correction on every present whatever it costs (on a
 ; weak GPU that stalls the desktop). Read at start, never written; absent = 0.
 FaldCoreForce=0
-; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis)
+; 1 = dither the HDR output after the 3D LUT (default); 0 = off, for an A/B
+HdrDither=1
+; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis). Absent = 0.
 DwmHookMode=1
+; 1 = the calibration pipe for DLC is armed (Settings > Calibration > DLC CONTROL). Absent = 0.
+CalibrationControl=0
 ; Auto-disable desktop gamma when these apps run
 GammaWhitelist=mpv.exe,mpvnet.exe
 
@@ -112,6 +116,8 @@ LastSeen=2026-10-07
 LUT_SDR=C:\path\to\sdr.cube
 ; 3D LUT for HDR
 LUT_HDR=C:\path\to\hdr.cube
+; the 3D LUT stage's switch: true = off, the path is kept (also LUT_SDR_Bypass)
+LUT_HDR_Bypass=false
 
 ; HDR tonemapping (applied by DWM hook when DwmHookMode=1, overlay shader as fallback)
 HDR_TonemapEnabled=0
@@ -161,7 +167,7 @@ SDR_MHCCorrGS24=false
 SDR_MHCActivePerm=0
 ; Cached profile paths indexed by permutation bitmask
 SDR_MHCPermPath0=
-; ...through MHCPermPath7
+; ...through MHCPermPath63; entries from 8 up (the stage-bypass and 10000-nit variants) are written only while cached
 SDR_MHCPermPath1=
 
 ; --- MHC ICC Profile (HDR) ---
@@ -183,7 +189,7 @@ HDR_MHCCorrGSEnabled=false
 HDR_MHCCorrGSPeak=10000.0
 ; Active permutation bitmask (WB=1, DG=2, GS=4, NOPRIM=8, NOGRAY=16, PEAK_MAX=32 — HDR: reports 10000 nits)
 HDR_MHCActivePerm=2
-; Cached profiles indexed by bitmask (0-7)
+; Cached profiles indexed by bitmask (0-63)
 HDR_MHCPermPath0=
 ; DG-only variant
 HDR_MHCPermPath2=C:\...\DesktopLUT_Mon0_HDR_P2_xxx.icm
@@ -199,12 +205,12 @@ HDR_MHCRefreshTrim=0
 
 ## Refresh-Rate Trim (HDR MHC)
 
-Some panels are brighter at lower refresh rates (the PA32UCXR in HDR: +3.4 % at 0.5-10 nits ... +1.0 % at 1000 at
+Some panels are brighter at lower refresh rates (one mini-LED monitor measured in HDR: +3.4 % at 0.5-10 nits ... +1.0 % at 1000 at
 47.952 Hz; luminance only, channel-independent, not linear in frame period). DLC measures the response and records it in
 the display's DIP: `<DLC folder>\dip_store.json`, record `"<display>:HDR"`, section `refresh_response` (per measured rate
 its exact rational and, per grey level, the light at that rate over the light at 60 Hz; `same_as` where DLC's tests found
-two rates equal, e.g. 48 = 47.952, 59.94 = 60). DesktopLUT finds the DLC folder through the DLC tab's setting
-(`[UI] DlcFolder`, else next to DesktopLUT), matches the section to a live display by the EDID hardware id it recorded
+two rates equal, e.g. 48 = 47.952, 59.94 = 60). DesktopLUT finds the DLC folder through Settings → CALIBRATION → DLC FOLDER
+(`[UI] DlcFolder`, else found automatically, see the INI above), matches the section to a live display by the EDID hardware id it recorded
 (twin panels also by device path), and derives the trim at bake time: `g = 1 / ratio`, held below the lowest level,
 faded out to 1 above the highest (nothing is measured there: a monotone curve in log level from the top level's gain and
 slope to 1, flat, at the panel's peak — the section's `peak_nits`, else the HDR profile's), applied as the HDR MHC 1D
@@ -219,16 +225,17 @@ Nothing changes during a calibration session (`calibration.enter` clears the tri
 MHC dialog. At exit every display goes back to its untrimmed variant. No DLC folder / DIP / section, or the switch off =
 no trim, and the profiles are byte-identical to a build without the feature (`tests/test_mhc_golden.cpp`).
 
-The DIP is read again on every display change, the MHC tab's REFRESH TRIM switch / RELOAD, and `layers.set
+The DIP is read again on every display change, the REFRESH TRIM row's switch / RELOAD (new interface: **PIPELINE** →
+**GRAYSCALE** on the HDR side; the classic window has no control for it), and `layers.set
 refresh_trim`; `state.get` reports `refresh_trim` per `<monitor>:HDR` (the live rate, the trim, whether it is on
 screen, the DIP section). A refresh-response measurement must run with `layers.set refresh_trim=false`.
 
 ## DWM Hook Mode
 
-When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injecting `DwmHook.dll` into `dwm.exe` instead of using the Desktop Duplication overlay. This is overlay-free — no extra window, no capture latency.
+When `DwmHookMode=1` (Settings → **DWM HOOK**; off by default), 3D LUTs and HDR tonemapping are applied by injecting `DwmHook.dll` into `dwm.exe` instead of using the Desktop Duplication overlay. This is overlay-free — no extra window, no capture latency.
 
 **How it works**:
-1. On Start, `dwm_inject.cpp` elevates to SYSTEM (via TrustedInstaller token), stages LUT files to `%TEMP%\DesktopLUT_DwmHook\`, and injects the DLL via `CreateRemoteThread(LoadLibraryW)`.
+1. When a display needs the live layers, `dwm_inject.cpp` elevates its thread to SYSTEM (it impersonates a system process's token), stages the DLL and the LUT files under `%SYSTEMROOT%\Temp\` (`DesktopLUT_luts\`), and injects the DLL via `CreateRemoteThread(LoadLibraryW)`.
 2. `DwmHook.dll` hooks `IDXGISwapChain::Present` in DWM using MinHook. It identifies monitor swapchains by matching desktop coordinates from `IDXGIOutput::GetDesc`.
 3. Before each Present call, the hook applies 3D LUT + ICtCp tonemapping via pixel/compute shaders. All 5 tonemap curves are supported (BT.2390, SoftClip, Reinhard, BT.2446A, HardClip) including dynamic peak detection (every 4th pixel, temporal EMA smoothing — the same shaders as the overlay, `shared/peak_detect.h`).
 4. Live parameter updates (tonemapping changes, monitor hotplug) are communicated via shared memory IPC (`Global\DesktopLUT_DwmHook_Config`) — no re-injection needed.
@@ -238,14 +245,15 @@ When `DwmHookMode=1` (default), 3D LUTs and HDR tonemapping are applied by injec
 
 **Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event). Max 3 consecutive re-injection retries. Orphan detection via `hostPid` in shared memory — DLL self-unloads if host process dies.
 
-**Repair**: Windows updates can break DWM internals (AOB patterns, struct offsets). See `DWM_HOOK_REPAIR.md` for diagnosis and repair procedures.
+**Repair**: Windows updates can break DWM internals (AOB patterns, struct offsets). The hook then has to be repaired against the new `dwmcore.dll`; [AGENTS.md](AGENTS.md) §7 lists the rules for that. Until then, switch DWM HOOK off and use overlay mode.
 
-**Twin-panel routing on 25H2**: the 25H2 overlay context exposes no monitor position (HW-probed 2026-09-04: the context object holds only device-space rects, never the second panel's desktop rect), so `ApplyLUTDirect` matches a context to `monitors.dat` by back-buffer size, then bit depth, then first-present ORDER. Two identical panels (same resolution + bpc, e.g. two 4K 10-bit HDR displays) are therefore a coin toss, re-rolled on every injection — and every LUT set/clear re-injects. Fix: the DLL persists its context→position assignment in `%SYSTEMROOT%\Temp\DesktopLUT_hook_routing_<dwmPid>.dat` (keyed by the dwm.exe pid + creation time and the monitors.dat topology) and honours it on the next injection of the same dwm.exe (`pinned` in the hook log, vs `order-match` for a fresh roll). A twin context that arrives while BOTH positions are held by contexts that presented this injection is a replacement for one DWM destroyed (a mode change / HDR toggle recreates the overlay context); it is placed `provisional` on the position whose holder presented least recently and settled by liveness — the survivor keeps presenting, the dead one never does — into `replaced` (a pin; `confirmed` cleared), or moved the first time the guessed position's holder presents. Provisional entries are never loaded as pins, and pins sharing one position are all dropped at load (the 2026-09-06 failure: the old blind fallback stacked the replacement onto monitor 0, persisted it, and both panels rendered monitor 0's LUT on every re-injection). **Identity beacon (positive identification, survives reboots)**: pins are keyed to one dwm.exe lifetime, so every reboot used to be a fresh coin toss. After every injection (and after the resend pump of a display change) the host runs a beacon session: one 8x8 solid-colour topmost window per monitor at its top-left corner (palette `DwmHookBeaconRGB` in `shared/dwm_hook_config.h`: monitor i gets colour (i mod 6)+1), repainted every 40 ms so DWM composes a frame on each monitor; the DLL (`ProbeBeacon`) copies that corner of each twin context's back buffer into a staging texture and reads it on the next present with DO_NOT_WAIT (no GPU sync in the present path), classifies by channel dominance (works for 8-bit, 10-bit and scRGB FP16), and assigns the context to the monitor showing that colour — method `beacon`, authoritative over pins/order, never sets `needs_check`. The session ends when the routing file shows every twin identified (typically < 300 ms) or after 2 s; rigs without indistinguishable twins skip it. Settings tab: a `LUT routing:` status line, `Identify monitors` (runs a session) and `Swap with twin` (manual override for the selected monitor; only holds where identification is impossible, since the beacon runs after the re-injection). Pipe: `hook.set_routing {action:"identify"}` runs a blocking session. The host reports it as `state.get → hook {active, needs_check, routing{session, stale, confirmed, entries[{ctx,left,top,method,monitor}]}}` on the calibration pipe and exposes `hook.set_routing {action: swap|confirm|clear|assign}`: `swap` exchanges a monitor's assignment with its single indistinguishable twin and re-injects; `confirm` records that a client verified the assignment through a meter (the DLL clears the flag whenever it has to order-match a new context); `clear` deletes the file (fresh roll). A DWM restart invalidates the file (`stale`) — the next injection rolls once, then sticks again. DLC's hardware-readiness self-check installs a probe cube, reads a patch with it on/off, swaps once if the meter sees no change, and refuses if it still sees none.
+**Twin-panel routing on 25H2**: the 25H2 overlay context exposes no monitor position (HW-probed 2026-09-04: the context object holds only device-space rects, never the second panel's desktop rect), so `ApplyLUTDirect` matches a context to `monitors.dat` by back-buffer size, then bit depth, then first-present ORDER. Two identical panels (same resolution + bpc, e.g. two 4K 10-bit HDR displays) are therefore a coin toss, re-rolled on every injection — and every LUT set/clear re-injects. Fix: the DLL persists its context→position assignment in `%SYSTEMROOT%\Temp\DesktopLUT_hook_routing_<dwmPid>.dat` (keyed by the dwm.exe pid + creation time and the monitors.dat topology) and honours it on the next injection of the same dwm.exe (`pinned` in the hook log, vs `order-match` for a fresh roll). A twin context that arrives while BOTH positions are held by contexts that presented this injection is a replacement for one DWM destroyed (a mode change / HDR toggle recreates the overlay context); it is placed `provisional` on the position whose holder presented least recently and settled by liveness — the survivor keeps presenting, the dead one never does — into `replaced` (a pin; `confirmed` cleared), or moved the first time the guessed position's holder presents. Provisional entries are never loaded as pins, and pins sharing one position are all dropped at load (the 2026-09-06 failure: the old blind fallback stacked the replacement onto monitor 0, persisted it, and both panels rendered monitor 0's LUT on every re-injection). **Identity beacon (positive identification, survives reboots)**: pins are keyed to one dwm.exe lifetime, so every reboot used to be a fresh coin toss. After every injection (and after the resend pump of a display change) the host runs a beacon session: one 8x8 solid-colour topmost window per monitor at its top-left corner (palette `DwmHookBeaconRGB` in `shared/dwm_hook_config.h`: monitor i gets colour (i mod 6)+1), repainted every 40 ms so DWM composes a frame on each monitor; the DLL (`ProbeBeacon`) copies that corner of each twin context's back buffer into a staging texture and reads it on the next present with DO_NOT_WAIT (no GPU sync in the present path), classifies by channel dominance (works for 8-bit, 10-bit and scRGB FP16), and assigns the context to the monitor showing that colour — method `beacon`, authoritative over pins/order, never sets `needs_check`. The session ends when the routing file shows every twin identified (typically < 300 ms) or after 2 s; rigs without indistinguishable twins skip it. The classic window's Settings tab (the new interface has no control for it): a `LUT routing:` status line, `Identify monitors` (runs a session) and `Swap with twin` (manual override for the selected monitor; only holds where identification is impossible, since the beacon runs after the re-injection). Pipe: `hook.set_routing {action:"identify"}` runs a blocking session. The host reports it as `state.get → hook {active, needs_check, routing{session, stale, confirmed, entries[{ctx,left,top,method,monitor}]}}` on the calibration pipe and exposes `hook.set_routing {action: swap|confirm|clear|assign}`: `swap` exchanges a monitor's assignment with its single indistinguishable twin and re-injects; `confirm` records that a client verified the assignment through a meter (the DLL clears the flag whenever it has to order-match a new context); `clear` deletes the file (fresh roll). A DWM restart invalidates the file (`stale`) — the next injection rolls once, then sticks again. DLC's hardware-readiness self-check installs a probe cube, reads a patch with it on/off, swaps once if the meter sees no change, and refuses if it still sees none.
 
 **Transient monitor-state hardening**: DWM can temporarily hide a monitor's DXGI output when a fullscreen video takes over, or briefly report HDR=false during color re-brokering. Without protection, this corrupts context→monitor routing mid-frame and can crash DWM. Mitigations:
 - Hook side (`UpdateLocalTonemapFromShared` in `dwm_hook/dllmain.cpp`): require 3 consecutive observations of a monitor-count shrink or same-position HDR-flag flip before accepting. Benign growth and tonemap-param tweaks apply immediately. Context position cache invalidated on topology changes.
 - Host side (`EnumerateDxgiMonitors` in `src/dwm_inject.cpp`): retry DXGI enumeration up to 2× with 50 ms spacing if the fresh result shrank vs the last known-good count.
-- `RenderLUT` (in `dwm_hook/hook_render.cpp`): for FP16 backbuffers, pick `colorMode` based on which LUT is staged for the position (HDR LUT → 1, SDR LUT → 2) before falling back to `IsMonitorHdr`. Keeps the right pipeline live even if monitor state is briefly wrong.
+- `RenderLUT` (in `dwm_hook/hook_render.cpp`): for FP16 backbuffers, `colorMode` follows the monitor's actual mode (the debounced `IsMonitorHdr`: HDR → 1, ACM SDR → 2), not which LUT is configured — an HDR LUT can stay loaded while the display is in SDR. Which LUT is staged for the position decides only when the position is missing from the detected state.
+- Host side (`StartDwmHookConfigResends` in `src/gui.cpp`): because of the debounce one config push never flips hook state, so every display change and HDR/SDR switch pushes a fresh snapshot and then resends it a few times.
 
 ## MHC Profile Self-Healing
 
@@ -266,7 +274,7 @@ Windows can silently drop MHC calibration without unassociating the profile. Two
 | ICM registry watcher thread | `RegNotifyChangeKeyValue` on HKCU+HKLM `ICM\ProfileAssociations\Display` and HKCU `ICM\Display`, 500 ms debounce | Mode B — catches third-party writes from calibration tools, colorcpl, GPU vendor panels |
 | `ReapplyAllMhcProfiles` fallback | On demand, if `TriggerCalibrationLoader` fails | Mode B — remove+re-add kick when DisplayCAL's installer (or similar) has disabled the Calibration Loader task |
 | Event-driven reapply | WM_DISPLAYCHANGE, WM_WTSSESSION_CHANGE unlock, WM_SETTINGCHANGE ImmersiveColorSet, WM_POWERBROADCAST wake | Mode A + Mode B proactively on known triggers |
-| `SweepStaleMhcAssociations` | At startup and in every transition-burst stage | Mode C — enumerates each display's association list via `ColorProfileGetDisplayList` and removes any `DesktopLUT_*` entry not referenced by current settings, from both the SDR and Advanced Color lists |
+| `SweepStaleMhcAssociations` | Whenever the live layers start and in every transition-burst stage | Mode C — enumerates each display's association list via `ColorProfileGetDisplayList` and removes any `DesktopLUT_*` entry not referenced by current settings, from both the SDR and Advanced Color lists |
 | Transition burst | Staged at +2 s / +7 s / +22 s after ImmersiveColorSet, any WM_DISPLAYCHANGE (including refresh-rate-only modesets), resume, session unlock, display wake | Modes A+B+C — each stage runs verify + sweep + an unconditional Calibration Loader kick. Outlasts Windows' own transition processing, which can re-broker associations or reload hardware LUTs *after* a single immediate reapply |
 
 The Calibration Loader is preferred over remove+re-add because it never disassociates — the display never briefly falls back to sRGB IEC or another profile, so there's no visible flicker. The transition burst exists because a mode switch is a race: one immediate reapply can be overwritten by Windows' own late transition work, and Mode B staleness right after a switch is invisible to association queries — so the burst re-asserts unconditionally until the transition has long settled.
@@ -283,9 +291,8 @@ HDR processing uses the Dolby ICtCp color space for perceptually accurate tonema
 5. **Rec.2020 → ICtCp**: LMS (Hunt-Pointer-Estevez) → PQ encode (t5) → ICtCp matrix
 6. **ICtCp Tonemapping** (on I channel only, CT/CP unchanged = hue preserved):
    - Tonemapping (content preference - static or dynamic)
-   - Blue noise dithering (always on, perceptually uniform)
 7. **ICtCp → PQ Rec.2020**: Inverse transforms → PQ decode (t6) for LUT input
-8. **Apply LUT**: Tetrahedral or trilinear interpolation
+8. **Apply LUT**: Tetrahedral or trilinear interpolation, then the **HDR output dither** on the PQ value (`shared/hdr_dither.h`: blue-noise TPDF of ±1 LSB of 10-bit PQ, static pattern; on by default, **HDR DITHER** / INI `HdrDither`)
 9. **PQ → scRGB**: ST.2084 EOTF (t6) → White Balance (von Kries gains) → Rec.2020 → BT.709
 
 **Why ICtCp?** (from Dolby whitepaper)
@@ -400,8 +407,8 @@ sends the EDID's own peak back when it no longer applies (`windows_tonemap.h`).
 
 | Method | Samples | Description |
 |--------|---------|-------------|
-| **Tetrahedral** | 4 | Divides cube into 6 tetrahedra, higher quality (opt-in) |
-| **Trilinear** (default) | 8 | Hardware-accelerated, faster |
+| **Tetrahedral** (default) | 4 | Divides cube into 6 tetrahedra, higher quality. The DWM hook always uses it |
+| **Trilinear** | 8 | Hardware-accelerated, faster. An overlay-mode option (`TetrahedralInterp=0`) |
 
 **Supported sizes**: 2-128 (typical: 17, 33, 65). Larger sizes rejected to prevent excessive memory use.
 
@@ -474,13 +481,13 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   could run: not on the SDR side of a display in legacy SDR); selecting it opens **ADD FALD**, whose
   **PANEL FILE › BROWSE…** loads the first file. With a file the stage carries the header switch (on / off) and
   the rows PANEL FILE (BROWSE… / RELOAD / CLEAR — clear takes the file away and switches the layer off),
-  PEDESTAL, LED LAG, FLANK FADE, STARFIELD, STAR TARGET and VIEW; all but PANEL FILE and the switch apply to
-  HDR and SDR at once. Classic window: the Corrections tab's *Enable* + *panel file* row per mode, with the
+  PEDESTAL, GPU (a readout, see the rate cap below), LED LAG, FLANK FADE, STARFIELD, STAR TARGET and VIEW; all but
+  PANEL FILE, GPU and the switch apply to HDR and SDR at once. Classic window: the Corrections tab's *Enable* + *panel file* row per mode, with the
   same shared rows below it.
 - **Needs a per-panel parameter file** (INI `HDR_FaldParamsPath` / `SDR_FaldParamsPath`), produced by
   the DLC calibrator's profiling pass (`python -m dlc.stages.fald_profile`, one colorimeter spot, ≈ 40 min,
   no camera: it needs the panel's zone count and diagonal from the spec sheet, and ends with a verify pass
-  of the file on your unit — `DLC/docs/fald-profile-flow.md`). None is shipped: a file describes the unit it
+  of the file on your unit — [DLC/docs/operator-guide.md](DLC/docs/operator-guide.md) §15). None is shipped: a file describes the unit it
   was profiled on; the code is panel-agnostic, the numbers are not. The layer refuses, logging once, when the
   file's zone lattice does not fit the monitor's resolution.
 - **Any zone pitch, not only whole pixels** (2026-10-19, `docs/fald-fractional-pitch.md`). A 27" 2560×1440 panel
@@ -528,8 +535,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   show on a static desktop.
 - Cost: four small compute passes on the zone grid (48×48 zones × 2 sub-cells, for example) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
-- **Flank fade** (experimental, default off; the frozen fade stack ASF10 + T11_TMTC with round 12's line and halo fixes,
-  `shared/fald_fade.h`): fades the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside
+- **Flank fade** (experimental, default off; `shared/fald_fade.h`): fades the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside
   the soft knee's reach, keeps a small dark object's own edge from lending fade to the lit floor round it (no bright halo
   round a lamp head next to a glow), and low-passes the fade over content frames along the content's motion (phase
   correlation + a cut test). INI per
@@ -584,8 +590,8 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   reports `fald_core_governor` per monitor and mode (`state`: off / running / capped / forced / unknown; `p90_ms`,
   `budget_ms`, `refresh_ms`, `spacing_ms`, `content_ms`; `forced`). In hook mode the DLL reports it through the same
   section as the fade's (`DwmHookFaldStatus::core`; the force key travels as faldFlags bit 11). The same report carries
-  the layer's variant and rule: `conv_so` / `conv_tune` (below) and `core_mode_applied` / `core_on` (the always-on core's
-  rule that runs: 0 C, 1 KC2c, 2 KC3, 4 KC5 — `fald_core_mode` is the setting, this is what the layer applies).
+  the convolution variant, `conv_so` / `conv_tune` (below), and `core_mode_applied` / `core_on` (which core rule the
+  layer applies; diagnostic).
 - **The convolution's auto-tune** (`shared/fald_conv_tune.h`, overlay and hook alike): the convolution pass exists in four
   byte-identical variants (1 / 2 / 4 / 8 sub-offsets per thread); which is fastest depends on the GPU and the lattice. The
   layer keeps every variant's tables resident and, while tuning, times ONE extra dispatch of the variant under test per
@@ -595,18 +601,16 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   so later starts begin on it. Without timestamp queries the measured policy stands (2 sub-offsets from 2048 zones, else
   1). The decision is logged (`conv auto-tune: S=1 .. us, S=2 .. us, S=4 .. us, S=8 .. us -> S=k`); `state.get
   fald_core_governor` reports `conv_so` (in use) and `conv_tune` (`policy` / `cached` / `tuning` / `tuned`).
-- **The always-on core's rule** (`shared/fald_core_mode.h`): KC5 by default (mode 4) — C's near-field fill kept, with a
-  brightening CAP on the fine grid away from pixels whose brightening would hit the LCD ceiling (an exact whole-lattice
-  min-plus of the knee headroom, slope 0.10 ln per 100 px, per round) in place of KC3's deficit, plus alpha (the
-  near-field brightening shrunk at dark zone levels: KC3's law below 0.5 nit, none above 2 nit); no temporal state, so the
-  change-driven path reuses its fields. Both outcomes measured on 2026-10-23: the colorimeter fill re-run keeps C's fill
-  (RMS vs the target at neutral levels KC5 1.77 %, C 1.51 %, KC3 5.89 %) and the owner's live blind test saw none of C's
-  dark band beside bright objects (C in 5 of 12 clips, KC5 in none). Test modes for A/B checks: `<mode>_FaldCoreModeTest=0`
-  in a display's section (read at start, never written; absent = the default) runs C, the layer as it was; `=2` KC3 (round
-  3: alpha + the fine-grid sliding-window deficit — the band gone, most of the fill lost); `=1` KC2c (round 2: the
-  zone-level deficit with a zone IIR — always the full path); 3 is reserved (KC4). A lattice of more than 2048 fine nodes
-  per axis (none known) runs KC5 as C. The pipe's `runtime.fald_core_mode {monitor, mode, core}` switches at runtime
-  (never saved); `state.get` reports `fald_core_mode` + `fald_core_mode_name` per monitor and mode. No GUI control.
+- **The always-on core's rule** (`shared/fald_core2.h`; the default is set in `shared/fald_core_mode.h`): next to a
+  bright object the layer brightens the near field to fill the dip the panel leaves there. Where that brightening would
+  hit the LCD ceiling it cannot be delivered, and an unlimited fill then leaves a dark band beside the object. The
+  default rule keeps the fill and puts a brightening CAP on the fine grid away from pixels whose brightening would hit
+  the ceiling (an exact whole-lattice min-plus of the knee headroom, slope 0.10 ln per 100 px, per round), and shrinks
+  the near-field brightening at dark zone levels (below 2 nit; the whole shrink law applies below 0.5 nit). It has no temporal
+  state, so the change-driven path reuses its fields. Measured on one mini-LED monitor (2026-10-23): the fill stays
+  within 1.77 % RMS of its target at neutral levels on a colorimeter, and a blind viewing test of 12 clips showed no
+  dark band beside bright objects. A lattice of more than 2048 fine nodes per axis (none known) runs without the cap.
+  No GUI control.
 
 ### In the DWM hook
 
@@ -775,7 +779,7 @@ This is a fundamental NVIDIA driver limitation affecting all external overlay ap
 
 **For NVIDIA users**:
 1. Enable Windows "Variable refresh rate" setting (Settings > Display > Graphics > Variable refresh rate: On)
-2. Use Passthrough Mode (Settings tab) to disable corrections when specific games are running — this restores full VRR
+2. Use Passthrough Mode (Settings → **PASSTHROUGH**) to disable corrections when specific games are running — this restores full VRR
 3. DWM Hook Mode eliminates the overlay G-Sync tearline issue, but VRR is still lost for fullscreen apps when LUT/tonemapping is active
 
 See [GitHub Issue #1](https://github.com/sup3rflyer/DesktopLUT/issues/1) for technical details.
@@ -787,7 +791,7 @@ Automatically hides all overlays when specified applications are running. Useful
 - Applications where color correction should be disabled
 - Any app where you want the raw display output
 
-**Setup**: Settings tab → Enable "Hide overlay for apps" → Click "Whitelist..." → Enter comma-separated exe names (e.g., `game.exe, launcher.exe`). Matching is case-insensitive, `.exe` extension optional.
+**Setup**: **SETTINGS** → **PASSTHROUGH** on → **WHITELIST** (classic window: Settings tab → "Hide overlay for apps" → "Whitelist...") → Enter comma-separated exe names (e.g., `game.exe, launcher.exe`). Matching is case-insensitive, `.exe` extension optional.
 
 **Behavior**: Polls running processes every 500ms. When a whitelisted app is detected, all monitor overlays are hidden. When the app exits, overlays are restored.
 

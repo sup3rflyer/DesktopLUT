@@ -62,7 +62,8 @@ Also:
    builds lack pipe commands DLC needs (`layers.set`, `hook.set_routing`). It runs elevated; the human starts and
    stops it.
 2. **Arm the calibration pipe** (opt-in, off by default). Use either:
-   - the in-app toggle: **Settings** tab → *Experimental* → *Calibration control (DLC)*, or the tray menu; or
+   - the in-app toggle: **SETTINGS** → *CALIBRATION* → *DLC CONTROL* (classic window: **Settings** tab →
+     *Experimental* → *Calibration control (DLC)*), or the tray menu's *Calibration control*; or
    - an empty `DesktopLUT_Calibration.flag` next to the exe, then restart DesktopLUT.
 
    Disarm it after the session (§10).
@@ -83,6 +84,9 @@ Also:
    python -m dlc.stages.simulate --run runs/_rehearsal
    python -m pytest -q -m "not slow"
    ```
+8. **DesktopLUT's DLC tab** reads this folder. DesktopLUT finds it by itself when it is named `DLC` and sits next
+   to `DesktopLUT.exe`, or one or two folders up, and it remembers where it last found it. Anywhere else, the human
+   sets it: **SETTINGS** → *CALIBRATION* → *DLC FOLDER*.
 
 ## 4. Onboarding a display (first time only)
 
@@ -317,7 +321,7 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
 | `runs/<run>/live/` | `state.json` + `charts.json`: the run as DesktopLUT's DLC tab shows it (final copy at exit or a seam) |
 | `runs/<run>/notes.jsonl` | your `python -m dlc.note` lines (shown in the DLC tab's feed) |
 | `results/` | applied profiles / cubes and reports |
-| `correction_store.json`, `dip_store.json`, `stack_registry.json` | per display + mode: meter correction, learned panel facts, what's installed |
+| `correction_store.json`, `dip_store.json`, `stack_registry.json` | per display + mode: meter correction, learned panel facts (the DIP, with the refresh response of §16), what's installed |
 | `python -m dlc.calibrate --help` | every flag's syntax; operating policy (e.g. never `--supervised` on hardware) comes from this guide |
 | `docs/NAMING.md` | glossary of DLC identifiers |
 
@@ -341,3 +345,23 @@ python -m dlc.stages.fald_profile --phase register --run runs/<dir>     # then g
 - Expect about 40 minutes of measurement plus the fit, then an on-panel verify (layer off / identity / on).
 - Ship nothing the verify didn't confirm. The fitted `.bin` describes this one panel; never share it as a
   "profile" for other units.
+- The human loads the file in DesktopLUT: **PIPELINE** → the display → HDR or SDR → **+ FALD** → *BROWSE…*. A file
+  belongs to the mode it was profiled in; the other mode refuses it.
+
+## 16. Refresh-rate trim (HDR)
+
+Some panels are a few percent brighter at lower refresh rates. DesktopLUT 3.0 trims the HDR MHC profile for the
+rate the display runs at, from a `refresh_response` section in the display's HDR DIP (`dip_store.json`). Rates that
+were not measured get no trim.
+
+- The measurement is not a `--flow` yet. The building blocks are `dlc.refresh_mode` (switches one display's refresh
+  rate by hardware ID, temporarily, and verifies the switch) and `dlc.refresh_trim` (the analysis and the record
+  step).
+- Measure with DesktopLUT's own trim off: `layers.set` with `refresh_trim: false` for the display's HDR pair.
+  With it on, the readings show the trim's residual, not the panel's response.
+- Record a finished run: `python -m dlc.refresh_trim record --run <dir>` prints what would be written and any
+  problems; add `--write` to store it. A run with problems is not recorded.
+- DesktopLUT reads the DIP again on its next refresh-rate switch, on *RELOAD* in the REFRESH TRIM row (**PIPELINE**
+  → **GRAYSCALE**, HDR side), or on a `layers.set` with `refresh_trim`. `state.get` → `refresh_trim` says what is
+  applied.
+- Nothing is swapped during a calibration session. A normal run needs no extra step for it.
