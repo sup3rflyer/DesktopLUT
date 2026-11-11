@@ -505,8 +505,8 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
                            iniPath);
         }
     }
-    // The refresh-trim switch (HDR): written only when off — absent = on.
-    if (isHDR) IniWriteString(section, (p + L"MHCRefreshTrim").c_str(), mhc.refreshTrimEnabled ? nullptr : L"0", iniPath);
+    // The refresh-trim switch (HDR): written only when on — absent = off (the default since 3.0).
+    if (isHDR) IniWriteString(section, (p + L"MHCRefreshTrim").c_str(), mhc.refreshTrimEnabled ? L"1" : nullptr, iniPath);
 
     // Correction grayscale (fine-tuning on top of base)
     WritePrivateProfileBool(section, (p + L"MHCCorrGSEnabled").c_str(), mhc.correctionGrayscale.enabled, iniPath);
@@ -747,7 +747,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
             }
         }
     }
-    if (isHDR) mhc.refreshTrimEnabled = GetPrivateProfileBool(section, (p + L"MHCRefreshTrim").c_str(), true, iniPath);
+    if (isHDR) mhc.refreshTrimEnabled = GetPrivateProfileBool(section, (p + L"MHCRefreshTrim").c_str(), false, iniPath);
     // Backward compatibility: if no permutation data but old DG path exists, migrate
     if (mhc.permNames[mhc.activePerm].empty() && !mhc.profileName.empty()) {
         // Old format: profilePath is the active profile, compute perm from settings
@@ -1294,6 +1294,16 @@ void SaveSettings() {
     ui::Invalidate();   // every settings change ends in a save: let the interface redraw (any thread)
 }
 
+bool DefaultDwmHookMode() {
+    // RtlGetVersion: the real build number, whatever compatibility mode or manifest the process runs under.
+    typedef LONG (WINAPI* RtlGetVersionFn)(OSVERSIONINFOW*);
+    OSVERSIONINFOW v = {};
+    v.dwOSVersionInfoSize = sizeof(v);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    RtlGetVersionFn fn = ntdll ? (RtlGetVersionFn)GetProcAddress(ntdll, "RtlGetVersion") : nullptr;
+    return fn && fn(&v) == 0 && v.dwBuildNumber >= 22000;
+}
+
 bool LoadSettings() {
     std::wstring iniPath = GetIniPath();
 
@@ -1315,7 +1325,7 @@ bool LoadSettings() {
     g_frameBufferEnabled.store(GetPrivateProfileBool(L"General", L"FrameBuffer", true, iniPath.c_str()));
     g_framePacerLogEnabled.store(GetPrivateProfileBool(L"General", L"FramePacerLog", false, iniPath.c_str()));
     g_frameBufferIdleMs.store((int)GetPrivateProfileIntW(L"General", L"FrameBufferIdleMs", 3000, iniPath.c_str()));
-    g_dwmHookMode.store(GetPrivateProfileBool(L"General", L"DwmHookMode", false, iniPath.c_str()));
+    g_dwmHookMode.store(GetPrivateProfileBool(L"General", L"DwmHookMode", DefaultDwmHookMode(), iniPath.c_str()));
     g_calibrationControlEnabled.store(GetPrivateProfileBool(L"General", L"CalibrationControl", false, iniPath.c_str()));
 
     // Load gamma whitelist (expanding buffer to avoid truncation)

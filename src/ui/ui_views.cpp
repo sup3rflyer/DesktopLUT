@@ -788,9 +788,14 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
     EndRow(row);
 
     // The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h); both modes at once like LED LAG. Default off.
+    // HIDDEN since 3.0 (the owner's call: the always-on core is the product, the fade a heavy experiment). It is
+    // switched on only by the INI (<mode>_FaldFlankFade) or the pipe (runtime.fald_flank_fade); the row is drawn
+    // only while it is on, so a running fade is never invisible and can be switched off here.
+    if (f.flankFade) {
     row = BeginRow("FLANK FADE");
     RowTip(row, "Experimental. Fades the correction on smooth steep edges, along the motion.\n"
-                "Paused while the GPU cannot run it in time (15 % of the content frame interval).");
+                "Paused while the GPU cannot run it in time (15 % of the content frame interval).\n"
+                "Switched off, this row goes away: the fade is set in the INI.");
     RowPlace(row);
     bool fade = false;
     if (OnOff("##fald_flank_fade", f.flankFade, &fade))
@@ -813,6 +818,7 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
         }
     }
     EndRow(row);
+    }   // f.flankFade
 
     // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields the classic rows have; the rest
     // are INI / pipe only. The fields stay in place, disabled, while it is off.

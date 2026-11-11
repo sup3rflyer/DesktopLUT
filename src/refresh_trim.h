@@ -13,7 +13,7 @@
 // (the DLC tab's: [UI] DlcFolder, else found next to DesktopLUT) and DERIVES the trim at bake time: g = 1 / ratio,
 // held below the lowest level, faded out to 1 above the highest — flat at the panel's peak (the section's, else the
 // HDR profile's), both ends the panel's own (DeriveRefreshTrim, mhc.h MhcRefreshTrimGain). No DLC folder, no DIP, no
-// section, the display's switch off (INI HDR_MHCRefreshTrim=0) = no trim, and every profile byte-identical to one
+// section, the display's switch off (the default; INI HDR_MHCRefreshTrim=1 = on) = no trim, and every profile byte-identical to one
 // baked without this feature.
 //
 // WHICH SECTION: the section's identity.hardware_id (the EDID vendor + product the measurement read off the display,

@@ -619,7 +619,7 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(ok=False, error="desktop_gamma / tonemap / refresh_trim are HDR-only layers")
             if is_hdr:
                 cur["refresh_trim"] = bool(params["refresh_trim"])
-                before.setdefault("refresh_trim", True)
+                before.setdefault("refresh_trim", False)   # the switch's default (off since 3.0)
         for name in self.LAYER_NAMES:
             if name in params:
                 val = bool(params[name])

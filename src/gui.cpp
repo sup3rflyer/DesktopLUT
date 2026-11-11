@@ -1051,6 +1051,33 @@ static const int MHC_BURST_DELAYS_MS[] = { 2000, 5000, 15000 };  // fires at +2s
 static const int MHC_BURST_STAGES = 3;
 static int g_mhcBurstStage = 0;
 
+// The hook will not stay attached, or cannot be injected again, on this system. Without this the same loop
+// (a black flash per re-injection, then nothing applied) would run again on every start — and hook mode is
+// the default on Windows 11. So hook mode is switched OFF, saved, and the overlay takes the live layers
+// over; switching DWM HOOK on again in Settings is the retry (after a Windows update, say). GUI thread.
+static void HookUnusableFallBackToOverlay(const std::wstring& why) {
+    if (IsCalibrationOrLiveEditActive()) {
+        // A calibration run or a live edit owns the stack: no engine change under it (its measurements were
+        // taken through the hook). As before 3.0: stop trying, say so; the next start tries the hook again.
+        SetStatus(L"DWM Hook unstable — disabled (use overlay mode)");
+        RequestWindowsToneMap(false);   // nothing tone maps now: Auto reports the panel's peak again
+        return;
+    }
+    const std::wstring title = L"DWM Hook switched off: the overlay applies your corrections";
+    const std::wstring detail = why + L"\n\nDWM Hook mode is now off and the overlay engine runs instead. "
+                                      L"To try the hook again, switch DWM HOOK on in Settings.";
+    if (g_uiClassic) {   // unowned, on its own thread: never a modal box on the GUI thread (a pipe caller may wait on it)
+        std::thread([msg = title + L".\n\n" + detail]() {
+            MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
+                        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        }).detach();
+    } else {   // the new interface: a warning (the footer shows it in amber; Events has the detail)
+        notify::Post(notify::Sev::Warning, -1, L"hook", title, detail);
+    }
+    act::SetDwmHookMode(false);   // saves; restarts the live layers in overlay mode
+    RequestWindowsToneMap(false); // whatever tone maps now decides what Auto reports
+}
+
 static bool AnyMhcProfileActive() {
     std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
     for (const auto& ms : g_gui.monitorSettings) {
@@ -2765,13 +2792,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // won't stay attached on this system (common on some Windows 10
                 // builds where the dwmcore offsets don't match). See issue #3.
                 KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
-                SetStatus(L"DWM Hook unstable — disabled (use overlay mode)");
-                RequestWindowsToneMap(false);   // nothing tone maps now: Auto reports the panel's peak again
                 std::cout << "[DWM Hook Watchdog] Hook keeps dropping after "
                           << g_dwmHookReinjectCount << " re-injections — giving up to stop "
                              "the re-injection flash loop. DWM Hook Mode is unreliable on "
-                             "this system (common on Windows 10); turn it off and use overlay "
-                             "mode in Settings." << std::endl;
+                             "this system (common on Windows 10)." << std::endl;
+                HookUnusableFallBackToOverlay(L"The hook kept detaching from the desktop compositor.");
                 return 0;
             }
             if (action == act::WatchdogAction::StandDown) {
@@ -2804,8 +2829,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                << L"): " << err << std::endl;
                     if (g_dwmHookWatchdogRetries >= DWM_HOOK_WATCHDOG_MAX_RETRIES) {
                         KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
-                        SetStatus(L"DWM Hook lost — re-injection failed");
                         std::cout << "[DWM Hook Watchdog] Max retries reached, giving up" << std::endl;
+                        HookUnusableFallBackToOverlay(L"The hook was lost and could not be injected again:\n" + err);
+                        return 0;
                     }
                 }
             } else {

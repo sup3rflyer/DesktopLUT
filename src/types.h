@@ -1017,9 +1017,9 @@ struct MHCSettings {
     // "" = none. A slot whose stamp is not what the current want bakes (MhcPermTrimBakedAt) is stale for it: a stashed
     // variant is swapped in, else it is regenerated. Saved with the cache (INI HDR_MHCPermTrim<k>, only when set).
     std::string permTrimStamp[PERM_COUNT];
-    // The user's switch: off = no trim on this display, whatever its DIP holds. INI HDR_MHCRefreshTrim, written only
-    // when off (absent = on: "present in the DIP = applied").
-    bool refreshTrimEnabled = true;
+    // The user's switch: off (the default) = no trim on this display, whatever its DIP holds. INI
+    // HDR_MHCRefreshTrim, written only when on (absent = off).
+    bool refreshTrimEnabled = false;
     // Runtime only (never saved): the trim the display's live refresh rate asks for (ReconcileRefreshTrim, outside
     // calibrations and live edits). Every bake of the mode carries it (BuildMHC2ParamsForPerm); inactive = none.
     MhcRefreshTrim refreshTrimWant;

@@ -612,6 +612,8 @@ TEST_CASE("Refresh trim variants: what a bake carries; the grayscale bypass and 
     m.enabled = true;
     m.refreshTrimWant = Flat(0.97);
     const uint8_t gs = MHCSettings::PERM_GS;
+    CHECK_FALSE(MhcBakesRefreshTrim(m, true, gs));                          // the switch is off by default
+    m.refreshTrimEnabled = true;
     CHECK(MhcBakesRefreshTrim(m, true, gs));
     CHECK(MhcExpectedTrimStamp(m, true, gs) == m.refreshTrimWant.stamp);
     CHECK_FALSE(MhcBakesRefreshTrim(m, false, gs));                         // SDR
@@ -648,6 +650,7 @@ TEST_CASE("Refresh trim variants: what a bake carries; the grayscale bypass and 
 TEST_CASE("Refresh trim stash: a switch back takes the kept variant; bounded; never forgets the profile on screen") {
     MHCSettings m;
     m.enabled = true;
+    m.refreshTrimEnabled = true;
     const uint8_t perm = MHCSettings::PERM_GS | MHCSettings::PERM_DG;
     m.dgSdrWhiteNits = 116.0f;
     // 60 Hz: the untrimmed variant in the slot, on screen.
@@ -724,22 +727,23 @@ TEST_CASE("Refresh trim INI: stamps and the switch round-trip; an untrimmed cach
     SaveMHCSettings(L"TestMon", L"HDR_", plain, ini.c_str());
     const std::string t0 = text();
     CHECK(t0.find("MHCPermTrim") == std::string::npos);
-    CHECK(t0.find("MHCRefreshTrim") == std::string::npos);
+    CHECK(t0.find("MHCRefreshTrim") == std::string::npos);   // off (the default) writes no key
     MHCSettings back;
+    back.refreshTrimEnabled = true;                          // the load must set it, not leave it
     LoadMHCSettings(L"TestMon", L"HDR_", back, ini.c_str());
-    CHECK(back.refreshTrimEnabled);
+    CHECK_FALSE(back.refreshTrimEnabled);
     for (int k = 0; k < MHCSettings::PERM_COUNT; k++) CHECK(back.permTrimStamp[k].empty());
 
     MHCSettings trimmed = plain;
     trimmed.permTrimStamp[4] = Flat(0.97).stamp;
     trimmed.permTrimStamp[5] = "0123456789abcdef";       // no file named: not written
-    trimmed.refreshTrimEnabled = false;
+    trimmed.refreshTrimEnabled = true;
     SaveMHCSettings(L"TestMon", L"HDR_", trimmed, ini.c_str());
     LoadMHCSettings(L"TestMon", L"HDR_", back, ini.c_str());
     CHECK(back.permTrimStamp[4] == trimmed.permTrimStamp[4]);
     CHECK(back.permTrimStamp[5].empty());
-    CHECK_FALSE(back.refreshTrimEnabled);
-    CHECK(text().find("HDR_MHCRefreshTrim=0") != std::string::npos);
+    CHECK(back.refreshTrimEnabled);
+    CHECK(text().find("HDR_MHCRefreshTrim=1") != std::string::npos);
 
     // Unreadable = stale for every trim, "none" included.
     for (const wchar_t* bad : { L"xyz", L"0123456789abcdeg", L"0123" }) {
@@ -749,9 +753,11 @@ TEST_CASE("Refresh trim INI: stamps and the switch round-trip; an untrimmed cach
         back.refreshTrimWant = MhcRefreshTrim{};
         CHECK_FALSE(MhcPermTrimBakedAt(back, true, 4));
     }
-    // Switched back on: the key goes.
-    trimmed.refreshTrimEnabled = true;
+    // Switched off again: the key goes.
+    trimmed.refreshTrimEnabled = false;
     SaveMHCSettings(L"TestMon", L"HDR_", trimmed, ini.c_str());
     CHECK(text().find("MHCRefreshTrim") == std::string::npos);
+    LoadMHCSettings(L"TestMon", L"HDR_", back, ini.c_str());
+    CHECK_FALSE(back.refreshTrimEnabled);
     _wremove(ini.c_str());
 }

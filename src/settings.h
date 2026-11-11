@@ -90,6 +90,11 @@ constexpr size_t kMaxSavedMonitorSections = (size_t)kMaxDisplaySlots;
 constexpr int kIniVersion = 3;
 constexpr int kIniVersionExactFloats = 3;
 
+// [General] DwmHookMode when the INI does not say (a first run): on for Windows 11 (build 22000 and later, the
+// builds the hook's patterns are maintained for), off for Windows 10 (the hook can keep detaching there; the
+// overlay is the safe engine). Every save writes the key, so this decides a fresh install only.
+bool DefaultDwmHookMode();
+
 // Today's local date as ISO "YYYY-MM-DD" (the FirstSeen / LastSeen stamps).
 std::wstring TodayIsoDate();
 

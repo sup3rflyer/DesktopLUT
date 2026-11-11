@@ -87,7 +87,7 @@ std::atomic<bool> g_framePacerSpinWait{ true }; // Enable spin-wait phase (defau
 std::atomic<bool> g_frameBufferEnabled{ true };  // Enable auto frame buffer (default: on)
 std::atomic<bool> g_framePacerLogEnabled{ false }; // Log frame pacer stats to CSV (default: off)
 std::atomic<int> g_frameBufferIdleMs{ 3000 };  // Idle timeout before buffer engages (default: 3s)
-std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (default: off, experimental)
+std::atomic<bool> g_dwmHookMode{ false };      // DWM hook mode (set by LoadSettings; a first run's default: DefaultDwmHookMode)
 std::atomic<bool> g_appShuttingDown{ false };
 std::atomic<bool> g_sessionEnding{ false };
 std::atomic<bool> g_calibrationControlEnabled{ false };  // DLC calibration IPC server arm (default: off — normal DesktopLUT exposes nothing)

@@ -841,10 +841,12 @@ void CreateGUILayout(HWND hwnd) {
     // DLC/results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md): the correction fades toward "layer off" on smooth steep
     // flanks, low-passed along the content's motion. Applies to both modes like View. Default off until the owner's
     // hardware gates pass. On the second starfield row's free right end: no new row, the group keeps its height.
+    // HIDDEN since 3.0 (the owner's call: the always-on core is the product, the fade a heavy experiment): the
+    // control exists (the handlers read it) but is not in the tab's list, so it never shows. The fade is still
+    // reachable by the INI (<mode>_FaldFlankFade) and the pipe (runtime.fald_flank_fade).
     g_gui.hwndFaldFlankFade = CreateWindow(L"BUTTON", L"Flank fade",
         WS_CHILD | BS_AUTOCHECKBOX,
         innerX + 300, faldS2Y, 90, h, panel2, (HMENU)ID_CORR_FALD_FLANK_FADE, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldFlankFade);
 
     g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + Windows tone map (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
 

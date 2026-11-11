@@ -418,6 +418,7 @@ ui::Snapshot FakeSnapshot() {
     a.settings.hdrPath = L"D:\\Calibration\\DLC\\results\\PA32UCXR_HDR\\final_hdr.cube";
     MHCSettings& m = a.settings.hdrMHC;
     m.enabled = true;
+    m.refreshTrimEnabled = true;   // off by default; the REFRESH TRIM shots show it switched on
     m.profileName = L"DesktopLUT_HDR_AUS322A.icm";
     m.profilePath = L"C:\\Windows\\System32\\spool\\drivers\\color\\DesktopLUT_HDR_AUS322A.icm";
     m.sourceFilePath = L"D:\\Calibration\\DLC\\results\\PA32UCXR_HDR\\mhc_hdr.cube";
