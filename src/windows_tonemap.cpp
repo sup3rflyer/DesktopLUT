@@ -293,3 +293,21 @@ void ReleaseWindowsToneMapForExit(bool sessionEnding) {
 float EdidHdrPeakNits(const DisplayInfo& display) {
     return display.devicePath.empty() ? 0.0f : EdidFor(display).luminance.maxNits;
 }
+
+int ReleaseReportedPeakForUninstall(HMONITOR hmon, const DisplayInfo& di) {
+    if (di.devicePath.empty()) return 0;
+    DXGI_OUTPUT_DESC1 desc;
+    if (!InHdr(hmon, desc)) return 0;   // the override takes only in HDR (and leaving HDR drops it)
+    const EdidValues edid = EdidFor(di);
+    const float peak = edid.luminance.maxNits;
+    if (!(peak > 0.0f) || peak >= kWindowsToneMapBypassNits - 1.0f) return 0;   // nothing of the panel's to go back to
+    auto it = g_overrides.find(di.devicePath);
+    const bool sentHere = it != g_overrides.end() && it->second.sent;
+    // Another process's 10000 (an earlier run, the command line) is recognised by the value: only the bypass says it.
+    const bool reportsBypass = desc.MaxLuminance >= kWindowsToneMapBypassNits - 1.0f;
+    if (!sentHere && !reportsBypass) return 0;
+    const float frameAvg = edid.luminance.maxFrameAvgNits > 0.0f ? edid.luminance.maxFrameAvgNits : peak;
+    if (!SetDisplayPeakOverride(di, OverridePrimaries(edid, desc), edid.luminance.minNits, peak, frameAvg)) return -1;
+    if (it != g_overrides.end()) it->second = OverrideState();
+    return 1;
+}

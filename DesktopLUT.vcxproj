@@ -104,6 +104,8 @@
     <ClCompile Include="src\gui_whitelist.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
     <ClCompile Include="src\monitor_identity.cpp" />
+    <ClCompile Include="src\uninstall.cpp" />
+    <ClCompile Include="src\uninstall_win.cpp" />
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\mhc_icc.cpp" />
     <ClCompile Include="src\mhc_install.cpp" />
@@ -170,6 +172,8 @@
     <ClInclude Include="src\display_power.h" />
     <ClInclude Include="src\windows_tonemap.h" />
     <ClInclude Include="src\refresh_trim.h" />
+    <ClInclude Include="src\uninstall.h" />
+    <ClInclude Include="src\uninstall_win.h" />
     <ClInclude Include="src\shader.h" />
     <ClInclude Include="shared\fald_panel.h" />
     <ClInclude Include="shared\fald_panel_live.h" />

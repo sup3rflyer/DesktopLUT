@@ -5,6 +5,7 @@
 #include "ui_snapshot.h"
 #include "ui_gsedit.h"
 #include "ui_mhcedit.h"
+#include "uninstall.h"
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -42,6 +43,16 @@ struct DlcView {
     bool dirty = false;                    // the viewer changed a pick or an option: save them
     int openOptions = -1;                  // a tile whose options menu opens on the next frame (the UI shots)
 };
+// SETTINGS > REMOVE EVERYTHING: the modal shows the plan built from a snapshot of the PC, runs that same plan once
+// confirmed, then shows each step's outcome; its EXIT ends the app (uninstall_win.h).
+struct UninstallView {
+    enum class Phase { Closed, Plan, Running, Done } phase = Phase::Closed;
+    bool openRequested = false;
+    uninst::State state;
+    uninst::Plan plan;
+    uninst::Result result;
+};
+
 inline const wchar_t* const kDlcPickLive = L"<live>";
 inline const wchar_t* const kDlcPickStack = L"<stack>";   // what the display runs now: its layers and their verification
 
@@ -66,6 +77,7 @@ struct ViewState {
     char whitelistAdd[128] = {};   // the add field (UTF-8)
     bool whitelistRefocus = false; // an app was added with Enter: the field keeps the focus for the next one
     bool faldViewOpenRequested = false;   // the FALD VIEW list opens on the next frame (the UI shots)
+    UninstallView uninstall;       // REMOVE EVERYTHING (Settings > About)
 };
 
 // An editor holds the page (its display, its mode, the pipeline) until DONE / CANCEL.

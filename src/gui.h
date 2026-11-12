@@ -93,6 +93,13 @@ void UpdateStartupPath();
 // IsStartupEnabled as last read (-1 unknown, 0, 1): the new interface's frames read this, never the COM query.
 int StartupEnabledCached();
 void RefreshStartupEnabledCache();   // GUI thread, outside a frame (a command or a handler)
+// Remove everything (uninstall.h): whether the "DesktopLUT" logon task (whatever exe it names) and the pre-task
+// HKCU Run entry exist, and their removal (1 = removed, 0 = neither existed, -1 = failed, err set). Out-of-process COM.
+void StartupEntriesPresent(bool& task, bool& runKey);
+int RemoveStartupEntries(std::wstring& err);
+// Remove everything, in the app: the first half of the exit teardown (no timer, display, power or pipe message re-arms
+// anything; live edits and the beacon end) without closing the interface, which then shows the result. GUI thread.
+void QuiesceForUninstall();
 
 // Arms / disarms the DLC calibration pipe and remembers the choice. GUI thread.
 void ApplyCalibrationControl(bool enable);

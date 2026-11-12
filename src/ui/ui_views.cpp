@@ -17,6 +17,7 @@
 #include "gui.h"
 #include "gui_mhc.h"   // MhcProfileMetadataPeakNits
 #include "mhc_preview.h"   // MhcPreviewHolds
+#include "uninstall_win.h"   // REMOVE EVERYTHING
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -1667,6 +1668,20 @@ void SettingsAbout(ViewState& vs) {
     row = BeginRow("LICENSE");
     RowText(row, "GPL-3.0");
     EndRow(row);
+    row = BeginRow("UNINSTALL");
+    RowTip(row, "Takes back what DesktopLUT changed outside its folder, then exits.\nShows the list first.");
+    RowPlace(row);
+    if (Button("##set_uninstall", "REMOVE EVERYTHING\xE2\x80\xA6", 170)) {
+        UninstallView* u = &vs.uninstall;
+        Post([u]() {   // the snapshot queries Task Scheduler (out-of-process COM) and Windows' profile lists: not in a frame
+            u->state = uninst::CollectStateInApp();
+            u->plan = uninst::BuildPlan(u->state);
+            u->result = {};
+            u->phase = UninstallView::Phase::Plan;
+            u->openRequested = true;
+        });
+    }
+    EndRow(row);
     row = BeginRow("NOTICES");
     if (RowButtons(row, "set_notices", { vs.showNotices ? "HIDE" : "SHOW" }) == 0) vs.showNotices = !vs.showNotices;
     std::string names;
@@ -2192,6 +2207,95 @@ void DrawWhitelist(ViewState& vs) {
     ImGui::EndPopup();
 }
 
+// REMOVE EVERYTHING: the plan (what goes, what stays), then each step's outcome. One table for both, the outcome column
+// reserved from the start, so the modal keeps its size from the question to the answer.
+void DrawUninstall(ViewState& vs) {
+    using Phase = UninstallView::Phase;
+    UninstallView& u = vs.uninstall;
+    if (u.openRequested) {
+        ImGui::OpenPopup("##uninstall");
+        u.openRequested = false;
+    }
+    if (u.phase == Phase::Closed) return;
+    const char* title = u.phase == Phase::Plan ? "REMOVE EVERYTHING?"
+                      : u.phase == Phase::Running ? "REMOVING\xE2\x80\xA6"
+                      : u.result.anyFailed ? "REMOVED, NOT ALL OF IT" : "REMOVED";
+    if (!BeginModal("##uninstall", title)) return;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    // Rows as tall as the window allows (the modal sits at 40 % of it: it must stay under 80 %), 16..24 DIP.
+    const float rows = (float)(u.plan.steps.size() + u.plan.stays.size());
+    const float fit = (ImGui::GetMainViewport()->WorkSize.y * 0.78f - Px(170)) / (rows > 0 ? rows : 1.0f);
+    const float rowH = Snap((std::max)(Px(16), (std::min)(Px(24), fit)));
+    const float tagW = Snap(Px(72)), labelW = Snap(Px(230)), textW = Snap(Px(400));
+    const float totalW = tagW + labelW + textW;
+    auto line = [&](const char* tag, ImU32 tagCol, const std::string& label, const std::string& text, ImU32 textCol) {
+        const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+        const float cy = p.y + rowH * 0.5f;
+        if (tag && *tag) DrawText(dl, Font::Label, kSizeLabel, p.x, cy, tagCol, tag);
+        DrawText(dl, Font::Label, kSizeLabel, p.x + tagW, cy, pal::InkDim,
+                 Ellipsize(Font::Label, kSizeLabel, label, labelW - Px(12)).c_str());
+        const std::string shown = Ellipsize(Font::Body, 13.0f, text, textW);
+        DrawText(dl, Font::Body, 13.0f, p.x + tagW + labelW, cy, textCol, shown.c_str());
+        ImGui::Dummy(ImVec2(totalW, rowH));
+        if (shown != text && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", text.c_str());
+    };
+    auto heading = [&](const char* text) {
+        ImGui::Dummy(ImVec2(0, Px(6)));
+        Text(Font::Label, kSizeLabel, pal::InkFaint, text);
+        ImGui::Dummy(ImVec2(0, Px(2)));
+    };
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), 0));   // the rows' own height is their pitch
+    heading(u.phase == Phase::Done ? "RESULT" : "REMOVES");
+    for (size_t i = 0; i < u.plan.steps.size(); i++) {
+        const uninst::Step& st = u.plan.steps[i];
+        if (u.phase == Phase::Done && i < u.result.steps.size()) {
+            const uninst::StepResult& r = u.result.steps[i];
+            const bool failed = r.outcome == uninst::Outcome::Failed, done = r.outcome == uninst::Outcome::Done;
+            line(failed ? "FAILED" : done ? "DONE" : "\xE2\x80\x94", failed ? pal::Alarm : done ? pal::Good : pal::InkFaint,
+                 st.label, r.note, failed ? pal::Ink : pal::InkDim);
+        } else {
+            line(nullptr, 0, st.label, st.detail, pal::Ink);
+        }
+    }
+    heading("STAYS");
+    for (const uninst::Stay& s : u.plan.stays) line(nullptr, 0, s.label, s.detail, pal::InkDim);
+    ImGui::PopStyleVar();
+
+    ImGui::Dummy(ImVec2(0, Px(14)));
+    if (u.phase == Phase::Plan) {
+        if (PushButton("##uninstall_go", "REMOVE EVERYTHING", 170, 26, true)) {
+            u.phase = Phase::Running;
+            UninstallView* up = &u;
+            Post([up]() {
+                try {
+                    up->result = uninst::RunInApp(up->plan, up->state);
+                } catch (...) {   // the steps catch nothing themselves: say so, and keep EXIT reachable
+                    up->result = {};
+                    up->result.steps.resize(up->plan.steps.size(), { uninst::Outcome::Failed, "Stopped by an error" });
+                    up->result.anyFailed = true;
+                }
+                up->phase = Phase::Done;
+            });
+        }
+        ImGui::SameLine(0, Px(8));
+        if (PushButton("##uninstall_no", "CANCEL", kButtonW, 26) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            u = UninstallView();
+            ImGui::CloseCurrentPopup();
+        }
+    } else if (u.phase == Phase::Done) {
+        if (PushButton("##uninstall_exit", "EXIT", kButtonW, 26, true) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+            uninst::RequestExitAfterUninstall();
+        ImGui::SameLine(0, Px(14));
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        DrawText(dl, Font::Body, 13.0f, p.x, p.y + Snap(Px(26)) * 0.5f, pal::InkDim, "Then delete the DesktopLUT folder.");
+        ImGui::Dummy(ImVec2(0, Snap(Px(26))));
+    } else {
+        ImGui::Dummy(ImVec2(0, Snap(Px(26))));   // the buttons' row, kept while it runs
+    }
+    ImGui::EndPopup();
+}
+
 void DrawConfirm(ViewState& vs) {
     if (vs.confirmOpenRequested) {
         ImGui::OpenPopup("##confirm");
@@ -2252,6 +2356,7 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     DrawFooter(snap, vs, busy);
     DrawConfirm(vs);
     DrawWhitelist(vs);
+    DrawUninstall(vs);
     if (escEndsView) Post([]() { act::ClearFaldViews(); });
     ImGui::End();
 }

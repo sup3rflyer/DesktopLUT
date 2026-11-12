@@ -15,6 +15,7 @@
 #include "dlc/dlc_scan.h"
 #include "dlc/dlc_live.h"
 #include "globals.h"
+#include "uninstall_win.h"
 #include "../resource.h"
 #include <windows.h>
 #include <dwmapi.h>
@@ -348,6 +349,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_CLOSE:
+        // After a remove-everything the app only exits (it is quiesced: the tray's menu no longer answers).
+        if (g_view.uninstall.phase == UninstallView::Phase::Done) {
+            uninst::RequestExitAfterUninstall();
+            return 0;
+        }
         Hide();
         return 0;
     case WM_DESTROY:

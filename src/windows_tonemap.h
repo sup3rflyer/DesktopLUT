@@ -48,3 +48,8 @@ void ReleaseWindowsToneMapForExit(bool sessionEnding);
 // a display without a profile or an override. 0 = unknown.
 struct DisplayInfo;
 float EdidHdrPeakNits(const DisplayInfo& display);
+
+// Remove everything (uninstall.h): the display's reported HDR peak goes back to its EDID's where it can only be
+// DesktopLUT's doing — this process sent the override, or Windows reports the bypass's 10000 nits while the EDID
+// declares less. 1 = sent, 0 = nothing to do (not in HDR, not ours, no EDID peak), -1 = the override failed.
+int ReleaseReportedPeakForUninstall(HMONITOR hmon, const DisplayInfo& display);

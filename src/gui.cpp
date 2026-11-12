@@ -23,6 +23,7 @@
 #include "analysis.h"
 #include "desktoplut_ipc_server.h"
 #include "monitor_identity.h"
+#include "uninstall_win.h"
 #include "actions/actions.h"
 #include "actions/notify.h"
 #include "actions/reconcile.h"
@@ -952,6 +953,50 @@ void SetStartupEnabled(bool enable) {
     SysFreeString(bstrName);
 }
 
+void StartupEntriesPresent(bool& task, bool& runKey) {
+    runKey = HasOldRegistryStartup();
+    task = false;
+    TaskSchedulerConnection ts;
+    if (!ts.Connect()) return;
+    BSTR name = SysAllocString(g_scheduledTaskName);
+    IRegisteredTask* pTask = nullptr;
+    if (SUCCEEDED(ts.folder->GetTask(name, &pTask)) && pTask) {
+        task = true;
+        pTask->Release();
+    }
+    SysFreeString(name);
+}
+
+int RemoveStartupEntries(std::wstring& err) {
+    bool task = false, runKey = false;
+    StartupEntriesPresent(task, runKey);
+    if (!task && !runKey) return 0;
+    if (runKey) RemoveOldRegistryStartup();
+    if (task) {
+        TaskSchedulerConnection ts;
+        if (!ts.Connect()) {
+            err = L"Task Scheduler unavailable";
+            return -1;
+        }
+        BSTR name = SysAllocString(g_scheduledTaskName);
+        const HRESULT hr = ts.folder->DeleteTask(name, 0);
+        SysFreeString(name);
+        if (FAILED(hr)) {
+            wchar_t buf[64];
+            swprintf_s(buf, L"Task Scheduler refused (0x%08lX)", (unsigned long)hr);
+            err = buf;
+            return -1;
+        }
+    }
+    bool taskLeft = false, runLeft = false;
+    StartupEntriesPresent(taskLeft, runLeft);
+    if (taskLeft || runLeft) {
+        err = taskLeft ? L"The logon task is still there" : L"The Run entry is still there";
+        return -1;
+    }
+    return 1;
+}
+
 void AddTrayIcon(HWND hwnd) {
     g_gui.nid.cbSize = sizeof(NOTIFYICONDATA);
     g_gui.nid.hWnd = hwnd;
@@ -1748,6 +1793,18 @@ static void KillAllGuiTimers(HWND hwnd) {
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
 
+void QuiesceForUninstall() {
+    // As WM_DESTROY, up to the engine stop (the uninstall's own first step): from here on nothing starts or re-arms —
+    // a verify tick, burst stage, display change or pipe command would re-associate or re-bake what is being removed.
+    g_appShuttingDown.store(true);
+    if (g_gui.hwndMain) KillAllGuiTimers(g_gui.hwndMain);
+    FaldExemptShutdown();
+    StopIcmRegistryWatcher();
+    StopCalibrationIpcServer();
+    AbortLiveEditsForShutdown();
+    if (g_gui.hwndMain) StopDwmHookBeacon(g_gui.hwndMain);
+}
+
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_appShuttingDown.load(std::memory_order_relaxed) && IgnoredDuringShutdown(msg)) {
         if (msg == WM_TIMER) KillTimer(hwnd, wParam);
@@ -1755,6 +1812,12 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
     if (WM_SHOW_ACTIVE_UI && msg == WM_SHOW_ACTIVE_UI) {
         if (!g_appShuttingDown.load()) ShowActiveUi();   // a relaunch during exit: nothing comes back
+        return 0;
+    }
+    // `DesktopLUT.exe /uninstall` asks a running instance to exit (it holds the hook and the profiles), and the
+    // interface's EXIT after a remove-everything comes here too: the ordered teardown, as the tray's Exit.
+    if (const UINT exitMsg = uninst::ExitForUninstallMessage(); exitMsg && msg == exitMsg) {
+        if (!uninst::UninstallInProgress()) DestroyWindow(hwnd);   // never under a running remove-everything
         return 0;
     }
     // Re-add tray icon when explorer restarts or finishes initializing
@@ -3233,8 +3296,10 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         AbortLiveEditsForShutdown();       // a live grayscale edit gives scanout back to the user's profile
         StopDwmHookBeacon(hwnd);
         StopProcessing();                  // joins the processing thread (inside a running Start/Stop: replayed after it)
-        ReleaseRefreshTrimForExit(g_sessionEnding.load());       // nothing follows the rate once DesktopLUT is gone
-        ReleaseWindowsToneMapForExit(g_sessionEnding.load());   // Auto: nothing tone maps once DesktopLUT is gone
+        if (!uninst::UninstallRan()) {     // after a remove-everything both would swap in (bake) profiles again
+            ReleaseRefreshTrimForExit(g_sessionEnding.load());       // nothing follows the rate once DesktopLUT is gone
+            ReleaseWindowsToneMapForExit(g_sessionEnding.load());   // Auto: nothing tone maps once DesktopLUT is gone
+        }
         KillAllGuiTimers(hwnd);            // anything the teardown above armed
         RemoveTrayIcon();
         // Unregister session change notifications
@@ -3326,6 +3391,8 @@ int RunGUI() {
     }
     // A second launch runs unelevated or elevated alike: let its show request through either way.
     if (WM_SHOW_ACTIVE_UI) ChangeWindowMessageFilterEx(g_gui.hwndMain, WM_SHOW_ACTIVE_UI, MSGFLT_ALLOW, nullptr);
+    // (uninst::ExitForUninstallMessage is deliberately NOT let through: only an elevated process — `/uninstall` is one,
+    // the exe requires it — may make this one exit.)
 
     // Create OSD window on GUI thread — available in all modes (hook-only, analysis-only, full overlay)
     CreateOSDWindow(GetModuleHandle(nullptr));

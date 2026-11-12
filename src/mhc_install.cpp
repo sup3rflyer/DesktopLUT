@@ -252,6 +252,21 @@ std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool 
     return result;
 }
 
+std::vector<std::wstring> ListDisplayProfileAssociations(LUID adapterLuid, UINT32 sourceId) {
+    std::vector<std::wstring> out;
+    EnsureMscmsLoaded();
+    if (!g_pfnGetDisplayList) return out;
+    LPWSTR* list = nullptr;
+    DWORD count = 0;
+    if (FAILED(g_pfnGetDisplayList(1 /* WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER */, adapterLuid, sourceId, &list, &count)) ||
+        !list)
+        return out;
+    for (DWORD k = 0; k < count; k++)
+        if (list[k]) out.emplace_back(list[k]);
+    LocalFree(list);
+    return out;
+}
+
 void CleanupOrphanedMhcProfiles() {
     // A file put in the color directory shortly before the settings below were read may belong to an install that
     // has not recorded its name yet (EnsureMhcPermProfile installs, then records; it runs on the GUI, whitelist and
