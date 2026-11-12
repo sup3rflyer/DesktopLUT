@@ -206,4 +206,3 @@ GUIState g_gui;
 // Grayscale Editor
 // ============================================================================
 
-GrayscaleEditorData* g_grayscaleEditor = nullptr;

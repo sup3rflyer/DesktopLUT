@@ -245,8 +245,3 @@ extern std::atomic<bool> g_mhcEditDialogOpen;  // Suppress profile monitoring du
 
 extern GUIState g_gui;
 
-// ============================================================================
-// Grayscale Editor
-// ============================================================================
-
-extern GrayscaleEditorData* g_grayscaleEditor;

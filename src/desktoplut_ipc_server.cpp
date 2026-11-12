@@ -27,7 +27,6 @@
 #include "calib_snapshot.h"
 #include "gui_mhc.h"
 #include "mhc_preview.h"
-#include "gui_shared.h"
 #include "mhc.h"
 #include "fald.h"
 #include "fald_core_status.h"   // the core layer's rate-cap governor's report (state.get)
@@ -191,8 +190,8 @@ std::string MonitorModeKey(int mon, bool isHDR) {
 // MHC + 3D-LUT stack (measurable by the meter), nudge it per patch, then bake it
 // into the ICC ("OK") or revert ("Cancel"). It edits ONLY correctionGrayscale —
 // never the matrix, baseGrayscale, primaries/white, or the 3D LUT — and is
-// one-toggle revertible to the vanilla core ICM. This mirrors the GUI handler at
-// gui.cpp ID_MHC_SDR_GS_EDIT, just split across begin/set/commit/cancel calls so
+// one-toggle revertible to the vanilla core ICM. This mirrors the interface's live edit
+// (actions/gs_live), just split across begin/set/commit/cancel calls so
 // a tiny per-(monitor,mode) record carries the preview session and the pre-begin
 // correction across the calls. Guarded by g_monitorSettingsMutex.
 // The preview is exact to the bake (mhc_preview.h): scanout runs an identity profile while
@@ -1165,14 +1164,14 @@ void DoExitCalibration(const JsonValue& p, JsonValue& result, std::string& error
 }
 
 // layers.set — toggle the viewing layers of one monitor:mode over the pipe, exactly as the
-// GUI checkboxes do (DLC captures them before a run, measures with them OFF, restores after;
+// interface's switches do (DLC captures them before a run, measures with them OFF, restores after;
 // the user should never have to manage corrections around a pipeline run). Params: monitor,
 // mode, and any of white_balance / grayscale / desktop_gamma / tonemap (bool; omitted = keep).
 //   * white_balance / grayscale / desktop_gamma live in the MHC layer: set the flags, then ONE
-//     RegenerateMhcIfActive (BuildMHC2Params bakes all three), like ID_MHC_*_WB_ENABLE /
-//     ID_MHC_*_GS_ENABLE. Desktop Gamma also drives the live gamma atomics (ID_MHC_HDR_DG_ENABLE).
-//   * tonemap (HDR) is the shader flag: ID_CORR_TONEMAP_ENABLE's live update path.
-//   * fald is the shader flag of the addressed mode (HDR, or SDR under ACM): ID_CORR_FALD_[SDR_]ENABLE's path.
+//     RegenerateMhcIfActive (BuildMHC2Params bakes all three), like act::MhcSetWhiteBalanceEnabled /
+//     act::MhcSetCorrectionGsEnabled. Desktop Gamma also drives the live gamma atomics (act::MhcSetDesktopGamma).
+//   * tonemap (HDR) is the shader flag: act::SetTonemap's live update path.
+//   * fald is the shader flag of the addressed mode (HDR, or SDR under ACM): act::SetFaldEnabled's path.
 //   * hook mode, running: switching either ON then reconciles the live layers like the GUI's (re-injects the
 //     hook when it lacks what the layer needs; waits out a calibration session). OFF only updates the config.
 // Result: {monitor_mode, before:{...}, after:{...}, regenerated, profile_name}.
@@ -1307,9 +1306,9 @@ void DoLayersSet(const JsonValue& p, JsonValue& result, std::string& error) {
         SaveSettings();
         FaldTrace("LayersSet: UpdateGUIState");
         UpdateGUIState();
-        FaldTrace("LayersSet: UpdateColorCorrectionControls");
-        UpdateColorCorrectionControls();   // the GUI checkboxes follow the pipe
-        FaldTrace("LayersSet: controls updated");
+        FaldTrace("LayersSet: GuiNotifySettingsChanged");
+        GuiNotifySettingsChanged(mon);   // the interface follows the pipe
+        FaldTrace("LayersSet: interface notified");
     }
     bool restartForBypass = false;
     if (lutBypassChanged) {
@@ -1498,16 +1497,14 @@ void DoMhcApply(const JsonValue& p, JsonValue& result, std::string& error) {
         return;
     }
     {
-        // Refresh the Display Calibration panel's "Primaries / Gamma / Peak" labels the way
-        // the GUI Apply button does (gui.cpp ID_MHC_*_APPLY); a pipe apply used to leave them
-        // describing the previous profile (e.g. "Rec.2020 / PQ / 10000" over a DLC install).
+        // The profile's "Primaries / Gamma / Peak" metadata labels, as act::MhcInstall computes them; a pipe apply
+        // used to leave them describing the previous profile (e.g. "Rec.2020 / PQ / 10000" over a DLC install).
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
         ComputeMhcMetadata(m, isHDR);
     }
-    // Pipe handlers run on the GUI thread (WM_CALIB_CMD marshalling), so the panel can be
-    // repainted directly, exactly as the GUI Apply path does.
-    UpdateMhcInfoDisplay(mon, isHDR);
+    // Pipe handlers run on the GUI thread (WM_CALIB_CMD marshalling): the interface redraws from the settings.
+    GuiNotifySettingsChanged(mon);
     UpdateMhcFlagsLive(mon);
     SaveSettings();
     JsonValue m = JObj();
@@ -1579,8 +1576,8 @@ static void FaldPropagate(int mon, bool isHDR) {
         }
         else DwmHookReevaluateOverlay();
     }
-    FaldTrace("FaldPropagate: UpdateColorCorrectionControls");
-    UpdateColorCorrectionControls();   // the GUI's View combo / Panel file box follow the pipe
+    FaldTrace("FaldPropagate: GuiNotifySettingsChanged");
+    GuiNotifySettingsChanged(mon);   // the interface's VIEW / PANEL FILE rows follow the pipe
     FaldTrace("FaldPropagate: end");
 }
 
@@ -1819,13 +1816,8 @@ void DoSet3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     }
     SaveSettings();
     ReapplyProcessing();
-    // Reflect the pipe-applied path in the GUI's LUT box so an operator sees it without a
-    // restart. Safe to touch the controls directly: mutating methods run on the GUI thread
-    // (dispatched via WM_CALIB_CMD). Only refresh when the affected monitor is the one
-    // currently shown, otherwise we'd overwrite another monitor's box.
-    if (mon == g_gui.currentMonitor) {
-        SetPathText(isHDR ? g_gui.hwndHdrPath : g_gui.hwndSdrPath, cube.c_str());
-    }
+    // The interface shows the pipe-applied path (mutating methods run on the GUI thread, via WM_CALIB_CMD).
+    GuiNotifySettingsChanged(mon);
     JsonValue rt = JObj();
     rt.set("cube_path", JStr(WideToUtf8(cube)));
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
@@ -1946,9 +1938,7 @@ void DoClear3dlut(const JsonValue& p, JsonValue& result, std::string& error) {
     }
     SaveSettings();
     ReapplyProcessing();
-    if (mon == g_gui.currentMonitor) {
-        SetPathText(isHDR ? g_gui.hwndHdrPath : g_gui.hwndSdrPath, L"");
-    }
+    GuiNotifySettingsChanged(mon);
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("runtime", JObj());
 }
@@ -2460,7 +2450,7 @@ void AbortLiveEditsForShutdown() {
 bool IsCalibrationOrLiveEditActive() {
     if (act::GsEditActive()) return true;   // the interface's grayscale editor (GUI thread state)
     if (act::MhcEditActive()) return true;  // the interface's profile editor (with or without a preview)
-    if (MhcPreviewActive()) return true;    // any live edit preview (the classic editor's too)
+    if (MhcPreviewActive()) return true;    // any live edit preview
     // Sequential, never nested: the GUI-thread enter nests settings -> calib.
     {
         std::lock_guard<std::mutex> lk(g_calibMutex);

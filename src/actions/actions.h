@@ -1,8 +1,7 @@
 #pragma once
-// User actions shared by the classic window, the ImGui interface and (where it fits) the calibration
-// pipe. Each takes the display and mode explicitly (never g_gui.currentMonitor), writes the settings
-// under g_monitorSettingsMutex, calls the existing helpers OUTSIDE that lock (they lock internally,
-// pump messages, or both), saves, and refreshes whichever window shows the display.
+// User actions shared by the interface, the tray, the hotkeys and (where it fits) the calibration pipe. Each
+// takes the display and mode explicitly, writes the settings under g_monitorSettingsMutex, calls the existing
+// helpers OUTSIDE that lock (they lock internally, pump messages, or both), saves, and redraws the interface.
 //
 // GUI thread only. Several actions stop/start processing or regenerate MHC profiles, which pump
 // messages: a caller must not hold references into g_gui.monitorSettings across a call.
@@ -66,7 +65,7 @@ bool SetFaldDebugView(FaldSettings& f, unsigned int view);
 bool FaldViewOn();
 // Every display back to the corrected picture (Esc, the tray's "End FALD view"). True = a view was on.
 bool ClearFaldViews();
-// The starfield fields the interfaces show (the others are INI / pipe only), clamped to the ranges the classic rows
+// The starfield fields the interface shows (the others are INI / pipe only), clamped to the ranges the classic rows
 // use: even and strength 0..1, spread (targetSigma) 0..4, keep 0..10000 nits, reach (evenReach) whole zones
 // 0..FALD_STAR_EVEN_REACH_MAX. NaN and negatives = 0.
 enum class FaldStarField { Even, Strength, Spread, Keep, Reach };
@@ -144,7 +143,7 @@ void SetUiDlcCharts(const std::wstring& encoded);   // the DLC tab's chart picks
 void SetRecalReminderDays(int days);             // 0 = off
 
 // ---- Live layers -----------------------------------------------------------------------------------
-// The classic Start / Apply: resume (act::SetLiveLayersSuspended) and restart, which re-reads the cube
+// Resume (act::SetLiveLayersSuspended) and restart, which re-reads the cube (the classic Start / Apply; unused now)
 // files at their paths. Starting and stopping otherwise follow the configuration (actions/reconcile.h).
 void ReloadLiveLayers();
 

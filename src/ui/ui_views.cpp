@@ -9,7 +9,6 @@
 #include "actions/logcap.h"
 #include "actions/reconcile.h"
 #include "dlc/dlc_scan.h"
-#include "gui_whitelist.h"
 #include "monitor_identity.h"
 #include "ui_notices.h"
 #include "version.h"
@@ -821,7 +820,7 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
             const unsigned v = lag == 1 ? FALD_TEMPORAL_PANEL : FALD_TEMPORAL_OFF; bool c = s.temporalMode != v; s.temporalMode = v; return c; });
     EndRow(row);
 
-    // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields the classic rows have; the rest
+    // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields that have a row; the rest
     // are INI / pipe only. The fields stay in place, disabled, while it is off.
     const FaldStarfieldSettings& sf = f.star;
     auto starField = [&shared](act::FaldStarField field, float v) {

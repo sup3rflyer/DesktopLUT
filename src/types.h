@@ -59,19 +59,7 @@ struct MovableAtomic {
 // Control IDs
 // ============================================================================
 
-// GUI Control IDs
-#define ID_MONITOR_LIST     101
-#define ID_SDR_PATH         102
-#define ID_SDR_BROWSE       103
-#define ID_SDR_CLEAR        104
-#define ID_HDR_PATH         105
-#define ID_HDR_BROWSE       106
-#define ID_HDR_CLEAR        107
-#define ID_APPLY            108
-#define ID_STOP             109
-#define ID_STATUS           111
-#define ID_TETRAHEDRAL_CHECK 112
-#define ID_HDR_DITHER_CHECK  114
+// The hub window's tray icon and messages (the classic window's control IDs went with it)
 #define ID_TRAY_ICON        1
 #define WM_TRAYICON              (WM_USER + 1)
 #define WM_UPDATE_ANALYSIS       (WM_USER + 2)
@@ -84,7 +72,7 @@ struct MovableAtomic {
 #define WM_DWMHOOK_INJECTED      (WM_USER + 106)  // DwmHook.dll loaded into dwm.exe: run an identity-beacon session
 #define WM_FALD_RECOMPOSE        (WM_USER + 107)  // hook FALD needs one full-screen recomposition (any thread -> GUI thread)
 #define WM_MHC_REGENERATE_MISSING (WM_USER + 108) // the active MHC profile's .icm is gone: regenerate it (verify -> GUI thread)
-#define WM_STATUS_TEXT           (WM_USER + 109)  // SetStatus from a non-GUI thread: show the latest status text (any thread -> GUI thread)
+// WM_USER + 109 was WM_STATUS_TEXT (the classic window's status line)
 // The MHC hardware LUT may be stale (adapter change, a start that superseded a pending reapply, a restart after the
 // overlay was lost): run an MHC transition burst — verify, sweep, Calibration Loader kicks, no flicker (any thread
 // -> GUI thread). wParam: MhcReloadReason.
@@ -117,156 +105,6 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_TRAY_CALIBRATION 2006
 // 2007 was ID_TRAY_CLASSIC_UI ("Classic interface", removed with the classic window)
 #define ID_TRAY_FALD_VIEW   2008   // "End FALD view": shown only while a FALD view is on
-
-// Tab control
-#define ID_TAB_CONTROL      200
-
-// SDR Corrections tab control IDs
-#define ID_CORR_PRIMARIES_ENABLE 501
-#define ID_CORR_PRIMARIES_WX     509
-#define ID_CORR_PRIMARIES_WY     510
-#define ID_CORR_GRAYSCALE_ENABLE 512
-#define ID_CORR_GRAYSCALE_10     513
-#define ID_CORR_GRAYSCALE_20     514
-#define ID_CORR_GRAYSCALE_32     515
-#define ID_CORR_GRAYSCALE_EDIT   516
-#define ID_CORR_GRAYSCALE_RESET  517
-#define ID_CORR_GRAYSCALE_24     518  // SDR only: 2.4 gamma checkbox
-
-// HDR Corrections tab control IDs
-#define ID_CORR_HDR_PRIMARIES_ENABLE  601
-#define ID_CORR_HDR_PRIMARIES_WX      602
-#define ID_CORR_HDR_PRIMARIES_WY      603
-#define ID_CORR_HDR_GRAYSCALE_ENABLE  604
-#define ID_CORR_HDR_GRAYSCALE_10      605
-#define ID_CORR_HDR_GRAYSCALE_20      606
-#define ID_CORR_HDR_GRAYSCALE_32      607
-#define ID_CORR_HDR_GRAYSCALE_EDIT    608
-#define ID_CORR_HDR_GRAYSCALE_RESET   609
-#define ID_CORR_HDR_GRAYSCALE_PEAK    610  // HDR only: peak nits edit
-
-// HDR Tonemapping control IDs (Corrections tab, HDR only)
-#define ID_CORR_TONEMAP_ENABLE   520
-#define ID_CORR_TONEMAP_CURVE    521
-#define ID_CORR_TONEMAP_TARGET   522
-#define ID_CORR_TONEMAP_SOURCE   523
-#define ID_CORR_TONEMAP_DYNAMIC  524
-
-// Windows tone map (what Windows tells apps the HDR peak is) control ID (Corrections tab, HDR only; 525, 527 and
-// 528 retired with the MaxTML enable / value / apply controls)
-#define ID_CORR_WINTONEMAP_COMBO 526
-
-// FALD compensation layer (Experimental, overlay path; one row per mode — HDR and SDR under ACM)
-#define ID_CORR_FALD_ENABLE      529   // HDR row
-#define ID_CORR_FALD_PATH        530
-#define ID_CORR_FALD_BROWSE      531
-#define ID_CORR_FALD_DEBUG       532   // View combo + pedestal toggle apply to both modes
-#define ID_CORR_FALD_PEDMODE     533
-#define ID_CORR_FALD_SDR_ENABLE  534   // SDR (ACM) row
-#define ID_CORR_FALD_SDR_PATH    535
-#define ID_CORR_FALD_SDR_BROWSE  536
-#define ID_CORR_FALD_TEMPORAL    537   // LED-lag row (temporal drive state), applies to both modes
-#define ID_CORR_FALD_CLOSURE     547   // LED-lag row in "Panel clock" mode (temporal mode 3): closure edit + parity combo
-#define ID_CORR_FALD_PARITY      548
-#define ID_CORR_FALD_STAR_ENABLE 541   // Starfield rows (starfield balancing, work guide S1), apply to both modes
-#define ID_CORR_FALD_STAR_EVEN   542
-#define ID_CORR_FALD_STAR_SIGMA  543   // spread σ = target_sigma
-#define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
-#define ID_CORR_FALD_STAR_STRENGTH 545
-#define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach
-
-// SDR MHC Hardware Calibration control IDs (MHC tab)
-#define ID_MHC_TAB_APPLY    551
-#define ID_MHC_TAB_REMOVE   552
-#define ID_MHC_TAB_EDIT     553
-
-// HDR MHC Hardware Calibration control IDs (MHC tab)
-#define ID_MHC_HDR_APPLY    561
-#define ID_MHC_HDR_REMOVE   562
-#define ID_MHC_HDR_EDIT     563
-
-// Settings tab (Tab 3) control IDs
-#define ID_SETTINGS_HOTKEY_GAMMA_CHECK    401
-#define ID_SETTINGS_HOTKEY_HDR_CHECK      402
-#define ID_SETTINGS_HOTKEY_ANALYSIS_CHECK 403
-#define ID_SETTINGS_START_MINIMIZED       404
-#define ID_SETTINGS_RUN_AT_STARTUP        405
-#define ID_SETTINGS_CONSOLE_LOG           406
-#define ID_SETTINGS_FRAME_BUFFER          410
-#define ID_SETTINGS_LOG_PEAK              407
-#define ID_SETTINGS_VRR_WHITELIST_CHECK   408
-#define ID_SETTINGS_VRR_WHITELIST_BTN     409
-#define ID_SETTINGS_DWM_HOOK             411
-#define ID_SETTINGS_CALIBRATION          412
-#define ID_SETTINGS_HOOK_IDENTIFY        413   // run the DWM-hook identity beacon now
-#define ID_SETTINGS_HOOK_SWAP            414   // manual twin swap for the selected monitor
-
-// MHC Settings dialog control IDs
-#define ID_MHC_PRIMARIES_ENABLE  7001
-#define ID_MHC_PRIMARIES_PRESET  7002
-#define ID_MHC_PRIMARIES_DETECT  7003
-#define ID_MHC_PRIMARIES_RX      7004
-#define ID_MHC_PRIMARIES_RY      7005
-#define ID_MHC_PRIMARIES_GX      7006
-#define ID_MHC_PRIMARIES_GY      7007
-#define ID_MHC_PRIMARIES_BX      7008
-#define ID_MHC_PRIMARIES_BY      7009
-#define ID_MHC_PRIMARIES_WX      7010
-#define ID_MHC_PRIMARIES_WY      7011
-#define ID_MHC_GRAYSCALE_ENABLE  7012
-#define ID_MHC_GRAYSCALE_10      7013
-#define ID_MHC_GRAYSCALE_20      7014
-#define ID_MHC_GRAYSCALE_32      7015
-#define ID_MHC_GRAYSCALE_EDIT    7016
-#define ID_MHC_GRAYSCALE_RESET   7017
-#define ID_MHC_GRAYSCALE_24      7018
-#define ID_MHC_GRAYSCALE_PEAK    7019
-#define ID_MHC_OK                7020
-#define ID_MHC_CANCEL            7021
-#define ID_MHC_FILE_PATH         7022
-#define ID_MHC_FILE_BROWSE       7023
-// IDs 7024-7025 were Extract buttons (removed)
-// ID 7026 was ID_MHC_GRAYSCALE_STANDARD (removed)
-#define ID_MHC_FILE_CLEAR        7027
-
-// MHC tab inline correction control IDs (SDR)
-#define ID_MHC_SDR_WB_ENABLE     7030
-#define ID_MHC_SDR_WB_WX         7031
-#define ID_MHC_SDR_WB_WY         7032
-#define ID_MHC_SDR_GS_ENABLE     7033
-#define ID_MHC_SDR_GS_10         7034
-#define ID_MHC_SDR_GS_20         7035
-#define ID_MHC_SDR_GS_32         7036
-#define ID_MHC_SDR_GS_EDIT       7037
-#define ID_MHC_SDR_GS_RESET      7038
-#define ID_MHC_SDR_GS_24         7039
-
-// MHC tab inline correction control IDs (HDR)
-#define ID_MHC_HDR_WB_ENABLE     7040
-#define ID_MHC_HDR_WB_WX         7041
-#define ID_MHC_HDR_WB_WY         7042
-#define ID_MHC_HDR_GS_ENABLE     7043
-#define ID_MHC_HDR_GS_10         7044
-#define ID_MHC_HDR_GS_20         7045
-#define ID_MHC_HDR_GS_32         7046
-#define ID_MHC_HDR_GS_EDIT       7047
-#define ID_MHC_HDR_GS_RESET      7048
-#define ID_MHC_HDR_GS_PEAK       7049
-#define ID_MHC_HDR_DG_ENABLE     7050
-#define ID_MHC_HDR_DG_WHITELIST  7051
-
-// Grayscale editor control IDs
-#define ID_GRAYSCALE_OK     5001
-#define ID_GRAYSCALE_CANCEL 5002
-#define ID_GRAYSCALE_SLIDER_BASE 5100
-#define ID_GRAYSCALE_EDIT_BASE 2500
-#define ID_GRAYSCALE_RGB_STRIP_BASE 5200
-#define ID_GRAYSCALE_RGB_EDIT_BASE 5300
-
-// Gamma whitelist dialog control IDs
-#define ID_WHITELIST_EDIT   6001
-#define ID_WHITELIST_OK     6002
-#define ID_WHITELIST_CANCEL 6003
 
 // ============================================================================
 // Constants
@@ -1103,15 +941,7 @@ constexpr int kMhcMatrixRev = 3;
 
 // GUI state
 struct GUIState {
-    HWND hwndMain = nullptr;
-    HWND hwndMonitorList = nullptr;
-    HWND hwndSdrPath = nullptr;
-    HWND hwndHdrPath = nullptr;
-    HWND hwndStatus = nullptr;
-    HWND hwndTetrahedralCheck = nullptr;
-    HWND hwndHdrDitherCheck = nullptr;
-    HWND hwndApply = nullptr;
-    HWND hwndStop = nullptr;
+    HWND hwndMain = nullptr;   // the hub window (never shown; gui.h)
     NOTIFYICONDATA nid = {};
     std::atomic<bool> isRunning{false};
     std::thread processingThread;
@@ -1120,173 +950,9 @@ struct GUIState {
     std::vector<MonitorSettings> monitorSettings;  // Settings of the LIVE displays, in enumeration order (editable)
     std::vector<MonitorSettings> parkedSettings;   // Known displays not currently connected (kept for re-attach + save)
     std::vector<MonitorSettings> activeSettings;   // Settings currently running (for comparison)
-    int currentMonitor = 0;  // Currently selected monitor in list
-
-    // Tab control
-    HWND hwndTab = nullptr;
-    int currentTab = 0;
-
-    // SDR White Point controls (Corrections tab)
-    HWND hwndPrimariesEnable = nullptr;
-    HWND hwndPrimariesWx = nullptr;
-    HWND hwndPrimariesWy = nullptr;
-    // SDR Grayscale controls (Corrections tab)
-    HWND hwndGrayscaleEnable = nullptr;
-    HWND hwndGrayscale10 = nullptr;
-    HWND hwndGrayscale20 = nullptr;
-    HWND hwndGrayscale32 = nullptr;
-    HWND hwndGrayscale24 = nullptr;        // SDR only: 2.4 gamma checkbox
-    HWND hwndGrayscaleEdit = nullptr;
-    HWND hwndGrayscaleReset = nullptr;
-
-    // HDR White Point controls (Corrections tab)
-    HWND hwndHdrPrimariesEnable = nullptr;
-    HWND hwndHdrPrimariesWx = nullptr;
-    HWND hwndHdrPrimariesWy = nullptr;
-    // HDR Grayscale controls (Corrections tab)
-    HWND hwndHdrGrayscaleEnable = nullptr;
-    HWND hwndHdrGrayscale10 = nullptr;
-    HWND hwndHdrGrayscale20 = nullptr;
-    HWND hwndHdrGrayscale32 = nullptr;
-    HWND hwndHdrGrayscaleEdit = nullptr;
-    HWND hwndHdrGrayscaleReset = nullptr;
-    HWND hwndGrayscalePeak = nullptr;       // HDR only: peak nits edit
-    HWND hwndGrayscalePeakLabel = nullptr;  // HDR only: "Peak:" label
-
-    // Tonemapping controls (Corrections tab, HDR only)
-    HWND hwndTonemapEnable = nullptr;
-    HWND hwndTonemapCurve = nullptr;
-    HWND hwndTonemapTarget = nullptr;
-    HWND hwndTonemapSource = nullptr;
-    HWND hwndTonemapDynamic = nullptr;
-
-    // Windows tone map (Corrections tab, HDR only)
-    HWND hwndWinToneMapCombo = nullptr;
-
-    // FALD compensation (Experimental) controls: one Enable + panel-file row per mode, shared View / pedestal
-    HWND hwndFaldEnable = nullptr;      // HDR row
-    HWND hwndFaldPath = nullptr;
-    HWND hwndFaldBrowse = nullptr;
-    HWND hwndFaldSdrEnable = nullptr;   // SDR (ACM) row
-    HWND hwndFaldSdrPath = nullptr;
-    HWND hwndFaldSdrBrowse = nullptr;
-    HWND hwndFaldDebug = nullptr;
-    HWND hwndFaldPedMode = nullptr;
-    HWND hwndFaldTemporal = nullptr;    // LED-lag row: mode combo (Off / Panel clock); the closure edit + parity combo show
-                                        // in "Panel clock" mode (gui.cpp ShowFaldTemporalRow)
-    HWND hwndFaldClosureLabel = nullptr;
-    HWND hwndFaldClosure = nullptr;
-    HWND hwndFaldParityLabel = nullptr;
-    HWND hwndFaldParity = nullptr;
-    HWND hwndFaldStarEnable = nullptr;  // Starfield rows: enable | even | spread σ | keep nits | strength | mean reach
-    HWND hwndFaldStarEven = nullptr;
-    HWND hwndFaldStarSigma = nullptr;   // "spread σ" = target_sigma
-    HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
-    HWND hwndFaldStarStrength = nullptr;
-    HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
-
-    // SDR MHC Hardware Calibration controls (MHC tab)
-    HWND hwndMhcApply = nullptr;
-    HWND hwndMhcRemove = nullptr;
-    HWND hwndMhcEdit = nullptr;
-    HWND hwndMhcStatus = nullptr;
-    HWND hwndMhcIccCoords[8] = {};  // Read-only RGBW xy boxes (Rx,Ry,Gx,Gy,Bx,By,Wx,Wy)
-    HWND hwndMhcMetaLabels[3] = {};  // Primaries, Gamma/EOTF, Peak (replaces hwndMhcTrcLabel)
-
-    // HDR MHC Hardware Calibration controls (MHC tab)
-    HWND hwndHdrMhcApply = nullptr;
-    HWND hwndHdrMhcRemove = nullptr;
-    HWND hwndHdrMhcEdit = nullptr;
-    HWND hwndHdrMhcStatus = nullptr;
-    HWND hwndHdrMhcIccCoords[8] = {};
-    HWND hwndHdrMhcMetaLabels[3] = {};  // Primaries, Gamma/EOTF, Peak
-
-    // SDR MHC inline correction controls (MHC tab)
-    HWND hwndMhcWbEnable = nullptr;
-    HWND hwndMhcWbWx = nullptr;
-    HWND hwndMhcWbWy = nullptr;
-    HWND hwndMhcGsEnable = nullptr;
-    HWND hwndMhcGs10 = nullptr;
-    HWND hwndMhcGs20 = nullptr;
-    HWND hwndMhcGs32 = nullptr;
-    HWND hwndMhcGsEdit = nullptr;
-    HWND hwndMhcGsReset = nullptr;
-    HWND hwndMhcGs24 = nullptr;         // SDR only: 2.2->2.4 gamma
-
-    // HDR MHC inline correction controls (MHC tab)
-    HWND hwndHdrMhcWbEnable = nullptr;
-    HWND hwndHdrMhcWbWx = nullptr;
-    HWND hwndHdrMhcWbWy = nullptr;
-    HWND hwndHdrMhcGsEnable = nullptr;
-    HWND hwndHdrMhcGs10 = nullptr;
-    HWND hwndHdrMhcGs20 = nullptr;
-    HWND hwndHdrMhcGs32 = nullptr;
-    HWND hwndHdrMhcGsEdit = nullptr;
-    HWND hwndHdrMhcGsReset = nullptr;
-    HWND hwndHdrMhcGsPeak = nullptr;    // HDR only: peak nits edit
-    HWND hwndHdrMhcDgEnable = nullptr;  // HDR only: desktop gamma checkbox
-    HWND hwndHdrMhcDgWhitelist = nullptr; // HDR only: DG whitelist button
-
-    // Scrollable panels for each tab
-    HWND hwndScrollPanel[4] = { nullptr, nullptr, nullptr, nullptr };
-    int scrollPos[4] = { 0, 0, 0, 0 };           // Current scroll position per tab
-    int contentHeight[4] = { 0, 0, 0, 0 };       // Total content height per tab
-
-    // Tab 0 controls (MHC - to show/hide)
-    std::vector<HWND> tab0Controls;
-    std::vector<int> tab0OriginalY;   // Original Y positions for scroll
-    // Tab 1 controls (3D LUT)
-    std::vector<HWND> tab1Controls;
-    std::vector<int> tab1OriginalY;
-    // Tab 2 controls (Corrections)
-    std::vector<HWND> tab2Controls;
-    std::vector<int> tab2OriginalY;
-    // Tab 3 controls (Settings)
-    std::vector<HWND> tab3Controls;
-    std::vector<int> tab3OriginalY;
-
-    // Settings tab controls
-    HWND hwndSettingsHotkeyGamma = nullptr;
-    HWND hwndSettingsHotkeyHdr = nullptr;
-    HWND hwndSettingsHotkeyAnalysis = nullptr;
-    HWND hwndSettingsStartMinimized = nullptr;
-    HWND hwndSettingsRunAtStartup = nullptr;
-    HWND hwndSettingsConsoleLog = nullptr;
-    HWND hwndSettingsVrrWhitelistCheck = nullptr;
-    HWND hwndSettingsVrrWhitelistBtn = nullptr;
-    HWND hwndSettingsDwmHook = nullptr;
-    HWND hwndSettingsCalibration = nullptr;  // DLC calibration-control IPC server arm/disarm
-    HWND hwndSettingsHookRouting = nullptr;  // DWM-hook LUT routing status line (twin panels, 25H2)
-    HWND hwndSettingsHookIdentify = nullptr; // "Identify monitors" — runs the identity beacon
-    HWND hwndSettingsHookSwap = nullptr;     // "Swap with twin" — manual override for the selected monitor
-
-    int panelHeight = 0;  // Visible height of scroll panels
 
     // Auto-restart state
     int restartRetryCount = 0;  // Exponential backoff counter (0 = no pending restart)
-};
-
-// Grayscale editor dialog data
-struct GrayscaleEditorData {
-    int pointCount;
-    float* points;           // Pointer to the grayscale points array
-    std::vector<float> originalPoints;  // Copy for Cancel restore
-    std::vector<HWND> sliders;
-    std::vector<HWND> editBoxes;
-    HWND hwndDialog;
-    bool updatingFromSlider = false;  // Prevent feedback loops
-    bool updatingFromEdit = false;
-    bool isHDR = false;      // true if editing HDR grayscale, false for SDR
-    float peakNits = 10000.0f;  // HDR peak for label calculation (must match ColourSpace target)
-    int codeCap = 1023;      // Max code for the top label = the working bit depth (255 legacy SDR,
-                             // 1023 ACM SDR / HDR), so the printed number IS the patch code at that depth.
-    std::function<void()> liveUpdateCallback;  // If set, called instead of UpdateColorCorrectionLive
-    // Per-channel RGB deviations
-    float* rgbDeviations[3] = {};          // Pointers to settings rgbDeviations data
-    std::vector<float> originalRGBDev[3];  // Backup for Cancel
-    std::vector<HWND> rgbStrips;           // Custom strip controls (one per point)
-    std::vector<HWND> rgbEditBoxes;        // Per-point RGB edit boxes (one per point)
-    int selectedChannel = 0;               // 0=R, 1=G, 2=B (which channel edits show)
 };
 
 // ============================================================================

@@ -1,19 +1,19 @@
 // DesktopLUT - gui.h
-// Main GUI window and controls
+// The hub: a hidden window on the GUI thread (class "DesktopLUT_GUI") with the message loop, the tray icon, the
+// timers, the hotkeys, display / power / session handling, the MHC drop defence and the hook watchdog. The interface
+// is a separate window (ui/ui_window.h).
 
 #pragma once
 #include <cstdint>
 
 #include <windows.h>
 #include "types.h"
-#include "gui_shared.h"
 #include "gui_mhc.h"
-#include "gui_whitelist.h"
 
-// Update GUI state (enable/disable controls)
+// The settings changed: refresh what derives from them (the analysis-only thread's corrections flag). GUI thread.
 void UpdateGUIState();
 
-// Set status message
+// Status message: the newest one shows in the interface's footer and in Events. Any thread.
 void SetStatus(const wchar_t* text);
 
 // Browse for LUT file
@@ -21,17 +21,8 @@ bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize);
 // Browse for a FALD panel parameter file (.bin)
 bool BrowseForFaldPanelFile(HWND hwndParent, wchar_t* path, size_t pathSize);
 
-// Update color correction controls for current monitor. Edits that have the keyboard focus
-// are left alone (a value being typed) unless forceEdits — a change of the selected display,
-// where the half-typed value belongs to the other display.
-void UpdateColorCorrectionControls(bool forceEdits = false);
-
-// Show monitor `index`'s settings in every per-monitor control and highlight it in the list
-// (clamped to the live range). The one place the selected monitor changes.
-void SelectMonitor(int index);
-
-// Display `mon`'s settings changed (an action, the pipe): refresh the classic controls when they show
-// that display, the Start/Stop state, and the ImGui interface. GUI thread.
+// Display `mon`'s settings changed (an action, the pipe; -1 = any): UpdateGUIState and a redraw of the interface.
+// GUI thread.
 void GuiNotifySettingsChanged(int mon);
 
 // Opens the interface: tray Show / left click and a second launch (userAsked), startup (not). When it cannot start
@@ -40,10 +31,8 @@ void GuiNotifySettingsChanged(int mon);
 void ShowActiveUi(bool userAsked);
 struct UiShowFailureNotice { bool balloon = false; bool messageBox = false; };
 UiShowFailureNotice DecideUiShowFailure(bool userAsked, bool balloonShown);   // pure, exposed for testing
-// Re-reads the global settings into the classic window's checkboxes (another interface changed them). GUI thread.
-void SyncClassicGlobalControls();
 
-// The user stopped the live layers (classic Stop / tray Stop); automatic restarts respect it. GUI thread.
+// The user suspended the live layers (LIVE LAYERS / the tray's Suspend); automatic restarts respect it. GUI thread.
 extern std::atomic<bool> g_userStopped;   // read by the pipe thread (state.get)
 
 // GUI-thread pin on g_gui.monitorSettings: while held, a handler keeps a reference / index
@@ -61,7 +50,7 @@ struct MonitorSettingsPin {
 };
 
 // Rebuild g_gui.monitors / g_gui.monitorNames (swapped under g_monitorSettingsMutex — the
-// calibration pipe thread reads both under it) and the monitor list box's entries.
+// calibration pipe thread reads both under it) and the twin-routing view.
 void SetLiveMonitors(const std::vector<HMONITOR>& monitors);
 // Hook FALD: one full-screen DWM recomposition (primes the layer's clean copy / clears corrected pixels). Any thread.
 void RequestFaldFullRecompose();
@@ -111,16 +100,10 @@ void RemoveTrayIcon();
 void UpdateTrayIcon(bool active);
 void ShowTrayMenu(HWND hwnd);
 
-// Grayscale editor
-void ShowGrayscaleEditor(HWND hwndParent, GrayscaleSettings& settings, bool isHDR,
-                         std::function<void()> liveUpdateCallback = nullptr);
-
-// GUI layout creation (WM_CREATE body, in gui_layout.cpp)
-void CreateGUILayout(HWND hwnd);
-LRESULT CALLBACK ScrollPanelProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
+// EnumDisplayMonitors callback: appends each HMONITOR to the std::vector<HMONITOR> at lParam.
 BOOL CALLBACK GUIMonitorEnumProc(HMONITOR hMonitor, HDC hdc, LPRECT lprcMonitor, LPARAM lParam);
 
-// Display power notification (shared between gui.cpp and gui_layout.cpp)
+// Display power notification (the hub's registration)
 extern HPOWERNOTIFY g_guiDisplayPowerNotify;
 extern const GUID GUID_CONSOLE_DISPLAY_STATE_GUI;
 
@@ -150,10 +133,9 @@ HookRoutingView BuildHookRoutingView(const std::vector<std::vector<int>>& groups
 std::wstring HookRoutingMethodLabel(const std::string& method);   // the routing file's method -> the word shown
 void RefreshHookRouting();                                         // GUI thread
 const HookRoutingView& HookRoutingCached();                        // GUI thread
-void RefreshHookRoutingLabel();                                    // RefreshHookRouting + the classic status line
 
-// Main GUI window procedure
+// The hub window's procedure
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-// Run GUI mode (entry point)
+// Run GUI mode (entry point): the hub, the tray, the interface unless started minimized, the message loop
 int RunGUI();

@@ -35,7 +35,7 @@ Result Fail(notify::Sev sev, std::wstring text) {
     return r;
 }
 
-// Report an action's message once, in the notification log (the classic status line shows it too).
+// Report an action's message once, in the notification log.
 Result Told(int mon, const wchar_t* source, Result r) {
     if (!r.text.empty()) notify::Post(r.sev, mon, source, r.text);
     return r;
@@ -54,7 +54,7 @@ void PushCorrection(int mon, bool hdr, bool reevaluateOverlay) {
     else if (reevaluateOverlay) DwmHookReevaluateOverlay();
 }
 
-// A FALD layer setting of one mode changed (GUI-thread port of the classic ApplyFaldSettingChange).
+// A FALD layer setting of one mode changed.
 // Returns what the reconcile did (a Start / Restart already loaded the panel files).
 ReconcileDecision PushFald(int mon, bool hdr, bool enabledNow) {
     if (g_gui.isRunning) {
@@ -137,7 +137,6 @@ Result SetLutBypass(int mon, bool hdr, bool bypass) {
 void SetTetrahedral(bool on) {
     g_tetrahedralInterp = on;
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetHdrDither(bool on) {
@@ -145,7 +144,6 @@ void SetHdrDither(bool on) {
     g_hdrDither = on;
     SaveSettings();
     UpdateDwmHookSharedConfig();
-    SyncClassicGlobalControls();
 }
 
 void SetDwmHookMode(bool on) {
@@ -156,8 +154,7 @@ void SetDwmHookMode(bool on) {
     SaveSettings();
     if (g_gui.isRunning) RestartLiveLayers();
     else ReconcileLiveLayers("engine");   // the FALD layer's need differs per engine (the hook's needs a panel file)
-    if (ValidMonitor(g_gui.currentMonitor)) Finish(g_gui.currentMonitor);
-    SyncClassicGlobalControls();
+    Finish(-1);
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -291,7 +288,7 @@ Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload
     std::wstring mismatch = FaldTransferMismatch(path, hdr);
     if (!mismatch.empty()) {
         SetStatus(mismatch.c_str());
-        Finish(mon);   // the classic row shows the file it keeps
+        Finish(mon);   // the interface shows the file it keeps
         return Fail(notify::Sev::Warning, mismatch);
     }
     bool changed = false, enabledNow = false;
@@ -779,7 +776,6 @@ void SetHotkeyEnabled(int hotkeyId, bool on) {
     // The hub window holds every hotkey for the session (RegisterHotkeys); its thread registers it.
     if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_HOTKEY_REGISTER, hotkeyId, on ? 1 : 0);
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -932,13 +928,11 @@ Result SetAnalysis(bool on) {
 void SetStartMinimized(bool on) {
     g_startMinimized.store(on);
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetRunAtStartup(bool on) {
     SetStartupEnabled(on);
     RefreshStartupEnabledCache();
-    SyncClassicGlobalControls();
 }
 
 void SetConsoleLog(bool on) {
@@ -959,7 +953,6 @@ void SetConsoleLog(bool on) {
         FreeConsole();
     }
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetDlcFolder(const std::wstring& folder) {
@@ -992,7 +985,6 @@ void SetRecalReminderDays(int days) {
 void SetVrrWhitelistEnabled(bool on) {
     g_vrrWhitelistEnabled.store(on);
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetGammaWhitelist(const std::wstring& raw) {

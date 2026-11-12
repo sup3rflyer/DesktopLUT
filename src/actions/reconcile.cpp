@@ -156,7 +156,7 @@ void SetLiveLayersSuspended(bool suspended) {
     }
     if (suspended && IsCalibrationOrLiveEditActive()) {
         notify::Post(notify::Sev::Warning, -1, L"live", L"Calibration in progress: live layers stay on");
-        GuiNotifySettingsChanged(-1);   // the classic control shows the state it keeps
+        GuiNotifySettingsChanged(-1);   // the interface shows the state it keeps
         return;
     }
     g_userStopped = suspended;

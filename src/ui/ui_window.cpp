@@ -170,7 +170,7 @@ void UpdateAnimTimer() {
 }
 
 // Runs the posted commands, outside any frame. A command may pump (stop/start, profile generation,
-// file dialogs, the classic editors): the frames it lets through draw the interface disabled, and
+// file dialogs): the frames it lets through draw the interface disabled, and
 // nothing they post runs until this loop takes it.
 void DrainCommands() {
     if (g_busy || g_commands.empty()) return;
