@@ -1,6 +1,7 @@
 #include "doctest.h"
 #include "dlc/dlc_data.h"
 #include "dlc/dlc_join.h"
+#include "dlc/dlc_live.h"
 #include "dlc/dlc_scan.h"
 #include "dlc/dlc_yaml.h"
 #include "ipc_json.h"
@@ -11,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 
 // ============================================================================
@@ -797,6 +799,294 @@ TEST_CASE("dlc dip: every record summarised as DLC loads it; the malformed ones 
     CHECK_FALSE(ReadDipStore(empty.path, none, hash));
     CHECK(none.records.empty());
     CHECK(hash == 0);
+}
+
+// The PANEL card's one number format: significant digits per quantity, never a "0" for what is not zero.
+TEST_CASE("dlc: FormatSig keeps every measured digit that matters and never prints 0 for a non-zero value") {
+    CHECK(FormatSig(1835.101779, 3) == "1835");     // whole digits are never rounded away
+    CHECK(FormatSig(121.722159, 3) == "122");
+    CHECK(FormatSig(114.515401, 3) == "115");
+    CHECK(FormatSig(0.0021, 2) == "0.0021");
+    CHECK(FormatSig(0.0021, 3) == "0.0021");        // trailing zeros dropped, not padded
+    CHECK(FormatSig(0.05376, 3) == "0.0538");
+    CHECK(FormatSig(0.05376, 2) == "0.054");
+    CHECK(FormatSig(1.6597, 2) == "1.7");
+    CHECK(FormatSig(29.5697, 2) == "30");
+    CHECK(FormatSig(3.469, 2) == "3.5");
+    CHECK(FormatSig(0.00999, 2) == "0.01");         // rounding into the next decade
+    CHECK(FormatSig(1.453, 2, true) == "+1.5");
+    CHECK(FormatSig(-1.217, 2, true) == "-1.2");
+    CHECK(FormatSig(0.0004, 2, true) == "+0.0004");
+    CHECK(FormatSig(-0.00004, 1) == "-0.00004");
+    CHECK(FormatSig(2130.1, 3) == "2130");
+    CHECK(FormatSig(0.3169243, 4) == "0.3169");
+    CHECK(FormatSig(0.0, 3) == "0");                // exactly zero is zero
+    CHECK(FormatSig(0.0, 3, true) == "0");
+    CHECK(FormatSig(kNaN, 3).empty());
+    // Below every fixed decimal: still not "0".
+    CHECK(FormatSig(3e-17, 2) != "0");
+    CHECK(FormatSig(3e-17, 2).find('e') != std::string::npos);
+    for (double v : { 1e-9, 4.9e-7, 0.00049, 0.0049, 0.049, 0.49 }) {
+        INFO(v);
+        CHECK(FormatSig(v, 1) != "0");
+        CHECK(std::strtod(FormatSig(v, 2).c_str(), nullptr) > 0.0);
+    }
+}
+
+namespace {
+std::string FixtureText(const wchar_t* name) {
+    const std::wstring root = RepoRoot();
+    return root.empty() ? std::string() : ReadText(root + L"\\tests\\fixtures\\" + name);
+}
+const DipRecord* RecordAt(const DipStoreData& d, const std::string& key) {
+    for (const DipRecord& r : d.records) if (r.key == key) return &r;
+    return nullptr;
+}
+const DipPeakSize* SizeAt(const DipPeakByWindow& p, double area) {
+    for (const DipPeakSize& z : p.curve) if (std::fabs(z.areaPct - area) < 1e-9) return &z;
+    return nullptr;
+}
+}  // namespace
+
+// tests/fixtures/dip_store_probes.json is written by DLC's own code (tests/fixtures/gen_dip_probes.py runs the
+// peak-window and refresh-response flows on DLC's probe simulator and records them through dip.py): what DLC writes,
+// not a copy of its format. `--check` there says when DLC's format moved.
+TEST_CASE("dlc dip: peak_by_window as DLC records it — an OLED's steep curve, a mini-LED's flat one, a drift's invalid one") {
+    const std::string json = FixtureText(L"dip_store_probes.json");
+    REQUIRE(!json.empty());
+    const DipStoreData d = ParseDipStore(json);
+    REQUIRE(d.readable);
+    CHECK(d.dropped.empty());
+
+    const DipRecord* oled = RecordAt(d, "Probe OLED 42:HDR");
+    REQUIRE(oled);
+    const DipPeakByWindow& o = oled->peakByWindow;
+    REQUIRE(o.Usable());
+    CHECK(o.schema == kDipPeakWindowSchema);
+    CHECK_FALSE(o.newer);
+    CHECK(o.valid);
+    CHECK(o.complete);
+    CHECK(o.measured == "2026-11-12");
+    CHECK(!o.runId.empty());
+    REQUIRE(o.curve.size() == 9);
+    CHECK(o.curve.front().areaPct == 1.0);
+    CHECK(o.curve.back().areaPct == 100.0);
+    CHECK(o.plateauNits == doctest::Approx(1000.0).epsilon(0.02));
+    CHECK(o.runWindowAreaPct == doctest::Approx(10.0));
+    CHECK(o.fullFieldSustainedNits < 0.35 * o.plateauNits);   // the power limiter
+    const DipPeakSize* half = SizeAt(o, 50.0);
+    REQUIRE(half);
+    CHECK(half->agree == 1);
+    CHECK(half->up.present);
+    CHECK(half->down.present);
+    CHECK(half->early > 1.05 * half->sustained);              // the limiter acts over the hold
+    CHECK(std::isfinite(half->tau));
+    CHECK(SizeAt(o, 100.0)->agree == -1);                     // the turn: measured once
+    CHECK_FALSE(SizeAt(o, 100.0)->down.present);
+    CHECK(o.stack == "native");
+    CHECK(o.emissive == 1);
+    CHECK(o.steps > 0);
+    CHECK(std::isfinite(o.peakWhiteS));
+
+    const DipRecord* mini = RecordAt(d, "Probe MiniLED 32:HDR");
+    REQUIRE(mini);
+    REQUIRE(mini->peakByWindow.Usable());
+    CHECK(mini->peakByWindow.valid);
+    CHECK(mini->peakByWindow.fullFieldSustainedNits > 0.6 * mini->peakByWindow.plateauNits);   // flat-ish
+    CHECK(mini->peakByWindow.emissive == 0);
+
+    // Drift: the passes disagree at most sizes, with one sign. No combined value there; each pass's own remains.
+    const DipRecord* drift = RecordAt(d, "Probe Drift 27:HDR");
+    REQUIRE(drift);
+    const DipPeakByWindow& dr = drift->peakByWindow;
+    REQUIRE(dr.Usable());
+    CHECK_FALSE(dr.valid);
+    CHECK(dr.systematic);
+    REQUIRE(!dr.areasFailed.empty());
+    for (double a : dr.areasFailed) {
+        const DipPeakSize* z = SizeAt(dr, a);
+        REQUIRE(z);
+        CHECK(z->agree == 0);
+        CHECK(std::isnan(z->sustained));
+        CHECK(std::isnan(z->early));
+        CHECK(std::isfinite(z->up.sustained));
+        CHECK(std::isfinite(z->down.sustained));
+        CHECK(z->relDiff > z->tol);
+    }
+}
+
+TEST_CASE("dlc dip: a peak_by_window DLC would drop is dropped alone; a newer schema is said, not read") {
+    // Unknown fields are ignored.
+    DipPeakByWindow p = ParsePeakByWindowJson(R"({"measured": "2026-11-12", "a_future_field": [1, {"x": 2}],
+        "curve": [{"area_pct": 1, "sustained_nits": 900, "early_nits": 950, "something_new": "yes"},
+                  {"area_pct": 10, "sustained_nits": null}], "valid": true})");
+    CHECK(p.Usable());
+    CHECK(p.curve.size() == 2);
+    CHECK(std::isnan(p.curve[1].sustained));
+    // What dip.py PeakByWindow.from_dict refuses.
+    const char* refused[] = {
+        R"([1, 2])",
+        R"({"measured": "2026-11-12", "curve": []})",
+        R"({"measured": "2026-11-12"})",
+        R"({"curve": [{"area_pct": 1}]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 250}]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 0}]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 5, "sustained_nits": -1}]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 5, "tau_s": "slow"}]})",
+        R"({"measured": "2026-11-12", "curve": [7]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 5}], "steps": [{"area_pct": 120}]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 5}], "plateau_nits": -3})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 5}], "wear": [1]})",
+        R"({"measured": "2026-11-12", "curve": [{"area_pct": 5}], "schema": null})",
+    };
+    for (const char* j : refused) {
+        CAPTURE(j);
+        p = ParsePeakByWindowJson(j);
+        CHECK(p.present);
+        CHECK_FALSE(p.error.empty());
+        CHECK_FALSE(p.Usable());
+        CHECK(p.curve.empty());
+    }
+    p = ParsePeakByWindowJson(R"({"schema": 2, "measured": "2026-11-12", "curve": [{"area_pct": 1}]})");
+    CHECK(p.newer);
+    CHECK(p.error.empty());
+    CHECK(p.schema == 2);
+    CHECK(p.curve.empty());
+    CHECK_FALSE(p.Usable());
+    // Inside a store: the record stays, with its other numbers, and says the section is unreadable.
+    const DipStoreData d = ParseDipStore(R"({"displays": {"X:HDR": {"display": "X", "mode": "HDR", "made": "2026-11-01",
+        "native_white_nits": 640, "peak_by_window": {"measured": "2026-11-12", "curve": [{"area_pct": 250}]}}}})");
+    REQUIRE(d.records.size() == 1);
+    CHECK(d.dropped.empty());
+    CHECK(d.records[0].whiteNits == 640.0);
+    CHECK(d.records[0].peakByWindow.present);
+    CHECK_FALSE(d.records[0].peakByWindow.error.empty());
+}
+
+TEST_CASE("dlc dip: the refresh response's reference, its VRR-derived rates and the VRR sweep, as DLC records them") {
+    const DipStoreData d = ParseDipStore(FixtureText(L"dip_store_probes.json"));
+    REQUIRE(d.readable);
+    const DipRecord* rec = RecordAt(d, "Probe VRR 27:HDR");
+    REQUIRE(rec);
+    REQUIRE(rec->refresh >= 0);
+    const DipRefreshSection& s = d.refresh[(size_t)rec->refresh];
+    CHECK(s.error.empty());
+    CHECK(s.referenceRecorded);
+    CHECK(s.referenceKey == "60");
+    CHECK(s.ReferenceHz() == 60.0);
+    CHECK(s.hardwareId == "PRB0042");
+    std::map<std::string, const DipRefreshRate*> by;
+    for (const DipRefreshRate& r : s.rates) by[r.key] = &r;
+    REQUIRE(by.count("47.952"));
+    CHECK(by["47.952"]->source == "mode");
+    CHECK(by["47.952"]->proofOk == 1);
+    for (const char* k : { "48", "50", "59.94" }) {
+        CAPTURE(k);
+        REQUIRE(by.count(k));
+        CHECK(by[k]->source == "vrr");
+        CHECK(by[k]->proofOk == 1);
+        CHECK(by[k]->proofKind.rfind("vrr:", 0) == 0);
+    }
+    CHECK(s.vrr.present);
+    CHECK(s.vrr.rangeLoHz == 40.0);
+    CHECK(s.vrr.rangeHiHz == 60.0);
+    CHECK(s.vrr.points > 0);
+    CHECK(s.vrr.crossCheckOk == 1);
+    CHECK(s.vrr.crossCheckRate == "47.952");
+    CHECK(s.vrr.fixedModeTrimDerived);
+
+    // The reference block: recorded as written (another rate), required to name a positive rational, absent = not
+    // recorded (dip.py's 60 / 1 kept as the fields' value, but not trusted by the trim).
+    auto section = [](const char* ref) {
+        const std::string j = std::string(R"({"displays": {"X:HDR": {"display": "X", "refresh_response": {"measured": "2026-10-23", )") +
+                              ref + R"("rates": [{"key": "48", "num": 48, "den": 1, "levels": [{"nits": 1, "ratio": 1.02}]}]}}}})";
+        const DipStoreData dd = ParseDipStore(j);
+        REQUIRE(dd.refresh.size() == 1);
+        return dd.refresh[0];
+    };
+    const DipRefreshSection r120 = section(R"("reference": {"key": "120", "num": 120, "den": 1}, )");
+    CHECK(r120.error.empty());
+    CHECK(r120.referenceRecorded);
+    CHECK(r120.ReferenceHz() == 120.0);
+    CHECK(r120.referenceKey == "120");
+    const DipRefreshSection r5994 = section(R"("reference": {"num": 60000, "den": 1001}, )");
+    CHECK(r5994.referenceKey == "59.94");          // no key: the catalogue's spelling of its rational
+    for (const char* bad : { R"("reference": {"key": "120"}, )", R"("reference": {"key": "120", "num": 0, "den": 1}, )",
+                             R"("reference": "60", )" }) {
+        CAPTURE(bad);
+        const DipRefreshSection b = section(bad);
+        CHECK_FALSE(b.error.empty());
+        CHECK(b.rates.empty());
+    }
+    const DipRefreshSection none = section("");
+    CHECK(none.error.empty());
+    CHECK_FALSE(none.referenceRecorded);
+    CHECK(none.referenceKey == "60");
+}
+
+// The live payloads (charts.json "probes"), from the same generator: DLC's DashboardState after the flows ran.
+TEST_CASE("dlc live: a probe flow's chart payloads — peak by window in the DIP section's shape, the refresh points by source") {
+    const std::string json = FixtureText(L"charts_probes.json");
+    REQUIRE(!json.empty());
+    LiveCharts c;
+    REQUIRE(ParseLiveCharts(json, c));
+    const DipPeakByWindow& p = c.probes.peakByWindow;
+    REQUIRE(p.present);
+    CHECK(p.complete);
+    CHECK(p.valid);
+    REQUIRE(p.curve.size() == 9);
+    CHECK(p.runWindowAreaPct == doctest::Approx(10.0));
+    CHECK(p.plateauNits == doctest::Approx(1000.0).epsilon(0.02));
+    CHECK(p.stepsDone == p.stepsPlanned);
+    const DipPeakSize* half = SizeAt(p, 50.0);
+    REQUIRE(half);
+    CHECK(half->agree == 1);
+    CHECK(half->up.present);
+    CHECK(half->down.present);
+    CHECK(std::isfinite(half->sustained));
+    CHECK(half->early > half->sustained);
+    CHECK(SizeAt(p, 100.0)->agree == -1);
+
+    const RefreshProbeChart& r = c.probes.refresh;
+    REQUIRE(r.present);
+    CHECK(r.referenceHz == 60.0);
+    REQUIRE(!r.series.empty());
+    int vrr = 0, mode = 0;
+    for (const RefreshProbeSeries& s : r.series)
+        for (const RefreshProbePoint& q : s.points) (q.vrr ? vrr : mode)++;
+    CHECK(vrr > 0);
+    CHECK(mode > 0);
+
+    // The drifting panel's payload: the passes disagree, so the curve has no combined value there.
+    ipc_json::JsonValue root;
+    {
+        ipc_json::JsonParser parser(json, ipc_json::JsonOptions::Files());
+        root = parser.parse();
+    }
+    const ipc_json::JsonValue* byPanel = root.find("probes_by_panel");
+    REQUIRE(byPanel);
+    const ipc_json::JsonValue* drift = byPanel->find("Probe Drift 27");
+    REQUIRE(drift);
+    std::string one = "{\"probes\": {\"peak_by_window\": ";
+    ipc_json::Serialize(*drift, one);
+    one += "}}";
+    const ProbeCharts dc = ParseProbeCharts(one);
+    REQUIRE(dc.peakByWindow.present);
+    CHECK(dc.peakByWindow.complete);
+    CHECK_FALSE(dc.peakByWindow.valid);
+    CHECK_FALSE(dc.peakByWindow.areasFailed.empty());
+    for (double a : dc.peakByWindow.areasFailed) CHECK(SizeAt(dc.peakByWindow, a)->agree == 0);
+    // A run still going: no verdict yet, nothing judged.
+    const ProbeCharts running = ParseProbeCharts(R"({"probes": {"peak_by_window": {"complete": false, "steps_done": 3,
+        "steps_planned": 17, "series": [{"name": "early", "pass": "up", "points": [[1, 990], [2, 985]]},
+                                        {"name": "sustained", "pass": "up", "points": [[1, 980], [2, 970], [3, 960]]}]}}})");
+    REQUIRE(running.peakByWindow.present);
+    CHECK_FALSE(running.peakByWindow.complete);
+    CHECK(running.peakByWindow.curve.size() == 3);
+    for (const DipPeakSize& z : running.peakByWindow.curve) CHECK(z.agree == -1);
+    CHECK(running.peakByWindow.stepsDone == 3);
+    CHECK_FALSE(ParseProbeCharts("{}").peakByWindow.present);
+    CHECK_FALSE(ParseProbeCharts("{}").refresh.present);
 }
 
 TEST_CASE("dlc dip: a display's record as DLC looks it up; the hardware id breaks ties for the refresh response") {

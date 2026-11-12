@@ -9,6 +9,7 @@
 #include "dlc/dlc_scan.h"
 #include "dlc/dlc_setup.h"
 #include "globals.h"
+#include "gui_mhc.h"   // MhcProfileMetadataPeakNits (the PEAK BY WINDOW chart's reference)
 #include "settings.h"
 #include "shell_open.h"
 #include "version.h"
@@ -20,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 
 namespace ui {
 
@@ -944,10 +946,27 @@ std::string AgeText(const std::string& date, const std::string& today) {
     return days >= 0 ? std::to_string(days) + " D" : std::string();
 }
 
-std::string NitsCard(double v) {
+// The card's numbers, all through dlc::FormatSig: as many significant digits as the row's quantity carries, never a
+// "0" for a value that is not zero.
+std::string Sig(double v, int sig, const char* unit = nullptr, bool sign = false) {
     if (!std::isfinite(v)) return "\xE2\x80\x94";
-    if (v == 0.0) return "0 NIT";
-    return NitsText((float)v);
+    std::string s = dlc::FormatSig(v, sig, sign);
+    if (unit) s += std::string(" ") + unit;
+    return s;
+}
+
+// A refresh rate's response as a range of %, over its levels ("+3.4 .. +1 %"); "" when it has none.
+std::string RatePctRange(const dlc::DipRefreshRate& rate) {
+    double lo = dlc::kNaN, hi = dlc::kNaN;
+    for (const dlc::DipRefreshLevel& lv : rate.levels) {
+        const double pct = (lv.ratio - 1.0) * 100.0;
+        if (!std::isfinite(pct)) continue;
+        if (!std::isfinite(lo) || pct < lo) lo = pct;
+        if (!std::isfinite(hi) || pct > hi) hi = pct;
+    }
+    if (!std::isfinite(lo)) return {};
+    if (dlc::FormatSig(lo, 2, true) == dlc::FormatSig(hi, 2, true)) return dlc::FormatSig(lo, 2, true) + " %";
+    return dlc::FormatSig(lo, 2, true) + " .. " + dlc::FormatSig(hi, 2, true) + " %";
 }
 
 // One measurement: known (value + age) or not measured (a dash), with what it is and what measures it.
@@ -1026,95 +1045,143 @@ void PanelCard(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewStat
     // ---- the measurements ----
     std::vector<CardItem> items;
     const std::string made = rec ? rec->made : std::string();
-    auto num = [](const char* fmt, double v) { return Fmt(fmt, v); };
     {
         const bool k = rec && std::isfinite(rec->whiteNits);
-        items.push_back({ "WHITE", k, k ? NitsCard(rec->whiteNits) : dash, pal::Ink, made,
+        items.push_back({ "WHITE", k, k ? Sig(rec->whiteNits, 3, "NIT") : dash, pal::Ink, made,
                           "The panel's own white, full field, before any calibration.\n" + measuredBy });
     }
     {
         const bool k = rec && std::isfinite(rec->whiteX) && std::isfinite(rec->whiteY);
-        items.push_back({ "WHITE XY", k, k ? num("%.4f", rec->whiteX) + " " + num("%.4f", rec->whiteY) : dash, pal::Ink, made,
+        items.push_back({ "WHITE XY", k, k ? Sig(rec->whiteX, 4) + " " + Sig(rec->whiteY, 4) : dash, pal::Ink, made,
                           "Where that white sits (CIE 1931 x, y).\n" + measuredBy });
     }
     {
         const bool k = rec && std::isfinite(rec->blackNits);
-        items.push_back({ "BLACK", k, !k ? dash : rec->blackNits > 0.0 ? NitsCard(rec->blackNits) : std::string("BELOW METER"),
+        items.push_back({ "BLACK", k, !k ? dash : rec->blackNits > 0.0 ? Sig(rec->blackNits, 3, "NIT") : std::string("BELOW METER"),
                           pal::Ink, made, "The panel's own black. BELOW METER: darker than the meter reads.\n" + measuredBy });
     }
     {
         const bool k = rec && std::isfinite(rec->whiteNits) && std::isfinite(rec->blackNits);
         const double c = rec ? dlc::DipContrast(*rec) : dlc::kNaN;
-        items.push_back({ "CONTRAST", k, !k ? dash : std::isfinite(c) ? num("%.0f", c) + ":1" : std::string("BEYOND METER"),
+        items.push_back({ "CONTRAST", k, !k ? dash : std::isfinite(c) ? Sig(c, 3) + ":1" : std::string("BEYOND METER"),
                           pal::Ink, made, "White over black, full field.\nBEYOND METER: the black is below what the meter reads." });
     }
     {
-        const bool k = rec && (std::isfinite(rec->noiseFloorNits) || rec->noiseBands > 0);
+        // DLC (metrics.resolve_meter_floor): a floor of 0 or less is NOT a measured floor (characterize clamps an
+        // all-clean survey to the black, 0 on a local-dimming panel), so it is not shown as one.
+        const bool k = rec && std::isfinite(rec->noiseFloorNits) && rec->noiseFloorNits > 0.0;
         std::string tip = "Below this light a single meter read is mostly noise.\n" + measuredBy;
         if (rec && rec->noiseBands > 0) tip += "\nNoise measured at " + std::to_string(rec->noiseBands) + " levels.";
-        items.push_back({ "NOISE FLOOR", k, k ? NitsCard(rec->noiseFloorNits) : dash, pal::Ink, made, tip });
+        if (rec && std::isfinite(rec->noiseFloorNits) && rec->noiseFloorNits <= 0.0)
+            tip += "\nRecorded as 0: every level read clean. DLC counts that as no measured floor.";
+        items.push_back({ "NOISE FLOOR", k, k ? Sig(rec->noiseFloorNits, 2, "NIT") : dash, pal::Ink, made, tip });
     }
     {
+        // A settle of 0 = the first read after the change already matched: settled within one read (DLC's blind spot
+        // is below one meter integration), not "no time".
         const bool k = rec && std::isfinite(rec->settleS);
         std::string tip = "How long the panel takes to settle after the patch changes.\n" + measuredBy;
+        auto settle = [](double s) { return s > 0.0 ? Sig(s, 2, "s") : std::string("within 1 read"); };
         if (rec && std::isfinite(rec->settleBrightS) && std::isfinite(rec->settleDarkS))
-            tip += "\nBright " + num("%.1f", rec->settleBrightS) + " s, dark " + num("%.1f", rec->settleDarkS) + " s.";
-        items.push_back({ "SETTLE", k, k ? num("%.1f", rec->settleS) + " S" : dash, pal::Ink, made, tip });
+            tip += "\nBright " + settle(rec->settleBrightS) + ", dark " + settle(rec->settleDarkS) + ".";
+        items.push_back({ "SETTLE", k, !k ? dash : rec->settleS > 0.0 ? Sig(rec->settleS, 2, "S") : std::string("WITHIN 1 READ"),
+                          pal::Ink, made, tip });
     }
     {
         const bool k = rec && (!rec->thermalRegime.empty() || std::isfinite(rec->warmupMinutes));
         std::string v = rec && !rec->thermalRegime.empty() ? Upper(rec->thermalRegime) : std::string();
-        if (rec && std::isfinite(rec->warmupMinutes))
-            v += (v.empty() ? "" : " ") + num("%.0f", rec->warmupMinutes) + " MIN";
+        if (rec && std::isfinite(rec->warmupMinutes)) v += (v.empty() ? "" : " ") + Sig(rec->warmupMinutes, 2, "MIN");
         std::string tip = "How the panel warms up, and the minutes until it holds steady.\n" + measuredBy;
         if (rec && !rec->coldChannel.empty()) tip += "\nDrifts most: " + rec->coldChannel + ".";
         items.push_back({ "WARM-UP", k, k ? v : dash, pal::Ink, made, tip });
     }
     {
         const bool k = rec && std::isfinite(rec->eotfUndershoot);
-        items.push_back({ "EOTF", k, k ? num("%+.1f", rec->eotfUndershoot * 100.0) + " %" : dash, pal::Ink, made,
+        items.push_back({ "EOTF", k, k ? Sig(rec->eotfUndershoot * 100.0, 2, "%", true) : dash, pal::Ink, made,
                           "Full-field light against what the signal asks for (+: brighter).\n" + measuredBy });
     }
-    // The refresh response: its own date; unusable or another panel's says so.
+    // The refresh response: its own date, its reference rate, VRR-derived rates marked; unusable or another panel's
+    // says so.
     bool refreshUsable = false;
     {
         const dlc::DipRefreshSection* s = rec && rec->refresh >= 0 && rec->refresh < (int)d.dip.refresh.size()
                                               ? &d.dip.refresh[(size_t)rec->refresh] : nullptr;
-        std::string tip = "The panel's light at other refresh rates against 60 Hz.\nDLC's refresh measurement (dlc.refresh_trim) writes it.";
+        std::string tip = "The panel's light at other refresh rates against the reference rate\n"
+                          "(the calibration's). DLC's refresh measurement (dlc.refresh_trim) writes it.";
         std::string v = dash;
         ImU32 col = pal::Ink;
         if (s && !s->error.empty()) {
             v = "UNREADABLE";
             col = pal::Alarm;
             tip += "\nNot usable: " + s->error + ".";
+        } else if (s && !s->referenceRecorded) {
+            v = "NO REFERENCE";
+            col = pal::Alarm;
+            tip += "\nIt names no reference rate: DesktopLUT does not apply it.";
         } else if (s && link.refreshOtherPanel) {
             v = "OTHER PANEL";
             col = pal::InkDim;
             tip += "\nMeasured on " + s->hardwareId + ", not this display (" + r.dlcLive.hardwareId + ").";
         } else if (s) {
             refreshUsable = true;
-            v.clear();
-            for (const dlc::DipRefreshRate& rate : s->rates) v += (v.empty() ? "" : " ") + rate.key;
-            tip += "\nRates: " + (v.empty() ? std::string("none") : v + " Hz") + ".";
-            if (v.empty()) v = "NO RATES";
+            std::string list;
+            bool anyVrr = false;
+            tip += "\nReference " + s->referenceKey + " Hz.";
+            for (const dlc::DipRefreshRate& rate : s->rates) {
+                const bool vrr = rate.source == "vrr";
+                anyVrr |= vrr;
+                list += (list.empty() ? "" : " ") + rate.key + (vrr ? "*" : "");
+                std::string line = "\n" + rate.key + " Hz";
+                if (!rate.sameAs.empty()) line += ": = " + rate.sameAs + " Hz";
+                else if (const std::string pr = RatePctRange(rate); !pr.empty()) line += ": " + pr;
+                if (vrr) line += "  (VRR)";
+                tip += line;
+            }
+            if (anyVrr) {
+                tip += "\n* from a VRR cadence";
+                if (!s->vrr.crossCheckRate.empty()) tip += ", cross-checked against " + s->vrr.crossCheckRate + " Hz";
+                tip += ".";
+            }
+            if (s->vrr.present && std::isfinite(s->vrr.rangeLoHz) && std::isfinite(s->vrr.rangeHiHz))
+                tip += "\nVRR sweep " + Sig(s->vrr.rangeLoHz, 4) + " .. " + Sig(s->vrr.rangeHiHz, 4) + " Hz, " +
+                       std::to_string(s->vrr.points) + " points.";
+            v = "VS " + s->referenceKey + ":" + (list.empty() ? std::string(" NONE") : " " + list);
             // The rates when they fit beside the label and the age, else how many (the tooltip lists them).
             const std::string age = AgeText(s->measured, d.today);
             const float room = ImGui::GetContentRegionAvail().x - Px(kCardLabelW) - Px(10) -
                                (age.empty() ? 0.0f : MeasureText(Font::Mono, 11.5f, age.c_str()).x);
             if (!s->rates.empty() && MeasureText(Font::Mono, kSizeMono, v.c_str()).x > room)
-                v = std::to_string(s->rates.size()) + (s->rates.size() == 1 ? " RATE" : " RATES");
+                v = std::to_string(s->rates.size()) + (s->rates.size() == 1 ? " RATE" : " RATES") + (anyVrr ? "*" : "") +
+                    " VS " + s->referenceKey;
             if (!s->runId.empty()) tip += "\nRun " + s->runId + ".";
         }
         items.push_back({ "REFRESH", s != nullptr, v, col, s ? s->measured : std::string(), tip });
     }
     if (showHdr) {
         const bool k = rec && std::isfinite(rec->sustainedPeakNits);
-        items.push_back({ "SUSTAINED PEAK", k, k ? NitsCard(rec->sustainedPeakNits) : dash, pal::Ink, made,
+        items.push_back({ "SUSTAINED PEAK", k, k ? Sig(rec->sustainedPeakNits, 3, "NIT") : dash, pal::Ink, made,
                           "The peak the panel holds under a lasting load.\nNo DLC flow measures it yet." });
-        const bool p = rec && rec->peakByWindow.present;
-        items.push_back({ "PEAK BY WINDOW", p, p ? std::string("MEASURED") : dash, pal::Ink,
-                          p ? rec->peakByWindow.measured : std::string(),
-                          "The peak the panel holds per window size (its ABL).\nDLC's peak-by-window measurement writes it." });
+        const dlc::DipPeakByWindow* pbw = rec && rec->peakByWindow.present ? &rec->peakByWindow : nullptr;
+        std::string v = dash, tip = "The light the panel holds per window size (its ABL), charted beside.\n"
+                                    "DLC's peak-window flow measures it.";
+        ImU32 col = pal::Ink;
+        if (pbw && pbw->newer) { v = "NEWER"; col = pal::InkDim; tip += "\nA newer format than this DesktopLUT reads."; }
+        else if (pbw && !pbw->error.empty()) { v = "UNREADABLE"; col = pal::Alarm; tip += "\nNot usable: " + pbw->error + "."; }
+        else if (pbw && !pbw->valid) {
+            v = "INVALID";
+            col = pal::Alarm;
+            tip += "\nThe up and down passes disagree";
+            if (pbw->systematic) tip += " (the panel drifted over the run)";
+            tip += ": DLC's verdict is invalid. The numbers stay shown, faint.";
+        } else if (pbw) {
+            v = std::isfinite(pbw->fullFieldSustainedNits)
+                    ? Sig(pbw->plateauNits, 3) + " \xE2\x80\xA6 " + Sig(pbw->fullFieldSustainedNits, 3, "NIT")
+                    : Sig(pbw->plateauNits, 3, "NIT");
+            tip += "\nSmall window " + Sig(pbw->plateauNits, 3, "nit") + ", full field " + Sig(pbw->fullFieldSustainedNits, 3, "nit") + ".";
+            if (std::isfinite(pbw->runWindowAreaPct))
+                tip += "\nRun window " + Sig(pbw->runWindowAreaPct, 3, "%") + " (the largest still on the plateau).";
+        }
+        items.push_back({ "PEAK BY WINDOW", pbw != nullptr, v, col, pbw ? pbw->measured : std::string(), tip });
     }
     {
         items.push_back({ std::string(otherMode) + " RECORD", otherRec != nullptr,
@@ -1176,6 +1243,122 @@ void PanelCard(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewStat
                                             : "For Claude Code: it adds this display to DLC, then runs the characterize flow.");
         EndRow(row);
     }
+}
+
+// ---- PANEL view, left: the DIP's headline numbers and its two charts ----------------------------------------------
+const dlc::DipRecord* PanelRecord(const dlc::Data& d, const DisplayRow& r, bool showHdr) {
+    if (r.dlcMatch.name.empty()) return nullptr;
+    const dlc::DipLink link = dlc::DipRecordFor(d, r.dlcMatch.name, showHdr ? 1 : 0, r.dlcLive);
+    return link.record >= 0 ? &d.dip.records[(size_t)link.record] : nullptr;
+}
+
+std::vector<Tile> PanelTiles(const dlc::DipRecord* rec, bool hdr) {
+    const std::string dash = "\xE2\x80\x94";
+    auto tile = [&](const char* label, bool known, const std::string& v, const std::string& sub, float weight = 1.0f) {
+        return Tile{ label, known ? v : dash, known ? sub : std::string(), known ? pal::Ink : pal::InkFaint, 0u, weight };
+    };
+    std::vector<Tile> t;
+    const bool w = rec && std::isfinite(rec->whiteNits);
+    t.push_back(tile("WHITE", w, Sig(rec ? rec->whiteNits : dlc::kNaN, 3, "NIT"),
+                     rec && std::isfinite(rec->whiteX) ? Sig(rec->whiteX, 4) + " " + Sig(rec->whiteY, 4) : std::string(), 1.2f));
+    const bool b = rec && std::isfinite(rec->blackNits);
+    t.push_back(tile("BLACK", b, !b ? dash : rec->blackNits > 0.0 ? Sig(rec->blackNits, 3, "NIT") : std::string("BELOW METER"),
+                     std::string()));
+    const double c = rec ? dlc::DipContrast(*rec) : dlc::kNaN;
+    t.push_back(tile("CONTRAST", w && b, std::isfinite(c) ? Sig(c, 3) + ":1" : std::string("BEYOND METER"), std::string(), 1.25f));
+    const dlc::DipPeakByWindow* p = hdr && rec && rec->peakByWindow.Usable() ? &rec->peakByWindow : nullptr;
+    const bool faint = p && !p->valid;
+    Tile smallW = tile("SMALL WINDOW", p && std::isfinite(p->plateauNits), Sig(p ? p->plateauNits : dlc::kNaN, 3, "NIT"),
+                      p && std::isfinite(p->runWindowAreaPct) ? "UP TO " + Sig(p->runWindowAreaPct, 3, "%") : std::string(), 1.1f);
+    Tile fullF = tile("FULL FIELD", p && std::isfinite(p->fullFieldSustainedNits), Sig(p ? p->fullFieldSustainedNits : dlc::kNaN, 3, "NIT"),
+                     p && std::isfinite(p->plateauNits) && p->plateauNits > 0.0 && std::isfinite(p->fullFieldSustainedNits)
+                         ? Sig(100.0 * p->fullFieldSustainedNits / p->plateauNits, 2, "% OF SMALL") : std::string(), 1.1f);
+    if (faint) { smallW.col = fullF.col = pal::InkFaint; smallW.sub = fullF.sub = "INVALID RUN"; }
+    t.push_back(smallW);
+    t.push_back(fullF);
+    return t;
+}
+
+// The DIP's refresh response as the refresh chart draws it: per grey level (in order), each rate's light vs the
+// reference, %; VRR-derived rates as such.
+dlc::RefreshProbeChart RefreshChartFromDip(const dlc::DipRefreshSection& s) {
+    dlc::RefreshProbeChart c;
+    if (!s.error.empty() || !s.referenceRecorded) return c;
+    c.present = true;
+    c.complete = true;
+    c.referenceHz = s.ReferenceHz();
+    size_t levels = 0;
+    for (const dlc::DipRefreshRate& r : s.rates) levels = std::max(levels, r.levels.size());
+    for (size_t i = 0; i < levels; i++) {
+        dlc::RefreshProbeSeries se;
+        for (const dlc::DipRefreshRate& r : s.rates) {
+            if (i >= r.levels.size()) continue;
+            const dlc::DipRefreshLevel& lv = r.levels[i];
+            if (se.name.empty()) se.name = dlc::FormatSig(lv.nits, 2) + " nit";
+            se.points.push_back({ r.hz, (lv.ratio - 1.0) * 100.0, std::isfinite(lv.uLn) ? lv.uLn * 100.0 : dlc::kNaN,
+                                  r.source == "vrr" });
+        }
+        if (!se.points.empty()) c.series.push_back(std::move(se));
+    }
+    return c;
+}
+
+// A chart with a title line (and its date on the right) over it.
+void TitledChart(const char* title, const std::string& right, ImVec2 a, ImVec2 b, const std::function<void(ImVec2, ImVec2)>& draw) {
+    const float head = Snap(Px(kTileHeadH));
+    const float cy = a.y + head * 0.5f;
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, a.x, cy, title);
+    if (!right.empty()) {
+        const float w = MeasureText(Font::Mono, 11.5f, right.c_str()).x;
+        TextAt(Font::Mono, 11.5f, pal::InkFaint, Snap(b.x - w), cy, right.c_str());
+    }
+    draw(ImVec2(a.x, a.y + head + Snap(Px(6))), b);
+}
+
+void PanelCharts(const Snapshot& snap, const DisplayRow& r, bool showHdr, ImVec2 a, ImVec2 b) {
+    const dlc::Data& d = *snap.dlc;
+    const dlc::DipRecord* rec = PanelRecord(d, r, showHdr);
+    const float gap = Snap(Px(12));
+    const bool side = (b.x - a.x) >= Px(640);
+    const ImVec2 a1 = a;
+    const ImVec2 b1 = side ? ImVec2(Snap(a.x + (b.x - a.x - gap) * 0.5f), b.y) : ImVec2(b.x, Snap(a.y + (b.y - a.y - gap) * 0.5f));
+    const ImVec2 a2 = side ? ImVec2(b1.x + gap, a.y) : ImVec2(a.x, b1.y + gap);
+    auto dated = [&d](const std::string& date) {
+        if (date.empty()) return std::string();
+        const int days = dlc::DaysBetween(date, d.today);
+        return date.substr(0, 10) + (days >= 0 ? "  \xC2\xB7  " + std::to_string(days) + " D" : std::string());
+    };
+    // PEAK BY WINDOW (HDR); the reference: the tone map's target while it runs (what highlights are mapped to), else
+    // the HDR profile's peak (where the calibration puts white).
+    static const dlc::DipPeakByWindow kNone;
+    const dlc::DipPeakByWindow& pbw = showHdr && rec ? rec->peakByWindow : kNone;
+    TitledChart("PEAK BY WINDOW", dated(pbw.measured), a1, b1, [&](ImVec2 pa, ImVec2 pb) {
+        if (!showHdr) {
+            DrawFieldBox(ImGui::GetWindowDrawList(), pa, pb);
+            DrawTextIn(ImGui::GetWindowDrawList(), Font::Label, kSizeLabel, pa, pb, pal::InkFaint, "HDR ONLY");
+            return;
+        }
+        const TonemapSettings& tm = r.settings.hdrColorCorrection.tonemap;
+        double ref = dlc::kNaN;
+        const char* refLabel = nullptr;
+        if (tm.enabled && tm.targetPeakNits > 0.0f) { ref = tm.targetPeakNits; refLabel = "TONE MAP"; }
+        else if (r.settings.hdrMHC.enabled) { ref = MhcProfileMetadataPeakNits(r.settings.hdrMHC, true); refLabel = "PROFILE"; }
+        DrawPeakByWindow(pbw, pa, pb, ref, refLabel);
+    });
+    const dlc::DipRefreshSection* s = rec && rec->refresh >= 0 && rec->refresh < (int)d.dip.refresh.size()
+                                          ? &d.dip.refresh[(size_t)rec->refresh] : nullptr;
+    TitledChart("REFRESH RESPONSE", dated(s ? s->measured : std::string()), a2, b, [&](ImVec2 pa, ImVec2 pb) {
+        if (!s) { DrawRefreshProbe(dlc::RefreshProbeChart(), pa, pb, "NOT MEASURED"); return; }
+        if (!s->error.empty() || !s->referenceRecorded) {
+            DrawFieldBox(ImGui::GetWindowDrawList(), pa, pb);
+            DrawTextIn(ImGui::GetWindowDrawList(), Font::Label, kSizeLabel, pa, pb, pal::Alarm,
+                       s->error.empty() ? "NO REFERENCE RATE" : "UNREADABLE");
+            return;
+        }
+        DrawRefreshProbe(RefreshChartFromDip(*s), pa, pb, "NO RATES");
+    });
+    ImGui::SetCursorScreenPos(ImVec2(a.x, b.y));
+    ImGui::Dummy(ImVec2(b.x - a.x, 0));
 }
 
 // ---- no DLC: what it is, what it needs, and its setup ------------------------------------------------------------
@@ -1424,8 +1607,8 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
     std::vector<int> reports = sel->dlcMatch.name.empty() ? std::vector<int>() : ReportsFor(d, sel->dlcMatch.name, showHdr);
     const dlc::ModeRecord& rec = sel->dlcRecord[showHdr ? 1 : 0];
     const bool hasStack = !d.folder.empty() && !sel->dlcMatch.name.empty() && (rec.stack >= 0 || rec.current >= 0);
-    // The PANEL view (what DLC has measured about the display) keeps the current stack's charts on the left, else the
-    // newest run's.
+    // The PANEL view: what DLC has measured about the display (its DIP record) — its numbers, its charts, its card; no
+    // run is shown.
     bool liveView = false, stackView = false, panelView = false;
     int shown = -1;
     if (vs.dlc.pick == kDlcPickLive) liveView = runHere;
@@ -1434,7 +1617,7 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
     else if (!vs.dlc.pick.empty()) {
         for (int i : reports) if (dlc::SamePath(d.reports[i].path, vs.dlc.pick)) shown = i;
     }
-    if (panelView) shown = hasStack ? rec.current : (reports.empty() ? -1 : reports.front());
+    if (panelView) shown = -1;
     else if (!liveView && !stackView && shown < 0) {
         if (vs.dlc.pick.empty() && runHere && InProgress(L.phase)) liveView = true;
         else if (hasStack) stackView = true;
@@ -1486,10 +1669,11 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         if (ImGui::IsItemHovered() && panelView)
             ImGui::SetTooltip("What DLC has measured about the display: its record (DIP).");
         float x = Snap(p.x + Px(48) + Px(kRunPickerW) + Px(12));
-        if (panelView) {   // the charts beside the card: the current stack's verification, else the newest run
-            const std::string from = shown < 0 ? std::string() : (hasStack ? "VERIFIED  " : "RUN  ") + ReportLabel(d.reports[shown]);
-            TextAt(Font::Label, kSizeLabel, pal::InkDim, x, cy,
-                   Ellipsize(Font::Label, kSizeLabel, from, p.x + w - Px(kButtonW) - Px(16) - x).c_str());
+        if (panelView) {   // the record shown
+            const dlc::DipRecord* dip = PanelRecord(d, *sel, showHdr);
+            const std::string what = dip ? "DIP  " + dip->key : std::string("NO DIP RECORD");
+            TextAt(Font::Label, kSizeLabel, dip ? pal::InkDim : pal::InkFaint, x, cy,
+                   Ellipsize(Font::Label, kSizeLabel, what, p.x + w - Px(kButtonW) - Px(16) - x).c_str());
         } else if (stackView && shown >= 0) {   // the verification the stack's charts come from
             const std::string from = "VERIFIED  " + ReportLabel(d.reports[shown]);
             TextAt(Font::Label, kSizeLabel, pal::InkDim, x, cy,
@@ -1563,6 +1747,7 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
     // Readouts: the run's live numbers; a record's practical view (its report's numbers when it has none).
     const dlc::LiveCharts* lc = charts && charts->present ? charts.get() : nullptr;
     if (liveView) ReadoutRow(LiveTiles(*L.state, lc));
+    else if (panelView) ReadoutRow(PanelTiles(PanelRecord(d, *sel, showHdr), showHdr));
     else if (lc && lc->practical.present) ReadoutRow(PracticalTiles(lc->practical, rep, chartsHdr));
     else ReadoutRow(RecordTiles(rep));
     ImGui::Dummy(ImVec2(0, Px(14)));
@@ -1579,7 +1764,32 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         ctx.slopePct10 = L.state->driftSlopePct10;
         ctx.channel = L.state->driftChannel.c_str();
     }
-    ChartTiles(vs, charts.get(), chartsHdr, liveView, ImVec2(chartsW, stacked ? Px(440) : colH), emptyText, ctx);
+    // A probe flow (peak-window, refresh-response) measures no calibration patches: its own chart takes the area.
+    const std::string liveFlow = liveView ? (!L.state->flow.empty() ? L.state->flow : L.active.flow) : std::string();
+    if (liveFlow == "peak-window" || liveFlow == "refresh-response") {
+        const ImVec2 pa(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+        const ImVec2 pb(Snap(pa.x + chartsW), Snap(pa.y + (stacked ? Px(440) : colH)));
+        static const dlc::ProbeCharts kNoProbes;
+        const dlc::ProbeCharts& pr = charts && charts->present ? charts->probes : kNoProbes;
+        if (liveFlow == "peak-window") {
+            const TonemapSettings& tm = sel->settings.hdrColorCorrection.tonemap;
+            const bool tmRef = tm.enabled && tm.targetPeakNits > 0.0f;
+            dlc::DipPeakByWindow waiting;   // no payload yet: the run has not finished a step
+            waiting.present = true;
+            waiting.complete = false;
+            DrawPeakByWindow(pr.peakByWindow.present ? pr.peakByWindow : waiting, pa, pb,
+                             tmRef ? (double)tm.targetPeakNits : dlc::kNaN, tmRef ? "TONE MAP" : nullptr);
+        } else {
+            DrawRefreshProbe(pr.refresh, pa, pb);
+        }
+        ImGui::SetCursorScreenPos(ImVec2(pa.x, pb.y));
+        ImGui::Dummy(ImVec2(chartsW, 0));
+    } else if (panelView) {
+        const ImVec2 pa(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
+        PanelCharts(snap, *sel, showHdr, pa, ImVec2(Snap(pa.x + chartsW), Snap(pa.y + (stacked ? Px(440) : colH))));
+    } else {
+        ChartTiles(vs, charts.get(), chartsHdr, liveView, ImVec2(chartsW, stacked ? Px(440) : colH), emptyText, ctx);
+    }
     if (stacked) ImGui::Dummy(ImVec2(0, Px(kPanelGap)));
     else ImGui::SetCursorScreenPos(ImVec2(top.x + chartsW + gutter, top.y));
     const ImVec2 sideSize(stacked ? total : sideW, stacked ? 0.0f : colH);

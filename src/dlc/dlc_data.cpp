@@ -306,6 +306,16 @@ std::string Upper(std::string s) {
     return s;
 }
 
+// The catalogue's spelling of a rate: 3 decimals, trailing zeros dropped ("47.952", "60").
+std::string HzKey(double hz) {
+    char b[32];
+    snprintf(b, sizeof(b), "%.3f", hz);
+    std::string s = b;
+    while (!s.empty() && s.back() == '0') s.pop_back();
+    if (!s.empty() && s.back() == '.') s.pop_back();
+    return s;
+}
+
 // One record's refresh_response (DLC dip.py RefreshResponse.from_dict's rules; anything it would refuse is an error
 // here too, so DesktopLUT never derives a trim from a section DLC itself would drop).
 DipRefreshSection ParseRefreshSection(const std::string& key, const JsonValue& rec, const JsonValue& rr) {
@@ -330,10 +340,33 @@ DipRefreshSection ParseRefreshSection(const std::string& key, const JsonValue& r
     s.measured = Str(&rr, "measured");
     if (s.measured.empty()) return fail("no measured date");
     s.runId = Str(&rr, "run_id");
-    if (const JsonValue* ref = Obj(&rr, "reference")) {
-        if (!Str(ref, "key").empty()) s.referenceKey = Str(ref, "key");
+    // The reference: recorded, or (no block) dip.py's default 60 / 1, not recorded. A block that names no positive
+    // rational is unusable: the trim would not know what its ratios are against.
+    if (const JsonValue* refv = rr.find("reference"); refv && refv->type != JsonValue::Null) {
+        if (refv->type != JsonValue::Obj) return fail("the reference is not an object");
         uint32_t n = 0, d = 0;
-        if (Rational(ref, "num", n) && Rational(ref, "den", d)) { s.referenceNum = n; s.referenceDen = d; }
+        if (!Rational(refv, "num", n) || !Rational(refv, "den", d))
+            return fail("the reference rate has no positive rational");
+        s.referenceNum = n;
+        s.referenceDen = d;
+        s.referenceKey = Str(refv, "key").empty() ? HzKey((double)n / (double)d) : Str(refv, "key");
+        s.referenceRecorded = true;
+    }
+    if (const JsonValue* v = Obj(&rr, "vrr")) {
+        s.vrr.present = true;
+        if (const JsonValue* range = v->find("range_hz"); range && range->type == JsonValue::Arr && range->arr.size() >= 2) {
+            if (range->arr[0].type == JsonValue::Num) s.vrr.rangeLoHz = range->arr[0].num;
+            if (range->arr[1].type == JsonValue::Num) s.vrr.rangeHiHz = range->arr[1].num;
+        }
+        if (const JsonValue* pts = v->find("points"); pts && pts->type == JsonValue::Arr) s.vrr.points = (int)pts->arr.size();
+        if (const JsonValue* xc = Obj(v, "cross_check")) {
+            const JsonValue* measuredv = xc->find("measured");
+            const bool notMeasured = measuredv && measuredv->type == JsonValue::Bool && !measuredv->b;
+            if (const JsonValue* ok = xc->find("ok"); ok && ok->type == JsonValue::Bool && !notMeasured)
+                s.vrr.crossCheckOk = ok->b ? 1 : 0;
+            s.vrr.crossCheckRate = Str(xc, "rate");
+        }
+        s.vrr.fixedModeTrimDerived = Bool(v, "fixed_mode_trim_derived");
     }
     if (const JsonValue* id = Obj(&rr, "identity")) {
         s.hardwareId = Upper(Str(id, "hardware_id"));
@@ -352,6 +385,11 @@ DipRefreshSection ParseRefreshSection(const std::string& key, const JsonValue& r
             return fail("a rate without a key or a positive rational");
         rate.hz = (double)rate.num / (double)rate.den;
         rate.sameAs = Str(&r, "same_as");
+        if (!Str(&r, "source").empty()) rate.source = Str(&r, "source");
+        if (const JsonValue* proof = Obj(&r, "proof")) {
+            if (const JsonValue* ok = proof->find("ok"); ok && ok->type == JsonValue::Bool) rate.proofOk = ok->b ? 1 : 0;
+            rate.proofKind = Str(proof, "kind");
+        }
         if (const JsonValue* levels = r.find("levels"); levels && levels->type == JsonValue::Arr) {
             for (const JsonValue& l : levels->arr) {
                 DipRefreshLevel lv;
@@ -452,15 +490,120 @@ std::string OptStr(const JsonValue& rec, const char* key) {
     return v && v->type == JsonValue::Str ? v->str : std::string();
 }
 
-// peak_by_window: presence and its measured date (DipPeakByWindow says where the rest goes).
-DipPeakByWindow ParsePeakByWindow(const JsonValue& rec) {
+// ---- peak_by_window (dip.py PeakByWindow.from_dict's rules) ----
+// _opt_pos: absent / null = NaN; otherwise a finite number >= 0, or the section is refused.
+bool OptPos(const JsonValue& o, const char* key, double& out, std::string& err) {
+    out = kNaN;
+    const JsonValue* v = o.find(key);
+    if (!v || v->type == JsonValue::Null) return true;
+    double d = 0.0;
+    if (!AsFloat(*v, d) || !std::isfinite(d)) { err = std::string(key) + " is not a finite number"; return false; }
+    if (d < 0.0) { err = std::string(key) + " is negative"; return false; }
+    out = d;
+    return true;
+}
+
+// An entry of steps / curve: an object with area_pct in (0, 100] and its numbers non-negative.
+bool PeakEntry(const JsonValue& e, const std::vector<const char*>& nums, double& area, std::string& err) {
+    if (e.type != JsonValue::Obj) { err = "a peak_by_window entry is not an object"; return false; }
+    const JsonValue* a = e.find("area_pct");
+    if (!a || !AsFloat(*a, area) || !std::isfinite(area)) { err = "an entry without a finite area_pct"; return false; }
+    if (!(area > 0.0 && area <= 100.0)) { err = "area_pct " + FormatSig(area, 4) + " outside (0, 100]"; return false; }
+    double unused = 0.0;
+    for (const char* k : nums) if (!OptPos(e, k, unused, err)) return false;
+    return true;
+}
+
+DipPeakPass PeakPass(const JsonValue* p) {
+    DipPeakPass out;
+    if (!p || p->type != JsonValue::Obj) return out;
+    out.present = true;
+    std::string ignored;
+    OptPos(*p, "early_nits", out.early, ignored);
+    OptPos(*p, "sustained_nits", out.sustained, ignored);
+    OptPos(*p, "min_nits", out.min, ignored);
+    OptPos(*p, "tau_s", out.tau, ignored);
+    if (const JsonValue* s = p->find("settled"); s && s->type == JsonValue::Bool) out.settled = s->b ? 1 : 0;
+    return out;
+}
+
+DipPeakByWindow PeakByWindowFrom(const JsonValue* v) {
     DipPeakByWindow p;
-    const JsonValue* v = rec.find("peak_by_window");
     if (!v || v->type == JsonValue::Null) return p;
     p.present = true;
-    if (v->type == JsonValue::Obj) p.measured = Str(v, "measured");
+    auto fail = [&p](const std::string& why) { p.error = why; p.curve.clear(); return p; };
+    if (v->type != JsonValue::Obj) return fail("peak_by_window is not an object");
+    p.measured = Str(v, "measured");
+    if (const JsonValue* sv = v->find("schema")) {   // int(d.get("schema", 1)): a null or a word is refused
+        if (!AsInt(*sv, p.schema)) return fail("the schema is not a number");
+    } else {
+        p.schema = kDipPeakWindowSchema;
+    }
+    if (p.schema > kDipPeakWindowSchema) { p.newer = true; return p; }
+    if (!v->find("measured") || v->find("measured")->type == JsonValue::Null) return fail("no measured date");
+    p.runId = Str(v, "run_id");
+    std::string err;
+    static const std::vector<const char*> kStepNums = { "early_nits", "early_t_s", "sustained_nits", "min_nits",
+                                                                  "max_nits", "tau_s", "hold_s", "cooldown_s",
+                                                                  "black_nits", "t_start_s" };
+    static const std::vector<const char*> kCurveNums = { "early_nits", "sustained_nits", "min_nits", "tau_s" };
+    if (const JsonValue* steps = v->find("steps"); steps && !Falsy(*steps)) {
+        if (steps->type != JsonValue::Arr) return fail("steps is not a list");
+        for (const JsonValue& s : steps->arr) {
+            double area = 0.0;
+            if (!PeakEntry(s, kStepNums, area, err)) return fail(err);
+        }
+        p.steps = (int)steps->arr.size();
+    }
+    const JsonValue* curve = v->find("curve");
+    if (curve && !Falsy(*curve) && curve->type != JsonValue::Arr) return fail("curve is not a list");
+    if (!curve || Falsy(*curve)) return fail("no curve");
+    for (const JsonValue& c : curve->arr) {
+        DipPeakSize z;
+        if (!PeakEntry(c, kCurveNums, z.areaPct, err)) return fail(err);
+        OptPos(c, "early_nits", z.early, err);
+        OptPos(c, "sustained_nits", z.sustained, err);
+        OptPos(c, "min_nits", z.min, err);
+        OptPos(c, "tau_s", z.tau, err);
+        z.up = PeakPass(c.find("up"));
+        z.down = PeakPass(c.find("down"));
+        if (const JsonValue* ag = Obj(&c, "agreement")) {
+            if (const JsonValue* ok = ag->find("ok"); ok && ok->type == JsonValue::Bool) z.agree = ok->b ? 1 : 0;
+            z.relDiff = Num(ag, "rel_diff");
+            z.tol = Num(ag, "tol");
+        }
+        z.n = Int(&c, "n", 0);
+        p.curve.push_back(z);
+    }
+    std::stable_sort(p.curve.begin(), p.curve.end(), [](const DipPeakSize& a, const DipPeakSize& b) { return a.areaPct < b.areaPct; });
+    if (!OptPos(*v, "plateau_nits", p.plateauNits, err) || !OptPos(*v, "run_window_area_pct", p.runWindowAreaPct, err) ||
+        !OptPos(*v, "run_window_sustained_nits", p.runWindowSustainedNits, err) ||
+        !OptPos(*v, "full_field_sustained_nits", p.fullFieldSustainedNits, err))
+        return fail(err);
+    for (const char* k : { "agreement", "identity", "conditions", "rules", "wear" })   // dict(x or {})
+        if (const JsonValue* o = v->find(k); o && !Falsy(*o) && o->type != JsonValue::Obj) return fail(std::string(k) + " is not an object");
+    if (const JsonValue* notes = v->find("notes"); notes && !Falsy(*notes) && notes->type != JsonValue::Arr &&
+                                                    notes->type != JsonValue::Str && notes->type != JsonValue::Obj)
+        return fail("notes is not a list");
+    p.valid = Bool(v, "valid");
+    if (const JsonValue* ag = Obj(v, "agreement")) {
+        if (const JsonValue* failed = ag->find("areas_failed"); failed && failed->type == JsonValue::Arr)
+            for (const JsonValue& a : failed->arr) if (a.type == JsonValue::Num) p.areasFailed.push_back(a.num);
+        p.systematic = Bool(ag, "systematic");
+        p.maxRelDiff = Num(ag, "max_rel_diff");
+    }
+    if (const JsonValue* cond = Obj(v, "conditions")) {
+        p.stack = Str(cond, "stack");
+        if (const JsonValue* e = cond->find("emissive"); e && e->type == JsonValue::Bool) p.emissive = e->b ? 1 : 0;
+    }
+    if (const JsonValue* wear = Obj(v, "wear")) {
+        p.peakWhiteS = Num(wear, "peak_white_s");
+        p.longestHoldS = Num(wear, "longest_hold_s");
+    }
     return p;
 }
+
+DipPeakByWindow ParsePeakByWindow(const JsonValue& rec) { return PeakByWindowFrom(rec.find("peak_by_window")); }
 
 // False: DLC's loader would refuse the record (a field that does not convert), so it is dropped here too.
 bool ParseDipRecord(const std::string& key, const JsonValue& rec, DipRecord& r) {
@@ -542,6 +685,43 @@ bool ParseDipRecord(const std::string& key, const JsonValue& rec, DipRecord& r) 
 }
 
 }  // namespace
+
+std::string FormatSig(double v, int sig, bool sign) {
+    if (!std::isfinite(v)) return {};
+    if (v == 0.0) return "0";
+    sig = std::clamp(sig, 1, 12);
+    const double a = std::fabs(v);
+    // Decimals so the first significant digit and sig - 1 after it show; none for whole numbers past 10^sig.
+    int decimals = sig - 1 - (int)std::floor(std::log10(a));
+    decimals = std::clamp(decimals, 0, 15);
+    char b[64];
+    snprintf(b, sizeof(b), "%.*f", decimals, a);
+    // A value that rounded up into the next decade (0.00999 at 2 -> "0.010"): the trailing zeros go below.
+    std::string s = b;
+    if (s.find('.') != std::string::npos) {
+        while (!s.empty() && s.back() == '0') s.pop_back();
+        if (!s.empty() && s.back() == '.') s.pop_back();
+    }
+    // Never "0" for a value that is not zero (decimals are bounded at 15: below 1e-15 shows in exponent form).
+    if (s == "0") {
+        snprintf(b, sizeof(b), "%.*e", (std::max)(0, sig - 1), a);
+        s = b;
+    }
+    if (v < 0.0) s = "-" + s;
+    else if (sign) s = "+" + s;
+    return s;
+}
+
+DipPeakByWindow ParsePeakByWindowJson(const std::string& json) {
+    JsonValue root;
+    if (!ParseJson(json, root)) {
+        DipPeakByWindow p;
+        p.present = true;
+        p.error = "not JSON";
+        return p;
+    }
+    return PeakByWindowFrom(&root);
+}
 
 double DipContrast(const DipRecord& r) {
     if (!(std::isfinite(r.whiteNits) && r.whiteNits > 0.0 && std::isfinite(r.blackNits) && r.blackNits > 0.0)) return kNaN;
