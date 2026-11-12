@@ -53,6 +53,11 @@
 #include "../src/types.h"                // g_blueNoiseData
 #include "../shared/fald_shader.h"
 #include "../shared/fald_core_mode.h"
+#include "../shared/fald_change.h"
+#include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride
+#include "../shared/fald_conv_tune.h"       // g_faldConvTuneOverride, g_faldConvTuneCachePath
+#include "../shared/fald_shader_set.h"
+#include "fald_pass_probe.h"
 #include "../shared/peak_detect.h"
 #include "../shared/tonemap_curves.h"
 #include "../shared/hdr_dither.h"
@@ -181,20 +186,24 @@ struct HookRig {
     double initUs = 0.0;                       // InitializeStuff: in the DLL it runs inside the first hooked present
     int fakeCtx[4] = {};                       // the pass only uses the context as a key
 
-    HookRig(perf::Dev& dev, int lutSize) : d(dev), lutN(lutSize) {
+    // hdrPanel / sdrPanel: the FALD panel files staged for the monitor's HDR / SDR (ACM) mode (empty = none)
+    HookRig(perf::Dev& dev, int lutSize, const std::string& hdrPanel = OwnerPanel(), const std::string& sdrPanel = std::string())
+        : d(dev), lutN(lutSize) {
         char tmp[MAX_PATH] = {};
         GetTempPathA(MAX_PATH, tmp);
         stage = std::string(tmp) + "dlut_perf_" + std::to_string(GetCurrentProcessId());
         CreateDirectoryA(stage.c_str(), nullptr);
         CreateDirectoryA((stage + "\\fald").c_str(), nullptr);
         if (!WriteCube(stage + "\\0_0.cube", lutN) || !WriteCube(stage + "\\0_0_hdr.cube", lutN)) return;
-        const std::string src = OwnerPanel();
-        if (!src.empty()) panel = CopyFileA(src.c_str(), (stage + "\\fald\\0_0_hdr.bin").c_str(), FALSE) != FALSE;
+        int staged = 0;
+        if (!hdrPanel.empty() && CopyFileA(hdrPanel.c_str(), (stage + "\\fald\\0_0_hdr.bin").c_str(), FALSE)) staged++;
+        if (!sdrPanel.empty() && CopyFileA(sdrPanel.c_str(), (stage + "\\fald\\0_0.bin").c_str(), FALSE)) staged++;
+        panel = staged > 0;
         UninitializeStuff();                   // whatever an earlier case left (no-op on a clean process)
         std::memset(textureDesc, 0, sizeof(D3D11_TEXTURE2D_DESC) * 2);
         ResetContextRouting();
         if (!AddLUTs((char*)stage.c_str()) || numLuts != 2) return;
-        if (panel) panel = FaldLoadPanelFiles(stage.c_str()) == 1;
+        if (panel) panel = FaldLoadPanelFiles(stage.c_str()) == staged;
         prev25h2 = isWindows11_25h2;
         isWindows11_25h2 = true;               // the context's monitor comes from the routing cache, as on 25H2
         g_numMonitorHdrStates = 1;
@@ -214,7 +223,7 @@ struct HookRig {
         g_numLocalFald = 0;
         g_hdrDitherOff = 0;
         isWindows11_25h2 = prev25h2;
-        for (const char* f : { "\\0_0.cube", "\\0_0_hdr.cube", "\\fald\\0_0_hdr.bin" }) DeleteFileA((stage + f).c_str());
+        for (const char* f : { "\\0_0.cube", "\\0_0_hdr.cube", "\\fald\\0_0_hdr.bin", "\\fald\\0_0.bin" }) DeleteFileA((stage + f).c_str());
         RemoveDirectoryA((stage + "\\fald").c_str());
         RemoveDirectoryA(stage.c_str());
     }
@@ -1156,5 +1165,374 @@ TEST_CASE("perf: output reference manifest (DLUT_PERF_HASH_WRITE / DLUT_PERF_HAS
     if (!refPath.empty()) {
         MESSAGE("against " << refPath << ": " << same << " identical, " << differ << " differ, " << missing << " not in the manifest");
         CHECK(missing == 0);
+    }
+}
+
+// =================================================================================================================
+// 4. The FALD layer as it ships, per pass (DLUT_PERF_FALD=<dir>)
+// =================================================================================================================
+// The hook's real RenderLUT + FALD layer over a back buffer standing in for DWM's, the layer configured AS IT SHIPS: the
+// rate-cap governor deciding (g_faldCoreHoldOverride -1), the conv auto-tune deciding (a cache file of this run's own),
+// the change-driven path by its rules, the always-on core KC5, and — per configuration — the owner's settings (cube +
+// dynamic tone map, starfield on, LED lag = the panel clock) or the layer alone. Every present is timed as a whole AND per
+// pass (tests/fald_pass_probe.h: a timestamp before and after each GPU command the layer issues; an indirect command's
+// "ran" comes from the arguments the decide passes wrote), over scenarios whose content REALLY changes the way the name
+// says: two content frames A / B that differ only inside the scenario's rects, composed alternately.
+//   -> <dir>/fald_presents.tsv (one row per configuration x resolution x scenario: the present's GPU / CPU time, the runs'
+//      kinds, the governor) and <dir>/fald_passes.tsv (one row per pass of it: issued, ran, GPU us).
+// DLUT_PERF_ADAPTER / DLUT_PERF_N (40) / DLUT_PERF_ONLY ("<cfg>/<scenario>" substrings) / DLUT_PERF_HEAT (one value,
+// default 12 ms) as above; DLUT_PERF_RES = "2160" by default — "1440" / "1080" run the SAME 48 x 48 lattice and kernels
+// stretched over the smaller frame (a fractional-pitch copy of the panel file made here: the per-pixel passes scale with
+// the frame, the lattice passes do not; a real smaller panel has its own lattice); DLUT_PERF_FALD_HZ = the refresh rate
+// the governor budgets against (120).
+namespace {
+
+struct FaldPerfCfg {
+    std::string id;
+    Dom dom;
+    bool lut, tm, star;
+    unsigned int lag;        // LED lag: 0 off, 3 the panel clock
+};
+std::vector<FaldPerfCfg> FaldPerfConfigs() {
+    return {
+        { "hdr_owner",        Dom::Hdr, true,  true,  true,  3u },   // the owner's HDR settings: cube + dynamic SoftClip, starfield, panel clock
+        { "hdr_owner_lag0",   Dom::Hdr, true,  true,  true,  0u },   // ... with LED lag off
+        { "hdr_fald",         Dom::Hdr, false, false, false, 0u },   // the layer alone (KC5), no starfield, no LED lag
+        { "hdr_fald_star_lag3", Dom::Hdr, false, false, true, 3u },  // the layer alone with both
+        { "acm_owner",        Dom::Acm, true,  false, true,  3u },   // SDR under ACM: cube, starfield, panel clock (the SDR panel file)
+    };
+}
+
+void FpPut(std::vector<unsigned char>& f, Dom d, int W, int x, int y, const float v[3], bool isCode) {
+    perf::PutPixel(d, f.data() + ((size_t)y * W + (size_t)x) * 8u, v, isCode);
+}
+void FpShift(std::vector<unsigned char>& dst, const std::vector<unsigned char>& src, int W, const RECT& rc, int dx, int dy) {
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const int sx = rc.left + ((x + dx) % w + w) % w, sy = rc.top + ((y + dy) % h + h) % h;
+            std::memcpy(dst.data() + ((size_t)(rc.top + y) * W + (size_t)(rc.left + x)) * 8u, src.data() + ((size_t)sy * W + (size_t)sx) * 8u, 8);
+        }
+}
+
+struct FaldPerfScn { std::string id; std::vector<RECT> rects; int mut; const char* what; };
+std::vector<FaldPerfScn> FaldPerfScenarios(int W, int H) {
+    const int s = std::max(1, H / 1080);
+    const RECT caret = { W / 5, H * 3 / 10, W / 5 + 2 * s, H * 3 / 10 + 18 * s };
+    const RECT clock = { W - 90 * s, H - 40 * s, W - 10 * s, H - 8 * s };
+    const RECT doc = { 80 * s, 60 * s, 1000 * s, 900 * s };
+    const RECT win = { 1050 * s, 300 * s, 1050 * s + 524 * s, 300 * s + 300 * s };
+    return {
+        { "idle_norect",  {},                      0, "a present with no dirty rect" },
+        { "idle_kick",    { RECT{ 0, 0, 1, 1 } },  0, "the settle kick's pixel, unchanged" },
+        { "same_small",   { caret, clock },        0, "a caret + clock rect recomposed with the same pixels" },
+        { "caret",        { caret },               1, "a caret blinking in a light document" },
+        { "clock",        { clock },               2, "the task bar clock's digits change" },
+        { "caret_clock",  { caret, clock },        3, "both" },
+        { "dark_type",    { RECT{ 1100 * s, 300 * s, 1300 * s, 320 * s } }, 8, "typing a line in a dark editor" },
+        { "hover",        { RECT{ 300 * s, 950 * s, 428 * s, 1030 * s } }, 9, "a hover highlight on the wallpaper (x 1.15)" },
+        { "scroll_doc",   { doc },                 4, "a light document scrolls one text line (37 % of the frame)" },
+        { "window_move",  { win },                 6, "a light window moves 24 px over dark content" },
+        { "video_window", { perf::VideoWindow(W, H) }, 5, "a video plays in a window (44 %)" },
+        { "full_video",   { RECT{ 0, 0, W, H } },  7, "fullscreen video" },
+    };
+}
+// The scenario's two content frames from the base frame (mut as above).
+void FaldPerfFrames(const FaldPerfScn& sc, Dom d, int W, int H, const std::vector<unsigned char>& base, std::vector<unsigned char>& A, std::vector<unsigned char>& B) {
+    const int s = std::max(1, H / 1080);
+    A = base; B = base;
+    auto fill = [&](std::vector<unsigned char>& f, const RECT& rc, float code) {
+        const float v[3] = { code, code, code };
+        for (int y = rc.top; y < rc.bottom; y++) for (int x = rc.left; x < rc.right; x++) FpPut(f, d, W, x, y, v, true);
+    };
+    switch (sc.mut) {
+    case 1: fill(B, sc.rects[0], 0.10f); break;
+    case 3: fill(B, sc.rects[0], 0.10f); [[fallthrough]];
+    case 2: {
+        const RECT& rc = sc.rects.back();
+        for (int f = 0; f < 2; f++)
+            for (int y = rc.top; y < rc.bottom; y++)
+                for (int x = rc.left; x < rc.right; x++) {
+                    const bool ink = perf::Hash01((uint32_t)(x / (2 * s)), (uint32_t)(y / (2 * s)), 71u + (uint32_t)f) < 0.3f;
+                    const float c = ink ? 0.92f : 0.16f;
+                    const float v[3] = { c, c, c };
+                    FpPut(f ? B : A, d, W, x, y, v, true);
+                }
+        break;
+    }
+    case 4: FpShift(B, base, W, sc.rects[0], 0, 18 * s); break;
+    case 5: FpShift(B, base, W, sc.rects[0], 61, 0); break;
+    case 6: {
+        const RECT& rc = sc.rects[0];
+        const RECT a = { rc.left, rc.top, rc.right - 24 * s, rc.bottom }, b = { rc.left + 24 * s, rc.top, rc.right, rc.bottom };
+        fill(A, a, 0.96f); fill(B, b, 0.96f);
+        break;
+    }
+    case 7: FpShift(B, base, W, sc.rects[0], W / 2, 0); break;
+    case 8: {
+        const RECT& rc = sc.rects[0];
+        for (int f = 0; f < 2; f++)
+            for (int y = rc.top; y < rc.bottom; y++)
+                for (int x = rc.left; x < rc.right; x++) {
+                    const bool ink = (y - rc.top) > 5 * s && (y - rc.top) < 15 * s && perf::Hash01((uint32_t)(x / s), (uint32_t)(y / (2 * s)), 81u + (uint32_t)f) < 0.4f;
+                    const float v[3] = { ink ? 0.80f : 0.11f, ink ? 0.85f : 0.11f, ink ? 0.60f : 0.11f };
+                    FpPut(f ? B : A, d, W, x, y, v, true);
+                }
+        break;
+    }
+    case 9: {
+        const RECT& rc = sc.rects[0];
+        for (int y = rc.top; y < rc.bottom; y++)
+            for (int x = rc.left; x < rc.right; x++) {
+                float c[3];
+                perf::DeskCode((float)x * 1080.0f / (float)H, (float)y * 1080.0f / (float)H, x, y, c);
+                for (float& k : c) k = std::min(1.0f, k * 1.15f);
+                FpPut(B, d, W, x, y, c, true);
+            }
+        break;
+    }
+    default: break;
+    }
+}
+
+// A copy of a panel file with the same lattice (zones, kernels) stretched over a W x H frame (docs/fald-fractional-pitch.md:
+// cell words 4 / 5 = 0, word 31 = the extent). Cost-faithful for a smaller frame, not a fit of any panel.
+bool FaldPerfStretchPanel(const std::string& src, const std::string& dst, int W, int H) {
+    std::vector<unsigned char> b;
+    if (!perf::LoadBytes(src, b) || b.size() < 128) return false;
+    uint32_t w[32];
+    std::memcpy(w, b.data(), sizeof(w));
+    if ((int)(w[1] * w[4]) != W || (int)(w[2] * w[5]) != H) {
+        w[4] = 0; w[5] = 0; w[31] = (uint32_t)W | ((uint32_t)H << 16);
+        std::memcpy(b.data(), w, sizeof(w));
+    }
+    return perf::SaveBytes(dst, b.data(), b.size());
+}
+
+}  // namespace
+
+TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
+    const std::string out = perf::Env("DLUT_PERF_FALD");
+    if (out.empty()) return;
+    CreateDirectoryA(out.c_str(), nullptr);
+    const std::string adapter = perf::Env("DLUT_PERF_ADAPTER");
+    const bool wantWarp = adapter == "WARP" || adapter == "warp";
+    perf::BePolite(wantWarp ? 0x0FF00000ull : 0x0FFFFFFFull);
+    const std::string hdrPanel = OwnerPanel();
+    std::string sdrPanel = perf::Env("DLUT_PERF_FALD_PANEL_SDR");
+    if (sdrPanel.empty()) sdrPanel = "H:\\Projects\\DesktopLUT\\DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_refit_sdr_fald_panel_blur0.7.bin";
+    if (GetFileAttributesA(sdrPanel.c_str()) == INVALID_FILE_ATTRIBUTES) sdrPanel.clear();
+    if (hdrPanel.empty()) { MESSAGE("no FALD panel file - nothing measured"); return; }
+    const int N = std::max(3, perf::EnvInt("DLUT_PERF_N", wantWarp ? 4 : 40));
+    const std::string only = perf::Env("DLUT_PERF_ONLY");
+    const std::vector<int> resList = ResList(perf::Env("DLUT_PERF_RES"), "2160");
+    const double heatMs = perf::Env("DLUT_PERF_HEAT").empty() ? (wantWarp ? 0.0 : 12.0) : atof(perf::Env("DLUT_PERF_HEAT").c_str());
+    const double hz = std::max(24.0, atof(perf::Env("DLUT_PERF_FALD_HZ").empty() ? "120" : perf::Env("DLUT_PERF_FALD_HZ").c_str()));
+    const int lutN = std::clamp(perf::EnvInt("DLUT_PERF_LUT", 65), 2, 128);
+    struct TimerRes { TimerRes() { timeBeginPeriod(1); } ~TimerRes() { timeEndPeriod(1); } } timerRes;
+
+    // the layer as it ships: the governor and the auto-tune decide (tests/test_main.cpp switches both off for the suite)
+    const int savedHold = g_faldCoreHoldOverride, savedTune = g_faldConvTuneOverride;
+    const std::string savedCache = g_faldConvTuneCachePath;
+    g_faldCoreHoldOverride = -1;
+    g_faldConvTuneOverride = -1;
+    g_faldConvTuneCachePath = out + "\\conv_tune_cache.txt";
+    struct Restore { int h, t; std::string c; ~Restore() { g_faldCoreHoldOverride = h; g_faldConvTuneOverride = t; g_faldConvTuneCachePath = c; } } restore{ savedHold, savedTune, savedCache };
+
+    std::ofstream presTsv(out + "\\fald_presents.tsv"), passTsv(out + "\\fald_passes.tsv");
+    presTsv << "adapter\thz\tcfg\tres\tscenario\tdirty_px\ttouched_zones\tn\tgpu_us_med\tgpu_us_p10\tgpu_us_p90\tgpu_us_min\tgpu_us_max\tcpu_us_med\tcpu_us_p90\tlayer_us_med\trest_us_med\tfull\tpartial\theld\tidle\tgovernor\tconv_so\ttune\twhat\n";
+    passTsv << "adapter\thz\tcfg\tres\tscenario\tpass\tissued\tran\tgpu_us_med_when_ran\tgpu_us_p90_when_ran\tgpu_us_mean_all\n";
+
+    for (int H : resList) {
+        const int W = WidthOf(H);
+        for (const FaldPerfCfg& c : FaldPerfConfigs()) {
+            bool any = false;
+            for (const FaldPerfScn& sc : FaldPerfScenarios(W, H)) if (perf::Selected(only, c.id + "/" + sc.id)) any = true;
+            if (!any) continue;
+            const bool hdr = c.dom == Dom::Hdr;
+            const std::string& srcPanel = hdr ? hdrPanel : sdrPanel;
+            if (srcPanel.empty()) { MESSAGE(c.id << ": no panel file for this mode - skipped"); continue; }
+            perf::Dev dev(adapter);
+            REQUIRE_MESSAGE(dev.ok, "no adapter matching '" << adapter << "'");
+            perf::Heater heater(dev);
+            // the panel file for this frame size, staged the way the host stages it
+            const std::string stretched = out + "\\panel_" + std::to_string(H) + (hdr ? "_hdr.bin" : "_sdr.bin");
+            REQUIRE(FaldPerfStretchPanel(srcPanel, stretched, W, H));
+            HookRig rig(dev, lutN, hdr ? stretched : std::string(), hdr ? std::string() : stretched);
+            REQUIRE_MESSAGE(rig.ok, "the hook's InitializeStuff failed");
+            if (!rig.panel) { MESSAGE(c.id << ": the panel file did not load - skipped"); continue; }
+            HookCfg hc{ c.id, c.dom, c.lut, c.tm, 1, c.tm, true, false };   // SoftClip, dynamic
+            rig.Apply(hc, W, H);
+            s_perfTonemap.targetPeakNits = 1700.0f;
+            s_perfTonemap.pqTargetPeak = LinearToPQ(1700.0f / 10000.0f);
+            LocalFaldParams& fp = g_localFald[0];
+            fp.flags = DwmHookFaldPackCore2(DwmHookFaldPack(1, 0, 0, c.star ? 1 : 0, 0), FALD_CORE_MODE_DEFAULT);
+            fp.hasTuning = true;
+            fp.tuning = {};
+            fp.tuning.starEven = 0.8f; fp.tuning.starTargetGain = 1.0f; fp.tuning.starKeepNits = 100.0f; fp.tuning.starStrength = 1.0f;
+            fp.tuning.starAreaLo = 40.0f; fp.tuning.starAreaHi = 160.0f; fp.tuning.starNbLo = 0.15f; fp.tuning.starNbHi = 0.30f;
+            fp.tuning.starReach = 2u; fp.tuning.starEvenReach = 8u;
+            fp.tuning.tempMode = c.lag; fp.tuning.tempClockClosure = 0.72f; fp.tuning.tempClockParity = -1;
+            fp.tuning.refreshMs = (float)(1000.0 / hz);
+
+            const DXGI_FORMAT fmt = perf::DomFormat(c.dom);
+            ID3D11Texture2D* back = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+            ID3D11Texture2D* content[2] = { perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE), perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE) };
+            REQUIRE((back && content[0] && content[1]));
+            const std::vector<unsigned char> base = perf::MakeFrame(Kind::Mix, c.dom, W, H);
+            std::vector<RECT> full = { RECT{ 0, 0, W, H } };
+            auto compose = [&](ID3D11Texture2D* src, const std::vector<RECT>& rects) {
+                for (const RECT& r : rects) {
+                    D3D11_BOX box = { (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
+                    dev.ic->CopySubresourceRegion(back, 0, (UINT)r.left, (UINT)r.top, 0, src, 0, &box);
+                }
+            };
+            auto layer = [&]() { return FaldAcquire(0, 0, hdr, (unsigned)W, (unsigned)H, fmt); };
+            FaldPassProbe probe(dev.dev, dev.ic, true);
+
+            // the conv auto-tune first (it times one extra dispatch per FULL run): full presents until it has decided
+            dev.ic->UpdateSubresource(content[0], 0, nullptr, base.data(), (UINT)W * 8u, 0);
+            {
+                std::vector<unsigned char> shifted = base;
+                FpShift(shifted, base, W, full[0], W / 2, 0);
+                dev.ic->UpdateSubresource(content[1], 0, nullptr, shifted.data(), (UINT)W * 8u, 0);
+            }
+            unsigned int tuneState = 0, convSo = 0;
+            for (int i = 0; i < 120; i++) {
+                compose(content[i & 1], full);
+                rig.Present(back, full);
+                dev.ic->Flush();
+                Sleep(3);
+                if (FaldMonitor* m = layer()) { tuneState = FaldTestConvTuneState(m); convSo = FaldTestConvSo(m); FaldReturn(m); }
+                if (i >= 8 && tuneState != 2u) break;
+            }
+
+            for (const FaldPerfScn& sc : FaldPerfScenarios(W, H)) {
+                if (!perf::Selected(only, c.id + "/" + sc.id)) continue;
+                std::vector<unsigned char> A, B;
+                FaldPerfFrames(sc, c.dom, W, H, base, A, B);
+                dev.ic->UpdateSubresource(content[0], 0, nullptr, A.data(), (UINT)W * 8u, 0);
+                dev.ic->UpdateSubresource(content[1], 0, nullptr, B.data(), (UINT)W * 8u, 0);
+                std::vector<RECT> rects = sc.rects;
+                // two full presents of A (the clean copy, the peak source, the fields), then the scenario's own warm-up
+                for (int i = 0; i < 2; i++) { compose(content[0], full); rig.Present(back, full); dev.ic->Flush(); Sleep(3); }
+                for (int i = 0; i < 8; i++) { compose(content[(i + 1) & 1], rects); rig.Present(back, rects); dev.ic->Flush(); Sleep(3); }
+                std::vector<double> g, cu, layerUs, restUs, passUs[FALD_HP_COUNT];
+                int issued[FALD_HP_COUNT] = {}, ran[FALD_HP_COUNT] = {};
+                double passSum[FALD_HP_COUNT] = {};
+                int kinds[4] = {};
+                unsigned int gov = 0;
+                bool ok = true;
+                for (int i = 0; i < N; i++) {
+                    compose(content[(i + 1) & 1], rects);
+                    dev.ic->Flush();
+                    if (heatMs > 0.0 && !dev.warp) heater.Heat(dev, heatMs);
+                    double gu = -1, cpu = 0, wall = 0;
+                    dev.Time([&] { probe.BeginPresent(); ok = rig.Present(back, rects) && ok; probe.Close(); }, gu, cpu, wall);
+                    unsigned int kind = 0;
+                    ID3D11Buffer* args = nullptr;
+                    if (FaldMonitor* m = layer()) { kind = FaldTestLastRunKind(m); args = FaldTestArgs(m); gov = FaldTestCoreGovState(m); FaldReturn(m); }
+                    probe.Resolve(args, kind == 1u);
+                    kinds[kind & 3u]++;
+                    double sum = 0.0;
+                    for (unsigned int p = 0; p < FALD_HP_COUNT; p++) {
+                        if (probe.issued[p]) issued[p]++;
+                        if (probe.ran[p]) { ran[p]++; passUs[p].push_back(probe.us[p]); }
+                        passSum[p] += probe.us[p];
+                        sum += probe.us[p];
+                    }
+                    if (gu > 45000.0) { MESSAGE(c.id << "/" << sc.id << ": a present over 45 ms - stopping this scenario"); break; }
+                    g.push_back(gu); cu.push_back(cpu); layerUs.push_back(sum); restUs.push_back(gu > 0 ? gu - sum : -1.0);
+                    if (!dev.warp) Sleep(2);
+                }
+                const perf::Stats sg = perf::MakeStats(g), sc2 = perf::MakeStats(cu), sl = perf::MakeStats(layerUs), sr = perf::MakeStats(restUs);
+                size_t touched = 0;
+                {
+                    std::vector<FaldChangeRect> cr;
+                    for (const RECT& r : rects) cr.push_back({ (int)r.left, (int)r.top, (int)r.right, (int)r.bottom });
+                    std::vector<uint32_t> z;
+                    FaldTouchedZones(cr.data(), (int)cr.size(), 0, 0, (unsigned)W, (unsigned)H, 48, 48, 48 * 48, z);
+                    touched = z.size();
+                }
+                static const char* const govName[4] = { "off", "running", "capped", "forced" };
+                presTsv << dev.name << "\t" << hz << "\t" << c.id << "\t" << H << "\t" << sc.id << "\t" << (long long)DirtyPx(rects) << "\t" << touched << "\t" << sg.n << "\t"
+                        << sg.med << "\t" << sg.p10 << "\t" << sg.p90 << "\t" << sg.mn << "\t" << sg.mx << "\t" << sc2.med << "\t" << sc2.p90 << "\t" << sl.med << "\t" << sr.med << "\t"
+                        << kinds[0] << "\t" << kinds[1] << "\t" << kinds[2] << "\t" << kinds[3] << "\t" << govName[gov & 3u] << "\t" << convSo << "\t" << tuneState << "\t"
+                        << sc.what << (ok ? "" : " PASS_DID_NOT_RUN") << "\n";
+                presTsv.flush();
+                for (unsigned int p = 0; p < FALD_HP_COUNT; p++) {
+                    if (!issued[p]) continue;
+                    const perf::Stats sp = perf::MakeStats(passUs[p]);
+                    passTsv << dev.name << "\t" << hz << "\t" << c.id << "\t" << H << "\t" << sc.id << "\t" << FaldHookPassName(p) << "\t" << issued[p] << "\t" << ran[p] << "\t"
+                            << sp.med << "\t" << sp.p90 << "\t" << passSum[p] / (double)std::max(1, sg.n) << "\n";
+                }
+                passTsv.flush();
+            }
+            Rel(content[0]); Rel(content[1]); Rel(back);
+            dev.ic->ClearState(); dev.ic->Flush();
+        }
+    }
+}
+
+// =================================================================================================================
+// 5. What the FALD layer's start costs (DLUT_PERF_FALD_INIT=<dir>)
+// =================================================================================================================
+// Per shader of the layer (shared/fald_shader_set.h: the list both hosts create): D3DCompile's time on this thread, the
+// blob's size, and the time Create*Shader takes from the finished blob on the chosen adapter — the two halves of what
+// the hook used to do inside DWM's first hooked present for every user. Then the hook's first FaldAcquire for a monitor
+// (BuildMonitor: the tables, ~60 textures / buffers / views, the flat-response convolution): its CPU time and the GPU's.
+// -> <dir>/fald_init.tsv
+TEST_CASE("perf: what the FALD layer's start costs (DLUT_PERF_FALD_INIT)") {
+    const std::string out = perf::Env("DLUT_PERF_FALD_INIT");
+    if (out.empty()) return;
+    CreateDirectoryA(out.c_str(), nullptr);
+    perf::BePolite();
+    perf::Dev dev(perf::Env("DLUT_PERF_ADAPTER"));
+    REQUIRE(dev.ok);
+    std::ofstream tsv(out + "\\fald_init.tsv");
+    tsv << "adapter\titem\ttarget\tsource_bytes\tblob_bytes\tcompile_ms\tcreate_us\n";
+    double compileMs = 0.0, createUs = 0.0;
+    size_t blobBytes = 0;
+    for (unsigned int id = 0; id < FALD_SH_COUNT; id++) {
+        const std::string src = FaldShaderSource(id);
+        ID3DBlob* b = nullptr; ID3DBlob* e = nullptr;
+        double t0 = perf::QpcUs();
+        const HRESULT hr = D3DCompile(src.c_str(), src.size(), FaldShaderName(id), nullptr, nullptr, "main", FaldShaderTarget(id), 0, 0, &b, &e);
+        const double cMs = (perf::QpcUs() - t0) / 1000.0;
+        if (e) e->Release();
+        REQUIRE_MESSAGE(SUCCEEDED(hr), FaldShaderName(id) << " did not compile");
+        double best = 1e30;
+        for (int rep = 0; rep < 3; rep++) {                       // the first creation of a kind also loads driver state: take the best
+            IUnknown* sh = nullptr;
+            t0 = perf::QpcUs();
+            if (id == FALD_SH_PIXEL) dev.dev->CreatePixelShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, (ID3D11PixelShader**)&sh);
+            else if (id == FALD_SH_FULLSCREEN_VS) dev.dev->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, (ID3D11VertexShader**)&sh);
+            else dev.dev->CreateComputeShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, (ID3D11ComputeShader**)&sh);
+            const double us = perf::QpcUs() - t0;
+            if (rep == 0) tsv << dev.name << "\t" << FaldShaderName(id) << "\t" << FaldShaderTarget(id) << "\t" << src.size() << "\t" << b->GetBufferSize() << "\t" << cMs << "\t" << us << "\n";
+            if (rep == 0) createUs += us;
+            best = std::min(best, us);
+            if (sh) sh->Release();
+        }
+        compileMs += cMs; blobBytes += b->GetBufferSize();
+        b->Release();
+    }
+    tsv << dev.name << "\tALL_SHADERS\t-\t0\t" << blobBytes << "\t" << compileMs << "\t" << createUs << "\n";
+    MESSAGE(FALD_SH_COUNT << " shaders: D3DCompile " << compileMs << " ms, blobs " << blobBytes << " bytes, Create*Shader from the blobs " << createUs / 1000.0 << " ms (first creation each)");
+
+    // the hook's first FaldAcquire of a monitor (the build), then a second (nothing to do)
+    const std::string panel = OwnerPanel();
+    if (!panel.empty()) {
+        HookRig rig(dev, 17);
+        REQUIRE(rig.ok);
+        if (rig.panel) {
+            double gu = -1, cu = 0, wu = 0;
+            dev.Time([&] { FaldMonitor* m = FaldAcquire(0, 0, true, 3840u, 2160u, DXGI_FORMAT_R16G16B16A16_FLOAT); if (m) FaldReturn(m); }, gu, cu, wu);
+            tsv << dev.name << "\thook_first_FaldAcquire_build_4k\t-\t0\t0\t" << cu / 1000.0 << "\t" << gu << "\n";
+            MESSAGE("the hook's first FaldAcquire (BuildMonitor, 4K): CPU " << cu / 1000.0 << " ms in the present, GPU " << gu / 1000.0 << " ms, done after " << wu / 1000.0 << " ms");
+            dev.Time([&] { FaldMonitor* m = FaldAcquire(0, 0, true, 3840u, 2160u, DXGI_FORMAT_R16G16B16A16_FLOAT); if (m) FaldReturn(m); }, gu, cu, wu);
+            tsv << dev.name << "\thook_later_FaldAcquire\t-\t0\t0\t" << cu / 1000.0 << "\t" << gu << "\n";
+        }
+        tsv << dev.name << "\thook_InitializeStuff\t-\t0\t0\t" << rig.initUs / 1000.0 << "\t0\n";
     }
 }

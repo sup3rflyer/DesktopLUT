@@ -91,6 +91,23 @@ static const UINT FALD_SRV_SLOTS = HOOK_FALD_SRV_SLOTS;
 static const UINT FALD_UAV_SLOTS = HOOK_FALD_UAV_SLOTS;
 static const UINT FALD_CORE_SRV_SLOTS = 13;   // t40..t52: the always-on core's (shared/fald_core2.h; nullSrv has FALD_SRV_SLOTS >= 13 entries)
 
+// The per-pass hook (hook_fald.h FaldHookPassHook; the test exe only): PassScope frames every GPU command the layer issues.
+// In the DLL it is an empty object the optimiser removes.
+#ifdef DLUT_HOOK_TESTING
+FaldHookPassHook* g_faldHookPassHook = nullptr;
+struct PassScope {
+    unsigned int pass;
+    explicit PassScope(unsigned int p, int slot = -1) : pass(p) { if (g_faldHookPassHook) g_faldHookPassHook->Before(g_ctx, pass, slot); }
+    ~PassScope() { if (g_faldHookPassHook) g_faldHookPassHook->After(g_ctx, pass); }
+};
+#else
+struct PassScope { explicit PassScope(unsigned int, int = -1) {} };
+enum : unsigned int { FALD_HP_CLEAN_COPY, FALD_HP_PREDECIDE, FALD_HP_STAR_S0, FALD_HP_STAR_S0_FULL, FALD_HP_DECIDE_STAR, FALD_HP_STAR_S1,
+                      FALD_HP_STAR_S2, FALD_HP_CLOCK, FALD_HP_STAT0, FALD_HP_STAT0_FULL, FALD_HP_DECIDE0, FALD_HP_CORE_ZONE, FALD_HP_CONV0,
+                      FALD_HP_GAIN0, FALD_HP_CORE_CAP0, FALD_HP_DECIDE0B, FALD_HP_STAT1, FALD_HP_STAT1_FULL, FALD_HP_DECIDE1, FALD_HP_CONV1,
+                      FALD_HP_GAIN1, FALD_HP_CORE_CAP1, FALD_HP_DECIDE1B, FALD_HP_COMMIT, FALD_HP_PIXEL_FULL, FALD_HP_PIXEL_RECTS, FALD_HP_TUNE };
+#endif
+
 static void LogF(const char* fmt, ...) {
     char msg[512];
     va_list ap;
@@ -628,6 +645,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     bool stateComplete = false;            // the previous run left every texture of a complete run (and the intermediate whole)
     bool planPartial = false;              // this present's plan (FaldPlanPartial), consumed by FaldRun
     bool lastPartial = false;              // the previous run took the partial path (the dump)
+    uint8_t lastRunKind = 0;               // the last FaldRun: 0 full, 1 partial, 2 held, 3 idle (the cost log, the tests)
     unsigned long long lastSettingsKey = 0, lastLutPassKey = 0, planSettingsKey = 0;
     uint32_t lastTrueMap = 0xFFFFFFFFu, lastEstMap = 0xFFFFFFFFu;   // the maps (FaldDriveMap) the previous run's kernels
                                            // read: a run whose routing differs (a panel-clock seed, the clock run after it) is full
@@ -705,7 +723,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 //     tables and the aliases of the one in use, convVariant, the conv auto-tune's scratch textures / convTune /
 //     convTuneKey / convTuneStored — a swap re-keys the tuner: the cache if it knows the lattice, else tuning again —,
 //     gainFused, the boost counters and the change-driven path's maps / list / flags / arguments and its
-//     runMode, stateComplete, planPartial, lastPartial, lastSettingsKey, lastLutPassKey, planSettingsKey, lastTrueMap,
+//     runMode, stateComplete, planPartial, lastPartial, lastRunKind, lastSettingsKey, lastLutPassKey, planSettingsKey, lastTrueMap,
 //     lastEstMap, touched, touchedOk, rects among the panel tables), zoneSlices, cb, starOn,
 //     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, core2 / core2On /
 //     core2Flags (the core's textures, released with the old panel part by ReleaseMonitor, rebuilt by ResolveFeatures),
@@ -1525,6 +1543,7 @@ bool FaldUpdateClean(FaldMonitor* m, ID3D11Texture2D* backBuffer, const RECT* re
     const LONG T = (LONG)HOOK_FALD_COVER_TILE;
     m->rects.clear();
     m->planPartial = false;
+    PassScope cleanScope(FALD_HP_CLEAN_COPY);
     for (int i = 0; i < numRects; i++) {
         const LONG l = rects[i].left > 0 ? rects[i].left : 0;
         const LONG t = rects[i].top > 0 ? rects[i].top : 0;
@@ -1773,6 +1792,8 @@ static void RunStat(FaldMonitor* m, uint32_t roundIdx, StatDispatch d = kStatFul
     if (roundIdx == 0 && m->core2On)                 // the always-on core (fald_core2.h), round 0: the zones' P, M, lnG (u4) and,
         FaldCore2StatViews(m->core2, &uavs[4], &uavs[6], &uavs[7]);   // round 3, the node peaks (u6; slice partials u7) — compared on the partial path
     g_ctx->CSSetUnorderedAccessViews(0, 8, uavs, nullptr);
+    PassScope scope(roundIdx ? (d.partial ? FALD_HP_STAT1 : FALD_HP_STAT1_FULL) : ((d.partial || !d.indirect) ? FALD_HP_STAT0 : FALD_HP_STAT0_FULL),
+                    d.indirect ? (int)d.slot : -1);
     if (d.indirect) g_ctx->DispatchIndirect(m->argsBuf, d.slot);
     else if (d.partial) g_ctx->Dispatch((UINT)m->touched.size(), 1, m->zoneSlices);
     else g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
@@ -1797,6 +1818,7 @@ static void RunDecide(FaldMonitor* m, uint32_t which, bool partial) {
     BindCommon(m, true);
     ID3D11UnorderedAccessView* uavs[7] = { nullptr, nullptr, nullptr, m->boostCountUAV, m->boostUAV[which & 1u], m->changeFlagsUAV, m->argsUAV };
     g_ctx->CSSetUnorderedAccessViews(0, 7, uavs, nullptr);
+    PassScope scope(which == 0 ? FALD_HP_DECIDE0 : which == 1 ? FALD_HP_DECIDE1 : which == 2 ? FALD_HP_DECIDE_STAR : FALD_HP_PREDECIDE);
     g_ctx->Dispatch(1, 1, 1);
     UnbindCompute();
 }
@@ -1820,8 +1842,11 @@ static void RunConv(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive, ID3D11S
                                            roundIdx == 0 ? m->fields0UAV : m->fieldsUAV };   // u2: the two packed with their flat response
     g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
     // cells x sub-offset groups (fald_shader.h: FALD_CONV_SO sub-offsets per thread); indirect: the decide pass's arguments
-    if (indirect) g_ctx->DispatchIndirect(m->argsBuf, roundIdx ? FALD_ARGS_CONV1 : FALD_ARGS_CONV0);
-    else g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(m->convVariant)), 1);
+    {
+        PassScope scope(roundIdx == 0 ? FALD_HP_CONV0 : FALD_HP_CONV1, indirect ? (int)(roundIdx ? FALD_ARGS_CONV1 : FALD_ARGS_CONV0) : -1);
+        if (indirect) g_ctx->DispatchIndirect(m->argsBuf, roundIdx ? FALD_ARGS_CONV1 : FALD_ARGS_CONV0);
+        else g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(m->convVariant)), 1);
+    }
     UnbindCompute();
 }
 
@@ -1892,7 +1917,7 @@ static void TuneConvDispatch(FaldMonitor* m, ID3D11ShaderResourceView* trueDrive
     ID3D11UnorderedAccessView* uavs[3] = { m->tuneTrueUAV, m->tuneEstUAV, m->tuneFieldsUAV };
     g_ctx->CSSetUnorderedAccessViews(0, 3, uavs, nullptr);
     for (int k = 1; k <= 6; k++) FaldCoreTimingStamp(&g_tuneTiming, g_ctx, slot, k);
-    g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(v)), 1);
+    { PassScope scope(FALD_HP_TUNE); g_ctx->Dispatch(FaldConvGroupsX(p.cols, p.rows), FaldConvGroups(p.sub, FaldConvSoOf(v)), 1); }
     FaldCoreTimingEnd(&g_tuneTiming, g_ctx, slot);
     UnbindCompute();
     m->runMode = savedRunMode;
@@ -1928,6 +1953,7 @@ static void TuneCollect() {
 // Pass 2b/2c: (gain, the knee's ceiling B_est) on the fine grid, then a separable Gaussian low-pass of both (A -> B -> A; final in gainB).
 static void RunGain(FaldMonitor* m, uint32_t roundIdx, bool indirect = false) {
     const FaldPanelParams& p = m->params;
+    PassScope scope(roundIdx ? FALD_HP_GAIN1 : FALD_HP_GAIN0, indirect ? (int)(roundIdx ? FALD_ARGS_GAIN1 : FALD_ARGS_GAIN0) : -1);
     const UINT gx = (p.cols * p.sub + 15) / 16, gy = (p.rows * p.sub + 15) / 16;
     ID3D11ShaderResourceView* fields[2] = { roundIdx ? m->bTrueSRV : m->bTrue0SRV, roundIdx ? m->bEstSRV : m->bEst0SRV };   // the round's own
     ID3D11ShaderResourceView* packed = roundIdx ? m->fieldsSRV : m->fields0SRV;                                             // t39: the same packed
@@ -1985,7 +2011,7 @@ static void RunPanelClock(FaldMonitor* m, bool partial) {
     // (2026-10-22: a branch wrote a round-0 slot while round 1's convolution read round 1's — a map nothing writes in mode 3.)
     ID3D11UnorderedAccessView* uavs[6] = { m->driveFiltUAV, m->clkEstUAV, m->clkStateUAV[0], m->clkStateUAV[1], nullptr, m->changeFlagsUAV };
     g_ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
-    g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    { PassScope scope(FALD_HP_CLOCK); g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1); }
     UnbindCompute();   // clears all FALD_UAV_SLOTS
 }
 
@@ -2010,6 +2036,7 @@ static void RunStarS0(FaldMonitor* m, bool partial, bool indirectFull = false) {
     g_ctx->CSSetShader(g_starStatCS, nullptr, 0);
     g_ctx->CSSetShaderResources(0, 2, in2);
     g_ctx->CSSetUnorderedAccessViews(0, 6, out0, nullptr);
+    PassScope scope(indirectFull ? FALD_HP_STAR_S0_FULL : FALD_HP_STAR_S0, indirectFull ? (int)FALD_ARGS_STAR_S0_FULL : -1);
     if (indirectFull) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S0_FULL);
     else if (partial) g_ctx->Dispatch((UINT)m->touched.size(), 1, m->zoneSlices);
     else g_ctx->Dispatch(p.cols, p.rows, m->zoneSlices);
@@ -2034,8 +2061,11 @@ static void RunStarPlan(FaldMonitor* m, bool indirect) {
     g_ctx->CSSetShaderResources(16, 1, &m->starStatSRV);
     g_ctx->CSSetShaderResources(19, 1, &m->starBgSRV);
     g_ctx->CSSetUnorderedAccessViews(0, 2, out1, nullptr);
-    if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S1);
-    else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    {
+        PassScope scope(FALD_HP_STAR_S1, indirect ? (int)FALD_ARGS_STAR_S1 : -1);
+        if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S1);
+        else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    }
     UnbindCompute();
     // S2: (w0_field, ln target, 0, ln peak)
     ID3D11ShaderResourceView* in3[2] = { m->starStatSRV, m->starWSRV };
@@ -2043,8 +2073,11 @@ static void RunStarPlan(FaldMonitor* m, bool indirect) {
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetShaderResources(16, 2, in3);
     g_ctx->CSSetUnorderedAccessViews(0, 1, &m->starPlanUAV, nullptr);
-    if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S2);
-    else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    {
+        PassScope scope(FALD_HP_STAR_S2, indirect ? (int)FALD_ARGS_STAR_S2 : -1);
+        if (indirect) g_ctx->DispatchIndirect(m->argsBuf, FALD_ARGS_STAR_S2);
+        else g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    }
     UnbindCompute();
 }
 
@@ -2336,12 +2369,13 @@ static void PixelPass(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, ID3D11Shad
     g_ctx->PSSetShaderResources(4, 1, &m->driveSRV);
     g_ctx->PSSetShaderResources(10, 1, &filt);
     g_ctx->PSSetShaderResources(13, 1, &m->activeSRV[1]);   // debug view 8 (null without a boost LUT)
-    if (!partial) g_ctx->Draw(3, 0);
+    if (!partial) { PassScope scope(FALD_HP_PIXEL_FULL); g_ctx->Draw(3, 0); }
     else {
         // the whole frame only if anything moved (the decide pass's draw arguments), and always the rects DWM re-composed
         // (the back buffer holds the previous output everywhere else); scissored draws of the same triangle
-        g_ctx->DrawInstancedIndirect(m->argsBuf, FALD_ARGS_PIXEL);
+        { PassScope scope(FALD_HP_PIXEL_FULL, (int)FALD_ARGS_PIXEL); g_ctx->DrawInstancedIndirect(m->argsBuf, FALD_ARGS_PIXEL); }
         if (g_exemptRS && !m->rects.empty()) {
+            PassScope scope(FALD_HP_PIXEL_RECTS);
             ID3D11RasterizerState* prevRS = nullptr;
             g_ctx->RSGetState(&prevRS);
             D3D11_RECT prevScissor[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
@@ -2437,7 +2471,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
         const FaldDriveMap filtMap = (m->tempSettings.mode == FALD_TEMPORAL_PANEL && m->clkEstTex) ? FALD_MAP_CLOCK_EST : FALD_MAP_DRIVE;
         PixelPass(m, dstRTV, mapSrv(filtMap, 1), false);
         m->framesRun++; m->heldRuns++;
-        m->lastPartial = false;
+        m->lastPartial = false; m->lastRunKind = 2;
         m->stateComplete = false;             // the standing textures are not this frame's: the next present that is not held plans full
         FaldUnbindAll();
         WriteGovernorStatus(m);
@@ -2487,7 +2521,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     const bool frameMayChange = partial && frameChanged != nullptr;
     if (frameMayChange) {
         const D3D11_BOX box = { frameChangedOffset, 0, 0, frameChangedOffset + 4u, 1, 1 };
-        g_ctx->CopySubresourceRegion(m->changeFlagsBuf, 0, FALD_CHANGE_FLAG_FRAME_BYTES, 0, 0, frameChanged, 0, &box);
+        { PassScope scope(FALD_HP_PREDECIDE); g_ctx->CopySubresourceRegion(m->changeFlagsBuf, 0, FALD_CHANGE_FLAG_FRAME_BYTES, 0, 0, frameChanged, 0, &box); }
         RunDecide(m, 3, true);
     }
     if (m->starOn) {
@@ -2508,11 +2542,16 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     else if (!m->starOn && !frameMayChange) RunStat(m, 0, kStatPartial);   // (else the pre-decide's / decide(2)'s arguments)
     else { RunStat(m, 0, stat0Full); RunStat(m, 0, stat0Part); }
     RunDecide(m, 0, partial);                 // round 0's boost (boostTex[0]); partial: what follows from the flags
-    if (m->core2On) FaldCore2RunZone(m->core2, g_ctx, m->cb, partial ? m->argsBuf : nullptr, FALD_ARGS_CORE_LATTICE);   // alpha, the gate
+    if (m->core2On) {                         // alpha, the gate
+        PassScope scope(FALD_HP_CORE_ZONE, partial ? (int)FALD_ARGS_CORE_LATTICE : -1);
+        FaldCore2RunZone(m->core2, g_ctx, m->cb, partial ? m->argsBuf : nullptr, FALD_ARGS_CORE_LATTICE);
+    }
     RunConv(m, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), m->boostSRV[0], 0, partial);
     RunGain(m, 0, partial);
-    if (m->core2On)                           // round 0's cap from round 0's gain (the round-1 statistic reads it)
+    if (m->core2On) {                         // round 0's cap from round 0's gain (the round-1 statistic reads it)
+        PassScope scope(FALD_HP_CORE_CAP0, partial ? (int)FALD_ARGS_CORE_FINE0 : -1);
         FaldCore2RunCap(m->core2, g_ctx, m->cb, m->gainFused ? m->gain0SRV : m->gainBSRV, 0, partial ? m->argsBuf : nullptr, FALD_ARGS_CORE_FINE0);
+    }
     GpuTimingStamp(ts, 3);
     GpuTimingStamp(ts, 4);
     if (!partial) RunStat(m, 1);
@@ -2520,12 +2559,14 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     RunDecide(m, 1, partial);                 // round 1's boost (boostTex[1]); partial: the convolution, the gain, the pixel pass
     RunConv(m, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), m->boostSRV[1], 1, partial);
     RunGain(m, 1, partial);
-    if (m->core2On)                           // round 1's cap from round 1's gain (the pixel pass reads it)
+    if (m->core2On) {                         // round 1's cap from round 1's gain (the pixel pass reads it)
+        PassScope scope(FALD_HP_CORE_CAP1, partial ? (int)FALD_ARGS_CORE_FINE1 : -1);
         FaldCore2RunCap(m->core2, g_ctx, m->cb, m->gainBSRV, 1, partial ? m->argsBuf : nullptr, FALD_ARGS_CORE_FINE1);
+    }
     GpuTimingStamp(ts, 5);
     GpuTimingStamp(ts, 6);
     m->framesRun++;
-    m->lastPartial = partial;
+    m->lastPartial = partial; m->lastRunKind = partial ? 1 : 0;
 
     if (!dumpDir.empty()) {                   // before the commit: the state files are the maps the passes read
         DumpFields(m, dumpDir);
@@ -2534,6 +2575,7 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
 
     // LED lag commit (the copies; FaldTemporalEndRun below does the settle accounting)
     if (trun.panel) {                         // round 1's instantaneous map is the next frame's target; a seeding run
+        PassScope scope(FALD_HP_COMMIT);
         if (trun.clock.seedStates) {          // takes the panel as settled on this frame (both clocks)
             g_ctx->CopyResource(m->clkStateTex[0], m->driveTex);
             g_ctx->CopyResource(m->clkStateTex[1], m->driveTex);
@@ -2630,4 +2672,16 @@ ID3D11Buffer* FaldTestCB(FaldMonitor* m) { return m ? m->cb : nullptr; }
 unsigned long long FaldTestClockElapsed(const FaldMonitor* m) { return m ? m->clkElapsed : 0ull; }
 bool FaldTestClockSeeded(const FaldMonitor* m) { return m && m->clkSeeded; }
 bool FaldTestLastPartial(const FaldMonitor* m) { return m && m->lastPartial; }
+ID3D11Buffer* FaldTestArgs(FaldMonitor* m) { return m ? m->argsBuf : nullptr; }
+unsigned int FaldTestLastRunKind(const FaldMonitor* m) { return m ? m->lastRunKind : 0u; }
+unsigned int FaldTestConvTuneState(const FaldMonitor* m) { return m ? (unsigned int)m->convTune.GetState() : 0u; }
+unsigned int FaldTestConvSo(const FaldMonitor* m) { return m ? FaldConvSoOf(m->convVariant) : 0u; }
+const char* FaldHookPassName(unsigned int pass) {
+    static const char* const names[FALD_HP_COUNT] = {
+        "clean_copy", "predecide", "star_s0", "star_s0_full", "decide_star", "star_s1", "star_s2", "clock",
+        "stat0", "stat0_full", "decide0", "core_zone", "conv0", "gain0", "core_cap0", "decide0b",
+        "stat1", "stat1_full", "decide1", "conv1", "gain1", "core_cap1", "decide1b",
+        "commit", "pixel_full", "pixel_rects", "tune" };
+    return pass < FALD_HP_COUNT ? names[pass] : "?";
+}
 #endif

@@ -85,6 +85,10 @@ inline bool FaldCore2CapFits(unsigned int cols, unsigned int rows, unsigned int 
 
 // Process-global shaders (Z1, Z2, C1, CX, CY), compiled from `common` (g_faldCommonSource) + the core source.
 bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err);
+// The five kernels as FaldCore2InitShaders compiles them (cs_5_0, entry "main"): kernel k's whole source text and name.
+constexpr unsigned int FALD_CORE2_SHADERS = 5u;
+std::string FaldCore2ShaderSource(unsigned int k, const char* common);
+const char* FaldCore2ShaderName(unsigned int k);
 void FaldCore2ReleaseShaders();
 bool FaldCore2ShadersReady();
 

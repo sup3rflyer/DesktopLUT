@@ -162,9 +162,13 @@ ID3D11ComputeShader* g_cs[K_COUNT] = {};
 template <typename T> void SafeRel(T*& p) { if (p) { p->Release(); p = nullptr; } }
 }
 
-bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err) {
-    if (FaldCore2ShadersReady()) return true;
-    if (!dev || !common) { if (err) *err = "no device"; return false; }
+const char* FaldCore2ShaderName(unsigned int k) {
+    static const char* const name[K_COUNT] = { "FaldCore2Z1", "FaldCore2Z2", "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
+    return k < (unsigned int)K_COUNT ? name[k] : "?";
+}
+
+std::string FaldCore2ShaderSource(unsigned int k, const char* common) {
+    if (k >= (unsigned int)K_COUNT || !common) return std::string();
     const std::string fx = std::string(kFineHead);
     char a5[160];                                          // alpha's level law (ln G0, ln G1) as float32
     std::snprintf(a5, sizeof(a5), "#define CORE_A5_LN0 %.9ef\n#define CORE_A5_LN1 %.9ef\n",
@@ -174,10 +178,16 @@ bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* er
                   (double)(FALD_CORE2_CAP_S * 0.01f), FALD_CORE2_SCAN_MAX);
     const std::string src[K_COUNT] = { std::string(a5) + kZ1, kZ2, fx + kC1, std::string(cs) + fx + kCS,
                                        std::string(cs) + "#define CORE_CAP_Y 1\n" + fx + kCS };
-    const char* name[K_COUNT] = { "FaldCore2Z1", "FaldCore2Z2", "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
-    const std::string head = std::string(common);
+    return std::string(common) + src[k];
+}
+
+bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err) {
+    if (FaldCore2ShadersReady()) return true;
+    if (!dev || !common) { if (err) *err = "no device"; return false; }
+    static_assert(K_COUNT == (int)FALD_CORE2_SHADERS, "FALD_CORE2_SHADERS");
+    const char* name[K_COUNT] = { FaldCore2ShaderName(0), FaldCore2ShaderName(1), FaldCore2ShaderName(2), FaldCore2ShaderName(3), FaldCore2ShaderName(4) };
     for (int k = 0; k < K_COUNT; k++) {
-        const std::string s = head + src[k];
+        const std::string s = FaldCore2ShaderSource((unsigned int)k, common);
         ID3DBlob* b = nullptr; ID3DBlob* e = nullptr;
         HRESULT hr = D3DCompile(s.c_str(), s.size(), name[k], nullptr, nullptr, "main", "cs_5_0", 0, 0, &b, &e);
         if (FAILED(hr)) {

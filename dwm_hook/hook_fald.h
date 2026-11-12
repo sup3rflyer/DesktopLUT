@@ -179,4 +179,35 @@ unsigned long long FaldTestHeldRuns(const FaldMonitor* m);
 unsigned long long FaldTestClockElapsed(const FaldMonitor* m);
 bool FaldTestClockSeeded(const FaldMonitor* m);
 bool FaldTestLastPartial(const FaldMonitor* m);
+// The layer's GPU commands of a present, by pass (tests/test_perf.cpp's per-pass timing and the "did not run" tests): a
+// hook called before and after each pass the host ISSUES. slot < 0 = issued directly (it runs); slot >= 0 = an indirect
+// dispatch / draw whose arguments the decide pass wrote at that byte offset of the arguments buffer (FaldTestArgs:
+// shared/fald_change.h FALD_ARGS_*) — it ran iff those arguments are non-zero (a test reads the buffer back after the
+// present; each slot is written at most once per decide stage and read by the passes after it).
+enum FaldHookPass : unsigned int {
+    FALD_HP_CLEAN_COPY = 0,   // FaldUpdateClean: this present's rects, back buffer -> the clean copy
+    FALD_HP_PREDECIDE,        // the "frame changed everywhere" word's copy + the decide before any sweep
+    FALD_HP_STAR_S0, FALD_HP_STAR_S0_FULL, FALD_HP_DECIDE_STAR, FALD_HP_STAR_S1, FALD_HP_STAR_S2,
+    FALD_HP_CLOCK,
+    FALD_HP_STAT0, FALD_HP_STAT0_FULL, FALD_HP_DECIDE0, FALD_HP_CORE_ZONE, FALD_HP_CONV0, FALD_HP_GAIN0, FALD_HP_CORE_CAP0,
+    FALD_HP_DECIDE0B,
+    FALD_HP_STAT1, FALD_HP_STAT1_FULL, FALD_HP_DECIDE1, FALD_HP_CONV1, FALD_HP_GAIN1, FALD_HP_CORE_CAP1,
+    FALD_HP_DECIDE1B,
+    FALD_HP_COMMIT, FALD_HP_PIXEL_FULL, FALD_HP_PIXEL_RECTS, FALD_HP_TUNE,
+    FALD_HP_COUNT
+};
+const char* FaldHookPassName(unsigned int pass);
+struct FaldHookPassHook {
+    virtual void Before(ID3D11DeviceContext* ctx, unsigned int pass, int slot) = 0;
+    virtual void After(ID3D11DeviceContext* ctx, unsigned int pass) = 0;
+};
+extern FaldHookPassHook* g_faldHookPassHook;
+ID3D11Buffer* FaldTestArgs(FaldMonitor* m);
+// The run's kind of the last FaldRun: 0 full, 1 partial (the GPU decided the rest), 2 held (the governor's cap), 3 idle
+// (nothing could have changed: no GPU command issued at all).
+unsigned int FaldTestLastRunKind(const FaldMonitor* m);
+// The conv auto-tune (shared/fald_conv_tune.h): its state (FaldConvTuner::State as a number; 2 = still tuning) and the
+// sub-offsets per thread of the variant in use.
+unsigned int FaldTestConvTuneState(const FaldMonitor* m);
+unsigned int FaldTestConvSo(const FaldMonitor* m);
 #endif
