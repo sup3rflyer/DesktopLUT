@@ -248,7 +248,7 @@ When `DwmHookMode=1` (Settings → **DWM HOOK**; without the key: on for Windows
 
 **Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for non-DWM-hook shader corrections, or for an editor's live preview while the hook is not live (in hook mode the hook applies the preview itself: `mhc_preview.h`). State tracked by `g_analysisOnlyMode` atomic. Desktop Duplication delivers the frame BEFORE the hook, so in hook mode the analysis readout is the content signal ahead of the 3D LUT and tone map — it measures what apps draw, never what the hook outputs (measured 2026-10-15: a PQ 860 window read Peak 2257.5 nits with the tone map on; a post-hook capture would read ≤ the 1700-nit target).
 
-**Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event) and re-injects a hook that is gone while a display has work for it. Orphan detection: the DLL reads the host's PID from the staged `host.pid` and polls the process list every 5 s; when DesktopLUT has died it restores DWM's patched globals and code, disables its hooks and stays loaded but inert. The hook is given up — hook mode switched off and saved, the overlay takes the live layers over, a notice and an Events entry say so (not during a calibration run or live edit: then it only stops trying) — when (`src/dwm_hook_stability.h`):
+**Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event) and re-injects a hook that is gone while a display has work for it. Orphan detection: DesktopLUT holds a named mutex for as long as its process lives (`Global\DesktopLUT_DwmHook_HostAlive_<pid>`, announced on the second line of the staged `host.pid`), and a thread of the DLL blocks on it: when DesktopLUT ends in any way (exit, kill, crash) Windows hands the abandoned mutex to that thread at once, and it restores DWM's patched globals and code, disables its hooks and stays loaded but inert. Nothing is polled inside `dwm.exe` (the DLL used to read the whole process list there every 5 s); only with an older DesktopLUT.exe that offers no mutex does the DLL fall back to that poll. The same thread serves the other direction: a hook that cannot create its rendering resources (final for that injection) reports it once from the present path, reverts itself the same way and closes the heartbeat, so the watchdog sees it as gone instead of a hook that looks alive and corrects nothing. The hook is given up — hook mode switched off and saved, the overlay takes the live layers over, a notice and an Events entry say so (not during a calibration run or live edit: then it only stops trying) — when (`src/dwm_hook_stability.h`):
 - the first injection of a start fails twice (one retry after 5 s);
 - a re-injection fails 3 times in a row;
 - it flaps: 5 re-injections without 30 s attached between them (a start re-arms this count);
@@ -731,6 +731,23 @@ Overlay pass (one fullscreen draw per changed desktop frame), µs:
 
 One RTX 5090 says nothing certain about a weak GPU. On this card the passes are bound by memory traffic (the full-frame copy the hook needs is a third of its HDR pass) and insensitive to shader arithmetic; on the software rasteriser (WARP) it is the reverse. Where an integrated GPU falls between the two has not been measured.
 
+### Idle cost, CPU side (2026-11-12)
+
+What `DesktopLUT.exe` and the hook DLL do on timers while nothing on screen changes: thread wake-ups and CPU time per minute. Ryzen 7950X3D, two displays, about 370 running processes; medians from the test suite's opt-in measurement (`tests/test_host_idle.cpp`, `DLUT_IDLE_BENCH=1`). The per-frame work of the overlay's render loop and of the hook's pass is not in here (see above).
+
+| State (window closed, whitelists empty) | wake-ups / min | CPU ms / min |
+|---|---|---|
+| Nothing configured | 34 | 4 |
+| MHC profiles only | 34 | 10, plus 14 per installed profile that is checked |
+| DWM hook, 3D LUT / tone map | 106, none inside `dwm.exe` | 8 |
+| Overlay, 3D LUT (plus its render loop) | 214 | 7 |
+| DWM hook with FALD on | 148 | 20 |
+
+- Every state: the 15 s MHC verify tick (display queries, about 1 ms; with profiles, Windows' "which profile is the default" query costs 3.6 ms per profile and mode), a 2 s hang check of the overlay thread, and with an MHC profile the 5-minute Calibration Loader kick (a hidden `schtasks.exe`, about 50 ms).
+- Running modes add the whitelist thread (awake once a second to see whether a whitelist became live; an adapter check every 5 s) and, in hook mode, the 5 s watchdog (one named-event lookup).
+- The DLL keeps no timer inside `dwm.exe`: its one thread sleeps until DesktopLUT ends or the hook reports that it cannot render.
+- A whitelist with entries whose feature is on adds, per minute, 120 reads of the process-id list (16 ms together) and a full process read (7.6 ms) whenever a process started or ended anywhere, or after 5 s without one: about 110 ms on a quiet desktop. While a whitelisted program runs nothing is read. Up to 3.0.0 every running mode read the full list twice a second, whitelists or not (915 ms and 1200 wake-ups per minute), and the DLL read it inside `dwm.exe` every 5 s.
+
 ### GPU Benchmark (RTX 5090, 4K 60Hz)
 
 Whole-system figures from `nvidia-smi` with the overlay running (measured in overlay mode, before the pass timings above existed).
@@ -821,7 +838,7 @@ Overlay mode: automatically hides all overlays when specified applications are r
 
 **Setup**: **SETTINGS** → **PASSTHROUGH** on → **WHITELIST** → Enter comma-separated exe names (e.g., `game.exe, launcher.exe`). Matching is case-insensitive, `.exe` extension optional.
 
-**Behavior**: Polls running processes every 500ms. When a whitelisted app is detected, all monitor overlays are hidden. When the app exits, overlays are restored.
+**Behavior**: While the switch is on and the list has entries, running processes are checked every 500 ms: the list of process ids (about 0.1 ms), and the full list with names (4-11 ms with ~370 processes) only when a process started or ended somewhere, or 5 s after the last full read. When a whitelisted app is detected, all monitor overlays are hidden; DesktopLUT then holds a handle on that process and reads no process list at all until it exits (seen at once), at which point overlays are restored. With the switch off or the list empty nothing is read. The desktop gamma whitelist (`GammaWhitelist`) works the same way, armed while it has entries, desktop gamma is on and a display is in HDR.
 
 ## Why This Exists
 

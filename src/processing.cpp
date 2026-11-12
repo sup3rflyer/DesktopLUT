@@ -1467,7 +1467,8 @@ static void StopProcessingImpl() {
         // ...and the hook may still be resident: the overlay thread died in hook mode (WM_PROCESSING_EXITED
         // clears isRunning but leaves the hook for the auto-restart) or a previous session left it. A Stop
         // means nothing stays on screen — e.g. corrections.disable_all used to leave the cube applied.
-        if (IsDwmHookActive()) {
+        // (Also a DLL that reverted itself because it could not render: no heartbeat, but still loaded.)
+        if (DwmHookMayBeResident()) {
             std::cout << "[DWM Hook] Stop while not running: ejecting the resident hook" << std::endl;
             UninjectDwmHook(/*keepOwnSession=*/g_sessionEnding.load());
         }
@@ -1504,8 +1505,10 @@ static void StopProcessingImpl() {
     // the new mode BEFORE calling StopProcessing, so switching hook mode OFF used to leave the DLL
     // injected: dwm.exe kept applying LUT/tonemap to the composed frame — including the overlay's
     // own output — while the overlay applied its layers too (double processing, 2026-09-12).
+    // "Resident" includes a DLL that reverted itself (it could not render: no heartbeat, the watchdog's fall-back to
+    // the overlay arrives here with hook mode already off): its module and the hook's shared memory go too.
     FaldTrace("StopProcessing: before hook check");
-    if (g_dwmHookMode.load() || IsDwmHookActive()) {
+    if (g_dwmHookMode.load() || DwmHookMayBeResident()) {
         std::cout << "[DWM Hook] Stopping — uninjecting from dwm.exe" << std::endl;
         FaldTrace("StopProcessing: UninjectDwmHook begin");
         UninjectDwmHook(/*keepOwnSession=*/g_sessionEnding.load());
