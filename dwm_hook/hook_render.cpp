@@ -1669,6 +1669,20 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		}
 		else
 		{
+			// The dynamic tone map is a function of the whole frame's smoothed peak, and the smoothing advances on every
+			// present: when the peak moved, the pixels OUTSIDE this present's rects are wrong too (they keep the tone map
+			// of the peak they were last drawn with - after a scene cut followed by small-rect presents, up to 177 nits
+			// off in tests/test_perf.cpp's case). So the whole frame is redrawn from this monitor's source copy on exactly
+			// those presents: the smoothing pass's draw arguments (4 vertices; 1 instance iff its output changed, bit for
+			// bit; 0 otherwise), decided on the GPU with no readback - the word the FALD path already draws by. Only from
+			// a PRIMED per-monitor copy (every pixel refreshed since it went stale): the shared staging texture and an
+			// unprimed copy hold other pixels outside the rects.
+			if (peakSlot && peakArgsBuf && srcSRV == peakSlot->srcSRV && peakSlot->srcCover.Primed())
+			{
+				struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
+				SetRectangleTex(&fullFrame, srcW, srcH);
+				deviceContext->DrawInstancedIndirect(peakArgsBuf, 0);
+			}
 			// The rects were copied into srcSRV's texture above, before the peak pass.
 			for (int i = 0; i < numRects; i++)
 				DrawRectangleTex(&rects[i], srcW, srcH);

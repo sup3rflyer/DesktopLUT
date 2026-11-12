@@ -1204,3 +1204,53 @@ TEST_CASE("hook: a failed InitializeStuff is final for the injection and every a
     back->Release();
     ic->ClearState(); ic->Flush(); ic->Release(); dev->Release();
 }
+
+// The dynamic tone map is a function of the whole frame's (smoothed) peak, and the smoothing advances on EVERY present. A
+// scene cut followed by presents that only carry small dirty rects (a caret, a clock) must leave the frame as if every one
+// of those presents had redrawn all of it: the part outside the rects cannot keep the tone map of an older peak.
+TEST_CASE("hook: with a dynamic peak the whole frame follows the peak, not only the present's dirty rects (WARP)") {
+    perf::Dev dev("WARP");
+    if (!dev.ok) { MESSAGE("skipped: no WARP device"); return; }
+    const int W = 480, H = 270;
+    const std::vector<unsigned char> bright = perf::MakeFrame(Kind::Video, Dom::Hdr, W, H);
+    std::vector<unsigned char> dark = bright;           // the same picture at 2 % (peak ~80 nits)
+    for (size_t i = 0; i + 7 < dark.size(); i += 8)
+        for (int c = 0; c < 3; c++) {
+            uint16_t h; std::memcpy(&h, &dark[i + (size_t)c * 2], 2);
+            h = perf::FloatToHalf(perf::HalfToFloat(h) * 0.02f);
+            std::memcpy(&dark[i + (size_t)c * 2], &h, 2);
+        }
+    auto sequence = [&](bool everyPresentFull) {
+        std::vector<unsigned char> out;
+        HookRig rig(dev, 17);
+        REQUIRE(rig.ok);
+        const HookCfg c{ "hdr_tm_dyn", Dom::Hdr, false, true, 0, true, false, false };
+        rig.Apply(c, W, H);
+        const DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        ID3D11Texture2D* back = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        ID3D11Texture2D* tb = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE, bright.data(), (UINT)W * 8u);
+        ID3D11Texture2D* td = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE, dark.data(), (UINT)W * 8u);
+        REQUIRE((back && tb && td));
+        std::vector<RECT> full = { RECT{ 0, 0, W, H } };
+        std::vector<RECT> caret = { RECT{ W / 5, H * 3 / 10, W / 5 + 2, H * 3 / 10 + 18 }, RECT{ W - 90, H - 40, W - 10, H - 8 } };
+        bool ran = true;
+        for (int i = 0; i < 3; i++) { Compose(dev.ic, back, td, full, W, H, 0); ran = rig.Present(back, full) && ran; }   // a dark scene, settled
+        Compose(dev.ic, back, tb, full, W, H, 0); ran = rig.Present(back, full) && ran;                                    // the cut
+        for (int i = 0; i < 45; i++) {                                                                                     // the peak climbs
+            std::vector<RECT>& rects = everyPresentFull ? full : caret;
+            Compose(dev.ic, back, tb, rects, W, H, 0);
+            ran = rig.Present(back, rects) && ran;
+        }
+        CHECK(ran);
+        dev.ic->Flush();
+        out = perf::ReadBack(dev.dev, dev.ic, back);
+        Rel(td); Rel(tb); Rel(back);
+        dev.ic->ClearState(); dev.ic->Flush();
+        return out;
+    };
+    const std::vector<unsigned char> partial = sequence(false), reference = sequence(true);
+    const perf::Diff d = perf::Compare(reference, partial, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    MESSAGE("small-rect presents vs full redraws after a cut: " << d.differing << " of " << d.total << " components differ, max "
+            << d.maxAbs << " scRGB (" << d.maxAbs * 80.0 << " nits), max relative " << d.maxRel);
+    CHECK(d.differing == 0);
+}
