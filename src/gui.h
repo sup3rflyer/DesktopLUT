@@ -127,7 +127,29 @@ extern const GUID GUID_CONSOLE_DISPLAY_STATE_GUI;
 void StartDwmHookBeacon(HWND hwnd, const char* why);      // timer-driven session; no-op without twins / hook mode
 void RunDwmHookBeaconBlocking(HWND hwnd, const char* why); // same, ticked in place (calibration-pipe handlers)
 void StopDwmHookBeacon(HWND hwnd);
-void RefreshHookRoutingLabel();                             // Settings tab status line
+
+// DWM-hook LUT routing of identical twin displays (same size + bit depth: the hook cannot tell them apart from a DWM
+// context), as the interface shows it. Twins are listed whatever the engine (the rows stay put when DWM HOOK is
+// switched); `how` comes from the hook's routing file. Rebuilt by RefreshHookRouting on the events that change it
+// (display change, injection, beacon session, swap, the interface shown); frames read the copy (HookRoutingCached).
+struct HookRoutingTwin {
+    int monitor = -1;    // live index (g_gui.monitors)
+    int group = 0;       // twins that share size + bit depth share a group (0, 1, ...)
+    std::wstring how;    // identified | unambiguous | guessed | inferred | pinned | ... ; empty = no context assigned
+};
+struct HookRoutingView {
+    std::vector<HookRoutingTwin> twins;   // grouped, in live-index order within a group; empty = no twins
+    bool identifying = false;             // an identity-beacon session runs
+    bool fileStale = false;               // the routing file is from an earlier dwm.exe (or absent): nothing assigned
+};
+struct DwmHookRouting;
+// Pure, exposed for testing: twin groups (live indices) + the live monitors' desktop positions + the routing file.
+HookRoutingView BuildHookRoutingView(const std::vector<std::vector<int>>& groups, const std::vector<POINT>& positions,
+                                     const DwmHookRouting& r);
+std::wstring HookRoutingMethodLabel(const std::string& method);   // the routing file's method -> the word shown
+void RefreshHookRouting();                                         // GUI thread
+const HookRoutingView& HookRoutingCached();                        // GUI thread
+void RefreshHookRoutingLabel();                                    // RefreshHookRouting + the classic status line
 
 // Main GUI window procedure
 LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);

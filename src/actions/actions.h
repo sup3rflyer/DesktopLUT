@@ -29,6 +29,14 @@ void SetTetrahedral(bool on);
 void SetHdrDither(bool on);
 void SetDwmHookMode(bool on);
 
+// ---- DWM hook routing of identical twin displays (HookRoutingView, gui.h) -----------------------------------
+// IDENTIFY: an identity-beacon session now (a small coloured square in each display's corner for a moment; the hook
+// pins each context to the display whose colour it sees). Needs hook mode running with twins attached.
+Result IdentifyHookTwins();
+// SWAP: the display and its one twin exchange their recorded contexts, then the hook is re-injected (the beacon that
+// follows overrides a swap wherever it can see the displays, so this holds where identification cannot).
+Result SwapHookRoutingWithTwin(int mon);
+
 // ---- Tone mapping (HDR settings) ---------------------------------------------------------------
 // Values are clamped to 10..10000 nits. Enabling while stopped starts processing (as the classic box did).
 Result SetTonemap(int mon, const TonemapSettings& t);

@@ -152,6 +152,10 @@ void InvalidateDxgiMonitorCache();
 // True when at least two monitors are indistinguishable to the hook (same size + bit depth):
 // the only rigs where the identity beacon has anything to tell apart.
 bool DwmHookHasTwinMonitors();
+// The same twins, grouped: one group per set of monitors that share size + bit depth, each monitor by its desktop
+// position (rcMonitor left, top). Empty when there are none. Any thread (the cached DXGI enumeration).
+struct DwmHookTwinPos { int left = 0, top = 0; };
+std::vector<std::vector<DwmHookTwinPos>> DwmHookTwinGroups();
 
 // --- Twin-panel routing (25H2 first-present order-match) ---------------------
 // The hook DLL persists its overlay-context -> monitor assignment in

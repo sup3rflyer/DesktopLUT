@@ -1317,6 +1317,7 @@ void StartDwmHookBeacon(HWND hwnd, const char* why) {
     UpdateDwmHookSharedConfig();
     std::cout << "[DWM Hook] Identity beacon session " << g_hookBeaconGeneration.load()
               << " (" << why << ")" << std::endl;
+    RefreshHookRouting();   // the interface says it identifies
     if (g_gui.hwndSettingsHookRouting)
         SetWindowText(g_gui.hwndSettingsHookRouting, L"LUT routing: identifying monitors...");
     SetTimer(hwnd, DWM_HOOK_BEACON_TIMER_ID, DWM_HOOK_BEACON_TICK_MS, nullptr);
@@ -1353,7 +1354,67 @@ void RunDwmHookBeaconBlocking(HWND hwnd, const char* why) {
     }
 }
 
+std::wstring HookRoutingMethodLabel(const std::string& method) {
+    if (method == "beacon") return L"identified";
+    if (method == "unique" || method == "bpc" || method == "legacy") return L"unambiguous";
+    if (method == "order") return L"guessed";
+    if (method == "replaced") return L"inferred";
+    return std::wstring(method.begin(), method.end());
+}
+
+HookRoutingView BuildHookRoutingView(const std::vector<std::vector<int>>& groups, const std::vector<POINT>& positions,
+                                     const DwmHookRouting& r) {
+    HookRoutingView v;
+    v.fileStale = !r.present || r.stale;
+    for (size_t g = 0; g < groups.size(); g++) {
+        for (int mon : groups[g]) {
+            HookRoutingTwin t;
+            t.monitor = mon;
+            t.group = (int)g;
+            if (!v.fileStale && mon >= 0 && mon < (int)positions.size()) {
+                // Every context recorded at the monitor's position (a re-injection may leave an older one there).
+                for (const auto& e : r.entries) {
+                    if (e.left != positions[(size_t)mon].x || e.top != positions[(size_t)mon].y) continue;
+                    const std::wstring m = HookRoutingMethodLabel(e.method);
+                    if (m.empty() || t.how.find(m) != std::wstring::npos) continue;
+                    if (!t.how.empty()) t.how += L"/";
+                    t.how += m;
+                }
+            }
+            v.twins.push_back(std::move(t));
+        }
+    }
+    return v;
+}
+
+static HookRoutingView g_hookRouting;   // GUI thread
+const HookRoutingView& HookRoutingCached() { return g_hookRouting; }
+
+void RefreshHookRouting() {
+    std::vector<POINT> positions;
+    for (HMONITOR h : g_gui.monitors) {
+        MONITORINFO info = { sizeof(info) };
+        positions.push_back(GetMonitorInfo(h, &info) ? POINT{ info.rcMonitor.left, info.rcMonitor.top } : POINT{ INT_MIN, INT_MIN });
+    }
+    // The hook's twins (same size + bit depth) by position, as live indices; a position no live monitor has (a
+    // display change not settled yet) is left out.
+    std::vector<std::vector<int>> groups;
+    for (const auto& g : DwmHookTwinGroups()) {
+        std::vector<int> mons;
+        for (const DwmHookTwinPos& p : g)
+            for (size_t i = 0; i < positions.size(); i++)
+                if (positions[i].x == p.left && positions[i].y == p.top) { mons.push_back((int)i); break; }
+        std::sort(mons.begin(), mons.end());
+        if (mons.size() > 1) groups.push_back(std::move(mons));
+    }
+    const DwmHookRouting r = groups.empty() ? DwmHookRouting() : ReadDwmHookRouting();
+    g_hookRouting = BuildHookRoutingView(groups, positions, r);
+    g_hookRouting.identifying = g_hookBeaconActive.load();
+    ui::Invalidate();
+}
+
 void RefreshHookRoutingLabel() {
+    RefreshHookRouting();
     if (!g_gui.hwndSettingsHookRouting) return;
     std::wstring text;
     if (!g_dwmHookMode.load()) {
@@ -1388,26 +1449,6 @@ void RefreshHookRoutingLabel() {
         }
     }
     SetWindowText(g_gui.hwndSettingsHookRouting, text.c_str());
-}
-
-// Manual override for the selected monitor: exchange its assignment with its twin's and
-// re-inject. The identity beacon runs after the injection; where it can see the monitors it
-// is the authority, so a manual swap only holds where identification is impossible.
-static void SwapDwmHookRoutingForCurrentMonitor(HWND hwnd) {
-    (void)hwnd;
-    int mon = g_gui.currentMonitor;
-    if (mon < 0 || mon >= (int)g_gui.monitors.size()) return;
-    MONITORINFO info = { sizeof(info) };
-    if (!GetMonitorInfo(g_gui.monitors[mon], &info)) return;
-    DwmHookRouting r = ReadDwmHookRouting();
-    if (!r.present || r.stale) { SetStatus(L"LUT routing: nothing assigned yet to swap"); return; }
-    std::wstring err = SwapDwmHookRouting(r, info.rcMonitor.left, info.rcMonitor.top);
-    if (!err.empty()) { SetStatus((L"LUT routing: " + err).c_str()); return; }
-    r.confirmed = false;
-    if (!WriteDwmHookRouting(r)) { SetStatus(L"LUT routing: failed to rewrite the routing file"); return; }
-    RestartLiveLayers();   // stays stopped if the user suspended meanwhile
-    SetStatus(L"LUT routing swapped and re-injected");
-    RefreshHookRoutingLabel();
 }
 
 // ============================================================================
@@ -1446,6 +1487,7 @@ static void ShowClassicWindow() {
 
 void ShowActiveUi() {
     if (!g_uiClassic) {
+        RefreshHookRouting();   // the twins' routing as of now (it changes without a message: a pipe swap, a re-roll)
         if (ui::Show()) return;
         notify::Post(notify::Sev::Warning, -1, L"ui", L"Classic interface opened: the new one could not start");
     }
@@ -1557,6 +1599,8 @@ void SetLiveMonitors(const std::vector<HMONITOR>& monitors) {
     for (const auto& n : names) SendMessage(g_gui.hwndMonitorList, LB_ADDSTRING, 0, (LPARAM)n.c_str());
     SendMessage(g_gui.hwndMonitorList, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(g_gui.hwndMonitorList, nullptr, TRUE);
+    InvalidateDxgiMonitorCache();   // the twin check reads the cached enumeration
+    RefreshHookRouting();
 }
 
 // True when some identifiable live display is not the display whose settings sit at its
@@ -2448,14 +2492,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case ID_SETTINGS_HOOK_IDENTIFY:
-            StartDwmHookBeacon(hwnd, "user");
-            if (!g_hookBeaconActive.load() && g_gui.hwndSettingsHookRouting)
-                SetWindowText(g_gui.hwndSettingsHookRouting,
-                    L"LUT routing: identification needs DWM hook mode running on identical monitors");
+            act::IdentifyHookTwins();
             return 0;
 
         case ID_SETTINGS_HOOK_SWAP:
-            SwapDwmHookRoutingForCurrentMonitor(hwnd);
+            act::SwapHookRoutingWithTwin(g_gui.currentMonitor);
             return 0;
 
         case ID_SETTINGS_VRR_WHITELIST_CHECK:
@@ -2527,6 +2568,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively
         StartDwmHookBeacon(hwnd, "injection");
+        RefreshHookRouting();         // a fresh routing file (no twins: no beacon session ran)
         RequestFaldFullRecompose();   // prime the hook FALD layer's clean source
         ReportUnverifiedDwmcoreOnce();
         return 0;

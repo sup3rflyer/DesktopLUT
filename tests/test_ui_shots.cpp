@@ -619,6 +619,12 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "fronttiponwl", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 585, 95, 1180, 760, 71 },
         { "fronttippeak", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 300, 282, 1180, 760, 70 },
         { "fronttipanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 995, 28, 1180, 760, 70 },
+        // ENGINE's TWIN ROUTING rows (two identical displays): 80 identified, 81 DWM HOOK off (the rows stay, disabled),
+        // 82 identifying; a rig without twins draws none (the "settings" shot).
+        { "settingstwins", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 80 },
+        { "settingstwinsnarrow", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 80 },
+        { "settingstwinsoff", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 81 },
+        { "settingstwinsid", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 82 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -689,6 +695,15 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     cubeOffRecord(snap.live[0], 1);
                     cubeOffRecord(snap.live[1], 0);
                     snap.live[0].reportedPeakNits = 1612;
+                } else if (shot.variant >= 80 && shot.variant <= 82) {
+                    snap.live[1].name = snap.live[0].name;   // twins share a name until renamed
+                    HookRoutingTwin a, b;
+                    a.monitor = 0; b.monitor = 1;
+                    a.how = L"identified";
+                    b.how = shot.variant == 82 ? L"guessed" : L"identified";
+                    snap.routing.twins = { a, b };
+                    snap.routing.identifying = shot.variant == 82;
+                    if (shot.variant == 81) { snap.hookMode = false; snap.hookActive = false; }
                 } else if (shot.variant == 14) {
                     if (!realRun) continue;
                     snap.run = realRun;

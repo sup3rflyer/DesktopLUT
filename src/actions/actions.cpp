@@ -161,6 +161,40 @@ void SetDwmHookMode(bool on) {
 }
 
 // ---------------------------------------------------------------------------------------------------
+// DWM hook routing of twin displays
+
+Result IdentifyHookTwins() {
+    if (!g_dwmHookMode.load() || !g_gui.isRunning || !IsDwmHookActive())
+        return Told(-1, L"hook", Fail(notify::Sev::Warning, L"Identify: the DWM hook is not running"));
+    if (!DwmHookHasTwinMonitors())
+        return Told(-1, L"hook", Fail(notify::Sev::Warning, L"Identify: no identical displays to tell apart"));
+    StartDwmHookBeacon(g_gui.hwndMain, "user");
+    if (!g_hookBeaconActive.load())
+        return Told(-1, L"hook", Fail(notify::Sev::Warning, L"Identify: the beacon could not start"));
+    return Done();
+}
+
+Result SwapHookRoutingWithTwin(int mon) {
+    if (mon < 0 || mon >= (int)g_gui.monitors.size()) return Done(false);
+    if (!g_dwmHookMode.load() || !g_gui.isRunning)
+        return Told(mon, L"hook", Fail(notify::Sev::Warning, L"Swap: the DWM hook is not running"));
+    MONITORINFO info = { sizeof(info) };
+    if (!GetMonitorInfo(g_gui.monitors[mon], &info)) return Done(false);
+    DwmHookRouting r = ReadDwmHookRouting();
+    if (!r.present || r.stale)
+        return Told(mon, L"hook", Fail(notify::Sev::Warning, L"Swap: nothing assigned yet"));
+    const std::wstring err = SwapDwmHookRouting(r, info.rcMonitor.left, info.rcMonitor.top);
+    if (!err.empty()) return Told(mon, L"hook", Fail(notify::Sev::Warning, L"Swap: " + err));
+    r.confirmed = false;
+    if (!WriteDwmHookRouting(r))
+        return Told(mon, L"hook", Fail(notify::Sev::Error, L"Swap: the routing file could not be rewritten"));
+    RestartLiveLayers();   // the DLL reads the pins at injection; stays stopped if the user suspended meanwhile
+    SetStatus(L"LUT routing swapped: DWM hook re-injected");
+    RefreshHookRouting();
+    return Done();
+}
+
+// ---------------------------------------------------------------------------------------------------
 // Tone mapping
 
 Result SetTonemap(int mon, const TonemapSettings& t) {
