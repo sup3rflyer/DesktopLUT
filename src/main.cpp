@@ -34,6 +34,9 @@ static bool HasSwitch(const wchar_t* name) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
     (void)hInstance; (void)hPrevInstance; (void)lpCmdLine; (void)nCmdShow;
 
+    // Remove everything acts on the real PC only from this process (the test exe links the same code, never this).
+    uninst::ArmRealRun();
+
     // Minidump on any crash / std::terminate (crashdumps\ next to the exe).
     InstallCrashHandler();
 

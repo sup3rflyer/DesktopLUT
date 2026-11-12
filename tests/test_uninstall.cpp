@@ -3,6 +3,7 @@
 
 #include "doctest.h"
 #include "uninstall.h"
+#include "uninstall_win.h"   // only for the arm test below
 
 #include <algorithm>
 #include <map>
@@ -186,6 +187,32 @@ int IndexOf(const Plan& p, StepKind k, int display = -1) {
 
 }  // namespace
 
+// The one test that calls the real half: the arm (only DesktopLUT.exe's wWinMain sets it) makes it inert here.
+TEST_CASE("uninstall: unarmed (the test exe), the real half refuses and touches nothing") {
+    REQUIRE_FALSE(uninst::RealRunArmed());
+    if (uninst::RealRunArmed()) return;   // never call the real thing armed, whatever REQUIRE did
+    State s;
+    FakeSystem sys;
+    MakePc(s, sys);   // a non-empty plan: every kind of step
+    const Plan p = uninst::BuildPlan(s);
+    REQUIRE(p.steps.size() == 9);
+    const uninst::Result r = uninst::RunInApp(p, s);
+    CHECK(r.anyFailed);
+    REQUIRE(r.steps.size() == p.steps.size());
+    for (const uninst::StepResult& sr : r.steps) {
+        CHECK(sr.outcome == Outcome::Failed);
+        CHECK(sr.note == uninst::kNotArmedNote);
+    }
+    CHECK_FALSE(uninst::UninstallRan());          // no quiesce, no run recorded
+    CHECK_FALSE(uninst::UninstallInProgress());
+    const State empty = uninst::CollectStateInApp();   // no system queries either
+    CHECK(empty.displays.empty());
+    CHECK(empty.profileFiles.empty());
+    CHECK(empty.tempFiles.empty());
+    CHECK_FALSE(empty.startupTask);
+    CHECK(sys.log.empty());   // and the fake was never handed to anything
+}
+
 TEST_CASE("uninstall: the namespace rules") {
     CHECK(uninst::IsOurProfileName(L"DesktopLUT_Mon0_HDR_P32_200.icm"));
     CHECK(uninst::IsOurProfileName(L"desktoplut_display3_SDR_Identity.ICM"));   // Windows compares without case
@@ -234,11 +261,11 @@ TEST_CASE("uninstall: the plan, from a PC with two connected displays and one th
     CHECK(p.steps[(size_t)stop].detail == "Stop");
     CHECK(p.steps[(size_t)hook].detail == "Unload from dwm.exe");
     CHECK(p.steps[(size_t)pa].label == "PROFILES \xC2\xB7 PA32UCXR");
-    CHECK(p.steps[(size_t)pa].detail.find("4 associations") == 0);
-    CHECK(p.steps[(size_t)pa].detail.find("SDR and HDR default") != std::string::npos);
+    CHECK(p.steps[(size_t)pa].detail.find("4 profiles") == 0);
+    CHECK(p.steps[(size_t)pa].detail.find("default in SDR and HDR") != std::string::npos);
     CHECK(p.steps[(size_t)files].detail == "6 files in the colour directory");
     CHECK(p.steps[(size_t)task].detail == "Delete");
-    CHECK(p.steps[(size_t)temp].detail.find("4 items") == 0);
+    CHECK(p.steps[(size_t)temp].detail == "4 files");
 
     // What stays: the folder, and the display that is not connected (its associations cannot be reached).
     REQUIRE(p.stays.size() == 2);
@@ -317,7 +344,7 @@ TEST_CASE("uninstall: the run takes every association and file of ours, leaves t
     CHECK(sys.colorFiles.empty());
     CHECK(sys.tempFiles.empty());
     CHECK_FALSE(sys.task);
-    CHECK(r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 0)].note == "4 associations removed");
+    CHECK(r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 0)].note == "4 profiles removed");
     CHECK(r.steps[(size_t)IndexOf(p, StepKind::ReportedPeak)].note == "2 displays put back");
 
     const std::string text = uninst::ResultText(p, r);
@@ -373,10 +400,10 @@ TEST_CASE("uninstall: an association Windows keeps keeps its file, and the run s
 
     const uninst::StepResult& pa = r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 0)];
     CHECK(pa.outcome == Outcome::Failed);
-    CHECK(pa.note == "1 association still listed");
+    CHECK(pa.note == "1 profile still listed");
     const uninst::StepResult& files = r.steps[(size_t)IndexOf(p, StepKind::DeleteProfiles)];
     CHECK(files.outcome == Outcome::Failed);
-    CHECK(files.note.find("1 kept: still associated") != std::string::npos);
+    CHECK(files.note.find("1 kept (still listed)") != std::string::npos);
     CHECK(sys.colorFiles == std::set<std::wstring>{ L"DesktopLUT_Mon0_HDR_P0_150.icm" });
     CHECK(r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 1)].outcome == Outcome::Done);   // the BenQ is clean
 }
@@ -390,7 +417,7 @@ TEST_CASE("uninstall: no neutral identity possible: the associations still go, a
     const uninst::Result r = uninst::Execute(p, s, sys);
     const uninst::StepResult& pa = r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 0)];
     CHECK(pa.outcome == Outcome::Failed);
-    CHECK(pa.note.find("until Windows restarts") != std::string::npos);
+    CHECK(pa.note.find("until restart") != std::string::npos);
     CHECK(sys.displays[kPa].lists[1].empty());
     CHECK(sys.displays[kPa].lists[0] == std::vector<std::wstring>{ L"PA32UCXR_user.icm" });
 }
@@ -411,7 +438,7 @@ TEST_CASE("uninstall: nothing outside the namespace is ever removed") {
     CHECK(sys.displays[kPa].lists[0] == std::vector<std::wstring>{ L"PA32UCXR_user.icm" });
     const uninst::StepResult& temp = r.steps[(size_t)IndexOf(p, StepKind::DeleteTemp)];
     CHECK(temp.outcome == Outcome::Failed);   // refused, and reported
-    CHECK(temp.note.find("1 refused: not ours") != std::string::npos);
+    CHECK(temp.note.find("1 refused (not ours)") != std::string::npos);
 }
 
 TEST_CASE("uninstall: a display unplugged between the plan and the run fails alone") {
@@ -423,7 +450,7 @@ TEST_CASE("uninstall: a display unplugged between the plan and the run fails alo
     const uninst::Result r = uninst::Execute(p, s, sys);
     const uninst::StepResult& benq = r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 1)];
     CHECK(benq.outcome == Outcome::Failed);
-    CHECK(benq.note.find("Not connected any more") == 0);
+    CHECK(benq.note.find("Not connected now") == 0);
     CHECK(r.steps[(size_t)IndexOf(p, StepKind::DisplayProfiles, 0)].outcome == Outcome::Done);
     // Its file goes with the rest (an unplugged display cannot be asked; the PLAN's stays say so for parked ones).
     CHECK(sys.colorFiles.empty());

@@ -27,7 +27,15 @@ namespace uninst {
 
 namespace {
 
+std::atomic<bool> g_armed{ false };   // ArmRealRun: DesktopLUT.exe's wWinMain only
 std::atomic<bool> g_ran{ false };
+
+Result NotArmed(const Plan& plan) {
+    Result r;
+    r.steps.assign(plan.steps.size(), StepResult{ Outcome::Failed, kNotArmedNote });
+    r.anyFailed = true;
+    return r;
+}
 std::atomic<bool> g_inProgress{ false };
 
 std::wstring SystemColorDir() {
@@ -398,11 +406,16 @@ UINT ExitForUninstallMessage() {
     return msg;
 }
 
+void ArmRealRun() { g_armed.store(true); }
+
+bool RealRunArmed() { return g_armed.load(); }
+
 bool UninstallRan() { return g_ran.load(); }
 
 bool UninstallInProgress() { return g_inProgress.load(); }
 
 State CollectStateInApp() {
+    if (!RealRunArmed()) return State();
     std::vector<MonitorSettings> saved;
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
@@ -415,6 +428,7 @@ State CollectStateInApp() {
 }
 
 Result RunInApp(const Plan& plan, const State& state) {
+    if (!RealRunArmed()) return NotArmed(plan);   // before anything: no quiesce, no WinSystem, not even g_ran
     g_ran.store(true);
     struct InProgress {
         InProgress() { g_inProgress.store(true); }
@@ -431,6 +445,7 @@ void RequestExitAfterUninstall() {
 }
 
 int RunCommandLine(bool quiet) {
+    if (!RealRunArmed()) return 1;   // nothing read, nothing written, no report file
     g_ran.store(true);
     std::vector<MonitorSettings> saved;
     LoadMonitorSettingsPool(saved, GetIniPath().c_str());

@@ -12,6 +12,13 @@
 
 namespace uninst {
 
+// The process-level arm: only DesktopLUT.exe's wWinMain calls ArmRealRun (first thing). Unarmed — the test exe, or
+// anything else that links this file — RunInApp and RunCommandLine refuse and call nothing on the system, and
+// CollectStateInApp returns an empty snapshot without querying it.
+void ArmRealRun();
+bool RealRunArmed();
+inline constexpr const char* kNotArmedNote = "Not armed: only DesktopLUT.exe runs this";
+
 // The registered message a running instance exits on (any instance of this build or later). 0 = unavailable.
 UINT ExitForUninstallMessage();
 
