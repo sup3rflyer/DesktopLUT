@@ -190,4 +190,30 @@ ModeRecord RecordFor(const Data& d, const std::string& name, int modeIndex, cons
     return rec;
 }
 
+DipLink DipRecordFor(const Data& d, const std::string& name, int modeIndex, const LiveDisplay& live) {
+    DipLink link;
+    if (name.empty()) return link;
+    link.key = name + ":" + ModeName(modeIndex);
+    // Exact keys, as DLC's store lookup is (a dict): the mode's key first, then the bare name.
+    auto find = [&d](const std::string& key) {
+        for (size_t i = 0; i < d.dip.records.size(); i++) if (d.dip.records[i].key == key) return (int)i;
+        return -1;
+    };
+    link.record = find(link.key);
+    if (link.record < 0) {
+        link.record = find(name);
+        link.modeless = link.record >= 0;
+    }
+    if (link.record < 0) {
+        for (const std::string& k : d.dip.dropped) if (k == link.key || k == name) link.unreadable = true;
+        return link;
+    }
+    const DipRecord& r = d.dip.records[(size_t)link.record];
+    if (r.refresh >= 0 && r.refresh < (int)d.dip.refresh.size()) {
+        const std::string& hw = d.dip.refresh[(size_t)r.refresh].hardwareId;
+        link.refreshOtherPanel = !hw.empty() && !live.hardwareId.empty() && !SameId(hw, live.hardwareId);
+    }
+    return link;
+}
+
 }  // namespace dlc

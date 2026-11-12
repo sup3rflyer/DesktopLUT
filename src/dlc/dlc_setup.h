@@ -35,4 +35,16 @@ std::wstring SetupRepoFolder(const std::wstring& home);
 // DesktopLUT's version ("3.0.0"), the tag to fall back to when DLC and the app disagree on the pipe. UTF-8.
 std::string SetupPrompt(const std::wstring& repoFolder, const char* appVersion);
 
+// ---- the DLC tab's COPY PROMPT requests (UTF-8, for Claude Code or another coding agent) -----------------------------
+// `dlcName`: the display's name in DLC's profile (dlc::MatchDisplay); `liveName`: DesktopLUT's name for a display DLC
+// has not met (the agent onboards it first). `hdr`: the mode shown.
+std::string CalibratePrompt(const std::string& dlcName, bool hdr);
+std::string OnboardCalibratePrompt(const std::string& liveName, bool hdr);
+// Characterize: DLC's characterize flow measures the panel and the meter (noise, settle, native white / black,
+// thermal) and writes the display's DIP record. The flow's command line as the operator guide gives it:
+constexpr const char* kCharacterizeFlow = "--flow characterize --mode";   // + " SDR" / " HDR"
+constexpr const char* kCharacterizeDoc = "DLC/docs/operator-guide.md";
+std::string CharacterizePrompt(const std::string& dlcName, bool hdr);
+std::string OnboardCharacterizePrompt(const std::string& liveName, bool hdr);
+
 }  // namespace dlc

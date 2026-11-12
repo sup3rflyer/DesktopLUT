@@ -35,7 +35,8 @@ struct LogView {
 
 // DLC page: what is shown (interface-local, not persisted).
 struct DlcView {
-    std::wstring pick;                     // the record shown: a report.json path, kDlcPickLive, kDlcPickStack, or empty = automatic
+    std::wstring pick;                     // the record shown: a report.json path, kDlcPickLive, kDlcPickStack, kDlcPickPanel,
+                                           // or empty = automatic
     int tile[4] = { -1, -1, -1, -1 };      // the chart in each tile (DlcChart); -1 = the default for the stage
     int maximized = -1;                    // the tile shown alone over the whole chart area; -1 = the four tiles
     uint8_t opt[16][8] = {};               // per chart (DlcChart): each option's value + 1; 0 = the chart's default
@@ -55,6 +56,7 @@ struct UninstallView {
 
 inline const wchar_t* const kDlcPickLive = L"<live>";
 inline const wchar_t* const kDlcPickStack = L"<stack>";   // what the display runs now: its layers and their verification
+inline const wchar_t* const kDlcPickPanel = L"<panel>";   // what DLC has measured about the display (its DIP record)
 
 // Interface-local state that survives frames and device teardown (not persisted yet).
 struct ViewState {

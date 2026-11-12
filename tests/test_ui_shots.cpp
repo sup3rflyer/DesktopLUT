@@ -602,6 +602,15 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "uninstall", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 40 },
         { "uninstalldone", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 41 },
         { "uninstallnarrow", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 40 },
+        // The PANEL view (the DIP record): 60 the HDR display with everything measured and its REFRESH TRIM off (also
+        // narrow), 61 the BenQ with a record of the mandatory fields only, 62 the BenQ with no record, 63 not matched.
+        { "dlcpanelhdr", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 60 },
+        { "dlcpanelnarrow", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 60 },
+        { "dlcpaneltall", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 1040, 60 },   // the whole card
+        { "dlcpanelnarrowtall", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 1560, 60 },   // under the charts
+        { "dlcpanelsdr", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 61 },
+        { "dlcpanelnone", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 62 },
+        { "dlcpanelunmatched", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 63 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -729,6 +738,39 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     } else {
                         t.waiting = "calibration"; t.applied = false; t.activeStamp.clear();
                     }
+                } else if (shot.variant >= 60 && shot.variant <= 63) {
+                    // The DIP: the HDR display's full record (and a minimal SDR one for it); the BenQ's per variant.
+                    std::string benq;
+                    if (shot.variant == 61) benq = R"(, "BenQ PD2700U:SDR": {"display": "BenQ PD2700U", "mode": "SDR", "made": "2026-09-26"})";
+                    const std::string json = std::string(R"({"schema": 1, "displays": {
+                        "PA32UCXR:HDR": {"display": "PA32UCXR", "mode": "HDR",
+                          "noise_model": [{"nits": 0.07, "sigma_de": 0.0003}, {"nits": 1.8, "sigma_de": 0.0048}],
+                          "noise_floor_nits": 0.0, "settle_seconds": 1.66, "settle_by_level": {"bright": 1.66, "dark": 0.0},
+                          "native_white_xy": [0.31692, 0.32838], "native_white_nits": 1835.1, "native_black_nits": 0.0,
+                          "sustained_peak_nits": 1652.0, "eotf_undershoot": 0.01453,
+                          "native_primaries": {"R": [0.6934, 0.3016], "G": [0.1906, 0.7444], "B": [0.1521, 0.0632]},
+                          "thermal_regime": "convergent", "warmup_minutes": 29.57, "cold_channel": "B",
+                          "instrument": "X-Rite i1 DisplayPro", "made": "2026-06-19", "updated": "2026-10-10",
+                          "refresh_response": {"measured": "2026-10-03", "run_id": "20261003_180329_refresh_trim_hdr_mon0_trim",
+                            "identity": {"hardware_id": "AUS322A"},
+                            "rates": [{"key": "59.94", "num": 60000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 1.0003}]},
+                                      {"key": "50", "num": 50, "den": 1, "levels": [{"nits": 0.5, "ratio": 0.98}]},
+                                      {"key": "48", "num": 48, "den": 1, "levels": [{"nits": 0.5, "ratio": 0.97}]},
+                                      {"key": "47.952", "num": 48000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 0.97}]}]},
+                          "peak_by_window": {"measured": "2026-10-10"}},
+                        "PA32UCXR:SDR": {"display": "PA32UCXR", "mode": "SDR", "native_white_nits": 121.7, "made": "2026-03-18"})") +
+                                             benq + "}}";
+                    auto data = std::make_shared<dlc::Data>(*snap.dlc);
+                    data->dip = dlc::ParseDipStore(json);
+                    data->dipFound = data->dip.readable;
+                    snap.dlc = data;
+                    snap.live[0].dlcLive.hardwareId = "AUS322A";
+                    snap.live[0].settings.hdrMHC.refreshTrimEnabled = false;   // the DIP has a response, the trim is off
+                    if (shot.variant == 63) {
+                        snap.live[1].dlcMatch = dlc::DisplayMatch();
+                        snap.live[1].dlcRecord[0] = snap.live[1].dlcRecord[1] = dlc::ModeRecord();
+                        snap.live[1].reminderDue = false;
+                    }
                 } else if (shot.variant == 23 || shot.variant == 25) {
                     FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;
                     f.star.enabled = true;
@@ -751,6 +793,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
+                if (shot.variant >= 60 && shot.variant <= 63) vs.dlc.pick = ui::kDlcPickPanel;
                 if (shot.variant == 25) vs.faldViewOpenRequested = true;
                 if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = shot.variant == 16 ? 3 : 0;   // 16: WORST MISSES, wide
                 if (shot.variant == 19 || shot.variant == 20 || shot.variant == 21) {

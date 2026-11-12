@@ -4,7 +4,9 @@
 #include "ipc_json.h"
 
 #include <windows.h>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cwctype>
 #include <algorithm>
 
@@ -369,7 +371,192 @@ DipRefreshSection ParseRefreshSection(const std::string& key, const JsonValue& r
     return s;
 }
 
+// ---- the record summary: DLC's own load rules (dip.py DisplayInstrumentProfile.from_dict) -------------------------
+// Python truthiness of a JSON value: what `x or []` / `if d.get(k)` skip.
+bool Falsy(const JsonValue& v) {
+    switch (v.type) {
+    case JsonValue::Null: return true;
+    case JsonValue::Bool: return !v.b;
+    case JsonValue::Num:  return v.num == 0.0;
+    case JsonValue::Str:  return v.str.empty();
+    case JsonValue::Arr:  return v.arr.empty();
+    case JsonValue::Obj:  return v.members.empty();
+    }
+    return true;
+}
+
+// float(v): a number, a bool, or a string that is a whole number literal.
+bool AsFloat(const JsonValue& v, double& out) {
+    if (v.type == JsonValue::Num) { out = v.num; return true; }
+    if (v.type == JsonValue::Bool) { out = v.b ? 1.0 : 0.0; return true; }
+    if (v.type != JsonValue::Str) return false;
+    const char* s = v.str.c_str();
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+    char* end = nullptr;
+    out = strtod(s, &end);
+    if (end == s) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r') end++;
+    return *end == '\0';
+}
+
+// int(v): a number (truncated), a bool, or a string holding an integer.
+bool AsInt(const JsonValue& v, int& out) {
+    double d = 0.0;
+    if (v.type == JsonValue::Str) {
+        const std::string& s = v.str;
+        size_t i = 0;
+        while (i < s.size() && s[i] == ' ') i++;
+        if (i < s.size() && (s[i] == '+' || s[i] == '-')) i++;
+        const size_t digits = i;
+        while (i < s.size() && isdigit((unsigned char)s[i])) i++;
+        size_t j = i;
+        while (j < s.size() && s[j] == ' ') j++;
+        if (i == digits || j != s.size()) return false;
+        d = strtod(s.c_str(), nullptr);
+    } else if (!AsFloat(v, d) || !std::isfinite(d)) {
+        return false;
+    }
+    if (d > 2147483647.0 || d < -2147483648.0) return false;
+    out = (int)std::trunc(d);
+    return true;
+}
+
+// A float field: absent / null = unmeasured (NaN); otherwise it must convert, or DLC drops the record.
+bool OptFloat(const JsonValue& rec, const char* key, double& out) {
+    out = kNaN;
+    const JsonValue* v = rec.find(key);
+    if (!v || v->type == JsonValue::Null) return true;
+    return AsFloat(*v, out);
+}
+
+bool OptInt(const JsonValue& rec, const char* key, int& out, int def) {
+    out = def;
+    const JsonValue* v = rec.find(key);
+    if (!v || v->type == JsonValue::Null) return true;
+    return AsInt(*v, out);
+}
+
+// Iterable of floats (`[float(c) for c in v]`), when truthy; `count` its length.
+bool FloatList(const JsonValue* v, size_t& count) {
+    count = 0;
+    if (!v || Falsy(*v)) return true;
+    if (v->type != JsonValue::Arr) return false;
+    double d = 0.0;
+    for (const JsonValue& c : v->arr) if (!AsFloat(c, d)) return false;
+    count = v->arr.size();
+    return true;
+}
+
+std::string OptStr(const JsonValue& rec, const char* key) {
+    const JsonValue* v = rec.find(key);
+    return v && v->type == JsonValue::Str ? v->str : std::string();
+}
+
+// peak_by_window: presence and its measured date (DipPeakByWindow says where the rest goes).
+DipPeakByWindow ParsePeakByWindow(const JsonValue& rec) {
+    DipPeakByWindow p;
+    const JsonValue* v = rec.find("peak_by_window");
+    if (!v || v->type == JsonValue::Null) return p;
+    p.present = true;
+    if (v->type == JsonValue::Obj) p.measured = Str(v, "measured");
+    return p;
+}
+
+// False: DLC's loader would refuse the record (a field that does not convert), so it is dropped here too.
+bool ParseDipRecord(const std::string& key, const JsonValue& rec, DipRecord& r) {
+    r.key = key;
+    r.display = Str(&rec, "display");
+    std::string mode = Str(&rec, "mode");
+    if (r.display.empty()) {   // DLC: the key names the display when the record does not
+        const size_t colon = key.rfind(':');
+        r.display = colon != std::string::npos && !NormMode(key.substr(colon + 1)).empty() ? key.substr(0, colon) : key;
+    }
+    r.mode = NormMode(mode);
+    if (r.mode.empty() && !mode.empty()) r.mode = mode;   // kept as written; it then matches no live mode
+    // noise_model: each band needs float nits and sigma_de.
+    if (const JsonValue* nm = rec.find("noise_model"); nm && !Falsy(*nm)) {
+        if (nm->type != JsonValue::Arr) return false;
+        for (const JsonValue& b : nm->arr) {
+            double d = 0.0;
+            if (b.type != JsonValue::Obj || !b.find("nits") || !b.find("sigma_de") || !AsFloat(*b.find("nits"), d) ||
+                !AsFloat(*b.find("sigma_de"), d))
+                return false;
+            if (const JsonValue* sr = b.find("sigma_rel"); sr && sr->type != JsonValue::Null && !AsFloat(*sr, d)) return false;
+        }
+        r.noiseBands = (int)nm->arr.size();
+    }
+    double unused = 0.0;
+    if (!OptFloat(rec, "noise_floor_nits", r.noiseFloorNits) || !OptFloat(rec, "read_overhead_s", r.readOverheadS) ||
+        !OptFloat(rec, "settle_seconds", r.settleS) || !OptFloat(rec, "native_white_nits", r.whiteNits) ||
+        !OptFloat(rec, "sustained_peak_nits", r.sustainedPeakNits) || !OptFloat(rec, "native_black_nits", r.blackNits) ||
+        !OptFloat(rec, "eotf_undershoot", r.eotfUndershoot) || !OptFloat(rec, "warmup_minutes", r.warmupMinutes) ||
+        !OptFloat(rec, "fluctuation_envelope", unused) || !OptFloat(rec, "warmin_magnitude", unused) ||
+        !OptFloat(rec, "creep_rate_de_per_min", r.creepDePerMin) || !OptFloat(rec, "recommended_drift_threshold", unused) ||
+        !OptFloat(rec, "patch_window_area_pct", unused))
+        return false;
+    int ignored = 0;
+    if (!OptInt(rec, "warmup_reads_to_settle", ignored, 0) || !OptInt(rec, "thermal_tau_patches", ignored, 0) ||
+        !OptInt(rec, "recommended_neutral_interval", ignored, 0) || !OptInt(rec, "max_age_days", r.maxAgeDays, -1))
+        return false;
+    // settle_by_level / native_primaries: dict(x) when truthy.
+    for (const char* k : { "settle_by_level", "native_primaries" })
+        if (const JsonValue* v = rec.find(k); v && !Falsy(*v) && v->type != JsonValue::Obj) return false;
+    if (const JsonValue* sbl = Obj(&rec, "settle_by_level")) {
+        double d = 0.0;
+        if (const JsonValue* b = sbl->find("bright"); b && AsFloat(*b, d)) r.settleBrightS = d;
+        if (const JsonValue* k = sbl->find("dark"); k && AsFloat(*k, d)) r.settleDarkS = d;
+    }
+    if (const JsonValue* pr = Obj(&rec, "native_primaries")) {
+        auto xy = [pr](const char* c) {
+            const JsonValue* v = pr->find(c);
+            return v && v->type == JsonValue::Arr && v->arr.size() >= 2 && v->arr[0].type == JsonValue::Num &&
+                   v->arr[1].type == JsonValue::Num;
+        };
+        r.hasPrimaries = xy("R") && xy("G") && xy("B");
+    }
+    // native_white_xy: [float(v[0]), float(v[1])] when truthy.
+    if (const JsonValue* w = rec.find("native_white_xy"); w && !Falsy(*w)) {
+        if (w->type != JsonValue::Arr || w->arr.size() < 2 || !AsFloat(w->arr[0], r.whiteX) || !AsFloat(w->arr[1], r.whiteY))
+            return false;
+    }
+    // white_vs_luminance: rows of floats; warm_balance: floats.
+    if (const JsonValue* wl = rec.find("white_vs_luminance"); wl && !Falsy(*wl)) {
+        if (wl->type != JsonValue::Arr) return false;
+        size_t n = 0;
+        for (const JsonValue& row : wl->arr) if (!FloatList(&row, n) || row.type != JsonValue::Arr) return false;
+        r.whiteVsLuminance = (int)wl->arr.size();
+    }
+    size_t n = 0;
+    if (!FloatList(rec.find("warm_balance"), n)) return false;
+    if (const JsonValue* notes = rec.find("notes"); notes && !Falsy(*notes) && notes->type != JsonValue::Arr &&
+                                                      notes->type != JsonValue::Str && notes->type != JsonValue::Obj)
+        return false;   // list(x): any iterable
+    r.thermalRegime = OptStr(rec, "thermal_regime");
+    r.coldChannel = OptStr(rec, "cold_channel");
+    r.instrument = OptStr(rec, "instrument");
+    r.correctionFile = OptStr(rec, "correction_file");
+    r.made = OptStr(rec, "made");
+    r.updated = OptStr(rec, "updated");
+    r.peakByWindow = ParsePeakByWindow(rec);
+    return true;
+}
+
 }  // namespace
+
+double DipContrast(const DipRecord& r) {
+    if (!(std::isfinite(r.whiteNits) && r.whiteNits > 0.0 && std::isfinite(r.blackNits) && r.blackNits > 0.0)) return kNaN;
+    return r.whiteNits / r.blackNits;
+}
+
+int DipAgeDays(const DipRecord& r, const std::string& today) {
+    return r.made.empty() ? -1 : DaysBetween(r.made, today);
+}
+
+bool DipStale(const DipRecord& r, const std::string& today) {
+    if (r.made.empty() || DaysBetween(r.made, r.made) != 0) return true;   // no readable `made`: stale, as DLC says
+    if (DaysBetween(today, today) != 0) return true;                       // DLC: an unreadable date is stale
+    return DaysBetween(r.made, today) > (r.maxAgeDays >= 0 ? r.maxAgeDays : kDipDefaultMaxAgeDays);
+}
 
 DipStoreData ParseDipStore(const std::string& json) {
     DipStoreData out;
@@ -379,10 +566,22 @@ DipStoreData ParseDipStore(const std::string& json) {
     if (!displays) return out;
     out.readable = true;
     for (const auto& kv : displays->members) {
-        if (kv.second.type != JsonValue::Obj) continue;
-        const JsonValue* rr = kv.second.find("refresh_response");
-        if (!rr || rr->type == JsonValue::Null) continue;
-        out.refresh.push_back(ParseRefreshSection(kv.first, kv.second, *rr));
+        if (kv.second.type != JsonValue::Obj) {   // DLC cannot read it either
+            out.dropped.push_back(kv.first);
+            continue;
+        }
+        int refresh = -1;
+        if (const JsonValue* rr = kv.second.find("refresh_response"); rr && rr->type != JsonValue::Null) {
+            refresh = (int)out.refresh.size();
+            out.refresh.push_back(ParseRefreshSection(kv.first, kv.second, *rr));
+        }
+        DipRecord r;
+        if (!ParseDipRecord(kv.first, kv.second, r)) {
+            out.dropped.push_back(kv.first);
+            continue;
+        }
+        r.refresh = refresh;
+        out.records.push_back(std::move(r));
     }
     return out;
 }
