@@ -1023,7 +1023,6 @@ void ShowTrayMenu(HWND hwnd) {
         AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     }
     AppendMenu(hMenu, MF_STRING, ID_TRAY_SHOW, L"Show");
-    AppendMenu(hMenu, g_uiClassic ? (MF_STRING | MF_CHECKED) : MF_STRING, ID_TRAY_CLASSIC_UI, L"Classic interface");
     AppendMenu(hMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenu(hMenu, act::LiveLayersSuspended() ? (MF_STRING | MF_CHECKED) : MF_STRING, ID_TRAY_SUSPEND,
                L"Suspend live layers");
@@ -1092,14 +1091,7 @@ static void HookUnusableFallBackToOverlay(const std::wstring& why) {
     const std::wstring title = L"DWM Hook switched off: the overlay applies your corrections";
     const std::wstring detail = why + L"\n\nDWM Hook mode is now off and the overlay engine runs instead. "
                                       L"To try the hook again, switch DWM HOOK on in Settings.";
-    if (g_uiClassic) {   // unowned, on its own thread: never a modal box on the GUI thread (a pipe caller may wait on it)
-        std::thread([msg = title + L".\n\n" + detail]() {
-            MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
-                        MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-        }).detach();
-    } else {   // the new interface: a warning (the footer shows it in amber; Events has the detail)
-        notify::Post(notify::Sev::Warning, -1, L"hook", title, detail);
-    }
+    notify::Post(notify::Sev::Warning, -1, L"hook", title, detail);   // the footer shows it in amber; Events has the detail
     act::SetDwmHookMode(false);   // saves; restarts the live layers in overlay mode
     RequestWindowsToneMap(false); // whatever tone maps now decides what Auto reports
 }
@@ -1117,14 +1109,7 @@ static void HandleDwmHookStartFailed(HWND hwnd, bool noRetry) {
     const std::wstring firstLine = err.substr(0, err.find(L'\n'));
     if (IsCalibrationOrLiveEditActive()) {
         SetStatus(firstLine.c_str());
-        if (g_uiClassic) {   // unowned, on its own thread: never a modal box on the GUI thread (a pipe caller may wait)
-            std::thread([msg = err]() {
-                MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
-                            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-            }).detach();
-        } else {
-            notify::Post(notify::Sev::Error, -1, L"hook", firstLine, err);
-        }
+        notify::Post(notify::Sev::Error, -1, L"hook", firstLine, err);
         return;
     }
     if (noRetry) {
@@ -1474,39 +1459,45 @@ void SyncClassicGlobalControls() {
     if (StartupEnabledCached() >= 0) check(g_gui.hwndSettingsRunAtStartup, StartupEnabledCached() == 1);
 }
 
-// The classic window is the hub itself: restore it and bring it to the front.
-static void ShowClassicWindow() {
-    HWND hwnd = g_gui.hwndMain;
-    if (!hwnd) return;
-    SyncClassicGlobalControls();   // the other interface may have changed them
-    ShowWindow(hwnd, SW_RESTORE);
-    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    SetForegroundWindow(hwnd);
+UiShowFailureNotice DecideUiShowFailure(bool userAsked, bool balloonShown) {
+    UiShowFailureNotice n;
+    n.balloon = !balloonShown;     // once per failure streak: a startup that cannot open the window says so once
+    n.messageBox = userAsked;      // the user asked for the window and gets none: an answer they cannot miss
+    return n;
 }
 
-void ShowActiveUi() {
-    if (!g_uiClassic) {
-        RefreshHookRouting();   // the twins' routing as of now (it changes without a message: a pipe swap, a re-roll)
-        if (ui::Show()) return;
-        notify::Post(notify::Sev::Warning, -1, L"ui", L"Classic interface opened: the new one could not start");
-    }
-    ShowClassicWindow();
+static bool g_uiFailureBalloonShown = false;   // since the last time the window opened
+
+// A tray notification (the icon's balloon / toast). Fails quietly without a tray (Explorer not running).
+static void ShowTrayBalloon(const wchar_t* title, const std::wstring& text) {
+    NOTIFYICONDATA n = g_gui.nid;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_WARNING;
+    wcsncpy_s(n.szInfoTitle, title, _TRUNCATE);
+    wcsncpy_s(n.szInfo, text.c_str(), _TRUNCATE);
+    Shell_NotifyIcon(NIM_MODIFY, &n);
 }
 
-void SetInterfaceClassic(bool classic) {
-    if (classic != g_uiClassic) {
-        // Either window may hold an editor bound to the settings vector (the MHC dialogs, a pinned edit).
-        if (g_mhcEditDialogOpen.load() || g_monitorSettingsPins > 0) {
-            notify::Post(notify::Sev::Warning, -1, L"ui", L"Close the open editor first");
-            return;
-        }
-        g_uiClassic = classic;
-        SaveSettings();
-        if (classic) ui::Hide();
-        else ShowWindow(g_gui.hwndMain, SW_HIDE);
+void ShowActiveUi(bool userAsked) {
+    RefreshHookRouting();   // the twins' routing as of now (it changes without a message: a pipe swap, a re-roll)
+    std::wstring why;
+    if (ui::Show(&why)) {
+        g_uiFailureBalloonShown = false;
+        return;
     }
-    ShowActiveUi();
+    // No window (ui::Show posted the reason to Events and the log). Nothing else depends on it: the tray, the hotkeys,
+    // the pipe and everything the INI configures keep running, and the next Show tries again.
+    const UiShowFailureNotice n = DecideUiShowFailure(userAsked, g_uiFailureBalloonShown);
+    const std::wstring text = why + L". Your settings keep running; Show tries again.";
+    if (n.balloon) {
+        ShowTrayBalloon(L"DesktopLUT: the window could not start", text);
+        g_uiFailureBalloonShown = true;
+    }
+    if (n.messageBox) {   // unowned, on its own thread: never a modal box on the GUI thread (a pipe caller may wait on it)
+        std::thread([msg = L"The window could not start: " + text]() {
+            MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+        }).detach();
+    }
 }
 
 // ============================================================================
@@ -1893,7 +1884,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
     if (WM_SHOW_ACTIVE_UI && msg == WM_SHOW_ACTIVE_UI) {
-        if (!g_appShuttingDown.load()) ShowActiveUi();   // a relaunch during exit: nothing comes back
+        if (!g_appShuttingDown.load()) ShowActiveUi(true);   // a relaunch during exit: nothing comes back
         return 0;
     }
     // `DesktopLUT.exe /uninstall` asks a running instance to exit (it holds the hook and the profiles), and the
@@ -2507,14 +2498,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ShowVrrWhitelistDialog(hwnd);
             return 0;
 
-        case ID_TRAY_CLASSIC_UI:
-            SetInterfaceClassic(!g_uiClassic);
-            return 0;
         case ID_TRAY_FALD_VIEW:
             act::ClearFaldViews();
             return 0;
         case ID_TRAY_SHOW:
-            ShowActiveUi();
+            ShowActiveUi(true);
             return 0;
         case ID_TRAY_SUSPEND:
             act::SetLiveLayersSuspended(!act::LiveLayersSuspended());
@@ -2539,7 +2527,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (lParam == WM_RBUTTONUP) {
             ShowTrayMenu(hwnd);
         } else if (lParam == WM_LBUTTONUP) {
-            ShowActiveUi();
+            ShowActiveUi(true);
         }
         return 0;
 
@@ -3428,7 +3416,7 @@ int RunGUI() {
     StartMhcTransitionBurst(g_gui.hwndMain, "startup");
 
     // Only start minimized if user explicitly enabled the setting
-    if (!g_startMinimized.load()) ShowActiveUi();
+    if (!g_startMinimized.load()) ShowActiveUi(false);
     // If starting minimized, every window stays hidden (tray icon provides access)
 
     // Start the opt-in calibration control server (no-op unless explicitly enabled

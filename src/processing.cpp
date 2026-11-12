@@ -1307,17 +1307,11 @@ static void StartProcessingImpl() {
             std::wstring err = InjectDwmHook(dwmMonitors, &stagingWarning);
             if (err.empty() && !stagingWarning.empty()) {
                 // Injected, but a LUT file could not be read: that display runs without its cube.
-                // Same non-blocking dialog as an injection error (a pipe-driven start must not block).
+                // A warning, never a blocking dialog (a pipe-driven start must not block): the footer shows it in
+                // amber, Events has the detail.
                 SetStatus(L"Active (DWM Hook) - a LUT file could not be read");
-                if (g_uiClassic) {
-                    std::thread([msg = stagingWarning]() {
-                        MessageBoxW(nullptr, (msg + L"\n\nThat display runs without its 3D LUT.").c_str(),
-                                    L"DesktopLUT — DWM Hook", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-                    }).detach();
-                } else {   // the new interface: a warning (the footer shows it in amber; Events has the detail)
-                    notify::Post(notify::Sev::Warning, -1, L"hook", L"A 3D LUT file could not be read",
-                                 stagingWarning + L"\n\nThat display runs without its 3D LUT.");
-                }
+                notify::Post(notify::Sev::Warning, -1, L"hook", L"A 3D LUT file could not be read",
+                             stagingWarning + L"\n\nThat display runs without its 3D LUT.");
             }
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;

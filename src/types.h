@@ -115,7 +115,7 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_TRAY_EXIT        2004
 #define ID_TRAY_STARTUP     2005
 #define ID_TRAY_CALIBRATION 2006
-#define ID_TRAY_CLASSIC_UI  2007
+// 2007 was ID_TRAY_CLASSIC_UI ("Classic interface", removed with the classic window)
 #define ID_TRAY_FALD_VIEW   2008   // "End FALD view": shown only while a FALD view is on
 
 // Tab control

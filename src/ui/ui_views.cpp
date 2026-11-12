@@ -1521,18 +1521,7 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 void SettingsTwinRouting(const Snapshot& snap);   // ENGINE's last rows (below)
 
 void SettingsGeneral() {
-    RowCtx row = BeginRow("INTERFACE");
-    RowTip(row, "Classic: the previous window. The tray switches too.");
-    RowPlace(row);
-    static const char* const kUi[] = { "NEW", "CLASSIC" };
-    const int pick = Segmented("##set_ui", kUi, 2, g_uiClassic ? 1 : 0, 80);
-    if (pick >= 0) {
-        const bool classic = pick == 1;
-        Post([classic]() { SetInterfaceClassic(classic); });
-    }
-    EndRow(row);
-
-    row = BeginRow("THEME");
+    RowCtx row = BeginRow("THEME");
     RowTip(row, "Dark: Instrument. Gray: softer greys. Light: Windows 98 colours.");
     RowPlace(row);
     static const char* const kThemes[] = { "DARK", "GRAY", "LIGHT" };

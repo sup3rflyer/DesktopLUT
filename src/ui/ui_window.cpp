@@ -437,16 +437,23 @@ void* LogoTexture() { return g_logo; }
 
 HWND Window() { return g_hwnd; }
 
-bool Show() {
-    if (g_shutDown) return false;
+bool Show(std::wstring* why) {
+    if (g_shutDown) {
+        if (why) *why = L"DesktopLUT is exiting";
+        return false;
+    }
     if (!g_hwnd && !CreateUiWindow()) {
-        notify::Post(notify::Sev::Error, -1, L"ui", L"New interface could not be created");
+        const std::wstring text = L"Windows refused to create the window";
+        notify::Post(notify::Sev::Error, -1, L"ui", text);
+        if (why) *why = text;
         return false;
     }
     KillTimer(g_hwnd, kReleaseTimer);
     RefreshModeCache();
     if (!EnsureImGui()) {
-        notify::Post(notify::Sev::Error, -1, L"ui", L"New interface: no Direct3D device");
+        const std::wstring text = L"No Direct3D 11 device for the window";
+        notify::Post(notify::Sev::Error, -1, L"ui", text);
+        if (why) *why = text;
         return false;
     }
     if (IsIconic(g_hwnd)) ShowWindow(g_hwnd, SW_RESTORE);

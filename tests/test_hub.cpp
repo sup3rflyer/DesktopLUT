@@ -63,3 +63,19 @@ TEST_CASE("hub: the twin routing view") {
         CHECK(v.twins[3].how.empty());
     }
 }
+
+// The interface could not start (no Direct3D device): the hub keeps everything running and says so.
+TEST_CASE("hub: the window could not start: a balloon once per streak, a message box only when asked for") {
+    UiShowFailureNotice n = DecideUiShowFailure(false, false);   // startup, first failure
+    CHECK(n.balloon);
+    CHECK(!n.messageBox);
+    n = DecideUiShowFailure(false, true);                        // a later automatic attempt: nothing new
+    CHECK(!n.balloon);
+    CHECK(!n.messageBox);
+    n = DecideUiShowFailure(true, true);                         // the user's Show after the balloon
+    CHECK(!n.balloon);
+    CHECK(n.messageBox);
+    n = DecideUiShowFailure(true, false);                        // the user's Show is the first failure
+    CHECK(n.balloon);
+    CHECK(n.messageBox);
+}

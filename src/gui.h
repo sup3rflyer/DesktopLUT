@@ -34,11 +34,12 @@ void SelectMonitor(int index);
 // that display, the Start/Stop state, and the ImGui interface. GUI thread.
 void GuiNotifySettingsChanged(int mon);
 
-// The interface the user chose ([UI] Interface): tray Show / left click, a second launch, startup. When the
-// new interface cannot start (no window, no Direct3D device) the classic window opens instead. GUI thread.
-void ShowActiveUi();
-// Switch interfaces and remember the choice (refused while an editor holds the settings). GUI thread.
-void SetInterfaceClassic(bool classic);
+// Opens the interface: tray Show / left click and a second launch (userAsked), startup (not). When it cannot start
+// (no window, no Direct3D device) nothing else stops: the reason goes to Events / the log, a tray notification says so
+// once per failure streak, a message box only when the user asked; the next call tries again. GUI thread.
+void ShowActiveUi(bool userAsked);
+struct UiShowFailureNotice { bool balloon = false; bool messageBox = false; };
+UiShowFailureNotice DecideUiShowFailure(bool userAsked, bool balloonShown);   // pure, exposed for testing
 // Re-reads the global settings into the classic window's checkboxes (another interface changed them). GUI thread.
 void SyncClassicGlobalControls();
 

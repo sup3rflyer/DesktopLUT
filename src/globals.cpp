@@ -112,7 +112,6 @@ std::atomic<char> g_hotkeyGammaKey{ 'G' };         // Key for gamma toggle
 std::atomic<char> g_hotkeyHdrKey{ 'Z' };           // Key for HDR toggle
 std::atomic<char> g_hotkeyAnalysisKey{ 'X' };      // Key for analysis toggle
 std::atomic<bool> g_startMinimized{ false };       // Start minimized to tray
-bool g_uiClassic = false;                          // [UI] Interface (GUI thread)
 std::wstring g_dlcFolder;                          // [UI] DlcFolder (GUI thread)
 std::wstring g_dlcFolderLast;                      // [UI] DlcFolderLast (GUI thread)
 int g_uiTheme = 0;                                 // [UI] Theme (GUI thread)
