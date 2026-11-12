@@ -1319,22 +1319,13 @@ static void StartProcessingImpl() {
                 // Not running: activeSettings must not claim otherwise (it reads as "the user had it
                 // running" to the auto-restart paths and to SettingsChanged).
                 g_gui.activeSettings.clear();
-                // Status bar can only show a single short line — surface the full,
-                // actionable detail (e.g. the DwmHook.dll-missing guidance) in a dialog.
-                // Unowned, on its own thread: a pipe-driven start (layers.set / runtime.*)
-                // marshals to the GUI thread via WM_CALIB_CMD, and a modal box on that
-                // thread would block the caller for the full 60s timeout and leave a dialog
-                // nobody is there to click during an unattended calibration run.
-                std::wstring firstLine = err.substr(0, err.find(L'\n'));
-                SetStatus(firstLine.c_str());
-                if (g_uiClassic) {
-                    std::thread([msg = err]() {
-                        MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
-                                    MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-                    }).detach();
-                } else {   // the new interface: an error (the footer shows it in amber; Events has the detail)
-                    notify::Post(notify::Sev::Error, -1, L"hook", firstLine, err);
-                }
+                SetStatus(err.substr(0, err.find(L'\n')).c_str());
+                // What follows (one retry, then the fall-back to the overlay: dwm_hook_stability.h) switches the
+                // engine and starts the live layers again: not inside this start's transition. The GUI thread
+                // takes it from the posted message once the transition is over (gui.cpp WM_DWMHOOK_START_FAILED),
+                // and the user hears about it there: the notice and the Events entry carry this error.
+                g_dwmHookStartError = err;
+                if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_DWMHOOK_START_FAILED, 0, 0);
                 return;
             }
         }
@@ -1430,7 +1421,7 @@ static void StartProcessingImpl() {
 
         // Start DWM hook watchdog timer (detects DWM restart / hook loss)
         g_dwmHookWatchdogRetries = 0;
-        g_dwmHookReinjectCount = 0;
+        g_dwmHookStability.OnStart();
         if (g_gui.hwndMain)
             SetTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID, DWM_HOOK_WATCHDOG_INTERVAL_MS, nullptr);
 

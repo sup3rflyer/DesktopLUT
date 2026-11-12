@@ -101,6 +101,9 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define WM_FALD_EXEMPT_REFRESH   (WM_USER + 113)
 // Resolve each display's refresh-rate trim again (refresh_trim.h ReconcileRefreshTrim; any thread -> GUI thread).
 #define WM_REFRESH_TRIM          (WM_USER + 114)
+// A hook-mode start could not inject the DWM hook (g_dwmHookStartError says why): retry once, then fall back to the
+// overlay (dwm_hook_stability.h). Posted by StartProcessing, handled once its transition is over (GUI thread).
+#define WM_DWMHOOK_START_FAILED  (WM_USER + 120)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
 #define ID_TRAY_SHOW        2001
@@ -286,7 +289,9 @@ const int DWM_HOOK_WATCHDOG_MAX_RETRIES = 3;    // Max consecutive re-injection 
 const int DWM_HOOK_WATCHDOG_MAX_REINJECTS = 5;  // Max total re-injection cycles before declaring the hook unstable
                                                 // (guards against a succeed-then-lose flap loop that flashes the
                                                 // screen black — seen on some Windows 10 builds, see issue #3)
-const int DWM_HOOK_RESEND_TIMER_ID = 110;       // Drives shared-config resends after a modeset/HDR flip
+const int DWM_HOOK_START_RETRY_TIMER_ID = 125;  // A hook-mode start whose injection failed tries once more after
+const int DWM_HOOK_START_RETRY_MS = 5000;       //   this wait, then falls back to the overlay (dwm_hook_stability.h)
+const int DWM_HOOK_RESEND_TIMER_ID = 110;      // Drives shared-config resends after a modeset/HDR flip
 const int DWM_HOOK_RESEND_INTERVAL_MS = 2000;   // Resend spacing — hook needs 3 consecutive updates to
                                                 // accept an HDR flip; each resend re-enumerates DXGI fresh
 const int DWM_HOOK_BEACON_TIMER_ID = 111;       // Identity-beacon session: repaints the beacon squares

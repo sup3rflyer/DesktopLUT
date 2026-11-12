@@ -20,6 +20,7 @@
 #include "refresh_trim.h"
 #include "mhc.h"
 #include "dwm_inject.h"
+#include "dwm_hook_build.h"
 #include "analysis.h"
 #include "desktoplut_ipc_server.h"
 #include "monitor_identity.h"
@@ -1078,6 +1079,53 @@ static void HookUnusableFallBackToOverlay(const std::wstring& why) {
     RequestWindowsToneMap(false); // whatever tone maps now decides what Auto reports
 }
 
+// A hook-mode start could not inject the hook (StartProcessing posted WM_DWMHOOK_START_FAILED; its transition is
+// over). Before 3.0.1 that start just stopped with an error, although hook mode is the default on Windows 11 and the
+// README promised the overlay as the fall-back. Now: one retry after a short wait (a dwm.exe restarting at that
+// moment), then the watchdog's fall-back. Not during a calibration run or a live edit: no engine change under it, the
+// error is reported as before. GUI thread.
+static void HandleDwmHookStartFailed(HWND hwnd) {
+    const std::wstring err = g_dwmHookStartError;
+    if (!g_dwmHookMode.load() || g_gui.isRunning) return;   // the engine was switched, or a later start got through
+    const std::wstring firstLine = err.substr(0, err.find(L'\n'));
+    if (IsCalibrationOrLiveEditActive()) {
+        SetStatus(firstLine.c_str());
+        if (g_uiClassic) {   // unowned, on its own thread: never a modal box on the GUI thread (a pipe caller may wait)
+            std::thread([msg = err]() {
+                MessageBoxW(nullptr, msg.c_str(), L"DesktopLUT — DWM Hook",
+                            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
+            }).detach();
+        } else {
+            notify::Post(notify::Sev::Error, -1, L"hook", firstLine, err);
+        }
+        return;
+    }
+    if (g_dwmHookStability.OnStartFailed() == HookStartFailAction::Retry) {
+        std::wcout << L"[DWM Hook] Start failed (" << firstLine << L"): trying once more in "
+                   << DWM_HOOK_START_RETRY_MS / 1000 << L" s" << std::endl;
+        SetStatus(L"DWM Hook could not start: trying again");
+        SetTimer(hwnd, DWM_HOOK_START_RETRY_TIMER_ID, DWM_HOOK_START_RETRY_MS, nullptr);
+        return;
+    }
+    std::wcout << L"[DWM Hook] Start failed again: falling back to the overlay" << std::endl;
+    HookUnusableFallBackToOverlay(L"The hook could not be injected into the desktop compositor:\n" + err);
+}
+
+// The running dwmcore.dll is newer than anything this release's hook was verified against (or its pattern set has
+// no verified version): one Events entry per process, at the first injection. The Settings row shows it standing.
+static void ReportUnverifiedDwmcoreOnce() {
+    static bool s_reported = false;
+    if (s_reported) return;
+    s_reported = true;
+    const DwmHookBuildStatus& s = DwmHookBuildCheck();
+    if (!DwmHookBuildUntested(s)) return;
+    std::wcout << L"[DWM Hook] dwmcore.dll " << FormatDwmcoreVersion(s.running)
+               << L" is not among the verified versions (newest verified for this branch: "
+               << FormatDwmcoreVersion(s.verified) << L")" << std::endl;
+    notify::Post(notify::Sev::Warning, -1, L"hook", L"DWM Hook: not tested with this Windows update",
+                 DwmHookBuildDetail(s));
+}
+
 static bool AnyMhcProfileActive() {
     std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
     for (const auto& ms : g_gui.monitorSettings) {
@@ -1729,6 +1777,7 @@ static bool IgnoredDuringShutdown(UINT msg) {
     case WM_HOTKEY_REGISTER: case WM_SHOW_OSD: case WM_FALD_RECOMPOSE: case WM_DWMHOOK_INJECTED:
     case WM_MHC_PROFILE_REAPPLIED: case WM_SHADER_STATE_CHANGED: case WM_CALIB_CMD: case WM_MHC_REGENERATE_MISSING:
     case WM_MHC_RELOAD_HARDWARE: case WM_WINDOWS_TONEMAP: case WM_FALD_EXEMPT_REFRESH: case WM_REFRESH_TRIM:
+    case WM_DWMHOOK_START_FAILED:
         return true;
     default:
         return msg == WM_TASKBARCREATED;
@@ -1744,6 +1793,7 @@ static void KillAllGuiTimers(HWND hwnd) {
         FALD_RECOMPOSE_TIMER_ID, SDR_WHITE_CHECK_TIMER_ID, TOPOLOGY_PIPELINE_TIMER_ID, MHC_MATRIX_REBAKE_TIMER_ID,
         RENDER_HEALTH_TIMER_ID, RECONCILE_TIMER_ID, WINDOWS_TONEMAP_TIMER_ID, FALD_PANEL_VERDICT_TIMER_ID,
         REFRESH_TRIM_TIMER_ID,
+        DWM_HOOK_START_RETRY_TIMER_ID,
     };
     for (UINT_PTR id : kIds) KillTimer(hwnd, id);
 }
@@ -2467,6 +2517,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_DWMHOOK_INJECTED:  // DwmHook.dll just loaded into dwm.exe: name the twins positively
         StartDwmHookBeacon(hwnd, "injection");
         RequestFaldFullRecompose();   // prime the hook FALD layer's clean source
+        ReportUnverifiedDwmcoreOnce();
+        return 0;
+
+    case WM_DWMHOOK_START_FAILED:   // a hook-mode start could not inject (StartProcessing; its transition is over)
+        HandleDwmHookStartFailed(hwnd);
         return 0;
 
     case WM_SHADER_STATE_CHANGED:  // Shader active state changed (from render thread)
@@ -2783,7 +2838,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::vector<DwmHookMonitorLUT> dwmMonitors;
             if (!hookActive) dwmMonitors = DesiredDwmHookStagingSet();
             const act::WatchdogAction action = act::DecideHookWatchdog(
-                hookActive, g_dwmHookReinjectCount, DWM_HOOK_WATCHDOG_MAX_REINJECTS, dwmMonitors.empty());
+                hookActive, g_dwmHookStability.reinjects, DWM_HOOK_WATCHDOG_MAX_REINJECTS, dwmMonitors.empty());
             if (action == act::WatchdogAction::GiveUp) {
                 // Flap detector: a re-injection that "succeeds" (the hook's named
                 // event appears) but is then lost again next tick will loop forever,
@@ -2792,11 +2847,25 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // won't stay attached on this system (common on some Windows 10
                 // builds where the dwmcore offsets don't match). See issue #3.
                 KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                g_dwmHookStability.OnGiveUp();
                 std::cout << "[DWM Hook Watchdog] Hook keeps dropping after "
-                          << g_dwmHookReinjectCount << " re-injections — giving up to stop "
+                          << g_dwmHookStability.reinjects << " re-injections — giving up to stop "
                              "the re-injection flash loop. DWM Hook Mode is unreliable on "
                              "this system (common on Windows 10)." << std::endl;
                 HookUnusableFallBackToOverlay(L"The hook kept detaching from the desktop compositor.");
+                return 0;
+            }
+            // A detach (the hook was resident; not the retry of a failed re-injection): the slow-loop rule. A hook
+            // that dies every minute or so builds a healthy streak between deaths, so the flap cap above never
+            // trips; a count over minutes or hours does (dwm_hook_stability.h).
+            if (action == act::WatchdogAction::Reinject && g_dwmHookWatchdogRetries == 0 &&
+                g_dwmHookStability.OnDetach(GetTickCount64())) {
+                KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                std::cout << "[DWM Hook Watchdog] Hook detached "
+                          << g_dwmHookStability.DetachesWithin(GetTickCount64(), DwmHookStability::kDayLoopWindowMs)
+                          << " times within hours — giving up (slow crash loop)" << std::endl;
+                HookUnusableFallBackToOverlay(L"The hook kept detaching from the desktop compositor "
+                                              L"(again and again over minutes or hours).");
                 return 0;
             }
             if (action == act::WatchdogAction::StandDown) {
@@ -2816,9 +2885,9 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 std::cout << "[DWM Hook Watchdog] Hook lost (DWM restart?), attempting re-injection..." << std::endl;
                 std::wstring err = InjectDwmHook(dwmMonitors);
                 if (err.empty()) {
-                    g_dwmHookReinjectCount++;
+                    g_dwmHookStability.OnReinjected();
                     std::cout << "[DWM Hook Watchdog] Re-injection successful (cycle "
-                              << g_dwmHookReinjectCount << "/" << DWM_HOOK_WATCHDOG_MAX_REINJECTS
+                              << g_dwmHookStability.reinjects << "/" << DWM_HOOK_WATCHDOG_MAX_REINJECTS
                               << ")" << std::endl;
                     g_dwmHookWatchdogRetries = 0;
                     SetStatus(L"Active (DWM Hook)");
@@ -2829,6 +2898,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                                << L"): " << err << std::endl;
                     if (g_dwmHookWatchdogRetries >= DWM_HOOK_WATCHDOG_MAX_RETRIES) {
                         KillTimer(hwnd, DWM_HOOK_WATCHDOG_TIMER_ID);
+                        g_dwmHookStability.OnGiveUp();
                         std::cout << "[DWM Hook Watchdog] Max retries reached, giving up" << std::endl;
                         HookUnusableFallBackToOverlay(L"The hook was lost and could not be injected again:\n" + err);
                         return 0;
@@ -2844,13 +2914,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // stable and clear the flap counter, so rare legitimate DWM restarts over a
                 // long session don't slowly accumulate toward the give-up cap. A true flap
                 // re-injects on every tick and never builds a healthy streak this long.
-                static int s_dwmHookHealthyStreak = 0;
-                if (g_dwmHookReinjectCount > 0 && ++s_dwmHookHealthyStreak >= 6) {
-                    g_dwmHookReinjectCount = 0;
-                    s_dwmHookHealthyStreak = 0;
-                } else if (g_dwmHookReinjectCount == 0) {
-                    s_dwmHookHealthyStreak = 0;
-                }
+                // (A slow loop does build one: the detach count over hours catches it.)
+                g_dwmHookStability.OnHealthyTick();
                 // The flank fade governor's status changes the DLL reported (shared/fald_fade_governor.h): Events lines
                 FaldFadeGovPollHookEvents();
                 FaldCoreGovPollHookEvents();   // ... and the core layer's rate-cap governor's (shared/fald_core_governor.h)
@@ -2865,6 +2930,11 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         if (wParam == DWM_HOOK_BEACON_TIMER_ID) {
             TickDwmHookBeacon(hwnd);
+            return 0;
+        }
+        if (wParam == DWM_HOOK_START_RETRY_TIMER_ID) {   // the one retry of a failed hook-mode start
+            KillTimer(hwnd, DWM_HOOK_START_RETRY_TIMER_ID);
+            if (g_dwmHookMode.load() && !g_gui.isRunning) act::ReconcileLiveLayers("hook start retry");
             return 0;
         }
         if (wParam == MONITOR_IDENTITY_TIMER_ID) {

@@ -1522,9 +1522,19 @@ void SettingsGeneral() {
 void SettingsEngine(const Snapshot& snap, ViewState& vs) {
     bool v = false;
     RowCtx row = BeginRow("DWM HOOK");
-    RowTip(row, "3D LUT and tone mapping inside DWM: no overlay window.\nOff: the overlay applies them.");
+    RowTip(row, "3D LUT and tone mapping inside DWM: no overlay window.\n"
+                "While it runs, DWM composes every app, fullscreen games too:\n"
+                "no independent flip, VRR may be lost.\n"
+                "Off: the overlay applies them.");
     RowPlace(row);
     if (OnOff("##set_hook", snap.hookMode, &v)) Post([v]() { act::SetDwmHookMode(v); });
+    // This Windows' compositor is newer than anything the hook was verified against: it still runs (drawn without
+    // layout, nothing moves when it shows).
+    if (snap.hookMode && DwmHookBuildUntested(snap.hookBuild)) {
+        RowNext(row);
+        RowText(row, "UNTESTED WINDOWS UPDATE", pal::Alarm, Font::Label, kSizeLabel,
+                DwmHookBuildTooltip(snap.hookBuild));
+    }
     EndRow(row);
 
     row = BeginRow("INTERPOLATION");
@@ -1549,7 +1559,8 @@ void SettingsEngine(const Snapshot& snap, ViewState& vs) {
 
     auto listText = [](const std::wstring& raw) { return raw.empty() ? std::string("\xE2\x80\x94") : Utf8(raw); };
     row = BeginRow("PASSTHROUGH");
-    RowTip(row, "Hide the overlay while a whitelisted app runs (keeps G-Sync).");
+    RowTip(row, "Overlay mode: hide the overlay while a whitelisted app runs (keeps G-Sync).\n"
+                "No effect on the DWM hook: for VRR there, turn DWM HOOK off.");
     if (RowButtons(row, "set_vrr", { "WHITELIST" }) == 0) OpenWhitelist(vs, 2);
     RowPlace(row);
     if (OnOff("##set_vrr_on", g_vrrWhitelistEnabled.load(), &v)) Post([v]() { act::SetVrrWhitelistEnabled(v); });

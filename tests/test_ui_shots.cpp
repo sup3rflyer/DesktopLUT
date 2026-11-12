@@ -565,6 +565,9 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
         // 24: a DLC folder set in the INI that the scan did not find (shown as set, in amber).
         { "settingsdlcmissing", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 24 },
+        // 33: a Windows update newer than the hook was verified against (the DWM HOOK row's notice).
+        { "settingsuntested", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 33 },
+        { "settingsuntestednarrow", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 33 },
         { "mhcedit", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 1180, 760, 6 },
         { "mhceditsdr", ui::Page::Pipeline, ui::StageId::Primaries, 1, false, -1, -1, 1180, 760, 7 },
         { "mhceditnarrow", ui::Page::Pipeline, ui::StageId::Primaries, 0, false, -1, -1, 920, 520, 6 },
@@ -694,6 +697,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     snap.live[0].settings.windowsToneMap = WindowsToneMap::Panel;
                     snap.live[0].settings.hdrMHC.reportPeakMax = false;
                     snap.live[0].reportedPeakNits = 1729;
+                } else if (shot.variant == 33) {
+                    snap.hookBuild = MakeDwmHookBuildStatus(26200, MakeDwmcoreVersion(10, 0, 26100, 9400));
                 } else if (shot.variant == 24) {
                     auto data = std::make_shared<dlc::Data>();
                     data->configured = L"X:\\Moved\\DLC";   // the scan for it found nothing there

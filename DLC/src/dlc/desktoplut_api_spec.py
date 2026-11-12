@@ -154,7 +154,13 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                         "sent_path, sent_gen, want_path, status: staged|delivered|ingested|applied|refused|"
                         "build_failed|no_ack}]: the FALD panel file the DWM hook HOLDS per display and mode apart "
                         "from the one sent to it live (a client that switched files waits for status applied "
-                        "on the sent_gen runtime.set_fald_params returned as hook_gen).",
+                        "on the sent_gen runtime.set_fald_params returned as hook_gen). "
+                        "Builds from 2026-11-12 also carry dwmcore:{version:str|null (the running "
+                        "Windows' dwmcore.dll, e.g. '10.0.26100.9168'), verified_up_to:str|null (the newest "
+                        "dwmcore this DesktopLUT's hook was verified against for that Windows branch; null = "
+                        "none recorded), tested:bool}: tested false = the hook still runs on a compositor it "
+                        "was never checked on (a Windows update can tint the output instead of failing), so "
+                        "a run measuring through the hook should say so.",
                 "overlay": "object {awake:bool (the overlay render path is running and not auto-asleep), "
                            "dwm_hook_mode:bool}: which path renders what a meter sees. The awake FP16 "
                            "overlay reads 0.5-2.4 % below the sleeping one at low levels (DLC fald-lessons "

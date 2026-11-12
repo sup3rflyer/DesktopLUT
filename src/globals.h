@@ -4,6 +4,7 @@
 #pragma once
 
 #include "types.h"
+#include "dwm_hook_stability.h"
 #include <d3d11_4.h>
 #include <dcomp.h>
 #include <atomic>
@@ -106,7 +107,10 @@ extern std::atomic<bool> g_appShuttingDown;
 // (no seconds-long remote FreeLibrary inside the end-session budget). Other sessions' copies are still ejected.
 extern std::atomic<bool> g_sessionEnding;
 extern int g_dwmHookWatchdogRetries;           // Consecutive re-injection failures (GUI thread only)
-extern int g_dwmHookReinjectCount;             // Total re-injection cycles this run — flap detector (GUI thread only)
+// The hook's give-up rules: the flap cap, the slow-loop windows, the first-injection retry (dwm_hook_stability.h;
+// GUI thread only)
+extern DwmHookStability g_dwmHookStability;
+extern std::wstring g_dwmHookStartError;       // Why the last hook-mode start could not inject (GUI thread only)
 extern std::atomic<bool> g_hookBeaconActive;       // Identity-beacon session running (beacon windows shown)
 extern std::atomic<uint32_t> g_hookBeaconGeneration; // Incremented per session; the DLL probes each twin once per generation
 extern int g_dwmHookConfigResends;             // Countdown of extra shared-config resends after a topology
