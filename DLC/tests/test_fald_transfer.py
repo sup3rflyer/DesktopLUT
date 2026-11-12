@@ -84,20 +84,20 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert np.array_equal(matrix("BT2020_TO_BT709"), M.BT2020_TO_BT709)
     panel = re.search(r"float3 PanelNits\(float3 scrgb\) \{(.*?)\n\}", src, re.S).group(1)
     assert "transfer == 1u" in panel and "pow(" in panel and "sdrGamma" in panel and "80.0f" in panel
-    # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43); the temporal drive state fills 44-47,
-    # the black-frame LED boost word 34 (step count) and 48-51 (zone activation rule), starfield balancing word 35 (on)
-    # and 52-65 (its parameters), the panel clock (temporal mode 3, work guide C13) 66-71, the boost's zone rule (C12b)
-    # 72-74 + the fade stack switch (75, fadeFlags: bit 0 = ASF10 + T11_TMTC, 2026-10-20), the zone lattice's extent
+    # the CB carries transfer / sdrGamma at the words FillCB writes (31 and 43); 44-47 are 0 (LED lag modes 1 / 2's,
+    # removed 2026-11-12), the black-frame LED boost word 34 (step count) and 48-51 (zone activation rule), starfield
+    # balancing word 35 (on) and 52-65 (its parameters), the panel clock (temporal mode 3, work guide C13) 66-71, the boost's
+    # zone rule (C12b) 72-74 + word 75 = 0 (the flank fade's flags until 2026-11-12), the zone lattice's extent
     # (fractional pitch, docs/fald-fractional-pitch.md)
     # 76/77 + two pads — FALD_CB_BYTES 320 = 80 words
     cb = re.search(r"cbuffer FaldCB : register\(b0\) \{(.*?)\n\};", src, re.S).group(1)
     fields = re.findall(r"(?:uint|float) (\w+);", cb)
     assert len(fields) == 80 and fields[31] == "transfer" and fields[43] == "sdrGamma"
-    assert fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "fadeFlags"]
+    assert fields[72:76] == ["boostRule", "boostMeanGamma", "boostMeanThresh", "_pad75"]
     assert fields[76:80] == ["latW", "latH", "_pad78", "runMode"]   # word 79: the change-driven path's run mode (2026-10-22)
     assert fields[64:68] == ["starTargetSigma", "starKeepNits", "clkW0", "clkW1"]
     assert fields[68:72] == ["clkTrue0", "clkEst0", "clkTrue1", "clkEst1"]
-    assert fields[44:48] == ["tempAlphaRise", "tempAlphaFall", "tempMode", "tempInit"]
+    assert fields[44:48] == ["_pad44", "_pad45", "_pad46", "_pad47"]
     assert fields[34] == "boostN" and fields[48:52] == ["boostLitNits", "boostLitFrac", "boostDimNits", "boostDimFrac"]
     assert fields[35] == "starOn" and fields[52:64] == ["starEven", "starRetired53", "starTargetGain", "starCapNits", "starStrength",
                                                         "starAreaLo", "starAreaHi", "starPeakHi", "starNbLo", "starNbHi",
@@ -111,7 +111,7 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "f[64] = sc.targetSigma; f[65] = sc.keepNits;" in cpp
     assert "f[66] = r->clkW[0]; f[67] = r->clkW[1];" in cpp
     assert "f[68] = r->clkFactor[0]; f[69] = r->clkFactor[1]; f[70] = r->clkFactor[2]; f[71] = r->clkFactor[3];" in cpp
-    assert "u[75] = r->fadeOn ? FALD_FADE_FLAG_FLANK : 0u;" in cpp                 # fadeFlags (bit 1 = L, reserved, never set)
+    assert "u[75] = 0u;" in cpp and "u[44] = 0u; u[45] = 0u; u[46] = 0u; u[47] = 0u;" in cpp   # the retired words
     # ... and the DWM hook's (dwm_hook/hook_fald.cpp; its starfield settings come from the tuning tail `t`)
     hook = _HOOK.read_text(encoding="utf-8")
     assert "u[35] = m->starOn ? 1u : 0u;" in hook
@@ -121,7 +121,7 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "f[64] = t.starTargetSigma; f[65] = t.starKeepNits;" in hook
     assert "f[66] = m->clkW[0]; f[67] = m->clkW[1];" in hook
     assert "f[68] = m->clkFactor[0]; f[69] = m->clkFactor[1]; f[70] = m->clkFactor[2]; f[71] = m->clkFactor[3];" in hook
-    assert "u[75] = m->fadeOn ? FALD_FADE_FLAG_FLANK : 0u;" in hook
+    assert "u[75] = 0u;" in hook and "u[44] = 0u; u[45] = 0u; u[46] = 0u; u[47] = 0u;" in hook   # the retired words
     decl = re.search(r"float starNbLo; float starNbHi; (\w+) starReach; (\w+) starEvenReach;", cb)
     assert decl.groups() == ("uint", "uint")
 
@@ -304,11 +304,11 @@ def test_faldcb_offsets_reported_by_the_hlsl_compiler_match_fillcb():
     # the word each HLSL name must sit at = where FillCB puts that quantity (semantic pairs, spot-checked by name)
     named = {"frameW": 0, "rows": 3, "roundIdx": 7, "curveN": 12, "white": 13, "area0": 15, "gainMin": 19, "driveFloor": 21,
              "debugMode": 24, "originX": 25, "blurDir": 27, "transfer": 31, "lumFadeLo": 32, "boostN": 34, "starOn": 35,
-             "tminR": 36, "pedMode": 39, "sdrGamma": 43, "tempAlphaRise": 44, "tempInit": 47, "boostLitNits": 48,
+             "tminR": 36, "pedMode": 39, "sdrGamma": 43, "_pad44": 44, "_pad47": 47, "boostLitNits": 48,
              "boostDimFrac": 51, "starEven": 52, "starCapNits": 55, "starStrength": 56, "starPeakHi": 59, "starNbLo": 60,
              "starReach": 62, "starEvenReach": 63, "starTargetSigma": 64, "starKeepNits": 65, "clkW0": 66, "clkW1": 67,
              "clkTrue0": 68, "clkEst0": 69, "clkTrue1": 70, "clkEst1": 71, "boostRule": 72, "boostMeanGamma": 73,
-             "boostMeanThresh": 74, "fadeFlags": 75, "latW": 76, "latH": 77, "_pad78": 78, "runMode": 79}
+             "boostMeanThresh": 74, "_pad75": 75, "latW": 76, "latH": 77, "_pad78": 78, "runMode": 79}
     for shader, target in (("g_faldPixelSource", "ps_5_0"), ("g_faldStatSource", "cs_5_0"), ("g_faldStarStatSource", "cs_5_0"),
                            ("g_faldStarPlanSource", "cs_5_0"), ("g_faldConvSource", "cs_5_0"), ("g_faldPanelClockSource", "cs_5_0"),
                            ("g_faldGainSource", "cs_5_0"), ("g_faldBlurSource", "cs_5_0"),    # the two-channel gain (C15)

@@ -199,11 +199,8 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     out: dict[str, Any] = {"fald_params_path": path, "fald_debug_mode": int(entry.get("debug_mode", 0)),
                            "fald_ped_mode": int(entry.get("ped_mode", 0)), "fald_ped_colour_in_file": False,
                            "fald_boost_in_file": _fald_file_has_boost(Path(path)) if path else False,   # FLD4 boost LUT (C12)
-                           # temporal drive state (2026-09-17, work guide H5 / item 4a): persisted like ped_mode
+                           # LED lag (persisted like ped_mode): 0 off / 3 panel clock (modes 1 / 2 removed 2026-11-12)
                            "fald_temporal_mode": int(entry.get("temporal_mode", 0)),
-                           "fald_tau_rise_ms": float(entry.get("tau_rise_ms", 0.0)),
-                           "fald_tau_fall_ms": float(entry.get("tau_fall_ms", 0.0)),
-                           "fald_delay_frames": int(entry.get("delay_frames", 0)),
                            # temporal mode 3 "panel clock" (2026-09-20, work guide C13): closure per tick + tick parity
                            "fald_temporal_closure": float(entry.get("closure", 0.72)),
                            "fald_temporal_parity": int(entry.get("parity", -1))}
@@ -211,15 +208,10 @@ def _fald_state_keys(entry: dict[str, Any] | None) -> dict[str, Any]:
     star = _fald_star(entry)
     out["fald_starfield"] = star["enabled"]
     out.update({f"fald_star_{k}": v for k, v in star.items() if k != "enabled"})
-    # the frozen fade stack (2026-10-20; runtime.fald_flank_fade) and item L (reserved, no setter)
-    # the always-on core's rule (shared/fald_core_mode.h; the default KC5 = 4 — the 2026-10-23 fill re-run + live blind test;
-    # runtime.fald_core_mode switches to the test modes 0 C / 1 KC2c / 2 KC3; 3 reserved for KC4)
-    out["fald_core_mode"] = int(entry.get("core_mode", 4))
-    out["fald_core_mode_name"] = {0: "C", 1: "KC2c", 2: "KC3", 3: "KC4 (reserved)", 4: "KC5"}.get(out["fald_core_mode"], "?")
-    out["fald_flank_fade"] = bool(entry.get("flank_fade", False))
-    out["fald_low_ext"] = False
-    # the fade's GPU safety governor (2026-10-22): the mock renders nothing, so an enabled fade has no report yet
-    out["fald_flank_fade_governor"] = {"state": "unknown" if out["fald_flank_fade"] else "off", "forced": False}
+    # the always-on core's rule (shared/fald_core_mode.h): KC5 = 4, the only rule that ships (the A/B test modes, their
+    # runtime.fald_core_mode and the flank fade's state fields went 2026-11-12)
+    out["fald_core_mode"] = 4
+    out["fald_core_mode_name"] = "KC5"
     transfer = _fald_file_transfer(Path(path)) if path else None
     if transfer is not None:
         out["fald_file_transfer"] = transfer
@@ -988,42 +980,31 @@ class MockDesktopLutServer:
             return self.ok({"monitor_mode": key, "debug_mode": fs.get("debug_mode", 0), "ped_mode": fs.get("ped_mode", 0),
                             "ped_colour_in_file": False})      # mock: no panel file is ever parsed
         if method == "runtime.fald_temporal":
-            # C++ DoFaldTemporal (2026-09-17): the shader's per-cell drive state (LED-lag filter), persisted per mode
-            tm = params.get("temporal_mode"); tr = params.get("tau_rise_ms"); tf = params.get("tau_fall_ms")
-            df = params.get("delay_frames"); cl = params.get("closure"); pa = params.get("parity")
+            # C++ DoFaldTemporal: LED lag, 0 off / 3 the panel clock, persisted per mode; refusals word for word (the
+            # first-order modes 1 / 2 with their tau / delay and the plain-mean parity -2 were removed 2026-11-12)
+            for gone in ("tau_rise_ms", "tau_fall_ms", "delay_frames"):
+                if gone in params:
+                    return DesktopLutResponse(ok=False, error=f"{gone} was removed with temporal modes 1 / 2 (only 0 off and 3 panel clock remain)")
+            tm = params.get("temporal_mode"); cl = params.get("closure"); pa = params.get("parity")
             num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-            if not (num(tm) or num(tr) or num(tf) or num(df) or num(cl) or num(pa)):
-                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1|-2)")
-            if num(tm) and tm not in (0, 1, 2, 3):
-                return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)")
-            for name, v in (("tau_rise_ms", tr), ("tau_fall_ms", tf)):
-                if num(v) and not (0.0 <= v <= 5000.0):
-                    return DesktopLutResponse(ok=False, error=f"{name} must be 0..5000 ms")
-            if num(df) and df not in (0, 1, 2, 3):
-                return DesktopLutResponse(ok=False, error="delay_frames must be 0..3")
+            if not (num(tm) or num(cl) or num(pa)):
+                return DesktopLutResponse(ok=False, error="missing parameter: temporal_mode (0|3), closure (0.05..1) or parity (-1|0|1)")
+            if num(tm) and tm not in (0, 3):
+                return DesktopLutResponse(ok=False, error="temporal_mode must be 0 (off) or 3 (panel clock)")
             if num(cl) and not (0.05 <= cl <= 1.0):
                 return DesktopLutResponse(ok=False, error="closure must be 0.05..1")
-            if num(pa) and pa not in (-1, 0, 1, -2):     # -2 = unknown, the plain mean of both clocks (the A/B's test arm)
-                return DesktopLutResponse(ok=False, error="parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)")
+            if num(pa) and pa not in (-1, 0, 1):
+                return DesktopLutResponse(ok=False, error="parity must be -1 (unknown), 0 or 1")
             if num(tm):
                 fs["temporal_mode"] = int(tm)
-            if num(tr):
-                fs["tau_rise_ms"] = float(tr)
-            if num(tf):
-                fs["tau_fall_ms"] = float(tf)
-            if num(df):
-                fs["delay_frames"] = int(df)
             if num(cl):
                 fs["closure"] = float(cl)
             if num(pa):
                 fs["parity"] = int(pa)
             from dlc.fald.paneltime import MODE_PANEL, settle_refreshes
-            from dlc.fald.temporal import settle_frames
-            rise = float(fs.get("tau_rise_ms", 0.0)); fall = float(fs.get("tau_fall_ms", 0.0)); delay = int(fs.get("delay_frames", 0))
             mode_now = int(fs.get("temporal_mode", 0)); closure = float(fs.get("closure", 0.72))
-            settle = settle_refreshes(closure) if mode_now == MODE_PANEL else settle_frames(rise, fall, 1000.0 / 60.0, delay)
-            return self.ok({"monitor_mode": key, "temporal_mode": mode_now, "tau_rise_ms": rise, "tau_fall_ms": fall,
-                            "delay_frames": delay, "closure": closure, "parity": int(fs.get("parity", -1)),
+            settle = settle_refreshes(closure) if mode_now == MODE_PANEL else 0
+            return self.ok({"monitor_mode": key, "temporal_mode": mode_now, "closure": closure, "parity": int(fs.get("parity", -1)),
                             "settle_frames_60hz": settle})
         if method == "runtime.fald_starfield":
             # C++ DoFaldStarfield (2026-09-19, work guide S1): starfield balancing, partial updates, persisted per mode.
@@ -1054,25 +1035,6 @@ class MockDesktopLutServer:
                 return DesktopLutResponse(ok=False, error="nb_hi must be >= nb_lo")
             fs["star"] = st
             return self.ok({"monitor_mode": key, **_fald_star(fs)})
-        if method == "runtime.fald_core_mode":
-            # C++ DoFaldCoreMode (branch fald/principled): runtime only, never saved; refusals word for word
-            if "core" not in params:
-                return DesktopLutResponse(ok=False, error="missing parameter: core")
-            cm = params.get("core")
-            if isinstance(cm, bool) or not isinstance(cm, (int, float)):
-                return DesktopLutResponse(ok=False, error="core must be a number")
-            if cm not in (0, 1, 2, 4):              # the table's known modes (3 = KC4 reserved): the C++ text generated from it
-                return DesktopLutResponse(ok=False, error="core must be 0, 1, 2 or 4")
-            fs["core_mode"] = int(cm)
-            return self.ok({"monitor_mode": key, "core": cm})
-        if method == "runtime.fald_flank_fade":
-            # C++ DoFaldFlankFade (2026-10-20): the frozen fade stack's switch, persisted per mode; refusals word for word
-            if "enabled" not in params:
-                return DesktopLutResponse(ok=False, error="missing parameter: enabled")
-            if not isinstance(params.get("enabled"), bool):
-                return DesktopLutResponse(ok=False, error="enabled must be a boolean")
-            fs["flank_fade"] = params["enabled"]
-            return self.ok({"monitor_mode": key, "enabled": params["enabled"]})
         if method == "runtime.fald_dump":
             d = str(params.get("dir") or "")
             if not d:

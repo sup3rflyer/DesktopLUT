@@ -120,10 +120,8 @@ def test_mock_serves_every_spec_method_with_spec_result_shape(tmp_path):
         ("runtime.fald_dump", {"monitor": 0, "mode": "SDR", "dir": str(tmp_path)}),   # the live mode (set_hdr off above)
         ("runtime.set_fald_params", {"monitor": 0, "mode": "SDR", "params_path": str(_write_fald_panel(tmp_path / "sdr.bin", "gamma"))}),
         ("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4}),
-        ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120}),
+        ("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 3, "closure": 0.72}),
         ("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "enabled": True, "even": 0.8, "even_reach": 6}),
-        ("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": True}),
-        ("runtime.fald_core_mode", {"monitor": 0, "mode": "SDR", "core": 2}),
         ("layers.set", {**mm, "fald": True}),
         ("layers.set", {**mm, "fald": False}),
         ("mhc.remove", mm),
@@ -331,26 +329,25 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     client.call("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(empty4)})
     assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_boost_in_file"] is False
     client.call("runtime.set_fald_params", {"monitor": 0, "mode": "HDR", "params_path": str(pq)})
-    # temporal drive state (2026-09-17): persisted per mode, reported in layers[key], refusals word for word
-    tmp = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 40, "tau_fall_ms": 120})
-    assert tmp.ok and tmp.result["temporal_mode"] == 1 and tmp.result["tau_rise_ms"] == 40.0 and tmp.result["tau_fall_ms"] == 120.0
-    assert tmp.result["settle_frames_60hz"] == 36                                      # ceil(5 * 120 / 16.667)
-    only_tau = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "tau_fall_ms": 0})
-    assert only_tau.ok and only_tau.result["temporal_mode"] == 1 and only_tau.result["tau_fall_ms"] == 0.0
+    # LED lag: 0 off / 3 the panel clock, persisted per mode, reported in layers[key], refusals word for word; the first-
+    # order modes 1 / 2 (tau_rise_ms / tau_fall_ms / delay_frames) and the plain-mean parity -2 were removed 2026-11-12
+    tmp = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 3})
+    assert tmp.ok and tmp.result["temporal_mode"] == 3 and set(tmp.result) == {"monitor_mode", "temporal_mode", "closure", "parity",
+                                                                                "settle_frames_60hz"}
     st = client.call("state.get", {}).result
-    assert st["layers"]["0:SDR"]["fald_temporal_mode"] == 1 and st["layers"]["0:SDR"]["fald_tau_rise_ms"] == 40.0
-    assert st["layers"]["0:HDR"]["fald_temporal_mode"] == 0 and st["layers"]["0:HDR"]["fald_tau_rise_ms"] == 0.0   # per mode
-    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 4}), raise_on_error=False)
-    assert not bad.ok and bad.error == "temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)"
-    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "tau_rise_ms": 9000}), raise_on_error=False)
-    assert not bad.ok and bad.error == "tau_rise_ms must be 0..5000 ms"
+    assert st["layers"]["0:SDR"]["fald_temporal_mode"] == 3 and st["layers"]["0:HDR"]["fald_temporal_mode"] == 0   # per mode
+    for gone in ("fald_tau_rise_ms", "fald_tau_fall_ms", "fald_delay_frames"):
+        assert gone not in st["layers"]["0:SDR"], gone
+    for mode in (1, 2, 4):
+        bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": mode}), raise_on_error=False)
+        assert not bad.ok and bad.error == "temporal_mode must be 0 (off) or 3 (panel clock)"
+    for gone in ("tau_rise_ms", "tau_fall_ms", "delay_frames"):
+        bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", gone: 0}), raise_on_error=False)
+        assert not bad.ok and bad.error == f"{gone} was removed with temporal modes 1 / 2 (only 0 off and 3 panel clock remain)"
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR"}), raise_on_error=False)
     assert not bad.ok and bad.error.startswith("missing parameter: temporal_mode")
-    dl = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "delay_frames": 2})
-    assert dl.ok and dl.result["delay_frames"] == 2 and dl.result["settle_frames_60hz"] == 12 + 2   # tau_fall is 0 now: 5*40/16.667 = 12, + delay
-    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_delay_frames"] == 2
-    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "delay_frames": 4}), raise_on_error=False)
-    assert not bad.ok and bad.error == "delay_frames must be 0..3"
+    off = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "SDR", "temporal_mode": 0})
+    assert off.ok and off.result["settle_frames_60hz"] == 0
     # temporal mode 3 "panel clock" (2026-09-20, work guide C13): closure + parity, defaults 0.72 / -1 (unknown), per mode
     st3 = client.call("state.get", {}).result["layers"]
     assert st3["0:HDR"]["fald_temporal_closure"] == 0.72 and st3["0:HDR"]["fald_temporal_parity"] == -1
@@ -363,22 +360,22 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert only_closure.ok and only_closure.result["closure"] == 0.5 and only_closure.result["settle_frames_60hz"] == 24
     st3 = client.call("state.get", {}).result["layers"]
     assert st3["0:HDR"]["fald_temporal_mode"] == 3 and st3["0:HDR"]["fald_temporal_closure"] == 0.5 and st3["0:HDR"]["fald_temporal_parity"] == 1
-    assert st3["0:SDR"]["fald_temporal_mode"] == 1 and st3["0:SDR"]["fald_temporal_closure"] == 0.72                # per mode
+    assert st3["0:SDR"]["fald_temporal_mode"] == 0 and st3["0:SDR"]["fald_temporal_closure"] == 0.72                # per mode
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "closure": 0.01}), raise_on_error=False)
     assert not bad.ok and bad.error == "closure must be 0.05..1"
     bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 2}), raise_on_error=False)
-    assert not bad.ok and bad.error == "parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)"
-    ab = client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": -2})   # the A/B's plain-mean arm (2026-10-23)
-    assert ab.ok and ab.result["parity"] == -2
-    client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": 1})
+    assert not bad.ok and bad.error == "parity must be -1 (unknown), 0 or 1"
+    bad = client.send(DesktopLutCommand("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "parity": -2}), raise_on_error=False)
+    assert not bad.ok and bad.error == "parity must be -1 (unknown), 0 or 1"                 # the removed plain-mean arm
     assert client.call("state.get", {}).result["layers"]["0:HDR"]["fald_temporal_closure"] == 0.5                   # a refusal stores nothing
     client.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 0, "closure": 0.72, "parity": -1})
     # ... and the C++ handler carries the same refusals word for word
     if CPP_SERVER.exists():
         cpp = CPP_SERVER.read_text(encoding="utf-8", errors="replace")
-        for text in ("temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)", "closure must be 0.05..1",
-                     "parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)",
-                     "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1|-2)"):
+        for text in ("temporal_mode must be 0 (off) or 3 (panel clock)", "closure must be 0.05..1",
+                     "parity must be -1 (unknown), 0 or 1",
+                     "missing parameter: temporal_mode (0|3), closure (0.05..1) or parity (-1|0|1)",
+                     " was removed with temporal modes 1 / 2 (only 0 off and 3 panel clock remain)"):
             assert text in cpp, text
     # starfield balancing (2026-09-19, work guide S1): partial updates, persisted per mode, reported in layers[key]
     st0 = client.call("state.get", {}).result["layers"]["0:SDR"]
@@ -424,33 +421,22 @@ def test_fald_layer_is_per_mode_with_transfer_check(tmp_path):
     assert not bad.ok and client.call("state.get", {}).result["layers"]["0:SDR"]["fald_star_even"] == 0.7
     pair = client.call("runtime.fald_starfield", {"monitor": 0, "mode": "SDR", "area_lo": 200, "area_hi": 300, "enabled": False})
     assert pair.ok and pair.result["area_lo"] == 200.0 and pair.result["area_hi"] == 300.0 and pair.result["enabled"] is False
-    # the frozen fade stack ASF10 + T11_TMTC (2026-10-20): one switch per mode, default off; item L reserved (no setter)
+    # the flank fade (its switch, item L, its governor) and the core's A/B switch were removed 2026-11-12: no verb, no
+    # state field; the core reports KC5, the rule that ships
     st0 = client.call("state.get", {}).result["layers"]
-    assert st0["0:SDR"]["fald_flank_fade"] is False and st0["0:SDR"]["fald_low_ext"] is False
-    ff = client.call("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": True})
-    assert ff.ok and ff.result == {"monitor_mode": "0:SDR", "enabled": True}
-    st1 = client.call("state.get", {}).result["layers"]
-    assert st1["0:SDR"]["fald_flank_fade"] is True and st1["0:HDR"]["fald_flank_fade"] is False        # per mode
-    # the fade's GPU safety governor (2026-10-22): its state per pair; 'unknown' = on, no report (nothing rendered yet)
-    assert st0["0:SDR"]["fald_flank_fade_governor"]["state"] == "off"
-    assert st1["0:SDR"]["fald_flank_fade_governor"]["state"] in ("unknown", "running", "suspended_budget",
-                                                                   "suspended_weak_gpu", "forced")
-    assert st1["0:HDR"]["fald_flank_fade_governor"]["state"] == "off"
-    assert isinstance(st1["0:SDR"]["fald_flank_fade_governor"]["forced"], bool)
-    for bad_params, text in (({}, "missing parameter: enabled"), ({"enabled": 1}, "enabled must be a boolean")):
-        bad = client.send(DesktopLutCommand("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", **bad_params}), raise_on_error=False)
-        assert not bad.ok and bad.error == text, (bad_params, bad.error)
-    assert client.call("state.get", {}).result["layers"]["0:SDR"]["fald_flank_fade"] is True            # a refusal stores nothing
-    client.call("runtime.fald_flank_fade", {"monitor": 0, "mode": "SDR", "enabled": False})
+    for gone in ("fald_flank_fade", "fald_low_ext", "fald_flank_fade_governor"):
+        assert gone not in st0["0:SDR"] and gone not in st0["0:HDR"], gone
+    assert st0["0:SDR"]["fald_core_mode"] == 4 and st0["0:SDR"]["fald_core_mode_name"] == "KC5"
+    for verb in ("runtime.fald_flank_fade", "runtime.fald_core_mode"):
+        assert verb not in _spec_methods(), verb
+        bad = client.send(DesktopLutCommand(verb, {"monitor": 0, "mode": "SDR", "enabled": True, "core": 4}), raise_on_error=False)
+        assert not bad.ok, verb
     if CPP_SERVER.exists():
         cpp = CPP_SERVER.read_text(encoding="utf-8", errors="replace")
-        fn = re.search(r"\nvoid DoFaldFlankFade\(.*?\n\}", cpp, re.S).group(0)
-        for text in ('"missing parameter: enabled"', '"enabled must be a boolean"', "fs.flankFade = en->b;", "SaveSettings();",
-                     "FaldPropagate(mon, isHDR);"):
-            assert text in fn, text
-        assert 'l.set("fald_flank_fade", JBool(fs.flankFade));' in cpp and 'l.set("fald_low_ext", JBool(fs.lowExt));' in cpp
-        assert 'l.set("fald_flank_fade_governor", gj);' in cpp and 'gj.set("state", JStr(FaldFadeGovStateName(gov.state)));' in cpp
-        assert 'gj.set("state", JStr(fs.flankFade ? "unknown" : "off"));' in cpp
+        for gone in ("runtime.fald_flank_fade", "runtime.fald_core_mode", "fald_flank_fade", "fald_low_ext", "fald_tau_rise_ms",
+                     "fald_delay_frames"):
+            assert f'"{gone}"' not in cpp, gone
+        assert 'l.set("fald_core_mode_name", JStr(FaldCoreModeName(fs.coreMode)));' in cpp
     dbg9 = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 12})
     assert dbg9.ok and dbg9.result["debug_mode"] == 9                                    # clamped to the last view
     dbg = client.call("runtime.fald_debug", {"monitor": 0, "mode": "SDR", "debug_mode": 4})

@@ -311,12 +311,12 @@ def test_hlsl_boost_passes_mirror_the_reference():
     common, stat, conv, pixel = (part(n) for n in ("g_faldCommonSource", "g_faldStatSource", "g_faldConvSource", "g_faldPixelSource"))
     assert "float lumFadeLo; float lumFadeHi; uint boostN; uint starOn;" in common                # CB word 34 (35: S1)
     assert "float boostLitNits; float boostLitFrac; float boostDimNits; float boostDimFrac;" in common   # CB words 48-51
-    assert common.index("uint tempMode; uint tempInit;") < common.index("float boostLitNits;")
+    assert common.index("uint _pad44; uint _pad45; uint _pad46; uint _pad47;") < common.index("float boostLitNits;")
     for reg in ("boostLut    : register(t12)", "activeTex   : register(t13)", "boostTex    : register(t14)"):
         assert reg in common
     # stat pass: counts on the frame the panel receives (after Correct in round 1), raw max channel, strict '>'
-    # FadePost: the fade stack (fadeFlags 0 = req as it is); CoreGain: the always-on core (fald_core2.h; identity with the core off)
-    corrected = "img = FadePost(Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py))), img, int2((int)px, (int)py));"
+    # CoreGain: the always-on core (fald_core2.h; identity with the core off)
+    corrected = "img = Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py)));"
     assert stat.index(corrected) < stat.index("if (mc > boostLitNits) lit++;")
     assert "float mc = max(img.r, max(img.g, img.b));" in stat and "if (mc > boostDimNits) dim++;" in stat
     # the second criterion is the file's zone rule since C12b (tests/test_fald_zone_rule.py): rule 0 = DIM, as before
@@ -349,12 +349,12 @@ def test_hlsl_boost_passes_mirror_the_reference():
     assert "FALD_CB_BYTES = 320" in h and f"FALD_BOOST_MAX_STEPS = {BOOST_MAX_STEPS}" in h   # 80 words since the lattice extent (fractional pitch, 2026-10-19)
     assert "FALD_MAGIC4 = 0x464C4434u;" in loader and "if (magic == FALD_MAGIC4) return 104 * 4;" in loader   # FLD4 = 416 B
     assert "std::ceil((double)lo * z - (1e-3 + 1e-6 * z))" in loader     # panelfile.boost_zone_threshold's twin
-    for cpp, v, p in ((c, "r", "panel"), (hook, "m", "trun.panel")):   # both paths read the file with the shared loader
+    for cpp, v in ((c, "r"), (hook, "m")):   # both paths read the file with the shared loader
         assert "LoadFaldPanelParams(" in cpp
         assert f"FillCB({v}, 0, 0, false);" in cpp and f"RunConv({v}, {v}->driveSRV, {v}->driveSRV, nullptr);" in cpp
         assert "RunBoost(" not in cpp                                      # the statistic pass finishes the boost (2026-10-22)
         # (2026-10-22: the sweep, then the decide pass that finishes the round's boost, then the convolution that reads it;
-        # the kernels' maps by round, the panel clock's one map for both rounds — mapSrv's clockMaps)
-        assert cpp.index(f"RunStat({v}, 0);") < cpp.index(f"RunDecide({v}, 0, partial);") < cpp.index(f"RunConv({v}, mapSrv(trun.trueMap, 0, {p}), mapSrv(trun.estMap, 0, {p}), {v}->boostSRV[0]")
-        assert cpp.index(f"RunStat({v}, 1);") < cpp.index(f"RunDecide({v}, 1, partial);") < cpp.index(f"RunConv({v}, mapSrv(trun.trueMap, 1, {p}), mapSrv(trun.estMap, 1, {p}), {v}->boostSRV[1]")
+        # the kernels' maps by round, the panel clock's one map for both rounds)
+        assert cpp.index(f"RunStat({v}, 0);") < cpp.index(f"RunDecide({v}, 0, partial);") < cpp.index(f"RunConv({v}, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), {v}->boostSRV[0]")
+        assert cpp.index(f"RunStat({v}, 1);") < cpp.index(f"RunDecide({v}, 1, partial);") < cpp.index(f"RunConv({v}, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), {v}->boostSRV[1]")
         assert f"{v}->boostCountUAV, nullptr," in cpp and f"{v}->boostCountUAV, {v}->boostUAV[which & 1u], {v}->changeFlagsUAV, {v}->argsUAV" in cpp

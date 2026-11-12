@@ -246,7 +246,7 @@ def test_overlay_tracker_forces_starfield_balancing_off_and_restores_it():
     must never go through it. It is a persisted owner setting, so the tracker switches it off and puts it back."""
     ctl = CalibrationController.mock()
     ctl.call("runtime.fald_starfield", {"monitor": 1, "mode": "SDR", "enabled": True, "even": 0.7, "strength": 0.6, "even_reach": 5})
-    ctl.call("runtime.fald_temporal", {"monitor": 1, "mode": "SDR", "temporal_mode": 1, "tau_rise_ms": 80})
+    ctl.call("runtime.fald_temporal", {"monitor": 1, "mode": "SDR", "temporal_mode": 3})
     tr = FP.OverlayTracker(_TrackerSession(ctl), 1, "SDR")
     layers = ctl.state()["layers"]["1:SDR"]
     assert layers["fald_starfield"] is False and layers["fald_temporal_mode"] == 0      # both forced off for the reads
@@ -259,15 +259,15 @@ def test_overlay_tracker_forces_starfield_balancing_off_and_restores_it():
     assert ctl.state()["layers"]["1:HDR"]["fald_starfield"] is False                     # the other mode was never on
     tr.restore()
     layers = ctl.state()["layers"]["1:SDR"]
-    assert layers["fald_starfield"] is True and layers["fald_star_even"] == 0.7 and layers["fald_temporal_mode"] == 1
+    assert layers["fald_starfield"] is True and layers["fald_star_even"] == 0.7 and layers["fald_temporal_mode"] == 3
     res = StageResult("t")
     tr.report(res, "rings")
     assert not res.anomalies and any("starfield balancing was ON" in n for n in res.notes)
 
 
 def test_overlay_tracker_forces_the_panel_clock_off_and_restores_mode_closure_and_parity():
-    """Work guide C13: temporal mode 3 (panel clock) is a temporal mode like 1 / 2 — a measuring phase must read the
-    STATELESS layer — and the owner's closure / parity must come back with the mode."""
+    """Work guide C13: temporal mode 3 (panel clock) — a measuring phase must read the STATELESS layer — and the owner's
+    closure / parity must come back with the mode."""
     ctl = _RefusingCtl(CalibrationController.mock(), refuse=())
     ctl.call("runtime.fald_temporal", {"monitor": 0, "mode": "HDR", "temporal_mode": 3, "closure": 0.6, "parity": 1})
     tr = FP.OverlayTracker(_TrackerSession(ctl), 0, "HDR")
@@ -284,7 +284,8 @@ def test_overlay_tracker_forces_the_panel_clock_off_and_restores_mode_closure_an
     sent = [p for m, p in ctl.calls if m == "runtime.fald_temporal"][-1]
     assert sent == {"monitor": 0, "mode": "HDR", "temporal_mode": 3, "closure": 0.6, "parity": 1}
     assert not tr.reasons
-    # a build that does not report closure / parity (pre-2026-09-20) is restored with the mode alone
+    # a build that does not report closure / parity (pre-2026-09-20; it still had the first-order mode 1) is restored
+    # with the mode alone, whatever else its report carries
     class _OldBuild:
         def __init__(self):
             self.calls = []

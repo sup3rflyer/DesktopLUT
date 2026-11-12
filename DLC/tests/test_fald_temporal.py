@@ -274,17 +274,16 @@ def test_panel_file_reader_refuses_what_the_cpp_loader_refuses(tmp_path):
 
 
 @pytest.mark.skipif(not _SHADER.exists(), reason="DesktopLUT C++ tree not next to DLC")
-def test_hlsl_temporal_pass_mirrors_the_reference():
+def test_the_shipped_layer_has_no_first_order_pass_and_its_kernels_read_their_maps():
+    """The first-order filter this module models (LED lag modes 1 / 2, pass 1b) was REJECTED as the panel's law by the
+    2026-09-19/20 camera measurement and removed from DesktopLUT 2026-11-12: the model stays here as research (and
+    led_step_fit uses its step response), but nothing ships to mirror any more."""
     src = _SHADER.read_text(encoding="utf-8")
-    body = re.search(r'g_faldTemporalSource = R"\((.*?)\)";', src, re.S).group(1)
-    assert "if (tempInit != 0u) o = d;" in body                                          # no state: copy (DriveState.peek)
-    assert "float a = (d > s) ? tempAlphaRise : tempAlphaFall;" in body                  # per-edge blend
-    assert "o = s + a * (d - s);" in body and "driveFiltOut[id.xy] = o;" in body        # (compared on the partial path first)
-    assert "stateTex.Load" in body and "driveTex.Load" in body
+    assert "g_faldTemporalSource" not in src and "tempAlphaRise" not in src and "stateTex" not in src
     conv = re.search(r'g_faldConvSource = R"\((.*?)\)";', src, re.S).group(1)
     assert "ConvRow(driveTex, kTrue," in conv and "ConvRow(driveEstTex, kEst," in conv    # true / est kernels on their own maps
     assert "ConvRow(driveTex, kEst" not in conv and "ConvRow(driveEstTex, kTrue" not in conv
-    assert "register(t10)" in src and "register(t11)" in src
+    assert "register(t10)" in src and "register(t11)" not in src
 
 
 # ------------------------------------------------------------------------------------------ measuring the LED law
