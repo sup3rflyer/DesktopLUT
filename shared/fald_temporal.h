@@ -74,6 +74,36 @@ constexpr double FALD_CLOCK_LOCK_GAIN = 0.08;                // steady gain of t
 // clamp gives back part of the plain mean's surround-flicker gain beside small bright moving objects. Swept 0.05 / 0.1 /
 // 0.2 / 0.35 offline under both parities (0.1 best); HLSL pass 1c.
 constexpr float FALD_CLOCK_ROBUST_CAP = 0.1f;
+// THE CLOCK AT REST (2026-11-13; the owner's decision on the panel clock's idle cost). The clock's target is the
+// previous run's round-1 drives, and those come from a picture the clock's own maps corrected: a loop, and in finite
+// arithmetic one without a fixed point. The drive is read from the curve texture through a bilinear sampler whose weight
+// has 8 fractional bits, so it is a staircase of the zone statistic (steps of 2.6e-5 .. 4.7e-5 of the drive on the
+// PA32UCXR's curve); a zone whose statistic sits on a stair edge has its target toggle between the two adjacent stairs,
+// the clocks' states chase it, the maps move, and the picture with them — for ever, on a desktop that stands still
+// (measured: 2 .. 28 zones of 2304, the output 300 .. 8000 components by one FP16 step; the pattern repeats exactly
+// after 2 runs with two or more refreshes between runs, after 12 .. 210 and more runs at one refresh per run, where the
+// states integrate — a sigma-delta loop). Every run of it is a full run of the layer.
+// The rule: a clock run first WATCHES (pass 1c-0, FaldPanelClockWatchCS). Per zone it keeps the target last seen, the
+// distinct one before it, and how often in a row the target went back to the one before it while the content stood
+// still (A, B, A, B: two returns, the changes committed by runs without new content: nothing but the loop moved them;
+// a third value, or a change a run WITH new content committed, starts over). Two returns make a pair — one is what a
+// decaying transient does at a clamp. The zone is confined when both clocks' states lie between the pair's two
+// targets, ends included — or, without a pair, equal the target bit for bit. When EVERY zone is confined the clock is
+// AT REST for this run: pass 1c writes nothing — the states and both maps stand, no change is flagged, the change-driven
+// path takes the present. Nothing is tuned: the comparisons are exact, the interval is the one the shipped arithmetic
+// itself toggles across. While at rest the maps do not move, so the loop is open and the target stands still too; the
+// first run whose committed target differs in any zone (the content moved a drive) finds that zone's states off its
+// target and the clock runs again, at once and from the states it rested with. Elapsed time does not end a rest: a
+// settled panel stays settled (the pass's blends are exactly 1 after a long pause for the same reason).
+// What it changes in the picture: at the run that comes to rest, nothing (the standing maps are the previous run's, as
+// the unheld arithmetic made them); afterwards the unheld layer would have kept toggling inside the same per-zone
+// intervals, so no zone's map is further from the unheld layer's than that zone's own toggle step. Seeding runs, the
+// first clock run after one (its maps are not written yet) and g_faldClockRestOverride == 0 never rest.
+constexpr uint32_t FALD_CLOCK_REST_ALLOWED = 1u;   // CB word 45 bit 0: pass 1c may rest this run
+constexpr uint32_t FALD_CLOCK_REST_RESET = 2u;     // bit 1: the watch pass starts its per-zone levels over (after a seed)
+constexpr uint32_t FALD_CLOCK_REST_STILL = 4u;     // bit 2: no run with new content committed the target since the last watch
+// Test seam (both hosts; tests only): -1 = the rule (the shipped default), 0 = the clock never rests (the unheld layer).
+extern int g_faldClockRestOverride;
 // (Parity -2, the PLAIN mean of the two clocks — the unknown parity before 2026-10-23 and the losing arm of the owner's
 // 2026-10-24 blind A/B — was a pipe-only test value until 2026-11-12; it now reads as -1 like any other value.)
 // Closure into FALD_CLOCK_CLOSURE_MIN..MAX (NaN -> the default); parity into -1 / 0 / 1 (anything else -> -1).
@@ -117,6 +147,15 @@ struct FaldTemporalState {
     bool clkSeeded = false;                  // the last run (re-)seeded the clocks: the stateless layer, no clock pass
     float clkFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };   // CB words 68-71 of the last run: aTrue_0, aEst_0, aTrue_1, aEst_1
     float clkW[2] = { 0.5f, 0.5f };                     // CB words 66-67: the clocks' weights
+    // the clock at rest (above FALD_CLOCK_REST_ALLOWED)
+    uint32_t clkRunSeq = 0;                  // CB word 44: the number of the last clock run (1, 2, ...; 0 = none yet)
+    uint32_t clkRestFlags = 0;               // CB word 45 of the last clock run (FALD_CLOCK_REST_*)
+    uint32_t clkArmSeq = 0;                  // clkRunSeq when the settle hold was last (re-)armed
+    uint32_t clkRestSeq = 0;                 // the newest clock run a readback reported (0 = none)
+    bool clkLevelsValid = false;             // the watch pass's per-zone levels stand for the committed state (else: reset)
+    bool clkTargetFromContent = false;       // a run with new content committed the target since the last clock run
+    bool clkRestKnown = false;               // clock run clkRestSeq was at rest (a readback: a few runs late)
+    unsigned long long clkRestRuns = 0;      // the clock runs readbacks reported at rest (the log, the tests)
 };
 
 // Per-run bookkeeping of the panel clock (the caller passes the run's QPC time): applies the reset rules and the time
@@ -132,6 +171,14 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
 // frame's round-1 drives become the next target (ALWAYS: on k = 0 the later frame replaces the earlier one on the panel).
 struct FaldClockPlan { bool runPass; bool bindMaps; bool seedStates; bool commitPrev; };
 FaldClockPlan FaldPanelClockPlan(bool seeded, unsigned long long elapsed);
+// The clock at rest, per clock run (the callers: RunPanelClock of both hosts). Begin: numbers the run and sets
+// clkRunSeq / clkRestFlags for the CB — before the watch and the clock dispatch. Note: what the GPU decided for clock run
+// `seq`, read back without waiting some runs later (lastOutSeq = the watch pass's "a zone was not confined" mark, flags
+// = that run's CB word 45): keeps clkRestSeq / clkRestKnown / clkRestRuns and ENDS THE SETTLE HOLD when the clock rested
+// on a run after the hold was armed — that run saw the target the arming frame committed and found nothing to do, so
+// more presents of the still desktop would show nothing new (the host stops kicking DWM). Returns "at rest".
+void FaldClockRestBegin(FaldTemporalState* r);
+bool FaldClockRestNote(FaldTemporalState* r, uint32_t lastOutSeq, uint32_t seq, uint32_t flags);
 // Settle-hold accounting after a run (pure): rearm (new content / a resume) = the full hold; otherwise the hold pays the
 // ELAPSED REFRESHES (a k = 0 run pays nothing, one slow run pays k); never above `settle`.
 void FaldSettleAccount(FaldTemporalState* r, bool rearm, unsigned int settle);
@@ -166,6 +213,9 @@ struct FaldTemporalRun {
 // create its clock textures (mode 3 runs as off otherwise). refreshMs: the monitor's nominal refresh period (mode 3's grid).
 FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSettings& s, bool clockTexturesOk,
                                      long long nowQpc, long long qpcFreq, float refreshMs);
+// Test seam (both hosts; tests only, like g_faldCoreHoldOverride): non-zero = the time FaldTemporalBeginRun uses in place
+// of its caller's QPC reading, so a test SETS the refreshes elapsed between two runs instead of waiting for them.
+extern long long g_faldTestNowQpc;
 // End of a run, AFTER the caller has done the copies the plan implies: clock.seedStates — the round-1 drive into both
 // clock states, clock.commitPrev — the round-1 drive into clkPrev. Does the settle accounting; newContent = the frame is
 // new content (not a re-run for the settle hold).

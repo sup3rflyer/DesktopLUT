@@ -197,6 +197,7 @@ enum FaldHookPass : unsigned int {
     FALD_HP_CLEAN_COPY = 0,   // FaldUpdateClean: this present's rects, back buffer -> the clean copy
     FALD_HP_PREDECIDE,        // the "frame changed everywhere" word's copy + the decide before any sweep
     FALD_HP_STAR_S0, FALD_HP_STAR_S0_FULL, FALD_HP_DECIDE_STAR, FALD_HP_STAR_S1, FALD_HP_STAR_S2,
+    FALD_HP_CLOCK_WATCH,      // pass 1c-0: is every zone's clock confined (shared/fald_temporal.h: the clock at rest)
     FALD_HP_CLOCK,
     FALD_HP_STAT0, FALD_HP_STAT0_FULL, FALD_HP_DECIDE0, FALD_HP_CORE_ZONE, FALD_HP_CONV0, FALD_HP_GAIN0, FALD_HP_CORE_CAP0,
     FALD_HP_STAT1, FALD_HP_STAT1_FULL, FALD_HP_DECIDE1, FALD_HP_CONV1, FALD_HP_GAIN1, FALD_HP_CORE_CAP1,
@@ -218,4 +219,16 @@ unsigned int FaldTestLastRunKind(const FaldMonitor* m);
 // sub-offsets per thread of the variant in use.
 unsigned int FaldTestConvTuneState(const FaldMonitor* m);
 unsigned int FaldTestConvSo(const FaldMonitor* m);
+// The clock at rest (shared/fald_temporal.h): the watch pass's words (4 uints: the last clock run with a zone not
+// confined, the last clock run's number, its flags, 0) and its per-zone levels (cols * rows float4) for a test's own
+// readback; what the entry's non-blocking readbacks have reported so far (clock runs at rest; the newest run reported
+// and whether it rested); the settle hold's refreshes still owed.
+ID3D11Buffer* FaldTestClockRestWords(FaldMonitor* m);
+ID3D11Buffer* FaldTestClockLevels(FaldMonitor* m);
+unsigned long long FaldTestClockRestRuns(const FaldMonitor* m);
+unsigned int FaldTestClockRestSeq(const FaldMonitor* m);
+bool FaldTestClockRestKnown(const FaldMonitor* m);
+unsigned int FaldTestClockRunSeq(const FaldMonitor* m);
+unsigned int FaldTestSettleLeft(const FaldMonitor* m);
+ID3D11Texture2D* FaldTestClockTex(FaldMonitor* m, unsigned int which);   // 0 / 1 the clocks' states, 2 the target, 3 B_true's map, 4 B_est's
 #endif

@@ -68,6 +68,7 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
     if (!r->stateValid) {
         r->clkOriginQpc = nowQpc; r->clkTimeMs = 0.0; r->clkGridMs = 0.0; r->clkResidual = 0.0; r->clkGain = 0.0;
         r->clkLockRuns = 0; r->clkIndex = 0; r->clkElapsed = 0; r->clkSeeded = true;
+        r->clkLevelsValid = false; r->clkRestKnown = false;                   // (the clock at rest: the levels start over)
         r->stateValid = true;
         FaldPanelClockFactors(0, 1, closure, parity, r->clkFactor, r->clkW);   // (weights for the dump; the pass does not run)
         return true;
@@ -88,6 +89,7 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
     if (n == 0ull) {
         // still inside the seeding refresh: the later frame replaces the seed (the grid keeps locking meanwhile)
         r->clkElapsed = 0; r->clkSeeded = true;
+        r->clkLevelsValid = false; r->clkRestKnown = false;
         return true;
     }
     if (k > 0ull) FaldPanelClockFactors(r->clkIndex, k, closure, parity, r->clkFactor, r->clkW);   // k = 0: the previous
@@ -111,9 +113,34 @@ void FaldSettleAccount(FaldTemporalState* r, bool rearm, unsigned int settle) {
 // ---------------------------------------------------------------------------------------------------------------------
 // One run, start to end (moved out of src/fald.cpp FaldRunPasses unchanged in behaviour)
 // ---------------------------------------------------------------------------------------------------------------------
+long long g_faldTestNowQpc = 0;
+int g_faldClockRestOverride = -1;
+
+void FaldClockRestBegin(FaldTemporalState* r) {
+    if (++r->clkRunSeq == 0u) { r->clkRunSeq = 1u; r->clkLevelsValid = false; r->clkArmSeq = 0u; r->clkRestSeq = 0u; }   // (wrapped: start over)
+    uint32_t f = 0u;
+    if (!r->clkLevelsValid) f |= FALD_CLOCK_REST_RESET;                       // the first clock run after a seed: its maps
+    else if (g_faldClockRestOverride != 0) f |= FALD_CLOCK_REST_ALLOWED;      // are not written yet, so it never rests
+    if (!r->clkTargetFromContent) f |= FALD_CLOCK_REST_STILL;
+    r->clkRestFlags = f;
+    r->clkLevelsValid = true;
+    r->clkTargetFromContent = false;
+}
+bool FaldClockRestNote(FaldTemporalState* r, uint32_t lastOutSeq, uint32_t seq, uint32_t flags) {
+    if (seq == 0u || seq > r->clkRunSeq || (r->clkRestSeq != 0u && seq <= r->clkRestSeq)) return false;   // stale / not ours
+    const bool rest = (flags & FALD_CLOCK_REST_ALLOWED) != 0u && lastOutSeq != seq;
+    r->clkRestSeq = seq; r->clkRestKnown = rest;
+    if (rest) {
+        r->clkRestRuns++;
+        if (seq > r->clkArmSeq) r->settleLeft = 0;
+    }
+    return rest;
+}
+
 FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSettings& s, bool clockTexturesOk,
                                      long long nowQpc, long long qpcFreq, float refreshMs) {
     FaldTemporalRun run = {};
+    if (g_faldTestNowQpc != 0) nowQpc = g_faldTestNowQpc;
     // dt = the interval between consecutive runs while rendering continuously (EMA over 2..100 ms intervals; a long
     // static gap keeps the last estimate — the response starts at the new frame, however long the desktop stood still)
     run.resumed = false;
@@ -156,8 +183,12 @@ void FaldTemporalEndRun(FaldTemporalState* r, const FaldTemporalRun& run, bool n
     // loop may run faster than the panel refreshes (k = 0 runs pay nothing) or slower (one run pays k). A resume after a
     // gap (> FALD_RESUME_GAP_MS since the last run: the desktop stood still past the hold, or the layer was asleep) counts
     // as new content too — the first frame after it may carry a change the pass blends from the settled state.
-    if (run.panel) FaldSettleAccount(r, newContent || run.resumed, FaldPanelClockSettleFrames(r->clkClosure));
-    else r->settleLeft = 0;
+    if (run.panel) {
+        FaldSettleAccount(r, newContent || run.resumed, FaldPanelClockSettleFrames(r->clkClosure));
+        // the clock at rest: which clock runs come after this arming, and whether new content committed the target
+        if (newContent || run.resumed) r->clkArmSeq = r->clkRunSeq;
+        if (run.clock.commitPrev && newContent) r->clkTargetFromContent = true;
+    } else r->settleLeft = 0;
 }
 
 bool FaldTemporalSettlePending(const FaldTemporalState* r) {
@@ -169,4 +200,5 @@ void FaldTemporalIdle(FaldTemporalState* r) {
     r->stateValid = false;
     r->settleLeft = 0;
     r->lastRunQpc = 0;
+    r->clkLevelsValid = false; r->clkRestKnown = false;
 }

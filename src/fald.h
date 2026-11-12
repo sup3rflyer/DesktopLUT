@@ -23,6 +23,7 @@
 #include "../shared/fald_exempt.h"   // FaldExemptRect: DesktopLUT's own windows, exempt from the FALD views
 #include "../shared/fald_core_governor.h"   // the core layer's rate-cap governor (FaldResources::coreGov)
 #include "../shared/fald_change.h"          // the change-driven path: touched zones, the rules, the argument slots
+#include "../shared/fald_clock_rest.h"      // the panel clock at rest: its buffers and their readback (FaldResources::clkRest)
 #include "../shared/fald_conv_tune.h"       // the conv pass's variant auto-tune (FaldResources::convTune)
 
 struct MonitorContext;
@@ -83,6 +84,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* clkStateTex[2] = {}; ID3D11UnorderedAccessView* clkStateUAV[2] = {}; ID3D11ShaderResourceView* clkStateSRV[2] = {};
     ID3D11Texture2D* clkPrevTex = nullptr; ID3D11UnorderedAccessView* clkPrevUAV = nullptr; ID3D11ShaderResourceView* clkPrevSRV = nullptr;
     ID3D11Texture2D* clkEstTex = nullptr;  ID3D11UnorderedAccessView* clkEstUAV = nullptr;  ID3D11ShaderResourceView* clkEstSRV = nullptr;
+    FaldClockRestGpu clkRest;              // the clock at rest (shared/fald_clock_rest.h): made with the clock textures
     bool clkFailLogged = false;
     unsigned int clkRetryCounter = 0;        // frames since the clock textures failed to create (retry every ~300, like Build)
     // panel tables

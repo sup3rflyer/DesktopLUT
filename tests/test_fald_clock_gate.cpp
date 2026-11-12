@@ -232,6 +232,10 @@ TEST_CASE("FALD panel clock gate: a scheduled mode-3 sequence hashes as on main,
     const std::string cellDir = CkEnv("FALD_TEST_FADE_DIR");
     if (cellDir.empty()) return;
     const std::string record = CkEnv("FALD_TEST_CLOCK_RECORD"), ref = CkEnv("FALD_TEST_CLOCK_REF");
+    // FALD_TEST_CLOCK_REST=0: the clock never rests (shared/fald_temporal.h g_faldClockRestOverride) — the unheld
+    // arithmetic, whatever the schedule. Without it the gate runs the layer AS SHIPPED; on this schedule (no still stretch
+    // longer than two presents) the clock never comes to rest, which the case asserts, so both give the same manifest.
+    struct RestSeam { RestSeam(bool off) { g_faldClockRestOverride = off ? 0 : -1; } ~RestSeam() { g_faldClockRestOverride = -1; } } restSeam(CkEnv("FALD_TEST_CLOCK_REST") == "0");
     const std::string periodEnv = CkEnv("FALD_TEST_CLOCK_PERIOD_MS");
     const float periodMs = periodEnv.empty() ? 2000.0f : (float)std::atof(periodEnv.c_str());
     REQUIRE(periodMs >= 100.0f);
@@ -254,7 +258,7 @@ TEST_CASE("FALD panel clock gate: a scheduled mode-3 sequence hashes as on main,
 #ifdef FALD_RUN_HAS_RECTS
         CkLayer part(w, C, W, H, cfg.star, cfg.parity, periodMs, -1);   // the change-driven path by its rules
         REQUIRE(part.ok);
-        int partialRuns = 0, clockRuns = 0;
+        int partialRuns = 0, clockRuns = 0, restRuns = 0;
 #endif
         std::vector<uint16_t> frame;
         unsigned long long key = 5000;
@@ -296,11 +300,14 @@ TEST_CASE("FALD panel clock gate: a scheduled mode-3 sequence hashes as on main,
                 CHECK_MESSAGE(rp->lastPartial == expectPartial, id << " (" << std::string(s.what) << "): partial " << rp->lastPartial << ", expected " << expectPartial);
                 if (rp->lastPartial) partialRuns++;
                 if (!rp->clkSeeded && rp->clkElapsed >= 1ull) clockRuns++;
+                restRuns += (int)(rp->clkRestRuns + full.ctx.fald->clkRestRuns);   // (cumulative: only its being 0 matters)
             }
 #endif
         }
 #ifdef FALD_RUN_HAS_RECTS
         MESSAGE(std::string(cfg.name) << ": " << partialRuns << " of " << kStepCount << " runs partial, " << clockRuns << " clock runs");
+        // the manifest pins the UNHELD arithmetic only while no run of this schedule rests (see FALD_TEST_CLOCK_REST above)
+        CHECK_MESSAGE(restRuns == 0, std::string(cfg.name) << ": a clock run of the gate's schedule came to rest - the manifest no longer pins the unheld pass alone");
 #endif
     }
     MESSAGE(man.size() << " manifest lines");
