@@ -105,9 +105,61 @@ struct DipRefreshSection {
     std::vector<DipRefreshRate> rates;
     std::string error;                     // non-empty: present but unusable, and why
 };
+// ---- dip_store.json: every record, summarised (the DLC tab's PANEL card) --------------------------------------------
+// What DLC has measured about one display in one mode (dip.py DisplayInstrumentProfile). Read-only: DesktopLUT never
+// writes the DIP. A number DLC has not measured (absent or null) stays NaN, a word or a date stays empty.
+constexpr int kDipDefaultMaxAgeDays = 180;      // dip.py is_stale's default_max_age_days (a record may set its own)
+
+// peak_by_window (HDR, the "ABL graph": the light the panel holds per window size). Its JSON is not final, so only
+// its presence and its measured date are read. Extension point: the steps ({area_pct, early_nits, sustained_nits,
+// min_nits, tau_s, n}), identity, run id and conditions belong in this struct, read by ParsePeakByWindow in
+// dlc_data.cpp; their chart belongs to the PANEL card's PEAK BY WINDOW row (PanelCard in ui_dlc.cpp).
+struct DipPeakByWindow {
+    bool present = false;                  // the record carries the section (non-null)
+    std::string measured;                  // YYYY-MM-DD ("" when it has none)
+};
+
+struct DipRecord {
+    std::string key;                       // the store key: "<display>:<MODE>", or a bare "<display>" (mode-less, old)
+    std::string display;                   // the record's display name (the key's when absent)
+    std::string mode;                      // "SDR" / "HDR"; "" for a mode-less record
+    std::string made, updated;             // YYYY-MM-DD; `made` is DLC's staleness clock
+    int maxAgeDays = -1;                   // the record's max_age_days (-1: DLC's default, kDipDefaultMaxAgeDays)
+    std::string instrument;                // the meter ("X-Rite i1 DisplayPro")
+    std::string correctionFile;            // the meter correction in force while characterizing ("" none)
+    // Noise (the instrument axis).
+    int noiseBands = 0;                    // noise_model entries
+    double noiseFloorNits = kNaN, readOverheadS = kNaN;
+    // Timing.
+    double settleS = kNaN, settleBrightS = kNaN, settleDarkS = kNaN;
+    // The native panel.
+    double whiteNits = kNaN, whiteX = kNaN, whiteY = kNaN, blackNits = kNaN;
+    bool hasPrimaries = false;             // native_primaries R, G, B
+    double sustainedPeakNits = kNaN;       // declared by DLC, no writer yet (null everywhere today)
+    // Tone (HDR mostly).
+    double eotfUndershoot = kNaN;          // full-field measured vs requested light, a fraction (+0.0145 = 1.45 % over)
+    int whiteVsLuminance = 0;              // white_vs_luminance rows
+    // Thermal.
+    std::string thermalRegime;             // "convergent" | "fluctuating" | "warming"
+    double warmupMinutes = kNaN;
+    std::string coldChannel;               // "R" / "G" / "B"
+    double creepDePerMin = kNaN;
+    // Optional sections.
+    int refresh = -1;                      // index into DipStoreData::refresh (its refresh_response), -1 none
+    DipPeakByWindow peakByWindow;
+};
+// The record's native contrast (white / black); NaN when either is unmeasured or black reads 0 (below the meter).
+double DipContrast(const DipRecord& r);
+// Days since `made` (-1 when it is missing or unreadable) and whether DLC calls the record stale (dip.py is_stale:
+// older than its max_age_days, else kDipDefaultMaxAgeDays; no readable `made` = stale).
+int DipAgeDays(const DipRecord& r, const std::string& today);
+bool DipStale(const DipRecord& r, const std::string& today);
+
 struct DipStoreData {
     bool readable = false;                 // the file parsed as a DIP store
     std::vector<DipRefreshSection> refresh;   // one per record that carries a refresh_response
+    std::vector<DipRecord> records;        // one per readable record, in the file's order
+    std::vector<std::string> dropped;      // keys of records DLC itself would drop (dip.py DipStore.load): not shown
 };
 DipStoreData ParseDipStore(const std::string& json);
 

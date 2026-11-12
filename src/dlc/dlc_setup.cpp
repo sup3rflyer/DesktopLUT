@@ -83,4 +83,30 @@ std::string SetupPrompt(const std::wstring& repoFolder, const char* appVersion) 
     return s;
 }
 
+namespace {
+const char* ModeWord(bool hdr) { return hdr ? "HDR" : "SDR"; }
+}  // namespace
+
+std::string CalibratePrompt(const std::string& dlcName, bool hdr) {
+    return "Calibrate " + dlcName + " (" + ModeWord(hdr) + ") with DLC.";
+}
+
+std::string OnboardCalibratePrompt(const std::string& liveName, bool hdr) {
+    return "Calibrate the display DesktopLUT calls \"" + liveName + "\" (" + ModeWord(hdr) +
+           ") with DLC. It is not in DLC's profile yet: onboard it first.";
+}
+
+std::string CharacterizePrompt(const std::string& dlcName, bool hdr) {
+    return "Characterize " + dlcName + " (" + ModeWord(hdr) + ") with DLC: its characterize flow (" + kCharacterizeFlow +
+           " " + ModeWord(hdr) + ") measures the panel and the meter and writes the display's DIP record. "
+           "No calibration run after it unless I ask.";
+}
+
+std::string OnboardCharacterizePrompt(const std::string& liveName, bool hdr) {
+    return "Characterize the display DesktopLUT calls \"" + liveName + "\" (" + ModeWord(hdr) + ") with DLC. It is not "
+           "in DLC's profile yet: onboard it first, then run its characterize flow (" + kCharacterizeFlow + " " +
+           ModeWord(hdr) + "), which measures the panel and the meter and writes the display's DIP record. "
+           "No calibration run after it unless I ask.";
+}
+
 }  // namespace dlc

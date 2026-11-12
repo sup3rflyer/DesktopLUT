@@ -1,0 +1,95 @@
+{
+  "schema": 1,
+  "displays": {
+    "Studio 32:HDR": {
+      "display": "Studio 32",
+      "mode": "HDR",
+      "noise_model": [
+        {"nits": 0.07, "sigma_de": 0.0003, "sigma_rel": 0.0014, "reads": 20},
+        {"nits": 1.8, "sigma_de": 0.0048, "sigma_rel": null, "reads": 20}
+      ],
+      "noise_floor_nits": 0.0,
+      "read_overhead_s": 1.96,
+      "settle_seconds": 1.66,
+      "settle_by_level": {"bright": 1.66, "dark": 0.0},
+      "native_white_xy": [0.3169, 0.3284],
+      "native_white_nits": 1835.1,
+      "sustained_peak_nits": null,
+      "native_black_nits": 0.0,
+      "native_primaries": {"R": [0.6934, 0.3016], "G": [0.1906, 0.7444], "B": [0.1521, 0.0632]},
+      "refresh_response": {
+        "measured": "2026-10-23",
+        "run_id": "20261023_180329_refresh_trim_hdr_mon0_trim",
+        "rates": [
+          {"key": "59.94", "num": 60000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 1.0003, "n": 2}], "same_as": "60"},
+          {"key": "47.952", "num": 48000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 0.96, "n": 2}, {"nits": 100.0, "ratio": 0.97, "n": 2}]}
+        ],
+        "reference": {"key": "60", "num": 60, "den": 1},
+        "identity": {"hardware_id": "abc3201", "device_path": "\\\\?\\DISPLAY#ABC3201#1&2", "edid_id": "ABC3201-1"},
+        "peak_nits": 1835.1,
+        "interpolable": false
+      },
+      "peak_by_window": {
+        "measured": "2026-11-10",
+        "run_id": "20261110_120000_hdr_peak",
+        "steps": [{"area_pct": 2, "early_nits": 1900, "sustained_nits": 1650, "min_nits": 1600, "tau_s": 12.0, "n": 3}],
+        "future_detail": {"anything": [1, 2, 3]}
+      },
+      "eotf_undershoot": 0.0145,
+      "white_vs_luminance": [[0.34, 0.312, 0.323], [2.5, 0.314, 0.324]],
+      "warmup_reads_to_settle": 4,
+      "thermal_tau_patches": 208,
+      "warmup_minutes": 29.57,
+      "fluctuation_envelope": 0.0041,
+      "warmin_magnitude": 0.0874,
+      "warm_balance": [0.98, 0.96, 1.0],
+      "thermal_regime": "convergent",
+      "cold_channel": "R",
+      "creep_rate_de_per_min": 0.095,
+      "recommended_neutral_interval": 32,
+      "recommended_drift_threshold": 0.0063,
+      "instrument": "Example Colorimeter Pro",
+      "correction_file": null,
+      "patch_window_area_pct": null,
+      "made": "2026-06-19",
+      "max_age_days": null,
+      "updated": "2026-10-23",
+      "notes": [],
+      "a_field_from_a_newer_dlc": {"nested": true}
+    },
+    "Studio 32:SDR": {
+      "display": "Studio 32",
+      "mode": "SDR"
+    },
+    "Office 27:SDR": {
+      "display": "Office 27",
+      "mode": "SDR",
+      "noise_floor_nits": "0.05",
+      "native_white_nits": 110.0,
+      "native_black_nits": 0.05,
+      "native_white_xy": [0.3134, 0.3379],
+      "made": "2026-09-01",
+      "max_age_days": 30,
+      "instrument": "Example Colorimeter Pro",
+      "correction_file": "corrections\\office27.ccmx"
+    },
+    "Bright 24:SDR": {
+      "display": "Bright 24",
+      "mode": "SDR",
+      "native_white_nits": "very bright",
+      "made": "2026-09-01"
+    },
+    "Flat 22:HDR": [1, 2, 3],
+    "Banded 26:SDR": {
+      "display": "Banded 26",
+      "mode": "SDR",
+      "noise_model": [{"nits": 0.1}],
+      "made": "2026-09-01"
+    },
+    "Legacy 21": {
+      "display": "Legacy 21",
+      "native_black_nits": NaN,
+      "made": "2026-01-05"
+    }
+  }
+}
