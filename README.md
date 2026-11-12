@@ -156,12 +156,17 @@ Click the icon to open the window. Right-click for Show, Classic interface, Susp
 
 ## DWM Hook Mode
 
-When enabled (Settings → **DWM HOOK**), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. On a new installation it is on for Windows 11 and off for Windows 10. Nothing is injected until a display has a 3D LUT, tone mapping or FALD configured. If the hook will not stay attached on your system, DesktopLUT switches DWM Hook mode off by itself, says so, and applies your corrections with the overlay instead. This means:
+When enabled (Settings → **DWM HOOK**), 3D LUTs and HDR tonemapping are injected directly into `dwm.exe` instead of using the overlay. On a new installation it is on for Windows 11 and off for Windows 10. Nothing is injected until a display has a 3D LUT, tone mapping or FALD configured. This means:
 - No extra overlay window — 3D LUT and tonemapping are fully overlay-free
 - No Desktop Duplication capture overhead
 - No TOPMOST overlay window (eliminates the G-Sync tearline issue from overlay mode)
-- Fullscreen/borderless games fall back to DWM-composed mode when LUT or tonemapping is active (DirectFlip/iFlip disabled so the shader can process all content) — VRR is lost for those apps; use Passthrough Mode to restore it
 - Analysis overlay runs in lightweight mode (DD capture + compute shader only, no fullscreen overlay window)
+
+What it costs: while the hook is injected, DWM composes every window on every display, fullscreen and borderless games included, so the hook can process them. No app gets independent flip (DirectFlip) or a hardware overlay plane, and VRR (G-Sync, FreeSync) may be lost for games. Passthrough Mode does not change this: it hides DesktopLUT's overlay windows, not the hook. To give a game independent flip back, switch **DWM HOOK** off; overlay mode with Passthrough Mode then hides the corrections while that game runs.
+
+If the hook cannot be injected, or keeps detaching (quickly or over hours), DesktopLUT switches DWM Hook mode off by itself, says so, and applies your corrections with the overlay instead. Switch **DWM HOOK** on again to retry, after a Windows update for example.
+
+Windows updates can change the desktop compositor the hook patches. When this Windows' compositor is newer than anything the release was tested with, the hook still runs and the **DWM HOOK** row shows **UNTESTED WINDOWS UPDATE**. If colours then look wrong (a tint, flicker), switch **DWM HOOK** off.
 
 ## Grayscale correction
 
@@ -202,7 +207,7 @@ Turn hotkeys on or off in Settings → **HOTKEYS**. To change a key letter, clos
 
 - Per-monitor settings (SDR and HDR modes handled separately) that follow the physical display, even when Windows renumbers it
 - Application whitelist to bypass corrections for selected programs
-- Passthrough mode for full VRR compatibility
+- Passthrough mode for full VRR compatibility (overlay mode)
 - Automatic start with Windows
 - Support for .cube, .icc, and .icm files
 - 3D LUT interpolation: tetrahedral (trilinear is an overlay-mode option)
@@ -214,9 +219,9 @@ Turn hotkeys on or off in Settings → **HOTKEYS**. To change a key letter, clos
 - Introduces approximately one frame of visual delay in overlay mode, zero in DWM hook mode (input latency is unaffected)
 - DRM-protected content (e.g., Netflix) appears black
 - Some UI elements (such as Start menu animations) may remain uncorrected
-- DWM Hook Mode disables DirectFlip/iFlip when LUT or tonemapping is active — fullscreen/borderless games lose VRR (use Passthrough Mode to restore it for specific apps)
+- While the DWM hook is injected, every app is composed by DWM: no independent flip for fullscreen or borderless games, and VRR may be lost. Passthrough Mode does not apply to the hook; switch DWM HOOK off for those games
 - DWM Hook Mode is experimental and may need repair after Windows updates
-- DWM Hook Mode is tuned for Windows 11 and can be unstable on Windows 10 (the hook may repeatedly detach, briefly flashing the screen); DesktopLUT detects this, switches DWM Hook Mode off after a few attempts and continues in overlay mode. On Windows 10 a new installation starts in overlay mode.
+- DWM Hook Mode is tuned for Windows 11 and can be unstable on Windows 10 (the hook may repeatedly detach, briefly flashing the screen); DesktopLUT detects this, switches DWM Hook Mode off and continues in overlay mode. On Windows 10 a new installation starts in overlay mode.
 - DWM Hook mode, HDR dither and LUT interpolation are global settings, not per display
 - The DWM hook handles up to 8 displays
 - With Windows ACM on, SDR colors outside sRGB are clipped before the SDR 3D LUT

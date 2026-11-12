@@ -23,7 +23,7 @@ Desktop color correction for Windows, in three layers:
    DesktopLUT exits.
 2. **3D LUT + tone mapping** (DWM hook). `DwmHook.dll` is injected into `dwm.exe` and draws the 3D LUT, ICtCp HDR
    tone mapping and the FALD layer in DWM's present path. Live parameters travel over shared memory. If hook mode is
-   off, an overlay does the same work.
+   off, or the hook proves unusable (the fall-back switches hook mode off), an overlay does the same work.
 3. **Analysis overlay** (Desktop Duplication), on demand by hotkey.
 
 Three display modes: HDR (`isHDREnabled`), ACM SDR (`isFP16SDR`, Windows "Automatically manage color for apps" on),
@@ -124,6 +124,7 @@ refresh-rate trim, the readers for DLC's files, the interface model, and the sha
 | `src/refresh_trim.*` | Per-refresh-rate grey trim of the HDR profile, from the display's DLC record (§8) |
 | `src/windows_tonemap.*`, `src/displayconfig.*` | What Windows reports as the HDR peak; EDID |
 | `src/dwm_inject.*` | Injecting the hook, shared-memory config, watchdog, LUT and panel-file staging |
+| `src/dwm_hook_stability.h`, `src/dwm_hook_build.*` | When the hook gives up and falls back to the overlay; whether it was verified against the running `dwmcore.dll` |
 | `src/fald.*`, `src/fald_*_status.*` | FALD layer, overlay side; the governors' status for the UI and the pipe |
 | `src/desktoplut_ipc_server.*`, `src/ipc_*.h`, `src/calib_snapshot.h` | The calibration pipe (§10); what a calibration session captures and restores |
 | `src/actions/` | `act::*`: every user action, shared by both windows and the pipe; live-layer reconcile; event log |
@@ -204,6 +205,15 @@ every injected state is lost.
   the quick test) or with a meter. The DLL logs to `%SYSTEMROOT%\Temp\DesktopLUT_dwmhook.log`.
 - Pacing problems under hardware-accelerated GPU scheduling (HAGS) with DWM composing a heavy window happen with the
   DLL inert too. They are not a hook defect.
+- While injected, the hook keeps every window on every display composed (no independent flip, no multiplane
+  overlays), so fullscreen games can lose VRR. Passthrough Mode only hides overlay windows; it does not touch the
+  hook. Do not tell users it restores VRR in hook mode: the way out is DWM HOOK off.
+- After repairing or re-verifying the hook against a new `dwmcore.dll`, raise that branch's entry in
+  `kVerifiedDwmcore` (`src/dwm_hook_build.h`) to the raw file version checked; otherwise users get the
+  "untested Windows update" notice.
+- When the hook gives up (first injection fails twice, a re-injection fails 3 times, the flap cap, the slow-loop
+  counts in `src/dwm_hook_stability.h`), hook mode is switched off and saved and the overlay takes over, except during
+  a calibration run or live edit. Keep new failure paths on that one fall-back (`HookUnusableFallBackToOverlay`).
 
 ## 8. Gotchas that have caused real bugs
 

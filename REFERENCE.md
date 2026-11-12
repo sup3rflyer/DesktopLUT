@@ -243,7 +243,15 @@ When `DwmHookMode=1` (Settings → **DWM HOOK**; without the key: on for Windows
 
 **Analysis-only mode**: When analysis is the only active correction, a lightweight thread runs instead of the full overlay pipeline — just DD capture + analysis compute shader, no overlay windows, no swapchain, no pixel shader. This eliminates the fullscreen TOPMOST overlay that would break NVIDIA G-Sync. The full DD overlay only activates for the classic MHC base editor's preview or non-DWM-hook shader corrections (the fine-tune live edit is applied by the hook itself). State tracked by `g_analysisOnlyMode` atomic. Desktop Duplication delivers the frame BEFORE the hook, so in hook mode the analysis readout is the content signal ahead of the 3D LUT and tone map — it measures what apps draw, never what the hook outputs (measured 2026-10-15: a PQ 860 window read Peak 2257.5 nits with the tone map on; a post-hook capture would read ≤ the 1700-nit target).
 
-**Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event). Max 3 consecutive re-injection retries. Orphan detection via `hostPid` in shared memory — DLL self-unloads if host process dies.
+**Health monitoring**: GUI-side watchdog timer checks injection health every 5s (heartbeat event) and re-injects a hook that is gone while a display has work for it. Orphan detection: the DLL reads the host's PID from the staged `host.pid` and polls the process list every 5 s; when DesktopLUT has died it restores DWM's patched globals and code, disables its hooks and stays loaded but inert. The hook is given up — hook mode switched off and saved, the overlay takes the live layers over, a notice and an Events entry say so (not during a calibration run or live edit: then it only stops trying) — when (`src/dwm_hook_stability.h`):
+- the first injection of a start fails twice (one retry after 5 s);
+- a re-injection fails 3 times in a row;
+- it flaps: 5 re-injections without 30 s attached between them (a start re-arms this count);
+- it keeps detaching slowly: 6 detaches within 2 hours, or 10 within 24 hours. These counts survive restarts of the live layers; an isolated DWM restart (a Windows update, a driver install) stays far below them.
+
+Switching **DWM HOOK** on again clears every count.
+
+**Untested Windows builds**: the DLL picks its pattern set by Windows build (26200+ 25H2, 26100 24H2, 22000+ Windows 11, else Windows 10) with no upper bound. The host compares the running `dwmcore.dll` file version with the newest one this release was verified against for that set (`src/dwm_hook_build.h`, `kVerifiedDwmcore`: 25H2 = 10.0.26100.9168; no version recorded for the other sets). A newer one, or a set with none recorded, still injects: the **DWM HOOK** row shows **UNTESTED WINDOWS UPDATE**, the first injection adds one Events entry, and `state.get` reports `hook.dwmcore {version, verified_up_to, tested}`. A pattern the DLL does not find fails safe: without the `Present` pattern it refuses to load (the injection fails, then the fall-back above); a missing secondary pattern only leaves that hook or patch out (logged in `DesktopLUT_dwmhook.log`). A pattern that still matches while dwmcore's internals moved is what the notice is for: the Aug 2026 update tinted the desktop instead of failing.
 
 **Repair**: Windows updates can break DWM internals (AOB patterns, struct offsets). The hook then has to be repaired against the new `dwmcore.dll`; [AGENTS.md](AGENTS.md) §7 lists the rules for that. Until then, switch DWM HOOK off and use overlay mode.
 
@@ -776,21 +784,21 @@ The utilization numbers above can look alarming on mid/low-tier GPUs, but actual
 
 This is a fundamental NVIDIA driver limitation affecting all external overlay applications (ShaderGlass, Lossless Scaling, Discord overlay, Xbox Game Bar, etc.). No workaround exists.
 
-**DWM Hook Mode**: The hook eliminates the overlay window that breaks NVIDIA G-Sync, but when a 3D LUT or tonemapping is active, the hook disables DirectFlip/iFlip to ensure all content passes through the composition pipeline where the shader runs. This forces fullscreen and borderless-fullscreen games into DWM-composed mode, which means VRR is lost for those apps. Analysis-only mode (no LUT or tonemapping) does not block DirectFlip.
+**DWM Hook Mode**: The hook has no overlay window, so the overlay's G-Sync problem does not arise. But while the hook is injected (a display has a 3D LUT, tone mapping or FALD), it keeps every window composed so its shader sees all content: on 25H2 it sets DWM's `DisableIndependentFlip` and `OverlayTestMode=5` (no multiplane overlays) and patches `OverlaysEnabled`, which applies to every window on every display; on older builds it also hooks DWM's DirectFlip / independent-flip candidate checks. Fullscreen and borderless games are therefore composed by DWM (PresentMon: "Composed: Flip") instead of independent flip, and VRR may be lost for them. Analysis-only mode (no LUT, tone mapping or FALD) injects nothing and blocks nothing. Passthrough Mode does not apply to the hook. The way out today is to switch **DWM HOOK** off and use overlay mode with Passthrough Mode for those games.
 
 **For NVIDIA users**:
 1. Enable Windows "Variable refresh rate" setting (Settings > Display > Graphics > Variable refresh rate: On)
-2. Use Passthrough Mode (Settings → **PASSTHROUGH**) to disable corrections when specific games are running — this restores full VRR
-3. DWM Hook Mode eliminates the overlay G-Sync tearline issue, but VRR is still lost for fullscreen apps when LUT/tonemapping is active
+2. Overlay mode: use Passthrough Mode (Settings → **PASSTHROUGH**) to hide the overlay while specific games run — this restores full VRR for them
+3. DWM Hook Mode: Passthrough Mode has no effect; switch **DWM HOOK** off to give a game independent flip back
 
 See [GitHub Issue #1](https://github.com/sup3rflyer/DesktopLUT/issues/1) for technical details.
 
 ### Passthrough Mode
 
-Automatically hides all overlays when specified applications are running. Useful for:
+Overlay mode: automatically hides all overlays when specified applications are running. It does not unload or bypass the DWM hook. Useful for:
 - Games that need G-Sync/VRR (NVIDIA)
 - Applications where color correction should be disabled
-- Any app where you want the raw display output
+- Any app where you want the output without the overlay's layers (the MHC profiles stay at scanout)
 
 **Setup**: **SETTINGS** → **PASSTHROUGH** on → **WHITELIST** (classic window: Settings tab → "Hide overlay for apps" → "Whitelist...") → Enter comma-separated exe names (e.g., `game.exe, launcher.exe`). Matching is case-insensitive, `.exe` extension optional.
 
@@ -798,14 +806,14 @@ Automatically hides all overlays when specified applications are running. Useful
 
 ## Why This Exists
 
-Alternative to DWM_LUT after NVIDIA RTX 50-series drivers wrap DXGI swapchains via `ddisplay.dll`, making traditional DWM hooking impossible.
+Started as an alternative to DWM_LUT, which stopped working with NVIDIA RTX 50-series drivers and Windows 11 25H2. DesktopLUT now carries its own DWM hook (descended from dwm_lut via [dwm_lut_fixed](https://github.com/zkippp/dwm_lut_fixed), which made DWM hooking work again on 25H2; that repository is archived) and keeps the overlay as the fall-back. Its hook runs on an RTX 5090 with Windows 11 25H2.
 
 | Method | Pros | Cons |
 |--------|------|------|
 | Monitor hardware LUT | Zero latency, HDR | Limited RGB support, vendor lock-in |
 | ICC profiles | OS-integrated | 1D gamma + 3x3 only |
-| DWM_LUT | Full 3D LUT | Broken on 50-series, Win11 25H2 |
-| **DesktopLUT** | Full 3D LUT, DWM hook + overlay, no input lag | ~1 frame visual latency (overlay mode) |
+| DWM_LUT (original) | Full 3D LUT | No 25H2 support (forks added it) |
+| **DesktopLUT** | Full 3D LUT, DWM hook + overlay, no input lag | ~1 frame visual latency (overlay mode); the hook needs repair after some Windows updates |
 
 ## Developer Tools
 
