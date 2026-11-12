@@ -1,5 +1,5 @@
 // DesktopLUT - gui_mhc.h
-// MHC settings dialog and helpers
+// MHC profile helpers: generation, the permutation cache, desktop-gamma SDR-white following, identity profiles
 
 #pragma once
 
@@ -160,18 +160,6 @@ struct DesktopGammaSdrWhitePending {
     const char* reason = "";    // a SdrWhiteFollowPlan reason, or "mhc_maintenance"
 };
 std::vector<DesktopGammaSdrWhitePending> GetDesktopGammaSdrWhitePending();   // thread-safe
-
-// Update MHC info labels in the appropriate SDR or HDR groupbox
-void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR);
-
-// Helper to recalculate primaries matrix and apply live update
-void ApplyPrimariesChange(bool isHDR);
-
-// Show MHC settings edit dialog (modal)
-void ShowMhcSettingsDialog(HWND hwndParent, MHCSettings& settings, bool isHDR, int monitorIndex,
-                           bool livePreview = false, bool hadProfile = false,
-                           const std::wstring& origProfileName = L"",
-                           const std::wstring& origProfilePath = L"");
 
 // ============================================================================
 // Permutation Profile System

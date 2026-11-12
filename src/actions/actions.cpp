@@ -35,7 +35,7 @@ Result Fail(notify::Sev sev, std::wstring text) {
     return r;
 }
 
-// Report an action's message once, in the notification log (the classic status line shows it too).
+// Report an action's message once, in the notification log.
 Result Told(int mon, const wchar_t* source, Result r) {
     if (!r.text.empty()) notify::Post(r.sev, mon, source, r.text);
     return r;
@@ -54,7 +54,7 @@ void PushCorrection(int mon, bool hdr, bool reevaluateOverlay) {
     else if (reevaluateOverlay) DwmHookReevaluateOverlay();
 }
 
-// A FALD layer setting of one mode changed (GUI-thread port of the classic ApplyFaldSettingChange).
+// A FALD layer setting of one mode changed.
 // Returns what the reconcile did (a Start / Restart already loaded the panel files).
 ReconcileDecision PushFald(int mon, bool hdr, bool enabledNow) {
     if (g_gui.isRunning) {
@@ -137,7 +137,6 @@ Result SetLutBypass(int mon, bool hdr, bool bypass) {
 void SetTetrahedral(bool on) {
     g_tetrahedralInterp = on;
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetHdrDither(bool on) {
@@ -145,7 +144,6 @@ void SetHdrDither(bool on) {
     g_hdrDither = on;
     SaveSettings();
     UpdateDwmHookSharedConfig();
-    SyncClassicGlobalControls();
 }
 
 void SetDwmHookMode(bool on) {
@@ -156,8 +154,41 @@ void SetDwmHookMode(bool on) {
     SaveSettings();
     if (g_gui.isRunning) RestartLiveLayers();
     else ReconcileLiveLayers("engine");   // the FALD layer's need differs per engine (the hook's needs a panel file)
-    if (ValidMonitor(g_gui.currentMonitor)) Finish(g_gui.currentMonitor);
-    SyncClassicGlobalControls();
+    Finish(-1);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// DWM hook routing of twin displays
+
+Result IdentifyHookTwins() {
+    if (!g_dwmHookMode.load() || !g_gui.isRunning || !IsDwmHookActive())
+        return Told(-1, L"hook", Fail(notify::Sev::Warning, L"Identify: the DWM hook is not running"));
+    if (!DwmHookHasTwinMonitors())
+        return Told(-1, L"hook", Fail(notify::Sev::Warning, L"Identify: no identical displays to tell apart"));
+    StartDwmHookBeacon(g_gui.hwndMain, "user");
+    if (!g_hookBeaconActive.load())
+        return Told(-1, L"hook", Fail(notify::Sev::Warning, L"Identify: the beacon could not start"));
+    return Done();
+}
+
+Result SwapHookRoutingWithTwin(int mon) {
+    if (mon < 0 || mon >= (int)g_gui.monitors.size()) return Done(false);
+    if (!g_dwmHookMode.load() || !g_gui.isRunning)
+        return Told(mon, L"hook", Fail(notify::Sev::Warning, L"Swap: the DWM hook is not running"));
+    MONITORINFO info = { sizeof(info) };
+    if (!GetMonitorInfo(g_gui.monitors[mon], &info)) return Done(false);
+    DwmHookRouting r = ReadDwmHookRouting();
+    if (!r.present || r.stale)
+        return Told(mon, L"hook", Fail(notify::Sev::Warning, L"Swap: nothing assigned yet"));
+    const std::wstring err = SwapDwmHookRouting(r, info.rcMonitor.left, info.rcMonitor.top);
+    if (!err.empty()) return Told(mon, L"hook", Fail(notify::Sev::Warning, L"Swap: " + err));
+    r.confirmed = false;
+    if (!WriteDwmHookRouting(r))
+        return Told(mon, L"hook", Fail(notify::Sev::Error, L"Swap: the routing file could not be rewritten"));
+    RestartLiveLayers();   // the DLL reads the pins at injection; stays stopped if the user suspended meanwhile
+    SetStatus(L"LUT routing swapped: DWM hook re-injected");
+    RefreshHookRouting();
+    return Done();
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -257,7 +288,7 @@ Result SetFaldPanelFile(int mon, bool hdr, const std::wstring& path, bool reload
     std::wstring mismatch = FaldTransferMismatch(path, hdr);
     if (!mismatch.empty()) {
         SetStatus(mismatch.c_str());
-        Finish(mon);   // the classic row shows the file it keeps
+        Finish(mon);   // the interface shows the file it keeps
         return Fail(notify::Sev::Warning, mismatch);
     }
     bool changed = false, enabledNow = false;
@@ -806,7 +837,6 @@ void SetHotkeyEnabled(int hotkeyId, bool on) {
     // The hub window holds every hotkey for the session (RegisterHotkeys); its thread registers it.
     if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_HOTKEY_REGISTER, hotkeyId, on ? 1 : 0);
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -959,13 +989,11 @@ Result SetAnalysis(bool on) {
 void SetStartMinimized(bool on) {
     g_startMinimized.store(on);
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetRunAtStartup(bool on) {
     SetStartupEnabled(on);
     RefreshStartupEnabledCache();
-    SyncClassicGlobalControls();
 }
 
 void SetConsoleLog(bool on) {
@@ -986,7 +1014,6 @@ void SetConsoleLog(bool on) {
         FreeConsole();
     }
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetDlcFolder(const std::wstring& folder) {
@@ -1019,7 +1046,6 @@ void SetRecalReminderDays(int days) {
 void SetVrrWhitelistEnabled(bool on) {
     g_vrrWhitelistEnabled.store(on);
     SaveSettings();
-    SyncClassicGlobalControls();
 }
 
 void SetGammaWhitelist(const std::wstring& raw) {

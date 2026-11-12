@@ -1252,8 +1252,8 @@ void SaveSettings() {
     // Save startup settings
     WritePrivateProfileBool(L"General", L"StartMinimized", g_startMinimized.load(), iniPath.c_str());
 
-    // Interface
-    IniWriteString(L"UI", L"Interface", g_uiClassic ? L"classic" : L"new", iniPath.c_str());
+    // Interface. [UI] Interface (new / classic, 3.0.0) is gone with the classic window: deleted.
+    IniWriteString(L"UI", L"Interface", nullptr, iniPath.c_str());
     IniWriteString(L"UI", L"DlcFolder", g_dlcFolder.empty() ? nullptr : g_dlcFolder.c_str(), iniPath.c_str());
     IniWriteString(L"UI", L"DlcFolderLast", g_dlcFolderLast.empty() ? nullptr : g_dlcFolderLast.c_str(), iniPath.c_str());
     IniWriteString(L"UI", L"RecalReminderDays", std::to_wstring(g_recalReminderDays).c_str(), iniPath.c_str());
@@ -1354,12 +1354,10 @@ bool LoadSettings() {
     // Load startup settings
     g_startMinimized.store(GetPrivateProfileBool(L"General", L"StartMinimized", false, iniPath.c_str()));
 
-    // Interface (absent = the new one)
+    // The interface's own settings. ([UI] Interface, the 3.0.0 choice between this interface and the classic window, is
+    // not read: the classic window is gone, and SaveSettings deletes the key.)
     {
         wchar_t buf[MAX_PATH] = {};
-        GetPrivateProfileStringW(L"UI", L"Interface", L"new", buf, MAX_PATH, iniPath.c_str());
-        g_uiClassic = _wcsicmp(buf, L"classic") == 0;
-        buf[0] = 0;
         g_dlcFolder = ReadLongINIString(L"UI", L"DlcFolder", iniPath.c_str());
         g_dlcFolderLast = ReadLongINIString(L"UI", L"DlcFolderLast", iniPath.c_str());
         const int days = (int)GetPrivateProfileIntW(L"UI", L"RecalReminderDays", 90, iniPath.c_str());

@@ -10,6 +10,7 @@
 #include "fald_core_status.h"
 #include "refresh_trim.h"
 #include "dwm_hook_build.h"
+#include "gui.h"   // HookRoutingView
 #include <windows.h>
 #include <memory>
 #include <string>
@@ -50,6 +51,7 @@ struct Snapshot {
     bool hookIdle = false;    // hook mode, running: no hook resident because no display has hook work (DwmHookIdle)
     bool analysis = false;    // the analysis readout is on (g_analysisEnabled)
     DwmHookBuildStatus hookBuild;  // was the hook verified against this Windows' dwmcore.dll (dwm_hook_build.h)
+    HookRoutingView routing;       // identical twin displays and how the hook routes them (gui.h; empty = no twins)
     std::wstring lastStatus;      // the newest status line or warning / error (any source)
     notify::Sev lastStatusSev = notify::Sev::Info;
 };

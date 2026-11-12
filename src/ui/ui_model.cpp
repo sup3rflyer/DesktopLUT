@@ -219,7 +219,7 @@ std::vector<Stage> BuildPixelPath(const MonitorSettings& ms, Mode shown, Mode li
         path.push_back(add);
     }
 
-    // The overlay shader tweak (pipe / INI only, no classic control) — shown so a live correction is
+    // The overlay shader tweak (pipe / INI only) — shown so a live correction is
     // never invisible.
     if (ShaderTweakActive(cc)) path.push_back({ StageId::ShaderTweak, Light::Configured, true, false });
 

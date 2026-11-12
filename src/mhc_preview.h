@@ -19,8 +19,8 @@
 // A profile edit (the interface's MHC editor, actions/mhc_edit: the source file, the primaries, the white, the peak)
 // previews the same way: the whole profile recomputed from the edited settings (UpdateMhcPreviewProfile).
 //
-// One preview at a time, GUI thread. Used by the interface's editors (actions/gs_live, actions/mhc_edit), the classic
-// editor (gui.cpp ID_MHC_*_GS_EDIT) and the pipe's mhc.grayscale_live_* (desktoplut_ipc_server.cpp).
+// One preview at a time, GUI thread. Used by the interface's editors (actions/gs_live, actions/mhc_edit) and the pipe's
+// mhc.grayscale_live_* (desktoplut_ipc_server.cpp).
 
 #pragma once
 

@@ -1113,7 +1113,7 @@ TEST_CASE("INI free text: plain ASCII stays readable, anything else round-trips 
     CHECK(DecodeIniText(L"u8:cut%4") == L"u8:cut%4");
 }
 
-TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, round-trip and clear") {
+TEST_CASE("LoadSettings/SaveSettings: [UI] DlcFolder, reminder and theme default, round-trip and clear") {
     AppIniGuard guard;
     if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
     const wchar_t* ini = guard.path.c_str();
@@ -1121,10 +1121,8 @@ TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, roun
     g_gui.monitorSettings.clear();
     g_gui.parkedSettings.clear();
     WritePrivateProfileStringW(L"General", L"StartMinimized", L"false", ini);   // an INI without [UI]
-    g_uiClassic = true;
     g_dlcFolder = L"stale";
     LoadSettings();
-    CHECK(g_uiClassic == false);                        // absent -> the new interface
     CHECK(g_dlcFolder.empty());
     CHECK(g_recalReminderDays == 90);                   // absent -> 90 days
     g_recalReminderDays = 0;                            // off survives a round trip
@@ -1150,16 +1148,11 @@ TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, roun
     WritePrivateProfileStringW(L"UI", L"Theme", L"sepia", ini);
     LoadSettings();
     CHECK(g_uiTheme == 0);                              // unknown -> dark
-    g_uiClassic = true;
     g_dlcFolder = L"D:\\Calibration\\DLC";
     SaveSettings();
     wchar_t buf[MAX_PATH] = {};
-    GetPrivateProfileStringW(L"UI", L"Interface", L"", buf, MAX_PATH, ini);
-    CHECK(std::wstring(buf) == L"classic");
-    g_uiClassic = false;
     g_dlcFolder.clear();
     LoadSettings();
-    CHECK(g_uiClassic == true);
     CHECK(g_dlcFolder == L"D:\\Calibration\\DLC");
     g_dlcFolder.clear();
     SaveSettings();                                     // empty folder: the key goes
@@ -1177,11 +1170,37 @@ TEST_CASE("LoadSettings/SaveSettings: [UI] Interface and DlcFolder default, roun
     SaveSettings();
     GetPrivateProfileStringW(L"UI", L"DlcFolderLast", L"<absent>", buf, MAX_PATH, ini);
     CHECK(std::wstring(buf) == L"<absent>");
-    WritePrivateProfileStringW(L"UI", L"Interface", L"CLASSIC", ini);
-    g_uiClassic = false;
-    LoadSettings();
-    CHECK(g_uiClassic == true);                         // case-insensitive
-    g_uiClassic = false;
+}
+
+// 3.0.0 kept the choice between this interface and the classic window in [UI] Interface. The classic window is gone: an
+// INI that chose it loads like any other (every other setting as saved) and the key is deleted on the next save.
+TEST_CASE("LoadSettings/SaveSettings: an INI naming the classic interface loads, and the key is deleted on save") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    for (const wchar_t* chosen : { L"classic", L"CLASSIC", L"new" }) {
+        WritePrivateProfileStringW(L"UI", L"Interface", chosen, ini);
+        WritePrivateProfileStringW(L"UI", L"Theme", L"gray", ini);
+        WritePrivateProfileStringW(L"General", L"StartMinimized", L"true", ini);
+        g_uiTheme = 0;
+        g_startMinimized.store(false);
+        LoadSettings();
+        CHECK(g_uiTheme == 1);                          // the rest of [UI] and [General] as saved
+        CHECK(g_startMinimized.load());
+        SaveSettings();
+        wchar_t buf[32] = {};
+        GetPrivateProfileStringW(L"UI", L"Interface", L"<absent>", buf, 32, ini);
+        CHECK(std::wstring(buf) == L"<absent>");
+        GetPrivateProfileStringW(L"UI", L"Theme", L"", buf, 32, ini);
+        CHECK(std::wstring(buf) == L"gray");
+        GetPrivateProfileStringW(L"General", L"StartMinimized", L"", buf, 32, ini);
+        CHECK(_wcsicmp(buf, L"true") == 0);
+    }
+    g_uiTheme = 0;
+    g_startMinimized.store(false);
 }
 
 TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sections once matched") {

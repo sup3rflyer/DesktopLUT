@@ -1307,17 +1307,11 @@ static void StartProcessingImpl() {
             std::wstring err = InjectDwmHook(dwmMonitors, &stagingWarning);
             if (err.empty() && !stagingWarning.empty()) {
                 // Injected, but a LUT file could not be read: that display runs without its cube.
-                // Same non-blocking dialog as an injection error (a pipe-driven start must not block).
+                // A warning, never a blocking dialog (a pipe-driven start must not block): the footer shows it in
+                // amber, Events has the detail.
                 SetStatus(L"Active (DWM Hook) - a LUT file could not be read");
-                if (g_uiClassic) {
-                    std::thread([msg = stagingWarning]() {
-                        MessageBoxW(nullptr, (msg + L"\n\nThat display runs without its 3D LUT.").c_str(),
-                                    L"DesktopLUT — DWM Hook", MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-                    }).detach();
-                } else {   // the new interface: a warning (the footer shows it in amber; Events has the detail)
-                    notify::Post(notify::Sev::Warning, -1, L"hook", L"A 3D LUT file could not be read",
-                                 stagingWarning + L"\n\nThat display runs without its 3D LUT.");
-                }
+                notify::Post(notify::Sev::Warning, -1, L"hook", L"A 3D LUT file could not be read",
+                             stagingWarning + L"\n\nThat display runs without its 3D LUT.");
             }
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
@@ -1400,8 +1394,6 @@ static void StartProcessingImpl() {
             StartGammaWhitelistThread();
         }
 
-        EnableWindow(g_gui.hwndApply, FALSE);
-        EnableWindow(g_gui.hwndStop, TRUE);
         SetStatus(stagingWarning.empty() ? L"Active (DWM Hook)" : L"Active (DWM Hook) - a LUT file could not be read");
 
         // Start DWM hook watchdog timer (detects DWM restart / hook loss)
@@ -1420,9 +1412,6 @@ static void StartProcessingImpl() {
     RetireStaleAnalysisThread();  // full overlay owns g_monitors too
     g_gui.processingThread = LaunchRenderThread(configs);
 
-    // Directly set button states - don't call UpdateGUIState which may re-enable via SettingsChanged
-    EnableWindow(g_gui.hwndApply, FALSE);
-    EnableWindow(g_gui.hwndStop, TRUE);
     SetStatus(L"Active");
 }
 
@@ -1680,15 +1669,6 @@ void UpdateColorCorrectionLive(int monitorIndex, bool isHDR, bool ictcpMode) {
     // queued while the overlay is dormant wait up to 500ms and then are still missed
     // because the auto-sleep path used to return unconditionally before the queue check.
     if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-}
-
-// Helper to get white point from edit boxes
-static void GetWhitePointFromEditBoxes(float& Wx, float& Wy, bool isHDR) {
-    wchar_t buf[16];
-    HWND hwndWx = isHDR ? g_gui.hwndHdrPrimariesWx : g_gui.hwndPrimariesWx;
-    HWND hwndWy = isHDR ? g_gui.hwndHdrPrimariesWy : g_gui.hwndPrimariesWy;
-    if (hwndWx) { GetWindowText(hwndWx, buf, 16); Wx = (float)_wcstod_l(buf, nullptr, GetCLocale()); }
-    if (hwndWy) { GetWindowText(hwndWy, buf, 16); Wy = (float)_wcstod_l(buf, nullptr, GetCLocale()); }
 }
 
 bool SettingsChanged() {

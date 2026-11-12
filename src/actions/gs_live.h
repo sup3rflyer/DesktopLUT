@@ -2,8 +2,7 @@
 // The interface's live fine-tune edit (MHC correction grayscale), one at a time. While it runs, the display's scanout
 // runs an identity profile and the overlay applies the profile the bake would install with the edited curve in it
 // (mhc_preview.h: the same matrix and LUT entries, so the preview IS the bake). End re-bakes the profile with the
-// result (keep) or with the curve as it was. The same preview as the classic editor (gui.cpp ID_MHC_*_GS_EDIT) and
-// the pipe's mhc.grayscale_live_*.
+// result (keep) or with the curve as it was. The same preview as the pipe's mhc.grayscale_live_*.
 //
 // GUI thread. Begin and End start/stop processing and swap profiles (they pump): call them outside an ImGui
 // frame (ui::Post). Preview is cheap and safe inside a frame.
