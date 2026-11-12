@@ -416,12 +416,11 @@ struct HookPsGpu {
         REQUIRE(SUCCEEDED(dev->CreateShaderResourceView(in, nullptr, &inputSRV)));
         Keep(inputSRV);
 
-        std::vector<float> noise(NOISE_SIZE * NOISE_SIZE);   // exactly as hook_render.cpp builds it
-        for (int i = 0; i < NOISE_SIZE; i++)
-            for (int j = 0; j < NOISE_SIZE; j++) noise[i * NOISE_SIZE + j] = (noiseBytes[i][j] + 0.5f) / 256;
+        std::vector<float> noise(NOISE_SIZE * NOISE_SIZE * 4);   // exactly as hook_render.cpp builds it (one RGBA texel
+        HookBuildNoiseTexels(noise.data());                      // per position: the tile and its two half-tile shifts)
         D3D11_TEXTURE2D_DESC nd = td;
-        nd.Width = nd.Height = NOISE_SIZE; nd.Format = DXGI_FORMAT_R32_FLOAT;
-        D3D11_SUBRESOURCE_DATA ninit = { noise.data(), NOISE_SIZE * 4, 0 };
+        nd.Width = nd.Height = NOISE_SIZE; nd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        D3D11_SUBRESOURCE_DATA ninit = { noise.data(), NOISE_SIZE * 16, 0 };
         ID3D11Texture2D* nt = nullptr;
         REQUIRE(SUCCEEDED(dev->CreateTexture2D(&nd, &ninit, &nt)));
         Keep(nt);

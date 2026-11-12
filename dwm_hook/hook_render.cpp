@@ -985,25 +985,18 @@ void InitializeStuff(ID3D11Device* inputDevice)
 			desc.Height = NOISE_SIZE;
 			desc.MipLevels = 1;
 			desc.ArraySize = 1;
-			desc.Format = DXGI_FORMAT_R32_FLOAT;
+			desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;   // the tile and its two half-tile shifts in one texel (hook_shader.h)
 			desc.SampleDesc.Count = 1;
 			desc.SampleDesc.Quality = 0;
 			desc.Usage = D3D11_USAGE_IMMUTABLE;
 			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-			float noise[NOISE_SIZE][NOISE_SIZE];
-
-			for (int i = 0; i < NOISE_SIZE; i++)
-			{
-				for (int j = 0; j < NOISE_SIZE; j++)
-				{
-					noise[i][j] = (noiseBytes[i][j] + 0.5) / 256;
-				}
-			}
+			static float noise[NOISE_SIZE * NOISE_SIZE * 4];   // 64 KB: not on the present thread's stack
+			HookBuildNoiseTexels(noise);
 
 			D3D11_SUBRESOURCE_DATA initData;
 			initData.pSysMem = noise;
-			initData.SysMemPitch = sizeof(noise[0]);
+			initData.SysMemPitch = NOISE_SIZE * 4 * sizeof(float);
 
 			ID3D11Texture2D* tex;
 			EXECUTE_WITH_LOG(device->CreateTexture2D(&desc, &initData, &tex))
