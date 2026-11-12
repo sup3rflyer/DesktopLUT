@@ -3,7 +3,7 @@
 //
 // DwmHook.dll finds what it patches in dwmcore.dll by byte patterns, one set per "branch" it picks from the Windows
 // build number (dwm_hook/dllmain.cpp: >= 26200 the 25H2 set, >= 26100 24H2, >= 22000 Windows 11, else Windows 10),
-// with no upper bound. A monthly update can move dwmcore's internals while every pattern still matches: the Aug 2026
+// with no upper bound; on 26100..26199 the 25H2 set when this dwmcore carries the 25H2 code (dwmcore_scan.h). A monthly update can move dwmcore's internals while every pattern still matches: the Aug 2026
 // update put a CMY tint over the whole desktop instead of failing (DWM_HOOK_REPAIR.md). So the host compares the
 // running dwmcore.dll's file version with the newest one this release was verified against, per branch. Newer still
 // injects; the interface says so (Settings, DWM HOOK row; one Events entry) and so does the calibration pipe
@@ -105,8 +105,10 @@ inline const char* DwmcoreVerdictName(DwmcoreVerdict v) {
     return "unknown";
 }
 
-// Pure: the status for a Windows build and a dwmcore version.
+// Pure: the status for a Windows build and a dwmcore version, on the branch the DLL takes (by default the one the OS
+// build picks; on OS builds 26100..26199 the DLL decides by the dwmcore binary: dwmcore_scan.h DwmHookBranchFor).
 DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running);
+DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running, DwmHookBranch branch);
 
 // This machine's status, read once per process (the build number and dwmcore.dll's file version on disk: an update
 // normally swaps dwmcore in at a reboot, which restarts DesktopLUT too). Any thread.

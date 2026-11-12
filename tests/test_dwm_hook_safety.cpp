@@ -208,6 +208,12 @@ TEST_CASE("dwmcore version: compare, branch and verdict") {
     CHECK(DwmHookBuildDetail(newer).find(L"10.0.26100.9168") != std::wstring::npos);
     // A future feature update with a dwmcore build of its own, on the 25H2 patterns.
     CHECK(MakeDwmHookBuildStatus(26300, MakeDwmcoreVersion(10, 0, 26300, 100)).verdict == DwmcoreVerdict::Newer);
+    // A patched 24H2 (OS build 26100) whose dwmcore carries the 25H2 code takes the 25H2 path (dwmcore_scan.h) and is
+    // judged against the 25H2 baseline: the same binary family.
+    CHECK(MakeDwmHookBuildStatus(26100, verified, DwmHookBranch::Win11_25H2).verdict == DwmcoreVerdict::Verified);
+    CHECK(MakeDwmHookBuildStatus(26100, MakeDwmcoreVersion(10, 0, 26100, 9300), DwmHookBranch::Win11_25H2).verdict ==
+          DwmcoreVerdict::Newer);
+    CHECK(MakeDwmHookBuildStatus(26100, verified).verdict == DwmcoreVerdict::NoBaseline);   // the 24H2 path: none recorded
     // Branches with no verified version recorded: reported (no_baseline), no notice (nothing the user can act on).
     const DwmHookBuildStatus win11 = MakeDwmHookBuildStatus(22631, MakeDwmcoreVersion(10, 0, 22621, 4000));
     CHECK(win11.verdict == DwmcoreVerdict::NoBaseline);

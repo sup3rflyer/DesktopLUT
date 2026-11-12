@@ -2,6 +2,7 @@
 // Reads the Windows build and dwmcore.dll's file version once and judges them (dwm_hook_build.h).
 
 #include "dwm_hook_build.h"
+#include "dwmcore_scan.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -25,9 +26,13 @@ const wchar_t* DwmHookBranchName(DwmHookBranch b) {
 }
 
 DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running) {
+    return MakeDwmHookBuildStatus(osBuild, running, DwmHookBranchForOsBuild(osBuild));
+}
+
+DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running, DwmHookBranch branch) {
     DwmHookBuildStatus s;
     s.osBuild = osBuild;
-    s.branch = DwmHookBranchForOsBuild(osBuild);
+    s.branch = branch;
     s.running = running;
     s.verified = VerifiedDwmcoreFor(s.branch);
     s.verdict = JudgeDwmcore(s.branch, running);
@@ -83,7 +88,20 @@ DwmcoreVersion ReadDwmcoreVersion() {
 }  // namespace
 
 const DwmHookBuildStatus& DwmHookBuildCheck() {
-    static const DwmHookBuildStatus s = MakeDwmHookBuildStatus(ReadOsBuild(), ReadDwmcoreVersion());
+    static const DwmHookBuildStatus s = [] {
+        const uint32_t os = ReadOsBuild();
+        DwmHookBranch branch = DwmHookBranchForOsBuild(os);
+        if (branch == DwmHookBranch::Win11_24H2) {
+            // A 24H2 build: the DLL takes the 25H2 path when this dwmcore carries the 25H2 code (dwmcore_scan.h), and
+            // is then judged against the 25H2 baseline. Only these builds read the file here.
+            wchar_t sys[MAX_PATH] = {};
+            const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+            DwmcoreImage img;
+            if (n > 0 && n < MAX_PATH && LoadDwmcoreImage(std::wstring(sys) + L"\\dwmcore.dll", img))
+                branch = DwmHookBranchFor(os, &img);
+        }
+        return MakeDwmHookBuildStatus(os, ReadDwmcoreVersion(), branch);
+    }();
     return s;
 }
 
