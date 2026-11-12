@@ -482,15 +482,19 @@ class _Run:
         t0 = self.clock.now()
         ys: list[float] = []
         first = True
+        attempts = 0
         while True:
             rd = self.reader.read(self._patch(f"{label}:black", (0, 0, 0), 100.0, repaint=first),
-                                  t_paint=t0, row={"part": "cool", "step": label})
+                                  t_paint=t0, row={"part": "cool", "step": label}, soft_fail_ok=True)
             first = False
+            attempts += 1
             if rd.y is not None:
                 ys.append(rd.y)
             el = self.clock.now() - t0
             stable = False
-            if len(ys) >= 3:
+            if not ys and attempts >= 3:
+                stable = True             # black below the meter's range (an OLED): nothing to wait out but time
+            elif len(ys) >= 3:
                 tail = ys[-3:]
                 m = sum(tail) / 3.0
                 stable = max(abs(y - m) for y in tail) <= max(sp.black_stable_rel * m, sp.black_stable_abs_nits)

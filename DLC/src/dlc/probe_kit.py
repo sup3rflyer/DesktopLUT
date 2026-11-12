@@ -98,7 +98,10 @@ class ProbeReader:
             self.clock.sleep(min(chunk_s, left))
             self.cal.liveness.progress(self.stage)
 
-    def read(self, patch: MeasurePatch, *, t_paint: Optional[float] = None, row: Optional[dict] = None) -> Read:
+    def read(self, patch: MeasurePatch, *, t_paint: Optional[float] = None, row: Optional[dict] = None,
+             soft_fail_ok: bool = False) -> Read:
+        """``soft_fail_ok``: a failed read that is not a meter-PROCESS fault (spotread's under-range warning on a
+        true black, an OLED's black) does not count toward meter-down — only a fault does."""
         self.check()
         self.cal.liveness.activity(self.stage)
         t0 = self.clock.now()
@@ -108,11 +111,13 @@ class ProbeReader:
         rd = Read(reading, t0 if t_paint is None else t_paint, t1, t1 - t0)
         ok = rd.y is not None
         raw = reading.raw or {}
-        if ok:
+        soft = (not ok) and soft_fail_ok and not (raw.get("meter_fault") or raw.get("meter_down"))
+        if ok or soft:
             self.failures = 0
             self.cal.liveness.progress(self.stage)
         else:
             self.failures += 1
+        if not ok:
             self.n_failed += 1
         rec = {"label": patch.label, "rgb": list(patch.rgb), "area_pct": patch.window_area_pct,
                "t_end": round(t1, 3), "since_paint_s": round(t1 - rd.t_paint, 3), "dur_s": round(t1 - t0, 3),

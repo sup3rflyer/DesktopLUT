@@ -346,3 +346,20 @@ def test_plan_cli_prints_and_writes_a_spec(tmp_path, capsys):
     spec = json.loads(out.read_text(encoding="utf-8"))
     assert spec["probe"] == "peak-window" and spec["areas"] == [1.0, 10.0, 100.0] and spec["emissive"] is True
     assert pw.main(["plan", "--emissive", "--spec", str(out)]) == 0
+
+
+def test_an_oled_black_below_the_meter_range_is_not_meter_loss(tmp_path):
+    from dlc.measure_loop import Reading
+    panel = oled_like(clock=VirtualClock())
+
+    def measure(patch):
+        r = panel(patch)
+        if tuple(patch.rgb) == (0, 0, 0):        # spotread's under-range warning on a true black
+            return Reading(xyz=None, ok=False, error="Warning: the reading is under range", raw={})
+        return r
+    measure.probe_clock = panel.probe_clock
+    cal = _calib(tmp_path, "black", measure, adjudicator=MappingAdjudicator(dict(_OLED_YES)))
+    res = cal.run("peak-window")
+    assert res.status == "completed", res.digest
+    s = _recorded(cal)
+    assert s.valid and all(st["cooldown_settled"] and st["black_nits"] is None for st in s.steps)
