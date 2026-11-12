@@ -407,8 +407,13 @@ const char* CtxPosMethodName(int method) {
 static const char* RoutingFilePath() {
 	static char path[MAX_PATH] = {0};
 	if (path[0] == '\0') {
+#ifdef DLUT_HOOK_TESTING   // the hook's sources compiled into the test exe: never the real hook's folder
+		char pattern[MAX_PATH] = {0};
+		snprintf(pattern, sizeof(pattern), "%%TEMP%%\\DesktopLUT_hook_routing_test_%lu.dat", (unsigned long)GetCurrentProcessId());
+#else
 		char pattern[MAX_PATH] = {0};
 		snprintf(pattern, sizeof(pattern), DWM_HOOK_ROUTING_FILE_FMT_A, (unsigned long)GetCurrentProcessId());
+#endif
 		ExpandEnvironmentStringsA(pattern, path, sizeof(path));
 	}
 	return path;
@@ -703,6 +708,37 @@ static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
 }
 
 void UninitializeStuff();  // Forward declaration for error cleanup
+
+// The apply paths initialise on their first present, ONCE per injection. A failed InitializeStuff has already run
+// UninitializeStuff: the device is gone and so are the cubes parsed at attach and the FALD panel files (their staging
+// folder is deleted right after injection: there is nothing to read them from again). So a later attempt could at best
+// "succeed" into a pass without the monitors' cubes - a wrong picture reported as a working hook - and every attempt is a
+// blocking call inside DWM's present. No retry here: the pass stays off, every apply path returns "not applied", the log
+// says so once, and HookRenderInitFailed() tells dllmain.cpp; the host's watchdog re-injection (bounded, then its
+// fall-back to the overlay) is the retry, with a freshly staged set.
+static bool s_initFailed = false;
+static int s_initAttempts = 0;
+
+bool HookRenderInitFailed() { return s_initFailed; }
+#ifdef DLUT_HOOK_TESTING
+int HookTestInitAttempts() { return s_initAttempts; }
+void HookTestResetInitState() { s_initFailed = false; s_initAttempts = 0; }
+#endif
+
+void InitializeStuff(ID3D11Device* inputDevice);
+
+// True when the pass's resources exist (created now if this is the injection's first present with a device).
+static bool HookEnsureInitialized(ID3D11Device* dev)
+{
+	if (device && deviceContext) return true;
+	if (s_initFailed || !dev) return false;
+	s_initAttempts++;
+	InitializeStuff(dev);
+	if (device && deviceContext) return true;
+	s_initFailed = true;
+	log_to_file("ERROR: the hook's rendering resources could not be created - LUT / tone map / FALD are OFF until the next injection (see the lines above)");
+	return false;
+}
 
 void ReleaseMhcPreviewMapping() {
 	if (s_mhcView) { UnmapViewOfFile(s_mhcView); s_mhcView = NULL; }
@@ -1165,6 +1201,7 @@ void UninitializeStuff()
 
 bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects)
 {
+	if (!device || !deviceContext) return false;   // no resources (a failed init): nothing is applied, nothing is dereferenced
 	ID3D11RenderTargetView* renderTargetView;
 
 	D3D11_TEXTURE2D_DESC newBackBufferDesc;
@@ -1786,11 +1823,13 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 
 		if (!device)
 		{
+			if (s_initFailed) return false;   // off until the next injection (HookEnsureInitialized)
 			LOG_ONLY_ONCE("Initializing stuff in ApplyLUT")
-			ID3D11Device* dev;
+			ID3D11Device* dev = NULL;
 			EXECUTE_WITH_LOG(swapChain->GetDevice(IID_ID3D11Device, (void**)&dev))
-			InitializeStuff(dev);
-			dev->Release();
+			const bool ready = HookEnsureInitialized(dev);
+			if (dev) dev->Release();
+			if (!ready) return false;
 		}
 		LOG_ONLY_ONCE("Init done, continuing with LUT application")
 
@@ -2176,11 +2215,13 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 	{
 		if (!device)
 		{
+			if (s_initFailed) return false;   // off until the next injection (HookEnsureInitialized)
 			LOG_ONLY_ONCE("Initializing from texture device (25H2)")
-			ID3D11Device* dev;
+			ID3D11Device* dev = NULL;
 			backBuffer->GetDevice(&dev);
-			InitializeStuff(dev);
-			dev->Release();
+			const bool ready = HookEnsureInitialized(dev);
+			if (dev) dev->Release();
+			if (!ready) return false;
 		}
 
 		// 25H2: resolve this context's monitor position — monitors.dat by back-buffer size, then

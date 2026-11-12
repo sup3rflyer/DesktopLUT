@@ -1158,3 +1158,49 @@ TEST_CASE("perf: output reference manifest (DLUT_PERF_HASH_WRITE / DLUT_PERF_HAS
         CHECK(missing == 0);
     }
 }
+
+// =================================================================================================================
+// Always-on cases (WARP): the hook pass's safety and correctness rules that the instruments' rig can drive
+// =================================================================================================================
+
+// A device on which the pass's resources cannot be created (feature level 10: no vs_5_0 / ps_5_0). The old code retried
+// InitializeStuff on every present and, with a tone map configured, went on into RenderLUT with a null device (an access
+// violation inside dwm.exe: the DLL is not built with /EHa).
+TEST_CASE("hook: a failed InitializeStuff is final for the injection and every apply path is a clean no-op (WARP, feature level 10)") {
+    ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_10_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic))) {
+        MESSAGE("skipped: no WARP device");
+        return;
+    }
+    UninitializeStuff();
+    std::memset(textureDesc, 0, sizeof(D3D11_TEXTURE2D_DESC) * 2);
+    ResetContextRouting();
+    HookTestResetInitState();
+    const bool prev25h2 = isWindows11_25h2;
+    isWindows11_25h2 = true;
+    g_numMonitorHdrStates = 1;
+    g_monitorHdrStates[0] = { 0, 0, true, 10u, 64u, 64u };
+    s_perfTonemap = {};
+    s_perfTonemap.enabled = true;                       // a tone map: the pass has work, so the old code reached the device
+    s_perfTonemap.sourcePeakNits = 4000.0f; s_perfTonemap.targetPeakNits = 1000.0f;
+    s_perfTonemap.pqSourcePeak = LinearToPQ(0.4f); s_perfTonemap.pqTargetPeak = LinearToPQ(0.1f);
+    g_numLocalFald = 0;
+    ID3D11Texture2D* back = perf::MakeTex(dev, 64, 64, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+    REQUIRE(back != nullptr);
+    RECT full = { 0, 0, 64, 64 };
+    int ctx[4] = {};
+    for (int i = 0; i < 5; i++) CHECK_FALSE(ApplyLUTDirect(ctx, back, &full, 1));
+    CHECK(device == nullptr);
+    CHECK(HookRenderInitFailed());
+    CHECK(HookTestInitAttempts() == 1);                 // one attempt, not one per present
+    CHECK_FALSE(RenderLUT(ctx, back, &full, 1));        // and the pass itself never touches a null device
+    HookTestResetInitState();
+    UninitializeStuff();
+    ResetContextRouting();
+    g_numMonitorHdrStates = 0;
+    s_perfTonemap = {};
+    isWindows11_25h2 = prev25h2;
+    back->Release();
+    ic->ClearState(); ic->Flush(); ic->Release(); dev->Release();
+}
