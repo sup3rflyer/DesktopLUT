@@ -1,7 +1,11 @@
 // FALD always-on core KC5 (see fald_core2.h). One implementation for the overlay path (src/fald.cpp) and the DWM hook
 // (dwm_hook/hook_fald.cpp): the HLSL, the shaders, the zone / fine textures.
 #include "fald_core2.h"
-#include <d3dcompiler.h>
+#include "fald_shader_set.h"   // FaldShaderBytecode / FaldBytecodeCompiler: defined here, the one holder of the blobs
+#include "fald_bytecode.h"     // GENERATED: every shader of the layer, precompiled
+#ifndef DWMHOOK_EXPORTS
+#include <d3dcompiler.h>       // (not in the hook DLL: nothing is compiled inside dwm.exe, and the DLL keeps no reference to it)
+#endif
 #include <cmath>
 #include <cstring>
 
@@ -36,6 +40,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 // Z2: alpha_z (direct 7 x 7 Gaussian of the state, edge clamp), the spread gate k, ln P, the cone's rate -> u0 coreZone
 static const char* kZ2 = R"(
 RWTexture2D<float4> coreZoneOut : register(u0);
+RWTexture2D<float> coreAlphaZOut : register(u1);         // alpha_z alone (R32F, readable back): what the partial path compares
+RWStructuredBuffer<uint> coreChangeFlags : register(u5); // the layer's change flags (fald_change.h): [0] |= 8u = alpha_z moved
+RWByteAddressBuffer coreLateArgs : register(u6);         // ... and the round-1 sweep is re-ordered over the whole lattice
 Texture2D<float> coreAlphaStateT : register(t44);
 Texture2D<float> coreLzT : register(t45);
 [numthreads(16, 16, 1)]
@@ -55,7 +62,22 @@ void main(uint3 id : SV_DispatchThreadID) {
     float k = exp(-(1.0f + coreBeta * max(sqrt(gx * gx + gy * gy) - coreTau, 0.0f)));
     float P = coreStatTex.Load(int3(c, 0)).x;
     const float rate = 1.0f + coreBeta * max(sqrt(gx * gx + gy * gy) - coreTau, 0.0f);   // -ln k: the round-3 cone's rate
-    coreZoneOut[id.xy] = float4(saturate(a), k, log(max(P, 1e-6f)), rate);
+    const float az = saturate(a);
+    // The partial path: alpha_z is the ONE zone value the correction reads (CoreGain samples coreZoneTex.x); the other three
+    // channels are the dump's. A zone's M / lnG move with almost any pixel, alpha_z rarely does (a lit zone's is exactly 1).
+    // Moved = the flag (the decide after round 1's sweep draws the pixel pass in full) and the round-1 sweep re-ordered
+    // over the whole lattice here: the corrected frame of every zone under the moved alpha_z changed. Real branches (HLSL's
+    // && evaluates both operands; a full run binds neither buffer), and no compare once that sweep is ordered in full anyway.
+    [branch] if (RunModePartial() == 1u) {
+        [branch] if (coreLateArgs.Load(ARGS_STAT1_FULL) == 0u) {
+            if (coreAlphaZOut[id.xy] != az) {
+                InterlockedOr(coreChangeFlags[0], 8u);
+                FALD_ORDER_SWEEP_FULL(coreLateArgs, ARGS_STAT1_FULL, ARGS_STAT1_FULL_COMBINE, ARGS_STAT1_PART, ARGS_STAT1_PART_COMBINE)
+            }
+        }
+    }
+    coreAlphaZOut[id.xy] = az;
+    coreZoneOut[id.xy] = float4(az, k, log(max(P, 1e-6f)), rate);
 }
 )";
 
@@ -111,6 +133,7 @@ static const char* kCS = R"(
 groupshared float gCapF[CORE_SCAN_MAX];
 groupshared float gCapB[CORE_SCAN_MAX];
 RWTexture2D<float> coreCapOut : register(u0);
+RWByteAddressBuffer coreLateArgs : register(u6);         // CY only, the partial path: a cap that moved re-orders what reads it
 Texture2D<float> coreCapIn : register(t51);
 [numthreads(64, 1, 1)]
 void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
@@ -123,6 +146,13 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 #else
     const int n = mx.x + 1, lines = mx.y + 1;
     const float st = CORE_CAP_S01 * (float)latW / (float)(cols * sub);
+#endif
+#ifdef CORE_CAP_Y
+    // The partial path: the round's cap A compared with the previous run's. Moved = what reads it re-ordered in full —
+    // round 0's cap (the FaldCB's roundIdx is the cap's round): the round-1 sweep; round 1's: the pixel pass. `watch` is
+    // false on a full run (no buffer bound: the load reads 0 only where the path bit is 0) and once that order stands.
+    bool watch = false;
+    [branch] if (RunModePartial() == 1u) watch = coreLateArgs.Load(roundIdx == 0u ? ARGS_STAT1_FULL : ARGS_PIXEL + 4u) == 0u;
 #endif
     for (int lineIdx = (int)gid.y * gxCount + (int)gid.x; lineIdx < lines; lineIdx += groups) {
         for (int i = (int)tid.x; i < n; i += 64) {
@@ -143,6 +173,12 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         for (int i = (int)tid.x; i < n; i += 64) {
             const float a = min(gCapF[i], gCapB[i]);
 #ifdef CORE_CAP_Y
+            [branch] if (watch) {
+                if (coreCapOut[int2(lineIdx, i)] != a) {
+                    if (roundIdx == 0u) FALD_ORDER_SWEEP_FULL(coreLateArgs, ARGS_STAT1_FULL, ARGS_STAT1_FULL_COMBINE, ARGS_STAT1_PART, ARGS_STAT1_PART_COMBINE)
+                    else FALD_ORDER_PIXEL_FULL(coreLateArgs)
+                }
+            }
             coreCapOut[int2(lineIdx, i)] = a;
 #else
             coreCapOut[int2(i, lineIdx)] = a;
@@ -162,9 +198,13 @@ ID3D11ComputeShader* g_cs[K_COUNT] = {};
 template <typename T> void SafeRel(T*& p) { if (p) { p->Release(); p = nullptr; } }
 }
 
-bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err) {
-    if (FaldCore2ShadersReady()) return true;
-    if (!dev || !common) { if (err) *err = "no device"; return false; }
+const char* FaldCore2ShaderName(unsigned int k) {
+    static const char* const name[K_COUNT] = { "FaldCore2Z1", "FaldCore2Z2", "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
+    return k < (unsigned int)K_COUNT ? name[k] : "?";
+}
+
+std::string FaldCore2ShaderSource(unsigned int k, const char* common) {
+    if (k >= (unsigned int)K_COUNT || !common) return std::string();
     const std::string fx = std::string(kFineHead);
     char a5[160];                                          // alpha's level law (ln G0, ln G1) as float32
     std::snprintf(a5, sizeof(a5), "#define CORE_A5_LN0 %.9ef\n#define CORE_A5_LN1 %.9ef\n",
@@ -174,10 +214,20 @@ bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* er
                   (double)(FALD_CORE2_CAP_S * 0.01f), FALD_CORE2_SCAN_MAX);
     const std::string src[K_COUNT] = { std::string(a5) + kZ1, kZ2, fx + kC1, std::string(cs) + fx + kCS,
                                        std::string(cs) + "#define CORE_CAP_Y 1\n" + fx + kCS };
-    const char* name[K_COUNT] = { "FaldCore2Z1", "FaldCore2Z2", "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
-    const std::string head = std::string(common);
+    return std::string(common) + src[k];
+}
+
+bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err) {
+    if (FaldCore2ShadersReady()) return true;
+    if (!dev || !common) { if (err) *err = "no device"; return false; }
+#ifdef DWMHOOK_EXPORTS
+    if (err) *err = "the hook creates the core's kernels from shipped bytecode (FaldCore2CreateShader)";
+    return false;
+#else
+    static_assert(K_COUNT == (int)FALD_CORE2_SHADERS, "FALD_CORE2_SHADERS");
+    const char* name[K_COUNT] = { FaldCore2ShaderName(0), FaldCore2ShaderName(1), FaldCore2ShaderName(2), FaldCore2ShaderName(3), FaldCore2ShaderName(4) };
     for (int k = 0; k < K_COUNT; k++) {
-        const std::string s = head + src[k];
+        const std::string s = FaldCore2ShaderSource((unsigned int)k, common);
         ID3DBlob* b = nullptr; ID3DBlob* e = nullptr;
         HRESULT hr = D3DCompile(s.c_str(), s.size(), name[k], nullptr, nullptr, "main", "cs_5_0", 0, 0, &b, &e);
         if (FAILED(hr)) {
@@ -191,9 +241,27 @@ bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* er
         if (FAILED(hr)) { if (err) *err = std::string(name[k]) + ": CreateComputeShader failed"; FaldCore2ReleaseShaders(); return false; }
     }
     return true;
+#endif
+}
+
+bool FaldCore2CreateShader(ID3D11Device* dev, unsigned int k, const void* bytecode, size_t bytes) {
+    if (k >= (unsigned int)K_COUNT) return false;
+    if (g_cs[k]) return true;
+    if (!dev || !bytecode || bytes == 0) return false;
+    if (FAILED(dev->CreateComputeShader(bytecode, bytes, nullptr, &g_cs[k]))) { g_cs[k] = nullptr; return false; }
+    return true;
 }
 
 void FaldCore2ReleaseShaders() { for (auto& c : g_cs) SafeRel(c); }
+
+// The layer's precompiled shaders (shared/fald_shader_set.h): this translation unit holds the generated header.
+static_assert(sizeof(g_faldBytecode) / sizeof(g_faldBytecode[0]) == FALD_SH_COUNT, "shared/fald_bytecode.h: regenerate (the shader list changed)");
+FaldShaderBlobRef FaldShaderBytecode(unsigned int id) {
+    FaldShaderBlobRef r = { nullptr, 0u };
+    if (id < FALD_SH_COUNT) { r.data = g_faldBytecode[id].data; r.size = g_faldBytecode[id].size; }
+    return r;
+}
+const char* FaldBytecodeCompiler() { return FALD_BYTECODE_COMPILER; }
 bool FaldCore2ShadersReady() { for (auto* c : g_cs) if (!c) return false; return true; }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -203,6 +271,7 @@ struct Tex { ID3D11Texture2D* t = nullptr; ID3D11UnorderedAccessView* u = nullpt
 struct FaldCore2 {
     unsigned int cols = 0, rows = 0, sub = 0, slices = 0;
     Tex stat, zone, alphaState, lz;          // the zone textures
+    Tex alphaZ;                              // alpha_z alone (R32F): Z2 writes it beside zone.x and, on the partial path, compares
     Tex nodePeak, fa, fb, nodeD[2];          // the fine grid: node peaks (uint), ping / pong, the cap A per round
     ID3D11Buffer* nodePartBuf = nullptr; ID3D11UnorderedAccessView* nodePartUAV = nullptr;   // slices > 1: the sweeps' node partials
     ID3D11Buffer* cb = nullptr;
@@ -228,7 +297,7 @@ FaldCore2* FaldCore2Create() { return new FaldCore2(); }
 
 void FaldCore2Release(FaldCore2* c) {
     if (!c) return;
-    RelTex(c->stat); RelTex(c->zone); RelTex(c->alphaState); RelTex(c->lz);
+    RelTex(c->stat); RelTex(c->zone); RelTex(c->alphaState); RelTex(c->lz); RelTex(c->alphaZ);
     RelTex(c->nodePeak); RelTex(c->fa); RelTex(c->fb); RelTex(c->nodeD[0]); RelTex(c->nodeD[1]);
     SafeRel(c->nodePartUAV); SafeRel(c->nodePartBuf); SafeRel(c->cb);
     c->cols = c->rows = c->sub = c->slices = 0; c->bytes = 0;
@@ -246,6 +315,7 @@ bool FaldCore2Ensure(FaldCore2* c, ID3D11Device* dev, unsigned int cols, unsigne
            && MakeTex(dev, cols, rows, DXGI_FORMAT_R32G32B32A32_FLOAT, c->zone, b, 16)
            && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->alphaState, b, 4)
            && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->lz, b, 4)
+           && MakeTex(dev, cols, rows, DXGI_FORMAT_R32_FLOAT, c->alphaZ, b, 4)
            && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_UINT, c->nodePeak, b, 4)
            && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_FLOAT, c->fa, b, 4)
            && MakeTex(dev, cols * sub, rows * sub, DXGI_FORMAT_R32_FLOAT, c->fb, b, 4)
@@ -309,6 +379,7 @@ static void Unbind(ID3D11DeviceContext* ctx) {
     ID3D11ShaderResourceView* n9 = nullptr;
     ctx->CSSetShaderResources(9, 1, &n9);
     ctx->CSSetUnorderedAccessViews(0, 2, nu, nullptr);
+    ctx->CSSetUnorderedAccessViews(5, 2, nu, nullptr);     // the change flags (Z2) and the late arguments (Z2, CY)
     ctx->CSSetShader(nullptr, nullptr, 0);
 }
 
@@ -317,7 +388,8 @@ static void Dispatch2D(ID3D11DeviceContext* ctx, unsigned cols, unsigned rows, I
     else ctx->Dispatch((cols + 15) / 16, (rows + 15) / 16, 1);
 }
 
-void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11Buffer* args, unsigned int latticeSlot) {
+void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11Buffer* args, unsigned int latticeSlot,
+                      ID3D11UnorderedAccessView* changeFlags, ID3D11UnorderedAccessView* lateArgs) {
     if (!c || !c->cb || !FaldCore2ShadersReady() || c->flags == 0u) return;   // flags 0: BeginRun made this run C (nothing reads the fields)
     // Z1
     ctx->CSSetConstantBuffers(0, 1, &faldCB);
@@ -334,13 +406,16 @@ void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* fald
     ctx->CSSetShader(g_cs[K_Z2], nullptr, 0);
     ID3D11ShaderResourceView* s2[6] = { c->stat.s, nullptr, nullptr, nullptr, c->alphaState.s, c->lz.s };
     ctx->CSSetShaderResources(40, 6, s2);
-    ctx->CSSetUnorderedAccessViews(0, 1, &c->zone.u, nullptr);
+    ID3D11UnorderedAccessView* u2[2] = { c->zone.u, c->alphaZ.u };
+    ctx->CSSetUnorderedAccessViews(0, 2, u2, nullptr);
+    ID3D11UnorderedAccessView* cmp[2] = { changeFlags, lateArgs };   // (null on a full run: the pass compares on the partial path only)
+    ctx->CSSetUnorderedAccessViews(5, 2, cmp, nullptr);
     Dispatch2D(ctx, c->cols, c->rows, args, latticeSlot);
     Unbind(ctx);
 }
 
 void FaldCore2RunCap(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11ShaderResourceView* gainB,
-                     unsigned int round, ID3D11Buffer* args, unsigned int fineSlot) {
+                     unsigned int round, ID3D11Buffer* args, unsigned int fineSlot, ID3D11UnorderedAccessView* lateArgs) {
     if (!c || !c->cb || !FaldCore2ShadersReady() || c->flags == 0u) return;   // flags 0: BeginRun made this run C
     const unsigned fw = c->cols * c->sub, fh = c->rows * c->sub;
     struct Step { int k; ID3D11ShaderResourceView* in; UINT slot; ID3D11UnorderedAccessView* out; };
@@ -356,6 +431,7 @@ void FaldCore2RunCap(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldC
         ctx->CSSetShaderResources(41, 1, &c->zone.s);
         ctx->CSSetShaderResources(st.slot, 1, &st.in);
         ctx->CSSetUnorderedAccessViews(0, 1, &st.out, nullptr);
+        if (st.k == K_CY) ctx->CSSetUnorderedAccessViews(6, 1, &lateArgs, nullptr);   // the round's cap, compared on the partial path
         Dispatch2D(ctx, fw, fh, args, fineSlot);
         Unbind(ctx);
     }

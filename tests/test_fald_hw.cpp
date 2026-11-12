@@ -23,7 +23,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -441,4 +443,265 @@ TEST_CASE("FALD HW: GPU time per run of the layer, the core off / on, content / 
         }
     }
     CHECK_FALSE(stop);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// EXPERIMENT (nothing here ships): the panel clock's maps held inside a DEAD-BAND, measured against the shipped pass.
+// With LED lag = the panel clock, the clock pass flags "a map moved" by an exact compare, and on the owner's settings the
+// maps never stop moving: the round-1 drives feed back through the correction and the float32 states end in a limit cycle
+// one unit in the last place wide, so every present of a static desktop runs the convolutions, the round-1 sweep and the
+// pixel pass in full (tests/test_perf.cpp DLUT_PERF_FALD: 300 of 300 presents). The variant below holds a zone's two maps
+// at their previous values while the new ones are within EPS (relative) of them — the clocks' own states keep their exact
+// evolution, so the held maps are never further than EPS from the shipped ones — and flags only real movement.
+// The measurement: the SAME scheduled sequence (a cut, a long still, a caret-sized edit, a still) through the shipped
+// pass and through the variant at each EPS; per variant how many still runs moved a map, and how far its output frames
+// are from the shipped pass's (FP16 scRGB, 1.0 = 80 nits) at the sampled runs.
+// FALD_HW_DEADBAND_OUT=<dir> (deadband.tsv); FALD_HW_DEADBAND_FRAMES="a.rgba16f;b.rgba16f" (3840 x 2160 FP16 frames: the
+// layer's INPUT, e.g. the hook's intermediate dumped by DLUT_PERF_FALD_DUMP_INTER); FALD_HW_DEADBAND_EPS="1e-6;1e-5;1e-4".
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+void DbWaitUntil(long long targetQpc) {
+    LARGE_INTEGER now;
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= targetQpc) return;
+        SwitchToThread();
+    }
+}
+std::vector<unsigned char> DbReadBack(ID3D11Texture2D* tex) {
+    std::vector<unsigned char> out;
+    D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(g_device->CreateTexture2D(&d, nullptr, &st))) return out;
+    g_context->CopyResource(st, tex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        out.resize((size_t)d.Width * d.Height * 8u);
+        for (UINT y = 0; y < d.Height; y++)
+            std::memcpy(out.data() + (size_t)y * d.Width * 8u, (const unsigned char*)m.pData + (size_t)y * m.RowPitch, (size_t)d.Width * 8u);
+        g_context->Unmap(st, 0);
+    }
+    st->Release();
+    return out;
+}
+bool DbConvRan(const FaldResources* r) {                 // did the last partial run's decide order round 0's convolution?
+    D3D11_BUFFER_DESC d; r->argsBuf->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0; d.StructureByteStride = 0;
+    ID3D11Buffer* st = nullptr;
+    if (FAILED(g_device->CreateBuffer(&d, nullptr, &st))) return true;
+    g_context->CopyResource(st, r->argsBuf);
+    bool ran = true;
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        const uint32_t* a = (const uint32_t*)((const unsigned char*)m.pData + FALD_ARGS_CONV0);
+        ran = a[0] != 0u && a[1] != 0u && a[2] != 0u;
+        g_context->Unmap(st, 0);
+    }
+    st->Release();
+    return ran;
+}
+float DbHalf(uint16_t h) {
+    const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+    float v;
+    if (e == 0) v = std::ldexp((float)m, -24);
+    else if (e == 31) v = m ? NAN : INFINITY;
+    else v = std::ldexp((float)(m | 0x400u), (int)e - 25);
+    return s ? -v : v;
+}
+}  // namespace
+
+TEST_CASE("FALD HW experiment: the panel clock's maps held inside a dead-band, against the shipped pass (FALD_HW_DEADBAND_OUT)") {
+    const std::string out = HwEnv("FALD_HW_DEADBAND_OUT");
+    if (out.empty()) return;
+    CreateDirectoryA(out.c_str(), nullptr);
+    std::vector<std::string> frames, epsList;
+    {
+        std::stringstream fs(HwEnv("FALD_HW_DEADBAND_FRAMES")), es(HwEnv("FALD_HW_DEADBAND_EPS").empty() ? "1e-6;1e-5;1e-4" : HwEnv("FALD_HW_DEADBAND_EPS"));
+        std::string t;
+        while (std::getline(fs, t, ';')) if (!t.empty()) frames.push_back(t);
+        while (std::getline(es, t, ';')) if (!t.empty()) epsList.push_back(t);
+    }
+    REQUIRE_MESSAGE(frames.size() >= 2, "FALD_HW_DEADBAND_FRAMES needs two 3840 x 2160 FP16 frames");
+    const std::wstring panel = L"H:\\Projects\\DesktopLUT\\DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin";
+    REQUIRE(GetFileAttributesW(panel.c_str()) != INVALID_FILE_ATTRIBUTES);
+    const int W = 3840, H = 2160;
+    std::vector<uint16_t> fA((size_t)W * H * 4), fB((size_t)W * H * 4);
+    for (int i = 0; i < 2; i++) {
+        std::ifstream f(frames[(size_t)i], std::ios::binary);
+        REQUIRE_MESSAGE(f.good(), frames[(size_t)i]);
+        std::vector<uint16_t>& dst = i ? fB : fA;
+        f.read((char*)dst.data(), (std::streamsize)(dst.size() * 2));
+        REQUIRE((size_t)f.gcount() == dst.size() * 2);
+    }
+    // the schedule: k refreshes between runs alternate 2 / 3 (what a 120 Hz monitor sees of presents ~20 ms apart) on a
+    // nominal period long enough for a run with its upload; the still phases are what the comparison is about
+    const double periodMs = 12.0;
+    const int nStill1 = 160, nStill2 = 60;
+    const std::vector<int> sample = { 0, 1, 2, 4, 9, 19, 39, 79, 157, 158, 159 };   // still-1 runs whose output is kept (+ the edit, + sample2)
+    // FALD_HW_DEADBAND_K = the refreshes between runs, a digit string cycled ("23" by default: presents ~20 ms apart on a
+    // 120 Hz monitor; "1" = a present every refresh, the host's settle kicks)
+    std::string kPattern = HwEnv("FALD_HW_DEADBAND_K");
+    if (kPattern.empty() || kPattern.find_first_not_of("123456789") != std::string::npos) kPattern = "23";
+    const std::vector<int> sample2 = { 0, 1, 4, 19, 59 };
+
+    struct RunOut { std::vector<std::vector<unsigned char>> kept; int moved1 = 0, moved2 = 0, ran1 = 0, ran2 = 0; std::vector<unsigned long long> k; };
+    auto sequence = [&](const std::string& eps, RunOut& ro) -> bool {
+        // the device's layer shaders: the shipped set, or the same sources with the clock pass's dead-band variant
+        ReleaseFaldShaders();
+        FaldShaderSources src = FaldDefaultShaderSources();
+        std::string clock = g_faldPanelClockSource;
+        if (!eps.empty()) {
+            const std::string from =
+                "    if (RunModePartial() == 1u && (clkTrueOut[id.xy] != oTrue || clkEstOut[id.xy] != oEst)) InterlockedOr(changeFlags[0], 1u);\n";
+            const std::string to =
+                "    if (RunModePartial() == 1u) {\n"
+                "        const float pT = clkTrueOut[id.xy], pE = clkEstOut[id.xy];\n"
+                "        const bool mv = abs(oTrue - pT) > " + eps + "f * max(abs(pT), 1e-6f) || abs(oEst - pE) > " + eps + "f * max(abs(pE), 1e-6f);\n"
+                "        if (mv) InterlockedOr(changeFlags[0], 1u); else { oTrue = pT; oEst = pE; }\n"
+                "    }\n";
+            const size_t at = clock.find(from);
+            if (at == std::string::npos) { MESSAGE("the clock pass's compare line was not found - the experiment's variant needs updating"); return false; }
+            clock.replace(at, from.size(), to);
+        }
+        src.panelClock = clock.c_str();
+        if (!InitFaldShadersFrom(src)) return false;
+        MonitorContext ctx;
+        ctx.width = W; ctx.height = H; ctx.isHDREnabled = true; ctx.isFP16SDR = false;
+        ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = (float)periodMs;
+        FaldSettings& fs = ctx.hdrColorCorrection.fald;
+        fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = true; fs.coreMode = FALD_CORE_MODE_KC5;
+        fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockClosure = 0.72f; fs.clockParity = -1;
+        if (!FaldEnsureResources(&ctx, fs)) { FaldReleaseResources(&ctx); return false; }
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)W; td.Height = (UINT)H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
+        g_device->CreateTexture2D(&td, nullptr, &target);
+        if (target) g_device->CreateRenderTargetView(target, nullptr, &rtv);
+        if (!rtv) { if (target) target->Release(); FaldReleaseResources(&ctx); return false; }
+        ID3D11VertexShader* vs = nullptr;
+        {
+            ID3DBlob* b = nullptr;
+            if (SUCCEEDED(D3DCompile(g_faldFullscreenVsSource, std::strlen(g_faldFullscreenVsSource), "vs", nullptr, nullptr, "main", "vs_5_0", 0, 0, &b, nullptr))) {
+                g_device->CreateVertexShader(b->GetBufferPointer(), b->GetBufferSize(), nullptr, &vs);
+                b->Release();
+            }
+        }
+        LARGE_INTEGER freq, t0;
+        QueryPerformanceFrequency(&freq);
+        std::vector<uint16_t> frame = fA;
+        unsigned long long key = 1;
+        long long refresh = 0;
+        int run = 0;
+        const FaldChangeRect caret = { W / 5, H * 3 / 10, W / 5 + 2, H * 3 / 10 + 18 };
+        auto one = [&](bool newContent, const FaldChangeRect* rects, int numRects, bool upload) {
+            refresh += (run == 0) ? 0 : (long long)(kPattern[(size_t)run % kPattern.size()] - '0');
+            if (run == 0) { QueryPerformanceCounter(&t0); t0.QuadPart += freq.QuadPart / 10; }
+            if (upload) g_context->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)W * 8u, 0);
+            g_context->Flush();
+            DbWaitUntil(t0.QuadPart + (long long)((double)refresh * periodMs * (double)freq.QuadPart / 1000.0));
+            D3D11_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+            g_context->RSSetViewports(1, &vp);
+            g_context->VSSetShader(vs, nullptr, 0);
+            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            FaldRunPasses(&ctx, rtv, newContent, key, rects, numRects);
+            g_context->Flush();
+            ro.k.push_back(ctx.fald->clkElapsed);
+            run++;
+        };
+        for (int i = 0; i < 3; i++) one(true, nullptr, -1, true);                      // frame A, settled enough for the cut to be a cut
+        frame = fB; key++;
+        one(true, nullptr, -1, true);                                                  // the cut
+        for (int i = 0; i < nStill1; i++) {                                            // a static desktop: no rect
+            one(false, nullptr, 0, false);
+            if (ctx.fald->lastPartial) { ro.ran1++; if (DbConvRan(ctx.fald)) ro.moved1++; }
+            if (std::find(sample.begin(), sample.end(), i) != sample.end()) ro.kept.push_back(DbReadBack(target));
+        }
+        for (int y = caret.top; y < caret.bottom; y++)                                 // a caret: dark, 2 x 18 px
+            for (int x = caret.left; x < caret.right; x++)
+                for (int c = 0; c < 3; c++) frame[((size_t)y * W + x) * 4 + c] = 0x2800;   // 2^-5 scRGB = 2.5 nits
+        key++;
+        one(true, &caret, 1, true);
+        ro.kept.push_back(DbReadBack(target));
+        for (int i = 0; i < nStill2; i++) {
+            one(false, nullptr, 0, false);
+            if (ctx.fald->lastPartial) { ro.ran2++; if (DbConvRan(ctx.fald)) ro.moved2++; }
+            if (std::find(sample2.begin(), sample2.end(), i) != sample2.end()) ro.kept.push_back(DbReadBack(target));
+        }
+        if (vs) vs->Release();
+        rtv->Release(); target->Release();
+        FaldReleaseResources(&ctx);
+        return true;
+    };
+
+    HwDev hw;
+    REQUIRE(hw.ok);
+    std::ofstream tsv(out + "\\deadband.tsv");
+    tsv << "adapter\teps\tstill1_partial\tstill1_moved\tstill2_partial\tstill2_moved\tschedule_equal\tframes_compared\tframes_differing\tcomponents_differing_max\tmax_abs_scrgb\tmax_abs_nits\tmax_rel\n";
+    RunOut ref;
+    REQUIRE(sequence(std::string(), ref));
+    MESSAGE("shipped pass (k pattern " << kPattern << "): " << ref.moved1 << " of " << ref.ran1 << " still runs after the cut moved a map, " << ref.moved2 << " of " << ref.ran2 << " after the caret");
+    // how far the SHIPPED output itself moves between presents of the static desktop, long after the cut (still runs 157,
+    // 158, 159: kept frames 8, 9, 10): the yardstick for the variants' differences below
+    auto frameDiff = [&](const std::vector<unsigned char>& fa, const std::vector<unsigned char>& fb, size_t& comp, double& maxAbs, double& maxRel) {
+        comp = 0; maxAbs = 0.0; maxRel = 0.0;
+        const uint16_t* a = (const uint16_t*)fa.data(); const uint16_t* b = (const uint16_t*)fb.data();
+        for (size_t j = 0; j < fa.size() / 2 && j < fb.size() / 2; j++) {
+            if (a[j] == b[j]) continue;
+            comp++;
+            const double x = (double)DbHalf(a[j]), y = (double)DbHalf(b[j]);
+            const double d = std::fabs(x - y);
+            if (d > maxAbs) maxAbs = d;
+            const double rel = d / std::max(std::max(std::fabs(x), std::fabs(y)), 1e-6);
+            if (rel > maxRel) maxRel = rel;
+        }
+    };
+    if (ref.kept.size() >= 11) {
+        size_t c1 = 0, c2 = 0; double a1 = 0, r1 = 0, a2 = 0, r2 = 0;
+        frameDiff(ref.kept[9], ref.kept[10], c1, a1, r1);
+        frameDiff(ref.kept[8], ref.kept[10], c2, a2, r2);
+        MESSAGE("shipped pass, the static desktop's own movement: still run 158 -> 159: " << c1 << " components differ, max " << a1 * 80.0 << " nits, max relative " << r1
+                << "; 157 -> 159: " << c2 << " components, max " << a2 * 80.0 << " nits, max relative " << r2);
+        tsv << hw.adapter << "\tshipped_158_vs_159\t-\t-\t-\t-\t1\t1\t" << (c1 ? 1 : 0) << "\t" << c1 << "\t" << a1 << "\t" << a1 * 80.0 << "\t" << r1 << "\n";
+        tsv << hw.adapter << "\tshipped_157_vs_159\t-\t-\t-\t-\t1\t1\t" << (c2 ? 1 : 0) << "\t" << c2 << "\t" << a2 << "\t" << a2 * 80.0 << "\t" << r2 << "\n";
+    }
+    tsv << hw.adapter << "\t0\t" << ref.ran1 << "\t" << ref.moved1 << "\t" << ref.ran2 << "\t" << ref.moved2 << "\t1\t" << ref.kept.size() << "\t0\t0\t0\t0\t0\n";
+    {   // the same sequence through the shipped pass again: the harness's own repeatability (must be 0 everywhere)
+        RunOut again;
+        REQUIRE(sequence(std::string(), again));
+        size_t differ = 0;
+        for (size_t i = 0; i < ref.kept.size() && i < again.kept.size(); i++) if (ref.kept[i] != again.kept[i]) differ++;
+        MESSAGE("repeat of the shipped pass: " << differ << " of " << ref.kept.size() << " kept frames differ, schedule " << std::string(ref.k == again.k ? "equal" : "DIFFERENT"));
+        tsv << hw.adapter << "\trepeat\t" << again.ran1 << "\t" << again.moved1 << "\t" << again.ran2 << "\t" << again.moved2 << "\t" << (ref.k == again.k ? 1 : 0) << "\t"
+            << ref.kept.size() << "\t" << differ << "\t-\t-\t-\t-\n";
+    }
+    for (const std::string& eps : epsList) {
+        RunOut v;
+        REQUIRE(sequence(eps, v));
+        size_t framesDiffer = 0, compMax = 0;
+        double maxAbs = 0.0, maxRel = 0.0;
+        for (size_t i = 0; i < ref.kept.size() && i < v.kept.size(); i++) {
+            if (ref.kept[i] == v.kept[i]) continue;
+            framesDiffer++;
+            const uint16_t* a = (const uint16_t*)ref.kept[i].data(); const uint16_t* b = (const uint16_t*)v.kept[i].data();
+            size_t comp = 0;
+            for (size_t j = 0; j < ref.kept[i].size() / 2; j++) {
+                if (a[j] == b[j]) continue;
+                comp++;
+                const double x = (double)DbHalf(a[j]), y = (double)DbHalf(b[j]);
+                const double d = std::fabs(x - y);
+                if (d > maxAbs) maxAbs = d;
+                const double rel = d / std::max(std::max(std::fabs(x), std::fabs(y)), 1e-6);
+                if (rel > maxRel) maxRel = rel;
+            }
+            compMax = std::max(compMax, comp);
+        }
+        MESSAGE("dead-band " << eps << ": " << v.moved1 << " of " << v.ran1 << " still runs after the cut moved a map, " << v.moved2 << " of " << v.ran2
+                << " after the caret; " << framesDiffer << " of " << ref.kept.size() << " kept output frames differ from the shipped pass's, at most " << compMax
+                << " of " << (size_t)W * H * 4 << " components, max " << maxAbs << " scRGB (" << maxAbs * 80.0 << " nits), max relative " << maxRel
+                << "; schedule " << std::string(ref.k == v.k ? "equal" : "DIFFERENT (compare with care)"));
+        tsv << hw.adapter << "\t" << eps << "\t" << v.ran1 << "\t" << v.moved1 << "\t" << v.ran2 << "\t" << v.moved2 << "\t" << (ref.k == v.k ? 1 : 0) << "\t"
+            << ref.kept.size() << "\t" << framesDiffer << "\t" << compMax << "\t" << maxAbs << "\t" << maxAbs * 80.0 << "\t" << maxRel << "\n";
+    }
 }

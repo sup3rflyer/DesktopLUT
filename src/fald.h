@@ -139,6 +139,7 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* gain0Tex = nullptr;  ID3D11UnorderedAccessView* gain0UAV = nullptr;  ID3D11ShaderResourceView* gain0SRV = nullptr;
     ID3D11Buffer* zoneListBuf = nullptr; ID3D11ShaderResourceView* zoneListSRV = nullptr;   // dynamic, cols * rows uints
     ID3D11Buffer* changeFlagsBuf = nullptr; ID3D11UnorderedAccessView* changeFlagsUAV = nullptr;   // 3 uints, zeroed
+    ID3D11Buffer* argsLateBuf = nullptr; ID3D11UnorderedAccessView* argsLateUAV = nullptr;   // the LATE arguments (fald_change.h)
     ID3D11Buffer* argsBuf = nullptr; ID3D11UnorderedAccessView* argsUAV = nullptr;   // FALD_ARGS_BYTES, raw, indirect
     uint32_t runMode = 0;                  // CB word 79 of the next FillCB (fald_shader.h runMode)
     bool stateComplete = false;            // the previous run left every texture of a complete run (FaldChangeInputs)

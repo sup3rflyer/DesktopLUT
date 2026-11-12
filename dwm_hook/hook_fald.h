@@ -46,12 +46,21 @@ struct ID3D11Buffer;
 // out by FaldAcquire and released wholesale by FaldReleaseAll (UninitializeStuff).
 struct FaldMonitor;
 
-// Compile the core's shaders (5 compute + the pixel pass + a fullscreen-triangle vertex shader) on
-// DWM's device. Safe to call repeatedly; false leaves the layer permanently off for this attach.
-// Called from InitializeStuff, so a compile failure costs the FALD layer and nothing else.
+// The layer's shaders, created on DWM's device from SHIPPED BYTECODE (shared/fald_bytecode.h; nothing is compiled inside
+// dwm.exe) and only when a monitor needs the layer — RenderLUT asks on a present of a monitor whose layer switch is on or
+// that has a live panel file announced; a hook user who never enables FALD creates nothing.
+// FaldInitShadersStep does a bounded SLICE of that work per call: it creates shader objects (~0.1 ms each on an RTX 5090,
+// 22 of them, then the sampler / rasterizer state and the two timing rings) until `budgetUs` microseconds of the calling
+// present are spent — at least one object per call, budgetUs < 0 = everything now — and returns true once the layer can
+// run (FaldShadersReady). Until then the caller's present takes the path without the layer. A creation the layer cannot
+// run without failing latches FaldShadersFailed for this attach (logged once; FaldReleaseShaders clears it).
+// FaldInitShaders = everything at once (the tests; ~3.4 ms).
+#define FALD_INIT_STEP_BUDGET_US 250.0
+bool FaldInitShadersStep(ID3D11Device* dev, ID3D11DeviceContext* ctx, double budgetUs = FALD_INIT_STEP_BUDGET_US);
 bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx);
 void FaldReleaseShaders();
 bool FaldShadersReady();
+bool FaldShadersFailed();
 
 // Read the panel parameter files the host staged for this injection ("<left>_<top>.bin" and
 // "<left>_<top>_hdr.bin" under <lutFolder>\fald). Called once at attach, beside AddLUTs: the
@@ -179,4 +188,34 @@ unsigned long long FaldTestHeldRuns(const FaldMonitor* m);
 unsigned long long FaldTestClockElapsed(const FaldMonitor* m);
 bool FaldTestClockSeeded(const FaldMonitor* m);
 bool FaldTestLastPartial(const FaldMonitor* m);
+// The layer's GPU commands of a present, by pass (tests/test_perf.cpp's per-pass timing and the "did not run" tests): a
+// hook called before and after each pass the host ISSUES. slot < 0 = issued directly (it runs); slot >= 0 = an indirect
+// dispatch / draw whose arguments stand at that byte offset of the arguments buffer (FaldTestArgs; shared/fald_change.h
+// FALD_ARGS_*) or, for the slots FaldArgsLate names, of the late one (FaldTestLateArgs) — it ran iff those arguments are
+// non-zero (a test reads the buffers back after the present: a slot's last value is the one its pass was run with).
+enum FaldHookPass : unsigned int {
+    FALD_HP_CLEAN_COPY = 0,   // FaldUpdateClean: this present's rects, back buffer -> the clean copy
+    FALD_HP_PREDECIDE,        // the "frame changed everywhere" word's copy + the decide before any sweep
+    FALD_HP_STAR_S0, FALD_HP_STAR_S0_FULL, FALD_HP_DECIDE_STAR, FALD_HP_STAR_S1, FALD_HP_STAR_S2,
+    FALD_HP_CLOCK,
+    FALD_HP_STAT0, FALD_HP_STAT0_FULL, FALD_HP_DECIDE0, FALD_HP_CORE_ZONE, FALD_HP_CONV0, FALD_HP_GAIN0, FALD_HP_CORE_CAP0,
+    FALD_HP_STAT1, FALD_HP_STAT1_FULL, FALD_HP_DECIDE1, FALD_HP_CONV1, FALD_HP_GAIN1, FALD_HP_CORE_CAP1,
+    FALD_HP_COMMIT, FALD_HP_PIXEL_FULL, FALD_HP_PIXEL_RECTS, FALD_HP_TUNE,
+    FALD_HP_COUNT
+};
+const char* FaldHookPassName(unsigned int pass);
+struct FaldHookPassHook {
+    virtual void Before(ID3D11DeviceContext* ctx, unsigned int pass, int slot) = 0;
+    virtual void After(ID3D11DeviceContext* ctx, unsigned int pass) = 0;
+};
+extern FaldHookPassHook* g_faldHookPassHook;
+ID3D11Buffer* FaldTestArgs(FaldMonitor* m);
+ID3D11Buffer* FaldTestLateArgs(FaldMonitor* m);
+// The run's kind of the last FaldRun: 0 full, 1 partial (the GPU decided the rest), 2 held (the governor's cap), 3 idle
+// (nothing could have changed: no GPU command issued at all).
+unsigned int FaldTestLastRunKind(const FaldMonitor* m);
+// The conv auto-tune (shared/fald_conv_tune.h): its state (FaldConvTuner::State as a number; 2 = still tuning) and the
+// sub-offsets per thread of the variant in use.
+unsigned int FaldTestConvTuneState(const FaldMonitor* m);
+unsigned int FaldTestConvSo(const FaldMonitor* m);
 #endif
