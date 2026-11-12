@@ -10,6 +10,7 @@
 #include "mhc_preview.h"   // MhcPreviewHolds
 #include "fald.h"
 #include "lut.h"   // LoadLUT + WriteCanonicalCube: the staged cube is the host's parse
+#include "dwmcore_scan.h"   // the pre-flight: the hook's anchor patterns in the on-disk dwmcore
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -523,6 +524,17 @@ bool IsDwmHookActive()
 
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::wstring* stagingWarning)
 {
+    // Pre-flight (dwmcore_scan.h): the path the DLL will take must find its anchor patterns in the on-disk dwmcore,
+    // or the DLL would refuse to load inside dwm.exe (or load and not cover fullscreen windows). Then dwm.exe is not
+    // touched at all. Read and scanned once per process; a file that cannot be read leaves the decision to the DLL.
+    {
+        const DwmHookPreflight& pf = DwmHookPreflightCheck();
+        if (!pf.ok) {
+            std::wcout << L"[DWM Hook] Pre-flight: the hook's anchor patterns are missing from dwmcore.dll — not injecting"
+                       << std::endl;
+            return DwmHookPreflightReason(pf);
+        }
+    }
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     g_injectedSetValid = false;   // whatever happens below, the old set no longer describes the hook
     SystemImpersonationGuard impGuard;

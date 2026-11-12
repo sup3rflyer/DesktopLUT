@@ -2,6 +2,7 @@
 // Reads the Windows build and dwmcore.dll's file version once and judges them (dwm_hook_build.h).
 
 #include "dwm_hook_build.h"
+#include "dwmcore_scan.h"
 
 #include <windows.h>
 #include <cstdio>
@@ -25,9 +26,13 @@ const wchar_t* DwmHookBranchName(DwmHookBranch b) {
 }
 
 DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running) {
+    return MakeDwmHookBuildStatus(osBuild, running, DwmHookBranchForOsBuild(osBuild));
+}
+
+DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running, DwmHookBranch branch) {
     DwmHookBuildStatus s;
     s.osBuild = osBuild;
-    s.branch = DwmHookBranchForOsBuild(osBuild);
+    s.branch = branch;
     s.running = running;
     s.verified = VerifiedDwmcoreFor(s.branch);
     s.verdict = JudgeDwmcore(s.branch, running);
@@ -83,34 +88,33 @@ DwmcoreVersion ReadDwmcoreVersion() {
 }  // namespace
 
 const DwmHookBuildStatus& DwmHookBuildCheck() {
-    static const DwmHookBuildStatus s = MakeDwmHookBuildStatus(ReadOsBuild(), ReadDwmcoreVersion());
+    static const DwmHookBuildStatus s = [] {
+        const uint32_t os = ReadOsBuild();
+        DwmHookBranch branch = DwmHookBranchForOsBuild(os);
+        if (branch == DwmHookBranch::Win11_24H2) {
+            // A 24H2 build: the DLL takes the 25H2 path when this dwmcore carries the 25H2 code (dwmcore_scan.h), and
+            // is then judged against the 25H2 baseline. Only these builds read the file here.
+            wchar_t sys[MAX_PATH] = {};
+            const UINT n = GetSystemDirectoryW(sys, MAX_PATH);
+            DwmcoreImage img;
+            if (n > 0 && n < MAX_PATH && LoadDwmcoreImage(std::wstring(sys) + L"\\dwmcore.dll", img))
+                branch = DwmHookBranchFor(os, &img);
+        }
+        return MakeDwmHookBuildStatus(os, ReadDwmcoreVersion(), branch);
+    }();
     return s;
 }
 
 std::wstring DwmHookBuildTooltip(const DwmHookBuildStatus& s) {
-    std::wstring first;
-    switch (s.verdict) {
-    case DwmcoreVerdict::Newer:
-        first = L"Not tested with this Windows update (dwmcore " + FormatDwmcoreVersion(s.running) + L", tested up to " +
-                FormatDwmcoreVersion(s.verified) + L").";
-        break;
-    case DwmcoreVerdict::NoBaseline:
-        first = L"Not tested on this Windows version (dwmcore " + FormatDwmcoreVersion(s.running) + L").";
-        break;
-    case DwmcoreVerdict::Unknown:
-        first = L"Could not read this Windows' dwmcore.dll version.";
-        break;
-    case DwmcoreVerdict::Verified:
-        return {};
-    }
-    return first + L"\nIf colours look wrong, turn DWM HOOK off.";
+    if (!DwmHookBuildNewerThanVerified(s)) return {};
+    return L"Not tested with this Windows update (dwmcore " + FormatDwmcoreVersion(s.running) + L", tested up to " +
+           FormatDwmcoreVersion(s.verified) + L").\nIf colours look wrong, turn DWM HOOK off.";
 }
 
 std::wstring DwmHookBuildDetail(const DwmHookBuildStatus& s) {
     std::wstring d = L"Windows build " + std::to_wstring(s.osBuild) + L", dwmcore.dll " +
                      FormatDwmcoreVersion(s.running) + L". The hook's patterns for " + DwmHookBranchName(s.branch);
-    d += s.verified.valid ? L" were verified up to dwmcore " + FormatDwmcoreVersion(s.verified) + L"."
-                          : std::wstring(L" have no verified dwmcore version recorded for this release.");
+    d += L" were verified up to dwmcore " + FormatDwmcoreVersion(s.verified) + L".";
     d += L"\n\nThe hook still runs. A Windows update can change the desktop compositor so that colours come out "
          L"wrong (a tint, flicker) instead of the hook failing. If colours look wrong, switch DWM HOOK off in "
          L"Settings: the overlay then applies your corrections.";

@@ -158,9 +158,15 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                         "Builds from 2026-11-12 also carry dwmcore:{version:str|null (the running "
                         "Windows' dwmcore.dll, e.g. '10.0.26100.9168'), verified_up_to:str|null (the newest "
                         "dwmcore this DesktopLUT's hook was verified against for that Windows branch; null = "
-                        "none recorded), tested:bool}: tested false = the hook still runs on a compositor it "
-                        "was never checked on (a Windows update can tint the output instead of failing), so "
-                        "a run measuring through the hook should say so.",
+                        "none recorded), tested:bool|null, verdict:'verified'|'newer'|'no_baseline'|"
+                        "'unknown'}: tested false (verdict newer) = the hook still runs on a compositor newer "
+                        "than any it was checked on (a Windows update can tint the output instead of "
+                        "failing), so a run measuring through the hook should say so; tested null = no "
+                        "verified version is recorded for that Windows branch, or the version is unreadable. "
+                        "dwmcore.preflight:{ran:bool, ok:bool, missing:[str]}: the host's scan of the on-disk "
+                        "dwmcore for the hook's anchor patterns; ok false = DesktopLUT refuses to inject and "
+                        "falls back to the overlay (missing names the patterns); ran false = the file could "
+                        "not be read.",
                 "overlay": "object {awake:bool (the overlay render path is running and not auto-asleep), "
                            "dwm_hook_mode:bool}: which path renders what a meter sees. The awake FP16 "
                            "overlay reads 0.5-2.4 % below the sleeping one at low levels (DLC fald-lessons "

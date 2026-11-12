@@ -1129,7 +1129,9 @@ static void HookUnusableFallBackToOverlay(const std::wstring& why) {
 // README promised the overlay as the fall-back. Now: one retry after a short wait (a dwm.exe restarting at that
 // moment), then the watchdog's fall-back. Not during a calibration run or a live edit: no engine change under it, the
 // error is reported as before. GUI thread.
-static void HandleDwmHookStartFailed(HWND hwnd) {
+// noRetry: the pre-flight refused (the on-disk dwmcore lacks the hook's anchor patterns: dwmcore_scan.h); dwm.exe was
+// never touched and a retry would refuse again.
+static void HandleDwmHookStartFailed(HWND hwnd, bool noRetry) {
     const std::wstring err = g_dwmHookStartError;
     if (!g_dwmHookMode.load() || g_gui.isRunning) return;   // the engine was switched, or a later start got through
     const std::wstring firstLine = err.substr(0, err.find(L'\n'));
@@ -1143,6 +1145,12 @@ static void HandleDwmHookStartFailed(HWND hwnd) {
         } else {
             notify::Post(notify::Sev::Error, -1, L"hook", firstLine, err);
         }
+        return;
+    }
+    if (noRetry) {
+        std::wcout << L"[DWM Hook] Pre-flight refused: falling back to the overlay" << std::endl;
+        g_dwmHookStability.OnGiveUp();
+        HookUnusableFallBackToOverlay(err);
         return;
     }
     if (g_dwmHookStability.OnStartFailed() == HookStartFailAction::Retry) {
@@ -1163,7 +1171,7 @@ static void ReportUnverifiedDwmcoreOnce() {
     if (s_reported) return;
     s_reported = true;
     const DwmHookBuildStatus& s = DwmHookBuildCheck();
-    if (!DwmHookBuildUntested(s)) return;
+    if (!DwmHookBuildNewerThanVerified(s)) return;
     std::wcout << L"[DWM Hook] dwmcore.dll " << FormatDwmcoreVersion(s.running)
                << L" is not among the verified versions (newest verified for this branch: "
                << FormatDwmcoreVersion(s.verified) << L")" << std::endl;
@@ -2584,7 +2592,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_DWMHOOK_START_FAILED:   // a hook-mode start could not inject (StartProcessing; its transition is over)
-        HandleDwmHookStartFailed(hwnd);
+        HandleDwmHookStartFailed(hwnd, wParam == 1);
         return 0;
 
     case WM_SHADER_STATE_CHANGED:  // Shader active state changed (from render thread)

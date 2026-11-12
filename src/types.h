@@ -102,7 +102,8 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 // Resolve each display's refresh-rate trim again (refresh_trim.h ReconcileRefreshTrim; any thread -> GUI thread).
 #define WM_REFRESH_TRIM          (WM_USER + 114)
 // A hook-mode start could not inject the DWM hook (g_dwmHookStartError says why): retry once, then fall back to the
-// overlay (dwm_hook_stability.h). Posted by StartProcessing, handled once its transition is over (GUI thread).
+// overlay (dwm_hook_stability.h); wParam 1 = the pre-flight refused (dwmcore_scan.h): fall back at once. Posted by
+// StartProcessing, handled once its transition is over (GUI thread).
 #define WM_DWMHOOK_START_FAILED  (WM_USER + 120)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"

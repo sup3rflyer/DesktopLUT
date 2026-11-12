@@ -217,6 +217,10 @@ every injected state is lost.
 - While injected, the hook keeps every window on every display composed (no independent flip, no multiplane
   overlays), so fullscreen games can lose VRR. Passthrough Mode only hides overlay windows; it does not touch the
   hook. Do not tell users it restores VRR in hook mode: the way out is DWM HOOK off.
+- The AOB patterns live in `shared/dwm_hook_patterns.h` (one source). Before any change to them, or any hardware test
+  of a new Windows build, run the offline audit: `DLUT_DWMCORE=<that dwmcore.dll> DesktopLUT.Tests.exe -tc="dwmcore
+  scan*" -s` prints every pattern's RVA per branch. DllMain's scan loops have copies in `src/dwmcore_scan.cpp` (the
+  host's pre-flight); change one, change the other.
 - After repairing or re-verifying the hook against a new `dwmcore.dll`, raise that branch's entry in
   `kVerifiedDwmcore` (`src/dwm_hook_build.h`) to the raw file version checked; otherwise users get the
   "untested Windows update" notice.
