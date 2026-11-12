@@ -48,6 +48,14 @@ Design goals, in order of how often they decide a change:
   before starting a test build.
 - **It runs elevated** (the DWM hook needs admin). The calibration pipe is the only external control surface, and it
   is opt-in. Leave it off unless the task needs it, and turn it off afterwards.
+- **Removing everything** is one code path (`src/uninstall*.cpp`), reached from Settings → ABOUT → REMOVE EVERYTHING…
+  and from `DesktopLUT.exe /uninstall [/quiet]`. It stops processing, unloads the hook, puts the reported HDR peak
+  back, takes every `DesktopLUT_*` profile off every connected display (a neutral identity first, so the hardware LUT
+  ends neutral), deletes the profile files, the logon task and the `DesktopLUT_*` files in `%SystemRoot%\Temp`, then
+  exits; the folder stays. A running instance is asked to exit first. Exit code 0 = all removed, 1 = a step failed,
+  2 = another instance would not exit (nothing changed); the per-step result is in `DesktopLUT_uninstall.txt` next to
+  the exe. It needs a UAC approval from the user, and it removes the user's calibration from scanout: run it only
+  when the user asked for it. Displays that are not connected keep their association entries (connect them first).
 - **Ask before changing a display the user is working on.** Calibration and live tests take the screen over.
 
 ## 3. Build
@@ -120,6 +128,7 @@ refresh-rate trim, the readers for DLC's files, the interface model, and the sha
 | `src/lut.*` | `.cube` / eeColor `.txt` parsing |
 | `src/color.*`, `src/mhc.*`, `src/mhc_icc.cpp`, `src/mhc_read.cpp` | Color math, MHC2 profile generation, ICC / 1D cube import |
 | `src/mhc_install.cpp` | Windows color profile install, association, self-healing |
+| `src/uninstall.*`, `src/uninstall_win.*` | Remove everything: the plan and executor (pure, tested with fakes); the system half and `/uninstall` |
 | `src/mhc_preview.*`, `shared/mhc_scanout_hlsl.h` | Live edit preview exact to the bake |
 | `src/refresh_trim.*` | Per-refresh-rate grey trim of the HDR profile, from the display's DLC record (§8) |
 | `src/windows_tonemap.*`, `src/displayconfig.*` | What Windows reports as the HDR peak; EDID |

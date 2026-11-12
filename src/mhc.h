@@ -347,6 +347,10 @@ void ComputeGrayscaleICtCpOffsets(GrayscaleData& gs);
 // Returns the profile filename, or empty string if unavailable
 std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool isHDR);
 
+// Every profile name in the display's association list (ColorProfileGetDisplayList, current-user scope). Windows
+// may report only the list of the mode the display is in. Empty when unavailable.
+std::vector<std::wstring> ListDisplayProfileAssociations(LUID adapterLuid, UINT32 sourceId);
+
 // ============================================================================
 // MHC Profile Maintenance
 // ============================================================================

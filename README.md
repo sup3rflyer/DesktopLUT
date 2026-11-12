@@ -35,6 +35,41 @@ Tone mapping, the 3D LUT and FALD run first, inside DWM (or in the overlay). The
 
 **Upgrading:** exit DesktopLUT, then replace `DesktopLUT.exe` and `DwmHook.dll` in the folder you already use. Your settings are in `DesktopLUT.ini` next to the exe. If you start the new version from a different folder, copy `DesktopLUT.ini` there first: without it DesktopLUT starts with empty settings and removes the MHC profiles the old copy installed.
 
+## What DesktopLUT changes on your PC
+
+**Administrator rights.** Windows asks for them every time DesktopLUT starts. It needs them to load its DLL into `dwm.exe` (DWM hook mode) and to install color profiles into the Windows color folder.
+
+**What it changes:**
+
+- **Color profiles.** `DesktopLUT_*.icm` files in `C:\Windows\System32\spool\drivers\color`, set as your displays' profiles (for your user account). They stay active after DesktopLUT exits: that is how the MHC layer works without it running.
+- **Run at startup.** If you turn it on, a scheduled task named `DesktopLUT` starts DesktopLUT at sign-in with administrator rights, without the prompt.
+- **DWM hook mode.** `DwmHook.dll` is copied to `C:\Windows\Temp` and loaded into `dwm.exe`, the Windows compositor, while DesktopLUT runs. It is unloaded when DesktopLUT exits.
+- **`C:\Windows\Temp`.** The hook's log (`DesktopLUT_dwmhook.log`, up to 20 MB) and a few small `DesktopLUT_*` files.
+- **The HDR peak Windows reports.** With the Windows tone map on Auto or Bypass, Windows is told the display peaks at 10000 nits.
+- **Its own folder.** `DesktopLUT.ini` (all settings: DesktopLUT keeps none in the registry), crash dumps and logs.
+
+**No network.** `DesktopLUT.exe` and `DwmHook.dll` contain no network code: no update check, no telemetry. DLC, the optional calibrator, only talks to programs it starts on this PC, and to a phone camera on your network if you set one up for FALD measurements.
+
+**SmartScreen and antivirus.** The release files are not code-signed, and `DwmHook.dll` is loaded into another process. Tools that do this can be flagged by SmartScreen ("Windows protected your PC") or by antivirus software. If your antivirus quarantines `DwmHook.dll`, DesktopLUT says so; overlay mode (Settings → **DWM HOOK** off) works without it.
+
+**Anti-cheat.** The DLL is loaded into `dwm.exe`, never into a game. DesktopLUT makes no promise about how any anti-cheat system treats that. If in doubt, turn **DWM HOOK** off before you play; overlay mode loads nothing into other processes.
+
+### Removing everything
+
+Settings → ABOUT → **REMOVE EVERYTHING…** lists what goes and what stays, then:
+
+1. stops DesktopLUT's processing and unloads the DWM hook from `dwm.exe`,
+2. sets the HDR peak Windows reports back to the panel's, where DesktopLUT had changed it,
+3. takes DesktopLUT's profiles off every connected display and deletes them (your own profiles stay),
+4. deletes the startup task and DesktopLUT's files in `C:\Windows\Temp`,
+5. and exits.
+
+Then delete the DesktopLUT folder. Each display is left with what Windows uses without DesktopLUT: your own profile if you associated one, otherwise none.
+
+Connect every display first. A display that is not connected keeps its profile entries in Windows' list (their files are deleted) until it is connected and you remove everything again.
+
+If the window does not start, run `DesktopLUT.exe /uninstall` from a command prompt. It does the same thing without a window. If DesktopLUT is running, it asks it to exit first. The result is printed in the command prompt (a message box when there is none; `/quiet` skips it) and written to `DesktopLUT_uninstall.txt` in the folder.
+
 ## Changing DesktopLUT with an AI assistant
 
 The release is a ready-made build. The source is here so you can change it. You can point an AI coding assistant at this repository and have it adapt DesktopLUT to your display and workflow.

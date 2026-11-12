@@ -101,6 +101,8 @@
     <ClCompile Include="src\gui_whitelist.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
     <ClCompile Include="src\monitor_identity.cpp" />
+    <ClCompile Include="src\uninstall.cpp" />
+    <ClCompile Include="src\uninstall_win.cpp" />
     <ClCompile Include="src\desktoplut_ipc_server.cpp" />
     <ClCompile Include="src\mhc.cpp" />
     <ClCompile Include="src\mhc_icc.cpp" />
@@ -173,6 +175,7 @@
     <ClCompile Include="tests\test_framepacer.cpp" />
     <ClCompile Include="tests\test_displayconfig.cpp" />
     <ClCompile Include="tests\test_monitor_identity.cpp" />
+    <ClCompile Include="tests\test_uninstall.cpp" />
     <ClCompile Include="tests\test_settings.cpp" />
     <ClCompile Include="tests\test_ini_roundtrip.cpp" />
     <ClCompile Include="tests\test_calib_snapshot.cpp" />

@@ -598,6 +598,10 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "dlcrealsdralt", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 20 },
         // 21: shot 19 with the CIE tile's options menu open.
         { "dlcrealoptions", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 21 },
+        // REMOVE EVERYTHING: 40 the plan (two displays connected, the LG TV not), 41 its result with a failure.
+        { "uninstall", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 40 },
+        { "uninstalldone", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 41 },
+        { "uninstallnarrow", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 40 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -817,6 +821,36 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     ed.selected = hdr ? 1 : 3;
                     ed.renderHeld = hdr ? (kMhcHeldTonemap | kMhcHeldFald | kMhcHeldDesktopGamma) : 0u;
                     ed.renderNightLight = hdr;
+                }
+                if (shot.variant == 40 || shot.variant == 41) {   // REMOVE EVERYTHING, drawn from a made-up PC
+                    uninst::State& st = vs.uninstall.state;
+                    st.engineRunning = st.hookResident = st.startupTask = true;
+                    uninst::Display pa, benq, lg;
+                    pa.key = L"\\\\?\\DISPLAY#AUS322A"; pa.name = L"PA32UCXR"; pa.connected = true; pa.hdrOn = true;
+                    pa.sdrDefault = L"DesktopLUT_Mon0_SDR_P0_1.icm"; pa.hdrDefault = L"DesktopLUT_Mon0_HDR_P32_2.icm";
+                    pa.listed = { pa.sdrDefault, pa.hdrDefault, L"DesktopLUT_Mon0_HDR_P0_3.icm" };
+                    benq.key = L"\\\\?\\DISPLAY#BNQ802E"; benq.name = L"BenQ SW272U"; benq.connected = true;
+                    benq.sdrDefault = L"DesktopLUT_Display1_SDR_Identity.icm"; benq.listed = { benq.sdrDefault };
+                    lg.key = L"\\\\?\\DISPLAY#GSM84CD"; lg.name = L"LG TV SSCR2"; lg.named = { L"DesktopLUT_Mon2_HDR_P0_4.icm" };
+                    st.displays = { pa, benq, lg };
+                    for (int k = 0; k < 23; k++) st.profileFiles.push_back(L"DesktopLUT_Mon0_HDR_P" + std::to_wstring(k) + L"_9.icm");
+                    st.tempFiles = { L"C:\\Windows\\Temp\\DwmHook.dll", L"C:\\Windows\\Temp\\DesktopLUT_dwmhook.log",
+                                     L"C:\\Windows\\Temp\\DesktopLUT_hook_routing_1234.dat" };
+                    vs.uninstall.plan = uninst::BuildPlan(st);
+                    vs.uninstall.phase = ui::UninstallView::Phase::Plan;
+                    if (shot.variant == 41) {
+                        uninst::Result& r = vs.uninstall.result;
+                        r.steps.resize(vs.uninstall.plan.steps.size(), { uninst::Outcome::Done, "Done" });
+                        const char* notes[] = { "Stopped", "Unloaded", "1 display put back", "3 profiles removed",
+                                                "1 profile removed", "Started", "", "Deleted", "3 deleted" };
+                        for (size_t i = 0; i < r.steps.size() && i < 9; i++) r.steps[i].note = notes[i];
+                        r.steps[6] = { uninst::Outcome::Failed, "22 deleted, 1 failed" };
+                        r.steps[2].outcome = uninst::Outcome::Done;
+                        r.steps[1] = { uninst::Outcome::Nothing, "Not loaded" };
+                        r.anyFailed = true;
+                        vs.uninstall.phase = ui::UninstallView::Phase::Done;
+                    }
+                    vs.uninstall.openRequested = true;
                 }
                 g_dlcFolder = shot.variant == 24 ? L"X:\\Moved\\DLC" : L"";   // the [UI] DlcFolder setting
                 if (shot.variant == 5) {   // the desktop gamma whitelist editor
