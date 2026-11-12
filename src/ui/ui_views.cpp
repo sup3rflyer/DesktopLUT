@@ -2264,7 +2264,20 @@ void DrawUninstall(ViewState& vs) {
 
     ImGui::Dummy(ImVec2(0, Px(14)));
     if (u.phase == Phase::Plan) {
-        if (PushButton("##uninstall_go", "REMOVE EVERYTHING", 170, 26, true)) {
+        // CANCEL is the default (first, emphasised, keyboard focus); the removal takes a mouse click: it is out of
+        // keyboard navigation, so neither Enter nor Space can reach it.
+        if (PushButton("##uninstall_no", "CANCEL", kButtonW, 26, true) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+            u = UninstallView();
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            return;
+        }
+        ImGui::SetItemDefaultFocus();
+        ImGui::SameLine(0, Px(8));
+        ImGui::PushItemFlag(ImGuiItemFlags_NoNav, true);
+        const bool go = PushButton("##uninstall_go", "REMOVE EVERYTHING", 170, 26, false, true);
+        ImGui::PopItemFlag();
+        if (go) {
             u.phase = Phase::Running;
             UninstallView* up = &u;
             Post([up]() {
@@ -2277,11 +2290,6 @@ void DrawUninstall(ViewState& vs) {
                 }
                 up->phase = Phase::Done;
             });
-        }
-        ImGui::SameLine(0, Px(8));
-        if (PushButton("##uninstall_no", "CANCEL", kButtonW, 26) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
-            u = UninstallView();
-            ImGui::CloseCurrentPopup();
         }
     } else if (u.phase == Phase::Done) {
         if (PushButton("##uninstall_exit", "EXIT", kButtonW, 26, true) || ImGui::IsKeyPressed(ImGuiKey_Escape))

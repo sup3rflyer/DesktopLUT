@@ -63,7 +63,9 @@ void Hairline(ImU32 col = pal::Rule);
 // ---- Controls ------------------------------------------------------------------------------------
 
 // An action. `primary`: the one default action of a dialog (the strongest fill).
-bool PushButton(const char* id, const char* label, float widthDip, float heightDip = kControlH, bool primary = false);
+// `alarm`: a destructive action (text and edge in the alarm colour); it is never the primary (default) button.
+bool PushButton(const char* id, const char* label, float widthDip, float heightDip = kControlH, bool primary = false,
+                bool alarm = false);
 inline bool Button(const char* id, const char* label, float widthDip, float heightDip = kControlH) {
     return PushButton(id, label, widthDip, heightDip);
 }

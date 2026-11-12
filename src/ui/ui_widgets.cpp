@@ -291,7 +291,7 @@ void Hairline(ImU32 col) {
 
 // ---- Controls ------------------------------------------------------------------------------------
 
-bool PushButton(const char* id, const char* label, float widthDip, float heightDip, bool primary) {
+bool PushButton(const char* id, const char* label, float widthDip, float heightDip, bool primary, bool alarm) {
     const ImVec2 size(Snap(Px(widthDip)), Snap(Px(heightDip)));
     const ImVec2 p = SnapV(ImGui::GetCursorScreenPos());
     ImGui::SetCursorScreenPos(p);
@@ -316,8 +316,9 @@ bool PushButton(const char* id, const char* label, float widthDip, float heightD
         const float r = Rounding();
         const ImU32 fill = primary ? pal::Strong : (held ? pal::Sel : (hovered ? pal::ControlHover : pal::Control));
         Fill(dl, a, b, fill, r);
-        Edge(dl, a, b, primary ? pal::StrongEdge : (hovered ? pal::RuleStrong : pal::ControlEdge), r);
+        Edge(dl, a, b, primary ? pal::StrongEdge : alarm ? pal::Alarm : (hovered ? pal::RuleStrong : pal::ControlEdge), r);
     }
+    if (alarm && !primary) text = pal::Alarm;   // a destructive action: the alarm colour, never the default's emphasis
     DrawTextIn(dl, Font::Label, kSizeLabel, ImVec2(a.x + shift, a.y + shift), ImVec2(b.x + shift, b.y + shift), text, label);
     return clicked;
 }
