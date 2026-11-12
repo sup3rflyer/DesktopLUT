@@ -667,7 +667,6 @@ TEST_CASE("perf: static shader cost table (DLUT_PERF_STATIC)") {
             { "fald.star_stat.cs", common + g_faldStarStatSource, "cs_5_0" },
             { "fald.star_weight.cs", common + g_faldStarWeightSource, "cs_5_0" },
             { "fald.star_plan.cs", common + g_faldStarPlanSource, "cs_5_0" },
-            { "fald.temporal.cs", common + g_faldTemporalSource, "cs_5_0" },
             { "fald.panel_clock.cs", common + g_faldPanelClockSource, "cs_5_0" },
         };
         double tFald = perf::QpcUs();
