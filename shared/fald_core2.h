@@ -43,6 +43,10 @@
 // when the core's shaders or textures are unavailable or the lattice is too long for the cap's scans; the tests select
 // it (FaldSettings::coreMode) to hold the layer to its references.
 //
+// (2026-11-12: the path follows what the core's passes CHANGED, not what their inputs were: a zone's statistics moving
+// orders Z1 / Z2 only; the round-1 sweep and the pixel pass run in full only when alpha_z or a cap moved — Z2 and each
+// round's last cap pass compare their output with the previous run's and re-order what reads it themselves.
+// shared/fald_change.h lists the bits.)
 // The change-driven path (shared/fald_change.h) with the core on: KC5 is STATELESS (the fields are a pure function of this
 // frame's zone statistics / node peaks and the round's gain — the cap is a GLOBAL min-plus, but of exactly those inputs:
 // when none of them moved the previous run's h / A are this run's bytes), so the partial path applies: the touched-zone
@@ -87,6 +91,10 @@ inline bool FaldCore2CapFits(unsigned int cols, unsigned int rows, unsigned int 
 bool FaldCore2InitShaders(ID3D11Device* dev, const char* common, std::string* err);
 // The five kernels as FaldCore2InitShaders compiles them (cs_5_0, entry "main"): kernel k's whole source text and name.
 constexpr unsigned int FALD_CORE2_SHADERS = 5u;
+// Kernel k from precompiled bytecode (shared/fald_shader_set.h FaldShaderBytecode(FALD_SH_CORE_Z1 + k)): nothing is compiled.
+// One kernel per call, so a host inside another process's present can spread them (dwm_hook/hook_fald.cpp). True when the
+// kernel exists afterwards.
+bool FaldCore2CreateShader(ID3D11Device* dev, unsigned int k, const void* bytecode, size_t bytes);
 std::string FaldCore2ShaderSource(unsigned int k, const char* common);
 const char* FaldCore2ShaderName(unsigned int k);
 void FaldCore2ReleaseShaders();
@@ -112,10 +120,20 @@ unsigned long long FaldCore2VramBytes(const FaldCore2* c);
 void FaldCore2BeginRun(FaldCore2* c, ID3D11DeviceContext* ctx, uint32_t flags);
 void FaldCore2StatViews(const FaldCore2* c, ID3D11UnorderedAccessView** statU4, ID3D11UnorderedAccessView** nodePeakU6,
                         ID3D11UnorderedAccessView** nodePartU7);
+// changeFlags / lateArgs (the partial path; the layer's FALD_CHANGE_FLAGS buffer at u5, its LATE arguments buffer as a
+// UAV at u6 — never the buffer `args` these passes are dispatched from): Z2 compares alpha_z — the one zone value the
+// correction reads — with the previous run's; moved = [0] |= FALD_CHANGE_ALPHA_MOVED and the round-1 sweep re-ordered
+// over the whole lattice. A round's last cap pass compares A; moved = what reads it re-ordered in full (round 0's: the
+// round-1 sweep; round 1's: the pixel pass). They store those arguments themselves (fald_shader.h FALD_ORDER_*;
+// shared/fald_change.h "THE LATE ARGUMENTS"): the caller's decide pass of the round must have run BEFORE them, and
+// nothing rewrites those slots after. The caller's FaldCB must hold the run's path bit (runMode) and, for RunCap,
+// roundIdx = `round`. Null on a full run.
 void FaldCore2RunZone(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11Buffer* args = nullptr,
-                      unsigned int latticeSlot = 0);
+                      unsigned int latticeSlot = 0, ID3D11UnorderedAccessView* changeFlags = nullptr,
+                      ID3D11UnorderedAccessView* lateArgs = nullptr);
 void FaldCore2RunCap(FaldCore2* c, ID3D11DeviceContext* ctx, ID3D11Buffer* faldCB, ID3D11ShaderResourceView* gainB,
-                     unsigned int round, ID3D11Buffer* args = nullptr, unsigned int fineSlot = 0);
+                     unsigned int round, ID3D11Buffer* args = nullptr, unsigned int fineSlot = 0,
+                     ID3D11UnorderedAccessView* lateArgs = nullptr);
 ID3D11Buffer* FaldCore2CB(const FaldCore2* c);         // b3 (with flags 0 when the core does not run: CoreGain = identity)
 ID3D11ShaderResourceView* FaldCore2ZoneSRV(const FaldCore2* c);                       // t41 (alpha_z, k, ln P, rate)
 ID3D11ShaderResourceView* FaldCore2NodeDSRV(const FaldCore2* c, unsigned int round);  // t48 the cap A of that round

@@ -134,3 +134,107 @@ TEST_CASE("FALD core on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DIR)") {
     ic->ClearState(); ic->Flush();
     ic->Release(); dev->Release();
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The layer's shaders ship as bytecode (shared/fald_bytecode.h through shared/fald_shader_set.h): the DWM hook creates
+// them from it — nothing is compiled inside dwm.exe — and the overlay does too. That header must be exactly what
+// D3DCompile makes of the current shader text (FaldShaderSource, the text both hosts compiled until 2026-11-12): an edit
+// of shared/fald_shader.h or of the core's kernels without regenerating it fails here. Same rules as the hook's own
+// header (tests/test_perf.cpp "hook: the shipped shader bytecode ..."), including the compiler's version.
+// Regenerate (then rebuild):  DLUT_FALD_BYTECODE_WRITE=1 bin/Test/DesktopLUT.Tests.exe -tc="FALD: the shipped shader bytecode*"
+// ---------------------------------------------------------------------------------------------------------------------
+#include "../shared/fald_shader_set.h"
+namespace {
+std::string FaldBcCompilerVersion() {
+    char path[MAX_PATH] = {};
+    HMODULE m = GetModuleHandleA("D3DCompiler_47.dll");
+    if (!m || !GetModuleFileNameA(m, path, MAX_PATH)) return "unknown";
+    DWORD dummy = 0;
+    const DWORD n = GetFileVersionInfoSizeA(path, &dummy);
+    if (!n) return "unknown";
+    std::vector<unsigned char> buf(n);
+    VS_FIXEDFILEINFO* fi = nullptr; UINT len = 0;
+    if (!GetFileVersionInfoA(path, 0, n, buf.data()) || !VerQueryValueA(buf.data(), "\\", (void**)&fi, &len) || !fi) return "unknown";
+    char v[64];
+    snprintf(v, sizeof(v), "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return v;
+}
+}  // namespace
+
+TEST_CASE("FALD: the shipped shader bytecode is D3DCompile of the current source") {
+    std::vector<std::vector<unsigned char>> made;
+    for (unsigned int id = 0; id < FALD_SH_COUNT; id++) {
+        const std::string src = FaldShaderSource(id);
+        ID3DBlob* blob = nullptr; ID3DBlob* msgs = nullptr;
+        const HRESULT hr = D3DCompile(src.c_str(), src.size(), FaldShaderName(id), nullptr, nullptr, "main", FaldShaderTarget(id), 0, 0, &blob, &msgs);
+        if (msgs) msgs->Release();
+        REQUIRE_MESSAGE((SUCCEEDED(hr) && blob), FaldShaderName(id) << " does not compile");
+        const unsigned char* b = (const unsigned char*)blob->GetBufferPointer();
+        made.emplace_back(b, b + blob->GetBufferSize());
+        blob->Release();
+    }
+    const std::string compiler = FaldBcCompilerVersion();
+
+    char* writeEnv = nullptr; size_t writeLen = 0;
+    const bool write = _dupenv_s(&writeEnv, &writeLen, "DLUT_FALD_BYTECODE_WRITE") == 0 && writeEnv && *writeEnv;
+    free(writeEnv);
+    if (write) {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir(exe), file;
+        for (int up = 0; up < 8 && file.empty(); up++) {
+            const size_t slash = dir.find_last_of("\\/");
+            if (slash == std::string::npos) break;
+            dir.resize(slash);
+            if (GetFileAttributesA((dir + "\\shared\\fald_shader_set.h").c_str()) != INVALID_FILE_ATTRIBUTES) file = dir + "\\shared\\fald_bytecode.h";
+        }
+        REQUIRE_MESSAGE(!file.empty(), "shared/fald_shader_set.h not found above " << exe);
+        std::string text =
+            "// GENERATED - do not edit. The FALD layer's shaders as bytecode: D3DCompile of every shader of shared/fald_shader_set.h\n"
+            "// (FaldShaderSource: shared/fald_shader.h's passes and the always-on core's kernels of shared/fald_core2.cpp; entry\n"
+            "// \"main\", FaldShaderTarget, flags 0), in FaldShaderId order. Both hosts create the layer's shaders from these arrays\n"
+            "// (shared/fald_core2.cpp FaldShaderBytecode holds them), so nothing is compiled inside DWM's present or at the\n"
+            "// overlay's start. tests/test_fald_core2.cpp (\"FALD: the shipped shader bytecode is D3DCompile of the current\n"
+            "// source\") fails when this file and the shader text disagree. After ANY edit of that text regenerate and rebuild:\n"
+            "//   DLUT_FALD_BYTECODE_WRITE=1 bin/Test/DesktopLUT.Tests.exe -tc=\"FALD: the shipped shader bytecode*\"\n"
+            "#pragma once\n\n"
+            "#define FALD_BYTECODE_COMPILER \"" + compiler + "\"   // the d3dcompiler_47.dll that made it (file version)\n";
+        for (size_t k = 0; k < made.size(); k++) {
+            text += "\n// " + std::string(FaldShaderName((unsigned int)k)) + " (" + FaldShaderTarget((unsigned int)k) + ")\n";
+            text += "static const unsigned char g_faldBc" + std::to_string(k) + "[" + std::to_string(made[k].size()) + "] = {";
+            char b[8];
+            for (size_t i = 0; i < made[k].size(); i++) {
+                if (i % 24 == 0) text += "\n\t";
+                snprintf(b, sizeof(b), "0x%02X,", made[k][i]);
+                text += b;
+            }
+            text += "\n};\n";
+        }
+        text += "\nstatic const struct { const unsigned char* data; unsigned int size; } g_faldBytecode[" + std::to_string(made.size()) + "] = {\n";
+        for (size_t k = 0; k < made.size(); k++)
+            text += "\t{ g_faldBc" + std::to_string(k) + ", sizeof(g_faldBc" + std::to_string(k) + ") },\n";
+        text += "};\n";
+        std::ofstream o(file, std::ios::binary);
+        o.write(text.data(), (std::streamsize)text.size());
+        REQUIRE(o.good());
+        MESSAGE("wrote " << file << " (compiler " << compiler << "): rebuild the DLL, the exe and this exe");
+        return;
+    }
+
+    bool allEqual = true;
+    for (unsigned int id = 0; id < FALD_SH_COUNT; id++) {
+        const FaldShaderBlobRef have = FaldShaderBytecode(id);
+        if (made[id].size() != have.size || std::memcmp(made[id].data(), have.data, have.size) != 0) {
+            allEqual = false;
+            MESSAGE(std::string(FaldShaderName(id)) << ": the header has " << have.size << " bytes, the current source compiles to " << made[id].size()
+                    << (made[id].size() == have.size ? " (different bytes)" : ""));
+        }
+    }
+    if (!allEqual && compiler != FaldBytecodeCompiler()) {
+        // another d3dcompiler_47.dll than the one that made the header: its output may differ for the same text, so this
+        // machine cannot tell an edited shader from a different compiler. The machine that regenerates the header can.
+        MESSAGE("the header was made by d3dcompiler " << std::string(FaldBytecodeCompiler()) << ", this machine has " << compiler << ": not judged here");
+        return;
+    }
+    CHECK_MESSAGE(allEqual, "shared/fald_bytecode.h is not the current shader source: regenerate it (the command is above this test) and rebuild");
+}

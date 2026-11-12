@@ -1279,16 +1279,21 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		~FaldBorrowScope() { if (m) FaldReturn(m); }
 	} faldBorrow;
 	// The layer's shaders, when this monitor needs the layer: its switch is on, or the host announced a live panel file for
-	// it (the delivery below is only taken with the shaders ready). One attempt per injection: FaldInitShaders failing leaves
-	// the layer off for this attach (hook_fald.h), and every FALD call site checks FaldShadersReady().
-	if (index != -1 && !s_faldInitTried && !FaldShadersReady())
+	// it (the delivery below is only taken with the shaders ready). They are created from shipped bytecode, a bounded slice
+	// of work per present of such a monitor (hook_fald.h FaldInitShadersStep: nothing is compiled, no present waits for the
+	// whole set); until the last slice FaldShadersReady() is false and this present takes the path without the layer, as
+	// every FALD call site below already does. A creation the layer cannot run without failing is final for the attach
+	// (FaldShadersFailed, logged by the layer; s_faldInitTried then only keeps the warning to one line).
+	if (index != -1 && !FaldShadersReady() && !FaldShadersFailed())
 	{
 		const LocalFaldParams* ip = FindFaldForMonitor(monLeft, monTop);
 		if (ip && (DwmHookFaldEnabled(ip->flags) || (ip->hasTuning && (ip->tuning.panelGen[0] || ip->tuning.panelGen[1]))))
 		{
-			s_faldInitTried = true;
-			if (!FaldInitShaders(device, deviceContext))
+			if (!FaldInitShadersStep(device, deviceContext) && FaldShadersFailed() && !s_faldInitTried)
+			{
+				s_faldInitTried = true;
 				log_to_file("WARNING: FALD shader init failed - the correction layer stays off");
+			}
 		}
 	}
 	// A panel file the host delivered live for this monitor (either mode) since the last present: taken into the

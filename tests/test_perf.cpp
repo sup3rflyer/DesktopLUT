@@ -1121,7 +1121,9 @@ TEST_CASE("perf: output reference manifest (DLUT_PERF_HASH_WRITE / DLUT_PERF_HAS
         int w = W, h = H;
         if (c.fald) {
             w = 3840; h = 2160;                                  // the panel file's lattice
-            if (!rig.panel) { MESSAGE("hook/" << c.id << ": no FALD panel file - skipped"); continue; }   // (the shaders: RenderLUT asks for them, as in the DLL)
+            // (the layer's shaders all at once here: RenderLUT creates them a slice per present — hook_fald.h
+            // FaldInitShadersStep — and this sequence's first present must already run the layer)
+            if (!rig.FaldAvailable(w, h)) { MESSAGE("hook/" << c.id << ": no FALD panel file - skipped"); continue; }
         }
         rig.Apply(c, w, h);
         const DXGI_FORMAT fmt = perf::DomFormat(c.dom);
@@ -1421,9 +1423,11 @@ void FpShift(std::vector<unsigned char>& dst, const std::vector<unsigned char>& 
 struct FaldPerfScn { std::string id; std::vector<RECT> rects; int mut; const char* what; };
 std::vector<FaldPerfScn> FaldPerfScenarios(int W, int H) {
     const int s = std::max(1, H / 1080);
-    const RECT caret = { W / 5, H * 3 / 10, W / 5 + 2 * s, H * 3 / 10 + 18 * s };
+    // (the Mix frame's video window covers x 320 s .. 1600 s, y 180 s .. 900 s: the document shows left of it, the dark
+    // editor right of it — the rects below lie in what is visible of each)
+    const RECT caret = { 200 * s, 324 * s, 202 * s, 342 * s };
     const RECT clock = { W - 90 * s, H - 40 * s, W - 10 * s, H - 8 * s };
-    const RECT doc = { 80 * s, 60 * s, 1000 * s, 900 * s };
+    const RECT doc = { 80 * s, 60 * s, 320 * s, 900 * s };
     const RECT win = { 1050 * s, 300 * s, 1050 * s + 524 * s, 300 * s + 300 * s };
     return {
         { "idle_norect",  {},                      0, "a present with no dirty rect" },
@@ -1432,9 +1436,9 @@ std::vector<FaldPerfScn> FaldPerfScenarios(int W, int H) {
         { "caret",        { caret },               1, "a caret blinking in a light document" },
         { "clock",        { clock },               2, "the task bar clock's digits change" },
         { "caret_clock",  { caret, clock },        3, "both" },
-        { "dark_type",    { RECT{ 1100 * s, 300 * s, 1300 * s, 320 * s } }, 8, "typing a line in a dark editor" },
+        { "dark_type",    { RECT{ 1650 * s, 300 * s, 1830 * s, 320 * s } }, 8, "typing a line in a dark editor" },
         { "hover",        { RECT{ 300 * s, 950 * s, 428 * s, 1030 * s } }, 9, "a hover highlight on the wallpaper (x 1.15)" },
-        { "scroll_doc",   { doc },                 4, "a light document scrolls one text line (37 % of the frame)" },
+        { "scroll_doc",   { doc },                 4, "a light document scrolls one text line (10 % of the frame)" },
         { "window_move",  { win },                 6, "a light window moves 24 px over dark content" },
         { "video_window", { perf::VideoWindow(W, H) }, 5, "a video plays in a window (44 %)" },
         { "full_video",   { RECT{ 0, 0, W, H } },  7, "fullscreen video" },
@@ -1566,6 +1570,7 @@ TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
             if (!rig.panel) { MESSAGE(c.id << ": the panel file did not load - skipped"); continue; }
             HookCfg hc{ c.id, c.dom, c.lut, c.tm, 1, c.tm, true, false };   // SoftClip, dynamic
             rig.Apply(hc, W, H);
+            REQUIRE(FaldInitShaders(device, deviceContext));   // (RenderLUT would create them a slice per present: not what is timed here)
             s_perfTonemap.targetPeakNits = 1700.0f;
             s_perfTonemap.pqTargetPeak = LinearToPQ(1700.0f / 10000.0f);
             LocalFaldParams& fp = g_localFald[0];
@@ -1619,6 +1624,14 @@ TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
                 std::vector<RECT> rects = sc.rects;
                 // two full presents of A (the clean copy, the peak source, the fields), then the scenario's own warm-up
                 for (int i = 0; i < 2; i++) { compose(content[0], full); rig.Present(back, full); dev.ic->Flush(); Sleep(3); }
+                // DLUT_PERF_FALD_DUMP_INTER=<file prefix>: the layer's INPUT of this scenario's frame A (the intermediate the
+                // LUT / tone-map pass left: what an experiment on the overlay's layer needs to see the same numbers)
+                if (!perf::Env("DLUT_PERF_FALD_DUMP_INTER").empty())
+                    if (FaldMonitor* m = layer()) {
+                        const std::vector<unsigned char> px = perf::ReadBack(dev.dev, dev.ic, FaldIntermediateTexture(m));
+                        FaldReturn(m);
+                        perf::SaveBytes(perf::Env("DLUT_PERF_FALD_DUMP_INTER") + "_" + c.id + "_" + sc.id + ".rgba16f", px.data(), px.size());
+                    }
                 for (int i = 0; i < 8; i++) { compose(content[(i + 1) & 1], rects); rig.Present(back, rects); dev.ic->Flush(); Sleep(3); }
                 std::vector<double> g, cu, layerUs, restUs, passUs[FALD_HP_COUNT];
                 int issued[FALD_HP_COUNT] = {}, ran[FALD_HP_COUNT] = {};
@@ -1633,9 +1646,12 @@ TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
                     double gu = -1, cpu = 0, wall = 0;
                     dev.Time([&] { probe.BeginPresent(); ok = rig.Present(back, rects) && ok; probe.Close(); }, gu, cpu, wall);
                     unsigned int kind = 0;
-                    ID3D11Buffer* args = nullptr;
-                    if (FaldMonitor* m = layer()) { kind = FaldTestLastRunKind(m); args = FaldTestArgs(m); gov = FaldTestCoreGovState(m); FaldReturn(m); }
-                    probe.Resolve(args, kind == 1u);
+                    ID3D11Buffer* args = nullptr; ID3D11Buffer* lateArgs = nullptr;
+                    if (FaldMonitor* m = layer()) {
+                        kind = FaldTestLastRunKind(m); args = FaldTestArgs(m); lateArgs = FaldTestLateArgs(m); gov = FaldTestCoreGovState(m);
+                        FaldReturn(m);
+                    }
+                    probe.Resolve(args, lateArgs, kind == 1u);
                     kinds[kind & 3u]++;
                     double sum = 0.0;
                     for (unsigned int p = 0; p < FALD_HP_COUNT; p++) {
@@ -1730,12 +1746,35 @@ TEST_CASE("perf: what the FALD layer's start costs (DLUT_PERF_FALD_INIT)") {
         REQUIRE(rig.ok);
         if (rig.panel) {
             double gu = -1, cu = 0, wu = 0;
+            {                                                       // the build's pure-CPU part: the conv tables of all four variants
+                FaldPanelParams pp; std::string perr;
+                if (LoadFaldPanelParams(std::wstring(panel.begin(), panel.end()), pp, perr)) {
+                    const double t0 = perf::QpcUs();
+                    size_t floats = 0;
+                    for (unsigned int v = 0; v < 4; v++) {
+                        floats += FaldConvTableLayout(pp.kTrue, pp.sub, 2 * pp.reachTrueC + 1, 2 * pp.reachTrueR + 1, 1u << v).size();
+                        floats += FaldConvTableLayout(pp.kEst, pp.sub, 2 * pp.reachEstC + 1, 2 * pp.reachEstR + 1, 1u << v).size();
+                    }
+                    const double ms = (perf::QpcUs() - t0) / 1000.0;
+                    tsv << dev.name << "\tbuild_conv_table_layouts_x8\t-\t0\t" << floats * 4 << "\t" << ms << "\t0\n";
+                    MESSAGE("BuildMonitor's eight conv-table layouts (four variants x two kernels, " << floats * 4 << " bytes): " << ms << " ms of CPU");
+                }
+            }
             {                                                       // the layer's shaders, as the first present of a monitor that needs it
-                const double t0 = perf::QpcUs();
-                const bool ok = FaldInitShaders(device, deviceContext);
-                const double ms = (perf::QpcUs() - t0) / 1000.0;
-                tsv << dev.name << "\thook_FaldInitShaders\t-\t0\t0\t" << ms << "\t0\n";
-                MESSAGE("FaldInitShaders (inside the first present of a monitor that needs the layer): " << ms << " ms" << (ok ? "" : " FAILED"));
+                // one object per call (a zero budget): each call is the most a present can be made to carry
+                double total = 0.0, worst = 0.0;
+                int calls = 0;
+                bool ok = false;
+                while (!ok && !FaldShadersFailed() && calls < 200) {
+                    const double t0 = perf::QpcUs();
+                    ok = FaldInitShadersStep(device, deviceContext, 0.0);
+                    const double us = perf::QpcUs() - t0;
+                    total += us; worst = std::max(worst, us); calls++;
+                }
+                tsv << dev.name << "\thook_FaldInitShadersStep_total\t-\t0\t0\t" << total / 1000.0 << "\t" << total << "\n";
+                tsv << dev.name << "\thook_FaldInitShadersStep_worst_call\t-\t0\t0\t" << worst / 1000.0 << "\t" << worst << "\n";
+                MESSAGE("the layer's shaders from the shipped bytecode: " << calls << " steps, " << total / 1000.0 << " ms in all, the longest step " << worst
+                        << " us" << (ok ? "" : " FAILED"));
             }
             dev.Time([&] { FaldMonitor* m = FaldAcquire(0, 0, true, 3840u, 2160u, DXGI_FORMAT_R16G16B16A16_FLOAT); if (m) FaldReturn(m); }, gu, cu, wu);
             tsv << dev.name << "\thook_first_FaldAcquire_build_4k\t-\t0\t0\t" << cu / 1000.0 << "\t" << gu << "\n";
@@ -1744,5 +1783,51 @@ TEST_CASE("perf: what the FALD layer's start costs (DLUT_PERF_FALD_INIT)") {
             tsv << dev.name << "\thook_later_FaldAcquire\t-\t0\t0\t" << cu / 1000.0 << "\t" << gu << "\n";
         }
         tsv << dev.name << "\thook_InitializeStuff\t-\t0\t0\t" << rig.initUs / 1000.0 << "\t0\n";
+    }
+}
+
+// RenderLUT's FALD init block (dwm_hook/hook_render.cpp) with the layer's stepped creation (hook_fald.h
+// FaldInitShadersStep): a monitor whose layer switch is on gets the layer's shaders a slice per present, the presents
+// before the last slice take the path without the layer (here: nothing to draw, RenderLUT reports the back buffer
+// untouched), and the layer runs once they exist and its clean copy is primed. Nothing is compiled on the way.
+TEST_CASE("hook: the FALD layer's shaders arrive a slice per present and the layer starts after the last (WARP)") {
+    const std::string src = OwnerPanel();
+    if (src.empty()) { MESSAGE("skipped: no FALD panel file on this machine"); return; }
+    perf::Dev dev("WARP");
+    REQUIRE(dev.ok);
+    const int W = 960, H = 540;
+    char tmp[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string panel = std::string(tmp) + "dlut_perf_step_panel_" + std::to_string(GetCurrentProcessId()) + ".bin";
+    REQUIRE(FaldPerfStretchPanel(src, panel, W, H));
+    struct Cleanup { std::string f; ~Cleanup() { DeleteFileA(f.c_str()); } } cleanup{ panel };
+    {
+        HookRig rig(dev, 17, panel);
+        REQUIRE(rig.ok);
+        REQUIRE(rig.panel);
+        const HookCfg c{ "hdr_fald", Dom::Hdr, false, false, 0, false, true, false };   // the layer alone: no cube, no tone map
+        rig.Apply(c, W, H);
+        ID3D11Texture2D* back = perf::MakeTex(dev.dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        const std::vector<unsigned char> px = perf::MakeFrame(Kind::Mix, Dom::Hdr, W, H);
+        ID3D11Texture2D* content = perf::MakeTex(dev.dev, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_SHADER_RESOURCE, px.data(), (UINT)W * 8u);
+        REQUIRE((back && content));
+        std::vector<RECT> full = { RECT{ 0, 0, W, H } };
+        CHECK_FALSE(FaldShadersReady());                 // InitializeStuff created none of them
+        int readyAt = -1, ranAt = -1;
+        for (int p = 0; p < 400 && ranAt < 0; p++) {
+            Compose(dev.ic, back, content, full, W, H, 0);
+            const bool before = FaldShadersReady();
+            const bool ran = rig.Present(back, full);
+            if (!before && !FaldShadersReady()) CHECK_MESSAGE(!ran, "present " << p << ": the layer ran before its shaders existed");
+            if (readyAt < 0 && FaldShadersReady()) readyAt = p;
+            if (ran) ranAt = p;
+            dev.ic->Flush();
+        }
+        CHECK_FALSE(FaldShadersFailed());
+        CHECK_MESSAGE(readyAt >= 1, "the shaders were ready after present " << readyAt << ": expected more than one slice");
+        CHECK_MESSAGE((ranAt >= readyAt && ranAt >= 0 && ranAt <= readyAt + 8), "shaders ready at present " << readyAt << ", the layer ran at " << ranAt);
+        MESSAGE("the layer's shaders: ready after " << readyAt + 1 << " presents, the layer ran at present " << ranAt);
+        Rel(content); Rel(back);
+        dev.ic->ClearState(); dev.ic->Flush();
     }
 }

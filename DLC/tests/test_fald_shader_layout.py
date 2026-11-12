@@ -204,16 +204,25 @@ def test_both_paths_dispatch_the_slices_and_run_the_combine(path, v):
     assert f"{v}->zoneSlices = FaldZoneSlices(p.cellW, p.cellH);" in c
     assert c.count(f"Dispatch(p.cols, p.rows, {v}->zoneSlices);") == 2                 # stat, S0
     assert c.count(f"if ({v}->zoneSlices > 1) {{") == 2
-    assert c.count("g_faldZoneCombineDefine") >= 1
     # the overlay compiles from a source set (FaldShaderSources: shared/fald_shader.h by default, a frozen copy in the
-    # bit-identity test, docs/fald-fractional-pitch.md); the hook from the globals
-    for src, alias, combine in (("g_faldStatSource", "stat", "StatCombineCS"),
-                                ("g_faldStarStatSource", "starStat", "StarStatCombineCS")):
+    # bit-identity test, docs/fald-fractional-pitch.md) when it does not take the shipped bytecode; the hook creates its
+    # shaders from the shipped bytecode alone (2026-11-12: nothing is compiled inside dwm.exe) — the bytecode of the ONE
+    # list shared/fald_shader_set.h, whose text for the two combine variants is the define + the same sources (the C++
+    # test "FALD: the shipped shader bytecode is D3DCompile of the current source" holds the blobs to that text)
+    shader_set = (_ROOT / "shared" / "fald_shader_set.h").read_text(encoding="utf-8")
+    assert "const std::string combine = std::string(g_faldZoneCombineDefine) + common;" in shader_set
+    for src, alias, combine, sid, hook_var in (("g_faldStatSource", "stat", "StatCombineCS", "FALD_SH_STAT_COMBINE", "g_statCombineCS"),
+                                               ("g_faldStarStatSource", "starStat", "StarStatCombineCS", "FALD_SH_STAR_STAT_COMBINE",
+                                                "g_starStatCombineCS")):
+        assert f"case {sid}: return combine + {src};" in shader_set, f"{sid} is not the combine variant of {src}"
+        assert f'"Fald{combine}"' in shader_set
         if v == "r":
+            assert c.count("g_faldZoneCombineDefine") >= 1
             assert re.search(r"src\." + alias + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from src.{alias}"
             assert f"s.{alias} = {src};" in c, f"FaldDefaultShaderSources does not map {alias} to {src}"
+            assert sid in c, f"{sid} is not created from the shipped bytecode"
         else:
-            assert re.search(re.escape(src) + r',\s*"Fald' + combine + '"', c), f"{combine} not compiled from {src}"
+            assert re.search(r"case " + sid + r":[^\n]*&" + hook_var + r"\)", c), f"{combine} not created from {sid}'s bytecode"
     assert f"SafeRelease({v}->zonePartUAV); SafeRelease({v}->zonePartBuf);" in c
     assert f"if ({v}->zoneSlices > FALD_ZONE_SLICES_MAX)" in c                            # a slice grid D3D11 cannot dispatch
     assert "static const unsigned int FALD_ZONE_SLICES_MAX = 65535u;" in _SHADER.read_text(encoding="utf-8")

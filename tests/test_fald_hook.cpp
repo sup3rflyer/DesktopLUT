@@ -10,6 +10,7 @@
 #include "doctest.h"
 #include "../dwm_hook/hook_fald.h"
 #include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride (the held-run case)
+#include "fald_pass_probe.h"                // which passes a present ran (the "did not run" pins)
 #include "../shared/fald_core_mode.h"       // the always-on core's modes (the cases run C and KC5)
 
 #include <windows.h>
@@ -758,3 +759,193 @@ TEST_CASE("FALD hook: the always-on core in the DWM hook's layer equals the over
 }
 
 #endif
+
+// ---------------------------------------------------------------------------------------------------------------------
+// What a present RUNS (shared/fald_change.h): the layer's passes by a pass counter (tests/fald_pass_probe.h — which GPU
+// commands the present issued and, for the indirect ones, whether the decide passes' arguments let them run; never a
+// timing), on a synthetic desktop where each step changes exactly one kind of thing. Beside every pin the back buffer is
+// held to the full path's, present for present. The always-on core KC5 (the default) and C.
+// The frame: 960 x 540, the owner's 48 x 48 lattice stretched over it (a fractional-pitch copy of the panel file made
+// here, its area statistic's A0 scaled with the zone area so a lit zone's statistic is its peak, as at 4K): a 100-nit
+// field with a 1-nit band down the left quarter.
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+uint16_t HkHalf(float f) {                       // positive normal floats only (the test's levels)
+    uint32_t u; std::memcpy(&u, &f, 4);
+    const int e = (int)((u >> 23) & 0xFF) - 127 + 15;
+    return (uint16_t)((e << 10) | ((u >> 13) & 0x3FF));
+}
+bool HkStretchedPanel(const std::wstring& src, const std::string& dst, unsigned W, unsigned H) {
+    std::vector<unsigned char> b;
+    std::string narrow;                           // ASCII paths (a test convenience)
+    for (wchar_t ch : src) narrow += (char)ch;
+    if (!ReadAll(narrow, b) || b.size() < 128) return false;
+    uint32_t w[32]; float f[32];
+    std::memcpy(w, b.data(), sizeof(w)); std::memcpy(f, b.data(), sizeof(f));
+    const float area = (float)(W * H) / (float)(w[1] * w[4] * w[2] * w[5]);
+    f[15] *= area;                                // A0, px^2 (word 15)
+    std::memcpy(&w[15], &f[15], 4);
+    w[4] = 0; w[5] = 0; w[31] = W | (H << 16);    // the lattice's extent (docs/fald-fractional-pitch.md)
+    std::memcpy(b.data(), w, sizeof(w));
+    std::ofstream o(dst, std::ios::binary);
+    o.write((const char*)b.data(), (std::streamsize)b.size());
+    return (bool)o;
+}
+struct HkPassStep {
+    const char* what;
+    RECT rc; float nits;             // the edit: the rect's pixels to this level (nits < 0: no edit; an empty rect: no rect at all)
+    // the passes that RAN beyond the touched zones' own sweeps, as a signature (HkPassSignature), per configuration:
+    // [0] KC5, starfield off  [1] KC5, starfield on  [2] C, starfield off  [3] C, starfield on
+    const char* expect[4];
+};
+// S = the starfield's plan passes (S1 / S2), F0 = round 0's sweep in full, Z = the core's zone passes, C0 / G0 = round 0's
+// convolution / gain, K0 = round 0's cap, F1 = round 1's sweep in full, C1 / G1 / K1 = round 1's, PF = the pixel pass over
+// the whole frame. (Not in the signature: the decide stages and the touched zones' sweeps, which every partial run has.)
+std::string HkPassSignature(const FaldPassProbe& p) {
+    static const struct { unsigned int pass; const char* tag; } order[] = {
+        { FALD_HP_STAR_S1, "S" }, { FALD_HP_STAT0_FULL, "F0" }, { FALD_HP_CORE_ZONE, "Z" }, { FALD_HP_CONV0, "C0" }, { FALD_HP_GAIN0, "G0" },
+        { FALD_HP_CORE_CAP0, "K0" }, { FALD_HP_STAT1_FULL, "F1" }, { FALD_HP_CONV1, "C1" }, { FALD_HP_GAIN1, "G1" }, { FALD_HP_CORE_CAP1, "K1" },
+        { FALD_HP_PIXEL_FULL, "PF" } };
+    std::string sig;
+    for (const auto& o : order)
+        if (p.ran[o.pass]) { if (!sig.empty()) sig += ' '; sig += o.tag; }
+    return sig.empty() ? std::string("-") : sig;
+}
+}  // namespace
+
+TEST_CASE("FALD hook: a present runs only the passes whose inputs changed, and equals the full path (WARP; FALD_TEST_FADE_DIR)") {
+    if (HookEnv("FALD_TEST_FADE_DIR").empty()) return;       // the opt-in switch of every WARP case here (no cell is read)
+    const std::wstring C = OwnerPanelPath(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
+    REQUIRE_FALSE(C.empty());
+    const unsigned W = 960, H = 540;
+    char tmp[MAX_PATH] = {};
+    GetTempPathA(MAX_PATH, tmp);
+    const std::string panel = std::string(tmp) + "dlut_hook_pass_panel_" + std::to_string(GetCurrentProcessId()) + ".bin";
+    REQUIRE(HkStretchedPanel(C, panel, W, H));
+    struct Cleanup { std::string f; ~Cleanup() { DeleteFileA(f.c_str()); } } cleanup{ panel };
+
+    const char* const kAll = "Z C0 G0 K0 F1 C1 G1 K1 PF";
+    const HkPassStep steps[] = {
+        { "the same pixels again (a rect, nothing changed)", { 700, 295, 701, 302 }, -1.0f,
+          { "-", "-", "-", "-" } },
+        // the zone's mean and geometric mean move, and the starfield's lit sum: Z1 / Z2 and S1 / S2 run, find alpha_z and the
+        // plan where they were, and nothing at full resolution follows (2026-11-12; before: the round-1 sweep and the pixel
+        // pass over the whole frame, and with the starfield on both rounds entire)
+        { "a caret in the lit field: the zone's statistics move, nothing the correction reads does", { 700, 295, 701, 302 }, 10.0f,
+          { "Z", "S Z", "-", "S" } },
+        { "the caret off again", { 700, 295, 701, 302 }, 100.0f,
+          { "Z", "S Z", "-", "S" } },
+        // alpha_z follows a dark zone's geometric mean (the core's level law below 2 nits): the round-1 sweep and the pixel
+        // pass run in full, the convolutions do not; with the starfield on the pixel is also the zone's new darkest one —
+        // its background in the plan — so the plan moved and everything follows
+        { "one pixel of the dark band dims: alpha_z moves, no drive does", { 100, 200, 101, 201 }, 0.7f,
+          { "Z F1 PF", "S F0 Z C0 G0 K0 F1 C1 G1 K1 PF", "-", "S F0 C0 G0 F1 C1 G1 PF" } },
+        { "a bright patch in the dark band: drives move", { 60, 300, 100, 330 }, 1000.0f,
+          { kAll, "S F0 Z C0 G0 K0 F1 C1 G1 K1 PF", "C0 G0 F1 C1 G1 PF", "S F0 C0 G0 F1 C1 G1 PF" } },
+        { "no rect at all", { 0, 0, 0, 0 }, -1.0f,
+          { "-", "-", "-", "-" } },
+    };
+    for (unsigned int coreMode : { FALD_CORE_MODE_KC5, FALD_CORE_MODE_C })
+    for (int star = 0; star < 2; star++) {
+        const int cfg = (coreMode == FALD_CORE_MODE_KC5 ? 0 : 2) + star;
+        std::vector<std::vector<unsigned char>> outs[2];
+        for (int forced = 0; forced < 2; forced++) {           // 0: every run full (the reference); 1: the path by its rules, pinned
+            g_faldPartialOverride = forced == 0 ? 0 : -1;
+            HookWarp w;
+            REQUIRE(w.ok);
+            Staged staged(std::wstring(panel.begin(), panel.end()), true);
+            REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+            HookMonitor hm(w, W, H, true, star != 0);
+            hm.coreMode = coreMode;
+            hm.frame.assign((size_t)W * H * 8u, 0);
+            const uint16_t lit = HkHalf(100.0f / 80.0f), dark = HkHalf(1.0f / 80.0f), ink = HkHalf(5.0f / 80.0f), one = HkHalf(1.0f);
+            for (unsigned y = 0; y < H; y++)
+                for (unsigned x = 0; x < W; x++) {
+                    // (one 5-nit "ink" pixel in the caret's zone: the zone's darkest pixel — the starfield's background —
+                    // is there before the caret comes and after it goes)
+                    const uint16_t v = (x == 705 && y == 298) ? ink : (x < W / 4 ? dark : lit);
+                    const uint16_t px[4] = { v, v, v, one };
+                    std::memcpy(&hm.frame[((size_t)y * W + x) * 8u], px, 8);
+                }
+            FaldPassProbe probe(w.dev, w.ic, false);
+            HookMonitor::Result r;
+            for (int i = 0; i < 3; i++) { r = hm.Present(true, false); if (r.ran) break; }
+            REQUIRE_MESSAGE(r.ran, r.err);
+            outs[forced].push_back(ReadBackTex(w.dev, w.ic, hm.back));
+            for (const HkPassStep& s : steps) {
+                const bool hasRect = s.rc.right > s.rc.left;
+                if (s.nits >= 0.0f) {
+                    const uint16_t v = HkHalf(s.nits / 80.0f);
+                    for (LONG y = s.rc.top; y < s.rc.bottom; y++)
+                        for (LONG x = s.rc.left; x < s.rc.right; x++)
+                            for (int c = 0; c < 3; c++) std::memcpy(&hm.frame[((size_t)y * W + x) * 8 + c * 2], &v, 2);
+                }
+                std::vector<RECT> rects;
+                if (hasRect) rects.push_back(s.rc);
+                probe.BeginPresent();
+                r = hm.Present(hasRect, false, &rects);
+                REQUIRE_MESSAGE(r.ran, std::string(s.what) << ": " << r.err);
+                FaldMonitor* m = FaldAcquire(0, 0, true, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT);
+                REQUIRE(m);
+                probe.EndPresent(FaldTestArgs(m), FaldTestLateArgs(m), FaldTestLastPartial(m));
+                FaldReturn(m);
+                outs[forced].push_back(ReadBackTex(w.dev, w.ic, hm.back));
+                if (forced == 0) continue;
+                const std::string id = std::string("core ") + (coreMode == FALD_CORE_MODE_KC5 ? "KC5" : "C") + ", starfield " + (star ? "on" : "off") + ": " + s.what;
+                CHECK_MESSAGE(r.partial, id << ": the present should take the change-driven path");
+                const std::string sig = HkPassSignature(probe);
+                CHECK_MESSAGE(sig == std::string(s.expect[cfg]), id << ": ran [" << sig << "], expected [" << std::string(s.expect[cfg]) << "]");
+                // what was not full was done on the touched zones / the rects, never both, never neither
+                if (hasRect) {
+                    CHECK_MESSAGE(probe.ran[FALD_HP_STAT1] != probe.ran[FALD_HP_STAT1_FULL], id << ": round 1's sweep, touched zones XOR full");
+                    CHECK_MESSAGE(probe.ran[FALD_HP_PIXEL_RECTS] != probe.ran[FALD_HP_PIXEL_FULL], id << ": the pixel pass, rects XOR the whole frame");
+                } else {
+                    CHECK_MESSAGE(!probe.ran[FALD_HP_PIXEL_RECTS], id << ": no rect, no rect draw");
+                }
+            }
+            g_faldPartialOverride = -1;
+        }
+        REQUIRE(outs[0].size() == outs[1].size());
+        for (size_t i = 0; i < outs[0].size(); i++)
+            CHECK_MESSAGE(outs[0][i] == outs[1][i], "core mode " << coreMode << " star " << star << ": present " << i << " differs between the full and the change-driven path");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The hook's shader init (hook_fald.h FaldInitShadersStep): created from the shipped bytecode — never compiled — a bounded
+// slice per call, and nothing is "ready" before the last step, so a present never runs the layer on half a set.
+// ---------------------------------------------------------------------------------------------------------------------
+#include "../shared/fald_shader_set.h"
+TEST_CASE("FALD hook: the layer's shaders are created from shipped bytecode in steps, ready only after the last (WARP)") {
+    ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic)));
+    FaldReleaseAll();
+    FaldReleaseShaders();
+    CHECK_FALSE(FaldShadersReady());
+    CHECK_FALSE(FaldShadersFailed());
+    // no layer before its shaders: FaldAcquire refuses whatever panel file is held
+    CHECK(FaldAcquire(0, 0, true, 3840u, 2160u, DXGI_FORMAT_R16G16B16A16_FLOAT) == nullptr);
+    // a zero budget = exactly one object per call: every shader of the list, the states, the two timing rings
+    unsigned int calls = 0;
+    bool ready = false;
+    while (!ready && calls < 200u) {
+        ready = FaldInitShadersStep(dev, ic, 0.0);
+        calls++;
+        if (!ready) CHECK_FALSE(FaldShadersReady());
+    }
+    CHECK(ready);
+    CHECK(FaldShadersReady());
+    CHECK_FALSE(FaldShadersFailed());
+    CHECK(calls == FALD_SH_COUNT + 3u);
+    CHECK(FaldCore2ShadersReady());                          // the always-on core's kernels came with them
+    CHECK(FaldInitShadersStep(dev, ic, 0.0));                // done: a further call creates nothing and says so
+    // a release starts over; everything at once = FaldInitShaders (the tests' way)
+    FaldReleaseShaders();
+    CHECK_FALSE(FaldShadersReady());
+    CHECK(FaldInitShaders(dev, ic));
+    CHECK(FaldShadersReady());
+    FaldReleaseShaders();
+    ic->ClearState(); ic->Flush();
+    ic->Release(); dev->Release();
+}

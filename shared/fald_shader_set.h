@@ -2,8 +2,10 @@
 // The FALD layer's shaders as ONE list: every shader both hosts (src/fald.cpp, dwm_hook/hook_fald.cpp) create, with the
 // exact source text, target and entry point they are compiled from (entry "main", flags 0). The hosts create them from
 // this list — precompiled (shared/fald_bytecode.h) or, when a blob is absent or refused, compiled from the text — and the
-// tests hold the precompiled blobs to D3DCompile of this text, byte for byte (tests/test_fald_bytecode.cpp).
+// tests hold the precompiled blobs to D3DCompile of this text, byte for byte (tests/test_fald_core2.cpp).
 // Header-only (no project-file entry): fald_shader.h's sources + the always-on core's kernels (shared/fald_core2.cpp).
+// The blobs themselves (shared/fald_bytecode.h, GENERATED, ~220 KB) are held by ONE translation unit, shared/fald_core2.cpp
+// — the D3D source all three binaries already build — and reached through FaldShaderBytecode.
 #pragma once
 #include <string>
 
@@ -21,6 +23,13 @@ enum FaldShaderId : unsigned int {
     FALD_SH_CORE_Z1, FALD_SH_CORE_Z2, FALD_SH_CORE_C1, FALD_SH_CORE_CX, FALD_SH_CORE_CY,   // shared/fald_core2.cpp, in its order
     FALD_SH_COUNT
 };
+
+// Shader `id` precompiled: D3DCompile of FaldShaderSource(id) (name FaldShaderName(id), entry "main", FaldShaderTarget(id),
+// flags 0) by the d3dcompiler_47.dll whose file version FaldBytecodeCompiler() returns. size 0 = no blob (a placeholder
+// header before its first generation).
+struct FaldShaderBlobRef { const unsigned char* data; unsigned int size; };
+FaldShaderBlobRef FaldShaderBytecode(unsigned int id);
+const char* FaldBytecodeCompiler();
 
 inline const char* FaldShaderName(unsigned int id) {
     static const char* const names[FALD_SH_COUNT] = {

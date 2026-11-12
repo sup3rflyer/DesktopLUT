@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "../dwm_hook/hook_fald.h"
+#include "../shared/fald_change.h"
 
 struct FaldPassProbe : FaldHookPassHook {
     ID3D11Device* dev = nullptr;
@@ -67,33 +68,40 @@ struct FaldPassProbe : FaldHookPassHook {
         open = false;
         if (timing && dj) ic->End(dj);
     }
-    void EndPresent(ID3D11Buffer* args, bool partial) { Close(); Resolve(args, partial); }
-    // After the present: `args` = the layer's arguments buffer (FaldTestArgs; null = none), `partial` = the run took the
-    // change-driven path (an indirect pass of a full run does not exist: every issued pass ran). Flushes and waits.
-    void Resolve(ID3D11Buffer* args, bool partial) {
+    void EndPresent(ID3D11Buffer* args, ID3D11Buffer* lateArgs, bool partial) { Close(); Resolve(args, lateArgs, partial); }
+    std::vector<uint32_t> ReadArgs(ID3D11Buffer* args) {
         std::vector<uint32_t> a;
-        if (args && partial) {
-            D3D11_BUFFER_DESC d; args->GetDesc(&d);
-            if (!argsStaging) {
-                D3D11_BUFFER_DESC s = d;
-                s.Usage = D3D11_USAGE_STAGING; s.BindFlags = 0; s.CPUAccessFlags = D3D11_CPU_ACCESS_READ; s.MiscFlags = 0; s.StructureByteStride = 0;
-                dev->CreateBuffer(&s, nullptr, &argsStaging);
-            }
-            if (argsStaging) {
-                ic->CopyResource(argsStaging, args);
-                D3D11_MAPPED_SUBRESOURCE m;
-                if (SUCCEEDED(ic->Map(argsStaging, 0, D3D11_MAP_READ, 0, &m))) {
-                    a.assign((const uint32_t*)m.pData, (const uint32_t*)m.pData + d.ByteWidth / 4u);
-                    ic->Unmap(argsStaging, 0);
-                }
+        if (!args) return a;
+        D3D11_BUFFER_DESC d; args->GetDesc(&d);
+        if (!argsStaging) {
+            D3D11_BUFFER_DESC s = d;
+            s.Usage = D3D11_USAGE_STAGING; s.BindFlags = 0; s.CPUAccessFlags = D3D11_CPU_ACCESS_READ; s.MiscFlags = 0; s.StructureByteStride = 0;
+            dev->CreateBuffer(&s, nullptr, &argsStaging);
+        }
+        if (argsStaging) {
+            ic->CopyResource(argsStaging, args);
+            D3D11_MAPPED_SUBRESOURCE m;
+            if (SUCCEEDED(ic->Map(argsStaging, 0, D3D11_MAP_READ, 0, &m))) {
+                a.assign((const uint32_t*)m.pData, (const uint32_t*)m.pData + d.ByteWidth / 4u);
+                ic->Unmap(argsStaging, 0);
             }
         }
+        return a;
+    }
+    // After the present: `args` / `lateArgs` = the layer's two arguments buffers (FaldTestArgs / FaldTestLateArgs; the
+    // slots shared/fald_change.h FaldArgsLate names are read from the second), `partial` = the run took the change-driven
+    // path (an indirect pass of a full run does not exist: every issued pass ran). Flushes and waits.
+    void Resolve(ID3D11Buffer* args, ID3D11Buffer* lateArgs, bool partial) {
+        std::vector<uint32_t> first, late;
+        if (partial) { first = ReadArgs(args); late = ReadArgs(lateArgs); }
         for (unsigned int p = 0; p < FALD_HP_COUNT; p++) {
             ran[p] = issued[p];
             if (issued[p] && slot[p] >= 0 && partial) {
+                const std::vector<uint32_t>& a = FaldArgsLate((unsigned int)slot[p]) ? late : first;
                 const size_t w = (size_t)slot[p] / 4u;
                 if (w + 2 < a.size())
-                    ran[p] = (p == FALD_HP_PIXEL_FULL) ? a[w + 1] != 0u : (a[w] != 0u && a[w + 1] != 0u && a[w + 2] != 0u);
+                    ran[p] = (p == FALD_HP_PIXEL_FULL || p == FALD_HP_PIXEL_RECTS) ? a[w + 1] != 0u   // a draw: its instance count
+                                                                                   : (a[w] != 0u && a[w + 1] != 0u && a[w + 2] != 0u);
             }
             us[p] = 0.0;
         }

@@ -448,6 +448,26 @@ float2 CoreGain(float2 g, float2 px) {
     return g;
 }
 float CoreW(int d) { d = abs(d); return d == 0 ? coreW0 : (d == 1 ? coreW1 : (d == 2 ? coreW2 : coreW3)); }
+
+// The change-driven path's indirect arguments (shared/fald_change.h FALD_ARGS_*: byte offsets, 3 uints a dispatch, 4 a
+// draw). Two raw buffers of this one layout: the decide pass writes the passes' arguments into the first and the LATE
+// ones — the two statistic sweeps', the pixel pass's — into the second; a pass that COMPARES its own output with the
+// previous run's (S1 / S2: the starfield plan; the core's Z2: alpha_z; a round's last cap pass) and finds it moved
+// re-orders what reads that output by storing into the late buffer itself (the macros below; every thread that sees a
+// difference stores the same words), so no decide stage follows it — and no dispatch writes the buffer its own arguments
+// come from.
+static const uint ARGS_STAR_S1 = 0, ARGS_STAR_S2 = 16, ARGS_STAT0_FULL = 32, ARGS_STAT0_FULL_COMBINE = 48, ARGS_STAT0_PART = 64,
+                  ARGS_STAT0_PART_COMBINE = 80, ARGS_CONV0 = 96, ARGS_GAIN0 = 112, ARGS_STAT1_FULL = 128, ARGS_STAT1_FULL_COMBINE = 144,
+                  ARGS_STAT1_PART = 160, ARGS_STAT1_PART_COMBINE = 176, ARGS_CONV1 = 192, ARGS_GAIN1 = 208, ARGS_PIXEL = 224,
+                  ARGS_STAR_S0_FULL = 240, ARGS_STAR_S0_FULL_COMBINE = 256,
+                  ARGS_CORE_LATTICE = 272, ARGS_CORE_FINE0 = 288, ARGS_CORE_FINE1 = 304,   // the always-on core (fald_core2.h)
+                  ARGS_PIXEL_RECTS = 320, ARGS_STAR_S0_PART = 336, ARGS_STAR_S0_PART_COMBINE = 352;   // the complements (fald_change.h)
+// a statistic sweep over the WHOLE lattice instead of the touched zones (FULL / FULLC / PART / PARTC = its slots)
+#define FALD_ORDER_SWEEP_FULL(buf, FULL, FULLC, PART, PARTC) { \
+    buf.Store3(FULL, uint3(cols, rows, ZoneSlices())); buf.Store3(FULLC, uint3(cols, rows, 1u)); \
+    buf.Store3(PART, uint3(0u, 0u, 0u)); buf.Store3(PARTC, uint3(0u, 0u, 0u)); }
+// the pixel pass over the WHOLE frame instead of the present's rects
+#define FALD_ORDER_PIXEL_FULL(buf) { buf.Store4(ARGS_PIXEL, uint4(3u, 1u, 0u, 0u)); buf.Store4(ARGS_PIXEL_RECTS, uint4(3u, 0u, 0u, 0u)); }
 )";
 
 // Pass 1: per-cell area statistic -> drive. One thread group per cell, 256 threads sweep the block.
@@ -478,7 +498,8 @@ RWTexture2D<float4> coreStatOut : register(u4);          // the always-on core (
 RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [round] = a drive / flag of that round moved,
                                                         // [2] = the starfield's S0 moved, [3] = the caller's "the frame changed
                                                         // everywhere" (read and cleared by the decide pass; fald_change.h);
-                                                        // [0] bit 1 (2u) = a zone's core statistics / node peaks moved
+                                                        // [0] bit 1 (2u) = a zone's core statistics moved, bit 2 (4u) = a
+                                                        // node peak moved (fald_change.h has every bit)
 RWTexture2D<uint> coreNodePeakOut : register(u6);        // core round 3: per FINE node the peak min(mc, white) of the pixels whose
                                                         // nearest node it is — the finished zone's S x S nodes stored whole
 RWStructuredBuffer<uint> coreNodePart : register(u7);    // core round 3, lattices of more than one slice: each slice's S x S node
@@ -587,7 +608,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 #endif
     if (coreNodes && tid.x < sub * sub) {                         // the finished zone's node peaks, stored whole (an order-free
         const uint2 node = uint2(cx * sub + tid.x % sub, cy * sub + tid.x / sub);   // max: = the prototype's cleared InterlockedMax map);
-        if (RunModePartial() == 1u && coreNodePeakOut[node] != gNodeMax[tid.x]) InterlockedOr(changeFlags[0], 2u);   // moved -> the core
+        if (RunModePartial() == 1u && coreNodePeakOut[node] != gNodeMax[tid.x]) InterlockedOr(changeFlags[0], 4u);   // moved -> the caps
         coreNodePeakOut[node] = gNodeMax[tid.x];
     }
     if (tid.x == 0) {
@@ -810,6 +831,8 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
 inline const char* g_faldStarWeightSource = R"(
 RWTexture2D<float4> starWOut : register(u0);
 RWTexture2D<float4> starPlan2Out : register(u1);
+RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [2] |= 2u = the plan the pixels read moved
+RWByteAddressBuffer lateArgs : register(u6);            // ... and round 0's sweep is re-ordered over the whole lattice
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
@@ -853,6 +876,17 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
     float wt = flank ? 0.0f : w / (1.0f + partners);              // the zone's weight in the target average
     starWOut[id.xy] = float4(wt, wt * log(max(st.r, 1e-12f)), flank ? 1.0f : 0.0f, st.g);
+    // The partial path: what Balance reads of this pass compared with the previous run's; moved = the flag (every later
+    // decide counts it) and round 0's sweep over the whole lattice. Real branches (HLSL's && evaluates both operands): the
+    // loads are for the partial path alone, and not even there once the sweep is ordered in full anyway.
+    [branch] if (RunModePartial() == 1u) {
+        [branch] if (lateArgs.Load(ARGS_STAT0_FULL) == 0u) {
+            if (any(starPlan2Out[id.xy] != float4(starBgTex.Load(int3(id.xy, 0)).x, near, st.g, w))) {
+                InterlockedOr(changeFlags[2], 2u);
+                FALD_ORDER_SWEEP_FULL(lateArgs, ARGS_STAT0_FULL, ARGS_STAT0_FULL_COMBINE, ARGS_STAT0_PART, ARGS_STAT0_PART_COMBINE)
+            }
+        }
+    }
     starPlan2Out[id.xy] = float4(starBgTex.Load(int3(id.xy, 0)).x, near, st.g, w);
 }
 )";
@@ -876,6 +910,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 // barrier comes before any thread returns.
 inline const char* g_faldStarPlanSource = R"(
 RWTexture2D<float4> starPlanOut : register(u0);
+RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: [2] |= 2u = the plan the pixels read moved
+RWByteAddressBuffer lateArgs : register(u6);            // ... and round 0's sweep is re-ordered over the whole lattice
 groupshared float4 gW[40 * 40];   // starWTex over the tile + apron (row-major, 40 wide); outside the lattice unread
 
 [numthreads(16, 16, 1)]
@@ -941,6 +977,14 @@ void main(uint3 id : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 tid : SV
     float carry = s3 * starStrength / max(n3, 1.0f) * (1.0f - StarSmooth(starNbLo, starNbHi, st.a));   // sparse > 0 only in speck zones
     float wField = spk ? st.b * starStrength : carry;
     float lnT = log(max((target > 0.0f) ? target : white, 1e-12f));
+    [branch] if (RunModePartial() == 1u) {                                   // (as S1: the plan moved -> round 0's sweep in full)
+        [branch] if (lateArgs.Load(ARGS_STAT0_FULL) == 0u) {
+            if (any(starPlanOut[id.xy] != float4(wField, lnT, 0.0f, spk ? lp : lnT))) {
+                InterlockedOr(changeFlags[2], 2u);
+                FALD_ORDER_SWEEP_FULL(lateArgs, ARGS_STAT0_FULL, ARGS_STAT0_FULL_COMBINE, ARGS_STAT0_PART, ARGS_STAT0_PART_COMBINE)
+            }
+        }
+    }
     starPlanOut[id.xy] = float4(wField, lnT, 0.0f, spk ? lp : lnT);
 }
 )";
@@ -1194,7 +1238,9 @@ void main(uint3 id : SV_DispatchThreadID) {
 )";
 
 // The decide pass (2026-10-22, work guide core-speed; shared/fald_change.h): one thread after each round's statistic sweep
-// (roundIdx 0 / 1) and, with the starfield on, after S0 (roundIdx 2). It finishes the round's black-frame boost from the
+// (roundIdx 0 / 1) and, with the starfield on, after S0 (roundIdx 2). (2026-11-12: the passes behind it that compare
+// their own output — S1 / S2, the core's Z2 and each round's last cap pass — re-order what reads it themselves, in the
+// late arguments buffer: FALD_ORDER_* in the common source.) It finishes the round's black-frame boost from the
 // persistent count (the 2 x 1 texture the conv reads), and on the PARTIAL path (runMode bits 0-7 = 1) writes the indirect
 // arguments of everything downstream from the change flags: a moved star statistic re-forms the plan (S1, S2) and
 // re-sweeps round 0 in full; a moved drive / flag / LED-lag map of round 0 runs the convolution, the gain, the round-1
@@ -1202,19 +1248,15 @@ void main(uint3 id : SV_DispatchThreadID) {
 // rects alone (the hosts draw that one; the full-frame pixel pass is the indirect draw here). The flags are cleared by
 // the last decide of the run. On the full path only the boost is written (the hosts dispatch everything directly).
 // roundIdx 3 = BEFORE any sweep, when the caller's pass may have changed the whole frame (changeFlags[3], the dynamic
-// tone map's peak: shared/fald_change.h): it orders S0 and round 0's sweep over the whole lattice (the touched-zone
-// sweeps still run first: harmless, their values are rewritten), and every later decide takes that flag as "moved".
+// tone map's peak: shared/fald_change.h): it orders S0 and round 0's sweep over the whole lattice INSTEAD of the
+// touched zones' (the whole-lattice sweep rewrites those too), and every later decide takes that flag as "moved".
 // Argument slots (bytes; 3 uints each, the pixel pass 4): shared/fald_change.h FALD_ARGS_*.
 inline const char* g_faldDecideSource = R"(
 RWStructuredBuffer<uint> boostCount : register(u3);
 RWTexture2D<float> boostOut : register(u4);              // this round's 2 x 1 (boost, count)
 RWStructuredBuffer<uint> changeFlags : register(u5);
-RWByteAddressBuffer args : register(u6);                 // the indirect arguments
-static const uint ARGS_STAR_S1 = 0, ARGS_STAR_S2 = 16, ARGS_STAT0_FULL = 32, ARGS_STAT0_FULL_COMBINE = 48, ARGS_STAT0_PART = 64,
-                  ARGS_STAT0_PART_COMBINE = 80, ARGS_CONV0 = 96, ARGS_GAIN0 = 112, ARGS_STAT1_FULL = 128, ARGS_STAT1_FULL_COMBINE = 144,
-                  ARGS_STAT1_PART = 160, ARGS_STAT1_PART_COMBINE = 176, ARGS_CONV1 = 192, ARGS_GAIN1 = 208, ARGS_PIXEL = 224,
-                  ARGS_STAR_S0_FULL = 240, ARGS_STAR_S0_FULL_COMBINE = 256,
-                  ARGS_CORE_LATTICE = 272, ARGS_CORE_FINE0 = 288, ARGS_CORE_FINE1 = 304;   // the always-on core (fald_core2.h)
+RWByteAddressBuffer args : register(u6);                 // the indirect arguments (the slots ARGS_*: the common source)
+RWByteAddressBuffer lateArgs : register(u7);             // ... and the LATE ones: the statistic sweeps', the pixel pass's
 
 [numthreads(1, 1, 1)]
 void main() {
@@ -1237,47 +1279,55 @@ void main() {
     uint3 lattice = uint3((cols + 15u) / 16u, (rows + 15u) / 16u, 1u);
     uint3 conv = uint3((cols * rows + 63u) / 64u, (sub * sub + so - 1u) / so, 1u);
     uint3 fine = uint3((cols * sub + 15u) / 16u, (rows * sub + 15u) / 16u, 1u);
-    if (roundIdx == 3u) {                                                // before any sweep: the frame changed everywhere?
-        bool all = flagF != 0u;
-        args.Store3(ARGS_STAR_S0_FULL, all ? zonesFull : none);
-        args.Store3(ARGS_STAR_S0_FULL_COMBINE, all ? zonesFullC : none);
-        args.Store3(ARGS_STAT0_FULL, all ? zonesFull : none);
-        args.Store3(ARGS_STAT0_FULL_COMBINE, all ? zonesFullC : none);
-        args.Store3(ARGS_STAT0_PART, all ? none : zonesPart);
-        args.Store3(ARGS_STAT0_PART_COMBINE, all ? none : zonesPartC);
+    bool all = flagF != 0u;                                              // the frame changed everywhere (the caller's word)
+    if (roundIdx == 3u || roundIdx == 2u) {
+        // Before any sweep (3: the frame may have changed everywhere) and after S0 (2, the starfield on): round 0's sweep
+        // on the touched zones, or over the whole lattice INSTEAD when the frame changed everywhere (the whole-lattice sweep
+        // rewrites the touched zones too). After S0 the plan passes are ordered when a zone's S0 statistic moved; S1 / S2
+        // re-order round 0's sweep over the whole lattice themselves if the PLAN moved (fald_change.h).
+        if (roundIdx == 3u) {
+            args.Store3(ARGS_STAR_S0_FULL, all ? zonesFull : none);
+            args.Store3(ARGS_STAR_S0_FULL_COMBINE, all ? zonesFullC : none);
+            args.Store3(ARGS_STAR_S0_PART, all ? none : zonesPart);
+            args.Store3(ARGS_STAR_S0_PART_COMBINE, all ? none : zonesPartC);
+        } else {
+            bool star = ((flagS & 1u) | flagF) != 0u;
+            args.Store3(ARGS_STAR_S1, star ? lattice : none);
+            args.Store3(ARGS_STAR_S2, star ? lattice : none);
+        }
+        lateArgs.Store3(ARGS_STAT0_FULL, all ? zonesFull : none);
+        lateArgs.Store3(ARGS_STAT0_FULL_COMBINE, all ? zonesFullC : none);
+        lateArgs.Store3(ARGS_STAT0_PART, all ? none : zonesPart);
+        lateArgs.Store3(ARGS_STAT0_PART_COMBINE, all ? none : zonesPartC);
         return;
     }
-    if (roundIdx == 2u) {                                                // after S0: the plan passes + round 0's sweep
-        bool star = (flagS | flagF) != 0u;
-        args.Store3(ARGS_STAR_S1, star ? lattice : none);
-        args.Store3(ARGS_STAR_S2, star ? lattice : none);
-        args.Store3(ARGS_STAT0_FULL, star ? zonesFull : none);
-        args.Store3(ARGS_STAT0_FULL_COMBINE, star ? zonesFullC : none);
-        args.Store3(ARGS_STAT0_PART, star ? none : zonesPart);
-        args.Store3(ARGS_STAT0_PART_COMBINE, star ? none : zonesPartC);
-        return;
-    }
-    // flag0's bit 1 (2u) = a zone's CORE statistics / node peaks moved (fald_core2.h, round 3): the correction changes with
-    // no drive moving — the core's lattice passes, the round-1 sweep in full and the pixel pass run; the convolution and
-    // the gain (pure functions of the drive maps) only when a drive / zone flag / LED-lag map did (the other bits). With
-    // the core off bit 1 is never set and drv == any: the arguments of 2026-10-22.
-    uint drv0 = flagS | (flag0 & ~2u) | flagF, any0 = drv0 | (flag0 & 2u);
+    flagS &= 2u;                                                         // from here on: the starfield's PLAN moved
+    // The always-on core's bits (fald_change.h; fald_core2.h): flag0 2u = a zone's core statistics moved, 4u = a node peak
+    // moved (the sweep); 8u = alpha_z moved (Z2 found it). Each orders only what reads the value: the zone passes on 2u /
+    // 4u, a round's cap passes on 4u or that round's gain. The round-1 sweep and the pixel pass are ordered here from the
+    // drives (+ alpha_z for the pixels) and RE-ordered in full by the pass that finds its output moved: Z2 and round 0's
+    // last cap pass the round-1 sweep, round 1's last cap pass the pixel pass. The convolution and the gain are pure
+    // functions of the drive maps: bit 0 only. With the core off none of its bits is ever set and nothing re-orders: the
+    // arguments of 2026-10-22.
+    uint drv0 = flagS | (flag0 & 1u) | flagF, node0 = flag0 & 4u, zone0 = flag0 & (2u | 4u);
     if (roundIdx == 0u) {                                                // after round 0's sweep (+ LED lag)
         args.Store3(ARGS_CONV0, drv0 != 0u ? conv : none);
         args.Store3(ARGS_GAIN0, drv0 != 0u ? fine : none);
-        args.Store3(ARGS_CORE_LATTICE, any0 != 0u ? lattice : none);     // the core's Z1 / Z2 (stateless: from this frame's stats)
-        args.Store3(ARGS_CORE_FINE0, any0 != 0u ? fine : none);          // ... and its fine passes of round 0 (the gain or the stats moved)
-        args.Store3(ARGS_STAT1_FULL, any0 != 0u ? zonesFull : none);
-        args.Store3(ARGS_STAT1_FULL_COMBINE, any0 != 0u ? zonesFullC : none);
-        args.Store3(ARGS_STAT1_PART, any0 != 0u ? none : zonesPart);
-        args.Store3(ARGS_STAT1_PART_COMBINE, any0 != 0u ? none : zonesPartC);
+        args.Store3(ARGS_CORE_LATTICE, (drv0 | zone0) != 0u ? lattice : none);   // the core's Z1 / Z2 (stateless: from this frame's stats)
+        args.Store3(ARGS_CORE_FINE0, (drv0 | node0) != 0u ? fine : none);        // round 0's cap: the node peaks or the gain moved
+        lateArgs.Store3(ARGS_STAT1_FULL, drv0 != 0u ? zonesFull : none);
+        lateArgs.Store3(ARGS_STAT1_FULL_COMBINE, drv0 != 0u ? zonesFullC : none);
+        lateArgs.Store3(ARGS_STAT1_PART, drv0 != 0u ? none : zonesPart);
+        lateArgs.Store3(ARGS_STAT1_PART_COMBINE, drv0 != 0u ? none : zonesPartC);
         return;
     }
-    uint drv1 = drv0 | flag1, any1 = any0 | flag1;                       // after round 1's sweep (+ LED lag)
+    uint drv1 = drv0 | (flag1 & 1u), pix = drv1 | (flag0 & 8u);          // after round 1's sweep
     args.Store3(ARGS_CONV1, drv1 != 0u ? conv : none);
     args.Store3(ARGS_GAIN1, drv1 != 0u ? fine : none);
-    args.Store3(ARGS_CORE_FINE1, any1 != 0u ? fine : none);              // the core's fine passes of round 1
-    args.Store4(ARGS_PIXEL, uint4(3u, any1 != 0u ? 1u : 0u, 0u, 0u));   // DrawInstancedIndirect: the fullscreen triangle or nothing
+    args.Store3(ARGS_CORE_FINE1, (drv1 | node0) != 0u ? fine : none);    // round 1's cap: the node peaks or the gain moved
+    lateArgs.Store4(ARGS_PIXEL, uint4(3u, pix != 0u ? 1u : 0u, 0u, 0u)); // DrawInstancedIndirect: the fullscreen triangle or nothing
+    lateArgs.Store4(ARGS_PIXEL_RECTS, uint4(3u, pix != 0u ? 0u : 1u, 0u, 0u));   // ... and the rects' draws exactly when it is nothing
+    // (round 1's last cap pass, which runs after this, re-orders those two if its cap moved; it needs no flag)
     changeFlags[0] = 0u; changeFlags[1] = 0u; changeFlags[2] = 0u; changeFlags[3] = 0u;
 }
 )";

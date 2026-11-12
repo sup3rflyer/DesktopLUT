@@ -66,9 +66,19 @@ enum FaldArgsSlot : unsigned int {
     FALD_ARGS_CONV1 = 192, FALD_ARGS_GAIN1 = 208, FALD_ARGS_PIXEL = 224,
     FALD_ARGS_STAR_S0_FULL = 240, FALD_ARGS_STAR_S0_FULL_COMBINE = 256,  // S0 over the whole lattice (the frame changed everywhere)
     // the always-on core's lattice passes (shared/fald_core2.h): Z1 / Z2 after round 0's decide; the fine passes per round
-    FALD_ARGS_CORE_LATTICE = 272, FALD_ARGS_CORE_FINE0 = 288, FALD_ARGS_CORE_FINE1 = 304
+    FALD_ARGS_CORE_LATTICE = 272, FALD_ARGS_CORE_FINE0 = 288, FALD_ARGS_CORE_FINE1 = 304,
+    // the complements, so a partial present never does a thing twice: the pixel pass over the RECTS (the hook's draws: 1
+    // instance exactly when the whole-frame draw of FALD_ARGS_PIXEL has 0), and S0 over the TOUCHED zones when the frame may
+    // have changed everywhere (nothing when the whole-lattice sweep of FALD_ARGS_STAR_S0_FULL runs)
+    FALD_ARGS_PIXEL_RECTS = 320, FALD_ARGS_STAR_S0_PART = 336, FALD_ARGS_STAR_S0_PART_COMBINE = 352
 };
-constexpr unsigned int FALD_ARGS_BYTES = 320;
+constexpr unsigned int FALD_ARGS_BYTES = 368;
+// The slots that live in the LATE arguments buffer (below, "THE LATE ARGUMENTS"): the two statistic sweeps', the pixel
+// pass's. The hosts dispatch / draw these from that buffer and everything else from the first.
+inline bool FaldArgsLate(unsigned int slot) {
+    return (slot >= FALD_ARGS_STAT0_FULL && slot <= FALD_ARGS_STAT0_PART_COMBINE) || (slot >= FALD_ARGS_STAT1_FULL && slot <= FALD_ARGS_STAT1_PART_COMBINE) ||
+           slot == FALD_ARGS_PIXEL || slot == FALD_ARGS_PIXEL_RECTS;
+}
 // The change flags (u5, FALD_CHANGE_FLAGS uints, zeroed at build and by the last decide of a run): [0] / [1] = a drive, a
 // zone flag or an LED-lag map of that round moved, [2] = the starfield's S0 moved, [3] = THE FRAME CHANGED EVERYWHERE —
 // the caller's word that the pass which made the intermediate (the tone map with a dynamic peak: shared/peak_detect.h,
@@ -76,10 +86,30 @@ constexpr unsigned int FALD_ARGS_BYTES = 320;
 // taken as unchanged: a decide pass before any sweep (RunDecide 3) then orders S0 and round 0's sweep in full, and
 // every later decide treats it as "moved". The hosts copy the caller's 4-byte flag into [3] (a GPU copy, no readback).
 constexpr unsigned int FALD_CHANGE_FLAGS = 4;
-// [0]'s bits: 1u = a drive / zone flag / LED-lag map of round 0 moved; 2u = a zone's CORE statistics or node peaks moved
-// (shared/fald_core2.h: the correction changes without any drive moving — the decide pass runs the core's passes, the round-1
-// sweep in full and the pixel pass, but not the convolution / gain).
+// [0]'s bits: 1u = a drive / zone flag / LED-lag map of round 0 moved; the always-on core's (shared/fald_core2.h), each set
+// by the pass that can see it and each ordering only what reads the value that moved:
+//   2u  a zone's CORE STATISTICS (P, M, lnG) moved (the statistic sweep)        -> the core's zone passes Z1 / Z2
+//   4u  a NODE PEAK moved (the statistic sweep)                                 -> the zone passes and both rounds' cap passes
+//   8u  ALPHA_z, the one zone value the correction reads, moved (Z2 compares)   -> the round-1 sweep in full, the pixel pass
+// and [1]'s: 1u = a drive / zone flag of round 1 moved. A round's CAP A is compared by its last pass too: round 0's moved
+// -> the round-1 sweep in full; round 1's moved -> the pixel pass over the whole frame (no flag needed: see below).
+// [2], the starfield's: 1u = a zone's S0 statistic moved (the S0 sweep) -> the plan passes S1 / S2; 2u = the PLAN the
+// pixels read (S1's plan2, S2's plan) moved (they compare) -> round 0's sweep in full and everything after it. S0's
+// statistic holds a zone's darkest pixel, its lit sum and the brightest pixel's position: it moves with almost any
+// change, the plan of a lit desktop does not.
+// The zone statistics move with almost any pixel (a mean and a geometric mean), alpha_z and the caps only when what they
+// are made of really changes the correction: a caret in a lit document moves M and lnG and nothing the pixels read.
+// THE LATE ARGUMENTS. The decide pass orders the two statistic sweeps and the pixel pass from the flags it can see; a
+// pass after it that finds its own output moved RE-ORDERS what reads that output by storing the arguments itself
+// (fald_shader.h FALD_ORDER_SWEEP_FULL / FALD_ORDER_PIXEL_FULL: S1 / S2 round 0's sweep, Z2 and round 0's last cap pass
+// the round-1 sweep, round 1's last cap pass the pixel pass), so no decide stage follows it. Those slots — FaldArgsLate —
+// live in a SECOND buffer of the same layout: a compare pass is itself dispatched from the first, so no dispatch ever
+// writes the buffer its own arguments come from.
 constexpr unsigned int FALD_CHANGE_CORE_MOVED = 2u;
+constexpr unsigned int FALD_CHANGE_NODE_MOVED = 4u;
+constexpr unsigned int FALD_CHANGE_ALPHA_MOVED = 8u;
+constexpr unsigned int FALD_CHANGE_STAR_STAT_MOVED = 1u;   // of [2]
+constexpr unsigned int FALD_CHANGE_STAR_PLAN_MOVED = 2u;   // of [2]
 constexpr unsigned int FALD_CHANGE_FLAG_FRAME_BYTES = 12;   // byte offset of [3]
 // CB word 79 (fald_shader.h runMode): the path, the conv pass's sub-offsets per thread, the list's length.
 inline uint32_t FaldRunModeWord(bool partial, unsigned int convSo, unsigned int listLen) {
