@@ -6,8 +6,11 @@
 #include "ipc_json.h"
 
 #include <windows.h>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 // ============================================================================
@@ -509,15 +512,20 @@ TEST_CASE("dlc scan: a folder with profile, registry, reports and runs; reports 
 // source checkout (bin\Release), then the folder DLC was last found in. The configured folder is authoritative.
 TEST_CASE("dlc folder: candidates in order, the first one holding DLC's files wins, the setting is authoritative") {
     // Candidates: lexical (no file touched), full paths, no duplicates, the last one used at the end.
-    const auto c = FolderCandidates(L"C:\\Apps\\Repo\\bin\\Release", L"d:\\dlc");
-    REQUIRE(c.size() == 5);
+    const auto c = FolderCandidates(L"C:\\Apps\\Repo\\bin\\Release", L"d:\\dlc", L"C:\\Users\\me");
+    REQUIRE(c.size() == 8);
     CHECK(c[0] == L"C:\\Apps\\Repo\\bin\\Release\\DLC");
     CHECK(c[1] == L"C:\\Apps\\Repo\\bin\\Release");
     CHECK(c[2] == L"C:\\Apps\\Repo\\bin\\DLC");
     CHECK(c[3] == L"C:\\Apps\\Repo\\DLC");
-    CHECK(c[4] == L"d:\\dlc");
-    CHECK(FolderCandidates(L"C:\\Apps\\Repo\\bin\\Release", L"C:\\apps\\repo\\DLC\\").size() == 4);   // already a candidate
+    CHECK(c[4] == L"C:\\Apps\\Repo\\bin\\Release\\DesktopLUT\\DLC");   // a repository clone inside the exe's folder
+    CHECK(c[5] == L"C:\\Apps\\Repo\\bin\\DesktopLUT\\DLC");            // ... or beside it
+    CHECK(c[6] == L"C:\\Users\\me\\DesktopLUT\\DLC");                  // where the DLC tab's setup puts it
+    CHECK(c[7] == L"d:\\dlc");
+    CHECK(FolderCandidates(L"C:\\Apps\\Repo\\bin\\Release", L"C:\\apps\\repo\\DLC\\").size() == 6);   // already a candidate
     CHECK(FolderCandidates(L"", L"D:\\DLC") == std::vector<std::wstring>{ L"D:\\DLC" });
+    CHECK(FolderCandidates(L"", L"D:\\DLC", L"C:\\Users\\me") ==
+          std::vector<std::wstring>{ L"C:\\Users\\me\\DesktopLUT\\DLC", L"D:\\DLC" });
     CHECK(FolderCandidates(L"", L"").empty());
 
     TempDir t;
@@ -553,6 +561,109 @@ TEST_CASE("dlc folder: candidates in order, the first one holding DLC's files wi
     // Nothing anywhere: none.
     CHECK(ResolveFolder(L"", FolderCandidates(t.mkdir(L"Bare\\App"), L""), &detected).empty());
     CHECK_FALSE(detected);
+    // A release unpacked anywhere finds the clone the setup made in the user's folder (a fresh clone: DLC's sources
+    // beside the example profile)...
+    const std::wstring home = t.mkdir(L"Home");
+    t.mkdir(L"Home\\DesktopLUT\\DLC\\src\\dlc");
+    t.write(L"Home\\DesktopLUT\\DLC\\calibration_profile.example.yaml", "displays: []\n");
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(t.mkdir(L"Downloads\\DesktopLUT_v3.0.0"), L"", home), &detected),
+                   home + L"\\DesktopLUT\\DLC"));
+    CHECK(detected);
+    // ...and a clone beside the release's folder comes before it.
+    const std::wstring zipExe = t.mkdir(L"Apps\\DesktopLUT_v3.0.0");
+    t.mkdir(L"Apps\\DesktopLUT\\DLC\\src\\dlc");
+    t.write(L"Apps\\DesktopLUT\\DLC\\calibration_profile.example.yaml", "displays: []\n");
+    CHECK(SamePath(ResolveFolder(L"", FolderCandidates(zipExe, L"", home)), t.path + L"\\Apps\\DesktopLUT\\DLC"));
+}
+
+// ---- getting DLC from zero (the DLC tab's setup) ---------------------------------------------------------------
+namespace {
+
+// The repository root: up from this source file (tests\test_dlc.cpp), else up from the working directory.
+std::wstring RepoRoot() {
+    auto up = [](std::wstring p) {
+        for (int i = 0; i < 6 && !p.empty(); i++) {
+            const DWORD a = GetFileAttributesW((p + L"\\DLC\\pyproject.toml").c_str());
+            if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) return p;
+            const size_t cut = p.find_last_of(L"\\/");
+            if (cut == std::wstring::npos) break;
+            p.resize(cut);
+        }
+        return std::wstring();
+    };
+    std::wstring here = Utf8ToWide(__FILE__);
+    if (const size_t cut = here.find_last_of(L"\\/"); cut != std::wstring::npos) here.resize(cut);
+    if (std::wstring r = up(here); !r.empty()) return r;
+    wchar_t cwd[MAX_PATH] = {};
+    GetCurrentDirectoryW(MAX_PATH, cwd);
+    return up(cwd);
+}
+
+std::string ReadText(const std::wstring& path) {
+    std::string out;
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return out;
+    char buf[65536];
+    DWORD got = 0;
+    while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got) out.append(buf, got);
+    CloseHandle(h);
+    return out;
+}
+
+std::wstring Native(const std::string& rel) {
+    std::wstring w = Utf8ToWide(rel);
+    for (wchar_t& c : w) if (c == L'/') c = L'\\';
+    return w;
+}
+
+}  // namespace
+
+// The setup request names real repository files and the commands DLC's own docs give: a renamed doc or a changed
+// command breaks this test instead of a user's setup.
+TEST_CASE("dlc setup: the setup request and the guide link name what the repository holds") {
+    const std::wstring root = RepoRoot();
+    REQUIRE_MESSAGE(!root.empty(), "the repository root (DLC\\pyproject.toml) was not found");
+    const std::string prompt = SetupPrompt(L"C:\\Users\\me\\DesktopLUT", "3.0.0");
+    const SetupFacts& f = SetupPromptFacts();
+    REQUIRE(!f.paths.empty());
+    for (const std::string& p : f.paths) {
+        INFO(p);
+        CHECK(prompt.find(p) != std::string::npos);
+        const DWORD a = GetFileAttributesW((root + L"\\" + Native(p)).c_str());
+        CHECK((a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)));
+    }
+    // Every command / tool path appears in the tracked setup docs as written.
+    std::string docs;
+    for (const char* doc : { "DLC/README.md", "DLC/docs/operator-guide.md", "DLC/third_party/README.md" })
+        docs += ReadText(root + L"\\" + Native(doc)) + "\n";
+    REQUIRE(docs.size() > 1000);
+    for (const std::string& c : f.docText) {
+        INFO(c);
+        CHECK(prompt.find(c) != std::string::npos);
+        CHECK(docs.find(c) != std::string::npos);
+    }
+    // The Python floor matches the package's.
+    CHECK(ReadText(root + L"\\DLC\\pyproject.toml").find("requires-python = \">=3.11\"") != std::string::npos);
+    // The prompt: the repository, the folder DesktopLUT looks in, this version's tag, no run before the user asks.
+    CHECK(prompt.find(std::string("git clone ") + kRepoGitUrl + " \"C:\\Users\\me\\DesktopLUT\"") != std::string::npos);
+    CHECK(prompt.find("git checkout v3.0.0") != std::string::npos);
+    CHECK(prompt.find("Don't start a calibration run until I ask") != std::string::npos);
+    CHECK(SetupRepoFolder(L"C:\\Users\\me") == L"C:\\Users\\me\\DesktopLUT");
+    CHECK(SetupRepoFolder(L"").empty());
+    // The folder the prompt names is one DesktopLUT finds by itself.
+    const auto c = FolderCandidates(L"D:\\Anywhere", L"", L"C:\\Users\\me");
+    CHECK(std::find(c.begin(), c.end(), SetupRepoFolder(L"C:\\Users\\me") + L"\\DLC") != c.end());
+    // The guide link: the repository's README for DLC, at a heading it has.
+    const std::string url = kGuideUrl;
+    CHECK(url.rfind(std::string(kRepoUrl) + "/blob/main/" + kGuideDoc + "#", 0) == 0);
+    const std::string readme = ReadText(root + L"\\" + Native(kGuideDoc));
+    const size_t at = readme.find(std::string("\n") + kGuideHeading);
+    REQUIRE(at != std::string::npos);
+    const size_t after = at + 1 + std::strlen(kGuideHeading);
+    CHECK((after < readme.size() && (readme[after] == '\n' || readme[after] == '\r')));   // the whole heading
+    std::string anchor = std::string(kGuideHeading).substr(3);   // GitHub: lower case, spaces to hyphens
+    for (char& ch : anchor) ch = ch == ' ' ? '-' : (char)std::tolower((unsigned char)ch);
+    CHECK(url.substr(url.find('#') + 1) == anchor);
 }
 
 // Developer check against a real DLC folder (read-only): set DLUT_REAL_DLC to its path. Skipped otherwise.

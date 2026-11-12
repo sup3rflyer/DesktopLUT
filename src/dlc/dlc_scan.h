@@ -4,6 +4,7 @@
 // changed, and each scan is published as an immutable snapshot (Current) that frames read for free.
 
 #include "dlc/dlc_join.h"
+#include "dlc/dlc_setup.h"   // UserHome (FolderCandidates' home)
 
 #include <atomic>
 #include <cstdint>
@@ -19,9 +20,12 @@ namespace dlc {
 // DLC not set up yet) its sources beside the example profile (src\dlc, calibration_profile.example.yaml).
 bool LooksLikeDlcFolder(const std::wstring& dir);
 // Where an unconfigured DesktopLUT looks for DLC, best first: next to the exe (<exe>\DLC, or the exe's own folder),
-// beside the exe's folder (<exe>\..\DLC), a source checkout's layout (<exe>\..\..\DLC: bin\Release), then `lastUsed`
+// beside the exe's folder (<exe>\..\DLC), a source checkout's layout (<exe>\..\..\DLC: bin\Release), a clone of the
+// repository inside or beside the exe's folder (<exe>\DesktopLUT\DLC, <exe>\..\DesktopLUT\DLC), where the DLC tab's
+// setup puts it (<home>\DesktopLUT\DLC, dlc_setup.h; `home` = the user's profile folder, "" to skip), then `lastUsed`
 // (the folder a scan last found it in). Full paths, no duplicates; no file is touched.
-std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std::wstring& lastUsed);
+std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std::wstring& lastUsed,
+                                           const std::wstring& home = std::wstring());
 // The folder to read: the configured one (authoritative: as it is, even when it does not exist), else the first
 // candidate that holds DLC's files; "" none. `detected` (optional): true when it came from the candidates. Touches the
 // file system (the scan worker calls it, never the GUI thread).

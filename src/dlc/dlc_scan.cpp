@@ -1,4 +1,5 @@
 #include "dlc/dlc_scan.h"
+#include "dlc/dlc_setup.h"  // SetupRepoFolder
 #include "dlc/dlc_yaml.h"   // kMaxYamlBytes
 
 #include <windows.h>
@@ -108,7 +109,7 @@ bool LooksLikeDlcFolder(const std::wstring& dir) {
     return IsFile(dir + L"\\calibration_profile.example.yaml") && IsDir(dir + L"\\src\\dlc");
 }
 
-std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std::wstring& lastUsed) {
+std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std::wstring& lastUsed, const std::wstring& home) {
     std::vector<std::wstring> out;
     auto add = [&out](const std::wstring& path) {
         if (path.empty()) return;
@@ -126,7 +127,11 @@ std::vector<std::wstring> FolderCandidates(const std::wstring& exeDir, const std
         add(exeDir);
         add(exeDir + L"\\..\\DLC");
         add(exeDir + L"\\..\\..\\DLC");
+        // A clone of the repository inside the exe's folder or beside it.
+        add(exeDir + L"\\DesktopLUT\\DLC");
+        add(exeDir + L"\\..\\DesktopLUT\\DLC");
     }
+    if (const std::wstring repo = SetupRepoFolder(home); !repo.empty()) add(repo + L"\\DLC");   // where the setup puts it
     add(lastUsed);
     return out;
 }

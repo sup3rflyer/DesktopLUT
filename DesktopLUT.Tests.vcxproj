@@ -135,6 +135,8 @@
     <ClCompile Include="src\dlc\dlc_data.cpp" />
     <ClCompile Include="src\dlc\dlc_join.cpp" />
     <ClCompile Include="src\dlc\dlc_scan.cpp" />
+    <ClCompile Include="src\dlc\dlc_setup.cpp" />
+    <ClCompile Include="src\shell_open.cpp" />
     <ClCompile Include="src\dlc\dlc_live.cpp" />
     <ClCompile Include="src\ui\ui_model.cpp" />
     <ClCompile Include="src\ui\ui_gscurve.cpp" />
