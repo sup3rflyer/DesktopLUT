@@ -66,6 +66,14 @@ void UpdateDwmHookSharedConfig();
 // Close shared memory mapping. Called on uninject/stop.
 void CloseDwmHookSharedMemory();
 
+// The hook's FALD service thread (LED-lag settle kicks, recompose requests) keeps a monitor list (one kick window and
+// two named events per monitor, refreshed every 2 s) only while some monitor's published flags have the layer on;
+// otherwise it is parked: it blocks on stop / the recompose request / a wake, with no periodic work. Pure (tested).
+bool DwmHookConfigWantsFaldKicker(const DwmHookSharedConfig& cfg);
+// Parked: the layer is on nowhere, and either it never was in this thread's life or it has been off for `lingerMs`
+// (the DLL debounces a mode flip and may run the layer a little longer than the config says).
+bool FaldKickerShouldPark(bool wanted, bool everWanted, unsigned long long msSinceWanted, unsigned long long lingerMs);
+
 // The FALD governors' status the resident DLL reports (dwm_hook_config.h DwmHookFaldStatus): a consistent copy of
 // the block (false = none: no section, no DLL wrote, or a write kept overlapping the copy). Any thread, no lock.
 bool ReadDwmHookFaldStatus(DwmHookFaldStatus& out);

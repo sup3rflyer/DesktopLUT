@@ -1144,6 +1144,35 @@ struct FaldKickMonitor {
 static HANDLE g_faldPrimeEvent = nullptr;
 static HANDLE g_faldKickStop = nullptr;
 static HANDLE g_faldKickThread = nullptr;
+// Parked while no monitor has the layer on: without it nothing signals SETTLE / CONTENT, so the thread keeps no
+// monitor list (no kick windows, no events, no 2 s refresh) and blocks on stop / PRIME / wake only. PRIME stays
+// served: the dynamic tone map's peak source asks for recompositions through it too (hook_render.cpp).
+//  * g_faldKickWanted: some monitor's published faldFlags have the layer on (UpdateDwmHookSharedConfig, the only writer).
+//  * g_faldKickWake (auto-reset): that changed. The thread re-reads it at once.
+//  * g_faldKickArmed (manual-reset): the thread built its monitor list for the current "wanted" (the per-monitor
+//    events exist). UpdateDwmHookSharedConfig waits for it, briefly, BEFORE it publishes a config that switches the
+//    layer on: the DLL opens the events by name on its first run and retries only every 120 runs.
+// The thread parks only after the layer has been off everywhere for FALD_KICK_PARK_LINGER_MS: the DLL debounces a
+// mode flip over three config updates and may run the layer a few seconds longer than the config says.
+static std::atomic<bool> g_faldKickWanted{ false };
+static HANDLE g_faldKickWake = nullptr;
+static HANDLE g_faldKickArmed = nullptr;
+static const ULONGLONG FALD_KICK_PARK_LINGER_MS = 10000;
+static const DWORD FALD_KICK_ARM_WAIT_MS = 250;
+
+bool DwmHookConfigWantsFaldKicker(const DwmHookSharedConfig& cfg)
+{
+    const uint32_t n = cfg.numMonitors < MAX_DWM_HOOK_MONITORS ? cfg.numMonitors : MAX_DWM_HOOK_MONITORS;
+    for (uint32_t i = 0; i < n; i++)
+        if (DwmHookFaldEnabled(cfg.faldFlags[i])) return true;
+    return false;
+}
+
+bool FaldKickerShouldPark(bool wanted, bool everWanted, unsigned long long msSinceWanted, unsigned long long lingerMs)
+{
+    if (wanted) return false;
+    return !everWanted || msSinceWanted >= lingerMs;   // never on in this thread's life: parked from the start
+}
 
 static BOOL CALLBACK CollectMonitorOrigin(HMONITOR, HDC, LPRECT rc, LPARAM lp) {
     reinterpret_cast<std::vector<POINT>*>(lp)->push_back(POINT{ rc->left, rc->top });
@@ -1222,7 +1251,7 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
         for (const POINT& o : origins) {
             bool known = false;
             for (const FaldKickMonitor& m : mons) if (m.origin.x == o.x && m.origin.y == o.y) { known = true; break; }
-            if (known || mons.size() >= 60) continue;           // (60 + stop + prime stay inside MAXIMUM_WAIT_OBJECTS)
+            if (known || mons.size() >= 60) continue;           // (60 + stop + prime + wake stay inside MAXIMUM_WAIT_OBJECTS)
             FaldKickMonitor m;
             m.origin = o;
             wchar_t name[96];
@@ -1250,24 +1279,45 @@ static DWORD WINAPI FaldSettleKickThread(LPVOID) {
         if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_FALD_RECOMPOSE, 0, 0);
     };
 
-    refreshMonitors();
+    bool listed = false;                      // the monitor list is built (false while parked)
+    bool everWanted = false;
+    ULONGLONG lastWantedMs = 0;
     for (;;) {
         const ULONGLONG now = GetTickCount64();
-        if (now - lastEnumMs > FALD_KICK_ENUM_MS) refreshMonitors();
+        const bool wanted = g_faldKickWanted.load();
+        if (wanted) { lastWantedMs = now; everWanted = true; }
+        if (FaldKickerShouldPark(wanted, everWanted, now - lastWantedMs, FALD_KICK_PARK_LINGER_MS)) {
+            // parked: no monitor has the layer on. Nothing to kick, nothing to refresh: block until that changes.
+            if (listed) {
+                for (FaldKickMonitor& m : mons) closeMon(m);
+                mons.clear();
+                listed = false;
+            }
+            HANDLE waits[3] = { g_faldKickStop, g_faldPrimeEvent, g_faldKickWake };
+            const DWORD w = MsgWaitForMultipleObjectsEx(3, waits, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            if (w == WAIT_OBJECT_0) break;                                   // stop
+            if (w == WAIT_OBJECT_0 + 1) handlePrime();
+            else if (w == WAIT_FAILED) Sleep(50);
+            PumpThreadMessages();
+            continue;
+        }
+        if (!listed || now - lastEnumMs > FALD_KICK_ENUM_MS) { refreshMonitors(); listed = true; }
+        if (wanted) SetEvent(g_faldKickArmed);    // the events of every monitor exist now (see g_faldKickArmed)
         bool active = false;
         for (const FaldKickMonitor& m : mons) if (m.lastSettleMs && now - m.lastSettleMs < FALD_KICK_QUIET_MS) { active = true; break; }
 
         if (!active) {
-            // idle: sleep on stop / prime / every SETTLE event, pumping messages; wake at least for the list refresh
+            // idle: sleep on stop / prime / wake / every SETTLE event, pumping messages; wake at least for the list refresh
             HANDLE waits[MAXIMUM_WAIT_OBJECTS];
             DWORD n = 0;
             waits[n++] = g_faldKickStop;
             waits[n++] = g_faldPrimeEvent;
+            waits[n++] = g_faldKickWake;
             for (const FaldKickMonitor& m : mons) waits[n++] = m.settle;
             const DWORD w = MsgWaitForMultipleObjectsEx(n, waits, (DWORD)FALD_KICK_ENUM_MS, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if (w == WAIT_OBJECT_0) break;                                   // stop
             if (w == WAIT_OBJECT_0 + 1) handlePrime();
-            else if (w >= WAIT_OBJECT_0 + 2 && w < WAIT_OBJECT_0 + n) mons[w - WAIT_OBJECT_0 - 2].lastSettleMs = GetTickCount64();
+            else if (w >= WAIT_OBJECT_0 + 3 && w < WAIT_OBJECT_0 + n) mons[w - WAIT_OBJECT_0 - 3].lastSettleMs = GetTickCount64();
             else if (w == WAIT_FAILED) Sleep(50);
             PumpThreadMessages();
             continue;
@@ -1317,12 +1367,15 @@ static void StartFaldSettleKicker() {
     if (g_faldKickThread) return;
     if (!g_faldPrimeEvent) g_faldPrimeEvent = CreateFaldEvent(DWM_HOOK_FALD_PRIME_EVENT);
     if (!g_faldKickStop) g_faldKickStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!g_faldPrimeEvent || !g_faldKickStop) {
+    if (!g_faldKickWake) g_faldKickWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_faldKickArmed) g_faldKickArmed = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_faldPrimeEvent || !g_faldKickStop || !g_faldKickWake || !g_faldKickArmed) {
         std::wcerr << L"[DWM Hook] FALD service events could not be created: LED lag cannot settle and priming is not"
                       L" requested on a static desktop" << std::endl;
         return;
     }
     ResetEvent(g_faldKickStop);
+    ResetEvent(g_faldKickArmed);
     g_faldKickThread = CreateThread(nullptr, 0, FaldSettleKickThread, nullptr, 0, nullptr);
     if (!g_faldKickThread)
         std::wcerr << L"[DWM Hook] FALD service thread could not be started: " << GetLastError() << std::endl;
@@ -1340,12 +1393,31 @@ static void StopFaldSettleKicker() {
         g_faldKickThread = nullptr;
         g_faldKickStop = nullptr;
         g_faldPrimeEvent = nullptr;
+        g_faldKickWake = nullptr;
+        g_faldKickArmed = nullptr;
         return;
     }
     CloseHandle(g_faldKickThread);
     g_faldKickThread = nullptr;
     CloseHandle(g_faldKickStop); g_faldKickStop = nullptr;
     CloseHandle(g_faldPrimeEvent); g_faldPrimeEvent = nullptr;
+    CloseHandle(g_faldKickWake); g_faldKickWake = nullptr;
+    CloseHandle(g_faldKickArmed); g_faldKickArmed = nullptr;
+}
+
+// The published config switches the layer on / off somewhere (UpdateDwmHookSharedConfig, g_dwmInjectMutex held, BEFORE
+// the config is written): wake the service thread, and when the layer comes on wait, briefly, until its per-monitor
+// events exist. Without a thread (not started yet: it reads the flag when it starts) only the flag is kept.
+static void SetFaldKickerWanted(bool wanted)
+{
+    if (g_faldKickWanted.load() == wanted) return;
+    if (wanted && g_faldKickArmed) ResetEvent(g_faldKickArmed);
+    g_faldKickWanted.store(wanted);
+    if (!g_faldKickThread || !g_faldKickWake) return;
+    SetEvent(g_faldKickWake);
+    if (wanted && g_faldKickArmed && WaitForSingleObject(g_faldKickArmed, FALD_KICK_ARM_WAIT_MS) != WAIT_OBJECT_0)
+        std::wcerr << L"[DWM Hook] FALD service thread not ready in " << FALD_KICK_ARM_WAIT_MS
+                   << L" ms: the LED-lag settle kicks may start a moment late" << std::endl;
 }
 
 // The FALD governors' status block (dwm_hook_config.h DwmHookFaldStatus; the DLL writes, the host reads): created
@@ -1586,6 +1658,10 @@ void UpdateDwmHookSharedConfig()
         for (const HookFaldPanel& e : g_hookFaldPanels)
             if (e.left == cfg.monitors[i].left && e.top == cfg.monitors[i].top)
                 ex.tail.fald[i].panelGen[e.hdr ? 1 : 0] = FaldPanelTrackPublishedGen(e.track);
+
+    // The FALD service thread is parked while no monitor has the layer on: bring it up (its per-monitor events) before
+    // the DLL can read a config that switches the layer on.
+    SetFaldKickerWanted(DwmHookConfigWantsFaldKicker(cfg));
 
     // Seqlock write: odd version = write in progress, even = complete.
     // Reader rejects odd versions and mismatched pre/post-copy versions.
