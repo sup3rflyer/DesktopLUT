@@ -128,11 +128,12 @@ MonitorPrimaries OverridePrimaries(const EdidValues& edid, const DXGI_OUTPUT_DES
     return MonitorPrimaries();
 }
 
-// Nothing tone maps, whatever the intent says: the hook gave up (the watchdog's flap cap, until a start re-arms it),
-// or, in overlay mode, the VRR passthrough hides the overlay for a whitelisted game (it would get no tone map at all).
+// Nothing tone maps, whatever the intent says: the hook gave up (any of its give-up rules, dwm_hook_stability.h,
+// until a start re-arms it), or, in overlay mode, the VRR passthrough hides the overlay for a whitelisted game (it
+// would get no tone map at all).
 bool ToneMapEngineOff() {
     if (g_dwmHookMode.load())
-        return g_dwmHookReinjectCount >= DWM_HOOK_WATCHDOG_MAX_REINJECTS && !IsDwmHookActive();
+        return g_dwmHookStability.gaveUp && !IsDwmHookActive();
     return g_vrrWhitelistActive.load();
 }
 

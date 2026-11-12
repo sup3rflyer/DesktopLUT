@@ -145,6 +145,9 @@ void SetHdrDither(bool on) {
 }
 
 void SetDwmHookMode(bool on) {
+    // Switching it on is the user's deliberate retry (after a fall-back, a Windows update): every give-up count of
+    // the hook starts again (dwm_hook_stability.h). The fall-back itself only ever switches it off.
+    if (on) g_dwmHookStability.OnUserReEnable();
     g_dwmHookMode.store(on);
     SaveSettings();
     if (g_gui.isRunning) RestartLiveLayers();

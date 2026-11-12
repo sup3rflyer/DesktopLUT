@@ -164,6 +164,7 @@ void TakeSnapshot(Snapshot& out) {
     }
     out.hookMode = g_dwmHookMode.load();
     out.hookActive = out.hookActive && out.hookMode;
+    out.hookBuild = DwmHookBuildCheck();   // read once per process
     out.suspended = act::LiveLayersSuspended();
     out.calibrating = IsCalibrationOrLiveEditActive();   // locks of its own: outside the settings lock above
     auto attach = [&](DisplayRow& r) {

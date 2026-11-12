@@ -10,6 +10,7 @@
 #include "fald_fade_status.h"
 #include "fald_core_status.h"
 #include "refresh_trim.h"
+#include "dwm_hook_build.h"
 #include <windows.h>
 #include <memory>
 #include <string>
@@ -48,7 +49,8 @@ struct Snapshot {
     std::shared_ptr<const dlc::Live> run;   // DLC's run in progress, or the last one (never null)
     bool hookMode = false;
     bool hookActive = false;
-    std::wstring lastStatus;       // the newest status line or warning / error (any source)
+    DwmHookBuildStatus hookBuild;  // was the hook verified against this Windows' dwmcore.dll (dwm_hook_build.h)
+    std::wstring lastStatus;      // the newest status line or warning / error (any source)
     notify::Sev lastStatusSev = notify::Sev::Info;
 };
 
