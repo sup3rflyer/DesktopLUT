@@ -47,9 +47,9 @@ std::string ProfilesDetail(const Display& d) {
     size_t listed = 0;
     for (const std::wstring& n : d.listed) if (IsOurProfileName(n)) listed++;
     const bool sdr = IsOurProfileName(d.sdrDefault), hdr = IsOurProfileName(d.hdrDefault);
-    std::string s = listed ? Count(listed, "association", "associations") : std::string("None listed");
-    if (sdr || hdr) s += std::string(", ours is the ") + (sdr && hdr ? "SDR and HDR" : sdr ? "SDR" : "HDR") + " default";
-    return s + "; both lists checked";
+    std::string s = listed ? Count(listed, "profile", "profiles") : std::string("None listed");
+    if (sdr || hdr) s += std::string(" \xC2\xB7 default in ") + (sdr && hdr ? "SDR and HDR" : sdr ? "SDR" : "HDR");
+    return s;
 }
 
 // Removes every name of ours from one display's lists (uninstall.h: neutral identity first, so the hardware LUT the
@@ -58,7 +58,7 @@ StepResult RunDisplayProfiles(const Display& d, const State& state, System& sys)
     StepResult r;
     if (!sys.Present(d)) {
         r.outcome = Outcome::Failed;
-        r.note = "Not connected any more: its associations stay";
+        r.note = "Not connected now: its profiles stay listed";
         return r;
     }
     std::vector<std::wstring> names;
@@ -91,14 +91,13 @@ StepResult RunDisplayProfiles(const Display& d, const State& state, System& sys)
     const bool defaultLeft = IsOurProfileName(sys.DefaultProfile(d, false)) || IsOurProfileName(sys.DefaultProfile(d, true));
     if (left || defaultLeft) {
         r.outcome = Outcome::Failed;
-        r.note = left ? Count(left, "association", "associations") + " still listed" : std::string("Still the default");
+        r.note = left ? Count(left, "profile", "profiles") + " still listed" : std::string("Still the default");
     } else if (identityFailed) {
         r.outcome = Outcome::Failed;
-        r.note = Count(removed, "removed", "removed") + "; no neutral profile first: the panel may keep the calibration "
-                 "until Windows restarts";
+        r.note = Count(removed, "removed", "removed") + "; the calibration may stay until restart";
     } else if (removed) {
         r.outcome = Outcome::Done;
-        r.note = Count(removed, "association removed", "associations removed");
+        r.note = Count(removed, "profile removed", "profiles removed");
     } else {
         r.outcome = Outcome::Nothing;
         r.note = "None";
@@ -111,9 +110,9 @@ StepResult FilesResult(size_t deleted, size_t failed, size_t kept, size_t refuse
     std::string s;
     auto add = [&s](const std::string& part) { s += (s.empty() ? "" : ", ") + part; };
     if (deleted) add(std::to_string(deleted) + " deleted");
-    if (failed) add(std::to_string(failed) + " could not be deleted");
-    if (kept) add(std::to_string(kept) + " kept: still associated");
-    if (refused) add(std::to_string(refused) + " refused: not ours");
+    if (failed) add(std::to_string(failed) + " failed");
+    if (kept) add(std::to_string(kept) + " kept (still listed)");
+    if (refused) add(std::to_string(refused) + " refused (not ours)");
     r.outcome = (failed || kept || refused) ? Outcome::Failed : deleted ? Outcome::Done : Outcome::Nothing;
     r.note = s.empty() ? "None" : s;
     return r;
@@ -146,13 +145,13 @@ Plan BuildPlan(const State& s) {
     }
     if (anyConnected)
         p.steps.push_back({ StepKind::ReportedPeak, -1, "HDR PEAK",
-                            anyHdr ? "The panel's again where Windows reports 10000 nits" : "No display in HDR" });
+                            anyHdr ? "Back to the panel's own value" : "No display in HDR" });
     for (int i = 0; i < (int)s.displays.size(); i++) {
         const Display& d = s.displays[(size_t)i];
         if (d.connected) p.steps.push_back({ StepKind::DisplayProfiles, i, DisplayLabel(d), ProfilesDetail(d) });
     }
     if (anyConnected)
-        p.steps.push_back({ StepKind::ReloadCalibration, -1, "CALIBRATION LOADER", "Windows applies what is left" });
+        p.steps.push_back({ StepKind::ReloadCalibration, -1, "CALIBRATION LOADER", "Reapply the profiles left" });
     size_t files = 0;
     for (const std::wstring& n : s.profileFiles) if (IsOurProfileName(n)) files++;
     p.steps.push_back({ StepKind::DeleteProfiles, -1, "PROFILE FILES",
@@ -162,16 +161,16 @@ Plan BuildPlan(const State& s) {
     size_t temp = 0;
     for (const std::wstring& t : s.tempFiles) if (IsOurTempPath(t)) temp++;
     p.steps.push_back({ StepKind::DeleteTemp, -1, "TEMP FILES",
-                        temp ? Count(temp, "item", "items") + " in Windows\\Temp and %TEMP%" : std::string("None") });
+                        temp ? Count(temp, "file", "files") : std::string("None") });
 
-    p.stays.push_back({ "FOLDER", "DesktopLUT.exe, DwmHook.dll, the INI, your LUTs and profiles. Delete it yourself." });
+    p.stays.push_back({ "FOLDER", "Exe, DLL, INI and your files. Delete it yourself." });
     for (const Display& d : s.displays) {
         if (d.connected) continue;
         std::vector<std::wstring> named;
         AddOurs(named, d.named);
         if (named.empty()) continue;
         p.stays.push_back({ d.name.empty() ? std::string("DISPLAY") : Narrow(d.name),
-                            "Not connected: its associations stay. Connect it first." });
+                            "Not connected: its profiles stay listed. Connect it first." });
     }
     return p;
 }
@@ -217,7 +216,7 @@ Result Execute(const Plan& plan, const State& state, System& sys, const std::fun
             }
             r.outcome = failed ? Outcome::Failed : restored ? Outcome::Done : Outcome::Nothing;
             r.note = failed ? Count(failed, "display failed", "displays failed")
-                   : restored ? Count(restored, "display put back", "displays put back") : std::string("Nothing to put back");
+                   : restored ? Count(restored, "display put back", "displays put back") : std::string("Nothing to do");
             break;
         }
         case StepKind::DisplayProfiles:
@@ -230,7 +229,7 @@ Result Execute(const Plan& plan, const State& state, System& sys, const std::fun
             break;
         case StepKind::ReloadCalibration:
             r.outcome = sys.ReloadCalibration() ? Outcome::Done : Outcome::Failed;
-            r.note = r.outcome == Outcome::Done ? "Started" : "The Calibration Loader task did not start";
+            r.note = r.outcome == Outcome::Done ? "Started" : "Did not start";
             break;
         case StepKind::DeleteProfiles: {
             // A file still in a connected display's list stays: deleting it would leave Windows a default it cannot
@@ -272,7 +271,7 @@ Result Execute(const Plan& plan, const State& state, System& sys, const std::fun
         }
         } catch (...) {   // a step that throws fails alone, like any other failure
             r.outcome = Outcome::Failed;
-            r.note = "An error stopped this step";
+            r.note = "Error";
         }
         if (r.outcome == Outcome::Failed) res.anyFailed = true;
     }

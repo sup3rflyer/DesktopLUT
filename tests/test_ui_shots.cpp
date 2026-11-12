@@ -832,10 +832,10 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     if (shot.variant == 41) {
                         uninst::Result& r = vs.uninstall.result;
                         r.steps.resize(vs.uninstall.plan.steps.size(), { uninst::Outcome::Done, "Done" });
-                        const char* notes[] = { "Stopped", "Unloaded", "1 display put back", "3 associations removed",
-                                                "1 association removed", "Started", "", "Deleted", "3 deleted" };
+                        const char* notes[] = { "Stopped", "Unloaded", "1 display put back", "3 profiles removed",
+                                                "1 profile removed", "Started", "", "Deleted", "3 deleted" };
                         for (size_t i = 0; i < r.steps.size() && i < 9; i++) r.steps[i].note = notes[i];
-                        r.steps[6] = { uninst::Outcome::Failed, "22 deleted, 1 could not be deleted" };
+                        r.steps[6] = { uninst::Outcome::Failed, "22 deleted, 1 failed" };
                         r.steps[2].outcome = uninst::Outcome::Done;
                         r.steps[1] = { uninst::Outcome::Nothing, "Not loaded" };
                         r.anyFailed = true;
