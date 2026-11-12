@@ -158,7 +158,7 @@ from .patch_sets import (
     outside_in_indices,
 )
 from .paths import atomic_write_text, runs_dir
-from .runs import (RunContext, create_run, open_run, publish_active_pointer,
+from .runs import (RUN_DRIVERS, RunContext, create_run, open_run, publish_active_pointer,
                    update_active_pointer)
 from .stages import _common, build_mhc
 
@@ -540,10 +540,16 @@ class Calibration:
         keep_layers: Optional[Sequence[str]] = None,
         sdr_white_probe: Optional[Callable[[Optional[Mapping[str, Any]]], dict[str, Any]]] = None,
         patch_window_size: Optional[Mapping[str, Any]] = None,
+        driver: str = "cli",
     ) -> None:
         self.ctx = ctx
         self.profile = profile
         self.monitor = monitor
+        # Who launched this invocation (--driver: cli / claude / desktoplut) — active.json carries it
+        # for the DLC tab. Advisory metadata; nothing in the run reads it.
+        if driver not in RUN_DRIVERS:
+            raise ValueError(f"driver must be one of {RUN_DRIVERS}, not {driver!r}")
+        self.driver = driver
         # Local DisplayConfig link-format probe (dlc.link_format.probe_link_formats) — the fallback
         # when the DesktopLUT build's query_monitors predates link_bpc. The live CLI wires it; the
         # default None keeps sim/tests off the host's real displays.
@@ -8341,11 +8347,13 @@ class Calibration:
     # Flows
     # ====================================================================
     def _active_pointer_identity(self) -> dict[str, Any]:
-        """Who this run is, for ``active.json``: the display / monitor / mode, and the panel's EDID
-        hardware id — the profile's recorded one (``quirks.hardware_id``) when it has one, else the
-        id the preflight read from live enumeration, else omitted."""
+        """Who this run is, for ``active.json``: the display / monitor / mode, who drives this
+        invocation (``driver``: cli / claude / desktoplut — the DLC tab shows it), and the panel's
+        EDID hardware id — the profile's recorded one (``quirks.hardware_id``) when it has one, else
+        the id the preflight read from live enumeration, else omitted."""
         out: dict[str, Any] = {"display": self.display.name, "monitor": self.monitor,
-                               "mode": self.mode, "content_mode": self.content_mode}
+                               "mode": self.mode, "content_mode": self.content_mode,
+                               "driver": self.driver}
         hw = str(self.display.quirks.get("hardware_id") or "").strip()
         source = "profile"
         if not hw:
@@ -12434,6 +12442,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                 "/ optimizer floor / failed verify). Kept for supervised experiments.")
     parser.add_argument("--no-live-state", action="store_true", dest="no_live_state",
                         help="don't write live/state.json + live/charts.json (DesktopLUT's DLC tab)")
+    parser.add_argument("--driver", choices=list(RUN_DRIVERS), default="cli",
+                        help="who launched THIS invocation: `cli` (a person at a shell — the default), "
+                             "`claude` (the supervising LLM) or `desktoplut` (DesktopLUT's DLC tab). "
+                             "Recorded in the manifest's launch record and written to runs/active.json, "
+                             "where the DLC tab reads it. Advisory only: it changes nothing about the run.")
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
@@ -12639,7 +12652,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # `--run <dir> --decide KEY=CHOICE`. Advisory: a manifest write that fails never stops the run.
     try:
         ctx.record_launch(sys.argv[1:] if argv is None else argv,
-                          program=sys.argv[0] if argv is None else None)
+                          program=sys.argv[0] if argv is None else None, driver=args.driver)
     except Exception as exc:  # noqa: BLE001
         ctx.log(f"could not record the launch argv in the manifest: {type(exc).__name__}: {exc}")
 
@@ -12736,6 +12749,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             _common.save_dlc_state(ctx, state)
         try:   # advisory: the run is over (only if active.json still names it)
             update_active_pointer(ctx.root, state="cancelled", aborted_by="--abort", abort_exit_code=code,
+                                  driver=args.driver,
                                   updated=datetime.now().isoformat(timespec="seconds"))
         except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
             pass
@@ -12993,6 +13007,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                          if args.keep_layers else None),
                             sdr_white_probe=_sdr_white_probe,
                             patch_window_size=patch_window_report,
+                            driver=args.driver,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))

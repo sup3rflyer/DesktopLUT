@@ -168,6 +168,54 @@ def test_record_launch_keeps_the_first_launch_and_appends_resumes(tmp_path: Path
     assert open_run(legacy).manifest.launch == {} and open_run(legacy).manifest.resumes == []
 
 
+def test_record_launch_carries_who_drove_the_invocation(tmp_path: Path):
+    ctx = create_run("SDR", display="synthetic", run_dir=tmp_path / "run")
+    ctx.record_launch(["--flow", "full"], cwd=tmp_path, driver="desktoplut")
+    ctx.record_launch(["--run", "x", "--decide", "a=b"], cwd=tmp_path, driver="claude")
+    ctx.record_launch(["--run", "x", "--abort"], cwd=tmp_path)                 # in-process: no driver
+    raw = json.loads((tmp_path / "run" / "manifest.json").read_text(encoding="utf-8"))
+    assert raw["launch"]["driver"] == "desktoplut"
+    assert raw["resumes"][0]["driver"] == "claude" and "driver" not in raw["resumes"][1]
+    with pytest.raises(ValueError):
+        ctx.record_launch(["--flow", "full"], driver="someone")
+
+
+def test_main_records_the_driver_in_the_launch_and_in_active_json(tmp_path, monkeypatch, capsys):
+    from test_park_window import _run_main
+
+    full_field = {"patch_size_pct": 100, "area_pct": 100.0}
+    rc, _out, _ = _run_main(tmp_path, monkeypatch, capsys, tech="WOLED", window=full_field,
+                            extra=("--driver", "desktoplut"))
+    assert rc == 10
+    run = tmp_path / "run"
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["launch"]["driver"] == "desktoplut"
+    assert _pointer()["driver"] == "desktoplut" and _pointer()["state"] == "paused_seam"
+    # the supervising LLM resumes it: the resume is recorded as its own, active.json follows
+    rc, _out, _ = _run_main(tmp_path, monkeypatch, capsys, tech="WOLED", window=full_field,
+                            extra=("--driver", "claude", "--decide", "preflight:patch-window=abort"))
+    assert rc == 1
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["launch"]["driver"] == "desktoplut" and manifest["resumes"][-1]["driver"] == "claude"
+    assert _pointer()["driver"] == "claude" and _pointer()["state"] == "failed"
+    # a person at a shell abandons it (the default driver); the patched pipe/profile are still in place
+    from dlc.calibrate import main
+
+    rc = main(["--flow", "full", "--monitor", "0", "--mode", "SDR", "--run", str(run), "--abort"])
+    capsys.readouterr()
+    assert rc == 0
+    assert _pointer()["driver"] == "cli" and _pointer()["aborted_by"] == "--abort"
+    manifest = json.loads((run / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["resumes"][-1]["driver"] == "cli"
+
+
+def test_main_rejects_an_unknown_driver(tmp_path, monkeypatch, capsys):
+    from test_park_window import _run_main
+
+    with pytest.raises(SystemExit):
+        _run_main(tmp_path, monkeypatch, capsys, tech="WOLED", window=None, extra=("--driver", "robot"))
+
+
 def test_main_records_argv_across_a_resume_and_moves_the_active_state(tmp_path, monkeypatch, capsys):
     from test_park_window import _run_main
 
@@ -381,10 +429,11 @@ def test_active_pointer_running_then_done_with_identity(tmp_path: Path):
     assert Path(running["run"]) == calib.ctx.root and Path(running["events"]) == calib.ctx.events_path
     assert running["display"] == calib.display.name and running["monitor"] == 0
     assert running["mode"] == "SDR" and running["flow"] == "full"
+    assert running["driver"] == "cli"                    # in-process / a shell: the default
     assert running["started"] and running["run_created"] == calib.ctx.manifest.created
     done = _pointer()
     assert done["state"] == "done" and done["result_status"] == "completed"
-    assert done["started"] == running["started"]
+    assert done["started"] == running["started"] and done["driver"] == "cli"
     # the profile has no recorded EDID; the preflight's live enumeration supplies it
     assert done["hardware_id"] == "SIM0000" and done["hardware_id_source"] == "preflight"
 
