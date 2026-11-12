@@ -142,7 +142,9 @@ struct CkLayer {
         ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = periodMs;
         FaldSettings& fs = ctx.hdrColorCorrection.fald;
         fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = star;
-        fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
+        // the always-on core off (C) by default: this case holds the layer to its C reference; FALD_TEST_CORE_MODE=4 runs
+        // the same schedule with KC5 (the default core), for an equality check between two builds
+        fs.coreMode = CkEnv("FALD_TEST_CORE_MODE") == "4" ? FALD_CORE_MODE_KC5 : FALD_CORE_MODE_C;
         fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockParity = parity; fs.clockClosure = FALD_CLOCK_CLOSURE_DEFAULT;
         if (!FaldEnsureResources(&ctx, fs)) return;
         D3D11_TEXTURE2D_DESC td = {};
