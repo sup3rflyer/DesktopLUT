@@ -375,6 +375,63 @@ TEST_CASE("Refresh trim rate: the live rational matched within 0.01 Hz, same_as 
     CHECK(ChooseRefreshTrim(bad, 47.952).pick == RefreshTrimPick::Invalid);
 }
 
+// The reference rate is the section's, never a built-in 60: a section measured against 120 Hz leaves 120 untrimmed and
+// knows nothing about 60; one that records no reference is applied at no rate (the calibration's rate is unknown).
+TEST_CASE("Refresh trim reference: the section's recorded reference rate, never an assumed 60") {
+    auto section = [](const char* reference, const char* extraRates) {
+        const std::string j = std::string(R"({"displays": {"X:HDR": {"display": "X", "mode": "HDR", "refresh_response": {
+            "measured": "2026-11-12", "identity": {"hardware_id": "ABC1234"}, )") + reference + R"( "rates": [
+            {"key": "100", "num": 100, "den": 1, "levels": [{"nits": 0.5, "ratio": 1.02}, {"nits": 100, "ratio": 1.01}]},
+            {"key": "119.88", "num": 120000, "den": 1001, "same_as": "120", "levels": [{"nits": 0.5, "ratio": 1.0}]})" +
+                              extraRates + R"(]}}}})";
+        const dlc::DipStoreData d = dlc::ParseDipStore(j);
+        REQUIRE(d.refresh.size() == 1);
+        return d.refresh[0];
+    };
+    const dlc::DipRefreshSection s120 = section(R"("reference": {"key": "120", "num": 120, "den": 1},)", "");
+    REQUIRE(s120.error.empty());
+    CHECK(ChooseRefreshTrim(s120, 120.0).pick == RefreshTrimPick::Reference);
+    CHECK(ChooseRefreshTrim(s120, 119.997).pick == RefreshTrimPick::Reference);
+    CHECK(ChooseRefreshTrim(s120, 120000.0 / 1001.0).pick == RefreshTrimPick::Reference);   // same_as the reference
+    CHECK(ChooseRefreshTrim(s120, 100.0).pick == RefreshTrimPick::Trim);
+    // 60 Hz is just another rate here: not measured, so not trimmed — and not the reference either.
+    const RefreshTrimChoice at60 = ChooseRefreshTrim(s120, 60.0);
+    CHECK(at60.pick == RefreshTrimPick::Unmeasured);
+    // The trim at 100 Hz is the same maths whatever the reference: g = 1 / ratio at each level.
+    MhcRefreshTrim t;
+    REQUIRE(DeriveRefreshTrim(s120.rates[0], 1000.0, t));
+    CHECK(t.lnGain[0] == doctest::Approx(-std::log(1.02)));
+    // No reference block: never applied (it would be against an assumed rate).
+    const dlc::DipRefreshSection none = section("", "");
+    CHECK(none.error.empty());
+    CHECK_FALSE(none.referenceRecorded);
+    for (double hz : { 60.0, 100.0, 120.0 }) {
+        CAPTURE(hz);
+        const RefreshTrimChoice c = ChooseRefreshTrim(none, hz);
+        CHECK(c.pick == RefreshTrimPick::Invalid);
+        CHECK(c.why.find("reference") != std::string::npos);
+    }
+    const RefreshTrimLiveId self{ "ABC1234", L"" };
+    const std::vector<dlc::DipRefreshSection> both{ none };
+    const RefreshTrimResolution res = ResolveRefreshTrim(true, true, true, both, self, { self }, 100.0, 1000.0);
+    CHECK(res.state == "invalid");
+    CHECK_FALSE(res.want.active);
+    // A reference that names no rational: the section is unusable.
+    const dlc::DipRefreshSection broken = section(R"("reference": {"key": "120"},)", "");
+    CHECK_FALSE(broken.error.empty());
+    CHECK(ChooseRefreshTrim(broken, 100.0).pick == RefreshTrimPick::Invalid);
+    // VRR-derived rates (source "vrr", in `rates` only after DLC's cross-check) are trimmed like any other.
+    const dlc::DipRefreshSection vrr = section(R"("reference": {"key": "120", "num": 120, "den": 1},)",
+        R"(, {"key": "90", "num": 90, "den": 1, "source": "vrr", "proof": {"ok": true, "kind": "vrr:refresh_hz"},
+              "levels": [{"nits": 0.5, "ratio": 1.03}]})");
+    REQUIRE(vrr.rates.size() == 3);
+    CHECK(vrr.rates[2].source == "vrr");
+    CHECK(vrr.rates[0].source == "mode");
+    const RefreshTrimChoice c90 = ChooseRefreshTrim(vrr, 90.0);
+    CHECK(c90.pick == RefreshTrimPick::Trim);
+    CHECK(vrr.rates[(size_t)c90.curve].key == "90");
+}
+
 TEST_CASE("Refresh trim panel: matched by the recorded EDID hardware id; twin panels also by the connector") {
     dlc::DipStoreData d = Pa32Dip();
     const std::wstring path = d.refresh[0].devicePath;

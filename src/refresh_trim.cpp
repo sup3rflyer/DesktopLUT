@@ -95,8 +95,16 @@ bool DeriveRefreshTrim(const dlc::DipRefreshRate& rate, double peakNits, MhcRefr
 RefreshTrimChoice ChooseRefreshTrim(const dlc::DipRefreshSection& s, double liveHz) {
     RefreshTrimChoice c;
     if (!s.error.empty()) { c.pick = RefreshTrimPick::Invalid; c.why = s.error; return c; }
+    // The ratios are against the section's reference rate, which DLC records as the rate the calibration was made at
+    // (its plan seam has the overseer confirm it). DesktopLUT has no record of that rate of its own, so it takes the
+    // recorded one and never assumes 60: a section that records none is not applied at any rate.
+    if (!s.referenceRecorded || !(s.ReferenceHz() > 0.0)) {
+        c.pick = RefreshTrimPick::Invalid;
+        c.why = "the section records no reference rate (the rate the calibration was made at)";
+        return c;
+    }
     if (!(liveHz > 0.0)) { c.pick = RefreshTrimPick::Unmeasured; c.why = "refresh rate unknown"; return c; }
-    const double refHz = s.referenceDen ? (double)s.referenceNum / (double)s.referenceDen : 60.0;
+    const double refHz = s.ReferenceHz();
     int best = -1;
     double bestD = 1e30;
     for (size_t i = 0; i < s.rates.size(); i++) {
@@ -263,10 +271,11 @@ std::wstring Wide(const std::string& s) { return dlc::Utf8ToWide(s); }
 std::vector<std::string> RateLines(const dlc::DipRefreshSection& s) {
     std::vector<std::string> out;
     for (const dlc::DipRefreshRate& r : s.rates) {
-        if (!r.sameAs.empty()) out.push_back(r.key + " Hz = " + r.sameAs);
+        const std::string via = r.source == "vrr" ? ", VRR" : "";
+        if (!r.sameAs.empty()) out.push_back(r.key + " Hz = " + r.sameAs + (via.empty() ? "" : " (VRR)"));
         else if (!r.levels.empty())
-            out.push_back(r.key + " Hz trim (" + std::to_string(r.levels.size()) + " levels)");
-        else out.push_back(r.key + " Hz (no levels)");
+            out.push_back(r.key + " Hz trim (" + std::to_string(r.levels.size()) + " levels" + via + ")");
+        else out.push_back(r.key + " Hz (no levels" + via + ")");
     }
     return out;
 }
@@ -318,7 +327,7 @@ bool SetRefreshTrimEnabled(int monitor, bool on) {
 }
 
 void ReleaseRefreshTrimForExit(bool sessionEnding) {
-    // Without DesktopLUT nothing follows the rate: the untrimmed (60-Hz) profile is the one that is right at the
+    // Without DesktopLUT nothing follows the rate: the untrimmed (reference-rate) profile is the one that is right at the
     // reference rate, and only a trim's residual off at the others — leave that one on. A session end keeps what is
     // there (DesktopLUT runs again from the next sign-in and resolves it at its start).
     if (sessionEnding) return;
@@ -421,6 +430,7 @@ void ReconcileRefreshTrim(const char* why) {
             st.ageDays = dlc::DaysBetween(s.measured, today);
             st.stale = st.ageDays > (s.maxAgeDays > 0 ? s.maxAgeDays : 180);
             st.rates = RateLines(s);
+            st.referenceKey = s.referenceRecorded ? s.referenceKey : std::string();
         }
         if (res.want.active) {
             st.rateKey = res.want.rateKey;
