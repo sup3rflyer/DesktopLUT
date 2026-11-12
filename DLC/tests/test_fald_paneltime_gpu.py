@@ -255,3 +255,236 @@ def test_cpp_and_hlsl_carry_the_same_law():
     for src, v in ((cpp, "r"), (hook, "m")):
         assert f"f[66] = {v}->clkW[0]; f[67] = {v}->clkW[1];" in src
         assert f"f[68] = {v}->clkFactor[0]; f[69] = {v}->clkFactor[1]; f[70] = {v}->clkFactor[2]; f[71] = {v}->clkFactor[3];" in src
+
+
+# ------------------------------------------------------------------------------------------ the clock at rest
+# (shared/fald_temporal.h above FALD_CLOCK_REST_ALLOWED; HLSL pass 1c-0 g_faldPanelClockWatchSource + pass 1c's early
+# return; C++ FaldClockRestBegin / FaldTemporalEndRun). The watch reads the clocks' states BEFORE this run's advance and
+# the target the run aims at (d_prev); these tests set the states directly where the rule, not the arithmetic, is held.
+_A, _B = np.float32(0.25), np.float32(0.5)
+
+
+def _seeded(target=_A, shape=(1, 1), rest=True):
+    g = GpuPanelDriveState(0.72, -1, rest=rest)
+    g.commit(np.full(shape, target, np.float32))                        # the seeding run (new content)
+    return g
+
+
+def _clock_run(g, target, states, content=False, k=1, shape=(1, 1)):
+    """One run: the previous run's commit (the target this run's clock aims at), the states as given, the advance."""
+    g.commit(np.full(shape, target, np.float32), new_content=content)
+    g.s = [np.full(shape, states[0], np.float32), np.full(shape, states[1], np.float32)]
+    g.advance(k)
+    return g.at_rest
+
+
+def test_rest_one_return_is_not_a_pair_and_a_b_a_b_on_still_frames_is():
+    from dlc.fald.gpuemu import REST_ALLOWED, REST_RESET, REST_STILL
+    mid = np.float32(0.375)
+    g = _seeded()
+    assert not _clock_run(g, _A, (mid, mid))                             # the first clock run after the seed: RESET
+    assert g.rest_flags == REST_RESET and g.run_seq == 1                 # (the seed's commit was content: not STILL)
+    assert not _clock_run(g, _B, (mid, mid))                             # A -> B: (B, A, 0)
+    assert g.rest_flags == REST_ALLOWED | REST_STILL
+    assert not _clock_run(g, _A, (mid, mid))                             # back once: (A, B, 1) — not a pair, states != A
+    assert [float(v) for v in g.levels[0, 0]] == [0.25, 0.5, 1.0, 0.0]
+    assert _clock_run(g, _B, (mid, mid))                                 # back twice: (B, A, 2) — a pair, states inside
+    assert [float(v) for v in g.levels[0, 0]] == [0.5, 0.25, 2.0, 0.0] and g.rest_runs == 1
+    assert int(g.words[1]) == 4 and int(g.words[2]) == REST_ALLOWED | REST_STILL and int(g.words[0]) == 3
+    assert _clock_run(g, _A, (_A, _B))                                   # the ends are inside (ends included)
+    assert not _clock_run(g, _B, (_A, np.nextafter(_B, np.float32(1))))   # one ulp outside: not confined
+    assert int(g.words[0]) == g.run_seq
+    # a third value starts over: (C, B, 0) — no pair, so confined only on states equal to C bit for bit
+    c = np.float32(0.3)
+    assert _clock_run(g, c, (c, c))
+    assert [float(v) for v in g.levels[0, 0]] == [float(c), 0.5, 0.0, 0.0]
+    assert not _clock_run(g, c, (c, mid))                                # (unchanged target) mid is not C
+
+
+def test_rest_a_change_committed_by_a_content_frame_starts_over():
+    mid = np.float32(0.375)
+    g = _seeded()
+    _clock_run(g, _A, (mid, mid))
+    _clock_run(g, _B, (mid, mid))
+    _clock_run(g, _A, (mid, mid), content=True)                          # the content moved it: (A, A, 0), no pair
+    assert [float(v) for v in g.levels[0, 0]] == [0.25, 0.25, 0.0, 0.0]
+    assert not _clock_run(g, _B, (mid, mid))                             # (B, A, 0)
+    assert not _clock_run(g, _A, (mid, mid))                             # (A, B, 1)
+    assert _clock_run(g, _B, (mid, mid))                                 # (B, A, 2): a pair again
+    # content committed by a k = 0 run (no clock run of its own) counts for the next watch too (C++ EndRun runs every run)
+    g2 = _seeded()
+    _clock_run(g2, _A, (mid, mid)); _clock_run(g2, _B, (mid, mid)); _clock_run(g2, _A, (mid, mid))
+    g2.commit(np.full((1, 1), _A, np.float32), new_content=True)        # a content run's commit, then a k = 0 run's
+    g2.advance(0)
+    assert not _clock_run(g2, _B, (mid, mid))                            # STILL is off: (B, B, 0) instead of the pair
+    assert [float(v) for v in g2.levels[0, 0]] == [0.5, 0.5, 0.0, 0.0]
+
+
+def test_rest_first_clock_run_after_a_seed_never_rests():
+    from dlc.fald.gpuemu import REST_RESET
+    g = _seeded()
+    assert not _clock_run(g, _A, (_A, _A))                               # confined (equal bit for bit), but RESET
+    assert g.rest_flags & REST_RESET and int(g.words[0]) != g.run_seq    # every zone confined; the flag forbids the rest
+    assert _clock_run(g, _A, (_A, _A))                                   # the next one rests
+    g.reset()                                                            # the C++ reset rules (idle, a setting / period change)
+    assert not g.at_rest
+    g.commit(np.full((1, 1), _A, np.float32))                            # re-seed
+    assert not _clock_run(g, _A, (_A, _A)) and g.rest_flags & REST_RESET
+    assert _clock_run(g, _A, (_A, _A))
+    # a re-seed inside the seeding refresh (k = 0 at n = 0) starts the levels over too
+    g2 = _seeded()
+    g2.advance(0)
+    g2.commit(np.full((1, 1), _A, np.float32))
+    assert not _clock_run(g2, _A, (_A, _A)) and g2.rest_flags & REST_RESET
+    # the run number lives with the resources: it keeps counting across a reset (the C++ clkRunSeq)
+    assert g.run_seq == 4 and g2.run_seq == 1
+
+
+def test_rest_nothing_moves_and_the_maps_are_the_previous_runs_bit_for_bit():
+    shape = (2, 3)
+    rng = np.random.default_rng(3)
+    lo, hi = np.float32(0.2), np.float32(0.6)
+    g = _seeded(lo, shape)
+    g.advance(1)                                                         # RESET run with the arithmetic (states == target)
+    seq = [hi, lo, hi]                                                   # the loop's own toggle, still frames
+    for t in seq:
+        g.commit(np.full(shape, t, np.float32), new_content=False)
+        g.s = [rng.uniform(0.2, 0.6, shape).astype(np.float32) for _ in range(2)]   # anywhere inside the pair's interval
+        before = ([v.copy() for v in g.s], g.true.copy(), g.est.copy(), g.n)
+        g.advance(1)
+    assert g.at_rest and g.rest_runs == 1
+    assert all(np.array_equal(a.view(np.uint32), b.view(np.uint32)) for a, b in zip(g.s, before[0]))
+    assert np.array_equal(g.true.view(np.uint32), before[1].view(np.uint32))
+    assert np.array_equal(g.est.view(np.uint32), before[2].view(np.uint32))
+    assert g.n == before[3] + 1                                          # the refresh index still advances (CPU bookkeeping)
+    t1, e1 = g.pair(np.zeros(shape))
+    assert t1 is g.true and e1 is g.est
+    # at rest again on the next still run with the same toggle: still nothing moves; a long pause does not end a rest
+    g.commit(np.full(shape, lo, np.float32), new_content=False)
+    s_keep = [v.copy() for v in g.s]
+    g.advance(MAX_REFRESHES + 5)
+    assert g.at_rest and all(np.array_equal(a, b) for a, b in zip(g.s, s_keep))
+
+
+def test_rest_any_moved_target_releases_at_once_from_the_rested_states():
+    import copy
+    shape = (2, 2)
+    lo, hi = np.float32(0.2), np.float32(0.6)
+    g = _seeded(lo, shape)
+    g.advance(1)
+    mid = np.full(shape, np.float32(0.4))
+    for t in (hi, lo, hi):
+        g.commit(np.full(shape, t, np.float32), new_content=False)
+        g.s = [mid.copy(), mid.copy()]
+        g.advance(1)
+    assert g.at_rest
+    rested = [v.copy() for v in g.s]
+    moved = np.full(shape, hi, np.float32); moved[1, 0] = np.float32(0.9)    # one zone's target leaves the pair
+    for content in (False, True):
+        h = copy.deepcopy(g)
+        h.commit(moved, new_content=content)
+        ref = copy.deepcopy(h)
+        ref.rest_enabled = False                                         # the unheld arithmetic from the same states
+        h.advance(1); ref.advance(1)
+        assert not h.at_rest and int(h.words[0]) == h.run_seq
+        for a, b in [(h.true, ref.true), (h.est, ref.est), (h.s[0], ref.s[0]), (h.s[1], ref.s[1])]:
+            assert np.array_equal(a.view(np.uint32), b.view(np.uint32))
+        assert not np.array_equal(h.s[0], rested[0]) or not np.array_equal(h.s[1], rested[1])
+
+
+def _advance_without_the_rule(g, k):
+    """GpuPanelDriveState.advance as it was before the clock at rest (2026-11-12), for the bit-for-bit comparison."""
+    from dlc.fald.gpuemu import clock_robust_true32
+    if g.s is None:
+        return
+    if k == 0:
+        if g.n == 0:
+            g.reset()
+        return
+    aT0, aE0, aT1, aE1, w0, w1 = g.factors = clock_factors32(g.n, k, g.closure, g.parity)
+    d, (s0, s1) = g.d_prev, g.s
+    g0 = (d - s0).astype(np.float32); g1 = (d - s1).astype(np.float32)
+    t0 = (s0 + aT0 * g0).astype(np.float32); t1 = (s1 + aT1 * g1).astype(np.float32)
+    e0 = (s0 + aE0 * g0).astype(np.float32); e1 = (s1 + aE1 * g1).astype(np.float32)
+    g.est = (w0 * e0 + w1 * e1).astype(np.float32)
+    g.true = clock_robust_true32(t0, e0, t1, e1, w0, w1, g.est) if g.parity == -1 else (w0 * t0 + w1 * t1).astype(np.float32)
+    g.s = [t0, t1]
+    g.n += k
+
+
+@pytest.mark.parametrize("parity", [-1, 0, 1])
+def test_rest_off_is_todays_arithmetic_bit_for_bit(parity):
+    rng = np.random.default_rng(11)
+    shape = (4, 5)
+    a, b = rng.uniform(0.05, 0.9, shape).astype(np.float32), rng.uniform(0.05, 0.9, shape).astype(np.float32)
+    # a frame, a long still stretch whose target toggles between two stairs (the loop), a k = 0 and a k = 2 run, a change
+    targets = [(a, True, 0)] + [(a if i % 2 else b, False, 1) for i in range(30)] + [(b, False, 0), (b, False, 2)]
+    targets += [(rng.uniform(0.05, 0.9, shape).astype(np.float32), True, 1)] + [(a if i % 2 else b, False, 1) for i in range(12)]
+    on, off = GpuPanelDriveState(0.72, parity, rest=True), GpuPanelDriveState(0.72, parity, rest=False)
+    old = GpuPanelDriveState(0.72, parity)
+    for d, content, k in targets:
+        on.advance(k); off.advance(k); _advance_without_the_rule(old, k)
+        for x, y in ((off.true, old.true), (off.est, old.est)):
+            assert (x is None and y is None) or np.array_equal(x.view(np.uint32), y.view(np.uint32))
+        if old.s is not None:
+            assert all(np.array_equal(x.view(np.uint32), y.view(np.uint32)) for x, y in zip(off.s, old.s))
+        assert off.n == old.n and not off.at_rest
+        on.commit(d, new_content=content); off.commit(d, new_content=content); old.commit(d)
+    assert off.rest_runs == 0 and off.run_seq == on.run_seq
+    assert on.rest_runs > 0                                              # the same sequence with the rule rests
+
+
+@pytest.mark.skipif(not (_SRC.parent / "shared" / "fald_shader.h").exists(), reason="DesktopLUT C++ tree not next to DLC")
+def test_cpp_and_hlsl_carry_the_same_rest_rule():
+    """Text pins: the watch pass's decisive lines, pass 1c's early return and the C++ flag bookkeeping the twin mirrors
+    (GpuPanelDriveState._rest_begin / _watch / commit). An edit to either side breaks one of these."""
+    from dlc.fald.gpuemu import REST_ALLOWED, REST_RESET, REST_STILL
+    h = (_SHARED / "fald_temporal.h").read_text(encoding="utf-8")
+    tc = (_SHARED / "fald_temporal.cpp").read_text(encoding="utf-8")
+    sh = (_SHARED / "fald_shader.h").read_text(encoding="utf-8")
+    flag = lambda name: int(re.search(r"constexpr uint32_t " + name + r" = (\d+)u;", h).group(1))
+    assert (flag("FALD_CLOCK_REST_ALLOWED"), flag("FALD_CLOCK_REST_RESET"), flag("FALD_CLOCK_REST_STILL")) == (REST_ALLOWED, REST_RESET, REST_STILL)
+    watch = re.search(r'g_faldPanelClockWatchSource = R"\((.*?)\)";', sh, re.S).group(1)
+    for line in ("if (id.x == 0u && id.y == 0u) { clkRest[1] = clkRunSeq; clkRest[2] = clkRestFlags; }",
+                 "float d = driveTex.Load(int3(id.xy, 0));",
+                 "if ((clkRestFlags & 2u) != 0u) lv = float4(d, d, 0.0f, 0.0f);",
+                 "else if (d != lv.x) {",
+                 "if ((clkRestFlags & 4u) != 0u) lv = float4(d, lv.x, (d == lv.y) ? min(lv.z + 1.0f, 2.0f) : 0.0f, 0.0f);",
+                 "else lv = float4(d, d, 0.0f, 0.0f);",
+                 "clkLevels[zi] = lv;",
+                 "float lo = lv.x, hi = lv.x;",
+                 "if (lv.z >= 2.0f) { lo = min(lv.x, lv.y); hi = max(lv.x, lv.y); }",
+                 "float s0 = clkState0[id.xy], s1 = clkState1[id.xy];",
+                 "bool confined = s0 >= lo && s0 <= hi && s1 >= lo && s1 <= hi;",
+                 "if (!confined) clkRest[0] = clkRunSeq;"):
+        assert line in watch, line
+    clock = re.search(r'g_faldPanelClockSource = R"\((.*?)\)";', sh, re.S).group(1)
+    assert "[branch] if ((clkRestFlags & 1u) != 0u) {" in clock and "[branch] if (clkRest[0] != clkRunSeq) return;   // at rest: nothing moves" in clock
+    assert clock.index("if (clkRest[0] != clkRunSeq) return;") < clock.index("float d = driveTex.Load")
+    begin = re.search(r"void FaldClockRestBegin\(FaldTemporalState\* r\) \{.*?\n\}", tc, re.S).group(0)
+    for line in ("if (++r->clkRunSeq == 0u) { r->clkRunSeq = 1u; r->clkLevelsValid = false;",
+                 "if (!r->clkLevelsValid) f |= FALD_CLOCK_REST_RESET;",
+                 "else if (g_faldClockRestOverride != 0) f |= FALD_CLOCK_REST_ALLOWED;",
+                 "if (!r->clkTargetFromContent) f |= FALD_CLOCK_REST_STILL;",
+                 "r->clkRestFlags = f;", "r->clkLevelsValid = true;", "r->clkTargetFromContent = false;"):
+        assert line in begin, line
+    note = re.search(r"bool FaldClockRestNote\(.*?\n\}", tc, re.S).group(0)
+    assert "const bool rest = (flags & FALD_CLOCK_REST_ALLOWED) != 0u && lastOutSeq != seq;" in note
+    end = re.search(r"void FaldTemporalEndRun\(.*?\n\}", tc, re.S).group(0)
+    assert "if (run.clock.commitPrev && newContent) r->clkTargetFromContent = true;" in end
+    step = re.search(r"bool FaldPanelClockStep\(.*?\n\}", tc, re.S).group(0)
+    assert step.count("r->clkLevelsValid = false;") == 2                 # the seeding run and the re-seed inside its refresh
+    idle = re.search(r"void FaldTemporalIdle\(.*?\n\}", tc, re.S).group(0)
+    assert "r->clkLevelsValid = false;" in idle
+    # both hosts: the watch pass before the clock pass, Begin before both, ALLOWED cleared without the watch
+    cpp = (_SRC / "fald.cpp").read_text(encoding="utf-8")
+    hook = _HOOK.read_text(encoding="utf-8")
+    for src, v, cs in ((cpp, "r", "g_faldPanelClockWatchCS"), (hook, "m", "g_clockWatchCS")):
+        body = src[src.index("static void RunPanelClock("):]
+        body = body[:body.index("\n}\n")]
+        assert "FaldClockRestBegin(" + v + ");" in body and f"if (!watch) {v}->clkRestFlags &= ~FALD_CLOCK_REST_ALLOWED;" in body
+        assert body.index("FaldClockRestBegin(") < body.index(cs + ", nullptr, 0);")
+        # the dumps the WARP replay reads (fald_clock_rest.u32 / fald_clock_levels.f32 + the three text keys)
+        assert 'L"fald_clock_rest.u32"' in src and 'L"fald_clock_levels.f32"' in src
+        assert "clock_at_rest" in src and "clock_run_seq" in src and "clock_rest_flags" in src
+        assert "(restWords[2] & FALD_CLOCK_REST_ALLOWED) != 0u && restWords[0] != restWords[1]" in src

@@ -24,7 +24,7 @@ from typing import Optional
 
 import numpy as np
 
-from .gpuemu import KNEE_CAP_TRUST, Emu, clamp_star, trunc_half
+from .gpuemu import KNEE_CAP_TRUST, Emu, clamp_star, commit_temporal, trunc_half
 from .starfield import StarfieldParams
 
 CORE_ALPHA, CORE_FINE = 1, 8
@@ -161,9 +161,10 @@ class CoreEmu(Emu):
         return np.where(up, np.exp(lg), g)
 
     def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1,
-            core: Optional[CoreState] = None):
+            core: Optional[CoreState] = None, new_content: bool = True):
         if not self.flags or core is None:
-            return super().run(frame_scrgb, fp16_out=fp16_out, temporal=temporal, star=star, refreshes=refreshes)
+            return super().run(frame_scrgb, fp16_out=fp16_out, temporal=temporal, star=star, refreshes=refreshes,
+                               new_content=new_content)
         img = self.panel_nits(frame_scrgb)
         star_out = None
         if star is not None:
@@ -202,7 +203,7 @@ class CoreEmu(Emu):
         gc = self.sample(cB1.astype(np.float64)) if self.c15 else None
         req, wfade = self.correct(img, sT, sE, g, gc)
         if temporal is not None:
-            temporal.commit(d1)
+            commit_temporal(temporal, d1, new_content)
         core.valid = True
         if fp16_out:
             out = trunc_half(self.nits_to_scrgb32(req))

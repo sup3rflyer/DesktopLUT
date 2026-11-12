@@ -107,3 +107,86 @@ def test_warp_dumps_follow_the_reference_law_and_the_run_times():
     # the check only bites when consecutive frames differ (the C++ case moves its block every run)
     assert all(not np.array_equal(a, b) for a, b in zip(drives_seen[1:], drives_seen[2:])), "consecutive runs carried identical drives"
     print("k per run:", [m["k"] for m in metas], "seeds:", [m["seed"] for m in metas])
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The clock AT REST on WARP against the float32 twin (dlc/fald/gpuemu.py GpuPanelDriveState), bit for bit.
+# C++ tests/test_fald.cpp "FALD panel clock at rest on WARP" writes <dir>/on (the rule as shipped) and <dir>/off
+# (g_faldClockRestOverride = 0): one fald_dump per run (rNNN) and schedule.txt ("run k newContent"). The twin is fed the
+# dumped round-1 drives (fald_drive.f32 — the C++ commit's source) with the schedule's k and newContent, and must equal
+# every dumped clock texture (fald_drive_filt / fald_clock_est / _s0 / _s1 / _dprev), the watch's words and per-zone
+# levels, and the dump's clock_at_rest / clock_run_seq / clock_rest_flags, run for run: through coming to rest, at rest
+# and the release.
+#     $env:FALD_TEST_WARP_REST_DIR = "<dir>"; bin\\Test\\DesktopLUT.Tests.exe -tc="*clock at rest on WARP*"
+#     python -m pytest tests/test_fald_paneltime_warp.py -n0
+_REST_DIR = os.environ.get("FALD_TEST_WARP_REST_DIR", "")
+
+
+def _rest_meta(d: Path) -> dict:
+    t = (d / "fald_dump.txt").read_text()
+
+    def g(key, conv=int, default=None):
+        m = re.search(r"^" + key + r" (\S+)", t, re.M)
+        return conv(m.group(1)) if m else default
+    return {"seed": g("clock_seed"), "k": g("clock_elapsed_refreshes"), "n": g("clock_refresh_index"),
+            "closure": g("clock_closure", float), "parity": g("clock_parity"), "cols": g("cols"), "rows": g("rows"),
+            "temporal_mode": g("temporal_mode"), "run_seq": g("clock_run_seq"), "flags": g("clock_rest_flags"),
+            "at_rest": g("clock_at_rest")}
+
+
+def _bits(a: np.ndarray) -> np.ndarray:
+    return np.ascontiguousarray(a, dtype=np.float32).view(np.uint32)
+
+
+@pytest.mark.skipif(not _REST_DIR or not (Path(_REST_DIR) / "on" / "schedule.txt").exists(),
+                    reason="FALD_TEST_WARP_REST_DIR with the at-rest WARP dumps not given")
+@pytest.mark.parametrize("variant", ["on", "off"])
+def test_warp_rest_dumps_equal_the_twin(variant):
+    from dlc.fald.gpuemu import GpuPanelDriveState
+    root = Path(_REST_DIR) / variant
+    sched = [tuple(int(v) for v in line.split()) for line in (root / "schedule.txt").read_text().splitlines() if line.strip()]
+    assert [s[0] for s in sched] == list(range(len(sched)))
+    m0 = _rest_meta(root / "r000")
+    assert m0["temporal_mode"] == 3 and m0["seed"] == 1
+    rows, cols = m0["rows"], m0["cols"]
+    zone = lambda p: np.fromfile(p, dtype=np.float32).reshape(rows, cols)
+    g = GpuPanelDriveState(m0["closure"], m0["parity"], rest=(variant == "on"))
+    verdicts = []                                   # per run: 1 / 0 = the clock run of this run rested / did not, -1 = none
+    for i, k, content in sched:
+        d = root / f"r{i:03d}"
+        m = _rest_meta(d)
+        clock_run = g.s is not None and k >= 1      # (before the advance: a valid state and k >= 1 = a clock run)
+        g.advance(k)
+        assert int(g.s is None) == m["seed"], f"run {i}: the twin's seed verdict differs from the dump's"
+        assert m["k"] == (0 if m["seed"] else k) and (m["seed"] or m["n"] == g.n), (i, m, g.n)
+        drive = zone(d / "fald_drive.f32")
+        if not m["seed"]:
+            for name, want in (("fald_drive_filt.f32", g.true), ("fald_clock_est.f32", g.est), ("fald_clock_s0.f32", g.s[0]),
+                               ("fald_clock_s1.f32", g.s[1]), ("fald_clock_dprev.f32", g.d_prev)):
+                got = zone(d / name)
+                bad = int(np.count_nonzero(_bits(got) != _bits(want)))
+                assert bad == 0, (f"{variant} run {i} (k {k}, content {content}, twin at rest {g.at_rest}): {name} differs from the"
+                                  f" twin in {bad} zones, max {float(np.max(np.abs(got.astype(np.float64) - want))):.3e}")
+            words = np.fromfile(d / "fald_clock_rest.u32", dtype=np.uint32)
+            assert words.tolist() == g.words.tolist(), (variant, i, words.tolist(), g.words.tolist())
+            levels = np.fromfile(d / "fald_clock_levels.f32", dtype=np.float32).reshape(rows, cols, 4)
+            assert np.array_equal(_bits(levels), _bits(g.levels)), (variant, i, "the watch's per-zone levels")
+            assert (m["run_seq"], m["flags"], m["at_rest"]) == (g.run_seq, g.rest_flags, int(g.at_rest)), (variant, i, m)
+        verdicts.append(int(g.at_rest) if clock_run else -1)
+        g.commit(drive, new_content=bool(content))
+    rest_runs = [i for i, v in enumerate(verdicts) if v == 1]
+    print(f"{variant}: {len(rest_runs)} clock runs at rest of {sum(v >= 0 for v in verdicts)}; first at run "
+          f"{rest_runs[0] if rest_runs else None}; verdicts {''.join('.' if v < 0 else str(v) for v in verdicts)}")
+    if variant == "off":
+        assert not rest_runs and g.rest_runs == 0
+        return
+    # the schedule (tests/test_fald.cpp): content at runs 0 (the seed), 41 (the same pixels), 52 (a block raised), 98 (back)
+    contents = [i for i, _, c in sched if c]
+    assert len(contents) >= 3
+    first_edit = contents[1]
+    assert rest_runs and rest_runs[0] < first_edit, "the real layer did not come to rest on the first still stretch"
+    assert all(v == 1 for v in verdicts[rest_runs[0]:first_edit]), "a still desktop, and the clock left its rest"
+    for c in contents[2:]:                          # drives moved: the next clock run aims at them and is released
+        nxt = next(j for j in range(c + 1, len(sched)) if verdicts[j] >= 0)
+        assert verdicts[nxt] == 0, f"the clock run after the content change at run {c} (run {nxt}) was at rest"
+        assert any(v == 1 for v in verdicts[nxt:]), f"the clock never came to rest again after run {c}"
