@@ -15,6 +15,9 @@
 #include "../src/globals.h"
 #include "../shared/fald_shader.h"
 #include "../shared/fald_change.h"
+#include "../shared/fald_temporal.h"
+#include "../shared/fald_core_governor.h"
+#include "../shared/fald_panel.h"
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
 #include <algorithm>
@@ -703,5 +706,697 @@ TEST_CASE("FALD HW experiment: the panel clock's maps held inside a dead-band, a
                 << "; schedule " << std::string(ref.k == v.k ? "equal" : "DIFFERENT (compare with care)"));
         tsv << hw.adapter << "\t" << eps << "\t" << v.ran1 << "\t" << v.moved1 << "\t" << v.ran2 << "\t" << v.moved2 << "\t" << (ref.k == v.k ? 1 : 0) << "\t"
             << ref.kept.size() << "\t" << framesDiffer << "\t" << compMax << "\t" << maxAbs << "\t" << maxAbs * 80.0 << "\t" << maxRel << "\n";
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// STUDY (opt-in, nothing here ships): the panel clock's steady state on a static frame. With LED lag = the panel clock
+// the clock's maps keep moving on a desktop that stands still; this case records WHAT recurs and after how many runs.
+// The clock's dynamical state after run n is X_n = (S_0, S_1, d): the two parity clocks' LED states and the round-1
+// drives the next run aims them at; the run's maps and picture are functions of X_(n-1), the blend factors of run n and
+// the frame. With a static frame and a factor sequence of period q, X_n == X_(n-q) bit for bit means the layer repeats
+// with that period for good. Every run's X, maps and output are read back; per phase (after a cut, a caret-sized edit
+// that moves no drive, an edit that moves drives) the case reports the first run from which X recurs, the period, how
+// far the two phases are apart (zones, relative; output components, nits), under a set of schedules (the refreshes k
+// between runs, SET through g_faldTestNowQpc), closures, parities, starfield / core on and off, HDR and SDR, and with
+// the statistic pass's per-pixel floor removed (the "nofloor" variant: is the floor what keeps the loop from settling?).
+// FALD_HW_CYCLE_OUT=<dir> (cycle_phases.tsv, cycle_runs.tsv); FALD_HW_CYCLE_FRAMES="a.rgba16f;b.rgba16f" (3840 x 2160
+// FP16: the layer's input; the cut goes from a to b); FALD_HW_CYCLE_ONLY = a substring of the configuration ids;
+// FALD_HW_CYCLE_N = still runs per phase (160).
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+uint64_t CyHash(const void* p, size_t n) {
+    const unsigned char* b = (const unsigned char*)p;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t v; std::memcpy(&v, b + i, 8); h = (h ^ v) * 0xFF51AFD7ED558CCDull; h ^= h >> 29; }
+    for (; i < n; i++) { h = (h ^ b[i]) * 0x100000001B3ull; }
+    return h;
+}
+std::vector<float> CyReadR32(ID3D11Texture2D* tex) {
+    std::vector<float> out;
+    if (!tex) return out;
+    D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(g_device->CreateTexture2D(&d, nullptr, &st))) return out;
+    g_context->CopyResource(st, tex);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        out.resize((size_t)d.Width * d.Height);
+        for (UINT y = 0; y < d.Height; y++)
+            std::memcpy(out.data() + (size_t)y * d.Width, (const unsigned char*)m.pData + (size_t)y * m.RowPitch, (size_t)d.Width * 4u);
+        g_context->Unmap(st, 0);
+    }
+    st->Release();
+    return out;
+}
+struct CyCfg {
+    std::string id; bool hdr; bool star; unsigned int core; int parity; float closure; std::vector<int> k; double hz; std::string variant;
+};
+struct CyRun {
+    int phase; int k; std::vector<float> s0, s1, d, mT, mE; uint64_t hx, hOut; bool outKept;
+};
+// zones whose value differs, and the largest relative difference
+void CyDiff(const std::vector<float>& a, const std::vector<float>& b, size_t& zones, double& maxRel) {
+    zones = 0; maxRel = 0.0;
+    for (size_t i = 0; i < a.size() && i < b.size(); i++) {
+        if (std::memcmp(&a[i], &b[i], 4) == 0) continue;
+        zones++;
+        const double r = std::fabs((double)a[i] - (double)b[i]) / std::max(std::max(std::fabs((double)a[i]), std::fabs((double)b[i])), 1e-9);
+        if (r > maxRel) maxRel = r;
+    }
+}
+}  // namespace
+
+TEST_CASE("FALD HW study: what the panel clock's state does on a static frame (FALD_HW_CYCLE_OUT)") {
+    const std::string out = HwEnv("FALD_HW_CYCLE_OUT");
+    if (out.empty()) return;
+    CreateDirectoryA(out.c_str(), nullptr);
+    std::vector<std::string> frames;
+    {
+        std::stringstream fs(HwEnv("FALD_HW_CYCLE_FRAMES"));
+        std::string t;
+        while (std::getline(fs, t, ';')) if (!t.empty()) frames.push_back(t);
+    }
+    REQUIRE_MESSAGE(frames.size() >= 2, "FALD_HW_CYCLE_FRAMES needs two 3840 x 2160 FP16 frames");
+    // FALD_HW_CYCLE_SDR_FRAMES: the same two for the SDR / ACM configurations (their layer input; without them those are skipped)
+    std::vector<std::string> sdrFrames;
+    {
+        std::stringstream fs(HwEnv("FALD_HW_CYCLE_SDR_FRAMES"));
+        std::string t;
+        while (std::getline(fs, t, ';')) if (!t.empty()) sdrFrames.push_back(t);
+    }
+    const std::string only = HwEnv("FALD_HW_CYCLE_ONLY");
+    const int nStill = std::max(8, atoi(HwEnv("FALD_HW_CYCLE_N").empty() ? "160" : HwEnv("FALD_HW_CYCLE_N").c_str()));
+    const std::wstring hdrPanel = L"H:\\Projects\\DesktopLUT\\DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin";
+    const std::wstring sdrPanel = L"H:\\Projects\\DesktopLUT\\DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_refit_sdr_fald_panel_blur0.7.bin";
+    REQUIRE(GetFileAttributesW(hdrPanel.c_str()) != INVALID_FILE_ATTRIBUTES);
+    const int W = 3840, H = 2160;
+    std::vector<uint16_t> hA((size_t)W * H * 4), hB((size_t)W * H * 4);
+    for (int i = 0; i < 2; i++) {
+        std::ifstream f(frames[(size_t)i], std::ios::binary);
+        REQUIRE_MESSAGE(f.good(), frames[(size_t)i]);
+        std::vector<uint16_t>& dst = i ? hB : hA;
+        f.read((char*)dst.data(), (std::streamsize)(dst.size() * 2));
+        REQUIRE((size_t)f.gcount() == dst.size() * 2);
+    }
+    const unsigned int KC5 = FALD_CORE_MODE_KC5, CC = FALD_CORE_MODE_C;
+    std::vector<CyCfg> cfgs = {
+        // THE OWNER'S MONITOR (PA32UCXR, 60 Hz at most) at the rates it is driven at, his settings: a present every refresh
+        // (the settle kicks), a caret's blink (0.533 s = 32 refreshes at 60 Hz) with the presents the host kicks after it
+        // (the hold's 14 refreshes + the kicker's 100 ms = 6 at 60 Hz), the blinks alone; 24p video's rate; SDR / ACM
+        { "o60_k1",        true, true,  KC5, -1, 0.72f, { 1 }, 60.0, "" },
+        { "o5994_k1",      true, true,  KC5, -1, 0.72f, { 1 }, 60000.0 / 1001.0, "" },
+        { "o50_k1",        true, true,  KC5, -1, 0.72f, { 1 }, 50.0, "" },
+        { "o48_k1",        true, true,  KC5, -1, 0.72f, { 1 }, 48.0, "" },
+        { "o47952_k1",     true, true,  KC5, -1, 0.72f, { 1 }, 48000.0 / 1001.0, "" },
+        { "o60_blink",     true, true,  KC5, -1, 0.72f, { 32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 60.0, "" },
+        { "o50_blink",     true, true,  KC5, -1, 0.72f, { 27, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 50.0, "" },
+        { "o47952_blink",  true, true,  KC5, -1, 0.72f, { 26, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 48000.0 / 1001.0, "" },
+        { "o60_k32",       true, true,  KC5, -1, 0.72f, { 32 }, 60.0, "" },
+        { "o60_k2",        true, true,  KC5, -1, 0.72f, { 2 }, 60.0, "" },
+        { "s60_k1",        false, true, KC5, -1, 0.72f, { 1 }, 60.0, "" },
+        { "s60_blink",     false, true, KC5, -1, 0.72f, { 32, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 60.0, "" },
+        { "s60_k32",       false, true, KC5, -1, 0.72f, { 32 }, 60.0, "" },
+        // other panels' rates and schedules: a present every refresh (the settle kicks), every 2nd,
+        // every 3rd, 2 / 3 and 1 / 2 alternating, sparse presents (a caret's blink: half a second apart)
+        { "owner_k1",      true, true,  KC5, -1, 0.72f, { 1 }, 120.0, "" },
+        { "owner_k2",      true, true,  KC5, -1, 0.72f, { 2 }, 120.0, "" },
+        { "owner_k3",      true, true,  KC5, -1, 0.72f, { 3 }, 120.0, "" },
+        { "owner_k23",     true, true,  KC5, -1, 0.72f, { 2, 3 }, 120.0, "" },
+        { "owner_k12",     true, true,  KC5, -1, 0.72f, { 1, 2 }, 120.0, "" },
+        { "owner_k1112",   true, true,  KC5, -1, 0.72f, { 1, 1, 1, 2 }, 120.0, "" },
+        { "owner_k60",     true, true,  KC5, -1, 0.72f, { 60 }, 120.0, "" },
+        { "owner_k7",      true, true,  KC5, -1, 0.72f, { 7 }, 120.0, "" },
+        { "owner_burst",   true, true,  KC5, -1, 0.72f, { 60, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 120.0, "" },   // a blink + its 14 kicks
+        { "owner_k1_144",  true, true,  KC5, -1, 0.72f, { 1 }, 144.0, "" },
+        { "owner_k1_240",  true, true,  KC5, -1, 0.72f, { 1 }, 240.0, "" },
+        { "owner_k1_60",   true, true,  KC5, -1, 0.72f, { 1 }, 60.0, "" },
+        // the parity and the closure
+        { "par0_k1",       true, true,  KC5, 0, 0.72f, { 1 }, 120.0, "" },
+        { "par1_k1",       true, true,  KC5, 1, 0.72f, { 1 }, 120.0, "" },
+        { "par0_k2",       true, true,  KC5, 0, 0.72f, { 2 }, 120.0, "" },
+        { "clo050_k1",     true, true,  KC5, -1, 0.50f, { 1 }, 120.0, "" },
+        { "clo090_k1",     true, true,  KC5, -1, 0.90f, { 1 }, 120.0, "" },
+        { "clo100_k1",     true, true,  KC5, -1, 1.00f, { 1 }, 120.0, "" },
+        { "clo020_k1",     true, true,  KC5, -1, 0.20f, { 1 }, 120.0, "" },
+        // the starfield and the always-on core off
+        { "nostar_k1",     true, false, KC5, -1, 0.72f, { 1 }, 120.0, "" },
+        { "coreC_k1",      true, true,  CC,  -1, 0.72f, { 1 }, 120.0, "" },
+        { "plain_k1",      true, false, CC,  -1, 0.72f, { 1 }, 120.0, "" },
+        { "plain_k60",     true, false, CC,  -1, 0.72f, { 60 }, 120.0, "" },
+        // SDR / ACM
+        { "sdr_k1",        false, true, KC5, -1, 0.72f, { 1 }, 120.0, "" },
+        { "sdr_k60",       false, true, KC5, -1, 0.72f, { 60 }, 120.0, "" },
+        // the statistic's per-pixel floor removed (a variant shader: is the floor what the loop hops over?)
+        { "nofloor_k1",    true, true,  KC5, -1, 0.72f, { 1 }, 120.0, "nofloor" },
+        { "nofloor_k60",   true, true,  KC5, -1, 0.72f, { 60 }, 120.0, "nofloor" },
+        { "nofloor_plain_k1", true, false, CC, -1, 0.72f, { 1 }, 120.0, "nofloor" },
+        { "nofloor_plain_k60", true, false, CC, -1, 0.72f, { 60 }, 120.0, "nofloor" },
+        // the drive curve by a float lerp instead of the bilinear sampler (is the sampler's 8-bit weight the staircase?)
+        { "exactcurve_k1",  true, true,  KC5, -1, 0.72f, { 1 }, 120.0, "exactcurve" },
+        { "exactcurve_k2",  true, true,  KC5, -1, 0.72f, { 2 }, 120.0, "exactcurve" },
+        { "exactcurve_k60", true, true,  KC5, -1, 0.72f, { 60 }, 120.0, "exactcurve" },
+        { "exactcurve_plain_k1", true, false, CC, -1, 0.72f, { 1 }, 120.0, "exactcurve" },
+        // a blink and the kicks the host really sends: the hook's 14 refreshes + the kicker's 100 ms linger (12 at 120 Hz)
+        { "owner_burst26", true, true,  KC5, -1, 0.72f, { 60, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 120.0, "" },
+        { "sdr_burst26",   false, true, KC5, -1, 0.72f, { 60, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 120.0, "" },
+    };
+    HwDev hw;
+    REQUIRE(hw.ok);
+    const int savedHold = g_faldCoreHoldOverride, savedPartial = g_faldPartialOverride;
+    g_faldCoreHoldOverride = 0;            // the governor never holds a run here
+    g_faldClockRestOverride = HwEnv("FALD_HW_CYCLE_REST") == "1" ? -1 : 0;   // the UNHELD layer (the study is of its loop), unless asked
+    struct Restore { int h, p; ~Restore() { g_faldCoreHoldOverride = h; g_faldPartialOverride = p; g_faldTestNowQpc = 0; g_faldClockRestOverride = -1; } } restore{ savedHold, savedPartial };
+    std::ofstream phTsv(out + "\\cycle_phases.tsv"), runTsv(out + "\\cycle_runs.tsv");
+    phTsv << "adapter\tcfg\tphase\truns\tmaps_moved_runs\tfirst_recurrent_run\tperiod\tperiod_out\tdistinct_out_last8\tzones_d_phase\tmaxrel_d_phase\tzones_true_phase\tmaxrel_true_phase\tzones_est_phase\tmaxrel_est_phase\tout_comp_phase\tout_max_nits_phase\tzones_true_prev_end\n";
+    runTsv << "cfg\trun\tphase\tk\trecur_q\tmaps_moved\tzones_d_vs_prev\tmaxrel_d_vs_prev\tzones_d_vs_prev2\tmaxrel_d_vs_prev2\thx\thout\n";
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+    const char* phaseName[] = { "warm", "cut", "caret", "tick" };
+
+    std::vector<uint16_t> sA, sB;
+    if (sdrFrames.size() >= 2) {
+        sA.resize((size_t)W * H * 4); sB.resize((size_t)W * H * 4);
+        for (int i = 0; i < 2; i++) {
+            std::ifstream f(sdrFrames[(size_t)i], std::ios::binary);
+            REQUIRE_MESSAGE(f.good(), sdrFrames[(size_t)i]);
+            std::vector<uint16_t>& dst = i ? sB : sA;
+            f.read((char*)dst.data(), (std::streamsize)(dst.size() * 2));
+            REQUIRE((size_t)f.gcount() == dst.size() * 2);
+        }
+    }
+    for (const CyCfg& c : cfgs) {
+        if (!only.empty() && c.id.find(only) == std::string::npos) continue;
+        if (!c.hdr && GetFileAttributesW(sdrPanel.c_str()) == INVALID_FILE_ATTRIBUTES) { MESSAGE(c.id << ": no SDR panel file - skipped"); continue; }
+        if (!c.hdr && sA.empty()) { MESSAGE(c.id << ": no SDR frames (FALD_HW_CYCLE_SDR_FRAMES) - skipped"); continue; }
+        const std::vector<uint16_t>& fA = c.hdr ? hA : sA;
+        const std::vector<uint16_t>& fB = c.hdr ? hB : sB;
+        ReleaseFaldShaders();
+        std::string stat = g_faldStatSource;
+        if (c.variant == "nofloor") {
+            const std::string from = "        if (s > driveFloor) { m = max(m, s); sum += s; }\n";
+            const size_t at = stat.find(from);
+            REQUIRE_MESSAGE(at != std::string::npos, "the statistic pass's floor line was not found - the variant needs updating");
+            stat.replace(at, from.size(), "        { m = max(m, s); sum += s; }\n");
+        }
+        std::string common = g_faldCommonSource;
+        if (c.variant == "exactcurve") {
+            // DriveOf through two loads and a float32 lerp: the sampler's interpolation weight has 8 fractional bits, so the
+            // shipped drive is a staircase of the statistic (256 steps per knot interval)
+            const std::string from = "    return curveTex.SampleLevel(linearClamp, float2((u * (float)(curveN - 1) + 0.5f) / (float)curveN, 0.5f), 0);\n";
+            const size_t at = common.find(from);
+            REQUIRE_MESSAGE(at != std::string::npos, "DriveOf's sampler line was not found - the variant needs updating");
+            common.replace(at, from.size(),
+                "    float xf = u * (float)(curveN - 1); float xi = floor(xf); int i0 = (int)xi; int i1 = min(i0 + 1, (int)curveN - 1);\n"
+                "    float c0 = curveTex.Load(int3(i0, 0, 0)), c1 = curveTex.Load(int3(i1, 0, 0));\n"
+                "    return c0 + (c1 - c0) * (xf - xi);\n");
+        }
+        if (c.variant.empty()) { REQUIRE(InitFaldShaders()); }
+        else {
+            FaldShaderSources src = FaldDefaultShaderSources();
+            src.stat = stat.c_str();
+            src.common = common.c_str();
+            REQUIRE(InitFaldShadersFrom(src));
+        }
+        MonitorContext ctx;
+        ctx.width = W; ctx.height = H; ctx.isHDREnabled = c.hdr; ctx.isFP16SDR = !c.hdr;
+        ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = (float)(1000.0 / c.hz);
+        FaldSettings& fs = c.hdr ? ctx.hdrColorCorrection.fald : ctx.sdrColorCorrection.fald;
+        fs.enabled = true; fs.paramsPath = c.hdr ? hdrPanel : sdrPanel; fs.star.enabled = c.star; fs.coreMode = c.core;
+        fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockClosure = c.closure; fs.clockParity = c.parity;
+        if (!FaldEnsureResources(&ctx, fs)) { MESSAGE(c.id << ": the layer's resources failed - skipped"); FaldReleaseResources(&ctx); continue; }
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)W; td.Height = (UINT)H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
+        g_device->CreateTexture2D(&td, nullptr, &target);
+        if (target) g_device->CreateRenderTargetView(target, nullptr, &rtv);
+        REQUIRE(rtv);
+
+        const double periodQpc = (double)freq.QuadPart * (1000.0 / c.hz) / 1000.0;
+        LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+        std::vector<uint16_t> frame = fA;
+        unsigned long long key = 1;
+        long long refresh = 0;
+        std::vector<CyRun> runs;
+        std::vector<std::vector<unsigned char>> lastOut;   // the last outputs of the current phase (a ring of 4)
+        std::vector<int> lastOutRun;
+        g_faldPartialOverride = 0;         // the full path at every run: the study is about the values, not the path
+        auto one = [&](int phase, bool newContent, bool upload, bool keepOut) {
+            const int kk = runs.empty() ? 0 : c.k[(runs.size() - 1) % c.k.size()];
+            refresh += kk;
+            g_faldTestNowQpc = t0.QuadPart + (long long)((double)refresh * periodQpc + 0.5);
+            if (upload) g_context->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)W * 8u, 0);
+            D3D11_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+            g_context->RSSetViewports(1, &vp);
+            g_context->VSSetShader(hw.vs, nullptr, 0);
+            g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            FaldRunPasses(&ctx, rtv, newContent, key, nullptr, -1);
+            g_context->Flush();
+            const FaldResources* r = ctx.fald;
+            CyRun cr;
+            cr.phase = phase; cr.k = (int)r->clkElapsed;
+            cr.s0 = CyReadR32(r->clkStateTex[0]); cr.s1 = CyReadR32(r->clkStateTex[1]); cr.d = CyReadR32(r->clkPrevTex);
+            cr.mT = CyReadR32(r->driveFiltTex); cr.mE = CyReadR32(r->clkEstTex);
+            cr.hx = CyHash(cr.s0.data(), cr.s0.size() * 4) ^ (CyHash(cr.s1.data(), cr.s1.size() * 4) * 3ull) ^ (CyHash(cr.d.data(), cr.d.size() * 4) * 7ull);
+            cr.hOut = 0; cr.outKept = keepOut;
+            if (keepOut) {
+                std::vector<unsigned char> o = DbReadBack(target);
+                cr.hOut = CyHash(o.data(), o.size());
+                lastOut.push_back(std::move(o)); lastOutRun.push_back((int)runs.size());
+                if (lastOut.size() > 4) { lastOut.erase(lastOut.begin()); lastOutRun.erase(lastOutRun.begin()); }
+            }
+            runs.push_back(std::move(cr));
+            std::this_thread::yield();
+        };
+        auto sameX = [&](size_t a, size_t b) {
+            return runs[a].hx == runs[b].hx && runs[a].s0 == runs[b].s0 && runs[a].s1 == runs[b].s1 && runs[a].d == runs[b].d;
+        };
+        auto phaseReport = [&](int phase, size_t first) {
+            // first .. runs.size() - 1 are the phase's runs (the event's run included)
+            const size_t last = runs.size() - 1;
+            int mapsMoved = 0;
+            std::vector<int> q(runs.size(), 0);
+            for (size_t n = first; n <= last; n++) {
+                if (n > 0 && (runs[n].mT != runs[n - 1].mT || runs[n].mE != runs[n - 1].mE)) mapsMoved++;
+                for (size_t p = 1; p <= 16 && p <= n; p++) {
+                    if (n - p < first) break;                       // recurrence inside the phase only
+                    // the factor sequence must repeat with the same period: the schedule's k of the last p runs = the p before
+                    bool sched = true;
+                    for (size_t j = 0; j < p && sched; j++) if (n - j < p || runs[n - j].k != runs[n - j - p].k) sched = false;
+                    if (sched && sameX(n, n - p)) { q[n] = (int)p; break; }
+                }
+            }
+            size_t firstRec = (size_t)-1;
+            for (size_t n = last + 1; n-- > first;) { if (q[n] == 0) break; firstRec = n; }
+            const int period = firstRec == (size_t)-1 ? 0 : q[last];
+            // the output's own period over the kept tail, and how many distinct frames it holds
+            int periodOut = 0, distinct = 0;
+            {
+                std::vector<uint64_t> hs;
+                for (size_t n = (last >= 7 ? last - 7 : first); n <= last; n++) if (runs[n].outKept) hs.push_back(runs[n].hOut);
+                std::vector<uint64_t> u = hs; std::sort(u.begin(), u.end()); u.erase(std::unique(u.begin(), u.end()), u.end());
+                distinct = (int)u.size();
+                for (int p = 1; p <= 4 && !periodOut; p++) {
+                    bool ok = hs.size() > (size_t)p;
+                    for (size_t i = p; i < hs.size() && ok; i++) if (hs[i] != hs[i - p]) ok = false;
+                    if (ok) periodOut = p;
+                }
+            }
+            size_t zd = 0, zt = 0, ze = 0, ztp = 0; double rd = 0, rt = 0, re = 0, rtp = 0;
+            if (last >= first + 1) {
+                CyDiff(runs[last].d, runs[last - 1].d, zd, rd);
+                CyDiff(runs[last].mT, runs[last - 1].mT, zt, rt);
+                CyDiff(runs[last].mE, runs[last - 1].mE, ze, re);
+                ztp = zt; rtp = rt;
+            }
+            size_t comp = 0; double maxAbs = 0.0;
+            if (lastOut.size() >= 2) {
+                const std::vector<unsigned char>& fa = lastOut[lastOut.size() - 1]; const std::vector<unsigned char>& fb = lastOut[lastOut.size() - 2];
+                const uint16_t* a = (const uint16_t*)fa.data(); const uint16_t* b = (const uint16_t*)fb.data();
+                for (size_t j = 0; j < fa.size() / 2; j++) {
+                    if (a[j] == b[j]) continue;
+                    comp++;
+                    const double dv = std::fabs((double)DbHalf(a[j]) - (double)DbHalf(b[j]));
+                    if (dv > maxAbs) maxAbs = dv;
+                }
+            }
+            const double nitsPer = c.hdr ? 80.0 : 0.0;   // HDR: scRGB 1.0 = 80 nits; SDR / ACM: the value is reported in scRGB units x 0 (see max below)
+            phTsv << hw.adapter << "\t" << c.id << "\t" << phaseName[phase] << "\t" << (last - first + 1) << "\t" << mapsMoved << "\t"
+                  << (firstRec == (size_t)-1 ? -1 : (int)(firstRec - first)) << "\t" << period << "\t" << periodOut << "\t" << distinct << "\t"
+                  << zd << "\t" << rd << "\t" << zt << "\t" << rt << "\t" << ze << "\t" << re << "\t" << comp << "\t" << (c.hdr ? maxAbs * nitsPer : maxAbs) << "\t" << ztp << "\n";
+            for (size_t n = first; n <= last; n++) {
+                size_t z1 = 0, z2 = 0; double r1 = 0, r2 = 0;
+                if (n >= 1) CyDiff(runs[n].d, runs[n - 1].d, z1, r1);
+                if (n >= 2) CyDiff(runs[n].d, runs[n - 2].d, z2, r2);
+                const bool mv = n > 0 && (runs[n].mT != runs[n - 1].mT || runs[n].mE != runs[n - 1].mE);
+                runTsv << c.id << "\t" << n << "\t" << phaseName[phase] << "\t" << runs[n].k << "\t" << q[n] << "\t" << (mv ? 1 : 0) << "\t" << z1 << "\t" << r1 << "\t"
+                       << z2 << "\t" << r2 << "\t" << std::hex << runs[n].hx << "\t" << runs[n].hOut << std::dec << "\n";
+            }
+            MESSAGE(c.id << " / " << std::string(phaseName[phase]) << ": " << mapsMoved << " of " << (last - first + 1) << " runs moved a map; X recurs from run "
+                    << (firstRec == (size_t)-1 ? -1 : (int)(firstRec - first)) << " with period " << period << " (output period " << periodOut << ", " << distinct
+                    << " distinct frames in the last 8); between the last two runs: d " << zd << " zones (max rel " << rd << "), true map " << zt << " zones (max rel " << rt
+                    << "), output " << comp << " components, max " << (c.hdr ? maxAbs * 80.0 : maxAbs) << std::string(c.hdr ? " nits" : " (scRGB)"));
+        };
+        auto stills = [&](int phase, int n) {
+            for (int i = 0; i < n; i++) one(phase, false, false, i >= n - 8);
+        };
+        // warm: three runs of frame A
+        for (int i = 0; i < 3; i++) one(0, true, true, false);
+        // the cut to frame B, then a static desktop
+        size_t first = runs.size();
+        frame = fB; key++;
+        one(1, true, true, false);
+        stills(1, nStill);
+        phaseReport(1, first);
+        // a caret: dark, 4 x 36 px, in the document of the desktop frame (moves no drive)
+        first = runs.size();
+        for (int y = 648; y < 684; y++) for (int x = 400; x < 404; x++) for (int ch = 0; ch < 3; ch++) frame[((size_t)y * W + x) * 4 + ch] = 0x2800;
+        key++;
+        one(2, true, true, false);
+        stills(2, nStill);
+        phaseReport(2, first);
+        // the task bar clock's digits: 160 x 64 px of ink on dark at the bottom right (moves drives)
+        first = runs.size();
+        for (int y = H - 80; y < H - 16; y++)
+            for (int x = W - 180; x < W - 20; x++) {
+                const uint32_t hsh = (uint32_t)(x / 4) * 73856093u ^ (uint32_t)(y / 4) * 19349663u;
+                const uint16_t v = (hsh >> 7) % 10u < 3u ? 0x4000 : 0x2C00;   // 2.0 (160 nits) ink on 0.0625
+                for (int ch = 0; ch < 3; ch++) frame[((size_t)y * W + x) * 4 + ch] = v;
+            }
+        key++;
+        one(3, true, true, false);
+        stills(3, nStill);
+        phaseReport(3, first);
+        g_faldTestNowQpc = 0;
+        if (HwEnv("FALD_HW_CYCLE_DUMP") == "1") {   // per run: phase, k, then s0, s1, d, true map, est map (cols x rows float32 each)
+            std::ofstream raw(out + "\\" + c.id + ".f32", std::ios::binary);
+            for (const CyRun& r : runs) {
+                const float head[2] = { (float)r.phase, (float)r.k };
+                raw.write((const char*)head, sizeof(head));
+                for (const std::vector<float>* v : { &r.s0, &r.s1, &r.d, &r.mT, &r.mE }) raw.write((const char*)v->data(), (std::streamsize)(v->size() * 4));
+            }
+        }
+        rtv->Release(); target->Release();
+        FaldReleaseResources(&ctx);
+        g_context->ClearState(); g_context->Flush();
+    }
+    ReleaseFaldShaders();
+    InitFaldShaders();   // (HwDev's destructor releases the shipped set)
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The panel clock AT REST (shared/fald_temporal.h) against the UNHELD layer, refresh for refresh, on the hardware adapter
+// (opt-in; the overlay's layer at 4K, the owner's panel files). Two layers run the same desktop on the same refresh
+// grid: U with g_faldClockRestOverride = 0 (the clock never rests: the layer as it was) and R with the shipped rule. A
+// scenario is a cut to the desktop frame, the settle presents, then CYCLES of one content event (a caret, the clock's
+// digits, a hover, a scroll, a moved window — or content every refresh: video) every 0.533 s; after a content run
+// each layer is presented again every refresh while ITS settle hold is pending and for the kicker's linger after it (the
+// host's FALD_KICK_QUIET_MS = 100 ms), as DWM would be kicked. Time is SET (g_faldTestNowQpc).
+// Per refresh in which either layer ran, the two outputs are compared (what is on the panel then): components that
+// differ and the largest difference in nits; for R's runs at rest on a still desktop, whether its frame is one the unheld
+// layer itself produced since the last content event. Per layer: runs, runs that paid the convolutions (the full cost),
+// the clock runs reported at rest. -> <dir>/rest_vs_unheld.tsv
+// FALD_HW_REST_OUT=<dir>; FALD_HW_REST_FRAMES="warm.rgba16f;desktop.rgba16f" (3840 x 2160 FP16, the layer's input);
+// FALD_HW_REST_SDR_FRAMES likewise for the SDR / ACM configuration (optional); FALD_HW_REST_ONLY = a substring of
+// "<cfg>/<scenario>"; FALD_HW_REST_CYCLES (6).
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+uint16_t RhHalf(float f) {                        // non-negative finite floats
+    if (!(f > 0.0f)) return 0;
+    uint32_t u; std::memcpy(&u, &f, 4);
+    const int e = (int)((u >> 23) & 0xFF) - 127 + 15;
+    if (e <= 0) return 0;
+    if (e >= 31) return 0x7BFF;
+    return (uint16_t)((e << 10) | ((u >> 13) & 0x3FF));
+}
+// the watch pass's per-zone levels of a layer: zones with a toggle pair, the widest pair (relative to its upper target, and in
+// drive units)
+void RhPairs(const FaldResources* r, int& pairs, double& widestRel, double& widestAbs) {
+    pairs = 0; widestRel = 0.0; widestAbs = 0.0;
+    ID3D11Buffer* buf = r->clkRest.levels;
+    if (!buf) return;
+    D3D11_BUFFER_DESC bd; buf->GetDesc(&bd);
+    const UINT bytes = bd.ByteWidth;
+    bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; bd.MiscFlags = 0; bd.StructureByteStride = 0;
+    ID3D11Buffer* st = nullptr;
+    if (FAILED(g_device->CreateBuffer(&bd, nullptr, &st))) return;
+    g_context->CopyResource(st, buf);
+    D3D11_MAPPED_SUBRESOURCE mp;
+    if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &mp))) {
+        const float* v = (const float*)mp.pData;
+        for (UINT z = 0; z + 16 <= bytes; z += 16, v += 4) {
+            if (v[2] < 2.0f) continue;
+            pairs++;
+            const double hi = std::max(v[0], v[1]), lo = std::min(v[0], v[1]);
+            widestAbs = std::max(widestAbs, hi - lo);
+            if (hi > 0.0) widestRel = std::max(widestRel, (hi - lo) / hi);
+        }
+        g_context->Unmap(st, 0);
+    }
+    st->Release();
+}
+struct RhLayer {
+    MonitorContext ctx;
+    ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
+    int restOverride = -1;
+    bool ok = false;
+    long long lastRun = -1000000, lastSettle = -1000000;   // refresh indices
+    unsigned long long key = 1;
+    int runs = 0, costly = 0, kicks = 0, contentRuns = 0;
+    RhLayer(const std::wstring& panel, int W, int H, bool hdr, bool star, unsigned int core, int parity, float closure, double hz, int rest)
+        : restOverride(rest) {
+        ctx.width = W; ctx.height = H; ctx.isHDREnabled = hdr; ctx.isFP16SDR = !hdr;
+        ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = (float)(1000.0 / hz);
+        FaldSettings& fs = hdr ? ctx.hdrColorCorrection.fald : ctx.sdrColorCorrection.fald;
+        fs.enabled = true; fs.paramsPath = panel; fs.star.enabled = star; fs.coreMode = core;
+        fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockClosure = closure; fs.clockParity = parity;
+        if (!FaldEnsureResources(&ctx, fs)) return;
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)W; td.Height = (UINT)H; td.MipLevels = 1; td.ArraySize = 1; td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        ok = SUCCEEDED(g_device->CreateTexture2D(&td, nullptr, &target)) && SUCCEEDED(g_device->CreateRenderTargetView(target, nullptr, &rtv));
+    }
+    ~RhLayer() { if (rtv) rtv->Release(); if (target) target->Release(); FaldReleaseResources(&ctx); }
+    // One run at refresh `t`. rects: the content's dirty rects (already in `frame`); null + content = the whole frame.
+    void Run(HwDev& hw, long long t, long long t0Qpc, double periodQpc, const std::vector<uint16_t>& frame, bool content,
+             const std::vector<FaldChangeRect>* rects) {
+        const int W = ctx.width, H = ctx.height;
+        g_faldClockRestOverride = restOverride;
+        g_faldTestNowQpc = t0Qpc + (long long)((double)t * periodQpc + 0.5);
+        if (content) {
+            key++;
+            if (!rects) g_context->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)W * 8u, 0);
+            else for (const FaldChangeRect& rc : *rects) {
+                D3D11_BOX box = { (UINT)rc.left, (UINT)rc.top, 0, (UINT)rc.right, (UINT)rc.bottom, 1 };
+                g_context->UpdateSubresource(ctx.fald->inter, 0, &box, frame.data() + ((size_t)rc.top * W + (size_t)rc.left) * 4u, (UINT)W * 8u, 0);
+            }
+        }
+        D3D11_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+        g_context->RSSetViewports(1, &vp);
+        g_context->VSSetShader(hw.vs, nullptr, 0);
+        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (content && !rects) FaldRunPasses(&ctx, rtv, true, key, nullptr, -1);
+        else if (content) FaldRunPasses(&ctx, rtv, true, key, rects->data(), (int)rects->size());
+        else FaldRunPasses(&ctx, rtv, false, key, nullptr, 0);
+        g_context->Flush();
+        g_faldTestNowQpc = 0; g_faldClockRestOverride = -1;
+        runs++; if (content) contentRuns++; else kicks++;
+        if (!ctx.fald->lastPartial || DbConvRan(ctx.fald)) costly++;
+        lastRun = t;
+        if (FaldSettlePending(&ctx)) lastSettle = t;
+    }
+};
+}  // namespace
+
+TEST_CASE("FALD HW: the panel clock at rest against the unheld layer, refresh for refresh (FALD_HW_REST_OUT)") {
+    const std::string out = HwEnv("FALD_HW_REST_OUT");
+    if (out.empty()) return;
+    CreateDirectoryA(out.c_str(), nullptr);
+    auto split = [](const std::string& s) { std::vector<std::string> v; std::stringstream ss(s); std::string t; while (std::getline(ss, t, ';')) if (!t.empty()) v.push_back(t); return v; };
+    const std::vector<std::string> hdrFrames = split(HwEnv("FALD_HW_REST_FRAMES")), sdrFrames = split(HwEnv("FALD_HW_REST_SDR_FRAMES"));
+    REQUIRE_MESSAGE(hdrFrames.size() >= 2, "FALD_HW_REST_FRAMES needs two 3840 x 2160 FP16 frames");
+    const std::string only = HwEnv("FALD_HW_REST_ONLY");
+    const int cycles = std::max(2, atoi(HwEnv("FALD_HW_REST_CYCLES").empty() ? "6" : HwEnv("FALD_HW_REST_CYCLES").c_str()));
+    const std::wstring hdrPanel = L"H:\\Projects\\DesktopLUT\\DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin";
+    const std::wstring sdrPanel = L"H:\\Projects\\DesktopLUT\\DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_refit_sdr_fald_panel_blur0.7.bin";
+    const int W = 3840, H = 2160;
+    auto load = [&](const std::string& path, std::vector<uint16_t>& dst) {
+        dst.assign((size_t)W * H * 4, 0);
+        std::ifstream f(path, std::ios::binary);
+        if (!f.good()) return false;
+        f.read((char*)dst.data(), (std::streamsize)(dst.size() * 2));
+        return (size_t)f.gcount() == dst.size() * 2;
+    };
+    struct Cfg { std::string id; bool hdr, star; unsigned int core; int parity; float closure; double hz; };
+    const std::vector<Cfg> cfgs = {
+        // the owner's monitor (PA32UCXR: 60 Hz at most) at the rates it is driven at, HDR and SDR / ACM — the settings of
+        // his DesktopLUT.ini: both panel files, PANEL CLOCK, closure 0.72, parity unknown, starfield on, the core KC5
+        { "owner_60",    true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 60.0 },
+        { "owner_5994",  true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 60000.0 / 1001.0 },
+        { "owner_50",    true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 50.0 },
+        { "owner_48",    true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 48.0 },
+        { "owner_47952", true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 48000.0 / 1001.0 },
+        { "sdr_60",      false, true, FALD_CORE_MODE_KC5, -1, 0.72f, 60.0 },
+        { "sdr_47952",   false, true, FALD_CORE_MODE_KC5, -1, 0.72f, 48000.0 / 1001.0 },
+        // other panels' rates, other settings
+        { "owner_120", true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 120.0 },
+        { "owner_144", true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 144.0 },
+        { "owner_240", true, true, FALD_CORE_MODE_KC5, -1, 0.72f, 240.0 },
+        { "sdr_120",   false, true, FALD_CORE_MODE_KC5, -1, 0.72f, 120.0 },
+        { "plain_120", true, false, FALD_CORE_MODE_C, -1, 0.72f, 120.0 },
+        { "par0_120",  true, true, FALD_CORE_MODE_KC5, 0, 0.72f, 120.0 },
+        { "clo050_120", true, true, FALD_CORE_MODE_KC5, -1, 0.50f, 120.0 },
+        { "clo100_120", true, true, FALD_CORE_MODE_KC5, -1, 1.00f, 120.0 },
+    };
+    // the events (4K coordinates; the desktop frame of tests/test_perf.cpp: a document left, a video window in the middle,
+    // a dark editor right, the task bar's clock bottom right)
+    struct Scn { const char* id; int kind; FaldChangeRect rc; bool everyRefresh; };
+    const std::vector<Scn> scns = {
+        { "still",        0, { 0, 0, 0, 0 }, false },                       // a present with no content every 64 refreshes
+        { "caret",        1, { 400, 648, 404, 684 }, false },
+        { "clock",        2, { W - 180, H - 80, W - 20, H - 16 }, false },
+        { "hover",        3, { 600, 1900, 856, 2060 }, false },
+        { "scroll_doc",   4, { 160, 120, 640, 1800 }, false },
+        { "window_move",  5, { 2100, 600, 3148, 1200 }, false },
+        { "video_window", 6, { 640, 360, 3200, 1800 }, true },
+        { "full_video",   6, { 0, 0, W, H }, true },
+    };
+    HwDev hw;
+    REQUIRE(hw.ok);
+    const int savedHold = g_faldCoreHoldOverride, savedPartial = g_faldPartialOverride;
+    g_faldCoreHoldOverride = 0; g_faldPartialOverride = -1;
+    struct Restore { int h, p; ~Restore() { g_faldCoreHoldOverride = h; g_faldPartialOverride = p; g_faldTestNowQpc = 0; g_faldClockRestOverride = -1; } } restore{ savedHold, savedPartial };
+    std::ofstream tsv(out + "\\rest_vs_unheld.tsv");
+    tsv << "adapter\tcfg\tscenario\tphase\trefreshes_compared\tidentical\tmax_components\tmax_nits\tsum_components\t"
+           "u_runs\tu_costly\tu_kicks\tr_runs\tr_costly\tr_kicks\tr_clock_runs\tr_rest_runs\tr_still_at_rest\tr_still_in_unheld_set\tfirst_rest_refresh\t"
+           "pairs\twidest_pair_rel\twidest_pair_drive\n";
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+
+    for (const Cfg& c : cfgs) {
+        std::vector<uint16_t> fA, fB;
+        const std::vector<std::string>& fr = c.hdr ? hdrFrames : sdrFrames;
+        if (fr.size() < 2) { MESSAGE(c.id << ": no frames for this mode - skipped"); continue; }
+        if (!c.hdr && GetFileAttributesW(sdrPanel.c_str()) == INVALID_FILE_ATTRIBUTES) { MESSAGE(c.id << ": no SDR panel file - skipped"); continue; }
+        bool loaded = false;
+        for (const Scn& sc : scns) {
+            if (!only.empty() && (c.id + "/" + sc.id).find(only) == std::string::npos) continue;
+            if (!loaded) { REQUIRE(load(fr[0], fA)); REQUIRE(load(fr[1], fB)); loaded = true; }
+            RhLayer U(c.hdr ? hdrPanel : sdrPanel, W, H, c.hdr, c.star, c.core, c.parity, c.closure, c.hz, 0);
+            RhLayer R(c.hdr ? hdrPanel : sdrPanel, W, H, c.hdr, c.star, c.core, c.parity, c.closure, c.hz, -1);
+            REQUIRE((U.ok && R.ok));
+            const double periodQpc = (double)freq.QuadPart / c.hz;
+            LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+            const long long linger = (long long)std::ceil(100.0 * c.hz / 1000.0);   // the kicker's 100 ms, in refreshes
+            const long long kGap = std::max(8ll, (long long)(0.533 * c.hz + 0.5));  // a content event every 0.533 s (a caret's blink)
+            std::vector<uint16_t> frame = fA;
+            const std::vector<uint16_t> base = fB;
+            // per phase: the comparison's numbers
+            struct Acc { long long compared = 0, identical = 0; size_t maxComp = 0, sumComp = 0; double maxNits = 0.0;
+                         long long stillAtRest = 0, stillInSet = 0, firstRest = -1; };
+            Acc acc;
+            std::vector<uint64_t> unheldSet;            // U's output hashes since the last content event
+            unsigned long long restRunsBefore = 0;
+            int snapU[4] = {}, snapR[4] = {};
+            auto snap = [&]() { snapU[0] = U.runs; snapU[1] = U.costly; snapU[2] = U.kicks; snapR[0] = R.runs; snapR[1] = R.costly; snapR[2] = R.kicks;
+                                restRunsBefore = R.ctx.fald->clkRestRuns; snapR[3] = (int)R.ctx.fald->clkRunSeq; };
+            auto flush = [&](const char* phase) {
+                tsv << hw.adapter << "\t" << c.id << "\t" << sc.id << "\t" << phase << "\t" << acc.compared << "\t" << acc.identical << "\t" << acc.maxComp << "\t"
+                    << acc.maxNits << "\t" << acc.sumComp << "\t" << (U.runs - snapU[0]) << "\t" << (U.costly - snapU[1]) << "\t" << (U.kicks - snapU[2]) << "\t"
+                    << (R.runs - snapR[0]) << "\t" << (R.costly - snapR[1]) << "\t" << (R.kicks - snapR[2]) << "\t" << ((int)R.ctx.fald->clkRunSeq - snapR[3]) << "\t"
+                    << (R.ctx.fald->clkRestRuns - restRunsBefore) << "\t" << acc.stillAtRest << "\t" << acc.stillInSet << "\t" << acc.firstRest << "\t";
+                int pairs = 0; double wRel = 0.0, wAbs = 0.0;
+                RhPairs(R.ctx.fald, pairs, wRel, wAbs);
+                tsv << pairs << "\t" << wRel << "\t" << wAbs << "\n";
+                tsv.flush();
+                MESSAGE(c.id << " / " << std::string(sc.id) << " / " << std::string(phase) << ": " << acc.compared << " refreshes compared, " << acc.identical << " identical, at most "
+                        << acc.maxComp << " components differ, max " << acc.maxNits << " nits; unheld " << (U.runs - snapU[0]) << " runs (" << (U.costly - snapU[1])
+                        << " at full cost), at rest " << (R.runs - snapR[0]) << " runs (" << (R.costly - snapR[1]) << " at full cost; " << (R.ctx.fald->clkRestRuns - restRunsBefore)
+                        << " clock runs at rest); R's still frames at rest: " << acc.stillInSet << " of " << acc.stillAtRest << " are frames the unheld layer produced; "
+                        << pairs << " zones with a toggle pair, the widest " << wRel << " of its target");
+                acc = Acc();
+            };
+            // one refresh: the content event (if any) for both, else each layer's own kick; then the comparison
+            auto step = [&](long long t, bool content, const std::vector<FaldChangeRect>* rects) {
+                bool ranU = false, ranR = false;
+                for (RhLayer* L : { &U, &R }) {
+                    const bool kick = !content && (t - L->lastSettle) <= linger && L->lastRun < t && L->lastSettle > -1000;
+                    if (content || kick) { L->Run(hw, t, t0.QuadPart, periodQpc, frame, content, rects); (L == &U ? ranU : ranR) = true; }
+                }
+                if (!ranU && !ranR) return;
+                const std::vector<unsigned char> a = DbReadBack(U.target), b = DbReadBack(R.target);
+                const uint64_t ha = CyHash(a.data(), a.size()), hb = CyHash(b.data(), b.size());
+                if (content) unheldSet.clear();
+                if (ranU) unheldSet.push_back(ha);
+                acc.compared++;
+                if (a == b) acc.identical++;
+                else {
+                    const uint16_t* pa = (const uint16_t*)a.data(); const uint16_t* pb = (const uint16_t*)b.data();
+                    size_t comp = 0; double mx = 0.0;
+                    for (size_t j = 0; j < a.size() / 2; j++) {
+                        if (pa[j] == pb[j]) continue;
+                        comp++;
+                        const double dv = std::fabs((double)DbHalf(pa[j]) - (double)DbHalf(pb[j]));
+                        if (dv > mx) mx = dv;
+                    }
+                    acc.maxComp = std::max(acc.maxComp, comp); acc.sumComp += comp;
+                    acc.maxNits = std::max(acc.maxNits, mx * 80.0);
+                }
+                // R ran a still present that cost nothing: is its frame one the unheld layer produced since the content event?
+                if (ranR && !content && R.ctx.fald->lastPartial && !DbConvRan(R.ctx.fald)) {
+                    acc.stillAtRest++;
+                    if (std::find(unheldSet.begin(), unheldSet.end(), hb) != unheldSet.end()) acc.stillInSet++;
+                    if (acc.firstRest < 0) acc.firstRest = t;
+                }
+                std::this_thread::yield();
+            };
+            long long t = 0;
+            // warm: frame A, three presents; the cut to the desktop, its settle presents
+            snap();
+            for (int i = 0; i < 3; i++) { step(t, true, nullptr); t++; }
+            frame = base;
+            step(t, true, nullptr); t++;
+            for (long long e = t + kGap; t < e; t++) step(t, false, nullptr);
+            flush("cut");
+            // the cycles
+            snap();
+            for (int cy = 0; cy < cycles; cy++) {
+                const long long end = t + kGap;
+                for (; t < end; t++) {
+                    const bool first = (t == end - kGap);
+                    if (!(first || sc.everyRefresh)) { step(t, false, nullptr); continue; }
+                    const bool on = sc.everyRefresh ? true : (cy % 2 == 0);
+                    const FaldChangeRect rc = sc.rc;
+                    std::vector<FaldChangeRect> rects;
+                    auto px = [&](int x, int y) { return &frame[((size_t)y * W + (size_t)x) * 4]; };
+                    auto bpx = [&](int x, int y) { return &base[((size_t)y * W + (size_t)x) * 4]; };
+                    switch (sc.kind) {
+                    case 0: break;   // no content: a present that only wakes the layer (treated as a kick below)
+                    case 1:          // the caret: dark, then the document's own pixels again
+                        for (int y = rc.top; y < rc.bottom; y++) for (int x = rc.left; x < rc.right; x++)
+                            for (int ch = 0; ch < 3; ch++) px(x, y)[ch] = on ? (uint16_t)0x2800 : bpx(x, y)[ch];
+                        break;
+                    case 2:          // the clock's digits: other ink every time
+                        for (int y = rc.top; y < rc.bottom; y++) for (int x = rc.left; x < rc.right; x++) {
+                            const uint32_t hsh = ((uint32_t)(x / 4) * 73856093u) ^ ((uint32_t)(y / 4) * 19349663u) ^ ((uint32_t)cy * 83492791u);
+                            const uint16_t v = (hsh >> 7) % 10u < 3u ? RhHalf(c.hdr ? 2.0f : 0.8f) : RhHalf(0.02f);
+                            for (int ch = 0; ch < 3; ch++) px(x, y)[ch] = v;
+                        }
+                        break;
+                    case 3:          // a hover highlight: the wallpaper x 1.15, then back
+                        for (int y = rc.top; y < rc.bottom; y++) for (int x = rc.left; x < rc.right; x++)
+                            for (int ch = 0; ch < 3; ch++) px(x, y)[ch] = on ? RhHalf(DbHalf(bpx(x, y)[ch]) * 1.15f) : bpx(x, y)[ch];
+                        break;
+                    case 4:          // the document scrolls one text line (36 px), cyclically
+                        for (int y = rc.top; y < rc.bottom; y++) {
+                            const int sy = rc.top + ((y - rc.top) + 36 * (cy + 1)) % (rc.bottom - rc.top);
+                            std::memcpy(px(rc.left, y), bpx(rc.left, sy), (size_t)(rc.right - rc.left) * 8u);
+                        }
+                        break;
+                    case 5: {        // a light window moves 48 px over what is there, then back
+                        for (int y = rc.top; y < rc.bottom; y++) std::memcpy(px(rc.left, y), bpx(rc.left, y), (size_t)(rc.right - rc.left) * 8u);
+                        const int x0 = rc.left + (on ? 48 : 0), x1 = rc.right - (on ? 0 : 48);
+                        const uint16_t v = RhHalf(c.hdr ? 2.4f : 0.92f);
+                        for (int y = rc.top; y < rc.bottom; y++) for (int x = x0; x < x1; x++) for (int ch = 0; ch < 3; ch++) px(x, y)[ch] = v;
+                        break;
+                    }
+                    case 6: {        // video: the rect's content moves 61 px per refresh
+                        const int w = rc.right - rc.left, sh = (int)((t * 61) % w);
+                        for (int y = rc.top; y < rc.bottom; y++) {
+                            std::memcpy(px(rc.left, y), bpx(rc.left + sh, y), (size_t)(w - sh) * 8u);
+                            if (sh) std::memcpy(px(rc.left + (w - sh), y), bpx(rc.left, y), (size_t)sh * 8u);
+                        }
+                        break;
+                    }
+                    }
+                    if (sc.kind == 0) {   // wake both layers without content: one present, then whatever each still owes
+                        for (RhLayer* L : { &U, &R }) L->lastSettle = t - 1;   // (a kick-zone present: the kicker runs one round)
+                        step(t, false, nullptr);
+                    } else { rects.push_back(rc); step(t, true, &rects); }
+                }
+            }
+            flush("cycles");
+        }
     }
 }
