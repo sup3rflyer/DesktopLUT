@@ -9587,7 +9587,9 @@ class Calibration:
             digest={"characterize": outcome.digest,
                     "stored_display": dip.display if dip else None,
                     "dip_store": str(self._dip_store().path),
-                    "snapshot_restore": self.calib.get("snapshot_restore")})
+                    "snapshot_restore": self.calib.get("snapshot_restore"),
+                    # what the record still lacks that a probe flow measures (the overseer may suggest it)
+                    "gaps": _dip_probe_gaps(dip, mode=self.mode, emissive=self.display.is_emissive)})
 
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
         """3dlut-only assumes an installed stack. If it's missing, escalate
@@ -10859,6 +10861,18 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
 
 # The probe flows (measure the panel's behaviour, write a DIP section; never build or apply anything).
 PROBE_FLOWS = ("peak-window", "refresh-response")
+
+
+def _dip_probe_gaps(dip: Any, *, mode: str, emissive: bool) -> list[str]:
+    """The characterize digest's note of what the HDR record lacks that a probe flow measures."""
+    if dip is None or str(mode).upper() != "HDR":
+        return []
+    out = []
+    if getattr(dip, "refresh_response", None) is None:
+        out.append("no refresh response measured (python -m dlc.refresh_probe; REFRESH TRIM needs it)")
+    if emissive and getattr(dip, "peak_by_window", None) is None:
+        out.append("no peak-by-window curve measured (python -m dlc.peak_window)")
+    return out
 
 
 def _vrr_presenter_factory(args: Any) -> Optional[Callable[..., Any]]:  # pragma: no cover - live wiring

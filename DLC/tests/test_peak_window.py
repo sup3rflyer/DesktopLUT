@@ -331,7 +331,10 @@ def test_characterize_keeps_the_probe_sections(tmp_path):
                                                               primary_reads=1, settle_levels={"bright": 1.0},
                                                               warmup_observe_reads=8, creep_reads=2,
                                                               warmup_max_minutes=0))
-    assert char.run("characterize").status == "completed"
+    res = char.run("characterize")
+    assert res.status == "completed"
+    assert any("no refresh response measured" in g for g in res.digest["gaps"])
+    assert not any("peak-by-window" in g for g in res.digest["gaps"])         # it has one now
     assert DipStore.load(char._dip_store().path).get(f"{cal.display.name}:HDR").peak_by_window is not None
 
 
