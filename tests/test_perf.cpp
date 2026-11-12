@@ -49,6 +49,7 @@
 #include "../dwm_hook/hook_lut.h"
 #include "../dwm_hook/hook_fald.h"
 #include "../dwm_hook/hook_shader.h"     // g_shaders (the hook's VS + PS), noiseBytes
+#include "../dwm_hook/hook_shader_bytecode.h"   // what the DLL creates its shaders from
 #include "../src/shader.h"               // g_vsSource, g_psSource, g_analysisCSSource, BuildDesktopGammaLut
 #include "../src/types.h"                // g_blueNoiseData
 #include "../shared/fald_shader.h"
@@ -57,6 +58,7 @@
 #include "../shared/tonemap_curves.h"
 #include "../shared/hdr_dither.h"
 
+#pragma comment(lib, "version.lib")  // the compiler DLL's version (the bytecode test)
 #pragma comment(lib, "dxguid.lib")   // IID_ID3D11Texture2D / IID_ID3D11Device for hook_render.cpp in this exe (the DLL links it)
 
 using perf::Dom;
@@ -179,6 +181,7 @@ struct HookRig {
     int lutN = 0;
     bool ok = false, panel = false, prev25h2 = false;
     double initUs = 0.0;                       // InitializeStuff: in the DLL it runs inside the first hooked present
+    double faldInitUs = 0.0;                   // FaldInitShaders: inside the first present of a monitor that needs the layer
     int fakeCtx[4] = {};                       // the pass only uses the context as a key
 
     HookRig(perf::Dev& dev, int lutSize) : d(dev), lutN(lutSize) {
@@ -240,6 +243,12 @@ struct HookRig {
     // Would the FALD layer run for this frame (a panel file whose lattice fits it)?
     bool FaldAvailable(int W, int H) {
         if (!panel) return false;
+        if (!FaldShadersReady()) {             // as RenderLUT asks for them on that monitor's first present
+            const double t0 = perf::QpcUs();
+            const bool ok = FaldInitShaders(device, deviceContext);
+            faldInitUs = perf::QpcUs() - t0;
+            if (!ok) return false;
+        }
         FaldMonitor* m = FaldAcquire(0, 0, true, (unsigned)W, (unsigned)H, DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (!m) return false;
         FaldReturn(m);
@@ -806,7 +815,7 @@ TEST_CASE("perf: GPU time of the hook's pass (the real RenderLUT) and the overla
         HookRig rig(dev, lutN);
         REQUIRE_MESSAGE(rig.ok, "the hook's InitializeStuff failed (see %TEMP%\\DesktopLUT_dwmhook_test.log)");
         MESSAGE("hook rig: cube " << lutN << "^3, FALD panel file " << std::string(rig.panel ? "loaded" : "NOT available (FALD rows skipped)")
-                << "; InitializeStuff (every shader compiled, inside the first hooked present in the DLL) took " << rig.initUs / 1000.0 << " ms");
+                << "; InitializeStuff (inside the first hooked present in the DLL) took " << rig.initUs / 1000.0 << " ms");
         primTsv << dev.name << "\t0\thook_initialize_stuff\t-\t0\t1\t-1\t-1\t-1\t-1\t" << rig.initUs << "\t" << rig.initUs << "\t" << rig.initUs << "\t" << rig.initUs << "\n";
         ID3D11PixelShader* const productPs = pixelShader;
         std::map<std::string, ID3D11PixelShader*> psCache;
@@ -873,6 +882,12 @@ TEST_CASE("perf: GPU time of the hook's pass (the real RenderLUT) and the overla
                 for (const HookCfg& c : HookConfigs()) {
                     if (c.dom != dom || stop) continue;
                     if (c.fald && !rig.FaldAvailable(W, H)) continue;
+                    if (c.fald && rig.faldInitUs > 0.0) {
+                        MESSAGE("FaldInitShaders (inside the first present of a monitor that needs the layer) took " << rig.faldInitUs / 1000.0 << " ms");
+                        primTsv << dev.name << "\t0\thook_fald_init_shaders\t-\t0\t1\t-1\t-1\t-1\t-1\t" << rig.faldInitUs << "\t" << rig.faldInitUs << "\t"
+                                << rig.faldInitUs << "\t" << rig.faldInitUs << "\n";
+                        rig.faldInitUs = 0.0;
+                    }
                     rig.Apply(c, W, H);
                     struct Run { std::string variant; ID3D11PixelShader* ps; const LutVariant* lv; };
                     std::vector<Run> runs = { { "base", nullptr, nullptr } };
@@ -1097,7 +1112,7 @@ TEST_CASE("perf: output reference manifest (DLUT_PERF_HASH_WRITE / DLUT_PERF_HAS
         int w = W, h = H;
         if (c.fald) {
             w = 3840; h = 2160;                                  // the panel file's lattice
-            if (!rig.FaldAvailable(w, h)) { MESSAGE("hook/" << c.id << ": no FALD panel file - skipped"); continue; }
+            if (!rig.panel) { MESSAGE("hook/" << c.id << ": no FALD panel file - skipped"); continue; }   // (the shaders: RenderLUT asks for them, as in the DLL)
         }
         rig.Apply(c, w, h);
         const DXGI_FORMAT fmt = perf::DomFormat(c.dom);
@@ -1254,3 +1269,96 @@ TEST_CASE("hook: with a dynamic peak the whole frame follows the peak, not only 
             << d.maxAbs << " scRGB (" << d.maxAbs * 80.0 << " nits), max relative " << d.maxRel);
     CHECK(d.differing == 0);
 }
+
+// The hook creates its own shaders from dwm_hook/hook_shader_bytecode.h (nothing is compiled inside DWM's present). That
+// header must be exactly what D3DCompile makes of the current shader text with the calls the DLL used to make - a source
+// edit without regenerating it fails here.
+// Regenerate (then rebuild):  DLUT_HOOK_BYTECODE_WRITE=1 bin/Test/DesktopLUT.Tests.exe -tc="hook: the shipped shader bytecode*"
+namespace {
+std::string CompilerVersion() {
+    char path[MAX_PATH] = {};
+    HMODULE m = GetModuleHandleA("D3DCompiler_47.dll");
+    if (!m || !GetModuleFileNameA(m, path, MAX_PATH)) return "unknown";
+    DWORD dummy = 0;
+    const DWORD n = GetFileVersionInfoSizeA(path, &dummy);
+    if (!n) return "unknown";
+    std::vector<unsigned char> buf(n);
+    VS_FIXEDFILEINFO* fi = nullptr; UINT len = 0;
+    if (!GetFileVersionInfoA(path, 0, n, buf.data()) || !VerQueryValueA(buf.data(), "\\", (void**)&fi, &len) || !fi) return "unknown";
+    char v[64];
+    snprintf(v, sizeof(v), "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return v;
+}
+}  // namespace
+
+TEST_CASE("hook: the shipped shader bytecode is D3DCompile of the current source") {
+    struct Item { const char* array; const char* src; size_t len; const char* name; const char* entry; const char* target; const unsigned char* have; size_t haveLen; };
+    const Item items[] = {   // the calls hook_render.cpp InitializeStuff made
+        { "g_hookVsBytecode", g_shaders, sizeof g_shaders, nullptr, "VS", "vs_5_0", g_hookVsBytecode, sizeof(g_hookVsBytecode) },
+        { "g_hookPsBytecode", g_shaders, sizeof g_shaders, nullptr, "PS", "ps_5_0", g_hookPsBytecode, sizeof(g_hookPsBytecode) },
+        { "g_hookPeakReduceCsBytecode", g_peakReduceCSSource, strlen(g_peakReduceCSSource), "PeakReduceCS", "main", "cs_5_0", g_hookPeakReduceCsBytecode, sizeof(g_hookPeakReduceCsBytecode) },
+        { "g_hookPeakSmoothCsBytecode", g_peakSmoothCSSource, strlen(g_peakSmoothCSSource), "PeakSmoothCS", "main", "cs_5_0", g_hookPeakSmoothCsBytecode, sizeof(g_hookPeakSmoothCsBytecode) },
+    };
+    std::vector<std::vector<unsigned char>> made;
+    for (const Item& it : items) {
+        ID3DBlob* blob = nullptr; ID3DBlob* msgs = nullptr;
+        const HRESULT hr = D3DCompile(it.src, it.len, it.name, nullptr, nullptr, it.entry, it.target, 0, 0, &blob, &msgs);
+        if (msgs) msgs->Release();
+        REQUIRE_MESSAGE((SUCCEEDED(hr) && blob), it.array << " does not compile");
+        const unsigned char* b = (const unsigned char*)blob->GetBufferPointer();
+        made.emplace_back(b, b + blob->GetBufferSize());
+        blob->Release();
+    }
+    const std::string compiler = CompilerVersion();
+
+    if (!perf::Env("DLUT_HOOK_BYTECODE_WRITE").empty()) {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir(exe), file;
+        for (int up = 0; up < 8 && file.empty(); up++) {
+            const size_t slash = dir.find_last_of("\\/");
+            if (slash == std::string::npos) break;
+            dir.resize(slash);
+            if (GetFileAttributesA((dir + "\\dwm_hook\\hook_shader.h").c_str()) != INVALID_FILE_ATTRIBUTES) file = dir + "\\dwm_hook\\hook_shader_bytecode.h";
+        }
+        REQUIRE_MESSAGE(!file.empty(), "dwm_hook/hook_shader.h not found above " << exe);
+        std::string text =
+            "// GENERATED - do not edit. The DWM hook's own shaders as bytecode: D3DCompile of dwm_hook/hook_shader.h (VS, PS) and\n"
+            "// shared/peak_detect.h (the two peak-detection passes), entry points / targets / flags as hook_render.cpp compiled them\n"
+            "// at run time until 2026-11. InitializeStuff creates the shaders from these arrays, so nothing is compiled inside DWM's\n"
+            "// present. tests/test_perf.cpp (\"hook: the shipped shader bytecode is D3DCompile of the current source\") fails when this\n"
+            "// file and the shader text disagree. After ANY edit of that text regenerate and rebuild:\n"
+            "//   DLUT_HOOK_BYTECODE_WRITE=1 bin/Test/DesktopLUT.Tests.exe -tc=\"hook: the shipped shader bytecode*\"\n"
+            "#pragma once\n\n"
+            "#define HOOK_BYTECODE_COMPILER \"" + compiler + "\"   // the d3dcompiler_47.dll that made it (file version)\n";
+        for (size_t k = 0; k < made.size(); k++) {
+            text += std::string("\nstatic const unsigned char ") + items[k].array + "[" + std::to_string(made[k].size()) + "] = {";
+            char b[8];
+            for (size_t i = 0; i < made[k].size(); i++) {
+                if (i % 24 == 0) text += "\n\t";
+                snprintf(b, sizeof(b), "0x%02X,", made[k][i]);
+                text += b;
+            }
+            text += "\n};\n";
+        }
+        REQUIRE(perf::SaveBytes(file, text.data(), text.size()));
+        MESSAGE("wrote " << file << " (compiler " << compiler << "): rebuild the DLL and this exe");
+        return;
+    }
+
+    bool allEqual = true;
+    for (size_t k = 0; k < made.size(); k++)
+        if (made[k].size() != items[k].haveLen || std::memcmp(made[k].data(), items[k].have, made[k].size()) != 0) {
+            allEqual = false;
+            MESSAGE(std::string(items[k].array) << ": the header has " << items[k].haveLen << " bytes, the current source compiles to " << made[k].size()
+                    << (made[k].size() == items[k].haveLen ? " (different bytes)" : ""));
+        }
+    if (!allEqual && compiler != HOOK_BYTECODE_COMPILER) {
+        // another d3dcompiler_47.dll than the one that made the header: its output may differ for the same text, so this
+        // machine cannot tell an edited shader from a different compiler. The machine that regenerates the header can.
+        MESSAGE("the header was made by d3dcompiler " << std::string(HOOK_BYTECODE_COMPILER) << ", this machine has " << compiler << ": not judged here");
+        return;
+    }
+    CHECK_MESSAGE(allEqual, "dwm_hook/hook_shader_bytecode.h is not the current shader source: regenerate it (the command is above this test) and rebuild");
+}
+
