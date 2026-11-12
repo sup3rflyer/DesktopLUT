@@ -3,7 +3,33 @@
 DLC (DesktopLUT Calibrator) — an LLM-steered display-calibration harness for
 DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
 
-## Unreleased — ships with DesktopLUT v3.0.0 (v2 scripted-core redesign)
+## Unreleased (after DesktopLUT v3.0.0)
+
+### Fixed
+- **A `grayscale-wb` run that does not finish puts the previous grayscale curve back** (2026-11-12). The
+  touch-up is baked into the installed profile before its verify measurement, so a run that ended during the
+  verify — a cancel, a pause that timed out, a dead meter, a stall, a stage error, a crash, or `--abort` at the
+  `verify:accept` pause — left the unverified touch-up on the display: the rollback only cancelled a live
+  preview that no longer existed. Every ending that does not apply the touch-up now restores the curve the
+  display had before it (the user's own fine-tune, or the identity curve) and re-bakes the profile, through one
+  function shared with `revert`.
+  - `rolled_back` / `reverted` only when reading the curve back shows it. Otherwise the status says so
+    (`rollback_failed`, `rollback_unconfirmed`, `revert_unavailable`, `revert_unconfirmed`, `restore_unknown`),
+    the payload carries `display_may_carry_touchup: true`, and the hint names the `--abort` that finishes it once
+    DesktopLUT is back. Restoring twice is harmless.
+  - A rollback before the commit cancels the preview as before, and now also switches the curve back on when
+    the cancel left it off (DesktopLUT's own pre-touch-up copy was taken after the run had switched the
+    grayscale layer off).
+  - `--abort` restores the run's own monitor and mode from the run record (an HDR run aborted without
+    `--mode HDR`), and never takes back a touch-up that was applied.
+  - The bake record is marked rolled back, and a rolled-back run refuses to resume instead of verifying the old
+    curve as if it were the touch-up.
+
+### Added
+- **`--driver {cli,claude,desktoplut}`** (2026-11-12): who launched an invocation (default `cli`). Recorded in
+  the manifest's launch record and written to `runs/active.json` as `driver`, which DesktopLUT's DLC tab reads.
+
+## v3.0.0 — shipped with DesktopLUT v3.0.0 (v2 scripted-core redesign)
 
 Pivoted from an LLM-orchestrated autopilot to a **scripted core + thin LLM at the
 seams**: a deterministic state machine owns the mechanics (display mapping, patch
