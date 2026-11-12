@@ -332,3 +332,66 @@ TEST_CASE("ui_snapshot: when a connected display's cube is off the screen (MEASU
     s.hookActive = false;
     CHECK(CubeOffScreen(s, r, true));
 }
+
+TEST_CASE("front door: SDR CONTENT: GAMMA 2.2 is offered to an HDR display with nothing else in its HDR profile") {
+    MonitorSettings ms;   // a fresh install
+    CHECK(HdrMhcOnlyDesktopGamma(ms.hdrMHC));
+    CHECK(SdrGammaOffer(ms, true, Mode::HDR, true) == GammaOffer::Off);
+    // Not offered: SDR (legacy or ACM), the other side shown, not connected, mode unknown.
+    CHECK(SdrGammaOffer(ms, true, Mode::SDR, false) == GammaOffer::None);
+    CHECK(SdrGammaOffer(ms, true, Mode::AcmSdr, false) == GammaOffer::None);
+    CHECK(SdrGammaOffer(ms, true, Mode::AcmSdr, true) == GammaOffer::None);   // SDR display, its HDR side shown
+    CHECK(SdrGammaOffer(ms, true, Mode::HDR, false) == GammaOffer::None);     // HDR display, its SDR side shown
+    CHECK(SdrGammaOffer(ms, false, Mode::HDR, true) == GammaOffer::None);
+    CHECK(SdrGammaOffer(ms, true, Mode::Unknown, true) == GammaOffer::None);
+
+    // On, with the neutral profile it installed: still offered (switching it off is as easy).
+    ms.hdrMHC.enabled = true;
+    ms.hdrMHC.profileName = L"DesktopLUT_Mon0_HDR_1.icm";
+    ms.hdrMHC.desktopGammaEnabled = true;
+    CHECK(SdrGammaOffer(ms, true, Mode::HDR, true) == GammaOffer::On);
+    // The existing GRAYSCALE switch turned it off and kept the neutral profile: offered, off.
+    ms.hdrMHC.desktopGammaEnabled = false;
+    CHECK(SdrGammaOffer(ms, true, Mode::HDR, true) == GammaOffer::Off);
+    // The SDR side's settings do not matter to it.
+    ms.sdrMHC.primariesEnabled = true;
+    ms.sdrPath = L"x.cube";
+    CHECK(SdrGammaOffer(ms, true, Mode::HDR, true) == GammaOffer::Off);
+
+    // Anything else in the HDR profile: not offered (GRAYSCALE's DESKTOP GAMMA switch is the one).
+    auto with = [](void (*set)(MHCSettings&)) {
+        MonitorSettings m;
+        set(m.hdrMHC);
+        return SdrGammaOffer(m, true, Mode::HDR, true);
+    };
+    CHECK(with([](MHCSettings& m) { m.sourceFilePath = L"cal.cube"; m.sourceIs1DCube = true; }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.hasPerChannelTRC = true; }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.primariesEnabled = true; }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.whiteBalanceEnabled = true; m.whiteBalanceWx = 0.31f; }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.baseGrayscale.enabled = true; m.baseGrayscale.initLinearPQ(); }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.correctionGrayscale.enabled = true; m.correctionGrayscale.initLinearPQ(); }) ==
+          GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.bypassGrayscale = true; }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.bypassPrimaries = true; }) == GammaOffer::None);
+    CHECK(with([](MHCSettings& m) { m.refreshTrimEnabled = true; }) == GammaOffer::None);
+    // ...but a switched-on white balance left at D65, or a switched-on curve with no points, is nothing.
+    CHECK(with([](MHCSettings& m) { m.whiteBalanceEnabled = true; }) == GammaOffer::Off);
+    CHECK(with([](MHCSettings& m) { m.correctionGrayscale.enabled = true; m.correctionGrayscale.points.clear(); }) ==
+          GammaOffer::Off);
+}
+
+TEST_CASE("tone map: DISPLAY PEAK says where its value came from") {
+    auto has = [](const std::string& s, const char* part) { return s.find(part) != std::string::npos; };
+    // Seeded from a 1600-nit EDID (rounded to 10 nits).
+    CHECK(has(DisplayPeakTip(1600.0f, 1600.0f), "From the panel's EDID: 1600 nits"));
+    CHECK(has(DisplayPeakTip(1730.0f, 1729.3f), "From the panel's EDID: 1729 nits"));
+    // Under 400 nits the EDID's value is not taken: the default stays, and the tooltip says why.
+    CHECK(has(DisplayPeakTip(1000.0f, 350.0f), "The 1000-nit default: the EDID's 350 nits is under 400."));
+    // No EDID peak at all.
+    CHECK(has(DisplayPeakTip(1000.0f, 0.0f), "The 1000-nit default: the panel declares no HDR peak."));
+    // Set by the user (or by DLC): the EDID's value is given for comparison.
+    CHECK(has(DisplayPeakTip(1450.0f, 1600.0f), "The panel's EDID declares 1600 nits."));
+    CHECK(has(DisplayPeakTip(1450.0f, 0.0f), "The panel declares no HDR peak."));
+    // Every form first says what the value does.
+    CHECK(has(DisplayPeakTip(1600.0f, 1600.0f), "The brightest the tone map lets highlights go"));
+}

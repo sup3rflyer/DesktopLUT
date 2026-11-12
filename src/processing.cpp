@@ -439,17 +439,7 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
     });
 
     g_mainHwnd = g_monitors[0].hwnd;
-
-    // Register hotkeys (conditional based on settings, MOD_NOREPEAT prevents repeat when held)
-    if (g_hotkeyGammaEnabled.load()) {
-        RegisterHotKey(g_mainHwnd, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
-    }
-    if (g_hotkeyAnalysisEnabled.load()) {
-        RegisterHotKey(g_mainHwnd, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
-    }
-    if (g_hotkeyHdrEnabled.load()) {
-        RegisterHotKey(g_mainHwnd, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
-    }
+    // (The global hotkeys are the GUI thread's, on the hub window, for the whole session: act::RegisterHotkeys.)
 
     // Register for display power state notifications (display sleep/wake)
     RegisterDisplayPowerNotification(g_mainHwnd);
@@ -524,22 +514,12 @@ void ProcessingThreadFunc(std::vector<MonitorLUTConfig> configs, unsigned render
     // Stop gamma whitelist polling thread
     if (!abandoned()) StopGammaWhitelistThread();
 
-    // Unregister hotkeys before cleanup
-    if (g_mainHwnd) {
-        UnregisterHotKey(g_mainHwnd, HOTKEY_GAMMA);
-        UnregisterHotKey(g_mainHwnd, HOTKEY_ANALYSIS);
-        UnregisterHotKey(g_mainHwnd, HOTKEY_HDR_TOGGLE);
-    }
-
     // Unregister display power notifications
     UnregisterDisplayPowerNotification();
 
-    // Cleanup analysis overlay — skip in DWM hook mode if analysis is still enabled,
-    // so the window survives the transition to analysis-only mode or hook-only hotkey mode.
-    // StopProcessing handles final destruction.
-    if (!abandoned() && (!g_dwmHookMode.load() || !g_analysisEnabled.load())) {
-        DestroyAnalysisOverlay();
-    }
+    // The analysis window is the GUI thread's for the session (created at startup; the analysis switch and hotkey show
+    // and hide it): this destroys only one this thread made itself (DestroyAnalysisOverlay checks the owner).
+    if (!abandoned()) DestroyAnalysisOverlay();
 
     // Cleanup monitor contexts. The cleanup loop releases D3D + destroys windows
     // without the lock (cross-thread readers only touch POD/atomic fields, which stay
@@ -584,9 +564,15 @@ static void SupersedePendingReinit() {
         PostMessage(g_gui.hwndMain, WM_MHC_RELOAD_HARDWARE, kMhcReloadPending, 0);
 }
 
+// The displays the overlay render thread launched last was built with (GUI thread): an analysis switch in overlay mode
+// compares them with what the pipeline wants now (OverlayPipelineMonitors).
+static std::vector<int> s_overlayMonitors;
+
 static std::thread LaunchRenderThread(std::vector<MonitorLUTConfig> configs) {
     SupersedePendingReinit();   // every overlay start comes through here (StartProcessing, the hook's re-evaluation)
     g_renderLoopStarted.store(false);
+    s_overlayMonitors.clear();
+    for (const MonitorLUTConfig& c : configs) s_overlayMonitors.push_back(c.monitorIndex);
     return std::thread(ProcessingThreadFunc, std::move(configs), g_renderLoopGen.load());
 }
 
@@ -1153,18 +1139,36 @@ bool AnyDesktopGammaConfigured() {
     return false;
 }
 
+std::vector<int> PipelineMonitorIndices(const std::vector<bool>& needsProcessing, bool desktopGammaConfigured,
+                                        bool analysis) {
+    std::vector<int> out;
+    for (size_t i = 0; i < needsProcessing.size(); i++)
+        if (needsProcessing[i] || desktopGammaConfigured || (analysis && i == 0)) out.push_back((int)i);
+    return out;
+}
+
+static std::vector<int> WantedPipelineMonitors() {
+    std::vector<bool> needs;
+    for (const auto& ms : g_gui.monitorSettings) needs.push_back(MonitorNeedsProcessing(ms));
+    return PipelineMonitorIndices(needs, AnyDesktopGammaConfigured(), g_analysisEnabled.load());
+}
+
 bool LiveLayersNeeded() {
-    return AnyMonitorNeedsProcessing() || AnyDesktopGammaConfigured();
+    return !WantedPipelineMonitors().empty();
+}
+
+bool OverlayPipelineMonitorsDiffer() {
+    if (g_dwmHookMode.load() || !g_gui.isRunning || !g_gui.processingThread.joinable()) return false;
+    return s_overlayMonitors != WantedPipelineMonitors();
 }
 
 std::vector<MonitorLUTConfig> BuildPipelineConfigs() {
     // Every display that needs processing; every display while desktop gamma is configured, even toggled off by
-    // its hotkey (the pipeline hosts that hotkey; all join, as with the mode on, so turning it back on finds them).
+    // its hotkey (all join, as with the mode on, so turning it back on finds them); the analysis display (index 0,
+    // where the overlay and the analysis-only thread measure) while analysis is on.
     std::vector<MonitorLUTConfig> configs;
-    const bool desktopGammaConfigured = AnyDesktopGammaConfigured();
-    for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {
-        const auto& ms = g_gui.monitorSettings[i];
-        if (!MonitorNeedsProcessing(ms) && !desktopGammaConfigured) continue;
+    for (int i : WantedPipelineMonitors()) {
+        const auto& ms = g_gui.monitorSettings[(size_t)i];
         MonitorLUTConfig config;
         config.monitorIndex = (int)i;
         config.sdrLutPath = LiveLutPath(ms, false);   // the overlay applies only what runs (a bypassed cube: none)
@@ -1366,17 +1370,6 @@ static void StartProcessingImpl() {
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
 
-            // Register hotkeys on GUI window (analysis-only has no overlay WndProc)
-            if (g_gui.hwndMain) {
-                if (g_hotkeyGammaEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
-                if (g_hotkeyAnalysisEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
-                if (g_hotkeyHdrEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
-                g_hookOnlyHotkeys = true;
-            }
-
             StartAnalysisOnlyMode();
 
             // No processing thread here either: the same MHC pass as the LUT-only start, before the whitelist
@@ -1393,17 +1386,6 @@ static void StartProcessingImpl() {
             g_gui.isRunning = true;
             g_gui.restartRetryCount = 0;
             if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);
-
-            // Register hotkeys on GUI window since overlay WndProc doesn't exist
-            if (g_gui.hwndMain) {
-                if (g_hotkeyGammaEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
-                if (g_hotkeyAnalysisEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
-                if (g_hotkeyHdrEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
-                g_hookOnlyHotkeys = true;
-            }
 
             // Create analysis overlay (for potential hotkey toggle)
             CreateAnalysisOverlay(GetModuleHandle(nullptr));
@@ -1514,17 +1496,12 @@ static void StopProcessingImpl() {
     if (g_gui.hwndMain)
         KillTimer(g_gui.hwndMain, DWM_HOOK_WATCHDOG_TIMER_ID);
 
-    // Unregister hotkeys from GUI window if registered there (hook-only mode)
-    if (g_hookOnlyHotkeys && g_gui.hwndMain) {
-        UnregisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA);
-        UnregisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS);
-        UnregisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE);
-        g_hookOnlyHotkeys = false;
-    }
+    // (The hotkeys stay: they are the hub window's for the whole session.)
 
-    // Stop analysis-only thread if running
+    // Stop analysis-only thread if running. g_running (cleared above) ends its loop; whether analysis is on stays the
+    // user's (the analysis switch / hotkey, a Suspend): a restart (a cube change, an engine switch) brings it back,
+    // and its window (the GUI thread's, for the session) stays as it is.
     if (g_analysisOnlyMode.load()) {
-        g_analysisEnabled.store(false);  // Break analysis-only loop
         // Thread will exit and post WM_ANALYSIS_ONLY_EXITED, but we handle cleanup here
         if (!JoinProcessingThreadPumping(2000)) {
             // Detached: invalidate the zombie's generation so it exits even if
@@ -1532,12 +1509,6 @@ static void StopProcessingImpl() {
             g_analysisThreadGen.fetch_add(1);
         }
         g_analysisOnlyMode.store(false);
-        DestroyAnalysisOverlay();
-    }
-
-    // Destroy analysis overlay if created in hook-only mode (no thread running)
-    if (g_dwmHookMode.load() && !g_gui.processingThread.joinable()) {
-        DestroyAnalysisOverlay();
     }
 
     // Uninject DWM hook if in DWM hook mode OR if the DLL is still resident. The GUI toggle stores
@@ -1648,13 +1619,6 @@ static void DwmHookReevaluateOverlayOnce() {
             return;
         }
         if (!g_gui.processingThread.joinable()) {
-            // Unregister hook-only hotkeys — overlay thread will register its own
-            if (g_hookOnlyHotkeys && g_gui.hwndMain) {
-                UnregisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA);
-                UnregisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS);
-                UnregisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE);
-                g_hookOnlyHotkeys = false;
-            }
             std::cout << "[DWM Hook] Shader overlay now needed, starting DD" << std::endl;
             std::vector<MonitorLUTConfig> configs;
             for (size_t i = 0; i < g_gui.monitorSettings.size(); i++) {

@@ -887,3 +887,136 @@ TEST_CASE("MHC permutations: a bypassed stage bakes as the identity profile's st
     CHECK(both.primariesEnabled == ident.primariesEnabled);
     CHECK(both.peakNits == ident.peakNits);
 }
+
+// =============================================================================================
+// 5. The one step (Pipeline page, SDR CONTENT: GAMMA 2.2 = act::SetSdrGamma22 -> MhcSetDesktopGamma(mon, true)):
+//    on a display with nothing configured, the profile GenerateAndInstallMhcProfile installs is the identity
+//    profile that display gets on Remove (ReplaceMhcProfileWithIdentity) with desktop gamma in its 1D LUT,
+//    and nothing else: matrix identity, the same colorants, luminance tags and every other tag byte.
+// =============================================================================================
+
+namespace {
+
+// [first, last) byte ranges of a generated profile that may differ between two bakes of the same tags: the header's
+// date/time (24..35) and profile ID (84..99, an MD5 over the rest).
+bool SameOutside(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b,
+                 std::vector<std::pair<size_t, size_t>> skip, size_t* firstDiff) {
+    skip.push_back({ 24, 36 });
+    skip.push_back({ 84, 100 });
+    if (a.size() != b.size()) { *firstDiff = 0; return false; }
+    for (size_t i = 0; i < a.size(); i++) {
+        bool skipped = false;
+        for (const auto& r : skip) skipped = skipped || (i >= r.first && i < r.second);
+        if (!skipped && a[i] != b[i]) { *firstDiff = i; return false; }
+    }
+    return true;
+}
+
+// The three LUT payloads ('sf32' + reserved + words) of a profile's MHC2 tag, as profile byte ranges.
+std::vector<std::pair<size_t, size_t>> Mhc2LutRanges(const std::vector<uint8_t>& profile) {
+    uint32_t off = 0, size = 0;
+    REQUIRE(FindTag(profile, "MHC2", off, size));
+    const uint8_t* t = profile.data() + off;
+    const uint32_t lutSize = ReadBE32(t + 8);
+    std::vector<std::pair<size_t, size_t>> out;
+    for (int ch = 0; ch < 3; ch++) {
+        const size_t start = off + ReadBE32(t + 24 + ch * 4);
+        out.push_back({ start, start + 8 + (size_t)lutSize * 4 });
+    }
+    return out;
+}
+
+// The MHC2 tag's 3x4 matrix (s15Fixed16 words).
+std::vector<uint32_t> Mhc2MatrixWords(const std::vector<uint8_t>& profile) {
+    uint32_t off = 0, size = 0;
+    REQUIRE(FindTag(profile, "MHC2", off, size));
+    const uint8_t* m = profile.data() + off + ReadBE32(profile.data() + off + 20);
+    std::vector<uint32_t> words(12);
+    for (int i = 0; i < 12; i++) words[i] = ReadBE32(m + i * 4);
+    return words;
+}
+
+}  // namespace
+
+TEST_CASE("SDR gamma 2.2 in one step: the identity profile with desktop gamma in the 1D LUT, and nothing else") {
+    const MonitorSettings fresh;   // a fresh install: what a display's settings are before anything is configured
+    // The one step's settings change, as MhcSetDesktopGamma makes it (with the Windows SDR white it follows).
+    MHCSettings m = fresh.hdrMHC;
+    m.desktopGammaEnabled = true;
+    CHECK_FALSE(m.enabled);   // no profile yet: GenerateAndInstallMhcProfile makes one
+    for (float white : { 80.0f, 116.0f, 203.0f }) {
+        CAPTURE(white);
+        m.dgSdrWhiteNits = white;
+        const uint8_t perm = ComputeMhcPermutation(m, true);
+        CHECK(perm == MHCSettings::PERM_DG);   // desktop gamma only (the Windows tone map's PEAK_MAX bit: below)
+        MHC2ProfileParams dg;
+        REQUIRE(BuildMHC2ParamsForPerm(m, true, 99, perm, dg));   // as GenerateAndInstallMhcProfile bakes it
+        // The identity profile this display is given on Remove (MhcRemove -> ReplaceMhcProfileWithIdentity), named
+        // like this one: the description is the only tag that carries the name (the identity says "(identity)").
+        const MHC2ProfileParams id = BuildIdentityMHC2Params(true, MhcIdentityPeakNits(fresh, true), dg.monitorName);
+
+        // Field by field: only desktop gamma (and its reference white) differ.
+        CHECK(dg.desktopGammaEnabled);
+        CHECK_FALSE(id.desktopGammaEnabled);
+        CHECK(dg.sdrWhiteNits == white);
+        CHECK(dg.isHDR == id.isHDR);
+        CHECK_FALSE(dg.primariesEnabled);   // display := source: an identity matrix, no EDID primaries
+        CHECK(dg.primariesEnabled == id.primariesEnabled);
+        for (int c = 0; c < 3; c++) CHECK(dg.whiteBalanceGains[c] == 1.0f);
+        CHECK(dg.peakNits == id.peakNits);   // the luminance metadata the identity profile carries
+        CHECK(dg.reportedPeakNits == 0.0f);
+        CHECK(id.reportedPeakNits == 0.0f);
+        CHECK(dg.grayscaleEnabled == id.grayscaleEnabled);
+        CHECK(dg.grayscale.enabled == id.grayscale.enabled);
+        CHECK(dg.grayscale.use24Gamma == id.grayscale.use24Gamma);
+        CHECK(dg.hasPerChannelTRC == id.hasPerChannelTRC);
+        CHECK(dg.hasPrecomputedCorrection == id.hasPrecomputedCorrection);
+        CHECK(dg.correctionGrayscaleEnabled == id.correctionGrayscaleEnabled);
+        CHECK(dg.sdrGamma24 == id.sdrGamma24);
+        CHECK_FALSE(dg.refreshTrim.active);   // REFRESH TRIM is off by default
+
+        // Bytes: every tag the same — colorants (BT.2020 wire primaries, the HDR rule), TRC, lumi, the MHC2 header and
+        // matrix — except the 1D LUTs, which are desktop gamma over the identity's.
+        std::vector<uint8_t> dgBytes, idBytes;
+        REQUIRE(GenerateMHC2Profile(dg, dgBytes));
+        REQUIRE(GenerateMHC2Profile(id, idBytes));
+        size_t diff = 0;
+        INFO("first differing byte outside the LUTs: " << diff);
+        CHECK(SameOutside(dgBytes, idBytes, Mhc2LutRanges(dgBytes), &diff));
+        CHECK(Mhc2LutRanges(dgBytes) == Mhc2LutRanges(idBytes));
+        const std::vector<uint32_t> identityMatrix = { 0x10000u, 0, 0, 0, 0, 0x10000u, 0, 0, 0, 0, 0x10000u, 0 };
+        CHECK(Mhc2MatrixWords(dgBytes) == identityMatrix);
+        CHECK(Mhc2MatrixWords(idBytes) == identityMatrix);
+        bool lutsDiffer = false;
+        for (int ch = 0; ch < 3; ch++) {
+            CAPTURE(ch);
+            CHECK(Mhc2LutWords(idBytes, ch) == ExpectedWords(id, ch, [](float v) { return v; }));
+            CHECK(Mhc2LutWords(dgBytes, ch) == ExpectedWords(dg, ch, [white](float v) { return DesktopGammaPQ(v, white); }));
+            lutsDiffer = lutsDiffer || Mhc2LutWords(dgBytes, ch) != Mhc2LutWords(idBytes, ch);
+        }
+        CHECK(lutsDiffer);
+    }
+
+    // The GRAYSCALE inspector's switch turned desktop gamma off and kept the neutral profile: that variant IS the
+    // identity profile (every byte but the header's date and ID).
+    m.desktopGammaEnabled = false;
+    MHC2ProfileParams off;
+    REQUIRE(BuildMHC2ParamsForPerm(m, true, 99, ComputeMhcPermutation(m, true), off));
+    const MHC2ProfileParams id = BuildIdentityMHC2Params(true, MhcIdentityPeakNits(fresh, true), off.monitorName);
+    std::vector<uint8_t> offBytes, idBytes;
+    REQUIRE(GenerateMHC2Profile(off, offBytes));
+    REQUIRE(GenerateMHC2Profile(id, idBytes));
+    size_t diff = 0;
+    CHECK(SameOutside(offBytes, idBytes, {}, &diff));
+
+    // Windows tone map Auto with DesktopLUT's tone map over the full range (or Bypass): the variant carries PERM_PEAK_MAX,
+    // which changes the luminance tags only — as for every HDR profile of ours (windows_tonemap.h); the identity
+    // profile always carries the panel's value (it outlives DesktopLUT). Not part of "nothing configured".
+    m.desktopGammaEnabled = true;
+    m.reportPeakMax = true;
+    CHECK(ComputeMhcPermutation(m, true) == (MHCSettings::PERM_DG | MHCSettings::PERM_PEAK_MAX));
+    MHC2ProfileParams peakMax;
+    REQUIRE(BuildMHC2ParamsForPerm(m, true, 99, ComputeMhcPermutation(m, true), peakMax));
+    CHECK(peakMax.reportedPeakNits == kWindowsToneMapBypassNits);
+    CHECK(peakMax.peakNits == id.peakNits);   // the curves stay scaled to the panel
+}

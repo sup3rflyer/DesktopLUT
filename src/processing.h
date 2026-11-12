@@ -35,16 +35,24 @@ bool AnyMonitorNeedsProcessing();
 bool AnyMonitorHasCorrections();
 // Desktop gamma is configured on some live display (its persisted setting, not the hotkey's toggle).
 bool AnyDesktopGammaConfigured();
-// The live layers are needed: a live display needs processing, or desktop gamma is configured (by its persisted
-// setting: its hotkey toggles only the in-memory flag, and the running pipeline hosts that hotkey — stopping on
-// the toggle would unregister the very hotkey that turns it back on). The reconcile's `needed`. A start builds
-// a non-empty pipeline exactly then (BuildPipelineConfigs), so a restart does not end stopped for want of work
-// while this holds (it still can on a failed hook injection or a start deferred behind a stuck thread). GUI thread.
+// The live layers are needed: a live display needs processing, desktop gamma is configured (by its persisted
+// setting: its hotkey toggles only the in-memory flag, and the running pipeline hosts the desktop gamma whitelist
+// that switches it per app), or the analysis overlay is on (g_analysisEnabled: it measures through the overlay
+// engine). The reconcile's `needed`. A start builds a non-empty pipeline exactly then (BuildPipelineConfigs), so a
+// restart does not end stopped for want of work while this holds (it still can on a failed hook injection or a
+// start deferred behind a stuck thread). GUI thread.
 bool LiveLayersNeeded();
-// The per-display configs a start builds: every display that needs processing, and every display while desktop
-// gamma is configured anywhere (as with the mode on, so the hotkey turning it back on finds them all). Empty
-// exactly when !LiveLayersNeeded() (an MHC-only setup). GUI thread. Exposed for tests (StartProcessing uses it).
+// Pure (tested): the displays a start builds the pipeline for, by live index: each one that needs processing, every
+// one while desktop gamma is configured anywhere (as with the mode on, so the hotkey turning it back on finds them
+// all), and display 0 while analysis is on (the overlay and the analysis-only thread measure index 0).
+std::vector<int> PipelineMonitorIndices(const std::vector<bool>& needsProcessing, bool desktopGammaConfigured,
+                                        bool analysis);
+// The per-display configs a start builds (PipelineMonitorIndices over the live settings). Empty exactly when
+// !LiveLayersNeeded() (an MHC-only setup). GUI thread. Exposed for tests (StartProcessing uses it).
 std::vector<MonitorLUTConfig> BuildPipelineConfigs();
+// Overlay mode, the render thread running: it was launched for other displays than the pipeline wants now (analysis
+// switched on or off changes display 0's need). The overlay builds its displays only at a start. GUI thread.
+bool OverlayPipelineMonitorsDiffer();
 // Hook mode: no hook is resident because no display had hook work the last time one was due — the running start
 // staged nothing, or the watchdog found the hook gone with nothing to re-inject and stood down. Any hook work
 // then makes the resident hook stale (act::HookStale), which re-injects. A start with hook work, or a watchdog

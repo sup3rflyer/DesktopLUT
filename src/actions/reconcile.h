@@ -108,6 +108,24 @@ enum class WatchdogAction {
 // Pure (tested). `reinjects` = the watchdog's re-injection cycles so far, `maxReinjects` its cap.
 WatchdogAction DecideHookWatchdog(bool hookActive, int reinjects, int maxReinjects, bool nothingToInject);
 
+// The global hotkeys (act::OnHotkey). They are the hub window's from startup to exit, so each works whatever runs;
+// what one does is decided here.
+//   Desktop gamma toggles the desktop gamma that is configured (HDR MHC profiles carry it at scanout, suspended or
+//   not). With none configured there is nothing to toggle (it used to flip a global flag that then made every display
+//   "need" the live layers); with none of those displays in HDR it changes nothing visible, as before.
+enum class GammaHotkey { Toggle, NotSetUp, NoHdrDisplay };
+GammaHotkey DecideGammaHotkey(bool configured, bool configuredDisplayInHdr);   // pure (tested)
+
+//   Analysis switches the readout on or off; on needs the overlay engine (the live layers), so a Suspend refuses it
+//   (the switch would start what the user stopped). Off always goes through.
+enum class AnalysisSwitch { Show, Hide, Unchanged, RefusedSuspended };
+AnalysisSwitch DecideAnalysisSwitch(bool want, bool on, bool suspended, bool shuttingDown);   // pure (tested)
+
+// Overlay mode only builds its displays at a start: after an analysis switch, a running overlay launched for other
+// displays than the pipeline now wants (display 0 for analysis) restarts — unless nothing needs the live layers any
+// more (the reconcile stops them then). Hook mode re-evaluates instead (the analysis-only thread). Pure (tested).
+bool AnalysisNeedsOverlayRestart(bool hookMode, bool overlayRunning, bool monitorsDiffer, bool stillNeeded);
+
 // GUI thread. Suspend stops the live layers and keeps them stopped (display changes and wakes do not
 // start them); resume reconciles. Suspending is refused while a calibration session or live edit is
 // open (a DLC run owns the pipeline until calibration.exit).

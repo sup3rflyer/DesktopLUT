@@ -199,7 +199,8 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
     const bool live = !snap.suspended;
     const char* label = "LIVE LAYERS";
     const float sw = SwitchWidth(label);
-    ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Px(kGutter) - sw), Snap(cy - Px(kControlH) * 0.5f)));
+    const float liveX = Snap(p.x + w - Px(kGutter) - sw);
+    ImGui::SetCursorScreenPos(ImVec2(liveX, Snap(cy - Px(kControlH) * 0.5f)));
     ImGui::BeginDisabled(busy || (snap.calibrating && live));
     if (Switch("##live", label, live)) Post([live]() { act::SetLiveLayersSuspended(live); });
     ImGui::EndDisabled();
@@ -207,6 +208,27 @@ void DrawHeader(const Snapshot& snap, ViewState& vs, bool busy) {
         ImGui::SetTooltip(snap.calibrating && live ? "Calibration in progress."
                           : live ? "3D LUT, tone mapping and FALD. Off suspends them; MHC stays on."
                                  : "Suspended: 3D LUT, tone mapping and FALD off. MHC stays on.");
+
+    // Analysis: the readout of what is on the primary display (also its hotkey). A global tool, beside the other global
+    // switch; it measures through the live layers, so it waits while they are suspended.
+    {
+        const char* alabel = "ANALYSIS";
+        const float aw = SwitchWidth(alabel);
+        ImGui::SetCursorScreenPos(ImVec2(Snap(liveX - Px(28) - aw), Snap(cy - Px(kControlH) * 0.5f)));
+        const bool on = snap.analysis;
+        ImGui::BeginDisabled(busy || (snap.suspended && !on));
+        if (Switch("##analysis", alabel, on)) Post([on]() { act::SetAnalysis(!on); });
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            char combo[64];
+            snprintf(combo, sizeof(combo), "\nHotkey: Win+Shift+%c.", g_hotkeyAnalysisKey.load());
+            std::string tip = snap.suspended && !on ? "Needs the live layers: they are suspended."
+                                                    : "A readout over the primary display: peak and average "
+                                                      "nits, gamut use.";
+            if (g_hotkeyAnalysisEnabled.load()) tip += combo;
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
 
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
     ImGui::Dummy(ImVec2(0, 0));
@@ -231,7 +253,9 @@ void DrawFooter(const Snapshot& snap, ViewState& vs, bool busy) {
     const char* what;
     if (snap.hookMode) {
         what = "HOOK";
-        state = snap.hookActive ? Good : (snap.running ? Fault : Off);
+        // Running with no hook resident because no display has hook work (desktop gamma only, analysis only) is not a
+        // fault: nothing needs it injected.
+        state = snap.hookActive ? Good : (snap.running && !snap.hookIdle ? Fault : Off);
     } else {
         what = "OVERLAY";
         state = snap.running ? Good : Off;
@@ -608,6 +632,8 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     auto post = [&r](TonemapSettings t) { PostTo(r, [t](int mon) { act::SetTonemap(mon, t); }); };
 
     RowCtx row = BeginRow("CURVE");
+    RowTip(row, "How highlights brighter than DISPLAY PEAK are rolled off (hue kept).\n"
+                "BT.2390 (the default) is the ITU reference; SOFT CLIP and REINHARD keep the peak; HARD CLIP cuts flat.");
     RowPlace(row);
     static const char* kCurves[] = { "BT.2390", "BT.2446A", "REINHARD", "SOFT CLIP", "HARD CLIP" };
     const int pick = Segmented("##tm_curve", kCurves, 5, TonemapCurveToDropdownIndex(tm.curve), 88);
@@ -615,6 +641,10 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     EndRow(row);
 
     row = BeginRow("DISPLAY PEAK");
+    {
+        const std::string tip = DisplayPeakTip(tm.targetPeakNits, r.edidPeakNits);
+        RowTip(row, tip.c_str());
+    }
     RowPlace(row);
     float target = tm.targetPeakNits;
     if (NumberInput("##tm_target", &target, "%.0f", 80)) { TonemapSettings t = tm; t.targetPeakNits = target; post(t); }
@@ -623,6 +653,8 @@ void InspectToneMap(const DisplayRow& r, const Stage& st) {
     EndRow(row);
 
     row = BeginRow("CONTENT PEAK");
+    RowTip(row, "DYNAMIC: the curve follows each frame's brightest part.\n"
+                "FIXED: content is taken to peak at this value (its MaxCLL); brighter parts clip.");
     RowPlace(row);
     bool dyn = false;
     if (OnOff("##tm_dyn", tm.dynamicPeak, &dyn, "DYNAMIC", "FIXED", 84.0f)) { TonemapSettings t = tm; t.dynamicPeak = dyn; post(t); }
@@ -1330,20 +1362,23 @@ void DisplayListColumn(const Snapshot& snap, ViewState& vs, const DisplayRow* se
 
 // Title row: name left, mode switch right, both centred on one line. Notes go on this line without taking layout
 // space (TitleRow::noteX), so nothing moves when they appear.
-TitleRow DisplayTitleRow(const DisplayRow& sel, ViewState& vs) {
+// `reserve` (pixels): room the caller draws in after the name; a long name is shortened to leave it.
+TitleRow DisplayTitleRow(const DisplayRow& sel, ViewState& vs, float reserve = 0.0f) {
     const bool liveHdr = PipelineIsHdr(sel.mode);
     const bool showHdr = vs.showOtherMode ? !liveHdr : liveHdr;
     const ImVec2 p(Snap(ImGui::GetCursorScreenPos().x), Snap(ImGui::GetCursorScreenPos().y));
     const float w = ImGui::GetContentRegionAvail().x;
     const float h = Snap(Px(30)), cy = p.y + h * 0.5f;
-    const std::string name = Utf8(sel.name);
+    const float segW = 72.0f;
+    const float modeX = Snap(p.x + w - Snap(Px(segW)) * 2);
+    std::string name = Utf8(sel.name);
+    if (reserve > 0.0f) name = Ellipsize(Font::BodyBold, kSizeTitle, name, std::max(modeX - Px(16) - reserve - Px(16) - p.x, Px(40)));
     const float nameW = DrawText(ImGui::GetWindowDrawList(), Font::BodyBold, kSizeTitle, p.x, cy, pal::Ink, name.c_str());
     // Which side's settings are shown; a green light marks the mode the display is in now.
     const bool parked = sel.liveIndex < 0;
     static const char* const kModes[] = { "HDR", "SDR" };
     const ImU32 dots[2] = { !parked && liveHdr ? pal::Good : 0u, !parked && !liveHdr ? pal::Good : 0u };
-    const float segW = 72.0f;
-    ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Snap(Px(segW)) * 2), Snap(cy - Snap(Px(kControlH)) * 0.5f)));
+    ImGui::SetCursorScreenPos(ImVec2(modeX, Snap(cy - Snap(Px(kControlH)) * 0.5f)));
     ImGui::BeginDisabled(EditorOpen(vs));
     const int pick = Segmented("##mode", kModes, 2, showHdr ? 0 : 1, segW, dots);
     ImGui::EndDisabled();
@@ -1358,7 +1393,38 @@ TitleRow DisplayTitleRow(const DisplayRow& sel, ViewState& vs) {
     }
     ImGui::SetCursorScreenPos(ImVec2(p.x, p.y + h));
     ImGui::Dummy(ImVec2(0, Px(16)));
-    return { p.x + nameW + Px(16), cy, vs.showOtherMode ? !liveHdr : liveHdr };
+    return { p.x + nameW + Px(16), cy, vs.showOtherMode ? !liveHdr : liveHdr, modeX - Px(16) };
+}
+
+// SDR content in HDR: gamma 2.2 (ui::SdrGammaOffer, act::SetSdrGamma22). Up front, in the title line's note place (it
+// takes no layout: nothing moves where it is offered or not), for the display that has nothing else in its HDR MHC
+// profile; once anything else is there, GRAYSCALE's DESKTOP GAMMA switch is the one. The switch and the whitelist.
+constexpr const char* kSdrGammaLabel = "SDR CONTENT: GAMMA 2.2";
+constexpr float kSdrGammaGap = 12.0f;
+
+float SdrGammaOfferWidth() { return SwitchWidth(kSdrGammaLabel) + Px(kSdrGammaGap) + Snap(Px(kButtonW)); }
+
+void DrawSdrGammaOffer(const Snapshot& snap, const DisplayRow& r, GammaOffer offer, const TitleRow& title, ViewState& vs) {
+    const bool on = offer == GammaOffer::On;
+    const float y = Snap(title.cy - Px(kControlH) * 0.5f);
+    ImGui::SetCursorScreenPos(ImVec2(Snap(title.noteX), y));
+    ImGui::BeginDisabled(EditorOpen(vs) || snap.calibrating);
+    if (Switch("##sdr_g22", kSdrGammaLabel, on)) PostTo(r, [on](int mon) { act::SetSdrGamma22(mon, !on); });
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        std::string tip = snap.calibrating ? "Calibration in progress.\n" : "";
+        tip += "SDR content in HDR (desktop, apps, SDR video) at gamma 2.2, not Windows' sRGB curve, which lifts "
+               "dark greys.\nDesktop gamma, in an HDR MHC profile; it follows the Windows SDR brightness.\n"
+               "HDR games and video change too unless listed: WHITELIST.";
+        if (on) tip += Fmt("\nOn: 2.2 at %.0f nits. Off removes the profile again.", r.settings.hdrMHC.dgSdrWhiteNits);
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
+    ImGui::SetCursorScreenPos(ImVec2(Snap(ImGui::GetItemRectMax().x + Px(kSdrGammaGap)), y));
+    ImGui::BeginDisabled(EditorOpen(vs));
+    if (Button("##sdr_g22_wl", "WHITELIST", kButtonW)) OpenWhitelist(vs, 1);
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Apps that switch it off while they run.\nList HDR games and video players here.");
 }
 
 void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
@@ -1380,9 +1446,13 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
         return;
     }
     const bool liveHdr = PipelineIsHdr(sel->mode);
-    const TitleRow title = DisplayTitleRow(*sel, vs);
+    const GammaOffer gammaOffer = SdrGammaOffer(sel->settings, sel->liveIndex >= 0, sel->mode,
+                                                vs.showOtherMode ? !liveHdr : liveHdr);
+    const TitleRow title = DisplayTitleRow(*sel, vs, gammaOffer != GammaOffer::None ? SdrGammaOfferWidth() : 0.0f);
     if (vs.showOtherMode && sel->liveIndex >= 0)
         TextAt(Font::Label, kSizeLabel, pal::Alarm, title.noteX, title.cy, liveHdr ? "DISPLAY IS IN HDR" : "DISPLAY IS IN SDR");
+    else if (gammaOffer != GammaOffer::None)
+        DrawSdrGammaOffer(snap, *sel, gammaOffer, title, vs);
     const bool showHdr = title.showHdr;
     const Mode shown = showHdr ? Mode::HDR : (sel->mode == Mode::AcmSdr ? Mode::AcmSdr : Mode::SDR);
 

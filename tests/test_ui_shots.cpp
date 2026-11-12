@@ -600,6 +600,25 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "dlcpanelsdr", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 61 },
         { "dlcpanelnone", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 62 },
         { "dlcpanelunmatched", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 63 },
+        // The front door (a fresh install: nothing configured, no DLC): 70 the HDR display offered SDR CONTENT: GAMMA
+        // 2.2, 71 the same switched on (its neutral profile installed, the live layers running with no hook work), 72
+        // the SDR display (no offer), the calibrated HDR display (no offer; GRAYSCALE's switch as before), 74 analysis on.
+        { "frontoffer", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 70 },
+        { "frontoffernarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 70 },
+        { "fronton", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 71 },
+        { "frontonnarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 71 },
+        { "frontongray", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 71 },
+        { "frontsdr", ui::Page::Pipeline, ui::StageId::Lut3D, 1, false, -1, -1, 1180, 760, 72 },
+        { "frontsdrnarrow", ui::Page::Pipeline, ui::StageId::Lut3D, 1, false, -1, -1, 920, 520, 72 },
+        { "frontcal", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1 },
+        { "frontcalnarrow", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 920, 520 },
+        { "frontanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 74 },
+        { "frontanalysisnarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 74 },
+        // Their tooltips: the offer's switch and its WHITELIST, DISPLAY PEAK, the header's ANALYSIS.
+        { "fronttipoffer", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 510, 95, 1180, 760, 70 },
+        { "fronttiponwl", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 585, 95, 1180, 760, 71 },
+        { "fronttippeak", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 300, 282, 1180, 760, 70 },
+        { "fronttipanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 995, 28, 1180, 760, 70 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -752,6 +771,43 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                         snap.live[1].dlcMatch = dlc::DisplayMatch();
                         snap.live[1].dlcRecord[0] = snap.live[1].dlcRecord[1] = dlc::ModeRecord();
                         snap.live[1].reminderDue = false;
+                    }
+                } else if (shot.variant >= 70 && shot.variant <= 74) {
+                    // A fresh install: every display on default settings (the HDR one's tone map target seeded from its
+                    // 1600-nit EDID peak), no DLC folder, nothing running.
+                    snap.dlc = std::make_shared<dlc::Data>();
+                    for (ui::DisplayRow& r : snap.live) {
+                        MonitorSettings fresh;
+                        fresh.identity = r.settings.identity;
+                        fresh.slot = r.settings.slot;
+                        r.settings = fresh;
+                        r.dlcMatch = dlc::DisplayMatch();
+                        r.dlcRecord[0] = r.dlcRecord[1] = dlc::ModeRecord();
+                        r.reminderDue = false;
+                        r.refreshTrim = RefreshTrimStatus{};
+                    }
+                    snap.live[0].settings.hdrColorCorrection.tonemap.targetPeakNits = 1600;
+                    snap.live[0].edidPeakNits = 1600;
+                    snap.live[0].reportedPeakNits = 1600;
+                    snap.running = snap.hookActive = false;
+                    snap.lastStatus = L"Configure at least one monitor with LUT or color correction";
+                    if (shot.variant == 71) {   // SDR CONTENT: GAMMA 2.2 on: its neutral HDR profile carries desktop gamma
+                        MHCSettings& m = snap.live[0].settings.hdrMHC;
+                        m.enabled = true;
+                        m.desktopGammaEnabled = true;
+                        m.dgSdrWhiteNits = 116;
+                        m.activePerm = MHCSettings::PERM_DG;
+                        m.profileName = L"DesktopLUT_Mon0_HDR_9532406.icm";
+                        m.profilePath = L"C:\\Windows\\System32\\spool\\drivers\\color\\" + m.profileName;
+                        snap.live[0].reportedPeakNits = 1000;   // the profile's luminance tag (the params default)
+                        snap.running = true;
+                        snap.hookIdle = true;   // desktop gamma alone: no hook work
+                        snap.lastStatus = L"Active (DWM Hook)";
+                    } else if (shot.variant == 74) {   // analysis on, nothing else: the analysis-only thread
+                        snap.analysis = true;
+                        snap.running = true;
+                        snap.hookIdle = true;
+                        snap.lastStatus = L"Active (DWM Hook)";
                     }
                 } else if (shot.variant == 23 || shot.variant == 25) {
                     FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;

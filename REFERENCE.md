@@ -7,11 +7,11 @@ Detailed technical reference. For working on the code, see [AGENTS.md](AGENTS.md
 Run `DesktopLUT.exe` to launch the GUI. Configure LUTs and color corrections per-monitor in the interface.
 
 ### Hotkeys
-- **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR)
+- **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR; "Desktop gamma: not set up" when no display has it)
 - **Win+Shift+Z**: Toggle HDR on/off for the focused monitor
-- **Win+Shift+X**: Toggle analysis overlay
+- **Win+Shift+X**: Toggle analysis overlay (the header's **ANALYSIS** switch). From idle it starts the live layers it needs (hook mode: the analysis-only thread; overlay mode: the overlay on display 0) and stops them again when it ends; refused while the live layers are suspended, and a Suspend turns it off.
 
-Hotkeys can be enabled/disabled in **SETTINGS** → **HOTKEYS** (classic window: the Settings tab). Key letters are configurable via INI file only.
+The hotkeys belong to the GUI thread's hub window from startup to exit, so they work with nothing configured (through 3.0.0 a running pipeline registered them and handed them between the hub and the overlay window). A combination another program holds stays unregistered, with a warning in Events. Hotkeys can be enabled/disabled in **SETTINGS** → **HOTKEYS** (classic window: the Settings tab). Key letters are configurable via INI file only.
 
 ## Settings File (INI)
 

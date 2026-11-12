@@ -432,7 +432,8 @@ int DrawColumn(MhcEditorState& ed, ImVec2 a, float w, float& endY) {
     const bool locked = ed.sourceGivesPrimaries;
     {
         Line l = BeginLine(a.x, y, w, "PRIMARIES");
-        LabelTip(l, "The display's own primaries and white (measured): the profile maps them to the standard.");
+        LabelTip(l, "The display's own primaries and white: the profile maps them to the standard.\n"
+                    "Measured ones correct the gamut; DETECT's are the maker's declared values.");
         Place(l);
         bool v = false;
         if (OnOff("##mhc_prim_on", ed.work.primariesEnabled, &v)) {
@@ -471,7 +472,8 @@ int DrawColumn(MhcEditorState& ed, ImVec2 a, float w, float& endY) {
         }
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("%s", locked ? "From the imported profile (CLEAR to edit)."
-                                           : "The primaries the display reports (EDID), with a D65 white.");
+                                           : "The primaries the maker declares in the EDID, with a D65 white.\n"
+                                             "Declared, not measured: often only approximate.");
         ImGui::EndDisabled();
         y += step;
     }
@@ -491,7 +493,7 @@ int DrawColumn(MhcEditorState& ed, ImVec2 a, float w, float& endY) {
             }
         }
         l.x -= Px(16);
-        if (k == 3) LabelTip(l, "The display's own white, measured: the profile maps it to D65.");
+        if (k == 3) LabelTip(l, "The display's own white: the profile maps it to D65.\nDETECT assumes D65 (no correction).");
         if (ImGui::IsMouseHoveringRect(ImVec2(l.x0 - Px(16), l.y0), ImVec2(l.x0 + Px(kLabelW) - Px(24), l.y0 + l.h)) &&
             ImGui::IsMouseClicked(0))
             ed.selected = k;
