@@ -89,21 +89,39 @@ can't reach target are surfaced for adjudication, not silently accepted.
 
 ## Getting started
 
-1. **DesktopLUT** (`DesktopLUT.exe` + `DwmHook.dll`) running, with the calibration pipe armed
-   (below).
-2. **Python 3.11+** and `pip install -e .[engine,meter,test]` from this directory.
-3. **ArgyllCMS 3.3.0** and **dogegen** placed under `third_party/` (see
+You need a **colorimeter**, **Python 3.11+**, **ArgyllCMS** and an **AI coding agent** (Claude Code or
+similar), which sets DLC up and runs every calibration with you. The quickest start: on DesktopLUT's
+**DLC** tab, **SET UP WITH YOUR ASSISTANT** copies a setup request with these steps; paste it into your
+agent.
+
+1. **Get DLC.** It is not in the DesktopLUT release zip: it is this `DLC/` folder of the repository.
+   Clone the repository into your user folder, where DesktopLUT finds DLC by itself:
+   ```bat
+   git clone https://github.com/sup3rflyer/DesktopLUT.git "%USERPROFILE%\DesktopLUT"
+   ```
+   (Command Prompt; in PowerShell the folder is `"$env:USERPROFILE\DesktopLUT"`. Without git: download
+   the repository as a ZIP from GitHub and extract it there.) If preflight (step 5) reports a contract
+   mismatch with your DesktopLUT, check out the tag of your release (`git checkout v3.0.0`).
+2. **DesktopLUT** (`DesktopLUT.exe` + `DwmHook.dll`, v3.0.0 or newer) running, with the calibration
+   pipe armed (below) for runs.
+3. **Python 3.11+** and `pip install -e .[engine,meter,test]` from this directory.
+4. **ArgyllCMS 3.3.0** and **dogegen** placed under `third_party/` (see
    [`third_party/README.md`](third_party/README.md)) and a **colorimeter** (i1Display Pro family;
    a spectrometer is optional, for building meter corrections).
-4. Copy [`calibration_profile.example.yaml`](calibration_profile.example.yaml) to
+5. **Check the meter.** With it plugged in, `third_party\argyll\3.3.0\bin\spotread.exe -?` lists it
+   among the instruments (if not, install the driver ArgyllCMS documents for it).
+   `python -m dlc.stages.preflight --run runs/_setup` then reports the tools, the meter and DesktopLUT's
+   calibration pipe (the pipe answers only while it is armed).
+6. Copy [`calibration_profile.example.yaml`](calibration_profile.example.yaml) to
    `calibration_profile.yaml` (git-ignored — it's your hardware data) and describe your displays.
-5. Launch your agent in `DLC/` and ask it to calibrate; it follows
+7. Launch your agent in `DLC/` and ask it to calibrate; it follows
    [`docs/operator-guide.md`](docs/operator-guide.md) (onboarding: meter correction →
    `characterize` → `mhc-only` shakedown → `full`).
-6. Watch the run on DesktopLUT's **DLC** page (stage, live readouts, charts, the agent's
-   decisions; PAUSE and CANCEL). DesktopLUT finds this folder by itself when it is named `DLC`
-   and sits next to `DesktopLUT.exe` or one or two folders up; otherwise set it in Settings →
-   CALIBRATION → DLC FOLDER.
+8. Watch the run on DesktopLUT's **DLC** page (stage, live readouts, charts, the agent's
+   decisions; PAUSE and CANCEL). DesktopLUT finds this folder by itself in
+   `%USERPROFILE%\DesktopLUT\DLC`, next to `DesktopLUT.exe` or one or two folders up, or in a
+   repository clone (`DesktopLUT\DLC`) inside or beside the exe's folder. Anywhere else: **SET FOLDER…**
+   on the DLC tab, or Settings → CALIBRATION → DLC FOLDER.
 
 ## Quickstart (no hardware)
 
