@@ -960,6 +960,7 @@ class Calibration:
         "enter-neutral": ("Enter neutral", False),
         "characterize": ("Characterize panel", True),
         "peak-window": ("Peak by window", True),
+        "refresh-response": ("Refresh response", True),
         "hardware-readiness": ("Hardware readiness", False),
         "brightness": ("Brightness", False),
         "measure:raw": ("Measure · raw panel", True),
@@ -8580,6 +8581,9 @@ class Calibration:
             if flow == "peak-window":
                 from . import peak_window   # the probe flows live in their own modules
                 return peak_window.run_flow(self)
+            if flow == "refresh-response":
+                from . import refresh_probe
+                return refresh_probe.run_flow(self)
             if flow == "hdr":
                 # P13 (fable Phase 7a): HDR is a MODE, not a flow — `--mode HDR` on the normal
                 # flows runs the full HDR pipeline (PQ target, HDR refine, dE_ITP verify). This
@@ -10847,6 +10851,7 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
     "peak-window": ("preflight", "enter-neutral", "hardware-readiness", "peak-window"),
+    "refresh-response": ("preflight", "hardware-readiness", "refresh-response"),
     # verify-source / install-candidate only with --verify-patches-from / --verify-cube.
     "verify-only": ("preflight", "verify-source", "verify-patches-file", "resolve-target", "whitepoint",
                     "hardware-readiness", "install-candidate", "measure:verify", "verify"),
@@ -10878,6 +10883,9 @@ FLOWS: dict[str, str] = {
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
     "peak-window": ("HDR probe: consent → native (or --probe-spec stack installed) → white windows 1..100 % up and "
                     "down (the ABL graph) → restore → record seam → DIP peak_by_window (dlc.peak_window)"),
+    "refresh-response": ("HDR probe: plan seam → through the installed MHC (layers, cube, trim out) → reference ↔ rate "
+                         "brackets, a consent per mode switch (or a VRR cadence) → restore → files for "
+                         "`dlc.refresh_trim record` (dlc.refresh_probe)"),
     "verify-only": ("MEASURE the installed stack (or a --verify-cube candidate over it) against the verify "
                     "preset or a recorded run's exact set (--verify-patches-from, deltas vs its verify) → "
                     "report; builds/commits nothing (candidate: verify:candidate restore/keep)"),
@@ -10979,7 +10987,7 @@ def _restore_hint(calib_state: Optional[dict[str, Any]]) -> str:
 
 # Flows that never enter calibration mode: they tune / measure the INSTALLED stack in place, so
 # DesktopLUT never takes a snapshot of them (their own undo is the in-place baseline / candidate).
-_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only")
+_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only", "refresh-response")
 
 
 def _run_entered_calibration(calib_state: Optional[dict[str, Any]], *,

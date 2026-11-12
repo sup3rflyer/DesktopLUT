@@ -119,6 +119,11 @@ class RefreshRate:
     same_as: Optional[str] = None
     max_dxy: Optional[float] = None        # largest chromaticity move on any patch (luminance-only check)
     channel_independent: Optional[bool] = None
+    # Additive (2026-11-12, schema unchanged): how the rate was produced — "mode" (a fixed display mode, the
+    # default when absent) or "vrr" (a VRR cadence on the reference mode; only listed here when a cross-check rate
+    # measured both ways agreed, see RefreshResponse.vrr) — and the evidence the panel really ran at it.
+    source: Optional[str] = None
+    proof: dict[str, Any] = field(default_factory=dict)
 
     @property
     def hz(self) -> float:
@@ -139,7 +144,9 @@ class RefreshRate:
                    same_as=(str(d["same_as"]) if d.get("same_as") is not None else None),
                    max_dxy=_opt_float(d.get("max_dxy")),
                    channel_independent=(bool(d["channel_independent"]) if d.get("channel_independent") is not None
-                                        else None))
+                                        else None),
+                   source=(str(d["source"]) if d.get("source") is not None else None),
+                   proof=dict(d.get("proof") or {}))
 
 
 @dataclass
@@ -163,6 +170,11 @@ class RefreshResponse:
     verdict: Optional[str] = None                   # "nonlinear" | "linear in frame period" | ...
     schema: int = REFRESH_RESPONSE_SCHEMA
     notes: list[str] = field(default_factory=list)
+    # Additive (2026-11-12, schema unchanged): the VRR sweep, when the run used the VRR rate source — its range,
+    # every point (hz, levels, proof), the smooth-model verdict (interpolable / extrapolable, held-out residuals)
+    # and the mode-vs-VRR cross-check. ``rates`` above stays the fixed-mode trim input: a VRR point reaches it only
+    # when the cross-check passed. None = no VRR sweep (written exactly as before).
+    vrr: Optional[dict[str, Any]] = None
 
     def rate(self, key: str) -> Optional[RefreshRate]:
         return next((r for r in self.rates if r.key == key), None)
@@ -170,6 +182,13 @@ class RefreshResponse:
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["rates"] = [r.as_dict() for r in self.rates]
+        for r in d["rates"]:              # a record without the additive fields is written exactly as before
+            if r.get("source") is None:
+                r.pop("source", None)
+            if not r.get("proof"):
+                r.pop("proof", None)
+        if self.vrr is None:
+            d.pop("vrr")
         return d
 
     @classmethod
@@ -182,7 +201,8 @@ class RefreshResponse:
                    rates=[RefreshRate.from_dict(r) for r in (d.get("rates") or [])], reference=ref,
                    identity=dict(d.get("identity") or {}), conditions=dict(d.get("conditions") or {}),
                    peak_nits=_opt_float(d.get("peak_nits")), interpolable=bool(d.get("interpolable", False)),
-                   verdict=d.get("verdict"), schema=schema, notes=list(d.get("notes") or []))
+                   verdict=d.get("verdict"), schema=schema, notes=list(d.get("notes") or []),
+                   vrr=(dict(d["vrr"]) if isinstance(d.get("vrr"), dict) else None))
 
 
 def _opt_pos(d: dict[str, Any], key: str) -> Optional[float]:

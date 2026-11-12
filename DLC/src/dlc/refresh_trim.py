@@ -51,7 +51,10 @@ SEPARABLE_P_MIN = 0.01            # chi-square p-value of one curve shape across
 
 
 def _rate_hz_nominal(rate: str) -> float:
-    return {"60": 60.0, "59.94": 60000 / 1001, "50": 50.0, "48": 48.0, "47.952": 48000 / 1001}.get(rate, float(rate))
+    if rate in RATIONALS:
+        n, d = RATIONALS[rate]
+        return n / d
+    return float(rate)
 
 
 def load_rows(path: Path | str) -> list[dict[str, Any]]:
@@ -101,12 +104,12 @@ def loo_residuals(s60: Sequence[dict[str, Any]]) -> list[float]:
     return out
 
 
-def u_interp(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def u_interp(rows: Sequence[dict[str, Any]], ref: str = REF_RATE) -> dict[str, dict[str, Any]]:
     """The drift-interpolation uncertainty per patch (relative): RMS of the leave-one-out residuals / sqrt(2).
     A random-walk drift's interpolation error grows as the square root of the span, and the LOO span is twice a
     bracket's. A patch with fewer than 4 residuals uses the pooled RMS of its kind."""
     patches = sorted({r["patch"] for r in rows})
-    own: dict[str, list[float]] = {p: loo_residuals(series(rows, p)) for p in patches}
+    own: dict[str, list[float]] = {p: loo_residuals(series(rows, p, ref)) for p in patches}
     kind = {r["patch"]: r.get("kind", "grey") for r in rows}
     pooled: dict[str, list[float]] = {}
     for p, res in own.items():
@@ -122,20 +125,20 @@ def u_interp(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     return out
 
 
-def bracket_ratios(rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+def bracket_ratios(rows: Sequence[dict[str, Any]], ref: str = REF_RATE) -> list[dict[str, Any]]:
     """Each non-60 row against the 60-Hz value of the SAME patch, interpolated linearly in time between the nearest
     60-Hz rows before and after it. A row without a 60-Hz reading on both sides is not used (listed, unbracketed)."""
-    ui = u_interp(rows)
+    ui = u_interp(rows, ref)
     out = []
     for r in rows:
-        if r.get("rate") == REF_RATE or not _usable(r):
+        if r.get("rate") == ref or not _usable(r):
             continue
-        s60 = series(rows, r["patch"])
+        s60 = series(rows, r["patch"], ref)
         t = float(r["t_s"])
         before = [a for a in s60 if float(a["t_s"]) < t]
         after = [b for b in s60 if float(b["t_s"]) > t]
         rec: dict[str, Any] = {k: r.get(k) for k in ("leg", "pass", "rate", "rate_hz", "patch", "kind", "code",
-                                                       "nominal_nits", "t_s", "y", "settled")}
+                                                       "nominal_nits", "t_s", "y", "settled", "source")}
         if not before or not after:
             rec["unbracketed"] = True
             out.append(rec)
@@ -227,12 +230,12 @@ def chi2_sf(chi2: float, dof: int) -> float:
 
 
 # ----------------------------------------------------------------------------- predictability
-def _dT(hz: float) -> float:
-    return 1000.0 / hz - 1000.0 / REF_HZ
+def _dT(hz: float, ref_hz: float = REF_HZ) -> float:
+    return 1000.0 / hz - 1000.0 / ref_hz
 
 
-def _df(hz: float) -> float:
-    return REF_HZ - hz
+def _df(hz: float, ref_hz: float = REF_HZ) -> float:
+    return ref_hz - hz
 
 
 def _wls_origin(xs: Sequence[float], ys: Sequence[float], us: Sequence[float]) -> dict[str, float]:
@@ -258,15 +261,18 @@ def _pooled(vals: Sequence[tuple[float, float]]) -> dict[str, float]:
             "p_value": chi2_sf(chi2, len(vals) - 1)}
 
 
-def predictability(comb: dict[str, dict[str, dict[str, Any]]], *, ref_low: str = "47.952") -> dict[str, Any]:
-    """The four questions of the design (section 3), on the GREY levels, against the frozen thresholds."""
+def predictability(comb: dict[str, dict[str, dict[str, Any]]], *, ref_low: str = "47.952",
+                   ref_hz: float = REF_HZ) -> dict[str, Any]:
+    """The four questions of the design (section 3), on the GREY levels, against the frozen thresholds. The named
+    tests (59.94 control, 48 = 47.952, the 50-Hz linearity point) run only where those rates were measured; the
+    per-level frame-period / frequency fits run over every measured rate against the reference ``ref_hz``."""
     y60_of: dict[str, float] = {}
     for pats in comb.values():
         for p, v in pats.items():
             if v.get("kind") == "grey":
                 y60_of.setdefault(p, v["y60"])
     greys = sorted(y60_of, key=y60_of.get)
-    rates = [r for r in ("47.952", "48", "50", "59.94") if r in comb]
+    rates = sorted(comb, key=lambda r: -float(next(iter(comb[r].values()))["rate_hz"]))
     per_level = []
     for p in greys:
         pts = {r: comb[r][p] for r in rates if p in comb[r]}
@@ -275,8 +281,8 @@ def predictability(comb: dict[str, dict[str, dict[str, Any]]], *, ref_low: str =
                                "u": {r: v["u"] for r, v in pts.items()}}
         if len(pts) >= 2:
             hz = {r: v["rate_hz"] for r, v in pts.items()}
-            xs_t = [_dT(hz[r]) for r in pts]
-            xs_f = [_df(hz[r]) for r in pts]
+            xs_t = [_dT(hz[r], ref_hz) for r in pts]
+            xs_f = [_df(hz[r], ref_hz) for r in pts]
             ys = [v["ln_ratio"] for v in pts.values()]
             us = [v["u"] for v in pts.values()]
             row["fit_period"] = _wls_origin(xs_t, ys, us)
@@ -297,8 +303,8 @@ def predictability(comb: dict[str, dict[str, dict[str, Any]]], *, ref_low: str =
     hz_of = {r: (sum(v["rate_hz"] for v in comb[r].values()) / len(comb[r])) for r in rates}
     out["rate_hz"] = hz_of
     if "50" in hz_of and ref_low in hz_of:
-        pT = _dT(hz_of["50"]) / _dT(hz_of[ref_low])
-        pF = _df(hz_of["50"]) / _df(hz_of[ref_low])
+        pT = _dT(hz_of["50"], ref_hz) / _dT(hz_of[ref_low], ref_hz)
+        pF = _df(hz_of["50"], ref_hz) / _df(hz_of[ref_low], ref_hz)
         vals = [(lv["p_50"]["p"], lv["p_50"]["u"]) for lv in per_level if "p_50" in lv]
         if vals:
             pool = _pooled(vals)
@@ -375,12 +381,13 @@ def dpq_code(y60: float, ratio: float, bits: int = 10) -> float:
 
 
 def trim_curves(comb: dict[str, dict[str, dict[str, Any]]], pred: Optional[dict[str, Any]] = None, *,
-                peak_nits: Optional[float] = None, meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+                peak_nits: Optional[float] = None, meta: Optional[dict[str, Any]] = None,
+                ref: str = REF_RATE, ref_hz: float = REF_HZ) -> dict[str, Any]:
     """The bake's input. Per measured rate, the grey knots sorted by y60: ratio, gain = 1 / ratio, ln_gain, u and
     the equivalent PQ-code shift. With a linearity verdict in ``pred``, also the per-level frame-period
     (or frequency) slope over all rates, so an unmeasured rate between the measured ones can be interpolated."""
     out: dict[str, Any] = {
-        "schema": SCHEMA, "reference": {"rate": REF_RATE, "hz": REF_HZ}, "mode": "HDR", **(meta or {}),
+        "schema": SCHEMA, "reference": {"rate": ref, "hz": ref_hz}, "mode": "HDR", **(meta or {}),
         "domain": "y60_nits = the 60-Hz light of a full-field grey at that drive. The MHC is calibrated, so it is "
                   "the PQ target light of the 1D LUT input to <1 % (the trim's slope makes that a <2e-4 error).",
         "apply": "multiply the TARGET light by g right ahead of the base calibration curve (after every other "
@@ -398,6 +405,7 @@ def trim_curves(comb: dict[str, dict[str, dict[str, Any]]], pred: Optional[dict[
             continue
         out["rates"][rate] = {
             "hz": knots[0]["rate_hz"], "frame_period_ms": 1000.0 / knots[0]["rate_hz"],
+            **({"source": knots[0]["source"]} if knots[0].get("source") else {}),
             "knots": [{"patch": v["patch"], "code": v["code"], "nominal_nits": v["nominal_nits"],
                        "y60_nits": v["y60"], "ratio": v["ratio"], "ln_ratio": v["ln_ratio"], "u_ln": v["u"],
                        "gain": 1.0 / v["ratio"], "ln_gain": -v["ln_ratio"],
@@ -413,9 +421,9 @@ def trim_curves(comb: dict[str, dict[str, dict[str, Any]]], pred: Optional[dict[
                 slopes.append({"patch": lv["patch"], "y60_nits": lv["y60"], "s": f["s"], "u_s": f["u_s"],
                                "chi2": f["chi2"], "dof": f["dof"]})
         out["model"] = {"usable_for_unmeasured_rates": bool(usable), "verdict": lin.get("verdict"),
-                        "axis": axis, "x": "1000/hz - 1000/60 (ms)" if axis == "period" else "60 - hz (Hz)",
+                        "axis": axis, "x": (f"1000/hz - 1000/{ref_hz:g} (ms)" if axis == "period" else f"{ref_hz:g} - hz (Hz)"),
                         "ln_ratio": "s(y60) * x; ln_gain = -s * x",
-                        "valid_hz": [min(pred["rate_hz"].values()), REF_HZ],
+                        "valid_hz": [min(pred["rate_hz"].values()), ref_hz],
                         "slopes": sorted(slopes, key=lambda s: s["y60_nits"])}
     return out
 
@@ -473,7 +481,8 @@ def trim_for_hz(trim: dict[str, Any], hz: float, y_nits: float, *, tol_hz: float
     """The gain at any refresh. A measured rate (within ``tol_hz``) uses its own knots. Another rate inside the
     measured span uses the model when the verdict allows it. Otherwise None: no trim, the caller keeps the 60-Hz
     profile."""
-    if abs(hz - REF_HZ) <= tol_hz:
+    ref_hz = float((trim.get("reference") or {}).get("hz") or REF_HZ)
+    if abs(hz - ref_hz) <= tol_hz:
         return 1.0
     for entry in trim.get("rates", {}).values():
         if abs(entry["hz"] - hz) <= tol_hz:
@@ -484,19 +493,25 @@ def trim_for_hz(trim: dict[str, Any], hz: float, y_nits: float, *, tol_hz: float
     lo, hi = m["valid_hz"]
     if not (lo - tol_hz <= hz <= hi + tol_hz):
         return None
-    x = (1000.0 / hz - 1000.0 / REF_HZ) if m["axis"] == "period" else (REF_HZ - hz)
+    x = (1000.0 / hz - 1000.0 / ref_hz) if m["axis"] == "period" else (ref_hz - hz)
     s = _interp_log([(k["y60_nits"], k["s"]) for k in m["slopes"]], y_nits, trim.get("peak_nits"))
     return math.exp(-s * x)
 
 
 def analyze(rows: Sequence[dict[str, Any]], *, peak_nits: Optional[float] = None,
-            meta: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    br = bracket_ratios(rows)
+            meta: Optional[dict[str, Any]] = None, ref: str = REF_RATE, ref_hz: float = REF_HZ) -> dict[str, Any]:
+    br = bracket_ratios(rows, ref)
     comb = combine(br)
-    pred = predictability(comb)
+    for pats in comb.values():                    # which rate source each combined point came from
+        for v in pats.values():
+            srcs = {r.get("source") for r in br if r.get("rate") == v["rate"] and r.get("patch") == v["patch"]}
+            srcs.discard(None)
+            if srcs:
+                v["source"] = "+".join(sorted(srcs))
+    pred = predictability(comb, ref_hz=ref_hz)
     return {"ratios": br, "combined": comb, "predictability": pred, "chromaticity": chromaticity(comb),
-            "channels": channel_test(comb), "u_interp": u_interp(rows),
-            "trim": trim_curves(comb, pred, peak_nits=peak_nits, meta=meta)}
+            "channels": channel_test(comb), "u_interp": u_interp(rows, ref),
+            "trim": trim_curves(comb, pred, peak_nits=peak_nits, meta=meta, ref=ref, ref_hz=ref_hz)}
 
 
 # ----------------------------------------------------------------------------- the DIP's refresh response
@@ -504,7 +519,9 @@ def analyze(rows: Sequence[dict[str, Any]], *, peak_nits: Optional[float] = None
 # response there (ratios, not gains) and DesktopLUT derives g = 1 / ratio itself at bake time. ``record`` below is the
 # step that puts a finished refresh-trim run into the DIP.
 RATIONALS: dict[str, tuple[int, int]] = {"60": (60, 1), "59.94": (60000, 1001), "50": (50, 1), "48": (48, 1),
-                                         "47.952": (48000, 1001)}
+                                         "47.952": (48000, 1001), "23.976": (24000, 1001), "24": (24, 1),
+                                         "25": (25, 1), "29.97": (30000, 1001), "30": (30, 1), "100": (100, 1),
+                                         "119.88": (120000, 1001), "120": (120, 1), "144": (144, 1)}
 # The frozen equality tests of the analysis (refresh_result.json "tests", PREREG_REFRESH.md): rate -> (the test, the
 # rate whose response it proved this one equal to). The reference rate's key = no effect.
 SAME_AS_TESTS: dict[str, tuple[str, str]] = {"59.94": ("P3_59_94_control", REF_RATE),
@@ -521,29 +538,40 @@ def response_from_run(trim: dict[str, Any], tests: dict[str, Any], *, run_id: st
     p5 = (tests.get("P5_luminance_only") or {}).get("per_rate") or {}
     p6 = (tests.get("P6_channel_independent") or {}).get("per_rate") or {}
     rates = []
+    ref = trim.get("reference") or {}
+    ref_key = str(ref.get("rate") or REF_RATE)
     for key, entry in sorted((trim.get("rates") or {}).items(), key=lambda kv: -float(kv[1]["hz"])):
-        if key not in RATIONALS:
-            raise ValueError(f"rate {key!r} is not in the catalogue {sorted(RATIONALS)}")
-        num, den = RATIONALS[key]
+        if entry.get("num") and entry.get("den"):
+            num, den = int(entry["num"]), int(entry["den"])
+        elif key in RATIONALS:
+            num, den = RATIONALS[key]
+        else:
+            raise ValueError(f"rate {key!r} has no rational and is not in the catalogue {sorted(RATIONALS)}")
         levels = [RefreshLevel(nits=float(k["y60_nits"]), ratio=float(k["ratio"]), u_ln=float(k["u_ln"]),
                                n=int(k.get("n_repeats") or 0), code=int((k.get("code") or [0])[0]))
                   for k in entry["knots"]]
         same = None
         if key in SAME_AS_TESTS and (tests.get(SAME_AS_TESTS[key][0]) or {}).get("ok") is True:
             same = SAME_AS_TESTS[key][1]
+            if same == REF_RATE:
+                same = ref_key
         chroma = p5.get(key) or {}
         dxy = [v for v in (chroma.get("max_dxy_grey"), chroma.get("max_dxy_colour")) if v is not None]
         rates.append(RefreshRate(key=key, num=num, den=den, levels=sorted(levels, key=lambda lv: lv.nits),
                                  hz_measured=(hz_measured or {}).get(key), same_as=same,
                                  max_dxy=max(dxy) if dxy else None,
-                                 channel_independent=(bool(p6[key]) if key in p6 else None)))
+                                 channel_independent=(bool(p6[key]) if key in p6 else None),
+                                 source=entry.get("source"), proof=dict(entry.get("proof") or {})))
     model = trim.get("model") or {}
-    num, den = RATIONALS[REF_RATE]
+    if ref.get("num") and ref.get("den"):
+        num, den = int(ref["num"]), int(ref["den"])
+    else:
+        num, den = RATIONALS.get(ref_key, RATIONALS[REF_RATE])
     return RefreshResponse(measured=measured, run_id=run_id, rates=rates,
-                           reference={"key": REF_RATE, "num": num, "den": den}, identity=dict(identity),
+                           reference={"key": ref_key, "num": num, "den": den}, identity=dict(identity),
                            conditions=dict(conditions), peak_nits=trim.get("peak_nits"),
                            interpolable=bool(model.get("usable_for_unmeasured_rates", False)),
-                           verdict=model.get("verdict"))
+                           verdict=model.get("verdict"), vrr=dict(trim.get("vrr") or {}) or None)
 
 
 def run_problems(evidence: dict[str, Any], trim: dict[str, Any], result: dict[str, Any]) -> list[str]:
@@ -605,9 +633,11 @@ def response_for_run_dir(run_dir: Path | str) -> tuple[Any, list[str], dict[str,
     meter = evidence.get("meter") or {}
     instruments = (meter.get("resolve") or {}).get("instruments") or [{}]
     conditions = {"mode": trim.get("mode"), "through": "the installed MHC profile",
+                  "rate_sources": sorted({str(e.get("source") or "mode") for e in (trim.get("rates") or {}).values()}),
                   "mhc_profile": through.get("mhc_profile"), "active_perm": through.get("active_perm"),
                   "mhc_source": through.get("source_file"), "layers": through.get("layers"),
-                  "cube": through.get("cube"), "patch": "full field, time-bracketed against the reference rate",
+                  "cube": through.get("cube"),
+                  "patch": trim.get("patch") or "full field, time-bracketed against the reference rate",
                   "instrument": instruments[0].get("description"),
                   "correction": (meter.get("correction") or {}).get("file")}
     started = str(evidence.get("started") or "")

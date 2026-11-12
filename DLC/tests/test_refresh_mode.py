@@ -35,7 +35,8 @@ def test_struct_layouts():
 
 
 def test_catalogue_and_legacy_integers():
-    assert [rm.legacy_hz(r) for r in rm.RATES] == [60, 59, 50, 48, 47]
+    assert [rm.legacy_hz(r) for r in rm.RATES][:5] == [60, 59, 50, 48, 47]
+    assert [rm.legacy_hz(r) for r in rm.RATES][5:] == [23, 24, 25, 29, 30, 100, 119, 120, 144]
     assert rm.classify_hz(47.952) == "47.952" and rm.classify_hz(48.0) == "48"
     assert rm.classify_hz(59.997) == "60"                    # a CVT-RB "60"
     assert rm.classify_hz(59.94) == "59.94"
