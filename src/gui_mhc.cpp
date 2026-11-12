@@ -3,7 +3,6 @@
 
 #include "fald.h"
 #include "gui_mhc.h"
-#include "gui_shared.h"
 #include "gui.h"
 #include "globals.h"
 #include "settings.h"
@@ -1420,7 +1419,6 @@ bool RebakePendingMhcProfiles() {
                 auto& m = isHDR ? g_gui.monitorSettings[i].hdrMHC : g_gui.monitorSettings[i].sdrMHC;
                 m.matrixRebakePending = false;   // also when there was nothing to regenerate
             }   // a failed re-bake stays pending (saved as the old revision): retried on a later start
-            if (i == g_gui.currentMonitor) UpdateMhcInfoDisplay(i, isHDR);
             any = true;
         }
     }
@@ -1604,7 +1602,6 @@ void RefreshDesktopGammaSdrWhite(const char* reason) {
                 if (RebakeHdrMhcForSdrWhite(i, nits, &failed)) {
                     settingsChanged = true;
                     recordedNits = nits;
-                    if (i == g_gui.currentMonitor) UpdateMhcInfoDisplay(i, true);
                 }
                 if (failed) {
                     s_sdrWhiteBackoff.Failed(i, nits, now);   // remove/re-associate flickers: never every tick
@@ -1642,103 +1639,4 @@ void RefreshDesktopGammaSdrWhite(const char* reason) {
     }
     if (maintenanceBusy && g_gui.hwndMain)
         SetTimer(g_gui.hwndMain, SDR_WHITE_CHECK_TIMER_ID, SDR_WHITE_CHECK_DEBOUNCE_MS, nullptr);
-}
-
-// ============================================================================
-// SECTION: MHC Info Display
-// ============================================================================
-
-// Update MHC info labels in the appropriate SDR or HDR groupbox
-void UpdateMhcInfoDisplay(int monitorIndex, bool isHDR) {
-    if (monitorIndex < 0 || monitorIndex >= (int)g_gui.monitorSettings.size()) return;
-    const auto& mhc = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
-                             : g_gui.monitorSettings[monitorIndex].sdrMHC;
-
-    HWND hwndStatus = isHDR ? g_gui.hwndHdrMhcStatus : g_gui.hwndMhcStatus;
-    HWND* coords = isHDR ? g_gui.hwndHdrMhcIccCoords : g_gui.hwndMhcIccCoords;
-
-    if (!hwndStatus) return;
-
-    bool installed = !mhc.profileName.empty();
-
-    // Status text with indicator
-    if (installed) {
-        SetWindowText(hwndStatus, (L"\x25CF Active: " + mhc.profileName).c_str());
-    } else {
-        SetWindowText(hwndStatus, L"\x25CB Not installed");
-    }
-
-    // Show target display primaries from MHC settings (not ICC file colorants)
-    // SDR ICC colorants are always sRGB by design, which is useless info
-    if (installed && mhc.primariesEnabled) {
-        // Resolve preset to actual primaries
-        const DisplayPrimaries& p = (mhc.primariesPreset >= 0 && mhc.primariesPreset < g_numPresetPrimaries - 1)
-            ? g_presetPrimaries[mhc.primariesPreset]
-            : mhc.customPrimaries;
-        float vals[8] = { p.Rx, p.Ry, p.Gx, p.Gy, p.Bx, p.By, p.Wx, p.Wy };
-        for (int i = 0; i < 8; i++) {
-            if (coords[i]) {
-                wchar_t buf[16];
-                _swprintf_s_l(buf, _countof(buf), L"%.4f", GetCLocale(), vals[i]);
-                SetWindowText(coords[i], buf);
-            }
-        }
-    } else {
-        for (int i = 0; i < 8; i++)
-            if (coords[i]) SetWindowText(coords[i], L"");
-    }
-
-    // Show/hide metadata labels
-    HWND* metaLabels = isHDR ? g_gui.hwndHdrMhcMetaLabels : g_gui.hwndMhcMetaLabels;
-    if (installed && !mhc.metaPrimaries.empty()) {
-        std::wstring primText = L"Primaries: " + mhc.metaPrimaries;
-        if (metaLabels[0]) { SetWindowText(metaLabels[0], primText.c_str()); ShowWindow(metaLabels[0], SW_SHOW); }
-    } else {
-        if (metaLabels[0]) { SetWindowText(metaLabels[0], L""); ShowWindow(metaLabels[0], SW_HIDE); }
-    }
-    if (installed && !mhc.metaGamma.empty()) {
-        std::wstring gammaText = L"Gamma: " + mhc.metaGamma;
-        if (metaLabels[1]) { SetWindowText(metaLabels[1], gammaText.c_str()); ShowWindow(metaLabels[1], SW_SHOW); }
-    } else {
-        if (metaLabels[1]) { SetWindowText(metaLabels[1], L""); ShowWindow(metaLabels[1], SW_HIDE); }
-    }
-    // Third label: HDR shows the profile's peak; SDR (no peak metadata) shows what a white-balance target
-    // costs in peak luminance (the profile is scaled so the target white is reached at full drive).
-    float wbCostPct = 0.0f;
-    if (installed && !isHDR && mhc.whiteBalanceEnabled) {
-        MHC2ProfileParams mp;
-        BuildMHC2MatrixParams(mhc, false, mp);
-        wbCostPct = (1.0f - MhcSdrWhiteScale(mp)) * 100.0f;
-    }
-    if (installed && isHDR && mhc.metaPeakNits > 0.0f) {
-        wchar_t peakBuf[64];
-        _swprintf_s_l(peakBuf, _countof(peakBuf), L"Peak: %.0f nits", GetCLocale(), mhc.metaPeakNits);
-        if (metaLabels[2]) { SetWindowText(metaLabels[2], peakBuf); ShowWindow(metaLabels[2], SW_SHOW); }
-    } else if (wbCostPct >= 0.05f) {
-        wchar_t costBuf[64];
-        _swprintf_s_l(costBuf, _countof(costBuf), L"White balance: peak -%.1f %%", GetCLocale(), wbCostPct);
-        if (metaLabels[2]) { SetWindowText(metaLabels[2], costBuf); ShowWindow(metaLabels[2], SW_SHOW); }
-    } else {
-        if (metaLabels[2]) { SetWindowText(metaLabels[2], L""); ShowWindow(metaLabels[2], SW_HIDE); }
-    }
-}
-
-// Helper to recalculate primaries matrix and apply live update
-// isHDR parameter controls which settings struct is modified
-void ApplyPrimariesChange(bool isHDR) {
-    if (g_gui.currentMonitor < 0 || g_gui.currentMonitor >= (int)g_gui.monitorSettings.size()) {
-        return;
-    }
-    // Primaries matrix and white balance gains are computed in ConvertColorCorrection()
-    // Just trigger the live update with current stored values
-    if (g_gui.isRunning) {
-        UpdateColorCorrectionLive(g_gui.currentMonitor, isHDR);
-    } else {
-        auto& cc = isHDR ? g_gui.monitorSettings[g_gui.currentMonitor].hdrColorCorrection
-                         : g_gui.monitorSettings[g_gui.currentMonitor].sdrColorCorrection;
-        if (cc.primariesEnabled) {
-            StartProcessing();
-        }
-    }
-    UpdateGUIState();
 }

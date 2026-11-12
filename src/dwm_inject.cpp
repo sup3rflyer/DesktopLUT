@@ -2469,3 +2469,22 @@ bool DwmHookHasTwinMonitors()
             if (mons[i].w == mons[j].w && mons[i].h == mons[j].h && mons[i].bpc == mons[j].bpc) return true;
     return false;
 }
+
+std::vector<std::vector<DwmHookTwinPos>> DwmHookTwinGroups()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
+    const auto& mons = EnumerateDxgiMonitors();
+    std::vector<std::vector<DwmHookTwinPos>> groups;
+    std::vector<bool> taken(mons.size(), false);
+    for (size_t i = 0; i < mons.size(); i++) {
+        if (taken[i]) continue;
+        std::vector<DwmHookTwinPos> g = { DwmHookTwinPos{ mons[i].left, mons[i].top } };
+        for (size_t j = i + 1; j < mons.size(); j++) {
+            if (taken[j] || mons[i].w != mons[j].w || mons[i].h != mons[j].h || mons[i].bpc != mons[j].bpc) continue;
+            g.push_back(DwmHookTwinPos{ mons[j].left, mons[j].top });
+            taken[j] = true;
+        }
+        if (g.size() > 1) groups.push_back(std::move(g));
+    }
+    return groups;
+}

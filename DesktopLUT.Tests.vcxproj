@@ -93,12 +93,7 @@
     <ClCompile Include="src\windows_tonemap.cpp" />
     <ClCompile Include="src\refresh_trim.cpp" />
     <ClCompile Include="src\gui.cpp" />
-    <ClCompile Include="src\gui_layout.cpp" />
-    <ClCompile Include="src\gui_shared.cpp" />
     <ClCompile Include="src\gui_mhc.cpp" />
-    <ClCompile Include="src\gui_mhc_dialog.cpp" />
-    <ClCompile Include="src\gui_grayscale.cpp" />
-    <ClCompile Include="src\gui_whitelist.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
     <ClCompile Include="src\monitor_identity.cpp" />
     <ClCompile Include="src\uninstall.cpp" />
@@ -173,6 +168,7 @@
     <ClCompile Include="tests\test_displayconfig.cpp" />
     <ClCompile Include="tests\test_monitor_identity.cpp" />
     <ClCompile Include="tests\test_uninstall.cpp" />
+    <ClCompile Include="tests\test_hub.cpp" />
     <ClCompile Include="tests\test_settings.cpp" />
     <ClCompile Include="tests\test_ini_roundtrip.cpp" />
     <ClCompile Include="tests\test_calib_snapshot.cpp" />
@@ -259,9 +255,7 @@
     <ClInclude Include="src\analysis.h" />
     <ClInclude Include="src\processing.h" />
     <ClInclude Include="src\gui.h" />
-    <ClInclude Include="src\gui_shared.h" />
     <ClInclude Include="src\gui_mhc.h" />
-    <ClInclude Include="src\gui_whitelist.h" />
     <ClInclude Include="src\displayconfig.h" />
     <ClInclude Include="src\calib_snapshot.h" />
     <ClInclude Include="src\mhc.h" />

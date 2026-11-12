@@ -134,18 +134,19 @@ refresh-rate trim, the readers for DLC's files, the interface model, and the sha
 | `src/dwm_hook_stability.h`, `src/dwm_hook_build.*` | When the hook gives up and falls back to the overlay; whether it was verified against the running `dwmcore.dll` |
 | `src/fald.*`, `src/fald_*_status.*` | FALD layer, overlay side; the governors' status for the UI and the pipe |
 | `src/desktoplut_ipc_server.*`, `src/ipc_*.h`, `src/calib_snapshot.h` | The calibration pipe (§10); what a calibration session captures and restores |
-| `src/actions/` | `act::*`: every user action, shared by both windows and the pipe; live-layer reconcile; event log |
+| `src/actions/` | `act::*`: every user action, shared by the interface, the tray, the hotkeys and the pipe; live-layer reconcile; event log |
 | `src/ui/` | The ImGui interface: window, per-frame snapshot, model (pixel path, lights), pages, editors, themes, DLC tab |
 | `src/dlc/` | Tolerant readers for DLC's files (records, live run state) |
-| `src/gui*.cpp` | The classic Win32 window and the hidden hub window (tray, timers, hotkeys, pipe) |
+| `src/gui.cpp`, `src/gui_mhc.cpp` | The hidden hub window (message loop, tray, timers, hotkeys, pipe, display changes, the MHC drop defence, the hook watchdog); MHC profile generation and the permutation cache. No visible window of its own (the names predate the interface) |
 | `shared/` | Code both the app and the DLL compile: hook config, the FALD layer (§9), peak detection, tone curves, dither, the MHC scanout stage |
 | `dwm_hook/` | `DwmHook.dll`: hooks, rendering, FALD in DWM (§7) |
 | `tests/` | doctest suite (§4) |
 | `tools/` | Developer scripts: ICC inspector, frame-pacer log analysis, blue noise, logo, a DWM clock probe, a `dwmcore.pdb` symbol resolver |
 | `DLC/` | The calibrator (Python, §11) |
 
-How the two windows fit together: the hub window (`g_gui.hwndMain`) owns the tray, timers, hotkeys and the pipe. The
-ImGui window runs on the same GUI thread with its own D3D11 device and draws only when something changes. Its widgets
+How the two windows fit together: the hub window (`g_gui.hwndMain`, class `DesktopLUT_GUI`, never shown) owns the
+tray, timers, hotkeys and the pipe. A second launch finds it and asks it to show the interface. The ImGui window is
+the only visible one and runs on the same GUI thread with its own D3D11 device and draws only when something changes. Its widgets
 never call actions directly: they `ui::Post` a command, which runs after the frame is presented (actions can pump
 messages, which would re-enter the frame). Frames draw from a snapshot copied under `g_monitorSettingsMutex`, never
 from references into `g_gui.monitorSettings`.
@@ -156,8 +157,8 @@ stays on.
 
 ## 6. Adding features
 
-1. **New setting**: `types.h` struct → `settings.cpp` load/save → an `act::*` action in `src/actions` → the UI (new
-   interface in `src/ui`, and the classic control if it has one) → `processing.cpp` conversion.
+1. **New setting**: `types.h` struct → `settings.cpp` load/save → an `act::*` action in `src/actions` → the
+   interface in `src/ui` → `processing.cpp` conversion.
    - Save through the `WritePrivateProfile*` helpers / `IniWriteString` in `settings.cpp`, never
      `WritePrivateProfileStringW` directly. `SaveSettings` runs inside an `IniWriteBatch` that skips unchanged keys
      (each raw Win32 write rewrites the whole file; hundreds of them took seconds on the GUI thread).
@@ -166,8 +167,8 @@ stays on.
 2. **New shader parameter**: the constant buffer in `shader.h` → `RenderMonitor()` in `render.cpp`. Static-assert
    constant-buffer sizes.
 3. **New hotkey**: constant in `types.h` → `globals.h/cpp` (`std::atomic<char>` for the key: read by the render and
-   processing threads, written by settings load) → `settings.cpp` → the Settings UI → `processing.cpp`
-   (`MOD_NOREPEAT`) → `WndProc()` in `render.cpp`.
+   processing threads, written by settings load) → `settings.cpp` → the Settings UI (`SettingsHotkeys`) →
+   `act::RegisterHotkeys` / `act::ApplyHotkeyRegistration` (`MOD_NOREPEAT`, on the hub window) → `act::OnHotkey`.
 4. **New recovery scenario**: in `RenderMonitor()` or `RenderAll()`, with a backoff.
 5. **New MHC feature**: `MHC2ProfileParams` → `mhc.cpp` / `mhc_icc.cpp` → the UI → settings →
    `ComputeMhcMetadata()` if it needs labels. If it is a switchable variant, it is a permutation bit; if it follows

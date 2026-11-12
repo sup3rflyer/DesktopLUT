@@ -137,7 +137,6 @@ extern std::atomic<char> g_hotkeyGammaKey;        // Key for gamma toggle (defau
 extern std::atomic<char> g_hotkeyHdrKey;          // Key for HDR toggle (default 'Z')
 extern std::atomic<char> g_hotkeyAnalysisKey;     // Key for analysis toggle (default 'X')
 extern std::atomic<bool> g_startMinimized;        // Start minimized to tray
-extern bool g_uiClassic;                          // [UI] Interface=classic: the classic window instead of the new one (GUI thread)
 extern std::wstring g_dlcFolder;                  // [UI] DlcFolder: where DLC keeps its runs; empty = auto-detect (GUI thread)
 extern std::wstring g_dlcFolderLast;              // [UI] DlcFolderLast: the folder auto-detect last found DLC in (GUI thread)
 extern int g_uiTheme;                             // [UI] Theme=dark|gray|light: 0 / 1 / 2 (GUI thread)
@@ -246,8 +245,3 @@ extern std::atomic<bool> g_mhcEditDialogOpen;  // Suppress profile monitoring du
 
 extern GUIState g_gui;
 
-// ============================================================================
-// Grayscale Editor
-// ============================================================================
-
-extern GrayscaleEditorData* g_grayscaleEditor;

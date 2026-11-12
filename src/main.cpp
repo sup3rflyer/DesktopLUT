@@ -66,18 +66,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLi
             CloseHandle(g_singleInstanceMutex);
             return code;
         }
-        // Another instance is running: ask it to show the interface it uses (the classic window is its
-        // hub; the new one is a separate window only it knows about). This process was just launched by
-        // the user, so it may hand the foreground on.
+        // Another instance is running: ask its hub (a hidden window) to show the interface, a separate window only
+        // it knows about. This process was just launched by the user, so it may hand the foreground on.
         if (existingWnd) {
             DWORD pid = 0;
             GetWindowThreadProcessId(existingWnd, &pid);
             if (pid) AllowSetForegroundWindow(pid);
             const UINT showUi = RegisterWindowMessageW(DESKTOPLUT_SHOW_UI_MESSAGE);
-            if (!showUi || !PostMessageW(existingWnd, showUi, 0, 0)) {
-                ShowWindow(existingWnd, SW_RESTORE);
-                SetForegroundWindow(existingWnd);
-            }
+            if (showUi) PostMessageW(existingWnd, showUi, 0, 0);   // never shown itself: the hub has nothing to show
         }
         CloseHandle(g_singleInstanceMutex);
         return 0;

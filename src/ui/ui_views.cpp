@@ -9,7 +9,6 @@
 #include "actions/logcap.h"
 #include "actions/reconcile.h"
 #include "dlc/dlc_scan.h"
-#include "gui_whitelist.h"
 #include "monitor_identity.h"
 #include "ui_notices.h"
 #include "version.h"
@@ -821,7 +820,7 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
             const unsigned v = lag == 1 ? FALD_TEMPORAL_PANEL : FALD_TEMPORAL_OFF; bool c = s.temporalMode != v; s.temporalMode = v; return c; });
     EndRow(row);
 
-    // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields the classic rows have; the rest
+    // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields that have a row; the rest
     // are INI / pipe only. The fields stay in place, disabled, while it is off.
     const FaldStarfieldSettings& sf = f.star;
     auto starField = [&shared](act::FaldStarField field, float v) {
@@ -1522,19 +1521,10 @@ void DrawPipelinePage(const Snapshot& snap, ViewState& vs) {
 // ---------------------------------------------------------------------------------------------
 // Settings
 
-void SettingsGeneral() {
-    RowCtx row = BeginRow("INTERFACE");
-    RowTip(row, "Classic: the previous window. The tray switches too.");
-    RowPlace(row);
-    static const char* const kUi[] = { "NEW", "CLASSIC" };
-    const int pick = Segmented("##set_ui", kUi, 2, g_uiClassic ? 1 : 0, 80);
-    if (pick >= 0) {
-        const bool classic = pick == 1;
-        Post([classic]() { SetInterfaceClassic(classic); });
-    }
-    EndRow(row);
+void SettingsTwinRouting(const Snapshot& snap);   // ENGINE's last rows (below)
 
-    row = BeginRow("THEME");
+void SettingsGeneral() {
+    RowCtx row = BeginRow("THEME");
     RowTip(row, "Dark: Instrument. Gray: softer greys. Light: Windows 98 colours.");
     RowPlace(row);
     static const char* const kThemes[] = { "DARK", "GRAY", "LIGHT" };
@@ -1616,6 +1606,79 @@ void SettingsEngine(const Snapshot& snap, ViewState& vs) {
     if (RowButtons(row, "set_gwl", { "WHITELIST" }) == 0) OpenWhitelist(vs, 1);
     RowText(row, listText(g_gammaWhitelistRaw), g_gammaWhitelistRaw.empty() ? pal::InkFaint : pal::InkDim);
     EndRow(row);
+
+    SettingsTwinRouting(snap);
+}
+
+// Identical twin displays (same size and bit depth: the DWM hook cannot tell them apart by themselves): which one its
+// 3D LUT reaches. The last rows of ENGINE, drawn only on a rig with twins and whatever the engine, so switching DWM HOOK
+// moves nothing. The hook decides after every injection; these are the retry and the manual override.
+// Twins that share a name (until renamed, they do) are told apart by where they sit: from the pair's desktop rects,
+// else the live index.
+std::string TwinWhere(const Snapshot& snap, const HookRoutingTwin& t, const std::vector<HookRoutingTwin>& group) {
+    MONITORINFO mi = { sizeof(mi) };
+    const DisplayRow& r = snap.live[(size_t)t.monitor];
+    if (group.size() == 2 && r.hmon && GetMonitorInfo(r.hmon, &mi)) {
+        const HookRoutingTwin& o = group[0].monitor == t.monitor ? group[1] : group[0];
+        MONITORINFO oi = { sizeof(oi) };
+        if (o.monitor >= 0 && o.monitor < (int)snap.live.size() && snap.live[(size_t)o.monitor].hmon &&
+            GetMonitorInfo(snap.live[(size_t)o.monitor].hmon, &oi)) {
+            const long dx = mi.rcMonitor.left - oi.rcMonitor.left, dy = mi.rcMonitor.top - oi.rcMonitor.top;
+            if (dx != 0 && std::abs(dx) >= std::abs(dy)) return dx < 0 ? "LEFT" : "RIGHT";
+            if (dy != 0) return dy < 0 ? "TOP" : "BOTTOM";
+        }
+    }
+    return "#" + std::to_string(t.monitor + 1);
+}
+
+// "NAME  LEFT identified  ·  RIGHT guessed" for a same-named pair, else "NAME A identified  ·  NAME B guessed".
+std::string TwinsText(const Snapshot& snap, const std::vector<HookRoutingTwin>& group) {
+    bool sameName = true;
+    for (const HookRoutingTwin& t : group) {
+        if (t.monitor < 0 || t.monitor >= (int)snap.live.size()) return "\xE2\x80\x94";
+        if (snap.live[(size_t)t.monitor].name != snap.live[(size_t)group[0].monitor].name) sameName = false;
+    }
+    std::string text = sameName ? Utf8(snap.live[(size_t)group[0].monitor].name) + "  " : std::string();
+    for (size_t k = 0; k < group.size(); k++) {
+        const HookRoutingTwin& t = group[k];
+        if (k) text += "  \xC2\xB7  ";
+        text += sameName ? TwinWhere(snap, t, group) : Utf8(snap.live[(size_t)t.monitor].name);
+        text += " " + (t.how.empty() ? std::string("not assigned") : Utf8(t.how));
+    }
+    return text;
+}
+
+void SettingsTwinRouting(const Snapshot& snap) {
+    const HookRoutingView& rt = snap.routing;
+    if (rt.twins.empty()) return;
+    const bool live = snap.hookMode && snap.hookActive;
+    RowCtx row = BeginRow("TWIN ROUTING");
+    RowTip(row, "Identical displays: which one the DWM hook's 3D LUT reaches.\n"
+                "Settled after every injection by a square flashed in each corner.\n"
+                "IDENTIFY: flash again. SWAP: exchange a pair, where flashing cannot tell.");
+    ImGui::BeginDisabled(!live || rt.identifying);
+    if (RowButtons(row, "set_twin_id", { "IDENTIFY" }) == 0) Post([]() { act::IdentifyHookTwins(); });
+    ImGui::EndDisabled();
+    RowText(row, !snap.hookMode ? "DWM HOOK OFF" : !live ? "DWM HOOK NOT RUNNING" : rt.identifying ? "IDENTIFYING\xE2\x80\xA6" : "",
+            pal::InkDim, Font::Label, kSizeLabel);
+    EndRow(row);
+
+    for (size_t i = 0; i < rt.twins.size();) {
+        std::vector<HookRoutingTwin> group;
+        const int g = rt.twins[i].group;
+        while (i < rt.twins.size() && rt.twins[i].group == g) group.push_back(rt.twins[i++]);
+        row = BeginRow(g == 0 ? "TWINS" : ("TWINS " + std::to_string(g + 1)).c_str());
+        RowTip(row, group.size() == 2 ? "How each display was matched to its LUT: identified (by the flash), "
+                                        "unambiguous, guessed (first come), inferred.\nSWAP exchanges the two and re-injects."
+                                      : "More than two alike: assigned over the calibration pipe (hook.set_routing).");
+        ImGui::BeginDisabled(!live || rt.identifying || rt.fileStale || group.size() != 2);
+        const bool swap = RowButtons(row, ("set_twin_swap" + std::to_string(g)).c_str(), { "SWAP" }) == 0;
+        ImGui::EndDisabled();
+        if (swap && group[0].monitor >= 0 && group[0].monitor < (int)snap.live.size())
+            PostTo(snap.live[(size_t)group[0].monitor], [](int mon) { act::SwapHookRoutingWithTwin(mon); });
+        RowText(row, TwinsText(snap, group), live ? pal::Ink : pal::InkFaint, Font::Body, kSizeBody);
+        EndRow(row);
+    }
 }
 
 void SettingsHotkeys() {

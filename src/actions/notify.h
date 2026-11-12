@@ -5,7 +5,7 @@
 // and appends to a bounded ring, then calls the registered listener (which must itself be
 // thread-safe; the UI's is a coalesced PostMessage). Readers take a copy with Snapshot().
 //
-// SetStatus() (gui.h) records here too, so the classic one-line status bar and the new UI's Events
+// SetStatus() (gui.h) records here too, so the interface's footer and its Events
 // page read the same history.
 
 #include <windows.h>
