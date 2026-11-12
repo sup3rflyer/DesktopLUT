@@ -233,6 +233,13 @@ def clock_factors32(n_a: int, k: int, closure: float, parity: int) -> tuple:
     return a(ts0), a(tp0), a(ts1), a(tp1), w[0], w[1]
 
 
+# The clock at rest's flags (shared/fald_temporal.h FALD_CLOCK_REST_*; CB word 45). Pinned against the header by DLC
+# tests/test_fald_paneltime_gpu.py.
+REST_ALLOWED = 1      # pass 1c may rest this run
+REST_RESET = 2        # the watch starts its per-zone levels over (the first clock run after a seed)
+REST_STILL = 4        # no run with new content committed the target since the last watch
+
+
 def clock_robust_true32(t0, e0, t1, e1, w0, w1, est) -> np.ndarray:
     """Pass 1c's unknown-parity B_true map (float32, the HLSL's order): tr = w0 (t0 - e0) + w1 (t1 - e1), lim = CAP x
     est, est + clamp(tr, -lim, lim); :func:`paneltime.robust_transient` is the float64 reference."""
@@ -255,14 +262,35 @@ class GpuPanelDriveState:
     refresh): nothing advances, the previous frame's maps are read again and the commit REPLACES the target (the later
     frame is the one the panel shows); inside the seeding refresh (n = 0) it re-seeds. With no valid state (first frame,
     after :meth:`reset` = the C++ reset rules) the pass does not run, both rounds see their own instantaneous drives (the
-    stateless layer) and the commit seeds both clocks with the round-1 drives: the panel is taken as settled on it."""
+    stateless layer) and the commit seeds both clocks with the round-1 drives: the panel is taken as settled on it.
 
-    def __init__(self, closure: float = 0.72, parity: int = -1):
+    THE CLOCK AT REST (shared/fald_temporal.h above ``FALD_CLOCK_REST_ALLOWED``; the C++ ``FaldClockRestBegin`` /
+    ``FaldTemporalEndRun`` bookkeeping + the HLSL watch pass 1c-0 ``g_faldPanelClockWatchSource``): every clock run (k >= 1
+    with a valid state) is numbered (:attr:`run_seq`) and given the flags :data:`REST_RESET` (the first clock run after a
+    seed / reset: the per-zone :attr:`levels` start over and it never rests), :data:`REST_STILL` (no commit with
+    ``new_content`` since the previous clock run) and :data:`REST_ALLOWED` (otherwise, while :attr:`rest_enabled`). The
+    watch keeps per zone (c, q, n, 0) — the target last seen, the distinct one before it, the returns in a row — exactly as
+    the HLSL does in float32, and a zone is confined when both clocks' states (before this run's advance) lie between the
+    pair's two targets (n >= 2) or equal c bit for bit. All confined and allowed: AT REST — the states and both maps stand
+    (the refresh index and the factors still advance: CPU bookkeeping). :attr:`words` = the GPU words buffer
+    ([0] the last clock run with a zone not confined, [1] this run's number, [2] its flags, [3] 0); it and the run number
+    live with the resources (the constructor), not with the state (:meth:`reset`), like the C++. :attr:`at_rest` = the last
+    clock run rested (a k = 0 run keeps it; :meth:`reset` clears it), :attr:`rest_runs` = how many clock runs rested.
+    ``rest=False`` = ``g_faldClockRestOverride = 0``: the clock never rests (the arithmetic before the rule, bit for bit)."""
+
+    def __init__(self, closure: float = 0.72, parity: int = -1, rest: bool = True):
         from .paneltime import CLOSURE_MAX, CLOSURE_MIN, MODE_PANEL
         self.mode = MODE_PANEL
         self.closure = float(min(max(float(closure), CLOSURE_MIN), CLOSURE_MAX))
         from .paneltime import PARITY_MEAN
         self.parity = int(parity) if parity in (0, 1, PARITY_MEAN) else -1   # -2 = the plain mean (the A/B's legacy arm)
+        self.rest_enabled = bool(rest)                # False = g_faldClockRestOverride 0 (never rests)
+        self.run_seq = 0                              # C++ clkRunSeq: the number of the last clock run (uint32, 0 = none)
+        self.rest_flags = 0                           # C++ clkRestFlags: the last clock run's CB word 45
+        self.words = np.zeros(4, dtype=np.uint32)     # the watch's words buffer (zeroed at creation, kept across resets)
+        self.levels: Optional[np.ndarray] = None      # (rows, cols, 4) float32 (c, q, n, 0); None = never written
+        self.target_from_content = False              # C++ clkTargetFromContent (kept across resets, like the C++)
+        self.rest_runs = 0                            # clock runs that rested (C++ clkRestRuns, without the readback lag)
         self.reset()
 
     def reset(self) -> None:
@@ -272,6 +300,58 @@ class GpuPanelDriveState:
         self.true: Optional[np.ndarray] = None        # this frame's maps (C++ driveFiltTex / clkEstTex)
         self.est: Optional[np.ndarray] = None
         self.factors: Optional[tuple] = None
+        self.levels_valid = False                     # C++ clkLevelsValid: the next clock run starts the levels over
+        self.at_rest = False                          # the last clock run rested (cleared like C++ clkRestKnown)
+
+    def _rest_begin(self) -> int:
+        """C++ ``FaldClockRestBegin``: number the clock run and give it its flags."""
+        self.run_seq = (self.run_seq + 1) & 0xFFFFFFFF
+        if self.run_seq == 0:                         # (wrapped: start over)
+            self.run_seq = 1
+            self.levels_valid = False
+        f = 0
+        if not self.levels_valid:
+            f |= REST_RESET
+        elif self.rest_enabled:
+            f |= REST_ALLOWED
+        if not self.target_from_content:
+            f |= REST_STILL
+        self.rest_flags = f
+        self.levels_valid = True
+        self.target_from_content = False
+        return f
+
+    def _watch(self, flags: int) -> bool:
+        """HLSL pass 1c-0 (``g_faldPanelClockWatchSource``), float32, exact comparisons; returns "at rest" the way pass 1c
+        decides it (ALLOWED and the words' mark is not this run's number). Reads the states BEFORE this run's advance."""
+        d = np.asarray(self.d_prev, dtype=np.float32)
+        s0, s1 = self.s
+        seq = np.uint32(self.run_seq)
+        self.words[1] = seq
+        self.words[2] = np.uint32(flags)
+        if (flags & REST_RESET) or self.levels is None:     # (None: only before any RESET, which the C++ cannot reach)
+            lv = np.zeros(d.shape + (4,), dtype=np.float32)
+            lv[..., 0] = d; lv[..., 1] = d
+        else:
+            lv = self.levels
+            c, q, n = lv[..., 0], lv[..., 1], lv[..., 2]
+            moved = d != c                                  # (a NaN target always "moves")
+            if flags & REST_STILL:          # the loop moved it: (d, c, d == q ? min(n + 1, 2) : 0, 0)
+                n_new = np.where(d == q, np.minimum(n + f32(1.0), f32(2.0)), f32(0.0)).astype(np.float32)
+                q_new = c
+            else:                           # the content moved it: no pair
+                n_new = np.zeros_like(n)
+                q_new = d
+            new = np.stack([d, q_new, n_new, np.zeros_like(d)], axis=-1).astype(np.float32)
+            lv = np.where(moved[..., None], new, lv).astype(np.float32)
+        self.levels = lv
+        c, q, pair = lv[..., 0], lv[..., 1], lv[..., 2] >= f32(2.0)
+        lo = np.where(pair, np.minimum(c, q), c)
+        hi = np.where(pair, np.maximum(c, q), c)
+        confined = (s0 >= lo) & (s0 <= hi) & (s1 >= lo) & (s1 <= hi)      # NaN anywhere: False = not confined
+        if not bool(np.all(confined)):
+            self.words[0] = seq
+        return bool(flags & REST_ALLOWED) and int(self.words[0]) != int(seq)
 
     def advance(self, refreshes: int = 1) -> None:
         if self.s is None:
@@ -284,6 +364,12 @@ class GpuPanelDriveState:
                 self.reset()
             return                                    # else: the previous frame's maps stand, nothing advances
         aT0, aE0, aT1, aE1, w0, w1 = self.factors = clock_factors32(self.n, k, self.closure, self.parity)
+        rest = self._watch(self._rest_begin())        # pass 1c-0, then pass 1c (which returns early at rest)
+        self.at_rest = rest
+        if rest:
+            self.rest_runs += 1
+            self.n += k                               # the C++ refresh index advances on the CPU; on the GPU nothing moves
+            return
         d, (s0, s1) = self.d_prev, self.s
         g0 = (d - s0).astype(np.float32); g1 = (d - s1).astype(np.float32)
         t0 = (s0 + aT0 * g0).astype(np.float32); t1 = (s1 + aT1 * g1).astype(np.float32)
@@ -302,12 +388,26 @@ class GpuPanelDriveState:
             return d.astype(np.float32), d.astype(np.float32)
         return self.true, self.est
 
-    def commit(self, d: np.ndarray) -> None:
+    def commit(self, d: np.ndarray, new_content: bool = True) -> None:
+        """``d_prev`` <- this frame's round-1 drives (seeding the clocks when there is no state). ``new_content`` = the
+        C++ ``FaldTemporalEndRun(..., newContent)``: the host received a new frame (a captured / presented change), not a
+        re-run of the same desktop for the settle hold. Default True: every caller hands the twin one received frame per
+        call. Only False lets the watch form a toggle pair (:data:`REST_STILL`)."""
         d = d.astype(np.float32).copy()
         if self.s is None:
             self.s = [d.copy(), d.copy()]
             self.n = 0
         self.d_prev = d
+        if new_content:
+            self.target_from_content = True
+
+
+def commit_temporal(temporal, d1, new_content: bool = True) -> None:
+    """The end of a run's temporal bookkeeping: the panel clock takes ``new_content``, the first-order state does not."""
+    if isinstance(temporal, GpuPanelDriveState):
+        temporal.commit(d1, new_content=new_content)
+    else:
+        temporal.commit(d1)
 
 
 class Emu:
@@ -762,11 +862,14 @@ class Emu:
         g = self.sample(gainB.astype(np.float64))
         return sT, sE, g
 
-    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1):
+    def run(self, frame_scrgb, fp16_out=True, temporal=None, star: Optional[StarfieldParams] = None, refreshes: int = 1,
+            new_content: bool = True):
         """One frame of FaldRunPasses. ``temporal``: a GpuDriveState carried across calls (pass 1b after each stat
         round; the state commits after round 1 — the CopyResource in the C++), or a GpuPanelDriveState (mode 3: pass 1c
         once before round 0 with ``refreshes`` = the panel refreshes elapsed since the previous frame was first shown;
-        both rounds read the same maps; the commit stores round 1's instantaneous drives as the next frame's target).
+        both rounds read the same maps; the commit stores round 1's instantaneous drives as the next frame's target;
+        ``new_content`` = FaldRunPasses' newContent, False for a settle-hold re-run of the same desktop — see
+        :meth:`GpuPanelDriveState.commit`).
         ``star``: starfield balancing settings
         (None = the option off: no star pass runs and nothing below changes) — the zone fields come from the SOURCE
         frame and every later step works on Balance(source)."""
@@ -799,7 +902,7 @@ class Emu:
         gc = self.sample(cB1.astype(np.float64)) if self.c15 else None
         req, wfade = self.correct(img, sT, sE, g, gc)
         if temporal is not None:
-            temporal.commit(d1)
+            commit_temporal(temporal, d1, new_content)
         if fp16_out:
             # float32 encode (HLSL) then float->half TRUNCATION: matches the real GPU dump 98.4 % bit-for-bit (round-to-nearest 56 %)
             out = self.nits_to_scrgb32(req)

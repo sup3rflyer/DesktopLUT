@@ -1248,6 +1248,26 @@ static bool ReadBackFloats(ID3D11Texture2D* tex, float* out, UINT n) {
     return ok;
 }
 
+// A whole buffer (dump only; stalls the GPU): to `file` and into `out`. False = nothing read (no buffer, no staging copy).
+static bool DumpBuffer(ID3D11Buffer* buf, const std::wstring& file, std::vector<unsigned char>& out) {
+    out.clear();
+    if (!buf) return false;
+    D3D11_BUFFER_DESC d; buf->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0; d.StructureByteStride = 0;
+    ID3D11Buffer* st = nullptr;
+    if (FAILED(g_device->CreateBuffer(&d, nullptr, &st))) return false;
+    g_context->CopyResource(st, buf);
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (SUCCEEDED(g_context->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        out.assign((const unsigned char*)m.pData, (const unsigned char*)m.pData + d.ByteWidth);
+        g_context->Unmap(st, 0);
+        std::ofstream f(file, std::ios::binary);
+        f.write((const char*)out.data(), (std::streamsize)out.size());
+    }
+    st->Release();
+    return !out.empty();
+}
+
 // Consume a pending dump request: the directory (with a trailing separator) or "" when none.
 static std::wstring TakeDumpRequest(MonitorContext* ctx) {
     if (!ctx->faldDumpRequested.load(std::memory_order_acquire)) return L"";
@@ -1267,6 +1287,8 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
     const FaldPanelParams& p = r->params;
     const FaldSettings& fs = ctx->isHDREnabled ? ctx->hdrColorCorrection.fald : ctx->sdrColorCorrection.fald;
     DumpTexture(r->driveTex, dir + L"fald_drive.f32", p.cols, p.rows, 4);
+    uint32_t restWords[4] = { 0u, 0u, 0u, 0u };
+    bool restDumped = false;
     if (r->temporalMode == FALD_TEMPORAL_PANEL) {
         // panel clock: not on a seeding run (that frame is the stateless layer and the textures hold nothing yet).
         // filt / est = the maps both rounds' kernels saw; s0 / s1 = the parity clocks' LED states OF THIS FRAME (already
@@ -1279,6 +1301,16 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
             DumpTexture(r->clkStateTex[0], dir + L"fald_clock_s0.f32", p.cols, p.rows, 4);
             DumpTexture(r->clkStateTex[1], dir + L"fald_clock_s1.f32", p.cols, p.rows, 4);
             DumpTexture(r->clkPrevTex, dir + L"fald_clock_dprev.f32", p.cols, p.rows, 4);
+            // the clock at rest (shared/fald_clock_rest.h): the watch pass's words (4 uint32) and per-zone levels (zones x
+            // (c, q, n, 0) float32) as the GPU holds them after this run (a k = 0 run: the last clock run's)
+            if (r->clkRest.words && r->clkRest.levels) {
+                std::vector<unsigned char> w, lv;
+                if (DumpBuffer(r->clkRest.words, dir + L"fald_clock_rest.u32", w) && w.size() >= sizeof(restWords)) {
+                    memcpy(restWords, w.data(), sizeof(restWords));
+                    restDumped = true;
+                }
+                DumpBuffer(r->clkRest.levels, dir + L"fald_clock_levels.f32", lv);
+            }
         }
     }
     DumpTexture(r->bTrueTex, dir + L"fald_btrue.f32", p.cols * p.sub, p.rows * p.sub, 4);
@@ -1347,8 +1379,13 @@ static void DumpFields(MonitorContext* ctx, FaldResources* r, const std::wstring
          << " (k = round((time - the previous run's grid) / period); 0 = the same refresh: the previous run's maps were held; > " << FALD_CLOCK_MAX_REFRESHES
          << ": factors exactly 1)\nclock_factors " << clockText[2] << " (true0 est0 true1 est1)\nclock_weights " << r->clkW[0] << " " << r->clkW[1]
          << " (mode 3 files: fald_drive_filt.f32 / fald_clock_est.f32 = the maps the kernels saw, fald_clock_s0.f32 / _s1.f32 ="
-         << " the clocks' LED states of this frame, fald_clock_dprev.f32 = the previous frame's round-1 drives)"
-         << "\nboost_in_file " << (p.hasBoost ? 1 : 0) << "\nboost_steps " << p.boostN << "\nzones_total " << (p.cols * p.rows)
+         << " the clocks' LED states of this frame, fald_clock_dprev.f32 = the previous frame's round-1 drives)";
+    if (restDumped)
+        meta << "\nclock_run_seq " << restWords[1] << "\nclock_rest_flags " << restWords[2]
+             << " (1 allowed, 2 reset, 4 still)\nclock_at_rest " << (((restWords[2] & FALD_CLOCK_REST_ALLOWED) != 0u && restWords[0] != restWords[1]) ? 1 : 0)
+             << " (from fald_clock_rest.u32 [the last clock run with a zone not confined, the run, its flags, 0]; files"
+             << " fald_clock_levels.f32 = zones x (c, q, n, 0) float32)";
+    meta << "\nboost_in_file " << (p.hasBoost ? 1 : 0) << "\nboost_steps " << p.boostN << "\nzones_total " << (p.cols * p.rows)
          << "\nboost_lit_nits " << p.boostLitNits << "\nboost_lit_frac " << p.boostLitFrac
          << "\nboost_dim_nits " << p.boostDimNits << "\nboost_dim_frac " << p.boostDimFrac
          << "\nboost_rule " << p.boostRule << " (0 = LIT-or-DIM, 1 = LIT-or-MEAN)\nboost_mean_gamma " << p.boostMeanGamma

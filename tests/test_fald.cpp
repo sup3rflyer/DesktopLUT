@@ -1540,6 +1540,140 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     g_faldCoreHoldOverride = savedHold;
 }
 
+// Opt-in: the panel clock AT REST on WARP (shared/fald_temporal.h above FALD_CLOCK_REST_ALLOWED), dumped every run for the
+// DLC float32 twin (tests/test_fald_paneltime_warp.py test_warp_rest_dumps_equal_the_twin, same variable). <dir> =
+// FALD_TEST_WARP_REST_DIR holds `panel.bin` (python -m dlc.fald.export, PQ) and optionally `frame.rgba16f` (frame A; B =
+// A with a 2 x 2-zone block raised); the case writes <dir>/on (the rule as shipped) and <dir>/off
+// (g_faldClockRestOverride = 0) with one fald_dump per run in rNNN and `schedule.txt` ("run k newContent" per line). The
+// time is SET (g_faldTestNowQpc), so k is the schedule's: a frame, long still stretches (newContent = false, k = 1: the
+// settle re-runs of a still desktop), a content run with the same pixels, a content change and back, a k = 0 and a k = 2
+// run. Without the variable the case checks nothing.
+TEST_CASE("FALD panel clock at rest on WARP: dumps for the DLC twin (FALD_TEST_WARP_REST_DIR)") {
+    char* envDir = nullptr; size_t len = 0;
+    if (_dupenv_s(&envDir, &len, "FALD_TEST_WARP_REST_DIR") != 0 || !envDir) return;
+    std::string narrow(envDir); free(envDir);
+    const std::wstring dir(narrow.begin(), narrow.end());          // ASCII paths only (a test convenience)
+    struct Restore { int hold; ~Restore() { g_faldClockRestOverride = -1; g_faldTestNowQpc = 0; g_faldCoreHoldOverride = hold; } } restore{ g_faldCoreHoldOverride };
+    g_faldCoreHoldOverride = 0;                                    // every run a full one (WARP is far over the governor's budget)
+
+    struct Step { int k; bool content; int frame; };               // frame 0 = A, 1 = B
+    std::vector<Step> sched;
+    sched.push_back({ 0, true, 0 });                               // the seed
+    for (int i = 0; i < 40; i++) sched.push_back({ 1, false, 0 }); // a still desktop
+    sched.push_back({ 1, true, 0 });                               // a content run with the same pixels
+    for (int i = 0; i < 10; i++) sched.push_back({ 1, false, 0 });
+    sched.push_back({ 1, true, 1 });                               // the block raised: drives move
+    for (int i = 0; i < 8; i++) sched.push_back({ 1, false, 1 });
+    sched.push_back({ 0, false, 1 });                              // a second run inside one refresh
+    sched.push_back({ 2, false, 1 });
+    for (int i = 0; i < 35; i++) sched.push_back({ 1, false, 1 });
+    sched.push_back({ 1, true, 0 });                               // back to A
+    for (int i = 0; i < 60; i++) sched.push_back({ 1, false, 0 });
+
+    ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic)));
+    g_device = dev; g_context = ic;
+    REQUIRE(InitFaldShaders());
+    FaldPanelParams pp; std::string err;
+    REQUIRE_MESSAGE(LoadFaldPanelParams(dir + L"/panel.bin", pp, err), err);
+    static const char* vsSrc = "struct O { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
+                               "O main(uint id : SV_VertexID) { O o; o.uv = float2((id << 1) & 2, id & 2);"
+                               "o.pos = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }";
+    ID3DBlob* vsBlob = nullptr;
+    REQUIRE(SUCCEEDED(D3DCompile(vsSrc, strlen(vsSrc), "vs", nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, nullptr)));
+    ID3D11VertexShader* vs = nullptr;
+    REQUIRE(SUCCEEDED(dev->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs)));
+    vsBlob->Release();
+    const int W = (int)(pp.originX + pp.latW), H = (int)(pp.originY + pp.latH);
+    // frame A: 5-nit grey with a 2 x 2-zone 1000-nit block (or <dir>/frame.rgba16f); B: A with a 2 x 2-zone block at 250 nits
+    const uint16_t grey = 0x2C00, white = 0x4A40, quarter = 0x4240, one = 0x3C00;
+    std::vector<uint16_t> fa((size_t)W * H * 4);
+    for (size_t i = 0; i < fa.size(); i += 4) { fa[i] = fa[i + 1] = fa[i + 2] = grey; fa[i + 3] = one; }
+    auto block = [&](std::vector<uint16_t>& f, UINT zx, UINT zy, uint16_t v) {
+        const UINT x0 = pp.originX + zx * pp.cellW, y0 = pp.originY + zy * pp.cellH;
+        for (UINT y = y0; y < y0 + 2 * pp.cellH && y < (UINT)H; y++)
+            for (UINT x = x0; x < x0 + 2 * pp.cellW && x < (UINT)W; x++) { size_t o = ((size_t)y * W + x) * 4; f[o] = f[o + 1] = f[o + 2] = v; }
+    };
+    block(fa, pp.cols / 2 - 1, pp.rows / 2 - 1, white);
+    {
+        std::ifstream ff(dir + L"/frame.rgba16f", std::ios::binary);
+        if (ff) {
+            ff.read((char*)fa.data(), (std::streamsize)(fa.size() * sizeof(uint16_t)));
+            REQUIRE((size_t)ff.gcount() == fa.size() * sizeof(uint16_t));
+        }
+    }
+    std::vector<uint16_t> fb = fa;
+    block(fb, pp.cols / 4, pp.rows / 4, quarter);
+    LARGE_INTEGER qf; QueryPerformanceFrequency(&qf);
+    const float periodMs = 1000.0f / 60.0f;
+    const double periodQpc = (double)periodMs * (double)qf.QuadPart / 1000.0;
+
+    for (int variant = 0; variant < 2; variant++) {
+        g_faldClockRestOverride = variant == 0 ? -1 : 0;
+        const std::wstring vdir = dir + (variant == 0 ? L"/on" : L"/off");
+        CreateDirectoryW(vdir.c_str(), nullptr);
+        MonitorContext ctx;
+        ctx.width = W; ctx.height = H;
+        ctx.isHDREnabled = true;
+        ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        ctx.frameTimeExactMs = periodMs;
+        FaldSettings& fs = ctx.hdrColorCorrection.fald;
+        fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
+        fs.coreMode = FALD_CORE_MODE_C;
+        fs.temporalMode = FALD_TEMPORAL_PANEL; fs.clockParity = -1;
+        REQUIRE(FaldEnsureResources(&ctx, fs));
+        D3D11_TEXTURE2D_DESC td = {};
+        td.Width = (UINT)W; td.Height = (UINT)H; td.MipLevels = 1; td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        ID3D11Texture2D* target = nullptr; ID3D11RenderTargetView* rtv = nullptr;
+        REQUIRE(SUCCEEDED(dev->CreateTexture2D(&td, nullptr, &target)));
+        REQUIRE(SUCCEEDED(dev->CreateRenderTargetView(target, nullptr, &rtv)));
+        D3D11_VIEWPORT vp = { 0, 0, (float)W, (float)H, 0, 1 };
+        std::ofstream schedFile(vdir + L"/schedule.txt");
+        const long long t0 = 1000000000ll;
+        long long N = 0;
+        int rested = 0;
+        for (size_t i = 0; i < sched.size(); i++) {
+            const std::vector<uint16_t>& frame = sched[i].frame ? fb : fa;
+            ic->UpdateSubresource(ctx.fald->inter, 0, nullptr, frame.data(), (UINT)W * 8u, 0);
+            ic->RSSetViewports(1, &vp);
+            ic->VSSetShader(vs, nullptr, 0);
+            ic->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            wchar_t sub[16]; swprintf(sub, 16, L"/r%03u", (unsigned)i);
+            const std::wstring rdir = vdir + sub;
+            CreateDirectoryW(rdir.c_str(), nullptr);
+            {
+                std::lock_guard<std::mutex> lk(g_monitorsMutex);
+                ctx.faldDumpDir = rdir;
+            }
+            ctx.faldDumpRequested.store(true);
+            N += sched[i].k;
+            g_faldTestNowQpc = t0 + (long long)((double)N * periodQpc + 0.5);
+            FaldRunPasses(&ctx, rtv, sched[i].content);
+            ic->Flush();
+            CHECK_FALSE(ctx.faldDumpRequested.load());
+            schedFile << i << " " << sched[i].k << " " << (sched[i].content ? 1 : 0) << "\n";
+            CHECK(ctx.fald->clkElapsed == (unsigned long long)(ctx.fald->clkSeeded ? 0 : sched[i].k));
+            std::ifstream meta(rdir + L"/fald_dump.txt");
+            std::string line;
+            while (std::getline(meta, line)) if (line.rfind("clock_at_rest 1", 0) == 0) rested++;
+        }
+        MESSAGE("panel clock at rest on WARP (" << std::string(variant == 0 ? "as shipped" : "never at rest") << "): " << rested << " of "
+                << sched.size() << " dumped runs report clock_at_rest 1");
+        if (variant == 1) CHECK(rested == 0);
+        g_faldTestNowQpc = 0;
+        rtv->Release(); target->Release();
+        FaldReleaseResources(&ctx);
+    }
+    vs->Release();
+    ReleaseFaldShaders();
+    g_context = nullptr; g_device = nullptr;
+    ic->ClearState(); ic->Flush();
+    ic->Release(); dev->Release();
+}
+
 // The shared LED-lag orchestration (shared/fald_temporal.cpp FaldTemporalBeginRun / EndRun) — the overlay and the DWM
 // hook both run it, so its routing rules are pinned here without D3D.
 TEST_CASE("FALD temporal run plan: routing, resets, panel clock, settle") {

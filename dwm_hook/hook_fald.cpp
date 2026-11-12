@@ -2215,6 +2215,28 @@ static void DumpTexture(ID3D11Texture2D* tex, const std::wstring& file, UINT w, 
     st->Release();
 }
 
+// A whole buffer (dump only; stalls the GPU, like DumpTexture): to `file`, and its first `outBytes` bytes into `out`
+// (nullptr / 0 = the file only). False = nothing read.
+static bool DumpBuffer(ID3D11Buffer* buf, const std::wstring& file, void* out, size_t outBytes) {
+    if (!buf) return false;
+    D3D11_BUFFER_DESC d; buf->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0; d.StructureByteStride = 0;
+    ID3D11Buffer* st = nullptr;
+    if (FAILED(g_dev->CreateBuffer(&d, nullptr, &st))) return false;
+    g_ctx->CopyResource(st, buf);
+    D3D11_MAPPED_SUBRESOURCE map;
+    bool ok = false;
+    if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &map))) {
+        FILE* f = _wfopen(file.c_str(), L"wb");
+        if (f) { fwrite(map.pData, 1, d.ByteWidth, f); fclose(f); }
+        if (out && outBytes <= d.ByteWidth) { memcpy(out, map.pData, outBytes); ok = true; }
+        else if (!out) ok = true;
+        g_ctx->Unmap(st, 0);
+    }
+    st->Release();
+    return ok;
+}
+
 // The overlay's runtime.fald_dump field files, same names and layouts so the two are diffed directly (and both
 // against dlc/fald/gpuemu.py). The run's LED-lag bookkeeping goes to fald_hook_temporal.txt with the overlay's key
 // names (the hook writes no fald_dump.txt: the rest of that text is host-side state).
@@ -2233,6 +2255,8 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
         DumpTexture(m->boostTex[1], dir + L"fald_boost_r1.f32", 2, 1, 4);
     }
     // LED lag: the same files as the overlay's dump (src/fald.cpp DumpFields), dumped before the commit
+    uint32_t restWords[4] = { 0u, 0u, 0u, 0u };
+    bool restDumped = false;
     if (m->temporalMode == FALD_TEMPORAL_PANEL) {
         if (!m->clkSeeded) {
             DumpTexture(m->driveFiltTex, dir + L"fald_drive_filt.f32", p.cols, p.rows, 4);
@@ -2240,6 +2264,11 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
             DumpTexture(m->clkStateTex[0], dir + L"fald_clock_s0.f32", p.cols, p.rows, 4);
             DumpTexture(m->clkStateTex[1], dir + L"fald_clock_s1.f32", p.cols, p.rows, 4);
             DumpTexture(m->clkPrevTex, dir + L"fald_clock_dprev.f32", p.cols, p.rows, 4);
+            // the clock at rest: the watch pass's words + per-zone levels (the overlay's files, src/fald.cpp DumpFields)
+            if (m->clkRest.words && m->clkRest.levels) {
+                restDumped = DumpBuffer(m->clkRest.words, dir + L"fald_clock_rest.u32", restWords, sizeof(restWords));
+                DumpBuffer(m->clkRest.levels, dir + L"fald_clock_levels.f32", nullptr, 0);
+            }
         }
     }
     // the run's LED-lag bookkeeping, for replaying it offline (the overlay writes these in fald_dump.txt)
@@ -2267,6 +2296,12 @@ static void DumpFields(FaldMonitor* m, const std::wstring& dir) {
                     m->clkSeeded ? 1 : 0, m->clkTimeMs, m->clkGridMs, m->clkResidual, m->clkGain, m->refreshMs,
                     m->clkIndex, m->clkElapsed, m->clkFactor[0], m->clkFactor[1], m->clkFactor[2], m->clkFactor[3],
                     m->clkW[0], m->clkW[1], m->clkClosure, m->clkParity);
+            if (restDumped)   // from fald_clock_rest.u32 (the watch pass's words: [last run with a zone not confined, run, flags, 0])
+                fprintf(f, "clock_run_seq %u\n"
+                           "clock_rest_flags %u (1 allowed, 2 reset, 4 still)\n"
+                           "clock_at_rest %d\n",
+                        restWords[1], restWords[2],
+                        ((restWords[2] & FALD_CLOCK_REST_ALLOWED) != 0u && restWords[0] != restWords[1]) ? 1 : 0);
             fclose(f);
         }
     }
