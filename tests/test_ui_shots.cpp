@@ -600,6 +600,15 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "dlcpanelsdr", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 61 },
         { "dlcpanelnone", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 62 },
         { "dlcpanelunmatched", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 63 },
+        // PEAK BY WINDOW on the card (the whole card: tall): 60 OLED-like, 64 flat mini-LED-like, 65 invalid, 66 none.
+        { "dlcpanelpbwflat", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 1040, 64 },
+        { "dlcpanelpbwinvalid", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 1040, 65 },
+        { "dlcpanelpbwnone", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 1040, 66 },
+        // A probe flow running (its own chart over the chart area): 67 peak-window, 68 refresh-response (VRR points
+        // hollow squares), 69 peak-window at the narrow width.
+        { "dlcprobepeak", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 67 },
+        { "dlcproberefresh", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 68 },
+        { "dlcprobenarrow", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 67 },
         // The front door (a fresh install: nothing configured, no DLC): 70 the HDR display offered SDR CONTENT: GAMMA
         // 2.2, 71 the same switched on (its neutral profile installed, the live layers running with no hook work), 72
         // the SDR display (no offer), the calibrated HDR display (no offer; GRAYSCALE's switch as before), 74 analysis on.
@@ -617,6 +626,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         // Their tooltips: the offer's switch and its WHITELIST, DISPLAY PEAK, the header's ANALYSIS.
         { "fronttipoffer", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 510, 95, 1180, 760, 70 },
         { "fronttiponwl", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 585, 95, 1180, 760, 71 },
+        { "fronttipon", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 510, 95, 1180, 760, 71 },
         { "fronttippeak", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 300, 282, 1180, 760, 70 },
         { "fronttipanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 995, 28, 1180, 760, 70 },
         // ENGINE's TWIN ROUTING rows (two identical displays): 80 identified, 81 DWM HOOK off (the rows stay, disabled),
@@ -636,6 +646,14 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got) out.append(buf, got);
         CloseHandle(h);
         return out;
+    };
+    // A test fixture (tests/fixtures), from the repository root or the test binary's folder.
+    auto readFixture = [&read](const wchar_t* name) {
+        for (const wchar_t* dir : { L"tests/fixtures/", L"../../tests/fixtures/", L"../tests/fixtures/" }) {
+            const std::string t = read(std::wstring(dir) + name);
+            if (!t.empty()) return t;
+        }
+        return std::string();
     };
     std::shared_ptr<dlc::LiveCharts> realSdrCharts;
     {
@@ -722,6 +740,39 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 if (shot.variant == 10 || shot.variant == 11) {
                     snap.run = FakeRun(shot.variant == 11);
                     snap.live[0].dlcRun = true;
+                } else if (shot.variant == 67 || shot.variant == 68) {
+                    // A probe flow running on the HDR display: the charts.json DLC's own code published (the fixture).
+                    const bool peak = shot.variant == 67;
+                    auto L = std::make_shared<dlc::Live>(*FakeRun(false));
+                    auto st = std::make_shared<dlc::LiveState>(*L->state);
+                    st->flow = peak ? "peak-window" : "refresh-response";
+                    st->target.clear();
+                    st->steps.clear();
+                    const char* steps[] = { "Preflight", "Hardware readiness", peak ? "Peak window" : "Refresh response" };
+                    for (int i = 0; i < 3; i++)
+                        st->steps.push_back({ steps[i], steps[i], i < 2 ? dlc::StepStatus::Done : dlc::StepStatus::Current });
+                    st->stepIndex = 3;
+                    st->stepTotal = 3;
+                    st->patchesDone = st->patchesTotal = 0;
+                    st->feed.clear();
+                    L->state = st;
+                    auto ch = std::make_shared<dlc::LiveCharts>();
+                    REQUIRE(dlc::ParseLiveCharts(readFixture(L"charts_probes.json"), *ch));
+                    if (peak) {   // mid-run: the up pass done, the down pass started (no verdict yet)
+                        dlc::DipPeakByWindow& pw = ch->probes.peakByWindow;
+                        pw.complete = false;
+                        pw.valid = false;
+                        pw.stepsDone = 11;
+                        for (dlc::DipPeakSize& z : pw.curve) {
+                            if (z.areaPct < 50.0) z.down = dlc::DipPeakPass();
+                            z.agree = -1;
+                            z.early = z.sustained = dlc::kNaN;
+                        }
+                        pw.runWindowAreaPct = pw.plateauNits = dlc::kNaN;
+                    }
+                    L->charts = ch;
+                    snap.run = L;
+                    snap.live[0].dlcRun = true;
                 } else if (shot.variant == 13) {
                     snap.dlc = std::make_shared<dlc::Data>();
                     for (ui::DisplayRow& r : snap.live) {
@@ -754,7 +805,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     } else {
                         t.waiting = "calibration"; t.applied = false; t.activeStamp.clear();
                     }
-                } else if (shot.variant >= 60 && shot.variant <= 63) {
+                } else if ((shot.variant >= 60 && shot.variant <= 63) || (shot.variant >= 64 && shot.variant <= 66)) {
                     // The DIP: the HDR display's full record (and a minimal SDR one for it); the BenQ's per variant.
                     std::string benq;
                     if (shot.variant == 61) benq = R"(, "BenQ PD2700U:SDR": {"display": "BenQ PD2700U", "mode": "SDR", "made": "2026-09-26"})";
@@ -768,20 +819,32 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                           "thermal_regime": "convergent", "warmup_minutes": 29.57, "cold_channel": "B",
                           "instrument": "X-Rite i1 DisplayPro", "made": "2026-06-19", "updated": "2026-10-10",
                           "refresh_response": {"measured": "2026-10-03", "run_id": "20261003_180329_refresh_trim_hdr_mon0_trim",
-                            "identity": {"hardware_id": "AUS322A"},
+                            "identity": {"hardware_id": "AUS322A"}, "reference": {"key": "60", "num": 60, "den": 1},
                             "rates": [{"key": "59.94", "num": 60000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 1.0003}]},
                                       {"key": "50", "num": 50, "den": 1, "levels": [{"nits": 0.5, "ratio": 0.98}]},
-                                      {"key": "48", "num": 48, "den": 1, "levels": [{"nits": 0.5, "ratio": 0.97}]},
-                                      {"key": "47.952", "num": 48000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 0.97}]}]},
-                          "peak_by_window": {"measured": "2026-10-10"}},
+                                      {"key": "48", "num": 48, "den": 1, "source": "vrr", "levels": [{"nits": 0.5, "ratio": 0.97}]},
+                                      {"key": "47.952", "num": 48000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 0.97}]}]}},
                         "PA32UCXR:SDR": {"display": "PA32UCXR", "mode": "SDR", "native_white_nits": 121.7, "made": "2026-03-18"})") +
                                              benq + "}}";
                     auto data = std::make_shared<dlc::Data>(*snap.dlc);
                     data->dip = dlc::ParseDipStore(json);
                     data->dipFound = data->dip.readable;
+                    data->today = "2026-11-14";   // the probe sections were measured 2026-11-12
                     snap.dlc = data;
                     snap.live[0].dlcLive.hardwareId = "AUS322A";
                     snap.live[0].settings.hdrMHC.refreshTrimEnabled = false;   // the DIP has a response, the trim is off
+                    // Its peak by window, as DLC's flows record them (tests/fixtures/dip_store_probes.json, generated by
+                    // DLC's own code): 60 an OLED-like steep curve, 64 a flat mini-LED-like one, 65 a drifting run
+                    // (invalid), 66 none.
+                    const char* pbwFrom = shot.variant == 60 ? "Probe OLED 42:HDR" : shot.variant == 64 ? "Probe MiniLED 32:HDR"
+                                        : shot.variant == 65 ? "Probe Drift 27:HDR" : nullptr;
+                    if (pbwFrom) {
+                        const dlc::DipStoreData probes = dlc::ParseDipStore(readFixture(L"dip_store_probes.json"));
+                        for (const dlc::DipRecord& r : probes.records)
+                            if (r.key == pbwFrom)
+                                for (dlc::DipRecord& mine : data->dip.records)
+                                    if (mine.key == "PA32UCXR:HDR") mine.peakByWindow = r.peakByWindow;
+                    }
                     if (shot.variant == 63) {
                         snap.live[1].dlcMatch = dlc::DisplayMatch();
                         snap.live[1].dlcRecord[0] = snap.live[1].dlcRecord[1] = dlc::ModeRecord();
@@ -814,7 +877,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                         m.activePerm = MHCSettings::PERM_DG;
                         m.profileName = L"DesktopLUT_Mon0_HDR_9532406.icm";
                         m.profilePath = L"C:\\Windows\\System32\\spool\\drivers\\color\\" + m.profileName;
-                        snap.live[0].reportedPeakNits = 1000;   // the profile's luminance tag (the params default)
+                        m.panelPeakNits = 1600;                 // what Windows reported before (the EDID's): kept
+                        m.priorDefaultProfile = L"HDR Calibration_1.icc";   // the user's own, given back on off
                         snap.running = true;
                         snap.hookIdle = true;   // desktop gamma alone: no hook work
                         snap.lastStatus = L"Active (DWM Hook)";
@@ -846,7 +910,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
-                if (shot.variant >= 60 && shot.variant <= 63) vs.dlc.pick = ui::kDlcPickPanel;
+                if ((shot.variant >= 60 && shot.variant <= 63) || (shot.variant >= 64 && shot.variant <= 66))
+                    vs.dlc.pick = ui::kDlcPickPanel;
                 if (shot.variant == 25) vs.faldViewOpenRequested = true;
                 if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = shot.variant == 16 ? 3 : 0;   // 16: WORST MISSES, wide
                 if (shot.variant == 19 || shot.variant == 20 || shot.variant == 21) {

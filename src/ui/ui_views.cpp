@@ -989,7 +989,7 @@ std::pair<std::string, ImU32> RefreshTrimValue(const RefreshTrimStatus& t, bool 
 }
 
 std::string RefreshTrimTip(const RefreshTrimStatus& t) {
-    std::string tip = "Brightness at other refresh rates, trimmed to the 60 Hz calibration's (HDR MHC 1D LUT).\n"
+    std::string tip = "Brightness at other refresh rates, trimmed to the calibration's rate (HDR MHC 1D LUT).\n"
                       "From the display's DLC record (its DIP). RELOAD reads it again.";
     char b[256];
     if (t.monitor < 0) return tip;
@@ -1005,6 +1005,7 @@ std::string RefreshTrimTip(const RefreshTrimStatus& t) {
         if (t.ageDays >= 0) { snprintf(b, sizeof(b), " (%d days)", t.ageDays); tip += b; }
         if (!t.runId.empty()) tip += ", run " + t.runId;
         tip += ".";
+        if (!t.referenceKey.empty()) tip += "\nReference: " + t.referenceKey + " Hz (the calibration's rate).";
         if (!t.rates.empty()) {
             tip += "\nRates:";
             for (size_t i = 0; i < t.rates.size(); i++) tip += (i ? "; " : " ") + t.rates[i];
@@ -1415,7 +1416,10 @@ void DrawSdrGammaOffer(const Snapshot& snap, const DisplayRow& r, GammaOffer off
         tip += "SDR content in HDR (desktop, apps, SDR video) at gamma 2.2, not Windows' sRGB curve, which lifts "
                "dark greys.\nDesktop gamma, in an HDR MHC profile; it follows the Windows SDR brightness.\n"
                "HDR games and video change too unless listed: WHITELIST.";
+        tip += "\n" + SdrGammaPeakNote(r.settings.hdrMHC, on, r.reportedPeakNits, r.edidPeakNits);
         if (on) tip += Fmt("\nOn: 2.2 at %.0f nits. Off removes the profile again.", r.settings.hdrMHC.dgSdrWhiteNits);
+        if (on && !r.settings.hdrMHC.priorDefaultProfile.empty())
+            tip += "\nOff makes " + Utf8(r.settings.hdrMHC.priorDefaultProfile) + " the default again.";
         ImGui::SetTooltip("%s", tip.c_str());
     }
     ImGui::SetCursorScreenPos(ImVec2(Snap(ImGui::GetItemRectMax().x + Px(kSdrGammaGap)), y));

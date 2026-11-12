@@ -657,10 +657,44 @@ Result MhcSetDesktopGamma(int mon, bool on) {
     return Done();
 }
 
+bool IsDesktopLutProfileName(const std::wstring& name) { return name.rfind(L"DesktopLUT_", 0) == 0; }
+
+NeutralPeak DecideNeutralProfilePeak(float storedNits, bool inHdr, float reportedNits, bool defaultIsOurs, float edidNits) {
+    auto plausible = [](float v) { return std::isfinite(v) && v > 0.0f && v < kWindowsToneMapBypassNits - 1.0f; };
+    NeutralPeak out;
+    if (inHdr && !defaultIsOurs && plausible(reportedNits)) {
+        out.nits = reportedNits;
+        out.source = NeutralPeakSource::Reported;
+    } else if (plausible(storedNits)) {
+        out.nits = storedNits;
+        out.source = NeutralPeakSource::Kept;
+    } else if (plausible(edidNits)) {
+        out.nits = edidNits;
+        out.source = NeutralPeakSource::Edid;
+    }
+    return out;
+}
+
+bool ShouldRestorePriorDefault(const std::wstring& prior, bool fileExists) {
+    return !prior.empty() && !IsDesktopLutProfileName(prior) && fileExists;
+}
+
+namespace {
+
+std::wstring ColorDirPath(const std::wstring& name) {
+    wchar_t sysDir[MAX_PATH];
+    GetSystemDirectory(sysDir, MAX_PATH);
+    return std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + name;
+}
+
+}  // namespace
+
 Result SetSdrGamma22(int mon, bool on) {
     if (!ValidMonitor(mon)) return Done(false);
     if (on) {
-        Result r = MhcSetDesktopGamma(mon, true);   // the existing switch's path, its neutral profile included
+        // The existing switch's path, its neutral profile included. Its first installation records the peak HDR apps were
+        // told before it and the default it replaces (GenerateAndInstallMhcProfile, whatever route reaches it).
+        Result r = MhcSetDesktopGamma(mon, true);
         if (!r.ok()) return r;
         bool installed;
         {
@@ -694,7 +728,34 @@ Result SetSdrGamma22(int mon, bool on) {
     if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(anyDg);
     // The profile existed only for the gamma: the Remove path takes it away (the identity profile is associated first,
     // because Windows keeps applying the last MHC2 transform after a plain disassociation), with its variants.
+    std::wstring prior;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        prior = g_gui.monitorSettings[mon].hdrMHC.priorDefaultProfile;
+    }
     MhcRemove(mon, true);   // saves, refreshes
+    // The display ends where it started: the user's own previous default (the Windows HDR Calibration app's profile, a
+    // vendor's) is the default again. It stayed in the list all along. Associated AFTER the identity profile, so an MHC2
+    // one is the last transform Windows applies; then the identity association goes (Windows keeps applying the last
+    // MHC2 transform after a disassociation, so a non-MHC2 previous default leaves the identity's neutral one).
+    if (!prior.empty()) {
+        DisplayInfo di;
+        const bool exists = GetFileAttributesW(ColorDirPath(prior).c_str()) != INVALID_FILE_ATTRIBUTES;
+        if (ShouldRestorePriorDefault(prior, exists) && GetDisplayInfoForMonitor(mon, di) &&
+            ReassociateMHC2Profile(prior, di.adapterId, di.sourceId, true)) {
+            DisengageIdentityMhcProfile(mon, true);
+            std::wcout << L"[SDR gamma 2.2] monitor " << mon << L": " << prior << L" is the HDR default again" << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+                if (ValidMonitor(mon)) g_gui.monitorSettings[mon].hdrMHC.priorDefaultProfile.clear();
+            }
+            SaveSettings();
+        } else {
+            notify::Post(notify::Sev::Warning, mon, L"mhc", L"Previous HDR profile not restored",
+                         L"It is no longer installed, or Windows refused it: " + prior +
+                             L"\nThe display runs a neutral profile instead.");
+        }
+    }
     ReconcileLiveLayers("desktop gamma");
     notify::Post(notify::Sev::Info, mon, L"mhc", L"SDR gamma 2.2 off");
     Finish(mon);

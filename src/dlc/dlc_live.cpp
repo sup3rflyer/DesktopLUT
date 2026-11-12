@@ -394,6 +394,111 @@ bool ParseLiveState(const std::string& json, LiveState& out) {
     return true;
 }
 
+namespace {
+
+// The peak-window flow's live payload, in the DIP section's shape.
+DipPeakByWindow PeakWindowLive(const JsonValue& p) {
+    DipPeakByWindow out;
+    out.present = true;
+    out.schema = kDipPeakWindowSchema;
+    out.complete = Bool(&p, "complete");
+    out.stepsDone = Int(&p, "steps_done", -1);
+    out.stepsPlanned = Int(&p, "steps_planned", -1);
+    std::map<double, DipPeakSize> sizes;
+    if (const JsonValue* series = Arr(&p, "series")) {
+        for (const JsonValue& s : series->arr) {
+            const std::string name = Str(&s, "name"), pass = Str(&s, "pass");
+            if (pass != "up" && pass != "down") continue;
+            const JsonValue* pts = Arr(&s, "points");
+            if (!pts) continue;
+            for (const JsonValue& q : pts->arr) {
+                const double area = NumAt(q, 0), v = NumAt(q, 1);
+                if (!(std::isfinite(area) && area > 0.0 && area <= 100.0) || !(std::isfinite(v) && v >= 0.0)) continue;
+                DipPeakSize& z = sizes[area];
+                z.areaPct = area;
+                DipPeakPass& ps = pass == "up" ? z.up : z.down;
+                ps.present = true;
+                if (name == "early") ps.early = v;
+                else if (name == "sustained") ps.sustained = v;
+                else if (name == "min") ps.min = v;
+            }
+        }
+    }
+    // Once complete: the verdict and the combined curve (null where the passes disagree).
+    std::map<double, double> combined;
+    bool hasCurve = false;
+    if (const JsonValue* curve = Arr(&p, "curve")) {
+        hasCurve = true;
+        for (const JsonValue& q : curve->arr) {
+            const double area = NumAt(q, 0);
+            if (std::isfinite(area)) combined[area] = NumAt(q, 1);
+        }
+    }
+    for (auto& kv : sizes) {
+        DipPeakSize& z = kv.second;
+        const bool both = z.up.present && z.down.present;
+        if (hasCurve && combined.count(kv.first)) {
+            const double c = combined[kv.first];
+            z.sustained = c;
+            z.agree = !both ? -1 : (std::isfinite(c) ? 1 : 0);
+            if (z.agree != 0) {
+                const DipPeakPass& a = z.up.present ? z.up : z.down;
+                const DipPeakPass& b = z.down.present ? z.down : z.up;
+                z.early = std::isfinite(a.early) && std::isfinite(b.early) ? 0.5 * (a.early + b.early) : a.early;
+            }
+        }
+        out.curve.push_back(z);
+    }
+    if (out.complete && p.find("valid")) {
+        out.valid = Bool(&p, "valid");
+        out.plateauNits = Num(&p, "plateau_nits");
+        out.runWindowAreaPct = Num(&p, "run_window_area_pct");
+        for (const DipPeakSize& z : out.curve) if (z.agree == 0) out.areasFailed.push_back(z.areaPct);
+    }
+    return out;
+}
+
+RefreshProbeChart RefreshProbeLive(const JsonValue& p) {
+    RefreshProbeChart out;
+    out.present = true;
+    out.referenceHz = Num(&p, "reference_hz");
+    out.legsDone = Int(&p, "legs_done", -1);
+    out.legsPlanned = Int(&p, "legs_planned", -1);
+    out.complete = Bool(&p, "complete");
+    if (const JsonValue* series = Arr(&p, "series")) {
+        for (const JsonValue& s : series->arr) {
+            RefreshProbeSeries rs;
+            rs.name = Str(&s, "name");
+            const JsonValue* pts = Arr(&s, "points");
+            if (!pts) continue;
+            for (const JsonValue& q : pts->arr) {
+                RefreshProbePoint pt{ NumAt(q, 0), NumAt(q, 1), NumAt(q, 2), false };
+                if (!std::isfinite(pt.hz) || !std::isfinite(pt.pct)) continue;
+                if (q.type == JsonValue::Arr && q.arr.size() > 3 && q.arr[3].type == JsonValue::Str) pt.vrr = q.arr[3].str == "vrr";
+                rs.points.push_back(pt);
+            }
+            if (!rs.points.empty()) out.series.push_back(std::move(rs));
+        }
+    }
+    return out;
+}
+
+ProbeCharts ProbesFrom(const JsonValue* probes) {
+    ProbeCharts out;
+    if (!probes) return out;
+    if (const JsonValue* pbw = Obj(probes, "peak_by_window")) out.peakByWindow = PeakWindowLive(*pbw);
+    if (const JsonValue* rr = Obj(probes, "refresh_response")) out.refresh = RefreshProbeLive(*rr);
+    return out;
+}
+
+}  // namespace
+
+ProbeCharts ParseProbeCharts(const std::string& chartsJson) {
+    JsonValue root;
+    if (!ParseJson(chartsJson, root)) return {};
+    return ProbesFrom(Obj(&root, "probes"));
+}
+
 bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
     out = {};
     JsonValue root;
@@ -403,6 +508,7 @@ bool ParseLiveCharts(const std::string& json, LiveCharts& out) {
     out.seq = std::isfinite(seq) && seq > 0 ? (uint64_t)seq : 0;
     out.stage = Str(&root, "stage");
     out.targetDuv = Num(&root, "target_duv");
+    out.probes = ProbesFrom(Obj(&root, "probes"));
 
     if (const JsonValue* cie = Obj(&root, "cie")) {
         out.gamutLabel = Str(cie, "gamut_label");

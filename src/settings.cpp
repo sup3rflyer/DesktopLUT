@@ -494,6 +494,14 @@ void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
     }
     // The refresh-trim switch (HDR): written only when on — absent = off (the default since 3.0).
     if (isHDR) IniWriteString(section, (p + L"MHCRefreshTrim").c_str(), mhc.refreshTrimEnabled ? L"1" : nullptr, iniPath);
+    // The one-step desktop gamma's record (HDR): the peak Windows reported before it, and the user's own default profile
+    // it replaced. Written only when known: an INI that never used it keeps the keys it had.
+    if (isHDR) {
+        if (mhc.panelPeakNits > 0.0f) WritePrivateProfileFloat(section, (p + L"MHCPanelPeak").c_str(), mhc.panelPeakNits, iniPath);
+        else IniWriteString(section, (p + L"MHCPanelPeak").c_str(), nullptr, iniPath);
+        IniWriteString(section, (p + L"MHCPriorDefault").c_str(),
+                       mhc.priorDefaultProfile.empty() ? nullptr : mhc.priorDefaultProfile.c_str(), iniPath);
+    }
 
     // Correction grayscale (fine-tuning on top of base)
     WritePrivateProfileBool(section, (p + L"MHCCorrGSEnabled").c_str(), mhc.correctionGrayscale.enabled, iniPath);
@@ -735,6 +743,13 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
         }
     }
     if (isHDR) mhc.refreshTrimEnabled = GetPrivateProfileBool(section, (p + L"MHCRefreshTrim").c_str(), false, iniPath);
+    if (isHDR) {
+        const float panel = GetPrivateProfileFloat(section, (p + L"MHCPanelPeak").c_str(), 0.0f, iniPath);
+        mhc.panelPeakNits = (std::isfinite(panel) && panel > 0.0f && panel < kWindowsToneMapBypassNits) ? panel : 0.0f;
+        wchar_t prior[MAX_PATH] = {};
+        GetPrivateProfileStringW(section, (p + L"MHCPriorDefault").c_str(), L"", prior, MAX_PATH, iniPath);
+        mhc.priorDefaultProfile = prior;
+    }
     // Backward compatibility: if no permutation data but old DG path exists, migrate
     if (mhc.permNames[mhc.activePerm].empty() && !mhc.profileName.empty()) {
         // Old format: profilePath is the active profile, compute perm from settings

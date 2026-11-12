@@ -28,6 +28,7 @@
 #include "displayconfig.h"
 #include "globals.h"
 #include "shader.h"
+#include "actions/actions.h"   // NeutralPeak
 
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -1019,4 +1020,133 @@ TEST_CASE("SDR gamma 2.2 in one step: the identity profile with desktop gamma in
     REQUIRE(BuildMHC2ParamsForPerm(m, true, 99, ComputeMhcPermutation(m, true), peakMax));
     CHECK(peakMax.reportedPeakNits == kWindowsToneMapBypassNits);
     CHECK(peakMax.peakNits == id.peakNits);   // the curves stay scaled to the panel
+}
+
+namespace {
+float LumiNits(const std::vector<uint8_t>& p) {
+    uint32_t off = 0, size = 0;
+    REQUIRE(FindTag(p, "lumi", off, size));
+    return (float)(int32_t)ReadBE32(p.data() + off + 12) / 65536.0f;   // 'XYZ ' + reserved, then X Y Z: Y
+}
+float Mhc2MaxNits(const std::vector<uint8_t>& p) {
+    uint32_t off = 0, size = 0;
+    REQUIRE(FindTag(p, "MHC2", off, size));
+    return (float)(int32_t)ReadBE32(p.data() + off + 16) / 65536.0f;   // MinCLL at +12, MaxCLL at +16
+}
+}  // namespace
+
+TEST_CASE("SDR gamma 2.2 in one step: the profile tells HDR apps the peak they were told before, and so does the identity") {
+    // What Windows reported before the one step (act::DecideNeutralProfilePeak): 1600 (EDID), 600, 350, none.
+    for (float before : { 1600.0f, 600.0f, 350.0f, 0.0f }) {
+        CAPTURE(before);
+        MonitorSettings ms;
+        ms.hdrMHC.panelPeakNits = before;
+        ms.hdrMHC.desktopGammaEnabled = true;
+        ms.hdrMHC.dgSdrWhiteNits = 116.0f;
+        const float want = before > 0.0f ? before : MHC2ProfileParams().peakNits;   // none known: the 1000-nit default
+        CHECK(MhcProfileMetadataPeakNits(ms.hdrMHC, true) == want);
+        CHECK(MhcIdentityPeakNits(ms, true) == want);   // the identity left after the switch-off
+        MHC2ProfileParams dg;
+        REQUIRE(BuildMHC2ParamsForPerm(ms.hdrMHC, true, 99, ComputeMhcPermutation(ms.hdrMHC, true), dg));
+        const MHC2ProfileParams id = BuildIdentityMHC2Params(true, MhcIdentityPeakNits(ms, true), dg.monitorName);
+        std::vector<uint8_t> dgBytes, idBytes;
+        REQUIRE(GenerateMHC2Profile(dg, dgBytes));
+        REQUIRE(GenerateMHC2Profile(id, idBytes));
+        CHECK(LumiNits(dgBytes) == doctest::Approx(want).epsilon(1e-5));
+        CHECK(Mhc2MaxNits(dgBytes) == doctest::Approx(want).epsilon(1e-5));
+        CHECK(LumiNits(idBytes) == doctest::Approx(want).epsilon(1e-5));
+        CHECK(Mhc2MaxNits(idBytes) == doctest::Approx(want).epsilon(1e-5));
+        size_t diff = 0;
+        CHECK(SameOutside(dgBytes, idBytes, Mhc2LutRanges(dgBytes), &diff));   // still nothing else differs
+
+        // The peak is metadata only here: the 1D LUTs are those of the 1000-nit bake, word for word.
+        MonitorSettings at1000 = ms;
+        at1000.hdrMHC.panelPeakNits = 0.0f;
+        MHC2ProfileParams ref;
+        REQUIRE(BuildMHC2ParamsForPerm(at1000.hdrMHC, true, 99, ComputeMhcPermutation(at1000.hdrMHC, true), ref));
+        std::vector<uint8_t> refBytes;
+        REQUIRE(GenerateMHC2Profile(ref, refBytes));
+        for (int ch = 0; ch < 3; ch++) CHECK(Mhc2LutWords(dgBytes, ch) == Mhc2LutWords(refBytes, ch));
+    }
+}
+
+TEST_CASE("Desktop gamma, every route: the first HDR profile of ours records the peak and the previous default") {
+    // Every route that turns desktop gamma on for a display with no profile of ours reaches GenerateAndInstallMhcProfile
+    // with these settings: the Pipeline page's one step and GRAYSCALE's DESKTOP GAMMA switch (MhcSetDesktopGamma), the
+    // desktop gamma hotkey and the whitelist's swap (SwapDgAll's first pass), the processing start pass, and the pipe's
+    // layers verb followed by any of them. The record is taken inside it (HdrFirstInstallRecords), so they cannot differ.
+    MHCSettings dgOnly;
+    dgOnly.desktopGammaEnabled = true;
+    CHECK(HdrFirstInstallRecords(dgOnly, true));
+    // Other first installs with nothing measured record too (INSTALL with a white balance only, the editor's DONE).
+    MHCSettings wbOnly;
+    wbOnly.whiteBalanceEnabled = true;
+    wbOnly.whiteBalanceWx = 0.31f;
+    CHECK(HdrFirstInstallRecords(wbOnly, true));
+    // Never: SDR; a profile of ours already on it (its peak came from us); a measured peak (a calibration's).
+    CHECK_FALSE(HdrFirstInstallRecords(dgOnly, false));
+    MHCSettings ours = dgOnly;
+    ours.profileName = L"DesktopLUT_Mon0_HDR_1.icm";
+    CHECK_FALSE(HdrFirstInstallRecords(ours, true));
+    MHCSettings cube = dgOnly;
+    cube.sourceFilePath = L"C:\\cal\\mhc_hdr.cube";
+    cube.sourceIs1DCube = true;
+    CHECK_FALSE(HdrFirstInstallRecords(cube, true));
+    MHCSettings curve = dgOnly;
+    curve.baseGrayscale.enabled = true;
+    curve.baseGrayscale.initLinearPQ();
+    CHECK_FALSE(HdrFirstInstallRecords(curve, true));
+
+    // The record: the decided peak; the previous default when it was not ours.
+    act::NeutralPeak p;
+    p.nits = 600.0f;
+    p.source = act::NeutralPeakSource::Reported;
+    MHCSettings a = dgOnly;
+    ApplyHdrFirstInstallRecord(a, p, L"HDR Calibration_1.icc", false);
+    CHECK(a.panelPeakNits == 600.0f);
+    CHECK(a.priorDefaultProfile == L"HDR Calibration_1.icc");
+    MHCSettings b = dgOnly;
+    ApplyHdrFirstInstallRecord(b, p, L"", false);   // nothing was the default
+    CHECK(b.priorDefaultProfile.empty());
+    MHCSettings c = dgOnly;
+    c.priorDefaultProfile = L"HDR Calibration_1.icc";   // recorded earlier; our identity is the default now
+    ApplyHdrFirstInstallRecord(c, p, L"DesktopLUT_Display0_HDR_Identity.icm", true);
+    CHECK(c.priorDefaultProfile == L"HDR Calibration_1.icc");
+    CHECK(c.panelPeakNits == 600.0f);
+
+    // A display that never goes through any of them bakes as before, byte for byte (the 1000-nit default), and an SDR
+    // profile never carries the recorded peak.
+    MHCSettings never;
+    never.desktopGammaEnabled = true;
+    CHECK(MhcProfileMetadataPeakNits(never, true) == MHC2ProfileParams().peakNits);
+    MHCSettings sdr;
+    sdr.panelPeakNits = 600.0f;
+    MHC2ProfileParams sp, sp0;
+    REQUIRE(BuildMHC2ParamsForPerm(sdr, false, 99, ComputeMhcPermutation(sdr, false), sp));
+    sdr.panelPeakNits = 0.0f;
+    REQUIRE(BuildMHC2ParamsForPerm(sdr, false, 99, ComputeMhcPermutation(sdr, false), sp0));
+    std::vector<uint8_t> sb, sb0;
+    REQUIRE(GenerateMHC2Profile(sp, sb));
+    REQUIRE(GenerateMHC2Profile(sp0, sb0));
+    size_t diff = 0;
+    CHECK(SameOutside(sb, sb0, {}, &diff));
+}
+
+TEST_CASE("SDR gamma 2.2 in one step: the recorded peak never replaces a calibration's") {
+    MHCSettings m;
+    m.panelPeakNits = 600.0f;
+    // A base curve or an imported file carries the peak it was made at: it wins.
+    m.baseGrayscale.enabled = true;
+    m.baseGrayscale.peakNits = 1729.0f;
+    m.baseGrayscale.initLinearPQ();
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 1729.0f);
+    m.baseGrayscale.enabled = false;
+    m.sourceFilePath = L"C:\\cal\\mhc_hdr.cube";
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 1729.0f);
+    // Nothing measured: the recorded peak.
+    m.sourceFilePath.clear();
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 600.0f);
+    // A display that never used the one step: the 1000-nit default, as before (every existing profile bakes the same).
+    m.panelPeakNits = 0.0f;
+    CHECK(MhcProfileMetadataPeakNits(m, true) == MHC2ProfileParams().peakNits);
 }

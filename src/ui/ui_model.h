@@ -87,6 +87,11 @@ GammaOffer SdrGammaOffer(const MonitorSettings& ms, bool connected, Mode live, b
 // take away again (act::SetSdrGamma22). Whether a profile is installed is not part of it.
 bool HdrMhcOnlyDesktopGamma(const MHCSettings& hdr);
 
+// The offer's tooltip line about the peak HDR apps are told (act::DecideNeutralProfilePeak decides it at the switch):
+// on, the peak the profile reports (`hdr.panelPeakNits`, else the 1000-nit default, said as such); off, what it will
+// keep (`reportedNits` = what Windows reports now, else the EDID's `edidNits`, else the default).
+std::string SdrGammaPeakNote(const MHCSettings& hdr, bool on, float reportedNits, float edidNits);
+
 // Name to show for a display. The OS friendly name (EDID name descriptor via DisplayConfig) when there
 // is one; many EDIDs (and CRU overrides) carry none, so otherwise the EDID maker + product code from the
 // hardware id ("ASUS 322A"); "Display" when even that is unknown.

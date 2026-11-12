@@ -1,6 +1,8 @@
 #include "doctest.h"
 #include "actions/reconcile.h"
+#include "actions/actions.h"   // DecideNeutralProfilePeak
 #include "processing.h"   // PipelineMonitorIndices
+#include <cmath>
 #include <vector>
 
 // ============================================================================
@@ -472,6 +474,58 @@ TEST_CASE("analysis: the pipeline gets display 0 for it, and only while it is on
           ReconcileDecision::None);
     // Suspended: analysis is not a way around it.
     CHECK(DecideReconcile(In(false, neededOn, true)) == ReconcileDecision::None);
+}
+
+TEST_CASE("SDR gamma 2.2: the profile reports what HDR apps were told before it") {
+    using act::DecideNeutralProfilePeak;
+    using act::NeutralPeakSource;
+    auto peak = [](float stored, bool inHdr, float reported, bool ours, float edid) {
+        return DecideNeutralProfilePeak(stored, inHdr, reported, ours, edid);
+    };
+    // No profile before: Windows reports the EDID's peak (whatever it is; no 400-nit floor: it is what apps are told).
+    for (float edid : { 1600.0f, 600.0f, 350.0f }) {
+        CAPTURE(edid);
+        const auto p = peak(0.0f, true, edid, false, edid);
+        CHECK(p.nits == edid);
+        CHECK(p.source == NeutralPeakSource::Reported);
+    }
+    // No EDID peak, nothing reported: none known (the profile keeps the 1000-nit default; the interface says so).
+    CHECK(peak(0.0f, true, 0.0f, false, 0.0f).nits == 0.0f);
+    CHECK(peak(0.0f, true, 0.0f, false, 0.0f).source == NeutralPeakSource::Unknown);
+    // No EDID peak but Windows reports one (its own default for the panel): that is what apps are told.
+    CHECK(peak(0.0f, true, 1499.0f, false, 0.0f).nits == 1499.0f);
+    // The user's own default profile (the Windows HDR Calibration app's, 1250 nits) wins over the EDID.
+    CHECK(peak(0.0f, true, 1250.0f, false, 1600.0f).nits == 1250.0f);
+    // Our own profile is the default (the identity left by an earlier switch-off): its peak came from us — the recorded
+    // value stays; without one, the EDID's.
+    CHECK(peak(600.0f, true, 1000.0f, true, 1600.0f).nits == 600.0f);
+    CHECK(peak(600.0f, true, 1000.0f, true, 1600.0f).source == NeutralPeakSource::Kept);
+    CHECK(peak(0.0f, true, 1000.0f, true, 1600.0f).nits == 1600.0f);
+    CHECK(peak(0.0f, true, 1000.0f, true, 1600.0f).source == NeutralPeakSource::Edid);
+    // WINDOWS TONE MAP: Auto with our tone map off sends nothing (or gives the EDID's value back): what is reported is
+    // trusted. Auto with it over the full range, or Bypass, sent 10000: not a panel's peak, the EDID's then.
+    CHECK(peak(0.0f, true, 1600.0f, false, 1600.0f).nits == 1600.0f);
+    CHECK(peak(0.0f, true, 10000.0f, false, 1600.0f).nits == 1600.0f);
+    CHECK(peak(0.0f, true, 10000.0f, false, 0.0f).source == NeutralPeakSource::Unknown);
+    // Not in HDR (no reading to trust): the recorded value, else the EDID's.
+    CHECK(peak(0.0f, false, 80.0f, false, 600.0f).nits == 600.0f);
+    CHECK(peak(700.0f, false, 80.0f, false, 600.0f).nits == 700.0f);
+    // A later switch-on over a display whose default is not ours any more (the user ran HDR Calibration since):
+    // the new reading replaces the recorded one (it is never a value the user typed).
+    CHECK(peak(600.0f, true, 1250.0f, false, 1600.0f).nits == 1250.0f);
+    // Garbage readings never count.
+    CHECK(peak(0.0f, true, NAN, false, 600.0f).nits == 600.0f);
+    CHECK(peak(0.0f, true, -5.0f, false, 600.0f).nits == 600.0f);
+}
+
+TEST_CASE("SDR gamma 2.2: the switch-off gives the user's own previous default back") {
+    using act::ShouldRestorePriorDefault;
+    CHECK(ShouldRestorePriorDefault(L"HDR Calibration_1.icc", true));       // the Windows HDR Calibration app's
+    CHECK_FALSE(ShouldRestorePriorDefault(L"HDR Calibration_1.icc", false)); // its file is gone: the neutral one stays
+    CHECK_FALSE(ShouldRestorePriorDefault(L"", true));                        // there was none
+    CHECK_FALSE(ShouldRestorePriorDefault(L"DesktopLUT_Display0_HDR_Identity.icm", true));   // ours: never
+    CHECK(act::IsDesktopLutProfileName(L"DesktopLUT_Mon0_HDR_1.icm"));
+    CHECK_FALSE(act::IsDesktopLutProfileName(L"desktoplut.icm"));
 }
 
 TEST_CASE("analysis: overlay mode restarts the overlay for another display set, hook mode never") {

@@ -16,6 +16,7 @@
 #include <commdlg.h>
 #include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
 #include "actions/notify.h"
+#include "actions/actions.h"   // DecideNeutralProfilePeak
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -202,6 +203,9 @@ float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR) {
     // configured peak; otherwise the profile keeps the MHC2ProfileParams default.
     if (!mhc.sourceFilePath.empty()) return mhc.baseGrayscale.peakNits;
     if (mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty()) return mhc.baseGrayscale.peakNits;
+    // No measured peak: what Windows reported for the display before the one step put a profile of ours on it, so a
+    // neutral profile (and the identity one after it) changes nothing HDR apps are told. Else the params default.
+    if (isHDR && mhc.panelPeakNits > 0.0f && std::isfinite(mhc.panelPeakNits)) return mhc.panelPeakNits;
     return MHC2ProfileParams().peakNits;
 }
 
@@ -1053,6 +1057,65 @@ static bool SwapDgAll(bool dgEnabled) {
     return ok;
 }
 
+bool HdrFirstInstallRecords(const MHCSettings& m, bool isHDR) {
+    const bool measured = !m.sourceFilePath.empty() || (m.baseGrayscale.enabled && !m.baseGrayscale.points.empty());
+    return isHDR && m.profileName.empty() && !measured;
+}
+
+void ApplyHdrFirstInstallRecord(MHCSettings& m, const act::NeutralPeak& peak, const std::wstring& defaultProfile,
+                                bool defaultIsOurs) {
+    m.panelPeakNits = peak.nits;
+    if (!defaultIsOurs) m.priorDefaultProfile = defaultProfile;   // our own (an identity left by a Remove): kept as it was
+}
+
+namespace {
+
+// The display at a live index, enumerated afresh (any thread: g_gui.monitors is the GUI thread's).
+HMONITOR MonitorAt(int index) {
+    std::vector<HMONITOR> mons;
+    EnumDisplayMonitors(nullptr, nullptr,
+                        [](HMONITOR h, HDC, LPRECT, LPARAM lp) -> BOOL {
+                            reinterpret_cast<std::vector<HMONITOR>*>(lp)->push_back(h);
+                            return TRUE;
+                        },
+                        reinterpret_cast<LPARAM>(&mons));
+    return index >= 0 && index < (int)mons.size() ? mons[index] : nullptr;
+}
+
+// Before the first HDR profile of ours goes on a display whose profile carries no measured peak (every route: the
+// Pipeline page's one step, GRAYSCALE's DESKTOP GAMMA switch, the desktop gamma hotkey / whitelist swap, the start
+// pass, the pipe): what Windows reports for its peak now and which profile is its HDR default, recorded in the
+// settings (and in `copy`, which the bake reads) — the profile tells HDR apps what they were told before it, and the
+// one step's switch-off gives the user's own default back. Any thread (no GUI-thread caches).
+void RecordStateBeforeFirstHdrProfile(int monitorIndex, MHCSettings& copy) {
+    DisplayInfo di;
+    if (!GetDisplayInfoForMonitor(monitorIndex, di)) return;
+    const HMONITOR h = MonitorAt(monitorIndex);
+    DXGI_OUTPUT_DESC1 desc = {};
+    const bool inHdr = h && QueryFreshOutputDesc(h, desc) && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    const std::wstring def = QueryDisplayDefaultProfile(di.adapterId, di.sourceId, true);
+    const bool defOurs = act::IsDesktopLutProfileName(def);
+    float edid = 0.0f;
+    {
+        std::vector<BYTE> bytes;
+        EdidHdrLuminance lum;
+        if (!di.devicePath.empty() && ReadEDIDForDisplay(di, bytes) && ParseEDIDHdrLuminance(bytes.data(), bytes.size(), lum))
+            edid = lum.maxNits;
+    }
+    const act::NeutralPeak peak = act::DecideNeutralProfilePeak(copy.panelPeakNits, inHdr, desc.MaxLuminance, defOurs, edid);
+    ApplyHdrFirstInstallRecord(copy, peak, def, defOurs);
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        if (monitorIndex < (int)g_gui.monitorSettings.size())
+            ApplyHdrFirstInstallRecord(g_gui.monitorSettings[monitorIndex].hdrMHC, peak, def, defOurs);
+    }
+    std::wcout << L"[MHC] monitor " << monitorIndex << L": first HDR profile of ours: peak " << peak.nits
+               << L" nits (Windows reported " << desc.MaxLuminance << L", EDID " << edid << L"), HDR default before: "
+               << (def.empty() ? L"none" : def.c_str()) << std::endl;
+}
+
+}  // namespace
+
 // Generate, write, and install MHC2 ICC profile from current MHCSettings
 // Updates mhc.enabled/profilePath/profileName on success, calls UpdateMhcFlagsLive
 // Returns true if profile was generated and installed successfully
@@ -1070,6 +1133,7 @@ bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR) {
         mhcCopy = isHDR ? g_gui.monitorSettings[monitorIndex].hdrMHC
                         : g_gui.monitorSettings[monitorIndex].sdrMHC;
     }
+    if (HdrFirstInstallRecords(mhcCopy, isHDR)) RecordStateBeforeFirstHdrProfile(monitorIndex, mhcCopy);
 
     // Built for the variant the settings ask for, stage bypasses included: the profile filed under that
     // permutation must be the one on screen.

@@ -807,6 +807,15 @@ struct MHCSettings {
     // (RefreshDesktopGammaSdrWhite); persisted so a profile baked under another level is re-baked on load.
     // 80 = the original fixed bake (and the value assumed for profiles saved before this was tracked).
     float dgSdrWhiteNits = 80.0f;
+    // HDR: the peak Windows reported for the display before the one-step desktop gamma (act::SetSdrGamma22) put a
+    // profile of ours on it (a fresh DXGI read: the EDID's value or the user's own default profile's; else the EDID's).
+    // 0 = not known. The luminance tags of a profile with no measured peak (no imported file, no base curve) carry it
+    // instead of the 1000-nit params default (MhcProfileMetadataPeakNits), so the one step and the identity profile
+    // left after it tell HDR apps what they were told before. Never a value the user types. INI HDR_MHCPanelPeak.
+    float panelPeakNits = 0.0f;
+    // HDR: the display's default HDR profile before the one step, when it was not one of ours (the Windows HDR
+    // Calibration app's, a vendor's). Switching the one step off makes it the default again. INI HDR_MHCPriorDefault.
+    std::wstring priorDefaultProfile;
 
     // Stage bypasses (the interface's per-stage switches). The stage's own settings stay as they are; the
     // installed variant leaves the stage out (permutation bits PERM_NOPRIM / PERM_NOGRAY), so switching back

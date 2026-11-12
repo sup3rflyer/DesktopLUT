@@ -98,6 +98,20 @@ Result MhcSetDesktopGamma(int mon, bool on);                          // HDR
 // profile and its variants deleted). With anything else in the profile it is MhcSetDesktopGamma(mon, false).
 Result SetSdrGamma22(int mon, bool on);
 
+// Pure (tested): the peak the one step's profile reports (MHCSettings::panelPeakNits), decided just before it puts the
+// first profile of ours on the display. What Windows reports now is what HDR apps are told today — the EDID's value or
+// the user's own default profile's (the Windows HDR Calibration app's) — unless it is ours (our profile is the default:
+// its peak came from us; or the Windows tone map's 10000-nit bypass): then the stored value, else the EDID's, else none
+// (0: the profile keeps the 1000-nit params default, and the interface says so). Only plausible panel peaks count.
+enum class NeutralPeakSource { Reported, Kept, Edid, Unknown };
+struct NeutralPeak { float nits = 0.0f; NeutralPeakSource source = NeutralPeakSource::Unknown; };
+NeutralPeak DecideNeutralProfilePeak(float storedNits, bool inHdr, float reportedNits, bool defaultIsOurs, float edidNits);
+// A profile name DesktopLUT made (every one of ours starts with "DesktopLUT_").
+bool IsDesktopLutProfileName(const std::wstring& name);
+// Pure (tested): after the one step's off removed our profile, whether the user's own previous default profile is made
+// the default again — recorded, not ours, and its file still in the colour directory.
+bool ShouldRestorePriorDefault(const std::wstring& prior, bool fileExists);
+
 // The refresh-rate trim's switch (HDR, refresh_trim.h): on = the trim the display's DLC DIP holds for its live rate.
 // Either way the DIP is read again (the switch doubles as the RELOAD of a new measurement).
 Result MhcSetRefreshTrim(int mon, bool on);

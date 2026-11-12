@@ -72,9 +72,15 @@ std::vector<CorrectionRecord> ParseCorrectionStore(const std::string& json);
 
 // ---- dip_store.json: the refresh response per display and mode (DLC dip.py RefreshResponse, schema 1) -----------
 // A measured response, not a correction: per measured refresh rate, the panel's light at that rate over its light at
-// the reference rate (60 Hz) for full-field greys keyed by their 60-Hz light. DesktopLUT derives its per-rate MHC
-// trim from it (refresh_trim.h).
+// the section's reference rate (the rate the calibration was made at, by DLC's contract; 60 Hz on every section so far,
+// but recorded, never assumed) for full-field greys keyed by their reference-rate light. DesktopLUT derives its
+// per-rate MHC trim from it (refresh_trim.h).
 constexpr int kDipRefreshSchema = 1;            // the newest section schema this build reads
+// The number as DLC measured it, to `sig` significant digits, never shortened to "0" (or "-0") when it is not zero:
+// 1835.1 -> "1835", 121.72 -> "122", 0.0021 -> "0.0021", 0.05376 -> "0.0538"; trailing zeros dropped (0.0210 ->
+// "0.021"); whole digits are never rounded away (sig counts from the first digit only below 10^sig). `sign`: a "+"
+// on positive values. Exactly 0 prints "0"; not finite prints "" (the caller shows its dash).
+std::string FormatSig(double v, int sig, bool sign = false);
 struct DipRefreshLevel {
     double nits = kNaN;     // the reference-rate light (cd/m2), > 0
     double ratio = kNaN;    // light at the rate / at the reference rate, > 0
@@ -88,14 +94,38 @@ struct DipRefreshRate {
     std::vector<DipRefreshLevel> levels;   // ascending nits
     std::string sameAs;                    // DLC's verdict: this rate's response is that rate's ("" none; the
                                            // reference's key = no effect)
+    // How the rate was produced (additive, 2026-11-12): "mode" (a fixed display mode; also when absent) or "vrr" (a
+    // VRR cadence on the reference mode, listed here only when DLC's mode-vs-VRR cross-check passed). Informational:
+    // the trim treats both alike (DLC put it in `rates` as a fixed-mode trim input).
+    std::string source = "mode";
+    int proofOk = -1;                      // proof.ok: 1 / 0, -1 not given
+    std::string proofKind;                 // proof.kind ("displayconfig", "vrr:refresh_hz", ...)
+};
+// The VRR sweep (top-level `vrr`, additive): its range, how many points, the cross-check, and whether VRR points
+// became fixed-mode rates. Only what the card shows; the points themselves are DLC's evidence.
+struct DipRefreshVrr {
+    bool present = false;
+    double rangeLoHz = kNaN, rangeHiHz = kNaN;
+    int points = 0;
+    int crossCheckOk = -1;                 // 1 / 0, -1 not measured
+    std::string crossCheckRate;            // the rate measured both ways
+    bool fixedModeTrimDerived = false;
 };
 struct DipRefreshSection {
     std::string recordKey;                 // the DIP record ("Asus ProArt PA32UCXR:HDR")
     std::string display, mode;             // the record's display name, mode ("HDR"; from the key when absent)
     int schema = 0;
     std::string measured, runId;           // YYYY-MM-DD, the run
+    // The reference rate: the rate whose light every ratio is against, and at which no trim applies. Read from the
+    // section's `reference` {key, num, den}; a reference block without a positive rational makes the section unusable
+    // (error). With no reference block at all (DLC always writes one) the fields keep dip.py's own default, 60 / 1,
+    // and `referenceRecorded` is false: refresh_trim.cpp does not apply such a section (the calibration's rate is
+    // not on record).
     std::string referenceKey = "60";
     uint32_t referenceNum = 60, referenceDen = 1;
+    bool referenceRecorded = false;
+    double ReferenceHz() const { return referenceDen ? (double)referenceNum / (double)referenceDen : kNaN; }
+    DipRefreshVrr vrr;
     std::string hardwareId;                // identity.hardware_id, upper case: the EDID vendor + product it was measured on
     std::wstring devicePath;               // identity.device_path (the connector; twin panels)
     std::string edidId;                    // identity.edid_id (informational)
@@ -110,13 +140,51 @@ struct DipRefreshSection {
 // writes the DIP. A number DLC has not measured (absent or null) stays NaN, a word or a date stays empty.
 constexpr int kDipDefaultMaxAgeDays = 180;      // dip.py is_stale's default_max_age_days (a record may set its own)
 
-// peak_by_window (HDR, the "ABL graph": the light the panel holds per window size). Its JSON is not final, so only
-// its presence and its measured date are read. Extension point: the steps ({area_pct, early_nits, sustained_nits,
-// min_nits, tau_s, n}), identity, run id and conditions belong in this struct, read by ParsePeakByWindow in
-// dlc_data.cpp; their chart belongs to the PANEL card's PEAK BY WINDOW row (PanelCard in ui_dlc.cpp).
+// ---- peak_by_window (HDR, the "ABL graph", DLC dip.py PeakByWindow / peak_window.py, schema 1) -----------------------
+// The light against the size of a centred white window on black: per window size (% of the screen area) the EARLY
+// value (the first read after the window appeared), the SUSTAINED value (where the limiter / backlight settled), the
+// minimum and a fitted decay time, from an up pass and a mirrored down pass. Where the passes disagree DLC does not
+// average them: the combined values are null there (`agree` = 0) and each pass's own values remain. `valid` = every
+// size agreed and the run was complete. Read-only, like the rest of the DIP. Also the shape of the live probe chart
+// (charts.json probes.peak_by_window, ParsePeakWindowLive in dlc_live.cpp): there the passes come as series, the
+// verdict only once the run completes.
+constexpr int kDipPeakWindowSchema = 1;
+struct DipPeakPass {
+    bool present = false;
+    double early = kNaN, sustained = kNaN, min = kNaN, tau = kNaN;
+    int settled = -1;                      // 1 / 0 (the hold was cut at its max before settling: an upper bound), -1 unknown
+};
+struct DipPeakSize {
+    double areaPct = kNaN;                 // (0, 100]
+    double early = kNaN, sustained = kNaN, min = kNaN, tau = kNaN;   // combined; NaN where the passes disagree
+    DipPeakPass up, down;
+    int agree = -1;                        // 1 the passes agree, 0 they disagree, -1 one pass only (the turn) / not judged (live)
+    double relDiff = kNaN, tol = kNaN;     // |up - down| / mean, and the tolerance it was judged against
+    int n = 0;                             // reads behind it
+};
 struct DipPeakByWindow {
     bool present = false;                  // the record carries the section (non-null)
     std::string measured;                  // YYYY-MM-DD ("" when it has none)
+    int schema = 0;
+    bool newer = false;                    // a schema newer than this build reads: shown as such, not parsed
+    std::string error;                     // non-empty: present but unreadable (DLC drops it too), and why
+    std::string runId;
+    bool valid = false;
+    bool complete = true;                  // live: the run has finished (the DIP's section always has)
+    std::vector<DipPeakSize> curve;        // ascending area
+    double plateauNits = kNaN;             // the small-window level (the curve's maximum sustained value)
+    double runWindowAreaPct = kNaN;        // the largest window still on that plateau (evidence for a run window)
+    double runWindowSustainedNits = kNaN;
+    double fullFieldSustainedNits = kNaN;
+    std::vector<double> areasFailed;       // sizes whose passes disagree
+    bool systematic = false;               // one sign across the sizes: the panel drifted over the run
+    double maxRelDiff = kNaN;
+    int steps = 0;
+    std::string stack;                     // conditions.stack: "native" | "installed"
+    int emissive = -1;                     // conditions.emissive
+    double peakWhiteS = kNaN, longestHoldS = kNaN;   // wear
+    int stepsDone = -1, stepsPlanned = -1; // live only
+    bool Usable() const { return present && error.empty() && !newer && !curve.empty(); }
 };
 
 struct DipRecord {
@@ -162,6 +230,10 @@ struct DipStoreData {
     std::vector<std::string> dropped;      // keys of records DLC itself would drop (dip.py DipStore.load): not shown
 };
 DipStoreData ParseDipStore(const std::string& json);
+// One record's peak_by_window value as DLC's loader would take it (dip.py PeakByWindow.from_dict): not an object,
+// an entry that is not an object, an area outside (0, 100], a negative or non-numeric value, no curve or no measured
+// date = `error` (the record keeps its other fields); a newer schema = `newer`, nothing else read.
+DipPeakByWindow ParsePeakByWindowJson(const std::string& json);
 
 // ---- report.json ------------------------------------------------------------------------------------
 struct Verification {
