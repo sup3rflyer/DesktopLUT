@@ -83,6 +83,14 @@ Result SetLutBypass(int mon, bool hdr, bool bypass);
 Result MhcSetStageBypass(int mon, bool hdr, MhcStage stage, bool bypass);
 Result MhcSetCorrectionGsPeak(int mon, float nits);                   // HDR fine-tune, 10..10000
 Result MhcSetDesktopGamma(int mon, bool on);                          // HDR
+
+// ---- SDR content in HDR: gamma 2.2 (the Pipeline page's one-step desktop gamma) -----------------------
+// On: exactly MhcSetDesktopGamma(mon, true) — the GRAYSCALE inspector's DESKTOP GAMMA switch, which installs a neutral
+// HDR MHC profile when the display has none. Off: desktop gamma off and, while the HDR MHC settings hold nothing else
+// (ui::HdrMhcOnlyDesktopGamma), the profile removed by MhcRemove's path (the identity profile first, then the
+// profile and its variants deleted). With anything else in the profile it is MhcSetDesktopGamma(mon, false).
+Result SetSdrGamma22(int mon, bool on);
+
 // The refresh-rate trim's switch (HDR, refresh_trim.h): on = the trim the display's DLC DIP holds for its live rate.
 // Either way the DIP is read again (the switch doubles as the RELOAD of a new measurement).
 Result MhcSetRefreshTrim(int mon, bool on);
@@ -95,6 +103,23 @@ Result SetDisplayLabel(int slot, int liveIndex, const std::wstring& label);
 
 // ---- Settings ------------------------------------------------------------------------------------
 void SetHotkeyEnabled(int hotkeyId, bool on);      // HOTKEY_GAMMA / HOTKEY_HDR_TOGGLE / HOTKEY_ANALYSIS
+
+// ---- Global hotkeys (the hub window's, GUI thread) ----------------------------------------------------
+// Registered once at startup and kept until exit, each while its Settings switch is on: they work whether or not the
+// live layers run (the HDR switch needs nothing; analysis starts the engine it needs: SetAnalysis). A combination
+// another program holds cannot be registered: a warning says which, and the hotkey stays unregistered.
+void RegisterHotkeys();
+void UnregisterHotkeys();
+void ApplyHotkeyRegistration(int hotkeyId, bool on);   // WM_HOTKEY_REGISTER (SetHotkeyEnabled posts it)
+void OnHotkey(int hotkeyId);                            // WM_HOTKEY
+
+// ---- Analysis overlay (the readout of what is on the primary display) ---------------------------------------
+// On brings up what it measures through (the live layers start for it if nothing else runs them: the analysis-only
+// thread in hook mode, the overlay on display 0 otherwise); off stops whatever ran only for it. Refused while the
+// live layers are suspended. The header's ANALYSIS switch and the hotkey.
+Result SetAnalysis(bool on);
+bool AnalysisOn();
+
 void SetStartMinimized(bool on);
 void SetRunAtStartup(bool on);
 void SetConsoleLog(bool on);

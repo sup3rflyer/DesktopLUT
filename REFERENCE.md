@@ -7,11 +7,11 @@ Detailed technical reference. For working on the code, see [AGENTS.md](AGENTS.md
 Run `DesktopLUT.exe` to launch the GUI. Configure LUTs and color corrections per-monitor in the interface.
 
 ### Hotkeys
-- **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR)
+- **Win+Shift+G**: Toggle HDR gamma mode (HDR only, silent in SDR; "Desktop gamma: not set up" when no display has it)
 - **Win+Shift+Z**: Toggle HDR on/off for the focused monitor
-- **Win+Shift+X**: Toggle analysis overlay
+- **Win+Shift+X**: Toggle analysis overlay (the header's **ANALYSIS** switch). From idle it starts the live layers it needs (hook mode: the analysis-only thread; overlay mode: the overlay on display 0) and stops them again when it ends; refused while the live layers are suspended, and a Suspend turns it off.
 
-Hotkeys can be enabled/disabled in **SETTINGS** → **HOTKEYS** (classic window: the Settings tab). Key letters are configurable via INI file only.
+The hotkeys belong to the GUI thread's hub window from startup to exit, so they work with nothing configured (through 3.0.0 a running pipeline registered them and handed them between the hub and the overlay window). A combination another program holds stays unregistered, with a warning in Events. Hotkeys can be enabled/disabled in **SETTINGS** → **HOTKEYS** (classic window: the Settings tab). Key letters are configurable via INI file only.
 
 ## Settings File (INI)
 
@@ -33,9 +33,6 @@ TetrahedralInterp=1
 ConsoleLog=0
 ; 1 = show frame timing stats in analysis overlay (developer debug)
 ShowFrameTiming=0
-; 1 = the FALD flank fade's GPU safety governor never pauses it: on an integrated / small GPU and over its
-; budget alike (it may then stall the desktop on every content frame). Read at start, never written; absent = 0.
-FaldFlankFadeForce=0
 ; 1 = the FALD layer's GPU rate cap never holds a run: the full correction on every present whatever it costs (on a
 ; weak GPU that stalls the desktop). Read at start, never written; absent = 0.
 FaldCoreForce=0
@@ -251,7 +248,9 @@ When `DwmHookMode=1` (Settings → **DWM HOOK**; without the key: on for Windows
 
 Switching **DWM HOOK** on again clears every count.
 
-**Untested Windows builds**: the DLL picks its pattern set by Windows build (26200+ 25H2, 26100 24H2, 22000+ Windows 11, else Windows 10) with no upper bound. The host compares the running `dwmcore.dll` file version with the newest one this release was verified against for that set (`src/dwm_hook_build.h`, `kVerifiedDwmcore`: 25H2 = 10.0.26100.9168; no version recorded for the other sets). A newer one, or a set with none recorded, still injects: the **DWM HOOK** row shows **UNTESTED WINDOWS UPDATE**, the first injection adds one Events entry, and `state.get` reports `hook.dwmcore {version, verified_up_to, tested}`. A pattern the DLL does not find fails safe: without the `Present` pattern it refuses to load (the injection fails, then the fall-back above); a missing secondary pattern only leaves that hook or patch out (logged in `DesktopLUT_dwmhook.log`). A pattern that still matches while dwmcore's internals moved is what the notice is for: the Aug 2026 update tinted the desktop instead of failing.
+**Pre-flight**: before injecting, the host reads the on-disk `dwmcore.dll` as data (never loaded) and runs the DLL's own scan for the path it will take (`src/dwmcore_scan.*`, the patterns in `shared/dwm_hook_patterns.h`; about 25 ms, once per process). When an anchor is missing — `Present` (without it the DLL refuses to load), `OverlaysEnabled` (without it fullscreen windows bypass the LUT; on 25H2 its OverlayTestMode operand too), and before 25H2 `IsCandidateDirectFlipCompatible` — DesktopLUT does not touch `dwm.exe` and falls back to the overlay at once, saying the Windows update moved what the hook needs. `state.get` reports it as `hook.dwmcore.preflight {ran, ok, missing}`.
+
+**Untested Windows builds**: the DLL picks its pattern set by Windows build (26200+ 25H2, 26100 24H2, 22000+ Windows 11, else Windows 10) with no upper bound; on 26100.x it takes the 25H2 set when the 25H2 anchors resolve in that dwmcore (24H2 and 25H2 share cumulative updates: a patched 24H2 runs the 25H2-era dwmcore, where the 24H2 `Present` pattern matches nowhere). The host compares the running `dwmcore.dll` file version with the newest one this release was verified against for that set (`src/dwm_hook_build.h`, `kVerifiedDwmcore`: 25H2 = 10.0.26100.9168; no version recorded for the other sets). A newer one still injects: the **DWM HOOK** row shows **UNTESTED WINDOWS UPDATE**, the first injection adds one Events entry. A set with no version recorded, or an unreadable version, shows nothing. `state.get` reports `hook.dwmcore {version, verified_up_to, tested: true|false|null, verdict: verified|newer|no_baseline|unknown}`. A pattern the DLL does not find fails safe: without the `Present` pattern it refuses to load (the injection fails, then the fall-back above); a missing secondary pattern only leaves that hook or patch out (logged in `DesktopLUT_dwmhook.log`). A pattern that still matches while dwmcore's internals moved is what the notice is for: the Aug 2026 update tinted the desktop instead of failing.
 
 **Repair**: Windows updates can break DWM internals (AOB patterns, struct offsets). The hook then has to be repaired against the new `dwmcore.dll`; [AGENTS.md](AGENTS.md) §7 lists the rules for that. Until then, switch DWM HOOK off and use overlay mode.
 
@@ -513,7 +512,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   backlight: true / the panel's own estimate), 4 PASSTHROUGH (identity: the A/B baseline — the awake overlay itself
   differs from the sleeping overlay by 0.5–2 % at low levels, so compare against 4, not against OFF), 5 PEDESTAL ×100
   (the pedestal term applied), 6 PER-CHANNEL ×100 (what the per-channel pedestal changes against the white one),
-  7 SETTLING (LED lag: red = still rising, blue = still falling), 8 BOOST ZONES (white = a zone the black-frame boost
+  7 SETTLING (LED lag's panel clock: red = still rising, blue = still falling), 8 BOOST ZONES (white = a zone the black-frame boost
   counts as lit), 9 STARFIELD ZONES (blue = a peak pulled down). The new interface names the view on the
   FALD panel's title line, in amber, while one other than CORRECTED is on.
   **DesktopLUT's own windows keep the corrected picture** while a view is on (`shared/fald_exempt.h`): both paths draw
@@ -543,39 +542,10 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   show on a static desktop.
 - Cost: four small compute passes on the zone grid (48×48 zones × 2 sub-cells, for example) plus one full-screen
   pixel pass through an FP16 intermediate — not yet measured on low-end hardware.
-- **Flank fade** (experimental, default off, **no control in either window since 3.0**: it is switched by the INI or
-  the pipe, and the new interface shows its FLANK FADE row only while it is on; `shared/fald_fade.h`): fades the correction toward "layer off" on smooth steep flanks, keeps it on lit floors outside
-  the soft knee's reach, keeps a small dark object's own edge from lending fade to the lit floor round it (no bright halo
-  round a lamp head next to a glow), and low-passes the fade over content frames along the content's motion (phase
-  correlation + a cut test). INI per
-  monitor and mode `…FaldFlankFade` (absent = off; `…FaldLowExt` is reserved and not applied). Pipe:
-  `runtime.fald_flank_fade`; `state.get` reports `fald_flank_fade` / `fald_low_ext`. Overlay and hook (faldFlags
-  bit 8); its temporal state resets when the layer idles, on a panel-file switch and on re-injection. Its passes ship as
-  bytecode (`shared/fald_fade_bytecode.h`, regenerated by `tests/test_fald_fade.cpp`, which fails while it is stale) and
-  are created with its resources over the first ~25 runs after it is switched on (no shader compile, no burst of
-  allocations in one present); each texture is cleared as it is created and each pass is run once over an empty domain
-  there, so the driver's first touch of the memory (~40 ms at 4K) and its own compile do not land in the first content
-  frame. The layer runs without the fade until then. A run without new content on
-  the same frame (LED lag off) reuses both rounds' reach. GPU time of the fade on an RTX 5090 (boosted clock; the layer
-  with it minus without it): 4K 3.2 ms per content frame and 0.1 ms per present without new content, 1440p 1.6 /
-  0.02 ms, 1080p 1.1 / 0.02 ms; the first content frame with it costs the same. VRAM at 4K: ~490 MB. Two steps are
-  within the frozen gate-1 tolerances of the float64 twin rather than the first port's arithmetic bit for bit: the
-  phase correlation by a float32 FFT, and plain float32 sums on the Gaussians that feed thresholds and blends (lv's
-  four, which feed gradients, keep their Kahan sums). Float32 twin: `DLC/src/dlc/fald/fadeemu.py`.
-- **The flank fade's GPU safety governor** (`shared/fald_fade_governor.h`, overlay and hook alike): the GPU time of the
-  fade's passes is measured on every content frame with timestamp queries read a few frames later (no flush, no wait).
-  Budget = 15 % of the content-frame interval (median over the last 120 content frames), never more than the refresh
-  interval. When the p90 over the last 120 content frames (30 at least) is over the budget, or three content frames in a
-  row each take longer than a whole refresh interval, the fade is **paused**: FALD runs without it (exactly the layer
-  with the setting off) while the setting stays on. It is retried only after a mode change (HDR / SDR, resolution,
-  refresh), switching it off and on, or a content-frame interval that grew by 25 % and leaves 25 % headroom over the
-  p90 that paused it (at least 120 content frames later). An integrated / UMA GPU or one with less than 1 GB of VRAM
-  starts paused. `FaldFlankFadeForce=1` in `[General]` (above) disables the governor. The FALD panel shows `PAUSED`
-  with the p90 / budget (tooltip: why), an Events line records each change, and `state.get` reports
-  `fald_flank_fade_governor` per monitor and mode (`state`: off / running / suspended_budget / suspended_weak_gpu /
-  forced / unknown; `p90_ms`, `budget_ms`, `content_ms`, `refresh_ms`; `forced`). In hook mode the DLL reports it
-  through the section `Global\DesktopLUT_DwmHook_FaldStatus` (`shared/dwm_hook_config.h DwmHookFaldStatus`; the force
-  key travels as faldFlags bit 10).
+- **Flank fade**: removed after 3.0 (2026-11-12). It faded the correction toward "layer off" on smooth steep flanks; it was too
+  heavy for an always-on layer (several ms per 4K frame on a top GPU) and had no control since 3.0. An INI that still
+  has `…FaldFlankFade` / `…FaldLowExt` / `[General] FaldFlankFadeForce` loads without them and the next save deletes
+  them; `runtime.fald_flank_fade` and the `fald_flank_fade*` / `fald_low_ext` state fields are gone.
 - **The change-driven path** (`shared/fald_change.h`, overlay and hook alike): a present whose dirty rects touch few
   zones (at most half of them) recomputes only those zones' statistics; the GPU itself decides, with a decide pass
   after each sweep and indirect dispatches, whether the convolution, the gain, a full round-1 sweep and the full pixel
@@ -587,7 +557,7 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   recomputed (the presents while the peak settles after a content change: about 0.5 s after a brightening, up to ~3 s
   after a large darkening at 60 Hz). A live edit preview keys 0: the full path. The hook's log line carries `partial runs`.
 - **The layer's GPU rate cap** (`shared/fald_core_governor.h`, overlay and hook alike): the GPU time of the layer's full
-  run (the zone statistics, both convolutions, the gains, the pixel pass — not the flank fade) is measured on every full
+  run (the zone statistics, both convolutions, the gains, the pixel pass) is measured on every full
   run with timestamp queries read a few runs later. Budget = 15 % of the refresh interval. When the p90 over the last
   120 full runs (30 at least) is over the budget, or three full runs in a row each take longer than a whole refresh
   interval, the full run is **rate-capped**: it happens at most every p90 / 15 % of wall time (never less than a refresh
@@ -597,8 +567,8 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   switched off and on. `FaldCoreForce=1` in `[General]` (above) disables the cap. The FALD panel's `GPU` row shows
   the p90 / budget and `CAPPED` with the spacing (tooltip: why), an Events line records each change, and `state.get`
   reports `fald_core_governor` per monitor and mode (`state`: off / running / capped / forced / unknown; `p90_ms`,
-  `budget_ms`, `refresh_ms`, `spacing_ms`, `content_ms`; `forced`). In hook mode the DLL reports it through the same
-  section as the fade's (`DwmHookFaldStatus::core`; the force key travels as faldFlags bit 11). The same report carries
+  `budget_ms`, `refresh_ms`, `spacing_ms`, `content_ms`; `forced`). In hook mode the DLL reports it through the section
+  `Global\DesktopLUT_DwmHook_FaldStatus` (`DwmHookFaldStatus::core`; the force key travels as faldFlags bit 11). The same report carries
   the convolution variant, `conv_so` / `conv_tune` (below), and `core_mode_applied` / `core_on` (which core rule the
   layer applies; diagnostic).
 - **The convolution's auto-tune** (`shared/fald_conv_tune.h`, overlay and hook alike): the convolution pass exists in four
@@ -619,14 +589,15 @@ pre-distorts each pixel so it lands where it would in a flat field of its own le
   state, so the change-driven path reuses its fields. Measured on one mini-LED monitor (2026-10-23): the fill stays
   within 1.77 % RMS of its target at neutral levels on a colorimeter, and a blind viewing test of 12 clips showed no
   dark band beside bright objects. A lattice of more than 2048 fine nodes per axis (none known) runs without the cap.
-  No GUI control.
+  No GUI control and no setting: it is the only rule that ships (the earlier rules, kept as A/B test modes through
+  `…FaldCoreModeTest` and `runtime.fald_core_mode`, were removed after 3.0 (2026-11-12); an INI that still names one runs this rule).
 
 ### In the DWM hook
 
 The hook runs the **whole layer** the overlay path runs: the core (statistic → black-frame boost → convolution →
-gain, twice, then the pixel pass), starfield balancing, LED lag (the temporal modes, the panel clock and the settle
-hold — DWM presents nothing on a static desktop, so the host keeps it composing while the LED state settles) and the
-flank fade. Both paths run the same HLSL (`shared/fald_shader.h`), the same panel-file reader (`shared/fald_panel.h`)
+gain, twice, then the pixel pass), starfield balancing, LED lag (the panel clock and the settle
+hold — DWM presents nothing on a static desktop, so the host keeps it composing while the LED state settles). Both
+paths run the same HLSL (`shared/fald_shader.h`), the same panel-file reader (`shared/fald_panel.h`)
 and the same LED-lag bookkeeping (`shared/fald_temporal.cpp`) — there is no second implementation of the correction,
 and for the same input frame the hook's output must equal the overlay's (the field dump below checks it).
 
@@ -656,7 +627,7 @@ and for the same input frame the hook's output must equal the overlay's (the fie
   bytes is not re-delivered, a file being written is retried, a refused one is re-read only when it changes and
   reported once if it stays. Two dwm.exe processes (a second session) read the same sections and share one
   verdict word per section (status reporting only). The live switches (enable, view, per-channel pedestal,
-  starfield, flank fade) travel in `DwmHookSharedConfig::faldFlags`, and the starfield and LED-lag parameters in its
+  starfield) travel in `DwmHookSharedConfig::faldFlags`, and the starfield and LED-lag parameters in its
   tuning tail (`DwmHookFaldTuning`), over the seqlock, so changing them does not re-inject either — a re-injection
   re-rolls twin-panel routing.
 - **Dirty rects are given up while the layer is on.** One zone's content changes the correction of pixels far

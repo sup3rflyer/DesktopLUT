@@ -139,6 +139,8 @@ Also:
 | "how accurate is it now?" | `--flow verify-only` | measures the installed stack; builds and changes nothing |
 | learn the panel / meter | `--flow characterize` | first-time onboarding, or after big panel changes |
 | build a meter correction | `--flow build-correction` | needs a spectrometer |
+| "how bright is it per window size?" / the ABL graph | `--flow peak-window --mode HDR` | HDR probe, §17; nothing built or applied |
+| measure the refresh response for REFRESH TRIM | `--flow refresh-response --mode HDR` | HDR probe, §16; then `refresh_trim record` |
 
 **HDR is a mode, not a flow.** Use `--mode HDR` with `full` / `mhc-only` / `3dlut-only` / `verify-only`; never
 write `--flow hdr` (it aborts by design). Calibrate SDR and HDR separately; each mode has its own profile, cube,
@@ -174,6 +176,9 @@ Show the human the size before a long run.
 python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
   --dogegen-server 127.0.0.1:28930 --keep-dogegen-server
 ```
+- **Pass `--driver claude` on every invocation you launch** (the default is `cli`, a person at a shell;
+  DesktopLUT's DLC tab launches with `desktoplut`). It is recorded per invocation in `manifest.json` and shown in
+  the DLC tab from `runs/active.json`; it changes nothing else.
 - **Repeat every plan flag on every resume:** `--flow --mode --monitor --bit-depth`, the patch flags,
   `--dogegen-server`, `--keep-dogegen-server`. Then append `--run <dir> --decide <key>=<option>`.
   - Prior decisions persist in the run record; don't re-pass them.
@@ -184,7 +189,8 @@ python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
 - **Run folder:** a fresh run creates `runs/<timestamp>_…`. Find it in the first seam's `"run"` field or in
   `runs/active.json` (the newest run). You need it for resumes, check-ins and `--cancel`.
   - `runs/active.json` also says what that run is doing: `state` is `running`, `paused_seam` (with the waiting
-    `seam` key), `done`, `failed` or `cancelled`, next to its `pid`, display, monitor, mode and hardware id.
+    `seam` key), `done`, `failed` or `cancelled`, next to its `pid`, `driver`, display, monitor, mode and
+    hardware id.
   - The run's `manifest.json` keeps the exact first launch (`launch.argv` + `launch.cwd`) and appends every
     resume. A resume is `launch.argv` run from `launch.cwd`, plus `--run <dir> --decide <key>=<option>`.
   - A paused seam is also on the spine: its `seam` event (`status: paused`) carries the same question, options,
@@ -253,13 +259,27 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
   DLC tab (CANCEL), or PAUSE it (DLC rolls back after 3 minutes unless resumed): a `control.json` you did not
   write is the human's, so read it before resuming or deciding a seam.
 - **Abandon a paused run:** `python -m dlc.calibrate --run <dir> --abort` rolls DesktopLUT back and exits.
-  Without `--run` it can't restore what the run changed (candidate cube, viewing layers).
+  Without `--run` it can't restore what the run changed (candidate cube, viewing layers, a grayscale touch-up).
+  It restores the run's own monitor and mode from the run record, so `--mode` need not be repeated.
 - **Read the restore status it prints.** It is DesktopLUT's own answer. Full success is `reverted` (`--abort`,
   `revert`) or `rolled_back` (`--cancel` / rollback). Anything else needs telling the human:
   `partially_reverted` / `rolled_back_partially`, `nothing_restored` / `rollback_restored_nothing`,
-  `restore_unknown` / `rollback_unconfirmed`. The durable fallback is the pre-run
+  `restore_unknown` / `rollback_unconfirmed`, `rollback_failed`, `revert_unavailable` / `revert_unconfirmed`.
+  The durable fallback is the pre-run
   settings copy `runs/<run>/desktoplut_settings_backup.ini`. It needs `paths.desktoplut_ini` set in the profile.
   To use it: quit DesktopLUT, copy it back over `DesktopLUT.ini`, relaunch.
+- **`grayscale-wb` is committed before it is verified.** The touch-up is baked into the installed profile's
+  fine-tune curve at the end of its stage, so `measure:verify` scores the real result. Any ending that does not
+  apply it — `revert` at `verify:accept`, a cancel, a PAUSE that times out, a dead meter, a stall, a stage error,
+  a crash, `--abort` (also at the `verify:accept` pause) — puts back the curve the display had before the touch-up
+  (the user's own fine-tune, or the identity curve) and re-bakes. Before the commit, the live preview is simply
+  cancelled.
+  - `rolled_back` / `reverted` means a read-back showed that curve. When the payload says
+    `display_may_carry_touchup: true` (the pipe was gone, DesktopLUT refused, or the read-back did not match), the
+    display may still carry the unverified touch-up: tell the human, and run `--run <dir> --abort` again once
+    DesktopLUT is back. Restoring twice is harmless.
+  - `--abort` never takes back a touch-up that was applied (`verify:accept` = `apply`).
+  - A rolled-back `grayscale-wb` run refuses to resume (its result is no longer on the display).
 - Never resume a rolled-back run; start a fresh one.
 - Never run your own enter/exit probe scripts while a run is paused. The capture belongs to the open session.
 
@@ -355,20 +375,104 @@ python -m dlc.stages.fald_profile --phase register --run runs/<dir>     # then g
 
 ## 16. Refresh-rate trim (HDR)
 
-Some panels are a few percent brighter at lower refresh rates. DesktopLUT 3.0 trims the HDR MHC profile for the
-rate the display runs at, from a `refresh_response` section in the display's HDR DIP (`dip_store.json`). Rates that
-were not measured get no trim.
+Some panels are a few percent brighter at lower refresh rates (the PA32UCXR: +3.4 % at 0.5 nit, +1 % at 1000 nit
+at 48 Hz against 60). DesktopLUT 3.0 trims the HDR MHC profile for the rate the display runs at, from a
+`refresh_response` section in the display's HDR DIP (`dip_store.json`). Rates that were not measured get no trim.
 
-- The measurement is not a `--flow` yet. The building blocks are `dlc.refresh_mode` (switches one display's refresh
-  rate by hardware ID, temporarily, and verifies the switch) and `dlc.refresh_trim` (the analysis and the record
-  step).
-- Measure with DesktopLUT's own trim off: `layers.set` with `refresh_trim: false` for the display's HDR pair.
-  With it on, the readings show the trim's residual, not the panel's response.
-- Record a finished run: `python -m dlc.refresh_trim record --run <dir>` prints what would be written and any
-  problems; add `--write` to store it. A run with problems is not recorded.
-- The trim is off by default: the human switches it on in the REFRESH TRIM row (or `layers.set` with
-  `refresh_trim: true`).
-- DesktopLUT reads the DIP again on its next refresh-rate switch, on *RELOAD* in the REFRESH TRIM row (**PIPELINE**
-  → **GRAYSCALE**, HDR side), or on a `layers.set` with `refresh_trim`. `state.get` → `refresh_trim` says what is
-  applied.
-- Nothing is swapped during a calibration session. A normal run needs no extra step for it.
+**When to suggest it.** All of: the display is calibrated in HDR; the human watches content at 23.976 / 24 /
+47.952 / 48 / 50 Hz (a player that switches the refresh rate, or VRR); the HDR DIP record has no
+`refresh_response` (the characterize digest lists it under `gaps`). It is a suggestion: say what it costs (below)
+and let the human decide.
+
+**The run** is a probe flow — it measures and writes files, it builds and applies nothing:
+
+```bash
+python -m dlc.refresh_probe modes --hardware-id <EDID id>          # read-only: which rates the display offers
+python -m dlc.refresh_probe plan --rates 47.952,50 --reference 60 --out runs/refresh_spec.json
+python -m dlc.refresh_probe run --spec runs/refresh_spec.json --monitor N --profile calibration_profile.yaml \
+    --dogegen-server 127.0.0.1:28930 --bit-depth 10               # = python -m dlc.calibrate --flow refresh-response
+```
+- The display is found by `quirks.hardware_id` (else the pipe's) and cross-checked against Windows' DisplayConfig.
+  Only that display is ever switched; every switch is temporary (nothing saved), read back exactly (the rational,
+  so 47.952 and 48 are told apart; the resolution; HDR on; the other displays untouched).
+- **Seams:** `refresh-response:plan` (the rates, the legs, the levels, the window, the time — and *confirm that the
+  reference is the rate the calibration was made at*), then **one consent per switch away from the reference**
+  (`refresh-response:switch:L<leg>:<rate>`). The plan seam lists every switch key: once the human has agreed to
+  the switches, you may answer them together on the resume (`--decide` per key).
+- Through the installed HDR MHC, with the viewing layers (tone map, desktop gamma, WB, grayscale, FALD), the 3D LUT
+  and DesktopLUT's own refresh trim switched off; all of it is restored at the end. A pause leaves the display at
+  the reference rate with the measurement stack in place. **If you abandon a paused or died run:**
+  `python -m dlc.refresh_probe restore --run <dir>` (puts the exact recorded mode back, repairs the saved mode if
+  something saved one, restores the layers). `--abort` alone does not restore the refresh rate.
+- Length: a warm-in at the reference (5–20 min, closed loop), then reference → rate → reference brackets in two
+  mirrored passes, ≥ 30 s settle after each switch (DesktopLUT's MHC burst). Two rates ≈ 1 h.
+- **VRR instead of mode switches** (spec `"source": "vrr"`): the display stays in its reference mode with VRR
+  active and a presenter paces frames, so every rate is nearly free and needs no consent. The sweep starts at the
+  ends of the VRR range plus the content rates in it and adds rates where the response bends. Pre-flight refuses:
+  no presenter (the native `tools/vrr_tpg` presenter is **not built yet** — until it is, use the mode source), an
+  unreadable VRR range (EDID, or give `vrr_range` in the spec), DesktopLUT's DWM hook injected or overlay awake (the
+  human switches DWM Hook mode off for the sitting and back on afterwards). Rates below the range floor are never
+  planned (frame doubling). Have the human confirm VRR is on in the driver and the monitor's OSD. Each rate is
+  proven (the presenter's DXGI refresh count, or the meter's own refresh measurement); with neither, a check-in asks
+  the human to read the monitor's refresh counter — relay it, cancel if it is wrong. One rate is measured both ways
+  (VRR and a fixed mode): only if they agree do VRR points become fixed-mode trims.
+
+**Judge the result** (the run's digest and `refresh_result.json`):
+- The ratios per rate and level, with their uncertainty; luminance only (`P5`: dx, dy small), channel-independent
+  (`P6`), 59.94 ≈ 60 (`P3`, the control), 48 ≈ 47.952 (`P2`).
+- The predictability verdict: linear in frame period / in frequency / nonlinear. Nonlinear = only the measured
+  rates get a trim; never promise interpolation the verdict does not give.
+- VRR runs: `vrr.model` (interpolable inside the measured span? extrapolable — default no), `vrr.cross_check`, and
+  `fixed_mode_trim_derived`. A failed cross-check still records the VRR curve (its own thing), not a trim.
+- Anomalies (an unsettled switch, DesktopLUT state churn): a run with anomalies is not recordable as is — judge
+  whether to re-run.
+
+**Record:** `python -m dlc.refresh_trim record --run <dir>` prints what would be written and any problems (a
+simulated run, anomalies, a layer that was on, no hardware id); add `--write` to store it. Then **suggest that the
+human switches REFRESH TRIM on** in the app (**PIPELINE** → **GRAYSCALE**, HDR side: the REFRESH TRIM row, or
+`layers.set` with `refresh_trim: true`). DesktopLUT reads the DIP again on its next refresh-rate switch, on
+*RELOAD* in that row, or on a `layers.set` with `refresh_trim`; `state.get` → `refresh_trim` says what is applied.
+Nothing is swapped during a calibration session.
+
+## 17. Peak by window — the ABL graph (HDR)
+
+How bright the display gets as a white window grows from 1 % to 100 % of the screen: what OLED owners call the ABL
+graph. An OLED falls steeply past a knee (its power limiter); a mini-LED stays flatter and sags with heat. The
+curve itself tells them apart — there is no panel-class setting.
+
+**When to run it:** the human asks for it; an OLED was characterized in HDR and the record has no
+`peak_by_window` (the characterize digest lists it under `gaps`); before choosing an OLED run window.
+
+```bash
+python -m dlc.peak_window plan --emissive --out runs/pbw_spec.json      # sizes, durations, wear; touches nothing
+python -m dlc.peak_window run --spec runs/pbw_spec.json --monitor N --profile calibration_profile.yaml \
+    --dogegen-server 127.0.0.1:28930 --bit-depth 10                     # = python -m dlc.calibrate --flow peak-window
+python -m dlc.peak_window show --dip dip_store.json --display "<name>"   # a recorded curve
+```
+- It needs the patch **daemon** (Resolve transport, the default) — each step paints its own window; the daemon's
+  `--patch-size` does not matter here. It refuses up front: not HDR, no HDR DIP record (characterize first), a
+  calibration session another run holds, a plan over its wear caps.
+- **Consent** (`peak-window:consent`) before anything is shown: the sizes, the time at peak white (typical, worst
+  case, hard cap) and the longest single hold. Emissive defaults: holds ≤ 15 s (hard cap 30 s), ≤ 300 s at peak
+  white in total; a **full-field** step on an emissive panel asks its own consent (`peak-window:full-field`,
+  recommendation *skip*; at most 10 s). LCD defaults are longer (hold 30 s, cap 60 s, total 1200 s).
+- Each step: a black cool-down that ends on evidence (at least the previous hold's length, black reads stable,
+  capped), then full-code white read back to back: the **early** value (first read), the **sustained** value (a
+  settled tail), the minimum and a fitted decay time. Sizes run up and back down; the top size once.
+- Stack: `native` by default (identity profile, every layer off, as a calibration's raw stage); spec
+  `"stack": "installed"` measures through the user's MHC + 3D LUT. Either way it is recorded.
+- Cancel / meter loss / a crash restore the display as with any flow.
+
+**Read the result** (`results/peak_window.json`, the `peak-window:record` seam's digest, the DLC tab's chart):
+- `curve`: per size, early / sustained / min / decay, and the up/down agreement. **`valid` = the two passes agree**
+  at every size. Disagreement with one sign across the sizes = the panel drifted over the run (heat); those sizes
+  carry no combined value. Recommendation at the seam: record a valid curve, discard an invalid one (re-run cooler,
+  or later).
+- `plateau_nits` (the small-window level), `run_window_area_pct` (the largest window still within 3 % of it — a
+  candidate OLED run window, evidence only), `full_field_sustained_nits`.
+- Unsettled holds (still falling at the hold's max) are flagged: that size's sustained value is an upper bound.
+
+**What it does not measure:** the minutes-long static dimming (TPC / ASBL — a separate static-hold probe), a
+non-black surround (APL), windows away from the centre, the panel's other picture modes (each OSD mode is its own
+curve; it is not keyed by mode). It writes only `peak_by_window`: the HDR calibration peak
+(`sustained_peak_nits`) is untouched — which window a calibration peak should use is the owner's decision.

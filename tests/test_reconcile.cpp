@@ -1,5 +1,7 @@
 #include "doctest.h"
 #include "actions/reconcile.h"
+#include "processing.h"   // PipelineMonitorIndices
+#include <vector>
 
 // ============================================================================
 // Live layers follow the configuration (src/actions/reconcile.*): DecideReconcile is the whole policy —
@@ -413,4 +415,70 @@ TEST_CASE("hook watchdog: re-inject a lost hook, stand down idle when nothing ne
     // The flap cap wins over standing down: a hook that keeps dropping stays down for good.
     CHECK(DecideHookWatchdog(false, cap, cap, false) == WatchdogAction::GiveUp);
     CHECK(DecideHookWatchdog(false, cap, cap, true) == WatchdogAction::GiveUp);
+}
+
+// ============================================================================
+// The global hotkeys work from a fresh install (act::OnHotkey, the hub window's for the whole session) and
+// the analysis overlay brings up the engine it needs and takes it down again.
+// ============================================================================
+
+TEST_CASE("hotkeys: desktop gamma toggles only what is configured, and only where it shows") {
+    using act::DecideGammaHotkey;
+    using act::GammaHotkey;
+    // A fresh install: nothing to toggle (it used to flip a global flag that made every display "need" the live
+    // layers, with no profile to carry the gamma).
+    CHECK(DecideGammaHotkey(false, false) == GammaHotkey::NotSetUp);
+    CHECK(DecideGammaHotkey(false, true) == GammaHotkey::NotSetUp);
+    CHECK(DecideGammaHotkey(true, false) == GammaHotkey::NoHdrDisplay);   // SDR shows no desktop gamma
+    CHECK(DecideGammaHotkey(true, true) == GammaHotkey::Toggle);
+}
+
+TEST_CASE("analysis: the switch shows, hides, and refuses only a start while suspended") {
+    using act::AnalysisSwitch;
+    using act::DecideAnalysisSwitch;
+    CHECK(DecideAnalysisSwitch(true, false, false, false) == AnalysisSwitch::Show);
+    CHECK(DecideAnalysisSwitch(false, true, false, false) == AnalysisSwitch::Hide);
+    CHECK(DecideAnalysisSwitch(true, true, false, false) == AnalysisSwitch::Unchanged);
+    CHECK(DecideAnalysisSwitch(false, false, false, false) == AnalysisSwitch::Unchanged);
+    // Suspended: turning it on would start what the user stopped; turning it off always goes through.
+    CHECK(DecideAnalysisSwitch(true, false, true, false) == AnalysisSwitch::RefusedSuspended);
+    CHECK(DecideAnalysisSwitch(false, true, true, false) == AnalysisSwitch::Hide);
+    // Shutting down: nothing.
+    CHECK(DecideAnalysisSwitch(true, false, false, true) == AnalysisSwitch::Unchanged);
+    CHECK(DecideAnalysisSwitch(false, true, false, true) == AnalysisSwitch::Unchanged);
+}
+
+TEST_CASE("analysis: the pipeline gets display 0 for it, and only while it is on") {
+    // needsProcessing per live display, desktop gamma configured anywhere, analysis on.
+    using V = std::vector<int>;
+    CHECK(PipelineMonitorIndices({ false, false }, false, false).empty());   // a fresh install: nothing runs
+    CHECK(PipelineMonitorIndices({ false, false }, false, true) == V{ 0 });  // analysis alone: the display it measures
+    CHECK(PipelineMonitorIndices({ false, true }, false, false) == V{ 1 });
+    CHECK(PipelineMonitorIndices({ false, true }, false, true) == V{ 0, 1 });
+    CHECK(PipelineMonitorIndices({ true, false }, false, true) == V{ 0 });   // already there: once
+    CHECK(PipelineMonitorIndices({ false, false }, true, false) == V{ 0, 1 });   // desktop gamma: every display
+    CHECK(PipelineMonitorIndices({}, false, true).empty());                  // no display: nothing to measure
+
+    // From idle: analysis on is the only need, so the reconcile starts the live layers; analysis off again leaves no
+    // need, so it stops them — nothing the user did not ask for stays running.
+    bool analysis = true;
+    const bool neededOn = !PipelineMonitorIndices({ false, false }, false, analysis).empty();
+    CHECK(DecideReconcile(In(false, neededOn)) == ReconcileDecision::Start);
+    analysis = false;
+    const bool neededOff = !PipelineMonitorIndices({ false, false }, false, analysis).empty();
+    CHECK(DecideReconcile(In(true, neededOff)) == ReconcileDecision::Stop);
+    // With a cube running for display 1, switching analysis off keeps the pipeline (its need stays).
+    CHECK(DecideReconcile(In(true, !PipelineMonitorIndices({ false, true }, false, false).empty())) ==
+          ReconcileDecision::None);
+    // Suspended: analysis is not a way around it.
+    CHECK(DecideReconcile(In(false, neededOn, true)) == ReconcileDecision::None);
+}
+
+TEST_CASE("analysis: overlay mode restarts the overlay for another display set, hook mode never") {
+    using act::AnalysisNeedsOverlayRestart;
+    CHECK(AnalysisNeedsOverlayRestart(false, true, true, true));
+    CHECK_FALSE(AnalysisNeedsOverlayRestart(false, true, false, true));   // display 0 was there already
+    CHECK_FALSE(AnalysisNeedsOverlayRestart(false, false, true, true));   // not running: the reconcile starts it
+    CHECK_FALSE(AnalysisNeedsOverlayRestart(false, true, true, false));   // nothing needed any more: the reconcile stops
+    CHECK_FALSE(AnalysisNeedsOverlayRestart(true, true, true, true));     // hook mode: the analysis-only thread
 }

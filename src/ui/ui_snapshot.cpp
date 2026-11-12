@@ -9,7 +9,6 @@
 #include "desktoplut_ipc_server.h"
 #include "processing.h"   // IsProcessingTransitionActive
 #include "windows_tonemap.h"   // EdidHdrPeakNits
-#include "fald_fade_status.h"  // FaldFadeGovReportFor
 #include <dxgi1_6.h>
 #include <mutex>
 
@@ -137,8 +136,6 @@ void TakeSnapshot(Snapshot& out) {
             r.widthPx = mi.rcMonitor.right - mi.rcMonitor.left;
             r.heightPx = mi.rcMonitor.bottom - mi.rcMonitor.top;
         }
-        // the flank fade governor's status per mode (the overlay's table, or the hook's section by position)
-        for (int h = 0; h < 2; h++) FaldFadeGovReportFor(r.liveIndex, r.hmon, h == 1, r.fadeGov[h]);
         for (int h = 0; h < 2; h++) FaldCoreGovReportFor(r.liveIndex, r.hmon, h == 1, r.coreGov[h]);
     }
 
@@ -161,7 +158,9 @@ void TakeSnapshot(Snapshot& out) {
     if (!IsProcessingTransitionActive()) {
         out.running = g_gui.isRunning.load();
         out.hookActive = g_dwmHookMode.load() && IsDwmHookActive();
+        out.hookIdle = out.running && !out.hookActive && DwmHookIdle();
     }
+    out.analysis = g_analysisEnabled.load();
     out.hookMode = g_dwmHookMode.load();
     out.hookActive = out.hookActive && out.hookMode;
     out.hookBuild = DwmHookBuildCheck();   // read once per process

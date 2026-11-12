@@ -265,10 +265,11 @@ class OverlayTracker:
         if "fald_temporal_mode" not in layers:
             self.temporal_note = "build without runtime.fald_temporal (pre-2026-09-17): no temporal drive state"
             return
-        saved = {"temporal_mode": int(layers.get("fald_temporal_mode", 0)), "tau_rise_ms": float(layers.get("fald_tau_rise_ms", 0.0)),
-                 "tau_fall_ms": float(layers.get("fald_tau_fall_ms", 0.0)), "delay_frames": int(layers.get("fald_delay_frames", 0))}
-        # temporal mode 3 "panel clock" (2026-09-20, work guide C13) is a temporal mode like the others — any mode != 0
-        # is forced off — and carries two more persisted values (absent on older builds)
+        # (fald_tau_rise_ms / fald_tau_fall_ms / fald_delay_frames went with the first-order modes 1 / 2, 2026-11-12: a
+        # report is a record only — the restore below never sends them)
+        saved = {"temporal_mode": int(layers.get("fald_temporal_mode", 0))}
+        # the panel clock (temporal mode 3, 2026-09-20, work guide C13) — any mode != 0 is forced off — carries two more
+        # persisted values (absent on older builds)
         if "fald_temporal_closure" in layers:
             saved["closure"] = float(layers["fald_temporal_closure"])
         if "fald_temporal_parity" in layers:

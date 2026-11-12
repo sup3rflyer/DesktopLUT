@@ -10,7 +10,6 @@
 #include "ui/ui_dlc.h"
 #include "dlc/dlc_live.h"   // ResetLiveWatchForTest
 #include "dlc/dlc_scan.h"   // ResetScannerForTest
-#include "fald_fade_status.h"   // FaldFadeGovPostEvent (the flank fade governor's Events line)
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include <d3d11.h>
@@ -518,12 +517,6 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
     notify::Post(notify::Sev::Success, 0, L"mhc", L"Profile installed", L"DesktopLUT_HDR_AUS322A.icm");
     notify::Post(notify::Sev::Warning, 1, L"mhc", L"Profile restored", L"Windows dropped the association");
     notify::Post(notify::Sev::Info, 0, L"hook", L"Injected into dwm.exe");
-    {   // the flank fade governor's Events line (src/fald_fade_status.cpp), as the render path posts it
-        FaldFadeGovReport g;
-        g.known = true; g.state = FaldFadeGovState::SuspendedBudget;
-        g.p90Ms = 9.4; g.budgetMs = 6.3; g.contentMs = 41.7; g.refreshMs = 6.94;
-        FaldFadeGovPostEvent(0, true, g);
-    }
 
     const ui::Snapshot base = FakeSnapshot();
     // variant: 0 as made, 1 the 3D LUT and primaries stages of the HDR display switched off, 2 suspended, 3/4 grayscale
@@ -555,11 +548,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         // 25: shot 23 on BOOST ZONES with the VIEW list open: under the field, and over it where the window is short.
         { "faldview", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 25 },
         { "faldviewnarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 25 },
-        // the flank fade on and its governor: 26 paused over budget (p90 / budget), 27 paused on a weak GPU, 28 forced
-        { "faldfadepaused", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 26 },
-        { "faldfadepausednarrow", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 920, 520, 26 },
-        { "faldfadeweak", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 27 },
-        { "faldfadeforced", ui::Page::Pipeline, ui::StageId::Fald, 0, false, -1, -1, 1180, 760, 28 },
+        // (variants 26-28 were the removed flank fade's governor rows)
         { "gsedit", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 3 },
         { "gseditsdr", ui::Page::Pipeline, ui::StageId::Grayscale, 1, false, -1, -1, 1180, 760, 4 },
         { "whitelist", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 5 },
@@ -602,6 +591,34 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "uninstall", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 40 },
         { "uninstalldone", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 41 },
         { "uninstallnarrow", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 40 },
+        // The PANEL view (the DIP record): 60 the HDR display with everything measured and its REFRESH TRIM off (also
+        // narrow), 61 the BenQ with a record of the mandatory fields only, 62 the BenQ with no record, 63 not matched.
+        { "dlcpanelhdr", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 60 },
+        { "dlcpanelnarrow", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 60 },
+        { "dlcpaneltall", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 1040, 60 },   // the whole card
+        { "dlcpanelnarrowtall", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 1560, 60 },   // under the charts
+        { "dlcpanelsdr", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 61 },
+        { "dlcpanelnone", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 62 },
+        { "dlcpanelunmatched", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 63 },
+        // The front door (a fresh install: nothing configured, no DLC): 70 the HDR display offered SDR CONTENT: GAMMA
+        // 2.2, 71 the same switched on (its neutral profile installed, the live layers running with no hook work), 72
+        // the SDR display (no offer), the calibrated HDR display (no offer; GRAYSCALE's switch as before), 74 analysis on.
+        { "frontoffer", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 70 },
+        { "frontoffernarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 70 },
+        { "fronton", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 71 },
+        { "frontonnarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 71 },
+        { "frontongray", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 1180, 760, 71 },
+        { "frontsdr", ui::Page::Pipeline, ui::StageId::Lut3D, 1, false, -1, -1, 1180, 760, 72 },
+        { "frontsdrnarrow", ui::Page::Pipeline, ui::StageId::Lut3D, 1, false, -1, -1, 920, 520, 72 },
+        { "frontcal", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1 },
+        { "frontcalnarrow", ui::Page::Pipeline, ui::StageId::Grayscale, 0, false, -1, -1, 920, 520 },
+        { "frontanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 74 },
+        { "frontanalysisnarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 74 },
+        // Their tooltips: the offer's switch and its WHITELIST, DISPLAY PEAK, the header's ANALYSIS.
+        { "fronttipoffer", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 510, 95, 1180, 760, 70 },
+        { "fronttiponwl", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 585, 95, 1180, 760, 71 },
+        { "fronttippeak", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 300, 282, 1180, 760, 70 },
+        { "fronttipanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 995, 28, 1180, 760, 70 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -707,13 +724,6 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     auto data = std::make_shared<dlc::Data>();
                     data->configured = L"X:\\Moved\\DLC";   // the scan for it found nothing there
                     snap.dlc = data;
-                } else if (shot.variant == 26 || shot.variant == 27 || shot.variant == 28) {
-                    snap.live[0].settings.hdrColorCorrection.fald.flankFade = true;
-                    FaldFadeGovReport& g = snap.live[0].fadeGov[1];
-                    g.known = true;
-                    g.state = shot.variant == 26 ? FaldFadeGovState::SuspendedBudget
-                            : shot.variant == 27 ? FaldFadeGovState::SuspendedWeakGpu : FaldFadeGovState::Forced;
-                    g.p90Ms = 9.4; g.budgetMs = shot.variant == 28 ? 0.0 : 6.3; g.contentMs = 41.7; g.refreshMs = 6.94;
                 } else if (shot.variant >= 29 && shot.variant <= 32) {
                     RefreshTrimStatus& t = snap.live[0].refreshTrim;
                     if (shot.variant == 29) {
@@ -728,6 +738,76 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                         t.state = "off"; t.wantStamp.clear(); t.applied = false;
                     } else {
                         t.waiting = "calibration"; t.applied = false; t.activeStamp.clear();
+                    }
+                } else if (shot.variant >= 60 && shot.variant <= 63) {
+                    // The DIP: the HDR display's full record (and a minimal SDR one for it); the BenQ's per variant.
+                    std::string benq;
+                    if (shot.variant == 61) benq = R"(, "BenQ PD2700U:SDR": {"display": "BenQ PD2700U", "mode": "SDR", "made": "2026-09-26"})";
+                    const std::string json = std::string(R"({"schema": 1, "displays": {
+                        "PA32UCXR:HDR": {"display": "PA32UCXR", "mode": "HDR",
+                          "noise_model": [{"nits": 0.07, "sigma_de": 0.0003}, {"nits": 1.8, "sigma_de": 0.0048}],
+                          "noise_floor_nits": 0.0, "settle_seconds": 1.66, "settle_by_level": {"bright": 1.66, "dark": 0.0},
+                          "native_white_xy": [0.31692, 0.32838], "native_white_nits": 1835.1, "native_black_nits": 0.0,
+                          "sustained_peak_nits": 1652.0, "eotf_undershoot": 0.01453,
+                          "native_primaries": {"R": [0.6934, 0.3016], "G": [0.1906, 0.7444], "B": [0.1521, 0.0632]},
+                          "thermal_regime": "convergent", "warmup_minutes": 29.57, "cold_channel": "B",
+                          "instrument": "X-Rite i1 DisplayPro", "made": "2026-06-19", "updated": "2026-10-10",
+                          "refresh_response": {"measured": "2026-10-03", "run_id": "20261003_180329_refresh_trim_hdr_mon0_trim",
+                            "identity": {"hardware_id": "AUS322A"},
+                            "rates": [{"key": "59.94", "num": 60000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 1.0003}]},
+                                      {"key": "50", "num": 50, "den": 1, "levels": [{"nits": 0.5, "ratio": 0.98}]},
+                                      {"key": "48", "num": 48, "den": 1, "levels": [{"nits": 0.5, "ratio": 0.97}]},
+                                      {"key": "47.952", "num": 48000, "den": 1001, "levels": [{"nits": 0.5, "ratio": 0.97}]}]},
+                          "peak_by_window": {"measured": "2026-10-10"}},
+                        "PA32UCXR:SDR": {"display": "PA32UCXR", "mode": "SDR", "native_white_nits": 121.7, "made": "2026-03-18"})") +
+                                             benq + "}}";
+                    auto data = std::make_shared<dlc::Data>(*snap.dlc);
+                    data->dip = dlc::ParseDipStore(json);
+                    data->dipFound = data->dip.readable;
+                    snap.dlc = data;
+                    snap.live[0].dlcLive.hardwareId = "AUS322A";
+                    snap.live[0].settings.hdrMHC.refreshTrimEnabled = false;   // the DIP has a response, the trim is off
+                    if (shot.variant == 63) {
+                        snap.live[1].dlcMatch = dlc::DisplayMatch();
+                        snap.live[1].dlcRecord[0] = snap.live[1].dlcRecord[1] = dlc::ModeRecord();
+                        snap.live[1].reminderDue = false;
+                    }
+                } else if (shot.variant >= 70 && shot.variant <= 74) {
+                    // A fresh install: every display on default settings (the HDR one's tone map target seeded from its
+                    // 1600-nit EDID peak), no DLC folder, nothing running.
+                    snap.dlc = std::make_shared<dlc::Data>();
+                    for (ui::DisplayRow& r : snap.live) {
+                        MonitorSettings fresh;
+                        fresh.identity = r.settings.identity;
+                        fresh.slot = r.settings.slot;
+                        r.settings = fresh;
+                        r.dlcMatch = dlc::DisplayMatch();
+                        r.dlcRecord[0] = r.dlcRecord[1] = dlc::ModeRecord();
+                        r.reminderDue = false;
+                        r.refreshTrim = RefreshTrimStatus{};
+                    }
+                    snap.live[0].settings.hdrColorCorrection.tonemap.targetPeakNits = 1600;
+                    snap.live[0].edidPeakNits = 1600;
+                    snap.live[0].reportedPeakNits = 1600;
+                    snap.running = snap.hookActive = false;
+                    snap.lastStatus = L"Configure at least one monitor with LUT or color correction";
+                    if (shot.variant == 71) {   // SDR CONTENT: GAMMA 2.2 on: its neutral HDR profile carries desktop gamma
+                        MHCSettings& m = snap.live[0].settings.hdrMHC;
+                        m.enabled = true;
+                        m.desktopGammaEnabled = true;
+                        m.dgSdrWhiteNits = 116;
+                        m.activePerm = MHCSettings::PERM_DG;
+                        m.profileName = L"DesktopLUT_Mon0_HDR_9532406.icm";
+                        m.profilePath = L"C:\\Windows\\System32\\spool\\drivers\\color\\" + m.profileName;
+                        snap.live[0].reportedPeakNits = 1000;   // the profile's luminance tag (the params default)
+                        snap.running = true;
+                        snap.hookIdle = true;   // desktop gamma alone: no hook work
+                        snap.lastStatus = L"Active (DWM Hook)";
+                    } else if (shot.variant == 74) {   // analysis on, nothing else: the analysis-only thread
+                        snap.analysis = true;
+                        snap.running = true;
+                        snap.hookIdle = true;
+                        snap.lastStatus = L"Active (DWM Hook)";
                     }
                 } else if (shot.variant == 23 || shot.variant == 25) {
                     FaldSettings& f = snap.live[0].settings.hdrColorCorrection.fald;
@@ -751,6 +831,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                 vs.stage = shot.stage;
                 vs.selectedKey = shot.display == 0 ? L"L|\\\\?\\DISPLAY#AUS322A#5&1&0&UID4352#{e6f07b5f}" : L"L|BNQ802E-1";
                 if (shot.variant == 14) vs.dlc.pick = ui::kDlcPickLive;   // a finished run: shown as the run, not a record
+                if (shot.variant >= 60 && shot.variant <= 63) vs.dlc.pick = ui::kDlcPickPanel;
                 if (shot.variant == 25) vs.faldViewOpenRequested = true;
                 if (shot.variant == 16 || shot.variant == 18) vs.dlc.maximized = shot.variant == 16 ? 3 : 0;   // 16: WORST MISSES, wide
                 if (shot.variant == 19 || shot.variant == 20 || shot.variant == 21) {

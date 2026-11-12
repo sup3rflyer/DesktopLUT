@@ -855,9 +855,7 @@ void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, Vi
     if (r.dlcMatch.name.empty()) {
         SeamRow("DLC", r.dlcMatch.ambiguous ? "AMBIGUOUS" : "NOT MATCHED", pal::InkFaint, Font::Label);
         // A display DLC has not met: the agent onboards it first (its profile entry), then calibrates.
-        const std::string name = Utf8(r.name);
-        StartRow("Calibrate the display DesktopLUT calls \"" + name + "\" (" + (showHdr ? "HDR" : "SDR") +
-                     ") with DLC. It is not in DLC's profile yet: onboard it first.",
+        StartRow(dlc::OnboardCalibratePrompt(Utf8(r.name), showHdr),
                  "For Claude Code: it adds this display to DLC, then drives the run and decides its seams.");
         return;
     }
@@ -898,8 +896,286 @@ void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, Vi
     if (!rec.correctionMade.empty())
         SeamRow("METER", DateAge(rec.correctionMade, rec.correctionDaysAgo), rec.correctionStale ? pal::Alarm : pal::InkDim);
     // Runs are started from Claude Code: the prompt, ready to paste.
-    StartRow("Calibrate " + r.dlcMatch.name + " (" + (showHdr ? "HDR" : "SDR") + ") with DLC.",
-             "For Claude Code: it drives DLC and decides its seams.");
+    StartRow(dlc::CalibratePrompt(r.dlcMatch.name, showHdr), "For Claude Code: it drives DLC and decides its seams.");
+}
+
+// ---- right column, PANEL view: what DLC has measured about the display (its DIP record), read-only -------------
+// Fixed rows per mode: the record (DLC name, date + age, meter), then every measurement once, under KNOWN or NOT
+// MEASURED, then REFRESH TRIM (HDR) and START. A record that arrives moves rows between the groups; the card's
+// height stays.
+constexpr float kCardLabelW = 116.0f;
+constexpr float kCardRowH = 22.0f;
+
+void CardRow(const char* label, const std::string& value, ImU32 col, const std::string& right, const std::string& tip,
+             Font f = Font::Mono) {
+    RowCtx row = BeginRow("", kCardRowH);
+    const float cy = row.y0 + row.h * 0.5f;
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, cy,
+           Ellipsize(Font::Label, kSizeLabel, label, Px(kCardLabelW) - Px(8)).c_str());
+    float rightW = 0.0f;
+    if (!right.empty()) {
+        rightW = MeasureText(Font::Mono, 11.5f, right.c_str()).x;
+        TextAt(Font::Mono, 11.5f, pal::InkFaint, Snap(row.right - rightW), cy, right.c_str());
+    }
+    row.x = row.x0 + Px(kCardLabelW);
+    row.limit = row.right - (rightW > 0.0f ? rightW + Px(10) : 0.0f);
+    RowText(row, value, col, f, f == Font::Mono ? kSizeMono : kSizeLabel);
+    if (!tip.empty() && ImGui::IsMouseHoveringRect(ImVec2(row.x0, row.y0), ImVec2(row.right, row.y0 + row.h)) &&
+        ImGui::IsWindowHovered())
+        ImGui::SetTooltip("%s", tip.c_str());
+    EndRow(row);
+}
+
+void CardGroup(const char* title, bool empty) {
+    ImGui::Dummy(ImVec2(0, Px(2)));
+    Hairline(pal::Rule);
+    RowCtx row = BeginRow("", 22.0f);
+    const float cy = row.y0 + row.h * 0.5f;
+    TextAt(Font::Label, 11.0f, pal::InkDim, row.x0, cy, title);
+    if (empty) {
+        const float w = MeasureText(Font::Label, 11.0f, "NONE").x;
+        TextAt(Font::Label, 11.0f, pal::InkFaint, Snap(row.right - w), cy, "NONE");
+    }
+    EndRow(row);
+}
+
+std::string AgeText(const std::string& date, const std::string& today) {
+    const int days = date.empty() ? -1 : dlc::DaysBetween(date, today);
+    return days >= 0 ? std::to_string(days) + " D" : std::string();
+}
+
+std::string NitsCard(double v) {
+    if (!std::isfinite(v)) return "\xE2\x80\x94";
+    if (v == 0.0) return "0 NIT";
+    return NitsText((float)v);
+}
+
+// One measurement: known (value + age) or not measured (a dash), with what it is and what measures it.
+struct CardItem {
+    std::string label;
+    bool known;
+    std::string value;
+    ImU32 col;
+    std::string date;      // when it was measured (its age shows on the right)
+    std::string tip;
+};
+
+// The light of the PANEL view's title: a fresh record, a stale one (amber), an unreadable one, none.
+Light PanelLight(const dlc::Data& d, const DisplayRow& r, bool showHdr) {
+    if (r.dlcMatch.name.empty()) return Light::None;
+    const dlc::DipLink link = dlc::DipRecordFor(d, r.dlcMatch.name, showHdr ? 1 : 0, r.dlcLive);
+    if (link.record < 0) return link.unreadable ? Light::Fault : Light::None;
+    return dlc::DipStale(d.dip.records[(size_t)link.record], d.today) ? Light::Pending : Light::Configured;
+}
+
+void PanelCard(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs) {
+    const dlc::Data& d = *snap.dlc;
+    const char* mode = showHdr ? "HDR" : "SDR";
+    const char* otherMode = showHdr ? "SDR" : "HDR";
+    const std::string dash = "\xE2\x80\x94";
+    const bool matched = !r.dlcMatch.name.empty();
+    const dlc::DipLink link = matched ? dlc::DipRecordFor(d, r.dlcMatch.name, showHdr ? 1 : 0, r.dlcLive) : dlc::DipLink();
+    const dlc::DipRecord* rec = link.record >= 0 ? &d.dip.records[(size_t)link.record] : nullptr;
+    const dlc::DipLink other = matched ? dlc::DipRecordFor(d, r.dlcMatch.name, showHdr ? 0 : 1, r.dlcLive) : dlc::DipLink();
+    const dlc::DipRecord* otherRec = other.record >= 0 && !other.modeless ? &d.dip.records[(size_t)other.record] : nullptr;
+    const std::string measuredBy = "DLC's characterize flow measures it.";
+
+    // ---- the record ----
+    if (!matched) {
+        CardRow("DLC", r.dlcMatch.ambiguous ? "AMBIGUOUS" : "NOT MATCHED", pal::InkFaint, std::string(),
+                r.dlcMatch.ambiguous ? "More than one DLC display fits this one." : "DLC's profile names no display that is this one.",
+                Font::Label);
+    } else {
+        CardRow("DLC", r.dlcMatch.name, pal::Ink, std::string(), std::string(), Font::Label);
+    }
+    {
+        std::string value = dash, tip;
+        ImU32 col = pal::InkFaint;
+        Font f = Font::Label;
+        const int limit = rec && rec->maxAgeDays >= 0 ? rec->maxAgeDays : dlc::kDipDefaultMaxAgeDays;
+        if (rec) {
+            const bool stale = dlc::DipStale(*rec, d.today);
+            value = DateAge(rec->made, dlc::DipAgeDays(*rec, d.today));
+            if (rec->made.empty()) value = "UNDATED";
+            if (stale) value += "  \xC2\xB7  STALE";
+            col = stale ? pal::Alarm : pal::Ink;
+            f = Font::Mono;
+            tip = "DLC's record of this display in " + std::string(mode) + " (its DIP, " + rec->key + ").";
+            if (!rec->updated.empty()) tip += "\nMade " + (rec->made.empty() ? dash : rec->made) + ", updated " + rec->updated + ".";
+            tip += "\nOlder than " + std::to_string(limit) + " days: DLC asks to characterize again.";
+            if (link.modeless) tip += "\nAn older record without a mode: DLC uses it for SDR and HDR.";
+        } else if (link.unreadable) {
+            value = "UNREADABLE";
+            col = pal::Alarm;
+            tip = "DLC's record " + link.key + " does not load: DLC skips it too.\nCharacterizing again replaces it.";
+        } else {
+            value = matched ? "NONE" : dash;
+            tip = matched ? "DLC has measured nothing about this display in " + std::string(mode) + ".\n" +
+                                "DLC's characterize flow makes the record."
+                          : std::string("DLC keeps a record per display it knows: onboard this one first.");
+        }
+        CardRow("RECORD", value, col, std::string(), tip, f);
+    }
+    {
+        std::string tip = "The meter it was measured with.";
+        if (rec && !rec->correctionFile.empty()) tip += "\nCorrection: " + rec->correctionFile;
+        CardRow("METER", rec && !rec->instrument.empty() ? Upper(rec->instrument) : dash, rec ? pal::InkDim : pal::InkFaint,
+                std::string(), tip, Font::Label);
+    }
+
+    // ---- the measurements ----
+    std::vector<CardItem> items;
+    const std::string made = rec ? rec->made : std::string();
+    auto num = [](const char* fmt, double v) { return Fmt(fmt, v); };
+    {
+        const bool k = rec && std::isfinite(rec->whiteNits);
+        items.push_back({ "WHITE", k, k ? NitsCard(rec->whiteNits) : dash, pal::Ink, made,
+                          "The panel's own white, full field, before any calibration.\n" + measuredBy });
+    }
+    {
+        const bool k = rec && std::isfinite(rec->whiteX) && std::isfinite(rec->whiteY);
+        items.push_back({ "WHITE XY", k, k ? num("%.4f", rec->whiteX) + " " + num("%.4f", rec->whiteY) : dash, pal::Ink, made,
+                          "Where that white sits (CIE 1931 x, y).\n" + measuredBy });
+    }
+    {
+        const bool k = rec && std::isfinite(rec->blackNits);
+        items.push_back({ "BLACK", k, !k ? dash : rec->blackNits > 0.0 ? NitsCard(rec->blackNits) : std::string("BELOW METER"),
+                          pal::Ink, made, "The panel's own black. BELOW METER: darker than the meter reads.\n" + measuredBy });
+    }
+    {
+        const bool k = rec && std::isfinite(rec->whiteNits) && std::isfinite(rec->blackNits);
+        const double c = rec ? dlc::DipContrast(*rec) : dlc::kNaN;
+        items.push_back({ "CONTRAST", k, !k ? dash : std::isfinite(c) ? num("%.0f", c) + ":1" : std::string("BEYOND METER"),
+                          pal::Ink, made, "White over black, full field.\nBEYOND METER: the black is below what the meter reads." });
+    }
+    {
+        const bool k = rec && (std::isfinite(rec->noiseFloorNits) || rec->noiseBands > 0);
+        std::string tip = "Below this light a single meter read is mostly noise.\n" + measuredBy;
+        if (rec && rec->noiseBands > 0) tip += "\nNoise measured at " + std::to_string(rec->noiseBands) + " levels.";
+        items.push_back({ "NOISE FLOOR", k, k ? NitsCard(rec->noiseFloorNits) : dash, pal::Ink, made, tip });
+    }
+    {
+        const bool k = rec && std::isfinite(rec->settleS);
+        std::string tip = "How long the panel takes to settle after the patch changes.\n" + measuredBy;
+        if (rec && std::isfinite(rec->settleBrightS) && std::isfinite(rec->settleDarkS))
+            tip += "\nBright " + num("%.1f", rec->settleBrightS) + " s, dark " + num("%.1f", rec->settleDarkS) + " s.";
+        items.push_back({ "SETTLE", k, k ? num("%.1f", rec->settleS) + " S" : dash, pal::Ink, made, tip });
+    }
+    {
+        const bool k = rec && (!rec->thermalRegime.empty() || std::isfinite(rec->warmupMinutes));
+        std::string v = rec && !rec->thermalRegime.empty() ? Upper(rec->thermalRegime) : std::string();
+        if (rec && std::isfinite(rec->warmupMinutes))
+            v += (v.empty() ? "" : " ") + num("%.0f", rec->warmupMinutes) + " MIN";
+        std::string tip = "How the panel warms up, and the minutes until it holds steady.\n" + measuredBy;
+        if (rec && !rec->coldChannel.empty()) tip += "\nDrifts most: " + rec->coldChannel + ".";
+        items.push_back({ "WARM-UP", k, k ? v : dash, pal::Ink, made, tip });
+    }
+    {
+        const bool k = rec && std::isfinite(rec->eotfUndershoot);
+        items.push_back({ "EOTF", k, k ? num("%+.1f", rec->eotfUndershoot * 100.0) + " %" : dash, pal::Ink, made,
+                          "Full-field light against what the signal asks for (+: brighter).\n" + measuredBy });
+    }
+    // The refresh response: its own date; unusable or another panel's says so.
+    bool refreshUsable = false;
+    {
+        const dlc::DipRefreshSection* s = rec && rec->refresh >= 0 && rec->refresh < (int)d.dip.refresh.size()
+                                              ? &d.dip.refresh[(size_t)rec->refresh] : nullptr;
+        std::string tip = "The panel's light at other refresh rates against 60 Hz.\nDLC's refresh measurement (dlc.refresh_trim) writes it.";
+        std::string v = dash;
+        ImU32 col = pal::Ink;
+        if (s && !s->error.empty()) {
+            v = "UNREADABLE";
+            col = pal::Alarm;
+            tip += "\nNot usable: " + s->error + ".";
+        } else if (s && link.refreshOtherPanel) {
+            v = "OTHER PANEL";
+            col = pal::InkDim;
+            tip += "\nMeasured on " + s->hardwareId + ", not this display (" + r.dlcLive.hardwareId + ").";
+        } else if (s) {
+            refreshUsable = true;
+            v.clear();
+            for (const dlc::DipRefreshRate& rate : s->rates) v += (v.empty() ? "" : " ") + rate.key;
+            tip += "\nRates: " + (v.empty() ? std::string("none") : v + " Hz") + ".";
+            if (v.empty()) v = "NO RATES";
+            // The rates when they fit beside the label and the age, else how many (the tooltip lists them).
+            const std::string age = AgeText(s->measured, d.today);
+            const float room = ImGui::GetContentRegionAvail().x - Px(kCardLabelW) - Px(10) -
+                               (age.empty() ? 0.0f : MeasureText(Font::Mono, 11.5f, age.c_str()).x);
+            if (!s->rates.empty() && MeasureText(Font::Mono, kSizeMono, v.c_str()).x > room)
+                v = std::to_string(s->rates.size()) + (s->rates.size() == 1 ? " RATE" : " RATES");
+            if (!s->runId.empty()) tip += "\nRun " + s->runId + ".";
+        }
+        items.push_back({ "REFRESH", s != nullptr, v, col, s ? s->measured : std::string(), tip });
+    }
+    if (showHdr) {
+        const bool k = rec && std::isfinite(rec->sustainedPeakNits);
+        items.push_back({ "SUSTAINED PEAK", k, k ? NitsCard(rec->sustainedPeakNits) : dash, pal::Ink, made,
+                          "The peak the panel holds under a lasting load.\nNo DLC flow measures it yet." });
+        const bool p = rec && rec->peakByWindow.present;
+        items.push_back({ "PEAK BY WINDOW", p, p ? std::string("MEASURED") : dash, pal::Ink,
+                          p ? rec->peakByWindow.measured : std::string(),
+                          "The peak the panel holds per window size (its ABL).\nDLC's peak-by-window measurement writes it." });
+    }
+    {
+        items.push_back({ std::string(otherMode) + " RECORD", otherRec != nullptr,
+                          otherRec ? DateAge(otherRec->made, dlc::DipAgeDays(*otherRec, d.today)) : dash,
+                          otherRec && dlc::DipStale(*otherRec, d.today) ? pal::Alarm : pal::Ink, std::string(),
+                          "What DLC knows about this display in " + std::string(otherMode) + ".\n"
+                          "DLC's characterize flow, run in " + otherMode + ", makes it." });
+    }
+    int known = 0;
+    for (const CardItem& it : items) known += it.known ? 1 : 0;
+    CardGroup("KNOWN", known == 0);
+    for (const CardItem& it : items)
+        if (it.known)   // a row measured apart from the record (its own date) shows its own age; RECORD dates the rest
+            CardRow(it.label.c_str(), it.value, it.col, it.date != made ? AgeText(it.date, d.today) : std::string(),
+                    it.date.empty() || it.date == made ? it.tip : it.tip + "\nMeasured " + it.date + ".");
+    CardGroup("NOT MEASURED", known == (int)items.size());
+    for (const CardItem& it : items)
+        if (!it.known) CardRow(it.label.c_str(), dash, pal::InkFaint, std::string(), it.tip);
+
+    // ---- REFRESH TRIM (HDR): DesktopLUT's own switch; off while the DIP has a response for it says so ----
+    ImGui::Dummy(ImVec2(0, Px(2)));
+    Hairline(pal::Rule);
+    if (showHdr) {
+        const bool on = r.settings.hdrMHC.refreshTrimEnabled;
+        const bool offWithData = !on && refreshUsable;
+        RowCtx row = BeginRow("", kCardRowH);
+        const float cy = row.y0 + row.h * 0.5f;
+        TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, cy, "REFRESH TRIM");
+        if (offWithData && RowButtons(row, "dip_rt_show", { "SHOW" }) == 0) {
+            vs.page = Page::Pipeline;
+            vs.stage = StageId::Grayscale;
+            vs.showOtherMode = !PipelineIsHdr(r.mode);   // its row is on the HDR side
+        }
+        if (offWithData && ImGui::IsItemHovered()) ImGui::SetTooltip("PIPELINE \xE2\x80\xBA GRAYSCALE, HDR: the REFRESH TRIM row.");
+        row.x = row.x0 + Px(kCardLabelW);
+        RowText(row, on ? "ON" : "OFF", offWithData ? pal::Ink : on ? pal::InkDim : pal::InkFaint, Font::Label, kSizeLabel);
+        if (ImGui::IsMouseHoveringRect(ImVec2(row.x0, row.y0), ImVec2(row.limit, row.y0 + row.h)) && ImGui::IsWindowHovered())
+            ImGui::SetTooltip("%s", offWithData ? "DesktopLUT's refresh-rate trim is off for this display.\n"
+                                                  "It would use the refresh response above. Nothing switches by itself."
+                                                : "DesktopLUT's refresh-rate trim (PIPELINE \xE2\x80\xBA GRAYSCALE, HDR).\n"
+                                                  "It uses the display's refresh response.");
+        EndRow(row);
+    }
+
+    // ---- what makes or renews the record: the characterize flow ----
+    if (!d.folder.empty()) {
+        const std::string prompt = matched ? dlc::CharacterizePrompt(r.dlcMatch.name, showHdr)
+                                           : dlc::OnboardCharacterizePrompt(Utf8(r.name), showHdr);
+        RowCtx row = BeginRow("", kRowH);
+        TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, row.y0 + row.h * 0.5f, "START");
+        row.x = row.x0 + Px(kCardLabelW);
+        RowPlace(row);
+        if (Button("##dlc_char_prompt", "COPY PROMPT", 116)) {
+            ImGui::SetClipboardText(prompt.c_str());
+            notify::Post(notify::Sev::Info, -1, L"dlc", L"Prompt copied", Wide(prompt.c_str()));
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", matched ? "For Claude Code: it runs DLC's characterize flow, which measures the panel and the meter."
+                                            : "For Claude Code: it adds this display to DLC, then runs the characterize flow.");
+        EndRow(row);
+    }
 }
 
 // ---- no DLC: what it is, what it needs, and its setup ------------------------------------------------------------
@@ -1148,14 +1424,18 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
     std::vector<int> reports = sel->dlcMatch.name.empty() ? std::vector<int>() : ReportsFor(d, sel->dlcMatch.name, showHdr);
     const dlc::ModeRecord& rec = sel->dlcRecord[showHdr ? 1 : 0];
     const bool hasStack = !d.folder.empty() && !sel->dlcMatch.name.empty() && (rec.stack >= 0 || rec.current >= 0);
-    bool liveView = false, stackView = false;
+    // The PANEL view (what DLC has measured about the display) keeps the current stack's charts on the left, else the
+    // newest run's.
+    bool liveView = false, stackView = false, panelView = false;
     int shown = -1;
     if (vs.dlc.pick == kDlcPickLive) liveView = runHere;
     else if (vs.dlc.pick == kDlcPickStack) stackView = hasStack;
+    else if (vs.dlc.pick == kDlcPickPanel) panelView = true;
     else if (!vs.dlc.pick.empty()) {
         for (int i : reports) if (dlc::SamePath(d.reports[i].path, vs.dlc.pick)) shown = i;
     }
-    if (!liveView && !stackView && shown < 0) {
+    if (panelView) shown = hasStack ? rec.current : (reports.empty() ? -1 : reports.front());
+    else if (!liveView && !stackView && shown < 0) {
         if (vs.dlc.pick.empty() && runHere && InProgress(L.phase)) liveView = true;
         else if (hasStack) stackView = true;
         else {
@@ -1188,30 +1468,44 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         const float w = ImGui::GetContentRegionAvail().x, h = Snap(Px(kStepsH)), cy = p.y + h * 0.5f;
         TextAt(Font::Label, kSizeLabel, pal::InkDim, p.x, cy, "RUN");
         ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + Px(48)), Snap(cy - Px(kControlH) * 0.5f)));
-        const std::string preview = stackView ? std::string("CURRENT STACK") : shown >= 0 ? ReportLabel(d.reports[shown]) : std::string("NO RUNS");
-        ImGui::BeginDisabled(reports.empty() && !runHere && !hasStack);
-        if (BeginDropdown("##dlc_run", preview.c_str(), kRunPickerW)) {
+        const std::string preview = panelView ? std::string("PANEL")
+                                  : stackView ? std::string("CURRENT STACK") : shown >= 0 ? ReportLabel(d.reports[shown]) : std::string("NO RUNS");
+        if (BeginDropdown("##dlc_run", preview.c_str(), kRunPickerW)) {   // PANEL is always there
             if (runHere && DropdownItem(("LIVE  \xC2\xB7  " + Upper(L.state->flow)).c_str(), false)) vs.dlc.pick = kDlcPickLive;
             if (hasStack && DropdownItem("CURRENT STACK", stackView)) vs.dlc.pick = kDlcPickStack;
+            if (DropdownItem("PANEL", panelView)) vs.dlc.pick = kDlcPickPanel;
             for (int i : reports) {
                 ImGui::PushID(i);   // two runs can share a label (same day, same flow): ids by report
-                if (DropdownItem(ReportLabel(d.reports[i]).c_str(), !stackView && i == shown)) vs.dlc.pick = d.reports[i].path;
+                if (DropdownItem(ReportLabel(d.reports[i]).c_str(), !stackView && !panelView && i == shown)) vs.dlc.pick = d.reports[i].path;
                 ImGui::PopID();
             }
             EndDropdown();
         }
-        ImGui::EndDisabled();
         if (ImGui::IsItemHovered() && stackView)
             ImGui::SetTooltip("What the display runs now: its layers and the newest verification of them.");
+        if (ImGui::IsItemHovered() && panelView)
+            ImGui::SetTooltip("What DLC has measured about the display: its record (DIP).");
         float x = Snap(p.x + Px(48) + Px(kRunPickerW) + Px(12));
-        if (stackView && shown >= 0) {   // the verification the stack's charts come from
+        if (panelView) {   // the charts beside the card: the current stack's verification, else the newest run
+            const std::string from = shown < 0 ? std::string() : (hasStack ? "VERIFIED  " : "RUN  ") + ReportLabel(d.reports[shown]);
+            TextAt(Font::Label, kSizeLabel, pal::InkDim, x, cy,
+                   Ellipsize(Font::Label, kSizeLabel, from, p.x + w - Px(kButtonW) - Px(16) - x).c_str());
+        } else if (stackView && shown >= 0) {   // the verification the stack's charts come from
             const std::string from = "VERIFIED  " + ReportLabel(d.reports[shown]);
             TextAt(Font::Label, kSizeLabel, pal::InkDim, x, cy,
                    Ellipsize(Font::Label, kSizeLabel, from, p.x + w - Px(kButtonW) - Px(16) - x).c_str());
         } else if (stackView) {
             TextAt(Font::Label, kSizeLabel, pal::InkFaint, x, cy, "NOT VERIFIED SINCE APPLIED");
         }
-        if (shown >= 0) {
+        if (panelView) {   // the record's file (read only here: DLC writes it)
+            const std::wstring dip = d.folder + L"\\dip_store.json";
+            ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + w - Px(kButtonW)), Snap(cy - Px(kControlH) * 0.5f)));
+            ImGui::BeginDisabled(!d.dipFound);
+            if (Button("##dlc_folder", "FOLDER", kButtonW)) Post([dip]() { OpenFolderSelecting(dip); });
+            ImGui::EndDisabled();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+                ImGui::SetTooltip(d.dipFound ? "DLC's folder, at its DIP file (dip_store.json)." : "No DIP file in DLC's folder yet.");
+        } else if (shown >= 0) {
             const char* tag = !stackView && shown == rec.current ? "ON SCREEN" : nullptr;
             if (tag) {
                 ImDrawList* dl = ImGui::GetWindowDrawList();
@@ -1301,6 +1595,11 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
             ImGui::Dummy(ImVec2(0, Px(6)));
         }
         FeedRows(*L.state);
+        EndPanel();
+    } else if (panelView) {
+        const Light light = PanelLight(d, *sel, showHdr);
+        BeginPanel("##dlc_panel", "PANEL", &light, sideSize);
+        PanelCard(snap, *sel, showHdr, vs);
         EndPanel();
     } else {
         const Light light = rec.reminderDue ? Light::Fault : (rec.current >= 0 ? Light::Configured : Light::None);

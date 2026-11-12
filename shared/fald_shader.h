@@ -25,16 +25,14 @@
 //                       (statistic rounds, boost flags, Correct, output); off = none of it
 //   CS panel clock (opt., temporal mode 3; rules in fald.h above FALD_TEMPORAL_PANEL): once per frame, from PAST frames
 //                       only — both parity clocks' LED states advance toward the previous frame's drives, the two maps
-//                       the kernels see in BOTH rounds are written; modes 1 / 2 run "CS temporal" below instead
+//                       the kernels see in BOTH rounds are written
 //   CS stat  (round 0): per cell, area statistic over every pixel -> drive texture (cols x rows)
 //                       (+ the zone's NON-BLACK flag for the black-frame LED boost when the panel file has a boost LUT)
 //                       (+ with a boost LUT: the frame's non-black zone count -> step LUT -> LED boost, 2 x 1 texture,
 //                       finished by the last zone of the sweep)
-//   CS temporal (opt.): per cell, first-order drive STATE (rise/fall time constants) -> the drive the kernels see
 //   CS conv           : drives (x) K_true [x boost], drives (x) K_est on the sub-cell grid (cols*sub x rows*sub)
 //   CS stat  (round 1): same statistic (and zone flags) on the CORRECTED frame (the correction moves the drives, and
 //                       the panel counts the zones of the frame it RECEIVES)
-//   CS temporal (opt.): again from the committed state; the result is committed after this round
 //   CS conv           : final backlight fields
 //   PS                : per pixel: req = (img + ped_ref - ped) * one scale (gain; soft knee toward the ceiling)
 // The change-driven (PARTIAL) path, shared/fald_change.h: with a present's dirty rects and an otherwise unchanged state,
@@ -74,11 +72,8 @@ cbuffer FaldCB : register(b0) {
     float chromaGain; float chromaLo; float chromaHi; float sdrGamma; // colour part of the pedestal term: strength + its own
                                                                     // pixel-luminance fade (lo = hi = 0: none); sdrGamma: the
                                                                     // panel's EOTF exponent (transfer 1 only)
-    float tempAlphaRise; float tempAlphaFall; uint tempMode; uint tempInit; // per-cell drive state (pass 1b; DLC dlc/fald/temporal.py):
-                                                                    // per-frame blend factors 1 - exp(-dt/tau) (1 = instant);
-                                                                    // tempMode 0 = off (stateless), 1 = both fields from the
-                                                                    // state, 2 = B_true from the state, B_est instantaneous;
-                                                                    // tempInit 1 = no valid state yet: copy the drive
+    uint _pad44; uint _pad45; uint _pad46; uint _pad47;             // 0 always: LED lag modes 1 / 2's words (the first-order
+                                                                    // filter, pass 1b; removed 2026-11-12)
     float boostLitNits; float boostLitFrac; float boostDimNits; float boostDimFrac; // zone activation rule of the boost count
                                                                     // (DLC FaldModel.active_zone_fraction): a zone is non-black
                                                                     // when more than LitFrac of its pixels exceed LitNits (0 =
@@ -110,16 +105,16 @@ cbuffer FaldCB : register(b0) {
                                                                     // this frame's first refresh (True) and of the refresh
                                                                     // before it, which the panel's compensation uses (Est):
                                                                     // 1 - (1 - closure)^ticks (C++ FaldPanelClockFactors)
-    uint boostRule; float boostMeanGamma; float boostMeanThresh; uint fadeFlags; // the boost count's zone rule (work guide C12b;
+    uint boostRule; float boostMeanGamma; float boostMeanThresh; uint _pad75; // the boost count's zone rule (work guide C12b;
                                                                     // read only when boostN != 0): 0 = LIT-or-DIM as above, 1 =
                                                                     // LIT-or-MEAN: LIT OR the zone mean of (brightest channel,
                                                                     // as-if-white nits)^boostMeanGamma >= boostMeanThresh;
-                                                                    // fadeFlags: bit 0 = the frozen fade stack ASF10 + T11_TMTC
-                                                                    // (FadePost, t20-t22; shared/fald_fade.h), bit 1 = item L
-                                                                    // (reserved, always 0); 0 = the layer without it
+                                                                    // _pad75 = 0 always (the flank fade's flags until
+                                                                    // 2026-11-12)
     uint latW; uint latH; uint _pad78; uint runMode;                // the zone lattice's extent in px (cols * cellW / rows *
                                                                     // cellH for an integer pitch; docs/fald-fractional-pitch.md);
-                                                                    // _pad78 = 0 always: FadePost's FadeNoFuse operand;
+                                                                    // _pad78 = 0 always (the flank fade's no-fuse operand
+                                                                    // until 2026-11-12);
                                                                     // runMode (shared/fald_change.h, the partial path): bits
                                                                     // 0-7 = 0 full sweep (a zone per group id) / 1 partial
                                                                     // (the zones of t38, the touched-zone list, and a change
@@ -137,9 +132,10 @@ Texture2D<float>  flatTrueTex : register(t7); // the same two fields for a fully
 Texture2D<float>  flatEstTex  : register(t8);
 Texture2D<float2> gainTex     : register(t9); // R32G32F, fine grid, low-passed together (passes 2b / 2c): .x = the gain,
                                               // .y = the flat-normalised B_est the soft knee takes its CEILING from (C15)
-Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless tempMode 2 / 3);
-                                               // pixel pass view 7: the filtered drive (driveTex = the instantaneous one)
-Texture2D<float>  stateTex    : register(t11); // temporal pass: the committed drive state of the previous frame
+Texture2D<float>  driveEstTex : register(t10); // conv: the drive map the ESTIMATE kernel sees (= driveTex unless LED lag's
+                                               // panel clock routes its map); pixel pass view 7: the clocks' LED state
+                                               // (driveTex = the instantaneous drive)
+                                               // (t11 was LED lag modes 1 / 2's state texture, removed 2026-11-12: free)
 Buffer<float>     boostLut    : register(t12); // [boostN][2]: (first non-black zone COUNT of the step, LED boost), ascending
 Texture2D<float>  activeTex   : register(t13); // cols x rows: 1 = the zone counts as non-black (boost pass; pixel view 8)
 Texture2D<float>  boostTex    : register(t14); // 2 x 1: [0] = the frame's LED boost, [1] = its non-black zone count (conv pass)
@@ -153,13 +149,7 @@ Texture2D<float4> starPlan2Tex : register(t18); // S1 out: (ln background, near,
                                                 // bilinearly and loads .z of the pixel's OWN zone (nearest)
 Texture2D<float4> starBgTex    : register(t19); // S0 out: (ln background, the brightest pixel's index ly * zw + lx inside
                                                 // the zone (zw = the zone's own width), lit sum, a_eff) — read by S1
-// The fade stack (fadeFlags bit 0; shared/fald_fade.h), R32F, read by FadePost only. fade_T and the lit floor F are
-// formed per pixel in FadePost from the small maps (up-sampled exactly as the fade passes' FadeUp: FadeUpAt below):
-Texture2D<float>  fadeFieldTex : register(t20); // full res: the ASF9o field of the last content frame (fade)
-Texture2D<float>  floorOpenTex : register(t21); // 1/8 res: G16(grey_open(ln max(down8(mi), 0.05), 101)); F = exp(up8(.))
-Texture2D<float>  reachTex     : register(t22); // full res: reach of THIS round's soft knee (OF): round 0 in the round-1
-                                                // statistic, round 1 in the pixel pass
-Texture2D<float>  fadeDTex     : register(t23); // 1/4 res: s - f_q (T11_TMTC); fade_T = clamp(fade + up4(.), 0, 1)
+// (t20..t23 were the flank fade's views, removed 2026-11-12: free)
 Buffer<uint>      zoneList     : register(t38); // the partial path (runMode bits 0-7 = 1): the zones (row * cols + col) a
                                                 // present's rects touched, one per group of the statistic / S0 sweeps
 Texture2D<float4> fieldsTex    : register(t39); // the round's fields PACKED, (B_true, flat B_true, B_est, flat B_est) per fine
@@ -434,131 +424,28 @@ struct ZonePart { float4 f; uint4 u; };
 uint ZoneSlices() { return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX; }
 uint ZonePartIndex(uint cx, uint cy, uint s) { return (cy * cols + cx) * ZoneSlices() + s; }
 
-// The fade stack's post-Correct scale (fadeFlags bit 0; DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md 1.3, the
-// study twin's make_post11 with gc = oc = None; float32 twin dlc.fald.fadeemu.fade_post). req = Correct(img, ...), img = the
-// as-if-white nits Correct received, px = the pixel. ls = ln(max req / max img) (0 unless max img > 1e-9 and max req >
-// 1e-12); keep = smooth(1, 3, F) smooth(0, 0.03, ls) (1 - reach); fade = fade_T (1 - keep); ONE scale for the three
-// channels: req exp(ls (1 - fade) - ls) = req (max img / max req)^fade. Off: req unchanged.
-// NO `precise` here: precise propagates backwards to every operation feeding the value — it would turn all of Correct
-// (and the passes around it) precise, i.e. change the compiled layer with the fade OFF. The compiler may fuse a
-// multiply-add in these few lines (~1e-7 relative; the WARP gate allows one FP16 step).
-float FadePostSmooth(float a, float b, float x) {
-    float t = saturate((x - a) / (b - a));
-    return t * t * (3.0f - 2.0f * t);
-}
-// The fade passes' bilinear up-sampling (fald_fade_shader.h FadeUp, the twin's up(): texel-centre alignment t = (i + 0.5) /
-// f - 0.5 with rcp = 1 / f, the edge texel held outside, rows first, four Loads, float32 weights) evaluated at one output
-// texel: the same operations in the same order, `precise`, so the value is FadeUp's bit for bit. For the fade passes ONLY
-// (fald_fade_shader.h, strict compile): a layer pass must never call it (see FadeUpAtPost).
-void FadeUpAxisAt(int i, int nIn, float rcp, out int i0, out int i1, out float fr) {
-    precise float t = ((float)i + 0.5f) * rcp - 0.5f;
-    precise float fl = floor(t);
-    i0 = clamp((int)fl, 0, nIn - 1);
-    i1 = clamp(i0 + 1, 0, nIn - 1);
-    precise float r = min(max(t - fl, 0.0f), 1.0f);
-    if (t < 0.0f) r = 0.0f;
-    else if (t > (float)(nIn - 1)) r = 1.0f;
-    fr = r;
-}
-float FadeUpAt(Texture2D<float> t, int2 p, float rcp) {
-    uint w, h;
-    t.GetDimensions(w, h);
-    int y0, y1, x0, x1; float fy, fx;
-    FadeUpAxisAt(p.y, (int)h, rcp, y0, y1, fy);
-    FadeUpAxisAt(p.x, (int)w, rcp, x0, x1, fx);
-    precise float ofy = 1.0f - fy;
-    precise float ofx = 1.0f - fx;
-    precise float c0 = t.Load(int3(x0, y0, 0)) * ofy + t.Load(int3(x0, y1, 0)) * fy;
-    precise float c1 = t.Load(int3(x1, y0, 0)) * ofy + t.Load(int3(x1, y1, 0)) * fy;
-    precise float v = c0 * ofx + c1 * fx;
-    return v;
-}
-// FadeUpAt for FadePost (the layer's pixel pass and round-1 statistic, compiled with the default flags), WITHOUT
-// `precise`: precise propagates backwards through the compiled layer — with it here every operation of Correct and of
-// the passes around it turned precise, the compiled layer changed and its output moved with the fade OFF (the OFF gate,
-// tests/test_fald_fade.cpp). Instead every product (and every sum a product or an add follows) passes FadeNoFuse, an
-// integer XOR with _pad78 (always 0: both hosts write it so): neither the compiler nor the driver can fuse a multiply
-// into an add or re-associate across it, and D3D11's mul and add round correctly — the value is FadeUpAt's bit for bit.
-// The texel-centre arithmetic is exact for rcp = 1/4 and 1/8 in any order (multiples of 1/16 below 2^12).
-float FadeNoFuse(float x) { return asfloat(asuint(x) ^ _pad78); }
-void FadeUpAxisPost(int i, int nIn, float rcp, out int i0, out int i1, out float fr) {
-    float t = ((float)i + 0.5f) * rcp - 0.5f;
-    float fl = floor(t);
-    i0 = clamp((int)fl, 0, nIn - 1);
-    i1 = clamp(i0 + 1, 0, nIn - 1);
-    float r = min(max(t - fl, 0.0f), 1.0f);
-    if (t < 0.0f) r = 0.0f;
-    else if (t > (float)(nIn - 1)) r = 1.0f;
-    fr = r;
-}
-float FadeUpAtPost(Texture2D<float> t, int2 p, float rcp) {
-    uint w, h;
-    t.GetDimensions(w, h);
-    int y0, y1, x0, x1; float fy, fx;
-    FadeUpAxisPost(p.y, (int)h, rcp, y0, y1, fy);
-    FadeUpAxisPost(p.x, (int)w, rcp, x0, x1, fx);
-    const float ofy = 1.0f - fy;
-    const float ofx = 1.0f - fx;
-    const float c0 = FadeNoFuse(FadeNoFuse(t.Load(int3(x0, y0, 0)) * ofy) + FadeNoFuse(t.Load(int3(x0, y1, 0)) * fy));
-    const float c1 = FadeNoFuse(FadeNoFuse(t.Load(int3(x1, y0, 0)) * ofy) + FadeNoFuse(t.Load(int3(x1, y1, 0)) * fy));
-    return FadeNoFuse(FadeNoFuse(c0 * ofx) + FadeNoFuse(c1 * fx));
-}
-float3 FadePost(float3 req, float3 img, int2 px) {
-    if ((fadeFlags & 1u) == 0u) return req;
-    float mi = max(img.r, max(img.g, img.b));
-    float mr = max(req.r, max(req.g, req.b));
-    float ls = (mi > 1e-9f && mr > 1e-12f) ? log(max(mr, 1e-12f) / max(mi, 1e-9f)) : 0.0f;
-    // the lit floor F = exp(up8(the 1/8-res opening)) and fade_T = clamp(fade + up4(s - f_q), 0, 1): the values the fade
-    // passes' FadeUp (fOp bit 0 = exp) + FadePix TOUT wrote to full-res maps before (fald_fade.h)
-    const float floorF = exp(FadeUpAtPost(floorOpenTex, px, 0.125f));
-    const float fadeT = min(max(FadeNoFuse(fadeFieldTex.Load(int3(px, 0)) + FadeUpAtPost(fadeDTex, px, 0.25f)), 0.0f), 1.0f);
-    float lit = FadePostSmooth(1.0f, 3.0f, floorF);
-    float pos = FadePostSmooth(0.0f, 0.03f, ls);
-    float keep = lit * pos * (1.0f - reachTex.Load(int3(px, 0)));
-    float fade = fadeT * (1.0f - keep);
-    float lsEff = ls * (1.0f - fade);
-    // = max(req * exp(lsEff - ls), 0): req >= 0 (Correct clamps it) and exp >= 0, so the optimiser drops a plain max — and
-    // with it the max's NaN -> 0 (an inf input pixel: ls = ln(inf / inf) = NaN). Seen on WARP 2026-10-20: the NaN reached
-    // the round-1 statistic, where min(NaN, white) counts the pixel as white (that zone's drive 0.59 instead of 0.10).
-    // An integer NaN test the optimiser cannot fold restores the max: NaN -> 0, everything else unchanged.
-    float3 o = req * exp(lsEff - ls);
-    return ((asuint(o) & 0x7fffffffu) > 0x7f800000u) ? 0.0f : o;
-}
-)" /* the third seam: the always-on core, rounds 2 / 3 (shared/fald_core2.h; off = coreFlags 0, CoreGain = identity). The hosts
-      bind t42 / t48 per consumer: round 0's fields for the round-1 statistic (compute), round 1's for the pixel pass. */ R"(
+)" /* the third seam: the always-on core KC5 (shared/fald_core2.h; off = coreFlags 0, CoreGain = identity). The hosts bind
+      t48 per consumer: round 0's cap for the round-1 statistic (compute), round 1's for the pixel pass. */ R"(
 cbuffer FaldCoreCB : register(b3) {
-    uint coreFlags; float coreA; uint coreReset; float coreCutThr;       // flags: bit 0 alpha, 1 deficit (2 soft: reserved)
+    uint coreFlags; uint _corePad1; uint _corePad2; uint _corePad3;      // flags (fald_core_mode.h): bit 0 alpha, 3 the fine
+                                                                         // grid, 6 the cap, 7 alpha's level law (KC5 = all four)
     float coreMuInf; float coreLh; float coreZ; float coreKStart;        // alpha(L) = clamp(muInf L / (L + Lh) - z, 0, 1)
-    float coreBeta; float coreTau; float coreFixedRcp; uint _corePad;    // spread gate; 1 / the cut sum's fixed point
+    float coreBeta; float coreTau; uint _corePad10; uint _corePad11;     // the spread gate
     float coreW0; float coreW1; float coreW2; float coreW3;              // the sigma-0.7 Gaussian's taps (centre .. 3)
 };
 Texture2D<float4> coreStatTex  : register(t40);   // P, M, lnG (stat round 0)
 Texture2D<float4> coreZoneTex  : register(t41);   // alpha_z, k, ln P
-Texture2D<float2> coreFieldTex : register(t42);   // alpha_z, D (this round)
-Buffer<uint>      coreCutSum   : register(t43);   // [0]: sum over zones of |d ln max(M, 0.05)| (fixed point)
-Texture2D<float>  coreNodeDTex : register(t48);   // round 3 (coreFlags bit 3): the deficit D on the FINE grid; round 5
-                                                  // (bit 6): the brightening cap A there
-// Correct's gain at both call sites (fald_core2.h): brightening shrunk by alpha, minus the deficit D (round 5: capped at A);
-// darkening untouched. With coreFlags 0 (the core off, b3 bound with zeros or not at all) the input is returned unchanged.
+Texture2D<float>  coreNodeDTex : register(t48);   // the brightening cap A on the FINE grid (this round)
+// Correct's gain at both call sites (fald_core2.h): brightening shrunk by alpha and capped at A; darkening untouched.
+// With coreFlags 0 (the core off, b3 bound with zeros or not at all) the input is returned unchanged.
 float2 CoreGain(float2 g, float2 px) {
     if ((coreFlags & 3u) == 0u || !(g.x > 1.0f)) return g;
     float lg = log(g.x);
-    if ((coreFlags & 8u) != 0u) {             // round 3 (KC3): alpha from the zone field, D from the fine-grid field
-        const float2 uv = FineUV(px);
-        if ((coreFlags & 1u) != 0u) lg *= saturate(coreZoneTex.SampleLevel(linearClamp, uv, 0).x);
-        if ((coreFlags & 2u) != 0u) lg = max(lg - max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f), 0.0f);
-        if ((coreFlags & 64u) != 0u) lg = min(lg, max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f));   // round 5 (KC5): the cap A
-    } else {                                  // round 2 (KC2c): both from the zone field
-        float2 f = coreFieldTex.SampleLevel(linearClamp, FineUV(px), 0);
-        if ((coreFlags & 1u) != 0u) lg *= saturate(f.x);
-        if ((coreFlags & 2u) != 0u) lg = max(lg - max(f.y, 0.0f), 0.0f);
-    }
+    const float2 uv = FineUV(px);
+    if ((coreFlags & 1u) != 0u) lg *= saturate(coreZoneTex.SampleLevel(linearClamp, uv, 0).x);
+    if ((coreFlags & 64u) != 0u) lg = min(lg, max(coreNodeDTex.SampleLevel(linearClamp, uv, 0), 0.0f));   // the cap A
     g.x = exp(lg);
     return g;
-}
-bool CoreResetNow() {
-    float mean = (float)coreCutSum[0] * coreFixedRcp / (float)(cols * rows);
-    return coreReset != 0u || mean > coreCutThr;
 }
 float CoreW(int d) { d = abs(d); return d == 0 ? coreW0 : (d == 1 ? coreW1 : (d == 2 ? coreW2 : coreW3)); }
 )";
@@ -646,7 +533,7 @@ void main(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID) {
         if (roundIdx == 1) {
             float bT, bE; SampleFields(float2((float)px, (float)py), bT, bE);
             float2 g = gainTex.SampleLevel(linearClamp, FineUV(float2((float)px, (float)py)), 0);
-            img = FadePost(Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py))), img, int2((int)px, (int)py));   // fade stack: round 0's reach (t22)
+            img = Correct(img, bT, bE, CoreGain(g, float2((float)px, (float)py)));
         }
         float mc = max(img.r, max(img.g, img.b));
         float s = min(mc, white);
@@ -1226,31 +1113,6 @@ inline unsigned int FaldZoneSlices(unsigned int cellW, unsigned int cellH) {
     return (cellW * cellH + FALD_ZONE_SLICE_PX - 1u) / FALD_ZONE_SLICE_PX;
 }
 
-// Pass 1b (tempMode != 0 only): per-cell first-order drive state. driveTex (t4) = this round's instantaneous
-// drive, stateTex (t11) = the state committed after the previous frame's round 1. out = s + a * (d - s) with
-// a = tempAlphaRise when the drive rises, tempAlphaFall when it falls (DLC temporal.DriveState.peek); with no
-// valid state yet (tempInit) the drive is copied. Both rounds of a frame read the SAME committed state; the
-// C++ copies round 1's output into the state texture afterwards (DriveState.commit).
-inline const char* g_faldTemporalSource = R"(
-RWTexture2D<float> driveFiltOut : register(u0);
-RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: a filtered drive that moved flags this round
-
-[numthreads(16, 16, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= cols || id.y >= rows) return;
-    float d = driveTex.Load(int3(id.xy, 0));
-    float o;
-    if (tempInit != 0u) o = d;
-    else {
-        float s = stateTex.Load(int3(id.xy, 0));
-        float a = (d > s) ? tempAlphaRise : tempAlphaFall;
-        o = s + a * (d - s);
-    }
-    if (RunModePartial() == 1u && driveFiltOut[id.xy] != o) InterlockedOr(changeFlags[roundIdx], 1u);
-    driveFiltOut[id.xy] = o;
-}
-)";
-
 // Pass 1c (temporal mode 3 "panel clock" only; rules in fald.h above FALD_TEMPORAL_PANEL, reference DLC
 // dlc/fald/paneltime.py, GPU-order twin gpuemu.GpuPanelDriveState.advance). Runs ONCE per frame, before round 0, and
 // only with a valid state: driveTex (t4) = the PREVIOUS processed frame's round-1 instantaneous drives = the target of
@@ -1262,10 +1124,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 // two compensation states e_p, B_true's that mean plus the mean of the clocks' TRANSIENTS t_p - e_p, clamped to
 // +-FALD_CLOCK_ROBUST_CAP x the mean e — on a cut the two clocks want their step in different refreshes, and the half a
 // plain mean applies where the panel needs none must not dim the frame by more than that (DLC
-// paneltime.robust_transient, gpuemu.clock_robust_true32).
-// Compiled a second time with g_faldClockMeanDefine: the plain mean of both maps (the pre-2026-10-23 pass, parity
-// FALD_CLOCK_PARITY_MEAN = the blind A/B's other arm); known parity runs the same arithmetic in both variants.
-inline const char* g_faldClockMeanDefine = "#define FALD_CLOCK_MEAN 1\n";
+// paneltime.robust_transient, gpuemu.clock_robust_true32). (The plain mean of both maps — the pre-2026-10-23 pass, the
+// other arm of the owner's 2026-10-24 blind A/B, which the robust combination won — was a second variant until 2026-11-12.)
 inline const char* g_faldPanelClockSource = R"(
 RWTexture2D<float> clkTrueOut : register(u0);
 RWTexture2D<float> clkEstOut  : register(u1);
@@ -1284,12 +1144,8 @@ void main(uint3 id : SV_DispatchThreadID) {
     float t0 = s0 + clkTrue0 * g0, t1 = s1 + clkTrue1 * g1;
     float e0 = s0 + clkEst0 * g0, e1 = s1 + clkEst1 * g1;
     float oEst = clkW0 * e0 + clkW1 * e1;
-#ifdef FALD_CLOCK_MEAN
-    float oTrue = clkW0 * t0 + clkW1 * t1;
-#else
     float tr = clkW0 * (t0 - e0) + clkW1 * (t1 - e1), lim = FALD_CLOCK_ROBUST_CAP * oEst;
     float oTrue = (clkW0 > 0.0f && clkW1 > 0.0f) ? oEst + min(max(tr, -lim), lim) : clkW0 * t0 + clkW1 * t1;
-#endif
     if (RunModePartial() == 1u && (clkTrueOut[id.xy] != oTrue || clkEstOut[id.xy] != oEst)) InterlockedOr(changeFlags[0], 1u);
     clkTrueOut[id.xy] = oTrue;
     clkEstOut[id.xy] = oEst;
@@ -1500,9 +1356,9 @@ inline bool FaldGainBlurFused(float gainSmoothCells, unsigned int sub) {
 // 5 = the pedestal term actually applied (|adj| * fade, per channel, x100: 1 nit of subtraction shows as 100 nits;
 //     the colour is the colour of what is subtracted or lifted), 6 = the influence of the per-channel toggle:
 //     |adj_channel - adj_white| * fade, x100 (what changes on screen when the toggle flips; black = nothing),
-//     7 = temporal settling: per cell, the instantaneous drive minus the filtered one (red = the state is still BELOW
-//     the frame's drive, i.e. the LEDs are modelled as still rising; blue = above, falling), +-25 % drive full scale.
-//     In temporal mode 3 (panel clock) the "filtered" map is the clocks' mean LED state of this frame.
+//     7 = temporal settling: per cell, the instantaneous drive minus the panel clock's LED state of this frame (the
+//     clocks' mean; red = the state is still BELOW the frame's drive, i.e. the LEDs are modelled as still rising; blue =
+//     above, falling), +-25 % drive full scale. LED lag off: no difference (grey).
 //     8 = the black-frame boost's zone map of the corrected frame (round 1): white = the zone counts as non-black,
 //     black = it does not; passthrough when the panel file has no boost LUT.
 //     9 = starfield balancing at a glance, per ZONE (single pixels are invisible): grey level = the zone's weight
@@ -1583,7 +1439,7 @@ float4 main(PS_INPUT i) : SV_Target {
         float3 shown = (debugMode == 5) ? abs((pedMode == 1) ? t1 : t0) : abs(t1 - t0);
         return float4(PanelNitsToScRGB(min(shown * 100.0f, white)), 1.0f);   // x100 nits per nit
     }
-    float3 req = FadePost(Correct(img, bT, bE, CoreGain(gain, float2(px))), img, px);   // fade stack: round 1's reach (t22); core round 2 (fald_core2.h)
+    float3 req = Correct(img, bT, bE, CoreGain(gain, float2(px)));   // the always-on core (fald_core2.h)
     return float4(PanelNitsToScRGB(req), src.a);
 }
 )";

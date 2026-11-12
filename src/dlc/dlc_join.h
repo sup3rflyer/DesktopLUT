@@ -76,6 +76,20 @@ struct ModeRecord {
 };
 ModeRecord RecordFor(const Data& d, const std::string& name, int modeIndex, const LiveDisplay& live, int reminderDays);
 
+// The DIP record of a matched display in one mode, looked up as DLC does (calibrate.py dip_record_for): the key
+// "<name>:<MODE>", else the mode-less "<name>" (records written before mode-keying). Hardware id is the tie-breaker,
+// as for the refresh trim (refresh_trim.cpp FindRefreshSection): DLC keys a record by name only, but its refresh
+// response names the panel it was measured on; when that hardware id is not this display's, the response is not
+// this display's (the record's other numbers stay: DLC uses them by name).
+struct DipLink {
+    int record = -1;                        // index into Data::dip.records, -1 none
+    bool modeless = false;                  // found under the bare name (applies to either mode)
+    bool unreadable = false;                // no record, and DLC would drop the one under the key (Data::dip.dropped)
+    bool refreshOtherPanel = false;         // its refresh response names another hardware id
+    std::string key;                        // the key looked up ("<name>:<MODE>")
+};
+DipLink DipRecordFor(const Data& d, const std::string& name, int modeIndex, const LiveDisplay& live);
+
 // Does this report describe what `live` runs in that mode? (The cube it verified is the loaded one; with
 // no cube loaded, it comes from the run that installed the MHC profile in use.)
 bool ReportVerifiesLive(const Report& r, const StackRecord* stack, int modeIndex, const LiveDisplay& live);

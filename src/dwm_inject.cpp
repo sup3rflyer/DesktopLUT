@@ -10,6 +10,7 @@
 #include "mhc_preview.h"   // MhcPreviewHolds
 #include "fald.h"
 #include "lut.h"   // LoadLUT + WriteCanonicalCube: the staged cube is the host's parse
+#include "dwmcore_scan.h"   // the pre-flight: the hook's anchor patterns in the on-disk dwmcore
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -523,6 +524,17 @@ bool IsDwmHookActive()
 
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::wstring* stagingWarning)
 {
+    // Pre-flight (dwmcore_scan.h): the path the DLL will take must find its anchor patterns in the on-disk dwmcore,
+    // or the DLL would refuse to load inside dwm.exe (or load and not cover fullscreen windows). Then dwm.exe is not
+    // touched at all. Read and scanned once per process; a file that cannot be read leaves the decision to the DLL.
+    {
+        const DwmHookPreflight& pf = DwmHookPreflightCheck();
+        if (!pf.ok) {
+            std::wcout << L"[DWM Hook] Pre-flight: the hook's anchor patterns are missing from dwmcore.dll — not injecting"
+                       << std::endl;
+            return DwmHookPreflightReason(pf);
+        }
+    }
     std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);
     g_injectedSetValid = false;   // whatever happens below, the old set no longer describes the hook
     SystemImpersonationGuard impGuard;
@@ -584,7 +596,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
         }
     }
 
-    // No DLL of ours is resident from here on: the flank fade governor's status block starts empty (a block a crashed
+    // No DLL of ours is resident from here on: the FALD governors' status block starts empty (a block a crashed
     // dwm.exe left mid-write — odd version — would otherwise refuse every later write).
     ResetDwmHookFaldStatus();
 
@@ -1336,7 +1348,7 @@ static void StopFaldSettleKicker() {
     CloseHandle(g_faldPrimeEvent); g_faldPrimeEvent = nullptr;
 }
 
-// The flank fade governor's status block (dwm_hook_config.h DwmHookFaldStatus; the DLL writes, the host reads): created
+// The FALD governors' status block (dwm_hook_config.h DwmHookFaldStatus; the DLL writes, the host reads): created
 // once and kept for the life of the process — never unmapped, so the readers (the interface, the pipe, the watchdog tick)
 // need no lock against a close. NULL DACL as the config: dwm.exe's identity opens it.
 static std::atomic<DwmHookFaldStatus*> g_faldStatusPtr{ nullptr };
@@ -1366,7 +1378,7 @@ void ResetDwmHookFaldStatus() {
     const LONG v = (LONG)b->version;
     InterlockedExchange((volatile LONG*)&b->version, v | 1);
     b->magic = 0; b->dwmPid = 0;
-    for (DwmHookFaldFadeStatusEntry& e : b->entry) e = DwmHookFaldFadeStatusEntry{};
+    memset(b->_retiredFadeEntry, 0, sizeof(b->_retiredFadeEntry));
     for (DwmHookFaldCoreStatusEntry& e : b->core) e = DwmHookFaldCoreStatusEntry{};
     InterlockedExchange((volatile LONG*)&b->version, (v | 1) + 1);
 }
@@ -1535,10 +1547,8 @@ void UpdateDwmHookSharedConfig()
                                                            static_cast<uint32_t>(fs.debugMode),
                                                            static_cast<int>(fs.pedMode),
                                                            fs.star.enabled ? 1 : 0,
-                                                           fs.flankFade ? 1 : 0,    // bit 8; bit 9 (L) never set
-                                                           g_faldFadeForce.load() ? 1 : 0,    // bit 10: the governor forced
                                                            g_faldCoreForce.load() ? 1 : 0),   // bit 11: the core's rate cap forced off
-                                           fs.coreMode);                                      // bits 16-17: the core test switch
+                                           fs.coreMode);                                      // bits 16-19: the core's mode (KC5)
                         FaldStarfieldSettings st = fs.star;
                         FaldStarfieldClamp(st);
                         DwmHookFaldTuning& t = ex.tail.fald[i];
@@ -1547,10 +1557,8 @@ void UpdateDwmHookSharedConfig()
                         t.starStrength = st.strength; t.starAreaLo = st.areaLo; t.starAreaHi = st.areaHi;
                         t.starPeakHi = st.peakHi; t.starNbLo = st.nbLo; t.starNbHi = st.nbHi;
                         t.starReach = st.reach; t.starEvenReach = st.evenReach;
-                        // LED lag (temporal drive state): clamped here, re-bounded by the DLL
-                        t.tempMode = fs.temporalMode <= FALD_TEMPORAL_PANEL ? fs.temporalMode : FALD_TEMPORAL_OFF;
-                        t.tempTauRiseMs = fs.tauRiseMs; t.tempTauFallMs = fs.tauFallMs;
-                        t.tempDelayFrames = fs.delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : fs.delayFrames;
+                        // LED lag (the panel clock): clamped here, re-bounded by the DLL (the retired words stay 0)
+                        t.tempMode = FaldTemporalModeOf(fs.temporalMode);
                         t.tempClockClosure = FaldPanelClockClosure(fs.clockClosure);
                         t.tempClockParity = FaldPanelClockParity(fs.clockParity);
                         t.refreshMs = mons[i].refreshMs;

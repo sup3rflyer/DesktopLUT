@@ -17,9 +17,19 @@ DesktopLUT uses the following layers, which can be enabled individually or toget
    Applies a volumetric color correction using a loaded .cube file, plus ICtCp HDR tone mapping with dynamic peak detection. With DWM Hook mode on, both run inside DWM with no overlay. With it off, an overlay applies them.
 
 3. **Analysis overlay**
-   Real-time frame analysis (luminance, gamut, HDR histogram, timing stats), activated on demand via hotkey. In DWM Hook mode it is the only component that uses Desktop Duplication.
+   Real-time frame analysis (luminance, gamut, HDR histogram, timing stats), switched on with **ANALYSIS** at the top right of the window or its hotkey. In DWM Hook mode it is the only component that uses Desktop Duplication.
 
 Tone mapping, the 3D LUT and FALD run first, inside DWM (or in the overlay). The MHC profile comes after them, at scanout. The interface draws this order for each display as its pixel path.
+
+## No meter? Start here
+
+In HDR mode, Windows shows SDR content (the desktop, most apps, SDR video) with the piecewise sRGB curve. Dark greys come out lifted and the picture looks washed out. DesktopLUT fixes this in one step, without measuring anything:
+
+1. On **PIPELINE**, select the display. While it is in HDR, the line with its name offers **SDR CONTENT: GAMMA 2.2**.
+2. Switch it on. SDR content is shown as gamma 2.2 at your Windows SDR content brightness, and follows that slider. It is baked into a neutral MHC profile, so it runs at the GPU, with no overlay and nothing loaded into DWM.
+3. HDR games and video change too. Add them to **WHITELIST**, next to the switch, and it turns off while they run.
+
+Switching it off removes that profile again. A neutral profile stays associated in its place, because Windows keeps applying the last one otherwise. **Win + Shift + G** toggles it. Once the display's HDR profile holds a calibration as well, the same setting is **DESKTOP GAMMA** under **GRAYSCALE**.
 
 ## Requirements
 
@@ -101,6 +111,8 @@ The lights on each stage:
 
 **LIVE LAYERS** (top right) replaces the old Start / Stop buttons. The 3D LUT, tone mapping and FALD run whenever they are configured. Switch LIVE LAYERS off to suspend them; MHC profiles stay on. The tray menu has the same switch ("Suspend live layers").
 
+**ANALYSIS**, beside it, shows the analysis overlay on the primary display. It starts what it needs to measure and stops it again when you switch it off.
+
 Three themes are built in: Dark, Gray and Light (Settings → **THEME**).
 
 The previous window is still available: Settings → **INTERFACE** → **CLASSIC**, or the tray's "Classic interface" item. Two things are only there for now: the FALD LED-lag timing fields and the twin-monitor LUT routing tools. The DLC page, the event log, the themes and REFRESH TRIM are only in the new interface.
@@ -112,7 +124,7 @@ Select the display in the list first. The steps below use the new interface; in 
 ### 1. Correct SDR content in HDR mode
 This fixes washed-out SDR content (desktop, apps) while Windows is in HDR.
 
-1. On **PIPELINE**, select the display's HDR side and click **GRAYSCALE**.
+1. On **PIPELINE**, select the display's HDR side and click **GRAYSCALE** (or use **SDR CONTENT: GAMMA 2.2** next to the display's name: see [No meter? Start here](#no-meter-start-here)).
 2. Switch **DESKTOP GAMMA** on. It shows SDR content as gamma 2.2 at your Windows SDR content brightness. If the display has no MHC profile yet, a neutral one is created to carry it.
 3. **Win + Shift + G** toggles it.
 4. Add video players and games to its **WHITELIST**, so it turns off while they run.
@@ -236,6 +248,8 @@ Grayscale correction is applied before tone mapping so display calibration remai
 | **G**  | Toggle gamma correction (SDR-in-HDR fix) |
 | **Z**  | Toggle HDR state for the current monitor |
 | **X**  | Show real-time analysis overlay |
+
+The hotkeys work whenever DesktopLUT runs, also with nothing configured. **G** toggles desktop gamma only where it is set up. **X** is refused while the live layers are suspended. If another program already uses a combination, Events says so and that hotkey stays off.
 
 Turn hotkeys on or off in Settings → **HOTKEYS**. To change a key letter, close DesktopLUT and edit `HotkeyGammaKey`, `HotkeyHdrKey` or `HotkeyAnalysisKey` in `DesktopLUT.ini`.
 

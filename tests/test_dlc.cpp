@@ -666,6 +666,182 @@ TEST_CASE("dlc setup: the setup request and the guide link name what the reposit
     CHECK(url.substr(url.find('#') + 1) == anchor);
 }
 
+// The DLC tab's other requests: one place (dlc_setup), the characterize flow's command line as the operator guide
+// gives it, and a flow DLC has.
+TEST_CASE("dlc setup: the run and characterize requests name the display, the mode and DLC's own flow") {
+    const std::wstring root = RepoRoot();
+    REQUIRE_MESSAGE(!root.empty(), "the repository root (DLC\\pyproject.toml) was not found");
+    CHECK(CalibratePrompt("Studio 32", true) == "Calibrate Studio 32 (HDR) with DLC.");
+    CHECK(OnboardCalibratePrompt("ABC 3201", false).find("\"ABC 3201\" (SDR)") != std::string::npos);
+    CHECK(OnboardCalibratePrompt("ABC 3201", false).find("onboard it first") != std::string::npos);
+    const std::string sdr = CharacterizePrompt("Studio 32", false), hdr = CharacterizePrompt("Studio 32", true);
+    CHECK(sdr.rfind("Characterize Studio 32 (SDR) with DLC", 0) == 0);
+    CHECK(hdr.find(std::string(kCharacterizeFlow) + " HDR") != std::string::npos);
+    CHECK(sdr.find("No calibration run after it unless I ask") != std::string::npos);
+    const std::string onboard = OnboardCharacterizePrompt("ABC 3201", true);
+    CHECK(onboard.find("\"ABC 3201\" (HDR)") != std::string::npos);
+    CHECK(onboard.find("onboard it first") != std::string::npos);
+    CHECK(onboard.find(std::string(kCharacterizeFlow) + " HDR") != std::string::npos);
+    // The operator guide writes the command as the prompt does, and DLC's orchestrator has the flow.
+    const std::string guide = ReadText(root + L"\\" + Native(kCharacterizeDoc));
+    REQUIRE(guide.size() > 1000);
+    CHECK(guide.find(std::string(kCharacterizeFlow) + " SDR") != std::string::npos);
+    CHECK(sdr.find(std::string(kCharacterizeFlow) + " SDR") != std::string::npos);
+    CHECK(ReadText(root + L"\\DLC\\src\\dlc\\calibrate.py").find("\"characterize\": (") != std::string::npos);
+}
+
+namespace {
+const DipRecord* RecordOf(const DipStoreData& d, const std::string& key) {
+    for (const DipRecord& r : d.records) if (r.key == key) return &r;
+    return nullptr;
+}
+}  // namespace
+
+// tests/fixtures/dip_store_panel.json: a full HDR record (with sections DLC does not have yet and fields a newer DLC
+// might write), a record with only its display and mode, a numeric string, three records DLC's loader drops (a
+// field that is no number, a record that is no object, a noise band without sigma_de), a mode-less one with NaN.
+TEST_CASE("dlc dip: every record summarised as DLC loads it; the malformed ones dropped, the rest kept") {
+    const std::wstring root = RepoRoot();
+    REQUIRE(!root.empty());
+    const std::string json = ReadText(root + L"\\tests\\fixtures\\dip_store_panel.json");
+    REQUIRE(!json.empty());
+    const DipStoreData d = ParseDipStore(json);
+    REQUIRE(d.readable);
+    CHECK(d.records.size() == 4);
+    REQUIRE(d.dropped.size() == 3);   // dip.py DipStore.load drops the same three (checked against it, 2026-11-12)
+    CHECK(d.dropped[0] == "Bright 24:SDR");
+    CHECK(d.dropped[1] == "Flat 22:HDR");
+    CHECK(d.dropped[2] == "Banded 26:SDR");
+
+    const DipRecord* full = RecordOf(d, "Studio 32:HDR");
+    REQUIRE(full);
+    CHECK(full->display == "Studio 32");
+    CHECK(full->mode == "HDR");
+    CHECK(full->made == "2026-06-19");
+    CHECK(full->updated == "2026-10-23");
+    CHECK(full->instrument == "Example Colorimeter Pro");
+    CHECK(full->correctionFile.empty());
+    CHECK(full->noiseBands == 2);
+    CHECK(full->noiseFloorNits == 0.0);
+    CHECK(full->settleS == doctest::Approx(1.66));
+    CHECK(full->settleBrightS == doctest::Approx(1.66));
+    CHECK(full->settleDarkS == 0.0);
+    CHECK(full->whiteNits == doctest::Approx(1835.1));
+    CHECK(full->whiteX == doctest::Approx(0.3169));
+    CHECK(full->whiteY == doctest::Approx(0.3284));
+    CHECK(full->blackNits == 0.0);
+    CHECK(full->hasPrimaries);
+    CHECK(std::isnan(full->sustainedPeakNits));   // declared by DLC, null
+    CHECK(full->eotfUndershoot == doctest::Approx(0.0145));
+    CHECK(full->whiteVsLuminance == 2);
+    CHECK(full->thermalRegime == "convergent");
+    CHECK(full->warmupMinutes == doctest::Approx(29.57));
+    CHECK(full->coldChannel == "R");
+    CHECK(full->maxAgeDays == -1);
+    CHECK(std::isnan(DipContrast(*full)));        // black 0: below the meter, no ratio
+    REQUIRE(full->refresh >= 0);
+    REQUIRE(full->refresh < (int)d.refresh.size());
+    const DipRefreshSection& rr = d.refresh[(size_t)full->refresh];
+    CHECK(rr.recordKey == "Studio 32:HDR");
+    CHECK(rr.measured == "2026-10-23");
+    CHECK(rr.error.empty());
+    CHECK(rr.rates.size() == 2);
+    CHECK(rr.hardwareId == "ABC3201");
+    CHECK(full->peakByWindow.present);
+    CHECK(full->peakByWindow.measured == "2026-11-10");
+    CHECK(DipAgeDays(*full, "2026-11-12") == 146);
+    CHECK_FALSE(DipStale(*full, "2026-11-12"));
+    CHECK_FALSE(DipStale(*full, "2026-12-16"));   // 180 days: DLC's default limit, not past it
+    CHECK(DipStale(*full, "2026-12-17"));
+
+    // Only the mandatory fields: every number unmeasured, no sections, no date (DLC calls that stale).
+    const DipRecord* min = RecordOf(d, "Studio 32:SDR");
+    REQUIRE(min);
+    CHECK(min->mode == "SDR");
+    CHECK(min->noiseBands == 0);
+    for (double v : { min->noiseFloorNits, min->readOverheadS, min->settleS, min->whiteNits, min->whiteX, min->whiteY,
+                      min->blackNits, min->sustainedPeakNits, min->eotfUndershoot, min->warmupMinutes })
+        CHECK(std::isnan(v));
+    CHECK(min->thermalRegime.empty());
+    CHECK(min->instrument.empty());
+    CHECK(min->refresh == -1);
+    CHECK_FALSE(min->peakByWindow.present);
+    CHECK_FALSE(min->hasPrimaries);
+    CHECK(DipAgeDays(*min, "2026-11-12") == -1);
+    CHECK(DipStale(*min, "2026-11-12"));
+
+    // A number written as a string (Python's float() takes it); the record's own age limit.
+    const DipRecord* office = RecordOf(d, "Office 27:SDR");
+    REQUIRE(office);
+    CHECK(office->noiseFloorNits == doctest::Approx(0.05));
+    CHECK(DipContrast(*office) == doctest::Approx(2200.0));
+    CHECK(office->maxAgeDays == 30);
+    CHECK(office->correctionFile == "corrections\\office27.ccmx");
+    CHECK_FALSE(DipStale(*office, "2026-10-01"));
+    CHECK(DipStale(*office, "2026-10-02"));
+
+    // Mode-less (written before mode-keying); a NaN DLC wrote reads as unmeasured.
+    const DipRecord* legacy = RecordOf(d, "Legacy 21");
+    REQUIRE(legacy);
+    CHECK(legacy->mode.empty());
+    CHECK(legacy->display == "Legacy 21");
+    CHECK(std::isnan(legacy->blackNits));
+
+    // No file, not a store: no records.
+    CHECK(ParseDipStore("").records.empty());
+    CHECK_FALSE(ParseDipStore("[]").readable);
+    CHECK(ParseDipStore(R"({"schema": 1})").records.empty());
+    DipStoreData none;
+    uint64_t hash = 0;
+    TempDir empty;
+    CHECK_FALSE(ReadDipStore(empty.path, none, hash));
+    CHECK(none.records.empty());
+    CHECK(hash == 0);
+}
+
+TEST_CASE("dlc dip: a display's record as DLC looks it up; the hardware id breaks ties for the refresh response") {
+    const std::wstring root = RepoRoot();
+    REQUIRE(!root.empty());
+    Data data;
+    data.dip = ParseDipStore(ReadText(root + L"\\tests\\fixtures\\dip_store_panel.json"));
+    data.dipFound = data.dip.readable;
+    REQUIRE(data.dip.records.size() == 4);
+    LiveDisplay live;
+    live.hardwareId = "ABC3201";
+    auto keyOf = [&data](const DipLink& l) { return l.record >= 0 ? data.dip.records[(size_t)l.record].key : std::string(); };
+
+    DipLink hdr = DipRecordFor(data, "Studio 32", 1, live);
+    CHECK(keyOf(hdr) == "Studio 32:HDR");
+    CHECK(hdr.key == "Studio 32:HDR");
+    CHECK_FALSE(hdr.modeless);
+    CHECK_FALSE(hdr.refreshOtherPanel);
+    CHECK(keyOf(DipRecordFor(data, "Studio 32", 0, live)) == "Studio 32:SDR");
+    // Keys are exact, as DLC's dict is.
+    CHECK(DipRecordFor(data, "studio 32", 1, live).record == -1);
+    // The mode-less record serves either mode.
+    const DipLink legacy = DipRecordFor(data, "Legacy 21", 1, live);
+    CHECK(keyOf(legacy) == "Legacy 21");
+    CHECK(legacy.modeless);
+    // A record DLC drops: none, said so.
+    const DipLink bright = DipRecordFor(data, "Bright 24", 0, live);
+    CHECK(bright.record == -1);
+    CHECK(bright.unreadable);
+    CHECK(DipRecordFor(data, "Flat 22", 1, live).unreadable);
+    // No record for that mode / no such display / not matched.
+    const DipLink officeHdr = DipRecordFor(data, "Office 27", 1, live);
+    CHECK(officeHdr.record == -1);
+    CHECK_FALSE(officeHdr.unreadable);
+    CHECK(DipRecordFor(data, "Nobody", 0, live).record == -1);
+    CHECK(DipRecordFor(data, "", 1, live).record == -1);
+    // The refresh response names another panel: the record stays, its response is not this display's.
+    live.hardwareId = "XYZ9999";
+    hdr = DipRecordFor(data, "Studio 32", 1, live);
+    CHECK(keyOf(hdr) == "Studio 32:HDR");
+    CHECK(hdr.refreshOtherPanel);
+    live.hardwareId.clear();   // unknown: no verdict
+    CHECK_FALSE(DipRecordFor(data, "Studio 32", 1, live).refreshOtherPanel);
+}
+
 // Developer check against a real DLC folder (read-only): set DLUT_REAL_DLC to its path. Skipped otherwise.
 TEST_CASE("dlc scan: a real DLC folder (DLUT_REAL_DLC)" * doctest::skip(GetEnvironmentVariableW(L"DLUT_REAL_DLC", nullptr, 0) == 0)) {
     wchar_t folder[MAX_PATH] = {};
@@ -685,6 +861,11 @@ TEST_CASE("dlc scan: a real DLC folder (DLUT_REAL_DLC)" * doctest::skip(GetEnvir
     for (const StackRecord& s : d->stacks)
         MESSAGE("stack " << s.display << ":" << s.mode << " run " << s.runId << " mhc " << (s.baseLut.empty() ? "-" : "yes")
                 << " cube " << (s.cubePath.empty() ? "-" : "yes"));
+    for (const DipRecord& r : d->dip.records)
+        MESSAGE("dip " << r.key << " made " << r.made << " white " << r.whiteNits << " black " << r.blackNits << " refresh "
+                << std::string(r.refresh >= 0 ? "yes" : "-") << " peak_by_window "
+                << std::string(r.peakByWindow.present ? "yes" : "-"));
+    MESSAGE("dip records dropped: " << d->dip.dropped.size());
     CHECK(d->folder == folder);
 }
 

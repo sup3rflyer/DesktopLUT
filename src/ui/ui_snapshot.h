@@ -7,7 +7,6 @@
 #include "dlc/dlc_join.h"
 #include "dlc/dlc_live.h"
 #include "actions/notify.h"
-#include "fald_fade_status.h"
 #include "fald_core_status.h"
 #include "refresh_trim.h"
 #include "dwm_hook_build.h"
@@ -34,7 +33,6 @@ struct DisplayRow {
     dlc::ModeRecord dlcRecord[2];   // 0 SDR, 1 HDR
     bool reminderDue = false;       // for the mode the display is in
     bool dlcRun = false;            // the DLC run (Snapshot::run) measures this display
-    FaldFadeGovReport fadeGov[2];   // the flank fade governor's status, 0 SDR, 1 HDR (src/fald_fade_status.h)
     FaldCoreGovReport coreGov[2];   // the core layer's rate-cap governor's status, likewise (src/fald_core_status.h)
     RefreshTrimStatus refreshTrim;  // the refresh-rate trim (HDR) as of its last reconcile (monitor -1: none yet)
 };
@@ -49,6 +47,8 @@ struct Snapshot {
     std::shared_ptr<const dlc::Live> run;   // DLC's run in progress, or the last one (never null)
     bool hookMode = false;
     bool hookActive = false;
+    bool hookIdle = false;    // hook mode, running: no hook resident because no display has hook work (DwmHookIdle)
+    bool analysis = false;    // the analysis readout is on (g_analysisEnabled)
     DwmHookBuildStatus hookBuild;  // was the hook verified against this Windows' dwmcore.dll (dwm_hook_build.h)
     std::wstring lastStatus;      // the newest status line or warning / error (any source)
     notify::Sev lastStatusSev = notify::Sev::Info;

@@ -1,12 +1,11 @@
-// The always-on core round 2 — PROTOTYPE (shared/fald_core2.h; DLC results/fald_principled_2026-10-22/PREREG_CORE2.md).
+// The always-on core KC5 (shared/fald_core2.h; DLC results/fald_principled_2026-10-22/PREREG_CORE5.md).
 //   - the shaders compile (every pass with the common source's core seam; the core's five kernels) on WARP;
 //   - opt-in, FALD_TEST_CORE2_DIR: the overlay's layer with the core ON runs on WARP over the frames <dir>/fNN.rgba16f
 //     (panel.bin, frames written by DLC tests/test_fald_core2_warp.py), one fald_dump per run in <dir>/dNN (zone fields,
-//     the output), replayed by that test against the GPU-order twin dlc.fald.core2emu; then the setting goes off and the
-//     resources must be gone. The refresh period is set long (1 s) so every run advances the zone IIR by exactly k = 1
-//     refresh (FaldCore2Refreshes: the run interval over the period, at least 1): a = 1 - 0.65^0.5, deterministic.
-// The OFF identity (the core off = main bit for bit) is the flank fade's OFF manifest (tests/test_fald_fade.cpp,
-// FALD_TEST_FADE_REF with tests/fixtures/fald_fade_off_main.hashes).
+//     the output), replayed by that test against the GPU-order twin dlc.fald.core2emu; then the core goes off (C, the
+//     tests' reference mode) and the resources must be gone. KC5 is stateless: every run is a pure function of its frame.
+// The core off = C bit for bit: the layer gate's C manifest (tests/test_fald_layer_gate.cpp, FALD_TEST_LAYER_REF; the
+// 2026-10-20 reference tests/fixtures/fald_fade_off_main.hashes).
 #include "doctest.h"
 #include "../src/fald.h"
 #include "../src/types.h"
@@ -25,12 +24,6 @@
 #include <vector>
 
 namespace {
-int CoreEnvMode() {                      // FALD_TEST_CORE2_MODE: 1 = KC2c (default), 2 = KC3, 4 = KC5
-    char* v = nullptr; size_t n = 0;
-    if (_dupenv_s(&v, &n, "FALD_TEST_CORE2_MODE") != 0 || !v) return 1;
-    const int m = atoi(v); free(v);
-    return (m == 2 || m == 4) ? m : 1;
-}
 std::wstring CoreEnvDir(const char* name) {
     char* v = nullptr; size_t n = 0;
     if (_dupenv_s(&v, &n, name) != 0 || !v) return std::wstring();
@@ -39,7 +32,7 @@ std::wstring CoreEnvDir(const char* name) {
 }
 }  // namespace
 
-TEST_CASE("FALD core round 2: the core's kernels and the layer's passes compile with the common source's core seam") {
+TEST_CASE("FALD core: the core's kernels and the layer's passes compile with the common source's core seam") {
     ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     REQUIRE(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic)));
@@ -48,17 +41,19 @@ TEST_CASE("FALD core round 2: the core's kernels and the layer's passes compile 
     CHECK(FaldCore2ShadersReady());
     FaldCore2ReleaseShaders();
     CHECK_FALSE(FaldCore2ShadersReady());
-    CHECK(FaldCore2IirFactor(0) == 0.0f);
-    CHECK(std::fabs(FaldCore2IirFactor(2) - 0.35f) < 1e-6f);                  // 0.35 per 2-refresh content frame
-    CHECK(std::fabs(FaldCore2IirFactor(1) - (1.0f - std::sqrt(0.65f))) < 1e-6f);
-    CHECK(FaldCore2Refreshes(true, 3, 50.0f, 16.667f) == 3ull);              // mode 3: the panel clock's k
-    CHECK(FaldCore2Refreshes(false, 0, 33.4f, 16.667f) == 2ull);             // else the run interval over the period
-    CHECK(FaldCore2Refreshes(false, 0, 2.0f, 16.667f) == 1ull);              // at least one
-    CHECK(g_faldCore2TestRefreshes == 0ull);                                  // the seam is off unless a test sets it
+    // the mode table: KC5 is the default and the only rule that ships; C (0) is the core off; the removed test modes
+    // (1 KC2c, 2 KC3, 3 KC4) and anything else run as C
+    CHECK(FALD_CORE_MODE_DEFAULT == FALD_CORE_MODE_KC5);
+    CHECK(FaldCore2FlagsOfMode(FALD_CORE_MODE_KC5) == 201u);
+    CHECK(FaldCoreModeKnown(FALD_CORE_MODE_C)); CHECK(FaldCoreModeKnown(FALD_CORE_MODE_KC5));
+    for (uint32_t m : { 1u, 2u, 3u, 5u, 15u }) { CHECK_FALSE(FaldCoreModeKnown(m)); CHECK(FaldCore2FlagsOfMode(m) == 0u); }
+    CHECK(std::string(FaldCoreModeName(FALD_CORE_MODE_KC5)) == "KC5");
+    FaldSettings d;
+    CHECK(d.coreMode == FALD_CORE_MODE_KC5);
     ic->Release(); dev->Release();
 }
 
-TEST_CASE("FALD core round 2 on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DIR)") {
+TEST_CASE("FALD core on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DIR)") {
     const std::wstring dir = CoreEnvDir("FALD_TEST_CORE2_DIR");
     if (dir.empty()) return;
     ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
@@ -74,13 +69,12 @@ TEST_CASE("FALD core round 2 on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DI
     ctx.width = (int)(pp.originX + pp.latW); ctx.height = (int)(pp.originY + pp.latH);
     ctx.isHDREnabled = true;
     ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
-    ctx.frameTimeExactMs = 1000.0f;                                 // k = 1 refresh per run (see the header)
+    ctx.frameTimeExactMs = 16.667f;
     FaldSettings& fs = ctx.hdrColorCorrection.fald;
     fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
     fs.temporalMode = FALD_TEMPORAL_OFF;
-    fs.coreMode = (uint32_t)CoreEnvMode();
+    fs.coreMode = FALD_CORE_MODE_KC5;
     REQUIRE(FaldEnsureResources(&ctx, fs));
-    g_faldCore2TestRefreshes = 1;                                   // k = 1 per run, whatever WARP's run time
 
     static const char* vsSrc = "struct O { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };"
                                "O main(uint id : SV_VertexID) { O o; o.uv = float2((id << 1) & 2, id & 2);"
@@ -128,8 +122,7 @@ TEST_CASE("FALD core round 2 on WARP: dumps for the DLC twin (FALD_TEST_CORE2_DI
         Sleep(12);
     }
     CHECK(runs > 0);
-    g_faldCore2TestRefreshes = 0;
-    fs.coreMode = 0;                                                // off (C): the core's resources are released
+    fs.coreMode = FALD_CORE_MODE_C;                                 // off (C): the core's resources are released
     ctx.faldDumpRequested.store(false);
     FaldRunPasses(&ctx, rtv, true);
     CHECK_FALSE(ctx.fald->core2On);

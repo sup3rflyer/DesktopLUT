@@ -117,7 +117,6 @@ extern int g_dwmHookConfigResends;             // Countdown of extra shared-conf
                                                // change or HDR/SDR mode flip so the hook's suspicious-change
                                                // debounce can converge (GUI thread only —
                                                // DWM_HOOK_RESEND_TIMER_ID decrements it)
-extern std::atomic<bool> g_hookOnlyHotkeys;    // Hotkeys registered on GUI window (hook-only mode)
 extern std::atomic<bool> g_analysisOnlyMode;   // Lightweight analysis-only thread running (no overlay)
 extern std::atomic<unsigned> g_analysisThreadGen; // Analysis-only thread generation. A thread whose captured
                                                // generation goes stale (bumped on detach or by a successor

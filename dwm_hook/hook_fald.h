@@ -38,9 +38,9 @@ struct ID3D11Buffer;
 // The binding ranges the layer touches on DWM's immediate context, as the HLSL declares them
 // (t0..t19, u0..u3). hook_render.cpp clears these same ranges in its own cleanup paths — a slot
 // this layer left bound is DWM's problem the moment the hook returns.
-#define HOOK_FALD_SRV_SLOTS 40  // t0..t39: the layer t0..t22 (t20..t22 = the fade stack's views), the fade passes t24..t35,
-                                // the conv pass's float4 kernel views t36 / t37, the touched-zone list t38, the packed fields t39
-#define HOOK_FALD_UAV_SLOTS 8   // u0..u7: the fade passes bind up to u7 (the panel clock four)
+#define HOOK_FALD_SRV_SLOTS 40  // t0..t39: the layer t0..t19 (t20..t35 free), the conv pass's float4 kernel views t36 / t37,
+                                // the touched-zone list t38, the packed fields t39
+#define HOOK_FALD_UAV_SLOTS 8   // u0..u7: the statistic pass binds up to u7 (the core's node partials)
 
 // Per-monitor GPU resources + the panel file they were built for. Owned by hook_fald.cpp, handed
 // out by FaldAcquire and released wholesale by FaldReleaseAll (UninitializeStuff).
@@ -121,19 +121,15 @@ ID3D11ShaderResourceView* FaldCleanSRV(FaldMonitor* m);
 bool HookRequestFullRecompose();
 
 // Live settings from the shared config (DwmHookSharedConfig::faldFlags + the tuning tail), applied to
-// the next run. star: starfield balancing. tuning = null: its defaults (older host). fade: the frozen fade stack
-// (faldFlags bit 8; shared/fald_fade.h) — its passes (shipped bytecode) and resources are created over the first presents
-// any monitor wants it (paced, fald_fade.h); the layer runs without the fade until they exist.
+// the next run. star: starfield balancing. tuning = null: its defaults (older host).
 // monW / monH: the monitor's desktop size (the host's monitors[] entry; 0 = unknown = the frame's). While a debug view is
 // on, the rects in tuning->exempt (DesktopLUT's own windows, monitor pixels; shared/fald_exempt.h) are mapped onto the
 // frame with it and drawn again with the view off.
-// fadeForce: the fade's safety governor never suspends it (faldFlags bit 10, INI [General] FaldFlankFadeForce;
-// shared/fald_fade_governor.h).
 // coreForce: the core layer's rate-cap governor never caps the full path (faldFlags bit 11, INI [General] FaldCoreForce;
 // shared/fald_core_governor.h).
 void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bool star,
-                         const DwmHookFaldTuning* tuning, bool fade = false, unsigned int monW = 0, unsigned int monH = 0,
-                         bool fadeForce = false, bool coreForce = false, unsigned int coreMode = 0);
+                         const DwmHookFaldTuning* tuning, unsigned int monW = 0, unsigned int monH = 0,
+                         bool coreForce = false, unsigned int coreMode = 0);
 
 // Run the correction: read the frame left in this monitor's intermediate (full frame, FP16 scRGB,
 // 1.0 = 80 nits) and write the corrected frame into `dstRTV` (the back buffer). Leaves nothing
@@ -143,9 +139,7 @@ void FaldSetLiveSettings(FaldMonitor* m, unsigned int debugMode, int pedMode, bo
 // newContent: this present carries a content change (not only the host's settle kick — see
 // DWM_HOOK_FALD_SETTLE_EVENT); it re-arms the LED-lag settle hold.
 // lutPassKey: the identity of what the LUT / tone map pass made of the clean copy this present (equal keys = the same
-// pass on the same inputs; 0 = unknown or time-varying, e.g. the dynamic peak). With the clean copy unchanged since the
-// last run (FaldUpdateClean copied no rect), the same key = the same intermediate: with the flank fade on and LED lag off
-// both rounds' reach are reused (shared/fald_fade.h FaldFadeReachCurrent).
+// pass on the same inputs; 0 = unknown or time-varying, e.g. the dynamic peak): the change-driven path needs it known.
 // frameChanged / frameChangedOffset (shared/fald_change.h changeFlags[3]): a buffer whose uint at that byte offset the GPU
 // set to 1 when the pass that made the intermediate changed the WHOLE frame this present — the dynamic tone map's peak
 // moved (shared/peak_detect.h: the smoothing pass's draw arguments, PEAK_ARGS_MOVED_OFFSET) — and 0 when it is the same
@@ -173,15 +167,10 @@ void FaldReleaseAll();
 
 #ifdef DLUT_HOOK_TESTING
 // Test seams (tests/test_fald_hook.cpp; the test exe only, never the DLL): a live panel delivery without its named
-// section (true = ingested: the entry swaps at its next FaldAcquire), and read access to an entry's fade state.
-struct FaldFade;
+// section (true = ingested: the entry swaps at its next FaldAcquire), and read access to an entry's state.
 struct ID3D11Buffer;
 bool FaldTestDeliver(int left, int top, bool isHdr, unsigned int gen, const void* payload, size_t bytes);
-FaldFade* FaldTestFade(FaldMonitor* m);
-bool FaldTestFadeOn(const FaldMonitor* m);
 ID3D11Buffer* FaldTestCB(FaldMonitor* m);
-// The entry's governor state (shared/fald_fade_governor.h FaldFadeGovState as a number).
-unsigned int FaldTestFadeGovState(const FaldMonitor* m);
 // The entry's core governor state (shared/fald_core_governor.h FaldCoreGovState as a number) and its held runs.
 unsigned int FaldTestCoreGovState(const FaldMonitor* m);
 unsigned long long FaldTestHeldRuns(const FaldMonitor* m);

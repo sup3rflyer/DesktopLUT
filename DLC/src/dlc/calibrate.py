@@ -158,7 +158,7 @@ from .patch_sets import (
     outside_in_indices,
 )
 from .paths import atomic_write_text, runs_dir
-from .runs import (RunContext, create_run, open_run, publish_active_pointer,
+from .runs import (RUN_DRIVERS, RunContext, create_run, open_run, publish_active_pointer,
                    update_active_pointer)
 from .stages import _common, build_mhc
 
@@ -540,10 +540,16 @@ class Calibration:
         keep_layers: Optional[Sequence[str]] = None,
         sdr_white_probe: Optional[Callable[[Optional[Mapping[str, Any]]], dict[str, Any]]] = None,
         patch_window_size: Optional[Mapping[str, Any]] = None,
+        driver: str = "cli",
     ) -> None:
         self.ctx = ctx
         self.profile = profile
         self.monitor = monitor
+        # Who launched this invocation (--driver: cli / claude / desktoplut) — active.json carries it
+        # for the DLC tab. Advisory metadata; nothing in the run reads it.
+        if driver not in RUN_DRIVERS:
+            raise ValueError(f"driver must be one of {RUN_DRIVERS}, not {driver!r}")
+        self.driver = driver
         # Local DisplayConfig link-format probe (dlc.link_format.probe_link_formats) — the fallback
         # when the DesktopLUT build's query_monitors predates link_bpc. The live CLI wires it; the
         # default None keeps sim/tests off the host's real displays.
@@ -959,6 +965,8 @@ class Calibration:
         "clear-native": ("Clear to native", False),
         "enter-neutral": ("Enter neutral", False),
         "characterize": ("Characterize panel", True),
+        "peak-window": ("Peak by window", True),
+        "refresh-response": ("Refresh response", True),
         "hardware-readiness": ("Hardware readiness", False),
         "brightness": ("Brightness", False),
         "measure:raw": ("Measure · raw panel", True),
@@ -1404,30 +1412,28 @@ class Calibration:
         self._save()
         return record
 
-    def _revert_inplace(self) -> str:
-        """Revert the in-place refinement (``3dlut-only``). Its only display mutation is the
-        runtime cube, so it is fully restorable — put the prior cube back (or clear it if there
-        was none). If even that fails, surface the durable settings backup for a manual restore.
-        Returns the terminal status (``reverted`` when the display was put back, else
-        ``revert_unavailable``)."""
+    def _revert_inplace(self, *, why: str = "operator chose revert at the apply gate") -> str:
+        """Revert an in-place refinement. ``3dlut-only``: its only display mutation is the runtime
+        cube, so it is fully restorable — put the prior cube back (or clear it if there was none).
+        ``grayscale-wb``: :func:`restore_gswb_prior` (cancel an uncommitted preview, else re-apply
+        the run's pre-touch-up curve and re-bake), confirmed by a read-back. If neither can be done,
+        surface the durable settings backup for a manual restore. Returns the terminal status
+        (``reverted`` when the display was provably put back, ``revert_unconfirmed`` when the calls
+        returned but the read-back does not prove it, else ``revert_unavailable``)."""
         baseline = self.calib.get("inplace_baseline") or {}
         flow = self.calib.get("flow")
         if flow == "grayscale-wb":
-            # Design B revert (fable Phase 7a): the touch-up was BAKED in its stage, so the C++
-            # live session is gone and grayscale_cancel would be a no-op. Re-apply the DLC-owned
-            # pre-begin snapshot instead (set_correction_grayscale + apply_mhc) — this restores
-            # the user's PRE-EXISTING correction (or clears to identity if there was none) and is
-            # robust across a DesktopLUT restart (the snapshot is in dlc_state.json). Also cancel
-            # any still-open preview first, for the corner where the stage aborted BEFORE baking.
-            try:
-                self.controller.grayscale_cancel(self.monitor, self.mode)   # no-op after commit
-            except Exception:  # noqa: BLE001 - best-effort; the explicit restore below is authoritative
-                pass
-            if self._restore_correction_grayscale():
-                prior = self.calib.get("grayscale_wb_prior")
-                self.ctx.log("reverted: restored the pre-existing Grayscale correction"
-                             if prior else "reverted: cleared the Grayscale touch-up to identity")
+            # Design B revert (fable Phase 7a): the touch-up was BAKED in its stage, so the C++ live
+            # session is gone and grayscale_cancel is a no-op — the DLC-owned pre-begin snapshot
+            # (dlc_state.json, robust across a DesktopLUT restart) is what goes back. The same
+            # function serves the CLI rollback guard and --abort.
+            gs = restore_gswb_prior(self.controller, self.calib, monitor=self.monitor, mode=self.mode,
+                                    why=why, log=self.ctx.log)
+            self._save()
+            if gs["outcome"] in ("restored", "not_needed"):
                 return "reverted"
+            self.ctx.log(_gswb_rollback_hint(self.ctx.root))
+            return "revert_unconfirmed" if gs["outcome"] == "unconfirmed" else "revert_unavailable"
         if flow == "3dlut-only" and baseline.get("captured"):
             prev = baseline.get("cube_path")
             try:
@@ -3369,7 +3375,8 @@ class Calibration:
         # the DIP's, or an emissive panel would be measured full-field (its power limiter dims it) or
         # at a window nobody can confirm. Whether that window is right is a judgment — never auto.
         window_size = outcome.digest.get("patch_window_size") or {}
-        if window_size.get("seam") and self.calib.get("flow") != "build-correction":
+        # (The probe flows paint their own window per patch: the presenter's window is not theirs.)
+        if window_size.get("seam") and self.calib.get("flow") not in ("build-correction", *PROBE_FLOWS):
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="preflight:patch-window", seam=SEAM_PATCH_WINDOW, stage="preflight",
                 question=window_size.get("question") or "confirm the patch window — proceed or abort?",
@@ -4115,6 +4122,12 @@ class Calibration:
                           patch_window_area_pct=(self.patch_window_report or {}).get("area_pct"),
                           made=self.run_date.isoformat(),
                           updated=self.run_date.isoformat())
+            # A re-characterization replaces the record; the optional measured sections recorded by the
+            # probes (refresh_response, peak_by_window) are not re-measured here and carry their own date,
+            # so they are kept (else every characterize silently dropped them).
+            prior = store.get(dip.key)
+            if prior is not None:
+                dip = replace(dip, refresh_response=prior.refresh_response, peak_by_window=prior.peak_by_window)
             # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
             # 180-day default) — panel+meter behaviour drift is a different clock than the
             # colorimeter correction's age, so we deliberately do NOT inherit correction.max_age_days.
@@ -6680,7 +6693,7 @@ class Calibration:
         (the preview equals the bake's maths; the installed profile is what ships, and Windows' own MHC2
         evaluator is what the panel sees). Revert is DLC-owned (fable Phase 7a, Design B): the pre-begin
         correctionGrayscale is snapshotted to dlc_state before the edit, and ``verify:accept =
-        revert`` re-applies it (``_restore_correction_grayscale``) rather than relying on the C++
+        revert`` re-applies it (:func:`restore_gswb_prior`) rather than relying on the C++
         ``grayscale_cancel`` (a no-op once commit has run) — robust across a DesktopLUT restart.
         This is the toggleable third "+1": the core (matrix + base grayscale + 3D LUT) is never
         touched, and the result is one-toggle revertible to the user's prior correction. Requires the live preview path
@@ -6730,6 +6743,10 @@ class Calibration:
                              "re-capture a half-finished edit as the prior")
             else:
                 self.calib["grayscale_wb_prior"] = prior_snapshot = self._snapshot_correction_grayscale()
+            # The pair the prior belongs to (and the identity fallback's gamma), so --abort / the CLI
+            # rollback guard restore THIS monitor:mode — never their argparse defaults.
+            self.calib.setdefault("grayscale_wb_pair", {"monitor": self.monitor, "mode": self.mode,
+                                                        "gamma": float(spec.gamma)})
             self._save()
             if prior_snapshot is None:
                 # Honesty tell (fable Phase 9): a revert will clear the touch-up to identity
@@ -7073,6 +7090,30 @@ class Calibration:
             return StageOutcome("grayscale-wb", "done", digest=digest, data={"payload": payload})
 
         outcome = self._stage("grayscale-wb", run)
+        restore = self.calib.get("grayscale_wb_restore") or {}
+        if outcome.replayed and restore.get("began"):
+            # A rollback of THIS touch-up already ran (the CLI guard, --abort or a revert): the
+            # memoised stage result and bake record describe a curve that is no longer on the
+            # display. Verifying now would score the user's prior curve as the touch-up — a
+            # mechanical refusal, not a judgment. Recorded under its own key so the touch-up stage's
+            # memo stays "done": every later resume refuses the same way (an "aborted" memo would
+            # instead re-run a whole new touch-up on the next resume).
+            raise CalibrationAborted(StageOutcome(
+                "grayscale-wb:rolled-back", "aborted",
+                digest={"message": ("this run's Grayscale touch-up was rolled back "
+                                    f"({restore.get('why')}: {restore.get('outcome')}) — its result is no "
+                                    "longer on the display, so the run cannot resume; start a new "
+                                    "grayscale-wb run"),
+                        "rolled_back": True, "grayscale_wb_restore": restore}))
+        if not outcome.replayed:
+            # A freshly (re-)run touch-up made a NEW live edit: an earlier attempt's bake / rollback
+            # records describe a different curve (a stage re-run after a pre-commit rollback, or
+            # --force) and must not short-circuit this attempt's commit.
+            for key in ("grayscale_wb_baked", "grayscale_wb_restore"):
+                old = self.calib.pop(key, None)
+                if old is not None:
+                    self.calib.setdefault("grayscale_wb_attempt_history", []).append({key: old})
+            self._save()
         if outcome.digest.get("measurement_compromised"):
             decision = self.adjudicate(AdjudicationRequest(
                 key="grayscale-wb:measurement", seam=SEAM_MEASURE, stage="grayscale-wb",
@@ -7082,7 +7123,7 @@ class Calibration:
                 options=("accept", "abort"), recommendation="abort",
                 digest=outcome.digest))
             if decision.choice == "abort":
-                self._revert_inplace()
+                self._revert_inplace(why="grayscale-wb:measurement seam answered abort")
                 raise CalibrationAborted(StageOutcome(
                     "grayscale-wb", "aborted",
                     digest={"message": "aborted on Grayscale touch-up measurement session",
@@ -7097,7 +7138,7 @@ class Calibration:
                 options=("accept", "abort"), recommendation=recommendation,
                 digest=outcome.digest))
             if decision.choice == "abort":
-                self._revert_inplace()
+                self._revert_inplace(why="grayscale-wb:touchup-size seam answered abort")
                 raise CalibrationAborted(StageOutcome(
                     "grayscale-wb", "aborted",
                     digest={"message": "aborted on large Grayscale touch-up",
@@ -7201,36 +7242,6 @@ class Calibration:
         except Exception:  # noqa: BLE001 - advisory snapshot; revert falls back to clearing
             self.calib["grayscale_wb_prior_source"] = "unreadable"
             return None
-
-    def _restore_correction_grayscale(self) -> bool:
-        """Re-apply the DLC-owned pre-begin correctionGrayscale snapshot and regenerate the ICM
-        (Design B revert). Restores the user's prior correction if one was captured, else clears
-        to identity — either way it does NOT rely on the C++ cancel-after-commit no-op. Returns
-        whether the restore call chain succeeded.
-
-        The prior block goes back VERBATIM (``set_correction_grayscale_raw``): it is already in
-        DesktopLUT's stored decomposition, so the signal-domain bridge would bend a curve that
-        carries a luminance (main-slider) component. ``ApplyGrayscalePayload`` then forces the
-        curve ENABLED, so the prior on/off state is put back through ``layers.set`` — a curve the
-        user had switched off stays off."""
-        prior = self.calib.get("grayscale_wb_prior")
-        try:
-            if prior and prior.get("points"):
-                self.controller.set_correction_grayscale_raw(self.monitor, self.mode, prior)
-                if prior.get("enabled") is not None:
-                    self.controller.set_layers(self.monitor, self.mode, grayscale=bool(prior["enabled"]))
-            else:
-                n = 32
-                grid = [j / (n - 1) for j in range(n)]
-                self.controller.set_correction_grayscale(
-                    self.monitor, self.mode, n, grid,
-                    {ch: [1.0] * n for ch in ("r", "g", "b")}, gamma=float(self._spec().gamma))
-            self.controller.apply_mhc(self.monitor, self.mode)
-            return True
-        except Exception as exc:  # noqa: BLE001 - fall through to the manual-backup guidance
-            self.ctx.log(f"grayscale touch-up revert failed ({type(exc).__name__}: {exc}); "
-                         "see settings backup")
-            return False
 
     def _active_runtime_cube(self) -> Optional[str]:
         try:
@@ -8345,11 +8356,13 @@ class Calibration:
     # Flows
     # ====================================================================
     def _active_pointer_identity(self) -> dict[str, Any]:
-        """Who this run is, for ``active.json``: the display / monitor / mode, and the panel's EDID
-        hardware id — the profile's recorded one (``quirks.hardware_id``) when it has one, else the
-        id the preflight read from live enumeration, else omitted."""
+        """Who this run is, for ``active.json``: the display / monitor / mode, who drives this
+        invocation (``driver``: cli / claude / desktoplut — the DLC tab shows it), and the panel's
+        EDID hardware id — the profile's recorded one (``quirks.hardware_id``) when it has one, else
+        the id the preflight read from live enumeration, else omitted."""
         out: dict[str, Any] = {"display": self.display.name, "monitor": self.monitor,
-                               "mode": self.mode, "content_mode": self.content_mode}
+                               "mode": self.mode, "content_mode": self.content_mode,
+                               "driver": self.driver}
         hw = str(self.display.quirks.get("hardware_id") or "").strip()
         source = "profile"
         if not hw:
@@ -8519,7 +8532,7 @@ class Calibration:
         that window unnoticed — on an OLED, full-field ABL-dimmed reads. Mechanical no-op when nothing
         was recorded, the window is unknown now, or it is unchanged; a change is a judgment, keyed by
         the change itself so a later, different change asks again (never a replayed old answer)."""
-        if self.calib.get("flow") == "build-correction":
+        if self.calib.get("flow") in ("build-correction", *PROBE_FLOWS):
             return
         rec = self.calib.get("patch_window_size") or {}
         if not rec.get("known") or rec.get("area_pct") is None:
@@ -8569,6 +8582,12 @@ class Calibration:
                 return self._flow_build_correction()
             if flow == "characterize":
                 return self._flow_characterize()
+            if flow == "peak-window":
+                from . import peak_window   # the probe flows live in their own modules
+                return peak_window.run_flow(self)
+            if flow == "refresh-response":
+                from . import refresh_probe
+                return refresh_probe.run_flow(self)
             if flow == "hdr":
                 # P13 (fable Phase 7a): HDR is a MODE, not a flow — `--mode HDR` on the normal
                 # flows runs the full HDR pipeline (PQ target, HDR refine, dE_ITP verify). This
@@ -8922,6 +8941,11 @@ class Calibration:
         elif self.calib.get("inplace_baseline") is not None:
             if choice == "revert":
                 status = self._revert_inplace()
+            elif self.calib.get("flow") == "grayscale-wb" and \
+                    (self.calib.get("grayscale_wb_baked") or {}).get("baked"):
+                # The touch-up is KEPT: --abort must never take an applied result back off the display.
+                self.calib["grayscale_wb_baked"]["applied"] = True
+                self._save()
             # else: the in-place refinement is already applied; nothing to commit. The
             # grayscale-wb touch-up was baked in its stage (Design B, fable Phase 7a) so
             # measure:verify scored the real result; apply keeps it, revert (above →
@@ -8937,6 +8961,11 @@ class Calibration:
         digest = rep.digest
         if choice == "revert" and self.calib.get("snapshot_restore") is not None and isinstance(digest, dict):
             digest = {**digest, "snapshot_restore": self.calib["snapshot_restore"]}
+        if choice == "revert" and self.calib.get("flow") == "grayscale-wb" and isinstance(digest, dict) \
+                and self.calib.get("grayscale_wb_restore") is not None:
+            digest = {**digest, "grayscale_wb_restore": self.calib["grayscale_wb_restore"]}
+            if self.calib["grayscale_wb_restore"].get("display_may_carry_touchup"):
+                digest["hint"] = _gswb_rollback_hint(self.ctx.root)
         return CalibrationResult(
             flow=self.calib.get("flow"), monitor=self.monitor, mode=self.mode, target=self.target_name,
             status=status, stages=list(self.calib["stages"].keys()),
@@ -9572,7 +9601,9 @@ class Calibration:
             digest={"characterize": outcome.digest,
                     "stored_display": dip.display if dip else None,
                     "dip_store": str(self._dip_store().path),
-                    "snapshot_restore": self.calib.get("snapshot_restore")})
+                    "snapshot_restore": self.calib.get("snapshot_restore"),
+                    # what the record still lacks that a probe flow measures (the overseer may suggest it)
+                    "gaps": _dip_probe_gaps(dip, mode=self.mode, emissive=self.display.is_emissive)})
 
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
         """3dlut-only assumes an installed stack. If it's missing, escalate
@@ -10835,10 +10866,37 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
                    "measure:verify", "verify"),
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
+    "peak-window": ("preflight", "enter-neutral", "hardware-readiness", "peak-window"),
+    "refresh-response": ("preflight", "hardware-readiness", "refresh-response"),
     # verify-source / install-candidate only with --verify-patches-from / --verify-cube.
     "verify-only": ("preflight", "verify-source", "verify-patches-file", "resolve-target", "whitepoint",
                     "hardware-readiness", "install-candidate", "measure:verify", "verify"),
 }
+
+# The probe flows (measure the panel's behaviour, write a DIP section; never build or apply anything).
+PROBE_FLOWS = ("peak-window", "refresh-response")
+
+
+def _dip_probe_gaps(dip: Any, *, mode: str, emissive: bool) -> list[str]:
+    """The characterize digest's note of what the HDR record lacks that a probe flow measures."""
+    if dip is None or str(mode).upper() != "HDR":
+        return []
+    out = []
+    if getattr(dip, "refresh_response", None) is None:
+        out.append("no refresh response measured (python -m dlc.refresh_probe; REFRESH TRIM needs it)")
+    if emissive and getattr(dip, "peak_by_window", None) is None:
+        out.append("no peak-by-window curve measured (python -m dlc.peak_window)")
+    return out
+
+
+def _vrr_presenter_factory(args: Any) -> Optional[Callable[..., Any]]:  # pragma: no cover - live wiring
+    """The refresh probe's VRR rate source: the native presenter's client (dlc.vrr). None until it is built."""
+    try:
+        from .vrr import native_presenter_factory
+    except Exception:  # noqa: BLE001
+        return None
+    return native_presenter_factory()
+
 
 # Flow registry (the named flows the front door maps an intent onto). HDR is a run
 # MODE (--mode HDR), orthogonal to the flow — the "hdr" entry is a signpost stub.
@@ -10851,6 +10909,11 @@ FLOWS: dict[str, str] = {
                    "grayscale (white band) → re-apply its 3D LUT → short verify → apply gate"),
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
+    "peak-window": ("HDR probe: consent → native (or --probe-spec stack installed) → white windows 1..100 % up and "
+                    "down (the ABL graph) → restore → record seam → DIP peak_by_window (dlc.peak_window)"),
+    "refresh-response": ("HDR probe: plan seam → through the installed MHC (layers, cube, trim out) → reference ↔ rate "
+                         "brackets, a consent per mode switch (or a VRR cadence) → restore → files for "
+                         "`dlc.refresh_trim record` (dlc.refresh_probe)"),
     "verify-only": ("MEASURE the installed stack (or a --verify-cube candidate over it) against the verify "
                     "preset or a recorded run's exact set (--verify-patches-from, deltas vs its verify) → "
                     "report; builds/commits nothing (candidate: verify:candidate restore/keep)"),
@@ -10950,9 +11013,281 @@ def _restore_hint(calib_state: Optional[dict[str, Any]]) -> str:
     return hint
 
 
+# ---------------------------------------------------------------------------
+# grayscale-wb: putting the user's pre-touch-up correction curve back
+#
+# The touch-up is COMMITTED (baked into the installed MHC's fine-tune curve, correctionGrayscale)
+# at the end of its stage, BEFORE measure:verify scores it — on HDR the live preview provably
+# differs from the bake, so only the bake can be verified. From the commit on, the C++ live session
+# is gone and mhc.grayscale_cancel is a no-op; the only undo is the run's own pre-begin snapshot
+# (calib['grayscale_wb_prior']). Every ending of the run that does not APPLY the touch-up (verify
+# 'revert', a cancel / pause timeout / meter death / stall / stage error / crash caught by the CLI
+# rollback guard, an --abort) goes through restore_gswb_prior, which reports the restore as done
+# only when a state.get read-back shows the prior curve.
+# ---------------------------------------------------------------------------
+
+_GSWB_MATCH_TOL = 1e-6   # DesktopLUT stores float32 and prints %.10g: a curve read back round-trips
+
+
+def _gswb_floats_problem(name: str, got: Any, want: Any) -> Optional[str]:
+    try:
+        g = [float(v) for v in (got or [])]
+        w = [float(v) for v in (want or [])]
+    except (TypeError, ValueError):
+        return f"{name} unreadable"
+    if len(g) != len(w):
+        return f"{name}: {len(g)} values read back, {len(w)} expected"
+    for i, (a, b) in enumerate(zip(g, w)):
+        if abs(a - b) > _GSWB_MATCH_TOL * max(1.0, abs(b)):
+            return f"{name}[{i}] reads {a:.6g}, expected {b:.6g}"
+    return None
+
+
+def _gswb_curve_problem(read: Mapping[str, Any], want: Mapping[str, Any], *,
+                        check_enabled: bool = True) -> Optional[str]:
+    """Why the read-back curve is NOT ``want`` (None when it is): points, every channel's
+    deviations and — when ``want`` records one and ``check_enabled`` — the on/off state."""
+    problem = _gswb_floats_problem("points", read.get("points"), want.get("points"))
+    if problem:
+        return problem
+    rd, wd = read.get("deviations") or {}, want.get("deviations") or {}
+    for ch in ("r", "g", "b"):
+        problem = _gswb_floats_problem(f"deviations.{ch}", rd.get(ch), wd.get(ch))
+        if problem:
+            return problem
+    if check_enabled and want.get("enabled") is not None and read.get("enabled") is not None \
+            and bool(read["enabled"]) != bool(want["enabled"]):
+        return f"the curve is switched {'on' if read['enabled'] else 'off'}, expected " \
+               f"{'on' if want['enabled'] else 'off'}"
+    return None
+
+
+def _gswb_identity_problem(read: Mapping[str, Any], mode: str) -> Optional[str]:
+    """Why the read-back curve is not the identity curve (unit deviations on the mode's identity
+    points: SDR slot i at (i/(N-1))**2, HDR at i/(N-1)), or None."""
+    pts = read.get("points") or []
+    n = len(pts)
+    if n < 2:
+        return "no curve points read back"
+    ts = [i / (n - 1) for i in range(n)]
+    ident = ts if normalize_mode(mode) == "HDR" else [t * t for t in ts]
+    want = {"points": ident, "deviations": {ch: [1.0] * n for ch in ("r", "g", "b")}}
+    return _gswb_curve_problem(read, want)
+
+
+def _read_correction_grayscale(controller: Any, monitor: int, mode: str
+                               ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """The live ``correction_grayscale`` block of one monitor:mode, or ``(None, why not)``."""
+    try:
+        state = controller.state() or {}
+    except Exception as exc:  # noqa: BLE001 - a down pipe is an answer, not a crash
+        return None, f"state.get failed ({type(exc).__name__}: {exc})"
+    entry = (state.get("mhc") or {}).get(f"{monitor}:{mode}")
+    if not isinstance(entry, dict):
+        return None, f"DesktopLUT reports no MHC entry for {monitor}:{mode}"
+    cg = entry.get("correction_grayscale")
+    if not isinstance(cg, dict):
+        return None, "this DesktopLUT build does not report the correction curve (correction_grayscale)"
+    return cg, None
+
+
+def _gswb_pair(calib_state: Mapping[str, Any], monitor: Optional[int], mode: Optional[str]
+               ) -> tuple[Optional[int], Optional[str]]:
+    """The monitor:mode the touch-up edited — the run record's own (``grayscale_wb_pair``, written
+    when the prior was captured; then the viewing-layer capture), never only the caller's argparse
+    defaults (``--abort`` on an HDR run without ``--mode HDR``)."""
+    for src in (calib_state.get("grayscale_wb_pair"), calib_state.get("viewing_layers")):
+        if isinstance(src, dict) and src.get("monitor") is not None:
+            monitor = int(src["monitor"])
+            if src.get("mode"):
+                mode = str(src["mode"])
+            break
+    return monitor, (normalize_mode(mode) if mode else None)
+
+
+def gswb_touchup_applied(calib_state: Optional[Mapping[str, Any]]) -> bool:
+    """Did this grayscale-wb run KEEP its touch-up? True once the apply path recorded it
+    (``grayscale_wb_baked.applied``), or — a record from before that marker — once the verify
+    gate was answered with anything but ``revert`` after a recorded bake (the operator's choice to
+    keep what the bake put on the display). An applied touch-up is the run's result, never rolled
+    back by ``--abort``."""
+    rec = calib_state if isinstance(calib_state, Mapping) else {}
+    baked = rec.get("grayscale_wb_baked") or {}
+    if not baked.get("baked") or baked.get("rolled_back"):
+        return False
+    if baked.get("applied"):
+        return True
+    choice = ((rec.get("decisions") or {}).get("verify:accept") or {}).get("choice")
+    return choice is not None and choice != "revert"
+
+
+def restore_gswb_prior(controller: Any, calib_state: Optional[dict[str, Any]], *,
+                       monitor: Optional[int], mode: Optional[str], why: str,
+                       log: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+    """Undo a grayscale-wb touch-up: put back the correction curve the display had before the run's
+    touch-up began, re-bake the MHC, and CONFIRM it by reading the curve back. Never raises.
+
+    * The touch-up never began (no prior was captured): nothing of it is on the display — an
+      orphaned live preview is cancelled anyway (harmless no-op) and the outcome is ``not_needed``.
+    * Before the commit the live preview is cancelled (DesktopLUT puts its own pre-begin copy back).
+      If the read-back shows the prior, that is the restore — no re-bake.
+    * After the commit (the run record says baked, or the cancel found no live session — a commit
+      that raced the record, or a lost session), the cancel is a no-op: the prior goes back verbatim
+      (``set_correction_grayscale_raw``: the block is already in DesktopLUT's stored decomposition, so
+      the signal-domain bridge would bend a curve carrying a luminance / main-slider component) +
+      its on/off through ``layers.set`` (``ApplyGrayscalePayload`` forces the curve on, and a curve
+      the user had switched off must stay off), and ``mhc.apply`` re-bakes; no captured prior (an old DesktopLUT that does not report the curve) clears to identity.
+    * Idempotent: a run whose earlier restore was confirmed and whose curve still reads back as the
+      prior is left alone.
+
+    ``outcome``: ``restored`` (confirmed by the read-back — or, with no prior to compare against,
+    by DesktopLUT's own cancel of an uncommitted preview), ``unconfirmed`` (the calls returned but
+    the read-back does not show the prior, or cannot be read), ``failed`` (a call failed: the pipe is
+    gone), ``not_needed``. Unless restored / not_needed, ``display_may_carry_touchup`` is True and the
+    summary says how to finish it. The record is kept in ``calib_state['grayscale_wb_restore']``
+    (the previous one moves to ``grayscale_wb_restore_history``) and the bake record is marked
+    ``rolled_back`` (``reverted`` = confirmed), so a resume can never take the bake as applied.
+    The caller persists ``calib_state``."""
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    mon, md = _gswb_pair(rec, monitor, mode)
+    prior = rec.get("grayscale_wb_prior") if isinstance(rec.get("grayscale_wb_prior"), dict) else None
+    if prior is not None and not prior.get("points"):
+        prior = None
+    baked_rec = rec.get("grayscale_wb_baked") if isinstance(rec.get("grayscale_wb_baked"), dict) else None
+    prev = rec.get("grayscale_wb_restore") if isinstance(rec.get("grayscale_wb_restore"), dict) else {}
+    out: dict[str, Any] = {
+        "why": why, "at": datetime.now().isoformat(timespec="seconds"),
+        "monitor": mon, "mode": md,
+        "began": "grayscale_wb_prior_source" in rec,
+        "baked": bool(baked_rec and baked_rec.get("baked")),
+        "prior_source": rec.get("grayscale_wb_prior_source"),
+        "target": "prior" if prior is not None else "identity",
+        "actions": [], "outcome": None, "confirmed": False, "error": None,
+        "attempt": int(prev.get("attempt") or 0) + 1,
+    }
+
+    def say(msg: str) -> None:
+        if log is not None:
+            try:
+                log(msg)
+            except Exception:  # noqa: BLE001 - logging never breaks a restore
+                pass
+
+    def finish(outcome: str, summary: str, *, confirmed: bool = False,
+               error: Optional[str] = None) -> dict[str, Any]:
+        out.update(outcome=outcome, confirmed=confirmed, summary=summary,
+                   display_may_carry_touchup=outcome in ("unconfirmed", "failed"))
+        if error:
+            out["error"] = error
+        if outcome != "not_needed" and isinstance(calib_state, dict):
+            if prev:
+                calib_state.setdefault("grayscale_wb_restore_history", []).append(prev)
+            calib_state["grayscale_wb_restore"] = out
+            if baked_rec is not None and baked_rec.get("baked"):
+                baked_rec["rolled_back"] = {"why": why, "at": out["at"], "confirmed": confirmed,
+                                            "outcome": outcome}
+                baked_rec["reverted"] = bool(confirmed)
+        say(f"grayscale-wb restore ({why}): {summary}")
+        return out
+
+    if mon is None or not md:
+        return finish("failed", "could not tell which monitor/mode the touch-up edited — the display may "
+                                "still carry the Grayscale touch-up",
+                      error="monitor/mode unknown")
+
+    # 1. tear down any live preview (DesktopLUT restores its own pre-begin copy); a no-op after a commit
+    canceled: Optional[bool] = None
+    try:
+        reply = controller.grayscale_cancel(int(mon), str(md))
+        canceled = bool(reply.get("canceled")) if isinstance(reply, dict) else None
+        out["actions"].append({"call": "grayscale_cancel", "canceled": canceled})
+    except Exception as exc:  # noqa: BLE001 - recorded; the read-back below decides
+        out["actions"].append({"call": "grayscale_cancel", "error": f"{type(exc).__name__}: {exc}"})
+    if not out["began"]:
+        return finish("not_needed", "the Grayscale touch-up never began — nothing of it to restore",
+                      confirmed=True)
+
+    may_be_committed = out["baked"] or canceled is not True
+    read, read_why = _read_correction_grayscale(controller, int(mon), str(md))
+    out["before_restore"] = (read_why if read is None else
+                             (_gswb_curve_problem(read, prior) if prior is not None else None)) or "matches"
+    if prior is not None and read is not None and out["before_restore"] == "matches":
+        if not may_be_committed:
+            return finish("restored", "cancelled the live preview; the curve reads back as the one this "
+                                      "display had before the touch-up", confirmed=True)
+        if prev.get("confirmed"):
+            return finish("restored", "already restored by this run's earlier rollback; the curve still "
+                                      "reads back as the pre-touch-up one", confirmed=True)
+    if (prior is not None and read is not None and not may_be_committed and prior.get("enabled") is not None
+            and _gswb_curve_problem(read, prior, check_enabled=False) is None):
+        # The cancel put the curve VALUES back but not its on/off: DesktopLUT's pre-begin copy was
+        # taken after hardware-readiness switched the grayscale layer off (the layer IS the curve's
+        # enabled bit), so it restores "off" over the viewing layers run() had just re-asserted.
+        try:
+            controller.set_layers(int(mon), str(md), grayscale=bool(prior["enabled"]))
+            out["actions"].append({"call": "set_layers", "grayscale": bool(prior["enabled"])})
+            read2, why2 = _read_correction_grayscale(controller, int(mon), str(md))
+            if read2 is not None and _gswb_curve_problem(read2, prior) is None:
+                return finish("restored", "cancelled the live preview and switched the curve back "
+                                          f"{'on' if prior['enabled'] else 'off'}, as it was before the "
+                                          "touch-up; confirmed by reading it back", confirmed=True)
+        except Exception as exc:  # noqa: BLE001 - fall through to the full restore below
+            out["actions"].append({"call": "set_layers", "error": f"{type(exc).__name__}: {exc}"})
+    if prior is None and canceled is True and not out["baked"]:
+        return finish("restored", "cancelled the live preview before the touch-up was baked (DesktopLUT "
+                                  "put its own pre-touch-up copy back; no prior curve to compare it with)",
+                      confirmed=True)
+
+    # 2. the explicit restore (the commit made the C++ cancel a no-op)
+    gamma = float(((rec.get("grayscale_wb_pair") or {}).get("gamma")) or 2.2)
+    try:
+        if prior is not None:
+            controller.set_correction_grayscale_raw(int(mon), str(md), prior)
+            out["actions"].append({"call": "set_correction_grayscale_raw", "points": len(prior["points"])})
+            if prior.get("enabled") is not None:
+                controller.set_layers(int(mon), str(md), grayscale=bool(prior["enabled"]))
+                out["actions"].append({"call": "set_layers", "grayscale": bool(prior["enabled"])})
+        else:
+            n = 32
+            grid = [j / (n - 1) for j in range(n)]
+            controller.set_correction_grayscale(int(mon), str(md), n, grid,
+                                                {ch: [1.0] * n for ch in ("r", "g", "b")}, gamma=gamma)
+            out["actions"].append({"call": "set_correction_grayscale", "identity": True})
+        applied = controller.apply_mhc(int(mon), str(md))
+        out["actions"].append({"call": "apply_mhc",
+                               "applied": ((applied or {}).get("mhc") or {}).get("applied")
+                               if isinstance(applied, dict) else None})
+    except Exception as exc:  # noqa: BLE001 - the pipe is gone / DesktopLUT refused: say so plainly
+        err = f"{type(exc).__name__}: {exc}"
+        return finish("failed", f"could not put the pre-touch-up Grayscale curve back ({err}) — the display "
+                                "may still carry the UNVERIFIED touch-up", error=err)
+
+    # 3. confirm by reading it back
+    read, read_why = _read_correction_grayscale(controller, int(mon), str(md))
+    if read is None:
+        return finish("unconfirmed", f"sent the pre-touch-up Grayscale curve back but could not read it "
+                                     f"back ({read_why}) — the display may still carry the touch-up")
+    problem = (_gswb_curve_problem(read, prior) if prior is not None
+               else _gswb_identity_problem(read, str(md)))
+    if problem:
+        return finish("unconfirmed", f"sent the pre-touch-up Grayscale curve back but it does not read back "
+                                     f"as sent ({problem}) — the display may still carry the touch-up")
+    return finish("restored", ("restored the Grayscale correction this display had before the touch-up"
+                               if prior is not None else
+                               "cleared the Grayscale touch-up to the identity curve (no prior curve was "
+                               "readable from this DesktopLUT)") + ", re-baked the MHC and confirmed it "
+                              "by reading it back", confirmed=True)
+
+
+def _gswb_rollback_hint(run_root: Any) -> str:
+    return ("the display may still carry the UNVERIFIED Grayscale touch-up. Once DesktopLUT is running "
+            "with the calibration pipe, run `python -m dlc.calibrate --run " + str(run_root)
+            + " --abort` — it puts the pre-touch-up curve back and confirms it by reading it back")
+
+
 # Flows that never enter calibration mode: they tune / measure the INSTALLED stack in place, so
 # DesktopLUT never takes a snapshot of them (their own undo is the in-place baseline / candidate).
-_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only")
+_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only", "refresh-response")
 
 
 def _run_entered_calibration(calib_state: Optional[dict[str, Any]], *,
@@ -11032,7 +11367,19 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
     bak = ((calib_state or {}).get("backup") or {})
     layers = _reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
     run_flow = (calib_state or {}).get("flow") or flow
-    if entered is False and run_flow == "verify-only":
+    gswb: Optional[dict[str, Any]] = None
+    gswb_applied = False
+    if run_flow == "grayscale-wb" and isinstance(calib_state, dict):
+        # The touch-up is committed before its verify: put the prior curve back (after the viewing
+        # layers, so the read-back sees the final on/off) — unless the run KEPT it (applied).
+        gswb_applied = gswb_touchup_applied(calib_state)
+        if not gswb_applied:
+            gswb = restore_gswb_prior(controller, calib_state, monitor=monitor, mode=mode,
+                                      why="--abort", log=log)
+    if gswb is not None and gswb["outcome"] != "not_needed":
+        status = {"restored": "reverted", "unconfirmed": "restore_unknown"}.get(gswb["outcome"],
+                                                                                "nothing_restored")
+    elif entered is False and run_flow == "verify-only":
         # verify-only's only display changes are the candidate cube and the viewing layers
         cand_back = (not isinstance(candidate, dict) or not candidate.get("installed")
                      or candidate.get("restored") or candidate.get("kept"))
@@ -11048,8 +11395,18 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
     payload: dict[str, Any] = {"status": status, "restored_snapshot": report.get("restored"),
                                "snapshot_restore": report, "viewing_layers": layers,
                                "verify_candidate": candidate, "backup": bak, "run": str(run_root)}
+    if gswb is not None and gswb["outcome"] != "not_needed":
+        payload["grayscale_wb_restore"] = gswb
+        payload["display_may_carry_touchup"] = bool(gswb.get("display_may_carry_touchup"))
+    if gswb_applied:
+        payload["grayscale_wb_applied"] = True
+        payload["note"] = ("this run's Grayscale touch-up was APPLIED (kept at the verify gate) — --abort does "
+                           "not take an applied result back; the pre-touch-up curve is `grayscale_wb_prior` "
+                           "in the run's dlc_state.json")
     if status != "reverted":
         payload["hint"] = _restore_hint(calib_state)
+        if payload.get("display_may_carry_touchup"):
+            payload["hint"] = _gswb_rollback_hint(run_root) + "; " + payload["hint"]
     return 0, payload
 
 
@@ -11062,14 +11419,14 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
     viewing layers when a restore ran, and report what DesktopLUT actually put back. Raises when
     the exit call itself fails (the caller reports ``rollback_failed``).
 
-    A run that never entered (an in-place flow) gets its grayscale-wb live preview cancelled — the
-    one pipe-side undo that is safe without a session — and an honest "not rolled back"."""
-    if entered_calibration is False and (calib_state or {}).get("flow") == "grayscale-wb" \
-            and monitor is not None and mode:
-        try:
-            controller.grayscale_cancel(int(monitor), str(mode))   # no-op when no preview is live
-        except Exception:  # noqa: BLE001 - best-effort teardown
-            pass
+    A grayscale-wb run (never enters) gets its touch-up undone by :func:`restore_gswb_prior`: the
+    live preview cancelled before the commit, the run's pre-touch-up curve re-applied and re-baked
+    after it — ``rolled_back`` only when the read-back confirms it; otherwise ``rollback_unconfirmed``
+    / ``rollback_failed`` with ``display_may_carry_touchup`` and the ``--abort`` to finish it."""
+    gswb: Optional[dict[str, Any]] = None
+    if entered_calibration is False and (calib_state or {}).get("flow") == "grayscale-wb":
+        gswb = restore_gswb_prior(controller, calib_state, monitor=monitor, mode=mode,
+                                  why="rollback guard (run did not complete)")
     report = _common.request_snapshot_restore(controller, entered=entered_calibration,
                                               monitor=_run_monitor(calib_state, monitor),
                                               stale_tell=_enter_stale_tell(calib_state))
@@ -11077,7 +11434,12 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
     # were switched off, so put them back (run() already did, and a restore undoes it).
     layers = (_reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
               if report.get("requested") else None)
-    if report.get("complete"):
+    if gswb is not None and gswb["outcome"] != "not_needed":
+        # the touch-up curve is this flow's display change; the snapshot was (rightly) never asked for
+        status = {"restored": "rolled_back", "unconfirmed": "rollback_unconfirmed"}.get(
+            gswb["outcome"], "rollback_failed")
+        reason = "run did not complete; " + gswb["summary"]
+    elif report.get("complete"):
         status, reason = "rolled_back", "run did not complete; restored pre-run setup"
     elif report.get("restored") is True:
         status, reason = "rolled_back_partially", "run did not complete; " + report["summary"]
@@ -11087,9 +11449,14 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
         status, reason = "rollback_unconfirmed", "run did not complete; " + report["summary"]
     payload: dict[str, Any] = {"status": status, "reason": reason, "snapshot_restore": report,
                                "viewing_layers": layers, "run": str(run_root)}
-    if not report.get("complete"):
+    if gswb is not None and gswb["outcome"] != "not_needed":
+        payload["grayscale_wb_restore"] = gswb
+        payload["display_may_carry_touchup"] = bool(gswb.get("display_may_carry_touchup"))
+    if status != "rolled_back":
         payload["backup"] = ((calib_state or {}).get("backup") or {})
         payload["hint"] = _restore_hint(calib_state)
+        if payload.get("display_may_carry_touchup"):
+            payload["hint"] = _gswb_rollback_hint(run_root) + "; " + payload["hint"]
     return payload
 
 
@@ -11811,6 +12178,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
 
     parser = argparse.ArgumentParser(prog="dlc-calibrate", description="DLC v2 scripted calibration orchestrator")
     parser.add_argument("--flow", default="full", choices=sorted(FLOWS))
+    parser.add_argument("--probe-spec", type=Path, default=None, dest="probe_spec",
+                        help="probe flows (peak-window, refresh-response): the spec JSON from "
+                             "`python -m dlc.peak_window plan --out` / `python -m dlc.refresh_probe plan --out`; "
+                             "read on the first invocation, recorded in the run")
     parser.add_argument("--monitor", type=int, default=0)
     parser.add_argument("--mode", default="SDR")
     parser.add_argument("--run", type=Path, default=None, help="run dir (resume an existing run)")
@@ -12124,6 +12495,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                 "/ optimizer floor / failed verify). Kept for supervised experiments.")
     parser.add_argument("--no-live-state", action="store_true", dest="no_live_state",
                         help="don't write live/state.json + live/charts.json (DesktopLUT's DLC tab)")
+    parser.add_argument("--driver", choices=list(RUN_DRIVERS), default="cli",
+                        help="who launched THIS invocation: `cli` (a person at a shell — the default), "
+                             "`claude` (the supervising LLM) or `desktoplut` (DesktopLUT's DLC tab). "
+                             "Recorded in the manifest's launch record and written to runs/active.json, "
+                             "where the DLC tab reads it. Advisory only: it changes nothing about the run.")
     parser.add_argument("--checkin-interval", type=float, default=600.0, dest="checkin_interval",
                         metavar="SECONDS",
                         help="§12 timed check-in floor: past this many seconds, the next safe "
@@ -12329,7 +12705,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # `--run <dir> --decide KEY=CHOICE`. Advisory: a manifest write that fails never stops the run.
     try:
         ctx.record_launch(sys.argv[1:] if argv is None else argv,
-                          program=sys.argv[0] if argv is None else None)
+                          program=sys.argv[0] if argv is None else None, driver=args.driver)
     except Exception as exc:  # noqa: BLE001
         ctx.log(f"could not record the launch argv in the manifest: {type(exc).__name__}: {exc}")
 
@@ -12415,12 +12791,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # mode (verify-only / 3dlut-only / grayscale-wb) never asks DesktopLUT for a snapshot restore:
         # any snapshot it holds would be someone else's — on a build predating the snapshot store its
         # stale LAST slot, i.e. a completed earlier calibration's pre-run setup (see _abort_restore).
-        code, payload = _abort_restore(controller, state.get("calib"), monitor=args.monitor,
-                                       mode=args.mode, run_root=ctx.root, flow=eff_flow, log=ctx.log)
-        if payload.get("verify_candidate") is not None:
-            _common.save_dlc_state(ctx, state)   # restore_candidate updated calib['verify_candidate']
+        # The run's own monitor + (persisted) mode, never the argparse defaults: `--abort` on an HDR run
+        # issued without `--mode HDR` must restore the HDR pair.
+        abort_monitor = state.get("monitor") if state.get("monitor") is not None else args.monitor
+        code, payload = _abort_restore(controller, state.get("calib"), monitor=abort_monitor,
+                                       mode=eff_mode, run_root=ctx.root, flow=eff_flow, log=ctx.log)
+        if payload.get("verify_candidate") is not None or payload.get("grayscale_wb_restore") is not None:
+            # restore_candidate updated calib['verify_candidate']; restore_gswb_prior wrote
+            # calib['grayscale_wb_restore'] + marked the bake record rolled back
+            _common.save_dlc_state(ctx, state)
         try:   # advisory: the run is over (only if active.json still names it)
             update_active_pointer(ctx.root, state="cancelled", aborted_by="--abort", abort_exit_code=code,
+                                  driver=args.driver,
                                   updated=datetime.now().isoformat(timespec="seconds"))
         except Exception:  # noqa: BLE001 - the pointer is a convenience, never a gate
             pass
@@ -12678,9 +13060,27 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                                          if args.keep_layers else None),
                             sdr_white_probe=_sdr_white_probe,
                             patch_window_size=patch_window_report,
+                            driver=args.driver,
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
+        # The probe flows' extras (dlc.peak_window / dlc.refresh_probe read them with getattr): the spec file, and
+        # the read-only DisplayConfig reader (the refresh probe also switches modes through it, after its seams).
+        if args.probe_spec is not None:
+            calib.probe_spec = json.loads(Path(args.probe_spec).read_text(encoding="utf-8"))
+        if eff_flow in PROBE_FLOWS:
+            from .refresh_mode import Win32DisplayApi
+            calib.display_api = Win32DisplayApi()
+            calib.vrr_presenter_factory = _vrr_presenter_factory(args)
+            if persistent_meter is not None:
+                # the refresh probe's VRR source paints through its own presenter: it reads the meter alone,
+                # and asks the instrument for the refresh rate it sees (spotread's F key) as proof of the rate
+                class _NoPresent:
+                    def show(self, _patch: Any) -> None:
+                        return None
+                _meter_only = make_persistent_spotread_meter(presenter=_NoPresent(), persistent=persistent_meter)
+                calib.vrr_meter = lambda: _meter_only(MeasurePatch("vrr", (0, 0, 0), (0.0, 0.0, 0.0)))
+                calib.vrr_meter_refresh = lambda: persistent_meter.measure_refresh_rate()
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:
@@ -12761,7 +13161,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                     # restored:false, and that must not print as "restored pre-run setup".
                     rollback = _rollback_restore(
                         controller, calib.calib if calib is not None else None,
-                        monitor=args.monitor, mode=args.mode, run_root=ctx.root,
+                        monitor=calib.monitor if calib is not None else args.monitor,
+                        mode=calib.mode if calib is not None else eff_mode, run_root=ctx.root,
                         entered_calibration=_run_entered_calibration(calib.calib if calib is not None else None,
                                                                      flow=eff_flow))
                     layers = rollback.get("viewing_layers")
@@ -12776,6 +13177,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             if layers is not None:
                                 ctx.log("viewing layers after rollback: " + json.dumps(layers, default=str))
                             ctx.log("rollback: " + rollback["snapshot_restore"]["summary"])
+                            if rollback.get("grayscale_wb_restore") is not None:
+                                ctx.log(f"rollback ({rollback['status']}): {rollback['reason']}")
+                                # on the spine too: the DLC tab / the LLM must see a touch-up left behind
+                                calib.runlog.note(
+                                    "rollback", f"{rollback['status']}: {rollback['reason']}",
+                                    level="WARN" if rollback.get("display_may_carry_touchup") else "INFO",
+                                    rollback_status=rollback["status"],
+                                    display_may_carry_touchup=bool(rollback.get("display_may_carry_touchup")),
+                                    hint=rollback.get("hint"))
                         except Exception:  # noqa: BLE001 - bookkeeping only
                             pass
                     print(json.dumps(rollback, indent=2, default=str))

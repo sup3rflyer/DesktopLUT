@@ -1,7 +1,7 @@
 // FALD (mini-LED local dimming) context-dependence correction — the OVERLAY path's layer (HDR, and SDR under
 // Windows ACM where the overlay frame is FP16 scRGB too). This file never runs in DWM hook mode; there the
-// hook runs the same layer itself (dwm_hook/hook_fald.h): the core, starfield, LED lag (panel clock, settle
-// hold) and the flank fade, out of the same HLSL and the same panel-file reader.
+// hook runs the same layer itself (dwm_hook/hook_fald.h): the core, starfield and LED lag (panel clock, settle
+// hold), out of the same HLSL and the same panel-file reader.
 // Design + measurements: DLC/docs/fald-shader-design.md, DLC/docs/fald-spatial-probe-2026-09-10.md.
 // The per-panel parameter file (*.bin) is produced by `python -m dlc.fald.export <fit.json> <out.bin>`
 // (layout documented there); the shaders live in shared/fald_shader.h — shared with the DWM hook, so both
@@ -21,7 +21,6 @@
 // FALD_CB_BYTES, the transfer / boost-rule constants).
 #include "../shared/fald_panel.h"
 #include "../shared/fald_exempt.h"   // FaldExemptRect: DesktopLUT's own windows, exempt from the FALD views
-#include "../shared/fald_fade_governor.h"   // the flank fade's safety governor (FaldResources::fadeGov)
 #include "../shared/fald_core_governor.h"   // the core layer's rate-cap governor (FaldResources::coreGov)
 #include "../shared/fald_change.h"          // the change-driven path: touched zones, the rules, the argument slots
 #include "../shared/fald_conv_tune.h"       // the conv pass's variant auto-tune (FaldResources::convTune)
@@ -73,15 +72,11 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Texture2D* inter = nullptr;
     ID3D11RenderTargetView* interRTV = nullptr;
     ID3D11ShaderResourceView* interSRV = nullptr;
-    // temporal drive state (pass 1b): the filtered drive of the current round and the committed state
+    // LED lag's panel clock: its B_true map of this run (written by the clock pass, read by both rounds' kernels)
     ID3D11Texture2D* driveFiltTex = nullptr; ID3D11UnorderedAccessView* driveFiltUAV = nullptr; ID3D11ShaderResourceView* driveFiltSRV = nullptr;
-    ID3D11Texture2D* driveStateTex = nullptr; ID3D11UnorderedAccessView* driveStateUAV = nullptr; ID3D11ShaderResourceView* driveStateSRV = nullptr;
-    // pipeline delay ring: the round-1 instantaneous drive maps of the last FALD_DELAY_MAX frames (oldest overwritten);
-    // with delayFrames = n the temporal pass is fed ring[head - n] once the ring holds n maps, else the current drive
-    ID3D11Texture2D* delayTex[FALD_DELAY_MAX] = {}; ID3D11UnorderedAccessView* delayUAV[FALD_DELAY_MAX] = {}; ID3D11ShaderResourceView* delaySRV[FALD_DELAY_MAX] = {};
-    // (ring indices, stateValid, temporalMode, the blend factors, the settle hold, dt: FaldTemporalState)
+    // (stateValid, temporalMode, the settle hold, dt: FaldTemporalState)
     // panel clock (temporal mode 3): four cols x rows R32F textures, created on the first frame the mode is on and
-    // released when it goes off (modes 0-2 never see them). clkState[p] = the LED state of parity clock p (advanced in
+    // released when it goes off (mode 0 never sees them). clkState[p] = the LED state of parity clock p (advanced in
     // place by the clock pass), clkPrev = the previous frame's round-1 instantaneous drives (every tick's target),
     // clkEst = this frame's map for the estimate kernel (the one for the real-spread kernel reuses driveFiltTex).
     // stateValid = the clocks hold a committed state. (The clock's time law and its fields: FaldTemporalState.)
@@ -133,12 +128,11 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
     ID3D11Buffer* boostLutBuf = nullptr; ID3D11ShaderResourceView* boostLutSRV = nullptr;
     // the statistic pass's non-black zone counters, one per round (zeroed at creation; + (new - old) per finished zone)
     ID3D11Buffer* boostCountBuf = nullptr; ID3D11UnorderedAccessView* boostCountUAV = nullptr;
-    // The change-driven path (shared/fald_change.h). Round 0's own drive / filtered drive / fields (round 1's are the
-    // textures above, which the dump and the tests read as before); the touched-zone list the sweeps read on the partial
-    // path; the change flags the sweeps and the LED-lag passes set and the decide pass reads; the indirect arguments the
-    // decide pass writes; what the previous run left behind.
+    // The change-driven path (shared/fald_change.h). Round 0's own drive / fields (round 1's are the textures above,
+    // which the dump and the tests read as before); the touched-zone list the sweeps read on the partial path; the change
+    // flags the sweeps and the panel clock's pass set and the decide pass reads; the indirect arguments the decide pass
+    // writes; what the previous run left behind.
     ID3D11Texture2D* drive0Tex = nullptr; ID3D11UnorderedAccessView* drive0UAV = nullptr; ID3D11ShaderResourceView* drive0SRV = nullptr;
-    ID3D11Texture2D* driveFilt0Tex = nullptr; ID3D11UnorderedAccessView* driveFilt0UAV = nullptr; ID3D11ShaderResourceView* driveFilt0SRV = nullptr;
     ID3D11Texture2D* bTrue0Tex = nullptr; ID3D11UnorderedAccessView* bTrue0UAV = nullptr; ID3D11ShaderResourceView* bTrue0SRV = nullptr;
     ID3D11Texture2D* bEst0Tex = nullptr;  ID3D11UnorderedAccessView* bEst0UAV = nullptr;  ID3D11ShaderResourceView* bEst0SRV = nullptr;
     ID3D11Texture2D* fields0Tex = nullptr; ID3D11UnorderedAccessView* fields0UAV = nullptr; ID3D11ShaderResourceView* fields0SRV = nullptr;
@@ -182,30 +176,14 @@ struct FaldResources : FaldTemporalState {   // the temporal bookkeeping fields:
         float nbLo = 0.15f, nbHi = 0.30f; uint32_t reach = 2, evenReach = 8;
         float targetSigma = 0.0f, keepNits = 100.0f;
     } star;
-    // The frozen fade stack ASF10 + T11_TMTC (FaldSettings::flankFade; shared/fald_fade.h): its resources and T state exist
-    // only while the setting is on (released when it goes off). fadeOn = this run applies it (CB word 75 bit 0, t20-t22).
-    // fadeKey = the settings the cached frame part was computed under (the frame the layer works on: starfield and its
-    // parameters): a change re-forms the fade on the next run without a T step.
-    struct FaldFade* fade = nullptr;
-    // The always-on core round 2 (PROTOTYPE, FaldSettings::core2; shared/fald_core2.h): its zone textures and IIR state exist
-    // only while the setting is on; core2On = this run applies it (b3 flags, t42 field, the round-0 statistics).
+    // The always-on core KC5 (FaldSettings::coreMode; shared/fald_core2.h): its zone / fine textures exist while it runs;
+    // core2On = this run applies it (b3 flags, t41 / t48, the round-0 statistics).
     struct FaldCore2* core2 = nullptr;
     bool core2On = false;
     uint32_t core2Flags = 0;                 // FaldCore2FlagsOfMode(FaldSettings::coreMode) of this run (0 = C)
-    bool fadeOn = false;
-    bool fadeFailLogged = false;
-    unsigned int fadeRetryCounter = 0;       // frames since the fade resources failed to create (retry every ~300)
-    unsigned long long fadeKey = 0;
-    // The fade's safety governor (shared/fald_fade_governor.h): its GPU time per content frame against 15 % of the content
-    // interval; suspended = the layer runs without the fade (the setting stays on). Its status is published for the
-    // interface / the pipe (FaldFadeGovPublish).
-    FaldFadeGovernor fadeGov;
-    bool fadeGovConfigured = false;
-    bool fadeGovWeak = false;                // the device's adapter is weak for the fade (FaldFadeWeakAdapter)
-    uint32_t fadeGovPublishedGen = 0xFFFFFFFFu;
     // The core layer's rate-cap governor (shared/fald_core_governor.h): the full path's GPU time per run (coreTiming:
     // timestamp queries read a few runs later) against 15 % of the refresh interval; capped = the full path every
-    // `spacing`, held runs (the pixel pass on the standing fields) in between. Published as the fade's (FaldCoreGovPublish).
+    // `spacing`, held runs (the pixel pass on the standing fields) in between. Published by FaldCoreGovPublish.
     FaldCoreGovernor coreGov;
     FaldCoreTiming coreTiming;
     uint32_t coreGovPublishedGen = 0xFFFFFFFFu;
@@ -227,10 +205,9 @@ bool InitFaldShaders();
 // another set — the frozen pre-fractional-pitch copy (tests/fald_shader_legacy.h) — to hold the current shaders to it
 // bit for bit on integer lattices. Release the shaders (ReleaseFaldShaders) before compiling another set.
 struct FaldShaderSources {
-    const char* common; const char* stat; const char* conv; const char* gain; const char* blur; const char* gainBlur; const char* temporal;
+    const char* common; const char* stat; const char* conv; const char* gain; const char* blur; const char* gainBlur;
     const char* panelClock; const char* starStat; const char* starWeight; const char* starPlan; const char* decide;
     const char* zoneCombineDefine; const char* pixel;
-    const char* clockMeanDefine = nullptr;   // pass 1c's plain-mean variant (parity FALD_CLOCK_PARITY_MEAN); none = the pass itself
 };
 FaldShaderSources FaldDefaultShaderSources();
 bool InitFaldShadersFrom(const FaldShaderSources& src);
@@ -254,10 +231,7 @@ bool FaldLayerRefused(const MonitorContext* ctx, const FaldSettings& settings);
 // settle hold (FaldSettlePending), so a static desktop keeps re-running the layer for ~5 tau.
 // Starfield balancing (FaldSettings::star) recomputes its zone plan from ctx->fald->inter on EVERY call — new frame,
 // C2 re-process and settle frame alike (the plan is a stateless function of the source frame the caller left there).
-// frameKey = the caller's identity of the frame in ctx->fald->inter (equal keys = bit-identical frames; 0 = unknown):
-// with the flank fade on and LED lag off, a run without new content on the frame the last reach was formed from, under
-// the same settings, reuses both rounds' reach (shared/fald_fade.h FaldFadeReachCurrent) — the fields are a pure
-// function of that frame then.
+// frameKey = the caller's identity of the frame in ctx->fald->inter (equal keys = bit-identical frames; 0 = unknown).
 // rects / numRects (shared/fald_change.h, the change-driven path): the frame regions that changed since the previous run
 // — the caller's promise that nothing outside them differs from the frame of the previous run. numRects < 0 = unknown
 // (every pass runs); 0 = nothing changed. Without rects, a run without new content on the frame of the previous run
@@ -286,25 +260,18 @@ bool FaldSettlePending(const MonitorContext* ctx);
 void FaldLayerIdle(MonitorContext* ctx);
 void FaldReleaseResources(MonitorContext* ctx);
 
-// The flank fade's governor, process-wide inputs (render thread reads): the INI force key ([General]
-// FaldFlankFadeForce=1: never suspended, whatever the adapter or the cost; REFERENCE.md) and, for the tests, the same.
-extern std::atomic<bool> g_faldFadeForce;
-// The governor's status per monitor and mode, for the interface and the pipe (src/fald_fade_status.h reads both paths).
-void FaldFadeGovPublish(int monitorIndex, bool hdr, const FaldFadeGovernorStatus& st);
-// The core layer's rate-cap governor, likewise: the INI force key ([General] FaldCoreForce=1: never capped) and the
-// status per monitor and mode (src/fald_core_status.h).
+// The core layer's rate-cap governor, process-wide inputs (render thread reads): the INI force key ([General]
+// FaldCoreForce=1: never capped) and the status per monitor and mode (src/fald_core_status.h reads both paths).
 extern std::atomic<bool> g_faldCoreForce;
 // extra: the conv variant / auto-tune state / core mode word (dwm_hook_config.h DwmHookFaldCoreExtra; 0 = unknown).
 void FaldCoreGovPublish(int monitorIndex, bool hdr, const FaldCoreGovernorStatus& st, uint32_t extra = 0);
 
-// Test seam (tests/test_fald_fade_hw.cpp FALD_HW_PROFILE_CORE=1): a hook called before and after every GPU command of
+// Test seam (tests/test_fald_hw.cpp FALD_HW_PROFILE_CORE=1): a hook called before and after every GPU command of
 // FaldRunPasses, so a harness can put timestamp queries around each pass. Null in production: one pointer test per pass.
 enum FaldCorePass : unsigned int {
-    FALD_PASS_STAR_S0 = 0, FALD_PASS_STAR_S1, FALD_PASS_STAR_S2, FALD_PASS_FADE_FRAME, FALD_PASS_CLOCK,
-    FALD_PASS_STAT0, FALD_PASS_TEMPORAL0, FALD_PASS_CONV0, FALD_PASS_GAIN0, FALD_PASS_BLURH0,
-    FALD_PASS_BLURV0, FALD_PASS_COPY0, FALD_PASS_FADE_REACH0,
-    FALD_PASS_STAT1, FALD_PASS_TEMPORAL1, FALD_PASS_CONV1, FALD_PASS_GAIN1, FALD_PASS_BLURH1,
-    FALD_PASS_BLURV1, FALD_PASS_COPY1, FALD_PASS_FADE_REACH1,
+    FALD_PASS_STAR_S0 = 0, FALD_PASS_STAR_S1, FALD_PASS_STAR_S2, FALD_PASS_CLOCK,
+    FALD_PASS_STAT0, FALD_PASS_CONV0, FALD_PASS_GAIN0, FALD_PASS_BLURH0, FALD_PASS_BLURV0, FALD_PASS_COPY0,
+    FALD_PASS_STAT1, FALD_PASS_CONV1, FALD_PASS_GAIN1, FALD_PASS_BLURH1, FALD_PASS_BLURV1, FALD_PASS_COPY1,
     FALD_PASS_COMMIT, FALD_PASS_PIXEL, FALD_PASS_DECIDE_S, FALD_PASS_DECIDE0, FALD_PASS_DECIDE1, FALD_PASS_COUNT
 };
 const char* FaldCorePassName(unsigned int pass);

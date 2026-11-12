@@ -36,11 +36,17 @@ class RunManifest:
     resumes: list[dict[str, Any]] = field(default_factory=list)
 
 
+# Who launched an invocation (``--driver``): a person at a shell, the supervising LLM, or
+# DesktopLUT's DLC tab. Advisory metadata for viewers (the DLC tab reads it from active.json).
+RUN_DRIVERS = ("cli", "claude", "desktoplut")
+
+
 def launch_record(argv: Sequence[str], *, cwd: Path | str | None = None,
-                  program: str | None = None) -> dict[str, Any]:
+                  program: str | None = None, driver: str | None = None) -> dict[str, Any]:
     """One CLI invocation as the manifest keeps it: the exact ``argv`` (arguments after the
     program), the working directory it resolves relative paths against, the interpreter, the
-    program as invoked (``sys.argv[0]``, when the argv came from the command line), and when."""
+    program as invoked (``sys.argv[0]``, when the argv came from the command line), who drove it
+    (``driver``, one of :data:`RUN_DRIVERS`), and when."""
     rec: dict[str, Any] = {
         "argv": [str(a) for a in argv],
         "cwd": str(cwd if cwd is not None else os.getcwd()),
@@ -50,6 +56,10 @@ def launch_record(argv: Sequence[str], *, cwd: Path | str | None = None,
     }
     if program:
         rec["program"] = str(program)
+    if driver:
+        if driver not in RUN_DRIVERS:
+            raise ValueError(f"driver must be one of {RUN_DRIVERS}, not {driver!r}")
+        rec["driver"] = driver
     return rec
 
 
@@ -114,11 +124,11 @@ class RunContext:
         )
 
     def record_launch(self, argv: Sequence[str], *, cwd: Path | str | None = None,
-                      program: str | None = None) -> dict[str, Any]:
+                      program: str | None = None, driver: str | None = None) -> dict[str, Any]:
         """Persist this CLI invocation in the manifest: the first one becomes ``launch`` (never
         overwritten), every later one is appended to ``resumes``. Saved atomically at once, so a
         run that pauses or dies at its first seam still records how it was started."""
-        rec = launch_record(argv, cwd=cwd, program=program)
+        rec = launch_record(argv, cwd=cwd, program=program, driver=driver)
         if not self.manifest.launch:
             self.manifest.launch = rec
         else:

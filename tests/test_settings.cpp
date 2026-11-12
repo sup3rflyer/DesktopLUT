@@ -4,7 +4,7 @@
 #include "monitor_identity.h"
 #include "processing.h"
 #include "dwm_inject.h"   // DwmHookMonitorLUT
-#include "fald.h"    // FALD_TAU_MAX_MS
+#include "fald.h"    // the FALD constants (shared/fald_temporal.h, shared/fald_core_mode.h)
 #include <cstdio>
 #include <cmath>
 #include <cwctype>
@@ -275,10 +275,7 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.paramsPath = L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin";
         original.fald.pedMode = 1;
         original.fald.debugMode = 4;    // runtime only: must NOT persist
-        original.fald.temporalMode = 2; // temporal drive state (2026-09-17): persisted
-        original.fald.tauRiseMs = 40.5f;
-        original.fald.tauFallMs = 120.0f;
-        original.fald.delayFrames = 2;
+        original.fald.temporalMode = FALD_TEMPORAL_PANEL;   // LED lag (the panel clock): persisted
         original.fald.clockClosure = 0.65f;  // panel clock (temporal mode 3, 2026-09-20, work guide C13): persisted
         original.fald.clockParity = 1;
         original.fald.star.enabled = true;   // starfield balancing (2026-09-19, work guide S1): persisted
@@ -287,8 +284,6 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         original.fald.star.evenReach = 5; original.fald.star.capNits = 400.0f; original.fald.star.strength = 0.5f;
         original.fald.star.areaLo = 30.0f; original.fald.star.areaHi = 200.0f; original.fald.star.peakHi = 900.0f;
         original.fald.star.reach = 3; original.fald.star.nbLo = 0.1f; original.fald.star.nbHi = 0.4f;
-        original.fald.flankFade = true;      // the frozen fade stack (2026-10-20): persisted per mode
-        original.fald.lowExt = true;         // item L (reserved): persisted, never applied
         SaveColorCorrectionSettings(L"TestMon", prefix, original, ini.c_str());
         // The FALD view is never written: a restart always starts on the corrected picture (no key names it).
         {
@@ -309,10 +304,7 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.paramsPath == L"C:\\panels\\pa32ucxr_sdr_fald_panel.bin");
         CHECK(loaded.fald.pedMode == 1u);
         CHECK(loaded.fald.debugMode == 0u);
-        CHECK(loaded.fald.temporalMode == 2u);
-        CHECK(loaded.fald.tauRiseMs == doctest::Approx(40.5f).epsilon(1e-4));
-        CHECK(loaded.fald.tauFallMs == doctest::Approx(120.0f).epsilon(1e-4));
-        CHECK(loaded.fald.delayFrames == 2u);
+        CHECK(loaded.fald.temporalMode == FALD_TEMPORAL_PANEL);
         CHECK(loaded.fald.clockClosure == doctest::Approx(0.65f).epsilon(1e-4));
         CHECK(loaded.fald.clockParity == 1);
         CHECK(loaded.fald.star.enabled);
@@ -329,8 +321,7 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         CHECK(loaded.fald.star.reach == 3u);
         CHECK(loaded.fald.star.nbLo == doctest::Approx(0.1f).epsilon(1e-4));
         CHECK(loaded.fald.star.nbHi == doctest::Approx(0.4f).epsilon(1e-4));
-        CHECK(loaded.fald.flankFade);
-        CHECK(loaded.fald.lowExt);
+        CHECK(loaded.fald.coreMode == FALD_CORE_MODE_KC5);   // the core is not persisted: always the default
     }
     // a fresh INI (no keys) = the filter OFF; out-of-range values are clamped, an unknown mode is OFF
     {
@@ -338,24 +329,15 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         ColorCorrectionSettings fresh;
         LoadColorCorrectionSettings(L"TestMon", L"SDR_", fresh, ini.c_str());
         CHECK(fresh.fald.temporalMode == 0u);
-        CHECK(fresh.fald.tauRiseMs == 0.0f);
-        CHECK(fresh.fald.tauFallMs == 0.0f);
         CHECK(fresh.fald.clockClosure == FALD_CLOCK_CLOSURE_DEFAULT);   // panel clock: 0.72, parity unknown
         CHECK(fresh.fald.clockParity == -1);
-        CHECK_FALSE(fresh.fald.flankFade);      // an INI without FaldFlankFade = today's layer, bit for bit
-        CHECK_FALSE(fresh.fald.lowExt);
+        CHECK(fresh.fald.coreMode == FALD_CORE_MODE_KC5);
         WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalClosure", L"3.5", ini.c_str());
         WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalParity", L"4", ini.c_str());
         WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalMode", L"7", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTauRiseMs", L"9000", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTauFallMs", L"-3", ini.c_str());
-        WritePrivateProfileStringW(L"TestMon", L"SDR_FaldDelayFrames", L"9", ini.c_str());
         ColorCorrectionSettings clamped;
         LoadColorCorrectionSettings(L"TestMon", L"SDR_", clamped, ini.c_str());
         CHECK(clamped.fald.temporalMode == 0u);
-        CHECK(clamped.fald.tauRiseMs == FALD_TAU_MAX_MS);
-        CHECK(clamped.fald.tauFallMs == 0.0f);
-        CHECK(clamped.fald.delayFrames == FALD_DELAY_MAX);
         CHECK(clamped.fald.clockClosure == FALD_CLOCK_CLOSURE_MAX);
         CHECK(clamped.fald.clockParity == -1);                          // an unknown parity value = unknown
         // mode 3 (panel clock) is a valid persisted mode; closure below the range is clamped up, parity -1 / 0 survive
@@ -384,7 +366,12 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
         ColorCorrectionSettings spaced;
         LoadColorCorrectionSettings(L"TestMon", L"SDR_", spaced, ini.c_str());
         CHECK(spaced.fald.clockParity == 1);
-        CHECK(fresh.fald.delayFrames == 0u);
+        for (const wchar_t* gone : { L"-2" }) {                         // the removed plain-mean test value: unknown
+            WritePrivateProfileStringW(L"TestMon", L"SDR_FaldTemporalParity", gone, ini.c_str());
+            ColorCorrectionSettings mean;
+            LoadColorCorrectionSettings(L"TestMon", L"SDR_", mean, ini.c_str());
+            CHECK(mean.fald.clockParity == -1);
+        }
         // starfield balancing: a fresh INI = OFF with the reference defaults; out-of-range values are clamped
         CHECK_FALSE(fresh.fald.star.enabled);
         CHECK(fresh.fald.star.even == doctest::Approx(0.8f));
@@ -440,6 +427,58 @@ TEST_CASE("CC settings: FALD layer round-trips per mode (SDR under ACM and HDR)"
     CHECK(loadedHdr.fald.paramsPath.empty());
 }
 
+
+// An INI written before the 2026-11-12 FALD removals: the flank fade (<mode>_FaldFlankFade, its reserved item L
+// <mode>_FaldLowExt, [General] FaldFlankFadeForce), LED lag's first-order modes 1 / 2 (<mode>_FaldTemporalMode 1 / 2 with
+// <mode>_FaldTauRiseMs / FallMs / DelayFrames) and the core's A/B key (<mode>_FaldCoreModeTest). It must load cleanly —
+// the fade on in the file included: nothing left can run it, so the picture is the fade-off one —, a removed LED-lag mode
+// loads as OFF (not as the panel clock: that is a different, panel-specific law the user never chose), the core is KC5
+// whatever the key says, and the next save deletes every dead key.
+TEST_CASE("CC settings: an INI from before the FALD removals loads cleanly and loses the dead keys on the next save") {
+    const struct { const wchar_t* mode; unsigned int want; } modes[] = { { L"0", 0u }, { L"1", 0u }, { L"2", 0u }, { L"3", FALD_TEMPORAL_PANEL } };
+    for (const auto& md : modes) {
+        for (const wchar_t* prefix : { L"SDR_", L"HDR_" }) {
+            TempIni ini;
+            const std::wstring p(prefix);
+            auto put = [&](const wchar_t* k, const wchar_t* v) { WritePrivateProfileStringW(L"TestMon", (p + k).c_str(), v, ini.c_str()); };
+            put(L"FaldEnabled", L"true");
+            put(L"FaldParamsPath", L"C:\\panels\\pa32.bin");
+            put(L"FaldTemporalMode", md.mode);
+            put(L"FaldTauRiseMs", L"100.0000");
+            put(L"FaldTauFallMs", L"100.0000");
+            put(L"FaldDelayFrames", L"2");
+            put(L"FaldTemporalClosure", L"0.7200");
+            put(L"FaldTemporalParity", L"-1");
+            put(L"FaldFlankFade", L"true");
+            put(L"FaldLowExt", L"true");
+            put(L"FaldCoreModeTest", L"0");
+            WritePrivateProfileStringW(L"General", L"FaldFlankFadeForce", L"true", ini.c_str());
+
+            ColorCorrectionSettings loaded;
+            LoadColorCorrectionSettings(L"TestMon", prefix, loaded, ini.c_str());
+            CHECK(loaded.fald.enabled);
+            CHECK(loaded.fald.paramsPath == L"C:\\panels\\pa32.bin");
+            CHECK(loaded.fald.temporalMode == md.want);
+            CHECK(loaded.fald.clockClosure == doctest::Approx(0.72f).epsilon(1e-4));
+            CHECK(loaded.fald.clockParity == -1);
+            CHECK(loaded.fald.coreMode == FALD_CORE_MODE_KC5);   // FaldCoreModeTest=0 (C) is no longer read
+
+            SaveColorCorrectionSettings(L"TestMon", prefix, loaded, ini.c_str());
+            wchar_t buf[64] = {};
+            for (const wchar_t* k : { L"FaldTauRiseMs", L"FaldTauFallMs", L"FaldDelayFrames", L"FaldFlankFade", L"FaldLowExt",
+                                      L"FaldCoreModeTest" }) {
+                const DWORD n = GetPrivateProfileStringW(L"TestMon", (p + k).c_str(), L"<absent>", buf, 64, ini.c_str());
+                CHECK_MESSAGE(std::wstring(buf, n) == L"<absent>", "the dead key survived a save");
+            }
+            GetPrivateProfileStringW(L"TestMon", (p + L"FaldTemporalMode").c_str(), L"", buf, 64, ini.c_str());
+            CHECK(std::wstring(buf) == std::to_wstring(md.want));   // a removed mode is saved as off
+            ColorCorrectionSettings again;                          // and the saved file loads the same
+            LoadColorCorrectionSettings(L"TestMon", prefix, again, ini.c_str());
+            CHECK(again.fald.temporalMode == md.want);
+            CHECK(again.fald.enabled);
+        }
+    }
+}
 TEST_CASE("CC settings: 24Gamma not persisted (moved to MHC)") {
     TempIni ini;
     ColorCorrectionSettings original;
@@ -1033,6 +1072,27 @@ TEST_CASE("LoadSettings/SaveSettings: [General] HdrDither defaults on and round-
     LoadSettings();
     CHECK(g_hdrDither.load() == false);                 // the kill switch survives a restart
     g_hdrDither = true;
+}
+
+TEST_CASE("LoadSettings/SaveSettings: [General] FaldFlankFadeForce (the removed flank fade's) loads cleanly and the next save deletes it") {
+    AppIniGuard guard;
+    if (!guard.usable) { MESSAGE("skipped: an INI already exists next to the test executable"); return; }
+    const wchar_t* ini = guard.path.c_str();
+    g_gui.monitors.clear();
+    g_gui.monitorSettings.clear();
+    g_gui.parkedSettings.clear();
+    WritePrivateProfileStringW(L"General", L"StartMinimized", L"false", ini);
+    WritePrivateProfileStringW(L"General", L"FaldFlankFadeForce", L"true", ini);   // the owner's 3.0 INI has it
+    WritePrivateProfileStringW(L"General", L"FaldCoreForce", L"true", ini);        // a key that stays (read, never written)
+    LoadSettings();
+    CHECK(g_faldCoreForce.load());
+    SaveSettings();
+    wchar_t buf[16] = {};
+    GetPrivateProfileStringW(L"General", L"FaldFlankFadeForce", L"<absent>", buf, 16, ini);
+    CHECK(std::wstring(buf) == L"<absent>");
+    GetPrivateProfileStringW(L"General", L"FaldCoreForce", L"<absent>", buf, 16, ini);
+    CHECK(std::wstring(buf) == L"true");
+    g_faldCoreForce = false;
 }
 
 TEST_CASE("INI free text: plain ASCII stays readable, anything else round-trips through an ASCII escape") {

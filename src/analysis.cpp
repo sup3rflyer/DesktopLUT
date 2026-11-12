@@ -398,6 +398,12 @@ bool CreateAnalysisOverlay(HINSTANCE hInstance) {
 }
 
 void DestroyAnalysisOverlay() {
+    // Only the thread that owns the window destroys it. The GUI thread creates it at startup and owns it for the session
+    // (the analysis switch and hotkey show and hide it there); a render thread's teardown calling this used to clear the
+    // handle and delete the font under a window DestroyWindow refuses to destroy from another thread.
+    if (g_analysisHwnd && IsWindow(g_analysisHwnd) &&
+        GetWindowThreadProcessId(g_analysisHwnd, nullptr) != GetCurrentThreadId())
+        return;
     if (g_analysisHwnd) {
         DestroyWindow(g_analysisHwnd);
         g_analysisHwnd = nullptr;
@@ -450,9 +456,10 @@ void ShowAnalysisOverlay() {
 }
 
 void HideAnalysisOverlay() {
+    // Off whether or not a window is there (a switch-off must never leave the flag on, which keeps the engine running).
+    g_analysisEnabled.store(false);
     if (g_analysisHwnd) {
         ShowWindow(g_analysisHwnd, SW_HIDE);
-        g_analysisEnabled.store(false);
         std::cout << "Analysis overlay hidden" << std::endl;
     }
 }

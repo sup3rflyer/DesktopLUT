@@ -4,26 +4,13 @@
 #include <cmath>
 #include <cwchar>
 
-// Temporal drive state helpers (DLC dlc/fald/temporal.py alpha_from_tau / settle_frames; tests/test_fald.cpp).
-float FaldTemporalAlpha(float tauMs, float dtMs) {
-    if (!(tauMs > 0.0f) || !(dtMs > 0.0f)) return 1.0f;
-    return 1.0f - std::exp(-dtMs / tauMs);
-}
-unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsigned int delayFrames) {
-    const unsigned int delay = delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : delayFrames;
-    float tau = tauRiseMs > tauFallMs ? tauRiseMs : tauFallMs;
-    if (!(tau > 0.0f) || !(dtMs > 0.0f)) return delay;
-    double n = std::ceil(5.0 * (double)tau / (double)dtMs - 1e-4);   // 5 tau; the tolerance keeps exact multiples exact (float32 dt)
-    return (n < 1.0 ? 1u : (n > 100000.0 ? 100000u : (unsigned int)n)) + delay;
-}
-
 // Panel clock (temporal mode 3) helpers: DLC dlc/fald/paneltime.py clock_ticks / blend_factors / settle_refreshes and
 // dlc/fald/gpuemu.py clock_factors32 (the float32 twin); tests/test_fald.cpp.
 float FaldPanelClockClosure(float closure) {
     if (closure != closure) return FALD_CLOCK_CLOSURE_DEFAULT;
     return closure < FALD_CLOCK_CLOSURE_MIN ? FALD_CLOCK_CLOSURE_MIN : (closure > FALD_CLOCK_CLOSURE_MAX ? FALD_CLOCK_CLOSURE_MAX : closure);
 }
-int FaldPanelClockParity(int parity) { return (parity == 0 || parity == 1 || parity == FALD_CLOCK_PARITY_MEAN) ? parity : -1; }
+int FaldPanelClockParity(int parity) { return (parity == 0 || parity == 1) ? parity : -1; }
 int FaldPanelClockParityFromText(const wchar_t* text) {
     if (!text) return -1;
     wchar_t* end = nullptr;
@@ -115,10 +102,9 @@ FaldClockPlan FaldPanelClockPlan(bool seeded, unsigned long long elapsed) {
     plan.commitPrev = true;
     return plan;
 }
-void FaldSettleAccount(FaldTemporalState* r, bool rearm, unsigned int settle, bool perRefresh) {
+void FaldSettleAccount(FaldTemporalState* r, bool rearm, unsigned int settle) {
     if (rearm) r->settleLeft = settle;
-    else if (perRefresh) r->settleLeft -= (r->clkElapsed < (unsigned long long)r->settleLeft) ? (unsigned int)r->clkElapsed : r->settleLeft;
-    else if (r->settleLeft > 0) r->settleLeft--;
+    else r->settleLeft -= (r->clkElapsed < (unsigned long long)r->settleLeft) ? (unsigned int)r->clkElapsed : r->settleLeft;
     if (r->settleLeft > settle) r->settleLeft = settle;
 }
 
@@ -137,7 +123,7 @@ FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSet
         else if (iv > FALD_RESUME_GAP_MS) run.resumed = true;
     }
     r->lastRunQpc = nowQpc;
-    unsigned int mode = (s.mode <= FALD_TEMPORAL_PANEL) ? s.mode : FALD_TEMPORAL_OFF;
+    unsigned int mode = FaldTemporalModeOf(s.mode);
     if (mode == FALD_TEMPORAL_PANEL && !clockTexturesOk) mode = FALD_TEMPORAL_OFF;   // a failed creation runs as off
     // No usable clock (refresh period unknown, no QPC frequency): every run would re-seed with k = 0, and the settle
     // hold — paid in elapsed refreshes — would never end (a host kicking DWM forever). The mode runs as off instead.
@@ -145,58 +131,33 @@ FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSet
     if (mode == FALD_TEMPORAL_PANEL && (!(refreshMs > 0.0f) || qpcFreq <= 0)) mode = FALD_TEMPORAL_OFF;
     run.stateReset = false;
     if (mode != r->temporalMode) {
-        r->temporalMode = mode; r->stateValid = false; r->settleLeft = 0; r->delayCount = 0;
+        r->temporalMode = mode; r->stateValid = false; r->settleLeft = 0;
         run.stateReset = true;
     }
-    const unsigned int delay = s.delayFrames > FALD_DELAY_MAX ? FALD_DELAY_MAX : s.delayFrames;
-    if (delay != r->delayFrames) { r->delayFrames = delay; r->delayCount = 0; }   // a changed depth restarts the ring
     run.mode = mode;
-    run.delay = delay;
     run.panel = (mode == FALD_TEMPORAL_PANEL);
-    run.temporal = (mode != FALD_TEMPORAL_OFF) && !run.panel;   // the first-order filter (pass 1b, modes 1 / 2)
-    // the map the panel's pipeline is fed this frame: the ring entry `delay` frames back once the ring holds that many
-    // (DriveState.delayed), else the instantaneous drive. Both rounds are fed the same map.
-    run.delayedSlot = -1;
-    if (run.temporal && delay > 0 && r->delayCount >= delay)
-        run.delayedSlot = (int)((r->delayHead + FALD_DELAY_MAX - delay) % FALD_DELAY_MAX);
-    r->tempAlphaRise = FaldTemporalAlpha(s.tauRiseMs, r->dtMs);
-    r->tempAlphaFall = FaldTemporalAlpha(s.tauFallMs, r->dtMs);
     run.trueMap = FALD_MAP_DRIVE;   // what the real-spread kernel sees
     run.estMap = FALD_MAP_DRIVE;    // what the estimate kernel sees
-    if (mode == FALD_TEMPORAL_BOTH) { run.trueMap = FALD_MAP_FILTERED; run.estMap = FALD_MAP_FILTERED; }
-    else if (mode == FALD_TEMPORAL_TRUE_ONLY) { run.trueMap = FALD_MAP_FILTERED; }
     run.clock = FaldClockPlan{ false, false, false, false };
     if (run.panel) {
         const bool seeded = FaldPanelClockStep(r, nowQpc, qpcFreq, s.clockClosure, s.clockParity, refreshMs);
         run.clock = FaldPanelClockPlan(seeded, r->clkElapsed);
         if (run.clock.bindMaps) { run.trueMap = FALD_MAP_FILTERED; run.estMap = FALD_MAP_CLOCK_EST; }
     }
-    // debug view 7: instantaneous vs filtered (mode 3: vs the clocks' mean LED state of this frame)
-    run.debugFiltMap = (run.temporal || run.clock.bindMaps) ? FALD_MAP_FILTERED : FALD_MAP_DRIVE;
+    // debug view 7: instantaneous vs the clocks' mean LED state of this frame
+    run.debugFiltMap = run.clock.bindMaps ? FALD_MAP_FILTERED : FALD_MAP_DRIVE;
     return run;
 }
 
-void FaldTemporalEndRun(FaldTemporalState* r, const FaldTemporalRun& run, const FaldTemporalSettings& s, bool newContent) {
-    if (run.temporal) {                    // DriveState.commit (the caller copied the filtered map into the state texture
-        r->stateValid = true;              // and, delay > 0, round 1's instantaneous map into ring slot delayHead)
-        if (run.delay > 0) {
-            r->delayHead = (r->delayHead + 1) % FALD_DELAY_MAX;
-            if (r->delayCount < FALD_DELAY_MAX) r->delayCount++;
-        }
-    }
+void FaldTemporalEndRun(FaldTemporalState* r, const FaldTemporalRun& run, bool newContent) {
     // Settle hold: the capture (Desktop Duplication) / DWM delivers no frames on a static desktop, so a state still
-    // settling after the last content frame would freeze mid-transition. Owe 5 tau of settle frames after new content. A
-    // resume after a gap (> FALD_RESUME_GAP_MS since the last run: the desktop stood still past the hold, or the layer
-    // was asleep) counts as new content too — the first frame after it may carry a change the pass blends from the
-    // settled state. Mode 3 owes FaldPanelClockSettleFrames instead, counted in ELAPSED REFRESHES of this monitor (k),
-    // not in runs: a run loop may run faster than the panel refreshes (k = 0 runs pay nothing) or slower (one run pays k).
-    if (run.temporal || run.panel) {
-        const unsigned int settle = run.panel ? FaldPanelClockSettleFrames(r->clkClosure)
-                                              : FaldSettleFrames(s.tauRiseMs, s.tauFallMs, r->dtMs, run.delay);
-        FaldSettleAccount(r, newContent || run.resumed, settle, run.panel);   // (also: tau lowered mid-hold)
-    } else {
-        r->settleLeft = 0;
-    }
+    // settling after the last content frame would freeze mid-transition. The panel clock owes
+    // FaldPanelClockSettleFrames after new content, counted in ELAPSED REFRESHES of this monitor (k), not in runs: a run
+    // loop may run faster than the panel refreshes (k = 0 runs pay nothing) or slower (one run pays k). A resume after a
+    // gap (> FALD_RESUME_GAP_MS since the last run: the desktop stood still past the hold, or the layer was asleep) counts
+    // as new content too — the first frame after it may carry a change the pass blends from the settled state.
+    if (run.panel) FaldSettleAccount(r, newContent || run.resumed, FaldPanelClockSettleFrames(r->clkClosure));
+    else r->settleLeft = 0;
 }
 
 bool FaldTemporalSettlePending(const FaldTemporalState* r) {
@@ -207,6 +168,5 @@ void FaldTemporalIdle(FaldTemporalState* r) {
     if (!r) return;
     r->stateValid = false;
     r->settleLeft = 0;
-    r->delayCount = 0;
     r->lastRunQpc = 0;
 }

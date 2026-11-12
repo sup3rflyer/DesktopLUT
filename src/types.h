@@ -101,8 +101,12 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define WM_FALD_EXEMPT_REFRESH   (WM_USER + 113)
 // Resolve each display's refresh-rate trim again (refresh_trim.h ReconcileRefreshTrim; any thread -> GUI thread).
 #define WM_REFRESH_TRIM          (WM_USER + 114)
+// The HDR hotkey switched a display's HDR mode (GUI thread -> the overlay render thread's window): arm its delayed
+// re-detect (HDR_REINIT_TIMER_ID), which only that thread can set on its window.
+#define WM_OVERLAY_HDR_TOGGLED   (WM_USER + 115)
 // A hook-mode start could not inject the DWM hook (g_dwmHookStartError says why): retry once, then fall back to the
-// overlay (dwm_hook_stability.h). Posted by StartProcessing, handled once its transition is over (GUI thread).
+// overlay (dwm_hook_stability.h); wParam 1 = the pre-flight refused (dwmcore_scan.h): fall back at once. Posted by
+// StartProcessing, handled once its transition is over (GUI thread).
 #define WM_DWMHOOK_START_FAILED  (WM_USER + 120)
 // Registered message a second launch posts to the running instance's hub window: show the active interface.
 #define DESKTOPLUT_SHOW_UI_MESSAGE L"DesktopLUT.ShowUI"
@@ -162,9 +166,6 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_CORR_FALD_SDR_PATH    535
 #define ID_CORR_FALD_SDR_BROWSE  536
 #define ID_CORR_FALD_TEMPORAL    537   // LED-lag row (temporal drive state), applies to both modes
-#define ID_CORR_FALD_TAU_RISE    538
-#define ID_CORR_FALD_TAU_FALL    539
-#define ID_CORR_FALD_DELAY       540
 #define ID_CORR_FALD_CLOSURE     547   // LED-lag row in "Panel clock" mode (temporal mode 3): closure edit + parity combo
 #define ID_CORR_FALD_PARITY      548
 #define ID_CORR_FALD_STAR_ENABLE 541   // Starfield rows (starfield balancing, work guide S1), apply to both modes
@@ -173,7 +174,6 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define ID_CORR_FALD_STAR_KEEP   544   // keep nits = keep_nits
 #define ID_CORR_FALD_STAR_STRENGTH 545
 #define ID_CORR_FALD_STAR_REACH  546   // mean reach = even_reach
-#define ID_CORR_FALD_FLANK_FADE  549   // flank fade (the frozen fade stack ASF10 + T11_TMTC), applies to both modes
 
 // SDR MHC Hardware Calibration control IDs (MHC tab)
 #define ID_MHC_TAB_APPLY    551
@@ -328,6 +328,8 @@ const int MHC_BURST_TIMER_ID = 109;             // Staggered MHC re-assertion bu
 const int SDR_WHITE_CHECK_TIMER_ID = 114;       // Debounced re-read of the Windows SDR white level (desktop gamma reference)
 const int SDR_WHITE_CHECK_DEBOUNCE_MS = 1000;   // After the last trigger — a slider drag writes many intermediate levels
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear
+// The global hotkeys (MOD_WIN | MOD_SHIFT | MOD_NOREPEAT + the INI's key letter). All registered on the hub window
+// (g_gui.hwndMain) by the GUI thread for the whole session, each while its Settings switch is on (act::RegisterHotkeys).
 const int HOTKEY_GAMMA = 2;      // Win+Shift+G for gamma toggle
 const int HOTKEY_ANALYSIS = 4;   // Win+Shift+X for analysis toggle
 const int HOTKEY_HDR_TOGGLE = 5; // Win+Shift+Z for HDR toggle on focused monitor
@@ -606,37 +608,25 @@ struct FaldSettings {
                                   // (FLD2 words 32-34), subtracted per channel and floored per channel. FLD1 files: 1 == 0.
     unsigned int reloadSeq = 0;   // runtime only (not persisted): bumped by runtime.set_fald_params so a panel file
                                   // re-exported at the SAME path rebuilds the GPU tables (fald.cpp FaldEnsureResources)
-    // Temporal drive state (persisted, GUI "LED lag" row / runtime.fald_temporal; fald.h FALD_TEMPORAL_*): the shader's
-    // per-cell first-order filter with rise/fall time constants, so a cell handoff during a pan crossfades instead of
-    // snapping. 0 = off (the stateless layer). Default off (work guide H5). Modes 1 / 2 (this first-order filter) were
-    // REJECTED as the PA32UCXR's LED law by the 2026-09-19/20 camera measurement; the measured law is mode 3 below.
+    // LED lag (persisted INI <mode>_FaldTemporalMode, GUI "LED lag" row / runtime.fald_temporal; shared/fald_temporal.h):
+    // 0 = off (the stateless layer, the default), 3 = "panel clock" (EXPERIMENT, work guide C13; FALD_TEMPORAL_PANEL,
+    // reference DLC dlc/fald/paneltime.py): the PA32UCXR's measured half-refresh-rate sample-and-hold law. The values 1 / 2
+    // were the first-order filter, rejected as the panel's law by the 2026-09-19/20 camera measurement and removed
+    // 2026-11-12 (an INI that still names one loads as off).
     unsigned int temporalMode = 0;
-    float tauRiseMs = 0.0f;
-    float tauFallMs = 0.0f;
-    unsigned int delayFrames = 0;   // pipeline delay 0..FALD_DELAY_MAX: the filter is fed the drives of n frames ago
-    // temporalMode 3 = "panel clock" (EXPERIMENT, work guide C13; fald.h FALD_TEMPORAL_PANEL, reference DLC
-    // dlc/fald/paneltime.py): the measured half-refresh-rate sample-and-hold law. Persisted; used by mode 3 only.
+    // the panel clock's parameters: persisted
     float clockClosure = 0.72f;     // share of the remaining LED drive gap closed per tick, 0.05..1 (FALD_CLOCK_CLOSURE_*)
     int clockParity = -1;           // which refresh the engine ticks on: -1 = unknown (mean of both clocks), 0 / 1 = known
     // Starfield balancing (persisted, GUI "Starfield" row / runtime.fald_starfield). Off = the layer without it,
     // resource for resource and dispatch for dispatch.
     FaldStarfieldSettings star;
-    // The frozen fade stack ASF10 + T11_TMTC (persisted INI <mode>_FaldFlankFade, GUI "Flank fade" /
-    // runtime.fald_flank_fade; shared/fald_fade.h): the correction fades toward "layer off" on smooth steep flanks, low-
-    // passed along the content's motion. Default OFF = today's layer bit for bit (until the owner's hardware gates pass;
-    // DLC results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md section 6). An INI without the key loads OFF.
-    bool flankFade = false;
-    // The always-on core's rule (shared/fald_core_mode.h FALD_CORE_MODES): 4 = KC5 (round 5: C's fill with a brightening cap
-    // away from knee-bound pixels + alpha below 2 nit) — THE DEFAULT (FALD_CORE_MODE_DEFAULT; 2026-10-23: the colorimeter
-    // fill re-run keeps C's fill, the owner's live blind test saw no dark band), 0 = C (the 2026-10-22 layer bit for bit),
-    // 1 = KC2c (round 2: alpha + the zone deficit + a zone IIR), 2 = KC3 (round 3: alpha + the fine-grid deficit; the band
-    // gone, fill lost) — test modes for A/B; 3 reserved for KC4. Read from INI
-    // <mode>_FaldCoreModeTest (absent = the default), set at runtime by the pipe (runtime.fald_core_mode); NEVER saved; no
-    // GUI control.
+    // The always-on core's rule (shared/fald_core_mode.h): 4 = KC5 (C's fill with a brightening cap away from knee-bound
+    // pixels + alpha below 2 nit) — THE DEFAULT and the only rule that ships; 0 = C (the core off), selected by the tests
+    // only. Not persisted, no INI key, no pipe verb, no GUI control (the A/B test modes and their INI key
+    // <mode>_FaldCoreModeTest / pipe verb runtime.fald_core_mode went 2026-11-12).
     uint32_t coreMode = FALD_CORE_MODE_DEFAULT;
-    // Item L (the 1-3-nit zone-floor extension, round 12): RESERVED. Persisted (<mode>_FaldLowExt) so the setting has its
-    // home, but nothing reads it — the shader word (fadeFlags bit 1) is never set in this build.
-    bool lowExt = false;
+    // (The flank fade's <mode>_FaldFlankFade and the reserved item L's <mode>_FaldLowExt went 2026-11-12: an INI that still
+    // has them loads without them, and the next save deletes them.)
 };
 
 // Tonemapping settings (HDR only)
@@ -1182,13 +1172,8 @@ struct GUIState {
     HWND hwndFaldSdrBrowse = nullptr;
     HWND hwndFaldDebug = nullptr;
     HWND hwndFaldPedMode = nullptr;
-    HWND hwndFaldTemporal = nullptr;    // LED-lag row: mode combo + rise/fall ms
-    HWND hwndFaldTauRise = nullptr;
-    HWND hwndFaldTauFall = nullptr;
-    HWND hwndFaldDelay = nullptr;
-    HWND hwndFaldTauRiseLabel = nullptr;   // the row's labels: the first-order set is hidden in "Panel clock" mode, where
-    HWND hwndFaldTauFallLabel = nullptr;   // the closure edit + parity combo take its place (gui.cpp ShowFaldTemporalRow)
-    HWND hwndFaldDelayLabel = nullptr;
+    HWND hwndFaldTemporal = nullptr;    // LED-lag row: mode combo (Off / Panel clock); the closure edit + parity combo show
+                                        // in "Panel clock" mode (gui.cpp ShowFaldTemporalRow)
     HWND hwndFaldClosureLabel = nullptr;
     HWND hwndFaldClosure = nullptr;
     HWND hwndFaldParityLabel = nullptr;
@@ -1199,7 +1184,6 @@ struct GUIState {
     HWND hwndFaldStarKeep = nullptr;    // "keep nits" = keep_nits
     HWND hwndFaldStarStrength = nullptr;
     HWND hwndFaldStarReach = nullptr;   // "mean reach" = even_reach
-    HWND hwndFaldFlankFade = nullptr;   // flank fade (FaldSettings::flankFade), on the second starfield row
 
     // SDR MHC Hardware Calibration controls (MHC tab)
     HWND hwndMhcApply = nullptr;
