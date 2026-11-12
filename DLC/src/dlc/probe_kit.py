@@ -226,3 +226,48 @@ def median(v: Sequence[float]) -> Optional[float]:
     if not n:
         return None
     return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def viewing_layers_diff(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
+                        mode: Optional[str]) -> dict[str, Any]:
+    """Read back the user's viewing layers against what the run captured before switching them off.
+    ``{"ok": bool | None, "diff": {layer: [before, now]}}``; ``ok`` None = nothing captured / unreadable."""
+    rec = (calib_state or {}).get("viewing_layers")
+    if not isinstance(rec, dict) or not rec.get("captured"):
+        return {"ok": None, "diff": {}, "note": "no viewing layers were captured (nothing switched)"}
+    before = rec.get("before") or {}
+    kept = set(rec.get("kept") or ())
+    mon = rec.get("monitor", monitor)
+    md = rec.get("mode", mode)
+    try:
+        from .controller import CalibrationController
+        now = CalibrationController.layers_from_state(controller.state() or {}, int(mon), str(md))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": None, "diff": {}, "error": f"{type(exc).__name__}: {exc}"}
+    if now is None:
+        return {"ok": None, "diff": {}, "note": "this DesktopLUT reports no viewing layers"}
+    diff = {k: [bool(v), bool(now.get(k))] for k, v in before.items() if k not in kept and bool(now.get(k)) != bool(v)}
+    return {"ok": not diff, "diff": diff}
+
+
+def confirm_native_restored(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
+                            mode: Optional[str]) -> dict[str, Any]:
+    """A run that entered calibration mode is back as it started, by read-back: no calibration session / capture
+    open, the viewing layers as captured, and an MHC profile associated again when the user had one."""
+    from .stages import _common
+    out: dict[str, Any] = {"confirmed": False}
+    is_open, status = _common.calibration_session_open(controller)
+    out["session_open"] = is_open
+    layers = viewing_layers_diff(controller, calib_state, monitor=monitor, mode=mode)
+    out["viewing_layers"] = layers
+    bak = (calib_state or {}).get("backup") or {}
+    mhc_ok: Optional[bool] = None
+    if bak.get("had_mhc") and monitor is not None and mode:
+        try:
+            entry = ((controller.state() or {}).get("mhc") or {}).get(f"{int(monitor)}:{str(mode).upper()}") or {}
+            mhc_ok = bool(entry.get("profile_name") or entry.get("applied") or entry.get("enabled"))
+        except Exception:  # noqa: BLE001
+            mhc_ok = None
+    out["user_mhc_associated"] = mhc_ok
+    out["confirmed"] = is_open is False and layers.get("ok") is not False and mhc_ok is not False
+    return out

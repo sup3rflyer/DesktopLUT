@@ -188,8 +188,29 @@ struct DriftView {
     float slope = (float)kNaN;             // % per 10 min, the fastest channel
 };
 
+// ---- a probe flow's live chart (charts.json "probes", DLC dashboard/state.py: the latest payload per chart) ---------
+// peak_by_window: the peak-window flow's (dlc.peak_window.chart_payload), read into the DIP section's shape
+// (DipPeakByWindow: each size's up / down pass; the verdict, the combined curve, the plateau and the run window once the
+// run completes). refresh_response: the refresh-response flow's (dlc.refresh_probe chart): per grey patch, points of
+// (rate Hz, light vs the reference %, its 1-sigma %, the rate's source "mode" | "vrr").
+struct RefreshProbePoint { double hz = kNaN, pct = kNaN, uPct = kNaN; bool vrr = false; };
+struct RefreshProbeSeries { std::string name; std::vector<RefreshProbePoint> points; };
+struct RefreshProbeChart {
+    bool present = false;
+    double referenceHz = kNaN;
+    std::vector<RefreshProbeSeries> series;
+    int legsDone = -1, legsPlanned = -1;
+    bool complete = false;
+};
+struct ProbeCharts {
+    DipPeakByWindow peakByWindow;            // present = the payload was there
+    RefreshProbeChart refresh;
+};
+ProbeCharts ParseProbeCharts(const std::string& chartsJson);   // the "probes" object of a charts.json (tests, tools)
+
 struct LiveCharts {
     bool present = false;
+    ProbeCharts probes;
     uint64_t seq = 0;
     std::string stage;
     bool hdr = false;

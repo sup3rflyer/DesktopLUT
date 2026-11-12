@@ -8,8 +8,12 @@
 //
 // THE DATA: DLC measures it and records the RESPONSE in the display's DIP — <DLC folder>\dip_store.json, record
 // "<display>:HDR", section refresh_response (DLC dip.py): per measured rate (its exact rational), the light at that rate
-// over the light at 60 Hz at each level (keyed by the level's 60-Hz light), the run, the date, the identity of the
-// panel and the conditions. A measured response, not a correction. DesktopLUT reads it through the DLC folder setting
+// over the light at the section's REFERENCE rate at each level (keyed by the level's reference-rate light), the run, the
+// date, the identity of the panel and the conditions. A measured response, not a correction. The reference is the
+// rate the calibration was made at by DLC's contract (its plan seam has the overseer confirm it); it is 60 Hz on every
+// section so far but it is read, never assumed: a section that records no reference is not applied (DesktopLUT keeps
+// no record of the calibration's rate to check it against). Rates may carry a `source` ("vrr": produced by a VRR
+// cadence, put in `rates` by DLC only after its mode-vs-VRR cross-check passed): shown, and trimmed alike. DesktopLUT reads it through the DLC folder setting
 // (the DLC tab's: [UI] DlcFolder, else found next to DesktopLUT) and DERIVES the trim at bake time: g = 1 / ratio,
 // held below the lowest level, faded out to 1 above the highest — flat at the panel's peak (the section's, else the
 // HDR profile's), both ends the panel's own (DeriveRefreshTrim, mhc.h MhcRefreshTrimGain). No DLC folder, no DIP, no
@@ -120,6 +124,7 @@ struct RefreshTrimStatus {
     int ageDays = -1;                    // the section's age (-1 unknown)
     bool stale = false;                  // older than the record's max_age_days (DLC's default 180)
     std::vector<std::string> rates;      // "47.952 Hz trim", "48 Hz = 47.952", "59.94 Hz = 60" (the section's)
+    std::string referenceKey;            // the section's reference rate ("60"; "" none recorded / no section)
     double gain[3] = { 1.0, 1.0, 1.0 };  // the wanted trim's g at 0.5 / 100 / 1000 nits
     std::wstring profileName;
 };

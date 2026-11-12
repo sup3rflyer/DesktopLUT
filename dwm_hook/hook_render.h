@@ -146,6 +146,13 @@ LocalFaldParams* FindFaldForMonitor(int left, int top);
 
 // D3D11 rendering functions
 void InitializeStuff(ID3D11Device* inputDevice);
+// The apply paths' one initialisation attempt failed: the pass is off until the next injection (hook_render.cpp
+// HookEnsureInitialized has the reasons). For dllmain.cpp: a hook in this state does nothing a host should count as alive.
+bool HookRenderInitFailed();
+#ifdef DLUT_HOOK_TESTING
+int HookTestInitAttempts();        // InitializeStuff calls made by the apply paths since the last reset
+void HookTestResetInitState();     // a test's own "next injection"
+#endif
 void UninitializeStuff();
 bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects);
 // A present of this context skipped RenderLUT: the clean copies of its monitor fed from dirty rects (the FALD layer's,

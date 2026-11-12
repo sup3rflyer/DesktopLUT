@@ -990,7 +990,7 @@ std::pair<std::string, ImU32> RefreshTrimValue(const RefreshTrimStatus& t, bool 
 }
 
 std::string RefreshTrimTip(const RefreshTrimStatus& t) {
-    std::string tip = "Brightness at other refresh rates, trimmed to the 60 Hz calibration's (HDR MHC 1D LUT).\n"
+    std::string tip = "Brightness at other refresh rates, trimmed to the calibration's rate (HDR MHC 1D LUT).\n"
                       "From the display's DLC record (its DIP). RELOAD reads it again.";
     char b[256];
     if (t.monitor < 0) return tip;
@@ -1006,6 +1006,7 @@ std::string RefreshTrimTip(const RefreshTrimStatus& t) {
         if (t.ageDays >= 0) { snprintf(b, sizeof(b), " (%d days)", t.ageDays); tip += b; }
         if (!t.runId.empty()) tip += ", run " + t.runId;
         tip += ".";
+        if (!t.referenceKey.empty()) tip += "\nReference: " + t.referenceKey + " Hz (the calibration's rate).";
         if (!t.rates.empty()) {
             tip += "\nRates:";
             for (size_t i = 0; i < t.rates.size(); i++) tip += (i ? "; " : " ") + t.rates[i];
