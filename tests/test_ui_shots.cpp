@@ -577,6 +577,10 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "dlcrecord", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1 },
         { "dlcnarrow", ui::Page::Dlc, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 10 },
         { "dlcnone", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 13 },
+        // No DLC: the setup at the narrow width; a DLC folder set in the INI that is not there (24); MEASURED's cell.
+        { "dlcnonenarrow", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 920, 520, 13 },
+        { "dlcnonemissing", ui::Page::Dlc, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 24 },
+        { "pipelinenodlc", ui::Page::Pipeline, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 13 },
         { "pipelinerun", ui::Page::Pipeline, ui::StageId::ToneMap, 1, false, -1, -1, 1180, 760, 10 },
         // 14: a real run's published files (DLUT_LIVE_RUN = its run folder), shown on the HDR display; 15 the same
         // charts as the HDR display's current stack (the record view), 16 its first chart over the whole area; 17 an

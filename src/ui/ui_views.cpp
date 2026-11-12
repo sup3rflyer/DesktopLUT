@@ -1165,11 +1165,30 @@ void DrawMeasured(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewS
     const int shown = rec.current >= 0 ? rec.current : rec.latest;
 
     if (d.folder.empty()) {
-        MeasuredRow("DLC", "NO FOLDER", pal::InkFaint, Font::Label, "No DLC folder set or found. Settings > Calibration.");
+        // No DLC: the row and its button lead to the DLC tab, which says what DLC is and sets it up.
+        const bool missing = !g_dlcFolder.empty() && d.configured == g_dlcFolder;
+        const bool canGo = !EditorOpen(vs);
         RowCtx row = BeginRow("", kRowH);
+        const ImVec2 ra(row.x0, row.y0), rb(row.right, row.y0 + row.h);
+        const bool hover = canGo && ImGui::IsMouseHoveringRect(ra, rb) && ImGui::IsWindowHovered();
+        TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, row.y0 + row.h * 0.5f, "DLC");
+        row.x = row.x0 + Px(kMeasuredLabelW);
+        RowText(row, missing ? "FOLDER NOT FOUND" : "NOT SET UP", missing ? pal::Alarm : hover ? pal::Ink : pal::InkFaint,
+                Font::Label, kSizeLabel);
+        if (hover) {
+            ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+            ImGui::SetTooltip(missing ? "The DLC folder set in Settings is not there. Click: the DLC tab."
+                                      : "DLC measures this display with a colorimeter. Click: the DLC tab.");
+            if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) vs.page = Page::Dlc;
+        }
+        EndRow(row);
+        row = BeginRow("", kRowH);
         row.x = row.x0 + Px(kMeasuredLabelW);
         RowPlace(row);
-        if (Button("##meas_settings", "SETTINGS", kButtonW)) vs.page = Page::Settings;
+        ImGui::BeginDisabled(!canGo);
+        if (Button("##meas_dlc", "SET UP", kButtonW)) vs.page = Page::Dlc;
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("What DLC needs, and its setup.");
         EndRow(row);
         return;
     }
@@ -1609,16 +1628,12 @@ void SettingsCalibration(const Snapshot& snap) {
 
     row = BeginRow("DLC FOLDER");
     RowTip(row, "Where DLC keeps its profile, runs and results.\n"
-                "Not set: a DLC folder next to DesktopLUT or one or two folders up, else where it was last found.\n"
+                "Not set: found by itself next to DesktopLUT or one or two folders up, in a repository clone\n"
+                "beside it, or in %USERPROFILE%\\DesktopLUT\\DLC; else where it was last found.\n"
                 "CLEAR goes back to that and forgets the last one.");
     const int b = RowButtons(row, "set_dlc", { "BROWSE", "CLEAR" });
     if (b == 0) {
-        Post([]() {
-            std::wstring path = DlcFolder();
-            if (!PickFolder(Window(), path)) return;
-            act::SetDlcFolder(path);
-            RequestDlcScan();
-        });
+        BrowseDlcFolder();
     } else if (b == 1) {
         Post([]() {
             act::SetDlcFolder(L"");
@@ -2268,6 +2283,15 @@ float PageFooterTop() { return FooterTop(); }
 
 void AskConfirm(ViewState& vs, std::string title, std::string detail, std::string action, std::function<void()> onConfirm) {
     Ask(vs, std::move(title), std::move(detail), std::move(action), std::move(onConfirm));
+}
+
+void BrowseDlcFolder() {
+    Post([]() {
+        std::wstring path = DlcFolder();
+        if (!PickFolder(Window(), path)) return;
+        act::SetDlcFolder(path);
+        RequestDlcScan();
+    });
 }
 
 }  // namespace ui
