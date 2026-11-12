@@ -414,40 +414,22 @@ TEST_CASE("FALD starfield balancing: defaults follow the DLC reference and the c
     CHECK(s.nbHi == 0.8f);
 }
 
-TEST_CASE("FALD temporal drive state: alpha and settle frames follow the DLC reference") {
-    // dlc/fald/temporal.py alpha_from_tau / settle_frames (tests/test_fald_temporal.py pins the same numbers)
-    CHECK(FaldTemporalAlpha(0.0f, 16.667f) == 1.0f);          // tau 0 = instant on that edge
-    CHECK(FaldTemporalAlpha(-5.0f, 16.667f) == 1.0f);
-    CHECK(FaldTemporalAlpha(100.0f, 0.0f) == 1.0f);
-    CHECK(FaldTemporalAlpha(100.0f, 16.667f) == doctest::Approx(0.153521f).epsilon(1e-4));
-    CHECK(FaldTemporalAlpha(16.667f, 16.667f) == doctest::Approx(1.0f - 0.367879f).epsilon(1e-5));
-    CHECK(FaldSettleFrames(0.0f, 0.0f, 16.667f) == 0u);       // no time constant: no redraw hold
-    CHECK(FaldSettleFrames(100.0f, 50.0f, 16.667f) == 30u);   // 5 tau_max
-    CHECK(FaldSettleFrames(50.0f, 120.0f, 1000.0f / 60.0f) == 36u);   // an exact multiple stays exact
-    CHECK(FaldSettleFrames(100.0f, 0.0f, 0.0f) == 0u);
-    CHECK(FaldSettleFrames(1.0f, 0.0f, 16.667f) == 1u);       // never 0 while a time constant exists
-    CHECK(FaldSettleFrames(0.0f, 0.0f, 16.667f, 2u) == 2u);   // a pipeline delay alone owes its frames
-    CHECK(FaldSettleFrames(100.0f, 50.0f, 16.667f, 1u) == 31u);
-    CHECK(FaldSettleFrames(100.0f, 50.0f, 16.667f, 9u) == 33u);   // depth clamped to FALD_DELAY_MAX
-}
-
 TEST_CASE("FALD temporal drive state: settle pending and layer-idle reset (no D3D needed)") {
     MonitorContext ctx;
     CHECK_FALSE(FaldSettlePending(&ctx));                      // no resources
     FaldResources* r = new FaldResources();
     ctx.fald = r;
-    r->valid = true; r->temporalMode = FALD_TEMPORAL_BOTH; r->settleLeft = 3; r->stateValid = true; r->delayCount = 2;
+    r->valid = true; r->temporalMode = FALD_TEMPORAL_PANEL; r->settleLeft = 3; r->stateValid = true;
     CHECK(FaldSettlePending(&ctx));
     r->temporalMode = FALD_TEMPORAL_OFF;
     CHECK_FALSE(FaldSettlePending(&ctx));                      // off: never a settle frame
-    r->temporalMode = FALD_TEMPORAL_TRUE_ONLY; r->valid = false;
+    r->temporalMode = FALD_TEMPORAL_PANEL; r->valid = false;
     CHECK_FALSE(FaldSettlePending(&ctx));                      // refused / not built
     r->valid = true;
     CHECK(FaldSettlePending(&ctx));
-    FaldLayerIdle(&ctx);                                       // the layer did not run: state, hold and ring are void
+    FaldLayerIdle(&ctx);                                       // the layer did not run: state and hold are void
     CHECK_FALSE(r->stateValid);
     CHECK(r->settleLeft == 0u);
-    CHECK(r->delayCount == 0u);
     CHECK_FALSE(FaldSettlePending(&ctx));
     ctx.fald = nullptr;
     delete r;
@@ -689,27 +671,25 @@ TEST_CASE("FALD panel clock: what a run does with the step's result - the k = 0 
     const long long freq = 10000000;
     const double T = 1000.0 / 60.0;
     FaldPanelClockStep(&r, 9000000000ll, freq, 0.72f, -1, (float)T);
-    FaldSettleAccount(&r, true, hold, true);                     // new content re-arms
+    FaldSettleAccount(&r, true, hold);                     // new content re-arms
     CHECK(r.settleLeft == hold);
     unsigned int runs = 0; unsigned long long refreshes = 0;
     while (r.settleLeft > 0u && runs < 1000u) {
         runs++;
         FaldPanelClockStep(&r, 9000000000ll + (long long)(((double)runs * (T / 2.0) + 1.0) * 1.0e4), freq, 0.72f, -1, (float)T);
         refreshes += r.clkSeeded ? 0ull : r.clkElapsed;
-        FaldSettleAccount(&r, false, hold, true);
+        FaldSettleAccount(&r, false, hold);
     }
     CHECK(refreshes >= (unsigned long long)hold); CHECK(refreshes <= (unsigned long long)hold + 1ull);   // 14 refreshes ...
     CHECK(runs >= 2u * hold - 4u); CHECK(runs <= 2u * hold + 4u);   // ... = about 28 runs, not 14
     r.settleLeft = hold; r.clkElapsed = 0;
-    FaldSettleAccount(&r, false, hold, true); CHECK(r.settleLeft == hold);          // k = 0 pays nothing
-    r.clkElapsed = 3; FaldSettleAccount(&r, false, hold, true); CHECK(r.settleLeft == hold - 3u);
-    r.clkElapsed = 500; FaldSettleAccount(&r, false, hold, true); CHECK(r.settleLeft == 0u);   // one slow run pays it all
-    FaldSettleAccount(&r, false, hold, true); CHECK(r.settleLeft == 0u);
-    // the first-order modes keep paying one per run; a hold lowered mid-way clamps
-    r.settleLeft = 5; r.clkElapsed = 0;
-    FaldSettleAccount(&r, false, 30u, false); CHECK(r.settleLeft == 4u);
-    r.settleLeft = 40; FaldSettleAccount(&r, false, 30u, false); CHECK(r.settleLeft == 30u);
-    FaldSettleAccount(&r, true, 12u, false); CHECK(r.settleLeft == 12u);
+    FaldSettleAccount(&r, false, hold); CHECK(r.settleLeft == hold);          // k = 0 pays nothing
+    r.clkElapsed = 3; FaldSettleAccount(&r, false, hold); CHECK(r.settleLeft == hold - 3u);
+    r.clkElapsed = 500; FaldSettleAccount(&r, false, hold); CHECK(r.settleLeft == 0u);   // one slow run pays it all
+    FaldSettleAccount(&r, false, hold); CHECK(r.settleLeft == 0u);
+    // a hold lowered mid-way clamps
+    r.settleLeft = 40; r.clkElapsed = 0; FaldSettleAccount(&r, false, 30u); CHECK(r.settleLeft == 30u);
+    FaldSettleAccount(&r, true, 12u); CHECK(r.settleLeft == 12u);
 }
 
 TEST_CASE("FALD panel clock: per-run bookkeeping - seeding, k = 0, long pause, reset origins (no D3D needed)") {
@@ -783,18 +763,16 @@ TEST_CASE("FALD panel clock: settle hold, setting clamps, INI parity text") {
     CHECK(FaldPanelClockClosure(std::nanf("")) == FALD_CLOCK_CLOSURE_DEFAULT);
     CHECK(FaldPanelClockParity(-1) == -1); CHECK(FaldPanelClockParity(0) == 0); CHECK(FaldPanelClockParity(1) == 1);
     CHECK(FaldPanelClockParity(2) == -1); CHECK(FaldPanelClockParity(-7) == -1);
-    // the A/B's plain-mean arm (2026-10-23) survives the clamp, weighs both clocks 1/2, and is never read from an INI
-    CHECK(FaldPanelClockParity(FALD_CLOCK_PARITY_MEAN) == FALD_CLOCK_PARITY_MEAN);
+    // -2 (the removed plain-mean A/B arm) is no parity any more: unknown, from the pipe's clamp and from an INI alike
+    CHECK(FaldPanelClockParity(-2) == -1);
     CHECK(FaldPanelClockParityFromText(L"-2") == -1);
-    {
-        float fac[4], w[2];
-        FaldPanelClockFactors(0, 1, 0.72f, FALD_CLOCK_PARITY_MEAN, fac, w);
-        CHECK(w[0] == 0.5f); CHECK(w[1] == 0.5f);
-    }
+    // LED lag's modes: 3 = the panel clock; 0, the removed first-order 1 / 2 and anything else = off
+    CHECK(FaldTemporalModeOf(3u) == FALD_TEMPORAL_PANEL);
+    for (unsigned int m : { 0u, 1u, 2u, 4u, 7u, 0xFFFFFFFFu }) CHECK(FaldTemporalModeOf(m) == FALD_TEMPORAL_OFF);
     FaldSettings d;
     CHECK(d.temporalMode == 0u);                               // experimental: default OFF
     CHECK(d.clockClosure == FALD_CLOCK_CLOSURE_DEFAULT); CHECK(d.clockParity == -1);
-    // mode 3 shares the settle-frame machinery and the layer-idle reset of the first-order modes
+    // the panel clock's settle hold and its layer-idle reset
     MonitorContext ctx;
     FaldResources* r = new FaldResources();
     ctx.fald = r;
@@ -1391,9 +1369,7 @@ TEST_CASE("FALD loader: an exported panel file named by FALD_TEST_PANEL_FILE loa
 
 // Opt-in GPU smoke of the temporal modes on the WARP software device (the only D3D in this file; work guide C13).
 // FALD_TEST_WARP_DIR names a directory holding `panel.bin` (python -m dlc.fald.export, PQ transfer); FALD_TEST_WARP_MODE
-// = the temporal mode (default 3), FALD_TEST_WARP_PARITY = the parity (default -1), FALD_TEST_WARP_TAU_MS / _DELAY = the
-// first-order modes' rise time constant (fall = half; default 50; 0 makes modes 1 / 2 independent of the run timing, so
-// two builds' dumps can be compared byte for byte) and pipeline delay (default 0), FALD_TEST_WARP_PERIOD_US = the monitor's
+// = the temporal mode (default 3; 0 = off), FALD_TEST_WARP_PARITY = the parity (default -1), FALD_TEST_WARP_PERIOD_US = the monitor's
 // refresh period in microseconds (default 16667; a long one, e.g. 150000, makes runs share a refresh: k = 0). The case
 // runs the layer on a dark
 // frame, then six times on frames whose bright block moves and changes its level from run to run, and writes one fald_dump per run into <dir>/d0 .. d6 (the
@@ -1414,8 +1390,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         if (_dupenv_s(&v, &n, name) != 0 || !v) return dflt;
         int out = std::atoi(v); free(v); return out;
     };
-    const int mode = envInt("FALD_TEST_WARP_MODE", 3), parity = envInt("FALD_TEST_WARP_PARITY", -1);
-    const int tauMs = envInt("FALD_TEST_WARP_TAU_MS", 50), delay = envInt("FALD_TEST_WARP_DELAY", 0);
+    const int mode = (int)FaldTemporalModeOf((unsigned int)envInt("FALD_TEST_WARP_MODE", 3)), parity = envInt("FALD_TEST_WARP_PARITY", -1);
     const float periodMs = (float)envInt("FALD_TEST_WARP_PERIOD_US", 16667) / 1000.0f;
     const bool star = envInt("FALD_TEST_WARP_STAR", 0) != 0;
     // the core governor (shared/fald_core_governor.h) caps full runs to its GPU budget: WARP is two orders over it, and a
@@ -1441,7 +1416,6 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
     fs.enabled = true; fs.paramsPath = dir + L"/panel.bin";
     fs.coreMode = FALD_CORE_MODE_C;   // the always-on core off: this case holds the layer to its C reference
     fs.temporalMode = (unsigned int)mode; fs.clockParity = parity;
-    fs.tauRiseMs = (float)tauMs; fs.tauFallMs = 0.5f * (float)tauMs; fs.delayFrames = (unsigned int)delay;
     fs.star.enabled = star;                                        // at its defaults
     REQUIRE(FaldEnsureResources(&ctx, fs));
 
@@ -1549,7 +1523,7 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
         CHECK(ctx.fald->clkStateTex[0] == nullptr); CHECK(ctx.fald->clkEstTex == nullptr);
         CHECK_FALSE(ctx.fald->stateValid);
     } else {
-        CHECK(ctx.fald->clkStateTex[0] == nullptr);                // modes 0-2 never create them
+        CHECK(ctx.fald->clkStateTex[0] == nullptr);                // off never creates them
     }
     if (star) {                                                    // leaving the option releases its textures
         fs.star.enabled = false;
@@ -1568,62 +1542,56 @@ TEST_CASE("FALD temporal modes on WARP: dumps for the DLC GPU-order twin (FALD_T
 
 // The shared LED-lag orchestration (shared/fald_temporal.cpp FaldTemporalBeginRun / EndRun) — the overlay and the DWM
 // hook both run it, so its routing rules are pinned here without D3D.
-TEST_CASE("FALD temporal run plan: routing, delay ring, resets, panel clock, settle") {
+TEST_CASE("FALD temporal run plan: routing, resets, panel clock, settle") {
     const long long f = 10000000;              // 10 MHz QPC
     const long long frame = 166667;            // 16.6667 ms
     FaldTemporalState s;
     FaldTemporalSettings ts;
-    ts.mode = FALD_TEMPORAL_TRUE_ONLY; ts.tauRiseMs = 50.0f; ts.tauFallMs = 25.0f; ts.delayFrames = 2;
     long long t = 1000000000;
+    // off: the instantaneous drive everywhere, no hold
     FaldTemporalRun r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
-    CHECK(r.stateReset);                       // mode 0 -> 2
-    CHECK(r.temporal); CHECK_FALSE(r.panel); CHECK(r.mode == FALD_TEMPORAL_TRUE_ONLY);
-    CHECK(r.trueMap == FALD_MAP_FILTERED); CHECK(r.estMap == FALD_MAP_DRIVE); CHECK(r.debugFiltMap == FALD_MAP_FILTERED);
-    CHECK(r.delayedSlot == -1);                // the ring holds nothing yet
+    CHECK_FALSE(r.stateReset); CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.panel);
+    CHECK(r.trueMap == FALD_MAP_DRIVE); CHECK(r.estMap == FALD_MAP_DRIVE); CHECK(r.debugFiltMap == FALD_MAP_DRIVE);
     CHECK_FALSE(r.resumed);
-    FaldTemporalEndRun(&s, r, ts, true);
-    CHECK(s.stateValid); CHECK(s.delayHead == 1u); CHECK(s.delayCount == 1u);
-    CHECK(s.settleLeft == FaldSettleFrames(50.0f, 25.0f, s.dtMs, 2));
-    CHECK(FaldTemporalSettlePending(&s));
-    t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
-    CHECK_FALSE(r.stateReset); CHECK(r.delayedSlot == -1);   // one map in the ring, two needed
-    FaldTemporalEndRun(&s, r, ts, false);
-    t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
-    CHECK(r.delayedSlot == 0);                 // head 2, two back = slot 0
-    const unsigned int before = s.settleLeft;
-    FaldTemporalEndRun(&s, r, ts, false);
-    CHECK(s.settleLeft == before - 1u);        // a settle run pays one
-    // a gap past FALD_RESUME_GAP_MS re-arms like new content
+    FaldTemporalEndRun(&s, r, true);
+    CHECK(s.settleLeft == 0u); CHECK_FALSE(FaldTemporalSettlePending(&s));
+    // the removed first-order modes (an old host's tuning tail, an old INI) run as off
+    for (unsigned int gone : { 1u, 2u }) {
+        ts.mode = gone; t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 16.6667f);
+        CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.panel); CHECK_FALSE(r.stateReset);
+        CHECK(r.trueMap == FALD_MAP_DRIVE); CHECK(r.estMap == FALD_MAP_DRIVE);
+        FaldTemporalEndRun(&s, r, true);
+        CHECK(s.settleLeft == 0u);
+    }
+    // a gap past FALD_RESUME_GAP_MS reads as a resume
     t += 300 * 10000; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
     CHECK(r.resumed);
-    // mode 1: both kernels read the filtered map
-    ts.mode = FALD_TEMPORAL_BOTH; t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
-    CHECK(r.stateReset); CHECK_FALSE(s.stateValid); CHECK(s.delayCount == 0u);
-    CHECK(r.trueMap == FALD_MAP_FILTERED); CHECK(r.estMap == FALD_MAP_FILTERED);
     // mode 3 without clock textures runs as off
     ts.mode = FALD_TEMPORAL_PANEL; t += frame; r = FaldTemporalBeginRun(&s, ts, false, t, f, 16.6667f);
-    CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.temporal); CHECK_FALSE(r.panel);
+    CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.panel);
     CHECK(r.trueMap == FALD_MAP_DRIVE); CHECK(r.estMap == FALD_MAP_DRIVE); CHECK(r.debugFiltMap == FALD_MAP_DRIVE);
-    FaldTemporalEndRun(&s, r, ts, true);
+    FaldTemporalEndRun(&s, r, true);
     CHECK(s.settleLeft == 0u); CHECK_FALSE(FaldTemporalSettlePending(&s));
     // mode 3 with no usable refresh period runs as off (else the settle hold, paid per elapsed refresh, never ends)
     t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 0.0f);
     CHECK(r.mode == FALD_TEMPORAL_OFF); CHECK_FALSE(r.panel);
-    FaldTemporalEndRun(&s, r, ts, true);
+    FaldTemporalEndRun(&s, r, true);
     CHECK(s.settleLeft == 0u);
-    // mode 3 with them: a seeding run, then one refresh later the clock maps
+    // mode 3 with them: a seeding run (a state reset: the mode changed), then one refresh later the clock maps
     t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 16.6667f);
+    CHECK(r.stateReset);
     CHECK(r.panel); CHECK(r.clock.seedStates); CHECK_FALSE(r.clock.bindMaps); CHECK(r.trueMap == FALD_MAP_DRIVE);
-    FaldTemporalEndRun(&s, r, ts, true);
+    FaldTemporalEndRun(&s, r, true);
     CHECK(s.settleLeft == FaldPanelClockSettleFrames(ts.clockClosure));
+    CHECK(FaldTemporalSettlePending(&s));
     t += frame; r = FaldTemporalBeginRun(&s, ts, true, t, f, 16.6667f);
     CHECK(r.clock.runPass); CHECK(r.clock.bindMaps); CHECK(s.clkElapsed == 1ull);
     CHECK(r.trueMap == FALD_MAP_FILTERED); CHECK(r.estMap == FALD_MAP_CLOCK_EST); CHECK(r.debugFiltMap == FALD_MAP_FILTERED);
     const unsigned int held = s.settleLeft;
-    FaldTemporalEndRun(&s, r, ts, false);
+    FaldTemporalEndRun(&s, r, false);
     CHECK(s.settleLeft == held - 1u);          // mode 3 pays the elapsed refreshes (k = 1)
     FaldTemporalIdle(&s);                      // the layer did not run: all void
-    CHECK_FALSE(s.stateValid); CHECK(s.settleLeft == 0u); CHECK(s.delayCount == 0u); CHECK(s.lastRunQpc == 0);
+    CHECK_FALSE(s.stateValid); CHECK(s.settleLeft == 0u); CHECK(s.lastRunQpc == 0);
     CHECK_FALSE(FaldTemporalSettlePending(nullptr));
 }
 

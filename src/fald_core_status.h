@@ -1,7 +1,7 @@
 // The core layer's rate-cap governor status (shared/fald_core_governor.h) for the interface, the Events log and the pipe,
 // from both render paths: the overlay's render thread publishes per monitor (FaldCoreGovPublish, src/fald.h); in hook
 // mode the DLL writes it into its status section (dwm_hook_config.h DwmHookFaldStatus::core) and the host reads it by
-// position. The same shape as the flank fade's (src/fald_fade_status.h).
+// position.
 #pragma once
 #include "../shared/fald_core_governor.h"
 #include <windows.h>

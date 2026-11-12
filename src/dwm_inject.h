@@ -66,7 +66,7 @@ void UpdateDwmHookSharedConfig();
 // Close shared memory mapping. Called on uninject/stop.
 void CloseDwmHookSharedMemory();
 
-// The flank fade governor's status the resident DLL reports (dwm_hook_config.h DwmHookFaldStatus): a consistent copy of
+// The FALD governors' status the resident DLL reports (dwm_hook_config.h DwmHookFaldStatus): a consistent copy of
 // the block (false = none: no section, no DLL wrote, or a write kept overlapping the copy). Any thread, no lock.
 bool ReadDwmHookFaldStatus(DwmHookFaldStatus& out);
 // Empties the block (the injection does it before a DLL attaches). GUI thread.

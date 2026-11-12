@@ -101,11 +101,33 @@ TEST_CASE("INI roundtrip: a real INI loads and saves back with every key and val
         return nullptr;
     };
 
+    // Keys of features a later build removed (2026-11-12: the FALD flank fade with its item L and governor key, LED lag's
+    // first-order modes 1 / 2 with their time constants and delay, the core's A/B test mode): gone on purpose, no
+    // successor (per-mode keys end with the name). A FaldTemporalMode of 1 / 2 loads as 0 (off).
+    static const wchar_t* const kRemoved[] = { L"FaldFlankFade", L"FaldLowExt", L"FaldFlankFadeForce", L"FaldTauRiseMs",
+                                               L"FaldTauFallMs", L"FaldDelayFrames", L"FaldCoreModeTest" };
+    auto removed = [&](const std::wstring& k) {
+        for (const wchar_t* r : kRemoved) {
+            const size_t n = wcslen(r);
+            if (k.size() >= n && _wcsicmp(k.c_str() + k.size() - n, r) == 0) return true;
+        }
+        return false;
+    };
+    auto removedMode = [](const std::wstring& k, const std::wstring& v, const std::wstring& now) {
+        static const wchar_t kMode[] = L"FaldTemporalMode";
+        const size_t n = wcslen(kMode);
+        return k.size() >= n && _wcsicmp(k.c_str() + k.size() - n, kMode) == 0 && (v == L"1" || v == L"2") && now == L"0";
+    };
+
     int lost = 0, changed = 0, added = 0, finer = 0;
     for (const auto& [sec, keys] : before) {
         auto s = after.find(sec);
         for (const auto& [k, v] : keys) {
-            if (const wchar_t* successor = retiredFor(s == after.end() ? nullptr : &s->second, k);
+            if (removed(k) && (s == after.end() || s->second.find(k) == s->second.end())) {
+                MESSAGE("REMOVED [" << Narrow(sec) << "] " << Narrow(k) << "=" << Narrow(v));
+            } else if (s != after.end() && s->second.find(k) != s->second.end() && removedMode(k, v, s->second.at(k))) {
+                MESSAGE("REMOVED [" << Narrow(sec) << "] " << Narrow(k) << " " << Narrow(v) << " -> 0 (LED lag mode removed)");
+            } else if (const wchar_t* successor = retiredFor(s == after.end() ? nullptr : &s->second, k);
                 successor && (s == after.end() || s->second.find(k) == s->second.end())) {
                 MESSAGE("RETIRED [" << Narrow(sec) << "] " << Narrow(k) << "=" << Narrow(v) << " -> "
                         << Narrow(successor) << "=" << Narrow(s->second.at(successor)));

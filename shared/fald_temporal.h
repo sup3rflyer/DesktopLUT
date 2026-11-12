@@ -3,31 +3,19 @@
 // DWM hook (dwm_hook/hook_fald.cpp). ONE implementation of the rules — the time law, the resets, the delay ring's
 // indices, which drive map each kernel reads, the settle hold — so the two paths cannot drift. The GPU work (the
 // passes, the texture copies) stays with each caller; these functions only say what to bind, copy and dispatch.
-// DLC references: dlc/fald/temporal.py (modes 1 / 2), dlc/fald/paneltime.py (mode 3), dlc/fald/gpuemu.py (GPU order).
+// DLC references: dlc/fald/paneltime.py (the panel clock), dlc/fald/gpuemu.py (GPU order).
 // Standalone: no Windows, no D3D, no project headers.
 #pragma once
 
 #include <stdint.h>
 
-// Temporal drive state (FaldSettings::temporalMode):
-// 0 = off (stateless layer, byte for byte), 1 = both fields from the filtered drive (LEDs AND the panel's estimate
-// lag), 2 = B_true from the filtered drive, B_est from the instantaneous one (LEDs lag, the LCD compensation follows
-// the command). Default OFF. Modes 1 / 2 = a first-order filter, written before the PA32UCXR's LED law was measured
-// and REJECTED as that law by the 2026-09-19/20 camera measurement (work guide H5 / IDEA BOARD findings); kept as the
-// owner's A/B controls. 3 = the MEASURED law ("panel
-// clock", FALD_TEMPORAL_PANEL below) — its own pass and state; modes 0-2 are untouched by it.
+// Temporal drive state (FaldSettings::temporalMode): 0 = off (stateless layer, byte for byte), 3 = the panel clock
+// (FALD_TEMPORAL_PANEL below), the PA32UCXR's MEASURED LED law. Default OFF. Modes 1 / 2 (a first-order filter of the
+// drives, written before the law was measured and REJECTED as that law by the 2026-09-19/20 camera measurement: work
+// guide H5 / IDEA BOARD findings) were removed 2026-11-12; their numbers stay unused so 3 keeps its meaning in the INI,
+// the pipe and the hook's tuning tail. FaldTemporalModeOf maps any other value (1, 2 from an old INI or host) to off.
 constexpr unsigned int FALD_TEMPORAL_OFF = 0;
-constexpr unsigned int FALD_TEMPORAL_BOTH = 1;
-constexpr unsigned int FALD_TEMPORAL_TRUE_ONLY = 2;
-constexpr float FALD_TAU_MAX_MS = 5000.0f;
-constexpr unsigned int FALD_DELAY_MAX = 3;    // pipeline delay ring depth (FaldSettings::delayFrames 0..3)
 constexpr float FALD_RESUME_GAP_MS = 250.0f;  // a run this long after the previous one re-arms the settle hold
-// Per-frame blend factor 1 - exp(-dt/tau) of a first-order response; tau <= 0 (or dt <= 0) = instant (1).
-float FaldTemporalAlpha(float tauMs, float dtMs);
-// Frames the layer keeps re-rendering after the last content change so the state settles (5 tau_max, ceil, plus the
-// pipeline delay; 0 when neither edge has a time constant and there is no delay): Desktop Duplication delivers no
-// frames on a static desktop (and DWM presents none either — the hook asks the host to keep it composing).
-unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsigned int delayFrames = 0);
 
 // Temporal mode 3 = "panel clock" (EXPERIMENT, default off; work guide C13; DLC dlc/fald/paneltime.py is the reference,
 // dlc/fald/gpuemu.py GpuPanelDriveState the GPU-order twin). The PA32UCXR's law as the phone camera measured it
@@ -36,8 +24,8 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
 // (which one — the PARITY — software does not know TODAY: it is locked to the actually presented frame index and
 // re-rolls on display mode sets, so it needs the presented refresh index + a one-bit calibration; not built); at a tick every zone's LED drive closes `closure` of the remaining
 // gap to the drive demanded by the frame that was on the panel ONE refresh earlier (same up and down); the panel's own
-// LCD compensation uses the LED state of ONE refresh earlier. The first-order filter of modes 1 / 2 cannot express
-// this. Per zone and parity clock p the layer keeps the LED state S_p; with k = the panel refreshes elapsed since the
+// LCD compensation uses the LED state of ONE refresh earlier. A first-order filter (the removed modes 1 / 2) cannot
+// express this. Per zone and parity clock p the layer keeps the LED state S_p; with k = the panel refreshes elapsed since the
 // previous processed frame was first shown (Desktop Duplication delivers frames on change only), every tick in between
 // targeted that frame's round-1 drives d_prev, so t ticks are ONE blend a = 1 - (1 - closure)^t:
 //   B_true of this frame from S_p + aTrue_p (d_prev - S_p)   (ticks up to this refresh; committed as the new S_p)
@@ -67,6 +55,9 @@ unsigned int FaldSettleFrames(float tauRiseMs, float tauFallMs, float dtMs, unsi
 // layer-off / idle period (FaldTemporalIdle), a mode / closure / parity / refresh-period change, a resource rebuild
 // (device, resize, panel file).
 constexpr unsigned int FALD_TEMPORAL_PANEL = 3;
+// A stored / received mode as the mode that runs: FALD_TEMPORAL_PANEL stays, everything else (0, the removed 1 / 2,
+// garbage) is off.
+inline unsigned int FaldTemporalModeOf(unsigned int mode) { return mode == FALD_TEMPORAL_PANEL ? FALD_TEMPORAL_PANEL : FALD_TEMPORAL_OFF; }
 constexpr float FALD_CLOCK_CLOSURE_DEFAULT = 0.72f;   // measured 0.63-0.78 per tick
 constexpr float FALD_CLOCK_CLOSURE_MIN = 0.05f;
 constexpr float FALD_CLOCK_CLOSURE_MAX = 1.0f;
@@ -83,16 +74,12 @@ constexpr double FALD_CLOCK_LOCK_GAIN = 0.08;                // steady gain of t
 // clamp gives back part of the plain mean's surround-flicker gain beside small bright moving objects. Swept 0.05 / 0.1 /
 // 0.2 / 0.35 offline under both parities (0.1 best); HLSL pass 1c.
 constexpr float FALD_CLOCK_ROBUST_CAP = 0.1f;
-// Parity code of the PLAIN mean of the two clocks (the unknown parity before 2026-10-23): a test value for the blind A/B
-// (runtime.fald_temporal parity -2), never saved — the INI keeps -1; the hosts run the FALD_CLOCK_MEAN variant of pass 1c.
-// A DWM hook DLL from before it reads -2 as -1, which there IS the plain mean.
-constexpr int FALD_CLOCK_PARITY_MEAN = -2;
-// Closure into FALD_CLOCK_CLOSURE_MIN..MAX (NaN -> the default); parity into -1 / 0 / 1 / FALD_CLOCK_PARITY_MEAN (anything
-// else -> -1).
+// (Parity -2, the PLAIN mean of the two clocks — the unknown parity before 2026-10-23 and the losing arm of the owner's
+// 2026-10-24 blind A/B — was a pipe-only test value until 2026-11-12; it now reads as -1 like any other value.)
+// Closure into FALD_CLOCK_CLOSURE_MIN..MAX (NaN -> the default); parity into -1 / 0 / 1 (anything else -> -1).
 float FaldPanelClockClosure(float closure);
 int FaldPanelClockParity(int parity);
-// Parity from an INI value: exactly "-1", "0" or "1" (surrounding blanks allowed); empty / garbage / anything else -> -1
-// (FALD_CLOCK_PARITY_MEAN included: it is never saved).
+// Parity from an INI value: exactly "-1", "0" or "1" (surrounding blanks allowed); empty / garbage / anything else -> -1.
 int FaldPanelClockParityFromText(const wchar_t* text);
 // Ticks of the clock with this parity (it ticks at refresh n when (n + parity) is even) between a frame first shown at
 // refresh nA and the next one at nA + k (k >= 1): tTrue = ticks in nA+1 .. nA+k, tEst = ticks in nA+1 .. nA+k-1.
@@ -110,13 +97,9 @@ unsigned int FaldPanelClockSettleFrames(float closure);
 // The per-monitor temporal bookkeeping (no D3D). The overlay's FaldResources and the hook's FaldMonitor both DERIVE
 // from it, so every field is reached the same way (r->clkIndex) and the functions below take either.
 struct FaldTemporalState {
-    // delay ring (modes 1 / 2): indices only — the textures are the caller's
-    unsigned int delayHead = 0, delayCount = 0;
-    unsigned int delayFrames = 0;            // FaldSettings::delayFrames at the last run
-    bool stateValid = false;                 // the state texture holds a committed map (else the next pass copies the drive)
-    unsigned int temporalMode = 0;           // FaldSettings::temporalMode at the last run (a change resets the state)
-    float tempAlphaRise = 1.0f, tempAlphaFall = 1.0f;   // the CB words of the last frame (dump)
-    unsigned int settleLeft = 0;             // frames of redraw hold still owed after the last content change
+    bool stateValid = false;                 // the clocks hold a committed state (else the next run re-seeds them)
+    unsigned int temporalMode = 0;           // the mode that ran at the last run (a change resets the state)
+    unsigned int settleLeft = 0;             // refreshes of redraw hold still owed after the last content change
     float dtMs = 16.667f;                    // EMA of the interval between consecutive runs while rendering continuously
     long long lastRunQpc = 0;
     // panel clock (mode 3)
@@ -149,56 +132,47 @@ bool FaldPanelClockStep(FaldTemporalState* r, long long nowQpc, long long qpcFre
 // frame's round-1 drives become the next target (ALWAYS: on k = 0 the later frame replaces the earlier one on the panel).
 struct FaldClockPlan { bool runPass; bool bindMaps; bool seedStates; bool commitPrev; };
 FaldClockPlan FaldPanelClockPlan(bool seeded, unsigned long long elapsed);
-// Settle-hold accounting after a run (pure): rearm (new content / a resume) = the full hold; otherwise the first-order
-// modes pay ONE per run, the panel clock pays the ELAPSED REFRESHES (perRefresh: a k = 0 run pays nothing, one slow run
-// pays k); never above `settle` (a time constant lowered mid-hold).
-void FaldSettleAccount(FaldTemporalState* r, bool rearm, unsigned int settle, bool perRefresh);
+// Settle-hold accounting after a run (pure): rearm (new content / a resume) = the full hold; otherwise the hold pays the
+// ELAPSED REFRESHES (a k = 0 run pays nothing, one slow run pays k); never above `settle`.
+void FaldSettleAccount(FaldTemporalState* r, bool rearm, unsigned int settle);
 
 // ---------------------------------------------------------------------------------------------------------------------
 // One run of the layer, start to end — the orchestration both paths share.
 // ---------------------------------------------------------------------------------------------------------------------
 // The temporal settings of the mode the monitor is in (FaldSettings fields; the hook receives them in the tuning tail).
 struct FaldTemporalSettings {
-    unsigned int mode = FALD_TEMPORAL_OFF;   // 0..3; anything else = off
-    float tauRiseMs = 0.0f, tauFallMs = 0.0f;
-    unsigned int delayFrames = 0;
+    unsigned int mode = FALD_TEMPORAL_OFF;   // FALD_TEMPORAL_PANEL; anything else = off (FaldTemporalModeOf)
     float clockClosure = FALD_CLOCK_CLOSURE_DEFAULT;
     int clockParity = -1;
 };
 // Which drive map a kernel / pass reads this run (the caller maps these onto its own textures).
 enum FaldDriveMap : unsigned int {
     FALD_MAP_DRIVE = 0,        // this round's instantaneous drive (driveTex)
-    FALD_MAP_FILTERED = 1,     // the temporal pass's output (driveFiltTex; mode 3: the clock pass's B_true map)
-    FALD_MAP_CLOCK_EST = 2,    // mode 3: the clock pass's B_est map (clkEstTex)
+    FALD_MAP_FILTERED = 1,     // the clock pass's B_true map (driveFiltTex)
+    FALD_MAP_CLOCK_EST = 2,    // the clock pass's B_est map (clkEstTex)
 };
 struct FaldTemporalRun {
     unsigned int mode;         // the mode that RUNS (3 falls back to 0 when the caller has no clock textures)
-    bool temporal;             // modes 1 / 2: run the temporal pass after each statistic round
     bool panel;                // mode 3
-    unsigned int delay;        // clamped delayFrames of this run
-    int delayedSlot;           // modes 1 / 2: the ring slot the temporal pass is fed (-1 = the instantaneous drive)
     FaldDriveMap trueMap;      // what the real-spread kernel (B_true) reads
     FaldDriveMap estMap;       // what the estimate kernel (B_est) reads
     FaldDriveMap debugFiltMap; // what debug view 7's "filtered" slot shows (t10 of the pixel pass)
     FaldClockPlan clock;       // mode 3 plan (all false otherwise)
     bool resumed;              // first run after a gap > FALD_RESUME_GAP_MS
-    bool stateReset;           // the mode changed: the caller's ring / state textures are void (indices already reset)
+    bool stateReset;           // the mode changed: the caller's clock textures hold no state
 };
 // Start of a run: the dt estimate (EMA over 2..100 ms intervals; a longer gap = `resumed`), the mode (a change forgets
-// the state, the hold and the ring), the delay depth (a change restarts the ring), the blend factors (tempAlphaRise /
-// Fall), the panel clock's step, and which map each kernel reads. clockTexturesOk: the caller could create its clock
-// textures (mode 3 runs as off otherwise). refreshMs: the monitor's nominal refresh period (mode 3's grid).
+// the state and the hold), the panel clock's step, and which map each kernel reads. clockTexturesOk: the caller could
+// create its clock textures (mode 3 runs as off otherwise). refreshMs: the monitor's nominal refresh period (mode 3's grid).
 FaldTemporalRun FaldTemporalBeginRun(FaldTemporalState* r, const FaldTemporalSettings& s, bool clockTexturesOk,
                                      long long nowQpc, long long qpcFreq, float refreshMs);
-// End of a run, AFTER the caller has done the copies the plan implies, in this order: modes 1 / 2 — copy the filtered
-// map into the state texture, and (delay > 0) the round-1 instantaneous drive into ring slot r->delayHead; mode 3 —
-// clock.seedStates: the round-1 drive into both clock states, clock.commitPrev: the round-1 drive into clkPrev.
-// This commits the indices (stateValid, the ring head / count) and does the settle accounting; newContent = the frame
-// is new content (not a re-run for the settle hold).
-void FaldTemporalEndRun(FaldTemporalState* r, const FaldTemporalRun& run, const FaldTemporalSettings& s, bool newContent);
+// End of a run, AFTER the caller has done the copies the plan implies: clock.seedStates — the round-1 drive into both
+// clock states, clock.commitPrev — the round-1 drive into clkPrev. Does the settle accounting; newContent = the frame is
+// new content (not a re-run for the settle hold).
+void FaldTemporalEndRun(FaldTemporalState* r, const FaldTemporalRun& run, bool newContent);
 // True while the state still owes settle frames after the last content change.
 bool FaldTemporalSettlePending(const FaldTemporalState* r);
-// The layer did not run (disabled, refused, wrong format, hook-mode overlay): forget the state, the hold and the ring —
-// a state kept across a layer-OFF period would blend the new content with the OLD content's drives when the layer comes
-// back on a static desktop, and nothing would settle it (design review 2026-09-17).
+// The layer did not run (disabled, refused, wrong format, hook-mode overlay): forget the state and the hold — a state
+// kept across a layer-OFF period would blend the new content with the OLD content's drives when the layer comes back
+// on a static desktop, and nothing would settle it (design review 2026-09-17).
 void FaldTemporalIdle(FaldTemporalState* r);

@@ -3,7 +3,6 @@
 
 #include "gui.h"
 #include "fald.h"
-#include "fald_fade_status.h"   // FaldFadeGovPollHookEvents
 #include "fald_core_status.h"   // FaldCoreGovPollHookEvents
 #include "gui_shared.h"
 #include "gui_mhc.h"
@@ -562,12 +561,8 @@ bool BrowseForLUT(HWND hwndParent, wchar_t* path, size_t pathSize) {
 }
 
 
-// FALD LED-lag row: "Panel clock" (temporal mode 3) shows closure + parity where the first-order modes show
-// rise / fall / delay (gui_layout.cpp creates both sets on the same spot).
+// FALD LED-lag row: "Panel clock" (temporal mode 3) shows closure + parity (hidden while LED lag is off).
 static void ShowFaldTemporalRow(bool panelClock) {
-    for (HWND hCtrl : { g_gui.hwndFaldTauRiseLabel, g_gui.hwndFaldTauRise, g_gui.hwndFaldTauFallLabel, g_gui.hwndFaldTauFall,
-                        g_gui.hwndFaldDelayLabel, g_gui.hwndFaldDelay })
-        if (hCtrl) ShowWindow(hCtrl, panelClock ? SW_HIDE : SW_SHOW);
     for (HWND hCtrl : { g_gui.hwndFaldClosureLabel, g_gui.hwndFaldClosure, g_gui.hwndFaldParityLabel, g_gui.hwndFaldParity })
         if (hCtrl) ShowWindow(hCtrl, panelClock ? SW_SHOW : SW_HIDE);
 }
@@ -617,25 +612,15 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     const FaldSettings& shown = CurrentMonitorIsHDR() ? hdrCC.fald : sdrCC.fald;
     SendMessage(g_gui.hwndFaldDebug, CB_SETCURSEL, (WPARAM)(shown.debugMode <= 9 ? shown.debugMode : 0), 0);
     SendMessage(g_gui.hwndFaldPedMode, BM_SETCHECK, shown.pedMode == 1 ? BST_CHECKED : BST_UNCHECKED, 0);
-    SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(shown.temporalMode <= FALD_TEMPORAL_PANEL ? shown.temporalMode : 0), 0);
-    ShowFaldTemporalRow(shown.temporalMode == FALD_TEMPORAL_PANEL);
+    const bool panelClock = FaldTemporalModeOf(shown.temporalMode) == FALD_TEMPORAL_PANEL;
+    SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, (WPARAM)(panelClock ? 1 : 0), 0);   // two entries: Off, Panel clock
+    ShowFaldTemporalRow(panelClock);
     wchar_t tauBuf[32];
-    if (!typing(g_gui.hwndFaldTauRise)) {  // don't fight a value being typed
-        _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauRiseMs);
-        SetWindowText(g_gui.hwndFaldTauRise, tauBuf);
-    }
-    if (!typing(g_gui.hwndFaldTauFall)) {
-        _swprintf_s_l(tauBuf, 32, L"%.1f", GetCLocale(), shown.tauFallMs);
-        SetWindowText(g_gui.hwndFaldTauFall, tauBuf);
-    }
-    if (!typing(g_gui.hwndFaldDelay))
-        SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(shown.delayFrames).c_str());
     if (!typing(g_gui.hwndFaldClosure)) {
         _swprintf_s_l(tauBuf, 32, L"%.2f", GetCLocale(), shown.clockClosure);
         SetWindowText(g_gui.hwndFaldClosure, tauBuf);
     }
-    const int shownParity = FaldPanelClockParity(shown.clockParity);   // the A/B's plain mean shows as "unknown"
-    SendMessage(g_gui.hwndFaldParity, CB_SETCURSEL, (WPARAM)((shownParity == FALD_CLOCK_PARITY_MEAN ? -1 : shownParity) + 1), 0);   // index = parity + 1
+    SendMessage(g_gui.hwndFaldParity, CB_SETCURSEL, (WPARAM)(FaldPanelClockParity(shown.clockParity) + 1), 0);   // index = parity + 1
     // starfield balancing row (work guide S1)
     SendMessage(g_gui.hwndFaldStarEnable, BM_SETCHECK, shown.star.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     {
@@ -653,7 +638,6 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     }
     if (!typing(g_gui.hwndFaldStarReach))
         SetWindowText(g_gui.hwndFaldStarReach, std::to_wstring(shown.star.evenReach).c_str());
-    SendMessage(g_gui.hwndFaldFlankFade, BM_SETCHECK, shown.flankFade ? BST_CHECKED : BST_UNCHECKED, 0);   // the fade stack
     // The whole layer runs in both paths (overlay: src/fald.cpp; DWM hook: dwm_hook/hook_fald.cpp), so every FALD
     // control is live in either mode.
     EnableWindow(g_gui.hwndFaldEnable, TRUE);
@@ -663,9 +647,6 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     // LED lag runs in both paths (the bookkeeping is shared/fald_temporal.cpp; in hook mode the host keeps DWM composing
     // while the state settles — dwm_inject.cpp FaldSettleKickThread).
     EnableWindow(g_gui.hwndFaldTemporal, TRUE);
-    EnableWindow(g_gui.hwndFaldTauRise, TRUE);
-    EnableWindow(g_gui.hwndFaldTauFall, TRUE);
-    EnableWindow(g_gui.hwndFaldDelay, TRUE);
     EnableWindow(g_gui.hwndFaldClosure, TRUE);
     EnableWindow(g_gui.hwndFaldParity, TRUE);
     // Starfield runs in both paths.
@@ -675,7 +656,6 @@ void UpdateColorCorrectionControls(bool forceEdits) {
     EnableWindow(g_gui.hwndFaldStarStrength, TRUE);
     EnableWindow(g_gui.hwndFaldStarReach, TRUE);
     EnableWindow(g_gui.hwndFaldStarSigma, TRUE);
-    EnableWindow(g_gui.hwndFaldFlankFade, TRUE);   // the fade stack runs in both paths too
 
     // Windows tone map (the combo lists WindowsToneMap in order)
     SendMessage(g_gui.hwndWinToneMapCombo, CB_SETCURSEL, (WPARAM)settings.windowsToneMap, 0);
@@ -2010,35 +1990,16 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             return 0;
 
-        // Temporal drive state ("LED lag" row): mode combo + rise/fall ms, both modes at once like View. Persisted.
+        // LED lag row: Off / Panel clock (temporal mode 0 / 3), both modes at once like View. Persisted.
         case ID_CORR_FALD_TEMPORAL:
             if (HIWORD(wParam) == CBN_SELCHANGE && act::ValidMonitor(g_gui.currentMonitor)) {
                 int sel = (int)SendMessage(g_gui.hwndFaldTemporal, CB_GETCURSEL, 0, 0);
-                unsigned int mode = (sel >= 0 && sel <= (int)FALD_TEMPORAL_PANEL) ? (unsigned int)sel : 0u;   // one entry per mode 0..3
+                unsigned int mode = sel == 1 ? FALD_TEMPORAL_PANEL : FALD_TEMPORAL_OFF;   // two entries: Off, Panel clock
                 ShowFaldTemporalRow(mode == FALD_TEMPORAL_PANEL);
                 act::EditFaldShared(g_gui.currentMonitor, [mode](FaldSettings& f) {
                     bool c = f.temporalMode != mode; f.temporalMode = mode; return c; });
                 if (mode == FALD_TEMPORAL_PANEL)
                     SetStatus(L"FALD panel clock on (experimental): the measured 30-Hz LED law - judge flashes beside moving highlights by eye");
-                else if (mode != 0)
-                    SetStatus(L"FALD LED-lag filter on: the panel's LED law is unmeasured - judge slow pans by eye, off if worse");
-            }
-            return 0;
-        case ID_CORR_FALD_TAU_RISE:
-        case ID_CORR_FALD_TAU_FALL:
-            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
-                const bool rise = (LOWORD(wParam) == ID_CORR_FALD_TAU_RISE);
-                HWND edit = rise ? g_gui.hwndFaldTauRise : g_gui.hwndFaldTauFall;
-                wchar_t buf[32];
-                GetWindowText(edit, buf, 32);
-                float v = (float)_wcstod_l(buf, nullptr, GetCLocale());
-                if (!(v >= 0.0f)) v = 0.0f;
-                if (v > FALD_TAU_MAX_MS) v = FALD_TAU_MAX_MS;
-                wchar_t shown[32];
-                _swprintf_s_l(shown, 32, L"%.1f", GetCLocale(), v);
-                SetWindowText(edit, shown);
-                act::EditFaldShared(g_gui.currentMonitor, [rise, v](FaldSettings& f) {
-                    float& t = rise ? f.tauRiseMs : f.tauFallMs; bool c = t != v; t = v; return c; });
             }
             return 0;
         // "Panel clock" set of the LED-lag row: closure (0.05..1) + parity (combo index = parity + 1), both modes at once.
@@ -2073,17 +2034,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     SetStatus(L"FALD panel clock: a known parity is experimental - the WRONG one is as bad as no time law; Unknown is the safe choice");
             }
             return 0;
-        case ID_CORR_FALD_DELAY:
-            if (HIWORD(wParam) == EN_KILLFOCUS && act::ValidMonitor(g_gui.currentMonitor)) {
-                wchar_t buf[32];
-                GetWindowText(g_gui.hwndFaldDelay, buf, 32);
-                int n = _wtoi(buf);
-                unsigned int v = n < 0 ? 0u : (n > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)n);
-                SetWindowText(g_gui.hwndFaldDelay, std::to_wstring(v).c_str());
-                act::EditFaldShared(g_gui.currentMonitor, [v](FaldSettings& f) {
-                    bool c = f.delayFrames != v; f.delayFrames = v; return c; });
-            }
-            return 0;
         // Starfield balancing rows (EXPERIMENT, work guide S1): enable + even / spread σ / keep nits / strength / mean reach, both modes at
         // once like View. Persisted. The other parameters are INI / pipe only.
         case ID_CORR_FALD_STAR_ENABLE:
@@ -2093,16 +2043,6 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     bool c = f.star.enabled != on; f.star.enabled = on; return c; });
                 if (on)
                     SetStatus(L"FALD starfield on (experimental): evens scattered highlights on purpose");
-            }
-            return 0;
-        // Flank fade (the frozen fade stack ASF10 + T11_TMTC, shared/fald_fade.h): both modes at once like View. Persisted.
-        case ID_CORR_FALD_FLANK_FADE:
-            if (HIWORD(wParam) == BN_CLICKED && act::ValidMonitor(g_gui.currentMonitor)) {
-                bool on = (SendMessage(g_gui.hwndFaldFlankFade, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                act::EditFaldShared(g_gui.currentMonitor, [on](FaldSettings& f) {
-                    bool c = f.flankFade != on; f.flankFade = on; return c; });
-                if (on)
-                    SetStatus(L"FALD flank fade on (experimental)");
             }
             return 0;
         case ID_CORR_FALD_STAR_EVEN:
@@ -2987,9 +2927,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // re-injects on every tick and never builds a healthy streak this long.
                 // (A slow loop does build one: the detach count over hours catches it.)
                 g_dwmHookStability.OnHealthyTick();
-                // The flank fade governor's status changes the DLL reported (shared/fald_fade_governor.h): Events lines
-                FaldFadeGovPollHookEvents();
-                FaldCoreGovPollHookEvents();   // ... and the core layer's rate-cap governor's (shared/fald_core_governor.h)
+                FaldCoreGovPollHookEvents();   // the core layer's rate-cap governor's status changes (shared/fald_core_governor.h)
                 // Live FALD panel deliveries: the hook's verdicts (and the no-answer timeout, counted on these ticks),
                 // then the files it was given, re-exported in place, polled on a worker thread (the overlay path
                 // polls its file stamp the same way). A fallback re-injection here ends this tick's work.

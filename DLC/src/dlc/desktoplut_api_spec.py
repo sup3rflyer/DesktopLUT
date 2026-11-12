@@ -90,22 +90,17 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
                           "review); every pair (HDR and SDR, the FALD "
                           "layer is per mode since 2026-09-14) carries fald_params_path, fald_debug_mode, "
                           "fald_ped_mode, fald_ped_colour_in_file, fald_boost_in_file (the panel file is FLD4 with a "
-                          "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode, fald_tau_rise_ms, "
-                          "fald_tau_fall_ms, fald_delay_frames, fald_temporal_closure, fald_temporal_parity (runtime.fald_temporal; the last "
-                          "two absent on builds before 2026-09-20), fald_starfield (bool) + fald_star_even, "
+                          "black-frame LED boost LUT; absent on builds before 2026-09-18), fald_temporal_mode (0 off / 3 panel "
+                          "clock), fald_temporal_closure, fald_temporal_parity (runtime.fald_temporal; the last two absent on "
+                          "builds before 2026-09-20; fald_tau_rise_ms / fald_tau_fall_ms / fald_delay_frames of the removed "
+                          "modes 1 / 2 are absent from 2026-11-12), fald_starfield (bool) + fald_star_even, "
                           "fald_star_target_gain, fald_star_target_sigma, fald_star_keep_nits, fald_star_even_reach, fald_star_cap_nits, fald_star_strength, "
                           "fald_star_area_lo, fald_star_area_hi, fald_star_peak_hi, fald_star_reach, fald_star_nb_lo, "
                           "fald_star_nb_hi (runtime.fald_starfield; absent on builds before 2026-09-19), "
-                          "fald_core_mode (0 C / 1 KC2c / 2 KC3 / 4 KC5: the always-on core's rule, default 4 = KC5 — the "
-                          "2026-10-23 fill re-run + live blind test; runtime.fald_core_mode switches to the test modes for A/B "
-                          "checks; 3 reserved for KC4) + "
-                          "fald_core_mode_name ('C' / 'KC2c' / 'KC3' / 'KC5'; both absent on builds before 2026-10-23), "
-                          "fald_flank_fade (bool, runtime.fald_flank_fade) + fald_low_ext (bool, reserved; both absent "
-                          "on builds before 2026-10-20), fald_flank_fade_governor (the fade's GPU safety governor: "
-                          "{state: 'off'|'running'|'suspended_budget'|'suspended_weak_gpu'|'forced'|'unknown' (on, no "
-                          "report yet), p90_ms, budget_ms, content_ms, refresh_ms (with a report), forced (bool, INI "
-                          "[General] FaldFlankFadeForce)}; suspended = FALD runs without the fade while the setting stays "
-                          "on; absent on builds before 2026-10-22), and "
+                          "fald_core_mode (4 = KC5, the always-on core's rule — the 2026-10-23 fill re-run + live blind test; the "
+                          "A/B test modes and runtime.fald_core_mode were removed 2026-11-12) + "
+                          "fald_core_mode_name ('KC5'; both absent on builds before 2026-10-23; the flank fade's fald_flank_fade, "
+                          "fald_low_ext and fald_flank_fade_governor are absent from 2026-11-12), and "
                           "fald_file_transfer 'pq'|'gamma' when the "
                           "panel file is readable; bypass_3dlut, bypass_primaries, bypass_grayscale (bool, every "
                           "pair: the interface's stage switches — the stage keeps its settings but is NOT applied; "
@@ -491,39 +486,26 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "runtime.fald_temporal",
-            "FALD compensation layer: temporal drive state — the shader's per-cell LED-law filter (DLC "
-            "dlc/fald/temporal.py is the reference; work guide H5 / item 4a, 2026-09-17). temporal_mode 0 = off (the "
-            "stateless layer, byte for byte), 1 = both backlight fields from the filtered drive (the LEDs AND the "
-            "panel's own estimate lag: self-consistent firmware), 2 = only B_true from the filtered drive (the LEDs "
-            "lag physically, the LCD compensation follows the commanded drive). tau_rise_ms / tau_fall_ms = first-order "
-            "time constants per edge (0 = instant on that edge; max 5000); delay_frames = a pipeline delay 0..3 (the "
-            "filter is fed the drives of n frames ago: LED-driver latency after the LCD data, the law a first-order "
-            "filter cannot represent). The layer keeps re-running its passes on a static desktop for 5 tau + delay "
-            "after the last content frame so the state settles. Persisted per mode (= the GUI 'LED lag' row, which "
-            "sets both modes). At least one of the six. Default off: the panel's LED law is UNMEASURED — fit it "
-            "(python -m dlc.fald.led_step_fit on a high-fps video of the test clip's toggle segment, --block-roi for "
-            "the delay) before trusting a setting; a filter on an instant panel makes pans worse, not better, and the "
-            "wrong MODE flashes at every handoff (mode 2 only if the halo step overshoots). temporal_mode 3 = the "
+            "FALD compensation layer: LED lag. temporal_mode 0 = off (the stateless layer, byte for byte), 3 = the "
             "MEASURED law, 'panel clock' (EXPERIMENT, work guide C13, 2026-09-20; reference dlc/fald/paneltime.py): the "
             "dimming engine samples and holds at half the refresh rate — at a tick every zone closes `closure` (0.05..1, "
             "default 0.72) of the gap to the drive of the frame one refresh earlier, the panel's compensation follows one "
             "refresh later; `parity` = which refresh it ticks on: -1 unknown (default: both clocks, their mean flash / dip "
-            "correction clamped to 10 % of the LED estimate — 2026-10-23), 0 / 1 known (experimental — the "
-            "wrong one is as bad as no time law), -2 unknown with the PLAIN mean of both clocks (the combination before "
-            "2026-10-23; a test value for the blind A/B, never saved: the INI keeps -1). tau / delay are not used by mode 3; "
-            "settle_frames_60hz is then its settle hold in elapsed refreshes (closure 0.72 -> 14, capped at 120).",
+            "correction clamped to 10 % of the LED estimate — 2026-10-23), 0 / 1 known (experimental — the wrong one is "
+            "as bad as no time law). The layer keeps re-running its passes on a static desktop until the clocks settle; "
+            "settle_frames_60hz = that hold in elapsed refreshes (closure 0.72 -> 14, capped at 120; 0 when off). "
+            "Persisted per mode (= the GUI 'LED lag' row, which sets both modes). At least one of the three. The "
+            "first-order modes 1 / 2 (with tau_rise_ms / tau_fall_ms / delay_frames) and the plain-mean parity -2 were "
+            "removed 2026-11-12: a request that sends one is refused.",
             {
                 "monitor": _monitor_param(),
                 "mode": _mode_param(),
-                "temporal_mode": ApiParamSpec("number", required=False, description="0 | 1 | 2 | 3"),
-                "tau_rise_ms": ApiParamSpec("number", required=False, description="0..5000"),
-                "tau_fall_ms": ApiParamSpec("number", required=False, description="0..5000"),
-                "delay_frames": ApiParamSpec("number", required=False, description="0..3"),
+                "temporal_mode": ApiParamSpec("number", required=False, description="0 | 3"),
                 "closure": ApiParamSpec("number", required=False, description="0.05..1 (temporal_mode 3)"),
-                "parity": ApiParamSpec("number", required=False, description="-1 | 0 | 1 | -2 (temporal_mode 3; -2 = test value)"),
+                "parity": ApiParamSpec("number", required=False, description="-1 | 0 | 1 (temporal_mode 3)"),
             },
-            {"monitor_mode": "string", "temporal_mode": "number", "tau_rise_ms": "number", "tau_fall_ms": "number",
-             "delay_frames": "number", "closure": "number", "parity": "number", "settle_frames_60hz": "number"},
+            {"monitor_mode": "string", "temporal_mode": "number", "closure": "number", "parity": "number",
+             "settle_frames_60hz": "number"},
             mutates_state=True,
             gui_thread_required=True,
         ),
@@ -568,41 +550,6 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
             {"monitor_mode": "string", "enabled": "boolean", "even": "number", "target_gain": "number", "target_sigma": "number", "keep_nits": "number",
              "even_reach": "number", "cap_nits": "number", "strength": "number", "area_lo": "number", "area_hi": "number",
              "peak_hi": "number", "reach": "number", "nb_lo": "number", "nb_hi": "number"},
-            mutates_state=True,
-            gui_thread_required=True,
-        ),
-        ApiMethodSpec(
-            "runtime.fald_core_mode",
-            "FALD compensation layer: the always-on core's rule (shared/fald_core_mode.h): 4 = KC5 (round 5: C's fill with a "
-            "brightening cap away from knee-bound pixels + alpha below 2 nit; THE DEFAULT — the 2026-10-23 fill re-run and "
-            "live blind test), 0 = C (the 2026-10-22 layer bit for bit), 1 = KC2c (round 2: alpha + the zone deficit + a zone "
-            "IIR) and 2 = KC3 (round 3: alpha + the fine-grid deficit) — test modes for A/B checks; 3 reserved (KC4), refused "
-            "until it lands. Runtime only, never saved (INI <mode>_FaldCoreModeTest sets the start value; absent = the "
-            "default); reported as fald_core_mode / fald_core_mode_name in state.get. The live blind kits and the bench set it "
-            "per block / configuration.",
-            {
-                "monitor": _monitor_param(),
-                "mode": _mode_param(),
-                "core": ApiParamSpec("number", description="0, 1, 2 or 4"),
-            },
-            {"monitor_mode": "string", "core": "number"},
-            mutates_state=True,
-            gui_thread_required=True,
-        ),
-        ApiMethodSpec(
-            "runtime.fald_flank_fade",
-            "FALD compensation layer: the frozen fade stack ASF10 + T11_TMTC (frozen 2026-10-19; default off until the "
-            "owner's hardware gates pass; shared/fald_fade.h, float32 twin dlc/fald/fadeemu.py, brief "
-            "results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md): the correction fades toward 'layer off' on smooth steep "
-            "flanks, low-passed over content frames along the content's motion, kept on lit floors outside the soft knee's "
-            "reach. Persisted per mode (INI <mode>_FaldFlankFade); reported as fald_flank_fade in state.get. Item L "
-            "(fald_low_ext) is reserved and has no setter.",
-            {
-                "monitor": _monitor_param(),
-                "mode": _mode_param(),
-                "enabled": ApiParamSpec("boolean", description="the switch (default false)"),
-            },
-            {"monitor_mode": "string", "enabled": "boolean"},
             mutates_state=True,
             gui_thread_required=True,
         ),

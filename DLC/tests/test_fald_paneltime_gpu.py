@@ -190,46 +190,45 @@ def test_cpp_and_hlsl_carry_the_same_law():
     assert "run.clock = FaldPanelClockPlan(seeded, r->clkElapsed);" in begin
     # bindMaps: the real-spread kernel reads the clock's B_true map (driveFiltTex), the estimate kernel its B_est map
     assert "if (run.clock.bindMaps) { run.trueMap = FALD_MAP_FILTERED; run.estMap = FALD_MAP_CLOCK_EST; }" in begin
-    assert "FaldSettleAccount(r, newContent || run.resumed, settle, run.panel);" in end and "settleLeft--" not in end
+    assert "FaldSettleAccount(r, newContent || run.resumed, FaldPanelClockSettleFrames(r->clkClosure));" in end
+    assert "settleLeft--" not in end
     run = cpp[cpp.index("void FaldRunPasses("):]
     assert "const FaldTemporalRun trun = FaldTemporalBeginRun(r, ts, clockOk," in run and "const FaldClockPlan plan = trun.clock;" in run
     assert run.count("RunPanelClock(r, partial);") == 1 and run.index("if (plan.runPass) RunPanelClock(r, partial);") < run.index("RunStat(r, 0);")
-    # (2026-10-22: the maps per round — round 0 has its own instantaneous / filtered maps for the modes 1 / 2 temporal pass,
-    # which runs per round; the panel clock runs ONCE per run and both rounds read its two maps: the B_true map in the
-    # round-1 filtered slot (the dump's fald_drive_filt.f32, as on main) — mapSrv's clockMaps — and the est map. The
-    # evening of 2026-10-22: the clock pass wrote round 0's slot while round 1's convolution read round 1's, a map nothing
-    # writes in mode 3: the owner's over-brightened / shadowed areas in panel-clock mode. Pinned here, both hosts.)
-    assert "return m == FALD_MAP_FILTERED ? ((round || clockMaps) ? r->driveFiltSRV : r->driveFilt0SRV)" in run
+    # (2026-10-22: the panel clock runs ONCE per run and both rounds read its two maps: the B_true map in the round-1
+    # filtered slot (the dump's fald_drive_filt.f32, as on main) and the est map. The evening of 2026-10-22: a branch's clock
+    # pass wrote a round-0 slot while round 1's convolution read round 1's, a map nothing writes in mode 3: the owner's
+    # over-brightened / shadowed areas in panel-clock mode. Pinned here, both hosts. The round-0 filtered slot itself went
+    # with LED lag modes 1 / 2, 2026-11-12.)
+    assert "return m == FALD_MAP_FILTERED ? r->driveFiltSRV" in run and "driveFilt0" not in cpp
     assert ": (m == FALD_MAP_CLOCK_EST ? r->clkEstSRV : (round ? r->driveSRV : r->drive0SRV));" in run
-    assert "RunConv(r, mapSrv(trun.trueMap, 0, panel), mapSrv(trun.estMap, 0, panel), r->boostSRV[0], 0, partial);" in run
-    assert "RunConv(r, mapSrv(trun.trueMap, 1, panel), mapSrv(trun.estMap, 1, panel), r->boostSRV[1], 1, partial);" in run and run.count("clkEstSRV") == 1
+    assert "RunConv(r, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), r->boostSRV[0], 0, partial);" in run
+    assert "RunConv(r, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), r->boostSRV[1], 1, partial);" in run and run.count("clkEstSRV") == 1
     clock = cpp[cpp.index("static void RunPanelClock(FaldResources* r, bool partial)"):cpp.index("// trueDrive / estDrive:")]
     assert "{ r->driveFiltUAV, r->clkEstUAV, r->clkStateUAV[0], r->clkStateUAV[1], nullptr, r->changeFlagsUAV }" in clock
-    assert "driveFilt0UAV" not in clock
     # a run whose kernel map routing differs from the previous run's (a seeding run reads the drives, the clock run after
     # it the clock's maps) takes the full path: the GPU compares each map with its own previous value only
     assert "if (partial && (trun.trueMap != r->lastTrueMap || trun.estMap != r->lastEstMap)) partial = false;" in run
     assert "r->lastTrueMap = trun.trueMap; r->lastEstMap = trun.estMap;" in run
     assert run.index("RunStat(r, 1);") < run.index("if (plan.commitPrev) g_context->CopyResource(r->clkPrevTex, r->driveTex);")
     assert run.count("CopyResource(r->clkPrevTex") == 1 and run.count("plan.seedStates") == 1
-    assert "FaldTemporalEndRun(r, trun, ts, newContent);" in run and "settleLeft--" not in run
+    assert "FaldTemporalEndRun(r, trun, newContent);" in run and "settleLeft--" not in run
     # ... and the DWM hook executes the same plan from the same shared code
     hook = _HOOK.read_text(encoding="utf-8")
     hrun = hook[hook.index("bool FaldRun("):]
     assert "const FaldTemporalRun trun = FaldTemporalBeginRun(m, m->tempSettings, clockOk," in hrun
     assert hrun.count("RunPanelClock(m, partial);") == 1 and hrun.index("if (trun.clock.runPass) RunPanelClock(m, partial);") < hrun.index("RunStat(m, 0);")
-    assert "return k == FALD_MAP_FILTERED ? ((round || clockMaps) ? m->driveFiltSRV : m->driveFilt0SRV)" in hrun
+    assert "return k == FALD_MAP_FILTERED ? m->driveFiltSRV" in hrun and "driveFilt0" not in hook
     assert ": (k == FALD_MAP_CLOCK_EST ? m->clkEstSRV : (round ? m->driveSRV : m->drive0SRV));" in hrun
-    assert "RunConv(m, mapSrv(trun.trueMap, 0, trun.panel), mapSrv(trun.estMap, 0, trun.panel), m->boostSRV[0], 0, partial);" in hrun
-    assert "RunConv(m, mapSrv(trun.trueMap, 1, trun.panel), mapSrv(trun.estMap, 1, trun.panel), m->boostSRV[1], 1, partial);" in hrun and hrun.count("clkEstSRV") == 1
+    assert "RunConv(m, mapSrv(trun.trueMap, 0), mapSrv(trun.estMap, 0), m->boostSRV[0], 0, partial);" in hrun
+    assert "RunConv(m, mapSrv(trun.trueMap, 1), mapSrv(trun.estMap, 1), m->boostSRV[1], 1, partial);" in hrun and hrun.count("clkEstSRV") == 1
     hclock = hook[hook.index("static void RunPanelClock(FaldMonitor* m, bool partial)"):hook.index("// Starfield balancing, mirror of src/fald.cpp RunStar")]
     assert "{ m->driveFiltUAV, m->clkEstUAV, m->clkStateUAV[0], m->clkStateUAV[1], nullptr, m->changeFlagsUAV }" in hclock
-    assert "driveFilt0UAV" not in hclock
     assert "if (partial && (trun.trueMap != m->lastTrueMap || trun.estMap != m->lastEstMap)) partial = false;" in hrun
     assert "m->lastTrueMap = trun.trueMap; m->lastEstMap = trun.estMap;" in hrun
     assert hrun.index("RunStat(m, 1);") < hrun.index("if (trun.clock.commitPrev) g_ctx->CopyResource(m->clkPrevTex, m->driveTex);")
     assert hrun.count("CopyResource(m->clkPrevTex") == 1 and hrun.count("clock.seedStates") == 1
-    assert "FaldTemporalEndRun(m, trun, m->tempSettings, newContent);" in hrun and "settleLeft--" not in hrun
+    assert "FaldTemporalEndRun(m, trun, newContent);" in hrun and "settleLeft--" not in hrun
     from dlc.fald.paneltime import LOCK_GAIN
     assert num("FALD_CLOCK_LOCK_GAIN") == LOCK_GAIN
     # the pass: one blend per clock toward the previous frame's drives, the weighted maps, the states advanced in place
@@ -238,22 +237,20 @@ def test_cpp_and_hlsl_carry_the_same_law():
                  "float e0 = s0 + clkEst0 * g0, e1 = s1 + clkEst1 * g1;", "float oEst = clkW0 * e0 + clkW1 * e1;",
                  "clkState0[id.xy] = t0; clkState1[id.xy] = t1;"):
         assert line in body, line
-    # unknown parity (both weights > 0): the clamped mean transient (gpuemu.clock_robust_true32); FALD_CLOCK_MEAN and known
-    # parity: the plain weighted mean (the pre-2026-10-23 arithmetic)
-    mean_v, robust_v = body.split("#ifdef FALD_CLOCK_MEAN")[1].split("#else")
-    assert "float oTrue = clkW0 * t0 + clkW1 * t1;" in mean_v
-    assert "float tr = clkW0 * (t0 - e0) + clkW1 * (t1 - e1), lim = FALD_CLOCK_ROBUST_CAP * oEst;" in robust_v
-    assert "float oTrue = (clkW0 > 0.0f && clkW1 > 0.0f) ? oEst + min(max(tr, -lim), lim) : clkW0 * t0 + clkW1 * t1;" in robust_v
+    # unknown parity (both weights > 0): the clamped mean transient (gpuemu.clock_robust_true32); known parity: the plain
+    # weighted mean. (The plain-mean VARIANT for the A/B's parity -2 — FALD_CLOCK_MEAN — went 2026-11-12: the robust
+    # combination won the owner's 2026-10-24 blind A/B; dlc.fald.paneltime keeps PARITY_MEAN as the research model.)
+    assert "FALD_CLOCK_MEAN" not in body
+    assert "float tr = clkW0 * (t0 - e0) + clkW1 * (t1 - e1), lim = FALD_CLOCK_ROBUST_CAP * oEst;" in body
+    assert "float oTrue = (clkW0 > 0.0f && clkW1 > 0.0f) ? oEst + min(max(tr, -lim), lim) : clkW0 * t0 + clkW1 * t1;" in body
     from dlc.fald.paneltime import ROBUST_CAP
     hl = lambda name: float(re.search(r"static const float " + name + r" = ([\d.]+)f;", body).group(1))
     assert hl("FALD_CLOCK_ROBUST_CAP") == ROBUST_CAP and num("FALD_CLOCK_ROBUST_CAP") == ROBUST_CAP
-    assert num("FALD_CLOCK_PARITY_MEAN") == -2 and 'g_faldClockMeanDefine = "#define FALD_CLOCK_MEAN 1' in sh
-    # both hosts dispatch the plain-mean variant for the A/B's parity code only
-    assert "(r->clkParity == FALD_CLOCK_PARITY_MEAN && g_faldPanelClockMeanCS) ? g_faldPanelClockMeanCS : g_faldPanelClockCS" in cpp
-    assert "(m->clkParity == FALD_CLOCK_PARITY_MEAN && g_clockMeanCS) ? g_clockMeanCS : g_clockCS" in hook
-    # the first-order pass is untouched by the new mode
-    old = re.search(r'g_faldTemporalSource = R"\((.*?)\)";', sh, re.S).group(1)
-    assert "clk" not in old and "float a = (d > s) ? tempAlphaRise : tempAlphaFall;" in old
+    assert "FALD_CLOCK_PARITY_MEAN" not in sh and "g_faldClockMeanDefine" not in sh
+    # both hosts dispatch the one pass (no plain-mean variant, no first-order pass 1b)
+    assert "g_context->CSSetShader(g_faldPanelClockCS, nullptr, 0);" in cpp and "PanelClockMean" not in cpp
+    assert "g_ctx->CSSetShader(g_clockCS, nullptr, 0);" in hook and "g_clockMeanCS" not in hook
+    assert "g_faldTemporalSource" not in sh
     # FillCB puts the six words where the HLSL declares them (test_fald_transfer holds the offsets against the compiler)
     for src, v in ((cpp, "r"), (hook, "m")):
         assert f"f[66] = {v}->clkW[0]; f[67] = {v}->clkW[1];" in src

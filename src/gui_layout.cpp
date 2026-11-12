@@ -741,15 +741,11 @@ void CreateGUILayout(HWND hwnd) {
         innerX + 205, faldY, 140, h, panel2, (HMENU)ID_CORR_FALD_PEDMODE, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldPedMode);
 
-    // Row 4: temporal drive state ("LED lag", 2026-09-17, DLC work guide H5 / item 4a): the shader's per-cell first-order
-    // filter with rise/fall time constants, so a cell handoff during a pan crossfades instead of snapping. Off = the
-    // stateless layer. The panel's LED law has since been MEASURED (2026-09-19/20) and is NOT this first-order filter
-    // (modes 1 / 2 rejected as the law; see "Panel clock" below) — the row stays as the owner's live A/B control; a
-    // filter that does not match the panel makes pans worse. Applies to both modes like View (fald.h FALD_TEMPORAL_*, dlc/fald/temporal.py).
-    // "Panel clock" (mode 3, EXPERIMENT, work guide C13) = the law the phone camera measured 2026-09-19/20 (LEDs sampled
-    // and held at half the refresh rate, the panel's compensation one refresh later; dlc/fald/paneltime.py): with it the
-    // row shows closure (share of the LED gap closed per tick) + parity (which refresh the engine ticks on; unknown =
-    // the mean of both) IN PLACE of rise / fall / delay — gui.cpp ShowFaldTemporalRow switches the two sets.
+    // Row 4: LED lag (shared/fald_temporal.h): Off = the stateless layer; "Panel clock" (mode 3, EXPERIMENT, work guide
+    // C13) = the law the phone camera measured 2026-09-19/20 (LEDs sampled and held at half the refresh rate, the panel's
+    // compensation one refresh later; dlc/fald/paneltime.py): the row then shows closure (share of the LED gap closed per
+    // tick) + parity (which refresh the engine ticks on; unknown = both clocks, robust) — gui.cpp ShowFaldTemporalRow.
+    // Applies to both modes like View. (The first-order filter, modes 1 / 2, was removed 2026-11-12.)
     int faldTY = innerY + 99;
     ctrl = CreateWindow(L"STATIC", L"LED lag:", WS_CHILD, innerX + 10, faldTY + 2, 46, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(ctrl);
@@ -757,31 +753,10 @@ void CreateGUILayout(HWND hwnd) {
         WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
         innerX + 58, faldTY, 118, 100, panel2, (HMENU)ID_CORR_FALD_TEMPORAL, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldTemporal);
-    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Off (stateless)");
-    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"LEDs + estimate lag");
-    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"LEDs lag only");
-    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Panel clock");
+    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Off (stateless)");   // index 0 = mode 0
+    SendMessage(g_gui.hwndFaldTemporal, CB_ADDSTRING, 0, (LPARAM)L"Panel clock");       // index 1 = mode 3
     SendMessage(g_gui.hwndFaldTemporal, CB_SETCURSEL, 0, 0);
-    ctrl = CreateWindow(L"STATIC", L"rise ms", WS_CHILD, innerX + 182, faldTY + 2, 44, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldTauRiseLabel = ctrl;
-    g_gui.hwndFaldTauRise = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
-        innerX + 228, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_TAU_RISE, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldTauRise);
-    ctrl = CreateWindow(L"STATIC", L"fall ms", WS_CHILD, innerX + 272, faldTY + 2, 42, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldTauFallLabel = ctrl;
-    g_gui.hwndFaldTauFall = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
-        innerX + 316, faldTY, 38, h, panel2, (HMENU)ID_CORR_FALD_TAU_FALL, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldTauFall);
-    // pipeline delay in frames (0..3): the law a first-order filter cannot represent (design review 2026-09-17)
-    ctrl = CreateWindow(L"STATIC", L"delay", WS_CHILD, innerX + 360, faldTY + 2, 34, h, panel2, nullptr, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(ctrl);
-    g_gui.hwndFaldDelayLabel = ctrl;
-    g_gui.hwndFaldDelay = CreateWindow(L"EDIT", L"0", WS_CHILD | WS_BORDER | ES_RIGHT,
-        innerX + 396, faldTY, 30, h, panel2, (HMENU)ID_CORR_FALD_DELAY, nullptr, nullptr);
-    g_gui.tab2Controls.push_back(g_gui.hwndFaldDelay);
-    // the "Panel clock" set, on the same spot (hidden until the mode is selected)
+    // the "Panel clock" set (hidden until the mode is selected)
     g_gui.hwndFaldClosureLabel = CreateWindow(L"STATIC", L"closure", WS_CHILD, innerX + 182, faldTY + 2, 44, h, panel2, nullptr, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldClosureLabel);
     g_gui.hwndFaldClosure = CreateWindow(L"EDIT", L"0.72", WS_CHILD | WS_BORDER | ES_RIGHT,
@@ -837,25 +812,12 @@ void CreateGUILayout(HWND hwnd) {
     g_gui.hwndFaldStarReach = CreateWindow(L"EDIT", L"8", WS_CHILD | WS_BORDER | ES_RIGHT,
         innerX + 250, faldS2Y, 30, h, panel2, (HMENU)ID_CORR_FALD_STAR_REACH, nullptr, nullptr);
     g_gui.tab2Controls.push_back(g_gui.hwndFaldStarReach);
-    // Flank fade (2026-10-20, the frozen fade stack ASF10 + T11_TMTC; shared/fald_fade.h, brief
-    // DLC/results/fald_nearfield_2026-10-17/r11/PORT_PLAN.md): the correction fades toward "layer off" on smooth steep
-    // flanks, low-passed along the content's motion. Applies to both modes like View. Default off until the owner's
-    // hardware gates pass. On the second starfield row's free right end: no new row, the group keeps its height.
-    // HIDDEN since 3.0 (the owner's call: the always-on core is the product, the fade a heavy experiment): the
-    // control exists (the handlers read it) but is not in the tab's list, so it never shows. The fade is still
-    // reachable by the INI (<mode>_FaldFlankFade) and the pipe (runtime.fald_flank_fade).
-    g_gui.hwndFaldFlankFade = CreateWindow(L"BUTTON", L"Flank fade",
-        WS_CHILD | BS_AUTOCHECKBOX,
-        innerX + 300, faldS2Y, 90, h, panel2, (HMENU)ID_CORR_FALD_FLANK_FADE, nullptr, nullptr);
 
     g_gui.contentHeight[2] = innerY + 180 + 8;  // Tonemapping + Windows tone map (HDR) + FALD (HDR + SDR/ACM + View + LED-lag + 2 Starfield rows)
 
     // Apply Enter key handling to numeric edit boxes
     SetNumericEdit(g_gui.hwndTonemapTarget, 0);
     SetNumericEdit(g_gui.hwndTonemapSource, 0);
-    SetNumericEdit(g_gui.hwndFaldTauRise, 1);
-    SetNumericEdit(g_gui.hwndFaldTauFall, 1);
-    SetNumericEdit(g_gui.hwndFaldDelay, 0);
     SetNumericEdit(g_gui.hwndFaldClosure, 2);
     SetNumericEdit(g_gui.hwndFaldStarEven, 2);
     SetNumericEdit(g_gui.hwndFaldStarKeep, 1);
@@ -989,8 +951,7 @@ void CreateGUILayout(HWND hwnd) {
     for (HWND hCtrl : g_gui.tab1Controls) ShowWindow(hCtrl, SW_SHOW);
     for (HWND hCtrl : g_gui.tab2Controls) ShowWindow(hCtrl, SW_SHOW);
     for (HWND hCtrl : g_gui.tab3Controls) ShowWindow(hCtrl, SW_SHOW);
-    // FALD LED-lag row: the "Panel clock" set shares its spot with rise / fall / delay and starts hidden
-    // (gui.cpp ShowFaldTemporalRow shows the set of the selected mode)
+    // FALD LED-lag row: the "Panel clock" set starts hidden (gui.cpp ShowFaldTemporalRow shows it in that mode)
     for (HWND hCtrl : { g_gui.hwndFaldClosureLabel, g_gui.hwndFaldClosure, g_gui.hwndFaldParityLabel, g_gui.hwndFaldParity })
         ShowWindow(hCtrl, SW_HIDE);
 

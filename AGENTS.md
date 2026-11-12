@@ -94,8 +94,6 @@ refresh-rate trim, the readers for DLC's files, the interface model, and the sha
     must match a frozen copy of the older shader (`tests/fald_shader_legacy.h`).
   - The overlay and the hook must produce the same bytes for the same FALD input (the hook code compiles into the
     test exe behind `DLUT_HOOK_TESTING`).
-  - The flank-fade shaders ship as bytecode (`shared/fald_fade_bytecode.h`). The test fails while the header is
-    stale; regenerate it with `FALD_TEST_FADE_WRITE_BYTECODE=<path of that header>` and rebuild.
   - MHC profiles are hashed against frozen values (`tests/test_mhc_golden.cpp`): a bake change that is meant to be
     neutral must leave every profile byte for byte the same.
   A gate that fails is a finding, not a tolerance to widen.
@@ -298,13 +296,11 @@ pre-corrects each pixel. A per-panel file, fitted with DLC, carries every panel-
   limited next to bright objects) and which rule is the default.
 - `shared/fald_change.*`: the change-driven path. A present that touches few zones recomputes only those, and the GPU
   decides which later passes must run. It must give the full run's fields bit for bit.
-- `shared/fald_core_governor.*`, `shared/fald_fade_governor.*`: GPU budgets. The core's full run is rate-capped when
-  it costs more than 15 % of the refresh interval; the flank fade is paused when it is over its budget, and never
-  starts on an integrated GPU. Both report through `src/fald_*_status.*` (the FALD panel's GPU / PAUSED readouts,
-  `state.get`).
+- `shared/fald_core_governor.*`: the GPU budget. The core's full run is rate-capped when it costs more than 15 % of the
+  refresh interval. It reports through `src/fald_core_status.*` (the FALD panel's GPU readout, `state.get`).
 - `shared/fald_conv_tune.*`: times the convolution's byte-identical variants once per GPU and lattice and keeps the
   fastest (cached in `DesktopLUT_fald_conv_tune.txt`).
-- `shared/fald_temporal.*` (LED lag), `shared/fald_fade*` (flank fade, shipped as bytecode),
+- `shared/fald_temporal.*` (LED lag: off or the panel clock),
   `shared/fald_panel_live.*` (handing a new panel file to a resident hook without re-injection),
   `shared/fald_exempt.h` (DesktopLUT's own windows keep the corrected picture while a FALD view is on).
 - Runs on FP16 back buffers only: HDR and ACM SDR, never legacy SDR. Each mode has its own file.
@@ -312,10 +308,10 @@ pre-corrects each pixel. A per-panel file, fitted with DLC, carries every panel-
   - With a feature off, output is bit-identical to the layer without it.
   - The overlay and hook paths stay byte-identical.
   - A speed-up is exact (bit for bit) unless a frozen tolerance says otherwise.
-  - DLC's Python twins (`gpuemu.py`, `core2emu.py`, `fadeemu.py`) are the reference for the GPU code.
+  - DLC's Python twins (`gpuemu.py`, `core2emu.py`) are the reference for the GPU code.
   - The core must be cheap enough to stay on all day on an ordinary GPU. Do not add a heavy opt-in to fix an
-    artefact; fix the core's rule. The flank fade and the starfield option are experimental and off by default; the flank fade has no control in
-    either window (INI or pipe only).
+    artefact; fix the core's rule (the flank fade, a heavy opt-in, was removed for that reason; its code is under the
+    git tag `archive/fald-flank-fade`). The starfield option and LED lag are experimental and off by default.
   - Calibrate with the layer off. The layer refuses a display whose routing is a guess.
 - DLC side: `DLC/src/dlc/fald/` (model, fit, export, profile flow `python -m dlc.stages.fald_profile`).
 

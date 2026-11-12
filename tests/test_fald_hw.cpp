@@ -1,8 +1,8 @@
-// GPU timing of the FALD layer with and without the flank fade on a HARDWARE D3D11 device (standalone: its own device, no
-// DWM, no DesktopLUT running), per run of the layer: content frames (new content each run), runs without new content on
-// the same frame (a desktop's presents between content frames), and the first content frame with the fade on (the
-// paced build's last run). Every run's output is hashed (FNV-1a 64), so two builds' outputs on the same device can be
-// compared bit for bit. It compiles against main's fade too (the frame key / governor only where the build has them).
+// GPU timing of the FALD layer on a HARDWARE D3D11 device (standalone: its own device, no DWM, no DesktopLUT running),
+// with the always-on core off (C) and on (KC5, the default), per run of the layer: content frames (new content each run)
+// and runs without new content on the same frame (a desktop's presents between content frames). Every run's output is
+// hashed (FNV-1a 64), so two builds' outputs on the same device can be compared bit for bit. (Until 2026-11-12 this was
+// tests/test_fald_fade_hw.cpp and timed the flank fade too: tag archive/fald-flank-fade.)
 // Opt-in: FALD_HW_DIR = a directory with n7_lamp.rgba16f + s10_sm_seattle.rgba16f (3840 x 2160), x_frac2560.rgba16f +
 // frac_panel_48x24.bin (2560 x 1440), hw1080_n7.rgba16f + hw1080_seattle.rgba16f + panel_1080p.bin (1920 x 1080);
 // FALD_HW_OUT = the output directory (runs.csv); FALD_HW_N = content / still runs per case (default 30); FALD_HW_ONLY =
@@ -14,7 +14,6 @@
 #include "../src/types.h"
 #include "../src/globals.h"
 #include "../shared/fald_shader.h"
-#include "../shared/fald_fade.h"
 #include "../shared/fald_change.h"
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
@@ -95,7 +94,7 @@ struct HwDev {
 
 // The GPU's clock: an idle RTX 5090 runs its SM at a few hundred MHz and needs load to boost, so a run of the layer
 // after the harness's own gaps (upload, readback, hashing, sleeps) would be timed at whatever clock the gap left — a
-// first fade frame at 80 ms or at 6 ms for the same work. Before each timed run the heater keeps the GPU busy for
+// first frame at 80 ms or at 6 ms for the same work. Before each timed run the heater keeps the GPU busy for
 // FALD_HW_HEAT_MS (default 12; 0 = off) in ~2 ms batches of integer ALU work (no memory traffic), each flushed alone.
 struct HwHeater {
     ID3D11ComputeShader* cs = nullptr;
@@ -160,7 +159,7 @@ RWStructuredBuffer<uint> o : register(u0);
     ~HwHeater() { for (IUnknown* p : { (IUnknown*)cs, (IUnknown*)uav, (IUnknown*)buf, (IUnknown*)cb }) if (p) p->Release(); }
 };
 
-// A ring of timestamp pairs around passes (the fade's kernels or the core's passes): summed per kernel over the frames
+// A ring of timestamp pairs around the layer's passes: summed per kernel over the frames
 // collected -> a CSV (the timestamps serialise the passes a little: shares, not a frame time).
 struct HwStampRing {
     static const int kMax = 1024;
@@ -220,18 +219,9 @@ struct HwStampRing {
     }
 };
 
-#ifdef FALD_FADE_HAS_PASS_HOOK
-// FALD_HW_PROFILE=1: a timestamp before and after every fade pass of the timed content frames (fade on), summed per
-// kernel -> <out>/profile_<case>.csv.
-struct HwProfiler : FaldFadePassHook, HwStampRing {
-    explicit HwProfiler(ID3D11Device* dev) : HwStampRing(dev, FaldFadeKernelCount(), FaldFadeKernelName) {}
-    void Before(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::Before(ctx, k); }
-    void After(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::After(ctx, k); }
-};
-#endif
 #ifdef FALD_CORE_HAS_PASS_HOOK
-// FALD_HW_PROFILE_CORE=1: the same around every pass of the layer itself (src/fald.h FaldCorePass), for the content
-// AND the still runs, fade off and on -> <out>/profile_core_<case>_fade<f>_<phase>.csv.
+// FALD_HW_PROFILE_CORE=1: a timestamp before and after every pass of the layer (src/fald.h FaldCorePass), for the content
+// AND the still runs, the core off and on -> <out>/profile_core_<case>_core<c>_<phase>.csv.
 struct HwCoreProfiler : FaldCorePassHook, HwStampRing {
     explicit HwCoreProfiler(ID3D11Device* dev) : HwStampRing(dev, FALD_PASS_COUNT, FaldCorePassName) {}
     void Before(ID3D11DeviceContext* ctx, unsigned int k) override { HwStampRing::Before(ctx, k); }
@@ -275,10 +265,8 @@ struct HwCase { std::string id; std::wstring panel; std::vector<std::string> fra
 
 }  // namespace
 
-TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content / no new content (FALD_HW_DIR + FALD_HW_OUT)") {
+TEST_CASE("FALD HW: GPU time per run of the layer, the core off / on, content / no new content (FALD_HW_DIR + FALD_HW_OUT)") {
     const std::string dir = HwEnv("FALD_HW_DIR"), out = HwEnv("FALD_HW_OUT"), only = HwEnv("FALD_HW_ONLY");
-    const std::string core2Sel = HwEnv("FALD_HW_CORE2");   // the always-on core (1 KC2c / 2 KC3 / 4 KC5) against C instead of the fade
-    const bool core2Mode = core2Sel == "1" || core2Sel == "2" || core2Sel == "4";
     if (dir.empty() || out.empty()) return;
     const int n = std::max(4, atoi(HwEnv("FALD_HW_N").empty() ? "30" : HwEnv("FALD_HW_N").c_str()));
     CreateDirectoryA(out.c_str(), nullptr);
@@ -292,20 +280,14 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
     HwHeater heater(hw);
     if (heatMs > 0.0) REQUIRE(heater.ok);
     MESSAGE("heater: " << heatMs << " ms before each run, " << heater.iters << " iterations a batch; hash every " << hashEvery);
-#ifdef FALD_FADE_HAS_PASS_HOOK
-    const bool profile = HwEnv("FALD_HW_PROFILE") == "1";
-    HwProfiler prof(hw.dev);
-    if (profile) g_faldFadePassHook = &prof;
-    struct ClearHook { ~ClearHook() { g_faldFadePassHook = nullptr; } } clearHook;
-#endif
 #ifdef FALD_CORE_HAS_PASS_HOOK
     const bool profileCore = HwEnv("FALD_HW_PROFILE_CORE") == "1";
     HwCoreProfiler coreProf(hw.dev);
     if (profileCore) g_faldCorePassHook = &coreProf;
     struct ClearCoreHook { ~ClearCoreHook() { g_faldCorePassHook = nullptr; } } clearCoreHook;
 #endif
-    // FALD_HW_FADE = 0 / 1: only that setting of the flank fade (default: off then on)
-    const std::string fadeSel = HwEnv("FALD_HW_FADE");
+    // FALD_HW_CORE = 0 / 1: only the core off (C) / on (KC5) (default: off then on)
+    const std::string coreSel = HwEnv("FALD_HW_CORE");
     // FALD_HW_CONV_SO = 1 / 2 / 4 / 8: the conv pass's sub-offsets-per-thread variant (default: the hosts' policy)
     {
         const std::string so = HwEnv("FALD_HW_CONV_SO");
@@ -320,7 +302,7 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
         { "1440p", widen(dir + "/frac_panel_48x24.bin"), { "x_frac2560" }, 2560, 1440 },
         { "1080p", widen(dir + "/panel_1080p.bin"), { "hw1080_n7", "hw1080_seattle" }, 1920, 1080 } };
     std::ofstream csv(out + "/runs.csv");
-    csv << "case,fade,phase,run,new_content,gpu_us,out_fnv,fade_gov_us\n";
+    csv << "case,core,phase,run,new_content,gpu_us,out_fnv\n";
     bool stop = false;
     for (const HwCase& hc : cases) {
         if (stop) break;
@@ -331,27 +313,21 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
             REQUIRE_MESSAGE(HwReadFrame(dir + "/" + f + ".rgba16f", hc.w, hc.h, v), f);
             frames.push_back(std::move(v));
         }
-        if (frames.size() == 1) {   // a second content frame: the first mirrored (a cut every frame: the T path's worst)
+        if (frames.size() == 1) {   // a second content frame: the first mirrored (a cut every frame)
             std::vector<uint16_t> m(frames[0].size());
             for (int y = 0; y < hc.h; y++)
                 for (int x = 0; x < hc.w; x++)
                     for (int c = 0; c < 4; c++) m[((size_t)y * hc.w + x) * 4 + c] = frames[0][((size_t)y * hc.w + (hc.w - 1 - x)) * 4 + c];
             frames.push_back(std::move(m));
         }
-        for (int fade = 0; fade < 2 && !stop; fade++) {
-            if ((fadeSel == "0" && fade != 0) || (fadeSel == "1" && fade != 1)) continue;
+        for (int core = 0; core < 2 && !stop; core++) {
+            if ((coreSel == "0" && core != 0) || (coreSel == "1" && core != 1)) continue;
             MonitorContext ctx;
             ctx.width = hc.w; ctx.height = hc.h; ctx.isHDREnabled = true; ctx.isFP16SDR = false;
             ctx.swapchainFormat = DXGI_FORMAT_R16G16B16A16_FLOAT; ctx.frameTimeExactMs = 41.708f;   // a 23.976 Hz grid
             FaldSettings& fs = ctx.hdrColorCorrection.fald;
-            fs.enabled = true; fs.paramsPath = hc.panel; fs.star.enabled = true; fs.flankFade = fade != 0;
-            // the always-on core: FALD_HW_CORE2=1 / 2 / 4 makes the `fade` column KC2c / KC3 / KC5 against C (the fade off); else
-            // C throughout, so the fade rows read as they did whatever the product default (shared/fald_core_mode.h)
-            fs.coreMode = FALD_CORE_MODE_C;
-            if (core2Mode) {
-                fs.flankFade = false;
-                fs.coreMode = !fade ? FALD_CORE_MODE_C : (core2Sel == "4" ? FALD_CORE_MODE_KC5 : (core2Sel == "2" ? FALD_CORE_MODE_KC3 : FALD_CORE_MODE_KC2C));
-            }
+            fs.enabled = true; fs.paramsPath = hc.panel; fs.star.enabled = true;
+            fs.coreMode = core ? FALD_CORE_MODE_KC5 : FALD_CORE_MODE_C;   // shared/fald_core_mode.h
             REQUIRE(FaldEnsureResources(&ctx, fs));
             D3D11_TEXTURE2D_DESC td = {};
             td.Width = (UINT)hc.w; td.Height = (UINT)hc.h; td.MipLevels = 1; td.ArraySize = 1;
@@ -383,23 +359,11 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
                 if (heatMs > 0.0) heater.Heat(hw, heatMs);   // the clock up (queued ahead of the run's first timestamp)
                 hw.ic->Begin(hw.dj);
                 hw.ic->End(hw.q0);
-#ifdef FALD_FADE_HAS_PASS_HOOK
-                prof.on = profile && fade && std::strcmp(phase, "content") == 0;
-#endif
 #ifdef FALD_CORE_HAS_PASS_HOOK
                 coreProf.on = profileCore && (std::strcmp(phase, "content") == 0 || std::strcmp(phase, "still") == 0);
 #endif
-#ifdef FALD_RUN_HAS_FRAME_KEY
-                g_faldFadeForce.store(true);   // the governor measures but never pauses this harness
-#ifdef FALD_RUN_HAS_RECTS
                 FaldRunPasses(&ctx, rtv, newContent, key, rects ? rects->data() : nullptr, rects ? (int)rects->size() : -1);
                 if (ctx.fald->lastPartial) partialRuns++;
-#else
-                FaldRunPasses(&ctx, rtv, newContent, key);
-#endif
-#else
-                FaldRunPasses(&ctx, rtv, newContent);
-#endif
                 hw.ic->End(hw.q1);
                 hw.ic->End(hw.dj);
                 hw.ic->Flush();
@@ -413,56 +377,28 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
                 while (hw.ic->GetData(hw.q0, &a, 8, 0) != S_OK) {}
                 while (hw.ic->GetData(hw.q1, &b, 8, 0) != S_OK) {}
                 const double us = (!dj.Disjoint && dj.Frequency) ? (double)(b - a) * 1e6 / (double)dj.Frequency : -1.0;
-#ifdef FALD_FADE_HAS_PASS_HOOK
-                if (!dj.Disjoint && dj.Frequency) prof.Collect(hw.ic, dj.Frequency);
-                prof.on = false;
-#endif
 #ifdef FALD_CORE_HAS_PASS_HOOK
                 if (!dj.Disjoint && dj.Frequency) coreProf.Collect(hw.ic, dj.Frequency); else coreProf.n = 0;
                 coreProf.on = false;
 #endif
-                double gov = -1.0;
-#ifdef FALD_RUN_HAS_FRAME_KEY
-                if (ctx.fald->fade) {   // the governor's own measurement of this content frame (read later, without waiting)
-                    double s[4];
-                    const unsigned int k = FaldFadeCollectTiming(ctx.fald->fade, hw.ic, s, 4);
-                    if (k) gov = s[k - 1];
-                }
-#endif
                 char hb[32] = "-";
                 if (i % hashEvery == 0) snprintf(hb, sizeof(hb), "%016llx", (unsigned long long)HwFnvTex(target));
-                csv << hc.id << "," << fade << "," << phase << "," << i << "," << (newContent ? 1 : 0) << "," << us << "," << hb << ","
-                    << gov << "\n";
-                // A steady run over 45 ms stops everything (the owner's GPU rule: no batch over 50 ms). The paced build's
-                // runs only report it: the first content frame with the fade IS a measurement here (main eecda39's is ~51
-                // ms at 4K, once per case); anything over 100 ms stops all the same.
-                const bool build = std::strcmp(phase, "build") == 0;
-                if (us > (build ? 100000.0 : 45000.0)) {
-                    MESSAGE(hc.id << " " << phase << " run " << i << ": " << us << " us - stopping"); stop = true;
-                } else if (us > 45000.0) {
-                    MESSAGE(hc.id << " " << phase << " run " << i << ": " << us << " us (the paced build's last run: reported)");
-                }
+                csv << hc.id << "," << core << "," << phase << "," << i << "," << (newContent ? 1 : 0) << "," << us << "," << hb << "\n";
+                // a run over 45 ms stops everything (the owner's GPU rule: no batch over 50 ms)
+                if (us > 45000.0) { MESSAGE(hc.id << " " << phase << " run " << i << ": " << us << " us - stopping"); stop = true; }
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));   // the desktop gets the GPU between runs
                 return !stop;
             };
-            // the paced build (shaders, their warm-up, resources): content frames until the fade is on; the run that turns it
-            // on is the first content frame with the fade
-            int warm = 0;
-            for (; warm < 400 && !stop && ((fade && !core2Mode) ? !ctx.fald->fadeOn : warm < 4); warm++) run("build", warm, true);
-            if (fade && !core2Mode) {
-                CHECK(ctx.fald->fadeOn);
-                MESSAGE(hc.id << ": the fade on after " << warm << " runs, " << (FaldFadeVramBytes(ctx.fald->fade) >> 20) << " MB");
-            }
+            for (int i = 0; i < 4 && !stop; i++) run("build", i, true);   // the first runs: resources, the conv tune's start
             for (int i = 0; i < 4 && !stop; i++) run("warm", i, true);
             for (int i = 0; i < n && !stop; i++) run("content", i, true);
 #ifdef FALD_CORE_HAS_PASS_HOOK
             if (profileCore) {
-                coreProf.Write(out + "/profile_core_" + hc.id + "_fade" + std::to_string(fade) + "_content.csv");
+                coreProf.Write(out + "/profile_core_" + hc.id + "_core" + std::to_string(core) + "_content.csv");
                 coreProf.Reset();
             }
 #endif
             for (int i = 0; i < n && !stop; i++) run("still", i, false);
-#ifdef FALD_RUN_HAS_RECTS
             if (HwEnv("FALD_HW_PARTIAL") == "1" && !stop) {
                 // the frame of the last content run, edited inside a rect per phase; the first run of each phase is a full
                 // one (the state of the previous run has to be complete and the frame known), then the partial presents
@@ -493,26 +429,16 @@ TEST_CASE("FALD fade HW: GPU time per run of the layer, fade off / on, content /
                     MESSAGE(hc.id << " " << ph.name << ": " << partialRuns << " of " << n << " runs took the partial path");
                 }
             }
-#endif
 #ifdef FALD_CORE_HAS_PASS_HOOK
             if (profileCore) {
-                coreProf.Write(out + "/profile_core_" + hc.id + "_fade" + std::to_string(fade) + "_still.csv");
+                coreProf.Write(out + "/profile_core_" + hc.id + "_core" + std::to_string(core) + "_still.csv");
                 coreProf.Reset();
             }
 #endif
             csv.flush();
-#ifdef FALD_FADE_HAS_PASS_HOOK
-            if (profile && fade) {
-                prof.Write(out + "/profile_" + hc.id + ".csv");
-                prof.Reset();
-            }
-#endif
             rtv->Release(); target->Release();
             FaldReleaseResources(&ctx);
         }
     }
-#ifdef FALD_RUN_HAS_FRAME_KEY
-    g_faldFadeForce.store(false);
-#endif
     CHECK_FALSE(stop);
 }

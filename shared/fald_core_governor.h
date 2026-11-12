@@ -1,7 +1,7 @@
 // DesktopLUT - shared/fald_core_governor.h
 // The core FALD layer's rate-cap governor (2026-10-22, the owner's decision after the core-speed work): the layer's FULL
-// path (the zone statistics, the two convolutions, the gains, the pixel pass — everything but the flank fade, which has
-// its own governor, fald_fade_governor.h) costs GPU time on every present that changes enough (the change-driven path,
+// path (the zone statistics, the two convolutions, the gains, the pixel pass) costs GPU time on every present that
+// changes enough (the change-driven path,
 // fald_change.h, takes the small changes). On a device where that does not fit the refresh interval the layer is never
 // paused: its full path is run at a CAPPED RATE, and the presents in between keep the standing fields and run only the
 // pixel pass (a "held" run: the new content corrected with the previous full run's fields — the dimming lags by at most
@@ -115,12 +115,13 @@ extern int g_faldCoreHoldOverride;
 // The core passes' GPU time per run for the governor, in both hosts: a ring of kSlots timestamp-query sets, kStamps
 // stamps each, read back with DONOTFLUSH only once the GPU is done (a slot still in flight when its turn comes round
 // skips timing that run). The stamps of a run, in order:
-//   0 the run's start (before the starfield)   1 after the starfield (before the fade's frame passes)
-//   2 after the fade's frame passes             3 before the fade's reach of round 0
-//   4 after it                                  5 before the fade's reach of round 1
-//   6 after it                                  7 the run's end (after the pixel pass)
-// core = (1 - 0) + (3 - 2) + (5 - 4) + (7 - 6); total = 7 - 0; star = 1 - 0; fade = total - core. A host that does not run a
-// segment stamps its two ends back to back (zero). A held run is not timed (it is not a full run).
+//   0 the run's start (before the starfield)   1 after the starfield
+//   2 = 1                                       3 after round 0's gain
+//   4 = 3                                       5 after round 1's gain
+//   6 = 5                                       7 the run's end (after the pixel pass)
+// core = (1 - 0) + (3 - 2) + (5 - 4) + (7 - 6); total = 7 - 0; star = 1 - 0. Stamps 1 / 2, 3 / 4 and 5 / 6 framed the flank
+// fade's passes until 2026-11-12: both hosts now stamp each pair back to back (zero), the layout kept so the ring and
+// its readers stay as they were. A held run is not timed (it is not a full run).
 struct FaldCoreTimingSample { double coreUs, totalUs, starUs; void* owner; };
 struct FaldCoreTiming {
     static const int kSlots = 4;

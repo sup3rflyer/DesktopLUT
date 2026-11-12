@@ -43,9 +43,8 @@ unsigned int FaldChangeMaxZones(unsigned int totalZones) {
 }
 
 FaldChangePath FaldChangeDecide(const FaldChangeInputs& in, unsigned int maxZones) {
-    if (!in.stateComplete || !in.settingsSame || !in.frameKnown || !in.gainFused || in.fadeOn) return FALD_CHANGE_FULL;
-    if (in.coreStateful) return FALD_CHANGE_FULL;     // the core's zone IIRs move every run: nothing stands
-    if (in.temporalMode > 3u) return FALD_CHANGE_FULL;
+    if (!in.stateComplete || !in.settingsSame || !in.frameKnown || !in.gainFused) return FALD_CHANGE_FULL;
+    if (in.temporalMode != 0u && in.temporalMode != 3u) return FALD_CHANGE_FULL;   // a mode this build does not run
     if (in.touchedZones > maxZones || in.totalZones == 0u) return FALD_CHANGE_FULL;
     return FALD_CHANGE_PARTIAL;
 }
