@@ -274,13 +274,14 @@ TEST_CASE("host alive: owner probe (child process of the next case)") {
     if (GetEnvironmentVariableW(kHostChildEnv, mode, _countof(mode)) == 0) return;
     const bool held = EnsureDwmHookHostAlive();
     const std::wstring readyName = L"Local\\DesktopLUT_Test_HostAliveReady_" + std::to_wstring(GetCurrentProcessId());
+    const std::wstring goName = L"Local\\DesktopLUT_Test_HostAliveGo_" + std::to_wstring(GetCurrentProcessId());
     HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, readyName.c_str());
+    HANDLE go = CreateEventW(nullptr, TRUE, FALSE, goName.c_str());   // (both exist before the parent is told)
     REQUIRE(ready != nullptr);
+    REQUIRE(go != nullptr);
     if (held) SetEvent(ready);
     if (wcscmp(mode, L"exit") == 0) {
-        const std::wstring goName = L"Local\\DesktopLUT_Test_HostAliveGo_" + std::to_wstring(GetCurrentProcessId());
-        HANDLE go = CreateEventW(nullptr, TRUE, FALSE, goName.c_str());
-        if (go) WaitForSingleObject(go, 30000);
+        WaitForSingleObject(go, 30000);
         ExitProcess(0);   // a plain exit with the owner thread still parked
     }
     Sleep(30000);         // "kill": the parent terminates this process long before

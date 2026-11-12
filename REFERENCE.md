@@ -734,6 +734,23 @@ Overlay pass (one fullscreen draw per changed desktop frame), µs:
 
 One RTX 5090 says nothing certain about a weak GPU. On this card the passes are bound by memory traffic (the full-frame copy the hook needs is a third of its HDR pass) and insensitive to shader arithmetic; on the software rasteriser (WARP) it is the reverse. Where an integrated GPU falls between the two has not been measured.
 
+### Idle cost, CPU side (2026-11-12)
+
+What `DesktopLUT.exe` and the hook DLL do on timers while nothing on screen changes: thread wake-ups and CPU time per minute. Ryzen 7950X3D, two displays, about 370 running processes; medians from the test suite's opt-in measurement (`tests/test_host_idle.cpp`, `DLUT_IDLE_BENCH=1`). The per-frame work of the overlay's render loop and of the hook's pass is not in here (see above).
+
+| State (window closed, whitelists empty) | wake-ups / min | CPU ms / min |
+|---|---|---|
+| Nothing configured | 34 | 4 |
+| MHC profiles only | 34 | 10, plus 14 per installed profile that is checked |
+| DWM hook, 3D LUT / tone map | 106, none inside `dwm.exe` | 8 |
+| Overlay, 3D LUT (plus its render loop) | 214 | 7 |
+| DWM hook with FALD on | 148 | 20 |
+
+- Every state: the 15 s MHC verify tick (display queries, about 1 ms; with profiles, Windows' "which profile is the default" query costs 3.6 ms per profile and mode), a 2 s hang check of the overlay thread, and with an MHC profile the 5-minute Calibration Loader kick (a hidden `schtasks.exe`, about 50 ms).
+- Running modes add the whitelist thread (awake once a second to see whether a whitelist became live; an adapter check every 5 s) and, in hook mode, the 5 s watchdog (one named-event lookup).
+- The DLL keeps no timer inside `dwm.exe`: its one thread sleeps until DesktopLUT ends or the hook reports that it cannot render.
+- A whitelist with entries whose feature is on adds, per minute, 120 reads of the process-id list (16 ms together) and a full process read (7.6 ms) whenever a process started or ended anywhere, or after 5 s without one: about 110 ms on a quiet desktop. While a whitelisted program runs nothing is read. Up to 3.0.0 every running mode read the full list twice a second, whitelists or not (915 ms and 1200 wake-ups per minute), and the DLL read it inside `dwm.exe` every 5 s.
+
 ### GPU Benchmark (RTX 5090, 4K 60Hz)
 
 Whole-system figures from `nvidia-smi` with the overlay running (measured in overlay mode, before the pass timings above existed).
