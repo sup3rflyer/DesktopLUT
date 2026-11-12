@@ -81,6 +81,10 @@ class StackRecord:
     cube: Optional[dict[str, Any]] = None
     notes: list[str] = field(default_factory=list)
     sdr_white: Optional[dict[str, Any]] = None
+    # The display's refresh rate when this MHC was calibrated (additive 2026-11-12; None = not recorded):
+    # {"rational": [num, den], "hz", "rate": catalogue key | None, "hardware_id", "device_name", "source":
+    # "displayconfig", "run_id", "at"}. The refresh probe's reference rate.
+    refresh: Optional[dict[str, Any]] = None
 
     @property
     def key(self) -> str:
@@ -100,7 +104,10 @@ class StackRecord:
         return v if v is not None and v > 0 else None
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if self.refresh is None:
+            d.pop("refresh")              # a record without one is written exactly as before
+        return d
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "StackRecord":
@@ -110,7 +117,8 @@ class StackRecord:
                    hdr_peak=(dict(d["hdr_peak"]) if d.get("hdr_peak") else None),
                    cube=(dict(d["cube"]) if d.get("cube") else None),
                    notes=list(d.get("notes") or []),
-                   sdr_white=(dict(d["sdr_white"]) if d.get("sdr_white") else None))
+                   sdr_white=(dict(d["sdr_white"]) if d.get("sdr_white") else None),
+                   refresh=(dict(d["refresh"]) if isinstance(d.get("refresh"), dict) else None))
 
 
 def record_from_mhc_params(*, display: str, mode: str, monitor: int, run_id: str,

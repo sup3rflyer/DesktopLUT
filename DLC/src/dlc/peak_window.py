@@ -664,6 +664,22 @@ def run_flow(cal: Any) -> Any:
     if spec.stack == "native" and not st.get("display_restored"):
         st["display_restored"] = cal._restore_user_setup(why="peak-window measured — nothing applied")
         cal._save()
+    if not st.get("display_confirmed", {}).get("confirmed"):
+        # every ending leaves the display as it started, CONFIRMED by read-back (not "the calls returned"): the
+        # viewing layers back now (run() would re-assert them at exit anyway — idempotent), then read back
+        cal._restore_viewing_layers()
+        from .probe_kit import confirm_native_restored, viewing_layers_diff
+        if spec.stack == "native":
+            conf = confirm_native_restored(cal.controller, cal.calib, monitor=cal.monitor, mode=cal.mode)
+        else:
+            lay = viewing_layers_diff(cal.controller, cal.calib, monitor=cal.monitor, mode=cal.mode)
+            conf = {"confirmed": lay.get("ok") is not False, "viewing_layers": lay}
+        st["display_confirmed"] = conf
+        cal._save()
+        if not conf["confirmed"]:
+            cal.runlog.anomaly(STAGE, kind="restore_unconfirmed", read_back=conf,
+                               message=(f"the display does not read back as it started: python -m dlc.calibrate "
+                                        f"--run {cal.ctx.root} --abort"))
     section = _section(cal, spec, st)
     out_path = write_json(cal.ctx.root / "results" / "peak_window.json", section.as_dict())
     publish_chart(cal, STAGE, CHART, chart_payload(section.steps, spec, complete=True, section=section))
@@ -684,11 +700,13 @@ def run_flow(cal: Any) -> Any:
     if decision.choice == "record":
         recorded = _record(cal, section)
     cal.runlog.run_done("completed", flow="peak-window", valid=section.valid, recorded=bool(recorded),
-                        display_restored=st.get("display_restored"))
+                        display_restored=st.get("display_restored"),
+                        display_confirmed=(st.get("display_confirmed") or {}).get("confirmed"))
     return CalibrationResult(flow="peak-window", monitor=cal.monitor, mode=cal.mode, target=cal.target_name,
                              status="completed", stages=list(cal.calib["stages"].keys()), results_dir=None,
                              report_path=None, digest={**digest, "recorded": recorded,
-                                                       "dip_store": str(cal._dip_store().path)})
+                                                       "dip_store": str(cal._dip_store().path),
+                                                       "display_confirmed": st.get("display_confirmed")})
 
 
 def _section(cal: Any, spec: PeakWindowSpec, st: dict[str, Any]) -> Any:
@@ -700,7 +718,9 @@ def _section(cal: Any, spec: PeakWindowSpec, st: dict[str, Any]) -> Any:
     except Exception:  # noqa: BLE001 - evidence only
         pass
     conditions = {"mode": cal.mode, "stack": spec.stack, "stack_view": st.get("stack_view"),
-                  "refresh_hz": _refresh_hz(cal, ident.get("hardware_id")), "bit_depth": cal.bit_depth,
+                  "refresh_hz": ((cal.calib.get("display_refresh") or {}).get("hz")
+                                 or _refresh_hz(cal, ident.get("hardware_id"))),
+                  "refresh": cal.calib.get("display_refresh"), "bit_depth": cal.bit_depth,
                   "code": list(_white_code(cal.bit_depth)), "surround": "black",
                   "shape": "centred rectangle of the screen's aspect", "meter": "centre of the screen",
                   "instrument": cal.profile.meter.model, "correction": corr, "emissive": spec.emissive}

@@ -395,15 +395,19 @@ python -m dlc.refresh_probe run --spec runs/refresh_spec.json --monitor N --prof
 - The display is found by `quirks.hardware_id` (else the pipe's) and cross-checked against Windows' DisplayConfig.
   Only that display is ever switched; every switch is temporary (nothing saved), read back exactly (the rational,
   so 47.952 and 48 are told apart; the resolution; HDR on; the other displays untouched).
-- **Seams:** `refresh-response:plan` (the rates, the legs, the levels, the window, the time — and *confirm that the
-  reference is the rate the calibration was made at*), then **one consent per switch away from the reference**
+- **Seams:** `refresh-response:plan` (the rates, the legs, the levels, the window, the time, and the reference: the
+  rate the installed HDR calibration was recorded at — every calibrating run records the display's refresh rate at
+  preflight — stated as a fact; only when nothing is recorded, or the spec names another rate, does it ask you to
+  confirm), then **one consent per switch away from the reference**
   (`refresh-response:switch:L<leg>:<rate>`). The plan seam lists every switch key: once the human has agreed to
   the switches, you may answer them together on the resume (`--decide` per key).
 - Through the installed HDR MHC, with the viewing layers (tone map, desktop gamma, WB, grayscale, FALD), the 3D LUT
   and DesktopLUT's own refresh trim switched off; all of it is restored at the end. A pause leaves the display at
   the reference rate with the measurement stack in place. **If you abandon a paused or died run:**
-  `python -m dlc.refresh_probe restore --run <dir>` (puts the exact recorded mode back, repairs the saved mode if
-  something saved one, restores the layers). `--abort` alone does not restore the refresh rate.
+  `python -m dlc.calibrate --run <dir> --abort`, as for any run: it puts the exact recorded mode back (and repairs
+  the saved mode if something saved one), the 3D LUT bypass / refresh trim and the viewing layers, and says
+  `reverted` only when it reads them back as they were; otherwise `display_may_differ` and the command to finish
+  it. A second `--abort` is harmless. (`python -m dlc.refresh_probe restore --run <dir>` is the low-level tool.)
 - Length: a warm-in at the reference (5–20 min, closed loop), then reference → rate → reference brackets in two
   mirrored passes, ≥ 30 s settle after each switch (DesktopLUT's MHC burst). Two rates ≈ 1 h.
 - **VRR instead of mode switches** (spec `"source": "vrr"`): the display stays in its reference mode with VRR
@@ -461,7 +465,9 @@ python -m dlc.peak_window show --dip dip_store.json --display "<name>"   # a rec
   settled tail), the minimum and a fitted decay time. Sizes run up and back down; the top size once.
 - Stack: `native` by default (identity profile, every layer off, as a calibration's raw stage); spec
   `"stack": "installed"` measures through the user's MHC + 3D LUT. Either way it is recorded.
-- Cancel / meter loss / a crash restore the display as with any flow.
+- Every ending (done, cancel, pause timeout, meter loss, an error) leaves the display as it started and the run
+  reads it back (`display_confirmed`: no calibration session open, the viewing layers as before, the user's MHC
+  back). A run that died: `python -m dlc.calibrate --run <dir> --abort` (it says `reverted` only after the read-back).
 
 **Read the result** (`results/peak_window.json`, the `peak-window:record` seam's digest, the DLC tab's chart):
 - `curve`: per size, early / sustained / min / decay, and the up/down agreement. **`valid` = the two passes agree**
