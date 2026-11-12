@@ -156,6 +156,7 @@
     <ClInclude Include="noise.h" />
     <ClInclude Include="..\shared\dwm_hook_config.h" />
     <ClInclude Include="..\shared\dwm_hook_patterns.h" />
+    <ClInclude Include="..\shared\dwm_hook_host_alive.h" />
     <ClInclude Include="..\shared\fald_panel.h" />
     <ClInclude Include="..\shared\fald_panel_live.h" />
     <ClInclude Include="..\shared\fald_temporal.h" />

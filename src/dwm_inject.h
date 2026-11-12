@@ -39,8 +39,20 @@ bool DwmHookStagingSetsEqual(const std::vector<DwmHookMonitorLUT>& a, const std:
 std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid);
 
 // Check if the DWM hook is active via named event (lightweight, no elevation needed).
-// The injected DLL creates Global\DesktopLUT_DwmHook_Active on attach.
+// The injected DLL creates Global\DesktopLUT_DwmHook_Active on attach. It is the ONE thing that says a hook works:
+// the DLL closes it when it unloads, when its host is gone, and when it cannot render (a failed initialisation is
+// final for an injection: it reverts its patches and hooks and stays loaded, inert; shared/dwm_hook_host_alive.h).
+// The watchdog then re-injects (bounded) and falls back to the overlay.
 bool IsDwmHookActive();
+// A DLL of ours may still be loaded in dwm.exe: active, or loaded by this process and not ejected since (inert after
+// it reverted itself). For a Stop, which leaves nothing behind; "is the hook working" is IsDwmHookActive.
+bool DwmHookMayBeResident();
+
+// Host liveness for the DLL (shared/dwm_hook_host_alive.h): this process owns a named mutex, on a thread parked for
+// the life of the process, and the DLL blocks on it instead of polling the process list for the host's pid. Started
+// by the first injection (which then says so in host.pid). True when the mutex is held; false = it could not be
+// taken (the DLL then polls as before; the next injection tries again). Any thread.
+bool EnsureDwmHookHostAlive();
 
 // Inject DwmHook.dll into dwm.exe with the given LUT configuration.
 // Stages LUT files to %SYSTEMROOT%\Temp\DesktopLUT_luts\, copies DLL,

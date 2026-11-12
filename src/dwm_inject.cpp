@@ -3,6 +3,7 @@
 
 #include "dwm_inject.h"
 #include "../shared/dwm_hook_config.h"
+#include "../shared/dwm_hook_host_alive.h"
 #include "../shared/fald_panel_live.h"
 #include "../shared/fald_shader.h"   // FaldZoneSlices: the hook refuses a lattice it cannot sweep
 #include "globals.h"
@@ -38,6 +39,11 @@ static std::recursive_mutex g_dwmInjectMutex;
 // (DeliverDwmHookFaldPanel) updates its entry: the set keeps describing what the resident hook holds.
 static std::vector<DwmHookMonitorLUT> g_injectedSet;
 static bool g_injectedSetValid = false;
+// This process loaded DwmHook.dll into a dwm.exe and has not ejected it since. The heartbeat (IsDwmHookActive) is gone
+// as soon as the DLL reverts itself (it could not render, shared/dwm_hook_host_alive.h) while its module, its
+// handles on the shared memory and this process's hook services are still there: a Stop ejects that too
+// (DwmHookMayBeResident).
+static std::atomic<bool> g_hookDllLoadedByUs{ false };
 
 // The FALD panel files of the resident hook, per (position, mode): staged at the last injection (gen 0) or delivered
 // live since (dwm_hook_config.h, "FALD panel file live delivery"). Under g_dwmInjectMutex. Reset by every injection
@@ -512,7 +518,8 @@ std::vector<DwmHookMonitorLUT> DwmHookInjectedSet(bool* valid)
 
 bool IsDwmHookActive()
 {
-    // Lightweight check: the injected DLL creates this named event on attach.
+    // Lightweight check: the injected DLL creates this named event on attach, and closes it when it unloads, when
+    // its host is gone, or when it finds it cannot render (it then reverts itself and stays loaded, inert).
     // No SYSTEM elevation needed — just open and close.
     HANDLE h = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\DesktopLUT_DwmHook_Active");
     if (h) {
@@ -520,6 +527,73 @@ bool IsDwmHookActive()
         return true;
     }
     return false;
+}
+
+bool DwmHookMayBeResident()
+{
+    return g_hookDllLoadedByUs.load() || IsDwmHookActive();
+}
+
+// ---------------------------------------------------------------------------
+// Host liveness for the DLL (shared/dwm_hook_host_alive.h)
+// ---------------------------------------------------------------------------
+// The DLL's host monitor thread blocks on a mutex this process owns for as long as it lives; the kernel abandons it
+// when the process ends in any way, which wakes the DLL to revert the hook. The owner is a thread of its own, parked
+// for good: a mutex belongs to a THREAD, and one owned by whichever thread happened to inject would be abandoned as
+// soon as that thread ended. Created at the first injection, never released, never closed. NULL DACL like the other
+// hook objects: dwm.exe's identity opens it.
+static HANDLE g_hostAliveReady = nullptr;          // set once the owner thread knows whether it holds the mutex
+static std::atomic<int> g_hostAliveHeld{ 0 };      // 1 = held for the life of the process, -1 = could not be taken
+
+static DWORD WINAPI HostAliveOwnerThread(LPVOID)
+{
+    wchar_t name[96];
+    DwmHookHostAliveMutexName(GetCurrentProcessId(), name, _countof(name));
+    SECURITY_DESCRIPTOR sd;
+    InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+    SetSecurityDescriptorDacl(&sd, TRUE, nullptr, FALSE);
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+    HANDLE m = CreateMutexW(&sa, TRUE, name);
+    bool held = false;
+    if (m) {
+        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+            // The name outlived a previous process of this pid (a DLL of that host still has it open), or someone
+            // else made it: ours only if it can be taken now. Otherwise the DLL is told nothing and polls.
+            const DWORD w = WaitForSingleObject(m, 0);
+            held = (w == WAIT_OBJECT_0 || w == WAIT_ABANDONED);
+        } else {
+            held = true;
+        }
+    }
+    g_hostAliveHeld.store(held ? 1 : -1);
+    SetEvent(g_hostAliveReady);
+    if (!held) {
+        if (m) CloseHandle(m);
+        return 0;
+    }
+    for (;;) Sleep(INFINITE);   // owns the mutex until the process ends; nothing ever wakes or stops this thread
+}
+
+bool EnsureDwmHookHostAlive()
+{
+    std::lock_guard<std::recursive_mutex> lock(g_dwmInjectMutex);   // one attempt at a time
+    if (g_hostAliveHeld.load() > 0) return true;
+    if (!g_hostAliveReady) g_hostAliveReady = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_hostAliveReady) return false;
+    ResetEvent(g_hostAliveReady);
+    g_hostAliveHeld.store(0);
+    HANDLE t = CreateThread(nullptr, 0, HostAliveOwnerThread, nullptr, 0, nullptr);
+    if (!t) {
+        std::wcerr << L"[DWM Hook] Host liveness thread could not be started (" << GetLastError()
+                   << L"): the hook polls for this process instead" << std::endl;
+        return false;
+    }
+    CloseHandle(t);   // never joined: it parks until the process ends (or has already returned without the mutex)
+    WaitForSingleObject(g_hostAliveReady, 5000);
+    const bool held = g_hostAliveHeld.load() > 0;
+    if (!held)
+        std::wcerr << L"[DWM Hook] Host liveness mutex not held: the hook polls for this process instead" << std::endl;
+    return held;
 }
 
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::wstring* stagingWarning)
@@ -761,14 +835,20 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
     }
 
     // --- Write host PID for DLL-side orphan detection ---
+    // With the liveness mutex held, the file says so and the DLL blocks on the mutex instead of reading the process
+    // list every 5 s inside dwm.exe (shared/dwm_hook_host_alive.h). An older DLL reads the first line only.
     {
+        const bool aliveMutex = EnsureDwmHookHostAlive();
         std::wstring pidPath = lutsDir + L"host.pid";
         FILE* pf = nullptr;
-        if (_wfopen_s(&pf, pidPath.c_str(), L"w") == 0 && pf) {
-            fprintf(pf, "%lu\n", GetCurrentProcessId());
+        char text[64];
+        if (DwmHookFormatHostPidFile(text, sizeof(text), GetCurrentProcessId(), aliveMutex) > 0 &&
+            _wfopen_s(&pf, pidPath.c_str(), L"w") == 0 && pf) {
+            fputs(text, pf);
             fclose(pf);
             ClearDACL(pidPath);
-            std::wcout << L"[DWM Hook] Host PID " << GetCurrentProcessId() << L" written to host.pid" << std::endl;
+            std::wcout << L"[DWM Hook] Host PID " << GetCurrentProcessId() << L" written to host.pid ("
+                       << (aliveMutex ? L"liveness mutex held" : L"no liveness mutex: the hook polls") << L")" << std::endl;
         } else {
             std::wcerr << L"[DWM Hook] WARNING: Failed to create host.pid" << std::endl;
         }
@@ -929,6 +1009,7 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
                     firstError = L"Failed to load or initialize DwmHook.dll in dwm.exe. "
                                  L"This probably means that a LUT file is malformed or that DWM got updated.";
             } else {
+                g_hookDllLoadedByUs.store(true);
                 std::wcout << L"[DWM Hook] DLL verified loaded in PID " << pid << std::endl;
             }
         }
@@ -977,6 +1058,7 @@ std::wstring UninjectDwmHook(bool keepOwnSession)
     auto dwmPids = FindProcessesByName(L"dwm.exe");
     if (dwmPids.empty()) {
         std::wcout << L"[DWM Hook] No dwm.exe processes found" << std::endl;
+        g_hookDllLoadedByUs.store(false);
         return {};
     }
 
@@ -1076,6 +1158,7 @@ std::wstring UninjectDwmHook(bool keepOwnSession)
     }
 
     std::wcout << L"[DWM Hook] Uninjection successful" << std::endl;
+    if (!haveOwnSession) g_hookDllLoadedByUs.store(false);   // (a session end leaves its own dwm.exe's copy in place)
     return {};
 }
 

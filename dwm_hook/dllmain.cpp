@@ -6,6 +6,7 @@
  */
 #include "pch.h"
 #include "dwm_hook_config.h"
+#include "dwm_hook_host_alive.h"
 #include "hook_log.h"
 #include "hook_lut.h"
 #include "hook_render.h"
@@ -271,12 +272,24 @@ static void CloseHandleOnce(HANDLE* h) {
 }
 
 // --- Host process monitoring: detect orphaned injection ---
-// dwm.exe is a Protected Process on Win11 — cannot call OpenProcess() on non-PP processes.
-// Instead, poll the process list every 5s using CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS).
+// dwm.exe (Window Manager\DWM-n) cannot open the host process, so the host holds a named mutex for as long as it
+// lives and this DLL's monitor thread blocks on it: the kernel abandons the mutex the moment the host process ends
+// (shared/dwm_hook_host_alive.h). No polling. Only when the host did not offer the mutex (an older host), or it
+// cannot be opened or is not held at attach, the old check runs instead: the process list, read every 5 s
+// (CreateToolhelp32Snapshot, several ms inside dwm.exe each time).
 static DWORD g_hostPid = 0;
+static bool g_hostAliveMutexOffered = false;   // host.pid said the host owns its liveness mutex
 static HANDLE g_hostMonitorThread = NULL;
 static HANDLE g_hostMonitorStopEvent = NULL;
-static std::atomic<bool> g_hookReverted{false};  // Set when host dies, prevents double-revert in DLL_PROCESS_DETACH
+static std::atomic<bool> g_hookReverted{false};  // Set when the monitor thread reverted, prevents double-revert in DLL_PROCESS_DETACH
+
+// --- The other direction: the hook cannot work, and the host must see it as gone ---
+// A failed InitializeStuff is final for the injection (hook_render.cpp HookEnsureInitialized): nothing is corrected,
+// while the heartbeat would go on telling the host that the hook works. The present path reports it ONCE, with a
+// SetEvent and nothing else; the monitor thread (the same wait as the host's mutex) reverts the patches and hooks and
+// closes the heartbeat. The host's watchdog then finds no hook and takes its bounded re-injection, then the overlay.
+static HANDLE g_hookFailedEvent = NULL;        // manual-reset; set by NoteRenderInitFailed, waited on by the monitor thread
+static DwmHookFailureLatch g_hookFailedLatch;
 
 // --- Shared memory IPC: live parameter updates from host ---
 static HANDLE g_sharedMemHandle = NULL;
@@ -313,63 +326,156 @@ static bool IsProcessAlive(DWORD pid)
 	return found;
 }
 
-static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
+// The host is gone, or this hook cannot render: put DWM back as it was and close the heartbeat. The DLL stays loaded,
+// inert (the next injection unloads it first). Monitor thread only: MH_DisableHook suspends dwm.exe's threads while it
+// patches, never something for the present path.
+static void RevertHook(bool hostGone)
 {
-	while (true) {
-		// Wait 5 seconds or until stop event is signaled
-		DWORD result = WaitForSingleObject(g_hostMonitorStopEvent, 5000);
-		if (result == WAIT_OBJECT_0) break;  // Stop event signaled — normal shutdown
+	log_to_file(hostGone ? "Host process exited unexpectedly, reverting DWM hook..."
+	                     : "The hook's rendering resources could not be created, reverting DWM hook (the host re-injects)...");
 
-		// Check if host process is still alive
-		if (!IsProcessAlive(g_hostPid)) {
-			// Host process terminated — revert DWM to normal
-			log_to_file("Host process exited unexpectedly, reverting DWM hook...");
-
-			if (!g_hookReverted.exchange(true)) {
-				if (g_overlayTestModePatched && g_pOverlayTestMode != NULL) {
-					__try { *g_pOverlayTestMode = g_savedOverlayTestMode; }
-					__except (EXCEPTION_EXECUTE_HANDLER) {}
-				}
-				if (g_disableIndependentFlipPatched && g_pDisableIndependentFlip != NULL) {
-					__try { *g_pDisableIndependentFlip = g_savedDisableIndependentFlip; }
-					__except (EXCEPTION_EXECUTE_HANDLER) {}
-				}
-				if (g_overlaysEnabledPatchAddr != NULL) {
-					DWORD oldProt;
-					if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
-						memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
-						VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
-						FlushInstructionCache(GetCurrentProcess(), g_overlaysEnabledPatchAddr, 17);
-					}
-					g_overlaysEnabledPatchAddr = NULL;
-				}
-				MH_DisableHook(MH_ALL_HOOKS);
-			}
-
-			// Close heartbeat event so host watchdog (if restarted) sees it as gone
-			CloseHandleOnce(&g_heartbeatEvent);
-			CloseHandleOnce(&g_faldPanelLiveEvent);
-
-			log_to_file("DWM hook reverted (host exit) — DLL remains loaded but inert");
-			break;
+	if (!g_hookReverted.exchange(true)) {
+		if (g_overlayTestModePatched && g_pOverlayTestMode != NULL) {
+			__try { *g_pOverlayTestMode = g_savedOverlayTestMode; }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
 		}
+		if (g_disableIndependentFlipPatched && g_pDisableIndependentFlip != NULL) {
+			__try { *g_pDisableIndependentFlip = g_savedDisableIndependentFlip; }
+			__except (EXCEPTION_EXECUTE_HANDLER) {}
+		}
+		if (g_overlaysEnabledPatchAddr != NULL) {
+			DWORD oldProt;
+			if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
+				memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
+				VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
+				FlushInstructionCache(GetCurrentProcess(), g_overlaysEnabledPatchAddr, 17);
+			}
+			g_overlaysEnabledPatchAddr = NULL;
+		}
+		MH_DisableHook(MH_ALL_HOOKS);
 	}
-	return 0;
+
+	// Close heartbeat event so the host's watchdog (this host, or a restarted one) sees the hook as gone; with it the
+	// live panel-delivery capability. Nothing else tells a host that a hook works.
+	CloseHandleOnce(&g_heartbeatEvent);
+	CloseHandleOnce(&g_faldPanelLiveEvent);
+
+	log_to_file(hostGone ? "DWM hook reverted (host exit) — DLL remains loaded but inert"
+	                     : "DWM hook reverted (render init failed) — DLL remains loaded but inert");
 }
 
-// Read host PID from staging file written by the injector
-static DWORD ReadHostPid()
+// Present path, after the apply call: the one report that this hook cannot render. A bool read per present; on the
+// one present that finds the failure, a SetEvent (the monitor thread does the rest). Without a monitor thread the
+// heartbeat is closed right here (a CloseHandle, once): the host still sees the hook as gone, the patches stay until
+// its re-injection unloads this DLL.
+static inline void NoteRenderInitFailed()
 {
+	if (!g_hookFailedLatch.Report(HookRenderInitFailed())) return;
+	// (the event exists before the hooks are enabled, and only while a monitor thread is there, or about to be, to serve it)
+	HANDLE failed = g_hookFailedEvent;
+	if (failed != NULL) {
+		SetEvent(failed);
+	} else {
+		CloseHandleOnce(&g_heartbeatEvent);
+		CloseHandleOnce(&g_faldPanelLiveEvent);
+	}
+}
+
+// The host's liveness mutex, opened and probed once: non-NULL only when another thread (the host) owns it right now.
+static HANDLE OpenHeldHostMutex()
+{
+	if (!g_hostAliveMutexOffered) {
+		log_to_file("Host monitor: the host offers no liveness mutex (older host) — polling the process list");
+		return NULL;
+	}
+	wchar_t name[96];
+	DwmHookHostAliveMutexName(g_hostPid, name, _countof(name));
+	// MUTEX_MODIFY_STATE: a wait that hands the mutex to this thread is followed by ReleaseMutex.
+	HANDLE m = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, name);
+	if (!m) {
+		char msg[128];
+		sprintf_s(msg, "Host monitor: liveness mutex not opened (error %lu) — polling the process list", GetLastError());
+		log_to_file(msg);
+		return NULL;
+	}
+	switch (DwmHookClassifyHostProbe(WaitForSingleObject(m, 0))) {
+	case DwmHookHostProbe::Held:
+		return m;
+	case DwmHookHostProbe::NotHeld:
+		ReleaseMutex(m);   // the probe took it: nobody held it
+		log_to_file("Host monitor: liveness mutex exists but is not held — polling the process list");
+		break;
+	default:
+		log_to_file("Host monitor: liveness mutex cannot be waited on — polling the process list");
+		break;
+	}
+	CloseHandle(m);
+	return NULL;
+}
+
+// One thread, one wait, both directions (shared/dwm_hook_host_alive.h): { stop, hook failed, the host's mutex }.
+// With the mutex held by the host there is no timeout: no wake-up at all while the host lives and the hook works.
+// Without it (an older host, or the mutex could not be used) the wait times out every 5 s to read the process list;
+// without even a host pid only stop and hook-failed are served.
+static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
+{
+	HANDLE hostMutex = (g_hostPid != 0) ? OpenHeldHostMutex() : NULL;
+	bool pollingHost = (g_hostPid != 0) && hostMutex == NULL;
+	if (hostMutex) log_to_file("Host monitor: waiting on the host's liveness mutex (no polling)");
+
+	for (;;) {
+		HANDLE waits[3] = { g_hostMonitorStopEvent, g_hookFailedEvent, hostMutex };
+		bool owns = false;
+		const DwmHookMonitorWake wake = DwmHookClassifyMonitorWait(
+			WaitForMultipleObjects(hostMutex ? 3 : 2, waits, FALSE, DwmHookMonitorTimeoutMs(pollingHost)),
+			hostMutex != NULL, &owns);
+		if (owns) ReleaseMutex(hostMutex);
+		const DwmHookMonitorAction action = DwmHookMonitorDecide(wake, hostMutex != NULL, pollingHost);
+		if (action == DwmHookMonitorAction::WaitAgain) continue;
+		if (action == DwmHookMonitorAction::PollHost) {
+			if (IsProcessAlive(g_hostPid)) continue;
+			RevertHook(true);
+			return 0;
+		}
+		if (action == DwmHookMonitorAction::Backoff) {
+			// The wait itself failed (never seen): no spinning. The stop event alone for one interval, then the checks by hand.
+			if (WaitForSingleObject(g_hostMonitorStopEvent, kDwmHookHostPollMs) == WAIT_OBJECT_0) return 0;
+			if (HookRenderInitFailed()) { RevertHook(false); return 0; }
+			if (pollingHost && !IsProcessAlive(g_hostPid)) { RevertHook(true); return 0; }
+			continue;
+		}
+		if (hostMutex) { CloseHandle(hostMutex); hostMutex = NULL; }
+		switch (action) {
+		case DwmHookMonitorAction::RevertHostGone:   RevertHook(true); return 0;
+		case DwmHookMonitorAction::RevertHookFailed: RevertHook(false); return 0;
+		case DwmHookMonitorAction::DropMutexAndPoll:
+			log_to_file("Host monitor: the wait on the liveness mutex failed — polling the process list");
+			pollingHost = true;
+			continue;
+		default: return 0;   // Exit: normal shutdown (the DLL is unloading); nothing more on this path
+		}
+	}
+}
+
+// Read the host PID (and whether the host owns its liveness mutex) from the staging file written by the injector.
+// Stack only: DllMain calls this under the loader lock.
+static DWORD ReadHostPid(bool* aliveMutex)
+{
+	if (aliveMutex) *aliveMutex = false;
 	char pidPath[MAX_PATH] = {0};
 	ExpandEnvironmentStringsA("%SYSTEMROOT%\\Temp\\DesktopLUT_luts\\host.pid", pidPath, sizeof(pidPath));
 
 	FILE* pf = fopen(pidPath, "r");
 	if (!pf) return 0;
 
-	DWORD pid = 0;
-	if (fscanf(pf, "%lu", &pid) != 1) pid = 0;
+	char text[96] = {0};
+	const size_t n = fread(text, 1, sizeof(text) - 1, pf);
 	fclose(pf);
-	return pid;
+	text[n] = '\0';
+
+	unsigned long pid = 0;
+	if (!DwmHookParseHostPidFile(text, &pid, aliveMutex)) return 0;
+	return (DWORD)pid;
 }
 
 bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
@@ -776,6 +882,7 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 		}
 	}
 
+	NoteRenderInitFailed();   // a hook that cannot render tells the host, once (a bool read otherwise)
 	return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
 }
 
@@ -819,6 +926,7 @@ long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned i
 		}
 	}
 
+	NoteRenderInitFailed();   // a hook that cannot render tells the host, once (a bool read otherwise)
 	return COverlayContext_Present_orig(self, overlaySwapChain, a3, rectVec, a5, a6);
 }
 
@@ -1627,8 +1735,15 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					LOG_ONLY_ONCE("DIAG: hookLevel=0 — no hooks activated, memory patches only")
 					MH_Uninitialize();
 					break;  // Inert mode: skip heartbeat + host monitor
-				} else if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
+				}
+				// The monitor thread's events exist before a hook can run: the first present may report a failed
+				// initialisation (NoteRenderInitFailed) before the thread below is created.
+				g_hostMonitorStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+				g_hookFailedEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+				if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
 					log_to_file("ERROR: MH_EnableHook failed");
+					CloseHandleOnce(&g_hookFailedEvent);
+					CloseHandleOnce(&g_hostMonitorStopEvent);
 					MH_Uninitialize();
 					return FALSE;
 				}
@@ -1652,25 +1767,29 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 						log_to_file("WARNING: FALD panel live-delivery event not created - panel file changes re-inject");
 				}
 
-				// Start host process monitor (detects orphaned injection)
-				// dwm.exe is a Protected Process — can't OpenProcess on the host.
-				// Uses process list polling (CreateToolhelp32Snapshot) every 5s instead.
+				// Start the monitor thread: the host gone (an orphaned injection) and this hook unable to render both
+				// end in a revert there. It blocks on the host's liveness mutex (opened on that thread, not here
+				// under the loader lock); the process-list poll is only its fallback. Without a host pid it still
+				// serves the hook-failed report.
 				{
-					g_hostPid = ReadHostPid();
-					if (g_hostPid != 0) {
-						g_hostMonitorStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-						if (g_hostMonitorStopEvent) {
-							g_hostMonitorThread = CreateThread(NULL, 0, HostMonitorThreadFunc, NULL, 0, NULL);
-							if (g_hostMonitorThread) {
-								char buf[128];
-								sprintf_s(buf, "Host monitor started for PID %lu (polling)", g_hostPid);
-								log_to_file(buf);
-							} else {
-								log_to_file("WARNING: Failed to create host monitor thread");
-							}
-						}
-					} else {
+					g_hostPid = ReadHostPid(&g_hostAliveMutexOffered);
+					if (g_hostPid == 0)
 						log_to_file("WARNING: No host.pid found — orphan detection disabled");
+					if (g_hostMonitorStopEvent && g_hookFailedEvent)
+						g_hostMonitorThread = CreateThread(NULL, 0, HostMonitorThreadFunc, NULL, 0, NULL);
+					if (g_hostMonitorThread) {
+						char buf[128];
+						sprintf_s(buf, "Hook monitor started (host PID %lu, liveness mutex %s)", g_hostPid,
+							g_hostPid == 0 ? "n/a" : g_hostAliveMutexOffered ? "offered" : "not offered: polling");
+						log_to_file(buf);
+					} else {
+						log_to_file("WARNING: Failed to create the hook monitor thread");
+						// Nobody would serve the hook-failed event: the present path then closes the heartbeat itself.
+						CloseHandleOnce(&g_hookFailedEvent);
+						if (HookRenderInitFailed()) {   // (reported in the instant before: do it here)
+							CloseHandleOnce(&g_heartbeatEvent);
+							CloseHandleOnce(&g_faldPanelLiveEvent);
+						}
 					}
 				}
 
@@ -1712,7 +1831,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		CloseHandleOnce(&g_heartbeatEvent);
 		CloseHandleOnce(&g_faldPanelLiveEvent);
 
-		// Only revert hooks/overlay mode if not already done by host monitor
+		// Only revert hooks/overlay mode if not already done by the monitor thread
 		if (!g_hookReverted.exchange(true)) {
 			if (g_overlayTestModePatched && g_pOverlayTestMode != NULL)
 			{
@@ -1736,7 +1855,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			}
 			MH_DisableHook(MH_ALL_HOOKS);
 			MH_Uninitialize();
+		} else {
+			// The monitor thread disabled the hooks (host gone, or this hook could not render) and left MinHook
+			// initialised: free its trampoline pages too. A hook that cannot render is unloaded by a LIVE host on
+			// every re-injection, and each skipped MH_Uninitialize left those pages behind in dwm.exe. No thread is
+			// inside a trampoline: MH_DisableHook moved any that was back into the original function.
+			MH_Uninitialize();
 		}
+		CloseHandleOnce(&g_hookFailedEvent);   // after the hooks are gone: the present path can no longer signal it
 		// Close shared memory
 		if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
 		if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }

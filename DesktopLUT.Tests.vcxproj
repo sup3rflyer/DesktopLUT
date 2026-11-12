@@ -207,6 +207,7 @@
     <ClCompile Include="tests\test_ui_shots.cpp" />
     <ClCompile Include="tests\test_reconcile.cpp" />
     <ClCompile Include="tests\test_whitelist.cpp" />
+    <ClCompile Include="tests\test_host_idle.cpp" />
     <ClCompile Include="tests\test_hook_services.cpp" />
     <ClCompile Include="tests\test_dwm_hook_safety.cpp" />
     <ClCompile Include="tests\test_dwmcore_scan.cpp" />

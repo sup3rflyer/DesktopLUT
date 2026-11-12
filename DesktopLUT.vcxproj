@@ -175,6 +175,7 @@
     <ClInclude Include="src\dwm_hook_build.h" />
     <ClInclude Include="src\dwmcore_scan.h" />
     <ClInclude Include="shared\dwm_hook_patterns.h" />
+    <ClInclude Include="shared\dwm_hook_host_alive.h" />
     <ClInclude Include="src\windows_tonemap.h" />
     <ClInclude Include="src\refresh_trim.h" />
     <ClInclude Include="src\uninstall.h" />
