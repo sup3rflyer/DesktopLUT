@@ -98,7 +98,7 @@ It has four pages:
 - **PIPELINE**: the selected display's pixel path, DESKTOP → TONE MAP (HDR only) → 3D LUT → FALD (shown as **+ FALD** until a panel file is set) → SCANOUT → PRIMARIES → GRAYSCALE → PANEL. Click a stage to open its settings. Each stage has its own switch; switching it off keeps its settings. The **HDR / SDR** switch at the top right shows the settings of either mode. The **MEASURED** column beside it shows what DLC last measured on the display, if you use DLC.
 - **DLC**: a calibration run in progress and the calibration record of each display (see [Calibrating with DLC](#calibrating-with-dlc-desktoplut-calibrator)).
 - **EVENTS**: a log of what DesktopLUT did. **ALL OUTPUT** adds the diagnostic log.
-- **SETTINGS**: interface, theme, startup, engine, calibration, hotkeys, console log, about.
+- **SETTINGS**: theme, startup, engine, calibration, hotkeys, console log, about.
 
 The lights on each stage:
 
@@ -115,11 +115,11 @@ The lights on each stage:
 
 Three themes are built in: Dark, Gray and Light (Settings → **THEME**).
 
-The previous window is still available: Settings → **INTERFACE** → **CLASSIC**, or the tray's "Classic interface" item. Two things are only there for now: the FALD LED-lag timing fields and the twin-monitor LUT routing tools. The DLC page, the event log, the themes and REFRESH TRIM are only in the new interface.
+The classic window of 3.0.0 is gone. A setup that used it opens this window instead; nothing configured changes.
 
 ## Common setups
 
-Select the display in the list first. The steps below use the new interface; in the classic window the same controls are on the **I. MHC**, **II. 3D LUT** and **III. Corrections** tabs.
+Select the display in the list first.
 
 ### 1. Correct SDR content in HDR mode
 This fixes washed-out SDR content (desktop, apps) while Windows is in HDR.
@@ -163,7 +163,7 @@ DLC is operated by an **LLM agent** (e.g. Claude Code launched in `DLC/`) with y
 You need:
 - a colorimeter (DLC is developed with the i1Display Pro family; a spectrometer is optional, for meter corrections);
 - Python 3.11+, ArgyllCMS 3.3.0 and dogegen (placed under `DLC/third_party/`);
-- DesktopLUT 3.0 or newer with its **calibration pipe armed**: Settings → **CALIBRATION** → **DLC CONTROL** (classic window: Settings tab → *Experimental* → *Calibration control (DLC)*), the tray's "Calibration control", or an empty `DesktopLUT_Calibration.flag` next to the exe. It is off by default; turn it off when you are done.
+- DesktopLUT 3.0 or newer with its **calibration pipe armed**: Settings → **CALIBRATION** → **DLC CONTROL**, the tray's "Calibration control", or an empty `DesktopLUT_Calibration.flag` next to the exe. It is off by default; turn it off when you are done.
 
 DesktopLUT shows what DLC did:
 - The **DLC** page follows a run in progress: stage, patches, live error and time left, with **PAUSE** / **RESUME** and **CANCEL** (cancel restores your setup from before the run). Decisions at the run's seams are made by the agent and shown here read-only. **COPY PROMPT** gives a ready-made request for the agent.
@@ -200,7 +200,9 @@ DesktopLUT shows a system tray icon that reflects the current state:
 
 The inverted icon specifically indicates the DD overlay is presenting frames. It does **not** activate for DWM hook operation, MHC profiles, or analysis-only mode — those run without a visible overlay.
 
-Click the icon to open the window. Right-click for Show, Classic interface, Suspend live layers, Run at startup, Calibration control and Exit (and End FALD view while a FALD view is on).
+Click the icon to open the window. Right-click for Show, Suspend live layers, Run at startup, Calibration control and Exit (and End FALD view while a FALD view is on).
+
+If the window cannot start (no Direct3D device, for example), a tray notification says why and everything configured keeps running. Show tries again.
 
 ## DWM Hook Mode
 
@@ -213,6 +215,8 @@ When enabled (Settings → **DWM HOOK**), 3D LUTs and HDR tonemapping are inject
 What it costs: while the hook is injected, DWM composes every window on every display, fullscreen and borderless games included, so the hook can process them. No app gets independent flip (DirectFlip) or a hardware overlay plane, and VRR (G-Sync, FreeSync) may be lost for games. Passthrough Mode does not change this: it hides DesktopLUT's overlay windows, not the hook. To give a game independent flip back, switch **DWM HOOK** off; overlay mode with Passthrough Mode then hides the corrections while that game runs.
 
 If the hook cannot be injected, or keeps detaching (quickly or over hours), DesktopLUT switches DWM Hook mode off by itself, says so, and applies your corrections with the overlay instead. Switch **DWM HOOK** on again to retry, after a Windows update for example.
+
+Two identical displays (same resolution and bit depth) look the same to the hook. After every injection DesktopLUT flashes a small square in each one's corner to tell them apart. Settings → **TWIN ROUTING** (shown only with such a pair) says how each was matched, flashes again (**IDENTIFY**) or exchanges the pair (**SWAP**) if a LUT lands on the wrong one.
 
 Windows updates can change the desktop compositor the hook patches. When this Windows' compositor is newer than anything the release was tested with, the hook still runs and the **DWM HOOK** row shows **UNTESTED WINDOWS UPDATE**. If colours then look wrong (a tint, flicker), switch **DWM HOOK** off.
 
