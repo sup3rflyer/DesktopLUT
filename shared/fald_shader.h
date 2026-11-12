@@ -72,8 +72,11 @@ cbuffer FaldCB : register(b0) {
     float chromaGain; float chromaLo; float chromaHi; float sdrGamma; // colour part of the pedestal term: strength + its own
                                                                     // pixel-luminance fade (lo = hi = 0: none); sdrGamma: the
                                                                     // panel's EOTF exponent (transfer 1 only)
-    uint _pad44; uint _pad45; uint _pad46; uint _pad47;             // 0 always: LED lag modes 1 / 2's words (the first-order
-                                                                    // filter, pass 1b; removed 2026-11-12)
+    uint _pad44; uint _pad45; uint _pad46; uint _pad47;             // LED lag modes 1 / 2's words (the first-order filter,
+                                                                    // pass 1b; removed 2026-11-12). 44 / 45 are the panel
+                                                                    // clock's again (2026-11-13, passes 1c-0 / 1c only, under
+                                                                    // their names there: the clock run's number and its
+                                                                    // FALD_CLOCK_REST_* flags); 46 / 47 = 0 always
     float boostLitNits; float boostLitFrac; float boostDimNits; float boostDimFrac; // zone activation rule of the boost count
                                                                     // (DLC FaldModel.active_zone_fraction): a zone is non-black
                                                                     // when more than LitFrac of its pixels exceed LitNits (0 =
@@ -1170,18 +1173,27 @@ inline unsigned int FaldZoneSlices(unsigned int cellW, unsigned int cellH) {
 // plain mean applies where the panel needs none must not dim the frame by more than that (DLC
 // paneltime.robust_transient, gpuemu.clock_robust_true32). (The plain mean of both maps — the pre-2026-10-23 pass, the
 // other arm of the owner's 2026-10-24 blind A/B, which the robust combination won — was a second variant until 2026-11-12.)
+// AT REST (shared/fald_temporal.h above FALD_CLOCK_REST_ALLOWED): when the watch pass (1c-0, below) found every zone
+// confined this run — its mark clkRest[0] is not this run's number — the pass writes nothing: the states and both maps
+// stand, nothing is flagged. Otherwise (and always with the ALLOWED flag clear) it is the pass it always was, bit for bit.
 inline const char* g_faldPanelClockSource = R"(
 RWTexture2D<float> clkTrueOut : register(u0);
 RWTexture2D<float> clkEstOut  : register(u1);
 RWTexture2D<float> clkState0  : register(u2);
 RWTexture2D<float> clkState1  : register(u3);
 RWStructuredBuffer<uint> changeFlags : register(u5);    // the partial path: a map that moved flags round 0 (both rounds read them)
+RWStructuredBuffer<uint> clkRest : register(u6);        // [0] = the last clock run in which a zone was not confined (pass 1c-0)
+#define clkRunSeq _pad44                                // CB word 44: this clock run's number
+#define clkRestFlags _pad45                             // CB word 45: bit 0 = the pass may rest (FALD_CLOCK_REST_ALLOWED)
 
 static const float FALD_CLOCK_ROBUST_CAP = 0.1f;        // shared/fald_temporal.h (DLC tests pin the three equal)
 
 [numthreads(16, 16, 1)]
 void main(uint3 id : SV_DispatchThreadID) {
     if (id.x >= cols || id.y >= rows) return;
+    [branch] if ((clkRestFlags & 1u) != 0u) {
+        [branch] if (clkRest[0] != clkRunSeq) return;   // at rest: nothing moves
+    }
     float d = driveTex.Load(int3(id.xy, 0));
     float s0 = clkState0[id.xy], s1 = clkState1[id.xy];
     float g0 = d - s0, g1 = d - s1;
@@ -1194,6 +1206,46 @@ void main(uint3 id : SV_DispatchThreadID) {
     clkTrueOut[id.xy] = oTrue;
     clkEstOut[id.xy] = oEst;
     clkState0[id.xy] = t0; clkState1[id.xy] = t1;
+}
+)";
+
+// Pass 1c-0, the WATCH (temporal mode 3; runs right before pass 1c, same CB and bindings; rules in shared/fald_temporal.h
+// above FALD_CLOCK_REST_ALLOWED). driveTex (t4) = the target pass 1c is about to aim the clocks at: the previous run's
+// round-1 drives. Per zone clkLevels = (c, q, n, 0): c = the target last seen, q = the distinct one before it, n = how
+// many times in a row the target went back to the one before it, each change committed by a run without new content
+// (A, B, A, B is n = 2); another value, or a change a content run committed, starts over. Two returns make a PAIR: once
+// back is what a decaying transient does when it touches a clamp (the drive of a clipped zone: max, lower, max, and
+// never the same lower value again), there and back twice between the same two values is the loop's own toggle. A zone
+// is confined when both clocks' states lie in [min(c, q), max(c, q)] (a pair) or equal c bit for bit (none). A zone that
+// is not confined writes this run's number to
+// clkRest[0]; pass 1c rests when nobody did. clkRest[1] / [2] echo the run's number and flags for the hosts' readback
+// (never waited for). Exact comparisons only; a NaN anywhere is "not confined".
+inline const char* g_faldPanelClockWatchSource = R"(
+RWTexture2D<float> clkState0  : register(u2);
+RWTexture2D<float> clkState1  : register(u3);
+RWStructuredBuffer<uint> clkRest : register(u6);        // [0] the last run with a zone not confined, [1] this run, [2] its flags
+RWStructuredBuffer<float4> clkLevels : register(u7);    // cols * rows: (c, q, n, 0)
+#define clkRunSeq _pad44
+#define clkRestFlags _pad45                             // bit 1 = start the levels over, bit 2 = no new content since the last watch
+
+[numthreads(16, 16, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0u && id.y == 0u) { clkRest[1] = clkRunSeq; clkRest[2] = clkRestFlags; }
+    if (id.x >= cols || id.y >= rows) return;
+    uint zi = id.y * cols + id.x;
+    float d = driveTex.Load(int3(id.xy, 0));
+    float4 lv = clkLevels[zi];
+    if ((clkRestFlags & 2u) != 0u) lv = float4(d, d, 0.0f, 0.0f);
+    else if (d != lv.x) {
+        if ((clkRestFlags & 4u) != 0u) lv = float4(d, lv.x, (d == lv.y) ? min(lv.z + 1.0f, 2.0f) : 0.0f, 0.0f);   // the loop moved it
+        else lv = float4(d, d, 0.0f, 0.0f);                                                     // the content moved it: no pair
+    }
+    clkLevels[zi] = lv;
+    float lo = lv.x, hi = lv.x;
+    if (lv.z >= 2.0f) { lo = min(lv.x, lv.y); hi = max(lv.x, lv.y); }
+    float s0 = clkState0[id.xy], s1 = clkState1[id.xy];
+    bool confined = s0 >= lo && s0 <= hi && s1 >= lo && s1 <= hi;
+    if (!confined) clkRest[0] = clkRunSeq;
 }
 )";
 

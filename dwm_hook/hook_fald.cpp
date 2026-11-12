@@ -12,6 +12,7 @@
 #include "fald_shader.h"
 #include "fald_shader_set.h"   // the layer's shaders as one list + their shipped bytecode
 #include "fald_temporal.h"
+#include "fald_clock_rest.h"     // the clock at rest: its buffers and their readback
 #include "fald_panel_live.h"
 #include "fald_core_governor.h"
 #include "fald_exempt.h"
@@ -55,6 +56,7 @@ static ID3D11ComputeShader* g_starWeightCS = nullptr;   // S1: tapered protectio
 static ID3D11ComputeShader* g_starPlanCS = nullptr;     // S2: target + the plan the pixels sample
 static ID3D11ComputeShader* g_starStatCombineCS = nullptr;   // S0 combine variant (zones > one slice, C14)
 static ID3D11ComputeShader* g_clockCS = nullptr;        // LED lag pass 1c: the two parity clocks (mode 3)
+static ID3D11ComputeShader* g_clockWatchCS = nullptr;   // pass 1c-0: the clock at rest (shared/fald_temporal.h); null = never rests
 static bool StarShadersReady() { return g_starStatCS && g_starWeightCS && g_starPlanCS; }
 // (the settle / content events are per monitor: FaldMonitor::settleEvt / contentEvt)
 static void FaldUnbindAll();          // with FaldRun
@@ -103,7 +105,7 @@ struct PassScope {
 #else
 struct PassScope { explicit PassScope(unsigned int, int = -1) {} };
 enum : unsigned int { FALD_HP_CLEAN_COPY, FALD_HP_PREDECIDE, FALD_HP_STAR_S0, FALD_HP_STAR_S0_FULL, FALD_HP_DECIDE_STAR, FALD_HP_STAR_S1,
-                      FALD_HP_STAR_S2, FALD_HP_CLOCK, FALD_HP_STAT0, FALD_HP_STAT0_FULL, FALD_HP_DECIDE0, FALD_HP_CORE_ZONE, FALD_HP_CONV0,
+                      FALD_HP_STAR_S2, FALD_HP_CLOCK_WATCH, FALD_HP_CLOCK, FALD_HP_STAT0, FALD_HP_STAT0_FULL, FALD_HP_DECIDE0, FALD_HP_CORE_ZONE, FALD_HP_CONV0,
                       FALD_HP_GAIN0, FALD_HP_CORE_CAP0, FALD_HP_STAT1, FALD_HP_STAT1_FULL, FALD_HP_DECIDE1, FALD_HP_CONV1,
                       FALD_HP_GAIN1, FALD_HP_CORE_CAP1, FALD_HP_COMMIT, FALD_HP_PIXEL_FULL, FALD_HP_PIXEL_RECTS, FALD_HP_TUNE };
 #endif
@@ -143,7 +145,7 @@ static bool CreateShaderStep(unsigned int id) {
     bool required = true;
     switch (id) {
     case FALD_SH_STAT_COMBINE: case FALD_SH_STAR_STAT: case FALD_SH_STAR_STAT_COMBINE: case FALD_SH_STAR_WEIGHT: case FALD_SH_STAR_PLAN:
-    case FALD_SH_PANEL_CLOCK: case FALD_SH_CORE_Z1: case FALD_SH_CORE_Z2: case FALD_SH_CORE_C1: case FALD_SH_CORE_CX: case FALD_SH_CORE_CY:
+    case FALD_SH_PANEL_CLOCK: case FALD_SH_PANEL_CLOCK_WATCH: case FALD_SH_CORE_Z1: case FALD_SH_CORE_Z2: case FALD_SH_CORE_C1: case FALD_SH_CORE_CX: case FALD_SH_CORE_CY:
         required = false; break;
     default: break;
     }
@@ -164,6 +166,7 @@ static bool CreateShaderStep(unsigned int id) {
         case FALD_SH_STAR_WEIGHT: hr = g_dev->CreateComputeShader(b.data, b.size, nullptr, &g_starWeightCS); break;
         case FALD_SH_STAR_PLAN: hr = g_dev->CreateComputeShader(b.data, b.size, nullptr, &g_starPlanCS); break;
         case FALD_SH_PANEL_CLOCK: hr = g_dev->CreateComputeShader(b.data, b.size, nullptr, &g_clockCS); break;
+        case FALD_SH_PANEL_CLOCK_WATCH: hr = g_dev->CreateComputeShader(b.data, b.size, nullptr, &g_clockWatchCS); break;
         default:
             if (id >= FALD_SH_CORE_Z1 && id < FALD_SH_COUNT) hr = FaldCore2CreateShader(g_dev, id - FALD_SH_CORE_Z1, b.data, b.size) ? S_OK : E_FAIL;
             break;
@@ -232,7 +235,7 @@ bool FaldInitShaders(ID3D11Device* dev, ID3D11DeviceContext* ctx) { return FaldI
 template <typename T> static void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 static void ReleaseFeatureShaders() {
-    SafeRelease(g_clockCS);
+    SafeRelease(g_clockCS); SafeRelease(g_clockWatchCS);
     if (g_primeEvent) { CloseHandle(g_primeEvent); g_primeEvent = NULL; }
     SafeRelease(g_starStatCombineCS);
     SafeRelease(g_starPlanCS); SafeRelease(g_starWeightCS); SafeRelease(g_starStatCS);
@@ -547,7 +550,7 @@ void FaldSyncPanelDeliveries(int left, int top, unsigned int hostPid, const unsi
 // ---------------------------------------------------------------------------------------------
 // Per-monitor resources
 // ---------------------------------------------------------------------------------------------
-static const size_t FALD_MONITOR_AUDITED_BYTES = 5040;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
+static const size_t FALD_MONITOR_AUDITED_BYTES = 5168;   // sizeof(FaldMonitor) the live-swap audit below covers (x64)
                                                          // (2026-10-19: + FaldPanelParams::latW / latH in params and
                                                          // spareParams — panel-file state, BUILT FRESH / KEPT as before;
                                                          // 2026-10-20: + the fade stack's five fields; 2026-10-22: + the
@@ -557,7 +560,10 @@ static const size_t FALD_MONITOR_AUDITED_BYTES = 5040;   // sizeof(FaldMonitor) 
                                                          // tuner, its key and `stored`; 2026-11-12: - the flank fade's
                                                          // fields, its governor and cleanGen, - LED lag modes 1 / 2's state
                                                          // texture, delay ring and round-0 filtered map; + the late
-                                                         // arguments buffer and its view, panel-part state BUILT FRESH)
+                                                         // arguments buffer and its view, panel-part state BUILT FRESH;
+                                                         // 2026-11-13: + clkRest, the clock-at-rest buffers and their
+                                                         // readback slots — panel-clock resources, BUILT FRESH with the
+                                                         // clock textures — and the base's eight rest words)
 struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_temporal.h (the overlay's FaldResources too)
     int left = 0, top = 0;
     bool isHdr = false;
@@ -691,6 +697,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
     ID3D11Texture2D* clkStateTex[2] = {}; ID3D11UnorderedAccessView* clkStateUAV[2] = {}; ID3D11ShaderResourceView* clkStateSRV[2] = {};
     ID3D11Texture2D* clkPrevTex = nullptr; ID3D11UnorderedAccessView* clkPrevUAV = nullptr; ID3D11ShaderResourceView* clkPrevSRV = nullptr;
     ID3D11Texture2D* clkEstTex = nullptr;  ID3D11UnorderedAccessView* clkEstUAV = nullptr;  ID3D11ShaderResourceView* clkEstSRV = nullptr;
+    FaldClockRestGpu clkRest;                             // the clock at rest (shared/fald_clock_rest.h): made with the clock textures
 
     // GPU cost accumulated between log lines (microseconds; from the timestamp queries)
     double gpuSumUs = 0.0, gpuStarSumUs = 0.0, gpuMaxUs = 0.0, gpuCoreSumUs = 0.0;
@@ -735,7 +742,7 @@ struct FaldMonitor : FaldTemporalState {   // LED-lag bookkeeping: shared/fald_t
 //     gainFused, the boost counters and the change-driven path's maps / list / flags / arguments and its
 //     runMode, stateComplete, planPartial, lastPartial, lastRunKind, lastSettingsKey, lastLutPassKey, planSettingsKey, lastTrueMap,
 //     lastEstMap, touched, touchedOk, rects among the panel tables), zoneSlices, cb, starOn,
-//     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, core2 / core2On /
+//     starFailed, the five starfield textures, clockFailed, the LED-lag and panel-clock textures, clkRest, core2 / core2On /
 //     core2Flags (the core's textures, released with the old panel part by ReleaseMonitor, rebuilt by ResolveFeatures),
 //     coreForce, fieldsStand, and the whole FaldTemporalState base (the LED-lag bookkeeping).
 // A field added to FaldMonitor changes its size and stops this assert: put it in one of the lists above (and in
@@ -781,7 +788,9 @@ static void ReleaseClock(FaldMonitor* m) {
     for (unsigned int i = 0; i < 2; i++) { SafeRelease(m->clkStateSRV[i]); SafeRelease(m->clkStateUAV[i]); SafeRelease(m->clkStateTex[i]); }
     SafeRelease(m->clkPrevSRV); SafeRelease(m->clkPrevUAV); SafeRelease(m->clkPrevTex);
     SafeRelease(m->clkEstSRV); SafeRelease(m->clkEstUAV); SafeRelease(m->clkEstTex);
+    FaldClockRestRelease(&m->clkRest);
     m->clkElapsed = 0; m->clkIndex = 0; m->clkSeeded = false;   // as src/fald.cpp ReleaseClock
+    m->clkLevelsValid = false; m->clkRestKnown = false;         // (the watch pass's levels went with the buffers)
 }
 
 static void ReleaseTemporal(FaldMonitor* m) {
@@ -1084,8 +1093,13 @@ static bool EnsureClock(FaldMonitor* m) {
     if (MakeRWTexture(p.cols, p.rows, &m->clkStateTex[0], &m->clkStateUAV[0], &m->clkStateSRV[0]) &&
         MakeRWTexture(p.cols, p.rows, &m->clkStateTex[1], &m->clkStateUAV[1], &m->clkStateSRV[1]) &&
         MakeRWTexture(p.cols, p.rows, &m->clkPrevTex, &m->clkPrevUAV, &m->clkPrevSRV) &&
-        MakeRWTexture(p.cols, p.rows, &m->clkEstTex, &m->clkEstUAV, &m->clkEstSRV))
+        MakeRWTexture(p.cols, p.rows, &m->clkEstTex, &m->clkEstUAV, &m->clkEstSRV)) {
+        // the clock at rest: its two buffers (a failure only means the clock never rests: the layer as it was)
+        m->clkLevelsValid = false;
+        if (!FaldClockRestCreate(&m->clkRest, g_dev, p.cols * p.rows))
+            LogF("FALD: pos(%d,%d) the panel clock's rest buffers could not be created - it never rests", m->left, m->top);
         return true;
+    }
     ReleaseClock(m);
     m->clockFailed = true;
     LogF("FALD: pos(%d,%d) panel clock textures could not be created - LED lag mode 3 runs as off", m->left, m->top);
@@ -1706,7 +1720,8 @@ static void FillCB(FaldMonitor* m, uint32_t roundIdx, uint32_t blurDir = 0, bool
     f[41] = (p.chromaLo < 0.0f) ? p.lumFadeLo : p.chromaLo;
     f[42] = (p.chromaHi < 0.0f) ? p.lumFadeHi : p.chromaHi;
     f[43] = p.sdrGamma;                                                             // panel EOTF exponent (transfer 1)
-    u[44] = 0u; u[45] = 0u; u[46] = 0u; u[47] = 0u;                                // retired (LED lag modes 1 / 2's words)
+    u[44] = m->clkRunSeq; u[45] = m->clkRestFlags;                                  // the panel clock's run number and rest flags
+    u[46] = 0u; u[47] = 0u;                                                         // (passes 1c-0 / 1c only); 46 / 47 retired
     // black-frame LED boost: the zone activation rule (words 48-51; read only when word 34 != 0)
     f[48] = p.boostLitNits; f[49] = p.boostLitFrac; f[50] = p.boostDimNits; f[51] = p.boostDimFrac;
     // Starfield words 52-65: the clamped settings, written even while the feature is off (the shader
@@ -2017,8 +2032,12 @@ static void RunGain(FaldMonitor* m, uint32_t roundIdx, bool indirect = false) {
 static void RunPanelClock(FaldMonitor* m, bool partial) {
     const FaldPanelParams& p = m->params;
     m->runMode = (m->runMode & ~0xFFu) | (partial ? 1u : 0u);   // (the pass compares on the partial path: its own bit)
+    // The clock at rest (shared/fald_temporal.h): the run's number and flags (CB words 44 / 45), the watch pass before
+    // the clock pass — same CB, same bindings + u6 / u7 — and the words' snapshot for a later run's readback.
+    const bool watch = g_clockWatchCS && m->clkRest.wordsUAV && m->clkRest.levelsUAV;
+    FaldClockRestBegin(m);
+    if (!watch) m->clkRestFlags &= ~FALD_CLOCK_REST_ALLOWED;
     FillCB(m, 0);
-    g_ctx->CSSetShader(g_clockCS, nullptr, 0);   // unknown parity: the robust combination
     g_ctx->CSSetConstantBuffers(0, 1, &m->cb);
     g_ctx->CSSetShaderResources(4, 1, &m->clkPrevSRV);
     // u0 = the ONE B_true map both rounds' real-spread kernel reads this run (mapSrv's clockMaps): the round-1 filtered
@@ -2026,8 +2045,17 @@ static void RunPanelClock(FaldMonitor* m, bool partial) {
     // (2026-10-22: a branch wrote a round-0 slot while round 1's convolution read round 1's — a map nothing writes in mode 3.)
     ID3D11UnorderedAccessView* uavs[6] = { m->driveFiltUAV, m->clkEstUAV, m->clkStateUAV[0], m->clkStateUAV[1], nullptr, m->changeFlagsUAV };
     g_ctx->CSSetUnorderedAccessViews(0, 6, uavs, nullptr);
+    ID3D11UnorderedAccessView* rest[2] = { m->clkRest.wordsUAV, m->clkRest.levelsUAV };
+    g_ctx->CSSetUnorderedAccessViews(6, 2, rest, nullptr);
+    if (watch) {
+        g_ctx->CSSetShader(g_clockWatchCS, nullptr, 0);
+        PassScope scope(FALD_HP_CLOCK_WATCH);
+        g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1);
+    }
+    g_ctx->CSSetShader(g_clockCS, nullptr, 0);   // unknown parity: the robust combination
     { PassScope scope(FALD_HP_CLOCK); g_ctx->Dispatch((p.cols + 15) / 16, (p.rows + 15) / 16, 1); }
     UnbindCompute();   // clears all FALD_UAV_SLOTS
+    if (watch) FaldClockRestSnapshot(&m->clkRest, g_ctx);
 }
 
 // Starfield balancing, mirror of src/fald.cpp RunStar: S0 star statistic of the SOURCE frame -> S1
@@ -2488,6 +2516,8 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     // GPU timing: collect finished slots (no flush, no wait; the rate-cap governor gets each full run's core time).
     GpuTimingCollect(m);
     TuneCollect();                           // the conv auto-tune's finished timed dispatches (any entry's)
+    // the clock at rest: what the GPU decided some runs ago (no flush, no wait) — it ends a settle hold with nothing to settle
+    FaldClockRestCollect(&m->clkRest, g_ctx, [m](const uint32_t* w) { FaldClockRestNote(m, w[0], w[1], w[2]); });
     const double nowMs = freq.QuadPart > 0 ? (double)t0.QuadPart * 1000.0 / (double)freq.QuadPart : 0.0;
     if (newContent) m->coreGov.OnContentFrame(nowMs);
     // the drive maps the kernels of a round read: round 0 has its own instantaneous map; the panel clock's B_true map —
@@ -2678,11 +2708,11 @@ bool FaldRun(FaldMonitor* m, ID3D11RenderTargetView* dstRTV, bool newContent, un
     if (partial) m->partialRuns++;
     if ((m->framesRun % 600ull) == 1ull) {
         if (m->gpuSamples > 0)
-            LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us | GPU avg %.0f us (core %.0f), max %.0f us, starfield %.0f us (%u samples) [star %s, core mode %u %s, partial runs %llu, held runs %llu, governor %s]",
+            LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us | GPU avg %.0f us (core %.0f), max %.0f us, starfield %.0f us (%u samples) [star %s, core mode %u %s, partial runs %llu, held runs %llu, governor %s, clock runs %u (at rest %llu)]",
                  m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs,
                  m->gpuSumUs / m->gpuSamples, m->gpuCoreSumUs / m->gpuSamples, m->gpuMaxUs, m->gpuStarSumUs / m->gpuSamples, m->gpuSamples,
                  m->starOn ? "on" : "off", m->coreModeWanted, m->core2On ? FaldCoreModeName(m->coreModeWanted) : "C",
-                 m->partialRuns, m->heldRuns, FaldCoreGovStateName(m->coreGov.State()));
+                 m->partialRuns, m->heldRuns, FaldCoreGovStateName(m->coreGov.State()), m->clkRunSeq, m->clkRestRuns);
         else
             LogF("FALD: pos(%d,%d) %s frame %llu, CPU %.0f us/frame in the present path (no GPU timing yet) [star %s]",
                  m->left, m->top, m->isHdr ? "HDR" : "SDR(ACM)", m->framesRun, m->lastRunUs,
@@ -2718,9 +2748,20 @@ ID3D11Buffer* FaldTestLateArgs(FaldMonitor* m) { return m ? m->argsLateBuf : nul
 unsigned int FaldTestLastRunKind(const FaldMonitor* m) { return m ? m->lastRunKind : 0u; }
 unsigned int FaldTestConvTuneState(const FaldMonitor* m) { return m ? (unsigned int)m->convTune.GetState() : 0u; }
 unsigned int FaldTestConvSo(const FaldMonitor* m) { return m ? FaldConvSoOf(m->convVariant) : 0u; }
+ID3D11Buffer* FaldTestClockRestWords(FaldMonitor* m) { return m ? m->clkRest.words : nullptr; }
+ID3D11Buffer* FaldTestClockLevels(FaldMonitor* m) { return m ? m->clkRest.levels : nullptr; }
+unsigned long long FaldTestClockRestRuns(const FaldMonitor* m) { return m ? m->clkRestRuns : 0ull; }
+unsigned int FaldTestClockRestSeq(const FaldMonitor* m) { return m ? m->clkRestSeq : 0u; }
+bool FaldTestClockRestKnown(const FaldMonitor* m) { return m && m->clkRestKnown; }
+unsigned int FaldTestClockRunSeq(const FaldMonitor* m) { return m ? m->clkRunSeq : 0u; }
+unsigned int FaldTestSettleLeft(const FaldMonitor* m) { return m ? m->settleLeft : 0u; }
+ID3D11Texture2D* FaldTestClockTex(FaldMonitor* m, unsigned int which) {
+    if (!m) return nullptr;
+    return which == 0u ? m->clkStateTex[0] : (which == 1u ? m->clkStateTex[1] : (which == 2u ? m->clkPrevTex : (which == 3u ? m->driveFiltTex : m->clkEstTex)));
+}
 const char* FaldHookPassName(unsigned int pass) {
     static const char* const names[FALD_HP_COUNT] = {
-        "clean_copy", "predecide", "star_s0", "star_s0_full", "decide_star", "star_s1", "star_s2", "clock",
+        "clean_copy", "predecide", "star_s0", "star_s0_full", "decide_star", "star_s1", "star_s2", "clock_watch", "clock",
         "stat0", "stat0_full", "decide0", "core_zone", "conv0", "gain0", "core_cap0",
         "stat1", "stat1_full", "decide1", "conv1", "gain1", "core_cap1",
         "commit", "pixel_full", "pixel_rects", "tune" };

@@ -19,7 +19,7 @@ enum FaldShaderId : unsigned int {
     FALD_SH_PIXEL,                                               // ps_5_0
     FALD_SH_FULLSCREEN_VS,                                       // vs_5_0 (the hook's; the overlay binds its own identical one)
     FALD_SH_STAR_STAT, FALD_SH_STAR_STAT_COMBINE, FALD_SH_STAR_WEIGHT, FALD_SH_STAR_PLAN,
-    FALD_SH_PANEL_CLOCK,
+    FALD_SH_PANEL_CLOCK, FALD_SH_PANEL_CLOCK_WATCH,                // pass 1c and its watch (1c-0: the clock at rest)
     FALD_SH_CORE_Z1, FALD_SH_CORE_Z2, FALD_SH_CORE_C1, FALD_SH_CORE_CX, FALD_SH_CORE_CY,   // shared/fald_core2.cpp, in its order
     FALD_SH_COUNT
 };
@@ -36,7 +36,7 @@ inline const char* FaldShaderName(unsigned int id) {
         "FaldStatCS", "FaldStatCombineCS", "FaldConvCS1", "FaldConvCS2", "FaldConvCS4", "FaldConvCS8",
         "FaldGainCS", "FaldBlurCS", "FaldGainBlurCS", "FaldDecideCS", "FaldPS", "FaldVS",
         "FaldStarStatCS", "FaldStarStatCombineCS", "FaldStarWeightCS", "FaldStarPlanCS", "FaldPanelClockCS",
-        "FaldCore2Z1", "FaldCore2Z2", "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
+        "FaldPanelClockWatchCS", "FaldCore2Z1", "FaldCore2Z2", "FaldCore5C1", "FaldCore5CapX", "FaldCore5CapY" };
     return id < FALD_SH_COUNT ? names[id] : "?";
 }
 inline const char* FaldShaderTarget(unsigned int id) {
@@ -62,6 +62,7 @@ inline std::string FaldShaderSource(unsigned int id) {
     case FALD_SH_STAR_WEIGHT: return common + g_faldStarWeightSource;
     case FALD_SH_STAR_PLAN: return common + g_faldStarPlanSource;
     case FALD_SH_PANEL_CLOCK: return common + g_faldPanelClockSource;
+    case FALD_SH_PANEL_CLOCK_WATCH: return common + g_faldPanelClockWatchSource;
     case FALD_SH_CORE_Z1: case FALD_SH_CORE_Z2: case FALD_SH_CORE_C1: case FALD_SH_CORE_CX: case FALD_SH_CORE_CY:
         return FaldCore2ShaderSource(id - FALD_SH_CORE_Z1, g_faldCommonSource);
     default: return std::string();

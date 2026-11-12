@@ -111,7 +111,11 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "f[64] = sc.targetSigma; f[65] = sc.keepNits;" in cpp
     assert "f[66] = r->clkW[0]; f[67] = r->clkW[1];" in cpp
     assert "f[68] = r->clkFactor[0]; f[69] = r->clkFactor[1]; f[70] = r->clkFactor[2]; f[71] = r->clkFactor[3];" in cpp
-    assert "u[75] = 0u;" in cpp and "u[44] = 0u; u[45] = 0u; u[46] = 0u; u[47] = 0u;" in cpp   # the retired words
+    assert "u[75] = 0u;" in cpp and "u[46] = 0u; u[47] = 0u;" in cpp   # the retired words
+    # words 44 / 45: the panel clock's run number and rest flags (2026-11-13, shared/fald_temporal.h "the clock at rest";
+    # read by passes 1c-0 / 1c only, under those names — the cbuffer keeps _pad44 / _pad45)
+    assert "u[44] = r->clkRunSeq; u[45] = r->clkRestFlags;" in cpp
+    assert "#define clkRunSeq _pad44" in src and "#define clkRestFlags _pad45" in src
     # ... and the DWM hook's (dwm_hook/hook_fald.cpp; its starfield settings come from the tuning tail `t`)
     hook = _HOOK.read_text(encoding="utf-8")
     assert "u[35] = m->starOn ? 1u : 0u;" in hook
@@ -121,7 +125,8 @@ def test_python_reference_constants_match_the_hlsl_source():
     assert "f[64] = t.starTargetSigma; f[65] = t.starKeepNits;" in hook
     assert "f[66] = m->clkW[0]; f[67] = m->clkW[1];" in hook
     assert "f[68] = m->clkFactor[0]; f[69] = m->clkFactor[1]; f[70] = m->clkFactor[2]; f[71] = m->clkFactor[3];" in hook
-    assert "u[75] = 0u;" in hook and "u[44] = 0u; u[45] = 0u; u[46] = 0u; u[47] = 0u;" in hook   # the retired words
+    assert "u[75] = 0u;" in hook and "u[46] = 0u; u[47] = 0u;" in hook   # the retired words
+    assert "u[44] = m->clkRunSeq; u[45] = m->clkRestFlags;" in hook
     decl = re.search(r"float starNbLo; float starNbHi; (\w+) starReach; (\w+) starEvenReach;", cb)
     assert decl.groups() == ("uint", "uint")
 

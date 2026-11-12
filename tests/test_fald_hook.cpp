@@ -949,3 +949,290 @@ TEST_CASE("FALD hook: the layer's shaders are created from shipped bytecode in s
     ic->ClearState(); ic->Flush();
     ic->Release(); dev->Release();
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The panel clock AT REST (shared/fald_temporal.h above FALD_CLOCK_REST_ALLOWED), by counters and bytes. One schedule of
+// presents — a frame, the settle presents of a still desktop, presents half a second apart, edits that move no drive
+// and edits that do — runs three times with the time SET (g_faldTestNowQpc): the hook with the clock never at rest
+// (g_faldClockRestOverride = 0: the layer as it was, "U"), the hook as shipped ("R"), the overlay as shipped. Held:
+//   * R comes to rest on the still desktop (the watch pass's words, read back here), and from then on a still present
+//     runs no convolution and no whole-frame pass (the pass probe's counters), where U keeps paying for them while its
+//     maps move;
+//   * every still frame of R's first rest is, byte for byte, a frame U produced since the last content present;
+//   * a content present that moves no drive leaves R at rest (no convolution), and R's settle hold ends within a few
+//     presents of it (the non-blocking readback) where U's runs its full count;
+//   * the present after an edit that moves drives finds R's clock NOT at rest and pays in full; R rests again later;
+//   * R's output is never further from U's than a bound (reported per kept present: components and nits);
+//   * the overlay as shipped equals the hook as shipped, present for present.
+// ---------------------------------------------------------------------------------------------------------------------
+namespace {
+struct HkRestStep { int k; int kind; bool keep; };   // kind: 0 still, 1 the frame (seed), 2 the same pixels in a rect, 3 a dark patch,
+                                                    // 4 a white patch, 5 the white patch black again
+std::vector<HkRestStep> HkRestSchedule() {
+    std::vector<HkRestStep> s;
+    auto stills = [&s](int n, int keepLast) { for (int i = 0; i < n; i++) s.push_back({ 1, 0, i >= n - keepLast || i < 2 }); };
+    s.push_back({ 0, 1, true });
+    stills(30, 2);
+    s.push_back({ 64, 0, true }); stills(28, 2);          // half a second later: a present without content, its settle presents
+    s.push_back({ 64, 2, true }); stills(6, 6);           // the same pixels recomposed
+    s.push_back({ 64, 3, true }); stills(6, 6);           // a dark patch
+    s.push_back({ 64, 4, true }); stills(30, 2);          // a white patch: drives move
+    s.push_back({ 64, 0, true }); stills(28, 2);
+    s.push_back({ 64, 5, true }); stills(8, 8);           // the patch black: drives move again
+    return s;
+}
+const RECT kRestSame = { 700, 295, 740, 330 }, kRestDark = { 300, 500, 340, 530 }, kRestWhite = { 100, 100, 300, 300 };
+struct HkRestRun {
+    std::vector<std::string> hash;                         // every present's output
+    std::vector<std::vector<unsigned char>> kept;          // the kept presents' bytes (empty otherwise)
+    std::vector<int> rest;                                 // 1 = the clock run of this present was at rest, 0 = not, -1 = no clock run
+    std::vector<int> costly;                               // the present ran a convolution or a whole-frame pass
+    std::vector<unsigned int> settleLeft;
+    std::vector<int> pairs;                                // zones with a toggle pair (the watch pass's levels)
+};
+}  // namespace
+
+TEST_CASE("FALD hook: the panel clock comes to rest on a still desktop, a present then costs what it changes, a moved drive ends the rest (WARP; FALD_TEST_FADE_DIR)") {
+    const std::string cells = HookEnv("FALD_TEST_FADE_DIR");
+    if (cells.empty()) return;
+    const std::wstring ODD = std::wstring(cells.begin(), cells.end()) + L"\\odd_panel.bin";
+    std::vector<unsigned char> base;
+    REQUIRE(ReadAll(cells + "/x_odd1366.rgba16f", base));
+    REQUIRE(base.size() == (size_t)kClockW * kClockH * 8u);
+    const float periodMs = 1000.0f / 120.0f;
+    const long long f = HkQpcFreq();
+    const double periodQpc = (double)periodMs * (double)f / 1000.0;
+    DwmHookFaldTuning tuning = {};
+    tuning.starEven = 0.8f; tuning.starTargetGain = 1.0f; tuning.starKeepNits = 100.0f; tuning.starStrength = 1.0f;
+    tuning.starAreaLo = 40.0f; tuning.starAreaHi = 160.0f; tuning.starNbLo = 0.15f; tuning.starNbHi = 0.30f;
+    tuning.starReach = 2u; tuning.starEvenReach = 8u;
+    tuning.tempMode = FALD_TEMPORAL_PANEL; tuning.tempClockClosure = FALD_CLOCK_CLOSURE_DEFAULT; tuning.tempClockParity = -1;
+    tuning.refreshMs = periodMs;
+    const std::vector<HkRestStep> sched = HkRestSchedule();
+    const int n = (int)sched.size();
+    struct Restore { ~Restore() { g_faldClockRestOverride = -1; g_faldTestNowQpc = 0; g_faldPartialOverride = -1; } } restore;
+    auto edit = [](std::vector<unsigned char>& frame, const std::vector<unsigned char>& orig, int kind, std::vector<RECT>& rects) {
+        if (kind == 2) rects.push_back(kRestSame);
+        else if (kind == 3) { HkPatch(frame, kRestDark, 0x0400); rects.push_back(kRestDark); }
+        else if (kind == 4) { HkPatch(frame, kRestWhite, 0x3C00); rects.push_back(kRestWhite); }
+        else if (kind == 5) { HkPatch(frame, kRestWhite, 0x0000); rects.push_back(kRestWhite); }
+        (void)orig;
+    };
+    HkRestRun runs[3];                                     // 0 = U (hook, never at rest), 1 = R (hook as shipped), 2 = the overlay as shipped
+    for (int pass = 0; pass < 3; pass++) {
+        HkRestRun& out = runs[pass];
+        g_faldClockRestOverride = pass == 0 ? 0 : -1;
+        g_faldPartialOverride = -1;
+        const long long t0 = HkQpc();
+        long long N = 0;
+        if (pass == 2) {
+            std::vector<unsigned char> frame = base;
+            OverlayClockRef ov(ODD);
+            REQUIRE(ov.ok);
+            ov.ctx.frameTimeExactMs = periodMs;
+            for (int i = 0; i < n; i++) {
+                std::vector<RECT> rects;
+                edit(frame, base, sched[i].kind, rects);
+                N += sched[i].k;
+                g_faldTestNowQpc = t0 + (long long)((double)N * periodQpc + 0.5);
+                out.hash.push_back(HookFnvLine(ov.Run(frame, sched[i].kind != 0)));
+            }
+            g_faldTestNowQpc = 0;
+            continue;
+        }
+        HookWarp w;
+        REQUIRE(w.ok);
+        Staged staged(ODD, true);
+        REQUIRE(staged.ok);
+        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
+        HookMonitor hm(w, kClockW, kClockH, true, true);
+        hm.tuning = &tuning;
+        hm.frame = base;
+        FaldPassProbe probe(w.dev, w.ic, false);
+        for (int i = 0; i < n; i++) {
+            std::vector<RECT> rects;
+            edit(hm.frame, base, sched[i].kind, rects);
+            N += sched[i].k;
+            g_faldTestNowQpc = t0 + (long long)((double)N * periodQpc + 0.5);
+            HookMonitor::Result r;
+            probe.BeginPresent();
+            if (sched[i].kind == 1) { for (int a = 0; a < 3; a++) { r = hm.Present(true, false); if (r.ran) break; } }
+            else r = hm.Present(sched[i].kind != 0, false, &rects);        // (a still present: no rect)
+            REQUIRE_MESSAGE(r.ran, "pass " << pass << " present " << i << ": " << r.err);
+            FaldMonitor* m = FaldAcquire(0, 0, true, kClockW, kClockH, DXGI_FORMAT_R16G16B16A16_FLOAT);
+            REQUIRE(m);
+            probe.EndPresent(FaldTestArgs(m), FaldTestLateArgs(m), FaldTestLastPartial(m));
+            const std::vector<unsigned char> words = ReadBackBuf(w.dev, w.ic, FaldTestClockRestWords(m));
+            int rest = -1, pairs = 0;
+            if (words.size() >= 16 && r.clockElapsed >= 1ull && !r.clockSeeded) {
+                uint32_t wd[4]; std::memcpy(wd, words.data(), 16);
+                CHECK_MESSAGE(wd[1] == FaldTestClockRunSeq(m), "pass " << pass << " present " << i << ": the watch pass's echo is not this clock run's number");
+                rest = ((wd[2] & FALD_CLOCK_REST_ALLOWED) != 0u && wd[0] != wd[1]) ? 1 : 0;
+                const std::vector<unsigned char> lv = ReadBackBuf(w.dev, w.ic, FaldTestClockLevels(m));
+                for (size_t z = 0; z + 16 <= lv.size(); z += 16) { float v[4]; std::memcpy(v, lv.data() + z, 16); if (v[2] >= 2.0f) pairs++; }
+            }
+            out.rest.push_back(rest);
+            out.pairs.push_back(pairs);
+            out.settleLeft.push_back(FaldTestSettleLeft(m));
+            out.costly.push_back((!FaldTestLastPartial(m) || probe.ran[FALD_HP_CONV0] || probe.ran[FALD_HP_CONV1] || probe.ran[FALD_HP_PIXEL_FULL] ||
+                                  probe.ran[FALD_HP_STAT0_FULL] || probe.ran[FALD_HP_STAT1_FULL]) ? 1 : 0);
+            FaldReturn(m);
+            std::vector<unsigned char> px = ReadBackTex(w.dev, w.ic, hm.back);
+            out.hash.push_back(HookFnvLine(px));
+            out.kept.push_back(sched[i].keep ? std::move(px) : std::vector<unsigned char>());
+        }
+        g_faldTestNowQpc = 0;
+    }
+    g_faldClockRestOverride = -1;
+    const HkRestRun& U = runs[0]; const HkRestRun& R = runs[1];
+    REQUIRE((int)U.hash.size() == n);
+    REQUIRE((int)R.hash.size() == n);
+    REQUIRE((int)runs[2].hash.size() == n);
+
+    // the unheld layer never rests; the overlay as shipped is the hook as shipped
+    int firstRest = -1, restPresents = 0, uCostlyStill = 0, rCostlyStill = 0, uCostlyAtRest = 0;
+    for (int i = 0; i < n; i++) {
+        CHECK_MESSAGE(U.rest[i] != 1, "present " << i << ": the clock rested with g_faldClockRestOverride = 0");
+        CHECK_MESSAGE(runs[2].hash[i] == R.hash[i], "present " << i << ": the overlay's output differs from the hook's (both as shipped)");
+        if (R.rest[i] == 1) { restPresents++; if (firstRest < 0) firstRest = i; }
+        if (sched[i].kind == 0) { uCostlyStill += U.costly[i]; rCostlyStill += R.costly[i]; if (R.rest[i] == 1) uCostlyAtRest += U.costly[i]; }
+    }
+    // (1) the still desktop: at rest before the first edit, and from the first rest to that edit every present is at rest,
+    // costs no convolution and no whole-frame pass, and shows a frame U produced since the last content present
+    int firstEdit = 0;
+    for (int i = 1; i < n; i++) if (sched[i].kind >= 2) { firstEdit = i; break; }
+    REQUIRE(firstEdit > 0);
+    CHECK_MESSAGE((firstRest > 0 && firstRest < firstEdit), "the clock did not come to rest on the still desktop (first rest at present " << firstRest << ")");
+    if (firstRest > 0 && firstRest < firstEdit) {
+        CHECK_MESSAGE(R.hash[firstRest - 1] == U.hash[firstRest - 1], "the run before the first rest is not the unheld layer's");
+        for (int i = firstRest; i < firstEdit; i++) {
+            CHECK_MESSAGE(R.rest[i] == 1, "present " << i << ": a still desktop, and the clock left its rest");
+            CHECK_MESSAGE(R.costly[i] == 0, "present " << i << ": at rest, and a convolution or a whole-frame pass ran");
+            bool inSet = false;
+            for (int j = 0; j <= i && !inSet; j++) inSet = U.hash[j] == R.hash[i];
+            CHECK_MESSAGE(inSet, "present " << i << ": the frame at rest is not one the unheld layer produced");
+        }
+    }
+    // (2) / (3) the edits
+    for (int i = firstEdit; i < n; i++) {
+        const int kind = sched[i].kind;
+        if (kind < 2 || i + 1 >= n) continue;
+        const std::string id = "present " + std::to_string(i) + " (edit kind " + std::to_string(kind) + ")";
+        if (kind == 2) {            // the same pixels: nothing moved
+            CHECK_MESSAGE(R.rest[i] == 1, id << ": the content present itself (the clock sees the previous target)");
+            CHECK_MESSAGE(R.costly[i] == 0, id << ": the same pixels, and a convolution or a whole-frame pass ran");
+            CHECK_MESSAGE(R.rest[i + 1] == 1, id << ": the present after the same pixels left the rest");
+            // the settle hold: armed by the content present, ended by the readback of a clock run at rest after it
+            CHECK_MESSAGE(R.settleLeft[i] > 0u, id << ": the content present should arm the settle hold");
+            bool ended = false;
+            for (int j = i + 1; j <= i + 5 && j < n; j++) if (R.settleLeft[j] == 0u) ended = true;
+            CHECK_MESSAGE(ended, id << ": the settle hold did not end within five presents at rest");
+            CHECK_MESSAGE(U.settleLeft[((i + 5 < n - 1) ? i + 5 : n - 1)] > 0u, id << ": the unheld layer's settle hold should still run");
+        }
+        if (kind == 4 || kind == 5) {   // drives move: the next present's clock run is not at rest, and it pays
+            CHECK_MESSAGE(R.rest[i + 1] == 0, id << ": the present after a moved drive found the clock at rest");
+            CHECK_MESSAGE(R.costly[i + 1] == 1, id << ": the present after a moved drive ran no convolution");
+        }
+        if (kind == 3)
+            MESSAGE(id << ": after the dark patch the clock is " << std::string(R.rest[i + 1] == 1 ? "at rest (no drive moved)" : "not at rest (a drive moved)")
+                    << ", the present after it " << std::string(R.costly[i + 1] ? "paid in full" : "ran no convolution"));
+    }
+    // it rests again after the white patch (before the patch goes black)
+    {
+        int white = -1, black = -1;
+        for (int i = 0; i < n; i++) { if (sched[i].kind == 4) white = i; if (sched[i].kind == 5) black = i; }
+        bool again = false;
+        for (int i = white + 2; i < black; i++) if (R.rest[i] == 1) again = true;
+        CHECK_MESSAGE(again, "the clock did not come to rest again after the white patch");
+    }
+    CHECK(rCostlyStill <= uCostlyStill);
+    // (4) how far the picture at rest is from the unheld layer's: per kept present
+    size_t worstComp = 0; double worstAbs = 0.0; int differing = 0, kept = 0, worstAt = -1;
+    for (int i = 0; i < n; i++) {
+        if (U.kept[i].empty() || R.kept[i].empty()) continue;
+        kept++;
+        if (U.kept[i] == R.kept[i]) continue;
+        differing++;
+        const uint16_t* a = (const uint16_t*)U.kept[i].data(); const uint16_t* b = (const uint16_t*)R.kept[i].data();
+        size_t comp = 0; double mx = 0.0;
+        for (size_t j = 0; j < U.kept[i].size() / 2; j++) {
+            if (a[j] == b[j]) continue;
+            comp++;
+            auto half = [](uint16_t h) { const int e = (h >> 10) & 0x1F, mt = h & 0x3FF; const double v = e == 0 ? std::ldexp((double)mt, -24) : std::ldexp((double)(mt | 0x400), e - 25); return (h & 0x8000) ? -v : v; };
+            { const double dv = std::fabs(half(a[j]) - half(b[j])); if (dv > mx) mx = dv; }
+        }
+        if (comp > worstComp) worstComp = comp;
+        if (mx > worstAbs) { worstAbs = mx; worstAt = i; }
+    }
+    MESSAGE("the clock at rest (WARP, " << kClockW << " x " << kClockH << ", " << n << " presents): first rest at present " << firstRest << ", " << restPresents
+            << " clock runs at rest; still presents that ran a convolution or a whole-frame pass: unheld " << uCostlyStill << " (" << uCostlyAtRest
+            << " of them where the shipped layer rests), as shipped " << rCostlyStill << "; zones with a toggle pair at the end: " << R.pairs[n - 1]
+            << "; of " << kept << " kept presents " << differing << " differ from the unheld layer's, at most " << worstComp << " components, max "
+            << worstAbs * 80.0 << " nits (present " << worstAt << ")");
+    CHECK_MESSAGE(worstAbs * 80.0 <= 1.0, "the picture at rest is further from the unheld layer's than 1 nit");
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The clock at rest, the bookkeeping alone (shared/fald_temporal.h FaldClockRestBegin / FaldClockRestNote; no D3D): the
+// flags a clock run is given, what a readback's words mean, and which readback may end the settle hold.
+// ---------------------------------------------------------------------------------------------------------------------
+TEST_CASE("FALD: the clock at rest - a clock run's flags, the readback's verdict and the settle hold (no D3D)") {
+    struct Restore { ~Restore() { g_faldClockRestOverride = -1; } } restore;
+    g_faldClockRestOverride = -1;
+    const uint32_t A = FALD_CLOCK_REST_ALLOWED, RS = FALD_CLOCK_REST_RESET, ST = FALD_CLOCK_REST_STILL;
+    FaldTemporalState r;
+    // the first clock run after a seed: the levels start over and the pass may not rest (its maps are not written yet)
+    FaldClockRestBegin(&r);
+    CHECK(r.clkRunSeq == 1u);
+    CHECK(r.clkRestFlags == (RS | ST));
+    // the next: allowed, still
+    FaldClockRestBegin(&r);
+    CHECK(r.clkRunSeq == 2u);
+    CHECK(r.clkRestFlags == (A | ST));
+    // that run had new content: it arms the hold and its target comes from content
+    FaldTemporalRun run = {};
+    run.mode = FALD_TEMPORAL_PANEL; run.panel = true; run.clock = FaldClockPlan{ true, true, false, true };
+    r.clkElapsed = 1;
+    FaldTemporalEndRun(&r, run, true);
+    const unsigned int hold = FaldPanelClockSettleFrames(r.clkClosure);
+    CHECK(r.settleLeft == hold);
+    CHECK(r.clkArmSeq == 2u);
+    FaldClockRestBegin(&r);                                  // run 3 watches the target the content run committed
+    CHECK(r.clkRestFlags == A);
+    FaldTemporalEndRun(&r, run, false);                      // a still run: the hold pays its refresh, the next watch is still
+    CHECK(r.settleLeft == hold - 1u);
+    // readbacks. Run 2 rested, but it watched the target from BEFORE the arming frame: the hold stays
+    CHECK(FaldClockRestNote(&r, 0u, 2u, A | ST));
+    CHECK(r.settleLeft == hold - 1u);
+    CHECK(r.clkRestRuns == 1ull);
+    // run 3 did not rest (a zone was not confined: the mark is its number)
+    CHECK_FALSE(FaldClockRestNote(&r, 3u, 3u, A));
+    CHECK(r.settleLeft == hold - 1u);
+    CHECK_FALSE(r.clkRestKnown);
+    // run 4 rests, after the arming: nothing is left to settle
+    FaldClockRestBegin(&r);
+    CHECK(r.clkRestFlags == (A | ST));
+    CHECK(FaldClockRestNote(&r, 3u, 4u, A | ST));
+    CHECK(r.settleLeft == 0u);
+    CHECK(r.clkRestRuns == 2ull);
+    CHECK(r.clkRestKnown);
+    // an older or repeated readback, one from the future, one of a run that was not allowed to rest: no verdict
+    CHECK_FALSE(FaldClockRestNote(&r, 0u, 3u, A));
+    CHECK_FALSE(FaldClockRestNote(&r, 0u, 4u, A));
+    CHECK_FALSE(FaldClockRestNote(&r, 0u, 9u, A));
+    CHECK(r.clkRestRuns == 2ull);
+    FaldClockRestBegin(&r);
+    CHECK_FALSE(FaldClockRestNote(&r, 0u, 5u, ST));           // (the flags it ran with: not ALLOWED)
+    // the seam: never allowed
+    g_faldClockRestOverride = 0;
+    FaldClockRestBegin(&r);
+    CHECK((r.clkRestFlags & A) == 0u);
+    g_faldClockRestOverride = -1;
+    // a layer-off period forgets the levels: the next clock run starts them over and may not rest
+    FaldTemporalIdle(&r);
+    FaldClockRestBegin(&r);
+    CHECK((r.clkRestFlags & RS) != 0u);
+    CHECK((r.clkRestFlags & A) == 0u);
+    FaldClockRestBegin(&r);
+    CHECK((r.clkRestFlags & A) != 0u);
+}

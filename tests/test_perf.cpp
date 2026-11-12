@@ -10,7 +10,8 @@
 //                                  of each user mode: the same text with that mode's switches made compile-time
 //                                  constants (rows "<shader>@<mode>"), and the experiment variants ("...+sl" etc).
 //                                  DLUT_PERF_STATIC_REF=<tsv> prints every row that differs from a recorded table
-//                                  (tests/fixtures/perf_static_baseline.tsv is the integration state of 2026-11-12).
+//                                  (tests/fixtures/perf_static_baseline.tsv is the integration state of 2026-11-12, with
+//                                  the panel clock's two rows of 2026-11-13: fald.panel_clock.cs, fald.panel_clock_watch.cs).
 //   2. DLUT_PERF_GPU=<dir>         GPU time, offscreen, in this process (no DWM, no DesktopLUT): the hook's REAL pass
 //                                  (dwm_hook/hook_render.cpp compiled into this exe: InitializeStuff + RenderLUT, the
 //                                  cube parsed by the hook's own parser, the FALD layer's own files) over a back buffer
@@ -58,6 +59,7 @@
 #include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride
 #include "../shared/fald_conv_tune.h"       // g_faldConvTuneOverride, g_faldConvTuneCachePath
 #include "../shared/fald_shader_set.h"
+#include "../shared/fald_temporal.h"        // g_faldTestNowQpc, g_faldClockRestOverride
 #include "fald_pass_probe.h"
 #include "../shared/peak_detect.h"
 #include "../shared/tonemap_curves.h"
@@ -188,6 +190,15 @@ struct HookRig {
     double initUs = 0.0;                       // InitializeStuff: in the DLL it runs inside the first hooked present
     double faldInitUs = 0.0;                   // FaldInitShaders: inside the first present of a monitor that needs the layer
     int fakeCtx[4] = {};                       // the pass only uses the context as a key
+    // The panel clock's time (shared/fald_temporal.h g_faldTestNowQpc): with SetClock every Present is `k` refreshes of a
+    // `hz` monitor after the one before it, whatever this harness's own pace (the layer's LED-lag clock counts the
+    // refreshes between two runs from the wall clock: a harness presenting faster than the monitor refreshes would
+    // give it k = 0 runs — no clock pass at all — and one presenting slower k = 2, 3, ...).
+    double clkPeriodQpc = 0.0; long long clkT0 = 0, clkTick = 0; int clkK = 1;
+    void SetClock(double hz, int k) {
+        LARGE_INTEGER f, t; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+        clkPeriodQpc = (double)f.QuadPart / hz; clkT0 = t.QuadPart; clkTick = 0; clkK = k;
+    }
 
     // hdrPanel / sdrPanel: the FALD panel files staged for the monitor's HDR / SDR (ACM) mode (empty = none)
     HookRig(perf::Dev& dev, int lutSize, const std::string& hdrPanel = OwnerPanel(), const std::string& sdrPanel = std::string())
@@ -225,6 +236,7 @@ struct HookRig {
         g_numMonitorHdrStates = 0;
         g_numLocalFald = 0;
         g_hdrDitherOff = 0;
+        if (clkPeriodQpc > 0.0) g_faldTestNowQpc = 0;
         isWindows11_25h2 = prev25h2;
         for (const char* f : { "\\0_0.cube", "\\0_0_hdr.cube", "\\fald\\0_0_hdr.bin", "\\fald\\0_0.bin" }) DeleteFileA((stage + f).c_str());
         RemoveDirectoryA((stage + "\\fald").c_str());
@@ -264,6 +276,7 @@ struct HookRig {
         return true;
     }
     bool Present(ID3D11Texture2D* back, std::vector<RECT>& rects) {
+        if (clkPeriodQpc > 0.0) { clkTick += clkK; g_faldTestNowQpc = clkT0 + (long long)((double)clkTick * clkPeriodQpc + 0.5); }
         try { return RenderLUT(fakeCtx, back, rects.data(), (int)rects.size()); }
         catch (...) { return false; }
     }
@@ -686,6 +699,7 @@ TEST_CASE("perf: static shader cost table (DLUT_PERF_STATIC)") {
             { "fald.star_weight.cs", common + g_faldStarWeightSource, "cs_5_0" },
             { "fald.star_plan.cs", common + g_faldStarPlanSource, "cs_5_0" },
             { "fald.panel_clock.cs", common + g_faldPanelClockSource, "cs_5_0" },
+            { "fald.panel_clock_watch.cs", common + g_faldPanelClockWatchSource, "cs_5_0" },
         };
         double tFald = perf::QpcUs();
         for (const E& e : fald) add(e.name, e.target, perf::CostOf(e.text.c_str(), e.text.size(), "main", e.target));
@@ -1385,6 +1399,10 @@ TEST_CASE("hook: the shipped shader bytecode is D3DCompile of the current source
 // says: two content frames A / B that differ only inside the scenario's rects, composed alternately.
 //   -> <dir>/fald_presents.tsv (one row per configuration x resolution x scenario: the present's GPU / CPU time, the runs'
 //      kinds, the governor) and <dir>/fald_passes.tsv (one row per pass of it: issued, ran, GPU us).
+// DLUT_PERF_FALD_K (1) = the refreshes of the DLUT_PERF_FALD_HZ monitor between two presents, SET for the panel clock
+// (HookRig::SetClock; 0 = the harness's own pace, as before 2026-11-13: presents 5 - 8 ms apart, i.e. k = 0 / 1 mixed at
+// 120 Hz and mostly k = 0 at 60 Hz — runs without a clock pass, which no monitor produces). DLUT_PERF_FALD_REST=0 = the
+// clock never at rest (shared/fald_temporal.h: the layer before 2026-11-13).
 // DLUT_PERF_ADAPTER / DLUT_PERF_N (40) / DLUT_PERF_ONLY ("<cfg>/<scenario>" substrings) / DLUT_PERF_HEAT (one value,
 // default 12 ms) as above; DLUT_PERF_RES = "2160" by default — "1440" / "1080" run the SAME 48 x 48 lattice and kernels
 // stretched over the smaller frame (a fractional-pitch copy of the panel file made here: the per-pixel passes scale with
@@ -1544,7 +1562,9 @@ TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
     g_faldCoreHoldOverride = -1;
     g_faldConvTuneOverride = -1;
     g_faldConvTuneCachePath = out + "\\conv_tune_cache.txt";
-    struct Restore { int h, t; std::string c; ~Restore() { g_faldCoreHoldOverride = h; g_faldConvTuneOverride = t; g_faldConvTuneCachePath = c; } } restore{ savedHold, savedTune, savedCache };
+    const int clockK = perf::Env("DLUT_PERF_FALD_K").empty() ? 1 : perf::EnvInt("DLUT_PERF_FALD_K", 1);
+    g_faldClockRestOverride = perf::Env("DLUT_PERF_FALD_REST") == "0" ? 0 : -1;
+    struct Restore { int h, t; std::string c; ~Restore() { g_faldCoreHoldOverride = h; g_faldConvTuneOverride = t; g_faldConvTuneCachePath = c; g_faldClockRestOverride = -1; g_faldTestNowQpc = 0; } } restore{ savedHold, savedTune, savedCache };
 
     std::ofstream presTsv(out + "\\fald_presents.tsv"), passTsv(out + "\\fald_passes.tsv");
     presTsv << "adapter\thz\tcfg\tres\tscenario\tdirty_px\ttouched_zones\tn\tgpu_us_med\tgpu_us_p10\tgpu_us_p90\tgpu_us_min\tgpu_us_max\tcpu_us_med\tcpu_us_p90\tlayer_us_med\trest_us_med\tfull\tpartial\theld\tidle\tgovernor\tconv_so\ttune\twhat\n";
@@ -1570,6 +1590,7 @@ TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
             if (!rig.panel) { MESSAGE(c.id << ": the panel file did not load - skipped"); continue; }
             HookCfg hc{ c.id, c.dom, c.lut, c.tm, 1, c.tm, true, false };   // SoftClip, dynamic
             rig.Apply(hc, W, H);
+            if (clockK > 0) rig.SetClock(hz, clockK);
             REQUIRE(FaldInitShaders(device, deviceContext));   // (RenderLUT would create them a slice per present: not what is timed here)
             s_perfTonemap.targetPeakNits = 1700.0f;
             s_perfTonemap.pqTargetPeak = LinearToPQ(1700.0f / 10000.0f);
@@ -1665,6 +1686,53 @@ TEST_CASE("perf: the FALD layer as it ships, per pass (DLUT_PERF_FALD)") {
                     if (!dev.warp) Sleep(2);
                 }
                 const perf::Stats sg = perf::MakeStats(g), sc2 = perf::MakeStats(cu), sl = perf::MakeStats(layerUs), sr = perf::MakeStats(restUs);
+                // DLUT_PERF_FALD_REST_DIAG=1: why the panel clock is (not) at rest after this scenario — the watch pass's test
+                // redone here from the clock's textures: zones not confined, by kind
+                if (perf::Env("DLUT_PERF_FALD_REST_DIAG") == "1")
+                    if (FaldMonitor* m = layer()) {
+                        auto tex = [&](unsigned int which) {
+                            std::vector<float> v;
+                            if (ID3D11Texture2D* t = FaldTestClockTex(m, which)) {
+                                const std::vector<unsigned char> b = perf::ReadBack(dev.dev, dev.ic, t);
+                                v.resize(b.size() / 4); if (!b.empty()) std::memcpy(v.data(), b.data(), v.size() * 4);
+                            }
+                            return v;
+                        };
+                        const std::vector<float> s0 = tex(0), s1 = tex(1), dT = tex(2);
+                        std::vector<float> lv;
+                        if (ID3D11Buffer* lb = FaldTestClockLevels(m)) {
+                            D3D11_BUFFER_DESC bd; lb->GetDesc(&bd);
+                            const UINT bytes = bd.ByteWidth;
+                            bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; bd.MiscFlags = 0; bd.StructureByteStride = 0;
+                            ID3D11Buffer* st = nullptr;
+                            if (SUCCEEDED(dev.dev->CreateBuffer(&bd, nullptr, &st))) {
+                                dev.ic->CopyResource(st, lb);
+                                D3D11_MAPPED_SUBRESOURCE mp;
+                                if (SUCCEEDED(dev.ic->Map(st, 0, D3D11_MAP_READ, 0, &mp))) { lv.resize(bytes / 4); std::memcpy(lv.data(), mp.pData, bytes); dev.ic->Unmap(st, 0); }
+                                st->Release();
+                            }
+                        }
+                        FaldReturn(m);
+                        int pairs = 0, pairOut = 0, exactOff = 0, exactOffZero = 0, n1 = 0; double worstRel = 0.0, worstPair = 0.0;
+                        for (size_t z = 0; z < s0.size() && z * 4 + 3 < lv.size() && z < dT.size(); z++) {
+                            const float c = lv[z * 4], q = lv[z * 4 + 1], n = lv[z * 4 + 2];
+                            if (n == 1.0f) n1++;
+                            if (n >= 2.0f) {
+                                pairs++;
+                                const float lo = std::min(c, q), hi = std::max(c, q);
+                                if (hi > 0.0f) worstPair = std::max(worstPair, (double)(hi - lo) / hi);
+                                if (!(s0[z] >= lo && s0[z] <= hi && s1[z] >= lo && s1[z] <= hi)) pairOut++;
+                            } else if (!(s0[z] == c && s1[z] == c)) {
+                                exactOff++;
+                                if (c == 0.0f) exactOffZero++;
+                                const double r = std::max(std::fabs((double)s0[z] - c), std::fabs((double)s1[z] - c)) / std::max((double)std::fabs(c), 1e-30);
+                                if (c != 0.0f) worstRel = std::max(worstRel, r);
+                            }
+                        }
+                        MESSAGE(c.id << "/" << sc.id << " clock at rest? zones with a pair " << pairs << " (widest " << worstPair << ", states outside " << pairOut
+                                << "), one return so far " << n1 << "; zones without a pair whose states are not the target: " << exactOff << " (" << exactOffZero
+                                << " with target 0; the others off by at most " << worstRel << " of the target)");
+                    }
                 size_t touched = 0;
                 {
                     std::vector<FaldChangeRect> cr;
@@ -1828,6 +1896,238 @@ TEST_CASE("hook: the FALD layer's shaders arrive a slice per present and the lay
         CHECK_MESSAGE((ranAt >= readyAt && ranAt >= 0 && ranAt <= readyAt + 8), "shaders ready at present " << readyAt << ", the layer ran at " << ranAt);
         MESSAGE("the layer's shaders: ready after " << readyAt + 1 << " presents, the layer ran at present " << ranAt);
         Rel(content); Rel(back);
+        dev.ic->ClearState(); dev.ic->Flush();
+    }
+}
+
+// =================================================================================================================
+// 6. The FALD layer on a desktop's SCHEDULE, per content change (DLUT_PERF_FALD_SCHED=<dir>)
+// =================================================================================================================
+// Case 4 above times a present of each kind; this one times what a content change COSTS on a desktop, where the panel
+// clock (LED lag) asks for more presents after it: a content present, then a present every refresh while the layer's
+// settle hold is pending and for the kicker's linger after its last request (src/dwm_inject.cpp FALD_KICK_QUIET_MS =
+// 100 ms) — the 1 px kick rect, no new content — then nothing until the next change DLUT_PERF_FALD_GAP_MS (533) later.
+// The refreshes between two presents are SET (g_faldTestNowQpc), so the clock sees the schedule a monitor of
+// DLUT_PERF_FALD_HZ would give it whatever this harness's own pace. Video scenarios change content every refresh.
+// DLUT_PERF_FALD_REST=0 runs the layer with the clock never at rest (shared/fald_temporal.h g_faldClockRestOverride: the
+// layer before 2026-11-13); without it, the layer as shipped.
+//   -> <dir>/fald_sched.tsv: per configuration x scenario, medians over DLUT_PERF_N (8) measured cycles after 4 warm ones:
+//      presents per change, of them kicks and presents that ran a convolution, GPU us per change (all its presents), GPU us
+//      of the content present and of a kick, and the clock runs reported at rest.
+TEST_CASE("perf: the FALD layer on a desktop's schedule, per content change (DLUT_PERF_FALD_SCHED)") {
+    const std::string out = perf::Env("DLUT_PERF_FALD_SCHED");
+    if (out.empty()) return;
+    CreateDirectoryA(out.c_str(), nullptr);
+    const std::string adapter = perf::Env("DLUT_PERF_ADAPTER");
+    const bool wantWarp = adapter == "WARP" || adapter == "warp";
+    perf::BePolite(wantWarp ? 0x0FF00000ull : 0x0FFFFFFFull);
+    const std::string hdrPanel = OwnerPanel();
+    std::string sdrPanel = perf::Env("DLUT_PERF_FALD_PANEL_SDR");
+    if (sdrPanel.empty()) sdrPanel = "H:\\Projects\\DesktopLUT\\DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_refit_sdr_fald_panel_blur0.7.bin";
+    if (GetFileAttributesA(sdrPanel.c_str()) == INVALID_FILE_ATTRIBUTES) sdrPanel.clear();
+    if (hdrPanel.empty()) { MESSAGE("no FALD panel file - nothing measured"); return; }
+    const int N = std::max(2, perf::EnvInt("DLUT_PERF_N", wantWarp ? 2 : 8));
+    const int warmCycles = wantWarp ? 1 : 4;
+    const std::string only = perf::Env("DLUT_PERF_ONLY");
+    const double heatMs = perf::Env("DLUT_PERF_HEAT").empty() ? (wantWarp ? 0.0 : 12.0) : atof(perf::Env("DLUT_PERF_HEAT").c_str());
+    const double hz = std::max(24.0, atof(perf::Env("DLUT_PERF_FALD_HZ").empty() ? "120" : perf::Env("DLUT_PERF_FALD_HZ").c_str()));
+    const double gapMs = std::max(50.0, atof(perf::Env("DLUT_PERF_FALD_GAP_MS").empty() ? "533" : perf::Env("DLUT_PERF_FALD_GAP_MS").c_str()));
+    const bool restOff = perf::Env("DLUT_PERF_FALD_REST") == "0";
+    const int lutN = std::clamp(perf::EnvInt("DLUT_PERF_LUT", 65), 2, 128);
+    const int W = 3840, H = 2160;
+    struct TimerRes { TimerRes() { timeBeginPeriod(1); } ~TimerRes() { timeEndPeriod(1); } } timerRes;
+    const int savedHold = g_faldCoreHoldOverride, savedTune = g_faldConvTuneOverride;
+    const std::string savedCache = g_faldConvTuneCachePath;
+    g_faldCoreHoldOverride = -1;
+    g_faldConvTuneOverride = -1;
+    g_faldConvTuneCachePath = out + "\\conv_tune_cache.txt";
+    g_faldClockRestOverride = restOff ? 0 : -1;
+    struct Restore { int h, t; std::string c; ~Restore() { g_faldCoreHoldOverride = h; g_faldConvTuneOverride = t; g_faldConvTuneCachePath = c; g_faldClockRestOverride = -1; g_faldTestNowQpc = 0; } } restore{ savedHold, savedTune, savedCache };
+
+    // DLUT_PERF_FALD_SCHED_TRACE=1: every present of the measured cycles -> <dir>/fald_sched_trace.tsv (what it was, what ran,
+    // whether its clock run was at rest: the watch pass's words, read back here)
+    const bool trace = perf::Env("DLUT_PERF_FALD_SCHED_TRACE") == "1";
+    std::ofstream traceTsv;
+    if (trace) { traceTsv.open(out + "\\fald_sched_trace.tsv"); traceTsv << "cfg\tscenario\trefresh\twhat\trun_kind\tcostly\tsettle_left\tgpu_us\tclock_seq\tclock_rest\tpasses\n"; }
+    std::ofstream tsv(out + "\\fald_sched.tsv");
+    tsv << "adapter\thz\trest\tcfg\tscenario\tcycles\tgap_refreshes\tpresents_per_change\tkicks_per_change\tcostly_per_change\tgpu_us_per_change\t"
+           "gpu_us_content_med\tgpu_us_kick_med\tgpu_us_per_second\tclock_runs_at_rest\twhat\n";
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+    const double periodQpc = (double)freq.QuadPart / hz;
+    const long long gapRefreshes = std::max(2ll, (long long)(gapMs * hz / 1000.0 + 0.5));
+    const long long linger = (long long)std::ceil(100.0 * hz / 1000.0);
+
+    for (const FaldPerfCfg& c : FaldPerfConfigs()) {
+        bool any = false;
+        for (const FaldPerfScn& sc : FaldPerfScenarios(W, H)) if (perf::Selected(only, c.id + "/" + sc.id)) any = true;
+        if (!any) continue;
+        const bool hdr = c.dom == Dom::Hdr;
+        const std::string& srcPanel = hdr ? hdrPanel : sdrPanel;
+        if (srcPanel.empty()) { MESSAGE(c.id << ": no panel file for this mode - skipped"); continue; }
+        perf::Dev dev(adapter);
+        REQUIRE_MESSAGE(dev.ok, "no adapter matching '" << adapter << "'");
+        perf::Heater heater(dev);
+        HookRig rig(dev, lutN, hdr ? srcPanel : std::string(), hdr ? std::string() : srcPanel);
+        REQUIRE_MESSAGE(rig.ok, "the hook's InitializeStuff failed");
+        if (!rig.panel) { MESSAGE(c.id << ": the panel file did not load - skipped"); continue; }
+        HookCfg hc{ c.id, c.dom, c.lut, c.tm, 1, c.tm, true, false };   // SoftClip, dynamic
+        rig.Apply(hc, W, H);
+        REQUIRE(FaldInitShaders(device, deviceContext));
+        s_perfTonemap.targetPeakNits = 1700.0f;
+        s_perfTonemap.pqTargetPeak = LinearToPQ(1700.0f / 10000.0f);
+        LocalFaldParams& fp = g_localFald[0];
+        fp.flags = DwmHookFaldPackCore2(DwmHookFaldPack(1, 0, 0, c.star ? 1 : 0, 0), FALD_CORE_MODE_DEFAULT);
+        fp.hasTuning = true;
+        fp.tuning = {};
+        fp.tuning.starEven = 0.8f; fp.tuning.starTargetGain = 1.0f; fp.tuning.starKeepNits = 100.0f; fp.tuning.starStrength = 1.0f;
+        fp.tuning.starAreaLo = 40.0f; fp.tuning.starAreaHi = 160.0f; fp.tuning.starNbLo = 0.15f; fp.tuning.starNbHi = 0.30f;
+        fp.tuning.starReach = 2u; fp.tuning.starEvenReach = 8u;
+        fp.tuning.tempMode = c.lag; fp.tuning.tempClockClosure = 0.72f; fp.tuning.tempClockParity = -1;
+        fp.tuning.refreshMs = (float)(1000.0 / hz);
+
+        const DXGI_FORMAT fmt = perf::DomFormat(c.dom);
+        ID3D11Texture2D* back = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        ID3D11Texture2D* content[2] = { perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE), perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE) };
+        REQUIRE((back && content[0] && content[1]));
+        const std::vector<unsigned char> base = perf::MakeFrame(Kind::Mix, c.dom, W, H);
+        std::vector<RECT> full = { RECT{ 0, 0, W, H } };
+        std::vector<RECT> kickRect = { RECT{ 0, 0, 1, 1 } };
+        auto compose = [&](ID3D11Texture2D* src, const std::vector<RECT>& rects) {
+            for (const RECT& r : rects) {
+                D3D11_BOX box = { (UINT)r.left, (UINT)r.top, 0, (UINT)r.right, (UINT)r.bottom, 1 };
+                dev.ic->CopySubresourceRegion(back, 0, (UINT)r.left, (UINT)r.top, 0, src, 0, &box);
+            }
+        };
+        auto layer = [&]() { return FaldAcquire(0, 0, hdr, (unsigned)W, (unsigned)H, fmt); };
+        FaldPassProbe probe(dev.dev, dev.ic, true);
+        LARGE_INTEGER t0; QueryPerformanceCounter(&t0);
+        long long refresh = 0;
+        auto setTime = [&]() { g_faldTestNowQpc = t0.QuadPart + (long long)((double)refresh * periodQpc + 0.5); };
+
+        // the conv auto-tune first: full presents until it has decided (each a refresh apart)
+        dev.ic->UpdateSubresource(content[0], 0, nullptr, base.data(), (UINT)W * 8u, 0);
+        {
+            std::vector<unsigned char> shifted = base;
+            FpShift(shifted, base, W, full[0], W / 2, 0);
+            dev.ic->UpdateSubresource(content[1], 0, nullptr, shifted.data(), (UINT)W * 8u, 0);
+        }
+        for (int i = 0; i < 120; i++) {
+            compose(content[i & 1], full);
+            refresh++; setTime();
+            rig.Present(back, full);
+            dev.ic->Flush();
+            Sleep(3);
+            unsigned int tuneState = 0;
+            if (FaldMonitor* m = layer()) { tuneState = FaldTestConvTuneState(m); FaldReturn(m); }
+            if (i >= 8 && tuneState != 2u) break;
+        }
+
+        for (const FaldPerfScn& sc : FaldPerfScenarios(W, H)) {
+            if (!perf::Selected(only, c.id + "/" + sc.id)) continue;
+            if (sc.rects.empty()) continue;                                    // (idle_norect: no present at all on a desktop)
+            const bool video = sc.mut == 5 || sc.mut == 7;
+            const bool kickOnly = sc.id == "idle_kick";                        // a present of the kick pixel alone, every gap
+            std::vector<unsigned char> A, B;
+            FaldPerfFrames(sc, c.dom, W, H, base, A, B);
+            dev.ic->UpdateSubresource(content[0], 0, nullptr, A.data(), (UINT)W * 8u, 0);
+            dev.ic->UpdateSubresource(content[1], 0, nullptr, B.data(), (UINT)W * 8u, 0);
+            std::vector<RECT> rects = sc.rects;
+            // one timed present; what it was
+            struct One { double gpu; bool costly; unsigned int settleLeft; };
+            bool tracing = false;
+            auto present = [&](std::vector<RECT>& rc) {
+                dev.ic->Flush();
+                if (heatMs > 0.0 && !dev.warp) heater.Heat(dev, heatMs);
+                setTime();
+                double gu = -1, cpu = 0, wall = 0;
+                dev.Time([&] { probe.BeginPresent(); rig.Present(back, rc); probe.Close(); }, gu, cpu, wall);
+                One o{ gu, true, 0u };
+                unsigned int kind = 0;
+                ID3D11Buffer* args = nullptr; ID3D11Buffer* lateArgs = nullptr;
+                if (FaldMonitor* m = layer()) {
+                    kind = FaldTestLastRunKind(m); args = FaldTestArgs(m); lateArgs = FaldTestLateArgs(m); o.settleLeft = FaldTestSettleLeft(m);
+                    FaldReturn(m);
+                }
+                probe.Resolve(args, lateArgs, kind == 1u);
+                o.costly = kind == 0u || probe.ran[FALD_HP_CONV0] || probe.ran[FALD_HP_CONV1];
+                if (trace && tracing) {
+                    uint32_t wd[4] = {};
+                    if (FaldMonitor* m = layer()) {
+                        if (ID3D11Buffer* words = FaldTestClockRestWords(m)) {
+                            D3D11_BUFFER_DESC bd; words->GetDesc(&bd);
+                            bd.Usage = D3D11_USAGE_STAGING; bd.BindFlags = 0; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; bd.MiscFlags = 0; bd.StructureByteStride = 0;
+                            ID3D11Buffer* st = nullptr;
+                            if (SUCCEEDED(dev.dev->CreateBuffer(&bd, nullptr, &st))) {
+                                dev.ic->CopyResource(st, words);
+                                D3D11_MAPPED_SUBRESOURCE mp;
+                                if (SUCCEEDED(dev.ic->Map(st, 0, D3D11_MAP_READ, 0, &mp))) { std::memcpy(wd, mp.pData, 16); dev.ic->Unmap(st, 0); }
+                                st->Release();
+                            }
+                        }
+                        FaldReturn(m);
+                    }
+                    std::string sig;
+                    for (unsigned int p = 0; p < FALD_HP_COUNT; p++) if (probe.ran[p]) { sig += FaldHookPassName(p); sig += ' '; }
+                    traceTsv << c.id << "\t" << sc.id << "\t" << refresh << "\t" << (&rc == &kickRect ? "kick" : "content") << "\t" << kind << "\t" << (o.costly ? 1 : 0) << "\t"
+                             << o.settleLeft << "\t" << gu << "\t" << wd[1] << "\t" << (((wd[2] & 1u) && wd[0] != wd[1]) ? 1 : 0) << "\t" << sig << "\n";
+                }
+                return o;
+            };
+            // the scenario's frame A in full, its settle presents
+            refresh += gapRefreshes;
+            compose(content[0], full);
+            One o = present(full);
+            long long lastSettle = o.settleLeft > 0u ? refresh : -1000000;
+            int cur = 0;                                                       // the content DWM composes from (a kick recomposes its pixel)
+            for (int i = 0; i < 400 && refresh - lastSettle <= linger; i++) {
+                refresh++;
+                compose(content[cur], kickRect);
+                o = present(kickRect);
+                if (o.settleLeft > 0u) lastSettle = refresh;
+            }
+            std::vector<double> perChange, contentUs, kickUs, presentsPer, kicksPer, costlyPer;
+            unsigned long long restBefore = 0;
+            bool stop = false;
+            for (int cy = 0; cy < warmCycles + N && !stop; cy++) {
+                if (cy == warmCycles) if (FaldMonitor* m = layer()) { restBefore = FaldTestClockRestRuns(m); FaldReturn(m); }
+                tracing = cy >= warmCycles;
+                const long long start = refresh + (gapRefreshes - (refresh % gapRefreshes));   // the next change, on the gap's grid
+                refresh = start;
+                double sum = 0.0; int presents = 0, kicks = 0, costly = 0;
+                lastSettle = -1000000;
+                const long long changeRefreshes = video ? gapRefreshes : 1;
+                for (long long j = 0; j < changeRefreshes; j++) {
+                    if (j) refresh++;
+                    if (kickOnly) { compose(content[cur], kickRect); o = present(kickRect); }
+                    else { cur = (int)((cy * (video ? gapRefreshes : 1) + j + 1) & 1); compose(content[cur], rects); o = present(rects); }
+                    if (o.gpu > 45000.0) { MESSAGE(c.id << "/" << sc.id << ": a present over 45 ms - stopping this scenario"); stop = true; break; }
+                    sum += o.gpu; presents++; if (o.costly) costly++;
+                    if (j == 0 && cy >= warmCycles) contentUs.push_back(o.gpu);
+                    if (o.settleLeft > 0u) lastSettle = refresh;
+                }
+                // the kicks: a present every refresh while the hold is pending and for the linger after its last request
+                while (!video && !stop && refresh - lastSettle <= linger && presents < 400) {
+                    refresh++;
+                    compose(content[cur], kickRect);
+                    o = present(kickRect);
+                    sum += o.gpu; presents++; kicks++; if (o.costly) costly++;
+                    if (cy >= warmCycles) kickUs.push_back(o.gpu);
+                    if (o.settleLeft > 0u) lastSettle = refresh;
+                }
+                if (cy >= warmCycles) { perChange.push_back(sum); presentsPer.push_back(presents); kicksPer.push_back(kicks); costlyPer.push_back(costly); }
+                if (!dev.warp) Sleep(2);
+            }
+            unsigned long long restRuns = 0;
+            if (FaldMonitor* m = layer()) { restRuns = FaldTestClockRestRuns(m) - restBefore; FaldReturn(m); }
+            const perf::Stats sp = perf::MakeStats(perChange), scn = perf::MakeStats(contentUs), sk = perf::MakeStats(kickUs),
+                              spp = perf::MakeStats(presentsPer), skp = perf::MakeStats(kicksPer), scp = perf::MakeStats(costlyPer);
+            const double perSecond = sp.med * (1000.0 / gapMs);
+            tsv << dev.name << "\t" << hz << "\t" << (restOff ? 0 : 1) << "\t" << c.id << "\t" << sc.id << "\t" << sp.n << "\t" << gapRefreshes << "\t" << spp.med << "\t" << skp.med << "\t"
+                << scp.med << "\t" << sp.med << "\t" << scn.med << "\t" << (sk.n ? sk.med : 0.0) << "\t" << perSecond << "\t" << restRuns << "\t" << sc.what << "\n";
+            tsv.flush();
+        }
+        g_faldTestNowQpc = 0;
+        Rel(content[0]); Rel(content[1]); Rel(back);
         dev.ic->ClearState(); dev.ic->Flush();
     }
 }
