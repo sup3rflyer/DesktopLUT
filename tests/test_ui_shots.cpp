@@ -617,6 +617,7 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         // Their tooltips: the offer's switch and its WHITELIST, DISPLAY PEAK, the header's ANALYSIS.
         { "fronttipoffer", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 510, 95, 1180, 760, 70 },
         { "fronttiponwl", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 585, 95, 1180, 760, 71 },
+        { "fronttipon", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 510, 95, 1180, 760, 71 },
         { "fronttippeak", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 300, 282, 1180, 760, 70 },
         { "fronttipanalysis", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 995, 28, 1180, 760, 70 },
     };
@@ -799,7 +800,8 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                         m.activePerm = MHCSettings::PERM_DG;
                         m.profileName = L"DesktopLUT_Mon0_HDR_9532406.icm";
                         m.profilePath = L"C:\\Windows\\System32\\spool\\drivers\\color\\" + m.profileName;
-                        snap.live[0].reportedPeakNits = 1000;   // the profile's luminance tag (the params default)
+                        m.panelPeakNits = 1600;                 // what Windows reported before (the EDID's): kept
+                        m.priorDefaultProfile = L"HDR Calibration_1.icc";   // the user's own, given back on off
                         snap.running = true;
                         snap.hookIdle = true;   // desktop gamma alone: no hook work
                         snap.lastStatus = L"Active (DWM Hook)";

@@ -1416,7 +1416,10 @@ void DrawSdrGammaOffer(const Snapshot& snap, const DisplayRow& r, GammaOffer off
         tip += "SDR content in HDR (desktop, apps, SDR video) at gamma 2.2, not Windows' sRGB curve, which lifts "
                "dark greys.\nDesktop gamma, in an HDR MHC profile; it follows the Windows SDR brightness.\n"
                "HDR games and video change too unless listed: WHITELIST.";
+        tip += "\n" + SdrGammaPeakNote(r.settings.hdrMHC, on, r.reportedPeakNits, r.edidPeakNits);
         if (on) tip += Fmt("\nOn: 2.2 at %.0f nits. Off removes the profile again.", r.settings.hdrMHC.dgSdrWhiteNits);
+        if (on && !r.settings.hdrMHC.priorDefaultProfile.empty())
+            tip += "\nOff makes " + Utf8(r.settings.hdrMHC.priorDefaultProfile) + " the default again.";
         ImGui::SetTooltip("%s", tip.c_str());
     }
     ImGui::SetCursorScreenPos(ImVec2(Snap(ImGui::GetItemRectMax().x + Px(kSdrGammaGap)), y));

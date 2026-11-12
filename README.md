@@ -29,7 +29,7 @@ In HDR mode, Windows shows SDR content (the desktop, most apps, SDR video) with 
 2. Switch it on. SDR content is shown as gamma 2.2 at your Windows SDR content brightness, and follows that slider. It is baked into a neutral MHC profile, so it runs at the GPU, with no overlay and nothing loaded into DWM.
 3. HDR games and video change too. Add them to **WHITELIST**, next to the switch, and it turns off while they run.
 
-Switching it off removes that profile again. A neutral profile stays associated in its place, because Windows keeps applying the last one otherwise. **Win + Shift + G** toggles it. Once the display's HDR profile holds a calibration as well, the same setting is **DESKTOP GAMMA** under **GRAYSCALE**.
+The profile tells HDR games and apps the same peak brightness Windows reported before it. While it is on, it replaces the display's own HDR profile if it had one (for example the one the Windows HDR Calibration app makes). Switching it off removes DesktopLUT's profile and makes that one the default again. Without one, a neutral profile stays associated in its place, because Windows keeps applying the last one otherwise. **Win + Shift + G** toggles it. Once the display's HDR profile holds a calibration as well, the same setting is **DESKTOP GAMMA** under **GRAYSCALE**.
 
 ## Requirements
 
