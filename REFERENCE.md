@@ -38,7 +38,8 @@ ShowFrameTiming=0
 FaldCoreForce=0
 ; 1 = dither the HDR output after the 3D LUT (default); 0 = off, for an A/B
 HdrDither=1
-; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis). Absent = 0.
+; 1 = inject DLL into dwm.exe for 3D LUT + tonemapping (overlay-free, including analysis). Absent = 1 on
+; Windows 11, 0 on Windows 10 (DefaultDwmHookMode).
 DwmHookMode=1
 ; 1 = the calibration pipe for DLC is armed (Settings > Calibration > DLC CONTROL). Absent = 0.
 CalibrationControl=0
@@ -118,10 +119,12 @@ LUT_HDR_Bypass=false
 
 ; HDR tonemapping (applied by DWM hook when DwmHookMode=1, overlay shader as fallback)
 HDR_TonemapEnabled=0
-; BT2390, SoftClip, Reinhard, BT2446A, HardClip
-HDR_TonemapCurve=SoftClip
-; content peak (MaxCLL) for static mode; default 1000 ("Content" in the GUI)
+; BT2390 (default), SoftClip, Reinhard, BT2446A, HardClip
+HDR_TonemapCurve=BT2390
+; content peak (MaxCLL) for static mode; default 1000 (CONTENT PEAK in the GUI)
 HDR_TonemapSourcePeak=1000.0
+; display peak (DISPLAY PEAK); default 1000. A display seen for the first time starts at the peak it reports
+; (DXGI, else the EDID), rounded to 10 nits, when that is 400 nits or more.
 HDR_TonemapTargetPeak=1000.0
 ; 1 = detect peak per-frame
 HDR_TonemapDynamic=0
@@ -198,6 +201,13 @@ HDR_MHCPermDgWhite2=116.0000
 HDR_MHCPermTrim2=3f6c0a1d9e2b4c57
 ; The trim's switch, written only when on (absent = off, the default)
 HDR_MHCRefreshTrim=1
+; SDR CONTENT: GAMMA 2.2 (the Pipeline page's one step), written only when known. The peak Windows reported for the
+; display just before the step put a profile of ours on it: a profile with no measured peak (no imported file, no base
+; curve) and the identity profile carry it in their luminance tags instead of the 1000-nit default (absent = 1000).
+HDR_MHCPanelPeak=600.0000
+; The display's HDR default profile before the step, when it was not ours (the Windows HDR Calibration app's): the
+; step's switch-off makes it the default again
+HDR_MHCPriorDefault=HDR Calibration_1.icc
 ```
 
 ## Refresh-Rate Trim (HDR MHC)
