@@ -685,6 +685,16 @@ static bool ReadOverlaySwapChainInfo(void* overlaySwapChain, bool& hwProtected, 
 	}
 }
 
+// The 24H2 present hook's one-time diagnostic line. Out of line and stack only: the hook itself carries none of it.
+static __declspec(noinline) void LogOverlaySwapChainInfoOnce(void* overlaySwapChain)
+{
+	char msg[192];
+	snprintf(msg, sizeof(msg),
+		"OverlaySwapChain address: 0x%p -- windows 11 25h2: %d -- windows 11 24h2: %d -- windows 11: %d",
+		overlaySwapChain, isWindows11_25h2 ? 1 : 0, isWindows11_24h2 ? 1 : 0, isWindows11 ? 1 : 0);
+	log_to_file(msg);
+}
+
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
@@ -698,12 +708,13 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 
 	{
 		LOG_ONLY_ONCE("I am inside COverlayContext::Present hook inside the main if condition")
-		std::stringstream overlay_swapchain_message;
-		overlay_swapchain_message << "OverlaySwapChain address: 0x" << std::hex << overlaySwapChain
-			<< " -- windows 11 25h2: " << isWindows11_25h2
-			<< " -- windows 11 24h2: " << isWindows11_24h2
-			<< " -- " << "windows 11: " << isWindows11;
-		LOG_ONLY_ONCE(overlay_swapchain_message.str().c_str())
+		// Built inside its once-guard: this is DWM's present path. (It used to build a std::stringstream, with its
+		// heap allocations and locale, on every present of every monitor, to log one line once.)
+		static bool swapchainInfoLogged = false;
+		if (!swapchainInfoLogged) {
+			swapchainInfoLogged = true;
+			LogOverlaySwapChainInfoOnce(overlaySwapChain);
+		}
 
 		if (!rectVec || !rectVec->start || rectVec->end < rectVec->start) {
 			return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
