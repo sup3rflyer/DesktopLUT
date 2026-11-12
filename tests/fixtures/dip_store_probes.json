@@ -838,6 +838,7 @@
       }
      },
      "refresh_hz": null,
+     "refresh": null,
      "bit_depth": 10,
      "code": [
       1023,
@@ -1751,6 +1752,7 @@
       }
      },
      "refresh_hz": null,
+     "refresh": null,
      "bit_depth": 10,
      "code": [
       1023,
@@ -2662,6 +2664,7 @@
       }
      },
      "refresh_hz": null,
+     "refresh": null,
      "bit_depth": 10,
      "code": [
       1023,
