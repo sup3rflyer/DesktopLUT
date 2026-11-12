@@ -180,6 +180,7 @@
     <ClCompile Include="tests\test_fald_pitch.cpp" />
     <ClCompile Include="tests\test_fald_change.cpp" />
     <ClCompile Include="tests\test_fald_clock_gate.cpp" />
+    <ClCompile Include="tests\test_fald_layer_gate.cpp" />
     <ClCompile Include="tests\test_fald_conv_tune.cpp" />
     <ClCompile Include="tests\test_fald_core2.cpp" />
     <ClCompile Include="tests\test_peak_detect.cpp" />
