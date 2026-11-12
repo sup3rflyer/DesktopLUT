@@ -384,6 +384,30 @@ bool aob_match_inverse(const void* buf1, const void* mask, const int buf_len)
 	return false;
 }
 
+// The 24H2-build path choice (DllMain, OS build 26100..26199 only): does this dwmcore carry the 25H2 code? Both 25H2
+// anchors must resolve: COverlayContext::Present, and COverlayContext::OverlaysEnabled with its OverlayTestMode
+// operand (rip+7+disp32) inside the image. Stack only (loader lock). A COPY of Dwmcore25h2AnchorsResolve in
+// src/dwmcore_scan.cpp (the host mirrors this choice for its pre-flight and notice): keep the two in step.
+static bool Dwmcore25h2AnchorsResolve(const unsigned char* base, size_t size)
+{
+	bool present = false, overlays = false;
+	for (size_t i = 0; i < size && !(present && overlays); i++)
+	{
+		const unsigned char* a = base + i;
+		const size_t left = size - i;
+		if (!present && sizeof COverlayContext_Present_bytes_w11_25h2 <= left &&
+			!aob_match_inverse(a, COverlayContext_Present_bytes_w11_25h2, sizeof COverlayContext_Present_bytes_w11_25h2))
+			present = true;
+		if (!overlays && sizeof COverlayContext_OverlaysEnabled_bytes_w11_25h2 <= left &&
+			!aob_match_inverse(a, COverlayContext_OverlaysEnabled_bytes_w11_25h2, sizeof COverlayContext_OverlaysEnabled_bytes_w11_25h2))
+		{
+			const long long otm = (long long)i + 7 + *(const int*)(a + 2);
+			if (otm >= 0 && (unsigned long long)otm < size) overlays = true;
+		}
+	}
+	return present && overlays;
+}
+
 
 // Suspicious-change debounce: require N consecutive identical observations of a
 // monitor-set shrink or HDR-flag flip before accepting, to ride out transient DXGI
@@ -966,7 +990,19 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 			}
 			else if (VerifyVersionInfo(&versionInfo24h2, VER_BUILDNUMBER, dwlConditionMask))
 			{
-				isWindows11_24h2 = true;
+				// OS build 26100..26199. 24H2 and 25H2 share cumulative updates, so a patched 24H2 runs the same
+				// dwmcore.dll as 25H2 (26200 is an enablement package): the OS build does not say which code this
+				// dwmcore is. When the 25H2 set's anchors resolve, take the 25H2 path; otherwise the 24H2 path as
+				// before. Builds >= 26200 never reach this branch.
+				if (Dwmcore25h2AnchorsResolve((const unsigned char*)dwmcore, moduleInfo.SizeOfImage))
+				{
+					isWindows11_25h2 = true;
+					log_to_file("OS build 26100.x, but this dwmcore carries the 25H2 code: taking the 25H2 path");
+				}
+				else
+				{
+					isWindows11_24h2 = true;
+				}
 			}
 			else if (VerifyVersionInfo(&versionInfo, VER_BUILDNUMBER, dwlConditionMask))
 			{
