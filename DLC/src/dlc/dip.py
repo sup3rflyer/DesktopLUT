@@ -25,6 +25,12 @@ other refresh rates compares with the reference rate, per measured rate and leve
 NOT a correction. DLC records it from a refresh-trim run (``dlc.refresh_trim record``); DesktopLUT reads it
 from this file and derives its per-rate MHC trim itself (g = 1 / ratio). Optional: a record without it
 loads as before, and an unreadable section is dropped (noted) without dropping the record.
+
+**Peak by window** (display axis, ``peak_by_window``, schema 1, 2026-11-12): the light against the size of a
+white window (the "ABL graph"), early / sustained / minimum / decay per window, an up and a mirrored down pass
+and their agreement. Recorded by the ``peak-window`` flow (:mod:`dlc.peak_window`); optional and dropped when
+unreadable, like ``refresh_response``. It writes nothing else: ``sustained_peak_nits`` stays the HDR target's
+input and is NOT derived from it (which window a calibration peak should use is an owner decision).
 """
 
 from __future__ import annotations
@@ -38,9 +44,10 @@ from typing import Any, Optional
 from .paths import atomic_write_text
 
 __all__ = ["NoiseBand", "DisplayInstrumentProfile", "DipStore", "RefreshLevel", "RefreshRate",
-           "RefreshResponse", "REFRESH_RESPONSE_SCHEMA"]
+           "RefreshResponse", "REFRESH_RESPONSE_SCHEMA", "PeakByWindow", "PEAK_BY_WINDOW_SCHEMA"]
 
 REFRESH_RESPONSE_SCHEMA = 1
+PEAK_BY_WINDOW_SCHEMA = 1
 
 
 @dataclass
@@ -112,6 +119,11 @@ class RefreshRate:
     same_as: Optional[str] = None
     max_dxy: Optional[float] = None        # largest chromaticity move on any patch (luminance-only check)
     channel_independent: Optional[bool] = None
+    # Additive (2026-11-12, schema unchanged): how the rate was produced — "mode" (a fixed display mode, the
+    # default when absent) or "vrr" (a VRR cadence on the reference mode; only listed here when a cross-check rate
+    # measured both ways agreed, see RefreshResponse.vrr) — and the evidence the panel really ran at it.
+    source: Optional[str] = None
+    proof: dict[str, Any] = field(default_factory=dict)
 
     @property
     def hz(self) -> float:
@@ -132,7 +144,9 @@ class RefreshRate:
                    same_as=(str(d["same_as"]) if d.get("same_as") is not None else None),
                    max_dxy=_opt_float(d.get("max_dxy")),
                    channel_independent=(bool(d["channel_independent"]) if d.get("channel_independent") is not None
-                                        else None))
+                                        else None),
+                   source=(str(d["source"]) if d.get("source") is not None else None),
+                   proof=dict(d.get("proof") or {}))
 
 
 @dataclass
@@ -156,6 +170,11 @@ class RefreshResponse:
     verdict: Optional[str] = None                   # "nonlinear" | "linear in frame period" | ...
     schema: int = REFRESH_RESPONSE_SCHEMA
     notes: list[str] = field(default_factory=list)
+    # Additive (2026-11-12, schema unchanged): the VRR sweep, when the run used the VRR rate source — its range,
+    # every point (hz, levels, proof), the smooth-model verdict (interpolable / extrapolable, held-out residuals)
+    # and the mode-vs-VRR cross-check. ``rates`` above stays the fixed-mode trim input: a VRR point reaches it only
+    # when the cross-check passed. None = no VRR sweep (written exactly as before).
+    vrr: Optional[dict[str, Any]] = None
 
     def rate(self, key: str) -> Optional[RefreshRate]:
         return next((r for r in self.rates if r.key == key), None)
@@ -163,6 +182,13 @@ class RefreshResponse:
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["rates"] = [r.as_dict() for r in self.rates]
+        for r in d["rates"]:              # a record without the additive fields is written exactly as before
+            if r.get("source") is None:
+                r.pop("source", None)
+            if not r.get("proof"):
+                r.pop("proof", None)
+        if self.vrr is None:
+            d.pop("vrr")
         return d
 
     @classmethod
@@ -175,7 +201,89 @@ class RefreshResponse:
                    rates=[RefreshRate.from_dict(r) for r in (d.get("rates") or [])], reference=ref,
                    identity=dict(d.get("identity") or {}), conditions=dict(d.get("conditions") or {}),
                    peak_nits=_opt_float(d.get("peak_nits")), interpolable=bool(d.get("interpolable", False)),
-                   verdict=d.get("verdict"), schema=schema, notes=list(d.get("notes") or []))
+                   verdict=d.get("verdict"), schema=schema, notes=list(d.get("notes") or []),
+                   vrr=(dict(d["vrr"]) if isinstance(d.get("vrr"), dict) else None))
+
+
+def _opt_pos(d: dict[str, Any], key: str) -> Optional[float]:
+    """An optional finite non-negative number (``None`` stays ``None``); anything else refuses."""
+    v = d.get(key)
+    if v is None:
+        return None
+    f = _finite(v, key)
+    if f < 0:
+        raise ValueError(f"{key} is negative")
+    return f
+
+
+_PBW_STEP_NUMS = ("early_nits", "early_t_s", "sustained_nits", "min_nits", "max_nits", "tau_s", "hold_s",
+                  "cooldown_s", "black_nits", "t_start_s")
+_PBW_CURVE_NUMS = ("early_nits", "sustained_nits", "min_nits", "tau_s")
+
+
+@dataclass
+class PeakByWindow:
+    """The display's light against the size of a white window (``peak_by_window``, schema 1): what OLED owners
+    call the ABL graph. Per window size (% of the screen area, a centred rectangle of the screen's aspect on a
+    black surround): the early value (the first read after the window appeared), the sustained value (where the
+    limiter / backlight settled within the hold), the minimum and a fitted decay time; measured in an up pass and
+    a mirrored down pass, whose agreement is the validity check (a disagreement is drift or hysteresis, and the
+    curve then says so instead of averaging it). A measured response, NOT a correction; it writes no other field.
+
+    ``steps`` = every measured step in run order (``pass`` up/down); ``curve`` = one entry per window size with
+    the per-pass values, the combined ``sustained_nits`` only where the passes agree. ``run_window_area_pct`` =
+    the largest window still on the small-window plateau (evidence for a run window; nothing consumes it yet)."""
+
+    measured: str
+    run_id: str
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    curve: list[dict[str, Any]] = field(default_factory=list)
+    agreement: dict[str, Any] = field(default_factory=dict)
+    valid: bool = False
+    identity: dict[str, Any] = field(default_factory=dict)
+    conditions: dict[str, Any] = field(default_factory=dict)
+    rules: dict[str, Any] = field(default_factory=dict)
+    plateau_nits: Optional[float] = None
+    run_window_area_pct: Optional[float] = None
+    run_window_sustained_nits: Optional[float] = None
+    full_field_sustained_nits: Optional[float] = None
+    wear: dict[str, Any] = field(default_factory=dict)
+    schema: int = PEAK_BY_WINDOW_SCHEMA
+    notes: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PeakByWindow":
+        if not isinstance(d, dict):
+            raise TypeError("peak_by_window is not an object")
+        schema = int(d.get("schema", PEAK_BY_WINDOW_SCHEMA))
+        if schema > PEAK_BY_WINDOW_SCHEMA:
+            raise ValueError(f"peak_by_window schema {schema} is newer than this DLC ({PEAK_BY_WINDOW_SCHEMA})")
+
+        def entry(e: Any, nums: tuple[str, ...]) -> dict[str, Any]:
+            if not isinstance(e, dict):
+                raise TypeError("a peak_by_window entry is not an object")
+            area = _finite(e["area_pct"], "area_pct")
+            if not (0.0 < area <= 100.0):
+                raise ValueError(f"area_pct {area} outside (0, 100]")
+            for k in nums:
+                _opt_pos(e, k)
+            return dict(e)
+
+        steps = [entry(s, _PBW_STEP_NUMS) for s in (d.get("steps") or [])]
+        curve = sorted((entry(c, _PBW_CURVE_NUMS) for c in (d.get("curve") or [])), key=lambda c: c["area_pct"])
+        if not curve:
+            raise ValueError("peak_by_window has no curve")
+        return cls(measured=str(d["measured"]), run_id=str(d.get("run_id") or ""), steps=steps, curve=curve,
+                   agreement=dict(d.get("agreement") or {}), valid=bool(d.get("valid", False)),
+                   identity=dict(d.get("identity") or {}), conditions=dict(d.get("conditions") or {}),
+                   rules=dict(d.get("rules") or {}), plateau_nits=_opt_pos(d, "plateau_nits"),
+                   run_window_area_pct=_opt_pos(d, "run_window_area_pct"),
+                   run_window_sustained_nits=_opt_pos(d, "run_window_sustained_nits"),
+                   full_field_sustained_nits=_opt_pos(d, "full_field_sustained_nits"),
+                   wear=dict(d.get("wear") or {}), schema=schema, notes=list(d.get("notes") or []))
 
 
 @dataclass
@@ -204,6 +312,7 @@ class DisplayInstrumentProfile:
     native_black_nits: Optional[float] = None
     native_primaries: Optional[dict[str, list[float]]] = None    # {"R":[x,y],"G":..,"B":..}
     refresh_response: Optional[RefreshResponse] = None   # the light at other refresh rates vs the reference (above)
+    peak_by_window: Optional[PeakByWindow] = None         # the light against the white window's size (above)
     eotf_undershoot: Optional[float] = None       # HDR: full-field measured-vs-requested luminance error
     #   (e.g. -0.06 = panel renders ~6% below the PQ target across the range — a calibratable gain)
     white_vs_luminance: Optional[list[list[float]]] = None  # HDR: [[nits, x, y], ...] — the panel's
@@ -256,6 +365,10 @@ class DisplayInstrumentProfile:
             d.pop("refresh_response")        # a record without one is written exactly as before
         else:
             d["refresh_response"] = self.refresh_response.as_dict()
+        if self.peak_by_window is None:
+            d.pop("peak_by_window")
+        else:
+            d["peak_by_window"] = self.peak_by_window.as_dict()
         return d
 
     @classmethod
@@ -270,6 +383,13 @@ class DisplayInstrumentProfile:
                 refresh = RefreshResponse.from_dict(d["refresh_response"])
             except (KeyError, TypeError, ValueError) as exc:
                 notes.append(f"refresh_response dropped (unreadable: {exc})")
+        pbw = None
+        if d.get("peak_by_window"):
+            # Optional like refresh_response: an unreadable section is dropped (and said), the record kept.
+            try:
+                pbw = PeakByWindow.from_dict(d["peak_by_window"])
+            except (KeyError, TypeError, ValueError) as exc:
+                notes.append(f"peak_by_window dropped (unreadable: {exc})")
         return cls(
             display=d["display"],
             mode=d.get("mode"),
@@ -284,6 +404,7 @@ class DisplayInstrumentProfile:
             native_black_nits=_opt_float(d.get("native_black_nits")),
             native_primaries=(dict(d["native_primaries"]) if d.get("native_primaries") else None),
             refresh_response=refresh,
+            peak_by_window=pbw,
             eotf_undershoot=_opt_float(d.get("eotf_undershoot")),
             white_vs_luminance=([[float(c) for c in row] for row in d["white_vs_luminance"]]
                                 if d.get("white_vs_luminance") else None),

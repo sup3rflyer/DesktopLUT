@@ -23,7 +23,9 @@ the entry point. Where they differ, the guide and `python -m dlc.calibrate --hel
    - Which monitor index is the target? Ask; never assume monitor 0.
    - What panel type is it? OLED, mini-LED, LCD (guide §2).
 2. **Pick the flow** from the request (guide §5). Size it with `--preview-patches` and tell the human the size and
-   rough duration.
+   rough duration. The two HDR probes measure and record, never calibrate: `peak-window` (the ABL graph, guide
+   §17) and `refresh-response` (for REFRESH TRIM, guide §16; then `python -m dlc.refresh_trim record`). Suggest
+   them when the characterize digest lists a gap.
 3. **Bring up** (guide §6):
    - HDR first if needed (`--set-hdr on`).
    - Start the patch daemon with the right mode and bit depth, plus an OLED window / black idle if needed.

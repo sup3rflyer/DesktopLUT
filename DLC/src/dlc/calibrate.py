@@ -965,6 +965,8 @@ class Calibration:
         "clear-native": ("Clear to native", False),
         "enter-neutral": ("Enter neutral", False),
         "characterize": ("Characterize panel", True),
+        "peak-window": ("Peak by window", True),
+        "refresh-response": ("Refresh response", True),
         "hardware-readiness": ("Hardware readiness", False),
         "brightness": ("Brightness", False),
         "measure:raw": ("Measure · raw panel", True),
@@ -3373,7 +3375,8 @@ class Calibration:
         # the DIP's, or an emissive panel would be measured full-field (its power limiter dims it) or
         # at a window nobody can confirm. Whether that window is right is a judgment — never auto.
         window_size = outcome.digest.get("patch_window_size") or {}
-        if window_size.get("seam") and self.calib.get("flow") != "build-correction":
+        # (The probe flows paint their own window per patch: the presenter's window is not theirs.)
+        if window_size.get("seam") and self.calib.get("flow") not in ("build-correction", *PROBE_FLOWS):
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="preflight:patch-window", seam=SEAM_PATCH_WINDOW, stage="preflight",
                 question=window_size.get("question") or "confirm the patch window — proceed or abort?",
@@ -4119,6 +4122,12 @@ class Calibration:
                           patch_window_area_pct=(self.patch_window_report or {}).get("area_pct"),
                           made=self.run_date.isoformat(),
                           updated=self.run_date.isoformat())
+            # A re-characterization replaces the record; the optional measured sections recorded by the
+            # probes (refresh_response, peak_by_window) are not re-measured here and carry their own date,
+            # so they are kept (else every characterize silently dropped them).
+            prior = store.get(dip.key)
+            if prior is not None:
+                dip = replace(dip, refresh_response=prior.refresh_response, peak_by_window=prior.peak_by_window)
             # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
             # 180-day default) — panel+meter behaviour drift is a different clock than the
             # colorimeter correction's age, so we deliberately do NOT inherit correction.max_age_days.
@@ -8523,7 +8532,7 @@ class Calibration:
         that window unnoticed — on an OLED, full-field ABL-dimmed reads. Mechanical no-op when nothing
         was recorded, the window is unknown now, or it is unchanged; a change is a judgment, keyed by
         the change itself so a later, different change asks again (never a replayed old answer)."""
-        if self.calib.get("flow") == "build-correction":
+        if self.calib.get("flow") in ("build-correction", *PROBE_FLOWS):
             return
         rec = self.calib.get("patch_window_size") or {}
         if not rec.get("known") or rec.get("area_pct") is None:
@@ -8573,6 +8582,12 @@ class Calibration:
                 return self._flow_build_correction()
             if flow == "characterize":
                 return self._flow_characterize()
+            if flow == "peak-window":
+                from . import peak_window   # the probe flows live in their own modules
+                return peak_window.run_flow(self)
+            if flow == "refresh-response":
+                from . import refresh_probe
+                return refresh_probe.run_flow(self)
             if flow == "hdr":
                 # P13 (fable Phase 7a): HDR is a MODE, not a flow — `--mode HDR` on the normal
                 # flows runs the full HDR pipeline (PQ target, HDR refine, dE_ITP verify). This
@@ -9586,7 +9601,9 @@ class Calibration:
             digest={"characterize": outcome.digest,
                     "stored_display": dip.display if dip else None,
                     "dip_store": str(self._dip_store().path),
-                    "snapshot_restore": self.calib.get("snapshot_restore")})
+                    "snapshot_restore": self.calib.get("snapshot_restore"),
+                    # what the record still lacks that a probe flow measures (the overseer may suggest it)
+                    "gaps": _dip_probe_gaps(dip, mode=self.mode, emissive=self.display.is_emissive)})
 
     def _require_stack(self, *, need_mhc: bool, need_lut: bool) -> None:
         """3dlut-only assumes an installed stack. If it's missing, escalate
@@ -10849,10 +10866,37 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
                    "measure:verify", "verify"),
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
+    "peak-window": ("preflight", "enter-neutral", "hardware-readiness", "peak-window"),
+    "refresh-response": ("preflight", "hardware-readiness", "refresh-response"),
     # verify-source / install-candidate only with --verify-patches-from / --verify-cube.
     "verify-only": ("preflight", "verify-source", "verify-patches-file", "resolve-target", "whitepoint",
                     "hardware-readiness", "install-candidate", "measure:verify", "verify"),
 }
+
+# The probe flows (measure the panel's behaviour, write a DIP section; never build or apply anything).
+PROBE_FLOWS = ("peak-window", "refresh-response")
+
+
+def _dip_probe_gaps(dip: Any, *, mode: str, emissive: bool) -> list[str]:
+    """The characterize digest's note of what the HDR record lacks that a probe flow measures."""
+    if dip is None or str(mode).upper() != "HDR":
+        return []
+    out = []
+    if getattr(dip, "refresh_response", None) is None:
+        out.append("no refresh response measured (python -m dlc.refresh_probe; REFRESH TRIM needs it)")
+    if emissive and getattr(dip, "peak_by_window", None) is None:
+        out.append("no peak-by-window curve measured (python -m dlc.peak_window)")
+    return out
+
+
+def _vrr_presenter_factory(args: Any) -> Optional[Callable[..., Any]]:  # pragma: no cover - live wiring
+    """The refresh probe's VRR rate source: the native presenter's client (dlc.vrr). None until it is built."""
+    try:
+        from .vrr import native_presenter_factory
+    except Exception:  # noqa: BLE001
+        return None
+    return native_presenter_factory()
+
 
 # Flow registry (the named flows the front door maps an intent onto). HDR is a run
 # MODE (--mode HDR), orthogonal to the flow — the "hdr" entry is a signpost stub.
@@ -10865,6 +10909,11 @@ FLOWS: dict[str, str] = {
                    "grayscale (white band) → re-apply its 3D LUT → short verify → apply gate"),
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
+    "peak-window": ("HDR probe: consent → native (or --probe-spec stack installed) → white windows 1..100 % up and "
+                    "down (the ABL graph) → restore → record seam → DIP peak_by_window (dlc.peak_window)"),
+    "refresh-response": ("HDR probe: plan seam → through the installed MHC (layers, cube, trim out) → reference ↔ rate "
+                         "brackets, a consent per mode switch (or a VRR cadence) → restore → files for "
+                         "`dlc.refresh_trim record` (dlc.refresh_probe)"),
     "verify-only": ("MEASURE the installed stack (or a --verify-cube candidate over it) against the verify "
                     "preset or a recorded run's exact set (--verify-patches-from, deltas vs its verify) → "
                     "report; builds/commits nothing (candidate: verify:candidate restore/keep)"),
@@ -11238,7 +11287,7 @@ def _gswb_rollback_hint(run_root: Any) -> str:
 
 # Flows that never enter calibration mode: they tune / measure the INSTALLED stack in place, so
 # DesktopLUT never takes a snapshot of them (their own undo is the in-place baseline / candidate).
-_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only")
+_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only", "refresh-response")
 
 
 def _run_entered_calibration(calib_state: Optional[dict[str, Any]], *,
@@ -12129,6 +12178,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
 
     parser = argparse.ArgumentParser(prog="dlc-calibrate", description="DLC v2 scripted calibration orchestrator")
     parser.add_argument("--flow", default="full", choices=sorted(FLOWS))
+    parser.add_argument("--probe-spec", type=Path, default=None, dest="probe_spec",
+                        help="probe flows (peak-window, refresh-response): the spec JSON from "
+                             "`python -m dlc.peak_window plan --out` / `python -m dlc.refresh_probe plan --out`; "
+                             "read on the first invocation, recorded in the run")
     parser.add_argument("--monitor", type=int, default=0)
     parser.add_argument("--mode", default="SDR")
     parser.add_argument("--run", type=Path, default=None, help="run dir (resume an existing run)")
@@ -13011,6 +13064,23 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             link_probe=probe_link_formats,
                             optimize_config=OptimizeConfig(top_hold=(args.top_hold == "on"),
                                                            oog_solve=args.oog_solve))
+        # The probe flows' extras (dlc.peak_window / dlc.refresh_probe read them with getattr): the spec file, and
+        # the read-only DisplayConfig reader (the refresh probe also switches modes through it, after its seams).
+        if args.probe_spec is not None:
+            calib.probe_spec = json.loads(Path(args.probe_spec).read_text(encoding="utf-8"))
+        if eff_flow in PROBE_FLOWS:
+            from .refresh_mode import Win32DisplayApi
+            calib.display_api = Win32DisplayApi()
+            calib.vrr_presenter_factory = _vrr_presenter_factory(args)
+            if persistent_meter is not None:
+                # the refresh probe's VRR source paints through its own presenter: it reads the meter alone,
+                # and asks the instrument for the refresh rate it sees (spotread's F key) as proof of the rate
+                class _NoPresent:
+                    def show(self, _patch: Any) -> None:
+                        return None
+                _meter_only = make_persistent_spotread_meter(presenter=_NoPresent(), persistent=persistent_meter)
+                calib.vrr_meter = lambda: _meter_only(MeasurePatch("vrr", (0, 0, 0), (0.0, 0.0, 0.0)))
+                calib.vrr_meter_refresh = lambda: persistent_meter.measure_refresh_rate()
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:

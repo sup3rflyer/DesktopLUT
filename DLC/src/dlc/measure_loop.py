@@ -105,7 +105,14 @@ class MeasurePatch:
     ``min_reads`` is a per-patch accepted (inlier) read count set by the caller (a verify patches
     file's ``reads``); 0 = none (the loop's own policy). It REPLACES the dark near-neutral floor
     (``dark_min_reads``) for this patch and binds as a minimum in every stop path; the global /
-    bright-neutral floors and the DIP's SNR escalation still apply."""
+    bright-neutral floors and the DIP's SNR escalation still apply.
+
+    ``window_area_pct`` (the probes, :mod:`dlc.peak_window` / :mod:`dlc.refresh_probe`): paint the
+    patch as a centred rectangle of the screen's aspect covering that % of the screen AREA on a
+    black surround (100 = full field), instead of the presenter's own window. ``repaint=False``
+    says the same frame is already up: a presenter that knows it skips the repaint and its dwell,
+    so a run of back-to-back reads of one held frame is timed by the meter alone. Both default
+    off, and a patch that sets neither serializes exactly as before."""
 
     label: str
     rgb: tuple[int, int, int]
@@ -115,9 +122,38 @@ class MeasurePatch:
     seq: int = -1
     settle_bump_s: float = 0.0
     min_reads: int = 0
+    window_area_pct: Optional[float] = None
+    repaint: bool = True
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if self.window_area_pct is None:
+            d.pop("window_area_pct")
+        if self.repaint:
+            d.pop("repaint")
+        return d
+
+
+def window_shapes(rgb: Sequence[int], area_pct: float) -> list:
+    """The frame of a windowed patch (``MeasurePatch.window_area_pct``): a black full-field surround,
+    then a centred rectangle of the screen's aspect whose area is ``area_pct`` % of the screen (each
+    side ``sqrt(area / 100)`` of the screen's side). 100 or more = one full-field rectangle. Two shapes
+    at most: the daemon's Resolve transport paints the background + ONE rectangle."""
+    r, g, b = (int(v) for v in rgb)
+    a = float(area_pct)
+    if not (a > 0.0):
+        raise ValueError(f"window area must be > 0 % (got {area_pct!r})")
+    if a >= 100.0:
+        return [((r, g, b), (0.0, 0.0, 1.0, 1.0))]
+    side = math.sqrt(a / 100.0)
+    off = (1.0 - side) / 2.0
+    return [((0, 0, 0), (0.0, 0.0, 1.0, 1.0)), ((r, g, b), (off, off, side, side))]
+
+
+def shapes_command(shapes: Sequence[Any]) -> str:
+    """The daemon's ``shapes`` line for ``shapes`` (:func:`dlc.dogegen_server.parse_shapes_command`)."""
+    return "shapes " + " ; ".join(f"{int(c[0])} {int(c[1])} {int(c[2])} {x:.6f} {y:.6f} {cx:.6f} {cy:.6f}"
+                                  for c, (x, y, cx, cy) in shapes)
 
 
 @dataclass(frozen=True)
@@ -3609,6 +3645,11 @@ class DogegenPresenter:
                 "area_pct": window_area_pct(self.patch_size, self.place_rect)}
 
     def show(self, patch: MeasurePatch) -> None:
+        if patch.window_area_pct is not None:
+            # The spawned window paints ONE window size, fixed at start: a per-patch window needs the
+            # persistent daemon's shapes frames (python -m dlc.dogegen_server, Resolve transport).
+            raise RuntimeError("a windowed patch (window_area_pct) needs the dogegen daemon "
+                               "(--dogegen-server); the spawned dogegen window paints one fixed size")
         proc = self._ensure()
         r, g, b = patch.rgb
         # settle_bump_s: per-presentation extra dwell from the loop's luminance-jump
@@ -3692,6 +3733,7 @@ class SocketPresenter:
         self.settle_seconds = settle_seconds
         self.timeout = timeout
         self._sock = None
+        self._frame: Any = None     # the frame last painted (repaint=False skips an identical one)
 
     def _ensure(self):
         if self._sock is None:
@@ -3712,12 +3754,23 @@ class SocketPresenter:
 
     def show(self, patch: MeasurePatch) -> None:
         import time
-        s = self._ensure()
         r, g, b = patch.rgb
-        s.sendall(f"{r} {g} {b}\n".encode("ascii"))
+        frame = (tuple(patch.rgb), patch.window_area_pct)
+        if not patch.repaint and frame == self._frame and self._sock is not None:
+            return                    # the same frame is up: no repaint, no dwell (held-frame reads)
+        s = self._ensure()
+        if patch.window_area_pct is not None:
+            line = shapes_command(window_shapes(patch.rgb, patch.window_area_pct))
+        else:
+            line = f"{r} {g} {b}"
+        self._frame = None
+        s.sendall((line + "\n").encode("ascii"))
         ack = self._recv_line(s)
         if not ack.startswith("ok"):
-            raise RuntimeError(f"dogegen-server did not ack patch ({r},{g},{b}): {ack!r}")
+            raise RuntimeError(f"dogegen-server did not ack patch ({r},{g},{b}"
+                               + (f" at {patch.window_area_pct:g} % window" if patch.window_area_pct is not None
+                                  else "") + f"): {ack!r}")
+        self._frame = frame
         # per-presentation extra dwell from the loop's luminance-jump settle bump
         dwell = self.settle_seconds + patch.settle_bump_s
         if dwell:
@@ -3747,6 +3800,7 @@ class SocketPresenter:
         # Drop our connection ONLY — the daemon (and its fullscreen window) persists across
         # invocations on purpose (so a pause/resume keeps one fullscreen window). The run's
         # terminal step calls :meth:`shutdown_daemon` to actually stop it.
+        self._frame = None
         if self._sock is not None:
             try:
                 self._sock.close()

@@ -46,7 +46,21 @@ RATES: dict[str, tuple[int, int]] = {
     "50": (50, 1),
     "48": (48, 1),
     "47.952": (48000, 1001),
+    # 2026-11-12 (dlc.refresh_probe): the other rates video plays at, and the usual reference rates above 60. Every
+    # neighbour pair is still >= 0.024 Hz apart (23.976 / 24), so RATE_TOL_HZ separates them.
+    "23.976": (24000, 1001),
+    "24": (24, 1),
+    "25": (25, 1),
+    "29.97": (30000, 1001),
+    "30": (30, 1),
+    "100": (100, 1),
+    "119.88": (120000, 1001),
+    "120": (120, 1),
+    "144": (144, 1),
 }
+# The rates video content is played at (a candidate for the refresh probe when the display offers it).
+CONTENT_RATES: tuple[str, ...] = ("23.976", "24", "25", "29.97", "30", "47.952", "48", "50", "59.94", "60",
+                                  "100", "119.88", "120")
 # A mode "is" a catalogue rate when it is within this of it AND nearer to it than to any other catalogue rate.
 # Nearest neighbours: 48 / 47.952 are 0.048 Hz apart, 60 / 59.94 0.060 Hz. A CVT-RB "60" can be 59.997 (0.003 off),
 # and a CRU timing's pixel-clock quantum is ~20 ppm (0.001 Hz). So 0.01 Hz accepts both and still separates every
@@ -647,7 +661,7 @@ def mode_key(path: dict[str, Any]) -> dict[str, Any]:
 
 
 def plan_rates(display: dict[str, Any], dxgi: Sequence[dict[str, Any]], legacy: Sequence[dict[str, Any]],
-               rates: Sequence[str] = tuple(RATES)) -> dict[str, Any]:
+               rates: Sequence[str] = ("60", "59.94", "50", "48", "47.952")) -> dict[str, Any]:
     """For each catalogue rate at the display's CURRENT resolution: the exact DXGI modes that are that rate, the
     integer a legacy request names, every DXGI mode that shares that integer (two = the request is ambiguous) and
     whether the legacy list offers it. Pure; changes nothing."""
