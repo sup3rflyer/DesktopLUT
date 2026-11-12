@@ -325,6 +325,11 @@ hardware runs, and every judgement goes to the assistant or the user. Start with
 [DLC/docs/operator-guide.md](DLC/docs/operator-guide.md). An assistant running a calibration follows the operator
 guide; an assistant changing DLC's code reads its README and tests.
 
+DLC is not in the release zip. An assistant setting it up for a user who has only the zip follows
+[DLC/README.md → Getting started](DLC/README.md#getting-started). The DLC tab's **SET UP WITH YOUR ASSISTANT** copies a
+request with those steps; its text, and the folders DesktopLUT searches for DLC, are in `src/dlc/dlc_setup.*` and
+`dlc::FolderCandidates` (`src/dlc/dlc_scan.*`); `tests/test_dlc.cpp` checks the request against the docs.
+
 ## 12. Before you hand a change back
 
 - Release and test builds clean; the test suite passes (opt-in cases need their environment variables).

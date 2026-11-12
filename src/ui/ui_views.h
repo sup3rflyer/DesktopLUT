@@ -92,5 +92,7 @@ TitleRow DrawDisplayTitle(const DisplayRow& sel, ViewState& vs);
 float PageFooterTop();
 // A destructive action waits for confirmation in a modal.
 void AskConfirm(ViewState& vs, std::string title, std::string detail, std::string action, std::function<void()> onConfirm);
+// Picks the DLC folder in the Shell's folder dialog, sets it and scans it (posts the command: the dialog pumps).
+void BrowseDlcFolder();
 
 }  // namespace ui

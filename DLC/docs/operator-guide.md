@@ -58,6 +58,10 @@ Also:
 
 ## 3. One-time setup on a new machine
 
+0. **DLC itself.** The release zip has no DLC. A user who has only the zip gets the repository first
+   (`git clone https://github.com/sup3rflyer/DesktopLUT.git "%USERPROFILE%\DesktopLUT"`, where DesktopLUT finds
+   `DLC` by itself); `README.md` → *Getting started* has the steps. DesktopLUT's DLC tab copies them as a setup
+   request (**SET UP WITH YOUR ASSISTANT**).
 1. **DesktopLUT v3.0.0 or newer** running (`DesktopLUT.exe` + `DwmHook.dll` from the Releases page). Older
    builds lack pipe commands DLC needs (`layers.set`, `hook.set_routing`). It runs elevated; the human starts and
    stops it.
@@ -84,9 +88,10 @@ Also:
    python -m dlc.stages.simulate --run runs/_rehearsal
    python -m pytest -q -m "not slow"
    ```
-8. **DesktopLUT's DLC tab** reads this folder. DesktopLUT finds it by itself when it is named `DLC` and sits next
-   to `DesktopLUT.exe`, or one or two folders up, and it remembers where it last found it. Anywhere else, the human
-   sets it: **SETTINGS** → *CALIBRATION* → *DLC FOLDER*.
+8. **DesktopLUT's DLC tab** reads this folder. DesktopLUT finds it by itself in `%USERPROFILE%\DesktopLUT\DLC`,
+   when it is named `DLC` and sits next to `DesktopLUT.exe` or one or two folders up, or in a repository clone
+   (`DesktopLUT\DLC`) inside or beside the exe's folder; it remembers where it last found it. Anywhere else, the
+   human sets it: **SET FOLDER…** on the DLC tab, or **SETTINGS** → *CALIBRATION* → *DLC FOLDER*.
 
 ## 4. Onboarding a display (first time only)
 

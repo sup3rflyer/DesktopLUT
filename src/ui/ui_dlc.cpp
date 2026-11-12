@@ -7,8 +7,11 @@
 #include "actions/actions.h"
 #include "actions/notify.h"
 #include "dlc/dlc_scan.h"
+#include "dlc/dlc_setup.h"
 #include "globals.h"
 #include "settings.h"
+#include "shell_open.h"
+#include "version.h"
 #include <shellapi.h>
 #include <algorithm>
 #include <array>
@@ -831,19 +834,31 @@ void StackLayers(const Snapshot& snap, const DisplayRow& r, bool showHdr) {
 
 // ---- right column, record view: what DLC recorded for this display + the way to start a run ---------------------
 // `stack`: the CURRENT STACK view — the layers in pixel order and the verification that measured them.
-void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs, bool stack = false) {
-    const dlc::Data& d = *snap.dlc;
-    if (d.folder.empty()) {
-        SeamRow("DLC", "NO FOLDER", pal::InkFaint, Font::Label);
-        RowCtx row = BeginRow("", kRowH);
-        row.x = row.x0 + Px(96);
-        RowPlace(row);
-        if (Button("##dlc_settings", "SETTINGS", kButtonW)) vs.page = Page::Settings;
-        EndRow(row);
-        return;
+// The START row: a request for Claude Code (or another coding agent) to calibrate, ready to paste.
+void StartRow(const std::string& prompt, const char* tip) {
+    RowCtx row = BeginRow("", kRowH);
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, row.y0 + row.h * 0.5f, "START");
+    row.x = row.x0 + Px(96);
+    RowPlace(row);
+    if (Button("##dlc_prompt", "COPY PROMPT", 116)) {
+        ImGui::SetClipboardText(prompt.c_str());
+        notify::Post(notify::Sev::Info, -1, L"dlc", L"Prompt copied", Wide(prompt.c_str()));
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tip);
+    EndRow(row);
+}
+
+void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, ViewState& vs, bool stack = false) {
+    (void)vs;
+    const dlc::Data& d = *snap.dlc;
+    if (d.folder.empty()) return;   // no DLC: the page shows its setup instead (SetupPanel)
     if (r.dlcMatch.name.empty()) {
         SeamRow("DLC", r.dlcMatch.ambiguous ? "AMBIGUOUS" : "NOT MATCHED", pal::InkFaint, Font::Label);
+        // A display DLC has not met: the agent onboards it first (its profile entry), then calibrates.
+        const std::string name = Utf8(r.name);
+        StartRow("Calibrate the display DesktopLUT calls \"" + name + "\" (" + (showHdr ? "HDR" : "SDR") +
+                     ") with DLC. It is not in DLC's profile yet: onboard it first.",
+                 "For Claude Code: it adds this display to DLC, then drives the run and decides its seams.");
         return;
     }
     const dlc::ModeRecord& rec = r.dlcRecord[showHdr ? 1 : 0];
@@ -883,17 +898,80 @@ void RecordPanelRows(const Snapshot& snap, const DisplayRow& r, bool showHdr, Vi
     if (!rec.correctionMade.empty())
         SeamRow("METER", DateAge(rec.correctionMade, rec.correctionDaysAgo), rec.correctionStale ? pal::Alarm : pal::InkDim);
     // Runs are started from Claude Code: the prompt, ready to paste.
+    StartRow("Calibrate " + r.dlcMatch.name + " (" + (showHdr ? "HDR" : "SDR") + ") with DLC.",
+             "For Claude Code: it drives DLC and decides its seams.");
+}
+
+// ---- no DLC: what it is, what it needs, and its setup ------------------------------------------------------------
+void SetupRow(const char* label, const std::string& value, ImU32 col, Font f, const std::string& tip) {
     RowCtx row = BeginRow("", kRowH);
-    TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, row.y0 + row.h * 0.5f, "START");
+    TextAt(Font::Label, kSizeLabel, pal::InkDim, row.x0, row.y0 + row.h * 0.5f, label);
     row.x = row.x0 + Px(96);
-    RowPlace(row);
-    if (Button("##dlc_prompt", "COPY PROMPT", 116)) {
-        const std::string prompt = "Calibrate " + r.dlcMatch.name + " (" + (showHdr ? "HDR" : "SDR") + ") with DLC.";
-        ImGui::SetClipboardText(prompt.c_str());
-        notify::Post(notify::Sev::Info, -1, L"dlc", L"Prompt copied", Wide(prompt.c_str()));
-    }
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("For Claude Code: it drives DLC and decides its seams.");
+    RowText(row, value, col, f, f == Font::Mono ? kSizeMono : kSizeLabel);
+    if (!tip.empty() && ImGui::IsMouseHoveringRect(ImVec2(row.x0, row.y0), ImVec2(row.right, row.y0 + row.h)) &&
+        ImGui::IsWindowHovered())
+        ImGui::SetTooltip("%s", tip.c_str());
     EndRow(row);
+}
+
+void CopySetupPrompt() {
+    const std::string prompt = dlc::SetupPrompt(dlc::SetupRepoFolder(dlc::UserHome()), DESKTOPLUT_VERSION_STR);
+    ImGui::SetClipboardText(prompt.c_str());
+    notify::Post(notify::Sev::Info, -1, L"dlc", L"Setup request copied", L"Paste it into your AI coding agent.");
+}
+
+void OpenGuide() {
+    Post([]() {
+        if (OpenUrlAsUser(Wide(dlc::kGuideUrl))) return;
+        // The desktop shell did not take it (and an elevated browser is no fallback): the link, to paste.
+        if (ImGui::GetCurrentContext()) ImGui::SetClipboardText(dlc::kGuideUrl);
+        notify::Post(notify::Sev::Warning, -1, L"dlc", L"Guide link copied", L"Paste it into your browser.");
+    });
+}
+
+// The DLC page when no DLC folder is found: DLC is not in the release zip. The setup is the user's coding agent's job
+// (SET UP WITH YOUR ASSISTANT copies its request), the public guide is one click away, and someone who has DLC
+// already points DesktopLUT at it.
+void SetupPanel(const Snapshot& snap) {
+    const dlc::Data& d = *snap.dlc;
+    const bool missing = !g_dlcFolder.empty() && d.configured == g_dlcFolder;   // a set folder that is not there
+    const float w = std::min(ImGui::GetContentRegionAvail().x, Px(720));
+    const Light light = missing ? Light::Fault : Light::Off;
+    BeginPanel("##dlc_setup", "SET UP DLC", &light, ImVec2(w, 0.0f));
+    const char* dot = "  \xC2\xB7  ";
+    SetupRow("DOES", std::string("MEASURES THE DISPLAY") + dot + "INSTALLS MHC PROFILE + 3D LUT", pal::Ink, Font::Label,
+             "DLC, the DesktopLUT Calibrator, measures a display with a colorimeter\n"
+             "and installs its MHC profile and 3D LUT, SDR and HDR.");
+    SetupRow("NEEDS", std::string("COLORIMETER") + dot + "PYTHON 3.11+" + dot + "ARGYLLCMS" + dot + "AI CODING AGENT",
+             pal::Ink, Font::Label,
+             "DLC is developed with the i1Display Pro family.\n"
+             "An AI coding agent, such as Claude Code, runs each calibration with you.");
+    SetupRow("GET", "DLC FOLDER OF THE DESKTOPLUT REPOSITORY", pal::Ink, Font::Label,
+             std::string("Not in the release zip.\n") + dlc::kRepoUrl);
+    if (missing) {
+        SetupRow("FOLDER", "NOT FOUND  " + Utf8(g_dlcFolder), pal::Alarm, Font::Mono,
+                 "Set in SETTINGS > CALIBRATION > DLC FOLDER. CLEAR there finds DLC by itself.");
+    } else {
+        const std::wstring repo = dlc::SetupRepoFolder(dlc::UserHome());
+        SetupRow("LOOKS IN", repo.empty() ? std::string("\xE2\x80\x94") : Utf8(repo + L"\\DLC"), pal::InkDim, Font::Mono,
+                 "Where the setup puts DLC. DesktopLUT also looks next to DesktopLUT.exe,\n"
+                 "one or two folders up, and in a repository clone beside it.");
+    }
+    ImGui::Dummy(ImVec2(0, Px(6)));
+    Hairline(pal::Rule);
+    ImGui::Dummy(ImVec2(0, Px(10)));
+    const float gap = Snap(Px(8));
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    if (PushButton("##dlc_setup_ask", "SET UP WITH YOUR ASSISTANT", 236, kControlH, true)) CopySetupPrompt();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Copies a setup request: paste it into your AI coding agent.");
+    ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + Px(236) + gap), p.y));
+    if (Button("##dlc_setup_guide", "GUIDE", kButtonW)) OpenGuide();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("DLC's setup guide on GitHub, in your browser.");
+    ImGui::SetCursorScreenPos(ImVec2(Snap(p.x + Px(236) + gap + Px(kButtonW) + gap), p.y));
+    if (Button("##dlc_setup_folder", "SET FOLDER\xE2\x80\xA6", 116)) BrowseDlcFolder();
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("You have DLC already: pick its folder.");
+    ImGui::Dummy(ImVec2(0, Px(6)));
+    EndPanel();
 }
 
 // The reports for one DLC display and mode, newest first (indices into Data::reports).
@@ -1053,6 +1131,12 @@ void DrawDlcPage(const Snapshot& snap, ViewState& vs) {
         if (other && Button("##dlc_move", "MOVE", 72)) Post([measured, other]() { MoveWindowOff(measured, other); });
         if (other && ImGui::IsItemHovered()) ImGui::SetTooltip("Move this window to another display.");
         ImGui::SetCursorScreenPos(keep);
+    }
+
+    if (d.folder.empty()) {   // no DLC (a release zip has none): what it is and its setup, nothing to show yet
+        SetupPanel(snap);
+        ImGui::EndChild();
+        return;
     }
 
     RunStrip(snap, vs, sel);

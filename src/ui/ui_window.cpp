@@ -502,7 +502,7 @@ std::wstring DlcFolder() {
 
 void RequestDlcScan() {
     // The worker resolves the folder (the candidates' file checks never run on this thread) and scans it.
-    g_dlcRequest = dlc::RequestScan(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast));
+    g_dlcRequest = dlc::RequestScan(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast, dlc::UserHome()));
     FollowDlcFolder();               // the run in progress: polled while the interface is visible
     dlc::SetLiveWatchActive(true);
 }

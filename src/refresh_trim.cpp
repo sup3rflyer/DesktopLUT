@@ -285,7 +285,7 @@ void RequestRefreshTrim() {
 
 void RequestRefreshTrimDipScan() {
     // The worker resolves the folder (the candidates' file checks never run on this thread) and scans it.
-    dlc::RequestScan(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast));
+    dlc::RequestScan(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast, dlc::UserHome()));
 }
 
 void InitRefreshTrim() {
@@ -293,7 +293,7 @@ void InitRefreshTrim() {
     // One synchronous read before the first bakes (the worker's scan answers asynchronously): the folder the scan
     // would read, its dip_store.json only.
     bool detected = false;
-    g_primedFolder = dlc::ResolveFolder(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast), &detected);
+    g_primedFolder = dlc::ResolveFolder(g_dlcFolder, dlc::FolderCandidates(ExeDir(), g_dlcFolderLast, dlc::UserHome()), &detected);
     uint64_t hash = 0;
     g_primedDip = dlc::ReadDipStore(g_primedFolder, g_primedData, hash);
     g_primed = true;
