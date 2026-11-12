@@ -482,6 +482,12 @@ void VerifyAndRestoreMhcProfiles() {
     for (int i = 0; i < (int)snapshots.size(); i++) {
         const auto& snap = snapshots[i];
 
+        // Nothing of ours to verify on this monitor: no display query for it. (The 15 s tick resolved every
+        // monitor through DisplayConfig, set up or not.)
+        const bool verifySdr = snap.sdrEnabled && !snap.sdrName.empty();
+        const bool verifyHdr = snap.hdrEnabled && !snap.hdrName.empty();
+        if (!verifySdr && !verifyHdr) continue;
+
         DisplayInfo displayInfo;
         if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
 

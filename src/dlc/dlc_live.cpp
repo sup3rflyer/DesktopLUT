@@ -947,7 +947,12 @@ void WatchMain() {
         {
             std::unique_lock<std::mutex> lock(g_mutex);
             const auto wait = std::chrono::milliseconds(fast ? 500 : 2000);
-            g_cv.wait_for(lock, wait, [] { return g_stop || g_kick || !g_chartQueue.empty(); });
+            const auto wake = [] { return g_stop || g_kick || !g_chartQueue.empty(); };
+            // Not watching (the window is hidden or minimised): nothing to poll, so no timeout either. Showing the
+            // window, a folder change and a chart request all notify. (It used to wake every 2 s for good once the
+            // window had been opened.)
+            if (g_active) g_cv.wait_for(lock, wait, wake);
+            else g_cv.wait(lock, wake);
             if (g_stop) return;
             if (!g_chartQueue.empty()) {
                 chartRun = g_chartQueue.front();

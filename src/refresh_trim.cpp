@@ -364,6 +364,19 @@ void ReconcileRefreshTrim(const char* why) {
     const char* reason = why ? why : "";
     const bool periodic = strcmp(reason, "periodic") == 0;
 
+    // The periodic pass exists for a refresh change no message carried. With the trim off on every display (the
+    // default) there is nothing for it to catch: the switch, a DIP change, every display change and every retry
+    // (a hold, a failed swap) reconcile on their own. No DisplayConfig queries then.
+    if (periodic && !g_exiting) {
+        bool anyOn = false;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            for (const MonitorSettings& ms : g_gui.monitorSettings)
+                if (ms.hdrMHC.refreshTrimEnabled) { anyOn = true; break; }
+        }
+        if (!anyOn) return;
+    }
+
     // The DIP: the newest scan's, else the startup read.
     const std::shared_ptr<const dlc::Data> d = dlc::Current();
     const bool scanned = d->request != 0 || !g_primed;
