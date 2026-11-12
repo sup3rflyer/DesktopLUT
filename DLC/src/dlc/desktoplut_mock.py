@@ -665,7 +665,8 @@ class MockDesktopLutServer:
         view: dict[str, Any] = {"active": True, "needs_check": False,
                                 # C++ BuildHookStateJson: the simulated Windows runs the verified dwmcore
                                 "dwmcore": {"version": "10.0.26100.9168", "verified_up_to": "10.0.26100.9168",
-                                            "tested": True, "verdict": "verified"}}
+                                            "tested": True, "verdict": "verified",
+                                            "preflight": {"ran": True, "ok": True, "missing": []}}}
         if not st.hook_routing_present:
             return view
         entries = []

@@ -45,6 +45,7 @@
 #include "actions/mhc_edit.h"
 #include "dwm_inject.h"
 #include "dwm_hook_build.h"
+#include "dwmcore_scan.h"
 #include "windows_tonemap.h"
 
 #pragma comment(lib, "Advapi32.lib")
@@ -373,6 +374,17 @@ JsonValue BuildHookStateJson() {
         core.set("tested", b.verdict == DwmcoreVerdict::Verified ? JBool(true)
                          : b.verdict == DwmcoreVerdict::Newer ? JBool(false) : JsonValue());
         core.set("verdict", JStr(DwmcoreVerdictName(b.verdict)));
+        // preflight: { ran, ok, missing: [pattern names] } — the host's scan of the on-disk dwmcore for the anchor
+        // patterns of the path the DLL will take (dwmcore_scan.h). ok false = DesktopLUT does not inject (the
+        // overlay takes over); ran false = the file could not be read (the DLL decides, as before).
+        const DwmHookPreflight& pf = DwmHookPreflightCheck();
+        JsonValue pre = JObj();
+        pre.set("ran", JBool(pf.ran));
+        pre.set("ok", JBool(pf.ok));
+        JsonValue missing = JArr();
+        for (DwmPattern m : pf.missing) missing.arr.push_back(JStr(DwmPatternName(m)));
+        pre.set("missing", missing);
+        core.set("preflight", pre);
         hook.set("dwmcore", core);
     }
     // FALD panel files of the hook, per display and mode (dwm_inject.h DwmHookFaldPanels): what it HOLDS (its verdicts

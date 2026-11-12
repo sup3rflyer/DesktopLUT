@@ -21,6 +21,7 @@
 #include "gui_mhc.h"
 #include "whitelist.h"
 #include "dwm_inject.h"
+#include "dwmcore_scan.h"
 #include "actions/notify.h"
 #include <objbase.h>
 #include <iostream>
@@ -1325,7 +1326,9 @@ static void StartProcessingImpl() {
                 // takes it from the posted message once the transition is over (gui.cpp WM_DWMHOOK_START_FAILED),
                 // and the user hears about it there: the notice and the Events entry carry this error.
                 g_dwmHookStartError = err;
-                if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_DWMHOOK_START_FAILED, 0, 0);
+                // wParam 1: the pre-flight refused (dwmcore_scan.h) — a retry would refuse again: fall back at once.
+                const WPARAM preflightRefused = DwmHookPreflightCheck().ok ? 0 : 1;
+                if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_DWMHOOK_START_FAILED, preflightRefused, 0);
                 return;
             }
         }
