@@ -403,6 +403,11 @@ class _ConPtySpotreadProcess:
             pass
 
 
+# spotread's answer to the 'F' key ("Refresh rate = 59.940 Hz" / "... refresh rate is 60.0 Hz"); see
+# PersistentSpotread.measure_refresh_rate.
+_REFRESH_RATE_RE = re.compile(r"refresh\s+rate\s*(?:=|is|:)\s*([0-9]+(?:\.[0-9]+)?)\s*hz", re.IGNORECASE)
+
+
 class PersistentSpotread:
     """Drive one long-lived interactive ``spotread`` process.
 
@@ -506,6 +511,7 @@ class PersistentSpotread:
         # All of the following are guarded by _lock:
         self._buf = bytearray()                     # UNPROCESSED bytes (trailing partial line)
         self._results: list[SpotreadResult] = []    # extracted readings, not yet consumed
+        self._refresh: list[tuple[Optional[float], str]] = []   # 'F' refresh-rate answers (value or None, line)
         self._pending_warning: Optional[str] = None
         self._saw_cal = False
         self._total_bytes = 0                        # monotonic byte counter (quiescence)
@@ -597,6 +603,10 @@ class PersistentSpotread:
             if ok and warn:
                 ok, err = False, warn
             self._results.append(SpotreadResult(xyz=xyz, yxy=yxy, ok=ok, error=err, raw=line.strip()))
+        elif (m := _REFRESH_RATE_RE.search(line)) is not None:
+            self._refresh.append((float(m.group(1)), line.strip()))      # the 'F' key's answer (no reading)
+        elif "no refresh detected" in low:
+            self._refresh.append((None, line.strip()))
         elif any(tok in low for tok in _SPOTREAD_WARN_TOKENS):
             self._pending_warning = line.strip()
         elif self._CAL_RE.search(low):
@@ -1056,6 +1066,31 @@ class PersistentSpotread:
                    "out-of-sync process was stopped and "
                    + ("the meter was closed by its owner" if closed else
                       f"could not be respawned (self-heal budget {self._restart_budget} spent)")))
+
+    def measure_refresh_rate(self, *, timeout: float = 30.0) -> dict:
+        """The display's refresh rate as the INSTRUMENT measures it: spotread's interactive ``F`` key ("a display
+        refresh rate measurement", emissive mode, instruments that support it — the i1 Display Pro's typical error
+        is 0.05 Hz per ArgyllCMS' instruments page). Shows nothing and takes no reading; the patch on screen must be
+        bright enough to flicker at the refresh (a mid / bright field). Never raises: ``{"ok", "hz", "line"}`` or
+        ``{"ok": False, "error"}`` (not started / closed / timed out / "No refresh detected"). The refresh probe's
+        VRR source uses it as proof that the panel runs at the requested rate (dlc.vrr). HW-unverified: the
+        answer's wording is parsed loosely (``... refresh rate = <x> Hz``)."""
+        with self._lock:
+            if self._closed or self._proc is None:
+                return {"ok": False, "error": "spotread is not running"}
+            self._refresh.clear()
+        self._send(b"F")
+        end = time.monotonic() + max(0.5, float(timeout))
+        while time.monotonic() < end:
+            with self._lock:
+                if self._refresh:
+                    hz, line = self._refresh.pop(0)
+                    return ({"ok": True, "hz": hz, "line": line} if hz is not None
+                            else {"ok": False, "error": line})
+            if self._dead():
+                return {"ok": False, "error": "spotread exited during the refresh measurement"}
+            time.sleep(self._poll_interval)
+        return {"ok": False, "error": f"no refresh-rate answer within {timeout:.0f}s"}
 
     def summary(self) -> dict[str, int]:
         """The meter's lifetime counters (for the run's workflow.log): process deaths / respawns,

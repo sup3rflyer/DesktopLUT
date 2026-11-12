@@ -320,6 +320,7 @@ def make_source(cal: Any, spec: RefreshProbeSpec, hw: str) -> Any:
                          "--simulate run must hand one in (cal.display_api)")
         src = ModeSource(cal, api, hw)
     src.clock = probe_clock(cal)
+    src.tol_rel = spec.proof_tol_rel
     return src
 
 
@@ -508,7 +509,8 @@ class _Probe:
                 bad = 0
             row = {"seq": None, "leg": lg["leg"], "pass": lg["pass"], "rate": lg["rate"],
                    "rate_hz": self.src.current_hz, "patch": p["name"], "kind": p["kind"], "code": list(p["rgb"]),
-                   "nominal_nits": p.get("nominal_nits"), "source": self.src.kind, "implausible": why, **r}
+                   "nominal_nits": p.get("nominal_nits"), "source": lg.get("kind") or self.src.kind, "implausible": why,
+                   **r}
             with open(self.rows_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(jsonable(row)) + "\n")
             rows.append(row)
@@ -544,8 +546,19 @@ class _Probe:
                              **jsonable({k: rec.get(k) for k in ("rate", "ok", "fails", "active_hz", "proof")}))
         if not rec.get("ok"):
             raise _abort(f"the switch to {rate} Hz did not verify: {rec.get('fails')}", switch=jsonable(rec))
-        mn = self.spec.settle_min_s if self.src.kind == "mode" else self.spec.vrr_settle_min_s
-        after = self.spec.settle_after_s if self.src.kind == "mode" else 0.0
+        proof = rec.get("proof") or {}
+        if proof.get("ok") is None and self.src.kind == "vrr" and not self.st.get("osd_asked"):
+            # no display-side evidence (no DXGI refresh count, no meter refresh): the last resort is the human
+            # reading the monitor's refresh counter — held here, asked through a check-in (never a pause)
+            self.st["osd_asked"] = True
+            self.cal.runlog.check_in(STAGE, trigger="osd_refresh_check", evidence=jsonable({
+                "ask_the_human": f"read the monitor's refresh-rate counter (OSD) now: it should show {rec.get('active_hz')} Hz; "
+                                 "cancel the run (control.json) if it does not",
+                "rate": rate, "hold_s": 60.0, "proof": proof}))
+            self.reader.wait(60.0)
+        mode_switch = self.src.kind == "mode" or not rate.startswith("vrr:")
+        mn = self.spec.settle_min_s if mode_switch else self.spec.vrr_settle_min_s
+        after = self.spec.settle_after_s if mode_switch else 0.0
         self.st.setdefault("settles", []).append(self.settle_after_switch(t_sw, mn, after))
         self.check_stack(f"after the switch to {rate}")
 
@@ -561,20 +574,31 @@ class _Probe:
             st.setdefault("rewarm", []).append(self.warm_in(self.spec.rewarm_min_s))
         st["ref_view"] = stack_view(self.cal)
         self.cal._save()
-        for lg in self.legs[done:]:
-            if lg["rate"] != self.src.current and lg["rate"] != ref and self.src.kind == "mode":
-                self.consent(lg)
-            self.switch(lg["rate"])
-            summ = self.leg(lg)
-            st.setdefault("leg_summaries", []).append(jsonable(summ))
-            st["legs_done"] = lg["leg"] + 1
+        while True:
+            for lg in self.legs[int(st.get("legs_done", 0)):]:
+                # a fixed-mode switch away from the reference asks first (the mode source's every rate; the VRR
+                # source's cross-check)
+                if (lg["rate"] != self.src.current and lg["rate"] != ref
+                        and (self.src.kind == "mode" or lg.get("kind") == "mode")):
+                    self.consent(lg)
+                self.switch(lg["rate"])
+                summ = self.leg(lg)
+                st.setdefault("leg_summaries", []).append(jsonable(summ))
+                st["legs_done"] = lg["leg"] + 1
+                self.cal._save()
+                publish_chart(self.cal, STAGE, CHART, self.chart())
+                self.checkins.tick(st["legs_done"], lambda: {"leg": summ, "rate": self.src.current,
+                                                             "hz": self.src.current_hz,
+                                                             "anomalies": len(self.anomalies),
+                                                             "last_switch": (st.get("switches") or [None])[-1],
+                                                             "last_settle": (st.get("settles") or [None])[-1]})
+            more = self.src.extend(self) if hasattr(self.src, "extend") else []
+            if not more:
+                break
+            self.legs += more
+            st["legs"] = self.legs
+            self.checkins.total = len(self.legs)
             self.cal._save()
-            publish_chart(self.cal, STAGE, CHART, self.chart())
-            self.checkins.tick(st["legs_done"], lambda: {"leg": summ, "rate": self.src.current,
-                                                         "hz": self.src.current_hz,
-                                                         "anomalies": len(self.anomalies),
-                                                         "last_switch": (st.get("switches") or [None])[-1],
-                                                         "last_settle": (st.get("settles") or [None])[-1]})
         if self.src.current != ref:
             self.switch(ref)
 

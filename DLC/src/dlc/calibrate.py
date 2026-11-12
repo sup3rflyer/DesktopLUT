@@ -12728,6 +12728,15 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             from .refresh_mode import Win32DisplayApi
             calib.display_api = Win32DisplayApi()
             calib.vrr_presenter_factory = _vrr_presenter_factory(args)
+            if persistent_meter is not None:
+                # the refresh probe's VRR source paints through its own presenter: it reads the meter alone,
+                # and asks the instrument for the refresh rate it sees (spotread's F key) as proof of the rate
+                class _NoPresent:
+                    def show(self, _patch: Any) -> None:
+                        return None
+                _meter_only = make_persistent_spotread_meter(presenter=_NoPresent(), persistent=persistent_meter)
+                calib.vrr_meter = lambda: _meter_only(MeasurePatch("vrr", (0, 0, 0), (0.0, 0.0, 0.0)))
+                calib.vrr_meter_refresh = lambda: persistent_meter.measure_refresh_rate()
         try:
             result = calib.run(args.flow)
         except AdjudicationRequired as req:
