@@ -1,6 +1,8 @@
 #include "actions/actions.h"
 #include "actions/reconcile.h"
 
+#include "analysis.h"
+#include "osd.h"
 #include "gui.h"
 #include "gui_mhc.h"
 #include "refresh_trim.h"
@@ -13,8 +15,10 @@
 #include "mhc.h"
 #include "desktoplut_ipc_server.h"   // IsCalibrationOrLiveEditActive
 #include "windows_tonemap.h"
+#include "ui/ui_model.h"   // HdrMhcOnlyDesktopGamma (pure)
 #include <cmath>
 #include <cstdio>
+#include <cwctype>
 #include <iostream>
 #include <mutex>
 
@@ -622,6 +626,50 @@ Result MhcSetDesktopGamma(int mon, bool on) {
     return Done();
 }
 
+Result SetSdrGamma22(int mon, bool on) {
+    if (!ValidMonitor(mon)) return Done(false);
+    if (on) {
+        Result r = MhcSetDesktopGamma(mon, true);   // the existing switch's path, its neutral profile included
+        if (!r.ok()) return r;
+        bool installed;
+        {
+            std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+            const MHCSettings& m = g_gui.monitorSettings[mon].hdrMHC;
+            installed = m.enabled && !m.profileName.empty();
+        }
+        // The setting stays on (the next desktop gamma swap tries the profile again, as for the existing switch).
+        if (!installed)
+            return Told(mon, L"mhc", Fail(notify::Sev::Warning, L"SDR gamma 2.2: the HDR profile could not be installed"));
+        notify::Post(notify::Sev::Info, mon, L"mhc", L"SDR gamma 2.2 on");
+        return r;
+    }
+    bool onlyDg, installed;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        const MHCSettings& m = g_gui.monitorSettings[mon].hdrMHC;
+        onlyDg = ui::HdrMhcOnlyDesktopGamma(m);
+        installed = !m.profileName.empty();
+    }
+    // Something else lives in the profile (set since): only the gamma goes, as the GRAYSCALE inspector's switch does.
+    if (!onlyDg || !installed) return MhcSetDesktopGamma(mon, false);
+    if (RefusedDuringCalibration(mon)) return Done(false);   // the session measures the profile it set up
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        g_gui.monitorSettings[mon].hdrMHC.desktopGammaEnabled = false;
+    }
+    // The global flag follows what is still configured (another display may keep its desktop gamma).
+    const bool anyDg = AnyDesktopGammaConfigured();
+    g_userDesktopGammaMode.store(anyDg);
+    if (!g_gammaWhitelistActive.load()) g_desktopGammaMode.store(anyDg);
+    // The profile existed only for the gamma: the Remove path takes it away (the identity profile is associated first,
+    // because Windows keeps applying the last MHC2 transform after a plain disassociation), with its variants.
+    MhcRemove(mon, true);   // saves, refreshes
+    ReconcileLiveLayers("desktop gamma");
+    notify::Post(notify::Sev::Info, mon, L"mhc", L"SDR gamma 2.2 off");
+    Finish(mon);
+    return Done();
+}
+
 Result MhcSetStageBypass(int mon, bool hdr, MhcStage stage, bool bypass) {
     if (!ValidMonitor(mon) || RefusedDuringCalibration(mon)) return Done(false);
     const bool primaries = stage == MhcStage::Primaries;
@@ -694,11 +742,157 @@ void SetHotkeyEnabled(int hotkeyId, bool on) {
     else if (hotkeyId == HOTKEY_HDR_TOGGLE) g_hotkeyHdrEnabled.store(on);
     else if (hotkeyId == HOTKEY_ANALYSIS) g_hotkeyAnalysisEnabled.store(on);
     else return;
-    // Hook-only mode registers hotkeys on the hub window, overlay mode on the render thread's window.
-    HWND target = g_hookOnlyHotkeys ? g_gui.hwndMain : (HWND)g_mainHwnd.load();
-    if (target) PostMessage(target, WM_HOTKEY_REGISTER, hotkeyId, on ? 1 : 0);
+    // The hub window holds every hotkey for the session (RegisterHotkeys); its thread registers it.
+    if (g_gui.hwndMain) PostMessage(g_gui.hwndMain, WM_HOTKEY_REGISTER, hotkeyId, on ? 1 : 0);
     SaveSettings();
     SyncClassicGlobalControls();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Global hotkeys
+
+namespace {
+
+struct HotkeyDef { int id; const std::atomic<bool>* enabled; const std::atomic<char>* key; const wchar_t* name; };
+const HotkeyDef kHotkeys[] = {
+    { HOTKEY_GAMMA, &g_hotkeyGammaEnabled, &g_hotkeyGammaKey, L"Desktop gamma" },
+    { HOTKEY_HDR_TOGGLE, &g_hotkeyHdrEnabled, &g_hotkeyHdrKey, L"HDR" },
+    { HOTKEY_ANALYSIS, &g_hotkeyAnalysisEnabled, &g_hotkeyAnalysisKey, L"Analysis" },
+};
+
+const HotkeyDef* FindHotkey(int id) {
+    for (const HotkeyDef& h : kHotkeys) if (h.id == id) return &h;
+    return nullptr;
+}
+
+void RegisterOne(const HotkeyDef& h) {
+    HWND hub = g_gui.hwndMain;
+    const UINT vk = (UINT)(unsigned char)h.key->load();
+    if (!hub || !vk) return;
+    UnregisterHotKey(hub, h.id);   // a re-registration replaces (a second RegisterHotKey of the same id would add one)
+    if (RegisterHotKey(hub, h.id, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, vk)) return;
+    // Another program holds the combination: this hotkey stays unregistered, deliberately and visibly.
+    wchar_t text[96];
+    swprintf_s(text, L"%s hotkey Win+Shift+%c is taken by another program", h.name, (wchar_t)vk);
+    std::wcerr << L"[Hotkeys] " << text << L" (error " << GetLastError() << L")" << std::endl;
+    notify::Post(notify::Sev::Warning, -1, L"hotkey", text);
+}
+
+// Some display with desktop gamma configured is in HDR now (a fresh DisplayConfig + DXGI query: a key press only).
+bool DesktopGammaDisplayInHdr() {
+    std::vector<int> configured;
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        for (int i = 0; i < (int)g_gui.monitorSettings.size(); i++)
+            if (g_gui.monitorSettings[i].hdrMHC.desktopGammaEnabled) configured.push_back(i);
+    }
+    for (int i : configured) {
+        if (i >= (int)g_gui.monitors.size()) continue;
+        DisplayInfo di;
+        if (GetDisplayInfoForMonitor(i, di) && IsDisplayInHdrMode(di, g_gui.monitors[i])) return true;
+    }
+    return false;
+}
+
+void ToggleDesktopGammaHotkey() {
+    switch (DecideGammaHotkey(AnyDesktopGammaConfigured(), DesktopGammaDisplayInHdr())) {
+    case GammaHotkey::NotSetUp:
+        ShowOSD(L"Desktop gamma: not set up");
+        return;
+    case GammaHotkey::NoHdrDisplay:
+        return;   // nothing visible to change (as before): SDR shows no desktop gamma
+    case GammaHotkey::Toggle:
+        break;
+    }
+    const bool newMode = !g_desktopGammaMode.load();
+    g_desktopGammaMode.store(newMode);
+    // The user's choice: the whitelist respects it.
+    g_userDesktopGammaMode.store(newMode);
+    // Toggled while a whitelisted app runs: the override lasts until that app exits.
+    if (g_gammaWhitelistActive.load()) {
+        std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
+        g_gammaWhitelistOverrideProcess = g_gammaWhitelistMatch;
+        for (wchar_t& c : g_gammaWhitelistOverrideProcess) c = towlower(c);
+        g_gammaWhitelistMatch.clear();
+        g_gammaWhitelistUserOverride.store(true);
+        g_gammaWhitelistActive.store(false);
+        std::wcout << L"Gamma whitelist: user override active until " << g_gammaWhitelistOverrideProcess << L" exits"
+                   << std::endl;
+    }
+    SwapDgForAllMonitors(newMode);   // the HDR MHC profiles' variants with / without it
+    std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
+    ShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
+    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);   // an overlay carrying desktop gamma (no profile) redraws
+}
+
+}  // namespace
+
+void RegisterHotkeys() {
+    for (const HotkeyDef& h : kHotkeys)
+        if (h.enabled->load()) RegisterOne(h);
+}
+
+void UnregisterHotkeys() {
+    if (!g_gui.hwndMain) return;
+    for (const HotkeyDef& h : kHotkeys) UnregisterHotKey(g_gui.hwndMain, h.id);
+}
+
+void ApplyHotkeyRegistration(int hotkeyId, bool on) {
+    const HotkeyDef* h = FindHotkey(hotkeyId);
+    if (!h || !g_gui.hwndMain) return;
+    if (on) RegisterOne(*h);
+    else UnregisterHotKey(g_gui.hwndMain, hotkeyId);
+}
+
+void OnHotkey(int hotkeyId) {
+    if (g_appShuttingDown.load()) return;
+    if (hotkeyId == HOTKEY_GAMMA) {
+        ToggleDesktopGammaHotkey();
+    } else if (hotkeyId == HOTKEY_ANALYSIS) {
+        SetAnalysis(!g_analysisEnabled.load());
+    } else if (hotkeyId == HOTKEY_HDR_TOGGLE) {
+        // DisplayConfig alone: nothing of DesktopLUT's needs to run. A running overlay re-detects the mode after a
+        // delay (ACM HDR->SDR keeps the FP16 format, so its format check does not see it): its own thread's timer.
+        if (ToggleHdrOnFocusedMonitor()) {
+            HWND overlay = g_mainHwnd.load();
+            if (overlay) PostMessage(overlay, WM_OVERLAY_HDR_TOGGLED, 0, 0);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Analysis overlay
+
+bool AnalysisOn() { return g_analysisEnabled.load(); }
+
+Result SetAnalysis(bool on) {
+    const AnalysisSwitch step = DecideAnalysisSwitch(on, g_analysisEnabled.load(), g_userStopped.load(),
+                                                     g_appShuttingDown.load());
+    if (step == AnalysisSwitch::Unchanged) return Done(false);
+    if (step == AnalysisSwitch::RefusedSuspended) {
+        ShowOSD(L"Analysis: live layers suspended");
+        return Told(-1, L"analysis", Fail(notify::Sev::Warning, L"Analysis needs the live layers: resume them first"));
+    }
+    if (step == AnalysisSwitch::Show) {
+        CreateAnalysisOverlay(GetModuleHandle(nullptr));   // the GUI thread's (made at startup; again if it is gone)
+        ShowAnalysisOverlay();
+    } else {
+        HideAnalysisOverlay();
+    }
+    // What measures for it follows: in hook mode the analysis-only thread (or a running full overlay) via the
+    // re-evaluation; in overlay mode the overlay, whose displays are built at a start (display 0 joins or leaves).
+    if (g_gui.isRunning) {
+        if (g_dwmHookMode.load()) DwmHookReevaluateOverlay();
+        else if (AnalysisNeedsOverlayRestart(false, true, OverlayPipelineMonitorsDiffer(), LiveLayersNeeded()))
+            RestartLiveLayers();
+    }
+    if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);   // an auto-sleeping overlay picks the change up
+    // Nothing running: the live layers start for analysis alone. Analysis off: whatever ran only for it stops.
+    ReconcileLiveLayers("analysis");
+    GuiNotifySettingsChanged(-1);
+    Result r;
+    r.changed = true;
+    return r;
 }
 
 void SetStartMinimized(bool on) {

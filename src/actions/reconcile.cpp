@@ -1,6 +1,7 @@
 #include "actions/reconcile.h"
 
 #include "actions/notify.h"
+#include "analysis.h"
 #include "desktoplut_ipc_server.h"
 #include "dwm_inject.h"
 #include "globals.h"
@@ -24,6 +25,21 @@ ReconcileDecision DecideTopologyTick(const TopologyInputs& in) {
     if (!in.running) return (!in.suspended && in.needed) ? ReconcileDecision::Start : ReconcileDecision::None;
     if (!in.lutsChanged && !in.hookStale) return ReconcileDecision::None;
     return in.fullscreenExclusive ? ReconcileDecision::Defer : ReconcileDecision::Restart;
+}
+
+GammaHotkey DecideGammaHotkey(bool configured, bool configuredDisplayInHdr) {
+    if (!configured) return GammaHotkey::NotSetUp;
+    return configuredDisplayInHdr ? GammaHotkey::Toggle : GammaHotkey::NoHdrDisplay;
+}
+
+AnalysisSwitch DecideAnalysisSwitch(bool want, bool on, bool suspended, bool shuttingDown) {
+    if (shuttingDown || want == on) return AnalysisSwitch::Unchanged;
+    if (!want) return AnalysisSwitch::Hide;
+    return suspended ? AnalysisSwitch::RefusedSuspended : AnalysisSwitch::Show;
+}
+
+bool AnalysisNeedsOverlayRestart(bool hookMode, bool overlayRunning, bool monitorsDiffer, bool stillNeeded) {
+    return !hookMode && overlayRunning && monitorsDiffer && stillNeeded;
 }
 
 WatchdogAction DecideHookWatchdog(bool hookActive, int reinjects, int maxReinjects, bool nothingToInject) {
@@ -103,8 +119,8 @@ ReconcileDecision ReconcileLiveLayers(const char* why) {
     in.suspended = g_userStopped;
     in.busy = LiveLayersBusy();
     in.running = g_gui.isRunning.load();
-    // Desktop gamma counts by its persisted setting (LiveLayersNeeded): its hotkey toggles the in-memory flag,
-    // and stopping on that toggle would unregister the very hotkey that turns it back on.
+    // Desktop gamma counts by its persisted setting (LiveLayersNeeded): its hotkey toggles the in-memory flag, and
+    // the running pipeline hosts the whitelist that switches it per app. Analysis counts while it is on.
     in.needed = LiveLayersNeeded();
     in.hookStale = !in.busy && in.running && in.needed && HookStale();
     const char* reason = why ? why : "";
@@ -146,6 +162,8 @@ void SetLiveLayersSuspended(bool suspended) {
     g_userStopped = suspended;
     notify::Post(notify::Sev::Info, -1, L"live", suspended ? L"Live layers suspended" : L"Live layers resumed");
     if (suspended) {
+        // The readout measures through the live layers: it goes off with them (and stays off on resume).
+        if (g_analysisEnabled.load()) HideAnalysisOverlay();
         KillTimer(g_gui.hwndMain, RECONCILE_TIMER_ID);
         StopProcessing();
     } else {

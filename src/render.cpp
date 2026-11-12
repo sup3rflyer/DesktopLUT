@@ -1271,87 +1271,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_DESTROY:
         if (hwnd == g_mainHwnd) {
-            UnregisterHotKey(hwnd, HOTKEY_GAMMA);  // Gamma toggle
-            UnregisterHotKey(hwnd, HOTKEY_ANALYSIS);  // Analysis toggle
-            UnregisterHotKey(hwnd, HOTKEY_HDR_TOGGLE); // HDR toggle
             g_running = false;
             PostQuitMessage(0);
         }
         return 0;
-    case WM_HOTKEY:
-        // Wake auto-sleep on any hotkey (overlay may need to start rendering)
+    case WM_OVERLAY_HDR_TOGGLED:
+        // The HDR hotkey (the GUI thread's: act::OnHotkey) switched a display's HDR mode. On ACM displays HDR->SDR keeps
+        // the FP16 format, so the format-change detection does not fire: a delayed reinit re-detects the HDR state
+        // once Windows has finished the transition (no render thread blocking). This thread owns the timer's window.
         if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-        if (wParam == HOTKEY_GAMMA) {
-            // Win+Shift+G - toggle gamma mode (HDR only)
-            // Check if any monitor is in HDR mode
-            bool anyHDR = false;
-            for (const auto& ctx : g_monitors) {
-                if (ctx.isHDREnabled) {
-                    anyHDR = true;
-                    break;
-                }
-            }
-            if (anyHDR) {
-                bool newMode = !g_desktopGammaMode.load();
-                g_desktopGammaMode.store(newMode);
-                // Update user preference to match manual toggle
-                // This ensures whitelist respects the user's manual choice
-                g_userDesktopGammaMode.store(newMode);
-                // If user toggled while whitelist was active, set override flag
-                // Override persists until the whitelisted app exits
-                if (g_gammaWhitelistActive.load()) {
-                    std::wstring overrideProcess;
-                    {
-                        std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                        // Store the matched process name (lowercase) for tracking
-                        g_gammaWhitelistOverrideProcess = g_gammaWhitelistMatch;
-                        for (wchar_t& c : g_gammaWhitelistOverrideProcess) {
-                            c = towlower(c);
-                        }
-                        overrideProcess = g_gammaWhitelistOverrideProcess;
-                        g_gammaWhitelistMatch.clear();
-                    }
-                    g_gammaWhitelistUserOverride.store(true);
-                    g_gammaWhitelistActive.store(false);
-                    std::wcout << L"Gamma whitelist: user override active until " << overrideProcess << L" exits" << std::endl;
-                }
-                // Swap MHC ICC profiles for all HDR monitors
-                SwapDgForAllMonitors(newMode);
-                std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
-                RequestShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
-            }
-            // Silent ignore if no HDR monitors
-        }
-        else if (wParam == HOTKEY_ANALYSIS) {
-            // Win+Shift+X - toggle analysis overlay
-            ToggleAnalysisOverlay();
-        }
-        else if (wParam == HOTKEY_HDR_TOGGLE) {
-            // Win+Shift+H - toggle HDR on focused monitor
-            if (ToggleHdrOnFocusedMonitor()) {
-                // On ACM displays, HDR→SDR keeps FP16 format so format-change detection
-                // doesn't fire. Schedule a delayed reinit to re-detect HDR state after
-                // Windows completes the transition (no render thread blocking).
-                SetTimer(hwnd, HDR_REINIT_TIMER_ID, HDR_REINIT_DELAY_MS, nullptr);
-            }
-        }
-        return 0;
-    case WM_HOTKEY_REGISTER:
-        // Handle hotkey register/unregister on the render thread (which owns g_mainHwnd)
-        {
-            int hotkeyId = (int)wParam;
-            bool enable = (lParam != 0);
-            UINT vk = 0;
-            switch (hotkeyId) {
-                case HOTKEY_GAMMA:    vk = g_hotkeyGammaKey; break;
-                case HOTKEY_HDR_TOGGLE: vk = g_hotkeyHdrKey; break;
-                case HOTKEY_ANALYSIS: vk = g_hotkeyAnalysisKey; break;
-            }
-            if (vk) {
-                if (enable) RegisterHotKey(hwnd, hotkeyId, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, vk);
-                else UnregisterHotKey(hwnd, hotkeyId);
-            }
-        }
+        SetTimer(hwnd, HDR_REINIT_TIMER_ID, HDR_REINIT_DELAY_MS, nullptr);
         return 0;
     case WM_TIMER:
         if (wParam == HDR_REINIT_TIMER_ID) {

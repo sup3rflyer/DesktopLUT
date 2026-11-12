@@ -2636,20 +2636,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // an unjoined exited thread disabled analysis and live preview for the rest of the session.
         if (g_gui.processingThread.joinable()) g_gui.processingThread.join();
         // In DWM hook mode, overlay thread exiting just means corrections aren't needed —
-        // hook is still running. Re-register hotkeys on GUI window and keep isRunning true.
+        // hook is still running: keep isRunning true. (The hotkeys are this window's for the whole session.)
         if (g_dwmHookMode.load() && g_running.load()) {
-            // No overlay thread now: the hotkeys belong on the GUI window. Registered even when
-            // g_hookOnlyHotkeys is already set — a hook-only start made while an abandoned overlay thread
-            // still held them set the flag but could not register (an already-registered id just fails).
-            if (g_gui.hwndMain) {
-                if (g_hotkeyGammaEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_GAMMA, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyGammaKey);
-                if (g_hotkeyAnalysisEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_ANALYSIS, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyAnalysisKey);
-                if (g_hotkeyHdrEnabled.load())
-                    RegisterHotKey(g_gui.hwndMain, HOTKEY_HDR_TOGGLE, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, g_hotkeyHdrKey);
-                g_hookOnlyHotkeys = true;
-            }
             // If analysis is still enabled, start analysis-only mode (full overlay no longer needed)
             if (g_analysisEnabled.load()) {
                 DwmHookReevaluateOverlay();
@@ -2747,58 +2735,15 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_HOTKEY:
-        // Hook-only mode: hotkeys registered on GUI window
-        if (g_hookOnlyHotkeys) {
-            if (wParam == HOTKEY_GAMMA) {
-                // Toggle desktop gamma (HDR only)
-                bool newMode = !g_desktopGammaMode.load();
-                g_desktopGammaMode.store(newMode);
-                g_userDesktopGammaMode.store(newMode);
-                if (g_gammaWhitelistActive.load()) {
-                    std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-                    g_gammaWhitelistOverrideProcess = g_gammaWhitelistMatch;
-                    for (wchar_t& c : g_gammaWhitelistOverrideProcess) c = towlower(c);
-                    g_gammaWhitelistMatch.clear();
-                    g_gammaWhitelistUserOverride.store(true);
-                    g_gammaWhitelistActive.store(false);
-                }
-                // Swap MHC ICC profiles for all HDR monitors
-                SwapDgForAllMonitors(newMode);
-                std::cout << "Gamma mode: " << (newMode ? "Desktop (2.2)" : "Content (sRGB)") << std::endl;
-                ShowOSD(newMode ? L"Gamma: 2.2" : L"Gamma: sRGB");
-            }
-            else if (wParam == HOTKEY_ANALYSIS) {
-                ToggleAnalysisOverlay();
-                // In hook mode, start/stop the DD overlay for analysis
-                // (HasActiveShaderCorrections checks g_analysisEnabled)
-                DwmHookReevaluateOverlay();
-                // Wake auto-sleeping overlay thread so it picks up the analysis state change
-                if (g_overlayWakeEvent) SetEvent(g_overlayWakeEvent);
-            }
-            else if (wParam == HOTKEY_HDR_TOGGLE) {
-                ToggleHdrOnFocusedMonitor();
-            }
-        }
+        // Every global hotkey is this window's, from startup to exit (act::RegisterHotkeys): they work whether or
+        // not the live layers run.
+        act::OnHotkey((int)wParam);
         return 0;
 
     case WM_HOTKEY_REGISTER:
-        // Dynamic hotkey register/unregister from Settings tab (hook-only mode)
-        if (g_hookOnlyHotkeys) {
-            int hotkeyId = (int)wParam;
-            bool enable = (lParam != 0);
-            UINT vk = 0;
-            switch (hotkeyId) {
-                case HOTKEY_GAMMA:    vk = g_hotkeyGammaKey; break;
-                case HOTKEY_HDR_TOGGLE: vk = g_hotkeyHdrKey; break;
-                case HOTKEY_ANALYSIS: vk = g_hotkeyAnalysisKey; break;
-            }
-            if (vk) {
-                if (enable) RegisterHotKey(hwnd, hotkeyId, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, vk);
-                else UnregisterHotKey(hwnd, hotkeyId);
-            }
-            return 0;
-        }
-        break;
+        // A hotkey switched on or off in Settings (act::SetHotkeyEnabled).
+        act::ApplyHotkeyRegistration((int)wParam, lParam != 0);
+        return 0;
 
     case WM_SIZE:
         if (wParam == SIZE_MINIMIZED) {
@@ -3382,6 +3327,8 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         // Clean up OSD (owned by GUI thread now)
         if (g_osdHwnd) { DestroyWindow(g_osdHwnd); g_osdHwnd = nullptr; }
         DestroyOSDFont();
+        act::UnregisterHotkeys();          // this window's, since startup
+        DestroyAnalysisOverlay();          // the GUI thread's, since startup
         // Clean up custom brushes and fonts
         if (g_tabBgBrush) { DeleteObject(g_tabBgBrush); g_tabBgBrush = nullptr; }
         if (g_inactiveTabBrush) { DeleteObject(g_inactiveTabBrush); g_inactiveTabBrush = nullptr; }
@@ -3466,6 +3413,12 @@ int RunGUI() {
 
     // Create OSD window on GUI thread — available in all modes (hook-only, analysis-only, full overlay)
     CreateOSDWindow(GetModuleHandle(nullptr));
+    // The analysis readout's window likewise (hidden until analysis is switched on): the GUI thread owns it for the
+    // session, so the switch and the hotkey show and hide it here whichever engine measures for it.
+    CreateAnalysisOverlay(GetModuleHandle(nullptr));
+    // The global hotkeys, on this window for the whole session: they work whether or not the live layers run (they
+    // used to be registered only by a running pipeline, so on a fresh install, with nothing configured, none worked).
+    act::RegisterHotkeys();
 
     // Check if any visual correction is enabled (LUT, MHC, Primaries, Grayscale, 2.4 Gamma, Desktop Gamma,
     // tonemap, FALD) on a display that is connected now. A display that arrives later (the owner's LG,

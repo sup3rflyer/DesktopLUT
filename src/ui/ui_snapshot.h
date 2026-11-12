@@ -49,6 +49,8 @@ struct Snapshot {
     std::shared_ptr<const dlc::Live> run;   // DLC's run in progress, or the last one (never null)
     bool hookMode = false;
     bool hookActive = false;
+    bool hookIdle = false;    // hook mode, running: no hook resident because no display has hook work (DwmHookIdle)
+    bool analysis = false;    // the analysis readout is on (g_analysisEnabled)
     DwmHookBuildStatus hookBuild;  // was the hook verified against this Windows' dwmcore.dll (dwm_hook_build.h)
     std::wstring lastStatus;      // the newest status line or warning / error (any source)
     notify::Sev lastStatusSev = notify::Sev::Info;

@@ -101,6 +101,9 @@ enum MhcReloadReason : unsigned { kMhcReloadPending = 0, kMhcReloadOverlayLoss =
 #define WM_FALD_EXEMPT_REFRESH   (WM_USER + 113)
 // Resolve each display's refresh-rate trim again (refresh_trim.h ReconcileRefreshTrim; any thread -> GUI thread).
 #define WM_REFRESH_TRIM          (WM_USER + 114)
+// The HDR hotkey switched a display's HDR mode (GUI thread -> the overlay render thread's window): arm its delayed
+// re-detect (HDR_REINIT_TIMER_ID), which only that thread can set on its window.
+#define WM_OVERLAY_HDR_TOGGLED   (WM_USER + 115)
 // A hook-mode start could not inject the DWM hook (g_dwmHookStartError says why): retry once, then fall back to the
 // overlay (dwm_hook_stability.h). Posted by StartProcessing, handled once its transition is over (GUI thread).
 #define WM_DWMHOOK_START_FAILED  (WM_USER + 120)
@@ -328,6 +331,8 @@ const int MHC_BURST_TIMER_ID = 109;             // Staggered MHC re-assertion bu
 const int SDR_WHITE_CHECK_TIMER_ID = 114;       // Debounced re-read of the Windows SDR white level (desktop gamma reference)
 const int SDR_WHITE_CHECK_DEBOUNCE_MS = 1000;   // After the last trigger — a slider drag writes many intermediate levels
 const int GRAYSCALE_RANGE = 25;  // +/- 25% deviation from linear
+// The global hotkeys (MOD_WIN | MOD_SHIFT | MOD_NOREPEAT + the INI's key letter). All registered on the hub window
+// (g_gui.hwndMain) by the GUI thread for the whole session, each while its Settings switch is on (act::RegisterHotkeys).
 const int HOTKEY_GAMMA = 2;      // Win+Shift+G for gamma toggle
 const int HOTKEY_ANALYSIS = 4;   // Win+Shift+X for analysis toggle
 const int HOTKEY_HDR_TOGGLE = 5; // Win+Shift+Z for HDR toggle on focused monitor

@@ -1,6 +1,7 @@
 #include "ui_model.h"
 
 #include <cmath>
+#include <cstdio>
 #include <cwctype>
 
 namespace ui {
@@ -60,6 +61,39 @@ bool MhcGrayscaleContent(const MHCSettings& mhc, bool hdr) {
     const bool base = mhc.sourceFilePath.empty() && mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty();
     const bool correction = mhc.correctionGrayscale.enabled && !mhc.correctionGrayscale.points.empty();
     return imported || base || correction || (hdr && mhc.desktopGammaEnabled);
+}
+
+bool HdrMhcOnlyDesktopGamma(const MHCSettings& m) {
+    const bool base = m.baseGrayscale.enabled && !m.baseGrayscale.points.empty();
+    const bool fineTune = m.correctionGrayscale.enabled && !m.correctionGrayscale.points.empty();
+    return m.sourceFilePath.empty() && !m.hasPerChannelTRC && !MhcPrimariesContent(m) && !base && !fineTune &&
+           !m.bypassPrimaries && !m.bypassGrayscale && !m.refreshTrimEnabled;
+}
+
+GammaOffer SdrGammaOffer(const MonitorSettings& ms, bool connected, Mode live, bool showHdr) {
+    if (!connected || live != Mode::HDR || !showHdr || !HdrMhcOnlyDesktopGamma(ms.hdrMHC)) return GammaOffer::None;
+    return ms.hdrMHC.desktopGammaEnabled ? GammaOffer::On : GammaOffer::Off;
+}
+
+std::string DisplayPeakTip(float targetNits, float edidPeakNits) {
+    std::string tip = "The brightest the tone map lets highlights go: the panel's real peak.\n";
+    char b[128];
+    const float def = TonemapSettings{}.targetPeakNits;
+    const bool isDefault = std::fabs(targetNits - def) < 0.5f;
+    if (edidPeakNits > 0.0f && std::isfinite(edidPeakNits)) {
+        const float seeded = edidPeakNits >= 400.0f ? std::round(edidPeakNits / 10.0f) * 10.0f : 0.0f;
+        if (seeded > 0.0f && std::fabs(targetNits - seeded) < 0.5f)
+            snprintf(b, sizeof(b), "From the panel's EDID: %.0f nits, declared, not measured.", edidPeakNits);
+        else if (seeded == 0.0f && isDefault)
+            snprintf(b, sizeof(b), "The %.0f-nit default: the EDID's %.0f nits is under 400.", def, edidPeakNits);
+        else
+            snprintf(b, sizeof(b), "The panel's EDID declares %.0f nits.", edidPeakNits);
+    } else if (isDefault) {
+        snprintf(b, sizeof(b), "The %.0f-nit default: the panel declares no HDR peak.", def);
+    } else {
+        snprintf(b, sizeof(b), "The panel declares no HDR peak.");
+    }
+    return tip + b;
 }
 
 bool ShaderTweakActive(const ColorCorrectionSettings& cc) {

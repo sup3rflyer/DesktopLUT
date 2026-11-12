@@ -161,7 +161,9 @@ void TakeSnapshot(Snapshot& out) {
     if (!IsProcessingTransitionActive()) {
         out.running = g_gui.isRunning.load();
         out.hookActive = g_dwmHookMode.load() && IsDwmHookActive();
+        out.hookIdle = out.running && !out.hookActive && DwmHookIdle();
     }
+    out.analysis = g_analysisEnabled.load();
     out.hookMode = g_dwmHookMode.load();
     out.hookActive = out.hookActive && out.hookMode;
     out.hookBuild = DwmHookBuildCheck();   // read once per process

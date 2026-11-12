@@ -71,6 +71,22 @@ Light CombineLights(Light a, Light b);
 // True when the overlay shader-tweak layer (pipe runtime.set_grayscale_tweak / INI) is active for a mode.
 bool ShaderTweakActive(const ColorCorrectionSettings& cc);
 
+// The tone map's DISPLAY PEAK tooltip: what the value does, then where it stands against the panel's EDID-declared peak
+// (`edidPeakNits`, 0 = unknown). A display seen for the first time starts at the peak the panel reports, rounded to
+// 10 nits, when that is 400 nits or more (monitor_identity.cpp), else at TonemapSettings' 1000-nit default.
+std::string DisplayPeakTip(float targetNits, float edidPeakNits);
+
+// SDR content in HDR: gamma 2.2 — the Pipeline page's one-step desktop gamma (act::SetSdrGamma22), offered in the
+// display's title row. None: not offered (the display is not connected, not in HDR, the HDR side is not shown, or its
+// HDR MHC settings hold more than desktop gamma: the GRAYSCALE inspector's DESKTOP GAMMA switch is the way then).
+// Off / On: the switch's state (desktop gamma's setting).
+enum class GammaOffer { None, Off, On };
+GammaOffer SdrGammaOffer(const MonitorSettings& ms, bool connected, Mode live, bool showHdr);
+// The HDR MHC settings carry nothing but desktop gamma — no imported file or curve, no base or fine-tune grayscale,
+// no primaries or non-D65 white balance, no stage bypass, no refresh trim: what the one-step switch may create and
+// take away again (act::SetSdrGamma22). Whether a profile is installed is not part of it.
+bool HdrMhcOnlyDesktopGamma(const MHCSettings& hdr);
+
 // Name to show for a display. The OS friendly name (EDID name descriptor via DisplayConfig) when there
 // is one; many EDIDs (and CRU overrides) carry none, so otherwise the EDID maker + product code from the
 // hardware id ("ASUS 322A"); "Display" when even that is unknown.

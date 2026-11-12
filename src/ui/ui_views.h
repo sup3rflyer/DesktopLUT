@@ -100,7 +100,8 @@ const DisplayRow* SelectedDisplay(const Snapshot& snap, ViewState& vs);
 void DrawDisplayList(const Snapshot& snap, ViewState& vs, const DisplayRow* sel, ImVec2 body, float bodyH);
 // A page's title row: the display's name and the HDR | SDR segment (which mode's settings / record are shown,
 // a light on the mode it is in). Returns where a note may go on the line (x after the name, the line's centre).
-struct TitleRow { float noteX, cy; bool showHdr; };
+// noteX..noteRight: the free stretch of the title line between the name and the mode switch (pixels).
+struct TitleRow { float noteX, cy; bool showHdr; float noteRight = 0.0f; };
 TitleRow DrawDisplayTitle(const DisplayRow& sel, ViewState& vs);
 // The top of the pinned footer (pixels): pages fill down to it.
 float PageFooterTop();
