@@ -824,7 +824,7 @@ Overlay mode: automatically hides all overlays when specified applications are r
 
 **Setup**: **SETTINGS** → **PASSTHROUGH** on → **WHITELIST** (classic window: Settings tab → "Hide overlay for apps" → "Whitelist...") → Enter comma-separated exe names (e.g., `game.exe, launcher.exe`). Matching is case-insensitive, `.exe` extension optional.
 
-**Behavior**: Polls running processes every 500ms. When a whitelisted app is detected, all monitor overlays are hidden. When the app exits, overlays are restored.
+**Behavior**: While the switch is on and the list has entries, running processes are checked every 500 ms: the list of process ids (about 0.1 ms), and the full list with names (4-11 ms with ~370 processes) only when a process started or ended somewhere, or 5 s after the last full read. When a whitelisted app is detected, all monitor overlays are hidden; DesktopLUT then holds a handle on that process and reads no process list at all until it exits (seen at once), at which point overlays are restored. With the switch off or the list empty nothing is read. The desktop gamma whitelist (`GammaWhitelist`) works the same way, armed while it has entries, desktop gamma is on and a display is in HDR.
 
 ## Why This Exists
 

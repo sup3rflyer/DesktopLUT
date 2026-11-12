@@ -2,6 +2,7 @@
 // Process whitelist checking (gamma, VRR, MHC profile monitoring)
 
 #include "whitelist.h"
+#include "whitelist_logic.h"
 #include "globals.h"
 #include "osd.h"
 #include "mhc.h"
@@ -9,34 +10,72 @@
 #include "displayconfig.h"
 #include "windows_tonemap.h"
 #include <tlhelp32.h>
+#include <psapi.h>
+#include <algorithm>
 #include <thread>
 #include <iostream>
 
 // Thread handle for gamma whitelist polling
 static std::thread g_gammaWhitelistThread;
+// Ends the thread's wait at once (manual-reset; created on first start, kept for the life of the process).
+static HANDLE g_whitelistStopEvent = nullptr;
 
 // Shared helper: case-insensitive process name matching
 // Matches with or without .exe extension
 static bool MatchesPattern(const wchar_t* str, size_t strLen, const std::wstring& pattern) {
-    // Compare without .exe extension
-    size_t baseLen = strLen;
-    if (baseLen > 4 && _wcsnicmp(str + baseLen - 4, L".exe", 4) == 0) {
-        baseLen -= 4;
-    }
-    // Match pattern against base name (without extension)
-    if (baseLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), baseLen) == 0) {
-        return true;
-    }
-    // Match pattern against full name (with extension)
-    if (strLen == pattern.size() && _wcsnicmp(str, pattern.c_str(), strLen) == 0) {
-        return true;
-    }
-    // Match pattern+.exe against full name
-    if (strLen == pattern.size() + 4 && _wcsnicmp(str, pattern.c_str(), pattern.size()) == 0 &&
-        _wcsnicmp(str + pattern.size(), L".exe", 4) == 0) {
-        return true;
+    return WhitelistNameMatches(str, strLen, pattern);
+}
+
+// One tick's view of the process list, shared by the gamma and VRR checks. `read` false: the list is not read this
+// tick (whitelist_logic.h decides); the checks then only run their "nothing to look for" branches.
+struct ProcessRead {
+    bool read = false;
+    HANDLE snapshot = INVALID_HANDLE_VALUE;   // valid only while `read`
+    // Out, when the list was walked: what each check found, and one process whose exit can change it.
+    enum class Gamma { NotRead, OverrideRunning, Found, NotFound } gamma = Gamma::NotRead;
+    DWORD gammaPid = 0;             // Found: a matching process. OverrideRunning: a process of the override's name
+    std::wstring gammaExe;
+    enum class Vrr { NotRead, Found, NotFound } vrr = Vrr::NotRead;
+    DWORD vrrPid = 0;
+    std::wstring vrrExe;
+};
+
+// A display is in HDR, as far as the gamma whitelist cares (use atomic for thread safety).
+// In DWM hook mode with no overlay, g_monitors may be empty — trust g_userDesktopGammaMode, which reflects the user's
+// DG preference (auto-generates MHC if needed): DG is HDR-only, so that guard is sufficient.
+static bool AnyMonitorHdrForWhitelist() {
+    std::lock_guard<std::mutex> lk(g_monitorsMutex);
+    if (g_monitors.empty() && g_dwmHookMode.load()) return true;
+    for (const auto& ctx : g_monitors) {
+        if (ctx.isHDRAtom.load(std::memory_order_relaxed)) return true;
     }
     return false;
+}
+
+// What decides whether, and with what result, the process list is read: the lists, their switches, the HDR state and
+// the user override. No allocation, no system call beyond the two locks.
+static WhitelistSignature ReadWhitelistSignature() {
+    WhitelistSignature sig;
+    uint64_t h = kWhitelistHashSeed;
+    bool gammaEmpty = true, vrrEmpty = true;
+    {
+        std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
+        gammaEmpty = g_gammaWhitelist.empty();
+        h = WhitelistHash(h, g_gammaWhitelist);
+        h = WhitelistHashStep(h, g_gammaWhitelistOverrideProcess);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+        vrrEmpty = g_vrrWhitelist.empty();
+        h = WhitelistHash(h, g_vrrWhitelist);
+    }
+    sig.contentHash = h;
+    sig.gammaOverride = g_gammaWhitelistUserOverride.load();
+    const bool userDg = g_userDesktopGammaMode.load();
+    // (the HDR state is only asked for when the rest says the list is live: it takes the monitors lock)
+    sig.gammaArmed = GammaWhitelistArmed(gammaEmpty, userDg, true) && AnyMonitorHdrForWhitelist();
+    sig.vrrArmed = VrrWhitelistArmed(g_vrrWhitelistEnabled.load(), vrrEmpty);
+    return sig;
 }
 
 // ============================================================================
@@ -45,22 +84,19 @@ static bool MatchesPattern(const wchar_t* str, size_t strLen, const std::wstring
 
 // Check if any whitelisted process is running and update gamma state accordingly
 // Returns true if a whitelisted process was found
-// snapshot: shared process snapshot handle (caller creates/closes)
-static bool CheckGammaWhitelist(HANDLE snapshot) {
-    // Copy whitelist data under lock for thread-safe access
-    std::vector<std::wstring> localWhitelist;
-    std::wstring localOverrideProcess;
+// pr: this tick's process list (caller creates/closes the snapshot); not read = only the reset branches run
+static bool CheckGammaWhitelist(ProcessRead& pr) {
+    bool listEmpty;
     {
         std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
-        localWhitelist = g_gammaWhitelist;
-        localOverrideProcess = g_gammaWhitelistOverrideProcess;
+        listEmpty = g_gammaWhitelist.empty();
     }
 
     // Early exit conditions - only check when:
     // 1. Whitelist is populated
     // 2. User has gamma enabled (checkbox checked)
     // 3. At least one monitor is in HDR mode
-    if (localWhitelist.empty() || !g_userDesktopGammaMode.load()) {
+    if (listEmpty || !g_userDesktopGammaMode.load()) {
         if (g_gammaWhitelistActive.load()) {
             // Was active, now conditions changed - restore user preference
             g_gammaWhitelistActive.store(false);
@@ -79,23 +115,8 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
         return false;
     }
 
-    // Check if any monitor is in HDR mode (use atomic for thread safety)
-    // In DWM hook mode with no overlay, g_monitors may be empty — trust
-    // g_userDesktopGammaMode which reflects the user's DG preference (auto-generates MHC if needed)
-    bool anyHDR = false;
-    {
-        std::lock_guard<std::mutex> lk(g_monitorsMutex);
-        if (g_monitors.empty() && g_dwmHookMode.load()) {
-            anyHDR = true;  // DG is HDR-only; g_userDesktopGammaMode guard above is sufficient
-        } else {
-            for (const auto& ctx : g_monitors) {
-                if (ctx.isHDRAtom.load(std::memory_order_relaxed)) {
-                    anyHDR = true;
-                    break;
-                }
-            }
-        }
-    }
+    // Check if any monitor is in HDR mode
+    const bool anyHDR = AnyMonitorHdrForWhitelist();
     if (!anyHDR) {
         if (g_gammaWhitelistActive.load()) {
             g_gammaWhitelistActive.store(false);
@@ -114,8 +135,19 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
         return false;
     }
 
-    if (snapshot == INVALID_HANDLE_VALUE) {
+    // The list is live. Without a process list this tick, nothing changes.
+    if (!pr.read || pr.snapshot == INVALID_HANDLE_VALUE) {
         return false;
+    }
+    HANDLE snapshot = pr.snapshot;
+
+    // Copy whitelist data under lock for thread-safe access
+    std::vector<std::wstring> localWhitelist;
+    std::wstring localOverrideProcess;
+    {
+        std::lock_guard<std::mutex> lock(g_gammaWhitelistMutex);
+        localWhitelist = g_gammaWhitelist;
+        localOverrideProcess = g_gammaWhitelistOverrideProcess;
     }
 
     PROCESSENTRY32W pe32;
@@ -123,7 +155,10 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
 
     bool found = false;
     std::wstring matchedProcess;
+    DWORD matchedPid = 0;
     bool overrideProcessStillRunning = false;
+    DWORD overridePid = 0;
+    std::wstring overrideExe;
 
     if (Process32FirstW(snapshot, &pe32)) {
         do {
@@ -134,6 +169,8 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             if (g_gammaWhitelistUserOverride.load() && !localOverrideProcess.empty()) {
                 if (MatchesPattern(exeName, exeLen, localOverrideProcess)) {
                     overrideProcessStillRunning = true;
+                    overridePid = pe32.th32ProcessID;
+                    overrideExe = pe32.szExeFile;
                 }
             }
 
@@ -142,12 +179,18 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
                 if (MatchesPattern(exeName, exeLen, pattern)) {
                     found = true;
                     matchedProcess = pe32.szExeFile;  // Original case for display
+                    matchedPid = pe32.th32ProcessID;
                     break;
                 }
             }
             // Don't break early - need to check if override process is still running too
         } while (Process32NextW(snapshot, &pe32));
     }
+
+    // For the thread: what was found, and the process whose exit can change it (whitelist_logic.h, HELD).
+    pr.gamma = found ? ProcessRead::Gamma::Found : ProcessRead::Gamma::NotFound;
+    pr.gammaPid = matchedPid;
+    pr.gammaExe = matchedProcess;
 
     // Handle user override: if user manually toggled while whitelist was active,
     // the override persists until the whitelisted app that triggered it exits
@@ -163,6 +206,10 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
             // Continue to normal whitelist handling below
         } else {
             // Override process still running - don't trigger whitelist
+            // (for the thread: nothing changes until that process exits, whatever else starts or ends)
+            pr.gamma = ProcessRead::Gamma::OverrideRunning;
+            pr.gammaPid = overridePid;
+            pr.gammaExe = overrideExe;
             return found;
         }
     }
@@ -212,17 +259,16 @@ static bool CheckGammaWhitelist(HANDLE snapshot) {
 // ============================================================================
 
 // Check if any VRR-whitelisted process is running and hide/show overlay accordingly
-// snapshot: shared process snapshot handle (caller creates/closes)
-static void CheckVrrWhitelist(HANDLE snapshot) {
-    // Copy whitelist data under lock for thread-safe access
-    std::vector<std::wstring> localWhitelist;
+// pr: this tick's process list (caller creates/closes the snapshot); not read = only the reset branch runs
+static void CheckVrrWhitelist(ProcessRead& pr) {
+    bool listEmpty;
     {
         std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
-        localWhitelist = g_vrrWhitelist;
+        listEmpty = g_vrrWhitelist.empty();
     }
 
     // Early exit if feature disabled or whitelist empty
-    if (!g_vrrWhitelistEnabled.load() || localWhitelist.empty()) {
+    if (!g_vrrWhitelistEnabled.load() || listEmpty) {
         if (g_vrrWhitelistActive.load()) {
             // Was active, now disabled - show overlays again (unless auto-sleeping)
             g_vrrWhitelistActive.store(false);
@@ -245,8 +291,17 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
         return;
     }
 
-    if (snapshot == INVALID_HANDLE_VALUE) {
+    // The list is live. Without a process list this tick, nothing changes.
+    if (!pr.read || pr.snapshot == INVALID_HANDLE_VALUE) {
         return;
+    }
+    HANDLE snapshot = pr.snapshot;
+
+    // Copy whitelist data under lock for thread-safe access
+    std::vector<std::wstring> localWhitelist;
+    {
+        std::lock_guard<std::mutex> lock(g_vrrWhitelistMutex);
+        localWhitelist = g_vrrWhitelist;
     }
 
     PROCESSENTRY32W pe32;
@@ -254,6 +309,7 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
 
     bool found = false;
     std::wstring matchedProcess;
+    DWORD matchedPid = 0;
 
     if (Process32FirstW(snapshot, &pe32)) {
         do {
@@ -264,12 +320,18 @@ static void CheckVrrWhitelist(HANDLE snapshot) {
                 if (MatchesPattern(exeName, exeLen, pattern)) {
                     found = true;
                     matchedProcess = pe32.szExeFile;
+                    matchedPid = pe32.th32ProcessID;
                     break;
                 }
             }
             if (found) break;
         } while (Process32NextW(snapshot, &pe32));
     }
+
+    // For the thread: what was found, and the process whose exit can change it (whitelist_logic.h, HELD).
+    pr.vrr = found ? ProcessRead::Vrr::Found : ProcessRead::Vrr::NotFound;
+    pr.vrrPid = matchedPid;
+    pr.vrrExe = matchedProcess;
 
     // Update state based on result
     bool wasActive = g_vrrWhitelistActive.load();
@@ -445,51 +507,172 @@ static void CheckSystemHealth() {
 // SECTION: Whitelist Thread
 // ============================================================================
 
-// Dedicated thread function for gamma whitelist polling
-// Runs every 500ms to avoid impacting frame timing
+// The pids of every running process, sorted. ~0.1 ms, where the full list with names (the snapshot) costs 4-11 ms:
+// the thread reads the names only when this set changed. False = could not be read (the caller then reads the names).
+bool ReadSortedProcessIds(std::vector<unsigned long>& pids) {
+    pids.clear();
+    std::vector<DWORD> buf(1024);
+    for (;;) {
+        DWORD bytes = 0;
+        if (!K32EnumProcesses(buf.data(), (DWORD)(buf.size() * sizeof(DWORD)), &bytes)) return false;
+        if (bytes < buf.size() * sizeof(DWORD)) {   // a full buffer may have been truncated: grow and ask again
+            buf.resize(bytes / sizeof(DWORD));
+            break;
+        }
+        if (buf.size() >= (1u << 20)) return false;
+        buf.resize(buf.size() * 2);
+    }
+    pids.assign(buf.begin(), buf.end());
+    std::sort(pids.begin(), pids.end());
+    return true;
+}
+
+// A handle whose signal means "this process ended", for a process the list just named `exeName` under `pid`.
+// Null when it cannot be opened (a protected process), has ended already, or is not that program any more (the pid
+// was reused since the list was read): the list it belongs to then simply keeps being polled.
+HANDLE OpenWatchedProcess(unsigned long pid, const std::wstring& exeName) {
+    if (pid == 0 || exeName.empty()) return nullptr;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return nullptr;
+    wchar_t path[1024];
+    DWORD len = _countof(path);
+    bool same = false;
+    if (QueryFullProcessImageNameW(h, 0, path, &len) && len > 0) {
+        const wchar_t* base = path + len;
+        while (base > path && base[-1] != L'\\' && base[-1] != L'/') base--;
+        same = _wcsicmp(base, exeName.c_str()) == 0;
+    }
+    if (!same || WaitForSingleObject(h, 0) != WAIT_TIMEOUT) {
+        CloseHandle(h);
+        return nullptr;
+    }
+    return h;
+}
+
+// Dedicated thread for the process whitelists and two periodic checks (displaced MHC profiles, adapter / overlay
+// health), off the render thread so none of it touches frame timing. One wait per tick, on the stop event and the
+// handles of the processes it watches. When the process list is read at all: whitelist_logic.h.
 static void GammaWhitelistThreadFunc() {
     // Initial delay - let processing fully initialize before first check
     // Matches the original 500ms delay from inline check timing
-    for (int i = 0; i < 10 && g_gammaWhitelistThreadRunning.load(); i++) {
-        Sleep(50);  // 500ms total, in chunks for responsive shutdown
-    }
+    if (WaitForSingleObject(g_whitelistStopEvent, 500) != WAIT_TIMEOUT) return;
 
-    int mhcCheckCounter = 0;
-    int healthCheckCounter = 0;
+    WhitelistSignature lastSig;
+    bool haveSig = false;
+    WhitelistHold hold;
+    HANDLE gammaWatch = nullptr, vrrWatch = nullptr;   // held processes: their exit is a process read at once
+    auto dropWatches = [&]() {
+        if (gammaWatch) { CloseHandle(gammaWatch); gammaWatch = nullptr; }
+        if (vrrWatch) { CloseHandle(vrrWatch); vrrWatch = nullptr; }
+        hold = WhitelistHold();
+    };
+    std::vector<unsigned long> lastPids, pids;
+    bool everRead = false;
+    bool watchSignaled = false;
+    ULONGLONG lastFullReadMs = 0;
+    ULONGLONG nextHealthMs = GetTickCount64() + kWhitelistHealthMs;
+    ULONGLONG nextMhcMs = GetTickCount64() + kWhitelistMhcCheckMs;
+
     while (g_gammaWhitelistThreadRunning.load()) {
-        // Single process snapshot shared by both gamma and VRR whitelist checks
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        CheckGammaWhitelist(snapshot);
-        CheckVrrWhitelist(snapshot);
-        if (snapshot != INVALID_HANDLE_VALUE) {
-            CloseHandle(snapshot);
+        const WhitelistSignature sig = ReadWhitelistSignature();
+        ULONGLONG now = GetTickCount64();
+        WhitelistTick tick;
+        tick.signatureChanged = !haveSig || sig != lastSig;
+        tick.watchSignaled = watchSignaled;
+        tick.everRead = everRead;
+        tick.msSinceFullRead = now - lastFullReadMs;
+        watchSignaled = false;
+        lastSig = sig;
+        haveSig = true;
+        if (!sig.AnyArmed()) {      // nothing looks at processes: forget what the last read left
+            dropWatches();
+            everRead = false;
+            lastPids.clear();
         }
 
-        // Check MHC profiles every 20th iteration (~10 seconds).
+        // The pid set first (cheap), the names only when it moved (or something else forces a read).
+        bool pidsRead = false;
+        if (WhitelistNeedsPidSet(sig, hold)) {
+            pidsRead = ReadSortedProcessIds(pids);
+            tick.pidSetChanged = !pidsRead || !WhitelistPidSetsEqual(pids, lastPids);
+        }
+
+        ProcessRead pr;
+        pr.read = WhitelistFullReadDue(sig, hold, tick);
+        if (pr.read) {
+            // The pid set this read is compared against later is taken BEFORE the read: a process that starts or
+            // ends during it shows up as a change on the next tick.
+            if (!pidsRead) pidsRead = ReadSortedProcessIds(pids);
+            pr.snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        }
+        // Both checks every tick: with nothing to look for they put back what a match had changed.
+        CheckGammaWhitelist(pr);
+        CheckVrrWhitelist(pr);
+        if (pr.snapshot != INVALID_HANDLE_VALUE) {
+            CloseHandle(pr.snapshot);
+            dropWatches();
+            if (pr.gamma == ProcessRead::Gamma::Found || pr.gamma == ProcessRead::Gamma::OverrideRunning) {
+                gammaWatch = OpenWatchedProcess(pr.gammaPid, pr.gammaExe);
+                hold.gamma = gammaWatch != nullptr;
+            }
+            if (pr.vrr == ProcessRead::Vrr::Found) {
+                vrrWatch = OpenWatchedProcess(pr.vrrPid, pr.vrrExe);
+                hold.vrr = vrrWatch != nullptr;
+            }
+            if (pidsRead) lastPids = pids; else lastPids.clear();
+            everRead = true;
+            lastFullReadMs = GetTickCount64();
+        } else if (pr.read) {
+            everRead = false;   // the list could not be read: try again on the next tick, as every tick used to
+        }
+
+        // Check MHC profiles every ~10 seconds.
         // Profile displacement is rare (only when another app sets a profile).
         // Heavy display config API calls here can contend with DWM/render thread.
-        if (++mhcCheckCounter >= 20) {
-            mhcCheckCounter = 0;
+        now = GetTickCount64();
+        if (now >= nextMhcMs) {
+            nextMhcMs = now + kWhitelistMhcCheckMs;
             CheckMhcProfiles();
         }
 
-        // System health check every 10th iteration (~5 seconds).
+        // System health check every ~5 seconds.
         // Detects adapter LUID changes and overlay window destruction.
-        if (++healthCheckCounter >= 10) {
-            healthCheckCounter = 0;
+        if (now >= nextHealthMs) {
+            nextHealthMs = now + kWhitelistHealthMs;
             CheckSystemHealth();
         }
 
-        // Sleep in small chunks to allow quick exit on shutdown
-        for (int i = 0; i < 10 && g_gammaWhitelistThreadRunning.load(); i++) {
-            Sleep(50);  // 10 x 50ms = 500ms total
+        // One wait: the stop event, the watched processes, and the next thing due.
+        now = GetTickCount64();
+        ULONGLONG waitMs = WhitelistNextWaitMs(sig, hold);
+        waitMs = (std::min)(waitMs, nextHealthMs > now ? nextHealthMs - now : 0ull);
+        waitMs = (std::min)(waitMs, nextMhcMs > now ? nextMhcMs - now : 0ull);
+        HANDLE waits[3] = { g_whitelistStopEvent, nullptr, nullptr };
+        DWORD n = 1;
+        if (gammaWatch) waits[n++] = gammaWatch;
+        if (vrrWatch) waits[n++] = vrrWatch;
+        const DWORD w = WaitForMultipleObjects(n, waits, FALSE, (DWORD)waitMs);
+        if (w == WAIT_OBJECT_0) break;                       // stop
+        if (w > WAIT_OBJECT_0 && w < WAIT_OBJECT_0 + n) {    // a watched process ended: read the list now
+            watchSignaled = true;
+            dropWatches();                                   // (a signalled handle would end every later wait at once)
+        } else if (w == WAIT_FAILED) {
+            dropWatches();                                   // never spin on a bad handle
+            if (WaitForSingleObject(g_whitelistStopEvent, kWhitelistArmedMs) != WAIT_TIMEOUT) break;
         }
     }
+    dropWatches();
 }
 
 void StartGammaWhitelistThread() {
     if (g_gammaWhitelistThreadRunning.load()) return;  // Already running
 
+    if (!g_whitelistStopEvent) g_whitelistStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_whitelistStopEvent) {
+        std::cerr << "Whitelist thread not started: no stop event (" << GetLastError() << ")" << std::endl;
+        return;
+    }
+    ResetEvent(g_whitelistStopEvent);
     g_gammaWhitelistThreadRunning.store(true);
     g_gammaWhitelistThread = std::thread(GammaWhitelistThreadFunc);
 }
@@ -498,6 +681,7 @@ void StopGammaWhitelistThread() {
     if (!g_gammaWhitelistThreadRunning.load()) return;  // Not running
 
     g_gammaWhitelistThreadRunning.store(false);
+    if (g_whitelistStopEvent) SetEvent(g_whitelistStopEvent);
     if (g_gammaWhitelistThread.joinable()) {
         g_gammaWhitelistThread.join();
     }

@@ -206,6 +206,7 @@
     <ClCompile Include="tests\test_mhc_preview_hook.cpp" />
     <ClCompile Include="tests\test_ui_shots.cpp" />
     <ClCompile Include="tests\test_reconcile.cpp" />
+    <ClCompile Include="tests\test_whitelist.cpp" />
     <ClCompile Include="tests\test_dwm_hook_safety.cpp" />
     <ClCompile Include="tests\test_dwmcore_scan.cpp" />
     <ClCompile Include="tests\test_dlc.cpp" />
@@ -264,6 +265,7 @@
     <ClInclude Include="src\mhc.h" />
     <ClInclude Include="src\mhc_internal.h" />
     <ClInclude Include="src\whitelist.h" />
+    <ClInclude Include="src\whitelist_logic.h" />
     <ClInclude Include="src\framepacer.h" />
     <ClInclude Include="tests\doctest.h" />
     <ClInclude Include="tests\fixtures\edid_samples.h" />

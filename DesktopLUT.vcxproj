@@ -212,6 +212,7 @@
     <ClInclude Include="src\calib_snapshot.h" />
     <ClInclude Include="src\mhc_internal.h" />
     <ClInclude Include="src\whitelist.h" />
+    <ClInclude Include="src\whitelist_logic.h" />
     <ClInclude Include="src\framepacer.h" />
     <ClInclude Include="src\dwm_inject.h" />
   </ItemGroup>
