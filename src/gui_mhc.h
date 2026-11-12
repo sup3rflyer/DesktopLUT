@@ -66,8 +66,18 @@ bool BuildMHC2ParamsForPerm(const MHCSettings& mhc, bool isHDR, int monitorIndex
 // Only the matrix inputs of BuildMHC2Params (primaries + white-balance gains): no files read.
 void BuildMHC2MatrixParams(const MHCSettings& mhc, bool isHDR, MHC2ProfileParams& params);
 
-// Generate, write, and install MHC2 ICC profile from current MHCSettings
+// Generate, write, and install MHC2 ICC profile from current MHCSettings. The first HDR profile of ours on a display
+// whose profile carries no measured peak (HdrFirstInstallRecords) first records what Windows reports for its peak and
+// its HDR default (panelPeakNits / priorDefaultProfile): every route that installs one passes here.
 bool GenerateAndInstallMhcProfile(int monitorIndex, bool isHDR);
+namespace act { struct NeutralPeak; }
+// Pure (tested): an install of these settings records the display's state first — HDR, no profile of ours yet, no
+// measured peak (no imported file, no base curve).
+bool HdrFirstInstallRecords(const MHCSettings& m, bool isHDR);
+// Pure (tested): the record — the peak decided (act::DecideNeutralProfilePeak), and the previous default when it was
+// not ours (one of ours, e.g. an identity left by a Remove, leaves the recorded one as it was).
+void ApplyHdrFirstInstallRecord(MHCSettings& m, const act::NeutralPeak& peak, const std::wstring& defaultProfile,
+                                bool defaultIsOurs);
 
 // Auto-regenerate and reinstall MHC profile when MHC settings change
 // NoProfile = nothing installed for this mode (nothing to do); Failed = the profile could not be rebuilt
