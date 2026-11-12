@@ -1719,6 +1719,257 @@ void DrawDlcChart(DlcChart k, const dlc::LiveCharts& c, ImVec2 a, ImVec2 b, cons
     }
 }
 
+// ---- PEAK BY WINDOW ---------------------------------------------------------------------------------------------------
+namespace {
+
+// The y scale's top: the first step of a fixed ladder at or above `v` x 1.08 (a few steps, so two panels of a class
+// read alike; never an autoscale an early overshoot can flatten).
+float PeakScaleTop(float v) {
+    static const float kLadder[] = { 100, 200, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000, 5000, 10000 };
+    for (float s : kLadder) if (s >= v * 1.08f) return s;
+    return 10000.0f;
+}
+
+std::string NitTxt(double v) { return std::isfinite(v) ? dlc::FormatSig(v, 3) + " nit" : std::string("\xE2\x80\x94"); }
+
+// What a size draws: the combined value where the passes agree, else (one pass, or a live run not judged yet) the
+// passes' mean; NaN where they disagree (no combined value: marked instead).
+double SizeValue(const dlc::DipPeakSize& z, bool early) {
+    const double c = early ? z.early : z.sustained;
+    if (z.agree == 0) return dlc::kNaN;
+    if (std::isfinite(c)) return c;
+    const double u = early ? z.up.early : z.up.sustained, d = early ? z.down.early : z.down.sustained;
+    if (std::isfinite(u) && std::isfinite(d)) return 0.5 * (u + d);
+    return std::isfinite(u) ? u : d;
+}
+
+}  // namespace
+
+void DrawPeakByWindow(const dlc::DipPeakByWindow& p, ImVec2 a, ImVec2 b, double refNits, const char* refLabel) {
+    if (!p.present) { Empty(a, b, "NOT MEASURED"); return; }
+    if (p.newer) { Empty(a, b, "NEWER FORMAT"); return; }
+    if (!p.error.empty() || p.curve.empty()) { Empty(a, b, p.error.empty() ? "NO DATA YET" : "UNREADABLE"); return; }
+    const bool invalid = p.complete && !p.valid;
+    const float dim = invalid ? 0.40f : 1.0f;   // an invalid run: every number faint, nothing hidden
+    Plot pl = Field(a, b, 40, 22, 26, 12);
+    pl.logX = true;
+    float lo = 100.0f;
+    float top = 0.0f;
+    for (const dlc::DipPeakSize& z : p.curve) {
+        lo = std::min(lo, (float)z.areaPct);
+        for (double v : { z.sustained, z.up.sustained, z.down.sustained }) if (std::isfinite(v)) top = std::max(top, (float)v);
+    }
+    if (std::isfinite(p.plateauNits)) top = std::max(top, (float)p.plateauNits);
+    if (!(top > 0.0f)) for (const dlc::DipPeakSize& z : p.curve) for (double v : { z.early, z.up.early, z.down.early })
+        if (std::isfinite(v)) top = std::max(top, (float)v);
+    if (std::isfinite(refNits) && refNits > 0.0) top = std::max(top, (float)refNits);
+    LogRange(lo, 100.0f, pl.x0, pl.x1);
+    pl.x1 = 100.0f;
+    pl.y0 = 0.0f;
+    pl.y1 = PeakScaleTop(std::max(top, 1.0f));
+    Clip(pl);
+    for (float v : { 1.0f, 5.0f, 10.0f, 25.0f, 50.0f, 100.0f })
+        if (v >= pl.x0) TickX(pl, v, Fmt("%.0f", v).c_str(), v == pl.x0);
+    for (int i = 0; i <= 4; i++) {
+        const float v = pl.y1 * (float)i / 4.0f;
+        TickY(pl, v, v >= 1000.0f ? Fmt("%.1fk", v / 1000.0f).c_str() : Fmt("%.0f", v).c_str(), i == 0);
+    }
+    // The reference line (the target the app knows), then the run window.
+    if (std::isfinite(refNits) && refNits > 0.0 && refNits <= pl.y1) {
+        const float y = Snap(pl.Y((float)refNits));
+        DashedLine(pl.dl, ImVec2(pl.l, y), ImVec2(pl.r, y), Col(pal::InkDim), Px(4), Px(3), 1.0f);
+        if (refLabel) {
+            const std::string t = std::string(refLabel) + " " + dlc::FormatSig(refNits, 4);
+            const float w = MeasureInk(Font::Label, 10.0f, t.c_str()).advance;
+            DrawText(pl.dl, Font::Label, 10.0f, Snap(pl.r - w - Px(4)), Snap(y - Px(7)), pal::InkDim, t.c_str());
+        }
+    }
+    if (std::isfinite(p.runWindowAreaPct) && p.runWindowAreaPct >= pl.x0) {
+        const float x = Snap(pl.X((float)p.runWindowAreaPct));
+        DashedLine(pl.dl, ImVec2(x, pl.t), ImVec2(x, pl.btm), Fade(pal::InkFaint, dim), Px(3), Px(3), 1.0f);
+        const float lw = MeasureInk(Font::Label, 10.0f, "RUN WINDOW").advance;
+        const float lx = x + Px(4) + lw <= pl.r - Px(2) ? x + Px(4) : x - Px(4) - lw;   // inside the plot, either side
+        DrawText(pl.dl, Font::Label, 10.0f, Snap(lx), Snap(pl.btm - Px(8)), pal::InkFaint, "RUN WINDOW");
+    }
+    // The gap between early and sustained, shaded; then the two lines.
+    struct Pt { float x, e, s; };
+    std::vector<Pt> pts;
+    for (const dlc::DipPeakSize& z : p.curve)
+        pts.push_back({ (float)z.areaPct, (float)SizeValue(z, true), (float)SizeValue(z, false) });
+    const ImU32 data = Fade(pal::Data, dim), dataSoft = Fade(pal::Data, 0.55f * dim);
+    for (size_t i = 0; i + 1 < pts.size(); i++) {
+        const Pt& u = pts[i];
+        const Pt& v = pts[i + 1];
+        if (!Finite(u.e) || !Finite(u.s) || !Finite(v.e) || !Finite(v.s)) continue;
+        const float ue = std::min(u.e, pl.y1), ve = std::min(v.e, pl.y1);
+        pl.dl->AddQuadFilled(pl.P(u.x, ue), pl.P(v.x, ve), pl.P(v.x, std::min(v.s, pl.y1)), pl.P(u.x, std::min(u.s, pl.y1)),
+                             Fade(pal::Data, (Shape().lightPlots ? 0.12f : 0.16f) * dim));
+    }
+    auto line = [&](bool early) {
+        for (size_t i = 0; i + 1 < pts.size(); i++) {
+            const float y0 = early ? pts[i].e : pts[i].s, y1 = early ? pts[i + 1].e : pts[i + 1].s;
+            if (!Finite(y0) || !Finite(y1)) continue;   // a disagreement breaks the line
+            const ImVec2 q0 = pl.P(pts[i].x, std::min(y0, pl.y1)), q1 = pl.P(pts[i + 1].x, std::min(y1, pl.y1));
+            if (early) DashedLine(pl.dl, q0, q1, dataSoft, Px(4), Px(3), Px(1.2f));
+            else pl.dl->AddLine(q0, q1, data, Px(1.7f));
+        }
+    };
+    line(true);
+    line(false);
+    for (size_t i = 0; i < pts.size(); i++) {
+        const dlc::DipPeakSize& z = p.curve[i];
+        const float x = pl.X(pts[i].x);
+        if (z.agree == 0) {   // the passes disagree: both shown, joined, marked; no combined value
+            const ImU32 al = Fade(pal::Alarm, invalid ? 0.8f : 1.0f);
+            const float nan = (float)dlc::kNaN;
+            const float ya = Finite((float)z.up.sustained) ? pl.Y(std::min((float)z.up.sustained, pl.y1)) : nan;
+            const float yb = Finite((float)z.down.sustained) ? pl.Y(std::min((float)z.down.sustained, pl.y1)) : nan;
+            if (Finite(ya) && Finite(yb)) pl.dl->AddLine(ImVec2(x, ya), ImVec2(x, yb), al, Px(1.2f));
+            for (float y : { ya, yb }) {
+                if (!Finite(y)) continue;
+                const float s = Px(2.6f);
+                pl.dl->AddLine(ImVec2(x - s, y - s), ImVec2(x + s, y + s), al, Px(1.3f));
+                pl.dl->AddLine(ImVec2(x - s, y + s), ImVec2(x + s, y - s), al, Px(1.3f));
+            }
+            continue;
+        }
+        if (Finite(pts[i].s)) pl.dl->AddCircleFilled(pl.P(pts[i].x, std::min(pts[i].s, pl.y1)), Px(2.6f), data, 12);
+        if (Finite(pts[i].e)) {
+            if (pts[i].e > pl.y1) {
+                OverMark(pl.dl, x, pl.t + Px(4), true, dataSoft);
+            } else {
+                pl.dl->AddCircle(pl.P(pts[i].x, pts[i].e), Px(2.6f), dataSoft, 12, Px(1.1f));
+            }
+        }
+    }
+    pl.dl->PopClipRect();
+    // Captions: the axis, the key, and the run's state.
+    float cx = pl.a.x + Px(10);
+    cx += Caption(pl, cx, "NITS  \xC2\xB7  WINDOW %") + Px(14);
+    {
+        const float y = Snap(pl.a.y + Px(12));
+        if (cx + Px(120) < pl.b.x - Px(70)) {
+            pl.dl->AddLine(ImVec2(cx, y), ImVec2(cx + Px(12), y), data, Px(1.7f));
+            cx += Px(16) + Caption(pl, cx + Px(16), "SUSTAINED") + Px(10);
+            DashedLine(pl.dl, ImVec2(cx, y), ImVec2(cx + Px(12), y), dataSoft, Px(4), Px(3), Px(1.2f));
+            Caption(pl, cx + Px(16), "EARLY");
+        }
+    }
+    if (invalid) Chip(pl.dl, pl.b.x - Px(8), Snap(pl.a.y + Px(12)), "INVALID", pal::Alarm);
+    else if (!p.complete && p.stepsPlanned > 0)
+        Chip(pl.dl, pl.b.x - Px(8), Snap(pl.a.y + Px(12)),
+             (std::to_string(std::max(0, p.stepsDone)) + "/" + std::to_string(p.stepsPlanned)).c_str(), pal::InkDim);
+    // The size under the pointer.
+    if (Hovering(a, b) && !p.curve.empty()) {
+        const ImVec2 m = ImGui::GetIO().MousePos;
+        if (pl.Inside(m)) {
+            size_t best = 0;
+            float bd = 1e30f;
+            for (size_t i = 0; i < pts.size(); i++) {
+                const float d = std::fabs(pl.X(pts[i].x) - m.x);
+                if (d < bd) { bd = d; best = i; }
+            }
+            const dlc::DipPeakSize& z = p.curve[best];
+            std::string tip = dlc::FormatSig(z.areaPct, 3) + " % window";
+            if (z.agree == 0) {
+                tip += "\nThe passes disagree";
+                if (std::isfinite(z.relDiff)) tip += " (" + dlc::FormatSig(z.relDiff * 100.0, 2) + " %)";
+                tip += ": no combined value.\nUp: early " + NitTxt(z.up.early) + ", sustained " + NitTxt(z.up.sustained) +
+                       "\nDown: early " + NitTxt(z.down.early) + ", sustained " + NitTxt(z.down.sustained);
+            } else {
+                tip += "\nEarly " + NitTxt(SizeValue(z, true)) + "\nSustained " + NitTxt(SizeValue(z, false));
+                const double tau = std::isfinite(z.tau) ? z.tau : (std::isfinite(z.up.tau) ? z.up.tau : z.down.tau);
+                tip += "\nDecay " + (std::isfinite(tau) ? dlc::FormatSig(tau, 2) + " s" : std::string("\xE2\x80\x94"));
+            }
+            if (z.up.settled == 0 || z.down.settled == 0) tip += "\nA hold ended before it settled: an upper bound.";
+            if (std::isfinite(p.runWindowAreaPct) && std::fabs(p.runWindowAreaPct - z.areaPct) < 1e-6) tip += "\nThe run window.";
+            ImGui::SetTooltip("%s", tip.c_str());
+        }
+    }
+}
+
+// ---- REFRESH RESPONSE (live) ------------------------------------------------------------------------------------------
+void DrawRefreshProbe(const dlc::RefreshProbeChart& c, ImVec2 a, ImVec2 b, const char* emptyText) {
+    constexpr float kScale = 5.0f;   // %: DLC measured 0 .. +3.5 % on the panels so far; past it an overflow mark
+    if (!c.present) { Empty(a, b, emptyText); return; }
+    float lo = 1e9f, hi = 0.0f;
+    for (const dlc::RefreshProbeSeries& s : c.series)
+        for (const dlc::RefreshProbePoint& q : s.points) { lo = std::min(lo, (float)q.hz); hi = std::max(hi, (float)q.hz); }
+    if (std::isfinite(c.referenceHz)) { lo = std::min(lo, (float)c.referenceHz); hi = std::max(hi, (float)c.referenceHz); }
+    if (!(hi > 0.0f)) { Empty(a, b, emptyText); return; }
+    Plot pl = Field(a, b, 36, 22, 26, 12);
+    pl.x0 = std::floor((lo - 2.0f) / 5.0f) * 5.0f;
+    pl.x1 = std::ceil((hi + 2.0f) / 5.0f) * 5.0f;
+    pl.y0 = -kScale;
+    pl.y1 = kScale;
+    Clip(pl);
+    const float step = pl.x1 - pl.x0 > 60.0f ? 20.0f : pl.x1 - pl.x0 > 30.0f ? 10.0f : 5.0f;
+    for (float v = std::ceil(pl.x0 / step) * step; v <= pl.x1 + 0.01f; v += step) TickX(pl, v, Fmt("%.0f", v).c_str());
+    for (float v : { -5.0f, -2.5f, 0.0f, 2.5f, 5.0f })
+        TickY(pl, v, v == 0.0f ? "0" : Fmt("%+.1f", v).c_str(), v == 0.0f);
+    if (std::isfinite(c.referenceHz)) {
+        const float x = Snap(pl.X((float)c.referenceHz));
+        DashedLine(pl.dl, ImVec2(x, pl.t), ImVec2(x, pl.btm), Col(pal::InkDim), Px(3), Px(3), 1.0f);
+        const std::string t = "REF " + dlc::FormatSig(c.referenceHz, 5);
+        const float w = MeasureInk(Font::Label, 10.0f, t.c_str()).advance;
+        DrawText(pl.dl, Font::Label, 10.0f, Snap(x - w - Px(4)), Snap(pl.t + Px(7)), pal::InkDim, t.c_str());
+    }
+    // One shade per grey level (darker = a darker grey), in the series' order.
+    const size_t n = c.series.size();
+    struct Hit { float d; size_t s, i; };
+    Hit hot{ 1e30f, 0, 0 };
+    const ImVec2 m = ImGui::GetIO().MousePos;
+    const bool hovering = Hovering(a, b) && pl.Inside(m);
+    for (int layer = 0; layer < 2; layer++)   // VRR points first, the fixed-mode ones over them (a cross-check rate)
+    for (size_t si = 0; si < n; si++) {
+        const float f = n > 1 ? 0.45f + 0.55f * (float)si / (float)(n - 1) : 1.0f;
+        const ImU32 col = Fade(pal::Data, f);
+        for (size_t i = 0; i < c.series[si].points.size(); i++) {
+            const dlc::RefreshProbePoint& q = c.series[si].points[i];
+            if (q.vrr != (layer == 0)) continue;
+            const float x = pl.X((float)q.hz);
+            const float v = (float)q.pct;
+            if (std::fabs(v) > kScale) {
+                OverMark(pl.dl, x, v > 0 ? pl.t + Px(4) : pl.btm - Px(4), v > 0, col);
+            } else {
+                const ImVec2 at = pl.P((float)q.hz, v);
+                if (Finite((float)q.uPct) && q.uPct > 0.0)
+                    pl.dl->AddLine(pl.P((float)q.hz, std::max(v - (float)q.uPct, -kScale)),
+                                   pl.P((float)q.hz, std::min(v + (float)q.uPct, kScale)), col, 1.0f);
+                const float s = Px(2.6f);
+                if (q.vrr) pl.dl->AddRect(ImVec2(at.x - s, at.y - s), ImVec2(at.x + s, at.y + s), col, 0.0f, Px(1.1f));
+                else pl.dl->AddCircleFilled(at, s, col, 12);
+            }
+            if (hovering) {
+                const ImVec2 at = pl.P((float)q.hz, std::clamp(v, -kScale, kScale));
+                const float d = std::hypot(at.x - m.x, at.y - m.y);
+                if (d < hot.d) hot = { d, si, i };
+            }
+        }
+    }
+    pl.dl->PopClipRect();
+    float cx = pl.a.x + Px(10);
+    cx += Caption(pl, cx, "% VS REFERENCE  \xC2\xB7  HZ") + Px(14);
+    {
+        const float y = Snap(pl.a.y + Px(12)), s = Px(2.6f);
+        pl.dl->AddCircleFilled(ImVec2(cx + s, y), s, Col(pal::Data), 12);
+        cx += Px(10) + Caption(pl, cx + Px(10), "MODE") + Px(10);
+        pl.dl->AddRect(ImVec2(cx, y - s), ImVec2(cx + 2 * s, y + s), Col(pal::Data), 0.0f, Px(1.1f));
+        Caption(pl, cx + Px(10), "VRR");
+    }
+    if (c.legsPlanned > 0 && !c.complete)
+        Chip(pl.dl, pl.b.x - Px(8), Snap(pl.a.y + Px(12)),
+             (std::to_string(std::max(0, c.legsDone)) + "/" + std::to_string(c.legsPlanned)).c_str(), pal::InkDim);
+    if (hovering && hot.d < Px(14)) {
+        const dlc::RefreshProbePoint& q = c.series[hot.s].points[hot.i];
+        std::string tip = dlc::FormatSig(q.hz, 5) + " Hz  \xC2\xB7  " + c.series[hot.s].name + "\n" +
+                          dlc::FormatSig(q.pct, 2, true) + " %";
+        if (std::isfinite(q.uPct)) tip += " \xC2\xB1 " + dlc::FormatSig(q.uPct, 2);
+        tip += q.vrr ? "\nVRR cadence" : "\nfixed display mode";
+        ImGui::SetTooltip("%s", tip.c_str());
+    }
+}
+
 const char* DlcChartKey(DlcChart k) {
     switch (k) {
     case DlcChart::Bands:        return "bands";

@@ -62,6 +62,19 @@ struct ChartContext {
 };
 void DrawDlcChart(DlcChart k, const dlc::LiveCharts& c, ImVec2 a, ImVec2 b, const ChartContext& ctx = {});
 
+// ---- the probe charts (the PANEL view's peak by window; a probe flow's live run) -------------------------------------
+// PEAK BY WINDOW: window area (% of the screen, log) against nits; the sustained line over the early one, the gap
+// between them shaded (what the limiter takes over a hold); sizes whose up and down passes disagree carry no combined
+// value and are marked (both passes shown); the run window (the largest size on the small-window plateau) as a
+// dashed mark; `refNits` (> 0: the HDR target the app knows, `refLabel`) as a reference line. A fixed scale from the
+// plateau (an early overshoot past it gets an overflow mark, never a rescale). An invalid run: every number shown
+// faint under an INVALID tag, never hidden. Not measured / unreadable / a newer schema: the field says so.
+void DrawPeakByWindow(const dlc::DipPeakByWindow& p, ImVec2 a, ImVec2 b, double refNits = dlc::kNaN,
+                      const char* refLabel = nullptr);
+// REFRESH RESPONSE (live): the light at each measured rate against the reference rate, % (fixed ±5 % with overflow
+// marks), per grey level; points from a fixed display mode filled, points from a VRR cadence hollow squares.
+void DrawRefreshProbe(const dlc::RefreshProbeChart& c, ImVec2 a, ImVec2 b, const char* emptyText = "NO DATA YET");
+
 // A spectral colour for a CIE diagram's tint: xy at unit luminance to linear sRGB, out-of-gamut parts dropped,
 // brightest channel to 1, sRGB-encoded.
 ImU32 SpectralTint(float x, float y, float alpha);
