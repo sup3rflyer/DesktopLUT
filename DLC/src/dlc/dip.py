@@ -346,6 +346,9 @@ class DisplayInstrumentProfile:
     #   field) the presenter reported while characterizing — on an ABL panel the measured white /
     #   settle / noise depend on it, so a later run at a different window is a judgment (the
     #   preflight:patch-window seam). None = unknown / an older record (never a mismatch).
+    measured_refresh: Optional[dict[str, Any]] = None   # the refresh rate the characterization ran at
+    #   (additive 2026-11-12): {"rational": [num, den], "hz", "rate", "hardware_id", "device_name", "source",
+    #   "run_id", "at"}; None = not recorded (older records)
     made: Optional[str] = None                   # YYYY-MM-DD — the staleness clock
     max_age_days: Optional[int] = None
     updated: Optional[str] = None
@@ -365,6 +368,8 @@ class DisplayInstrumentProfile:
             d.pop("refresh_response")        # a record without one is written exactly as before
         else:
             d["refresh_response"] = self.refresh_response.as_dict()
+        if self.measured_refresh is None:
+            d.pop("measured_refresh")
         if self.peak_by_window is None:
             d.pop("peak_by_window")
         else:
@@ -422,6 +427,7 @@ class DisplayInstrumentProfile:
             instrument=d.get("instrument"),
             correction_file=d.get("correction_file"),
             patch_window_area_pct=_opt_float(d.get("patch_window_area_pct")),
+            measured_refresh=(dict(d["measured_refresh"]) if isinstance(d.get("measured_refresh"), dict) else None),
             made=d.get("made"),
             max_age_days=(int(d["max_age_days"]) if d.get("max_age_days") is not None else None),
             updated=d.get("updated"),

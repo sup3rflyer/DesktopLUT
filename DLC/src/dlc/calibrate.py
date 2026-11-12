@@ -1668,6 +1668,10 @@ class Calibration:
                                 "applied_at": rec.applied_at}
                     if cube_white is not None:
                         rec.cube["target_white_nits"] = cube_white
+                # the refresh rate the MHC (and the cube) was calibrated at — the refresh probe's reference
+                rec.refresh = self.calib.get("display_refresh")
+                if rec.cube is not None and rec.refresh:
+                    rec.cube["refresh"] = rec.refresh
                 reg.record(rec)
                 self.ctx.log(f"applied-stack registry: {rec.key} <- run {rec.run_id} "
                              f"(profile {pipe_profile}, top {rec.cube_peak_nits}, "
@@ -1675,7 +1679,10 @@ class Calibration:
             elif flow == "3dlut-only":
                 rec = reg.record_cube(display=self.display.name, mode=self.mode, monitor=self.monitor,
                                       run_id=self.ctx.root.name, cube_path=cube, profile_name=pipe_profile,
-                                      target_white_nits=cube_white)
+                                      target_white_nits=cube_white, save=False)
+                if self.calib.get("display_refresh"):
+                    rec.cube["refresh"] = self.calib["display_refresh"]
+                reg.record(rec)
                 self.ctx.log(f"applied-stack registry: {rec.key} cube <- run {self.ctx.root.name}")
         except Exception as exc:  # noqa: BLE001 - registry is priors for the next run, never a gate
             self.ctx.log(f"applied-stack registry not updated ({type(exc).__name__}: {exc})")
@@ -4120,6 +4127,8 @@ class Calibration:
                           # the window this DIP was measured at (None = unknown) — a later run at
                           # another window is the preflight:patch-window judgment
                           patch_window_area_pct=(self.patch_window_report or {}).get("area_pct"),
+                          # the refresh rate this characterization ran at (None = not recorded)
+                          measured_refresh=self.calib.get("display_refresh"),
                           made=self.run_date.isoformat(),
                           updated=self.run_date.isoformat())
             # A re-characterization replaces the record; the optional measured sections recorded by the
@@ -8563,8 +8572,48 @@ class Calibration:
                                            "changed_from_area_pct": old}
         self._save()
 
+    def _record_display_refresh(self) -> Optional[dict[str, Any]]:
+        """Record the display's ACTIVE refresh rate (the exact rational, read-only from DisplayConfig) in the run
+        record (``calib['display_refresh']``) — the rate this run measures / calibrates at. Carried into the
+        applied-stack registry (``StackRecord.refresh``) and a characterization's DIP (``measured_refresh``), so
+        the refresh probe can state the calibration's reference rate as a fact. Recorded once; a resume that finds
+        another rate keeps the first and notes the change (``changed``). No DisplayConfig reader (sim / tests
+        without one) = nothing recorded, as before. Never raises, never a gate."""
+        api = getattr(self, "display_api", None)
+        if api is None:
+            return self.calib.get("display_refresh")
+        try:
+            from . import refresh_mode as _rm
+            hw = str(self.display.quirks.get("hardware_id") or "").strip()
+            if not hw:
+                mons = (self.controller.query_monitors() or {}).get("monitors") or []
+                hw = next((str(m.get("hardware_id") or "") for m in mons
+                           if int(m.get("index", -1)) == int(self.monitor)), "")
+            d = _rm.find_display(api.snapshot(), hw)
+            num, den = (d.get("active") or {}).get("vsync") or [0, 0]
+            if not den:
+                return self.calib.get("display_refresh")
+            rec = {"rational": [int(num), int(den)], "hz": round(num / den, 6), "rate": _rm.classify_hz(num / den),
+                   "hardware_id": hw, "device_name": d.get("device_name"), "source": "displayconfig",
+                   "run_id": self.ctx.root.name, "at": datetime.now().isoformat(timespec="seconds")}
+        except Exception as exc:  # noqa: BLE001 - evidence only
+            self.ctx.log(f"display refresh rate not recorded: {type(exc).__name__}: {exc}")
+            return self.calib.get("display_refresh")
+        prev = self.calib.get("display_refresh")
+        if isinstance(prev, dict) and prev.get("rational"):
+            if list(prev["rational"]) != rec["rational"]:
+                prev.setdefault("changed", []).append({k: rec[k] for k in ("rational", "hz", "rate", "at")})
+                self.runlog.note("preflight", f"the display now runs at {rec['hz']} Hz; this run started at "
+                                              f"{prev.get('hz')} Hz", level="WARN", display_refresh=prev)
+                self._save()
+            return prev
+        self.calib["display_refresh"] = rec
+        self._save()
+        return rec
+
     def _run_flow(self, flow: str) -> CalibrationResult:
         try:
+            self._record_display_refresh()
             self._patch_window_resume_check()
             if flow == "full":
                 return self._flow_full()
@@ -11340,7 +11389,8 @@ def _revert_status(report: Mapping[str, Any]) -> str:
 
 def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
                    mode: Optional[str], run_root: Any, flow: Optional[str] = None,
-                   log: Optional[Callable[[str], None]] = None) -> tuple[int, dict[str, Any]]:
+                   log: Optional[Callable[[str], None]] = None,
+                   display_api: Any = None) -> tuple[int, dict[str, Any]]:
     """``--abort``: undo what this run changed and report what was ACTUALLY put back. Returns
     ``(exit_code, payload)`` for the CLI to print.
 
@@ -11376,9 +11426,13 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
         if not gswb_applied:
             gswb = restore_gswb_prior(controller, calib_state, monitor=monitor, mode=mode,
                                       why="--abort", log=log)
+    probe = _probe_flow_restore(controller, calib_state, run_flow=run_flow, monitor=monitor, mode=mode,
+                                run_root=run_root, why="--abort", display_api=display_api, log=log)
     if gswb is not None and gswb["outcome"] != "not_needed":
         status = {"restored": "reverted", "unconfirmed": "restore_unknown"}.get(gswb["outcome"],
                                                                                 "nothing_restored")
+    elif probe is not None:
+        status = {"confirmed": "reverted", "unconfirmed": "restore_unknown"}.get(probe["outcome"], "nothing_restored")
     elif entered is False and run_flow == "verify-only":
         # verify-only's only display changes are the candidate cube and the viewing layers
         cand_back = (not isinstance(candidate, dict) or not candidate.get("installed")
@@ -11398,6 +11452,9 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
     if gswb is not None and gswb["outcome"] != "not_needed":
         payload["grayscale_wb_restore"] = gswb
         payload["display_may_carry_touchup"] = bool(gswb.get("display_may_carry_touchup"))
+    if probe is not None:
+        payload["probe_restore"] = probe
+        payload["display_may_differ"] = probe["outcome"] != "confirmed"
     if gswb_applied:
         payload["grayscale_wb_applied"] = True
         payload["note"] = ("this run's Grayscale touch-up was APPLIED (kept at the verify gate) — --abort does "
@@ -11407,12 +11464,14 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
         payload["hint"] = _restore_hint(calib_state)
         if payload.get("display_may_carry_touchup"):
             payload["hint"] = _gswb_rollback_hint(run_root) + "; " + payload["hint"]
+        if probe is not None and probe.get("hint"):
+            payload["hint"] = probe["hint"] + "; " + payload["hint"]
     return 0, payload
 
 
 def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, monitor: Optional[int],
                       mode: Optional[str], run_root: Any,
-                      entered_calibration: Optional[bool] = None) -> dict[str, Any]:
+                      entered_calibration: Optional[bool] = None, display_api: Any = None) -> dict[str, Any]:
     """The CLI rollback guard's restore (a run that ended neither applied nor reverted): request the
     pre-run snapshot through :func:`_common.request_snapshot_restore` (never for a run that did not
     enter calibration mode, never when DesktopLUT holds no open session / capture), re-assert the
@@ -11434,7 +11493,15 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
     # were switched off, so put them back (run() already did, and a restore undoes it).
     layers = (_reassert_viewing_layers(controller, calib_state, monitor=monitor, mode=mode)
               if report.get("requested") else None)
-    if gswb is not None and gswb["outcome"] != "not_needed":
+    run_flow = (calib_state or {}).get("flow")
+    probe = _probe_flow_restore(controller, calib_state, run_flow=run_flow, monitor=monitor, mode=mode,
+                                run_root=run_root, why="rollback guard (run did not complete)",
+                                display_api=display_api)
+    if probe is not None:
+        status = {"confirmed": "rolled_back", "unconfirmed": "rollback_unconfirmed"}.get(probe["outcome"],
+                                                                                       "rollback_failed")
+        reason = "run did not complete; " + probe["summary"]
+    elif gswb is not None and gswb["outcome"] != "not_needed":
         # the touch-up curve is this flow's display change; the snapshot was (rightly) never asked for
         status = {"restored": "rolled_back", "unconfirmed": "rollback_unconfirmed"}.get(
             gswb["outcome"], "rollback_failed")
@@ -11452,12 +11519,62 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
     if gswb is not None and gswb["outcome"] != "not_needed":
         payload["grayscale_wb_restore"] = gswb
         payload["display_may_carry_touchup"] = bool(gswb.get("display_may_carry_touchup"))
+    if probe is not None:
+        payload["probe_restore"] = probe
+        payload["display_may_differ"] = probe["outcome"] != "confirmed"
     if status != "rolled_back":
         payload["backup"] = ((calib_state or {}).get("backup") or {})
         payload["hint"] = _restore_hint(calib_state)
         if payload.get("display_may_carry_touchup"):
             payload["hint"] = _gswb_rollback_hint(run_root) + "; " + payload["hint"]
+        if probe is not None and probe.get("hint"):
+            payload["hint"] = probe["hint"] + "; " + payload["hint"]
     return payload
+
+
+def _probe_flow_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, run_flow: Optional[str],
+                        monitor: Optional[int], mode: Optional[str], run_root: Any, why: str,
+                        display_api: Any = None, log: Optional[Callable[[str], None]] = None
+                        ) -> Optional[dict[str, Any]]:
+    """The probe flows' part of a teardown (``--abort`` / the rollback guard), CONFIRMED by read-back.
+
+    * ``refresh-response``: :func:`dlc.refresh_probe.restore_display` — the exact recorded rational mode (+ the
+      saved-mode repair) and the probe stack (3D LUT bypass, refresh trim) — then the viewing layers read back.
+    * ``peak-window``: no calibration session left open, the viewing layers as captured, the user's MHC associated
+      again (:func:`dlc.probe_kit.confirm_native_restored`; the snapshot restore itself is the caller's).
+
+    ``outcome``: ``confirmed`` / ``unconfirmed`` / ``failed``; ``hint`` names the command to finish it. A second
+    call on a restored display re-reads it and confirms (harmless). ``None`` for any other flow."""
+    if run_flow not in PROBE_FLOWS:
+        return None
+    from . import probe_kit
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    mon = _run_monitor(rec, monitor)
+    out: dict[str, Any] = {"flow": run_flow, "why": why}
+    if run_flow == "refresh-response":
+        from . import refresh_probe
+        rr = refresh_probe.restore_display(controller, rec, run_root, api=display_api, monitor=mon, mode=mode,
+                                           why=why, log=log)
+        layers = probe_kit.viewing_layers_diff(controller, rec, monitor=mon, mode=mode)
+        out.update(display=rr, viewing_layers=layers)
+        ok = rr["outcome"] in ("restored", "not_needed") and layers.get("ok") is not False
+        failed = rr["outcome"] == "failed"
+        out["summary"] = rr["summary"] + ("" if layers.get("ok") is not False else
+                                          f"; the viewing layers read back changed: {layers['diff']}")
+    else:
+        conf = probe_kit.confirm_native_restored(controller, rec, monitor=mon, mode=mode)
+        out["read_back"] = conf
+        ok, failed = bool(conf["confirmed"]), False
+        out["summary"] = ("the display reads back as it started: no calibration session open, the viewing layers "
+                          "as captured" if ok else
+                          f"could not confirm the display is back (read-back: {conf})")
+    out["outcome"] = "confirmed" if ok else ("failed" if failed else "unconfirmed")
+    if not ok:
+        out["hint"] = (f"the display may not be as it started: run `python -m dlc.calibrate --run {run_root} --abort` "
+                       "again once DesktopLUT runs with the calibration pipe"
+                       + (" (or `python -m dlc.refresh_probe restore --run <dir>` for the mode alone)"
+                          if run_flow == "refresh-response" else ""))
+    return out
 
 
 def _reassert_viewing_layers(controller: Any, calib_state: Optional[dict[str, Any]], *,
@@ -13068,9 +13185,14 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # the read-only DisplayConfig reader (the refresh probe also switches modes through it, after its seams).
         if args.probe_spec is not None:
             calib.probe_spec = json.loads(Path(args.probe_spec).read_text(encoding="utf-8"))
-        if eff_flow in PROBE_FLOWS:
+        # Every flow records the display's refresh rate at preflight (read-only DisplayConfig); the probe flows also
+        # switch modes through it (after their seams).
+        try:
             from .refresh_mode import Win32DisplayApi
             calib.display_api = Win32DisplayApi()
+        except Exception as exc:  # noqa: BLE001 - the refresh record is evidence, never a gate
+            ctx.log(f"DisplayConfig reader unavailable ({type(exc).__name__}: {exc}): refresh rate not recorded")
+        if eff_flow in PROBE_FLOWS:
             calib.vrr_presenter_factory = _vrr_presenter_factory(args)
             if persistent_meter is not None:
                 # the refresh probe's VRR source paints through its own presenter: it reads the meter alone,
@@ -13151,7 +13273,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             try:
                 entered = calib is not None and (
                     calib._entered_calibration()
-                    or calib.calib.get("inplace_baseline") is not None)
+                    or calib.calib.get("inplace_baseline") is not None
+                    or calib.calib.get("flow") in PROBE_FLOWS)
             except Exception:  # noqa: BLE001 - defensive; fall back to attempting rollback
                 entered = True
             if not handled and entered:
@@ -13164,7 +13287,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                         monitor=calib.monitor if calib is not None else args.monitor,
                         mode=calib.mode if calib is not None else eff_mode, run_root=ctx.root,
                         entered_calibration=_run_entered_calibration(calib.calib if calib is not None else None,
-                                                                     flow=eff_flow))
+                                                                     flow=eff_flow),
+                        display_api=getattr(calib, "display_api", None))
                     layers = rollback.get("viewing_layers")
                     if calib is not None:
                         try:
@@ -13177,14 +13301,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             if layers is not None:
                                 ctx.log("viewing layers after rollback: " + json.dumps(layers, default=str))
                             ctx.log("rollback: " + rollback["snapshot_restore"]["summary"])
-                            if rollback.get("grayscale_wb_restore") is not None:
+                            if (rollback.get("grayscale_wb_restore") is not None
+                                    or rollback.get("probe_restore") is not None):
                                 ctx.log(f"rollback ({rollback['status']}): {rollback['reason']}")
-                                # on the spine too: the DLC tab / the LLM must see a touch-up left behind
+                                # on the spine too: the DLC tab / the LLM must see a display left changed
+                                left = bool(rollback.get("display_may_carry_touchup")
+                                            or rollback.get("display_may_differ"))
                                 calib.runlog.note(
                                     "rollback", f"{rollback['status']}: {rollback['reason']}",
-                                    level="WARN" if rollback.get("display_may_carry_touchup") else "INFO",
+                                    level="WARN" if left else "INFO",
                                     rollback_status=rollback["status"],
                                     display_may_carry_touchup=bool(rollback.get("display_may_carry_touchup")),
+                                    display_may_differ=bool(rollback.get("display_may_differ")),
                                     hint=rollback.get("hint"))
                         except Exception:  # noqa: BLE001 - bookkeeping only
                             pass

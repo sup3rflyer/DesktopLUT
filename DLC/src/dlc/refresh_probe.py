@@ -222,7 +222,7 @@ class ModeSource:
             out.append(f"rates not in the catalogue {sorted(rm.RATES)}: {unknown}")
             cands = tuple(r for r in cands if r in rm.RATES)
         plan = rm.plan_rates(d, self.api.dxgi_modes(dev), self.api.legacy_modes(dev),
-                             rates=tuple(dict.fromkeys([*cands, *(rm.RATES if spec.reference is None else [])])))
+                             rates=tuple(dict.fromkeys([*cands, *(rm.RATES if spec.reference is None else [spec.reference])])))
         ref = spec.reference or plan.get("active_rate")
         if ref is None:
             out.append(f"the display runs at {plan.get('active_hz')} Hz, which is no catalogue rate: name the "
@@ -306,6 +306,41 @@ def _window(cal: Any, spec: RefreshProbeSpec) -> float:
         return float(spec.window_area_pct)
     w = cal.display.expected_window("HDR")
     return float(w) if w else (10.0 if cal.display.is_emissive else 100.0)
+
+
+def recorded_reference(cal: Any) -> Optional[dict[str, Any]]:
+    """The refresh rate the installed HDR calibration was made at: the applied-stack registry's
+    ``refresh`` for this display (recorded by the applying run at its preflight), else the HDR DIP's
+    ``measured_refresh`` (the characterization's). None = not recorded (calibrations before 2026-11-12)."""
+    try:
+        from . import stack_registry
+        rec = stack_registry.StackRegistry.load(stack_registry.registry_path(cal.profile, cal.ctx.root)).get(
+            cal.display.name, "HDR")
+        if rec is not None and rec.refresh:
+            return {**rec.refresh, "basis": "stack_registry", "applied_run": rec.run_id}
+    except Exception:  # noqa: BLE001 - priors only
+        pass
+    dip = cal._dip()
+    if dip is not None and getattr(dip, "measured_refresh", None):
+        return {**dip.measured_refresh, "basis": "dip"}
+    return None
+
+
+def _resolve_reference(cal: Any, spec: RefreshProbeSpec, st: dict[str, Any]) -> RefreshProbeSpec:
+    """The reference = the calibration's recorded rate (a fact, stated at the plan seam); the spec's own
+    ``reference`` wins but a disagreement with the record is flagged; nothing recorded = the active rate, which
+    the plan seam asks the overseer to confirm."""
+    rec = recorded_reference(cal)
+    st["reference_recorded"] = jsonable(rec)
+    key = (rec or {}).get("rate")
+    if rec is None or not key:
+        st["reference_basis"] = "missing" if rec is None else "recorded_not_in_catalogue"
+        return spec
+    if spec.reference is None:
+        st["reference_basis"] = "recorded"
+        return replace(spec, reference=str(key))
+    st["reference_basis"] = "recorded" if spec.reference == key else "recorded_disagrees"
+    return spec
 
 
 def make_source(cal: Any, spec: RefreshProbeSpec, hw: str) -> Any:
@@ -643,6 +678,18 @@ def _restore_probe_stack(controller: Any, monitor: int, mode: str, before: dict[
         return {"want": want, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
 
 
+def _reference_words(st: dict[str, Any]) -> str:
+    rec = st.get("reference_recorded") or {}
+    basis = st.get("reference_basis")
+    if basis == "recorded":
+        return (f"the rate the calibration was made at, recorded by run {rec.get('run_id')} "
+                f"({rec.get('rational')}, {rec.get('basis')})")
+    if basis == "recorded_disagrees":
+        return (f"BUT the calibration was recorded at {rec.get('rate')} Hz ({rec.get('rational')}, run "
+                f"{rec.get('run_id')}): CONFIRM which one the calibration was made at")
+    return "no calibration rate is recorded for this display: CONFIRM this is the rate the calibration was made at"
+
+
 def _write_pre_state(cal: Any, st: dict[str, Any], source: Any) -> None:
     write_json(cal.ctx.root / "pre_state.json", {
         "monitor": cal.monitor, "mode": cal.mode, "hardware_id": st["hardware_id"], "source": source.kind,
@@ -652,18 +699,118 @@ def _write_pre_state(cal: Any, st: dict[str, Any], source: Any) -> None:
         "written": datetime.now().isoformat(timespec="seconds")})
 
 
-def _restore_all(cal: Any, st: dict[str, Any], source: Any, why: str) -> dict[str, Any]:
-    out: dict[str, Any] = {"why": why}
+def abort_hint(run_root: Any) -> str:
+    return (f"the display may still be at the probe's refresh rate / with the 3D LUT bypassed: run "
+            f"`python -m dlc.calibrate --run {run_root} --abort` (it puts the exact recorded mode and the stack back "
+            f"and confirms them by reading them back; low level: `python -m dlc.refresh_probe restore --run {run_root}`)")
+
+
+def restore_display(controller: Any, calib_state: Optional[dict[str, Any]], run_root: Any, *, api: Any = None,
+                    monitor: Optional[int] = None, mode: Optional[str] = None, why: str = "",
+                    log: Optional[Any] = None) -> dict[str, Any]:
+    """Undo a refresh-response run's display changes and CONFIRM them by reading them back. Never raises.
+
+    What the run changes, in order: the probe stack (3D LUT bypassed, DesktopLUT's refresh trim off — recorded in
+    ``probe_stack_before``), then the refresh rate (the mode source / the VRR source's cross-check; the original
+    mode recorded in ``pre_mode`` / ``pre_state.json`` before the first switch). The viewing layers are the
+    orchestrator's (``_restore_viewing_layers`` / ``_reassert_viewing_layers``).
+
+    ``outcome``: ``restored`` (the mode reads back as the exact recorded rational with the saved mode repaired, and
+    the stack reads back as before), ``unconfirmed`` (the calls returned, a read-back disagrees or could not be made),
+    ``failed`` (a call failed: no DisplayConfig, the pipe gone), ``not_needed`` (the run changed nothing yet).
+    Idempotent: a second call on a restored display re-reads it and reports ``restored``. Unless restored /
+    not_needed, ``display_may_be_at_probe_rate`` / ``stack_may_be_changed`` say what may be left, and ``hint``
+    names the command. The record goes to ``calib_state['refresh_probe']['abort_restore']`` (+ history)."""
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    st = rec.get("refresh_probe") if isinstance(rec.get("refresh_probe"), dict) else {}
+    pre: dict[str, Any] = {}
     try:
-        out["mode"] = jsonable(source.restore())
-    except Exception as exc:  # noqa: BLE001
-        out["mode"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    out["stack"] = _restore_probe_stack(cal.controller, cal.monitor, cal.mode, st.get("probe_stack_before") or {})
+        f = Path(run_root) / "pre_state.json"
+        if f.exists():
+            pre = json.loads(f.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - the run record is the fallback
+        pre = {}
+    pre_mode = pre.get("pre_mode") or st.get("pre_mode")
+    stack_before = pre.get("probe_stack_before") or st.get("probe_stack_before")
+    hw = pre.get("hardware_id") or st.get("hardware_id")
+    mon = pre.get("monitor", monitor)
+    md = pre.get("mode", mode)
+    out: dict[str, Any] = {"why": why, "at": datetime.now().isoformat(timespec="seconds"), "outcome": None,
+                           "confirmed": False, "mode": None, "stack": None}
+    if not pre_mode and not stack_before:
+        out.update(outcome="not_needed", confirmed=True, summary="the run changed neither the mode nor the stack")
+        return out
+    mode_ok, stack_ok, failed = True, True, []
+    if pre_mode:
+        try:
+            if api is None:
+                api = rm.Win32DisplayApi()
+            r = rm.restore_mode(api, hardware_id=hw, original=pre_mode, others=pre_mode.get("others") or {})
+            out["mode"] = jsonable(r)
+            mode_ok = bool(r.get("ok"))
+            if r.get("others_changed"):
+                out["others_changed"] = jsonable(r["others_changed"])
+        except Exception as exc:  # noqa: BLE001
+            mode_ok = False
+            failed.append(f"mode: {type(exc).__name__}: {exc}")
+            out["mode"] = {"ok": False, "error": failed[-1]}
+    if stack_before:
+        if controller is None or mon is None or not md:
+            stack_ok = False
+            failed.append("stack: no pipe / monitor")
+            out["stack"] = {"ok": False, "error": failed[-1]}
+        else:
+            out["stack"] = _restore_probe_stack(controller, int(mon), str(md), stack_before)
+            stack_ok = bool(out["stack"].get("ok", True))
+            if out["stack"].get("error"):
+                failed.append("stack: " + str(out["stack"]["error"]))
+    if mode_ok and stack_ok:
+        target = (pre_mode or {}).get("expected_rational") or (pre_mode or {}).get("rate")
+        out.update(outcome="restored", confirmed=True,
+                   summary=("the display reads back at its recorded mode " f"({target}), the saved mode as before, "
+                            "and the 3D LUT / refresh trim as before") if pre_mode else
+                   "the 3D LUT / refresh trim read back as before (the mode was never switched)")
+    else:
+        out["outcome"] = "failed" if failed else "unconfirmed"
+        out["display_may_be_at_probe_rate"] = not mode_ok
+        out["stack_may_be_changed"] = not stack_ok
+        out["summary"] = ("could not confirm the display is back: "
+                          + ("the mode does not read back as recorded; " if not mode_ok else "")
+                          + ("the stack does not read back as before; " if not stack_ok else "")
+                          + ("; ".join(failed)))
+        out["hint"] = abort_hint(run_root)
+    if isinstance(calib_state, dict):
+        stt = calib_state.setdefault("refresh_probe", {})
+        if stt.get("abort_restore"):
+            stt.setdefault("abort_restore_history", []).append(stt["abort_restore"])
+        stt["abort_restore"] = out
+    if log is not None:
+        try:
+            log(f"refresh-response restore ({why}): {out['summary']}")
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _source_api(source: Any) -> Any:
+    if getattr(source, "api", None) is not None:
+        return source.api
+    m = getattr(source, "mode", None)
+    return getattr(m, "api", None)
+
+
+def _restore_all(cal: Any, st: dict[str, Any], source: Any, why: str) -> dict[str, Any]:
+    if hasattr(source, "stop"):
+        try:
+            source.stop()                     # the VRR presenter first (it is our child)
+        except Exception:  # noqa: BLE001
+            pass
+    out = restore_display(cal.controller, cal.calib, cal.ctx.root, api=_source_api(source), monitor=cal.monitor,
+                          mode=cal.mode, why=why)
     st["restore"] = out
     cal._save()
-    if not (out["mode"] or {}).get("ok", True) or not out["stack"].get("ok", True):
-        cal.runlog.anomaly(STAGE, kind="restore_incomplete", restore=out,
-                           message=f"put the display back by hand: python -m dlc.refresh_probe restore --run {cal.ctx.root}")
+    if out["outcome"] not in ("restored", "not_needed"):
+        cal.runlog.anomaly(STAGE, kind="restore_incomplete", restore=out, message=out.get("hint") or out["summary"])
     return out
 
 
@@ -773,6 +920,8 @@ def run_flow(cal: Any) -> Any:
     cal.stage_preflight()
     st = cal.calib.setdefault("refresh_probe", {})
     spec = resolve_spec(cal)
+    if not st.get("planned"):
+        spec = _resolve_reference(cal, spec, st)
     st["spec"] = spec.as_dict()
     hw = st.get("hardware_id") or _hardware_id(cal)
     if not hw:
@@ -798,6 +947,8 @@ def run_flow(cal: Any) -> Any:
         for r in refusals:
             cal.runlog.anomaly(STAGE, kind="refused", message=r)
         raise _abort("refresh-response refused before anything changed: " + "; ".join(refusals), refusals=refusals)
+    if not st.get("pre_mode") and plan.get("pre_mode"):
+        st["pre_mode"] = jsonable(plan["pre_mode"])      # the mode before any switch (the restore's target)
     if not st.get("planned"):
         st["reference"] = plan["reference"]
         st["reference_rational"] = plan.get("reference_rational")
@@ -816,8 +967,8 @@ def run_flow(cal: Any) -> Any:
         cal._abort_if(cal.adjudicate(AdjudicationRequest(
             key="refresh-response:plan", seam="probe_consent", stage=STAGE,
             question=(f"Measure the refresh response of monitor {cal.monitor} ({cal.display.name}, {hw}) in HDR via "
-                      f"the {source.kind} rate source: reference {st['reference']} Hz — CONFIRM this is the rate the "
-                      f"calibration was made at — against {', '.join(plan.get('measure') or [])} Hz; "
+                      f"the {source.kind} rate source: reference {st['reference']} Hz — {_reference_words(st)} — "
+                      f"against {', '.join(plan.get('measure') or [])} Hz; "
                       f"{len(st['legs'])} legs, {est['switches']} rate changes, greys at "
                       f"{', '.join(f'{n:g}' for n in st['levels_nits'])} nit on a {st['window_area_pct']:g} % window; "
                       f"~{est['total_min'][0]:.0f}-{est['total_min'][1]:.0f} min. Through the installed MHC with the "
@@ -825,7 +976,8 @@ def run_flow(cal: Any) -> Any:
                       + ("Every switch away from the reference asks its own consent. " if source.kind == "mode" else "")
                       + "approve = start; abort = nothing changes."),
             options=("approve", "abort"), recommendation="approve",
-            digest={"plan": st["plan"], "legs": st["legs"], "estimate": est, "levels_nits": st["levels_nits"],
+            digest={"reference_basis": st.get("reference_basis"), "reference_recorded": st.get("reference_recorded"),
+                    "plan": st["plan"], "legs": st["legs"], "estimate": est, "levels_nits": st["levels_nits"],
                     "window_area_pct": st["window_area_pct"], "reference": st["reference"], "source": source.kind,
                     "switch_seams": [f"refresh-response:switch:L{lg['leg']}:{lg['rate']}" for lg in st["legs"]
                                      if lg["rate"] != st["reference"]] if source.kind == "mode" else []})),
