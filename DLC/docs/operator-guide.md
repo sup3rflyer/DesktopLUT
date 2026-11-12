@@ -174,6 +174,9 @@ Show the human the size before a long run.
 python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
   --dogegen-server 127.0.0.1:28930 --keep-dogegen-server
 ```
+- **Pass `--driver claude` on every invocation you launch** (the default is `cli`, a person at a shell;
+  DesktopLUT's DLC tab launches with `desktoplut`). It is recorded per invocation in `manifest.json` and shown in
+  the DLC tab from `runs/active.json`; it changes nothing else.
 - **Repeat every plan flag on every resume:** `--flow --mode --monitor --bit-depth`, the patch flags,
   `--dogegen-server`, `--keep-dogegen-server`. Then append `--run <dir> --decide <key>=<option>`.
   - Prior decisions persist in the run record; don't re-pass them.
@@ -184,7 +187,8 @@ python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
 - **Run folder:** a fresh run creates `runs/<timestamp>_…`. Find it in the first seam's `"run"` field or in
   `runs/active.json` (the newest run). You need it for resumes, check-ins and `--cancel`.
   - `runs/active.json` also says what that run is doing: `state` is `running`, `paused_seam` (with the waiting
-    `seam` key), `done`, `failed` or `cancelled`, next to its `pid`, display, monitor, mode and hardware id.
+    `seam` key), `done`, `failed` or `cancelled`, next to its `pid`, `driver`, display, monitor, mode and
+    hardware id.
   - The run's `manifest.json` keeps the exact first launch (`launch.argv` + `launch.cwd`) and appends every
     resume. A resume is `launch.argv` run from `launch.cwd`, plus `--run <dir> --decide <key>=<option>`.
   - A paused seam is also on the spine: its `seam` event (`status: paused`) carries the same question, options,
@@ -253,13 +257,27 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
   DLC tab (CANCEL), or PAUSE it (DLC rolls back after 3 minutes unless resumed): a `control.json` you did not
   write is the human's, so read it before resuming or deciding a seam.
 - **Abandon a paused run:** `python -m dlc.calibrate --run <dir> --abort` rolls DesktopLUT back and exits.
-  Without `--run` it can't restore what the run changed (candidate cube, viewing layers).
+  Without `--run` it can't restore what the run changed (candidate cube, viewing layers, a grayscale touch-up).
+  It restores the run's own monitor and mode from the run record, so `--mode` need not be repeated.
 - **Read the restore status it prints.** It is DesktopLUT's own answer. Full success is `reverted` (`--abort`,
   `revert`) or `rolled_back` (`--cancel` / rollback). Anything else needs telling the human:
   `partially_reverted` / `rolled_back_partially`, `nothing_restored` / `rollback_restored_nothing`,
-  `restore_unknown` / `rollback_unconfirmed`. The durable fallback is the pre-run
+  `restore_unknown` / `rollback_unconfirmed`, `rollback_failed`, `revert_unavailable` / `revert_unconfirmed`.
+  The durable fallback is the pre-run
   settings copy `runs/<run>/desktoplut_settings_backup.ini`. It needs `paths.desktoplut_ini` set in the profile.
   To use it: quit DesktopLUT, copy it back over `DesktopLUT.ini`, relaunch.
+- **`grayscale-wb` is committed before it is verified.** The touch-up is baked into the installed profile's
+  fine-tune curve at the end of its stage, so `measure:verify` scores the real result. Any ending that does not
+  apply it — `revert` at `verify:accept`, a cancel, a PAUSE that times out, a dead meter, a stall, a stage error,
+  a crash, `--abort` (also at the `verify:accept` pause) — puts back the curve the display had before the touch-up
+  (the user's own fine-tune, or the identity curve) and re-bakes. Before the commit, the live preview is simply
+  cancelled.
+  - `rolled_back` / `reverted` means a read-back showed that curve. When the payload says
+    `display_may_carry_touchup: true` (the pipe was gone, DesktopLUT refused, or the read-back did not match), the
+    display may still carry the unverified touch-up: tell the human, and run `--run <dir> --abort` again once
+    DesktopLUT is back. Restoring twice is harmless.
+  - `--abort` never takes back a touch-up that was applied (`verify:accept` = `apply`).
+  - A rolled-back `grayscale-wb` run refuses to resume (its result is no longer on the display).
 - Never resume a rolled-back run; start a fresh one.
 - Never run your own enter/exit probe scripts while a run is paused. The capture belongs to the open session.
 

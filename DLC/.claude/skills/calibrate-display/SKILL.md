@@ -29,6 +29,7 @@ the entry point. Where they differ, the guide and `python -m dlc.calibrate --hel
    - Start the patch daemon with the right mode and bit depth, plus an OLED window / black idle if needed.
    - The meter goes on the patch.
 4. **Run and adjudicate.**
+   - Launch every invocation with `--driver claude` (the DLC tab shows who drives the run).
    - Exit code 10 = a seam: read the digest, decide or ask the human, resume with the **same plan flags** +
      `--run <dir> --decide <key>=<option>`.
    - Long measure stages: run in the background and read the `check_in` packets in `runs/<run>/events.jsonl` on a
@@ -37,7 +38,8 @@ the entry point. Where they differ, the guide and `python -m dlc.calibrate --hel
 6. **Tear down every time** (guide §10):
    - finish the run, or abort it with `--run <dir> --abort`;
    - stop the patch daemon;
-   - confirm the restored state;
+   - confirm the restored state (a `display_may_carry_touchup: true` from a `grayscale-wb` rollback means
+     `--run <dir> --abort` again once DesktopLUT is back — guide §9);
    - disarm the pipe unless the human wants it armed;
    - summarise.
 

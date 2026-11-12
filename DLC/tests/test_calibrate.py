@@ -1544,7 +1544,12 @@ def test_a_revert_the_server_could_not_honour_is_not_reported_as_reverted(tmp_pa
 def test_rollback_guard_does_not_ask_for_a_restore_an_in_place_run_never_took(tmp_path: Path):
     """An in-place run (3dlut-only / grayscale-wb) never entered calibration mode, so the automatic
     rollback must not call exit(restore_snapshot=True): on a new server that restores an unrelated
-    earlier session's capture, on a build predating the snapshot store a PREVIOUS run's setup."""
+    earlier session's capture, on a build predating the snapshot store a PREVIOUS run's setup.
+
+    grayscale-wb's own display change is the fine-tune curve. A run whose touch-up never began has
+    none of it on the display (an orphaned preview is cancelled, nothing else); a run that COMMITTED
+    its touch-up (baked before the verify) gets the run's pre-touch-up curve put back and re-baked —
+    still without a snapshot request — and is rolled_back only when the read-back shows it."""
     from types import SimpleNamespace
 
     from dlc.calibrate import _rollback_restore
@@ -1560,6 +1565,28 @@ def test_rollback_guard_does_not_ask_for_a_restore_an_in_place_run_never_took(tm
     assert ("exit", {"restore_snapshot": True}) not in calls
     assert calls == [("cancel", (0, "SDR"))]                  # the orphaned preview, and nothing else
     assert "correction grayscale" in out["hint"]
+
+    # The touch-up was committed: the prior curve goes back (mock = the real store, read back exactly).
+    mock = CalibrationController.mock()
+    mock.set_primaries(0, "SDR", {"rx": 0.64, "ry": 0.33, "gx": 0.30, "gy": 0.60, "bx": 0.15, "by": 0.06})
+    mock.apply_mhc(0, "SDR")
+    mock.set_correction_grayscale(0, "SDR", *_user_curve10(), gamma=2.2)
+    prior = mock.state()["mhc"]["0:SDR"]["correction_grayscale"]
+    mock.grayscale_live_begin(0, "SDR")
+    mock.grayscale_set_live(0, "SDR", *_user_curve10(1.2, 0.8))
+    mock.grayscale_commit(0, "SDR")
+    assert mock.state()["mhc"]["0:SDR"]["correction_grayscale"] != prior
+    exits: list = []
+    real_exit = mock.exit_calibration
+    mock.exit_calibration = lambda **k: exits.append(k) or real_exit(**k)
+    committed = {"flow": "grayscale-wb", "inplace_baseline": {"captured": True},
+                 "grayscale_wb_prior": prior, "grayscale_wb_prior_source": "prior",
+                 "grayscale_wb_baked": {"baked": True}}
+    out = _rollback_restore(mock, committed, monitor=0, mode="SDR", run_root=tmp_path, entered_calibration=False)
+    assert out["status"] == "rolled_back" and out["snapshot_restore"]["requested"] is False
+    assert exits == []
+    assert mock.state()["mhc"]["0:SDR"]["correction_grayscale"] == prior
+    assert committed["grayscale_wb_baked"]["reverted"] is True
 
 
 def test_abort_of_an_in_place_run_never_asks_for_a_restore_even_with_a_session_open(tmp_path: Path):
