@@ -44,6 +44,7 @@
 #include "actions/gs_live.h"
 #include "actions/mhc_edit.h"
 #include "dwm_inject.h"
+#include "dwm_hook_build.h"
 #include "windows_tonemap.h"
 
 #pragma comment(lib, "Advapi32.lib")
@@ -359,6 +360,17 @@ JsonValue BuildHookStateJson() {
         hook.set("routing", routing);
     }
     hook.set("needs_check", JBool(needsCheck));
+    // dwmcore: { version: "10.0.26100.9168"|null, verified_up_to: str|null, tested: bool } — whether this release's
+    // hook was verified against the running Windows' compositor (dwm_hook_build.h). tested false = newer than the
+    // newest verified version, no verified version recorded for its pattern set, or unreadable: the hook still runs.
+    {
+        const DwmHookBuildStatus& b = DwmHookBuildCheck();
+        JsonValue core = JObj();
+        core.set("version", b.running.valid ? JStr(WideToUtf8(FormatDwmcoreVersion(b.running))) : JsonValue());
+        core.set("verified_up_to", b.verified.valid ? JStr(WideToUtf8(FormatDwmcoreVersion(b.verified))) : JsonValue());
+        core.set("tested", JBool(!DwmHookBuildUntested(b)));
+        hook.set("dwmcore", core);
+    }
     // FALD panel files of the hook, per display and mode (dwm_inject.h DwmHookFaldPanels): what it HOLDS (its verdicts
     // say so; held_gen 0 = staged at injection) apart from what was SENT last. A client that switches panel files (a
     // blind A/B) waits until sent_gen is the hook_gen runtime.set_fald_params returned and status is "applied".
