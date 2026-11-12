@@ -409,6 +409,9 @@ class DashboardState:
     # Per-patch content weights of a content-sampled verify set (the run's --verify-patches-file), keyed by the
     # integer code triple a patch_read carries: {codes: (weight, role)}. Set by the publisher; empty otherwise.
     content_weights: dict = field(default_factory=dict)
+    # The probes' own charts (dlc.peak_window / dlc.refresh_probe emit a 'probe_chart' event per update):
+    # {chart name: the latest payload}, served verbatim under charts()['probes'].
+    _probe_charts: dict = field(default_factory=dict)
     # The content-sampled verify file those weights come from: the run header's verify_patches_file, else
     # the scored verification's practical.content_weighted.patch_weights.source (runs before the header had it).
     verify_patches_file: Optional[str] = None
@@ -502,6 +505,8 @@ class DashboardState:
             self.awaiting_decision = (data.get("status") == "paused")
         elif name == Ev.ANOMALY:
             self.last_anomaly = {"stage": ev.stage, "time": ev.time, **data}
+        elif name == "probe_chart":
+            self._probe_charts[str(data.get("chart") or "probe")] = dict(data)
         elif name == Ev.CHECK_IN:
             self.last_check_in = {"stage": ev.stage, "time": ev.time, **data}
         elif name == Ev.STALL:
@@ -1100,6 +1105,8 @@ class DashboardState:
             # through the longest phase. ``active`` tells the frontend to render it over the (frozen)
             # snapshot tiles with a "build preview — not final" badge.
             "build_preview": self._build_preview(hdr=hdr, white=white, gamma=gamma, luminance=luminance),
+            # Probe curves (peak by window, refresh response): the latest payload per chart, as emitted.
+            "probes": dict(self._probe_charts),
             "optimizer": list(self._optimizer_history),
             "white_track": list(self._drift_series()),
             "channel_drift": self._channel_drift(hdr, white),
