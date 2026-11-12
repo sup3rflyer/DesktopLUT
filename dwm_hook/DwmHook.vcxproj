@@ -169,6 +169,7 @@
     <ClInclude Include="hook_log.h" />
     <ClInclude Include="hook_lut.h" />
     <ClInclude Include="hook_render.h" />
+    <ClInclude Include="hook_shader_bytecode.h" />
     <ClInclude Include="hook_shader.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

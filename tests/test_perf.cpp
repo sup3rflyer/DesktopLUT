@@ -49,6 +49,7 @@
 #include "../dwm_hook/hook_lut.h"
 #include "../dwm_hook/hook_fald.h"
 #include "../dwm_hook/hook_shader.h"     // g_shaders (the hook's VS + PS), noiseBytes
+#include "../dwm_hook/hook_shader_bytecode.h"   // what the DLL creates its shaders from
 #include "../src/shader.h"               // g_vsSource, g_psSource, g_analysisCSSource, BuildDesktopGammaLut
 #include "../src/types.h"                // g_blueNoiseData
 #include "../shared/fald_shader.h"
@@ -57,6 +58,7 @@
 #include "../shared/tonemap_curves.h"
 #include "../shared/hdr_dither.h"
 
+#pragma comment(lib, "version.lib")  // the compiler DLL's version (the bytecode test)
 #pragma comment(lib, "dxguid.lib")   // IID_ID3D11Texture2D / IID_ID3D11Device for hook_render.cpp in this exe (the DLL links it)
 
 using perf::Dom;
@@ -179,6 +181,7 @@ struct HookRig {
     int lutN = 0;
     bool ok = false, panel = false, prev25h2 = false;
     double initUs = 0.0;                       // InitializeStuff: in the DLL it runs inside the first hooked present
+    double faldInitUs = 0.0;                   // FaldInitShaders: inside the first present of a monitor that needs the layer
     int fakeCtx[4] = {};                       // the pass only uses the context as a key
 
     HookRig(perf::Dev& dev, int lutSize) : d(dev), lutN(lutSize) {
@@ -240,6 +243,12 @@ struct HookRig {
     // Would the FALD layer run for this frame (a panel file whose lattice fits it)?
     bool FaldAvailable(int W, int H) {
         if (!panel) return false;
+        if (!FaldShadersReady()) {             // as RenderLUT asks for them on that monitor's first present
+            const double t0 = perf::QpcUs();
+            const bool ok = FaldInitShaders(device, deviceContext);
+            faldInitUs = perf::QpcUs() - t0;
+            if (!ok) return false;
+        }
         FaldMonitor* m = FaldAcquire(0, 0, true, (unsigned)W, (unsigned)H, DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (!m) return false;
         FaldReturn(m);
@@ -806,7 +815,7 @@ TEST_CASE("perf: GPU time of the hook's pass (the real RenderLUT) and the overla
         HookRig rig(dev, lutN);
         REQUIRE_MESSAGE(rig.ok, "the hook's InitializeStuff failed (see %TEMP%\\DesktopLUT_dwmhook_test.log)");
         MESSAGE("hook rig: cube " << lutN << "^3, FALD panel file " << std::string(rig.panel ? "loaded" : "NOT available (FALD rows skipped)")
-                << "; InitializeStuff (every shader compiled, inside the first hooked present in the DLL) took " << rig.initUs / 1000.0 << " ms");
+                << "; InitializeStuff (inside the first hooked present in the DLL) took " << rig.initUs / 1000.0 << " ms");
         primTsv << dev.name << "\t0\thook_initialize_stuff\t-\t0\t1\t-1\t-1\t-1\t-1\t" << rig.initUs << "\t" << rig.initUs << "\t" << rig.initUs << "\t" << rig.initUs << "\n";
         ID3D11PixelShader* const productPs = pixelShader;
         std::map<std::string, ID3D11PixelShader*> psCache;
@@ -873,6 +882,12 @@ TEST_CASE("perf: GPU time of the hook's pass (the real RenderLUT) and the overla
                 for (const HookCfg& c : HookConfigs()) {
                     if (c.dom != dom || stop) continue;
                     if (c.fald && !rig.FaldAvailable(W, H)) continue;
+                    if (c.fald && rig.faldInitUs > 0.0) {
+                        MESSAGE("FaldInitShaders (inside the first present of a monitor that needs the layer) took " << rig.faldInitUs / 1000.0 << " ms");
+                        primTsv << dev.name << "\t0\thook_fald_init_shaders\t-\t0\t1\t-1\t-1\t-1\t-1\t" << rig.faldInitUs << "\t" << rig.faldInitUs << "\t"
+                                << rig.faldInitUs << "\t" << rig.faldInitUs << "\n";
+                        rig.faldInitUs = 0.0;
+                    }
                     rig.Apply(c, W, H);
                     struct Run { std::string variant; ID3D11PixelShader* ps; const LutVariant* lv; };
                     std::vector<Run> runs = { { "base", nullptr, nullptr } };
@@ -1097,7 +1112,7 @@ TEST_CASE("perf: output reference manifest (DLUT_PERF_HASH_WRITE / DLUT_PERF_HAS
         int w = W, h = H;
         if (c.fald) {
             w = 3840; h = 2160;                                  // the panel file's lattice
-            if (!rig.FaldAvailable(w, h)) { MESSAGE("hook/" << c.id << ": no FALD panel file - skipped"); continue; }
+            if (!rig.panel) { MESSAGE("hook/" << c.id << ": no FALD panel file - skipped"); continue; }   // (the shaders: RenderLUT asks for them, as in the DLL)
         }
         rig.Apply(c, w, h);
         const DXGI_FORMAT fmt = perf::DomFormat(c.dom);
@@ -1158,3 +1173,192 @@ TEST_CASE("perf: output reference manifest (DLUT_PERF_HASH_WRITE / DLUT_PERF_HAS
         CHECK(missing == 0);
     }
 }
+
+// =================================================================================================================
+// Always-on cases (WARP): the hook pass's safety and correctness rules that the instruments' rig can drive
+// =================================================================================================================
+
+// A device on which the pass's resources cannot be created (feature level 10: no vs_5_0 / ps_5_0). The old code retried
+// InitializeStuff on every present and, with a tone map configured, went on into RenderLUT with a null device (an access
+// violation inside dwm.exe: the DLL is not built with /EHa).
+TEST_CASE("hook: a failed InitializeStuff is final for the injection and every apply path is a clean no-op (WARP, feature level 10)") {
+    ID3D11Device* dev = nullptr; ID3D11DeviceContext* ic = nullptr;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_10_0;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &dev, nullptr, &ic))) {
+        MESSAGE("skipped: no WARP device");
+        return;
+    }
+    UninitializeStuff();
+    std::memset(textureDesc, 0, sizeof(D3D11_TEXTURE2D_DESC) * 2);
+    ResetContextRouting();
+    HookTestResetInitState();
+    const bool prev25h2 = isWindows11_25h2;
+    isWindows11_25h2 = true;
+    g_numMonitorHdrStates = 1;
+    g_monitorHdrStates[0] = { 0, 0, true, 10u, 64u, 64u };
+    s_perfTonemap = {};
+    s_perfTonemap.enabled = true;                       // a tone map: the pass has work, so the old code reached the device
+    s_perfTonemap.sourcePeakNits = 4000.0f; s_perfTonemap.targetPeakNits = 1000.0f;
+    s_perfTonemap.pqSourcePeak = LinearToPQ(0.4f); s_perfTonemap.pqTargetPeak = LinearToPQ(0.1f);
+    g_numLocalFald = 0;
+    ID3D11Texture2D* back = perf::MakeTex(dev, 64, 64, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+    REQUIRE(back != nullptr);
+    RECT full = { 0, 0, 64, 64 };
+    int ctx[4] = {};
+    for (int i = 0; i < 5; i++) CHECK_FALSE(ApplyLUTDirect(ctx, back, &full, 1));
+    CHECK(device == nullptr);
+    CHECK(HookRenderInitFailed());
+    CHECK(HookTestInitAttempts() == 1);                 // one attempt, not one per present
+    CHECK_FALSE(RenderLUT(ctx, back, &full, 1));        // and the pass itself never touches a null device
+    HookTestResetInitState();
+    UninitializeStuff();
+    ResetContextRouting();
+    g_numMonitorHdrStates = 0;
+    s_perfTonemap = {};
+    isWindows11_25h2 = prev25h2;
+    back->Release();
+    ic->ClearState(); ic->Flush(); ic->Release(); dev->Release();
+}
+
+// The dynamic tone map is a function of the whole frame's (smoothed) peak, and the smoothing advances on EVERY present. A
+// scene cut followed by presents that only carry small dirty rects (a caret, a clock) must leave the frame as if every one
+// of those presents had redrawn all of it: the part outside the rects cannot keep the tone map of an older peak.
+TEST_CASE("hook: with a dynamic peak the whole frame follows the peak, not only the present's dirty rects (WARP)") {
+    perf::Dev dev("WARP");
+    if (!dev.ok) { MESSAGE("skipped: no WARP device"); return; }
+    const int W = 480, H = 270;
+    const std::vector<unsigned char> bright = perf::MakeFrame(Kind::Video, Dom::Hdr, W, H);
+    std::vector<unsigned char> dark = bright;           // the same picture at 2 % (peak ~80 nits)
+    for (size_t i = 0; i + 7 < dark.size(); i += 8)
+        for (int c = 0; c < 3; c++) {
+            uint16_t h; std::memcpy(&h, &dark[i + (size_t)c * 2], 2);
+            h = perf::FloatToHalf(perf::HalfToFloat(h) * 0.02f);
+            std::memcpy(&dark[i + (size_t)c * 2], &h, 2);
+        }
+    auto sequence = [&](bool everyPresentFull) {
+        std::vector<unsigned char> out;
+        HookRig rig(dev, 17);
+        REQUIRE(rig.ok);
+        const HookCfg c{ "hdr_tm_dyn", Dom::Hdr, false, true, 0, true, false, false };
+        rig.Apply(c, W, H);
+        const DXGI_FORMAT fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        ID3D11Texture2D* back = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+        ID3D11Texture2D* tb = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE, bright.data(), (UINT)W * 8u);
+        ID3D11Texture2D* td = perf::MakeTex(dev.dev, W, H, fmt, D3D11_BIND_SHADER_RESOURCE, dark.data(), (UINT)W * 8u);
+        REQUIRE((back && tb && td));
+        std::vector<RECT> full = { RECT{ 0, 0, W, H } };
+        std::vector<RECT> caret = { RECT{ W / 5, H * 3 / 10, W / 5 + 2, H * 3 / 10 + 18 }, RECT{ W - 90, H - 40, W - 10, H - 8 } };
+        bool ran = true;
+        for (int i = 0; i < 3; i++) { Compose(dev.ic, back, td, full, W, H, 0); ran = rig.Present(back, full) && ran; }   // a dark scene, settled
+        Compose(dev.ic, back, tb, full, W, H, 0); ran = rig.Present(back, full) && ran;                                    // the cut
+        for (int i = 0; i < 45; i++) {                                                                                     // the peak climbs
+            std::vector<RECT>& rects = everyPresentFull ? full : caret;
+            Compose(dev.ic, back, tb, rects, W, H, 0);
+            ran = rig.Present(back, rects) && ran;
+        }
+        CHECK(ran);
+        dev.ic->Flush();
+        out = perf::ReadBack(dev.dev, dev.ic, back);
+        Rel(td); Rel(tb); Rel(back);
+        dev.ic->ClearState(); dev.ic->Flush();
+        return out;
+    };
+    const std::vector<unsigned char> partial = sequence(false), reference = sequence(true);
+    const perf::Diff d = perf::Compare(reference, partial, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    MESSAGE("small-rect presents vs full redraws after a cut: " << d.differing << " of " << d.total << " components differ, max "
+            << d.maxAbs << " scRGB (" << d.maxAbs * 80.0 << " nits), max relative " << d.maxRel);
+    CHECK(d.differing == 0);
+}
+
+// The hook creates its own shaders from dwm_hook/hook_shader_bytecode.h (nothing is compiled inside DWM's present). That
+// header must be exactly what D3DCompile makes of the current shader text with the calls the DLL used to make - a source
+// edit without regenerating it fails here.
+// Regenerate (then rebuild):  DLUT_HOOK_BYTECODE_WRITE=1 bin/Test/DesktopLUT.Tests.exe -tc="hook: the shipped shader bytecode*"
+namespace {
+std::string CompilerVersion() {
+    char path[MAX_PATH] = {};
+    HMODULE m = GetModuleHandleA("D3DCompiler_47.dll");
+    if (!m || !GetModuleFileNameA(m, path, MAX_PATH)) return "unknown";
+    DWORD dummy = 0;
+    const DWORD n = GetFileVersionInfoSizeA(path, &dummy);
+    if (!n) return "unknown";
+    std::vector<unsigned char> buf(n);
+    VS_FIXEDFILEINFO* fi = nullptr; UINT len = 0;
+    if (!GetFileVersionInfoA(path, 0, n, buf.data()) || !VerQueryValueA(buf.data(), "\\", (void**)&fi, &len) || !fi) return "unknown";
+    char v[64];
+    snprintf(v, sizeof(v), "%u.%u.%u.%u", HIWORD(fi->dwFileVersionMS), LOWORD(fi->dwFileVersionMS), HIWORD(fi->dwFileVersionLS), LOWORD(fi->dwFileVersionLS));
+    return v;
+}
+}  // namespace
+
+TEST_CASE("hook: the shipped shader bytecode is D3DCompile of the current source") {
+    struct Item { const char* array; const char* src; size_t len; const char* name; const char* entry; const char* target; const unsigned char* have; size_t haveLen; };
+    const Item items[] = {   // the calls hook_render.cpp InitializeStuff made
+        { "g_hookVsBytecode", g_shaders, sizeof g_shaders, nullptr, "VS", "vs_5_0", g_hookVsBytecode, sizeof(g_hookVsBytecode) },
+        { "g_hookPsBytecode", g_shaders, sizeof g_shaders, nullptr, "PS", "ps_5_0", g_hookPsBytecode, sizeof(g_hookPsBytecode) },
+        { "g_hookPeakReduceCsBytecode", g_peakReduceCSSource, strlen(g_peakReduceCSSource), "PeakReduceCS", "main", "cs_5_0", g_hookPeakReduceCsBytecode, sizeof(g_hookPeakReduceCsBytecode) },
+        { "g_hookPeakSmoothCsBytecode", g_peakSmoothCSSource, strlen(g_peakSmoothCSSource), "PeakSmoothCS", "main", "cs_5_0", g_hookPeakSmoothCsBytecode, sizeof(g_hookPeakSmoothCsBytecode) },
+    };
+    std::vector<std::vector<unsigned char>> made;
+    for (const Item& it : items) {
+        ID3DBlob* blob = nullptr; ID3DBlob* msgs = nullptr;
+        const HRESULT hr = D3DCompile(it.src, it.len, it.name, nullptr, nullptr, it.entry, it.target, 0, 0, &blob, &msgs);
+        if (msgs) msgs->Release();
+        REQUIRE_MESSAGE((SUCCEEDED(hr) && blob), it.array << " does not compile");
+        const unsigned char* b = (const unsigned char*)blob->GetBufferPointer();
+        made.emplace_back(b, b + blob->GetBufferSize());
+        blob->Release();
+    }
+    const std::string compiler = CompilerVersion();
+
+    if (!perf::Env("DLUT_HOOK_BYTECODE_WRITE").empty()) {
+        char exe[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exe, MAX_PATH);
+        std::string dir(exe), file;
+        for (int up = 0; up < 8 && file.empty(); up++) {
+            const size_t slash = dir.find_last_of("\\/");
+            if (slash == std::string::npos) break;
+            dir.resize(slash);
+            if (GetFileAttributesA((dir + "\\dwm_hook\\hook_shader.h").c_str()) != INVALID_FILE_ATTRIBUTES) file = dir + "\\dwm_hook\\hook_shader_bytecode.h";
+        }
+        REQUIRE_MESSAGE(!file.empty(), "dwm_hook/hook_shader.h not found above " << exe);
+        std::string text =
+            "// GENERATED - do not edit. The DWM hook's own shaders as bytecode: D3DCompile of dwm_hook/hook_shader.h (VS, PS) and\n"
+            "// shared/peak_detect.h (the two peak-detection passes), entry points / targets / flags as hook_render.cpp compiled them\n"
+            "// at run time until 2026-11. InitializeStuff creates the shaders from these arrays, so nothing is compiled inside DWM's\n"
+            "// present. tests/test_perf.cpp (\"hook: the shipped shader bytecode is D3DCompile of the current source\") fails when this\n"
+            "// file and the shader text disagree. After ANY edit of that text regenerate and rebuild:\n"
+            "//   DLUT_HOOK_BYTECODE_WRITE=1 bin/Test/DesktopLUT.Tests.exe -tc=\"hook: the shipped shader bytecode*\"\n"
+            "#pragma once\n\n"
+            "#define HOOK_BYTECODE_COMPILER \"" + compiler + "\"   // the d3dcompiler_47.dll that made it (file version)\n";
+        for (size_t k = 0; k < made.size(); k++) {
+            text += std::string("\nstatic const unsigned char ") + items[k].array + "[" + std::to_string(made[k].size()) + "] = {";
+            char b[8];
+            for (size_t i = 0; i < made[k].size(); i++) {
+                if (i % 24 == 0) text += "\n\t";
+                snprintf(b, sizeof(b), "0x%02X,", made[k][i]);
+                text += b;
+            }
+            text += "\n};\n";
+        }
+        REQUIRE(perf::SaveBytes(file, text.data(), text.size()));
+        MESSAGE("wrote " << file << " (compiler " << compiler << "): rebuild the DLL and this exe");
+        return;
+    }
+
+    bool allEqual = true;
+    for (size_t k = 0; k < made.size(); k++)
+        if (made[k].size() != items[k].haveLen || std::memcmp(made[k].data(), items[k].have, made[k].size()) != 0) {
+            allEqual = false;
+            MESSAGE(std::string(items[k].array) << ": the header has " << items[k].haveLen << " bytes, the current source compiles to " << made[k].size()
+                    << (made[k].size() == items[k].haveLen ? " (different bytes)" : ""));
+        }
+    if (!allEqual && compiler != HOOK_BYTECODE_COMPILER) {
+        // another d3dcompiler_47.dll than the one that made the header: its output may differ for the same text, so this
+        // machine cannot tell an edited shader from a different compiler. The machine that regenerates the header can.
+        MESSAGE("the header was made by d3dcompiler " << std::string(HOOK_BYTECODE_COMPILER) << ", this machine has " << compiler << ": not judged here");
+        return;
+    }
+    CHECK_MESSAGE(allEqual, "dwm_hook/hook_shader_bytecode.h is not the current shader source: regenerate it (the command is above this test) and rebuild");
+}
+

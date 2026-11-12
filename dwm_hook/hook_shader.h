@@ -10,6 +10,22 @@
 #include "../shared/hdr_dither.h"      // DLUT_HDR_DITHER_HLSL (post-LUT TPDF dither, shared with the overlay)
 #include "../shared/mhc_scanout_hlsl.h" // DLUT_MHC_SCANOUT_HLSL (the live edit preview's MHC2 stage, shared with the overlay)
 
+// The dither tile as the pass samples it (t2, R32G32B32A32_FLOAT, NOISE_SIZE x NOISE_SIZE, point + wrap): r = the tile
+// value u = (b + 0.5) / 256 at that position, g = the tile half a tile to the right, b = half a tile down, a = 0. The HDR
+// output dither wants three decorrelated samples per pixel; they used to be three fetches of a one-channel tile at
+// those two fixed offsets - the same three values, now in one texel (rgba: NOISE_SIZE * NOISE_SIZE * 4 floats).
+inline void HookBuildNoiseTexels(float* rgba) {
+	const int half = NOISE_SIZE / 2;
+	for (int y = 0; y < NOISE_SIZE; y++)
+		for (int x = 0; x < NOISE_SIZE; x++) {
+			float* t = rgba + ((size_t)y * NOISE_SIZE + x) * 4;
+			t[0] = (float)((noiseBytes[y][x] + 0.5) / 256);
+			t[1] = (float)((noiseBytes[y][(x + half) % NOISE_SIZE] + 0.5) / 256);
+			t[2] = (float)((noiseBytes[(y + half) % NOISE_SIZE][x] + 0.5) / 256);
+			t[3] = 0.0f;
+		}
+}
+
 // Main vertex + pixel shader (VS, PS) — handles HDR/SDR/ACM color modes, ICtCp tonemapping, 3D LUT, output dither
 static char g_shaders[] = R"(
 struct VS_INPUT {
@@ -214,13 +230,11 @@ float3 ApplyTonemappingICtCp(float3 ictcp) {
 }
 
 )" DLUT_HDR_DITHER_HLSL R"(
-// Three decorrelated blue-noise samples per pixel from the static tile (texel centres, (b + 0.5) / 256): the
-// half-tile offsets put the R/G/B samples 32 texels apart (pairwise correlation <= 0.02 on this tile).
+// Three decorrelated blue-noise samples per pixel from the static tile (texel centres, (b + 0.5) / 256): the tile
+// itself, half a tile to the right and half a tile down, 32 texels apart (pairwise correlation <= 0.02 on this
+// tile) - one fetch: the texel carries all three (HookBuildNoiseTexels above).
 float3 HdrDitherNoise(float2 pos) {
-	float2 uv = pos / )" STRINGIFY(NOISE_SIZE) R"(;
-	return float3(noiseTex.Sample(noiseSmp, uv).x,
-	              noiseTex.Sample(noiseSmp, uv + float2(0.5, 0.0)).x,
-	              noiseTex.Sample(noiseSmp, uv + float2(0.0, 0.5)).x);
+	return noiseTex.Sample(noiseSmp, pos / )" STRINGIFY(NOISE_SIZE) R"().xyz;
 }
 
 )" DLUT_MHC_SCANOUT_HLSL R"(

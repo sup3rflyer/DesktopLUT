@@ -2,6 +2,7 @@
 #include "hook_render.h"
 #include "hook_log.h"
 #include "hook_shader.h"
+#include "hook_shader_bytecode.h"
 #include "hook_lut.h"
 #include "hook_fald.h"
 #include "noise.h"
@@ -407,8 +408,13 @@ const char* CtxPosMethodName(int method) {
 static const char* RoutingFilePath() {
 	static char path[MAX_PATH] = {0};
 	if (path[0] == '\0') {
+#ifdef DLUT_HOOK_TESTING   // the hook's sources compiled into the test exe: never the real hook's folder
+		char pattern[MAX_PATH] = {0};
+		snprintf(pattern, sizeof(pattern), "%%TEMP%%\\DesktopLUT_hook_routing_test_%lu.dat", (unsigned long)GetCurrentProcessId());
+#else
 		char pattern[MAX_PATH] = {0};
 		snprintf(pattern, sizeof(pattern), DWM_HOOK_ROUTING_FILE_FMT_A, (unsigned long)GetCurrentProcessId());
+#endif
 		ExpandEnvironmentStringsA(pattern, path, sizeof(path));
 	}
 	return path;
@@ -704,6 +710,40 @@ static void DrawRectangleTex(struct tagRECT* rect, float texW, float texH)
 
 void UninitializeStuff();  // Forward declaration for error cleanup
 
+// The apply paths initialise on their first present, ONCE per injection. A failed InitializeStuff has already run
+// UninitializeStuff: the device is gone and so are the cubes parsed at attach and the FALD panel files (their staging
+// folder is deleted right after injection: there is nothing to read them from again). So a later attempt could at best
+// "succeed" into a pass without the monitors' cubes - a wrong picture reported as a working hook - and every attempt is a
+// blocking call inside DWM's present. No retry here: the pass stays off, every apply path returns "not applied", the log
+// says so once, and HookRenderInitFailed() tells dllmain.cpp; the host's watchdog re-injection (bounded, then its
+// fall-back to the overlay) is the retry, with a freshly staged set.
+static bool s_initFailed = false;
+// The FALD layer's shaders (hook_fald.cpp compiles them from source, about a second) are asked for once per injection, by
+// the first present of a monitor that needs the layer - not by InitializeStuff, where every hook user paid for them.
+static bool s_faldInitTried = false;
+static int s_initAttempts = 0;
+
+bool HookRenderInitFailed() { return s_initFailed; }
+#ifdef DLUT_HOOK_TESTING
+int HookTestInitAttempts() { return s_initAttempts; }
+void HookTestResetInitState() { s_initFailed = false; s_initAttempts = 0; }
+#endif
+
+void InitializeStuff(ID3D11Device* inputDevice);
+
+// True when the pass's resources exist (created now if this is the injection's first present with a device).
+static bool HookEnsureInitialized(ID3D11Device* dev)
+{
+	if (device && deviceContext) return true;
+	if (s_initFailed || !dev) return false;
+	s_initAttempts++;
+	InitializeStuff(dev);
+	if (device && deviceContext) return true;
+	s_initFailed = true;
+	log_to_file("ERROR: the hook's rendering resources could not be created - LUT / tone map / FALD are OFF until the next injection (see the lines above)");
+	return false;
+}
+
 void ReleaseMhcPreviewMapping() {
 	if (s_mhcView) { UnmapViewOfFile(s_mhcView); s_mhcView = NULL; }
 	if (s_mhcMap) { CloseHandle(s_mhcMap); s_mhcMap = NULL; }
@@ -845,23 +885,11 @@ void InitializeStuff(ID3D11Device* inputDevice)
 		LOG_ADDRESS("The Device context is located at address: ", deviceContext)
 
 		{
-			ID3DBlob* vsBlob;
-			ID3DBlob* compile_error_interface;
-			{
-				char shaderMsg[64];
-				snprintf(shaderMsg, sizeof(shaderMsg), "Compiling shaders (%zu bytes)", sizeof g_shaders);
-				LOG_ONLY_ONCE(shaderMsg)
-			}
-			EXECUTE_D3DCOMPILE_WITH_LOG(
-				D3DCompile(g_shaders, sizeof g_shaders, NULL, NULL, NULL, "VS", "vs_5_0", 0, 0, &vsBlob, &
-					compile_error_interface), compile_error_interface)
-
-
-			LOG_ONLY_ONCE("Vertex shader compiled successfully")
-			EXECUTE_WITH_LOG(device->CreateVertexShader(vsBlob->GetBufferPointer(),
-				vsBlob->GetBufferSize(), NULL, &vertexShader))
-
-
+			// The pass's shaders are created from shipped bytecode (hook_shader_bytecode.h: D3DCompile of hook_shader.h's and
+			// peak_detect.h's text, which tests/test_perf.cpp asserts byte for byte): this function runs inside DWM's present, and
+			// compiling there froze the desktop for the length of the compile at every injection. No compile-from-source fallback:
+			// a device that refuses this bytecode would refuse the same compile's output.
+			EXECUTE_WITH_LOG(device->CreateVertexShader(g_hookVsBytecode, sizeof(g_hookVsBytecode), NULL, &vertexShader))
 			LOG_ONLY_ONCE("Vertex shader created successfully")
 			D3D11_INPUT_ELEMENT_DESC inputElementDesc[] =
 			{
@@ -872,22 +900,9 @@ void InitializeStuff(ID3D11Device* inputDevice)
 				}
 			};
 			EXECUTE_WITH_LOG(device->CreateInputLayout(inputElementDesc, ARRAYSIZE(inputElementDesc),
-				vsBlob->GetBufferPointer(),
-				vsBlob->GetBufferSize(), &inputLayout))
-
-			vsBlob->Release();
-		}
-		{
-			ID3DBlob* psBlob;
-			ID3DBlob* compile_error_interface;
-			EXECUTE_D3DCOMPILE_WITH_LOG(
-				D3DCompile(g_shaders, sizeof g_shaders, NULL, NULL, NULL, "PS", "ps_5_0", 0, 0, &psBlob, &
-					compile_error_interface), compile_error_interface)
-
-			LOG_ONLY_ONCE("Pixel shader compiled successfully")
-			EXECUTE_WITH_LOG(device->CreatePixelShader(psBlob->GetBufferPointer(),
-			                                          psBlob->GetBufferSize(), NULL, &pixelShader))
-			psBlob->Release();
+				g_hookVsBytecode, sizeof(g_hookVsBytecode), &inputLayout))
+			EXECUTE_WITH_LOG(device->CreatePixelShader(g_hookPsBytecode, sizeof(g_hookPsBytecode), NULL, &pixelShader))
+			LOG_ONLY_ONCE("Pixel shader created successfully")
 		}
 		{
 			stride = 4 * sizeof(float);
@@ -949,25 +964,18 @@ void InitializeStuff(ID3D11Device* inputDevice)
 			desc.Height = NOISE_SIZE;
 			desc.MipLevels = 1;
 			desc.ArraySize = 1;
-			desc.Format = DXGI_FORMAT_R32_FLOAT;
+			desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;   // the tile and its two half-tile shifts in one texel (hook_shader.h)
 			desc.SampleDesc.Count = 1;
 			desc.SampleDesc.Quality = 0;
 			desc.Usage = D3D11_USAGE_IMMUTABLE;
 			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 
-			float noise[NOISE_SIZE][NOISE_SIZE];
-
-			for (int i = 0; i < NOISE_SIZE; i++)
-			{
-				for (int j = 0; j < NOISE_SIZE; j++)
-				{
-					noise[i][j] = (noiseBytes[i][j] + 0.5) / 256;
-				}
-			}
+			static float noise[NOISE_SIZE * NOISE_SIZE * 4];   // 64 KB: not on the present thread's stack
+			HookBuildNoiseTexels(noise);
 
 			D3D11_SUBRESOURCE_DATA initData;
 			initData.pSysMem = noise;
-			initData.SysMemPitch = sizeof(noise[0]);
+			initData.SysMemPitch = NOISE_SIZE * 4 * sizeof(float);
 
 			ID3D11Texture2D* tex;
 			EXECUTE_WITH_LOG(device->CreateTexture2D(&desc, &initData, &tex))
@@ -1061,39 +1069,22 @@ void InitializeStuff(ID3D11Device* inputDevice)
 
 			LOG_ONLY_ONCE("Peak detection resources created")
 		}
-		// Compile peak detection compute shaders — both or neither: the pixel shader's dynamic-peak
+		// Peak detection compute shaders (shipped bytecode, as above) - both or neither: the pixel shader's dynamic-peak
 		// input is only valid when the smoothing pass runs after the reduction.
 		{
-			auto compileCS = [](const char* src, const char* name, ID3D11ComputeShader** out) {
-				ID3DBlob* csBlob = NULL;
-				ID3DBlob* csError = NULL;
-				HRESULT hr = D3DCompile(src, strlen(src), name, NULL, NULL, "main", "cs_5_0", 0, 0, &csBlob, &csError);
-				if (SUCCEEDED(hr) && csBlob) {
-					hr = device->CreateComputeShader(csBlob->GetBufferPointer(), csBlob->GetBufferSize(), NULL, out);
-					csBlob->Release();
-				}
-				if (FAILED(hr) && csError) {
-					std::stringstream ss;
-					ss << name << " compile error: " << (char*)csError->GetBufferPointer();
-					log_to_file(ss.str().c_str());
-				}
-				if (csError) csError->Release();
-				return SUCCEEDED(hr);
-			};
-			if (compileCS(g_peakReduceCSSource, "PeakReduceCS", &peakDetectCS) &&
-				compileCS(g_peakSmoothCSSource, "PeakSmoothCS", &peakSmoothCS)) {
-				LOG_ONLY_ONCE("Peak detection compute shaders compiled OK")
+			HRESULT hr = device->CreateComputeShader(g_hookPeakReduceCsBytecode, sizeof(g_hookPeakReduceCsBytecode), NULL, &peakDetectCS);
+			if (SUCCEEDED(hr))
+				hr = device->CreateComputeShader(g_hookPeakSmoothCsBytecode, sizeof(g_hookPeakSmoothCsBytecode), NULL, &peakSmoothCS);
+			if (SUCCEEDED(hr) && peakDetectCS && peakSmoothCS) {
+				LOG_ONLY_ONCE("Peak detection compute shaders created OK")
 			} else {
 				RELEASE_IF_NOT_NULL(peakDetectCS)
 				RELEASE_IF_NOT_NULL(peakSmoothCS)
-				log_to_file("WARNING: Peak detection CS compilation failed — dynamic tonemapping disabled");
+				log_to_file("WARNING: Peak detection compute shaders could not be created - dynamic tonemapping disabled");
 			}
 		}
 
-		// FALD correction shaders. Non-fatal by design: a failure here costs the correction layer
-		// and nothing else, and every FALD call site checks FaldShadersReady() first.
-		if (!FaldInitShaders(device, deviceContext))
-			log_to_file("WARNING: FALD shader init failed — the correction layer stays off");
+		// (The FALD layer's shaders are not compiled here: RenderLUT asks for them when a monitor needs the layer.)
 	}
 	catch (std::exception& ex)
 	{
@@ -1145,6 +1136,7 @@ void UninitializeStuff()
 	// FALD: the per-monitor resources first (they hold views onto DWM's device), then the shaders.
 	FaldReleaseAll();
 	FaldReleaseShaders();
+	s_faldInitTried = false;
 	ReleaseBeaconProbes();
 	// Snapshot + clear first so a concurrent reader sees an empty list before we free.
 	int oldNumLuts = numLuts;
@@ -1165,6 +1157,7 @@ void UninitializeStuff()
 
 bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagRECT* rects, int numRects)
 {
+	if (!device || !deviceContext) return false;   // no resources (a failed init): nothing is applied, nothing is dereferenced
 	ID3D11RenderTargetView* renderTargetView;
 
 	D3D11_TEXTURE2D_DESC newBackBufferDesc;
@@ -1285,6 +1278,19 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		FaldMonitor* m = NULL;
 		~FaldBorrowScope() { if (m) FaldReturn(m); }
 	} faldBorrow;
+	// The layer's shaders, when this monitor needs the layer: its switch is on, or the host announced a live panel file for
+	// it (the delivery below is only taken with the shaders ready). One attempt per injection: FaldInitShaders failing leaves
+	// the layer off for this attach (hook_fald.h), and every FALD call site checks FaldShadersReady().
+	if (index != -1 && !s_faldInitTried && !FaldShadersReady())
+	{
+		const LocalFaldParams* ip = FindFaldForMonitor(monLeft, monTop);
+		if (ip && (DwmHookFaldEnabled(ip->flags) || (ip->hasTuning && (ip->tuning.panelGen[0] || ip->tuning.panelGen[1]))))
+		{
+			s_faldInitTried = true;
+			if (!FaldInitShaders(device, deviceContext))
+				log_to_file("WARNING: FALD shader init failed - the correction layer stays off");
+		}
+	}
 	// A panel file the host delivered live for this monitor (either mode) since the last present: taken into the
 	// panel table now, so FaldAcquire below swaps it in before any pass of this present (hook_fald.h).
 	if (index != -1 && FaldShadersReady())
@@ -1632,6 +1638,20 @@ bool RenderLUT(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct tagREC
 		}
 		else
 		{
+			// The dynamic tone map is a function of the whole frame's smoothed peak, and the smoothing advances on every
+			// present: when the peak moved, the pixels OUTSIDE this present's rects are wrong too (they keep the tone map
+			// of the peak they were last drawn with - after a scene cut followed by small-rect presents, up to 177 nits
+			// off in tests/test_perf.cpp's case). So the whole frame is redrawn from this monitor's source copy on exactly
+			// those presents: the smoothing pass's draw arguments (4 vertices; 1 instance iff its output changed, bit for
+			// bit; 0 otherwise), decided on the GPU with no readback - the word the FALD path already draws by. Only from
+			// a PRIMED per-monitor copy (every pixel refreshed since it went stale): the shared staging texture and an
+			// unprimed copy hold other pixels outside the rects.
+			if (peakSlot && peakArgsBuf && srcSRV == peakSlot->srcSRV && peakSlot->srcCover.Primed())
+			{
+				struct tagRECT fullFrame = { 0, 0, (LONG)backBufferDesc.Width, (LONG)backBufferDesc.Height };
+				SetRectangleTex(&fullFrame, srcW, srcH);
+				deviceContext->DrawInstancedIndirect(peakArgsBuf, 0);
+			}
 			// The rects were copied into srcSRV's texture above, before the peak pass.
 			for (int i = 0; i < numRects; i++)
 				DrawRectangleTex(&rects[i], srcW, srcH);
@@ -1786,11 +1806,13 @@ bool ApplyLUT(void* cOverlayContext, IDXGISwapChain* swapChain, struct tagRECT* 
 
 		if (!device)
 		{
+			if (s_initFailed) return false;   // off until the next injection (HookEnsureInitialized)
 			LOG_ONLY_ONCE("Initializing stuff in ApplyLUT")
-			ID3D11Device* dev;
+			ID3D11Device* dev = NULL;
 			EXECUTE_WITH_LOG(swapChain->GetDevice(IID_ID3D11Device, (void**)&dev))
-			InitializeStuff(dev);
-			dev->Release();
+			const bool ready = HookEnsureInitialized(dev);
+			if (dev) dev->Release();
+			if (!ready) return false;
 		}
 		LOG_ONLY_ONCE("Init done, continuing with LUT application")
 
@@ -2176,11 +2198,13 @@ bool ApplyLUTDirect(void* cOverlayContext, ID3D11Texture2D* backBuffer, struct t
 	{
 		if (!device)
 		{
+			if (s_initFailed) return false;   // off until the next injection (HookEnsureInitialized)
 			LOG_ONLY_ONCE("Initializing from texture device (25H2)")
-			ID3D11Device* dev;
+			ID3D11Device* dev = NULL;
 			backBuffer->GetDevice(&dev);
-			InitializeStuff(dev);
-			dev->Release();
+			const bool ready = HookEnsureInitialized(dev);
+			if (dev) dev->Release();
+			if (!ready) return false;
 		}
 
 		// 25H2: resolve this context's monitor position — monitors.dat by back-buffer size, then
