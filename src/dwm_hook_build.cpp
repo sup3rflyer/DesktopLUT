@@ -88,29 +88,15 @@ const DwmHookBuildStatus& DwmHookBuildCheck() {
 }
 
 std::wstring DwmHookBuildTooltip(const DwmHookBuildStatus& s) {
-    std::wstring first;
-    switch (s.verdict) {
-    case DwmcoreVerdict::Newer:
-        first = L"Not tested with this Windows update (dwmcore " + FormatDwmcoreVersion(s.running) + L", tested up to " +
-                FormatDwmcoreVersion(s.verified) + L").";
-        break;
-    case DwmcoreVerdict::NoBaseline:
-        first = L"Not tested on this Windows version (dwmcore " + FormatDwmcoreVersion(s.running) + L").";
-        break;
-    case DwmcoreVerdict::Unknown:
-        first = L"Could not read this Windows' dwmcore.dll version.";
-        break;
-    case DwmcoreVerdict::Verified:
-        return {};
-    }
-    return first + L"\nIf colours look wrong, turn DWM HOOK off.";
+    if (!DwmHookBuildNewerThanVerified(s)) return {};
+    return L"Not tested with this Windows update (dwmcore " + FormatDwmcoreVersion(s.running) + L", tested up to " +
+           FormatDwmcoreVersion(s.verified) + L").\nIf colours look wrong, turn DWM HOOK off.";
 }
 
 std::wstring DwmHookBuildDetail(const DwmHookBuildStatus& s) {
     std::wstring d = L"Windows build " + std::to_wstring(s.osBuild) + L", dwmcore.dll " +
                      FormatDwmcoreVersion(s.running) + L". The hook's patterns for " + DwmHookBranchName(s.branch);
-    d += s.verified.valid ? L" were verified up to dwmcore " + FormatDwmcoreVersion(s.verified) + L"."
-                          : std::wstring(L" have no verified dwmcore version recorded for this release.");
+    d += L" were verified up to dwmcore " + FormatDwmcoreVersion(s.verified) + L".";
     d += L"\n\nThe hook still runs. A Windows update can change the desktop compositor so that colours come out "
          L"wrong (a tint, flicker) instead of the hook failing. If colours look wrong, switch DWM HOOK off in "
          L"Settings: the overlay then applies your corrections.";

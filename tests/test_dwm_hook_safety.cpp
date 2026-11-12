@@ -200,22 +200,28 @@ TEST_CASE("dwmcore version: compare, branch and verdict") {
     CHECK(MakeDwmHookBuildStatus(26200, MakeDwmcoreVersion(10, 0, 26100, 8655)).verdict == DwmcoreVerdict::Verified);
     const DwmHookBuildStatus newer = MakeDwmHookBuildStatus(26200, MakeDwmcoreVersion(10, 0, 26100, 9300));
     CHECK(newer.verdict == DwmcoreVerdict::Newer);
-    CHECK(DwmHookBuildUntested(newer));
+    CHECK(DwmHookBuildNewerThanVerified(newer));
+    CHECK(std::string(DwmcoreVerdictName(newer.verdict)) == "newer");
     CHECK(newer.verified.valid);
     CHECK(DwmHookBuildTooltip(newer).find(L"10.0.26100.9300") != std::wstring::npos);
     CHECK(DwmHookBuildTooltip(newer).find(L"turn DWM HOOK off") != std::wstring::npos);
     CHECK(DwmHookBuildDetail(newer).find(L"10.0.26100.9168") != std::wstring::npos);
     // A future feature update with a dwmcore build of its own, on the 25H2 patterns.
     CHECK(MakeDwmHookBuildStatus(26300, MakeDwmcoreVersion(10, 0, 26300, 100)).verdict == DwmcoreVerdict::Newer);
-    // Branches with no verified version recorded.
-    CHECK(MakeDwmHookBuildStatus(26100, verified).verdict == DwmcoreVerdict::NoBaseline);
-    CHECK(MakeDwmHookBuildStatus(22631, MakeDwmcoreVersion(10, 0, 22621, 4000)).verdict == DwmcoreVerdict::NoBaseline);
+    // Branches with no verified version recorded: reported (no_baseline), no notice (nothing the user can act on).
+    const DwmHookBuildStatus win11 = MakeDwmHookBuildStatus(22631, MakeDwmcoreVersion(10, 0, 22621, 4000));
+    CHECK(win11.verdict == DwmcoreVerdict::NoBaseline);
+    CHECK_FALSE(DwmHookBuildNewerThanVerified(win11));
+    CHECK(DwmHookBuildTooltip(win11).empty());
+    CHECK(std::string(DwmcoreVerdictName(win11.verdict)) == "no_baseline");
     CHECK(MakeDwmHookBuildStatus(19045, MakeDwmcoreVersion(10, 0, 19041, 5000)).verdict == DwmcoreVerdict::NoBaseline);
-    // Unreadable: said so, never claimed verified.
+    // Unreadable: reported (unknown), never claimed verified, no notice.
     const DwmHookBuildStatus unknown = MakeDwmHookBuildStatus(26200, DwmcoreVersion{});
     CHECK(unknown.verdict == DwmcoreVerdict::Unknown);
-    CHECK(DwmHookBuildUntested(unknown));
+    CHECK_FALSE(DwmHookBuildNewerThanVerified(unknown));
+    CHECK(DwmHookBuildTooltip(unknown).empty());
     // Verified: no notice text at all.
+    CHECK_FALSE(DwmHookBuildNewerThanVerified(MakeDwmHookBuildStatus(26200, verified)));
     CHECK(DwmHookBuildTooltip(MakeDwmHookBuildStatus(26200, verified)).empty());
 }
 

@@ -360,15 +360,19 @@ JsonValue BuildHookStateJson() {
         hook.set("routing", routing);
     }
     hook.set("needs_check", JBool(needsCheck));
-    // dwmcore: { version: "10.0.26100.9168"|null, verified_up_to: str|null, tested: bool } — whether this release's
-    // hook was verified against the running Windows' compositor (dwm_hook_build.h). tested false = newer than the
-    // newest verified version, no verified version recorded for its pattern set, or unreadable: the hook still runs.
+    // dwmcore: { version: "10.0.26100.9168"|null, verified_up_to: str|null, tested: bool|null,
+    //            verdict: "verified"|"newer"|"no_baseline"|"unknown" } — whether this release's hook was verified
+    // against the running Windows' compositor (dwm_hook_build.h). tested true = at or below a verified version, false =
+    // newer than the newest verified one (the UI notice), null = no verified version recorded for its pattern set, or
+    // the version unreadable. The hook runs in every case.
     {
         const DwmHookBuildStatus& b = DwmHookBuildCheck();
         JsonValue core = JObj();
         core.set("version", b.running.valid ? JStr(WideToUtf8(FormatDwmcoreVersion(b.running))) : JsonValue());
         core.set("verified_up_to", b.verified.valid ? JStr(WideToUtf8(FormatDwmcoreVersion(b.verified))) : JsonValue());
-        core.set("tested", JBool(!DwmHookBuildUntested(b)));
+        core.set("tested", b.verdict == DwmcoreVerdict::Verified ? JBool(true)
+                         : b.verdict == DwmcoreVerdict::Newer ? JBool(false) : JsonValue());
+        core.set("verdict", JStr(DwmcoreVerdictName(b.verdict)));
         hook.set("dwmcore", core);
     }
     // FALD panel files of the hook, per display and mode (dwm_inject.h DwmHookFaldPanels): what it HOLDS (its verdicts

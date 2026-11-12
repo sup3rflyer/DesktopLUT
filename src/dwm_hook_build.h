@@ -5,9 +5,10 @@
 // build number (dwm_hook/dllmain.cpp: >= 26200 the 25H2 set, >= 26100 24H2, >= 22000 Windows 11, else Windows 10),
 // with no upper bound. A monthly update can move dwmcore's internals while every pattern still matches: the Aug 2026
 // update put a CMY tint over the whole desktop instead of failing (DWM_HOOK_REPAIR.md). So the host compares the
-// running dwmcore.dll's file version with the newest one this release was verified against, per branch. Newer (or a
-// branch with no recorded verification) still injects; the interface says so (Settings, DWM HOOK row; one Events
-// entry) and so does the calibration pipe (state.get hook.dwmcore).
+// running dwmcore.dll's file version with the newest one this release was verified against, per branch. Newer still
+// injects; the interface says so (Settings, DWM HOOK row; one Events entry) and so does the calibration pipe
+// (state.get hook.dwmcore). A branch with no recorded verification, or an unreadable version, shows nothing (a
+// permanent notice the user can do nothing about tells them nothing); the pipe reports it as unknown.
 //
 // REPAIRING OR RE-VERIFYING THE HOOK: update kVerifiedDwmcore below to the dwmcore.dll version it was checked on
 // (the raw file version, `(Get-Item C:\Windows\System32\dwmcore.dll).VersionInfo.FileVersionRaw`: the FileVersion
@@ -90,7 +91,19 @@ struct DwmHookBuildStatus {
     DwmHookBranch branch = DwmHookBranch::Win11_25H2;
 };
 
-inline bool DwmHookBuildUntested(const DwmHookBuildStatus& s) { return s.verdict != DwmcoreVerdict::Verified; }
+// The notice (the DWM HOOK row, the Events entry): only a dwmcore newer than one this release actually verified.
+inline bool DwmHookBuildNewerThanVerified(const DwmHookBuildStatus& s) { return s.verdict == DwmcoreVerdict::Newer; }
+
+// state.get hook.dwmcore.verdict: "verified" | "newer" | "no_baseline" | "unknown".
+inline const char* DwmcoreVerdictName(DwmcoreVerdict v) {
+    switch (v) {
+    case DwmcoreVerdict::Verified:   return "verified";
+    case DwmcoreVerdict::Newer:      return "newer";
+    case DwmcoreVerdict::NoBaseline: return "no_baseline";
+    case DwmcoreVerdict::Unknown:    return "unknown";
+    }
+    return "unknown";
+}
 
 // Pure: the status for a Windows build and a dwmcore version.
 DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion& running);
@@ -100,5 +113,5 @@ DwmHookBuildStatus MakeDwmHookBuildStatus(uint32_t osBuild, const DwmcoreVersion
 const DwmHookBuildStatus& DwmHookBuildCheck();
 
 // The tooltip of the DWM HOOK row's notice (two short lines) and the Events entry's detail (a few more facts).
-std::wstring DwmHookBuildTooltip(const DwmHookBuildStatus& s);   // empty when verified
+std::wstring DwmHookBuildTooltip(const DwmHookBuildStatus& s);   // empty unless Newer
 std::wstring DwmHookBuildDetail(const DwmHookBuildStatus& s);

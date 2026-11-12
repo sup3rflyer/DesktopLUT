@@ -1118,7 +1118,7 @@ static void ReportUnverifiedDwmcoreOnce() {
     if (s_reported) return;
     s_reported = true;
     const DwmHookBuildStatus& s = DwmHookBuildCheck();
-    if (!DwmHookBuildUntested(s)) return;
+    if (!DwmHookBuildNewerThanVerified(s)) return;
     std::wcout << L"[DWM Hook] dwmcore.dll " << FormatDwmcoreVersion(s.running)
                << L" is not among the verified versions (newest verified for this branch: "
                << FormatDwmcoreVersion(s.verified) << L")" << std::endl;

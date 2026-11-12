@@ -1511,7 +1511,7 @@ void SettingsEngine(const Snapshot& snap, ViewState& vs) {
     if (OnOff("##set_hook", snap.hookMode, &v)) Post([v]() { act::SetDwmHookMode(v); });
     // This Windows' compositor is newer than anything the hook was verified against: it still runs (drawn without
     // layout, nothing moves when it shows).
-    if (snap.hookMode && DwmHookBuildUntested(snap.hookBuild)) {
+    if (snap.hookMode && DwmHookBuildNewerThanVerified(snap.hookBuild)) {
         RowNext(row);
         RowText(row, "UNTESTED WINDOWS UPDATE", pal::Alarm, Font::Label, kSizeLabel,
                 DwmHookBuildTooltip(snap.hookBuild));
