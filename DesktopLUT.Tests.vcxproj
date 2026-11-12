@@ -231,6 +231,17 @@
       <!-- drives both paths' layers (src/fald.cpp and dwm_hook/hook_fald.cpp) on WARP: the hook's names as test_fald_hook.cpp -->
       <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ClCompile Include="dwm_hook\hook_render.cpp">
+      <!-- the hook's LUT / tone-map pass, compiled as the DLL builds it, driven offscreen by tests/test_perf.cpp (opt-in:
+           DLUT_PERF_*). In this exe only: its GetMonitorPositionFromContext gets a name of its own (test_lut_canonical.cpp
+           has the stub hook_lut.cpp links to) and the FALD dump-trigger probe is a no-op (it reads %SYSTEMROOT%\Temp; a
+           test never touches that folder). What dllmain.cpp gives it in the DLL, test_perf.cpp defines. -->
+      <SDLCheck>false</SDLCheck>
+      <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;GetMonitorPositionFromContext=HookRender_GetMonitorPositionFromContext;FaldPollDumpRequest=PerfStub_FaldPollDumpRequest;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="tests\test_perf.cpp">
+      <PreprocessorDefinitions>DLUT_HOOK_TESTING;FaldShadersReady=HookFaldShadersReady;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemGroup>
   <!-- Headers -->
   <ItemGroup>
