@@ -415,7 +415,7 @@ sends the EDID's own peak back when it no longer applies (`windows_tonemap.h`).
 | Method | Samples | Description |
 |--------|---------|-------------|
 | **Tetrahedral** (default) | 4 | Divides cube into 6 tetrahedra, higher quality. The DWM hook always uses it |
-| **Trilinear** | 8 | Hardware-accelerated, faster. An overlay-mode option (`TetrahedralInterp=0`) |
+| **Trilinear** | 8 | One hardware-filtered fetch of 8 texels. An overlay-mode option (`TetrahedralInterp=0`). Not the faster one where it was measured: on an RTX 5090 the trilinear pass takes about twice as long as the tetrahedral one (4K: 90 vs 46 µs SDR, 131 vs 82 µs HDR), because the cube is a 32-bit float texture and filtering it costs more than four unfiltered fetches; on WARP the two are equal |
 
 **Supported sizes**: 2-128 (typical: 17, 33, 65). Larger sizes rejected to prevent excessive memory use.
 
@@ -672,7 +672,7 @@ Runs 24/7, must be invisible. All operations follow:
 |-------|---------|
 | Frame sync (CompClock/DwmFlush + predictive wait) | 0-16ms |
 | AcquireNextFrame | <1ms |
-| GPU shader | <0.1ms |
+| GPU shader | 0.02-0.17 ms (measured, RTX 5090, by resolution and configuration: see below) |
 | Present (tearing enabled) | Immediate |
 | **Processing overhead** | **~1-2ms** |
 
@@ -685,7 +685,48 @@ Full pipeline adds ~1 frame visual latency (inherent to capture-and-reprocess). 
 ### Memory Bandwidth
 At 4K 60Hz HDR: ~8 GB/s (capture read + swapchain write dominate)
 
+### Measured pass cost (RTX 5090, 2026-11-12)
+
+GPU time of the passes themselves, from GPU timestamps around them, offscreen in the test suite's opt-in harness (`tests/test_perf.cpp`, `DLUT_PERF_GPU`; the DWM hook's real `RenderLUT` over a stand-in back buffer, 65³ cube, median of 40). Not included: DWM's own composition, Desktop Duplication capture, the overlay's presentation. Run to run these move by about ±8 %.
+
+DWM hook, µs per present. The hook processes only what DWM re-composed, so the cost follows the dirty area:
+
+| 4K (3840x2160) | whole frame | video in a window (44 %) | a caret and the clock |
+|---|---|---|---|
+| SDR 8-bit, 3D LUT | 74 | 36 | 9 |
+| SDR under ACM, 3D LUT | 91 | 42 | 8 |
+| HDR, 3D LUT | 118 | 51 | 8 |
+| HDR, 3D LUT + static tone map (any curve) | 147-157 | 61-67 | 9-10 |
+| HDR, 3D LUT + dynamic tone map | 165 | 189 | 34 |
+| HDR, FALD alone | 501 | 489 | 431 |
+| HDR, 3D LUT + dynamic tone map + FALD | 584 | 652 | 470 |
+
+| whole frame | 1080p | 1440p | 4K |
+|---|---|---|---|
+| SDR 8-bit, 3D LUT | 26 | 36 | 74 |
+| HDR, 3D LUT | 31 | 50 | 118 |
+| HDR, 3D LUT + static tone map | 37-40 | 62-67 | 147-157 |
+| HDR, 3D LUT + dynamic tone map | 48 | 74 | 165 |
+
+- A whole 4K frame with 3D LUT and dynamic tone map is 4 % of a 240 Hz frame, 2.4 % at 144 Hz, 1 % at 60 Hz; with FALD 14 %, 8 %, 3.5 %.
+- With a dynamic tone map, a present whose smoothed peak moved redraws the whole frame (the tone map of every pixel changed), which is why a windowed video costs as much as a full frame there; presents whose peak stands cost the dirty area only.
+- FALD needs the whole frame on every present, so its cost barely depends on the dirty area.
+
+Overlay pass (one fullscreen draw per changed desktop frame), µs:
+
+| | 1080p | 1440p | 4K |
+|---|---|---|---|
+| SDR, 3D LUT (tetrahedral) | 18 | 25 | 47 |
+| SDR, 3D LUT (trilinear) | 27 | 44 | 94 |
+| HDR, 3D LUT (tetrahedral) | 23 | 37 | 89 |
+| HDR, 3D LUT + dynamic tone map | 42 | 66 | 146 |
+| HDR, desktop gamma + primaries + grayscale + dynamic tone map + 3D LUT | 48 | 79 | 174 |
+
+One RTX 5090 says nothing certain about a weak GPU. On this card the passes are bound by memory traffic (the full-frame copy the hook needs is a third of its HDR pass) and insensitive to shader arithmetic; on the software rasteriser (WARP) it is the reverse. Where an integrated GPU falls between the two has not been measured.
+
 ### GPU Benchmark (RTX 5090, 4K 60Hz)
+
+Whole-system figures from `nvidia-smi` with the overlay running (measured in overlay mode, before the pass timings above existed).
 
 **Test configuration**: 3D LUT + Tetrahedral interpolation + Display Primaries + 20pt Grayscale + Tonemapping (HDR only)
 
@@ -702,7 +743,7 @@ At 4K 60Hz HDR: ~8 GB/s (capture read + swapchain write dominate)
 
 The nvidia-smi "utilization" metric measures how often the GPU is *active*, not total work. Both modes do similar work (same power draw), just distributed differently between compute and memory subsystems.
 
-**Estimated usage by GPU tier** (4K 60Hz, full pipeline):
+**Estimated usage by GPU tier** (4K 60Hz, full pipeline). Only the flagship row was measured; the other rows are estimates scaled from it, and no DesktopLUT measurement exists on those GPUs or on any integrated GPU:
 
 | GPU Tier | Example | HDR | SDR |
 |----------|---------|-----|-----|
@@ -716,7 +757,7 @@ Lower resolutions scale down significantly (1080p = ~4x less work). SDR scales b
 
 ### Gaming Impact (Borderless Windowed)
 
-The utilization numbers above can look alarming on mid/low-tier GPUs, but actual gaming impact is much smaller:
+The utilization numbers above can look alarming on mid/low-tier GPUs, but actual gaming impact is expected to be much smaller. The table is an estimate; none of its rows was measured:
 
 | GPU | Idle Utilization | Gaming FPS Loss | Why |
 |-----|------------------|-----------------|-----|
