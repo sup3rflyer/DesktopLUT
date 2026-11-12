@@ -75,6 +75,30 @@ GammaOffer SdrGammaOffer(const MonitorSettings& ms, bool connected, Mode live, b
     return ms.hdrMHC.desktopGammaEnabled ? GammaOffer::On : GammaOffer::Off;
 }
 
+std::string SdrGammaPeakNote(const MHCSettings& hdr, bool on, float reportedNits, float edidNits) {
+    const float def = 1000.0f;   // MHC2ProfileParams' default peak (a profile with no known peak)
+    auto plausible = [](float v) { return std::isfinite(v) && v > 0.0f && v < 9999.0f; };
+    char b[160];
+    const bool ours = hdr.enabled && !hdr.profileName.empty();
+    if ((on || ours) && hdr.reportPeakMax) {
+        snprintf(b, sizeof(b), "HDR apps are told 10000 nits (WINDOWS TONE MAP).");
+    } else if (on || ours) {
+        if (plausible(hdr.panelPeakNits))
+            snprintf(b, sizeof(b), "HDR apps are told %.0f nits, as before.", hdr.panelPeakNits);
+        else
+            snprintf(b, sizeof(b), "HDR apps are told the %.0f-nit default: no peak was known.", def);
+    } else if (reportedNits >= 9999.0f) {
+        snprintf(b, sizeof(b), "HDR apps keep being told 10000 nits (WINDOWS TONE MAP).");
+    } else if (plausible(reportedNits)) {
+        snprintf(b, sizeof(b), "HDR apps keep being told %.0f nits, the peak reported now.", reportedNits);
+    } else if (plausible(edidNits)) {
+        snprintf(b, sizeof(b), "HDR apps are told %.0f nits, the EDID's peak.", edidNits);
+    } else {
+        snprintf(b, sizeof(b), "No HDR peak known: HDR apps would be told the %.0f-nit default.", def);
+    }
+    return b;
+}
+
 std::string DisplayPeakTip(float targetNits, float edidPeakNits) {
     std::string tip = "The brightest the tone map lets highlights go: the panel's real peak.\n";
     char b[128];

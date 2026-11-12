@@ -380,6 +380,24 @@ TEST_CASE("front door: SDR CONTENT: GAMMA 2.2 is offered to an HDR display with 
           GammaOffer::Off);
 }
 
+TEST_CASE("front door: the offer says which peak HDR apps are told") {
+    auto has = [](const std::string& s, const char* part) { return s.find(part) != std::string::npos; };
+    MHCSettings m;
+    CHECK(has(SdrGammaPeakNote(m, false, 600.0f, 600.0f), "keep being told 600 nits"));
+    CHECK(has(SdrGammaPeakNote(m, false, 0.0f, 1600.0f), "told 1600 nits, the EDID's peak"));
+    CHECK(has(SdrGammaPeakNote(m, false, 0.0f, 0.0f), "No HDR peak known"));
+    CHECK(has(SdrGammaPeakNote(m, false, 10000.0f, 1600.0f), "10000 nits (WINDOWS TONE MAP)"));
+    m.enabled = true;
+    m.profileName = L"DesktopLUT_Mon0_HDR_1.icm";
+    m.desktopGammaEnabled = true;
+    m.panelPeakNits = 600.0f;
+    CHECK(has(SdrGammaPeakNote(m, true, 600.0f, 1600.0f), "told 600 nits, as before"));
+    m.panelPeakNits = 0.0f;
+    CHECK(has(SdrGammaPeakNote(m, true, 1000.0f, 0.0f), "the 1000-nit default: no peak was known"));
+    m.reportPeakMax = true;
+    CHECK(has(SdrGammaPeakNote(m, true, 10000.0f, 0.0f), "10000 nits (WINDOWS TONE MAP)"));
+}
+
 TEST_CASE("tone map: DISPLAY PEAK says where its value came from") {
     auto has = [](const std::string& s, const char* part) { return s.find(part) != std::string::npos; };
     // Seeded from a 1600-nit EDID (rounded to 10 nits).

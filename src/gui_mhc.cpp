@@ -203,6 +203,9 @@ float MhcProfileMetadataPeakNits(const MHCSettings& mhc, bool isHDR) {
     // configured peak; otherwise the profile keeps the MHC2ProfileParams default.
     if (!mhc.sourceFilePath.empty()) return mhc.baseGrayscale.peakNits;
     if (mhc.baseGrayscale.enabled && !mhc.baseGrayscale.points.empty()) return mhc.baseGrayscale.peakNits;
+    // No measured peak: what Windows reported for the display before the one step put a profile of ours on it, so a
+    // neutral profile (and the identity one after it) changes nothing HDR apps are told. Else the params default.
+    if (isHDR && mhc.panelPeakNits > 0.0f && std::isfinite(mhc.panelPeakNits)) return mhc.panelPeakNits;
     return MHC2ProfileParams().peakNits;
 }
 

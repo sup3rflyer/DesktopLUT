@@ -1020,3 +1020,70 @@ TEST_CASE("SDR gamma 2.2 in one step: the identity profile with desktop gamma in
     CHECK(peakMax.reportedPeakNits == kWindowsToneMapBypassNits);
     CHECK(peakMax.peakNits == id.peakNits);   // the curves stay scaled to the panel
 }
+
+namespace {
+float LumiNits(const std::vector<uint8_t>& p) {
+    uint32_t off = 0, size = 0;
+    REQUIRE(FindTag(p, "lumi", off, size));
+    return (float)(int32_t)ReadBE32(p.data() + off + 12) / 65536.0f;   // 'XYZ ' + reserved, then X Y Z: Y
+}
+float Mhc2MaxNits(const std::vector<uint8_t>& p) {
+    uint32_t off = 0, size = 0;
+    REQUIRE(FindTag(p, "MHC2", off, size));
+    return (float)(int32_t)ReadBE32(p.data() + off + 16) / 65536.0f;   // MinCLL at +12, MaxCLL at +16
+}
+}  // namespace
+
+TEST_CASE("SDR gamma 2.2 in one step: the profile tells HDR apps the peak they were told before, and so does the identity") {
+    // What Windows reported before the one step (act::DecideNeutralProfilePeak): 1600 (EDID), 600, 350, none.
+    for (float before : { 1600.0f, 600.0f, 350.0f, 0.0f }) {
+        CAPTURE(before);
+        MonitorSettings ms;
+        ms.hdrMHC.panelPeakNits = before;
+        ms.hdrMHC.desktopGammaEnabled = true;
+        ms.hdrMHC.dgSdrWhiteNits = 116.0f;
+        const float want = before > 0.0f ? before : MHC2ProfileParams().peakNits;   // none known: the 1000-nit default
+        CHECK(MhcProfileMetadataPeakNits(ms.hdrMHC, true) == want);
+        CHECK(MhcIdentityPeakNits(ms, true) == want);   // the identity left after the switch-off
+        MHC2ProfileParams dg;
+        REQUIRE(BuildMHC2ParamsForPerm(ms.hdrMHC, true, 99, ComputeMhcPermutation(ms.hdrMHC, true), dg));
+        const MHC2ProfileParams id = BuildIdentityMHC2Params(true, MhcIdentityPeakNits(ms, true), dg.monitorName);
+        std::vector<uint8_t> dgBytes, idBytes;
+        REQUIRE(GenerateMHC2Profile(dg, dgBytes));
+        REQUIRE(GenerateMHC2Profile(id, idBytes));
+        CHECK(LumiNits(dgBytes) == doctest::Approx(want).epsilon(1e-5));
+        CHECK(Mhc2MaxNits(dgBytes) == doctest::Approx(want).epsilon(1e-5));
+        CHECK(LumiNits(idBytes) == doctest::Approx(want).epsilon(1e-5));
+        CHECK(Mhc2MaxNits(idBytes) == doctest::Approx(want).epsilon(1e-5));
+        size_t diff = 0;
+        CHECK(SameOutside(dgBytes, idBytes, Mhc2LutRanges(dgBytes), &diff));   // still nothing else differs
+
+        // The peak is metadata only here: the 1D LUTs are those of the 1000-nit bake, word for word.
+        MonitorSettings at1000 = ms;
+        at1000.hdrMHC.panelPeakNits = 0.0f;
+        MHC2ProfileParams ref;
+        REQUIRE(BuildMHC2ParamsForPerm(at1000.hdrMHC, true, 99, ComputeMhcPermutation(at1000.hdrMHC, true), ref));
+        std::vector<uint8_t> refBytes;
+        REQUIRE(GenerateMHC2Profile(ref, refBytes));
+        for (int ch = 0; ch < 3; ch++) CHECK(Mhc2LutWords(dgBytes, ch) == Mhc2LutWords(refBytes, ch));
+    }
+}
+
+TEST_CASE("SDR gamma 2.2 in one step: the recorded peak never replaces a calibration's") {
+    MHCSettings m;
+    m.panelPeakNits = 600.0f;
+    // A base curve or an imported file carries the peak it was made at: it wins.
+    m.baseGrayscale.enabled = true;
+    m.baseGrayscale.peakNits = 1729.0f;
+    m.baseGrayscale.initLinearPQ();
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 1729.0f);
+    m.baseGrayscale.enabled = false;
+    m.sourceFilePath = L"C:\\cal\\mhc_hdr.cube";
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 1729.0f);
+    // Nothing measured: the recorded peak.
+    m.sourceFilePath.clear();
+    CHECK(MhcProfileMetadataPeakNits(m, true) == 600.0f);
+    // A display that never used the one step: the 1000-nit default, as before (every existing profile bakes the same).
+    m.panelPeakNits = 0.0f;
+    CHECK(MhcProfileMetadataPeakNits(m, true) == MHC2ProfileParams().peakNits);
+}
