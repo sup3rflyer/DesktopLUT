@@ -17,6 +17,7 @@
 #include "gui.h"
 #include "gui_mhc.h"   // MhcProfileMetadataPeakNits
 #include "mhc_preview.h"   // MhcPreviewHolds
+#include "fald_temporal.h"   // FaldTemporalModeOf, FALD_TEMPORAL_PANEL (the LED LAG row)
 #include <algorithm>
 #include <cctype>
 #include <cfloat>
@@ -778,47 +779,14 @@ void InspectFald(const DisplayRow& r, const Stage& st, bool hdr, ViewState& vs) 
     }
 
     row = BeginRow("LED LAG");
-    RowTip(row, "Experimental. The LEDs' lag behind the picture: a first-order filter (the LEDs and the panel's "
-                "estimate, or the LEDs only), or the panel clock.");
+    RowTip(row, "Experimental. The LEDs' lag behind the picture, as the panel clock models it.");
     RowPlace(row);
-    static const char* kLag[] = { "OFF", "LEDS + EST", "LEDS ONLY", "PANEL CLOCK" };
-    const int lag = Segmented("##fald_lag", kLag, 4, (int)(f.temporalMode <= 3 ? f.temporalMode : 0), 100);
+    static const char* kLag[] = { "OFF", "PANEL CLOCK" };   // temporalMode 0 / 3 (the INI and the pipe keep the number 3)
+    const int lag = Segmented("##fald_lag", kLag, 2, FaldTemporalModeOf(f.temporalMode) == FALD_TEMPORAL_PANEL ? 1 : 0, 100);
     if (lag >= 0)
-        shared([lag](FaldSettings& s) { bool c = s.temporalMode != (unsigned)lag; s.temporalMode = (unsigned)lag; return c; });
+        shared([lag](FaldSettings& s) {
+            const unsigned v = lag == 1 ? FALD_TEMPORAL_PANEL : FALD_TEMPORAL_OFF; bool c = s.temporalMode != v; s.temporalMode = v; return c; });
     EndRow(row);
-
-    // The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h); both modes at once like LED LAG. Default off.
-    // HIDDEN since 3.0 (the owner's call: the always-on core is the product, the fade a heavy experiment). It is
-    // switched on only by the INI (<mode>_FaldFlankFade) or the pipe (runtime.fald_flank_fade); the row is drawn
-    // only while it is on, so a running fade is never invisible and can be switched off here.
-    if (f.flankFade) {
-    row = BeginRow("FLANK FADE");
-    RowTip(row, "Experimental. Fades the correction on smooth steep edges, along the motion.\n"
-                "Paused while the GPU cannot run it in time (15 % of the content frame interval).\n"
-                "Switched off, this row goes away: the fade is set in the INI.");
-    RowPlace(row);
-    bool fade = false;
-    if (OnOff("##fald_flank_fade", f.flankFade, &fade))
-        shared([fade](FaldSettings& s) { bool c = s.flankFade != fade; s.flankFade = fade; return c; });
-    {   // the safety governor (shared/fald_fade_governor.h): drawn after the switch on the same row (no layout shift)
-        const FaldFadeGovReport& g = r.fadeGov[hdr ? 1 : 0];
-        if (f.flankFade && g.known) {
-            const std::wstring tip = FaldFadeGovExplain(g);
-            if (g.state == FaldFadeGovState::SuspendedBudget) {
-                RowNext(row);   // past the switch; each RowText then advances by itself
-                RowText(row, "PAUSED", pal::Alarm, Font::Label, kSizeLabel, tip);
-                RowText(row, Fmt("%.1f", g.p90Ms) + " / " + Fmt("%.1f", g.budgetMs) + " ms", pal::Alarm, Font::Mono, kSizeMono, tip);
-            } else if (g.state == FaldFadeGovState::SuspendedWeakGpu) {
-                RowNext(row);
-                RowText(row, "PAUSED: WEAK GPU", pal::Alarm, Font::Label, kSizeLabel, tip);
-            } else if (g.state == FaldFadeGovState::Forced) {
-                RowNext(row);
-                RowText(row, "FORCED", pal::InkDim, Font::Label, kSizeLabel, tip);
-            }
-        }
-    }
-    EndRow(row);
-    }   // f.flankFade
 
     // Starfield balancing (fald.h, rules in fald_shader.h): the switch and the fields the classic rows have; the rest
     // are INI / pipe only. The fields stay in place, disabled, while it is off.

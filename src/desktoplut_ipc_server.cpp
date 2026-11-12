@@ -30,9 +30,8 @@
 #include "gui_shared.h"
 #include "mhc.h"
 #include "fald.h"
-#include "fald_fade_status.h"   // the flank fade governor's report (state.get)
 #include "fald_core_status.h"   // the core layer's rate-cap governor's report (state.get)
-#include "../shared/fald_core_mode.h"   // the always-on core's mode table (runtime.fald_core_mode, state.get)
+#include "../shared/fald_core_mode.h"   // the always-on core's mode name (state.get)
 #include "displayconfig.h"
 #include "ipc_json.h"
 #include "ipc_grayscale.h"
@@ -549,14 +548,11 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_params_path", JStr(WideToUtf8(fs.paramsPath)));
                 l.set("fald_debug_mode", JNum((double)fs.debugMode));
                 l.set("fald_ped_mode", JNum((double)fs.pedMode));
-                l.set("fald_temporal_mode", JNum((double)fs.temporalMode));   // temporal drive state (runtime.fald_temporal)
-                l.set("fald_tau_rise_ms", JNum((double)fs.tauRiseMs));
+                l.set("fald_temporal_mode", JNum((double)FaldTemporalModeOf(fs.temporalMode)));   // LED lag: 0 off / 3 panel clock (runtime.fald_temporal)
                 // Stage bypasses (the interface's stage switches; layers.set takes them too)
                 l.set("bypass_3dlut", JBool(isHDR ? s.hdrLutBypass : s.sdrLutBypass));
                 l.set("bypass_primaries", JBool(m.bypassPrimaries));
                 l.set("bypass_grayscale", JBool(m.bypassGrayscale));
-                l.set("fald_tau_fall_ms", JNum((double)fs.tauFallMs));
-                l.set("fald_delay_frames", JNum((double)fs.delayFrames));
                 l.set("fald_temporal_closure", JNum((double)fs.clockClosure));   // temporal mode 3 "panel clock" (work guide C13)
                 l.set("fald_temporal_parity", JNum((double)fs.clockParity));
                 // starfield balancing (runtime.fald_starfield; work guide S1)
@@ -574,27 +570,8 @@ void HandleStateGet(JsonValue& result) {
                 l.set("fald_star_reach", JNum((double)fs.star.reach));
                 l.set("fald_star_nb_lo", JNum((double)fs.star.nbLo));
                 l.set("fald_star_nb_hi", JNum((double)fs.star.nbHi));
-                // the frozen fade stack (runtime.fald_flank_fade) and item L (reserved: no setter, never applied)
-                l.set("fald_flank_fade", JBool(fs.flankFade));
-                l.set("fald_low_ext", JBool(fs.lowExt));
-                l.set("fald_core_mode", JNum((double)fs.coreMode));   // the always-on core's switch (runtime.fald_core_mode)
-                l.set("fald_core_mode_name", JStr(FaldCoreModeName(fs.coreMode)));   // "C" / "KC2c" / "KC3" (shared/fald_core2.h)
-                {   // the fade's safety governor (shared/fald_fade_governor.h; the overlay's or the hook's report)
-                    JsonValue gj = JObj();
-                    FaldFadeGovReport gov;
-                    const HMONITOR hm = idx < g_gui.monitors.size() ? g_gui.monitors[idx] : nullptr;
-                    if (FaldFadeGovReportFor((int)idx, hm, isHDR, gov)) {
-                        gj.set("state", JStr(FaldFadeGovStateName(gov.state)));
-                        gj.set("p90_ms", JNum(gov.p90Ms));
-                        gj.set("budget_ms", JNum(gov.budgetMs));
-                        gj.set("content_ms", JNum(gov.contentMs));
-                        gj.set("refresh_ms", JNum(gov.refreshMs));
-                    } else {
-                        gj.set("state", JStr(fs.flankFade ? "unknown" : "off"));   // not run yet / no report
-                    }
-                    gj.set("forced", JBool(g_faldFadeForce.load()));            // INI [General] FaldFlankFadeForce
-                    l.set("fald_flank_fade_governor", gj);
-                }
+                l.set("fald_core_mode", JNum((double)fs.coreMode));   // the always-on core's rule: 4 = KC5 (shared/fald_core_mode.h)
+                l.set("fald_core_mode_name", JStr(FaldCoreModeName(fs.coreMode)));   // "KC5"
                 {   // the core layer's rate-cap governor (shared/fald_core_governor.h; the overlay's or the hook's report)
                     JsonValue cj = JObj();
                     FaldCoreGovReport cg;
@@ -1645,55 +1622,43 @@ void DoFaldDebug(const JsonValue& p, JsonValue& result, std::string& error) {
     result.set("ped_colour_in_file", JBool(FaldPanelFileHasPedColour(pathNow)));   // false = an FLD1 file: ped_mode 1 is a no-op
 }
 
-// runtime.fald_temporal {monitor, mode, temporal_mode?, tau_rise_ms?, tau_fall_ms?, delay_frames?, closure?, parity?}: the
-// shader's per-cell drive state (LED-lag filter; fald.h FALD_TEMPORAL_*, DLC dlc/fald/temporal.py). temporal_mode 3 =
-// the measured panel clock (work guide C13, DLC dlc/fald/paneltime.py) with closure (share of the LED gap closed per
-// tick) and parity (-1 unknown / 0 / 1; -2 = unknown with the plain mean of both clocks, the combination before 2026-10-23:
-// a test value for the blind A/B, never saved — the INI keeps -1). Persisted per mode like ped_mode (the GUI row sets both
-// modes). Error texts are
-// mirrored by the DLC mock word for word.
+// runtime.fald_temporal {monitor, mode, temporal_mode?, closure?, parity?}: LED lag (shared/fald_temporal.h): temporal_mode
+// 0 = off, 3 = the measured panel clock (work guide C13, DLC dlc/fald/paneltime.py) with closure (share of the LED gap
+// closed per tick) and parity (-1 unknown / 0 / 1). Persisted per mode like ped_mode (the GUI row sets both modes). The
+// first-order modes 1 / 2 (with tau_rise_ms / tau_fall_ms / delay_frames) and the plain-mean parity -2 were removed
+// 2026-11-12: a request that sends one is refused, not silently ignored. Error texts are mirrored by the DLC mock word for
+// word.
 void DoFaldTemporal(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
     const JsonValue* tm = p.find("temporal_mode");
-    const JsonValue* tr = p.find("tau_rise_ms");
-    const JsonValue* tf = p.find("tau_fall_ms");
-    const JsonValue* df = p.find("delay_frames");
     const JsonValue* cl = p.find("closure");
     const JsonValue* pa = p.find("parity");
+    for (const char* gone : { "tau_rise_ms", "tau_fall_ms", "delay_frames" })
+        if (p.find(gone)) { error = std::string(gone) + " was removed with temporal modes 1 / 2 (only 0 off and 3 panel clock remain)"; return; }
     auto isNum = [](const JsonValue* v) { return v && v->type == JsonValue::Num; };
-    if (!isNum(tm) && !isNum(tr) && !isNum(tf) && !isNum(df) && !isNum(cl) && !isNum(pa)) { error = "missing parameter: temporal_mode (0|1|2|3), tau_rise_ms, tau_fall_ms (0..5000), delay_frames (0..3), closure (0.05..1) or parity (-1|0|1|-2)"; return; }
-    if (isNum(tm) && !(tm->num == 0 || tm->num == 1 || tm->num == 2 || tm->num == 3)) { error = "temporal_mode must be 0 (off), 1 (both fields), 2 (B_true only) or 3 (panel clock)"; return; }
-    if (isNum(tr) && !(tr->num >= 0 && tr->num <= FALD_TAU_MAX_MS)) { error = "tau_rise_ms must be 0..5000 ms"; return; }
-    if (isNum(tf) && !(tf->num >= 0 && tf->num <= FALD_TAU_MAX_MS)) { error = "tau_fall_ms must be 0..5000 ms"; return; }
-    if (isNum(df) && !(df->num == 0 || df->num == 1 || df->num == 2 || df->num == 3)) { error = "delay_frames must be 0..3"; return; }
+    if (!isNum(tm) && !isNum(cl) && !isNum(pa)) { error = "missing parameter: temporal_mode (0|3), closure (0.05..1) or parity (-1|0|1)"; return; }
+    if (isNum(tm) && !(tm->num == 0 || tm->num == 3)) { error = "temporal_mode must be 0 (off) or 3 (panel clock)"; return; }
     if (isNum(cl) && !(cl->num >= FALD_CLOCK_CLOSURE_MIN && cl->num <= FALD_CLOCK_CLOSURE_MAX)) { error = "closure must be 0.05..1"; return; }
-    if (isNum(pa) && !(pa->num == -1 || pa->num == 0 || pa->num == 1 || pa->num == FALD_CLOCK_PARITY_MEAN)) { error = "parity must be -1 (unknown), 0, 1 or -2 (unknown, plain mean: a test value)"; return; }
-    unsigned int mode = 0, delay = 0; float rise = 0.0f, fall = 0.0f, closure = FALD_CLOCK_CLOSURE_DEFAULT; int parity = -1;
+    if (isNum(pa) && !(pa->num == -1 || pa->num == 0 || pa->num == 1)) { error = "parity must be -1 (unknown), 0 or 1"; return; }
+    unsigned int mode = 0; float closure = FALD_CLOCK_CLOSURE_DEFAULT; int parity = -1;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
         if (isNum(tm)) fs.temporalMode = (unsigned int)tm->num;
-        if (isNum(tr)) fs.tauRiseMs = (float)tr->num;
-        if (isNum(tf)) fs.tauFallMs = (float)tf->num;
-        if (isNum(df)) fs.delayFrames = (unsigned int)df->num;
         if (isNum(cl)) fs.clockClosure = (float)cl->num;
         if (isNum(pa)) fs.clockParity = (int)pa->num;
-        mode = fs.temporalMode; rise = fs.tauRiseMs; fall = fs.tauFallMs; delay = fs.delayFrames;
+        mode = FaldTemporalModeOf(fs.temporalMode);
         closure = fs.clockClosure; parity = fs.clockParity;
     }
     SaveSettings();
     FaldPropagate(mon, isHDR);
     result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
     result.set("temporal_mode", JNum((double)mode));
-    result.set("tau_rise_ms", JNum((double)rise));
-    result.set("tau_fall_ms", JNum((double)fall));
-    result.set("delay_frames", JNum((double)delay));
     result.set("closure", JNum((double)closure));
     result.set("parity", JNum((double)parity));
-    // mode 3 settles in refreshes (independent of the rate); the first-order modes in frames at 60 Hz
-    result.set("settle_frames_60hz", JNum((double)(mode == FALD_TEMPORAL_PANEL ? FaldPanelClockSettleFrames(closure)
-                                                                               : FaldSettleFrames(rise, fall, 1000.0f / 60.0f, delay))));
+    // the panel clock settles in refreshes (independent of the rate); off = nothing to settle
+    result.set("settle_frames_60hz", JNum((double)(mode == FALD_TEMPORAL_PANEL ? FaldPanelClockSettleFrames(closure) : 0u)));
 }
 
 // runtime.fald_starfield {monitor, mode, enabled?, even?, target_gain?, target_sigma?, keep_nits?, even_reach?, cap_nits?, strength?,
@@ -1776,56 +1741,6 @@ void DoFaldStarfield(const JsonValue& p, JsonValue& result, std::string& error) 
     result.set("reach", JNum((double)out.reach));
     result.set("nb_lo", JNum((double)out.nbLo));
     result.set("nb_hi", JNum((double)out.nbHi));
-}
-
-// runtime.fald_flank_fade {monitor, mode, enabled}: the frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h; default
-// off). Persisted per mode. Item L (FaldSettings::lowExt) has no setter: reserved for round 12.
-void DoFaldFlankFade(const JsonValue& p, JsonValue& result, std::string& error) {
-    int mon; bool isHDR;
-    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    const JsonValue* en = p.find("enabled");
-    if (!en) { error = "missing parameter: enabled"; return; }
-    if (en->type != JsonValue::Bool) { error = "enabled must be a boolean"; return; }
-    {
-        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        fs.flankFade = en->b;
-    }
-    SaveSettings();
-    FaldPropagate(mon, isHDR);
-    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
-    result.set("enabled", JBool(en->b));
-}
-
-// runtime.fald_core_mode {monitor, mode, core}: the always-on core's switch (shared/fald_core_mode.h FALD_CORE_MODES): 4 = KC5
-// (the default: C's fill + the brightening cap), 0 = C (the 2026-10-22 layer bit for bit), 1 = KC2c (round 2), 2 = KC3 (round
-// 3) — test modes for A/B; 3 reserved (KC4). Runtime only: NEVER saved (the INI key <mode>_FaldCoreModeTest sets the start
-// value). The live blind kits and the bench set it per block / configuration.
-void DoFaldCoreMode(const JsonValue& p, JsonValue& result, std::string& error) {
-    int mon; bool isHDR;
-    if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    const JsonValue* cm = p.find("core");
-    if (!cm) { error = "missing parameter: core"; return; }
-    if (cm->type != JsonValue::Num) { error = "core must be a number"; return; }
-    const double v = cm->num;
-    std::vector<uint32_t> modes;                   // the modes the table defines (a reserved KC4 / KC5 slot is refused until it lands)
-    for (uint32_t k = 0; k < FALD_CORE_MODE_COUNT; k++) if (FaldCoreModeKnown(k)) modes.push_back(k);
-    bool known = false;
-    for (uint32_t k : modes) known = known || v == (double)k;
-    if (!known) {                                  // "core must be 0, 1, 2 or 4" (the mock's text, DLC desktoplut_mock.py)
-        error = "core must be ";
-        for (size_t i = 0; i < modes.size(); i++)
-            error += std::to_string(modes[i]) + (i + 2 < modes.size() ? ", " : (i + 1 < modes.size() ? " or " : ""));
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
-        FaldSettings& fs = isHDR ? g_gui.monitorSettings[mon].hdrColorCorrection.fald : g_gui.monitorSettings[mon].sdrColorCorrection.fald;
-        fs.coreMode = (uint32_t)v;
-    }
-    FaldPropagate(mon, isHDR);                     // no SaveSettings: a test switch
-    result.set("monitor_mode", JStr(MonitorModeKey(mon, isHDR)));
-    result.set("core", JNum(v));
 }
 
 void DoFaldDump(const JsonValue& p, JsonValue& result, std::string& error) {
@@ -2617,8 +2532,6 @@ LRESULT HandleCalibrationGuiCommand(WPARAM wParam, LPARAM /*lParam*/) {
         else if (m == "runtime.fald_dump") DoFaldDump(params, result, error);
         else if (m == "runtime.fald_temporal") DoFaldTemporal(params, result, error);
         else if (m == "runtime.fald_starfield") DoFaldStarfield(params, result, error);
-        else if (m == "runtime.fald_flank_fade") DoFaldFlankFade(params, result, error);
-        else if (m == "runtime.fald_core_mode") DoFaldCoreMode(params, result, error);
         else if (m == "hook.set_routing") DoHookSetRouting(params, result, error);
         else if (m == "runtime.set_grayscale_tweak") DoSetGrayscaleTweak(params, result, error);
         else if (m == "runtime.disable_grayscale_tweak") DoDisableGrayscaleTweak(params, result, error);

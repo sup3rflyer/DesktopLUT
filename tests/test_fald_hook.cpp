@@ -1,25 +1,16 @@
-// The DWM hook's FALD layer WITH the flank fade (faldFlags bit 8) on WARP — dwm_hook/hook_fald.cpp compiled into this exe as
-// the DLL builds it (DesktopLUT.Tests.vcxproj: DLUT_HOOK_TESTING = the test seams, no host events, a %TEMP% log), driven
-// the way hook_render.cpp RenderLUT drives it with no LUT and no tone map: FaldAcquire -> FaldSetLiveSettings ->
-// FaldUpdateClean (the present's dirty rects) -> the clean copy into the intermediate -> FaldRun into the back buffer ->
-// FaldReturn. Its output and fade-stack fields must equal, BYTE FOR BYTE, the overlay path's WARP dumps of the same frames
-// (tests/test_fald_fade.cpp "FALD fade ON", FALD_TEST_FADE_ON) — the hook and the overlay run the same passes.
-//
-// Cases: the stills (HDR with the starfield on — n7_lamp, round 12a's three, round 12b's ten halo frames when the cell dir
-// holds them; the sanitise cell with it off; the odd size on its own panel; ACM SDR; a fractional pitch);
-// the seattle pan (16 content frames, two presents WITHOUT new content in between: nothing steps, the output repeats);
-// the same pan with a live panel swap at frame 8 (the fade moves with the frame part, T resets: frames 8..15 = a fresh
-// context from frame 8 on the new file) and with an idle reset at frame 8 (FaldMarkStale) plus a re-injection at frame
-// 12 (FaldReleaseAll + the shaders released and re-created, the paced creation run again). The paced creation itself:
-// the layer runs without the fade (CB word 75 = 0) until the fade's shaders and resources exist, then word 75 = 1.
-//
-// Opt-in: FALD_TEST_FADE_DIR (the cells) + FALD_TEST_FADE_ON (the overlay's dumps, including its ref_* runs);
-// FALD_TEST_FADE_HOOK_ONLY = a substring of the case names to run.
+// The DWM hook's FALD layer on WARP — dwm_hook/hook_fald.cpp compiled into this exe as the DLL builds it
+// (DesktopLUT.Tests.vcxproj: DLUT_HOOK_TESTING = the test seams, no host events, a %TEMP% log), driven the way
+// hook_render.cpp RenderLUT drives it with no LUT and no tone map: FaldAcquire -> FaldSetLiveSettings -> FaldUpdateClean
+// (the present's dirty rects) -> the clean copy into the intermediate -> FaldRun into the back buffer -> FaldReturn.
+// Cases: the change-driven path against the full path, the core governor's held run, the panel clock against the overlay
+// and its own change-driven path, the frame-changed word, the always-on core against the overlay's.
+// (Until 2026-11-12 this file also held the hook's flank-fade cases, compared with the overlay's fade dumps: tag
+// archive/fald-flank-fade.)
+// Opt-in: FALD_TEST_FADE_DIR (the cells; the variable keeps its historical name), FALD_TEST_CORE2_DIR (the core case).
 #include "doctest.h"
 #include "../dwm_hook/hook_fald.h"
-#include "../shared/fald_fade.h"
 #include "../shared/fald_core_governor.h"   // g_faldCoreHoldOverride (the held-run case)
-#include "../shared/fald_core_mode.h"       // the always-on core's modes (the change-driven case runs C and KC3)
+#include "../shared/fald_core_mode.h"       // the always-on core's modes (the cases run C and KC5)
 
 #include <windows.h>
 #include <d3d11.h>
@@ -144,11 +135,9 @@ struct HookMonitor {
     }
     // One present. newContent: DWM composed a new frame (one full-frame dirty rect); false = a present with no dirty rect.
     // Returns the run's state; out / fields are read only when asked.
-    struct Result { bool ran = false, fadeOn = false, partial = false; uint32_t word75 = 0xFFFFFFFFu; FaldFade* fade = nullptr; std::string err;
-                    unsigned int govState = 0; unsigned int coreGovState = 0; unsigned long long heldRuns = 0;
+    struct Result { bool ran = false, partial = false; uint32_t word75 = 0xFFFFFFFFu; std::string err;
+                    unsigned int coreGovState = 0; unsigned long long heldRuns = 0;
                     unsigned long long clockElapsed = 0; bool clockSeeded = false, lastPartial = false; };
-    bool forceFade = true;   // the governor forced on (false: it decides — on WARP that is "weak GPU": never on)
-    bool fadeWanted = true;  // the flank fade setting (faldFlags bit 8)
     const DwmHookFaldTuning* tuning = nullptr;   // the shared config's tuning tail (LED lag, the refresh period); null = none
     // The caller's "the frame changed everywhere" word (hook_fald.h FaldRun frameChanged: the dynamic tone map's peak
     // moved): a 16-byte buffer as the smoothing pass writes, (4, moved, 0, 0); null = a static pass. With
@@ -159,7 +148,7 @@ struct HookMonitor {
     // The frame as the LUT / tone-map pass would leave it in the intermediate (null = the clean copy itself, no pass): on
     // a partial present its rects go in (or the whole of it with intermediateWhole), on a full one the whole of it.
     const std::vector<unsigned char>* intermediateFrame = nullptr;
-    unsigned int coreMode = 0;   // the always-on core's switch (faldFlags bits 16-19; shared/fald_core_mode.h): 0 C, 1 KC2c, 2 KC3, 4 KC5
+    unsigned int coreMode = 0;   // the always-on core's mode (faldFlags bits 16-19; shared/fald_core_mode.h): 0 C, 4 KC5
     // rects: this present's dirty rects (the frame already edited inside them); null = a full-frame rect (new content) or none
     Result Present(bool newContent, bool readCB, const std::vector<RECT>* rects = nullptr) {
         Result r;
@@ -174,12 +163,7 @@ struct HookMonitor {
             }
         FaldMonitor* m = FaldAcquire(0, 0, hdr, W, H, DXGI_FORMAT_R16G16B16A16_FLOAT);
         if (!m) { r.err = "FaldAcquire: no layer"; return r; }
-#ifdef FALD_RUN_HAS_FRAME_KEY
-        // the governor forced on (faldFlags bit 10): WARP is a software adapter, which it would never start the fade on
-        FaldSetLiveSettings(m, 0, 0, star, tuning, fadeWanted, 0, 0, forceFade, false, coreMode);
-#else
-        FaldSetLiveSettings(m, 0, 0, star, nullptr, true);
-#endif
+        FaldSetLiveSettings(m, 0, 0, star, tuning, 0, 0, false, coreMode);
         RECT full = { 0, 0, (LONG)W, (LONG)H };
         const RECT* rc = rects ? rects->data() : (newContent ? &full : nullptr);
         const int nrc = rects ? (int)rects->size() : (newContent ? 1 : 0);
@@ -212,7 +196,6 @@ struct HookMonitor {
         r.ran = FaldRun(m, backRTV, newContent);
 #endif
 #ifdef FALD_RUN_HAS_FRAME_KEY
-        r.govState = FaldTestFadeGovState(m);
         r.coreGovState = FaldTestCoreGovState(m);
         r.heldRuns = FaldTestHeldRuns(m);
         r.clockElapsed = FaldTestClockElapsed(m);
@@ -220,8 +203,6 @@ struct HookMonitor {
         r.lastPartial = FaldTestLastPartial(m);
 #endif
         if (!r.ran) w.ic->CopyResource(back, FaldIntermediateTexture(m));
-        r.fadeOn = FaldTestFadeOn(m);
-        r.fade = FaldTestFade(m);
         if (readCB) {
             const std::vector<unsigned char> cb = ReadBackBuf(w.dev, w.ic, FaldTestCB(m));
             if (cb.size() >= 76 * 4) std::memcpy(&r.word75, cb.data() + 75 * 4, 4);
@@ -232,54 +213,12 @@ struct HookMonitor {
     }
 };
 
-// The overlay's ON run as a hash manifest instead of dumps (FALD_TEST_FADE_HOOK_HASHES = tests/test_fald_fade.cpp's
-// FALD_TEST_FADE_HASHES output): "<run>/tNN <file>" -> "<bytes> <fnv>". `g_hookOnRoot` = the FALD_TEST_FADE_ON prefix the
-// reference paths carry (stripped to form the key).
-std::map<std::string, std::string>* g_hookHashes = nullptr;
-std::string g_hookOnRoot;
-
 std::string HookFnvLine(const std::vector<unsigned char>& b) {
     uint64_t h = 1469598103934665603ull;
     for (unsigned char c : b) { h ^= c; h *= 1099511628211ull; }
     char buf[64];
     snprintf(buf, sizeof(buf), "%zu %016llx", b.size(), (unsigned long long)h);
     return buf;
-}
-
-// Byte-compare this present's output + fade fields with the overlay's dump directory `ref`.
-void CompareWithOverlay(HookMonitor& hm, FaldFade* fade, const std::string& ref, const std::string& what, int& compared, int& equal) {
-    struct Item { const char* file; ID3D11Texture2D* tex; ID3D11Buffer* buf; };
-#ifdef FALD_FADE_HAS_DEBUG_MATERIALIZE
-    FaldFadeDebugMaterialize(fade, hm.w.ic);   // fade_T and F as full-res maps (FadePost forms them per pixel)
-#endif
-    const FaldFadeDebug d = FaldFadeDebugViews(fade);
-    const Item items[] = { { "out.rgba16f", hm.back, nullptr }, { "fade.f32", d.fade, nullptr }, { "fade_t.f32", d.fadeT, nullptr },
-                           { "floor.f32", d.floorF, nullptr }, { "reach0.f32", d.reach[0], nullptr },
-                           { "reach1.f32", d.reach[1], nullptr }, { "s.f32", d.s, nullptr }, { "mi.f32", d.mi, nullptr },
-                           { "flags.u32", nullptr, d.flags } };
-    for (const Item& it : items) {
-        if (g_hookHashes) {
-            const std::string key = ref.substr((std::min)(ref.size(), g_hookOnRoot.size() + 1)) + " " + it.file;
-            auto f = g_hookHashes->find(key);
-            CHECK_MESSAGE(f != g_hookHashes->end(), what << ": no overlay hash for " << key);
-            if (f == g_hookHashes->end()) continue;
-            const std::vector<unsigned char> got = it.tex ? ReadBackTex(hm.w.dev, hm.w.ic, it.tex) : ReadBackBuf(hm.w.dev, hm.w.ic, it.buf);
-            const bool same = HookFnvLine(got) == f->second;
-            compared++;
-            if (same) equal++;
-            CHECK_MESSAGE(same, what << ": " << std::string(it.file) << " differs from the overlay's " << key);
-            continue;
-        }
-        std::vector<unsigned char> want;
-        const bool have = ReadAll(ref + "/" + it.file, want);
-        CHECK_MESSAGE(have, what << ": no overlay dump " << ref << "/" << std::string(it.file));
-        if (!have) continue;
-        const std::vector<unsigned char> got = it.tex ? ReadBackTex(hm.w.dev, hm.w.ic, it.tex) : ReadBackBuf(hm.w.dev, hm.w.ic, it.buf);
-        const bool same = got.size() == want.size() && std::memcmp(got.data(), want.data(), got.size()) == 0;
-        compared++;
-        if (same) equal++;
-        CHECK_MESSAGE(same, what << ": " << std::string(it.file) << " differs from the overlay's " << ref);
-    }
 }
 
 struct Staged {
@@ -307,204 +246,24 @@ struct Staged {
     }
 };
 
-// The paced creation: present frame 0 until the fade is on; the run that turns it on is frame 0's first fade run (a fresh
-// T state = a still). Checks word 75 = 0 while it is off. Returns the presents it took (0 = never on).
-int WarmUp(HookMonitor& hm, HookMonitor::Result& last) {
-    for (int i = 1; i <= 400; i++) {
-        last = hm.Present(true, true);
-        if (!last.ran) { if (last.err == "unprimed") continue; return 0; }
-        if (last.fadeOn) {
-            CHECK(last.word75 == 1u);   // FALD_FADE_FLAG_FLANK
-            return i;
-        }
-        CHECK(last.word75 == 0u);       // the layer without the fade meanwhile
-    }
-    return 0;
-}
-
-bool HaveCell(const std::string& cells, const char* name) {
-    return GetFileAttributesA((cells + "/" + name + ".rgba16f").c_str()) != INVALID_FILE_ATTRIBUTES;
-}
-
-std::string SeqFrame(const std::string& cells, int t) {
-    char b[160];
-    snprintf(b, sizeof(b), "%s/seq_s10_sm_seattle__p6n/t%02d.rgba16f", cells.c_str(), t);
-    return b;
-}
-std::string RefDir(const std::string& on, const char* run, int t) {
-    char b[64];
-    snprintf(b, sizeof(b), "/%s/t%02d", run, t);
-    return on + b;
-}
-
 }  // namespace
 
-// The switch's trip host -> DLL: dwm_inject.cpp packs FaldSettings::flankFade into faldFlags bit 8, hook_render.cpp
-// RenderLUT unpacks it for FaldSetLiveSettings. Bit 9 (item L) is never set; the other fields keep their bits.
-TEST_CASE("FALD hook: faldFlags bit 8 carries the flank fade, alone") {
-    for (int fade = 0; fade < 2; fade++)
-        for (int star = 0; star < 2; star++)
-            for (int ped = 0; ped < 2; ped++)
-                for (uint32_t dbg : { 0u, 4u, DWM_HOOK_FALD_DEBUG_MAX }) {
-                    const uint32_t w = DwmHookFaldPack(1, dbg, ped, star, fade);
-                    CHECK(DwmHookFaldFade(w) == fade);
-                    CHECK(DwmHookFaldStar(w) == star);
-                    CHECK(DwmHookFaldPedMode(w) == ped);
-                    CHECK(DwmHookFaldDebugMode(w) == dbg);
+// The flags word's trip host -> DLL: dwm_inject.cpp packs the settings, hook_render.cpp RenderLUT unpacks them for
+// FaldSetLiveSettings. Bits 8-10 (the removed flank fade's) are never set by this host.
+TEST_CASE("FALD hook: faldFlags keeps every field in its bits, the removed fade's bits 8-10 clear") {
+    for (int star = 0; star < 2; star++)
+        for (int ped = 0; ped < 2; ped++)
+            for (uint32_t dbg = 0; dbg <= 9; dbg++)
+                for (int force = 0; force < 2; force++) {
+                    const uint32_t w = DwmHookFaldPackCore2(DwmHookFaldPack(1, dbg, ped, star, force), FALD_CORE_MODE_KC5);
                     CHECK(DwmHookFaldEnabled(w) == 1);
-                    CHECK((w & DWM_HOOK_FALD_LOWEXT_BIT) == 0u);
-                    CHECK(((w & DWM_HOOK_FALD_FADE_BIT) != 0u) == (fade != 0));
+                    CHECK(DwmHookFaldDebugMode(w) == dbg);
+                    CHECK(DwmHookFaldPedMode(w) == ped);
+                    CHECK(DwmHookFaldStar(w) == star);
+                    CHECK(DwmHookFaldCoreForce(w) == force);
+                    CHECK(DwmHookFaldCoreMode(w) == FALD_CORE_MODE_KC5);
+                    CHECK((w & 0x00000700u) == 0u);
                 }
-    CHECK(DWM_HOOK_FALD_FADE_BIT == 0x100u);
-    CHECK(DwmHookFaldFade(DwmHookFaldPack(1, 0, 0, 0)) == 0);   // an older host (no fade argument) sends it off
-}
-
-TEST_CASE("FALD hook: the flank fade in the DWM hook's layer equals the overlay's, frame for frame (WARP; FALD_TEST_FADE_ON)") {
-    const std::string cells = HookEnv("FALD_TEST_FADE_DIR"), on = HookEnv("FALD_TEST_FADE_ON"), only = HookEnv("FALD_TEST_FADE_HOOK_ONLY");
-    if (cells.empty() || on.empty()) return;
-    std::map<std::string, std::string> hashes;
-    const std::string hashPath = HookEnv("FALD_TEST_FADE_HOOK_HASHES");
-    if (!hashPath.empty()) {   // "<run>/tNN <file> <bytes> <fnv>" per line
-        std::ifstream f(hashPath);
-        std::string line;
-        while (std::getline(f, line)) {
-            std::istringstream is(line);
-            std::string run, file, bytes, fnv;
-            if (is >> run >> file >> bytes >> fnv) hashes[run + " " + file] = bytes + " " + fnv;
-        }
-        REQUIRE_FALSE(hashes.empty());
-        g_hookHashes = &hashes;
-        g_hookOnRoot = on;
-    }
-    struct ClearHashes { ~ClearHashes() { g_hookHashes = nullptr; } } clearHashes;
-    const std::wstring C = OwnerPanelPath(L"DLC\\results\\fald_candidate_2026-10-09\\candidate_C_fade3_only.bin");
-    const std::wstring B07 = OwnerPanelPath(L"DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_fald_panel_boost_meanrule_blur0.7.bin");
-    const std::wstring SDR = OwnerPanelPath(L"DLC\\results\\fald_daily_2026-10-06\\pa32ucxr_refit_sdr_fald_panel_blur0.7.bin");
-    const std::wstring ODD(cells.begin(), cells.end());
-    REQUIRE_FALSE(C.empty());
-    auto want = [&](const char* name) { return only.empty() || std::string(name).find(only) != std::string::npos; };
-    int compared = 0, equal = 0;
-
-    // ---- stills
-    struct Still { const char* name; const char* cell; std::wstring panel; bool hdr, star; unsigned w, h; };
-    const Still stills[] = {
-        { "still_n7_lamp", "n7_lamp", C, true, true, 3840, 2160 },
-        // round 12a's three (F12A_B16), when the cell dir holds them
-        { "still_aces_m18", "aces_m18", HaveCell(cells, "aces_m18") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_aces_m52", "aces_m52", HaveCell(cells, "aces_m52") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_s10_ac_redspot", "s10_ac_redspot", HaveCell(cells, "s10_ac_redspot") ? C : std::wstring(), true, true, 3840, 2160 },
-        // round 12b's ten halo stills (F12B_V8d: dark objects next to glows, the R-2 band frame), when the cell dir holds them
-        { "still_ax_552", "ax_552", HaveCell(cells, "ax_552") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_ax_412", "ax_412", HaveCell(cells, "ax_412") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_ax_422", "ax_422", HaveCell(cells, "ax_422") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_ax_442", "ax_442", HaveCell(cells, "ax_442") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_ax_492", "ax_492", HaveCell(cells, "ax_492") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_ax_522", "ax_522", HaveCell(cells, "ax_522") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_s10_sm_windmill", "s10_sm_windmill", HaveCell(cells, "s10_sm_windmill") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_s10_sm_cows", "s10_sm_cows", HaveCell(cells, "s10_sm_cows") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_s10_sm_snowfence", "s10_sm_snowfence", HaveCell(cells, "s10_sm_snowfence") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_s10_ac_rec2020", "s10_ac_rec2020", HaveCell(cells, "s10_ac_rec2020") ? C : std::wstring(), true, true, 3840, 2160 },
-        { "still_x_naninf", "x_naninf", C, true, false, 3840, 2160 },
-        { "still_x_odd1366", "x_odd1366", ODD + L"\\odd_panel.bin", true, true, 1366, 768 },
-        { "still_sdr_n7_lamp", "n7_lamp", SDR, false, true, 3840, 2160 },
-        // a fractional zone pitch (48 x 24 over 2560 x 1440), when the cell dir holds it (test_fald_fade.cpp still_frac2560)
-        { "still_frac2560", "x_frac2560",
-          GetFileAttributesW((ODD + L"\\frac_panel_48x24.bin").c_str()) != INVALID_FILE_ATTRIBUTES ? ODD + L"\\frac_panel_48x24.bin"
-                                                                                                    : std::wstring(),
-          true, true, 2560, 1440 } };
-    for (const Still& s : stills) {
-        if (!want(s.name) || s.panel.empty()) continue;
-        HookWarp w;
-        REQUIRE(w.ok);
-        Staged staged(s.panel, s.hdr);
-        REQUIRE(staged.ok);
-        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
-        HookMonitor hm(w, s.w, s.h, s.hdr, s.star);
-        REQUIRE(hm.Load(cells + "/" + s.cell + ".rgba16f"));
-        HookMonitor::Result r;
-        const int presents = WarmUp(hm, r);
-        CHECK_MESSAGE(presents > 1, s.name << ": the fade was on at the first present (the creation is not paced)");
-        REQUIRE_MESSAGE(presents > 0, s.name << ": the fade never turned on (" << r.err << ")");
-        MESSAGE(std::string(s.name) << ": the fade on at present " << presents);
-        CompareWithOverlay(hm, r.fade, on + "/" + s.name + "/t00", s.name, compared, equal);
-    }
-
-    // ---- the seattle pan: 16 content frames, presents without new content after frames 3 and 9
-    if (want("seq_plain")) {
-        HookWarp w;
-        REQUIRE(w.ok);
-        Staged staged(C, true);
-        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
-        HookMonitor hm(w, 3840, 2160, true, true);
-        HookMonitor::Result r;
-        for (int t = 0; t < 16; t++) {
-            REQUIRE(hm.Load(SeqFrame(cells, t)));
-            if (t == 0) { REQUIRE(WarmUp(hm, r) > 0); }
-            else { r = hm.Present(true, false); REQUIRE_MESSAGE((r.ran && r.fadeOn), "seq_plain t" << t << ": " << r.err); }
-            CompareWithOverlay(hm, r.fade, RefDir(on, "seq_s10_sm_seattle__p6n", t), "seq_plain t" + std::to_string(t), compared, equal);
-            if (t == 3 || t == 9) {   // DWM recomposes with no dirty rect: nothing steps, the same output
-                r = hm.Present(false, false);
-                REQUIRE(r.ran);
-                CompareWithOverlay(hm, r.fade, RefDir(on, "seq_s10_sm_seattle__p6n", t), "seq_plain repeat t" + std::to_string(t),
-                                   compared, equal);
-            }
-        }
-    }
-
-    // ---- a live panel swap at frame 8 (the hot reload): the fade moves with the frame part and its T state resets
-    if (want("seq_swap") && !B07.empty()) {
-        HookWarp w;
-        REQUIRE(w.ok);
-        Staged staged(C, true);
-        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
-        HookMonitor hm(w, 3840, 2160, true, true);
-        HookMonitor::Result r;
-        std::vector<unsigned char> b07;
-        REQUIRE(ReadAll(std::string(B07.begin(), B07.end()), b07));
-        FaldFade* before = nullptr;
-        for (int t = 0; t < 16; t++) {
-            REQUIRE(hm.Load(SeqFrame(cells, t)));
-            if (t == 8) REQUIRE(FaldTestDeliver(0, 0, true, 1u, b07.data(), b07.size()));
-            if (t == 0) { REQUIRE(WarmUp(hm, r) > 0); }
-            else { r = hm.Present(true, false); REQUIRE_MESSAGE((r.ran && r.fadeOn), "seq_swap t" << t << ": " << r.err); }
-            if (t == 7) before = r.fade;
-            if (t == 8) CHECK_MESSAGE(r.fade == before, "the swap rebuilt the fade's resources instead of moving them");
-            if (t < 8) CompareWithOverlay(hm, r.fade, RefDir(on, "seq_s10_sm_seattle__p6n", t), "seq_swap t" + std::to_string(t), compared, equal);
-            else CompareWithOverlay(hm, r.fade, RefDir(on, "ref_seattle_from8_B07", t - 8), "seq_swap t" + std::to_string(t), compared, equal);
-        }
-    }
-
-    // ---- an idle reset at frame 8 (FaldMarkStale: the copy unprimed, T reset) and a re-injection at frame 12
-    if (want("seq_reset")) {
-        HookWarp* w = new HookWarp();
-        REQUIRE(w->ok);
-        Staged staged(C, true);
-        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
-        HookMonitor* hm = new HookMonitor(*w, 3840, 2160, true, true);
-        HookMonitor::Result r;
-        for (int t = 0; t < 16; t++) {
-            if (t == 12) {   // re-injection: everything of the DLL released, a fresh init on the same device, the files staged again
-                FaldReleaseAll();
-                FaldReleaseShaders();
-                REQUIRE(FaldInitShaders(w->dev, w->ic));
-                REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
-            }
-            REQUIRE(hm->Load(SeqFrame(cells, t)));
-            if (t == 8) FaldMarkStale(0, 0);
-            if (t == 0 || t == 12) { REQUIRE(WarmUp(*hm, r) > 0); }
-            else {
-                r = hm->Present(true, false);
-                if (!r.ran && r.err == "unprimed") r = hm->Present(true, false);   // (the stale mark costs one present)
-                REQUIRE_MESSAGE((r.ran && r.fadeOn), "seq_reset t" << t << ": " << r.err);
-            }
-            const char* ref = t < 8 ? "seq_s10_sm_seattle__p6n" : t < 12 ? "ref_seattle_from8_C" : "ref_seattle_from12_C";
-            const int rt = t < 8 ? t : t < 12 ? t - 8 : t - 12;
-            CompareWithOverlay(*hm, r.fade, RefDir(on, ref, rt), "seq_reset t" + std::to_string(t), compared, equal);
-        }
-        delete hm;
-        delete w;
-    }
-    MESSAGE("hook vs overlay: " << equal << " of " << compared << " files byte-identical");
 }
 
 // The change-driven path in the hook (hook_fald.h FaldPlanPartial; shared/fald_change.h): presents with small dirty rects
@@ -524,8 +283,8 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
         { { 300, 300, 500, 500 }, 0x0000, "the white patch to black" },
         { { 2000, 1000, 2002, 1002 }, 0x3C00, "a 2 x 2 white speck" },
     };
-    // the always-on core (shared/fald_core_mode.h): C, KC3 and KC5 (the default) — the two stateless rules whose fields the path reuses
-    for (unsigned int coreMode : { FALD_CORE_MODE_C, FALD_CORE_MODE_KC3, FALD_CORE_MODE_KC5 })
+    // the always-on core (shared/fald_core_mode.h): C (the core off) and KC5 (the default, stateless: the path reuses its fields)
+    for (unsigned int coreMode : { FALD_CORE_MODE_C, FALD_CORE_MODE_KC5 })
     for (int star = 0; star < 2; star++) {
         std::vector<std::vector<unsigned char>> outs[2];
         int partialPresents = 0;
@@ -536,8 +295,7 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
             Staged staged(C, true);
             REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
             HookMonitor hm(w, 3840, 2160, true, star != 0);
-            hm.fadeWanted = false;
-            hm.coreMode = coreMode;
+                hm.coreMode = coreMode;
             REQUIRE(hm.Load(cells + "/n7_lamp.rgba16f"));
             HookMonitor::Result r;
             for (int i = 0; i < 3; i++) { r = hm.Present(true, false); if (r.ran) break; }   // primed on the first full present
@@ -563,47 +321,6 @@ TEST_CASE("FALD hook: the change-driven path equals the full path present for pr
 }
 
 #ifdef FALD_RUN_HAS_FRAME_KEY
-// The fade's safety governor in the hook (shared/fald_fade_governor.h): WARP is a software adapter, so without the force
-// bit the governor never starts the fade — the layer runs as C (CB word 75 = 0, nothing built) and its output equals the
-// layer with the fade switched off, byte for byte; with the force bit it runs.
-TEST_CASE("FALD hook: a fade the governor holds back is C byte for byte (WARP; FALD_TEST_FADE_DIR)") {
-    const std::string cells = HookEnv("FALD_TEST_FADE_DIR");
-    if (cells.empty()) return;
-    const std::wstring ODD = std::wstring(cells.begin(), cells.end()) + L"\\odd_panel.bin";
-    auto run = [&](bool fade, bool force, int presents, HookMonitor::Result& last) {
-        HookWarp w;
-        REQUIRE(w.ok);
-        Staged staged(ODD, true);
-        REQUIRE(staged.ok);
-        REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
-        HookMonitor hm(w, 1366, 768, true, true);
-        hm.fadeWanted = fade;
-        hm.forceFade = force;
-        REQUIRE(hm.Load(cells + "/x_odd1366.rgba16f"));
-        for (int i = 0; i < presents; i++) {
-            last = hm.Present(true, true);
-            if (!last.ran && last.err == "unprimed") { i--; continue; }
-            REQUIRE_MESSAGE(last.ran, last.err);
-        }
-        return ReadBackTex(w.dev, w.ic, hm.back);
-    };
-    HookMonitor::Result r;
-    const std::vector<unsigned char> C = run(false, false, 3, r);
-    CHECK(r.govState == 0u);                               // Off: the setting is off
-    const std::vector<unsigned char> held = run(true, false, 40, r);
-    CHECK(r.govState == 3u);                               // SuspendedWeakGpu
-    CHECK_FALSE(r.fadeOn);
-    CHECK(r.fade == nullptr);
-    CHECK(r.word75 == 0u);
-    REQUIRE(!C.empty());
-    CHECK(held == C);
-    const std::vector<unsigned char> forced = run(true, true, 40, r);
-    CHECK(r.govState == 4u);                               // Forced
-    CHECK(r.fadeOn);
-    CHECK(r.word75 == 1u);
-    CHECK(forced != C);
-}
-
 // The core governor's cap in the hook (shared/fald_core_governor.h): a held run keeps the entry's fields, reproduces the
 // full run's output on the same frame, corrects a new frame with the old fields, and leaves no residue — the full run
 // after it equals a fresh entry's full run on the same frames.
@@ -631,7 +348,6 @@ TEST_CASE("FALD hook: a held run (the core governor's cap) keeps the fields and 
         REQUIRE(staged.ok);
         REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
         HookMonitor hm(w, 1366, 768, true, false);
-        hm.fadeWanted = false;
         REQUIRE(hm.Load(cells + "/x_odd1366.rgba16f"));
         g_faldCoreHoldOverride = 0;
         HookMonitor::Result r = present(hm);                   // full (primed)
@@ -660,7 +376,6 @@ TEST_CASE("FALD hook: a held run (the core governor's cap) keeps the fields and 
         REQUIRE(staged.ok);
         REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
         HookMonitor hm(w, 1366, 768, true, false);
-        hm.fadeWanted = false;
         REQUIRE(hm.Load(cells + "/x_odd1366.rgba16f"));
         present(hm);
         whitePatch(hm.frame);
@@ -825,8 +540,7 @@ TEST_CASE("FALD hook: the panel clock (LED lag mode 3) equals the overlay's and 
             REQUIRE(staged.ok);
             REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
             HookMonitor hm(w, kClockW, kClockH, true, true);
-            hm.fadeWanted = false;
-            hm.tuning = &tuning;
+                hm.tuning = &tuning;
             hm.frame = base;
             const long long t0 = HkQpc() + periodQpc / 4;   // the schedule starts after the shaders compiled
             for (int i = 0; i < kClockStepCount; i++) {
@@ -940,7 +654,6 @@ TEST_CASE("FALD hook: the frame-changed word (the dynamic peak) keeps the change
         REQUIRE(staged.ok);
         REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
         HookMonitor hm(w, kClockW, kClockH, true, true);
-        hm.fadeWanted = false;
         hm.frame = base;
         // the word's buffer: (4, moved, 0, 0) as the smoothing pass writes it
         D3D11_BUFFER_DESC bd = {};
@@ -1003,12 +716,12 @@ TEST_CASE("FALD hook: the frame-changed word (the dynamic peak) keeps the change
     MESSAGE("the dynamic peak: " << partialWithWord << " of " << n << " presents partial with the word, exact on all; the whole frame redone on "
             << movedSteps << " of them by the GPU's own decision");
 }
-// The always-on core round 2 — PROTOTYPE (shared/fald_core2.h; faldFlags bit 16): the hook's layer with the core on equals
-// the overlay's, BYTE FOR BYTE, on the frames of DLC tests/test_fald_core2_warp.py (FALD_TEST_CORE2_DIR: panel.bin,
-// fNN.rgba16f and the overlay's dumps dNN/fald_out.rgba16f from tests/test_fald_core2.cpp's case, run first). Both advance the
-// zone IIR by one refresh per run (g_faldCore2TestRefreshes); the flank fade and the starfield are off.
+// The always-on core KC5 (shared/fald_core2.h; faldFlags bits 16-19): the hook's layer with the core on equals the
+// overlay's, BYTE FOR BYTE, on the frames of DLC tests/test_fald_core2_warp.py (FALD_TEST_CORE2_DIR: panel.bin,
+// fNN.rgba16f and the overlay's dumps dNN/fald_out.rgba16f from tests/test_fald_core2.cpp's case, run first); the starfield
+// is off.
 #include "../shared/fald_core2.h"
-TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overlay's, frame for frame (WARP; FALD_TEST_CORE2_DIR)") {
+TEST_CASE("FALD hook: the always-on core in the DWM hook's layer equals the overlay's, frame for frame (WARP; FALD_TEST_CORE2_DIR)") {
     const std::string dir = HookEnv("FALD_TEST_CORE2_DIR");
     if (dir.empty()) return;
     std::ifstream probe(dir + "/d00/fald_out.rgba16f", std::ios::binary);
@@ -1022,21 +735,14 @@ TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overla
     REQUIRE(staged.ok);
     REQUIRE(FaldLoadPanelFiles(staged.root.c_str()) == 1);
     HookMonitor hm(w, 960, 540, true, false);
-    hm.fadeWanted = false;
-    hm.forceFade = false;
-    {
-        char mv[8] = {};
-        const bool got = GetEnvironmentVariableA("FALD_TEST_CORE2_MODE", mv, sizeof(mv)) > 0;
-        hm.coreMode = (got && mv[0] == '2') ? 2u : ((got && mv[0] == '4') ? 4u : 1u);   // 1 KC2c (default), 2 KC3, 4 KC5
-    }
-    g_faldCore2TestRefreshes = 1;
+    hm.coreMode = FALD_CORE_MODE_KC5;
     int compared = 0;
     for (int run = 0; run < 100; run++) {
         char name[64];
         snprintf(name, sizeof(name), "/f%02d.rgba16f", run);
         if (!hm.Load(dir + name)) break;
         HookMonitor::Result r;
-        for (int tries = 0; tries < 50; tries++) {          // unprimed presents do not run the layer (no IIR step)
+        for (int tries = 0; tries < 50; tries++) {          // unprimed presents do not run the layer
             r = hm.Present(true, false);
             if (r.ran || r.err != "unprimed") break;
         }
@@ -1048,7 +754,6 @@ TEST_CASE("FALD hook: the core round 2 in the DWM hook's layer equals the overla
         CHECK_MESSAGE(got == ref, "run " << run << ": the hook's output differs from the overlay's");
         compared++;
     }
-    g_faldCore2TestRefreshes = 0;
     CHECK(compared > 0);
 }
 

@@ -188,15 +188,15 @@ FaldShaderSources LegacySources() {
     // range header), which the frozen conv cannot read, and the frozen set has no fused gain + blur pass: both come from
     // the current header here; so does the statistic pass, which finishes the black-frame boost itself since the same day
     // (the frozen set expects the boost pass that no longer exists). Their identity with the earlier passes is held by the
-    // fade-OFF manifest recorded on main (tests/fixtures/fald_fade_off_main.hashes) and the fused-vs-three-pass case in
-    // test_fald_fade.cpp.
+    // fade-OFF manifest recorded on main (tests/fixtures/fald_fade_off_main.hashes, now checked by test_fald_layer_gate.cpp)
+    // and the fused-vs-three-pass case there.
     // ... and the current statistic pass needs the current common source (the zone list, the run mode, the change flags);
     // the frozen passes below compile against it too (they use nothing it lost). What this case still holds bit for bit:
-    // the frozen gain / blur (the three passes, forced by g_faldGainFusedOverride below), temporal, panel clock, starfield
+    // the frozen gain / blur (the three passes, forced by g_faldGainFusedOverride below), panel clock, starfield
     // S0 / S1 / S2 and pixel passes against today's — i.e. the 2026-10-22 rewrites of S2, the fused gain + blur and the
     // compared LED-lag passes. The pre-fractional-pitch zone math was held to the fractional one when that landed (429cffa).
     s.common = g_faldCommonSource; s.stat = g_faldStatSource; s.conv = g_faldConvSource; s.gain = L::g_faldGainSource;
-    s.blur = L::g_faldBlurSource; s.gainBlur = g_faldGainBlurSource; s.temporal = L::g_faldTemporalSource; s.panelClock = L::g_faldPanelClockSource;
+    s.blur = L::g_faldBlurSource; s.gainBlur = g_faldGainBlurSource; s.panelClock = L::g_faldPanelClockSource;
     s.starStat = L::g_faldStarStatSource; s.starWeight = L::g_faldStarWeightSource;
     // The starfield's lift was retired 2026-10-26: CB word 53 is now starRetired53, always 0. The frozen plan pass still
     // computes its lift from that word, so at 0 it holds today's lift-free S2 + Balance to the pre-retirement maths.

@@ -4,7 +4,7 @@
 #include "settings.h"
 #include "globals.h"
 #include "monitor_identity.h"
-#include "fald.h"    // FALD_TAU_MAX_MS, FaldStarfieldClamp
+#include "fald.h"    // FaldStarfieldClamp, the LED-lag helpers (shared/fald_temporal.h)
 #include "displayconfig.h"   // IsValidSdrWhiteNits
 #include "grayscale_validate.h"
 #include "windows_tonemap.h"   // WindowsToneMapKey / ParseWindowsToneMap
@@ -301,16 +301,11 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     WritePrivateProfileBool(section, (p + L"FaldEnabled").c_str(), cc.fald.enabled, iniPath);
     IniWriteString(section, (p + L"FaldParamsPath").c_str(), cc.fald.paramsPath.c_str(), iniPath);
     WritePrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), cc.fald.pedMode == 1, iniPath);
-    // temporal drive state (LED-lag filter): mode 0/1/2 + rise/fall time constants in ms (0 = instant on that edge);
-    // mode 3 = panel clock (work guide C13) with its closure per tick + tick parity (-1 unknown / 0 / 1)
-    IniWriteString(section, (p + L"FaldTemporalMode").c_str(), std::to_wstring(cc.fald.temporalMode).c_str(), iniPath);
-    WritePrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), cc.fald.tauRiseMs, iniPath);
-    WritePrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), cc.fald.tauFallMs, iniPath);
-    IniWriteString(section, (p + L"FaldDelayFrames").c_str(), std::to_wstring(cc.fald.delayFrames).c_str(), iniPath);
+    // LED lag: mode 0 (off) / 3 (the panel clock, work guide C13) with its closure per tick + tick parity (-1 unknown / 0 / 1)
+    IniWriteString(section, (p + L"FaldTemporalMode").c_str(), std::to_wstring(FaldTemporalModeOf(cc.fald.temporalMode)).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldTemporalClosure").c_str(), cc.fald.clockClosure, iniPath);
-    // (FALD_CLOCK_PARITY_MEAN, the blind A/B's plain-mean arm, is a test value: the INI keeps "unknown")
     IniWriteString(section, (p + L"FaldTemporalParity").c_str(),
-                   std::to_wstring(cc.fald.clockParity == FALD_CLOCK_PARITY_MEAN ? -1 : cc.fald.clockParity).c_str(), iniPath);
+                   std::to_wstring(FaldPanelClockParity(cc.fald.clockParity)).c_str(), iniPath);
     // starfield balancing (experimental, default off; work guide S1): the GUI row's values + the INI/pipe-only ones
     const FaldStarfieldSettings& st = cc.fald.star;
     WritePrivateProfileBool(section, (p + L"FaldStarfield").c_str(), st.enabled, iniPath);
@@ -327,9 +322,12 @@ void SaveColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     IniWriteString(section, (p + L"FaldStarReach").c_str(), std::to_wstring(st.reach).c_str(), iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbLo").c_str(), st.nbLo, iniPath);
     WritePrivateProfileFloat(section, (p + L"FaldStarNbHi").c_str(), st.nbHi, iniPath);
-    // the frozen fade stack (ASF10 + T11_TMTC; default off) and item L (reserved: persisted, read by nothing yet)
-    WritePrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), cc.fald.flankFade, iniPath);
-    WritePrivateProfileBool(section, (p + L"FaldLowExt").c_str(), cc.fald.lowExt, iniPath);
+    // keys of removed FALD features, deleted so a saved file carries no dead switch (an old file loads without them):
+    // LED lag modes 1 / 2's time constants and delay, the flank fade, its reserved item L, the core's A/B test mode
+    // (2026-11-12)
+    for (const wchar_t* k : { L"FaldTauRiseMs", L"FaldTauFallMs", L"FaldDelayFrames", L"FaldFlankFade", L"FaldLowExt",
+                              L"FaldCoreModeTest" })
+        IniWriteString(section, (p + k).c_str(), nullptr, iniPath);
     // the glow fill's keys (work guide S2, removed 2026-10-07): deleted, so a saved file carries no dead switch
     for (const wchar_t* k : { L"FaldGlowFill", L"FaldGlowStrength", L"FaldGlowReach", L"FaldGlowCapNits" })
         IniWriteString(section, (p + k).c_str(), nullptr, iniPath);
@@ -362,16 +360,11 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
     cc.fald.paramsPath = faldBuf;
     cc.fald.pedMode = GetPrivateProfileBool(section, (p + L"FaldPerChannelPedestal").c_str(), false, iniPath) ? 1u : 0u;
     {
-        // temporal drive state: an unknown mode is OFF, time constants are clamped to 0..FALD_TAU_MAX_MS
-        int tmode = (int)GetPrivateProfileIntW(section, (p + L"FaldTemporalMode").c_str(), 0, iniPath);
-        cc.fald.temporalMode = (tmode >= 0 && tmode <= (int)FALD_TEMPORAL_PANEL) ? (unsigned int)tmode : 0u;
-        float rise = GetPrivateProfileFloat(section, (p + L"FaldTauRiseMs").c_str(), 0.0f, iniPath);
-        float fall = GetPrivateProfileFloat(section, (p + L"FaldTauFallMs").c_str(), 0.0f, iniPath);
-        auto clampTau = [](float v) { return (v != v || v < 0.0f) ? 0.0f : (v > FALD_TAU_MAX_MS ? FALD_TAU_MAX_MS : v); };
-        cc.fald.tauRiseMs = clampTau(rise);
-        cc.fald.tauFallMs = clampTau(fall);
-        int delay = (int)GetPrivateProfileIntW(section, (p + L"FaldDelayFrames").c_str(), 0, iniPath);
-        cc.fald.delayFrames = delay < 0 ? 0u : (delay > (int)FALD_DELAY_MAX ? FALD_DELAY_MAX : (unsigned int)delay);
+        // LED lag: 3 = the panel clock; anything else is OFF — 1 / 2 (the first-order filter, removed 2026-11-12) included:
+        // that filter was rejected as the panel's law, and the panel clock is a different, panel-specific law the user
+        // did not choose. FaldTauRiseMs / FaldTauFallMs / FaldDelayFrames (its parameters) are no longer read.
+        const int tmode = (int)GetPrivateProfileIntW(section, (p + L"FaldTemporalMode").c_str(), 0, iniPath);
+        cc.fald.temporalMode = FaldTemporalModeOf(tmode < 0 ? 0u : (unsigned int)tmode);
         // panel clock (mode 3): closure clamped to 0.05..1 (NaN -> 0.72), parity -1 / 0 / 1 (anything else -> -1 = unknown).
         // Read as text: GetPrivateProfileInt does not promise negative numbers, and an empty / garbage value must not
         // parse to 0 (a KNOWN parity).
@@ -402,14 +395,8 @@ void LoadColorCorrectionSettings(const wchar_t* section, const wchar_t* prefix,
         FaldStarfieldClamp(st);
         cc.fald.star = st;
     }
-    // the frozen fade stack: an INI without the key loads OFF (= the layer before the port, bit for bit); item L reserved
-    cc.fald.flankFade = GetPrivateProfileBool(section, (p + L"FaldFlankFade").c_str(), false, iniPath);
-    {   // the always-on core's switch (shared/fald_core_mode.h FALD_CORE_MODES; absent = the default KC5; 0 / 1 / 2 = C / KC2c / KC3 for an
-        // A/B check; a reserved or unknown number = the default): read, never written
-        const int cm = (int)GetPrivateProfileIntW(section, (p + L"FaldCoreModeTest").c_str(), (int)FALD_CORE_MODE_DEFAULT, iniPath);
-        cc.fald.coreMode = (cm >= 0 && FaldCoreModeKnown((uint32_t)cm)) ? (uint32_t)cm : FALD_CORE_MODE_DEFAULT;
-    }
-    cc.fald.lowExt = GetPrivateProfileBool(section, (p + L"FaldLowExt").c_str(), false, iniPath);
+    // (<mode>_FaldFlankFade, <mode>_FaldLowExt and <mode>_FaldCoreModeTest are no longer read: the flank fade and item L
+    // are gone, the core is KC5 — FaldSettings' default — whatever an old file says; SaveColorCorrectionSettings deletes them)
 }
 
 void SaveMHCSettings(const wchar_t* section, const wchar_t* prefix,
@@ -1234,6 +1221,7 @@ void SaveSettings() {
     IniWriteString(L"General", L"GammaWhitelist", NormalizeWhitelistRaw(g_gammaWhitelistRaw).c_str(), iniPath.c_str());
     WritePrivateProfileBool(L"General", L"VRRWhitelistEnabled", g_vrrWhitelistEnabled.load(), iniPath.c_str());
     IniWriteString(L"General", L"VRRWhitelist", NormalizeWhitelistRaw(g_vrrWhitelistRaw).c_str(), iniPath.c_str());
+    IniWriteString(L"General", L"FaldFlankFadeForce", nullptr, iniPath.c_str());   // the removed flank fade's (2026-11-12)
 
     // Save hotkey settings
     WritePrivateProfileBool(L"General", L"HotkeyGammaEnabled", g_hotkeyGammaEnabled.load(), iniPath.c_str());
@@ -1311,10 +1299,9 @@ bool LoadSettings() {
     // DesktopGamma is now per-monitor (derived from MHCDesktopGamma after monitors load below)
     g_tetrahedralInterp.store(GetPrivateProfileBool(L"General", L"TetrahedralInterp", true, iniPath.c_str()));
     g_hdrDither.store(GetPrivateProfileBool(L"General", L"HdrDither", true, iniPath.c_str()));
-    // The flank fade's safety governor forced on (fald.h g_faldFadeForce; REFERENCE.md): an INI-only key, read, never
-    // written (absent = 0 = the governor decides)
-    g_faldFadeForce.store(GetPrivateProfileBool(L"General", L"FaldFlankFadeForce", false, iniPath.c_str()));
-    // The core layer's rate-cap governor forced off (fald.h g_faldCoreForce; REFERENCE.md): the same kind of key
+    // The core layer's rate-cap governor forced off (fald.h g_faldCoreForce; REFERENCE.md): an INI-only key, read, never
+    // written (absent = 0 = the governor decides). ([General] FaldFlankFadeForce, the removed flank fade's, is not read:
+    // SaveSettings deletes it.)
     g_faldCoreForce.store(GetPrivateProfileBool(L"General", L"FaldCoreForce", false, iniPath.c_str()));
     g_logPeakDetection.store(GetPrivateProfileBool(L"General", L"LogPeakDetection", false, iniPath.c_str()));
     g_consoleEnabled.store(GetPrivateProfileBool(L"General", L"ConsoleLog", false, iniPath.c_str()));

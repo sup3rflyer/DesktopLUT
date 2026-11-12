@@ -276,10 +276,6 @@ TEST_CASE("FALD layer gate: every field and the output hash as the reference bui
     if (cellDir.empty()) return;
     const std::string record = LgEnv("FALD_TEST_LAYER_RECORD"), ref = LgEnv("FALD_TEST_LAYER_REF");
     const bool strict = LgEnv("FALD_TEST_LAYER_STRICT") == "1";
-    // with a stateful core mode the IIR advances exactly one refresh per run whatever WARP's timing (the test seam), so two
-    // builds hash the same sequence (KC5 and C are stateless: the seam changes nothing there)
-    const unsigned long long savedRefreshes = g_faldCore2TestRefreshes;
-    g_faldCore2TestRefreshes = atoi(LgEnv("FALD_TEST_CORE_MODE").c_str()) > 0 ? 1ull : 0ull;
     const std::vector<LgCell> cells = LgReadCells(cellDir);
     REQUIRE_FALSE(cells.empty());
     LgWarp w;
@@ -294,7 +290,6 @@ TEST_CASE("FALD layer gate: every field and the output hash as the reference bui
         CHECK_MESSAGE(ok, rs.id << ": " << err);
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    g_faldCore2TestRefreshes = savedRefreshes;
     MESSAGE(runs.size() << " runs, " << man.size() << " hashes, " << s << " s (core mode " << LgEnv("FALD_TEST_CORE_MODE") << ")");
     if (!record.empty()) {
         std::string text;
@@ -361,7 +356,6 @@ std::vector<LgPass> LgLayerPasses() {
         { "starWeight", common + s.starWeight, "cs_5_0" }, { "starPlan", common + s.starPlan, "cs_5_0" },
         { "statCombine", std::string(s.zoneCombineDefine) + common + s.stat, "cs_5_0" },
         { "starStatCombine", std::string(s.zoneCombineDefine) + common + s.starStat, "cs_5_0" } };
-    if (s.clockMeanDefine) p.push_back({ "panelClockMean", std::string(s.clockMeanDefine) + common + s.panelClock, "cs_5_0" });
     for (unsigned int v = 0; v < FALD_CONV_SO_VARIANTS; v++)
         p.push_back({ "conv" + std::to_string(v), std::string(g_faldConvSoDefine[v]) + common + s.conv, "cs_5_0" });
     return p;

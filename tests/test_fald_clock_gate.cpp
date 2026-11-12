@@ -176,7 +176,7 @@ struct CkLayer {
         w.ic->Flush();
         const FaldResources* r = ctx.fald;
         std::vector<std::pair<const char*, ID3D11Texture2D*>> tex = {
-            { "drive", r->driveTex }, { "drive_filt", r->driveFiltTex }, { "drive_state", r->driveStateTex },
+            { "drive", r->driveTex }, { "drive_filt", r->driveFiltTex },
             { "active_r0", r->activeTex[0] }, { "active_r1", r->activeTex[1] }, { "boost_r0", r->boostTex[0] }, { "boost_r1", r->boostTex[1] },
             { "btrue", r->bTrueTex }, { "best", r->bEstTex }, { "gainB", r->gainBTex },
             { "star_stat", r->starStatTex }, { "star_w", r->starWTex }, { "star_plan", r->starPlanTex }, { "star_plan2", r->starPlan2Tex },
@@ -185,7 +185,7 @@ struct CkLayer {
             { "OUTPUT", target } };
 #ifdef FALD_RUN_HAS_RECTS
         const std::pair<const char*, ID3D11Texture2D*> more[] = {   // the branch's round-0 maps (full vs partial only)
-            { "drive0", r->drive0Tex }, { "drive_filt0", r->driveFilt0Tex }, { "btrue0", r->bTrue0Tex }, { "best0", r->bEst0Tex },
+            { "drive0", r->drive0Tex }, { "btrue0", r->bTrue0Tex }, { "best0", r->bEst0Tex },
             { "gain0", r->gain0Tex }, { "fields0", r->fields0Tex }, { "fields", r->fieldsTex } };
         for (const auto& t : more) tex.push_back(t);
 #endif
@@ -196,7 +196,7 @@ struct CkLayer {
 };
 // the textures main 4207200 has (the manifest's lines); the branch's round-0 maps are compared between its two contexts only
 bool CkIsCommon(const std::string& name) {
-    static const char* const common[] = { "drive", "drive_filt", "drive_state", "active_r0", "active_r1", "boost_r0", "boost_r1", "btrue", "best",
+    static const char* const common[] = { "drive", "drive_filt", "active_r0", "active_r1", "boost_r0", "boost_r1", "btrue", "best",
                                           "gainB", "star_stat", "star_w", "star_plan", "star_plan2", "star_bg", "clk_state0", "clk_state1",
                                           "clk_prev", "clk_est", "OUTPUT" };
     for (const char* c : common) if (name == c) return true;
@@ -319,13 +319,18 @@ TEST_CASE("FALD panel clock gate: a scheduled mode-3 sequence hashes as on main,
             std::string cfgStep, field, a, b;
             if (is >> cfgStep >> field >> a >> b) want[cfgStep + " " + field] = a + " " + b;
         }
-        REQUIRE(want.size() == man.size());
-        size_t bad = 0;
+        // every line of this run must be in the reference with the same bytes; reference lines this build no longer
+        // hashes (a texture a removal took away: 2026-11-12, LED lag modes 1 / 2's drive_state) are listed, not failed
+        size_t bad = 0, onlyRef = 0;
         for (const auto& kv : man) {
             auto it = want.find(kv.first);
             const bool same = it != want.end() && it->second == kv.second;
             if (!same && bad++ < 40) MESSAGE("MISMATCH " << kv.first << ": " << kv.second << " vs " << (it == want.end() ? "absent" : it->second));
         }
+        for (const auto& kv : want)
+            if (!man.count(kv.first) && onlyRef++ < 40) MESSAGE("only in the reference: " << kv.first);
+        MESSAGE((man.size() - bad) << " lines equal, " << bad << " differ, " << onlyRef << " only in the reference");
         CHECK(bad == 0u);
+        CHECK(man.size() > 0u);
     }
 }

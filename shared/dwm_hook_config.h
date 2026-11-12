@@ -131,38 +131,29 @@ static_assert(MAX_DWM_HOOK_MONITORS <= 32, "lutOffMask holds one bit per monitor
 
 // Starfield (work guide S1). Bit 7 was the glow fill's (S2, removed 2026-10-07): never set, ignored.
 #define DWM_HOOK_FALD_STAR_BIT      0x00000040u   // bit 6: starfield balancing
-// The frozen fade stack ASF10 + T11_TMTC (shared/fald_fade.h): bit 8. Bit 9 = item L (the 1-3-nit extension, round 12):
-// RESERVED, never set by this host and ignored by this DLL. Bits 10-31 free. A host that predates bit 8 sends 0 = off.
-#define DWM_HOOK_FALD_FADE_BIT      0x00000100u   // bit 8: flank fade
-#define DWM_HOOK_FALD_LOWEXT_BIT    0x00000200u   // bit 9: item L (reserved)
+// Bits 8-10 were the flank fade's (bit 8 the fade, 9 its reserved item L, 10 its governor forced; removed 2026-11-12, tag
+// archive/fald-flank-fade): never set by this host, ignored by this DLL. A resident DLL that predates the removal reads
+// them 0 = the fade off.
 
-static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int fade = 0,
-                                       int fadeForce = 0, int coreForce = 0) {
+static inline uint32_t DwmHookFaldPack(int enabled, uint32_t debugMode, int pedMode, int star = 0, int coreForce = 0) {
     if (debugMode > DWM_HOOK_FALD_DEBUG_MAX) debugMode = 0;
     return (enabled ? DWM_HOOK_FALD_ENABLED_BIT : 0u)
          | ((debugMode << DWM_HOOK_FALD_DEBUG_SHIFT) & DWM_HOOK_FALD_DEBUG_MASK)
          | (pedMode ? DWM_HOOK_FALD_PEDMODE_BIT : 0u)
          | (star ? DWM_HOOK_FALD_STAR_BIT : 0u)
-         | (fade ? DWM_HOOK_FALD_FADE_BIT : 0u)
-         | (fadeForce ? 0x00000400u : 0u)    // DWM_HOOK_FALD_FADE_FORCE_BIT (below)
          | (coreForce ? 0x00000800u : 0u);   // DWM_HOOK_FALD_CORE_FORCE_BIT (below)
 }
 static inline int      DwmHookFaldEnabled(uint32_t w)  { return (w & DWM_HOOK_FALD_ENABLED_BIT) != 0; }
 static inline uint32_t DwmHookFaldDebugMode(uint32_t w) { return (w & DWM_HOOK_FALD_DEBUG_MASK) >> DWM_HOOK_FALD_DEBUG_SHIFT; }
 static inline int      DwmHookFaldPedMode(uint32_t w)  { return (w & DWM_HOOK_FALD_PEDMODE_BIT) != 0; }
 static inline int      DwmHookFaldStar(uint32_t w)     { return (w & DWM_HOOK_FALD_STAR_BIT) != 0; }
-static inline int      DwmHookFaldFade(uint32_t w)     { return (w & DWM_HOOK_FALD_FADE_BIT) != 0; }
-// The flank fade's safety governor (shared/fald_fade_governor.h) forced on: INI [General] FaldFlankFadeForce=1 — never
-// suspended, whatever the adapter or the cost. Bit 10; a host that predates it sends 0 (the governor decides).
-#define DWM_HOOK_FALD_FADE_FORCE_BIT 0x00000400u
-static inline int      DwmHookFaldFadeForce(uint32_t w) { return (w & DWM_HOOK_FALD_FADE_FORCE_BIT) != 0; }
 // The core layer's rate-cap governor (shared/fald_core_governor.h) forced off: INI [General] FaldCoreForce=1 — the full
 // path on every present whatever it costs. Bit 11; a host that predates it sends 0 (the governor decides).
 #define DWM_HOOK_FALD_CORE_FORCE_BIT 0x00000800u
 static inline int      DwmHookFaldCoreForce(uint32_t w) { return (w & DWM_HOOK_FALD_CORE_FORCE_BIT) != 0; }
-// The always-on core's mode (shared/fald_core_mode.h FALD_CORE_MODES; FaldSettings::coreMode): bits 16-19, set by
-// DwmHookFaldPackCore2 on top of DwmHookFaldPack. 0 = C, 1 KC2c, 2 KC3, 3 reserved (KC4), 4 KC5 (the default); a host that
-// predates it sends 0 = C; a mode the DLL does not know runs as C. (Two bits until 2026-10-23: the table outgrew them.)
+// The always-on core's mode (shared/fald_core_mode.h; FaldSettings::coreMode): bits 16-19, set by DwmHookFaldPackCore2 on
+// top of DwmHookFaldPack. 0 = C (the core off), 4 = KC5 (the default; 1 / 2 / 3 were the removed test modes KC2c / KC3 /
+// KC4); a host that predates it sends 0 = C; a mode the DLL does not run runs as C.
 #define DWM_HOOK_FALD_CORE_SHIFT 16
 #define DWM_HOOK_FALD_CORE_MASK  0x000F0000u
 static inline uint32_t DwmHookFaldPackCore2(uint32_t w, uint32_t coreMode) {
@@ -171,10 +162,10 @@ static inline uint32_t DwmHookFaldPackCore2(uint32_t w, uint32_t coreMode) {
 static inline uint32_t DwmHookFaldCoreMode(uint32_t w) { return (w & DWM_HOOK_FALD_CORE_MASK) >> DWM_HOOK_FALD_CORE_SHIFT; }
 
 // ---------------------------------------------------------------------------
-// The flank fade governor's status, DLL -> host
+// The FALD governors' status, DLL -> host
 // ---------------------------------------------------------------------------
-// Per FALD entry of the DLL (position + mode) the governor's state and numbers, for the host's FALD panel note, Events
-// line and state.get. The host creates the section (beside the config, NULL DACL) and only reads it; the DLL opens it
+// Per FALD entry of the DLL (position + mode) the core governor's state and numbers, for the host's FALD panel note,
+// Events line and state.get. The host creates the section (beside the config, NULL DACL) and only reads it; the DLL opens it
 // (retried rarely, never per present) and writes an entry when it changes, under the block's seqlock: it takes the
 // write by a compare-exchange of `version` from even v to v + 1 (busy or odd = another writer — a second present thread
 // or a second session's dwm.exe — and this write waits for a later present: no spin, no wait), copies, then stores
@@ -185,19 +176,8 @@ static inline uint32_t DwmHookFaldCoreMode(uint32_t w) { return (w & DWM_HOOK_FA
 #define DWM_HOOK_FALD_STATUS_SLOTS  16
 
 #pragma pack(push, 4)
-struct DwmHookFaldFadeStatusEntry {
-    int32_t  left, top;              // the monitor (DwmHookMonitorConfig match key)
-    uint32_t isHdr;                  // the mode of the entry (1 HDR, 0 SDR under ACM)
-    uint32_t state;                  // FaldFadeGovState: 0 off, 1 running, 2 suspended over budget, 3 suspended weak GPU,
-                                     // 4 forced
-    float    p90Us, budgetUs;        // running: the window's p90 / budget; suspended over budget: the ones that did it
-    float    contentMs, refreshMs;   // the content-frame interval the budget comes from, the refresh-interval cap
-    uint32_t generation;             // the governor's: bumps on every state change
-    uint32_t used;                   // 1 = this slot holds an entry
-    uint32_t _reserved[2];
-};
-// The core layer's rate-cap governor (shared/fald_core_governor.h), per entry as the fade's: appended after the fade
-// entries (a DLL that predates it never writes them: used 0 = no status known).
+// The core layer's rate-cap governor (shared/fald_core_governor.h), per entry: after the 16 retired flank-fade entries
+// (a DLL that predates it never writes them: used 0 = no status known).
 struct DwmHookFaldCoreStatusEntry {
     int32_t  left, top;              // the monitor (DwmHookMonitorConfig match key)
     uint32_t isHdr;                  // the mode of the entry (1 HDR, 0 SDR under ACM)
@@ -211,7 +191,7 @@ struct DwmHookFaldCoreStatusEntry {
 };
 // DwmHookFaldCoreStatusEntry::extra (the overlay publishes the same word): bits 0-7 the conv pass's sub-offsets per thread in
 // use (S = 1 / 2 / 4 / 8; 0 = unknown), bits 8-15 its auto-tune's state (shared/fald_conv_tune.h FaldConvTuner::State: 0 policy,
-// 1 cached, 2 tuning, 3 tuned), bits 16-19 the always-on core's mode applied (shared/fald_core_mode.h FALD_CORE_MODES), bit
+// 1 cached, 2 tuning, 3 tuned), bits 16-19 the always-on core's mode applied (shared/fald_core_mode.h: 0 C, 4 KC5), bit
 // 20 = the core runs (its shaders compiled and its textures exist).
 static inline uint32_t DwmHookFaldCoreExtra(uint32_t convSo, uint32_t tuneState, uint32_t coreMode, int coreOn) {
     return (convSo & 0xFFu) | ((tuneState & 0xFFu) << 8) | ((coreMode & 0xFu) << 16) | (coreOn ? (1u << 20) : 0u);
@@ -225,12 +205,15 @@ struct DwmHookFaldStatus {
     uint32_t magic;                  // DWM_HOOK_FALD_STATUS_MAGIC once a DLL wrote
     uint32_t dwmPid;                 // the writer
     uint32_t _reserved;
-    DwmHookFaldFadeStatusEntry entry[DWM_HOOK_FALD_STATUS_SLOTS];
+    // the flank fade governor's entries (48 bytes each; removed 2026-11-12): never written by this DLL, never read by
+    // this host. Kept so `core` stays where a resident DLL that predates the removal writes it (an older DLL with the
+    // fade off never wrote them either).
+    uint32_t _retiredFadeEntry[DWM_HOOK_FALD_STATUS_SLOTS][12];
     DwmHookFaldCoreStatusEntry core[DWM_HOOK_FALD_STATUS_SLOTS];
 };
 #pragma pack(pop)
-static_assert(sizeof(DwmHookFaldFadeStatusEntry) == 48, "DwmHookFaldFadeStatusEntry layout");
 static_assert(sizeof(DwmHookFaldCoreStatusEntry) == 48, "DwmHookFaldCoreStatusEntry layout");
+static_assert(offsetof(DwmHookFaldStatus, core) == 16 + 48 * DWM_HOOK_FALD_STATUS_SLOTS, "core must stay after the retired fade entries");
 static_assert(sizeof(DwmHookFaldStatus) == 16 + 96 * DWM_HOOK_FALD_STATUS_SLOTS, "DwmHookFaldStatus layout");
 
 // ---------------------------------------------------------------------------
@@ -312,9 +295,11 @@ struct DwmHookFaldTuning {           // per monitors[] index: the settings of th
     uint32_t _retiredGlow[3];
     // LED lag = the temporal drive state (shared/fald_temporal.h FaldTemporalSettings) + the monitor's refresh period
     // (mode 3's grid). Taken from _reserved: a tail from a host that predates them reads 0 = LED lag off.
-    uint32_t tempMode;               // 0 off, 1 both fields, 2 B_true only, 3 panel clock
-    float    tempTauRiseMs, tempTauFallMs;
-    uint32_t tempDelayFrames;
+    uint32_t tempMode;               // 0 off, 3 panel clock (1 / 2, the removed first-order modes, run as off)
+    // the removed modes 1 / 2's time constants and delay (2026-11-12): written 0, never read. Kept so the fields below stay
+    // where an already-resident DLL (layoutVersion 1) reads them.
+    float    _retiredTauRiseMs, _retiredTauFallMs;
+    uint32_t _retiredDelayFrames;
     float    tempClockClosure;
     int32_t  tempClockParity;        // -1 unknown, 0, 1
     float    refreshMs;              // exact nominal refresh period of this monitor (DisplayConfig vSyncFreq); 0 = unknown

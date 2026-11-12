@@ -8,7 +8,7 @@
 //       * view on + rects: inside every rect the output is the CORRECTED output byte for byte, outside it is the view's;
 //       * view off + rects: the output is the corrected output byte for byte (no rect is drawn);
 //       * the rasterizer state and the scissor rects the caller had bound are bound again afterwards (DWM's own state).
-//   The normal output with no rects is held to main by the OFF manifest (tests/test_fald_fade.cpp, opt-in).
+//   The normal output with no rects is held to main by the layer gate (tests/test_fald_layer_gate.cpp, opt-in).
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -407,7 +407,7 @@ struct HookRig {
             ic->UpdateSubresource(back, 0, nullptr, frame.data(), (UINT)kW * 8u, 0);
             FaldMonitor* m = FaldAcquire(0, 0, true, kW, kH, DXGI_FORMAT_R16G16B16A16_FLOAT);
             if (!m) return out;
-            FaldSetLiveSettings(m, view, 0, false, &tuning, false, monW, monH);
+            FaldSetLiveSettings(m, view, 0, false, &tuning, monW, monH);
             RECT full = { 0, 0, kW, kH };
             if (!FaldUpdateClean(m, back, &full, 1)) { FaldReturn(m); FaldMarkStale(0, 0); continue; }
             ic->CopyResource(FaldIntermediateTexture(m), FaldCleanTexture(m));

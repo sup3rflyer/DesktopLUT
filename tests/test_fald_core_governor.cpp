@@ -277,8 +277,8 @@ struct CgLayer {
         w.ic->Flush();
         const FaldResources* r = ctx.fald;
         const std::pair<const char*, ID3D11Texture2D*> tex[] = {
-            { "drive0", r->drive0Tex }, { "drive", r->driveTex }, { "drive_filt0", r->driveFilt0Tex }, { "drive_filt", r->driveFiltTex },
-            { "drive_state", r->driveStateTex }, { "active_r0", r->activeTex[0] }, { "active_r1", r->activeTex[1] },
+            { "drive0", r->drive0Tex }, { "drive", r->driveTex }, { "drive_filt", r->driveFiltTex },
+            { "active_r0", r->activeTex[0] }, { "active_r1", r->activeTex[1] },
             { "boost_r0", r->boostTex[0] }, { "boost_r1", r->boostTex[1] }, { "btrue0", r->bTrue0Tex }, { "best0", r->bEst0Tex },
             { "gain0", r->gain0Tex }, { "btrue", r->bTrueTex }, { "best", r->bEstTex }, { "gainB", r->gainBTex },
             { "fields0", r->fields0Tex }, { "fields", r->fieldsTex }, { "OUTPUT", target } };

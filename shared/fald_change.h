@@ -32,20 +32,16 @@ bool FaldTouchedZones(const FaldChangeRect* rects, int numRects, unsigned int or
 struct FaldChangeInputs {
     bool stateComplete;        // the previous run was a full or partial run on THIS panel / size / mode whose textures
                                // all stand (false after a build, a swap, a mode change, an idle period, a dump)
-    bool settingsSame;         // debug view, pedestal mode, starfield on/off + parameters, fade on/off: as at that run
+    bool settingsSame;         // debug view, pedestal mode, starfield on/off + parameters, the core's mode: as at that run
     bool frameKnown;           // the intermediate's identity is known: the LUT / tone map pass is deterministic
                                // (lutPassKey != 0) and nothing but the rects changed it
     bool newContent;           // the present carries content outside the kick zones (information only: a kick-only
                                // present goes partial like any other small change)
     bool gainFused;            // passes 2b + 2c run as one dispatch (the three-pass fallback has a copy, which cannot be
                                // made indirect)
-    unsigned int temporalMode; // LED lag (shared/fald_temporal.h): 0 off, 1 / 2 first-order, 3 panel clock. The state's
-                               // own movement is detected on the GPU (the temporal / clock passes compare their outputs
-                               // with the previous run's and flag a change), so no settle bookkeeping is needed here
-    bool fadeOn;               // the flank fade: its T state advances per content frame (not partial-able here)
-    bool coreStateful;         // the always-on core with temporal state (shared/fald_core2.h FaldCore2Stateful: KC2c's zone
-                               // IIRs advance every run) — its fields on a present that moved nothing would differ from the
-                               // previous run's, so the full path; KC3 (stateless) is partial-able
+    unsigned int temporalMode; // LED lag (shared/fald_temporal.h): 0 off, 3 panel clock. The state's own movement is
+                               // detected on the GPU (the clock pass compares its outputs with the previous run's and
+                               // flags a change), so no settle bookkeeping is needed here
     unsigned int touchedZones; // the list's size (0 = no rect inside the lattice)
     unsigned int totalZones;
 };
@@ -54,7 +50,7 @@ enum FaldChangePath : unsigned int {
     FALD_CHANGE_PARTIAL = 1,   // the touched zones' statistics + the GPU-gated remainder
 };
 // FULL unless every precondition holds: the state complete and the settings the same, the frame known, the gain pass
-// fused, a known LED-lag mode (0..3), the fade off, and the list below the cap (touchedZones <= maxZones, > 0 is not
+// fused, a known LED-lag mode (0 or 3), and the list below the cap (touchedZones <= maxZones, > 0 is not
 // required: no touched zone means nothing to recompute). A full-frame rect touches every zone and takes the full path
 // by the cap.
 FaldChangePath FaldChangeDecide(const FaldChangeInputs& in, unsigned int maxZones);
