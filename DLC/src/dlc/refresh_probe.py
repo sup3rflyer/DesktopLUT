@@ -636,12 +636,15 @@ class _Probe:
         while True:
             try:
                 chk = rv.trim_leg_check(rv.trim_status(self.cal.controller.state() or {}, key), rate,
-                                        self.st["reference"])
+                                        self.st["reference"], ref_active_stamp=self.st.get("trim_ref_active_stamp"))
             except Exception as exc:  # noqa: BLE001 - recorded as not ok
                 chk = {"rate": rate, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             if chk.get("ok") or self.clock.now() - t0 >= self.spec.trim_wait_s:
                 break
             self.reader.wait(2.0)
+        if rate == self.st["reference"] and chk.get("ok"):
+            # what the profile on screen carries at the reference (the stamp_differs rule's baseline)
+            self.st["trim_ref_active_stamp"] = chk.get("active_stamp") or ""
         chk["t_s"] = round(self.clock.now() - self.t0, 1)
         self.st.setdefault("trim_checks", []).append(jsonable(chk))
         if not chk.get("ok"):
@@ -1033,8 +1036,9 @@ def run_flow(cal: Any) -> Any:
             state_now = {}
             refusals.append(f"state.get failed ({type(exc).__name__}: {exc}): the trim cannot be checked")
         st["trim_before"] = jsonable(rv.trim_status(state_now, key))
-        refusals += rv.trim_refusals(state_now, key, [r for r in (plan.get("measure") or spec.rates)
-                                                      if r != (plan.get("reference") or spec.reference)])
+        ref_key = plan.get("reference") or spec.reference
+        refusals += rv.trim_refusals(state_now, key, [r for r in (plan.get("measure") or spec.rates) if r != ref_key],
+                                     reference=ref_key)
     if refusals and not st.get("measured"):
         for r in refusals:
             cal.runlog.anomaly(STAGE, kind="refused", message=r)

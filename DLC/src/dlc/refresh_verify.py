@@ -12,9 +12,11 @@ run with the spec's ``"purpose": "verify"``. What differs:
   invalid one), or when a rate to verify is not in the recorded response. It switches only the 3D LUT bypass (as the
   response measurement did); ``refresh_trim`` is never sent in a ``layers.set``, so no restore can change it either.
 * **The trim is read back at every rate**: after each switch has settled, ``state.get`` ``refresh_trim`` must say the
-  variant for that rate is on screen (``state`` ``trim`` and ``rate`` = the leg's rate, or ``reference`` at the
-  reference rate, ``applied`` true; polled for up to ``trim_wait_s``). A leg where it is not is recorded as such and
-  fails its rate.
+  variant for that rate is on screen (``state`` ``trim`` for the rate or the rate whose curve it uses, ``applied``, and
+  the profile's ``active_stamp`` equal to the wanted ``stamp`` — ``applied`` alone is not proof; ``state``
+  ``reference`` at the reference rate and at a rate recorded as the same as the reference, following the ``same_as``
+  chain as the C++ does; polled for up to ``trim_wait_s``). A leg where it is not is recorded as such and fails its
+  rate. Every rate, a same-as-reference one included, is judged by the same light rule.
 * **Nothing is recorded.** The run writes ``verify_result.json`` (and the rows / evidence), never ``trim_curves.json``
   or ``refresh_result.json``; ``python -m dlc.refresh_trim record`` refuses a verify run outright.
 
@@ -30,7 +32,8 @@ the nearest reference reads before and after it, ``refresh_trim.bracket_ratios``
 
 Verdict per rate: ``pass`` (every grey passes both, the trim read back applied on every leg of the rate), ``fail``
 (a luminance miss, or the trim not applied), or ``undecided`` — a chromaticity miss with the luminance inside, an
-unsettled or unbracketed read, or anomalies: not a deterministic yes/no, so the digest carries the numbers and the
+unsettled read, a read with no bracketed ratio (no reference read on both sides, no light, implausible — never dropped
+silently: named per grey in the result), or anomalies: not a deterministic yes/no, so the digest carries the numbers and the
 overseer judges (nothing is applied or recorded either way). The run's verdict is the worst of its rates.
 
 Simulation: ``python -m dlc.refresh_verify simulate --out DIR [--residual-pct P] [--trim-off] [--no-data]`` runs the
@@ -81,7 +84,31 @@ def dip_rates(lines: Sequence[Any]) -> dict[str, str]:
     return out
 
 
-def trim_refusals(state: dict[str, Any], key: str, rates: Sequence[str]) -> list[str]:
+def resolve_rate(rate: str, have: dict[str, str], reference: str) -> tuple[Optional[str], str]:
+    """Follow ``rate``'s ``same_as`` chain as the C++ does (ChooseRefreshTrim, refresh_trim.cpp:126-140):
+    ``("reference", why)`` when it ends at the reference (DesktopLUT then applies NO trim: state ``reference``),
+    ``(key, why)`` = the rate whose own curve applies, ``(None, why)`` = not recorded / a broken or circular chain."""
+    if rate == reference:
+        return "reference", "the reference rate"
+    if rate not in have:
+        return None, f"{rate} Hz is not recorded"
+    cur, seen = rate, {rate}
+    for _ in range(16):
+        nxt = have.get(cur)
+        if nxt is None:
+            return None, f"same_as {cur} is not in the section"
+        if nxt == cur:
+            return cur, f"{rate} Hz uses the {cur} Hz curve" if cur != rate else f"{rate} Hz has its own curve"
+        if nxt == reference:
+            return "reference", f"{rate} Hz = {reference} Hz (recorded same as the reference: no trim)"
+        if nxt in seen:
+            return None, f"{rate} Hz: same_as goes round in a circle"
+        seen.add(nxt)
+        cur = nxt
+    return None, f"{rate} Hz: same_as chain too long"
+
+
+def trim_refusals(state: dict[str, Any], key: str, rates: Sequence[str], reference: Optional[str] = None) -> list[str]:
     """Why a verify must not start (empty = it may). It never switches the trim, so off / no data are refusals."""
     st = trim_status(state, key)
     out = []
@@ -98,24 +125,58 @@ def trim_refusals(state: dict[str, Any], key: str, rates: Sequence[str]) -> list
         out.append(f"the DIP refresh response DesktopLUT uses for {key} is marked stale ({dip.get('record')}, "
                    f"{dip.get('age_days')} days): re-measure before verifying it")
     have = dip_rates(dip.get("rates") or [])
-    missing = [r for r in rates if r not in have] if dip else []
-    if missing:
-        out.append(f"rates {missing} have no recorded response for {key} (recorded: {have}): the trim has nothing to "
-                   "apply there")
+    if dip:
+        missing = [r for r in rates if r not in have]
+        if missing:
+            out.append(f"rates {missing} have no recorded response for {key} (recorded: {have}): the trim has nothing "
+                       "to apply there")
+        # the chain check needs the reference (the C++ reply does not name the DIP's reference key): skipped without it
+        broken = [why for r in rates if r in have and reference
+                  for res, why in [resolve_rate(r, have, reference)] if res is None]
+        if broken:
+            out.append(f"the recorded response for {key} has a broken same_as chain: {broken}")
     return out
 
 
-def trim_leg_check(status: dict[str, Any], rate: str, reference: str) -> dict[str, Any]:
-    """Is the trim variant for ``rate`` on screen? ``ok`` True / False (a deterministic read of DesktopLUT's own
-    report). At the reference the trim is the identity (``state`` ``reference``)."""
-    want = "reference" if rate == reference else "trim"
+def trim_leg_check(status: dict[str, Any], rate: str, reference: str, *,
+                   ref_active_stamp: Optional[str] = None) -> dict[str, Any]:
+    """Is the trim DesktopLUT means for ``rate`` on screen? ``ok`` True / False — a deterministic read of its own report.
+
+    * the reference, or a rate recorded as the same as the reference (``"59.94 Hz = 60"``; the chain is followed): no
+      trim — ``state`` ``reference`` and ``applied``;
+    * any other rate: ``state`` ``trim`` for that rate (or the rate whose curve it uses), ``applied``, AND the profile on
+      screen carries it. ``applied`` alone is not proof: with the stage bypass PERM_NOGRAY the C++ reports ``applied``
+      with no trim baked (refresh_trim.cpp:481-488). Rule ``stamp``: the reply's ``active_stamp`` is non-empty and equals
+      its ``stamp`` (the wanted one; both emitted by desktoplut_ipc_server.cpp RefreshTrimJson). Rule ``stamp_differs``
+      (a reply without ``stamp``): a non-empty ``active_stamp`` that differs from the one read at the reference."""
+    have = dip_rates(((status.get("dip") or {}).get("rates")) or [])
+    target, how = resolve_rate(rate, have, reference)
+    want = "reference" if target == "reference" else "trim"
     got_state, got_rate = status.get("state"), (str(status.get("rate")) if status.get("rate") is not None else None)
-    uses = dip_rates(((status.get("dip") or {}).get("rates")) or []).get(rate, rate)   # "48 Hz = 47.952"
-    ok = bool(status.get("applied")) and got_state == want and (rate == reference or got_rate in (rate, uses))
-    return {"rate": rate, "want_state": want, "state": got_state, "trim_rate": got_rate,
-            "applied": status.get("applied"), "waiting": status.get("waiting"), "refresh_hz": status.get("refresh_hz"),
-            "stamp": status.get("stamp"), "active_stamp": status.get("active_stamp"), "gain": status.get("gain"),
-            "ok": ok}
+    active, wanted = status.get("active_stamp") or "", status.get("stamp") or ""
+    out = {"rate": rate, "resolved": target, "resolved_why": how, "want_state": want, "state": got_state,
+           "trim_rate": got_rate, "applied": status.get("applied"), "waiting": status.get("waiting"),
+           "refresh_hz": status.get("refresh_hz"), "stamp": status.get("stamp"),
+           "active_stamp": status.get("active_stamp"), "gain": status.get("gain")}
+    if target is None:
+        out.update(ok=False, rule="unresolved", why=how)
+        return out
+    ok = bool(status.get("applied")) and got_state == want
+    if want == "reference":
+        out.update(ok=ok, rule="reference")
+        return out
+    ok = ok and got_rate in (rate, target)
+    if wanted:
+        rule = "stamp"
+        on_screen = bool(active) and active == wanted
+    else:
+        rule = "stamp_differs"
+        on_screen = bool(active) and active != (ref_active_stamp or "")
+    out.update(ok=bool(ok and on_screen), rule=rule, on_screen=on_screen)
+    if ok and not on_screen:
+        out["why"] = (f"DesktopLUT reports the {target} Hz trim applied, but the profile on screen does not carry it "
+                      f"(active_stamp {active!r}, wanted {wanted!r}{'' if wanted else ', reference ' + repr(ref_active_stamp)})")
+    return out
 
 
 # ----------------------------------------------------------------------------- the verdict (pure)
@@ -161,8 +222,16 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             c = (comb.get(rate) or {}).get(patch)
             s = sp.get(patch) or {}
             singles = [x for x in prow if x.get("ratio") is not None]
-            cell: dict[str, Any] = {"nominal_nits": next((x.get("nominal_nits") for x in prow), None),
-                                    "reads": len(prow), "bracketed": len(singles),
+            # every read of this grey at this rate, also those bracket_ratios left out (no light, implausible): a read
+            # without a ratio is never dropped silently — it makes the rate undecided, named here
+            taken = [x for x in greys if str(x.get("rate")) == rate and x["patch"] == patch]
+            used = {(x.get("leg"), x.get("t_s")) for x in singles}
+            lost = [{"leg": x.get("leg"), "pass": x.get("pass"), "t_s": x.get("t_s"),
+                     "why": ("implausible: " + str(x["implausible"])) if x.get("implausible") else
+                            ("no reading" if x.get("y") is None else "no reference read on both sides")}
+                    for x in taken if (x.get("leg"), x.get("t_s")) not in used]
+            cell: dict[str, Any] = {"nominal_nits": next((x.get("nominal_nits") for x in taken), None),
+                                    "reads": len(taken), "bracketed": len(singles), "unbracketed": lost,
                                     "ratios": [round(x["ratio"], 6) for x in singles],
                                     "unsettled": sum(1 for x in prow if x.get("settled") is False),
                                     "spread_ref": {k: s.get(k) for k in ("n", "x", "y", "Y_rel")}}
@@ -186,6 +255,9 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
                 cell["verdict"] = "fail"
                 why_fail.append(f"{patch}: light {cell['pct']:+.3f} % (single reads {[round((v - 1) * 100, 3) for v in cell['ratios']]} %) "
                                 f"outside +/-{lum_tol * 100:g} %")
+            elif lost:
+                cell["verdict"] = "undecided"
+                why_undecided.append(f"{patch}: {len(lost)} of {len(taken)} read(s) without a bracketed ratio: {lost}")
             elif chroma_ok is False:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: chromaticity dx {c['dx']:+.5f} dy {c['dy']:+.5f} outside the reference "
@@ -205,10 +277,12 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             why_undecided.append("the trim state was never read back at this rate")
         if not_applied:
             why_fail.append(f"the trim variant for {rate} Hz was not on screen on {len(not_applied)} of {len(checks)} "
-                            f"leg(s): {[{k: t.get(k) for k in ('state', 'trim_rate', 'applied', 'waiting')} for t in not_applied]}")
+                            f"leg(s): {[{k: t.get(k) for k in ('state', 'trim_rate', 'applied', 'waiting', 'rule', 'why', 'active_stamp', 'stamp') if t.get(k) is not None} for t in not_applied]}")
         verdict = "fail" if why_fail else ("undecided" if why_undecided else "pass")
         out_rates[rate] = {"verdict": verdict, "greys": cells, "fail": why_fail, "undecided": why_undecided,
-                           "trim_checks": len(checks), "trim_not_applied": len(not_applied)}
+                           "trim_checks": len(checks), "trim_not_applied": len(not_applied),
+                           "trim_rules": sorted({str(t.get("rule")) for t in checks if t.get("rule")}),
+                           "resolved": sorted({str(t.get("resolved")) for t in checks if t.get("resolved")})}
     ref_checks = [t for t in trim_checks if str(t.get("rate")) == reference]
     run_undecided = []
     if status != "ok":
@@ -243,13 +317,20 @@ def digest_lines(res: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # ----------------------------------------------------------------------------- simulation (offline)
-def sim_trim_model(api: Any, hardware_id: str, *, rates: Sequence[str] = ("47.952", "48", "50"),
-                   no_data: bool = False, stuck: bool = False) -> Callable[[dict[str, Any]], dict[str, Any]]:
-    """A model of DesktopLUT's ``state.get`` ``refresh_trim`` for the mock: follows the SimDisplayApi's live rate
-    (the trim swaps on a refresh change while the layer is on). ``stuck`` = the variant never follows (stays at the
-    reference's): a trim that is not applied."""
+def sim_trim_model(api: Any, hardware_id: str, *, rates: Sequence[str] = ("47.952", "50"),
+                   same_as: Optional[dict[str, str]] = None, no_data: bool = False, stuck: bool = False,
+                   no_gray: bool = False, stampless: bool = False,
+                   reference: str = "60") -> Callable[[dict[str, Any]], dict[str, Any]]:
+    """A model of DesktopLUT's ``state.get`` ``refresh_trim`` (desktoplut_ipc_server.cpp RefreshTrimJson, refresh_trim.cpp
+    ResolveRefreshTrim / the applied rule) for the mock: follows the SimDisplayApi's live rate. ``rates`` have their
+    own curves, ``same_as`` maps a rate to another (``{"48": "47.952", "59.94": "60"}``; ending at the reference = no
+    trim, state ``reference``). Faults: ``stuck`` = the variant never follows the rate (the reference's stays on screen:
+    ``applied`` false); ``no_gray`` = the stage bypass PERM_NOGRAY: ``state`` ``trim`` and ``applied`` TRUE with an empty
+    ``active_stamp`` (refresh_trim.cpp:481-488); ``stampless`` = a reply without the wanted ``stamp``."""
     from . import refresh_mode as rm
-    lines = [f"{r} Hz trim (3 levels)" for r in rates]      # the C++ RateLines wording
+    same = dict(same_as if same_as is not None else {"48": "47.952"})
+    lines = [f"{r} Hz trim (3 levels)" for r in rates] + [f"{k} Hz = {v}" for k, v in same.items()]   # RateLines
+    have = dip_rates(lines)
 
     def model(state: dict[str, Any]) -> dict[str, Any]:
         lay = ((state.get("layers") or {}).get("0:HDR") or {})
@@ -258,20 +339,26 @@ def sim_trim_model(api: Any, hardware_id: str, *, rates: Sequence[str] = ("47.95
         hz = rm.active_hz(d)
         key = next((k for k, (n, dd) in rm.RATES.items() if abs(n / dd - (hz or 0)) < 1e-6), None)
         e: dict[str, Any] = {"enabled": on, "refresh_hz": hz, "refresh_rational": list(d["active"]["vsync"]),
-                             "waiting": None, "stamp": None, "active_stamp": None}
+                             "waiting": None, "stamp": None, "active_stamp": ""}
+        dip = {"record": "synthetic:HDR", "rates": lines, "stale": False}
         if no_data:
             e.update(state="no_section", detail="the DIP record has no refresh_response", rate=None, applied=False,
                      installed=False, dip=None)
-        elif not on:
-            e.update(state="off", detail="switched off", rate=None, applied=False, installed=False,
-                     dip={"record": "synthetic:HDR", "rates": lines, "stale": False})
+            return {"0:HDR": e}
+        target, _ = resolve_rate(key or "", have, reference)
+        if not on:
+            e.update(state="off", detail="switched off", rate=None, applied=True, installed=True, dip=dip)
+        elif target == "reference":
+            e.update(state="reference", detail="", rate=None, applied=True, installed=True, dip=dip)
+        elif target is None:
+            e.update(state="unmeasured", detail=f"{key} Hz is not measured", rate=None, applied=True, installed=True,
+                     dip=dip)
         else:
-            at_ref = key == "60"
-            shown = "60" if stuck else key
-            e.update(state="reference" if at_ref else ("trim" if key in rates else "unmeasured"), detail="",
-                     rate=None if at_ref else key, applied=(shown == key), installed=True,
-                     stamp=None if at_ref else f"rt-{key}", active_stamp=None if shown == "60" else f"rt-{shown}",
-                     dip={"record": "synthetic:HDR", "rates": lines, "stale": False})
+            want = f"rt-{target}"
+            active = "" if (stuck or no_gray) else want
+            e.update(state="trim", detail="", rate=target, installed=True, dip=dip,
+                     stamp=None if stampless else want, active_stamp=active,
+                     applied=True if no_gray else active == want)
         return {"0:HDR": e}
     return model
 

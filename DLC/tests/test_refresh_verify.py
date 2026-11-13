@@ -51,8 +51,10 @@ def _calib(tmp_path: Path, name: str, *, residual=0.0, trim_on=True, model_kw=No
         return rm.active_hz(rm.find_display(api.snapshot(), "SIM0000"))
 
     def gain(h, nits):
+        """The panel's response at h, minus what DesktopLUT's trim takes away when the model says it is on screen."""
         x = (1000.0 / h - 1000.0 / 60.0) / (1000.0 / (48000 / 1001) - 1000.0 / 60.0)
-        on = server.state.layers.get("0:HDR", {}).get("refresh_trim") and not (model_kw or {}).get("stuck")
+        st = server.refresh_trim_model({"layers": {"0:HDR": dict(server.state.layers.get("0:HDR", {}))}})["0:HDR"]
+        on = st.get("state") == "trim" and bool(st.get("active_stamp"))      # a trimmed variant is on screen
         return math.exp(effect(nits) * x * (residual if on else 1.0))
     panel = ProbeSimPanel(clock=VirtualClock(), refresh_gain=gain, hz_fn=hz, **{"noise_rel": 0.0002, **(panel_kw or {})})
     cal = Calibration(ctx=ctx, profile=cp.Profile.synthetic(output_dir=str(tmp_path / "results")), monitor=0,
@@ -196,7 +198,8 @@ def test_the_plan_seam_says_verify(tmp_path):
 def test_dip_rate_lines_and_the_leg_check():
     lines = ["47.952 Hz trim (3 levels)", "48 Hz = 47.952", "50 Hz trim (3 levels)", "24 Hz (no levels)"]
     assert rv.dip_rates(lines) == {"47.952": "47.952", "48": "47.952", "50": "50"}
-    st = {"state": "trim", "rate": "47.952", "applied": True, "dip": {"rates": lines}}
+    st = {"state": "trim", "rate": "47.952", "applied": True, "stamp": "s48", "active_stamp": "s48",
+          "dip": {"rates": lines}}
     assert rv.trim_leg_check(st, "48", "60")["ok"] is True          # 48 uses the 47.952 curve
     assert rv.trim_leg_check({**st, "applied": False}, "47.952", "60")["ok"] is False
     assert rv.trim_leg_check({"state": "reference", "applied": True}, "60", "60")["ok"] is True
@@ -239,3 +242,125 @@ def test_spec_problems_and_plan_cli(tmp_path):
     assert rp.main(["plan", "--purpose", "verify", "--rates", "47.952,50", "--reference", "60", "--out", str(out)]) == 0
     spec = json.loads(out.read_text(encoding="utf-8"))
     assert spec["purpose"] == "verify" and spec["colours"] is False
+
+
+# ----------------------------------------------------------------------------- review 2026-11-13
+def test_a_rate_recorded_same_as_the_reference_wants_no_trim():
+    """The reviewer's repro (prep/review/repro_5994.py): the C++ picks Reference at 59.94 = 60 (state "reference",
+    rate null); the leg check must want that, not "trim". Failed before the fix (want_state "trim", ok False)."""
+    lines = ["59.94 Hz = 60", "50 Hz trim (3 levels)", "48 Hz = 47.952", "47.952 Hz trim (3 levels)"]
+    state = {"layers": {"0:HDR": {"refresh_trim": True}},
+             "refresh_trim": {"0:HDR": {"enabled": True, "state": "trim", "rate": "50", "applied": True,
+                                        "dip": {"record": "x", "rates": lines, "stale": False}}}}
+    assert rv.trim_refusals(state, "0:HDR", ["59.94", "50", "47.952"], reference="60") == []
+    at_5994 = {"state": "reference", "rate": None, "applied": True, "dip": {"rates": lines}}
+    chk = rv.trim_leg_check(at_5994, "59.94", "60")
+    assert chk["want_state"] == "reference" and chk["ok"] is True and chk["rule"] == "reference"
+    # the chain is followed (a -> b -> reference) and a circle is caught (refused before anything changes)
+    have = {"a": "b", "b": "60", "c": "d", "d": "c", "e": "e"}
+    assert rv.resolve_rate("a", have, "60")[0] == "reference"
+    assert rv.resolve_rate("c", have, "60")[0] is None and "circle" in rv.resolve_rate("c", have, "60")[1]
+    assert rv.resolve_rate("e", have, "60")[0] == "e"
+    circ = {"layers": {"0:HDR": {"refresh_trim": True}},
+            "refresh_trim": {"0:HDR": {"enabled": True, "state": "reference", "applied": True,
+                                       "dip": {"rates": ["50 Hz = 48", "48 Hz = 50"]}}}}
+    assert any("circle" in r for r in rv.trim_refusals(circ, "0:HDR", ["50"], reference="60"))
+
+
+def test_a_same_as_reference_rate_is_measured_and_judged_by_the_light(tmp_path):
+    cal, api, _, ctrl = _calib(tmp_path, "s5994", spec={"rates": ["59.94", "50"]},
+                               model_kw={"rates": ("47.952", "50"), "same_as": {"59.94": "60", "48": "47.952"}})
+    res = cal.run("refresh-response")
+    assert res.status == "completed" and res.digest["verdict"] == "pass", res.digest
+    out = json.loads((cal.ctx.root / rv.RESULT_FILE).read_text(encoding="utf-8"))
+    r = out["rates"]["59.94"]
+    assert r["verdict"] == "pass" and r["resolved"] == ["reference"] and r["trim_rules"] == ["reference"]
+    assert all(abs(c["pct"]) < 0.3 for c in r["greys"].values())
+    assert out["rates"]["50"]["trim_rules"] == ["stamp"]
+    assert _at(api) == (60, 1)
+
+
+def test_applied_without_the_trim_baked_fails_the_rate(tmp_path):
+    """PERM_NOGRAY: the C++ reports state "trim", applied true, an empty active_stamp (refresh_trim.cpp:481-488)."""
+    cal, api, _, ctrl = _calib(tmp_path, "nogray", model_kw={"no_gray": True})
+    res = cal.run("refresh-response")
+    assert res.status == "completed" and res.digest["verdict"] == "fail"
+    checks = [c for c in cal.calib["refresh_probe"]["trim_checks"] if c["rate"] != "60"]
+    assert checks and all(c["applied"] is True and c["ok"] is False and c["rule"] == "stamp" for c in checks)
+    assert all("does not carry it" in c["why"] for c in checks)
+    assert _at(api) == (60, 1) and _layers(ctrl).get("bypass_3dlut") is False
+
+
+def test_the_stamp_rules():
+    lines = ["47.952 Hz trim (3 levels)"]
+    base = {"state": "trim", "rate": "47.952", "applied": True, "dip": {"rates": lines}}
+    ok = rv.trim_leg_check({**base, "stamp": "w", "active_stamp": "w"}, "47.952", "60")
+    assert ok["ok"] and ok["rule"] == "stamp"
+    assert not rv.trim_leg_check({**base, "stamp": "w", "active_stamp": ""}, "47.952", "60")["ok"]
+    assert not rv.trim_leg_check({**base, "stamp": "w", "active_stamp": "other"}, "47.952", "60")["ok"]
+    # a reply without the wanted stamp: a non-empty active stamp that differs from the reference's
+    fb = rv.trim_leg_check({**base, "active_stamp": "x"}, "47.952", "60", ref_active_stamp="")
+    assert fb["ok"] and fb["rule"] == "stamp_differs"
+    assert not rv.trim_leg_check({**base, "active_stamp": "x"}, "47.952", "60", ref_active_stamp="x")["ok"]
+    assert not rv.trim_leg_check({**base, "active_stamp": ""}, "47.952", "60", ref_active_stamp="")["ok"]
+
+
+def test_a_stampless_reply_uses_the_fallback_rule_end_to_end(tmp_path):
+    cal, _, _, _ = _calib(tmp_path, "stampless", model_kw={"stampless": True})
+    res = cal.run("refresh-response")
+    assert res.status == "completed" and res.digest["verdict"] == "pass", res.digest
+    out = json.loads((cal.ctx.root / rv.RESULT_FILE).read_text(encoding="utf-8"))
+    assert out["rates"]["47.952"]["trim_rules"] == ["stamp_differs"]
+
+
+def test_an_unbracketed_read_makes_the_rate_undecided_and_is_named():
+    ok = [{"rate": r, "ok": True, "rule": "reference" if r == "60" else "stamp"} for r in ("60", "47.952", "60")]
+    rows = [_row(0, "60", 0, 100.0, (0.3127, 0.3290)), _row(1, "47.952", 60, 100.1, (0.3127, 0.3290)),
+            _row(2, "60", 120, 100.2, (0.3128, 0.3291))]
+    assert rv.analyze_verify(rows, reference="60", trim_checks=ok)["verdict"] == "pass"
+    late = _row(3, "47.952", 180, 100.1, (0.3127, 0.3290))          # after the last reference read: no bracket
+    res = rv.analyze_verify(rows + [late], reference="60", trim_checks=ok)
+    cell = res["rates"]["47.952"]["greys"]["g520"]
+    assert res["verdict"] == "undecided" and cell["verdict"] == "undecided"
+    assert cell["reads"] == 2 and cell["bracketed"] == 1
+    assert cell["unbracketed"] == [{"leg": 3, "pass": "A", "t_s": 180, "why": "no reference read on both sides"}]
+    assert any("without a bracketed ratio" in u for u in res["rates"]["47.952"]["undecided"])
+    # a read with no light is named too, never dropped silently
+    dark = {**_row(3, "47.952", 90, 100.1, (0.3127, 0.3290)), "y": None, "xyz": None}
+    res2 = rv.analyze_verify(rows + [dark], reference="60", trim_checks=ok)
+    assert res2["rates"]["47.952"]["greys"]["g520"]["unbracketed"][0]["why"] == "no reading"
+    # a light miss still fails (the worse verdict wins)
+    bad = rows[:1] + [_row(1, "47.952", 60, 100.6, (0.3127, 0.3290))] + rows[2:]
+    assert rv.analyze_verify(bad + [late], reference="60", trim_checks=ok)["verdict"] == "fail"
+
+
+def test_state_get_raising_inside_the_trim_check_ends_at_the_reference_with_the_bypass_restored(tmp_path, monkeypatch):
+    cal, api, _, ctrl = _calib(tmp_path, "stateboom")
+    real_check = rp._Probe.trim_check
+    calls = {"n": 0}
+
+    def booming_check(self, rate):
+        if rate == "47.952":
+            real_state = ctrl.state
+
+            def boom():
+                calls["n"] += 1
+                raise ConnectionError("pipe gone mid read-back")
+            ctrl.state = boom
+            try:
+                return real_check(self, rate)
+            finally:
+                ctrl.state = real_state
+        return real_check(self, rate)
+    monkeypatch.setattr(rp._Probe, "trim_check", booming_check)
+    try:
+        status = cal.run("refresh-response").status
+    except Exception as exc:  # noqa: BLE001 - ending by raising is acceptable; the restore is what is tested
+        status = f"raised {type(exc).__name__}"
+    assert calls["n"] >= 1
+    assert _at(api) == (60, 1) and api.legacy_registry(r"\\.\DISPLAY1")["hz"] == 60
+    assert _layers(ctrl).get("bypass_3dlut") is False and _layers(ctrl).get("refresh_trim") is True
+    if status == "completed":
+        out = json.loads((cal.ctx.root / rv.RESULT_FILE).read_text(encoding="utf-8"))
+        assert out["rates"]["47.952"]["verdict"] == "fail"
+        assert any(c.get("error", "").startswith("ConnectionError") for c in cal.calib["refresh_probe"]["trim_checks"])
