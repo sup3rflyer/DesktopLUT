@@ -622,6 +622,12 @@ def response_for_run_dir(run_dir: Path | str) -> tuple[Any, list[str], dict[str,
     """``(response, problems, trim)`` for a refresh-trim run folder (trim_curves.json, refresh_result.json,
     evidence.json)."""
     run = Path(run_dir)
+    ev_path = run / "evidence.json"
+    if ev_path.exists():
+        purpose = (json.loads(ev_path.read_text(encoding="utf-8")) or {}).get("purpose")
+        if purpose == "verify":
+            # a REFRESH TRIM verify measures WITH the trim on: its light is the trim's residual, never the panel's
+            raise ValueError(f"{run} is a refresh-trim VERIFY run (dlc.refresh_verify): it is never recorded in the DIP")
     trim = json.loads((run / "trim_curves.json").read_text(encoding="utf-8"))
     result = json.loads((run / "refresh_result.json").read_text(encoding="utf-8"))
     evidence = json.loads((run / "evidence.json").read_text(encoding="utf-8"))
@@ -679,7 +685,11 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     rp.add_argument("--dip", default=str(PROJECT_DIR / "dip_store.json"), help="the DIP store (default: DLC's)")
     rp.add_argument("--write", action="store_true", help="write it (default: show what would be written)")
     args = ap.parse_args(argv)
-    resp, problems, trim = response_for_run_dir(args.run)
+    try:
+        resp, problems, trim = response_for_run_dir(args.run)
+    except ValueError as exc:
+        print(f"NOT recorded: {exc}")
+        return 2
     display = (trim.get("display") or {}).get("name")
     print(json.dumps({"display": display, "mode": trim.get("mode"), "dip": args.dip, "problems": problems,
                       "refresh_response": resp.as_dict()}, indent=1))
