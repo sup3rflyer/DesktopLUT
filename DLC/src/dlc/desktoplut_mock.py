@@ -336,6 +336,7 @@ class MockDesktopLutServer:
 
     def __init__(self) -> None:
         self.state = MockDesktopLutState()
+        self.refresh_trim_model = None   # Optional[Callable[[dict], dict]]: state.get "refresh_trim" (see handle)
 
     def handle(self, command: DesktopLutCommand) -> DesktopLutResponse:
         self.state.command_count += 1
@@ -356,6 +357,11 @@ class MockDesktopLutServer:
                 # when the display has none (the loader's initLinear) — never absent, never empty.
                 for mhc_key, entry in (out.get("mhc") or {}).items():
                     entry["correction_grayscale"] = self.correction_grayscale_view(mhc_key)
+                # refresh_trim: the simulator has no DIP and no refresh rate; a test / the verify simulation may
+                # install a model of it (dlc.refresh_verify.sim_trim_model) that follows its DisplayConfig model
+                model = getattr(self, "refresh_trim_model", None)
+                if model is not None:
+                    out["refresh_trim"] = model(out)
                 return self.ok(out)
             if method == "hook.set_routing":
                 return self.handle_hook_set_routing(params)

@@ -61,6 +61,7 @@ CHART = "refresh_response"
 LADDER_NITS = (0.5, 2.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 4000.0)
 COLOURS = (("R", (1, 0, 0)), ("G", (0, 1, 0)), ("B", (0, 0, 1)), ("C", (0, 1, 1)), ("M", (1, 0, 1)), ("Y", (1, 1, 0)))
 PROBE_STACK = {"bypass_3dlut": True, "refresh_trim": False}   # beyond the viewing layers readiness switches off
+VERIFY_STACK = {"bypass_3dlut": True}                          # a verify never sends refresh_trim (it must stay ON)
 SOURCES = ("mode", "vrr")
 
 __all__ = ["RefreshProbeSpec", "mode_legs", "levels_for_peak", "ModeSource", "run_flow", "restore_run",
@@ -103,6 +104,11 @@ class RefreshProbeSpec:
     vrr_settle_min_s: float = 4.0         # a cadence change has no MHC burst
     vrr_cross_check: Optional[str] = None # the rate measured both ways (None = picked: a fixed mode in range)
     proof_tol_rel: float = 0.003          # the presenter's / meter's refresh within this of the target
+    # "response" = measure the panel with the trim OFF (recordable); "verify" = check DesktopLUT's REFRESH TRIM with it
+    # ON (never recorded, never switches the trim: dlc.refresh_verify)
+    purpose: str = "response"
+    verify_lum_tol: float = 0.003         # verify: each grey within this of the time-bracketed reference light
+    trim_wait_s: float = 30.0             # verify: how long after the settle to wait for the trim variant to show
 
     @classmethod
     def from_dict(cls, d: Optional[dict[str, Any]]) -> "RefreshProbeSpec":
@@ -137,10 +143,30 @@ class RefreshProbeSpec:
             out.append(f"window_area_pct {self.window_area_pct} outside (0, 100]")
         if any(lv <= 0 for lv in self.levels_nits):
             out.append("levels must be > 0 nit")
+        if self.purpose not in ("response", "verify"):
+            out.append(f"purpose must be 'response' or 'verify', not {self.purpose!r}")
+        if self.purpose == "verify" and self.source != "mode":
+            out.append("a verify runs on fixed display modes (source 'mode'): the trim is keyed by the mode's rate")
+        if self.purpose == "verify" and not 0 < self.verify_lum_tol < 0.05:
+            out.append(f"verify_lum_tol {self.verify_lum_tol} outside (0, 0.05)")
         return out
+
+    @property
+    def verify(self) -> bool:
+        return self.purpose == "verify"
 
 
 # ----------------------------------------------------------------------------- plan (pure)
+def probe_stack(spec: RefreshProbeSpec) -> dict[str, bool]:
+    """What the run SETS beyond the viewing layers (recorded in ``probe_stack_before``, put back by the restore)."""
+    return dict(VERIFY_STACK if spec.verify else PROBE_STACK)
+
+
+def expected_stack(spec: RefreshProbeSpec) -> dict[str, bool]:
+    """What the stack must read while measuring (a change of it mid-run ends the run)."""
+    return {**VERIFY_STACK, "refresh_trim": True} if spec.verify else dict(PROBE_STACK)
+
+
 def levels_for_peak(peak_nits: Optional[float], *, frac: float = 0.7, minimum: int = 5) -> list[float]:
     """The grey ladder up to ``frac`` of the HDR peak (the trim must be measured below where the panel limits), at
     least ``minimum`` levels (the lowest ones kept)."""
@@ -366,7 +392,7 @@ def _patches(cal: Any, spec: RefreshProbeSpec, st: dict[str, Any]) -> list[dict[
         c = pq_code(n, bits)
         out.append({"name": f"g{c}", "kind": "grey", "rgb": (c, c, c), "nominal_nits": code_nits(c, bits),
                     "level_nits": n})
-    if spec.colours:
+    if spec.colours and not spec.verify:         # the verify's rule is on greys (the trim is one gain per level)
         c = pq_code(spec.colour_nits, bits)
         for name, m in COLOURS:
             out.append({"name": f"{name}{c}", "kind": "colour", "rgb": tuple(c * k for k in m), "nominal_nits": None})
@@ -516,11 +542,13 @@ class _Probe:
         for k in ("mhc_source", "cube_path"):
             if v.get(k) != ref.get(k):
                 fatal[k] = [ref.get(k), v.get(k)]
-        for k, want in ({**{n: False for n in ("tonemap", "fald", "desktop_gamma")}, **PROBE_STACK}).items():
+        for k, want in ({**{n: False for n in ("tonemap", "fald", "desktop_gamma")}, **expected_stack(self.spec)}).items():
             got = (v.get("layers") or {}).get(k)
             if k in (ref.get("layers") or {}) and got != (ref.get("layers") or {}).get(k):
                 fatal[f"layer:{k}"] = [(ref.get("layers") or {}).get(k), got]
-        if v.get("mhc_profile") != ref.get("mhc_profile") or v.get("active_perm") != ref.get("active_perm"):
+        # a verify EXPECTS the profile variant to change with the rate (that is the trim); it reads the trim back instead
+        if not self.spec.verify and (v.get("mhc_profile") != ref.get("mhc_profile")
+                                     or v.get("active_perm") != ref.get("active_perm")):
             self.anomaly("desktoplut_state_churn", tag=tag, profile=[ref.get("mhc_profile"), v.get("mhc_profile")],
                          perm=[ref.get("active_perm"), v.get("active_perm")],
                          note="the MHC profile changed name / permutation: judge whether a curve changed")
@@ -596,6 +624,33 @@ class _Probe:
         after = self.spec.settle_after_s if mode_switch else 0.0
         self.st.setdefault("settles", []).append(self.settle_after_switch(t_sw, mn, after))
         self.check_stack(f"after the switch to {rate}")
+        if self.spec.verify:
+            self.trim_check(rate)
+
+    def trim_check(self, rate: str) -> dict[str, Any]:
+        """verify: DesktopLUT's own report of the trim variant on screen at ``rate`` (state.get refresh_trim), polled
+        up to ``trim_wait_s`` (a swap can lag the settle). Recorded per leg; a miss fails the rate (never an abort)."""
+        from . import refresh_verify as rv
+        key = f"{self.cal.monitor}:{self.cal.mode}"
+        t0 = self.clock.now()
+        while True:
+            try:
+                chk = rv.trim_leg_check(rv.trim_status(self.cal.controller.state() or {}, key), rate,
+                                        self.st["reference"], ref_active_stamp=self.st.get("trim_ref_active_stamp"))
+            except Exception as exc:  # noqa: BLE001 - recorded as not ok
+                chk = {"rate": rate, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if chk.get("ok") or self.clock.now() - t0 >= self.spec.trim_wait_s:
+                break
+            self.reader.wait(2.0)
+        if rate == self.st["reference"] and chk.get("ok"):
+            # what the profile on screen carries at the reference (the stamp_differs rule's baseline)
+            self.st["trim_ref_active_stamp"] = chk.get("active_stamp") or ""
+        chk["t_s"] = round(self.clock.now() - self.t0, 1)
+        self.st.setdefault("trim_checks", []).append(jsonable(chk))
+        if not chk.get("ok"):
+            self.anomaly("trim_not_applied", rate=rate, check=chk,
+                         note="DesktopLUT does not report the trim variant for this rate on screen: the rate fails")
+        return chk
 
     def run(self) -> None:
         st = self.st
@@ -603,6 +658,8 @@ class _Probe:
         ref = st["reference"]
         if self.src.current != ref:
             self.switch(ref)
+        elif self.spec.verify:
+            self.trim_check(ref)
         if done == 0:
             st["warm_in"] = self.warm_in(self.spec.warm_min_s)
         else:
@@ -652,12 +709,13 @@ class _Probe:
                 "legs_done": self.st.get("legs_done", 0), "legs_planned": len(self.legs)}
 
 
-def _set_probe_stack(cal: Any, st: dict[str, Any]) -> None:
+def _set_probe_stack(cal: Any, st: dict[str, Any], spec: Optional[RefreshProbeSpec] = None) -> None:
     key = f"{cal.monitor}:{cal.mode}"
+    stack = probe_stack(spec or RefreshProbeSpec())
     before = ((cal.controller.state() or {}).get("layers") or {}).get(key) or {}
-    st["probe_stack_before"] = {k: before.get(k) for k in PROBE_STACK}
+    st["probe_stack_before"] = {k: before.get(k) for k in stack}
     cal._save()
-    want = {k: v for k, v in PROBE_STACK.items() if k in before or k == "bypass_3dlut"}
+    want = {k: v for k, v in stack.items() if k in before or k == "bypass_3dlut"}
     cal.controller.call("layers.set", {"monitor": cal.monitor, "mode": cal.mode, **want})
     after = ((cal.controller.state() or {}).get("layers") or {}).get(key) or {}
     bad = {k: after.get(k) for k, v in want.items() if after.get(k) is not v}
@@ -912,6 +970,31 @@ def analyze_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, source: An
             "record": f"python -m dlc.refresh_trim record --run {root}  (dry run; then --write)"}
 
 
+def analyze_verify_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, source: Any, status: str) -> dict[str, Any]:
+    """verify: evidence.json + verify_result.json (never trim_curves.json / refresh_result.json: nothing to record)."""
+    from . import refresh_verify as rv
+    root = cal.ctx.root
+    rows = rt.load_rows(root / "trim_rows.jsonl") if (root / "trim_rows.jsonl").exists() else []
+    simulated = bool(getattr(source, "simulated", False))
+    evidence = {"purpose": rv.PURPOSE, "started": cal.run_date.isoformat(), "status": status,
+                "anomalies": st.get("anomalies") or [], "switches": st.get("switches") or [],
+                "settles": st.get("settles") or [], "trim_checks": st.get("trim_checks") or [],
+                "trim_before": st.get("trim_before"), "simulate": simulated, "spec": spec.as_dict(),
+                "plan": st.get("plan"), "warm_in": st.get("warm_in"), "rewarm": st.get("rewarm"),
+                "restore": st.get("restore"), "source": source.kind, "ref_view": st.get("ref_view"),
+                "audit_stack": {"monitor_identity": _identity(cal, st["hardware_id"])}}
+    write_json(root / "evidence.json", evidence)
+    res = rv.analyze_verify(rows, reference=st["reference"], lum_tol=spec.verify_lum_tol,
+                            trim_checks=st.get("trim_checks") or [], anomalies=st.get("anomalies") or [],
+                            status="ok" if status == "ok" else status)
+    res["meta"] = {"run": root.name, "status": status, "simulated": simulated, "purpose": rv.PURPOSE,
+                   "never_recorded": "a verify is evidence only: python -m dlc.refresh_trim record refuses it"}
+    write_json(root / rv.RESULT_FILE, res)
+    return {"purpose": rv.PURPOSE, "verdict": res["verdict"], "rates": rv.digest_lines(res),
+            "run_undecided": res["run_undecided"], "anomalies": len(st.get("anomalies") or []),
+            "result": str(root / rv.RESULT_FILE), "simulated": simulated}
+
+
 def run_flow(cal: Any) -> Any:
     """``--flow refresh-response``: preflight → refusals → plan seam → readiness → probe stack → (consent per
     switch) legs → restore → files → digest (recording is the separate ``refresh_trim record`` step)."""
@@ -943,6 +1026,19 @@ def run_flow(cal: Any) -> Any:
                         "recorded in that record)")
     src_refusals, plan = source.preflight(spec)
     refusals += src_refusals
+    if spec.verify and not st.get("planned"):
+        # the verify never switches REFRESH TRIM: off / no data / an unrecorded rate = refuse before anything changes
+        from . import refresh_verify as rv
+        key = f"{cal.monitor}:{cal.mode}"
+        try:
+            state_now = cal.controller.state() or {}
+        except Exception as exc:  # noqa: BLE001
+            state_now = {}
+            refusals.append(f"state.get failed ({type(exc).__name__}: {exc}): the trim cannot be checked")
+        st["trim_before"] = jsonable(rv.trim_status(state_now, key))
+        ref_key = plan.get("reference") or spec.reference
+        refusals += rv.trim_refusals(state_now, key, [r for r in (plan.get("measure") or spec.rates) if r != ref_key],
+                                     reference=ref_key)
     if refusals and not st.get("measured"):
         for r in refusals:
             cal.runlog.anomaly(STAGE, kind="refused", message=r)
@@ -960,19 +1056,28 @@ def run_flow(cal: Any) -> Any:
         st["legs"] = source.legs(spec, plan) if hasattr(source, "legs") else mode_legs(plan["measure"], plan["reference"],
                                                                                         spec.passes)
         st["plan"] = jsonable({k: v for k, v in plan.items() if k not in ("pre_mode",)})
-        n_col = len(COLOURS) if spec.colours else 0
+        n_col = len(COLOURS) if (spec.colours and not spec.verify) else 0
         est = estimate(st["legs"], len(st["levels_nits"]), n_col, spec)
         st["estimate"] = est
         cal._save()
+        what = (f"VERIFY DesktopLUT's REFRESH TRIM (ON, never switched; nothing recorded) on monitor {cal.monitor} "
+                f"({cal.display.name}, {hw}) in HDR: pass = every grey at each rate within "
+                f"{spec.verify_lum_tol * 100:g} % of the time-bracketed reference light and its chromaticity within "
+                "the reference reads' own spread, the trim read back applied at every rate. "
+                if spec.verify else
+                f"Measure the refresh response of monitor {cal.monitor} ({cal.display.name}, {hw}) in HDR via "
+                f"the {source.kind} rate source: ")
+        path = ("Through the installed MHC with its REFRESH TRIM on, the viewing layers and the 3D LUT out of the "
+                "path; all restored. " if spec.verify else
+                "Through the installed MHC with the viewing layers, the 3D LUT and DesktopLUT's refresh trim out of the "
+                "path; all restored. ")
         cal._abort_if(cal.adjudicate(AdjudicationRequest(
             key="refresh-response:plan", seam="probe_consent", stage=STAGE,
-            question=(f"Measure the refresh response of monitor {cal.monitor} ({cal.display.name}, {hw}) in HDR via "
-                      f"the {source.kind} rate source: reference {st['reference']} Hz — {_reference_words(st)} — "
+            question=(what + f"reference {st['reference']} Hz — {_reference_words(st)} — "
                       f"against {', '.join(plan.get('measure') or [])} Hz; "
                       f"{len(st['legs'])} legs, {est['switches']} rate changes, greys at "
                       f"{', '.join(f'{n:g}' for n in st['levels_nits'])} nit on a {st['window_area_pct']:g} % window; "
-                      f"~{est['total_min'][0]:.0f}-{est['total_min'][1]:.0f} min. Through the installed MHC with the "
-                      "viewing layers, the 3D LUT and DesktopLUT's refresh trim out of the path; all restored. "
+                      f"~{est['total_min'][0]:.0f}-{est['total_min'][1]:.0f} min. " + path
                       + ("Every switch away from the reference asks its own consent. " if source.kind == "mode" else "")
                       + "approve = start; abort = nothing changes."),
             options=("approve", "abort"), recommendation="approve",
@@ -989,7 +1094,7 @@ def run_flow(cal: Any) -> Any:
         try:
             cal.stage_hardware_readiness()
             if "probe_stack_before" not in st:
-                _set_probe_stack(cal, st)
+                _set_probe_stack(cal, st, spec)
             if hasattr(source, "start"):
                 source.start(spec, st)
             _write_pre_state(cal, st, source)
@@ -1009,13 +1114,13 @@ def run_flow(cal: Any) -> Any:
         except BaseException as exc:
             _restore_all(cal, st, source, why=f"ended early: {type(exc).__name__}")
             try:
-                analyze_run(cal, st, spec, source, status=f"aborted: {exc}")
+                (analyze_verify_run if spec.verify else analyze_run)(cal, st, spec, source, status=f"aborted: {exc}")
             except Exception:  # noqa: BLE001 - the abort is what matters; the files are evidence only
                 pass
             raise
         st["measured"] = True
         _restore_all(cal, st, source, why="completed")
-    digest = analyze_run(cal, st, spec, source, status=status)
+    digest = (analyze_verify_run if spec.verify else analyze_run)(cal, st, spec, source, status=status)
     publish_chart(cal, STAGE, CHART, {**_Probe(cal, spec, source, st).chart(), "complete": True})
     cal.runlog.run_done("completed", flow="refresh-response", restored=st.get("restore"))
     return CalibrationResult(flow="refresh-response", monitor=cal.monitor, mode=cal.mode, target=cal.target_name,
@@ -1069,6 +1174,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pp.add_argument("--reference", default="60")
     pp.add_argument("--source", choices=SOURCES, default="mode")
     pp.add_argument("--levels", default=None, help="grey levels, nits, comma-separated")
+    pp.add_argument("--purpose", choices=("response", "verify"), default="response",
+                    help="response = measure the panel, trim OFF (recordable); verify = check REFRESH TRIM, trim ON "
+                         "(never recorded; dlc.refresh_verify)")
     pp.add_argument("--out", default=None, help="write the spec JSON (run --spec)")
     rp = sub.add_parser("run", help="the flow (other arguments pass to python -m dlc.calibrate)")
     rp.add_argument("--spec", default=None)
@@ -1087,7 +1195,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if "plan" in rep else 2
     if args.cmd == "plan":
         spec = RefreshProbeSpec.from_dict({
-            "source": args.source, "reference": args.reference,
+            "source": args.source, "reference": args.reference, "purpose": args.purpose,
+            **({"colours": False} if args.purpose == "verify" else {}),
             **({"rates": [r.strip() for r in args.rates.split(",") if r.strip()]} if args.rates else {}),
             **({"levels_nits": [float(x) for x in args.levels.split(",") if x.strip()]} if args.levels else {})})
         rates = list(spec.rates) or [r for r in rm.CONTENT_RATES if r != args.reference]
