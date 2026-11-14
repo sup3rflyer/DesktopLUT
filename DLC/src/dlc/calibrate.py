@@ -538,6 +538,7 @@ class Calibration:
         viewing_hold_budget_min: Optional[float] = None,
         present_stall: Optional[str] = None,
         refine_cube: Optional[str] = None,
+        repair_span: Optional[str] = None,
         content_mode: Optional[str] = None,
         keep_layers: Optional[Sequence[str]] = None,
         sdr_white_probe: Optional[Callable[[Optional[Mapping[str, Any]]], dict[str, Any]]] = None,
@@ -681,6 +682,8 @@ class Calibration:
             # refine-mhc: which 3D LUT the re-refined MHC keeps — the source run's build (default) or
             # the cube INSTALLED now (a later 3dlut-only run over the same MHC lineage).
             ("refine_cube", str(refine_cube).strip().lower() if refine_cube is not None else None),
+            # repair-base: the operator's audit window (--repair-span LO:HI, wire codes) instead of the census's.
+            ("repair_span", _parse_repair_span(repair_span) if repair_span is not None else None),
             # (--content-mode is resolved after the display mode, below: resolve_content_mode)
             # verify-only: viewing layers left as the user has them for the run (--keep-layers).
             ("keep_layers", sorted({str(n).strip().lower() for n in keep_layers}) if keep_layers is not None
@@ -978,6 +981,12 @@ class Calibration:
         "seed-from-run": ("Seed from source run", False),
         "install-mhc": ("Reinstall MHC", False),
         "reapply-3dlut": ("Re-apply 3D LUT", False),
+        "repair-seed": ("Repair · installed base + plan", False),
+        "measure:repair-audit": ("Measure · dense grey audit", True),
+        "repair-build": ("Repair · balance candidate", False),
+        "repair-install": ("Repair · install (rollback kept)", False),
+        "measure:repair-verify": ("Measure · held-out greys", True),
+        "repair-verify": ("Repair · keep / revert", False),
         "verify-source": ("Load verify set (source run)", False),
         "verify-patches-file": ("Load verify set (file)", False),
         "install-candidate": ("Install candidate 3D LUT", False),
@@ -9155,6 +9164,8 @@ class Calibration:
                 return self._flow_grayscale_wb()
             if flow == "refine-mhc":
                 return self._flow_refine_mhc()
+            if flow == "repair-base":
+                return self._flow_repair_base()
             if flow == "verify-only":
                 return self._flow_verify_only()
             if flow == "build-correction":
@@ -9748,6 +9759,367 @@ class Calibration:
         self.stage_verify(ver.data["ti3"])
         return self._finish()
 
+    # ------------------------------------------------------------------------------------------
+    # repair-base: a balance-only repair of the INSTALLED SDR base 1D LUT (dlc.base_repair)
+    # ------------------------------------------------------------------------------------------
+
+    # Seconds per audited grey for the plan's time estimate: the PA32UCXR SDR raw pass of 2026-09-25 ran 130
+    # patches + warm-up + drift references in 11.2 min (~6.5 s a grey, dark greys read twice); rounded up.
+    _REPAIR_SECONDS_PER_READ = 7.0
+
+    def _flow_repair_base(self) -> CalibrationResult:
+        """Repair the tint the installed SDR base 1D LUT puts on a few greys, keeping their light.
+
+        In place (never enters calibration mode; the rollback point is the cube the display has now):
+        ``repair-seed`` (the source run's base must BE the installed one; the balance census picks where to
+        look; a plan seam with the read count and minutes) → hardware-readiness (viewing layers incl. the
+        fine-tune curve off) → ``measure:repair-audit`` (every code of each window) → ``repair-build`` (the
+        balance-only candidate; nothing to repair ends here; an apply seam otherwise) → ``repair-install``
+        (``mhc.set_base_lut`` + apply, confirmed by reading the installed source back) →
+        ``measure:repair-verify`` (the held-out codes, inside and beside the spans) → ``repair-verify`` (keep /
+        revert seam). Every ending that does not KEEP the candidate puts the previous cube back
+        (:func:`restore_base_repair_prior`: the rollback guard, ``--abort``, a revert)."""
+        self.stage_preflight()
+        seed = self.stage_repair_seed()
+        plan = (seed.data or {}).get("plan") or {}
+        if not plan.get("codes"):
+            return self._finish_repair("completed", "the installed cube shows no tinted greys to audit")
+        self.stage_hardware_readiness()
+        order = [plan["codes"][i] for i in outside_in_indices(len(plan["codes"]))]
+        audit = self.stage_measure(role="repair-audit", patches=[(c, c, c) for c in order],
+                                   ti3_name="repair_audit.ti3", ndjson_name="repair_audit.ndjson")
+        built = self.stage_repair_build(audit.data["ti3"])
+        if not (built.data or {}).get("candidate"):
+            return self._finish_repair("completed", "the audit found no tinted span: nothing changed")
+        self.stage_repair_install()
+        held = list((built.data or {}).get("held_out") or ())
+        order = [held[i] for i in outside_in_indices(len(held))]
+        ver = self.stage_measure(role="repair-verify", patches=[(c, c, c) for c in order],
+                                 ti3_name="repair_verify.ti3", ndjson_name="repair_verify.ndjson")
+        return self.stage_repair_verify(audit.data["ti3"], ver.data["ti3"])
+
+    def _repair_source(self) -> dict[str, Any]:
+        """The source run's MHC: base cube path, measured primaries / native white / peak (raises StageError)."""
+        key = "repair-seed"
+        src = self.calib.get("source_run")
+        if not src:
+            raise StageError(key, "repair-base needs --source-run: the run whose base 1D LUT is installed now")
+        root = Path(str(src))
+        try:
+            state = json.loads((root / "dlc_state.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise StageError(key, f"cannot read the source run's record ({root}): {exc}") from exc
+        mp = state.get("mhc_params") or {}
+        cube = (mp.get("base_lut") or {}).get("cube_path")
+        prim = mp.get("measured_primaries") or mp.get("primaries")
+        mw = mp.get("measured_white") or {}
+        peak = _as_float_local(mp.get("target_luminance"))
+        problems = [p for p, ok in (("no base 1D LUT recorded (mhc_params.base_lut.cube_path)", bool(cube)),
+                                    ("no measured primaries", bool(prim)),
+                                    ("no measured native white", mw.get("x") is not None and mw.get("y") is not None),
+                                    ("no target luminance", bool(peak))) if not ok]
+        if cube and not Path(cube).exists():
+            problems.append(f"its base cube is gone from disk ({cube})")
+        if problems:
+            raise StageError(key, f"the source run {root.name} cannot seed a repair: " + "; ".join(problems))
+        if str(mp.get("mode") or "SDR").upper() != "SDR":
+            raise StageError(key, "the source run's MHC is not SDR")
+        return {"root": str(root), "cube": str(cube), "primaries": prim,
+                "native_white": [float(mw["x"]), float(mw["y"])], "peak": float(peak)}
+
+    def stage_repair_seed(self) -> StageOutcome:
+        key = "repair-seed"
+        # The display's SDR target names the transfer (code depth) and the measure loop's read policy; the repair
+        # itself targets no curve (it keeps the installed light and takes the balance from its neighbours).
+        target = self.display.target_name(self.content_mode)
+        if not target:
+            raise StageError(key, f"display {self.monitor} has no {self.content_mode} target configured")
+        self._reject_mode_target_mismatch(key, target, self.profile.target(target))
+        self.target_name = target
+        self.calib["target"] = target
+        self._save()
+
+        def run() -> StageOutcome:
+            from . import base_repair
+            from .mhc_cube import mhc2_matrix, read_1d_cube
+            if normalize_mode(self.mode) != "SDR":
+                raise StageError(key, "repair-base repairs the SDR base 1D LUT only (the HDR base has no audit yet)")
+            src = self._repair_source()
+            installed, why = installed_base_cube(self.controller, self.monitor, self.mode)
+            if installed is None:
+                raise StageError(key, f"cannot tell which base 1D LUT is installed: {why}")
+            if not _same_file(installed, src["cube"]):
+                raise StageError(key, f"the installed base 1D LUT is {installed}, not the source run's "
+                                      f"{src['cube']} — the repair would be built for another cube",
+                                 installed=installed, source_cube=src["cube"])
+            # Scan-out reads the base cube at t^(2.4/2.2) when SDR GAMMA 2.4 is on (mhc_icc.cpp warp24): the
+            # per-channel placement below assumes it is off.
+            ini = self._resolve_desktoplut_ini()
+            g24 = None
+            if ini is not None:
+                try:
+                    flags = neutral_audit.parse_ini_flags(
+                        Path(ini).read_text(encoding="utf-8", errors="replace"), self.monitor, self.mode,
+                        keys=("MHCCorrGS24", "MHCGrayscale24"))
+                    g24 = any(neutral_audit.ini_true(v) for v in flags.values())
+                except OSError:
+                    g24 = None
+            if g24:
+                raise StageError(key, "SDR GAMMA 2.4 is on for this display: scan-out reads the base cube at a "
+                                      "warped index the repair does not place for — switch it off first")
+            # The audit measures greys through the installed stack: the 3D LUT must leave greys alone (DLC's
+            # cubes do), or the audit would see the cube, not the base.
+            runtime = None
+            try:
+                runtime = (((self.controller.state() or {}).get("runtime") or {})
+                           .get(f"{self.monitor}:{normalize_mode(self.mode)}") or {}).get("cube_path")
+            except Exception:  # noqa: BLE001 - no runtime report = no cube known
+                runtime = None
+            cube_grey = None
+            if runtime:
+                cube_grey = base_repair.cube3d_grey_deviation(runtime)
+                if cube_grey is None or cube_grey > 1e-4:
+                    raise StageError(key, f"the installed 3D LUT ({runtime}) is not identity on the grey axis "
+                                          f"(max |out-in| {cube_grey}) — the audit would measure the cube too")
+            applied = mhc2_matrix(src["primaries"], tuple(src["native_white"]), SRGB_PRIMARIES, (0.3127, 0.3290))
+            curves = read_1d_cube(Path(src["cube"]))
+            max_cv = self._transfer().max_cv
+            census = base_repair.balance_census(curves, applied, max_cv=max_cv)
+            proposals = base_repair.audit_codes(census, max_cv=max_cv)
+            span = self.calib.get("repair_span")
+            if not span:
+                # Never unattended: a census window can span greys nobody has measured through the stack, and two
+                # merged windows would carry a correction across entries no audit saw. The census only PROPOSES.
+                raise StageError(key, "repair-base needs --repair-span LO:HI (the wire greys to audit). The "
+                                      f"installed cube's own census proposes {proposals} — tints "
+                                      f"{[(r['lo'], r['hi'], r['peak_pct']) for r in census]}",
+                                 census=census, proposals=proposals)
+            val = base_repair.validate_span(curves, applied, span, max_cv=max_cv, census=census)
+            if not val["ok"]:
+                raise StageError(key, f"--repair-span {span[0]}:{span[1]} is not a valid repair window: "
+                                      f"{val['problem']}", census=census, proposals=proposals)
+            windows = [tuple(span)]
+            plan = base_repair.split_fit_held(windows)
+            reads = len(plan["codes"]) + len(plan["held_out"])
+            digest = {"source_run": src["root"], "installed_cube": installed, "census": census,
+                      "census_proposals": proposals, "tints_in_span": val["tints"],
+                      "windows": windows, "span_from": "--repair-span",
+                      "audit_greys": len(plan["codes"]), "verify_greys": len(plan["held_out"]),
+                      "planned_reads": reads,
+                      "planned_minutes": round(reads * self._REPAIR_SECONDS_PER_READ / 60.0, 1),
+                      "seconds_per_read_assumed": self._REPAIR_SECONDS_PER_READ,
+                      "rowsums": [round(sum(r), 6) for r in applied], "runtime_cube": runtime,
+                      "runtime_cube_grey_dev": cube_grey, "gamma24": g24}
+            self.calib["repair_base_pair"] = {"monitor": int(self.monitor), "mode": normalize_mode(self.mode)}
+            self.calib["repair_base_prior"] = {"cube_path": installed, "source_run": src["root"]}
+            self._save()
+            return StageOutcome(key, "done", digest=digest,
+                                data={"plan": plan, "source": src, "applied": applied, "windows": windows})
+
+        outcome = self._stage(key, run)
+        if (outcome.data or {}).get("plan", {}).get("codes"):
+            d = outcome.digest
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="repair-base:plan", seam=SEAM_PLAN, stage=key,
+                question=(f"repair the installed SDR base 1D LUT: audit {d['audit_greys']} grey(s) in "
+                          f"{d['windows']} ({d['span_from']}), then {d['verify_greys']} held-out grey(s) after the "
+                          f"candidate is applied — {d['planned_reads']} reads, ~{d['planned_minutes']} min. "
+                          "Balance only (light kept); the cube outside the repaired spans stays bit-identical. "
+                          "proceed or abort?"),
+                options=("proceed", "abort"), recommendation="proceed", digest=d)),
+                stage=key, message="repair-base aborted at its plan")
+        return outcome
+
+    def stage_repair_build(self, audit_ti3: str) -> StageOutcome:
+        key = "repair-build"
+
+        def run() -> StageOutcome:
+            from . import base_repair
+            from .mhc_cube import read_1d_cube, write_1d_cube
+            seed = (self.calib["stages"].get("repair-seed") or {}).get("data") or {}
+            src, plan, applied = seed["source"], seed["plan"], seed["applied"]
+            max_cv = self._transfer().max_cv
+            reads = _grey_reads_by_code(audit_ti3, max_cv)
+            sig = build_mhc_noise_sigma(audit_ti3)
+            curves = read_1d_cube(Path(src["cube"]))
+            census = (self.calib["stages"]["repair-seed"].get("digest") or {}).get("census") or []
+            span = (self.calib["stages"]["repair-seed"].get("digest") or {}).get("windows")[0]
+            try:
+                fixed, rep = base_repair.repair_balance(
+                    curves, reads, plan, applied=applied, primaries=src["primaries"],
+                    native_white_xy=src["native_white"], peak_luminance=src["peak"], max_cv=max_cv,
+                    luminance_sigma=sig, span=span, census=census)
+            except ValueError as exc:
+                raise StageError(key, f"cannot build a repair from this audit: {exc}") from exc
+            digest = {k: rep[k] for k in ("spans", "confirmation", "tolerance_pct", "structure_pct", "noise_pct",
+                                          "fit_codes", "unchanged_entries")}
+            if not rep["confirmation"]["confirmed"]:
+                # The correction is shaped by the cube; the reads must say the cube is what tints these greys.
+                # When they do not, the repair would be built on a premise the meter contradicts: refused.
+                raise StageError(key, "the audit does not confirm the installed cube's tint (the meter's balance is "
+                                      f"not explained by the cube: {rep['confirmation']}) — nothing installed",
+                                 **digest)
+            path = self.ctx.root / "generated" / "mhc_base_sdr.repaired.cube"
+            write_1d_cube(path, fixed, title=f"DLC SDR MHC base, balance repair (mon {self.monitor})")
+            return StageOutcome(key, "done", digest={**digest, "candidate": str(path.resolve())},
+                                data={"candidate": str(path.resolve()), "held_out": plan["held_out"],
+                                      "report": rep}, artifacts=[str(path)])
+
+        outcome = self._stage(key, run)
+        if (outcome.data or {}).get("candidate"):
+            d = outcome.digest
+            self._abort_if(self.adjudicate(AdjudicationRequest(
+                key="repair-base:apply", seam=SEAM_FOUNDATION, stage=key,
+                question=(f"the installed cube's tint at {[s['tints'] for s in d['spans']]} is confirmed by the audit "
+                          f"(k {d['confirmation']['k']}, every grey explained within tolerance); the candidate "
+                          f"rewrites {3 * 1024 - d['unchanged_entries']} LUT entries over {d['spans'][0]['codes']} "
+                          "(channel balance only, each grey's light kept). apply it (the previous cube is the "
+                          "rollback point) or abort?"),
+                options=("apply", "abort"), recommendation="apply", digest=d)),
+                stage=key, message="repair-base aborted before applying")
+        return outcome
+
+    def stage_repair_install(self) -> StageOutcome:
+        key = "repair-install"
+        restore = self.calib.get("repair_base_restore") or {}
+        if restore.get("confirmed") or (self.calib.get("repair_base_installed") or {}).get("rolled_back"):
+            raise CalibrationAborted(StageOutcome(
+                "repair-install:rolled-back", "aborted",
+                digest={"message": "this run's repair was rolled back — start a new repair-base run"}))
+
+        def run() -> StageOutcome:
+            built = (self.calib["stages"].get("repair-build") or {}).get("data") or {}
+            cand = built["candidate"]
+            prior = (self.calib.get("repair_base_prior") or {}).get("cube_path")
+            # Recorded BEFORE the call: a crash between here and the read-back is still rolled back.
+            self.calib["repair_base_installed"] = {"candidate": cand, "prior": prior,
+                                                   "at": datetime.now().isoformat(timespec="seconds")}
+            self._save()
+            try:
+                self.controller.set_base_lut(self.monitor, self.mode, cand, 0.0)
+                self.controller.apply_mhc(self.monitor, self.mode)
+            except Exception as exc:  # noqa: BLE001 - the restore below + the seam say what is on the display
+                back = restore_base_repair_prior(self.controller, self.calib, monitor=self.monitor,
+                                                 mode=self.mode, why="install failed", log=self.ctx.log)
+                self._save()
+                raise StageError(key, f"could not install the candidate ({type(exc).__name__}: {exc})",
+                                 restore=back) from exc
+            now, why = installed_base_cube(self.controller, self.monitor, self.mode)
+            if now is None or not _same_file(now, cand):
+                back = restore_base_repair_prior(self.controller, self.calib, monitor=self.monitor,
+                                                 mode=self.mode, why="install not confirmed", log=self.ctx.log)
+                self._save()
+                raise StageError(key, f"the candidate did not read back as installed ({now or why})", restore=back)
+            self.calib["repair_base_installed"]["confirmed"] = True
+            self._save()
+            return StageOutcome(key, "done", digest={"installed": cand, "prior": prior, "confirmed": True})
+
+        return self._stage(key, run)
+
+    def stage_repair_verify(self, audit_ti3: str, verify_ti3: str) -> CalibrationResult:
+        from . import base_repair
+        key = "repair-verify"
+        seed = (self.calib["stages"].get("repair-seed") or {}).get("data") or {}
+        built = (self.calib["stages"].get("repair-build") or {}).get("data") or {}
+        src = seed["source"]
+        max_cv = self._transfer().max_cv
+
+        def run() -> StageOutcome:
+            before = _grey_reads_by_code(audit_ti3, max_cv)
+            after = _grey_reads_by_code(verify_ti3, max_cv)
+            verdict = base_repair.judge_after(
+                before, after, built["report"], built["held_out"], primaries=src["primaries"],
+                native_white_xy=src["native_white"], peak_luminance=src["peak"],
+                luminance_sigma=build_mhc_noise_sigma(audit_ti3))
+            return StageOutcome(key, "done", digest=verdict)
+
+        outcome = self._stage(key, run)
+        verdict = outcome.digest or {}
+        ok = not verdict.get("out") and verdict.get("inside", 0) > 0
+        decision = self.adjudicate(AdjudicationRequest(
+            key="repair-base:keep", seam=SEAM_VERIFY, stage=key,
+            question=(f"held-out greys after the repair: {verdict.get('inside')} inside the span(s), "
+                      f"{verdict.get('beside')} beside; {len(verdict.get('out') or ())} out of tolerance "
+                      f"{verdict.get('tolerance_pct')}. keep the repaired cube, or revert to the previous one?"),
+            options=("keep", "revert"), recommendation="keep" if ok else "revert", digest=verdict))
+        if decision.choice == "revert":
+            back = restore_base_repair_prior(self.controller, self.calib, monitor=self.monitor, mode=self.mode,
+                                             why="operator chose revert at the keep seam", log=self.ctx.log)
+            self._save()
+            status = "reverted" if back.get("confirmed") else "revert_unavailable"
+            return self._finish_repair(status, back.get("summary") or "reverted", restore=back)
+        self.calib["repair_base_installed"]["kept"] = True
+        self._save()
+        lineage = self._record_repair_kept(built["candidate"], src)
+        return self._finish_repair("completed", "the repaired base 1D LUT is installed and kept",
+                                   verdict=verdict, lineage=lineage)
+
+    def _record_repair_kept(self, candidate: str, src: Mapping[str, Any]) -> dict[str, Any]:
+        """A KEPT repair is now the installed base: say so where the next runs look.
+
+        * This run's record carries ``mhc_params`` — the source run's, with ``base_lut.cube_path`` = the repaired
+          cube and ``base_lut.repaired_from`` = {prior cube, source run} — so a later ``repair-base`` seeds from
+          THIS run (``--source-run <this run>``) and the lineage is readable.
+        * The applied-stack registry's record for this display + mode keeps its run, refined SDR white and 3D LUT
+          (the repair changes neither the white nor what the cube was built over beyond a few entries' balance);
+          its ``mhc.base_lut`` becomes the repaired cube and a note says which repair run did it — so
+          ``check_against_pipe`` matches the installed ``source_file`` instead of reporting a stack changed
+          outside DLC. No record (an MHC applied before the registry existed) is created from the source run's
+          parameters. Best-effort: never a gate on a repair already kept on the display.
+        ``refine-mhc`` cannot seed from a repair run (it re-refines the BUILD's base cube and would discard the
+        repair): it is pointed at the original run — the repair is re-done after a re-refine."""
+        out: dict[str, Any] = {}
+        try:
+            src_state = json.loads((Path(src["root"]) / "dlc_state.json").read_text(encoding="utf-8"))
+            params = json.loads(json.dumps(src_state.get("mhc_params") or {}))
+            base = dict(params.get("base_lut") or {})
+            prior = (self.calib.get("repair_base_prior") or {}).get("cube_path")
+            base.update(cube_path=str(candidate),
+                        repaired_from={"cube_path": prior, "source_run": src["root"], "repair_run": self.ctx.root.name})
+            params["base_lut"] = base
+            self._state["mhc_params"] = params
+            self._save()
+            out["mhc_params"] = "recorded (seed a later repair-base from this run)"
+        except (OSError, ValueError) as exc:
+            out["mhc_params"] = f"not recorded ({type(exc).__name__}: {exc})"
+        try:
+            reg = stack_registry.StackRegistry.load(stack_registry.registry_path(self.profile, self.ctx.root))
+            rec = reg.get(self.display.name, self.mode)
+            try:
+                pipe_profile = (((self.controller.state() or {}).get("mhc") or {})
+                                .get(f"{self.monitor}:{normalize_mode(self.mode)}") or {}).get("profile_name")
+            except Exception:  # noqa: BLE001
+                pipe_profile = None
+            if rec is None:
+                rec = stack_registry.record_from_mhc_params(
+                    display=self.display.name, mode=self.mode, monitor=self.monitor,
+                    run_id=Path(src["root"]).name, profile_name=pipe_profile,
+                    mhc_params=self._state.get("mhc_params") or {})
+            rec.mhc = {**(rec.mhc or {}), "base_lut": str(candidate),
+                       "base_lut_repair": {"run_id": self.ctx.root.name,
+                                           "prior": (self.calib.get("repair_base_prior") or {}).get("cube_path"),
+                                           "at": datetime.now().isoformat(timespec="seconds")}}
+            if pipe_profile:
+                rec.profile_name = pipe_profile
+            rec.notes = list(rec.notes or []) + [f"base 1D LUT balance-repaired by repair-base run "
+                                                 f"{self.ctx.root.name} (light kept)"]
+            reg.record(rec)
+            out["registry"] = f"{rec.key}: base_lut -> repaired cube (run {rec.run_id} kept)"
+        except Exception as exc:  # noqa: BLE001 - the registry is priors for the next run
+            out["registry"] = f"not updated ({type(exc).__name__}: {exc})"
+        self.runlog.note("repair-verify", "repair kept: " + "; ".join(f"{k} {v}" for k, v in out.items()))
+        return out
+
+    def _finish_repair(self, status: str, message: str, **extra: Any) -> CalibrationResult:
+        digest: dict[str, Any] = {"message": message, **extra}
+        if (self.calib.get("repair_base_restore") or {}).get("display_may_carry_repair"):
+            digest["hint"] = _repair_rollback_hint(self.ctx.root)
+        self.runlog.run_done(status, message=message)
+        return CalibrationResult(
+            flow=self.calib.get("flow"), monitor=self.monitor, mode=self.mode, target=self.target_name,
+            status=status, stages=list(self.calib["stages"].keys()), results_dir=None, report_path=None,
+            digest=digest)
+
     def _refine_verify_patches(self) -> list[tuple[int, int, int]]:
         return build_refine_verify_set(self.patch_sizes, self._transfer(), warm_tau=self._warm_tau(),
                                        max_cv=self._patch_max_cv())
@@ -9935,6 +10307,16 @@ class Calibration:
             src_calib = src_state.get("calib") or {}
             params = src_state.get("mhc_params") or {}
             stages = src_calib.get("stages") or {}
+            if src_calib.get("flow") == "repair-base":
+                # A repair run carries the repaired cube, not a build: the refine restarts from the BUILD's base
+                # cube (and would discard the repair anyway). Refine from the run the repair was seeded from, then
+                # repair again if the tint is still there.
+                orig = ((params.get("base_lut") or {}).get("repaired_from") or {}).get("source_run") \
+                    or src_calib.get("source_run")
+                refuse(f"{src_root.name} is a repair-base run: refine-mhc re-refines a BUILD's base cube and would "
+                       f"discard the repair — use --source-run {orig} (the run it repaired), then run repair-base "
+                       "again over the new refine if the tint is still there", source_run=str(src_root),
+                       original_run=orig)
             problems: list[str] = []
             if str(src_state.get("mode") or "").upper() != self.mode:
                 problems.append(f"source mode {src_state.get('mode')!r} != this run's {self.mode}")
@@ -11531,6 +11913,8 @@ _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
     "refine-mhc": ("preflight", "resolve-target", "whitepoint", "seed-from-run", "enter-neutral",
                    "hardware-readiness", "install-mhc", "refine-mhc-grayscale", "reapply-3dlut",
                    "measure:verify", "verify"),
+    "repair-base": ("preflight", "repair-seed", "hardware-readiness", "measure:repair-audit", "repair-build",
+                    "repair-install", "measure:repair-verify", "repair-verify"),
     "build-correction": ("preflight", "clear-native", "probe-match"),
     "characterize": ("preflight", "clear-native", "hardware-readiness", "characterize"),
     "peak-window": ("preflight", "enter-neutral", "hardware-readiness", "peak-window"),
@@ -11574,6 +11958,10 @@ FLOWS: dict[str, str] = {
     "grayscale-wb": "verify MHC present -> patch-by-patch user Grayscale correction -> grey-ramp verify",
     "refine-mhc": ("SDR: seed a completed run's MHC (--source-run) → neutral → reinstall MHC → re-refine "
                    "grayscale (white band) → re-apply its 3D LUT → short verify → apply gate"),
+    "repair-base": ("SDR: the INSTALLED base 1D LUT (--source-run = the run that installed it) → census of its "
+                    "tinted greys → plan seam → dense audit → balance-only candidate (light kept, every other "
+                    "entry bit-identical) → apply seam → install (rollback captured) → held-out verify → keep / "
+                    "revert seam"),
     "build-correction": "preflight → prepare ccxxmake → operator runs it → ingest .ccmx (+white.sp) → store",
     "characterize": "preflight → plan → clear-native → learn panel+meter (noise/settle/drift) → DIP store → restore",
     "peak-window": ("HDR probe: consent → native (or --probe-spec stack installed) → white windows 1..100 % up and "
@@ -11952,9 +12340,167 @@ def _gswb_rollback_hint(run_root: Any) -> str:
             + " --abort` — it puts the pre-touch-up curve back and confirms it by reading it back")
 
 
+# ---------------------------------------------------------------------------
+# repair-base: the installed base 1D LUT, its rollback point and its read-back
+#
+# DesktopLUT keeps the PATH of the base .cube (MHCSettings::sourceFilePath, reported as the MHC entry's
+# `source_file`) and re-reads the file at every bake, so the repair writes a NEW cube in its run folder and
+# points the profile at it; the rollback point is the path installed before (never modified). Every ending
+# that does not KEEP the candidate (the keep-seam revert, the CLI rollback guard, --abort) goes through
+# restore_base_repair_prior, which reports the restore as done only when the installed source reads back.
+# ---------------------------------------------------------------------------
+
+def _parse_repair_span(value: Any) -> list[int]:
+    """``"LO:HI"`` (or a 2-sequence) wire grey codes -> ``[lo, hi]``; ValueError otherwise."""
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        lo, hi = int(value[0]), int(value[1])
+    else:
+        parts = str(value).replace(",", ":").split(":")
+        if len(parts) != 2:
+            raise ValueError(f"repair_span must be LO:HI wire codes, got {value!r}")
+        lo, hi = int(parts[0]), int(parts[1])
+    if lo < 0 or hi <= lo:
+        raise ValueError(f"repair_span must be 0 <= LO < HI, got {value!r}")
+    return [lo, hi]
+
+
+def _same_file(a: Any, b: Any) -> bool:
+    try:
+        return os.path.normcase(str(Path(str(a)).resolve())) == os.path.normcase(str(Path(str(b)).resolve()))
+    except OSError:
+        return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+
+def installed_base_cube(controller: Any, monitor: int, mode: str) -> tuple[Optional[str], Optional[str]]:
+    """The base 1D .cube the installed MHC of ``monitor:mode`` was generated from (``state.get`` MHC entry
+    ``source_file``; the mock's ``base_lut.cube_path``), or ``(None, why not)``."""
+    try:
+        state = controller.state() or {}
+    except Exception as exc:  # noqa: BLE001 - a down pipe is an answer
+        return None, f"state.get failed ({type(exc).__name__}: {exc})"
+    entry = (state.get("mhc") or {}).get(f"{int(monitor)}:{normalize_mode(mode)}")
+    if not isinstance(entry, dict):
+        return None, f"DesktopLUT reports no installed MHC for {monitor}:{normalize_mode(mode)}"
+    path = entry.get("source_file") or (entry.get("base_lut") or {}).get("cube_path")
+    if not path:
+        return None, "the installed MHC reports no base .cube source (not built from a 1D LUT, or an old build)"
+    return str(path), None
+
+
+def _grey_reads_by_code(ti3: Any, max_cv: int) -> dict[int, tuple[float, float, float]]:
+    """``{wire code: XYZ}`` of the grey rows of a measured TI3 (a code read twice: the mean)."""
+    acc: dict[int, list[tuple[float, ...]]] = {}
+    for s in parse_ti3(Path(str(ti3))):
+        if abs(s.rgb[0] - s.rgb[1]) < 1e-6 and abs(s.rgb[1] - s.rgb[2]) < 1e-6:
+            acc.setdefault(int(round(s.rgb[0] * max_cv)), []).append(tuple(s.xyz))
+    return {c: tuple(sum(v[k] for v in rows) / len(rows) for k in range(3)) for c, rows in acc.items()}
+
+
+def build_mhc_noise_sigma(ti3: Any) -> float:
+    """The relative luminance repeatability of a measure pass, from its log beside the TI3 (consecutive re-reads
+    of one patch and the interleaved drift references; robust). 0.0 with no evidence — the repair then judges
+    against the structure it measures."""
+    from .base_repair import read_repeatability
+    log = Path(str(ti3)).with_suffix(".ndjson")
+    rows = []
+    try:
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except ValueError:
+                    continue
+    except OSError:
+        return 0.0
+    return read_repeatability(rows)
+
+
+def restore_base_repair_prior(controller: Any, calib_state: Optional[dict[str, Any]], *,
+                              monitor: Optional[int], mode: Optional[str], why: str,
+                              log: Optional[Callable[[str], None]] = None) -> dict[str, Any]:
+    """Put the base 1D LUT the display had before a repair-base run back, re-bake, and CONFIRM it by reading the
+    installed source back. Never raises. ``outcome``: ``not_needed`` (no candidate was ever sent, or the run
+    KEPT it), ``restored`` (confirmed — also when it already reads back as the prior), ``unconfirmed`` (the calls
+    returned but the read-back shows something else or cannot be read), ``failed`` (a call failed). Unless
+    restored / not_needed, ``display_may_carry_repair`` is True. Recorded in ``calib_state['repair_base_restore']``
+    (the previous one moves to ``repair_base_restore_history``); the install record is marked ``rolled_back``."""
+    rec = calib_state if isinstance(calib_state, dict) else {}
+    inst = rec.get("repair_base_installed") if isinstance(rec.get("repair_base_installed"), dict) else None
+    pair = rec.get("repair_base_pair") if isinstance(rec.get("repair_base_pair"), dict) else {}
+    mon = pair.get("monitor", monitor)
+    md = normalize_mode(pair.get("mode") or mode) if (pair.get("mode") or mode) else None
+    prev = rec.get("repair_base_restore") if isinstance(rec.get("repair_base_restore"), dict) else {}
+    out: dict[str, Any] = {"why": why, "at": datetime.now().isoformat(timespec="seconds"), "monitor": mon,
+                           "mode": md, "prior": (inst or {}).get("prior"), "candidate": (inst or {}).get("candidate"),
+                           "actions": [], "outcome": None, "confirmed": False,
+                           "attempt": int(prev.get("attempt") or 0) + 1}
+
+    def finish(outcome: str, summary: str, *, confirmed: bool = False, error: Optional[str] = None) -> dict[str, Any]:
+        out.update(outcome=outcome, confirmed=confirmed, summary=summary,
+                   display_may_carry_repair=outcome in ("unconfirmed", "failed"))
+        if error:
+            out["error"] = error
+        if outcome != "not_needed" and isinstance(calib_state, dict):
+            if prev:
+                calib_state.setdefault("repair_base_restore_history", []).append(prev)
+            calib_state["repair_base_restore"] = out
+            if inst is not None:
+                inst["rolled_back"] = {"why": why, "at": out["at"], "confirmed": confirmed, "outcome": outcome}
+        if log is not None:
+            try:
+                log(f"repair-base restore ({why}): {summary}")
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+
+    if inst is None:
+        return finish("not_needed", "no repaired cube was ever sent to DesktopLUT — nothing to put back", confirmed=True)
+    if inst.get("kept"):
+        return finish("not_needed", "this run's repair was KEPT at its verify — it is the run's result", confirmed=True)
+    prior = inst.get("prior")
+    if mon is None or not md or not prior:
+        return finish("failed", "could not tell which cube or display to restore — the display may carry the "
+                                "UNVERIFIED repaired cube", error="monitor/mode/prior unknown")
+    now, _why = installed_base_cube(controller, int(mon), md)
+    cand = inst.get("candidate")
+    if now is not None and not _same_file(now, prior) and not (cand and _same_file(now, cand)):
+        # Someone installed another base since (the GUI, another run): it is neither this run's candidate nor
+        # what it replaced. Putting the prior back would undo THEIR change — refused, reported.
+        return finish("refused", f"the installed base 1D LUT is now {now} — neither this run's repaired cube nor "
+                                 f"the one it replaced ({prior}); it was changed by someone else, so nothing is "
+                                 "put back", confirmed=False)
+    if now is not None and _same_file(now, prior) and (prev.get("confirmed") or not inst.get("confirmed")):
+        # never applied (the install failed before DesktopLUT took it), or an earlier restore already put it back
+        return finish("restored", "the installed base 1D LUT already reads back as the one before the repair",
+                      confirmed=True)
+    try:
+        controller.set_base_lut(int(mon), md, str(prior), 0.0)
+        out["actions"].append({"call": "set_base_lut", "cube_path": str(prior)})
+        controller.apply_mhc(int(mon), md)
+        out["actions"].append({"call": "apply_mhc"})
+    except Exception as exc:  # noqa: BLE001 - the pipe is gone / DesktopLUT refused
+        err = f"{type(exc).__name__}: {exc}"
+        return finish("failed", f"could not put the previous base 1D LUT back ({err}) — the display may still "
+                                "carry the UNVERIFIED repaired cube", error=err)
+    now, why_not = installed_base_cube(controller, int(mon), md)
+    if now is None:
+        return finish("unconfirmed", f"sent the previous base 1D LUT back but could not read it back ({why_not})")
+    if not _same_file(now, prior):
+        return finish("unconfirmed", f"sent the previous base 1D LUT back but the installed source reads {now}")
+    return finish("restored", "restored the base 1D LUT this display had before the repair, re-baked and "
+                              "confirmed it by reading the installed source back", confirmed=True)
+
+
+def _repair_rollback_hint(run_root: Any) -> str:
+    return ("the display may still carry the UNVERIFIED repaired base 1D LUT. Once DesktopLUT is running with the "
+            "calibration pipe, run `python -m dlc.calibrate --run " + str(run_root) + " --abort` — it puts the "
+            "previous cube back and confirms it by reading it back")
+
+
 # Flows that never enter calibration mode: they tune / measure the INSTALLED stack in place, so
 # DesktopLUT never takes a snapshot of them (their own undo is the in-place baseline / candidate).
-_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only", "refresh-response")
+_NON_ENTERING_FLOWS = ("3dlut-only", "grayscale-wb", "verify-only", "refresh-response", "repair-base")
 
 
 def _run_entered_calibration(calib_state: Optional[dict[str, Any]], *,
@@ -12046,7 +12592,14 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
                                       why="--abort", log=log)
     probe = _probe_flow_restore(controller, calib_state, run_flow=run_flow, monitor=monitor, mode=mode,
                                 run_root=run_root, why="--abort", display_api=display_api, log=log)
-    if gswb is not None and gswb["outcome"] != "not_needed":
+    repair: Optional[dict[str, Any]] = None
+    if run_flow == "repair-base" and isinstance(calib_state, dict):
+        repair = restore_base_repair_prior(controller, calib_state, monitor=monitor, mode=mode,
+                                           why="--abort", log=log)
+    if repair is not None and repair["outcome"] != "not_needed":
+        status = {"restored": "reverted", "unconfirmed": "restore_unknown"}.get(repair["outcome"],
+                                                                                 "nothing_restored")
+    elif gswb is not None and gswb["outcome"] != "not_needed":
         status = {"restored": "reverted", "unconfirmed": "restore_unknown"}.get(gswb["outcome"],
                                                                                 "nothing_restored")
     elif probe is not None:
@@ -12073,6 +12626,11 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
     if probe is not None:
         payload["probe_restore"] = probe
         payload["display_may_differ"] = probe["outcome"] != "confirmed"
+    if repair is not None:
+        payload["repair_base_restore"] = repair
+        payload["display_may_carry_repair"] = bool(repair.get("display_may_carry_repair"))
+        if repair["outcome"] == "not_needed" and (calib_state or {}).get("repair_base_installed", {}).get("kept"):
+            payload["note"] = "this run's repair was KEPT at its verify — --abort does not take a kept result back"
     if gswb_applied:
         payload["grayscale_wb_applied"] = True
         payload["note"] = ("this run's Grayscale touch-up was APPLIED (kept at the verify gate) — --abort does "
@@ -12082,6 +12640,8 @@ def _abort_restore(controller: Any, calib_state: Optional[dict[str, Any]], *, mo
         payload["hint"] = _restore_hint(calib_state)
         if payload.get("display_may_carry_touchup"):
             payload["hint"] = _gswb_rollback_hint(run_root) + "; " + payload["hint"]
+        if payload.get("display_may_carry_repair"):
+            payload["hint"] = _repair_rollback_hint(run_root) + "; " + payload["hint"]
         if probe is not None and probe.get("hint"):
             payload["hint"] = probe["hint"] + "; " + payload["hint"]
     return 0, payload
@@ -12104,6 +12664,10 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
     if entered_calibration is False and (calib_state or {}).get("flow") == "grayscale-wb":
         gswb = restore_gswb_prior(controller, calib_state, monitor=monitor, mode=mode,
                                   why="rollback guard (run did not complete)")
+    repair: Optional[dict[str, Any]] = None
+    if (calib_state or {}).get("flow") == "repair-base":
+        repair = restore_base_repair_prior(controller, calib_state, monitor=monitor, mode=mode,
+                                           why="rollback guard (run did not complete)")
     report = _common.request_snapshot_restore(controller, entered=entered_calibration,
                                               monitor=_run_monitor(calib_state, monitor),
                                               stale_tell=_enter_stale_tell(calib_state))
@@ -12119,6 +12683,10 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
         status = {"confirmed": "rolled_back", "unconfirmed": "rollback_unconfirmed"}.get(probe["outcome"],
                                                                                        "rollback_failed")
         reason = "run did not complete; " + probe["summary"]
+    elif repair is not None and repair["outcome"] != "not_needed":
+        status = {"restored": "rolled_back", "unconfirmed": "rollback_unconfirmed",
+                  "refused": "rollback_restored_nothing"}.get(repair["outcome"], "rollback_failed")
+        reason = "run did not complete; " + repair["summary"]
     elif gswb is not None and gswb["outcome"] != "not_needed":
         # the touch-up curve is this flow's display change; the snapshot was (rightly) never asked for
         status = {"restored": "rolled_back", "unconfirmed": "rollback_unconfirmed"}.get(
@@ -12140,11 +12708,16 @@ def _rollback_restore(controller: Any, calib_state: Optional[dict[str, Any]], *,
     if probe is not None:
         payload["probe_restore"] = probe
         payload["display_may_differ"] = probe["outcome"] != "confirmed"
+    if repair is not None and repair["outcome"] != "not_needed":
+        payload["repair_base_restore"] = repair
+        payload["display_may_carry_repair"] = bool(repair.get("display_may_carry_repair"))
     if status != "rolled_back":
         payload["backup"] = ((calib_state or {}).get("backup") or {})
         payload["hint"] = _restore_hint(calib_state)
         if payload.get("display_may_carry_touchup"):
             payload["hint"] = _gswb_rollback_hint(run_root) + "; " + payload["hint"]
+        if payload.get("display_may_carry_repair"):
+            payload["hint"] = _repair_rollback_hint(run_root) + "; " + payload["hint"]
         if probe is not None and probe.get("hint"):
             payload["hint"] = probe["hint"] + "; " + payload["hint"]
     return payload
@@ -12923,6 +13496,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     parser.add_argument("--source-run", type=Path, default=None, dest="source_run",
                         help="refine-mhc flow: the COMPLETED run whose MHC is re-refined and whose "
                              "3D LUT is kept (read-only; the refine runs in a new run dir)")
+    parser.add_argument("--repair-span", default=None, dest="repair_span", metavar="LO:HI",
+                        help="repair-base flow: audit these wire grey codes (10-bit, inclusive) instead of the "
+                             "windows the installed cube's own balance census picks")
     parser.add_argument("--refine-cube", choices=("source", "installed"), default=None, dest="refine_cube",
                         help="refine-mhc flow: the 3D LUT the re-refined MHC keeps — 'source' (default: the "
                              "source run's build) or 'installed' (the cube installed now per the stack "
@@ -13790,6 +14366,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
                             viewing_hold_budget_min=args.viewing_hold_budget_min,
                             present_stall=args.present_stall,
                             refine_cube=args.refine_cube,
+                            repair_span=args.repair_span,
                             content_mode=args.content_mode,
                             keep_layers=([n for n in str(args.keep_layers).split(",") if n.strip()]
                                          if args.keep_layers else None),
