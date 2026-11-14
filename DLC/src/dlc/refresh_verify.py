@@ -9,8 +9,17 @@ run with the spec's ``"purpose": "verify"``. What differs:
 
 * **The trim stays ON and is never touched.** The run refuses before anything changes when the display's REFRESH TRIM
   is off, when DesktopLUT has no trim data for the mode (no DLC folder / DIP / ``refresh_response`` section, or an
-  invalid one), or when a rate to verify is not in the recorded response. It switches only the 3D LUT bypass (as the
-  response measurement did); ``refresh_trim`` is never sent in a ``layers.set``, so no restore can change it either.
+  invalid one), or when a rate to verify is not in the recorded response. ``refresh_trim`` is never sent in a
+  ``layers.set``, so no restore can change it either.
+* **What is measured** (spec ``verify_stack``). ``as_viewed`` (default, the owner's question "is what I watch at 48 /
+  50 Hz the same light as at 60"): the stack exactly as it is — the 3D LUT in the path, every viewing layer left as
+  the owner has it (the run changes NO layer; ``verify_layers_off`` names any to switch off for the run). The
+  comparison is a ratio at identical codes, so static layers cancel; the plan seam names the layers on and what each
+  means for a full-field grey (none is keyed by the refresh rate; the adaptive ones settle). ``mhc_only``: the
+  isolated MHC (3D LUT bypassed, viewing layers off) — no DesktopLUT pass processes the frame, so nothing dithers and
+  the MHC2 output lands on whole link codes per channel (live 2026-11-14: residuals of 0.3-0.7 % at 0.9-2.3 % per
+  code); one link code in % of light (the link depth from ``windows.query_monitors`` ``link_bpc``, the PQ slope at the
+  grey's light) is reported per grey, and a residual below it is "not resolvable without dither" (undecided).
 * **The trim is read back at every rate**: after each switch has settled, ``state.get`` ``refresh_trim`` must say the
   variant for that rate is on screen (``state`` ``trim`` for the rate or the rate whose curve it uses, ``applied``, and
   the profile's ``active_stamp`` equal to the wanted ``stamp`` — ``applied`` alone is not proof; ``state``
@@ -26,19 +35,28 @@ the nearest reference reads before and after it, ``refresh_trim.bracket_ratios``
 
 * luminance: the combined ratio (inverse-variance mean over the passes, ``refresh_trim.combine``) within
   ``verify_lum_tol`` (0.3 %) of 1, AND every single bracketed read within it too;
-* chromaticity: the combined |dx| and |dy| (rate minus interpolated reference) within the spread of that grey's own
-  reference reads over the run (max - min of x, of y). A spread is noise + drift; a deviation inside it is not
-  distinguishable from the reference.
+* chromaticity: the combined shift (rate minus interpolated reference, mean over the passes) in x and in y, against
+  how much that grey's chromaticity moves from one REFERENCE leg to the next with drift included — each interior
+  reference read predicted from its neighbours (leave-one-out), the residuals' RMS (:func:`reference_xy_repeatability`;
+  a rate read has the same make-up under "no refresh effect"). t = shift / (rms / sqrt(n passes)), Student t with nu =
+  the number of residuals, two-sided; a shift fails when p < 0.05 / (2 x the run's grey-rate cells) — Bonferroni, so
+  the run has <= 5 % chance of any false chromaticity fail. Every number (shift, se, t, p, critical shift) is in the
+  result. (Replaced 2026-11-14 the "within the reference reads' max-min spread" rule: on the live run that spread was
+  mostly the reference reads' LINEAR drift over the run, ~0.0003 in x; the leg-to-leg repeatability after drift is
+  ~0.00001-0.0001, and the rate shifts of 0.0001-0.003 the mhc_only stack showed are real, i.e. the link rounding.)
 
-Verdict per rate: ``pass`` (every grey passes both, the trim read back applied on every leg of the rate), ``fail``
-(a luminance miss, or the trim not applied), or ``undecided`` — a chromaticity miss with the luminance inside, an
+Verdict per rate: ``pass`` (every grey passes both, the trim read back on screen on every leg of the rate), ``fail``
+(a luminance miss, a significant chromaticity shift, or the trim not on screen), or ``undecided`` — in ``mhc_only`` a
+luminance miss below one link code or any chromaticity shift (link rounding: not resolvable without dither), an
 unsettled read, a read with no bracketed ratio (no reference read on both sides, no light, implausible — never dropped
-silently: named per grey in the result), or anomalies: not a deterministic yes/no, so the digest carries the numbers and the
-overseer judges (nothing is applied or recorded either way). The run's verdict is the worst of its rates.
+silently: named per grey in the result), too few reference legs for a repeatability estimate, or anomalies: not a
+deterministic yes/no, so the digest carries the numbers and the overseer judges (nothing is applied or recorded
+either way). The run's verdict is the worst of its rates.
 
-Simulation: ``python -m dlc.refresh_verify simulate --out DIR [--residual-pct P] [--trim-off] [--no-data]`` runs the
-whole flow in-process on the mock DesktopLUT + ``refresh_mode.SimDisplayApi`` + ``probe_sim.ProbeSimPanel`` (no pipe,
-no meter, no display mode is touched on this machine).
+Simulation: ``python -m dlc.refresh_verify simulate --out DIR [--verify-stack as_viewed|mhc_only] [--residual-pct P]
+[--trim-off] [--no-data] [--stuck]`` runs the whole flow in-process on the mock DesktopLUT + ``refresh_mode.SimDisplayApi``
++ ``probe_sim.ProbeSimPanel`` (no pipe, no meter, no display mode is touched on this machine); ``mhc_only`` rounds the
+simulated MHC output to the 10-bit link, ``as_viewed`` does not (:func:`sim_refresh_gain`).
 """
 from __future__ import annotations
 
@@ -188,30 +206,127 @@ def _xy(xyz: Optional[Sequence[float]]) -> tuple[Optional[float], Optional[float
 
 
 _RANK = {"pass": 0, "undecided": 1, "fail": 2}
+CHROMA_ALPHA = 0.05         # family-wise false-alarm rate of the chromaticity test over the whole run (Bonferroni)
+
+
+def t_two_sided_p(t: float, nu: int) -> float:
+    """P(|T| >= |t|) for Student's t with integer ``nu`` >= 1 degrees of freedom — the closed forms of Abramowitz &
+    Stegun 26.7.3 (odd nu) / 26.7.4 (even nu); no scipy."""
+    t = abs(float(t))
+    if math.isinf(t):
+        return 0.0
+    nu = int(nu)
+    th = math.atan(t / math.sqrt(nu))
+    c2, s = math.cos(th) ** 2, math.sin(th)
+    if nu % 2 == 1:
+        acc, term = 0.0, 1.0
+        if nu > 1:
+            acc, term = 1.0, 1.0
+            for k in range(1, (nu - 3) // 2 + 1):
+                term *= c2 * (2 * k) / (2 * k + 1)
+                acc += term
+            a = (2.0 / math.pi) * (th + s * math.cos(th) * acc)
+        else:
+            a = 2.0 * th / math.pi
+    else:
+        acc, term = 1.0, 1.0
+        for k in range(1, (nu - 2) // 2 + 1):
+            term *= c2 * (2 * k - 1) / (2 * k)
+            acc += term
+        a = s * acc
+    return max(0.0, min(1.0, 1.0 - a))
+
+
+def t_critical(p: float, nu: int) -> float:
+    """The |t| whose two-sided p-value is ``p`` (bisection on :func:`t_two_sided_p`)."""
+    lo, hi = 0.0, 1.0
+    while t_two_sided_p(hi, nu) > p and hi < 1e7:
+        hi *= 2.0
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        if t_two_sided_p(mid, nu) > p:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def reference_xy_repeatability(ref_rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """How much a grey's chromaticity moves from one reference leg to the next, drift included: each interior
+    reference read predicted by linear interpolation in time between its neighbours (leave-one-out), the residuals'
+    RMS in x and in y, and their count (= the degrees of freedom of that estimate).
+
+    Why this is the null distribution of a rate's shift: a rate read sits between two reference reads exactly as an
+    interior reference read sits between its neighbours, so under "no refresh effect" its shift against the
+    interpolated reference has the same make-up (its own read noise + both neighbours' noise weighted by the
+    interpolation + the drift the interpolation misses). The LOO span is two bracket gaps, so the drift part is if
+    anything overstated: the test errs towards passing a real shift, never towards failing a repeatable one."""
+    s = sorted((r for r in ref_rows if r.get("xyz") and _xy(r["xyz"])[0] is not None), key=lambda r: float(r["t_s"]))
+    ex, ey = [], []
+    for k in range(1, len(s) - 1):
+        a, m, b = s[k - 1], s[k], s[k + 1]
+        ta, tm, tb = float(a["t_s"]), float(m["t_s"]), float(b["t_s"])
+        if tb <= ta:
+            continue
+        w = (tm - ta) / (tb - ta)
+        (xa, ya), (xm, ym), (xb, yb) = _xy(a["xyz"]), _xy(m["xyz"]), _xy(b["xyz"])
+        ex.append(xm - (xa + (xb - xa) * w))
+        ey.append(ym - (ya + (yb - ya) * w))
+    rms = (lambda v: math.sqrt(sum(e * e for e in v) / len(v)) if v else None)
+    return {"n_ref": len(s), "nu": len(ex), "rms_x": rms(ex), "rms_y": rms(ey), "residuals_x": ex, "residuals_y": ey}
+
+
+def chroma_test(dx: Optional[float], dy: Optional[float], n_reads: int, rep: dict[str, Any], p_crit: float
+                ) -> dict[str, Any]:
+    """The combined (mean over ``n_reads`` passes) shift against the reference legs' own repeatability: t = shift /
+    (rms_loo / sqrt(n)), Student t with nu = the number of LOO residuals, two-sided; it passes when p >= ``p_crit``
+    (the run's Bonferroni share of :data:`CHROMA_ALPHA`)."""
+    nu = int(rep.get("nu") or 0)
+    if dx is None or dy is None or nu < 2 or n_reads < 1:
+        return {"ok": None, "why": f"too few reference legs for a repeatability estimate (nu {nu} < 2)"}
+    out: dict[str, Any] = {"nu": nu, "n_reads": n_reads, "p_crit": p_crit}
+    ok = True
+    for name, d, rms in (("x", dx, rep["rms_x"]), ("y", dy, rep["rms_y"])):
+        se = (rms or 0.0) / math.sqrt(n_reads)
+        if se <= 0.0:                       # a noiseless reference (simulation): only an exact match passes
+            t, p = (0.0, 1.0) if abs(d) <= 1e-12 else (math.inf, 0.0)
+            crit = 0.0
+        else:
+            t = d / se
+            p = t_two_sided_p(t, nu)
+            crit = t_critical(p_crit, nu) * se
+        out[name] = {"shift": d, "se": se, "t": t, "p": p, "critical_shift": crit}
+        ok = ok and p >= p_crit
+    out["ok"] = ok
+    return out
+
+
+def link_code_pct(light_nits: Optional[float], link_bpc: Optional[int]) -> Optional[float]:
+    """One code of a ``link_bpc`` PQ link at ``light_nits``, in % of that light (the step to the next code up)."""
+    if not light_nits or light_nits <= 0 or not link_bpc:
+        return None
+    from ._pq import eotf_norm, oetf_norm
+    m = float((1 << int(link_bpc)) - 1)
+    c = oetf_norm(min(light_nits, 10000.0) / 10000.0) * m
+    lo, hi = eotf_norm(c / m), eotf_norm(min(c + 1.0, m) / m)
+    return (hi / lo - 1.0) * 100.0 if lo > 0 else None
 
 
 def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: float = 0.003,
                    trim_checks: Sequence[dict[str, Any]] = (), anomalies: Sequence[dict[str, Any]] = (),
-                   status: str = "ok") -> dict[str, Any]:
-    """The verdict from the run's rows (``trim_rows.jsonl``). Pure; see the module docstring for the rule."""
+                   status: str = "ok", stack: str = "as_viewed", link_bpc: Optional[int] = None) -> dict[str, Any]:
+    """The verdict from the run's rows (``trim_rows.jsonl``). Pure; see the module docstring for the rule.
+    ``stack`` = what was measured (``as_viewed`` / ``mhc_only``); ``link_bpc`` = the link's bits per channel (one link
+    code in % of light is reported per grey; in ``mhc_only`` — no DesktopLUT pass, so no dither — a light miss inside one
+    link code is "not resolvable without dither", undecided, not fail)."""
     greys = [r for r in rows if r.get("kind") == "grey"]
     usable = [r for r in greys if not r.get("implausible")]
     ratios = rt.bracket_ratios(usable, reference)
     comb = rt.combine(ratios)
-    spread: dict[str, dict[str, Any]] = {}
-    for r in usable:
-        if r.get("rate") != reference or not r.get("xyz"):
-            continue
-        x, y = _xy(r["xyz"])
-        if x is None:
-            continue
-        s = spread.setdefault(r["patch"], {"x": [], "y": [], "Y": []})
-        s["x"].append(x)
-        s["y"].append(y)
-        s["Y"].append(float(r["y"]))
-    sp = {p: {"n": len(v["x"]), "x": max(v["x"]) - min(v["x"]), "y": max(v["y"]) - min(v["y"]),
-              "Y_rel": (max(v["Y"]) - min(v["Y"])) / (sum(v["Y"]) / len(v["Y"]))} for p, v in spread.items()}
+    rep = {p: reference_xy_repeatability(rt.series(usable, p, reference)) for p in sorted({r["patch"] for r in usable})}
     rates = sorted({str(r["rate"]) for r in greys if r.get("rate") != reference}, key=lambda k: -rt._rate_hz_nominal(k))
+    n_chroma = sum(1 for rate in rates for p in (comb.get(rate) or {}))
+    p_crit = CHROMA_ALPHA / max(1, 2 * n_chroma)
     out_rates: dict[str, Any] = {}
     for rate in rates:
         cells, why_fail, why_undecided = {}, [], []
@@ -220,7 +335,7 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
                             key=lambda p: min(float(x.get("nominal_nits") or 0) for x in greys if x["patch"] == p)):
             prow = [x for x in rrows if x["patch"] == patch]
             c = (comb.get(rate) or {}).get(patch)
-            s = sp.get(patch) or {}
+            rp_ = rep.get(patch) or {}
             singles = [x for x in prow if x.get("ratio") is not None]
             # every read of this grey at this rate, also those bracket_ratios left out (no light, implausible): a read
             # without a ratio is never dropped silently — it makes the rate undecided, named here
@@ -234,7 +349,7 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
                                     "reads": len(taken), "bracketed": len(singles), "unbracketed": lost,
                                     "ratios": [round(x["ratio"], 6) for x in singles],
                                     "unsettled": sum(1 for x in prow if x.get("settled") is False),
-                                    "spread_ref": {k: s.get(k) for k in ("n", "x", "y", "Y_rel")}}
+                                    "reference_repeatability": {k: rp_.get(k) for k in ("n_ref", "nu", "rms_x", "rms_y")}}
             if c is None or not singles:
                 cell["verdict"] = "undecided"
                 cell["why"] = "no read bracketed by reference reads on both sides"
@@ -245,26 +360,43 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             cell.update({"ratio": ratio, "pct": (ratio - 1.0) * 100.0, "u_pct": c["u"] * 100.0,
                          "dx": c.get("dx"), "dy": c.get("dy")})
             lum_ok = abs(ratio - 1.0) <= lum_tol and all(abs(x["ratio"] - 1.0) <= lum_tol for x in singles)
-            sx, sy = s.get("x"), s.get("y")
-            chroma_ok = None
-            if c.get("dx") is not None and c.get("dy") is not None and sx is not None and (s.get("n") or 0) >= 2:
-                eps = 1e-9                                  # float round-off only, not a tolerance
-                chroma_ok = abs(c["dx"]) <= sx + eps and abs(c["dy"]) <= sy + eps
-            cell.update(lum_ok=lum_ok, chroma_ok=chroma_ok)
-            if not lum_ok:
+            ct = chroma_test(c.get("dx"), c.get("dy"), len([x for x in singles if x.get("dx") is not None]), rp_, p_crit)
+            chroma_ok = ct.get("ok")
+            code_pct = link_code_pct(c.get("y60"), link_bpc)
+            worst_pct = max([abs(cell["pct"])] + [abs(x["ratio"] - 1.0) * 100.0 for x in singles])
+            below_code = code_pct is not None and worst_pct < code_pct
+            cell.update(lum_ok=lum_ok, chroma_ok=chroma_ok, chroma=ct, link_code_pct=code_pct,
+                        residual_below_one_link_code=below_code if code_pct is not None else None)
+            if not lum_ok and stack == "mhc_only" and below_code:
+                cell["verdict"] = "undecided"
+                why_undecided.append(f"{patch}: light {cell['pct']:+.3f} % (worst single {worst_pct:.3f} %) is outside "
+                                     f"+/-{lum_tol * 100:g} % but below one {link_bpc}-bit link code here "
+                                     f"({code_pct:.3f} %): not resolvable without dither (mhc_only stack: no "
+                                     "DesktopLUT pass dithers the MHC output)")
+            elif not lum_ok:
                 cell["verdict"] = "fail"
                 why_fail.append(f"{patch}: light {cell['pct']:+.3f} % (single reads {[round((v - 1) * 100, 3) for v in cell['ratios']]} %) "
-                                f"outside +/-{lum_tol * 100:g} %")
+                                f"outside +/-{lum_tol * 100:g} %"
+                                + (f" (one {link_bpc}-bit link code = {code_pct:.3f} %)" if code_pct is not None else ""))
             elif lost:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: {len(lost)} of {len(taken)} read(s) without a bracketed ratio: {lost}")
-            elif chroma_ok is False:
+            elif chroma_ok is False and stack == "mhc_only" and code_pct is not None:
                 cell["verdict"] = "undecided"
-                why_undecided.append(f"{patch}: chromaticity dx {c['dx']:+.5f} dy {c['dy']:+.5f} outside the reference "
-                                     f"reads' own spread (x {sx:.5f}, y {sy:.5f}); the light is inside")
+                why_undecided.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} is "
+                                     f"real against the reference legs' repeatability (p {min(ct['x']['p'], ct['y']['p']):.2g}) "
+                                     f"but the mhc_only stack has no dither: each channel lands on whole {link_bpc}-bit "
+                                     f"link codes ({code_pct:.3f} % of light each here), which moves the chromaticity "
+                                     "by itself — not resolvable without dither")
+            elif chroma_ok is False:
+                cell["verdict"] = "fail"
+                why_fail.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} (p {ct['x']['p']:.2g}, critical "
+                                f"{ct['x']['critical_shift']:.5f}), dy {ct['y']['shift']:+.5f} (p {ct['y']['p']:.2g}, "
+                                f"critical {ct['y']['critical_shift']:.5f}) beyond the reference legs' own repeatability "
+                                f"(Student t, nu {ct['nu']}, Bonferroni p < {p_crit:.2g})")
             elif chroma_ok is None:
                 cell["verdict"] = "undecided"
-                why_undecided.append(f"{patch}: no chromaticity spread (fewer than 2 reference reads)")
+                why_undecided.append(f"{patch}: {ct.get('why')}")
             elif cell["unsettled"]:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: {cell['unsettled']} unsettled read(s)")
@@ -296,13 +428,22 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
     worst = max([v["verdict"] for v in out_rates.values()] or ["undecided"], key=lambda v: _RANK[v])
     if run_undecided and worst == "pass":
         worst = "undecided"
-    return {"verdict": worst, "rule": {"luminance": f"|ratio - 1| <= {lum_tol * 100:g} % (combined and every single read), "
-                                                    "time-bracketed against the reference",
-                                       "chromaticity": "combined |dx|, |dy| <= the grey's own reference-read spread "
-                                                       "(max - min over the run)",
-                                       "trim": "state.get refresh_trim reads the rate's variant applied on every leg"},
+    return {"verdict": worst, "stack": stack, "link_bpc": link_bpc,
+            "rule": {"luminance": f"|ratio - 1| <= {lum_tol * 100:g} % (combined and every single read), "
+                                  "time-bracketed against the reference"
+                                  + ("; in mhc_only a miss below one link code is 'not resolvable without dither' "
+                                     "(undecided)" if stack == "mhc_only" else ""),
+                     "chromaticity": (f"the combined shift (mean over the passes) in x and in y against the grey's own "
+                                      f"reference-leg repeatability: leave-one-out interpolation residuals of the "
+                                      f"reference reads (drift included), t = shift / (rms / sqrt(n)), Student t with nu = "
+                                      f"their count; a shift fails when its two-sided p < {CHROMA_ALPHA:g} / "
+                                      f"{max(1, 2 * n_chroma)} tests (Bonferroni: <= {CHROMA_ALPHA:g} chance of any false "
+                                      "fail in the run)"),
+                     "chromaticity_p_crit": p_crit,
+                     "trim": "state.get refresh_trim reads the rate's variant on screen on every leg (stamp rule)"},
             "reference": reference, "rates": out_rates, "run_undecided": run_undecided,
-            "reference_spread": sp, "reference_trim_checks": len(ref_checks),
+            "reference_repeatability": {p: {k: v.get(k) for k in ("n_ref", "nu", "rms_x", "rms_y")} for p, v in rep.items()},
+            "reference_trim_checks": len(ref_checks),
             "unbracketed": [{k: x.get(k) for k in ("leg", "rate", "patch")} for x in ratios if x.get("unbracketed")]}
 
 
@@ -312,6 +453,8 @@ def digest_lines(res: dict[str, Any]) -> list[dict[str, Any]]:
         out.append({"rate": rate, "verdict": v["verdict"],
                     "pct_by_grey": {p: (round(c["pct"], 3) if c.get("pct") is not None else None)
                                     for p, c in v["greys"].items()},
+                    "link_code_pct_by_grey": {p: (round(c["link_code_pct"], 3) if c.get("link_code_pct") is not None
+                                                  else None) for p, c in v["greys"].items()},
                     "fail": v["fail"], "undecided": v["undecided"]})
     return out
 
@@ -363,7 +506,39 @@ def sim_trim_model(api: Any, hardware_id: str, *, rates: Sequence[str] = ("47.95
     return model
 
 
-def _simulate(out: Path, *, residual_pct: float, trim_off: bool, no_data: bool, stuck: bool, seed: int) -> dict[str, Any]:
+def sim_effect(nits: float) -> float:
+    """The simulated panel's own response at 47.952 Hz (ln of the light ratio; roughly the owner's PA32)."""
+    return 0.034 - 0.008 * math.log10(max(nits, 0.5) / 0.5)
+
+
+def sim_refresh_gain(server: Any, *, residual: float = 0.0, link_bpc: int = 10,
+                     effect: Callable[[float], float] = sim_effect) -> Callable[[float, float], float]:
+    """``ProbeSimPanel.refresh_gain`` for the verify simulation: the panel's response R at the rate (linear in frame
+    period), the trim T = R^-(1 - residual) when the mock's trim model says a trimmed variant is on screen, and —
+    when the 3D LUT is bypassed (the ``mhc_only`` stack: no DesktopLUT pass, so no dither) — the MHC output n·T
+    rounded per channel to the ``link_bpc``-bit PQ link. As viewed (the 3D LUT in the path) the hook's dither keeps
+    the fractional code on average: no rounding."""
+    from ._pq import eotf_norm, oetf_norm
+    m = float((1 << int(link_bpc)) - 1)
+
+    def q(nits: float) -> float:
+        return 10000.0 * eotf_norm(round(oetf_norm(min(max(nits, 0.0), 10000.0) / 10000.0) * m) / m)
+
+    def gain(h: float, nits: float) -> float:
+        x = (1000.0 / h - 1000.0 / 60.0) / (1000.0 / (48000 / 1001) - 1000.0 / 60.0)
+        r = math.exp(effect(nits) * x)
+        lay = dict(server.state.layers.get("0:HDR", {}))
+        st = (server.refresh_trim_model({"layers": {"0:HDR": lay}}) if server.refresh_trim_model else {}).get("0:HDR", {})
+        t = r ** -(1.0 - residual) if (st.get("state") == "trim" and st.get("active_stamp")) else 1.0
+        out = nits * t
+        if lay.get("bypass_3dlut"):
+            out = q(out)
+        return r * out / nits if nits > 0 else r
+    return gain
+
+
+def _simulate(out: Path, *, residual_pct: float, trim_off: bool, no_data: bool, stuck: bool, seed: int,
+              verify_stack: str = "as_viewed") -> dict[str, Any]:
     import datetime
 
     from . import calibration_profile as cp
@@ -394,21 +569,16 @@ def _simulate(out: Path, *, residual_pct: float, trim_off: bool, no_data: bool, 
     def hz() -> Optional[float]:
         return rm.active_hz(rm.find_display(api.snapshot(), "SIM0000"))
 
-    def effect(nits: float) -> float:           # the panel's own response at 47.952 Hz (roughly the owner's)
-        return 0.034 - 0.008 * math.log10(max(nits, 0.5) / 0.5)
-
-    def gain(h: float, nits: float) -> float:   # what is left after the trim: residual_pct of the response
-        x = (1000.0 / h - 1000.0 / 60.0) / (1000.0 / (48000 / 1001) - 1000.0 / 60.0)
-        trim_on = server.state.layers.get("0:HDR", {}).get("refresh_trim") and not stuck and not no_data
-        left = (residual_pct / 100.0) if trim_on else 1.0
-        return math.exp(effect(nits) * x * left)
-
+    # an as-viewed stack has a cube in the path (the hook dithers); mhc_only bypasses it (the sim then rounds to the link)
+    from .simulation import write_identity_cube
+    ctrl.set_3dlut(0, "HDR", str(write_identity_cube(run_dir / "sim_daily.cube", size=17)))
+    gain = sim_refresh_gain(server, residual=residual_pct / 100.0)
     panel = ProbeSimPanel(clock=VirtualClock(), refresh_gain=gain, hz_fn=hz, noise_rel=0.0002, seed=seed)
     cal = Calibration(ctx=ctx, profile=cp.Profile.synthetic(output_dir=str(out / "results")), monitor=0, mode="HDR",
                       controller=ctrl, measure=panel, adjudicator=AutoAdjudicator(), bit_depth=10)
     cal.display_api = api
     cal.probe_spec = {"purpose": PURPOSE, "rates": ["47.952", "50"], "reference": "60", "colours": False,
-                      "levels_nits": [0.5, 10.0, 100.0, 500.0]}
+                      "levels_nits": [0.5, 10.0, 100.0, 500.0], "verify_stack": verify_stack}
     cal._dip_store().record(DisplayInstrumentProfile(display=cal.display.name, mode="HDR", made="2026-11-01",
                                                      native_white_nits=1000.0))
     res = cal.run("refresh-response")
@@ -433,11 +603,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sp.add_argument("--no-data", action="store_true", dest="no_data", help="no trim data (expect a refusal)")
     sp.add_argument("--stuck", action="store_true", help="the trim variant never follows the rate (expect fail)")
     sp.add_argument("--seed", type=int, default=5)
+    sp.add_argument("--verify-stack", choices=("as_viewed", "mhc_only"), default="as_viewed", dest="verify_stack",
+                    help="mhc_only = the 3D LUT bypassed: the sim rounds the MHC output to the 10-bit link (no dither)")
     args = ap.parse_args(argv)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     rep = _simulate(out, residual_pct=args.residual_pct, trim_off=args.trim_off, no_data=args.no_data,
-                    stuck=args.stuck, seed=args.seed)
+                    stuck=args.stuck, seed=args.seed, verify_stack=args.verify_stack)
     print(json.dumps(rep, indent=1, default=str))
     return 0
 

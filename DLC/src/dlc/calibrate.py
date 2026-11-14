@@ -1568,6 +1568,9 @@ class Calibration:
             return rec
         # --keep-layers (verify-only): left exactly as the user has them — never switched off, never on.
         keep = set(self.calib.get("keep_layers") or ())
+        # A probe flow that measures the stack AS VIEWED (the refresh-trim verify) keeps every layer the same way
+        # (its own key: --keep-layers is refused outside verify-only, and this one is set by the flow, not the CLI).
+        keep |= set(self.calib.get("probe_keep_layers") or ())
         to_clear = {name: False for name, on in before.items() if on and name not in keep}
         # monitor/mode ride the record so a teardown outside this object (the --abort path, the
         # CLI rollback guard) can re-assert the layers without trusting argparse defaults.

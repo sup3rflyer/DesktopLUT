@@ -85,6 +85,10 @@ PRESENT_DWELL_S = 0.25            # frame-present latency after a paint (NOT a s
 OWNER_EXCEPTION = ("owner-approved 2026-10-01 (docs/hw-session-charter-2026-10-01.md standing rules): "
                    "measure-through-the-stack exception; the layers audit still runs and is recorded")
 LAYER_NAMES = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")
+LUMA_2020 = (0.2627, 0.6780, 0.0593)   # ITU-R BT.2020 luminance coefficients (the HDR container)
+LUMA_709 = (0.2126, 0.7152, 0.0722)    # ITU-R BT.709 (the SDR container)
+DARK_EXPECT_FACTOR = 100.0        # "should be lit" = expected light >= 100 x the meter floor (0.3 cd/m²): two decades
+DARK_STREAK = 3                   # dark reads in a row that stop the probe (as the no-read streak)
 
 
 class Refusal(RuntimeError):
@@ -93,6 +97,12 @@ class Refusal(RuntimeError):
 
 class MeterDown(RuntimeError):
     """The meter is gone (spotread self-heal exhausted / closed, or no usable read for 3 patches)."""
+
+
+class DisplayDark(MeterDown):
+    """Patches that should be lit read at / below the meter floor several in a row: the display asleep / off, or the
+    meter not on the panel (2026-11-14: a sleeping display recorded eight mid-greys as Y = 0.0, status ok). A
+    :class:`MeterDown` so every runner that stops on a dead meter stops on this too."""
 
 
 # ----------------------------------------------------------------------------- transfer math (pure)
@@ -801,6 +811,7 @@ class ProbeSession:
         self.t0 = self.clock.now()
         self.n_reads = 0
         self.no_read_streak = 0
+        self.dark_streak = 0
         self.anomalies: list[dict[str, Any]] = []
         self._ci_fired: set = set()
         self._ci_last = self.t0
@@ -1230,11 +1241,46 @@ class ProbeSession:
                 raise MeterDown(f"3 consecutive patches without a usable read (last: {err})")
         elif kept:
             self.no_read_streak = 0
+        self.check_dark(p, res, state)
         self.event("patch_measured", tier="stream", phase=p.phase, patch=p.name, state=state,
                    y=res.y, n_kept=res.n_kept, settled=settled, settle_s=res.settle_s, reads=len(reads))
         self.log(f"   {p.phase}:{p.name:<28}{(' [' + state + ']') if state else '':<11} Y={res.y if res.y is not None else float('nan'):10.5f}"
                  f"  n={res.n_kept}{'' if settled else ' UNSETTLED'}  settle {res.settle_s}s  ({len(reads)} reads)")
         return res
+
+    def expected_y(self, code: Sequence[int]) -> float:
+        """The light a patch's code at the meter should give (cd/m²), from the code alone: the mode's transfer per
+        channel (PQ / the SDR gamma at the nominal white) weighted by the container's luminance coefficients (BT.2020
+        in HDR, BT.709 in SDR). A rough nominal — it only has to tell "should be lit" from "should be dark"."""
+        bd = int(getattr(self.args, "bit_depth", 10) or 10)
+        white = float(getattr(self.args, "sdr_white_nits", None) or 120.0)
+        w = LUMA_2020 if self.mode == "HDR" else LUMA_709
+        return sum(wi * code_nits(c, self.mode, bd, white_nits=white) for wi, c in zip(w, list(code)[:3]))
+
+    def check_dark(self, p: Patch, res: PatchResult, state: str = "") -> None:
+        """A non-black patch that reads at / below the meter's low-light floor when its code should give far more light
+        (>= DARK_EXPECT_FACTOR x the floor) is an anomaly; DARK_STREAK of them in a row stop the probe (the display
+        asleep, the meter off the panel, the patch window not on this display). Patches that should be dark (expected
+        light within DARK_EXPECT_FACTOR x the floor: SDR codes 0-20, near-black PQ) are never judged — they do read ~0.
+        A patch that should be lit and reads lit resets the streak."""
+        if res.y is None or not p.field:
+            return
+        exp = self.expected_y(p.field)
+        if exp < DARK_EXPECT_FACTOR * SETTLE_ABS_TOL:
+            return
+        if res.y > SETTLE_ABS_TOL:
+            self.dark_streak = 0
+            return
+        self.dark_streak += 1
+        res.error = res.error or "dark_read"
+        self.anomaly("dark_read", phase=p.phase, patch=p.name, state=state, y=res.y, expected_y=round(exp, 4),
+                     floor=SETTLE_ABS_TOL, streak=self.dark_streak,
+                     note="a patch that should be lit read at / below the meter floor: display asleep, meter off the "
+                          "panel, or the patch not on this display")
+        if self.dark_streak >= DARK_STREAK:
+            raise DisplayDark(f"{self.dark_streak} patches in a row that should be lit (last {p.name}: expected "
+                              f"~{exp:.3g} cd/m²) read at / below the meter floor ({res.y:.4g} <= {SETTLE_ABS_TOL} cd/m²): "
+                              "the display is asleep or off, or the meter is not on the panel")
 
     def progress(self, phase: str, i: int, n: int, results: Sequence[PatchResult], last: str) -> None:
         """check_in evidence packets: 25/50/75 % of the phase + every 180 s. Non-blocking, no verdict."""
