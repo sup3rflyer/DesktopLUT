@@ -143,6 +143,12 @@ def _make(tmp_path: Path, name: str, ctrl, *, panel=None, adjudicator=None, sour
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run(mode, display="synthetic", run_dir=run_dir)
     panel = panel or ScanoutPanel(ctrl)
+    if decision_overrides is None and adjudicator is None:
+        # The MECHANICS tests (install, verify, rollback, lineage) go through both seams. On the fixture cube the
+        # sized repair is "better, not flat" by the model-free test (its bridge target sits up to ~0.6 % above the
+        # neighbours' line even when executed perfectly), so the seams recommend abort / revert; these tests decide
+        # apply / keep explicitly. The recommendations themselves are tested below (sizing / review section).
+        decision_overrides = {"repair-base:apply": Decision("apply"), "repair-base:keep": Decision("keep")}
     calib = Calibration(ctx=ctx, profile=cp.Profile.synthetic(output_dir=str(tmp_path / "results")), monitor=0,
                         mode=mode, controller=ctrl, measure=panel, adjudicator=adjudicator or AutoAdjudicator(),
                         patch_sizes=PatchSizes(), run_date=_DATE, source_run=source,
@@ -286,7 +292,10 @@ def test_flow_repairs_verifies_keeps_and_tells_the_registry(tmp_path: Path):
     assert seed["windows"] == [list(SPAN)] or seed["windows"] == [SPAN]
     assert seed["planned_reads"] == 39 + 19 and seed["census_proposals"]
     verdict = calib.calib["stages"]["repair-verify"]["digest"]
-    assert verdict["out"] == [] and verdict["inside"] > 0 and verdict["beside"] > 0
+    assert verdict["inside"] > 0 and verdict["beside"] > 0
+    # the repair did what the audit predicted (no change / model / light miss); what can be out is the MODEL-FREE
+    # flatness: the bridge target of the cube-shaped removal is not the neighbours' line (see the review section)
+    assert all("model-free" in m for r in verdict["out"] for m in r["missed"]), verdict["out"]
     for r in verdict["held_out"]:                       # neighbours' chromaticity unchanged within repeatability
         if r.get("where") == "beside":
             assert abs(r["rg_pct"]) < verdict["tolerance_pct"]["r/g"]
@@ -424,7 +433,8 @@ def test_an_ending_after_the_install_restores_the_previous_cube(tmp_path: Path, 
 
 def test_revert_at_the_keep_seam_restores_and_a_resume_refuses(tmp_path: Path):
     ctrl, cube, src = _setup(tmp_path)
-    calib = _make(tmp_path, "revert", ctrl, source=src, decision_overrides={"repair-base:keep": Decision("revert")})
+    calib = _make(tmp_path, "revert", ctrl, source=src, decision_overrides={"repair-base:apply": Decision("apply"),
+                                                                           "repair-base:keep": Decision("revert")})
     result = calib.run("repair-base")
     assert result.status == "reverted", result.digest
     assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube)
@@ -517,14 +527,15 @@ class ResponsePanel(ScanoutPanel):
     balance structure of the panel itself, ln units, (r/g, b/g)); light = d^gamma x a sawtooth in the GREEN drive
     code (``teeth``) common to the channels; read noise."""
 
-    def __init__(self, ctrl, *, sigma=0.0, gain=1.0, own=None, teeth=0.03, noise=2e-4, seed=3):
+    def __init__(self, ctrl, *, sigma=0.0, gain=1.0, own=None, teeth=0.03, noise=2e-4, seed=3, ref=None,
+                 change_scale=1.0, change_shift=0.0):
         super().__init__(ctrl, noise=noise, seed=seed)
         self.sigma, self.gain, self.own, self.teeth = sigma, gain, own, teeth
+        # error injection: for any cube other than ``ref`` the display shows ref's balance plus change_scale x the
+        # change, displaced by change_shift codes (an effect the audit could not have predicted)
+        self.ref, self.change_scale, self.change_shift = ref, change_scale, change_shift
 
-    def xyz(self, curves, signal):
-        s = sum(signal) / 3
-        c = s * 1023
-        d = br.scanout_grey_drive(curves, _APPLIED, s)
+    def _lr(self, curves, c):
         if self.sigma > 0:
             xs = [0.25 * i for i in range(-int(16 * self.sigma), int(16 * self.sigma) + 1)]
             ws = [math.exp(-0.5 * (x / self.sigma) ** 2) for x in xs]
@@ -533,9 +544,19 @@ class ResponsePanel(ScanoutPanel):
                 dd = br.scanout_grey_drive(curves, _APPLIED, min(max(c + x, 0.0), 1023.0) / 1023)
                 acc[0] += w * math.log(dd[0] / dd[1])
                 acc[1] += w * math.log(dd[2] / dd[1])
-            lr = [acc[0] / sum(ws), acc[1] / sum(ws)]
-        else:
-            lr = [math.log(d[0] / d[1]), math.log(d[2] / d[1])]
+            return [acc[0] / sum(ws), acc[1] / sum(ws)]
+        d = br.scanout_grey_drive(curves, _APPLIED, min(max(c, 0.0), 1023.0) / 1023)
+        return [math.log(d[0] / d[1]), math.log(d[2] / d[1])]
+
+    def xyz(self, curves, signal):
+        s = sum(signal) / 3
+        c = s * 1023
+        d = br.scanout_grey_drive(curves, _APPLIED, s)
+        lr = self._lr(curves, c)
+        if self.ref is not None and curves is not self.ref:
+            base = self._lr(self.ref, c)
+            new, old = self._lr(curves, c - self.change_shift), self._lr(self.ref, c - self.change_shift)
+            lr = [base[k] + self.change_scale * (new[k] - old[k]) for k in range(2)]
         extra = self.own(c) if self.own else (0.0, 0.0)
         g = d[1]
         ratio = [math.exp(self.gain * lr[0] + extra[0] / self.gamma), math.exp(self.gain * lr[1] + extra[1] / self.gamma)]
@@ -596,7 +617,8 @@ def test_sizing_cannot_see_the_panels_own_cancelling_structure_but_the_verify_do
     """(c) The panel's own balance cancels 23 % of the cube's tint: before the repair this is indistinguishable
     from a gain of 0.77 (same reads), so the core sizes alpha ~1 and predicts a change of 0.77 x the removal; the
     display then changes by the FULL removal and lands magenta. The verify, judging each held-out code against
-    its prediction, catches it (and the keep seam recommends revert)."""
+    its prediction, catches it (and the keep seam recommends revert). Low read noise here (2e-4); at hardware
+    noise see test_review_cancelling_structure_at_hardware_noise."""
     ctrl, cube_path, src = _setup(tmp_path)
     cube = _real_cube()
     probe = ResponsePanel(None, noise=0.0)
@@ -616,7 +638,8 @@ def test_sizing_cannot_see_the_panels_own_cancelling_structure_but_the_verify_do
             return (0.0, 0.0)
         return (-0.23 * 2.2 * (base[i][0] - lo_ref[i]), -0.23 * 2.2 * (base[i][1] - lb_ref[i]))
     panel = ResponsePanel(ctrl, own=own)
-    calib = _make(tmp_path, "own", ctrl, panel=panel, source=src)
+    calib = _make(tmp_path, "own", ctrl, panel=panel, source=src,
+                  decision_overrides={"repair-base:apply": Decision("apply")})   # keep: the recommendation
     result = calib.run("repair-base")
     build = calib.calib["stages"]["repair-build"]["digest"]
     assert build["confirmation"]["confirmed"] and all(0.7 <= k <= 0.85 for k in build["response"]["k"])
@@ -646,20 +669,196 @@ def test_sizing_refuses_a_tint_the_cube_does_not_explain():
 
 
 def test_flow_on_a_blurred_toothed_display_keeps_and_reports_light_as_observation(tmp_path):
-    """The whole flow on the blurred display with light teeth in the green drive code: confirmed, applied, the
-    verify judges balance against the prediction (nothing out), inside-span light is reported, never judged, and
-    the tooth edges the channels' drive moves cross are named."""
+    """The whole flow on the blurred display with light teeth in the green drive code (apply / keep decided):
+    the change lands as predicted (no change / model / light miss), light at changed codes is judged against the
+    audit's cap, the light steps the channels' drive moves cross are named, and the only possible misses are the
+    MODEL-FREE flatness ones (the bridge target's own bulge against the neighbours' line)."""
     ctrl, cube_path, src = _setup(tmp_path)
     panel = ResponsePanel(ctrl, sigma=2.0, teeth=0.03)
     calib = _make(tmp_path, "blur", ctrl, panel=panel, source=src)
     result = calib.run("repair-base")
     assert result.status == "completed", calib.calib["stages"].get("repair-verify")
     verdict = calib.calib["stages"]["repair-verify"]["digest"]
-    assert verdict["out"] == [] and verdict["inside"] > 0
+    assert verdict["inside"] > 0
+    assert all("model-free" in m for r in verdict["out"] for m in r["missed"]), verdict["out"]
     inside = [r for r in verdict["held_out"] if r.get("where") == "inside"]
-    assert all(r.get("light", "").startswith("observation") for r in inside)
+    assert all(r.get("light_cap_pct") for r in inside)
     assert verdict["tooth_edge_codes"]
+    assert verdict["free"]["before_worst_pct"][0] > 2.0 > verdict["free"]["after_worst_pct"][0]
     build = calib.calib["stages"]["repair-build"]["digest"]
     assert 1.5 <= build["response"]["sigma_codes"] <= 2.5
     for c, p in build["predicted"].items():
         assert "post_rg_pct" in p and "tooth_edge" in p
+
+
+# ---------------------------------------------------------------------------
+# REVIEW of 1c2527e: power at HARDWARE noise, model-free flatness, light gating, degenerate series.
+# Read noise 6e-4 per XYZ component gives a model-free single-read balance scatter of 0.11-0.26 % on this
+# simulated display (the 2026-11-14 audit: 0.12-0.16 %, upper bound 0.16 / 0.17 %). 8 fixed seeds per case.
+# Measured catch rates (scratch e7_power.py, these seeds): x0.60 8/8, x0.70 6/8, x0.75 4/8, x0.80-0.90 1/8,
+# x1.10 5/8, x1.15-1.20 6/8, x1.30-1.40 8/8; shift +0.5 6/8, +1 / +1.5 / +2 8/8, -1 4/8, -2 8/8.
+# SMALLEST ERROR CAUGHT IN EVERY SEED: x0.6 (40 % short), x1.3 (30 % over), +1 code, -2 codes.
+# Perfect execution (x1.00): the model checks never trip; the MODEL-FREE check trips in 3/8 seeds, because the
+# cube-shaped removal's bridge target itself sits up to 0.64 % (r/g) above the neighbours' line on this cube
+# (noise-free, perfectly executed) — "better, not flat" by construction until the target changes.
+# ---------------------------------------------------------------------------
+
+_HW_NOISE = 6e-4
+_HW_SEEDS = range(1, 9)
+
+
+@pytest.fixture(scope="module")
+def hw_builds():
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    out = []
+    for seed in _HW_SEEDS:
+        pb = ResponsePanel(None, sigma=2.0, noise=_HW_NOISE, seed=seed)
+        before = {c: pb.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+        fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                       peak_luminance=_PEAK, span=SPAN, luminance_sigma=_HW_NOISE)
+        out.append((seed, before, fixed, rep))
+    return cube, plan, out
+
+
+def _verdicts(hw_builds, scale, shift):
+    cube, plan, builds = hw_builds
+    res = []
+    for seed, before, fixed, rep in builds:
+        pa = ResponsePanel(None, sigma=2.0, noise=_HW_NOISE, seed=100 + seed, ref=cube, change_scale=scale,
+                           change_shift=shift)
+        after = {c: pa.xyz(fixed, (c / 1023,) * 3) for c in plan["held_out"]}
+        res.append(br.judge_after(before, after, rep, plan["held_out"], primaries=_PRIM, native_white_xy=_WHITE,
+                                  peak_luminance=_PEAK, luminance_sigma=_HW_NOISE))
+    return res
+
+
+def test_review_hardware_noise_is_what_the_audit_measured(hw_builds):
+    _cube, _plan, builds = hw_builds
+    for _seed, _b, _f, rep in builds:
+        assert all(0.08 <= v <= 0.3 for v in rep["free"]["scatter_pct"]), rep["free"]
+        assert rep["confirmation"]["confirmed"]
+
+
+@pytest.mark.parametrize("scale,shift", [(0.6, 0.0), (1.3, 0.0), (1.4, 0.0), (1.0, 1.0), (1.0, 1.5), (1.0, 2.0),
+                                         (1.0, -2.0)])
+def test_review_errors_caught_in_every_seed_at_hardware_noise(hw_builds, scale, shift):
+    assert all(v["out"] for v in _verdicts(hw_builds, scale, shift))
+
+
+@pytest.mark.parametrize("scale,shift,at_least", [(0.7, 0.0, 5), (0.75, 0.0, 3), (1.15, 0.0, 5), (1.2, 0.0, 5),
+                                                  (1.0, 0.5, 5), (1.0, -1.0, 3)])
+def test_review_errors_caught_in_most_seeds(hw_builds, scale, shift, at_least):
+    """The grey zone, stated: these are caught in most but not all seeds at this noise."""
+    assert sum(bool(v["out"]) for v in _verdicts(hw_builds, scale, shift)) >= at_least
+
+
+def test_review_perfect_execution_trips_only_the_model_free_check(hw_builds):
+    verdicts = _verdicts(hw_builds, 1.0, 0.0)
+    for v in verdicts:
+        for r in v["out"]:
+            assert all("model-free" in m for m in r["missed"]), r
+    # the bridge target is not the neighbours' line: some seeds are "better, not flat" even when perfect
+    assert 0 < sum(bool(v["out"]) for v in verdicts) < len(verdicts)
+    for v in verdicts:
+        assert v["free"]["before_worst_pct"][0] > 2.0 and v["free"]["after_worst_pct"][0] < 1.5
+
+
+@pytest.mark.parametrize("frac,at_least", [(0.4, 8), (0.3, 6), (0.23, 5)])
+def test_review_cancelling_structure_at_hardware_noise(frac, at_least):
+    """The panel's own structure cancelling ``frac`` of the tint (before the repair the same reads as a gain):
+    at hardware noise caught in every seed from 40 %; 23 % in 6 of 8 seeds (scratch e9_own_cancel.py: 10 % 3/8,
+    20 % 6/8, 23 % 6/8, 30 % 7/8, 40 % 8/8). The model checks alone would keep most of them: the catch comes from
+    the model-free flatness."""
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    probe = ResponsePanel(None, sigma=2.0, noise=0.0)
+    ref = {c: probe._lr(cube, c) for c in range(120, 200)}
+    line = {c: [ref[147][s] + (ref[157][s] - ref[147][s]) * (c - 147) / 10 for s in range(2)] for c in range(120, 200)}
+
+    def own(c):
+        i = int(round(c))
+        return (0.0, 0.0) if not 147 <= i <= 157 else tuple(-frac * 2.2 * (ref[i][s] - line[i][s]) for s in range(2))
+    caught = 0
+    for seed in _HW_SEEDS:
+        pb = ResponsePanel(None, sigma=2.0, noise=_HW_NOISE, seed=seed, own=own)
+        before = {c: pb.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+        fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                       peak_luminance=_PEAK, span=SPAN, luminance_sigma=_HW_NOISE)
+        pa = ResponsePanel(None, sigma=2.0, noise=_HW_NOISE, seed=100 + seed, own=own)
+        after = {c: pa.xyz(fixed, (c / 1023,) * 3) for c in plan["held_out"]}
+        v = br.judge_after(before, after, rep, plan["held_out"], primaries=_PRIM, native_white_xy=_WHITE,
+                           peak_luminance=_PEAK, luminance_sigma=_HW_NOISE)
+        caught += bool(v["out"])
+    assert caught >= at_least
+
+
+def test_review_light_is_gated_where_the_lut_did_not_change_and_capped_where_it_did():
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    panel = ResponsePanel(None, sigma=2.0, noise=2e-4)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                   peak_luminance=_PEAK, span=SPAN, luminance_sigma=2e-4)
+    assert rep["light"]["cap_pct"] and rep["light"]["source"].startswith("the display's largest")
+    unchanged = [c for c in plan["held_out"] if not rep["predicted"][str(c)]["changed"]]
+    changed = [c for c in plan["held_out"] if rep["predicted"][str(c)]["changed"]]
+    assert unchanged and changed
+    # an unchanged code whose BALANCE prediction is non-zero (the blur reaches it) is still light-gated
+    assert any(abs(rep["predicted"][str(c)]["change_rg"]) >= 1e-3 for c in unchanged)
+    after = {c: panel.xyz(fixed, (c / 1023,) * 3) for c in plan["held_out"]}
+    bump = unchanged[len(unchanged) // 2]
+    after[bump] = tuple(v * 1.01 for v in after[bump])                     # +1 % light where nothing changed
+    big = changed[0]
+    after[big] = tuple(v * (1.0 + 2.0 * rep["light"]["cap_pct"] / 100.0) for v in after[big])  # twice the cap
+    v = br.judge_after(before, after, rep, plan["held_out"], primaries=_PRIM, native_white_xy=_WHITE,
+                       peak_luminance=_PEAK, luminance_sigma=2e-4)
+    misses = {r["code"]: r["missed"] for r in v["out"]}
+    assert "light" in misses.get(bump, []), misses
+    assert any("light beyond" in m for m in misses.get(big, [])), misses
+
+
+def test_review_an_unread_held_out_code_is_out():
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    panel = ResponsePanel(None, sigma=2.0, noise=2e-4)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                   peak_luminance=_PEAK, span=SPAN, luminance_sigma=2e-4)
+    after = {c: panel.xyz(fixed, (c / 1023,) * 3) for c in plan["held_out"][1:]}
+    v = br.judge_after(before, after, rep, plan["held_out"], primaries=_PRIM, native_white_xy=_WHITE,
+                       peak_luminance=_PEAK, luminance_sigma=2e-4)
+    assert any(r["code"] == plan["held_out"][0] and r["missed"] == ["unread"] for r in v["out"])
+
+
+def test_review_a_series_the_reads_cannot_size_is_said_and_never_nan():
+    """Reads too noisy to resolve the removal's change in either series: alpha 1 is used and SAID (sized False),
+    its error is 0 (never NaN), the flatness numbers stay finite and the repair is refused (no series informative)."""
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    panel = ResponsePanel(None, sigma=2.0, noise=2e-4)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    _fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                    peak_luminance=_PEAK, span=SPAN, luminance_sigma=0.2)   # 20 % "noise"
+    per = rep["confirmation"]["per_series"]
+    assert not any(p["informative"] for p in per) and not any(p["sized"] for p in per)
+    assert rep["amplitude"]["alpha"] == [1.0, 1.0] and rep["amplitude"]["se"] == [0.0, 0.0]
+    assert math.isfinite(rep["flat"]["worst_over_tolerance"]) and math.isfinite(rep["free"]["predicted_worst_over_tolerance"])
+    for p in rep["predicted"].values():
+        assert all(math.isfinite(v) for k, v in p.items() if isinstance(v, float))
+    assert rep["confirmation"]["confirmed"] is False and rep["recommend_apply"] is False
+
+
+def test_review_apply_is_recommended_only_when_both_flatness_checks_pass(tmp_path):
+    ctrl, cube_path, src = _setup(tmp_path)
+    calib = _make(tmp_path, "rec", ctrl, source=src, adjudicator=AutoAdjudicator())
+    result = calib.run("repair-base")
+    dec = calib.calib["decisions"]["repair-base:apply"]
+    if dec["choice"] == "apply":
+        assert result.status in ("completed", "reverted")
+    else:
+        # better, not flat (model-free): the AutoAdjudicator takes the recommendation (abort): nothing installed
+        assert dec["choice"] == "abort" and result.status == "aborted"
+        assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube_path)
+    # on this cube the bridge target is not the neighbours' line: the recommendation here IS abort
+    assert dec["choice"] == "abort"

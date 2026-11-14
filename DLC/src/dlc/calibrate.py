@@ -9951,9 +9951,9 @@ class Calibration:
                     luminance_sigma=sig, span=span, census=census)
             except ValueError as exc:
                 raise StageError(key, f"cannot build a repair from this audit: {exc}") from exc
-            digest = {k: rep[k] for k in ("spans", "confirmation", "response", "amplitude", "flat", "predicted",
-                                          "tolerance_pct", "structure_pct", "noise_pct", "fit_codes",
-                                          "unchanged_entries")}
+            digest = {k: rep[k] for k in ("spans", "confirmation", "response", "amplitude", "flat", "free", "light",
+                                          "recommend_apply", "predicted", "tolerance_pct", "structure_pct",
+                                          "noise_pct", "fit_codes", "unchanged_entries")}
             if not rep["confirmation"]["confirmed"]:
                 # The correction is shaped by the cube and SIZED by the reads; the reads must explain the tint
                 # through the measured response and predict a flat after-balance. Otherwise refused.
@@ -9972,24 +9972,45 @@ class Calibration:
             resp, amp = d.get("response") or {}, d.get("amplitude") or {}
             pred = d.get("predicted") or {}
             edges = sorted(int(c) for c, p in pred.items() if p.get("tooth_edge"))
-            worst = max(pred.items(), key=lambda kv: max(abs(kv[1].get("post_rg_pct", 0)),
-                                                         abs(kv[1].get("post_bg_pct", 0))), default=(None, {}))
+            free = d.get("free") or {}
+            worst_txt = "no prediction"
+            if pred:
+                wc, wp = max(pred.items(), key=lambda kv: max(abs(kv[1].get("post_rg_pct", 0)),
+                                                              abs(kv[1].get("post_bg_pct", 0))))
+                worst_txt = f"worst {wc}: r/g {wp.get('post_rg_pct')} %, b/g {wp.get('post_bg_pct')} %"
+            flat_free = d.get("recommend_apply")
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="repair-base:apply", seam=SEAM_FOUNDATION, stage=key,
                 question=(f"the installed cube's tint at {[s['tints'] for s in d['spans']]} is explained by the audit "
                           f"through the display's measured response (blur sigma {resp.get('sigma_codes')} codes, "
                           f"shift {resp.get('shift_codes')}, gain r/g b/g {resp.get('k')} +- {resp.get('k_se')}); "
-                          f"the reads size the removal at {amp.get('alpha')} +- {amp.get('se')}; predicted "
-                          f"after-balance flat (worst {worst[0]}: r/g {worst[1].get('post_rg_pct')} %, b/g "
-                          f"{worst[1].get('post_bg_pct')} %, tolerance {(d.get('flat') or {}).get('tolerance_pct')} "
-                          f"%). The candidate rewrites {3 * 1024 - d['unchanged_entries']} LUT entries over "
-                          f"{d['spans'][0]['codes']} (channel balance only). LIGHT inside the span is not predictable "
-                          f"on this panel (teeth along the code): it is reported, not gated; channel drive moves "
-                          f"cross a tooth edge at {edges or 'no code'}. apply it (the previous cube is the rollback "
-                          "point) or abort?"),
-                options=("apply", "abort"), recommendation="apply", digest=d)),
+                          f"the reads size the removal at {amp.get('alpha')} +- {amp.get('se')}. Predicted after, "
+                          f"against the MODEL's target: {worst_txt} (tolerance "
+                          f"{(d.get('flat') or {}).get('tolerance_pct')} %); MODEL-FREE (the audit's own straight "
+                          f"line outside the correction's reach): worst |r/g|, |b/g| {free.get('before_worst_pct')} % "
+                          f"now -> {free.get('predicted_after_worst_pct')} % predicted "
+                          f"({free.get('predicted_worst_over_tolerance')} x its tolerance) — "
+                          + ("flat by both." if flat_free else "BETTER, NOT FLAT by the model-free test; abort is "
+                                                              "recommended, apply only if better is wanted.")
+                          + f" The candidate rewrites {3 * 1024 - d['unchanged_entries']} LUT entries over "
+                          f"{d['spans'][0]['codes']} (channel balance only). LIGHT: gated where the LUT entries do not "
+                          f"change; where they do, capped at {(d.get('light') or {}).get('cap_pct')} % (the display's "
+                          f"own largest code-to-code light step in this audit + noise); channel drive moves cross a "
+                          f"light step at {edges or 'no code'}."
+                          + (self._picture_dependent_light_note() or "")
+                          + " apply it (the previous cube is the rollback point) or abort?"),
+                options=("apply", "abort"), recommendation="apply" if flat_free else "abort", digest=d)),
                 stage=key, message="repair-base aborted before applying")
         return outcome
+
+    # --- HOOK: DIP knowledge facet (the display knowledge layer lives on another branch; nothing here depends on
+    # it). When the display's knowledge records that its full-field light steps along the code move with the
+    # picture (PA32UCXR 2026-11-14: a 10 % window shows other 4-code group offsets than the full field, SDR and
+    # HDR — fixes-2026-11-14/window_teeth_sdr, window_teeth_hdr), a full-field light change at a single code inside
+    # the span is not what a viewer sees, and the seam says so. Until that facet exists this returns None and the
+    # seam states only the measured cap.
+    def _picture_dependent_light_note(self) -> Optional[str]:
+        return None
 
     def stage_repair_install(self) -> StageOutcome:
         key = "repair-install"
@@ -10050,12 +10071,16 @@ class Calibration:
         ok = not verdict.get("out") and verdict.get("inside", 0) > 0
         decision = self.adjudicate(AdjudicationRequest(
             key="repair-base:keep", seam=SEAM_VERIFY, stage=key,
-            question=(f"held-out greys after the repair: {verdict.get('inside')} inside the span(s), "
-                      f"{verdict.get('beside')} beside, judged against "
+            question=(f"held-out greys after the repair: {verdict.get('inside')} where the LUT changed, "
+                      f"{verdict.get('beside')} where it did not, judged against "
                       f"{verdict.get('judged_against') or 'the envelope'}; {len(verdict.get('out') or ())} out of "
                       f"tolerance {verdict.get('tolerance_pct')}"
-                      + (f"; inside-span light is an observation, not judged (tooth edges at "
-                         f"{verdict.get('tooth_edge_codes')})" if verdict.get("judged_against") else "")
+                      + (f"; worst after-balance |r/g|, |b/g| against the model "
+                         f"{(verdict.get('model') or {}).get('after_worst_pct')} %, MODEL-FREE "
+                         f"{(verdict.get('free') or {}).get('before_worst_pct')} % before -> "
+                         f"{(verdict.get('free') or {}).get('after_worst_pct')} % after; light at changed codes "
+                         f"capped at {verdict.get('light_cap_pct')} % (light steps crossed at "
+                         f"{verdict.get('tooth_edge_codes')})" if verdict.get("free") else "")
                       + ". keep the repaired cube, or revert to the previous one?"),
             options=("keep", "revert"), recommendation="keep" if ok else "revert", digest=verdict))
         if decision.choice == "revert":
