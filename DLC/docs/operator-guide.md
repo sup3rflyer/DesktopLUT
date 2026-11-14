@@ -219,6 +219,9 @@ python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
 | `brightness:white-reach` | The forecast puts the exact D65 white below the SDR white band (`raised` / `continue` / `abort`) | Human raises the OSD → `raised` (re-read); `continue` keeps the backlight. |
 | `brightness:white-reach-late` | Same, but raw is already measured (`keep_backlight` / `abort`) | Raising now means re-measuring: `abort` and re-run, or keep. |
 | `build-install-mhc:white-reach` | Measured primaries put white below the band (`keep_below_band` / `abort`) | Human decides: dimmer exact white, or re-run brighter. |
+| `repair-base:plan` | `repair-base`: where the installed base 1D LUT is tinted (its census), the audit windows, reads and minutes (`proceed` / `abort`) | Confirm the time with the human; `--repair-span LO:HI` narrows the audit. |
+| `repair-base:apply` | The audit found tinted span(s); the balance-only candidate and the entries it changes (`apply` / `abort`) | Apply unless the spans look like noise; the previous cube is the rollback point. |
+| `repair-base:keep` | Held-out greys after the candidate went in, inside and beside the spans (`keep` / `revert`) | Keep when nothing is out; a revert puts the previous cube back and reads it back. |
 | `<stage>:foundation` | The MHC install crushed bright-neutral luminance | A real stopper; read the digest before anything else. |
 | `build-install-3dlut:floor` / `:oog-premise` | Cube residuals at the physical floor / out-of-gamut handling premise | Floors are panel limits, not retry triggers. |
 | `measure:*` (escalation, thermal-align) | Patches didn't settle, drift, or thermal shift across the stage | Read the anomalies, drift and present-stall evidence. |

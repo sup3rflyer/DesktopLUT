@@ -5,6 +5,13 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
 
 ## Unreleased (after DesktopLUT v3.0.0)
 
+### Added
+- **`--flow repair-base`** (2026-11-14): removes a tint the installed SDR base 1D LUT puts on a few greys,
+  without changing their light and without touching the rest of the curve. It checks that the installed base is
+  the one from `--source-run`, finds the tinted greys from the curve itself, measures every grey around them
+  (`--repair-span LO:HI` to choose the range), installs the corrected curve, measures greys it did not use, and
+  asks whether to keep it. Every ending that does not keep it puts the previous curve back (also `--abort`).
+
 ### Fixed
 - **A `grayscale-wb` run that does not finish puts the previous grayscale curve back** (2026-11-12). The
   touch-up is baked into the installed profile before its verify measurement, so a run that ended during the
