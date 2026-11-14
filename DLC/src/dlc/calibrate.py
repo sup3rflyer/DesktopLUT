@@ -10037,6 +10037,7 @@ class Calibration:
                                                               abs(kv[1].get("post_bg_pct", 0))))
                 worst_txt = f"worst {wc}: r/g {wp.get('post_rg_pct')} %, b/g {wp.get('post_bg_pct')} %"
             flat_free = d.get("recommend_apply")
+            vis = d.get("visibility") or {}
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="repair-base:apply", seam=SEAM_FOUNDATION, stage=key,
                 question=(f"the installed cube's tint at {[s['tints'] for s in d['spans']]} is explained by the audit "
@@ -10048,8 +10049,11 @@ class Calibration:
                           f"line outside the correction's reach): worst |r/g|, |b/g| {free.get('before_worst_pct')} % "
                           f"now -> {free.get('predicted_after_worst_pct')} % predicted "
                           f"({free.get('predicted_worst_over_tolerance')} x its tolerance) — "
-                          + ("flat by both." if flat_free else "BETTER, NOT FLAT by the model-free test; abort is "
-                                                              "recommended, apply only if better is wanted.")
+                          + (f"IN VIEWER TERMS: worst departure {vis.get('before_worst_itp')} -> "
+                             f"{vis.get('predicted_after_worst_itp')} dE_ITP predicted (1 = just visible at that "
+                             f"grey's light): {vis.get('class')} — "
+                             + ("apply recommended." if flat_free else "abort recommended (apply only if you want it "
+                                                                         "anyway)."))
                           + f" The candidate rewrites {3 * 1024 - d['unchanged_entries']} LUT entries over "
                           f"{d['spans'][0]['codes']} (channel balance only). LIGHT: gated where the LUT entries do not "
                           f"change; where they do, capped at {(d.get('light') or {}).get('cap_pct')} % (the display's "
@@ -10126,7 +10130,9 @@ class Calibration:
 
         outcome = self._stage(key, run)
         verdict = outcome.digest or {}
-        ok = not verdict.get("out") and verdict.get("inside", 0) > 0
+        ok = (verdict["recommend_keep"] if "recommend_keep" in verdict else not verdict.get("out")) \
+            and verdict.get("inside", 0) > 0
+        vis = verdict.get("visibility") or {}
         decision = self.adjudicate(AdjudicationRequest(
             key="repair-base:keep", seam=SEAM_VERIFY, stage=key,
             question=(f"held-out greys after the repair: {verdict.get('inside')} where the LUT changed, "
@@ -10139,6 +10145,11 @@ class Calibration:
                          f"{(verdict.get('free') or {}).get('after_worst_pct')} % after; light at changed codes "
                          f"capped at {verdict.get('light_cap_pct')} % (light steps crossed at "
                          f"{verdict.get('tooth_edge_codes')})" if verdict.get("free") else "")
+                      + (f". IN VIEWER TERMS: worst departure {vis.get('before_worst_itp')} -> "
+                         f"{vis.get('after_worst_itp')} dE_ITP (1 = just visible at that grey's light): "
+                         f"{vis.get('class')}; light changes below visibility at "
+                         f"{vis.get('light_changes_below_visibility_at')}, visible at "
+                         f"{vis.get('light_changes_visible_at')}" if vis else "")
                       + ". keep the repaired cube, or revert to the previous one?"),
             options=("keep", "revert"), recommendation="keep" if ok else "revert", digest=verdict))
         if decision.choice == "revert":

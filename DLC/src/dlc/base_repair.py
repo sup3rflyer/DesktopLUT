@@ -663,7 +663,7 @@ def repair_balance(curves: Mapping[str, Sequence[float]], reads: Mapping[int, Se
                                                                     for v in meas.values())) - 1.0), 3)}],
         "confirmation": sized["confirmation"], "response": sized["response"], "amplitude": sized["amplitude"],
         "predicted": sized["predicted"], "flat": sized["flat"], "free": sized["free"], "light": sized["light"],
-        "recommend_apply": sized["recommend_apply"],
+        "recommend_apply": sized["recommend_apply"], "visibility": sized["visibility"],
         "fit_codes": len(fit), "z": z, "envelope_codes": envelope_codes,
         "tolerance_pct": {"r/g": round(100.0 * (math.exp(tol[0]) - 1.0), 3),
                           "b/g": round(100.0 * (math.exp(tol[1]) - 1.0), 3)},
@@ -770,6 +770,7 @@ def _sized_repair(curves, reads, plan, *, applied, primaries, native_white_xy, p
     pt_sigma = point_scatter({c: reads[c] for c in codes}, Pinv, exclude=excl)
     free = free_line({c: reads[c] for c in codes}, Pinv, exclude=excl, sigma=pt_sigma)
     light = light_cap(reads, codes, luminance_sigma=sig, z=z)
+    P_n = _native_P(primaries, native_white_xy, peak_luminance)
     predicted, worst_flat, worst_free = {}, 0.0, 0.0
     for c in codes:
         sh = matvec(Pinv, list(reads[c]))
@@ -794,6 +795,13 @@ def _sized_repair(curves, reads, plan, *, applied, primaries, native_white_xy, p
                     worst_free = max(worst_free, fr)
                 row.update({f"free_before_{nm}_pct": round(100.0 * free["resid"][c][s], 3),
                             f"free_post_{nm}_pct": round(100.0 * fpost, 3), f"free_post_{nm}_over_tol": round(fr, 3)})
+        if c in free["resid"]:
+            fb = free["resid"][c]
+            row["free_before_itp"] = round(balance_visibility(reads[c], fb[0], fb[1], P_n, Pinv), 3)
+            # the predicted after-read: the before-read with its balance moved by the predicted change
+            sh_a = matvec(Pinv, list(reads[c]))
+            xyz_a = matvec(P_n, [sh_a[0] * math.exp(chg[c][0]), sh_a[1], sh_a[2] * math.exp(chg[c][1])])
+            row["free_post_itp"] = round(balance_visibility(xyz_a, fb[0] + chg[c][0], fb[1] + chg[c][1], P_n, Pinv), 3)
         d0 = scanout_grey_drive(curves, applied, c / max_cv)
         d1 = scanout_grey_drive(fixed, applied, c / max_cv)
         row["changed"] = any(abs(a - b) > 1e-12 for a, b in zip(d0, d1))
@@ -807,6 +815,10 @@ def _sized_repair(curves, reads, plan, *, applied, primaries, native_white_xy, p
     def worst_abs(key):
         return [round(max((abs(predicted[c][f"{key}_{nm}_pct"]) for c in reach_codes
                            if f"{key}_{nm}_pct" in predicted[c]), default=0.0), 3) for nm in ("rg", "bg")]
+    def worst_itp(key):
+        return round(max((predicted[c][key] for c in reach_codes if key in predicted[c]), default=0.0), 3)
+    cls = outcome_class(worst_flat <= 1.0 and worst_free <= 1.0, worst_itp("free_before_itp"),
+                        worst_itp("free_post_itp"))
     explained = max(p["worst_over_tolerance"] for p in per)
     k_ok = all(0.5 <= p["k"] <= 2.0 for p in per if p["informative"]) and any(p["informative"] for p in per)
     # the amplitude bound applies where the reads sized it (a series carrying no tint keeps alpha 1)
@@ -841,11 +853,54 @@ def _sized_repair(curves, reads, plan, *, applied, primaries, native_white_xy, p
                  "predicted_after_worst_pct": worst_abs("free_post"),
                  "predicted_worst_over_tolerance": round(worst_free, 3)},
         "light": light,
-        # apply is RECOMMENDED only when both the model's and the model-free prediction are flat; a confirmed
-        # repair whose model-free prediction is not flat is "better, not flat": the seam says so and recommends
-        # abort (the operator may still apply it)
-        "recommend_apply": confirmed and worst_free <= 1.0,
+        # the outcome in VIEWER terms (owner's rule): flat by both checks, or better with the remaining departure
+        # below one JND, recommends apply; better-but-visible and not-better recommend abort
+        "visibility": {"before_worst_itp": worst_itp("free_before_itp"),
+                       "predicted_after_worst_itp": worst_itp("free_post_itp"), "class": cls},
+        "recommend_apply": confirmed and recommends_change(cls),
     }
+
+
+# ---------------------------------------------------------------------------------------------
+# what a viewer can see (owner's rule: practical results; judge by visibility, never polish below it)
+# ---------------------------------------------------------------------------------------------
+# A departure's VISIBILITY is BT.2124 dE_ITP at the grey's own absolute light (1 = one just-noticeable
+# difference at every level; docs/practical-thresholds.md), via dlc.visibility (the one implementation, pinned
+# against the colour package). Light changes likewise: dE_ITP between the grey and the same grey with its light
+# moved (the I axis of PQ).
+VISIBLE_ITP = 1.0
+OUTCOME_CLASSES = ("flat", "better, remaining departure below visibility", "better, remaining departure visible",
+                   "not better")
+
+
+def balance_visibility(xyz: Sequence[float], d_rg: float, d_bg: float, P, Pinv) -> float:
+    """dE_ITP of a grey whose balance departs by ``(d_rg, d_bg)`` (ln units, native shares) from its reference:
+    the read against itself with that departure removed, at the read's own light."""
+    from .visibility import chroma_itp
+    sh = matvec(Pinv, list(xyz))
+    ref = matvec(P, [sh[0] * math.exp(-d_rg), sh[1], sh[2] * math.exp(-d_bg)])
+    return float(chroma_itp(list(xyz), ref))
+
+
+def light_visibility(xyz: Sequence[float], d_ln: float) -> float:
+    """dE_ITP between a grey and the same grey with its light ``exp(d_ln)`` times (chromaticity unchanged)."""
+    from .visibility import light_itp
+    return light_itp(xyz, d_ln)
+
+
+def outcome_class(flat: bool, before_itp: float, after_itp: float) -> str:
+    """The outcome in viewer terms: ``flat`` (both flatness checks) / better with the remaining departure below
+    one JND / better but still visible / not better (the worst departure did not shrink)."""
+    if flat:
+        return OUTCOME_CLASSES[0]
+    if not after_itp < before_itp:
+        return OUTCOME_CLASSES[3]
+    return OUTCOME_CLASSES[1] if after_itp < VISIBLE_ITP else OUTCOME_CLASSES[2]
+
+
+def recommends_change(cls: str) -> bool:
+    """Apply / keep for ``flat`` and ``better, below visibility``; abort / revert otherwise."""
+    return cls in OUTCOME_CLASSES[:2]
 
 
 FREE_NEAREST = 4
@@ -1134,6 +1189,8 @@ def _judge_predicted(before: Mapping[int, Sequence[float]], after: Mapping[int, 
     fitrms = [p["fit_rms_pct"] / 100.0 for p in per]
     sig = max(float(luminance_sigma), _SIGMA_FLOOR)
     free_rep = report.get("free") or {}
+    P = invert3x3(Pinv)
+    step = (report.get("light") or {}).get("largest_step_pct")
     cap = (report.get("light") or {}).get("cap_pct")
     cap_ln = math.log(1.0 + cap / 100.0) if cap is not None else None
 
@@ -1219,11 +1276,17 @@ def _judge_predicted(before: Mapping[int, Sequence[float]], after: Mapping[int, 
                     row[f"free_before_{nm}_pct"] = p[f"free_before_{nm}_pct"]
             if free_after and c in free_after["resid"]:
                 fr = free_after["resid"][c][s]
+                if s == 0:
+                    fa = free_after["resid"][c]
+                    row["free_after_itp"] = round(balance_visibility(a0, fa[0], fa[1], P, Pinv), 3)
                 ft = z * free_after["tol_sigma"][c][s]
                 row[f"free_after_{nm}_pct"] = round(100.0 * fr, 3)
                 row[f"free_after_{nm}_tol_pct"] = round(100.0 * ft, 3)
                 if abs(fr) > ft:
                     missed.append(f"{nm} not flat (model-free)")
+        row["light_itp"] = round(light_visibility(a0, light), 3)
+        if step:
+            row["light_vs_display_step"] = round(100.0 * abs(light) / step, 3)   # 1 = the display's own step
         if where == "beside":
             if abs(light) > tol_l:
                 missed.append("light")
@@ -1246,7 +1309,24 @@ def _judge_predicted(before: Mapping[int, Sequence[float]], after: Mapping[int, 
         return [round(max((abs(r[f"{key}_{nm}_pct"]) for r in where_rows if r.get(f"{key}_{nm}_pct") is not None),
                           default=0.0), 3) for nm in ("rg", "bg")]
     reach_rows = [r for r in rows if lo_x is not None and lo_x <= r["code"] <= hi_x]
+    # in VIEWER terms (owner's rule): the class from the model-free departures as dE_ITP at each grey's light;
+    # a light miss is a revert reason only when it is visible (a real change far below one JND is reported)
+    flat = not any("not flat" in m for r in rows for m in r.get("missed") or ())
+    before_itp = float((report.get("visibility") or {}).get("before_worst_itp") or 0.0)
+    after_itp = round(max((r["free_after_itp"] for r in reach_rows if "free_after_itp" in r), default=0.0), 3)
+    cls = outcome_class(flat, before_itp, after_itp)
+    light_visible = [r["code"] for r in rows
+                     if any(m.startswith("light") for m in r.get("missed") or ())
+                     and r.get("light_itp", 0.0) >= VISIBLE_ITP]
+    light_below = [r["code"] for r in rows
+                   if any(m.startswith("light") for m in r.get("missed") or ()) and r["code"] not in light_visible]
+    unread = [r["code"] for r in rows if any(m in ("unread", "unusable") for m in r.get("missed") or ())]
+    recommend_keep = recommends_change(cls) and not light_visible and not unread
     return {"held_out": rows, "out": out,
+            "visibility": {"before_worst_itp": before_itp, "after_worst_itp": after_itp, "class": cls,
+                           "light_changes_visible_at": light_visible,
+                           "light_changes_below_visibility_at": light_below, "unread": unread},
+            "recommend_keep": recommend_keep,
             "judged_against": "the audit's prediction AND the after-pass's own line (model-free)",
             "inside": sum(1 for r in rows if r.get("where") == "inside"),
             "beside": sum(1 for r in rows if r.get("where") == "beside"),
