@@ -13,6 +13,12 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
   once the measurement confirms it, installs the corrected curve, measures greys it did not use, and asks
   whether to keep it. Every ending that does not keep it puts the previous curve back (also `--abort`); a kept
   repair is recorded so later runs know the installed base.
+  - Sized and judged by its own prediction (2026-11-14, after the first hardware run): the measurement now
+    sizes the correction and predicts the result at every measured grey, and the run stops before installing
+    when that prediction is not flat. After installing, each grey is judged against what was predicted for it.
+  - Flat means flat against the neighbouring greys too, not only against the prediction: the run recommends
+    applying and keeping a repair only when both say flat, and shows the worst tint before and after. Light is
+    checked where the curve did not change, and limited where it did to the display's own steps.
 
 ### Fixed
 - **`grayscale-wb` is judged between its nodes, not only on them** (2026-11-14). The touch-up is fitted at the
