@@ -581,7 +581,11 @@ void ReconcileRefreshTrim(const char* why) {
                                   L"The HDR profile variant for this refresh rate could not be swapped in; retrying");
         }
     } else if (!wait) {
-        if (g_warned) notify::Resolve(-1, L"mhc", kTrimKey);   // the retries landed: the warning is over
+        // A pass that really tried and had no display failing: every trim warning is over, the per-display ones too
+        // (a display whose rate went back, or that left, never gets a "landed" swap of its own). NOT a pass inside the
+        // retry backoff, which skips the swaps and reaches this branch as well. Not gated on g_warned: a backoff
+        // pass has already cleared that flag below; a Resolve with nothing to end is one cheap ring walk.
+        if (!inBackoff) notify::Resolve(notify::kAnyMonitor, L"mhc", kTrimKey);
         g_failures = 0;
         g_retryNotBefore = 0;
         g_warned = false;

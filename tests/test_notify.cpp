@@ -181,6 +181,25 @@ TEST_CASE("headline: the FALD governor's own events (FaldCoreGovPostEvent)") {
     CHECK(HeadTitle() == L"Active (DWM Hook)");
 }
 
+TEST_CASE("headline: a resolve with nothing to end changes nothing; a clean pass ends every display's condition") {
+    notify::ResetForTest();
+    notify::Post(notify::Sev::Info, -1, L"status", L"Active (DWM Hook)");
+    notify::PostCondition(notify::Sev::Warning, 0, L"mhc", L"refresh-trim", L"Refresh trim swap failed");
+    notify::PostCondition(notify::Sev::Warning, -1, L"mhc", L"refresh-trim", L"Refresh trim could not be applied");
+    const uint64_t rev = notify::Revision();
+    notify::Resolve(-1, L"mhc", L"windows-tonemap");                  // another condition
+    notify::Resolve(3, L"mhc", L"refresh-trim");                      // another display
+    notify::Resolve(notify::kAnyMonitor, L"fald", L"refresh-trim");   // another source
+    CHECK(notify::Revision() == rev);                                 // a periodic pass that ends nothing wakes nobody
+    CHECK(HeadTitle() == L"Refresh trim could not be applied");
+    notify::Resolve(notify::kAnyMonitor, L"mhc", L"refresh-trim");    // a pass with no display failing: both are over
+    CHECK(notify::Revision() != rev);
+    CHECK(HeadTitle() == L"Active (DWM Hook)");
+    const uint64_t rev2 = notify::Revision();
+    notify::Resolve(notify::kAnyMonitor, L"mhc", L"refresh-trim");    // again: nothing left to end
+    CHECK(notify::Revision() == rev2);
+}
+
 TEST_CASE("headline: a one-off warning stands until it is seen; a newer one shows again") {
     notify::ResetForTest();
     notify::Post(notify::Sev::Info, -1, L"status", L"Active (DWM Hook)");

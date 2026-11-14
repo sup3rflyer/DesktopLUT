@@ -277,7 +277,10 @@ void ReconcileWindowsToneMap(const char* why, bool reapply) {
         }
     } else if (!wait) {
         if (g_failures > 0 && changed) std::cout << "[Windows tone map] applied after a retry" << std::endl;
-        if (g_warned) notify::Resolve(-1, L"mhc", kToneMapKey);   // a pass with nothing failing: the warning is over
+        // A pass that really tried and had nothing failing: the warning is over. NOT a pass inside the retry backoff,
+        // which skips the work (it reaches this branch too, and the fault may still stand). Not gated on g_warned:
+        // a backoff pass has already cleared that flag below; a Resolve with nothing to end is one cheap ring walk.
+        if (!inBackoff) notify::Resolve(-1, L"mhc", kToneMapKey);
         g_failures = 0;
         g_retryNotBefore = 0;
         g_warned = false;
