@@ -286,8 +286,16 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
 - **`grayscale-wb` is judged between its nodes.** The verify also reads held-out greys between the curve's
   slots (placed through the installed base 1D LUT; read before the touch-up in the same session, 8 of them
   again at its end). `verify:accept` shows them as `gswb_held_out`: LIGHT and COLOUR separately per grey, before
-  vs after, and recommends `revert` when any reads worse beyond the run's repeatability and the touch-up's own
-  tolerance. Light that moved where the curve commanded nothing is listed as `uncommanded_light` (evidence).
+  vs after. Colour is judged in the fit's own metric (luminance-relative CIEDE2000 chroma) against the run's
+  `--target` and the colour noise of re-presenting a grey at that level (the colour difference between the two
+  reads of the nearest bracket pairs). Beside every colour verdict stands dE_ITP (BT.2124) at the grey's own
+  light, and it sets the class of a real worsening: `regressed` at >= 1 JND, `regressed_below_visibility` under
+  it. The rule: recommend `revert` when any grey is `regressed` (light or colour), when a smoothed / held code
+  missed its prediction, or when the drift is unknown (no bracket, or too few pairs; one known bracket alone
+  only widens the threshold); otherwise `apply`, with every below-visibility grey named with both numbers for
+  you to weigh. A smoothed node's light may move from its prediction by one of the display's own light steps in
+  the drive's direction (the peak-to-peak residual of the detrended before-state light near it), never more.
+  Light that moved where the curve commanded nothing is listed as `uncommanded_light` (evidence).
   - `grayscale-wb:light-trend`: the light a node would carry that the nodes on both sides do not share (a tooth of
     a sawtooth-light panel). `trend` commits only the shared light; there is no per-node option, by design.
   - `grayscale-wb:node-outlier`: a node (or an adjacent pair) whose balance departs from the lines both sides

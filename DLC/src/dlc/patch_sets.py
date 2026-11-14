@@ -586,10 +586,23 @@ def build_grayscale_wb_verify_set(ps: PatchSizes, transfer: Transfer, *,
                                   warm_tau: Optional[int] = None,
                                   max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
     """The grayscale-wb grey verify: the 32 node greys AND the held-out greys between them, in the
-    outside-in order over the union (:func:`grayscale_wb_union_order`)."""
+    outside-in order over the union (:func:`grayscale_wb_union_order`), then the verify BRACKET: the
+    :data:`GSWB_BRACKET_GREYS` held-out greys the session bracket re-read, presented once more at the end
+    (:func:`grayscale_wb_bracket_codes`; the run uses the ones its session bracket actually read)."""
     nodes = build_grayscale_wb_set(ps, transfer, max_cv=max_cv)
     held = build_grayscale_wb_heldout_set(ps, transfer, max_cv=max_cv)
-    return [(nodes if kind == "node" else held)[i] for kind, i in grayscale_wb_union_order(nodes, held)]
+    seq = [(nodes if kind == "node" else held)[i] for kind, i in grayscale_wb_union_order(nodes, held)]
+    return seq + [(c, c, c) for c in grayscale_wb_bracket_codes([p[0] for p in held])]
+
+
+def grayscale_wb_bracket_codes(held_codes: list[int], n: Optional[int] = None) -> list[int]:
+    """The bracket greys: ``n`` (default :data:`GSWB_BRACKET_GREYS`) of the held-out codes, evenly spread over
+    the levels (ascending). Empty when there are fewer held-out greys than that."""
+    k = GSWB_BRACKET_GREYS if n is None else n
+    codes = sorted(held_codes)
+    if len(codes) < k or k < 2:
+        return []
+    return sorted({codes[round(j * (len(codes) - 1) / (k - 1))] for j in range(k)})
 
 
 # Time model of a grayscale-wb run for the plan / --preview-patches (an ESTIMATE for the operator, never a
@@ -607,7 +620,7 @@ def grayscale_wb_time_estimate(n_nodes: int, n_heldout: int) -> dict[str, Any]:
     per = GSWB_SECONDS_PER_GREY / 60.0
     lo, hi = GSWB_TOUCHUP_MINUTES_32
     scale = n_nodes / 32.0
-    bracket = min(GSWB_BRACKET_GREYS, n_heldout)
+    bracket = 2 * min(GSWB_BRACKET_GREYS, n_heldout)    # the session bracket and the verify bracket
     extra = (2 * n_heldout + bracket) * per
     return {
         "minutes": [round(lo * scale + n_nodes * per + extra, 1), round(hi * scale + n_nodes * per + extra, 1)],
@@ -618,7 +631,7 @@ def grayscale_wb_time_estimate(n_nodes: int, n_heldout: int) -> dict[str, Any]:
         "basis": ("measured on one display so far (PA32UCXR SDR 10-bit, i1D3, 2026-11-14: touch-up 9.3-12.7 min for "
                   "32 nodes, ~11.7 s per presented grey) - another display, meter or read policy scales it; held-out "
                   "greys are presented once before (two reads at least) and once in the verify, 8 of them once more "
-                  "at the end of the session (the drift bracket)"),
+                  "at the end of the session and once more at the end of the verify (the two drift brackets)"),
     }
 
 

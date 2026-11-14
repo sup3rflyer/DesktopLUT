@@ -197,6 +197,28 @@ def update_point(payload: Mapping[str, Any], index: int, patch: GrayTouchupPatch
     return updated, digest
 
 
+def committed_size(payload: Mapping[str, Any], config: Optional[GrayTouchupConfig] = None) -> dict[str, Any]:
+    """The size of a curve AS IT WILL BE COMMITTED, judged with the same bounds the solver warns and caps at
+    (:class:`GrayTouchupConfig` ``warn_abs_delta`` / ``warn_luminance_delta`` / ``max_abs_delta``): the largest
+    composed per-channel deviation and the largest luminance (common) deviation, and their nodes."""
+    cfg = config or GrayTouchupConfig()
+    points = [float(p) for p in payload.get("points") or ()]
+    cur = coerce_payload(payload, points)
+    n = len(points)
+    devs = [(abs(float(cur["deviations"][ch][i]) - 1.0), i) for ch in _CHANNELS for i in range(n)]
+    lums = [(abs(float(cur["luminance"][i]) - 1.0), i) for i in range(n)]
+    dmax, dnode = max(devs) if devs else (0.0, None)
+    lmax, lnode = max(lums) if lums else (0.0, None)
+    return {"max_abs_deviation": round(dmax, 6), "worst_deviation_node": dnode,
+            "max_abs_luminance": round(lmax, 6), "worst_luminance_node": lnode,
+            "large_correction": bool(dmax >= cfg.warn_abs_delta or lmax >= cfg.warn_luminance_delta),
+            "large_luminance_correction": bool(lmax >= cfg.warn_luminance_delta),
+            "capped": bool(dmax >= cfg.max_abs_delta - 1e-9),
+            "bounds": {"warn_abs_delta": cfg.warn_abs_delta, "warn_luminance_delta": cfg.warn_luminance_delta,
+                       "max_abs_delta": cfg.max_abs_delta},
+            "what": "the curve to be committed (after the light-trend and node-outlier decisions)"}
+
+
 def point_error(patch: GrayTouchupPatch, config: GrayTouchupConfig) -> dict[str, Any]:
     target = xy_to_XYZ(config.white_xy[0], config.white_xy[1], patch.target_y)
     ref_y = max(patch.target_y, patch.measured_xyz[1], 1e-6)
@@ -551,7 +573,8 @@ def apply_balance_smoothing(payload: Mapping[str, Any], features: Sequence[Seque
     return compose_payload(points, current["luminance"], rgb), detail
 
 
-def light_trend(nodes: Sequence[Mapping[str, Any]], *, alpha: float = FAMILY_ALPHA) -> dict[str, Any]:
+def light_trend(nodes: Sequence[Mapping[str, Any]], *, alpha: float = FAMILY_ALPHA,
+                between_sigma: Optional[float] = None) -> dict[str, Any]:
     """The LIGHT part of the touch-up, committed only as light the nodes on BOTH sides share.
 
     Why (2026-11-14 HW): the PA32UCXR's full-field light is a sawtooth in the 10-bit code (teeth of
@@ -561,7 +584,14 @@ def light_trend(nodes: Sequence[Mapping[str, Any]], *, alpha: float = FAMILY_ALP
 
     ``nodes``: the solved nodes that take part (any order): ``index``, ``need`` = ln of the luminance
     (common) curve gain that puts the node exactly on its target light, from its own read; ``own`` = ln
-    of the gain the solver left there; ``sigma`` = the read-noise SE of ``need`` (None: one read).
+    of the gain the solver left there; ``sigma`` = the SE of ``need`` over the repeat reads of ONE
+    presentation (None: one read). That is NOT a repeatability: a counting colorimeter's reads of one held patch
+    agree to ~0.001 % (2026-11-14 HW). It is reported as ``within_presentation_se_pct`` and decides nothing.
+
+    ``between_sigma``: the between-PRESENTATION scatter of a node's light need (ln signal gain) - the same grey
+    shown again later reads this differently (the session bracket, :func:`bracket_drift`, divided by the light
+    exponent). It labels the evidence (``z``) and decides only whether a move pauses at the seam (``material``:
+    the committed light moves a node by more than z x it); None = unknown, every move is material.
 
     Rule (no tuned constant, no noise dependence): the light committed at node k is what EVERY node of
     its centred window k-2 .. k+2 asks for at least - if all five ask the same sign, the smallest of
@@ -606,22 +636,23 @@ def light_trend(nodes: Sequence[Mapping[str, Any]], *, alpha: float = FAMILY_ALP
                 committed, reason = max(asks), "shared by k-2..k+2: the smallest ask"
             else:
                 committed, reason = 0.0, "k-2..k+2 ask for light of both signs: none is shared"
-        s = d.get("sigma")
-        if s is None:   # one read: the median read noise of the (up to 8) nearest nodes that have repeats
-            near = sorted((x for x in seq if x.get("sigma") is not None),
-                          key=lambda x: (abs(int(x["index"]) - k), int(x["index"])))[:MIN_SCALE_SAMPLES]
-            s = median(float(x["sigma"]) for x in near) if near else None
-        s_eff = max(float(s), SCALE_FLOOR) if s is not None else SCALE_FLOOR
-        z = (need - committed) / s_eff
-        tooth = abs(z) > z_crit
-        # material = the light at this node moves by more than its reads can resolve
-        material = abs(committed - own) > z_crit * s_eff
+        within = d.get("sigma")
+        if between_sigma is not None:
+            s_eff = max(float(between_sigma), SCALE_FLOOR)
+            z = (need - committed) / s_eff
+            tooth = abs(z) > z_crit
+            # material = the light at this node moves by more than a re-presentation of it can resolve
+            material = abs(committed - own) > z_crit * s_eff
+        else:
+            z, tooth, material = None, False, abs(committed - own) > 1e-12
         row = {"index": k, "code": d.get("code"),
                "need_pct": round(100.0 * (math.exp(need) - 1.0), 4),
                "own_pct": round(100.0 * (math.exp(own) - 1.0), 4),
                "committed_pct": round(100.0 * (math.exp(committed) - 1.0), 4),
                "committed_gain": math.exp(committed),
-               "sigma_pct": round(100.0 * float(s), 4) if s is not None else None,
+               "within_presentation_se_pct": round(100.0 * float(within), 5) if within is not None else None,
+               "between_presentation_sigma_pct": (round(100.0 * float(between_sigma), 4)
+                                                  if between_sigma is not None else None),
                "z": round(z, 3) if z is not None else None, "tooth": bool(tooth), "reason": reason,
                "changed": abs(committed - own) > 1e-12, "material": bool(material)}
         out["nodes"].append(row)
@@ -751,16 +782,32 @@ def chroma_de(xyz: Sequence[float], ref_xyz: Sequence[float], white_xy: tuple[fl
     return float(delta_e2000(xyz_to_lab(a, w), xyz_to_lab(b, w)))   # type: ignore[arg-type]
 
 
+def chroma_itp(xyz: Sequence[float], ref_xyz: Sequence[float]) -> float:
+    """dE_ITP (ITU-R BT.2124, 720 x the ICtCp distance, T = Ct/2) between two stimuli's CHROMATICITIES at the
+    first one's ABSOLUTE luminance (cd/m2): how visible a colour difference is at that light. 1 = one just
+    noticeable difference by the standard's own (conservative) definition - the same unit at every level, so a
+    colour shift at 0.3 nit and one at 100 nit are judged by what can be seen there (docs/practical-thresholds.md)."""
+    from .content_score import xyz_to_itp
+    y = float(xyz[1])
+    if y <= 0 or float(ref_xyz[1]) <= 0:
+        return float("nan")
+    ref = [float(v) * y / float(ref_xyz[1]) for v in ref_xyz]
+    a, b = xyz_to_itp([list(map(float, xyz)), ref])
+    return 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
+
+
 def grey_metrics(xyz: Sequence[float], target_y: float, white_xy: tuple[float, float]) -> dict[str, float]:
     """The two things a grey can get wrong, measured separately: LIGHT ``e = ln(Y / target)`` (signed;
     its error is ``|e|``) and CHROMATICITY ``c`` = the dE2000 of its chromaticity alone against the target
-    white (:func:`chroma_de` - the touch-up's own metric with the light taken out). ``du``/``dv`` = its u'v'
-    offset from the target white, for the record."""
+    white (:func:`chroma_de` - the touch-up's own metric with the light taken out); ``itp`` = the same colour
+    error as BT.2124 dE_ITP at the grey's absolute light (:func:`chroma_itp`: what the verify judges colour in).
+    ``du``/``dv`` = its u'v' offset from the target white, for the record."""
     y = float(xyz[1])
     wu, wv = _white_uv(white_xy)
     u, v = _uv(xyz)
+    white = xy_to_XYZ(white_xy[0], white_xy[1], 1.0)
     return {"e": math.log(y / target_y) if y > 0 and target_y > 0 else float("nan"),
-            "c": chroma_de(xyz, xy_to_XYZ(white_xy[0], white_xy[1], 1.0), white_xy),
+            "c": chroma_de(xyz, white, white_xy), "itp": chroma_itp(xyz, white),
             "du": u - wu, "dv": v - wv}
 
 
@@ -783,67 +830,144 @@ def _read_summary(xyz: Sequence[float], target_y: float, config: GrayTouchupConf
             "de2000": e["de2000"]}
 
 
-def _local(pairs: Sequence[Mapping[str, Any]], code: int, key: str) -> tuple[float, float, list[int]]:
-    near = sorted(pairs, key=lambda p: (abs(int(p["code"]) - code), int(p["code"])))[:MIN_SCALE_SAMPLES]
-    med, sig = _mad_scale([float(p[key]) for p in near])
-    return med, sig, [int(p["code"]) for p in near]
+def verify_after_and_late(reads: Mapping[int, Sequence[Any]], planned: Iterable[int]
+                          ) -> tuple[dict[int, Any], dict[int, Any]]:
+    """Split the verify's reads per code (measurement order) into after-reads and verify-bracket late reads. Only
+    a PLANNED bracket code (re-presented at the end of the verify) forms a pair: its first read is the after-read,
+    its last the late read. Any other code read twice was re-measured (a retried / appended read): its latest read
+    is the after-read and it forms no pair - a retry is not a drift measurement."""
+    planned = {int(c) for c in planned}
+    after = {c: (r[0] if c in planned else r[-1]) for c, r in reads.items() if r}
+    late = {c: r[-1] for c, r in reads.items() if c in planned and len(r) >= 2}
+    return after, late
 
 
-def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Sequence[float]],
-                   null_pairs: Sequence[Mapping[str, Any]], *, config: GrayTouchupConfig,
-                   alpha: float = FAMILY_ALPHA,
-                   bracket: Optional[Sequence[Mapping[str, Any]]] = None,
+def bracket_drift(pairs: Sequence[Mapping[str, Any]], white_xy: tuple[float, float]) -> dict[str, Any]:
+    """One bracket: the same greys read in the same display state at two times. Per pair: the light change
+    (``de``, ln), the change of the colour error (``dc``, the fit's own metric - its signed drift toward / away
+    from white) and the full colour difference between the two reads (``dd`` = :func:`chroma_de` of late vs
+    early, every direction, tangential moves included - the noise). Median drift and the largest change are
+    kept per metric. Needs :data:`MIN_SCALE_SAMPLES` pairs; with fewer, ``known`` is False and no number is given."""
+    d = []
+    for b in pairs:
+        try:
+            e0, e1 = grey_metrics(b["early_xyz"], b["target_Y"], white_xy), grey_metrics(b["late_xyz"], b["target_Y"], white_xy)
+            dd = chroma_de(b["late_xyz"], b["early_xyz"], white_xy)
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+        if all(math.isfinite(v) for v in (e0["e"], e1["e"], e0["c"], e1["c"], dd)):
+            d.append({"code": int(b["code"]), "y": float(b["target_Y"]), "de": e1["e"] - e0["e"],
+                      "dc": e1["c"] - e0["c"], "dd": dd})
+    if len(d) < MIN_SCALE_SAMPLES:
+        return {"known": False, "n": len(d), "raw": d,
+                "note": f"{len(d)} pair(s), fewer than {MIN_SCALE_SAMPLES}: drift unknown"}
+    me, se_ = _mad_scale([x["de"] for x in d])
+    mc, _sc = _mad_scale([x["dc"] for x in d])
+    return {"known": True, "n": len(d), "drift_e": me, "drift_c": mc,
+            "presentation_e": se_ / math.sqrt(2.0),
+            "max_e": max(abs(x["de"]) for x in d), "max_c": max(abs(x["dc"]) for x in d), "raw": d,
+            "pairs": [{"code": x["code"], "y": x["y"], "d_light_pct": round(100.0 * x["de"], 4),
+                       "d_colour_de": round(x["dc"], 4), "colour_difference_de": round(x["dd"], 4)} for x in d]}
+
+
+def light_steps(reads: Sequence[Mapping[str, Any]], white_xy: tuple[float, float]) -> list[dict[str, Any]]:
+    """The display's light STEPS, which a smooth error shape cannot fake: each before-state grey's light about a
+    straight line fitted (least squares, in the code) through the two greys on each side of it - the residual
+    that survives detrending. A smooth (or linearly sloped) light error leaves ~0; a stepped panel leaves its
+    steps. ``reads``: ``code``, ``target_Y``, ``xyz`` of greys read in the before state."""
+    s = sorted(({"code": int(r["code"]), **grey_metrics(r["xyz"], r["target_Y"], white_xy)} for r in reads
+                if r.get("xyz") is not None and float(r["xyz"][1]) > 0), key=lambda r: r["code"])
+    s = [r for r in s if math.isfinite(r["e"])]
+    out = []
+    for j in range(2, len(s) - 2):
+        nb = [s[j - 2], s[j - 1], s[j + 1], s[j + 2]]
+        xs = [float(r["code"]) for r in nb]
+        ys = [r["e"] for r in nb]
+        mx, my = sum(xs) / 4.0, sum(ys) / 4.0
+        sxx = sum((x - mx) ** 2 for x in xs)
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx > 0 else 0.0
+        out.append({"code": s[j]["code"], "residual": s[j]["e"] - (my + slope * (s[j]["code"] - mx))})
+    return out
+
+
+def _local_steps(steps: Sequence[Mapping[str, Any]], code: int) -> Optional[dict[str, float]]:
+    """Around ``code``: the :data:`MIN_SCALE_SAMPLES` detrended residuals nearest in code, the code ITSELF left out
+    (its own departure is the defect under judgement, not the display's step); the display's step size there at its
+    UPPER bound = their peak-to-peak range (the largest change between two nearby greys' departures from the smooth
+    light: the biggest fall a drive change can cross here)."""
+    others = [r for r in steps if int(r["code"]) != int(code)]
+    if len(others) < MIN_SCALE_SAMPLES:
+        return None
+    near = sorted(others, key=lambda r: (abs(int(r["code"]) - code), int(r["code"])))[:MIN_SCALE_SAMPLES]
+    res = [float(r["residual"]) for r in near]
+    return {"step_upper": max(res) - min(res), "scatter": _mad_scale(res)[1], "codes": [int(r["code"]) for r in near]}
+
+
+# The bracket pairs a grey's colour noise is taken from: the ones nearest to it in light. Four = two re-presentations
+# from each side of the level on average (both brackets pooled), the fewest that give a scatter on both sides of a
+# grey between bracket levels; RMS rather than MAD over so few values (it can only overstate the noise).
+LEVEL_PAIRS = 4
+# One just noticeable difference, BT.2124 dE_ITP (standard, conservative): the VISIBILITY class boundary of a
+# colour worsening that is real in the fit's own metric (docs/practical-thresholds.md).
+VISIBILITY_ITP = 1.0
+
+
+def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Sequence[float]], *,
+                   config: GrayTouchupConfig, alpha: float = FAMILY_ALPHA,
+                   session_bracket: Optional[Sequence[Mapping[str, Any]]] = None,
+                   verify_bracket: Optional[Sequence[Mapping[str, Any]]] = None,
+                   before_state_reads: Optional[Sequence[Mapping[str, Any]]] = None,
                    after_reads: Optional[Mapping[int, Sequence[Sequence[float]]]] = None,
                    light_tol: float = math.log(1.01), chroma_tol: float = 0.6) -> dict[str, Any]:
-    """Judge the touch-up at greys it was NOT fitted on, LIGHT and CHROMATICITY separately (review item 5:
-    one scalar dE hid code 160 going -3.6 % in light while its dE improved), each against the grey's OWN
-    before-read and its own repeatability. Either regressing counts.
+    """Judge the touch-up at greys it was NOT fitted on, LIGHT and COLOUR separately, each against the grey's OWN
+    before-read and repeatability measured in this run, in THE FIT'S OWN METRIC with the user's target as the
+    tolerance (``chroma_tol`` = the run's ``--target`` dE; the flow must not accept between its nodes what it
+    refuses at them).
 
-    ``greys``: ``code``, ``target_Y``, ``before_xyz``, ``before_reads``, optional ``commanded_e`` (ln of the
-    light ratio the committed curve commands at that code against the before table - known exactly from
-    the curves) and, for a held / smoothed node, ``predicted_xyz`` (the before-read carried through the
-    curve change: judged against the PREDICTION, not by the regression rule).
+    ``greys``: ``code``, ``target_Y``, ``before_xyz``, ``before_reads`` (the reads of ONE presentation), optional
+    ``commanded_e`` (ln of the light ratio the committed curve commands there) and, for a smoothed / held node,
+    ``predicted_xyz`` (its before read carried through the curve change: judged against the PREDICTION).
 
-    Repeatability, per metric m in {e, c}, all measured in this run:
-      * the grey's own repeat reads: the SE of its before reads and of its after reads (``after_reads``;
-        without them the after SE is taken equal to the before SE);
-      * BRACKET (drift over the touch-up session): greys re-read in the before state late in the session;
-        ``d = m(late) - m(early)``; median = the drift carried into the comparison, 1.4826 MAD = its
-        scatter; needs :data:`MIN_SCALE_SAMPLES` re-reads;
-      * NULL (session -> verify): solved nodes whose committed value is exactly the table their last
-        session read saw (``null_pairs``; moved nodes are never used - nothing is predicted), read again on
-        the bake; median and MAD over the :data:`MIN_SCALE_SAMPLES` pairs nearest in code. With fewer than
-        that in total the null is not used and the digest says so; the 8 nearest are taken however far
-        they lie, and each grey reports the code span its pairs came from.
-    change_m = m_after - drift_bracket - drift_null vs m_before (light: |e| after vs |e| before; chroma:
-    c after vs c before); sigma_m = sqrt(SE_b^2 + SE_a^2 + MAD_bracket^2 + MAD_null^2), floored at
-    :data:`SCALE_FLOOR`; regressed when change_m > z sigma_m, z = one-sided Bonferroni over 2 x J tests at
-    ``alpha``. LIGHT regresses only when the curve's own command explains it (``|e_b + commanded| - |e_b|``
-    beyond the same threshold): light that moved where the curve commanded ~nothing - a drive change across
-    a tooth of a sawtooth-light panel, or drift the bracket did not see - is listed as
-    ``uncommanded_light`` with its size, as evidence, not as the curve's regression. Without
-    ``commanded_e`` no gating is applied."""
+    Repeatability - every term measured:
+      * within one presentation: the SE of the grey's repeat reads (before; after when given) - reported under that
+        name, tiny on a counting colorimeter, never alone;
+      * the LEVEL's own between-presentation colour noise: the full colour difference between the two reads of the
+        :data:`LEVEL_PAIRS` bracket pairs nearest in light (tangential moves included), per axis RMS / 2;
+        light: the brackets' pooled 1.4826 MAD / sqrt 2;
+      * DRIFT: both brackets known -> expected (m_session + m_verify) / 2, uniform-position variance (m_s^2 + m_v^2)
+        / 12; only the session bracket -> no expected drift, but its LARGEST pair change as a uniform +-A drift
+        (variance A^2 / 3: widened, said so); neither -> "drift unknown" on every verdict (the caller must not
+        recommend apply on them alone).
+    COLOUR (fit metric, chroma dE2000 vs the target white): change = c_after - drift - c_before; REAL when it exceeds
+    max(z sigma, chroma_tol). Every colour verdict carries its VISIBILITY at the grey's own light (the change of
+    BT.2124 dE_ITP, :func:`chroma_itp`): a real worsening >= :data:`VISIBILITY_ITP` is ``regressed``, under it
+    ``regressed_below_visibility``. LIGHT: change of |ln(Y/target)| beyond max(z sigma, light_tol) is ``regressed``
+    where the curve commanded it, else ``uncommanded_light``. z = one-sided Bonferroni over 2 x the judged greys.
+    Smoothed / held codes: colour vs the prediction in the fit metric; LIGHT vs the prediction allowing one STEP of
+    the display (the peak-to-peak of the detrended before-state light residuals nearest the code,
+    :func:`light_steps`) only in the direction a drive change can cross one (falling back when the drive rose,
+    rising when it fell) - a light change beyond that is flagged however stepped the display."""
     wxy = config.white_xy
-    pairs = []
-    for p in null_pairs:
-        try:
-            a, f = grey_metrics(p["verify_xyz"], p["target_Y"], wxy), grey_metrics(p["final_xyz"], p["target_Y"], wxy)
-        except (KeyError, TypeError, ValueError):
-            continue
-        if math.isfinite(a["e"]) and math.isfinite(f["e"]):
-            pairs.append({"code": int(p["code"]), "de": a["e"] - f["e"], "dc": a["c"] - f["c"]})
-    null_ok = len(pairs) >= MIN_SCALE_SAMPLES
-    brk = []
-    for b in bracket or ():
-        try:
-            e0, e1 = grey_metrics(b["early_xyz"], b["target_Y"], wxy), grey_metrics(b["late_xyz"], b["target_Y"], wxy)
-        except (KeyError, TypeError, ValueError):
-            continue
-        if math.isfinite(e0["e"]) and math.isfinite(e1["e"]):
-            brk.append({"code": int(b["code"]), "de": e1["e"] - e0["e"], "dc": e1["c"] - e0["c"]})
-    brk_ok = len(brk) >= MIN_SCALE_SAMPLES
-    b_e = _mad_scale([b["de"] for b in brk]) if brk_ok else (0.0, 0.0)
-    b_c = _mad_scale([b["dc"] for b in brk]) if brk_ok else (0.0, 0.0)
+    sb = bracket_drift(session_bracket or (), wxy)
+    vb = bracket_drift(verify_bracket or (), wxy)
+    if sb["known"] and vb["known"]:
+        drift_state = "known"
+        drift_e = 0.5 * (sb["drift_e"] + vb["drift_e"])
+        drift_c = 0.5 * (sb["drift_c"] + vb["drift_c"])
+        var_de = (sb["drift_e"] ** 2 + vb["drift_e"] ** 2) / 12.0
+        var_dc = (sb["drift_c"] ** 2 + vb["drift_c"] ** 2) / 12.0
+    elif sb["known"] or vb["known"]:
+        one = sb if sb["known"] else vb
+        drift_state = "widened"
+        drift_e = drift_c = 0.0
+        var_de, var_dc = one["max_e"] ** 2 / 3.0, one["max_c"] ** 2 / 3.0
+    else:
+        drift_state = "unknown"
+        drift_e = drift_c = var_de = var_dc = 0.0
+    pres = [b for b in (sb, vb) if b["known"]]
+    pres_e = math.sqrt(sum(b["presentation_e"] ** 2 for b in pres) / len(pres)) if pres else None
+    level_pairs = [x for b in (sb, vb) for x in b.get("raw") or ()]
+    steps = light_steps(before_state_reads or (), wxy)
 
     rows: list[dict[str, Any]] = []
     for g in greys:
@@ -862,45 +986,50 @@ def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Seque
         a_reads = [grey_metrics(r, ty, wxy) for r in (after_reads or {}).get(code) or ()]
         se_be, se_bc = _se([r["e"] for r in b_reads]), _se([r["c"] for r in b_reads])
         se_ae, se_ac = _se([r["e"] for r in a_reads]), _se([r["c"] for r in a_reads])
-        if se_ae is None:
-            se_ae = se_be
-        if se_ac is None:
-            se_ac = se_bc
-        n_e = n_c = (0.0, 0.0)
-        span = None
-        if null_ok:
-            me, se_, codes_e = _local(pairs, code, "de")
-            mc, sc, _codes = _local(pairs, code, "dc")
-            n_e, n_c, span = (me, se_), (mc, sc), [min(codes_e), max(codes_e)]
-        have_noise = se_be is not None or null_ok or brk_ok
-        row.update(before=_read_summary(bxyz, ty, config), after=_read_summary(axyz, ty, config),
-                   null_span_codes=span)
-        if not have_noise:
-            row.update(judged=False, reason=f"no repeatability estimate (a single read, fewer than "
-                                            f"{MIN_SCALE_SAMPLES} unmoved node pairs and bracket re-reads)")
+        se_ae = se_be if se_ae is None else se_ae
+        se_ac = se_bc if se_ac is None else se_ac
+        near = sorted(level_pairs, key=lambda x: abs(math.log(max(x["y"], 1e-9) / max(ty, 1e-9))))[:LEVEL_PAIRS]
+        level_c = math.sqrt(sum(x["dd"] ** 2 for x in near) / len(near)) / 2.0 if near else None
+        if level_c is None and se_bc is None:
+            row.update(judged=False, reason="no repeatability estimate at this level (one read and no bracket)")
             rows.append(row)
             continue
-        sig_e = max(math.sqrt((se_be or 0.0) ** 2 + (se_ae or 0.0) ** 2 + b_e[1] ** 2 + n_e[1] ** 2), SCALE_FLOOR)
-        sig_c = max(math.sqrt((se_bc or 0.0) ** 2 + (se_ac or 0.0) ** 2 + b_c[1] ** 2 + n_c[1] ** 2), SCALE_FLOOR)
-        e_a = ma["e"] - b_e[0] - n_e[0]
-        c_a = ma["c"] - b_c[0] - n_c[0]
+        sig_e = max(math.sqrt((se_be or 0.0) ** 2 + (se_ae or 0.0) ** 2 + 2.0 * (pres_e or 0.0) ** 2 + var_de),
+                    SCALE_FLOOR)
+        sig_c = max(math.sqrt((se_bc or 0.0) ** 2 + (se_ac or 0.0) ** 2 + 2.0 * (level_c or 0.0) ** 2 + var_dc),
+                    SCALE_FLOOR)
+        e_a, c_a = ma["e"] - drift_e, ma["c"] - drift_c
         light_change = abs(e_a) - abs(mb["e"])
         chroma_change = c_a - mb["c"]
         cmd = g.get("commanded_e")
-        row.update(judged=True,
+        row.update(judged=True, drift=drift_state,
+                   before=_read_summary(bxyz, ty, config), after=_read_summary(axyz, ty, config),
                    light={"before_pct": round(100.0 * mb["e"], 3), "after_pct": round(100.0 * ma["e"], 3),
-                          "drift_pct": round(100.0 * (b_e[0] + n_e[0]), 3),
+                          "drift_pct": round(100.0 * drift_e, 3) if drift_state == "known" else None,
                           "change_pct": round(100.0 * light_change, 3), "sigma_pct": round(100.0 * sig_e, 4),
+                          "within_presentation_se_pct": round(100.0 * se_be, 5) if se_be is not None else None,
                           "commanded_pct": round(100.0 * float(cmd), 3) if cmd is not None else None},
                    chroma={"before_de": round(mb["c"], 4), "after_de": round(ma["c"], 4),
-                           "drift_de": round(b_c[0] + n_c[0], 4),
-                           "change_de": round(chroma_change, 4), "sigma_de": round(sig_c, 4)},
-                   _le=light_change, _ce=chroma_change, _se=sig_e, _sc=sig_c, _eb=mb["e"], _cmd=cmd)
+                           "drift_de": round(drift_c, 4) if drift_state == "known" else None,
+                           "change_de": round(chroma_change, 4), "sigma_de": round(sig_c, 4),
+                           "level_noise_de": round(level_c, 4) if level_c is not None else None,
+                           "level_noise_from": [{"code": x["code"], "y": round(x["y"], 3)} for x in near] or None,
+                           "within_presentation_se_de": round(se_bc, 5) if se_bc is not None else None,
+                           "before_itp": round(mb["itp"], 4), "after_itp": round(ma["itp"], 4),
+                           "visibility_itp": round(ma["itp"] - mb["itp"], 4)},
+                   _le=light_change, _ce=chroma_change, _se=sig_e, _sc=sig_c, _eb=mb["e"], _cmd=cmd,
+                   _vis=ma["itp"] - mb["itp"])
         if g.get("predicted_xyz") is not None:
             mp = grey_metrics(g["predicted_xyz"], ty, wxy)
+            # DIP knowledge hook: a facet such as "grey light is stepped in the code, steps picture-dependent"
+            # (dlc/knowledge.py, being built) would give the step size before any data; until then the run's own
+            # detrended before-state light gives it (light_steps).
+            st = _local_steps(steps, code)
             row["predicted"] = {"light_pct": round(100.0 * mp["e"], 3), "chroma_de": round(mp["c"], 4),
-                                "_de": ma["e"] - b_e[0] - n_e[0] - mp["e"],
-                                "_dc": chroma_de(axyz, g["predicted_xyz"], wxy),
+                                "_de": e_a - mp["e"], "_dc": chroma_de(axyz, g["predicted_xyz"], wxy),
+                                "_dir": mp["e"] - mb["e"],
+                                "step_upper_pct": round(100.0 * st["step_upper"], 3) if st else None,
+                                "_step": st["step_upper"] if st else 0.0,
                                 "note": g.get("predicted_note")}
         rows.append(row)
     judged = [r for r in rows if r.get("judged")]
@@ -910,42 +1039,76 @@ def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Seque
     z = NormalDist().inv_cdf(1.0 - alpha / n_tests) if n_tests else None
     for r in regular:
         th_e, th_c = max(z * r["_se"], light_tol), max(z * r["_sc"], chroma_tol)   # type: ignore[operator]
-        light_reg = r["_le"] > th_e
+        light_real = r["_le"] > th_e
         explained = True
         if r["_cmd"] is not None:
             explained = (abs(r["_eb"] + float(r["_cmd"])) - abs(r["_eb"])) > th_e
-        r["light"].update(threshold_pct=round(100.0 * th_e, 4), regressed=bool(light_reg and explained),
-                          uncommanded=bool(light_reg and not explained))
-        r["chroma"].update(threshold_de=round(th_c, 4), regressed=bool(r["_ce"] > th_c))
+        colour_real = r["_ce"] > th_c
+        visible = r["_vis"] >= VISIBILITY_ITP
+        r["light"].update(threshold_pct=round(100.0 * th_e, 4), regressed=bool(light_real and explained),
+                          uncommanded=bool(light_real and not explained))
+        r["chroma"].update(threshold_de=round(th_c, 4), real=bool(colour_real),
+                           regressed=bool(colour_real and visible),
+                           regressed_below_visibility=bool(colour_real and not visible))
         r["regressed"] = bool(r["light"]["regressed"] or r["chroma"]["regressed"])
+        r["regressed_below_visibility"] = bool(r["chroma"]["regressed_below_visibility"] and not r["regressed"])
         r["score"] = round(max(r["_le"] / r["_se"], r["_ce"] / r["_sc"]), 3)
     for r in predicted:
         p = r["predicted"]
-        ok_e = abs(p.pop("_de")) <= max(z * r["_se"], light_tol)      # type: ignore[operator]
-        ok_c = p.pop("_dc") <= max(z * r["_sc"], chroma_tol)           # type: ignore[operator]
-        p.update(as_predicted=bool(ok_e and ok_c), light_ok=bool(ok_e), chroma_ok=bool(ok_c))
+        de_, dc_, dirn, step = p.pop("_de"), p.pop("_dc"), p.pop("_dir"), p.pop("_step")
+        tol_e = max(z * r["_se"], light_tol)                 # type: ignore[operator]
+        ok_c = dc_ <= max(z * r["_sc"], chroma_tol)          # type: ignore[operator]
+        if dirn > 0:      # the drive rose: the light can fall back across a step, not rise beyond the prediction
+            lo, hi = -(tol_e + step), tol_e
+        elif dirn < 0:    # the drive fell: it can rise back across a step
+            lo, hi = -tol_e, tol_e + step
+        else:
+            lo, hi = -(tol_e + step), tol_e + step
+        ok_e = lo <= de_ <= hi
+        p.update(chroma_ok=bool(ok_c), light_ok=bool(ok_e),
+                 light_allowed_pct=[round(100.0 * lo, 3), round(100.0 * hi, 3)],
+                 light_vs_prediction_pct=round(100.0 * de_, 3),
+                 drive_change=("up" if dirn > 0 else "down" if dirn < 0 else "none"),
+                 as_predicted=bool(ok_c and ok_e))
         r["regressed"] = False
     for r in judged:
-        for k in ("_le", "_ce", "_se", "_sc", "_eb", "_cmd"):
+        for k in ("_le", "_ce", "_se", "_sc", "_eb", "_cmd", "_vis"):
             r.pop(k, None)
     regressed = [r for r in regular if r["regressed"]]
+    below = [r for r in regular if r.get("regressed_below_visibility")]
     worst = sorted(regular, key=lambda r: r["score"], reverse=True)[:5]
+
+    def _bk(b: Mapping[str, Any]) -> dict[str, Any]:
+        if not b["known"]:
+            return {"known": False, "n": b["n"], "note": b["note"]}
+        return {"known": True, "n": b["n"], "drift_light_pct": round(100.0 * b["drift_e"], 4),
+                "drift_colour_de": round(b["drift_c"], 4), "largest_light_pct": round(100.0 * b["max_e"], 4),
+                "largest_colour_de": round(b["max_c"], 4),
+                "presentation_light_pct": round(100.0 * b["presentation_e"], 4), "pairs": b["pairs"]}
+
     return {
         "available": bool(judged),
-        "rule": ("per grey, LIGHT (|ln(Y/target)|) and CHROMATICITY (dE2000 of the chromaticity alone vs the target "
-                 "white) separately, after (drift-corrected: bracket re-reads of the before state late in the session, "
-                 "plus the null of unmoved nodes session -> verify) vs the grey's own before-read; sigma = "
-                 "sqrt(SE_before^2 + SE_after^2 + MAD_bracket^2 + MAD_null^2); regressed when the change > max(z x "
-                 f"sigma, the touch-up's own tolerance: {100.0 * (math.exp(light_tol) - 1.0):.2g} % light, "
-                 f"{chroma_tol:g} dE colour), z = one-sided Bonferroni over 2 x the judged greys at alpha {alpha:g}; "
-                 "light counts only when the curve's own command explains it (else 'uncommanded light'); held / "
-                 "smoothed node codes are judged against their predicted outcome within the same bounds"),
+        "rule": ("per grey, LIGHT (|ln(Y/target)|) and COLOUR (the fit's own metric: chroma dE2000 vs the target white) "
+                 "separately, after (drift-handled: two brackets, or the session bracket's largest change as a "
+                 "widened drift) vs the grey's own before-read; sigma = sqrt(within-presentation SE_b^2 + SE_a^2 + "
+                 f"2 x the level's between-presentation noise^2 (the {LEVEL_PAIRS} bracket pairs nearest in light, full "
+                 "colour difference) + drift variance); real when the change > max(z x sigma, the target: "
+                 f"{100.0 * (math.exp(light_tol) - 1.0):.2g} % light, {chroma_tol:g} dE colour), z = one-sided "
+                 f"Bonferroni over 2 x the judged greys at alpha {alpha:g}; a real colour worsening is 'regressed' "
+                 f"when its visibility (dE_ITP change at the grey's own light) is >= {VISIBILITY_ITP:g} JND, else "
+                 "'regressed below visibility'; light counts only where the curve commanded it; smoothed / held "
+                 "codes: colour vs the prediction, light vs the prediction allowing one step of the display in the "
+                 "direction the drive moved"),
         "light_tol_pct": round(100.0 * (math.exp(light_tol) - 1.0), 3), "chroma_tol_de": chroma_tol,
+        "visibility_itp": VISIBILITY_ITP,
         "alpha": alpha, "z_crit": round(z, 4) if z is not None else None,
         "n_greys": len(rows), "n_judged": len(regular), "n_regressed": len(regressed),
         "regressed_codes": [r["code"] for r in regressed],
         "light_regressed_codes": [r["code"] for r in regressed if r["light"]["regressed"]],
         "chroma_regressed_codes": [r["code"] for r in regressed if r["chroma"]["regressed"]],
+        "regressed_below_visibility": [{"code": r["code"], "change_de": r["chroma"]["change_de"],
+                                        "threshold_de": r["chroma"]["threshold_de"],
+                                        "visibility_itp": r["chroma"]["visibility_itp"]} for r in below],
         "uncommanded_light": [{"code": r["code"], "change_pct": r["light"]["change_pct"],
                                "commanded_pct": r["light"]["commanded_pct"]}
                               for r in regular if r["light"].get("uncommanded")],
@@ -957,14 +1120,16 @@ def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Seque
         "worst": [{"code": r["code"], "kind": r["kind"], "regressed": r["regressed"], "score": r["score"],
                    "light": r["light"], "chroma": r["chroma"], "before": r["before"], "after": r["after"]}
                   for r in worst],
-        "bracket": {"n": len(brk), "used": brk_ok,
-                    "drift_light_pct": round(100.0 * b_e[0], 4), "scatter_light_pct": round(100.0 * b_e[1], 4),
-                    "drift_chroma_de": round(b_c[0], 4), "scatter_chroma_de": round(b_c[1], 4),
-                    "note": None if brk_ok else f"fewer than {MIN_SCALE_SAMPLES} bracket re-reads: session drift not in sigma"},
-        "null": {"n_pairs": len(pairs), "used": null_ok,
-                 "note": None if null_ok else (f"only {len(pairs)} solved nodes kept their table unchanged (fewer than "
-                                               f"{MIN_SCALE_SAMPLES}): the session -> verify drift is not in sigma"),
-                 "pairs": [{"code": p["code"], "d_light_pct": round(100.0 * p["de"], 4), "d_chroma_de": round(p["dc"], 4)}
-                           for p in pairs]},
+        "drift": {"state": drift_state, "known": drift_state == "known",
+                  "note": {"known": None,
+                           "widened": "only one bracket: no expected drift; its largest change taken as a +-drift "
+                                      "(sigma widened)",
+                           "unknown": "drift unknown (no bracket): every verdict rests on it; apply must not be "
+                                      "recommended on these alone"}[drift_state],
+                  "session_bracket": _bk(sb), "verify_bracket": _bk(vb),
+                  "expected_light_pct": round(100.0 * drift_e, 4) if drift_state == "known" else None,
+                  "expected_colour_de": round(drift_c, 4) if drift_state == "known" else None,
+                  "rests_on_reads": 2 * (sb["n"] if sb["known"] else 0) + 2 * (vb["n"] if vb["known"] else 0)},
+        "light_steps": {"n": len(steps), "used": len(steps) >= MIN_SCALE_SAMPLES},
         "greys": rows,
     }

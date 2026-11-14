@@ -63,6 +63,9 @@ _FEATURE_CODE = 153
 _FEATURE_HALF_WIDTH = 4.5
 _FEATURE_RUN = (0.033, 0.105, 0.05)
 _FEATURE_SPOT = (0.012, 0.026, 0.010)
+# A strongly green-side feature (the same width): its balance smear between the nodes is far beyond one just
+# noticeable difference at that light, so leaving it as solved must end in revert.
+_FEATURE_STRONG_GREEN = (0.02, 0.30, 0.05)
 # A plain uniform white-balance error like tonight's, the same at every level: red-heavy, light gains that
 # tonight's solved curve undoes (signal r 0.992, g 1.003, b 0.997 -> light x1.018, x0.9934, x1.0066).
 _RED_HEAVY = (1.018, 0.9934, 1.0066)
@@ -273,16 +276,20 @@ def test_held_out_greys_sit_at_the_interpolation_midpoints_over_the_corrected_ra
     assert 141 in held and 166 in held
     # the verify measures both sets once each
     ver = [p[0] for p in build_grayscale_wb_verify_set(PatchSizes(), _SDR)]
-    assert sorted(ver) == sorted(nodes + held) and ver[:2] == [0, 1023]
+    from dlc.patch_sets import grayscale_wb_bracket_codes
+    bracket = grayscale_wb_bracket_codes(held)
+    assert len(bracket) == 8 and set(bracket) <= set(held)
+    assert sorted(ver[:-8]) == sorted(nodes + held) and ver[:2] == [0, 1023]
+    assert ver[-8:] == bracket                     # the verify bracket: re-presented at the end
 
 
 def test_preview_and_plan_report_the_held_out_greys_and_the_time():
     plan = flow_patch_counts("grayscale-wb", PatchSizes(), _SDR)
-    assert plan["stages"] == {"grayscale-wb": 32, "grayscale-wb-heldout": 24, "grayscale-wb-verify": 56}
-    assert plan["held_out_greys"] == 24 and plan["total_patches"] == 112
+    assert plan["stages"] == {"grayscale-wb": 32, "grayscale-wb-heldout": 24, "grayscale-wb-verify": 64}
+    assert plan["held_out_greys"] == 24 and plan["total_patches"] == 120
     est = plan["time_estimate"]
-    assert est["held_out_presentations"] == 2 * 24 + 8
-    assert est["held_out_minutes"] == pytest.approx((2 * 24 + 8) * 11.7 / 60, abs=0.05)
+    assert est["held_out_presentations"] == 2 * 24 + 16
+    assert est["held_out_minutes"] == pytest.approx((2 * 24 + 16) * 11.7 / 60, abs=0.05)
     assert "one display" in est["basis"]
     assert est["minutes"][0] > est["without_held_out_minutes"][0]
 
@@ -367,8 +374,44 @@ def test_balance_smoothing_keeps_the_light_and_takes_the_line():
 # the flow, end to end on the simulated panel
 # ---------------------------------------------------------------------------
 
+def test_tonights_feature_left_as_solved_smears_colour_below_one_jnd(tmp_path: Path):
+    """Tonight's feature accepted as solved: with the light committed as shared light, what is left between the
+    nodes is node 12's balance smear - it makes 141 and 166 worse in colour, but at 1.4-1.9 nit by about a third of
+    one just noticeable difference (BT.2124 dE_ITP): not a visible regression, so apply."""
+    calib, result, judge, _panel = _run(tmp_path, "feature_accept_run", feature=_FEATURE_RUN,
+                                        choices={"grayscale-wb:node-outlier": "accept"})
+    ho = _verify(calib)["gswb_held_out"]
+    by = {g["code"]: g for g in ho["greys"]}
+    for code in (141, 166):
+        assert by[code]["chroma"]["after_itp"] > by[code]["chroma"]["before_itp"]          # worse ...
+        assert by[code]["chroma"]["after_de"] > by[code]["chroma"]["before_de"]
+        c = by[code]["chroma"]
+        assert c["real"] and c["change_de"] > c["threshold_de"] >= 0.6                   # worse beyond the target ...
+        assert not c["regressed"] and c["regressed_below_visibility"]                    # ... but not visibly
+        assert c["visibility_itp"] < 1.0
+    assert {b["code"] for b in ho["regressed_below_visibility"]} == {141, 166}
+    req = judge.request("verify:accept")
+    assert req.recommendation == "apply"                                       # apply, with the list named
+    assert "code 141: colour +" in req.question and "code 166: colour +" in req.question
+    assert "dE_ITP" in req.question and "revert when a grey reads worse" in req.question
+    assert result.status == "completed"
+
+
+def test_the_size_seam_judges_the_committed_curve_not_the_solver(tmp_path: Path):
+    """A light-only tooth of +14 % at code 153: the solver asks node 12 for a large luminance cut (over the 5 %
+    warning); the light-trend rule commits none of it. The size seam measures the COMMITTED curve, so it does
+    not fire (2026-11-14 HW: it fired quoting the solver's 6.7 % while the committed light was <= 0.44 %)."""
+    calib, result, judge, _panel = _run(tmp_path, "size", feature=(0.14, 0.14, 0.14))
+    touch = _touch(calib)
+    assert touch["large_correction"] is True and touch["max_abs_luminance"] >= 0.05     # the solver's raw curve
+    assert judge.request("grayscale-wb:touchup-size") is None
+    from dlc.grayscale_wb import committed_size
+    assert committed_size(calib.calib["grayscale_wb_touchup"])["large_correction"] is False
+    assert result.status == "completed"
+
+
 def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_path: Path):
-    calib, result, judge, _panel = _run(tmp_path, "feature_accept", feature=_FEATURE_RUN,
+    calib, result, judge, _panel = _run(tmp_path, "feature_accept", feature=_FEATURE_STRONG_GREEN,
                                         choices={"grayscale-wb:node-outlier": "accept"})
     touch = _touch(calib)
     # (a1) the LIGHT node 12 asked for (the feature's +light) is not shared by the nodes around it
@@ -385,7 +428,8 @@ def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_pat
     flagged = touch["node_outliers"]["flagged"]
     assert [f["nodes"] for f in flagged] == [[12]] and flagged[0]["code"] == 153
     f = flagged[0]
-    assert f["solved_vs_neighbours_pct"]["r"][0] > 1.0 and f["solved_vs_neighbours_pct"]["b"][0] > 0.5
+    pct = f["solved_vs_neighbours_pct"]
+    assert pct["g"][0] < pct["r"][0] and pct["g"][0] < pct["b"][0]   # green-side: green pulled down most
     assert f["hold_changes_grey_de"] >= touch["target_de2000"]
     assert "node 12 (code 153)" in seam.question and "spreads over codes 129-180" in seam.question
     assert "grayscale_wb_node_holds" not in calib.calib          # accepted as solved
@@ -393,10 +437,9 @@ def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_pat
     ho = _verify(calib)["gswb_held_out"]
     assert ho["available"] is True and ho["n_judged"] == 24
     assert set(ho["chroma_regressed_codes"]) == {141, 166}, ho["worst"]
-    assert ho["light_regressed_codes"] == []
     for w in ho["worst"][:2]:
         assert w["code"] in (141, 166) and w["chroma"]["regressed"]
-        assert abs(w["light"]["change_pct"]) < 0.5
+        assert w["chroma"]["visibility_itp"] >= 1.0 and w["chroma"]["change_de"] > w["chroma"]["threshold_de"]
     # (c) the recommendation is revert - a recommendation: the judge's answer stands
     req = judge.request("verify:accept")
     assert req.recommendation == "revert" and req.digest["held_out_regressed"] is True
@@ -455,7 +498,8 @@ def test_plain_white_balance_error_passes_with_apply(tmp_path: Path):
     assert _touch(calib)["node_outliers"]["flagged"] == []
     ho = _verify(calib)["gswb_held_out"]
     assert ho["available"] is True and ho["n_judged"] == 24 and ho["n_regressed"] == 0, ho["worst"]
-    assert ho["bracket"]["used"] is True and ho["bracket"]["n"] == 8
+    assert ho["drift"]["known"] is True and ho["drift"]["rests_on_reads"] == 32
+    assert ho["drift"]["session_bracket"]["n"] == 8 and ho["drift"]["verify_bracket"]["n"] == 8
     # the touch-up made the greys between the nodes better, not just the nodes
     improved = [g for g in ho["greys"] if g.get("judged") and g["after"]["de2000"] < g["before"]["de2000"]]
     assert len(improved) == ho["n_judged"]
