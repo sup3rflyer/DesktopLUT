@@ -21,6 +21,10 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
     checked where the curve did not change, and limited where it did to the display's own steps.
 
 ### Fixed
+- **The base 1D LUT no longer under-drives greys between the measured ones** (2026-11-14). Between two raw
+  greys the build interpolated in linear light, which on any gamma-like panel lands a little dark mid-gap (up to
+  ~1 % on the default ramp, several % on sparse ones). Above 1 % of white it now interpolates in the transfer
+  domain (SDR gamma, HDR PQ), which the raw ramps of all 29 past runs fit better; the shadows are built as before.
 - **`grayscale-wb` is judged between its nodes, not only on them** (2026-11-14). The touch-up is fitted at the
   curve's 32 nodes and its verify re-read the same 32 codes, but DesktopLUT bakes a CURVE: a node's correction
   reaches every grey out to its neighbours. On the PA32UCXR a feature ~9 codes wide at node 12 (code 153) got a
