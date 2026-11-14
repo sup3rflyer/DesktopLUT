@@ -284,9 +284,21 @@ def test_a_real_but_invisible_chromaticity_shift_is_a_practical_pass_said_beside
     assert cell["chroma"]["ok"] is False                                      # statistically real ...
     assert cell["chroma"]["practical"]["below"] is True                       # ... below one JND
     assert cell["chroma"]["practical"]["de_itp"] == pytest.approx(0.39, abs=0.05)
-    assert res["verdict"] == "pass" and cell["chroma_practical_pass"] is True
+    assert res["verdict"] == "pass_below_visibility" and cell["verdict"] == "pass_below_visibility"
+    assert cell["chroma_practical_pass"] is True
     note = res["rates"]["47.952"]["practical_notes"][0]
     assert "statistically real" in note and "BT.2124" in note
+    # the LLM sees it: the digest lines carry the note, the rule names the floor
+    line = next(x for x in rv.digest_lines(res) if x["rate"] == "47.952")
+    assert line["verdict"] == "pass_below_visibility" and line["practical_notes"] == [note]
+    assert "pass_below_visibility" in res["rule"]["chromaticity"] and "BT.2124" in res["rule"]["chromaticity"]
+    # unsettled reads come first: a below-floor shift with an unsettled read is undecided, not a practical pass
+    unsettled = rows(0.0006)
+    for r in unsettled:
+        if r["rate"] == "47.952":
+            r["settled"] = False
+    res_u = rv.analyze_verify(unsettled, reference="60", trim_checks=ok)
+    assert res_u["verdict"] == "undecided" and "unsettled" in res_u["rates"]["47.952"]["undecided"][0]
     big = rv.analyze_verify(rows(0.002), reference="60", trim_checks=ok)
     assert big["verdict"] == "fail" and big["rates"]["47.952"]["greys"]["g520"]["chroma"]["practical"]["below"] is False
 

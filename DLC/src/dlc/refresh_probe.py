@@ -1068,7 +1068,7 @@ def analyze_verify_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, sou
                    "never_recorded": "a verify is evidence only: python -m dlc.refresh_trim record refuses it"}
     write_json(root / rv.RESULT_FILE, res)
     return {"purpose": rv.PURPOSE, "verdict": res["verdict"], "verify_stack": spec.verify_stack,
-            "link_bpc": res.get("link_bpc"), "rates": rv.digest_lines(res),
+            "link_bpc": res.get("link_bpc"), "rates": rv.digest_lines(res), "rule": res.get("rule"),
             "run_undecided": res["run_undecided"], "anomalies": len(st.get("anomalies") or []),
             "result": str(root / rv.RESULT_FILE), "simulated": simulated}
 

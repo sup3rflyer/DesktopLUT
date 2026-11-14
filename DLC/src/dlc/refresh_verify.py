@@ -205,7 +205,9 @@ def _xy(xyz: Optional[Sequence[float]]) -> tuple[Optional[float], Optional[float
     return (float(xyz[0]) / s, float(xyz[1]) / s) if s > 0 else (None, None)
 
 
-_RANK = {"pass": 0, "undecided": 1, "fail": 2}
+# pass_below_visibility = a chromaticity shift the reference legs prove real but under one JND (BT.2124): passed on the
+# practical floor, never silently - the class, the number and the floor travel to the digest
+_RANK = {"pass": 0, "pass_below_visibility": 1, "undecided": 2, "fail": 3}
 CHROMA_ALPHA = 0.05         # family-wise false-alarm rate of the chromaticity test over the whole run (Bonferroni)
 
 
@@ -415,8 +417,11 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             elif lost:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: {len(lost)} of {len(taken)} read(s) without a bracketed ratio: {lost}")
+            elif below_floor and cell["unsettled"]:
+                cell["verdict"] = "undecided"
+                why_undecided.append(f"{patch}: {cell['unsettled']} unsettled read(s)")
             elif below_floor:
-                cell["verdict"] = "pass"
+                cell["verdict"] = "pass_below_visibility"
                 cell["chroma_practical_pass"] = True
                 notes.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} is "
                              f"statistically real (p {min(ct['x']['p'], ct['y']['p']):.2g} < {p_crit:.2g}) but "
@@ -451,7 +456,8 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
         if not_applied:
             why_fail.append(f"the trim variant for {rate} Hz was not on screen on {len(not_applied)} of {len(checks)} "
                             f"leg(s): {[{k: t.get(k) for k in ('state', 'trim_rate', 'applied', 'waiting', 'rule', 'why', 'active_stamp', 'stamp') if t.get(k) is not None} for t in not_applied]}")
-        verdict = "fail" if why_fail else ("undecided" if why_undecided else "pass")
+        verdict = "fail" if why_fail else ("undecided" if why_undecided else
+                                           ("pass_below_visibility" if notes else "pass"))
         out_rates[rate] = {"verdict": verdict, "greys": cells, "fail": why_fail, "undecided": why_undecided,
                            "practical_notes": notes,
                            "trim_checks": len(checks), "trim_not_applied": len(not_applied),
@@ -468,7 +474,7 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
     if not rates:
         run_undecided.append("no rate was measured")
     worst = max([v["verdict"] for v in out_rates.values()] or ["undecided"], key=lambda v: _RANK[v])
-    if run_undecided and worst == "pass":
+    if run_undecided and worst in ("pass", "pass_below_visibility"):
         worst = "undecided"
     return {"verdict": worst, "stack": stack, "link_bpc": link_bpc,
             "rule": {"luminance": f"|ratio - 1| <= {lum_tol * 100:g} % (combined and every single read), "
@@ -480,7 +486,10 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
                                       f"reference reads (drift included), t = shift / (rms / sqrt(n)), Student t with nu = "
                                       f"their count; a shift fails when its two-sided p < {CHROMA_ALPHA:g} / "
                                       f"{max(1, 2 * n_chroma)} tests (Bonferroni: <= {CHROMA_ALPHA:g} chance of any false "
-                                      "fail in the run)"),
+                                      "fail in the run); a shift that fails it but is under the practical floor "
+                                      f"(dE_ITP {PRACTICAL_CHROMA_ITP:g} = one JND, ITU-R BT.2124, at the grey's light) is "
+                                      "'pass_below_visibility', named with its number in practical_notes - never a "
+                                      "silent pass; unsettled reads make it undecided first"),
                      "chromaticity_p_crit": p_crit,
                      "trim": "state.get refresh_trim reads the rate's variant on screen on every leg (stamp rule)"},
             "reference": reference, "rates": out_rates, "run_undecided": run_undecided,
@@ -497,7 +506,8 @@ def digest_lines(res: dict[str, Any]) -> list[dict[str, Any]]:
                                     for p, c in v["greys"].items()},
                     "link_code_pct_by_grey": {p: (round(c["link_code_pct"], 3) if c.get("link_code_pct") is not None
                                                   else None) for p, c in v["greys"].items()},
-                    "fail": v["fail"], "undecided": v["undecided"]})
+                    "fail": v["fail"], "undecided": v["undecided"],
+                    "practical_notes": v.get("practical_notes") or []})
     return out
 
 
