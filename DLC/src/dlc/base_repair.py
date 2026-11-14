@@ -17,13 +17,18 @@ g 153.5, b 152.0). A correction meant for wire ``s`` is therefore written at eac
 
 Steps (the flow measures, decides at seams and applies; these only compute):
 
-* :func:`audit_codes` — where to look: the installed cube's own channel-balance departures (seen through
-  scan-out, per wire grey), widened by a margin; a dense audit then reads every code there.
-* :func:`repair_balance` — the audited greys' channel balance ``ln(r/g)``, ``ln(b/g)`` (linear native shares,
-  ``P^-1 XYZ``) against a masked smooth envelope of the FIT half (alternate codes); a span is where a balance
-  series leaves its envelope by more than ``z * sqrt(2) * max(read noise, that series' own structure)``. Inside
-  a span every channel's light is scaled so the balance lands on the envelope while the grey's LIGHT stays what
-  it measured (balance-only). Every LUT entry outside the spans is returned bit-identical.
+* :func:`balance_census` / :func:`audit_codes` — where the installed cube itself is tinted (its channel-balance
+  departure through scan-out, per wire grey). It only PROPOSES windows; the operator names the span
+  (``--repair-span``), and :func:`validate_span` refuses a span whose edges cut a tint.
+* :func:`cube_repair` — the correction is SHAPED BY THE CUBE: over the tint (+1 code) each channel's curve is
+  replaced by a straight line in ``ln(out/in)`` between its untouched edge entries, times a common factor per
+  wire grey that keeps that grey's light (``delta_bar``, the luminance-weighted mean of the channels' departures)
+  — the channel-imbalanced part of the departure is removed per entry, in index space, placed for each channel
+  where scan-out reads it. Every entry outside is bit-identical.
+* :func:`repair_balance` — that correction, CONFIRMED by the dense audit: the measured balance of every audited
+  grey must be the cube's drive balance through scan-out times the panel's response (``k``) plus a smooth
+  panel term, within z x the clean greys' residual spread; otherwise ``confirmed: False`` (the flow refuses).
+  The reads never shape the correction (single reads of a sawtooth panel would put its teeth into it).
 * :func:`judge_after` — after the candidate is applied, the HELD-OUT half (never used to build it) re-read:
   balance against the same envelope, light against its own pre-repair read.
 * :func:`scanout_grey_drive` — the scan-out twin, for tests and predictions.
@@ -38,7 +43,8 @@ from .colormath import invert3x3, matvec, rgb_to_xyz_matrix
 
 __all__ = [
     "DEFAULT_Z", "srgb_eotf", "srgb_oetf", "grey_lut_index", "lut_at", "scanout_grey_drive",
-    "balance_census", "audit_codes", "split_fit_held", "repair_balance", "judge_after",
+    "balance_census", "audit_codes", "split_fit_held", "validate_span", "cube_repair", "wire_for_index",
+    "repair_balance", "judge_after",
     "cube3d_grey_deviation", "read_repeatability",
 ]
 
@@ -48,6 +54,9 @@ DEFAULT_Z = 4.0
 # mid grey: under that a tint is below what one colorimeter read resolves at ~2 nit.
 CENSUS_BALANCE_PCT = 0.3
 _SIGMA_FLOOR = 1e-4
+# Codes kept on each side of a census tint inside the correction region: the bridge meets the untouched curve a
+# few codes from the tint (the census threshold marks where the departure exceeds 0.3 %, not where it starts).
+REGION_MARGIN = 1
 
 
 def srgb_eotf(v: float) -> float:
@@ -272,120 +281,236 @@ def _slope_safe(new: list[float], old: Sequence[float], j0: int, j1: int) -> int
     return limited
 
 
+def wire_for_index(applied: Sequence[Sequence[float]], channel: int, v: float) -> float:
+    """The wire grey whose channel ``channel`` scan-out reads LUT index ``v`` (the inverse of
+    :func:`grey_lut_index`)."""
+    rs = sum(float(x) for x in applied[channel])
+    return srgb_oetf(srgb_eotf(v) / rs) if rs > 0 else v
+
+
+def validate_span(curves: Mapping[str, Sequence[float]], applied: Sequence[Sequence[float]],
+                  span: Sequence[int], *, max_cv: int = 1023, clean_margin: int = 6,
+                  census: Optional[Sequence[Mapping[str, Any]]] = None) -> dict[str, Any]:
+    """Is ``span`` (wire codes, inclusive) a window the repair may work in? Every tint the installed cube shows
+    (:func:`balance_census`) that touches the span must lie strictly inside it with at least ``clean_margin`` clean
+    codes on both sides — the edges must be clean, or the repaired curve would meet the untouched one with a step
+    (``152:175`` cut the 149-155 bump at its peak). ``{"ok", "problem", "tints", "proposals"}``; ``proposals`` are
+    the census's own windows (tint +-16 codes), for the plan digest only."""
+    lo, hi = int(span[0]), int(span[1])
+    runs = list(census if census is not None else balance_census(curves, applied, max_cv=max_cv))
+    inside = [r for r in runs if r["hi"] >= lo and r["lo"] <= hi]
+    proposals = audit_codes(runs, max_cv=max_cv)
+    out = {"ok": True, "problem": None, "tints": inside, "proposals": proposals, "span": [lo, hi]}
+    if not inside:
+        out.update(ok=False, problem=f"the installed cube shows no tint inside {lo}:{hi} (its tinted greys: "
+                                     f"{[(r['lo'], r['hi']) for r in runs] or 'none'})")
+        return out
+    for r in inside:
+        if r["lo"] - lo < clean_margin or hi - r["hi"] < clean_margin:
+            out.update(ok=False, problem=(
+                f"the tint at {r['lo']}-{r['hi']} (peak {r['peak_pct']} % {r['series']} at {r['peak_code']}) is "
+                f"not inside {lo}:{hi} with {clean_margin} clean codes on both sides — an edge would cut it and "
+                f"leave a step; use e.g. {max(0, r['lo'] - 16)}:{min(max_cv, r['hi'] + 16)}"))
+            return out
+    return out
+
+
+def _bridge_envelope(curve: Sequence[float], ja: int, jb: int) -> list[float]:
+    """The replacement for ``curve`` between entries ``ja`` and ``jb`` (inclusive): a straight line in
+    ``ln(out/in)`` between the two edge entries, which it meets EXACTLY (no step where repaired and untouched
+    entries meet). Straight, not a fitted envelope: the DLC base cube is itself piecewise linear between its build
+    and refine levels (its ratio curve is a chain of straight segments), so a fitted quadratic would differ from
+    the curve's own clean neighbourhood and that difference would be written in as a correction (it was: up to
+    0.2 % r/g either side of the 2026-09-25 bump). The region is a few codes around the tint, so the line is local."""
+    n = len(curve)
+
+    def r(j):
+        x = j / (n - 1)
+        return math.log(max(float(curve[j]), 1e-12) / max(x, 1e-12))
+
+    ra, rb = r(ja), r(jb)
+    out = []
+    for j in range(ja, jb + 1):
+        t = (j - ja) / (jb - ja) if jb > ja else 0.0
+        out.append(math.exp(ra + (rb - ra) * t) * (j / (n - 1)))
+    return out
+
+
+def cube_repair(curves: Mapping[str, Sequence[float]], applied: Sequence[Sequence[float]], span: Sequence[int], *,
+                primaries: Mapping[str, float], native_white_xy: Sequence[float], peak_luminance: float,
+                max_cv: int = 1023, gamma: float = 2.2,
+                pred_codes: Optional[Sequence[int]] = None) -> tuple[dict[str, list[float]], dict[str, Any]]:
+    """The correction, SHAPED BY THE CUBE: inside ``span``, each channel's curve departs from its own smooth
+    envelope (:func:`_bridge_envelope`, in the cube's INDEX space) by ``delta_c(j)``. For a wire grey ``s`` the
+    channels read entries ``j_c(s)`` (:func:`grey_lut_index`); the repair keeps that grey's light — its common
+    departure ``delta_bar(s) = sum_c w_c delta_c(j_c(s)) / sum_c w_c`` (``w_c`` = the channel's share of the grey's
+    luminance) — and removes the channel-imbalanced rest. Written per entry: ``new_c[j] = env_c[j] *
+    exp(delta_bar(s_c(j)))`` with ``s_c(j)`` the wire grey that reads entry ``j`` of channel ``c``. To first order
+    in the departure the grey's light is unchanged whatever the panel's gamma (the weights carry it, the gamma
+    cancels); its balance is the envelopes' balance. Every entry outside the span's per-channel index range is
+    returned bit-identical. Returns ``(curves', info)`` with the predicted per-wire balance departure the reads must
+    confirm (``pred``: ``{code: (ln r/g, ln b/g)}`` of the installed cube against its envelopes, scaled by
+    ``gamma``)."""
+    lo, hi = int(span[0]), int(span[1])
+    n = len(curves["r"])
+    P = _native_P(primaries, native_white_xy, peak_luminance)
+    chans = ("r", "g", "b")
+    ja = [max(1, int(math.floor(grey_lut_index(applied, k, lo / max_cv) * (n - 1)))) for k in range(3)]
+    jb = [min(n - 2, int(math.ceil(grey_lut_index(applied, k, hi / max_cv) * (n - 1)))) for k in range(3)]
+    env = {ch: _bridge_envelope(curves[ch], ja[k], jb[k]) for k, ch in enumerate(chans)}
+
+    def delta(k: int, v: float) -> float:
+        """ln(curve / envelope) of channel k at LUT index v (0..1), linear between entries; 0 outside."""
+        x = v * (n - 1)
+        if x <= ja[k] or x >= jb[k]:
+            return 0.0
+        i0 = int(math.floor(x))
+        t = x - i0
+        ch = chans[k]
+        d0 = math.log(float(curves[ch][i0]) / env[ch][i0 - ja[k]])
+        d1 = math.log(float(curves[ch][i0 + 1]) / env[ch][i0 + 1 - ja[k]])
+        return d0 + (d1 - d0) * t
+
+    def common(s: float) -> float:
+        d = scanout_grey_drive(curves, applied, s)
+        w = [P[1][k] * max(d[k], 0.0) ** gamma for k in range(3)]
+        idx = [grey_lut_index(applied, k, s) for k in range(3)]
+        tot = sum(w) or 1.0
+        return sum(w[k] * delta(k, idx[k]) for k in range(3)) / tot
+
+    out = {ch: list(curves[ch]) for ch in chans}
+    changed = {}
+    for k, ch in enumerate(chans):
+        maxd = 0.0
+        for j in range(ja[k] + 1, jb[k]):
+            s = wire_for_index(applied, k, j / (n - 1))
+            new = env[ch][j - ja[k]] * math.exp(common(s))
+            out[ch][j] = min(max(new, 0.0), 1.0)
+            maxd = max(maxd, abs(out[ch][j] / float(curves[ch][j]) - 1.0))
+        limited = _slope_safe(out[ch], curves[ch], ja[k] + 1, jb[k] - 1)
+        changed[ch] = {"entries": [ja[k] + 1, jb[k] - 1], "max_drive_change_pct": round(100.0 * maxd, 3),
+                       "slope_limited": limited}
+    pred = {}
+    for c in (pred_codes if pred_codes is not None else range(lo, hi + 1)):
+        s = c / max_cv
+        idx = [grey_lut_index(applied, k, s) for k in range(3)]
+        dl = [delta(k, idx[k]) for k in range(3)]
+        pred[c] = (gamma * (dl[0] - dl[1]), gamma * (dl[2] - dl[1]))
+    return out, {"changed": changed, "pred": pred, "entries": {"lo": ja, "hi": jb}}
+
+
 def repair_balance(curves: Mapping[str, Sequence[float]], reads: Mapping[int, Sequence[float]],
                    plan: Mapping[str, Sequence[int]], *, applied: Sequence[Sequence[float]],
                    primaries: Mapping[str, float], native_white_xy: Sequence[float], peak_luminance: float,
-                   max_cv: int = 1023, luminance_sigma: float = 0.0, z: float = DEFAULT_Z,
+                   span: Sequence[int], max_cv: int = 1023, luminance_sigma: float = 0.0, z: float = DEFAULT_Z,
                    envelope_codes: float = 16.0, gamma: float = 2.2,
-                   suspect: Optional[Sequence[tuple[int, int]]] = None,
-                   balance_sigma: Optional[float] = None) -> tuple[dict[str, list[float]], dict[str, Any]]:
-    """The balance-only repair. ``reads``: ``{wire code: XYZ}`` of the audit through the installed MHC (fine-tune
-    curve, viewing layers off); ``plan``: :func:`split_fit_held`. The envelope (+-``envelope_codes``) is fitted
-    on the FIT half only; spans are runs of fit codes whose r/g or b/g departs (light never decides a span);
-    inside a span each channel's light is scaled by ``target share / measured share`` with the target keeping
-    the grey's measured LIGHT and taking the envelope's balance, written at that channel's scan-out index
-    (:func:`grey_lut_index`) as a drive change ``factor^(1/gamma)`` (the panel's local response ~ drive^gamma;
-    the held-out verify measures what it really did). Factor exactly 1 at the bracketing fit codes, so every
-    entry outside a span is bit-identical. Returns ``(curves', report)``."""
+                   census: Optional[Sequence[Mapping[str, Any]]] = None) -> tuple[dict[str, list[float]], dict[str, Any]]:
+    """The balance-only repair over the operator's ``span``: SHAPED by the installed cube (:func:`cube_repair`),
+    CONFIRMED by the audit. ``reads``: ``{wire code: XYZ}`` through the installed MHC; ``plan``:
+    :func:`split_fit_held`. The measured balance departure of the FIT codes (``ln r/g``, ``ln b/g`` of the linear
+    native shares against an envelope fitted on the clean fit codes beside the cube's tint) is compared with the
+    cube's predicted departure at the same codes: ``k`` = the least-squares scale (the panel's response to a drive
+    imbalance relative to gamma 2.2 — it does not scale the correction: the departure is removed in the drive,
+    where the cube made it), and the reads must be explained (``max |measured - k*pred| <= tolerance`` and
+    ``0.5 <= k <= 2``) or the repair is ``confirmed: False`` (the flow refuses it). Tolerance =
+    ``z * max(noise, clean-code structure)``. Raises ValueError when the span is not valid
+    (:func:`validate_span`)."""
+    val = validate_span(curves, applied, span, max_cv=max_cv, census=census)
+    if not val["ok"]:
+        raise ValueError(val["problem"])
+    tints = val["tints"]
+    lo, hi = int(span[0]), int(span[1])
     P = _native_P(primaries, native_white_xy, peak_luminance)
     Pinv = invert3x3(P)
-    fit, vals, shares = _series(reads, plan["fit"], Pinv)
-    if len(fit) < 7:
-        raise ValueError(f"too few audited greys to repair from ({len(fit)} fit reads)")
+    fit, vals, _shares = _series(reads, [c for c in plan["fit"] if lo <= c <= hi], Pinv)
+    mask = [any(r["lo"] - REGION_MARGIN <= c <= r["hi"] + REGION_MARGIN for r in tints) for c in fit]
+    if sum(1 for m in mask if not m) < 6 or not any(mask):
+        raise ValueError(f"the audit has too few clean fit greys beside the tint ({sum(1 for m in mask if not m)}) "
+                         "or none inside it")
     xs = [float(c) for c in fit]
     bal = [[v[1] for v in vals], [v[2] for v in vals]]
-    sig = max(float(balance_sigma if balance_sigma is not None else luminance_sigma), _SIGMA_FLOOR)
-    if suspect:
-        # The census already says where the INSTALLED CUBE is tinted (a property of the LUT, not of the panel):
-        # the envelope is fitted on the fit codes OUTSIDE those runs only and bridges them, and the balance
-        # structure the tolerance scales with is measured on those clean codes — the defect cannot inflate
-        # its own tolerance (with a handful of reads a robust spread over all codes is the defect's own size).
-        mask = [any(lo - 1 <= c <= hi + 1 for lo, hi in suspect) for c in fit]
-        if sum(1 for m in mask if not m) < 6:
-            raise ValueError("too few clean audited greys beside the suspect runs to fit an envelope")
-        env = [_robust_envelope(xs, ys, envelope_codes, mask) for ys in bal]
-        structure = []
-        for k in range(2):
-            res = sorted(abs(bal[k][i] - env[k][i]) for i in range(len(fit)) if not mask[i])
-            structure.append(1.4826 * res[len(res) // 2])
-        tol = [z * max(sig, s) for s in structure]
-    else:
-        env, _mask, tol, structure = _tolerances(xs, bal, envelope_codes, sig, z)
-    bad = [any(abs(bal[k][i] - env[k][i]) > tol[k] for k in range(2)) for i in range(len(fit))]
-    spans: list[tuple[int, int]] = []
-    i = 0
-    while i < len(fit):
-        if bad[i]:
-            j = i
-            while j + 1 < len(fit) and bad[j + 1]:
-                j += 1
-            spans.append((max(0, i - 1), min(len(fit) - 1, j + 1)))
-            i = j + 1
-        else:
-            i += 1
-    merged: list[tuple[int, int]] = []
-    for a, b in spans:
-        if merged and fit[a] - fit[merged[-1][1]] <= envelope_codes / 2.0:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-        else:
-            merged.append((a, b))
+    env = [_robust_envelope(xs, ys, envelope_codes, mask) for ys in bal]
+    structure = []
+    for k in range(2):
+        res = sorted(abs(bal[k][i] - env[k][i]) for i in range(len(fit)) if not mask[i])
+        structure.append(1.4826 * res[len(res) // 2])
+    sig = max(float(luminance_sigma), _SIGMA_FLOOR)
+    tol = [z * max(sig, s) for s in structure]
+    # The correction region: the cube's tint(s) plus REGION_MARGIN codes each side — only there does the cube
+    # depart from its own envelope; the rest of the audited span is the clean reference the reads confirm against
+    # and stays bit-identical.
+    region = (max(lo, min(r["lo"] for r in tints) - REGION_MARGIN),
+              min(hi, max(r["hi"] for r in tints) + REGION_MARGIN))
+    fixed, info = cube_repair(curves, applied, region, primaries=primaries, native_white_xy=native_white_xy,
+                              peak_luminance=peak_luminance, max_cv=max_cv, gamma=gamma, pred_codes=fit)
+    meas = {c: (bal[0][i] - env[0][i], bal[1][i] - env[1][i]) for i, c in enumerate(fit)}
+    # CONFIRMATION: does the installed cube explain what the meter saw? The panel's own chromaticity is flat, so
+    # the measured balance of every audited grey should be the cube's drive balance through scan-out
+    # (ln d_r/d_g, ln d_b/d_g), times the panel's response k*gamma, plus a smooth panel term (a + b*code):
+    # fitted per series by least squares over ALL fit codes — the cube's own clean neighbourhood included, so no
+    # envelope stands between the two. The fit's residuals on the clean codes are the yardstick (z x their robust
+    # spread, never below the noise); every code must be explained within it and k must be physical.
+    conf = []
+    for k in range(2):
+        rows = []
+        for i, c in enumerate(fit):
+            d = scanout_grey_drive(curves, applied, c / max_cv)
+            bc = math.log(d[0] / d[1]) if k == 0 else math.log(d[2] / d[1])
+            rows.append((gamma * bc, 1.0, (c - lo) / max(1.0, hi - lo), bal[k][i], mask[i]))
+        A = [[sum(r[a] * r[b] for r in rows) for b in range(3)] for a in range(3)]
+        y = [sum(r[a] * r[3] for r in rows) for a in range(3)]
+        try:
+            coef = matvec(invert3x3(A), y)
+        except (ValueError, ZeroDivisionError):
+            coef = [0.0, 0.0, 0.0]
+        res = [r[3] - (coef[0] * r[0] + coef[1] * r[1] + coef[2] * r[2]) for r in rows]
+        clean = sorted(abs(v) for v, r in zip(res, rows) if not r[4])
+        ytol = z * max(sig, 1.4826 * clean[len(clean) // 2] if clean else 0.0)
+        # how much tint the cube puts in this series over the region (only a series with a real departure
+        # carries information about k)
+        spread = max(r[0] for r in rows) - min(r[0] for r in rows)
+        conf.append({"k": coef[0], "worst": max(abs(v) for v in res) / ytol if ytol > 0 else 0.0,
+                     "tol": ytol, "informative": spread > 2.0 * ytol})
+    kscale = conf[0]["k"]
+    unexplained = max(c_["worst"] for c_ in conf)
+    predicted_max = max(max(abs(v[0]), abs(v[1])) for v in info["pred"].values())
+    measured_max = max(max(abs(meas[c][0]), abs(meas[c][1])) for c in fit)
+    confirmed = unexplained <= 1.0 and all(0.5 <= c_["k"] <= 2.0 for c_ in conf if c_["informative"]) \
+        and any(c_["informative"] for c_ in conf)
+    aimed = []
+    for c in fit:
+        if any(r["lo"] <= c <= r["hi"] for r in tints):
+            i = fit.index(c)
+            y = reads[c][1]
+            er, eb = math.exp(env[0][i]), math.exp(env[1][i])
+            g = y / (P[1][0] * er + P[1][1] + P[1][2] * eb)
+            xyz_t = matvec(P, [er * g, g, eb * g])
+            tot = sum(xyz_t)
+            aimed.append({"code": c, "x": round(xyz_t[0] / tot, 5), "y": round(xyz_t[1] / tot, 5)})
     n = len(curves["r"])
-    out = {ch: list(curves[ch]) for ch in ("r", "g", "b")}
-    rows = []
-    for a, b in merged:
-        pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
-        aimed = []
-        for i in range(a, b + 1):
-            c = fit[i]
-            if i in (a, b) and not bad[i]:
-                fac = (1.0, 1.0, 1.0)
-            else:
-                m = shares[i]
-                er, eb = math.exp(env[0][i]), math.exp(env[1][i])
-                y = reads[c][1]                                       # the grey's measured light, kept
-                g = y / (P[1][0] * er + P[1][1] + P[1][2] * eb)
-                tgt = (er * g, g, eb * g)
-                fac = tuple(tgt[k] / m[k] for k in range(3))
-                xyz_t = matvec(P, list(tgt))
-                tot = sum(xyz_t)
-                aimed.append({"code": c, "x": round(xyz_t[0] / tot, 5), "y": round(xyz_t[1] / tot, 5),
-                              "factor": [round(f, 5) for f in fac]})
-            for k in range(3):
-                pts[k].append((grey_lut_index(applied, k, c / max_cv), fac[k]))
-        changed = {}
-        for k, ch in enumerate(("r", "g", "b")):
-            xs_k = [p[0] for p in pts[k]]
-            fs_k = [p[1] for p in pts[k]]
-            j0 = max(0, int(math.floor(xs_k[0] * (n - 1))) + 1)
-            j1 = min(n - 1, int(math.ceil(xs_k[-1] * (n - 1))) - 1)
-            maxd, t = 0.0, 0
-            for j in range(j0, j1 + 1):
-                x = j / (n - 1)
-                while t + 1 < len(xs_k) - 1 and xs_k[t + 1] < x:
-                    t += 1
-                x0, x1 = xs_k[t], xs_k[t + 1]
-                f = fs_k[t] + (fs_k[t + 1] - fs_k[t]) * ((x - x0) / (x1 - x0) if x1 > x0 else 0.0)
-                if f == 1.0:
-                    continue
-                new = float(curves[ch][j]) * f ** (1.0 / gamma)
-                out[ch][j] = min(max(new, 0.0), 1.0)
-                maxd = max(maxd, abs(out[ch][j] / float(curves[ch][j]) - 1.0) if curves[ch][j] > 0 else 0.0)
-            limited = _slope_safe(out[ch], curves[ch], j0, j1)
-            changed[ch] = {"entries": [j0, j1], "max_drive_change_pct": round(100.0 * maxd, 3),
-                           "slope_limited": limited}
-        rows.append({"codes": [fit[a], fit[b]], "changed": changed, "aimed": aimed,
-                     "max_departure_pct": round(100.0 * max(
-                         abs(math.exp(bal[k][i] - env[k][i]) - 1.0) for i in range(a, b + 1) for k in range(2)), 3)})
     report = {
-        "spans": rows, "fit_codes": len(fit), "envelope_codes": envelope_codes, "z": z,
+        "spans": [{"codes": list(region), "audit": [lo, hi], "tints": [[r["lo"], r["hi"]] for r in tints],
+                   "changed": info["changed"],
+                   "aimed": aimed, "max_departure_pct": round(100.0 * (math.exp(measured_max) - 1.0), 3)}],
+        "confirmation": {"confirmed": confirmed, "k": round(kscale, 4),
+                         "per_series": [{"series": nm, "k": round(c_["k"], 4), "informative": c_["informative"],
+                                         "worst_over_tolerance": round(c_["worst"], 3),
+                                         "tolerance_pct": round(100.0 * (math.exp(c_["tol"]) - 1.0), 3)}
+                                        for nm, c_ in zip(("r/g", "b/g"), conf)],
+                         "unexplained_over_tolerance": round(unexplained, 3),
+                         "predicted_max_pct": round(100.0 * (math.exp(predicted_max) - 1.0), 3),
+                         "measured_max_pct": round(100.0 * (math.exp(measured_max) - 1.0), 3)},
+        "fit_codes": len(fit), "z": z, "envelope_codes": envelope_codes,
         "tolerance_pct": {"r/g": round(100.0 * (math.exp(tol[0]) - 1.0), 3),
                           "b/g": round(100.0 * (math.exp(tol[1]) - 1.0), 3)},
         "structure_pct": {"r/g": round(100.0 * structure[0], 3), "b/g": round(100.0 * structure[1], 3)},
         "noise_pct": round(100.0 * sig, 4),
         "envelope": {"codes": fit, "rg": [round(v, 7) for v in env[0]], "bg": [round(v, 7) for v in env[1]]},
-        "unchanged_entries": sum(1 for ch in ("r", "g", "b") for j in range(n) if out[ch][j] == curves[ch][j]),
+        "unchanged_entries": sum(1 for ch in ("r", "g", "b") for j in range(n) if fixed[ch][j] == curves[ch][j]),
+        "proposals": val["proposals"],
     }
-    return out, report
+    return fixed, report
+
 
 
 def read_repeatability(rows: Sequence[Mapping[str, Any]]) -> float:
@@ -514,6 +639,22 @@ def judge_after(before: Mapping[int, Sequence[float]], after: Mapping[int, Seque
         if len(pre[k]) >= 3:
             spread_b = 1.4826 * sorted(abs(v) for v in pre[k])[len(pre[k]) // 2]
             tol_b[k] = max(tol_b[k], z * spread_b)
+    # The pass-to-pass balance drift (a channel warming between the audit and the verify): the codes BESIDE the
+    # correction read the same LUT entries in both passes, so the median change of their balance is the drift —
+    # removed everywhere, as the light drift is.
+    bdrift = [0.0, 0.0]
+    chg: list[list[float]] = [[], []]
+    for c in held_out:
+        b0, a0 = before.get(c), after.get(c)
+        if b0 is None or a0 is None or any(lo <= c <= hi for lo, hi in spans):
+            continue
+        sb_, sa_ = matvec(Pinv, list(b0)), matvec(Pinv, list(a0))
+        if all(v > 0 for v in sb_) and all(v > 0 for v in sa_):
+            chg[0].append(math.log(sa_[0] / sa_[1]) - math.log(sb_[0] / sb_[1]))
+            chg[1].append(math.log(sa_[2] / sa_[1]) - math.log(sb_[2] / sb_[1]))
+    for k in range(2):
+        if len(chg[k]) >= 3:
+            bdrift[k] = sorted(chg[k])[len(chg[k]) // 2]
     rows, out = [], []
     for c in held_out:
         b0, a0 = before.get(c), after.get(c)
@@ -525,8 +666,8 @@ def judge_after(before: Mapping[int, Sequence[float]], after: Mapping[int, Seque
             rows.append({"code": c, "status": "unusable"})
             continue
         where = "inside" if any(lo <= c <= hi for lo, hi in spans) else "beside"
-        drg = math.log(sh[0] / sh[1]) - interp(ecodes, erg, c)
-        dbg = math.log(sh[2] / sh[1]) - interp(ecodes, ebg, c)
+        drg = math.log(sh[0] / sh[1]) - bdrift[0] - interp(ecodes, erg, c)
+        dbg = math.log(sh[2] / sh[1]) - bdrift[1] - interp(ecodes, ebg, c)
         dl = math.log(a0[1] / b0[1]) - drift
         tot = sum(a0)
         missed = [nm for nm, v, t in (("r/g", drg, tol_b[0]), ("b/g", dbg, tol_b[1])) if abs(v) > t]
@@ -545,6 +686,7 @@ def judge_after(before: Mapping[int, Sequence[float]], after: Mapping[int, Seque
             "inside": sum(1 for r in rows if r.get("where") == "inside"),
             "beside": sum(1 for r in rows if r.get("where") == "beside"),
             "light_drift_pct": round(100.0 * (math.exp(drift) - 1.0), 3),
+            "balance_drift_pct": [round(100.0 * (math.exp(v) - 1.0), 3) for v in bdrift],
             "tolerance_pct": {"r/g": round(100.0 * (math.exp(tol_b[0]) - 1.0), 3),
                               "b/g": round(100.0 * (math.exp(tol_b[1]) - 1.0), 3),
                               "light_beside": round(100.0 * (math.exp(tol_l) - 1.0), 3)}}

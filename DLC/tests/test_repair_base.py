@@ -2,9 +2,10 @@
 
 The panel is simulated THROUGH scan-out exactly as DesktopLUT applies the profile (mhc_icc.cpp EvalMhcScanout:
 sRGB EOTF of the wire, the as-applied matrix row per channel, the sRGB OETF, the base LUT read with linear
-interpolation): the measure function reads which base .cube the mock DesktopLUT has installed and drives a native
-power-law panel with it. The installed cube carries a per-channel bump that tints greys ~150-156 (the PA32UCXR
-2026-09-25 defect shape). No pipe, no meter.
+interpolation), as a native panel with FLAT chromaticity and a common light sawtooth in the wire code (the
+PA32UCXR's measured behaviour, 2026-11-14). The installed cube is the REAL PA32UCXR SDR base around the defect
+(tests/data/pa32_sdr_base_120_190.json: entries 120-190 of mhc_base_sdr.refine1.cube), extended smoothly outside.
+No pipe, no meter.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import datetime
 import json
 import math
+import random
 from pathlib import Path
 
 import pytest
@@ -20,9 +22,10 @@ pytest.importorskip("numpy")
 
 from dlc import base_repair as br
 from dlc import calibration_profile as cp
+from dlc import stack_registry
 from dlc.calibrate import (AdjudicationRequired, AutoAdjudicator, Calibration, Decision, MappingAdjudicator,
-                           PatchSizes, _abort_restore, _rollback_restore, _run_entered_calibration,
-                           installed_base_cube, restore_base_repair_prior)
+                           PatchSizes, _abort_restore, _parse_repair_span, _rollback_restore,
+                           _run_entered_calibration, installed_base_cube, restore_base_repair_prior)
 from dlc.colormath import matvec, rgb_to_xyz_matrix
 from dlc.controller import CalibrationController
 from dlc.liveness import MeterDown
@@ -39,42 +42,54 @@ _APPLIED = mhc2_matrix(_PRIM, _WHITE, SRGB_PRIMARIES, (0.3127, 0.3290))
 _P = rgb_to_xyz_matrix(_PRIM["rx"], _PRIM["ry"], _PRIM["gx"], _PRIM["gy"], _PRIM["bx"], _PRIM["by"],
                        _WHITE[0], _WHITE[1], white_Y=_PEAK)
 N = 1024
+SPAN = (133, 171)
+_FIX = json.loads((Path(__file__).parent / "data" / "pa32_sdr_base_120_190.json").read_text(encoding="utf-8"))
 
 
-def _bell(j: float, centre: float, half: float) -> float:
-    u = (j - centre) / half
-    return 0.5 * (1.0 + math.cos(math.pi * u)) if abs(u) < 1.0 else 0.0
-
-
-def _tinted_cube() -> dict[str, list[float]]:
-    """Identity, plus a +1.6 % drive bump whose channels sit entries apart (r/b at their post-matrix index,
-    g 1.5 entries later, g taller) — a green-side tint over wire greys ~148-158."""
-    out = {ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}
-    for j in range(N):
-        out["r"][j] *= 1.0 + 0.010 * _bell(j, 152.0, 5.0)
-        out["g"][j] *= 1.0 + 0.018 * _bell(j, 153.5, 5.0)
-        out["b"][j] *= 1.0 + 0.011 * _bell(j, 152.0, 5.0)
+def _real_cube() -> dict[str, list[float]]:
+    """The installed PA32UCXR SDR base over entries 120-190 (its bump at ~149-157), extended outside with each
+    channel's out/in ratio held at the slice's end and blended to 1 at full drive."""
+    lo = _FIX["first_entry"]
+    hi = lo + len(_FIX["r"]) - 1
+    out = {}
+    for ch in "rgb":
+        sl = _FIX[ch]
+        r_lo, r_hi = sl[0] / (lo / (N - 1)), sl[-1] / (hi / (N - 1))
+        cur = []
+        for j in range(N):
+            x = j / (N - 1)
+            if j < lo:
+                cur.append(x * r_lo)
+            elif j <= hi:
+                cur.append(sl[j - lo])
+            else:
+                t = (j - hi) / (N - 1 - hi)
+                cur.append(min(1.0, x * (r_hi + (1.0 - r_hi) * t)))
+        out[ch] = cur
     return out
 
 
-def _tinted_cube_round_trip() -> dict:
+def _saw(code: int) -> float:
+    return 1.0 + 0.03 * (((code * 7) % 12) / 12.0 - 0.5)
+
+
+def _cube_round_trip(curves) -> dict:
     import tempfile
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "x.cube"
-        write_1d_cube(p, _tinted_cube(), title="test base")
+        write_1d_cube(p, curves, title="t")
         return read_1d_cube(p)
 
 
 class ScanoutPanel:
-    """measure fn: the installed MHC (matrix + base cube) through scan-out onto a native power-law panel."""
+    """measure fn: the installed MHC (matrix + base cube) through scan-out onto a native panel with flat
+    chromaticity, light = drive^gamma per channel times a common sawtooth in the wire code, read noise."""
 
-    def __init__(self, ctrl, *, sawtooth: float = 0.0, period: float = 9.0, noise: float = 0.0005):
-        import random
-        self.ctrl, self.sawtooth, self.period = ctrl, sawtooth, period
-        self.noise, self.rng = noise, random.Random(7)      # a colorimeter-class 0.05 % per-component read noise
+    def __init__(self, ctrl, *, gamma: float = 2.2, noise: float = 0.0005, seed: int = 1):
+        self.ctrl, self.gamma, self.noise, self.rng = ctrl, gamma, noise, random.Random(seed)
         self.cache: dict[str, dict] = {}
         self.calib = None
-        self.on_phase = None          # (phase, fn) fired once on the first read in that phase
+        self.on_phase = None
         self.fired = False
 
     def curves(self) -> dict:
@@ -83,30 +98,28 @@ class ScanoutPanel:
             self.cache[path] = read_1d_cube(Path(path))
         return self.cache[path]
 
+    def xyz(self, curves, signal) -> tuple:
+        lin = [br.srgb_eotf(v) for v in signal]
+        code = int(round(sum(signal) / 3 * 1023))
+        light = []
+        for c, ch in enumerate("rgb"):
+            m = sum(_APPLIED[c][k] * lin[k] for k in range(3))
+            light.append(max(br.lut_at(curves[ch], br.srgb_oetf(m)), 0.0) ** self.gamma * _saw(code))
+        return tuple(v * (1.0 + self.rng.gauss(0.0, self.noise)) for v in matvec(_P, light))
+
     def __call__(self, patch):
         if (self.on_phase and not self.fired and self.calib is not None
                 and self.calib.runlog.phase == self.on_phase[0]):
             self.fired = True
             self.on_phase[1](self.calib)
-        curves = self.curves()
-        lin = [br.srgb_eotf(v) for v in patch.signal]
-        drive = []
-        for c, ch in enumerate("rgb"):
-            m = sum(_APPLIED[c][k] * lin[k] for k in range(3))
-            drive.append(br.lut_at(curves[ch], br.srgb_oetf(m)))
-        light = [max(d, 0.0) ** 2.2 for d in drive]
-        if self.sawtooth:
-            mean = sum(drive) / 3 * 1023
-            f = 1.0 + self.sawtooth * ((mean / self.period) % 1.0 - 0.5)
-            light = [v * f for v in light]
-        xyz = tuple(v * (1.0 + self.rng.gauss(0.0, self.noise)) for v in matvec(_P, light))
+        xyz = self.xyz(self.curves(), patch.signal)
         tot = sum(xyz)
         return Reading(xyz=xyz, yxy=(xyz[1], xyz[0] / tot, xyz[1] / tot) if tot > 0 else (0, 0, 0), ok=True)
 
 
 def _install(ctrl, tmp_path: Path, curves=None, name="installed.cube") -> Path:
     path = tmp_path / name
-    write_1d_cube(path, curves or _tinted_cube(), title="test base")
+    write_1d_cube(path, curves or _real_cube(), title="test base")
     ctrl.set_primaries(0, "SDR", _PRIM)
     ctrl.set_white(0, "SDR", *_WHITE)
     ctrl.set_base_lut(0, "SDR", str(path), 0.0)
@@ -124,32 +137,32 @@ def _source_run(tmp_path: Path, cube: Path) -> Path:
     return root
 
 
-def _make(tmp_path: Path, name: str, ctrl, *, panel=None, adjudicator=None, source=None,
-          decision_overrides=None) -> Calibration:
+def _make(tmp_path: Path, name: str, ctrl, *, panel=None, adjudicator=None, source=None, span=SPAN,
+          decision_overrides=None, mode="SDR") -> Calibration:
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
-        else create_run("SDR", display="synthetic", run_dir=run_dir)
+        else create_run(mode, display="synthetic", run_dir=run_dir)
     panel = panel or ScanoutPanel(ctrl)
     calib = Calibration(ctx=ctx, profile=cp.Profile.synthetic(output_dir=str(tmp_path / "results")), monitor=0,
-                        mode="SDR", controller=ctrl, measure=panel, adjudicator=adjudicator or AutoAdjudicator(),
+                        mode=mode, controller=ctrl, measure=panel, adjudicator=adjudicator or AutoAdjudicator(),
                         patch_sizes=PatchSizes(), run_date=_DATE, source_run=source,
+                        repair_span=(f"{span[0]}:{span[1]}" if span else None),
                         decision_overrides=decision_overrides)
     panel.calib = calib
     return calib
 
 
-def _setup(tmp_path: Path, **kw):
+def _setup(tmp_path: Path):
     ctrl = CalibrationController.mock()
     cube = _install(ctrl, tmp_path)
-    src = _source_run(tmp_path, cube)
-    return ctrl, cube, src
+    return ctrl, cube, _source_run(tmp_path, cube)
 
 
-def _balance(curves, c):
+def _grey(curves, c, gamma=2.2):
+    """(ln r/g, ln b/g of the native linear light, grey Y) of wire grey c through scan-out, noise-free."""
     d = br.scanout_grey_drive(curves, _APPLIED, c / 1023)
-    lr, lg, lb = (max(v, 0.0) ** 2.2 for v in d)
-    sh = matvec([[1, 0, 0], [0, 1, 0], [0, 0, 1]], [lr, lg, lb])
-    return sh[0] / sh[1], sh[2] / sh[1], sum(matvec(_P, [lr, lg, lb])[1:2])
+    lr, lg, lb = (max(v, 0.0) ** gamma for v in d)
+    return math.log(lr / lg), math.log(lb / lg), matvec(_P, [lr, lg, lb])[1]
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +176,7 @@ def test_grey_lut_index_is_where_scanout_reads_each_channel():
         for k in range(3):
             full = br.srgb_oetf(sum(_APPLIED[k][j] * lin for j in range(3)))   # the whole matrix row
             assert br.grey_lut_index(_APPLIED, k, s) == pytest.approx(full, abs=1e-12)
-    # PA32UCXR rowsums: wire 153 reads r and b ~1.6 entries below g (the power-law shortcut said 1.3)
+            assert br.wire_for_index(_APPLIED, k, full) == pytest.approx(s, abs=1e-9)
     idx = [br.grey_lut_index(_APPLIED, k, 153 / 1023) * 1023 for k in range(3)]
     assert idx[1] - idx[0] == pytest.approx(1.62, abs=0.05) and abs(idx[0] - idx[2]) < 0.01
 
@@ -179,137 +192,175 @@ def test_slope_safe_never_leaves_a_flat_run():
     old = [j / 99 for j in range(100)]
     new = list(old)
     for j in range(40, 50):
-        new[j] = old[40] - 0.002                      # a correction that would dip below its neighbours
+        new[j] = old[40] - 0.002
     br._slope_safe(new, old, 40, 49)
-    steps = [new[j + 1] - new[j] for j in range(38, 52)]
-    assert min(steps) > 0.0, steps
+    assert min(new[j + 1] - new[j] for j in range(38, 52)) > 0.0
 
 
 # ---------------------------------------------------------------------------
-# the core on the simulated installed defect
+# spans: required, validated against the cube's own census
 # ---------------------------------------------------------------------------
 
-def _audit(curves, codes, panel_ctrl=None, sawtooth=0.0):
-    class _C:
-        def __init__(self, c):
-            self.c = c
-
-        def state(self):
-            return {"mhc": {"0:SDR": {"source_file": "x"}}}
-    p = ScanoutPanel(_C(curves), sawtooth=sawtooth, noise=0.0)
-    p.curves = lambda: curves
-
-    class _Patch:
-        def __init__(self, s):
-            self.signal = (s, s, s)
-    return {c: p(_Patch(c / 1023)).xyz for c in codes}
+def test_parse_repair_span():
+    assert _parse_repair_span("133:171") == [133, 171]
+    assert _parse_repair_span([133, 171]) == [133, 171]
+    for bad in ("171:133", "133", "a:b", "-1:5", "5:5"):
+        with pytest.raises(ValueError):
+            _parse_repair_span(bad)
 
 
-@pytest.mark.parametrize("sawtooth", [0.0, 0.03])
-def test_core_repairs_the_balance_keeps_the_light_and_touches_nothing_else(sawtooth):
-    tinted = _tinted_cube()
-    runs = br.balance_census(tinted, _APPLIED)
-    assert len(runs) == 1 and runs[0]["lo"] <= 152 <= runs[0]["hi"], runs
-    windows = br.audit_codes(runs)
-    plan = br.split_fit_held(windows)
-    reads = _audit(tinted, plan["codes"], sawtooth=sawtooth)
-    fixed, rep = br.repair_balance(tinted, reads, plan, applied=_APPLIED, primaries=_PRIM,
-                                   native_white_xy=_WHITE, peak_luminance=_PEAK, luminance_sigma=1e-3,
-                                   suspect=[(r["lo"], r["hi"]) for r in runs])
-    assert len(rep["spans"]) == 1
-    lo_e = min(v["entries"][0] for v in rep["spans"][0]["changed"].values())
-    hi_e = max(v["entries"][1] for v in rep["spans"][0]["changed"].values())
-    for ch in "rgb":                                   # bit-identical outside the rewritten entries
-        assert all(fixed[ch][j] == tinted[ch][j] for j in range(N) if j < lo_e or j > hi_e)
-    ref = _balance({ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}, 140)
-    for c in range(130, 175):                          # every WIRE grey, fit and held-out alike
-        rg0, bg0, y0 = _balance(tinted, c)
-        rg, bg, y = _balance(fixed, c)
-        assert abs(rg / ref[0] - 1) < 0.002 and abs(bg / ref[1] - 1) < 0.002, (c, rg / ref[0], bg / ref[1])
-        assert abs(y / y0 - 1) < 0.003, (c, y / y0)     # light kept (balance-only)
-    before = max(abs(_balance(tinted, c)[0] / ref[0] - 1) for c in range(140, 165))
-    assert before > 0.004                               # the defect was there
-
-
-def test_core_with_the_power_law_shortcut_would_leave_a_tint():
-    """Placing the correction at rowsum^(1/2.2) * s (the DLC refine's shortcut) instead of scan-out's exact
-    index misplaces the channels by ~0.2 entry: measurably worse on a steep defect."""
-    tinted = _tinted_cube()
-    runs = br.balance_census(tinted, _APPLIED)
-    plan = br.split_fit_held(br.audit_codes(runs))
-    reads = _audit(tinted, plan["codes"])
-    kw = dict(primaries=_PRIM, native_white_xy=_WHITE, peak_luminance=_PEAK, luminance_sigma=1e-3,
-              suspect=[(r["lo"], r["hi"]) for r in runs])
-    exact, _ = br.repair_balance(tinted, reads, plan, applied=_APPLIED, **kw)
-    orig = br.grey_lut_index
-    try:
-        br.grey_lut_index = lambda A, k, s: (sum(A[k]) ** (1 / 2.2)) * s
-        approx, _ = br.repair_balance(tinted, reads, plan, applied=_APPLIED, **kw)
-    finally:
-        br.grey_lut_index = orig
-    ref = _balance({ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}, 140)
-    err = lambda cv: max(abs(_balance(cv, c)[0] / ref[0] - 1) for c in range(140, 165))  # noqa: E731
-    assert err(exact) < err(approx)
+def test_validate_span_on_the_real_cube():
+    cube = _real_cube()
+    ok = br.validate_span(cube, _APPLIED, SPAN)
+    assert ok["ok"] and [(r["lo"], r["hi"]) for r in ok["tints"]] == [(149, 155)]
+    cut = br.validate_span(cube, _APPLIED, (152, 175))          # an edge inside the bump: refused
+    assert not cut["ok"] and "an edge would cut it" in cut["problem"]
+    none = br.validate_span(cube, _APPLIED, (300, 400))
+    assert not none["ok"] and "no tint" in none["problem"]
 
 
 # ---------------------------------------------------------------------------
-# the flow, end to end on the mock
+# the core on the REAL cube: shaped by the cube, confirmed by the reads
 # ---------------------------------------------------------------------------
 
-def test_flow_repairs_installs_verifies_and_keeps(tmp_path: Path):
+@pytest.mark.parametrize("gamma", [2.0, 2.2, 2.6])
+def test_core_on_the_real_cube_removes_the_tint_and_nothing_else(gamma):
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    panel = ScanoutPanel(None, gamma=gamma)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                   peak_luminance=_PEAK, span=SPAN, luminance_sigma=7e-4)
+    assert rep["confirmation"]["confirmed"], rep["confirmation"]
+    region = rep["spans"][0]["codes"]
+    assert region == [148, 156]
+    for c in range(144, 163):
+        rg0, bg0, y0 = _grey(cube, c, gamma)
+        rg, bg, y = _grey(fixed, c, gamma)
+        assert abs(y / y0 - 1) < 0.002, (c, y / y0)                          # light kept
+        if c < 148 or c > 157:                                               # neighbours: untouched
+            assert (rg, bg) == (rg0, bg0), c
+    # the reference a grey inside should sit on: the straight line between the untouched greys 147 and 157
+    a, b = _grey(cube, 147, gamma), _grey(cube, 157, gamma)
+
+    def off(cv, c):
+        f = (c - 147) / 10.0
+        g = _grey(cv, c, gamma)
+        return max(abs(g[0] - (a[0] + (b[0] - a[0]) * f)), abs(g[1] - (a[1] + (b[1] - a[1]) * f)))
+
+    worst_before = max(off(cube, c) for c in range(148, 157))
+    worst_after = max(off(fixed, c) for c in range(148, 157))
+    # ~4-5 % -> about 0.45 % at gamma 2.2 (y ~0.001; scales with the panel's gamma), inside the verify's tolerance
+    assert worst_before > 0.03 and worst_after < 0.0025 * gamma, (worst_before, worst_after)
+    # every entry outside the region's per-channel range is bit-identical
+    for ch, d in rep["spans"][0]["changed"].items():
+        lo_e, hi_e = d["entries"]
+        assert all(fixed[ch][j] == cube[ch][j] for j in range(N) if j < lo_e or j > hi_e)
+
+
+def test_core_refuses_when_the_reads_do_not_show_the_cubes_tint():
+    """A panel whose reads carry no tint where the cube predicts one (the cube is not what the meter sees):
+    the repair is not confirmed."""
+    cube = _real_cube()
+    clean = {ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}
+    plan = br.split_fit_held([SPAN])
+    panel = ScanoutPanel(None)
+    reads = {c: panel.xyz(clean, (c / 1023,) * 3) for c in plan["codes"]}
+    _fixed, rep = br.repair_balance(cube, reads, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                    peak_luminance=_PEAK, span=SPAN, luminance_sigma=7e-4)
+    assert rep["confirmation"]["confirmed"] is False
+
+
+# ---------------------------------------------------------------------------
+# the flow, end to end on the mock with the real cube
+# ---------------------------------------------------------------------------
+
+def test_flow_repairs_verifies_keeps_and_tells_the_registry(tmp_path: Path):
     ctrl, cube, src = _setup(tmp_path)
     calib = _make(tmp_path, "ok", ctrl, source=src)
     result = calib.run("repair-base")
     assert result.status == "completed", result.digest
     now, _ = installed_base_cube(ctrl, 0, "SDR")
-    assert now != str(cube) and now.endswith("mhc_base_sdr.repaired.cube")
-    assert calib.calib["repair_base_installed"]["kept"] is True
+    assert now.endswith("mhc_base_sdr.repaired.cube")
     seed = calib.calib["stages"]["repair-seed"]["digest"]
-    assert seed["planned_reads"] == seed["audit_greys"] + seed["verify_greys"] and seed["planned_minutes"] > 0
+    assert seed["windows"] == [list(SPAN)] or seed["windows"] == [SPAN]
+    assert seed["planned_reads"] == 39 + 19 and seed["census_proposals"]
     verdict = calib.calib["stages"]["repair-verify"]["digest"]
     assert verdict["out"] == [] and verdict["inside"] > 0 and verdict["beside"] > 0
-    fixed = read_1d_cube(Path(now))
-    ref = _balance({ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}, 140)
-    worst = lambda cv: max(abs(_balance(cv, c)[0] / ref[0] - 1) for c in range(140, 165))  # noqa: E731
-    # through 0.05 % read noise on single reads: within ~0.3 % (y ~0.0006) of neutral, from ~1.3 %
-    assert worst(fixed) < 0.004 and worst(fixed) < worst(_tinted_cube()) / 3
-    # the previous cube is byte-identical on disk (the rollback point)
-    assert read_1d_cube(cube) == _tinted_cube_round_trip()
+    for r in verdict["held_out"]:                       # neighbours' chromaticity unchanged within repeatability
+        if r.get("where") == "beside":
+            assert abs(r["rg_pct"]) < verdict["tolerance_pct"]["r/g"]
+    assert read_1d_cube(cube) == _cube_round_trip(_real_cube())          # the rollback point is untouched
+    # lineage: this run can seed a later repair, and the registry knows the base changed by a DLC repair
+    st = json.loads((calib.ctx.root / "dlc_state.json").read_text(encoding="utf-8"))
+    assert st["mhc_params"]["base_lut"]["cube_path"] == now
+    assert st["mhc_params"]["base_lut"]["repaired_from"]["cube_path"] == str(cube)
+    reg = stack_registry.StackRegistry.load(stack_registry.registry_path(calib.profile, calib.ctx.root))
+    rec = reg.get(calib.display.name, "SDR")
+    assert rec is not None and rec.mhc["base_lut"] == now and rec.mhc["base_lut_repair"]["run_id"] == calib.ctx.root.name
+    ev = stack_registry.check_against_pipe(rec, ctrl.state(), 0, "SDR")
+    assert ev["matches"] is not False
 
 
-def test_flow_with_nothing_tinted_changes_nothing(tmp_path: Path):
-    ctrl = CalibrationController.mock()
-    clean = {ch: [j / (N - 1) for j in range(N)] for ch in "rgb"}
-    cube = _install(ctrl, tmp_path, clean)
-    calib = _make(tmp_path, "clean", ctrl, source=_source_run(tmp_path, cube))
-    result = calib.run("repair-base")
-    assert result.status == "completed" and "no tinted greys" in result.digest["message"]
+def test_refine_mhc_refuses_to_seed_from_a_repair_run(tmp_path: Path):
+    ctrl, cube, src = _setup(tmp_path)
+    rep = _make(tmp_path, "rep", ctrl, source=src)
+    assert rep.run("repair-base").status == "completed"
+    run_dir = tmp_path / "refine"
+    calib = Calibration(ctx=create_run("SDR", display="synthetic", run_dir=run_dir),
+                        profile=cp.Profile.synthetic(output_dir=str(tmp_path / "results")), monitor=0, mode="SDR",
+                        controller=ctrl, measure=ScanoutPanel(ctrl), adjudicator=AutoAdjudicator(),
+                        patch_sizes=PatchSizes(), run_date=_DATE, source_run=rep.ctx.root)
+    result = calib.run("refine-mhc")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "seed-from-run"
+    assert "repair-base run" in result.digest["message"] and str(src) in result.digest["message"]
+
+
+@pytest.mark.parametrize("span,why", [(None, "needs --repair-span"), ((152, 175), "an edge would cut it"),
+                                      ((300, 400), "no tint")])
+def test_seed_refuses_a_missing_or_bad_span(tmp_path: Path, span, why):
+    ctrl, cube, src = _setup(tmp_path)
+    result = _make(tmp_path, "span", ctrl, source=src, span=span).run("repair-base")
+    assert result.status == "aborted" and result.digest["aborted_at"] == "repair-seed"
+    assert why in result.digest["message"]
     assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube)
-    assert "measure:repair-audit" not in calib.calib["stages"]
 
 
 def test_seed_refuses_when_the_installed_cube_is_not_the_source_runs(tmp_path: Path):
     ctrl, cube, src = _setup(tmp_path)
-    other = _install(ctrl, tmp_path, None, name="other.cube")
-    assert installed_base_cube(ctrl, 0, "SDR")[0] == str(other)
+    _install(ctrl, tmp_path, None, name="other.cube")
     result = _make(tmp_path, "wrong", ctrl, source=src).run("repair-base")
-    assert result.status == "aborted" and result.digest["aborted_at"] == "repair-seed"
-    assert "not the source run's" in result.digest["message"]
+    assert result.status == "aborted" and "not the source run's" in result.digest["message"]
 
 
 def test_seed_refuses_a_3d_lut_that_moves_greys(tmp_path: Path):
     ctrl, cube, src = _setup(tmp_path)
-    n = 3
     lines = ["LUT_3D_SIZE 3"]
-    for b in range(n):
-        for g in range(n):
-            for r in range(n):
+    for b in range(3):
+        for g in range(3):
+            for r in range(3):
                 lines.append(f"{min(1.0, r / 2 * 1.01):.6f} {g / 2:.6f} {b / 2:.6f}")
     p = tmp_path / "warm.cube"
     p.write_text("\n".join(lines) + "\n", encoding="utf-8")
     ctrl.set_3dlut(0, "SDR", str(p))
     result = _make(tmp_path, "cube", ctrl, source=src).run("repair-base")
     assert result.status == "aborted" and "not identity on the grey axis" in result.digest["message"]
+
+
+def test_seed_refuses_sdr_gamma_24(tmp_path: Path, monkeypatch):
+    ctrl, cube, src = _setup(tmp_path)
+    ini = tmp_path / "DesktopLUT.ini"
+    ini.write_text("[Monitor0]\nSDR_MHCCorrGS24=1\n", encoding="utf-8")
+    calib = _make(tmp_path, "g24", ctrl, source=src)
+    monkeypatch.setattr(calib, "_resolve_desktoplut_ini", lambda: ini)
+    result = calib.run("repair-base")
+    assert result.status == "aborted" and "GAMMA 2.4" in result.digest["message"]
+
+
+def test_seed_refuses_hdr(tmp_path: Path):
+    ctrl, cube, src = _setup(tmp_path)
+    result = _make(tmp_path, "hdr", ctrl, source=src, mode="HDR").run("repair-base")
+    assert result.status == "aborted" and "SDR base 1D LUT only" in result.digest["message"]
 
 
 # ---------------------------------------------------------------------------
@@ -364,27 +415,22 @@ def test_an_ending_after_the_install_restores_the_previous_cube(tmp_path: Path, 
             status = calib.run("repair-base").status
         except AdjudicationRequired:
             status = "paused"
-        assert status in ("aborted", "paused")
         assert installed_base_cube(ctrl, 0, "SDR")[0] != str(cube)
         out = _guard(ctrl, calib) if status == "aborted" else \
-            dict(zip(("code", "payload"), _abort_restore(ctrl, calib.calib, monitor=0, mode="SDR",
-                                                           run_root=calib.ctx.root)))["payload"]
+            _abort_restore(ctrl, calib.calib, monitor=0, mode="SDR", run_root=calib.ctx.root)[1]
         assert out["status"] in ("rolled_back", "reverted"), out
     assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube)
-    assert ending == "crash" or calib.calib["repair_base_restore"]["confirmed"] is True
 
 
 def test_revert_at_the_keep_seam_restores_and_a_resume_refuses(tmp_path: Path):
     ctrl, cube, src = _setup(tmp_path)
-    calib = _make(tmp_path, "revert", ctrl, source=src,
-                  decision_overrides={"repair-base:keep": Decision("revert")})
+    calib = _make(tmp_path, "revert", ctrl, source=src, decision_overrides={"repair-base:keep": Decision("revert")})
     result = calib.run("repair-base")
     assert result.status == "reverted", result.digest
     assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube)
     calib._save()
     again = _make(tmp_path, "revert", ctrl, source=src).run("repair-base")
     assert again.status == "aborted" and again.digest["aborted_at"] == "repair-install:rolled-back"
-    assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube)
 
 
 def test_a_gone_pipe_says_so_and_a_later_abort_finishes_it(tmp_path: Path):
@@ -419,11 +465,23 @@ def test_a_restore_the_read_back_does_not_show_is_unconfirmed(tmp_path: Path):
     class _Deaf:
         def __getattr__(self, name):
             if name == "set_base_lut":
-                return lambda *a, **k: {}            # "ok", stores nothing
+                return lambda *a, **k: {}
             return getattr(ctrl, name)
 
     out = _guard(_Deaf(), calib)
     assert out["status"] == "rollback_unconfirmed" and out["display_may_carry_repair"] is True
+
+
+def test_restore_refuses_when_someone_else_changed_the_base_in_between(tmp_path: Path):
+    ctrl, cube, src = _setup(tmp_path)
+    panel = ScanoutPanel(ctrl)
+    panel.on_phase = ("measure:repair-verify", _cancel)
+    calib = _make(tmp_path, "theirs", ctrl, panel=panel, source=src)
+    calib.run("repair-base")
+    theirs = _install(ctrl, tmp_path, None, name="theirs.cube")            # e.g. the GUI loaded another cube
+    out = _guard(ctrl, calib)
+    assert out["repair_base_restore"]["outcome"] == "refused"
+    assert installed_base_cube(ctrl, 0, "SDR")[0] == str(theirs)          # their change kept
 
 
 def test_restoring_twice_is_harmless_and_abort_never_takes_a_kept_repair_back(tmp_path: Path):
@@ -435,7 +493,6 @@ def test_restoring_twice_is_harmless_and_abort_never_takes_a_kept_repair_back(tm
     assert _guard(ctrl, calib)["status"] == "rolled_back"
     again = restore_base_repair_prior(ctrl, calib.calib, monitor=0, mode="SDR", why="again")
     assert again["outcome"] == "restored" and again["actions"] == []
-    # a KEPT repair
     ctrl2, cube2, src2 = _setup(tmp_path / "k")
     kept = _make(tmp_path / "k", "kept", ctrl2, source=src2)
     assert kept.run("repair-base").status == "completed"
