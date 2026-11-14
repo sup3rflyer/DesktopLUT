@@ -216,16 +216,3 @@ def test_unknown_drift_is_never_an_apply(run):
     out = _judge(r2, verify_bracket=False)
     assert out["drift"]["state"] == "unknown" and "apply must not be recommended" in out["drift"]["note"]
     assert all(g.get("drift") == "unknown" for g in out["greys"] if g.get("judged"))
-
-
-@pytest.mark.parametrize("nits,dx,dy,ref", [
-    (0.3, 0.0020, 0.0, 0.4843), (0.3, 0.0, 0.0020, 0.3331), (10.0, 0.0020, 0.0, 1.0273), (10.0, 0.0020, 0.0020, 0.8931),
-    (100.0, 0.0006, 0.0, 0.3924), (100.0, 0.0020, 0.0, 1.3076), (1000.0, 0.0040, 0.0, 2.8397),
-    (1000.0, 0.0, 0.0020, 0.9777)])
-def test_chroma_itp_at_absolute_light_matches_the_reference(nits, dx, dy, ref):
-    """dE_ITP of an xy shift at an ABSOLUTE luminance, against the colour package (ITU-R BT.2100 PQ ICtCp, BT.2124
-    dE_ITP) values in review/itp_ref.py - a relative-Y ITP would get every level wrong."""
-    from dlc.colormath import xy_to_XYZ
-    from dlc.grayscale_wb import chroma_itp
-    w = (0.3127, 0.3290)
-    assert chroma_itp(xy_to_XYZ(w[0] + dx, w[1] + dy, nits), xy_to_XYZ(w[0], w[1], nits)) == pytest.approx(ref, abs=2e-4)

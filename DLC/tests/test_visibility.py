@@ -10,7 +10,7 @@ import math
 import pytest
 
 from dlc.colormath import xy_to_XYZ
-from dlc.visibility import chroma_itp, light_itp
+from dlc.visibility import chroma_itp, de_itp, light_itp
 
 W = (0.3127, 0.3290)
 SHIFTS = ((0.001, 0.0), (0.002, 0.0), (0.0, 0.002), (0.002, 0.002))
@@ -54,3 +54,34 @@ def test_light_itp_is_one_at_the_documented_visibility():
     # docs/practical-thresholds.md: a grey's light change is just visible from 1.39 % at 100 nit
     assert light_itp(xy_to_XYZ(W[0], W[1], 100.0), math.log(1.0139)) == pytest.approx(1.0, rel=0.03)
     assert light_itp(xy_to_XYZ(W[0], W[1], 100.0), 0.0) == pytest.approx(0.0, abs=1e-12)
+
+
+# de_itp: a grey's change, light and colour together (the refresh-trim verify), against colour 0.4.6 (XYZ_to_ICtCp
+# "ITU-R BT.2100-2 PQ" on absolute cd/m2 + delta_E_ITP), computed offline 2026-11-14
+DE_REF = [(0.5, 3.0, 0.0, 0.0, 0.9151), (2.0, 3.0, 0.0, 0.0, 1.2691), (10.0, 0.5, 0.0, 0.0, 0.2832),
+          (100.0, 0.3, 0.0, 0.0, 0.2165), (100.0, 0.9, 0.0, 0.0, 0.6476), (100.0, 3.0, 0.0, 0.0, 2.1381),
+          (1000.0, 3.0, 0.0, 0.0, 2.3202), (100.0, 0.5, 0.0003, 0.0004, 0.3994), (5.0, 0.8, 0.0, 0.0, 0.4058)]
+
+
+@pytest.mark.parametrize("nits,pct,dx,dy,ref", DE_REF)
+def test_de_itp_pinned_light_and_colour_together(nits, pct, dx, dy, ref):
+    a = xy_to_XYZ(W[0], W[1], nits)
+    b = xy_to_XYZ(W[0] + dx, W[1] + dy, nits * (1 + pct / 100))
+    assert de_itp(b, a) == pytest.approx(ref, abs=1e-4)
+
+
+@pytest.mark.parametrize("nits,pct,dx,dy,ref", DE_REF[:3])
+def test_de_itp_matches_the_colour_package_live(nits, pct, dx, dy, ref):
+    colour = pytest.importorskip("colour")
+    import numpy as np
+    a = xy_to_XYZ(W[0], W[1], nits)
+    b = xy_to_XYZ(W[0] + dx, W[1] + dy, nits * (1 + pct / 100))
+    ia = colour.XYZ_to_ICtCp(np.array(b, float), method="ITU-R BT.2100-2 PQ")
+    ib = colour.XYZ_to_ICtCp(np.array(a, float), method="ITU-R BT.2100-2 PQ")
+    assert de_itp(b, a) == pytest.approx(float(colour.difference.delta_E_ITP(ia, ib)), abs=1e-4)
+
+
+def test_de_itp_of_a_pure_light_change_is_light_itp():
+    xyz = xy_to_XYZ(W[0], W[1], 100.0)
+    assert de_itp([v * 1.009 for v in xyz], xyz) == pytest.approx(light_itp([v * 1.009 for v in xyz], math.log(1.009)),
+                                                                   abs=1e-9)

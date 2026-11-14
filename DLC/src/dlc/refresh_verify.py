@@ -329,10 +329,9 @@ def practical_chroma(dx: Optional[float], dy: Optional[float], base_xy: Optional
     if dx is None or dy is None or base_xy is None or not light_nits or light_nits <= 0:
         return {"de_itp": None, "floor": floor, "below": None, "why": "no base chromaticity or light"}
     from .colormath import xy_to_XYZ
-    from .content_score import xyz_to_itp
+    from .visibility import chroma_itp
     x0, y0 = base_xy
-    a, b = xyz_to_itp([xy_to_XYZ(x0, y0, light_nits), xy_to_XYZ(x0 + dx, y0 + dy, light_nits)])
-    de = 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
+    de = chroma_itp(xy_to_XYZ(x0 + dx, y0 + dy, light_nits), xy_to_XYZ(x0, y0, light_nits))
     return {"de_itp": de, "floor": floor, "below": de < floor,
             "source": "ITU-R BT.2124 Annex 1: dE_ITP 1 = one just noticeable difference (the DIP holds no "
                       "between-session white repeatability for this display yet)"}
@@ -348,12 +347,10 @@ VISIBILITY_ITP = PRACTICAL_CHROMA_ITP
 
 
 def de_itp(xyz_a: Sequence[float], xyz_b: Sequence[float]) -> float:
-    """BT.2124 dE_ITP (720 x the ICtCp distance, T = Ct/2) between two ABSOLUTE XYZ (cd/m2) — light and colour
-    together; the conversion of :func:`dlc.grayscale_wb.chroma_itp` (``content_score.xyz_to_itp``) without taking the
-    light out. Pinned against the colour package (ITU-R BT.2100-2 PQ) in the tests."""
-    from .content_score import xyz_to_itp
-    a, b = xyz_to_itp([[float(v) for v in xyz_a], [float(v) for v in xyz_b]])
-    return 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
+    """BT.2124 dE_ITP between two ABSOLUTE XYZ (cd/m2), light and colour together: :func:`dlc.visibility.de_itp`
+    (the one implementation, pinned in tests/test_visibility.py)."""
+    from .visibility import de_itp as _de_itp
+    return _de_itp(xyz_a, xyz_b)
 
 
 def change_itp(base_xy: Optional[tuple[float, float]], nits: Optional[float], ratio: Optional[float],

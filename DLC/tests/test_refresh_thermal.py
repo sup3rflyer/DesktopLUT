@@ -41,19 +41,16 @@ def _verify(fx, record, run: str, *, rows=None, knowledge=rf.KNOWLEDGE_F0006, an
                              record_source=src, knowledge=knowledge)
 
 
-# ----------------------------------------------------------------------------- visibility (pinned)
-@pytest.mark.parametrize("nits,pct,dx,dy,ref", [
-    (0.5, 3.0, 0.0, 0.0, 0.9151), (2.0, 3.0, 0.0, 0.0, 1.2691), (10.0, 0.5, 0.0, 0.0, 0.2832),
-    (100.0, 0.3, 0.0, 0.0, 0.2165), (100.0, 0.9, 0.0, 0.0, 0.6476), (100.0, 3.0, 0.0, 0.0, 2.1381),
-    (1000.0, 3.0, 0.0, 0.0, 2.3202), (100.0, 0.5, 0.0003, 0.0004, 0.3994), (5.0, 0.8, 0.0, 0.0, 0.4058)])
-def test_the_change_in_dE_ITP_matches_the_colour_package(nits, pct, dx, dy, ref):
-    """dE_ITP of a grey's change (light and colour together) at an absolute light; reference values from the colour
-    package (ITU-R BT.2100-2 PQ ICtCp, BT.2124 delta_E_ITP), computed offline."""
+# ----------------------------------------------------------------------------- visibility (pinned in test_visibility)
+@pytest.mark.parametrize("nits,pct,dx,dy", [(0.5, 3.0, 0.0, 0.0), (100.0, 0.9, 0.0, 0.0), (100.0, 0.5, 0.0003, 0.0004)])
+def test_the_change_uses_dlc_visibility(nits, pct, dx, dy):
+    """The verify's change of a grey is dlc.visibility.de_itp of the reference grey and the grey at the rate (the
+    values are pinned against the colour package in tests/test_visibility.py)."""
+    from dlc.visibility import de_itp
     w = (0.3127, 0.3290)
     a = xy_to_XYZ(w[0], w[1], nits)
     b = xy_to_XYZ(w[0] + dx, w[1] + dy, nits * (1 + pct / 100))
-    assert rv.de_itp(b, a) == pytest.approx(ref, abs=2e-4)
-    assert rv.change_itp(w, nits, 1 + pct / 100, dx, dy)["de_itp"] == pytest.approx(ref, abs=2e-4)
+    assert rv.change_itp(w, nits, 1 + pct / 100, dx, dy)["de_itp"] == de_itp(b, a) == rv.de_itp(b, a)
 
 
 # ----------------------------------------------------------------------------- the real runs

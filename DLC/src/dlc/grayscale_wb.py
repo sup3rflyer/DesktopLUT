@@ -782,18 +782,9 @@ def chroma_de(xyz: Sequence[float], ref_xyz: Sequence[float], white_xy: tuple[fl
     return float(delta_e2000(xyz_to_lab(a, w), xyz_to_lab(b, w)))   # type: ignore[arg-type]
 
 
-def chroma_itp(xyz: Sequence[float], ref_xyz: Sequence[float]) -> float:
-    """dE_ITP (ITU-R BT.2124, 720 x the ICtCp distance, T = Ct/2) between two stimuli's CHROMATICITIES at the
-    first one's ABSOLUTE luminance (cd/m2): how visible a colour difference is at that light. 1 = one just
-    noticeable difference by the standard's own (conservative) definition - the same unit at every level, so a
-    colour shift at 0.3 nit and one at 100 nit are judged by what can be seen there (docs/practical-thresholds.md)."""
-    from .content_score import xyz_to_itp
-    y = float(xyz[1])
-    if y <= 0 or float(ref_xyz[1]) <= 0:
-        return float("nan")
-    ref = [float(v) * y / float(ref_xyz[1]) for v in ref_xyz]
-    a, b = xyz_to_itp([list(map(float, xyz)), ref])
-    return 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
+# dE_ITP of two stimuli's chromaticities at the first one's absolute light: the one implementation in dlc.visibility
+# (pinned there against the colour package); kept importable under this name for the judge and its callers.
+from .visibility import chroma_itp  # noqa: E402
 
 
 def grey_metrics(xyz: Sequence[float], target_y: float, white_xy: tuple[float, float]) -> dict[str, float]:
