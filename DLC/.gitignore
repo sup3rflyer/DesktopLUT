@@ -20,6 +20,11 @@ correction_store.json
 # (native white/primaries, noise model, cold channel, thermal regime) — same private,
 # display-specific class as correction_store.json.
 dip_store.json
+# its write lock and revision counter (S0 of the DIP knowledge layer)
+dip_store.json.lock
+dip_store.json.rev
+# the per-unit DIP knowledge files (findings about each physical display) + their rendered views: same class
+dip_knowledge/
 # per-display applied-stack registry (what DLC last applied; the HDR peak pin for 3dlut-only)
 stack_registry.json
 results/

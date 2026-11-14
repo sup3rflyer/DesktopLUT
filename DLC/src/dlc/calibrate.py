@@ -2010,6 +2010,21 @@ class Calibration:
         SDR and an HDR profile for one panel must coexist."""
         return f"{self.display.name}:{self.mode}"
 
+    def _restore_prior_dip(self) -> None:
+        """Undo this run's characterize write: the prior record back (as it was read before the write), or the
+        new record removed when there was none. Before S0 a rejection removed the record outright, which lost the
+        probe sections a RE-characterization had carried over from the prior record."""
+        info = self.calib.get("characterize_prior_dip") or {}
+        key = info.get("key") or self._dip_key()
+        store = self._dip_store()
+        rec = info.get("record")
+        if rec:
+            store.record(DisplayInstrumentProfile.from_dict({**rec, "display": rec.get("display", key)}))
+            self.ctx.log(f"characterization rejected: restored the prior DIP record {key}")
+        else:
+            store.remove(key)
+            self.ctx.log(f"characterization rejected: removed the new DIP record {key} (there was no prior one)")
+
     def _dip(self) -> Optional[DisplayInstrumentProfile]:
         """This display+mode's DIP, if one has been characterized (else ``None`` → the measure
         loop falls back to its single-read default; runs are leaner, just not noise-aware). Falls
@@ -4165,6 +4180,11 @@ class Calibration:
             prior = store.get(dip.key)
             if prior is not None:
                 dip = replace(dip, refresh_response=prior.refresh_response, peak_by_window=prior.peak_by_window)
+            # What a rejection at the review seam puts back (S0, 2026-11-14): the record this characterization
+            # replaces, persisted in the run state because the review may be answered by a resumed process.
+            self.calib["characterize_prior_dip"] = {"key": dip.key,
+                                                    "record": prior.as_dict() if prior is not None else None}
+            self._save()
             # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
             # 180-day default) — panel+meter behaviour drift is a different clock than the
             # colorimeter correction's age, so we deliberately do NOT inherit correction.max_age_days.
@@ -10626,12 +10646,14 @@ class Calibration:
         try:
             outcome = self.stage_characterize()
         except CalibrationAborted:
-            # Review rejected this characterization: drop the just-written DIP so a bad profile
-            # is never left silently active, then RESTORE the display before re-raising — the
+            # Review rejected this characterization: put back the record it replaced (or drop the
+            # just-written one when there was none) so a bad profile is never left silently active
+            # and a rejected RE-characterization keeps the probe sections the prior record held
+            # (refresh_response, peak_by_window), then RESTORE the display before re-raising — the
             # operator's setup must come back even on the abort path (clear-native put it in
             # native). A live AdjudicationRequired pause is NOT a CalibrationAborted, so it skips
             # this and propagates to the pause (the panel stays native for the resuming run).
-            self._dip_store().remove(self._dip_key())
+            self._restore_prior_dip()
             self._restore_user_setup(why="characterization rejected at review — nothing applied")
             raise
         # Leave the display exactly as we found it (clear-native entered native via the pipe).

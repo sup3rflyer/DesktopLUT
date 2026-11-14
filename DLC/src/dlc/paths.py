@@ -24,7 +24,7 @@ def atomic_write_text(path: Path | str, text: str, *, encoding: str = "utf-8") -
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, path)
+        _replace_retrying(tmp, path)
     except BaseException:
         try:
             os.unlink(tmp)
@@ -32,6 +32,39 @@ def atomic_write_text(path: Path | str, text: str, *, encoding: str = "utf-8") -
             pass
         raise
     return path
+
+
+# Windows: os.replace over a file another process has open for reading (Python opens without FILE_SHARE_DELETE)
+# fails with "access denied" for that instant, and a read that lands mid-replace can fail the same way. Both are
+# transient; retry for up to about a second before giving up.
+_SHARE_RETRIES = 100
+_SHARE_RETRY_S = 0.01
+
+
+def _replace_retrying(src: str, dst: Path) -> None:
+    import time
+    for attempt in range(_SHARE_RETRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _SHARE_RETRIES - 1:
+                raise
+            time.sleep(_SHARE_RETRY_S)
+
+
+def read_text_shared(path: Path | str, *, encoding: str = "utf-8") -> str:
+    """``Path.read_text`` that rides out a concurrent atomic replace (see above)."""
+    import time
+    p = Path(path)
+    for attempt in range(_SHARE_RETRIES):
+        try:
+            return p.read_text(encoding=encoding)
+        except PermissionError:
+            if attempt == _SHARE_RETRIES - 1:
+                raise
+            time.sleep(_SHARE_RETRY_S)
+    raise AssertionError("unreachable")
 
 
 PACKAGE_DIR = Path(__file__).resolve().parent

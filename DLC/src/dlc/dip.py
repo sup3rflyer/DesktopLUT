@@ -493,7 +493,8 @@ class DipStore:
 
     def __init__(self, path: Path | str,
                  records: Optional[dict[str, DisplayInstrumentProfile]] = None,
-                 *, corrupt: bool = False, dropped: Optional[list[str]] = None) -> None:
+                 *, corrupt: bool = False, dropped: Optional[list[str]] = None,
+                 rev: int = 0, base: Optional[dict[str, dict[str, Any]]] = None) -> None:
         self.path = Path(path)
         self._records: dict[str, DisplayInstrumentProfile] = dict(records or {})
         self.corrupt = corrupt
@@ -502,26 +503,46 @@ class DipStore:
         # tolerant (never a gate), but a caller can surface "your DIP for X was dropped"
         # instead of silently running with no priors for that display.
         self.dropped: list[str] = list(dropped or [])
+        # S0 (2026-11-14): the revision counter (sidecar ``<file>.rev``: the file itself keeps exactly its two keys,
+        # which the C++ reader and the generated fixtures pin) and the records as this instance read them — the
+        # base of the three-way merge in save(), so a writer that loaded before another one saved loses nothing.
+        self.rev = int(rev)
+        self._base: dict[str, dict[str, Any]] = dict(base or {})
+        # A store built directly (not by load) never read the file: its content IS the file (the generated
+        # fixtures and tests build stores that way), so it writes without merging, as before S0. Once saved it
+        # has a base and merges like a loaded one.
+        self._merges = base is not None
 
-    @classmethod
-    def load(cls, path: Path | str) -> "DipStore":
-        p = Path(path)
+    @staticmethod
+    def _read(p: Path) -> tuple[dict[str, DisplayInstrumentProfile], bool, list[str]]:
         records: dict[str, DisplayInstrumentProfile] = {}
         corrupt = False
         dropped: list[str] = []
         if p.exists():
             try:
-                raw = json.loads(p.read_text(encoding="utf-8"))
+                from .paths import read_text_shared
+                raw = json.loads(read_text_shared(p))
+                if not isinstance(raw, dict):
+                    raise ValueError("not an object")
             except (ValueError, OSError):
                 raw, corrupt = {}, True
             for name, rec in (raw.get("displays", {}) or {}).items():
                 try:
                     records[name] = DisplayInstrumentProfile.from_dict(
                         {**rec, "display": rec.get("display", name)})
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError, AttributeError):
                     dropped.append(str(name))
                     continue
-        return cls(p, records, corrupt=corrupt, dropped=dropped)
+        return records, corrupt, dropped
+
+    @classmethod
+    def load(cls, path: Path | str) -> "DipStore":
+        from .file_lock import read_rev
+        p = Path(path)
+        rev = read_rev(p)          # BEFORE the file: a rev older than the content only costs a merge
+        records, corrupt, dropped = cls._read(p)
+        return cls(p, records, corrupt=corrupt, dropped=dropped, rev=rev,
+                   base={k: r.as_dict() for k, r in records.items()})
 
     def get(self, display: str) -> Optional[DisplayInstrumentProfile]:
         return self._records.get(display)
@@ -545,11 +566,72 @@ class DipStore:
         return existed
 
     def save(self) -> None:
-        # "schema" is a version stamp for forward drift (loaders today tolerate any shape via
-        # per-record try/except + the dropped list; a future breaking change bumps this).
-        payload = {"schema": 1,
-                   "displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
-        atomic_write_text(self.path, json.dumps(payload, indent=2))
+        """Persist under the store's lock, merged onto whatever is on disk NOW.
+
+        Three-way, per record and per top-level field: base = the record as this instance read it, ours = now,
+        theirs = on disk. A field only we changed takes ours, a field only they changed keeps theirs, a field both
+        changed to different values raises :class:`DipStoreConflict` (nothing written). A record we removed is
+        removed unless they changed it since; a record we never touched keeps theirs. An unreadable file on disk
+        is not merged into (this instance's state is written, as before S0). The revision sidecar counts writes."""
+        from .file_lock import FileLock, read_rev, write_rev
+        with FileLock(self.path):
+            disk_rev = read_rev(self.path)
+            theirs, disk_corrupt, _ = self._read(self.path)
+            merged = self._merge({k: r.as_dict() for k, r in theirs.items()}) \
+                if (self._merges and not disk_corrupt) else {k: r.as_dict() for k, r in self._records.items()}
+            # "schema" is a version stamp for forward drift (loaders today tolerate any shape via
+            # per-record try/except + the dropped list; a future breaking change bumps this).
+            payload = {"schema": 1, "displays": {name: merged[name] for name in sorted(merged)}}
+            atomic_write_text(self.path, json.dumps(payload, indent=2))
+            self.rev = max(disk_rev, self.rev) + 1
+            write_rev(self.path, self.rev)
+        self._records = {k: DisplayInstrumentProfile.from_dict({**d, "display": d.get("display", k)})
+                         for k, d in merged.items()}
+        self._base = {k: r.as_dict() for k, r in self._records.items()}
+        self._merges = True
+        self.corrupt = False
+
+    def _merge(self, theirs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        ours = {k: r.as_dict() for k, r in self._records.items()}
+        out: dict[str, dict[str, Any]] = {}
+        for key in sorted(set(ours) | set(theirs) | set(self._base)):
+            b, o, t = self._base.get(key), ours.get(key), theirs.get(key)
+            if b is None and o is not None:  # added (or blindly upserted) by us: ours, as before S0
+                out[key] = o
+                continue
+            if o == b:                     # untouched by us: whatever is on disk now
+                if t is not None:
+                    out[key] = t
+                continue
+            if t == b:                       # untouched by them: ours (incl. our removal)
+                if o is not None:
+                    out[key] = o
+                continue
+            if o is None or t is None:       # one side removed, the other changed
+                if o == t:
+                    continue
+                raise DipStoreConflict(f"{self.path}: {key!r} was removed on one side and changed on the other")
+            rec: dict[str, Any] = {}
+            bb = b or {}
+            for f in sorted(set(o) | set(t) | set(bb)):
+                bf, of, tf = bb.get(f, _MISSING), o.get(f, _MISSING), t.get(f, _MISSING)
+                if of == bf:
+                    v = tf
+                elif tf == bf or tf == of:
+                    v = of
+                else:
+                    raise DipStoreConflict(f"{self.path}: {key!r}.{f} changed by two writers to different values")
+                if v is not _MISSING:
+                    rec[f] = v
+            out[key] = rec
+        return out
+
+
+class DipStoreConflict(RuntimeError):
+    """Two writers changed the same field of one DIP record to different values; nothing was written."""
+
+
+_MISSING = object()
 
 
 def _opt_float(v: Any) -> Optional[float]:
