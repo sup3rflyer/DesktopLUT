@@ -56,7 +56,9 @@ std::string FmtHz(double hz) {
 
 std::string RefreshTrimStamp(const MhcRefreshTrim& t) {
     uint64_t h = 1469598103934665603ull;
-    static const char kTag[] = "dlut.refresh_trim.bake/2";   // bump with any change to what a trim bakes (2: the fade above)
+    // Bump with any change to what a trim bakes: every cached variant stamped with an older tag is then off-stamp and
+    // re-baked (2: the fade above; 3: the gain read at the grey's light, not the channel's, 2026-11-14).
+    static const char kTag[] = "dlut.refresh_trim.bake/3";
     Fnv(h, kTag, sizeof(kTag) - 1);
     Fnv(h, t.rateKey.data(), t.rateKey.size());
     FnvDouble(h, t.peakNits);

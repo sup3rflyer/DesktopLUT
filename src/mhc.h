@@ -239,11 +239,12 @@ struct MhcQuietLog {
 bool ComputeMhcScanoutBaseLuts(const MHC2ProfileParams& params, MhcScanout& out);
 // The bake's compose step: params' correction grayscale (first), then desktop gamma (HDR), then the refresh trim (HDR,
 // last), clamped to [0,1] and quantized to the file's s15Fixed16 grid. Reads only the correction / desktop gamma /
-// trim fields and the peak; cheap (no files). Logs nothing.
+// trim fields, the peak and base.applied (the trim reads the matrix); cheap (no files). Logs nothing.
 // The trim works on the drive the stages before it produce: the drive's 60-Hz light is read off the profile's own
 // calibration (base + correction, inverted where desktop gamma moved the entry), and the drive the calibration gives
 // for MhcRefreshTrimTarget of that light replaces it. So whatever the variant shows at 60 Hz (DG or not), its trimmed
-// twin shows at the rate.
+// twin shows at the rate. The gain is the one of the GREY the channel's light belongs to (light / the channel's
+// row sum of base.applied), so the three channels of a grey take one gain and its chromaticity stays put.
 void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, MhcScanout& out);
 // Base + compose: the profile's complete scanout.
 bool ComputeMhcScanout(const MHC2ProfileParams& params, MhcScanout& out);

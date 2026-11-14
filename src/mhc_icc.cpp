@@ -741,7 +741,11 @@ double TrimInvert(const std::vector<float>& env, double d) {
 
 // One channel's trim stage. `cal` = the calibration's drives (base + correction, before desktop gamma), `fin` = the
 // drives the stages before produce (desktop gamma included), both unclamped; fin becomes the trimmed, quantized LUT.
-void ApplyRefreshTrim(const MhcRefreshTrim& trim, const std::vector<float>& cal, float* fin, int n) {
+// `neutral` = what the as-applied matrix makes of a neutral grey in this channel (its row sum: grey light L arrives
+// here as neutral * L). The DIP's response is a function of the GREY's light, so the gain is read at light / neutral
+// (2026-11-14: read at the channel's own light, the three channels of one grey took gains from levels up to 0.05
+// decade apart: ~1e-4 of chromaticity and ~0.03 % of luminance at the top levels on the PA32's 0.92 / 1.03 / 1.03).
+void ApplyRefreshTrim(const MhcRefreshTrim& trim, const std::vector<float>& cal, float* fin, int n, double neutral) {
     std::vector<float> c((size_t)n), env((size_t)n);
     for (int j = 0; j < n; j++) {
         c[j] = std::clamp(cal[j], 0.0f, 1.0f);                         // what the panel is driven with
@@ -753,9 +757,11 @@ void ApplyRefreshTrim(const MhcRefreshTrim& trim, const std::vector<float>& cal,
         const double code = fin[j] == cal[j] ? (double)j / (double)(n - 1)
                                              : TrimInvert(env, std::clamp((double)fin[j], 0.0, 1.0));
         const double light = MhcPqEotfD(code) * 10000.0;                // its 60-Hz light (nits)
-        const double want = MhcRefreshTrimTarget(trim, light);           // the 60-Hz light to drive instead
+        const double grey = light / neutral;                             // the light of the grey it belongs to
+        const double wantGrey = MhcRefreshTrimTarget(trim, grey);        // that grey's 60-Hz light to drive instead
         // (g = 1 there: the entry's own signal, so a trim of gain 1 reproduces the untrimmed LUT exactly.)
-        const double drive = TrimLutAt(c, want == light ? code : MhcPqOetfLocal(want / 10000.0));
+        const double drive =
+            TrimLutAt(c, wantGrey == grey ? code : MhcPqOetfLocal(wantGrey * neutral / 10000.0));
         fin[j] = QuantizeS15Fixed16(std::clamp((float)drive, 0.0f, 1.0f));
     }
 }
@@ -817,7 +823,11 @@ void ComposeMhcScanout(const MHC2ProfileParams& params, const MhcScanout& base, 
             else lut[j] = QuantizeS15Fixed16(std::clamp(v, 0.0f, 1.0f));
         }
         // The refresh trim last (HDR): whatever the stages above make the panel show at 60 Hz, at the trim's rate.
-        if (hasTrim) ApplyRefreshTrim(params.refreshTrim, cal, lut, n);
+        if (hasTrim) {
+            const double neutral = (double)out.applied[ch * 3 + 0] + (double)out.applied[ch * 3 + 1] +
+                                   (double)out.applied[ch * 3 + 2];
+            ApplyRefreshTrim(params.refreshTrim, cal, lut, n, std::isfinite(neutral) && neutral > 0.0 ? neutral : 1.0);
+        }
     }
 }
 
