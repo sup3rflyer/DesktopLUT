@@ -640,3 +640,58 @@ def _opt_float(v: Any) -> Optional[float]:
 
 def _opt_xy(v: Any) -> Optional[list[float]]:
     return [float(v[0]), float(v[1])] if v else None
+
+
+# ----------------------------------------------------------------------------- a DIP change that could not be written
+PENDING_KIND = "dlc.dip pending change"
+
+
+def park_dip_change(path: Path | str, *, key: str, record: Optional[dict[str, Any]], why: str) -> Path:
+    """Keep a DIP write that could not be made (the store's lock did not come, or a conflicting writer) in a file
+    (normally in the run folder), so no measured record is lost to a lock. ``record`` None = remove ``key``.
+    ``python -m dlc.dip write-pending --file <path> --dip <store>`` applies it later."""
+    from datetime import datetime
+    p = Path(path)
+    payload = {"kind": PENDING_KIND, "key": key, "record": record, "why": why,
+               "parked": datetime.now().isoformat(timespec="seconds")}
+    atomic_write_text(p, json.dumps(payload, indent=2))
+    return p
+
+
+def write_pending(path: Path | str, dip_path: Path | str) -> str:
+    """Apply a parked change (see :func:`park_dip_change`) to the store at ``dip_path``."""
+    from .paths import read_text_shared
+    payload = json.loads(read_text_shared(path))
+    if not isinstance(payload, dict) or payload.get("kind") != PENDING_KIND or not payload.get("key"):
+        raise ValueError(f"{path}: not a parked DIP change")
+    store = DipStore.load(dip_path)
+    if store.corrupt:
+        raise ValueError(f"{dip_path}: the DIP store is unreadable; not overwriting it")
+    key, rec = str(payload["key"]), payload.get("record")
+    if rec is None:
+        store.remove(key)
+        return f"removed {key}"
+    store.record(DisplayInstrumentProfile.from_dict({**rec, "display": rec.get("display", key)}))
+    return f"wrote {key}"
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+
+    from .paths import PROJECT_DIR
+    ap = argparse.ArgumentParser(prog="python -m dlc.dip", description="DIP store maintenance")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    wp = sub.add_parser("write-pending", help="apply a DIP change a run kept because the store could not be written")
+    wp.add_argument("--file", required=True)
+    wp.add_argument("--dip", default=str(PROJECT_DIR / "dip_store.json"))
+    args = ap.parse_args(argv)
+    try:
+        print(f"{write_pending(args.file, args.dip)} in {args.dip}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"NOT written: {type(exc).__name__}: {exc}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

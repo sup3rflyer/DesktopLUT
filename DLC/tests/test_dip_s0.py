@@ -105,6 +105,78 @@ def test_rejected_recharacterize_restores_the_prior_record_across_a_resume(tmp_p
     _reject_case(tmp_path, live_pause=True)
 
 
+def _char_cfg():
+    from dlc.characterize import CharacterizeConfig
+    return CharacterizeConfig(noise_levels=(1.0,), noise_reads=4, black_reads=1, primary_reads=1,
+                              settle_levels={"bright": 1.0}, warmup_observe_reads=5, creep_reads=1,
+                              warmup_max_minutes=0)
+
+
+@pytest.mark.parametrize("ending", ["cancel", "stall", "meter_down"])
+def test_an_abort_before_the_write_leaves_the_existing_record_alone(tmp_path: Path, monkeypatch, ending: str):
+    """Review fix 1 (reproduced by the reviewer): a characterize cancelled / stalled / meter-down BEFORE it wrote
+    its record used to REMOVE the existing record, refresh_response included."""
+    from test_calibrate import _make, _transfer
+
+    import dlc.calibrate as cm
+    from dlc.adjudication import Decision, MappingAdjudicator
+    from dlc.controller import CalibrationController
+    from dlc.liveness import MeterDown, RunCancelled, RunStalled
+    from dlc.measure_loop import SyntheticPanel
+
+    def boom(**kw):
+        if ending == "cancel":
+            raise RunCancelled("characterize", "operator cancelled")
+        if ending == "stall":
+            raise RunStalled("characterize", 200.0, 180.0)
+        raise MeterDown("characterize", "meter gone")
+
+    monkeypatch.setattr(cm, "run_characterization", boom)
+    calib = _make(tmp_path, "char_cancel",
+                  panel=SyntheticPanel(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0, noise=0.5, seed=9),
+                  controller=CalibrationController.mock(), characterize_config=_char_cfg(),
+                  adjudicator=MappingAdjudicator({"characterize:plan": Decision("approve")}))
+    store = calib._dip_store()
+    prior = _prior("Synthetic mini-LED", calib.mode)
+    store.record(prior)
+    before = store.path.read_bytes()
+    result = calib.run("characterize")
+    assert result.status == "aborted"
+    assert store.path.read_bytes() == before
+    got = DipStore.load(store.path).get(prior.key)
+    assert got is not None and got.refresh_response is not None
+
+
+def test_a_reentered_characterize_keeps_the_first_prior(tmp_path: Path):
+    """Review fix 1: a --force re-entry (or a crash after the write) runs the stage again; the record on disk is
+    then this run's own first attempt, and a later reject must restore the record from BEFORE the run."""
+    from test_calibrate import _make, _transfer
+
+    from dlc.adjudication import AdjudicationRequired, Decision, MappingAdjudicator
+    from dlc.controller import CalibrationController
+    from dlc.measure_loop import SyntheticPanel
+
+    def jittery():
+        return SyntheticPanel(transfer=_transfer(), start_temp=1.0, cold_blue_gain=1.0, noise=0.5, seed=9)
+
+    ctrl = CalibrationController.mock()
+    plan = {"characterize:plan": Decision("approve")}
+    calib = _make(tmp_path, "char_force", panel=jittery(), controller=ctrl, characterize_config=_char_cfg(),
+                  adjudicator=MappingAdjudicator(plan))
+    store = calib._dip_store()
+    prior = _prior("Synthetic mini-LED", calib.mode)
+    store.record(prior)
+    with pytest.raises(AdjudicationRequired):
+        calib.run("characterize")                                    # attempt 1 written, paused at review
+    again = _make(tmp_path, "char_force", panel=jittery(), controller=ctrl, characterize_config=_char_cfg(),
+                  adjudicator=MappingAdjudicator({**plan, "characterize:review": Decision("abort", note="redo")}))
+    again.force = True                                               # the stage runs again
+    result = again.run("characterize")
+    assert result.status == "aborted"
+    got = DipStore.load(store.path).get(prior.key)
+    assert got is not None and got.made == "2026-06-01" and got.cold_channel == "G"
+
+
 # ----------------------------------------------------------------------------- lock + revision + merge
 def _plain(display: str, mode: str = "HDR", **kw) -> DisplayInstrumentProfile:
     return DisplayInstrumentProfile(display=display, mode=mode, made="2026-06-01", **kw)
