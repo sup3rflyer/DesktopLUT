@@ -254,15 +254,28 @@ static void StartFaldPanelVerdictPolls() {
 // The hook's verdicts on live panel deliveries -> the status line, a notification, and (a failure) the old path: the
 // re-injection with the current file staged, once per failed file stamp, never while the live layers are busy.
 // `watchdogTick`: the hook watchdog's tick (it counts toward the no-answer timeout). GUI thread.
+// A failed live panel delivery is a condition of that display + mode (notify key): the next delivery the hook takes
+// there ends it.
+static std::wstring FaldPanelNoticeKey(const DwmHookFaldPanelNotice& n) {
+    return L"panel " + std::to_wstring(n.left) + L"," + std::to_wstring(n.top) + (n.hdr ? L" hdr" : L" sdr");
+}
+
+static void PostFaldPanelFailure(const DwmHookFaldPanelNotice& n) {
+    const std::wstring key = FaldPanelNoticeKey(n);
+    notify::Resolve(-1, L"fald", key.c_str());   // the newer failure replaces the older one
+    notify::PostCondition(notify::Sev::Warning, -1, L"fald", key.c_str(), n.text);
+}
+
 static void HandleFaldPanelVerdicts(HWND hwnd, bool watchdogTick) {
     std::vector<DwmHookFaldPanelNotice> notices;
     bool recompose = false;
     CheckDwmHookFaldPanelVerdicts(watchdogTick, &notices, &recompose);
     for (const DwmHookFaldPanelNotice& n : notices) {
+        if (n.kind != DwmHookFaldPanelNotice::Kind::Failed) notify::Resolve(-1, L"fald", FaldPanelNoticeKey(n).c_str());
         if (n.kind == DwmHookFaldPanelNotice::Kind::Loaded) SetStatus(L"FALD panel file loaded live");
         else if (n.kind == DwmHookFaldPanelNotice::Kind::LoadedIdle) SetStatus(L"FALD panel file loaded live (layer idle)");
         else {
-            notify::Post(notify::Sev::Warning, -1, L"fald", n.text);
+            PostFaldPanelFailure(n);
             SetStatus(n.text.c_str());
         }
     }
@@ -884,7 +897,8 @@ static void HookUnusableFallBackToOverlay(const std::wstring& why) {
     const std::wstring title = L"DWM Hook switched off: the overlay applies your corrections";
     const std::wstring detail = why + L"\n\nDWM Hook mode is now off and the overlay engine runs instead. "
                                       L"To try the hook again, switch DWM HOOK on in Settings.";
-    notify::Post(notify::Sev::Warning, -1, L"hook", title, detail);   // the footer shows it in amber; Events has the detail
+    // The footer shows it in amber until seen, or until DWM HOOK is switched on again (act::SetDwmHookMode resolves it).
+    notify::PostCondition(notify::Sev::Warning, -1, L"hook", L"hook-off", title, detail);
     act::SetDwmHookMode(false);   // saves; restarts the live layers in overlay mode
     RequestWindowsToneMap(false); // whatever tone maps now decides what Auto reports
 }
@@ -1720,7 +1734,7 @@ LRESULT CALLBACK GUIWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         std::vector<DwmHookFaldPanelNotice> notices;
         bool delivered = false;
         FinishDwmHookFaldPanelPoll((intptr_t)lParam, &notices, &delivered);
-        for (const DwmHookFaldPanelNotice& n : notices) notify::Post(notify::Sev::Warning, -1, L"fald", n.text);
+        for (const DwmHookFaldPanelNotice& n : notices) PostFaldPanelFailure(n);
         if (delivered) {
             SetStatus(L"FALD panel file re-exported: sent to the DWM hook");
             StartFaldPanelVerdictPolls();

@@ -979,6 +979,7 @@ void DisengageIdentityMhcProfile(int monitorIndex, bool isHDR) {
 static std::atomic<bool> g_dgSwapRetry{ false };
 static std::atomic<int> g_dgSwapRetries{ 0 };
 constexpr int kMaxDgSwapRetries = 8;   // verify ticks (~2 min); any later switch arms it afresh
+constexpr const wchar_t* kDgSwapKey = L"dg-swap";   // notify condition: the swap gave up; the next one that lands ends it
 
 static bool SwapDgAll(bool dgEnabled);
 
@@ -986,6 +987,7 @@ bool SwapDgForAllMonitors(bool dgEnabled) {
     const bool ok = SwapDgAll(dgEnabled);
     g_dgSwapRetries.store(0);
     g_dgSwapRetry.store(!ok);
+    if (ok) notify::Resolve(-1, L"mhc", kDgSwapKey);   // every display has the asked-for variant: an old failure is over
     if (!ok) std::cerr << "MHC perm: desktop gamma " << (dgEnabled ? "on" : "off") << " did not reach every display; will retry" << std::endl;
     return ok;
 }
@@ -998,14 +1000,15 @@ void RetryDgSwap() {
     const bool dg = g_desktopGammaMode.load();
     if (SwapDgAll(dg)) {
         g_dgSwapRetry.store(false);
+        notify::Resolve(-1, L"mhc", kDgSwapKey);
         std::cout << "MHC perm: desktop gamma " << (dg ? "on" : "off") << " retry landed" << std::endl;
         return;
     }
     if (g_dgSwapRetries.fetch_add(1) + 1 >= kMaxDgSwapRetries) {
         g_dgSwapRetry.store(false);
-        notify::Post(notify::Sev::Warning, -1, L"mhc", dg ? L"Desktop gamma could not be switched on"
-                                                          : L"Desktop gamma could not be switched off",
-                     L"The MHC profile variant could not be swapped in");
+        notify::PostCondition(notify::Sev::Warning, -1, L"mhc", kDgSwapKey,
+                              dg ? L"Desktop gamma could not be switched on" : L"Desktop gamma could not be switched off",
+                              L"The MHC profile variant could not be swapped in");
     }
 }
 

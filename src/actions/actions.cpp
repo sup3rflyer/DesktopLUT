@@ -150,6 +150,7 @@ void SetDwmHookMode(bool on) {
     // Switching it on is the user's deliberate retry (after a fall-back, a Windows update): every give-up count of
     // the hook starts again (dwm_hook_stability.h). The fall-back itself only ever switches it off.
     if (on) g_dwmHookStability.OnUserReEnable();
+    if (on) notify::Resolve(-1, L"hook", L"hook-off");   // "DWM Hook switched off" is over: the user switched it on
     g_dwmHookMode.store(on);
     SaveSettings();
     if (g_gui.isRunning) RestartLiveLayers();
@@ -861,12 +862,14 @@ void RegisterOne(const HotkeyDef& h) {
     const UINT vk = (UINT)(unsigned char)h.key->load();
     if (!hub || !vk) return;
     UnregisterHotKey(hub, h.id);   // a re-registration replaces (a second RegisterHotKey of the same id would add one)
+    // "taken by another program" is a condition of this hotkey (keyed by its name): this attempt decides it afresh.
+    notify::Resolve(-1, L"hotkey", h.name);
     if (RegisterHotKey(hub, h.id, MOD_WIN | MOD_SHIFT | MOD_NOREPEAT, vk)) return;
     // Another program holds the combination: this hotkey stays unregistered, deliberately and visibly.
     wchar_t text[96];
     swprintf_s(text, L"%s hotkey Win+Shift+%c is taken by another program", h.name, (wchar_t)vk);
     std::wcerr << L"[Hotkeys] " << text << L" (error " << GetLastError() << L")" << std::endl;
-    notify::Post(notify::Sev::Warning, -1, L"hotkey", text);
+    notify::PostCondition(notify::Sev::Warning, -1, L"hotkey", h.name, text);
 }
 
 // Some display with desktop gamma configured is in HDR now (a fresh DisplayConfig + DXGI query: a key press only).
@@ -932,7 +935,10 @@ void ApplyHotkeyRegistration(int hotkeyId, bool on) {
     const HotkeyDef* h = FindHotkey(hotkeyId);
     if (!h || !g_gui.hwndMain) return;
     if (on) RegisterOne(*h);
-    else UnregisterHotKey(g_gui.hwndMain, hotkeyId);
+    else {
+        UnregisterHotKey(g_gui.hwndMain, hotkeyId);
+        notify::Resolve(-1, L"hotkey", h->name);   // switched off: whether another program holds it no longer matters
+    }
 }
 
 void OnHotkey(int hotkeyId) {

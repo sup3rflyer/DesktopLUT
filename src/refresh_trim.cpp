@@ -240,6 +240,7 @@ bool g_exiting = false;
 int g_failures = 0;
 ULONGLONG g_retryNotBefore = 0;
 bool g_warned = false;
+constexpr const wchar_t* kTrimKey = L"refresh-trim";   // notify condition: a swap failed, retrying
 std::map<int, std::string> g_lastLogged;   // per monitor: the last logged state line
 
 constexpr UINT kWaitRetryMs = 3000;          // a hold (calibration, live edit, dialog, maintenance)
@@ -509,6 +510,7 @@ void ReconcileRefreshTrim(const char* why) {
                               << (res.want.active ? "the " + res.want.rateKey + " Hz trim" : std::string("no trim"))
                               << " at " << FmtHz(st.liveHz) << " Hz, swapping the HDR profile (" << reason << ")"
                               << std::endl;
+                    bool swapFailed = false;   // this display's (`failed` covers every display of the pass)
                     if (SwapMhcPermBits(e.index, true, 0, 0)) {
                         swapped = true;
                         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
@@ -521,16 +523,17 @@ void ReconcileRefreshTrim(const char* why) {
                         }
                     } else {
                         failed = true;
+                        swapFailed = true;
                         st.waiting = "retry_backoff";
                     }
                     if (!g_exiting) {
-                        const std::wstring title = !failed && res.want.active
+                        const std::wstring title = !swapFailed && res.want.active
                             ? L"Refresh trim " + Wide(res.want.rateKey) + L" Hz"
-                            : !failed ? L"Refresh trim off at " + Wide(FmtHz(st.liveHz)) + L" Hz"
-                                      : L"Refresh trim swap failed";
+                            : !swapFailed ? L"Refresh trim off at " + Wide(FmtHz(st.liveHz)) + L" Hz"
+                                          : L"Refresh trim swap failed";
                         std::wstringstream detail;
                         detail.imbue(std::locale::classic());
-                        if (failed) {
+                        if (swapFailed) {
                             detail << L"The HDR profile stays as it was; retrying";
                         } else {
                             detail << L"HDR profile " << st.profileName;
@@ -540,8 +543,13 @@ void ReconcileRefreshTrim(const char* why) {
                                        << L" at 100, " << st.gain[2] << L" at 1000; DIP " << Wide(st.measured);
                             }
                         }
-                        notify::Post(failed ? notify::Sev::Warning : notify::Sev::Info, e.index, L"mhc", title,
-                                     detail.str());
+                        // A failed swap is a condition (retrying): this display's next swap that lands ends it.
+                        if (swapFailed) {
+                            notify::PostCondition(notify::Sev::Warning, e.index, L"mhc", kTrimKey, title, detail.str());
+                        } else {
+                            notify::Resolve(e.index, L"mhc", kTrimKey);
+                            notify::Post(notify::Sev::Info, e.index, L"mhc", title, detail.str());
+                        }
                     }
                 }
             }
@@ -569,10 +577,11 @@ void ReconcileRefreshTrim(const char* why) {
         ArmRetry(kFailRetryMs[step]);
         if (g_failures >= kWarnAfterFailures && !g_warned && !g_exiting) {
             g_warned = true;
-            notify::Post(notify::Sev::Warning, -1, L"mhc", L"Refresh trim could not be applied",
-                         L"The HDR profile variant for this refresh rate could not be swapped in; retrying");
+            notify::PostCondition(notify::Sev::Warning, -1, L"mhc", kTrimKey, L"Refresh trim could not be applied",
+                                  L"The HDR profile variant for this refresh rate could not be swapped in; retrying");
         }
     } else if (!wait) {
+        if (g_warned) notify::Resolve(-1, L"mhc", kTrimKey);   // the retries landed: the warning is over
         g_failures = 0;
         g_retryNotBefore = 0;
         g_warned = false;

@@ -97,6 +97,15 @@ void PostTo(const DisplayRow& r, std::function<void(int)> fn) {
 
 void PostToDisplay(const DisplayRow& r, std::function<void(int)> fn) { PostTo(r, std::move(fn)); }
 
+std::string FooterStamp(const SYSTEMTIME& t, const SYSTEMTIME& now) {
+    char b[32];
+    if (t.wYear == now.wYear && t.wMonth == now.wMonth && t.wDay == now.wDay)
+        snprintf(b, sizeof(b), "%02u:%02u  ", t.wHour, t.wMinute);
+    else
+        snprintf(b, sizeof(b), "%02u-%02u %02u:%02u  ", t.wMonth, t.wDay, t.wHour, t.wMinute);
+    return b;
+}
+
 namespace {
 
 // A file picked in a dialog, then applied: the dialog pumps messages (a display can come or go meanwhile),
@@ -240,6 +249,12 @@ float FooterTop() {
     return Snap(vp->WorkPos.y + vp->WorkSize.y - Px(kFooterH));
 }
 
+std::string FooterStamp(const SYSTEMTIME& t) {
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    return ui::FooterStamp(t, now);
+}
+
 void DrawFooter(const Snapshot& snap, ViewState& vs, bool busy) {
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     const ImVec2 p(vp->WorkPos.x, FooterTop());
@@ -291,16 +306,20 @@ void DrawFooter(const Snapshot& snap, ViewState& vs, bool busy) {
     if (busy) {
         DrawText(dl, Font::Label, kSizeLabel, x, cy, pal::Ink, "APPLYING");
     } else if (!snap.lastStatus.empty()) {
-        // The newest status, a warning in amber; a click opens Events (its detail is there).
-        const bool warn = snap.lastStatusSev == notify::Sev::Warning || snap.lastStatusSev == notify::Sev::Error;
+        // notify::PickHeadline: a warning (amber, after its local time) until it is resolved or seen, else the newest
+        // status line. A click opens Events (the detail is there; opening it marks every warning seen).
+        const bool warn = notify::IsWarning(snap.lastStatusSev);
         const std::string text = Utf8(snap.lastStatus);
-        const float tw = MeasureInk(Font::Mono, 12.0f, text.c_str()).advance;
+        const std::string stamp = warn ? FooterStamp(snap.lastStatusTime) : std::string();
+        const float sw = stamp.empty() ? 0.0f : MeasureInk(Font::Mono, 12.0f, stamp.c_str()).advance;
+        const float tw = sw + MeasureInk(Font::Mono, 12.0f, text.c_str()).advance;
         ImGui::SetCursorScreenPos(ImVec2(x, p.y));
         ImGui::InvisibleButton("##footer_status", ImVec2(std::max(tw, 1.0f), h));
         const bool hot = ImGui::IsItemHovered();
         if (ImGui::IsItemClicked()) vs.page = Page::Events;
-        if (hot) ImGui::SetTooltip("Events");
-        DrawText(dl, Font::Mono, 12.0f, x, cy, warn ? pal::Alarm : (hot ? pal::InkDim : pal::InkFaint), text.c_str());
+        if (hot) ImGui::SetTooltip(warn ? "Events. Opening them marks this warning seen." : "Events");
+        if (!stamp.empty()) DrawText(dl, Font::Mono, 12.0f, x, cy, hot ? pal::Ink : pal::InkDim, stamp.c_str());
+        DrawText(dl, Font::Mono, 12.0f, x + sw, cy, warn ? pal::Alarm : (hot ? pal::InkDim : pal::InkFaint), text.c_str());
     }
 }
 
@@ -1947,6 +1966,7 @@ void RebuildLog(LogCache& c, const Snapshot& snap, const ViewState& vs) {
         case notify::Sev::Error: r.level = "ERROR"; r.tone = LogRow::Tone::Alarm; break;
         default: r.level = "INFO"; r.tone = LogRow::Tone::Dim; break;
         }
+        if (warn && e.resolvedSeq != 0) r.tone = LogRow::Tone::Dim;   // a condition that has ended: no longer amber
         r.source = Utf8(e.source);
         for (char& ch : r.source) ch = (char)toupper((unsigned char)ch);
         if (e.monitor >= 0) {
@@ -2042,7 +2062,7 @@ void DrawEventsPage(const Snapshot& snap, ViewState& vs) {
     const std::string filterKey = std::to_string(lv.allOutput) + std::to_string(lv.warningsOnly) + "|" +
                                   std::to_string(lv.display) + "|" + lv.filter + "|" + std::to_string(lv.clearedEventSeq) +
                                   "|" + std::to_string(lv.clearedLineSeq);
-    const uint64_t es = notify::LastSeq(), ls = lv.allOutput ? logcap::LastSeq() : 0;
+    const uint64_t es = notify::Revision(), ls = lv.allOutput ? logcap::LastSeq() : 0;   // Revision: resolves too
     if (es != cache.eventSeq || ls != cache.lineSeq || filterKey != cache.filterKey) {
         RebuildLog(cache, snap, vs);
         cache.eventSeq = es;
@@ -2486,6 +2506,9 @@ void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(Px(8), Px(6)));
     ImGui::BeginDisabled(busy);   // an action is running (it may pump): nothing else may start meanwhile
     SetLogRedraws(vs.page == Page::Events && vs.log.allOutput);   // diagnostic lines redraw only here
+    // The Events page on screen: the user has seen every event up to the newest (the footer drops those warnings).
+    // A warning that arrived while it is open drew in the footer for one frame: draw again without it.
+    if (vs.page == Page::Events && notify::Acknowledge(notify::LastSeq())) Invalidate();
     if (vs.page == Page::Events) DrawEventsPage(snap, vs);
     else if (vs.page == Page::Settings) DrawSettingsPage(snap, vs);
     else if (vs.page == Page::Dlc) DrawDlcPage(snap, vs);

@@ -52,8 +52,9 @@ struct Snapshot {
     bool analysis = false;    // the analysis readout is on (g_analysisEnabled)
     DwmHookBuildStatus hookBuild;  // was the hook verified against this Windows' dwmcore.dll (dwm_hook_build.h)
     HookRoutingView routing;       // identical twin displays and how the hook routes them (gui.h; empty = no twins)
-    std::wstring lastStatus;      // the newest status line or warning / error (any source)
-    notify::Sev lastStatusSev = notify::Sev::Info;
+    std::wstring lastStatus;      // the footer's line: notify::PickHeadline (a standing, unseen warning / error, else
+    notify::Sev lastStatusSev = notify::Sev::Info;   //   the newest status line)
+    SYSTEMTIME lastStatusTime = {};                   // its local time (the footer shows it before a warning)
 };
 
 // Fills `out` from the live state. Cheap (a few KB copied per display); call once per frame.
