@@ -301,11 +301,18 @@ def test_hold_budget_knob_is_bounded(tmp_path: Path):
         _hdr(tmp_path, "vr_bad2", thermal_state="viewing", viewing_hold_budget_min=1e6)
 
 
-def test_default_refine_path_matches_main(tmp_path: Path):
+def test_default_refine_path_matches_main(tmp_path: Path, monkeypatch):
     """verify (default, no flag) == main e0a559e for the MHC refine: the SAME reads in the same order, the same
     refine / measure / verify digests, decisions and run-record keys, in the HDR and SDR mhc-only sim flows.
-    The golden was recorded by running ``tests/_refine_default_fingerprint.py`` against main e0a559e's source."""
+    The golden was recorded by running ``tests/_refine_default_fingerprint.py`` against main e0a559e's source.
+    The base build's transfer-domain inversion (2026-11-14) deliberately moves the base cube and so the refine's
+    reads; it is switched off here (every gap linear light, as main) — its own tests are
+    test_transfer_domain_inversion (including the pins on real-run cubes)."""
+    import math
+
     from _refine_default_fingerprint import fingerprint
+    from dlc import mhc_cube
+    monkeypatch.setattr(mhc_cube, "TRANSFER_DOMAIN_MIN_LIGHT", math.inf)
 
     golden = json.loads((Path(__file__).parent / "data" / "refine_default_path_main.json").read_text("utf-8"))
     golden.pop("_recorded_from")

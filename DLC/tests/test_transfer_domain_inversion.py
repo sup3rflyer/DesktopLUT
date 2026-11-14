@@ -9,7 +9,11 @@ delivered white; HDR the PQ light up to the cube peak). No noise: this is the in
 
 from __future__ import annotations
 
+import json as _json
 import math
+from pathlib import Path as _Path
+
+import pytest
 
 from dlc import mhc_cube as mc
 from dlc.colormath import matvec, rgb_to_xyz_matrix
@@ -152,3 +156,49 @@ def test_hdr_pq_panel_mid_gap_is_closer(monkeypatch):
     assert sum(e_old) / len(e_old) < -0.001
     assert abs(sum(e_new) / len(e_new)) < 0.25 * abs(sum(e_old) / len(e_old))
     assert rms(e_new) < 0.5 * rms(e_old)
+
+
+# ---------------------------------------------------------------------------
+# REAL-RUN cubes: the raw grey ramps of two past SDR runs (tests/data/raw_greys_*.json: BenQ PD2700U 2026-10-01,
+# PA32UCXR 2026-09-25), built with the transfer-domain inversion and with it off (every gap linear light, as
+# before). Pinned: nothing moves down, the shadows below the first transfer-domain gap are bit-identical, the
+# curves stay monotone, the largest move, and entries of the new cube.
+# ---------------------------------------------------------------------------
+
+_REAL = {
+    "benq_20261001": {"first_moved": 142, "worst": (0.8011086466816743, "r", 186),
+                      "pins": {"r300": 0.2880034439099171, "g600": 0.5785811872150262, "b900": 0.8768073933964149,
+                               "g162": 0.15118160227543792}},
+    "pa32_20260925": {"first_moved": 150, "worst": (1.0650298969239977, "r", 174),
+                      "pins": {"r170": 0.1743062904039243, "g300": 0.2974209250821215, "b600": 0.5903495618496033,
+                               "r900": 0.8712180084972455}},
+}
+
+
+def _real_build(label, monkeypatch=None, off=False):
+    doc = _json.loads((_Path(__file__).parent / "data" / f"raw_greys_{label}.json").read_text(encoding="utf-8"))
+    samples = [Ti3Sample(rgb=(s,) * 3, xyz=tuple(x)) for s, x in doc["greys"]]
+    if off:
+        monkeypatch.setattr(mc, "TRANSFER_DOMAIN_MIN_LIGHT", math.inf)
+    curves, _ = mc.build_sdr_cube(samples, doc["primaries"], tuple(doc["white_xy"]), doc["peak"], gamma=2.2)
+    if off:
+        monkeypatch.undo()
+    return curves
+
+
+@pytest.mark.parametrize("label", sorted(_REAL))
+def test_real_run_cube_moves_only_up_mid_gap_and_keeps_the_shadows(label, monkeypatch):
+    exp = _REAL[label]
+    new = _real_build(label)
+    old = _real_build(label, monkeypatch, off=True)
+    moves = [((b - a) * 1023, ch, j) for ch in "rgb" for j, (a, b) in enumerate(zip(old[ch], new[ch]))]
+    assert all(m >= -1e-9 for m, _ch, _j in moves)                                   # never down
+    first = min(j for m, _ch, j in moves if abs(m) > 1e-9)
+    assert first == exp["first_moved"]
+    for ch in "rgb":
+        assert new[ch][:first] == old[ch][:first]                                     # shadows bit-identical
+        assert all(new[ch][j + 1] >= new[ch][j] for j in range(len(new[ch]) - 1))    # monotone
+    worst = max(moves)
+    assert worst[1:] == exp["worst"][1:] and worst[0] == pytest.approx(exp["worst"][0], abs=1e-9)
+    for key, v in exp["pins"].items():
+        assert new[key[0]][int(key[1:])] == pytest.approx(v, abs=1e-12)
