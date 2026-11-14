@@ -13,7 +13,15 @@ from __future__ import annotations
 import math
 from typing import Sequence
 
-__all__ = ["chroma_itp", "light_itp"]
+__all__ = ["chroma_itp", "light_itp", "de_itp"]
+
+
+def de_itp(xyz_a: Sequence[float], xyz_b: Sequence[float]) -> float:
+    """dE_ITP between two ABSOLUTE XYZ (cd/m2) as they are — light and colour together (the refresh-trim verify's
+    "change of the grey from one refresh rate to another"); :func:`chroma_itp` without taking the light out."""
+    from .content_score import xyz_to_itp
+    a, b = xyz_to_itp([[float(v) for v in xyz_a], [float(v) for v in xyz_b]])
+    return 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
 
 
 def chroma_itp(xyz: Sequence[float], ref_xyz: Sequence[float]) -> float:

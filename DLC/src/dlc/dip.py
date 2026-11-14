@@ -175,6 +175,12 @@ class RefreshResponse:
     # and the mode-vs-VRR cross-check. ``rates`` above stays the fixed-mode trim input: a VRR point reaches it only
     # when the cross-check passed. None = no VRR sweep (written exactly as before).
     vrr: Optional[dict[str, Any]] = None
+    # Additive (2026-11-14, schema unchanged): the record's THERMOMETER — the reference-rate greys' chromaticity and
+    # light per level over the recording run (mean, start, end), so a later verify can say whether the panel is as
+    # warm as when this response was measured (dlc.refresh_verify.reference_thermometer). None = not stored (records
+    # before 2026-11-14; a verify then derives it from the run folder's trim_rows.jsonl when that still exists).
+    # DesktopLUT's reader (src/dlc/dlc_data.cpp ParseRefreshSection) reads named keys only and ignores it.
+    thermometer: Optional[dict[str, Any]] = None
 
     def rate(self, key: str) -> Optional[RefreshRate]:
         return next((r for r in self.rates if r.key == key), None)
@@ -189,6 +195,8 @@ class RefreshResponse:
                 r.pop("proof", None)
         if self.vrr is None:
             d.pop("vrr")
+        if self.thermometer is None:
+            d.pop("thermometer")             # a record without one is written exactly as before
         return d
 
     @classmethod
@@ -202,7 +210,8 @@ class RefreshResponse:
                    identity=dict(d.get("identity") or {}), conditions=dict(d.get("conditions") or {}),
                    peak_nits=_opt_float(d.get("peak_nits")), interpolable=bool(d.get("interpolable", False)),
                    verdict=d.get("verdict"), schema=schema, notes=list(d.get("notes") or []),
-                   vrr=(dict(d["vrr"]) if isinstance(d.get("vrr"), dict) else None))
+                   vrr=(dict(d["vrr"]) if isinstance(d.get("vrr"), dict) else None),
+                   thermometer=(dict(d["thermometer"]) if isinstance(d.get("thermometer"), dict) else None))
 
 
 def _opt_pos(d: dict[str, Any], key: str) -> Optional[float]:

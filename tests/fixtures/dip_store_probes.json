@@ -2996,7 +2996,10 @@
      "cube": "bypassed",
      "patch": "100 % window on black, time-bracketed against 60 Hz",
      "instrument": "synthetic meter",
-     "correction": "synthetic.ccmx"
+     "correction": "synthetic.ccmx",
+     "preheat": {
+      "policy": "none"
+     }
     },
     "peak_nits": 1000.0,
     "interpolable": false,
@@ -3405,6 +3408,89 @@
        "added_hz": []
       }
      ]
+    },
+    "thermometer": {
+     "basis": "the reference-rate greys of the run: per level the mean chromaticity and light of every plausible reference read, the first and the last read, and the change between them",
+     "reference": "60",
+     "levels": [
+      {
+       "patch": "g120",
+       "code": 120,
+       "n": 12,
+       "nits": 0.49817904312588573,
+       "x": 0.3127,
+       "y": 0.329,
+       "start": {
+        "t_s": 62.60000000000082,
+        "x": 0.31270000000000003,
+        "y": 0.32899999999999996,
+        "nits": 0.49821466431665246
+       },
+       "end": {
+        "t_s": 641.0000000001323,
+        "x": 0.3127,
+        "y": 0.329,
+        "nits": 0.49825249712952785
+       },
+       "drift_xy": [
+        -5.551115123125783e-17,
+        5.551115123125783e-17
+       ],
+       "drift_light_pct": 0.007593677100459217
+      },
+      {
+       "patch": "g307",
+       "code": 307,
+       "n": 12,
+       "nits": 10.051161997331702,
+       "x": 0.3127,
+       "y": 0.32899999999999996,
+       "start": {
+        "t_s": 64.40000000000123,
+        "x": 0.3127,
+        "y": 0.32899999999999996,
+        "nits": 10.050000265960762
+       },
+       "end": {
+        "t_s": 642.8000000001327,
+        "x": 0.3127,
+        "y": 0.32899999999999996,
+        "nits": 10.052606562296878
+       },
+       "drift_xy": [
+        0.0,
+        0.0
+       ],
+       "drift_light_pct": 0.02593329619049456
+      },
+      {
+       "patch": "g520",
+       "code": 520,
+       "n": 12,
+       "nits": 100.23494640871668,
+       "x": 0.3127,
+       "y": 0.32899999999999996,
+       "start": {
+        "t_s": 66.00000000000159,
+        "x": 0.3127,
+        "y": 0.329,
+        "nits": 100.23927304418996
+       },
+       "end": {
+        "t_s": 644.4000000001331,
+        "x": 0.3127,
+        "y": 0.32899999999999996,
+        "nits": 100.23822214158272
+       },
+       "drift_xy": [
+        0.0,
+        -5.551115123125783e-17
+       ],
+       "drift_light_pct": -0.0010483940827921145
+      }
+     ],
+     "span_s": 578.4000000001315,
+     "run_id": "vrr"
     }
    },
    "eotf_undershoot": null,

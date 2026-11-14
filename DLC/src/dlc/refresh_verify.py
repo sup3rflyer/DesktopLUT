@@ -45,8 +45,18 @@ the nearest reference reads before and after it, ``refresh_trim.bracket_ratios``
   mostly the reference reads' LINEAR drift over the run, ~0.0003 in x; the leg-to-leg repeatability after drift is
   ~0.00001-0.0001, and the rate shifts of 0.0001-0.003 the mhc_only stack showed are real, i.e. the link rounding.)
 
+**What a viewer can see** (2026-11-14, owner: judge by visibility, never polish below it, never move a threshold so a
+run passes): outside either tolerance above, the grey's change from the reference rate to the rate — light and colour
+together, BT.2124 dE_ITP at the grey's own light (:func:`change_itp`) — decides: >= 1 (one JND) = ``fail``, below it
+``pass_below_visibility``, named with its numbers in the rate's ``practical_notes`` and the run's ``summary`` (a single
+read reaching one JND while the combined change does not = ``undecided``). The verify also reports the panel's thermal
+state against the record's (:func:`thermal_state`: the reference greys' chromaticity, the record's from its stored
+thermometer or its run folder; cooler / hotter only from the display's knowledge, :func:`thermal_knowledge`), never a
+gate: a cool PA32UCXR leaves up to ~0.9 % of positive leftover that nobody can see (its knowledge entry F-0006).
+
 Verdict per rate: ``pass`` (every grey passes both, the trim read back on screen on every leg of the rate), ``fail``
-(a luminance miss, a significant chromaticity shift, or the trim not on screen), or ``undecided`` — in ``mhc_only`` a
+(a VISIBLE luminance / chromaticity change, or the trim not on screen), ``pass_below_visibility`` (an invisible one,
+named), or ``undecided`` — in ``mhc_only`` a
 luminance miss below one link code or any chromaticity shift (link rounding: not resolvable without dither), an
 unsettled read, a read with no bracketed ratio (no reference read on both sides, no light, implausible — never dropped
 silently: named per grey in the result), too few reference legs for a repeatability estimate, or anomalies: not a
@@ -319,13 +329,321 @@ def practical_chroma(dx: Optional[float], dy: Optional[float], base_xy: Optional
     if dx is None or dy is None or base_xy is None or not light_nits or light_nits <= 0:
         return {"de_itp": None, "floor": floor, "below": None, "why": "no base chromaticity or light"}
     from .colormath import xy_to_XYZ
-    from .content_score import xyz_to_itp
+    from .visibility import chroma_itp
     x0, y0 = base_xy
-    a, b = xyz_to_itp([xy_to_XYZ(x0, y0, light_nits), xy_to_XYZ(x0 + dx, y0 + dy, light_nits)])
-    de = 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
+    de = chroma_itp(xy_to_XYZ(x0 + dx, y0 + dy, light_nits), xy_to_XYZ(x0, y0, light_nits))
     return {"de_itp": de, "floor": floor, "below": de < floor,
             "source": "ITU-R BT.2124 Annex 1: dE_ITP 1 = one just noticeable difference (the DIP holds no "
                       "between-session white repeatability for this display yet)"}
+
+
+# ----------------------------------------------------------------------------- visibility of the change (pure)
+# The LIGHT gate (verify_lum_tol, 0.3 %) stays the statistical / design tolerance and is never moved so a run passes.
+# Outside it, what decides between "fail" and "pass_below_visibility" is whether a viewer can see the change of the
+# grey from the reference rate to the rate - light and colour together - as BT.2124 dE_ITP at the grey's own light:
+# >= 1 (one JND, the standard's own conservative unit) is visible = fail; below it the leftover is named, with its
+# number, never silently passed (owner rule 2026-11-14: judge by what a viewer can see; never polish below it).
+VISIBILITY_ITP = PRACTICAL_CHROMA_ITP
+
+
+def de_itp(xyz_a: Sequence[float], xyz_b: Sequence[float]) -> float:
+    """BT.2124 dE_ITP between two ABSOLUTE XYZ (cd/m2), light and colour together: :func:`dlc.visibility.de_itp`
+    (the one implementation, pinned in tests/test_visibility.py)."""
+    from .visibility import de_itp as _de_itp
+    return _de_itp(xyz_a, xyz_b)
+
+
+def change_itp(base_xy: Optional[tuple[float, float]], nits: Optional[float], ratio: Optional[float],
+               dx: Optional[float], dy: Optional[float]) -> dict[str, Any]:
+    """How visible the grey's change from the reference rate to the rate is: the reference grey (``base_xy`` at
+    ``nits``) against the same grey at ``nits * ratio`` shifted by (dx, dy), as dE_ITP; also the light alone. A
+    missing chromaticity shift is taken as none (said)."""
+    if base_xy is None or not nits or nits <= 0 or not ratio or ratio <= 0:
+        return {"de_itp": None, "light_itp": None, "why": "no base chromaticity, light or ratio"}
+    from .colormath import xy_to_XYZ
+    x0, y0 = base_xy
+    ref = xy_to_XYZ(x0, y0, nits)
+    out: dict[str, Any] = {"light_itp": de_itp(xy_to_XYZ(x0, y0, nits * ratio), ref)}
+    if dx is None or dy is None:
+        out["de_itp"] = out["light_itp"]
+        out["why"] = "no chromaticity shift: light only"
+    else:
+        out["de_itp"] = de_itp(xy_to_XYZ(x0 + dx, y0 + dy, nits * ratio), ref)
+    return out
+
+
+# ----------------------------------------------------------------------------- the thermal state (pure + read-only)
+# A white reading moves 0.001-0.0025 in xy between sessions on a real rig (meter placement, instrument); a thermal
+# state is called only beyond THERMAL_TOL_XY, the distance of the MEDIAN difference over the comparable levels.
+THERMAL_TOL_XY = 0.002
+THERMAL_TOL_BASIS = ("0.002 in xy, the distance of the median difference over the comparable levels: inside the "
+                     "0.001-0.0025 a white reading moves between sessions on a real rig, so only a clear difference "
+                     "is called (the margin = distance / tolerance is shown)")
+# A level is a thermometer for the comparison only where the verify shows the record's stimulus: its reference light
+# within this of the record's level (the as-viewed stack renders dark greys at another light than the record's
+# calibration-only stack: the PA32UCXR's 0.5 / 2 nit greys read 0.19 / 1.5 nit as viewed).
+THERMAL_LIGHT_MATCH = 0.10
+NOT_ESTABLISHED = ", but within the display's session-to-session offset: not established"
+THERMAL_STATES = ("as the record", "cooler than the record", "hotter than the record",
+                  "cooler than the record" + NOT_ESTABLISHED, "hotter than the record" + NOT_ESTABLISHED, "unknown")
+
+
+def _median(v: Sequence[float]) -> float:
+    s = sorted(v)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def thermometer_summary(th: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """The thermometer's in-run drift in a line: per level start -> end, and the medians over the levels."""
+    lv = (th or {}).get("levels") or []
+    if not lv:
+        return None
+    dx = [v["drift_xy"][0] for v in lv]
+    dy = [v["drift_xy"][1] for v in lv]
+    dl = [v["drift_light_pct"] for v in lv if v.get("drift_light_pct") is not None]
+    return {"levels": len(lv), "span_s": th.get("span_s"),
+            "drift_x_median": _median(dx), "drift_y_median": _median(dy),
+            "drift_light_pct_median": _median(dl) if dl else None,
+            "per_level": [{"patch": v["patch"], "nits": round(v["nits"], 3), "x": round(v["x"], 5),
+                           "y": round(v["y"], 5), "x_start": round(v["start"]["x"], 5), "x_end": round(v["end"]["x"], 5),
+                           "drift_light_pct": (round(v["drift_light_pct"], 3)
+                                               if v.get("drift_light_pct") is not None else None)} for v in lv]}
+
+
+def thermal_knowledge(store_root: Optional[Path | str], names: Sequence[Optional[str]], *, mode: str = "HDR",
+                      today: Optional[str] = None) -> Optional[dict[str, Any]]:
+    """KNOWLEDGE FACET HOOK (read-only): what the display's knowledge (``dlc.knowledge``) says about its thermal
+    offset — the first MEASURED entry with a ``thermal_offset`` signature whose scope covers ``mode``. From its
+    signature: the thermometer axis (the ``d<axis>_thermometer`` key of ``max_abs``), the sign and largest size of the
+    rate leftover when cooler (``sign.rate_ratio_when_cooler``, ``max_abs.rate_ratio_pct``); which way along the axis
+    is cooler from ``sign.d<axis>_thermometer_when_cooler`` when the entry carries it, else from its observations'
+    paired ``<axis>_..._cool`` / ``<axis>_..._hot`` numbers. Nothing is written (no view re-render either); a missing,
+    broken or unrelated store is no knowledge (``None``). Evidence for the digest only, never a gate."""
+    if not store_root:
+        return None
+    try:
+        from .knowledge import KnowledgeStore, entry_state
+        ks = KnowledgeStore(Path(store_root))
+        uid = None
+        for n in names:
+            if not n:
+                continue
+            try:
+                uid = ks.resolve(str(n))
+                break
+            except Exception:  # noqa: BLE001 - an unknown / ambiguous name: try the next
+                continue
+        doc = ks.load_tolerant(uid) if uid else None
+    except Exception:  # noqa: BLE001 - knowledge is evidence, never a failure
+        return None
+    if not doc:
+        return None
+    entries = [e for e in doc.get("entries") or [] if isinstance(e, dict)]
+
+    def in_scope(e: dict) -> bool:
+        modes = (e.get("scope") or {}).get("mode")
+        return not modes or mode in modes
+
+    # entries about the refresh response: a see_field to a DIP refresh_response, the refresh_response_key facet, and
+    # (one step) the entries that refine those
+    refresh_ids = {e.get("id") for e in entries
+                   if "refresh_response_key" in (e.get("facets") or {})
+                   or any(str(lk.get("field") or "").endswith(".refresh_response") for lk in e.get("links") or [])}
+    refresh_ids |= {e.get("id") for e in entries
+                    if (e.get("signature") or {}).get("type") != "thermal_offset"
+                    and any(lk.get("rel") in ("refines", "refined_by") and lk.get("id") in refresh_ids
+                            for lk in e.get("links") or [])}
+    refresh_ids.discard(None)
+    found, skipped = [], []
+    for e in entries:
+        sig = e.get("signature") or {}
+        if sig.get("type") != "thermal_offset" or e.get("status") != "measured" or not in_scope(e):
+            continue
+        mx, sign = dict(sig.get("max_abs") or {}), dict(sig.get("sign") or {})
+        axis = next((k[1] for k in mx if k.startswith("d") and k.endswith("_thermometer") and len(k) > 1), None)
+        cooler, how = None, None
+        if axis:
+            # the structured form: sign.d<axis>_thermometer_when_cooler = '+' / '-' (the validator's axis -> sign)
+            s = sign.get(f"d{axis}_thermometer_when_cooler")
+            if s in ("+", "-"):
+                cooler, how = (1 if s == "+" else -1), f"signature sign.d{axis}_thermometer_when_cooler '{s}'"
+            else:
+                for o in e.get("observations") or []:
+                    nums = o.get("numbers") or {}
+                    for k, v in nums.items():
+                        if not (k.startswith(axis + "_") and k.endswith("_cool")):
+                            continue
+                        hot = nums.get(k[:-len("_cool")] + "_hot")
+                        if isinstance(v, (int, float)) and isinstance(hot, (int, float)) and v != hot:
+                            cooler = 1 if v > hot else -1
+                            how = f"observation {o.get('id')}: {k} {v} vs {k[:-len('_cool')]}_hot {hot}"
+                            break
+                    if cooler is not None:
+                        break
+        if cooler is None:
+            skipped.append(e.get("id"))        # no direction: it cannot say cooler / hotter, and must not hide one
+            continue
+        rank = (2 if any(lk.get("id") in refresh_ids for lk in e.get("links") or []) else 0) \
+            + (1 if any(k.startswith("rate_ratio") for k in list(sign) + list(mx)) else 0)
+        found.append((rank, e, sig, mx, sign, axis, cooler, how))
+    out: dict[str, Any] = {"unit": uid, "entry": None, "axis": None, "cooler_sign": None,
+                           "skipped_without_direction": skipped}
+    if found:
+        rank, e, sig, mx, sign, axis, cooler, how = max(found, key=lambda f: f[0])   # first of the best rank
+        try:
+            state = entry_state(doc, e, today=today)
+        except Exception:  # noqa: BLE001
+            state = {}
+        out.update({"entry": e.get("id"), "title": e.get("title"), "axis": axis, "cooler_sign": cooler,
+                    "cooler_from": how, "leftover_sign_when_cooler": sign.get("rate_ratio_when_cooler"),
+                    "leftover_max_pct": mx.get("rate_ratio_pct"), "thermometer_max_abs": mx.get(f"d{axis}_thermometer"),
+                    "precondition": sig.get("precondition"), "about_refresh_response": rank >= 2,
+                    "can_explain": state.get("can_explain"), "cannot_explain_why": state.get("cannot_explain_why")})
+    # the display's (rig's) session-to-session offset of a white reading: a thermal difference inside it is not
+    # established (a re-placed meter does that by itself)
+    for e in entries:
+        sig = e.get("signature") or {}
+        if e.get("status") not in ("measured", "inferred"):
+            continue
+        bound = sig.get("max_abs_dxy") if sig.get("type") == "session_offset" else None
+        if bound is None:
+            bound = ((e.get("facets") or {}).get("session_offset_bound") or {}).get("dxy")
+        if isinstance(bound, (int, float)) and bound > 0:
+            out.update({"session_offset_dxy": float(bound), "session_offset_entry": e.get("id")})
+            break
+    if out["entry"] is None and "session_offset_dxy" not in out:
+        return None
+    return out
+
+
+def record_thermometer(response: Any, run_dirs: Sequence[Path | str] = ()) -> tuple[Optional[dict[str, Any]], str]:
+    """The record's thermometer: the one stored with the DIP's refresh response (records from 2026-11-14 on), else
+    derived from its run folder's ``trim_rows.jsonl`` (``<runs>/probes/<run_id>`` or ``<runs>/<run_id>``), else none.
+    ``(thermometer, where it came from)``."""
+    if response is None:
+        return None, "no recorded refresh response"
+    get = (lambda k: response.get(k)) if isinstance(response, dict) else (lambda k: getattr(response, k, None))
+    stored = get("thermometer")
+    if isinstance(stored, dict) and stored.get("levels"):
+        return stored, "stored with the record"
+    run_id = str(get("run_id") or "")
+    ref = str((get("reference") or {}).get("key") or rt.REF_RATE)
+    if run_id:
+        for base in run_dirs:
+            for cand in (Path(base) / "probes" / run_id, Path(base) / run_id):
+                f = cand / "trim_rows.jsonl"
+                if f.exists():
+                    try:
+                        th = rt.reference_thermometer(rt.load_rows(f), ref)
+                    except Exception as exc:  # noqa: BLE001
+                        return None, f"{f} unreadable ({type(exc).__name__}: {exc})"
+                    if th["levels"]:
+                        th["run_id"] = run_id
+                        return th, f"derived from {f}"
+    return None, (f"the record ({run_id or 'no run id'}) stores no thermometer and its run folder was not found"
+                  + (f" under {', '.join(str(b) for b in run_dirs)}" if run_dirs else ""))
+
+
+def thermal_state(verify_th: Optional[dict[str, Any]], record_th: Optional[dict[str, Any]], *,
+                  knowledge: Optional[dict[str, Any]] = None, record_source: str = "",
+                  tol_xy: float = THERMAL_TOL_XY, light_match: float = THERMAL_LIGHT_MATCH) -> dict[str, Any]:
+    """Is the panel as warm as when the response was recorded? The verify's reference greys against the record's,
+    level by level where both show the same stimulus (60-Hz light within ``light_match``), as the median difference
+    in x and y. Within ``tol_xy`` = ``as the record``; beyond it ``cooler`` / ``hotter`` only when the display's
+    knowledge says which way along its thermometer axis is warmer and the levels agree in direction, else
+    ``unknown`` (with the difference stated). Never guessed: no record thermometer / no comparable level = unknown."""
+    out: dict[str, Any] = {"state": "unknown", "tolerance_xy": tol_xy, "tolerance_basis": THERMAL_TOL_BASIS,
+                           "light_match": light_match, "record_source": record_source,
+                           "verify": thermometer_summary(verify_th), "record": thermometer_summary(record_th),
+                           "knowledge": knowledge}
+    vl = (verify_th or {}).get("levels") or []
+    rl = (record_th or {}).get("levels") or []
+    if not rl:
+        out["why"] = f"no record thermometer ({record_source or 'none'})"
+        return out
+    if not vl:
+        out["why"] = "the verify read no usable reference grey"
+        return out
+    pairs = []
+    for v in vl:
+        r = min(rl, key=lambda r: abs(math.log(r["nits"] / v["nits"])) if r["nits"] > 0 and v["nits"] > 0 else 1e9)
+        same = r["nits"] > 0 and abs(v["nits"] / r["nits"] - 1.0) <= light_match
+        pairs.append({"patch": v["patch"], "nits": round(v["nits"], 3), "record_patch": r["patch"],
+                      "record_nits": round(r["nits"], 3), "comparable": same,
+                      "dx": v["x"] - r["x"], "dy": v["y"] - r["y"]})
+    out["levels"] = [{**p, "dx": round(p["dx"], 5), "dy": round(p["dy"], 5)} for p in pairs]
+    use = [p for p in pairs if p["comparable"]]
+    if not use:
+        out["why"] = (f"no level shows the record's stimulus (reference light within {light_match * 100:g} % of a "
+                      "record level): the two stacks render these greys differently")
+        return out
+    mdx, mdy = _median([p["dx"] for p in use]), _median([p["dy"] for p in use])
+    dist = math.hypot(mdx, mdy)
+    agree = sum(1 for p in use if p["dx"] * mdx + p["dy"] * mdy > 0)
+    out.update({"n_levels": len(use), "median_dx": round(mdx, 5), "median_dy": round(mdy, 5),
+                "distance_xy": round(dist, 5), "margin": round(dist / tol_xy, 2), "levels_agreeing": agree})
+    if dist <= tol_xy:
+        out["state"] = "as the record"
+        return out
+    if 3 * agree < 2 * len(use):
+        out["why"] = (f"the levels disagree in direction ({agree} of {len(use)} with the median): no thermal state "
+                      "is called")
+        return out
+    kn = knowledge or {}
+    axis, cooler = kn.get("axis"), kn.get("cooler_sign")
+    if axis not in ("x", "y") or cooler not in (1, -1):
+        out["why"] = ("the reference greys read differently from the record's beyond the session tolerance, but this "
+                      "display's knowledge does not say which way is warmer")
+        return out
+    comp = mdx if axis == "x" else mdy
+    if abs(comp) <= 0.5 * tol_xy:
+        out["why"] = f"the difference lies mostly off the display's thermometer axis ({axis})"
+        return out
+    which = "cooler than the record" if comp * cooler > 0 else "hotter than the record"
+    out["direction_from"] = f"{kn.get('entry')} ({kn.get('cooler_from')})"
+    # a difference a re-placed meter makes by itself is no thermal state: the display's own session-to-session offset
+    # bound (its knowledge), else the tolerance
+    bound = kn.get("session_offset_dxy")
+    out["session_offset_dxy"] = float(bound) if bound else tol_xy
+    out["session_offset_from"] = (f"{kn.get('session_offset_entry')} (session_offset max_abs_dxy)" if bound
+                                  else "the session tolerance (no session_offset entry in the display's knowledge)")
+    if dist <= out["session_offset_dxy"]:
+        out["state"] = f"{which}, but within the display's session-to-session offset: not established"
+        out["established"] = False
+        return out
+    out["state"] = which
+    out["established"] = True
+    return out
+
+
+def thermal_words(th: dict[str, Any]) -> str:
+    """The thermal state in words for the digest; the knowledge's expectation only when it supplies one."""
+    st = th.get("state")
+    if st == "as the record":
+        s = (f"panel as warm as when the response was recorded (reference greys {th.get('median_dx'):+.4f} / "
+             f"{th.get('median_dy'):+.4f} in x / y over {th.get('n_levels')} level(s), within {th.get('tolerance_xy')})")
+    elif st in THERMAL_STATES[3:5]:
+        s = (f"panel possibly {st.split(' than')[0]} than when the response was recorded (reference greys "
+             f"{th.get('median_dx'):+.4f} / {th.get('median_dy'):+.4f} in x / y over {th.get('n_levels')} level(s), "
+             f"{th.get('distance_xy')} in xy), but within the display's session-to-session offset "
+             f"({th.get('session_offset_dxy')}, {th.get('session_offset_from')}): not established")
+    elif st in ("cooler than the record", "hotter than the record"):
+        s = (f"panel {st.split(' than')[0]} than when the response was recorded (reference greys "
+             f"{th.get('median_dx'):+.4f} / {th.get('median_dy'):+.4f} in x / y over {th.get('n_levels')} level(s), "
+             f"tolerance {th.get('tolerance_xy')}, margin {th.get('margin')}x)")
+        kn = th.get("knowledge") or {}
+        lsign, lmax = kn.get("leftover_sign_when_cooler"), kn.get("leftover_max_pct")
+        if lsign in ("+", "-") and lmax is not None:
+            if st.startswith("cooler"):
+                s += (f": a {'positive' if lsign == '+' else 'negative'} leftover of up to about {lmax:g} % is "
+                      f"expected ({kn.get('entry')}: {kn.get('title')})")
+            else:
+                s += (f": a leftover of the opposite sign ({'negative' if lsign == '+' else 'positive'}) is expected "
+                      f"({kn.get('entry')} sizes the cooler side only, up to about {lmax:g} %)")
+    else:
+        s = f"thermal state unknown ({th.get('why')})"
+    return s
 
 
 def link_code_pct(light_nits: Optional[float], link_bpc: Optional[int]) -> Optional[float]:
@@ -341,8 +659,13 @@ def link_code_pct(light_nits: Optional[float], link_bpc: Optional[int]) -> Optio
 
 def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: float = 0.003,
                    trim_checks: Sequence[dict[str, Any]] = (), anomalies: Sequence[dict[str, Any]] = (),
-                   status: str = "ok", stack: str = "as_viewed", link_bpc: Optional[int] = None) -> dict[str, Any]:
+                   status: str = "ok", stack: str = "as_viewed", link_bpc: Optional[int] = None,
+                   record_th: Optional[dict[str, Any]] = None, record_source: str = "",
+                   knowledge: Optional[dict[str, Any]] = None,
+                   stacks: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """The verdict from the run's rows (``trim_rows.jsonl``). Pure; see the module docstring for the rule.
+    ``record_th`` = the record's thermometer (:func:`record_thermometer`), ``knowledge`` = :func:`thermal_knowledge`,
+    ``stacks`` = what the record and this verify were measured through (words for the thermal state).
     ``stack`` = what was measured (``as_viewed`` / ``mhc_only``); ``link_bpc`` = the link's bits per channel (one link
     code in % of light is reported per grey; in ``mhc_only`` — no DesktopLUT pass, so no dither — a light miss inside one
     link code is "not resolvable without dither", undecided, not fail)."""
@@ -392,60 +715,78 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             refs = [_xy(x.get("xyz")) for x in rt.series(usable, patch, reference)]
             refs = [r for r in refs if r[0] is not None]
             base_xy = (sum(r[0] for r in refs) / len(refs), sum(r[1] for r in refs) / len(refs)) if refs else None
-            practical = practical_chroma(c.get("dx"), c.get("dy"), base_xy,
-                                         c.get("y60") or cell.get("nominal_nits"))
+            light = c.get("y60") or cell.get("nominal_nits")
+            practical = practical_chroma(c.get("dx"), c.get("dy"), base_xy, light)
             ct["practical"] = practical
-            # statistically real but below the practical floor: reported beside the statistical verdict, never
-            # silently - the shift is named, with both numbers, in the rate's notes
-            below_floor = chroma_ok is False and practical.get("below") is True
+            # the change of the grey from the reference rate to the rate, light and colour together, as dE_ITP at the
+            # grey's own light: what decides between fail and pass_below_visibility outside the tolerances
+            vis = change_itp(base_xy, light, ratio, c.get("dx"), c.get("dy"))
+            single_vis = [change_itp(base_xy, x.get("y60") or light, x["ratio"], x.get("dx"), x.get("dy")).get("de_itp")
+                          for x in singles]
+            single_vis = [v for v in single_vis if v is not None]
+            vis["worst_single_itp"] = max(single_vis) if single_vis else None
+            de = vis.get("de_itp")
+            visible = de is not None and de >= VISIBILITY_ITP
             code_pct = link_code_pct(c.get("y60"), link_bpc)
             worst_pct = max([abs(cell["pct"])] + [abs(x["ratio"] - 1.0) * 100.0 for x in singles])
             below_code = code_pct is not None and worst_pct < code_pct
+            outside = (not lum_ok) or chroma_ok is False
             cell.update(lum_ok=lum_ok, chroma_ok=chroma_ok, chroma=ct, link_code_pct=code_pct,
-                        residual_below_one_link_code=below_code if code_pct is not None else None)
+                        residual_below_one_link_code=below_code if code_pct is not None else None,
+                        visibility=vis, visibility_itp=de)
+            vis_txt = (f"{de:.2f} dE_ITP at {light:.1f} nit (light alone {vis['light_itp']:.2f})"
+                       if de is not None else f"visibility unknown ({vis.get('why')})")
             if not lum_ok and stack == "mhc_only" and below_code:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: light {cell['pct']:+.3f} % (worst single {worst_pct:.3f} %) is outside "
                                      f"+/-{lum_tol * 100:g} % but below one {link_bpc}-bit link code here "
                                      f"({code_pct:.3f} %): not resolvable without dither (mhc_only stack: no "
                                      "DesktopLUT pass dithers the MHC output)")
-            elif not lum_ok:
+            elif not lum_ok and (visible or de is None):
                 cell["verdict"] = "fail"
                 why_fail.append(f"{patch}: light {cell['pct']:+.3f} % (single reads {[round((v - 1) * 100, 3) for v in cell['ratios']]} %) "
-                                f"outside +/-{lum_tol * 100:g} %"
+                                f"outside +/-{lum_tol * 100:g} %, and the change {reference} -> {rate} Hz is visible: "
+                                f"{vis_txt} (>= {VISIBILITY_ITP:g} = one JND, BT.2124)"
                                 + (f" (one {link_bpc}-bit link code = {code_pct:.3f} %)" if code_pct is not None else ""))
-            elif lost:
-                cell["verdict"] = "undecided"
-                why_undecided.append(f"{patch}: {len(lost)} of {len(taken)} read(s) without a bracketed ratio: {lost}")
-            elif below_floor and cell["unsettled"]:
-                cell["verdict"] = "undecided"
-                why_undecided.append(f"{patch}: {cell['unsettled']} unsettled read(s)")
-            elif below_floor:
-                cell["verdict"] = "pass_below_visibility"
-                cell["chroma_practical_pass"] = True
-                notes.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} is "
-                             f"statistically real (p {min(ct['x']['p'], ct['y']['p']):.2g} < {p_crit:.2g}) but "
-                             f"{practical['de_itp']:.2f} dE_ITP at {c.get('y60') or cell.get('nominal_nits'):.1f} nit, "
-                             f"below the practical floor {practical['floor']:g} (one JND, BT.2124): practical pass")
-            elif chroma_ok is False and stack == "mhc_only" and code_pct is not None:
+            elif chroma_ok is False and visible and stack == "mhc_only" and code_pct is not None:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} is "
                                      f"real against the reference legs' repeatability (p {min(ct['x']['p'], ct['y']['p']):.2g}) "
                                      f"but the mhc_only stack has no dither: each channel lands on whole {link_bpc}-bit "
                                      f"link codes ({code_pct:.3f} % of light each here), which moves the chromaticity "
                                      "by itself — not resolvable without dither")
-            elif chroma_ok is False:
+            elif chroma_ok is False and (visible or de is None):
                 cell["verdict"] = "fail"
                 why_fail.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} (p {ct['x']['p']:.2g}, critical "
                                 f"{ct['x']['critical_shift']:.5f}), dy {ct['y']['shift']:+.5f} (p {ct['y']['p']:.2g}, "
                                 f"critical {ct['y']['critical_shift']:.5f}) beyond the reference legs' own repeatability "
-                                f"(Student t, nu {ct['nu']}, Bonferroni p < {p_crit:.2g})")
+                                f"(Student t, nu {ct['nu']}, Bonferroni p < {p_crit:.2g}), and visible: {vis_txt}")
+            elif lost:
+                cell["verdict"] = "undecided"
+                why_undecided.append(f"{patch}: {len(lost)} of {len(taken)} read(s) without a bracketed ratio: {lost}")
             elif chroma_ok is None:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: {ct.get('why')}")
             elif cell["unsettled"]:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: {cell['unsettled']} unsettled read(s)")
+            elif outside and vis["worst_single_itp"] is not None and vis["worst_single_itp"] >= VISIBILITY_ITP:
+                cell["verdict"] = "undecided"
+                why_undecided.append(f"{patch}: the combined change is {vis_txt}, below one JND, but a single read "
+                                     f"reaches {vis['worst_single_itp']:.2f}: judge the reads")
+            elif outside:
+                cell["verdict"] = "pass_below_visibility"
+                cell["practical_pass"] = True
+                what = []
+                if not lum_ok:
+                    what.append(f"light {cell['pct']:+.3f} % (single reads "
+                                f"{[round((v - 1) * 100, 3) for v in cell['ratios']]} %) outside +/-{lum_tol * 100:g} %")
+                if chroma_ok is False:
+                    cell["chroma_practical_pass"] = True
+                    what.append(f"chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} statistically "
+                                f"real (p {min(ct['x']['p'], ct['y']['p']):.2g} < {p_crit:.2g})")
+                notes.append(f"{patch}: " + "; ".join(what) + f" - the change {reference} -> {rate} Hz is {vis_txt}, "
+                             f"below one JND (BT.2124 dE_ITP {VISIBILITY_ITP:g}): pass below visibility")
             else:
                 cell["verdict"] = "pass"
             cells[patch] = cell
@@ -476,20 +817,38 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
     worst = max([v["verdict"] for v in out_rates.values()] or ["undecided"], key=lambda v: _RANK[v])
     if run_undecided and worst in ("pass", "pass_below_visibility"):
         worst = "undecided"
+    thermo = rt.reference_thermometer(usable, reference)
+    thermal = thermal_state(thermo, record_th, knowledge=knowledge, record_source=record_source)
+    if stacks:
+        thermal["stacks"] = stacks
+    summary = run_summary(out_rates, thermal, worst, run_undecided)
     return {"verdict": worst, "stack": stack, "link_bpc": link_bpc,
+            "summary": summary["line"], "per_rate": summary["per_rate"], "recommendation": summary["recommendation"],
+            "thermal": thermal, "thermometer": thermo,
             "rule": {"luminance": f"|ratio - 1| <= {lum_tol * 100:g} % (combined and every single read), "
                                   "time-bracketed against the reference"
                                   + ("; in mhc_only a miss below one link code is 'not resolvable without dither' "
-                                     "(undecided)" if stack == "mhc_only" else ""),
+                                     "(undecided)" if stack == "mhc_only" else "")
+                                  + f"; outside it the grey's change {reference} Hz -> rate, light and colour "
+                                  f"together, decides: >= {VISIBILITY_ITP:g} dE_ITP (one JND, ITU-R BT.2124) at the "
+                                  "grey's own light = 'fail' (visible), below it 'pass_below_visibility', named with "
+                                  "its number in practical_notes (unsettled / unbracketed reads, or a single read "
+                                  "reaching one JND, make it undecided first). The tolerance is never moved so a run "
+                                  "passes",
+                     "thermal": (f"the reference greys' chromaticity against the record's, per level where the "
+                                 f"reference light is within {THERMAL_LIGHT_MATCH * 100:g} % of a record level: "
+                                 f"{THERMAL_TOL_BASIS}; cooler / hotter only from the display's knowledge (which way "
+                                 "is warmer), else unknown. Reported, never a gate"),
                      "chromaticity": (f"the combined shift (mean over the passes) in x and in y against the grey's own "
                                       f"reference-leg repeatability: leave-one-out interpolation residuals of the "
                                       f"reference reads (drift included), t = shift / (rms / sqrt(n)), Student t with nu = "
                                       f"their count; a shift fails when its two-sided p < {CHROMA_ALPHA:g} / "
                                       f"{max(1, 2 * n_chroma)} tests (Bonferroni: <= {CHROMA_ALPHA:g} chance of any false "
-                                      "fail in the run); a shift that fails it but is under the practical floor "
-                                      f"(dE_ITP {PRACTICAL_CHROMA_ITP:g} = one JND, ITU-R BT.2124, at the grey's light) is "
-                                      "'pass_below_visibility', named with its number in practical_notes - never a "
-                                      "silent pass; unsettled reads make it undecided first"),
+                                      "fail in the run); a shift that fails it while the grey's change (light and colour "
+                                      f"together) is under the practical floor (dE_ITP {PRACTICAL_CHROMA_ITP:g} = one "
+                                      "JND, ITU-R BT.2124, at the grey's light) is 'pass_below_visibility', named with "
+                                      "its number in practical_notes - never a silent pass; unsettled reads make it "
+                                      "undecided first"),
                      "chromaticity_p_crit": p_crit,
                      "trim": "state.get refresh_trim reads the rate's variant on screen on every leg (stamp rule)"},
             "reference": reference, "rates": out_rates, "run_undecided": run_undecided,
@@ -498,11 +857,60 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             "unbracketed": [{k: x.get(k) for k in ("leg", "rate", "patch")} for x in ratios if x.get("unbracketed")]}
 
 
+def run_summary(out_rates: dict[str, Any], thermal: dict[str, Any], verdict: str,
+                run_undecided: Sequence[str]) -> dict[str, Any]:
+    """The line the overseer judges at a glance: per rate the leftover's mean and range over the greys and its
+    largest change in JND, the thermal state, the drift inside the run; and the recommendation (fail only for a
+    visible leftover; pass_below_visibility with the list otherwise; undecided when the rule cannot say)."""
+    per_rate: dict[str, Any] = {}
+    parts = []
+    below, visible = [], []
+    for rate, v in out_rates.items():
+        cells = [(p, c) for p, c in v["greys"].items() if c.get("pct") is not None]
+        pcts = [c["pct"] for _, c in cells]
+        vis = [(c.get("visibility_itp"), p) for p, c in cells if c.get("visibility_itp") is not None]
+        top = max(vis) if vis else (None, None)
+        per_rate[rate] = {"verdict": v["verdict"], "n": len(pcts),
+                          "mean_pct": round(sum(pcts) / len(pcts), 3) if pcts else None,
+                          "min_pct": round(min(pcts), 3) if pcts else None,
+                          "max_pct": round(max(pcts), 3) if pcts else None,
+                          "largest_itp": round(top[0], 3) if top[0] is not None else None, "largest_at": top[1]}
+        for p, c in cells:
+            item = f"{rate} Hz {p}: {c['pct']:+.2f} %, {c['visibility_itp']:.2f} JND" if c.get("visibility_itp") \
+                is not None else f"{rate} Hz {p}: {c['pct']:+.2f} %"
+            if c.get("verdict") == "pass_below_visibility":
+                below.append(item)
+            elif c.get("verdict") == "fail":
+                visible.append(item)
+        pr = per_rate[rate]
+        parts.append(f"{rate} Hz: leftover mean {pr['mean_pct']:+.2f} % (range {pr['min_pct']:+.2f}..{pr['max_pct']:+.2f}"
+                     f" over {pr['n']} greys), largest {pr['largest_itp']:.2f} JND at {pr['largest_at']}"
+                     if pcts and top[0] is not None else f"{rate} Hz: no bracketed grey")
+    drift = (thermal.get("verify") or {})
+    drift_txt = (f"drift inside the run (reference greys, first -> last read, median over {drift['levels']} levels): "
+                 f"x {drift['drift_x_median']:+.4f}, y {drift['drift_y_median']:+.4f}"
+                 + (f", light {drift['drift_light_pct_median']:+.2f} %" if drift.get("drift_light_pct_median") is not None
+                    else "")) if drift else "no drift reading"
+    line = "; ".join(parts) + f". {thermal_words(thermal)}. {drift_txt}. Verdict: {verdict}"
+    if visible:
+        line += f" (visible: {', '.join(visible)})"
+    elif below:
+        line += f" (below visibility: {', '.join(below)})"
+    if run_undecided:
+        line += f"; the run: {'; '.join(run_undecided)}"
+    rec = {"verdict": verdict, "visible": visible, "below_visibility": below,
+           "rule": "fail only for a visible leftover (>= 1 JND dE_ITP at the grey's light); below it "
+                   "pass_below_visibility with every such grey named; undecided where the rule cannot decide"}
+    return {"line": line, "per_rate": per_rate, "recommendation": rec}
+
+
 def digest_lines(res: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for rate, v in res["rates"].items():
         out.append({"rate": rate, "verdict": v["verdict"],
                     "pct_by_grey": {p: (round(c["pct"], 3) if c.get("pct") is not None else None)
+                                    for p, c in v["greys"].items()},
+                    "itp_by_grey": {p: (round(c["visibility_itp"], 3) if c.get("visibility_itp") is not None else None)
                                     for p, c in v["greys"].items()},
                     "link_code_pct_by_grey": {p: (round(c["link_code_pct"], 3) if c.get("link_code_pct") is not None
                                                   else None) for p, c in v["greys"].items()},

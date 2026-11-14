@@ -26,6 +26,14 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
   greys the build interpolated in linear light, which on any gamma-like panel lands a little dark mid-gap (up to
   ~1 % on the default ramp, several % on sparse ones). Above 1 % of white it now interpolates in the transfer
   domain (SDR gamma, HDR PQ), which the raw ramps of all 29 past runs fit better; the shadows are built as before.
+- **REFRESH TRIM verify judges light by what a viewer can see** (2026-11-14): outside the 0.3 % light gate (unchanged)
+  a grey's change between refresh rates, light and colour together, fails only at one just noticeable difference
+  (BT.2124 dE_ITP 1) or more; below it the verify passes it as `pass_below_visibility` and names it with its number.
+  The verify now reports the panel's thermal state against the recorded response (`as the record`, `cooler`,
+  `hotter`, `unknown`; a cooler panel leaves a small positive leftover on some displays), a one-line summary per
+  rate, and the drift inside the run. Recorded responses store their reference greys' chromaticity for this (older
+  records still load). New optional `preheat: closed_loop` takes the panel to its operating load before a record or
+  a verify, so both can be taken in the same thermal state.
 - **`grayscale-wb` verify after review** (2026-11-14): colour is judged again in the fit's own metric against the
   run's `--target`, with the level's noise taken from the full colour difference of nearby re-read pairs; dE_ITP at
   the grey's light is reported beside it and sets the class (`regressed` >= 1 JND, revert; `regressed_below_visibility`
