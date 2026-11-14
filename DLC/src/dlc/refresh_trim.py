@@ -193,6 +193,43 @@ def combine(ratios: Sequence[dict[str, Any]]) -> dict[str, dict[str, dict[str, A
     return out
 
 
+# ----------------------------------------------------------------------------- the thermometer
+THERMOMETER_BASIS = ("the reference-rate greys of the run: per level the mean chromaticity and light of every "
+                     "plausible reference read, the first and the last read, and the change between them")
+
+
+def reference_thermometer(rows: Iterable[dict[str, Any]], ref: str = REF_RATE) -> dict[str, Any]:
+    """The run's THERMOMETER: per grey level, the chromaticity and light of its reference-rate reads — mean over the
+    run, the first and the last read, and the in-run drift between them (``drift_xy``, ``drift_light_pct``). A
+    panel's grey chromaticity follows how warm it is from its own backlight load (the PA32UCXR: hot = lower x, F-0006
+    in its knowledge), so two runs' thermometers say whether they were taken in the same thermal state. Reads only;
+    which way is warmer is NOT decided here (that is the display's knowledge)."""
+    per: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        if r.get("kind") != "grey" or str(r.get("rate")) != str(ref) or r.get("implausible"):
+            continue
+        if not _usable(r) or r.get("t_s") is None or _xy(r["xyz"])[0] is None:
+            continue
+        per.setdefault(str(r["patch"]), []).append(r)
+    levels = []
+    for patch, s in per.items():
+        s = sorted(s, key=lambda r: float(r["t_s"]))
+        xs = [_xy(r["xyz"]) for r in s]
+        ys = [float(r["y"]) for r in s]
+        first, last = s[0], s[-1]
+        levels.append({
+            "patch": patch, "code": int((first.get("code") or [0])[0]), "n": len(s),
+            "nits": sum(ys) / len(ys), "x": sum(p[0] for p in xs) / len(xs), "y": sum(p[1] for p in xs) / len(xs),
+            "start": {"t_s": float(first["t_s"]), "x": xs[0][0], "y": xs[0][1], "nits": ys[0]},
+            "end": {"t_s": float(last["t_s"]), "x": xs[-1][0], "y": xs[-1][1], "nits": ys[-1]},
+            "drift_xy": [xs[-1][0] - xs[0][0], xs[-1][1] - xs[0][1]],
+            "drift_light_pct": (ys[-1] / ys[0] - 1.0) * 100.0 if ys[0] > 0 else None})
+    levels.sort(key=lambda lv: lv["nits"])
+    span = [lv["end"]["t_s"] - lv["start"]["t_s"] for lv in levels]
+    return {"basis": THERMOMETER_BASIS, "reference": str(ref), "levels": levels,
+            "span_s": max(span) if span else None}
+
+
 # ----------------------------------------------------------------------------- chi-square survival (no scipy)
 def _gammq(a: float, x: float) -> float:
     """Regularised upper incomplete gamma Q(a, x) (Numerical Recipes gser / gcf)."""
@@ -530,7 +567,8 @@ SAME_AS_TESTS: dict[str, tuple[str, str]] = {"59.94": ("P3_59_94_control", REF_R
 
 def response_from_run(trim: dict[str, Any], tests: dict[str, Any], *, run_id: str, measured: str,
                       identity: dict[str, Any], conditions: dict[str, Any],
-                      hz_measured: Optional[dict[str, float]] = None) -> Any:
+                      hz_measured: Optional[dict[str, float]] = None,
+                      thermometer: Optional[dict[str, Any]] = None) -> Any:
     """The DIP section (``dlc.dip.RefreshResponse``) for one analysed run: per measured rate its exact rational,
     the grey levels (the 60-Hz light, the ratio, its uncertainty, the repeats), and the frozen tests' verdicts
     (``same_as`` where an equality / control test passed; luminance-only and channel-independence per rate)."""
@@ -571,7 +609,8 @@ def response_from_run(trim: dict[str, Any], tests: dict[str, Any], *, run_id: st
                            reference={"key": ref_key, "num": num, "den": den}, identity=dict(identity),
                            conditions=dict(conditions), peak_nits=trim.get("peak_nits"),
                            interpolable=bool(model.get("usable_for_unmeasured_rates", False)),
-                           verdict=model.get("verdict"), vrr=dict(trim.get("vrr") or {}) or None)
+                           verdict=model.get("verdict"), vrr=dict(trim.get("vrr") or {}) or None,
+                           thermometer=thermometer)
 
 
 def run_problems(evidence: dict[str, Any], trim: dict[str, Any], result: dict[str, Any]) -> list[str]:
@@ -649,8 +688,17 @@ def response_for_run_dir(run_dir: Path | str) -> tuple[Any, list[str], dict[str,
     started = str(evidence.get("started") or "")
     run_id = str((result.get("meta") or {}).get("run") or run.name)
     measured = started[:10] if len(started) >= 10 else f"{run_id[:4]}-{run_id[4:6]}-{run_id[6:8]}"
+    # the record's thermometer (its reference greys' chromaticity per level), stored with it so a later verify can
+    # compare thermal states without the run folder (an optional field: old records stay valid)
+    thermo = None
+    if (run / "trim_rows.jsonl").exists():
+        ref_key = str((trim.get("reference") or {}).get("rate") or REF_RATE)
+        thermo = reference_thermometer(load_rows(run / "trim_rows.jsonl"), ref_key)
+        thermo["run_id"] = run_id
+        if not thermo["levels"]:
+            thermo = None
     resp = response_from_run(trim, result.get("tests") or {}, run_id=run_id, measured=measured, identity=identity,
-                             conditions=conditions, hz_measured=_hz_measured(evidence))
+                             conditions=conditions, hz_measured=_hz_measured(evidence), thermometer=thermo)
     return resp, run_problems(evidence, trim, result), trim
 
 

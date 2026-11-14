@@ -463,7 +463,25 @@ simulated run, anomalies, a layer that was on, no hardware id); add `--write` to
 human switches REFRESH TRIM on** in the app (**PIPELINE** → **GRAYSCALE**, HDR side: the REFRESH TRIM row, or
 `layers.set` with `refresh_trim: true`). DesktopLUT reads the DIP again on its next refresh-rate switch, on
 *RELOAD* in that row, or on a `layers.set` with `refresh_trim`; `state.get` → `refresh_trim` says what is applied.
-Nothing is swapped during a calibration session.
+Nothing is swapped during a calibration session. The record also stores its **thermometer** (the reference greys'
+chromaticity and light per level over the run), so a later verify can tell whether the panel is as warm as then.
+
+**Verify the trim** (spec `"purpose": "verify"`, `python -m dlc.refresh_probe plan --purpose verify --out <spec>`;
+the trim stays ON and is never switched; nothing is recorded). Judge the digest by its `summary` line:
+- Per grey and rate: `pass` (light within `verify_lum_tol`, 0.3 %, and the chromaticity inside the reference legs'
+  repeatability); outside them, the grey's change from the reference rate to the rate, light and colour together, as
+  BT.2124 dE_ITP at its own light decides: `fail` at >= 1 JND (visible), `pass_below_visibility` below it, named with
+  both numbers; `undecided` as before (unsettled / unbracketed reads, too few reference legs, the trim not read back),
+  and when a single read reaches one JND while the combined change does not. The 0.3 % gate is never moved so a run
+  passes. The recommendation: `fail` only for a visible leftover.
+- `thermal_state`: the reference greys against the record's thermometer, at the levels whose light matches the
+  record's: `as the record` within 0.002 in xy (a white reading moves 0.001-0.0025 between sessions), `cooler than
+  the record` / `hotter than the record` only when the display's knowledge says which way is warmer, else `unknown`
+  (with the numbers). On a cooler panel the knowledge may say a positive leftover is expected (the PA32UCXR: up to
+  about 0.9 %, F-0006): below one JND it is no defect. Reported, never a gate; no temperature-following trim.
+- `preheat` (spec, both purposes): `none` (default: the warm-in at the reference only) or `closed_loop` (DLC's
+  closed-loop thermal preheat on the run's greys first). Offer `closed_loop` when a record and a verify should be
+  compared in the same regime; the plan seam says which was chosen.
 
 ## 17. Peak by window — the ABL graph (HDR)
 

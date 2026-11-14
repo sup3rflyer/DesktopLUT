@@ -108,13 +108,24 @@ def test_a_trim_that_holds_the_light_passes_and_nothing_is_recorded(tmp_path, ca
     assert any(e["event"] == "check_in" and e["stage"] == rp.STAGE for e in ev)
 
 
-def test_a_trim_that_leaves_light_fails_on_luminance(tmp_path):
+def test_a_trim_that_leaves_light_is_judged_by_what_a_viewer_can_see(tmp_path):
+    """A trim that leaves 30 % of the panel's response (~1 % of light, outside the 0.3 % gate) is a leftover below
+    one JND: pass_below_visibility, every such grey named with its number. No trim at all (the full ~2.6-3.4 %
+    response) is visible: fail."""
     cal, api, _, ctrl = _calib(tmp_path, "resid", residual=0.3)
     res = cal.run("refresh-response")
-    assert res.status == "completed" and res.digest["verdict"] == "fail"
+    assert res.status == "completed" and res.digest["verdict"] == "pass_below_visibility", res.digest
     r48 = next(x for x in res.digest["rates"] if x["rate"] == "47.952")
-    assert r48["verdict"] == "fail" and any("outside +/-0.3 %" in f for f in r48["fail"])
+    assert r48["verdict"] == "pass_below_visibility" and r48["fail"] == []
+    assert any("outside +/-0.3 %" in n and "below one JND" in n for n in r48["practical_notes"])
+    assert all(v is not None and v < 1.0 for v in r48["itp_by_grey"].values())
+    assert res.digest["recommendation"]["below_visibility"] and "Verdict: pass_below_visibility" in res.digest["summary"]
     assert _at(api) == (60, 1) and _layers(ctrl).get("refresh_trim") is True
+    cal2, _, _, _ = _calib(tmp_path, "resid_full", residual=1.0)
+    res2 = cal2.run("refresh-response")
+    assert res2.status == "completed" and res2.digest["verdict"] == "fail"
+    r48 = next(x for x in res2.digest["rates"] if x["rate"] == "47.952")
+    assert r48["verdict"] == "fail" and any("is visible" in f and "outside +/-0.3 %" in f for f in r48["fail"])
 
 
 def test_a_trim_variant_that_never_shows_fails_the_rate(tmp_path):
@@ -240,8 +251,12 @@ def test_the_rule_luminance_and_chromaticity():
     cell = res["rates"]["47.952"]["greys"]["g520"]
     assert cell["chroma"]["nu"] == 3 and cell["chroma"]["ok"] is True
     assert cell["reference_repeatability"]["rms_x"] > 0
-    # light 0.5 % over the bracket -> fail
-    assert rv.analyze_verify(_bracketed(rate_y=(100.6, 100.6)), reference="60", trim_checks=ok)["verdict"] == "fail"
+    # light 0.5 % over the bracket: outside the 0.3 % gate, 0.36 dE_ITP at 100 nit -> pass below visibility, named;
+    # 1.9 % (1.35 dE_ITP) -> fail
+    half = rv.analyze_verify(_bracketed(rate_y=(100.6, 100.6)), reference="60", trim_checks=ok)
+    assert half["verdict"] == "pass_below_visibility"
+    assert half["rates"]["47.952"]["greys"]["g520"]["visibility_itp"] == pytest.approx(0.36, abs=0.03)
+    assert rv.analyze_verify(_bracketed(rate_y=(102.0, 102.0)), reference="60", trim_checks=ok)["verdict"] == "fail"
     # a chromaticity shift of 0.002 (>> the legs' ~1e-4 repeatability, and well inside the 0.0003 linear drift the old
     # max-min spread counted) -> fail, with the statistics in the reason
     shifted = _bracketed(rate_xy=((0.3147, 0.3290), (0.3147, 0.3290)))
@@ -326,11 +341,12 @@ def test_mhc_only_names_a_residual_below_one_link_code():
     cell = res["rates"]["47.952"]["greys"]["g520"]
     assert res["verdict"] == "undecided" and cell["residual_below_one_link_code"] is True
     assert "not resolvable without dither" in res["rates"]["47.952"]["undecided"][0]
-    big = _bracketed(rate_y=(101.5, 101.5))                # +1.5 %: more than one code -> fail even without dither
+    big = _bracketed(rate_y=(102.0, 102.0))                # +1.9 %: more than one code and visible -> fail
     assert rv.analyze_verify(big, reference="60", trim_checks=ok, stack="mhc_only", link_bpc=10)["verdict"] == "fail"
-    # as viewed the same +0.5 % is a plain fail (0.3 % stays), the code size still reported
+    # as viewed the same +0.5 % is outside the 0.3 % gate but below visibility, the code size still reported
     res_v = rv.analyze_verify(rows, reference="60", trim_checks=ok, stack="as_viewed", link_bpc=10)
-    assert res_v["verdict"] == "fail" and res_v["rates"]["47.952"]["greys"]["g520"]["link_code_pct"] > 0.9
+    assert res_v["verdict"] == "pass_below_visibility"
+    assert res_v["rates"]["47.952"]["greys"]["g520"]["link_code_pct"] > 0.9
 
 
 def test_spec_problems_and_plan_cli(tmp_path):
@@ -441,9 +457,11 @@ def test_an_unbracketed_read_makes_the_rate_undecided_and_is_named():
     dark = {**_row(3, "47.952", 180, 100.1, (0.3127, 0.3290)), "y": None, "xyz": None}
     res2 = rv.analyze_verify(rows + [dark], reference="60", trim_checks=ok)
     assert res2["rates"]["47.952"]["greys"]["g520"]["unbracketed"][0]["why"] == "no reading"
-    # a light miss still fails (the worse verdict wins)
-    bad = _bracketed(rate_y=(100.6, 100.6))
+    # a visible light miss still fails (the worse verdict wins); one below visibility with a lost read is undecided
+    bad = _bracketed(rate_y=(102.0, 102.0))
     assert rv.analyze_verify(bad + [late], reference="60", trim_checks=ok)["verdict"] == "fail"
+    small = _bracketed(rate_y=(100.6, 100.6))
+    assert rv.analyze_verify(small + [late], reference="60", trim_checks=ok)["verdict"] == "undecided"
 
 
 def test_state_get_raising_inside_the_trim_check_ends_at_the_reference_with_the_bypass_restored(tmp_path, monkeypatch):

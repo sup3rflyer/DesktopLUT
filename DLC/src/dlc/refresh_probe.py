@@ -65,6 +65,7 @@ VERIFY_STACK = {"bypass_3dlut": True}                          # verify mhc_only
 VERIFY_STACKS = ("as_viewed", "mhc_only")
 VIEWING_LAYERS = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")   # controller.LAYER_NAMES
 SOURCES = ("mode", "vrr")
+PREHEATS = ("none", "closed_loop")
 
 __all__ = ["RefreshProbeSpec", "mode_legs", "levels_for_peak", "ModeSource", "run_flow", "restore_run",
            "sim_desk_for_mock", "STAGE"]
@@ -116,6 +117,13 @@ class RefreshProbeSpec:
     # MHC (3D LUT bypassed, viewing layers off): nothing dithers, so residuals below one link code are not resolvable
     verify_stack: str = "as_viewed"
     verify_layers_off: tuple[str, ...] = ()   # as_viewed: viewing layers switched off for the run (restored after)
+    # The thermal state the run is taken in (offered, never forced; the record flow and the verify alike). "none"
+    # (default, today's behaviour) = the probe's own warm-in at the reference only: the panel is measured in whatever
+    # state it is in (a cool panel's refresh response is larger than a hot one's on the PA32UCXR, F-0006).
+    # "closed_loop" = DLC's closed-loop thermal preheat first (dlc.thermal.ThermalController, the HDR flows' preheat:
+    # the run's own greys, soaked up to 1.6x and glided to their operating load until light and balance are flat), so a
+    # record and a verify both taken this way are in the same regime.
+    preheat: str = "none"
 
     @classmethod
     def from_dict(cls, d: Optional[dict[str, Any]]) -> "RefreshProbeSpec":
@@ -162,6 +170,8 @@ class RefreshProbeSpec:
         bad = sorted(set(self.verify_layers_off) - set(VIEWING_LAYERS))
         if bad:
             out.append(f"verify_layers_off: unknown layer(s) {bad}; known: {list(VIEWING_LAYERS)}")
+        if self.preheat not in PREHEATS:
+            out.append(f"preheat must be one of {PREHEATS}, not {self.preheat!r}")
         if self.verify_layers_off and self.verify_stack != "as_viewed":
             out.append("verify_layers_off applies to verify_stack 'as_viewed' (mhc_only switches every viewing layer off)")
         return out
@@ -536,6 +546,34 @@ class _Probe:
             self.anomaly("warm_not_converged", reads=ys[-5:], note="the legs go on; the brackets carry the drift")
         return out
 
+    def preheat(self) -> dict[str, Any]:
+        """``preheat: closed_loop``: DLC's closed-loop thermal preheat (:class:`dlc.thermal.ThermalController`, as the
+        HDR flows use it) on this run's own greys at the run's window, before the warm-in: soaked up to ``k_start``
+        and glided to the greys' operating load until the neutral reference's light and balance are flat within
+        their self-calibrated read noise. Its outcome is evidence; a run that did not converge goes on (flagged)."""
+        from .engine.patches import Transfer
+        from .thermal import ThermalConfig, ThermalController
+        transfer = Transfer.pq(int(self.cal.bit_depth))       # the probe is HDR only; no target is resolved for it
+        greys = [tuple(p["rgb"]) for p in self.patches if p["kind"] == "grey"]
+        dip = self.cal._dip()
+        noise = (dip.recommended_drift_threshold / 3.0) if (dip is not None and dip.recommended_drift_threshold) else None
+
+        def measure(mp: MeasurePatch) -> Any:
+            return self._read(replace(mp, window_area_pct=self.window), {"part": "preheat", "patch": mp.label}).reading
+
+        t0 = self.clock.now()
+        res = ThermalController(measure=measure, transfer=transfer, content=greys,
+                                ref_nits=code_nits(self.settle_code, int(self.cal.bit_depth)), balance_noise=noise,
+                                config=ThermalConfig(peak_nits=self.st.get("peak_nits")), clock=self.clock.now).run()
+        out = {"policy": "closed_loop", "converged": res.converged, "regime": res.regime, "reason": res.reason,
+               "blocks": res.blocks, "content_reads": res.content_reads, "final_k": res.final_k,
+               "compromised": res.compromised, "protection_limited": res.protection_limited,
+               "minutes": round((self.clock.now() - t0) / 60.0, 2)}
+        if not res.converged or res.compromised:
+            self.anomaly("preheat_not_converged", **out,
+                         note="the legs go on; the thermal state is reported against the record's")
+        return out
+
     def settle_after_switch(self, t_switch: float, min_s: float, after_s: float) -> dict[str, Any]:
         sp = self.spec
         code = (self.settle_code,) * 3
@@ -686,6 +724,9 @@ class _Probe:
         elif self.spec.verify:
             self.trim_check(ref)
         if done == 0:
+            if self.spec.preheat == "closed_loop" and "preheat" not in st:
+                st["preheat"] = self.preheat()
+                self.cal._save()
             st["warm_in"] = self.warm_in(self.spec.warm_min_s)
         else:
             st.setdefault("rewarm", []).append(self.warm_in(self.spec.rewarm_min_s))
@@ -803,6 +844,18 @@ def verify_stack_words(spec: RefreshProbeSpec, st: dict[str, Any]) -> str:
               "keyed by the refresh rate, and the adaptive ones (dynamic tone map, FALD / LED lag) settle on a static "
               "grey before the reads (per-layer notes in the digest). To take a layer out, re-plan with the spec key "
               "verify_layers_off [names]; verify_stack mhc_only isolates the MHC. ")
+
+
+def preheat_words(spec: RefreshProbeSpec) -> str:
+    """The plan seam's sentence on the thermal state the run is taken in, and why it matters."""
+    why = ("why it matters: a panel's refresh response can depend on how warm it is from its own backlight load (the "
+           "PA32UCXR's is ~0.4-0.9 points larger cool than hot, F-0006), so a record and a verify compare cleanly only "
+           "when taken in the same regime; the verify reports its thermal state against the record's either way. ")
+    if spec.preheat == "closed_loop":
+        return ("Preheat: closed_loop — DLC's closed-loop thermal preheat on the run's own greys first (soak, then "
+                "glide to their operating load until light and balance are flat), then the warm-in; " + why)
+    return ("Preheat: none (default) — only the warm-in at the reference: the panel is measured in the state it is "
+            "in; preheat 'closed_loop' would take it to the greys' operating load first; " + why)
 
 
 def _reference_words(st: dict[str, Any]) -> str:
@@ -1039,6 +1092,44 @@ def analyze_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, source: An
             "record": f"python -m dlc.refresh_trim record --run {root}  (dry run; then --write)"}
 
 
+def _verify_thermal_inputs(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec
+                           ) -> tuple[Optional[dict[str, Any]], str, Optional[dict[str, Any]], dict[str, Any]]:
+    """The thermal comparison's inputs (read-only, evidence only; any failure = unknown): the record's thermometer
+    (stored with the DIP's refresh response, else derived from its run folder), the display's knowledge about its
+    thermal offset (the knowledge store beside the DIP store), and what each was measured through."""
+    from . import refresh_verify as rv
+    from .paths import runs_dir
+    resp = None
+    try:
+        dip = cal._dip()
+        resp = getattr(dip, "refresh_response", None) if dip is not None else None
+    except Exception:  # noqa: BLE001
+        resp = None
+    bases: list[Path] = []
+    for b in (runs_dir(), getattr(cal.ctx.root, "parent", None)):
+        if b is not None and Path(b) not in bases:
+            bases.append(Path(b))
+    record_th, source = rv.record_thermometer(resp, bases)
+    knowledge = None
+    try:
+        from .calibrate import dip_store_path
+        root = Path(dip_store_path(cal.profile, cal.ctx.root)).parent / "dip_knowledge"
+        mon = monitor_entry(cal)
+        knowledge = rv.thermal_knowledge(root, [mon.get("edid_id"), cal.display.name, st.get("hardware_id")],
+                                         mode=str(cal.mode))
+    except Exception:  # noqa: BLE001 - knowledge is evidence, never a failure
+        knowledge = None
+    cond = (getattr(resp, "conditions", None) or {}) if resp is not None else {}
+    stacks = {"record": ("the calibration alone (3D LUT bypassed, viewing layers off)" if cond.get("cube") == "bypassed"
+                         else (f"through {cond.get('cube')}" if cond.get("cube") else "unknown")),
+              "verify": ("as viewed (3D LUT and viewing layers as the owner has them)" if spec.as_viewed
+                         else "the MHC alone (3D LUT bypassed, viewing layers off)")}
+    if stacks["record"] != stacks["verify"]:
+        stacks["note"] = ("the two were measured through different stacks: only levels whose reference light matches "
+                          "the record's are compared")
+    return record_th, source, knowledge, stacks
+
+
 def analyze_verify_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, source: Any, status: str) -> dict[str, Any]:
     """verify: evidence.json + verify_result.json (never trim_curves.json / refresh_result.json: nothing to record)."""
     from . import refresh_verify as rv
@@ -1055,10 +1146,12 @@ def analyze_verify_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, sou
                 "audit_stack": {"monitor_identity": _identity(cal, st["hardware_id"])}}
     write_json(root / "evidence.json", evidence)
     link_bpc = (st.get("link") or {}).get("link_bpc")
+    record_th, record_source, knowledge, stacks = _verify_thermal_inputs(cal, st, spec)
     res = rv.analyze_verify(rows, reference=st["reference"], lum_tol=spec.verify_lum_tol,
                             trim_checks=st.get("trim_checks") or [], anomalies=st.get("anomalies") or [],
                             status="ok" if status == "ok" else status, stack=spec.verify_stack,
-                            link_bpc=int(link_bpc) if link_bpc else None)
+                            link_bpc=int(link_bpc) if link_bpc else None, record_th=record_th,
+                            record_source=record_source, knowledge=knowledge, stacks=stacks)
     res["meta"] = {"run": root.name, "status": status, "simulated": simulated, "purpose": rv.PURPOSE,
                    "verify_stack": spec.verify_stack, "measured_stack": st.get("measured_stack"),
                    # a hook pass that processes the HDR frame (a 3D LUT in the path) dithers the MHC input; without one
@@ -1067,7 +1160,13 @@ def analyze_verify_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, sou
                                                and not ((st.get("measured_stack") or {}).get("layers") or {}).get("bypass_3dlut")),
                    "never_recorded": "a verify is evidence only: python -m dlc.refresh_trim record refuses it"}
     write_json(root / rv.RESULT_FILE, res)
-    return {"purpose": rv.PURPOSE, "verdict": res["verdict"], "verify_stack": spec.verify_stack,
+    th = res.get("thermal") or {}
+    return {"purpose": rv.PURPOSE, "verdict": res["verdict"], "summary": res.get("summary"),
+            "recommendation": res.get("recommendation"), "per_rate": res.get("per_rate"),
+            "thermal_state": th.get("state"), "thermal": {k: th.get(k) for k in (
+                "state", "why", "median_dx", "median_dy", "distance_xy", "margin", "n_levels", "tolerance_xy",
+                "record_source", "direction_from", "stacks")},
+            "preheat": st.get("preheat"), "verify_stack": spec.verify_stack,
             "link_bpc": res.get("link_bpc"), "rates": rv.digest_lines(res), "rule": res.get("rule"),
             "run_undecided": res["run_undecided"], "anomalies": len(st.get("anomalies") or []),
             "result": str(root / rv.RESULT_FILE), "simulated": simulated}
@@ -1161,13 +1260,14 @@ def run_flow(cal: Any) -> Any:
                       f"against {', '.join(plan.get('measure') or [])} Hz; "
                       f"{len(st['legs'])} legs, {est['switches']} rate changes, greys at "
                       f"{', '.join(f'{n:g}' for n in st['levels_nits'])} nit on a {st['window_area_pct']:g} % window; "
-                      f"~{est['total_min'][0]:.0f}-{est['total_min'][1]:.0f} min. " + path
+                      f"~{est['total_min'][0]:.0f}-{est['total_min'][1]:.0f} min. " + path + preheat_words(spec)
                       + ("Every switch away from the reference asks its own consent. " if source.kind == "mode" else "")
                       + "approve = start; abort = nothing changes."),
             options=("approve", "abort"), recommendation="approve",
             digest={"reference_basis": st.get("reference_basis"), "reference_recorded": st.get("reference_recorded"),
                     "plan": st["plan"], "legs": st["legs"], "estimate": est, "levels_nits": st["levels_nits"],
                     "window_area_pct": st["window_area_pct"], "reference": st["reference"], "source": source.kind,
+                    "preheat": spec.preheat,
                     **({"verify_stack": spec.verify_stack, "verify_layers_off": list(spec.verify_layers_off),
                         "layers_now": st.get("layers_at_plan"), "cube_now": st.get("cube_at_plan"),
                         "link": st.get("link"), "per_layer": verify_layer_notes(st.get("layers_at_plan") or {})}
@@ -1281,6 +1381,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "dither, residuals below one link code not resolvable)")
     pp.add_argument("--verify-layers-off", default=None, dest="verify_layers_off",
                     help="verify as_viewed: comma list of viewing layers switched off for the run (restored after)")
+    pp.add_argument("--preheat", choices=PREHEATS, default="none",
+                    help="none (default): the warm-in at the reference only; closed_loop: DLC's closed-loop thermal "
+                         "preheat first, so a record and a verify are taken in the same regime")
     pp.add_argument("--out", default=None, help="write the spec JSON (run --spec)")
     rp = sub.add_parser("run", help="the flow (other arguments pass to python -m dlc.calibrate)")
     rp.add_argument("--spec", default=None)
@@ -1299,7 +1402,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0 if "plan" in rep else 2
     if args.cmd == "plan":
         spec = RefreshProbeSpec.from_dict({
-            "source": args.source, "reference": args.reference, "purpose": args.purpose,
+            "source": args.source, "reference": args.reference, "purpose": args.purpose, "preheat": args.preheat,
             **({"colours": False, "verify_stack": args.verify_stack} if args.purpose == "verify" else {}),
             **({"verify_layers_off": [n.strip() for n in args.verify_layers_off.split(",") if n.strip()]}
                if args.verify_layers_off else {}),
