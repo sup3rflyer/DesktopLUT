@@ -78,7 +78,6 @@ import numpy as np
 
 from .adjudication import (
     SEAM_BACKUP,
-    SEAM_BASE_HOLDOUT,
     SEAM_BRIGHTNESS,
     SEAM_CHARACTERIZE,
     SEAM_CORRECTION,
@@ -971,10 +970,7 @@ class Calibration:
         "hardware-readiness": ("Hardware readiness", False),
         "brightness": ("Brightness", False),
         "measure:raw": ("Measure · raw panel", True),
-        "raw-densify": ("Raw greys · narrow features", False),
-        "measure:raw-dense": ("Measure · densified greys", True),
         "build-install-mhc": ("Build + install MHC", False),
-        "measure:base-holdout": ("Measure · base held-out check", False),
         "refine-mhc-cube": ("Refine MHC (HDR cube)", True),
         "refine-mhc-grayscale": ("Refine MHC grayscale", True),
         "seed-from-run": ("Seed from source run", False),
@@ -1016,19 +1012,6 @@ class Calibration:
             keys = [k for k in keys if k != "verify-patches-file"]
         if not self.calib.get("verify_cube"):
             keys = [k for k in keys if k != "install-candidate"]
-        # The densify pass is data-driven: it exists only once raw-densify planned greys (a smooth
-        # panel never measures one); the held-out check only with its knob on and once the build
-        # carried a feature report (an identity-fallback build has nothing to check).
-        stages = self.calib.get("stages") or {}
-        dens = stages.get("raw-densify") or {}
-        if not ((dens.get("data") or {}).get("codes") or (dens.get("data") or {}).get("anchors")):
-            keys = [k for k in keys if k != "measure:raw-dense"]
-        built = (stages.get("build-install-mhc") or {}).get("status") == "done"
-        st = getattr(self, "_state", None)
-        has_report = bool((((((st or {}).get("mhc_params") or {}).get("base_lut") or {})
-                            .get("summary") or {}).get("grey_features"))) if isinstance(st, dict) else False
-        if int(self.patch_sizes.base_holdout_points) <= 0 or (built and not has_report):
-            keys = [k for k in keys if k != "measure:base-holdout"]
         out: list[dict[str, Any]] = []
         for key in keys:
             label, long = self._STAGE_LABELS.get(key, (key, False))
@@ -5183,17 +5166,14 @@ class Calibration:
                 pass
             return None
 
-    def stage_build_install_mhc(self, raw_ti3: str, *, dense_ti3: Optional[str] = None) -> StageOutcome:
+    def stage_build_install_mhc(self, raw_ti3: str) -> StageOutcome:
         def run() -> StageOutcome:
             spec = self._spec()
             # Derive MHC params from the raw TI3 (reuses the proven build-mhc stage:
             # measured primaries + native-white→target-white matrix + tone-only base 1D).
-            # ``dense_ti3`` = the raw-densify pass (stage_densify_raw_greys), folded into the base
-            # cube's grey ramp only.
             args = Namespace(run=self.ctx.root, monitor=self.monitor, mode=self.mode,
                              simulate=False, gamma=spec.gamma, source_ti3=raw_ti3,
-                             is_hdr=spec.is_hdr, top_hold=self.mhc_top_hold,
-                             dense_grey_ti3=dense_ti3, max_cv=self._transfer().max_cv)
+                             is_hdr=spec.is_hdr, top_hold=self.mhc_top_hold)
             if spec.is_hdr:
                 # ONE SOURCE OF TRUTH (Task C): hand build-mhc the SAME resolved max-sustained peak
                 # patch bounding uses (_patch_max_cv → _hdr_target().peak_nits), so the MHC cube
@@ -5251,16 +5231,6 @@ class Calibration:
                 # LUT goes flat and at what drive — the evidence that greys above the calibrated top
                 # stay at the D65 cap white instead of walking back toward native.
                 digest["top_hold"] = top_hold
-            base_summary = (base_lut or {}).get("summary") or {}
-            gfeat = base_summary.get("grey_features")
-            if gfeat:
-                # Narrow grey features the base cube was built AROUND (envelope, not data) — evidence
-                # for the LLM, with the panel's own structure scale they were judged against.
-                digest["grey_features"] = {
-                    k: gfeat.get(k) for k in ("features", "structure_pct", "luminance_sigma",
-                                              "luminance_sigma_basis", "levels_judged")}
-            if base_summary.get("grey_densify"):
-                digest["grey_densify"] = base_summary["grey_densify"]
             sanity = self._mhc_foundation_sanity_check()
             if sanity:
                 digest["sanity"] = sanity
@@ -5278,165 +5248,6 @@ class Calibration:
         if outcome.status == "done" and self._spec().is_hdr:
             self._pin_hdr_peak_to_cap(outcome)
         return outcome
-
-    def stage_densify_raw_greys(self, raw_ti3: str) -> Optional[str]:
-        """Resolve the raw grey ramp's NARROW features before the base 1D LUT is built.
-
-        The base cube inverts the measured grey shares piecewise-linearly between the raw levels, so a
-        deviation one level shows and its neighbours do not (PA32UCXR 2026-09-25: grey 165 -5 % against
-        the 132..198 envelope, repeatable for months) gets a correction shaped by the SPACING, not by
-        the panel. :func:`build_mhc.grey_densify_plan` judges the raw ramp exactly as the build will
-        (``dlc.grey_features``: leave-one-out envelope vs the panel's own level-to-level structure and
-        the run's measured read noise) and, for each feature the spacing cannot resolve, plans greys
-        across the span between its neighbours at the LUT's resolution step, plus the neighbours and the
-        flagged level as ANCHORS read at the start and end of the pass (the repeat is the outlier check;
-        the anchors put the pass on the raw pass's scale). Measured here as role ``raw-dense``; the
-        build folds it in (``merge_dense_greys``). Returns the dense TI3, or ``None`` when nothing needs
-        it (a smooth panel: no read at all). Mechanics only — the plan and every feature it found ride
-        the stage digest + a check-in note for the LLM; what the build then did is in the
-        build-install-mhc digest (``grey_features`` / ``grey_densify``)."""
-        key = "raw-densify"
-        ps = self.patch_sizes
-
-        def run() -> StageOutcome:
-            spec = self._spec()
-            transfer = self._transfer()
-            peak = None
-            if spec.is_hdr:
-                try:
-                    peak = self._hdr_target().peak_nits
-                except Exception:  # noqa: BLE001 - the raw max then bounds the analysis
-                    peak = None
-            try:
-                res = build_mhc.grey_densify_plan(
-                    raw_ti3, is_hdr=spec.is_hdr, gamma=spec.gamma, max_cv=transfer.max_cv,
-                    max_reads=int(ps.raw_densify_max_reads), resolved_peak_nits=peak)
-            except Exception as exc:  # noqa: BLE001 - a refinement, never a precondition
-                self.runlog.anomaly(key, kind="grey_densify",
-                                    message=f"raw grey densify plan unavailable ({type(exc).__name__}: {exc}); "
-                                            "the base cube is built from the raw ramp alone")
-                return StageOutcome(key, "done", digest={"skipped": True, "reason": f"{type(exc).__name__}: {exc}"},
-                                    data={"codes": [], "anchors": []})
-            plan = res["plan"]
-            digest = {"features": res["features"], "structure_pct": res["structure_pct"],
-                      "luminance_sigma": res["luminance_sigma"],
-                      "luminance_sigma_basis": res["luminance_sigma_basis"],
-                      "levels_judged": res["levels_judged"], "dark_floor_nits": res["dark_floor_nits"],
-                      "plan": {k: plan.get(k) for k in ("spans", "reads", "coarsened", "max_reads")},
-                      "budget_off": int(ps.raw_densify_max_reads) <= 0}
-            return StageOutcome(key, "done", digest=digest,
-                                data={"codes": plan["codes"], "anchors": plan["anchors"]})
-
-        outcome = self._stage(key, run)
-        codes = [int(c) for c in (outcome.data or {}).get("codes") or ()]
-        anchors = [int(c) for c in (outcome.data or {}).get("anchors") or ()]
-        digest = outcome.digest or {}
-        if digest.get("features") and not outcome.replayed:
-            unresolved = [f for f in digest["features"] if not f.get("resolved")]
-            self.runlog.note(
-                key, (f"raw grey ramp: {len(digest['features'])} narrow feature(s) "
-                      f"({len(unresolved)} unresolved by the spacing) against a level-to-level structure of "
-                      f"{digest.get('structure_pct')} %; densifying {len(codes)} grey(s) + {len(anchors)} "
-                      "anchor(s)" if codes or anchors else
-                      f"raw grey ramp: {len(digest['features'])} narrow feature(s); NO densify pass "
-                      f"(budget {ps.raw_densify_max_reads}) — the base is built from their neighbours' envelope"),
-                features=digest["features"], plan=digest.get("plan"))
-        if not codes and not anchors:
-            return None
-        cap = self._patch_max_cv() or self._transfer().max_cv
-        seq = [(a, a, a) for a in anchors if a <= cap]
-        patches = seq + [(c, c, c) for c in codes if c <= cap] + seq
-        meas = self.stage_measure(role="raw-dense", patches=patches,
-                                  ti3_name="raw_dense.ti3", ndjson_name="raw_dense.ndjson")
-        return (meas.data or {}).get("ti3")
-
-    def stage_base_holdout_check(self) -> Optional[StageOutcome]:
-        """Self-check of the INSTALLED base 1D LUT on greys the fit never saw (``dlc.grey_features``).
-
-        Reads ``patch_sizes.base_holdout_points`` held-out greys — the gap midpoints beside every
-        feature the build modelled plus midpoints spread over the range — each with its two bracketing
-        fit levels, in one pass through the just-installed MHC (matrix + base, before the refine), and
-        judges each against the straight line through its bracket in the build's own three series
-        (luminance, r/g, b/g) and against the build's own scales (read noise, panel structure). A miss
-        is a narrow error the fit could not see: a seam (``build-install-mhc:holdout``) with the table,
-        never a silent pass; nothing missed = a check-in note with the same table. ``None`` when off,
-        or when the build carried no feature report (an older run / identity fallback)."""
-        n = int(self.patch_sizes.base_holdout_points)
-        if n <= 0:
-            return None
-        params = (self._state.get("mhc_params") or {}) if isinstance(self._state, dict) else {}
-        summary = ((params.get("base_lut") or {}).get("summary") or {})
-        report = summary.get("grey_features")
-        if not report or not report.get("fit_codes"):
-            return None
-        from . import grey_features as gfm
-        from .mhc_cube import pq_eotf, pq_oetf
-        spec = self._spec()
-        transfer = self._transfer()
-        max_cv = transfer.max_cv
-        peak = float(params.get("target_luminance") or 0.0)
-        floor_nits = float(report.get("y_floor_nits") or 0.0)
-        if spec.is_hdr:
-            def eotf(s: float) -> float:
-                return pq_eotf(s)
-            dark_sig = pq_oetf(min(floor_nits, 10000.0) / 10000.0)
-            cap = self._patch_max_cv() or max_cv
-            peak = float((params.get("base_lut") or {}).get("peak_nits") or peak)
-        else:
-            def eotf(s: float, _g: float = spec.gamma) -> float:
-                return s ** _g
-            dark_sig = (min(floor_nits, peak) / peak) ** (1.0 / spec.gamma) if peak > 0 else 0.0
-            cap = None
-        if peak <= 0:
-            return None
-        points = gfm.held_out_codes(report["fit_codes"], report, max_cv=max_cv,
-                                    floor_code=int(math.ceil(2.0 * dark_sig * max_cv)),
-                                    ceiling_code=cap, uniform=n, max_points=n)
-        if not points:
-            return None
-        codes = sorted({c for p in points for c in (p["code"], p["lo"], p["hi"])})
-        meas = self.stage_measure(role="base-holdout", patches=[(c, c, c) for c in codes],
-                                  ti3_name="base_holdout.ti3", ndjson_name="base_holdout.ndjson")
-        ti3 = (meas.data or {}).get("ti3")
-        reads: dict[int, Any] = {}
-        if ti3 and Path(ti3).exists():
-            for smp in parse_ti3(Path(ti3)):
-                if smp.rgb[0] == smp.rgb[1] == smp.rgb[2]:
-                    reads[int(round(smp.rgb[0] * max_cv))] = smp.xyz
-        prim = params.get("measured_primaries") or params.get("primaries")
-        mw = params.get("measured_white") or {}
-        check = gfm.held_out_check(
-            points, reads, max_cv=max_cv, eotf=eotf, primaries=prim,
-            white_xy=(float(mw.get("x")), float(mw.get("y"))), peak_luminance=peak,
-            luminance_sigma=float(report.get("luminance_sigma") or gfm.DEFAULT_LUMINANCE_SIGMA),
-            structure_pct=report.get("structure_pct"))
-        key = "build-install-mhc:holdout"
-        self.calib.setdefault("base_holdout", {})
-        self.calib["base_holdout"] = _jsonable(check)
-        self._save()
-        if not check["out"]:
-            self.runlog.note("base-holdout",
-                             f"base 1D LUT held-out check: {len(points)} grey(s) within tolerance "
-                             f"(max {check['max_luminance_pct']} % luminance, {check['max_balance_pct']} % "
-                             f"balance, dxy {check['max_dxy']})", check=check)
-            return StageOutcome("base-holdout", "done", digest=check)
-        worst = max(check["out"], key=lambda r: abs(r["luminance_pct"]) + abs(r["rg_pct"]) + abs(r["bg_pct"]))
-        question = (
-            f"the installed base 1D LUT misses {len(check['out'])} of {len(points)} held-out grey(s) the fit "
-            f"never saw beyond the panel's own structure scale (worst: code {worst['code']} — luminance "
-            f"{worst['luminance_pct']} %, r/g {worst['rg_pct']} %, b/g {worst['bg_pct']} %, dxy {worst['dxy']} "
-            f"against tolerance {check['tolerance_pct']}). A narrow error between fit levels: the refine and "
-            "the 3D LUT cannot remove it. 'continue' (judge it acceptable — e.g. inside the target's grey "
-            "tolerance), or 'abort' and re-run with a denser raw grey ramp (raise raw_densify_max_reads / "
-            "raw_ramp_steps)?")
-        self._abort_if(self.adjudicate(AdjudicationRequest(
-            key=key, seam=SEAM_BASE_HOLDOUT, stage="build-install-mhc", question=question,
-            options=("continue", "abort"), recommendation="continue",
-            digest={"base_holdout": check, "grey_features": report.get("features"),
-                    "structure_pct": report.get("structure_pct")})),
-            stage="build-install-mhc",
-            message="aborted at the base held-out check — re-run with a denser raw grey ramp")
-        return StageOutcome("base-holdout", "done", digest=check)
 
     def _install_mhc_params(self, params: dict[str, Any], spec: cp.TargetSpec
                             ) -> tuple[Any, Any, Any]:
@@ -6429,16 +6240,10 @@ class Calibration:
                     noise = match_level_noise(noise_entries, s.rgb[0]) if noise_entries else None
                     entry = (s.rgb[0], tuple(s.xyz))
                     measured_neutral.append(entry + (noise,) if noise is not None else entry)
-                freport: dict[str, Any] = {}
                 new_curves = refine_hdr_cube(
                     read_1d_cube(Path(installed)), measured_neutral, channel_peak_xyz, rowsums,
                     peak_cap_nits=cap_nits, target_white_xy=(wx, wy), dark_floor_nits=dark_floor,
-                    top_hold=self.mhc_top_hold, feature_report=freport,
-                    luminance_sigma=build_mhc._raw_luminance_sigma(res.ti3_path)["sigma"])
-                if freport.get("features"):
-                    self.runlog.note("refine-mhc-cube", f"refine round {rnd}: {len(freport['features'])} narrow "
-                                     "neutral level(s) refined from their neighbours' envelope",
-                                     features=freport["features"], structure_pct=freport.get("structure_pct"))
+                    top_hold=self.mhc_top_hold)
                 new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
                 write_1d_cube(new_path, new_curves,
                               title=f"DLC HDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
@@ -6773,16 +6578,10 @@ class Calibration:
                     noise = match_level_noise(noise_entries, s.rgb[0]) if noise_entries else None
                     entry = (s.rgb[0], tuple(s.xyz))
                     measured_neutral.append(entry + (noise,) if noise is not None else entry)
-                freport: dict[str, Any] = {}
                 new_curves = refine_sdr_cube(
                     read_1d_cube(Path(installed_path)), measured_neutral, primaries, (nwx, nwy),
                     peak, rowsums, gamma=gamma, target_white_xy=(wx, wy), dark_floor_nits=dark_floor,
-                    target_white_nits=white_nits, feature_report=freport,
-                    luminance_sigma=build_mhc._raw_luminance_sigma(res.ti3_path)["sigma"])
-                if freport.get("features"):
-                    self.runlog.note("refine-mhc-grayscale", f"refine round {rnd}: {len(freport['features'])} "
-                                     "narrow neutral level(s) refined from their neighbours' envelope",
-                                     features=freport["features"], structure_pct=freport.get("structure_pct"))
+                    target_white_nits=white_nits)
                 new_path = gen / f"mhc_base_{self.mode.lower()}.refine{rnd}.cube"
                 write_1d_cube(new_path, new_curves,
                               title=f"DLC SDR MHC standalone-D65 refine r{rnd} (mon {self.monitor})")
@@ -9158,8 +8957,7 @@ class Calibration:
     # PatchSizes knobs added after plans were already approved: left out of the plan identity while
     # at their defaults, so an in-flight run's approved fingerprint survives the upgrade (a
     # non-default override still invalidates the plan, as any patch-size change does).
-    _FINGERPRINT_DEFAULT_EXEMPT = ("neutral_top_pins", "neutral_top_band", "verify_held_out_draws",
-                                   "raw_densify_max_reads", "base_holdout_points")
+    _FINGERPRINT_DEFAULT_EXEMPT = ("neutral_top_pins", "neutral_top_band", "verify_held_out_draws")
 
     def _fingerprinted_patch_sizes(self) -> dict[str, Any]:
         sizes = asdict(self.patch_sizes)
@@ -9232,9 +9030,7 @@ class Calibration:
         self.stage_brightness()
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(extend_full_drive=True),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
-        dense = self.stage_densify_raw_greys(raw.data["ti3"])
-        self.stage_build_install_mhc(raw.data["ti3"], dense_ti3=dense)
-        self.stage_base_holdout_check()
+        self.stage_build_install_mhc(raw.data["ti3"])
         # Standalone-D65 foundation (1+1+1): pull the MHC to D65 BEFORE the optional 3D LUT refines
         # the off-gray volume — the MHC owns the neutral axis. HDR refines the base 1D cube; SDR
         # refines the correctionGrayscale layer (Task B / #C1). The MHC is now the SOLE neutral-axis
@@ -9267,9 +9063,7 @@ class Calibration:
         self.stage_brightness()
         raw = self.stage_measure(role="raw", patches=self._ramp_patches(extend_full_drive=True),
                                  ti3_name="raw.ti3", ndjson_name="raw.ndjson")
-        dense = self.stage_densify_raw_greys(raw.data["ti3"])
-        self.stage_build_install_mhc(raw.data["ti3"], dense_ti3=dense)
-        self.stage_base_holdout_check()
+        self.stage_build_install_mhc(raw.data["ti3"])
         # The mhc-only flow IS the standalone-ICC path — refine the MHC to D65 so verify scores the
         # foundation as a self-sufficient D65 layer (no 3D LUT to lean on). HDR: base 1D cube; SDR:
         # the correctionGrayscale layer (Task B / #C1).
@@ -11105,13 +10899,11 @@ class Calibration:
 _REFINE_FORK = "{refine}"
 _FLOW_STAGE_SEQUENCES: dict[str, tuple[str, ...]] = {
     "full": ("preflight", "resolve-target", "whitepoint", "enter-neutral",
-             "hardware-readiness", "brightness", "measure:raw", "raw-densify", "measure:raw-dense",
-             "build-install-mhc", "measure:base-holdout",
+             "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
              _REFINE_FORK, "adaptive-planning", "measure:post-mhc", "build-install-3dlut",
              "measure:verify", "verify"),
     "mhc-only": ("preflight", "resolve-target", "whitepoint", "enter-neutral",
-                 "hardware-readiness", "brightness", "measure:raw", "raw-densify", "measure:raw-dense",
-                 "build-install-mhc", "measure:base-holdout",
+                 "hardware-readiness", "brightness", "measure:raw", "build-install-mhc",
                  _REFINE_FORK, "measure:verify", "verify"),
     "3dlut-only": ("preflight", "resolve-target", "whitepoint", "hardware-readiness",
                    "adaptive-planning", "measure:post-mhc", "build-install-3dlut",

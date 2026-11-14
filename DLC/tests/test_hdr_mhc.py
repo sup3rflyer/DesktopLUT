@@ -303,9 +303,7 @@ def test_sdr_build_mhc_stable_dark_drift_is_corrected_not_smoothed(tmp_path):
     curves3 = read_1d_cube(Path(_common.load_dlc_state(ctx3)["mhc_params"]["base_lut"]["cube_path"]))
     held_dev = abs(curves3["g"][j] - 0.1)
 
-    # the stable drift IS corrected (0.00243 since the build inverts in the γ domain, 2026-11-14: the
-    # old linear-light interpolation toward the 0.05 grey added ~0.0003 of interpolation error here)
-    assert corrected_dev > 0.002, corrected_dev
+    assert corrected_dev > 0.0025, corrected_dev              # the stable drift IS corrected
     assert held_dev < corrected_dev / 3, (held_dev, corrected_dev)   # corroborated σ-less held ~identity
 
 

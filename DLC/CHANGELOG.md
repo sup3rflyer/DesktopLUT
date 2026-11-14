@@ -6,18 +6,6 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
 ## Unreleased (after DesktopLUT v3.0.0)
 
 ### Fixed
-- **The MHC base 1D LUT no longer bakes in corrections narrower than what was measured** (2026-11-14). A grey
-  that departs from its neighbours (a real, narrow panel feature or a one-off read) used to shape the LUT
-  over the whole gap to the next measured grey, unequally per channel — a slightly tinted, too-bright step
-  at the greys in between. The flow now re-reads such a grey and measures the greys around it before the
-  base is built (`raw-densify`, capped by `patches.raw_densify_max_reads`); a feature that still cannot be
-  resolved is built from its neighbours instead, and a grey that does not repeat is dropped. After the
-  install, a few greys the build never saw are measured and judged (`build-install-mhc:holdout` seam when
-  one misses; `patches.base_holdout_points`, 0 = off).
-- **The base 1D LUT is exact between measured greys on a panel that follows its curve** (2026-11-14): the build
-  inverted each channel in linear light, which under-drove the middle of every gap between two measured greys
-  (up to about -1 % in light in the darker SDR greys, under 0.2 % above mid-grey; ~0.3-0.5 code in HDR). It now inverts in
-  the transfer's own domain (γ / PQ).
 - **A `grayscale-wb` run that does not finish puts the previous grayscale curve back** (2026-11-12). The
   touch-up is baked into the installed profile before its verify measurement, so a run that ended during the
   verify — a cancel, a pause that timed out, a dead meter, a stall, a stage error, a crash, or `--abort` at the

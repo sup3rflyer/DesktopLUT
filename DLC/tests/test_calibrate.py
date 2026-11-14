@@ -150,7 +150,7 @@ def test_full_flow_completes_clean(tmp_path: Path):
     # GS+WB is removed — the MHC owns the neutral axis standalone (1+1+1, Task B / #C1).
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
-        "raw-densify", "build-install-mhc", "measure:base-holdout", "refine-mhc-grayscale", "measure:post-mhc", "build-install-3dlut",
+        "build-install-mhc", "refine-mhc-grayscale", "measure:post-mhc", "build-install-3dlut",
         "measure:verify", "verify",
     ]
     verify = calib.calib["stages"]["verify"]["digest"]
@@ -180,7 +180,7 @@ def test_hdr_full_flow_completes_clean(tmp_path: Path):
     # correctionGrayscale). GS+WB is removed for all modes (the MHC owns the neutral axis).
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
-        "raw-densify", "build-install-mhc", "measure:base-holdout", "refine-mhc-cube", "measure:post-mhc", "build-install-3dlut",
+        "build-install-mhc", "refine-mhc-cube", "measure:post-mhc", "build-install-3dlut",
         "measure:verify", "verify",
     ]
     assert "gswb-tweak" not in result.stages and "measure:gray-wb" not in result.stages
@@ -1183,7 +1183,7 @@ def test_hdr_mhc_only_runs_standalone_d65_refine(tmp_path: Path):
     assert result.status == "completed", result.digest
     assert result.stages == [
         "preflight", "whitepoint", "enter-neutral", "brightness", "measure:raw",
-        "raw-densify", "build-install-mhc", "measure:base-holdout", "refine-mhc-cube", "measure:verify", "verify",
+        "build-install-mhc", "refine-mhc-cube", "measure:verify", "verify",
     ]
     refine = calib.calib["stages"]["refine-mhc-cube"]["digest"]
     assert refine.get("skipped") is not True
