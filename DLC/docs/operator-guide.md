@@ -330,6 +330,8 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
   the panel / meter limit, not a failure to retry.
 - When a number is outside the advisory targets, explain *why* with the evidence before recommending `apply` or
   `revert`. The human decides close calls.
+- **Before judging an anomaly on a display, read its knowledge view** (§18): `python -m dlc.knowledge show
+  --display "<name>"`. It may already say the bump is the panel (with the conditions and the size it holds for).
 
 ## 12. Reading DesktopLUT state (traps)
 
@@ -363,6 +365,7 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
 | `runs/<run>/notes.jsonl` | your `python -m dlc.note` lines (shown in the DLC tab's feed) |
 | `results/` | applied profiles / cubes and reports |
 | `correction_store.json`, `dip_store.json`, `stack_registry.json` | per display + mode: meter correction, learned panel facts (the DIP, with the refresh response of §16), what's installed |
+| `dip_knowledge/<unit>.json` + `.md` | per physical display: what is known about the panel, the rig and unexplained events (§18); read the `.md` |
 | `python -m dlc.calibrate --help` | every flag's syntax; operating policy (e.g. never `--supervised` on hardware) comes from this guide |
 | `docs/NAMING.md` | glossary of DLC identifiers |
 
@@ -498,3 +501,37 @@ python -m dlc.peak_window show --dip dip_store.json --display "<name>"   # a rec
 non-black surround (APL), windows away from the centre, the panel's other picture modes (each OSD mode is its own
 curve; it is not keyed by mode). It writes only `peak_by_window`: the HDR calibration peak
 (`sustained_peak_nits`) is untouched — which window a calibration peak should use is the owner's decision.
+
+## 18. What DLC knows about a display (`dip_knowledge/`)
+
+The DIP's sections are measurements; the knowledge files are their meaning, per **physical unit** (the EDID id with
+its serial; a panel swap is a new unit): plain statements about the panel, the rig (meter placement, link, sleep)
+and unexplained events, each with its conditions (`scope`, and what was **not** tested), a status (measured /
+inferred / hypothesis / refuted / superseded), append-only observations with their evidence files (path + sha256)
+and the owner's standing monitor settings. Local only, like the DIP.
+
+**Read the view before judging an anomaly on that display** (a tooth at one code, a level that moved between
+sessions, a flat HDR top):
+```
+python -m dlc.knowledge show --display "<DLC display name>"          # the whole view; --mode SDR, --id F-0001
+```
+It lists the open questions first, then panel, rig and events, refuted entries last. Each entry says whether it
+**can explain** an observation: only a measured entry, seen in two independent sessions, not unconfirmed (a unit
+event after it, or older than the DIP's age limit), whose conditions cover the reading and whose signature bounds
+hold (size, sign, **chromaticity**). Anything less is a resemblance: say what differs and judge the reading as an
+anomaly. A known property never changes a gate or a recommendation; it is evidence for you.
+
+Writing (judgement, so yours; flows will only append re-observations that match):
+```
+python -m dlc.knowledge add --display "<name>" --file entries.json          # {by, why, entries: [...]}
+python -m dlc.knowledge add-observation --display "<name>" --id F-0001 --file obs.json --by llm:<you> --why "..."
+python -m dlc.knowledge set-status --display "<name>" --id H-0001 --status refuted --by llm:<you> --why "..."
+python -m dlc.knowledge amend --display "<name>" --file ops.json            # any other op, validated, all or nothing
+python -m dlc.knowledge validate [--evidence]                               # --evidence re-hashes the files
+```
+Write the JSON with your file tool (no inline scripts). Rules the CLI enforces: evidence paths must exist (hashed when
+written); a measured entry needs numbers, an evidence file and a non-empty `scope.unknown`; no per-code tables (raw
+reads stay in evidence files); a contradiction is a new observation (`verdict: contradicts`), never an edit; a
+wrong entry is refuted or superseded with a reason, never deleted. Firmware update, panel service or an OSD factory
+reset → `add_unit_event`: every older entry becomes unconfirmed until re-observed. No DesktopLUT or DLC defect
+belongs here (that goes to the tracker), and no calibration result.

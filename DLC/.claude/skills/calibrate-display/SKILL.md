@@ -37,6 +37,10 @@ the entry point. Where they differ, the guide and `python -m dlc.calibrate --hel
    - Long measure stages: run in the background and read the `check_in` packets in `runs/<run>/events.jsonl` on a
      timer (guide §7–§8).
 5. **Judge the result** with the evidence (guide §11). Let the human make close calls on `verify:accept`.
+   **Before calling anything odd on a display a defect** (a bump at one code, a level that moved, a flat top), read
+   what DLC already knows about that display: `python -m dlc.knowledge show --display "<name>"` (guide §18). A
+   known property explains a reading only when the view says it can and the conditions match; otherwise it is a
+   resemblance at most, and the anomaly is still yours to judge.
 6. **Tear down every time** (guide §10):
    - finish the run, or abort it with `--run <dir> --abort`;
    - stop the patch daemon;
