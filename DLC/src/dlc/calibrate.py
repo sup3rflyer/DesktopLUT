@@ -13646,6 +13646,54 @@ def _auto_on_live_measuring_run(args: Any) -> bool:
         and getattr(args, "flow", None) != "build-correction"
 
 
+def resolve_patch_server(cli_server: Optional[str], cli_keep: bool, state: Mapping[str, Any]) -> dict[str, Any]:
+    """The patch server this invocation measures through: the one named on the command line, else the one the
+    run REMEMBERS (``state["patch_server"]``, written when the run was started against it). ``keep`` follows the
+    command line or the remembered choice. ``{"address": "host:port" | None, "keep": bool, "remembered": bool}``."""
+    rec = state.get("patch_server") if isinstance(state.get("patch_server"), dict) else {}
+    if cli_server:
+        keep = bool(cli_keep) or (bool(rec.get("keep")) and rec.get("address") == cli_server)
+        return {"address": str(cli_server), "keep": keep, "remembered": False}
+    if rec.get("address"):
+        return {"address": str(rec["address"]), "keep": bool(cli_keep) or bool(rec.get("keep")), "remembered": True}
+    return {"address": None, "keep": bool(cli_keep), "remembered": False}
+
+
+def remember_patch_server(state: dict[str, Any], patch_server: Mapping[str, Any]) -> None:
+    """Record the run's patch server (and keep choice) so a resumed step reuses it."""
+    state["patch_server"] = {"address": patch_server["address"], "keep": bool(patch_server.get("keep"))}
+
+
+def open_patch_server(address: str, settle_seconds: float, *, remembered: bool,
+                      factory: Optional[Callable[..., Any]] = None,
+                      log: Optional[Callable[[str], None]] = None) -> tuple[Any, Optional[dict[str, Any]], Optional[str]]:
+    """Connect to a persistent dogegen daemon and ask its mode: ``(presenter, mode | None, refusal | None)``.
+    A REMEMBERED server that does not answer is a refusal (the run stops with this message: it must not open a
+    second, windowed patch generator and measure another picture); a server named on this command line that does
+    not answer keeps today's behaviour (logged; the first patch fails)."""
+    if factory is None:
+        from .measure_loop import SocketPresenter as factory   # noqa: N813 - the live presenter
+    host, _, port = str(address).partition(":")
+    presenter = factory(host or "127.0.0.1", int(port or 28930), settle_seconds=settle_seconds)
+    try:
+        return presenter, presenter.query_mode(), None
+    except Exception as exc:  # noqa: BLE001 - an unreachable daemon
+        msg = f"dogegen daemon mode query failed ({type(exc).__name__}: {exc})"
+        if log:
+            log(msg)
+        if remembered:
+            try:
+                presenter.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return None, None, (f"this run measures through the patch server {address} (remembered from its start) "
+                                f"and it does not answer ({type(exc).__name__}: {exc}). Start it again "
+                                "(python -m dlc.dogegen_server ... with the run's mode and bit depth) and resume, "
+                                "or name another with --dogegen-server. Not opening a second, windowed patch "
+                                "generator: it would measure a different picture.")
+        return presenter, None, None
+
+
 def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wiring
     """Live CLI. Wires the real controller + dogegen/spotread measure seam and runs a
     flow; on an :class:`AdjudicationRequired` pause it prints the request as JSON and
@@ -14300,6 +14348,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
     # Resolved against the persisted run spec (see above); when nothing is persisted/explicit
     # (_eff_bd is None) keep main()'s long-standing live default: 10-bit HDR, 8-bit SDR.
     bit_depth = _eff_bd if _eff_bd is not None else (10 if eff_content == "HDR" else 8)
+    # The patch server (and whether to keep it) a run was started against is part of the run: remembered, and
+    # reused by every later invocation of the same run unless one names another.
+    patch_server = resolve_patch_server(args.dogegen_server, args.keep_dogegen_server, state)
+    if patch_server["address"] and eff_flow != "build-correction":
+        remember_patch_server(state, patch_server)
+        _common.save_dlc_state(ctx, state)
     presenter = None
     persistent_meter = None
     measure: Optional[MeasureFn] = None
@@ -14330,19 +14384,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
             presenter_settle = max(0.2, dip_rec.settle_seconds)
         else:
             presenter_settle = 0.5
-        if args.dogegen_server:
+        if patch_server["address"]:
             # Reuse a persistent, operator-fullscreened dogegen window across invocations
-            # (no respawn/flash) — the daemon owns the dogegen process + its bit-depth mode.
-            host, _, srv_port = args.dogegen_server.partition(":")
-            presenter = SocketPresenter(host or "127.0.0.1", int(srv_port or 28930),
-                                        settle_seconds=presenter_settle)
-            # The daemon's mode is set out of band: a daemon in another mode / depth would show these
-            # codes as another signal (an HDR daemon renders SDR 8-bit codes as PQ) — refuse, mechanically.
-            try:
-                daemon_mode = presenter.query_mode()
-            except Exception as exc:  # noqa: BLE001 - an unreachable daemon fails at the first patch anyway
-                daemon_mode = None
-                ctx.log(f"dogegen daemon mode query failed ({type(exc).__name__}: {exc})")
+            # (no respawn/flash) — the daemon owns the dogegen process + its bit-depth mode. A run started
+            # against a patch server REMEMBERS it: a resumed step without --dogegen-server reuses it, and when
+            # the remembered server does not answer the run stops (never a second, windowed patch generator
+            # measuring another picture — 2026-11-14, run 143042).
+            presenter, daemon_mode, refusal = open_patch_server(patch_server["address"], presenter_settle,
+                                                                remembered=patch_server["remembered"],
+                                                                log=ctx.log)
+            if refusal:
+                print(json.dumps({"error": refusal, "patch_server": patch_server}))
+                return 2
             if daemon_mode is None:
                 ctx.log("dogegen daemon did not report its mode (an older daemon?) — make sure it runs "
                         f"--mode {eff_content} --bit-depth {bit_depth}")
@@ -14591,7 +14644,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         if presenter is not None:
             try:
                 terminal = not paused
-                if (terminal and not args.keep_dogegen_server
+                if (terminal and not patch_server["keep"]
                         and hasattr(presenter, "shutdown_daemon")):
                     presenter.shutdown_daemon()
                 else:
@@ -14697,7 +14750,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover - live wi
         # window per the display's idle policy LAST — after the meter teardown and the rollback guard —
         # so a slow/wedged daemon (up to the socket timeout) can never delay them, or skip them on a
         # second Ctrl-C.
-        if (presenter is not None and not paused and args.keep_dogegen_server
+        if (presenter is not None and not paused and patch_server["keep"]
                 and hasattr(presenter, "shutdown_daemon")):
             try:
                 _park("exit (daemon kept)")
