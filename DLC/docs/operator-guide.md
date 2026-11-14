@@ -280,6 +280,16 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
     DesktopLUT is back. Restoring twice is harmless.
   - `--abort` never takes back a touch-up that was applied (`verify:accept` = `apply`).
   - A rolled-back `grayscale-wb` run refuses to resume (its result is no longer on the display).
+- **`grayscale-wb` is judged between its nodes.** The verify also reads the held-out greys between the curve's
+  nodes (read once before the touch-up, in the same session); `verify:accept` shows them as `gswb_held_out`
+  (before / after per grey, the worst ones) and recommends `revert` when any reads worse than before beyond the
+  run's own repeatability. `grayscale-wb:node-outlier` raises a solved node that departs from its neighbours (a
+  display feature narrower than the node spacing): `hold` puts it on its neighbours' interpolation, `accept`
+  keeps it, `abort` ends the run. A held node is judged like a held-out grey: its feature stays uncorrected, so
+  it may read worse than before while everything around it improves — weigh that with the owner.
+  `grayscale-wb:light-trend` (before it) lists nodes whose LIGHT need their neighbours do not share (a tooth
+  of a sawtooth-light panel): `trend` commits their light as the neighbours' (or none), keeping their colour
+  balance; there is no per-node option, by design.
 - Never resume a rolled-back run; start a fresh one.
 - Never run your own enter/exit probe scripts while a run is paused. The capture belongs to the open session.
 

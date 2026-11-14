@@ -37,6 +37,10 @@ __all__ = [
     "build_volumetric_set",
     "build_neutral_set",
     "build_grayscale_wb_set",
+    "build_grayscale_wb_heldout_set",
+    "build_grayscale_wb_verify_set",
+    "grayscale_wb_union_order",
+    "grayscale_wb_time_estimate",
     "build_verify_set",
     "build_refine_verify_set",
     "flow_patch_counts",
@@ -527,7 +531,7 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
     Uniform spacing here mistunes every interior slider.
     """
     cap = max_cv if max_cv is not None else transfer.max_cv
-    n = 32
+    n = GSWB_NODES
     if transfer.kind == "pq":  # HDR editor: linear in code across the active peak
         levels = uniform_levels(n, cap)
     else:
@@ -535,6 +539,85 @@ def build_grayscale_wb_set(ps: PatchSizes, transfer: Transfer, *,
         # (dense low, sparse high). The slider's number is exactly this code.
         levels = [round(cap * (i / (n - 1)) ** 2) for i in range(n)]
     return [(v, v, v) for v in levels]
+
+
+# The grayscale-wb editor's node count (DesktopLUT's 32-point fine-tune curve).
+GSWB_NODES = 32
+
+
+def build_grayscale_wb_heldout_set(ps: PatchSizes, transfer: Transfer, *,
+                                   warm_tau: Optional[int] = None,
+                                   max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The greys the grayscale-wb touch-up is NOT fitted on but is judged on (2026-11-14 HW: a
+    correction at one node smeared by the curve's interpolation over both neighbouring intervals,
+    invisible to a verify of the node codes alone): ONE grey between each pair of adjacent nodes,
+    at the place the curve's interpolation error is largest (:func:`dlc.grayscale_wb.heldout_code`:
+    the midpoint in the curve's own interpolation coordinate), over the range the touch-up can
+    correct — every interval whose upper node's target is at or above the touch-up's dark floor
+    (below it ``update_point`` holds both nodes, the curve stays identity, nothing to judge). A
+    code that coincides with a node (low codes at 8-bit) is dropped. Ascending."""
+    from .grayscale_wb import GrayTouchupConfig, heldout_code
+
+    cap = max_cv if max_cv is not None else transfer.max_cv
+    nodes = [p[0] for p in build_grayscale_wb_set(ps, transfer, max_cv=cap)]
+    kind = "hdr" if transfer.kind == "pq" else "sdr"
+    floor = GrayTouchupConfig().dark_floor_nits
+    have = set(nodes)
+    out: list[int] = []
+    for i in range(len(nodes) - 1):
+        if transfer.cv_to_nits(nodes[i + 1]) < floor:
+            continue
+        code = heldout_code(i, cap, len(nodes), kind)
+        if nodes[i] < code < nodes[i + 1] and code not in have:
+            have.add(code)
+            out.append(code)
+    return [(v, v, v) for v in out]
+
+
+def grayscale_wb_union_order(nodes: list[tuple[int, int, int]],
+                             heldout: list[tuple[int, int, int]]) -> list[tuple[str, int]]:
+    """The touch-up's and the grey verify's visit schedule over nodes ∪ held-out greys:
+    ``[("node"|"heldout", index into its own list), ...]`` in the outside-in alternating order (D4)
+    over the union sorted by code — so the held-out reads keep the same flat-APL rhythm and the
+    same timeline as the node reads (black first, full drive second)."""
+    union = sorted([(p[0], "node", i) for i, p in enumerate(nodes)]
+                   + [(p[0], "heldout", i) for i, p in enumerate(heldout)])
+    return [(union[j][1], union[j][2]) for j in outside_in_indices(len(union))]
+
+
+def build_grayscale_wb_verify_set(ps: PatchSizes, transfer: Transfer, *,
+                                  warm_tau: Optional[int] = None,
+                                  max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+    """The grayscale-wb grey verify: the 32 node greys AND the held-out greys between them, in the
+    outside-in order over the union (:func:`grayscale_wb_union_order`)."""
+    nodes = build_grayscale_wb_set(ps, transfer, max_cv=max_cv)
+    held = build_grayscale_wb_heldout_set(ps, transfer, max_cv=max_cv)
+    return [(nodes if kind == "node" else held)[i] for kind, i in grayscale_wb_union_order(nodes, held)]
+
+
+# Time model of a grayscale-wb run for the plan / --preview-patches (an ESTIMATE for the operator,
+# never a decision input). Basis: the three PA32UCXR SDR 10-bit runs of 2026-11-14 — the touch-up
+# stage took 9.3 / 10.4 / 12.7 min over its 32 nodes (rounds included), and the 32-grey verify
+# 6.2 / 6.3 min, i.e. ~11.7 s per verified grey (dark greys read longer, bright ones re-read).
+# A held-out grey costs one such read before the touch-up (inside the session) and one in the verify.
+GSWB_TOUCHUP_MINUTES_32 = (9.3, 12.7)
+GSWB_SECONDS_PER_GREY = 11.7
+
+
+def grayscale_wb_time_estimate(n_nodes: int, n_heldout: int) -> dict[str, Any]:
+    per = GSWB_SECONDS_PER_GREY / 60.0
+    lo, hi = GSWB_TOUCHUP_MINUTES_32
+    scale = n_nodes / 32.0
+    verify = (n_nodes + n_heldout) * per
+    before = n_heldout * per
+    return {
+        "minutes": [round(lo * scale + before + verify, 1), round(hi * scale + before + verify, 1)],
+        "held_out_minutes": round(2.0 * n_heldout * per, 1),
+        "without_held_out_minutes": [round(lo * scale + n_nodes * per, 1),
+                                     round(hi * scale + n_nodes * per, 1)],
+        "basis": ("PA32UCXR SDR 10-bit, 2026-11-14: touch-up 9.3-12.7 min for 32 nodes, verify ~11.7 s "
+                  "per grey; each held-out grey is read once before the touch-up and once in the verify"),
+    }
 
 
 def outside_in_indices(n: int) -> list[int]:
@@ -634,7 +717,8 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
     "full": ("raw", "post-mhc", "verify"),
     "mhc-only": ("raw", "verify"),
     "3dlut-only": ("post-mhc", "verify"),
-    "grayscale-wb": ("grayscale-wb", "grayscale-wb-verify"),
+    # nodes (tuned) + the held-out greys read before the touch-up + the verify over both
+    "grayscale-wb": ("grayscale-wb", "grayscale-wb-heldout", "grayscale-wb-verify"),
     # refine rounds (the neutral ramp, repeated until the physics judge stops) are not counted —
     # as for the full/mhc-only refine; the fixed cost is the short verify.
     "refine-mhc": ("refine-verify",),
@@ -644,7 +728,8 @@ _FLOW_PATCH_STAGES: dict[str, tuple[str, ...]] = {
 }
 _PATCH_BUILDERS = {"raw": build_ramp_set, "verify-ramp": build_ramp_set,
                    "post-mhc": build_volumetric_set, "grayscale-wb": build_grayscale_wb_set,
-                   "grayscale-wb-verify": build_grayscale_wb_set, "verify": build_verify_set,
+                   "grayscale-wb-heldout": build_grayscale_wb_heldout_set,
+                   "grayscale-wb-verify": build_grayscale_wb_verify_set, "verify": build_verify_set,
                    "refine-verify": build_refine_verify_set}
 
 
@@ -679,4 +764,8 @@ def flow_patch_counts(flow: str, ps: PatchSizes, transfer: Transfer, *,
                            "volumetric_mode": ps.volumetric_mode, "order": ps.order}
     if draws:
         out["verify_held_out_draws"] = draws
+    if flow == "grayscale-wb":
+        held = stages.get("grayscale-wb-heldout", 0)
+        out["held_out_greys"] = held
+        out["time_estimate"] = grayscale_wb_time_estimate(stages.get("grayscale-wb", 0), held)
     return out
