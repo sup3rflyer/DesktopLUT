@@ -188,6 +188,7 @@
     <ClCompile Include="tests\test_desktop_gamma_refresh.cpp" />
     <ClCompile Include="tests\test_mhc_golden.cpp" />
     <ClCompile Include="tests\test_refresh_trim.cpp" />
+    <ClCompile Include="tests\test_refresh_trim_owner.cpp" />
     <ClCompile Include="tests\test_ipc_json.cpp" />
     <ClCompile Include="tests\test_ipc_grayscale.cpp" />
     <ClCompile Include="tests\test_ipc_pipe.cpp" />
