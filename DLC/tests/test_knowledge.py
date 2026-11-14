@@ -136,7 +136,7 @@ def test_round_trip_and_file_shape(tmp_path: Path, ev: Path):
     assert [q["id"] for q in f1["open_questions"]] == ["Q1", "Q2"]
     assert store.md_path(_uid()).read_text(encoding="utf-8").startswith(
         f"<!-- generated from {_uid()}.json rev 1, do not edit -->")
-    assert doc["rev"] == 1 and len(doc["revisions"]) == 3
+    assert doc["rev"] == 1 and len(doc["revisions"]) == 4   # create_unit + 3 entries
 
 
 def test_ids_are_allocated_per_prefix_and_never_reused(tmp_path: Path, ev: Path):
@@ -641,15 +641,40 @@ def test_resolution_by_alias_dip_key_edid_device_path_and_unit_id(tmp_path: Path
         store.resolve("Other Panel")
     with pytest.raises(UnitNotFound, match="empty"):
         KnowledgeStore(tmp_path / "nothing").resolve("Test Panel 32")
-    # a second unit with the same alias makes the name ambiguous
+    # a second unit with the same alias (allowed with a reason) makes the name ambiguous: the candidates are listed
     h = _header()
     h["identity"] = {"hardware_id": "TST1234", "edid_id": "TST1234-99999"}
     hdr = kn.unit_from_header(h)
     store.apply_ops(hdr["unit_id"], [{"op": "create_entry", "by": BY, "why": "x", "entry": _hyp(links=[])}],
-                    create=hdr)
-    with pytest.raises(KnowledgeError, match="more than one unit"):
+                    create=hdr, allow_second_unit="the owner's second panel of this model")
+    with pytest.raises(KnowledgeError, match=r"more than one unit; candidates: TST1234-12345 \(Test Panel 32\); "
+                                             r"TST1234-99999 \(Test Panel 32\)"):
         store.resolve("Test Panel 32")
     assert store.resolve("TST1234-99999") == "TST1234-99999"
+
+
+@pytest.mark.parametrize("variant", ["zero-serial EDID id", "another connector, renamed"])
+def test_a_second_file_for_the_same_display_is_refused_without_a_reason(tmp_path: Path, ev: Path, variant: str):
+    """Review fix 5: a zero-serial EDID id or another connector's device path gives another unit id for what may
+    be the same physical display; creating it needs an explicit reason."""
+    store = _store(tmp_path)
+    _create(store, [_measured(ev), _hyp()])
+    h = _header()
+    if variant == "zero-serial EDID id":
+        h["identity"]["edid_id"] = "TST1234-0"
+    else:
+        h["identity"] = {"hardware_id": "TST1234", "device_paths": [r"\\?\DISPLAY#TST1234#other#{y}"]}
+        h["aliases"] = ["PA (DP2)"]
+    hdr = kn.unit_from_header(h)
+    assert hdr["unit_id"] != _uid()
+    op = [{"op": "create_entry", "by": BY, "why": "x", "entry": _hyp(links=[])}]
+    with pytest.raises(KnowledgeError, match=rf"{_uid()} shares .*hardware id tst1234.*--allow-second-unit"):
+        store.apply_ops(hdr["unit_id"], op, create=hdr)
+    assert store.unit_ids() == [_uid()]
+    doc = store.apply_ops(hdr["unit_id"], op, create=hdr, allow_second_unit="a second PA32 on the desk")
+    log = doc["revisions"][0]
+    assert log["op"] == "create_unit" and "a second PA32 on the desk" in log["detail"] and log["by"] == BY
+    assert store.unit_ids() == sorted([_uid(), hdr["unit_id"]])
 
 
 def test_relative_evidence_resolves_against_the_dip_store_folder_and_folders_hash(tmp_path: Path):

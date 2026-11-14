@@ -62,6 +62,9 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     disp(p, required=False)
     p.add_argument("--file", required=True)
     p.add_argument("--create-unit", action="store_true", help="create the unit from the file's 'unit' header")
+    p.add_argument("--allow-second-unit", default=None, metavar="REASON",
+                   help="create a unit that shares a name, device path or hardware id with an existing one, saying why "
+                        "it is another physical display")
     p.add_argument("--base-rev", type=int, default=None)
     p = sub.add_parser("amend", help="apply ops from a JSON file {by?, why?, ops: [...]} as one write")
     disp(p)
@@ -153,7 +156,8 @@ def _run(args: Any, store: KnowledgeStore) -> int:
             if "id_prefix" in e:
                 op["id_prefix"] = e.pop("id_prefix")
             ops.append(op)
-        doc = store.apply_ops(uid, ops, base_rev=args.base_rev, create=create, today=today)
+        doc = store.apply_ops(uid, ops, base_rev=args.base_rev, create=create, today=today,
+                              allow_second_unit=args.allow_second_unit)
         print(f"written {store.path(uid)} rev {doc['rev']} ({len(entries)} entries); view {store.md_path(uid)}")
         return 0
     if args.cmd == "amend":

@@ -806,7 +806,7 @@ def _validate_unit(doc: Any) -> list[str]:
             out.append(f"{w}: must be an object")
             continue
         _unknown_keys(r, UNIT_REVISION_KEYS, w, out)
-        if r.get("op") not in OPS:
+        if r.get("op") not in OPS + ("create_unit",):
             out.append(f"{w}.op: one of {OPS}")
         _check_by(r.get("by"), w, out)
     entries = doc.get("entries")
@@ -1485,7 +1485,8 @@ class KnowledgeStore:
 
     # -- writes
     def write(self, unit_id: str, mutate: Callable[[dict], None], *, base_rev: Optional[int] = None,
-              create: Optional[dict] = None, today: Optional[str] = None) -> dict:
+              create: Optional[dict] = None, today: Optional[str] = None,
+              allow_second_unit: Optional[str] = None, created_by: Optional[str] = None) -> dict:
         """Read -> ``mutate(doc)`` -> validate (whole file + append-only + size) -> CAS on ``rev`` under the lock ->
         atomic write -> re-render the view. ``base_rev`` = the rev the caller's decision was based on (None = the
         file as it is now). A changed file reloads and re-applies once, then :class:`ConcurrentWrite`."""
@@ -1499,6 +1500,7 @@ class KnowledgeStore:
                     raise UnitNotFound(f"no knowledge file for unit {unit_id} ({p}); create it with a unit header")
                 if create.get("unit_id") != unit_id:
                     raise KnowledgeError(f"create: header is for {create.get('unit_id')!r}, not {unit_id!r}")
+                create = self._checked_new_unit(create, allow_second_unit, today=today, by=created_by)
             seen_rev = int(current.get("rev", 0)) if current is not None else 0
             if attempts == 2 and base_rev is not None and seen_rev != base_rev:
                 attempts = 1               # the caller's base is stale: this application IS the one re-apply
@@ -1518,6 +1520,52 @@ class KnowledgeStore:
                     return new
         raise ConcurrentWrite(f"{p}: changed under this write (now rev {last_seen}); re-read and decide again")
 
+    def overlapping_units(self, header: dict) -> list[tuple[str, list[str]]]:
+        """Existing units that share an alias, a device path, the EDID id or the hardware id with ``header``."""
+        ident = header.get("identity") or {}
+        mine = {"alias": {_norm_name(a) for a in header.get("aliases") or []},
+                "device path": {_norm_name(d) for d in ident.get("device_paths") or []},
+                "EDID id": {_norm_name(ident["edid_id"])} if ident.get("edid_id") else set(),
+                "hardware id": {_norm_name(ident["hardware_id"])} if ident.get("hardware_id") else set()}
+        out = []
+        for uid in self.unit_ids():
+            if uid == header.get("unit_id"):
+                continue
+            doc = self.load_tolerant(uid)
+            if doc is None:
+                out.append((uid, ["an unreadable file (repair it before adding another unit)"]))
+                continue
+            oi = doc.get("identity") or {}
+            theirs = {"alias": {_norm_name(a) for a in doc.get("aliases") or []},
+                      "device path": {_norm_name(d) for d in oi.get("device_paths") or []},
+                      "EDID id": {_norm_name(oi["edid_id"])} if oi.get("edid_id") else set(),
+                      "hardware id": {_norm_name(oi["hardware_id"])} if oi.get("hardware_id") else set()}
+            shared = [f"{k} {', '.join(sorted(mine[k] & theirs[k]))}" for k in mine if mine[k] & theirs[k]]
+            if shared:
+                out.append((uid, shared))
+        return out
+
+    def _checked_new_unit(self, create: dict, allow_second_unit: Optional[str], *, today: Optional[str],
+                          by: Optional[str] = None) -> dict:
+        """Review fix 5: refuse a second file for what may be the same physical display (a zero-serial EDID id, or
+        another connector's device path, gives another unit id) unless the caller states why it is another unit."""
+        overlaps = self.overlapping_units(create)
+        create = copy.deepcopy(create)
+        if overlaps and not (isinstance(allow_second_unit, str) and allow_second_unit.strip()):
+            raise KnowledgeError(
+                f"unit {create.get('unit_id')} may be a display that already has a file: "
+                + "; ".join(f"{u} shares {', '.join(s)}" for u, s in overlaps)
+                + ". If it is the same display seen under another id, add the name or device path to that unit "
+                  "(op add_alias); if it really is another physical display (a second unit of the model), say so "
+                  "with --allow-second-unit \"<reason>\"")
+        detail = ("new unit" if not overlaps else
+                  f"second unit beside {', '.join(u for u, _ in overlaps)}: {allow_second_unit.strip()}")
+        create.setdefault("revisions", []).append({"rev": 1, "date": today or today_iso(),
+                                                   "by": by if isinstance(by, str) and _BY_RE.match(by) else "owner",
+                                                   "op": "create_unit", "why": "unit file created",
+                                                   "detail": detail[:300]})
+        return create
+
     def _finish(self, old: Optional[dict], new: dict) -> dict:
         errs = validate_unit(new)
         if old is not None and not errs:
@@ -1536,7 +1584,8 @@ class KnowledgeStore:
         return new
 
     def apply_ops(self, unit_id: str, ops: Sequence[dict], *, base_rev: Optional[int] = None,
-                  create: Optional[dict] = None, today: Optional[str] = None) -> dict:
+                  create: Optional[dict] = None, today: Optional[str] = None,
+                  allow_second_unit: Optional[str] = None) -> dict:
         """Validate and apply ``ops`` as one write (all or nothing)."""
         if not isinstance(ops, (list, tuple)) or not ops:
             raise KnowledgeError("no ops")
@@ -1550,7 +1599,9 @@ class KnowledgeStore:
                                          exc.violations) from exc
                 except (TypeError, AttributeError, ValueError, KeyError) as exc:
                     raise KnowledgeError(f"op {i + 1}: malformed ({type(exc).__name__}: {exc})") from exc
-        return self.write(unit_id, mutate, base_rev=base_rev, create=create, today=today)
+        first_by = ops[0].get("by") if isinstance(ops[0], dict) else None
+        return self.write(unit_id, mutate, base_rev=base_rev, create=create, today=today,
+                          allow_second_unit=allow_second_unit, created_by=first_by)
 
     def render_all(self, *, today: Optional[str] = None) -> list[Path]:
         out = []
