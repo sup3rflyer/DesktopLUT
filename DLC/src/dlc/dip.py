@@ -493,7 +493,8 @@ class DipStore:
 
     def __init__(self, path: Path | str,
                  records: Optional[dict[str, DisplayInstrumentProfile]] = None,
-                 *, corrupt: bool = False, dropped: Optional[list[str]] = None) -> None:
+                 *, corrupt: bool = False, dropped: Optional[list[str]] = None,
+                 rev: int = 0, base: Optional[dict[str, dict[str, Any]]] = None) -> None:
         self.path = Path(path)
         self._records: dict[str, DisplayInstrumentProfile] = dict(records or {})
         self.corrupt = corrupt
@@ -502,26 +503,46 @@ class DipStore:
         # tolerant (never a gate), but a caller can surface "your DIP for X was dropped"
         # instead of silently running with no priors for that display.
         self.dropped: list[str] = list(dropped or [])
+        # S0 (2026-11-14): the revision counter (sidecar ``<file>.rev``: the file itself keeps exactly its two keys,
+        # which the C++ reader and the generated fixtures pin) and the records as this instance read them — the
+        # base of the three-way merge in save(), so a writer that loaded before another one saved loses nothing.
+        self.rev = int(rev)
+        self._base: dict[str, dict[str, Any]] = dict(base or {})
+        # A store built directly (not by load) never read the file: its content IS the file (the generated
+        # fixtures and tests build stores that way), so it writes without merging, as before S0. Once saved it
+        # has a base and merges like a loaded one.
+        self._merges = base is not None
 
-    @classmethod
-    def load(cls, path: Path | str) -> "DipStore":
-        p = Path(path)
+    @staticmethod
+    def _read(p: Path) -> tuple[dict[str, DisplayInstrumentProfile], bool, list[str]]:
         records: dict[str, DisplayInstrumentProfile] = {}
         corrupt = False
         dropped: list[str] = []
         if p.exists():
             try:
-                raw = json.loads(p.read_text(encoding="utf-8"))
+                from .paths import read_text_shared
+                raw = json.loads(read_text_shared(p))
+                if not isinstance(raw, dict):
+                    raise ValueError("not an object")
             except (ValueError, OSError):
                 raw, corrupt = {}, True
             for name, rec in (raw.get("displays", {}) or {}).items():
                 try:
                     records[name] = DisplayInstrumentProfile.from_dict(
                         {**rec, "display": rec.get("display", name)})
-                except (KeyError, TypeError, ValueError):
+                except (KeyError, TypeError, ValueError, AttributeError):
                     dropped.append(str(name))
                     continue
-        return cls(p, records, corrupt=corrupt, dropped=dropped)
+        return records, corrupt, dropped
+
+    @classmethod
+    def load(cls, path: Path | str) -> "DipStore":
+        from .file_lock import read_rev
+        p = Path(path)
+        rev = read_rev(p)          # BEFORE the file: a rev older than the content only costs a merge
+        records, corrupt, dropped = cls._read(p)
+        return cls(p, records, corrupt=corrupt, dropped=dropped, rev=rev,
+                   base={k: r.as_dict() for k, r in records.items()})
 
     def get(self, display: str) -> Optional[DisplayInstrumentProfile]:
         return self._records.get(display)
@@ -545,11 +566,72 @@ class DipStore:
         return existed
 
     def save(self) -> None:
-        # "schema" is a version stamp for forward drift (loaders today tolerate any shape via
-        # per-record try/except + the dropped list; a future breaking change bumps this).
-        payload = {"schema": 1,
-                   "displays": {name: r.as_dict() for name, r in sorted(self._records.items())}}
-        atomic_write_text(self.path, json.dumps(payload, indent=2))
+        """Persist under the store's lock, merged onto whatever is on disk NOW.
+
+        Three-way, per record and per top-level field: base = the record as this instance read it, ours = now,
+        theirs = on disk. A field only we changed takes ours, a field only they changed keeps theirs, a field both
+        changed to different values raises :class:`DipStoreConflict` (nothing written). A record we removed is
+        removed unless they changed it since; a record we never touched keeps theirs. An unreadable file on disk
+        is not merged into (this instance's state is written, as before S0). The revision sidecar counts writes."""
+        from .file_lock import FileLock, read_rev, write_rev
+        with FileLock(self.path):
+            disk_rev = read_rev(self.path)
+            theirs, disk_corrupt, _ = self._read(self.path)
+            merged = self._merge({k: r.as_dict() for k, r in theirs.items()}) \
+                if (self._merges and not disk_corrupt) else {k: r.as_dict() for k, r in self._records.items()}
+            # "schema" is a version stamp for forward drift (loaders today tolerate any shape via
+            # per-record try/except + the dropped list; a future breaking change bumps this).
+            payload = {"schema": 1, "displays": {name: merged[name] for name in sorted(merged)}}
+            atomic_write_text(self.path, json.dumps(payload, indent=2))
+            self.rev = max(disk_rev, self.rev) + 1
+            write_rev(self.path, self.rev)
+        self._records = {k: DisplayInstrumentProfile.from_dict({**d, "display": d.get("display", k)})
+                         for k, d in merged.items()}
+        self._base = {k: r.as_dict() for k, r in self._records.items()}
+        self._merges = True
+        self.corrupt = False
+
+    def _merge(self, theirs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        ours = {k: r.as_dict() for k, r in self._records.items()}
+        out: dict[str, dict[str, Any]] = {}
+        for key in sorted(set(ours) | set(theirs) | set(self._base)):
+            b, o, t = self._base.get(key), ours.get(key), theirs.get(key)
+            if b is None and o is not None:  # added (or blindly upserted) by us: ours, as before S0
+                out[key] = o
+                continue
+            if o == b:                     # untouched by us: whatever is on disk now
+                if t is not None:
+                    out[key] = t
+                continue
+            if t == b:                       # untouched by them: ours (incl. our removal)
+                if o is not None:
+                    out[key] = o
+                continue
+            if o is None or t is None:       # one side removed, the other changed
+                if o == t:
+                    continue
+                raise DipStoreConflict(f"{self.path}: {key!r} was removed on one side and changed on the other")
+            rec: dict[str, Any] = {}
+            bb = b or {}
+            for f in sorted(set(o) | set(t) | set(bb)):
+                bf, of, tf = bb.get(f, _MISSING), o.get(f, _MISSING), t.get(f, _MISSING)
+                if of == bf:
+                    v = tf
+                elif tf == bf or tf == of:
+                    v = of
+                else:
+                    raise DipStoreConflict(f"{self.path}: {key!r}.{f} changed by two writers to different values")
+                if v is not _MISSING:
+                    rec[f] = v
+            out[key] = rec
+        return out
+
+
+class DipStoreConflict(RuntimeError):
+    """Two writers changed the same field of one DIP record to different values; nothing was written."""
+
+
+_MISSING = object()
 
 
 def _opt_float(v: Any) -> Optional[float]:
@@ -558,3 +640,69 @@ def _opt_float(v: Any) -> Optional[float]:
 
 def _opt_xy(v: Any) -> Optional[list[float]]:
     return [float(v[0]), float(v[1])] if v else None
+
+
+# ----------------------------------------------------------------------------- a DIP change that could not be written
+PENDING_KIND = "dlc.dip pending change"
+
+
+def park_dip_change(path: Path | str, *, key: str, record: Optional[dict[str, Any]], why: str,
+                    fields: Optional[dict[str, Any]] = None) -> Path:
+    """Keep a DIP write that could not be made (the store's lock did not come, or a conflicting writer) in a file
+    (normally in the run folder), so no measured record is lost to a lock. ``record`` = the whole record to write;
+    ``fields`` (with ``record`` None) = only these fields of the record that exists then (a probe section);
+    neither = remove ``key``. ``python -m dlc.dip write-pending --file <path> --dip <store>`` applies it later."""
+    from datetime import datetime
+    p = Path(path)
+    payload = {"kind": PENDING_KIND, "key": key, "record": record, "why": why,
+               "parked": datetime.now().isoformat(timespec="seconds")}
+    if fields is not None:
+        payload["fields"] = fields
+    atomic_write_text(p, json.dumps(payload, indent=2))
+    return p
+
+
+def write_pending(path: Path | str, dip_path: Path | str) -> str:
+    """Apply a parked change (see :func:`park_dip_change`) to the store at ``dip_path``."""
+    from .paths import read_text_shared
+    payload = json.loads(read_text_shared(path))
+    if not isinstance(payload, dict) or payload.get("kind") != PENDING_KIND or not payload.get("key"):
+        raise ValueError(f"{path}: not a parked DIP change")
+    store = DipStore.load(dip_path)
+    if store.corrupt:
+        raise ValueError(f"{dip_path}: the DIP store is unreadable; not overwriting it")
+    key, rec = str(payload["key"]), payload.get("record")
+    if rec is None and isinstance(payload.get("fields"), dict):
+        cur = store.get(key)
+        if cur is None:
+            raise ValueError(f"no DIP record {key!r} in {dip_path} to put {sorted(payload['fields'])} into")
+        merged = {**cur.as_dict(), **payload["fields"]}
+        store.record(DisplayInstrumentProfile.from_dict({**merged, "display": merged.get("display", key)}))
+        return f"wrote {sorted(payload['fields'])} of {key}"
+    if rec is None:
+        store.remove(key)
+        return f"removed {key}"
+    store.record(DisplayInstrumentProfile.from_dict({**rec, "display": rec.get("display", key)}))
+    return f"wrote {key}"
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+
+    from .paths import PROJECT_DIR
+    ap = argparse.ArgumentParser(prog="python -m dlc.dip", description="DIP store maintenance")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    wp = sub.add_parser("write-pending", help="apply a DIP change a run kept because the store could not be written")
+    wp.add_argument("--file", required=True)
+    wp.add_argument("--dip", default=str(PROJECT_DIR / "dip_store.json"))
+    args = ap.parse_args(argv)
+    try:
+        print(f"{write_pending(args.file, args.dip)} in {args.dip}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"NOT written: {type(exc).__name__}: {exc}")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

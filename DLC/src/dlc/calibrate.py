@@ -112,7 +112,8 @@ from .controller import CalibrationController, normalize_mode
 from .desktoplut_client import contract_version_mismatch
 from .correction_store import MODE_RECORDED, CorrectionRecord, CorrectionStore
 from . import gamut
-from .dip import DipStore, DisplayInstrumentProfile
+from .dip import DipStore, DipStoreConflict, DisplayInstrumentProfile, park_dip_change
+from .file_lock import LockTimeout
 from .engine.patches import Transfer
 from .events import Ev, EventWriter, RunLog
 from .keep_awake import keep_awake
@@ -2009,6 +2010,37 @@ class Calibration:
         (SDR converges to a steady temperature; HDR is content-driven and never settles), so an
         SDR and an HDR profile for one panel must coexist."""
         return f"{self.display.name}:{self.mode}"
+
+    def _restore_prior_dip(self) -> None:
+        """Undo this run's characterize write: the prior record back (as it was read before the write), or the
+        new record removed when there was none. Before S0 a rejection removed the record outright, which lost the
+        probe sections a RE-characterization had carried over from the prior record."""
+        info = self.calib.get("characterize_prior_dip")
+        if not isinstance(info, dict) or not info.get("written"):
+            # Review fix (2026-11-14): an abort before THIS run wrote its record (cancel, stall, meter down, a
+            # lock that would not come) must leave the DIP exactly as it is — never remove an existing record.
+            self.ctx.log("characterization ended before this run wrote a DIP record: the DIP is untouched")
+            return
+        key = info.get("key") or self._dip_key()
+        rec = info.get("record")
+        try:
+            store = self._dip_store()
+            if rec:
+                store.record(DisplayInstrumentProfile.from_dict({**rec, "display": rec.get("display", key)}))
+                self.ctx.log(f"characterization rejected: restored the prior DIP record {key}")
+            else:
+                store.remove(key)
+                self.ctx.log(f"characterization rejected: removed the new DIP record {key} (there was no prior one)")
+        except (LockTimeout, DipStoreConflict) as exc:
+            parked = park_dip_change(self.ctx.root / "dip_restore_pending.json", key=key, record=rec,
+                                     why="undo a characterization rejected at review")
+            msg = (f"characterization rejected, but the DIP store could not be written ({exc}): the record this run "
+                   f"wrote is still in {self._dip_store().path.name}. The undo is kept in {parked}; apply it with "
+                   f"`python -m dlc.dip write-pending --file \"{parked}\" --dip \"{self._dip_store().path}\"`.")
+            self.calib["characterize_restore_pending"] = str(parked)
+            self._save()
+            self.ctx.log(msg)
+            self.runlog.anomaly("characterize", kind="dip_restore_pending", message=msg)
 
     def _dip(self) -> Optional[DisplayInstrumentProfile]:
         """This display+mode's DIP, if one has been characterized (else ``None`` → the measure
@@ -4165,10 +4197,36 @@ class Calibration:
             prior = store.get(dip.key)
             if prior is not None:
                 dip = replace(dip, refresh_response=prior.refresh_response, peak_by_window=prior.peak_by_window)
+            # What a rejection at the review seam puts back (S0, 2026-11-14): the record this characterization
+            # replaces, persisted in the run state because the review may be answered by a resumed process.
+            # Recorded ONCE per run (review fix): a --force re-entry, or a crash between the write and the stage
+            # being marked done, re-runs this function, and the record on disk is then this run's own earlier
+            # attempt, not the prior. `written` turns true only after the write: an abort before it leaves the
+            # DIP untouched (_restore_prior_dip).
+            info = self.calib.get("characterize_prior_dip")
+            if not isinstance(info, dict) or info.get("key") != dip.key:
+                info = {"key": dip.key, "record": prior.as_dict() if prior is not None else None, "written": False}
+                self.calib["characterize_prior_dip"] = info
+                self._save()
             # NOTE: the DIP keeps its OWN staleness clock (DisplayInstrumentProfile.is_stale's
             # 180-day default) — panel+meter behaviour drift is a different clock than the
             # colorimeter correction's age, so we deliberately do NOT inherit correction.max_age_days.
-            store.record(dip)
+            try:
+                store.record(dip)
+            except (LockTimeout, DipStoreConflict) as exc:
+                # No measured record is lost to a lock: it is kept in the run folder with the command that
+                # writes it later, and the stage ends cleanly, saying so.
+                parked = park_dip_change(self.ctx.root / "dip_record_pending.json", key=dip.key,
+                                         record=dip.as_dict(), why="characterize result not written")
+                raise CalibrationAborted(StageOutcome(
+                    "characterize", "aborted",
+                    digest={"message": (f"characterization measured, but the DIP store could not be written ({exc}). "
+                                        f"The record is kept in {parked}; write it with `python -m dlc.dip "
+                                        f"write-pending --file \"{parked}\" --dip \"{store.path}\"` once nothing "
+                                        f"else holds the store."),
+                            "dip_pending": str(parked)}))
+            info["written"] = True
+            self._save()
             self.ctx.log(f"characterized {self.display.name}: {len(dip.noise_model)} noise band(s), "
                          f"cold channel {dip.cold_channel}, "
                          f"settle {dip.settle_seconds}s — DIP → {store.path.name}")
@@ -10667,12 +10725,14 @@ class Calibration:
         try:
             outcome = self.stage_characterize()
         except CalibrationAborted:
-            # Review rejected this characterization: drop the just-written DIP so a bad profile
-            # is never left silently active, then RESTORE the display before re-raising — the
+            # Review rejected this characterization: put back the record it replaced (or drop the
+            # just-written one when there was none) so a bad profile is never left silently active
+            # and a rejected RE-characterization keeps the probe sections the prior record held
+            # (refresh_response, peak_by_window), then RESTORE the display before re-raising — the
             # operator's setup must come back even on the abort path (clear-native put it in
             # native). A live AdjudicationRequired pause is NOT a CalibrationAborted, so it skips
             # this and propagates to the pause (the panel stays native for the resuming run).
-            self._dip_store().remove(self._dip_key())
+            self._restore_prior_dip()
             self._restore_user_setup(why="characterization rejected at review — nothing applied")
             raise
         # Leave the display exactly as we found it (clear-native entered native via the pipe).
