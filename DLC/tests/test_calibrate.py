@@ -834,8 +834,10 @@ def test_grayscale_wb_flow_is_standalone_mhc_only_touchup(tmp_path: Path):
     # immediate re-measure rate is identical under monotonic and alternating visit order
     # (18 = 9 bright points × the 3-read floor's 2 extra reads; the pre-floor monotonic
     # baseline was 14). The dark↔bright swings are absorbed by the luminance-jump settle
-    # bump (extra presenter dwell), never by extra reads.
-    assert digest["session"]["immediate_remeasures"] <= 18
+    # bump (extra presenter dwell), never by extra reads. The held-out greys between the nodes (read in the
+    # before state, 2026-11-14) add their own: the 8 bright ones the 3-read floor (8 x 2), the 16 dark ones
+    # their two-read minimum (16 x 1), and the 8 bracket re-reads at most 2 each (8 x 2).
+    assert digest["session"]["immediate_remeasures"] <= 18 + 16 + 16 + 16
     assert digest["session"]["jump_settles"] > 0
     # The touch-up live-edits the MHC correctionGrayscale (the toggleable third "+1") and bakes it
     # into the ICM on accept — NOT a runtime overlay tweak. Core (matrix/base/3D-LUT) untouched.
@@ -1095,10 +1097,13 @@ def test_grayscale_wb_outside_in_visit_order_and_ceiling_bound(tmp_path: Path):
 
     # Visit order: first appearances of measured codes = the outside-in permutation of
     # the ascending editor set (the set/payload themselves stay ascending).
+    # The held-out greys between the nodes (read once each in the before state) ride the same
+    # outside-in schedule over the union of both sets, sorted by code.
     patches = calib._grayscale_wb_patches()
     codes = [p[0] for p in patches]
+    union = sorted(codes + [p[0] for p in calib._grayscale_wb_heldout_patches()])
     first_seen = list(dict.fromkeys(visited))
-    assert first_seen == [codes[i] for i in outside_in_indices(len(codes))]
+    assert first_seen == [union[i] for i in outside_in_indices(len(union))]
     assert first_seen[1] == codes[-1]                 # full drive measured second
 
     # The full-drive point trips the existing top-point cap (120 asked, 100 delivered)…
@@ -1129,9 +1134,12 @@ def test_grayscale_wb_verify_set_is_outside_in(tmp_path: Path):
     calib = _make(tmp_path, "gswb_vorder")
     calib.target_name = "srgb_g22"
     tune = calib._grayscale_wb_patches()
+    held = calib._grayscale_wb_heldout_patches()
     verify = calib._grayscale_wb_verify_patches()
-    assert verify == [tune[i] for i in outside_in_indices(len(tune))]
-    assert sorted(verify) == sorted(tune)             # same points, different rhythm
+    union = sorted(tune + held)
+    assert verify == [union[i] for i in outside_in_indices(len(union))]
+    assert sorted(verify) == union                    # the nodes + the held-out greys between them
+    assert not set(tune) & set(held)
     assert tune == sorted(tune)                       # the tune/editor set stays ascending
 
 

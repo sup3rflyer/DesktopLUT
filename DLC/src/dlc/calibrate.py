@@ -146,6 +146,7 @@ from .patch_sets import (
     # the bookend generator is shared with _bookend_drift_qc, which must expect EXACTLY
     # the sweep the builders prepend/append (start-vs-end drift witness)
     _saturation_sweep_bookend,
+    build_grayscale_wb_heldout_set,
     build_grayscale_wb_set,
     build_neutral_set,
     build_ramp_set,
@@ -153,6 +154,7 @@ from .patch_sets import (
     build_verify_set,
     build_volumetric_set,
     flow_patch_counts,
+    grayscale_wb_union_order,
     held_out_draws_apply,
     insert_held_out_draws,
     outside_in_indices,
@@ -3647,7 +3649,20 @@ class Calibration:
                                      "installed_stack": self._installed_stack_evidence(),
                                      "scoring_gamut": self._scoring_gamut_source()}
         plan_warnings: list[str] = []
-        listed_digest = (((self.calib.get("stages") or {}).get("verify-patches-file") or {}).get("digest") or {}
+        if flow == "grayscale-wb":
+            # The fine-tune curve runs on the base 1D LUT's output (src/mhc_icc.cpp ComposeMhcScanout): the
+            # held-out greys are placed through it, and the SDR GAMMA 2.4 switch moves it in the bake.
+            ctx = self._gswb_base_context()
+            digest["gswb_base"] = {k: v for k, v in ctx.items() if k != "base"}
+            if not ctx.get("available"):
+                plan_warnings.append(f"grayscale-wb: {ctx.get('note')}")
+            if not spec.is_hdr and ctx.get("gamma24") is None:
+                plan_warnings.append(
+                    "grayscale-wb: DesktopLUT does not report the SDR GAMMA 2.4 switch; the held-out greys are placed "
+                    "with it OFF (the live edit holds it off). If it is ON, the bake reads the base at t^(2.4/2.2): "
+                    "the held-out greys would land near the nodes and the touch-up (tuned with 2.4 held off) is "
+                    "verified in a different state than it was tuned in - switch GAMMA 2.4 off for this run")
+        listed_digest =(((self.calib.get("stages") or {}).get("verify-patches-file") or {}).get("digest") or {}
                          if flow == "verify-only" else {})
         file_plan: Optional[str] = None
         if listed_digest:
@@ -3723,6 +3738,7 @@ class Calibration:
                       + (f"{patch_plan['total_patches']} patches "
                          f"({patch_plan['volumetric_mode']} volumetric, {patch_plan['order']} order). "
                          if file_plan is None else file_plan)
+                      + self._gswb_plan_text(patch_plan)
                       + ("".join(f"⚠ {w}. " for w in plan_warnings))
                       + "Proceed?"),
             options=("approve", "abort"), recommendation="approve", digest=digest)),
@@ -6716,8 +6732,11 @@ class Calibration:
             from .grayscale_wb import (
                 GrayTouchupConfig,
                 GrayTouchupPatch,
+                apply_light_trend,
                 compose_payload,
+                find_node_outliers,
                 identity_payload,
+                light_trend,
                 point_error,
                 summarize_errors,
                 update_point,
@@ -6817,22 +6836,46 @@ class Calibration:
             # table — the state the warm reference was established in — then restore the
             # current live table. Edits therefore never masquerade as panel drift.
             ident = identity_payload(points)
+            # The table presented after a guarded read: the touch-up's live table, or — while a
+            # held-out grey is read in the BEFORE state — that state's table (a reference read
+            # inside the before read must not hand the patch back to the live table).
+            presented: list[Optional[dict[str, Any]]] = [None]
+
+            def set_live(table: Mapping[str, Any]) -> None:
+                self.controller.grayscale_set_live(
+                    self.monitor, self.mode, table["point_count"], table["points"],
+                    table["deviations"], luminance=table["luminance"], rgb=table["rgb"])
 
             @contextmanager
             def reference_identity_guard():
-                self.controller.grayscale_set_live(
-                    self.monitor, self.mode, ident["point_count"], ident["points"],
-                    ident["deviations"], luminance=ident["luminance"], rgb=ident["rgb"])
+                set_live(ident)
                 try:
                     yield
                 finally:
-                    self.controller.grayscale_set_live(
-                        self.monitor, self.mode, payload["point_count"], payload["points"],
-                        payload["deviations"], luminance=payload["luminance"],
-                        rgb=payload["rgb"])
+                    set_live(presented[0] or payload)
+
+            # HELD-OUT greys (2026-11-14 HW): one grey between each pair of adjacent nodes where the
+            # curve's interpolation error is largest (build_grayscale_wb_heldout_set). The touch-up
+            # never measures them in the state it fits; each is read ONCE here in the BEFORE state
+            # (the state a revert gives back), interleaved with the node visits so the before reads
+            # share the nodes' thermal timeline, and once more by the verify on the bake —
+            # stage_verify judges after vs before against this run's own repeatability.
+            base_ctx = self._gswb_base_context()
+            heldout = self._grayscale_wb_heldout_patches(base_ctx=base_ctx)
+            before_table, before_state = self._gswb_before_table(prior_snapshot, ident)
+
+            @contextmanager
+            def before_state_guard():
+                presented[0] = before_table
+                set_live(before_table)
+                try:
+                    yield
+                finally:
+                    presented[0] = None
+                    set_live(payload)
 
             session = IncrementalMeasureSession(
-                patches=patches,
+                patches=list(patches) + list(heldout),
                 transfer=transfer,
                 measure=self.measure,
                 config=loop_cfg,
@@ -6843,6 +6886,9 @@ class Calibration:
                 checkin_interval_s=self._checkin_interval_s,
                 checkin_window=self._checkin_window,
                 reference_guard=reference_identity_guard,
+                # every held-out before-read takes at least two reads: its own repeatability is part of
+                # the judgment (a single read has none)
+                patch_min_reads=[0] * len(patches) + [2] * len(heldout),
             )
             session_start = session.start()
             if session_start.get("panel_dark"):
@@ -6871,7 +6917,17 @@ class Calibration:
             # achievable ceiling below can bound every later bright point from round one.
             # The patches/points/payload lists stay ascending — only the visit order changes.
             achievable_ceiling_y: float | None = None
-            for pos, idx in enumerate(outside_in_indices(len(patches))):
+            heldout_before: list[dict[str, Any]] = []
+            schedule = grayscale_wb_union_order(list(patches), list(heldout))
+            for pos, (visit_kind, idx) in enumerate(schedule):
+                if visit_kind == "heldout":
+                    heldout_before.append(self._gswb_measure_heldout_before(
+                        session, heldout, idx, n_nodes=len(patches), transfer=transfer,
+                        ceiling_y=achievable_ceiling_y, guard=before_state_guard))
+                    self._last_refine = {"stage": "grayscale-wb", "point": pos + 1,
+                                         "points": len(schedule), "held_out_code": int(heldout[idx][0])}
+                    self._maybe_timed_checkin("grayscale-wb")
+                    continue
                 patch = patches[idx]
                 target_y = transfer.cv_to_nits(patch[0])
                 at_full_drive = int(patch[0]) >= int(cap)
@@ -6914,6 +6970,13 @@ class Calibration:
                 first_error: dict[str, Any] | None = None
                 latest_error: dict[str, Any] | None = None
                 prev_xyz: tuple[float, float, float] | None = None
+                # The node's round-1 read (its BEFORE state) and its last read; ``stale`` = the
+                # table at this node changed after that last read (a nudge then a break), so it no
+                # longer describes the node's final state (held-out verify null, stage_verify).
+                first_read: dict[str, Any] | None = None
+                last_read: dict[str, Any] | None = None
+                stale = False
+                held_dark_node = False
                 for rnd in range(1, max_rounds_per_point + 1):
                     try:
                         accepted = session.measure_index(idx)
@@ -6962,9 +7025,14 @@ class Calibration:
                     gpatch = GrayTouchupPatch(level=points[idx], measured_xyz=tuple(accepted.xyz),
                                               target_y=target_y)
                     latest_error = point_error(gpatch, cfg)
+                    last_read = {"xyz": [float(v) for v in accepted.xyz],
+                                 "reads": [[float(v) for v in r] for r in accepted.round_reads],
+                                 "target_Y": float(target_y), "round": rnd}
+                    stale = False
                     if rnd == 1:
                         before_errors.append(latest_error)
                         first_error = latest_error
+                        first_read = last_read
                     point_log["rounds"].append({"round": rnd, **latest_error})
                     if (latest_error["de2000"] <= target_de
                             and abs(latest_error["delta_Y"]) <= y_tol):
@@ -7004,6 +7072,7 @@ class Calibration:
                         # Below the dark floor: update_point holds the point (no correction is
                         # possible at this luminance), so re-measuring can't improve it — break
                         # instead of burning the whole round budget on an unchanged table.
+                        held_dark_node = True
                         break
                     # Live-set the editor table — the preview shader applies it next frame, so
                     # the very next read reflects this nudge. The DECOMPOSED sliders ride the
@@ -7014,6 +7083,7 @@ class Calibration:
                         self.monitor, self.mode, payload["point_count"], payload["points"],
                         payload["deviations"], luminance=payload["luminance"],
                         rgb=payload["rgb"])
+                    stale = True
                     any_capped = any_capped or bool(upd.get("capped"))
                     any_large = any_large or bool(upd.get("large_correction"))
                     any_large_y = any_large_y or bool(upd.get("large_luminance_correction"))
@@ -7043,21 +7113,39 @@ class Calibration:
                     }
                     regression_holds += 1
                     latest_error = first_error
+                    last_read, stale = first_read, False
                 if latest_error is not None:
                     after_errors.append(latest_error)
+                # Evidence for the between-node checks: whether the node carries a solved value
+                # (tuned: read, not held dark), its round-1 (before) read, and its last read with
+                # whether that read still describes the node's final table.
+                point_log["tuned"] = first_read is not None and not held_dark_node
+                # SOLVED = the solver actually moved this node (a node within target at round 1
+                # keeps its default 1.0 — a value anywhere in the tolerance band, not a solve).
+                point_log["solved"] = bool(point_log["tuned"] and "held_regression" not in point_log and any(
+                    (r.get("update") or {}) and not (r.get("update") or {}).get("held_dark")
+                    for r in point_log["rounds"]))
+                point_log["first_read"] = first_read
+                point_log["final_read"] = ({**last_read, "describes_final_table": not stale}
+                                           if last_read is not None else None)
                 per_point.append(point_log)
                 self._last_refine = {
                     "stage": "grayscale-wb",
                     # progress = visit position (outside-in), not the ascending slot index
                     "point": pos + 1,
                     "index": idx,
-                    "points": len(patches),
+                    "points": len(schedule),
                     "latest": latest_error,
                     "capped": any_capped,
                     "large_correction": any_large,
                 }
                 self._maybe_timed_checkin("grayscale-wb")
 
+            # BRACKET (drift over the session): re-read MIN_SCALE_SAMPLES held-out greys, spread over the
+            # levels, in the before state again now - the same grey in the same state early and late; the
+            # verify carries the measured drift into every before/after comparison.
+            bracket = self._gswb_bracket_reads(session, heldout, heldout_before, n_nodes=len(patches),
+                                               guard=before_state_guard)
             session_digest = session.finish()
 
             # Ensure the final table is live in the preview even if every point was already within
@@ -7071,6 +7159,13 @@ class Calibration:
             self._state["grayscale_wb_touchup"] = payload
             self._save()
 
+            # LIGHT vs BALANCE (2026-11-14 HW, dense reads at codes 118-190): the panel's full-field light
+            # is a sawtooth in the code while its chromaticity is flat. A node's balance correction is sound;
+            # its light correction samples one phase of the sawtooth. The light part is therefore committed
+            # only as a trend several nodes share (grayscale-wb:light-trend applies it); node outliers are
+            # judged on that light-trended curve (what remains is balance / narrow chroma features).
+            lt = light_trend(self._gswb_light_needs(per_point, payload, transfer))
+            trended, _detail = apply_light_trend(payload, lt)
             max_abs_delta = max(
                 [abs(v - 1.0) for col in payload["deviations"].values() for v in col] or [0.0])
             max_lum_delta = max([abs(v - 1.0) for v in payload["luminance"]] or [0.0])
@@ -7098,6 +7193,21 @@ class Calibration:
                                     or session_digest.get("needs_adjudication")),
                 "per_point": per_point,
                 "updates": all_updates,
+                # Between-node evidence (2026-11-14 HW). node_outliers: solved nodes that disagree
+                # with their neighbours (a feature narrower than the node spacing) — raised at the
+                # grayscale-wb:node-outlier seam. held_out: the greys between the nodes, read in
+                # the BEFORE state here and judged after the bake by stage_verify.
+                "light_trend": lt,
+                "node_outliers": find_node_outliers(
+                    trended["deviations"], [p["index"] for p in per_point if p.get("solved")],
+                    codes=[int(p[0]) for p in patches],
+                    kind="hdr" if transfer.kind == "pq" else "sdr",
+                    materiality_de=target_de, white_xy=cfg.white_xy,
+                    light_exponent=[self._gswb_light_exponent(transfer, int(p[0])) for p in patches]),
+                "held_out": {"before_state": before_state, "n": len(heldout), "bracket": bracket,
+                             "base": {k: v for k, v in base_ctx.items() if k != "base"},
+                             "node_positions": self._gswb_positions([int(p[0]) for p in patches], base_ctx),
+                             "codes": [int(p[0]) for p in heldout], "greys": heldout_before},
             }
             return StageOutcome("grayscale-wb", "done", digest=digest, data={"payload": payload})
 
@@ -7121,7 +7231,8 @@ class Calibration:
             # A freshly (re-)run touch-up made a NEW live edit: an earlier attempt's bake / rollback
             # records describe a different curve (a stage re-run after a pre-commit rollback, or
             # --force) and must not short-circuit this attempt's commit.
-            for key in ("grayscale_wb_baked", "grayscale_wb_restore"):
+            for key in ("grayscale_wb_baked", "grayscale_wb_restore", "grayscale_wb_node_holds",
+                        "grayscale_wb_light_trend"):
                 old = self.calib.pop(key, None)
                 if old is not None:
                     self.calib.setdefault("grayscale_wb_attempt_history", []).append({key: old})
@@ -7140,6 +7251,12 @@ class Calibration:
                     "grayscale-wb", "aborted",
                     digest={"message": "aborted on Grayscale touch-up measurement session",
                             "decision_note": decision.note, **outcome.digest}))
+        live = not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable"))
+        if live and (outcome.digest.get("light_trend") or {}).get("changed"):  # seam only when material
+            self._gswb_light_trend_seam(outcome)
+        flagged = (outcome.digest.get("node_outliers") or {}).get("flagged") or []
+        if flagged and live:
+            self._gswb_node_outlier_seam(outcome)
         if outcome.digest.get("large_correction") or outcome.digest.get("capped"):
             recommendation = "abort" if outcome.digest.get("capped") else "accept"
             decision = self.adjudicate(AdjudicationRequest(
@@ -7202,6 +7319,249 @@ class Calibration:
                     self._save()
                     self.ctx.log("baked the Grayscale touch-up into the ICM")
         return outcome
+
+    def _gswb_light_needs(self, per_point: Sequence[Mapping[str, Any]], payload: Mapping[str, Any],
+                          transfer: Transfer) -> list[dict[str, Any]]:
+        """Per tuned node, the LIGHT it asks for: ``need`` = ln of the luminance gain that puts the node
+        exactly on its target light, from its last read when that still describes the final table
+        (``ln(lum) + ln(target / Y) / exponent``), else from its round-1 read (luminance 1), and the read
+        noise of that need (the SE of ln Y over the read's repeat reads / exponent; None for one read)."""
+        out = []
+        cap = int(self._patch_max_cv() or transfer.max_cv)
+        for p in sorted(per_point, key=lambda q: int(q["index"])):
+            # Not part of the light trend: untuned nodes, and the full-drive / ceiling-bounded ones —
+            # their light is bounded by the panel (a gain above full drive clips) and full drive is the
+            # white every grey is scored against, not a phase of a sawtooth.
+            if not p.get("tuned") or int(p["code"]) >= cap or p.get("unreachable_target"):
+                continue
+            k = int(p["index"])
+            fin, first = p.get("final_read") or {}, p.get("first_read") or {}
+            if fin.get("describes_final_table"):
+                read, lum0 = fin, float(payload["luminance"][k])
+            else:
+                read, lum0 = first, 1.0
+            y, ty = float((read.get("xyz") or [0, 0, 0])[1]), float(read.get("target_Y") or 0.0)
+            if y <= 0.0 or ty <= 0.0 or lum0 <= 0.0:
+                continue
+            g = self._gswb_light_exponent(transfer, int(p["code"]))
+            logs = [math.log(float(r[1])) for r in read.get("reads") or () if float(r[1]) > 0.0]
+            sigma = None
+            if len(logs) >= 2:
+                mu = sum(logs) / len(logs)
+                sigma = math.sqrt(sum((v - mu) ** 2 for v in logs) / (len(logs) - 1)) / math.sqrt(len(logs)) / g
+            out.append({"index": k, "code": int(p["code"]), "need": math.log(lum0) + math.log(ty / y) / g,
+                        "own": math.log(max(float(payload["luminance"][k]), 1e-9)), "sigma": sigma})
+        return out
+
+    def _gswb_light_trend_seam(self, outcome: StageOutcome) -> None:
+        """Commit the LIGHT part of the curve only as light the nodes on both sides share
+        (:func:`dlc.grayscale_wb.light_trend`). When some node's light moves by more than its own reads can
+        resolve, the move is a judgment: seam ``grayscale-wb:light-trend`` (``trend`` / ``abort``; there is
+        no per-node option - an isolated light value is what smears a tooth over the greys between the
+        nodes). When every move is below the read noise it is applied without a pause (nothing a read could
+        see changes) and recorded as such."""
+        lt = outcome.digest.get("light_trend") or {}
+        rows = [r for r in lt.get("nodes") or () if r.get("changed")]
+        material = [r for r in rows if r.get("material")]
+        if material:
+            lines = [f"node {r['index']} (code {r['code']}): asks {r['need_pct']:+.2f} %, solver left "
+                     f"{r['own_pct']:+.2f} %, committed {r['committed_pct']:+.2f} % ({r['reason']})"
+                     for r in sorted(material, key=lambda r: -abs(r["own_pct"] - r["committed_pct"]))[:8]]
+            decision = self.adjudicate(AdjudicationRequest(
+                key="grayscale-wb:light-trend", seam=SEAM_OPTIMIZE, stage="grayscale-wb",
+                question=(f"{len(material)} of {lt.get('n_nodes')} grey nodes would carry a light (luminance, signal "
+                          "gain) correction the nodes on both sides do not share, by more than their own reads "
+                          "resolve: " + "; ".join(lines) + (" ..." if len(material) > 8 else "")
+                          + ". The committed light at a node is the smallest ask of the five nodes around it when "
+                            "all five ask the same sign, else none (never extrapolated; zero at the edges of the "
+                            "supported range; never more than a supporting node asks). A display whose light is a "
+                            "sawtooth in the code is right at a node's code and wrong a few codes away with a "
+                            "per-node light value. 'trend' commits that light and keeps every node's colour "
+                            "balance; 'abort' ends the run with the prior curve back."),
+                options=("trend", "abort"), recommendation="trend",
+                digest={"light_trend": lt, "changes": [r["index"] for r in rows],
+                        "material": [r["index"] for r in material]}))
+            if decision.choice == "abort":
+                self._revert_inplace(why="grayscale-wb:light-trend seam answered abort")
+                raise CalibrationAborted(StageOutcome(
+                    "grayscale-wb", "aborted",
+                    digest={"message": "aborted at the grey light-trend seam", "decision_note": decision.note,
+                            "light_trend": lt}))
+        rec = self.calib.get("grayscale_wb_light_trend") or {}
+        if rec.get("applied") or (self.calib.get("grayscale_wb_baked") or {}).get("baked"):
+            return
+        from .grayscale_wb import apply_light_trend
+        base = self.calib.get("grayscale_wb_touchup") or (outcome.data or {}).get("payload")
+        trended, detail = apply_light_trend(base, lt)
+        self.controller.grayscale_set_live(
+            self.monitor, self.mode, trended["point_count"], trended["points"], trended["deviations"],
+            luminance=trended["luminance"], rgb=trended["rgb"])
+        self.calib["grayscale_wb_light_trend"] = {"applied": True, "nodes": [r["index"] for r in rows],
+                                                  "material": [r["index"] for r in material],
+                                                  "via_seam": bool(material),
+                                                  "detail": detail, "per_node_payload": base}
+        self.calib["grayscale_wb_touchup"] = trended
+        self._state["grayscale_wb_touchup"] = trended
+        self._save()
+        self.ctx.log(f"grayscale-wb: light committed as the shared trend at node(s) {[r['index'] for r in rows]}"
+                     + ("" if material else " (every move below the read noise)"))
+
+    @staticmethod
+    def _gswb_light_exponent(transfer: Transfer, code: int) -> float:
+        """d ln(light) / d ln(curve gain) at a grey ``code``: the power-law gamma for SDR (the curve
+        scales the signal), the local PQ slope for HDR (the curve scales the PQ value)."""
+        if transfer.kind != "pq":
+            return float(transfer.gamma)
+        lo = transfer.cv_to_nits(code)
+        if code <= 0 or lo <= 0:
+            return 1.0
+        return math.log(transfer.cv_to_nits(code * 1.01) / lo) / math.log(1.01)
+
+    @staticmethod
+    def _gswb_plan_text(plan: Mapping[str, Any]) -> str:
+        """The plan-seam clause of a grayscale-wb run: the held-out greys and the time they cost."""
+        est = plan.get("time_estimate") if isinstance(plan, Mapping) else None
+        if not isinstance(est, Mapping):
+            return ""
+        lo, hi = est.get("minutes") or (None, None)
+        return (f"Incl. {plan.get('held_out_greys')} held-out greys between the curve's nodes, read before "
+                f"the touch-up and in the verify (judged, never fitted; ~{est.get('held_out_minutes')} min). "
+                f"Estimated ~{lo}-{hi} min ({est.get('basis')}). ")
+
+    def _gswb_before_table(self, prior: Optional[Mapping[str, Any]],
+                           ident: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The live-editor table that shows the BEFORE state at the held-out greys — the state a
+        revert gives back: the user's own pre-run curve when it was switched on and is not the
+        identity, else the identity (what every node's round 1 is read in). The prior is sent as
+        its own stored slots (points = the slot grid, luminance = stored point / slot, rgb = the
+        stored balance), which the SDR bridge passes through unchanged and DesktopLUT stores as
+        the prior's exact points x deviations."""
+        mode = normalize_mode(self.mode)
+        if (self.calib.get("grayscale_wb_prior_source") == "prior" and isinstance(prior, Mapping)
+                and prior.get("enabled") and _gswb_identity_problem(prior, mode) is not None):
+            pts = [float(p) for p in prior.get("points") or ()]
+            n = len(pts)
+            devs = prior.get("deviations") or {}
+            if n in (10, 20, 32) and all(len(devs.get(ch) or ()) == n for ch in ("r", "g", "b")):
+                grid = [(i / (n - 1)) if mode == "HDR" else (i / (n - 1)) ** 2 for i in range(n)]
+                lum = [(pts[i] / grid[i]) if grid[i] > 0 else 1.0 for i in range(n)]
+                rgb = {ch: [float(v) for v in devs[ch]] for ch in ("r", "g", "b")}
+                table = {"point_count": n, "points": grid, "luminance": lum, "rgb": rgb,
+                         "deviations": {ch: [lum[i] * rgb[ch][i] for i in range(n)] for ch in rgb}}
+                return table, {"table": "prior", "point_count": n,
+                               "note": "the user's own pre-run curve (what a revert restores)"}
+            return dict(ident), {"table": "identity",
+                                 "note": (f"the pre-run curve ({n} points) cannot be presented in the live "
+                                          "editor — compared against the identity, NOT against what a "
+                                          "revert restores"), "revert_state_differs": True}
+        why = {"prior": "the pre-run curve was off or the identity",
+               "none": "no pre-run curve", "unsupported": "this DesktopLUT does not report the curve",
+               "unreadable": "the pre-run curve could not be read"}.get(
+                   str(self.calib.get("grayscale_wb_prior_source")), "no pre-run curve")
+        return dict(ident), {"table": "identity", "note": f"{why}: the identity is what a revert restores"
+                             if self.calib.get("grayscale_wb_prior_source") in ("prior", "none")
+                             else f"{why}: compared against the identity"}
+
+    def _gswb_measure_heldout_before(self, session: Any, heldout: Sequence[tuple[int, int, int]], h: int,
+                                     *, n_nodes: int, transfer: Transfer, ceiling_y: Optional[float],
+                                     guard: Callable[[], Any]) -> dict[str, Any]:
+        """Read held-out grey ``h`` once in the BEFORE state (through ``guard``) inside the touch-up's
+        measurement session (same warm reference, drift checkpoints, read policy). Its target is the
+        touch-up's own (the transfer's nits at its code, bounded by the measured full-drive ceiling
+        when that is lower, exactly as a node's would be) and is recorded for the after scoring."""
+        code = int(heldout[h][0])
+        target = float(transfer.cv_to_nits(code))
+        rec: dict[str, Any] = {"code": code, "kind": "between", "target_Y": target}
+        nodes = self._grayscale_wb_patches()
+        lower = max((i for i in range(len(nodes)) if nodes[i][0] < code), default=None)
+        rec["between_nodes"] = [lower, lower + 1] if lower is not None else None
+        if ceiling_y is not None and ceiling_y + max(0.15, target * 0.01) < target:
+            rec["target_Y"] = float(ceiling_y)
+            rec["bounded_by_ceiling"] = True
+        try:
+            with guard():
+                accepted = session.measure_index(n_nodes + h)
+        except RuntimeError as exc:
+            rec.update(before_xyz=None, error=str(exc))
+            return rec
+        if not accepted.usable:
+            rec.update(before_xyz=None, note=accepted.note)
+            return rec
+        rec.update(before_xyz=[float(v) for v in accepted.xyz],
+                   before_reads=[[float(v) for v in r] for r in accepted.round_reads],
+                   reads_taken=int(accepted.reads_taken))
+        return rec
+
+    def _gswb_node_outlier_seam(self, outcome: StageOutcome) -> None:
+        """The narrow-feature seam (2026-11-14 HW): one node, or two adjacent nodes, whose BALANCE departs from
+        the lines both sides draw toward it (after the light was committed as the shared light). The curve
+        spreads a node's value over both neighbouring intervals, so a feature narrower than the node spacing is
+        corrected at its node and DAMAGED around it. Options:
+          * ``smooth`` (recommended - what the owner wants on this display): the flagged nodes' BALANCE takes the
+            straight line between their neighbours, so the committed white balance is a smooth trend with no
+            per-node outlier; their light stays the shared light. The display's own defect at that code is left
+            uncorrected (it belongs to the base LUT, not to this flow);
+          * ``hold``: the flagged nodes' whole gain (light and balance) is bridged by the curve's own law;
+          * ``accept``: keep the curve as solved;  * ``abort``: the prior curve goes back.
+        The verify judges the flagged codes against their PREDICTED outcome and every other held-out grey by the
+        regression rule; nothing is decided here by code."""
+        info = (self.calib["stages"].get("grayscale-wb") or {}).get("digest", {}).get("node_outliers") \
+            or outcome.digest.get("node_outliers") or {}
+        flagged = info.get("flagged") or []
+        lines = []
+        for f in flagged:
+            pct = f.get("solved_vs_neighbours_pct") or {}
+            per = "; ".join(f"node {k} (code {c}): r {pct['r'][j]:+.2f} % g {pct['g'][j]:+.2f} % b {pct['b'][j]:+.2f} %"
+                            for j, (k, c) in enumerate(zip(f["nodes"], f["codes"])))
+            lines.append(f"{per} off the lines both sides draw, max |z| {f['max_abs_z']}, bridging moves its grey "
+                         f"{f.get('hold_changes_grey_de')} dE; spreads over codes "
+                         f"{f['spreads_over_codes'][0]}-{f['spreads_over_codes'][1]}")
+        features = [list(f["nodes"]) for f in flagged]
+        decision = self.adjudicate(AdjudicationRequest(
+            key="grayscale-wb:node-outlier", seam=SEAM_OPTIMIZE, stage="grayscale-wb",
+            question=(f"{len(flagged)} narrow feature(s) under the grey nodes (|z| > {info.get('z_crit')}, family-wise "
+                      f"alpha {info.get('alpha')}): " + " | ".join(lines)
+                      + ". The baked curve spreads a node's correction over both neighbouring intervals. 'smooth' "
+                        "makes the committed white balance a smooth trend through these nodes (their balance takes "
+                        "the line between their neighbours, their light stays the shared light) - the display's own "
+                        "defect at that code is then left uncorrected (it belongs to the base LUT); 'hold' bridges "
+                        "their whole gain; 'accept' keeps the curve as solved; 'abort' ends the run with the prior "
+                        "curve back. The verify reports the flagged codes against their predicted outcome."),
+            options=("smooth", "hold", "accept", "abort"), recommendation="smooth",
+            digest={"node_outliers": info, "held_out": {
+                "n": (outcome.digest.get("held_out") or {}).get("n"),
+                "before_state": (outcome.digest.get("held_out") or {}).get("before_state")},
+                "proposed_features": features}))
+        if decision.choice == "abort":
+            self._revert_inplace(why="grayscale-wb:node-outlier seam answered abort")
+            raise CalibrationAborted(StageOutcome(
+                "grayscale-wb", "aborted",
+                digest={"message": "aborted on a narrow feature under the grey nodes",
+                        "decision_note": decision.note, "node_outliers": info}))
+        if decision.choice not in ("smooth", "hold"):
+            return
+        rec = self.calib.get("grayscale_wb_node_holds") or {}
+        if rec.get("applied") or (self.calib.get("grayscale_wb_baked") or {}).get("baked"):
+            return   # a resume: already on the live table / in the bake
+        from .grayscale_wb import apply_balance_smoothing, apply_node_holds
+        base = self.calib.get("grayscale_wb_touchup") or (outcome.data or {}).get("payload")
+        kind = "hdr" if normalize_mode(self.mode) == "HDR" else "sdr"
+        nodes = sorted({k for f in features for k in f})
+        if decision.choice == "smooth":
+            held, detail = apply_balance_smoothing(base, features)
+        else:
+            held, detail = apply_node_holds(base, nodes, kind=kind)
+        self.controller.grayscale_set_live(
+            self.monitor, self.mode, held["point_count"], held["points"], held["deviations"],
+            luminance=held["luminance"], rgb=held["rgb"])
+        self.calib["grayscale_wb_node_holds"] = {"applied": True, "mode": decision.choice, "nodes": nodes,
+                                                 "features": features,
+                                                 "codes": [c for f in flagged for c in f["codes"]],
+                                                 "detail": detail, "solved_payload": base}
+        self.calib["grayscale_wb_touchup"] = held
+        self._state["grayscale_wb_touchup"] = held
+        self._save()
+        self.ctx.log(f"grayscale-wb: {decision.choice} at node(s) {nodes}")
 
     def _snapshot_correction_grayscale(self) -> Optional[dict[str, Any]]:
         """The live correctionGrayscale for this monitor/mode from ``state.get`` (the user's
@@ -7943,6 +8303,14 @@ class Calibration:
                 # What was measured (installed stack / candidate) and, with --verify-patches-from,
                 # the per-bucket deltas vs the source run's RECORDED verify — evidence, no pause.
                 digest.update(self._verify_only_evidence(digest, metrics))
+            if self.calib.get("flow") == "grayscale-wb":
+                # The touch-up judged where it was NOT fitted (2026-11-14 HW): the held-out greys
+                # between the nodes, after (these reads) vs before (the touch-up session).
+                try:
+                    digest["gswb_held_out"] = self._gswb_held_out_verify(samples)
+                except Exception as exc:  # noqa: BLE001 - evidence must never break the verify gate
+                    digest["gswb_held_out"] = {"available": False,
+                                               "reason": f"judging failed ({type(exc).__name__}: {exc})"}
             return StageOutcome("verify", "done", digest=digest,
                                 data={"within_quality": within, "metrics": {
                                     "avg_de2000": summary.avg_de2000, "p95_de2000": summary.p95_de2000,
@@ -7988,13 +8356,21 @@ class Calibration:
             thermal_txt += f" MHC white ({mw.get('stage')}): refined in the {mw.get('state')!r} state (model)."
         if ts.get("note"):
             thermal_txt += f" Note: {ts['note']}."
+        gswb = d.get("gswb_held_out") if self.calib.get("flow") == "grayscale-wb" else None
+        # revert when a grey the touch-up was not fitted on reads worse than before (light or colour), or a
+        # smoothed / held node's code did not do what was predicted
+        gswb_regressed = bool((gswb or {}).get("n_regressed")) or any(
+            not p.get("as_predicted") for p in (gswb or {}).get("predicted") or ())
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
             question=(f"The new calibration reads {_content_lead_text(d)}{reads} — "
-                      f"{'within' if within else 'outside'} the quality targets.{thermal_txt} "
+                      f"{'within' if within else 'outside'} the quality targets.{thermal_txt}"
+                      f"{self._gswb_held_out_question_text(gswb) if gswb is not None else ''} "
                       "Apply this calibration, or revert to the previous display setup?"),
             options=("apply", "revert"),
-            recommendation=("revert" if severe else "apply"),
+            # A grayscale-wb touch-up that made ANY grey it was not fitted on worse than before
+            # (beyond the run's own repeatability) recommends revert — a suggestion; the judge decides.
+            recommendation=("revert" if (severe or gswb_regressed) else "apply"),
             # severe → recommend revert (auto/sim reverts a catastrophic result). gate_failed flag
             # → even a NON-severe quality-gate miss escalates under SupervisedAdjudicator, so an
             # unattended run never silently applies a sub-quality calibration at this terminal gate.
@@ -8002,8 +8378,159 @@ class Calibration:
             # judged on the TRAJECTORY (did the calibration improve the panel?), not one absolute
             # number (fable Phase 8, digest-sufficiency).
             digest={**outcome.digest, "severe_failure": severe, "gate_failed": not bool(within),
+                    **({"held_out_regressed": gswb_regressed} if gswb is not None else {}),
                     "before_scores": self.calib.get("stage_scores") or None}))
         return outcome
+
+    def _gswb_held_out_verify(self, samples: Sequence[Any]) -> dict[str, Any]:
+        """grayscale-wb: judge the bake at the greys it was not fitted on - LIGHT and CHROMATICITY separately,
+        each against the grey's own before-read (:func:`dlc.grayscale_wb.judge_held_out`):
+          * every held-out grey by the regression rule, with the light the committed curve COMMANDS there
+            (committed vs before-table gains at the grey's curve coordinate THROUGH THE BASE) so light that
+            moved where the curve commanded nothing is evidence, not the curve's regression;
+          * the codes of smoothed / held nodes against their PREDICTED outcome (their round-1 read carried
+            through the curve change) - the display's own defect there is left uncorrected by design;
+          * repeatability: the greys' repeat reads, the bracket re-reads (session drift) and the null of nodes
+            whose committed value is exactly what their last session read saw (moved nodes never enter it)."""
+        from .grayscale_wb import (GrayTouchupConfig, base_positions, carry_through, commanded_light, curve_gains,
+                                   judge_held_out, light_ratios)
+
+        touch = (self.calib["stages"].get("grayscale-wb") or {}).get("digest") or {}
+        ho = touch.get("held_out")
+        if not isinstance(ho, dict):
+            return {"available": False,
+                    "reason": "the touch-up recorded no held-out before reads (a run that began before the "
+                              "held-out check) - the greys between the nodes are UNVERIFIED"}
+        transfer = self._transfer()
+        max_cv = transfer.max_cv
+        cap = int(self._patch_max_cv() or max_cv)
+        kind = "hdr" if transfer.kind == "pq" else "sdr"
+        sums: dict[int, list[float]] = {}
+        counts: dict[int, int] = {}
+        for s, code in zip(samples, verify_holdout.to_codes([s.rgb for s in samples], max_cv)):
+            c = [int(v) for v in code]
+            if c[0] == c[1] == c[2] and all(math.isfinite(float(v)) for v in s.xyz):
+                acc = sums.setdefault(c[0], [0.0, 0.0, 0.0])
+                for k in range(3):
+                    acc[k] += float(s.xyz[k])
+                counts[c[0]] = counts.get(c[0], 0) + 1
+        after = {code: [v / counts[code] for v in acc] for code, acc in sums.items()}
+        committed = self.calib.get("grayscale_wb_touchup") or {}
+        n = int(committed.get("point_count") or len(committed.get("points") or ()) or 32)
+        after_gains = {ch: [float(v) for v in (committed.get("deviations") or {}).get(ch) or [1.0] * n]
+                       for ch in ("r", "g", "b")}
+        before_state = ho.get("before_state") or {}
+        before_gains = None
+        if before_state.get("table") == "prior":
+            prior = self.calib.get("grayscale_wb_prior") or {}
+            before_gains = curve_gains(prior.get("points") or [], prior.get("deviations") or {}, kind)
+        base_ctx = self._gswb_base_context()
+        gamma24 = bool(base_ctx.get("gamma24"))
+
+        def u_of(code: int) -> dict[str, float]:
+            return base_positions(code, max_cv=max_cv, cap=cap, n=n, kind=kind, base=base_ctx.get("base"),
+                                  gamma24=gamma24)
+
+        greys = []
+        for g in ho.get("greys") or ():
+            g = dict(g)
+            ratios = light_ratios(after_gains, before_gains, u_of(int(g["code"])),
+                                  light_exponent=self._gswb_light_exponent(transfer, int(g["code"])), kind=kind)
+            g["commanded_e"] = commanded_light(ratios)
+            greys.append(g)
+        holds_rec = self.calib.get("grayscale_wb_node_holds") or {}
+        holds = [int(k) for k in holds_rec.get("nodes") or ()] if holds_rec.get("applied") else []
+        mode = holds_rec.get("mode", "hold")
+        per_point = {int(p["index"]): p for p in touch.get("per_point") or () if "index" in p}
+        skipped_holds = []
+        for k in holds:
+            p = per_point.get(k) or {}
+            first = p.get("first_read")
+            if before_state.get("table") == "identity" and first:
+                code = int(p["code"])
+                ratios = light_ratios(after_gains, None, u_of(code),
+                                      light_exponent=self._gswb_light_exponent(transfer, code), kind=kind)
+                greys.append({"code": code, "kind": f"{'smoothed' if mode == 'smooth' else 'held'}_node",
+                              "between_nodes": [k, k], "target_Y": first["target_Y"], "before_xyz": first["xyz"],
+                              "before_reads": first.get("reads") or (),
+                              "predicted_xyz": carry_through(first["xyz"], ratios, self._white_xy()),
+                              "predicted_note": "its round-1 read (the identity curve) carried through the committed "
+                                                "curve at its coordinate"})
+            else:
+                skipped_holds.append(k)
+        lt_rec = self.calib.get("grayscale_wb_light_trend") or {}
+        moved = set(holds) | ({int(k) for k in lt_rec.get("nodes") or ()} if lt_rec.get("applied") else set())
+        null_pairs = []
+        for k, p in per_point.items():
+            fin = p.get("final_read") or {}
+            if (not p.get("tuned") or k in moved or not fin.get("describes_final_table")
+                    or int(p["code"]) not in after):
+                continue
+            null_pairs.append({"index": k, "code": int(p["code"]), "target_Y": fin["target_Y"],
+                               "final_xyz": fin["xyz"], "verify_xyz": after[int(p["code"])]})
+        spec = self._spec()
+        res = judge_held_out(greys, after, null_pairs, bracket=ho.get("bracket") or (),
+                             config=GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma)),
+                             chroma_tol=float(touch.get("target_de2000") or 0.6))
+        res["before_state"] = before_state
+        res["held_nodes"] = holds
+        res["held_mode"] = mode if holds else None
+        res["light_trend_nodes"] = sorted(moved - set(holds))
+        res["base"] = {k: v for k, v in base_ctx.items() if k != "base"}
+        if skipped_holds:
+            res["held_nodes_not_judged"] = {
+                "nodes": skipped_holds,
+                "reason": "the before state is the user's own curve; the node's round-1 read was taken through the "
+                          "identity curve, so it is not the before state and the node's code cannot be judged"}
+        if holds:
+            res["defect_left_uncorrected"] = (
+                "the display's own defect at code(s) " + ", ".join(str(int(per_point[k]["code"])) for k in holds
+                                                                  if k in per_point)
+                + " is left uncorrected by this flow (it belongs to the base 1D LUT, not to the fine-tune curve)")
+        return res
+
+    @staticmethod
+    def _gswb_held_out_question_text(gswb: Mapping[str, Any]) -> str:
+        """The verify:accept clause of a grayscale-wb run: the greys between the nodes, light and colour."""
+        if not gswb.get("available"):
+            return f" Between-node greys: NOT JUDGED ({gswb.get('reason') or 'no judged greys'})."
+        txt = (f" Between-node greys (never fitted): {gswb.get('n_judged')} judged before vs after, light and colour "
+               f"separately, against this run's repeatability: {gswb.get('n_regressed')} WORSE than before")
+        regressed = [w for w in gswb.get("worst") or () if w.get("regressed")]
+        if regressed:
+            parts = []
+            for w in regressed[:5]:
+                lt, ch = w.get("light") or {}, w.get("chroma") or {}
+                what = []
+                if lt.get("regressed"):
+                    what.append(f"light {lt.get('before_pct')} % -> {lt.get('after_pct')} % (the curve commanded "
+                                f"{lt.get('commanded_pct')} %)")
+                if ch.get("regressed"):
+                    what.append(f"colour {ch.get('before_de')} -> {ch.get('after_de')} dE")
+                parts.append(f"code {w['code']}: " + ", ".join(what))
+            txt += " - " + "; ".join(parts) + " - the touch-up leaves greys it was not fitted on worse than before"
+        txt += f" ({len(gswb.get('improved_codes') or ())} of {gswb.get('n_judged')} read better in both)"
+        unc = gswb.get("uncommanded_light") or []
+        if unc:
+            txt += (f"; {len(unc)} grey(s) moved in light where the curve commanded ~nothing (a drive change across a "
+                    "tooth, or drift): " + ", ".join(f"{u['code']} {u['change_pct']:+.2f} %" for u in unc[:5]))
+        for p in gswb.get("predicted") or ():
+            txt += (f"; code {p['code']} ({p['kind'].replace('_', ' ')}): "
+                    + ("did what was predicted" if p.get("as_predicted") else "did NOT do what was predicted")
+                    + f" (light {p.get('light_after_pct')} % vs predicted {p.get('light_pct')} %)")
+        if gswb.get("defect_left_uncorrected"):
+            txt += f"; {gswb['defect_left_uncorrected']}"
+        if gswb.get("held_nodes_not_judged"):
+            hn = gswb["held_nodes_not_judged"]
+            txt += f"; held node(s) {hn['nodes']} NOT judged ({hn['reason']})"
+        for key, label in (("null", "null"), ("bracket", "bracket")):
+            note = (gswb.get(key) or {}).get("note")
+            if note:
+                txt += f"; {label}: {note}"
+        state = (gswb.get("before_state") or {})
+        if state.get("revert_state_differs"):
+            txt += f" [before = identity, not the revert state: {state.get('note')}]"
+        return txt + "."
 
     def _score_verify_samples(self, samples: Sequence[Any], *, reachable: Any = None,
                               reuse_reachable: bool = False) -> dict[str, Any]:
@@ -8789,13 +9316,101 @@ class Calibration:
     def _grayscale_wb_patches(self) -> list[tuple[int, int, int]]:
         return build_grayscale_wb_set(self.patch_sizes, self._transfer(), max_cv=self._patch_max_cv())
 
+    def _grayscale_wb_heldout_patches(self, *, base_ctx: Optional[Mapping[str, Any]] = None
+                                      ) -> list[tuple[int, int, int]]:
+        """The greys between the touch-up's slots it is judged on but never fitted on
+        (:func:`build_grayscale_wb_heldout_set`), placed through the installed base 1D LUT. Once the
+        touch-up recorded them, the recorded codes (the verify must read exactly what was read before)."""
+        rec = ((self.calib.get("stages") or {}).get("grayscale-wb") or {}).get("digest") or {}
+        codes = (rec.get("held_out") or {}).get("codes")
+        if isinstance(codes, list) and codes:
+            return [(int(c), int(c), int(c)) for c in codes]
+        ctx = base_ctx if base_ctx is not None else self._gswb_base_context()
+        return build_grayscale_wb_heldout_set(self.patch_sizes, self._transfer(), max_cv=self._patch_max_cv(),
+                                              base=ctx.get("base"), gamma24=bool(ctx.get("gamma24")))
+
+    def _gswb_base_context(self) -> dict[str, Any]:
+        """The base 1D LUT the bake evaluates the fine-tune curve on (src/mhc_icc.cpp ``ComposeMhcScanout``:
+        the curve runs on the base's OUTPUT) - from ``state.get`` ``mhc.<mon:mode>.source_file`` (the DLC base
+        cube; the mock reports it as ``base_lut.cube_path``). ``gamma24`` = the SDR GAMMA 2.4 switch, which
+        moves the base read to t^(2.4/2.2) in the bake: ``state.get`` does not report it, so it is ``None``
+        (unknown; positions are computed with it off - the live edit holds it off - and the plan warns)."""
+        out: dict[str, Any] = {"available": False, "source": None, "gamma24": None, "base": None}
+        try:
+            entry = ((self.controller.state() or {}).get("mhc") or {}).get(f"{self.monitor}:{self.mode}") or {}
+        except Exception as exc:  # noqa: BLE001 - a down pipe is an answer
+            out["note"] = f"state.get failed ({type(exc).__name__}: {exc})"
+            return out
+        lay = ((self.controller.state() or {}).get("layers") or {}).get(f"{self.monitor}:{self.mode}") or {}
+        if isinstance(lay.get("sdr_gamma24"), bool):
+            out["gamma24"] = lay["sdr_gamma24"]
+        path = entry.get("source_file") or (entry.get("base_lut") or {}).get("cube_path")
+        out["source"] = path
+        if not path:
+            out["note"] = ("the installed MHC reports no base 1D cube (source_file): the held-out greys are placed as "
+                           "if the base were identity and may not sit at the curve's mid-positions")
+            return out
+        try:
+            from .mhc_cube import read_1d_cube
+            cube = read_1d_cube(Path(path))
+        except (OSError, ValueError) as exc:
+            out["note"] = f"the base cube {path} cannot be read ({type(exc).__name__}: {exc}); placed as identity"
+            return out
+        out.update(available=True, base=cube, entries=len(cube["r"]))
+        return out
+
+    def _gswb_positions(self, codes: Sequence[int], base_ctx: Mapping[str, Any]) -> dict[str, Any]:
+        """Where each patch code lands on the fine-tune curve through the base (per channel u), against the
+        slot the patch was meant for - the evidence for "slider = patch code"."""
+        from .grayscale_wb import base_positions
+        transfer = self._transfer()
+        cap = int(self._patch_max_cv() or transfer.max_cv)
+        kind = "hdr" if transfer.kind == "pq" else "sdr"
+        rows = []
+        for i, c in enumerate(codes):
+            u = base_positions(c, max_cv=transfer.max_cv, cap=cap, n=len(codes), kind=kind,
+                               base=base_ctx.get("base"), gamma24=bool(base_ctx.get("gamma24")))
+            rows.append({"index": i, "code": int(c), "u": {ch: round(v, 3) for ch, v in u.items()},
+                         "offset": round(max(u.values(), key=lambda v: abs(v - i)) - i, 3)})
+        worst = max(rows, key=lambda r: abs(r["offset"])) if rows else None
+        return {"base_available": bool(base_ctx.get("available")), "nodes": rows,
+                "max_offset_slots": worst["offset"] if worst else None,
+                "max_offset_node": worst["index"] if worst else None}
+
+    def _gswb_bracket_reads(self, session: Any, heldout: Sequence[tuple[int, int, int]],
+                            before: Sequence[Mapping[str, Any]], *, n_nodes: int,
+                            guard: Callable[[], Any]) -> list[dict[str, Any]]:
+        """Re-read :data:`dlc.grayscale_wb.MIN_SCALE_SAMPLES` held-out greys (spread evenly over the levels) in
+        the before state at the END of the session: early and late reads of the same grey in the same state
+        measure the display's drift over the session, which the verify carries into the comparison."""
+        from .grayscale_wb import MIN_SCALE_SAMPLES
+        early = {int(g["code"]): g for g in before if g.get("before_xyz") is not None}
+        idx = [h for h, p in enumerate(heldout) if int(p[0]) in early]
+        if len(idx) < MIN_SCALE_SAMPLES:
+            return []
+        pick = sorted({idx[round(j * (len(idx) - 1) / (MIN_SCALE_SAMPLES - 1))] for j in range(MIN_SCALE_SAMPLES)})
+        out = []
+        for h in pick:
+            code = int(heldout[h][0])
+            try:
+                with guard():
+                    accepted = session.measure_index(n_nodes + h)
+            except RuntimeError:
+                continue
+            if accepted.usable:
+                out.append({"code": code, "target_Y": early[code]["target_Y"], "early_xyz": early[code]["before_xyz"],
+                            "late_xyz": [float(v) for v in accepted.xyz]})
+        return out
+
     def _grayscale_wb_verify_patches(self) -> list[tuple[int, int, int]]:
-        """The grey-ramp verify sequence: the SAME points as the tune set, visited in the
-        outside-in alternating order (D4) so the verify holds the same roughly-flat APL as
+        """The grey-ramp verify sequence: the SAME points as the tune set PLUS the held-out greys
+        between them (read before the touch-up in its session), visited in the outside-in
+        alternating order (D4) over the union so the verify holds the same roughly-flat APL as
         the tune instead of cooling through an ascending dark half. Scoring is per-patch
         (order-independent), so only the measurement rhythm changes."""
-        patches = self._grayscale_wb_patches()
-        return [patches[i] for i in outside_in_indices(len(patches))]
+        nodes = self._grayscale_wb_patches()
+        held = self._grayscale_wb_heldout_patches()
+        return [(nodes if kind == "node" else held)[i] for kind, i in grayscale_wb_union_order(nodes, held)]
 
     def _verify_patches(self, *, gamut_aware: bool = True) -> list[tuple[int, int, int]]:
         # The "cover all bases" QC set (see build_verify_set): dense grey/PQ + shadow toe, colour
