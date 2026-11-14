@@ -25,6 +25,20 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
   greys the build interpolated in linear light, which on any gamma-like panel lands a little dark mid-gap (up to
   ~1 % on the default ramp, several % on sparse ones). Above 1 % of white it now interpolates in the transfer
   domain (SDR gamma, HDR PQ), which the raw ramps of all 29 past runs fit better; the shadows are built as before.
+- **`grayscale-wb` judgement after the first hardware acceptance** (2026-11-14 11:46 run):
+  - the size seam measures the curve that will be COMMITTED (after the light-trend and node-outlier decisions),
+    not the solver's per-node values;
+  - drift rests on two brackets by design (8 held-out greys re-read at the end of the session and again at the end
+    of the verify; +8 presentations); with too few pairs the verify says "drift unknown";
+  - colour between the nodes is judged in BT.2124 dE_ITP at the grey's own light (1 = one JND at every level) with
+    the noise of re-presenting greys at that level, so a 0.3-nit grey is no longer weighed like a 100-nit one;
+  - a smoothed node's colour is checked against its prediction; its light only where the run's own greys show the
+    light is smooth in the code there (else reported as an observation);
+  - the per-node "read noise" (the scatter of one presentation's reads, ~0.001 %) is reported under that name and
+    decides nothing; a light move pauses when it exceeds the between-presentation scatter.
+- **refresh-response verify: a practical chromaticity floor** (2026-11-14): a shift the very repeatable reference
+  legs prove real but below one JND (BT.2124 dE_ITP 1) is a practical pass, named in the rate's notes with both
+  numbers.
 - **`grayscale-wb` is judged between its nodes, not only on them** (2026-11-14). The touch-up is fitted at the
   curve's 32 nodes and its verify re-read the same 32 codes, but DesktopLUT bakes a CURVE: a node's correction
   reaches every grey out to its neighbours. On the PA32UCXR a feature ~9 codes wide at node 12 (code 153) got a
