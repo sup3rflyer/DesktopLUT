@@ -90,6 +90,9 @@ std::wstring RowIdOf(const DisplayRow& r);
 // Posts `fn` for the display's live index as it is when the command runs (found again by identity).
 void PostToDisplay(const DisplayRow& r, std::function<void(int)> fn);
 
+// The footer's time in front of a warning: "13:02  " today, "11-13 13:02  " (month-day) on another day.
+std::string FooterStamp(const SYSTEMTIME& t, const SYSTEMTIME& now);
+
 void DrawRoot(const Snapshot& snap, ViewState& vs, bool busy);
 
 // ---- shared with the other pages that show the display list (ui_dlc.cpp) ----------------------------------------

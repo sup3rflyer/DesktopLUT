@@ -70,6 +70,7 @@ bool g_exiting = false;
 int g_failures = 0;                  // consecutive reconciles with a failed swap / override
 ULONGLONG g_retryNotBefore = 0;      // a periodic reconcile leaves failed work to the backoff timer until then
 bool g_warned = false;               // the user was told the Windows tone map could not be applied
+constexpr const wchar_t* kToneMapKey = L"windows-tonemap";   // notify condition: that warning, until a pass lands
 
 std::atomic<bool> g_requestPending{ false };
 std::atomic<bool> g_reapplyPending{ false };
@@ -271,11 +272,12 @@ void ReconcileWindowsToneMap(const char* why, bool reapply) {
         ArmRetry(kFailRetryMs[step]);
         if (g_failures >= kWarnAfterFailures && !g_warned) {
             g_warned = true;
-            notify::Post(notify::Sev::Warning, -1, L"mhc", L"Windows tone map could not be applied",
-                         L"Windows may still report the panel's peak; retrying");
+            notify::PostCondition(notify::Sev::Warning, -1, L"mhc", kToneMapKey, L"Windows tone map could not be applied",
+                                  L"Windows may still report the panel's peak; retrying");
         }
     } else if (!wait) {
         if (g_failures > 0 && changed) std::cout << "[Windows tone map] applied after a retry" << std::endl;
+        if (g_warned) notify::Resolve(-1, L"mhc", kToneMapKey);   // a pass with nothing failing: the warning is over
         g_failures = 0;
         g_retryNotBefore = 0;
         g_warned = false;

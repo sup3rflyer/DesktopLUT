@@ -22,6 +22,7 @@
 #include "whitelist.h"
 #include "dwm_inject.h"
 #include "dwmcore_scan.h"
+#include "fald_core_status.h"   // FaldCoreGovLayersStopped
 #include "actions/notify.h"
 #include <objbase.h>
 #include <iostream>
@@ -1305,13 +1306,16 @@ static void StartProcessingImpl() {
             UpdateDwmHookSharedConfig();
         } else if (!dwmMonitors.empty()) {
             std::wstring err = InjectDwmHook(dwmMonitors, &stagingWarning);
+            // An injection that read every LUT file ends an earlier "could not be read" (the hook holds them now).
+            if (err.empty() && stagingWarning.empty()) notify::Resolve(-1, L"hook", L"lut-read");
             if (err.empty() && !stagingWarning.empty()) {
                 // Injected, but a LUT file could not be read: that display runs without its cube.
                 // A warning, never a blocking dialog (a pipe-driven start must not block): the footer shows it in
                 // amber, Events has the detail.
                 SetStatus(L"Active (DWM Hook) - a LUT file could not be read");
-                notify::Post(notify::Sev::Warning, -1, L"hook", L"A 3D LUT file could not be read",
-                             stagingWarning + L"\n\nThat display runs without its 3D LUT.");
+                notify::Resolve(-1, L"hook", L"lut-read");   // this injection's list replaces the last one's
+                notify::PostCondition(notify::Sev::Warning, -1, L"hook", L"lut-read", L"A 3D LUT file could not be read",
+                                      stagingWarning + L"\n\nThat display runs without its 3D LUT.");
             }
             if (!err.empty()) {
                 std::wcout << L"[DWM Hook] Injection failed" << std::endl;
@@ -1455,6 +1459,7 @@ void StopProcessing() {
 
 static void StopProcessingImpl() {
     FaldTrace("StopProcessing: enter");
+    FaldCoreGovLayersStopped();   // every FALD governor stops with the live layers: a rate-cap warning is over
     // Cancel any pending auto-restart (user explicitly wants stopped)
     g_gui.restartRetryCount = 0;
     if (g_gui.hwndMain) KillTimer(g_gui.hwndMain, RESTART_TIMER_ID);

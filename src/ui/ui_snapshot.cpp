@@ -232,16 +232,18 @@ void TakeSnapshot(Snapshot& out) {
         if (at >= 0) out.live[(size_t)at].dlcRun = true;
     }
 
-    out.lastStatus.clear();
-    out.lastStatusSev = notify::Sev::Info;
-    for (auto it = notify::Snapshot(32); !it.empty(); it.pop_back()) {
-        const notify::Event& e = it.back();
-        if (e.source == L"status" || e.sev == notify::Sev::Warning || e.sev == notify::Sev::Error) {
-            out.lastStatus = e.title;
-            out.lastStatusSev = e.sev;
-            break;
-        }
+    // The footer's line: notify::PickHeadline (a warning until it is resolved or seen, else the newest status line).
+    // Re-picked only when the log, a resolve or the acknowledgement changed (GUI thread only).
+    static uint64_t s_rev = ~0ull;
+    static notify::Event s_pick;
+    static bool s_has = false;
+    if (const uint64_t rev = notify::Revision(); rev != s_rev) {
+        s_rev = rev;
+        s_has = notify::Headline(s_pick);
     }
+    out.lastStatus = s_has ? s_pick.title : std::wstring();
+    out.lastStatusSev = s_has ? s_pick.sev : notify::Sev::Info;
+    out.lastStatusTime = s_has ? s_pick.time : SYSTEMTIME{};
 }
 
 }  // namespace ui

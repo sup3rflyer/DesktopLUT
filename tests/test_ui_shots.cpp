@@ -635,6 +635,13 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
         { "settingstwinsnarrow", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 80 },
         { "settingstwinsoff", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 81 },
         { "settingstwinsid", ui::Page::Settings, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 82 },
+        // The footer's line (notify::PickHeadline): 90 a standing warning with its time (today), 91 one from another
+        // day, 92 an error at the narrow width; the plain status line is every other shot's footer. 93 the footer's
+        // tooltip over a warning.
+        { "footerwarn", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 90 },
+        { "footerwarnday", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 1180, 760, 91 },
+        { "footerwarnnarrow", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, -1, -1, 920, 520, 92 },
+        { "footerwarntip", ui::Page::Pipeline, ui::StageId::ToneMap, 0, false, 420, 748, 1180, 760, 90 },
     };
     // The real runs for shots 14-17 (skipped without DLUT_LIVE_RUN / DLUT_LIVE_RUN_SDR).
     auto read = [](const std::wstring& path) {
@@ -713,6 +720,15 @@ TEST_CASE("ui shots: every theme, page and scale renders offscreen (DLUT_UI_SHOT
                     cubeOffRecord(snap.live[0], 1);
                     cubeOffRecord(snap.live[1], 0);
                     snap.live[0].reportedPeakNits = 1612;
+                } else if (shot.variant >= 90 && shot.variant <= 92) {
+                    SYSTEMTIME at;
+                    GetLocalTime(&at);   // today (FooterStamp prints the date only for another day)
+                    at.wHour = 13; at.wMinute = 2;
+                    if (shot.variant == 91) { at.wDay = at.wDay > 1 ? at.wDay - 1 : 2; }
+                    snap.lastStatusTime = at;
+                    snap.lastStatusSev = shot.variant == 92 ? notify::Sev::Error : notify::Sev::Warning;
+                    snap.lastStatus = shot.variant == 92 ? L"Failed to install MHC2 profile. Check that the GPU supports MHC2."
+                                                         : L"FALD rate-capped: GPU over budget";
                 } else if (shot.variant >= 80 && shot.variant <= 82) {
                     snap.live[1].name = snap.live[0].name;   // twins share a name until renamed
                     HookRoutingTwin a, b;

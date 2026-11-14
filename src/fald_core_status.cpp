@@ -125,12 +125,15 @@ void FaldCoreGovPostEvent(int monitorIndex, bool hdr, const FaldCoreGovReport& r
     switch (r.state) {
     case FaldCoreGovState::Capped:   // terse: the numbers (the FALD panel's tooltip explains)
         swprintf_s(num, L": %.2f ms p90 / %.2f ms budget, a full run every %.0f ms", r.p90Ms, r.budgetMs, r.spacingMs);
-        notify::Post(notify::Sev::Warning, monitorIndex, L"fald", L"FALD rate-capped: GPU over budget", who + num);
+        notify::PostCondition(notify::Sev::Warning, monitorIndex, L"fald", kFaldRateCapKey,
+                              L"FALD rate-capped: GPU over budget", who + num);
         break;
     case FaldCoreGovState::Forced:
+        notify::Resolve(monitorIndex, L"fald", kFaldRateCapKey);
         notify::Post(notify::Sev::Info, monitorIndex, L"fald", L"FALD GPU budget forced off", who);
         break;
     case FaldCoreGovState::Running:
+        notify::Resolve(monitorIndex, L"fald", kFaldRateCapKey);
         notify::Post(notify::Sev::Info, monitorIndex, L"fald", L"FALD full rate resumed", who);
         break;
     default:
@@ -138,8 +141,20 @@ void FaldCoreGovPostEvent(int monitorIndex, bool hdr, const FaldCoreGovReport& r
     }
 }
 
+namespace {
+std::mutex g_govSeenMutex;
+std::map<std::tuple<int, int, bool>, uint32_t> g_govSeen;   // (left, top, hdr) -> the generation last posted
+}  // namespace
+
+void FaldCoreGovLayersStopped() {
+    notify::Resolve(notify::kAnyMonitor, L"fald", kFaldRateCapKey);
+    std::lock_guard<std::mutex> lk(g_govSeenMutex);
+    g_govSeen.clear();
+}
+
 void FaldCoreGovPollHookEvents() {
-    static std::map<std::tuple<int, int, bool>, uint32_t> seen;   // (left, top, hdr) -> the generation last posted
+    std::lock_guard<std::mutex> seenLock(g_govSeenMutex);
+    auto& seen = g_govSeen;
     DwmHookFaldStatus b;
     if (!IsDwmHookActive() || !ReadDwmHookFaldStatus(b)) return;
     std::vector<std::pair<int, HMONITOR>> mons;

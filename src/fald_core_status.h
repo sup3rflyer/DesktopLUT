@@ -27,6 +27,13 @@ bool FaldCoreGovReportFor(int monitorIndex, HMONITOR hmon, bool hdr, FaldCoreGov
 void FaldCoreGovPollHookEvents();
 // The Events line for a status change (title + detail), terse: the monitor goes in the line's DISPLAY column, the
 // detail is the mode ("HDR") and, when capped, the p90 / budget and the spacing.
+// Capped is a CONDITION (notify::PostCondition, source "fald", key kFaldRateCapKey): Running ("full rate resumed") and
+// Forced ("GPU budget forced off") resolve it, so the footer stops showing a cap that is over.
 void FaldCoreGovPostEvent(int monitorIndex, bool hdr, const FaldCoreGovReport& r);
+inline constexpr const wchar_t* kFaldRateCapKey = L"rate-cap";
+// The live layers stopped (StopProcessing): every governor stops with them, so every standing rate-cap warning is
+// resolved, and the hook poll forgets what it posted (a governor still capped after the next start is announced
+// again, like the overlay's, whose governor starts afresh). Any thread.
+void FaldCoreGovLayersStopped();
 // One line for the UI note's tooltip.
 std::wstring FaldCoreGovExplain(const FaldCoreGovReport& r);
