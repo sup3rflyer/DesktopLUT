@@ -154,6 +154,16 @@ Grey Show(const MhcScanout& s, const MhcScanout& ref, double code10, int linkBit
 // 2026-11-14 verify showed 120 193 307 450 520 592 692 769, the same greys within a code).
 constexpr int kLevelCodes[8] = { 120, 193, 307, 451, 520, 594, 693, 770 };
 
+// The chromaticity the LUT's own quantum allows at a grey: a channel's drive is off by up to half an s15Fixed16 step
+// (1/65536 PQ), i.e. 0.5 * lsbRel of its light, and xy moves by about half the channels' relative difference:
+// 0.25 * lsbRel (x a base slope above 1, which spreads a code over fewer entries). Never below 2e-5.
+// At 0.5 nit lsbRel is 3.7e-4 (tol 9e-5), at 1000 nit 1.4e-4 (tol 3.5e-5).
+double ChromaTol(int code10, double baseSlope = 1.0) {
+    const double s = code10 / 1023.0;
+    const double lsbRel = Eotf(s + 1.0 / 65536.0) / Eotf(s) - 1.0;
+    return (std::max)(2e-5, 0.25 * lsbRel * baseSlope);
+}
+
 bool Bake(const MHCSettings& m, uint8_t perm, MhcScanout& out) {
     MHC2ProfileParams p;
     if (!BuildMHC2ParamsForPerm(m, true, 0, perm, p)) return false;
@@ -199,11 +209,11 @@ TEST_CASE("Refresh trim, owner's inputs: trimmed at the rate == reference at 60 
                 CHECK(std::fabs(residual) < 5e-4);
                 // The trim really moved the light (it is not a no-op that passes trivially).
                 CHECK(gR.Y / g60.Y < 1.0 - 0.8 * (ratio - 1.0));
-                // No chromaticity change: <= 2e-5 in x and y (the s15Fixed16 quantum per channel; the verify's grey
-                // spread was 2.6e-4). Before 2026-11-14 the gain was read at each channel's own light (0.92 / 1.03 /
-                // 1.03 of the grey's here), which moved the top greys ~1e-4.
-                CHECK(std::fabs(gR.x() - g60.x()) < 2e-5);
-                CHECK(std::fabs(gR.y() - g60.y()) < 2e-5);
+                // No chromaticity change beyond the LUT's quantum (ChromaTol: 9e-5 at 0.5 nit .. 3.5e-5 at 1000; the
+                // verify's grey spread was 2.6e-4). Before 2026-11-14 the gain was read at each channel's own light
+                // (0.92 / 1.03 / 1.03 of the grey's here), which moved the top greys ~1e-4.
+                CHECK(std::fabs(gR.x() - g60.x()) < ChromaTol(code));
+                CHECK(std::fabs(gR.y() - g60.y()) < ChromaTol(code));
             }
         }
     }
@@ -285,8 +295,8 @@ TEST_CASE("Refresh trim, owner's inputs: an identity and a steep base realise th
                 CAPTURE(residual * 100.0);
                 // A steep base spreads a code over fewer LUT entries: 0.06 % (same quantum argument, slope <= 1.35).
                 CHECK(std::fabs(residual) < 6e-4);
-                CHECK(std::fabs(gR.x() - g60.x()) < 2e-5);
-                CHECK(std::fabs(gR.y() - g60.y()) < 2e-5);
+                CHECK(std::fabs(gR.x() - g60.x()) < ChromaTol(code, base ? 1.35 : 1.0));
+                CHECK(std::fabs(gR.y() - g60.y()) < ChromaTol(code, base ? 1.35 : 1.0));
             }
         }
     }
