@@ -954,6 +954,13 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
 
     curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     prev = {ch: 0.0 for ch in _CHANNELS}
+    # Invert in the TRANSFER-LINEARISED domain (the PQ signal of the share's light), not in linear
+    # light — the PQ twin of build_sdr_cube's γ domain: a panel that tracks PQ inverts to identity
+    # BETWEEN the measured greys too (linear-light interpolation mis-states every segment's middle).
+    # Monotone on both sides: exact at the measured greys, as before.
+    def _to_pq(v: float) -> float:
+        return pq_oetf(min(max(v, 0.0) * peak_luminance / _PQ_CONTAINER_NITS, 1.0))
+    lin_shares = {ch: [_to_pq(v) for v in shares[ch]] for ch in _CHANNELS}
     for j in range(lut_size):
         pq_in = j / (lut_size - 1)
         lin_raw = pq_eotf(pq_in) * _PQ_CONTAINER_NITS
@@ -966,7 +973,7 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         for ch in _CHANNELS:
             frac = min(lin_raw, ceiling[ch]) / peak_luminance   # native-white-proportional target
             target_share = frac * peak_share[ch]
-            corrected = invert_monotone(sigs, shares[ch], target_share)
+            corrected = invert_monotone(sigs, lin_shares[ch], _to_pq(target_share))
             if max_drive is not None:
                 corrected = min(corrected, max_drive)   # never drive above the peak code (additive policy)
             val = w * corrected + (1.0 - w) * pq_in   # blend to identity in the dark
@@ -1033,6 +1040,14 @@ def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
 
     curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     prev = {ch: 0.0 for ch in _CHANNELS}
+    # Invert in the TRANSFER-LINEARISED domain (share^(1/γ) vs signal), not in linear light: between
+    # two measured greys the inverse is then a straight line exactly where a γ panel IS straight, so a
+    # panel that tracks the power law inverts to identity between the greys too. In linear light the
+    # piecewise-linear share over-states every convex segment's middle, and the cube under-drove it:
+    # up to -1 % in light midway between two 33-code greys (simulated; tests/test_grey_features.py).
+    # A monotone transform of both sides: exact at the measured greys, as before.
+    inv_g = 1.0 / gamma
+    lin_shares = {ch: [max(v, 0.0) ** inv_g for v in shares[ch]] for ch in _CHANNELS}
     for j in range(lut_size):
         sig_in = j / (lut_size - 1)
         frac = sig_in ** gamma                        # native-white-proportional target (0..1)
@@ -1042,7 +1057,7 @@ def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
             w *= _interp(sig_in, trust_xs, trust_ws)
         for ch in _CHANNELS:
             target_share = frac * peak_share[ch]
-            corrected = invert_monotone(sigs, shares[ch], target_share)
+            corrected = invert_monotone(sigs, lin_shares[ch], max(target_share, 0.0) ** inv_g)
             val = w * corrected + (1.0 - w) * sig_in  # blend to identity in the dark
             # Enforce monotone non-decreasing — the blend boundary or a noisy share can dip, and
             # the MHC2 LUT must be monotone for a well-defined inverse.
@@ -1061,6 +1076,35 @@ def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     for ch in _CHANNELS:
         summary[f"{ch}_peak_share"] = round(peak_share[ch], 4)
     return curves, summary
+
+
+def _model_refine_neutral(measured_neutral: Sequence[Sequence], *, basis: Sequence[Sequence[float]],
+                          eotf, y_floor: float, signal_ceiling: Optional[float] = None,
+                          luminance_sigma: Optional[float] = None, max_cv: int = 1023,
+                          report_out: Optional[dict] = None) -> list:
+    """The closed-loop refine's measured neutral ramp through the same narrow-feature model the base
+    build uses (:func:`dlc.grey_features.model_grey_samples`): a refine level that departs from its
+    neighbours' envelope by more than the panel's own level-to-level structure is replaced by that
+    envelope before its correction factor is taken — the refine interpolates its factors linearly
+    between levels, so one such level would otherwise shape the cube across both gaps (the installed
+    2026-10-02 SDR refine: -2.8 % across entries 56-68 between the 51 and 64 greys). Every other level
+    passes through unchanged (same XYZ, same σ)."""
+    from . import grey_features as gfm
+
+    entries = sorted(measured_neutral, key=lambda p: float(p[0]))
+    samples = [Ti3Sample(rgb=(float(e[0]),) * 3, xyz=tuple(float(v) for v in e[1])) for e in entries]
+    chroma = {float(e[0]): float(e[2]) for e in entries if len(e) > 2 and e[2] is not None}
+    model, report = gfm.model_grey_samples(
+        samples, {}, (0.0, 0.0), 0.0, basis=basis, eotf=eotf, max_cv=max_cv, y_floor=y_floor,
+        signal_ceiling=signal_ceiling,
+        luminance_sigma=luminance_sigma if luminance_sigma else gfm.DEFAULT_LUMINANCE_SIGMA,
+        chroma_sigma=chroma)
+    if report_out is not None:
+        report_out.update(report)
+    out = []
+    for e, m in zip(entries, model):
+        out.append((e[0], m.xyz) + tuple(e[2:]) if m is not samples[len(out)] else tuple(e))
+    return out
 
 
 def _interp(x: float, xs: Sequence[float], ys: Sequence[float]) -> float:
@@ -1086,7 +1130,9 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
                     *, peak_cap_nits: float, target_white_xy: tuple[float, float] = _D65,
                     damping: float = 0.85, dark_floor_nits: float = 1.0,
                     ratio_clamp: tuple[float, float] = (0.5, 2.0),
-                    top_hold: bool = True
+                    top_hold: bool = True,
+                    feature_model: bool = True, luminance_sigma: Optional[float] = None,
+                    feature_report: Optional[dict] = None, feature_top_band: float = 0.10
                     ) -> dict[str, list[float]]:
     """One closed-loop grayscale-refine step on the HDR base cube — PANEL-AGNOSTIC.
 
@@ -1143,6 +1189,15 @@ def refine_hdr_cube(current_curves: Mapping[str, Sequence[float]],
     disp = [[channel_peak_xyz[c][row] for c in range(3)] for row in range(3)]
     disp_inv = invert3x3(disp)
     wx, wy = target_white_xy
+    if feature_model and len(measured_neutral) >= 4:
+        # narrow refine levels -> their neighbours' envelope. The near-peak roll-off band (the last
+        # ``feature_top_band`` of the signal range below the cap = PatchSizes.neutral_top_band, where the
+        # data-driven top pins resolve the panel's knee) is the top hold's business, not judged.
+        cap_sig = pq_oetf(min(peak_cap_nits, _PQ_CONTAINER_NITS) / _PQ_CONTAINER_NITS)
+        measured_neutral = _model_refine_neutral(
+            measured_neutral, basis=disp, eotf=pq_eotf, y_floor=dark_floor_nits,
+            signal_ceiling=max(0.0, cap_sig - float(feature_top_band)),
+            luminance_sigma=luminance_sigma, report_out=feature_report)
 
     # gather (post-matrix signal, linear-light correction factor) per channel from the measurement
     pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}
@@ -1203,7 +1258,9 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
                     *, gamma: float = 2.2, target_white_xy: tuple[float, float] = _D65,
                     damping: float = 0.85, dark_floor_nits: float = 0.5,
                     ratio_clamp: tuple[float, float] = (0.5, 2.0),
-                    target_white_nits: Optional[float] = None
+                    target_white_nits: Optional[float] = None,
+                    feature_model: bool = True, luminance_sigma: Optional[float] = None,
+                    feature_report: Optional[dict] = None
                     ) -> dict[str, list[float]]:
     """One closed-loop grayscale-refine step on the **SDR base cube** — PANEL-AGNOSTIC.
 
@@ -1261,6 +1318,11 @@ def refine_sdr_cube(current_curves: Mapping[str, Sequence[float]],
     disp_inv = invert3x3(disp)
     wx, wy = target_white_xy
     white_nits = float(target_white_nits) if target_white_nits else float(peak_luminance)
+    if feature_model and len(measured_neutral) >= 4:
+        # narrow refine levels -> their neighbours' envelope (``feature_report`` receives the verdicts)
+        measured_neutral = _model_refine_neutral(
+            measured_neutral, basis=disp, eotf=lambda s, _g=gamma: s ** _g, y_floor=dark_floor_nits,
+            luminance_sigma=luminance_sigma, report_out=feature_report)
 
     # gather (post-matrix signal, linear-light correction factor) per channel from the measurement
     pts: dict[int, list[tuple[float, float]]] = {0: [], 1: [], 2: []}

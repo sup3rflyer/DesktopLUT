@@ -61,6 +61,24 @@ def build(args, ctx: RunContext) -> StageResult:
 
     samples = parse_ti3(source)
     result.action(f"parsed {len(samples)} patches from raw-mhc TI3")
+    # Densified greys (the raw-densify pass, :func:`grey_densify_plan`): folded into the samples the
+    # base CUBE is built from — never into the primaries / white / dark floor, which stay the raw
+    # pass's own (one consistent pass for the matrix).
+    dense_info = None
+    cube_samples = samples
+    dense_path = getattr(args, "dense_grey_ti3", None)
+    if dense_path:
+        from ..grey_features import merge_dense_greys
+        dense_path = resolve_run_path(ctx, Path(dense_path))
+        if Path(dense_path).exists():
+            cube_samples, dense_info = merge_dense_greys(
+                samples, parse_ti3(dense_path), max_cv=_max_cv(args),
+                luminance_sigma=_raw_luminance_sigma(source)["sigma"])
+            dense_info["source"] = str(dense_path)
+            result.add_artifact(dense_path)
+            result.action(f"folded {dense_info['added_levels']} densified grey level(s) into the cube's ramp "
+                          f"(scale {dense_info['scale_k']}, {len(dense_info['unstable_levels'])} level(s) "
+                          "did not reproduce and were dropped)")
 
     try:
         # size is irrelevant here (we discard the 1D curve); this call also
@@ -214,11 +232,22 @@ def build(args, ctx: RunContext) -> StageResult:
             except (ValueError, ZeroDivisionError, KeyError):
                 matrix_rowsums = None
         try:
+            # Resolution-limited grey ramp (dlc.grey_features): a level whose deviation its
+            # neighbours do not support is built from their envelope, not as a feature the LUT
+            # cannot place; every other sample passes through unchanged.
+            from .. import grey_features as gfm
+            model_samples, grey_report = grey_feature_model(
+                cube_samples, measured_primaries, white_xy, cube_peak, is_hdr=True, gamma=args.gamma,
+                y_floor=dark_floor_nits, ceiling_signal=pq_oetf_signal(cube_peak),
+                rowsums=matrix_rowsums, source=source, max_cv=_max_cv(args), z=gfm.DEFAULT_Z)
             cube_curves, cube_summary = build_hdr_cube(
-                samples, measured_primaries, white_xy, cube_peak,
+                model_samples, measured_primaries, white_xy, cube_peak,
                 dark_floor_nits=dark_floor_nits, level_trust=level_trust, max_drive=max_drive,
                 matrix_rowsums=matrix_rowsums,
             )
+            cube_summary["grey_features"] = grey_report
+            if dense_info:
+                cube_summary["grey_densify"] = dense_info
             cube_summary["dark_floor"] = dark_floor_info
             if level_trust:
                 cube_summary["dark_trust_levels"] = len(level_trust)
@@ -282,9 +311,26 @@ def build(args, ctx: RunContext) -> StageResult:
             "deviations": Deviations.identity(n).as_dict(),
         }
         try:
+            # Resolution-limited grey ramp (dlc.grey_features) — see the HDR branch. The SDR matrix
+            # the orchestrator installs is native -> sRGB @ D65 from the measured native white; its
+            # rowsums say where each channel reads the LUT for one wire grey.
+            from ..mhc import SRGB_PRIMARIES as _SRGB
+            from ..mhc_cube import mhc2_matrix as _mhc2_matrix
+            try:
+                _m = _mhc2_matrix(measured_primaries, white_xy, _SRGB, (0.3127, 0.3290))
+                sdr_rowsums = [sum(_m[r]) for r in range(3)]
+            except (ValueError, ZeroDivisionError, KeyError):
+                sdr_rowsums = None
+            model_samples, grey_report = grey_feature_model(
+                cube_samples, measured_primaries, white_xy, target_luminance, is_hdr=False,
+                gamma=args.gamma, y_floor=sdr_dark_floor_nits, ceiling_signal=None, rowsums=sdr_rowsums,
+                source=source, max_cv=_max_cv(args))
             cube_curves, cube_summary = build_sdr_cube(
-                samples, measured_primaries, white_xy, target_luminance,
+                model_samples, measured_primaries, white_xy, target_luminance,
                 gamma=args.gamma, dark_floor_nits=sdr_dark_floor_nits, level_trust=level_trust)
+            cube_summary["grey_features"] = grey_report
+            if dense_info:
+                cube_summary["grey_densify"] = dense_info
             cube_summary["dark_floor"] = sdr_dark_floor_info
             if level_trust:
                 cube_summary["dark_trust_levels"] = len(level_trust)
@@ -536,3 +582,128 @@ def cube_max_drive(*, resolved_peak_nits, wrgb_nonadditive):
         return None
     from ..mhc_cube import _PQ_CONTAINER_NITS, pq_oetf   # lazy: engine-side module
     return pq_oetf(min(float(resolved_peak_nits), _PQ_CONTAINER_NITS) / _PQ_CONTAINER_NITS)
+
+
+# ---------------------------------------------------------------------------------------------
+# resolution-limited grey ramp (dlc.grey_features) — shared by the build and the densify plan
+# ---------------------------------------------------------------------------------------------
+
+def _max_cv(args) -> int:
+    v = getattr(args, "max_cv", None)
+    return int(v) if v else 1023
+
+
+def pq_oetf_signal(nits: float) -> float:
+    """PQ signal (0..1) of an absolute luminance."""
+    from ..mhc_cube import _PQ_CONTAINER_NITS, pq_oetf
+    return pq_oetf(min(max(float(nits), 0.0), _PQ_CONTAINER_NITS) / _PQ_CONTAINER_NITS)
+
+
+def _raw_luminance_sigma(source) -> dict:
+    """The raw pass's measured relative luminance repeatability, from the measure log beside the TI3
+    (``raw.ti3`` -> ``raw.ndjson``: repeat reads + drift references, :func:`grey_features.luminance_repeatability`);
+    the documented no-evidence default when there is no log or no repeat in it."""
+    from ..grey_features import DEFAULT_LUMINANCE_SIGMA, luminance_repeatability
+    log = Path(source).with_suffix(".ndjson")
+    rows = []
+    if log.exists():
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                continue
+    rep = luminance_repeatability(rows) if rows else None
+    if rep is None or not (rep["sigma"] > 0):
+        return {"sigma": DEFAULT_LUMINANCE_SIGMA, "basis": "default (no repeat evidence in the run)"}
+    return {**{k: (round(v, 7) if isinstance(v, float) else v) for k, v in rep.items()},
+            "sigma": rep["sigma"], "basis": f"measured ({log.name})"}
+
+
+def _chroma_sigma_by_level(source, grey_samples) -> dict:
+    """``{signal: xy SE}`` per grey level from the noise sidecar (multi-read levels only)."""
+    out = {}
+    for s, (se, _bound) in zip(grey_samples, _grey_noise(source, grey_samples)):
+        if se is not None:
+            out[float(s.rgb[0])] = float(se)
+    return out
+
+
+def grey_feature_model(samples, primaries, white_xy, peak, *, is_hdr: bool, gamma: float, y_floor: float,
+                       ceiling_signal, rowsums, source, max_cv: int, z: float = None):
+    """:func:`grey_features.model_grey_samples` with this run's transfer, matrix registration and measured
+    noise. Returns ``(samples', report)``; ``report`` also carries the fit's grey codes (``fit_codes``)
+    and the noise basis, for the densify plan and the post-install held-out check."""
+    from .. import grey_features as gfm
+    from ..mhc_cube import pq_eotf, pq_oetf
+
+    if is_hdr:
+        eotf = pq_eotf
+
+        def index_scale(c, s, _r=rowsums):
+            return pq_oetf(min(max(float(_r[c]), 0.0) * pq_eotf(s), 1.0)) if _r else s
+    else:
+        def eotf(s, _g=gamma):
+            return s ** _g
+
+        def index_scale(c, s, _r=rowsums, _g=gamma):
+            return (max(float(_r[c]), 0.0) ** (1.0 / _g)) * s if _r else s
+    lum = _raw_luminance_sigma(source)
+    greys = [s for s in classify_samples(samples)["grey"]] if samples else []
+    chroma = _chroma_sigma_by_level(source, greys) if greys else {}
+    model, report = gfm.model_grey_samples(
+        samples, primaries, white_xy, peak, eotf=eotf, max_cv=max_cv, y_floor=y_floor,
+        signal_ceiling=ceiling_signal, luminance_sigma=lum["sigma"], chroma_sigma=chroma,
+        index_scale=index_scale, z=z if z is not None else gfm.DEFAULT_Z)
+    report["luminance_sigma_basis"] = {k: v for k, v in lum.items() if k != "sigma"}
+    report["fit_codes"] = sorted({int(round(float(s.rgb[0]) * max_cv)) for s in samples
+                                  if abs(s.rgb[0] - s.rgb[1]) < 1e-4 and abs(s.rgb[1] - s.rgb[2]) < 1e-4})
+    report["y_floor_nits"] = round(float(y_floor), 6)
+    return model, report
+
+
+def grey_densify_plan(source_ti3, *, is_hdr: bool, gamma: float, max_cv: int, max_reads: int,
+                      resolved_peak_nits=None) -> dict:
+    """The raw-densify plan for a raw ramp: judge its grey levels exactly as the build will
+    (:func:`grey_feature_model`, same dark floor, matrix registration and noise) and ask for greys across
+    every UNRESOLVED narrow feature (:func:`grey_features.densification_plan`). Pure: reads the TI3 + its
+    measure log + noise sidecar, measures nothing. ``{"plan": ..., "features": [...], ...}``."""
+    from .. import grey_features as gfm
+    from ..mhc_cube import HDR_REFERENCE_WHITE_BAND, adaptive_dark_floor, mhc2_matrix
+
+    source = Path(source_ti3)
+    samples = parse_ti3(source)
+    _c, prim, peak = build_curves_from_ti3(samples, size=2, gamma=gamma)
+    white = _common.measured_white_xy(samples)
+    groups = classify_samples(samples)
+    floor, _info = adaptive_dark_floor(
+        _grey_reads_with_noise(source, groups["grey"], xy_from_xyz),
+        reference_band=HDR_REFERENCE_WHITE_BAND if is_hdr else None)
+    if is_hdr:
+        ceiling_nits = min(float(resolved_peak_nits), peak) if resolved_peak_nits else peak
+        try:
+            m = mhc2_matrix(prim, white, prim, (0.3127, 0.3290))
+            rowsums = [sum(m[r]) for r in range(3)]
+        except (ValueError, ZeroDivisionError, KeyError):
+            rowsums = None
+        ceiling = pq_oetf_signal(ceiling_nits)
+    else:
+        from ..mhc import SRGB_PRIMARIES as _SRGB
+        try:
+            m = mhc2_matrix(prim, white, _SRGB, (0.3127, 0.3290))
+            rowsums = [sum(m[r]) for r in range(3)]
+        except (ValueError, ZeroDivisionError, KeyError):
+            rowsums = None
+        ceiling = None
+        ceiling_nits = peak
+    _model, report = grey_feature_model(samples, prim, white, ceiling_nits if is_hdr else peak,
+                                        is_hdr=is_hdr, gamma=gamma, y_floor=floor, ceiling_signal=ceiling,
+                                        rowsums=rowsums, source=source, max_cv=max_cv)
+    plan = gfm.densification_plan(report, max_cv=max_cv, existing_codes=report["fit_codes"],
+                                  max_reads=max_reads, signal_ceiling=ceiling)
+    return {"plan": plan, "features": report["features"], "structure_pct": report.get("structure_pct"),
+            "luminance_sigma": report.get("luminance_sigma"),
+            "luminance_sigma_basis": report.get("luminance_sigma_basis"),
+            "levels_judged": report.get("levels_judged"), "dark_floor_nits": round(float(floor), 6)}

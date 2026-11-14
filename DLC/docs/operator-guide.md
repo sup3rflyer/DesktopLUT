@@ -219,6 +219,7 @@ python -m dlc.calibrate --flow mhc-only --mode SDR --monitor N --bit-depth 8 \
 | `brightness:white-reach` | The forecast puts the exact D65 white below the SDR white band (`raised` / `continue` / `abort`) | Human raises the OSD → `raised` (re-read); `continue` keeps the backlight. |
 | `brightness:white-reach-late` | Same, but raw is already measured (`keep_backlight` / `abort`) | Raising now means re-measuring: `abort` and re-run, or keep. |
 | `build-install-mhc:white-reach` | Measured primaries put white below the band (`keep_below_band` / `abort`) | Human decides: dimmer exact white, or re-run brighter. |
+| `build-install-mhc:holdout` | The installed base 1D LUT misses greys the build never measured, beyond the panel's own level-to-level structure (`continue` / `abort`) | A narrow error between raw greys; the refine and the 3D LUT cannot remove it. Judge its size against the grey target; `abort` and re-run with a larger `raw_densify_max_reads` / `raw_ramp_steps` if it matters. The `raw-densify` digest says which greys were densified. |
 | `<stage>:foundation` | The MHC install crushed bright-neutral luminance | A real stopper; read the digest before anything else. |
 | `build-install-3dlut:floor` / `:oog-premise` | Cube residuals at the physical floor / out-of-gamut handling premise | Floors are panel limits, not retry triggers. |
 | `measure:*` (escalation, thermal-align) | Patches didn't settle, drift, or thermal shift across the stage | Read the anomalies, drift and present-stall evidence. |

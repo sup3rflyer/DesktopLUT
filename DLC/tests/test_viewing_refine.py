@@ -157,8 +157,10 @@ def test_viewing_refine_seam_precondition_hold_and_stage_states(tmp_path: Path):
     (req,) = adj.asked(f"{STAGE}:thermal-state")
     assert req.options == ("precondition", "measure-now", "abort") and req.recommendation == "precondition"
     d = req.digest
-    assert d["policy"] == "viewing-refine" and d["start"]["kind"] == "assumed-hot"
-    assert "build-install-mhc" in d["start"]["unmodelled_stages"]          # raw's history is not trusted
+    # since 2026-11-14 the base held-out check (a modelled measure pass) runs right after the build, so the
+    # refine starts from the run's recorded history, not from an assumed-hot start after an unmodelled stage
+    assert d["policy"] == "viewing-refine" and d["start"]["kind"] == "run-history"
+    assert not d["start"].get("unmodelled_stages")
     pred = d["predicted"]
     assert pred["precondition_minutes"] > 0 and pred["hold_dwell_total_min"] >= 0
     budget = d["hold_budget"]

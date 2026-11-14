@@ -72,6 +72,18 @@ class PatchSizes:
     # 2026-09-02: 71 of 417 raw reads were sub-nit primaries at ~8 s each ≈ 10 min, 0 information).
     # 1 nit ≈ the colorimeter chroma floor (the same rationale as verify_color_min_signal). 0 ⇒ off.
     raw_color_min_nits: float = 1.0
+    # RAW grey densification (dlc.grey_features): after the raw ramp, a grey level that departs from
+    # its neighbours' envelope by more than the panel's own level-to-level structure (and the read
+    # noise) is a NARROW feature the ramp cannot resolve; the flow re-reads it and measures greys
+    # across the span between its neighbours at the LUT's resolution step before the base 1D LUT is
+    # built. This caps that pass (reads, anchors counted twice); a plan above it widens its step
+    # evenly. 0 => no densify pass (unresolved features are then built from the envelope). One grey
+    # read is ~6-7 s, so the default caps the pass near 10 minutes; a smooth panel asks for none.
+    raw_densify_max_reads: int = 96
+    # Post-install self-check of the base 1D LUT on greys the fit never saw (dlc.grey_features
+    # .held_out_codes): this many held-out midpoints (each read with its two bracketing fit levels),
+    # judged locally against the panel's own structure scale. 0 => off.
+    base_holdout_points: int = 8
 
     # near-neutral tube (MHC FOUNDATION): off-axis samples around the grey axis (R≠G≠B but close
     # to neutral) along the six hue directions. Characterizes the OFF-AXIS non-additivity / white-
