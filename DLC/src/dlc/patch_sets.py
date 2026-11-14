@@ -547,31 +547,28 @@ GSWB_NODES = 32
 
 def build_grayscale_wb_heldout_set(ps: PatchSizes, transfer: Transfer, *,
                                    warm_tau: Optional[int] = None,
-                                   max_cv: Optional[int] = None) -> list[tuple[int, int, int]]:
+                                   max_cv: Optional[int] = None,
+                                   base: Optional[dict[str, list[float]]] = None,
+                                   gamma24: bool = False) -> list[tuple[int, int, int]]:
     """The greys the grayscale-wb touch-up is NOT fitted on but is judged on (2026-11-14 HW: a
     correction at one node smeared by the curve's interpolation over both neighbouring intervals,
-    invisible to a verify of the node codes alone): ONE grey between each pair of adjacent nodes,
-    at the place the curve's interpolation error is largest (:func:`dlc.grayscale_wb.heldout_code`:
-    the midpoint in the curve's own interpolation coordinate), over the range the touch-up can
-    correct — every interval whose upper node's target is at or above the touch-up's dark floor
-    (below it ``update_point`` holds both nodes, the curve stays identity, nothing to judge). A
-    code that coincides with a node (low codes at 8-bit) is dropped. Ascending."""
-    from .grayscale_wb import GrayTouchupConfig, heldout_code
+    invisible to a verify of the node codes alone): ONE grey between each pair of adjacent curve slots,
+    at the place the curve's interpolation error is largest - the slot midpoint u = i + 1/2 of the
+    curve's own coordinate, reached THROUGH THE INSTALLED BASE 1D LUT the bake evaluates the curve on
+    (:func:`dlc.grayscale_wb.heldout_codes_on_base`; ``base`` None = identity, which the offline plan
+    uses: the count does not depend on the base), over the range the touch-up can correct - every
+    interval whose upper node's target is at or above the touch-up's dark floor (below it
+    ``update_point`` holds both nodes, the curve stays identity, nothing to judge). Ascending."""
+    from .grayscale_wb import GrayTouchupConfig, heldout_codes_on_base
 
     cap = max_cv if max_cv is not None else transfer.max_cv
     nodes = [p[0] for p in build_grayscale_wb_set(ps, transfer, max_cv=cap)]
     kind = "hdr" if transfer.kind == "pq" else "sdr"
     floor = GrayTouchupConfig().dark_floor_nits
-    have = set(nodes)
-    out: list[int] = []
-    for i in range(len(nodes) - 1):
-        if transfer.cv_to_nits(nodes[i + 1]) < floor:
-            continue
-        code = heldout_code(i, cap, len(nodes), kind)
-        if nodes[i] < code < nodes[i + 1] and code not in have:
-            have.add(code)
-            out.append(code)
-    return [(v, v, v) for v in out]
+    intervals = [i for i in range(len(nodes) - 1) if transfer.cv_to_nits(nodes[i + 1]) >= floor]
+    out = heldout_codes_on_base(nodes, intervals, max_cv=transfer.max_cv, cap=cap, kind=kind,
+                                base=base, gamma24=gamma24)
+    return [(v, v, v) for v in sorted(set(out))]
 
 
 def grayscale_wb_union_order(nodes: list[tuple[int, int, int]],
@@ -595,28 +592,33 @@ def build_grayscale_wb_verify_set(ps: PatchSizes, transfer: Transfer, *,
     return [(nodes if kind == "node" else held)[i] for kind, i in grayscale_wb_union_order(nodes, held)]
 
 
-# Time model of a grayscale-wb run for the plan / --preview-patches (an ESTIMATE for the operator,
-# never a decision input). Basis: the three PA32UCXR SDR 10-bit runs of 2026-11-14 — the touch-up
-# stage took 9.3 / 10.4 / 12.7 min over its 32 nodes (rounds included), and the 32-grey verify
-# 6.2 / 6.3 min, i.e. ~11.7 s per verified grey (dark greys read longer, bright ones re-read).
-# A held-out grey costs one such read before the touch-up (inside the session) and one in the verify.
+# Time model of a grayscale-wb run for the plan / --preview-patches (an ESTIMATE for the operator, never a
+# decision input). The only measured basis so far is ONE display (PA32UCXR, SDR 10-bit, i1D3, 2026-11-14):
+# the touch-up stage took 9.3 / 10.4 / 12.7 min over its 32 nodes (rounds included) and the 32-grey verify
+# 6.2 / 6.3 min, i.e. ~11.7 s per presented grey. Another display / meter / read policy scales these.
+# A held-out grey is presented once before the touch-up (at least two reads) and once in the verify; the
+# BRACKET re-presents 8 of them in the before state at the end of the session.
 GSWB_TOUCHUP_MINUTES_32 = (9.3, 12.7)
 GSWB_SECONDS_PER_GREY = 11.7
+GSWB_BRACKET_GREYS = 8
 
 
 def grayscale_wb_time_estimate(n_nodes: int, n_heldout: int) -> dict[str, Any]:
     per = GSWB_SECONDS_PER_GREY / 60.0
     lo, hi = GSWB_TOUCHUP_MINUTES_32
     scale = n_nodes / 32.0
-    verify = (n_nodes + n_heldout) * per
-    before = n_heldout * per
+    bracket = min(GSWB_BRACKET_GREYS, n_heldout)
+    extra = (2 * n_heldout + bracket) * per
     return {
-        "minutes": [round(lo * scale + before + verify, 1), round(hi * scale + before + verify, 1)],
-        "held_out_minutes": round(2.0 * n_heldout * per, 1),
+        "minutes": [round(lo * scale + n_nodes * per + extra, 1), round(hi * scale + n_nodes * per + extra, 1)],
+        "held_out_minutes": round(extra, 1),
+        "held_out_presentations": 2 * n_heldout + bracket,
         "without_held_out_minutes": [round(lo * scale + n_nodes * per, 1),
                                      round(hi * scale + n_nodes * per, 1)],
-        "basis": ("PA32UCXR SDR 10-bit, 2026-11-14: touch-up 9.3-12.7 min for 32 nodes, verify ~11.7 s "
-                  "per grey; each held-out grey is read once before the touch-up and once in the verify"),
+        "basis": ("measured on one display so far (PA32UCXR SDR 10-bit, i1D3, 2026-11-14: touch-up 9.3-12.7 min for "
+                  "32 nodes, ~11.7 s per presented grey) - another display, meter or read policy scales it; held-out "
+                  "greys are presented once before (two reads at least) and once in the verify, 8 of them once more "
+                  "at the end of the session (the drift bracket)"),
     }
 
 

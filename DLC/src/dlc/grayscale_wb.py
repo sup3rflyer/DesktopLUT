@@ -333,6 +333,55 @@ def heldout_code(i: int, cap: int, n: int, kind: str) -> int:
     return int(round(cap * (t * t if _kind(kind) == "sdr" else t)))
 
 
+GAMMA24_WARP = 2.4 / 2.2
+
+
+def _lerp_curve(curve: Sequence[float], t: float) -> float:
+    """mhc_icc.cpp ``resampleCurve``: linear interpolation of a 1D cube's entries at ``t`` in [0, 1]."""
+    n = len(curve)
+    x = max(0.0, min(1.0, t)) * (n - 1)
+    i0 = int(math.floor(x))
+    i1 = min(i0 + 1, n - 1)
+    return max(0.0, min(1.0, float(curve[i0]) + (float(curve[i1]) - float(curve[i0])) * (x - i0)))
+
+
+def base_positions(code: float, *, max_cv: int, cap: int, n: int, kind: str,
+                   base: Optional[Mapping[str, Sequence[float]]] = None, gamma24: bool = False) -> dict[str, float]:
+    """The fine-tune curve coordinate ``u`` PER CHANNEL of a grey patch at ``code``, as the bake evaluates it
+    (src/mhc_icc.cpp ``ComposeMhcScanout``: the curve runs on the BASE 1D LUT's OUTPUT; with SDR GAMMA 2.4 the
+    base is read at t^(2.4/2.2) - ``ComputeMhcScanoutBaseLuts``). ``base`` = the installed base 1D cube
+    (per channel, None = identity). SDR: u = sqrt(base(t)) (n-1); HDR: u = base(t) / (cap/max_cv) (n-1)."""
+    kd = _kind(kind)
+    t = max(0.0, min(1.0, float(code) / float(max_cv)))
+    if gamma24 and kd == "sdr" and t > 0:
+        t = t ** GAMMA24_WARP
+    out = {}
+    for ch in _CHANNELS:
+        v = _lerp_curve(base[ch], t) if base is not None else t
+        out[ch] = (math.sqrt(v) if kd == "sdr" else v / (float(cap) / float(max_cv))) * (n - 1)
+    return out
+
+
+def heldout_codes_on_base(node_codes: Sequence[int], intervals: Iterable[int], *, max_cv: int, cap: int,
+                          kind: str, base: Optional[Mapping[str, Sequence[float]]] = None,
+                          gamma24: bool = False) -> list[int]:
+    """The held-out grey of each interval ``i`` (between slots i and i+1): the patch code whose curve
+    coordinate is closest to the slot midpoint u = i + 1/2 THROUGH THE BASE the bake uses. Three channels,
+    one patch: the code that minimises the LARGEST channel distance max_c |u_c - (i + 1/2)| (no channel
+    lands further from the midpoint than it must). Node codes are never chosen."""
+    n = len(node_codes)
+    nodes = {int(c) for c in node_codes}
+    pos = {c: base_positions(c, max_cv=max_cv, cap=cap, n=n, kind=kind, base=base, gamma24=gamma24)
+           for c in range(1, int(cap))}
+    out: list[int] = []
+    for i in intervals:
+        mid = i + 0.5
+        best = min((c for c in pos if c not in nodes and c not in out),
+                   key=lambda c: (max(abs(u - mid) for u in pos[c].values()), c))
+        out.append(best)
+    return out
+
+
 def neighbour_hold_gain(gains: Sequence[float], k: int, left: int, right: int, kind: str) -> float:
     """The gain node ``k`` takes when it is put ON the curve its nearest kept neighbours ``left`` <
     k < ``right`` draw through it (the C++ interpolation law, so the held curve is exactly the line
@@ -340,25 +389,6 @@ def neighbour_hold_gain(gains: Sequence[float], k: int, left: int, right: int, k
     kd = _kind(kind)
     q = ((right - k) * _node_q(gains[left], left, kd) + (k - left) * _node_q(gains[right], right, kd)) \
         / float(right - left)
-    return _q_to_gain(q, float(k), kd)
-
-
-def local_trend_gain(gains: Sequence[float], k: int, nb: Sequence[int], kind: str) -> float:
-    """The gain the curve's local TREND predicts at node ``k`` from two kept nodes on each side
-    (``nb`` = [l2, l1, r1, r2]): the cubic through the interpolated quantity q_i (= i*sqrt(g_i) SDR,
-    i*g_i HDR) at those four slots, evaluated at ``k``. Exact for any cubic, so a smooth bend of the
-    correction (a real, gradual need) predicts itself and leaves no residual; only a departure
-    narrower than the node spacing does."""
-    kd = _kind(kind)
-    xs = [float(j) for j in nb]
-    qs = [_node_q(gains[j], j, kd) for j in nb]
-    q = 0.0
-    for a, (xa, qa) in enumerate(zip(xs, qs)):
-        w = 1.0
-        for b, xb in enumerate(xs):
-            if b != a:
-                w *= (k - xb) / (xa - xb)
-        q += w * qa
     return _q_to_gain(q, float(k), kd)
 
 
@@ -389,107 +419,136 @@ def find_node_outliers(deviations: Mapping[str, Sequence[float]], solved: Iterab
                        materiality_de: Optional[float] = None,
                        light_exponent: Optional[Sequence[float]] = None,
                        white_xy: tuple[float, float] = (0.3127, 0.3290)) -> dict[str, Any]:
-    """Solved nodes whose correction departs from their neighbours - evidence of a feature narrower
-    than the node spacing under that node (its correction will be smeared over both neighbouring
-    intervals by the curve's interpolation).
+    """Narrow features under the nodes: one node, or two adjacent nodes, whose correction departs from
+    the straight lines BOTH sides draw toward it - in the same direction.
 
-    Statistic: per node ``k`` and channel, the log ratio of the solved composed gain to the gain the
-    LOCAL TREND of its neighbours predicts there (:func:`local_trend_gain`: the cubic through nodes
-    k-2, k-1, k+1, k+2 - all solved - in the quantity the curve interpolates). A smooth correction -
-    flat, sloped or bending - predicts itself (residual ~0); a single node off its neighbours' trend
-    does not. Scale = 1.4826 x the MAD of the residuals over all eligible nodes (robust to the few
-    outliers it looks for). Candidates: nodes whose largest |z| exceeds the two-sided Bonferroni
-    critical value for ``3 x m`` tests at ``alpha`` family-wise (m eligible nodes). A spike at k also
-    moves the residuals of k+-1 and k+-2 (their trend runs through k), so those are not independent
-    evidence: the candidates are taken largest |z| first and every candidate within two nodes of an
-    accepted one is reported as its ECHO, not flagged. ``solved`` = the nodes the solver moved (a
-    node left at its default is no evidence either way). The reported ``neighbour_interpolation`` is
-    what a hold puts there (the curve's own law between the nearest neighbours).
+    For each channel, in ln(gain): the LEFT line through the two solved nodes just below the feature and
+    the RIGHT line through the two just above it, each extrapolated onto the feature's node(s). A narrow
+    feature departs from both lines the same way. A KNEE in a smooth correction (a change of slope at a
+    node) sits on one of the two lines - it is not a feature (review item 7); a smooth bend departs from
+    both by the same small amount at every node, which the per-channel median removes.
 
-    MATERIALITY (``materiality_de``, the touch-up's own acceptance target): a statistically clear
-    departure is flagged only when holding the node would move the grey at its code by at least that
-    much (:func:`gain_change_de`, light = gain**``light_exponent[k]``). The node's value reaches the
-    greys around it as a tent that peaks at the node, so a departure below the flow's own "done"
-    tolerance cannot damage any grey by more than the flow already accepts at a node; such nodes are
-    listed under ``immaterial``."""
+    Scale: s = 1.4826 MAD of all one-step one-sided residuals of the channel (eligible nodes, both sides
+    pooled) about their median; a two-step extrapolation (a pair's far node) has sqrt(14/6) that noise
+    (var(3y1 - 2y2 - y) / var(2y1 - y2 - y) for independent node noise). A single node is a feature when,
+    in some channel, both its residuals exceed ``z * s`` with the same sign; a PAIR (k, k+1) when all four
+    of its residuals do (its partner is then not used as a neighbour - review item 7: the second node of a
+    pair used to be called an echo and was used as the first one's neighbour). z = the two-sided Bonferroni
+    critical value over 3 channels x (singles + pairs tested) at ``alpha``. Materiality (``materiality_de``,
+    the touch-up's own acceptance target): flagged only when bridging the feature moves its grey by at
+    least that much (:func:`gain_change_de`, light = gain ** ``light_exponent``)."""
     kd = _kind(kind)
     n = len(codes)
-    devs = {ch: [float(v) for v in (deviations.get(ch) or [1.0] * n)] for ch in _CHANNELS}
     ok = {int(k) for k in solved}
-    rows: dict[int, tuple[dict[str, float], dict[str, float]]] = {}
-    for k in range(2, n - 2):
-        if not {k - 2, k - 1, k, k + 1, k + 2} <= ok:
-            continue
-        trend = {ch: local_trend_gain(devs[ch], k, (k - 2, k - 1, k + 1, k + 2), kd) for ch in _CHANNELS}
-        if any(t <= 0.0 or devs[ch][k] <= 0.0 for ch, t in trend.items()):
-            continue
-        rows[k] = (trend, {ch: math.log(devs[ch][k] / trend[ch]) for ch in _CHANNELS})
-    m = len(rows)
+    y = {ch: [math.log(max(float(v), 1e-9)) for v in (deviations.get(ch) or [1.0] * n)] for ch in _CHANNELS}
+    singles = [k for k in range(2, n - 2) if {k - 2, k - 1, k, k + 1, k + 2} <= ok]
+    pairs = [k for k in range(2, n - 3) if {k - 2, k - 1, k, k + 1, k + 2, k + 3} <= ok]
+    m = len(singles) + len(pairs)
     out: dict[str, Any] = {
-        "rule": ("node residual = ln(solved gain / the gain the cubic through solved nodes k-2, k-1, k+1, "
-                 "k+2 predicts) per channel, in the quantity the C++ curve interpolates; z = (residual - "
-                 "median) / (1.4826 MAD) over the eligible nodes; flag when max |z| > the two-sided "
-                 f"Bonferroni critical value for 3 x m tests at family-wise alpha {alpha:g}; largest first, "
-                 "candidates within 2 nodes of a flagged node are its echoes"),
-        "alpha": alpha, "eligible_nodes": m, "kind": kd, "flagged": [], "echoes": [], "immaterial": [],
-        "materiality_de": materiality_de,
+        "rule": ("per channel in ln(gain): the left line (two solved nodes below) and the right line (two above), "
+                 "extrapolated onto a node or an adjacent pair; a feature departs from both lines in the same "
+                 "direction by more than z x s (s = 1.4826 MAD of the one-sided residuals; x sqrt(14/6) two steps "
+                 f"out); z = two-sided Bonferroni over 3 x the tests at family-wise alpha {alpha:g}; a knee sits "
+                 "on one line and is not a feature; flagged only when bridging moves the grey by the touch-up's "
+                 "own acceptance target"),
+        "alpha": alpha, "eligible_nodes": len(singles), "eligible_pairs": len(pairs), "kind": kd,
+        "flagged": [], "immaterial": [], "materiality_de": materiality_de,
     }
-    if m < MIN_SCALE_SAMPLES:
-        out.update(available=False,
-                   reason=f"only {m} solved nodes have two solved neighbours on each side (need "
-                          f"{MIN_SCALE_SAMPLES} for a robust scale)")
+    if len(singles) < MIN_SCALE_SAMPLES:
+        out.update(available=False, reason=f"only {len(singles)} solved nodes have two solved neighbours on each "
+                                           f"side (need {MIN_SCALE_SAMPLES} for a robust scale)")
         return out
-    z_crit = NormalDist().inv_cdf(1.0 - alpha / (2.0 * 3.0 * m))
-    stats = {ch: _mad_scale([r[1][ch] for r in rows.values()]) for ch in _CHANNELS}
-    zs = {k: {ch: (r[1][ch] - stats[ch][0]) / max(stats[ch][1], SCALE_FLOOR) for ch in _CHANNELS}
-          for k, r in rows.items()}
-    zmax = {k: max(abs(z) for z in zk.values()) for k, zk in zs.items()}
-    out.update(available=True, z_crit=round(z_crit, 4),
-               residual_scale={ch: {"median": round(stats[ch][0], 6), "sigma": round(stats[ch][1], 6)}
-                               for ch in _CHANNELS},
-               z_by_node={str(k): round(v, 3) for k, v in sorted(zmax.items())})
-    accepted: list[int] = []
-    for k in sorted((k for k in zmax if zmax[k] > z_crit), key=lambda k: -zmax[k]):
-        near = [a for a in accepted if abs(a - k) <= 2]
-        if near:
-            out["echoes"].append({"index": k, "code": int(codes[k]), "max_abs_z": round(zmax[k], 3),
-                                  "echo_of": near[0]})
+    z = NormalDist().inv_cdf(1.0 - alpha / (2.0 * 3.0 * m))
+
+    def left(ch: str, k: int, steps: int) -> float:   # line through k-steps-1, k-steps onto k
+        a, b = y[ch][k - steps], y[ch][k - steps - 1]
+        return y[ch][k] - (a + steps * (a - b))
+
+    def right(ch: str, k: int, steps: int) -> float:
+        a, b = y[ch][k + steps], y[ch][k + steps + 1]
+        return y[ch][k] - (a + steps * (a - b))
+
+    scale = {}
+    for ch in _CHANNELS:
+        res = [left(ch, k, 1) for k in singles] + [right(ch, k, 1) for k in singles]
+        scale[ch] = _mad_scale(res)
+    s2 = math.sqrt(14.0 / 6.0)
+    out.update(available=True, z_crit=round(z, 4),
+               residual_scale={ch: {"median": round(v[0], 6), "sigma": round(v[1], 6)} for ch, v in scale.items()})
+
+    def zr(ch: str, r: float, far: bool) -> float:
+        med, s = scale[ch]
+        return (r - med) / (max(s, SCALE_FLOOR) * (s2 if far else 1.0))
+
+    found: list[tuple[list[int], dict[str, list[float]]]] = []
+    for k in pairs:
+        zs = {ch: [zr(ch, left(ch, k, 1), False), zr(ch, left(ch, k + 1, 2), True),
+                   zr(ch, right(ch, k + 1, 1), False), zr(ch, right(ch, k, 2), True)] for ch in _CHANNELS}
+        if any(all(v > z for v in zz) or all(v < -z for v in zz) for zz in zs.values()):
+            found.append(([k, k + 1], zs))
+    in_pair = {j for nodes, _z in found for j in nodes}
+    for k in singles:
+        if k in in_pair:
             continue
-        trend = rows[k][0]
-        hold = {ch: neighbour_hold_gain(devs[ch], k, k - 1, k + 1, kd) for ch in _CHANNELS}
+        zs = {ch: [zr(ch, left(ch, k, 1), False), zr(ch, right(ch, k, 1), False)] for ch in _CHANNELS}
+        if any(all(v > z for v in zz) or all(v < -z for v in zz) for zz in zs.values()):
+            found.append(([k], zs))
+    found.sort(key=lambda f: f[0][0])
+    gains = {ch: [math.exp(v) for v in y[ch]] for ch in _CHANNELS}
+    for nodes, zs in found:
+        lo, hi = nodes[0] - 1, nodes[-1] + 1
+        bridged = {ch: [neighbour_hold_gain(gains[ch], k, lo, hi, kd) for k in nodes] for ch in _CHANNELS}
         effect = None
         if materiality_de is not None and light_exponent is not None:
-            effect = gain_change_de({ch: hold[ch] / devs[ch][k] for ch in _CHANNELS},
-                                    light_exponent=float(light_exponent[k]), white_xy=white_xy)
+            effect = max(gain_change_de({ch: bridged[ch][j] / gains[ch][k] for ch in _CHANNELS},
+                                        light_exponent=float(light_exponent[k]), white_xy=white_xy)
+                         for j, k in enumerate(nodes))
             if effect < materiality_de:
-                out["immaterial"].append({"index": k, "code": int(codes[k]), "max_abs_z": round(zmax[k], 3),
+                out["immaterial"].append({"nodes": nodes, "codes": [int(codes[k]) for k in nodes],
                                           "hold_changes_grey_de": round(effect, 4)})
                 continue
-        accepted.append(k)
-        nb_mean = {ch: 0.5 * (devs[ch][k - 1] + devs[ch][k + 1]) for ch in _CHANNELS}
-        direction = {}
-        for ch in _CHANNELS:
-            s_node, s_nb = _sign(devs[ch][k] - 1.0), _sign(nb_mean[ch] - 1.0)
-            direction[ch] = ("opposite" if s_node and s_nb and s_node != s_nb
-                             else "same" if s_node and s_node == s_nb else "neutral")
+        maxz = max(abs(v) for zz in zs.values() for v in zz)
         out["flagged"].append({
-            "index": k, "code": int(codes[k]),
-            "solved_gain": {ch: round(devs[ch][k], 6) for ch in _CHANNELS},
-            "local_trend": {ch: round(trend[ch], 6) for ch in _CHANNELS},
-            "solved_vs_trend_pct": {ch: round(100.0 * (devs[ch][k] / trend[ch] - 1.0), 4) for ch in _CHANNELS},
-            "neighbour_interpolation": {ch: round(hold[ch], 6) for ch in _CHANNELS},
-            "solved_vs_neighbours_pct": {ch: round(100.0 * (devs[ch][k] / hold[ch] - 1.0), 4)
-                                         for ch in _CHANNELS},
-            "z": {ch: round(zs[k][ch], 3) for ch in _CHANNELS},
-            "max_abs_z": round(zmax[k], 3),
+            "index": nodes[0], "nodes": nodes, "code": int(codes[nodes[0]]), "codes": [int(codes[k]) for k in nodes],
+            "solved_gain": {ch: [round(gains[ch][k], 6) for k in nodes] for ch in _CHANNELS},
+            "neighbour_interpolation": {ch: [round(v, 6) for v in bridged[ch]] for ch in _CHANNELS},
+            "solved_vs_neighbours_pct": {ch: [round(100.0 * (gains[ch][k] / bridged[ch][j] - 1.0), 4)
+                                              for j, k in enumerate(nodes)] for ch in _CHANNELS},
+            "z": {ch: [round(v, 3) for v in zz] for ch, zz in zs.items()},
+            "max_abs_z": round(maxz, 3),
             "hold_changes_grey_de": round(effect, 4) if effect is not None else None,
-            "direction_vs_neighbours": direction,
             "neighbours": {side: {"index": j, "code": int(codes[j]),
-                                  "gain": {ch: round(devs[ch][j], 6) for ch in _CHANNELS}}
-                           for side, j in (("left", k - 1), ("right", k + 1))},
-            "spreads_over_codes": [int(codes[k - 1]), int(codes[k + 1])],
+                                  "gain": {ch: round(gains[ch][j], 6) for ch in _CHANNELS}}
+                           for side, j in (("left", lo), ("right", hi))},
+            "spreads_over_codes": [int(codes[lo]), int(codes[hi])],
         })
     return out
+
+
+def apply_balance_smoothing(payload: Mapping[str, Any], features: Sequence[Sequence[int]]
+                            ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The owner's outcome for a narrow feature: a SMOOTH white-balance correction with no per-node outlier.
+    Each flagged node's BALANCE (rgb) takes the straight line in ln(balance) between the nearest unflagged
+    neighbours; its LIGHT (the luminance slider, already committed as the shared light) is kept. The
+    display's own defect at that code is then left uncorrected by this flow (it belongs to the base LUT)."""
+    points = [float(p) for p in payload["points"]]
+    current = coerce_payload(payload, points)
+    n = len(points)
+    flagged = sorted({int(k) for f in features for k in f if 0 < int(k) < n - 1})
+    rgb = {ch: list(current["rgb"][ch]) for ch in _CHANNELS}
+    detail: dict[str, Any] = {}
+    for k in flagged:
+        lo = max(j for j in range(k) if j not in flagged)
+        hi = min(j for j in range(k + 1, n) if j not in flagged)
+        w = (k - lo) / float(hi - lo)
+        new = {ch: math.exp((1.0 - w) * math.log(rgb[ch][lo]) + w * math.log(rgb[ch][hi])) for ch in _CHANNELS}
+        gm = (new["r"] * new["g"] * new["b"]) ** (1.0 / 3.0)
+        new = {ch: v / gm for ch, v in new.items()}       # zero-mean balance, as the solver keeps it
+        detail[str(k)] = {"from": {ch: round(rgb[ch][k], 6) for ch in _CHANNELS},
+                          "to": {ch: round(new[ch], 6) for ch in _CHANNELS}, "between_nodes": [lo, hi]}
+        for ch in _CHANNELS:
+            rgb[ch][k] = new[ch]
+    return compose_payload(points, current["luminance"], rgb), detail
 
 
 def light_trend(nodes: Sequence[Mapping[str, Any]], *, alpha: float = FAMILY_ALPHA) -> dict[str, Any]:
@@ -621,61 +680,171 @@ def apply_node_holds(payload: Mapping[str, Any], holds: Sequence[int], *,
     return compose_payload(points, lum, rgb), detail
 
 
+def curve_gains(points: Sequence[float], deviations: Mapping[str, Sequence[float]], kind: str) -> dict[str, list[float]]:
+    """The composed per-channel slot gains of a curve AS DESKTOPLUT STORES IT (``points`` already carry
+    the luminance, ``deviations`` the balance): gain_c[i] = points[i] * dev_c[i] / identity_point[i]."""
+    kd = _kind(kind)
+    n = len(points)
+    ident = [(i / (n - 1)) if kd == "hdr" else (i / (n - 1)) ** 2 for i in range(n)]
+    return {ch: [(float(points[i]) * float((deviations.get(ch) or [1.0] * n)[i]) / ident[i]) if ident[i] > 0 else 1.0
+                 for i in range(n)] for ch in _CHANNELS}
+
+
+def light_ratios(after: Mapping[str, Sequence[float]], before: Optional[Mapping[str, Sequence[float]]],
+                 u: Mapping[str, float], *, light_exponent: float, kind: str) -> dict[str, float]:
+    """Per channel, the LIGHT ratio the change from the ``before`` curve (None = identity) to the ``after``
+    curve makes at a grey whose curve coordinate is ``u[ch]`` (signal gain ** light exponent)."""
+    out = {}
+    for ch in _CHANNELS:
+        ga = interpolated_gain(after[ch], u[ch], kind)
+        gb = interpolated_gain(before[ch], u[ch] * (len(before[ch]) - 1) / (len(after[ch]) - 1), kind) \
+            if before is not None else 1.0
+        out[ch] = (ga / gb) ** light_exponent if gb > 0 else 1.0
+    return out
+
+
+def _srgb_matrix(white_xy: tuple[float, float]):
+    return rgb_to_xyz_matrix(_SRGB[0][0], _SRGB[0][1], _SRGB[1][0], _SRGB[1][1], _SRGB[2][0], _SRGB[2][1],
+                             white_xy[0], white_xy[1], white_Y=1.0)
+
+
+def commanded_light(ratios: Mapping[str, float], white_xy: tuple[float, float] = (0.3127, 0.3290)) -> float:
+    """ln of the grey's luminance ratio for per-channel light ratios (the solver's sRGB basis)."""
+    m = _srgb_matrix(white_xy)
+    num = sum(m[1][j] * float(ratios[ch]) for j, ch in enumerate(_CHANNELS))
+    return math.log(num / sum(m[1])) if num > 0 else 0.0
+
+
+def carry_through(xyz: Sequence[float], ratios: Mapping[str, float],
+                  white_xy: tuple[float, float] = (0.3127, 0.3290)) -> list[float]:
+    """A read carried through per-channel light ratios (the solver's sRGB basis): the PREDICTED read."""
+    m = _srgb_matrix(white_xy)
+    rgb = matvec(invert3x3(m), [float(v) for v in xyz])
+    return list(matvec(m, [rgb[j] * float(ratios[ch]) for j, ch in enumerate(_CHANNELS)]))
+
+
 def _err(xyz: Sequence[float], target_y: float, config: GrayTouchupConfig) -> dict[str, Any]:
     return point_error(GrayTouchupPatch(level=0.0, measured_xyz=tuple(float(v) for v in xyz),  # type: ignore[arg-type]
                                         target_y=float(target_y)), config)
 
 
+def _uv(xyz: Sequence[float]) -> tuple[float, float]:
+    x, y, z = (float(v) for v in xyz)
+    d = x + 15.0 * y + 3.0 * z
+    return (4.0 * x / d, 9.0 * y / d) if d > 0 else (0.0, 0.0)
+
+
+def _white_uv(white_xy: tuple[float, float]) -> tuple[float, float]:
+    x, y = white_xy
+    d = -2.0 * x + 12.0 * y + 3.0
+    return 4.0 * x / d, 9.0 * y / d
+
+
+def chroma_de(xyz: Sequence[float], ref_xyz: Sequence[float], white_xy: tuple[float, float]) -> float:
+    """dE2000 between two stimuli's CHROMATICITIES alone (both brought to the same luminance) - the colour
+    part of the touch-up's own point metric, with the light part removed."""
+    if float(xyz[1]) <= 0 or float(ref_xyz[1]) <= 0:
+        return float("nan")
+    w = white_xyz(1.0, white_xy[0], white_xy[1])
+    a = tuple(float(v) / float(xyz[1]) for v in xyz)
+    b = tuple(float(v) / float(ref_xyz[1]) for v in ref_xyz)
+    return float(delta_e2000(xyz_to_lab(a, w), xyz_to_lab(b, w)))   # type: ignore[arg-type]
+
+
+def grey_metrics(xyz: Sequence[float], target_y: float, white_xy: tuple[float, float]) -> dict[str, float]:
+    """The two things a grey can get wrong, measured separately: LIGHT ``e = ln(Y / target)`` (signed;
+    its error is ``|e|``) and CHROMATICITY ``c`` = the dE2000 of its chromaticity alone against the target
+    white (:func:`chroma_de` - the touch-up's own metric with the light taken out). ``du``/``dv`` = its u'v'
+    offset from the target white, for the record."""
+    y = float(xyz[1])
+    wu, wv = _white_uv(white_xy)
+    u, v = _uv(xyz)
+    return {"e": math.log(y / target_y) if y > 0 and target_y > 0 else float("nan"),
+            "c": chroma_de(xyz, xy_to_XYZ(white_xy[0], white_xy[1], 1.0), white_xy),
+            "du": u - wu, "dv": v - wv}
+
+
+def _se(values: Sequence[float]) -> Optional[float]:
+    vals = [float(v) for v in values if math.isfinite(float(v))]
+    if len(vals) < 2:
+        return None
+    mu = sum(vals) / len(vals)
+    return math.sqrt(sum((v - mu) ** 2 for v in vals) / (len(vals) - 1)) / math.sqrt(len(vals))
+
+
 def _read_summary(xyz: Sequence[float], target_y: float, config: GrayTouchupConfig) -> dict[str, Any]:
     e = _err(xyz, target_y, config)
     x, y = e["measured_xy"]
+    gm = grey_metrics(xyz, target_y, config.white_xy)
     return {"Y": e["measured_Y"],
-            "Y_err_pct": round(100.0 * (float(xyz[1]) / target_y - 1.0), 3) if target_y > 0 else None,
+            "Y_err_pct": round(100.0 * (math.exp(gm["e"]) - 1.0), 3) if math.isfinite(gm["e"]) else None,
+            "chroma_de": round(gm["c"], 4),
             "dxy": [round(x - config.white_xy[0], 5), round(y - config.white_xy[1], 5)],
             "de2000": e["de2000"]}
 
 
-def _reads_se(reads: Sequence[Sequence[float]], target_y: float,
-              config: GrayTouchupConfig) -> Optional[float]:
-    """Standard error of the mean dE2000 (to target) over a grey's repeat reads; None for < 2."""
-    des = [_err(r, target_y, config)["de2000"] for r in reads
-           if r is not None and len(r) == 3 and all(math.isfinite(float(v)) for v in r)]
-    if len(des) < 2:
-        return None
-    mu = sum(des) / len(des)
-    sd = math.sqrt(sum((d - mu) ** 2 for d in des) / (len(des) - 1))
-    return sd / math.sqrt(len(des))
+def _local(pairs: Sequence[Mapping[str, Any]], code: int, key: str) -> tuple[float, float, list[int]]:
+    near = sorted(pairs, key=lambda p: (abs(int(p["code"]) - code), int(p["code"])))[:MIN_SCALE_SAMPLES]
+    med, sig = _mad_scale([float(p[key]) for p in near])
+    return med, sig, [int(p["code"]) for p in near]
 
 
 def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Sequence[float]],
                    null_pairs: Sequence[Mapping[str, Any]], *, config: GrayTouchupConfig,
-                   alpha: float = FAMILY_ALPHA) -> dict[str, Any]:
-    """Judge the touch-up at greys it was NOT fitted on: each grey's dE2000 to its target AFTER the
-    bake (``after[code]``, the verify read) against BEFORE the touch-up (``grey['before_xyz']``, read
-    in the touch-up session through the before-state table).
+                   alpha: float = FAMILY_ALPHA,
+                   bracket: Optional[Sequence[Mapping[str, Any]]] = None,
+                   after_reads: Optional[Mapping[int, Sequence[Sequence[float]]]] = None,
+                   light_tol: float = math.log(1.01), chroma_tol: float = 0.6) -> dict[str, Any]:
+    """Judge the touch-up at greys it was NOT fitted on, LIGHT and CHROMATICITY separately (review item 5:
+    one scalar dE hid code 160 going -3.6 % in light while its dE improved), each against the grey's OWN
+    before-read and its own repeatability. Either regressing counts.
 
-    Repeatability (the measurement's own, from this run):
-      * the NULL - every solved node read twice in an unchanged state: its last read in the
-        touch-up session and its verify read of the bake (``null_pairs``). ``d = dE(verify) -
-        dE(session)`` holds read noise + drift between the two occasions + any preview/bake gap.
-        Per grey, the median (drift) and 1.4826 MAD (scatter) of ``d`` over the
-        :data:`MIN_SCALE_SAMPLES` pairs nearest in code (noise and drift depend on the level);
-      * the grey's own repeat reads: sqrt(2) x the SE of its before reads (the after read at the same
-        level is assumed as noisy).
-    Rule: ``change = dE_after - dE_before - median_local(d)``; sigma = max(MAD sigma, sqrt(2) SE)
-    (floored at :data:`SCALE_FLOOR`); REGRESSED when ``change > z * sigma`` with z the one-sided
-    Bonferroni critical value for the judged greys at ``alpha`` family-wise. A grey with no
-    repeatability estimate at all (fewer than 8 pairs AND a single read) is reported, not judged."""
+    ``greys``: ``code``, ``target_Y``, ``before_xyz``, ``before_reads``, optional ``commanded_e`` (ln of the
+    light ratio the committed curve commands at that code against the before table - known exactly from
+    the curves) and, for a held / smoothed node, ``predicted_xyz`` (the before-read carried through the
+    curve change: judged against the PREDICTION, not by the regression rule).
+
+    Repeatability, per metric m in {e, c}, all measured in this run:
+      * the grey's own repeat reads: the SE of its before reads and of its after reads (``after_reads``;
+        without them the after SE is taken equal to the before SE);
+      * BRACKET (drift over the touch-up session): greys re-read in the before state late in the session;
+        ``d = m(late) - m(early)``; median = the drift carried into the comparison, 1.4826 MAD = its
+        scatter; needs :data:`MIN_SCALE_SAMPLES` re-reads;
+      * NULL (session -> verify): solved nodes whose committed value is exactly the table their last
+        session read saw (``null_pairs``; moved nodes are never used - nothing is predicted), read again on
+        the bake; median and MAD over the :data:`MIN_SCALE_SAMPLES` pairs nearest in code. With fewer than
+        that in total the null is not used and the digest says so; the 8 nearest are taken however far
+        they lie, and each grey reports the code span its pairs came from.
+    change_m = m_after - drift_bracket - drift_null vs m_before (light: |e| after vs |e| before; chroma:
+    c after vs c before); sigma_m = sqrt(SE_b^2 + SE_a^2 + MAD_bracket^2 + MAD_null^2), floored at
+    :data:`SCALE_FLOOR`; regressed when change_m > z sigma_m, z = one-sided Bonferroni over 2 x J tests at
+    ``alpha``. LIGHT regresses only when the curve's own command explains it (``|e_b + commanded| - |e_b|``
+    beyond the same threshold): light that moved where the curve commanded ~nothing - a drive change across
+    a tooth of a sawtooth-light panel, or drift the bracket did not see - is listed as
+    ``uncommanded_light`` with its size, as evidence, not as the curve's regression. Without
+    ``commanded_e`` no gating is applied."""
+    wxy = config.white_xy
     pairs = []
     for p in null_pairs:
         try:
-            d = (_err(p["verify_xyz"], p["target_Y"], config)["de2000"]
-                 - _err(p["final_xyz"], p["target_Y"], config)["de2000"])
+            a, f = grey_metrics(p["verify_xyz"], p["target_Y"], wxy), grey_metrics(p["final_xyz"], p["target_Y"], wxy)
         except (KeyError, TypeError, ValueError):
             continue
-        if math.isfinite(d):
-            pairs.append({"code": int(p["code"]), "index": p.get("index"), "d": d})
+        if math.isfinite(a["e"]) and math.isfinite(f["e"]):
+            pairs.append({"code": int(p["code"]), "de": a["e"] - f["e"], "dc": a["c"] - f["c"]})
     null_ok = len(pairs) >= MIN_SCALE_SAMPLES
+    brk = []
+    for b in bracket or ():
+        try:
+            e0, e1 = grey_metrics(b["early_xyz"], b["target_Y"], wxy), grey_metrics(b["late_xyz"], b["target_Y"], wxy)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(e0["e"]) and math.isfinite(e1["e"]):
+            brk.append({"code": int(b["code"]), "de": e1["e"] - e0["e"], "dc": e1["c"] - e0["c"]})
+    brk_ok = len(brk) >= MIN_SCALE_SAMPLES
+    b_e = _mad_scale([b["de"] for b in brk]) if brk_ok else (0.0, 0.0)
+    b_c = _mad_scale([b["dc"] for b in brk]) if brk_ok else (0.0, 0.0)
+
     rows: list[dict[str, Any]] = []
     for g in greys:
         code = int(g["code"])
@@ -685,53 +854,117 @@ def judge_held_out(greys: Sequence[Mapping[str, Any]], after: Mapping[int, Seque
         bxyz = g.get("before_xyz")
         axyz = after.get(code)
         if bxyz is None or axyz is None:
-            row.update(judged=False, reason=("no usable before read" if bxyz is None
-                                             else "not measured by the verify"))
+            row.update(judged=False, reason=("no usable before read" if bxyz is None else "not measured by the verify"))
             rows.append(row)
             continue
-        before = _read_summary(bxyz, ty, config)
-        aft = _read_summary(axyz, ty, config)
-        se = _reads_se(g.get("before_reads") or (), ty, config)
-        med_d, sig_d = 0.0, None
+        mb, ma = grey_metrics(bxyz, ty, wxy), grey_metrics(axyz, ty, wxy)
+        b_reads = [grey_metrics(r, ty, wxy) for r in g.get("before_reads") or ()]
+        a_reads = [grey_metrics(r, ty, wxy) for r in (after_reads or {}).get(code) or ()]
+        se_be, se_bc = _se([r["e"] for r in b_reads]), _se([r["c"] for r in b_reads])
+        se_ae, se_ac = _se([r["e"] for r in a_reads]), _se([r["c"] for r in a_reads])
+        if se_ae is None:
+            se_ae = se_be
+        if se_ac is None:
+            se_ac = se_bc
+        n_e = n_c = (0.0, 0.0)
+        span = None
         if null_ok:
-            local = sorted(pairs, key=lambda p: (abs(p["code"] - code), p["code"]))[:MIN_SCALE_SAMPLES]
-            med_d, sig_d = _mad_scale([p["d"] for p in local])
-        parts = [v for v in (sig_d, (math.sqrt(2.0) * se) if se is not None else None) if v is not None]
-        row.update(before=before, after=aft,
-                   drift_median=round(med_d, 5),
-                   null_sigma=round(sig_d, 5) if sig_d is not None else None,
-                   reads_se=round(se, 5) if se is not None else None)
-        if not parts:
-            row.update(judged=False, reason="no repeatability estimate (fewer than "
-                                            f"{MIN_SCALE_SAMPLES} node pairs and a single read)")
+            me, se_, codes_e = _local(pairs, code, "de")
+            mc, sc, _codes = _local(pairs, code, "dc")
+            n_e, n_c, span = (me, se_), (mc, sc), [min(codes_e), max(codes_e)]
+        have_noise = se_be is not None or null_ok or brk_ok
+        row.update(before=_read_summary(bxyz, ty, config), after=_read_summary(axyz, ty, config),
+                   null_span_codes=span)
+        if not have_noise:
+            row.update(judged=False, reason=f"no repeatability estimate (a single read, fewer than "
+                                            f"{MIN_SCALE_SAMPLES} unmoved node pairs and bracket re-reads)")
             rows.append(row)
             continue
-        sigma = max(max(parts), SCALE_FLOOR)
-        change = aft["de2000"] - before["de2000"] - med_d
-        row.update(judged=True, change=round(change, 5), sigma=round(sigma, 5),
-                   score=round(change / sigma, 3))
+        sig_e = max(math.sqrt((se_be or 0.0) ** 2 + (se_ae or 0.0) ** 2 + b_e[1] ** 2 + n_e[1] ** 2), SCALE_FLOOR)
+        sig_c = max(math.sqrt((se_bc or 0.0) ** 2 + (se_ac or 0.0) ** 2 + b_c[1] ** 2 + n_c[1] ** 2), SCALE_FLOOR)
+        e_a = ma["e"] - b_e[0] - n_e[0]
+        c_a = ma["c"] - b_c[0] - n_c[0]
+        light_change = abs(e_a) - abs(mb["e"])
+        chroma_change = c_a - mb["c"]
+        cmd = g.get("commanded_e")
+        row.update(judged=True,
+                   light={"before_pct": round(100.0 * mb["e"], 3), "after_pct": round(100.0 * ma["e"], 3),
+                          "drift_pct": round(100.0 * (b_e[0] + n_e[0]), 3),
+                          "change_pct": round(100.0 * light_change, 3), "sigma_pct": round(100.0 * sig_e, 4),
+                          "commanded_pct": round(100.0 * float(cmd), 3) if cmd is not None else None},
+                   chroma={"before_de": round(mb["c"], 4), "after_de": round(ma["c"], 4),
+                           "drift_de": round(b_c[0] + n_c[0], 4),
+                           "change_de": round(chroma_change, 4), "sigma_de": round(sig_c, 4)},
+                   _le=light_change, _ce=chroma_change, _se=sig_e, _sc=sig_c, _eb=mb["e"], _cmd=cmd)
+        if g.get("predicted_xyz") is not None:
+            mp = grey_metrics(g["predicted_xyz"], ty, wxy)
+            row["predicted"] = {"light_pct": round(100.0 * mp["e"], 3), "chroma_de": round(mp["c"], 4),
+                                "_de": ma["e"] - b_e[0] - n_e[0] - mp["e"],
+                                "_dc": chroma_de(axyz, g["predicted_xyz"], wxy),
+                                "note": g.get("predicted_note")}
         rows.append(row)
     judged = [r for r in rows if r.get("judged")]
-    z_crit = NormalDist().inv_cdf(1.0 - alpha / len(judged)) if judged else None
+    regular = [r for r in judged if "predicted" not in r]
+    predicted = [r for r in judged if "predicted" in r]
+    n_tests = 2 * len(judged)
+    z = NormalDist().inv_cdf(1.0 - alpha / n_tests) if n_tests else None
+    for r in regular:
+        th_e, th_c = max(z * r["_se"], light_tol), max(z * r["_sc"], chroma_tol)   # type: ignore[operator]
+        light_reg = r["_le"] > th_e
+        explained = True
+        if r["_cmd"] is not None:
+            explained = (abs(r["_eb"] + float(r["_cmd"])) - abs(r["_eb"])) > th_e
+        r["light"].update(threshold_pct=round(100.0 * th_e, 4), regressed=bool(light_reg and explained),
+                          uncommanded=bool(light_reg and not explained))
+        r["chroma"].update(threshold_de=round(th_c, 4), regressed=bool(r["_ce"] > th_c))
+        r["regressed"] = bool(r["light"]["regressed"] or r["chroma"]["regressed"])
+        r["score"] = round(max(r["_le"] / r["_se"], r["_ce"] / r["_sc"]), 3)
+    for r in predicted:
+        p = r["predicted"]
+        ok_e = abs(p.pop("_de")) <= max(z * r["_se"], light_tol)      # type: ignore[operator]
+        ok_c = p.pop("_dc") <= max(z * r["_sc"], chroma_tol)           # type: ignore[operator]
+        p.update(as_predicted=bool(ok_e and ok_c), light_ok=bool(ok_e), chroma_ok=bool(ok_c))
+        r["regressed"] = False
     for r in judged:
-        r["threshold"] = round(z_crit * r["sigma"], 5)   # type: ignore[operator]
-        r["regressed"] = bool(r["change"] > z_crit * r["sigma"])   # type: ignore[operator]
-    regressed = [r for r in judged if r["regressed"]]
-    worst = sorted(judged, key=lambda r: r["score"], reverse=True)[:5]
+        for k in ("_le", "_ce", "_se", "_sc", "_eb", "_cmd"):
+            r.pop(k, None)
+    regressed = [r for r in regular if r["regressed"]]
+    worst = sorted(regular, key=lambda r: r["score"], reverse=True)[:5]
     return {
         "available": bool(judged),
-        "rule": ("change = dE_after - dE_before - median(d) over the 8 nearest node pairs (d = a solved "
-                 "node's verify dE minus its last session dE: the same state read twice); sigma = "
-                 "max(1.4826 MAD of those d, sqrt(2) x SE of the grey's before reads); regressed when "
-                 f"change > z x sigma, z = one-sided Bonferroni critical value for the judged greys at "
-                 f"alpha {alpha:g}"),
-        "alpha": alpha, "z_crit": round(z_crit, 4) if z_crit is not None else None,
-        "n_greys": len(rows), "n_judged": len(judged), "n_regressed": len(regressed),
+        "rule": ("per grey, LIGHT (|ln(Y/target)|) and CHROMATICITY (dE2000 of the chromaticity alone vs the target "
+                 "white) separately, after (drift-corrected: bracket re-reads of the before state late in the session, "
+                 "plus the null of unmoved nodes session -> verify) vs the grey's own before-read; sigma = "
+                 "sqrt(SE_before^2 + SE_after^2 + MAD_bracket^2 + MAD_null^2); regressed when the change > max(z x "
+                 f"sigma, the touch-up's own tolerance: {100.0 * (math.exp(light_tol) - 1.0):.2g} % light, "
+                 f"{chroma_tol:g} dE colour), z = one-sided Bonferroni over 2 x the judged greys at alpha {alpha:g}; "
+                 "light counts only when the curve's own command explains it (else 'uncommanded light'); held / "
+                 "smoothed node codes are judged against their predicted outcome within the same bounds"),
+        "light_tol_pct": round(100.0 * (math.exp(light_tol) - 1.0), 3), "chroma_tol_de": chroma_tol,
+        "alpha": alpha, "z_crit": round(z, 4) if z is not None else None,
+        "n_greys": len(rows), "n_judged": len(regular), "n_regressed": len(regressed),
         "regressed_codes": [r["code"] for r in regressed],
-        "worst": [{**{k: r.get(k) for k in ("code", "kind", "change", "threshold", "score", "regressed")},
-                   "before": r["before"], "after": r["after"]} for r in worst],
+        "light_regressed_codes": [r["code"] for r in regressed if r["light"]["regressed"]],
+        "chroma_regressed_codes": [r["code"] for r in regressed if r["chroma"]["regressed"]],
+        "uncommanded_light": [{"code": r["code"], "change_pct": r["light"]["change_pct"],
+                               "commanded_pct": r["light"]["commanded_pct"]}
+                              for r in regular if r["light"].get("uncommanded")],
+        "improved_codes": [r["code"] for r in regular
+                           if r["light"]["change_pct"] <= 0 and r["chroma"]["change_de"] <= 0],
+        "predicted": [{"code": r["code"], "kind": r["kind"], **r["predicted"],
+                       "light_after_pct": r["light"]["after_pct"], "chroma_after_de": r["chroma"]["after_de"]}
+                      for r in predicted],
+        "worst": [{"code": r["code"], "kind": r["kind"], "regressed": r["regressed"], "score": r["score"],
+                   "light": r["light"], "chroma": r["chroma"], "before": r["before"], "after": r["after"]}
+                  for r in worst],
+        "bracket": {"n": len(brk), "used": brk_ok,
+                    "drift_light_pct": round(100.0 * b_e[0], 4), "scatter_light_pct": round(100.0 * b_e[1], 4),
+                    "drift_chroma_de": round(b_c[0], 4), "scatter_chroma_de": round(b_c[1], 4),
+                    "note": None if brk_ok else f"fewer than {MIN_SCALE_SAMPLES} bracket re-reads: session drift not in sigma"},
         "null": {"n_pairs": len(pairs), "used": null_ok,
-                 "median_d": round(median([p["d"] for p in pairs]), 5) if pairs else None,
-                 "pairs": [{"code": p["code"], "d": round(p["d"], 5)} for p in pairs]},
+                 "note": None if null_ok else (f"only {len(pairs)} solved nodes kept their table unchanged (fewer than "
+                                               f"{MIN_SCALE_SAMPLES}): the session -> verify drift is not in sigma"),
+                 "pairs": [{"code": p["code"], "d_light_pct": round(100.0 * p["de"], 4), "d_chroma_de": round(p["dc"], 4)}
+                           for p in pairs]},
         "greys": rows,
     }

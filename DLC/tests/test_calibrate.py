@@ -834,9 +834,10 @@ def test_grayscale_wb_flow_is_standalone_mhc_only_touchup(tmp_path: Path):
     # immediate re-measure rate is identical under monotonic and alternating visit order
     # (18 = 9 bright points × the 3-read floor's 2 extra reads; the pre-floor monotonic
     # baseline was 14). The dark↔bright swings are absorbed by the luminance-jump settle
-    # bump (extra presenter dwell), never by extra reads. The 8 bright held-out greys between the
-    # nodes (read once each in the before state, 2026-11-14) carry the same floor: 8 x 2 more.
-    assert digest["session"]["immediate_remeasures"] <= 18 + 16
+    # bump (extra presenter dwell), never by extra reads. The held-out greys between the nodes (read in the
+    # before state, 2026-11-14) add their own: the 8 bright ones the 3-read floor (8 x 2), the 16 dark ones
+    # their two-read minimum (16 x 1), and the 8 bracket re-reads at most 2 each (8 x 2).
+    assert digest["session"]["immediate_remeasures"] <= 18 + 16 + 16 + 16
     assert digest["session"]["jump_settles"] > 0
     # The touch-up live-edits the MHC correctionGrayscale (the toggleable third "+1") and bakes it
     # into the ICM on accept — NOT a runtime overlay tweak. Core (matrix/base/3D-LUT) untouched.

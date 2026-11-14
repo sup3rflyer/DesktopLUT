@@ -11,24 +11,26 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
   reaches every grey out to its neighbours. On the PA32UCXR a feature ~9 codes wide at node 12 (code 153) got a
   correction opposite to its neighbours, the curve spread it over codes ~130-179 (148: +0.5 % -> -7.6 % light),
   and three runs still verified "within quality, apply". Now:
-  - 24 held-out greys (SDR 10-bit) sit between the nodes at the curve's own worst-interpolation point (the
-    midpoint in sqrt(signal), mhc.cpp `EvalGrayscaleSDR_Channel`; HDR: the PQ midpoint). Each is read once in the
-    BEFORE state inside the touch-up session (interleaved with the nodes) and once by the verify on the bake; the
-    fit never sees them.
-  - The `verify:accept` digest carries `gswb_held_out` (before / after per grey, the worst five) and the
-    recommendation is `revert` when any of them reads worse than before beyond this run's own repeatability
-    (every solved node read twice in an unchanged state is the null; one-sided Bonferroni at 5 % family-wise).
-  - A new seam `grayscale-wb:node-outlier` (hold / accept / abort, recommendation hold) raises a solved node that
-    departs from its neighbours' trend (robust z, Bonferroni at 5 %, and only when holding it moves its grey by
-    at least the touch-up's own 0.6 dE target). `hold` puts it on its neighbours' interpolation; the held-out
-    verify still decides.
-  - LIGHT is committed only as a trend the nodes share (dense reads 2026-11-14: the panel's full-field light
-    is a sawtooth in the code, teeth of 2-4 % every 4-12 codes, its chromaticity flat — a per-node light value
-    is right at its code and wrong a few codes away). A node whose light need departs from its neighbours'
-    (symmetric median, node left out) beyond its repeat-read noise is a tooth: it takes the neighbours' light,
-    or none where that is within its own uncertainty; no committed node may depart from its neighbours' light
-    beyond the noise. Balance stays per node. Seam `grayscale-wb:light-trend` (trend / abort) shows it.
-  - Cost: +48 grey reads, about +9 min on a ~16 min run; `--preview-patches` and the plan seam say so.
+  - 24 held-out greys (SDR 10-bit) sit at the curve's slot mid-positions THROUGH THE INSTALLED BASE 1D LUT (the
+    curve runs on the base's output, mhc_icc.cpp `ComposeMhcScanout`); the plan warns when the base is unknown and
+    that the SDR GAMMA 2.4 switch is not reported. Each is read in the BEFORE state inside the touch-up session
+    (two reads at least, interleaved with the nodes), 8 of them again at the end of the session (the drift
+    bracket), and once by the verify on the bake; the fit never sees them.
+  - The verify judges LIGHT and COLOUR separately at each held-out grey against its own before-read and this
+    run's repeatability (repeat reads, the bracket, unmoved node pairs - never predicted ones), beyond the
+    touch-up's own tolerance (1 % light, 0.6 dE colour); light counts only where the committed curve commanded
+    it. `revert` is recommended when any grey reads worse.
+  - LIGHT is committed only as light the nodes on both sides share (the panel's full-field light is a sawtooth
+    in the code, teeth of 2-4 % every 4-12 codes, its chromaticity flat): the smallest ask of the five nodes
+    around a node when all five ask the same sign, else none - never extrapolated, zero at the edges, never more
+    than a supporting node asks, independent of the assumed noise. Seam `grayscale-wb:light-trend` when a move
+    exceeds what the reads resolve.
+  - Seam `grayscale-wb:node-outlier` (smooth / hold / accept / abort, recommendation smooth) raises one node or
+    an adjacent pair whose balance departs from the lines both sides draw (a knee is not a feature). `smooth`
+    makes the committed white balance a smooth trend through them; their codes are then judged against their
+    PREDICTED outcome and the digest says the display's own defect there is left for the base LUT.
+  - Cost: about 56 more grey presentations, ~+11 min on a ~16 min run on the one display measured so far;
+    `--preview-patches` and the plan seam say so.
 - **A `grayscale-wb` run that does not finish puts the previous grayscale curve back** (2026-11-12). The
   touch-up is baked into the installed profile before its verify measurement, so a run that ended during the
   verify — a cancel, a pause that timed out, a dead meter, a stall, a stage error, a crash, or `--abort` at the

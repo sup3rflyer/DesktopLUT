@@ -2971,6 +2971,7 @@ class IncrementalMeasureSession:
         white_peak_y: Optional[float] = None,
         correction_max_nits: Optional[float] = None,
         correction_channel_scale: Optional[tuple[float, float, float]] = None,
+        patch_min_reads: Optional[Sequence[int]] = None,
     ) -> None:
         self.cfg = config or MeasureLoopConfig()
         self.ndjson = _NdjsonWriter(ndjson_path)
@@ -2991,6 +2992,7 @@ class IncrementalMeasureSession:
             white_peak_y=white_peak_y,
             correction_max_nits=correction_max_nits,
             correction_channel_scale=correction_channel_scale,
+            patch_min_reads=patch_min_reads,
         )
         self.preheat_digest: Optional[dict[str, Any]] = None
         self.preheat_compromised = False

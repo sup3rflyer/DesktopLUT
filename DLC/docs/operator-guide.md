@@ -280,16 +280,19 @@ Unfamiliar key? Read its `question` and `digest`. If it's ambiguous, ask the hum
     DesktopLUT is back. Restoring twice is harmless.
   - `--abort` never takes back a touch-up that was applied (`verify:accept` = `apply`).
   - A rolled-back `grayscale-wb` run refuses to resume (its result is no longer on the display).
-- **`grayscale-wb` is judged between its nodes.** The verify also reads the held-out greys between the curve's
-  nodes (read once before the touch-up, in the same session); `verify:accept` shows them as `gswb_held_out`
-  (before / after per grey, the worst ones) and recommends `revert` when any reads worse than before beyond the
-  run's own repeatability. `grayscale-wb:node-outlier` raises a solved node that departs from its neighbours (a
-  display feature narrower than the node spacing): `hold` puts it on its neighbours' interpolation, `accept`
-  keeps it, `abort` ends the run. A held node is judged like a held-out grey: its feature stays uncorrected, so
-  it may read worse than before while everything around it improves — weigh that with the owner.
-  `grayscale-wb:light-trend` (before it) lists nodes whose LIGHT need their neighbours do not share (a tooth
-  of a sawtooth-light panel): `trend` commits their light as the neighbours' (or none), keeping their colour
-  balance; there is no per-node option, by design.
+- **`grayscale-wb` is judged between its nodes.** The verify also reads held-out greys between the curve's
+  slots (placed through the installed base 1D LUT; read before the touch-up in the same session, 8 of them
+  again at its end). `verify:accept` shows them as `gswb_held_out`: LIGHT and COLOUR separately per grey, before
+  vs after, and recommends `revert` when any reads worse beyond the run's repeatability and the touch-up's own
+  tolerance. Light that moved where the curve commanded nothing is listed as `uncommanded_light` (evidence).
+  - `grayscale-wb:light-trend`: the light a node would carry that the nodes on both sides do not share (a tooth of
+    a sawtooth-light panel). `trend` commits only the shared light; there is no per-node option, by design.
+  - `grayscale-wb:node-outlier`: a node (or an adjacent pair) whose balance departs from the lines both sides
+    draw. `smooth` (recommended) makes the white balance a smooth trend through it - the display's own defect at
+    that code stays (it belongs to the base LUT) and the verify checks that code did what was predicted; `hold`
+    bridges its whole gain; `accept` keeps it; `abort` ends the run.
+  - The plan warns when the base cube is unknown and that the SDR GAMMA 2.4 switch is not reported: switch it off
+    for the run (the live edit holds it off; with it on the bake differs from what was tuned).
 - Never resume a rolled-back run; start a fresh one.
 - Never run your own enter/exit probe scripts while a run is paused. The capture belongs to the open session.
 

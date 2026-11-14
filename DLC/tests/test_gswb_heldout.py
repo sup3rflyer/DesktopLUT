@@ -82,6 +82,43 @@ def _sawtooth(seed: int = 1114) -> list[float]:
     return out[:1024]
 
 
+def _lerp(curve, t: float) -> float:
+    n = len(curve)
+    x = min(1.0, max(0.0, t)) * (n - 1)
+    i0 = int(math.floor(x))
+    i1 = min(i0 + 1, n - 1)
+    return curve[i0] + (curve[i1] - curve[i0]) * (x - i0)
+
+
+def _invert_curve(curve, size: int = 4096) -> list[float]:
+    """The inverse of a monotone curve on [0, 1], tabulated."""
+    out, j = [], 0
+    n = len(curve)
+    for k in range(size):
+        y = k / (size - 1)
+        while j < n - 2 and curve[j + 1] < y:
+            j += 1
+        a, b = curve[j], curve[j + 1]
+        f = 0.0 if b <= a else min(1.0, max(0.0, (y - a) / (b - a)))
+        out.append((j + f) / (n - 1))
+    return out
+
+
+def _lift_base(amp=(0.05, 0.06, 0.045)) -> dict[str, list[float]]:
+    """A base 1D LUT like the owner's around codes 129-180: it lifts the signal 4.5-6 % (per channel)
+    around signal 0.15 (code 153) and is identity elsewhere. Monotone."""
+    out = {}
+    for ch, a in zip("rgb", amp):
+        out[ch] = [t * (1.0 + a * math.exp(-((t - 0.15) / 0.05) ** 2)) for t in (j / 1023 for j in range(1024))]
+    return out
+
+
+def _install_base(ctrl, base, path: Path) -> None:
+    lines = ["LUT_1D_SIZE 1024"] + [f"{base['r'][j]:.8f} {base['g'][j]:.8f} {base['b'][j]:.8f}" for j in range(1024)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    ctrl.set_base_lut(0, "SDR", str(path), 0.0)
+
+
 def _cxx_channel(cg: dict, signal: float, ch: str) -> float:
     """src/mhc.cpp EvalGrayscaleSDR_Channel, transcribed: slot index = sqrt(signal)*(n-1), sqrt-domain
     linear interpolation of points[i]*deviation[i], squared."""
@@ -108,11 +145,18 @@ class _CurvePanel:
     # noise: +-0.03 % per XYZ component per read (uniform) — a good colorimeter on a bright grey, and
     # inside the DIP-less loop's 0.3 % settle / 0.4 % drift tolerances.
     def __init__(self, ctrl, *, wb=_RED_HEAVY, feature=None, noise: float = 0.0006, seed: int = 11,
-                 sawtooth: bool = False):
+                 sawtooth: bool = False, base=None, gamma24_bake: bool = False):
         self.ctrl = ctrl
         self.wb = wb
         self.feature = feature
         self.sawtooth = _sawtooth() if sawtooth else None
+        # The installed BASE 1D LUT (per channel, 1024 entries) and the panel it calibrates: the bake runs
+        # base -> fine-tune curve (src/mhc_icc.cpp ComposeMhcScanout), the panel shows base^-1(output)^2.2,
+        # so base + identity curve = the target. SDR GAMMA 2.4 reads the base at t^(2.4/2.2) in the BAKE
+        # only (the live edit holds it off).
+        self.base = base
+        self.gamma24_bake = gamma24_bake
+        self._inv = {ch: _invert_curve(base[ch]) for ch in "rgb"} if base is not None else None
         self.panel = SyntheticPanel(transfer=_SDR, start_temp=1.0, cold_blue_gain=1.0, noise=noise, seed=seed)
         self.calib = None
         self.reads: list[tuple[str, int, bool]] = []   # (phase, code, curve-is-identity)
@@ -134,9 +178,13 @@ class _CurvePanel:
                 abs(p - (i / (len(cg["points"]) - 1)) ** 2) < 1e-6 for i, p in enumerate(cg["points"]))
             self.reads.append((self.calib.runlog.phase, code, bool(ident)))
         sig = []
+        baked = bool(st.get("gs_committed")) and not st.get("gs_preview_active")
         for s, ch, k in zip(patch.signal, "rgb", self.light_gain(code)):
-            v = _cxx_channel(cg, s, ch) if on else s
-            sig.append(min(1.0, max(0.0, v * k ** (1.0 / 2.2))))
+            t = s ** (2.4 / 2.2) if (self.gamma24_bake and baked and s > 0) else s
+            v = _lerp(self.base[ch], t) if self.base is not None else t
+            out = _cxx_channel(cg, v, ch) if on else v
+            w = _lerp(self._inv[ch], out) if self._inv is not None else out
+            sig.append(min(1.0, max(0.0, w * k ** (1.0 / 2.2))))
         if self.sawtooth is not None:
             # light only, in the code the PANEL receives (the green drive: the luminance), same factor on
             # every channel — the teeth move with the curve's output, the chromaticity stays flat
@@ -168,9 +216,12 @@ def _controller() -> CalibrationController:
     return ctrl
 
 
-def _run(tmp_path: Path, name: str, *, feature, choices=None, sawtooth: bool = False):
+def _run(tmp_path: Path, name: str, *, feature, choices=None, sawtooth: bool = False, base=None,
+         gamma24_bake: bool = False):
     ctrl = _controller()
-    panel = _CurvePanel(ctrl, feature=feature, sawtooth=sawtooth)
+    if base is not None:
+        _install_base(ctrl, base, tmp_path / f"{name}_base.cube")
+    panel = _CurvePanel(ctrl, feature=feature, sawtooth=sawtooth, base=base, gamma24_bake=gamma24_bake)
     judge = _Judge(choices)
     ctx = create_run("SDR", display="synthetic", run_dir=tmp_path / name)
     calib = Calibration(ctx=ctx, profile=cp.Profile.synthetic(output_dir=str(tmp_path / "results")), monitor=0,
@@ -230,7 +281,9 @@ def test_preview_and_plan_report_the_held_out_greys_and_the_time():
     assert plan["stages"] == {"grayscale-wb": 32, "grayscale-wb-heldout": 24, "grayscale-wb-verify": 56}
     assert plan["held_out_greys"] == 24 and plan["total_patches"] == 112
     est = plan["time_estimate"]
-    assert est["held_out_minutes"] == pytest.approx(2 * 24 * 11.7 / 60, abs=0.05)
+    assert est["held_out_presentations"] == 2 * 24 + 8
+    assert est["held_out_minutes"] == pytest.approx((2 * 24 + 8) * 11.7 / 60, abs=0.05)
+    assert "one display" in est["basis"]
     assert est["minutes"][0] > est["without_held_out_minutes"][0]
 
 
@@ -238,48 +291,76 @@ def test_preview_and_plan_report_the_held_out_greys_and_the_time():
 # pure statistics
 # ---------------------------------------------------------------------------
 
-def test_node_outlier_flags_a_single_spike_and_not_its_neighbours():
-    n = 32
-    codes = [round(1023 * (i / 31) ** 2) for i in range(n)]
+def _devs(n=32, *, spike=None, pair=None, knee=None):
     base = {"r": 0.992, "g": 1.003, "b": 0.997}
     jitter = [0.0015 * math.sin(2.3 * i) for i in range(n)]
     devs = {ch: [1.0 if i < 8 else base[ch] * (1.0 + jitter[i] * (k + 1) / 3) for i in range(n)]
             for k, ch in enumerate("rgb")}
-    # tonight's node 12, composed (luminance x balance)
-    devs["r"][12], devs["g"][12], devs["b"][12] = 0.9776, 0.9596, 0.9770
-    out = find_node_outliers(devs, range(8, n), codes=codes, kind="sdr")
+    if spike is not None:     # tonight's node 12 balance (composed, light already shared): r +2.2, g -0.8, b +1.6 %
+        for ch, f in zip("rgb", (1.022, 0.992, 1.016)):
+            devs[ch][spike] *= f
+    if pair is not None:
+        for k in (pair, pair + 1):
+            for ch, f in zip("rgb", (1.022, 0.992, 1.016)):
+                devs[ch][k] *= f
+    if knee is not None:      # a smooth change of slope at node `knee`: red falls 0.6 % per node above it
+        for i in range(knee, n):
+            devs["r"][i] *= math.exp(-0.006 * (i - knee))
+    return devs
+
+
+_CODES = [round(1023 * (i / 31) ** 2) for i in range(32)]
+
+
+def test_node_outlier_flags_a_single_spike_with_its_numbers():
+    out = find_node_outliers(_devs(spike=12), range(8, 32), codes=_CODES, kind="sdr",
+                             materiality_de=0.6, light_exponent=[2.2] * 32)
     assert out["available"] is True
-    assert [f["index"] for f in out["flagged"]] == [12]
+    assert [f["nodes"] for f in out["flagged"]] == [[12]]
     f = out["flagged"][0]
     assert f["code"] == 153 and f["spreads_over_codes"] == [129, 180]
-    assert f["solved_vs_neighbours_pct"]["g"] < -3.0
-    held, detail = apply_node_holds({**identity_payload([c / 1023 for c in codes]),
-                                     "deviations": devs, "luminance": [1.0] * n,
-                                     "rgb": devs}, [12], kind="sdr")
+    assert f["solved_vs_neighbours_pct"]["r"][0] > 1.5 and f["hold_changes_grey_de"] >= 0.6
+    held, _detail = apply_node_holds({**identity_payload([c / 1023 for c in _CODES]), "deviations": _devs(spike=12),
+                                      "luminance": [1.0] * 32, "rgb": _devs(spike=12)}, [12], kind="sdr")
     for ch in "rgb":
-        assert held["deviations"][ch][12] == pytest.approx(f["neighbour_interpolation"][ch], rel=1e-5)
-    # a smooth curve (no spike) flags nothing
-    devs["r"][12], devs["g"][12], devs["b"][12] = base["r"], base["g"], base["b"]
-    assert find_node_outliers(devs, range(8, n), codes=codes, kind="sdr")["flagged"] == []
+        assert held["deviations"][ch][12] == pytest.approx(f["neighbour_interpolation"][ch][0], rel=1e-5)
+    assert find_node_outliers(_devs(), range(8, 32), codes=_CODES, kind="sdr")["flagged"] == []
 
 
-def test_regression_rule_uses_the_runs_own_repeatability():
-    cfg = GrayTouchupConfig()
-    ty = 2.0
-    good = [ty * 0.9505 / 1.0, ty, ty * 1.089]          # D65 at the target
+def test_two_adjacent_nodes_are_one_feature_not_a_node_and_its_echo():
+    out = find_node_outliers(_devs(pair=12), range(8, 32), codes=_CODES, kind="sdr",
+                             materiality_de=0.6, light_exponent=[2.2] * 32)
+    assert [f["nodes"] for f in out["flagged"]] == [[12, 13]]
+    f = out["flagged"][0]
+    assert f["neighbours"]["left"]["index"] == 11 and f["neighbours"]["right"]["index"] == 14
 
-    def scaled(k):
-        return [v * k for v in good]
 
-    pairs = [{"code": 100 + i, "target_Y": ty, "final_xyz": scaled(1.0 + 0.002 * ((-1) ** i)),
-              "verify_xyz": scaled(1.0 - 0.002 * ((-1) ** i))} for i in range(10)]
-    greys = [{"code": 50, "target_Y": ty, "before_xyz": scaled(1.005)},
-             {"code": 51, "target_Y": ty, "before_xyz": scaled(1.005)}]
-    out = judge_held_out(greys, {50: scaled(0.93), 51: scaled(1.004)}, pairs, config=cfg)
-    assert out["n_judged"] == 2 and out["regressed_codes"] == [50]
-    # without any repeatability estimate a grey is reported, never judged
-    out = judge_held_out(greys, {50: scaled(0.93), 51: scaled(1.004)}, pairs[:3], config=cfg)
-    assert out["available"] is False and all(g["judged"] is False for g in out["greys"])
+def test_a_smooth_knee_in_the_balance_is_not_a_narrow_feature():
+    """A real change of slope (red falling 0.6 % per node above node 16 - 5 % by the top, far more than
+    the 0.6 dE materiality): it sits on the line one side draws, so it is a trend, not a feature."""
+    devs = _devs(knee=16)
+    out = find_node_outliers(devs, range(8, 32), codes=_CODES, kind="sdr", materiality_de=0.6,
+                             light_exponent=[2.2] * 32)
+    assert out["flagged"] == [], out["flagged"]
+    from dlc.grayscale_wb import gain_change_de
+    assert gain_change_de({"r": devs["r"][31] / devs["r"][16], "g": 1.0, "b": 1.0}, light_exponent=2.2) >= 0.6
+
+
+def test_balance_smoothing_keeps_the_light_and_takes_the_line():
+    from dlc.grayscale_wb import apply_balance_smoothing, compose_payload
+    n = 32
+    lum = [1.0 + 0.001 * i for i in range(n)]
+    rgb = {ch: list(v) for ch, v in _devs(spike=12).items()}
+    pay = compose_payload([c / 1023 for c in _CODES], lum, rgb)
+    out, detail = apply_balance_smoothing(pay, [[12]])
+    assert out["luminance"][12] == lum[12]
+    for ch in "rgb":
+        line = math.exp(0.5 * (math.log(rgb[ch][11]) + math.log(rgb[ch][13])))
+        gm = (math.exp(0.5 * (math.log(rgb["r"][11]) + math.log(rgb["r"][13])))
+              * math.exp(0.5 * (math.log(rgb["g"][11]) + math.log(rgb["g"][13])))
+              * math.exp(0.5 * (math.log(rgb["b"][11]) + math.log(rgb["b"][13])))) ** (1 / 3)
+        assert out["rgb"][ch][12] == pytest.approx(line / gm, rel=1e-9)
+    assert detail["12"]["between_nodes"] == [11, 13]
 
 
 # ---------------------------------------------------------------------------
@@ -290,39 +371,32 @@ def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_pat
     calib, result, judge, _panel = _run(tmp_path, "feature_accept", feature=_FEATURE_RUN,
                                         choices={"grayscale-wb:node-outlier": "accept"})
     touch = _touch(calib)
-    # (a1) the LIGHT node 12 asked for (the feature's +light) is not shared by its neighbours: the
-    # light-trend seam takes it off the node (no isolated light step is committed)
+    # (a1) the LIGHT node 12 asked for (the feature's +light) is not shared by the nodes around it
     light = judge.request("grayscale-wb:light-trend")
     assert light is not None and light.recommendation == "trend" and light.options == ("trend", "abort")
     assert 12 in touch["light_trend"]["material"]
     row12 = next(r for r in touch["light_trend"]["nodes"] if r["index"] == 12)
-    assert row12["committed_pct"] * row12["need_pct"] >= 0 and abs(row12["committed_pct"]) <= abs(row12["need_pct"])
+    assert abs(row12["committed_pct"]) <= abs(row12["need_pct"]) and row12["committed_pct"] * row12["need_pct"] >= 0
     assert "node 12 (code 153)" in light.question
-    # (a2) what remains at node 12 is its BALANCE (the feature's green-side colour), still off its
-    # neighbours' trend: the node-outlier seam raises it with its numbers (size + direction per channel)
+    # (a2) what remains at node 12 is its BALANCE (the feature's green-side colour): the seam raises it
     seam = judge.request("grayscale-wb:node-outlier")
-    assert seam is not None and seam.recommendation == "hold"
-    assert seam.options == ("hold", "accept", "abort")
+    assert seam is not None and seam.recommendation == "smooth"
+    assert seam.options == ("smooth", "hold", "accept", "abort")
     flagged = touch["node_outliers"]["flagged"]
-    assert [f["index"] for f in flagged] == [12] and flagged[0]["code"] == 153
+    assert [f["nodes"] for f in flagged] == [[12]] and flagged[0]["code"] == 153
     f = flagged[0]
-    assert f["solved_vs_trend_pct"]["r"] > 1.0 and f["solved_vs_trend_pct"]["b"] > 0.5   # less green
-    assert f["solved_vs_trend_pct"]["g"] < 0.0
+    assert f["solved_vs_neighbours_pct"]["r"][0] > 1.0 and f["solved_vs_neighbours_pct"]["b"][0] > 0.5
     assert f["hold_changes_grey_de"] >= touch["target_de2000"]
-    assert {e["index"] for e in touch["node_outliers"]["echoes"]} <= {10, 11, 13, 14}
     assert "node 12 (code 153)" in seam.question and "spreads over codes 129-180" in seam.question
     assert "grayscale_wb_node_holds" not in calib.calib          # accepted as solved
-    # (b) the verify digest shows the between-node regression, before vs after per grey: the
-    # light is no longer smeared (the light trend), the colour is
+    # (b) the verify digest: the colour smear between the nodes, light untouched (it was not smeared)
     ho = _verify(calib)["gswb_held_out"]
     assert ho["available"] is True and ho["n_judged"] == 24
-    assert set(ho["regressed_codes"]) == {141, 166}, ho["worst"]
+    assert set(ho["chroma_regressed_codes"]) == {141, 166}, ho["worst"]
+    assert ho["light_regressed_codes"] == []
     for w in ho["worst"][:2]:
-        assert w["code"] in (141, 166) and w["regressed"]
-        assert w["after"]["de2000"] > w["before"]["de2000"] + w["threshold"]
-        assert abs(w["after"]["Y_err_pct"] - w["before"]["Y_err_pct"]) < 0.5
-        b, a = w["before"]["dxy"], w["after"]["dxy"]
-        assert math.hypot(*a) > 1.5 * math.hypot(*b)                         # the colour smear
+        assert w["code"] in (141, 166) and w["chroma"]["regressed"]
+        assert abs(w["light"]["change_pct"]) < 0.5
     # (c) the recommendation is revert - a recommendation: the judge's answer stands
     req = judge.request("verify:accept")
     assert req.recommendation == "revert" and req.digest["held_out_regressed"] is True
@@ -331,45 +405,45 @@ def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_pat
     assert result.status == "reverted"
 
 
-def test_narrow_feature_held_at_the_neighbours_is_judged_too(tmp_path: Path):
-    """'hold' (the seam's recommendation) puts node 12 on its neighbours' interpolation: the greys
-    around it are no longer damaged, but the feature's own code is left uncorrected - and here, with
-    the neighbours' white-balance correction on top of a green-side feature, it reads worse than before.
-    The held-out verify judges the held node like any un-fitted grey and says so (revert); whether a
-    9-code band ~1 dE worse is worth 24 better greys is the judge's call, not the code's."""
-    calib, result, judge, _panel = _run(tmp_path, "feature_hold", feature=_FEATURE_RUN)
+@pytest.mark.parametrize("choice", ["smooth", "hold"])
+def test_narrow_feature_smoothed_or_held_is_judged_against_its_prediction_and_applies(tmp_path: Path, choice):
+    """The owner's outcome ('smooth', recommended) or 'hold': the greys around node 12 are no longer damaged,
+    and code 153 itself - its own defect now uncorrected - does what was PREDICTED; the verify recommends
+    apply and says the defect is left for the base LUT."""
+    calib, result, judge, _panel = _run(tmp_path, f"feature_{choice}", feature=_FEATURE_RUN,
+                                        choices={"grayscale-wb:node-outlier": choice})
     holds = calib.calib["grayscale_wb_node_holds"]
-    assert holds["applied"] is True and holds["nodes"] == [12]
-    baked = calib.calib["grayscale_wb_touchup"]          # what was committed (the revert put the prior back)
-    for ch in "rgb":   # node 12 is its neighbours' interpolation, not the solved spike
-        assert baked["deviations"][ch][12] == pytest.approx(holds["detail"]["12"]["to"][ch], rel=1e-5)
-        assert holds["solved_payload"]["deviations"][ch][12] != pytest.approx(baked["deviations"][ch][12], rel=1e-3)
-    ho = _verify(calib)["gswb_held_out"]
-    by_code = {g["code"]: g for g in ho["greys"]}
-    assert not by_code[141]["regressed"] and not by_code[166]["regressed"]
-    assert by_code[141]["after"]["de2000"] < by_code[141]["before"]["de2000"]
-    assert by_code[153]["kind"] == "held_node" and by_code[153]["judged"]
-    assert ho["regressed_codes"] == [153]
-    req = judge.request("verify:accept")
-    assert req.recommendation == "revert" and "held node" in req.question
-    assert result.status == "reverted"
-
-
-def test_spot_read_amplitude_is_flagged_and_its_smear_judged_against_the_white_balance_gain(tmp_path: Path):
-    """At the owner's spot-read amplitude (+2.2 %) node 12's light is still taken off the node and its
-    balance still flagged at the seam, but the small colour smear left between the nodes is smaller
-    than the white-balance error the touch-up removes there: every grey between the nodes reads
-    BETTER than before, so the recommendation stays apply. The verdict follows the measurement, not
-    the flag."""
-    calib, result, judge, _panel = _run(tmp_path, "feature_spot", feature=_FEATURE_SPOT,
-                                        choices={"grayscale-wb:node-outlier": "accept"})
-    assert 12 in _touch(calib)["light_trend"]["changed"]
-    assert [f["index"] for f in _touch(calib)["node_outliers"]["flagged"]] == [12]
+    assert holds["applied"] is True and holds["nodes"] == [12] and holds["mode"] == choice
+    baked = calib.calib["grayscale_wb_touchup"]
+    if choice == "smooth":
+        assert baked["luminance"][12] == pytest.approx(holds["solved_payload"]["luminance"][12])   # light kept
+        for ch in "rgb":
+            assert baked["rgb"][ch][12] == pytest.approx(holds["detail"]["12"]["to"][ch], rel=1e-5)
     ho = _verify(calib)["gswb_held_out"]
     assert ho["n_regressed"] == 0, ho["worst"]
     by_code = {g["code"]: g for g in ho["greys"]}
-    assert abs(by_code[141]["after"]["Y_err_pct"] - by_code[141]["before"]["Y_err_pct"]) < 0.5  # no light smear
-    assert by_code[141]["after"]["de2000"] < by_code[141]["before"]["de2000"]               # net better
+    assert by_code[141]["after"]["de2000"] < by_code[141]["before"]["de2000"]
+    pred = {p["code"]: p for p in ho["predicted"]}
+    assert pred[153]["as_predicted"] is True and pred[153]["kind"].endswith("_node")
+    assert "code(s) 153 is left uncorrected" in ho["defect_left_uncorrected"]
+    req = judge.request("verify:accept")
+    assert req.recommendation == "apply"
+    assert "did what was predicted" in req.question and "left uncorrected" in req.question
+    assert result.status == "completed"
+
+
+def test_spot_read_amplitude_is_flagged_and_its_smear_judged_against_the_white_balance_gain(tmp_path: Path):
+    """At the owner's spot-read amplitude (+2.2 %) node 12 is still flagged, but the small colour smear
+    left between the nodes is inside the touch-up's own tolerance while the white-balance error it removes
+    there is not: the recommendation stays apply. The verdict follows the measurement, not the flag."""
+    calib, result, judge, _panel = _run(tmp_path, "feature_spot", feature=_FEATURE_SPOT,
+                                        choices={"grayscale-wb:node-outlier": "accept"})
+    assert [f["nodes"] for f in _touch(calib)["node_outliers"]["flagged"]] == [[12]]
+    ho = _verify(calib)["gswb_held_out"]
+    assert ho["n_regressed"] == 0, ho["worst"]
+    by_code = {g["code"]: g for g in ho["greys"]}
+    assert abs(by_code[141]["light"]["change_pct"]) < 0.5                                # no light smear
+    assert by_code[141]["after"]["de2000"] < by_code[141]["before"]["de2000"]            # net better
     assert judge.request("verify:accept").recommendation == "apply"
     assert result.status == "completed"
 
@@ -377,9 +451,11 @@ def test_spot_read_amplitude_is_flagged_and_its_smear_judged_against_the_white_b
 def test_plain_white_balance_error_passes_with_apply(tmp_path: Path):
     calib, result, judge, _panel = _run(tmp_path, "plain", feature=None)
     assert judge.request("grayscale-wb:node-outlier") is None
+    assert judge.request("grayscale-wb:light-trend") is None       # no light move a read could see
     assert _touch(calib)["node_outliers"]["flagged"] == []
     ho = _verify(calib)["gswb_held_out"]
     assert ho["available"] is True and ho["n_judged"] == 24 and ho["n_regressed"] == 0, ho["worst"]
+    assert ho["bracket"]["used"] is True and ho["bracket"]["n"] == 8
     # the touch-up made the greys between the nodes better, not just the nodes
     improved = [g for g in ho["greys"] if g.get("judged") and g["after"]["de2000"] < g["before"]["de2000"]]
     assert len(improved) == ho["n_judged"]
@@ -392,6 +468,39 @@ def test_plain_white_balance_error_passes_with_apply(tmp_path: Path):
     assert "24 held-out greys" in plan.question and "min" in plan.question
     assert plan.digest["patch_plan"]["stages"]["grayscale-wb-heldout"] == 24
     assert plan.digest["patch_plan"]["time_estimate"]["held_out_minutes"] > 0
+    # no base cube on this mock MHC and GAMMA 2.4 unreported: the plan says so
+    assert "no base 1D cube" in plan.question and "GAMMA 2.4" in plan.question
+    # every held-out before-read took at least two reads (its own repeatability)
+    assert all(len(g.get("before_reads") or ()) >= 2 for g in _touch(calib)["held_out"]["greys"])
+
+
+def test_held_out_greys_sit_at_the_curve_mid_positions_through_the_base(tmp_path: Path):
+    """Review item 4: the curve runs on the BASE 1D LUT's output. With a base that lifts the signal ~5 %
+    around code 153 the patch codes land 0.3 of a slot off; the held-out greys are placed at the TRUE
+    mid-positions, and the digest reports where the node patches really land."""
+    from dlc.grayscale_wb import base_positions
+    base = _lift_base()
+    calib, result, judge, _panel = _run(tmp_path, "based", feature=None, base=base)
+    touch = _touch(calib)
+    ho = touch["held_out"]
+    assert ho["base"]["available"] is True
+    plain = {p[0] for p in build_grayscale_wb_heldout_set(PatchSizes(), _SDR)}
+    assert set(ho["codes"]) != plain                                   # placed through the base, not code/cap
+    nodes = [p[0] for p in build_grayscale_wb_set(PatchSizes(), _SDR)]
+    for code in ho["codes"]:
+        u = base_positions(code, max_cv=1023, cap=1023, n=32, kind="sdr", base=base)
+        i = math.floor(u["g"])
+        assert max(abs(v - (i + 0.5)) for v in u.values()) < 0.06, (code, u)
+    pos = ho["node_positions"]
+    assert pos["base_available"] and abs(pos["max_offset_slots"]) > 0.25 and pos["max_offset_node"] in (11, 12, 13)
+    assert set(_verify(calib)["gswb_held_out"]["base"]) >= {"available", "source"}
+    assert judge.request("verify:accept").recommendation == "apply"
+    assert result.status == "completed"
+    # with SDR GAMMA 2.4 baked the same codes would sit near the slots (u off the midpoints)
+    near = [max(abs(v - (math.floor(v) + 0.5)) for v in base_positions(c, max_cv=1023, cap=1023, n=32, kind="sdr",
+                                                                        base=base, gamma24=True).values())
+            for c in ho["codes"]]
+    assert max(near) > 0.25
 
 
 def test_sawtooth_light_is_left_alone_and_the_white_balance_still_fixed(tmp_path: Path):
