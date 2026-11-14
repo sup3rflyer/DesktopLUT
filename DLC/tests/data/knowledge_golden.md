@@ -19,7 +19,7 @@ What DLC knows about this physical display: read this BEFORE judging an anomaly 
 
 ### F-0001 — Full-field grey light is a sawtooth in the code
 
-**measured** · seen 2× (2 independent) · last confirmed 2026-11-14 · rev 1
+**measured** · seen 2× · 2 independent confirming session(s) · last confirmed 2026-11-14 · rev 1
 
 Can explain an observation: yes (still only evidence; never a gate)
 
@@ -35,10 +35,10 @@ Scope:
 Signature: `code_structure` {domain: sdr_drive_code10, code_range: [118, 190], quantity: light, max_abs_dev_pct: 4.43, period_codes: [4, 12], chroma_dxy_max: 0.001}
 Facet `grey_light_structure` (read by base 1D LUT build, grayscale-wb (stage S4)): {mode: SDR, stimulus_area_pct: 100, code_range: [118, 190], max_abs_dev_pct: 4.43, balance: flat}
 
-| obs | date | verdict | ind. | by | source | numbers |
-|---|---|---|---|---|---|---|
-| O1 | 2026-11-14 | establishes | yes | llm:test | dense read: `evidence/dense.json` (sha256 ef2e393ef100…, file) | {teeth_pct: [2, 4], max_dev_pct: 4.43} |
-| O2 | 2026-09-25 | consistent | yes | llm:test | raw ramp: `an older run, file not kept` (no evidence file) | {loo_light_structure_pct: 0.92, ratio_to_g22: {132: 0.88, 165: 0.874}} |
+| obs | date | verdict | counts | session / run | by | source | numbers |
+|---|---|---|---|---|---|---|---|
+| O1 | 2026-11-14 | establishes | confirms | — | llm:test | dense read: `evidence/dense.json` (sha256 ef2e393ef100…, file) | {teeth_pct: [2, 4], max_dev_pct: 4.43} |
+| O2 | 2026-09-25 | matches | confirms | — | llm:test | raw ramp: `an older run, file not kept` (no evidence file) | {loo_light_structure_pct: 0.92, ratio_to_g22: {132: 0.88, 165: 0.874}} |
 
 - Implication for grayscale-wb: Correct light as a trend, balance per grey.
 - Link: mechanism_hypothesis H-0001
@@ -46,9 +46,9 @@ Facet `grey_light_structure` (read by base 1D LUT build, grayscale-wb (stage S4)
 
 ### H-0001 — Hypothesis: the backlight steps for a full-field grey
 
-**hypothesis** · seen 0× (0 independent) · last confirmed — · rev 1
+**hypothesis** · seen 0× · 0 independent confirming session(s) · last confirmed — · rev 1
 
-Can explain an observation: no — status hypothesis; 0 independent observation(s), 2 needed; no signature
+Can explain an observation: no — status hypothesis; 0 independent confirming session(s), 2 needed; no signature
 
 Proposed mechanism for F-0001: the local dimming sets the backlight in steps.
 
@@ -69,9 +69,9 @@ Signature: `none`
 
 ### E-0001 — An evening with a flat HDR peak
 
-**hypothesis** · **not explained** · seen 0× (0 independent) · last confirmed — · rev 1
+**hypothesis** · **not explained** · seen 0× · 0 independent confirming session(s) · last confirmed — · rev 1
 
-Can explain an observation: no — status hypothesis; 0 independent observation(s), 2 needed
+Can explain an observation: no — status hypothesis; 0 independent confirming session(s), 2 needed
 
 One evening the full stack read a flat 1469 nit full field; not reproduced two days later.
 
@@ -87,9 +87,9 @@ Signature: `luminance_cap` {level_nits: [1360, 1476]}
 
 ### R-0001 — The meter drifts warm
 
-**refuted** · seen 0× (0 independent) · last confirmed — · rev 2
+**refuted** · seen 0× · 0 independent confirming session(s) · last confirmed — · rev 2
 
-Can explain an observation: no — status refuted; 0 independent observation(s), 2 needed; no signature
+Can explain an observation: no — status refuted; 0 independent confirming session(s), 2 needed; no signature
 
 The colorimeter's own reading drifts as it warms up on the panel.
 

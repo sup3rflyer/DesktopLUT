@@ -48,7 +48,7 @@ def _measured(ev: Path, **kw) -> dict:
              {"date": "2026-11-14", "verdict": "establishes", "independent": True,
               "source": {"kind": "dense read", "path": str(ev)},
               "numbers": {"teeth_pct": [2, 4], "max_dev_pct": 4.43}},
-             {"date": "2026-09-25", "verdict": "consistent", "independent": True,
+             {"date": "2026-09-25", "verdict": "matches", "independent": True,
               "source": {"kind": "raw ramp", "ref": "an older run, file not kept"},
               "numbers": {"loo_light_structure_pct": 0.92, "ratio_to_g22": {"132": 0.88, "165": 0.874}}}],
          "signature": {"type": "code_structure", "domain": "sdr_drive_code10", "code_range": [118, 190],
@@ -359,7 +359,7 @@ def test_rollup_folds_only_matching_observations_and_keeps_contradictions(tmp_pa
     for i in range(50):
         verdict = "contradicts" if i % 10 == 3 else ("refines" if i % 10 == 7 else "matches")
         ops.append({"op": "add_observation", "by": "flow:test", "why": "re-observed", "id": "F-0001",
-                    "observation": {"date": f"2026-12-{1 + i % 28:02d}", "verdict": verdict, "independent": i % 2 == 0,
+                    "observation": {"date": f"2026-12-{1 + i % 28:02d}", "verdict": verdict, "independent": False,
                                     "source": {"kind": "probe", "path": str(ev)},
                                     "numbers": {"max_dev_pct": 3.0 + i / 100, "teeth_pct": [2, 4 + i / 100]}}})
     doc = store.apply_ops(_uid(), ops, today=TODAY)
@@ -384,7 +384,7 @@ def test_nothing_foldable_keeps_everything(tmp_path: Path, ev: Path):
     store = _store(tmp_path)
     _create(store, [_measured(ev), _hyp()])
     ops = [{"op": "add_observation", "by": BY, "why": "x", "id": "F-0001",
-            "observation": {"verdict": "contradicts", "independent": True, "source": {"kind": "p", "ref": "r"},
+            "observation": {"verdict": "contradicts", "independent": False, "source": {"kind": "p", "ref": "r"},
                             "numbers": {"dev": 7.6}}} for _ in range(45)]
     doc = store.apply_ops(_uid(), ops, today=TODAY)
     f1 = doc["entries"][0]
@@ -408,7 +408,70 @@ def test_explain_eligibility_and_unconfirmed_after_a_unit_event(tmp_path: Path, 
     assert entry_state(doc, doc["entries"][0], "2027-07-01")["unconfirmed_why"][-1].startswith("not re-observed")
     single = _measured(ev, links=[], observations=[_measured(ev)["observations"][0]])
     assert entry_state({"unit_events": []}, {**single, "last_confirmed": TODAY},
-                       TODAY)["cannot_explain_why"] == ["1 independent observation(s), 2 needed"]
+                       TODAY)["cannot_explain_why"] == ["1 independent confirming session(s), 2 needed"]
+
+
+def _obs(verdict: str, date: str, **kw) -> dict:
+    path = kw.pop("path", None)
+    src = {"kind": "probe", "path": str(path)} if path else {"kind": "probe", "ref": kw.pop("ref", "r")}
+    kw.pop("ref", None)
+    return {"date": date, "verdict": verdict, "independent": kw.pop("independent", False),
+            "source": src, "numbers": {"max_dev_pct": 3.0}, **kw}
+
+
+def test_only_establishing_and_matching_observations_confirm(tmp_path: Path, ev: Path):
+    """Review fix 3: 'consistent', 'refines', 'inconclusive' and 'contradicts' never count toward excuse power."""
+    store = _store(tmp_path)
+    m = _measured(ev, links=[], observations=[_measured(ev)["observations"][0]])
+    _create(store, [m])
+    ops = [{"op": "add_observation", "by": BY, "why": "x", "id": "F-0001", "observation": _obs(v, d, independent=True)}
+           for v, d in (("consistent", "2026-11-01"), ("refines", "2026-11-02"), ("inconclusive", "2026-11-03"))]
+    doc = store.apply_ops(_uid(), ops, today=TODAY)
+    st = entry_state(doc, doc["entries"][0], TODAY)
+    assert st["independent"] == 1 and not st["can_explain"]
+    assert doc["entries"][0]["last_confirmed"] == "2026-11-14"     # only confirming verdicts move it
+
+
+def test_a_newer_contradiction_switches_excuse_power_off_until_resolved(tmp_path: Path, ev: Path):
+    store = _store(tmp_path)
+    _create(store, [_measured(ev, links=[])])
+    doc = store.load(_uid())
+    assert entry_state(doc, doc["entries"][0], TODAY)["can_explain"] is True
+    doc = store.apply_ops(_uid(), [{"op": "add_observation", "by": BY, "why": "x", "id": "F-0001",
+                                    "observation": _obs("contradicts", "2026-11-20", independent=True)}], today=TODAY)
+    st = entry_state(doc, doc["entries"][0], "2026-11-21")
+    assert not st["can_explain"] and st["contradicted_by"] == "O3"
+    assert any("contradicted by O3" in w for w in st["cannot_explain_why"])
+    # an older contradiction than the last confirmation does not switch it off
+    doc = store.apply_ops(_uid(), [{"op": "add_observation", "by": BY, "why": "x", "id": "F-0001",
+                                    "observation": _obs("matches", "2026-11-22", independent=True)}], today=TODAY)
+    assert entry_state(doc, doc["entries"][0], "2026-11-23")["can_explain"] is True
+
+
+def test_independence_is_derived_from_session_and_run_not_believed(tmp_path: Path, ev: Path):
+    store = _store(tmp_path)
+    one = _measured(ev, links=[], observations=[
+        _obs("establishes", "2026-11-14", path=ev, ref="a", run="runs/probes/20261114_071452_full_stack_spots_x"),
+        _obs("matches", "2026-11-14", ref="b", run="runs/probes/20261114_124156_full_stack_spots_y")])
+    # same date, no session labels: ONE session, whatever the flags say
+    doc = _create(store, [one])
+    assert entry_state(doc, doc["entries"][0], TODAY)["independent"] == 1
+    # a claim of independence from the same session is refused
+    bad = _measured(ev, links=[], observations=[_obs("establishes", "2026-11-14", path=ev, independent=True),
+                                                _obs("matches", "2026-11-14", independent=True)])
+    with pytest.raises(KnowledgeError, match="shares the session or the run of O1"):
+        _create(_store(tmp_path / "b"), [bad])
+    # session labels (the meter was re-placed) make two sessions on one day; one run is one session whatever its labels
+    two = _measured(ev, links=[], observations=[
+        _obs("establishes", "2026-11-14", path=ev, independent=True, session="meter placed before 07:15"),
+        _obs("matches", "2026-11-14", independent=True, session="meter re-placed 11:39")])
+    doc = _create(_store(tmp_path / "c"), [two])
+    assert entry_state(doc, doc["entries"][0], TODAY)["independent"] == 2
+    same_run = _measured(ev, links=[], observations=[
+        _obs("establishes", "2026-11-14", path=ev, session="a", run="20261114_045100_904510_hdr_x"),
+        _obs("matches", "2026-11-15", session="b", run="20261114_045100_904510_hdr_x")])
+    doc = _create(_store(tmp_path / "d"), [same_run])
+    assert entry_state(doc, doc["entries"][0], TODAY)["independent"] == 1
 
 
 # ----------------------------------------------------------------------------- the store: corrupt, CAS, lock

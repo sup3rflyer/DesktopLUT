@@ -27,7 +27,11 @@ Rules this module enforces (the validator names every violation; nothing is writ
   hypothesis.
 
 Excuse power is never a gate: whether an entry may *explain* an observation (``entry_state(...)["can_explain"]``)
-is evidence for the overseeing LLM, nothing here changes a recommendation. Stdlib only, like ``dip.py``.
+is evidence for the overseeing LLM, nothing here changes a recommendation. It needs status measured, a signature,
+no unit event or age since the last confirmation, no ``contradicts`` observation newer than the last confirming
+one, and at least two independent CONFIRMING sessions: only ``establishes`` / ``matches`` confirm (``consistent``
+= does not contradict, did not resolve the property), and independence is derived, not believed — observations
+sharing a session (date + ``session`` label) or a run folder are one. Stdlib only, like ``dip.py``.
 
 CLI: ``python -m dlc.knowledge show | add | amend | add-observation | set-status | match | validate | render``.
 """
@@ -67,7 +71,11 @@ STATUSES = ("measured", "inferred", "hypothesis", "refuted", "superseded")
 ACTIVE_STATUSES = ("measured", "inferred", "hypothesis")
 VERDICTS = ("establishes", "consistent", "matches", "contradicts", "refines", "inconclusive")
 FOLDABLE_VERDICTS = ("matches", "consistent")
-CONFIRMING_VERDICTS = ("establishes", "consistent", "matches", "refines")
+# Verdicts that CONFIRM the property (count toward excuse power and move last_confirmed). Review ruling 2026-11-14:
+# 'consistent' does NOT count — it means "does not contradict, did not resolve the property" (the coarse-ramp case);
+# 'refines' adds detail to a property another observation established and does not count on its own either.
+CONFIRMING_VERDICTS = ("establishes", "matches")
+SESSION_MAX = 120
 MODES = ("SDR", "HDR", "ACM")
 DOMAINS = ("sdr_drive_code8", "sdr_drive_code10", "sdr_link_code10", "hdr_drive_code10", "hdr_link_code10", "nits")
 TRANSFERABLE = ("no", "candidate")
@@ -119,10 +127,11 @@ SCOPE_KEYS = frozenset({"mode", "domain", "code_range", "level_nits", "stimulus"
                         "stack", "thermal", "instrument", "link_bpc", "unknown"})
 STIMULUS_KEYS = frozenset({"pattern", "area_pct"})
 STATUS_HISTORY_KEYS = frozenset({"status", "date", "by", "why"})
-OBS_KEYS = frozenset({"id", "date", "by", "verdict", "source", "conditions", "numbers", "independent", "note"})
+OBS_KEYS = frozenset({"id", "date", "by", "verdict", "source", "conditions", "numbers", "independent", "session",
+                      "run", "note"})
 OBS_INPUT_KEYS = OBS_KEYS - {"id"}
 SOURCE_KEYS = frozenset({"kind", "path", "sha256", "hash_of", "ref"})
-ROLLUP_KEYS = frozenset({"count", "independent", "first", "last", "folded_ids", "verdicts", "numbers"})
+ROLLUP_KEYS = frozenset({"count", "independent", "first", "last", "folded_ids", "verdicts", "numbers", "sessions"})
 IMPLICATION_KEYS = frozenset({"flows", "text"})
 QUESTION_KEYS = frozenset({"id", "q", "test", "owner_action", "status", "answer", "closed", "closed_by"})
 LINK_KEYS = frozenset({"rel", "id", "field"})
@@ -141,6 +150,7 @@ _BY_RE = re.compile(r"^(owner(:.{1,60})?|flow:[A-Za-z0-9_.:-]{1,60}|llm:.{1,80})
 _UNIT_ID_RE = re.compile(r"^[A-Za-z0-9._~-]{3,80}$")
 _SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 _NUMKEY_RE = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)$")
+_RUN_RE = re.compile(r"(?<![0-9])(\d{8}_\d{6})(?:_\d+)?_[A-Za-z0-9]")
 
 
 class KnowledgeError(ValueError):
@@ -474,6 +484,10 @@ def _check_observation(o: Any, where: str, out: list[str]) -> None:
     _check_numbers(o.get("numbers"), f"{where}.numbers", out)
     if not isinstance(o.get("independent"), bool):
         out.append(f"{where}.independent: true only for a different run AND session (day or re-placed meter)")
+    if "session" in o:
+        _check_text(o["session"], f"{where}.session", out, max_len=SESSION_MAX)
+    if "run" in o and not (isinstance(o["run"], str) and _RUN_RE.search(o["run"])):
+        out.append(f"{where}.run: a DLC run id or folder (YYYYMMDD_HHMMSS_...)")
     if "conditions" in o and (not isinstance(o["conditions"], dict) or not all(
             isinstance(v, (str, int, float, bool)) for v in o["conditions"].values())):
         out.append(f"{where}.conditions: an object of scalars")
@@ -554,9 +568,23 @@ def validate_entry(e: Any, where: str = "entry") -> list[str]:
     for i, o in enumerate(obs):
         _check_observation(o, f"{where}.observations[{i}]", out)
         oid = o.get("id") if isinstance(o, dict) else None
+        if not isinstance(oid, str):
+            continue
         if oid in seen_o:
             out.append(f"{where}.observations[{i}].id: {oid} used twice")
         seen_o.add(oid)
+    # 'independent' is checked, not believed (review fix 3): a claim of independence for an observation from the
+    # session or the run of an earlier one is refused
+    good = [o for o in obs if isinstance(o, dict)]
+    for i, o in enumerate(good):
+        if o.get("independent") is not True:
+            continue
+        s, r = observation_session(o), observation_run(o)
+        for p in good[:i]:
+            if observation_session(p) == s or (r is not None and observation_run(p) == r):
+                out.append(f"{where}.observations[{o.get('id')}].independent: claimed, but it shares the session or "
+                           f"the run of {p.get('id')} (give a 'session' label when the meter was re-placed)")
+                break
     roll = e.get("rollup")
     if roll is not None:
         if not isinstance(roll, dict):
@@ -876,10 +904,14 @@ def entry_state(doc: dict, e: dict, today: Optional[str] = None,
     ``can_explain`` + why not (status measured, >= 2 independent observations, not unconfirmed). Excuse power is
     evidence for the LLM, never a gate."""
     t = _parse(today or today_iso()) or _dt.date.today()
-    obs = e.get("observations") or []
+    obs = [o for o in e.get("observations") or [] if isinstance(o, dict)]
     roll = e.get("rollup") or {}
     n_obs = len(obs) + int(roll.get("count") or 0)
-    n_ind = sum(1 for o in obs if o.get("independent")) + int(roll.get("independent") or 0)
+    # Review fix 3: confirmations are COUNTED, not believed. Only establishing / matching observations confirm; the
+    # 'independent' flag is not trusted: observations sharing a session (date + session label) or a run folder are
+    # one, and the count is the number of such distinct groups (folded ones included through the rollup's keys).
+    n_ind = confirming_sessions(e)
+    contra = _open_contradiction(obs)
     reasons: list[str] = []
     last = _parse(e.get("last_confirmed"))
     for ev in doc.get("unit_events") or []:
@@ -897,13 +929,79 @@ def entry_state(doc: dict, e: dict, today: Optional[str] = None,
     if e.get("status") != "measured":
         why_not.append(f"status {e.get('status')}")
     if n_ind < 2:
-        why_not.append(f"{n_ind} independent observation(s), 2 needed")
+        why_not.append(f"{n_ind} independent confirming session(s), 2 needed")
+    if contra is not None:
+        why_not.append(f"contradicted by {contra['id']} ({contra.get('date')}) after the last confirmation: refute, "
+                       f"narrow the scope or re-observe")
     if unconfirmed:
         why_not.append("unconfirmed")
     if (e.get("signature") or {}).get("type") in (None, "none"):
         why_not.append("no signature")
     return {"observations": n_obs, "independent": n_ind, "unconfirmed": unconfirmed, "unconfirmed_why": reasons,
+            "contradicted_by": contra.get("id") if contra else None,
             "dormant": dormant, "can_explain": not why_not, "cannot_explain_why": why_not}
+
+
+def observation_run(o: dict) -> Optional[str]:
+    """The DLC run an observation comes from: its ``run`` field, else the run-id stamp in its evidence path."""
+    for text in (o.get("run"), (o.get("source") or {}).get("path") if isinstance(o.get("source"), dict) else None):
+        if isinstance(text, str):
+            m = _RUN_RE.search(text.replace("\\", "/"))
+            if m:
+                return m.group(1)
+    return None
+
+
+def observation_session(o: dict) -> str:
+    """The session an observation belongs to: ``<date>`` plus its ``session`` label (meter placement, sitting) when
+    one is given. Two observations with the same date and no labels are one session (the conservative reading)."""
+    label = o.get("session")
+    return f"{o.get('date')}|{label}" if isinstance(label, str) and label.strip() else str(o.get("date"))
+
+
+def _session_groups(keys: list[tuple[str, Optional[str]]]) -> int:
+    """Distinct groups when items sharing a session key OR a run are the same group (union-find)."""
+    parent = list(range(len(keys)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(keys)):
+        for j in range(i):
+            if keys[i][0] == keys[j][0] or (keys[i][1] is not None and keys[i][1] == keys[j][1]):
+                parent[find(i)] = find(j)
+    return len({find(i) for i in range(len(keys))})
+
+
+def confirming_sessions(e: dict) -> int:
+    obs = [o for o in e.get("observations") or [] if isinstance(o, dict)
+           and o.get("verdict") in CONFIRMING_VERDICTS]
+    keys = [(observation_session(o), observation_run(o)) for o in obs]
+    roll = e.get("rollup") or {}
+    for pair in roll.get("sessions") or []:            # folded confirming observations: [session, run or null]
+        if isinstance(pair, list) and len(pair) == 2:
+            keys.append((str(pair[0]), pair[1] if isinstance(pair[1], str) else None))
+    return _session_groups(keys)
+
+
+def _order_key(i_o: tuple[int, dict]) -> tuple[str, int]:
+    return (str(i_o[1].get("date")), i_o[0])
+
+
+def _open_contradiction(obs: list[dict]) -> Optional[dict]:
+    """The latest ``contradicts`` observation when it is newer (date, then order) than the latest confirming one."""
+    idx = list(enumerate(obs))
+    contra = [x for x in idx if x[1].get("verdict") == "contradicts"]
+    if not contra:
+        return None
+    last_c = max(contra, key=_order_key)
+    conf = [x for x in idx if x[1].get("verdict") in CONFIRMING_VERDICTS]
+    if conf and _order_key(max(conf, key=_order_key)) > _order_key(last_c):
+        return None
+    return last_c[1]
 
 
 # ----------------------------------------------------------------------------- ops
@@ -923,6 +1021,11 @@ def _fold(e: dict) -> None:
         r["last"] = max(r["last"], o["date"])
         r["folded_ids"].append(o["id"])
         r["verdicts"][o["verdict"]] = r["verdicts"].get(o["verdict"], 0) + 1
+        if o.get("verdict") in CONFIRMING_VERDICTS:
+            pair = [observation_session(o), observation_run(o)]
+            sessions = r.setdefault("sessions", [])
+            if pair not in sessions:
+                sessions.append(pair)
         for k, v in (o.get("numbers") or {}).items():
             if _is_num(v):
                 lo, hi = v, v
@@ -987,7 +1090,8 @@ def _add_obs(e: dict, obs_in: dict, *, by: str, base_dir: Optional[Path], defaul
     return o
 
 
-_OBS_ORDER = ["id", "date", "by", "verdict", "independent", "source", "conditions", "numbers", "note"]
+_OBS_ORDER = ["id", "date", "by", "verdict", "independent", "session", "run", "source", "conditions", "numbers",
+              "note"]
 _ENTRY_ORDER = ["id", "kind", "title", "statement", "scope", "status", "explained", "status_history",
                 "observations", "rollup", "signature", "facets", "implications", "open_questions", "links",
                 "transferable", "created", "last_confirmed", "rev", "revisions"]
@@ -1518,7 +1622,7 @@ def _entry_md(doc: dict, e: dict, today: str) -> list[str]:
         status += " · **UNCONFIRMED** (" + "; ".join(st["unconfirmed_why"]) + ")"
     if st["dormant"]:
         status += " · dormant"
-    status += (f" · seen {st['observations']}× ({st['independent']} independent)"
+    status += (f" · seen {st['observations']}× · {st['independent']} independent confirming session(s)"
                f" · last confirmed {e.get('last_confirmed') or '—'} · rev {e.get('rev')}")
     lines.append(status)
     lines.append("")
@@ -1538,22 +1642,25 @@ def _entry_md(doc: dict, e: dict, today: str) -> list[str]:
     lines.append("")
     obs = e.get("observations") or []
     if obs or e.get("rollup"):
-        lines.append("| obs | date | verdict | ind. | by | source | numbers |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| obs | date | verdict | counts | session / run | by | source | numbers |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for o in obs:
+            counts = "confirms" if o.get("verdict") in CONFIRMING_VERDICTS else "no"
+            sess = (o.get("session") or "—") + (f" / {observation_run(o)}" if observation_run(o) else "")
             src = o.get("source") or {}
             where = src.get("path") or src.get("ref") or ""
             sha = f" (sha256 {src['sha256'][:12]}…, {src.get('hash_of')})" if src.get("sha256") else \
                 " (no evidence file)"
             cond = f"; conditions {_fmt(o['conditions'])}" if o.get("conditions") else ""
             note = f"; {o['note']}" if o.get("note") else ""
-            lines.append(f"| {o['id']} | {o['date']} | {o['verdict']} | {'yes' if o.get('independent') else 'no'} "
+            lines.append(f"| {o['id']} | {o['date']} | {o['verdict']} | {counts} | {_md_cell(sess)} "
                          f"| {_md_cell(o.get('by', ''))} | {_md_cell(src.get('kind', ''))}: `{_md_cell(where)}`"
                          f"{sha} | {_md_cell(_fmt(o.get('numbers') or {}) + cond + note)} |")
         r = e.get("rollup")
         if r:
             lines.append(f"| rollup | {r['first']} … {r['last']} | {_fmt(r.get('verdicts') or {})} | "
-                         f"{r.get('independent', 0)} | | {r['count']} folded observations | "
+                         f"{len(r.get('sessions') or [])} confirming session key(s) | | | {r['count']} folded "
+                         f"observations | "
                          f"{_md_cell(_fmt(r.get('numbers') or {}))} |")
         lines.append("")
     for im in e.get("implications") or []:
