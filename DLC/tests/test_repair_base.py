@@ -500,3 +500,166 @@ def test_restoring_twice_is_harmless_and_abort_never_takes_a_kept_repair_back(tm
     code, payload = _abort_restore(ctrl2, kept.calib, monitor=0, mode="SDR", run_root=kept.ctx.root)
     assert payload["repair_base_restore"]["outcome"] == "not_needed" and "KEPT" in payload["note"]
     assert installed_base_cube(ctrl2, 0, "SDR")[0] == now
+
+
+# ---------------------------------------------------------------------------
+# SIZING (2026-11-14 hardware run: the unsized removal was reverted). Simulated displays whose balance response
+# to the cube is (a) BLURRED along the wire code (what the PA32UCXR showed: sigma ~2 codes), (b) a pure GAIN of 0.77,
+# (c) the panel's OWN opposite structure cancelling 23 % of the tint (indistinguishable from (b) before the
+# repair), and whose light has TEETH in the green drive code (common to the channels: light moves when a drive
+# crosses a tooth edge, balance does not). Domains: the response is fitted in ln balance (r/g, b/g of native
+# shares) against the wire code; teeth in the drive code.
+# ---------------------------------------------------------------------------
+
+class ResponsePanel(ScanoutPanel):
+    """The real cube through scan-out, then the display's response: each channel's drive balance against green
+    (ln d_k/d_g) blurred along the wire code (Gaussian ``sigma``), times ``gain``, plus ``own(code)`` (an extra
+    balance structure of the panel itself, ln units, (r/g, b/g)); light = d^gamma x a sawtooth in the GREEN drive
+    code (``teeth``) common to the channels; read noise."""
+
+    def __init__(self, ctrl, *, sigma=0.0, gain=1.0, own=None, teeth=0.03, noise=2e-4, seed=3):
+        super().__init__(ctrl, noise=noise, seed=seed)
+        self.sigma, self.gain, self.own, self.teeth = sigma, gain, own, teeth
+
+    def xyz(self, curves, signal):
+        s = sum(signal) / 3
+        c = s * 1023
+        d = br.scanout_grey_drive(curves, _APPLIED, s)
+        if self.sigma > 0:
+            xs = [0.25 * i for i in range(-int(16 * self.sigma), int(16 * self.sigma) + 1)]
+            ws = [math.exp(-0.5 * (x / self.sigma) ** 2) for x in xs]
+            acc = [0.0, 0.0]
+            for x, w in zip(xs, ws):
+                dd = br.scanout_grey_drive(curves, _APPLIED, min(max(c + x, 0.0), 1023.0) / 1023)
+                acc[0] += w * math.log(dd[0] / dd[1])
+                acc[1] += w * math.log(dd[2] / dd[1])
+            lr = [acc[0] / sum(ws), acc[1] / sum(ws)]
+        else:
+            lr = [math.log(d[0] / d[1]), math.log(d[2] / d[1])]
+        extra = self.own(c) if self.own else (0.0, 0.0)
+        g = d[1]
+        ratio = [math.exp(self.gain * lr[0] + extra[0] / self.gamma), math.exp(self.gain * lr[1] + extra[1] / self.gamma)]
+        tooth = 1.0 + self.teeth * (((g * 1023) / 7.0) % 1.0 - 0.5)
+        light = [(g * ratio[0]) ** self.gamma * tooth, g ** self.gamma * tooth, (g * ratio[1]) ** self.gamma * tooth]
+        return tuple(v * (1.0 + self.rng.gauss(0.0, self.noise)) for v in matvec(_P, light))
+
+
+def _flat_after(panel, cube, fixed, rep, span=SPAN):
+    """The after-balance through the simulated display against the core's TARGET, at every span code (ln %)."""
+    from dlc.colormath import invert3x3
+    Pinv = invert3x3(_P)
+    out = {}
+    noise, panel.noise = panel.noise, 0.0
+    for c in range(span[0], span[1] + 1):
+        sh = matvec(Pinv, list(panel.xyz(fixed, (c / 1023,) * 3)))
+        p = rep["predicted"][str(c)]
+        out[c] = (100 * (math.log(sh[0] / sh[1]) - p["target_rg"]), 100 * (math.log(sh[2] / sh[1]) - p["target_bg"]))
+    panel.noise = noise
+    return out
+
+
+def _tint_rg(panel, cube, span=SPAN):
+    from dlc.colormath import invert3x3
+    Pinv = invert3x3(_P)
+    noise, panel.noise = panel.noise, 0.0
+    v = {c: math.log((lambda sh: sh[0] / sh[1])(matvec(Pinv, list(panel.xyz(cube, (c / 1023,) * 3)))))
+         for c in range(span[0], span[1] + 1)}
+    panel.noise = noise
+    ref = [(v[span[0]] * (span[1] - c) + v[span[1]] * (c - span[0])) / (span[1] - span[0]) for c in v]
+    return 100 * max(abs(v[c] - r) for c, r in zip(v, ref))
+
+
+@pytest.mark.parametrize("kind", ["blur", "gain"])
+def test_sizing_blurred_or_gain_response_is_sized_right_and_lands_flat(kind):
+    """(a) blur sigma 2: the old sharp fit read it as k ~0.77; the response fit finds the blur, gain ~1, alpha ~1.
+    (b) a pure gain of 0.77: k ~0.77, and the full removal is still right (the gain scales the change too):
+    alpha ~1. Both land flat within the clean scatter, confirmed."""
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    panel = ResponsePanel(None, sigma=2.0) if kind == "blur" else ResponsePanel(None, gain=0.77)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                   peak_luminance=_PEAK, span=SPAN, luminance_sigma=2e-4)
+    conf, resp = rep["confirmation"], rep["response"]
+    assert conf["confirmed"], conf
+    if kind == "blur":
+        assert 1.5 <= resp["sigma_codes"] <= 2.5 and all(0.85 <= k <= 1.2 for k in resp["k"]), resp
+    else:
+        assert resp["sigma_codes"] <= 0.5 and all(0.7 <= k <= 0.85 for k in resp["k"]), resp
+    assert all(abs(a - 1.0) < 0.1 for a in rep["amplitude"]["alpha"]), rep["amplitude"]
+    after = _flat_after(panel, cube, fixed, rep)
+    assert _tint_rg(panel, cube) > 2.0                               # a tint of several % before
+    assert max(max(abs(v[0]), abs(v[1])) for v in after.values()) < 0.25, after   # flat after
+
+
+def test_sizing_cannot_see_the_panels_own_cancelling_structure_but_the_verify_does(tmp_path):
+    """(c) The panel's own balance cancels 23 % of the cube's tint: before the repair this is indistinguishable
+    from a gain of 0.77 (same reads), so the core sizes alpha ~1 and predicts a change of 0.77 x the removal; the
+    display then changes by the FULL removal and lands magenta. The verify, judging each held-out code against
+    its prediction, catches it (and the keep seam recommends revert)."""
+    ctrl, cube_path, src = _setup(tmp_path)
+    cube = _real_cube()
+    probe = ResponsePanel(None, noise=0.0)
+    from dlc.colormath import invert3x3
+    Pinv = invert3x3(_P)
+
+    def drive_bal(c):
+        d = br.scanout_grey_drive(cube, _APPLIED, c / 1023)
+        return math.log(d[0] / d[1]), math.log(d[2] / d[1])
+    base = {c: drive_bal(c) for c in range(100, 200)}
+    lo_ref = {c: base[147][0] + (base[157][0] - base[147][0]) * (c - 147) / 10 for c in range(100, 200)}
+    lb_ref = {c: base[147][1] + (base[157][1] - base[147][1]) * (c - 147) / 10 for c in range(100, 200)}
+
+    def own(c):
+        i = int(round(c))
+        if not 147 <= i <= 157:
+            return (0.0, 0.0)
+        return (-0.23 * 2.2 * (base[i][0] - lo_ref[i]), -0.23 * 2.2 * (base[i][1] - lb_ref[i]))
+    panel = ResponsePanel(ctrl, own=own)
+    calib = _make(tmp_path, "own", ctrl, panel=panel, source=src)
+    result = calib.run("repair-base")
+    build = calib.calib["stages"]["repair-build"]["digest"]
+    assert build["confirmation"]["confirmed"] and all(0.7 <= k <= 0.85 for k in build["response"]["k"])
+    verdict = calib.calib["stages"]["repair-verify"]["digest"]
+    assert verdict["judged_against"].startswith("the audit's prediction")
+    missed = [m for r in verdict["out"] for m in r["missed"]]
+    assert any("change" in m or "not flat" in m for m in missed), verdict["out"]
+    assert result.status == "reverted"                           # AutoAdjudicator takes the recommendation
+
+
+def test_sizing_refuses_a_tint_the_cube_does_not_explain():
+    """The reads carry an extra balance feature inside the tint that the cube's shape cannot produce (a narrow
+    +1.2 % r/g bump on the tint's upper flank): not explained by the response, the predicted after is not flat ->
+    refused (nothing installed). (A feature among the CLEAN greys instead widens the clean scatter itself — the
+    yardstick is what the untouched greys show.)"""
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+
+    def own(c):
+        return (0.012 * math.exp(-0.5 * ((c - 154.0) / 1.0) ** 2), 0.0)
+    panel = ResponsePanel(None, own=own)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    _fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                    peak_luminance=_PEAK, span=SPAN, luminance_sigma=2e-4)
+    assert rep["confirmation"]["confirmed"] is False
+    assert rep["confirmation"]["refused_because"]
+
+
+def test_flow_on_a_blurred_toothed_display_keeps_and_reports_light_as_observation(tmp_path):
+    """The whole flow on the blurred display with light teeth in the green drive code: confirmed, applied, the
+    verify judges balance against the prediction (nothing out), inside-span light is reported, never judged, and
+    the tooth edges the channels' drive moves cross are named."""
+    ctrl, cube_path, src = _setup(tmp_path)
+    panel = ResponsePanel(ctrl, sigma=2.0, teeth=0.03)
+    calib = _make(tmp_path, "blur", ctrl, panel=panel, source=src)
+    result = calib.run("repair-base")
+    assert result.status == "completed", calib.calib["stages"].get("repair-verify")
+    verdict = calib.calib["stages"]["repair-verify"]["digest"]
+    assert verdict["out"] == [] and verdict["inside"] > 0
+    inside = [r for r in verdict["held_out"] if r.get("where") == "inside"]
+    assert all(r.get("light", "").startswith("observation") for r in inside)
+    assert verdict["tooth_edge_codes"]
+    build = calib.calib["stages"]["repair-build"]["digest"]
+    assert 1.5 <= build["response"]["sigma_codes"] <= 2.5
+    for c, p in build["predicted"].items():
+        assert "post_rg_pct" in p and "tooth_edge" in p

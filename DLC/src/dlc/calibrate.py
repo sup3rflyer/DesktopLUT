@@ -9951,13 +9951,14 @@ class Calibration:
                     luminance_sigma=sig, span=span, census=census)
             except ValueError as exc:
                 raise StageError(key, f"cannot build a repair from this audit: {exc}") from exc
-            digest = {k: rep[k] for k in ("spans", "confirmation", "tolerance_pct", "structure_pct", "noise_pct",
-                                          "fit_codes", "unchanged_entries")}
+            digest = {k: rep[k] for k in ("spans", "confirmation", "response", "amplitude", "flat", "predicted",
+                                          "tolerance_pct", "structure_pct", "noise_pct", "fit_codes",
+                                          "unchanged_entries")}
             if not rep["confirmation"]["confirmed"]:
-                # The correction is shaped by the cube; the reads must say the cube is what tints these greys.
-                # When they do not, the repair would be built on a premise the meter contradicts: refused.
-                raise StageError(key, "the audit does not confirm the installed cube's tint (the meter's balance is "
-                                      f"not explained by the cube: {rep['confirmation']}) — nothing installed",
+                # The correction is shaped by the cube and SIZED by the reads; the reads must explain the tint
+                # through the measured response and predict a flat after-balance. Otherwise refused.
+                raise StageError(key, "the audit does not support this repair ("
+                                      f"{'; '.join(rep['confirmation']['refused_because'])}) — nothing installed",
                                  **digest)
             path = self.ctx.root / "generated" / "mhc_base_sdr.repaired.cube"
             write_1d_cube(path, fixed, title=f"DLC SDR MHC base, balance repair (mon {self.monitor})")
@@ -9968,13 +9969,24 @@ class Calibration:
         outcome = self._stage(key, run)
         if (outcome.data or {}).get("candidate"):
             d = outcome.digest
+            resp, amp = d.get("response") or {}, d.get("amplitude") or {}
+            pred = d.get("predicted") or {}
+            edges = sorted(int(c) for c, p in pred.items() if p.get("tooth_edge"))
+            worst = max(pred.items(), key=lambda kv: max(abs(kv[1].get("post_rg_pct", 0)),
+                                                         abs(kv[1].get("post_bg_pct", 0))), default=(None, {}))
             self._abort_if(self.adjudicate(AdjudicationRequest(
                 key="repair-base:apply", seam=SEAM_FOUNDATION, stage=key,
-                question=(f"the installed cube's tint at {[s['tints'] for s in d['spans']]} is confirmed by the audit "
-                          f"(k {d['confirmation']['k']}, every grey explained within tolerance); the candidate "
-                          f"rewrites {3 * 1024 - d['unchanged_entries']} LUT entries over {d['spans'][0]['codes']} "
-                          "(channel balance only, each grey's light kept). apply it (the previous cube is the "
-                          "rollback point) or abort?"),
+                question=(f"the installed cube's tint at {[s['tints'] for s in d['spans']]} is explained by the audit "
+                          f"through the display's measured response (blur sigma {resp.get('sigma_codes')} codes, "
+                          f"shift {resp.get('shift_codes')}, gain r/g b/g {resp.get('k')} +- {resp.get('k_se')}); "
+                          f"the reads size the removal at {amp.get('alpha')} +- {amp.get('se')}; predicted "
+                          f"after-balance flat (worst {worst[0]}: r/g {worst[1].get('post_rg_pct')} %, b/g "
+                          f"{worst[1].get('post_bg_pct')} %, tolerance {(d.get('flat') or {}).get('tolerance_pct')} "
+                          f"%). The candidate rewrites {3 * 1024 - d['unchanged_entries']} LUT entries over "
+                          f"{d['spans'][0]['codes']} (channel balance only). LIGHT inside the span is not predictable "
+                          f"on this panel (teeth along the code): it is reported, not gated; channel drive moves "
+                          f"cross a tooth edge at {edges or 'no code'}. apply it (the previous cube is the rollback "
+                          "point) or abort?"),
                 options=("apply", "abort"), recommendation="apply", digest=d)),
                 stage=key, message="repair-base aborted before applying")
         return outcome
@@ -10039,8 +10051,12 @@ class Calibration:
         decision = self.adjudicate(AdjudicationRequest(
             key="repair-base:keep", seam=SEAM_VERIFY, stage=key,
             question=(f"held-out greys after the repair: {verdict.get('inside')} inside the span(s), "
-                      f"{verdict.get('beside')} beside; {len(verdict.get('out') or ())} out of tolerance "
-                      f"{verdict.get('tolerance_pct')}. keep the repaired cube, or revert to the previous one?"),
+                      f"{verdict.get('beside')} beside, judged against "
+                      f"{verdict.get('judged_against') or 'the envelope'}; {len(verdict.get('out') or ())} out of "
+                      f"tolerance {verdict.get('tolerance_pct')}"
+                      + (f"; inside-span light is an observation, not judged (tooth edges at "
+                         f"{verdict.get('tooth_edge_codes')})" if verdict.get("judged_against") else "")
+                      + ". keep the repaired cube, or revert to the previous one?"),
             options=("keep", "revert"), recommendation="keep" if ok else "revert", digest=verdict))
         if decision.choice == "revert":
             back = restore_base_repair_prior(self.controller, self.calib, monitor=self.monitor, mode=self.mode,
