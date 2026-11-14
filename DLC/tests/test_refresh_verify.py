@@ -263,6 +263,34 @@ def test_the_rule_luminance_and_chromaticity():
     assert res_f["verdict"] == "undecided" and "too few reference legs" in res_f["rates"]["47.952"]["undecided"][0]
 
 
+def test_a_real_but_invisible_chromaticity_shift_is_a_practical_pass_said_beside_the_statistics():
+    """Very repeatable reference legs (xy wobble 1e-5) make the statistical tolerance collapse: a 0.0006 shift in x
+    at 100 nit is 'real' (p << the Bonferroni share) yet 0.39 dE_ITP - below one just noticeable difference
+    (BT.2124). It passes on the practical floor, and the rate's notes say so with both numbers; 0.002 (1.3 dE_ITP)
+    still fails."""
+    ok = [{"rate": r, "ok": True, "rule": "stamp"} for r in ("60", "47.952")]
+
+    def rows(dx):
+        out = []
+        for i, leg in enumerate((0, 2, 4, 6, 8)):
+            w = (0.0, 1e-5, -1e-5, 1e-5, -1e-5)[i]
+            out.append(_row(leg, "60", leg * 60, 100.0, (0.3127 + w, 0.3290 - w)))
+        for leg in (1, 7):
+            out.append(_row(leg, "47.952", leg * 60, 100.0, (0.3127 + dx, 0.3290)))
+        return out
+
+    res = rv.analyze_verify(rows(0.0006), reference="60", trim_checks=ok)
+    cell = res["rates"]["47.952"]["greys"]["g520"]
+    assert cell["chroma"]["ok"] is False                                      # statistically real ...
+    assert cell["chroma"]["practical"]["below"] is True                       # ... below one JND
+    assert cell["chroma"]["practical"]["de_itp"] == pytest.approx(0.39, abs=0.05)
+    assert res["verdict"] == "pass" and cell["chroma_practical_pass"] is True
+    note = res["rates"]["47.952"]["practical_notes"][0]
+    assert "statistically real" in note and "BT.2124" in note
+    big = rv.analyze_verify(rows(0.002), reference="60", trim_checks=ok)
+    assert big["verdict"] == "fail" and big["rates"]["47.952"]["greys"]["g520"]["chroma"]["practical"]["below"] is False
+
+
 def test_student_t_and_its_critical_values():
     for nu, t, p in ((1, 1.0, 0.5), (2, 4.303, 0.05), (3, 3.182, 0.05), (4, 2.776, 0.05), (10, 2.228, 0.05),
                      (3, 5.841, 0.01)):

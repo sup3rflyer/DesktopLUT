@@ -301,6 +301,31 @@ def chroma_test(dx: Optional[float], dy: Optional[float], n_reads: int, rep: dic
     return out
 
 
+# The PRACTICAL floor of the chromaticity test: a shift the reference legs prove real can still be far below what
+# anyone can see when the reads are very repeatable (the statistical tolerance then collapses to ~1e-4 in xy).
+# Source: ITU-R BT.2124-0 (2019) normative Annex 1 - dE_ITP 1 is one just noticeable difference "in the most critical
+# adaptation state" (standard, conservative; docs/practical-thresholds.md). A display's own between-session white
+# repeatability would be the better floor (a shift smaller than what the display does between sessions is not the
+# trim's); the DIP has no such section yet - when it does, its larger value should be used here.
+PRACTICAL_CHROMA_ITP = 1.0
+
+
+def practical_chroma(dx: Optional[float], dy: Optional[float], base_xy: Optional[tuple[float, float]],
+                     light_nits: Optional[float], *, floor: float = PRACTICAL_CHROMA_ITP) -> dict[str, Any]:
+    """The chromaticity shift (dx, dy) of a grey at ``base_xy`` and ``light_nits`` (absolute) as BT.2124 dE_ITP,
+    against the practical floor. ``below`` True = statistically real or not, it is below one JND."""
+    if dx is None or dy is None or base_xy is None or not light_nits or light_nits <= 0:
+        return {"de_itp": None, "floor": floor, "below": None, "why": "no base chromaticity or light"}
+    from .colormath import xy_to_XYZ
+    from .content_score import xyz_to_itp
+    x0, y0 = base_xy
+    a, b = xyz_to_itp([xy_to_XYZ(x0, y0, light_nits), xy_to_XYZ(x0 + dx, y0 + dy, light_nits)])
+    de = 720.0 * math.sqrt(sum((float(a[k]) - float(b[k])) ** 2 for k in range(3)))
+    return {"de_itp": de, "floor": floor, "below": de < floor,
+            "source": "ITU-R BT.2124 Annex 1: dE_ITP 1 = one just noticeable difference (the DIP holds no "
+                      "between-session white repeatability for this display yet)"}
+
+
 def link_code_pct(light_nits: Optional[float], link_bpc: Optional[int]) -> Optional[float]:
     """One code of a ``link_bpc`` PQ link at ``light_nits``, in % of that light (the step to the next code up)."""
     if not light_nits or light_nits <= 0 or not link_bpc:
@@ -329,7 +354,7 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
     p_crit = CHROMA_ALPHA / max(1, 2 * n_chroma)
     out_rates: dict[str, Any] = {}
     for rate in rates:
-        cells, why_fail, why_undecided = {}, [], []
+        cells, why_fail, why_undecided, notes = {}, [], [], []
         rrows = [x for x in ratios if str(x.get("rate")) == rate]
         for patch in sorted({str(x["patch"]) for x in greys if str(x.get("rate")) == rate},
                             key=lambda p: min(float(x.get("nominal_nits") or 0) for x in greys if x["patch"] == p)):
@@ -362,6 +387,15 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             lum_ok = abs(ratio - 1.0) <= lum_tol and all(abs(x["ratio"] - 1.0) <= lum_tol for x in singles)
             ct = chroma_test(c.get("dx"), c.get("dy"), len([x for x in singles if x.get("dx") is not None]), rp_, p_crit)
             chroma_ok = ct.get("ok")
+            refs = [_xy(x.get("xyz")) for x in rt.series(usable, patch, reference)]
+            refs = [r for r in refs if r[0] is not None]
+            base_xy = (sum(r[0] for r in refs) / len(refs), sum(r[1] for r in refs) / len(refs)) if refs else None
+            practical = practical_chroma(c.get("dx"), c.get("dy"), base_xy,
+                                         c.get("y60") or cell.get("nominal_nits"))
+            ct["practical"] = practical
+            # statistically real but below the practical floor: reported beside the statistical verdict, never
+            # silently - the shift is named, with both numbers, in the rate's notes
+            below_floor = chroma_ok is False and practical.get("below") is True
             code_pct = link_code_pct(c.get("y60"), link_bpc)
             worst_pct = max([abs(cell["pct"])] + [abs(x["ratio"] - 1.0) * 100.0 for x in singles])
             below_code = code_pct is not None and worst_pct < code_pct
@@ -381,6 +415,13 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
             elif lost:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: {len(lost)} of {len(taken)} read(s) without a bracketed ratio: {lost}")
+            elif below_floor:
+                cell["verdict"] = "pass"
+                cell["chroma_practical_pass"] = True
+                notes.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} is "
+                             f"statistically real (p {min(ct['x']['p'], ct['y']['p']):.2g} < {p_crit:.2g}) but "
+                             f"{practical['de_itp']:.2f} dE_ITP at {c.get('y60') or cell.get('nominal_nits'):.1f} nit, "
+                             f"below the practical floor {practical['floor']:g} (one JND, BT.2124): practical pass")
             elif chroma_ok is False and stack == "mhc_only" and code_pct is not None:
                 cell["verdict"] = "undecided"
                 why_undecided.append(f"{patch}: chromaticity shift dx {ct['x']['shift']:+.5f} dy {ct['y']['shift']:+.5f} is "
@@ -412,6 +453,7 @@ def analyze_verify(rows: Sequence[dict[str, Any]], *, reference: str, lum_tol: f
                             f"leg(s): {[{k: t.get(k) for k in ('state', 'trim_rate', 'applied', 'waiting', 'rule', 'why', 'active_stamp', 'stamp') if t.get(k) is not None} for t in not_applied]}")
         verdict = "fail" if why_fail else ("undecided" if why_undecided else "pass")
         out_rates[rate] = {"verdict": verdict, "greys": cells, "fail": why_fail, "undecided": why_undecided,
+                           "practical_notes": notes,
                            "trim_checks": len(checks), "trim_not_applied": len(not_applied),
                            "trim_rules": sorted({str(t.get("rule")) for t in checks if t.get("rule")}),
                            "resolved": sorted({str(t.get("resolved")) for t in checks if t.get("resolved")})}
