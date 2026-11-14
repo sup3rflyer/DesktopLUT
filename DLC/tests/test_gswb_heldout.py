@@ -385,9 +385,15 @@ def test_tonights_feature_left_as_solved_smears_colour_below_one_jnd(tmp_path: P
     for code in (141, 166):
         assert by[code]["chroma"]["after_itp"] > by[code]["chroma"]["before_itp"]          # worse ...
         assert by[code]["chroma"]["after_de"] > by[code]["chroma"]["before_de"]
-        assert not by[code]["chroma"]["regressed"]                                       # ... not visibly
-        assert by[code]["chroma"]["change_itp"] < by[code]["chroma"]["threshold_itp"] == 1.0
-    assert judge.request("verify:accept").recommendation == "apply"
+        c = by[code]["chroma"]
+        assert c["real"] and c["change_de"] > c["threshold_de"] >= 0.6                   # worse beyond the target ...
+        assert not c["regressed"] and c["regressed_below_visibility"]                    # ... but not visibly
+        assert c["visibility_itp"] < 1.0
+    assert {b["code"] for b in ho["regressed_below_visibility"]} == {141, 166}
+    req = judge.request("verify:accept")
+    assert req.recommendation == "apply"                                       # apply, with the list named
+    assert "code 141: colour +" in req.question and "code 166: colour +" in req.question
+    assert "dE_ITP" in req.question and "revert when a grey reads worse" in req.question
     assert result.status == "completed"
 
 
@@ -433,7 +439,7 @@ def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_pat
     assert set(ho["chroma_regressed_codes"]) == {141, 166}, ho["worst"]
     for w in ho["worst"][:2]:
         assert w["code"] in (141, 166) and w["chroma"]["regressed"]
-        assert w["chroma"]["change_itp"] > 1.0
+        assert w["chroma"]["visibility_itp"] >= 1.0 and w["chroma"]["change_de"] > w["chroma"]["threshold_de"]
     # (c) the recommendation is revert - a recommendation: the judge's answer stands
     req = judge.request("verify:accept")
     assert req.recommendation == "revert" and req.digest["held_out_regressed"] is True

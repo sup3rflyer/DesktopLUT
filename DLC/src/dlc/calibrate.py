@@ -7329,7 +7329,7 @@ class Calibration:
                     digest={"message": "aborted on Grayscale touch-up measurement session",
                             "decision_note": decision.note, **outcome.digest}))
         live = not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable"))
-        if live and (outcome.digest.get("light_trend") or {}).get("changed"):  # seam only when material
+        if live and (outcome.digest.get("light_trend") or {}).get("changed"):  # applied; pauses only when material
             self._gswb_light_trend_seam(outcome)
         flagged = (outcome.digest.get("node_outliers") or {}).get("flagged") or []
         if flagged and live:
@@ -8449,10 +8449,13 @@ class Calibration:
         if ts.get("note"):
             thermal_txt += f" Note: {ts['note']}."
         gswb = d.get("gswb_held_out") if self.calib.get("flow") == "grayscale-wb" else None
-        # revert when a grey the touch-up was not fitted on reads worse than before (light or colour), or a
-        # smoothed / held node's code did not do what was predicted
+        # Rule (stated in the seam text and the operator guide): revert when a grey the touch-up was not fitted on
+        # reads worse than before beyond the target AND visibly (>= 1 JND dE_ITP at its light), when a smoothed /
+        # held node's code did not do what was predicted, or when the drift is unknown (no bracket: nothing to rest
+        # an apply on); a worsening beyond the target but under visibility is listed, with apply recommended.
         gswb_regressed = bool((gswb or {}).get("n_regressed")) or any(
-            not p.get("as_predicted") for p in (gswb or {}).get("predicted") or ())
+            not p.get("as_predicted") for p in (gswb or {}).get("predicted") or ()) or (
+            ((gswb or {}).get("drift") or {}).get("state") == "unknown")
         self.adjudicate(AdjudicationRequest(
             key="verify:accept", seam=SEAM_VERIFY, stage="verify",
             question=(f"The new calibration reads {_content_lead_text(d)}{reads} — "
@@ -8487,7 +8490,7 @@ class Calibration:
             (the verify's first read of a code is its after-read, its last the verify bracket); the level's own
             between-presentation scatter from the before-state greys around it."""
         from .grayscale_wb import (GrayTouchupConfig, base_positions, carry_through, commanded_light, curve_gains,
-                                   judge_held_out, light_ratios)
+                                   judge_held_out, light_ratios, verify_after_and_late)
 
         touch = (self.calib["stages"].get("grayscale-wb") or {}).get("digest") or {}
         ho = touch.get("held_out")
@@ -8499,17 +8502,16 @@ class Calibration:
         max_cv = transfer.max_cv
         cap = int(self._patch_max_cv() or max_cv)
         kind = "hdr" if transfer.kind == "pq" else "sdr"
-        # the verify reads in measurement order: a code's FIRST read is its after-read, a later read of the same
-        # code is the verify bracket's late read (the bracket greys are re-presented at the end of the verify)
-        after: dict[int, list[float]] = {}
-        late: dict[int, list[float]] = {}
+        # the verify reads in measurement order. Only the PLANNED bracket codes (re-presented at the end of the
+        # verify) form verify-bracket pairs: their first read is the after-read, their last the late read. Any other
+        # code read twice was re-measured (a retried / appended read): its latest read stands as the after-read.
+        planned = {int(b["code"]) for b in ho.get("bracket") or ()}
+        reads: dict[int, list[list[float]]] = {}
         for s, code in zip(samples, verify_holdout.to_codes([s.rgb for s in samples], max_cv)):
             c = [int(v) for v in code]
             if c[0] == c[1] == c[2] and all(math.isfinite(float(v)) for v in s.xyz):
-                if c[0] in after:
-                    late[c[0]] = [float(v) for v in s.xyz]
-                else:
-                    after[c[0]] = [float(v) for v in s.xyz]
+                reads.setdefault(c[0], []).append([float(v) for v in s.xyz])
+        after, late = verify_after_and_late(reads, planned)
         committed = self.calib.get("grayscale_wb_touchup") or {}
         n = int(committed.get("point_count") or len(committed.get("points") or ()) or 32)
         after_gains = {ch: [float(v) for v in (committed.get("deviations") or {}).get(ch) or [1.0] * n]
@@ -8567,7 +8569,10 @@ class Calibration:
         spec = self._spec()
         res = judge_held_out(greys, after, session_bracket=ho.get("bracket") or (), verify_bracket=verify_bracket,
                              before_state_reads=before_reads,
-                             config=GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma)))
+                             config=GrayTouchupConfig(white_xy=self._white_xy(), gamma=float(spec.gamma)),
+                             # the user's --target: the verify must not accept between the nodes what the fit refuses
+                             # at them (the fit metric's tolerance)
+                             chroma_tol=float(touch.get("target_de2000") or 0.6))
         res["before_state"] = before_state
         res["held_nodes"] = holds
         res["held_mode"] = mode if holds else None
@@ -8590,8 +8595,12 @@ class Calibration:
         """The verify:accept clause of a grayscale-wb run: the greys between the nodes, light and colour."""
         if not gswb.get("available"):
             return f" Between-node greys: NOT JUDGED ({gswb.get('reason') or 'no judged greys'})."
+        below = gswb.get("regressed_below_visibility") or []
         txt = (f" Between-node greys (never fitted): {gswb.get('n_judged')} judged before vs after, light and colour "
-               f"separately, against this run's repeatability: {gswb.get('n_regressed')} WORSE than before")
+               f"separately, in the fit's metric against the target ({gswb.get('chroma_tol_de')} dE colour, "
+               f"{gswb.get('light_tol_pct')} % light) and this run's repeatability: {gswb.get('n_regressed')} WORSE "
+               f"than before AND visible (>= {gswb.get('visibility_itp')} dE_ITP at its light), {len(below)} worse "
+               "but below visibility")
         regressed = [w for w in gswb.get("worst") or () if w.get("regressed")]
         if regressed:
             parts = []
@@ -8602,9 +8611,14 @@ class Calibration:
                     what.append(f"light {lt.get('before_pct')} % -> {lt.get('after_pct')} % (the curve commanded "
                                 f"{lt.get('commanded_pct')} %)")
                 if ch.get("regressed"):
-                    what.append(f"colour {ch.get('before_itp')} -> {ch.get('after_itp')} dE_ITP")
+                    what.append(f"colour {ch.get('before_de')} -> {ch.get('after_de')} dE (visibility "
+                                f"{ch.get('visibility_itp')} dE_ITP)")
                 parts.append(f"code {w['code']}: " + ", ".join(what))
             txt += " - " + "; ".join(parts) + " - the touch-up leaves greys it was not fitted on worse than before"
+        if below:
+            txt += (" (worse in the fit's metric beyond its tolerance, under one JND where it sits): "
+                    + "; ".join(f"code {b['code']}: colour +{b['change_de']} dE (tolerance {b['threshold_de']}), "
+                                f"{b['visibility_itp']} dE_ITP" for b in below[:8]))
         txt += f" ({len(gswb.get('improved_codes') or ())} of {gswb.get('n_judged')} read better in both)"
         unc = gswb.get("uncommanded_light") or []
         if unc:
@@ -8613,9 +8627,10 @@ class Calibration:
         for p in gswb.get("predicted") or ():
             txt += (f"; code {p['code']} ({p['kind'].replace('_', ' ')}): "
                     + ("did what was predicted" if p.get("as_predicted") else "did NOT do what was predicted")
-                    + f" (colour {p.get('chroma_after_itp')} dE_ITP vs predicted {p.get('chroma_itp')}"
-                    + (f", light {p.get('light_after_pct')} % vs predicted {p.get('light_pct')} %)" if p.get("light_judged")
-                       else f"; {p.get('light_observation')})"))
+                    + f" (colour {p.get('chroma_after_de')} dE vs predicted {p.get('chroma_de')}; light "
+                      f"{p.get('light_after_pct')} % vs predicted {p.get('light_pct')} %, allowed "
+                      f"{p.get('light_allowed_pct')} % around it: one display step of {p.get('step_upper_pct')} % "
+                      f"in the direction the drive moved ({p.get('drive_change')}))")
         if gswb.get("defect_left_uncorrected"):
             txt += f"; {gswb['defect_left_uncorrected']}"
         if gswb.get("held_nodes_not_judged"):
@@ -8624,13 +8639,16 @@ class Calibration:
         drift = gswb.get("drift") or {}
         if drift.get("known"):
             txt += (f"; drift between the before- and after-reads (two brackets, {drift.get('rests_on_reads')} reads): "
-                    f"{drift.get('expected_light_pct')} % light, {drift.get('expected_chroma_itp')} dE_ITP colour")
+                    f"{drift.get('expected_light_pct')} % light, {drift.get('expected_colour_de')} dE colour")
         elif drift:
             txt += f"; {drift.get('note')}"
         state = (gswb.get("before_state") or {})
         if state.get("revert_state_differs"):
             txt += f" [before = identity, not the revert state: {state.get('note')}]"
-        return txt + "."
+        return txt + (". The recommendation follows one rule: revert when a grey reads worse than before beyond the "
+                      "target AND visibly (>= 1 JND dE_ITP at its light), when a smoothed / held code missed its "
+                      "prediction, or when the drift is unknown; otherwise apply, with any worse-but-below-visibility "
+                      "greys named above for you to weigh.")
 
     def _score_verify_samples(self, samples: Sequence[Any], *, reachable: Any = None,
                               reuse_reachable: bool = False) -> dict[str, Any]:

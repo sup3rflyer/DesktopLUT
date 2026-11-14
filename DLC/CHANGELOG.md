@@ -25,6 +25,14 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
   greys the build interpolated in linear light, which on any gamma-like panel lands a little dark mid-gap (up to
   ~1 % on the default ramp, several % on sparse ones). Above 1 % of white it now interpolates in the transfer
   domain (SDR gamma, HDR PQ), which the raw ramps of all 29 past runs fit better; the shadows are built as before.
+- **`grayscale-wb` verify after review** (2026-11-14): colour is judged again in the fit's own metric against the
+  run's `--target`, with the level's noise taken from the full colour difference of nearby re-read pairs; dE_ITP at
+  the grey's light is reported beside it and sets the class (`regressed` >= 1 JND, revert; `regressed_below_visibility`
+  under it, apply with the greys named). A smoothed node's light may differ from its prediction by at most one of the
+  display's measured light steps in the drive's direction. One bracket alone widens the drift threshold; no bracket
+  means "drift unknown" and never an apply recommendation. Refresh verify: a below-floor shift is
+  `pass_below_visibility` (named in the digest, with the floor in the rule text), and unsettled reads make it
+  undecided first.
 - **`grayscale-wb` judgement after the first hardware acceptance** (2026-11-14 11:46 run):
   - the size seam measures the curve that will be COMMITTED (after the light-trend and node-outlier decisions),
     not the solver's per-node values;

@@ -104,3 +104,35 @@ def test_drift_from_the_two_brackets_is_carried_into_the_comparison():
     assert out["drift"]["known"] and out["drift"]["rests_on_reads"] == 32
     assert out["drift"]["expected_light_pct"] == pytest.approx(1.98, abs=0.1)
     assert out["n_regressed"] == 0 and not out["uncommanded_light"]
+
+
+def test_the_bracket_noise_is_the_full_colour_difference_not_the_change_of_error():
+    """Two reads equally far from white on opposite sides: the fit's error does not change (dc ~ 0) but the colour
+    moved - the level's noise is the colour difference between the reads, every direction included."""
+    pairs = [{"code": 60 + j, "target_Y": _TY, "early_xyz": _at(1.0, 0.01), "late_xyz": _at(1.0, -0.01)}
+             for j in range(8)]
+    b = bracket_drift(pairs, _CFG.white_xy)
+    p = b["pairs"][0]
+    assert abs(p["d_colour_de"]) < 0.1 * p["colour_difference_de"]
+    assert p["colour_difference_de"] > 0.5
+
+
+def test_one_known_bracket_is_not_a_known_drift():
+    """Only the session bracket: the drift is 'widened' (the largest drift it alone supports), never 'known'."""
+    sb = [{"code": 60 + 40 * j, "target_Y": _TY, "early_xyz": _at(1.0 + 0.0002 * j), "late_xyz": _at(1.02 + 0.0002 * j)}
+          for j in range(8)]
+    reads = [_at(1.0), _at(1.0005)]
+    greys = [{"code": 300, "target_Y": _TY, "before_xyz": _mean(reads), "before_reads": reads, "commanded_e": 0.0}]
+    out = judge_held_out(greys, {300: _mean(reads)}, config=_CFG, after_reads={300: reads}, session_bracket=sb)
+    assert out["drift"]["state"] == "widened" and out["drift"]["known"] is False
+    none = judge_held_out(greys, {300: _mean(reads)}, config=_CFG, after_reads={300: reads})
+    assert none["drift"]["state"] == "unknown"
+
+
+def test_a_retried_verify_read_is_not_a_bracket_pair():
+    """Code 200 was read twice because a read was retried: its latest read stands, no pair. Code 100 is a planned
+    bracket code: first read = after, last = the verify bracket's late read."""
+    from dlc.grayscale_wb import verify_after_and_late
+    after, late = verify_after_and_late({100: ["a1", "a2"], 200: ["r1", "r2"], 300: ["x"]}, planned=[100])
+    assert after == {100: "a1", 200: "r2", 300: "x"}
+    assert late == {100: "a2"}
