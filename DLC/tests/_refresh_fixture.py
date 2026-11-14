@@ -25,7 +25,10 @@ OK_CHECKS = [{"rate": "60", "ok": True, "rule": "reference"}, {"rate": "47.952",
 KNOWLEDGE_F0006 = {"unit": "AUS322A-335544320", "entry": "F-0006",
                    "title": "The HDR refresh-rate response is larger on a cool panel than on a hot one",
                    "axis": "x", "cooler_sign": 1, "cooler_from": "observation O1: x_100nit_cool 0.3127 vs x_100nit_hot 0.3067",
-                   "leftover_sign_when_cooler": "+", "leftover_max_pct": 0.9, "thermometer_max_abs": 0.006}
+                   "leftover_sign_when_cooler": "+", "leftover_max_pct": 0.9, "thermometer_max_abs": 0.006,
+                   "about_refresh_response": True,
+                   # the rig's session-to-session offset of a white reading (R-0001, session_offset max_abs_dxy)
+                   "session_offset_dxy": 0.0025, "session_offset_entry": "R-0001"}
 
 
 def load() -> dict:
@@ -93,6 +96,32 @@ def with_leftover(rows: list[dict], leftover: float, reference: str = "60") -> l
             k = (1.0 + leftover) / b["ratio"]
             r2["y"] = r["y"] * k
             r2["xyz"] = [v * k for v in r["xyz"]]
+        out.append(r2)
+    return out
+
+
+def recorded_ratio(fx: dict, rate: str, code: int) -> float:
+    """The record's ratio at ``rate`` for the recorded level nearest ``code`` (its DIP section, as DesktopLUT reads it)."""
+    r = next(x for x in fx["record"]["response"]["rates"] if x["key"] == rate)
+    return min(r["levels"], key=lambda lv: abs(lv["code"] - code))["ratio"]
+
+
+FAULTS = {"trim not applied": lambda q: q, "half strength": lambda q: math.sqrt(q), "applied twice": lambda q: 1.0 / q}
+
+
+def with_fault(fx: dict, rows: list[dict], fault: str, reference: str = "60") -> list[dict]:
+    """The real verify rows with a trim FAULT on top of what was measured (the reviewer's enumeration): every rate
+    read multiplied by f(recorded ratio) - not applied = x ratio, half strength = x sqrt(ratio), applied twice =
+    x 1/ratio."""
+    out = []
+    for r in rows:
+        r2 = dict(r)
+        if r.get("kind") == "grey" and str(r.get("rate")) != reference:
+            k = FAULTS[fault](recorded_ratio(fx, str(r["rate"]), int(str(r["patch"])[1:])))
+            if r.get("y") is not None:
+                r2["y"] = r["y"] * k
+            if r.get("xyz"):
+                r2["xyz"] = [v * k for v in r["xyz"]]
         out.append(r2)
     return out
 

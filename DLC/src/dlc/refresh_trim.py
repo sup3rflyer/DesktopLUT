@@ -684,7 +684,12 @@ def response_for_run_dir(run_dir: Path | str) -> tuple[Any, list[str], dict[str,
                   "cube": through.get("cube"),
                   "patch": trim.get("patch") or "full field, time-bracketed against the reference rate",
                   "instrument": instruments[0].get("description"),
-                  "correction": (meter.get("correction") or {}).get("file")}
+                  "correction": (meter.get("correction") or {}).get("file"),
+                  # the thermal state it was taken in: the run's preheat policy (runs before 2026-11-14: none) and,
+                  # when one ran, whether it converged
+                  "preheat": {"policy": str(((evidence.get("spec") or {}).get("preheat")) or "none"),
+                              **({k: (evidence.get("preheat") or {}).get(k) for k in ("converged", "regime", "minutes")}
+                                 if evidence.get("preheat") else {})}}
     started = str(evidence.get("started") or "")
     run_id = str((result.get("meta") or {}).get("run") or run.name)
     measured = started[:10] if len(started) >= 10 else f"{run_id[:4]}-{run_id[4:6]}-{run_id[6:8]}"

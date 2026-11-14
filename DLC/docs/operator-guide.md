@@ -477,8 +477,12 @@ the trim stays ON and is never switched; nothing is recorded). Judge the digest 
 - `thermal_state`: the reference greys against the record's thermometer, at the levels whose light matches the
   record's: `as the record` within 0.002 in xy (a white reading moves 0.001-0.0025 between sessions), `cooler than
   the record` / `hotter than the record` only when the display's knowledge says which way is warmer, else `unknown`
-  (with the numbers). On a cooler panel the knowledge may say a positive leftover is expected (the PA32UCXR: up to
-  about 0.9 %, F-0006): below one JND it is no defect. Reported, never a gate; no temperature-following trim.
+  (with the numbers). A difference inside the display's session-to-session offset (its knowledge's `session_offset`
+  entry, the PA32UCXR's 0.0025; else the tolerance) is `..., but within the display's session-to-session offset: not
+  established`: a re-placed meter does that by itself. Only on an established cooler panel may the knowledge say a
+  positive leftover is expected (the PA32UCXR: up to about 0.9 %, F-0006): below one JND it is no defect. Reported,
+  never a gate, and it never changes a verdict; no temperature-following trim. The record also notes its preheat in
+  `conditions.preheat`.
 - `preheat` (spec, both purposes): `none` (default: the warm-in at the reference only) or `closed_loop` (DLC's
   closed-loop thermal preheat on the run's greys first). Offer `closed_loop` when a record and a verify should be
   compared in the same regime; the plan seam says which was chosen.

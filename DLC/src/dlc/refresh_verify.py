@@ -386,7 +386,9 @@ THERMAL_TOL_BASIS = ("0.002 in xy, the distance of the median difference over th
 # within this of the record's level (the as-viewed stack renders dark greys at another light than the record's
 # calibration-only stack: the PA32UCXR's 0.5 / 2 nit greys read 0.19 / 1.5 nit as viewed).
 THERMAL_LIGHT_MATCH = 0.10
-THERMAL_STATES = ("as the record", "cooler than the record", "hotter than the record", "unknown")
+NOT_ESTABLISHED = ", but within the display's session-to-session offset: not established"
+THERMAL_STATES = ("as the record", "cooler than the record", "hotter than the record",
+                  "cooler than the record" + NOT_ESTABLISHED, "hotter than the record" + NOT_ESTABLISHED, "unknown")
 
 
 def _median(v: Sequence[float]) -> float:
@@ -440,20 +442,35 @@ def thermal_knowledge(store_root: Optional[Path | str], names: Sequence[Optional
         return None
     if not doc:
         return None
-    for e in doc.get("entries") or []:
-        sig = e.get("signature") or {}
-        if sig.get("type") != "thermal_offset" or e.get("status") != "measured":
-            continue
+    entries = [e for e in doc.get("entries") or [] if isinstance(e, dict)]
+
+    def in_scope(e: dict) -> bool:
         modes = (e.get("scope") or {}).get("mode")
-        if modes and mode not in modes:
+        return not modes or mode in modes
+
+    # entries about the refresh response: a see_field to a DIP refresh_response, the refresh_response_key facet, and
+    # (one step) the entries that refine those
+    refresh_ids = {e.get("id") for e in entries
+                   if "refresh_response_key" in (e.get("facets") or {})
+                   or any(str(lk.get("field") or "").endswith(".refresh_response") for lk in e.get("links") or [])}
+    refresh_ids |= {e.get("id") for e in entries
+                    if (e.get("signature") or {}).get("type") != "thermal_offset"
+                    and any(lk.get("rel") in ("refines", "refined_by") and lk.get("id") in refresh_ids
+                            for lk in e.get("links") or [])}
+    refresh_ids.discard(None)
+    found, skipped = [], []
+    for e in entries:
+        sig = e.get("signature") or {}
+        if sig.get("type") != "thermal_offset" or e.get("status") != "measured" or not in_scope(e):
             continue
         mx, sign = dict(sig.get("max_abs") or {}), dict(sig.get("sign") or {})
         axis = next((k[1] for k in mx if k.startswith("d") and k.endswith("_thermometer") and len(k) > 1), None)
         cooler, how = None, None
         if axis:
+            # the structured form: sign.d<axis>_thermometer_when_cooler = '+' / '-' (the validator's axis -> sign)
             s = sign.get(f"d{axis}_thermometer_when_cooler")
             if s in ("+", "-"):
-                cooler, how = (1 if s == "+" else -1), f"signature sign.d{axis}_thermometer_when_cooler"
+                cooler, how = (1 if s == "+" else -1), f"signature sign.d{axis}_thermometer_when_cooler '{s}'"
             else:
                 for o in e.get("observations") or []:
                     nums = o.get("numbers") or {}
@@ -467,16 +484,40 @@ def thermal_knowledge(store_root: Optional[Path | str], names: Sequence[Optional
                             break
                     if cooler is not None:
                         break
+        if cooler is None:
+            skipped.append(e.get("id"))        # no direction: it cannot say cooler / hotter, and must not hide one
+            continue
+        rank = (2 if any(lk.get("id") in refresh_ids for lk in e.get("links") or []) else 0) \
+            + (1 if any(k.startswith("rate_ratio") for k in list(sign) + list(mx)) else 0)
+        found.append((rank, e, sig, mx, sign, axis, cooler, how))
+    out: dict[str, Any] = {"unit": uid, "entry": None, "axis": None, "cooler_sign": None,
+                           "skipped_without_direction": skipped}
+    if found:
+        rank, e, sig, mx, sign, axis, cooler, how = max(found, key=lambda f: f[0])   # first of the best rank
         try:
             state = entry_state(doc, e, today=today)
         except Exception:  # noqa: BLE001
             state = {}
-        return {"unit": uid, "entry": e.get("id"), "title": e.get("title"), "axis": axis, "cooler_sign": cooler,
-                "cooler_from": how, "leftover_sign_when_cooler": sign.get("rate_ratio_when_cooler"),
-                "leftover_max_pct": mx.get("rate_ratio_pct"), "thermometer_max_abs": mx.get(f"d{axis}_thermometer")
-                if axis else None, "precondition": sig.get("precondition"),
-                "can_explain": state.get("can_explain"), "cannot_explain_why": state.get("cannot_explain_why")}
-    return None
+        out.update({"entry": e.get("id"), "title": e.get("title"), "axis": axis, "cooler_sign": cooler,
+                    "cooler_from": how, "leftover_sign_when_cooler": sign.get("rate_ratio_when_cooler"),
+                    "leftover_max_pct": mx.get("rate_ratio_pct"), "thermometer_max_abs": mx.get(f"d{axis}_thermometer"),
+                    "precondition": sig.get("precondition"), "about_refresh_response": rank >= 2,
+                    "can_explain": state.get("can_explain"), "cannot_explain_why": state.get("cannot_explain_why")})
+    # the display's (rig's) session-to-session offset of a white reading: a thermal difference inside it is not
+    # established (a re-placed meter does that by itself)
+    for e in entries:
+        sig = e.get("signature") or {}
+        if e.get("status") not in ("measured", "inferred"):
+            continue
+        bound = sig.get("max_abs_dxy") if sig.get("type") == "session_offset" else None
+        if bound is None:
+            bound = ((e.get("facets") or {}).get("session_offset_bound") or {}).get("dxy")
+        if isinstance(bound, (int, float)) and bound > 0:
+            out.update({"session_offset_dxy": float(bound), "session_offset_entry": e.get("id")})
+            break
+    if out["entry"] is None and "session_offset_dxy" not in out:
+        return None
+    return out
 
 
 def record_thermometer(response: Any, run_dirs: Sequence[Path | str] = ()) -> tuple[Optional[dict[str, Any]], str]:
@@ -562,8 +603,20 @@ def thermal_state(verify_th: Optional[dict[str, Any]], record_th: Optional[dict[
     if abs(comp) <= 0.5 * tol_xy:
         out["why"] = f"the difference lies mostly off the display's thermometer axis ({axis})"
         return out
-    out["state"] = "cooler than the record" if comp * cooler > 0 else "hotter than the record"
+    which = "cooler than the record" if comp * cooler > 0 else "hotter than the record"
     out["direction_from"] = f"{kn.get('entry')} ({kn.get('cooler_from')})"
+    # a difference a re-placed meter makes by itself is no thermal state: the display's own session-to-session offset
+    # bound (its knowledge), else the tolerance
+    bound = kn.get("session_offset_dxy")
+    out["session_offset_dxy"] = float(bound) if bound else tol_xy
+    out["session_offset_from"] = (f"{kn.get('session_offset_entry')} (session_offset max_abs_dxy)" if bound
+                                  else "the session tolerance (no session_offset entry in the display's knowledge)")
+    if dist <= out["session_offset_dxy"]:
+        out["state"] = f"{which}, but within the display's session-to-session offset: not established"
+        out["established"] = False
+        return out
+    out["state"] = which
+    out["established"] = True
     return out
 
 
@@ -573,6 +626,11 @@ def thermal_words(th: dict[str, Any]) -> str:
     if st == "as the record":
         s = (f"panel as warm as when the response was recorded (reference greys {th.get('median_dx'):+.4f} / "
              f"{th.get('median_dy'):+.4f} in x / y over {th.get('n_levels')} level(s), within {th.get('tolerance_xy')})")
+    elif st in THERMAL_STATES[3:5]:
+        s = (f"panel possibly {st.split(' than')[0]} than when the response was recorded (reference greys "
+             f"{th.get('median_dx'):+.4f} / {th.get('median_dy'):+.4f} in x / y over {th.get('n_levels')} level(s), "
+             f"{th.get('distance_xy')} in xy), but within the display's session-to-session offset "
+             f"({th.get('session_offset_dxy')}, {th.get('session_offset_from')}): not established")
     elif st in ("cooler than the record", "hotter than the record"):
         s = (f"panel {st.split(' than')[0]} than when the response was recorded (reference greys "
              f"{th.get('median_dx'):+.4f} / {th.get('median_dy'):+.4f} in x / y over {th.get('n_levels')} level(s), "

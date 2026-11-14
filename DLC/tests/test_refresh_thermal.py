@@ -58,12 +58,14 @@ def test_the_change_in_dE_ITP_matches_the_colour_package(nits, pct, dx, dy, ref)
 
 # ----------------------------------------------------------------------------- the real runs
 def test_the_warming_morning_run_is_a_below_visibility_leftover_on_a_cooler_panel(fx, record):
-    """08:07 (the panel warming under the run): +0.1..+0.75 % left over at 47.952 / 50 Hz, under one JND everywhere;
-    the reference greys read +0.0022 in x over the record's at the six comparable levels: cooler than the record,
-    and the display's knowledge (F-0006) expects a positive leftover of up to about 0.9 %."""
+    """08:07 (the panel warming under the run): +0.1..+0.75 % left over at 47.952 / 50 Hz, under one JND everywhere.
+    The reference greys read +0.0022 in x over the record's at the six comparable levels: beyond the 0.002 tolerance,
+    in the cooler direction (F-0006), but inside the rig's 0.0025 session-to-session offset (R-0001) - a re-placed
+    meter does that by itself, so 'cooler' is NOT established and no leftover expectation is stated."""
     res = _verify(fx, record, "0807")
     th = res["thermal"]
-    assert th["state"] == "cooler than the record" and th["n_levels"] == 6
+    assert th["state"] == "cooler than the record" + rv.NOT_ESTABLISHED and th["n_levels"] == 6
+    assert th["established"] is False and th["session_offset_dxy"] == 0.0025 and "R-0001" in th["session_offset_from"]
     assert {lv["patch"] for lv in th["levels"] if lv["comparable"]} == LEVELS_COMPARED
     assert th["median_dx"] == pytest.approx(0.0022, abs=0.0002) and th["distance_xy"] > rv.THERMAL_TOL_XY
     for rate in ("47.952", "50"):
@@ -77,9 +79,14 @@ def test_the_warming_morning_run_is_a_below_visibility_leftover_on_a_cooler_pane
     assert res["per_rate"]["47.952"]["mean_pct"] == pytest.approx(0.37, abs=0.03)
     assert res["per_rate"]["47.952"]["largest_itp"] < 0.5
     s = res["summary"]
-    assert "panel cooler than when the response was recorded" in s
-    assert "a positive leftover of up to about 0.9 % is expected" in s and "F-0006" in s
+    assert "panel possibly cooler than when the response was recorded" in s and "not established" in s
+    assert "is expected" not in s                          # the expectation only for an established state
     assert "drift inside the run" in s and "below visibility" in s
+    # established once beyond the session offset: the same run against a 0.002 offset (no session entry)
+    kn = {k: v for k, v in rf.KNOWLEDGE_F0006.items() if not k.startswith("session_offset")}
+    res2 = _verify(fx, record, "0807", knowledge=kn)
+    assert res2["thermal"]["state"] == "cooler than the record" and res2["thermal"]["established"] is True
+    assert "a positive leftover of up to about 0.9 % is expected" in res2["summary"] and "F-0006" in res2["summary"]
     # the run itself stays undecided: its nine implausible g120 reads are anomalies to judge
     assert res["verdict"] == "undecided" and res["recommendation"]["visible"] == []
 
@@ -223,31 +230,146 @@ def test_a_verify_reads_the_records_thermometer_end_to_end(tmp_path):
     assert d["recommendation"]["verdict"] == "pass" and d["preheat"] is None
 
 
-def test_the_knowledge_hook_reads_the_thermal_offset_and_writes_nothing(tmp_path):
+def _knowledge_store(tmp_path: Path, *, structured_sign: bool = False, with_session: bool = True):
+    """A knowledge unit shaped like the PA32UCXR's: a refresh-response entry, a thermal_offset entry WITHOUT a
+    direction listed first (like F-0005), the refresh-linked thermal_offset with one (like F-0006), and the rig's
+    session_offset (like R-0001)."""
     from dlc import knowledge as kn
     ev = tmp_path / "ev.txt"
     ev.write_text("warm.log\n", encoding="utf-8")
     store = kn.KnowledgeStore(tmp_path / "dip_knowledge")
     hdr = kn.unit_from_header({"identity": {"hardware_id": "TST1234", "edid_id": "TST1234-12345"},
                                "aliases": ["Test Panel 32"], "model": "Test Panel 32", "panel": {"tech": "mini-LED"}})
-    entry = {"kind": "panel", "title": "The refresh response is larger on a cool panel",
-             "statement": "Leftover about 0 hot and +0.5..+0.9 % cool; the grey's x is the thermometer (hot = lower x).",
-             "scope": {"mode": ["HDR"], "unknown": ["SDR"]}, "status": "measured",
-             "observations": [{"date": "2026-11-14", "verdict": "establishes", "independent": True,
-                               "source": {"kind": "meter", "path": str(ev)},
-                               "numbers": {"x_100nit_cool": 0.3127, "x_100nit_hot": 0.3067, "leftover_pct": 0.55}}],
-             "signature": {"type": "thermal_offset", "sign": {"rate_ratio_when_cooler": "+"},
-                           "max_abs": {"rate_ratio_pct": 0.9, "dx_thermometer": 0.006}, "tau_min": [15, 30]}}
-    store.apply_ops(hdr["unit_id"], [{"op": "create_entry", "by": "llm:test", "why": "t", "entry": entry}],
+    obs = lambda nums: [{"date": "2026-11-14", "verdict": "establishes", "independent": True,  # noqa: E731
+                         "source": {"kind": "meter", "path": str(ev)}, "numbers": nums}]
+    refresh = {"kind": "panel", "id": "F-0001", "title": "The panel is brighter at lower refresh rates",
+               "statement": "About +1 to +3.4 % at 47.952 Hz against 60 Hz.", "status": "measured",
+               "scope": {"mode": ["HDR"], "unknown": ["SDR"]}, "observations": obs({"ratio_pct_520": 2.64}),
+               "signature": {"type": "none"},
+               "links": [{"rel": "see_field", "field": "Test Panel 32:HDR.refresh_response"}]}
+    load = {"kind": "panel", "id": "F-0002", "title": "Warm-in under load", "status": "measured",
+            "statement": "The white drifts with the backlight load.", "scope": {"mode": ["HDR"], "unknown": ["SDR"]},
+            "observations": obs({"tau_min": 20}),
+            "signature": {"type": "thermal_offset", "sign": {"light_when_cooler": "-"}, "max_abs": {"light_pct": 1.0}}}
+    sign = {"rate_ratio_when_cooler": "+", **({"dx_thermometer_when_cooler": "+"} if structured_sign else {})}
+    thermal = {"kind": "panel", "id": "F-0003", "title": "The refresh response is larger on a cool panel",
+               "statement": "Leftover about 0 hot, +0.5..+0.9 % cool; the grey's x is the thermometer (hot = lower x).",
+               "scope": {"mode": ["HDR"], "unknown": ["SDR"]}, "status": "measured",
+               "observations": obs({"x_100nit_cool": 0.3127, "x_100nit_hot": 0.3067, "leftover_pct": 0.55}),
+               "signature": {"type": "thermal_offset", "sign": sign,
+                             "max_abs": {"rate_ratio_pct": 0.9, "dx_thermometer": 0.006}, "tau_min": [15, 30]},
+               "links": [{"rel": "refines", "id": "F-0001"}, {"rel": "refines", "id": "F-0002"}]}
+    session = {"kind": "rig", "id": "R-0001", "title": "A white reading moves between sessions",
+               "statement": "Re-placing the meter moves a white reading by up to 0.0025 in xy.", "status": "measured",
+               "scope": {"unknown": ["a month apart"]}, "observations": obs({"dxy": [0.0002, 0.0021]}),
+               "signature": {"type": "session_offset", "max_abs_dxy": 0.0025, "max_spread_dxy": 0.0008}}
+    ents = [refresh, load, thermal] + ([session] if with_session else [])
+    store.apply_ops(hdr["unit_id"], [{"op": "create_entry", "by": "llm:test", "why": "t", "entry": e} for e in ents],
                     create=hdr, today="2026-11-14")
+    return store
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_the_knowledge_hook_reads_the_thermal_offset_and_writes_nothing(tmp_path, structured):
+    """A thermal_offset entry without a direction (listed first) is skipped, never returned; the refresh-linked one
+    with a direction is: from sign.dx_thermometer_when_cooler '+' when the entry carries it, else from its paired
+    x_..._cool / x_..._hot numbers. The session offset comes from the session_offset entry. Nothing is written."""
+    store = _knowledge_store(tmp_path, structured_sign=structured)
     before = {p.name: p.stat().st_mtime_ns for p in store.root.iterdir()}
     k = rv.thermal_knowledge(store.root, [None, "Test Panel 32"], mode="HDR", today="2026-11-14")
     assert {p.name: p.stat().st_mtime_ns for p in store.root.iterdir()} == before
+    assert k["entry"] == "F-0003" and k["skipped_without_direction"] == ["F-0002"] and k["about_refresh_response"]
     assert k["axis"] == "x" and k["cooler_sign"] == 1 and k["leftover_sign_when_cooler"] == "+"
-    assert k["leftover_max_pct"] == 0.9 and "x_100nit_cool" in k["cooler_from"]
+    assert k["leftover_max_pct"] == 0.9
+    assert ("dx_thermometer_when_cooler" in k["cooler_from"]) if structured else ("x_100nit_cool" in k["cooler_from"])
+    assert k["session_offset_dxy"] == 0.0025 and k["session_offset_entry"] == "R-0001"
     assert rv.thermal_knowledge(store.root, ["SDR panel nobody knows"]) is None
-    assert rv.thermal_knowledge(store.root, ["Test Panel 32"], mode="SDR") is None
+    sdr = rv.thermal_knowledge(store.root, ["Test Panel 32"], mode="SDR")
+    assert sdr["entry"] is None and sdr["session_offset_dxy"] == 0.0025       # the rig's bound is mode-free
     assert rv.thermal_knowledge(tmp_path / "nowhere", ["Test Panel 32"]) is None
+    for p in store.root.glob("*.json"):                                       # a broken file is no knowledge
+        p.write_text("{broken", encoding="utf-8")
+    assert rv.thermal_knowledge(store.root, ["TST1234-12345"], mode="HDR") is None
+
+
+def test_without_a_session_entry_the_tolerance_is_the_session_bound(tmp_path, fx, record):
+    store = _knowledge_store(tmp_path, with_session=False)
+    k = rv.thermal_knowledge(store.root, ["Test Panel 32"], mode="HDR")
+    assert "session_offset_dxy" not in k
+    res = _verify(fx, record, "0807", knowledge=k)
+    th = res["thermal"]
+    assert th["state"] == "cooler than the record" and th["session_offset_dxy"] == rv.THERMAL_TOL_XY
+    assert "no session_offset entry" in th["session_offset_from"]
+
+
+def test_a_pure_session_offset_on_the_hot_run_is_not_an_established_state(fx, record):
+    """The reviewer's case: the HOT run's reference greys shifted by +0.0021 in x (a re-placed meter) read beyond the
+    0.002 tolerance in the cooler direction - inside the rig's 0.0025 session offset: not established."""
+    rows = []
+    for r in fx["runs"]["0846"]["rows"]:
+        r2 = dict(r)
+        if r.get("xyz") and str(r.get("rate")) == "60":
+            s = sum(r["xyz"])
+            x, y = r["xyz"][0] / s + 0.0021, r["xyz"][1] / s
+            r2["xyz"] = [x / y * r["y"], r["y"], (1 - x - y) / y * r["y"]]
+        rows.append(r2)
+    th = rv.thermal_state(rt.reference_thermometer(rows, "60"), record[0], knowledge=rf.KNOWLEDGE_F0006)
+    assert th["state"] == "cooler than the record" + rv.NOT_ESTABLISHED and th["distance_xy"] > rv.THERMAL_TOL_XY
+
+
+@pytest.mark.parametrize("run", ["0807", "0846"])
+def test_the_thermal_inputs_never_change_a_verdict(fx, record, tmp_path, run):
+    """Per grey and per rate, the real morning runs' verdicts are the same with the record's thermometer present /
+    absent and the knowledge present / absent / broken: the thermal state is reported, never a gate."""
+    r = fx["runs"][run]
+    th, src = record
+    broken = _knowledge_store(tmp_path)
+    for p in broken.root.glob("*.json"):
+        p.write_text("{broken", encoding="utf-8")
+    kn_broken = rv.thermal_knowledge(broken.root, ["TST1234-12345"])
+    assert kn_broken is None
+    seen = []
+    for rec_th in (th, None):
+        for kn in (rf.KNOWLEDGE_F0006, None, kn_broken, {"axis": "x", "cooler_sign": None}):
+            res = rv.analyze_verify(r["rows"], reference="60", trim_checks=r["trim_checks"], anomalies=r["anomalies"],
+                                    link_bpc=r["link_bpc"], record_th=rec_th, record_source=src, knowledge=kn)
+            seen.append((res["verdict"], {rate: (v["verdict"], {p: c["verdict"] for p, c in v["greys"].items()})
+                                          for rate, v in res["rates"].items()}, res["recommendation"]["visible"],
+                         res["recommendation"]["below_visibility"]))
+    assert all(s == seen[0] for s in seen)
+
+
+@pytest.mark.parametrize("run", ["0807", "0846"])
+@pytest.mark.parametrize("fault", ["trim not applied", "half strength", "applied twice"])
+def test_a_trim_fault_on_the_real_rows_fails(fx, record, run, fault):
+    """The reviewer's enumeration: the trim not applied, at half strength (x sqrt of the recorded ratio) or applied
+    twice (x 1 / ratio) on top of what the panel did, on both real runs - each fails the run, with its anomalies kept."""
+    r = fx["runs"][run]
+    res = _verify(fx, record, run, rows=rf.with_fault(fx, r["rows"], fault))
+    assert res["verdict"] == "fail", res["summary"]
+    for rate in ("47.952", "50"):
+        assert res["rates"][rate]["verdict"] == "fail"
+        assert any(c.get("verdict") == "fail" and c["visibility_itp"] >= 1.0
+                   for c in res["rates"][rate]["greys"].values())
+
+
+def test_the_committed_probe_fixtures_match_what_dlc_writes():
+    """tests/fixtures/gen_dip_probes.py --check (the DIP / chart fixtures the C++ DLC readers are tested on, built by
+    DLC's own probe simulators): the committed files must load as DLC loads them and carry exactly the keys DLC
+    writes today. A new DIP field without a regenerated fixture fails here, not in the C++ suite."""
+    import importlib.util
+    import sys
+    gen = Path(__file__).resolve().parents[2] / "tests" / "fixtures" / "gen_dip_probes.py"
+    if not gen.exists():
+        pytest.skip("the repository's C++ fixtures are not beside this DLC tree")
+    spec = importlib.util.spec_from_file_location("gen_dip_probes", gen)
+    mod = importlib.util.module_from_spec(spec)
+    saved = list(sys.path)
+    try:
+        spec.loader.exec_module(mod)
+        assert mod.check() == 0
+    finally:
+        sys.path[:] = saved
 
 
 def test_nothing_changes_for_a_run_with_the_trim_off(tmp_path):
@@ -282,3 +404,35 @@ def test_preheat_is_offered_not_forced(tmp_path):
     plan = next(json.loads(x) for x in (cal.ctx.root / "events.jsonl").read_text(encoding="utf-8").splitlines()
                 if '"refresh-response:plan"' in x)
     assert "Preheat: closed_loop" in json.dumps(plan)
+    # the plan's time estimate includes the chosen preheat
+    est = cal.calib["refresh_probe"]["estimate"]
+    assert est["preheat_min"][0] > 0 and est["preheat_min"][1] > est["preheat_min"][0]
+    from dataclasses import replace
+    run_spec = rp.RefreshProbeSpec.from_dict(cal.calib["refresh_probe"]["spec"])
+    none = rp.estimate(cal.calib["refresh_probe"]["legs"], 3, 0, replace(run_spec, preheat="none"))
+    assert none["preheat_min"] == [0.0, 0.0]
+    assert est["total_min"][0] == pytest.approx(none["total_min"][0] + est["preheat_min"][0], abs=0.15)
+
+
+def test_the_record_flow_with_closed_loop_preheats_with_the_trim_off_and_records_it(tmp_path, monkeypatch):
+    """The record flow (purpose response) with preheat closed_loop: the probe stack (trim OFF, 3D LUT bypassed) is
+    set before the preheat runs, and the recorded section's conditions say it was preheated."""
+    from test_refresh_probe import _calib as probe_calib
+    cal, _, _ = probe_calib(tmp_path, "recpre", spec={"preheat": "closed_loop"})
+    cal.controller.call("layers.set", {"monitor": 0, "mode": "HDR", "refresh_trim": True})   # on before the run
+    seen = {}
+    real = rp._Probe.preheat
+
+    def spy(self):
+        seen["layers"] = dict((cal.controller.state().get("layers") or {}).get("0:HDR") or {})
+        return real(self)
+    monkeypatch.setattr(rp._Probe, "preheat", spy)
+    res = cal.run("refresh-response")
+    assert res.status == "completed", res.digest
+    assert seen["layers"].get("refresh_trim") is False and seen["layers"].get("bypass_3dlut") is True
+    resp, _, _ = rt.response_for_run_dir(cal.ctx.root)
+    pre = resp.conditions["preheat"]
+    assert pre["policy"] == "closed_loop" and "converged" in pre
+    cal2, _, _ = probe_calib(tmp_path, "recnone")
+    cal2.run("refresh-response")
+    assert rt.response_for_run_dir(cal2.ctx.root)[0].conditions["preheat"] == {"policy": "none"}

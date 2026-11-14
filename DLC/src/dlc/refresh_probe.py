@@ -239,10 +239,24 @@ def estimate(legs: Sequence[dict[str, Any]], n_greys: int, n_colours: int, spec:
     reads = sum((n_greys + (n_colours if lg["full"] else 0)) * per_patch_s for lg in legs)
     sw = sum(1 for a, b in zip(legs, legs[1:]) if a["rate"] != b["rate"])
     settle = sw * (switch_settle_s if switch_settle_s is not None else spec.settle_min_s + 4.0)
+    pre = preheat_estimate_s(spec, per_patch_s=per_patch_s)
     return {"switches": sw, "reads_min": round(reads / 60.0, 1), "settle_min": round(settle / 60.0, 1),
             "warm_min": [round(spec.warm_min_s / 60.0, 1), round(spec.warm_max_s / 60.0, 1)],
-            "total_min": [round((reads + settle + spec.warm_min_s) / 60.0, 1),
-                          round((reads + sw * spec.settle_max_s + spec.warm_max_s) / 60.0, 1)]}
+            "preheat_min": [round(pre[0] / 60.0, 1), round(pre[1] / 60.0, 1)],
+            "total_min": [round((reads + settle + spec.warm_min_s + pre[0]) / 60.0, 1),
+                          round((reads + sw * spec.settle_max_s + spec.warm_max_s + pre[1]) / 60.0, 1)]}
+
+
+def preheat_estimate_s(spec: RefreshProbeSpec, *, per_patch_s: float = 6.0) -> tuple[float, float]:
+    """The chosen preheat's time, (least, most): a closed-loop block is ``load_reads_per_block`` + ``ref_reads``
+    reads; it converges after at least ``window_blocks`` blocks (an already-warm panel) and stops at ``max_blocks``
+    (flagged). ``none`` = (0, 0)."""
+    if spec.preheat != "closed_loop":
+        return 0.0, 0.0
+    from .thermal import ThermalConfig
+    c = ThermalConfig()
+    block = (c.load_reads_per_block + c.ref_reads) * per_patch_s
+    return c.window_blocks * block, c.max_blocks * block
 
 
 # ----------------------------------------------------------------------------- the mode rate source
@@ -1050,6 +1064,7 @@ def analyze_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, source: An
                 "meter": {"resolve": {"instruments": [{"description": cal.profile.meter.model}]},
                           "correction": {"file": corr}},
                 "spec": spec.as_dict(), "plan": st.get("plan"), "warm_in": st.get("warm_in"), "rewarm": st.get("rewarm"),
+                "preheat": st.get("preheat"),
                 "restore": st.get("restore"), "source": source.kind, "ref_view": ref_view}
     write_json(root / "evidence.json", evidence)
     ref, ref_hz = st["reference"], float(st["reference_hz"])
@@ -1244,10 +1259,13 @@ def run_flow(cal: Any) -> Any:
         st["estimate"] = est
         cal._save()
         what = (f"VERIFY DesktopLUT's REFRESH TRIM (ON, never switched; nothing recorded) on monitor {cal.monitor} "
-                f"({cal.display.name}, {hw}) in HDR: pass = every grey at each rate within "
-                f"{spec.verify_lum_tol * 100:g} % of the time-bracketed reference light, its chromaticity shift inside "
-                "the reference legs' own repeatability (Student t, Bonferroni), the trim read back on screen at every "
-                "rate. "
+                f"({cal.display.name}, {hw}) in HDR, per grey and rate: pass = within "
+                f"{spec.verify_lum_tol * 100:g} % of the time-bracketed reference light and its chromaticity shift "
+                "inside the reference legs' own repeatability (Student t, Bonferroni); outside them the grey's change "
+                "(light and colour together, BT.2124 dE_ITP at its light) decides: fail at >= 1 JND (visible), "
+                "pass_below_visibility below it (named with its number); undecided where the reads cannot decide; "
+                "the trim must read back on screen at every rate (else fail). The panel's thermal state against the "
+                "record's is reported, never a gate. "
                 if spec.verify else
                 f"Measure the refresh response of monitor {cal.monitor} ({cal.display.name}, {hw}) in HDR via "
                 f"the {source.kind} rate source: ")
