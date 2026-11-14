@@ -277,7 +277,7 @@ def test_an_event_may_share_a_signature_type_with_a_property(tmp_path: Path, ev:
 def test_hard_size_limit_and_active_entry_cap(tmp_path: Path, ev: Path, monkeypatch):
     store = _store(tmp_path)
     _create(store, [_measured(ev, links=[])])
-    monkeypatch.setattr(kn, "HARD_LIMIT_BYTES", 2000)
+    monkeypatch.setattr(kn, "HARD_LIMIT_BYTES", store.path(_uid()).stat().st_size + 200)   # readable, no room
     with pytest.raises(KnowledgeError, match="over the hard limit"):
         store.apply_ops(_uid(), [{"op": "create_entry", "by": BY, "why": "x", "entry": _hyp(id=None, links=[])}])
     monkeypatch.setattr(kn, "HARD_LIMIT_BYTES", 1024 * 1024)
@@ -677,17 +677,69 @@ def test_a_second_file_for_the_same_display_is_refused_without_a_reason(tmp_path
     assert store.unit_ids() == sorted([_uid(), hdr["unit_id"]])
 
 
-def test_relative_evidence_resolves_against_the_dip_store_folder_and_folders_hash(tmp_path: Path):
+def test_relative_evidence_resolves_against_the_dip_store_folder_and_only_files_hash(tmp_path: Path):
+    """Review nit: a run folder is never hashed whole (any later write into it would break the hash): the
+    observation names its result files."""
     (tmp_path / "runs" / "r1").mkdir(parents=True)
-    (tmp_path / "runs" / "r1" / "a.txt").write_text("a", encoding="utf-8")
-    (tmp_path / "runs" / "r1" / "b.txt").write_text("b", encoding="utf-8")
+    (tmp_path / "runs" / "r1" / "a.txt").write_bytes(b"a")
+    (tmp_path / "runs" / "r1" / "b.txt").write_bytes(b"b")
     store = KnowledgeStore.beside(tmp_path / "dip_store.json")
     assert store.root == tmp_path / "dip_knowledge" and store.base_dir == tmp_path
-    src = kn.hash_evidence({"kind": "run", "path": "runs/r1#raw.ti3"}, store.base_dir)
-    assert src["hash_of"] == "dir" and src["path"] == "runs/r1#raw.ti3"
-    assert src["sha256"] == kn.sha256_dir(tmp_path / "runs" / "r1")
-    (tmp_path / "runs" / "r1" / "b.txt").write_text("c", encoding="utf-8")
-    assert kn.sha256_dir(tmp_path / "runs" / "r1") != src["sha256"]
+    with pytest.raises(KnowledgeError, match="is a folder: name its result files"):
+        kn.hash_evidence({"kind": "run", "path": "runs/r1#raw.ti3"}, store.base_dir)
+    src = kn.hash_evidence({"kind": "run", "path": "runs/r1/a.txt#row 3",
+                            "files": [{"path": "runs/r1/b.txt"}]}, store.base_dir)
+    assert src["hash_of"] == "file" and src["path"] == "runs/r1/a.txt#row 3"
+    assert src["sha256"] == hashlib.sha256(b"a").hexdigest()
+    assert src["files"] == [{"path": "runs/r1/b.txt", "sha256": hashlib.sha256(b"b").hexdigest()}]
+    for bad in (r"\\server\share\x.json", "//server/share/x.json", r"\\?\C:\x.json"):
+        with pytest.raises(KnowledgeError, match="no UNC"):
+            kn.hash_evidence({"kind": "x", "path": bad}, store.base_dir)
+
+
+def test_per_code_tables_cannot_be_smuggled(tmp_path: Path, ev: Path):
+    """Review fix 6: the reviewer's smuggling cases, each refused."""
+    doc = _create(_store(tmp_path), [_measured(ev), _hyp()])
+    cases = {
+        "200 named keys": ("numbers", {f"code_{c}": 1.0 for c in range(100, 300)}, "keys (limit 16)"),
+        "16x16 nested list": ("numbers", {"t": [[float(i)] * 16 for i in range(16)]}, "flat list"),
+        "number-keyed 16x16": ("numbers", {"t": {f"{c}": [1.0] * 16 for c in range(16)}}, "flat list of at most 4"),
+        "too many numbers": ("numbers", {f"k{i}": [1.0] * 16 for i in range(4)}, "numbers (limit 48)"),
+        "5000-value string": ("conditions", {"table": ",".join(str(i) for i in range(5000))}, "limit 200"),
+        "13 conditions": ("conditions", {f"c{i}": "x" for i in range(13)}, "keys (limit 12)"),
+        "long note": ("note", "x" * 2500, "limit"),
+    }
+    for name, (field, value, match) in cases.items():
+        d = copy.deepcopy(doc)
+        d["entries"][0]["observations"][0][field] = value
+        v = validate_unit(d)
+        assert any(match in x for x in v), (name, v[:3])
+
+
+def test_an_oversized_file_is_not_read(tmp_path: Path, ev: Path, monkeypatch):
+    store = _store(tmp_path)
+    _create(store, [_measured(ev), _hyp()])
+    monkeypatch.setattr(kn, "HARD_LIMIT_BYTES", 1000)
+    with pytest.raises(CorruptFile, match="over the 1000-byte limit"):
+        store.read_raw(_uid())
+
+
+def test_a_view_that_failed_to_render_is_repaired_on_the_next_read(tmp_path: Path, ev: Path, monkeypatch, capsys):
+    store = _store(tmp_path)
+    _create(store, [_measured(ev), _hyp()])
+
+    def broken(*a, **k):
+        raise RuntimeError("render failed")
+
+    real = kn.render
+    monkeypatch.setattr(kn, "render", broken)
+    doc = store.apply_ops(_uid(), [{"op": "add_alias", "by": BY, "why": "x", "alias": "Second"}], today=TODAY)
+    assert doc["rev"] == 2 and "could not be" in capsys.readouterr().err
+    assert "rev 1," in store.md_path(_uid()).read_text(encoding="utf-8").splitlines()[0]     # stale
+    monkeypatch.setattr(kn, "render", real)
+    store.load(_uid(), today=TODAY)
+    assert "rev 2," in store.md_path(_uid()).read_text(encoding="utf-8").splitlines()[0]
+    assert "re-rendered" in capsys.readouterr().err
 
 
 # ----------------------------------------------------------------------------- the view

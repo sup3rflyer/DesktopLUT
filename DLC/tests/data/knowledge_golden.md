@@ -37,7 +37,7 @@ Facet `grey_light_structure` (read by base 1D LUT build, grayscale-wb (stage S4)
 
 | obs | date | verdict | counts | session / run | by | source | numbers |
 |---|---|---|---|---|---|---|---|
-| O1 | 2026-11-14 | establishes | confirms | — | llm:test | dense read: `evidence/dense.json` (sha256 ef2e393ef100…, file) | {teeth_pct: [2, 4], max_dev_pct: 4.43} |
+| O1 | 2026-11-14 | establishes | confirms | — | llm:test | dense read: `evidence/dense.json` (sha256 ef2e393ef100…) | {teeth_pct: [2, 4], max_dev_pct: 4.43} |
 | O2 | 2026-09-25 | matches | confirms | — | llm:test | raw ramp: `an older run, file not kept` (no evidence file) | {loo_light_structure_pct: 0.92, ratio_to_g22: {132: 0.88, 165: 0.874}} |
 
 - Implication for grayscale-wb: Correct light as a trend, balance per grey.

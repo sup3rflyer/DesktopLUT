@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from .knowledge import (MODES, STATUSES, KnowledgeError, KnowledgeStore, _entry, _norm_name, evidence_file, render,
-                        sha256_dir, sha256_file, unit_from_header, validate_observation_context)
+                        sha256_file, unit_from_header, validate_observation_context)
 from .paths import atomic_write_text
 
 def _read_json_file(path: str) -> Any:
@@ -114,7 +114,7 @@ def _run(args: Any, store: KnowledgeStore) -> int:
     today = args.today
     if args.cmd == "show":
         uid = store.resolve(args.display)
-        doc = store.read_raw(uid)
+        doc = store.load(uid, today=today)
         print(render(doc, source=store.path(uid).name, today=today, mode=args.mode, only=args.id), end="")
         return 0
     if args.cmd == "add":
@@ -237,15 +237,14 @@ def _evidence_problems(doc: dict, base_dir: Optional[Path]) -> list[str]:
     for e in doc.get("entries") or []:
         for o in e.get("observations") or []:
             src = o.get("source") or {}
-            if not src.get("path"):
-                continue
-            p = evidence_file(src["path"], base_dir)
-            if not p.exists():
-                out.append(f"{e['id']} {o['id']}: {src['path']} is gone")
-                continue
-            now = sha256_file(p) if p.is_file() else sha256_dir(p)
-            if now != src.get("sha256"):
-                out.append(f"{e['id']} {o['id']}: {src['path']} changed since it was recorded")
+            items = ([{"path": src["path"], "sha256": src.get("sha256")}] if src.get("path") else []) + \
+                list(src.get("files") or [])
+            for it in items:
+                p = evidence_file(it["path"], base_dir)
+                if not p.is_file():
+                    out.append(f"{e['id']} {o['id']}: {it['path']} is gone")
+                elif sha256_file(p) != it.get("sha256"):
+                    out.append(f"{e['id']} {o['id']}: {it['path']} changed since it was recorded")
     return out
 
 

@@ -130,7 +130,13 @@ STATUS_HISTORY_KEYS = frozenset({"status", "date", "by", "why"})
 OBS_KEYS = frozenset({"id", "date", "by", "verdict", "source", "conditions", "numbers", "independent", "session",
                       "run", "note"})
 OBS_INPUT_KEYS = OBS_KEYS - {"id"}
-SOURCE_KEYS = frozenset({"kind", "path", "sha256", "hash_of", "ref"})
+SOURCE_KEYS = frozenset({"kind", "path", "sha256", "hash_of", "ref", "files"})
+SOURCE_FILE_KEYS = frozenset({"path", "sha256"})
+MAX_NUMBERS_KEYS = 16
+MAX_NUMBERS_LEAVES = 48
+MAX_CONDITIONS_KEYS = 12
+CONDITION_STR_MAX = 200
+ANY_STRING_MAX = 2000
 ROLLUP_KEYS = frozenset({"count", "independent", "first", "last", "folded_ids", "verdicts", "numbers", "sessions"})
 IMPLICATION_KEYS = frozenset({"flows", "text"})
 QUESTION_KEYS = frozenset({"id", "q", "test", "owner_action", "status", "answer", "closed", "closed_by"})
@@ -210,43 +216,66 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def sha256_dir(path: Path) -> str:
-    """A directory's hash: sha256 over ``relpath NUL file-sha256 LF`` of every file, sorted by relpath."""
-    h = hashlib.sha256()
-    for f in sorted((p for p in path.rglob("*") if p.is_file()), key=lambda p: p.relative_to(path).as_posix()):
-        h.update(f"{f.relative_to(path).as_posix()}\0{sha256_file(f)}\n".encode("utf-8"))
-    return h.hexdigest()
+_LOCAL_PATH_RE = re.compile(r"^(?:[A-Za-z]:[/\\]|(?![/\\]))")
+MAX_SOURCE_FILES = 8
+
+
+def evidence_path_problem(path_text: Any) -> Optional[str]:
+    """Why an evidence path is not acceptable (None = fine): local drive paths or paths relative to the DIP store's
+    folder only — no UNC / network / device paths (they change or vanish with the network)."""
+    if not isinstance(path_text, str) or not path_text.strip():
+        return "a non-empty string"
+    t = path_text.strip()
+    if t.startswith(("\\\\", "//")) or not _LOCAL_PATH_RE.match(t):
+        return f"{path_text!r} is not a local drive path or a path relative to the DIP store's folder (no UNC)"
+    return None
 
 
 def evidence_file(path_text: str, base_dir: Optional[Path]) -> Path:
-    """The file (or folder) an evidence path names: the part before any ``#fragment``; a relative path is relative
-    to ``base_dir`` (the folder holding ``dip_store.json``)."""
+    """The file an evidence path names: the part before any ``#fragment``; a relative path is relative to
+    ``base_dir`` (the folder holding ``dip_store.json``)."""
     p = Path(path_text.split("#", 1)[0])
     if not p.is_absolute() and base_dir is not None:
         p = base_dir / p
     return p
 
 
-def hash_evidence(source: dict[str, Any], base_dir: Optional[Path]) -> dict[str, Any]:
-    """Return ``source`` with ``sha256`` + ``hash_of`` filled from the file it names. Refuses a path that does not
-    exist and a given sha256 that does not match the file now."""
-    src = dict(source)
-    path_text = src.get("path")
-    if not path_text:
-        return src
+def _hash_one(path_text: Any, given: Any, base_dir: Optional[Path]) -> tuple[str, str]:
+    problem = evidence_path_problem(path_text)
+    if problem:
+        raise KnowledgeError(f"evidence path: {problem}")
     p = evidence_file(str(path_text), base_dir)
-    if p.is_file():
-        digest, kind = sha256_file(p), "file"
-    elif p.is_dir():
-        digest, kind = sha256_dir(p), "dir"
-    else:
+    if p.is_dir():
+        raise KnowledgeError(f"evidence {path_text} is a folder: name its result files (for a run folder e.g. "
+                             f"spots/spots.json, refresh_result.json) in 'path' / 'files'; a live folder's hash breaks "
+                             f"at the next write into it")
+    if not p.is_file():
         raise KnowledgeError(f"evidence path does not exist: {path_text}")
-    given = src.get("sha256")
+    digest = sha256_file(p)
     if given and given != digest:
         raise KnowledgeError(f"evidence {path_text}: sha256 {given} does not match the file now ({digest})")
-    src["path"] = str(path_text).replace("\\", "/")
-    src["sha256"] = digest
-    src["hash_of"] = kind
+    return str(path_text).replace("\\", "/"), digest
+
+
+def hash_evidence(source: dict[str, Any], base_dir: Optional[Path]) -> dict[str, Any]:
+    """Return ``source`` with ``sha256`` (+ ``hash_of`` = "file") filled from the FILE it names, and each of its
+    ``files`` ({path} -> {path, sha256}). Refuses a folder, a path that does not exist, a non-local path and a given
+    sha256 that does not match the file now."""
+    src = dict(source)
+    if src.get("path"):
+        src["path"], src["sha256"] = _hash_one(src["path"], src.get("sha256"), base_dir)
+        src["hash_of"] = "file"
+    if "files" in src:
+        files = src["files"]
+        if not isinstance(files, list) or not files or len(files) > MAX_SOURCE_FILES:
+            raise KnowledgeError(f"evidence 'files': a list of 1-{MAX_SOURCE_FILES} {{path}} objects")
+        out = []
+        for f in files:
+            if not isinstance(f, dict) or set(f) - SOURCE_FILE_KEYS or "path" not in f:
+                raise KnowledgeError("evidence 'files': each item is {path} (sha256 is filled in)")
+            path, digest = _hash_one(f["path"], f.get("sha256"), base_dir)
+            out.append({"path": path, "sha256": digest})
+        src["files"] = out
     return src
 
 
@@ -427,24 +456,46 @@ def _check_numbers(nums: Any, where: str, out: list[str]) -> None:
     if not isinstance(nums, dict) or not nums:
         out.append(f"{where}: an observation needs numbers (a non-empty object of summary statistics)")
         return
+    # Review fix 6: summary statistics, bounded in count AND depth, so no per-code table gets in under other names:
+    # at most 16 keys; a value is a number, a short string, a FLAT list of at most 16 numbers, or a map of at most
+    # 16 numbers / flat lists of at most 4; at most 48 numbers in all.
+    if len(nums) > MAX_NUMBERS_KEYS:
+        out.append(f"{where}: {len(nums)} keys (limit {MAX_NUMBERS_KEYS}): summary statistics, not a table "
+                   f"(raw reads go in an evidence file)")
+    leaves = 0
+
+    def flat(v: Any, limit: int) -> bool:
+        return isinstance(v, list) and 0 < len(v) <= limit and all(_is_num(x) for x in v)
+
     for k, v in nums.items():
         w = f"{where}.{k}"
         if _is_num(v) or isinstance(v, bool):
+            leaves += 1
             continue
         if isinstance(v, str):
             if len(v) > 80:
                 out.append(f"{w}: a string of {len(v)} characters (limit 80)")
             continue
         if isinstance(v, list):
-            if not _numeric_list(v):
-                out.append(f"{w}: a list must hold numbers")
+            if not flat(v, MAX_NUMERIC_ARRAY):
+                out.append(f"{w}: a flat list of at most {MAX_NUMERIC_ARRAY} numbers (no nested lists)")
+            else:
+                leaves += len(v)
             continue
         if isinstance(v, dict):
+            if len(v) > MAX_NUMERIC_ARRAY:
+                continue                       # named by the per-code-table rule
             for kk, vv in v.items():
-                if not (_is_num(vv) or (isinstance(vv, list) and _numeric_list(vv))):
-                    out.append(f"{w}.{kk}: a number or a short number list")
+                if _is_num(vv):
+                    leaves += 1
+                elif flat(vv, MAX_FACET_ARRAY):
+                    leaves += len(vv)
+                else:
+                    out.append(f"{w}.{kk}: a number or a flat list of at most {MAX_FACET_ARRAY} numbers")
             continue
         out.append(f"{w}: numbers hold numbers, short strings, number lists or small maps")
+    if leaves > MAX_NUMBERS_LEAVES:
+        out.append(f"{where}: {leaves} numbers (limit {MAX_NUMBERS_LEAVES}): summary statistics, not a table")
 
 
 def _check_source(src: Any, where: str, out: list[str]) -> None:
@@ -453,17 +504,33 @@ def _check_source(src: Any, where: str, out: list[str]) -> None:
         return
     _unknown_keys(src, SOURCE_KEYS, where, out)
     _check_text(src.get("kind"), f"{where}.kind", out, max_len=120)
-    if not src.get("path") and not src.get("ref"):
-        out.append(f"{where}: needs a 'path' (an evidence file, hashed) or a 'ref' (a pointer without a file)")
+    if not src.get("path") and not src.get("ref") and not src.get("files"):
+        out.append(f"{where}: needs a 'path' / 'files' (evidence files, hashed) or a 'ref' (a pointer without a "
+                   f"file)")
     if src.get("path"):
-        if not isinstance(src["path"], str):
-            out.append(f"{where}.path: a string")
+        problem = evidence_path_problem(src["path"])
+        if problem:
+            out.append(f"{where}.path: {problem}")
         if not (isinstance(src.get("sha256"), str) and _SHA_RE.match(src["sha256"])):
             out.append(f"{where}.sha256: an evidence path needs the sha256 taken when it was written")
-        if src.get("hash_of") not in ("file", "dir"):
-            out.append(f"{where}.hash_of: 'file' or 'dir'")
+        if src.get("hash_of") != "file":
+            out.append(f"{where}.hash_of: 'file' (folders are not hashed: name the result files)")
     elif "sha256" in src or "hash_of" in src:
         out.append(f"{where}: sha256 / hash_of without a path")
+    if "files" in src:
+        files = src["files"]
+        if not isinstance(files, list) or not files or len(files) > MAX_SOURCE_FILES:
+            out.append(f"{where}.files: a list of 1-{MAX_SOURCE_FILES} {{path, sha256}}")
+        else:
+            for i, f in enumerate(files):
+                if not isinstance(f, dict) or set(f) != SOURCE_FILE_KEYS:
+                    out.append(f"{where}.files[{i}]: {{path, sha256}}")
+                    continue
+                problem = evidence_path_problem(f["path"])
+                if problem:
+                    out.append(f"{where}.files[{i}].path: {problem}")
+                if not (isinstance(f["sha256"], str) and _SHA_RE.match(f["sha256"])):
+                    out.append(f"{where}.files[{i}].sha256: taken when it was written")
     if "ref" in src:
         _check_text(src["ref"], f"{where}.ref", out, max_len=300)
 
@@ -488,9 +555,17 @@ def _check_observation(o: Any, where: str, out: list[str]) -> None:
         _check_text(o["session"], f"{where}.session", out, max_len=SESSION_MAX)
     if "run" in o and not (isinstance(o["run"], str) and _RUN_RE.search(o["run"])):
         out.append(f"{where}.run: a DLC run id or folder (YYYYMMDD_HHMMSS_...)")
-    if "conditions" in o and (not isinstance(o["conditions"], dict) or not all(
-            isinstance(v, (str, int, float, bool)) for v in o["conditions"].values())):
-        out.append(f"{where}.conditions: an object of scalars")
+    if "conditions" in o:
+        cond = o["conditions"]
+        if not isinstance(cond, dict) or not all(isinstance(v, (str, int, float, bool)) for v in cond.values()):
+            out.append(f"{where}.conditions: an object of scalars")
+        else:
+            if len(cond) > MAX_CONDITIONS_KEYS:
+                out.append(f"{where}.conditions: {len(cond)} keys (limit {MAX_CONDITIONS_KEYS})")
+            for k, v in cond.items():
+                if isinstance(v, str) and len(v) > CONDITION_STR_MAX:
+                    out.append(f"{where}.conditions.{k}: a string of {len(v)} characters (limit "
+                               f"{CONDITION_STR_MAX}); data goes in an evidence file")
     if "note" in o:
         _check_text(o["note"], f"{where}.note", out, max_len=600)
 
@@ -689,7 +764,7 @@ def validate_entry(e: Any, where: str = "entry") -> list[str]:
         rolled = (roll or {}).get("count", 0) if isinstance(roll, dict) else 0
         if not all_obs and not rolled:
             out.append(f"{where}: a measured entry needs observations with numbers")
-        if not any(isinstance(o.get("source"), dict) and o["source"].get("path") for o in all_obs):
+        if not any(isinstance(o.get("source"), dict) and (o["source"].get("path") or o["source"].get("files")) for o in all_obs):
             out.append(f"{where}: a measured entry needs at least one observation with a hashed evidence file")
         sc = e.get("scope") if isinstance(e.get("scope"), dict) else {}
         if isinstance(sc.get("unknown"), list) and not sc["unknown"]:
@@ -745,8 +820,25 @@ def _as_list(v: Any, where: str, out: list[str]) -> list:
     return v
 
 
+def _long_strings(node: Any, path: str, out: list[str], depth: int = 0) -> None:
+    if depth > 12:
+        out.append(f"{path}: nested more than 12 levels deep")
+        return
+    if isinstance(node, str):
+        if len(node) > ANY_STRING_MAX:
+            out.append(f"{path}: a string of {len(node)} characters (limit {ANY_STRING_MAX}): data goes in an "
+                       f"evidence file")
+    elif isinstance(node, list):
+        for i, x in enumerate(node):
+            _long_strings(x, f"{path}[{i}]", out, depth + 1)
+    elif isinstance(node, dict):
+        for k, x in node.items():
+            _long_strings(x, f"{path}.{k}", out, depth + 1)
+
+
 def _validate_unit(doc: Any) -> list[str]:
     out: list[str] = []
+    _long_strings(doc, "unit", out)
     if not isinstance(doc, dict):
         return ["the file must hold a JSON object"]
     _unknown_keys(doc, UNIT_KEYS, "unit", out)
@@ -1420,6 +1512,13 @@ class KnowledgeStore:
         if not p.exists():
             return None
         try:
+            size = p.stat().st_size
+        except OSError as exc:
+            raise CorruptFile(f"{p}: cannot be read ({exc})") from exc
+        if size > HARD_LIMIT_BYTES:
+            raise CorruptFile(f"{p}: {size} bytes, over the {HARD_LIMIT_BYTES}-byte limit; not read, never "
+                              f"overwritten")
+        try:
             doc = json.loads(read_text_shared(p))
         except (OSError, ValueError) as exc:
             raise CorruptFile(f"{p}: does not parse ({exc}); it is never overwritten: repair it by hand or move "
@@ -1431,8 +1530,35 @@ class KnowledgeStore:
             raise CorruptFile(f"{p}: holds unit {doc.get('unit_id')!r}")
         return doc
 
-    def load(self, unit_id: str) -> Optional[dict]:
-        return self.read_raw(unit_id)
+    def load(self, unit_id: str, *, today: Optional[str] = None) -> Optional[dict]:
+        """The document (as read_raw), with its ``.md`` view repaired when it is missing or stale (a render that
+        failed after a write: reported then, repaired here)."""
+        doc = self.read_raw(unit_id)
+        if doc is not None:
+            self.ensure_view(unit_id, doc, today=today)
+        return doc
+
+    def view_is_current(self, unit_id: str, doc: dict) -> bool:
+        p = self.md_path(unit_id)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                first = fh.readline()
+        except OSError:
+            return False
+        return f"{unit_id}.json rev {doc.get('rev')}," in first
+
+    def ensure_view(self, unit_id: str, doc: dict, *, today: Optional[str] = None) -> bool:
+        """Re-render the view when it does not carry the file's rev; True = it was repaired. Never raises."""
+        if self.view_is_current(unit_id, doc):
+            return False
+        try:
+            atomic_write_text(self.md_path(unit_id), render(doc, source=self.path(unit_id).name, today=today))
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: the view {self.md_path(unit_id)} could not be written ({type(exc).__name__}: {exc})",
+                  file=sys.stderr)
+            return False
+        print(f"note: the view {self.md_path(unit_id)} was stale or missing and was re-rendered", file=sys.stderr)
+        return True
 
     def load_tolerant(self, unit_id: str) -> Optional[dict]:
         """For readers (digests, the tab, resolution): a missing or broken file is no knowledge, never a failure.
@@ -1516,7 +1642,12 @@ class KnowledgeStore:
                         (on_disk is not None and current is not None and last_seen == seen_rev):
                     self.root.mkdir(parents=True, exist_ok=True)
                     atomic_write_text(p, _dump(new))
-                    atomic_write_text(self.md_path(unit_id), render(new, source=p.name, today=today))
+                    try:
+                        atomic_write_text(self.md_path(unit_id), render(new, source=p.name, today=today))
+                    except Exception as exc:  # noqa: BLE001  (the JSON is written; the view is repaired on read)
+                        print(f"warning: {p.name} rev {new['rev']} is written but its view "
+                              f"{self.md_path(unit_id).name} could not be ({type(exc).__name__}: {exc}); the next "
+                              f"read re-renders it", file=sys.stderr)
                     return new
         raise ConcurrentWrite(f"{p}: changed under this write (now rev {last_seen}); re-read and decide again")
 
@@ -1748,9 +1879,13 @@ def _entry_md(doc: dict, e: dict, today: str) -> list[str]:
             counts = "confirms" if o.get("verdict") in CONFIRMING_VERDICTS else "no"
             sess = (o.get("session") or "—") + (f" / {observation_run(o)}" if observation_run(o) else "")
             src = o.get("source") or {}
-            where = src.get("path") or src.get("ref") or ""
-            sha = f" (sha256 {src['sha256'][:12]}…, {src.get('hash_of')})" if src.get("sha256") else \
-                " (no evidence file)"
+            files = list(src.get("files") or [])
+            where = src.get("path") or (files[0]["path"] if files else src.get("ref") or "")
+            sha = f" (sha256 {src['sha256'][:12]}…)" if src.get("sha256") else \
+                (f" (sha256 {files[0]['sha256'][:12]}…)" if files else " (no evidence file)")
+            more = files[1:] if not src.get("path") else files
+            if more:
+                sha += " + " + ", ".join(f"`{_md_cell(f['path'].rsplit('/', 1)[-1])}`" for f in more)
             cond = f"; conditions {_fmt(o['conditions'])}" if o.get("conditions") else ""
             note = f"; {o['note']}" if o.get("note") else ""
             lines.append(f"| {o['id']} | {o['date']} | {o['verdict']} | {counts} | {_md_cell(sess)} "
