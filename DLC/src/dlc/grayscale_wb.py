@@ -492,171 +492,86 @@ def find_node_outliers(deviations: Mapping[str, Sequence[float]], solved: Iterab
     return out
 
 
-def _neighbour_median(values: Sequence[float], i: int) -> tuple[Optional[float], int]:
-    """The light node ``i``'s neighbours share, the node itself left out, and how many values it rests
-    on: the median of the SYMMETRIC neighbours i-+1 (and i-+2 where both exist) - exact on any straight
-    trend; at an end, Tukey's end-point extrapolation median(y1, 2 y1 - y2, 3 y1 - 2 y2) from the two
-    nearest (also exact on a straight trend). None with fewer than 3 values."""
-    n = len(values)
-    if n < 3:
-        return None, 0
-    if i in (0, n - 1):
-        d = 1 if i == 0 else -1
-        y1, y2 = values[i + d], values[i + 2 * d]
-        return median([y1, 2.0 * y1 - y2, 3.0 * y1 - 2.0 * y2]), 2
-    nb = [values[i - 1], values[i + 1]]
-    if i - 2 >= 0 and i + 2 < n:
-        nb += [values[i - 2], values[i + 2]]
-    return median(nb), len(nb)
-
-
-# Asymptotic standard error of a sample median relative to sigma/sqrt(n) for a normal population
-# (sqrt(pi/2)).
-MEDIAN_SE_FACTOR = math.sqrt(math.pi / 2.0)
-
-
 def light_trend(nodes: Sequence[Mapping[str, Any]], *, alpha: float = FAMILY_ALPHA) -> dict[str, Any]:
-    """The LIGHT part of the touch-up as a trend its nodes share (2026-11-14 HW: the PA32UCXR's full-field
-    light is a sawtooth in the 10-bit code, teeth of 2-4 % every 4-12 codes, while its chromaticity is
-    flat; a node's light correction from reads at one code samples one phase of the sawtooth and is wrong
-    by up to a tooth a few codes away. Its BALANCE correction is sound - this touches light only).
+    """The LIGHT part of the touch-up, committed only as light the nodes on BOTH sides share.
 
-    ``nodes`` (ascending, the solved nodes that take part): ``index``, ``need`` = ln of the luminance gain
-    that puts the node exactly on its target light (from its own read), ``own`` = ln of the luminance
-    gain the solver left there, ``sigma`` = the need's read-noise SE (the node's repeat reads; None = one
-    read: it borrows the median of the up to 8 nearest nodes' that have repeats).
+    Why (2026-11-14 HW): the PA32UCXR's full-field light is a sawtooth in the 10-bit code (teeth of
+    2-4 % every 4-12 codes) while its chromaticity is flat. A node's light correction from reads at one
+    code samples one phase of the sawtooth; it is right at that code and wrong by up to a tooth a few
+    codes away. Its BALANCE correction is sound - this touches light only.
 
-    * NEIGHBOURS' LIGHT: ``T_k`` = :func:`_neighbour_median` of the needs (the node left out; exact on
-      any straight trend).
-    * TOOTH: ``|need_k - T_k| > z * sigma_k`` - the node asks for light its neighbours do not share
-      beyond its own read noise; z = the two-sided Bonferroni critical value over the nodes at ``alpha``.
-    * A tooth takes the neighbours' light ``T_k`` - when that is distinguishable from no correction at
-      all: ``|T_k| > z * MEDIAN_SE_FACTOR * s / sqrt(n_k)``, s = 1.4826 MAD of (need - T) over the nodes
-      (the tooth-to-tooth scatter the neighbours' median is drawn from); otherwise its light is LEFT
-      ALONE (gain 1). Non-teeth keep the solver's value.
-    * NO ISOLATED STEP (the guarantee): then, until nothing moves, any node whose COMMITTED light departs
-      from its neighbours' committed light by more than z * sigma_k is put on its neighbours' median.
+    ``nodes``: the solved nodes that take part (any order): ``index``, ``need`` = ln of the luminance
+    (common) curve gain that puts the node exactly on its target light, from its own read; ``own`` = ln
+    of the gain the solver left there; ``sigma`` = the read-noise SE of ``need`` (None: one read).
+
+    Rule (no tuned constant, no noise dependence): the light committed at node k is what EVERY node of
+    its centred window k-2 .. k+2 asks for at least - if all five ask the same sign, the smallest of
+    the five asks; if their signs differ, or any of the five does not take part (an end of the
+    supported range, a held-dark node, white), none. Consequences, each one a property:
+      * never extrapolated: a value needs two supporting nodes on each side;
+      * continuous to zero at the edges of the supported range (the two nodes at an edge get none);
+      * bounded by what the supporting nodes themselves ask for (never more than any of them asks);
+      * a tooth one or two nodes wide, or teeth that alternate, commit nothing; a light need shared over
+        five nodes is kept (reduced to its smallest ask - a genuine trend is under-corrected by at most
+        the scatter of its asks, never over-corrected);
+      * independent of the assumed read noise: the noise only LABELS the evidence (``z`` = how far a
+        node's own ask is from what is committed, in units of its read noise), it decides nothing.
+    The window is the trend support of the node-outlier test (two nodes each side): the smallest
+    centred support that can tell a node's own ask from what its neighbours ask on both sides.
     """
     seq = sorted(nodes, key=lambda d: int(d["index"]))
+    by_idx = {int(d["index"]): d for d in seq}
     m = len(seq)
     out: dict[str, Any] = {
-        "rule": ("need = ln(luminance gain that puts the node on its target light, from its own read); "
-                 "neighbours' light T = median of the symmetric neighbours' needs (k-+1, k-+2; Tukey's "
-                 "extrapolation at the ends); tooth when |need - T| > "
-                 "z x read-noise sigma (the node's repeat reads, else the median of the 8 nearest nodes'), z = "
-                 f"two-sided Bonferroni over the nodes at family-wise alpha {alpha:g}; a tooth takes T when "
-                 "|T| > z x 1.2533 x 1.4826 MAD(need - T) / sqrt(n), else its light is left alone; then no "
-                 "committed node may depart from its neighbours' committed light by more than z x sigma"),
-        "alpha": alpha, "n_nodes": m, "teeth": [], "changed": [], "nodes": [],
+        "rule": ("committed light at node k = the smallest ask of the five nodes k-2..k+2 when all five take "
+                 "part and ask the same sign, else none (no extrapolation, zero at the edges of the supported "
+                 "range, never more than any supporting node asks, independent of the read noise)"),
+        "alpha": alpha, "n_nodes": m, "teeth": [], "changed": [], "material": [], "nodes": [],
     }
-    if m < 5:
-        out.update(available=False, reason=f"only {m} solved nodes take part (need 5)")
+    if m == 0:
+        out.update(available=False, reason="no solved node takes part")
         return out
-    needs = [float(d["need"]) for d in seq]
-    own = [float(d.get("own", d["need"])) for d in seq]
     z_crit = NormalDist().inv_cdf(1.0 - alpha / (2.0 * m))
-    known = [(i, float(d["sigma"])) for i, d in enumerate(seq) if d.get("sigma") is not None]
-    sigmas: list[Optional[float]] = []
-    borrowed: list[bool] = []
-    for i, d in enumerate(seq):
-        s = d.get("sigma")
-        b = False
-        if s is None and known:
-            s, b = median(v for _j, v in sorted(known, key=lambda t: (abs(t[0] - i), t[0]))[:MIN_SCALE_SAMPLES]), True
-        sigmas.append(max(float(s), SCALE_FLOOR) if s is not None else None)
-        borrowed.append(b)
-    def nb_sigma(i: int) -> Optional[float]:
-        """Read noise of node i's need AND of its neighbours' light: sqrt(s_i^2 + c s_nb^2), c = the
-        variance factor of the neighbours' estimate (median of 4 ~ (pi/2)/4, mean of 2 = 1/2, Tukey's
-        end extrapolation 2 y1 - y2 = 5), s_nb = the median sigma of the nodes it rests on."""
-        s = sigmas[i]
-        if s is None:
-            return None
-        if i in (0, m - 1):
-            idx, c = ([i + 1, i + 2] if i == 0 else [i - 1, i - 2]), 5.0
-        elif i - 2 >= 0 and i + 2 < m:
-            idx, c = [i - 2, i - 1, i + 1, i + 2], (math.pi / 2.0) / 4.0
+    out.update(available=True, z_crit=round(z_crit, 4))
+    for d in seq:
+        k = int(d["index"])
+        need, own = float(d["need"]), float(d.get("own", d["need"]))
+        window = [by_idx.get(j) for j in range(k - 2, k + 3)]
+        if any(w is None for w in window):
+            committed, reason = 0.0, "not supported on both sides (an edge of the range): no light"
         else:
-            idx, c = [i - 1, i + 1], 0.5
-        nbs = [sigmas[j] for j in idx if sigmas[j] is not None]
-        s_nb = median(nbs) if nbs else s
-        return math.sqrt(s * s + c * s_nb * s_nb)
-
-    # Sequential (the worst first): a tooth also bends its neighbours' medians, so once a node is found
-    # to be a tooth its need is replaced by its neighbours' light before the rest are tested again.
-    work = list(needs)
-    tooth = [False] * m
-    t_at: list[Optional[float]] = [None] * m
-    n_at = [0] * m
-    z_at: list[Optional[float]] = [None] * m
-    for i in range(m):
-        if sigmas[i] is None:          # no read noise known anywhere: cannot be shown to be shared
-            t, n_nb = _neighbour_median(needs, i)
-            tooth[i], t_at[i], n_at[i] = t is not None, t, n_nb
-    while True:
-        best, best_z = None, 0.0
-        for i in range(m):
-            if tooth[i]:
-                continue
-            t, n_nb = _neighbour_median(work, i)
-            s = nb_sigma(i)
-            if t is None or s is None:
-                continue
-            z = (needs[i] - t) / s
-            t_at[i], n_at[i], z_at[i] = t, n_nb, z
-            if abs(z) > abs(best_z):
-                best, best_z = i, z
-        if best is None or abs(best_z) <= z_crit:
-            break
-        tooth[best] = True
-        work[best] = t_at[best]          # type: ignore[assignment]
-    deps = [needs[i] - t_at[i] for i in range(m) if t_at[i] is not None]
-    scatter = MAD_TO_SIGMA * median(abs(v - median(deps)) for v in deps) if deps else 0.0
-    out.update(available=True, z_crit=round(z_crit, 4), tooth_scatter_pct=round(100.0 * scatter, 4))
-    committed = list(own)
-    rows = []
-    for i, d in enumerate(seq):
-        t, n_nb, z = t_at[i], n_at[i], z_at[i]
-        reason = "own"
-        if tooth[i] and t is not None:
-            se_t = MEDIAN_SE_FACTOR * scatter / math.sqrt(max(n_nb, 1))
-            if abs(t) > z_crit * se_t:
-                committed[i], reason = t, "neighbours' light"
+            asks = [float(w["need"]) for w in window]   # type: ignore[index]
+            if all(a > 0 for a in asks):
+                committed, reason = min(asks), "shared by k-2..k+2: the smallest ask"
+            elif all(a < 0 for a in asks):
+                committed, reason = max(asks), "shared by k-2..k+2: the smallest ask"
             else:
-                committed[i], reason = 0.0, "left alone (the neighbours' light is within its own uncertainty)"
-        s = sigmas[i]
-        rows.append({"index": int(d["index"]), "code": d.get("code"),
-                     "need_pct": round(100.0 * (math.exp(needs[i]) - 1.0), 4),
-                     "neighbours_pct": round(100.0 * (math.exp(t) - 1.0), 4) if t is not None else None,
-                     "sigma_pct": round(100.0 * s, 4) if s is not None else None, "sigma_borrowed": borrowed[i],
-                     "z": round(z, 3) if (z is not None and not (tooth[i] and sigmas[i] is None)) else None,
-                     "tooth": bool(tooth[i]), "reason": reason})
-    # the guarantee: no committed node departs from its neighbours' committed light beyond the noise
-    passes = 0
-    for passes in range(1, 4 * m + 1):
-        moved = False
-        for i in range(m):
-            t, _n = _neighbour_median(committed, i)
-            s = nb_sigma(i)
-            if t is None:
-                continue
-            if s is None or abs(committed[i] - t) > z_crit * s:
-                if abs(committed[i] - t) > 1e-12:
-                    committed[i] = t
-                    rows[i]["reason"] = "smoothed onto its neighbours' committed light"
-                    moved = True
-        if not moved:
-            break
-    out["smoothing_passes"] = passes
-    for i, row in enumerate(rows):
-        row["committed_pct"] = round(100.0 * (math.exp(committed[i]) - 1.0), 4)
-        row["committed_gain"] = math.exp(committed[i])
-        row["changed"] = abs(committed[i] - own[i]) > 1e-12
-        if row["tooth"]:
-            out["teeth"].append(row["index"])
+                committed, reason = 0.0, "k-2..k+2 ask for light of both signs: none is shared"
+        s = d.get("sigma")
+        if s is None:   # one read: the median read noise of the (up to 8) nearest nodes that have repeats
+            near = sorted((x for x in seq if x.get("sigma") is not None),
+                          key=lambda x: (abs(int(x["index"]) - k), int(x["index"])))[:MIN_SCALE_SAMPLES]
+            s = median(float(x["sigma"]) for x in near) if near else None
+        s_eff = max(float(s), SCALE_FLOOR) if s is not None else SCALE_FLOOR
+        z = (need - committed) / s_eff
+        tooth = abs(z) > z_crit
+        # material = the light at this node moves by more than its reads can resolve
+        material = abs(committed - own) > z_crit * s_eff
+        row = {"index": k, "code": d.get("code"),
+               "need_pct": round(100.0 * (math.exp(need) - 1.0), 4),
+               "own_pct": round(100.0 * (math.exp(own) - 1.0), 4),
+               "committed_pct": round(100.0 * (math.exp(committed) - 1.0), 4),
+               "committed_gain": math.exp(committed),
+               "sigma_pct": round(100.0 * float(s), 4) if s is not None else None,
+               "z": round(z, 3) if z is not None else None, "tooth": bool(tooth), "reason": reason,
+               "changed": abs(committed - own) > 1e-12, "material": bool(material)}
+        out["nodes"].append(row)
+        if tooth:
+            out["teeth"].append(k)
+        if material:
+            out["material"].append(k)
         if row["changed"]:
-            out["changed"].append(row["index"])
-    out["nodes"] = rows
+            out["changed"].append(k)
     return out
 
 

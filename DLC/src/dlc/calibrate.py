@@ -7225,7 +7225,7 @@ class Calibration:
                     digest={"message": "aborted on Grayscale touch-up measurement session",
                             "decision_note": decision.note, **outcome.digest}))
         live = not (outcome.digest.get("skipped") or outcome.digest.get("preview_unavailable"))
-        if live and (outcome.digest.get("light_trend") or {}).get("changed"):
+        if live and (outcome.digest.get("light_trend") or {}).get("changed"):  # seam only when material
             self._gswb_light_trend_seam(outcome)
         flagged = (outcome.digest.get("node_outliers") or {}).get("flagged") or []
         if flagged and live:
@@ -7327,35 +7327,39 @@ class Calibration:
         return out
 
     def _gswb_light_trend_seam(self, outcome: StageOutcome) -> None:
-        """Teeth found (the light a node asks for is not shared by its neighbours beyond its read noise):
-        the committed curve carries the light only as the trend. Options: ``trend`` (put the teeth on the
-        trend, keep every node's balance) or ``abort``. There is no per-node option: an isolated light
-        step is exactly what smears a tooth over the greys between the nodes."""
+        """Commit the LIGHT part of the curve only as light the nodes on both sides share
+        (:func:`dlc.grayscale_wb.light_trend`). When some node's light moves by more than its own reads can
+        resolve, the move is a judgment: seam ``grayscale-wb:light-trend`` (``trend`` / ``abort``; there is
+        no per-node option - an isolated light value is what smears a tooth over the greys between the
+        nodes). When every move is below the read noise it is applied without a pause (nothing a read could
+        see changes) and recorded as such."""
         lt = outcome.digest.get("light_trend") or {}
-        teeth = [r for r in lt.get("nodes") or () if r.get("changed")]
-        lines = [f"node {r['index']} (code {r['code']}): asks {r['need_pct']:+.2f} %, neighbours "
-                 f"{r['neighbours_pct'] if r.get('neighbours_pct') is not None else '?'} %, committed "
-                 f"{r['committed_pct']:+.2f} %" + (f", z {r['z']}" if r.get("z") is not None else "")
-                 for r in sorted(teeth, key=lambda r: -abs(r.get("z") or 0.0))[:8]]
-        decision = self.adjudicate(AdjudicationRequest(
-            key="grayscale-wb:light-trend", seam=SEAM_OPTIMIZE, stage="grayscale-wb",
-            question=(f"{len(lt.get('teeth') or ())} of {lt.get('n_nodes')} grey nodes ask for a light (luminance, "
-                      f"signal gain) correction their neighbours do not share beyond their read noise (|z| > "
-                      f"{lt.get('z_crit')}; tooth-to-tooth scatter {lt.get('tooth_scatter_pct')} %); "
-                      f"{len(teeth)} node(s) change: " + "; ".join(lines) + (" ..." if len(teeth) > 8 else "")
-                      + ". A display whose light is a sawtooth in the code is right at a node's code and wrong a "
-                        "few codes away with a per-node light value. 'trend' commits those nodes' light as their "
-                        "neighbours' (or leaves it alone where the neighbours' light is within its own "
-                        "uncertainty) and keeps every node's colour balance; 'abort' ends the run with the prior "
-                        "curve back."),
-            options=("trend", "abort"), recommendation="trend",
-            digest={"light_trend": lt, "changes": [r["index"] for r in teeth]}))
-        if decision.choice == "abort":
-            self._revert_inplace(why="grayscale-wb:light-trend seam answered abort")
-            raise CalibrationAborted(StageOutcome(
-                "grayscale-wb", "aborted",
-                digest={"message": "aborted at the grey light-trend seam", "decision_note": decision.note,
-                        "light_trend": lt}))
+        rows = [r for r in lt.get("nodes") or () if r.get("changed")]
+        material = [r for r in rows if r.get("material")]
+        if material:
+            lines = [f"node {r['index']} (code {r['code']}): asks {r['need_pct']:+.2f} %, solver left "
+                     f"{r['own_pct']:+.2f} %, committed {r['committed_pct']:+.2f} % ({r['reason']})"
+                     for r in sorted(material, key=lambda r: -abs(r["own_pct"] - r["committed_pct"]))[:8]]
+            decision = self.adjudicate(AdjudicationRequest(
+                key="grayscale-wb:light-trend", seam=SEAM_OPTIMIZE, stage="grayscale-wb",
+                question=(f"{len(material)} of {lt.get('n_nodes')} grey nodes would carry a light (luminance, signal "
+                          "gain) correction the nodes on both sides do not share, by more than their own reads "
+                          "resolve: " + "; ".join(lines) + (" ..." if len(material) > 8 else "")
+                          + ". The committed light at a node is the smallest ask of the five nodes around it when "
+                            "all five ask the same sign, else none (never extrapolated; zero at the edges of the "
+                            "supported range; never more than a supporting node asks). A display whose light is a "
+                            "sawtooth in the code is right at a node's code and wrong a few codes away with a "
+                            "per-node light value. 'trend' commits that light and keeps every node's colour "
+                            "balance; 'abort' ends the run with the prior curve back."),
+                options=("trend", "abort"), recommendation="trend",
+                digest={"light_trend": lt, "changes": [r["index"] for r in rows],
+                        "material": [r["index"] for r in material]}))
+            if decision.choice == "abort":
+                self._revert_inplace(why="grayscale-wb:light-trend seam answered abort")
+                raise CalibrationAborted(StageOutcome(
+                    "grayscale-wb", "aborted",
+                    digest={"message": "aborted at the grey light-trend seam", "decision_note": decision.note,
+                            "light_trend": lt}))
         rec = self.calib.get("grayscale_wb_light_trend") or {}
         if rec.get("applied") or (self.calib.get("grayscale_wb_baked") or {}).get("baked"):
             return
@@ -7365,12 +7369,15 @@ class Calibration:
         self.controller.grayscale_set_live(
             self.monitor, self.mode, trended["point_count"], trended["points"], trended["deviations"],
             luminance=trended["luminance"], rgb=trended["rgb"])
-        self.calib["grayscale_wb_light_trend"] = {"applied": True, "nodes": [r["index"] for r in teeth],
+        self.calib["grayscale_wb_light_trend"] = {"applied": True, "nodes": [r["index"] for r in rows],
+                                                  "material": [r["index"] for r in material],
+                                                  "via_seam": bool(material),
                                                   "detail": detail, "per_node_payload": base}
         self.calib["grayscale_wb_touchup"] = trended
         self._state["grayscale_wb_touchup"] = trended
         self._save()
-        self.ctx.log(f"grayscale-wb: light of node(s) {[r['index'] for r in teeth]} put on the trend")
+        self.ctx.log(f"grayscale-wb: light committed as the shared trend at node(s) {[r['index'] for r in rows]}"
+                     + ("" if material else " (every move below the read noise)"))
 
     @staticmethod
     def _gswb_light_exponent(transfer: Transfer, code: int) -> float:

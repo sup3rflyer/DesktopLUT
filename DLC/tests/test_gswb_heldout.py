@@ -294,8 +294,9 @@ def test_narrow_feature_left_as_solved_is_flagged_and_recommended_revert(tmp_pat
     # light-trend seam takes it off the node (no isolated light step is committed)
     light = judge.request("grayscale-wb:light-trend")
     assert light is not None and light.recommendation == "trend" and light.options == ("trend", "abort")
-    assert touch["light_trend"]["teeth"] == [12]
-    assert calib.calib["grayscale_wb_light_trend"]["nodes"] == [12]
+    assert 12 in touch["light_trend"]["material"]
+    row12 = next(r for r in touch["light_trend"]["nodes"] if r["index"] == 12)
+    assert row12["committed_pct"] * row12["need_pct"] >= 0 and abs(row12["committed_pct"]) <= abs(row12["need_pct"])
     assert "node 12 (code 153)" in light.question
     # (a2) what remains at node 12 is its BALANCE (the feature's green-side colour), still off its
     # neighbours' trend: the node-outlier seam raises it with its numbers (size + direction per channel)
@@ -362,7 +363,7 @@ def test_spot_read_amplitude_is_flagged_and_its_smear_judged_against_the_white_b
     the flag."""
     calib, result, judge, _panel = _run(tmp_path, "feature_spot", feature=_FEATURE_SPOT,
                                         choices={"grayscale-wb:node-outlier": "accept"})
-    assert _touch(calib)["light_trend"]["teeth"] == [12]
+    assert 12 in _touch(calib)["light_trend"]["changed"]
     assert [f["index"] for f in _touch(calib)["node_outliers"]["flagged"]] == [12]
     ho = _verify(calib)["gswb_held_out"]
     assert ho["n_regressed"] == 0, ho["worst"]
@@ -393,30 +394,6 @@ def test_plain_white_balance_error_passes_with_apply(tmp_path: Path):
     assert plan.digest["patch_plan"]["time_estimate"]["held_out_minutes"] > 0
 
 
-def test_light_trend_takes_a_tooth_off_its_node_and_keeps_a_shared_trend():
-    from dlc.grayscale_wb import light_trend
-
-    # a smooth light slope every node shares: nothing changes
-    slope = [{"index": i, "code": i * 30, "need": 0.002 * i, "own": 0.002 * i, "sigma": 0.0005}
-             for i in range(8, 30)]
-    out = light_trend(slope)
-    assert out["available"] and out["teeth"] == [] and out["changed"] == []
-    # one node asking for 3 % more signal than its neighbours: it is a tooth; it takes the neighbours'
-    # light, and no committed node departs from its neighbours by more than its read noise allows
-    toothy = [dict(d) for d in slope]
-    toothy[6]["need"] = toothy[6]["own"] = toothy[6]["need"] + 0.03
-    out = light_trend(toothy)
-    assert out["teeth"] == [14] and out["changed"] == [14]
-    row = next(r for r in out["nodes"] if r["index"] == 14)
-    assert row["committed_pct"] == pytest.approx(100 * (math.exp(0.002 * 14) - 1), abs=0.05)
-    assert row["reason"] == "neighbours' light"
-    # repeat-read noise decides: the same 3 % departure on a node read once with no noisy neighbour
-    # estimate available is not provably shared either - it never stays as an isolated step
-    for d in toothy:
-        d["sigma"] = None
-    assert 14 in light_trend(toothy)["changed"]
-
-
 def test_sawtooth_light_is_left_alone_and_the_white_balance_still_fixed(tmp_path: Path):
     """The PA32UCXR's full-field light is a sawtooth in the code (teeth of 2-4 % every 4-12 codes),
     its chromaticity flat. Per-node light corrections would sample one phase each; the flow must commit
@@ -427,12 +404,15 @@ def test_sawtooth_light_is_left_alone_and_the_white_balance_still_fixed(tmp_path
     lt = touch["light_trend"]
     assert judge.request("grayscale-wb:light-trend") is not None
     assert len(lt["teeth"]) >= len(lt["nodes"]) // 2               # most nodes sit on a tooth
-    # the committed light curve: no node departs from its neighbours' committed light beyond its noise
-    from dlc.grayscale_wb import _neighbour_median
-    logs = [math.log(r["committed_gain"]) for r in lt["nodes"]]
-    for i, r in enumerate(lt["nodes"]):
-        t, _n = _neighbour_median(logs, i)
-        assert abs(logs[i] - t) <= lt["z_crit"] * r["sigma_pct"] / 100.0 * 1.001 + 1e-9
+    # the committed light: never more than any of the five nodes around it asks for, none at the ends
+    rows = {r["index"]: r for r in lt["nodes"]}
+    for k, r in rows.items():
+        window = [rows.get(j) for j in range(k - 2, k + 3)]
+        if any(w is None for w in window):
+            assert r["committed_pct"] == 0.0
+        elif r["committed_pct"] != 0.0:
+            assert all(w["need_pct"] * r["committed_pct"] > 0 and abs(w["need_pct"]) >= abs(r["committed_pct"]) - 1e-9
+                       for w in window)
     ho = _verify(calib)["gswb_held_out"]
     assert ho["n_judged"] == 24 and ho["n_regressed"] == 0, ho["worst"]
     rows = [g for g in ho["greys"] if g["judged"]]
