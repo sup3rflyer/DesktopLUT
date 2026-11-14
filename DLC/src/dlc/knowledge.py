@@ -776,8 +776,10 @@ def validate_unit(doc: Any) -> list[str]:
     if len(active) > MAX_ACTIVE_ENTRIES:
         out.append(f"unit.entries: {len(active)} measured / inferred / hypothesis entries (limit "
                    f"{MAX_ACTIVE_ENTRIES}): supersede or merge one first")
-    # two measured entries with the same signature type and overlapping scope need an explicit link
-    measured = [e for e in ids.values() if e.get("status") == "measured"
+    # two measured entries with the same signature type and overlapping scope need an explicit link (panel and rig
+    # entries: an event is a happening, not a property, and may share a signature type with the property it
+    # resembles; the matcher's 'ambiguous' verdict covers that case at read time)
+    measured = [e for e in ids.values() if e.get("status") == "measured" and e.get("kind") != "event"
                 and isinstance(e.get("signature"), dict) and e["signature"].get("type") not in (None, "none")]
     for i, a in enumerate(measured):
         for b in measured[i + 1:]:

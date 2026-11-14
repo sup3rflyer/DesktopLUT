@@ -262,6 +262,18 @@ def test_two_measured_entries_with_one_signature_and_overlapping_scope_need_a_li
     store.apply_ops(_uid(), [{"op": "create_entry", "by": BY, "why": "x", "entry": apart}])
 
 
+def test_an_event_may_share_a_signature_type_with_a_property(tmp_path: Path, ev: Path):
+    # an event is a happening, not a property: no link is demanded (the S3 matcher's 'ambiguous' covers it)
+    store = _store(tmp_path)
+    _create(store, [_measured(ev, links=[])])
+    happening = {**_event(), "status": "measured",
+                 "signature": _measured(ev)["signature"],
+                 "scope": {"mode": ["SDR"], "unknown": ["cause"]},
+                 "observations": [_measured(ev)["observations"][0]]}
+    doc = store.apply_ops(_uid(), [{"op": "create_entry", "by": BY, "why": "x", "entry": happening}], today=TODAY)
+    assert [e["id"] for e in doc["entries"]] == ["E-0001", "F-0001"]
+
+
 def test_hard_size_limit_and_active_entry_cap(tmp_path: Path, ev: Path, monkeypatch):
     store = _store(tmp_path)
     _create(store, [_measured(ev, links=[])])
