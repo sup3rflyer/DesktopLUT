@@ -516,9 +516,11 @@ sessions, a flat HDR top):
 python -m dlc.knowledge show --display "<DLC display name>"          # the whole view; --mode SDR, --id F-0001
 ```
 It lists the open questions first, then panel, rig and events, refuted entries last. Each entry says whether it
-**can explain** an observation: only a measured entry, seen in two independent sessions, not unconfirmed (a unit
-event after it, or older than the DIP's age limit), whose conditions cover the reading and whose signature bounds
-hold (size, sign, **chromaticity**). Anything less is a resemblance: say what differs and judge the reading as an
+**can explain** an observation: only a measured entry, confirmed in two independent sessions (only `establishes` /
+`matches` observations confirm; `consistent` does not; observations from one session or one run count once), with
+no `contradicts` observation newer than its last confirmation, not unconfirmed (a unit event after it, or older than
+the DIP's age limit), whose conditions cover the reading and whose signature bounds hold (size, sign,
+**chromaticity**). Anything less is a resemblance: say what differs and judge the reading as an
 anomaly. A known property never changes a gate or a recommendation; it is evidence for you.
 
 Writing (judgement, so yours; flows will only append re-observations that match):
@@ -529,8 +531,9 @@ python -m dlc.knowledge set-status --display "<name>" --id H-0001 --status refut
 python -m dlc.knowledge amend --display "<name>" --file ops.json            # any other op, validated, all or nothing
 python -m dlc.knowledge validate [--evidence]                               # --evidence re-hashes the files
 ```
-Write the JSON with your file tool (no inline scripts). Rules the CLI enforces: evidence paths must exist (hashed when
-written); a measured entry needs numbers, an evidence file and a non-empty `scope.unknown`; no per-code tables (raw
+Write the JSON with your file tool (no inline scripts). Rules the CLI enforces: evidence is FILES on a local drive, which must
+exist (hashed when written; name a run's result files such as `spots/spots.json`, never the run folder); give an
+observation a `session` label when the meter was re-placed the same day; a measured entry needs numbers, an evidence file and a non-empty `scope.unknown`; no per-code tables (raw
 reads stay in evidence files); a contradiction is a new observation (`verdict: contradicts`), never an edit; a
 wrong entry is refuted or superseded with a reason, never deleted. Firmware update, panel service or an OSD factory
 reset → `add_unit_event`: every older entry becomes unconfirmed until re-observed. No DesktopLUT or DLC defect
