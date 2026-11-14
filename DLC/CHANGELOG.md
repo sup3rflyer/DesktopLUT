@@ -3,7 +3,7 @@
 DLC (DesktopLUT Calibrator) — an LLM-steered display-calibration harness for
 DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
 
-## Unreleased (after DesktopLUT v3.0.0)
+## v3.1.0 — shipped with DesktopLUT v3.1.0
 
 ### Added
 - **`--flow repair-base`** (2026-11-14): removes a tint the installed SDR base 1D LUT puts on a few greys,

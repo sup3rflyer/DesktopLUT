@@ -101,8 +101,8 @@ agent.
    ```
    (Command Prompt; in PowerShell the folder is `"$env:USERPROFILE\DesktopLUT"`. Without git: download
    the repository as a ZIP from GitHub and extract it there.) If preflight (step 5) reports a contract
-   mismatch with your DesktopLUT, check out the tag of your release (`git checkout v3.0.0`).
-2. **DesktopLUT** (`DesktopLUT.exe` + `DwmHook.dll`, v3.0.0 or newer) running, with the calibration
+   mismatch with your DesktopLUT, check out the tag of your release (for example `git checkout v3.1.0`).
+2. **DesktopLUT** (`DesktopLUT.exe` + `DwmHook.dll`, v3.1.0 or newer; with an older DesktopLUT check out its tag) running, with the calibration
    pipe armed (below) for runs.
 3. **Python 3.11+** and `pip install -e .[engine,meter,test]` from this directory.
 4. **ArgyllCMS 3.3.0** and **dogegen** placed under `third_party/` (see
