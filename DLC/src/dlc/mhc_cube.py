@@ -43,7 +43,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
 from .colormath import invert3x3, matvec, rgb_to_xyz_matrix, xy_to_XYZ
 from .mhc import Ti3Sample
@@ -63,6 +63,9 @@ __all__ = [
     "pq_oetf",
     "invert_trc",
     "invert_monotone",
+    "invert_monotone_domain",
+    "transfer_domain_gaps",
+    "TRANSFER_DOMAIN_MIN_LIGHT",
     "peak_chroma_luminance",
     "adaptive_dark_floor",
     "noise_trust",
@@ -629,6 +632,59 @@ def invert_monotone(xs: Sequence[float], ys: Sequence[float], target: float) -> 
     return xs[-1]
 
 
+# Between two raw greys the base build inverts each channel's measured share. A power-law panel is a straight line
+# in the TRANSFER domain (SDR: share^(1/gamma); HDR: the PQ code of the share's light), while the chord in LINEAR
+# light lies above the convex response — inverting it puts the drive mid-gap too LOW (light under-driven).
+# Measured on all 29 past raw ramps (2026-11-14, leave-one-out over greys above 1 % of white and above twice the
+# black): linear light over-predicts the held grey by 0.3-3.5 % on average in every run (56-100 % of greys), the
+# transfer domain is within -0.4..+1.1 % with the lower RMS in every run. In the shadows (below 1 % of white, or
+# light <= 2 x black) the evidence is panel-dependent (PA32UCXR / LG C6 favour the transfer domain, the BenQ
+# PD2700U's toe favours linear light), so there the inversion stays in linear light, as it always was. Both
+# interpolants pass through the greys: the curve is continuous and unchanged AT every grey.
+TRANSFER_DOMAIN_MIN_LIGHT = 0.01
+
+
+def transfer_domain_gaps(grey_y: Sequence[float], peak_luminance: float, black_y: float) -> list[bool]:
+    """Per gap ``k`` (between grey ``k-1`` and grey ``k``; index 0 unused): True = invert in the transfer domain —
+    the gap's lower grey has at least ``TRANSFER_DOMAIN_MIN_LIGHT`` of the white above the black AND more than
+    twice the black. One decision per gap for all three channels (from the grey's measured luminance)."""
+    out = [False]
+    for k in range(1, len(grey_y)):
+        lit = grey_y[k - 1] - black_y
+        out.append(lit >= TRANSFER_DOMAIN_MIN_LIGHT * peak_luminance and lit > 2.0 * black_y)
+    return out
+
+
+def invert_monotone_domain(xs: Sequence[float], ys: Sequence[float], target: float,
+                           enc: Callable[[float], float], gaps: Sequence[bool]) -> float:
+    """:func:`invert_monotone` with each gap interpolated in the transfer domain ``enc`` where ``gaps[k]`` says
+    so, in linear light elsewhere. Identical at every grey and outside the measured range."""
+    n = len(xs)
+    if n == 0:
+        return 0.0
+    if n == 1 or target <= ys[0]:
+        return xs[0]
+    if target >= ys[-1]:
+        return xs[-1]
+    for k in range(1, n):
+        if ys[k] >= target:
+            y0, y1, x0, x1 = ys[k - 1], ys[k], xs[k - 1], xs[k]
+            if gaps[k]:
+                e0, e1 = enc(y0), enc(y1)
+                denom = e1 - e0
+                t = (enc(target) - e0) / denom if denom > 1e-12 else 0.0
+            else:
+                denom = y1 - y0
+                t = (target - y0) / denom if denom > 1e-12 else 0.0
+            return x0 + (x1 - x0) * t
+    return xs[-1]
+
+
+def _grey_black(sigs: Sequence[float], grey_y: Sequence[float]) -> float:
+    """The measured black (the code-0 grey's luminance), 0 when the ramp has none."""
+    return float(grey_y[0]) if sigs and sigs[0] <= 0.0 else 0.0
+
+
 def _peak_share_at_ceiling(grey_y: Sequence[float], share: Sequence[float],
                            ceiling_nits: float) -> float:
     """The channel share at the neutral CEILING (``ceiling_nits``), interpolated against measured
@@ -952,6 +1008,12 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         r = max(float(matrix_rowsums[ci]), 0.0) if matrix_rowsums is not None else 1.0
         ceiling[ch] = peak_luminance * (r if (r <= 1.0 or max_drive is not None) else 1.0)
 
+    # Transfer-domain inversion between raw greys (see TRANSFER_DOMAIN_MIN_LIGHT): the PQ code of the share's light.
+    gaps = transfer_domain_gaps(grey_y, peak_luminance, _grey_black(sigs, grey_y))
+
+    def enc(share: float) -> float:
+        return pq_oetf(min(max(share * peak_luminance, 0.0), _PQ_CONTAINER_NITS) / _PQ_CONTAINER_NITS)
+
     curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     prev = {ch: 0.0 for ch in _CHANNELS}
     for j in range(lut_size):
@@ -966,7 +1028,7 @@ def build_hdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
         for ch in _CHANNELS:
             frac = min(lin_raw, ceiling[ch]) / peak_luminance   # native-white-proportional target
             target_share = frac * peak_share[ch]
-            corrected = invert_monotone(sigs, shares[ch], target_share)
+            corrected = invert_monotone_domain(sigs, shares[ch], target_share, enc, gaps)
             if max_drive is not None:
                 corrected = min(corrected, max_drive)   # never drive above the peak code (additive policy)
             val = w * corrected + (1.0 - w) * pq_in   # blend to identity in the dark
@@ -1030,6 +1092,12 @@ def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
     dark_sig = max(0.0, floor_frac) ** (1.0 / gamma)
     trust_xs = [p[0] for p in level_trust] if level_trust else []
     trust_ws = [p[1] for p in level_trust] if level_trust else []
+    # Transfer-domain inversion between raw greys (see TRANSFER_DOMAIN_MIN_LIGHT): share^(1/gamma).
+    gaps = transfer_domain_gaps(grey_y, peak_luminance, _grey_black(sigs, grey_y))
+    inv_gamma = 1.0 / gamma
+
+    def enc(share: float) -> float:
+        return max(share, 0.0) ** inv_gamma
 
     curves: dict[str, list[float]] = {ch: [] for ch in _CHANNELS}
     prev = {ch: 0.0 for ch in _CHANNELS}
@@ -1042,7 +1110,7 @@ def build_sdr_cube(samples: Sequence[Ti3Sample], primaries: Mapping[str, float],
             w *= _interp(sig_in, trust_xs, trust_ws)
         for ch in _CHANNELS:
             target_share = frac * peak_share[ch]
-            corrected = invert_monotone(sigs, shares[ch], target_share)
+            corrected = invert_monotone_domain(sigs, shares[ch], target_share, enc, gaps)
             val = w * corrected + (1.0 - w) * sig_in  # blend to identity in the dark
             # Enforce monotone non-decreasing — the blend boundary or a noisy share can dip, and
             # the MHC2 LUT must be monotone for a well-defined inverse.
