@@ -16,9 +16,10 @@ DesktopLUT (MHC ICC + 3D LUT). Notable changes, newest first.
   - Sized and judged by its own prediction (2026-11-14, after the first hardware run): the measurement now
     sizes the correction and predicts the result at every measured grey, and the run stops before installing
     when that prediction is not flat. After installing, each grey is judged against what was predicted for it.
-  - Flat means flat against the neighbouring greys too, not only against the prediction: the run recommends
-    applying and keeping a repair only when both say flat, and shows the worst tint before and after. Light is
-    checked where the curve did not change, and limited where it did to the display's own steps.
+  - The run judges a repair by what a viewer can see: it shows the worst tint before and after as a visibility
+    figure (1 = just visible at that grey's light) and recommends keeping it when it is flat, or better with
+    what remains below visibility. Light is checked where the curve did not change and limited where it did
+    to the display's own steps; a change far below visibility is reported, not a reason to revert.
 
 ### Fixed
 - **The base 1D LUT no longer under-drives greys between the measured ones** (2026-11-14). Between two raw

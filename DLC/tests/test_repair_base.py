@@ -647,7 +647,11 @@ def test_sizing_cannot_see_the_panels_own_cancelling_structure_but_the_verify_do
     assert verdict["judged_against"].startswith("the audit's prediction")
     missed = [m for r in verdict["out"] for m in r["missed"]]
     assert any("change" in m or "not flat" in m for m in missed), verdict["out"]
-    assert result.status == "reverted"                           # AutoAdjudicator takes the recommendation
+    # the recommendation is in VIEWER terms (owner's rule): the mismatch is reported; keep / revert follows the
+    # class of the worst remaining departure in dE_ITP (AutoAdjudicator takes the recommendation)
+    vis = verdict["visibility"]
+    assert result.status == ("completed" if verdict["recommend_keep"] else "reverted")
+    assert verdict["recommend_keep"] == (vis["class"] in br.OUTCOME_CLASSES[:2] and not vis["light_changes_visible_at"])
 
 
 def test_sizing_refuses_a_tint_the_cube_does_not_explain():
@@ -860,5 +864,88 @@ def test_review_apply_is_recommended_only_when_both_flatness_checks_pass(tmp_pat
         # better, not flat (model-free): the AutoAdjudicator takes the recommendation (abort): nothing installed
         assert dec["choice"] == "abort" and result.status == "aborted"
         assert installed_base_cube(ctrl, 0, "SDR")[0] == str(cube_path)
-    # on this cube the bridge target is not the neighbours' line: the recommendation here IS abort
-    assert dec["choice"] == "abort"
+    # the recommendation follows the class in viewer terms (on this cube: better, remaining departure below
+    # visibility -> apply)
+    assert dec["choice"] == "apply"
+
+
+# ---------------------------------------------------------------------------
+# VIEWER TERMS (owner's rule: practical results; judge by what a viewer can see). Visibility = BT.2124 dE_ITP at
+# the grey's own light via grayscale_wb.chroma_itp (balance) and the I axis (light); classes flat / better below
+# visibility (apply, keep) / better but visible / not better (abort, revert).
+# ---------------------------------------------------------------------------
+
+def test_visibility_units():
+    from dlc.colormath import invert3x3
+    P = _P
+    Pinv = invert3x3(P)
+    grey = matvec(P, [0.02, 0.02, 0.02])                                  # ~2.4 nit grey
+    assert br.balance_visibility(grey, 0.0, 0.0, P, Pinv) == pytest.approx(0.0, abs=1e-9)
+    a = br.balance_visibility(grey, 0.03, 0.0, P, Pinv)
+    b = br.balance_visibility(grey, 0.06, 0.0, P, Pinv)
+    assert 0 < a < b
+    # docs/practical-thresholds.md: a grey's light change is just visible from 1.39 % at 100 nit
+    white100 = [v * 100.0 / matvec(P, [1, 1, 1])[1] for v in matvec(P, [1, 1, 1])]
+    assert br.light_visibility(white100, math.log(1.0139)) == pytest.approx(1.0, rel=0.05)
+
+
+@pytest.mark.parametrize("flat,before,after,cls,keep", [
+    (True, 2.0, 0.3, "flat", True),
+    (False, 1.13, 0.51, "better, remaining departure below visibility", True),
+    (False, 3.0, 1.4, "better, remaining departure visible", False),
+    (False, 0.8, 0.8, "not better", False),
+])
+def test_outcome_classes(flat, before, after, cls, keep):
+    assert br.outcome_class(flat, before, after) == cls
+    assert br.recommends_change(cls) is keep
+
+
+def _vis_setup(noise=2e-4):
+    cube = _real_cube()
+    plan = br.split_fit_held([SPAN])
+    panel = ResponsePanel(None, sigma=2.0, noise=noise)
+    before = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["codes"]}
+    fixed, rep = br.repair_balance(cube, before, plan, applied=_APPLIED, primaries=_PRIM, native_white_xy=_WHITE,
+                                   peak_luminance=_PEAK, span=SPAN, luminance_sigma=noise)
+    return cube, plan, panel, before, fixed, rep
+
+
+def _judge(before, after, rep, plan, noise=2e-4):
+    return br.judge_after(before, after, rep, plan["held_out"], primaries=_PRIM, native_white_xy=_WHITE,
+                          peak_luminance=_PEAK, luminance_sigma=noise)
+
+
+def test_build_and_verify_report_the_class_in_viewer_terms():
+    cube, plan, panel, before, fixed, rep = _vis_setup()
+    vis = rep["visibility"]
+    assert vis["class"] in br.OUTCOME_CLASSES
+    assert vis["before_worst_itp"] > vis["predicted_after_worst_itp"]
+    assert rep["recommend_apply"] == (rep["confirmation"]["confirmed"] and br.recommends_change(vis["class"]))
+    after = {c: panel.xyz(fixed, (c / 1023,) * 3) for c in plan["held_out"]}
+    v = _judge(before, after, rep, plan)
+    assert v["visibility"]["class"] in br.OUTCOME_CLASSES[:2] and v["recommend_keep"] is True
+    for r in v["held_out"]:
+        assert "light_itp" in r and "light_vs_display_step" in r
+
+
+def test_nothing_applied_is_not_better_and_reverts():
+    cube, plan, panel, before, fixed, rep = _vis_setup()
+    after = {c: panel.xyz(cube, (c / 1023,) * 3) for c in plan["held_out"]}      # the old cube still in place
+    v = _judge(before, after, rep, plan)
+    assert v["visibility"]["class"] in ("not better", "better, remaining departure visible")
+    assert v["recommend_keep"] is False
+
+
+def test_a_light_change_far_below_visibility_at_an_unchanged_code_is_reported_not_a_revert_reason():
+    cube, plan, panel, before, fixed, rep = _vis_setup()
+    after = {c: panel.xyz(fixed, (c / 1023,) * 3) for c in plan["held_out"]}
+    unchanged = [c for c in plan["held_out"] if not rep["predicted"][str(c)]["changed"]]
+    c0 = unchanged[len(unchanged) // 2]
+    after[c0] = tuple(v * 1.0023 for v in after[c0])                     # +0.23 % (today's code 157)
+    v = _judge(before, after, rep, plan)
+    assert any(r["code"] == c0 and "light" in r["missed"] for r in v["out"])         # gated: reported
+    assert c0 in v["visibility"]["light_changes_below_visibility_at"]
+    assert v["recommend_keep"] is True                                               # not a revert reason
+    after[c0] = tuple(v * 1.08 for v in after[c0])                       # +8 %: visible at this light
+    v = _judge(before, after, rep, plan)
+    assert c0 in v["visibility"]["light_changes_visible_at"] and v["recommend_keep"] is False
