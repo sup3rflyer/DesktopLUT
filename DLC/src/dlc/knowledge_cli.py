@@ -89,10 +89,22 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     store = _store_from_args(args)
     try:
-        return _run(args, store)
+        rc = _run(args, store)
     except KnowledgeError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
-        return 2
+        rc = EXIT_REFUSED
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"CRASHED (a defect of dlc.knowledge, not of your input): {type(exc).__name__}: {exc}\n"
+              f"{traceback.format_exc(limit=4)}", file=sys.stderr)
+        return EXIT_CRASHED
+    for uid, why in sorted(store.broken.items()):
+        print(f"warning: {store.path(uid)} is broken and was skipped: {why}", file=sys.stderr)
+    return rc
+
+
+# exit codes: 0 done; 1 invalid files found by validate; 2 refused (a bad op, name or file); 3 crashed (a defect)
+EXIT_OK, EXIT_INVALID, EXIT_REFUSED, EXIT_CRASHED = 0, 1, 2, 3
 
 
 def _run(args: Any, store: KnowledgeStore) -> int:
@@ -202,7 +214,7 @@ def _run(args: Any, store: KnowledgeStore) -> int:
             bad += 1 if problems else 0
         if not uids:
             print(f"no unit files in {store.root}")
-        return 1 if bad else 0
+        return EXIT_INVALID if bad else EXIT_OK
     if args.cmd == "render":
         if args.display:
             uid = store.resolve(args.display)

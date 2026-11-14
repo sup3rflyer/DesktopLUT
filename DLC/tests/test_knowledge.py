@@ -494,6 +494,99 @@ def test_a_corrupt_or_invalid_file_is_never_overwritten(tmp_path: Path, ev: Path
     assert store.load_tolerant(_uid()) is None          # readers: no knowledge, never a failure
 
 
+_MALFORMED = {
+    "unit_events int": lambda d: d.__setitem__("unit_events", 5),
+    "standing_conditions int": lambda d: d.__setitem__("standing_conditions", 7),
+    "revisions int": lambda d: d.__setitem__("revisions", 3),
+    "aliases str": lambda d: d.__setitem__("aliases", "abc"),
+    "identity list": lambda d: d.__setitem__("identity", [1]),
+    "entries contain a list": lambda d: d["entries"].append([1, 2]),
+    "entries dict": lambda d: d.__setitem__("entries", {"a": 1}),
+    "signature type list": lambda d: d["entries"][0]["signature"].__setitem__("type", ["code_structure"]),
+    "signature str": lambda d: d["entries"][0].__setitem__("signature", "x"),
+    "links int": lambda d: d["entries"][0].__setitem__("links", 5),
+    "link rel list": lambda d: d["entries"][0].__setitem__("links", [{"rel": ["x"], "id": "H-0001"}]),
+    "facet value int": lambda d: d["entries"][0].__setitem__("facets", {"grey_light_structure": 5}),
+    "scope.mode str": lambda d: d["entries"][0]["scope"].__setitem__("mode", "SDR"),
+    "scope list": lambda d: d["entries"][0].__setitem__("scope", [1]),
+    "rollup verdicts list": lambda d: d["entries"][0].__setitem__(
+        "rollup", {"count": 1, "folded_ids": ["O99"], "verdicts": [1]}),
+    "rollup folded_ids of lists": lambda d: d["entries"][0].__setitem__(
+        "rollup", {"count": 1, "folded_ids": [["O9"]], "verdicts": {}}),
+    "observation id list": lambda d: d["entries"][0]["observations"][0].__setitem__("id", ["O1"]),
+    "observation source list": lambda d: d["entries"][0]["observations"][0].__setitem__("source", [1]),
+    "observations dict": lambda d: d["entries"][0].__setitem__("observations", {"O1": 1}),
+    "status_history str": lambda d: d["entries"][0].__setitem__("status_history", "x"),
+    "open_questions dict": lambda d: d["entries"][0].__setitem__("open_questions", {"Q1": 1}),
+    "revisions of an entry int": lambda d: d["entries"][0].__setitem__("revisions", 4),
+    "NaN number": lambda d: d["entries"][0]["observations"][0]["numbers"].__setitem__("x", float("nan")),
+}
+
+
+def test_a_malformed_document_is_a_list_of_violations_never_a_crash(tmp_path: Path, ev: Path):
+    """Review fix 4: every malformed shape the reviewer's fuzz found (and more) is reported, never raised."""
+    doc = _create(_store(tmp_path), [_measured(ev), _hyp()])
+    for name, mut in _MALFORMED.items():
+        d = copy.deepcopy(doc)
+        mut(d)
+        v = validate_unit(d)
+        assert isinstance(v, list) and v, name
+        st = KnowledgeStore(tmp_path / f"m{abs(hash(name)) % 10 ** 8}")
+        st.root.mkdir(parents=True)
+        st.path(_uid()).write_text(json.dumps(d, allow_nan=True), encoding="utf-8")
+        with pytest.raises(CorruptFile):
+            st.read_raw(_uid())
+        assert st.load_tolerant(_uid()) is None and _uid() in st.broken
+
+
+def test_one_broken_file_never_stops_the_other_units_from_resolving(tmp_path: Path, ev: Path, capsys):
+    store = _store(tmp_path)
+    doc = _create(store, [_measured(ev), _hyp()])
+    bad = copy.deepcopy(doc)
+    bad["unit_id"] = "BROKEN-UNIT-1"
+    bad["unit_events"] = 5
+    (store.root / "BROKEN-UNIT-1.json").write_text(json.dumps(bad), encoding="utf-8")
+    (store.root / "ALSO-BROKEN-2.json").write_text("{ not json", encoding="utf-8")
+    assert store.resolve("Test Panel 32") == _uid()
+    assert set(store.broken) == {"BROKEN-UNIT-1", "ALSO-BROKEN-2"}
+    with pytest.raises(UnitNotFound, match=r"BROKEN-UNIT-1 \(unreadable"):
+        store.resolve("Nobody")
+    assert [p.name for p in store.render_all(today=TODAY)] == [f"{_uid()}.md"]
+    # the CLI: validate reports invalid (1), a refusal is 2, a crash is 3; the broken files are named
+    from dlc import knowledge_cli as cli
+    base = ["--dir", str(store.root), "--today", TODAY]
+    assert cli._main([*base, "validate"]) == cli.EXIT_INVALID
+    out = capsys.readouterr()
+    assert "INVALID BROKEN-UNIT-1" in out.out and f"ok {_uid()}" in out.out
+    assert cli._main([*base, "show", "--display", "Test Panel 32"]) == cli.EXIT_OK
+    assert "BROKEN-UNIT-1.json is broken and was skipped" in capsys.readouterr().err
+    assert cli._main([*base, "show", "--display", "Nobody"]) == cli.EXIT_REFUSED
+
+
+def test_an_unforeseen_exception_is_reported_as_a_crash(tmp_path: Path, monkeypatch, capsys):
+    from dlc import knowledge_cli as cli
+
+    def boom(args, store):
+        raise RuntimeError("a defect")
+
+    monkeypatch.setattr(cli, "_run", boom)
+    assert cli._main(["--dir", str(tmp_path), "validate"]) == cli.EXIT_CRASHED
+    assert "CRASHED" in capsys.readouterr().err
+
+
+def test_a_malformed_op_is_refused_not_a_crash(tmp_path: Path, ev: Path):
+    store = _store(tmp_path)
+    _create(store, [_measured(ev), _hyp()])
+    for op in ({"op": "add_link", "by": BY, "why": "x", "id": "F-0001", "link": 5},
+               {"op": "add_observation", "by": BY, "why": "x", "id": "F-0001", "observation": [1]},
+               {"op": "set_scope", "by": BY, "why": "x", "id": "F-0001", "scope": 7},
+               {"op": "add_unit_event", "by": BY, "why": "x", "event": [1]},
+               {"op": "set_standing_condition", "by": BY, "why": "x", "condition": {"setting": 5}}):
+        with pytest.raises(KnowledgeError):
+            store.apply_ops(_uid(), [op])
+        assert kn.validate_ops(store.load(_uid()), [op])
+
+
 def test_cas_on_rev_reapplies_once_then_refuses(tmp_path: Path, ev: Path):
     store = _store(tmp_path)
     _create(store, [_measured(ev), _hyp()])

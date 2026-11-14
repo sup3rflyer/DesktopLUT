@@ -354,7 +354,7 @@ def _check_signature(sig: Any, where: str, out: list[str]) -> None:
         out.append(f"{where}: an object with a 'type' (use {{\"type\": \"none\"}} when nothing can be matched)")
         return
     t = sig["type"]
-    if t not in SIGNATURES:
+    if not isinstance(t, str) or t not in SIGNATURES:
         out.append(f"{where}.type: {t!r} is not one of {tuple(SIGNATURES)}")
         return
     req, opt = SIGNATURES[t]
@@ -594,11 +594,21 @@ def validate_entry(e: Any, where: str = "entry") -> list[str]:
             if not (isinstance(roll.get("count"), int) and roll["count"] > 0):
                 out.append(f"{where}.rollup.count: a positive integer")
             fids = roll.get("folded_ids")
-            if not isinstance(fids, list) or len(fids) != roll.get("count"):
+            if not isinstance(fids, list) or len(fids) != roll.get("count") or not all(isinstance(x, str)
+                                                                                        for x in fids):
                 out.append(f"{where}.rollup.folded_ids: one id per folded observation")
             elif seen_o & set(fids):
                 out.append(f"{where}.rollup.folded_ids: {sorted(seen_o & set(fids))} are also kept in full")
-            for k, v in (roll.get("verdicts") or {}).items():
+            verdicts = roll.get("verdicts") or {}
+            if not isinstance(verdicts, dict):
+                out.append(f"{where}.rollup.verdicts: an object verdict -> count")
+                verdicts = {}
+            sessions = roll.get("sessions") or []
+            if not isinstance(sessions, list) or not all(
+                    isinstance(p, list) and len(p) == 2 and isinstance(p[0], str)
+                    and (p[1] is None or isinstance(p[1], str)) for p in sessions):
+                out.append(f"{where}.rollup.sessions: a list of [session, run or null]")
+            for k, v in verdicts.items():
                 if k not in FOLDABLE_VERDICTS:
                     out.append(f"{where}.rollup.verdicts: a {k!r} observation was folded (only "
                                f"{FOLDABLE_VERDICTS} fold)")
@@ -717,7 +727,25 @@ def _scopes_overlap(a: dict, b: dict) -> bool:
 
 
 def validate_unit(doc: Any) -> list[str]:
-    """Every violation in a unit document (an empty list = valid)."""
+    """Every violation in a unit document (an empty list = valid). Never raises: a structure the field checks did
+    not foresee is reported as a violation (review fix 4), so a broken file is refused, never a crash."""
+    try:
+        return _validate_unit(doc)
+    except Exception as exc:  # noqa: BLE001
+        return [f"the document's structure could not be read ({type(exc).__name__}: {exc}): a field holds the wrong "
+                f"type"]
+
+
+def _as_list(v: Any, where: str, out: list[str]) -> list:
+    if v is None:
+        return []
+    if not isinstance(v, list):
+        out.append(f"{where}: a list (got {type(v).__name__})")
+        return []
+    return v
+
+
+def _validate_unit(doc: Any) -> list[str]:
     out: list[str] = []
     if not isinstance(doc, dict):
         return ["the file must hold a JSON object"]
@@ -752,7 +780,7 @@ def validate_unit(doc: Any) -> list[str]:
             out.append("unit.panel: an object")
         else:
             _unknown_keys(doc["panel"], PANEL_KEYS, "unit.panel", out)
-    for i, s in enumerate(doc.get("standing_conditions") or []):
+    for i, s in enumerate(_as_list(doc.get("standing_conditions"), "unit.standing_conditions", out)):
         w = f"unit.standing_conditions[{i}]"
         if not isinstance(s, dict):
             out.append(f"{w}: must be an object")
@@ -762,7 +790,7 @@ def validate_unit(doc: Any) -> list[str]:
             _check_text(s.get(k), f"{w}.{k}", out, max_len=200)
         if not isinstance(s.get("verified"), bool):
             out.append(f"{w}.verified: true only when DLC read the setting itself")
-    for i, ev in enumerate(doc.get("unit_events") or []):
+    for i, ev in enumerate(_as_list(doc.get("unit_events"), "unit.unit_events", out)):
         w = f"unit.unit_events[{i}]"
         if not isinstance(ev, dict):
             out.append(f"{w}: must be an object")
@@ -772,7 +800,7 @@ def validate_unit(doc: Any) -> list[str]:
             out.append(f"{w}.date: YYYY-MM-DD")
         _check_text(ev.get("what"), f"{w}.what", out, max_len=400)
         _check_by(ev.get("by"), w, out)
-    for i, r in enumerate(doc.get("revisions") or []):
+    for i, r in enumerate(_as_list(doc.get("revisions"), "unit.revisions", out)):
         w = f"unit.revisions[{i}]"
         if not isinstance(r, dict):
             out.append(f"{w}: must be an object")
@@ -796,7 +824,7 @@ def validate_unit(doc: Any) -> list[str]:
     if [e.get("id") for e in entries if isinstance(e, dict)] != sorted(ids):
         out.append("unit.entries: must be sorted by id")
     for eid, e in ids.items():
-        for ln in e.get("links") or []:
+        for ln in e.get("links") if isinstance(e.get("links"), list) else []:
             lid = ln.get("id") if isinstance(ln, dict) else None
             if isinstance(lid, str) and _ID_RE.match(lid) and lid not in ids:
                 out.append(f"entries[{eid}].links: {lid} is not an entry of this unit")
@@ -819,7 +847,7 @@ def validate_unit(doc: Any) -> list[str]:
             def linked(x: dict, y: dict) -> bool:
                 return any(isinstance(ln, dict) and ln.get("id") == y["id"]
                            and str(ln.get("rel", "")).rstrip("?") in CONFLICT_LINK_RELS
-                           and not str(ln.get("rel", "")).endswith("?") for ln in x.get("links") or [])
+                           and not str(ln.get("rel", "")).endswith("?") for ln in (x.get("links") if isinstance(x.get("links"), list) else []))
             if not (linked(a, b) or linked(b, a)):
                 out.append(f"entries[{a['id']}] and entries[{b['id']}]: both measured, signature "
                            f"{a['signature']['type']}, overlapping scope: one must 'refines' / 'supersedes' / "
@@ -1407,38 +1435,51 @@ class KnowledgeStore:
         return self.read_raw(unit_id)
 
     def load_tolerant(self, unit_id: str) -> Optional[dict]:
-        """For readers (digests, the tab): a missing or broken file is no knowledge, never a failure."""
+        """For readers (digests, the tab, resolution): a missing or broken file is no knowledge, never a failure.
+        A broken file is remembered in ``self.broken`` (unit id -> the first problem) so callers can report it."""
         try:
             return self.read_raw(unit_id)
-        except KnowledgeError:
+        except Exception as exc:  # noqa: BLE001  (any broken file: reported, skipped)
+            self.broken[unit_id] = str(exc).splitlines()[0][:300]
             return None
+
+    @property
+    def broken(self) -> dict[str, str]:
+        if not hasattr(self, "_broken"):
+            self._broken: dict[str, str] = {}
+        return self._broken
+
+    def _names(self, doc: dict) -> set[str]:
+        ident = doc.get("identity") or {}
+        names = {_norm_name(doc.get("unit_id", ""))} | {_norm_name(a) for a in doc.get("aliases") or []}
+        if ident.get("edid_id"):
+            names.add(_norm_name(ident["edid_id"]))
+        return names | {_norm_name(d) for d in ident.get("device_paths") or []}
 
     # -- resolution
     def resolve(self, name: str) -> str:
         """A unit id from a DLC display name (an alias), a DIP key (``name:MODE``), a unit id, an EDID id or a
-        device path. Refuses an ambiguous or unknown name, listing what is known."""
+        device path. Refuses an ambiguous or unknown name, listing the candidates; a broken file in the folder is
+        reported and skipped (its unit id still resolves to itself, so it can be validated)."""
         want = _norm_name(name)
         bare = _norm_name(name.rsplit(":", 1)[0]) if name.rsplit(":", 1)[-1].upper() in MODES else None
         hits: list[str] = []
         known: list[str] = []
         for uid in self.unit_ids():
             doc = self.load_tolerant(uid)
-            names = {_norm_name(uid)}
+            names = self._names(doc) if doc else {_norm_name(uid)}
             if doc:
-                names |= {_norm_name(a) for a in doc.get("aliases") or []}
-                ident = doc.get("identity") or {}
-                if ident.get("edid_id"):
-                    names.add(_norm_name(ident["edid_id"]))
-                names |= {_norm_name(d) for d in ident.get("device_paths") or []}
                 known.append(f"{uid} ({', '.join(doc.get('aliases') or [])})")
             else:
-                known.append(f"{uid} (unreadable)")
+                known.append(f"{uid} (unreadable: {self.broken.get(uid, '?')})")
             if want in names or (bare is not None and bare in names):
                 hits.append(uid)
         if len(hits) == 1:
             return hits[0]
         if len(hits) > 1:
-            raise KnowledgeError(f"{name!r} names more than one unit: {hits}; use the unit id")
+            cands = [k for k in known if k.split(" ", 1)[0] in hits]
+            raise KnowledgeError(f"{name!r} names more than one unit; candidates: {'; '.join(cands)}. Use the unit "
+                                 f"id")
         raise UnitNotFound(f"no unit known as {name!r} in {self.root}" + (f"; known: {'; '.join(known)}"
                                                                            if known else " (the folder is empty)"))
 
@@ -1479,8 +1520,11 @@ class KnowledgeStore:
 
     def _finish(self, old: Optional[dict], new: dict) -> dict:
         errs = validate_unit(new)
-        if old is not None:
-            errs += check_append_only(old, new)
+        if old is not None and not errs:
+            try:
+                errs += check_append_only(old, new)
+            except Exception as exc:  # noqa: BLE001
+                errs.append(f"the append-only check could not read the result ({type(exc).__name__}: {exc})")
         if errs:
             raise KnowledgeError(f"unit {new.get('unit_id')}: refused, nothing written", errs)
         size = len(_dump(new).encode("utf-8"))
@@ -1504,12 +1548,14 @@ class KnowledgeStore:
                 except KnowledgeError as exc:
                     raise KnowledgeError(f"op {i + 1} ({op.get('op') if isinstance(op, dict) else op}): {exc}",
                                          exc.violations) from exc
+                except (TypeError, AttributeError, ValueError, KeyError) as exc:
+                    raise KnowledgeError(f"op {i + 1}: malformed ({type(exc).__name__}: {exc})") from exc
         return self.write(unit_id, mutate, base_rev=base_rev, create=create, today=today)
 
     def render_all(self, *, today: Optional[str] = None) -> list[Path]:
         out = []
         for uid in self.unit_ids():
-            doc = self.read_raw(uid)
+            doc = self.load_tolerant(uid)          # a broken file is reported (self.broken) and skipped
             if doc is not None:
                 p = self.md_path(uid)
                 atomic_write_text(p, render(doc, source=self.path(uid).name, today=today))
@@ -1526,8 +1572,11 @@ def validate_ops(doc: dict, ops: Sequence[dict], *, base_dir: Optional[Path] = N
             apply_op(new, op, base_dir=base_dir, today=today)
     except KnowledgeError as exc:
         return [str(exc).splitlines()[0]] + exc.violations
+    except (TypeError, AttributeError, ValueError, KeyError) as exc:
+        return [f"malformed op ({type(exc).__name__}: {exc})"]
     new["rev"] = int(doc.get("rev", 0)) + 1
-    return validate_unit(new) + check_append_only(doc, new)
+    errs = validate_unit(new)
+    return errs if errs else check_append_only(doc, new)
 
 
 # ----------------------------------------------------------------------------- observation context (match input)
