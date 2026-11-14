@@ -739,7 +739,19 @@ def _record(cal: Any, section: Any) -> Optional[str]:
         return None
     rec.peak_by_window = section
     rec.updated = cal.run_date.isoformat()
-    store.record(rec)
+    from .dip import DipStoreConflict, park_dip_change
+    from .file_lock import LockTimeout
+    try:
+        store.record(rec)
+    except (LockTimeout, DipStoreConflict) as exc:
+        # no measured section is lost to a lock: kept in the run folder with the command that writes it later
+        parked = park_dip_change(cal.ctx.root / "dip_peak_by_window_pending.json", key=rec.key, record=None,
+                                 fields={"peak_by_window": section.as_dict(), "updated": rec.updated},
+                                 why="peak-window record seam: the DIP store could not be written")
+        cal.runlog.anomaly(STAGE, kind="not_recorded",
+                           message=(f"the DIP store could not be written ({exc}); the section is kept in {parked}: "
+                                    f"python -m dlc.dip write-pending --file \"{parked}\" --dip \"{store.path}\""))
+        return None
     return f"{store.path}#{rec.key}"
 
 

@@ -191,7 +191,6 @@ def test_revision_lives_in_a_sidecar_and_the_file_keeps_its_two_keys(tmp_path: P
     assert DipStore.load(p).rev == 1
     s.record(_plain("B"))
     assert DipStore.load(p).rev == 2 and s.rev == 2
-    assert not (tmp_path / "dip_store.json.lock").exists()
 
 
 def test_two_stale_writers_on_different_records_both_survive(tmp_path: Path):
@@ -308,37 +307,149 @@ def test_processes_writing_at_once_lose_nothing(tmp_path: Path):
     assert got.rev == 25
 
 
-def test_a_dead_holders_old_lock_is_broken_a_live_one_is_not(tmp_path: Path):
-    target = tmp_path / "x.json"
-    lock = Path(str(target) + ".lock")
-    # a pid that is certainly gone: a child we started and reaped
+_HOLDER = ("import sys, time\n"
+           "from dlc.file_lock import FileLock\n"
+           "lk = FileLock(sys.argv[1], timeout_s=30)\n"
+           "lk.acquire()\n"
+           "print('held', flush=True)\n"
+           "sys.stdin.read()\n")
+
+
+def _start_holder(tmp_path: Path, target: Path) -> subprocess.Popen:
+    script = tmp_path / "holder.py"
+    script.write_text(_HOLDER, encoding="utf-8")
+    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    child = subprocess.Popen([sys.executable, "-c", "pass"], stdin=subprocess.DEVNULL, creationflags=flags)
-    child.wait()
-    lock.write_text(json.dumps({"pid": child.pid, "time": time.time() - 120}), encoding="utf-8")
-    old = time.time() - 120
-    os.utime(lock, (old, old))
-    with FileLock(target, timeout_s=2.0):
-        assert lock.exists()
-    assert not lock.exists()
-    # a live holder (this process), however old, is never broken
-    lock.write_text(json.dumps({"pid": os.getpid(), "time": time.time() - 120}), encoding="utf-8")
-    os.utime(lock, (old, old))
-    with pytest.raises(LockTimeout):
-        with FileLock(target, timeout_s=0.3):
-            pass
-    assert lock.exists()
-    lock.unlink()
+    p = subprocess.Popen([sys.executable, str(script), str(target)], env=env, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=flags, text=True)
+    assert p.stdout.readline().strip() == "held"
+    return p
 
 
-def test_a_fresh_lock_of_a_dead_holder_is_waited_for_not_broken(tmp_path: Path):
+def test_a_live_holder_blocks_and_is_named_a_killed_one_releases_at_once(tmp_path: Path):
+    """Review fix 2: no age rule. The kernel lock is the holder's; it goes when the holder's process goes, however
+    it ends (killed here), so a dead holder never makes a writer time out, and a reused pid cannot hold it."""
+    from dlc.file_lock import holder_alive, read_holder
+    target = tmp_path / "x.json"
+    holder = _start_holder(tmp_path, target)
+    try:
+        info = read_holder(Path(str(target) + ".lock"))
+        assert info["pid"] == holder.pid and info.get("created") is not None and holder_alive(info) is True
+        t0 = time.monotonic()
+        with pytest.raises(LockTimeout, match=str(holder.pid)):
+            with FileLock(target, timeout_s=0.3):
+                pass
+        assert time.monotonic() - t0 < 5
+    finally:
+        holder.kill()                     # our own child: TerminateProcess, no cleanup in the holder
+        holder.wait()
+    t0 = time.monotonic()
+    with FileLock(target, timeout_s=5):
+        pass
+    assert time.monotonic() - t0 < 1.0
+    # its description is still in the file: a reused pid would not match the creation time
+    assert holder_alive({**info, "created": int(info["created"]) + 1}) in (False, None)
+
+
+def test_a_leftover_lock_file_never_blocks(tmp_path: Path):
     target = tmp_path / "x.json"
     lock = Path(str(target) + ".lock")
-    lock.write_text(json.dumps({"pid": 999999, "time": time.time()}), encoding="utf-8")
-    with pytest.raises(LockTimeout):
-        with FileLock(target, timeout_s=0.3):
+    lock.write_text(json.dumps({"pid": os.getpid(), "time": time.time()}), encoding="utf-8")   # a live pid, no lock
+    with FileLock(target, timeout_s=0.5):
+        pass
+    lock.write_bytes(b"\x00garbage")
+    with FileLock(target, timeout_s=0.5):
+        pass
+
+
+def test_waiters_queue_behind_a_holder_and_none_breaks_it(tmp_path: Path):
+    """The check-then-act race of the age rule is gone: several waiters on a live holder all wait, none enters."""
+    target = tmp_path / "x.json"
+    holder = _start_holder(tmp_path, target)
+    entered: list[int] = []
+
+    def waiter(i: int) -> None:
+        try:
+            with FileLock(target, timeout_s=0.5):
+                entered.append(i)
+        except LockTimeout:
             pass
-    lock.unlink()
+
+    try:
+        ts = [threading.Thread(target=waiter, args=(i,)) for i in range(4)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert entered == []
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def test_a_characterize_record_the_lock_refuses_is_kept_and_written_later(tmp_path: Path, monkeypatch):
+    """Review fix 2: no flow loses a measured record to a lock: it is parked in the run folder, the stage ends
+    cleanly saying how to write it, and `python -m dlc.dip write-pending` writes it."""
+    from test_calibrate import _make
+
+    import dlc.file_lock as fl
+    from dlc.controller import CalibrationController
+    from dlc.dip import _main as dip_main
+
+    calib = _make(tmp_path, "char_locked", controller=CalibrationController.mock(), characterize_config=_char_cfg())
+    store = calib._dip_store()
+    prior = _prior("Synthetic mini-LED", calib.mode)
+    store.record(prior)
+    before = store.path.read_bytes()
+    monkeypatch.setattr(fl, "DEFAULT_TIMEOUT_S", 0.3)
+    with FileLock(store.path, timeout_s=1):         # held by this thread: the run's write times out
+        result = calib.run("characterize")
+    assert result.status == "aborted"
+    msg = result.digest["message"]
+    assert "write-pending" in msg
+    parked = calib.ctx.root / "dip_record_pending.json"
+    assert parked.exists() and str(parked) in msg
+    assert store.path.read_bytes() == before          # nothing written, nothing removed
+    assert dip_main(["write-pending", "--file", str(parked), "--dip", str(store.path)]) == 0
+    got = DipStore.load(store.path).get(prior.key)
+    assert got.made == "2026-06-16" and got.refresh_response is not None     # the new record, sections carried
+
+
+def test_a_peak_window_section_the_lock_refuses_is_kept(tmp_path: Path, monkeypatch):
+    import datetime as _d
+    from types import SimpleNamespace
+
+    import dlc.file_lock as fl
+    from dlc.dip import write_pending
+    from dlc.peak_window import _record
+
+    p = tmp_path / "dip_store.json"
+    DipStore.load(p).record(_plain("A"))
+    notes: list[dict] = []
+    cal = SimpleNamespace(_dip_store=lambda: DipStore.load(p), _dip_key=lambda: "A:HDR",
+                          run_date=_d.date(2026, 11, 14), ctx=SimpleNamespace(root=tmp_path),
+                          runlog=SimpleNamespace(anomaly=lambda stage, **kw: notes.append(kw)))
+    monkeypatch.setattr(fl, "DEFAULT_TIMEOUT_S", 0.3)
+    with FileLock(p, timeout_s=1):
+        assert _record(cal, _peak()) is None
+    parked = tmp_path / "dip_peak_by_window_pending.json"
+    assert parked.exists() and "write-pending" in notes[0]["message"]
+    assert DipStore.load(p).get("A:HDR").peak_by_window is None
+    write_pending(parked, p)
+    assert DipStore.load(p).get("A:HDR").peak_by_window.as_dict() == _peak().as_dict()
+
+
+def test_write_pending_puts_only_the_parked_fields(tmp_path: Path):
+    from dlc.dip import park_dip_change, write_pending
+    p = tmp_path / "dip_store.json"
+    DipStore.load(p).record(_plain("A", cold_channel="R"))
+    f = park_dip_change(tmp_path / "pending.json", key="A:HDR", record=None, why="test",
+                        fields={"peak_by_window": _peak().as_dict()})
+    w = DipStore.load(p)
+    r = w.get("A:HDR"); r.cold_channel = "B"; w.record(r)            # changed after the park
+    assert write_pending(f, p) == "wrote ['peak_by_window'] of A:HDR"
+    got = DipStore.load(p).get("A:HDR")
+    assert got.peak_by_window is not None and got.cold_channel == "B"
 
 
 def test_a_store_built_without_load_writes_its_own_content_as_before(tmp_path: Path):

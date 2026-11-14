@@ -699,7 +699,15 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     if not args.write:
         print("dry run: --write records it")
         return 0
-    record_response(args.dip, display, str(trim.get("mode")), resp)
+    from .dip import DipStoreConflict
+    from .file_lock import LockTimeout
+    try:
+        record_response(args.dip, display, str(trim.get("mode")), resp)
+    except (LockTimeout, DipStoreConflict) as exc:
+        # nothing is lost: the response is derived from the run folder; the same command writes it later
+        print(f"NOT recorded: the DIP store could not be written ({exc}). The run folder still holds the response; "
+              f"run this same command again once nothing else holds the store.")
+        return 2
     print(f"recorded in {args.dip} ({display}:{trim.get('mode')}). DesktopLUT re-reads the DIP on its next refresh "
           f"switch, the REFRESH TRIM row's RELOAD, or a layers.set refresh_trim.")
     return 0

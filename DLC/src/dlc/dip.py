@@ -646,14 +646,18 @@ def _opt_xy(v: Any) -> Optional[list[float]]:
 PENDING_KIND = "dlc.dip pending change"
 
 
-def park_dip_change(path: Path | str, *, key: str, record: Optional[dict[str, Any]], why: str) -> Path:
+def park_dip_change(path: Path | str, *, key: str, record: Optional[dict[str, Any]], why: str,
+                    fields: Optional[dict[str, Any]] = None) -> Path:
     """Keep a DIP write that could not be made (the store's lock did not come, or a conflicting writer) in a file
-    (normally in the run folder), so no measured record is lost to a lock. ``record`` None = remove ``key``.
-    ``python -m dlc.dip write-pending --file <path> --dip <store>`` applies it later."""
+    (normally in the run folder), so no measured record is lost to a lock. ``record`` = the whole record to write;
+    ``fields`` (with ``record`` None) = only these fields of the record that exists then (a probe section);
+    neither = remove ``key``. ``python -m dlc.dip write-pending --file <path> --dip <store>`` applies it later."""
     from datetime import datetime
     p = Path(path)
     payload = {"kind": PENDING_KIND, "key": key, "record": record, "why": why,
                "parked": datetime.now().isoformat(timespec="seconds")}
+    if fields is not None:
+        payload["fields"] = fields
     atomic_write_text(p, json.dumps(payload, indent=2))
     return p
 
@@ -668,6 +672,13 @@ def write_pending(path: Path | str, dip_path: Path | str) -> str:
     if store.corrupt:
         raise ValueError(f"{dip_path}: the DIP store is unreadable; not overwriting it")
     key, rec = str(payload["key"]), payload.get("record")
+    if rec is None and isinstance(payload.get("fields"), dict):
+        cur = store.get(key)
+        if cur is None:
+            raise ValueError(f"no DIP record {key!r} in {dip_path} to put {sorted(payload['fields'])} into")
+        merged = {**cur.as_dict(), **payload["fields"]}
+        store.record(DisplayInstrumentProfile.from_dict({**merged, "display": merged.get("display", key)}))
+        return f"wrote {sorted(payload['fields'])} of {key}"
     if rec is None:
         store.remove(key)
         return f"removed {key}"
