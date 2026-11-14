@@ -35,7 +35,7 @@ def effect(nits: float) -> float:
 
 
 def _calib(tmp_path: Path, name: str, *, residual=0.0, trim_on=True, model_kw=None, adjudicator=None, spec=None,
-           controller=None, api=None, panel_kw=None):
+           controller=None, api=None, panel_kw=None, cube=False, layers_on=None):
     run_dir = tmp_path / name
     ctx = open_run(run_dir) if (run_dir / "manifest.json").exists() \
         else create_run("HDR", display="synthetic", run_dir=run_dir)
@@ -46,16 +46,18 @@ def _calib(tmp_path: Path, name: str, *, residual=0.0, trim_on=True, model_kw=No
     server.refresh_trim_model = rv.sim_trim_model(api, "SIM0000", **(model_kw or {}))
     if trim_on and controller is None:
         ctrl.call("layers.set", {"monitor": 0, "mode": "HDR", "refresh_trim": True})
+    if cube and controller is None:
+        from dlc.simulation import write_identity_cube
+        ctrl.set_3dlut(0, "HDR", str(write_identity_cube(tmp_path / f"{name}_daily.cube", size=17)))
+    if layers_on and controller is None:
+        ctrl.set_layers(0, "HDR", **{n: True for n in layers_on})
 
     def hz():
         return rm.active_hz(rm.find_display(api.snapshot(), "SIM0000"))
 
-    def gain(h, nits):
-        """The panel's response at h, minus what DesktopLUT's trim takes away when the model says it is on screen."""
-        x = (1000.0 / h - 1000.0 / 60.0) / (1000.0 / (48000 / 1001) - 1000.0 / 60.0)
-        st = server.refresh_trim_model({"layers": {"0:HDR": dict(server.state.layers.get("0:HDR", {}))}})["0:HDR"]
-        on = st.get("state") == "trim" and bool(st.get("active_stamp"))      # a trimmed variant is on screen
-        return math.exp(effect(nits) * x * (residual if on else 1.0))
+    # the panel's response at the rate, what the trim takes away when the model says a trimmed variant is on screen,
+    # and the link rounding when the 3D LUT is bypassed (no DesktopLUT pass dithers then)
+    gain = rv.sim_refresh_gain(server, residual=residual, effect=effect)
     panel = ProbeSimPanel(clock=VirtualClock(), refresh_gain=gain, hz_fn=hz, **{"noise_rel": 0.0002, **(panel_kw or {})})
     cal = Calibration(ctx=ctx, profile=cp.Profile.synthetic(output_dir=str(tmp_path / "results")), monitor=0,
                       mode="HDR", controller=ctrl, measure=panel, adjudicator=adjudicator or AutoAdjudicator(),
@@ -214,30 +216,101 @@ def _row(leg, rate, t, y, xy, patch="g520"):
             "settled": True, "xyz": [x / yy * Y, Y, (1 - x - yy) / yy * Y], "source": "mode"}
 
 
+# reference x / y wobble leg to leg (drift + read noise) used by the pure rule tests: ~1e-4, a linear drift on top
+_WOB = (0.0, 1.2e-4, -0.9e-4, 1.0e-4, -1.1e-4)
+
+
+def _bracketed(rate_xy=((0.3127, 0.3290), (0.3127, 0.3290)), rate_y=(100.1, 100.1), *, drift=3e-4):
+    """Five reference legs (0, 2, 4, 6, 8) and two rate legs (1 and 7, one per pass) of one grey."""
+    rows = []
+    for i, leg in enumerate((0, 2, 4, 6, 8)):
+        w = _WOB[i]
+        rows.append(_row(leg, "60", leg * 60, 100.0 + 0.05 * i, (0.3127 + drift * i / 4 + w, 0.3290 - w)))
+    for (leg, xy, y) in zip((1, 7), rate_xy, rate_y):
+        base = drift * (leg / 2) / 4                  # the linear drift at that time
+        rows.append(_row(leg, "47.952", leg * 60, y, (xy[0] + base, xy[1])))
+    return rows
+
+
 def test_the_rule_luminance_and_chromaticity():
-    ok = [{"rate": r, "ok": True} for r in ("60", "47.952", "60")]
-    rows = [_row(0, "60", 0, 100.0, (0.3127, 0.3290)), _row(1, "47.952", 60, 100.1, (0.3127, 0.3290)),
-            _row(2, "60", 120, 100.2, (0.3128, 0.3291))]
+    ok = [{"rate": r, "ok": True, "rule": "stamp"} for r in ("60", "47.952")]
+    rows = _bracketed()
     res = rv.analyze_verify(rows, reference="60", trim_checks=ok)
-    assert res["verdict"] == "pass"
+    assert res["verdict"] == "pass", res["rates"]["47.952"]
+    cell = res["rates"]["47.952"]["greys"]["g520"]
+    assert cell["chroma"]["nu"] == 3 and cell["chroma"]["ok"] is True
+    assert cell["reference_repeatability"]["rms_x"] > 0
     # light 0.5 % over the bracket -> fail
-    rows_l = rows[:1] + [_row(1, "47.952", 60, 100.6, (0.3127, 0.3290))] + rows[2:]
-    assert rv.analyze_verify(rows_l, reference="60", trim_checks=ok)["verdict"] == "fail"
-    # light inside, chromaticity outside the reference reads' own spread -> undecided (the overseer judges)
-    rows_c = rows[:1] + [_row(1, "47.952", 60, 100.1, (0.3140, 0.3290))] + rows[2:]
-    res_c = rv.analyze_verify(rows_c, reference="60", trim_checks=ok)
-    assert res_c["verdict"] == "undecided" and "chromaticity" in res_c["rates"]["47.952"]["undecided"][0]
+    assert rv.analyze_verify(_bracketed(rate_y=(100.6, 100.6)), reference="60", trim_checks=ok)["verdict"] == "fail"
+    # a chromaticity shift of 0.002 (>> the legs' ~1e-4 repeatability, and well inside the 0.0003 linear drift the old
+    # max-min spread counted) -> fail, with the statistics in the reason
+    shifted = _bracketed(rate_xy=((0.3147, 0.3290), (0.3147, 0.3290)))
+    res_c = rv.analyze_verify(shifted, reference="60", trim_checks=ok)
+    assert res_c["verdict"] == "fail" and "Student t" in res_c["rates"]["47.952"]["fail"][0]
+    # a shift inside the repeatability (0.0001) passes
+    small = _bracketed(rate_xy=((0.3128, 0.3290), (0.3128, 0.3290)))
+    assert rv.analyze_verify(small, reference="60", trim_checks=ok)["verdict"] == "pass"
+    # the old max-min rule would have failed a shift the size of the linear drift; this one does not
+    drift_only = _bracketed(rate_xy=((0.31275, 0.3290), (0.31275, 0.3290)))
+    assert rv.analyze_verify(drift_only, reference="60", trim_checks=ok)["verdict"] == "pass"
     # no trim read-back at the rate -> undecided; a failed one -> fail
-    assert rv.analyze_verify(rows, reference="60", trim_checks=[])["verdict"] == "undecided"
+    assert rv.analyze_verify(rows, reference="60", trim_checks=ok[:1])["verdict"] == "undecided"
     bad = [{"rate": "47.952", "ok": False, "state": "trim", "applied": False}]
     assert rv.analyze_verify(rows, reference="60", trim_checks=bad)["verdict"] == "fail"
+    # two reference legs only: no repeatability estimate -> undecided, said so
+    few = [r for r in rows if r["leg"] in (0, 1, 2)]
+    res_f = rv.analyze_verify(few, reference="60", trim_checks=ok)
+    assert res_f["verdict"] == "undecided" and "too few reference legs" in res_f["rates"]["47.952"]["undecided"][0]
+
+
+def test_student_t_and_its_critical_values():
+    for nu, t, p in ((1, 1.0, 0.5), (2, 4.303, 0.05), (3, 3.182, 0.05), (4, 2.776, 0.05), (10, 2.228, 0.05),
+                     (3, 5.841, 0.01)):
+        assert rv.t_two_sided_p(t, nu) == pytest.approx(p, abs=2e-4)
+        assert rv.t_critical(p, nu) == pytest.approx(t, rel=2e-3)
+    assert rv.t_two_sided_p(0.0, 3) == pytest.approx(1.0)
+
+
+def test_link_code_size():
+    # 10-bit PQ: ~2.3 % of light per code at 0.5 nit, ~0.9 % at 1000 nit (the live run's numbers)
+    assert rv.link_code_pct(0.5, 10) == pytest.approx(2.3, abs=0.1)
+    assert rv.link_code_pct(1000.0, 10) == pytest.approx(0.90, abs=0.03)
+    assert rv.link_code_pct(100.0, 12) < rv.link_code_pct(100.0, 10) / 3.5
+    assert rv.link_code_pct(None, 10) is None and rv.link_code_pct(100.0, None) is None
+
+
+def test_mhc_only_names_a_residual_below_one_link_code():
+    ok = [{"rate": r, "ok": True, "rule": "stamp"} for r in ("60", "47.952")]
+    rows = _bracketed(rate_y=(100.6, 100.6))              # +0.5 %: outside 0.3 %, inside one 10-bit code (~0.98 %)
+    res = rv.analyze_verify(rows, reference="60", trim_checks=ok, stack="mhc_only", link_bpc=10)
+    cell = res["rates"]["47.952"]["greys"]["g520"]
+    assert res["verdict"] == "undecided" and cell["residual_below_one_link_code"] is True
+    assert "not resolvable without dither" in res["rates"]["47.952"]["undecided"][0]
+    big = _bracketed(rate_y=(101.5, 101.5))                # +1.5 %: more than one code -> fail even without dither
+    assert rv.analyze_verify(big, reference="60", trim_checks=ok, stack="mhc_only", link_bpc=10)["verdict"] == "fail"
+    # as viewed the same +0.5 % is a plain fail (0.3 % stays), the code size still reported
+    res_v = rv.analyze_verify(rows, reference="60", trim_checks=ok, stack="as_viewed", link_bpc=10)
+    assert res_v["verdict"] == "fail" and res_v["rates"]["47.952"]["greys"]["g520"]["link_code_pct"] > 0.9
 
 
 def test_spec_problems_and_plan_cli(tmp_path):
     assert rp.RefreshProbeSpec.from_dict({"purpose": "verify", "source": "vrr"}).problems()
     assert rp.RefreshProbeSpec.from_dict({"purpose": "nonsense"}).problems()
-    assert rp.expected_stack(rp.RefreshProbeSpec(purpose="verify")) == {"bypass_3dlut": True, "refresh_trim": True}
-    assert "refresh_trim" not in rp.probe_stack(rp.RefreshProbeSpec(purpose="verify"))
+    assert rp.RefreshProbeSpec.from_dict({"purpose": "verify", "verify_stack": "x"}).problems()
+    assert rp.RefreshProbeSpec.from_dict({"purpose": "verify", "verify_layers_off": ["nope"]}).problems()
+    assert rp.RefreshProbeSpec.from_dict({"purpose": "verify", "verify_stack": "mhc_only",
+                                          "verify_layers_off": ["fald"]}).problems()
+    mhc = rp.RefreshProbeSpec(purpose="verify", verify_stack="mhc_only")
+    assert rp.expected_stack(mhc) == {"bypass_3dlut": True, "refresh_trim": True}
+    assert rp.probe_stack(mhc) == {"bypass_3dlut": True}
+    viewed = rp.RefreshProbeSpec(purpose="verify")
+    assert viewed.as_viewed and rp.probe_stack(viewed) == {}
+    assert rp.expected_stack(viewed)["refresh_trim"] is True
+    assert "refresh_trim" not in rp.probe_stack(mhc)
+    out2 = tmp_path / "m.json"
+    assert rp.main(["plan", "--purpose", "verify", "--verify-stack", "mhc_only", "--rates", "47.952,50",
+                    "--out", str(out2)]) == 0
+    assert json.loads(out2.read_text(encoding="utf-8"))["verify_stack"] == "mhc_only"
     out = tmp_path / "v.json"
     assert rp.main(["plan", "--purpose", "verify", "--rates", "47.952,50", "--reference", "60", "--out", str(out)]) == 0
     spec = json.loads(out.read_text(encoding="utf-8"))
@@ -314,23 +387,22 @@ def test_a_stampless_reply_uses_the_fallback_rule_end_to_end(tmp_path):
 
 
 def test_an_unbracketed_read_makes_the_rate_undecided_and_is_named():
-    ok = [{"rate": r, "ok": True, "rule": "reference" if r == "60" else "stamp"} for r in ("60", "47.952", "60")]
-    rows = [_row(0, "60", 0, 100.0, (0.3127, 0.3290)), _row(1, "47.952", 60, 100.1, (0.3127, 0.3290)),
-            _row(2, "60", 120, 100.2, (0.3128, 0.3291))]
+    ok = [{"rate": r, "ok": True, "rule": "reference" if r == "60" else "stamp"} for r in ("60", "47.952")]
+    rows = _bracketed()
     assert rv.analyze_verify(rows, reference="60", trim_checks=ok)["verdict"] == "pass"
-    late = _row(3, "47.952", 180, 100.1, (0.3127, 0.3290))          # after the last reference read: no bracket
+    late = _row(9, "47.952", 540, 100.1, (0.3127, 0.3290))          # after the last reference read: no bracket
     res = rv.analyze_verify(rows + [late], reference="60", trim_checks=ok)
     cell = res["rates"]["47.952"]["greys"]["g520"]
     assert res["verdict"] == "undecided" and cell["verdict"] == "undecided"
-    assert cell["reads"] == 2 and cell["bracketed"] == 1
-    assert cell["unbracketed"] == [{"leg": 3, "pass": "A", "t_s": 180, "why": "no reference read on both sides"}]
+    assert cell["reads"] == 3 and cell["bracketed"] == 2
+    assert cell["unbracketed"] == [{"leg": 9, "pass": "A", "t_s": 540, "why": "no reference read on both sides"}]
     assert any("without a bracketed ratio" in u for u in res["rates"]["47.952"]["undecided"])
     # a read with no light is named too, never dropped silently
-    dark = {**_row(3, "47.952", 90, 100.1, (0.3127, 0.3290)), "y": None, "xyz": None}
+    dark = {**_row(3, "47.952", 180, 100.1, (0.3127, 0.3290)), "y": None, "xyz": None}
     res2 = rv.analyze_verify(rows + [dark], reference="60", trim_checks=ok)
     assert res2["rates"]["47.952"]["greys"]["g520"]["unbracketed"][0]["why"] == "no reading"
     # a light miss still fails (the worse verdict wins)
-    bad = rows[:1] + [_row(1, "47.952", 60, 100.6, (0.3127, 0.3290))] + rows[2:]
+    bad = _bracketed(rate_y=(100.6, 100.6))
     assert rv.analyze_verify(bad + [late], reference="60", trim_checks=ok)["verdict"] == "fail"
 
 
@@ -364,3 +436,68 @@ def test_state_get_raising_inside_the_trim_check_ends_at_the_reference_with_the_
         out = json.loads((cal.ctx.root / rv.RESULT_FILE).read_text(encoding="utf-8"))
         assert out["rates"]["47.952"]["verdict"] == "fail"
         assert any(c.get("error", "").startswith("ConnectionError") for c in cal.calib["refresh_probe"]["trim_checks"])
+
+
+# ----------------------------------------------------------------------------- 2026-11-14: as viewed / mhc_only
+def _set_calls(ctrl) -> list:
+    return [dict(r.params or {}) for r in ctrl.client.transport.requests if r.method == "layers.set"]
+
+
+def test_as_viewed_measures_the_owners_stack_untouched_and_passes_a_good_trim(tmp_path):
+    adj = MappingAdjudicator({})
+    cal0, _, _, _ = _calib(tmp_path, "viewed_seam", adjudicator=adj, cube=True, layers_on=("fald", "tonemap"))
+    with pytest.raises(AdjudicationRequired) as ei:
+        cal0.run("refresh-response")
+    q, d = ei.value.request.question, ei.value.request.digest
+    assert "AS VIEWED" in q and "IN the path" in q and "fald" in q and "tonemap" in q and "verify_layers_off" in q
+    assert d["verify_stack"] == "as_viewed" and set(d["per_layer"]) == {"tonemap", "fald"}
+    assert d["link"]["link_bpc"] == 10
+    cal, api, _, ctrl = _calib(tmp_path, "viewed", cube=True, layers_on=("fald", "tonemap"))
+    before = len(_set_calls(ctrl))
+    res = cal.run("refresh-response")
+    assert res.status == "completed" and res.digest["verdict"] == "pass", res.digest
+    assert res.digest["verify_stack"] == "as_viewed"
+    assert _set_calls(ctrl)[before:] == []                      # the run sent NO layers.set at all
+    lay = _layers(ctrl)
+    assert lay["fald"] is True and lay["tonemap"] is True and lay["bypass_3dlut"] is False
+    ms = cal.calib["refresh_probe"]["measured_stack"]
+    assert ms["verify_stack"] == "as_viewed" and ms["layers"]["fald"] is True and ms["cube_path"]
+    assert sorted((ms["viewing_layers"] or {}).get("kept") or {}) == sorted(rp.VIEWING_LAYERS)
+    out = json.loads((cal.ctx.root / rv.RESULT_FILE).read_text(encoding="utf-8"))
+    assert out["stack"] == "as_viewed" and out["link_bpc"] == 10
+    assert all(c["link_code_pct"] > 0.8 for r in out["rates"].values() for c in r["greys"].values())
+    assert _at(api) == (60, 1)
+
+
+def test_as_viewed_can_take_a_layer_out_and_puts_it_back(tmp_path):
+    cal, api, _, ctrl = _calib(tmp_path, "viewed_off", cube=True, layers_on=("fald", "tonemap"),
+                               spec={"verify_layers_off": ["fald"]})
+    res = cal.run("refresh-response")
+    assert res.status == "completed", res.digest
+    assert cal.calib["refresh_probe"]["measured_stack"]["layers"]["fald"] is False
+    assert cal.calib["refresh_probe"]["measured_stack"]["layers"]["tonemap"] is True
+    assert _layers(ctrl)["fald"] is True                       # restored at the end
+
+
+def test_mhc_only_rounds_to_the_link_and_says_not_resolvable(tmp_path):
+    """The sim rounds the MHC output to the 10-bit link when the 3D LUT is bypassed (no dither): a perfect trim then
+    misses 0.3 % at some greys by less than one link code -> undecided, worded; as viewed the same trim passes."""
+    cal, api, _, ctrl = _calib(tmp_path, "mhc", cube=True, layers_on=("fald",), spec={"verify_stack": "mhc_only"})
+    res = cal.run("refresh-response")
+    assert res.status == "completed", res.digest
+    assert res.digest["verdict"] == "undecided", res.digest
+    reasons = [u for r in res.digest["rates"] for u in r["undecided"]]
+    assert any("not resolvable without dither" in u for u in reasons)
+    assert all("not resolvable" in u or "too few" in u for u in reasons), reasons
+    out = json.loads((cal.ctx.root / rv.RESULT_FILE).read_text(encoding="utf-8"))
+    below = [c for r in out["rates"].values() for c in r["greys"].values() if c.get("residual_below_one_link_code")]
+    assert below and all(abs(c["pct"]) < c["link_code_pct"] for c in below)
+    ms = cal.calib["refresh_probe"]["measured_stack"]
+    assert ms["layers"]["bypass_3dlut"] is True and ms["layers"]["fald"] is False
+    assert _layers(ctrl)["bypass_3dlut"] is False and _layers(ctrl)["fald"] is True and _at(api) == (60, 1)
+
+
+def test_mhc_only_still_fails_a_trim_that_misses_by_more_than_a_code(tmp_path):
+    cal, _, _, _ = _calib(tmp_path, "mhc_bad", cube=True, residual=1.0, spec={"verify_stack": "mhc_only"})
+    res = cal.run("refresh-response")
+    assert res.status == "completed" and res.digest["verdict"] == "fail", res.digest

@@ -61,7 +61,9 @@ CHART = "refresh_response"
 LADDER_NITS = (0.5, 2.0, 10.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 4000.0)
 COLOURS = (("R", (1, 0, 0)), ("G", (0, 1, 0)), ("B", (0, 0, 1)), ("C", (0, 1, 1)), ("M", (1, 0, 1)), ("Y", (1, 1, 0)))
 PROBE_STACK = {"bypass_3dlut": True, "refresh_trim": False}   # beyond the viewing layers readiness switches off
-VERIFY_STACK = {"bypass_3dlut": True}                          # a verify never sends refresh_trim (it must stay ON)
+VERIFY_STACK = {"bypass_3dlut": True}                          # verify mhc_only; never refresh_trim (it stays ON)
+VERIFY_STACKS = ("as_viewed", "mhc_only")
+VIEWING_LAYERS = ("tonemap", "desktop_gamma", "white_balance", "grayscale", "fald")   # controller.LAYER_NAMES
 SOURCES = ("mode", "vrr")
 
 __all__ = ["RefreshProbeSpec", "mode_legs", "levels_for_peak", "ModeSource", "run_flow", "restore_run",
@@ -109,6 +111,11 @@ class RefreshProbeSpec:
     purpose: str = "response"
     verify_lum_tol: float = 0.003         # verify: each grey within this of the time-bracketed reference light
     trim_wait_s: float = 30.0             # verify: how long after the settle to wait for the trim variant to show
+    # verify: what is measured. "as_viewed" (default) = the owner's stack exactly as it is (3D LUT in the path, the
+    # viewing layers untouched; the ratio at identical codes cancels every static layer); "mhc_only" = the isolated
+    # MHC (3D LUT bypassed, viewing layers off): nothing dithers, so residuals below one link code are not resolvable
+    verify_stack: str = "as_viewed"
+    verify_layers_off: tuple[str, ...] = ()   # as_viewed: viewing layers switched off for the run (restored after)
 
     @classmethod
     def from_dict(cls, d: Optional[dict[str, Any]]) -> "RefreshProbeSpec":
@@ -118,7 +125,7 @@ class RefreshProbeSpec:
         bad = sorted(set(d) - known)
         if bad:
             raise ValueError(f"unknown refresh-probe spec keys: {bad}")
-        for k in ("rates",):
+        for k in ("rates", "verify_layers_off"):
             if k in d:
                 d[k] = tuple(str(x) for x in d[k])
         if "levels_nits" in d:
@@ -130,6 +137,7 @@ class RefreshProbeSpec:
     def as_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["rates"] = list(self.rates)
+        out["verify_layers_off"] = list(self.verify_layers_off)
         out["levels_nits"] = list(self.levels_nits)
         return out
 
@@ -149,7 +157,18 @@ class RefreshProbeSpec:
             out.append("a verify runs on fixed display modes (source 'mode'): the trim is keyed by the mode's rate")
         if self.purpose == "verify" and not 0 < self.verify_lum_tol < 0.05:
             out.append(f"verify_lum_tol {self.verify_lum_tol} outside (0, 0.05)")
+        if self.verify_stack not in VERIFY_STACKS:
+            out.append(f"verify_stack must be one of {VERIFY_STACKS}, not {self.verify_stack!r}")
+        bad = sorted(set(self.verify_layers_off) - set(VIEWING_LAYERS))
+        if bad:
+            out.append(f"verify_layers_off: unknown layer(s) {bad}; known: {list(VIEWING_LAYERS)}")
+        if self.verify_layers_off and self.verify_stack != "as_viewed":
+            out.append("verify_layers_off applies to verify_stack 'as_viewed' (mhc_only switches every viewing layer off)")
         return out
+
+    @property
+    def as_viewed(self) -> bool:
+        return self.verify and self.verify_stack == "as_viewed"
 
     @property
     def verify(self) -> bool:
@@ -158,12 +177,18 @@ class RefreshProbeSpec:
 
 # ----------------------------------------------------------------------------- plan (pure)
 def probe_stack(spec: RefreshProbeSpec) -> dict[str, bool]:
-    """What the run SETS beyond the viewing layers (recorded in ``probe_stack_before``, put back by the restore)."""
+    """What the run SETS beyond the viewing layers (recorded in ``probe_stack_before``, put back by the restore).
+    A verify AS VIEWED sets nothing."""
+    if spec.as_viewed:
+        return {}
     return dict(VERIFY_STACK if spec.verify else PROBE_STACK)
 
 
 def expected_stack(spec: RefreshProbeSpec) -> dict[str, bool]:
-    """What the stack must read while measuring (a change of it mid-run ends the run)."""
+    """What the stack must read while measuring (a change of it mid-run ends the run). The values are what the run
+    sets; the check compares every key with the stack read at the start of the measurement (``ref_view``)."""
+    if spec.as_viewed:
+        return {"refresh_trim": True, "bypass_3dlut": False, **{n: False for n in VIEWING_LAYERS}}
     return {**VERIFY_STACK, "refresh_trim": True} if spec.verify else dict(PROBE_STACK)
 
 
@@ -716,6 +741,8 @@ def _set_probe_stack(cal: Any, st: dict[str, Any], spec: Optional[RefreshProbeSp
     st["probe_stack_before"] = {k: before.get(k) for k in stack}
     cal._save()
     want = {k: v for k, v in stack.items() if k in before or k == "bypass_3dlut"}
+    if not want:                                  # a verify as viewed: nothing to set
+        return
     cal.controller.call("layers.set", {"monitor": cal.monitor, "mode": cal.mode, **want})
     after = ((cal.controller.state() or {}).get("layers") or {}).get(key) or {}
     bad = {k: after.get(k) for k, v in want.items() if after.get(k) is not v}
@@ -734,6 +761,48 @@ def _restore_probe_stack(controller: Any, monitor: int, mode: str, before: dict[
         return {"want": want, "diff": diff, "ok": not diff}
     except Exception as exc:  # noqa: BLE001 - reported, the restore CLI is the fallback
         return {"want": want, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+LAYER_NOTES = {
+    "tonemap": ("the HDR tone map: a fixed curve maps a code to the same light at any rate; the DYNAMIC mode follows the "
+                "frame's own peak, which for a static full-field grey settles to the same state at each rate (if its "
+                "adaptation is counted in frames it settles a little faster at 60 than at 48 Hz — covered by the >= 30 s "
+                "settle after each switch and the settled-tail reads). Not keyed by the refresh rate."),
+    "fald": ("the FALD compensation layer: driven by the frame content; on a static full-field grey every zone gets the "
+             "same request at each rate. LED lag PANEL CLOCK steps once per refresh, so it reaches its rest in fewer "
+             "seconds at 60 Hz — settled before the reads. Not keyed by the refresh rate."),
+    "desktop_gamma": ("desktop gamma: baked into the MHC 1D LUT of every trim variant alike (a code maps the same way). "
+                      "Not keyed by the refresh rate."),
+    "white_balance": "white balance: baked into the MHC of every trim variant alike. Not keyed by the refresh rate.",
+    "grayscale": ("the fine-tune (grayscale) curve: baked into the MHC of every trim variant alike. Not keyed by the "
+                  "refresh rate."),
+}
+
+
+def verify_layer_notes(layers: dict[str, Any]) -> dict[str, str]:
+    """Per viewing layer ON in the stack: what a full-field grey means under it, and whether it can differ between
+    refresh rates for the same code (none of DesktopLUT's layers is keyed by the rate; the adaptive ones settle)."""
+    return {n: LAYER_NOTES[n] for n in VIEWING_LAYERS if layers.get(n)}
+
+
+def verify_stack_words(spec: RefreshProbeSpec, st: dict[str, Any]) -> str:
+    lay = st.get("layers_at_plan") or {}
+    if not spec.as_viewed:
+        return ("MHC ONLY (verify_stack mhc_only): the 3D LUT bypassed and the viewing layers off (all restored). "
+                "Nothing in DesktopLUT processes the frame, so nothing dithers: the MHC2 output is rounded to the "
+                f"{(st.get('link') or {}).get('link_bpc') or '?'}-bit link per channel, and a residual below one link "
+                "code is reported as not resolvable without dither. ")
+    on = [n for n in VIEWING_LAYERS if lay.get(n) and n not in spec.verify_layers_off]
+    off = list(spec.verify_layers_off)
+    return ("AS VIEWED (verify_stack as_viewed): the installed MHC with its REFRESH TRIM on, the 3D LUT "
+            + ("IN the path" if st.get("cube_at_plan") and not lay.get("bypass_3dlut") else
+               "(none loaded / bypassed by the owner: as found)")
+            + f", the viewing layers exactly as they are (ON: {', '.join(on) or 'none'}"
+            + (f"; switched off for the run and restored: {', '.join(off)}" if off else "")
+            + "). The comparison is a ratio at identical codes, so every static layer cancels; none of the layers is "
+              "keyed by the refresh rate, and the adaptive ones (dynamic tone map, FALD / LED lag) settle on a static "
+              "grey before the reads (per-layer notes in the digest). To take a layer out, re-plan with the spec key "
+              "verify_layers_off [names]; verify_stack mhc_only isolates the MHC. ")
 
 
 def _reference_words(st: dict[str, Any]) -> str:
@@ -982,15 +1051,24 @@ def analyze_verify_run(cal: Any, st: dict[str, Any], spec: RefreshProbeSpec, sou
                 "trim_before": st.get("trim_before"), "simulate": simulated, "spec": spec.as_dict(),
                 "plan": st.get("plan"), "warm_in": st.get("warm_in"), "rewarm": st.get("rewarm"),
                 "restore": st.get("restore"), "source": source.kind, "ref_view": st.get("ref_view"),
+                "measured_stack": st.get("measured_stack"), "link": st.get("link"),
                 "audit_stack": {"monitor_identity": _identity(cal, st["hardware_id"])}}
     write_json(root / "evidence.json", evidence)
+    link_bpc = (st.get("link") or {}).get("link_bpc")
     res = rv.analyze_verify(rows, reference=st["reference"], lum_tol=spec.verify_lum_tol,
                             trim_checks=st.get("trim_checks") or [], anomalies=st.get("anomalies") or [],
-                            status="ok" if status == "ok" else status)
+                            status="ok" if status == "ok" else status, stack=spec.verify_stack,
+                            link_bpc=int(link_bpc) if link_bpc else None)
     res["meta"] = {"run": root.name, "status": status, "simulated": simulated, "purpose": rv.PURPOSE,
+                   "verify_stack": spec.verify_stack, "measured_stack": st.get("measured_stack"),
+                   # a hook pass that processes the HDR frame (a 3D LUT in the path) dithers the MHC input; without one
+                   # the MHC2 output lands on whole link codes (as viewed or not)
+                   "dither_pass_in_path": bool((st.get("measured_stack") or {}).get("cube_path")
+                                               and not ((st.get("measured_stack") or {}).get("layers") or {}).get("bypass_3dlut")),
                    "never_recorded": "a verify is evidence only: python -m dlc.refresh_trim record refuses it"}
     write_json(root / rv.RESULT_FILE, res)
-    return {"purpose": rv.PURPOSE, "verdict": res["verdict"], "rates": rv.digest_lines(res),
+    return {"purpose": rv.PURPOSE, "verdict": res["verdict"], "verify_stack": spec.verify_stack,
+            "link_bpc": res.get("link_bpc"), "rates": rv.digest_lines(res),
             "run_undecided": res["run_undecided"], "anomalies": len(st.get("anomalies") or []),
             "result": str(root / rv.RESULT_FILE), "simulated": simulated}
 
@@ -1039,6 +1117,12 @@ def run_flow(cal: Any) -> Any:
         ref_key = plan.get("reference") or spec.reference
         refusals += rv.trim_refusals(state_now, key, [r for r in (plan.get("measure") or spec.rates) if r != ref_key],
                                      reference=ref_key)
+        lay_now = dict(((state_now.get("layers") or {}).get(key)) or {})
+        st["layers_at_plan"] = jsonable({k: lay_now.get(k) for k in (*VIEWING_LAYERS, "bypass_3dlut", "refresh_trim",
+                                                                    "fald_temporal_mode", "fald_params_path")})
+        st["cube_at_plan"] = (((state_now.get("runtime") or {}).get(key)) or {}).get("cube_path")
+        mon = monitor_entry(cal)
+        st["link"] = jsonable({k: mon.get(k) for k in ("link_bpc", "link_color_encoding", "color_space")})
     if refusals and not st.get("measured"):
         for r in refusals:
             cal.runlog.anomaly(STAGE, kind="refused", message=r)
@@ -1062,13 +1146,13 @@ def run_flow(cal: Any) -> Any:
         cal._save()
         what = (f"VERIFY DesktopLUT's REFRESH TRIM (ON, never switched; nothing recorded) on monitor {cal.monitor} "
                 f"({cal.display.name}, {hw}) in HDR: pass = every grey at each rate within "
-                f"{spec.verify_lum_tol * 100:g} % of the time-bracketed reference light and its chromaticity within "
-                "the reference reads' own spread, the trim read back applied at every rate. "
+                f"{spec.verify_lum_tol * 100:g} % of the time-bracketed reference light, its chromaticity shift inside "
+                "the reference legs' own repeatability (Student t, Bonferroni), the trim read back on screen at every "
+                "rate. "
                 if spec.verify else
                 f"Measure the refresh response of monitor {cal.monitor} ({cal.display.name}, {hw}) in HDR via "
                 f"the {source.kind} rate source: ")
-        path = ("Through the installed MHC with its REFRESH TRIM on, the viewing layers and the 3D LUT out of the "
-                "path; all restored. " if spec.verify else
+        path = (verify_stack_words(spec, st) if spec.verify else
                 "Through the installed MHC with the viewing layers, the 3D LUT and DesktopLUT's refresh trim out of the "
                 "path; all restored. ")
         cal._abort_if(cal.adjudicate(AdjudicationRequest(
@@ -1084,6 +1168,10 @@ def run_flow(cal: Any) -> Any:
             digest={"reference_basis": st.get("reference_basis"), "reference_recorded": st.get("reference_recorded"),
                     "plan": st["plan"], "legs": st["legs"], "estimate": est, "levels_nits": st["levels_nits"],
                     "window_area_pct": st["window_area_pct"], "reference": st["reference"], "source": source.kind,
+                    **({"verify_stack": spec.verify_stack, "verify_layers_off": list(spec.verify_layers_off),
+                        "layers_now": st.get("layers_at_plan"), "cube_now": st.get("cube_at_plan"),
+                        "link": st.get("link"), "per_layer": verify_layer_notes(st.get("layers_at_plan") or {})}
+                       if spec.verify else {}),
                     "switch_seams": [f"refresh-response:switch:L{lg['leg']}:{lg['rate']}" for lg in st["legs"]
                                      if lg["rate"] != st["reference"]] if source.kind == "mode" else []})),
             stage=STAGE, message="refresh-response declined at the plan seam: nothing changed")
@@ -1092,9 +1180,20 @@ def run_flow(cal: Any) -> Any:
     status = "ok"
     if not st.get("measured"):
         try:
+            if spec.as_viewed and "probe_keep_layers" not in cal.calib:
+                # as viewed: the readiness leaves every viewing layer exactly as the owner has it (only the named
+                # verify_layers_off are switched off — and put back at the end)
+                cal.calib["probe_keep_layers"] = [n for n in VIEWING_LAYERS if n not in spec.verify_layers_off]
+                cal._save()
             cal.stage_hardware_readiness()
             if "probe_stack_before" not in st:
                 _set_probe_stack(cal, st, spec)
+            if spec.verify and "measured_stack" not in st:
+                # the stack actually measured (after the readiness and the probe stack), for the result and the record
+                st["measured_stack"] = jsonable({"verify_stack": spec.verify_stack, **stack_view(cal),
+                                                 "viewing_layers": cal.calib.get("viewing_layers")})
+                cal.runlog.emit("INFO", STAGE, "measured_stack", tier="digest", **st["measured_stack"])
+                cal._save()
             if hasattr(source, "start"):
                 source.start(spec, st)
             _write_pre_state(cal, st, source)
@@ -1177,6 +1276,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pp.add_argument("--purpose", choices=("response", "verify"), default="response",
                     help="response = measure the panel, trim OFF (recordable); verify = check REFRESH TRIM, trim ON "
                          "(never recorded; dlc.refresh_verify)")
+    pp.add_argument("--verify-stack", choices=VERIFY_STACKS, default="as_viewed", dest="verify_stack",
+                    help="verify: as_viewed (default: the owner's stack as it is) or mhc_only (the isolated MHC; no "
+                         "dither, residuals below one link code not resolvable)")
+    pp.add_argument("--verify-layers-off", default=None, dest="verify_layers_off",
+                    help="verify as_viewed: comma list of viewing layers switched off for the run (restored after)")
     pp.add_argument("--out", default=None, help="write the spec JSON (run --spec)")
     rp = sub.add_parser("run", help="the flow (other arguments pass to python -m dlc.calibrate)")
     rp.add_argument("--spec", default=None)
@@ -1196,7 +1300,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.cmd == "plan":
         spec = RefreshProbeSpec.from_dict({
             "source": args.source, "reference": args.reference, "purpose": args.purpose,
-            **({"colours": False} if args.purpose == "verify" else {}),
+            **({"colours": False, "verify_stack": args.verify_stack} if args.purpose == "verify" else {}),
+            **({"verify_layers_off": [n.strip() for n in args.verify_layers_off.split(",") if n.strip()]}
+               if args.verify_layers_off else {}),
             **({"rates": [r.strip() for r in args.rates.split(",") if r.strip()]} if args.rates else {}),
             **({"levels_nits": [float(x) for x in args.levels.split(",") if x.strip()]} if args.levels else {})})
         rates = list(spec.rates) or [r for r in rm.CONTENT_RATES if r != args.reference]
