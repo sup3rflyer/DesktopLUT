@@ -7,6 +7,7 @@
 #include "pch.h"
 #include "dwm_hook_config.h"
 #include "dwm_hook_host_alive.h"
+#include "dwm_hook_unload.h"
 #include "hook_log.h"
 #include "hook_lut.h"
 #include "hook_render.h"
@@ -283,6 +284,41 @@ static HANDLE g_hostMonitorThread = NULL;
 static HANDLE g_hostMonitorStopEvent = NULL;
 static std::atomic<bool> g_hookReverted{false};  // Set when the monitor thread reverted, prevents double-revert in DLL_PROCESS_DETACH
 
+// --- Leaving dwm.exe (shared/dwm_hook_unload.h) ---
+// The DLL is unmapped only after it has seen that no thread of dwm.exe is inside it. g_hookCalls counts the threads
+// inside detours (DwmHookCallScope, every detour's first statement) and the DLL's own two threads (the monitor thread,
+// the unload thread) for as long as they live; the trampoline slots are remembered so the frozen look
+// (DwmHookThreadsOutside) can also see a thread that sits on MinHook's relay jump.
+static HMODULE g_hModule = NULL;
+static DwmHookCallGate g_hookCalls;
+static void* g_trampolines[32] = {};
+static int g_numTrampolines = 0;
+static bool g_trampolinesUntracked = false;       // more hooks than slots: never claim "nobody inside"
+static bool g_unloadPrepared = false;             // the unload thread drained and tore down: DLL_PROCESS_DETACH has nothing left
+// The unload thread: parked since attach on { its stop event, the host's request } (UnloadThreadFunc). The host never
+// starts a thread in here: a thread whose start address is inside the DLL is inside it before anything can count it.
+static HANDLE g_unloadThread = NULL;
+static HANDLE g_unloadThreadStopEvent = NULL;     // manual-reset; set by DLL_PROCESS_DETACH of a plain FreeLibrary
+static HANDLE g_unloadRequestEvent = NULL;        // named, auto-reset: the host asks (DWM_HOOK_UNLOAD_REQUEST_EVENT_FMT)
+static HANDLE g_unloadBusyEvent = NULL;           // named, manual-reset: this DLL refused and stays loaded
+
+static MH_STATUS HookCreateTracked(LPVOID target, LPVOID detour, LPVOID* original)
+{
+	const MH_STATUS status = (MH_CreateHook)(target, detour, original);
+	if (status == MH_OK && original && *original) {
+		if (g_numTrampolines < (int)_countof(g_trampolines)) g_trampolines[g_numTrampolines++] = *original;
+		else g_trampolinesUntracked = true;
+	}
+	return status;
+}
+
+// MinHook's trampoline pages freed: the remembered slots are no longer ours to look for.
+static void HookUninitialize()
+{
+	(MH_Uninitialize)();
+	g_numTrampolines = 0;
+}
+
 // --- The other direction: the hook cannot work, and the host must see it as gone ---
 // A failed InitializeStuff is final for the injection (hook_render.cpp HookEnsureInitialized): nothing is corrected,
 // while the heartbeat would go on telling the host that the hook works. The present path reports it ONCE, with a
@@ -326,6 +362,120 @@ static bool IsProcessAlive(DWORD pid)
 	return found;
 }
 
+// Every MinHook hook disabled: no thread can ENTER a detour any more. A thread that is already inside one stays there
+// until it returns (MH_DisableHook only moves threads that sit in a trampoline or in the patched first bytes).
+// False = MinHook could not do it (its thread freeze or a page protection failed) and a hook may still be live:
+// nothing may be freed or unmapped on the strength of this call. Safe to call again (all off already = MH_OK).
+static bool DisableHooksChecked()
+{
+	const MH_STATUS status = MH_DisableHook(MH_ALL_HOOKS);
+	if (status == MH_OK || status == MH_ERROR_NOT_INITIALIZED) return true;   // (not initialised: no hook exists)
+	char msg[96];
+	sprintf_s(msg, "WARNING: MH_DisableHook failed (%d): a hook may still be live", (int)status);
+	log_to_file(msg);
+	return false;
+}
+
+// DWM's globals and the OverlaysEnabled bytes back as they were, then the hooks off (DisableHooksChecked: whoever
+// goes on to unload asks again and reads the answer). Callers hold g_hookReverted.exchange(true).
+static void RestorePatchesAndDisableHooks()
+{
+	if (g_overlayTestModePatched && g_pOverlayTestMode != NULL) {
+		__try { *g_pOverlayTestMode = g_savedOverlayTestMode; }
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	if (g_disableIndependentFlipPatched && g_pDisableIndependentFlip != NULL) {
+		__try { *g_pDisableIndependentFlip = g_savedDisableIndependentFlip; }
+		__except (EXCEPTION_EXECUTE_HANDLER) {}
+	}
+	if (g_overlaysEnabledPatchAddr != NULL) {
+		DWORD oldProt;
+		if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
+			memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
+			VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
+			FlushInstructionCache(GetCurrentProcess(), g_overlaysEnabledPatchAddr, 17);
+		}
+		g_overlaysEnabledPatchAddr = NULL;
+	}
+	DisableHooksChecked();
+}
+
+// Waits until no thread of dwm.exe is inside this DLL (shared/dwm_hook_unload.h): the count of threads inside reads 0
+// and, with every other thread suspended, no instruction pointer is in the image or in a trampoline slot.
+// Only after the hooks are disabled. False = the budget ran out: the caller must not free what a detour uses.
+// `why` (may be NULL): what the last frozen look found, for the log line of a refusal.
+struct HookDrainOps {
+	DwmHookCodeRange ranges[1 + _countof(g_trampolines)];
+	int numRanges = 0;
+	bool usable = false;
+	int looks = 0;
+	int lastResult = -1;
+	DwmHookLook last;
+	long Inside() { return g_hookCalls.inside.load(std::memory_order_acquire); }
+	int ThreadsOutside()
+	{
+		if (!usable) return -1;
+		looks++;
+		lastResult = DwmHookThreadsOutside(ranges, numRanges, &g_hookCalls, &last);
+		return lastResult;
+	}
+	unsigned long long NowMs() { return GetTickCount64(); }
+	void Pause(unsigned ms) { Sleep(ms); }
+};
+
+static bool DrainHookThreads(unsigned budgetMs, char* why = NULL, size_t whyBytes = 0)
+{
+	HookDrainOps ops;
+	if (g_hModule != NULL && !g_trampolinesUntracked) {
+		const BYTE* base = (const BYTE*)g_hModule;
+		const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+		const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+		ops.ranges[ops.numRanges++] = { (uintptr_t)base, (uintptr_t)base + nt->OptionalHeader.SizeOfImage };
+		// A trampoline and its relay jump share one MinHook slot (minhook/src/buffer.h MEMORY_SLOT_SIZE, 64 on x64).
+		for (int i = 0; i < g_numTrampolines; i++)
+			ops.ranges[ops.numRanges++] = { (uintptr_t)g_trampolines[i], (uintptr_t)g_trampolines[i] + 64 };
+		ops.usable = true;
+	}
+	const bool clear = DwmHookDrainHooks(ops, budgetMs);
+	if (!clear && why != NULL && whyBytes > 0) {
+		// Which of the three it was: a thread counted inside, a thread standing in our code, or a thread the look
+		// could not read (that one is never taken as "outside").
+		if (!ops.usable)
+			sprintf_s(why, whyBytes, "the hook's code ranges are not known (%d trampolines untracked)", g_numTrampolines);
+		else if (ops.looks == 0)
+			sprintf_s(why, whyBytes, "%ld thread(s) counted inside for the whole wait", ops.Inside());
+		else if (ops.lastResult == 0 && ops.last.insideTid != 0)
+			sprintf_s(why, whyBytes, "thread %lu stands at %p inside the hook's code (count %ld, %d looks)",
+				ops.last.insideTid, (void*)ops.last.insideIp, ops.last.count, ops.looks);
+		else if (ops.lastResult == 0)
+			sprintf_s(why, whyBytes, "%ld thread(s) counted inside at the last of %d looks", ops.last.count, ops.looks);
+		else
+			sprintf_s(why, whyBytes, "a thread could not be looked at (reason %d, thread %lu, error %lu, %d threads seen, %d looks)",
+				(int)ops.last.unseen, ops.last.unseenTid, ops.last.unseenError, ops.last.threads, ops.looks);
+	}
+	return clear;
+}
+
+// Everything a detour could touch, freed. Only after DrainHookThreads returned true (or, in DLL_PROCESS_DETACH of a
+// plain FreeLibrary, when the image is about to be unmapped whatever this does).
+static void TeardownAfterDrain()
+{
+	// MinHook's trampoline pages too (also when the monitor thread did the revert: it only disables, and a hook that
+	// cannot render is unloaded by a live host on every re-injection).
+	HookUninitialize();
+	if (g_hostMonitorThread) { CloseHandle(g_hostMonitorThread); g_hostMonitorThread = NULL; }
+	if (g_hostMonitorStopEvent) { CloseHandle(g_hostMonitorStopEvent); g_hostMonitorStopEvent = NULL; }
+	if (g_unloadThread) { CloseHandle(g_unloadThread); g_unloadThread = NULL; }
+	if (g_unloadThreadStopEvent) { CloseHandle(g_unloadThreadStopEvent); g_unloadThreadStopEvent = NULL; }
+	if (g_unloadRequestEvent) { CloseHandle(g_unloadRequestEvent); g_unloadRequestEvent = NULL; }
+	if (g_unloadBusyEvent) { CloseHandle(g_unloadBusyEvent); g_unloadBusyEvent = NULL; }
+	CloseHandleOnce(&g_hookFailedEvent);
+	if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
+	if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }
+	ReleaseMhcPreviewMapping();
+	UninitializeStuff();
+}
+
 // The host is gone, or this hook cannot render: put DWM back as it was and close the heartbeat. The DLL stays loaded,
 // inert (the next injection unloads it first). Monitor thread only: MH_DisableHook suspends dwm.exe's threads while it
 // patches, never something for the present path.
@@ -334,26 +484,7 @@ static void RevertHook(bool hostGone)
 	log_to_file(hostGone ? "Host process exited unexpectedly, reverting DWM hook..."
 	                     : "The hook's rendering resources could not be created, reverting DWM hook (the host re-injects)...");
 
-	if (!g_hookReverted.exchange(true)) {
-		if (g_overlayTestModePatched && g_pOverlayTestMode != NULL) {
-			__try { *g_pOverlayTestMode = g_savedOverlayTestMode; }
-			__except (EXCEPTION_EXECUTE_HANDLER) {}
-		}
-		if (g_disableIndependentFlipPatched && g_pDisableIndependentFlip != NULL) {
-			__try { *g_pDisableIndependentFlip = g_savedDisableIndependentFlip; }
-			__except (EXCEPTION_EXECUTE_HANDLER) {}
-		}
-		if (g_overlaysEnabledPatchAddr != NULL) {
-			DWORD oldProt;
-			if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
-				memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
-				VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
-				FlushInstructionCache(GetCurrentProcess(), g_overlaysEnabledPatchAddr, 17);
-			}
-			g_overlaysEnabledPatchAddr = NULL;
-		}
-		MH_DisableHook(MH_ALL_HOOKS);
-	}
+	if (!g_hookReverted.exchange(true)) RestorePatchesAndDisableHooks();
 
 	// Close heartbeat event so the host's watchdog (this host, or a restarted one) sees the hook as gone; with it the
 	// live panel-delivery capability. Nothing else tells a host that a hook works.
@@ -417,7 +548,19 @@ static HANDLE OpenHeldHostMutex()
 // With the mutex held by the host there is no timeout: no wake-up at all while the host lives and the hook works.
 // Without it (an older host, or the mutex could not be used) the wait times out every 5 s to read the process list;
 // without even a host pid only stop and hook-failed are served.
+static DWORD HostMonitorThreadBody();
+
+// The monitor thread is a thread inside this DLL like any thread in a detour: it is counted in g_hookCalls from
+// before its CreateThread until this last statement, so an unload waits for it (shared/dwm_hook_unload.h). A join on
+// its handle cannot do that under the loader lock: a thread that returns still needs that lock to end.
 static DWORD WINAPI HostMonitorThreadFunc(LPVOID)
+{
+	const DWORD result = HostMonitorThreadBody();
+	g_hookCalls.inside.fetch_sub(1, std::memory_order_acq_rel);
+	return result;
+}
+
+static DWORD HostMonitorThreadBody()
 {
 	HANDLE hostMutex = (g_hostPid != 0) ? OpenHeldHostMutex() : NULL;
 	bool pollingHost = (g_hostPid != 0) && hostMutex == NULL;
@@ -804,6 +947,7 @@ static __declspec(noinline) void LogOverlaySwapChainInfoOnce(void* overlaySwapCh
 long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
 	int a5, void* a6, bool a7)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (g_diagNoLutDraw) {
 		MarkContextCopiesStale(self);
 		return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rectVec, a5, a6, a7);
@@ -890,6 +1034,7 @@ long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwapChain, 
 long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned int a3, rectVec* rectVec,
                                   unsigned int a5, bool a6)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	UpdateLocalTonemapFromShared();
 
 	if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig)
@@ -951,6 +1096,7 @@ static bool HasActiveHookProcessing() {
 
 bool CWindowContext_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, bool a3)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (HasActiveHookProcessing())
 	{
 		return false;
@@ -963,6 +1109,7 @@ CCompSwapChain_IsCandidateDirectFlipCompatbile_t* CCompSwapChain_IsCandidateDire
 
 bool CCompSwapChain_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, bool a3)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (HasActiveHookProcessing())
 	{
 		return false;
@@ -975,6 +1122,7 @@ CCompVisual_IsCandidateForPromotion_t* CCompVisual_IsCandidateForPromotion_orig 
 
 bool CCompVisual_IsCandidateForPromotion_hook(void* self, void* a2, void* a3)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (HasActiveHookProcessing())
 	{
 		return false;
@@ -987,6 +1135,7 @@ CCompSwapChain_IsCandidateIndependentFlipCompatible_t* CCompSwapChain_IsCandidat
 
 bool CCompSwapChain_IsCandidateIndependentFlipCompatible_hook(void* self)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (HasActiveHookProcessing())
 	{
 		return false;
@@ -1000,6 +1149,7 @@ COverlayContext_IsDirectFlipSupportedOnTarget_t* COverlayContext_IsDirectFlipSup
 
 bool COverlayContext_IsDirectFlipSupportedOnTarget_hook(void* self, void* a2, void* a3)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (IsLUTActive(self))
 	{
 		return false;
@@ -1012,6 +1162,7 @@ CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_t* CGlobalCompositi
 
 bool CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_hook(void* self)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (HasActiveHookProcessing())
 	{
 		return false;
@@ -1029,6 +1180,7 @@ COverlayContext_IsCandidateDirectFlipCompatbile_24h2_t* COverlayContext_IsCandid
 bool COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2(void* self, void* a2, void* a3, void* a4, unsigned int a5,
 	bool a6)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (IsLUTActive(self))
 	{
 		return false;
@@ -1039,6 +1191,7 @@ bool COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2(void* self, void*
 bool COverlayContext_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, void* a3, void* a4, int a5,
                                                           unsigned int a6, bool a7, bool a8)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (IsLUTActive(self))
 	{
 		return false;
@@ -1052,11 +1205,70 @@ COverlayContext_OverlaysEnabled_t* COverlayContext_OverlaysEnabled_orig  = NULL;
 
 bool COverlayContext_OverlaysEnabled_hook(void* self)
 {
+	DwmHookCallScope inHook(g_hookCalls);   // first statement to return: shared/dwm_hook_unload.h
 	if (IsLUTActive(self))
 	{
 		return false;
 	}
 	return COverlayContext_OverlaysEnabled_orig(self);
+}
+
+// The way out of dwm.exe (shared/dwm_hook_unload.h), on the unload thread, outside the loader lock: it can wait for
+// dwm.exe's threads to leave the hook, and it can refuse. True = nobody is inside and everything is torn down: the
+// caller frees the library. False = the DLL stays loaded and inert (patches restored, heartbeat closed, hooks off
+// unless MinHook itself failed), and a later request tries again.
+static bool UnloadNow()
+{
+	log_to_file("Unload requested: hooks off, then waiting for dwm.exe's threads to leave the hook");
+
+	// The hooks first, and the answer read (whoever reverted earlier may have been told no): with a hook still live
+	// "nobody inside" would mean nothing the moment after it was seen. Refused here, nothing else has changed: the
+	// heartbeat stays open and the hook goes on working, which is what the host must go on believing.
+	if (!DisableHooksChecked()) {
+		log_to_file("Unload REFUSED: the hooks could not be disabled - staying loaded, still working");
+		return false;
+	}
+	CloseHandleOnce(&g_heartbeatEvent);
+	CloseHandleOnce(&g_faldPanelLiveEvent);
+	if (!g_hookReverted.exchange(true)) RestorePatchesAndDisableHooks();
+
+	// The monitor thread: stopped and waited for until it has ENDED. Its count goes down as its last statement, but
+	// its exit then still runs this image's per-thread CRT cleanup; outside the loader lock a join is possible.
+	if (g_hostMonitorStopEvent) SetEvent(g_hostMonitorStopEvent);
+	if (g_hostMonitorThread && WaitForSingleObject(g_hostMonitorThread, kDwmHookUnloadDrainMs) != WAIT_OBJECT_0) {
+		log_to_file("Unload REFUSED: the hook's monitor thread did not end - staying loaded, inert");
+		return false;
+	}
+
+	char why[224] = "";
+	if (!DrainHookThreads(kDwmHookUnloadDrainMs, why, sizeof(why))) {
+		char msg[352];
+		sprintf_s(msg, "Unload REFUSED after %u ms: %s - staying loaded, inert", kDwmHookUnloadDrainMs, why);
+		log_to_file(msg);
+		return false;
+	}
+
+	TeardownAfterDrain();
+	g_unloadPrepared = true;
+	log_to_file("Unload: no thread inside, resources released - unloading");
+	return true;
+}
+
+// Parked from attach on { stop, the host's request }. Counted in g_hookCalls like every thread inside this DLL, except
+// while it is the one that waits for the others. A request that ends in a refusal leaves it parked for the next one.
+static DWORD WINAPI UnloadThreadFunc(LPVOID)
+{
+	for (;;) {
+		HANDLE waits[2] = { g_unloadThreadStopEvent, g_unloadRequestEvent };
+		if (WaitForMultipleObjects(2, waits, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) break;   // stop, or the wait failed
+		if (g_unloadBusyEvent) ResetEvent(g_unloadBusyEvent);
+		g_hookCalls.inside.fetch_sub(1, std::memory_order_acq_rel);
+		if (UnloadNow()) FreeLibraryAndExitThread(g_hModule, 0);   // does not return
+		g_hookCalls.inside.fetch_add(1, std::memory_order_acq_rel);
+		if (g_unloadBusyEvent) SetEvent(g_unloadBusyEvent);        // the host stops waiting: still loaded
+	}
+	g_hookCalls.inside.fetch_sub(1, std::memory_order_acq_rel);   // last statement: DLL_PROCESS_DETACH waits for this
+	return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
@@ -1065,12 +1277,30 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 	{
 	case DLL_PROCESS_ATTACH:
 		{
+			g_hModule = hModule;
 			// Force C locale so sscanf("%f") always uses '.' as decimal separator,
 			// regardless of the system locale. Without this, .cube LUT parsing breaks
 			// on European locales where ',' is the decimal separator.
 			setlocale(LC_NUMERIC, "C");
 
 			log_to_file("DLL_PROCESS_ATTACH: DllMain entered");
+			// The unload request event exists from the first moment of this DLL (shared/dwm_hook_unload.h): a host
+			// that finds the module finds the event, whatever state the attach is in, and never mistakes this DLL
+			// for an older one it would FreeLibrary. A request set before the unload thread exists stays pending for
+			// it. Not reset here: a stale request needs someone else still holding the name, and the host closes its
+			// handle as soon as it has set it. Every way out of the attach closes it (TeardownAfterDrain via
+			// DLL_PROCESS_DETACH after a FALSE return; the hook-level-0 exit below).
+			{
+				SECURITY_DESCRIPTOR sd;
+				InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
+				SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE);  // NULL DACL, like the heartbeat
+				SECURITY_ATTRIBUTES sa = { sizeof(sa), &sd, FALSE };
+				wchar_t requestName[96], busyName[96];
+				DwmHookUnloadRequestEventName(GetCurrentProcessId(), requestName, _countof(requestName));
+				DwmHookUnloadBusyEventName(GetCurrentProcessId(), busyName, _countof(busyName));
+				g_unloadBusyEvent = CreateEventW(&sa, TRUE, FALSE, busyName);
+				g_unloadRequestEvent = CreateEventW(&sa, FALSE, FALSE, requestName);
+			}
 			HMODULE dwmcore = GetModuleHandle(L"dwmcore.dll");
 			if (!dwmcore) {
 				log_to_file("ERROR: dwmcore.dll not found — cannot set up hooks");
@@ -1525,14 +1755,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (g_hookLevel >= 1) {
 					if (!isWindows11_24h2 && !isWindows11_25h2)
-						mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig, (PVOID)COverlayContext_Present_hook,
+						mhStatus = HookCreateTracked((PVOID)COverlayContext_Present_orig, (PVOID)COverlayContext_Present_hook,
 									  (PVOID*)&COverlayContext_Present_orig);
 					else
-						mhStatus = MH_CreateHook((PVOID)COverlayContext_Present_orig_24h2, (PVOID)COverlayContext_Present_hook_24h2,
+						mhStatus = HookCreateTracked((PVOID)COverlayContext_Present_orig_24h2, (PVOID)COverlayContext_Present_hook_24h2,
 							(PVOID*)&COverlayContext_Present_orig_24h2);
 					if (mhStatus != MH_OK) {
 						log_to_file("ERROR: MH_CreateHook failed for COverlayContext::Present");
-						MH_Uninitialize();
+						HookUninitialize();
 						return FALSE;
 					}
 					LOG_ONLY_ONCE("Hook L1: Present")
@@ -1540,11 +1770,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (g_hookLevel >= 2) {
 					if (!isWindows11_24h2 && !isWindows11_25h2)
-						mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
+						mhStatus = HookCreateTracked((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig,
 									  (PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook,
 									  (PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig);
 					else
-						mhStatus = MH_CreateHook((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2,
+						mhStatus = HookCreateTracked((PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2,
 							(PVOID)COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2,
 							(PVOID*)&COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2);
 					if (mhStatus != MH_OK) {
@@ -1556,7 +1786,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				if (g_hookLevel >= 3) {
 				if (CWindowContext_IsCandidateDirectFlipCompatbile_orig)
 				{
-					mhStatus = MH_CreateHook((PVOID)CWindowContext_IsCandidateDirectFlipCompatbile_orig,
+					mhStatus = HookCreateTracked((PVOID)CWindowContext_IsCandidateDirectFlipCompatbile_orig,
 						(PVOID)CWindowContext_IsCandidateDirectFlipCompatbile_hook,
 						(PVOID*)&CWindowContext_IsCandidateDirectFlipCompatbile_orig);
 					if (mhStatus == MH_OK) {
@@ -1571,7 +1801,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (CCompSwapChain_IsCandidateIndependentFlipCompatible_orig)
 				{
-					mhStatus = MH_CreateHook((PVOID)CCompSwapChain_IsCandidateIndependentFlipCompatible_orig,
+					mhStatus = HookCreateTracked((PVOID)CCompSwapChain_IsCandidateIndependentFlipCompatible_orig,
 						(PVOID)CCompSwapChain_IsCandidateIndependentFlipCompatible_hook,
 						(PVOID*)&CCompSwapChain_IsCandidateIndependentFlipCompatible_orig);
 					if (mhStatus == MH_OK) {
@@ -1586,7 +1816,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (CCompSwapChain_IsCandidateDirectFlipCompatbile_orig)
 				{
-					mhStatus = MH_CreateHook((PVOID)CCompSwapChain_IsCandidateDirectFlipCompatbile_orig,
+					mhStatus = HookCreateTracked((PVOID)CCompSwapChain_IsCandidateDirectFlipCompatbile_orig,
 						(PVOID)CCompSwapChain_IsCandidateDirectFlipCompatbile_hook,
 						(PVOID*)&CCompSwapChain_IsCandidateDirectFlipCompatbile_orig);
 					if (mhStatus == MH_OK) {
@@ -1601,7 +1831,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 				if (CCompVisual_IsCandidateForPromotion_orig)
 				{
-					mhStatus = MH_CreateHook((PVOID)CCompVisual_IsCandidateForPromotion_orig,
+					mhStatus = HookCreateTracked((PVOID)CCompVisual_IsCandidateForPromotion_orig,
 						(PVOID)CCompVisual_IsCandidateForPromotion_hook,
 						(PVOID*)&CCompVisual_IsCandidateForPromotion_orig);
 					if (mhStatus == MH_OK) {
@@ -1623,7 +1853,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				{
 					if (COverlayContext_IsDirectFlipSupportedOnTarget_orig)
 					{
-						mhStatus = MH_CreateHook((PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_orig,
+						mhStatus = HookCreateTracked((PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_orig,
 							(PVOID)COverlayContext_IsDirectFlipSupportedOnTarget_hook,
 							(PVOID*)&COverlayContext_IsDirectFlipSupportedOnTarget_orig);
 						if (mhStatus == MH_OK) {
@@ -1638,7 +1868,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 
 					if (CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig)
 					{
-						mhStatus = MH_CreateHook((PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig,
+						mhStatus = HookCreateTracked((PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig,
 							(PVOID)CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_hook,
 							(PVOID*)&CGlobalCompositionSurfaceInfo_IsAdvancedDirectFlipCompatible_orig);
 						if (mhStatus == MH_OK) {
@@ -1684,7 +1914,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				if (g_hookLevel >= 5) {
 					// Level 5: force MinHook (diagnostic — known to crash on 25H2+)
 					if (COverlayContext_OverlaysEnabled_orig) {
-						MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
+						HookCreateTracked((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
 						              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
 						LOG_ONLY_ONCE("Hook L5: OverlaysEnabled (MinHook)")
 					}
@@ -1726,14 +1956,16 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				else if (!isWindows11_25h2 && g_hookLevel >= 4 && COverlayContext_OverlaysEnabled_orig != NULL)
 				{
 					// Pre-25H2: MinHook works fine on older OverlaysEnabled functions
-					MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
+					HookCreateTracked((PVOID)COverlayContext_OverlaysEnabled_orig, (PVOID)COverlayContext_OverlaysEnabled_hook,
 					              (PVOID*)&COverlayContext_OverlaysEnabled_orig);
 					LOG_ONLY_ONCE("Hooked OverlaysEnabled (MinHook)")
 				}
 
 				if (g_hookLevel == 0) {
 					LOG_ONLY_ONCE("DIAG: hookLevel=0 — no hooks activated, memory patches only")
-					MH_Uninitialize();
+					HookUninitialize();
+					// No hooks, no unload thread: nobody would serve a request. The host's FreeLibrary is safe here.
+					if (g_unloadRequestEvent) { CloseHandle(g_unloadRequestEvent); g_unloadRequestEvent = NULL; }
 					break;  // Inert mode: skip heartbeat + host monitor
 				}
 				// The monitor thread's events exist before a hook can run: the first present may report a failed
@@ -1742,9 +1974,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 				g_hookFailedEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 				if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) {
 					log_to_file("ERROR: MH_EnableHook failed");
+					// Some hooks may be live already and a thread inside one: off again, and that thread out, before
+					// the trampolines go and this DLL is unmapped (returning FALSE unloads it).
+					DisableHooksChecked();   // (logs when it could not; this path cannot refuse)
+					if (!DrainHookThreads(kDwmHookDetachDrainMs))
+						log_to_file("WARNING: a thread of dwm.exe is still inside a hook that could not be enabled");
 					CloseHandleOnce(&g_hookFailedEvent);
 					CloseHandleOnce(&g_hostMonitorStopEvent);
-					MH_Uninitialize();
+					HookUninitialize();
 					return FALSE;
 				}
 				LOG_ONLY_ONCE("DWM HOOK DLL INITIALIZATION. START LOGGING")
@@ -1775,8 +2012,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 					g_hostPid = ReadHostPid(&g_hostAliveMutexOffered);
 					if (g_hostPid == 0)
 						log_to_file("WARNING: No host.pid found — orphan detection disabled");
-					if (g_hostMonitorStopEvent && g_hookFailedEvent)
+					if (g_hostMonitorStopEvent && g_hookFailedEvent) {
+						// Counted as a thread inside the DLL before it exists (HostMonitorThreadFunc gives the count back).
+						g_hookCalls.inside.fetch_add(1, std::memory_order_acq_rel);
 						g_hostMonitorThread = CreateThread(NULL, 0, HostMonitorThreadFunc, NULL, 0, NULL);
+						if (!g_hostMonitorThread) g_hookCalls.inside.fetch_sub(1, std::memory_order_acq_rel);
+					}
 					if (g_hostMonitorThread) {
 						char buf[128];
 						sprintf_s(buf, "Hook monitor started (host PID %lu, liveness mutex %s)", g_hostPid,
@@ -1790,6 +2031,24 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 							CloseHandleOnce(&g_heartbeatEvent);
 							CloseHandleOnce(&g_faldPanelLiveEvent);
 						}
+					}
+				}
+
+				// The unload thread, which serves the request event created at the top of the attach
+				// (shared/dwm_hook_unload.h). Without the thread the event is closed: a host that cannot open it falls
+				// back to FreeLibrary, and DLL_PROCESS_DETACH then does what it can.
+				{
+					g_unloadThreadStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+					if (g_unloadThreadStopEvent && g_unloadRequestEvent) {
+						g_hookCalls.inside.fetch_add(1, std::memory_order_acq_rel);   // counted before it exists
+						g_unloadThread = CreateThread(NULL, 0, UnloadThreadFunc, NULL, 0, NULL);
+						if (!g_unloadThread) g_hookCalls.inside.fetch_sub(1, std::memory_order_acq_rel);
+					}
+					if (g_unloadThread) {
+						log_to_file("Unload thread started (the host asks by event; no FreeLibrary from outside)");
+					} else {
+						log_to_file("WARNING: no unload thread - the host falls back to FreeLibrary");
+						if (g_unloadRequestEvent) { CloseHandle(g_unloadRequestEvent); g_unloadRequestEvent = NULL; }
 					}
 				}
 
@@ -1809,66 +2068,44 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
 		if (lpReserved != NULL) {
 			break;
 		}
-		log_to_file("DLL_PROCESS_DETACH: cleanup starting");
+		if (g_unloadPrepared) {
+			// The normal way out: the unload thread saw every thread leave, tore everything down outside the loader
+			// lock and called FreeLibraryAndExitThread. Nothing is left to do here.
+			log_to_file("DLL_PROCESS_DETACH: unloaded by the unload thread");
+			break;
+		}
+		// A plain FreeLibrary (a host from before the unload thread, or one that could not open its event). This
+		// cannot refuse to unload, so it does what it can inside a short budget: hooks off, then the same wait for
+		// the threads inside (shared/dwm_hook_unload.h; it used to free the trampolines and the D3D objects at once,
+		// under a render thread that was still in RenderLUT: dwm.exe crashed in "DwmHook.dll_unloaded", 2026-11-15).
+		log_to_file("DLL_PROCESS_DETACH: cleanup starting (plain FreeLibrary)");
 
-		// Stop host monitor thread first (before removing hooks)
+		// The DLL's own threads: told to stop, then waited for with every other thread inside (they are counted in
+		// g_hookCalls). Not a join on their handles: a thread that returns cannot END while this thread holds the
+		// loader lock, so that join always ran into its timeout.
 		if (g_hostMonitorStopEvent) {
 			SetEvent(g_hostMonitorStopEvent);
 		}
-		if (g_hostMonitorThread) {
-			// Wait briefly for thread exit — stop event was signaled above,
-			// thread wakes from WaitForSingleObject immediately. 200ms is generous.
-			DWORD waitResult = WaitForSingleObject(g_hostMonitorThread, 200);
-			if (waitResult == WAIT_TIMEOUT) {
-				log_to_file("WARNING: Host monitor thread still running after 200ms — closing handle");
-			}
-			CloseHandle(g_hostMonitorThread);
-			g_hostMonitorThread = NULL;
+		if (g_unloadThreadStopEvent) {
+			SetEvent(g_unloadThreadStopEvent);
 		}
-		if (g_hostMonitorStopEvent) { CloseHandle(g_hostMonitorStopEvent); g_hostMonitorStopEvent = NULL; }
 
 		// Close heartbeat event (host will see hook as gone)
 		CloseHandleOnce(&g_heartbeatEvent);
 		CloseHandleOnce(&g_faldPanelLiveEvent);
 
 		// Only revert hooks/overlay mode if not already done by the monitor thread
-		if (!g_hookReverted.exchange(true)) {
-			if (g_overlayTestModePatched && g_pOverlayTestMode != NULL)
-			{
-				__try { *g_pOverlayTestMode = g_savedOverlayTestMode; }
-				__except (EXCEPTION_EXECUTE_HANDLER) { /* already detaching, nothing to do */ }
-			}
-			if (g_disableIndependentFlipPatched && g_pDisableIndependentFlip != NULL)
-			{
-				__try { *g_pDisableIndependentFlip = g_savedDisableIndependentFlip; }
-				__except (EXCEPTION_EXECUTE_HANDLER) {}
-			}
-			if (g_overlaysEnabledPatchAddr != NULL)
-			{
-				DWORD oldProt;
-				if (VirtualProtect(g_overlaysEnabledPatchAddr, 17, PAGE_EXECUTE_READWRITE, &oldProt)) {
-					memcpy(g_overlaysEnabledPatchAddr, g_overlaysEnabledOrigBytes, 17);
-					VirtualProtect(g_overlaysEnabledPatchAddr, 17, oldProt, &oldProt);
-					FlushInstructionCache(GetCurrentProcess(), g_overlaysEnabledPatchAddr, 17);
-				}
-				g_overlaysEnabledPatchAddr = NULL;
-			}
-			MH_DisableHook(MH_ALL_HOOKS);
-			MH_Uninitialize();
-		} else {
-			// The monitor thread disabled the hooks (host gone, or this hook could not render) and left MinHook
-			// initialised: free its trampoline pages too. A hook that cannot render is unloaded by a LIVE host on
-			// every re-injection, and each skipped MH_Uninitialize left those pages behind in dwm.exe. No thread is
-			// inside a trampoline: MH_DisableHook moved any that was back into the original function.
-			MH_Uninitialize();
-		}
-		CloseHandleOnce(&g_hookFailedEvent);   // after the hooks are gone: the present path can no longer signal it
-		// Close shared memory
-		if (g_sharedConfig) { UnmapViewOfFile((void*)g_sharedConfig); g_sharedConfig = NULL; }
-		if (g_sharedMemHandle) { CloseHandle(g_sharedMemHandle); g_sharedMemHandle = NULL; }
-		ReleaseMhcPreviewMapping();
+		if (!g_hookReverted.exchange(true)) RestorePatchesAndDisableHooks();
 
-		UninitializeStuff();
+		{
+			char why[224] = "";
+			if (!DrainHookThreads(kDwmHookDetachDrainMs, why, sizeof(why))) {
+				char msg[352];
+				sprintf_s(msg, "WARNING: this unload cannot wait any longer: %s", why);
+				log_to_file(msg);
+			}
+		}
+		TeardownAfterDrain();
 		log_to_file("DLL_PROCESS_DETACH: cleanup complete");
 		break;
 	default:

@@ -47,6 +47,9 @@ bool IsDwmHookActive();
 // A DLL of ours may still be loaded in dwm.exe: active, or loaded by this process and not ejected since (inert after
 // it reverted itself). For a Stop, which leaves nothing behind; "is the hook working" is IsDwmHookActive.
 bool DwmHookMayBeResident();
+// The last ejection left a DLL of ours loaded in a dwm.exe: it would not unload while a thread of dwm.exe was inside
+// it (shared/dwm_hook_unload.h). It is inert and its heartbeat is closed, so IsDwmHookActive() is false for it.
+bool DwmHookLeftLoaded();
 
 // Host liveness for the DLL (shared/dwm_hook_host_alive.h): this process owns a named mutex, on a thread parked for
 // the life of the process, and the DLL blocks on it instead of polling the process list for the host's pid. Started

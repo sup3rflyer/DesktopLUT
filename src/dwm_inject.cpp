@@ -4,6 +4,7 @@
 #include "dwm_inject.h"
 #include "../shared/dwm_hook_config.h"
 #include "../shared/dwm_hook_host_alive.h"
+#include "../shared/dwm_hook_unload.h"
 #include "../shared/fald_panel_live.h"
 #include "../shared/fald_shader.h"   // FaldZoneSlices: the hook refuses a lattice it cannot sweep
 #include "globals.h"
@@ -596,6 +597,156 @@ bool EnsureDwmHookHostAlive()
     return held;
 }
 
+// ---------------------------------------------------------------------------
+// Taking the DLL out of a dwm.exe (shared/dwm_hook_unload.h)
+// ---------------------------------------------------------------------------
+// DwmHook.dll in that dwm.exe, as far as its module list can be read. A snapshot taken while a module loads or
+// unloads fails with ERROR_BAD_LENGTH (documented: take it again).
+static DwmHookModule QueryHookModuleIn(DWORD pid, HMODULE* base = nullptr)
+{
+    if (base) *base = nullptr;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap == INVALID_HANDLE_VALUE) {
+            if (GetLastError() == ERROR_BAD_LENGTH) continue;
+            return DwmHookModule::Unreadable;
+        }
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
+        if (!Module32FirstW(snap, &me)) {
+            CloseHandle(snap);
+            return DwmHookModule::Unreadable;
+        }
+        DwmHookModule found = DwmHookModule::Gone;
+        do {
+            if (_wcsicmp(me.szModule, kDllName) == 0) {
+                if (base) *base = me.hModule;
+                found = DwmHookModule::Loaded;
+                break;
+            }
+        } while (Module32NextW(snap, &me));
+        CloseHandle(snap);
+        return found;
+    }
+    return DwmHookModule::Unreadable;
+}
+
+// DwmHook.dll's base in that process, null when it is not loaded (or the module list cannot be read).
+static HMODULE FindHookModuleIn(DWORD pid)
+{
+    HMODULE base = nullptr;
+    return QueryHookModuleIn(pid, &base) == DwmHookModule::Loaded ? base : nullptr;
+}
+
+// An ejection left a DLL of ours loaded in a dwm.exe (it refused, or was not seen to go). It is inert and its
+// heartbeat is closed, so IsDwmHookActive() says nothing about it. Cleared by the next ejection pass that finds
+// every dwm.exe clean.
+static std::atomic<bool> g_hookLeftLoaded{ false };
+bool DwmHookLeftLoaded() { return g_hookLeftLoaded.load(); }
+
+// One dwm.exe, our DLL at dllBase: out. Never a bare FreeLibrary on a DLL that can unload itself, and never a remote
+// thread started inside the DLL: a thread of dwm.exe inside the hook while the image is unmapped crashes the
+// compositor ("DwmHook.dll_unloaded", 2026-11-15). The host sets the DLL's request event; the DLL's own unload thread
+// waits for dwm.exe's threads to leave, outside the loader lock, and frees the library itself, or keeps the DLL loaded
+// (inert) and sets the busy event. What is true is read from the module list. Only a DLL without the event (an older
+// one, hook level 0) gets the remote FreeLibrary it always got.
+static DwmHookEject EjectDwmHookFrom(HANDLE hProcess, DWORD pid, HMODULE dllBase)
+{
+    wchar_t requestName[96], busyName[96];
+    DwmHookUnloadRequestEventName(pid, requestName, _countof(requestName));
+    DwmHookUnloadBusyEventName(pid, busyName, _countof(busyName));
+
+    // A dwm.exe that has ended holds nothing of ours.
+    const auto moduleNow = [&]() {
+        return WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0 ? DwmHookModule::Gone : QueryHookModuleIn(pid);
+    };
+    const auto report = [pid](DwmHookEject result) {
+        switch (result) {
+        case DwmHookEject::Unloaded:
+            std::wcout << L"[DWM Hook] DLL unloaded from PID " << pid << std::endl;
+            break;
+        case DwmHookEject::StillLoaded:
+            std::wcerr << L"[DWM Hook] The DLL in PID " << pid << L" did not unload (a thread of dwm.exe is still "
+                          L"inside it, see DesktopLUT_dwmhook.log): left loaded, inert" << std::endl;
+            break;
+        default:
+            std::wcerr << L"Warning: the DLL in PID " << pid << L" was not seen to unload in time" << std::endl;
+            break;
+        }
+        return result;
+    };
+
+    DwmHookEjectWait wait;
+    HANDLE request = OpenEventW(EVENT_MODIFY_STATE, FALSE, requestName);
+    DWORD openError = request ? ERROR_SUCCESS : GetLastError();
+    if (!request) {
+        // The module is there and its request event is not. That is an older DLL (or one without hooks) only if it
+        // stays that way: a DLL in the last moment of its own unload has closed the event and is about to be gone,
+        // and a FreeLibrary started now would run its detach under the thread that is unloading it.
+        const ULONGLONG start = GetTickCount64();
+        while (!request && GetTickCount64() - start < kDwmHookNoEventRecheckMs) {
+            Sleep(kDwmHookUnloadPollMs);
+            if (DwmHookEjectPoll(wait, moduleNow(), false) == DwmHookEjectStep::Unloaded)
+                return report(DwmHookEject::Unloaded);
+            request = OpenEventW(EVENT_MODIFY_STATE, FALSE, requestName);
+            if (!request) openError = GetLastError();
+        }
+    }
+
+    DwmHookEject result = DwmHookEject::Unknown;
+    if (request) {
+        HANDLE busy = OpenEventW(EVENT_MODIFY_STATE | SYNCHRONIZE, FALSE, busyName);
+        if (busy) ResetEvent(busy);   // a refusal of an earlier request is not this one's answer
+        SetEvent(request);
+        CloseHandle(request);
+        wait = DwmHookEjectWait{};
+        const ULONGLONG start = GetTickCount64();
+        for (;;) {
+            bool busySignalled = false;
+            if (busy) busySignalled = WaitForSingleObject(busy, kDwmHookUnloadPollMs) == WAIT_OBJECT_0;
+            else Sleep(kDwmHookUnloadPollMs);
+            const DwmHookEjectStep step = DwmHookEjectPoll(wait, moduleNow(), busySignalled);
+            if (step == DwmHookEjectStep::Unloaded) { result = DwmHookEject::Unloaded; break; }
+            if (step == DwmHookEjectStep::StillLoaded) { result = DwmHookEject::StillLoaded; break; }
+            if (GetTickCount64() - start >= kDwmHookUnloadHostMs) break;
+            if (busySignalled) Sleep(kDwmHookUnloadPollMs);   // (signalled and the list says gone once: one more look)
+        }
+        if (busy) CloseHandle(busy);
+        return report(result);
+    }
+
+    if (openError != ERROR_FILE_NOT_FOUND) {
+        // The event may exist and not be ours to open: not a reason to unmap the DLL under its own threads.
+        std::wcerr << L"[DWM Hook] The unload request event of PID " << pid << L" could not be opened (" << openError
+                   << L"): the DLL stays" << std::endl;
+        return report(DwmHookEject::Unknown);
+    }
+    HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+    FARPROC pFreeLibrary = hK32 ? GetProcAddress(hK32, "FreeLibrary") : nullptr;
+    if (!pFreeLibrary) {
+        std::wcerr << L"[DWM Hook] Cannot resolve FreeLibrary: the DLL in PID " << pid << L" stays" << std::endl;
+        return DwmHookEject::Unknown;
+    }
+    std::wcout << L"[DWM Hook] The DLL in PID " << pid << L" takes no unload request (an older DLL, or one with "
+                  L"no hooks): FreeLibrary" << std::endl;
+    HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(pFreeLibrary),
+                                        dllBase, 0, nullptr);
+    if (!hThread) {
+        std::wcerr << L"Warning: CreateRemoteThread (FreeLibrary) failed for PID " << pid << L": "
+                   << GetLastErrorString() << std::endl;
+        return DwmHookEject::Unknown;
+    }
+    const bool finished = WaitForSingleObject(hThread, 4000) == WAIT_OBJECT_0;
+    CloseHandle(hThread);
+    if (finished)
+        result = moduleNow() == DwmHookModule::Loaded ? DwmHookEject::StillLoaded : DwmHookEject::Unloaded;
+    return report(result);
+}
+
+static const wchar_t* const kHookStillLoadedError =
+    L"The previous DWM hook could not be unloaded from the desktop compositor (it was still busy) and was left "
+    L"switched off inside it.";
+
 std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::wstring* stagingWarning)
 {
     // Pre-flight (dwmcore_scan.h): the path the DLL will take must find its anchor patterns in the on-disk dwmcore,
@@ -626,30 +777,11 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
     // --- Uninject if already loaded (handles stale injection from previous run) ---
     {
         auto dwmPids = FindProcessesByName(L"dwm.exe");
-        HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
-        FARPROC pFreeLib = hK32 ? GetProcAddress(hK32, "FreeLibrary") : nullptr;
-
-        if (!hK32 || !pFreeLib)
-            std::wcerr << L"[DWM Hook] WARNING: Cannot resolve FreeLibrary — stale injection cleanup skipped" << std::endl;
+        bool stillLoaded = false;
 
         for (DWORD pid : dwmPids) {
-            HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-            if (snap == INVALID_HANDLE_VALUE) continue;
-
-            MODULEENTRY32W me{};
-            me.dwSize = sizeof(me);
-            HMODULE dllBase = nullptr;
-            if (Module32FirstW(snap, &me)) {
-                do {
-                    if (_wcsicmp(me.szModule, kDllName) == 0) {
-                        dllBase = me.hModule;
-                        break;
-                    }
-                } while (Module32NextW(snap, &me));
-            }
-            CloseHandle(snap);
-
-            if (dllBase && pFreeLib) {
+            HMODULE dllBase = FindHookModuleIn(pid);
+            if (dllBase) {
                 std::wcout << L"[DWM Hook] Stale DLL found in PID " << pid << L", unloading first..." << std::endl;
                 HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
                 if (hProc) {
@@ -658,15 +790,18 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
                         CloseHandle(hProc);
                         continue;
                     }
-                    HANDLE hThread = CreateRemoteThread(hProc, nullptr, 0,
-                        reinterpret_cast<LPTHREAD_START_ROUTINE>(pFreeLib), dllBase, 0, nullptr);
-                    if (hThread) {
-                        WaitForSingleObject(hThread, 4000);
-                        CloseHandle(hThread);
-                    }
+                    if (EjectDwmHookFrom(hProc, pid, dllBase) != DwmHookEject::Unloaded) stillLoaded = true;
                     CloseHandle(hProc);
                 }
             }
+        }
+        // A DLL that kept itself loaded (a thread of dwm.exe was still inside it) is inert, and nothing can be
+        // staged over it: its file is mapped, and a second LoadLibrary of that path would only hand back the old
+        // module. This injection fails; the caller's retry (the start's one retry, the watchdog) ejects again.
+        g_hookLeftLoaded.store(stillLoaded);
+        if (stillLoaded) {
+            std::wcout << L"[DWM Hook] The previous DLL is still loaded - not injecting over it" << std::endl;
+            return kHookStillLoadedError;
         }
     }
 
@@ -714,7 +849,17 @@ std::wstring InjectDwmHook(const std::vector<DwmHookMonitorLUT>& monitors, std::
         return L"Cannot access DwmHook.dll next to DesktopLUT.exe: " + GetLastErrorString();
     }
 
-    if (!CopyFileW(dllSrc.c_str(), dllDest.c_str(), FALSE)) {
+    // The previous DLL may have left dwm.exe's module list a moment before its image was unmapped: its file cannot be
+    // replaced until then. A few short tries, only for that.
+    bool copied = CopyFileW(dllSrc.c_str(), dllDest.c_str(), FALSE) != FALSE;
+    for (int attempt = 0; !copied && attempt < 10; attempt++) {
+        const DWORD copyError = GetLastError();
+        if (copyError != ERROR_SHARING_VIOLATION && copyError != ERROR_USER_MAPPED_FILE &&
+            copyError != ERROR_ACCESS_DENIED) break;
+        Sleep(50);
+        copied = CopyFileW(dllSrc.c_str(), dllDest.c_str(), FALSE) != FALSE;
+    }
+    if (!copied) {
         std::wcout << L"[DWM Hook] DLL copy FAILED: " << GetLastErrorString() << std::endl;
         return L"Failed to copy DwmHook.dll to staging: " + GetLastErrorString();
     }
@@ -1062,13 +1207,8 @@ std::wstring UninjectDwmHook(bool keepOwnSession)
         return {};
     }
 
-    // Resolve FreeLibrary address
-    HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (!hKernel32) { return L"Failed to get kernel32.dll handle"; }
-    FARPROC pFreeLibrary = GetProcAddress(hKernel32, "FreeLibrary");
-    if (!pFreeLibrary) { return L"Failed to get FreeLibrary address"; }
-
     bool anyFailed = false;
+    bool anyStillLoaded = false;
     std::wstring firstError;
     DWORD ownSession = 0;
     const bool haveOwnSession = keepOwnSession && ProcessIdToSessionId(GetCurrentProcessId(), &ownSession);
@@ -1076,34 +1216,18 @@ std::wstring UninjectDwmHook(bool keepOwnSession)
     for (DWORD pid : dwmPids) {
         DWORD pidSession = 0;
         if (haveOwnSession && ProcessIdToSessionId(pid, &pidSession) && pidSession == ownSession) {
-            // The remote FreeLibrary waits on the detach (seconds) — time the end-session budget does
+            // The remote unload waits for dwm.exe's threads (seconds at worst) — time the end-session budget does
             // not have, for a process that ends with the session anyway.
             std::wcout << L"[DWM Hook] Session ending: leaving PID " << pid << L" (ends with the session)" << std::endl;
             continue;
         }
         // Enumerate modules to find DwmHook.dll base address
-        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
-        if (snap == INVALID_HANDLE_VALUE) continue;
-
-        MODULEENTRY32W me{};
-        me.dwSize = sizeof(me);
-
-        HMODULE dllBase = nullptr;
-        if (Module32FirstW(snap, &me)) {
-            do {
-                if (_wcsicmp(me.szModule, kDllName) == 0) {
-                    dllBase = me.hModule;
-                    break;
-                }
-            } while (Module32NextW(snap, &me));
-        }
-        CloseHandle(snap);
-
+        HMODULE dllBase = FindHookModuleIn(pid);
         if (!dllBase) {
             std::wcout << L"[DWM Hook] DwmHook.dll not found in PID " << pid << L", skipping" << std::endl;
             continue; // DLL not loaded in this dwm.exe instance
         }
-        std::wcout << L"[DWM Hook] Found DwmHook.dll in PID " << pid << L", calling FreeLibrary..." << std::endl;
+        std::wcout << L"[DWM Hook] Found DwmHook.dll in PID " << pid << L", unloading..." << std::endl;
 
         HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
         if (!hProcess) {
@@ -1120,34 +1244,23 @@ std::wstring UninjectDwmHook(bool keepOwnSession)
             continue;
         }
 
-        DWORD threadId = 0;
-        HANDLE hThread = CreateRemoteThread(
-            hProcess, nullptr, 0,
-            reinterpret_cast<LPTHREAD_START_ROUTINE>(pFreeLibrary),
-            dllBase, 0, &threadId);
-
-        if (!hThread) {
-            std::wcerr << L"Warning: CreateRemoteThread (FreeLibrary) failed for PID " << pid << L": " << GetLastErrorString() << std::endl;
-            CloseHandle(hProcess);
+        if (EjectDwmHookFrom(hProcess, pid, dllBase) != DwmHookEject::Unloaded) {
+            // Still loaded (a thread of dwm.exe would not leave it), but inert: hooks off, heartbeat closed. It
+            // counts as a failed ejection, so g_hookDllLoadedByUs stays set and the next Stop or injection ejects again.
             anyFailed = true;
-            if (firstError.empty()) firstError = L"CreateRemoteThread failed for dwm.exe PID " + std::to_wstring(pid);
-            continue;
-        }
-
-        DWORD waitResult = WaitForSingleObject(hThread, 4000);
-        CloseHandle(hThread);
-        if (waitResult == WAIT_TIMEOUT) {
-            std::wcerr << L"Warning: FreeLibrary thread timed out for PID " << pid << std::endl;
-        } else {
-            std::wcout << L"[DWM Hook] FreeLibrary completed for PID " << pid << std::endl;
+            anyStillLoaded = true;
+            if (firstError.empty()) firstError = kHookStillLoadedError;
         }
         CloseHandle(hProcess);
     }
 
-    // Clean up shared memory and DLL from staging location
+    g_hookLeftLoaded.store(anyStillLoaded);
+
+    // Clean up shared memory and DLL from staging location (a DLL that stayed loaded keeps its file mapped: the
+    // delete fails and the file stays for it)
     CloseDwmHookSharedMemory();
     std::wstring sysTemp = ExpandEnv(L"%SYSTEMROOT%\\Temp\\");
-    if (!sysTemp.empty()) {
+    if (!sysTemp.empty() && !anyStillLoaded) {
         std::wstring dllPath = sysTemp + kDllName;
         DeleteFileW(dllPath.c_str());
     }

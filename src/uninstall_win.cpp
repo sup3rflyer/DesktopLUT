@@ -230,7 +230,8 @@ public:
         return was ? 1 : 0;
     }
 
-    bool HookResident() override { return IsDwmHookActive(); }
+    // (A DLL that refused to unload has closed its heartbeat: the ejection's own verdict counts too.)
+    bool HookResident() override { return IsDwmHookActive() || DwmHookLeftLoaded(); }
 
     int RestoreReportedPeak(const Display& d) override {
         DisplayInfo di;
