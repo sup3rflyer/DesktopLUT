@@ -70,7 +70,7 @@ void LoadMHCSettings(const wchar_t* section, const wchar_t* prefix,
 int RestoreLegacyIdentityPoints(GrayscaleSettings& gs, bool isHDR);
 
 // Per-display sections. Settings are keyed by physical display identity:
-//   [Display<slot>]  the per-monitor keys + DevicePath= / EdidId= / DisplayName= /
+//   [Display<slot>]  the per-monitor keys + DevicePath= / EdidId= / EdidIdSerial= / DisplayName= /
 //                    FirstSeen= / LastSeen=. The identity keys are written LAST: they are
 //                    the commit marker, so a section cut short by a crash carries no
 //                    identity and can never shadow anything.

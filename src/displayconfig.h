@@ -161,6 +161,9 @@ std::wstring ExtractHardwareIdFromPath(const std::wstring& devicePath);
 // else the 32-bit ID serial (bytes 12-15) in decimal when non-zero. Returns false (out
 // empty) when the EDID carries no serial at all. Exposed for testing.
 bool ParseEDIDSerial(const BYTE* edid, size_t edidSize, std::wstring& outSerial);
+// The 32-bit ID serial number (bytes 12-15), 0 when absent or the block is not an EDID.
+// An EDID override that replaces the descriptors (CRU) keeps it. Exposed for testing.
+uint32_t ParseEDIDIdSerialNumber(const BYTE* edid, size_t edidSize);
 
 // \\?\DISPLAY#<hwid>#<instance>#{guid}  ->  DISPLAY\<hwid>\<instance>  (SetupAPI instance id).
 // Returns empty if the path does not have that shape. Exposed for testing.

@@ -1047,6 +1047,7 @@ DisplayIdentity AsusId() {
     DisplayIdentity d;
     d.devicePath = L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{guid}";
     d.edidId = L"AUS322A-S4LMSB007317";
+    d.edidIdSerial = L"335544320";
     d.friendlyName = L"PA32UCXR";
     return d;
 }
@@ -1288,6 +1289,7 @@ TEST_CASE("LoadSettings/SaveSettings: legacy sections migrate to identity sectio
     REQUIRE(g_gui.parkedSettings.size() == 2);
     CHECK(g_gui.parkedSettings[0].slot == 0);
     CHECK(g_gui.parkedSettings[0].identity.edidId == L"AUS322A-S4LMSB007317");
+    CHECK(g_gui.parkedSettings[0].identity.edidIdSerial == L"335544320");
     CHECK(g_gui.parkedSettings[0].sdrPath == L"C:\\luts\\asus.cube");
     CHECK(g_gui.parkedSettings[1].legacyIndex == 1);
     CHECK(g_gui.parkedSettings[1].hdrMHC.desktopGammaEnabled == true);

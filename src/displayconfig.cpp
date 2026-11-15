@@ -972,6 +972,15 @@ MonitorPrimaries GetMonitorPrimariesFromEDID(int monitorIndex) {
 // Display identity (settings keyed by physical display, not enumeration index)
 // ============================================================================
 
+uint32_t ParseEDIDIdSerialNumber(const BYTE* edid, size_t edidSize) {
+    if (!edid || edidSize < 128) return 0;
+    static const BYTE kHeader[8] = { 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00 };
+    if (memcmp(edid, kHeader, 8) != 0) return 0;
+    // ID serial number, bytes 12-15 little-endian. Zero means "not provided".
+    return (uint32_t)edid[12] | ((uint32_t)edid[13] << 8)
+         | ((uint32_t)edid[14] << 16) | ((uint32_t)edid[15] << 24);
+}
+
 bool ParseEDIDSerial(const BYTE* edid, size_t edidSize, std::wstring& outSerial) {
     outSerial.clear();
     if (!edid || edidSize < 128) return false;
@@ -996,9 +1005,7 @@ bool ParseEDIDSerial(const BYTE* edid, size_t edidSize, std::wstring& outSerial)
         if (!s.empty()) { outSerial = s; return true; }
     }
 
-    // ID serial number, bytes 12-15 little-endian. Zero means "not provided".
-    uint32_t idSerial = (uint32_t)edid[12] | ((uint32_t)edid[13] << 8)
-                      | ((uint32_t)edid[14] << 16) | ((uint32_t)edid[15] << 24);
+    const uint32_t idSerial = ParseEDIDIdSerialNumber(edid, edidSize);
     if (idSerial != 0) {
         outSerial = std::to_wstring(idSerial);
         return true;
@@ -1075,6 +1082,8 @@ bool QueryDisplayIdentity(HMONITOR hMonitor, DisplayIdentity& outIdentity) {
     std::wstring serial;
     if (!hardwareId.empty() && ReadEDIDForDevicePath(info.devicePath, edid)) {
         ParseEDIDSerial(edid.data(), edid.size(), serial);
+        const uint32_t idSerial = ParseEDIDIdSerialNumber(edid.data(), edid.size());
+        if (idSerial != 0) outIdentity.edidIdSerial = std::to_wstring(idSerial);
     }
     if (!hardwareId.empty()) {
         outIdentity.edidId = serial.empty() ? hardwareId : hardwareId + L"-" + serial;

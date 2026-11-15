@@ -1114,6 +1114,7 @@ void SaveMonitorSettings(const wchar_t* section, const MonitorSettings& ms, cons
 static void LoadIdentityKeys(const wchar_t* section, MonitorSettings& ms, const wchar_t* iniPath) {
     ms.identity.devicePath   = ReadLongINIString(section, L"DevicePath", iniPath);
     ms.identity.edidId       = ReadLongINIString(section, L"EdidId", iniPath);
+    ms.identity.edidIdSerial = ReadLongINIString(section, L"EdidIdSerial", iniPath);
     ms.identity.friendlyName = ReadLongINIString(section, L"DisplayName", iniPath);
     ms.firstSeen             = ReadLongINIString(section, L"FirstSeen", iniPath);
     ms.lastSeen              = ReadLongINIString(section, L"LastSeen", iniPath);
@@ -1129,6 +1130,9 @@ static void SaveIdentityKeys(const wchar_t* section, const MonitorSettings& ms, 
     const std::wstring label = EncodeIniText(ms.label);
     IniWriteString(section, L"Label", label.empty() ? nullptr : label.c_str(), iniPath);
     IniWriteString(section, L"EdidId", ms.identity.edidId.c_str(), iniPath);
+    // The EDID's ID serial number (bridges an EDID override, EdidIdsBridged); absent = not read yet.
+    IniWriteString(section, L"EdidIdSerial", ms.identity.edidIdSerial.empty() ? nullptr : ms.identity.edidIdSerial.c_str(),
+                   iniPath);
     // Written last of all the section's keys: a section with a DevicePath is a complete one.
     IniWriteString(section, L"DevicePath", ms.identity.devicePath.c_str(), iniPath);
 }

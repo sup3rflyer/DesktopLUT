@@ -63,7 +63,7 @@ int ResolveLive(const DisplayIdentity& id, int hint) {
     if (id.empty()) return hint >= 0 && hint < (int)list.size() && list[hint].identity.empty() ? hint : -1;
     auto byPath = [&](const MonitorSettings& ms) {
         return !id.devicePath.empty() && _wcsicmp(ms.identity.devicePath.c_str(), id.devicePath.c_str()) == 0 &&
-               EdidIdsCompatible(ms.identity.edidId, id.edidId);
+               EdidSameUnit(ms.identity, id);
     };
     if (hint >= 0 && hint < (int)list.size() && byPath(list[hint])) return hint;
     for (int i = 0; i < (int)list.size(); i++) if (byPath(list[i])) return i;

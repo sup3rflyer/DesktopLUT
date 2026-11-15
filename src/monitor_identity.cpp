@@ -52,6 +52,25 @@ bool EdidIdsCompatible(const std::wstring& a, const std::wstring& b) {
     return false;
 }
 
+namespace {
+std::wstring EdidSerialPart(const std::wstring& edidId) {
+    size_t dash = edidId.find(L'-');
+    return dash == std::wstring::npos ? std::wstring() : edidId.substr(dash + 1);
+}
+}  // namespace
+
+bool EdidIdsBridged(const DisplayIdentity& a, const DisplayIdentity& b) {
+    const std::wstring sa = EdidSerialPart(a.edidId), sb = EdidSerialPart(b.edidId);
+    if (sa.empty() || sb.empty() || EqualsNoCase(sa, sb)) return false;
+    if (!EqualsNoCase(EdidHardwarePart(a.edidId), EdidHardwarePart(b.edidId))) return false;
+    return (!b.edidIdSerial.empty() && sa == b.edidIdSerial) ||
+           (!a.edidIdSerial.empty() && sb == a.edidIdSerial);
+}
+
+bool EdidSameUnit(const DisplayIdentity& a, const DisplayIdentity& b) {
+    return EdidIdsCompatible(a.edidId, b.edidId) || EdidIdsBridged(a, b);
+}
+
 MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
                                         const std::vector<MonitorSettings>& previousLive,
                                         const std::vector<MonitorSettings>& parked,
@@ -122,7 +141,7 @@ MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
                 // per-unit calibration.
                 pick = findFirst([&](const PoolEntry& e) {
                     return EqualsNoCase(e.ms.identity.devicePath, d.identity.devicePath) &&
-                           EdidIdsCompatible(e.ms.identity.edidId, d.identity.edidId);
+                           EdidSameUnit(e.ms.identity, d.identity);
                 });
                 if (pick >= 0) how = L"device path";
             }
@@ -138,6 +157,14 @@ MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
                     });
                 }
                 if (pick >= 0) how = L"EDID id (connector changed)";
+                if (pick < 0) {
+                    // An EDID override (CRU) on only one of the two connectors: the descriptor serial on one
+                    // side, the EDID's ID serial number on the other.
+                    pick = findPreferIndex((int)i, [&](const PoolEntry& e) {
+                        return EdidIdsBridged(e.ms.identity, d.identity);
+                    });
+                    if (pick >= 0) how = L"EDID ID serial number (EDID override on one connector only)";
+                }
             }
             if (pick < 0) {
                 pick = findFirst([&](const PoolEntry& e) {
@@ -176,7 +203,8 @@ MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
         if (d.identified) {
             // Refresh the device path (connector move) and name. Never downgrade the stored EDID
             // id: a serial-less read of the same model keeps the serial-bearing id on record.
-            std::wstring keepEdid = out.identity.edidId;
+            const DisplayIdentity kept = out.identity;
+            const std::wstring& keepEdid = kept.edidId;
             out.identity = d.identity;
             if (!keepEdid.empty() && !IsHardwareOnly(keepEdid) &&
                 (d.identity.edidId.empty() ||
@@ -184,6 +212,13 @@ MonitorMatchResult MatchMonitorSettings(const std::vector<LiveDisplay>& live,
                   EqualsNoCase(EdidHardwarePart(keepEdid), d.identity.edidId)))) {
                 out.identity.edidId = keepEdid;
             }
+            // Nor is a descriptor serial replaced by the ID-number form of the same unit (an EDID override on
+            // this connector): the id on record stays one string whichever form the connector reads today.
+            // The other way round (the record holds the number, the live read has the descriptor) upgrades.
+            if (EdidIdsBridged(kept, d.identity) && EdidSerialPart(d.identity.edidId) == d.identity.edidIdSerial) {
+                out.identity.edidId = keepEdid;
+            }
+            if (out.identity.edidIdSerial.empty()) out.identity.edidIdSerial = kept.edidIdSerial;
             if (out.slot < 0) {
                 out.slot = allocSlot();
                 if (out.slot < 0) how += L" (no free settings slot: not persisted)";

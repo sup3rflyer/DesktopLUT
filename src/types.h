@@ -902,6 +902,11 @@ struct MHCSettings {
 struct DisplayIdentity {
     std::wstring devicePath;    // \\?\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid} (QueryDisplayConfig target)
     std::wstring edidId;        // EDID hardware id + serial, e.g. "GSM84CD-16843009"; hardware id alone if no serial
+    // The EDID's 32-bit ID serial number (bytes 12-15) in decimal, empty when zero / unread. edidId takes the
+    // serial-string descriptor when there is one, else this number; an EDID override (CRU) that fills the
+    // descriptor slots with timings drops the string but keeps this number, so it bridges the two forms of one
+    // unit's id (EdidIdsBridged). INI EdidIdSerial.
+    std::wstring edidIdSerial;
     std::wstring friendlyName;  // e.g. "LG TV SSCR2" — informational only, never used for matching
     bool empty() const { return devicePath.empty() && edidId.empty(); }
 };

@@ -29,6 +29,13 @@ std::wstring EdidHardwarePart(const std::wstring& edidId);
 // True when the two ids can name the same physical panel: either is empty, they are equal
 // (case-insensitive), or exactly one of them lacks the serial and the hardware ids agree.
 bool EdidIdsCompatible(const std::wstring& a, const std::wstring& b);
+// True when the two ids are the two forms one unit's id can take: both carry a serial, the hardware ids agree,
+// the serials differ, and one side's serial IS the other side's EDID ID serial number (edidIdSerial). That is
+// an EDID override (CRU) that filled the descriptor slots with timings: the serial-string descriptor is gone,
+// the id falls back to the number, and the override is per connector, so moving the cable flips the form.
+bool EdidIdsBridged(const DisplayIdentity& a, const DisplayIdentity& b);
+// EdidIdsCompatible on the ids, or EdidIdsBridged.
+bool EdidSameUnit(const DisplayIdentity& a, const DisplayIdentity& b);
 
 // Pure matcher — no Windows calls, fully testable.
 //
@@ -38,9 +45,11 @@ bool EdidIdsCompatible(const std::wstring& a, const std::wstring& b);
 //     1. same device path (case-insensitive) AND compatible EDID id — exact panel on the
 //        exact connector (a same-model replacement on that connector has the same path but
 //        another serial, so it does not inherit the old unit's calibration)
+//        (or a bridged one: EdidIdsBridged — an EDID override added or removed on this connector)
 //     2. same EDID id (case-insensitive), then a compatible one (one side read without its
-//        serial) — the panel moved to another connector; a candidate that sat at this same
-//        index is preferred over other twins
+//        serial), then a bridged one (an EDID override on only one of the two connectors) —
+//        the panel moved to another connector; a candidate that sat at this same index is
+//        preferred over other twins
 //     3. entry at this same index that has NO identity — a display we could not identify earlier
 //     4. unclaimed legacy [Monitor<i>] entry           — pre-identity INI, adopted by index once
 //     5. a fresh default entry
@@ -50,7 +59,7 @@ bool EdidIdsCompatible(const std::wstring& a, const std::wstring& b);
 //     3. a fresh default entry (no identity, not persisted until identified)
 // A matched identified display has the live identity stamped on it (device path refreshes
 // when a panel moves connector; a serial-bearing EDID id is never replaced by a serial-less
-// read of the same model), gets the lowest free storage slot if it had none, and — when
+// read of the same model, nor a descriptor serial by the bridged ID-number form), gets the lowest free storage slot if it had none, and — when
 // `today` is given — FirstSeen (once) / LastSeen stamps.
 // Untaken entries with an identity, a legacy origin or a storage slot are parked;
 // anonymous leftovers drop. Duplicate slots are repaired (the later entry moves).

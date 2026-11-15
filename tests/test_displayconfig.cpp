@@ -465,6 +465,19 @@ TEST_CASE("EDID serial: falls back to the numeric ID serial") {
     CHECK(s == L"16843009");
 }
 
+TEST_CASE("EDID ID serial number: read whether or not a serial descriptor is present") {
+    EdidBuilder e; e.idSerial(335544320).asciiSerial("S4LMSB007317");
+    CHECK(ParseEDIDIdSerialNumber(e.bytes, 128) == 335544320u);
+    EdidBuilder n; n.idSerial(335544320);   // descriptors replaced by an EDID override
+    CHECK(ParseEDIDIdSerialNumber(n.bytes, 128) == 335544320u);
+    EdidBuilder z;
+    CHECK(ParseEDIDIdSerialNumber(z.bytes, 128) == 0u);
+    EdidBuilder bad; bad.idSerial(7); bad.bytes[1] = 0x00;
+    CHECK(ParseEDIDIdSerialNumber(bad.bytes, 128) == 0u);
+    CHECK(ParseEDIDIdSerialNumber(n.bytes, 100) == 0u);
+    CHECK(ParseEDIDIdSerialNumber(nullptr, 128) == 0u);
+}
+
 TEST_CASE("EDID serial: none present, bad header, too short") {
     EdidBuilder e;
     std::wstring s = L"stale";

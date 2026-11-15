@@ -340,6 +340,92 @@ TEST_CASE("Identity: an exact EDID match wins over a serial-less compatible one"
     CHECK(r.live[0].sdrPath == L"sn2.cube");
 }
 
+// 2026-11-15, the owner's PA32UCXR and BenQ: each connector's CRU EDID override filled all four descriptor slots
+// with timings, so the id fell back to the EDID ID serial number; recabled to other connectors (no override there)
+// the descriptor serial reads, and the panels came up on fresh defaults.
+TEST_CASE("Identity: an EDID override on the old connector only (id was the ID number) still finds the panel") {
+    DisplayIdentity stored = Id(L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4353#{guid}", L"AUS322A-335544320", L"");
+    // An INI written before EdidIdSerial existed: no number on record.
+    DisplayIdentity now = Id(L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4355#{guid}", L"AUS322A-S4LMSB007317", L"PA32UCXR");
+    now.edidIdSerial = L"335544320";
+    DisplayIdentity benqStored = Id(L"\\\\?\\DISPLAY#BNQ802E#5&14ca04b&2&UID4352#{guid}", L"BNQ802E-16843009", L"");
+    DisplayIdentity benqNow = Id(L"\\\\?\\DISPLAY#BNQ802E#5&14ca04b&2&UID4353#{guid}", L"BNQ802E-ETV1M03879SL0", L"BenQ PD2700U");
+    benqNow.edidIdSerial = L"16843009";
+    DisplayIdentity lgNow = Id(L"\\\\?\\DISPLAY#GSM84CD#5&14ca04b&2&UID4352#{guid}", L"GSM84CD-16843009", L"LG TV SSCR2");
+    lgNow.edidIdSerial = L"16843009";
+
+    std::vector<MonitorSettings> parked = { Known(stored, 0, L"asus.cube"), Known(benqStored, 2, L"benq.cube") };
+    auto r = MatchMonitorSettings({ Live(now), Live(lgNow), Live(benqNow) }, {}, parked, L"2026-11-15");
+    REQUIRE(r.live.size() == 3);
+    CHECK(r.live[0].sdrPath == L"asus.cube");
+    CHECK(r.live[0].slot == 0);
+    CHECK(r.live[0].identity.edidId == L"AUS322A-S4LMSB007317");   // upgraded to the descriptor form
+    CHECK(r.live[0].identity.edidIdSerial == L"335544320");
+    CHECK(r.live[0].identity.devicePath == now.devicePath);
+    CHECK(r.live[1].sdrPath.empty());                                // the LG's placeholder number never crosses models
+    CHECK(r.live[1].slot == 1);
+    CHECK(r.live[2].sdrPath == L"benq.cube");
+    CHECK(r.live[2].slot == 2);
+    CHECK(r.parked.empty());
+    CHECK_FALSE(r.fresh[0]);
+    CHECK(r.fresh[1]);
+    CHECK_FALSE(r.fresh[2]);
+}
+
+TEST_CASE("Identity: an EDID override added on the panel's own connector keeps it and the id on record") {
+    DisplayIdentity stored = kAsus;
+    stored.edidIdSerial = L"335544320";
+    DisplayIdentity overridden = kAsus;                 // same connector, CRU override now applied
+    overridden.edidId = L"AUS322A-335544320";
+    overridden.edidIdSerial = L"335544320";
+    overridden.friendlyName.clear();
+    std::vector<MonitorSettings> prev = { Known(stored, 0, L"asus.cube") };
+    auto r = MatchMonitorSettings({ Live(overridden) }, prev, {});
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath == L"asus.cube");
+    CHECK(r.live[0].identity.edidId == L"AUS322A-S4LMSB007317");   // the descriptor form stays on record
+    CHECK_FALSE(LiveSettingsAttachmentChanged(prev, r.live));
+
+    // ...and when the panel then moves to a connector without the override, it still matches exactly.
+    DisplayIdentity moved = kAsus;
+    moved.devicePath = L"\\\\?\\DISPLAY#AUS322A#5&14ca04b&2&UID4355#{guid}";
+    moved.edidIdSerial = L"335544320";
+    auto r2 = MatchMonitorSettings({ Live(moved) }, r.live, {});
+    REQUIRE(r2.live.size() == 1);
+    CHECK(r2.live[0].sdrPath == L"asus.cube");
+}
+
+TEST_CASE("Identity: the bridge never joins two units that both have descriptor serials") {
+    DisplayIdentity a = kAsus;
+    a.edidIdSerial = L"335544320";
+    DisplayIdentity b = kAsus;
+    b.edidId = L"AUS322A-S4LMSB009999";
+    b.edidIdSerial = L"335544320";                      // same placeholder number, another unit
+    CHECK_FALSE(EdidIdsBridged(a, b));
+    CHECK_FALSE(EdidSameUnit(a, b));
+
+    DisplayIdentity numberForm = Id(L"p", L"AUS322A-335544320", L"");
+    CHECK(EdidIdsBridged(numberForm, a));
+    CHECK(EdidIdsBridged(a, numberForm));
+    DisplayIdentity otherModel = Id(L"p", L"GSM84CD-335544320", L"");
+    CHECK_FALSE(EdidIdsBridged(otherModel, a));
+    DisplayIdentity bare = Id(L"p", L"AUS322A", L"");
+    CHECK_FALSE(EdidIdsBridged(bare, a));               // the serial-less case is EdidIdsCompatible's
+    CHECK(EdidSameUnit(bare, a));
+}
+
+TEST_CASE("Identity: an exact EDID match wins over a bridged one") {
+    DisplayIdentity numberForm = Id(L"\\\\?\\DISPLAY#AUS322A#5&1&0&UID1#{g}", L"AUS322A-335544320", L"");
+    DisplayIdentity descForm = Id(L"\\\\?\\DISPLAY#AUS322A#5&1&0&UID2#{g}", L"AUS322A-S4LMSB007317", L"PA32UCXR");
+    std::vector<MonitorSettings> parked = { Known(numberForm, 0, L"old.cube"), Known(descForm, 1, L"desc.cube") };
+    DisplayIdentity live = descForm;
+    live.devicePath = L"\\\\?\\DISPLAY#AUS322A#5&1&0&UID9#{g}";
+    live.edidIdSerial = L"335544320";
+    auto r = MatchMonitorSettings({ Live(live) }, {}, parked);
+    REQUIRE(r.live.size() == 1);
+    CHECK(r.live[0].sdrPath == L"desc.cube");
+}
+
 TEST_CASE("Identity: EdidIdsCompatible") {
     CHECK(EdidIdsCompatible(L"", L"AUS322A-X"));
     CHECK(EdidIdsCompatible(L"AUS322A-X", L""));

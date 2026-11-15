@@ -1332,7 +1332,7 @@ static bool LiveIdentitiesDiffer(const std::vector<HMONITOR>& monitors) {
         const DisplayIdentity& have = g_gui.monitorSettings[i].identity;
         if (have.empty()) return true;
         if (_wcsicmp(have.devicePath.c_str(), live[i].identity.devicePath.c_str()) != 0) return true;
-        if (!EdidIdsCompatible(have.edidId, live[i].identity.edidId)) return true;
+        if (!EdidSameUnit(have, live[i].identity)) return true;
     }
     return false;
 }
