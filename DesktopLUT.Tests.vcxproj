@@ -96,6 +96,7 @@
     <ClCompile Include="src\gui_mhc.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
     <ClCompile Include="src\monitor_identity.cpp" />
+    <ClCompile Include="src\mhc_store.cpp" />
     <ClCompile Include="src\uninstall.cpp" />
     <ClCompile Include="src\uninstall_win.cpp" />
     <ClCompile Include="src\desktoplut_ipc_server.cpp" />
@@ -167,6 +168,7 @@
     <ClCompile Include="tests\test_framepacer.cpp" />
     <ClCompile Include="tests\test_displayconfig.cpp" />
     <ClCompile Include="tests\test_monitor_identity.cpp" />
+    <ClCompile Include="tests\test_mhc_store.cpp" />
     <ClCompile Include="tests\test_uninstall.cpp" />
     <ClCompile Include="tests\test_hub.cpp" />
     <ClCompile Include="tests\test_settings.cpp" />

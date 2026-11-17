@@ -28,6 +28,7 @@
 #include "gui_mhc.h"
 #include "mhc_preview.h"
 #include "mhc.h"
+#include "mhc_store.h"
 #include "fald.h"
 #include "fald_core_status.h"   // the core layer's rate-cap governor's report (state.get)
 #include "../shared/fald_core_mode.h"   // the always-on core's mode name (state.get)
@@ -1546,13 +1547,52 @@ void DoMhcRemove(const JsonValue& p, JsonValue& result, std::string& error) {
 void DoVerifyMhc(const JsonValue& p, JsonValue& result, std::string& error) {
     int mon; bool isHDR;
     if (!ParseMonitorMode(p, mon, isHDR, error)) return;
-    bool verified;
+    // Asks Windows (2026-11-17): it used to read only the settings, and said "verified" while Windows applied
+    // another display's profile to this one (a shared colour-profile store, mhc_store.h).
+    std::wstring expected;
+    bool enabled;
     {
         std::lock_guard<std::mutex> lk(g_monitorSettingsMutex);
         const MHCSettings& m = isHDR ? g_gui.monitorSettings[mon].hdrMHC : g_gui.monitorSettings[mon].sdrMHC;
-        verified = m.enabled && !m.profileName.empty();
+        enabled = m.enabled && !m.profileName.empty();
+        expected = MhcScanoutName(m);
     }
+    DisplayInfo di;
+    const bool haveDisplay = GetDisplayInfoForMonitor(mon, di);
+    const std::wstring current = haveDisplay ? QueryDisplayDefaultProfile(di.adapterId, di.sourceId, isHDR) : L"";
+
+    MhcStoreSnapshot stores;
+    int slot = -1;
+    if (haveDisplay && SnapshotMhcStores(stores)) slot = stores.Find(di.adapterId, di.sourceId);
+    const bool yields = slot >= 0 && stores.plan[slot].yields;
+
+    const bool verified = enabled && haveDisplay && !expected.empty() && current == expected && !yields;
     result.set("verified", JBool(verified));
+    result.set("expected_profile", expected.empty() ? JsonValue() : JStr(WideToUtf8(expected)));
+    result.set("windows_default", current.empty() ? JsonValue() : JStr(WideToUtf8(current)));
+    JsonValue store = JObj();
+    if (slot >= 0) {
+        const MhcStoreSlot& s = stores.slots[slot];
+        const MhcStoreVerdict& v = stores.plan[slot];
+        store.set("key", s.storeKey.empty() ? JsonValue() : JStr(WideToUtf8(s.storeKey)));
+        store.set("device", JStr(WideToUtf8(s.storeDevice)));
+        store.set("own", JBool(!v.foreign));
+        store.set("shared", JBool(!v.sharedWith.empty()));
+        store.set("yields", JBool(v.yields));
+        // The live monitors sharing it, by DesktopLUT monitor index.
+        JsonValue with = JArr();
+        for (int j : v.sharedWith) {
+            DisplayInfo dm;
+            for (int m = 0; m < 16 && GetDisplayInfoForMonitor(m, dm); m++) {   // EnumDisplayMonitors order, fresh
+                if (stores.Find(dm.adapterId, dm.sourceId) == j) {
+                    with.arr.push_back(JNum(m));
+                    break;
+                }
+            }
+        }
+        store.set("shared_with", with);
+    }
+    result.set("store", slot >= 0 ? store : JsonValue());
 }
 
 // FALD correction layer, per mode (HDR, and SDR under Windows ACM — 2026-09-14, work guide P7).

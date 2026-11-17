@@ -99,6 +99,7 @@
     <ClCompile Include="src\gui_mhc.cpp" />
     <ClCompile Include="src\displayconfig.cpp" />
     <ClCompile Include="src\monitor_identity.cpp" />
+    <ClCompile Include="src\mhc_store.cpp" />
     <ClCompile Include="src\uninstall.cpp" />
     <ClCompile Include="src\uninstall_win.cpp" />
     <ClCompile Include="src\mhc.cpp" />

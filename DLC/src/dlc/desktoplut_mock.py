@@ -382,8 +382,10 @@ class MockDesktopLutServer:
             if method.startswith("runtime."):
                 return self.handle_runtime(method, params)
             if method == "maintenance.verify_mhc":
-                # C++ DoVerifyMhc: verified = enabled && !profileName.empty() — i.e. only a
-                # BAKED profile verifies. Staged-but-never-applied params must NOT verify
+                # C++ DoVerifyMhc: verified = a BAKED profile (enabled && !profileName.empty())
+                # that Windows reports as the display's default, on a display that does not
+                # yield a shared colour-profile store. The mock has no Windows: a baked profile
+                # is what Windows applies. Staged-but-never-applied params must NOT verify
                 # (fable Phase 9 fidelity: the previous dict-non-empty check let a sim run
                 # pass a verify gate hardware would fail).
                 entry = self.state.mhc.get(self.key(params)) or {}

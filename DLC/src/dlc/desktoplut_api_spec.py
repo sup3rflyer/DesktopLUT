@@ -414,14 +414,20 @@ def build_desktoplut_api_spec() -> dict[str, Any]:
         ),
         ApiMethodSpec(
             "maintenance.verify_mhc",
-            "Report whether DesktopLUT has a coherent applied MHC state (enabled AND a baked "
-            "profile_name — staged-but-unapplied params do not verify).",
+            "Report whether WINDOWS applies DesktopLUT's MHC profile on the target: enabled, a baked "
+            "profile_name (staged-but-unapplied params do not verify), Windows' default profile for the "
+            "display/mode equal to it, and the display not yielding a colour-profile store it shares with "
+            "another display (2026-11-17: a TV in standby made Windows apply one display's profile to "
+            "another while this reported verified). store: where Windows files the display's profiles "
+            "(null when unknown).",
             {"monitor": _monitor_param(), "mode": _mode_param()},
-            {"verified": "boolean"},
+            {"verified": "boolean", "expected_profile": "string|null", "windows_default": "string|null",
+             "store": "object|null {key, device, own, shared, yields, shared_with: [monitor]}"},
             mutates_state=False,
             # Served on the pipe thread (Dispatch handles it before the GUI marshal;
-            # the settings mutex makes the read safe off-thread) — fable Phase 9 fixed
-            # this flag, which wrongly claimed a GUI-thread dependency.
+            # the settings mutex makes the read safe off-thread; the Windows queries are
+            # read-only) — fable Phase 9 fixed this flag, which wrongly claimed a GUI-thread
+            # dependency.
             gui_thread_required=False,
         ),
         ApiMethodSpec(

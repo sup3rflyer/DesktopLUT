@@ -6,6 +6,10 @@
 #include "displayconfig.h"
 #include "types.h"
 #include "gui_mhc.h"   // MhcScanoutName
+#include "mhc_store.h"
+#include "actions/notify.h"
+#include <algorithm>
+#include <map>
 #include <iostream>
 #include <set>
 #include <mutex>
@@ -90,6 +94,14 @@ bool InstallMHC2Profile(const std::wstring& profilePath, LUID adapterLuid, UINT3
     size_t lastSlash = profileName.find_last_of(L"\\/");
     if (lastSlash != std::wstring::npos) {
         profileName = profileName.substr(lastSlash + 1);
+    }
+
+    // Another display owns the store Windows would file this under (mhc_store.h): associating would hand this
+    // display's calibration to the owner. The file is installed; the association waits for the stores to separate.
+    if (MhcSourceYieldsStore(adapterLuid, sourceId)) {
+        std::wcout << L"MHC2: " << profileName << L" installed, not associated: the display shares its colour "
+                   << L"profile store with the display that owns it" << std::endl;
+        return true;
     }
 
     // SDR profiles: associateAsAdvancedColor=FALSE → classified as "SDR Profile"
@@ -182,6 +194,7 @@ bool ReassociateMHC2Profile(const std::wstring& profileName, LUID adapterLuid, U
         std::cerr << "MHC2: Reassociate API not available" << std::endl;
         return false;
     }
+    if (MhcSourceYieldsStore(adapterLuid, sourceId)) return true;   // the store's owner keeps it (InstallMHC2Profile)
 
     HRESULT hr = g_pfnAddAssociation(
         1,                  // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
@@ -252,7 +265,8 @@ std::wstring QueryDisplayDefaultProfile(LUID adapterLuid, UINT32 sourceId, bool 
     return result;
 }
 
-std::vector<std::wstring> ListDisplayProfileAssociations(LUID adapterLuid, UINT32 sourceId) {
+// The API list, which Windows 11 26200 answers with nothing (S_OK, count 0).
+static std::vector<std::wstring> ApiDisplayList(LUID adapterLuid, UINT32 sourceId) {
     std::vector<std::wstring> out;
     EnsureMscmsLoaded();
     if (!g_pfnGetDisplayList) return out;
@@ -264,6 +278,23 @@ std::vector<std::wstring> ListDisplayProfileAssociations(LUID adapterLuid, UINT3
     for (DWORD k = 0; k < count; k++)
         if (list[k]) out.emplace_back(list[k]);
     LocalFree(list);
+    return out;
+}
+
+std::vector<std::wstring> ListDisplayProfileAssociations(LUID adapterLuid, UINT32 sourceId) {
+    // The store's own lists (mhc_store.h), both modes, plus whatever the API reports.
+    std::vector<std::wstring> out;
+    MhcStoreSnapshot snap;
+    if (SnapshotMhcStores(snap)) {
+        const int i = snap.Find(adapterLuid, sourceId);
+        std::vector<std::wstring> sdr, hdr;
+        if (i >= 0 && ReadMhcStoreLists(snap.slots[i].storeKey, sdr, hdr)) {
+            out = sdr;
+            out.insert(out.end(), hdr.begin(), hdr.end());
+        }
+    }
+    for (std::wstring& n : ApiDisplayList(adapterLuid, sourceId))
+        if (std::find(out.begin(), out.end(), n) == out.end()) out.push_back(std::move(n));
     return out;
 }
 
@@ -355,98 +386,240 @@ void CleanupOrphanedMhcProfiles() {
 // list during mode switches, so a stale entry can silently become the active
 // "calibration". Only names referenced by current settings survive.
 //
-// The keep-set is GLOBAL (all monitors, active + all cached permutation names)
-// rather than per-monitor: permutation swaps can run on the gamma-whitelist
-// thread concurrently with a GUI-thread sweep, and a global keep-set guarantees
-// a just-associated variant is never swept mid-swap. Stale entries always carry
-// names absent from current settings (timestamp-suffixed), so they're still
-// caught.
+// The lists are read from the store Windows files each display's profiles under (mhc_store.h): the list API
+// answers with nothing on Windows 11 26200, so this sweep removed nothing there until 2026-11-17. A store is swept
+// once even when several displays share it. Kept per store: every name of the displays it belongs to (active,
+// cached permutations, trim stash, preview stand-in), so a variant a swap is associating on another thread for one
+// of them is never swept mid-swap. Removed: names no settings reference (stale), and names that belong to another
+// display (left there while a TV in standby made the displays share one store). Only when the store cannot be
+// found does the old rule apply: the API list, keep every name any display references, remove from both lists.
 void SweepStaleMhcAssociations() {
     EnsureMscmsLoaded();
-    if (!g_pfnGetDisplayList || !g_pfnRemoveAssociation) return;
+    if (!g_pfnRemoveAssociation) return;
 
-    // Snapshot every profile name referenced by current settings, plus per-monitor "is a real
-    // DesktopLUT MHC profile active" flags for the identity-profile rule below.
+    // Every profile name referenced by settings, per live monitor and per parked display, plus per-monitor "is a
+    // real DesktopLUT MHC profile active" flags for the identity-profile rule.
     std::set<std::wstring> keep;
-    size_t monitorCount = 0;
+    std::vector<std::set<std::wstring>> liveNames;
+    std::vector<std::pair<std::wstring, std::set<std::wstring>>> parkedNames;   // {devicePath, names}
     std::vector<std::pair<bool, bool>> realActive;  // [monitor] = {sdrActive, hdrActive}
     {
         std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
-        monitorCount = g_gui.monitorSettings.size();
         for (const auto& ms : g_gui.monitorSettings) {
             realActive.push_back({ ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty(),
                                    ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty() });
         }
-        auto collect = [&](const MonitorSettings& ms) {
+        auto collect = [](const MonitorSettings& ms, std::set<std::wstring>& out) {
             for (int k = 0; k < MHCSettings::PERM_COUNT; k++) {
-                if (!ms.sdrMHC.permNames[k].empty()) keep.insert(ms.sdrMHC.permNames[k]);
-                if (!ms.hdrMHC.permNames[k].empty()) keep.insert(ms.hdrMHC.permNames[k]);
+                if (!ms.sdrMHC.permNames[k].empty()) out.insert(ms.sdrMHC.permNames[k]);
+                if (!ms.hdrMHC.permNames[k].empty()) out.insert(ms.hdrMHC.permNames[k]);
             }
             // The refresh-trim stash: cached variants like the slots (a swap may be associating one right now).
-            for (const auto& e : ms.sdrMHC.trimStash) keep.insert(e.name);
-            for (const auto& e : ms.hdrMHC.trimStash) keep.insert(e.name);
-            if (!ms.sdrMHC.profileName.empty()) keep.insert(ms.sdrMHC.profileName);
-            if (!ms.hdrMHC.profileName.empty()) keep.insert(ms.hdrMHC.profileName);
+            for (const auto& e : ms.sdrMHC.trimStash) out.insert(e.name);
+            for (const auto& e : ms.hdrMHC.trimStash) out.insert(e.name);
+            if (!ms.sdrMHC.profileName.empty()) out.insert(ms.sdrMHC.profileName);
+            if (!ms.hdrMHC.profileName.empty()) out.insert(ms.hdrMHC.profileName);
             // A live edit's identity scanout profile (mhc_preview.h): the mode's default until the edit ends.
-            if (!ms.sdrMHC.previewScanoutName.empty()) keep.insert(ms.sdrMHC.previewScanoutName);
-            if (!ms.hdrMHC.previewScanoutName.empty()) keep.insert(ms.hdrMHC.previewScanoutName);
+            if (!ms.sdrMHC.previewScanoutName.empty()) out.insert(ms.sdrMHC.previewScanoutName);
+            if (!ms.hdrMHC.previewScanoutName.empty()) out.insert(ms.hdrMHC.previewScanoutName);
         };
-        for (const auto& ms : g_gui.monitorSettings) collect(ms);
-        for (const auto& ms : g_gui.parkedSettings) collect(ms);  // absent panels keep their names
+        for (const auto& ms : g_gui.monitorSettings) {
+            liveNames.emplace_back();
+            collect(ms, liveNames.back());
+            keep.insert(liveNames.back().begin(), liveNames.back().end());
+        }
+        for (const auto& ms : g_gui.parkedSettings) {   // absent panels keep their names
+            parkedNames.push_back({ ms.identity.devicePath, {} });
+            collect(ms, parkedNames.back().second);
+            keep.insert(parkedNames.back().second.begin(), parkedNames.back().second.end());
+        }
+    }
+    const int monitorCount = (int)liveNames.size();
+
+    MhcStoreSnapshot snap;
+    const bool haveStores = SnapshotMhcStores(snap);
+    std::vector<DisplayInfo> infos(monitorCount);
+    std::vector<int> slotOf(monitorCount, -1);
+    for (int i = 0; i < monitorCount; i++) {
+        if (!GetDisplayInfoForMonitor(i, infos[i])) { slotOf[i] = -2; continue; }
+        if (haveStores) slotOf[i] = snap.Find(infos[i].adapterId, infos[i].sourceId);
     }
 
     int swept = 0;
-    for (int i = 0; i < (int)monitorCount; i++) {
-        DisplayInfo di;
-        if (!GetDisplayInfoForMonitor(i, di)) continue;
+    std::set<std::wstring> sweptStores;
+    for (int i = 0; i < monitorCount; i++) {
+        if (slotOf[i] == -2) continue;
+        const DisplayInfo& di = infos[i];
 
-        LPWSTR* list = nullptr;
-        DWORD count = 0;
-        HRESULT hr = g_pfnGetDisplayList(
-            1,  // WCS_PROFILE_MANAGEMENT_SCOPE_CURRENT_USER
-            di.adapterId, di.sourceId, &list, &count);
-        if (FAILED(hr) || !list) continue;
-
-        for (DWORD k = 0; k < count; k++) {
-            if (!list[k]) continue;
-            std::wstring name = list[k];
-            if (name.rfind(L"DesktopLUT_", 0) != 0) continue;  // not ours — never touch
-            if (keep.count(name)) continue;                     // referenced by settings
-
-            // Identity profile: KEEP while this monitor's mode has no real DesktopLUT profile
-            // active (it is the deliberate stand-in after an explicit Remove/disable — sweeping it
-            // would leave nothing associated). Once a real profile is active it is only a stale
-            // entry Windows could re-broker to during a mode switch, so drop it from its own list.
-            bool idIsHDR = false;
-            if (IsMhcIdentityProfileName(name, &idIsHDR)) {
-                bool active = (i < (int)realActive.size())
-                    && (idIsHDR ? realActive[i].second : realActive[i].first);
-                if (!active) continue;
-                if (SUCCEEDED(g_pfnRemoveAssociation(1, name.c_str(), di.adapterId, di.sourceId,
-                                                     idIsHDR ? TRUE : FALSE))) {
-                    std::wcout << L"MHC sweep: removed superseded identity association '" << name
-                               << L"' from monitor " << i << std::endl;
-                    swept++;
+        struct Entry { std::wstring name; int list; };   // list: 0 SDR, 1 advanced colour, -1 unknown (both)
+        std::vector<Entry> entries;
+        std::set<std::wstring> storeNames;
+        int owner = i;
+        const int slot = slotOf[i];
+        bool fromStore = false;
+        if (slot >= 0 && !snap.slots[slot].storeKey.empty()) {
+            const std::wstring& key = snap.slots[slot].storeKey;
+            if (!sweptStores.insert(key).second) continue;   // a shared store: already swept
+            std::vector<std::wstring> sdr, hdr;
+            if (ReadMhcStoreLists(key, sdr, hdr)) {
+                fromStore = true;
+                for (auto& n : sdr) entries.push_back({ std::move(n), 0 });
+                for (auto& n : hdr) entries.push_back({ std::move(n), 1 });
+                for (int m = 0; m < monitorCount; m++) {
+                    if (slotOf[m] < 0 || snap.slots[slotOf[m]].storeKey != key) continue;
+                    storeNames.insert(liveNames[m].begin(), liveNames[m].end());
+                    if (snap.plan[slotOf[m]].owner == slotOf[m]) owner = m;
                 }
-                continue;
-            }
-
-            // Stale entry. The list API doesn't say which list (SDR vs Advanced
-            // Color) the entry lives in, so remove from both — removal from the
-            // list it's not in fails harmlessly.
-            HRESULT r1 = g_pfnRemoveAssociation(1, name.c_str(), di.adapterId, di.sourceId, FALSE);
-            HRESULT r2 = g_pfnRemoveAssociation(1, name.c_str(), di.adapterId, di.sourceId, TRUE);
-            if (SUCCEEDED(r1) || SUCCEEDED(r2)) {
-                std::wcout << L"MHC sweep: removed stale association '" << name
-                           << L"' from monitor " << i << std::endl;
-                swept++;
+                // A parked display's own store (the TV in standby whose store the others use): its names stay.
+                for (const auto& p : parkedNames)
+                    if (!p.first.empty() && _wcsicmp(p.first.c_str(), snap.slots[slot].storeDevice.c_str()) == 0)
+                        storeNames.insert(p.second.begin(), p.second.end());
             }
         }
-        LocalFree(list);
+        if (!fromStore) {
+            for (auto& n : ApiDisplayList(di.adapterId, di.sourceId)) entries.push_back({ std::move(n), -1 });
+            storeNames = keep;
+        }
+
+        std::vector<std::wstring> dead[2];   // stale / foreign entries Windows would not remove: their file is gone
+        for (const Entry& e : entries) {
+            bool idIsHDR = (e.list == 1);
+            const bool isIdentity = IsMhcIdentityProfileName(e.name, &idIsHDR);
+            const bool active = owner < (int)realActive.size() &&
+                                (idIsHDR ? realActive[owner].second : realActive[owner].first);
+            const MhcStoreEntryAction action = ClassifyMhcStoreEntry(e.name, storeNames, keep, isIdentity, active);
+            if (action == MhcStoreEntryAction::Keep) continue;
+
+            // Identity profile: KEPT while the owner's mode has no real DesktopLUT profile active (the deliberate
+            // stand-in after an explicit Remove/disable); once a real profile is active it is only a stale entry
+            // Windows could re-broker to during a mode switch.
+            bool removed = false;
+            if (action == MhcStoreEntryAction::RemoveIdentity) {
+                removed = SUCCEEDED(g_pfnRemoveAssociation(1, e.name.c_str(), di.adapterId, di.sourceId,
+                                                           idIsHDR ? TRUE : FALSE));
+            } else if (e.list >= 0) {
+                removed = SUCCEEDED(g_pfnRemoveAssociation(1, e.name.c_str(), di.adapterId, di.sourceId,
+                                                           e.list == 1 ? TRUE : FALSE));
+            } else {
+                // The list API does not say which list the entry is in: removal from the other fails harmlessly.
+                HRESULT r1 = g_pfnRemoveAssociation(1, e.name.c_str(), di.adapterId, di.sourceId, FALSE);
+                HRESULT r2 = g_pfnRemoveAssociation(1, e.name.c_str(), di.adapterId, di.sourceId, TRUE);
+                removed = SUCCEEDED(r1) || SUCCEEDED(r2);
+            }
+            if (removed) {
+                const wchar_t* what = action == MhcStoreEntryAction::RemoveIdentity ? L"superseded identity"
+                                    : action == MhcStoreEntryAction::RemoveForeign  ? L"another display's"
+                                                                                    : L"stale";
+                std::wcout << L"MHC sweep: removed " << what << L" association '" << e.name << L"' from monitor "
+                           << i << std::endl;
+                swept++;
+            } else if (fromStore && e.list >= 0 && action != MhcStoreEntryAction::RemoveIdentity) {
+                wchar_t sysDir[MAX_PATH];
+                GetSystemDirectory(sysDir, MAX_PATH);
+                const std::wstring path = std::wstring(sysDir) + L"\\spool\\drivers\\color\\" + e.name;
+                if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) dead[e.list].push_back(e.name);
+            }
+        }
+        for (int list = 0; list < 2 && fromStore; list++) {
+            const int n = DropDeadMhcStoreEntries(snap.slots[slot].storeKey, list == 1, dead[list]);
+            if (n > 0) {
+                std::wcout << L"MHC sweep: dropped " << n << L" dead " << (list ? L"advanced-colour" : L"SDR")
+                           << L" association(s) (profile file gone) from monitor " << i << std::endl;
+                swept += n;
+            }
+        }
     }
 
     if (swept > 0) {
-        std::cout << "MHC sweep: removed " << swept << " stale association(s)" << std::endl;
+        std::cout << "MHC sweep: removed " << swept << " association(s)" << std::endl;
+    }
+}
+
+// "\\?\DISPLAY#GSM84CD#5&...#{guid}" -> "GSM84CD" (the monitor's hardware id), else the path.
+static std::wstring HardwareIdOfDevicePath(const std::wstring& path) {
+    const size_t a = path.find(L'#');
+    const size_t b = a == std::wstring::npos ? std::wstring::npos : path.find(L'#', a + 1);
+    return b == std::wstring::npos ? path : path.substr(a + 1, b - a - 1);
+}
+
+// The footer notice for displays that yield a shared colour-profile store (mhc_store.h): posted when it starts or
+// its wording changes, resolved when it ends. nullptr = the stores could not be read (nothing changes).
+static void UpdateMhcSharedStoreNotice(const MhcStoreSnapshot* stores) {
+    static std::mutex s_mutex;
+    static std::map<int, std::wstring> s_posted;   // monitor -> title + detail of its standing notice
+    if (!stores) return;
+
+    struct Mon { std::wstring name; bool hasMhc = false; int slot = -1; };
+    std::vector<Mon> mons;
+    std::vector<std::pair<std::wstring, std::wstring>> known;   // {devicePath, name} of every display we know
+    {
+        std::lock_guard<std::mutex> lock(g_monitorSettingsMutex);
+        auto nameOf = [](const MonitorSettings& ms) {
+            if (!ms.label.empty()) return ms.label;
+            if (!ms.identity.friendlyName.empty()) return ms.identity.friendlyName;
+            return HardwareIdOfDevicePath(ms.identity.devicePath);
+        };
+        for (const auto& ms : g_gui.monitorSettings) {
+            Mon m;
+            m.name = nameOf(ms);
+            m.hasMhc = (ms.sdrMHC.enabled && !ms.sdrMHC.profileName.empty()) ||
+                       (ms.hdrMHC.enabled && !ms.hdrMHC.profileName.empty());
+            mons.push_back(std::move(m));
+            known.push_back({ ms.identity.devicePath, nameOf(ms) });
+        }
+        for (const auto& ms : g_gui.parkedSettings) known.push_back({ ms.identity.devicePath, nameOf(ms) });
+    }
+    for (int i = 0; i < (int)mons.size(); i++) {
+        DisplayInfo di;
+        if (GetDisplayInfoForMonitor(i, di)) mons[i].slot = stores->Find(di.adapterId, di.sourceId);
+        if (mons[i].name.empty()) mons[i].name = di.name;
+    }
+    auto monitorOfSlot = [&](int slot) {
+        for (int i = 0; i < (int)mons.size(); i++) if (mons[i].slot == slot) return i;
+        return -1;
+    };
+
+    std::map<int, std::pair<std::wstring, std::wstring>> now;   // monitor -> {title, detail}
+    for (int i = 0; i < (int)mons.size(); i++) {
+        const int slot = mons[i].slot;
+        if (slot < 0 || !stores->plan[slot].yields) continue;
+        const int owner = monitorOfSlot(stores->plan[slot].owner);
+        const std::wstring ownerName = owner >= 0 ? mons[owner].name : std::wstring(L"another display");
+        const bool ownerHasMhc = owner >= 0 && mons[owner].hasMhc;
+        if (!mons[i].hasMhc && !ownerHasMhc) continue;   // nothing shown wrong
+        const std::wstring& storeDevice = stores->slots[slot].storeDevice;
+        std::wstring storeName = HardwareIdOfDevicePath(storeDevice);
+        for (const auto& k : known)
+            if (!k.first.empty() && _wcsicmp(k.first.c_str(), storeDevice.c_str()) == 0 && !k.second.empty()) {
+                storeName = k.second;
+                break;
+            }
+        const std::wstring title = ownerHasMhc ? L"Shows the calibration of " + ownerName : L"Calibration not applied";
+        const std::wstring detail =
+            L"Windows keeps one colour profile for " + mons[i].name + L" and " + ownerName + L" while " + storeName +
+            L" is connected but not in use; " + ownerName + L" keeps its own. Turn " + storeName +
+            L" on, or unplug it, to give each display its calibration.";
+        now[i] = { title, detail };
+    }
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+    for (auto it = s_posted.begin(); it != s_posted.end();) {
+        if (!now.count(it->first)) {
+            notify::Resolve(it->first, L"mhc", L"shared-store");
+            std::wcout << L"MHC: monitor " << it->first << L" has its own colour profile store again" << std::endl;
+            it = s_posted.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const auto& [mon, text] : now) {
+        const std::wstring sig = text.first + L"\n" + text.second;
+        auto it = s_posted.find(mon);
+        if (it != s_posted.end() && it->second == sig) continue;
+        notify::Resolve(mon, L"mhc", L"shared-store");
+        notify::PostCondition(notify::Sev::Warning, mon, L"mhc", L"shared-store", text.first, text.second);
+        std::wcout << L"MHC: monitor " << mon << L" yields its colour profile store: " << text.second << std::endl;
+        s_posted[mon] = sig;
     }
 }
 
@@ -478,6 +651,12 @@ void VerifyAndRestoreMhcProfiles() {
         }
     }
 
+    // Shared colour-profile stores (mhc_store.h): a display that yields its store to the owner is not re-asserted —
+    // that was a fight every 15 s which the display checked last won. Said in the footer while it lasts.
+    MhcStoreSnapshot stores;
+    const bool haveStores = SnapshotMhcStores(stores);
+    UpdateMhcSharedStoreNotice(haveStores ? &stores : nullptr);
+
     int restored = 0;
     for (int i = 0; i < (int)snapshots.size(); i++) {
         const auto& snap = snapshots[i];
@@ -490,6 +669,10 @@ void VerifyAndRestoreMhcProfiles() {
 
         DisplayInfo displayInfo;
         if (!GetDisplayInfoForMonitor(i, displayInfo)) continue;
+        if (haveStores) {
+            const int slot = stores.Find(displayInfo.adapterId, displayInfo.sourceId);
+            if (slot >= 0 && stores.plan[slot].yields) continue;
+        }
 
         auto verifyOne = [&](bool isHDR, const std::wstring& expected) {
             if (expected.empty()) return;
