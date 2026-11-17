@@ -389,7 +389,15 @@ class MockDesktopLutServer:
                 # (fable Phase 9 fidelity: the previous dict-non-empty check let a sim run
                 # pass a verify gate hardware would fail).
                 entry = self.state.mhc.get(self.key(params)) or {}
-                return self.ok({"verified": bool(entry.get("applied"))})
+                applied = bool(entry.get("applied"))
+                name = entry.get("profile_name") if applied else None
+                return self.ok({
+                    "verified": applied,
+                    "expected_profile": name,
+                    "windows_default": name,
+                    "store": {"key": None, "device": "", "own": True, "shared": False, "yields": False,
+                              "shared_with": []},
+                })
             if method == "windows.query_profiles":
                 # C++ HandleQueryProfiles is deliberately thin (v1): DLC does the
                 # authoritative ICC audit via Argyll. Mirror its shape, note included.
